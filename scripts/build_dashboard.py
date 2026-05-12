@@ -32,9 +32,13 @@ def generate_markdown_table(data, headers, keys):
 def main():
     tracker_file = Path('tracker/work_tracker.csv')
     coverage_file = Path('tracker/source_coverage.csv')
+    ranked_file = Path('dashboard/ranked_tasks.csv')
+    daily_log_file = Path('tracker/daily_log.csv')
 
     tasks = read_csv(tracker_file)
     coverage = read_csv(coverage_file)
+    ranked_tasks = read_csv(ranked_file)
+    logs = read_csv(daily_log_file)
 
     # Calculate metrics
     total_tasks = len(tasks)
@@ -48,15 +52,21 @@ def main():
     done = status_counts.get('Done', 0)
     in_progress = status_counts.get('In Progress', 0)
     not_started = status_counts.get('Not Started', 0)
-    blocked = status_counts.get('Blocked', 0)
+    blocked_count = status_counts.get('Blocked', 0)
     parked = status_counts.get('Parked', 0)
 
     completion_percentage = (done / total_tasks * 100) if total_tasks > 0 else 0
 
     # Subsets of tasks
-    high_priority_open = [t for t in tasks if t.get('Priority') == 'High' and t.get('Status') not in ('Done', 'Parked')]
-    recently_completed = [t for t in tasks if t.get('Status') == 'Done'] # We don't have completed dates to sort, but just filter them
-    # For a real "recently completed" we would sort by date, but since they might be blank, we just show them
+    actionable_tasks = [t for t in ranked_tasks if t.get('ReadyStatus') == 'Ready']
+    top_5 = actionable_tasks[:5]
+    quick_wins = [t for t in actionable_tasks if str(t.get('Effort', '')).strip() == '1']
+    blocked_waiting = [t for t in tasks if t.get('ReadyStatus') in ['Blocked', 'Waiting']]
+    stale_status = [t for t in tasks if t.get('StatusSuggestion') and t.get('StatusSuggestion') != 'No Change']
+
+    # Sort logs by date desc to get recent
+    logs.sort(key=lambda x: x.get('Date', ''), reverse=True)
+    recent_logs = logs[:10]
 
     # Generate content
     now_utc = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
@@ -69,32 +79,44 @@ def main():
         f"- **Done:** {done}",
         f"- **In Progress:** {in_progress}",
         f"- **Not Started:** {not_started}",
-        f"- **Blocked:** {blocked}",
+        f"- **Blocked:** {blocked_count}",
         f"- **Parked:** {parked}",
         f"- **Completion:** {completion_percentage:.1f}%\n",
-        "## Tasks by Status\n",
+        "## Today's Top 5 Tasks\n",
         generate_markdown_table(
-            [{"Status": k, "Count": v} for k, v in status_counts.items()],
-            ["Status", "Count"],
-            ["Status", "Count"]
+            top_5,
+            ["TaskID", "Category", "Task", "Priority", "Effort", "NextAction"],
+            ["TaskID", "Category", "Task", "Priority", "Effort", "NextAction"]
         ),
-        "## Tasks by Category\n",
+        "## Quick Wins (Effort 1)\n",
         generate_markdown_table(
-            [{"Category": k, "Count": v} for k, v in category_counts.items()],
-            ["Category", "Count"],
-            ["Category", "Count"]
+            quick_wins,
+            ["TaskID", "Task", "Priority"],
+            ["TaskID", "Task", "Priority"]
         ),
-        "## High-Priority Open Tasks\n",
+        "## Blocked / Waiting Tasks\n",
         generate_markdown_table(
-            high_priority_open,
-            ["No", "Category", "Task", "Status"],
-            ["No", "Category", "Task", "Status"]
+            blocked_waiting,
+            ["TaskID", "Task", "ReadyStatus", "BlockedBy", "Notes"],
+            ["TaskID", "Task", "ReadyStatus", "BlockedBy", "Notes"]
         ),
-        "## Recently Completed Tasks\n",
+        "## Tasks with Stale Status / Suggested Status\n",
         generate_markdown_table(
-            recently_completed,
-            ["No", "Category", "Task", "Evidence / Output"],
-            ["No", "Category", "Task", "Evidence / Output"]
+            stale_status,
+            ["TaskID", "Task", "Current Status", "Suggested Status"],
+            ["TaskID", "Task", "Status", "StatusSuggestion"]
+        ),
+        "## Recent Daily Log Entries\n",
+        generate_markdown_table(
+            recent_logs,
+            ["Date", "TaskID", "What I Did", "Confidence", "Suggested Status"],
+            ["Date", "TaskID", "WhatIDid", "Confidence", "SuggestedStatus"]
+        ),
+        "## Ranked Open Tasks (Full List)\n",
+        generate_markdown_table(
+            ranked_tasks,
+            ["TaskID", "Category", "Task", "RankScore", "Priority", "Effort", "Status"],
+            ["TaskID", "Category", "Task", "RankScore", "Priority", "Effort", "Status"]
         ),
         "## Source Coverage Summary\n",
         generate_markdown_table(
@@ -105,8 +127,8 @@ def main():
         "## Full Tracker\n",
         generate_markdown_table(
             tasks,
-            ["No", "Category", "Task", "Brief Description / Goal", "Status", "Priority", "Source", "Started", "Completed", "Evidence / Output", "Notes"],
-            ["No", "Category", "Task", "Brief Description / Goal", "Status", "Priority", "Source", "Started", "Completed", "Evidence / Output", "Notes"]
+            ["TaskID", "No", "Category", "Task", "Brief Description / Goal", "Status", "Priority", "DependsOn", "Effort", "DueDate"],
+            ["TaskID", "No", "Category", "Task", "Brief Description / Goal", "Status", "Priority", "DependsOn", "Effort", "DueDate"]
         )
     ]
 
