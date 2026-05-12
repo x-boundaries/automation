@@ -1,0 +1,15 @@
+.env
+*.env
+data/
+exports/
+outputs/
+exceptions/
+backups/
+*.bak
+*.sql
+*.sqlite
+*.db
+~$*.xlsx
+__pycache__/
+.venv/
+.pytest_cache/

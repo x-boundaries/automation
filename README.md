@@ -1,68 +1,35 @@
 # X-Boundaries Automation
 
-Automation repo for X-Boundaries digital transformation work.
+This repository tracks internal automation work, migration prep tasks, and post-migration automation roadmap progress for X-Boundaries digital transformation and AutoCount migration. It features a lightweight GitHub-powered work tracker and an automated dashboard.
 
-## Purpose
+## ⚠️ WARNING: DATA POLICY
 
-This repo stores automation logic, schemas, documentation, and template definitions for the AutoCount 2.0 / SiteGiant / marketplace data layer.
+**Do NOT commit real company operational data to this repository.**
 
-## Rule
-
-Do **not** commit real company data here.
-
-Use this repo for:
-
-- Documentation.
-- Data schemas.
-- Empty template definitions.
-- Scripts.
-- Validation rules.
-- n8n workflow exports.
-- Dummy sample data.
-
-Do **not** commit:
-
-- Real stock exports.
-- Real product master files.
+This repository must NOT store:
+- Real stock master or product master files.
 - Real customer or supplier lists.
-- AP / AR / bank data.
-- AutoCount backups.
+- AP/AR records or invoices.
+- Bank or payment exports.
+- AutoCount database backups.
 - Passwords, API keys, or `.env` files.
 
-## Current MVP
+Please review the full data policy in [docs/data_policy.md](docs/data_policy.md).
 
-The first MVP is a simple product/SKU master legend + new stock input flow:
+## How to Update the Tracker
 
-```text
-Master Legend
-+ New Stock Input
--> Generated AutoCount copy-paste rows
--> Paste into AutoCount 2
-```
+1. Edit the CSV file at `tracker/work_tracker.csv`.
+2. Update task details, ensuring you use the allowed Status values: `Not Started`, `In Progress`, `Blocked`, `Done`, `Parked`.
+3. Allowed Priority values: `High`, `Medium`, `Low`.
+4. Commit and push your changes to GitHub.
 
-## Key design decision
+For more details, see [docs/tracker_usage.md](docs/tracker_usage.md).
 
-AutoCount fields are limited, so X-Boundaries will maintain its own external mapping legend.
+## How the Dashboard is Generated
 
-The master legend must support SKU changes over time. Old SKUs must be kept as history instead of directly overwritten.
+The dashboard is generated automatically using a GitHub Actions workflow whenever changes are pushed to the tracker files or the generation script.
 
-## Folder layout
-
-```text
-docs/       Project notes, architecture, work tracker.
-schemas/    Column definitions and data rules.
-templates/  Empty CSV template definitions and workbook notes.
-scripts/    Future Python scripts / validators / generators.
-samples/    Dummy sample files only. No real company data.
-n8n/        Future n8n workflow exports.
-```
-
-## Current local workbook templates
-
-The working Excel files should stay outside GitHub unless they are clean empty templates:
-
-- `xb_master_legend_TEMPLATE_v0_1.xlsx`
-- `xb_new_stock_input_TEMPLATE_v0_1.xlsx`
-- `ac2_stock_item_copypaste_TEMPLATE_v0_1.xlsx`
-
-GitHub tracks the schema and logic. Real working data should stay in a secure shared drive.
+- The Python script `scripts/build_dashboard.py` reads the tracker CSVs and outputs a Markdown dashboard.
+- The GitHub Actions workflow (`.github/workflows/build-dashboard.yml`) runs the script on every push to the `tracker/` directory or relevant files.
+- The workflow automatically commits the updated `dashboard/README.md` back to the repository.
+- You can view the live dashboard at [dashboard/README.md](dashboard/README.md).

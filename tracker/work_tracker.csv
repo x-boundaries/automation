@@ -1,0 +1,11 @@
+No,Category,Task,Brief Description / Goal,Status,Priority,Source,Started,Completed,Evidence / Output,Notes
+1,Migration Prep,Build Mike migration call checklist,Create a focused checklist to ask Ingenious what X-Boundaries must prepare before migration day,Done,High,Minutes,,,mike_call_migration_prep_checklist_v3_sku_mapping.md,
+2,Migration Prep,Confirm AutoCount 2.0 module scope,Confirm stock accounting POS bank recon AP/AR price master multi-location and import capabilities,In Progress,High,Minutes,,,Mike call,
+3,Migration Prep,Confirm 6 migration templates,Confirm purpose mandatory fields import order and reversibility for stock stock open balance debtor creditor AR and AP templates,In Progress,High,Minutes,,,Mike call,
+4,Data Foundation,Create master legend concept,Design external product/SKU mapping legend because AutoCount fields are limited,Done,High,Derived,,,xb_master_legend_TEMPLATE_v0_1.xlsx,
+5,Data Foundation,Create SKU history approach,Keep old and new SKUs as growing alias rows instead of overwriting SKU values,Done,High,Minutes,,,SKU_History sheet,
+6,Data Foundation,Create primary product ID concept,Define InternalProductID PrimarySKU AutoCountItemCode roles so SKU changes do not break reports,In Progress,High,Minutes,,,,Need Mike confirmation on AC2 ItemCode change behaviour.
+7,Automation,Build stock upload generator,Generate AutoCount-ready rows from master legend and new stock input file,Not Started,High,Derived,,,,Start after Mike confirms required fields and quantity workflow.
+8,Finance,Create daily POS/payment reconciliation MVP,Compare POS sales by payment method against bank/card/payment reports and flag exceptions,Not Started,High,Minutes,,,,
+9,Operations,Create goods-in-transit tracker,Track PO supplier payment shipment ETA packing list GRN landed cost and closure,Not Started,High,Minutes,,,,
+10,Reporting,Create basic sales/channel dashboard,Show simple sales by channel outlet SKU category after data exports become reliable,Not Started,Medium,Derived,,,,
