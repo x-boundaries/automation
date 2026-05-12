@@ -1,0 +1,17 @@
+X-Boundaries Work Tracker Dashboard v2
+
+Metric,Value,,Status,Count,Share
+Total tasks,=COUNTA(Tracker!C2:C300),,Done,"=COUNTIF(Tracker!E2:E300,D4)","=IF($E$9=0,0,E4/$E$9)"
+Done,"=COUNTIF(Tracker!E2:E300,""Done"")",,In Progress,"=COUNTIF(Tracker!E2:E300,D5)","=IF($E$9=0,0,E5/$E$9)"
+In Progress,"=COUNTIF(Tracker!E2:E300,""In Progress"")",,Not Started,"=COUNTIF(Tracker!E2:E300,D6)","=IF($E$9=0,0,E6/$E$9)"
+Not Started,"=COUNTIF(Tracker!E2:E300,""Not Started"")",,Blocked,"=COUNTIF(Tracker!E2:E300,D7)","=IF($E$9=0,0,E7/$E$9)"
+Blocked,"=COUNTIF(Tracker!E2:E300,""Blocked"")",,Parked,"=COUNTIF(Tracker!E2:E300,D8)","=IF($E$9=0,0,E8/$E$9)"
+Parked,"=COUNTIF(Tracker!E2:E300,""Parked"")",,Total,=SUM(E4:E8),=SUM(F4:F8)
+
+
+Current focus
+1,Confirm Mike rules,"Mandatory fields, ItemCode/SKU change behaviour, quantity workflow, import order."
+2,Confirm Brendan data sources,"CoA, opening balances, AP/AR, stock value, bank/cash, supplier prepayment."
+3,Build master legend,Keep product master and SKU history clean before generating imports.
+4,Build stock upload generator,Use master legend + simple stock input to produce AC2 copy-paste rows.
+5,Update tracker weekly,Keep proof of work and tenure achievements visible.
