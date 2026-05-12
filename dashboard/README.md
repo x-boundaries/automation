@@ -1,6 +1,6 @@
 # X-Boundaries Automation Dashboard
 
-*Last generated: 2026-05-12 15:27:44 UTC*
+*Last generated: 2026-05-12 15:35:40 UTC*
 
 ## Summary Metrics
 
@@ -93,15 +93,55 @@
 | Minutes | Customer master list | Prepare customer/debtor master list | Covered |
 | Minutes | Supplier master list | Prepare supplier/creditor master list | Covered |
 | Minutes | Chart of Accounts | Prepare Chart of Accounts draft; Confirm opening accounting balances | Covered |
+| Minutes | AutoCount module scope | Confirm AutoCount 2.0 module scope | Covered |
+| Minutes | Daily reconciliation | Create daily POS/payment reconciliation MVP | Covered |
 | Minutes | Goods in transit | Add stock-in-transit questions; Create goods-in-transit tracker | Covered |
 | Minutes | SKU identity / primary key | Create SKU history approach; Create primary product ID concept | Covered |
 | Minutes | Migration parallel run | Add parallel run questions | Covered |
-| Minutes | Daily reconciliation | Create daily POS/payment reconciliation MVP | Covered |
-| Wishlist | New/current products update on AutoCount via shipment upload / PO / price alert | Shipment upload to PO/product update workflow; price calculator + alert | Covered |
-| Wishlist | Goods received at warehouse scan vs PO / discrepancy | Create warehouse GRN scan/discrepancy tracker | Covered |
-| Wishlist | Goods disbursement to channels | Create goods disbursement workflow by channel | Covered |
-| Wishlist | Membership POS / discount / points / birthday voucher | Membership POS workflow | Covered |
-| Wishlist | Reports by vendor / brand / category / sales breakdown | Reporting dashboard tasks | Covered |
+| Minutes | POS edge cases | Confirm POS edge case handling | Covered |
+| Minutes | Selling price formula / price alert | Create price calculator + price change alert | Covered |
+| Minutes | AR invoice dumping ground | Create AR chasing queue | Covered |
+| Minutes | AP invoice inbox / manual expense automation | Create AP invoice inbox tracker; supplier invoice/expense automation plan | Covered |
+| Minutes | RFID / barcode scanning | Barcode scanning workflow; RFID pilot | Covered |
+| XB new system 2026.xlsx | New/current products update on AutoCount via shipment upload / PO / price alert | Shipment upload to PO/product update workflow; price calculator + alert | Covered |
+| XB new system 2026.xlsx | Goods received at warehouse scan vs PO / discrepancy | Create warehouse GRN scan/discrepancy tracker | Covered |
+| XB new system 2026.xlsx | Goods disbursement to channels | Create goods disbursement workflow by channel | Covered |
+| XB new system 2026.xlsx | Goods received acknowledgement by channels | Create channel receiving acknowledgement tracker | Covered |
+| XB new system 2026.xlsx | Evergreen replenishment alert | Create evergreen replenishment alert | Covered |
+| XB new system 2026.xlsx | ETA of pre-order stock | Create pre-order ETA tracker | Covered |
+| XB new system 2026.xlsx | Retail receive from HQ | Retail receive from HQ workflow | Covered |
+| XB new system 2026.xlsx | Retail receive from suppliers / GRN | Retail supplier GRN workflow | Covered |
+| XB new system 2026.xlsx | Membership POS / discount / points / birthday voucher | Membership POS workflow | Covered |
+| XB new system 2026.xlsx | Membership mandatory fields | Membership mandatory fields checker | Covered |
+| XB new system 2026.xlsx | Wholesale goods receive | Wholesale receiving workflow | Covered |
+| XB new system 2026.xlsx | Outright buyer invoice | Wholesale outright buyer invoice workflow | Covered |
+| XB new system 2026.xlsx | Consignee DO to AR / different stores | Consignee DO to AR workflow; Metro/consignment ageing tracker | Covered |
+| XB new system 2026.xlsx | Reports by vendor | Create report by vendor | Covered |
+| XB new system 2026.xlsx | Reports by brand | Create report by brand | Covered |
+| XB new system 2026.xlsx | Reports by category | Create report by category; category cleanup/mapping | Covered |
+| XB new system 2026.xlsx | Sales breakdown average pieces / average sales | Create sales breakdown report | Covered |
+| Post-migration automation roadmap | Phase 0 stabilise first: issue log, export archive, backup alert, sync tracker, master data change tracker, POS closing checklist, daily sales archive | Create daily post-go-live issue log; export archive structure; backup success / restore check alert; failed sync tracker; master data change tracker; POS closing checklist; daily sales report archive | Covered |
+| Post-migration automation roadmap | Phase 1 data foundation: exports, SKU mapping, data dictionary, product audit, data quality checks | Create export archive structure; SKU history approach; data dictionary; product master cleanup checker; stock upload exception report | Covered |
+| Post-migration automation roadmap | SKU mapping / product identity automation | Create master legend concept; SKU history approach; primary product ID concept; stock upload generator | Covered |
+| Post-migration automation roadmap | Stock upload staging / AutoCount import template generator | Create new stock input template; AutoCount stock item copy-paste template; build stock upload generator; stock upload exception report | Covered |
+| Post-migration automation roadmap | Product master / category cleanup automation | Product master cleanup checker; current category cleanup/mapping | Covered |
+| Post-migration automation roadmap | Price calculator + price change alert | Create price calculator + price change alert | Covered |
+| Post-migration automation roadmap | Goods-in-transit / supplier prepayment tracker | Create goods-in-transit tracker | Covered |
+| Post-migration automation roadmap | GRN discrepancy tracker | Create warehouse GRN scan/discrepancy tracker | Covered |
+| Post-migration automation roadmap | Stock transfer / channel acknowledgement tracker | Create channel receiving acknowledgement tracker; goods disbursement workflow by channel | Covered |
+| Post-migration automation roadmap | Evergreen replenishment alert | Create evergreen replenishment alert | Covered |
+| Post-migration automation roadmap | Daily sales reconciliation | Create daily POS/payment reconciliation MVP; POS closing checklist | Covered |
+| Post-migration automation roadmap | Marketplace payout reconciliation | Create marketplace payout reconciliation | Covered |
+| Post-migration automation roadmap | AR chasing queue | Create AR chasing queue | Covered |
+| Post-migration automation roadmap | AP invoice inbox / OCR later | AP invoice inbox tracker; supplier invoice/expense automation plan | Covered |
+| Post-migration automation roadmap | Returns / RMA tracker | Create SOPs for key workflows; confirm POS edge case handling | Partial - needs a dedicated RMA tracker row later |
+| Post-migration automation roadmap | Management dashboard / reporting layer | Basic sales/channel dashboard; inventory dashboard; reports by vendor/brand/category/sales breakdown | Covered |
+| Post-migration automation roadmap | SiteGiant sync monitor and marketplace listing/SKU monitor | Create SiteGiant sync monitor; marketplace payout reconciliation; primary product ID concept | Partial - listing monitor can become its own row later |
+| Post-migration automation roadmap | KrisShop workaround | Confirm KrisShop workflow | Covered |
+| Post-migration automation roadmap | Membership cleanup / birthday voucher / points reporting | Membership mandatory fields checker; membership POS workflow | Covered |
+| Post-migration automation roadmap | RFID later after barcode/GRN/transfer/stocktake are stable | Barcode scanning workflow; RFID pilot | Covered |
+| Post-migration automation roadmap | AI / analytics only after clean data | Park AI/direct write-back until data is clean | Covered |
+| Post-migration automation roadmap | Minimal stack: scheduled exports, central storage, Python/n8n transform, alerts/dashboard, write-back later | Export archive structure; read-only automation rule; AutoCount export/API/SQL access; write-back approval gate | Covered |
 
 ## Full Tracker
 
