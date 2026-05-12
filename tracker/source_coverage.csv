@@ -1,0 +1,14 @@
+Source,Request / Wishlist Item,Covered in tracker task(s),Coverage
+Minutes,Stock master list,Prepare stock master list; Product master cleanup checker,Covered
+Minutes,Customer master list,Prepare customer/debtor master list,Covered
+Minutes,Supplier master list,Prepare supplier/creditor master list,Covered
+Minutes,Chart of Accounts,Prepare Chart of Accounts draft; Confirm opening accounting balances,Covered
+Minutes,Goods in transit,Add stock-in-transit questions; Create goods-in-transit tracker,Covered
+Minutes,SKU identity / primary key,Create SKU history approach; Create primary product ID concept,Covered
+Minutes,Migration parallel run,Add parallel run questions,Covered
+Minutes,Daily reconciliation,Create daily POS/payment reconciliation MVP,Covered
+Wishlist,New/current products update on AutoCount via shipment upload / PO / price alert,Shipment upload to PO/product update workflow; price calculator + alert,Covered
+Wishlist,Goods received at warehouse scan vs PO / discrepancy,Create warehouse GRN scan/discrepancy tracker,Covered
+Wishlist,Goods disbursement to channels,Create goods disbursement workflow by channel,Covered
+Wishlist,Membership POS / discount / points / birthday voucher,Membership POS workflow,Covered
+Wishlist,Reports by vendor / brand / category / sales breakdown,Reporting dashboard tasks,Covered
