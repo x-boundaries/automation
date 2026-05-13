@@ -43,6 +43,7 @@ jobs:
           git push
 
       - name: Send Email Digest
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
         env:
           SMTP_HOST: ${{ vars.SMTP_HOST }}
           SMTP_PORT: ${{ vars.SMTP_PORT }}

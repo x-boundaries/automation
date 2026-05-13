@@ -9,7 +9,7 @@ def send_email():
     smtp_user = os.environ.get('SMTP_USERNAME')
     smtp_pass = os.environ.get('SMTP_PASSWORD')
     email_from = os.environ.get('EMAIL_FROM')
-    email_to = os.environ.get('EMAIL_TO', 'weijun.seh@x-boundaries.com')
+    email_to = os.environ.get('EMAIL_TO') or 'weijun.seh@x-boundaries.com'
 
     if not all([smtp_host, smtp_port, smtp_user, smtp_pass, email_from]):
         print("SMTP secrets are not fully configured. Skipping email notification gracefully.")
