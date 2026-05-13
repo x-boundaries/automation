@@ -1,6 +1,6 @@
 # X-Boundaries Automation Dashboard
 
-*Last generated: 2026-05-13 04:15:11 UTC*
+*Last generated: 2026-05-13 05:03:06 UTC*
 
 ## Summary Metrics
 
@@ -16,11 +16,11 @@
 
 | TaskID | Category | Task | Priority | Effort | NextAction |
 | --- | --- | --- | --- | --- | --- |
-| T002 | Migration Prep | Confirm AutoCount 2.0 module scope | High |  |  |
-| T003 | Migration Prep | Confirm 6 migration templates | High |  |  |
-| T006 | Migration Prep | Prepare Brendan finance data-source call | High |  |  |
-| T016 | Data Foundation | Create primary product ID concept | High |  |  |
-| T007 | Migration Prep | Prepare stock master list | High |  |  |
+| T003 | Migration Prep | Confirm 6 migration templates | High |  | Ask Mike for compulsory columns, optional columns, sample completed rows, import sequence, and rollback/correction process. |
+| T002 | Migration Prep | Confirm AutoCount 2.0 module scope | High |  | Confirm exact modules live at go-live and what Ingenious configures vs X-Boundaries/accountant prepares. |
+| T006 | Migration Prep | Prepare Brendan finance data-source call | High |  | Build Brendan/accountant source-owner table and confirm sign-off owner for each opening balance. |
+| T016 | Data Foundation | Create primary product ID concept | High |  | Ask Mike whether AutoCount ItemCode can change and whether it should be stable bridge key. |
+| T013 | Migration Prep | Confirm opening accounting balances | High |  | Confirm bank opening, GL opening, AR/AP opening, stock value, GST/FX, supplier prepayment/goods-in-transit treatment. |
 
 ## Quick Wins (Effort 1)
 
@@ -28,7 +28,13 @@
 
 ## Blocked / Waiting Tasks
 
-*No data available.*
+| TaskID | Task | ReadyStatus | BlockedBy | Notes |
+| --- | --- | --- | --- | --- |
+| T007 | Prepare stock master list | Waiting | T003 |  |
+| T019 | Build stock upload generator | Waiting | T003,T018,T016 | Start after Mike confirms required fields and quantity workflow. |
+| T020 | Build stock upload exception report | Waiting | T019 |  |
+| T022 | Create export archive structure | Waiting | T068 |  |
+| T025 | Create goods-in-transit tracker | Waiting | T013 | Mike said Outstanding PO Listing can track stock in transit. Accounting treatment still not confirmed. |
 
 ## Tasks with Stale Status / Suggested Status
 
@@ -42,17 +48,18 @@
 
 | TaskID | Category | Task | RankScore | Priority | Effort | Status |
 | --- | --- | --- | --- | --- | --- | --- |
+| T003 | Migration Prep | Confirm 6 migration templates | 3175 | High |  | In Progress |
 | T002 | Migration Prep | Confirm AutoCount 2.0 module scope | 3150 | High |  | In Progress |
-| T003 | Migration Prep | Confirm 6 migration templates | 3150 | High |  | In Progress |
 | T006 | Migration Prep | Prepare Brendan finance data-source call | 3150 | High |  | In Progress |
 | T016 | Data Foundation | Create primary product ID concept | 3150 | High |  | In Progress |
+| T013 | Migration Prep | Confirm opening accounting balances | 3025 | High |  | Not Started |
+| T019 | Automation | Build stock upload generator | 3025 | High |  | Not Started |
+| T068 | Architecture | Investigate AutoCount export/API/SQL access | 3025 | High |  | Not Started |
 | T007 | Migration Prep | Prepare stock master list | 3000 | High |  | Not Started |
 | T008 | Migration Prep | Prepare customer/debtor master list | 3000 | High |  | Not Started |
 | T009 | Migration Prep | Prepare supplier/creditor master list | 3000 | High |  | Not Started |
 | T010 | Migration Prep | Prepare Chart of Accounts draft | 3000 | High |  | Not Started |
 | T012 | Migration Prep | Confirm POS edge case handling | 3000 | High |  | Not Started |
-| T013 | Migration Prep | Confirm opening accounting balances | 3000 | High |  | Not Started |
-| T019 | Automation | Build stock upload generator | 3000 | High |  | Not Started |
 | T020 | Automation | Build stock upload exception report | 3000 | High |  | Not Started |
 | T021 | Data Foundation | Create data dictionary | 3000 | High |  | Not Started |
 | T022 | Data Foundation | Create export archive structure | 3000 | High |  | Not Started |
@@ -69,7 +76,6 @@
 | T065 | Stabilisation | Create POS closing checklist | 3000 | High |  | Not Started |
 | T066 | Stabilisation | Create daily sales report archive | 3000 | High |  | Not Started |
 | T067 | Architecture | Define read-only automation rule | 3000 | High |  | Not Started |
-| T068 | Architecture | Investigate AutoCount export/API/SQL access | 3000 | High |  | Not Started |
 | T059 | Data Foundation | Create weekly achievement update habit | 2150 | Medium |  | In Progress |
 | T070 | Reporting | Generate GitHub dashboard from tracker | 2150 | Medium |  | In Progress |
 | T011 | Migration Prep | Prepare channel pricing tiers | 2000 | Medium |  | Not Started |
@@ -169,7 +175,7 @@
 | T004 | 4 | Migration Prep | Add stock-in-transit questions | Clarify how paid-but-not-received goods, supplier prepayments, PO, AP, and GRN should be handled. | Done | High |  |  |  |
 | T005 | 5 | Migration Prep | Add parallel run questions | Clarify whether AutoCount 1.0 and 2.0 run in parallel, what is keyed twice, and what reports are compared. | Done | High |  |  |  |
 | T006 | 6 | Migration Prep | Prepare Brendan finance data-source call | Map Mike's required accounting data to Brendan/finance/accountant sources and owners. | In Progress | High |  |  |  |
-| T007 | 7 | Migration Prep | Prepare stock master list | Prepare item/product master data for migration and vendor review. | Not Started | High |  |  |  |
+| T007 | 7 | Migration Prep | Prepare stock master list | Prepare item/product master data for migration and vendor review. | Not Started | High | T003 |  |  |
 | T008 | 8 | Migration Prep | Prepare customer/debtor master list | Prepare customer/debtor data for migration, especially wholesale, Metro, corporate, and Gebiz customers. | Not Started | High |  |  |  |
 | T009 | 9 | Migration Prep | Prepare supplier/creditor master list | Prepare supplier/creditor data including local/overseas suppliers, terms, currency, and contacts. | Not Started | High |  |  |  |
 | T010 | 10 | Migration Prep | Prepare Chart of Accounts draft | Coordinate with Brendan/Lik/accountant to prepare accounting buckets before using accounting module. | Not Started | High |  |  |  |
@@ -181,13 +187,13 @@
 | T016 | 16 | Data Foundation | Create primary product ID concept | Define InternalProductID / PrimarySKU / AutoCountItemCode roles so SKU changes do not break reports. | In Progress | High |  |  |  |
 | T017 | 17 | Data Foundation | Create new stock input template | Make stock upload simple: upload guy keys SKU, qty, location, PO/ref, remarks only. | Done | High |  |  |  |
 | T018 | 18 | Automation | Create AutoCount stock item copy-paste template | Create exact 24-column output format matching AutoCount Stock Item import/copy-paste screen. | Done | High |  |  |  |
-| T019 | 19 | Automation | Build stock upload generator | Generate AutoCount-ready rows from master legend + new stock input file. | Not Started | High |  |  |  |
-| T020 | 20 | Automation | Build stock upload exception report | Flag missing SKU, inactive product, invalid qty, invalid location, missing AutoCount item code. | Not Started | High |  |  |  |
+| T019 | 19 | Automation | Build stock upload generator | Generate AutoCount-ready rows from master legend + new stock input file. | Not Started | High | T003,T018,T016 |  |  |
+| T020 | 20 | Automation | Build stock upload exception report | Flag missing SKU, inactive product, invalid qty, invalid location, missing AutoCount item code. | Not Started | High | T019 |  |  |
 | T021 | 21 | Data Foundation | Create data dictionary | Document fields from AutoCount, SiteGiant, marketplace exports, and internal templates. | Not Started | High |  |  |  |
-| T022 | 22 | Data Foundation | Create export archive structure | Set up folders/naming rules for daily/weekly/hourly exports from AutoCount, SiteGiant, marketplaces, and payment rails. | Not Started | High |  |  |  |
+| T022 | 22 | Data Foundation | Create export archive structure | Set up folders/naming rules for daily/weekly/hourly exports from AutoCount, SiteGiant, marketplaces, and payment rails. | Not Started | High | T068 |  |  |
 | T023 | 23 | Operations | Create product master cleanup checker | Check missing brand, category, barcode, UOM, cost, price, duplicate SKU, and inactive items. | Not Started | High |  |  |  |
 | T024 | 24 | Operations | Shipment upload to PO/product update workflow | Take shipment details and prepare process for PO creation, new product creation, existing stock update, and price-change flag. | Not Started | High |  |  |  |
-| T025 | 25 | Operations | Create goods-in-transit tracker | Track PO, supplier payment, shipment ETA, packing list, GRN, landed cost, and closure. | Not Started | High |  |  |  |
+| T025 | 25 | Operations | Create goods-in-transit tracker | Track PO, supplier payment, shipment ETA, packing list, GRN, landed cost, and closure. | Not Started | High | T013 |  |  |
 | T026 | 26 | Operations | Create pre-order ETA tracker | Track ETA of pre-order stock and alert staff before/after expected arrival. | Not Started | Medium |  |  |  |
 | T027 | 27 | Operations | Create warehouse GRN scan/discrepancy tracker | Compare scanned goods received at warehouse against PO and support rectify now / rectify later flow. | Not Started | High |  |  |  |
 | T028 | 28 | Operations | Create goods disbursement workflow by channel | Use goods received data to disburse stock to MG, Online, Warehouse, JBM, or other locations. | Not Started | High |  |  |  |

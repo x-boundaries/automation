@@ -1,0 +1,10 @@
+Date,DecisionID,Area,Decision,Source,Owner,Status,FollowUp
+2026-05-12,D001,Migration templates,Debtor/Creditor templates are for existing trade customers/suppliers.,Mike WhatsApp,Wei Jun,Confirmed by Mike,Confirm mandatory fields.
+2026-05-12,D002,Opening stock,Stock Item Opening template requires opening qty and cost by item/location.,Mike WhatsApp,Wei Jun,Confirmed by Mike,Confirm same as Import Stock Open Bal.
+2026-05-12,D003,AR/AP opening,AR/AP Invoice templates are for outstanding customer/supplier opening balances.,Mike WhatsApp,Wei Jun,Confirmed by Mike,Confirm required fields and cutover date.
+2026-05-12,D004,Data ownership,X-Boundaries prepares all Excel data.,Mike WhatsApp,Wei Jun,Confirmed by Mike,Assign internal owners.
+2026-05-12,D005,Test import,X-Boundaries can provide sample data first for test import before full migration.,Mike WhatsApp,Wei Jun,Confirmed by Mike,Confirm sandbox and rollback.
+2026-05-12,D006,CoA,CoA can use system default or accountant-provided CoA; account codes/info keyed manually by user.,Mike WhatsApp,Brendan / accountant,Needs internal decision,Decide CoA owner and source.
+2026-05-12,D007,Full accounts,Full accounts require bank opening balances and GL account opening balances.,Mike WhatsApp,Brendan / accountant,Confirmed by Mike,Prepare balances and sign-off.
+2026-05-13,D008,Stock in transit,Outstanding PO Listing can be used to track stock in transit.,Mike WhatsApp,Ops + finance,Partially confirmed,Confirm accounting treatment.
+2026-05-12,D009,Automation reference,Mike shared AutoCount Programmer and Integration Methods wiki links.,Mike WhatsApp,Wei Jun,Reference only,Confirm approved integration method/licence.
