@@ -86,16 +86,8 @@ def main():
         today_content
     ]
 
-    if stale_status:
-        md.append("## Tasks Needing Status Review\n")
-        md.append(generate_markdown_table(
-            stale_status,
-            ["TaskID", "Task", "Current Status", "Suggested Status"],
-            ["TaskID", "Task", "Status", "StatusSuggestion"]
-        ))
-
     md.extend([
-        "## Partial/Uncovered Source Items\n",
+        "\n## Partial/Uncovered Source Items\n",
         generate_markdown_table(
             partial_coverage,
             ["Source", "Request / Wishlist Item", "Covered in tracker task(s)", "Coverage"],

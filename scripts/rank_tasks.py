@@ -25,25 +25,31 @@ def rank_tasks():
     for t in tasks:
         deps = [d.strip() for d in t.get('DependsOn', '').split(',') if d.strip()]
 
-        is_blocked = False
-        blocked_by = []
-        for d in deps:
-            if d in task_dict and task_dict[d]['Status'] not in ['Done', 'Parked']:
-                is_blocked = True
-                blocked_by.append(d)
+        status = t.get('Status', 'Unknown')
 
-        # Only override ReadyStatus if it's currently empty or Ready, but dependencies aren't met
-        if is_blocked and t.get('ReadyStatus') not in ['Blocked', 'Waiting']:
-             t['ReadyStatus'] = 'Waiting'
-             if not t.get('BlockedBy'):
-                 t['BlockedBy'] = ",".join(blocked_by)
-        elif not is_blocked and t.get('ReadyStatus') not in ['Blocked', 'Waiting']:
-             t['ReadyStatus'] = 'Ready'
+        if status == 'Done':
+            t['ReadyStatus'] = 'Done'
+        elif status == 'Parked':
+            t['ReadyStatus'] = 'Parked'
+        else:
+            is_blocked = False
+            blocked_by = []
+            for d in deps:
+                if d in task_dict and task_dict[d]['Status'] not in ['Done', 'Parked']:
+                    is_blocked = True
+                    blocked_by.append(d)
+
+            # Only override ReadyStatus if it's currently empty or Ready, but dependencies aren't met
+            if is_blocked and t.get('ReadyStatus') not in ['Blocked', 'Waiting']:
+                 t['ReadyStatus'] = 'Waiting'
+                 if not t.get('BlockedBy'):
+                     t['BlockedBy'] = ",".join(blocked_by)
+            elif not is_blocked and t.get('ReadyStatus') not in ['Blocked', 'Waiting']:
+                 t['ReadyStatus'] = 'Ready'
 
         # Ranking logic
         score = 0
 
-        status = t.get('Status', 'Unknown')
         if status in ['Done', 'Parked']:
             score = 0
         else:
@@ -123,7 +129,7 @@ def generate_today_md(tasks):
         md.append("*No blocked or waiting tasks.*\n")
 
     if stale_status:
-        md.append("\n## 🔎 Tasks Needing Status Review")
+        md.append("## 🔎 Tasks Needing Status Review")
         for t in stale_status:
             md.append(f"- **[{t['TaskID']}] {t['Task']}** - Suggested: *{t.get('StatusSuggestion', '')}*")
 
