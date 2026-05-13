@@ -99,8 +99,8 @@ def main():
         if not tid: continue
         depends_on = [x.strip() for x in t.get('DependsOn', '').split(';') if x.strip()]
         for req in depends_on:
+            prereqs[tid].append(req)
             if req in task_map:
-                prereqs[tid].append(req)
                 dependents[req].append(tid)
 
     # Calculate unlock count
@@ -129,7 +129,8 @@ def main():
         incomplete_prereqs = []
         for req in prereqs.get(tid, []):
             req_task = task_map.get(req)
-            if req_task and req_task.get('Status') != 'Done':
+            # Treat unknown/missing task as an incomplete prerequisite
+            if not req_task or req_task.get('Status') != 'Done':
                 incomplete_prereqs.append(req)
 
         if incomplete_prereqs:

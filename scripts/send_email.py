@@ -46,6 +46,8 @@ def send_email():
         print(f"Failed to send email: {e}")
         # The prompt says: "either skip email gracefully or fail with a clear message explaining which secrets are missing."
         # If we reached here, credentials were provided but connection/login failed.
+        import sys
+        sys.exit(1)
 
 if __name__ == '__main__':
     send_email()
