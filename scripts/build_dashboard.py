@@ -83,13 +83,18 @@ def main():
         f"*Last generated: {now_utc}*\n",
         "## Summary Metrics\n",
         summary_metrics_table,
-        today_content,
-        "## Tasks Needing Status Review\n",
-        generate_markdown_table(
+        today_content
+    ]
+
+    if stale_status:
+        md.append("## Tasks Needing Status Review\n")
+        md.append(generate_markdown_table(
             stale_status,
             ["TaskID", "Task", "Current Status", "Suggested Status"],
             ["TaskID", "Task", "Status", "StatusSuggestion"]
-        ),
+        ))
+
+    md.extend([
         "## Partial/Uncovered Source Items\n",
         generate_markdown_table(
             partial_coverage,
@@ -103,7 +108,7 @@ def main():
             ["TaskID", "Category", "Task", "Status", "Priority", "ReadyStatus", "DependsOn", "Effort", "NextAction", "BlockedBy"]
         ),
         "<!-- GENERATED CONTENT END -->"
-    ]
+    ])
 
     dashboard_content = "\n".join(md)
 
