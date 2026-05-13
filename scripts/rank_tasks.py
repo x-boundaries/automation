@@ -162,8 +162,11 @@ def main():
 
     # 5. Adjust RankScore so prerequisites rank higher than dependents
     changed = True
-    while changed:
+    iterations = 0
+    max_iterations = 1000
+    while changed and iterations < max_iterations:
         changed = False
+        iterations += 1
         for t in tasks:
             tid = t.get('TaskID')
             if not tid or t['ReadyStatus'] in ['Done', 'Parked']: continue
