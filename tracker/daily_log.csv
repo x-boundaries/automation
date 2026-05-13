@@ -1,1 +1,2 @@
 Date,TaskID,WhatIDid,Evidence,TimeSpentMinutes,Confidence,SuggestedStatus,Notes
+2026-05-13,T003,"Captured Mike replies on Debtor/Creditor, Stock Item Opening, AR/AP Invoice templates, CoA, bank/GL balances, sample test import, and Outstanding PO Listing.","Mike WhatsApp replies 12/05-13/05",30,High,"In Progress","Partial confirmations only; mandatory fields/import sequence/rollback still open."
