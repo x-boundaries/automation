@@ -112,8 +112,8 @@
   - Where should internal product ID live?
   - Can duplicate SKU/barcode be prevented?
 
-- [x] Confirmed / clarified by Mike:
-  - (No replies yet)
+- [ ] Confirmed / clarified by Mike:
+  - No confirmation yet.
 
 - [ ] Pending confirmation:
   - SKU identity behaviour and ItemCode stability.
@@ -179,8 +179,8 @@
 - [ ] What is needed?
   - Explicit `do not touch` rules before migration (e.g., template headers, manual item creation, CoA changes).
 
-- [x] Confirmed / clarified by Mike:
-  - (No replies yet)
+- [ ] Confirmed / clarified by Mike:
+  - No confirmation yet.
 
 - [ ] Pending confirmation:
   - Rules on what to avoid.

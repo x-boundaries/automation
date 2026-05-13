@@ -66,6 +66,9 @@ def main():
     logs.sort(key=lambda x: x.get('Date', ''), reverse=True)
     recent_logs = logs[:10]
 
+    # Stale status subset - exclude items where suggestion is the same as current status
+    stale_status = [t for t in tasks if t.get('StatusSuggestion') and t.get('StatusSuggestion') != 'No Change' and t.get('StatusSuggestion') != t.get('Status')]
+
     # Read today.md content
     today_content = "*`dashboard/today.md` is missing. Please run `python scripts/rank_tasks.py` to generate the daily action plan.*"
     if today_md_file.exists():
@@ -81,6 +84,12 @@ def main():
         "## Summary Metrics\n",
         summary_metrics_table,
         today_content,
+        "## Tasks Needing Status Review\n",
+        generate_markdown_table(
+            stale_status,
+            ["TaskID", "Task", "Current Status", "Suggested Status"],
+            ["TaskID", "Task", "Status", "StatusSuggestion"]
+        ),
         "## Partial/Uncovered Source Items\n",
         generate_markdown_table(
             partial_coverage,
