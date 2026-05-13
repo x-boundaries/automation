@@ -34,10 +34,12 @@ def send_email():
 
     try:
         port = int(smtp_port)
-        # Use starttls if typical, or SSL depending on port. We'll try starttls as a default approach.
-        # But wait, python smtplib is pretty standard:
-        server = smtplib.SMTP(smtp_host, port)
-        server.starttls()
+        if port == 465:
+            server = smtplib.SMTP_SSL(smtp_host, port)
+        else:
+            server = smtplib.SMTP(smtp_host, port)
+            server.starttls()
+
         server.login(smtp_user, smtp_pass)
         server.send_message(msg)
         server.quit()

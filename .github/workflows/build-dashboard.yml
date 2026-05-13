@@ -49,5 +49,5 @@ jobs:
           SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
           EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
-          EMAIL_TO: "weijun.seh@x-boundaries.com"
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
         run: python scripts/send_email.py
