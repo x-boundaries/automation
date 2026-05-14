@@ -98,6 +98,8 @@ Before sending any production import file to Mike / Ingenious, the export should
 - `IncomingQty` must be numeric and greater than zero where quantity is used.
 - `Location` must match confirmed AutoCount location codes.
 - Required AutoCount fields must not be blank once Mike confirms mandatory columns.
+- Confirm whether the SKU already exists in AutoCount 2.0 before importing stock quantity.
+- If the SKU does not exist in AutoCount 2.0, confirm whether the import will auto-create the item or whether the item master must be created first.
 - Character length limits must be checked before export:
   - `ItemCode`: 30 chars.
   - `Description`: 100 chars.
@@ -113,6 +115,7 @@ Before sending any production import file to Mike / Ingenious, the export should
 - Do not import rows with `LeadTime = ???`.
 - Do not assume `0`, blank, or text is safe for LeadTime until Mike confirms.
 - Do not mix item master import and opening stock quantity import unless Mike confirms the exact workflow.
+- Do not assume incoming stock can be imported for a new SKU before AutoCount confirms whether that SKU has already been created.
 
 ---
 
@@ -150,7 +153,7 @@ Practical working assumption until Mike confirms:
 
 | Template | Working assumption | Risk |
 |---|---|---|
-| `Import Stock Item` | Likely creates stock item master records and may possibly update item master fields. | Need confirm create/update behaviour and safe key. |
+| `Import Stock Item` | Likely creates stock item master records and may possibly update item master fields. | Need confirm create/update behaviour, safe key, and whether import can auto-add a new SKU. |
 | `Import Stock Open Bal` / `Stock Item Opening` | Likely one-time cutover opening stock quantity/cost. | Should not be used casually after go-live unless Mike confirms. |
 | `Import Debtor` | Likely customer master import. | Need confirm reusable after go-live. |
 | `Import Creditor` | Likely supplier master import. | Need confirm reusable after go-live. |
@@ -179,6 +182,10 @@ For each template, please confirm whether it is one-time migration only or safe 
 - Is it create-only or can it update existing items?
 - If update is allowed, what key does AutoCount use?
 - Can a wrong stock item import be reversed, deleted, or corrected?
+- When new stock is coming in, how do we check whether the SKU has already been created in AutoCount 2.0?
+- If the incoming stock SKU is new and does not exist in AutoCount 2.0 yet, will `Import Stock Item` auto-create it, or must X-Boundaries create the item master first?
+- If a stock opening / stock quantity import row uses a SKU that does not exist yet, will AutoCount reject the row, auto-create the item, or create an error report?
+- What is the safest workflow for a new SKU: check existing AutoCount item first, create item master, then import opening/incoming stock?
 
 ### LeadTime
 
@@ -223,6 +230,7 @@ Recommended tracker interpretation:
 
 - Do not import production rows until Mike confirms the mandatory fields and import sequence.
 - Do not use stock opening import after go-live unless Mike confirms it is safe.
+- Do not import incoming stock for a SKU until AutoCount confirms whether that SKU already exists or can be auto-created through import.
 - Do not overwrite SKU history.
 - Do not treat marketplace SKU as permanent product identity.
 - Keep `InternalProductID` permanent.
@@ -243,4 +251,6 @@ Preferred test set:
 - One product with blank LeadTime.
 - One product with `LeadTime = 0`.
 - One product with `LeadTime = 30`.
+- One SKU that already exists in AutoCount 2.0, to confirm update/create behaviour.
+- One new SKU that does not exist in AutoCount 2.0 yet, to confirm whether import auto-creates or rejects it.
 - One intentionally unmatched SKU to confirm exception handling catches it before export.
