@@ -286,6 +286,41 @@ X-Boundaries has internal Google Sheets prepared for the stock import workflow. 
 - `InternalProductID` is a permanent internal ID and probably should not enter AutoCount unless Mike confirms a safe field.
 - Old/changed SKUs should be tracked in `SKU_History`, not overwritten.
 
+Current stock input fields include:
+| Field | Purpose |
+|---|---|
+| `LineNo` | Input row number / traceability. |
+| `VendorSKU` | User-entered SKU or supplier SKU to match against master data. |
+| `IncomingQty` | Incoming quantity. |
+| `Location` | Target stock location. |
+| `PORef` | PO or shipment reference. |
+| `Remarks` | Free-text notes. |
+| `LookupKey` | Generated lookup key. |
+| `MatchCount` | Number of master matches found. |
+| `MatchStatus` | Match result, such as `OK` or `NOT FOUND`. |
+
+Current AutoCount stock output fields include:
+| AutoCount output field | Current source / default |
+|---|---|
+| `InternalProductID` | From master. |
+| `ItemCode (30 chars)` | `PrimarySKU`. |
+| `Description (100 chars)` | `ProductDescription`. |
+| `Desc2 (100 chars)` | `Style Name`. |
+| `ItemGroup (8 chars)` | Pending default / Mike confirmation. |
+| `ItemType (12 chars)` | Pending default / Mike confirmation. |
+| `ItemBrand (20 chars)` | `Brand`. |
+| `ItemCategory (20 chars)` | `Vendor`. |
+| `ItemClass (20 chars)` | `Category`. |
+| `LeadTime (40 chars)` | Pending. Do not leave `???` in production import. |
+| `StockControl` | `T`. |
+| `UOM (8 chars)` | `UOM`, commonly `PCS` for sample rows. |
+| `Rate (Decimal)` | `Rate`. |
+| `Price (Decimal)` | `Price`. |
+| `Cost (Decimal)` | `Cost`. |
+| Min/max sale/purchase price fields | Current default `0`, pending confirmation. |
+| Min/Max/Normal/Reorder quantity fields | Current default `0`, pending confirmation. |
+| `BarCode (30 chars)` | Pending barcode policy. |
+
 ### Key question:
 
 - Which of these must be clean before migration, and which can be cleaned after go-live?
