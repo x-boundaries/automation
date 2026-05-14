@@ -1,7 +1,7 @@
 # AutoCount 2.0 Stock Import Automation Notes
 
-**Date:** 2026-05-14  
-**Area:** Migration preparation / stock import automation  
+**Date:** 2026-05-14
+**Area:** Migration preparation / stock import automation
 **Status:** Prepared internally; not ready for production import until Mike / Ingenious confirms open rules.
 
 ---
