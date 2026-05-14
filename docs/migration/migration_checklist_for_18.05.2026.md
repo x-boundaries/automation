@@ -180,14 +180,21 @@ For each template, please confirm:
   - Used for creation only?
   - Can it update existing items after go-live?
   - Will this be used for future stock importing?
+- [ ] Is `Import Stock Item` item master only, or can it affect stock quantity?
+- [ ] Can `Import Stock Item` update existing items after go-live?
+- [ ] If update is allowed, what key does AutoCount use?
 - [ ] When new stock is coming in, how do we check whether the SKU has already been created in AutoCount 2.0?
 - [ ] If the incoming stock SKU is new and does not exist in AutoCount 2.0 yet, will `Import Stock Item` auto-create it, or must X-Boundaries create the item master first?
 - [ ] If a stock opening / stock quantity import row uses a SKU that does not exist yet, will AutoCount reject the row, auto-create the item, or create an error report?
 - [ ] What is the safest workflow for a new SKU: check existing AutoCount item first, create item master, then import opening/incoming stock?
 - [ ] What are the compulsory columns for each template?
 - [ ] What are the optional columns for each template?
+- [ ] What are the mandatory columns for `Import Stock Item`?
+- [ ] What are the mandatory columns for `Import Stock Open Bal` / `Stock Item Opening`?
 - [ ] Can Mike provide one sample completed row for each template?
 - [ ] If imported wrongly, can each template import be reversed, deleted, or corrected?
+- [ ] Is `Stock Item Opening` the same thing as `Import Stock Open Bal`?
+- [ ] Can a wrong stock item import be reversed, deleted, or corrected?
 
 ---
 
@@ -252,6 +259,32 @@ Do not assume this order is correct. Ingenious confirmation is required.
 | Locations | Confirm HQ, XB01, XB02, XB03, XB04. |
 | Payment methods | Cash, NETS, credit card, PayNow, GrabPay, AliPay, etc. |
 | Price lists | Do we need channel pricing tiers before go-live? |
+
+### Internal Source Sheets (for stock import):
+
+X-Boundaries has internal Google Sheets prepared for the stock import workflow. The working sheets should remain private, but the important source/master fields are:
+- `InternalProductID`
+- `PrimarySKU`
+- `ProductDescription`
+- `Vendor`
+- `Brand`
+- `Category`
+- `Style Name`
+- `Style Number`
+- `Size`
+- `Colour`
+- `Gender`
+- `Price`
+- `Cost`
+- `UOM`
+- `Rate`
+- `LookupKey`
+- `IsActive`
+- `ActiveLookupKey`
+
+- `PrimarySKU` is intended to be the AutoCount `ItemCode`.
+- `InternalProductID` is a permanent internal ID and probably should not enter AutoCount unless Mike confirms a safe field.
+- Old/changed SKUs should be tracked in `SKU_History`, not overwritten.
 
 ### Key question:
 
@@ -410,6 +443,15 @@ We need our own stable primary product key so product history, stock, sales repo
 - Can item codes be locked so normal users cannot accidentally change them?
 - Is there a recommended AutoCount structure for products with changing channel SKUs?
 
+### Internal decision:
+
+- X-Boundaries will use the same SKU across platforms where practical.
+- `PrimarySKU` is the shared platform SKU and should be imported into AutoCount as ItemCode.
+- `InternalProductID` remains the permanent internal product identity, likely outside AutoCount.
+- AutoCount probably does not need `InternalProductID`.
+- `SKU_History` will hold old/changed SKU aliases if SKU changes later.
+- Future web app expansion is parked for later.
+
 ### Key question:
 
 - What is the safest product identity structure for us before migration, assuming SKUs may change later?
@@ -419,6 +461,8 @@ We need our own stable primary product key so product history, stock, sales repo
 If AutoCount fields are too limited, we will keep our own master mapping legend outside AutoCount.
 
 Need confirmation on:
+- Can AutoCount 2.0 ItemCode / SKU be changed safely after item creation?
+- If not, X-Boundaries will rely on `SKU_History` outside AutoCount for SKU changes.
 - Which AutoCount field should be used as the stable bridge key.
 - Which AutoCount exports we can use to refresh our mapping legend.
 - Whether copy-paste Excel import can update/create items safely using this bridge key.
@@ -707,6 +751,16 @@ Do not spend days cleaning a huge Excel file before confirming the format works.
 - [ ] Can wrong test imports be deleted/reversed?
 - [ ] Can we test 5-10 sample rows for each template before preparing full files?
 
+### Test cases to ensure:
+- One normal active product.
+- One product with long description near character limit.
+- One product with blank `LeadTime`.
+- One product with `LeadTime = 0`.
+- One product with `LeadTime = 30`.
+- One SKU that already exists in AutoCount 2.0, to confirm update/create behaviour.
+- One new SKU that does not exist in AutoCount 2.0 yet, to confirm whether import auto-creates or rejects it.
+- One intentionally unmatched SKU to confirm exception handling catches it before export.
+
 ---
 
 # 9. Confirm what NOT to do
@@ -736,6 +790,15 @@ Avoid creating migration problems by accident.
 - [ ] Avoid changing ItemCode after setup?
 - [ ] Avoid changing CoA after opening balances?
 - [ ] Any other `do not touch` rules?
+
+### Guardrails:
+- Do not import production rows until Mike confirms mandatory fields and import sequence.
+- Do not use stock opening import after go-live unless Mike confirms it is safe.
+- Do not import incoming stock for a SKU until AutoCount confirms whether that SKU already exists or can be auto-created through import.
+- Do not leave `LeadTime = ???` in production import.
+- Do not assume blank, `0`, or text is safe for `LeadTime` until Mike confirms.
+- Do not overwrite SKU history.
+- Keep real operational data out of GitHub.
 
 ---
 
@@ -821,6 +884,12 @@ Use this if time is short. Ask only what blocks migration and go-live.
 - [ ] API / export / SQL availability for future automation.
 - [ ] Whether API Module or other licence is needed for automation.
 - [ ] New SKU import behaviour: whether missing SKUs are rejected, auto-created, or must be created in item master first.
+
+### Stock import blockers:
+- [ ] Mandatory fields for `Import Stock Item`.
+- [ ] Mandatory fields for `Import Stock Open Bal` / `Stock Item Opening`.
+- [ ] Whether `Import Stock Item` is reusable after go-live.
+- [ ] Whether `LeadTime` is mandatory and what value to use if unknown.
 
 ### Do not over-focus yet
 
