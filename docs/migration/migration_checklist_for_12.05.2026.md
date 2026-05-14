@@ -180,6 +180,10 @@ For each template, please confirm:
   - Used for creation only?
   - Can it update existing items after go-live?
   - Will this be used for future stock importing?
+- [ ] When new stock is coming in, how do we check whether the SKU has already been created in AutoCount 2.0?
+- [ ] If the incoming stock SKU is new and does not exist in AutoCount 2.0 yet, will `Import Stock Item` auto-create it, or must X-Boundaries create the item master first?
+- [ ] If a stock opening / stock quantity import row uses a SKU that does not exist yet, will AutoCount reject the row, auto-create the item, or create an error report?
+- [ ] What is the safest workflow for a new SKU: check existing AutoCount item first, create item master, then import opening/incoming stock?
 - [ ] What are the compulsory columns for each template?
 - [ ] What are the optional columns for each template?
 - [ ] Can Mike provide one sample completed row for each template?
@@ -816,6 +820,7 @@ Use this if time is short. Ask only what blocks migration and go-live.
 - [ ] Import error checking and rollback process.
 - [ ] API / export / SQL availability for future automation.
 - [ ] Whether API Module or other licence is needed for automation.
+- [ ] New SKU import behaviour: whether missing SKUs are rejected, auto-created, or must be created in item master first.
 
 ### Do not over-focus yet
 
