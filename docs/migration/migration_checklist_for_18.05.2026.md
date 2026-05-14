@@ -173,16 +173,11 @@ For each template, please confirm:
 - [x] Sample data can be provided first for test import.
 
 ### Still pending / ask Mike
-
-- [ ] Is `Stock Item Opening` the same thing as `Import Stock Open Bal`?
 - [ ] What exactly is `Import Stock Item` for?
-  - Item master only?
+  - Item master only, or can it affect stock quantity?
   - Used for creation only?
-  - Can it update existing items after go-live?
+  - Can it update existing items after go-live? If update is allowed, what key does AutoCount use?
   - Will this be used for future stock importing?
-- [ ] Is `Import Stock Item` item master only, or can it affect stock quantity?
-- [ ] Can `Import Stock Item` update existing items after go-live?
-- [ ] If update is allowed, what key does AutoCount use?
 - [ ] When new stock is coming in, how do we check whether the SKU has already been created in AutoCount 2.0?
 - [ ] If the incoming stock SKU is new and does not exist in AutoCount 2.0 yet, will `Import Stock Item` auto-create it, or must X-Boundaries create the item master first?
 - [ ] If a stock opening / stock quantity import row uses a SKU that does not exist yet, will AutoCount reject the row, auto-create the item, or create an error report?
@@ -194,7 +189,6 @@ For each template, please confirm:
 - [ ] Can Mike provide one sample completed row for each template?
 - [ ] If imported wrongly, can each template import be reversed, deleted, or corrected?
 - [ ] Is `Stock Item Opening` the same thing as `Import Stock Open Bal`?
-- [ ] Can a wrong stock item import be reversed, deleted, or corrected?
 
 ---
 

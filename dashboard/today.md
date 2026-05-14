@@ -44,7 +44,7 @@
 - **[T020] Build stock upload exception report** - Suggested: *Keep In Progress*
 
 ## 📝 Recent Daily Log Entries
+- **2026-05-14 [T019]** - Synced inventory Google Sheets / stock upload generator progress into tracker and Monday migration checklist; merged stock import automation notes into the 18.05 Mike checklist.
 - **2026-05-14 [T019]** - Documented internal stock import automation flow, field mapping, validation rules, LeadTime uncertainty, repeat-use questions, and production guardrails.
 - **2026-05-14 [T016]** - Confirmed internal SKU identity direction: PrimarySKU will be shared across platforms and imported into AutoCount; InternalProductID remains internal/outside AutoCount; SKU_History handles future SKU changes.
-- **2026-05-14 [T019]** - Synced inventory Google Sheets / stock upload generator progress into tracker and Monday migration checklist; merged stock import automation notes into the 18.05 Mike checklist.
 - **2026-05-13 [T003]** - Captured Mike replies on Debtor/Creditor, Stock Item Opening, AR/AP Invoice templates, CoA, bank/GL balances, sample test import, and Outstanding PO Listing.
