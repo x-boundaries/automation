@@ -43,11 +43,11 @@ def rank_tasks():
                     blocked_by.append(d)
 
             # Only override ReadyStatus if it's currently empty or Ready, but dependencies aren't met
-            # If it's blocked by manual 'Blocked' setting, keep it.
-            if is_blocked and t.get('ReadyStatus') != 'Blocked':
+            # If it's blocked by manual 'Blocked' or 'Waiting' setting, keep it.
+            if is_blocked and t.get('ReadyStatus') not in ['Blocked', 'Waiting']:
                  t['ReadyStatus'] = 'Waiting'
                  t['BlockedBy'] = ",".join(blocked_by)
-            elif not is_blocked and t.get('ReadyStatus') != 'Blocked':
+            elif not is_blocked and t.get('ReadyStatus') not in ['Blocked', 'Waiting']:
                  t['ReadyStatus'] = 'Ready'
                  t['BlockedBy'] = ""
 
@@ -192,7 +192,7 @@ def generate_today_md(tasks):
         if recent_logs:
             md.append("\n## 📝 Recent Daily Log Entries")
             for log in recent_logs:
-                md.append(f"- **{log.get('Date', '')} [{log.get('TaskID', '')}]** - {log.get('Progress / Output', '')}")
+                md.append(f"- **{log.get('Date', '')} [{log.get('TaskID', '')}]** - {log.get('WhatIDid', '')}")
 
     Path('dashboard').mkdir(exist_ok=True)
     with open('dashboard/today.md', 'w', encoding='utf-8') as f:
