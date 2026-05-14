@@ -34,14 +34,17 @@
 - **[T007] Prepare stock master list** (Waiting) - Blocked by: T003
 - **[T010] Prepare Chart of Accounts draft** (Waiting) - Blocked by: Brendan/accountant CoA decision
 - **[T013] Confirm opening accounting balances** (Waiting) - Blocked by: Brendan/accountant + Mike accounting treatment confirmation
-- **[T019] Build stock upload generator** (Waiting) - Blocked by: T003,T018,T016
+- **[T019] Build stock upload generator** (Waiting) - Blocked by: T003,T016
 - **[T020] Build stock upload exception report** (Waiting) - Blocked by: T019
 - **[T022] Create export archive structure** (Waiting) - Blocked by: T068
 - **[T025] Create goods-in-transit tracker** (Waiting) - Blocked by: T013
 ## 🔎 Tasks Needing Status Review
 - **[T016] Create primary product ID concept** - Suggested: *Ready for Mike confirmation*
+- **[T019] Build stock upload generator** - Suggested: *Keep In Progress*
+- **[T020] Build stock upload exception report** - Suggested: *Keep In Progress*
 
 ## 📝 Recent Daily Log Entries
+- **2026-05-14 [T019]** - Synced inventory Google Sheets / stock upload generator progress into tracker and Monday migration checklist; merged stock import automation notes into the 18.05 Mike checklist.
 - **2026-05-14 [T019]** - Documented internal stock import automation flow, field mapping, validation rules, LeadTime uncertainty, repeat-use questions, and production guardrails.
 - **2026-05-14 [T016]** - Confirmed internal SKU identity direction: PrimarySKU will be shared across platforms and imported into AutoCount; InternalProductID remains internal/outside AutoCount; SKU_History handles future SKU changes.
 - **2026-05-13 [T003]** - Captured Mike replies on Debtor/Creditor, Stock Item Opening, AR/AP Invoice templates, CoA, bank/GL balances, sample test import, and Outstanding PO Listing.
