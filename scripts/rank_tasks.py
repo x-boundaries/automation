@@ -23,7 +23,7 @@ def rank_tasks():
     task_dict = {t['TaskID']: t for t in tasks}
 
     for t in tasks:
-        deps = [d.strip() for d in t.get('DependsOn', '').split(',') if d.strip()]
+        deps = [d.strip() for d in t.get('DependsOn', '').replace(';', ',').split(',') if d.strip()]
 
         status = t.get('Status', 'Unknown')
 
@@ -35,41 +35,86 @@ def rank_tasks():
             is_blocked = False
             blocked_by = []
             for d in deps:
-                if d in task_dict and task_dict[d]['Status'] not in ['Done', 'Parked']:
+                if d not in task_dict:
+                    is_blocked = True
+                    blocked_by.append(d)
+                elif task_dict[d]['Status'] not in ['Done', 'Parked']:
                     is_blocked = True
                     blocked_by.append(d)
 
             # Only override ReadyStatus if it's currently empty or Ready, but dependencies aren't met
-            if is_blocked and t.get('ReadyStatus') not in ['Blocked', 'Waiting']:
+            # If it's blocked by manual 'Blocked' setting, keep it.
+            if is_blocked and t.get('ReadyStatus') != 'Blocked':
                  t['ReadyStatus'] = 'Waiting'
-                 if not t.get('BlockedBy'):
-                     t['BlockedBy'] = ",".join(blocked_by)
-            elif not is_blocked and t.get('ReadyStatus') not in ['Blocked', 'Waiting']:
+                 t['BlockedBy'] = ",".join(blocked_by)
+            elif not is_blocked and t.get('ReadyStatus') != 'Blocked':
                  t['ReadyStatus'] = 'Ready'
+                 t['BlockedBy'] = ""
 
+    # Pre-calculate what tasks are unlocked by each task
+    unlocks = {}
+    for t in tasks:
+        deps = [d.strip() for d in t.get('DependsOn', '').replace(';', ',').split(',') if d.strip()]
+        for d in deps:
+            if d not in unlocks:
+                unlocks[d] = []
+            unlocks[d].append(t['TaskID'])
+
+    for t in tasks:
+        status = t.get('Status', 'Unknown')
         # Ranking logic
         score = 0
 
         if status in ['Done', 'Parked']:
             score = 0
         else:
-            # Base score by priority
+            # PriorityScore
             pri = t.get('Priority', 'Low')
             if pri == 'High': score += 3000
             elif pri == 'Medium': score += 2000
             else: score += 1000
 
-            # Boost if in progress
-            if status == 'In Progress':
-                score += 500
-
-            # Adjust by effort (lower effort = higher score, quick win bias)
+            # EaseScore
             effort = parse_effort(t.get('Effort', '5'))
-            score -= (effort * 10)
+            if effort == 1.0: score += 250
+            elif effort == 2.0: score += 200
+            elif effort == 3.0: score += 150
+            elif effort == 4.0: score += 100
+            else: score += 50
 
-            # Penalize if blocked/waiting
+            # StatusBonus
+            if status == 'In Progress':
+                score += 150
+
+            # UnlockBonus
+            # Find tasks this unlocks that are not done/parked
+            unlocked_tasks = unlocks.get(t['TaskID'], [])
+            active_unlocked = 0
+            for ut_id in unlocked_tasks:
+                if ut_id in task_dict and task_dict[ut_id]['Status'] not in ['Done', 'Parked']:
+                    active_unlocked += 1
+            unlock_bonus = min(250, active_unlocked * 25)
+            score += unlock_bonus
+
+            # UrgencyBonus
+            due_date_str = t.get('DueDate', '').strip()
+            if due_date_str:
+                try:
+                    due_date = datetime.datetime.strptime(due_date_str, '%Y-%m-%d').date()
+                    today_date = datetime.datetime.now(datetime.timezone.utc).date()
+                    days_until_due = (due_date - today_date).days
+                    if days_until_due <= 0:
+                        score += 300
+                    elif days_until_due <= 3:
+                        score += 200
+                    elif days_until_due <= 7:
+                        score += 100
+                except ValueError:
+                    pass
+
+            # Penalize if blocked/waiting so it doesn't show up top
             if t.get('ReadyStatus') in ['Blocked', 'Waiting']:
-                score -= 1000
+                score -= 5000
 
         t['RankScore'] = max(0, int(score))
 
@@ -132,6 +177,22 @@ def generate_today_md(tasks):
         md.append("## 🔎 Tasks Needing Status Review")
         for t in stale_status:
             md.append(f"- **[{t['TaskID']}] {t['Task']}** - Suggested: *{t.get('StatusSuggestion', '')}*")
+
+    # Recent daily log entries
+    daily_log_file = Path('tracker/daily_log.csv')
+    if daily_log_file.exists():
+        with open(daily_log_file, 'r', encoding='utf-8') as f:
+            log_reader = csv.DictReader(f)
+            logs = list(log_reader)
+
+        # Sort desc by date, get top 5
+        logs.sort(key=lambda x: x.get('Date', ''), reverse=True)
+        recent_logs = logs[:5]
+
+        if recent_logs:
+            md.append("\n## 📝 Recent Daily Log Entries")
+            for log in recent_logs:
+                md.append(f"- **{log.get('Date', '')} [{log.get('TaskID', '')}]** - {log.get('Progress / Output', '')}")
 
     Path('dashboard').mkdir(exist_ok=True)
     with open('dashboard/today.md', 'w', encoding='utf-8') as f:
