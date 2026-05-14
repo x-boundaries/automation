@@ -2,6 +2,7 @@ import os
 import sys
 import re
 import smtplib
+import html as html_lib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
@@ -69,6 +70,7 @@ def render_html_digest(markdown_text: str) -> str:
         # Date
         if line.startswith("**Date:**"):
             date_str = line.replace("**Date:**", "").strip()
+            date_str = html_lib.escape(date_str)
             html.append(f"<div class='date'>Date: {date_str}</div>")
             i += 1
             continue
@@ -76,7 +78,8 @@ def render_html_digest(markdown_text: str) -> str:
         # Reminder
         if line.startswith(">"):
             reminder_text = line.replace("> ", "").replace("⚠️", "").strip()
-            # simple bold replacement
+            reminder_text = html_lib.escape(reminder_text)
+            # simple bold replacement after escaping
             reminder_text = re.sub(r'\*\*(.*?)\*\*', r'<strong>\1</strong>', reminder_text)
             html.append(f"<div class='reminder'>⚠️ {reminder_text}</div>")
             i += 1
@@ -89,7 +92,9 @@ def render_html_digest(markdown_text: str) -> str:
             while i < len(lines) and lines[i].strip().startswith("- ["):
                 m = re.match(r'- \[(.*?)\]\((.*?)\)', lines[i].strip())
                 if m:
-                    html.append(f"<a href='{m.group(2)}' class='btn'>{m.group(1)}</a>")
+                    btn_text = html_lib.escape(m.group(1))
+                    btn_link = html_lib.escape(m.group(2))
+                    html.append(f"<a href='{btn_link}' class='btn'>{btn_text}</a>")
                 i += 1
             html.append("</div>")
             html.append("</div>") # close header
@@ -101,7 +106,8 @@ def render_html_digest(markdown_text: str) -> str:
             if in_section:
                 html.append("</div>") # close previous section
             in_section = line[3:].strip()
-            html.append(f"<div class='section'><div class='section-title'>{in_section}</div>")
+            in_section_escaped = html_lib.escape(in_section)
+            html.append(f"<div class='section'><div class='section-title'>{in_section_escaped}</div>")
             i += 1
             continue
 
@@ -110,8 +116,8 @@ def render_html_digest(markdown_text: str) -> str:
             # parse card
             m = re.match(r'^\d+\.\s+\*\*(.*?)\*\*\s+\((.*?)\)', line)
             if m:
-                task_title = m.group(1)
-                task_meta = m.group(2)
+                task_title = html_lib.escape(m.group(1))
+                task_meta = html_lib.escape(m.group(2))
                 html.append("<div class='card'>")
                 html.append(f"<div class='task-title'>{task_title}</div>")
 
@@ -126,6 +132,7 @@ def render_html_digest(markdown_text: str) -> str:
                     if subline.startswith("-"):
                         # remove bullet
                         subtext = subline[1:].strip()
+                        subtext = html_lib.escape(subtext)
                         # parse **Key:** Value
                         subtext = re.sub(r'\*\*(.*?)\*\*', r'<strong>\1</strong>', subtext)
                         html.append(f"<div class='task-detail'>{subtext}</div>")
@@ -136,13 +143,15 @@ def render_html_digest(markdown_text: str) -> str:
         # "No items" text
         if line.startswith("*") and line.endswith("*"):
             flush_list()
-            html.append(f"<div class='compact-list'><p>{line.strip('*')}</p></div>")
+            escaped_line = html_lib.escape(line.strip('*'))
+            html.append(f"<div class='compact-list'><p>{escaped_line}</p></div>")
             i += 1
             continue
 
         # Normal lists in other sections
         if in_section and line.startswith("-"):
             text = line[1:].strip()
+            text = html_lib.escape(text)
             text = re.sub(r'\*\*(.*?)\*\*', r'<strong>\1</strong>', text)
             text = re.sub(r'\*(.*?)\*', r'<em>\1</em>', text)
             list_items.append(text)
