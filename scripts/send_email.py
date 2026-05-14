@@ -21,13 +21,13 @@ def render_html_digest(markdown_text: str) -> str:
         ".date { color: #57606a; font-size: 14px; margin-bottom: 15px; }",
         ".reminder { background-color: #fff8c5; border: 1px solid #f0b429; border-radius: 6px; padding: 10px 15px; margin-bottom: 20px; font-size: 14px; }",
         ".buttons { margin-bottom: 20px; display: flex; gap: 10px; flex-wrap: wrap; }",
-        ".btn { display: inline-block; background-color: #0969da; color: #ffffff; text-decoration: none; padding: 5px 12px; border-radius: 6px; font-size: 14px; font-weight: 500; margin-right: 10px; margin-bottom: 5px; }",
+        ".btn { display: inline-block; background-color: #0969da; color: #ffffff !important; text-decoration: none !important; padding: 5px 12px; border-radius: 6px; font-size: 14px; font-weight: 700; margin-right: 10px; margin-bottom: 5px; }",
         ".section { margin-bottom: 20px; }",
         ".section-title { font-size: 18px; font-weight: bold; margin-bottom: 10px; border-bottom: 1px solid #d0d7de; padding-bottom: 5px; }",
         ".card { background-color: #ffffff; border: 1px solid #d0d7de; border-radius: 6px; padding: 15px; margin-bottom: 10px; }",
         ".task-title { font-weight: bold; margin-bottom: 5px; }",
         ".task-meta { color: #57606a; font-size: 12px; margin-bottom: 10px; }",
-        ".task-detail { font-size: 14px; margin-bottom: 5px; }",
+        ".task-detail { font-size: 14px; margin-bottom: 14px; }",
         ".task-detail strong { color: #24292f; }",
         ".compact-list { background-color: #ffffff; border: 1px solid #d0d7de; border-radius: 6px; padding: 15px; }",
         ".compact-list ul { margin: 0; padding-left: 20px; font-size: 14px; }",
@@ -94,7 +94,7 @@ def render_html_digest(markdown_text: str) -> str:
                 if m:
                     btn_text = html_lib.escape(m.group(1))
                     btn_link = html_lib.escape(m.group(2))
-                    html.append(f"<a href='{btn_link}' class='btn'>{btn_text}</a>")
+                    html.append(f"<a href='{btn_link}' class='btn' style='color:#ffffff !important; text-decoration:none !important;'>{btn_text}</a>")
                 i += 1
             html.append("</div>")
             html.append("</div>") # close header
@@ -131,11 +131,22 @@ def render_html_digest(markdown_text: str) -> str:
                     subline = lines[i].strip()
                     if subline.startswith("-"):
                         # remove bullet
-                        subtext = subline[1:].strip()
-                        subtext = html_lib.escape(subtext)
-                        # parse **Key:** Value
-                        subtext = re.sub(r'\*\*(.*?)\*\*', r'<strong>\1</strong>', subtext)
-                        html.append(f"<div class='task-detail'>{subtext}</div>")
+                        raw_subtext = subline[1:].strip()
+
+                        detail_match = re.match(r'\*\*(.*?)\*\*\s*(.*)', raw_subtext)
+                        if detail_match:
+                            label = html_lib.escape(detail_match.group(1).rstrip(":"))
+                            body = html_lib.escape(detail_match.group(2).strip())
+                        
+                            html.append(
+                                "<div class='task-detail'>"
+                                f"<div><strong>{label}:</strong></div>"
+                                f"<div style='margin-top:4px;'>{body}</div>"
+                                "</div>"
+                            )
+                        else:
+                            subtext = html_lib.escape(raw_subtext)
+                            html.append(f"<div class='task-detail'>{subtext}</div>")
                     i += 1
                 html.append("</div>")
                 continue
