@@ -6,9 +6,18 @@ on:
       - 'tracker/**'
       - 'scripts/**'
       - '.github/workflows/build-dashboard.yml'
+
   workflow_dispatch:
+
   schedule:
-    - cron: "0 0 * * 1-5"
+    # GitHub Actions schedules can be delayed/dropped at busy times.
+    # These are fallback attempts after the selected start time.
+    # 00:17 UTC = 08:17 SGT
+    # 00:37 UTC = 08:37 SGT
+    # 00:57 UTC = 08:57 SGT
+    # 01:17 UTC = 09:17 SGT
+    - cron: "17,37,57 0 * * 1-5"
+    - cron: "17 1 * * 1-5"
 
 permissions:
   contents: write
@@ -26,25 +35,43 @@ jobs:
         with:
           python-version: '3.11'
 
+      - name: Check if dashboard already generated today
+        id: once
+        run: |
+          TODAY=$(date -u +%F)
+
+          if grep -q "Last generated: $TODAY" README.md; then
+            echo "Dashboard already generated today."
+            echo "already_run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Dashboard has not been generated today."
+            echo "already_run=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Rank tasks and build dashboard
+        if: github.event_name != 'schedule' || steps.once.outputs.already_run != 'true'
         run: |
           python scripts/rank_tasks.py
           python scripts/build_dashboard.py
 
       - name: Commit changes
+        if: github.event_name != 'schedule' || steps.once.outputs.already_run != 'true'
         run: |
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
           git config --local user.name "github-actions[bot]"
+
           git add dashboard/
           git add README.md
           git add tracker/work_tracker.csv
+
           # Only commit if there are changes to avoid error
           git diff --quiet && git diff --staged --quiet || git commit -m "chore: update tracker dashboard [skip ci]"
+
           git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
           git push
 
       - name: Send Email Digest
-        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        if: (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && (github.event_name != 'schedule' || steps.once.outputs.already_run != 'true')
         env:
           SMTP_HOST: ${{ vars.SMTP_HOST }}
           SMTP_PORT: ${{ vars.SMTP_PORT }}
