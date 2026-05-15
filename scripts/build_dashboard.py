@@ -11,6 +11,33 @@ def read_csv(filepath):
         reader = csv.DictReader(f)
         return list(reader)
 
+def build_task_details_cell(task):
+    parts = []
+
+    goal = task.get('Brief Description / Goal', '').strip()
+    if goal:
+        parts.append(f"**Goal:** {goal}")
+
+    next_action = task.get('NextAction', '').strip()
+    if next_action:
+        parts.append(f"**Next:** {next_action}")
+    else:
+        parts.append("**Next:** Not defined yet.")
+
+    evidence = task.get('Evidence / Output', '').strip()
+    if evidence:
+        parts.append(f"**Proof:** {evidence}")
+    else:
+        parts.append("**Proof:** Not defined yet.")
+
+    notes = task.get('Notes', '').strip()
+    if notes:
+        parts.append(f"**Notes:** {notes}")
+
+    cell = "<br>".join(parts)
+    cell = cell.replace('\n', ' ').replace('\r', '')
+    return cell
+
 def generate_markdown_table(data, headers, keys):
     if not data:
         return "*No data available.*\n"
@@ -24,73 +51,11 @@ def generate_markdown_table(data, headers, keys):
         for key in keys:
             val = item.get(key, "")
             val = str(val).replace('\n', ' ').replace('\r', '')
+            val = val.replace('|', '\\|')
             row.append(val)
         rows.append("| " + " | ".join(row) + " |")
 
     return "\n".join([header_row, separator_row] + rows) + "\n"
-
-def generate_task_detail_guide(tasks):
-    if not tasks:
-        return "*No tasks available.*\n"
-
-    lines = []
-    for t in tasks:
-        task_id = t.get('TaskID', '')
-        task_name = t.get('Task', '')
-        priority = t.get('Priority', '')
-        status = t.get('Status', '')
-        ready_status = t.get('ReadyStatus', '')
-
-        summary_title = f"<strong>{task_id} - {task_name}</strong>"
-        if priority: summary_title += f" | {priority}"
-        if status: summary_title += f" | {status}"
-        if ready_status: summary_title += f" | {ready_status}"
-
-        lines.append("<details>")
-        lines.append(f"<summary>{summary_title}</summary>")
-        lines.append("")
-
-        category = t.get('Category', '')
-        if category:
-            lines.append(f"- **Category:** {category}")
-
-        effort = t.get('Effort', '')
-        if effort:
-            lines.append(f"- **Effort:** {effort}")
-
-        brief_desc = t.get('Brief Description / Goal', '')
-        if brief_desc:
-            lines.append(f"- **What this means:** {brief_desc}")
-
-        next_action = t.get('NextAction', '').strip()
-        if next_action:
-            lines.append(f"- **What to do next:** {next_action}")
-        else:
-            lines.append("- **What to do next:** Not defined yet. Add a clear next action in tracker/work_tracker.csv.")
-
-        evidence = t.get('Evidence / Output', '').strip()
-        if evidence:
-            lines.append(f"- **Expected output / proof:** {evidence}")
-        else:
-            lines.append("- **Expected output / proof:** Not defined yet.")
-
-        depends_on = t.get('DependsOn', '').strip()
-        if depends_on:
-            lines.append(f"- **Depends on:** {depends_on}")
-
-        blocked_by = t.get('BlockedBy', '').strip()
-        if blocked_by:
-            lines.append(f"- **Blocked by:** {blocked_by}")
-
-        notes = t.get('Notes', '').strip()
-        if notes:
-            lines.append(f"- **Notes:** {notes}")
-
-        lines.append("")
-        lines.append("</details>")
-        lines.append("")
-
-    return "\n".join(lines)
 
 def main():
     tracker_file = Path('tracker/work_tracker.csv')
@@ -103,6 +68,10 @@ def main():
     tasks = read_csv(tracker_file)
     coverage = read_csv(coverage_file)
     logs = read_csv(daily_log_file)
+
+    # Add Details to tasks
+    for task in tasks:
+        task['Details'] = build_task_details_cell(task)
 
     # Calculate metrics
     total_tasks = len(tasks)
@@ -156,13 +125,11 @@ def main():
             ["Source", "Request / Wishlist Item", "Covered in tracker task(s)", "Coverage"],
             ["Source", "Request / Wishlist Item", "Covered in tracker task(s)", "Coverage"]
         ),
-        "## Task Detail Guide\n",
-        generate_task_detail_guide(tasks),
         "## Full Tracker\n",
         generate_markdown_table(
             tasks,
-            ["TaskID", "Category", "Task", "Status", "Priority", "ReadyStatus", "DependsOn", "Effort", "NextAction", "BlockedBy"],
-            ["TaskID", "Category", "Task", "Status", "Priority", "ReadyStatus", "DependsOn", "Effort", "NextAction", "BlockedBy"]
+            ["TaskID", "Category", "Task", "Status", "Priority", "ReadyStatus", "DependsOn", "Effort", "Details", "BlockedBy"],
+            ["TaskID", "Category", "Task", "Status", "Priority", "ReadyStatus", "DependsOn", "Effort", "Details", "BlockedBy"]
         ),
         "<!-- GENERATED CONTENT END -->"
     ])
