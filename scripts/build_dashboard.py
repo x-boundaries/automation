@@ -3,6 +3,9 @@ import datetime
 import re
 from pathlib import Path
 from collections import defaultdict
+from zoneinfo import ZoneInfo
+
+SGT = ZoneInfo('Asia/Singapore')
 
 def read_csv(filepath):
     if not Path(filepath).exists():
@@ -11,13 +14,39 @@ def read_csv(filepath):
         reader = csv.DictReader(f)
         return list(reader)
 
+def apply_status_updates(tasks):
+    """Apply lightweight override CSVs without duplicating tracker rows.
+
+    Files: tracker/status_updates*.csv
+    Rule: match by TaskID. Non-empty cells replace base task values.
+    Special value __CLEAR__ clears the target field.
+    """
+    task_by_id = {t.get('TaskID'): t for t in tasks if t.get('TaskID')}
+    for update_file in sorted(Path('tracker').glob('status_updates*.csv')):
+        for update in read_csv(update_file):
+            task_id = update.get('TaskID', '').strip()
+            if not task_id or task_id not in task_by_id:
+                continue
+            target = task_by_id[task_id]
+            for key, value in update.items():
+                if key == 'TaskID' or value is None:
+                    continue
+                value = value.strip()
+                if value == '':
+                    continue
+                if value == '__CLEAR__':
+                    target[key] = ''
+                else:
+                    target[key] = value
+    return tasks
+
 def read_tracker_tasks():
     tasks = read_csv('tracker/work_tracker.csv')
     extra_dir = Path('tracker/additions')
     if extra_dir.exists():
         for extra_file in sorted(extra_dir.glob('*.csv')):
             tasks.extend(read_csv(extra_file))
-    return tasks
+    return apply_status_updates(tasks)
 
 def build_task_details_cell(task):
     parts = []
@@ -65,16 +94,49 @@ def generate_markdown_table(data, headers, keys):
 
     return "\n".join([header_row, separator_row] + rows) + "\n"
 
+def normalise_task_name(name):
+    return re.sub(r'\s+', ' ', str(name).strip().lower())
+
+def find_duplicate_tasks(tasks):
+    by_name = defaultdict(list)
+    by_goal = defaultdict(list)
+
+    for task in tasks:
+        name_key = normalise_task_name(task.get('Task', ''))
+        goal_key = normalise_task_name(task.get('Brief Description / Goal', ''))
+        if name_key:
+            by_name[name_key].append(task)
+        if goal_key:
+            by_goal[goal_key].append(task)
+
+    rows = []
+    seen = set()
+    for label, grouped in [('Task name', by_name), ('Goal', by_goal)]:
+        for _, items in grouped.items():
+            if len(items) <= 1:
+                continue
+            task_ids = ', '.join(i.get('TaskID', '') for i in items)
+            task_names = ' / '.join(i.get('Task', '') for i in items)
+            key = (label, task_ids)
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append({
+                'Duplicate type': label,
+                'TaskIDs': task_ids,
+                'Tasks': task_names,
+                'Recommendation': 'Review and merge/retire one row if these are not intentionally separate.'
+            })
+    return rows
+
 def main():
     coverage_file = Path('tracker/source_coverage.csv')
-    daily_log_file = Path('tracker/daily_log.csv')
     today_md_file = Path('dashboard/today.md')
     readme_file = Path('README.md')
     dashboard_readme_file = Path('dashboard/README.md')
 
     tasks = read_tracker_tasks()
     coverage = read_csv(coverage_file)
-    logs = read_csv(daily_log_file)
 
     # Add Details to tasks
     for task in tasks:
@@ -95,37 +157,33 @@ def main():
 
     completion_percentage = (done / total_tasks * 100) if total_tasks > 0 else 0
 
-    # Summary metrics table
     summary_metrics_table = f"| Total | Done | In Progress | Not Started | Blocked | Parked | Completion |\n|---:|---:|---:|---:|---:|---:|---:|\n| {total_tasks} | {done} | {in_progress} | {not_started} | {blocked_count} | {parked} | {completion_percentage:.1f}% |\n"
 
-    # Partial source coverage items
     partial_coverage = [c for c in coverage if c.get('Coverage') in ['Partial', 'None']]
+    duplicates = find_duplicate_tasks(tasks)
 
-    # Sort logs by date desc to get recent
-    logs.sort(key=lambda x: x.get('Date', ''), reverse=True)
-    recent_logs = logs[:10]
-
-    # Stale status subset - exclude items where suggestion is the same as current status
-    stale_status = [t for t in tasks if t.get('StatusSuggestion') and t.get('StatusSuggestion') != 'No Change' and t.get('StatusSuggestion') != t.get('Status')]
-
-    # Read today.md content
     today_content = "*`dashboard/today.md` is missing. Please run `python scripts/rank_tasks.py` to generate the daily action plan.*"
     if today_md_file.exists():
         with open(today_md_file, 'r', encoding='utf-8') as f:
             today_content = f.read()
 
-    # Generate dashboard content
-    now_utc = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+    now_sgt = datetime.datetime.now(SGT).strftime('%Y-%m-%d %H:%M:%S SGT')
 
     md = [
         "<!-- GENERATED CONTENT START: Do not manually edit this block. Generated by scripts/build_dashboard.py -->",
-        f"*Last generated: {now_utc}*\n",
+        f"*Last generated: {now_sgt}*\n",
         "## Summary Metrics\n",
         summary_metrics_table,
         today_content
     ]
 
     md.extend([
+        "\n## Duplicate Check\n",
+        generate_markdown_table(
+            duplicates,
+            ["Duplicate type", "TaskIDs", "Tasks", "Recommendation"],
+            ["Duplicate type", "TaskIDs", "Tasks", "Recommendation"]
+        ),
         "\n## Partial/Uncovered Source Items\n",
         generate_markdown_table(
             partial_coverage,
@@ -143,7 +201,6 @@ def main():
 
     dashboard_content = "\n".join(md)
 
-    # Overwrite dashboard block in root README.md
     if readme_file.exists():
         with open(readme_file, 'r', encoding='utf-8') as f:
             readme_text = f.read()
@@ -159,7 +216,6 @@ def main():
         else:
             print(f"Warning: DASHBOARD markers not found in {readme_file}. Root README not updated.")
 
-    # Also keep generating dashboard/README.md for backward compatibility
     Path('dashboard').mkdir(parents=True, exist_ok=True)
     with open(dashboard_readme_file, 'w', encoding='utf-8') as f:
         f.write("# X-Boundaries Automation Dashboard\n\n" + dashboard_content)
