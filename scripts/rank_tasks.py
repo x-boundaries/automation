@@ -16,7 +16,11 @@ def read_csv(filepath):
         return []
     with open(filepath, 'r', encoding='utf-8') as f:
         reader = csv.DictReader(f)
-        return list(reader)
+        rows = []
+        for row in reader:
+            row.pop(None, None)
+            rows.append(row)
+        return rows
 
 def apply_status_updates(tasks):
     """Apply lightweight override CSVs without duplicating tracker rows.
@@ -168,7 +172,7 @@ def rank_tasks():
             base_rows.append(row)
 
     with open(tracker_file, 'w', encoding='utf-8', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=base_fieldnames)
+        writer = csv.DictWriter(f, fieldnames=base_fieldnames, lineterminator='\n')
         writer.writeheader()
         writer.writerows(base_rows)
 
@@ -245,7 +249,7 @@ def save_ranked_csv(tasks):
     Path('dashboard').mkdir(exist_ok=True)
     with open('dashboard/ranked_tasks.csv', 'w', encoding='utf-8', newline='') as f:
         if sorted_tasks:
-            writer = csv.DictWriter(f, fieldnames=sorted_tasks[0].keys())
+            writer = csv.DictWriter(f, fieldnames=sorted_tasks[0].keys(), extrasaction='ignore', lineterminator='\n')
             writer.writeheader()
             writer.writerows(sorted_tasks)
 

@@ -12,7 +12,11 @@ def read_csv(filepath):
         return []
     with open(filepath, 'r', encoding='utf-8') as f:
         reader = csv.DictReader(f)
-        return list(reader)
+        rows = []
+        for row in reader:
+            row.pop(None, None)
+            rows.append(row)
+        return rows
 
 def apply_status_updates(tasks):
     """Apply lightweight override CSVs without duplicating tracker rows.
