@@ -8,14 +8,31 @@ def parse_effort(effort_str):
     except:
         return 5.0  # Default effort if blank or unparseable
 
+def read_csv(filepath):
+    if not Path(filepath).exists():
+        return []
+    with open(filepath, 'r', encoding='utf-8') as f:
+        reader = csv.DictReader(f)
+        return list(reader)
+
+def read_tracker_tasks():
+    tasks = read_csv('tracker/work_tracker.csv')
+    extra_dir = Path('tracker/additions')
+    if extra_dir.exists():
+        for extra_file in sorted(extra_dir.glob('*.csv')):
+            tasks.extend(read_csv(extra_file))
+    return tasks
+
 def rank_tasks():
     tracker_file = Path('tracker/work_tracker.csv')
     if not tracker_file.exists():
         return
 
+    tasks = read_tracker_tasks()
+    base_fieldnames = []
     with open(tracker_file, 'r', encoding='utf-8') as f:
         reader = csv.DictReader(f)
-        tasks = list(reader)
+        base_fieldnames = reader.fieldnames or []
 
     # Simple topological sort/dependency resolution logic
     # Also calculate readiness
@@ -118,16 +135,29 @@ def rank_tasks():
 
         t['RankScore'] = max(0, int(score))
 
-    # Write back to work_tracker.csv with updated RankScore, ReadyStatus
-    with open(tracker_file, 'w', encoding='utf-8', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=reader.fieldnames)
-        writer.writeheader()
-        writer.writerows(tasks)
+    # Write back updated RankScore/ReadyStatus only for base tracker rows.
+    # Extra task-addition CSVs stay separate so quick manual backlog additions do not rewrite the canonical tracker.
+    base_task_ids = set()
+    base_rows = []
+    with open(tracker_file, 'r', encoding='utf-8') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            base_task_ids.add(row['TaskID'])
+            if row['TaskID'] in task_dict:
+                merged = task_dict[row['TaskID']]
+                for field in base_fieldnames:
+                    row[field] = merged.get(field, row.get(field, ''))
+            base_rows.append(row)
 
-    # Generate today.md
+    with open(tracker_file, 'w', encoding='utf-8', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=base_fieldnames)
+        writer.writeheader()
+        writer.writerows(base_rows)
+
+    # Generate today.md using base tracker + additions.
     generate_today_md(tasks)
 
-    # Save ranked list for dashboard
+    # Save ranked list for dashboard using base tracker + additions.
     save_ranked_csv(tasks)
 
 def generate_today_md(tasks):
