@@ -1,6 +1,9 @@
 import csv
 import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
+
+SGT = ZoneInfo('Asia/Singapore')
 
 def parse_effort(effort_str):
     try:
@@ -15,13 +18,39 @@ def read_csv(filepath):
         reader = csv.DictReader(f)
         return list(reader)
 
+def apply_status_updates(tasks):
+    """Apply lightweight override CSVs without duplicating tracker rows.
+
+    Files: tracker/status_updates*.csv
+    Rule: match by TaskID. Non-empty cells replace base task values.
+    Special value __CLEAR__ clears the target field.
+    """
+    task_by_id = {t.get('TaskID'): t for t in tasks if t.get('TaskID')}
+    for update_file in sorted(Path('tracker').glob('status_updates*.csv')):
+        for update in read_csv(update_file):
+            task_id = update.get('TaskID', '').strip()
+            if not task_id or task_id not in task_by_id:
+                continue
+            target = task_by_id[task_id]
+            for key, value in update.items():
+                if key == 'TaskID' or value is None:
+                    continue
+                value = value.strip()
+                if value == '':
+                    continue
+                if value == '__CLEAR__':
+                    target[key] = ''
+                else:
+                    target[key] = value
+    return tasks
+
 def read_tracker_tasks():
     tasks = read_csv('tracker/work_tracker.csv')
     extra_dir = Path('tracker/additions')
     if extra_dir.exists():
         for extra_file in sorted(extra_dir.glob('*.csv')):
             tasks.extend(read_csv(extra_file))
-    return tasks
+    return apply_status_updates(tasks)
 
 def rank_tasks():
     tracker_file = Path('tracker/work_tracker.csv')
@@ -34,9 +63,6 @@ def rank_tasks():
         reader = csv.DictReader(f)
         base_fieldnames = reader.fieldnames or []
 
-    # Simple topological sort/dependency resolution logic
-    # Also calculate readiness
-
     task_dict = {t['TaskID']: t for t in tasks}
 
     for t in tasks:
@@ -46,8 +72,10 @@ def rank_tasks():
 
         if status == 'Done':
             t['ReadyStatus'] = 'Done'
+            t['BlockedBy'] = ''
         elif status == 'Parked':
             t['ReadyStatus'] = 'Parked'
+            t['BlockedBy'] = ''
         else:
             is_blocked = False
             blocked_by = []
@@ -59,16 +87,13 @@ def rank_tasks():
                     is_blocked = True
                     blocked_by.append(d)
 
-            # Only override ReadyStatus if it's currently empty or Ready, but dependencies aren't met
-            # If it's blocked by manual 'Blocked' or 'Waiting' setting, keep it.
-            if is_blocked and t.get('ReadyStatus') not in ['Blocked', 'Waiting']:
+            if is_blocked:
                  t['ReadyStatus'] = 'Waiting'
-                 t['BlockedBy'] = ",".join(blocked_by)
-            elif not is_blocked and t.get('ReadyStatus') not in ['Blocked', 'Waiting']:
+                 t['BlockedBy'] = ','.join(blocked_by)
+            elif t.get('ReadyStatus') not in ['Blocked', 'Waiting']:
                  t['ReadyStatus'] = 'Ready'
-                 t['BlockedBy'] = ""
+                 t['BlockedBy'] = ''
 
-    # Pre-calculate what tasks are unlocked by each task
     unlocks = {}
     for t in tasks:
         deps = [d.strip() for d in t.get('DependsOn', '').replace(';', ',').split(',') if d.strip()]
@@ -79,19 +104,16 @@ def rank_tasks():
 
     for t in tasks:
         status = t.get('Status', 'Unknown')
-        # Ranking logic
         score = 0
 
         if status in ['Done', 'Parked']:
             score = 0
         else:
-            # PriorityScore
             pri = t.get('Priority', 'Low')
             if pri == 'High': score += 3000
             elif pri == 'Medium': score += 2000
             else: score += 1000
 
-            # EaseScore
             effort = parse_effort(t.get('Effort', '5'))
             if effort == 1.0: score += 250
             elif effort == 2.0: score += 200
@@ -99,12 +121,9 @@ def rank_tasks():
             elif effort == 4.0: score += 100
             else: score += 50
 
-            # StatusBonus
             if status == 'In Progress':
                 score += 150
 
-            # UnlockBonus
-            # Find tasks this unlocks that are not done/parked
             unlocked_tasks = unlocks.get(t['TaskID'], [])
             active_unlocked = 0
             for ut_id in unlocked_tasks:
@@ -113,12 +132,11 @@ def rank_tasks():
             unlock_bonus = min(250, active_unlocked * 25)
             score += unlock_bonus
 
-            # UrgencyBonus
             due_date_str = t.get('DueDate', '').strip()
             if due_date_str:
                 try:
                     due_date = datetime.datetime.strptime(due_date_str, '%Y-%m-%d').date()
-                    today_date = datetime.datetime.now(datetime.timezone.utc).date()
+                    today_date = datetime.datetime.now(SGT).date()
                     days_until_due = (due_date - today_date).days
                     if days_until_due <= 0:
                         score += 300
@@ -129,20 +147,15 @@ def rank_tasks():
                 except ValueError:
                     pass
 
-            # Penalize if blocked/waiting so it doesn't show up top
             if t.get('ReadyStatus') in ['Blocked', 'Waiting']:
                 score -= 5000
 
         t['RankScore'] = max(0, int(score))
 
-    # Write back updated RankScore/ReadyStatus only for base tracker rows.
-    # Extra task-addition CSVs stay separate so quick manual backlog additions do not rewrite the canonical tracker.
-    base_task_ids = set()
     base_rows = []
     with open(tracker_file, 'r', encoding='utf-8') as f:
         reader = csv.DictReader(f)
         for row in reader:
-            base_task_ids.add(row['TaskID'])
             if row['TaskID'] in task_dict:
                 merged = task_dict[row['TaskID']]
                 for field in base_fieldnames:
@@ -154,29 +167,23 @@ def rank_tasks():
         writer.writeheader()
         writer.writerows(base_rows)
 
-    # Generate today.md using base tracker + additions.
     generate_today_md(tasks)
-
-    # Save ranked list for dashboard using base tracker + additions.
     save_ranked_csv(tasks)
 
 def generate_today_md(tasks):
-    # Filter actionable tasks
     actionable = [t for t in tasks if t.get('ReadyStatus') == 'Ready' and t.get('Status') not in ['Done', 'Parked']]
     actionable.sort(key=lambda x: int(x.get('RankScore', 0)), reverse=True)
 
     top_5 = actionable[:5]
     quick_wins = [t for t in actionable if str(t.get('Effort', '')).strip() == '1']
-
     blocked_waiting = [t for t in tasks if t.get('ReadyStatus') in ['Blocked', 'Waiting'] and t.get('Status') not in ['Done', 'Parked']]
-
     stale_status = [t for t in tasks if t.get('StatusSuggestion') and t.get('StatusSuggestion') != 'No Change' and t.get('StatusSuggestion') != t.get('Status')]
 
-    today = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d')
+    today = datetime.datetime.now(SGT).strftime('%Y-%m-%d')
 
     md = [
         "# Daily Action Plan\n",
-        f"**Date:** {today}\n",
+        f"**Date:** {today} SGT\n",
         "> ⚠️ **Reminder:** The agent does not auto-mark tasks as Done. Update the tracker manually when work is confirmed and evidence is provided.\n",
         "- [X-Boundaries Automation Repo](https://github.com/x-boundaries/automation)",
         "- [Main Dashboard](https://github.com/x-boundaries/automation/blob/main/dashboard/README.md)\n",
@@ -208,14 +215,12 @@ def generate_today_md(tasks):
         for t in stale_status:
             md.append(f"- **[{t['TaskID']}] {t['Task']}** - Suggested: *{t.get('StatusSuggestion', '')}*")
 
-    # Recent daily log entries
     daily_log_file = Path('tracker/daily_log.csv')
     if daily_log_file.exists():
         with open(daily_log_file, 'r', encoding='utf-8') as f:
             log_reader = csv.DictReader(f)
             logs = list(log_reader)
 
-        # Sort desc by date, get top 5
         logs.sort(key=lambda x: x.get('Date', ''), reverse=True)
         recent_logs = logs[:5]
 
