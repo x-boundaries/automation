@@ -38,6 +38,7 @@
 - **[T020] Build stock upload exception report** (Waiting) - Blocked by: T019
 - **[T022] Create export archive structure** (Waiting) - Blocked by: T068
 - **[T025] Create goods-in-transit tracker** (Waiting) - Blocked by: T013
+- **[T071] Create bank reconciliation dashboard task** (Waiting) - Blocked by: T068
 ## 🔎 Tasks Needing Status Review
 - **[T016] Create primary product ID concept** - Suggested: *Ready for Mike confirmation*
 
