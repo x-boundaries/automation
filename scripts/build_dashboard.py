@@ -11,6 +11,14 @@ def read_csv(filepath):
         reader = csv.DictReader(f)
         return list(reader)
 
+def read_tracker_tasks():
+    tasks = read_csv('tracker/work_tracker.csv')
+    extra_dir = Path('tracker/additions')
+    if extra_dir.exists():
+        for extra_file in sorted(extra_dir.glob('*.csv')):
+            tasks.extend(read_csv(extra_file))
+    return tasks
+
 def build_task_details_cell(task):
     parts = []
 
@@ -58,14 +66,13 @@ def generate_markdown_table(data, headers, keys):
     return "\n".join([header_row, separator_row] + rows) + "\n"
 
 def main():
-    tracker_file = Path('tracker/work_tracker.csv')
     coverage_file = Path('tracker/source_coverage.csv')
     daily_log_file = Path('tracker/daily_log.csv')
     today_md_file = Path('dashboard/today.md')
     readme_file = Path('README.md')
     dashboard_readme_file = Path('dashboard/README.md')
 
-    tasks = read_csv(tracker_file)
+    tasks = read_tracker_tasks()
     coverage = read_csv(coverage_file)
     logs = read_csv(daily_log_file)
 
