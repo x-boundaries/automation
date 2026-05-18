@@ -97,11 +97,26 @@ def rank_tasks():
                     blocked_by.append(d)
 
             if is_blocked:
-                 t['ReadyStatus'] = 'Waiting'
-                 t['BlockedBy'] = ','.join(blocked_by)
-            elif t.get('ReadyStatus') not in ['Blocked', 'Waiting']:
-                 t['ReadyStatus'] = 'Ready'
-                 t['BlockedBy'] = ''
+                t['ReadyStatus'] = 'Waiting'
+                t['BlockedBy'] = ','.join(blocked_by)
+            else:
+                existing_blockers = [
+                    b.strip()
+                    for b in t.get('BlockedBy', '').replace(';', ',').split(',')
+                    if b.strip()
+                ]
+                has_manual_waiting_blocker = (
+                    t.get('ReadyStatus') == 'Waiting'
+                    and existing_blockers
+                    and not all(
+                        b in task_dict and task_dict[b].get('Status') in ['Done', 'Parked']
+                        for b in existing_blockers
+                    )
+                )
+
+                if t.get('ReadyStatus') != 'Blocked' and not has_manual_waiting_blocker:
+                    t['ReadyStatus'] = 'Ready'
+                    t['BlockedBy'] = ''
 
     unlocks = {}
     for t in tasks:

@@ -8,39 +8,35 @@
 - [Main Dashboard](https://github.com/x-boundaries/automation/blob/main/dashboard/README.md)
 
 ## 🏆 Today's Top 5 Tasks
-1. **[T003] Confirm 6 migration templates** (Priority: High, Effort: 2)
-   - **Next Action:** Ask Mike for compulsory columns, optional columns, sample completed rows, import sequence, and rollback/correction process.
-   - **Goal:** Confirm purpose, mandatory fields, import order, and reversibility for stock, stock open balance, debtor, creditor, AR, and AP templates.
-
-2. **[T002] Confirm AutoCount 2.0 module scope** (Priority: High, Effort: 2)
-   - **Next Action:** Confirm exact modules live at go-live and what Ingenious configures vs X-Boundaries/accountant prepares.
-   - **Goal:** Confirm stock, accounting, POS, bank recon, AP/AR, price master, multi-location, and import capabilities.
-
-3. **[T006] Prepare Brendan finance data-source call** (Priority: High, Effort: 3)
-   - **Next Action:** Build Brendan/accountant source-owner table and confirm sign-off owner for each opening balance.
-   - **Goal:** Map Mike's required accounting data to Brendan/finance/accountant sources and owners.
-
-4. **[T068] Investigate AutoCount export/API/SQL access** (Priority: High, Effort: 3)
-   - **Next Action:** Ask Mike what integration/export method is allowed for X-Boundaries and whether API Module/licence is needed.
+1. **[T068] Investigate AutoCount export/API/SQL access** (Priority: High, Effort: 3)
+   - **Next Action:** Investigate AutoCount export/API/SQL access options directly.
    - **Goal:** Confirm allowed ways to extract data from AutoCount 2.0: export, SQL, API, or scheduled reports.
 
-5. **[T012] Confirm POS edge case handling** (Priority: High, Effort: 2)
+2. **[T012] Confirm POS edge case handling** (Priority: High, Effort: 2)
    - **Goal:** Ask Ingenious how refunds, exchanges, mall vouchers, store credits, voids, partial refunds, and split payments are handled.
+
+3. **[T073] Verify receipt printer Windows 11 support** (Priority: High, Effort: 2)
+   - **Next Action:** Get current printer model from store/server area, check Windows 11 driver availability, and record go/no-go result.
+   - **Goal:** Check current shop receipt printer model, specs, Windows 11 driver support, and whether replacement is needed before AutoCount 2.0/POS rollout.
+
+4. **[T075] Confirm SiteGiant to Shopify mapping reliability** (Priority: High, Effort: 2)
+   - **Next Action:** Ask Mike for SiteGiant-Shopify field mapping approach, mismatch handling, and whether a sample sync/export can be tested.
+   - **Goal:** Get Mike/SiteGiant to confirm how SiteGiant data maps reliably into Shopify despite different input fields, including mandatory fields, fallback fields, and exception handling.
+
+5. **[T007] Prepare stock master list** (Priority: High, Effort: 3)
+   - **Next Action:** Prepare real cleaned stock master list using the completed master legend structure after Mike confirms required migration fields.
+   - **Goal:** Prepare item/product master data for migration and vendor review.
 
 ## ⚡ Quick Wins (Effort 1)
 *No quick wins identified.*
 
 ## 🛑 Blocked & Waiting Tasks
-- **[T007] Prepare stock master list** (Waiting) - Blocked by: T003
-- **[T010] Prepare Chart of Accounts draft** (Waiting) - Blocked by: Brendan/accountant CoA decision
 - **[T013] Confirm opening accounting balances** (Waiting) - Blocked by: Brendan/accountant + Mike accounting treatment confirmation
-- **[T020] Build stock upload exception report** (Waiting) - Blocked by: T019
 - **[T022] Create export archive structure** (Waiting) - Blocked by: T068
 - **[T025] Create goods-in-transit tracker** (Waiting) - Blocked by: T013
 - **[T071] Create bank reconciliation dashboard task** (Waiting) - Blocked by: T068
 - **[T071] Build bank reconciliation download comparator** (Waiting) - Blocked by: T068
-- **[T072] Create 30 Jun cutover balance gate** (Waiting) - Blocked by: T003,T013
-- **[T074] Define 5-day parallel run plan** (Waiting) - Blocked by: T002
+- **[T072] Create 30 Jun cutover balance gate** (Waiting) - Blocked by: T013
 ## 🔎 Tasks Needing Status Review
 - **[T014] Create master legend concept** - Suggested: *2026-05-18*
 - **[T015] Create SKU history approach** - Suggested: *2026-05-18*
