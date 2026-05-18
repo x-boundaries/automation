@@ -24,6 +24,9 @@ def apply_status_updates(tasks):
     Files: tracker/status_updates*.csv
     Rule: match by TaskID. Non-empty cells replace base task values.
     Special value __CLEAR__ clears the target field.
+
+    csv.DictReader puts overflow columns under key None. Ignore those so one
+    accidental trailing comma cannot kill the dashboard workflow.
     """
     task_by_id = {t.get('TaskID'): t for t in tasks if t.get('TaskID')}
     for update_file in sorted(Path('tracker').glob('status_updates*.csv')):
@@ -33,7 +36,9 @@ def apply_status_updates(tasks):
                 continue
             target = task_by_id[task_id]
             for key, value in update.items():
-                if key == 'TaskID' or value is None:
+                if key is None or key == 'TaskID' or value is None:
+                    continue
+                if not isinstance(value, str):
                     continue
                 value = value.strip()
                 if value == '':
