@@ -12,12 +12,14 @@ on:
   schedule:
     # GitHub Actions schedules can be delayed/dropped at busy times.
     # These are fallback attempts after the selected start time.
-    # 00:17 UTC = 08:17 SGT daily fallback 1
-    # 00:37 UTC = 08:37 SGT
-    # 00:57 UTC = 08:57 SGT
-    # 01:17 UTC = 09:17 SGT
-    - cron: "17,37,57 0 * * 1-5"
-    - cron: "17 1 * * 1-5"
+    - cron: "23 8 * * 1-5"
+      timezone: "Asia/Singapore"
+    - cron: "23 10 * * 1-5"
+      timezone: "Asia/Singapore"
+    - cron: "23 12 * * 1-5"
+      timezone: "Asia/Singapore"
+    - cron: "23 16 * * 1-5"
+      timezone: "Asia/Singapore"
 
 permissions:
   contents: write
@@ -38,7 +40,7 @@ jobs:
       - name: Check if dashboard already generated today
         id: once
         run: |
-          TODAY=$(date -u +%F)
+          TODAY=$(TZ=Asia/Singapore date +%F)
 
           if grep -q "Last generated: $TODAY" README.md; then
             echo "Dashboard already generated today."
