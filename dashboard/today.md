@@ -19,18 +19,19 @@
    - **Next Action:** Ask Vendor Ingenious/Mike for SiteGiant-Shopify field mapping approach, mismatch handling, and whether a sample sync/export can be tested.
    - **Goal:** Get Vendor Ingenious/Mike/SiteGiant to confirm how SiteGiant data maps reliably into Shopify despite different input fields, including mandatory fields, fallback fields, and exception handling.
 
-4. **[T007] Prepare stock master list** (Priority: High, Effort: 3)
-   - **Next Action:** Pending MD Kar Han to clean master list data
-   - **Goal:** Prepare item/product master data for migration and vendor review.
-
-5. **[T008] Prepare customer/debtor master list** (Priority: High, Effort: 3)
+4. **[T008] Prepare customer/debtor master list** (Priority: High, Effort: 3)
    - **Next Action:** Identify trade customers to migrate and prepare 5-10 sample Debtor rows for test import.
    - **Goal:** Prepare customer/debtor data for migration, especially wholesale, Metro, corporate, and Gebiz customers.
+
+5. **[T009] Prepare supplier/creditor master list** (Priority: High, Effort: 3)
+   - **Next Action:** Identify trade suppliers to migrate and prepare 5-10 sample Creditor rows for test import.
+   - **Goal:** Prepare supplier/creditor data including local/overseas suppliers, terms, currency, and contacts.
 
 ## ⚡ Quick Wins (Effort 1)
 *No quick wins identified.*
 
 ## 🛑 Blocked & Waiting Tasks
+- **[T007] Prepare stock master list** (Waiting) - Blocked by: MD Kar Han
 - **[T013] Confirm opening accounting balances** (Waiting) - Blocked by: Brendan/accountant + Vendor Ingenious/Mike accounting treatment confirmation
 - **[T022] Create export archive structure** (Waiting) - Blocked by: T068
 - **[T025] Create goods-in-transit tracker** (Waiting) - Blocked by: T013
