@@ -1,6 +1,6 @@
 # Meeting notes on 18.05.2026
 
-## Mike will check with SiteGiant
+## Vendor Ingenious/Mike will check with SiteGiant
 
 Since Shopify has different input fields from SiteGiant, confirm how data can be mapped from SiteGiant into Shopify reliably.
 
