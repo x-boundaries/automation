@@ -151,16 +151,25 @@ def main():
         task['Details'] = build_task_details_cell(task)
 
     total_tasks = len(tasks)
-    status_counts = defaultdict(int)
+    done = 0
+    in_progress = 0
+    not_started = 0
+    blocked_count = 0
+    parked = 0
 
     for t in tasks:
-        status_counts[t.get('Status', 'Unknown')] += 1
-
-    done = status_counts.get('Done', 0)
-    in_progress = status_counts.get('In Progress', 0)
-    not_started = status_counts.get('Not Started', 0)
-    blocked_count = status_counts.get('Blocked', 0)
-    parked = status_counts.get('Parked', 0)
+        status = t.get('Status', 'Unknown')
+        ready_status = t.get('ReadyStatus', '')
+        if status == 'Done':
+            done += 1
+        elif status == 'Parked':
+            parked += 1
+        elif ready_status in ['Waiting', 'Blocked']:
+            blocked_count += 1
+        elif status == 'In Progress':
+            in_progress += 1
+        else:
+            not_started += 1
 
     completion_percentage = (done / total_tasks * 100) if total_tasks > 0 else 0
 
