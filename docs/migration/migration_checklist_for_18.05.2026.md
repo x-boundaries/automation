@@ -1,7 +1,7 @@
 # AutoCount 2.0 Migration Preparation - Meeting Checklist
 
 **Prepared by:** X-Boundaries  
-**For:** Ingenious / Mike  
+**For:** Ingenious / Vendor Ingenious/Mike  
 **Purpose:** Pre-meeting checklist and live call script for Monday's migration preparation discussion.
 
 > Note: This document is intended to be used both as a pre-read and as the live call structure. The aim is to align on required preparation, responsibilities, deadlines, and go-live blockers before migration day.
@@ -51,9 +51,9 @@ This meeting is not intended to be full AutoCount training yet; the focus is mig
 
 So X-Boundaries needs to understand what accounting data must be prepared properly before migration.
 
-## Mike replies already captured
+## Vendor Ingenious/Mike replies already captured
 
-These are current answer notes from Mike / Ingenious. Treat them as useful confirmations, not as full closure of the checklist.
+These are current answer notes from Vendor Ingenious/Mike / Ingenious. Treat them as useful confirmations, not as full closure of the checklist.
 
 - [x] Debtor and Creditor Excel templates are used to import existing trade customers and suppliers.
 - [x] Debtor / Creditor data can also be migrated from the old AutoCount version.
@@ -68,8 +68,8 @@ These are current answer notes from Mike / Ingenious. Treat them as useful confi
 - [x] Full accounts require bank opening balances and General Ledger (GL) account opening balances.
 - [x] Stock in transit can be tracked using Outstanding PO Listing.
   - Path: `PO > PO Listing > Outstanding PO Listing`.
-  - Mike said this is available in the old version too.
-- [x] Programming references shared by Mike:
+  - Vendor Ingenious/Mike said this is available in the old version too.
+- [x] Programming references shared by Vendor Ingenious/Mike:
   - https://wiki.autocountsoft.com/wiki/Programmer
   - https://wiki.autocountsoft.com/wiki/Integration_Methods
 
@@ -107,7 +107,7 @@ These are current answer notes from Mike / Ingenious. Treat them as useful confi
 | X-Boundaries responsibility | What we must prepare |
 | Accountant responsibility | Accounting numbers / sign-off |
 
-### Mike confirmed / clarified
+### Vendor Ingenious/Mike confirmed / clarified
 
 - [x] X-Boundaries prepares all Excel data.
 - [x] Sample data can be provided first for test import.
@@ -116,7 +116,7 @@ These are current answer notes from Mike / Ingenious. Treat them as useful confi
 - [x] AR/AP Invoice templates are for outstanding customer/supplier opening balances.
 - [x] Full accounts need CoA decision, bank opening balances, and GL opening balances.
 
-### Still pending / ask Mike
+### Still pending / ask Vendor Ingenious/Mike
 
 - [ ] Are the 6 Excel templates provided by Ingenious definitely the latest/correct ones?
 - [ ] Confirm exactly what Ingenious imports/configures.
@@ -161,7 +161,7 @@ For each template, please confirm:
 - Whether we can test import 5-10 rows first.
 - If imported wrongly, whether it can be reversed or corrected.
 
-### Mike confirmed / clarified
+### Vendor Ingenious/Mike confirmed / clarified
 
 - [x] Debtor template imports existing trade customers.
 - [x] Creditor template imports existing trade suppliers.
@@ -172,7 +172,7 @@ For each template, please confirm:
 - [x] AP Invoice template is for supplier opening balances / outstanding invoices.
 - [x] Sample data can be provided first for test import.
 
-### Still pending / ask Mike
+### Still pending / ask Vendor Ingenious/Mike
 
 - [ ] Is `Stock Item Opening` the same thing as `Import Stock Open Bal`?
 - [ ] What exactly is `Import Stock Item` for?
@@ -186,7 +186,7 @@ For each template, please confirm:
 - [ ] What is the safest workflow for a new SKU: check existing AutoCount item first, create item master, then import opening/incoming stock?
 - [ ] What are the compulsory columns for each template?
 - [ ] What are the optional columns for each template?
-- [ ] Can Mike provide one sample completed row for each template?
+- [ ] Can Vendor Ingenious/Mike provide one sample completed row for each template?
 - [ ] If imported wrongly, can each template import be reversed, deleted, or corrected?
 
 ---
@@ -218,9 +218,9 @@ For each template, please confirm:
 
 Do not assume this order is correct. Ingenious confirmation is required.
 
-### Mike confirmed / clarified
+### Vendor Ingenious/Mike confirmed / clarified
 
-- [x] Mike has not confirmed exact sequence yet, but his replies imply these areas are required:
+- [x] Vendor Ingenious/Mike has not confirmed exact sequence yet, but his replies imply these areas are required:
   - Debtor / customer master.
   - Creditor / supplier master.
   - Stock opening quantity and cost by item/location.
@@ -229,7 +229,7 @@ Do not assume this order is correct. Ingenious confirmation is required.
   - Bank opening balances.
   - GL opening balances.
 
-### Still pending / ask Mike
+### Still pending / ask Vendor Ingenious/Mike
 
 - [ ] Confirm the real import/setup order.
 - [ ] Confirm whether CoA, locations, item master, debtor master, and creditor master must exist before opening balances.
@@ -257,14 +257,14 @@ Do not assume this order is correct. Ingenious confirmation is required.
 
 - Which of these must be clean before migration, and which can be cleaned after go-live?
 
-### Mike confirmed / clarified
+### Vendor Ingenious/Mike confirmed / clarified
 
 - [x] Debtor template imports existing trade customers.
 - [x] Creditor template imports existing trade suppliers.
 - [x] Customer/supplier data can also be migrated from old AutoCount version.
 - [x] Opening stock requires quantity and cost for each item by location.
 
-### Still pending / ask Mike
+### Still pending / ask Vendor Ingenious/Mike
 
 - [ ] Which customers count as trade customers?
   - Wholesale?
@@ -306,7 +306,7 @@ This is the most important section because X-Boundaries was not using the accoun
 
 Also confirm whether stock in transit / paid-but-not-received goods is part of opening accounting balances, opening stock, open PO, AP, or a separate tracker.
 
-### Mike confirmed / clarified
+### Vendor Ingenious/Mike confirmed / clarified
 
 - [x] CoA can follow AutoCount system default or be provided by accountant.
 - [x] Account codes and information need to be keyed in manually by user.
@@ -317,7 +317,7 @@ Also confirm whether stock in transit / paid-but-not-received goods is part of o
 - [x] Stock Item Opening requires quantity and cost by item/location.
 - [x] Operational stock in transit can be tracked using Outstanding PO Listing.
 
-### Still pending / ask Mike
+### Still pending / ask Vendor Ingenious/Mike
 
 - [ ] Who keys the CoA manually?
   - X-Boundaries?
@@ -352,11 +352,11 @@ Also confirm whether stock in transit / paid-but-not-received goods is part of o
 - Does opening stock need one row per item per location?
 - Can Shopify share XB01  stock?
 
-### Mike confirmed / clarified
+### Vendor Ingenious/Mike confirmed / clarified
 
 - [x] Opening stock quantity and cost are needed by item and by location.
 
-### Still pending / ask Mike
+### Still pending / ask Vendor Ingenious/Mike
 
 - [ ] Confirm exact AutoCount location codes:
   - `HQ`.
@@ -423,11 +423,11 @@ Need confirmation on:
 - Which AutoCount exports we can use to refresh our mapping legend.
 - Whether copy-paste Excel import can update/create items safely using this bridge key.
 
-### Mike confirmed / clarified
+### Vendor Ingenious/Mike confirmed / clarified
 
 - [ ] No confirmation yet on SKU identity / ItemCode behaviour.
 
-### Still pending / ask Mike
+### Still pending / ask Vendor Ingenious/Mike
 
 - [ ] Can AutoCount ItemCode / stock code be changed after item creation?
 - [ ] What happens to historical transactions if ItemCode changes?
@@ -517,19 +517,19 @@ Need to know how AutoCount should handle this during migration and after go-live
 
 - For migration day, what exact list of supplier prepayments / stock in transit / paid-but-not-received goods must X-Boundaries prepare, and who should sign it off?
 
-### Mike confirmed / clarified
+### Vendor Ingenious/Mike confirmed / clarified
 
-- [x] Mike first asked what stock in transit means.
+- [x] Vendor Ingenious/Mike first asked what stock in transit means.
 - [x] X-Boundaries clarified:
   - Stock purchased as PO.
   - Not all delivered yet.
   - Delivered in batches.
   - Enters HQ location batch by batch.
-- [x] Mike replied that Outstanding PO Listing can be used for tracking.
+- [x] Vendor Ingenious/Mike replied that Outstanding PO Listing can be used for tracking.
   - Path: `PO > PO Listing > Outstanding PO Listing`.
   - Available in old version too.
 
-### Still pending / ask Mike
+### Still pending / ask Vendor Ingenious/Mike
 
 - [ ] Is Outstanding PO Listing only operational tracking, or enough for accounting too?
 - [ ] If supplier is paid before goods arrive, should it be supplier prepayment?
@@ -562,15 +562,15 @@ Need to know how AutoCount should handle this during migration and after go-live
 
 Opening stock, AP, AR, bank, cash, and accounting balances should all be based on the same cutover timing.
 
-### Mike confirmed / clarified
+### Vendor Ingenious/Mike confirmed / clarified
 
-- [x] Mike confirmed full accounts require:
+- [x] Vendor Ingenious/Mike confirmed full accounts require:
   - Opening stock quantity/cost.
   - AR/AP opening invoices.
   - Bank opening balances.
   - GL opening balances.
 
-### Still pending / ask Mike
+### Still pending / ask Vendor Ingenious/Mike
 
 - [ ] Confirm whether numbers are based on closing 30 Jun or opening 1 Jul.
 - [ ] Confirm when old AutoCount stops.
@@ -654,12 +654,12 @@ If X-Boundaries is using AutoCount 1.0 and AutoCount 2.0 in parallel, we need to
 
 - What exactly does X-Boundaries need to do during parallel run, and what does Ingenious check before confirming we are ready to go live?
 
-### Mike confirmed / clarified
+### Vendor Ingenious/Mike confirmed / clarified
 
 - [x] Sample data can be provided first for test import before full migration.
 - [ ] No confirmation yet on parallel run details.
 
-### Still pending / ask Mike
+### Still pending / ask Vendor Ingenious/Mike
 
 - [ ] Are we definitely doing a parallel run?
 - [ ] How long is the parallel run?
@@ -693,11 +693,11 @@ Can we test import 5-10 sample rows for each template before preparing the full 
 
 Do not spend days cleaning a huge Excel file before confirming the format works.
 
-### Mike confirmed / clarified
+### Vendor Ingenious/Mike confirmed / clarified
 
 - [x] Sample data can be provided first for test import before full migration.
 
-### Still pending / ask Mike
+### Still pending / ask Vendor Ingenious/Mike
 
 - [ ] Which database should test import use?
 - [ ] Is there a sandbox/test database?
@@ -724,11 +724,11 @@ Do not spend days cleaning a huge Excel file before confirming the format works.
 
 Avoid creating migration problems by accident.
 
-### Mike confirmed / clarified
+### Vendor Ingenious/Mike confirmed / clarified
 
 - [ ] No confirmation yet on what to avoid before migration.
 
-### Still pending / ask Mike
+### Still pending / ask Vendor Ingenious/Mike
 
 - [ ] Do not change template headers?
 - [ ] Avoid manual product creation before template import?
@@ -753,15 +753,15 @@ Before ending the call, ask Ingenious to confirm this table.
 | AP opening | Import AP Invoice | Ingenious to confirm | Finance / accountant | TBC | Yes |
 | CoA | TBC | Ingenious / accountant to confirm | Finance / accountant | TBC | Yes |
 | GL opening balance | TBC | Ingenious / accountant to confirm | Finance / accountant | TBC | Yes |
-| Locations | AutoCount setup | Ingenious to confirm | X-Boundaries + Mike | TBC | Yes |
+| Locations | AutoCount setup | Ingenious to confirm | X-Boundaries + Vendor Ingenious/Mike | TBC | Yes |
 | Payment methods | AutoCount setup | Ingenious to confirm | Retail + finance | TBC | Yes |
-| SKU identity / internal primary product ID | TBC | Ingenious to confirm | X-Boundaries + Mike | TBC | Yes |
+| SKU identity / internal primary product ID | TBC | Ingenious to confirm | X-Boundaries + Vendor Ingenious/Mike | TBC | Yes |
 | Stock in transit / supplier prepayment | TBC | Ingenious to confirm | Finance + ops | TBC | Yes |
 | Parallel run / migration rehearsal | TBC | Ingenious to confirm | Ingenious + X-Boundaries | TBC | Yes |
 
-### Mike reply summary to capture in this output table
+### Vendor Ingenious/Mike reply summary to capture in this output table
 
-| Data item | Mike reply captured | Still open |
+| Data item | Vendor Ingenious/Mike reply captured | Still open |
 |---|---|---|
 | Customer master | Debtor template imports existing trade customers. Data can also be migrated from old version. | Which customers count as trade customers? Mandatory fields? |
 | Supplier master | Creditor template imports existing trade suppliers. Data can also be migrated from old version. | Mandatory fields? Local/overseas supplier fields? |
@@ -773,13 +773,13 @@ Before ending the call, ask Ingenious to confirm this table.
 | GL opening balance | Full accounts require GL account opening balances. | Format, entry method, sign-off owner. |
 | Stock in transit / supplier prepayment | Outstanding PO Listing can track stock in transit: `PO > PO Listing > Outstanding PO Listing`. | Confirm accounting treatment and cutover list. |
 | Test import | Sample data can be provided first for test import. | Confirm sandbox database and rollback process. |
-| API / automation | Mike shared AutoCount Programmer and Integration Methods wiki links. | Confirm approved integration method, API licence, SQL/export access. |
+| API / automation | Vendor Ingenious/Mike shared AutoCount Programmer and Integration Methods wiki links. | Confirm approved integration method, API licence, SQL/export access. |
 
 ---
 
 # 11. Internal action for Brendan / finance call
 
-Mike's replies mean Brendan / finance / accountant need to prepare or confirm the accounting side clearly.
+Vendor Ingenious/Mike's replies mean Brendan / finance / accountant need to prepare or confirm the accounting side clearly.
 
 | Item | Needed from finance/accountant | Suggested owner | Status |
 |---|---|---|---|
@@ -795,7 +795,7 @@ Mike's replies mean Brendan / finance / accountant need to prepare or confirm th
 
 ---
 
-# 12. Immediate Monday Mike call focus
+# 12. Immediate Monday Vendor Ingenious/Mike call focus
 
 Use this if time is short. Ask only what blocks migration and go-live.
 
@@ -826,4 +826,4 @@ Use this if time is short. Ask only what blocks migration and go-live.
 
 - Do not design full AI agents before migration is stable.
 - Do not build write-back automation before export/read-only access is confirmed.
-- Do not build stock upload generator until Mike confirms the correct stock quantity workflow and import method.
+- Do not build stock upload generator until Vendor Ingenious/Mike confirms the correct stock quantity workflow and import method.
