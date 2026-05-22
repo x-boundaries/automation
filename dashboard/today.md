@@ -19,19 +19,21 @@
    - **Next Action:** Ask Vendor Ingenious/Mike for SiteGiant-Shopify field mapping approach, mismatch handling, and whether a sample sync/export can be tested.
    - **Goal:** Get Vendor Ingenious/Mike/SiteGiant to confirm how SiteGiant data maps reliably into Shopify despite different input fields, including mandatory fields, fallback fields, and exception handling.
 
-4. **[T008] Prepare customer/debtor master list** (Priority: High, Effort: 3)
-   - **Next Action:** Identify trade customers to migrate and prepare 5-10 sample Debtor rows for test import.
-   - **Goal:** Prepare customer/debtor data for migration, especially wholesale, Metro, corporate, and Gebiz customers.
+4. **[T024] Shipment upload to PO/product update workflow** (Priority: High, Effort: 3)
+   - **Goal:** Take shipment details and prepare process for PO creation, new product creation, existing stock update, and price-change flag.
 
-5. **[T009] Prepare supplier/creditor master list** (Priority: High, Effort: 3)
-   - **Next Action:** Identify trade suppliers to migrate and prepare 5-10 sample Creditor rows for test import.
-   - **Goal:** Prepare supplier/creditor data including local/overseas suppliers, terms, currency, and contacts.
+5. **[T067] Define read-only automation rule** (Priority: High, Effort: 3)
+   - **Next Action:** Document phase 1 automations as export/compare/alert only; no write-back until process stable.
+   - **Goal:** Document that phase 1 automations collect/export/compare/alert only; no direct write-back until process is stable.
 
 ## ⚡ Quick Wins (Effort 1)
 *No quick wins identified.*
 
 ## 🛑 Blocked & Waiting Tasks
 - **[T007] Prepare stock master list** (Waiting) - Blocked by: MD Kar Han
+- **[T008] Prepare customer/debtor master list** (Waiting) - Blocked by: Brendan
+- **[T009] Prepare supplier/creditor master list** (Waiting) - Blocked by: Brendan
+- **[T010] Prepare Chart of Accounts draft** (Waiting) - Blocked by: Brendan/accountant
 - **[T013] Confirm opening accounting balances** (Waiting) - Blocked by: Brendan/accountant + Vendor Ingenious/Mike accounting treatment confirmation
 - **[T020] Build stock upload exception report** (Waiting) - Blocked by: Vendor Ingenious/Mike
 - **[T021] Create data dictionary** (Waiting) - Blocked by: Vendor Ingenious/Mike
@@ -46,6 +48,6 @@
 ## 📝 Recent Daily Log Entries
 - **2026-05-22 [T073]** - Verified receipt printer Windows 11 support. Current printer model is supported.
 - **2026-05-22 [T007]** - Updated next action: Pending MD Kar Han to clean master list data.
-- **2026-05-18 [T014]** - Completed live stock master legend workbook with README, Product_Master, SKU_History, and Lists tabs.
-- **2026-05-18 [T017]** - Completed live stock input workbook for staff incoming-stock entry.
-- **2026-05-18 [T019]** - Completed stock upload preparation MVP: input rows match against the master legend, show OK / NOT FOUND / DUPLICATE, and prepare AC2-ready output columns.
+- **2026-05-22 [T008]** - Prepared customer/debtor master list draft and passed to Brendan for checking.
+- **2026-05-22 [T009]** - Prepared supplier/creditor master list draft and passed to Brendan for checking.
+- **2026-05-22 [T010]** - Updated ReadyStatus to Waiting, blocked by Brendan/accountant.

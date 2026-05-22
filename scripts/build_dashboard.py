@@ -164,10 +164,10 @@ def main():
             done += 1
         elif status == 'Parked':
             parked += 1
-        elif ready_status in ['Waiting', 'Blocked']:
-            blocked_count += 1
         elif status == 'In Progress':
             in_progress += 1
+        elif ready_status in ['Waiting', 'Blocked']:
+            blocked_count += 1
         else:
             not_started += 1
 
