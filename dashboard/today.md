@@ -19,13 +19,12 @@
    - **Next Action:** Ask Vendor Ingenious/Mike for SiteGiant-Shopify field mapping approach, mismatch handling, and whether a sample sync/export can be tested.
    - **Goal:** Get Vendor Ingenious/Mike/SiteGiant to confirm how SiteGiant data maps reliably into Shopify despite different input fields, including mandatory fields, fallback fields, and exception handling.
 
-4. **[T008] Prepare customer/debtor master list** (Priority: High, Effort: 3)
-   - **Next Action:** Identify trade customers to migrate and prepare 5-10 sample Debtor rows for test import.
-   - **Goal:** Prepare customer/debtor data for migration, especially wholesale, Metro, corporate, and Gebiz customers.
+4. **[T010] Prepare Chart of Accounts draft** (Priority: High, Effort: 3)
+   - **Next Action:** Ask Brendan/accountant whether to use AutoCount default CoA or accountant-provided CoA.
+   - **Goal:** Coordinate with Brendan/Lik/accountant to prepare accounting buckets before using accounting module.
 
-5. **[T009] Prepare supplier/creditor master list** (Priority: High, Effort: 3)
-   - **Next Action:** Identify trade suppliers to migrate and prepare 5-10 sample Creditor rows for test import.
-   - **Goal:** Prepare supplier/creditor data including local/overseas suppliers, terms, currency, and contacts.
+5. **[T024] Shipment upload to PO/product update workflow** (Priority: High, Effort: 3)
+   - **Goal:** Take shipment details and prepare process for PO creation, new product creation, existing stock update, and price-change flag.
 
 ## ⚡ Quick Wins (Effort 1)
 *No quick wins identified.*
@@ -46,6 +45,6 @@
 ## 📝 Recent Daily Log Entries
 - **2026-05-22 [T073]** - Verified receipt printer Windows 11 support. Current printer model is supported.
 - **2026-05-22 [T007]** - Updated next action: Pending MD Kar Han to clean master list data.
+- **2026-05-22 [T008]** - Prepared customer/debtor master list draft and passed to Brendan for checking.
+- **2026-05-22 [T009]** - Prepared supplier/creditor master list draft and passed to Brendan for checking.
 - **2026-05-18 [T014]** - Completed live stock master legend workbook with README, Product_Master, SKU_History, and Lists tabs.
-- **2026-05-18 [T017]** - Completed live stock input workbook for staff incoming-stock entry.
-- **2026-05-18 [T019]** - Completed stock upload preparation MVP: input rows match against the master legend, show OK / NOT FOUND / DUPLICATE, and prepare AC2-ready output columns.
