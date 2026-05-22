@@ -8,6 +8,6 @@ Date,TaskID,WhatIDid,Evidence,TimeSpentMinutes,Confidence,SuggestedStatus,Notes
 2026-05-18,T070,Updated dashboard generator to use SGT timestamps and added duplicate-check output to the generated dashboard.,scripts/build_dashboard.py; scripts/rank_tasks.py,35,High,In Progress,Exact duplicate check is automated; semantic overlaps still need human review where workflows are intentionally split.
 2026-05-22,T073,Verified receipt printer Windows 11 support. Current printer model is supported.,User confirmation,10,High,Done,Windows 11 driver support confirmed.
 2026-05-22,T007,Updated next action: Pending MD Kar Han to clean master list data.,User update,5,High,Not Started,Structure/master legend is done; MD is cleaning master list data.
-2026-05-22,T008,"Prepared customer/debtor master list draft and passed to Brendan for checking.",Passed draft to Brendan,45,High,Done,Passed to Brendan for checking.
-2026-05-22,T009,"Prepared supplier/creditor master list draft and passed to Brendan for checking.",Passed draft to Brendan,45,High,Done,Passed to Brendan for checking.
+2026-05-22,T008,"Prepared customer/debtor master list draft and passed to Brendan for checking.",Passed draft to Brendan,45,High,Not Started,Passed draft to Brendan. Waiting for confirmation.
+2026-05-22,T009,"Prepared supplier/creditor master list draft and passed to Brendan for checking.",Passed draft to Brendan,45,High,Not Started,Passed draft to Brendan. Waiting for confirmation.
 2026-05-22,T010,"Updated ReadyStatus to Waiting, blocked by Brendan/accountant.",User request,5,High,Not Started,Waiting for Brendan/accountant to decide on default CoA vs accountant CoA.

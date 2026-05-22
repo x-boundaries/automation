@@ -31,6 +31,8 @@
 
 ## 🛑 Blocked & Waiting Tasks
 - **[T007] Prepare stock master list** (Waiting) - Blocked by: MD Kar Han
+- **[T008] Prepare customer/debtor master list** (Waiting) - Blocked by: Brendan
+- **[T009] Prepare supplier/creditor master list** (Waiting) - Blocked by: Brendan
 - **[T010] Prepare Chart of Accounts draft** (Waiting) - Blocked by: Brendan/accountant
 - **[T013] Confirm opening accounting balances** (Waiting) - Blocked by: Brendan/accountant + Vendor Ingenious/Mike accounting treatment confirmation
 - **[T020] Build stock upload exception report** (Waiting) - Blocked by: Vendor Ingenious/Mike
