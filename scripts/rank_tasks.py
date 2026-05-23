@@ -198,7 +198,7 @@ def generate_today_md(tasks):
     actionable = [t for t in tasks if t.get('ReadyStatus') == 'Ready' and t.get('Status') not in ['Done', 'Parked']]
     actionable.sort(key=lambda x: int(x.get('RankScore', 0)), reverse=True)
 
-    top_5 = actionable[:5]
+    top_10 = actionable[:10]
     quick_wins = [t for t in actionable if str(t.get('Effort', '')).strip() == '1']
     blocked_waiting = [t for t in tasks if t.get('ReadyStatus') in ['Blocked', 'Waiting'] and t.get('Status') not in ['Done', 'Parked']]
     stale_status = [t for t in tasks if t.get('StatusSuggestion') and t.get('StatusSuggestion') != 'No Change' and t.get('StatusSuggestion') != t.get('Status')]
@@ -211,11 +211,11 @@ def generate_today_md(tasks):
         "> ⚠️ **Reminder:** The agent does not auto-mark tasks as Done. Update the tracker manually when work is confirmed and evidence is provided.\n",
         "- [X-Boundaries Automation Repo](https://github.com/x-boundaries/automation)",
         "- [Main Dashboard](https://github.com/x-boundaries/automation/blob/main/dashboard/README.md)\n",
-        "## 🏆 Today's Top 5 Tasks"
+        "## 🏆 Today's Top 10 Tasks"
     ]
 
-    for i, t in enumerate(top_5, 1):
-        md.append(f"{i}. **[{t['TaskID']}] {t['Task']}** (Priority: {t.get('Priority', '')}, Effort: {t.get('Effort', '')})")
+    for i, t in enumerate(top_10, 1):
+        md.append(f"{i}. **[{t['TaskID']}] {t['Task']}** (Category: {t.get('Category', '')}, Priority: {t.get('Priority', '')}, Effort: {t.get('Effort', '')})")
         if t.get('NextAction'):
             md.append(f"   - **Next Action:** {t['NextAction']}")
         md.append(f"   - **Goal:** {t.get('Brief Description / Goal', '')}\n")
@@ -223,21 +223,21 @@ def generate_today_md(tasks):
     md.append("## ⚡ Quick Wins (Effort 1)")
     if quick_wins:
         for t in quick_wins:
-            md.append(f"- **[{t['TaskID']}] {t['Task']}** - {t.get('Brief Description / Goal', '')}")
+            md.append(f"- **[{t['TaskID']}] {t['Task']}** (Category: {t.get('Category', '')}) - {t.get('Brief Description / Goal', '')}")
     else:
         md.append("*No quick wins identified.*\n")
 
     md.append("## 🛑 Blocked & Waiting Tasks")
     if blocked_waiting:
         for t in blocked_waiting:
-            md.append(f"- **[{t['TaskID']}] {t['Task']}** ({t.get('ReadyStatus', '')}) - Blocked by: {t.get('BlockedBy', '')}")
+            md.append(f"- **[{t['TaskID']}] {t['Task']}** (Category: {t.get('Category', '')}, {t.get('ReadyStatus', '')}) - Blocked by: {t.get('BlockedBy', '')}")
     else:
         md.append("*No blocked or waiting tasks.*\n")
 
     if stale_status:
         md.append("## 🔎 Tasks Needing Status Review")
         for t in stale_status:
-            md.append(f"- **[{t['TaskID']}] {t['Task']}** - Suggested: *{t.get('StatusSuggestion', '')}*")
+            md.append(f"- **[{t['TaskID']}] {t['Task']}** (Category: {t.get('Category', '')}) - Suggested: *{t.get('StatusSuggestion', '')}*")
 
     daily_log_file = Path('tracker/daily_log.csv')
     if daily_log_file.exists():
