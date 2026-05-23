@@ -214,11 +214,22 @@ def generate_today_md(tasks):
         "## 🏆 Today's Top 10 Tasks"
     ]
 
-    for i, t in enumerate(top_10, 1):
-        md.append(f"{i}. **[{t['TaskID']}] {t['Task']}** (Category: {t.get('Category', '')}, Priority: {t.get('Priority', '')}, Effort: {t.get('Effort', '')})")
-        if t.get('NextAction'):
-            md.append(f"   - **Next Action:** {t['NextAction']}")
-        md.append(f"   - **Goal:** {t.get('Brief Description / Goal', '')}\n")
+    top_10_by_cat = {}
+    for t in top_10:
+        cat = t.get('Category', 'Other')
+        if not cat.strip():
+            cat = 'Other'
+        if cat not in top_10_by_cat:
+            top_10_by_cat[cat] = []
+        top_10_by_cat[cat].append(t)
+
+    for cat, tasks_in_cat in top_10_by_cat.items():
+        md.append(f"\n### {cat}")
+        for t in tasks_in_cat:
+            md.append(f"- **[{t['TaskID']}] {t['Task']}** (Priority: {t.get('Priority', '')}, Effort: {t.get('Effort', '')})")
+            if t.get('NextAction'):
+                md.append(f"  - **Next Action:** {t['NextAction']}")
+            md.append(f"  - **Goal:** {t.get('Brief Description / Goal', '')}\n")
 
     md.append("## ⚡ Quick Wins (Effort 1)")
     if quick_wins:
