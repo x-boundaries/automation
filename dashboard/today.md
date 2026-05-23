@@ -1,6 +1,6 @@
 # Daily Action Plan
 
-**Date:** 2026-05-22 SGT
+**Date:** 2026-05-23 SGT
 
 > ⚠️ **Reminder:** The agent does not auto-mark tasks as Done. Update the tracker manually when work is confirmed and evidence is provided.
 
@@ -41,7 +41,7 @@
 - **[T025] Create goods-in-transit tracker** (Waiting) - Blocked by: T013
 - **[T051] Create basic sales/channel dashboard** (Waiting) - Blocked by: Data exports reliability
 - **[T062] Create backup success / restore check alert** (Waiting) - Blocked by: Go-live
-- **[T071] Create bank reconciliation dashboard task** (Waiting) - Blocked by: T068
+- **[T076] Create bank reconciliation dashboard task** (Waiting) - Blocked by: T068
 - **[T071] Build bank reconciliation download comparator** (Waiting) - Blocked by: T068
 - **[T072] Create 30 Jun cutover balance gate** (Waiting) - Blocked by: T013
 

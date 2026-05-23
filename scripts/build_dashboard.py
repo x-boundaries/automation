@@ -206,14 +206,87 @@ def main():
             ["Source", "Request / Wishlist Item", "Covered in tracker task(s)", "Coverage"],
             ["Source", "Request / Wishlist Item", "Covered in tracker task(s)", "Coverage"]
         ),
-        "## Full Tracker\n",
-        generate_markdown_table(
-            tasks,
+        "\n## Active Task Streams\n"
+    ])
+
+    CATEGORIES_CONFIG = [
+        {
+            "name": "AutoCount ERP & Migration",
+            "header": "🏢 AutoCount ERP & Migration Tasks",
+            "description": "Tasks related to AutoCount 2.0 configuration, data migration preparation, POS hardware setup, training, and cutover gates."
+        },
+        {
+            "name": "Automation & Integrations",
+            "header": "🤖 Automation & Integration Tasks",
+            "description": "Tasks related to building custom scripts, n8n workflows, API integrations, data dictionaries, automated mapping templates, and alerts."
+        },
+        {
+            "name": "Operations & SOPs",
+            "header": "📦 Operations & SOPs Tasks",
+            "description": "Tasks related to Standard Operating Procedures (SOPs), manual workflows, goods-in-transit/pre-order tracking, and physical operations."
+        },
+        {
+            "name": "Analytics & Dashboards",
+            "header": "📊 Analytics & Dashboard Tasks",
+            "description": "Tasks related to designing and generating sales/inventory reports, KPIs, and dashboard visualizations."
+        }
+    ]
+
+    active_tasks = [t for t in tasks if t.get('Status') not in ['Done', 'Parked']]
+    completed_parked_tasks = [t for t in tasks if t.get('Status') in ['Done', 'Parked']]
+
+    # Separate active tasks by category
+    tasks_by_cat = defaultdict(list)
+    for t in active_tasks:
+        cat = t.get('Category', '').strip()
+        tasks_by_cat[cat].append(t)
+
+    recognized_cats = {c['name'] for c in CATEGORIES_CONFIG}
+
+    for cat_cfg in CATEGORIES_CONFIG:
+        cat_name = cat_cfg['name']
+        cat_tasks = tasks_by_cat[cat_name]
+        
+        md.append(f"\n### {cat_cfg['header']}\n")
+        md.append(f"*{cat_cfg['description']}*\n")
+        
+        if cat_tasks:
+            # Generate table without redundant Category column
+            md.append(generate_markdown_table(
+                cat_tasks,
+                ["TaskID", "Task", "Status", "Priority", "ReadyStatus", "DependsOn", "Effort", "Details", "BlockedBy"],
+                ["TaskID", "Task", "Status", "Priority", "ReadyStatus", "DependsOn", "Effort", "Details", "BlockedBy"]
+            ))
+        else:
+            md.append("*No active tasks in this section.*\n")
+
+    # Group other unrecognized active categories
+    other_cats = [cat for cat in tasks_by_cat if cat not in recognized_cats]
+    if other_cats:
+        md.append("\n### ❓ Other Active Tasks\n")
+        md.append("*Tasks in other unrecognized categories.*\n")
+        other_tasks = []
+        for cat in other_cats:
+            other_tasks.extend(tasks_by_cat[cat])
+        md.append(generate_markdown_table(
+            other_tasks,
             ["TaskID", "Category", "Task", "Status", "Priority", "ReadyStatus", "DependsOn", "Effort", "Details", "BlockedBy"],
             ["TaskID", "Category", "Task", "Status", "Priority", "ReadyStatus", "DependsOn", "Effort", "Details", "BlockedBy"]
-        ),
-        "<!-- GENERATED CONTENT END -->"
-    ])
+        ))
+
+    # Completed/parked section
+    md.append("\n<details>\n<summary><b>✅ Completed & Parked Tasks (Click to expand)</b></summary>\n<br>\n")
+    if completed_parked_tasks:
+        md.append(generate_markdown_table(
+            completed_parked_tasks,
+            ["TaskID", "Category", "Task", "Status", "Priority", "ReadyStatus", "DependsOn", "Effort", "Details", "BlockedBy"],
+            ["TaskID", "Category", "Task", "Status", "Priority", "ReadyStatus", "DependsOn", "Effort", "Details", "BlockedBy"]
+        ))
+    else:
+        md.append("*No completed or parked tasks.*\n")
+    md.append("</details>\n")
+
+    md.append("<!-- GENERATED CONTENT END -->")
 
     dashboard_content = "\n".join(md)
 
