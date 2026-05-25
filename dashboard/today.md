@@ -1,6 +1,6 @@
 # Daily Action Plan
 
-**Date:** 2026-05-23 SGT
+**Date:** 2026-05-25 SGT
 
 > ⚠️ **Reminder:** The agent does not auto-mark tasks as Done. Update the tracker manually when work is confirmed and evidence is provided.
 
@@ -10,13 +10,13 @@
 ## 🏆 Today's Top 10 Tasks
 
 ### Automation & Integrations
-- **[T068] Investigate AutoCount export/API/SQL access** (Priority: High, Effort: 3)
-  - **Next Action:** Investigate AutoCount export/API/SQL access options directly.
-  - **Goal:** Confirm allowed ways to extract data from AutoCount 2.0: export, SQL, API, or scheduled reports.
-
 - **[T075] Confirm SiteGiant to Shopify mapping reliability** (Priority: High, Effort: 2)
   - **Next Action:** Ask Vendor Ingenious/Mike for SiteGiant-Shopify field mapping approach, mismatch handling, and whether a sample sync/export can be tested.
   - **Goal:** Get Vendor Ingenious/Mike/SiteGiant to confirm how SiteGiant data maps reliably into Shopify despite different input fields, including mandatory fields, fallback fields, and exception handling.
+
+- **[T068] Investigate AutoCount export/API/SQL access** (Priority: High, Effort: 3)
+  - **Next Action:** Investigate AutoCount export/API/SQL access options directly.
+  - **Goal:** Confirm allowed ways to extract data from AutoCount 2.0: export, SQL, API, or scheduled reports.
 
 - **[T024] Shipment upload to PO/product update workflow** (Priority: High, Effort: 3)
   - **Goal:** Take shipment details and prepare process for PO creation, new product creation, existing stock update, and price-change flag.
