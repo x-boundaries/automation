@@ -1,6 +1,6 @@
 # Daily Action Plan
 
-**Date:** 2026-05-23 SGT
+**Date:** 2026-05-31 SGT
 
 > ⚠️ **Reminder:** The agent does not auto-mark tasks as Done. Update the tracker manually when work is confirmed and evidence is provided.
 
@@ -10,10 +10,6 @@
 ## 🏆 Today's Top 10 Tasks
 
 ### Automation & Integrations
-- **[T068] Investigate AutoCount export/API/SQL access** (Priority: High, Effort: 3)
-  - **Next Action:** Investigate AutoCount export/API/SQL access options directly.
-  - **Goal:** Confirm allowed ways to extract data from AutoCount 2.0: export, SQL, API, or scheduled reports.
-
 - **[T075] Confirm SiteGiant to Shopify mapping reliability** (Priority: High, Effort: 2)
   - **Next Action:** Ask Vendor Ingenious/Mike for SiteGiant-Shopify field mapping approach, mismatch handling, and whether a sample sync/export can be tested.
   - **Goal:** Get Vendor Ingenious/Mike/SiteGiant to confirm how SiteGiant data maps reliably into Shopify despite different input fields, including mandatory fields, fallback fields, and exception handling.
@@ -31,14 +27,13 @@
 - **[T039] Create daily POS/payment reconciliation MVP** (Priority: High, Effort: 5)
   - **Goal:** Compare POS sales by payment method against bank/card/payment reports and flag exceptions.
 
+- **[T070] Generate GitHub dashboard from tracker** (Priority: Medium, Effort: 3)
+  - **Goal:** Use tracker/work_tracker.csv and source_coverage.csv to build dashboard/README.md automatically.
+
 
 ### AutoCount ERP & Migration
-- **[T012] Confirm POS edge case handling** (Priority: High, Effort: 2)
-  - **Goal:** Ask Ingenious how refunds, exchanges, mall vouchers, store credits, voids, partial refunds, and split payments are handled.
-
-- **[T074] Define 5-day parallel run plan** (Priority: High, Effort: 3)
-  - **Next Action:** Draft 5-day parallel checklist covering POS, stock receiving, stock transfer, AR/AP, payments, refunds, and daily comparison reports.
-  - **Goal:** Turn Vendor Ingenious/Mike's suggestion into an exact Monday-Friday parallel run plan: what gets keyed into both systems, what reports are compared, who checks variances, and what blocks go-live.
+- **[T077] AutoCount ERP Migration & Setup (Consolidated)** (Priority: High, Effort: )
+  - **Goal:** Consolidated task. Includes: Build Vendor Ingenious/Mike migration call checklist | Confirm AutoCount 2.0 module scope | Confirm 6 migration templates | Add stock-in-transit questions | Add parallel run questions | Prepare Brendan finance data-source call | Prepare stock master list | Prepare customer/debtor master list | Prepare supplier/creditor master list | Prepare Chart of Accounts draft | Prepare channel pricing tiers | Confirm POS edge case handling | Confirm opening accounting balances | Create AutoCount stock item copy-paste template | Create current category cleanup/mapping | Create daily post-go-live issue log | Create backup success / restore check alert | Create failed sync tracker | Create master data change tracker | Create POS closing checklist | Create daily sales report archive | Investigate AutoCount export/API/SQL access | Create 30 Jun cutover balance gate | Verify receipt printer Windows 11 support | Define 5-day parallel run plan
 
 
 ### Operations & SOPs
@@ -48,24 +43,20 @@
 - **[T028] Create goods disbursement workflow by channel** (Priority: High, Effort: 5)
   - **Goal:** Use goods received data to disburse stock to MG, Online, Warehouse, JBM, or other locations.
 
+- **[T045] Confirm KrisShop workflow** (Priority: Medium, Effort: 2)
+  - **Goal:** Confirm SiteGiant compatibility or create manual import/export workaround.
+
 ## ⚡ Quick Wins (Effort 1)
 *No quick wins identified.*
 
 ## 🛑 Blocked & Waiting Tasks
-- **[T007] Prepare stock master list** (Category: AutoCount ERP & Migration, Waiting) - Blocked by: MD Kar Han
-- **[T008] Prepare customer/debtor master list** (Category: AutoCount ERP & Migration, Waiting) - Blocked by: Brendan
-- **[T009] Prepare supplier/creditor master list** (Category: AutoCount ERP & Migration, Waiting) - Blocked by: Brendan
-- **[T010] Prepare Chart of Accounts draft** (Category: AutoCount ERP & Migration, Waiting) - Blocked by: Brendan/accountant
-- **[T013] Confirm opening accounting balances** (Category: AutoCount ERP & Migration, Waiting) - Blocked by: Brendan/accountant + Vendor Ingenious/Mike accounting treatment confirmation
 - **[T020] Build stock upload exception report** (Category: Automation & Integrations, Waiting) - Blocked by: Vendor Ingenious/Mike
 - **[T021] Create data dictionary** (Category: Automation & Integrations, Waiting) - Blocked by: Vendor Ingenious/Mike
 - **[T022] Create export archive structure** (Category: Automation & Integrations, Waiting) - Blocked by: T068
 - **[T025] Create goods-in-transit tracker** (Category: Operations & SOPs, Waiting) - Blocked by: T013
 - **[T051] Create basic sales/channel dashboard** (Category: Analytics & Dashboards, Waiting) - Blocked by: Data exports reliability
-- **[T062] Create backup success / restore check alert** (Category: AutoCount ERP & Migration, Waiting) - Blocked by: Go-live
 - **[T076] Create bank reconciliation dashboard task** (Category: Analytics & Dashboards, Waiting) - Blocked by: T068
 - **[T071] Build bank reconciliation download comparator** (Category: Automation & Integrations, Waiting) - Blocked by: T068
-- **[T072] Create 30 Jun cutover balance gate** (Category: AutoCount ERP & Migration, Waiting) - Blocked by: T013
 
 ## 📝 Recent Daily Log Entries
 - **2026-05-22 [T073]** - Verified receipt printer Windows 11 support. Current printer model is supported.
