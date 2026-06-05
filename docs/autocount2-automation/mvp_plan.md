@@ -12,7 +12,7 @@ Tasks:
 - Confirm SQL Server instance name, database name, and edition.
 - Confirm whether the AutoCount API Module is licensed.
 - Confirm whether AOTG or API Maintenance is included in the current subscription.
-- Ask the vendor which stock, sales, AR/AP, GL, and item master read surfaces are supported.
+- Map official AutoCount docs and local sandbox tests to the stock, sales, AR/AP, GL, and item master read surfaces that are safe to use.
 - Identify which datasets must use official API/report logic because direct SQL could miss business rules.
 - Create a sandbox/test account book if possible.
 
@@ -152,7 +152,7 @@ Do not start this phase until:
 - dashboards reconcile with AutoCount reports,
 - security guardrails are signed off,
 - finance/operations define approval rules,
-- vendor confirms the official write path.
+- official docs, local sandbox testing, and optional later vendor review confirm the official write path.
 
 Design:
 

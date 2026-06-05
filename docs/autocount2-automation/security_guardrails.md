@@ -23,7 +23,7 @@ Create a dedicated SQL login or Windows identity for source reads.
 
 Minimum permissions:
 
-- `SELECT` on approved AutoCount views or vendor-approved read surfaces.
+- `SELECT` on approved AutoCount views or locally approved read surfaces.
 - No `INSERT`, `UPDATE`, `DELETE`, `MERGE`, `ALTER`, `CREATE`, `DROP`, or `EXECUTE` on posting routines.
 - No ownership chaining that allows writes indirectly.
 
@@ -90,7 +90,8 @@ Every scheduled run must write:
 - source date window,
 - row count,
 - file path outside repo,
-- file hash,
+- file SHA-256 hash,
+- file byte size,
 - status,
 - warning/error details.
 

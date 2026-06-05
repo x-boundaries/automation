@@ -53,7 +53,7 @@ Preferred implementation: .NET Framework 4.8 console application.
 
 Responsibilities:
 
-- Open a read-only AutoCount API/session or read vendor-approved SQL views.
+- Open a read-only AutoCount API/session or read approved read-only SQL views.
 - Extract only configured datasets.
 - Write raw batch files and reporting database rows.
 - Record run status, row counts, checksums, warnings, and exceptions.

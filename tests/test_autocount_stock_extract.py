@@ -1,4 +1,5 @@
 import csv
+import hashlib
 import json
 import sys
 import tempfile
@@ -89,24 +90,34 @@ class AutoCountStockExtractTests(unittest.TestCase):
 
             saved_manifest = json.loads((batch_dir / "run_manifest.json").read_text(encoding="utf-8"))
             self.assertEqual(saved_manifest["storage_batch_id"], "ac2_stock_2026-06-04")
+            self.assertRegex(saved_manifest["run_id"], r"^[0-9a-f-]{36}$")
+            self.assertEqual(manifest["run_id"], saved_manifest["run_id"])
             self.assertNotIn("rows", saved_manifest)
             self.assertNotIn("data", saved_manifest)
+            self.assertIn("files", saved_manifest["storage"])
+            for dataset_name in ("stock_master", "stock_balance", "stock_movement"):
+                dataset_file = batch_dir / f"{dataset_name}.csv"
+                file_record = saved_manifest["storage"]["files"][dataset_name]
+
+                self.assertEqual(file_record["path"], str(dataset_file))
+                self.assertEqual(file_record["byte_size"], dataset_file.stat().st_size)
+                self.assertEqual(file_record["sha256"], hashlib.sha256(dataset_file.read_bytes()).hexdigest())
             self.assertEqual(notifier.payloads, [saved_manifest])
 
-    def test_rerun_same_business_date_replaces_dataset_file(self):
+    def test_rerun_same_business_date_replaces_dataset_file_and_uses_new_run_id(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             config = base_config(Path(tmpdir))
             first_source = FakeSource({"stock_master": [{"ItemCode": "SKU-001"}]})
             second_source = FakeSource({"stock_master": [{"ItemCode": "SKU-002"}]})
 
-            extract.run_extraction(
+            first_manifest = extract.run_extraction(
                 config,
                 source=first_source,
                 notifier=None,
                 business_date="2026-06-04",
                 now=datetime.fromisoformat("2026-06-05T02:00:00+08:00"),
             )
-            extract.run_extraction(
+            second_manifest = extract.run_extraction(
                 config,
                 source=second_source,
                 notifier=None,
@@ -119,6 +130,8 @@ class AutoCountStockExtractTests(unittest.TestCase):
                 rows = list(csv.DictReader(handle))
 
             self.assertEqual(rows, [{"ItemCode": "SKU-002"}])
+            self.assertEqual(first_manifest["storage_batch_id"], second_manifest["storage_batch_id"])
+            self.assertNotEqual(first_manifest["run_id"], second_manifest["run_id"])
 
     def test_failed_run_writes_failure_manifest_and_notifies_without_secret_config(self):
         class FailingSource(FakeSource):

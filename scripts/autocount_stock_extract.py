@@ -1,5 +1,6 @@
 import argparse
 import csv
+import hashlib
 import json
 import os
 import re
@@ -7,6 +8,7 @@ import sys
 import urllib.request
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
+from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 
@@ -29,6 +31,7 @@ def build_run_context(
     snapshot_as_at = datetime.combine(run_date, time(23, 59, 59), tzinfo=tz)
 
     return {
+        "run_id": str(uuid4()),
         "business_date": run_date.isoformat(),
         "storage_batch_id": f"ac2_stock_{run_date.isoformat()}",
         "movement_from": movement_start.isoformat(),
@@ -54,6 +57,7 @@ def run_extraction(config, source=None, notifier=None, business_date=None, now=N
     source = source or create_source(config)
     row_counts = {}
     dataset_files = {}
+    storage_files = {}
     exceptions = []
 
     for dataset_name, dataset_config in config.get("datasets", {}).items():
@@ -63,6 +67,7 @@ def run_extraction(config, source=None, notifier=None, business_date=None, now=N
             write_csv(dataset_path, rows, columns=dataset_config.get("columns"))
             row_counts[dataset_name] = len(rows)
             dataset_files[dataset_name] = str(dataset_path)
+            storage_files[dataset_name] = describe_file(dataset_path)
         except Exception as exc:  # noqa: BLE001 - manifest should capture source failures.
             row_counts[dataset_name] = 0
             exceptions.append(
@@ -76,6 +81,7 @@ def run_extraction(config, source=None, notifier=None, business_date=None, now=N
     manifest = {
         "source": config.get("source", "autocount_ac2"),
         "job": config.get("job", "daily_stock_extract"),
+        "run_id": context["run_id"],
         "business_date": context["business_date"],
         "status": "failed" if exceptions else "success",
         "storage_batch_id": context["storage_batch_id"],
@@ -93,6 +99,7 @@ def run_extraction(config, source=None, notifier=None, business_date=None, now=N
         "storage": {
             "archive_path": str(batch_dir),
             "dataset_files": dataset_files,
+            "files": storage_files,
         },
     }
     if exceptions:
@@ -122,6 +129,14 @@ def write_csv(path, rows, columns=None):
         writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)
+
+
+def describe_file(path):
+    return {
+        "path": str(path),
+        "byte_size": path.stat().st_size,
+        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+    }
 
 
 def infer_columns(rows):

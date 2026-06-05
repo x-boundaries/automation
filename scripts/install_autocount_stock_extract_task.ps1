@@ -3,7 +3,10 @@ param(
     [string]$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path,
     [string]$PythonExe = "python.exe",
     [string]$ConfigPath = "D:\AutoCountStockExtract\autocount_stock_extract.local.json",
-    [string]$StartTime = "02:00"
+    [string]$StartTime = "02:00",
+    [string]$UserId = ([System.Security.Principal.WindowsIdentity]::GetCurrent().Name),
+    [ValidateSet("S4U", "Password", "Interactive", "InteractiveOrPassword", "ServiceAccount", "Group", "None")]
+    [string]$LogonType = "S4U"
 )
 
 $ErrorActionPreference = "Stop"
@@ -23,6 +26,10 @@ if ($timeParts.Count -ne 2) {
     throw "StartTime must use HH:mm format, for example 02:00"
 }
 
+if ($LogonType -eq "Interactive") {
+    Write-Warning "Interactive logon is intended for development/testing and may require a logged-in Windows session."
+}
+
 $today = Get-Date
 $triggerAt = Get-Date -Year $today.Year -Month $today.Month -Day $today.Day -Hour ([int]$timeParts[0]) -Minute ([int]$timeParts[1]) -Second 0
 
@@ -34,8 +41,8 @@ $settings = New-ScheduledTaskSettingsSet `
     -MultipleInstances IgnoreNew `
     -ExecutionTimeLimit (New-TimeSpan -Hours 2)
 $principal = New-ScheduledTaskPrincipal `
-    -UserId $env:USERNAME `
-    -LogonType Interactive `
+    -UserId $UserId `
+    -LogonType $LogonType `
     -RunLevel LeastPrivilege
 
 Register-ScheduledTask `
@@ -51,3 +58,5 @@ Write-Host "Registered scheduled task: $TaskName"
 Write-Host "Script: $scriptPath"
 Write-Host "Config: $ConfigPath"
 Write-Host "Daily start time: $StartTime"
+Write-Host "Run as: $UserId"
+Write-Host "Logon type: $LogonType"

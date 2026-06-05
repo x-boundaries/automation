@@ -8,7 +8,7 @@ This spike is for a local Windows VM where AutoCount Accounting 2.0 and Microsof
 
 The best first path for X-Boundaries is a native Windows/.NET extractor running beside AutoCount on the VM. The official AutoCount Programmer wiki presents the on-premise Accounting API as a .NET Framework integration surface for plug-ins, standalone applications, and services. The same Programmer page separately lists Cloud Accounting API documentation, which is a REST API for AutoCount Cloud Accounting, not proof of direct REST access to the local desktop database.
 
-For phase 1, build a read-only extractor against official AutoCount .NET APIs and/or vendor-approved read-only SQL views. Do not write directly to AutoCount production tables. If read-only SQL is used, constrain it to a dedicated SQL login with `SELECT` only on approved views, then load a separate reporting database.
+For phase 1, build a read-only extractor against official AutoCount .NET APIs and/or locally approved read-only SQL views. Do not write directly to AutoCount production tables. If read-only SQL is used, constrain it to a dedicated SQL login with `SELECT` only on approved views, then load a separate reporting database.
 
 ## Source Access Notes
 
@@ -50,11 +50,11 @@ Verified characteristics:
 
 ### Plug-ins and scripting: verified
 
-The Programmer page also lists plug-in and report/application scripting tutorials for Accounting 2.0. This is useful if a later integration must run inside the AutoCount desktop process or use UI/report behavior. It is not the recommended first read-only path unless the vendor confirms a plug-in is required to access specific reports.
+The Programmer page also lists plug-in and report/application scripting tutorials for Accounting 2.0. This is useful if a later integration must run inside the AutoCount desktop process or use UI/report behavior. It is not the recommended first read-only path unless official docs, local sandbox testing, or optional later vendor review show a plug-in is required to access specific reports.
 
-### Read-only SQL views: plausible but vendor-dependent
+### Read-only SQL views: plausible but requires local validation
 
-AutoCount Accounting uses Microsoft SQL Server, and the current X-Boundaries environment already has SQL Server 2019 on the same VM. Direct SQL reads are operationally simple and low cost, but the table schema and costing logic must be treated as vendor-owned. Use SQL only through vendor-approved views or read-only queries, and do not write to production AutoCount tables.
+AutoCount Accounting uses Microsoft SQL Server, and the current X-Boundaries environment already has SQL Server 2019 on the same VM. Direct SQL reads are operationally simple and low cost, but the table schema and costing logic must be treated as product-owned and version-sensitive. Use SQL only through locally approved read-only views or queries validated against AutoCount reports in a sandbox/local test, and do not write to production AutoCount tables.
 
 ### Excel/XML/common data import: verified, but write-oriented
 
@@ -86,7 +86,7 @@ The public Swagger lists endpoints such as:
 - `GET|POST|PUT|DELETE /{accountBookId}/journalentry`
 - `GET|POST|PUT|DELETE /{accountBookId}/stocktransfer`
 
-Do not assume these endpoints work against AutoCount Accounting 2.0 desktop/on-premise. Treat them as cloud-only unless AutoCount or the vendor confirms otherwise.
+Do not assume these endpoints work against AutoCount Accounting 2.0 desktop/on-premise. Treat them as cloud-only unless official AutoCount documentation or optional later vendor review confirms otherwise.
 
 ### API Maintenance: verified as key setup, unclear fit for local read-only
 
@@ -125,7 +125,7 @@ Assumptions to confirm:
 
 - Exact installed AutoCount Accounting version and build on the VM.
 - Whether the API Module is licensed for the production account book.
-- Whether the vendor supports read-only extractor use from a scheduled console app without launching UI.
+- Whether official AutoCount APIs support read-only extractor use from a scheduled console app without launching UI.
 - Whether report APIs can run unattended under Windows Task Scheduler.
 
 ## Public Example Links And Minimal Patterns
@@ -206,7 +206,7 @@ These pages confirm document APIs exist for accounting flows. Treat all save/pos
 - Which exact AutoCount build is installed, and which NuGet package version matches it?
 - Can an unattended scheduled process safely call `SubProjectStartup` without UI dependencies?
 - Are stock status/cost reports available through stable APIs without opening the desktop UI?
-- Which AutoCount data should be extracted via official API vs vendor-approved SQL view?
+- Which AutoCount data should be extracted via official API vs locally approved SQL view?
 - Will the read-only SQL account be allowed to query AutoCount production database views directly?
 - Are AOTG or API Maintenance already included in the current license/subscription?
 - If AOTG is used, what are the real current base URLs and rate/queue behavior? Some old wiki snippets still show legacy `http://aotg.cloud:8080` examples despite newer notes.
@@ -215,7 +215,7 @@ These pages confirm document APIs exist for accounting flows. Treat all save/pos
 
 ## Recommended First Read-only Integration Path
 
-1. Confirm installed AutoCount build, API Module licensing, and vendor-approved read surfaces.
+1. Confirm installed AutoCount build, API Module licensing, and locally approved read surfaces.
 2. Create a .NET Framework 4.8 console extractor on the Windows VM.
 3. Start with read-only master/reporting data:
    - company/account book metadata,
