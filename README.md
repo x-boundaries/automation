@@ -199,6 +199,15 @@ This repository must NOT store:
 
 Please review the full data policy in [docs/data_policy.md](docs/data_policy.md).
 
+## AutoCount 2.0 Automation Spike
+
+Research and architecture notes for local AutoCount 2.0 automation on the Windows VM:
+
+- [API research](docs/autocount2-automation/api_research.md)
+- [Local architecture](docs/autocount2-automation/architecture.md)
+- [MVP plan](docs/autocount2-automation/mvp_plan.md)
+- [Security guardrails](docs/autocount2-automation/security_guardrails.md)
+
 ## How to Update the Tracker
 
 1. Edit the CSV file at `tracker/work_tracker.csv`.
