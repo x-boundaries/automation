@@ -1,0 +1,96 @@
+{
+  "source": "autocount_ac2",
+  "job": "daily_stock_extract",
+  "timezone": "Asia/Singapore",
+  "overlap_days": 3,
+  "archive_root": "D:\\AutoCountStockArchive",
+  "source_connection": {
+    "kind": "sqlserver",
+    "connection_string_env": "AUTOCOUNT_READONLY_SQL_CONNECTION_STRING"
+  },
+  "notification": {
+    "webhook_url": "",
+    "timeout_seconds": 15
+  },
+  "datasets": {
+    "stock_master": {
+      "mode": "full",
+      "query": "SELECT ItemCode, Description, UOM, Barcode, ItemGroup, ItemBrand, ItemCategory, ItemClass, IsActive, StockControl, LastModified FROM dbo.vw_AutoCountStockMaster;",
+      "columns": [
+        "ItemCode",
+        "Description",
+        "UOM",
+        "Barcode",
+        "ItemGroup",
+        "ItemBrand",
+        "ItemCategory",
+        "ItemClass",
+        "IsActive",
+        "StockControl",
+        "LastModified"
+      ]
+    },
+    "stock_balance": {
+      "mode": "snapshot",
+      "query": "SELECT AsAtDate, ItemCode, Location, UOM, BalanceQty, SmallestBalQty, UnitCost, CostValue FROM dbo.vw_AutoCountStockBalance WHERE AsAtDate = CAST(? AS date);",
+      "parameters": [
+        "snapshot_as_at"
+      ],
+      "columns": [
+        "AsAtDate",
+        "ItemCode",
+        "Location",
+        "UOM",
+        "BalanceQty",
+        "SmallestBalQty",
+        "UnitCost",
+        "CostValue"
+      ]
+    },
+    "stock_movement": {
+      "mode": "window",
+      "query": "SELECT DocType, DocNo, DocDate, ItemCode, Location, BatchNo, UOM, QtyIn, QtyOut, UnitCost, SourceTable, LastModified FROM dbo.vw_AutoCountStockMovement WHERE DocDate >= CAST(? AS datetime2) AND DocDate < CAST(? AS datetime2);",
+      "parameters": [
+        "movement_from",
+        "movement_to"
+      ],
+      "columns": [
+        "DocType",
+        "DocNo",
+        "DocDate",
+        "ItemCode",
+        "Location",
+        "BatchNo",
+        "UOM",
+        "QtyIn",
+        "QtyOut",
+        "UnitCost",
+        "SourceTable",
+        "LastModified"
+      ]
+    },
+    "stock_documents": {
+      "mode": "window",
+      "query": "SELECT DocType, DocNo, DocDate, Cancelled, FromLocation, ToLocation, ItemCode, Location, UOM, Qty, UnitCost, RefDocNo, LastModified FROM dbo.vw_AutoCountStockDocuments WHERE DocDate >= CAST(? AS datetime2) AND DocDate < CAST(? AS datetime2);",
+      "parameters": [
+        "movement_from",
+        "movement_to"
+      ],
+      "columns": [
+        "DocType",
+        "DocNo",
+        "DocDate",
+        "Cancelled",
+        "FromLocation",
+        "ToLocation",
+        "ItemCode",
+        "Location",
+        "UOM",
+        "Qty",
+        "UnitCost",
+        "RefDocNo",
+        "LastModified"
+      ]
+    }
+  }
+}
