@@ -12,6 +12,7 @@ Tasks:
 - Confirm SQL Server instance name, database name, and edition.
 - Confirm whether the AutoCount API Module is licensed.
 - Confirm whether AOTG or API Maintenance is included in the current subscription.
+- Run the [AutoCount SQL Server local probe](../autocount_sql_probe.md) on the Windows VM with the read-only login to inventory visible schemas, tables/views, columns, permissions, and heuristic candidate read surfaces.
 - Map official AutoCount docs and local sandbox tests to the stock, sales, AR/AP, GL, and item master read surfaces that are safe to use.
 - Identify which datasets must use official API/report logic because direct SQL could miss business rules.
 - Create a sandbox/test account book if possible.
@@ -20,6 +21,7 @@ Deliverables:
 
 - API decision log.
 - Confirmed package version to pin.
+- SQL probe candidate report, kept outside the repo except for safe summaries.
 - Approved read-only source list.
 - Initial field/data dictionary for phase 1.
 
