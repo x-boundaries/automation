@@ -1,56 +1,64 @@
 import os
-import sys
 import subprocess
-import csv
+import sys
 from pathlib import Path
 
+
+REQUIRED_TEXT = [
+    "Source scope: `todo.md` and `XB new system 2026.xlsx` only.",
+    "Track SKU speed sold",
+    "What The Excel Workbook Is Asking For",
+    "Open Questions To Clarify",
+]
+
+FORBIDDEN_TEXT = [
+    "Today's Top 10 Tasks",
+    "Summary Metrics",
+    "Active Task Streams",
+    "Completed & Parked Tasks",
+    "ranked_tasks.csv",
+    "work_tracker.csv",
+]
+
+
+def fail(message):
+    print(f"FAIL: {message}")
+    sys.exit(1)
+
+
+def read_text(path):
+    return Path(path).read_text(encoding="utf-8")
+
+
 def run_test():
-    tracker_path = 'tracker/work_tracker.csv'
+    if not Path("dashboard/source_intake.md").exists():
+        fail("dashboard/source_intake.md not found.")
 
-    # 1. Check tracker exists
-    if not os.path.exists(tracker_path):
-        print("FAIL: tracker/work_tracker.csv not found.")
-        sys.exit(1)
-
-    # 2. Check required ranking columns exist
-    with open(tracker_path, 'r', encoding='utf-8') as f:
-        reader = csv.reader(f)
-        headers = next(reader)
-        required = ['RankScore', 'ReadyStatus', 'BlockedBy']
-        missing = [req for req in required if req not in headers]
-        if missing:
-            print(f"FAIL: Missing ranking columns: {missing}")
-            sys.exit(1)
-
-    # 3. Run rank_tasks.py
-    print("Running rank_tasks.py...")
-    res1 = subprocess.run([sys.executable, 'scripts/rank_tasks.py'], capture_output=True, text=True)
-    if res1.returncode != 0:
-        print(f"FAIL: rank_tasks.py failed.\n{res1.stderr}")
-        sys.exit(1)
-
-    # Check outputs of rank_tasks.py
-    if not os.path.exists('dashboard/today.md'):
-        print("FAIL: dashboard/today.md was not generated.")
-        sys.exit(1)
-    if not os.path.exists('dashboard/ranked_tasks.csv'):
-        print("FAIL: dashboard/ranked_tasks.csv was not generated.")
-        sys.exit(1)
-
-    # 4. Run build_dashboard.py
     print("Running build_dashboard.py...")
-    res2 = subprocess.run([sys.executable, 'scripts/build_dashboard.py'], capture_output=True, text=True)
-    if res2.returncode != 0:
-        print(f"FAIL: build_dashboard.py failed.\n{res2.stderr}")
-        sys.exit(1)
+    result = subprocess.run([sys.executable, "scripts/build_dashboard.py"], capture_output=True, text=True)
+    if result.returncode != 0:
+        fail(f"build_dashboard.py failed.\n{result.stderr}")
 
-    # Optional: check if dashboard updated successfully
-    if not os.path.exists('dashboard/README.md'):
-        print("FAIL: dashboard/README.md was not generated.")
-        sys.exit(1)
+    for path in ("dashboard/README.md", "README.md"):
+        if not Path(path).exists():
+            fail(f"{path} was not generated.")
 
-    print("SUCCESS: Smoke test passed.")
+    dashboard_text = read_text("dashboard/README.md")
+    root_text = read_text("README.md")
+    combined_text = dashboard_text + "\n" + root_text
+
+    for text in REQUIRED_TEXT:
+        if text not in combined_text:
+            fail(f"Expected text missing: {text}")
+
+    for text in FORBIDDEN_TEXT:
+        if text in combined_text:
+            fail(f"Legacy dashboard text still present: {text}")
+
+    print("SUCCESS: Two-document dashboard smoke test passed.")
     sys.exit(0)
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
+    os.chdir(Path(__file__).resolve().parents[1])
     run_test()
