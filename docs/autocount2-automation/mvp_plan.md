@@ -22,6 +22,7 @@ Deliverables:
 - API decision log.
 - Confirmed package version to pin.
 - SQL probe candidate report, kept outside the repo except for safe summaries.
+- [Extraction surface decision pack](extraction_surface_decision.md) using only safe probe summaries.
 - Approved read-only source list.
 - Initial field/data dictionary for phase 1.
 
@@ -44,6 +45,9 @@ Implementation:
   - item master,
   - debtor/creditor listing,
   - stock status if API/report access is confirmed.
+- Use the [Phase 1 extraction mapping](phase1_extraction_mapping.md) and
+  [reconciliation checklist](reconciliation_checklist.md) before replacing
+  placeholder stock extractor sources.
 - Log row counts, start/end time, source version, and exception details.
 - Register with Windows Task Scheduler only after manual runs succeed.
 

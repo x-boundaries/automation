@@ -208,6 +208,9 @@ Research and architecture notes for local AutoCount 2.0 automation on the Window
 - [MVP plan](docs/autocount2-automation/mvp_plan.md)
 - [Security guardrails](docs/autocount2-automation/security_guardrails.md)
 - [SQL Server local probe runbook](docs/autocount_sql_probe.md)
+- [Extraction surface decision pack](docs/autocount2-automation/extraction_surface_decision.md)
+- [Phase 1 extraction mapping](docs/autocount2-automation/phase1_extraction_mapping.md)
+- [Stock reconciliation checklist](docs/autocount2-automation/reconciliation_checklist.md)
 
 ## How to Update the Tracker
 
