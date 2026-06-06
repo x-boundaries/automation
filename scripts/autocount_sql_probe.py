@@ -45,6 +45,25 @@ RISKY_PERMISSION_NAMES = {
     "CREATE TABLE",
 }
 
+FIXED_DATABASE_ROLES_TO_CHECK = [
+    "db_owner",
+    "db_datawriter",
+    "db_ddladmin",
+    "db_securityadmin",
+    "db_accessadmin",
+    "db_backupoperator",
+    "db_datareader",
+]
+
+RISKY_DATABASE_ROLES = {
+    "db_owner": "Database owner can read, write, alter schema, and administer the database.",
+    "db_datawriter": "Data writer can insert, update, or delete rows and is not read-only.",
+    "db_ddladmin": "DDL admin can run schema changes and is not read-only.",
+    "db_securityadmin": "Security admin can change database security settings.",
+    "db_accessadmin": "Access admin can add or remove database access.",
+    "db_backupoperator": "Backup operator is elevated database access and should not be used for the probe/extractor login.",
+}
+
 
 def run_probe(
     config,
@@ -81,6 +100,7 @@ def run_probe(
         column_rows = active_source.fetch_columns(plan["schemas"])
         index_rows = active_source.fetch_indexes(plan["schemas"])
         permission_rows = active_source.fetch_permissions()
+        role_membership_rows = active_source.fetch_role_memberships()
         row_count_rows = []
         if plan["include_row_counts"]:
             row_count_rows = active_source.fetch_row_counts(object_rows)
@@ -88,6 +108,7 @@ def run_probe(
         keyword_groups = config.get("keyword_groups") or DEFAULT_KEYWORD_GROUPS
         candidates = match_candidate_objects(object_rows, column_rows, keyword_groups)
         permission_risks = detect_risky_permissions(permission_rows)
+        role_risks = detect_risky_roles(role_membership_rows)
 
         output_files["schemas_csv"] = write_csv(probe_path / "schemas.csv", schema_rows)
         output_files["objects_csv"] = write_csv(probe_path / "objects.csv", object_rows)
@@ -95,6 +116,8 @@ def run_probe(
         output_files["indexes_csv"] = write_csv(probe_path / "indexes.csv", index_rows)
         output_files["permissions_csv"] = write_csv(probe_path / "permissions.csv", permission_rows)
         output_files["permission_risks_csv"] = write_csv(probe_path / "permission_risks.csv", permission_risks)
+        output_files["role_memberships_csv"] = write_csv(probe_path / "role_memberships.csv", role_membership_rows)
+        output_files["role_risks_csv"] = write_csv(probe_path / "role_risks.csv", role_risks)
         output_files["candidates_csv"] = write_csv(probe_path / "candidates.csv", flatten_candidates(candidates))
         if plan["include_row_counts"]:
             output_files["row_counts_csv"] = write_csv(probe_path / "row_counts.csv", row_count_rows)
@@ -118,6 +141,8 @@ def run_probe(
                 columns=column_rows,
                 candidates=candidates,
                 permission_risks=permission_risks,
+                role_memberships=role_membership_rows,
+                role_risks=role_risks,
                 row_counts=row_count_rows,
                 sample_files=sample_files,
                 warnings=warnings,
@@ -133,9 +158,11 @@ def run_probe(
         column_rows = []
         index_rows = []
         permission_rows = []
+        role_membership_rows = []
         row_count_rows = []
         candidates = {name: [] for name in (config.get("keyword_groups") or DEFAULT_KEYWORD_GROUPS)}
         permission_risks = []
+        role_risks = []
         errors.append(sanitize_text(str(exc)))
         status = "failed"
 
@@ -157,11 +184,14 @@ def run_probe(
             "columns": len(column_rows),
             "indexes": len(index_rows),
             "permissions": len(permission_rows),
+            "role_memberships": len(role_membership_rows),
             "row_counts": len(row_count_rows),
             "permission_risks": len(permission_risks),
+            "role_risks": len(role_risks),
         },
         "candidate_groups": {group: len(records) for group, records in candidates.items()},
         "permission_risks": permission_risks,
+        "role_risks": role_risks,
         "storage": {
             "output_root": str(plan["output_root"]),
             "probe_path": str(probe_path),
@@ -292,6 +322,38 @@ def detect_risky_permissions(permission_rows):
     return risks
 
 
+def detect_risky_roles(role_membership_rows):
+    risks = []
+    seen_roles = set()
+    for row in role_membership_rows:
+        role_name = str(row.get("role_name", "")).lower()
+        if role_name not in RISKY_DATABASE_ROLES or not is_positive_membership(row.get("is_member", True)):
+            continue
+        if role_name in seen_roles:
+            continue
+        seen_roles.add(role_name)
+        risks.append(
+            {
+                "role_name": role_name,
+                "member_name": row.get("member_name", ""),
+                "source": row.get("source", ""),
+                "reason": RISKY_DATABASE_ROLES[role_name],
+                "best_effort": True,
+            }
+        )
+    return risks
+
+
+def is_positive_membership(value):
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value > 0
+    return str(value).strip().lower() in {"1", "true", "yes", "y"}
+
+
 def sanitize_text(message):
     redacted = re.sub(r"(?i)(password|pwd)\s*=\s*[^;\s]+", r"\1=<redacted>", str(message))
     redacted = re.sub(r"(?i)(token|apikey|api_key)\s*=\s*[^;&\s]+", r"\1=<redacted>", redacted)
@@ -417,6 +479,38 @@ class SqlServerMetadataSource:
             """
         )
 
+    def fetch_role_memberships(self):
+        role_memberships = self.query(
+            """
+            SELECT
+              role_principal.name AS role_name,
+              member_principal.name AS member_name,
+              CAST('database_role_members' AS nvarchar(64)) AS source,
+              CONVERT(bit, 1) AS is_member
+            FROM sys.database_role_members AS role_member
+            INNER JOIN sys.database_principals AS role_principal
+              ON role_principal.principal_id = role_member.role_principal_id
+            INNER JOIN sys.database_principals AS member_principal
+              ON member_principal.principal_id = role_member.member_principal_id
+            WHERE member_principal.principal_id = USER_ID()
+               OR member_principal.name = USER_NAME()
+            ORDER BY role_principal.name, member_principal.name
+            """
+        )
+        for role_name in FIXED_DATABASE_ROLES_TO_CHECK:
+            rows = self.query(
+                """
+                SELECT
+                  CAST(? AS nvarchar(128)) AS role_name,
+                  USER_NAME() AS member_name,
+                  CAST('is_rolemember' AS nvarchar(64)) AS source,
+                  IS_ROLEMEMBER(?) AS is_member
+                """,
+                [role_name, role_name],
+            )
+            role_memberships.extend(rows)
+        return role_memberships
+
     def fetch_row_counts(self, objects):
         object_filter = build_object_filter(objects)
         if not object_filter[0]:
@@ -493,6 +587,8 @@ def render_markdown_report(
     columns,
     candidates,
     permission_risks,
+    role_memberships=None,
+    role_risks=None,
     row_counts=None,
     sample_files=None,
     warnings=None,
@@ -516,6 +612,7 @@ def render_markdown_report(
             f"- Schemas: {len(schemas)}",
             f"- Tables/views: {len(objects)}",
             f"- Columns: {len(columns)}",
+            f"- Role memberships/checks: {len(role_memberships or [])}",
             f"- Row-count rows: {len(row_counts or [])}",
             "",
             "## Candidate Groups",
@@ -539,6 +636,19 @@ def render_markdown_report(
     for risk in permission_risks:
         target = risk.get("object_name") or risk.get("schema_name") or risk.get("class_desc")
         lines.append(f"- `{risk['permission_name']}` on `{target}`: {risk['reason']}")
+
+    lines.extend(
+        [
+            "",
+            "## Role Membership Risk Flags",
+            "",
+            "These flags are best-effort checks from visible role memberships and fixed-role membership probes.",
+        ]
+    )
+    if not role_risks:
+        lines.append("- No obvious risky database roles were visible to the probe login.")
+    for risk in role_risks or []:
+        lines.append(f"- `{risk['role_name']}` via `{risk.get('source', '')}`: {risk['reason']}")
 
     if sample_files:
         lines.extend(["", "## Sample Files", ""])

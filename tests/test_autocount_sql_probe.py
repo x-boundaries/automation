@@ -102,6 +102,34 @@ class FakeProbeSource:
             {"permission_name": "EXECUTE", "class_desc": "SCHEMA", "schema_name": "dbo"},
         ]
 
+    def fetch_role_memberships(self):
+        return [
+            {
+                "role_name": "db_owner",
+                "member_name": "svc_autocount_probe",
+                "source": "database_role_members",
+                "is_member": True,
+            },
+            {
+                "role_name": "db_datawriter",
+                "member_name": "svc_autocount_probe",
+                "source": "is_rolemember",
+                "is_member": True,
+            },
+            {
+                "role_name": "db_ddladmin",
+                "member_name": "svc_autocount_probe",
+                "source": "is_rolemember",
+                "is_member": True,
+            },
+            {
+                "role_name": "db_datareader",
+                "member_name": "svc_autocount_probe",
+                "source": "database_role_members",
+                "is_member": True,
+            },
+        ]
+
     def fetch_row_counts(self, objects):
         self.row_count_calls.append(objects)
         return [{"object_schema": "dbo", "object_name": "Item", "row_count": 10}]
@@ -139,7 +167,7 @@ class AutoCountSqlProbeTests(unittest.TestCase):
             self.assertEqual(saved_manifest["status"], "success")
             self.assertRegex(saved_manifest["run_id"], r"^[0-9a-f-]{36}$")
             self.assertEqual(saved_manifest["connection_string_env"], "AUTOCOUNT_READONLY_SQL_CONNECTION_STRING")
-            self.assertNotIn("rows", json.dumps(saved_manifest).lower())
+            self.assertNotIn('"rows":', json.dumps(saved_manifest).lower())
             self.assertNotIn("SKU-001", json.dumps(saved_manifest))
             self.assertEqual(saved_manifest["sample_limit"], 0)
             self.assertFalse(saved_manifest["samples_enabled"])
@@ -148,7 +176,15 @@ class AutoCountSqlProbeTests(unittest.TestCase):
             self.assertTrue((probe_path / "objects.csv").exists())
             self.assertTrue((probe_path / "columns.csv").exists())
             self.assertTrue((probe_path / "candidates.csv").exists())
+            self.assertTrue((probe_path / "role_memberships.csv").exists())
+            self.assertTrue((probe_path / "role_risks.csv").exists())
             self.assertTrue((probe_path / "probe_report.md").exists())
+            self.assertEqual(saved_manifest["counts"]["role_memberships"], 4)
+            self.assertEqual(saved_manifest["counts"]["role_risks"], 3)
+            self.assertIn("role_risks", saved_manifest)
+            report = (probe_path / "probe_report.md").read_text(encoding="utf-8")
+            self.assertIn("## Role Membership Risk Flags", report)
+            self.assertIn("db_owner", report)
 
     def test_output_root_must_stay_outside_repo(self):
         with self.assertRaises(ValueError):
@@ -173,6 +209,16 @@ class AutoCountSqlProbeTests(unittest.TestCase):
         self.assertIn("UPDATE", risk_names)
         self.assertIn("EXECUTE", risk_names)
         self.assertTrue(any("broad schema" in risk["reason"] for risk in risks))
+
+    def test_detects_risky_database_roles_without_flagging_datareader_only(self):
+        risks = probe.detect_risky_roles(FakeProbeSource().fetch_role_memberships())
+
+        role_names = {risk["role_name"] for risk in risks}
+        self.assertIn("db_owner", role_names)
+        self.assertIn("db_datawriter", role_names)
+        self.assertIn("db_ddladmin", role_names)
+        self.assertNotIn("db_datareader", role_names)
+        self.assertTrue(all(risk["best_effort"] for risk in risks))
 
     def test_redacts_secrets_from_error_text(self):
         text = "Login failed; Password=super-secret; PWD=another; token=abc123; Api_Key=xyz"

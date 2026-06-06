@@ -140,6 +140,8 @@ D:\AutoCountSqlProbe\
     indexes.csv
     permissions.csv
     permission_risks.csv
+    role_memberships.csv
+    role_risks.csv
     candidates.csv
     row_counts.csv
     samples\
@@ -152,7 +154,8 @@ candidate sample objects are configured.
 
 `probe_manifest.json` stores run metadata, counts, output file paths, candidate
 group counts, warning/error text with obvious secrets redacted, and best-effort
-permission risk flags. It must not contain raw sampled rows or credentials.
+direct-permission and role-membership risk flags. It must not contain raw
+sampled rows or credentials.
 
 ## Candidate Report
 
@@ -175,9 +178,14 @@ These are heuristic hints, not verified AutoCount truth. A candidate object is
 only safe to use after local validation proves the read-only login can query it
 and its totals reconcile with AutoCount UI/report outputs.
 
-## Read-Only Permission Check
+## Read-Only Permission And Role Checks
 
-The probe reads visible SQL permissions and flags obvious risky capabilities:
+The probe reads visible SQL permissions and database-role memberships. It also
+runs fixed-role membership checks with `IS_ROLEMEMBER(...)` for common SQL
+Server database roles. These checks are read-only and do not run destructive
+test statements.
+
+For direct permissions, it flags obvious risky capabilities:
 
 - `INSERT`,
 - `UPDATE`,
@@ -187,10 +195,25 @@ The probe reads visible SQL permissions and flags obvious risky capabilities:
 - `CREATE TABLE`,
 - broad-schema or database-level `EXECUTE`.
 
+For role memberships, dangerous roles such as these should block use as the
+read-only probe/extractor login until removed or replaced with a safer account:
+
+- `db_owner`,
+- `db_datawriter`,
+- `db_ddladmin`,
+- `db_securityadmin`,
+- `db_accessadmin`,
+- `db_backupoperator`.
+
+`db_datareader` alone is not flagged as risky by the probe, but it is still only
+one part of the read-only review. Confirm no other direct permissions or role
+memberships grant write, schema, security, or broad execute capability.
+
 This is a best-effort guardrail, not a formal security audit. A clean
-`permission_risks.csv` does not prove the login is safe. Confirm separately
-that the probe/extractor account cannot insert, update, delete, execute posting
-procedures, alter schema, or write to AutoCount production tables.
+`permission_risks.csv` and `role_risks.csv` do not prove the login is safe.
+Confirm separately that the probe/extractor account cannot insert, update,
+delete, execute posting procedures, alter schema, change security, or write to
+AutoCount production tables.
 
 ## Next Manual Step
 
