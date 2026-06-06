@@ -191,3 +191,52 @@ Optional later: ask the AutoCount vendor or implementation partner to review the
 
 The extractor is intentionally read-only. Phase 1 should not post stock,
 adjustment, transfer, or accounting entries back into AutoCount.
+
+## After Running The SQL Probe
+
+Use only safe summaries from the local probe outputs. Do not commit or paste raw
+sample rows, generated probe folders, local configs, credentials, connection
+strings, or production database names.
+
+1. Update the decision pack:
+
+   - Add safe SQL Server/database context to
+     [extraction_surface_decision.md](autocount2-automation/extraction_surface_decision.md).
+   - Summarise `permission_risks.csv` and `role_risks.csv`.
+   - Mark each candidate as `Selected for Phase 1`, `Needs reconciliation`,
+     `Rejected`, or `Unknown`.
+
+2. Choose stock candidates:
+
+   - Start with item/product/stock master candidates for `stock_master`.
+   - Use stock balance/status candidates only if they expose as-at quantity and
+     value semantics that can reconcile to AutoCount reports.
+   - Use stock movement/stock card candidates only if date-window totals,
+     document references, and signs can reconcile to AutoCount reports.
+   - Use stock document/transfer/adjustment candidates only after
+     cancelled/voided and transfer handling is clear.
+
+3. Update the local extractor config on the VM:
+
+   - Copy `config/autocount_stock_extract.from_probe.example.json` to a local
+     VM path such as
+     `D:\AutoCountStockExtract\autocount_stock_extract.local.json`.
+   - Replace only placeholder view names that have been selected in
+     [phase1_extraction_mapping.md](autocount2-automation/phase1_extraction_mapping.md).
+   - Keep `archive_root` outside GitHub.
+   - Keep the SQL connection string in
+     `AUTOCOUNT_READONLY_SQL_CONNECTION_STRING`.
+   - Do not add passwords or production connection strings to JSON.
+
+4. Run reconciliation before scheduling:
+
+   - Follow
+     [reconciliation_checklist.md](autocount2-automation/reconciliation_checklist.md).
+   - Confirm item counts, active/inactive counts, stock balance by location,
+     stock balance by item, stock value/cost totals, movement date-window
+     totals, cancelled/voided handling, and backdated movement handling.
+   - Confirm the SQL login has no direct write/schema/security risks and no
+     risky database roles such as `db_owner`, `db_datawriter`, or
+     `db_ddladmin`.
+   - Schedule the extractor only after manual runs and reconciliation pass for
+     the selected business dates.

@@ -1,0 +1,106 @@
+{
+  "source": "autocount_ac2",
+  "job": "daily_stock_extract",
+  "timezone": "Asia/Singapore",
+  "overlap_days": 3,
+  "archive_root": "D:\\AutoCountStockArchive",
+  "source_connection": {
+    "kind": "sqlserver",
+    "connection_string_env": "AUTOCOUNT_READONLY_SQL_CONNECTION_STRING"
+  },
+  "notification": {
+    "webhook_url": "",
+    "timeout_seconds": 15
+  },
+  "decision_pack": {
+    "source": "docs/autocount2-automation/extraction_surface_decision.md",
+    "mapping": "docs/autocount2-automation/phase1_extraction_mapping.md",
+    "reconciliation": "docs/autocount2-automation/reconciliation_checklist.md",
+    "status": "placeholder_until_safe_probe_summary_is_reviewed"
+  },
+  "datasets": {
+    "stock_master": {
+      "mode": "full",
+      "source_surface_status": "Unknown - replace after decision pack selects a reconciled read-only source",
+      "query": "SELECT ItemCode, Description, UOM, Barcode, ItemGroup, ItemBrand, ItemCategory, ItemClass, IsActive, StockControl, LastModified FROM dbo.vw_XB_AC2_StockMaster_Phase1;",
+      "columns": [
+        "ItemCode",
+        "Description",
+        "UOM",
+        "Barcode",
+        "ItemGroup",
+        "ItemBrand",
+        "ItemCategory",
+        "ItemClass",
+        "IsActive",
+        "StockControl",
+        "LastModified"
+      ]
+    },
+    "stock_balance": {
+      "mode": "snapshot",
+      "source_surface_status": "Unknown - replace after decision pack selects a reconciled read-only source",
+      "query": "SELECT AsAtDate, ItemCode, Location, UOM, BalanceQty, SmallestBalQty, UnitCost, CostValue FROM dbo.vw_XB_AC2_StockBalance_Phase1 WHERE AsAtDate = CAST(? AS date);",
+      "parameters": [
+        "snapshot_as_at"
+      ],
+      "columns": [
+        "AsAtDate",
+        "ItemCode",
+        "Location",
+        "UOM",
+        "BalanceQty",
+        "SmallestBalQty",
+        "UnitCost",
+        "CostValue"
+      ]
+    },
+    "stock_movement": {
+      "mode": "window",
+      "source_surface_status": "Unknown - replace after decision pack selects a reconciled read-only source",
+      "query": "SELECT DocType, DocNo, DocDate, ItemCode, Location, BatchNo, UOM, QtyIn, QtyOut, UnitCost, SourceTable, LastModified FROM dbo.vw_XB_AC2_StockMovement_Phase1 WHERE DocDate >= CAST(? AS datetime2) AND DocDate < CAST(? AS datetime2);",
+      "parameters": [
+        "movement_from",
+        "movement_to"
+      ],
+      "columns": [
+        "DocType",
+        "DocNo",
+        "DocDate",
+        "ItemCode",
+        "Location",
+        "BatchNo",
+        "UOM",
+        "QtyIn",
+        "QtyOut",
+        "UnitCost",
+        "SourceTable",
+        "LastModified"
+      ]
+    },
+    "stock_documents": {
+      "mode": "window",
+      "source_surface_status": "Unknown - replace after decision pack selects a reconciled read-only source",
+      "query": "SELECT DocType, DocNo, DocDate, Cancelled, FromLocation, ToLocation, ItemCode, Location, UOM, Qty, UnitCost, RefDocNo, LastModified FROM dbo.vw_XB_AC2_StockDocuments_Phase1 WHERE DocDate >= CAST(? AS datetime2) AND DocDate < CAST(? AS datetime2);",
+      "parameters": [
+        "movement_from",
+        "movement_to"
+      ],
+      "columns": [
+        "DocType",
+        "DocNo",
+        "DocDate",
+        "Cancelled",
+        "FromLocation",
+        "ToLocation",
+        "ItemCode",
+        "Location",
+        "UOM",
+        "Qty",
+        "UnitCost",
+        "RefDocNo",
+        "LastModified"
+      ]
+    }
+  }
+}
