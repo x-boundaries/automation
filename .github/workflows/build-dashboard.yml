@@ -3,23 +3,10 @@ name: Build Dashboard
 on:
   push:
     paths:
-      - 'tracker/**'
-      - 'scripts/**'
-      - '.github/workflows/build-dashboard.yml'
-
+      - "dashboard/source_intake.md"
+      - "scripts/build_dashboard.py"
+      - ".github/workflows/build-dashboard.yml"
   workflow_dispatch:
-
-  schedule:
-    # GitHub Actions schedules can be delayed/dropped at busy times.
-    # These are fallback attempts after the selected start time.
-    - cron: "23 8 * * 1-5"
-      timezone: "Asia/Singapore"
-    - cron: "23 10 * * 1-5"
-      timezone: "Asia/Singapore"
-    - cron: "23 12 * * 1-5"
-      timezone: "Asia/Singapore"
-    - cron: "23 16 * * 1-5"
-      timezone: "Asia/Singapore"
 
 permissions:
   contents: write
@@ -30,55 +17,24 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Set up Python 3.11
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
-      - name: Check if dashboard already generated today
-        id: once
-        run: |
-          TODAY=$(TZ=Asia/Singapore date +%F)
+      - name: Build dashboard
+        run: python scripts/build_dashboard.py
 
-          if grep -q "Last generated: $TODAY" README.md; then
-            echo "Dashboard already generated today."
-            echo "already_run=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "Dashboard has not been generated today."
-            echo "already_run=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Rank tasks and build dashboard
-        if: github.event_name != 'schedule' || steps.once.outputs.already_run != 'true'
-        run: |
-          python scripts/rank_tasks.py
-          python scripts/build_dashboard.py
-
-      - name: Commit changes
-        if: github.event_name != 'schedule' || steps.once.outputs.already_run != 'true'
+      - name: Commit generated dashboard
         run: |
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
           git config --local user.name "github-actions[bot]"
 
-          git add dashboard/
+          git add dashboard/source_intake.md
+          git add dashboard/README.md
           git add README.md
-          git add tracker/work_tracker.csv
 
-          # Only commit if there are changes to avoid error
-          git diff --quiet && git diff --staged --quiet || git commit -m "chore: update tracker dashboard [skip ci]"
-
-          git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
+          git diff --quiet && git diff --staged --quiet || git commit -m "chore: update two-document dashboard [skip ci]"
           git push
-
-      - name: Send Email Digest
-        if: (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && (github.event_name != 'schedule' || steps.once.outputs.already_run != 'true')
-        env:
-          SMTP_HOST: ${{ vars.SMTP_HOST }}
-          SMTP_PORT: ${{ vars.SMTP_PORT }}
-          SMTP_USERNAME: ${{ vars.SMTP_USERNAME }}
-          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
-          EMAIL_FROM: ${{ vars.EMAIL_FROM }}
-          EMAIL_TO: ${{ vars.EMAIL_TO }}
-        run: python scripts/send_email.py
