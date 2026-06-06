@@ -15,7 +15,6 @@ __pycache__/
 .venv/
 .pytest_cache/
 .env.*
-dashboard/email_preview.html
 
 # AutoCount SQL probe local outputs/config
 AutoCountSqlProbe/

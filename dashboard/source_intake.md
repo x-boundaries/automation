@@ -1,14 +1,3 @@
-# X-Boundaries Automation
-
-This repository keeps a small, source-backed automation intake dashboard for X-Boundaries. The active dashboard is intentionally scoped to `todo.md` and `XB new system 2026.xlsx` so the next work stays focused on confirmed needs and workbook clarification.
-
-<!-- DASHBOARD:START -->
-# X-Boundaries Automation Dashboard
-
-*Last reviewed: 2026-06-06 18:49:34 SGT*
-
-Source scope: `todo.md` and `XB new system 2026.xlsx` only.
-
 # Two-Document Intake
 
 This dashboard is intentionally scoped to two working documents:
@@ -92,37 +81,3 @@ The original files live outside this repository. This note is a distilled, non-o
 4. Confirm hardware and owner responsibilities for retail, warehouse, and wholesale scanning.
 5. Design the lowest-risk first dashboard around incoming orders, pending delivery, low-stock alerts, and SKU/category trend views.
 6. Keep write-back out of scope until export/import behavior is confirmed and manually validated.
-<!-- DASHBOARD:END -->
-
-## Data Policy Warning
-
-**Do NOT commit real company operational data to this repository.**
-
-This repository must NOT store:
-- Real stock master or product master files.
-- Real customer or supplier lists.
-- AP/AR records or invoices.
-- Bank or payment exports.
-- AutoCount database backups.
-- Passwords, API keys, or `.env` files.
-
-Please review the full data policy in [docs/data_policy.md](docs/data_policy.md).
-
-## AutoCount 2.0 Automation Spike
-
-Research and architecture notes for local AutoCount 2.0 automation on the Windows VM:
-
-- [API research](docs/autocount2-automation/api_research.md)
-- [Local architecture](docs/autocount2-automation/architecture.md)
-- [MVP plan](docs/autocount2-automation/mvp_plan.md)
-- [Security guardrails](docs/autocount2-automation/security_guardrails.md)
-- [SQL Server local probe runbook](docs/autocount_sql_probe.md)
-
-## How to Update This Dashboard
-
-1. Review the original `todo.md` and `XB new system 2026.xlsx` files outside this repo.
-2. Update the distilled intake summary at `dashboard/source_intake.md`.
-3. Run `python scripts/build_dashboard.py`.
-4. Commit `dashboard/source_intake.md`, `dashboard/README.md`, and `README.md`.
-
-Do not commit the original workbook or operational exports to this repository.
