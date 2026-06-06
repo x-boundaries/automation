@@ -1,0 +1,92 @@
+{
+  "job": "autocount_sql_probe",
+  "connection_string_env": "AUTOCOUNT_READONLY_SQL_CONNECTION_STRING",
+  "output_root": "D:\\AutoCountSqlProbe",
+  "database_name": "",
+  "schemas": [
+    "dbo"
+  ],
+  "sample_limit": 0,
+  "include_row_counts": false,
+  "sample_objects": [],
+  "keyword_groups": {
+    "item_product_stock_master": [
+      "item",
+      "product",
+      "stock",
+      "sku",
+      "barcode",
+      "uom"
+    ],
+    "stock_balance_status": [
+      "stockbalance",
+      "balance",
+      "status",
+      "onhand",
+      "quantity",
+      "qty"
+    ],
+    "stock_movement_card": [
+      "movement",
+      "stockcard",
+      "stock card",
+      "transaction",
+      "ledger"
+    ],
+    "stock_document_transfer_adjustment": [
+      "document",
+      "transfer",
+      "adjustment",
+      "adjust",
+      "receive",
+      "issue",
+      "stocktake",
+      "assembly"
+    ],
+    "sales_invoice_cash_sale": [
+      "sales",
+      "invoice",
+      "cashsale",
+      "cash sale"
+    ],
+    "purchase_order_grn": [
+      "purchase",
+      "purchaseorder",
+      "po",
+      "grn",
+      "goodsreceived",
+      "goods received"
+    ],
+    "debtor_customer": [
+      "debtor",
+      "customer"
+    ],
+    "creditor_supplier": [
+      "creditor",
+      "supplier",
+      "vendor"
+    ],
+    "ar_ap": [
+      "ar",
+      "ap",
+      "receivable",
+      "payable"
+    ],
+    "gl_account_journal": [
+      "gl",
+      "account",
+      "journal",
+      "ledger",
+      "coa"
+    ],
+    "payment_bank_cashbook": [
+      "payment",
+      "bank",
+      "cashbook",
+      "cash book",
+      "receipt",
+      "cheque",
+      "deposit"
+    ]
+  }
+}

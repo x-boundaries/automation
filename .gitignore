@@ -16,3 +16,10 @@ __pycache__/
 .pytest_cache/
 .env.*
 dashboard/email_preview.html
+
+# AutoCount SQL probe local outputs/config
+AutoCountSqlProbe/
+probe_outputs/
+probe_manifest.json
+autocount_sql_probe.local.json
+config/autocount_sql_probe.local.json

@@ -40,26 +40,32 @@ Weekly later:
 
 ## Production Setup On The VM
 
-1. Create a secure runtime folder outside the repo, for example:
+1. Run the [AutoCount SQL Server local probe](autocount_sql_probe.md) first.
+   Use its metadata-only candidate report to choose real read-only views,
+   official API/report outputs, or validated SQL queries before replacing the
+   placeholder `dbo.vw_AutoCount...` examples in the stock extractor config.
+   Do not commit probe outputs or raw sample rows.
+
+2. Create a secure runtime folder outside the repo, for example:
 
    ```powershell
    New-Item -ItemType Directory -Force D:\AutoCountStockExtract
    New-Item -ItemType Directory -Force D:\AutoCountStockArchive
    ```
 
-2. Copy `config/autocount_stock_extract.example.json` to:
+3. Copy `config/autocount_stock_extract.example.json` to:
 
    ```text
    D:\AutoCountStockExtract\autocount_stock_extract.local.json
    ```
 
-3. Edit the local config on the VM only:
+4. Edit the local config on the VM only:
 
    - Keep `archive_root` outside GitHub.
    - Replace the example `dbo.vw_AutoCount...` view names with approved read-only views, official API/report outputs, or SQL validated in local sandbox testing.
    - Leave `notification.webhook_url` blank unless a webhook receiver is ready.
 
-4. Use a read-only SQL connection. Prefer Windows authentication with a dedicated read-only Windows account. If SQL authentication is required, store it only on the VM, never in this repo.
+5. Use a read-only SQL connection. Prefer Windows authentication with a dedicated read-only Windows account. If SQL authentication is required, store it only on the VM, never in this repo.
 
    Example user-level environment variable:
 
@@ -71,13 +77,13 @@ Weekly later:
    )
    ```
 
-5. Install Python on the VM.
+6. Install Python on the VM.
 
    - Minimum: Python 3.9, because the extractor uses the standard-library `zoneinfo` module.
    - Recommended: Python 3.11 or newer on the Windows VM.
    - For scheduled production use, pass the full Python executable path to the installer script rather than relying on the interactive user's `PATH`.
 
-6. Install Python dependencies on the VM:
+7. Install Python dependencies on the VM:
 
    ```powershell
    py -3.11 -m pip install pyodbc
@@ -85,19 +91,19 @@ Weekly later:
 
    The VM also needs Microsoft ODBC Driver for SQL Server installed.
 
-7. Validate config without connecting to SQL:
+8. Validate config without connecting to SQL:
 
    ```powershell
    py -3.11 scripts\autocount_stock_extract.py --config D:\AutoCountStockExtract\autocount_stock_extract.local.json --dry-run
    ```
 
-8. Run a manual extraction for a known business date:
+9. Run a manual extraction for a known business date:
 
    ```powershell
    py -3.11 scripts\autocount_stock_extract.py --config D:\AutoCountStockExtract\autocount_stock_extract.local.json --business-date 2026-06-04
    ```
 
-9. Register the daily scheduled task.
+10. Register the daily scheduled task.
 
    Recommended production posture:
 
