@@ -42,6 +42,11 @@ Copy-Item config\autocount_sql_probe.example.json D:\AutoCountSqlProbeConfig\aut
 
 Do not commit the local config or generated probe outputs.
 
+## Troubleshooting
+
+If SQL Server reports a syntax error around an alias or keyword, pull the latest
+repo; probe aliases were hardened after Windows VM testing.
+
 ## Connection String
 
 The probe reads the SQL Server connection string only from an environment
