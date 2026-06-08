@@ -381,7 +381,7 @@ class SqlServerMetadataSource:
               CAST(SERVERPROPERTY('Edition') AS nvarchar(256)) AS edition,
               DB_NAME() AS current_database,
               SUSER_SNAME() AS current_login,
-              USER_NAME() AS current_user
+              USER_NAME() AS current_user_name
             """
         )
         return rows[0] if rows else {}

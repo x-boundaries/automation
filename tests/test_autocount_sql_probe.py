@@ -23,7 +23,7 @@ class FakeProbeSource:
             "edition": "Developer Edition",
             "current_database": database_name or "AutoCountSandbox",
             "current_login": "XB\\svc_autocount_probe",
-            "current_user": "svc_autocount_probe",
+            "current_user_name": "svc_autocount_probe",
         }
 
     def fetch_schemas(self, schemas=None):
@@ -140,6 +140,23 @@ class FakeProbeSource:
 
 
 class AutoCountSqlProbeTests(unittest.TestCase):
+    def test_server_info_query_uses_keyword_safe_user_alias(self):
+        class CapturingSource(probe.SqlServerMetadataSource):
+            def __init__(self):
+                super().__init__("Driver={stub};")
+                self.sql = ""
+
+            def query(self, sql, params=None):
+                self.sql = sql
+                return [{"current_user_name": "svc_autocount_probe"}]
+
+        source = CapturingSource()
+
+        source.fetch_server_info()
+
+        self.assertIn("AS current_user_name", source.sql)
+        self.assertNotRegex(source.sql, r"\bAS\s+current_user\b")
+
     def test_candidate_keyword_grouping_is_heuristic(self):
         source = FakeProbeSource()
 
