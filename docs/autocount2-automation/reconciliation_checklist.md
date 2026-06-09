@@ -9,6 +9,26 @@ Do not commit AutoCount exports, raw CSVs, screenshots with sensitive data,
 credentials, or local config files. Record only safe summaries, pass/fail
 results, row counts, totals, and non-sensitive notes.
 
+## Confirmed AC2 Target Phase 1 Checklist
+
+Use this concrete checklist for `localhost\A2006 / AED_XBOUNDARIES`, confirmed
+by the AutoCount 2.2 login screen as `(local)\A2006`, database
+`AED_XBOUNDARIES`, app DB version `2.2.94`.
+
+| Check | Compare | Pass criteria |
+| --- | --- | --- |
+| Confirm target database | Extractor/probe connection target vs AutoCount 2.2 login screen | Server is `localhost\A2006` or `(local)\A2006`; database is `AED_XBOUNDARIES`; no SQLEXPRESS database is used for AC2 extraction. |
+| Item master count | `Item` and `vItem` counts vs AutoCount stock item listing | 21,831-row safe count reconciles after applying the same stock/non-stock and active/inactive filters. |
+| Item/UOM count | `ItemUOM`, `vItemUOM`, and `vItemUOMBalQty` counts vs AutoCount item/UOM setup or listing | 21,831-row safe counts are expected, or differences are explained by UI/report filters. |
+| Location setup count | `Location` count vs AutoCount location setup | 7 locations reconcile to the AC2 location setup. |
+| Stock balance/status rows | `vItemBalQty`, `vItemUOMBalQty`, `ItemBatchBalQty`, and `vItemBatchBalQty` vs AutoCount stock balance/status report | Row counts and quantity totals match after the same date, location, UOM, zero-balance, and batch filters. |
+| `vItemBalQty` low count | `vItemBalQty` 1-row safe count vs stock balance/status report filters | Confirm whether the 1 row is expected, filtered, non-zero only, or unsuitable for Phase 1. |
+| `StockDTL` two rows | The two `StockDTL` rows dated 2026-06-04 vs AC2 stock card/movement UI/report | Both rows trace to AC2 UI/report output with matching document/date/item/location/UOM/sign meaning. |
+| Mostly empty transaction tables | `CS`, `IV`, `DO`, `GR`, and `PO` counts vs AC2 UI/report state | 0-row counts are expected because AC2 is not live yet. |
+| Imported master data counts | `Item`, `ItemUOM`, `Location`, `Debtor`, `Creditor`, `GLMast`, and `PaymentMethod` counts vs AC2 setup/import summaries | Counts are expected for imported master data and do not imply historical AC1 transactions. |
+| SQLEXPRESS exclusion | Candidate source references and local config placeholders | No old AC1 historical transactions are pulled from `localhost\SQLEXPRESS / AED_XBoundaries`. |
+| Final login posture | Follow-up probe with read-only login | Current `dbo` discovery login is replaced before scheduling; permission and role-risk outputs do not block automation. |
+
 ## Setup
 
 | Check | Expected evidence |
