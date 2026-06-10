@@ -8,6 +8,7 @@ exceptions/
 backups/
 *.bak
 *.sql
+!sql/**/*.template.sql
 *.sqlite
 *.db
 ~$*.xlsx
@@ -22,3 +23,11 @@ probe_outputs/
 probe_manifest.json
 autocount_sql_probe.local.json
 config/autocount_sql_probe.local.json
+
+# AutoCount Phase 1 reconciliation local outputs/config
+autocount_phase1_reconcile_outputs/
+phase1_reconcile_outputs/
+phase1_reconcile_manifest.json
+phase1_reconcile_report.md
+autocount_phase1_reconcile.local.json
+config/autocount_phase1_reconcile.local.json

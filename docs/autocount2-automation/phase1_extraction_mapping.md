@@ -1,5 +1,7 @@
 # Phase 1 Extraction Mapping
 
+Use the [Phase 1 reconciliation runbook](phase1_reconciliation_runbook.md) to validate these candidate surfaces against AutoCount UI/report outputs before replacing any placeholder with a wrapper view.
+
 This mapping turns the SQL probe decision pack into stock extractor
 configuration guidance. It is intentionally read-only and does not define any
 SQL write path.

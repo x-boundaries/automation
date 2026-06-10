@@ -1,0 +1,73 @@
+{
+  "job": "autocount_phase1_reconcile",
+  "target_label": "AutoCount 2.2 confirmed target: UI server (local)\\A2006; SQL server localhost\\A2006; database AED_XBOUNDARIES; app DB version 2.2.94",
+  "connection_string_env": "AUTOCOUNT_READONLY_SQL_CONNECTION_STRING",
+  "output_root": "C:\\XB\\autocount_phase1_reconcile_outputs",
+  "objects": [
+    "dbo.Item",
+    "dbo.ItemUOM",
+    "dbo.vItem",
+    "dbo.vItemUOM",
+    "dbo.Location",
+    "dbo.vItemBalQty",
+    "dbo.vItemUOMBalQty",
+    "dbo.ItemBatchBalQty",
+    "dbo.vItemBatchBalQty",
+    "dbo.StockDTL",
+    "dbo.vStockAdjustment",
+    "dbo.vStockAdjustmentDetail",
+    "dbo.vStockReceive",
+    "dbo.vStockReceiveDetail",
+    "dbo.vStockTransfer",
+    "dbo.vStockTransferDetail",
+    "dbo.vStockIssue",
+    "dbo.vStockIssueDetail",
+    "dbo.vStockWriteOff",
+    "dbo.vStockWriteOffDetail",
+    "dbo.vGoodsReceivedNote",
+    "dbo.vGoodsReceivedNoteDetail"
+  ],
+  "required_contracts": {
+    "stock_master": [
+      "ItemCode",
+      "Description",
+      "UOM",
+      "Barcode",
+      "ItemGroup",
+      "ItemBrand",
+      "ItemCategory",
+      "ItemClass",
+      "IsActive",
+      "StockControl",
+      "LastModified"
+    ],
+    "stock_balance": [
+      "ItemCode",
+      "Location",
+      "UOM",
+      "BalQty",
+      "LastModified"
+    ],
+    "stock_movement": [
+      "ItemCode",
+      "DocDate",
+      "DocNo",
+      "Location",
+      "UOM",
+      "Qty",
+      "Cost",
+      "TotalCost"
+    ],
+    "stock_documents": [
+      "DocDate",
+      "DocNo",
+      "ItemCode",
+      "Location",
+      "UOM",
+      "Qty",
+      "Cost",
+      "TotalCost",
+      "Cancelled"
+    ]
+  }
+}

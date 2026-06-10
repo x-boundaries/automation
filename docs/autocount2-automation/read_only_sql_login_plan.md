@@ -1,5 +1,7 @@
 # Read-Only SQL Login Plan
 
+Use the [Phase 1 reconciliation runbook](phase1_reconciliation_runbook.md) before granting the final read-only login access to approved wrapper views.
+
 This plan defines the security posture required before any scheduled AutoCount
 2.2 extraction runs against `localhost\A2006 / AED_XBOUNDARIES`.
 

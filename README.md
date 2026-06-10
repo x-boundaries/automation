@@ -7,12 +7,14 @@ Task tracking, pending-work dashboards, completed-task logs, and personal planni
 ## Current Automation Surfaces
 
 - `scripts/autocount_sql_probe.py`: read-only SQL metadata probe for discovering AutoCount database objects, columns, role memberships, and risky permissions.
+- `scripts/autocount_phase1_reconcile.py`: safe aggregate Phase 1 stock reconciliation summaries for validating candidate SQL surfaces against AutoCount UI/report outputs before scheduling extraction.
 - `scripts/autocount_stock_extract.py`: stock extraction/archive workflow for AutoCount stock master, stock balance, and stock movement datasets.
 - `scripts/install_autocount_stock_extract_task.ps1`: Windows Task Scheduler installer for the stock extraction job.
 
 ## Configuration Templates
 
 - `config/autocount_sql_probe.example.json`
+- `config/autocount_phase1_reconcile.example.json`
 - `config/autocount_stock_extract.example.json`
 - `config/autocount_stock_extract.from_probe.example.json`
 
@@ -27,6 +29,7 @@ Copy example files to local ignored config paths before use. Do not commit crede
 - [AutoCount 2 MVP plan](docs/autocount2-automation/mvp_plan.md)
 - [Extraction surface decision pack](docs/autocount2-automation/extraction_surface_decision.md)
 - [Phase 1 extraction mapping](docs/autocount2-automation/phase1_extraction_mapping.md)
+- [Phase 1 reconciliation runbook](docs/autocount2-automation/phase1_reconciliation_runbook.md)
 - [Stock reconciliation checklist](docs/autocount2-automation/reconciliation_checklist.md)
 - [Security guardrails](docs/autocount2-automation/security_guardrails.md)
 - [Data policy](docs/data_policy.md)
