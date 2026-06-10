@@ -24,6 +24,14 @@ class FakeReconcileSource(reconcile.SqlServerSummarySource):
             "dbo.StockDTL": ["ItemCode", "DocDate", "Location", "Qty", "TotalCost"],
         }
 
+    def fetch_column_inventory(self, objects):
+        rows = []
+        for obj in objects:
+            oid = reconcile.object_id(obj)
+            for column in self.columns.get(oid, []):
+                rows.append({"object_id": oid, "column_name": column, "data_type": "nvarchar", "is_nullable": "YES"})
+        return rows
+
     def fetch_columns(self, objects):
         return {reconcile.object_id(obj): self.columns.get(reconcile.object_id(obj), []) for obj in objects}
 
@@ -60,6 +68,11 @@ class AutoCountPhase1ReconcileTests(unittest.TestCase):
             self.assertNotIn("SKU-001", run_path.read_text if False else json.dumps(saved_manifest))
             for filename in reconcile.SUMMARY_FILES.values():
                 self.assertTrue((run_path / filename).exists())
+            self.assertTrue((run_path / "column_inventory.csv").exists())
+            self.assertIn("column_inventory", saved_manifest["output_files"])
+            self.assertIn("column_inventory", saved_manifest["counts"])
+            report_text = (run_path / "phase1_reconcile_report.md").read_text(encoding="utf-8")
+            self.assertIn("column_inventory.csv", report_text)
             self.assertTrue((run_path / "phase1_reconcile_report.md").exists())
 
     def test_column_coverage_logic(self):
@@ -94,6 +107,32 @@ class AutoCountPhase1ReconcileTests(unittest.TestCase):
             self.assertEqual(movement_rows[0]["total_qty"], "3.5")
             self.assertEqual(movement_rows[0]["total_cost"], "12.25")
 
+
+    def test_column_inventory_contains_metadata_only(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manifest = reconcile.run_reconciliation(base_config(tmpdir), source=FakeReconcileSource())
+            run_path = Path(manifest["storage"]["run_path"])
+
+            inventory_rows = read_csv(run_path / "column_inventory.csv")
+            self.assertTrue(inventory_rows)
+            self.assertEqual(set(inventory_rows[0]), {"object_id", "column_name", "data_type", "is_nullable"})
+            self.assertTrue(any(row["object_id"] == "dbo.Item" and row["column_name"] == "ItemCode" for row in inventory_rows))
+            inventory_text = (run_path / "column_inventory.csv").read_text(encoding="utf-8")
+            self.assertNotIn("SKU-001", inventory_text)
+            self.assertNotIn("Sample Item", inventory_text)
+            self.assertNotIn("row_count", inventory_text)
+
+    def test_no_connection_string_or_secrets_are_written(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manifest = reconcile.run_reconciliation(base_config(tmpdir), source=FakeReconcileSource())
+            run_path = Path(manifest["storage"]["run_path"])
+            output_text = "\n".join(path.read_text(encoding="utf-8") for path in run_path.iterdir() if path.is_file())
+
+            self.assertNotIn("Driver=", output_text)
+            self.assertNotIn("Password=", output_text)
+            self.assertNotIn("secret", output_text.lower())
+            self.assertNotIn("Server=prod", output_text)
+
     def test_secret_redaction(self):
         text = "Password=secret; PWD=other; token=abc; Server=prod; Database=Demo;"
 
@@ -116,6 +155,8 @@ class AutoCountPhase1ReconcileTests(unittest.TestCase):
 
             self.assertTrue(manifest["dry_run"])
             self.assertTrue((run_path / "phase1_reconcile_manifest.json").exists())
+            self.assertTrue((run_path / "column_inventory.csv").exists())
+            self.assertEqual(read_csv(run_path / "column_inventory.csv"), [])
             self.assertIn("Dry run", (run_path / "phase1_reconcile_report.md").read_text(encoding="utf-8"))
 
 

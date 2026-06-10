@@ -1,3 +1,4 @@
+import csv
 import json
 import sys
 import tempfile
@@ -136,7 +137,7 @@ class FakeProbeSource:
 
     def fetch_sample_rows(self, object_ref, limit):
         self.sample_calls.append((object_ref, limit))
-        return [{"ItemCode": "SKU-001", "Description": "Sample"}]
+        return [{"ItemCode": "=1+1", "Description": "Sample"}]
 
 
 class AutoCountSqlProbeTests(unittest.TestCase):
@@ -218,6 +219,22 @@ class AutoCountSqlProbeTests(unittest.TestCase):
             self.assertEqual(manifest["sample_limit"], 0)
             self.assertEqual(source.sample_calls, [])
             self.assertEqual(manifest["storage"]["sample_files"], [])
+
+    def test_enabled_sample_export_neutralizes_formula_like_values(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = FakeProbeSource()
+            config = base_config(tmpdir)
+            config["sample_limit"] = 1
+            config["sample_objects"] = [{"schema_name": "dbo", "object_name": "Item"}]
+
+            manifest = probe.run_probe(config, source=source)
+
+            self.assertTrue(manifest["samples_enabled"])
+            sample_path = Path(manifest["storage"]["sample_files"][0]["path"])
+            with sample_path.open("r", encoding="utf-8", newline="") as handle:
+                rows = list(csv.DictReader(handle))
+            self.assertEqual(rows[0]["ItemCode"], "'=1+1")
+            self.assertFalse(rows[0]["ItemCode"].startswith("="))
 
     def test_detects_risky_permissions_best_effort(self):
         risks = probe.detect_risky_permissions(FakeProbeSource().fetch_permissions())

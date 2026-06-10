@@ -8,6 +8,12 @@ from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from csv_safety import safe_csv_row
+
 
 DEFAULT_CONNECTION_STRING_ENV = "AUTOCOUNT_READONLY_SQL_CONNECTION_STRING"
 DEFAULT_OUTPUT_ROOT = r"D:\AutoCountSqlProbe"
@@ -672,7 +678,8 @@ def write_csv(path, rows):
             return str(path)
         writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
-        writer.writerows([{key: coerce_cell(row.get(key)) for key in fieldnames} for row in rows])
+        # Spreadsheet formula injection protection, including optional sample exports.
+        writer.writerows([safe_csv_row(row, fieldnames) for row in rows])
     return str(path)
 
 

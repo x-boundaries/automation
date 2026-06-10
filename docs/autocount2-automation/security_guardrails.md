@@ -79,6 +79,30 @@ AUTOCOUNT_READONLY_SQL_CONNECTION_STRING=<set on VM>
 AI_PROVIDER_API_KEY=<set outside repo>
 ```
 
+## CSV And Spreadsheet Safety
+
+Generated CSVs are spreadsheet-formula-neutralised before they are written. Text
+values that look like spreadsheet formulas are prefixed so spreadsheet tools
+should treat them as text if an operator opens the file. This protects the main
+stock extractor CSV outputs, SQL probe metadata/sample CSVs, and Phase 1
+reconciliation CSVs from formula injection regressions.
+
+Formula neutralisation does not make raw ERP exports safe to share. Extractor
+outputs and explicitly enabled SQL probe sample outputs can still contain raw
+business data, so keep them outside Git and restrict access to approved admins.
+Operators should avoid casually opening raw ERP CSVs in Excel or other
+spreadsheet tools unless there is an operational need.
+
+## Environment Metadata Disclosure
+
+Concrete local SQL server/database names, probe output paths, exact operational
+row counts, and role posture are environment metadata. Keep future exact
+environment snapshots in ignored local runbooks/configs where practical.
+Version-controlled docs should prefer generic labels or safe summaries when repo
+access may extend beyond trusted admins. If this repository remains
+private/admin-only, existing committed metadata can be accepted as low risk, but
+repo access must stay restricted.
+
 ## Job Logs And Audit Tables
 
 Every scheduled run must write:

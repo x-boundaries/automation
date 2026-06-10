@@ -1,6 +1,6 @@
 {
   "job": "autocount_phase1_reconcile",
-  "target_label": "AutoCount 2.2 confirmed target: UI server (local)\\A2006; SQL server localhost\\A2006; database AED_XBOUNDARIES; app DB version 2.2.94",
+  "target_label": "AutoCount 2.2 confirmed target - set exact local server/database details only in ignored local config",
   "connection_string_env": "AUTOCOUNT_READONLY_SQL_CONNECTION_STRING",
   "output_root": "C:\\XB\\autocount_phase1_reconcile_outputs",
   "objects": [
