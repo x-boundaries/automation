@@ -3,12 +3,10 @@
 ## Purpose
 
 This runbook defines the Phase 1 stock reconciliation kit for the confirmed
-AutoCount 2.2 target:
-
-- AutoCount UI server: `(local)\A2006`
-- SQL connection server: `localhost\A2006`
-- Database: `AED_XBOUNDARIES`
-- App DB version: `2.2.94`
+AutoCount 2.2 target. Keep exact server, database, and app-build details in
+ignored local config/run notes where practical; version-controlled docs should
+prefer this generic confirmed-target label unless repo access is limited to
+trusted admins.
 
 The goal is to validate candidate SQL surfaces against AutoCount UI/report
 outputs before creating final wrapper views, granting a final read-only login,
@@ -88,11 +86,10 @@ The script must not output raw business rows, item descriptions, customer names,
 supplier names, addresses, phone numbers, free-text remarks, credentials, or
 connection strings.
 
-
 ## Findings from first non-dry-run AC2 reconciliation
 
-The first confirmed non-dry-run pass against `localhost\A2006` /
-`AED_XBOUNDARIES` completed with `dry_run: false`, `safe_outputs_only: true`,
+The first confirmed non-dry-run pass against the approved local AC2 target
+completed with `dry_run: false`, `safe_outputs_only: true`,
 `raw_rows_exported: false`, and no warnings. Keep these findings as aggregate
 evidence only; do not commit the generated output folder or raw CSVs.
 
@@ -120,6 +117,14 @@ use. This is not approval for scheduled extraction or any SQL surface selection.
 
 > Warning: the current wrapper SQL template must not be executed until it is
 > updated for confirmed columns/sign semantics and manually reviewed.
+
+## CSV Safety
+
+All generated reconciliation CSVs are spreadsheet-formula-neutralised before
+write. Formula-like text values, including location or metadata fields beginning
+with `=`, `+`, `-`, or `@` after leading whitespace/control characters, should
+open as text in spreadsheet tools. These files are still operational evidence;
+keep generated folders outside Git and review before sharing.
 
 ## Compare Inside AutoCount UI
 

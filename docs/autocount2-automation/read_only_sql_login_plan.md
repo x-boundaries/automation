@@ -3,7 +3,7 @@
 Use the [Phase 1 reconciliation runbook](phase1_reconciliation_runbook.md) before granting the final read-only login access to approved wrapper views.
 
 This plan defines the security posture required before any scheduled AutoCount
-2.2 extraction runs against `localhost\A2006 / AED_XBOUNDARIES`.
+2.2 extraction runs against the confirmed AC2 target.
 
 ## Why The Current Login Is Discovery-Only
 
@@ -52,12 +52,24 @@ Preferred access pattern:
 - keep the connection string in `AUTOCOUNT_READONLY_SQL_CONNECTION_STRING`;
 - do not store passwords, tokens, or production connection strings in Git.
 
+## CSV And Metadata Handling
+
+SQL probe CSVs are spreadsheet-formula-neutralised, including optional sample
+exports when sample mode is explicitly enabled. This protection is only for
+spreadsheet formula injection; sample exports can still contain raw ERP values
+and must remain outside Git.
+
+Treat exact server/database names, local output paths, row counts, and role
+posture as environment metadata. Prefer generic labels in version-controlled
+docs unless the repository is restricted to trusted admins.
+
 ## Recommended Validation
 
 Before scheduling:
 
-1. Re-run the SQL probe against `localhost\A2006 / AED_XBOUNDARIES` using the
-   final read-only login.
+1. Re-run the SQL probe against the confirmed AC2 target using the final
+   read-only login. Keep exact server/database details in ignored local config
+   where practical.
 2. Confirm the probe can see only the approved source objects or wrapper views
    needed for Phase 1.
 3. Confirm `permission_risks.csv` is empty.

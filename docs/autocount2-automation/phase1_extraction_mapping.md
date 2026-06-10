@@ -6,10 +6,10 @@ This mapping turns the SQL probe decision pack into stock extractor
 configuration guidance. It is intentionally read-only and does not define any
 SQL write path.
 
-The confirmed AC2 target is `localhost\A2006 / AED_XBOUNDARIES`, matching the
-AutoCount 2.2 login screen for `(local)\A2006`, database `AED_XBOUNDARIES`, app
-DB version `2.2.94`. The safe probe handoff and first non-dry-run reconciliation confirm object
-visibility, aggregate counts, and metadata-only column coverage for several
+The confirmed AC2 target is represented here with a generic label; keep exact
+local server/database/app-build details in ignored operator notes where
+practical. The safe probe handoff and first non-dry-run reconciliation
+confirm object visibility, aggregate counts, and metadata-only column coverage for several
 candidates. Keep the configuration placeholder/wrapper-view based until
 [extraction_surface_decision.md](extraction_surface_decision.md) and
 [reconciliation_checklist.md](reconciliation_checklist.md) pass.
@@ -29,7 +29,6 @@ Before any candidate can replace a placeholder config entry:
 - No raw probe output, raw extract, local config, or credential is committed.
 
 ## Confirmed AC2 target and candidate shortlist
-
 
 ## Actual column findings from first reconciliation
 

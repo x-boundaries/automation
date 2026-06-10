@@ -11,6 +11,12 @@ from pathlib import Path
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from csv_safety import safe_csv_row
+
 
 DEFAULT_TIMEZONE = "Asia/Singapore"
 DEFAULT_OVERLAP_DAYS = 3
@@ -128,7 +134,8 @@ def write_csv(path, rows, columns=None):
             return
         writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
-        writer.writerows(rows)
+        # Spreadsheet formula injection protection for raw ERP text values.
+        writer.writerows([safe_csv_row(row, fieldnames) for row in rows])
 
 
 def describe_file(path):

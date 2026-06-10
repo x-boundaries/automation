@@ -9,6 +9,12 @@ from decimal import Decimal
 from pathlib import Path
 from uuid import uuid4
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from csv_safety import coerce_csv_cell
+
 DEFAULT_CONNECTION_STRING_ENV = "AUTOCOUNT_READONLY_SQL_CONNECTION_STRING"
 DEFAULT_CONFIG_PATH = Path("config/autocount_phase1_reconcile.example.json")
 DEFAULT_OUTPUT_ROOT = r"C:\XB\autocount_phase1_reconcile_outputs"
@@ -340,7 +346,8 @@ def write_csv(path, rows):
         writer = csv.DictWriter(handle, fieldnames=fieldnames or ["status"])
         writer.writeheader()
         for row in rows:
-            writer.writerow({key: redact_value(row.get(key, "")) for key in fieldnames})
+            # Spreadsheet formula injection protection for future metadata/aggregate fields.
+            writer.writerow({key: coerce_csv_cell(redact_value(row.get(key, ""))) for key in fieldnames})
     return str(path)
 
 
