@@ -1,5 +1,7 @@
 # AutoCount Stock Reconciliation Checklist
 
+Run the [Phase 1 reconciliation runbook](phase1_reconciliation_runbook.md) before marking any candidate object or wrapper view as reconciled.
+
 Use this checklist before scheduling any Phase 1 stock extraction job. All
 checks compare read-only extractor output against AutoCount UI/report outputs
 for the same company/account book, date, location scope, posting state, and UOM

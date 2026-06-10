@@ -1,5 +1,7 @@
 # AutoCount Extraction Surface Decision
 
+See also the [Phase 1 reconciliation runbook](phase1_reconciliation_runbook.md) for the safe aggregate validation workflow before wrapper views are finalized.
+
 ## Status
 
 Decision pack date: 2026-06-09
