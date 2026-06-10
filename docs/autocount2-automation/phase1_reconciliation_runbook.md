@@ -59,6 +59,7 @@ writes only safe summaries:
 - `phase1_reconcile_manifest.json`
 - `phase1_reconcile_report.md`
 - `object_counts.csv`
+- `column_inventory.csv`
 - `column_coverage.csv`
 - `date_ranges.csv`
 - `location_counts.csv`
@@ -71,6 +72,8 @@ Use the outputs as evidence for or against candidate wrapper-view design. They
 are not final extraction outputs.
 
 - `object_counts.csv`: row count by shortlisted object.
+- `column_inventory.csv`: metadata-only list of object columns, data types, and
+  nullable flags where available. It must not contain row values.
 - `column_coverage.csv`: required extractor-contract columns present/missing by
   object and contract.
 - `date_ranges.csv`: min/max `DocDate` only for objects where that column exists.
@@ -84,6 +87,39 @@ are not final extraction outputs.
 The script must not output raw business rows, item descriptions, customer names,
 supplier names, addresses, phone numbers, free-text remarks, credentials, or
 connection strings.
+
+
+## Findings from first non-dry-run AC2 reconciliation
+
+The first confirmed non-dry-run pass against `localhost\A2006` /
+`AED_XBOUNDARIES` completed with `dry_run: false`, `safe_outputs_only: true`,
+`raw_rows_exported: false`, and no warnings. Keep these findings as aggregate
+evidence only; do not commit the generated output folder or raw CSVs.
+
+Safe aggregate findings:
+
+- Master candidate counts: `dbo.Item`, `dbo.ItemUOM`, `dbo.vItem`, and
+  `dbo.vItemUOM` each reported 21,831 rows.
+- Location setup reported 7 rows: `GIT`, `HQ`, `XB01`, `XB02`, `XB03`,
+  `XB04`, and `XB05`.
+- Location-bearing activity in the safe summaries was limited to `XB01`: one
+  `vItemBalQty` row, one `ItemBatchBalQty` row, and two `StockDTL` rows.
+- Stock balance totals reconciled to aggregate `BalQty = -2` across
+  `vItemBalQty`, `vItemUOMBalQty`, `ItemBatchBalQty`, and
+  `vItemBatchBalQty`.
+- Movement summary reported two `StockDTL` rows, total `Qty = -2`, total
+  `Cost = 66.16`, and a movement date range from
+  `2026-06-04T12:18:07.493000` to `2026-06-04T12:25:02.990000`.
+- Stock adjustment, stock receive, stock transfer, stock issue, stock write-off,
+  and goods-received-note candidate header/detail views currently reported 0
+  rows in the aggregate pass.
+
+These aggregate facts support the working interpretation that the AC2
+environment has setup/master data loaded but is not yet in live transactional
+use. This is not approval for scheduled extraction or any SQL surface selection.
+
+> Warning: the current wrapper SQL template must not be executed until it is
+> updated for confirmed columns/sign semantics and manually reviewed.
 
 ## Compare Inside AutoCount UI
 

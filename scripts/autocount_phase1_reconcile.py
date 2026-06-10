@@ -34,6 +34,7 @@ REQUIRED_CONTRACTS = {
 
 SUMMARY_FILES = {
     "object_counts": "object_counts.csv",
+    "column_inventory": "column_inventory.csv",
     "column_coverage": "column_coverage.csv",
     "date_ranges": "date_ranges.csv",
     "location_counts": "location_counts.csv",
@@ -61,7 +62,8 @@ def run_reconciliation(config, source=None, output_root=None, dry_run=False, now
         columns_by_object = {object_id(obj): [] for obj in objects}
     else:
         active_source = source or create_source(plan["connection_string_env"])
-        columns_by_object = active_source.fetch_columns(objects)
+        summaries["column_inventory"] = active_source.fetch_column_inventory(objects)
+        columns_by_object = columns_by_object_from_inventory(summaries["column_inventory"])
         summaries["object_counts"] = active_source.fetch_object_counts(objects)
         summaries["date_ranges"] = active_source.fetch_date_ranges(objects, columns_by_object)
         summaries["location_counts"] = active_source.fetch_location_counts(objects, columns_by_object)
@@ -155,6 +157,16 @@ def empty_summaries():
     return {key: [] for key in SUMMARY_FILES}
 
 
+def columns_by_object_from_inventory(column_inventory):
+    columns = {}
+    for row in column_inventory:
+        object_key = row.get("object_id")
+        column_name = row.get("column_name")
+        if object_key and column_name:
+            columns.setdefault(object_key, []).append(column_name)
+    return columns
+
+
 def build_column_coverage(objects, columns_by_object, contracts):
     rows = []
     for obj in objects:
@@ -191,20 +203,33 @@ class SqlServerSummarySource:
             columns = [column[0] for column in cursor.description]
             return [dict(zip(columns, row)) for row in cursor.fetchall()]
 
-    def fetch_columns(self, objects):
-        results = {}
+    def fetch_column_inventory(self, objects):
+        rows = []
         for obj in objects:
-            rows = self.query(
+            for row in self.query(
                 """
-                SELECT COLUMN_NAME AS column_name
+                SELECT
+                    COLUMN_NAME AS column_name,
+                    DATA_TYPE AS data_type,
+                    IS_NULLABLE AS is_nullable
                 FROM INFORMATION_SCHEMA.COLUMNS
                 WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
                 ORDER BY ORDINAL_POSITION
                 """,
                 [obj["schema_name"], obj["object_name"]],
-            )
-            results[object_id(obj)] = [row["column_name"] for row in rows]
-        return results
+            ):
+                rows.append(
+                    {
+                        "object_id": object_id(obj),
+                        "column_name": row.get("column_name"),
+                        "data_type": row.get("data_type"),
+                        "is_nullable": row.get("is_nullable"),
+                    }
+                )
+        return rows
+
+    def fetch_columns(self, objects):
+        return columns_by_object_from_inventory(self.fetch_column_inventory(objects))
 
     def fetch_object_counts(self, objects):
         rows = []
@@ -340,7 +365,7 @@ def render_report(manifest, summaries):
     lines.extend([
         "",
         "## Required Manual Comparisons",
-        "- Compare stock item listing count to `object_counts.csv` and `column_coverage.csv`.",
+        "- Compare stock item listing count to `object_counts.csv`, `column_inventory.csv`, and `column_coverage.csv`.",
         "- Compare location setup count to `location_counts.csv`.",
         "- Compare stock balance/status report totals to `stock_balance_summary.csv`.",
         "- Compare stock card/movement report totals to `movement_summary.csv` and `date_ranges.csv`.",
