@@ -141,6 +141,16 @@ class FakeProbeSource:
 
 
 class AutoCountSqlProbeTests(unittest.TestCase):
+    def test_load_config_accepts_utf8_bom(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "autocount_sql_probe.local.json"
+            path.write_text("\ufeff" + json.dumps(base_config(tmpdir)), encoding="utf-8")
+
+            loaded = probe.load_config(path)
+
+            self.assertEqual(loaded["job"], "autocount_sql_probe")
+            self.assertEqual(loaded["connection_string_env"], "AUTOCOUNT_READONLY_SQL_CONNECTION_STRING")
+
     def test_server_info_query_uses_keyword_safe_user_alias(self):
         class CapturingSource(probe.SqlServerMetadataSource):
             def __init__(self):

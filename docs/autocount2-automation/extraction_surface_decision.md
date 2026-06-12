@@ -36,7 +36,7 @@ Use exactly these labels for each candidate:
 | Server shown in AutoCount 2.2 login | `(local)\A2006` |
 | Database shown in AutoCount 2.2 login | `AED_XBOUNDARIES` |
 | App DB version shown in AutoCount 2.2 | `2.2.94` |
-| Probe output folder | `C:\XB\autocount_probe_outputs\probe_20260608_164301_21ea2942` |
+| Probe output folder | `C:\XB\autocount_probe_outputs\probe_20260608_164301_21ea2942` (legacy/manual first-run folder; use `C:\XB\autocount_outputs\probe` going forward) |
 | Probe output handling | Keep local only; do not commit generated probe files |
 
 ## Probe Metadata Summary

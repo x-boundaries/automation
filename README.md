@@ -15,10 +15,21 @@ Task tracking, pending-work dashboards, completed-task logs, and personal planni
 
 - `config/autocount_sql_probe.example.json`
 - `config/autocount_phase1_reconcile.example.json`
+- `config/autocount_stock_extract.ac2_smoke.example.json`
 - `config/autocount_stock_extract.example.json`
 - `config/autocount_stock_extract.from_probe.example.json`
 
 Copy example files to local ignored config paths before use. Do not commit credentials, connection strings, production exports, or real operational data.
+
+## Local Output Convention
+
+Keep all generated AutoCount outputs under `C:\XB\autocount_outputs`:
+
+- SQL probe: `C:\XB\autocount_outputs\probe`
+- Phase 1 reconciliation: `C:\XB\autocount_outputs\reconcile`
+- Stock extraction: `C:\XB\autocount_outputs\extract\stock`
+
+Raw CSVs stay local and must not be committed. Paste back only reviewed manifests and safe summaries.
 
 ## Runbooks And Design Notes
 
@@ -29,6 +40,7 @@ Copy example files to local ignored config paths before use. Do not commit crede
 - [AutoCount 2 MVP plan](docs/autocount2-automation/mvp_plan.md)
 - [Extraction surface decision pack](docs/autocount2-automation/extraction_surface_decision.md)
 - [Phase 1 extraction mapping](docs/autocount2-automation/phase1_extraction_mapping.md)
+- [Phase 1 AC2 stock extraction smoke runbook](docs/autocount2-automation/phase1_stock_extract_smoke_runbook.md)
 - [Phase 1 reconciliation runbook](docs/autocount2-automation/phase1_reconciliation_runbook.md)
 - [Stock reconciliation checklist](docs/autocount2-automation/reconciliation_checklist.md)
 - [Security guardrails](docs/autocount2-automation/security_guardrails.md)
@@ -51,4 +63,4 @@ This repository must not store:
 - AutoCount database backups.
 - Passwords, API keys, or `.env` files.
 
-Real data should stay in approved secure storage outside GitHub. Local test outputs should go into ignored folders such as `data/`, `exports/`, `outputs/`, or `exceptions/`.
+Real data should stay in approved secure storage outside GitHub. AutoCount workflow outputs should go under `C:\XB\autocount_outputs` on the VM; generic local test outputs should go into ignored folders such as `data/`, `exports/`, `outputs/`, or `exceptions/`.

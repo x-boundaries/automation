@@ -93,6 +93,29 @@ business data, so keep them outside Git and restrict access to approved admins.
 Operators should avoid casually opening raw ERP CSVs in Excel or other
 spreadsheet tools unless there is an operational need.
 
+## Local Output Folders
+
+All generated AutoCount workflow outputs should stay under:
+
+```text
+C:\XB\autocount_outputs
+```
+
+Use workflow subfolders:
+
+- `C:\XB\autocount_outputs\probe`
+- `C:\XB\autocount_outputs\reconcile`
+- `C:\XB\autocount_outputs\extract\stock`
+
+Older ad hoc folders such as `C:\XB\autocount_stock_extract_outputs`,
+`C:\XB\autocount_phase1_reconcile_outputs`, and
+`C:\XB\autocount_probe_outputs` are legacy/manual paths and should be avoided
+going forward.
+
+Raw CSVs stay local and must not be committed. Only reviewed manifests and safe
+summaries should be pasted back for review. For the verified smoke workflow,
+use the [Phase 1 AC2 stock extraction smoke runbook](phase1_stock_extract_smoke_runbook.md).
+
 ## Environment Metadata Disclosure
 
 Concrete local SQL server/database names, probe output paths, exact operational

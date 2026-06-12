@@ -16,7 +16,7 @@ from csv_safety import safe_csv_row
 
 
 DEFAULT_CONNECTION_STRING_ENV = "AUTOCOUNT_READONLY_SQL_CONNECTION_STRING"
-DEFAULT_OUTPUT_ROOT = r"D:\AutoCountSqlProbe"
+DEFAULT_OUTPUT_ROOT = r"C:\XB\autocount_outputs\probe"
 DEFAULT_CONFIG_PATH = Path("config/autocount_sql_probe.example.json")
 
 DEFAULT_KEYWORD_GROUPS = {
@@ -769,7 +769,7 @@ def coerce_cell(value):
 
 
 def load_config(path):
-    return json.loads(Path(path).read_text(encoding="utf-8"))
+    return json.loads(Path(path).read_text(encoding="utf-8-sig"))
 
 
 def _coerce_datetime(value):
@@ -791,7 +791,7 @@ def _is_relative_to(path, root):
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Probe AutoCount SQL Server metadata using a read-only login.")
     parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH), help="Path to secret-free probe config JSON.")
-    parser.add_argument("--output-root", help="Local output root outside the repo. Defaults to D:\\AutoCountSqlProbe.")
+    parser.add_argument("--output-root", help=r"Local output root outside the repo. Defaults to C:\XB\autocount_outputs\probe.")
     parser.add_argument("--database-name", help="Optional database name/context to use for metadata queries.")
     parser.add_argument("--schemas", help="Comma-separated schema filter. Empty means all visible schemas.")
     parser.add_argument("--sample-limit", type=int, help="Optional SELECT TOP (N) sample limit. Defaults to config value.")

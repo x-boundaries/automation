@@ -1,7 +1,7 @@
 {
   "job": "autocount_sql_probe",
   "connection_string_env": "AUTOCOUNT_READONLY_SQL_CONNECTION_STRING",
-  "output_root": "D:\\AutoCountSqlProbe",
+  "output_root": "C:\\XB\\autocount_outputs\\probe",
   "database_name": "",
   "schemas": [
     "dbo"

@@ -1,4 +1,6 @@
 import csv
+import contextlib
+import io
 import hashlib
 import json
 import sys
@@ -6,6 +8,7 @@ import tempfile
 import unittest
 from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfoNotFoundError
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -48,6 +51,16 @@ def base_config(archive_root):
 
 
 class AutoCountStockExtractTests(unittest.TestCase):
+    def test_load_config_accepts_utf8_bom(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "autocount_stock_extract.local.json"
+            path.write_text("\ufeff" + json.dumps(base_config(Path(tmpdir))), encoding="utf-8")
+
+            loaded = extract.load_config(path)
+
+            self.assertEqual(loaded["source"], "autocount_ac2")
+            self.assertEqual(loaded["timezone"], "Asia/Singapore")
+
     def test_build_run_context_uses_overlap_window(self):
         context = extract.build_run_context(
             business_date="2026-06-04",
@@ -193,6 +206,64 @@ class AutoCountStockExtractTests(unittest.TestCase):
         self.assertEqual(params[0], datetime.fromisoformat("2026-06-01T00:00:00"))
         self.assertEqual(params[1], datetime.fromisoformat("2026-06-05T00:00:00"))
         self.assertEqual(params[2], datetime.fromisoformat("2026-06-04T23:59:59"))
+
+    def test_missing_timezone_data_error_is_operator_friendly(self):
+        original_zoneinfo = extract.ZoneInfo
+
+        def missing_timezone_data(timezone_name):
+            raise ZoneInfoNotFoundError(f"No time zone found with key {timezone_name}")
+
+        extract.ZoneInfo = missing_timezone_data
+        try:
+            with self.assertRaisesRegex(RuntimeError, "Windows Python.*tzdata.*python -m pip install tzdata"):
+                extract.build_run_context(
+                    business_date="2026-06-04",
+                    timezone_name="Asia/Singapore",
+                    now=datetime.fromisoformat("2026-06-05T02:00:00+08:00"),
+                )
+        finally:
+            extract.ZoneInfo = original_zoneinfo
+
+    def test_smoke_example_config_contract_is_secret_free(self):
+        config_path = ROOT / "config" / "autocount_stock_extract.ac2_smoke.example.json"
+
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(config["job"], "phase1_stock_extract_smoke")
+        self.assertEqual(config["source"], "autocount_ac2")
+        self.assertEqual(config["timezone"], "Asia/Singapore")
+        self.assertEqual(config["overlap_days"], 3)
+        self.assertEqual(config["archive_root"], r"C:\XB\autocount_outputs\extract\stock")
+        self.assertEqual(
+            config["source_connection"],
+            {
+                "kind": "sqlserver",
+                "connection_string_env": "AUTOCOUNT_READONLY_SQL_CONNECTION_STRING",
+            },
+        )
+        self.assertNotIn("connection_string", set(config["source_connection"]) - {"connection_string_env"})
+        self.assertNotRegex(json.dumps(config), r"(?i)(Driver=|Server=|Password=|PWD=|Trusted_Connection=)")
+        self.assertEqual(set(config["datasets"]), {"stock_master", "stock_balance", "stock_movement"})
+
+    def test_smoke_example_config_dry_run_context_still_works(self):
+        stdout = io.StringIO()
+
+        with contextlib.redirect_stdout(stdout):
+            exit_code = extract.main(
+                [
+                    "--config",
+                    str(ROOT / "config" / "autocount_stock_extract.ac2_smoke.example.json"),
+                    "--business-date",
+                    "2026-06-04",
+                    "--dry-run",
+                ]
+            )
+
+        context = json.loads(stdout.getvalue())
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(context["business_date"], "2026-06-04")
+        self.assertEqual(context["movement_from"], "2026-06-01T00:00:00+08:00")
+        self.assertEqual(context["movement_to"], "2026-06-05T00:00:00+08:00")
 
 
 if __name__ == "__main__":

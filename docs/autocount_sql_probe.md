@@ -26,21 +26,25 @@ Install Python and the SQL Server ODBC pieces on the AutoCount VM:
 - Minimum Python: 3.9.
 - Recommended Python: 3.11 or newer.
 - Python package: `pyodbc`.
-- Microsoft ODBC Driver for SQL Server.
+- Microsoft ODBC Driver 17 for SQL Server.
 
 ```powershell
 py -3.11 -m pip install pyodbc
-New-Item -ItemType Directory -Force D:\AutoCountSqlProbe
+New-Item -ItemType Directory -Force C:\XB\autocount_outputs\probe
 ```
 
 Copy the example config to a local-only path:
 
 ```powershell
-New-Item -ItemType Directory -Force D:\AutoCountSqlProbeConfig
-Copy-Item config\autocount_sql_probe.example.json D:\AutoCountSqlProbeConfig\autocount_sql_probe.local.json
+Copy-Item config\autocount_sql_probe.example.json config\autocount_sql_probe.local.json
 ```
 
 Do not commit the local config or generated probe outputs.
+
+All generated AutoCount outputs should stay under `C:\XB\autocount_outputs`.
+The probe subfolder is `C:\XB\autocount_outputs\probe`. Older folders such as
+`C:\XB\autocount_probe_outputs` and `D:\AutoCountSqlProbe` are legacy/manual
+paths and should be avoided going forward.
 
 ## Troubleshooting
 
@@ -61,7 +65,7 @@ Set it on the VM for the Windows/task account that will run the probe:
 ```powershell
 [Environment]::SetEnvironmentVariable(
   "AUTOCOUNT_READONLY_SQL_CONNECTION_STRING",
-  "Driver={ODBC Driver 18 for SQL Server};Server=YOUR-SERVER;Database=YOUR-AUTOCOUNT-DB;Trusted_Connection=yes;Encrypt=yes;TrustServerCertificate=yes;ApplicationIntent=ReadOnly;",
+  "Driver={ODBC Driver 17 for SQL Server};Server=YOUR-SERVER;Database=YOUR-AUTOCOUNT-DB;Trusted_Connection=yes;Encrypt=yes;TrustServerCertificate=yes;ApplicationIntent=ReadOnly;",
   "User"
 )
 ```
@@ -77,7 +81,7 @@ without connecting to SQL Server or creating a probe output folder.
 
 ```powershell
 py -3.11 scripts\autocount_sql_probe.py `
-  --config D:\AutoCountSqlProbeConfig\autocount_sql_probe.local.json `
+  --config config\autocount_sql_probe.local.json `
   --dry-run
 ```
 
@@ -87,8 +91,8 @@ The default probe writes SQL metadata only. It does not write raw business rows.
 
 ```powershell
 py -3.11 scripts\autocount_sql_probe.py `
-  --config D:\AutoCountSqlProbeConfig\autocount_sql_probe.local.json `
-  --output-root D:\AutoCountSqlProbe `
+  --config config\autocount_sql_probe.local.json `
+  --output-root C:\XB\autocount_outputs\probe `
   --schemas dbo
 ```
 
@@ -135,7 +139,7 @@ test statements.
 Each real probe creates one timestamped folder under the output root:
 
 ```text
-D:\AutoCountSqlProbe\
+C:\XB\autocount_outputs\probe\
   probe_20260606_093000_1a2b3c4d\
     probe_manifest.json
     probe_report.md

@@ -1,20 +1,28 @@
 # AutoCount Stock Extraction Runbook
 
-## Recommended Architecture
+## Phase 1 Smoke Architecture
 
-Run the extractor on the AutoCount SQL Server VM with Windows Task Scheduler.
+The current Phase 1 workflow is manual, read-only smoke extraction on the
+AutoCount SQL Server VM. Operators run the extractor manually for approved
+smoke dates, review `run_manifest.json`, and keep raw CSVs local.
+
+Windows Task Scheduler is future production reference only. No scheduled
+extraction is approved yet.
 
 ```text
-Windows Task Scheduler
+Manual operator run on the VM
   -> scripts/autocount_stock_extract.py
   -> read-only AutoCount SQL views or approved AutoCount API/report outputs
   -> secure archive batch outside GitHub
-  -> optional webhook/email/dashboard refresh
+  -> reviewed run_manifest.json for safe handoff
 ```
 
 n8n is not required for storage. If it is used later, keep it as an optional
 notification/orchestration layer that receives only `run_manifest.json`, not raw
 stock rows.
+
+For the verified AC2 smoke workflow, use the
+[Phase 1 AC2 stock extraction smoke runbook](autocount2-automation/phase1_stock_extract_smoke_runbook.md).
 
 ## What Gets Extracted
 
@@ -35,6 +43,7 @@ Weekly later:
 
 - `scripts/autocount_stock_extract.py`: read-only extractor CLI.
 - `scripts/install_autocount_stock_extract_task.ps1`: Windows Task Scheduler installer.
+- `config/autocount_stock_extract.ac2_smoke.example.json`: secret-free AC2 smoke extraction-validation profile.
 - `config/autocount_stock_extract.example.json`: safe example config with placeholder SQL views.
 - `tests/test_autocount_stock_extract.py`: unit tests for extraction windows, manifests, archive writes, and failure notifications.
 
@@ -46,22 +55,21 @@ Weekly later:
    placeholder `dbo.vw_AutoCount...` examples in the stock extractor config.
    Do not commit probe outputs or raw sample rows.
 
-2. Create a secure runtime folder outside the repo, for example:
+2. Create the standard local output folder outside the repo:
 
    ```powershell
-   New-Item -ItemType Directory -Force D:\AutoCountStockExtract
-   New-Item -ItemType Directory -Force D:\AutoCountStockArchive
+   New-Item -ItemType Directory -Force C:\XB\autocount_outputs\extract\stock
    ```
 
 3. Copy `config/autocount_stock_extract.example.json` to:
 
    ```text
-   D:\AutoCountStockExtract\autocount_stock_extract.local.json
+   config\autocount_stock_extract.local.json
    ```
 
 4. Edit the local config on the VM only:
 
-   - Keep `archive_root` outside GitHub.
+   - Keep `archive_root` under `C:\XB\autocount_outputs\extract\stock`.
    - Replace the example `dbo.vw_AutoCount...` view names with approved read-only views, official API/report outputs, or SQL validated in local sandbox testing.
    - Leave `notification.webhook_url` blank unless a webhook receiver is ready.
 
@@ -72,7 +80,7 @@ Weekly later:
    ```powershell
    [Environment]::SetEnvironmentVariable(
      "AUTOCOUNT_READONLY_SQL_CONNECTION_STRING",
-     "Driver={ODBC Driver 18 for SQL Server};Server=YOUR-SERVER;Database=YOUR-AUTOCOUNT-DB;Trusted_Connection=yes;Encrypt=yes;TrustServerCertificate=yes;ApplicationIntent=ReadOnly;",
+     "Driver={ODBC Driver 17 for SQL Server};Server=YOUR-SERVER;Database=YOUR-AUTOCOUNT-DB;Trusted_Connection=yes;Encrypt=yes;TrustServerCertificate=yes;ApplicationIntent=ReadOnly;",
      "User"
    )
    ```
@@ -81,29 +89,45 @@ Weekly later:
 
    - Minimum: Python 3.9, because the extractor uses the standard-library `zoneinfo` module.
    - Recommended: Python 3.11 or newer on the Windows VM.
+   - Windows Python may require the `tzdata` package for `ZoneInfo("Asia/Singapore")`.
    - For scheduled production use, pass the full Python executable path to the installer script rather than relying on the interactive user's `PATH`.
 
 7. Install Python dependencies on the VM:
 
    ```powershell
-   py -3.11 -m pip install pyodbc
+   py -3.11 -m pip install pyodbc tzdata
    ```
 
-   The VM also needs Microsoft ODBC Driver for SQL Server installed.
+   The VM also needs Microsoft ODBC Driver 17 for SQL Server installed. If the
+   extractor reports missing timezone data on Windows, run:
+
+   ```powershell
+   python -m pip install tzdata
+   ```
 
 8. Validate config without connecting to SQL:
 
    ```powershell
-   py -3.11 scripts\autocount_stock_extract.py --config D:\AutoCountStockExtract\autocount_stock_extract.local.json --dry-run
+   py -3.11 scripts\autocount_stock_extract.py --config config\autocount_stock_extract.local.json --dry-run
    ```
 
 9. Run a manual extraction for a known business date:
 
    ```powershell
-   py -3.11 scripts\autocount_stock_extract.py --config D:\AutoCountStockExtract\autocount_stock_extract.local.json --business-date 2026-06-04
+   py -3.11 scripts\autocount_stock_extract.py --config config\autocount_stock_extract.local.json --business-date 2026-06-04
    ```
 
-10. Register the daily scheduled task.
+10. Future production reference: register the daily scheduled task.
+
+   Hard gate: do not register Task Scheduler yet. Scheduling requires all of
+   the following approvals first:
+
+   - Dedicated read-only SQL login.
+   - Reconciliation/sign-off against AutoCount UI/report outputs.
+   - Approved wrapper views or explicit approval for the direct smoke profile.
+   - Operator approval.
+
+   Keep the instructions below only as future production reference.
 
    Recommended production posture:
 
@@ -116,7 +140,7 @@ Weekly later:
    ```powershell
    powershell -ExecutionPolicy Bypass -File scripts\install_autocount_stock_extract_task.ps1 `
      -PythonExe "C:\Python311\python.exe" `
-     -ConfigPath "D:\AutoCountStockExtract\autocount_stock_extract.local.json" `
+     -ConfigPath "config\autocount_stock_extract.local.json" `
      -UserId ".\svc_autocount_extract" `
      -LogonType S4U `
      -StartTime "02:00"
@@ -127,7 +151,7 @@ Weekly later:
 Each run writes one idempotent batch folder:
 
 ```text
-D:\AutoCountStockArchive\
+C:\XB\autocount_outputs\extract\stock\
   ac2_stock_2026-06-04\
     stock_master.csv
     stock_balance.csv
@@ -151,13 +175,13 @@ Example manifest storage shape:
   "run_id": "2decb5fe-64d7-4db0-bcbe-a5b3df8574a0",
   "storage_batch_id": "ac2_stock_2026-06-04",
   "storage": {
-    "archive_path": "D:\\AutoCountStockArchive\\ac2_stock_2026-06-04",
+    "archive_path": "C:\\XB\\autocount_outputs\\extract\\stock\\ac2_stock_2026-06-04",
     "dataset_files": {
-      "stock_master": "D:\\AutoCountStockArchive\\ac2_stock_2026-06-04\\stock_master.csv"
+      "stock_master": "C:\\XB\\autocount_outputs\\extract\\stock\\ac2_stock_2026-06-04\\stock_master.csv"
     },
     "files": {
       "stock_master": {
-        "path": "D:\\AutoCountStockArchive\\ac2_stock_2026-06-04\\stock_master.csv",
+        "path": "C:\\XB\\autocount_outputs\\extract\\stock\\ac2_stock_2026-06-04\\stock_master.csv",
         "byte_size": 1204,
         "sha256": "example-placeholder-not-a-real-file-hash"
       }
@@ -219,8 +243,7 @@ strings, or production database names.
 3. Update the local extractor config on the VM:
 
    - Copy `config/autocount_stock_extract.from_probe.example.json` to a local
-     VM path such as
-     `D:\AutoCountStockExtract\autocount_stock_extract.local.json`.
+     ignored VM path `config\autocount_stock_extract.local.json`.
    - Replace only placeholder view names that have been selected in
      [phase1_extraction_mapping.md](autocount2-automation/phase1_extraction_mapping.md).
    - Keep `archive_root` outside GitHub.
