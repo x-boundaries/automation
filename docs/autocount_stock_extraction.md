@@ -1,15 +1,20 @@
 # AutoCount Stock Extraction Runbook
 
-## Recommended Architecture
+## Phase 1 Smoke Architecture
 
-Run the extractor on the AutoCount SQL Server VM with Windows Task Scheduler.
+The current Phase 1 workflow is manual, read-only smoke extraction on the
+AutoCount SQL Server VM. Operators run the extractor manually for approved
+smoke dates, review `run_manifest.json`, and keep raw CSVs local.
+
+Windows Task Scheduler is future production reference only. No scheduled
+extraction is approved yet.
 
 ```text
-Windows Task Scheduler
+Manual operator run on the VM
   -> scripts/autocount_stock_extract.py
   -> read-only AutoCount SQL views or approved AutoCount API/report outputs
   -> secure archive batch outside GitHub
-  -> optional webhook/email/dashboard refresh
+  -> reviewed run_manifest.json for safe handoff
 ```
 
 n8n is not required for storage. If it is used later, keep it as an optional
@@ -112,7 +117,17 @@ Weekly later:
    py -3.11 scripts\autocount_stock_extract.py --config config\autocount_stock_extract.local.json --business-date 2026-06-04
    ```
 
-10. Register the daily scheduled task.
+10. Future production reference: register the daily scheduled task.
+
+   Hard gate: do not register Task Scheduler yet. Scheduling requires all of
+   the following approvals first:
+
+   - Dedicated read-only SQL login.
+   - Reconciliation/sign-off against AutoCount UI/report outputs.
+   - Approved wrapper views or explicit approval for the direct smoke profile.
+   - Operator approval.
+
+   Keep the instructions below only as future production reference.
 
    Recommended production posture:
 
