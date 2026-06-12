@@ -9,7 +9,7 @@ import urllib.request
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from uuid import uuid4
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
@@ -28,7 +28,7 @@ def build_run_context(
     timezone_name=DEFAULT_TIMEZONE,
     now=None,
 ):
-    tz = ZoneInfo(timezone_name)
+    tz = load_timezone(timezone_name)
     current_time = _coerce_datetime(now, tz) if now else datetime.now(tz)
     run_date = date.fromisoformat(business_date) if business_date else current_time.date() - timedelta(days=1)
 
@@ -83,7 +83,8 @@ def run_extraction(config, source=None, notifier=None, business_date=None, now=N
                 }
             )
 
-    finished_at = _coerce_datetime(now, ZoneInfo(context["timezone"])) if now else datetime.now(ZoneInfo(context["timezone"]))
+    finish_tz = load_timezone(context["timezone"])
+    finished_at = _coerce_datetime(now, finish_tz) if now else datetime.now(finish_tz)
     manifest = {
         "source": config.get("source", "autocount_ac2"),
         "job": config.get("job", "daily_stock_extract"),
@@ -251,7 +252,18 @@ def sanitize_error(message):
 
 
 def load_config(path):
-    return json.loads(Path(path).read_text(encoding="utf-8"))
+    return json.loads(Path(path).read_text(encoding="utf-8-sig"))
+
+
+def load_timezone(timezone_name):
+    try:
+        return ZoneInfo(timezone_name)
+    except ZoneInfoNotFoundError as exc:
+        raise RuntimeError(
+            f"Timezone data for {timezone_name!r} is unavailable. "
+            "Windows Python may require tzdata. "
+            "Run `python -m pip install tzdata`, then rerun the extractor."
+        ) from exc
 
 
 def _coerce_datetime(value, tz):

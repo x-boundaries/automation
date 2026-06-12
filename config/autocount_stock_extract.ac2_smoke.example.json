@@ -1,0 +1,79 @@
+{
+  "source": "autocount_ac2",
+  "job": "phase1_stock_extract_smoke",
+  "profile_status": "Smoke/extraction-validation profile only; not final production mapping.",
+  "timezone": "Asia/Singapore",
+  "overlap_days": 3,
+  "archive_root": "C:\\XB\\autocount_outputs\\extract\\stock",
+  "source_connection": {
+    "kind": "sqlserver",
+    "connection_string_env": "AUTOCOUNT_READONLY_SQL_CONNECTION_STRING"
+  },
+  "notes": [
+    "Use this profile to repeat the AC2 stock extraction smoke test safely on the VM.",
+    "This profile does not select final production SQL surfaces.",
+    "The stock_balance query uses dbo.vItemBalQty, which returned only 1 row in the verified smoke run; do not treat it as final."
+  ],
+  "datasets": {
+    "stock_master": {
+      "mode": "full",
+      "source_surface_status": "Smoke validation direct query only - not final production-selected mapping",
+      "query": "SELECT i.ItemCode, i.Description, iu.UOM, iu.BarCode AS Barcode, i.ItemGroup, i.ItemBrand, i.ItemCategory, i.ItemClass, i.IsActive, i.StockControl, i.LastModified FROM dbo.Item AS i LEFT JOIN dbo.ItemUOM AS iu ON iu.ItemCode = i.ItemCode;",
+      "columns": [
+        "ItemCode",
+        "Description",
+        "UOM",
+        "Barcode",
+        "ItemGroup",
+        "ItemBrand",
+        "ItemCategory",
+        "ItemClass",
+        "IsActive",
+        "StockControl",
+        "LastModified"
+      ]
+    },
+    "stock_balance": {
+      "mode": "snapshot",
+      "source_surface_status": "Smoke validation direct query only - vItemBalQty returned 1 row and is not final",
+      "query": "SELECT CAST(? AS datetime2) AS AsAtDate, ItemCode, Location, UOM, BalQty AS BalanceQty, CAST(NULL AS decimal(18,6)) AS UnitCost, CAST(NULL AS decimal(18,6)) AS CostValue, CAST(NULL AS datetime2) AS LastModified FROM dbo.vItemBalQty;",
+      "parameters": [
+        "snapshot_as_at"
+      ],
+      "columns": [
+        "AsAtDate",
+        "ItemCode",
+        "Location",
+        "UOM",
+        "BalanceQty",
+        "UnitCost",
+        "CostValue",
+        "LastModified"
+      ]
+    },
+    "stock_movement": {
+      "mode": "window",
+      "source_surface_status": "Smoke validation direct query only - not final production-selected mapping",
+      "query": "SELECT DocType, DocKey, DtlKey, DocInfo, DocDate, ItemCode, Location, BatchNo, UOM, Qty, Cost, TotalCost, LastModified FROM dbo.StockDTL WHERE DocDate >= CAST(? AS datetime2) AND DocDate < CAST(? AS datetime2);",
+      "parameters": [
+        "movement_from",
+        "movement_to"
+      ],
+      "columns": [
+        "DocType",
+        "DocKey",
+        "DtlKey",
+        "DocInfo",
+        "DocDate",
+        "ItemCode",
+        "Location",
+        "BatchNo",
+        "UOM",
+        "Qty",
+        "Cost",
+        "TotalCost",
+        "LastModified"
+      ]
+    }
+  }
+}

@@ -3,7 +3,7 @@
   "job": "daily_stock_extract",
   "timezone": "Asia/Singapore",
   "overlap_days": 3,
-  "archive_root": "D:\\AutoCountStockArchive",
+  "archive_root": "C:\\XB\\autocount_outputs\\extract\\stock",
   "source_connection": {
     "kind": "sqlserver",
     "connection_string_env": "AUTOCOUNT_READONLY_SQL_CONNECTION_STRING"

@@ -2,7 +2,7 @@ param(
     [string]$TaskName = "AutoCount Daily Stock Extract",
     [string]$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path,
     [string]$PythonExe = "python.exe",
-    [string]$ConfigPath = "D:\AutoCountStockExtract\autocount_stock_extract.local.json",
+    [string]$ConfigPath = "config\autocount_stock_extract.local.json",
     [string]$StartTime = "02:00",
     [string]$UserId = ([System.Security.Principal.WindowsIdentity]::GetCurrent().Name),
     [ValidateSet("S4U", "Password", "Interactive", "InteractiveOrPassword", "ServiceAccount", "Group", "None")]

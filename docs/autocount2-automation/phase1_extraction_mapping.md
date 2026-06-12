@@ -1,6 +1,6 @@
 # Phase 1 Extraction Mapping
 
-Use the [Phase 1 reconciliation runbook](phase1_reconciliation_runbook.md) to validate these candidate surfaces against AutoCount UI/report outputs before replacing any placeholder with a wrapper view.
+Use the [Phase 1 reconciliation runbook](phase1_reconciliation_runbook.md) to validate these candidate surfaces against AutoCount UI/report outputs before replacing any placeholder with a wrapper view. Use the [Phase 1 AC2 stock extraction smoke runbook](phase1_stock_extract_smoke_runbook.md) only to repeat the verified smoke extraction workflow; it does not select final production SQL surfaces.
 
 This mapping turns the SQL probe decision pack into stock extractor
 configuration guidance. It is intentionally read-only and does not define any
@@ -317,8 +317,15 @@ as the starting point after the decision pack is updated. Copy it to a local VM
 path such as:
 
 ```text
-D:\AutoCountStockExtract\autocount_stock_extract.local.json
+config\autocount_stock_extract.local.json
 ```
+
+Keep extractor output under `C:\XB\autocount_outputs\extract\stock`. The smoke
+validation profile is
+[config/autocount_stock_extract.ac2_smoke.example.json](../../config/autocount_stock_extract.ac2_smoke.example.json);
+it is not final production mapping, and its `stock_balance` query must not be
+treated as final because `dbo.vItemBalQty` returned only 1 row in the verified
+smoke run.
 
 Keep the current placeholder wrapper view names until reconciliation passes:
 

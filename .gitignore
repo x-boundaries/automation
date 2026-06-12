@@ -20,9 +20,19 @@ __pycache__/
 # AutoCount SQL probe local outputs/config
 AutoCountSqlProbe/
 probe_outputs/
+autocount_probe_outputs/
 probe_manifest.json
 autocount_sql_probe.local.json
 config/autocount_sql_probe.local.json
+
+# Standard AutoCount local output root. Keep generated CSVs/manifests local.
+autocount_outputs/
+**/autocount_outputs/
+autocount_outputs/**/*.csv
+autocount_outputs/**/run_manifest.json
+autocount_outputs/**/probe_manifest.json
+autocount_outputs/**/phase1_reconcile_manifest.json
+autocount_outputs/**/phase1_reconcile_report.md
 
 # AutoCount Phase 1 reconciliation local outputs/config
 autocount_phase1_reconcile_outputs/
@@ -31,3 +41,13 @@ phase1_reconcile_manifest.json
 phase1_reconcile_report.md
 autocount_phase1_reconcile.local.json
 config/autocount_phase1_reconcile.local.json
+
+# AutoCount stock extraction local outputs/config
+autocount_stock_extract_outputs/
+stock_master.csv
+stock_balance.csv
+stock_movement.csv
+stock_documents.csv
+run_manifest.json
+autocount_stock_extract.local.json
+config/autocount_stock_extract.local.json

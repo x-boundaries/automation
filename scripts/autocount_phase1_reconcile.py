@@ -17,7 +17,7 @@ from csv_safety import coerce_csv_cell
 
 DEFAULT_CONNECTION_STRING_ENV = "AUTOCOUNT_READONLY_SQL_CONNECTION_STRING"
 DEFAULT_CONFIG_PATH = Path("config/autocount_phase1_reconcile.example.json")
-DEFAULT_OUTPUT_ROOT = r"C:\XB\autocount_phase1_reconcile_outputs"
+DEFAULT_OUTPUT_ROOT = r"C:\XB\autocount_outputs\reconcile"
 
 REQUIRED_CONTRACTS = {
     "stock_master": [
@@ -410,7 +410,7 @@ def _coerce_datetime(value):
 
 
 def load_config(path):
-    with Path(path).open("r", encoding="utf-8") as handle:
+    with Path(path).open("r", encoding="utf-8-sig") as handle:
         return json.load(handle)
 
 

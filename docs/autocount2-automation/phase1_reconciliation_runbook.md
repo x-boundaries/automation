@@ -12,6 +12,10 @@ The goal is to validate candidate SQL surfaces against AutoCount UI/report
 outputs before creating final wrapper views, granting a final read-only login,
 or scheduling extraction.
 
+Use the [Phase 1 AC2 stock extraction smoke runbook](phase1_stock_extract_smoke_runbook.md)
+only for the repeatable smoke extraction-validation workflow. The smoke runbook
+does not approve final SQL surfaces or scheduling.
+
 ## Why Extraction Is Not Scheduled Yet
 
 Do not schedule extraction yet because the current login is discovery-only. The
@@ -23,6 +27,11 @@ No SQL surface is selected for Phase 1 in this branch. Every candidate remains a
 reconciliation candidate until the UI/report comparisons below pass.
 
 ## Run The Reconciliation Script On The VM
+
+Generated reconciliation outputs should stay under
+`C:\XB\autocount_outputs\reconcile`. Older folders such as
+`C:\XB\autocount_phase1_reconcile_outputs` are legacy/manual paths and should
+be avoided going forward.
 
 1. Copy the example config to an ignored local config file and review it:
 
@@ -48,7 +57,7 @@ reconciliation candidate until the UI/report comparisons below pass.
    discovery session:
 
    ```powershell
-   python scripts\autocount_phase1_reconcile.py --config config\autocount_phase1_reconcile.local.json --output-root C:\XB\autocount_phase1_reconcile_outputs
+   python scripts\autocount_phase1_reconcile.py --config config\autocount_phase1_reconcile.local.json --output-root C:\XB\autocount_outputs\reconcile
    ```
 
 The script creates one timestamped folder per run under the output root and

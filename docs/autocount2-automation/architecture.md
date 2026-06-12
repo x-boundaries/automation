@@ -44,8 +44,8 @@ Required local software:
 - AutoCount Accounting 2.0 client/server components.
 - Microsoft SQL Server 2019.
 - .NET Framework 4.8 runtime.
-- Extractor runtime folder outside the repo, for example `D:\XBoundaries\AutoCountAutomation`.
-- Secure archive folder outside the repo, for example `D:\XBoundaries\AutoCountArchive`.
+- Extractor runtime folder outside the repo, with generated outputs under `C:\XB\autocount_outputs`.
+- Secure stock archive folder outside the repo, for example `C:\XB\autocount_outputs\extract\stock`.
 
 ### Native Extractor Runner
 
@@ -103,8 +103,8 @@ Optional later schemas:
 Keep raw CSV/JSON extracts outside GitHub. Each batch should have a deterministic folder:
 
 ```text
-D:\XBoundaries\AutoCountArchive\
-  2026-06-06\
+C:\XB\autocount_outputs\extract\stock\
+  ac2_stock_2026-06-06\
     run_manifest.json
     item_master.csv
     stock_status.csv

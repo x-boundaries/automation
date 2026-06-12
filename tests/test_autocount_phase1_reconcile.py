@@ -49,6 +49,16 @@ class FakeReconcileSource(reconcile.SqlServerSummarySource):
 
 
 class AutoCountPhase1ReconcileTests(unittest.TestCase):
+    def test_load_config_accepts_utf8_bom(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "autocount_phase1_reconcile.local.json"
+            path.write_text("\ufeff" + json.dumps(base_config(tmpdir)), encoding="utf-8")
+
+            loaded = reconcile.load_config(path)
+
+            self.assertEqual(loaded["job"], "autocount_phase1_reconcile")
+            self.assertEqual(loaded["connection_string_env"], "AUTOCOUNT_READONLY_SQL_CONNECTION_STRING")
+
     def test_manifest_shape_and_safe_output_only_no_raw_rows(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             manifest = reconcile.run_reconciliation(
