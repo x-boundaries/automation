@@ -18,6 +18,24 @@ DEFAULT_SMOKE_SURFACES = [
     {"schema_name": "dbo", "object_name": "StockDTL"},
 ]
 WRITE_LIKE_PERMISSIONS = ["INSERT", "UPDATE", "DELETE", "ALTER", "CONTROL", "TAKE OWNERSHIP"]
+DANGEROUS_DATABASE_ROLES = {
+    "db_accessadmin": "can add or remove database access",
+    "db_backupoperator": "can back up database contents",
+    "db_datawriter": "can modify table data",
+    "db_ddladmin": "can change database objects",
+    "db_owner": "has full database control",
+    "db_securityadmin": "can change role membership and permissions",
+}
+DANGEROUS_SERVER_ROLES = {
+    "bulkadmin": "can bulk import data",
+    "dbcreator": "can create, alter, drop, and restore databases",
+    "diskadmin": "can manage disk files",
+    "processadmin": "can manage SQL Server processes",
+    "securityadmin": "can manage server logins and permissions",
+    "serveradmin": "can change server-wide settings",
+    "setupadmin": "can manage linked servers and startup procedures",
+    "sysadmin": "has full SQL Server control",
+}
 SECRET_PATTERN = re.compile(
     r"(?i)\b(password|pwd|token|secret|api[_-]?key|access[_-]?key)\s*=\s*[^;\s]+"
 )
@@ -188,6 +206,58 @@ class SqlServerReadonlyValidationSource:
                         "has_permission": result[0].get("has_permission") if result else None,
                     }
                 )
+        rows.extend(self.fetch_database_role_advisory())
+        rows.extend(self.fetch_server_role_advisory())
+        return rows
+
+    def fetch_database_role_advisory(self):
+        rows = []
+        for role_name in DANGEROUS_DATABASE_ROLES:
+            result = self.query(
+                """
+                SELECT
+                  CAST(? AS nvarchar(128)) AS role_name,
+                  USER_NAME() AS member_name,
+                  CAST('IS_ROLEMEMBER' AS nvarchar(64)) AS source,
+                  IS_ROLEMEMBER(?) AS is_member
+                """,
+                [role_name, role_name],
+            )
+            rows.append(
+                {
+                    "scope": "database_role",
+                    "surface": "",
+                    "role_name": role_name,
+                    "member_name": result[0].get("member_name") if result else "",
+                    "source": result[0].get("source") if result else "IS_ROLEMEMBER",
+                    "is_member": result[0].get("is_member") if result else None,
+                }
+            )
+        return rows
+
+    def fetch_server_role_advisory(self):
+        rows = []
+        for role_name in DANGEROUS_SERVER_ROLES:
+            result = self.query(
+                """
+                SELECT
+                  CAST(? AS nvarchar(128)) AS role_name,
+                  SUSER_SNAME() AS member_name,
+                  CAST('IS_SRVROLEMEMBER' AS nvarchar(64)) AS source,
+                  IS_SRVROLEMEMBER(?) AS is_member
+                """,
+                [role_name, role_name],
+            )
+            rows.append(
+                {
+                    "scope": "server_role",
+                    "surface": "",
+                    "role_name": role_name,
+                    "member_name": result[0].get("member_name") if result else "",
+                    "source": result[0].get("source") if result else "IS_SRVROLEMEMBER",
+                    "is_member": result[0].get("is_member") if result else None,
+                }
+            )
         return rows
 
     def query(self, sql, params=None):
@@ -206,14 +276,38 @@ class SqlServerReadonlyValidationSource:
 def evaluate_permission_advisory(permission_rows):
     flagged = []
     for row in permission_rows:
+        scope = str(row.get("scope", "")).strip().lower()
         permission_name = str(row.get("permission_name", "")).upper()
         if permission_name in WRITE_LIKE_PERMISSIONS and is_positive(row.get("has_permission")):
             flagged.append(
                 {
-                    "scope": row.get("scope", ""),
+                    "scope": scope,
                     "surface": row.get("surface", ""),
                     "permission_name": permission_name,
                     "has_permission": True,
+                }
+            )
+        role_name = str(row.get("role_name", "")).strip().lower()
+        if scope == "database_role" and role_name in DANGEROUS_DATABASE_ROLES and is_positive(row.get("is_member")):
+            flagged.append(
+                {
+                    "scope": scope,
+                    "surface": row.get("surface", ""),
+                    "role_name": role_name,
+                    "is_member": True,
+                    "source": sanitize_text(row.get("source", "")),
+                    "reason": DANGEROUS_DATABASE_ROLES[role_name],
+                }
+            )
+        if scope == "server_role" and role_name in DANGEROUS_SERVER_ROLES and is_positive(row.get("is_member")):
+            flagged.append(
+                {
+                    "scope": scope,
+                    "surface": row.get("surface", ""),
+                    "role_name": role_name,
+                    "is_member": True,
+                    "source": sanitize_text(row.get("source", "")),
+                    "reason": DANGEROUS_SERVER_ROLES[role_name],
                 }
             )
     return {
@@ -256,6 +350,14 @@ def build_check_definitions():
         {
             "name": "object_permission_advisory",
             "sql": "SELECT CAST(? AS nvarchar(256)) AS surface, CAST(? AS nvarchar(128)) AS permission_name, HAS_PERMS_BY_NAME(?, 'OBJECT', ?) AS has_permission",
+        },
+        {
+            "name": "database_role_advisory",
+            "sql": "SELECT CAST(? AS nvarchar(128)) AS role_name, USER_NAME() AS member_name, CAST('IS_ROLEMEMBER' AS nvarchar(64)) AS source, IS_ROLEMEMBER(?) AS is_member",
+        },
+        {
+            "name": "server_role_advisory",
+            "sql": "SELECT CAST(? AS nvarchar(128)) AS role_name, SUSER_SNAME() AS member_name, CAST('IS_SRVROLEMEMBER' AS nvarchar(64)) AS source, IS_SRVROLEMEMBER(?) AS is_member",
         },
     ]
 
