@@ -6,7 +6,7 @@ Use this runbook to validate a dedicated AutoCount 2 / AC2 SQL login or Windows
 account before scheduled extraction or broader extraction scope is considered.
 The validation kit checks whether the account can run metadata-only reads
 against the known stock smoke surfaces and whether advisory permission probes
-show obvious write-like permissions.
+show obvious write-like permissions or dangerous fixed-role memberships.
 
 This does not approve scheduled extraction. It does not select final production
 SQL surfaces. It does not create production users automatically.
@@ -23,6 +23,10 @@ Do not use accounts with elevated database roles or server roles, including:
 - `sysadmin`
 - `db_owner`
 - `db_datawriter`
+- `db_ddladmin`
+- `db_securityadmin`
+- `db_accessadmin`
+- `db_backupoperator`
 - schema/security/admin roles that can change objects or permissions
 
 Grant only the read permissions needed for approved extraction surfaces. The
@@ -73,7 +77,8 @@ The validator:
 - Reads current database/login/user metadata.
 - Checks table/view presence for the configured smoke surfaces.
 - Runs `SELECT TOP (0)` metadata checks, which return no ERP rows.
-- Uses `HAS_PERMS_BY_NAME` advisory checks for write-like permissions.
+- Uses `HAS_PERMS_BY_NAME`, `IS_ROLEMEMBER`, and `IS_SRVROLEMEMBER` advisory
+  checks for write-like permissions and dangerous fixed roles.
 - Writes one local `readonly_login_validation_manifest.json`.
 
 The validator does not attempt writes. It does not run `INSERT`, `UPDATE`,
@@ -93,6 +98,9 @@ Treat validation as failed if:
   check.
 - Advisory permission checks detect write-like permissions such as `INSERT`,
   `UPDATE`, `DELETE`, `ALTER`, `CONTROL`, or `TAKE OWNERSHIP`.
+- Advisory role checks detect dangerous fixed database or server roles such as
+  `db_owner`, `db_datawriter`, `db_ddladmin`, `db_securityadmin`,
+  `db_accessadmin`, `db_backupoperator`, `sysadmin`, or `securityadmin`.
 
 The permission checks are advisory. A clean manifest does not replace
 DBA/admin/operator sign-off.

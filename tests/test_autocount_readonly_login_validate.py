@@ -37,6 +37,20 @@ class FakeValidationSource:
         return list(self.permission_rows)
 
 
+class RecordingSqlValidationSource(validator.SqlServerReadonlyValidationSource):
+    def __init__(self):
+        super().__init__("Driver={ODBC Driver};Server=test;")
+        self.queries = []
+
+    def query(self, sql, params=None):
+        self.queries.append({"sql": sql, "params": list(params or [])})
+        if "IS_ROLEMEMBER" in sql:
+            return [{"member_name": "svc_ac2_readonly", "source": "IS_ROLEMEMBER", "is_member": 0}]
+        if "IS_SRVROLEMEMBER" in sql:
+            return [{"member_name": "svc_ac2_readonly", "source": "IS_SRVROLEMEMBER", "is_member": 0}]
+        return [{"has_permission": 0}]
+
+
 class AutoCountReadonlyLoginValidateTests(unittest.TestCase):
     def test_load_config_accepts_utf8_bom(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -105,6 +119,32 @@ class AutoCountReadonlyLoginValidateTests(unittest.TestCase):
         self.assertEqual(result["status"], "failed")
         self.assertEqual(result["flagged_permissions"][0]["permission_name"], "INSERT")
 
+    def test_permission_evaluator_flags_dangerous_database_role_membership(self):
+        result = validator.evaluate_permission_advisory(
+            [
+                {"scope": "database_role", "role_name": "db_securityadmin", "is_member": True},
+                {"scope": "database_role", "role_name": "db_datareader", "is_member": True},
+            ]
+        )
+
+        self.assertTrue(result["write_like_permission_detected"])
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["flagged_permissions"][0]["scope"], "database_role")
+        self.assertEqual(result["flagged_permissions"][0]["role_name"], "db_securityadmin")
+
+    def test_permission_evaluator_flags_dangerous_server_role_membership(self):
+        result = validator.evaluate_permission_advisory(
+            [
+                {"scope": "server_role", "role_name": "sysadmin", "is_member": 1},
+                {"scope": "server_role", "role_name": "public", "is_member": 1},
+            ]
+        )
+
+        self.assertTrue(result["write_like_permission_detected"])
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["flagged_permissions"][0]["scope"], "server_role")
+        self.assertEqual(result["flagged_permissions"][0]["role_name"], "sysadmin")
+
     def test_validation_fails_when_write_like_permission_is_detected(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             manifest = validator.run_validation(
@@ -125,6 +165,41 @@ class AutoCountReadonlyLoginValidateTests(unittest.TestCase):
             self.assertTrue(manifest["write_permission_advisory"]["write_like_permission_detected"])
             self.assertEqual(manifest["exception_count"], 0)
 
+    def test_validation_fails_when_dangerous_role_membership_is_detected(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manifest = validator.run_validation(
+                base_config(tmpdir),
+                source=FakeValidationSource(
+                    permission_rows=[
+                        {
+                            "scope": "database_role",
+                            "role_name": "db_owner",
+                            "is_member": True,
+                        }
+                    ]
+                ),
+            )
+
+            self.assertEqual(manifest["status"], "failed")
+            self.assertTrue(manifest["write_permission_advisory"]["write_like_permission_detected"])
+            self.assertEqual(manifest["write_permission_advisory"]["flagged_permissions"][0]["role_name"], "db_owner")
+            self.assertEqual(manifest["exception_count"], 0)
+
+    def test_sql_source_fetches_fixed_role_membership_advisories(self):
+        source = RecordingSqlValidationSource()
+
+        rows = source.fetch_permission_advisory(
+            [{"schema_name": "dbo", "object_name": "Item"}],
+            ["INSERT"],
+        )
+
+        database_role_names = {row["role_name"] for row in rows if row["scope"] == "database_role"}
+        server_role_names = {row["role_name"] for row in rows if row["scope"] == "server_role"}
+        self.assertIn("db_owner", database_role_names)
+        self.assertIn("db_securityadmin", database_role_names)
+        self.assertIn("sysadmin", server_role_names)
+        self.assertIn("securityadmin", server_role_names)
+
     def test_check_sql_definitions_do_not_contain_dml_or_ddl(self):
         sql_text = "\n".join(query["sql"] for query in validator.build_check_definitions())
 
@@ -132,6 +207,12 @@ class AutoCountReadonlyLoginValidateTests(unittest.TestCase):
             sql_text,
             r"(?i)\b(INSERT|UPDATE|DELETE|MERGE|CREATE|ALTER|DROP|TRUNCATE)\b",
         )
+
+    def test_check_sql_definitions_include_role_membership_advisories(self):
+        names = {query["name"] for query in validator.build_check_definitions()}
+
+        self.assertIn("database_role_advisory", names)
+        self.assertIn("server_role_advisory", names)
 
 
 def base_config(output_root):
