@@ -16,6 +16,10 @@ Use the [Phase 1 AC2 stock extraction smoke runbook](phase1_stock_extract_smoke_
 only for the repeatable smoke extraction-validation workflow. The smoke runbook
 does not approve final SQL surfaces or scheduling.
 
+Validate any dedicated extraction login with the
+[AC2 read-only SQL login validation runbook](readonly_sql_login_runbook.md)
+before using it for smoke extraction or scheduling decisions.
+
 ## Why Extraction Is Not Scheduled Yet
 
 Do not schedule extraction yet because the current login is discovery-only. The
@@ -168,8 +172,10 @@ only to approved wrapper views.
 
 The final login must not have write/admin permissions such as `db_owner`,
 `db_datawriter`, `db_ddladmin`, `db_securityadmin`, `db_accessadmin`, or
-`db_backupoperator`. Re-run the SQL probe with the final login before scheduling
-any extraction.
+`db_backupoperator`. Validate it with
+[readonly_sql_login_runbook.md](readonly_sql_login_runbook.md), then re-run the
+SQL probe and smoke extraction with the final login before scheduling any
+extraction.
 
 ## Safe To Paste Back Into ChatGPT/Codex
 

@@ -20,6 +20,9 @@ These guardrails apply to all X-Boundaries AutoCount 2.0 automation work.
 ### Source read account
 
 Create a dedicated SQL login or Windows identity for source reads.
+Validate it with the
+[AC2 read-only SQL login validation runbook](readonly_sql_login_runbook.md)
+before scheduled extraction or broader extraction scope.
 
 Minimum permissions:
 
@@ -115,6 +118,8 @@ going forward.
 Raw CSVs stay local and must not be committed. Only reviewed manifests and safe
 summaries should be pasted back for review. For the verified smoke workflow,
 use the [Phase 1 AC2 stock extraction smoke runbook](phase1_stock_extract_smoke_runbook.md).
+For dedicated-login checks, use the
+[AC2 read-only SQL login validation runbook](readonly_sql_login_runbook.md).
 
 ## Environment Metadata Disclosure
 

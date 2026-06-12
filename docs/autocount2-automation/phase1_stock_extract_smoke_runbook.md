@@ -10,6 +10,9 @@ committing raw ERP data.
 This is not scheduled extraction. It does not approve SQL write-back, final
 wrapper views, or final production-selected SQL surfaces.
 
+Before using a dedicated extraction account, validate it with the
+[AC2 read-only SQL login validation runbook](readonly_sql_login_runbook.md).
+
 ## Prerequisites
 
 - Python 3.9 or newer.
@@ -139,7 +142,8 @@ sensitive business data and must stay local. Paste/share only reviewed
 
 Final scheduled extraction still requires:
 
-- Dedicated read-only SQL login.
+- Dedicated read-only SQL login validated with
+  [readonly_sql_login_runbook.md](readonly_sql_login_runbook.md).
 - Approved wrapper views or explicit approval for the direct smoke profile.
 - Reconciliation sign-off against AutoCount UI/report outputs.
 - Operator approval for scheduling.
