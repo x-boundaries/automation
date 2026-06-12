@@ -14,6 +14,7 @@ Task tracking, pending-work dashboards, completed-task logs, and personal planni
 ## Configuration Templates
 
 - `config/autocount_sql_probe.example.json`
+- `config/autocount_readonly_login_validate.example.json`
 - `config/autocount_phase1_reconcile.example.json`
 - `config/autocount_stock_extract.ac2_smoke.example.json`
 - `config/autocount_stock_extract.example.json`
@@ -39,6 +40,7 @@ Raw CSVs stay local and must not be committed. Paste back only reviewed manifest
 - [AutoCount 2 API research](docs/autocount2-automation/api_research.md)
 - [AutoCount 2 MVP plan](docs/autocount2-automation/mvp_plan.md)
 - [Extraction surface decision pack](docs/autocount2-automation/extraction_surface_decision.md)
+- [AC2 read-only SQL login validation runbook](docs/autocount2-automation/readonly_sql_login_runbook.md)
 - [Phase 1 extraction mapping](docs/autocount2-automation/phase1_extraction_mapping.md)
 - [Phase 1 AC2 stock extraction smoke runbook](docs/autocount2-automation/phase1_stock_extract_smoke_runbook.md)
 - [Phase 1 reconciliation runbook](docs/autocount2-automation/phase1_reconciliation_runbook.md)

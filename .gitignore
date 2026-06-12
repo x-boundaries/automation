@@ -24,6 +24,9 @@ autocount_probe_outputs/
 probe_manifest.json
 autocount_sql_probe.local.json
 config/autocount_sql_probe.local.json
+autocount_readonly_login_validate.local.json
+config/autocount_readonly_login_validate.local.json
+readonly_login_validation_manifest.json
 
 # Standard AutoCount local output root. Keep generated CSVs/manifests local.
 autocount_outputs/
@@ -31,6 +34,7 @@ autocount_outputs/
 autocount_outputs/**/*.csv
 autocount_outputs/**/run_manifest.json
 autocount_outputs/**/probe_manifest.json
+autocount_outputs/**/readonly_login_validation_manifest.json
 autocount_outputs/**/phase1_reconcile_manifest.json
 autocount_outputs/**/phase1_reconcile_report.md
 
