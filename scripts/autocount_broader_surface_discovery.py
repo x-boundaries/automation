@@ -54,6 +54,79 @@ DEFAULT_CANDIDATE_SCORING = {
         {"group": "purchase_order_outstanding_po", "header": "PO", "detail": "PODTL", "boost": 20},
         {"group": "purchase_order_outstanding_po", "header": "GR", "detail": "GRDTL", "boost": 16},
     ],
+    "intent_shortlists": {
+        "debtor_customer": {
+            "master_candidates": {
+                "include_patterns": [r"^v?Debtor$", r"^DebtorType$"],
+                "boost_patterns": [r"^v?Debtor$", r"^DebtorType$"],
+                "penalty_patterns": [r"Invoice", r"Payment", r"DTL"],
+            },
+            "transaction_candidates": {
+                "include_patterns": [r"Invoice", r"Payment", r"CreditNote", r"DebitNote"],
+            },
+        },
+        "creditor_supplier": {
+            "master_candidates": {
+                "include_patterns": [r"^v?Creditor$", r"^CreditorType$"],
+                "boost_patterns": [r"^v?Creditor$", r"^CreditorType$"],
+                "penalty_patterns": [r"Invoice", r"Payment", r"DTL"],
+            },
+            "transaction_candidates": {
+                "include_patterns": [r"Invoice", r"Payment", r"CreditNote", r"DebitNote", r"GoodsReceived"],
+            },
+        },
+        "chart_of_accounts_gl": {
+            "account_master_candidates": {
+                "include_patterns": [r"Account", r"COA", r"Chart"],
+                "boost_patterns": [r"GLAccount", r"Account"],
+                "penalty_patterns": [r"DTL", r"Journal"],
+            },
+            "gl_transaction_candidates": {
+                "include_patterns": [r"GLDTL", r"Journal", r"Ledger", r"DTL"],
+            },
+        },
+        "ar_ap_opening": {
+            "ar_opening_candidates": {
+                "include_patterns": [r"ARInvoice", r"AR.*Opening"],
+                "boost_patterns": [r"ARInvoice", r"ARInvoiceDTL"],
+                "penalty_patterns": [r"CashBook.*ImportedGoods"],
+            },
+            "ap_opening_candidates": {
+                "include_patterns": [r"APInvoice", r"AP.*Opening"],
+                "boost_patterns": [r"APInvoice", r"APInvoiceDTL"],
+                "penalty_patterns": [r"CashBook.*ImportedGoods"],
+            },
+        },
+        "purchase_order_outstanding_po": {
+            "po_header_candidates": {
+                "include_patterns": [r"^PO$", r"PurchaseOrder"],
+                "boost_patterns": [r"^PO$", r"vPurchaseOrder"],
+                "penalty_patterns": [r"^Pos(Order)?$"],
+            },
+            "po_detail_candidates": {
+                "include_patterns": [r"PODTL", r"PurchaseOrder.*DTL"],
+                "boost_patterns": [r"PODTL"],
+                "penalty_patterns": [r"^Pos(Order)?$"],
+            },
+        },
+        "locations": {
+            "master_candidates": {
+                "include_patterns": [r"^v?Branch$", r"Location", r"Warehouse"],
+                "boost_patterns": [r"^v?Branch$"],
+                "penalty_patterns": [r"Invoice", r"PO", r"SO"],
+            },
+            "transaction_location_candidates": {
+                "include_patterns": [r"Invoice", r"PO", r"SO", r"Branch"],
+            },
+        },
+        "payment_methods": {
+            "master_candidates": {
+                "include_patterns": [r"PaymentMethod", r"PayMethod"],
+                "boost_patterns": [r"^PaymentMethod$"],
+                "penalty_patterns": [r"DTL", r"Refund", r"Invoice"],
+            },
+        },
+    },
 }
 
 SECRET_PATTERN = re.compile(
@@ -327,6 +400,11 @@ def normalize_scoring_config(configured):
             config[key] = merged
         elif key in {"false_positive_patterns", "known_header_detail_pairs"}:
             config[key] = list(value or [])
+        elif key == "intent_shortlists":
+            merged = dict(config.get(key, {}))
+            for group_name, group_intents in dict(value or {}).items():
+                merged[group_name] = dict(group_intents or {})
+            config[key] = merged
         else:
             config[key] = value
     config["enabled"] = bool(config.get("enabled", True))
@@ -417,7 +495,7 @@ def build_candidate_group_summary(groups, matches, scoring_config=None):
     for group_name, hints in groups.items():
         matched_objects = matches["matched_objects_by_group"].get(group_name, [])
         matched_columns = matches["matched_columns_by_group"].get(group_name, [])
-        summary[group_name] = {
+        group_summary = {
             "keyword_hints": list(hints),
             "decision": NEEDS_RECONCILIATION,
             "matched_object_count": len(matched_objects),
@@ -432,6 +510,10 @@ def build_candidate_group_summary(groups, matches, scoring_config=None):
             ),
             "final_production_selected": False,
         }
+        group_summary.update(
+            build_intent_shortlists(group_name, hints, matched_objects, matched_columns, matches, scoring_config)
+        )
+        summary[group_name] = group_summary
     return summary
 
 
@@ -472,8 +554,84 @@ def build_top_candidates(group_name, hints, matched_objects, matched_columns, al
                 "final_production_selected": False,
             }
         )
+    return ranked_candidates(scored, top_n)
+
+
+def ranked_candidates(scored, top_n):
     scored.sort(key=lambda item: (-item["score"], item["schema_name"].lower(), item["object_name"].lower()))
-    return scored[:top_n]
+    limited = scored[:top_n]
+    for index, candidate in enumerate(limited, start=1):
+        candidate["rank"] = index
+    return limited
+
+
+def build_intent_shortlists(group_name, hints, matched_objects, matched_columns, matches, scoring_config):
+    intent_configs = scoring_config.get("intent_shortlists", {}).get(group_name, {})
+    if not scoring_config.get("enabled", True) or not intent_configs:
+        return {}
+
+    columns_by_object = {}
+    for column in matched_columns:
+        columns_by_object.setdefault(column["object_id"], []).append(column)
+    object_names_by_group = {
+        name: {normalize_keyword(record.get("object_name", "")) for record in records}
+        for name, records in matches["matched_objects_by_group"].items()
+    }
+
+    shortlists = {}
+    for intent_name, intent_config in intent_configs.items():
+        top_n = int(intent_config.get("top_n", scoring_config.get("top_n_per_group", 15)) or 15)
+        scored = []
+        for record in matched_objects:
+            if not intent_matches(record, columns_by_object.get(record["object_id"], []), intent_config):
+                continue
+            score, reasons = score_candidate(
+                group_name,
+                hints,
+                record,
+                columns_by_object.get(record["object_id"], []),
+                object_names_by_group,
+                scoring_config,
+            )
+            score += apply_intent_adjustments(record, intent_config, reasons)
+            scored.append(
+                {
+                    "object_id": record["object_id"],
+                    "schema_name": record["schema_name"],
+                    "object_name": record["object_name"],
+                    "object_type": record["object_type"],
+                    "score": score,
+                    "matched_keywords": list(record.get("matched_keywords", [])),
+                    "score_reasons": reasons,
+                    "decision": NEEDS_RECONCILIATION,
+                    "final_production_selected": False,
+                }
+            )
+        shortlists[intent_name] = ranked_candidates(scored, max(top_n, 0))
+    return shortlists
+
+
+def intent_matches(record, columns, intent_config):
+    include_patterns = intent_config.get("include_patterns", [])
+    if not include_patterns:
+        return True
+    values = [record.get("object_name", ""), record.get("object_id", "")]
+    values.extend(column.get("column_name", "") for column in columns)
+    return any(pattern_matches_any(pattern, values) for pattern in include_patterns)
+
+
+def apply_intent_adjustments(record, intent_config, reasons):
+    score = 0
+    values = [record.get("object_name", ""), record.get("object_id", "")]
+    for pattern in intent_config.get("boost_patterns", []):
+        if pattern_matches_any(pattern, values):
+            score += 45
+            reasons.append(f"Intent shortlist boost `{pattern}` (+45).")
+    for pattern in intent_config.get("penalty_patterns", []):
+        if pattern_matches_any(pattern, values):
+            score -= 35
+            reasons.append(f"Intent shortlist penalty `{pattern}` (-35).")
+    return score
 
 
 def score_candidate(group_name, hints, record, matched_columns, object_names_by_group, scoring_config):
@@ -554,6 +712,10 @@ def score_name_hint(object_name, hint):
         return 0, ""
     if normalized_object == normalized_hint:
         return 30, f"Exact object-name keyword match `{hint}` (+30)."
+    if len(normalized_hint) <= 2 and not acronym_token_match(object_name, hint):
+        if normalized_hint in normalized_object:
+            return 1, f"Weak acronym substring match `{hint}` (+1)."
+        return 0, ""
     if normalized_object.startswith(normalized_hint):
         return 14, f"Object-name prefix keyword match `{hint}` (+14)."
     if normalized_object.endswith(normalized_hint):
@@ -604,6 +766,9 @@ def apply_false_positive_penalties(group_name, object_name, patterns, reasons):
         pattern = str(rule.get("pattern", ""))
         if not pattern:
             continue
+        selected_groups = rule.get("groups", [])
+        if selected_groups and group_name not in selected_groups:
+            continue
         unless_tokens = [normalize_keyword(token) for token in rule.get("unless_group_contains", [])]
         if any(token and token in normalized_group for token in unless_tokens):
             continue
@@ -638,6 +803,27 @@ def is_weak_substring_match(value, keyword):
 
 def normalized_names_equal(left, right):
     return normalize_keyword(left) == normalize_keyword(right)
+
+
+def acronym_token_match(value, keyword):
+    text = str(value or "")
+    key = str(keyword or "")
+    if not text or not key:
+        return False
+    key_lower = key.lower()
+    if any(token.lower() == key_lower for token in split_name_tokens(text)):
+        return True
+    key_upper = key.upper()
+    return text.startswith(key_upper) and (len(text) == len(key_upper) or text[len(key_upper)].isupper())
+
+
+def split_name_tokens(value):
+    spaced = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", str(value))
+    return [part for part in re.split(r"[^A-Za-z0-9]+", spaced) if part]
+
+
+def pattern_matches_any(pattern, values):
+    return any(re.search(str(pattern), str(value or ""), flags=re.IGNORECASE) for value in values)
 
 
 def empty_matches(groups):
@@ -753,7 +939,20 @@ def render_report(manifest):
             for candidate in top_candidates:
                 reasons = "; ".join(candidate.get("score_reasons", []))
                 lines.append(
-                    f"  - `{candidate['object_id']}` ({candidate['object_type']}), "
+                    f"  - #{candidate.get('rank', '?')} `{candidate['object_id']}` ({candidate['object_type']}), "
+                    f"score {candidate['score']}, decision: {candidate['decision']}, "
+                    f"final production selected: {str(candidate['final_production_selected']).lower()}"
+                )
+                if reasons:
+                    lines.append(f"    - Reasons: {reasons}")
+        for shortlist_name, candidates in iter_intent_shortlists(group):
+            lines.append(f"- {shortlist_name}:")
+            if not candidates:
+                lines.append("  - No metadata matches.")
+            for candidate in candidates:
+                reasons = "; ".join(candidate.get("score_reasons", []))
+                lines.append(
+                    f"  - #{candidate.get('rank', '?')} `{candidate['object_id']}` ({candidate['object_type']}), "
                     f"score {candidate['score']}, decision: {candidate['decision']}, "
                     f"final production selected: {str(candidate['final_production_selected']).lower()}"
                 )
@@ -780,6 +979,12 @@ def render_report(manifest):
         for exception in manifest["exceptions"]:
             lines.append(f"- {sanitize_text(exception)}")
     return "\n".join(lines) + "\n"
+
+
+def iter_intent_shortlists(group):
+    for key, value in group.items():
+        if key != "top_candidates" and key.endswith("_candidates") and isinstance(value, list):
+            yield key, value
 
 
 def build_object_filter(objects):

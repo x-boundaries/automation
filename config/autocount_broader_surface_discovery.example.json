@@ -94,20 +94,28 @@
     "exact_name_boosts": {
       "debtor_customer": [
         "Debtor",
+        "vDebtor",
+        "DebtorType",
         "Customer"
       ],
       "creditor_supplier": [
         "Creditor",
+        "vCreditor",
+        "CreditorType",
         "Supplier",
         "Vendor"
       ],
       "chart_of_accounts_gl": [
-        "Account",
         "GLAccount",
+        "Account",
         "ChartOfAccount",
         "COA"
       ],
       "ar_ap_opening": [
+        "ARInvoice",
+        "ARInvoiceDTL",
+        "APInvoice",
+        "APInvoiceDTL",
         "ARAPOpening",
         "AROpening",
         "APOpening"
@@ -123,6 +131,8 @@
       ],
       "purchase_order_outstanding_po": [
         "PO",
+        "PODTL",
+        "vPurchaseOrder",
         "PurchaseOrder"
       ],
       "stock_in_transit_candidates": [
@@ -167,6 +177,22 @@
           "e_invoice",
           "einvoice"
         ]
+      },
+      {
+        "pattern": "^Pos(Order)?$",
+        "penalty": -45,
+        "groups": [
+          "purchase_order_outstanding_po"
+        ],
+        "unless_group_contains": []
+      },
+      {
+        "pattern": "CashBook.*ImportedGoods.*DTL",
+        "penalty": -35,
+        "groups": [
+          "ar_ap_opening"
+        ],
+        "unless_group_contains": []
       }
     ],
     "known_header_detail_pairs": [
@@ -194,7 +220,181 @@
         "detail": "GRDTL",
         "boost": 16
       }
-    ]
+    ],
+    "intent_shortlists": {
+      "debtor_customer": {
+        "master_candidates": {
+          "include_patterns": [
+            "^v?Debtor$",
+            "^DebtorType$"
+          ],
+          "boost_patterns": [
+            "^v?Debtor$",
+            "^DebtorType$"
+          ],
+          "penalty_patterns": [
+            "Invoice",
+            "Payment",
+            "DTL"
+          ]
+        },
+        "transaction_candidates": {
+          "include_patterns": [
+            "Invoice",
+            "Payment",
+            "CreditNote",
+            "DebitNote"
+          ]
+        }
+      },
+      "creditor_supplier": {
+        "master_candidates": {
+          "include_patterns": [
+            "^v?Creditor$",
+            "^CreditorType$"
+          ],
+          "boost_patterns": [
+            "^v?Creditor$",
+            "^CreditorType$"
+          ],
+          "penalty_patterns": [
+            "Invoice",
+            "Payment",
+            "DTL"
+          ]
+        },
+        "transaction_candidates": {
+          "include_patterns": [
+            "Invoice",
+            "Payment",
+            "CreditNote",
+            "DebitNote",
+            "GoodsReceived"
+          ]
+        }
+      },
+      "chart_of_accounts_gl": {
+        "account_master_candidates": {
+          "include_patterns": [
+            "Account",
+            "COA",
+            "Chart"
+          ],
+          "boost_patterns": [
+            "GLAccount",
+            "Account"
+          ],
+          "penalty_patterns": [
+            "DTL",
+            "Journal"
+          ]
+        },
+        "gl_transaction_candidates": {
+          "include_patterns": [
+            "GLDTL",
+            "Journal",
+            "Ledger",
+            "DTL"
+          ]
+        }
+      },
+      "ar_ap_opening": {
+        "ar_opening_candidates": {
+          "include_patterns": [
+            "ARInvoice",
+            "AR.*Opening"
+          ],
+          "boost_patterns": [
+            "ARInvoice",
+            "ARInvoiceDTL"
+          ],
+          "penalty_patterns": [
+            "CashBook.*ImportedGoods"
+          ]
+        },
+        "ap_opening_candidates": {
+          "include_patterns": [
+            "APInvoice",
+            "AP.*Opening"
+          ],
+          "boost_patterns": [
+            "APInvoice",
+            "APInvoiceDTL"
+          ],
+          "penalty_patterns": [
+            "CashBook.*ImportedGoods"
+          ]
+        }
+      },
+      "purchase_order_outstanding_po": {
+        "po_header_candidates": {
+          "include_patterns": [
+            "^PO$",
+            "PurchaseOrder"
+          ],
+          "boost_patterns": [
+            "^PO$",
+            "vPurchaseOrder"
+          ],
+          "penalty_patterns": [
+            "^Pos(Order)?$"
+          ]
+        },
+        "po_detail_candidates": {
+          "include_patterns": [
+            "PODTL",
+            "PurchaseOrder.*DTL"
+          ],
+          "boost_patterns": [
+            "PODTL"
+          ],
+          "penalty_patterns": [
+            "^Pos(Order)?$"
+          ]
+        }
+      },
+      "locations": {
+        "master_candidates": {
+          "include_patterns": [
+            "^v?Branch$",
+            "Location",
+            "Warehouse"
+          ],
+          "boost_patterns": [
+            "^v?Branch$"
+          ],
+          "penalty_patterns": [
+            "Invoice",
+            "PO",
+            "SO"
+          ]
+        },
+        "transaction_location_candidates": {
+          "include_patterns": [
+            "Invoice",
+            "PO",
+            "SO",
+            "Branch"
+          ]
+        }
+      },
+      "payment_methods": {
+        "master_candidates": {
+          "include_patterns": [
+            "PaymentMethod",
+            "PayMethod"
+          ],
+          "boost_patterns": [
+            "^PaymentMethod$"
+          ],
+          "penalty_patterns": [
+            "DTL",
+            "Refund",
+            "Invoice"
+          ]
+        }
+      }
+    }
   },
   "stock_smoke_reference_surfaces": [
     {
