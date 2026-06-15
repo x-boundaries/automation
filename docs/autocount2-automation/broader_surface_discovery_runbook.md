@@ -71,6 +71,35 @@ metadata only by scoring object names, column names, known AutoCount naming
 patterns, likely header/detail table pairs, and obvious false-positive
 patterns.
 
+Broad `top_candidates` can still be noisy because a single keyword group may
+mix setup/master data, transaction headers, transaction detail tables, and
+views. Review the intent-specific shortlist keys first when they are present,
+then use the broad `top_candidates` list as fallback context.
+
+Recommended intent-specific review paths include:
+
+- `debtor_customer.master_candidates` before debtor-bearing AR transaction
+  candidates. `Debtor`, `vDebtor`, and `DebtorType` are different review
+  questions from AR invoice or payment surfaces.
+- `creditor_supplier.master_candidates` before AP transaction candidates.
+  `Creditor`, `vCreditor`, and `CreditorType` are different review questions
+  from AP invoice, payment, credit-note, or goods-received surfaces.
+- `payment_methods.master_candidates` before payment/refund/detail transaction
+  tables. `PaymentMethod` is usually stronger evidence for payment-method
+  setup than payment transaction detail tables.
+- `purchase_order_outstanding_po.po_header_candidates` and
+  `purchase_order_outstanding_po.po_detail_candidates` before POS-related
+  tables. Review `PO`, `PODTL`, and `vPurchaseOrder` before treating `Pos` or
+  `PosOrder` as relevant to purchase orders.
+- `chart_of_accounts_gl.account_master_candidates` separately from
+  `chart_of_accounts_gl.gl_transaction_candidates`. CoA/account master review
+  should not be dominated by `GLDTL` or journal/detail tables, although those
+  may remain relevant for GL transaction review.
+- `ar_ap_opening.ar_opening_candidates` and
+  `ar_ap_opening.ap_opening_candidates` before generic cashbook/imported-goods
+  detail views unless those views are reconciled to direct AR/AP opening needs.
+- `locations.master_candidates` before transaction location candidates.
+
 Scoring is only a ranking aid. A high score does not approve extraction, does
 not select a SQL surface for production use, and does not replace reconciliation
 against AutoCount UI/report outputs. Every shortlisted candidate remains
@@ -79,7 +108,8 @@ against AutoCount UI/report outputs. Every shortlisted candidate remains
 Review shortlisted debtor/customer, creditor/supplier, GL/accounting, AR/AP,
 payment, PO, stock-in-transit, stock reference, and location candidates with
 Ingenious/Mike and finance or operations stakeholders where relevant. Do not
-treat `top_candidates` as a final production mapping.
+treat `top_candidates` or any intent-specific shortlist as a final production
+mapping.
 
 ## What The Script Does
 
@@ -91,6 +121,8 @@ The script:
 - Matches candidate groups by object names and column names.
 - Scores matched candidates to create a bounded metadata-only shortlist for
   human review.
+- Adds intent-specific shortlist keys where broad groups need separate master
+  and transaction review paths.
 - Marks all candidate groups and matched surfaces as `Needs reconciliation`.
 - Redacts password/PWD/token/API-key-like fragments from exception text.
 - Writes a local JSON manifest and Markdown report.

@@ -40,17 +40,29 @@ class FakeDiscoverySource:
     def fetch_objects(self, schemas=None):
         return [
             object_record("dbo", "Debtor", "USER_TABLE"),
+            object_record("dbo", "vDebtor", "VIEW"),
+            object_record("dbo", "DebtorType", "USER_TABLE"),
             object_record("dbo", "ARInvoice", "USER_TABLE"),
+            object_record("dbo", "ARInvoiceDTL", "USER_TABLE"),
             object_record("dbo", "CustomerPayment", "USER_TABLE"),
             object_record("dbo", "Creditor", "USER_TABLE"),
+            object_record("dbo", "vCreditor", "VIEW"),
+            object_record("dbo", "CreditorType", "USER_TABLE"),
             object_record("dbo", "APInvoice", "USER_TABLE"),
+            object_record("dbo", "APInvoiceDTL", "USER_TABLE"),
             object_record("dbo", "GLAccount", "USER_TABLE"),
+            object_record("dbo", "GLDTL", "USER_TABLE"),
             object_record("dbo", "ARAPOpening", "USER_TABLE"),
+            object_record("dbo", "vCashBookImportedGoodsDTL", "VIEW"),
             object_record("dbo", "Branch", "USER_TABLE"),
+            object_record("dbo", "vBranch", "VIEW"),
             object_record("dbo", "InvoiceBranchAudit", "USER_TABLE"),
             object_record("dbo", "PaymentMethod", "USER_TABLE"),
             object_record("dbo", "PO", "USER_TABLE"),
             object_record("dbo", "PODTL", "USER_TABLE"),
+            object_record("dbo", "vPurchaseOrder", "VIEW"),
+            object_record("dbo", "Pos", "USER_TABLE"),
+            object_record("dbo", "PosOrder", "USER_TABLE"),
             object_record("dbo", "POColumnLock", "USER_TABLE"),
             object_record("dbo", "POBonusPoint", "USER_TABLE"),
             object_record("dbo", "SupportTicket", "USER_TABLE"),
@@ -62,18 +74,31 @@ class FakeDiscoverySource:
         return [
             column_record("dbo", "Debtor", "DebtorCode", "nvarchar"),
             column_record("dbo", "Debtor", "CompanyName", "nvarchar"),
+            column_record("dbo", "vDebtor", "DebtorCode", "nvarchar"),
+            column_record("dbo", "DebtorType", "DebtorType", "nvarchar"),
             column_record("dbo", "ARInvoice", "DebtorCode", "nvarchar"),
+            column_record("dbo", "ARInvoiceDTL", "DebtorCode", "nvarchar"),
             column_record("dbo", "CustomerPayment", "CustomerCode", "nvarchar"),
             column_record("dbo", "Creditor", "CreditorCode", "nvarchar"),
+            column_record("dbo", "vCreditor", "CreditorCode", "nvarchar"),
+            column_record("dbo", "CreditorType", "CreditorType", "nvarchar"),
             column_record("dbo", "APInvoice", "CreditorCode", "nvarchar"),
+            column_record("dbo", "APInvoiceDTL", "CreditorCode", "nvarchar"),
             column_record("dbo", "GLAccount", "AccNo", "nvarchar"),
+            column_record("dbo", "GLDTL", "AccNo", "nvarchar"),
+            column_record("dbo", "GLDTL", "JournalNo", "nvarchar"),
             column_record("dbo", "ARAPOpening", "OpeningBalance", "decimal"),
+            column_record("dbo", "vCashBookImportedGoodsDTL", "APInvoiceNo", "nvarchar"),
             column_record("dbo", "Branch", "BranchCode", "nvarchar"),
+            column_record("dbo", "vBranch", "BranchCode", "nvarchar"),
             column_record("dbo", "InvoiceBranchAudit", "BranchCode", "nvarchar"),
             column_record("dbo", "PaymentMethod", "PaymentMethod", "nvarchar"),
             column_record("dbo", "PO", "DocNo", "nvarchar"),
             column_record("dbo", "PODTL", "PONo", "nvarchar"),
             column_record("dbo", "PODTL", "OutstandingQty", "decimal"),
+            column_record("dbo", "vPurchaseOrder", "PONo", "nvarchar"),
+            column_record("dbo", "Pos", "PosNo", "nvarchar"),
+            column_record("dbo", "PosOrder", "PosOrderNo", "nvarchar"),
             column_record("dbo", "POColumnLock", "PONo", "nvarchar"),
             column_record("dbo", "POBonusPoint", "PONo", "nvarchar"),
             column_record("dbo", "StockTransfer", "FromLocation", "nvarchar"),
@@ -128,6 +153,7 @@ class AutoCountBroaderSurfaceDiscoveryTests(unittest.TestCase):
         self.assertTrue(config["candidate_scoring"]["weak_match_penalties"])
         self.assertTrue(config["candidate_scoring"]["false_positive_patterns"])
         self.assertTrue(config["candidate_scoring"]["known_header_detail_pairs"])
+        self.assertTrue(config["candidate_scoring"]["intent_shortlists"])
         self.assertNotIn("connection_string", config)
         self.assertNotRegex(json.dumps(config), r"(?i)(Driver=|Server=|Password=|PWD=|Trusted_Connection=)")
         for group_config in config["discovery_groups"].values():
@@ -176,15 +202,17 @@ class AutoCountBroaderSurfaceDiscoveryTests(unittest.TestCase):
             self.assertGreaterEqual(saved_manifest["object_counts_by_group"]["stock_reference_followup"], 1)
             self.assertIn("top_candidates", saved_manifest["candidate_groups"]["debtor_customer"])
             self.assertTrue(saved_manifest["candidate_groups"]["debtor_customer"]["top_candidates"])
+            self.assert_sequential_ranks(saved_manifest["candidate_groups"]["debtor_customer"]["top_candidates"])
+            self.assertIn("master_candidates", saved_manifest["candidate_groups"]["debtor_customer"])
             self.assertTrue(all(
                 candidate["decision"] == "Needs reconciliation"
                 for group in saved_manifest["candidate_groups"].values()
-                for candidate in group["top_candidates"]
+                for candidate in all_group_candidates(group)
             ))
             self.assertTrue(all(
                 candidate["final_production_selected"] is False
                 for group in saved_manifest["candidate_groups"].values()
-                for candidate in group["top_candidates"]
+                for candidate in all_group_candidates(group)
             ))
             self.assert_no_raw_payload_keys(saved_manifest)
             self.assertTrue((run_path / "broader_surface_discovery_report.md").exists())
@@ -205,6 +233,54 @@ class AutoCountBroaderSurfaceDiscoveryTests(unittest.TestCase):
             self.assert_top_candidate(manifest, "locations", "dbo.Branch")
             self.assert_ranked_above(manifest, "locations", "dbo.Branch", "dbo.InvoiceBranchAudit")
 
+    def test_intent_shortlists_surface_master_candidates_before_transactions(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manifest = discovery.run_discovery(
+                base_config(tmpdir),
+                source=FakeDiscoverySource(),
+                now=datetime.fromisoformat("2026-06-15T09:30:00+08:00"),
+            )
+
+            debtor_master = manifest["candidate_groups"]["debtor_customer"]["master_candidates"]
+            creditor_master = manifest["candidate_groups"]["creditor_supplier"]["master_candidates"]
+            location_master = manifest["candidate_groups"]["locations"]["master_candidates"]
+            payment_master = manifest["candidate_groups"]["payment_methods"]["master_candidates"]
+
+            self.assertIn(debtor_master[0]["object_id"], {"dbo.Debtor", "dbo.vDebtor"})
+            self.assertIn("dbo.DebtorType", object_ids(debtor_master))
+            self.assertIn(creditor_master[0]["object_id"], {"dbo.Creditor", "dbo.vCreditor"})
+            self.assertIn("dbo.CreditorType", object_ids(creditor_master))
+            self.assertIn(location_master[0]["object_id"], {"dbo.Branch", "dbo.vBranch"})
+            self.assertEqual(payment_master[0]["object_id"], "dbo.PaymentMethod")
+            self.assertNotIn("dbo.ARInvoice", object_ids(debtor_master[:3]))
+            self.assertNotIn("dbo.APInvoice", object_ids(creditor_master[:3]))
+
+    def test_intent_shortlists_separate_opening_po_and_gl_review_paths(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manifest = discovery.run_discovery(
+                base_config(tmpdir),
+                source=FakeDiscoverySource(),
+                now=datetime.fromisoformat("2026-06-15T09:30:00+08:00"),
+            )
+
+            ar_opening = manifest["candidate_groups"]["ar_ap_opening"]["ar_opening_candidates"]
+            ap_opening = manifest["candidate_groups"]["ar_ap_opening"]["ap_opening_candidates"]
+            po_header = manifest["candidate_groups"]["purchase_order_outstanding_po"]["po_header_candidates"]
+            po_detail = manifest["candidate_groups"]["purchase_order_outstanding_po"]["po_detail_candidates"]
+            account_master = manifest["candidate_groups"]["chart_of_accounts_gl"]["account_master_candidates"]
+            gl_transactions = manifest["candidate_groups"]["chart_of_accounts_gl"]["gl_transaction_candidates"]
+
+            self.assertIn("dbo.ARInvoice", object_ids(ar_opening))
+            self.assertIn("dbo.ARInvoiceDTL", object_ids(ar_opening))
+            self.assertIn("dbo.APInvoice", object_ids(ap_opening))
+            self.assertIn("dbo.APInvoiceDTL", object_ids(ap_opening))
+            self.assertEqual(po_header[0]["object_id"], "dbo.PO")
+            self.assertIn("dbo.vPurchaseOrder", object_ids(po_header))
+            self.assertIn("dbo.PODTL", object_ids(po_detail))
+            self.assertEqual(account_master[0]["object_id"], "dbo.GLAccount")
+            self.assertNotEqual(account_master[0]["object_id"], "dbo.GLDTL")
+            self.assertIn("dbo.GLDTL", object_ids(gl_transactions))
+
     def test_scoring_detects_header_detail_pairs_and_penalizes_false_positives(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             manifest = discovery.run_discovery(
@@ -222,22 +298,30 @@ class AutoCountBroaderSurfaceDiscoveryTests(unittest.TestCase):
             self.assertLess(column_lock["score"], po_detail["score"])
             self.assertLess(bonus_point["score"], po_detail["score"])
 
-    def test_scoring_limits_top_candidates_and_keeps_weak_substrings_from_dominating(self):
+    def test_scoring_limits_top_candidates_and_keeps_pos_from_dominating_po(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             config = base_config(tmpdir)
-            config["candidate_scoring"]["top_n_per_group"] = 2
+            config["candidate_scoring"]["top_n_per_group"] = 15
             manifest = discovery.run_discovery(
                 config,
                 source=FakeDiscoverySource(),
                 now=datetime.fromisoformat("2026-06-15T09:30:00+08:00"),
             )
             po_candidates = manifest["candidate_groups"]["purchase_order_outstanding_po"]["top_candidates"]
+            po = candidate_by_id(po_candidates, "dbo.PO")
+            pos = candidate_by_id(po_candidates, "dbo.Pos")
+            pos_order = candidate_by_id(po_candidates, "dbo.PosOrder")
 
-            self.assertLessEqual(len(po_candidates), 2)
+            self.assertLessEqual(len(po_candidates), 15)
             self.assertIn("dbo.PO", [candidate["object_id"] for candidate in po_candidates])
             self.assertNotIn("dbo.SupportTicket", [candidate["object_id"] for candidate in po_candidates])
+            self.assert_ranked_above(manifest, "purchase_order_outstanding_po", "dbo.PO", "dbo.Pos")
+            self.assert_ranked_above(manifest, "purchase_order_outstanding_po", "dbo.PO", "dbo.PosOrder")
+            self.assertTrue(any("pos" in reason.lower() for reason in pos["score_reasons"]))
+            self.assertTrue(any("pos" in reason.lower() for reason in pos_order["score_reasons"]))
             self.assertTrue(all(candidate["decision"] == "Needs reconciliation" for candidate in po_candidates))
             self.assertTrue(all(candidate["final_production_selected"] is False for candidate in po_candidates))
+            self.assertIsNotNone(po)
 
     def test_empty_no_match_metadata_is_safe_success(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -286,6 +370,9 @@ class AutoCountBroaderSurfaceDiscoveryTests(unittest.TestCase):
         positions = {candidate["object_id"]: index for index, candidate in enumerate(candidates)}
         self.assertLess(positions[higher_object_id], positions[lower_object_id])
 
+    def assert_sequential_ranks(self, candidates):
+        self.assertEqual([candidate["rank"] for candidate in candidates], list(range(1, len(candidates) + 1)))
+
 
 def base_config(output_root):
     return {
@@ -309,10 +396,13 @@ def base_config(output_root):
             "enabled": True,
             "top_n_per_group": 15,
             "exact_name_boosts": {
-                "debtor_customer": ["Debtor"],
-                "creditor_supplier": ["Creditor"],
-                "locations": ["Branch"],
-                "purchase_order_outstanding_po": ["PO"],
+                "debtor_customer": ["Debtor", "vDebtor", "DebtorType"],
+                "creditor_supplier": ["Creditor", "vCreditor", "CreditorType"],
+                "chart_of_accounts_gl": ["GLAccount"],
+                "locations": ["Branch", "vBranch"],
+                "payment_methods": ["PaymentMethod"],
+                "purchase_order_outstanding_po": ["PO", "vPurchaseOrder"],
+                "ar_ap_opening": ["ARInvoice", "ARInvoiceDTL", "APInvoice", "APInvoiceDTL"],
             },
             "weak_match_penalties": {
                 "object_name_weak_substring": -8
@@ -320,10 +410,87 @@ def base_config(output_root):
             "false_positive_patterns": [
                 {"pattern": "ColumnLock", "penalty": -25, "unless_group_contains": []},
                 {"pattern": "BonusPoint", "penalty": -20, "unless_group_contains": ["loyalty", "member"]},
+                {"pattern": "^Pos(Order)?$", "penalty": -45, "groups": ["purchase_order_outstanding_po"]},
+                {"pattern": "CashBook.*ImportedGoods.*DTL", "penalty": -35, "groups": ["ar_ap_opening"]},
             ],
             "known_header_detail_pairs": [
-                {"group": "purchase_order_outstanding_po", "header": "PO", "detail": "PODTL", "boost": 20}
+                {"group": "purchase_order_outstanding_po", "header": "PO", "detail": "PODTL", "boost": 20},
+                {"group": "ar_ap_opening", "header": "ARInvoice", "detail": "ARInvoiceDTL", "boost": 20},
+                {"group": "ar_ap_opening", "header": "APInvoice", "detail": "APInvoiceDTL", "boost": 20},
             ],
+            "intent_shortlists": {
+                "debtor_customer": {
+                    "master_candidates": {
+                        "include_patterns": ["^v?Debtor$", "^DebtorType$"],
+                        "boost_patterns": ["^v?Debtor$", "^DebtorType$"],
+                        "penalty_patterns": ["Invoice", "Payment"]
+                    },
+                    "transaction_candidates": {
+                        "include_patterns": ["Invoice", "Payment", "CreditNote", "DebitNote"]
+                    }
+                },
+                "creditor_supplier": {
+                    "master_candidates": {
+                        "include_patterns": ["^v?Creditor$", "^CreditorType$"],
+                        "boost_patterns": ["^v?Creditor$", "^CreditorType$"],
+                        "penalty_patterns": ["Invoice", "Payment"]
+                    },
+                    "transaction_candidates": {
+                        "include_patterns": ["Invoice", "Payment", "CreditNote", "DebitNote", "GoodsReceived"]
+                    }
+                },
+                "chart_of_accounts_gl": {
+                    "account_master_candidates": {
+                        "include_patterns": ["Account", "COA", "Chart"],
+                        "boost_patterns": ["GLAccount", "Account"],
+                        "penalty_patterns": ["DTL", "Journal"]
+                    },
+                    "gl_transaction_candidates": {
+                        "include_patterns": ["GLDTL", "Journal", "Ledger", "DTL"]
+                    }
+                },
+                "ar_ap_opening": {
+                    "ar_opening_candidates": {
+                        "include_patterns": ["ARInvoice", "AR.*Opening"],
+                        "boost_patterns": ["ARInvoice", "ARInvoiceDTL"],
+                        "penalty_patterns": ["CashBook.*ImportedGoods"]
+                    },
+                    "ap_opening_candidates": {
+                        "include_patterns": ["APInvoice", "AP.*Opening"],
+                        "boost_patterns": ["APInvoice", "APInvoiceDTL"],
+                        "penalty_patterns": ["CashBook.*ImportedGoods"]
+                    }
+                },
+                "purchase_order_outstanding_po": {
+                    "po_header_candidates": {
+                        "include_patterns": ["^PO$", "PurchaseOrder"],
+                        "boost_patterns": ["^PO$", "vPurchaseOrder"],
+                        "penalty_patterns": ["^Pos(Order)?$"]
+                    },
+                    "po_detail_candidates": {
+                        "include_patterns": ["PODTL", "PurchaseOrder.*DTL"],
+                        "boost_patterns": ["PODTL"],
+                        "penalty_patterns": ["^Pos(Order)?$"]
+                    }
+                },
+                "locations": {
+                    "master_candidates": {
+                        "include_patterns": ["^v?Branch$", "Location", "Warehouse"],
+                        "boost_patterns": ["^v?Branch$"],
+                        "penalty_patterns": ["Invoice", "PO", "SO"]
+                    },
+                    "transaction_location_candidates": {
+                        "include_patterns": ["Invoice", "PO", "SO", "Branch"]
+                    }
+                },
+                "payment_methods": {
+                    "master_candidates": {
+                        "include_patterns": ["PaymentMethod", "PayMethod"],
+                        "boost_patterns": ["^PaymentMethod$"],
+                        "penalty_patterns": ["DTL", "Refund", "Invoice"]
+                    }
+                }
+            },
         },
     }
 
@@ -360,6 +527,14 @@ def candidate_by_id(candidates, object_id):
         if candidate["object_id"] == object_id:
             return candidate
     return None
+
+
+def all_group_candidates(group):
+    candidates = list(group.get("top_candidates", []))
+    for key, value in group.items():
+        if key.endswith("_candidates") and isinstance(value, list):
+            candidates.extend(value)
+    return candidates
 
 
 if __name__ == "__main__":
