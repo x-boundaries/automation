@@ -20,6 +20,13 @@ Validate any dedicated extraction login with the
 [AC2 read-only SQL login validation runbook](readonly_sql_login_runbook.md)
 before using it for smoke extraction or scheduling decisions.
 
+Use the
+[Broader AC2 surface discovery runbook](broader_surface_discovery_runbook.md)
+only after read-only login validation and the stock smoke rerun have passed. The
+broader discovery output is metadata-only planning evidence for future
+customer/supplier/GL/AR/AP/location/payment/PO/stock-in-transit scope; it does
+not approve final SQL surfaces.
+
 ## Why Extraction Is Not Scheduled Yet
 
 Do not schedule extraction yet because the current login is discovery-only. The

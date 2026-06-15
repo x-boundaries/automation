@@ -1,6 +1,6 @@
 # Phase 1 Extraction Mapping
 
-Use the [Phase 1 reconciliation runbook](phase1_reconciliation_runbook.md) to validate these candidate surfaces against AutoCount UI/report outputs before replacing any placeholder with a wrapper view. Use the [Phase 1 AC2 stock extraction smoke runbook](phase1_stock_extract_smoke_runbook.md) only to repeat the verified smoke extraction workflow; it does not select final production SQL surfaces.
+Use the [Phase 1 reconciliation runbook](phase1_reconciliation_runbook.md) to validate these candidate surfaces against AutoCount UI/report outputs before replacing any placeholder with a wrapper view. Use the [Phase 1 AC2 stock extraction smoke runbook](phase1_stock_extract_smoke_runbook.md) only to repeat the verified smoke extraction workflow; it does not select final production SQL surfaces. Use the [Broader AC2 surface discovery runbook](broader_surface_discovery_runbook.md) only for metadata-only planning of future non-stock surfaces; its candidates remain `Needs reconciliation`.
 
 This mapping turns the SQL probe decision pack into stock extractor
 configuration guidance. It is intentionally read-only and does not define any
