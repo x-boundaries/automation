@@ -40,12 +40,20 @@ class FakeDiscoverySource:
     def fetch_objects(self, schemas=None):
         return [
             object_record("dbo", "Debtor", "USER_TABLE"),
+            object_record("dbo", "ARInvoice", "USER_TABLE"),
+            object_record("dbo", "CustomerPayment", "USER_TABLE"),
             object_record("dbo", "Creditor", "USER_TABLE"),
+            object_record("dbo", "APInvoice", "USER_TABLE"),
             object_record("dbo", "GLAccount", "USER_TABLE"),
             object_record("dbo", "ARAPOpening", "USER_TABLE"),
-            object_record("dbo", "Location", "USER_TABLE"),
+            object_record("dbo", "Branch", "USER_TABLE"),
+            object_record("dbo", "InvoiceBranchAudit", "USER_TABLE"),
             object_record("dbo", "PaymentMethod", "USER_TABLE"),
-            object_record("dbo", "PurchaseOrder", "VIEW"),
+            object_record("dbo", "PO", "USER_TABLE"),
+            object_record("dbo", "PODTL", "USER_TABLE"),
+            object_record("dbo", "POColumnLock", "USER_TABLE"),
+            object_record("dbo", "POBonusPoint", "USER_TABLE"),
+            object_record("dbo", "SupportTicket", "USER_TABLE"),
             object_record("dbo", "StockTransfer", "VIEW"),
             object_record("dbo", "Item", "USER_TABLE"),
         ]
@@ -54,12 +62,20 @@ class FakeDiscoverySource:
         return [
             column_record("dbo", "Debtor", "DebtorCode", "nvarchar"),
             column_record("dbo", "Debtor", "CompanyName", "nvarchar"),
+            column_record("dbo", "ARInvoice", "DebtorCode", "nvarchar"),
+            column_record("dbo", "CustomerPayment", "CustomerCode", "nvarchar"),
             column_record("dbo", "Creditor", "CreditorCode", "nvarchar"),
+            column_record("dbo", "APInvoice", "CreditorCode", "nvarchar"),
             column_record("dbo", "GLAccount", "AccNo", "nvarchar"),
             column_record("dbo", "ARAPOpening", "OpeningBalance", "decimal"),
-            column_record("dbo", "Location", "Location", "nvarchar"),
+            column_record("dbo", "Branch", "BranchCode", "nvarchar"),
+            column_record("dbo", "InvoiceBranchAudit", "BranchCode", "nvarchar"),
             column_record("dbo", "PaymentMethod", "PaymentMethod", "nvarchar"),
-            column_record("dbo", "PurchaseOrder", "OutstandingQty", "decimal"),
+            column_record("dbo", "PO", "DocNo", "nvarchar"),
+            column_record("dbo", "PODTL", "PONo", "nvarchar"),
+            column_record("dbo", "PODTL", "OutstandingQty", "decimal"),
+            column_record("dbo", "POColumnLock", "PONo", "nvarchar"),
+            column_record("dbo", "POBonusPoint", "PONo", "nvarchar"),
             column_record("dbo", "StockTransfer", "FromLocation", "nvarchar"),
             column_record("dbo", "StockTransfer", "ToLocation", "nvarchar"),
             column_record("dbo", "Item", "ItemCode", "nvarchar"),
@@ -106,6 +122,12 @@ class AutoCountBroaderSurfaceDiscoveryTests(unittest.TestCase):
         self.assertEqual(config["connection_string_env"], "AUTOCOUNT_READONLY_SQL_CONNECTION_STRING")
         self.assertEqual(config["output_root"], r"C:\XB\autocount_outputs\probe\broader_surfaces")
         self.assertEqual(set(config["discovery_groups"]), REQUIRED_GROUPS)
+        self.assertEqual(config["candidate_scoring"]["enabled"], True)
+        self.assertEqual(config["candidate_scoring"]["top_n_per_group"], 15)
+        self.assertTrue(config["candidate_scoring"]["exact_name_boosts"]["debtor_customer"])
+        self.assertTrue(config["candidate_scoring"]["weak_match_penalties"])
+        self.assertTrue(config["candidate_scoring"]["false_positive_patterns"])
+        self.assertTrue(config["candidate_scoring"]["known_header_detail_pairs"])
         self.assertNotIn("connection_string", config)
         self.assertNotRegex(json.dumps(config), r"(?i)(Driver=|Server=|Password=|PWD=|Trusted_Connection=)")
         for group_config in config["discovery_groups"].values():
@@ -152,9 +174,70 @@ class AutoCountBroaderSurfaceDiscoveryTests(unittest.TestCase):
             self.assertIn("dbo.StockTransfer", object_ids(saved_manifest["matched_objects_by_group"]["stock_in_transit_candidates"]))
             self.assertTrue(saved_manifest["matched_columns_by_group"]["purchase_order_outstanding_po"])
             self.assertGreaterEqual(saved_manifest["object_counts_by_group"]["stock_reference_followup"], 1)
+            self.assertIn("top_candidates", saved_manifest["candidate_groups"]["debtor_customer"])
+            self.assertTrue(saved_manifest["candidate_groups"]["debtor_customer"]["top_candidates"])
+            self.assertTrue(all(
+                candidate["decision"] == "Needs reconciliation"
+                for group in saved_manifest["candidate_groups"].values()
+                for candidate in group["top_candidates"]
+            ))
+            self.assertTrue(all(
+                candidate["final_production_selected"] is False
+                for group in saved_manifest["candidate_groups"].values()
+                for candidate in group["top_candidates"]
+            ))
             self.assert_no_raw_payload_keys(saved_manifest)
             self.assertTrue((run_path / "broader_surface_discovery_report.md").exists())
             self.assertIn("AutoCount UI/report reconciliation", "\n".join(saved_manifest["notes"]))
+
+    def test_scoring_ranks_exact_master_candidates_above_transaction_matches(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manifest = discovery.run_discovery(
+                base_config(tmpdir),
+                source=FakeDiscoverySource(),
+                now=datetime.fromisoformat("2026-06-15T09:30:00+08:00"),
+            )
+
+            self.assert_top_candidate(manifest, "debtor_customer", "dbo.Debtor")
+            self.assert_ranked_above(manifest, "debtor_customer", "dbo.Debtor", "dbo.ARInvoice")
+            self.assert_top_candidate(manifest, "creditor_supplier", "dbo.Creditor")
+            self.assert_ranked_above(manifest, "creditor_supplier", "dbo.Creditor", "dbo.APInvoice")
+            self.assert_top_candidate(manifest, "locations", "dbo.Branch")
+            self.assert_ranked_above(manifest, "locations", "dbo.Branch", "dbo.InvoiceBranchAudit")
+
+    def test_scoring_detects_header_detail_pairs_and_penalizes_false_positives(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manifest = discovery.run_discovery(
+                base_config(tmpdir),
+                source=FakeDiscoverySource(),
+                now=datetime.fromisoformat("2026-06-15T09:30:00+08:00"),
+            )
+            po_candidates = manifest["candidate_groups"]["purchase_order_outstanding_po"]["top_candidates"]
+            po_detail = candidate_by_id(po_candidates, "dbo.PODTL")
+            column_lock = candidate_by_id(po_candidates, "dbo.POColumnLock")
+            bonus_point = candidate_by_id(po_candidates, "dbo.POBonusPoint")
+
+            self.assertIsNotNone(po_detail)
+            self.assertTrue(any("detail pair" in reason.lower() for reason in po_detail["score_reasons"]))
+            self.assertLess(column_lock["score"], po_detail["score"])
+            self.assertLess(bonus_point["score"], po_detail["score"])
+
+    def test_scoring_limits_top_candidates_and_keeps_weak_substrings_from_dominating(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = base_config(tmpdir)
+            config["candidate_scoring"]["top_n_per_group"] = 2
+            manifest = discovery.run_discovery(
+                config,
+                source=FakeDiscoverySource(),
+                now=datetime.fromisoformat("2026-06-15T09:30:00+08:00"),
+            )
+            po_candidates = manifest["candidate_groups"]["purchase_order_outstanding_po"]["top_candidates"]
+
+            self.assertLessEqual(len(po_candidates), 2)
+            self.assertIn("dbo.PO", [candidate["object_id"] for candidate in po_candidates])
+            self.assertNotIn("dbo.SupportTicket", [candidate["object_id"] for candidate in po_candidates])
+            self.assertTrue(all(candidate["decision"] == "Needs reconciliation" for candidate in po_candidates))
+            self.assertTrue(all(candidate["final_production_selected"] is False for candidate in po_candidates))
 
     def test_empty_no_match_metadata_is_safe_success(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -193,6 +276,16 @@ class AutoCountBroaderSurfaceDiscoveryTests(unittest.TestCase):
             for item in value:
                 self.assert_no_raw_payload_keys(item)
 
+    def assert_top_candidate(self, manifest, group_name, object_id):
+        candidates = manifest["candidate_groups"][group_name]["top_candidates"]
+        self.assertTrue(candidates)
+        self.assertEqual(candidates[0]["object_id"], object_id)
+
+    def assert_ranked_above(self, manifest, group_name, higher_object_id, lower_object_id):
+        candidates = manifest["candidate_groups"][group_name]["top_candidates"]
+        positions = {candidate["object_id"]: index for index, candidate in enumerate(candidates)}
+        self.assertLess(positions[higher_object_id], positions[lower_object_id])
+
 
 def base_config(output_root):
     return {
@@ -202,15 +295,35 @@ def base_config(output_root):
         "schemas": ["dbo"],
         "include_row_counts": False,
         "discovery_groups": {
-            "debtor_customer": {"keyword_hints": ["debtor", "customer"]},
+            "debtor_customer": {"keyword_hints": ["debtor", "customer", "cust"]},
             "creditor_supplier": {"keyword_hints": ["creditor", "supplier", "vendor"]},
             "chart_of_accounts_gl": {"keyword_hints": ["account", "gl", "ledger", "coa", "accno"]},
             "ar_ap_opening": {"keyword_hints": ["ar", "ap", "opening", "receivable", "payable"]},
-            "locations": {"keyword_hints": ["location", "warehouse", "store"]},
+            "locations": {"keyword_hints": ["location", "warehouse", "store", "branch"]},
             "payment_methods": {"keyword_hints": ["payment", "paymethod", "cash", "bank", "cheque"]},
             "purchase_order_outstanding_po": {"keyword_hints": ["purchase", "po", "order", "outstanding"]},
             "stock_in_transit_candidates": {"keyword_hints": ["transit", "transfer", "fromlocation", "tolocation"]},
             "stock_reference_followup": {"keyword_hints": ["item", "stock", "uom", "balance", "movement"]},
+        },
+        "candidate_scoring": {
+            "enabled": True,
+            "top_n_per_group": 15,
+            "exact_name_boosts": {
+                "debtor_customer": ["Debtor"],
+                "creditor_supplier": ["Creditor"],
+                "locations": ["Branch"],
+                "purchase_order_outstanding_po": ["PO"],
+            },
+            "weak_match_penalties": {
+                "object_name_weak_substring": -8
+            },
+            "false_positive_patterns": [
+                {"pattern": "ColumnLock", "penalty": -25, "unless_group_contains": []},
+                {"pattern": "BonusPoint", "penalty": -20, "unless_group_contains": ["loyalty", "member"]},
+            ],
+            "known_header_detail_pairs": [
+                {"group": "purchase_order_outstanding_po", "header": "PO", "detail": "PODTL", "boost": 20}
+            ],
         },
     }
 
@@ -240,6 +353,13 @@ def column_record(schema_name, object_name, column_name, data_type):
 
 def object_ids(records):
     return {record["object_id"] for record in records}
+
+
+def candidate_by_id(candidates, object_id):
+    for candidate in candidates:
+        if candidate["object_id"] == object_id:
+            return candidate
+    return None
 
 
 if __name__ == "__main__":
