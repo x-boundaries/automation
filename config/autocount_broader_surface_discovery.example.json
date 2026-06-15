@@ -88,6 +88,114 @@
       ]
     }
   },
+  "candidate_scoring": {
+    "enabled": true,
+    "top_n_per_group": 15,
+    "exact_name_boosts": {
+      "debtor_customer": [
+        "Debtor",
+        "Customer"
+      ],
+      "creditor_supplier": [
+        "Creditor",
+        "Supplier",
+        "Vendor"
+      ],
+      "chart_of_accounts_gl": [
+        "Account",
+        "GLAccount",
+        "ChartOfAccount",
+        "COA"
+      ],
+      "ar_ap_opening": [
+        "ARAPOpening",
+        "AROpening",
+        "APOpening"
+      ],
+      "locations": [
+        "Branch",
+        "Location",
+        "Warehouse"
+      ],
+      "payment_methods": [
+        "PaymentMethod",
+        "PayMethod"
+      ],
+      "purchase_order_outstanding_po": [
+        "PO",
+        "PurchaseOrder"
+      ],
+      "stock_in_transit_candidates": [
+        "DocTransfer",
+        "StockTransfer"
+      ],
+      "stock_reference_followup": [
+        "Item",
+        "ItemUOM",
+        "StockDTL"
+      ]
+    },
+    "weak_match_penalties": {
+      "object_name_weak_substring": -8
+    },
+    "false_positive_patterns": [
+      {
+        "pattern": "ColumnLock",
+        "penalty": -25,
+        "unless_group_contains": []
+      },
+      {
+        "pattern": "BonusPoint",
+        "penalty": -20,
+        "unless_group_contains": [
+          "loyalty",
+          "member"
+        ]
+      },
+      {
+        "pattern": "Temp|Tmp|Staging|Stage",
+        "penalty": -15,
+        "unless_group_contains": [
+          "temp",
+          "staging"
+        ]
+      },
+      {
+        "pattern": "EInvoice|Einvoice|EInv",
+        "penalty": -12,
+        "unless_group_contains": [
+          "e_invoice",
+          "einvoice"
+        ]
+      }
+    ],
+    "known_header_detail_pairs": [
+      {
+        "group": "ar_ap_opening",
+        "header": "ARInvoice",
+        "detail": "ARInvoiceDTL",
+        "boost": 20
+      },
+      {
+        "group": "ar_ap_opening",
+        "header": "APInvoice",
+        "detail": "APInvoiceDTL",
+        "boost": 20
+      },
+      {
+        "group": "purchase_order_outstanding_po",
+        "header": "PO",
+        "detail": "PODTL",
+        "boost": 20
+      },
+      {
+        "group": "purchase_order_outstanding_po",
+        "header": "GR",
+        "detail": "GRDTL",
+        "boost": 16
+      }
+    ]
+  },
   "stock_smoke_reference_surfaces": [
     {
       "schema_name": "dbo",

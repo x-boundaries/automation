@@ -25,6 +25,37 @@ DEFAULT_DISCOVERY_GROUPS = {
     "stock_reference_followup": ["item", "stock", "uom", "balance", "movement", "stockdtl"],
 }
 
+DEFAULT_CANDIDATE_SCORING = {
+    "enabled": True,
+    "top_n_per_group": 15,
+    "exact_name_boosts": {
+        "debtor_customer": ["Debtor", "Customer"],
+        "creditor_supplier": ["Creditor", "Supplier", "Vendor"],
+        "chart_of_accounts_gl": ["Account", "GLAccount", "ChartOfAccount", "COA"],
+        "ar_ap_opening": ["ARAPOpening", "AROpening", "APOpening"],
+        "locations": ["Branch", "Location", "Warehouse"],
+        "payment_methods": ["PaymentMethod", "PayMethod"],
+        "purchase_order_outstanding_po": ["PO", "PurchaseOrder"],
+        "stock_in_transit_candidates": ["DocTransfer", "StockTransfer"],
+        "stock_reference_followup": ["Item", "ItemUOM", "StockDTL"],
+    },
+    "weak_match_penalties": {
+        "object_name_weak_substring": -8,
+    },
+    "false_positive_patterns": [
+        {"pattern": "ColumnLock", "penalty": -25, "unless_group_contains": []},
+        {"pattern": "BonusPoint", "penalty": -20, "unless_group_contains": ["loyalty", "member"]},
+        {"pattern": "Temp|Tmp|Staging|Stage", "penalty": -15, "unless_group_contains": ["temp", "staging"]},
+        {"pattern": "EInvoice|Einvoice|EInv", "penalty": -12, "unless_group_contains": ["e_invoice", "einvoice"]},
+    ],
+    "known_header_detail_pairs": [
+        {"group": "ar_ap_opening", "header": "ARInvoice", "detail": "ARInvoiceDTL", "boost": 20},
+        {"group": "ar_ap_opening", "header": "APInvoice", "detail": "APInvoiceDTL", "boost": 20},
+        {"group": "purchase_order_outstanding_po", "header": "PO", "detail": "PODTL", "boost": 20},
+        {"group": "purchase_order_outstanding_po", "header": "GR", "detail": "GRDTL", "boost": 16},
+    ],
+}
+
 SECRET_PATTERN = re.compile(
     r"(?i)\b(password|pwd|token|secret|api[_ -]?key|access[_ -]?key)\b\s*[:=]\s*[^;\s]+"
 )
@@ -45,6 +76,7 @@ def run_discovery(config, source=None, output_root=None, include_row_counts=None
     run_path.mkdir(parents=True, exist_ok=False)
 
     groups = normalize_discovery_groups(config.get("discovery_groups") or DEFAULT_DISCOVERY_GROUPS)
+    scoring_config = normalize_scoring_config(config.get("candidate_scoring"))
     warnings = []
     exceptions = []
     context = {}
@@ -84,7 +116,7 @@ def run_discovery(config, source=None, output_root=None, include_row_counts=None
             "approximate_object_counts": len(approximate_counts),
             "exceptions": len(exceptions),
         },
-        "candidate_groups": build_candidate_group_summary(groups, matches),
+        "candidate_groups": build_candidate_group_summary(groups, matches, scoring_config),
         "matched_objects_by_group": matches["matched_objects_by_group"],
         "matched_columns_by_group": matches["matched_columns_by_group"],
         "object_counts_by_group": {
@@ -285,6 +317,27 @@ def normalize_discovery_groups(configured_groups):
     return groups
 
 
+def normalize_scoring_config(configured):
+    config = dict(DEFAULT_CANDIDATE_SCORING)
+    configured = configured or {}
+    for key, value in configured.items():
+        if key in {"exact_name_boosts", "weak_match_penalties"}:
+            merged = dict(config.get(key, {}))
+            merged.update(value or {})
+            config[key] = merged
+        elif key in {"false_positive_patterns", "known_header_detail_pairs"}:
+            config[key] = list(value or [])
+        else:
+            config[key] = value
+    config["enabled"] = bool(config.get("enabled", True))
+    try:
+        top_n = int(config.get("top_n_per_group", 15))
+    except (TypeError, ValueError):
+        top_n = 15
+    config["top_n_per_group"] = max(top_n, 0)
+    return config
+
+
 def match_candidate_surfaces(objects, columns, groups):
     columns_by_object = {}
     for column in columns:
@@ -358,17 +411,233 @@ def match_candidate_surfaces(objects, columns, groups):
     }
 
 
-def build_candidate_group_summary(groups, matches):
+def build_candidate_group_summary(groups, matches, scoring_config=None):
+    scoring_config = normalize_scoring_config(scoring_config)
     summary = {}
     for group_name, hints in groups.items():
+        matched_objects = matches["matched_objects_by_group"].get(group_name, [])
+        matched_columns = matches["matched_columns_by_group"].get(group_name, [])
         summary[group_name] = {
             "keyword_hints": list(hints),
             "decision": NEEDS_RECONCILIATION,
-            "matched_object_count": len(matches["matched_objects_by_group"].get(group_name, [])),
-            "matched_column_count": len(matches["matched_columns_by_group"].get(group_name, [])),
+            "matched_object_count": len(matched_objects),
+            "matched_column_count": len(matched_columns),
+            "top_candidates": build_top_candidates(
+                group_name,
+                hints,
+                matched_objects,
+                matched_columns,
+                matches["matched_objects_by_group"],
+                scoring_config,
+            ),
             "final_production_selected": False,
         }
     return summary
+
+
+def build_top_candidates(group_name, hints, matched_objects, matched_columns, all_matched_objects, scoring_config):
+    if not scoring_config.get("enabled", True):
+        return []
+    top_n = scoring_config.get("top_n_per_group", 15)
+    if top_n <= 0:
+        return []
+    columns_by_object = {}
+    for column in matched_columns:
+        columns_by_object.setdefault(column["object_id"], []).append(column)
+    object_names_by_group = {
+        name: {normalize_keyword(record.get("object_name", "")) for record in records}
+        for name, records in all_matched_objects.items()
+    }
+
+    scored = []
+    for record in matched_objects:
+        score, reasons = score_candidate(
+            group_name,
+            hints,
+            record,
+            columns_by_object.get(record["object_id"], []),
+            object_names_by_group,
+            scoring_config,
+        )
+        scored.append(
+            {
+                "object_id": record["object_id"],
+                "schema_name": record["schema_name"],
+                "object_name": record["object_name"],
+                "object_type": record["object_type"],
+                "score": score,
+                "matched_keywords": list(record.get("matched_keywords", [])),
+                "score_reasons": reasons,
+                "decision": NEEDS_RECONCILIATION,
+                "final_production_selected": False,
+            }
+        )
+    scored.sort(key=lambda item: (-item["score"], item["schema_name"].lower(), item["object_name"].lower()))
+    return scored[:top_n]
+
+
+def score_candidate(group_name, hints, record, matched_columns, object_names_by_group, scoring_config):
+    score = 0
+    reasons = []
+    object_name = str(record.get("object_name", ""))
+    normalized_object = normalize_keyword(object_name)
+    matched_keywords = list(record.get("matched_keywords", []))
+    matched_column_names = list(record.get("matched_columns", []))
+
+    if matched_keywords:
+        boost = len(matched_keywords) * 5
+        score += boost
+        reasons.append(f"Matched {len(matched_keywords)} group keyword(s) (+{boost}).")
+    if matched_column_names:
+        boost = len(matched_column_names) * 4
+        score += boost
+        reasons.append(f"Matched {len(matched_column_names)} column name(s) (+{boost}).")
+
+    exact_names = scoring_config.get("exact_name_boosts", {}).get(group_name, [])
+    for expected_name in exact_names:
+        normalized_expected = normalize_keyword(expected_name)
+        if normalized_object == normalized_expected:
+            score += 60
+            reasons.append(f"Exact object-name boost for {expected_name} (+60).")
+        elif normalized_object.startswith(normalized_expected) and normalized_expected:
+            score += 18
+            reasons.append(f"Object-name prefix boost for {expected_name} (+18).")
+        elif normalized_object.endswith(normalized_expected) and normalized_expected:
+            score += 12
+            reasons.append(f"Object-name suffix boost for {expected_name} (+12).")
+
+    for hint in hints:
+        score_delta, reason = score_name_hint(object_name, hint)
+        if score_delta:
+            score += score_delta
+            reasons.append(reason)
+
+    for column_name in matched_column_names:
+        for hint in hints:
+            if normalized_names_equal(column_name, hint):
+                score += 10
+                reasons.append(f"Exact column-name match `{column_name}` for `{hint}` (+10).")
+            elif normalize_keyword(column_name).startswith(normalize_keyword(hint)):
+                score += 6
+                reasons.append(f"Column-name prefix match `{column_name}` for `{hint}` (+6).")
+
+    score += apply_autocount_pattern_boosts(object_name, matched_column_names, reasons)
+    score += apply_header_detail_boosts(
+        group_name,
+        object_name,
+        object_names_by_group,
+        scoring_config.get("known_header_detail_pairs", []),
+        reasons,
+    )
+    score += apply_false_positive_penalties(
+        group_name,
+        object_name,
+        scoring_config.get("false_positive_patterns", []),
+        reasons,
+    )
+    score += apply_weak_match_penalties(
+        object_name,
+        matched_keywords,
+        scoring_config.get("weak_match_penalties", {}),
+        reasons,
+    )
+
+    if not reasons:
+        reasons.append("Metadata candidate retained from broad keyword matching.")
+    return score, reasons
+
+
+def score_name_hint(object_name, hint):
+    normalized_object = normalize_keyword(object_name)
+    normalized_hint = normalize_keyword(hint)
+    if not normalized_hint:
+        return 0, ""
+    if normalized_object == normalized_hint:
+        return 30, f"Exact object-name keyword match `{hint}` (+30)."
+    if normalized_object.startswith(normalized_hint):
+        return 14, f"Object-name prefix keyword match `{hint}` (+14)."
+    if normalized_object.endswith(normalized_hint):
+        return 10, f"Object-name suffix keyword match `{hint}` (+10)."
+    if normalized_hint in normalized_object:
+        return 3, f"Weak object-name substring match `{hint}` (+3)."
+    return 0, ""
+
+
+def apply_autocount_pattern_boosts(object_name, matched_column_names, reasons):
+    boost = 0
+    normalized_object = normalize_keyword(object_name)
+    if normalized_object.endswith("dtl"):
+        boost += 10
+        reasons.append("Known AutoCount detail-table suffix `DTL` (+10).")
+    common_columns = {"docno", "debtorcode", "creditorcode", "branchcode", "acccno", "accno", "itemcode"}
+    matched_common = [name for name in matched_column_names if normalize_keyword(name) in common_columns]
+    if matched_common:
+        column_boost = min(len(matched_common) * 4, 12)
+        boost += column_boost
+        reasons.append(f"Known AutoCount key/code column pattern (+{column_boost}).")
+    return boost
+
+
+def apply_header_detail_boosts(group_name, object_name, object_names_by_group, pairs, reasons):
+    boost = 0
+    normalized_object = normalize_keyword(object_name)
+    group_object_names = object_names_by_group.get(group_name, set())
+    for pair in pairs:
+        if pair.get("group") not in {None, "", group_name}:
+            continue
+        header = normalize_keyword(pair.get("header", ""))
+        detail = normalize_keyword(pair.get("detail", ""))
+        pair_boost = int(pair.get("boost", 16))
+        if normalized_object == header and detail in group_object_names:
+            boost += pair_boost
+            reasons.append(f"Known header/detail pair hint with `{pair.get('detail')}` (+{pair_boost}).")
+        if normalized_object == detail and header in group_object_names:
+            boost += pair_boost
+            reasons.append(f"Known detail pair hint for `{pair.get('header')}` (+{pair_boost}).")
+    return boost
+
+
+def apply_false_positive_penalties(group_name, object_name, patterns, reasons):
+    penalty = 0
+    normalized_group = normalize_keyword(group_name)
+    for rule in patterns:
+        pattern = str(rule.get("pattern", ""))
+        if not pattern:
+            continue
+        unless_tokens = [normalize_keyword(token) for token in rule.get("unless_group_contains", [])]
+        if any(token and token in normalized_group for token in unless_tokens):
+            continue
+        if re.search(pattern, object_name, flags=re.IGNORECASE):
+            rule_penalty = int(rule.get("penalty", -10))
+            penalty += rule_penalty
+            reasons.append(f"False-positive pattern `{pattern}` ({rule_penalty}).")
+    return penalty
+
+
+def apply_weak_match_penalties(object_name, matched_keywords, penalties, reasons):
+    weak_penalty = int(penalties.get("object_name_weak_substring", 0) or 0)
+    if not weak_penalty:
+        return 0
+    penalty = 0
+    for keyword in matched_keywords:
+        if is_weak_substring_match(object_name, keyword):
+            penalty += weak_penalty
+            reasons.append(f"Weak substring-only object match `{keyword}` ({weak_penalty}).")
+    return penalty
+
+
+def is_weak_substring_match(value, keyword):
+    normalized_value = normalize_keyword(value)
+    normalized_key = normalize_keyword(keyword)
+    if not normalized_value or not normalized_key:
+        return False
+    if normalized_value == normalized_key or normalized_value.startswith(normalized_key) or normalized_value.endswith(normalized_key):
+        return False
+    return normalized_key in normalized_value
+
+
+def normalized_names_equal(left, right):
+    return normalize_keyword(left) == normalize_keyword(right)
 
 
 def empty_matches(groups):
@@ -478,6 +747,18 @@ def render_report(manifest):
         records = manifest["matched_objects_by_group"].get(group_name, [])
         if not records:
             lines.append("- No metadata matches.")
+        top_candidates = group.get("top_candidates", [])
+        if top_candidates:
+            lines.append("- Shortlist:")
+            for candidate in top_candidates:
+                reasons = "; ".join(candidate.get("score_reasons", []))
+                lines.append(
+                    f"  - `{candidate['object_id']}` ({candidate['object_type']}), "
+                    f"score {candidate['score']}, decision: {candidate['decision']}, "
+                    f"final production selected: {str(candidate['final_production_selected']).lower()}"
+                )
+                if reasons:
+                    lines.append(f"    - Reasons: {reasons}")
         for record in records:
             lines.append(
                 f"- `{record['object_id']}` ({record['object_type']}): "

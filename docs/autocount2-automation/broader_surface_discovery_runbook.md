@@ -62,6 +62,25 @@ Generated manifests and reports stay local. Do not commit generated outputs or
    `C:\XB\autocount_outputs\probe\broader_surfaces`.
 5. Use the metadata-only results to decide future extraction scope.
 
+## Candidate Scoring And Shortlists
+
+Broad AC2 metadata discovery can return hundreds of candidate objects per
+group. The manifest and report include a `top_candidates` shortlist for each
+candidate group to make review more practical. The shortlist is produced from
+metadata only by scoring object names, column names, known AutoCount naming
+patterns, likely header/detail table pairs, and obvious false-positive
+patterns.
+
+Scoring is only a ranking aid. A high score does not approve extraction, does
+not select a SQL surface for production use, and does not replace reconciliation
+against AutoCount UI/report outputs. Every shortlisted candidate remains
+`Needs reconciliation`, and `final_production_selected` remains `false`.
+
+Review shortlisted debtor/customer, creditor/supplier, GL/accounting, AR/AP,
+payment, PO, stock-in-transit, stock reference, and location candidates with
+Ingenious/Mike and finance or operations stakeholders where relevant. Do not
+treat `top_candidates` as a final production mapping.
+
 ## What The Script Does
 
 The script:
@@ -70,6 +89,8 @@ The script:
 - Reads SQL catalog metadata for visible tables/views and columns.
 - Optionally captures approximate object row counts from SQL Server metadata.
 - Matches candidate groups by object names and column names.
+- Scores matched candidates to create a bounded metadata-only shortlist for
+  human review.
 - Marks all candidate groups and matched surfaces as `Needs reconciliation`.
 - Redacts password/PWD/token/API-key-like fragments from exception text.
 - Writes a local JSON manifest and Markdown report.
