@@ -111,6 +111,12 @@ After the dedicated login validation passes, rerun the
 [Phase 1 AC2 stock extraction smoke runbook](phase1_stock_extract_smoke_runbook.md)
 using that dedicated login.
 
+After the stock smoke extraction has been rerun successfully with the dedicated
+login, use the
+[Broader AC2 surface discovery runbook](broader_surface_discovery_runbook.md)
+only for metadata-only planning of future non-stock extraction surfaces. Broader
+discovery does not approve final extraction mapping or scheduling.
+
 Do not schedule extraction yet. Scheduling still requires:
 
 - Dedicated read-only login validation.

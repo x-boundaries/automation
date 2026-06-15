@@ -107,6 +107,7 @@ C:\XB\autocount_outputs
 Use workflow subfolders:
 
 - `C:\XB\autocount_outputs\probe`
+- `C:\XB\autocount_outputs\probe\broader_surfaces`
 - `C:\XB\autocount_outputs\reconcile`
 - `C:\XB\autocount_outputs\extract\stock`
 
@@ -120,6 +121,9 @@ summaries should be pasted back for review. For the verified smoke workflow,
 use the [Phase 1 AC2 stock extraction smoke runbook](phase1_stock_extract_smoke_runbook.md).
 For dedicated-login checks, use the
 [AC2 read-only SQL login validation runbook](readonly_sql_login_runbook.md).
+For broader non-stock planning, use the
+[Broader AC2 surface discovery runbook](broader_surface_discovery_runbook.md);
+its outputs are metadata-only candidates and do not approve extraction scope.
 
 ## Environment Metadata Disclosure
 
