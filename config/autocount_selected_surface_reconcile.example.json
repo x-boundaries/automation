@@ -1,0 +1,56 @@
+{
+  "job": "autocount_selected_surface_reconcile",
+  "connection_string_env": "AUTOCOUNT_READONLY_SQL_CONNECTION_STRING",
+  "output_root": "C:\\XB\\autocount_outputs\\probe\\selected_surface_reconcile",
+  "schemas": ["dbo"],
+  "enabled_aggregate_groups": [
+    "customer_master",
+    "supplier_master",
+    "branch_location",
+    "payment_method",
+    "ar_opening",
+    "ap_opening",
+    "po_outstanding",
+    "gl_transaction",
+    "coa_account_master"
+  ],
+  "business_date": {
+    "enabled": false,
+    "as_of_date": ""
+  },
+  "safe_aggregate_settings": {
+    "allow_status_breakdowns": false,
+    "allow_gl_amount_totals": false
+  },
+  "selected_surfaces": {
+    "customer_master": [
+      {"schema_name": "dbo", "object_name": "Debtor"},
+      {"schema_name": "dbo", "object_name": "vDebtor"}
+    ],
+    "supplier_master": [
+      {"schema_name": "dbo", "object_name": "Creditor"},
+      {"schema_name": "dbo", "object_name": "vCreditor"}
+    ],
+    "branch_location": [
+      {"schema_name": "dbo", "object_name": "Branch"},
+      {"schema_name": "dbo", "object_name": "vBranch"}
+    ],
+    "payment_method": [
+      {"schema_name": "dbo", "object_name": "PaymentMethod"}
+    ],
+    "ar_opening": [
+      {"schema_name": "dbo", "object_name": "ARInvoice"}
+    ],
+    "ap_opening": [
+      {"schema_name": "dbo", "object_name": "APInvoice"}
+    ],
+    "po_outstanding": [
+      {"schema_name": "dbo", "object_name": "PO"},
+      {"schema_name": "dbo", "object_name": "PODTL"}
+    ],
+    "gl_transaction": [
+      {"schema_name": "dbo", "object_name": "GLDTL"}
+    ],
+    "coa_account_master": []
+  }
+}
