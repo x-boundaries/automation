@@ -12,6 +12,116 @@ DEFAULT_CONFIG_PATH = Path("config/autocount_broader_surface_discovery.example.j
 DEFAULT_CONNECTION_STRING_ENV = "AUTOCOUNT_READONLY_SQL_CONNECTION_STRING"
 DEFAULT_OUTPUT_ROOT = r"C:\XB\autocount_outputs\probe\broader_surfaces"
 NEEDS_RECONCILIATION = "Needs reconciliation"
+SELECTED_PROFILE_WARNINGS = [
+    "This is metadata-only and not approved for extraction.",
+    "Confirm against AutoCount UI/report paths and Ingenious/Mike before extraction.",
+    "No final production mapping selected.",
+]
+
+SELECTED_SURFACE_DEFINITIONS = [
+    {
+        "review_area": "customer_master",
+        "objects": [
+            {"object_name": "Debtor", "candidate_role": "master_table"},
+            {"object_name": "vDebtor", "candidate_role": "enriched_view"},
+        ],
+        "expected_columns": ["DebtorCode", "CompanyName"],
+        "notes": "Likely customer/debtor master setup surface; reconcile with AutoCount debtor maintenance and reports.",
+    },
+    {
+        "review_area": "supplier_master",
+        "objects": [
+            {"object_name": "Creditor", "candidate_role": "master_table"},
+            {"object_name": "vCreditor", "candidate_role": "enriched_view"},
+        ],
+        "expected_columns": ["CreditorCode", "CompanyName"],
+        "notes": "Likely supplier/creditor master setup surface; reconcile with AutoCount creditor maintenance and reports.",
+    },
+    {
+        "review_area": "branch_location",
+        "objects": [
+            {"object_name": "Branch", "candidate_role": "master_table"},
+            {"object_name": "vBranch", "candidate_role": "enriched_view"},
+        ],
+        "expected_columns": ["BranchCode", "Description"],
+        "notes": "Likely branch/location setup surface; confirm against AutoCount location or branch paths.",
+    },
+    {
+        "review_area": "payment_method",
+        "objects": [
+            {"object_name": "PaymentMethod", "candidate_role": "master_table"},
+        ],
+        "expected_columns": ["PaymentMethod", "Description"],
+        "notes": "Likely payment method setup surface; reconcile before using for payment extraction planning.",
+    },
+    {
+        "review_area": "ar_opening",
+        "objects": [
+            {"object_name": "ARInvoice", "candidate_role": "header_table"},
+            {"object_name": "ARInvoiceDTL", "candidate_role": "detail_table"},
+        ],
+        "expected_columns": ["DocNo", "DebtorCode", "Outstanding", "OutstandingAmt"],
+        "notes": "Likely AR opening or outstanding review surface; confirm against AutoCount AR reports before extraction.",
+    },
+    {
+        "review_area": "ap_opening",
+        "objects": [
+            {"object_name": "APInvoice", "candidate_role": "header_table"},
+            {"object_name": "APInvoiceDTL", "candidate_role": "detail_table"},
+        ],
+        "expected_columns": ["DocNo", "CreditorCode", "Outstanding", "OutstandingAmt"],
+        "notes": "Likely AP opening or outstanding review surface; confirm against AutoCount AP reports before extraction.",
+    },
+    {
+        "review_area": "po_outstanding",
+        "objects": [
+            {"object_name": "PO", "candidate_role": "header_table"},
+            {"object_name": "PODTL", "candidate_role": "detail_table"},
+            {"object_name": "vPurchaseOrder", "candidate_role": "enriched_view"},
+        ],
+        "expected_columns": ["DocNo", "PONo", "CreditorCode", "OutstandingQty"],
+        "notes": "Likely purchase order or outstanding PO review surface; reconcile with PO UI/report paths.",
+    },
+    {
+        "review_area": "gl_transaction",
+        "objects": [
+            {"object_name": "GLDTL", "candidate_role": "transaction_detail"},
+        ],
+        "expected_columns": ["AccNo", "JournalNo", "DocNo", "Debit", "Credit"],
+        "notes": "GLDTL is GL transaction/detail metadata, not chart-of-accounts master metadata.",
+    },
+]
+
+COA_OBJECT_NAME_SIGNALS = {
+    "account",
+    "accounts",
+    "glaccount",
+    "glacc",
+    "acc",
+    "chartofaccount",
+    "coa",
+    "postingaccount",
+    "accountgroup",
+}
+COA_COLUMN_SIGNALS = {
+    "accno",
+    "description",
+    "desc2",
+    "accounttype",
+    "parentaccno",
+    "specialacctype",
+    "isactive",
+}
+COA_TRANSACTION_PENALTY_PATTERNS = [
+    r"GLDTL",
+    r"Journal",
+    r"DTL$",
+    r"Invoice",
+    r"Payment",
+    r"Revaluation",
+    r"GainLoss",
+    r"Gain.*Loss",
+]
 
 DEFAULT_DISCOVERY_GROUPS = {
     "debtor_customer": ["debtor", "customer", "cust"],
@@ -172,6 +282,13 @@ def run_discovery(config, source=None, output_root=None, include_row_counts=None
         status = "failed"
         exceptions.append(sanitize_text(str(exc)))
 
+    candidate_groups = build_candidate_group_summary(groups, matches, scoring_config)
+    selected_surface_profile = build_selected_surface_profile(
+        object_inventory,
+        column_inventory,
+        candidate_groups,
+    )
+
     manifest = {
         "job": config.get("job", "autocount_broader_surface_discovery"),
         "status": status,
@@ -189,7 +306,8 @@ def run_discovery(config, source=None, output_root=None, include_row_counts=None
             "approximate_object_counts": len(approximate_counts),
             "exceptions": len(exceptions),
         },
-        "candidate_groups": build_candidate_group_summary(groups, matches, scoring_config),
+        "candidate_groups": candidate_groups,
+        "selected_surface_profile": selected_surface_profile,
         "matched_objects_by_group": matches["matched_objects_by_group"],
         "matched_columns_by_group": matches["matched_columns_by_group"],
         "object_counts_by_group": {
@@ -208,6 +326,7 @@ def run_discovery(config, source=None, output_root=None, include_row_counts=None
             "run_path": plan["run_path"],
             "manifest": str(run_path / "broader_surface_discovery_manifest.json"),
             "report": str(run_path / "broader_surface_discovery_report.md"),
+            "selected_surface_profile_report": str(run_path / "selected_surface_profile.md"),
         },
         "notes": [
             "All candidate surfaces are metadata-only heuristic matches and require AutoCount UI/report reconciliation before extraction use.",
@@ -218,6 +337,8 @@ def run_discovery(config, source=None, output_root=None, include_row_counts=None
 
     report_path = run_path / "broader_surface_discovery_report.md"
     report_path.write_text(render_report(manifest), encoding="utf-8")
+    selected_profile_path = run_path / "selected_surface_profile.md"
+    selected_profile_path.write_text(render_selected_surface_profile_report(manifest), encoding="utf-8")
     manifest_path = run_path / "broader_surface_discovery_manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
     return manifest
@@ -909,6 +1030,164 @@ def sanitize_context(context):
     return {str(key): sanitize_text(value) for key, value in dict(context or {}).items()}
 
 
+def build_selected_surface_profile(objects, columns, candidate_groups):
+    objects_by_name = {}
+    for obj in objects:
+        objects_by_name.setdefault(normalize_keyword(obj.get("object_name", "")), []).append(obj)
+    columns_by_object = columns_grouped_by_object(columns)
+
+    items = []
+    for definition in SELECTED_SURFACE_DEFINITIONS:
+        expected_columns = definition["expected_columns"]
+        for selected_object in definition["objects"]:
+            for obj in objects_by_name.get(normalize_keyword(selected_object["object_name"]), []):
+                items.append(
+                    build_selected_surface_item(
+                        definition["review_area"],
+                        obj,
+                        columns_by_object.get(obj["object_id"], []),
+                        selected_object["candidate_role"],
+                        "exact_object_name",
+                        expected_columns,
+                        definition["notes"],
+                    )
+                )
+
+    coa_candidates = find_coa_account_master_candidates(objects, columns_by_object, candidate_groups)
+    if coa_candidates:
+        for candidate in coa_candidates:
+            items.append(
+                build_selected_surface_item(
+                    "coa_account_master",
+                    candidate,
+                    columns_by_object.get(candidate["object_id"], []),
+                    "master_table" if candidate.get("object_type") == "USER_TABLE" else "enriched_view",
+                    "manual_metadata_rule",
+                    ["AccNo", "Description", "Desc2", "AccountType", "ParentAccNo", "SpecialAccType", "IsActive"],
+                    "Possible CoA/account master metadata candidate; still requires AutoCount UI/report reconciliation.",
+                )
+            )
+    else:
+        items.append(
+            {
+                "review_area": "coa_account_master",
+                "schema_name": "",
+                "object_name": "unresolved",
+                "object_id": "unresolved",
+                "object_type": "unresolved",
+                "decision": NEEDS_RECONCILIATION,
+                "final_production_selected": False,
+                "candidate_role": "unresolved",
+                "matched_from": "manual_metadata_rule",
+                "key_columns_found": [],
+                "missing_expected_columns": [
+                    "AccNo",
+                    "Description",
+                    "Desc2",
+                    "AccountType",
+                    "ParentAccNo",
+                    "SpecialAccType",
+                    "IsActive",
+                ],
+                "notes": (
+                    "CoA/account master remains unresolved because metadata did not expose a strong account master "
+                    "candidate. GLDTL and Accountant are not treated as CoA master."
+                ),
+            }
+        )
+
+    return {
+        "decision": NEEDS_RECONCILIATION,
+        "final_production_selected": False,
+        "warnings": list(SELECTED_PROFILE_WARNINGS),
+        "summary": {
+            "item_count": len(items),
+            "review_areas": sorted({item["review_area"] for item in items}),
+            "unresolved_review_areas": sorted(
+                {item["review_area"] for item in items if item["candidate_role"] == "unresolved"}
+            ),
+        },
+        "items": items,
+    }
+
+
+def build_selected_surface_item(
+    review_area,
+    obj,
+    columns,
+    candidate_role,
+    matched_from,
+    expected_columns,
+    notes,
+):
+    column_names = [column.get("column_name", "") for column in columns]
+    key_columns_found = [
+        column_name
+        for column_name in column_names
+        if any(normalized_names_equal(column_name, expected) for expected in expected_columns)
+    ]
+    missing_expected_columns = [
+        expected
+        for expected in expected_columns
+        if not any(normalized_names_equal(column_name, expected) for column_name in column_names)
+    ]
+    return {
+        "review_area": review_area,
+        "schema_name": obj["schema_name"],
+        "object_name": obj["object_name"],
+        "object_id": obj["object_id"],
+        "object_type": obj["object_type"],
+        "decision": NEEDS_RECONCILIATION,
+        "final_production_selected": False,
+        "candidate_role": candidate_role,
+        "matched_from": matched_from,
+        "key_columns_found": key_columns_found,
+        "missing_expected_columns": missing_expected_columns,
+        "notes": notes,
+    }
+
+
+def find_coa_account_master_candidates(objects, columns_by_object, candidate_groups):
+    shortlisted_ids = {
+        candidate.get("object_id")
+        for candidate in candidate_groups.get("chart_of_accounts_gl", {}).get("account_master_candidates", [])
+    }
+    scored = []
+    for obj in objects:
+        object_name = obj.get("object_name", "")
+        normalized_object = normalize_keyword(object_name)
+        if normalized_object == "accountant":
+            continue
+        column_names = [
+            normalize_keyword(column.get("column_name", ""))
+            for column in columns_by_object.get(obj["object_id"], [])
+        ]
+        column_signal_count = len({column for column in column_names if column in COA_COLUMN_SIGNALS})
+        object_signal = normalized_object in COA_OBJECT_NAME_SIGNALS
+        if not object_signal and column_signal_count < 3:
+            continue
+
+        score = column_signal_count * 20
+        if object_signal:
+            score += 60
+        if obj["object_id"] in shortlisted_ids:
+            score += 15
+        if any(re.search(pattern, object_name, flags=re.IGNORECASE) for pattern in COA_TRANSACTION_PENALTY_PATTERNS):
+            score -= 80
+        if score >= 60:
+            scored.append((score, obj))
+
+    scored.sort(key=lambda item: (-item[0], item[1]["schema_name"].lower(), item[1]["object_name"].lower()))
+    return [obj for _, obj in scored[:3]]
+
+
+def columns_grouped_by_object(columns):
+    grouped = {}
+    for column in columns:
+        grouped.setdefault(column["object_id"], []).append(column)
+    return grouped
+
+
 def render_report(manifest):
     lines = [
         "# AutoCount Broader Surface Discovery Report",
@@ -979,6 +1258,85 @@ def render_report(manifest):
         for exception in manifest["exceptions"]:
             lines.append(f"- {sanitize_text(exception)}")
     return "\n".join(lines) + "\n"
+
+
+def render_selected_surface_profile_report(manifest):
+    profile = manifest["selected_surface_profile"]
+    lines = [
+        "# Selected Surface Profile",
+        "",
+        "This report is generated from SQL Server metadata only for human review.",
+        "",
+        "## Warnings",
+        "",
+    ]
+    for warning in SELECTED_PROFILE_WARNINGS:
+        lines.append(f"- {warning}")
+
+    lines.extend(
+        [
+            "",
+            "## Run Context",
+            "",
+            f"- Status: {manifest['status']}",
+            f"- Run ID: {manifest['run_id']}",
+            f"- Started at: {manifest['started_at']}",
+            f"- Finished at: {manifest['finished_at']}",
+            f"- Database: {manifest.get('context', {}).get('current_database', '')}",
+            f"- Login/User: {manifest.get('context', {}).get('current_login', '')}"
+            f"/{manifest.get('context', {}).get('current_user_name', '')}",
+            f"- Objects inspected: {manifest['counts']['objects']}",
+            f"- Columns inspected: {manifest['counts']['columns']}",
+            "",
+            "## Profile Summary",
+            "",
+            "| Review area | Object | Type | Role | Decision | Final production selected |",
+            "| --- | --- | --- | --- | --- | --- |",
+        ]
+    )
+    for item in profile["items"]:
+        lines.append(
+            f"| {item['review_area']} | `{item['object_id']}` | {item['object_type']} | "
+            f"{item['candidate_role']} | {item['decision']} | "
+            f"{str(item['final_production_selected']).lower()} |"
+        )
+
+    lines.extend(["", "## Selected Surface Tables", ""])
+    for item in profile["items"]:
+        lines.append(f"### {item['review_area']} - `{item['object_id']}`")
+        lines.append(f"- Schema: {item['schema_name']}")
+        lines.append(f"- Object name: {item['object_name']}")
+        lines.append(f"- Object type: {item['object_type']}")
+        lines.append(f"- Candidate role: {item['candidate_role']}")
+        lines.append(f"- Matched from: {item['matched_from']}")
+        lines.append(f"- Decision: {item['decision']}")
+        lines.append(f"- Final production selected: {str(item['final_production_selected']).lower()}")
+        lines.append(f"- Key columns found: {format_list(item['key_columns_found'])}")
+        lines.append(f"- Missing expected columns: {format_list(item['missing_expected_columns'])}")
+        lines.append(f"- Notes: {item['notes']}")
+        lines.append("")
+
+    unresolved = [item for item in profile["items"] if item["review_area"] == "coa_account_master"]
+    if any(item["candidate_role"] == "unresolved" for item in unresolved):
+        lines.extend(
+            [
+                "## Unresolved CoA Note",
+                "",
+                (
+                    "The CoA/account master surface remains unresolved. GLDTL is transaction/detail GL metadata, "
+                    "and Accountant is not treated as chart-of-accounts master metadata."
+                ),
+                "",
+            ]
+        )
+
+    return "\n".join(lines) + "\n"
+
+
+def format_list(values):
+    if not values:
+        return "none"
+    return ", ".join(f"`{value}`" for value in values)
 
 
 def iter_intent_shortlists(group):
