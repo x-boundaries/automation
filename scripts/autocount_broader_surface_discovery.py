@@ -26,6 +26,7 @@ SELECTED_SURFACE_DEFINITIONS = [
             {"object_name": "vDebtor", "candidate_role": "enriched_view"},
         ],
         "expected_columns": ["DebtorCode", "CompanyName"],
+        "matched_from": "debtor_customer.master_candidates",
         "notes": "Likely customer/debtor master setup surface; reconcile with AutoCount debtor maintenance and reports.",
     },
     {
@@ -35,6 +36,7 @@ SELECTED_SURFACE_DEFINITIONS = [
             {"object_name": "vCreditor", "candidate_role": "enriched_view"},
         ],
         "expected_columns": ["CreditorCode", "CompanyName"],
+        "matched_from": "creditor_supplier.master_candidates",
         "notes": "Likely supplier/creditor master setup surface; reconcile with AutoCount creditor maintenance and reports.",
     },
     {
@@ -44,6 +46,7 @@ SELECTED_SURFACE_DEFINITIONS = [
             {"object_name": "vBranch", "candidate_role": "enriched_view"},
         ],
         "expected_columns": ["BranchCode", "Description"],
+        "matched_from": "locations.master_candidates",
         "notes": "Likely branch/location setup surface; confirm against AutoCount location or branch paths.",
     },
     {
@@ -52,6 +55,7 @@ SELECTED_SURFACE_DEFINITIONS = [
             {"object_name": "PaymentMethod", "candidate_role": "master_table"},
         ],
         "expected_columns": ["PaymentMethod", "Description"],
+        "matched_from": "payment_methods.master_candidates",
         "notes": "Likely payment method setup surface; reconcile before using for payment extraction planning.",
     },
     {
@@ -61,6 +65,7 @@ SELECTED_SURFACE_DEFINITIONS = [
             {"object_name": "ARInvoiceDTL", "candidate_role": "detail_table"},
         ],
         "expected_columns": ["DocNo", "DebtorCode", "Outstanding", "OutstandingAmt"],
+        "matched_from": "ar_ap_opening.ar_opening_candidates",
         "notes": "Likely AR opening or outstanding review surface; confirm against AutoCount AR reports before extraction.",
     },
     {
@@ -70,6 +75,7 @@ SELECTED_SURFACE_DEFINITIONS = [
             {"object_name": "APInvoiceDTL", "candidate_role": "detail_table"},
         ],
         "expected_columns": ["DocNo", "CreditorCode", "Outstanding", "OutstandingAmt"],
+        "matched_from": "ar_ap_opening.ap_opening_candidates",
         "notes": "Likely AP opening or outstanding review surface; confirm against AutoCount AP reports before extraction.",
     },
     {
@@ -80,6 +86,7 @@ SELECTED_SURFACE_DEFINITIONS = [
             {"object_name": "vPurchaseOrder", "candidate_role": "enriched_view"},
         ],
         "expected_columns": ["DocNo", "PONo", "CreditorCode", "OutstandingQty"],
+        "matched_from": "purchase_order_outstanding_po intent shortlists",
         "notes": "Likely purchase order or outstanding PO review surface; reconcile with PO UI/report paths.",
     },
     {
@@ -88,6 +95,7 @@ SELECTED_SURFACE_DEFINITIONS = [
             {"object_name": "GLDTL", "candidate_role": "transaction_detail"},
         ],
         "expected_columns": ["AccNo", "JournalNo", "DocNo", "Debit", "Credit"],
+        "matched_from": "chart_of_accounts_gl.gl_transaction_candidates",
         "notes": "GLDTL is GL transaction/detail metadata, not chart-of-accounts master metadata.",
     },
 ]
@@ -1047,7 +1055,7 @@ def build_selected_surface_profile(objects, columns, candidate_groups):
                         obj,
                         columns_by_object.get(obj["object_id"], []),
                         selected_object["candidate_role"],
-                        "exact_object_name",
+                        definition["matched_from"],
                         expected_columns,
                         definition["notes"],
                     )
@@ -1164,12 +1172,11 @@ def find_coa_account_master_candidates(objects, columns_by_object, candidate_gro
         ]
         column_signal_count = len({column for column in column_names if column in COA_COLUMN_SIGNALS})
         object_signal = normalized_object in COA_OBJECT_NAME_SIGNALS
-        if not object_signal and column_signal_count < 3:
+        if not object_signal or "accno" not in column_names:
             continue
 
         score = column_signal_count * 20
-        if object_signal:
-            score += 60
+        score += 60
         if obj["object_id"] in shortlisted_ids:
             score += 15
         if any(re.search(pattern, object_name, flags=re.IGNORECASE) for pattern in COA_TRANSACTION_PENALTY_PATTERNS):

@@ -29,6 +29,7 @@ config/autocount_readonly_login_validate.local.json
 readonly_login_validation_manifest.json
 broader_surface_discovery_manifest.json
 broader_surface_discovery_report.md
+selected_surface_profile.md
 
 # Standard AutoCount local output root. Keep generated CSVs/manifests local.
 autocount_outputs/
@@ -39,6 +40,7 @@ autocount_outputs/**/probe_manifest.json
 autocount_outputs/**/readonly_login_validation_manifest.json
 autocount_outputs/**/broader_surface_discovery_manifest.json
 autocount_outputs/**/broader_surface_discovery_report.md
+autocount_outputs/**/selected_surface_profile.md
 autocount_outputs/**/phase1_reconcile_manifest.json
 autocount_outputs/**/phase1_reconcile_report.md
 
