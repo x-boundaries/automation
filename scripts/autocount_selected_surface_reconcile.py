@@ -3,7 +3,8 @@ import json
 import os
 import re
 import sys
-from datetime import datetime
+from datetime import date, datetime
+from decimal import Decimal
 from pathlib import Path
 from uuid import uuid4
 
@@ -97,12 +98,14 @@ def run_reconciliation(config, source=None, output_root=None, now=None):
         ],
     }
 
+    json_manifest = normalize_for_json(manifest)
+
     (run_path / "selected_surface_reconcile_manifest.json").write_text(
-        json.dumps(manifest, indent=2, sort_keys=True),
+        json.dumps(json_manifest, indent=2, sort_keys=True),
         encoding="utf-8",
     )
-    (run_path / "selected_surface_reconcile_report.md").write_text(render_report(manifest), encoding="utf-8")
-    return manifest
+    (run_path / "selected_surface_reconcile_report.md").write_text(render_report(json_manifest), encoding="utf-8")
+    return json_manifest
 
 
 def build_run_plan(config, output_root=None, now=None):
@@ -445,11 +448,26 @@ def build_surface_filter(schema_expression, object_expression, surfaces):
 
 
 def sanitize_aggregate_values(values):
-    return {sanitize_text(key): coerce_cell(value) for key, value in dict(values or {}).items()}
+    return {
+        sanitize_text(key): normalize_for_json(value)
+        for key, value in dict(values or {}).items()
+    }
 
 
 def sanitize_context(context):
     return {str(key): sanitize_text(value) for key, value in dict(context or {}).items()}
+
+
+def normalize_for_json(value):
+    if isinstance(value, Decimal):
+        return str(value)
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {str(key): normalize_for_json(nested) for key, nested in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [normalize_for_json(nested) for nested in value]
+    return value
 
 
 def render_report(manifest):
