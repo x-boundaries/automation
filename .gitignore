@@ -32,6 +32,8 @@ broader_surface_discovery_report.md
 selected_surface_profile.md
 selected_surface_reconcile_manifest.json
 selected_surface_reconcile_report.md
+selected_surface_extract_manifest.json
+selected_surface_extract_report.md
 
 # Standard AutoCount local output root. Keep generated CSVs/manifests local.
 autocount_outputs/
@@ -45,6 +47,8 @@ autocount_outputs/**/broader_surface_discovery_report.md
 autocount_outputs/**/selected_surface_profile.md
 autocount_outputs/**/selected_surface_reconcile_manifest.json
 autocount_outputs/**/selected_surface_reconcile_report.md
+autocount_outputs/**/selected_surface_extract_manifest.json
+autocount_outputs/**/selected_surface_extract_report.md
 autocount_outputs/**/phase1_reconcile_manifest.json
 autocount_outputs/**/phase1_reconcile_report.md
 
@@ -67,6 +71,12 @@ autocount_selected_surface_reconcile_outputs/
 selected_surface_reconcile_outputs/
 autocount_selected_surface_reconcile.local.json
 config/autocount_selected_surface_reconcile.local.json
+
+# AutoCount selected surface raw snapshot local outputs/config
+autocount_selected_surface_extract_outputs/
+selected_surface_extract_outputs/
+autocount_selected_surface_extract.local.json
+config/autocount_selected_surface_extract.local.json
 
 # AutoCount stock extraction local outputs/config
 autocount_stock_extract_outputs/

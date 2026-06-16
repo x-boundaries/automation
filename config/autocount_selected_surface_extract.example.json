@@ -1,0 +1,120 @@
+{
+  "job": "autocount_selected_surface_extract",
+  "connection_string_env": "AUTOCOUNT_READONLY_SQL_CONNECTION_STRING",
+  "output_root": "C:\\XB\\autocount_outputs\\extract\\selected_surfaces",
+  "include_views": true,
+  "enable_gl_transaction": false,
+  "enable_ap_ar_detail": false,
+  "max_rows": null,
+  "business_date": "",
+  "as_of_date": "",
+  "surfaces": {
+    "Debtor": {
+      "schema_name": "dbo",
+      "object_name": "Debtor",
+      "enabled": true,
+      "object_type": "master_table",
+      "columns": ["DebtorCode", "CompanyName", "IsActive", "TaxType", "Phone1", "EmailAddress", "LastModified"],
+      "order_by": ["DebtorCode"]
+    },
+    "vDebtor": {
+      "schema_name": "dbo",
+      "object_name": "vDebtor",
+      "enabled": true,
+      "object_type": "enriched_view",
+      "columns": ["DebtorCode", "CompanyName", "IsActive", "TaxType", "Phone1", "EmailAddress", "LastModified"],
+      "order_by": ["DebtorCode"]
+    },
+    "Creditor": {
+      "schema_name": "dbo",
+      "object_name": "Creditor",
+      "enabled": true,
+      "object_type": "master_table",
+      "columns": ["CreditorCode", "CompanyName", "IsActive", "TaxType", "Phone1", "EmailAddress", "LastModified"],
+      "order_by": ["CreditorCode"]
+    },
+    "vCreditor": {
+      "schema_name": "dbo",
+      "object_name": "vCreditor",
+      "enabled": true,
+      "object_type": "enriched_view",
+      "columns": ["CreditorCode", "CompanyName", "IsActive", "TaxType", "Phone1", "EmailAddress", "LastModified"],
+      "order_by": ["CreditorCode"]
+    },
+    "PaymentMethod": {
+      "schema_name": "dbo",
+      "object_name": "PaymentMethod",
+      "enabled": true,
+      "object_type": "master_table",
+      "columns": ["PaymentMethod", "Description", "IsActive", "LastModified"],
+      "order_by": ["PaymentMethod"]
+    },
+    "PO": {
+      "schema_name": "dbo",
+      "object_name": "PO",
+      "enabled": true,
+      "object_type": "header_table",
+      "columns": ["DocKey", "DocNo", "DocDate", "CreditorCode", "CreditorName", "NetTotal", "LocalNetTotal", "Cancelled", "Closed", "LastModified"],
+      "order_by": ["DocNo"]
+    },
+    "PODTL": {
+      "schema_name": "dbo",
+      "object_name": "PODTL",
+      "enabled": true,
+      "object_type": "detail_table",
+      "columns": ["DocKey", "DtlKey", "DocNo", "ItemCode", "Description", "Qty", "TransferedQty", "OutstandingQty", "UOM", "DeliveryDate"],
+      "order_by": ["DocNo", "DtlKey"]
+    },
+    "vPurchaseOrder": {
+      "schema_name": "dbo",
+      "object_name": "vPurchaseOrder",
+      "enabled": true,
+      "object_type": "enriched_view",
+      "columns": ["DocNo", "PONo", "DocDate", "CreditorCode", "CreditorName", "ItemCode", "Description", "Qty", "TransferedQty", "OutstandingQty", "UOM"],
+      "order_by": ["DocNo", "ItemCode"]
+    },
+    "ARInvoice": {
+      "schema_name": "dbo",
+      "object_name": "ARInvoice",
+      "enabled": true,
+      "object_type": "header_table",
+      "columns": ["DocNo", "DocDate", "DebtorCode", "DebtorName", "NetTotal", "LocalNetTotal", "Outstanding", "OutstandingAmt", "Cancelled", "LastModified"],
+      "order_by": ["DocNo"]
+    },
+    "APInvoice": {
+      "schema_name": "dbo",
+      "object_name": "APInvoice",
+      "enabled": true,
+      "object_type": "header_table",
+      "columns": ["DocNo", "DocDate", "CreditorCode", "CreditorName", "NetTotal", "LocalNetTotal", "Outstanding", "OutstandingAmt", "Cancelled", "LastModified"],
+      "order_by": ["DocNo"]
+    },
+    "ARInvoiceDTL": {
+      "schema_name": "dbo",
+      "object_name": "ARInvoiceDTL",
+      "enabled": false,
+      "requires_flag": "enable_ap_ar_detail",
+      "object_type": "detail_table",
+      "columns": ["DocNo", "DtlKey", "ItemCode", "Description", "Qty", "UOM", "Amount"],
+      "order_by": ["DocNo", "DtlKey"]
+    },
+    "APInvoiceDTL": {
+      "schema_name": "dbo",
+      "object_name": "APInvoiceDTL",
+      "enabled": false,
+      "requires_flag": "enable_ap_ar_detail",
+      "object_type": "detail_table",
+      "columns": ["DocNo", "DtlKey", "ItemCode", "Description", "Qty", "UOM", "Amount"],
+      "order_by": ["DocNo", "DtlKey"]
+    },
+    "GLDTL": {
+      "schema_name": "dbo",
+      "object_name": "GLDTL",
+      "enabled": false,
+      "requires_flag": "enable_gl_transaction",
+      "object_type": "transaction_detail",
+      "columns": ["JournalNo", "DocNo", "TransDate", "AccNo", "Debit", "Credit", "Description"],
+      "order_by": ["TransDate", "JournalNo"]
+    }
+  }
+}
