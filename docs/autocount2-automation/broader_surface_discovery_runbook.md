@@ -62,6 +62,65 @@ Generated manifests and reports stay local. Do not commit generated outputs or
    `C:\XB\autocount_outputs\probe\broader_surfaces`.
 5. Use the metadata-only results to decide future extraction scope.
 
+## Selected Surface Profile
+
+Each successful run also writes a local `selected_surface_profile.md` review
+pack under the run folder. This report is a curated metadata-only profile for
+the currently likely AC2 review surfaces:
+
+- customer master: `Debtor`, `vDebtor`
+- supplier master: `Creditor`, `vCreditor`
+- branch/location: `Branch`, `vBranch`
+- payment method setup: `PaymentMethod`
+- AR opening/outstanding: `ARInvoice`, `ARInvoiceDTL`
+- AP opening/outstanding: `APInvoice`, `APInvoiceDTL`
+- purchase order/outstanding PO: `PO`, `PODTL`, `vPurchaseOrder`
+- GL transaction detail: `GLDTL`
+- CoA/account master: unresolved unless stronger account-master metadata is
+  discovered
+
+Read this profile as a human review queue. Every item remains
+`Needs reconciliation`, and every item has `final_production_selected: false`.
+The profile records the review area, object type, candidate role, metadata-only
+key columns found, expected columns not seen in metadata, and notes for
+reconciliation. It must not contain row samples, row values, raw ERP exports, or
+business records.
+
+The candidate roles distinguish the review question:
+
+- `master_table` means setup/master metadata such as debtor, creditor, branch,
+  payment method, or a possible account master table.
+- `enriched_view` means a view that may combine or expose master/setup fields
+  in a more review-friendly shape, but still needs reconciliation.
+- `header_table` means document header metadata such as AR/AP invoices or PO.
+- `detail_table` means document line/detail metadata such as invoice or PO
+  details.
+- `transaction_detail` means accounting transaction/detail metadata. `GLDTL`
+  falls here.
+- `unresolved` means no safe metadata candidate has been selected for that
+  review area.
+
+`GLDTL` should be reviewed for GL transaction detail only. It contains
+transaction/detail signals such as account numbers and journal/document fields,
+but that does not make it the Chart of Accounts master. Do not use `GLDTL` as a
+CoA/account master mapping.
+
+The script performs a targeted CoA/account-master metadata search for object
+names such as `Account`, `GLAccount`, `GLAcc`, `ChartOfAccount`, `COA`,
+`PostingAccount`, and `AccountGroup`, combined with columns such as `AccNo`,
+`Description`, `Desc2`, `AccountType`, `ParentAccNo`, `SpecialAccType`, and
+`IsActive`. It penalizes likely transaction/detail surfaces including `GLDTL`,
+journal/detail tables, invoice/payment/detail tables, and revaluation or
+gain-loss tables. `Accountant` is not treated as CoA master. If no strong
+candidate remains, the profile explicitly records `coa_account_master` as
+`unresolved`.
+
+Use this review pack to plan the next safe extraction design step: reconcile
+each metadata candidate against AutoCount UI/report paths and Ingenious/Mike,
+then document any future extraction scope separately. The profile itself does
+not approve extraction, does not schedule anything, and does not select a final
+production SQL mapping.
+
 ## Candidate Scoring And Shortlists
 
 Broad AC2 metadata discovery can return hundreds of candidate objects per
@@ -149,6 +208,7 @@ planning:
 
 - `broader_surface_discovery_manifest.json`
 - `broader_surface_discovery_report.md`
+- `selected_surface_profile.md`
 
 Do not paste raw ERP rows, screenshots, connection strings, local config files,
 customer/supplier lists, payment details, invoice lines, database backups, or

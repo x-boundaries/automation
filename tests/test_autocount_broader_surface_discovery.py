@@ -52,6 +52,7 @@ class FakeDiscoverySource:
             object_record("dbo", "APInvoiceDTL", "USER_TABLE"),
             object_record("dbo", "GLAccount", "USER_TABLE"),
             object_record("dbo", "GLDTL", "USER_TABLE"),
+            object_record("dbo", "Accountant", "USER_TABLE"),
             object_record("dbo", "ARAPOpening", "USER_TABLE"),
             object_record("dbo", "vCashBookImportedGoodsDTL", "VIEW"),
             object_record("dbo", "Branch", "USER_TABLE"),
@@ -85,8 +86,13 @@ class FakeDiscoverySource:
             column_record("dbo", "APInvoice", "CreditorCode", "nvarchar"),
             column_record("dbo", "APInvoiceDTL", "CreditorCode", "nvarchar"),
             column_record("dbo", "GLAccount", "AccNo", "nvarchar"),
+            column_record("dbo", "GLAccount", "Description", "nvarchar"),
+            column_record("dbo", "GLAccount", "AccountType", "nvarchar"),
+            column_record("dbo", "GLAccount", "IsActive", "bit"),
             column_record("dbo", "GLDTL", "AccNo", "nvarchar"),
             column_record("dbo", "GLDTL", "JournalNo", "nvarchar"),
+            column_record("dbo", "Accountant", "UserID", "nvarchar"),
+            column_record("dbo", "Accountant", "Name", "nvarchar"),
             column_record("dbo", "ARAPOpening", "OpeningBalance", "decimal"),
             column_record("dbo", "vCashBookImportedGoodsDTL", "APInvoiceNo", "nvarchar"),
             column_record("dbo", "Branch", "BranchCode", "nvarchar"),
@@ -126,6 +132,20 @@ class EmptyDiscoverySource:
 
     def fetch_row_counts(self, objects):
         return []
+
+
+class AccountantOnlyDiscoverySource(FakeDiscoverySource):
+    def fetch_objects(self, schemas=None):
+        return [
+            record for record in super().fetch_objects(schemas)
+            if record["object_name"] not in {"GLAccount"}
+        ]
+
+    def fetch_columns(self, schemas=None):
+        return [
+            record for record in super().fetch_columns(schemas)
+            if record["object_name"] not in {"GLAccount"}
+        ]
 
 
 class AutoCountBroaderSurfaceDiscoveryTests(unittest.TestCase):
@@ -217,6 +237,75 @@ class AutoCountBroaderSurfaceDiscoveryTests(unittest.TestCase):
             self.assert_no_raw_payload_keys(saved_manifest)
             self.assertTrue((run_path / "broader_surface_discovery_report.md").exists())
             self.assertIn("AutoCount UI/report reconciliation", "\n".join(saved_manifest["notes"]))
+
+    def test_selected_surface_profile_is_metadata_only_and_review_scoped(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manifest = discovery.run_discovery(
+                base_config(tmpdir),
+                source=FakeDiscoverySource(),
+                now=datetime.fromisoformat("2026-06-15T09:30:00+08:00"),
+            )
+            run_path = Path(manifest["storage"]["run_path"])
+            profile = manifest["selected_surface_profile"]
+            profile_ids = {(item["review_area"], item["object_id"]) for item in profile["items"]}
+
+            expected = {
+                ("customer_master", "dbo.Debtor"),
+                ("customer_master", "dbo.vDebtor"),
+                ("supplier_master", "dbo.Creditor"),
+                ("supplier_master", "dbo.vCreditor"),
+                ("branch_location", "dbo.Branch"),
+                ("branch_location", "dbo.vBranch"),
+                ("payment_method", "dbo.PaymentMethod"),
+                ("ar_opening", "dbo.ARInvoice"),
+                ("ar_opening", "dbo.ARInvoiceDTL"),
+                ("ap_opening", "dbo.APInvoice"),
+                ("ap_opening", "dbo.APInvoiceDTL"),
+                ("po_outstanding", "dbo.PO"),
+                ("po_outstanding", "dbo.PODTL"),
+                ("po_outstanding", "dbo.vPurchaseOrder"),
+                ("gl_transaction", "dbo.GLDTL"),
+                ("coa_account_master", "dbo.GLAccount"),
+            }
+            self.assertTrue(expected.issubset(profile_ids))
+            self.assertNotIn(("coa_account_master", "dbo.GLDTL"), profile_ids)
+            self.assertNotIn(("coa_account_master", "dbo.Accountant"), profile_ids)
+            self.assertEqual(profile["decision"], "Needs reconciliation")
+            self.assertFalse(profile["final_production_selected"])
+            self.assertTrue(all(item["decision"] == "Needs reconciliation" for item in profile["items"]))
+            self.assertTrue(all(item["final_production_selected"] is False for item in profile["items"]))
+            self.assertTrue(all("key_columns_found" in item for item in profile["items"]))
+            self.assertTrue(all("missing_expected_columns" in item for item in profile["items"]))
+            self.assert_no_raw_payload_keys(profile)
+
+            gl_transaction = profile_item(profile, "gl_transaction", "dbo.GLDTL")
+            coa_master = profile_item(profile, "coa_account_master", "dbo.GLAccount")
+            self.assertEqual(gl_transaction["candidate_role"], "transaction_detail")
+            self.assertEqual(coa_master["matched_from"], "manual_metadata_rule")
+            self.assertIn("AccNo", coa_master["key_columns_found"])
+
+            report_path = run_path / "selected_surface_profile.md"
+            report = report_path.read_text(encoding="utf-8")
+            self.assertIn("This is metadata-only and not approved for extraction.", report)
+            self.assertIn("Confirm against AutoCount UI/report paths and Ingenious/Mike before extraction.", report)
+            self.assertIn("No final production mapping selected.", report)
+            self.assertNotRegex(report, r"(?i)\b(row sample|row values|SELECT \*)\b")
+
+    def test_selected_surface_profile_represents_unresolved_coa_without_strong_candidate(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manifest = discovery.run_discovery(
+                base_config(tmpdir),
+                source=AccountantOnlyDiscoverySource(),
+                now=datetime.fromisoformat("2026-06-15T09:30:00+08:00"),
+            )
+            profile = manifest["selected_surface_profile"]
+            coa_items = [item for item in profile["items"] if item["review_area"] == "coa_account_master"]
+
+            self.assertEqual(len(coa_items), 1)
+            self.assertEqual(coa_items[0]["candidate_role"], "unresolved")
+            self.assertEqual(coa_items[0]["object_name"], "unresolved")
+            self.assertNotIn("dbo.Accountant", {item["object_id"] for item in coa_items})
+            self.assertIn("unresolved", coa_items[0]["notes"].lower())
 
     def test_scoring_ranks_exact_master_candidates_above_transaction_matches(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -527,6 +616,13 @@ def candidate_by_id(candidates, object_id):
         if candidate["object_id"] == object_id:
             return candidate
     return None
+
+
+def profile_item(profile, review_area, object_id):
+    for item in profile["items"]:
+        if item["review_area"] == review_area and item["object_id"] == object_id:
+            return item
+    raise AssertionError(f"{review_area} {object_id} not found")
 
 
 def all_group_candidates(group):
