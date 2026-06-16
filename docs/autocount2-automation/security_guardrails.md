@@ -108,6 +108,7 @@ Use workflow subfolders:
 
 - `C:\XB\autocount_outputs\probe`
 - `C:\XB\autocount_outputs\probe\broader_surfaces`
+- `C:\XB\autocount_outputs\probe\selected_surface_reconcile`
 - `C:\XB\autocount_outputs\reconcile`
 - `C:\XB\autocount_outputs\extract\stock`
 
@@ -124,6 +125,9 @@ For dedicated-login checks, use the
 For broader non-stock planning, use the
 [Broader AC2 surface discovery runbook](broader_surface_discovery_runbook.md);
 its outputs are metadata-only candidates and do not approve extraction scope.
+For selected non-stock aggregate checks, use the
+[Selected Surface Reconciliation runbook](selected_surface_reconciliation_runbook.md);
+its outputs are aggregate-only and do not approve extraction scope.
 
 ## Environment Metadata Disclosure
 
