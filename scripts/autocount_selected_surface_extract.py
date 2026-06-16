@@ -41,15 +41,36 @@ DEFAULT_SURFACES = {
         "object_name": "Debtor",
         "enabled": True,
         "object_type": "master_table",
-        "columns": ["DebtorCode", "CompanyName", "IsActive", "TaxType", "Phone1", "EmailAddress", "LastModified"],
-        "order_by": ["DebtorCode"],
+        "columns": [
+            "AccNo",
+            "CompanyName",
+            "IsActive",
+            "DebtorType",
+            "Phone1",
+            "Mobile",
+            "EmailAddress",
+            "CurrencyCode",
+            "TaxCode",
+            "LastModified",
+        ],
+        "order_by": ["AccNo"],
     },
     "vDebtor": {
         "schema_name": "dbo",
         "object_name": "vDebtor",
         "enabled": True,
         "object_type": "enriched_view",
-        "columns": ["DebtorCode", "CompanyName", "IsActive", "TaxType", "Phone1", "EmailAddress", "LastModified"],
+        "columns": [
+            "DebtorCode",
+            "DebtorCompanyName",
+            "DebtorType",
+            "DebtorPhone1",
+            "DebtorMobile",
+            "DebtorEmailAddress",
+            "DebtorCurrencyCode",
+            "DebtorTaxCode",
+            "DebtorLastModified",
+        ],
         "order_by": ["DebtorCode"],
     },
     "Creditor": {
@@ -57,15 +78,36 @@ DEFAULT_SURFACES = {
         "object_name": "Creditor",
         "enabled": True,
         "object_type": "master_table",
-        "columns": ["CreditorCode", "CompanyName", "IsActive", "TaxType", "Phone1", "EmailAddress", "LastModified"],
-        "order_by": ["CreditorCode"],
+        "columns": [
+            "AccNo",
+            "CompanyName",
+            "IsActive",
+            "CreditorType",
+            "Phone1",
+            "Mobile",
+            "EmailAddress",
+            "CurrencyCode",
+            "TaxCode",
+            "LastModified",
+        ],
+        "order_by": ["AccNo"],
     },
     "vCreditor": {
         "schema_name": "dbo",
         "object_name": "vCreditor",
         "enabled": True,
         "object_type": "enriched_view",
-        "columns": ["CreditorCode", "CompanyName", "IsActive", "TaxType", "Phone1", "EmailAddress", "LastModified"],
+        "columns": [
+            "CreditorCode",
+            "CreditorCompanyName",
+            "CreditorType",
+            "CreditorPhone1",
+            "CreditorMobile",
+            "CreditorEmailAddress",
+            "CreditorCurrencyCode",
+            "CreditorTaxCode",
+            "CreditorLastModified",
+        ],
         "order_by": ["CreditorCode"],
     },
     "PaymentMethod": {
@@ -73,7 +115,7 @@ DEFAULT_SURFACES = {
         "object_name": "PaymentMethod",
         "enabled": True,
         "object_type": "master_table",
-        "columns": ["PaymentMethod", "Description", "IsActive", "LastModified"],
+        "columns": ["PaymentMethod", "BankAccount", "JournalType", "PaymentBy", "PaymentType", "IsActive", "LastUpdate"],
         "order_by": ["PaymentMethod"],
     },
     "PO": {
@@ -89,9 +131,11 @@ DEFAULT_SURFACES = {
             "CreditorName",
             "NetTotal",
             "LocalNetTotal",
+            "Total",
             "Cancelled",
-            "Closed",
+            "DocStatus",
             "LastModified",
+            "PurchaseLocation",
         ],
         "order_by": ["DocNo"],
     },
@@ -103,16 +147,18 @@ DEFAULT_SURFACES = {
         "columns": [
             "DocKey",
             "DtlKey",
-            "DocNo",
+            "Seq",
             "ItemCode",
+            "Location",
             "Description",
             "Qty",
             "TransferedQty",
-            "OutstandingQty",
             "UOM",
             "DeliveryDate",
+            "SubTotal",
+            "LocalSubTotal",
         ],
-        "order_by": ["DocNo", "DtlKey"],
+        "order_by": ["DocKey", "DtlKey"],
     },
     "vPurchaseOrder": {
         "schema_name": "dbo",
@@ -120,19 +166,20 @@ DEFAULT_SURFACES = {
         "enabled": True,
         "object_type": "enriched_view",
         "columns": [
+            "DocKey",
             "DocNo",
-            "PONo",
             "DocDate",
             "CreditorCode",
             "CreditorName",
-            "ItemCode",
-            "Description",
-            "Qty",
-            "TransferedQty",
-            "OutstandingQty",
-            "UOM",
+            "NetTotal",
+            "LocalNetTotal",
+            "Total",
+            "Cancelled",
+            "DocStatus",
+            "LastModified",
+            "PurchaseLocation",
         ],
-        "order_by": ["DocNo", "ItemCode"],
+        "order_by": ["DocNo"],
     },
     "ARInvoice": {
         "schema_name": "dbo",
@@ -140,15 +187,16 @@ DEFAULT_SURFACES = {
         "enabled": True,
         "object_type": "header_table",
         "columns": [
+            "DocKey",
             "DocNo",
             "DocDate",
             "DebtorCode",
-            "DebtorName",
             "NetTotal",
             "LocalNetTotal",
             "Outstanding",
-            "OutstandingAmt",
+            "PaymentAmt",
             "Cancelled",
+            "DocStatus",
             "LastModified",
         ],
         "order_by": ["DocNo"],
@@ -159,15 +207,17 @@ DEFAULT_SURFACES = {
         "enabled": True,
         "object_type": "header_table",
         "columns": [
+            "DocKey",
             "DocNo",
             "DocDate",
             "CreditorCode",
-            "CreditorName",
+            "SupplierInvoiceNo",
             "NetTotal",
             "LocalNetTotal",
             "Outstanding",
-            "OutstandingAmt",
+            "PaymentAmt",
             "Cancelled",
+            "DocStatus",
             "LastModified",
         ],
         "order_by": ["DocNo"],
@@ -335,12 +385,17 @@ def resolve_output_root(output_root, repo_root=None):
 
 def build_extract_definitions(config):
     max_rows = normalize_max_rows(config.get("max_rows"))
+    columns_by_surface = None
+    if "column_inventory" in config:
+        columns_by_surface = columns_grouped_by_surface(config.get("column_inventory"))
     definitions = []
     for surface in normalize_surface_configs(config.get("surfaces") or DEFAULT_SURFACES):
         if should_skip_surface(surface, config):
             continue
         columns = require_columns(surface)
         order_by = list(surface.get("order_by") or columns[:1])
+        validate_columns_against_inventory(surface, columns, columns_by_surface, "column allowlist")
+        validate_columns_against_inventory(surface, order_by, columns_by_surface, "order_by")
         top_clause = f"TOP ({max_rows}) " if max_rows is not None else ""
         sql = (
             f"SELECT {top_clause}{', '.join(quote_identifier(column) for column in columns)} "
@@ -430,6 +485,38 @@ def require_columns(surface):
     if any(str(column).strip() == "*" for column in columns):
         raise ValueError(f"{surface['surface_id']} column allowlist must not include *")
     return columns
+
+
+def validate_columns_against_inventory(surface, column_names, columns_by_surface, field_name):
+    if columns_by_surface is None:
+        return
+    surface_id = surface["surface_id"]
+    available_columns = columns_by_surface.get(surface_id)
+    if available_columns is None:
+        raise ValueError(f"{surface_id} is missing from supplied column_inventory")
+    missing_columns = [
+        column_name
+        for column_name in column_names
+        if normalize_identifier(column_name) not in available_columns
+    ]
+    if missing_columns:
+        raise ValueError(
+            f"{surface_id} configured {field_name} includes column(s) absent from supplied "
+            f"column_inventory: {', '.join(missing_columns)}"
+        )
+
+
+def columns_grouped_by_surface(column_inventory):
+    grouped = {}
+    for column in list(column_inventory or []):
+        schema_name = str(column.get("object_schema") or column.get("schema_name") or "dbo")
+        object_name = str(column.get("object_name") or "")
+        column_name = str(column.get("column_name") or "")
+        if not object_name or not column_name:
+            continue
+        surface_id = make_surface_id(schema_name, object_name)
+        grouped.setdefault(surface_id, set()).add(normalize_identifier(column_name))
+    return grouped
 
 
 def normalize_max_rows(value):
@@ -567,6 +654,10 @@ def make_surface_id(schema_name, object_name):
 def quote_identifier(value):
     escaped = str(value).replace("]", "]]")
     return f"[{escaped}]"
+
+
+def normalize_identifier(value):
+    return str(value).strip().casefold()
 
 
 def safe_filename(value):

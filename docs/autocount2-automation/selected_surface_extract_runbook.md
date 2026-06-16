@@ -42,6 +42,13 @@ $env:AUTOCOUNT_READONLY_SQL_CONNECTION_STRING = '<stored outside Git>'
 The config uses only `AUTOCOUNT_READONLY_SQL_CONNECTION_STRING` by default.
 Do not add production connection strings to the JSON file.
 
+Default column allowlists must match the PR #41 selected-surface profile
+metadata gathered from AC2. If a local config includes a `column_inventory`
+array from discovery metadata, the extractor validates configured `columns` and
+`order_by` values against that supplied inventory before building SQL. The
+extractor does not require a live `sys.columns` metadata check during raw
+snapshot extraction.
+
 Default local output root:
 
 ```text

@@ -14,6 +14,133 @@ if str(ROOT) not in sys.path:
 
 from scripts import autocount_selected_surface_extract as extract
 
+EXPECTED_DEFAULT_COLUMNS = {
+    "dbo.Debtor": [
+        "AccNo",
+        "CompanyName",
+        "IsActive",
+        "DebtorType",
+        "Phone1",
+        "Mobile",
+        "EmailAddress",
+        "CurrencyCode",
+        "TaxCode",
+        "LastModified",
+    ],
+    "dbo.vDebtor": [
+        "DebtorCode",
+        "DebtorCompanyName",
+        "DebtorType",
+        "DebtorPhone1",
+        "DebtorMobile",
+        "DebtorEmailAddress",
+        "DebtorCurrencyCode",
+        "DebtorTaxCode",
+        "DebtorLastModified",
+    ],
+    "dbo.Creditor": [
+        "AccNo",
+        "CompanyName",
+        "IsActive",
+        "CreditorType",
+        "Phone1",
+        "Mobile",
+        "EmailAddress",
+        "CurrencyCode",
+        "TaxCode",
+        "LastModified",
+    ],
+    "dbo.vCreditor": [
+        "CreditorCode",
+        "CreditorCompanyName",
+        "CreditorType",
+        "CreditorPhone1",
+        "CreditorMobile",
+        "CreditorEmailAddress",
+        "CreditorCurrencyCode",
+        "CreditorTaxCode",
+        "CreditorLastModified",
+    ],
+    "dbo.PaymentMethod": [
+        "PaymentMethod",
+        "BankAccount",
+        "JournalType",
+        "PaymentBy",
+        "PaymentType",
+        "IsActive",
+        "LastUpdate",
+    ],
+    "dbo.PO": [
+        "DocKey",
+        "DocNo",
+        "DocDate",
+        "CreditorCode",
+        "CreditorName",
+        "NetTotal",
+        "LocalNetTotal",
+        "Total",
+        "Cancelled",
+        "DocStatus",
+        "LastModified",
+        "PurchaseLocation",
+    ],
+    "dbo.PODTL": [
+        "DocKey",
+        "DtlKey",
+        "Seq",
+        "ItemCode",
+        "Location",
+        "Description",
+        "Qty",
+        "TransferedQty",
+        "UOM",
+        "DeliveryDate",
+        "SubTotal",
+        "LocalSubTotal",
+    ],
+    "dbo.vPurchaseOrder": [
+        "DocKey",
+        "DocNo",
+        "DocDate",
+        "CreditorCode",
+        "CreditorName",
+        "NetTotal",
+        "LocalNetTotal",
+        "Total",
+        "Cancelled",
+        "DocStatus",
+        "LastModified",
+        "PurchaseLocation",
+    ],
+    "dbo.ARInvoice": [
+        "DocKey",
+        "DocNo",
+        "DocDate",
+        "DebtorCode",
+        "NetTotal",
+        "LocalNetTotal",
+        "Outstanding",
+        "PaymentAmt",
+        "Cancelled",
+        "DocStatus",
+        "LastModified",
+    ],
+    "dbo.APInvoice": [
+        "DocKey",
+        "DocNo",
+        "DocDate",
+        "CreditorCode",
+        "SupplierInvoiceNo",
+        "NetTotal",
+        "LocalNetTotal",
+        "Outstanding",
+        "PaymentAmt",
+        "Cancelled",
+        "DocStatus",
+        "LastModified",
+    ],
+}
+
 
 class FakeSelectedSurfaceExtractSource:
     def __init__(self, rows_by_surface=None):
@@ -73,10 +200,66 @@ class SelectedSurfaceExtractTests(unittest.TestCase):
 
         self.assertNotRegex(sql_text, r"(?i)\b(INSERT|UPDATE|DELETE|MERGE|CREATE|ALTER|DROP|TRUNCATE)\b")
         self.assertNotRegex(sql_text, r"(?i)\bSELECT\s+\*")
-        self.assertNotIn("[AccNo]", sql_text)
         for spec in definitions:
             self.assertEqual(extract.extract_sql_selected_columns(spec["sql"]), spec["columns"])
             self.assertIn("ORDER BY", spec["sql"])
+
+    def test_default_allowlists_match_discovered_ac2_metadata(self):
+        config = json.loads((ROOT / "config" / "autocount_selected_surface_extract.example.json").read_text(encoding="utf-8"))
+        config_definitions = {
+            spec["surface_id"]: spec for spec in extract.build_extract_definitions(config)
+        }
+        script_definitions = {
+            spec["surface_id"]: spec for spec in extract.build_extract_definitions(base_defaultless_config(r"C:\XB\tmp"))
+        }
+
+        for surface_id, expected_columns in EXPECTED_DEFAULT_COLUMNS.items():
+            with self.subTest(surface_id=surface_id):
+                self.assertEqual(config_definitions[surface_id]["columns"], expected_columns)
+                self.assertEqual(script_definitions[surface_id]["columns"], expected_columns)
+
+    def test_customer_vendor_table_defaults_use_account_number_columns(self):
+        definitions = {
+            spec["surface_id"]: spec
+            for spec in extract.build_extract_definitions(base_defaultless_config(r"C:\XB\tmp"))
+        }
+
+        self.assertIn("AccNo", definitions["dbo.Debtor"]["columns"])
+        self.assertNotIn("DebtorCode", definitions["dbo.Debtor"]["columns"])
+        self.assertIn("AccNo", definitions["dbo.Creditor"]["columns"])
+        self.assertNotIn("CreditorCode", definitions["dbo.Creditor"]["columns"])
+
+    def test_customer_vendor_view_defaults_use_prefixed_view_columns(self):
+        definitions = {
+            spec["surface_id"]: spec
+            for spec in extract.build_extract_definitions(base_defaultless_config(r"C:\XB\tmp"))
+        }
+
+        self.assertIn("DebtorCompanyName", definitions["dbo.vDebtor"]["columns"])
+        self.assertNotIn("CompanyName", definitions["dbo.vDebtor"]["columns"])
+        self.assertIn("CreditorCompanyName", definitions["dbo.vCreditor"]["columns"])
+        self.assertNotIn("CompanyName", definitions["dbo.vCreditor"]["columns"])
+
+    def test_po_detail_and_header_defaults_avoid_unconfirmed_columns(self):
+        definitions = {
+            spec["surface_id"]: spec
+            for spec in extract.build_extract_definitions(base_defaultless_config(r"C:\XB\tmp"))
+        }
+
+        self.assertNotIn("DocNo", definitions["dbo.PODTL"]["columns"])
+        self.assertNotIn("OutstandingQty", definitions["dbo.PODTL"]["columns"])
+        self.assertNotIn("Closed", definitions["dbo.PO"]["columns"])
+        self.assertNotIn("ItemCode", definitions["dbo.vPurchaseOrder"]["columns"])
+        self.assertNotIn("Qty", definitions["dbo.vPurchaseOrder"]["columns"])
+        self.assertNotIn("OutstandingQty", definitions["dbo.vPurchaseOrder"]["columns"])
+
+    def test_supplied_column_inventory_rejects_mismatched_allowlists(self):
+        config = base_config(r"C:\XB\tmp")
+        config["column_inventory"] = column_inventory_from_expected_defaults()
+        config["surfaces"]["Debtor"]["columns"] = ["AccNo", "DebtorCode"]
+
+        with self.assertRaisesRegex(ValueError, r"dbo\.Debtor.*DebtorCode"):
+            extract.build_extract_definitions(config)
 
     def test_max_rows_uses_top_clause_and_as_of_metadata_does_not_filter(self):
         config = base_config(r"C:\XB\tmp")
@@ -95,12 +278,15 @@ class SelectedSurfaceExtractTests(unittest.TestCase):
                 {
                     "dbo.Debtor": [
                         {
-                            "DebtorCode": "=XB001",
+                            "AccNo": "=XB001",
                             "CompanyName": "Formula Test",
                             "IsActive": True,
-                            "TaxType": "SV",
+                            "DebtorType": "LOCAL",
                             "Phone1": "+6012",
+                            "Mobile": "+6019",
                             "EmailAddress": "ops@example.invalid",
+                            "CurrencyCode": "MYR",
+                            "TaxCode": "SV",
                             "LastModified": datetime(2026, 6, 16, 15, 43, 57),
                         }
                     ],
@@ -108,24 +294,30 @@ class SelectedSurfaceExtractTests(unittest.TestCase):
                         {
                             "DocKey": "POKEY-1",
                             "DtlKey": "DTL-1",
-                            "DocNo": "PO-001",
+                            "Seq": 1,
                             "ItemCode": "SKU-001",
+                            "Location": "HQ",
                             "Description": "Widget",
                             "Qty": Decimal("20.0000"),
                             "TransferedQty": Decimal("0.0000"),
-                            "OutstandingQty": Decimal("20.0000"),
                             "UOM": "PCS",
                             "DeliveryDate": date(2026, 6, 20),
+                            "SubTotal": Decimal("200.0000"),
+                            "LocalSubTotal": Decimal("200.0000"),
                         }
                     ],
                     "dbo.ARInvoice": [
                         {
+                            "DocKey": "ARKEY-1",
                             "DocNo": "AR-001",
                             "DocDate": date(2026, 6, 16),
                             "DebtorCode": "D001",
                             "NetTotal": Decimal("123.45"),
+                            "LocalNetTotal": Decimal("123.45"),
                             "Outstanding": Decimal("23.45"),
+                            "PaymentAmt": Decimal("100.00"),
                             "Cancelled": False,
+                            "DocStatus": "A",
                         }
                     ],
                 }
@@ -162,7 +354,7 @@ class SelectedSurfaceExtractTests(unittest.TestCase):
             self.assertTrue(debtor_path.read_bytes().startswith(b"\xef\xbb\xbf"))
             with debtor_path.open("r", encoding="utf-8-sig", newline="") as handle:
                 debtor_rows = list(csv.DictReader(handle))
-            self.assertEqual(debtor_rows[0]["DebtorCode"], "'=XB001")
+            self.assertEqual(debtor_rows[0]["AccNo"], "'=XB001")
             self.assertEqual(debtor_rows[0]["LastModified"], "2026-06-16T15:43:57")
 
             podtl_path = Path(saved_manifest["output_files"]["dbo.PODTL"])
@@ -252,21 +444,44 @@ def base_config(output_root):
         "business_date": "",
         "as_of_date": "",
         "surfaces": {
-            "Debtor": surface("dbo", "Debtor", ["DebtorCode", "CompanyName", "IsActive", "TaxType", "Phone1", "EmailAddress", "LastModified"], ["DebtorCode"]),
-            "vDebtor": surface("dbo", "vDebtor", ["DebtorCode", "CompanyName", "IsActive", "TaxType", "Phone1", "EmailAddress", "LastModified"], ["DebtorCode"]),
-            "Creditor": surface("dbo", "Creditor", ["CreditorCode", "CompanyName", "IsActive", "TaxType", "Phone1", "EmailAddress", "LastModified"], ["CreditorCode"]),
-            "vCreditor": surface("dbo", "vCreditor", ["CreditorCode", "CompanyName", "IsActive", "TaxType", "Phone1", "EmailAddress", "LastModified"], ["CreditorCode"]),
-            "PaymentMethod": surface("dbo", "PaymentMethod", ["PaymentMethod", "Description", "IsActive", "LastModified"], ["PaymentMethod"]),
-            "PO": surface("dbo", "PO", ["DocKey", "DocNo", "DocDate", "CreditorCode", "CreditorName", "NetTotal", "LocalNetTotal", "Cancelled", "Closed", "LastModified"], ["DocNo"]),
-            "PODTL": surface("dbo", "PODTL", ["DocKey", "DtlKey", "DocNo", "ItemCode", "Description", "Qty", "TransferedQty", "OutstandingQty", "UOM", "DeliveryDate"], ["DocNo", "DtlKey"]),
-            "vPurchaseOrder": surface("dbo", "vPurchaseOrder", ["DocNo", "PONo", "DocDate", "CreditorCode", "CreditorName", "ItemCode", "Description", "Qty", "TransferedQty", "OutstandingQty", "UOM"], ["DocNo", "ItemCode"]),
-            "ARInvoice": surface("dbo", "ARInvoice", ["DocNo", "DocDate", "DebtorCode", "DebtorName", "NetTotal", "LocalNetTotal", "Outstanding", "OutstandingAmt", "Cancelled", "LastModified"], ["DocNo"]),
-            "APInvoice": surface("dbo", "APInvoice", ["DocNo", "DocDate", "CreditorCode", "CreditorName", "NetTotal", "LocalNetTotal", "Outstanding", "OutstandingAmt", "Cancelled", "LastModified"], ["DocNo"]),
+            "Debtor": surface("dbo", "Debtor", EXPECTED_DEFAULT_COLUMNS["dbo.Debtor"], ["AccNo"]),
+            "vDebtor": surface("dbo", "vDebtor", EXPECTED_DEFAULT_COLUMNS["dbo.vDebtor"], ["DebtorCode"]),
+            "Creditor": surface("dbo", "Creditor", EXPECTED_DEFAULT_COLUMNS["dbo.Creditor"], ["AccNo"]),
+            "vCreditor": surface("dbo", "vCreditor", EXPECTED_DEFAULT_COLUMNS["dbo.vCreditor"], ["CreditorCode"]),
+            "PaymentMethod": surface("dbo", "PaymentMethod", EXPECTED_DEFAULT_COLUMNS["dbo.PaymentMethod"], ["PaymentMethod"]),
+            "PO": surface("dbo", "PO", EXPECTED_DEFAULT_COLUMNS["dbo.PO"], ["DocNo"]),
+            "PODTL": surface("dbo", "PODTL", EXPECTED_DEFAULT_COLUMNS["dbo.PODTL"], ["DocKey", "DtlKey"]),
+            "vPurchaseOrder": surface("dbo", "vPurchaseOrder", EXPECTED_DEFAULT_COLUMNS["dbo.vPurchaseOrder"], ["DocNo"]),
+            "ARInvoice": surface("dbo", "ARInvoice", EXPECTED_DEFAULT_COLUMNS["dbo.ARInvoice"], ["DocNo"]),
+            "APInvoice": surface("dbo", "APInvoice", EXPECTED_DEFAULT_COLUMNS["dbo.APInvoice"], ["DocNo"]),
             "ARInvoiceDTL": surface("dbo", "ARInvoiceDTL", ["DocNo", "DtlKey", "ItemCode", "Description", "Qty", "UOM", "Amount"], ["DocNo", "DtlKey"], enabled=False, requires_flag="enable_ap_ar_detail"),
             "APInvoiceDTL": surface("dbo", "APInvoiceDTL", ["DocNo", "DtlKey", "ItemCode", "Description", "Qty", "UOM", "Amount"], ["DocNo", "DtlKey"], enabled=False, requires_flag="enable_ap_ar_detail"),
             "GLDTL": surface("dbo", "GLDTL", ["JournalNo", "DocNo", "TransDate", "AccNo", "Debit", "Credit", "Description"], ["TransDate", "JournalNo"], enabled=False, requires_flag="enable_gl_transaction"),
         },
     }
+
+
+def base_defaultless_config(output_root):
+    config = base_config(output_root)
+    config.pop("surfaces")
+    return config
+
+
+def column_inventory_from_expected_defaults():
+    records = []
+    for surface_id, columns in EXPECTED_DEFAULT_COLUMNS.items():
+        schema_name, object_name = surface_id.split(".", 1)
+        for index, column_name in enumerate(columns, start=1):
+            records.append(
+                {
+                    "object_schema": schema_name,
+                    "object_name": object_name,
+                    "column_name": column_name,
+                    "data_type": "nvarchar",
+                    "column_id": index,
+                }
+            )
+    return records
 
 
 def surface(schema_name, object_name, columns, order_by, enabled=True, requires_flag=""):

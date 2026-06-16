@@ -14,15 +14,15 @@
       "object_name": "Debtor",
       "enabled": true,
       "object_type": "master_table",
-      "columns": ["DebtorCode", "CompanyName", "IsActive", "TaxType", "Phone1", "EmailAddress", "LastModified"],
-      "order_by": ["DebtorCode"]
+      "columns": ["AccNo", "CompanyName", "IsActive", "DebtorType", "Phone1", "Mobile", "EmailAddress", "CurrencyCode", "TaxCode", "LastModified"],
+      "order_by": ["AccNo"]
     },
     "vDebtor": {
       "schema_name": "dbo",
       "object_name": "vDebtor",
       "enabled": true,
       "object_type": "enriched_view",
-      "columns": ["DebtorCode", "CompanyName", "IsActive", "TaxType", "Phone1", "EmailAddress", "LastModified"],
+      "columns": ["DebtorCode", "DebtorCompanyName", "DebtorType", "DebtorPhone1", "DebtorMobile", "DebtorEmailAddress", "DebtorCurrencyCode", "DebtorTaxCode", "DebtorLastModified"],
       "order_by": ["DebtorCode"]
     },
     "Creditor": {
@@ -30,15 +30,15 @@
       "object_name": "Creditor",
       "enabled": true,
       "object_type": "master_table",
-      "columns": ["CreditorCode", "CompanyName", "IsActive", "TaxType", "Phone1", "EmailAddress", "LastModified"],
-      "order_by": ["CreditorCode"]
+      "columns": ["AccNo", "CompanyName", "IsActive", "CreditorType", "Phone1", "Mobile", "EmailAddress", "CurrencyCode", "TaxCode", "LastModified"],
+      "order_by": ["AccNo"]
     },
     "vCreditor": {
       "schema_name": "dbo",
       "object_name": "vCreditor",
       "enabled": true,
       "object_type": "enriched_view",
-      "columns": ["CreditorCode", "CompanyName", "IsActive", "TaxType", "Phone1", "EmailAddress", "LastModified"],
+      "columns": ["CreditorCode", "CreditorCompanyName", "CreditorType", "CreditorPhone1", "CreditorMobile", "CreditorEmailAddress", "CreditorCurrencyCode", "CreditorTaxCode", "CreditorLastModified"],
       "order_by": ["CreditorCode"]
     },
     "PaymentMethod": {
@@ -46,7 +46,7 @@
       "object_name": "PaymentMethod",
       "enabled": true,
       "object_type": "master_table",
-      "columns": ["PaymentMethod", "Description", "IsActive", "LastModified"],
+      "columns": ["PaymentMethod", "BankAccount", "JournalType", "PaymentBy", "PaymentType", "IsActive", "LastUpdate"],
       "order_by": ["PaymentMethod"]
     },
     "PO": {
@@ -54,7 +54,7 @@
       "object_name": "PO",
       "enabled": true,
       "object_type": "header_table",
-      "columns": ["DocKey", "DocNo", "DocDate", "CreditorCode", "CreditorName", "NetTotal", "LocalNetTotal", "Cancelled", "Closed", "LastModified"],
+      "columns": ["DocKey", "DocNo", "DocDate", "CreditorCode", "CreditorName", "NetTotal", "LocalNetTotal", "Total", "Cancelled", "DocStatus", "LastModified", "PurchaseLocation"],
       "order_by": ["DocNo"]
     },
     "PODTL": {
@@ -62,23 +62,23 @@
       "object_name": "PODTL",
       "enabled": true,
       "object_type": "detail_table",
-      "columns": ["DocKey", "DtlKey", "DocNo", "ItemCode", "Description", "Qty", "TransferedQty", "OutstandingQty", "UOM", "DeliveryDate"],
-      "order_by": ["DocNo", "DtlKey"]
+      "columns": ["DocKey", "DtlKey", "Seq", "ItemCode", "Location", "Description", "Qty", "TransferedQty", "UOM", "DeliveryDate", "SubTotal", "LocalSubTotal"],
+      "order_by": ["DocKey", "DtlKey"]
     },
     "vPurchaseOrder": {
       "schema_name": "dbo",
       "object_name": "vPurchaseOrder",
       "enabled": true,
       "object_type": "enriched_view",
-      "columns": ["DocNo", "PONo", "DocDate", "CreditorCode", "CreditorName", "ItemCode", "Description", "Qty", "TransferedQty", "OutstandingQty", "UOM"],
-      "order_by": ["DocNo", "ItemCode"]
+      "columns": ["DocKey", "DocNo", "DocDate", "CreditorCode", "CreditorName", "NetTotal", "LocalNetTotal", "Total", "Cancelled", "DocStatus", "LastModified", "PurchaseLocation"],
+      "order_by": ["DocNo"]
     },
     "ARInvoice": {
       "schema_name": "dbo",
       "object_name": "ARInvoice",
       "enabled": true,
       "object_type": "header_table",
-      "columns": ["DocNo", "DocDate", "DebtorCode", "DebtorName", "NetTotal", "LocalNetTotal", "Outstanding", "OutstandingAmt", "Cancelled", "LastModified"],
+      "columns": ["DocKey", "DocNo", "DocDate", "DebtorCode", "NetTotal", "LocalNetTotal", "Outstanding", "PaymentAmt", "Cancelled", "DocStatus", "LastModified"],
       "order_by": ["DocNo"]
     },
     "APInvoice": {
@@ -86,7 +86,7 @@
       "object_name": "APInvoice",
       "enabled": true,
       "object_type": "header_table",
-      "columns": ["DocNo", "DocDate", "CreditorCode", "CreditorName", "NetTotal", "LocalNetTotal", "Outstanding", "OutstandingAmt", "Cancelled", "LastModified"],
+      "columns": ["DocKey", "DocNo", "DocDate", "CreditorCode", "SupplierInvoiceNo", "NetTotal", "LocalNetTotal", "Outstanding", "PaymentAmt", "Cancelled", "DocStatus", "LastModified"],
       "order_by": ["DocNo"]
     },
     "ARInvoiceDTL": {
