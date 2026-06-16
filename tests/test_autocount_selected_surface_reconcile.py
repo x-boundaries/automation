@@ -3,7 +3,8 @@ import os
 import sys
 import tempfile
 import unittest
-from datetime import datetime
+from datetime import date, datetime
+from decimal import Decimal
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -61,6 +62,20 @@ class MissingOptionalColumnSource(FakeSelectedSurfaceSource):
         ]
 
 
+class DecimalAndDateAggregateSource(FakeSelectedSurfaceSource):
+    def fetch_aggregate(self, sql):
+        self.queries.append(sql)
+        return {
+            "total_count": 2,
+            "outstanding_total": Decimal("123.45"),
+            "max_trans_date": datetime(2026, 6, 16, 15, 43, 57),
+            "nested": {
+                "as_of_date": date(2026, 6, 16),
+                "totals": [Decimal("1.10"), Decimal("2.20")],
+            },
+        }
+
+
 class SelectedSurfaceReconcileTests(unittest.TestCase):
     def test_example_config_is_secret_free_and_complete(self):
         config_path = ROOT / "config" / "autocount_selected_surface_reconcile.example.json"
@@ -111,6 +126,30 @@ class SelectedSurfaceReconcileTests(unittest.TestCase):
             report_text = (run_path / "selected_surface_reconcile_report.md").read_text(encoding="utf-8")
             self.assertIn("aggregate-only", report_text)
             self.assertIn("not approved for extraction", report_text)
+
+    def test_decimal_and_date_aggregate_values_serialize_safely(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = DecimalAndDateAggregateSource()
+            manifest = reconcile.run_reconciliation(
+                base_config(tmpdir),
+                source=source,
+                now=datetime.fromisoformat("2026-06-16T09:30:00+08:00"),
+            )
+            run_path = Path(manifest["storage"]["run_path"])
+            saved_manifest = json.loads(
+                (run_path / "selected_surface_reconcile_manifest.json").read_text(encoding="utf-8")
+            )
+
+            aggregate_values = saved_manifest["aggregate_results"][0]["checks"][0]["aggregate_values"]
+            self.assertEqual(aggregate_values["outstanding_total"], "123.45")
+            self.assertEqual(aggregate_values["max_trans_date"], "2026-06-16T15:43:57")
+            self.assertEqual(aggregate_values["nested"]["as_of_date"], "2026-06-16")
+            self.assertEqual(aggregate_values["nested"]["totals"], ["1.10", "2.20"])
+            self.assertEqual(saved_manifest["decision"], "Needs reconciliation")
+            self.assertFalse(saved_manifest["final_production_selected"])
+            self.assertTrue(all(area["decision"] == "Needs reconciliation" for area in saved_manifest["aggregate_results"]))
+            self.assertTrue(all(area["final_production_selected"] is False for area in saved_manifest["aggregate_results"]))
+            self.assert_no_forbidden_payload_keys(saved_manifest)
 
     def test_missing_optional_columns_are_skipped_safely(self):
         with tempfile.TemporaryDirectory() as tmpdir:
