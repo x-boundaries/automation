@@ -77,6 +77,31 @@ SOURCE_TO_STAGING_TABLE = {
     "dbo.vStockTransferDetail": "stg_ac2_transfer_line",
     "dbo.PODTL": "stg_ac2_purchase_order_line",
 }
+SOURCE_COLUMN_TO_STAGING_FIELD = {
+    "stg_ac2_grn_line": {
+        "DocNo": ["grn_doc_no"],
+        "DtlKey": ["grn_dtl_key"],
+        "ItemCode": ["item_code"],
+    },
+    "stg_ac2_stock_receive_line": {
+        "DocNo": ["receive_doc_no"],
+        "ItemCode": ["item_code"],
+    },
+    "stg_ac2_transfer_line": {
+        "DocNo": ["transfer_doc_no"],
+        "ItemCode": ["item_code"],
+    },
+    "stg_ac2_purchase_order_line": {
+        "DocKey": ["po_doc_key"],
+        "DtlKey": ["po_dtl_key"],
+        "ItemCode": ["item_code"],
+        "Description": ["description"],
+        "UOM": ["uom"],
+        "Qty": ["qty", "outstanding_qty_candidate"],
+        "TransferedQty": ["transferred_qty", "outstanding_qty_candidate"],
+        "Location": ["location"],
+    },
+}
 DUPLICATE_SOURCE_SURFACES = {
     "stg_ac2_supplier": ["dbo.vCreditor", "dbo.Creditor"],
     "stg_ac2_purchase_order_header": ["dbo.vPurchaseOrder", "dbo.PO"],
@@ -101,6 +126,7 @@ def run_schema_gap_review(manifest_path, output_root=None, now=None):
     exceptions = []
     row_counts = {}
     header_evidence = []
+    source_column_evidence = {}
 
     try:
         source_manifest = load_manifest(manifest_path)
@@ -109,13 +135,14 @@ def run_schema_gap_review(manifest_path, output_root=None, now=None):
         staging_run_path = Path(source_manifest.get("source_staging_run_path") or warning_run_path).resolve(strict=False)
         row_counts = collect_row_counts(source_manifest)
         header_evidence = collect_header_evidence(source_manifest, staging_run_path, row_counts, exceptions)
+        source_column_evidence = collect_source_column_evidence(source_manifest, staging_run_path, exceptions)
     except Exception as exc:  # noqa: BLE001 - local review writes redacted failure output.
         exceptions.append(sanitize_text(str(exc)))
 
     present_headers_by_table = {item["table_name"]: item["present_header_names"] for item in header_evidence}
     expected_headers_by_table = {item["table_name"]: item["expected_header_names"] for item in header_evidence}
     source_schema_gaps = [
-        classify_schema_gap(item, expected_headers_by_table, present_headers_by_table)
+        classify_schema_gap(item, expected_headers_by_table, present_headers_by_table, source_column_evidence)
         for item in source_manifest.get("warning_classifications", [])
         if item.get("classification") == "source_schema_gap"
     ]
@@ -229,7 +256,61 @@ def read_csv_headers(path):
         return next(csv.reader(handle), [])
 
 
-def classify_schema_gap(warning_item, expected_headers_by_table, present_headers_by_table):
+def collect_source_column_evidence(manifest, staging_run_path, exceptions):
+    evidence = {}
+    for item in manifest.get("source_column_diagnostics", []) + manifest.get("source_schema_gap_diagnostics", []):
+        merge_source_column_evidence(evidence, item)
+
+    build_manifest_path = staging_run_path / "inventory_staging_build_manifest.json"
+    if build_manifest_path.exists():
+        build_manifest = load_manifest(build_manifest_path)
+        for item in build_manifest.get("source_column_diagnostics", []) + build_manifest.get("source_schema_gap_diagnostics", []):
+            merge_source_column_evidence(evidence, item)
+        extract_manifest = load_declared_extract_manifest(build_manifest, staging_run_path)
+        if extract_manifest:
+            for item in extract_manifest.get("schema_metadata", []) + extract_manifest.get("surface_exports", []):
+                merge_source_column_evidence(evidence, item)
+    return evidence
+
+
+def load_declared_extract_manifest(build_manifest, staging_run_path):
+    raw_extract_run_path = build_manifest.get("source_extract_run_path")
+    if not raw_extract_run_path:
+        return {}
+    extract_run_path = Path(raw_extract_run_path).resolve(strict=False)
+    if _is_relative_to(extract_run_path, Path(__file__).resolve().parents[1].resolve(strict=False)):
+        return {}
+    if _is_relative_to(staging_run_path.resolve(strict=False), extract_run_path):
+        return {}
+    extract_manifest_path = extract_run_path / "inventory_operation_extract_manifest.json"
+    if not extract_manifest_path.exists():
+        return {}
+    return load_manifest(extract_manifest_path)
+
+
+def merge_source_column_evidence(evidence, item):
+    if not isinstance(item, dict):
+        return
+    source_surface = sanitize_text(
+        item.get("source_surface")
+        or item.get("object_id")
+        or ".".join([part for part in [item.get("schema_name"), item.get("object_name")] if part])
+    )
+    if not source_surface:
+        return
+    expected = list(item.get("expected_source_columns") or item.get("expected_columns") or [])
+    present = list(item.get("present_source_columns") or item.get("selected_columns") or [])
+    missing = list(item.get("missing_source_columns") or item.get("missing_expected_columns") or [])
+    existing = evidence.setdefault(
+        source_surface,
+        {"expected_source_columns": [], "present_source_columns": [], "missing_source_columns": []},
+    )
+    existing["expected_source_columns"] = unique_list(existing["expected_source_columns"] + expected)
+    existing["present_source_columns"] = unique_list(existing["present_source_columns"] + present)
+    existing["missing_source_columns"] = unique_list(existing["missing_source_columns"] + missing)
+
+
+def classify_schema_gap(warning_item, expected_headers_by_table, present_headers_by_table, source_column_evidence=None):
     warning_code = sanitize_text(warning_item.get("warning_code", ""))
     source_surface = warning_code.split(":", 1)[1] if ":" in warning_code else sanitize_text(warning_item.get("source", ""))
     staging_table = SOURCE_TO_STAGING_TABLE.get(source_surface, "unknown")
@@ -237,6 +318,32 @@ def classify_schema_gap(warning_item, expected_headers_by_table, present_headers
     present_headers = list(present_headers_by_table.get(staging_table, []))
     present_header_set = set(present_headers)
     missing_expected_headers = [header for header in expected_headers if header not in present_header_set]
+    column_evidence = (source_column_evidence or {}).get(source_surface, {})
+    expected_source_columns = list(column_evidence.get("expected_source_columns") or [])
+    present_source_columns = list(column_evidence.get("present_source_columns") or [])
+    missing_source_columns = list(column_evidence.get("missing_source_columns") or [])
+    missing_source_columns_unknown = not bool(expected_source_columns or present_source_columns or missing_source_columns)
+    source_column_gap_classification = (
+        "requires_source_column_mapping_evidence"
+        if missing_source_columns_unknown
+        else "true_source_column_gap"
+        if missing_source_columns
+        else "source_column_gap_not_confirmed"
+    )
+    dependent_staging_fields = build_dependent_staging_fields(staging_table, missing_source_columns)
+    source_column_gap_detail = (
+        "missing_source_columns_unknown; requires_source_column_mapping_evidence from upstream manifest"
+        if missing_source_columns_unknown
+        else "source-column mapping evidence available from upstream manifest metadata"
+    )
+    decision_flags = [
+        "needs_source_column_mapping",
+        "needs_alternative_surface",
+        "safe_until_data_arrives",
+        "dashboard_blocker_when_data_arrives",
+    ]
+    if missing_source_columns_unknown:
+        decision_flags.append("missing_source_columns_unknown")
     return {
         "warning_code": warning_code,
         "source_surface": source_surface,
@@ -244,18 +351,22 @@ def classify_schema_gap(warning_item, expected_headers_by_table, present_headers
         "expected_header_names": expected_headers,
         "present_header_names": present_headers,
         "missing_expected_headers": missing_expected_headers,
-        "source_column_gap_detail": (
-            "source warning did not include exact source column names; "
-            "review uses mapped staging table expected headers as conservative proxy"
-        ),
+        "expected_source_columns": expected_source_columns,
+        "present_source_columns": present_source_columns,
+        "missing_source_columns": missing_source_columns,
+        "missing_source_columns_unknown": missing_source_columns_unknown,
+        "dependent_staging_fields": dependent_staging_fields,
+        "source_column_gap_classification": source_column_gap_classification,
+        "source_column_gap_detail": source_column_gap_detail,
         "classification": "needs_source_column_mapping",
-        "decision_flags": [
-            "needs_source_column_mapping",
-            "needs_alternative_surface",
-            "safe_until_data_arrives",
-            "dashboard_blocker_when_data_arrives",
-        ],
+        "dashboard_impact": "dashboard_blocker_when_data_arrives",
+        "decision_flags": decision_flags,
     }
+
+
+def build_dependent_staging_fields(staging_table, source_columns):
+    mapping = SOURCE_COLUMN_TO_STAGING_FIELD.get(staging_table, {})
+    return {column: mapping.get(column, []) for column in source_columns if mapping.get(column)}
 
 
 def classify_numeric_candidate(warning_code, headers_by_table):
@@ -428,6 +539,11 @@ def render_report(manifest):
             lines.append(f"  - Expected headers: {', '.join(item['expected_header_names'])}")
             lines.append(f"  - Present headers: {', '.join(item['present_header_names'])}")
             lines.append(f"  - Computed missing headers: {', '.join(item['missing_expected_headers']) or 'none'}")
+            lines.append(f"  - Expected source columns: {', '.join(item.get('expected_source_columns', [])) or 'unknown'}")
+            lines.append(f"  - Present source columns: {', '.join(item.get('present_source_columns', [])) or 'unknown'}")
+            lines.append(f"  - Missing source columns: {', '.join(item.get('missing_source_columns', [])) or 'unknown'}")
+            lines.append(f"  - Dependent staging fields: {format_dependent_staging_fields(item.get('dependent_staging_fields', {}))}")
+            lines.append(f"  - Source column classification: {item.get('source_column_gap_classification', 'unknown')}")
             if item.get("source_column_gap_detail"):
                 lines.append(f"  - Source column gap detail: {item['source_column_gap_detail']}")
     lines.extend(["", "## Numeric Candidate Reviews", ""])
@@ -468,6 +584,12 @@ def render_report(manifest):
     return "\n".join(lines) + "\n"
 
 
+def format_dependent_staging_fields(value):
+    if not value:
+        return "unknown"
+    return "; ".join(f"{column} -> {', '.join(fields)}" for column, fields in value.items())
+
+
 def sanitize_text(text):
     return re.sub(
         r"(?i)\b(password|pwd|token|secret|api[_ -]?key|access[_ -]?key)\b\s*[:=]\s*[^;\s]+",
@@ -495,6 +617,10 @@ def unique_preserve_order(values):
             seen.add(marker)
             result.append(value)
     return result
+
+
+def unique_list(values):
+    return list(unique_preserve_order([sanitize_text(value) for value in values if str(value).strip()]))
 
 
 def _coerce_datetime(value):

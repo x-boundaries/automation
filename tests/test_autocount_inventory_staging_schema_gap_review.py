@@ -17,10 +17,12 @@ class InventoryStagingSchemaGapReviewTests(unittest.TestCase):
     def test_source_schema_gap_classification(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             staging_run = Path(tmpdir) / "staging_run"
+            extract_run = Path(tmpdir) / "extract_run"
             warning_run = Path(tmpdir) / "warning_run"
             staging_run.mkdir()
+            extract_run.mkdir()
             warning_run.mkdir()
-            manifest_path = write_fixture_warning_review(staging_run, warning_run)
+            manifest_path = write_fixture_warning_review(staging_run, warning_run, extract_run=extract_run)
 
             result = review.run_schema_gap_review(
                 manifest_path,
@@ -33,15 +35,67 @@ class InventoryStagingSchemaGapReviewTests(unittest.TestCase):
         schema_items = [item for item in result["source_schema_gaps"] if item["source_surface"] == "dbo.GRDTL"]
         self.assertEqual(len(schema_items), 1)
         self.assertEqual(schema_items[0]["classification"], "needs_source_column_mapping")
+        self.assertEqual(schema_items[0]["dashboard_impact"], "dashboard_blocker_when_data_arrives")
         self.assertIn("dashboard_blocker_when_data_arrives", schema_items[0]["decision_flags"])
         self.assertIn("grn_dtl_key", schema_items[0]["expected_header_names"])
         self.assertNotIn("grn_dtl_key", schema_items[0]["present_header_names"])
         self.assertEqual(schema_items[0]["missing_expected_headers"], ["grn_dtl_key"])
-        self.assertEqual(
-            schema_items[0]["source_column_gap_detail"],
-            "source warning did not include exact source column names; review uses mapped staging table expected headers as conservative proxy",
-        )
+        self.assertEqual(schema_items[0]["expected_source_columns"], ["DocNo", "DtlKey", "ItemCode"])
+        self.assertEqual(schema_items[0]["present_source_columns"], ["DocNo", "ItemCode"])
+        self.assertEqual(schema_items[0]["missing_source_columns"], ["DtlKey"])
+        self.assertEqual(schema_items[0]["dependent_staging_fields"], {"DtlKey": ["grn_dtl_key"]})
+        self.assertEqual(schema_items[0]["source_column_gap_classification"], "true_source_column_gap")
+        self.assertFalse(schema_items[0]["missing_source_columns_unknown"])
         self.assertIn("grn_doc_no", schema_items[0]["present_header_names"])
+
+    def test_source_schema_gap_labels_unknown_when_source_column_evidence_is_unavailable(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            staging_run = Path(tmpdir) / "staging_run"
+            warning_run = Path(tmpdir) / "warning_run"
+            staging_run.mkdir()
+            warning_run.mkdir()
+            manifest_path = write_fixture_warning_review(staging_run, warning_run)
+
+            result = review.run_schema_gap_review(
+                manifest_path,
+                output_root=Path(tmpdir) / "schema_gap_review",
+                now=datetime.fromisoformat("2026-06-18T21:00:00+08:00"),
+            )
+
+        schema_item = next(item for item in result["source_schema_gaps"] if item["source_surface"] == "dbo.GRDTL")
+        self.assertEqual(schema_item["expected_source_columns"], [])
+        self.assertEqual(schema_item["present_source_columns"], [])
+        self.assertEqual(schema_item["missing_source_columns"], [])
+        self.assertEqual(schema_item["dependent_staging_fields"], {})
+        self.assertTrue(schema_item["missing_source_columns_unknown"])
+        self.assertEqual(schema_item["source_column_gap_classification"], "requires_source_column_mapping_evidence")
+        self.assertIn("missing_source_columns_unknown", schema_item["decision_flags"])
+        self.assertIn("requires_source_column_mapping_evidence", schema_item["source_column_gap_detail"])
+
+    def test_report_renders_source_column_diagnostics_without_raw_rows(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            staging_run = Path(tmpdir) / "staging_run"
+            extract_run = Path(tmpdir) / "extract_run"
+            warning_run = Path(tmpdir) / "warning_run"
+            staging_run.mkdir()
+            extract_run.mkdir()
+            warning_run.mkdir()
+            manifest_path = write_fixture_warning_review(staging_run, warning_run, extract_run=extract_run)
+
+            result = review.run_schema_gap_review(
+                manifest_path,
+                output_root=Path(tmpdir) / "schema_gap_review",
+                now=datetime.fromisoformat("2026-06-18T21:00:00+08:00"),
+            )
+            report_text = Path(result["storage"]["report"]).read_text(encoding="utf-8")
+
+        self.assertIn("Expected source columns: DocNo, DtlKey, ItemCode", report_text)
+        self.assertIn("Present source columns: DocNo, ItemCode", report_text)
+        self.assertIn("Missing source columns: DtlKey", report_text)
+        self.assertIn("Dependent staging fields: DtlKey -> grn_dtl_key", report_text)
+        self.assertIn("Source column classification: true_source_column_gap", report_text)
+        for raw_value in ["SUP-001", "PO-001", "ITEM-001", "Synthetic Supplier", "Synthetic item", "MAIN"]:
+            self.assertNotIn(raw_value, report_text)
 
     def test_numeric_candidate_not_computable_classification(self):
         classification = review.classify_numeric_candidate(
@@ -146,7 +200,7 @@ class InventoryStagingSchemaGapReviewTests(unittest.TestCase):
         self.assertIn("Expected headers: grn_doc_no, grn_dtl_key, item_code", report_text)
         self.assertIn("Present headers: grn_doc_no, item_code", report_text)
         self.assertIn("Computed missing headers: grn_dtl_key", report_text)
-        self.assertIn("Source column gap detail: source warning did not include exact source column names", report_text)
+        self.assertIn("Source column gap detail: missing_source_columns_unknown", report_text)
         self.assertIn("dbo.GRDTL", report_text)
         self.assertIn("stg_ac2_supplier", report_text)
 
@@ -175,7 +229,7 @@ class InventoryStagingSchemaGapReviewTests(unittest.TestCase):
         self.assertIn("unsafe_source_warning_review_business_reconciliation_status", result["exceptions"])
 
 
-def write_fixture_warning_review(staging_run, warning_run):
+def write_fixture_warning_review(staging_run, warning_run, extract_run=None):
     rows_by_table = {
         "stg_ac2_supplier": [
             {"supplier_code": "SUP-001", "supplier_name": "Synthetic Supplier", "source_surface": "dbo.vCreditor"}
@@ -292,6 +346,58 @@ def write_fixture_warning_review(staging_run, warning_run):
             "manifest": str(warning_run / "inventory_staging_warning_review_manifest.json"),
         },
     }
+    if extract_run:
+        extract_manifest = {
+            "job": "autocount_inventory_operation_extract",
+            "status": "success_with_warnings",
+            "run_id": "extract-run-123",
+            "surface_exports": [
+                {
+                    "object_id": "dbo.GRDTL",
+                    "expected_columns": ["DocNo", "DtlKey", "ItemCode"],
+                    "selected_columns": ["DocNo", "ItemCode"],
+                    "missing_expected_columns": ["DtlKey"],
+                },
+                {
+                    "object_id": "dbo.vStockReceiveDetail",
+                    "expected_columns": ["DocNo", "ItemCode"],
+                    "selected_columns": ["DocNo"],
+                    "missing_expected_columns": ["ItemCode"],
+                },
+            ],
+            "schema_metadata": [
+                {
+                    "object_id": "dbo.GRDTL",
+                    "expected_columns": ["DocNo", "DtlKey", "ItemCode"],
+                    "selected_columns": ["DocNo", "ItemCode"],
+                    "missing_expected_columns": ["DtlKey"],
+                }
+            ],
+            "decision": "Needs reconciliation",
+            "business_reconciliation_status": "not_reconciled",
+            "data_maturity": "immature_pre_go_live",
+            "final_production_selected": False,
+            "storage": {
+                "run_path": str(extract_run),
+                "manifest": str(extract_run / "inventory_operation_extract_manifest.json"),
+            },
+        }
+        (extract_run / "inventory_operation_extract_manifest.json").write_text(json.dumps(extract_manifest), encoding="utf-8")
+        staging_build_manifest = {
+            "job": "autocount_inventory_staging_build",
+            "status": "success_with_warnings",
+            "run_id": "staging-build-run-123",
+            "source_extract_run_path": str(extract_run),
+            "decision": "Needs reconciliation",
+            "business_reconciliation_status": "not_reconciled",
+            "data_maturity": "immature_pre_go_live",
+            "final_production_selected": False,
+            "storage": {
+                "run_path": str(staging_run),
+                "manifest": str(staging_run / "inventory_staging_build_manifest.json"),
+            },
+        }
+        (staging_run / "inventory_staging_build_manifest.json").write_text(json.dumps(staging_build_manifest), encoding="utf-8")
     manifest_path = warning_run / "inventory_staging_warning_review_manifest.json"
     manifest_path.write_text(json.dumps(warning_manifest), encoding="utf-8")
     return manifest_path

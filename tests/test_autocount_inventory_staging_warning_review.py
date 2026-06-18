@@ -56,6 +56,31 @@ class InventoryStagingWarningReviewTests(unittest.TestCase):
         self.assertEqual(classification["dashboard_impact"], "dashboard_blocker_when_data_arrives")
         self.assertIn("dbo.vStockTransferDetail", classification["source"])
 
+    def test_warning_review_carries_safe_source_column_diagnostics_when_available(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            staging_run = Path(tmpdir) / "staging_run"
+            audit_run = Path(tmpdir) / "audit_run"
+            extract_run = Path(tmpdir) / "extract_run"
+            staging_run.mkdir()
+            audit_run.mkdir()
+            extract_run.mkdir()
+            audit_manifest = write_fixture_run(staging_run, audit_run, extract_run=extract_run)
+
+            result = review.run_warning_review(
+                audit_manifest,
+                output_root=Path(tmpdir) / "review",
+                now=datetime.fromisoformat("2026-06-18T20:00:00+08:00"),
+            )
+
+        diagnostic = next(item for item in result["source_column_diagnostics"] if item["source_surface"] == "dbo.GRDTL")
+        self.assertEqual(diagnostic["staging_table"], "stg_ac2_grn_line")
+        self.assertEqual(diagnostic["expected_source_columns"], ["DocNo", "DtlKey", "ItemCode"])
+        self.assertEqual(diagnostic["present_source_columns"], ["DocNo", "ItemCode"])
+        self.assertEqual(diagnostic["missing_source_columns"], ["DtlKey"])
+        self.assertEqual(diagnostic["dependent_staging_fields"], {"DtlKey": ["grn_dtl_key"]})
+        self.assertEqual(diagnostic["classification"], "true_source_column_gap")
+        self.assertEqual(diagnostic["dashboard_impact"], "dashboard_blocker_when_data_arrives")
+
     def test_zero_row_operational_tables_are_source_data_thin_not_failure(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             staging_run = Path(tmpdir) / "staging_run"
@@ -156,7 +181,7 @@ class InventoryStagingWarningReviewTests(unittest.TestCase):
         self.assertIn("unsafe_source_audit_decision", result["exceptions"])
 
 
-def write_fixture_run(staging_run, audit_run, all_operational_zero=False):
+def write_fixture_run(staging_run, audit_run, all_operational_zero=False, extract_run=None):
     rows_by_table = {
         "stg_ac2_supplier": [
             {
@@ -273,6 +298,30 @@ def write_fixture_run(staging_run, audit_run, all_operational_zero=False):
             "manifest": str(staging_run / "inventory_staging_build_manifest.json"),
         },
     }
+    if extract_run:
+        extract_manifest = {
+            "job": "autocount_inventory_operation_extract",
+            "status": "success_with_warnings",
+            "run_id": "extract-run-123",
+            "surface_exports": [
+                {
+                    "object_id": "dbo.GRDTL",
+                    "expected_columns": ["DocNo", "DtlKey", "ItemCode"],
+                    "selected_columns": ["DocNo", "ItemCode"],
+                    "missing_expected_columns": ["DtlKey"],
+                }
+            ],
+            "decision": "Needs reconciliation",
+            "business_reconciliation_status": "not_reconciled",
+            "data_maturity": "immature_pre_go_live",
+            "final_production_selected": False,
+            "storage": {
+                "run_path": str(extract_run),
+                "manifest": str(extract_run / "inventory_operation_extract_manifest.json"),
+            },
+        }
+        (extract_run / "inventory_operation_extract_manifest.json").write_text(json.dumps(extract_manifest), encoding="utf-8")
+        build_manifest["source_extract_run_path"] = str(extract_run)
     (staging_run / "inventory_staging_build_manifest.json").write_text(json.dumps(build_manifest), encoding="utf-8")
 
     audit_manifest = {

@@ -61,6 +61,12 @@ accidental secrets. It includes only:
 - staging tables reviewed
 - missing expected header names
 - present header names
+- expected source column names, when upstream metadata preserved them
+- present source column names, when upstream metadata preserved them
+- missing source column names and dependent staging fields, when available
+- explicit `missing_source_columns_unknown` /
+  `requires_source_column_mapping_evidence` labels when the warning payload does
+  not preserve exact source-column detail
 - duplicate source overlap warnings
 - recommendation
 - warning and exception counts
@@ -89,7 +95,7 @@ $review = Get-Content -Raw -Path (Join-Path $reviewRun 'inventory_staging_schema
 }
 
 $review.source_schema_gaps |
-  Select-Object source_surface, staging_table, classification
+  Select-Object source_surface, staging_table, classification, source_column_gap_classification, missing_source_columns_unknown
 
 $review.numeric_candidate_reviews |
   Select-Object source_surface, staging_table, classification
