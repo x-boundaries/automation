@@ -119,8 +119,8 @@
       "business_function": "outstanding_po_in_transit",
       "schema_name": "dbo",
       "object_name": "PODTL",
-      "expected_columns": ["DocNo", "DtlKey", "ItemCode", "TransferedQty", "PostToStock"],
-      "order_by": ["DocNo", "DtlKey"]
+      "expected_columns": ["DtlKey", "ItemCode", "TransferedQty"],
+      "order_by": ["DtlKey"]
     },
     {
       "surface_name": "supplier_context_vCreditor",
@@ -135,23 +135,23 @@
       "business_function": "supplier_context",
       "schema_name": "dbo",
       "object_name": "Creditor",
-      "expected_columns": ["CreditorCode"],
-      "order_by": ["CreditorCode"]
+      "expected_columns": ["AccNo"],
+      "order_by": ["AccNo"]
     },
     {
       "surface_name": "stock_movement_StockDTL",
       "business_function": "movement_stock_reference",
       "schema_name": "dbo",
       "object_name": "StockDTL",
-      "expected_columns": ["DocType", "DocNo", "ItemCode"],
-      "order_by": ["DocNo", "ItemCode"]
+      "expected_columns": ["DocType", "ItemCode"],
+      "order_by": ["ItemCode"]
     },
     {
       "surface_name": "stock_balance_vItemBalQty",
       "business_function": "movement_stock_reference",
       "schema_name": "dbo",
       "object_name": "vItemBalQty",
-      "expected_columns": ["ItemCode", "LocationBalQty"],
+      "expected_columns": ["ItemCode"],
       "order_by": ["ItemCode"]
     }
   ]

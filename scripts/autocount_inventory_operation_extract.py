@@ -189,13 +189,16 @@ def extract_surface(source, surface, available_columns, run_path, row_limit):
     missing_columns = [column for column in expected_columns if normalize_keyword(column) not in available_normalized]
     if missing_columns:
         warnings.append(f"missing_expected_columns:{object_id}")
-    if not selected_columns:
-        selected_columns = expected_columns
 
     order_by = [column for column in surface.get("order_by", []) if column in selected_columns]
-    sql = build_extract_sql(surface, selected_columns, order_by=order_by, row_limit=row_limit)
     output_path = run_path / f"{safe_filename(object_id)}.csv"
     base_export = build_surface_export(surface, selected_columns, missing_columns, output_path)
+    if expected_columns and not selected_columns:
+        base_export.update({"status": "skipped", "row_count": 0, "output_path": None, "file_name": None})
+        warnings.append(f"no_selected_columns:{object_id}")
+        return base_export, warnings, exceptions
+
+    sql = build_extract_sql(surface, selected_columns, order_by=order_by, row_limit=row_limit)
 
     try:
         rows = list(source.fetch_rows({**surface, "object_id": object_id, "columns": selected_columns, "sql": sql}))
@@ -275,18 +278,34 @@ def normalize_selected_surfaces(value):
         object_name = sanitize_text(surface.get("object_name", ""))
         if not object_name:
             continue
+        object_id = make_surface_id(sanitize_text(surface.get("schema_name", "dbo")), object_name)
+        expected_columns = normalize_known_extract_columns(object_id, surface.get("expected_columns", []))
+        order_by = normalize_known_extract_columns(object_id, surface.get("order_by", surface.get("safe_key_columns", [])))
         surfaces.append(
             {
                 "surface_name": sanitize_text(surface.get("surface_name", object_name)),
                 "business_function": sanitize_text(surface.get("business_function", "")),
                 "schema_name": sanitize_text(surface.get("schema_name", "dbo")),
                 "object_name": object_name,
-                "expected_columns": [sanitize_text(column) for column in surface.get("expected_columns", [])],
-                "order_by": [sanitize_text(column) for column in surface.get("order_by", surface.get("safe_key_columns", []))],
+                "expected_columns": expected_columns,
+                "order_by": order_by,
                 "critical": bool(surface.get("critical", False)),
             }
         )
     return surfaces
+
+
+def normalize_known_extract_columns(object_id, columns):
+    normalized = [sanitize_text(column) for column in columns]
+    if object_id == "dbo.Creditor":
+        return ["AccNo" if column == "CreditorCode" else column for column in normalized]
+    known_missing = {
+        "dbo.PODTL": {"DocNo", "PostToStock"},
+        "dbo.StockDTL": {"DocNo"},
+        "dbo.vItemBalQty": {"LocationBalQty"},
+    }
+    missing = known_missing.get(object_id, set())
+    return [column for column in normalized if column not in missing]
 
 
 def validate_allowlisted_surfaces(selected_surfaces):

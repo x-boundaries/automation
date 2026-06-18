@@ -77,6 +77,18 @@ class InventoryOperationExtractTests(unittest.TestCase):
         self.assertIn("dbo.vItemBalQty", surface_ids)
         self.assertNotIn("dbo.GLDTL", surface_ids)
         self.assertNotIn("coa_account_master", surface_ids)
+        surface_by_id = {
+            extract.make_surface_id(surface["schema_name"], surface["object_name"]): surface
+            for surface in config["selected_surfaces"]
+        }
+        self.assertEqual(surface_by_id["dbo.Creditor"]["expected_columns"], ["AccNo"])
+        self.assertEqual(surface_by_id["dbo.Creditor"]["order_by"], ["AccNo"])
+        self.assertEqual(surface_by_id["dbo.vCreditor"]["expected_columns"], ["CreditorCode"])
+        self.assertEqual(surface_by_id["dbo.vCreditor"]["order_by"], ["CreditorCode"])
+        self.assertNotIn("DocNo", surface_by_id["dbo.PODTL"]["expected_columns"])
+        self.assertNotIn("PostToStock", surface_by_id["dbo.PODTL"]["expected_columns"])
+        self.assertNotIn("DocNo", surface_by_id["dbo.StockDTL"]["expected_columns"])
+        self.assertNotIn("LocationBalQty", surface_by_id["dbo.vItemBalQty"]["expected_columns"])
 
     def test_build_extract_sql_is_read_only_explicit_and_allowlisted(self):
         surface = selected_surface("dbo", "GR", ["DocNo", "DocDate"], ["DocNo"], True)
@@ -155,6 +167,32 @@ class InventoryOperationExtractTests(unittest.TestCase):
         self.assertEqual(gr_export["missing_expected_columns"], ["DocDate", "CreditorCode"])
         self.assertIn("missing_expected_columns:dbo.GR", manifest["warnings"])
         self.assertEqual(gr_export["row_count"], 1)
+
+    def test_zero_matching_expected_columns_skips_surface_without_invalid_sql(self):
+        config = base_config(tempfile.gettempdir())
+        for surface in config["selected_surfaces"]:
+            if extract.make_surface_id(surface["schema_name"], surface["object_name"]) == "dbo.PODTL":
+                surface["expected_columns"] = ["MissingColumn"]
+                surface["order_by"] = ["MissingColumn"]
+        source = FakeInventoryOperationExtractSource(columns_by_surface={"dbo.PODTL": []})
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config["output_root"] = tmpdir
+            manifest = extract.run_extraction(
+                config,
+                source=source,
+                now=datetime.fromisoformat("2026-06-18T16:00:00+08:00"),
+            )
+
+        podtl_export = surface_export(manifest, "dbo.PODTL")
+        podtl_calls = [call for call in source.fetch_calls if call["object_id"] == "dbo.PODTL"]
+        self.assertEqual(manifest["status"], "success_with_warnings")
+        self.assertEqual(podtl_export["status"], "skipped")
+        self.assertEqual(podtl_export["selected_columns"], [])
+        self.assertIn("no_selected_columns:dbo.PODTL", manifest["warnings"])
+        self.assertEqual(podtl_calls, [])
+        all_sql = "\n".join(call["sql"] for call in source.fetch_calls)
+        self.assertNotIn("SELECT [MissingColumn]", all_sql)
 
     def test_surface_extraction_failure_warns_and_continues(self):
         with tempfile.TemporaryDirectory() as tmpdir:
