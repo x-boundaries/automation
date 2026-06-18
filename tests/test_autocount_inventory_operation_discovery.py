@@ -116,6 +116,94 @@ class FakeInventoryOperationSource:
         ]
 
 
+class RowCountPermissionDeniedSource(FakeInventoryOperationSource):
+    def fetch_row_counts(self, objects):
+        raise RuntimeError("VIEW DATABASE STATE permission denied in database AED_XBOUNDARIES")
+
+
+class RowCountShouldNotBeCalledSource(FakeInventoryOperationSource):
+    def fetch_row_counts(self, objects):
+        raise AssertionError("row count query should be skipped when --no-row-counts is used")
+
+
+class NoisyInventoryOperationSource(FakeInventoryOperationSource):
+    def fetch_objects(self, schemas=None):
+        return super().fetch_objects(schemas) + [
+            object_record("dbo", "vGoodsReceivedNote", "VIEW"),
+            object_record("dbo", "vGoodsReceivedNoteDetail", "VIEW"),
+            object_record("dbo", "vGoodsReceivedNoteSubDetail", "VIEW"),
+            object_record("dbo", "vStockReceive", "VIEW"),
+            object_record("dbo", "vStockReceiveDetail", "VIEW"),
+            object_record("dbo", "vStockTransfer", "VIEW"),
+            object_record("dbo", "vStockTransferDetail", "VIEW"),
+            object_record("dbo", "XFER", "USER_TABLE"),
+            object_record("dbo", "XFERUDF_GIT", "USER_TABLE"),
+            object_record("dbo", "PosSetMeal", "USER_TABLE"),
+            object_record("dbo", "vCreditor", "VIEW"),
+            object_record("dbo", "vBranchContactProfile", "VIEW"),
+            object_record("dbo", "vCashPurchase", "VIEW"),
+            object_record("dbo", "vPurchaseInvoice", "VIEW"),
+        ]
+
+    def fetch_columns(self, schemas=None):
+        return super().fetch_columns(schemas) + [
+            column_record("dbo", "vGoodsReceivedNote", "DocNo", "nvarchar"),
+            column_record("dbo", "vGoodsReceivedNote", "DocDate", "datetime"),
+            column_record("dbo", "vGoodsReceivedNote", "CreditorCode", "nvarchar"),
+            column_record("dbo", "vGoodsReceivedNoteDetail", "ItemCode", "nvarchar"),
+            column_record("dbo", "vGoodsReceivedNoteDetail", "Qty", "decimal"),
+            column_record("dbo", "vGoodsReceivedNoteSubDetail", "BatchBalQty", "decimal"),
+            column_record("dbo", "vStockReceive", "DocNo", "nvarchar"),
+            column_record("dbo", "vStockReceiveDetail", "ItemCode", "nvarchar"),
+            column_record("dbo", "vStockReceiveDetail", "SmallestQty", "decimal"),
+            column_record("dbo", "vStockTransfer", "FromLocation", "nvarchar"),
+            column_record("dbo", "vStockTransfer", "ToLocation", "nvarchar"),
+            column_record("dbo", "vStockTransferDetail", "ItemCode", "nvarchar"),
+            column_record("dbo", "vStockTransferDetail", "SmallestQty", "decimal"),
+            column_record("dbo", "XFER", "DocNo", "nvarchar"),
+            column_record("dbo", "XFER", "FromLocation", "nvarchar"),
+            column_record("dbo", "XFER", "ToLocation", "nvarchar"),
+            column_record("dbo", "XFERUDF_GIT", "XFERUDF_RcvDate", "datetime"),
+            column_record("dbo", "XFERUDF_GIT", "XFERUDF_RcvBy", "nvarchar"),
+            column_record("dbo", "XFERUDF_GIT", "XFERUDF_UseGIT", "bit"),
+            column_record("dbo", "PosSetMeal", "CategoryMaxQty", "decimal"),
+            column_record("dbo", "PosSetMeal", "CategoryMinQty", "decimal"),
+            column_record("dbo", "PosSetMeal", "PointRedeem", "decimal"),
+            column_record("dbo", "vCreditor", "CreditorCode", "nvarchar"),
+            column_record("dbo", "vCreditor", "CreditorName", "nvarchar"),
+            column_record("dbo", "vCreditor", "CreditorContact", "nvarchar"),
+            column_record("dbo", "vCreditor", "EmailAddress", "nvarchar"),
+            column_record("dbo", "vCreditor", "PostCode", "nvarchar"),
+            column_record("dbo", "vBranchContactProfile", "BranchCode", "nvarchar"),
+            column_record("dbo", "vBranchContactProfile", "BranchAddress", "nvarchar"),
+            column_record("dbo", "vBranchContactProfile", "BranchContact", "nvarchar"),
+            column_record("dbo", "vBranchContactProfile", "BranchPostCode", "nvarchar"),
+            column_record("dbo", "vBranchContactProfile", "BranchPhone", "nvarchar"),
+            column_record("dbo", "vCashPurchase", "DocNo", "nvarchar"),
+            column_record("dbo", "vCashPurchase", "ItemCode", "nvarchar"),
+            column_record("dbo", "vPurchaseInvoice", "DocNo", "nvarchar"),
+            column_record("dbo", "vPurchaseInvoice", "ItemCode", "nvarchar"),
+        ]
+
+    def fetch_row_counts(self, objects):
+        return super().fetch_row_counts(objects) + [
+            {"object_schema": "dbo", "object_name": "vGoodsReceivedNote", "row_count": 4},
+            {"object_schema": "dbo", "object_name": "vGoodsReceivedNoteDetail", "row_count": 8},
+            {"object_schema": "dbo", "object_name": "vGoodsReceivedNoteSubDetail", "row_count": 8},
+            {"object_schema": "dbo", "object_name": "vStockReceive", "row_count": 4},
+            {"object_schema": "dbo", "object_name": "vStockReceiveDetail", "row_count": 8},
+            {"object_schema": "dbo", "object_name": "vStockTransfer", "row_count": 2},
+            {"object_schema": "dbo", "object_name": "vStockTransferDetail", "row_count": 4},
+            {"object_schema": "dbo", "object_name": "XFER", "row_count": 2},
+            {"object_schema": "dbo", "object_name": "XFERUDF_GIT", "row_count": 2},
+            {"object_schema": "dbo", "object_name": "PosSetMeal", "row_count": 20},
+            {"object_schema": "dbo", "object_name": "vCreditor", "row_count": 70},
+            {"object_schema": "dbo", "object_name": "vBranchContactProfile", "row_count": 0},
+            {"object_schema": "dbo", "object_name": "vCashPurchase", "row_count": 5},
+            {"object_schema": "dbo", "object_name": "vPurchaseInvoice", "row_count": 5},
+        ]
+
+
 class InventoryOperationDiscoveryTests(unittest.TestCase):
     def test_example_config_is_secret_free_and_inventory_scoped(self):
         config_path = ROOT / "config" / "autocount_inventory_operation_discovery.example.json"
@@ -194,6 +282,133 @@ class InventoryOperationDiscoveryTests(unittest.TestCase):
             self.assertIn("dbo.GR", report_text)
             self.assertIn("Needs reconciliation", report_text)
 
+    def test_row_count_permission_denial_is_success_with_warnings(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manifest = discovery.run_discovery(
+                base_config(tmpdir),
+                source=RowCountPermissionDeniedSource(),
+                now=datetime.fromisoformat("2026-06-18T12:30:00+08:00"),
+            )
+
+        self.assertEqual(manifest["status"], "success_with_warnings")
+        self.assertEqual(manifest["counts"]["row_count_records"], 0)
+        self.assertIn("row_counts_unavailable_permission_denied", manifest["warnings"])
+        self.assertRegex("\n".join(manifest["notes"]), "--no-row-counts")
+        self.assertEqual(manifest["exceptions"], [])
+        self.assertGreater(manifest["candidate_summary"]["total_candidates"], 0)
+
+    def test_no_row_counts_skips_row_count_query_and_remains_successful(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manifest = discovery.run_discovery(
+                base_config(tmpdir),
+                source=RowCountShouldNotBeCalledSource(),
+                include_row_counts=False,
+                now=datetime.fromisoformat("2026-06-18T12:30:00+08:00"),
+            )
+
+        self.assertEqual(manifest["status"], "success")
+        self.assertEqual(manifest["counts"]["row_count_records"], 0)
+        self.assertNotIn("row_counts_unavailable_permission_denied", manifest["warnings"])
+        self.assertGreater(manifest["candidate_summary"]["total_candidates"], 0)
+
+    def test_noisy_inventory_candidates_do_not_outrank_strong_surfaces(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manifest = discovery.run_discovery(
+                base_config(tmpdir),
+                source=NoisyInventoryOperationSource(),
+                now=datetime.fromisoformat("2026-06-18T12:30:00+08:00"),
+            )
+
+        movement_ids = ranked_ids(manifest, "movement_semantics")
+        item_ids = ranked_ids(manifest, "item_product_attributes")
+        location_ids = ranked_ids(manifest, "stock_location")
+
+        self.assert_ranked_before_if_present(movement_ids, "dbo.PODTL", "dbo.PosSetMeal")
+        self.assert_ranked_before_if_present(movement_ids, "dbo.StockDTL", "dbo.PosSetMeal")
+        self.assert_ranked_before_if_present(item_ids, "dbo.Item", "dbo.vCreditor")
+        self.assert_ranked_before_if_present(location_ids, "dbo.Location", "dbo.vBranchContactProfile")
+        self.assertIsNone(candidate_by_id(manifest, "movement_semantics", "dbo.vCashPurchase"))
+        self.assertIsNone(candidate_by_id(manifest, "movement_semantics", "dbo.vPurchaseInvoice"))
+
+    def test_strong_inventory_operation_candidates_are_boosted(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manifest = discovery.run_discovery(
+                base_config(tmpdir),
+                source=NoisyInventoryOperationSource(),
+                now=datetime.fromisoformat("2026-06-18T12:30:00+08:00"),
+            )
+
+        expected = [
+            ("grn_receiving", "dbo.vGoodsReceivedNote"),
+            ("grn_receiving", "dbo.vGoodsReceivedNoteDetail"),
+            ("grn_receiving", "dbo.GR"),
+            ("stock_transfer", "dbo.vStockTransfer"),
+            ("stock_transfer", "dbo.vStockTransferDetail"),
+            ("stock_transfer", "dbo.XFER"),
+            ("outstanding_po_transit_support", "dbo.vPurchaseOrder"),
+            ("outstanding_po_transit_support", "dbo.PO"),
+            ("outstanding_po_transit_support", "dbo.PODTL"),
+            ("movement_semantics", "dbo.StockDTL"),
+            ("movement_semantics", "dbo.PODTL"),
+        ]
+        for family_name, object_id in expected:
+            with self.subTest(family_name=family_name, object_id=object_id):
+                candidate = candidate_by_id(manifest, family_name, object_id)
+                self.assertIsNotNone(candidate)
+                self.assertTrue(
+                    any(reason.startswith("strong_inventory_candidate:") for reason in candidate["reason_codes"])
+                )
+                self.assertEqual(candidate["decision"], "Needs reconciliation")
+                self.assertFalse(candidate["final_production_selected"])
+
+    def test_inventory_operation_profile_draft_is_guarded_and_specific(self):
+        profile_path = ROOT / "docs" / "autocount2-automation" / "inventory_operation_selected_profile_draft.md"
+
+        profile_text = profile_path.read_text(encoding="utf-8")
+
+        self.assertIn("# Inventory Operation Selected Profile Draft", profile_text)
+        self.assertIn("Needs reconciliation", profile_text)
+        self.assertIn("not_reconciled", profile_text)
+        self.assertIn("final_production_selected=false", profile_text)
+        self.assertNotIn("final_production_selected=true", profile_text)
+        self.assertIn("dbo.vGoodsReceivedNote", profile_text)
+        self.assertIn("dbo.vStockTransfer", profile_text)
+        self.assertIn("dbo.vPurchaseOrder", profile_text)
+        self.assertIn("Possible transfer/GIT column evidence on `dbo.vStockTransfer`", profile_text)
+        self.assertIn("XFERUDF_GIT", profile_text)
+        self.assertNotIn("- `dbo.XFERUDF_GIT`", profile_text)
+        self.assertIn("CoA", profile_text)
+        self.assertIn("GLDTL", profile_text)
+        self.assertIn("AR/AP detail", profile_text)
+
+    def test_inventory_operation_guardrails_remain_unselected(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manifest = discovery.run_discovery(
+                base_config(tmpdir),
+                source=NoisyInventoryOperationSource(),
+                now=datetime.fromisoformat("2026-06-18T12:30:00+08:00"),
+            )
+
+        self.assertEqual(manifest["decision"], "Needs reconciliation")
+        self.assertFalse(manifest["final_production_selected"])
+        self.assertIn("CoA/account master", manifest["parked_scope"])
+        self.assertIn("GLDTL disabled by default", manifest["parked_scope"])
+        self.assertIn("AR/AP detail disabled by default", manifest["parked_scope"])
+
+        candidate_ids = {
+            candidate["object_id"]
+            for candidates in manifest["candidates_by_family"].values()
+            for candidate in candidates
+        }
+        self.assertNotIn("coa_account_master", candidate_ids)
+        self.assertNotIn("dbo.GLDTL", candidate_ids)
+        self.assertNotIn("dbo.ARInvoiceDTL", candidate_ids)
+        self.assertNotIn("dbo.APInvoiceDTL", candidate_ids)
+        for candidates in manifest["candidates_by_family"].values():
+            for candidate in candidates:
+                self.assertEqual(candidate["decision"], "Needs reconciliation")
+                self.assertFalse(candidate["final_production_selected"])
+
     def test_wrong_target_context_fails_before_candidate_scoring(self):
         source = FakeInventoryOperationSource(
             {
@@ -237,6 +452,12 @@ class InventoryOperationDiscoveryTests(unittest.TestCase):
         self.assertIn("inventory_operation_discovery_outputs/", gitignore_text)
         self.assertIn("autocount_outputs/**/inventory_operation_discovery_manifest.json", gitignore_text)
         self.assertIn("autocount_outputs/**/inventory_operation_discovery_report.md", gitignore_text)
+
+    def assert_ranked_before_if_present(self, ranked_object_ids, preferred_object_id, noisy_object_id):
+        if noisy_object_id not in ranked_object_ids:
+            return
+        self.assertIn(preferred_object_id, ranked_object_ids)
+        self.assertLess(ranked_object_ids.index(preferred_object_id), ranked_object_ids.index(noisy_object_id))
 
     def assert_no_raw_payload_keys(self, value):
         if isinstance(value, dict):
@@ -285,6 +506,10 @@ def candidate_by_id(manifest, family_name, object_id):
         if candidate["object_id"] == object_id:
             return candidate
     return None
+
+
+def ranked_ids(manifest, family_name):
+    return [candidate["object_id"] for candidate in manifest["candidates_by_family"].get(family_name, [])]
 
 
 if __name__ == "__main__":

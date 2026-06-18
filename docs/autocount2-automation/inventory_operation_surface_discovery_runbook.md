@@ -114,6 +114,13 @@ If metadata row counts are blocked by the SQL login, rerun with:
 python scripts\autocount_inventory_operation_discovery.py --config config\autocount_inventory_operation_discovery.local.json --no-row-counts
 ```
 
+If object and column metadata succeeds but row counts fail because
+`xb_ac2_readonly` lacks `VIEW DATABASE STATE`, the run status is
+`success_with_warnings` and the manifest includes the warning
+`row_counts_unavailable_permission_denied`. This means the candidate metadata
+was still generated safely. Use `--no-row-counts` for a clean metadata-only run
+that skips partition-stat row counts.
+
 ## Output Files
 
 Each run writes a timestamped local folder containing:
@@ -134,6 +141,45 @@ The manifest and report include only safe metadata summaries:
 
 They do not include raw ERP rows, raw CSV contents, screenshots, connection
 strings, local config values, or credentials.
+
+## Safe Manifest Summary Command
+
+Use this after a local run to summarize only manifest metadata. It does not
+print CSV contents or raw ERP rows.
+
+```powershell
+$runPath = 'C:\XB\autocount_outputs\probe\inventory_operations\inventory_operation_discovery_YYYYMMDD_HHMMSS_RUNID'
+$manifest = Get-Content -Raw -Path (Join-Path $runPath 'inventory_operation_discovery_manifest.json') | ConvertFrom-Json
+
+[pscustomobject]@{
+  run_path = $manifest.storage.run_path
+  status = $manifest.status
+  exception_count = @($manifest.exceptions).Count
+  data_maturity = $manifest.data_maturity
+  business_reconciliation_status = $manifest.business_reconciliation_status
+  row_count_records = $manifest.counts.row_count_records
+  total_candidates = $manifest.candidate_summary.total_candidates
+} | Format-List
+
+'Candidate counts by family:'
+$manifest.candidate_summary.counts_by_family.PSObject.Properties |
+  Sort-Object Name |
+  Select-Object @{Name='family';Expression={$_.Name}}, @{Name='candidate_count';Expression={$_.Value}} |
+  Format-Table -AutoSize
+
+'Top candidates by family:'
+$manifest.candidates_by_family.PSObject.Properties | ForEach-Object {
+  $family = $_.Name
+  $_.Value |
+    Select-Object @{Name='family';Expression={$family}}, rank, object_id, score, row_count,
+      @{Name='matched_columns';Expression={($_.matched_column_names -join ', ')}},
+      @{Name='reason_codes';Expression={($_.reason_codes -join ', ')}} |
+    Format-Table -AutoSize
+}
+
+'Warnings:'
+$manifest.warnings
+```
 
 ## Safe To Paste Back
 
