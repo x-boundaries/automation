@@ -51,6 +51,8 @@ autocount_outputs/**/selected_surface_extract_manifest.json
 autocount_outputs/**/selected_surface_extract_report.md
 autocount_outputs/**/inventory_operation_discovery_manifest.json
 autocount_outputs/**/inventory_operation_discovery_report.md
+autocount_outputs/**/inventory_operation_validation_manifest.json
+autocount_outputs/**/inventory_operation_validation_report.md
 autocount_outputs/**/phase1_reconcile_manifest.json
 autocount_outputs/**/phase1_reconcile_report.md
 
@@ -95,3 +97,9 @@ autocount_inventory_operation_discovery_outputs/
 inventory_operation_discovery_outputs/
 autocount_inventory_operation_discovery.local.json
 config/autocount_inventory_operation_discovery.local.json
+
+# AutoCount inventory operation aggregate validation local outputs/config
+autocount_inventory_operation_validate_outputs/
+inventory_operation_validation_outputs/
+autocount_inventory_operation_validate.local.json
+config/autocount_inventory_operation_validate.local.json
