@@ -134,12 +134,14 @@ def run_staging_build(manifest_path, output_root=None, config=None, allow_warnin
     staging_tables = []
     source_manifest = {}
     manifest_path = Path(manifest_path)
+    selected_extract_run_path = manifest_path.parent.resolve(strict=False)
 
     try:
         source_manifest = load_manifest(manifest_path)
         validate_source_manifest(source_manifest, allow_warning_source=allow_warning_source)
         warnings.extend([sanitize_text(warning) for warning in source_manifest.get("warnings", [])])
-        extract_run_path = Path(source_manifest.get("storage", {}).get("run_path") or manifest_path.parent).resolve(strict=False)
+        extract_run_path = resolve_selected_extract_run_path(manifest_path, source_manifest)
+        selected_extract_run_path = extract_run_path
         exports = {export.get("object_id"): export for export in source_manifest.get("surface_exports", [])}
         for table_spec in STAGING_TABLES:
             table, table_warnings = build_staging_table(table_spec, exports, extract_run_path, run_path, source_manifest)
@@ -153,7 +155,16 @@ def run_staging_build(manifest_path, output_root=None, config=None, allow_warnin
         if "surface_results" in str(exc):
             warnings.append("manifest_uses_legacy_surface_results_field")
 
-    manifest = build_manifest(source_manifest, staging_tables, plan, status, warnings, exceptions, now=now)
+    manifest = build_manifest(
+        source_manifest,
+        staging_tables,
+        plan,
+        status,
+        warnings,
+        exceptions,
+        source_extract_run_path=selected_extract_run_path,
+        now=now,
+    )
     manifest_path_out = run_path / "inventory_staging_build_manifest.json"
     report_path = run_path / "inventory_staging_build_report.md"
     manifest["storage"]["manifest"] = str(manifest_path_out)
@@ -196,6 +207,20 @@ def validate_source_manifest(source_manifest, allow_warning_source=False):
         # PR #50 local run is success_with_warnings, so default call path treats warnings as reviewable.
         if source_manifest.get("status") == "failed":
             raise ValueError("Source extract manifest status is failed.")
+
+
+def resolve_selected_extract_run_path(manifest_path, source_manifest):
+    selected_extract_run_path = Path(manifest_path).parent.resolve(strict=False)
+    declared_run_path = source_manifest.get("storage", {}).get("run_path")
+    if declared_run_path:
+        declared = Path(declared_run_path).resolve(strict=False)
+        if declared != selected_extract_run_path:
+            raise ValueError(
+                "source_manifest_run_path_mismatch:"
+                f"declared={sanitize_text(declared)};"
+                f"selected={sanitize_text(selected_extract_run_path)}"
+            )
+    return selected_extract_run_path
 
 
 def build_staging_table(table_spec, exports, extract_run_path, run_path, source_manifest):
@@ -326,7 +351,7 @@ def calculate_outstanding(qty, transferred_qty):
     return str(value)
 
 
-def build_manifest(source_manifest, staging_tables, plan, status, warnings, exceptions, now=None):
+def build_manifest(source_manifest, staging_tables, plan, status, warnings, exceptions, source_extract_run_path=None, now=None):
     finished_at = _coerce_datetime(now) if now else datetime.now().astimezone()
     return {
         "job": "autocount_inventory_staging_build",
@@ -335,17 +360,17 @@ def build_manifest(source_manifest, staging_tables, plan, status, warnings, exce
         "started_at": plan["started_at"],
         "finished_at": finished_at.isoformat(),
         "source_extract_run_id": source_manifest.get("run_id"),
-        "source_extract_run_path": source_manifest.get("storage", {}).get("run_path"),
+        "source_extract_run_path": str(source_extract_run_path or ""),
         "staging_output_root": plan["run_path"],
         "staging_tables": staging_tables,
         "row_counts": {table["table_name"]: table["row_count"] for table in staging_tables},
         "warnings": unique_preserve_order([sanitize_text(warning) for warning in warnings]),
         "exception_count": len(exceptions),
         "exceptions": [sanitize_text(exception) for exception in exceptions],
-        "decision": source_manifest.get("decision", NEEDS_RECONCILIATION),
-        "business_reconciliation_status": source_manifest.get("business_reconciliation_status", BUSINESS_RECONCILIATION_STATUS),
-        "data_maturity": source_manifest.get("data_maturity", DATA_MATURITY),
-        "final_production_selected": bool(source_manifest.get("final_production_selected", False)),
+        "decision": NEEDS_RECONCILIATION,
+        "business_reconciliation_status": BUSINESS_RECONCILIATION_STATUS,
+        "data_maturity": DATA_MATURITY,
+        "final_production_selected": False,
         "storage": {"output_root": plan["output_root"], "run_path": plan["run_path"], "manifest": "", "report": ""},
         "notes": [
             "Local staging CSV outputs only; no database load is performed.",

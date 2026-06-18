@@ -140,6 +140,60 @@ class InventoryStagingBuildTests(unittest.TestCase):
         self.assertEqual(result["status"], "success_with_warnings")
         self.assertIn("source_csv_outside_extract_run:dbo.vCreditor", result["warnings"])
 
+    def test_declared_run_path_cannot_expand_source_csv_confinement(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            extract_run = Path(tmpdir) / "extract"
+            declared_run = Path(tmpdir) / "declared_elsewhere"
+            extract_run.mkdir()
+            declared_run.mkdir()
+            external_csv = declared_run / "dbo.vCreditor.csv"
+            external_csv.write_text("CreditorCode,CreditorCompanyName\nEXTERNAL-SUP,External Supplier\n", encoding="utf-8")
+            manifest = synthetic_extract_manifest(extract_run)
+            manifest["storage"]["run_path"] = str(declared_run)
+            manifest["surface_exports"][0]["output_path"] = str(external_csv)
+            manifest_path = extract_run / "inventory_operation_extract_manifest.json"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+            result = build.run_staging_build(
+                manifest_path,
+                output_root=Path(tmpdir) / "staging",
+                now=datetime.fromisoformat("2026-06-18T18:00:00+08:00"),
+            )
+            report_text = Path(result["storage"]["report"]).read_text(encoding="utf-8")
+
+        self.assertEqual(result["status"], "failed")
+        self.assertRegex("\n".join(result["exceptions"]), "source_manifest_run_path_mismatch")
+        self.assertEqual(result["source_extract_run_path"], str(extract_run.resolve(strict=False)))
+        self.assertEqual(result["staging_tables"], [])
+        self.assertNotIn("EXTERNAL-SUP", json.dumps(result))
+        self.assertNotIn("EXTERNAL-SUP", report_text)
+
+    def test_staging_manifest_enforces_safety_metadata_over_source_values(self):
+        for upstream_final_production_selected in [True, "false"]:
+            with self.subTest(upstream_final_production_selected=upstream_final_production_selected):
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    extract_run = Path(tmpdir) / "extract"
+                    extract_run.mkdir()
+                    write_fixture_extract(extract_run)
+                    manifest_path = extract_run / "inventory_operation_extract_manifest.json"
+                    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                    manifest["decision"] = "Production ready"
+                    manifest["business_reconciliation_status"] = "reconciled"
+                    manifest["data_maturity"] = "production"
+                    manifest["final_production_selected"] = upstream_final_production_selected
+                    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+                    result = build.run_staging_build(
+                        manifest_path,
+                        output_root=Path(tmpdir) / "staging",
+                        now=datetime.fromisoformat("2026-06-18T18:00:00+08:00"),
+                    )
+
+                self.assertEqual(result["decision"], "Needs reconciliation")
+                self.assertEqual(result["business_reconciliation_status"], "not_reconciled")
+                self.assertEqual(result["data_maturity"], "immature_pre_go_live")
+                self.assertFalse(result["final_production_selected"])
+
     def test_report_contains_no_raw_business_values(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             extract_run = Path(tmpdir) / "extract"
