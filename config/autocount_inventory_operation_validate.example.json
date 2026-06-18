@@ -1,0 +1,193 @@
+{
+  "job": "autocount_inventory_operation_validate",
+  "connection_string_env": "AUTOCOUNT_READONLY_SQL_CONNECTION_STRING",
+  "output_root": "C:\\XB\\autocount_outputs\\probe\\inventory_operations_validation",
+  "expected_server": "localhost\\A2006",
+  "expected_database": "AED_XBOUNDARIES",
+  "expected_login": "xb_ac2_readonly",
+  "reject_server_patterns": [
+    "SQLEXPRESS"
+  ],
+  "reject_databases": [
+    "AED_XBoundaries",
+    "A893478"
+  ],
+  "selected_surfaces": [
+    {
+      "surface_name": "grn_header_vGoodsReceivedNote",
+      "business_function": "grn_header",
+      "schema_name": "dbo",
+      "object_name": "vGoodsReceivedNote",
+      "expected_columns": ["DocNo", "DocDate", "CreditorCode"],
+      "critical_columns": ["DocNo"],
+      "safe_key_columns": ["DocNo", "DocKey", "CreditorCode"],
+      "safe_date_columns": ["DocDate", "LastModified"],
+      "critical": true
+    },
+    {
+      "surface_name": "grn_header_GR",
+      "business_function": "grn_header",
+      "schema_name": "dbo",
+      "object_name": "GR",
+      "expected_columns": ["DocNo", "DocDate", "CreditorCode"],
+      "critical_columns": ["DocNo"],
+      "safe_key_columns": ["DocNo", "DocKey", "CreditorCode"],
+      "safe_date_columns": ["DocDate", "LastModified"],
+      "critical": true
+    },
+    {
+      "surface_name": "grn_detail_vGoodsReceivedNoteDetail",
+      "business_function": "grn_detail",
+      "schema_name": "dbo",
+      "object_name": "vGoodsReceivedNoteDetail",
+      "expected_columns": ["DocNo", "DocKey", "DtlKey", "ItemCode"],
+      "critical_columns": ["ItemCode"],
+      "safe_key_columns": ["DocNo", "DocKey", "DtlKey", "ItemCode"],
+      "safe_date_columns": ["LastModified"]
+    },
+    {
+      "surface_name": "grn_detail_vGoodsReceivedNoteSubDetail",
+      "business_function": "grn_detail",
+      "schema_name": "dbo",
+      "object_name": "vGoodsReceivedNoteSubDetail",
+      "expected_columns": ["DocNo", "DocKey", "DtlKey", "ItemCode", "BatchBalQty"],
+      "critical_columns": ["ItemCode"],
+      "safe_key_columns": ["DocNo", "DocKey", "DtlKey", "ItemCode"],
+      "safe_date_columns": ["LastModified"]
+    },
+    {
+      "surface_name": "grn_detail_GRDTL",
+      "business_function": "grn_detail",
+      "schema_name": "dbo",
+      "object_name": "GRDTL",
+      "expected_columns": ["DocNo", "DocKey", "DtlKey", "ItemCode"],
+      "critical_columns": ["ItemCode"],
+      "safe_key_columns": ["DocNo", "DocKey", "DtlKey", "ItemCode"],
+      "safe_date_columns": ["LastModified"]
+    },
+    {
+      "surface_name": "stock_receive_vStockReceive",
+      "business_function": "stock_receive",
+      "schema_name": "dbo",
+      "object_name": "vStockReceive",
+      "expected_columns": ["DocNo", "DocDate"],
+      "critical_columns": ["DocNo"],
+      "safe_key_columns": ["DocNo", "DocKey"],
+      "safe_date_columns": ["DocDate", "LastModified"]
+    },
+    {
+      "surface_name": "stock_receive_vStockReceiveDetail",
+      "business_function": "stock_receive",
+      "schema_name": "dbo",
+      "object_name": "vStockReceiveDetail",
+      "expected_columns": ["DocNo", "ItemCode", "SmallestQty"],
+      "critical_columns": ["ItemCode"],
+      "safe_key_columns": ["DocNo", "DocKey", "DtlKey", "ItemCode"],
+      "safe_date_columns": ["LastModified"]
+    },
+    {
+      "surface_name": "transfer_header_vStockTransfer",
+      "business_function": "transfer_header",
+      "schema_name": "dbo",
+      "object_name": "vStockTransfer",
+      "expected_columns": ["DocNo", "DocDate", "FromLocation", "ToLocation", "XFERUDF_GIT", "XFERUDF_RcvDate", "XFERUDF_RcvBy", "XFERUDF_UseGIT"],
+      "critical_columns": ["DocNo"],
+      "safe_key_columns": ["DocNo", "DocKey", "FromLocation", "ToLocation"],
+      "safe_date_columns": ["DocDate", "LastModified", "XFERUDF_RcvDate"],
+      "critical": true
+    },
+    {
+      "surface_name": "transfer_header_XFER",
+      "business_function": "transfer_header",
+      "schema_name": "dbo",
+      "object_name": "XFER",
+      "expected_columns": ["DocNo", "DocDate", "FromLocation", "ToLocation"],
+      "critical_columns": ["DocNo"],
+      "safe_key_columns": ["DocNo", "DocKey", "FromLocation", "ToLocation"],
+      "safe_date_columns": ["DocDate", "LastModified"],
+      "critical": true
+    },
+    {
+      "surface_name": "transfer_detail_vStockTransferDetail",
+      "business_function": "transfer_detail",
+      "schema_name": "dbo",
+      "object_name": "vStockTransferDetail",
+      "expected_columns": ["DocNo", "ItemCode", "SmallestQty"],
+      "critical_columns": ["ItemCode"],
+      "safe_key_columns": ["DocNo", "DocKey", "DtlKey", "ItemCode"],
+      "safe_date_columns": ["LastModified"]
+    },
+    {
+      "surface_name": "outstanding_po_vPurchaseOrder",
+      "business_function": "outstanding_po_in_transit",
+      "schema_name": "dbo",
+      "object_name": "vPurchaseOrder",
+      "expected_columns": ["DocNo", "DocDate", "CreditorCode", "PurchaseLocation"],
+      "critical_columns": ["DocNo"],
+      "safe_key_columns": ["DocNo", "DocKey", "CreditorCode", "PurchaseLocation"],
+      "safe_date_columns": ["DocDate", "LastModified"]
+    },
+    {
+      "surface_name": "outstanding_po_PO",
+      "business_function": "outstanding_po_in_transit",
+      "schema_name": "dbo",
+      "object_name": "PO",
+      "expected_columns": ["DocNo", "DocDate", "CreditorCode", "PurchaseLocation"],
+      "critical_columns": ["DocNo"],
+      "safe_key_columns": ["DocNo", "DocKey", "CreditorCode", "PurchaseLocation"],
+      "safe_date_columns": ["DocDate", "LastModified"]
+    },
+    {
+      "surface_name": "outstanding_po_PODTL",
+      "business_function": "outstanding_po_in_transit",
+      "schema_name": "dbo",
+      "object_name": "PODTL",
+      "expected_columns": ["DocNo", "DtlKey", "ItemCode", "TransferedQty", "PostToStock"],
+      "critical_columns": ["ItemCode"],
+      "safe_key_columns": ["DocNo", "DocKey", "DtlKey", "ItemCode"],
+      "safe_date_columns": ["LastModified"]
+    },
+    {
+      "surface_name": "supplier_context_vCreditor",
+      "business_function": "supplier_context",
+      "schema_name": "dbo",
+      "object_name": "vCreditor",
+      "expected_columns": ["CreditorCode"],
+      "critical_columns": ["CreditorCode"],
+      "safe_key_columns": ["CreditorCode"],
+      "safe_date_columns": ["LastModified"]
+    },
+    {
+      "surface_name": "supplier_context_Creditor",
+      "business_function": "supplier_context",
+      "schema_name": "dbo",
+      "object_name": "Creditor",
+      "expected_columns": ["CreditorCode"],
+      "critical_columns": ["CreditorCode"],
+      "safe_key_columns": ["CreditorCode"],
+      "safe_date_columns": ["LastModified"]
+    },
+    {
+      "surface_name": "stock_movement_StockDTL",
+      "business_function": "movement_stock_reference",
+      "schema_name": "dbo",
+      "object_name": "StockDTL",
+      "expected_columns": ["DocType", "DocNo", "ItemCode"],
+      "critical_columns": ["DocNo", "ItemCode"],
+      "safe_key_columns": ["DocType", "DocNo", "ItemCode"],
+      "safe_date_columns": ["DocDate", "LastModified"],
+      "optional": true
+    },
+    {
+      "surface_name": "stock_balance_vItemBalQty",
+      "business_function": "movement_stock_reference",
+      "schema_name": "dbo",
+      "object_name": "vItemBalQty",
+      "expected_columns": ["ItemCode", "LocationBalQty"],
+      "critical_columns": ["ItemCode"],
+      "safe_key_columns": ["ItemCode"],
+      "safe_date_columns": ["LastModified"],
+      "optional": true
+    }
+  ]
+}
