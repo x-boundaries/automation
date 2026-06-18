@@ -53,6 +53,8 @@ autocount_outputs/**/inventory_operation_discovery_manifest.json
 autocount_outputs/**/inventory_operation_discovery_report.md
 autocount_outputs/**/inventory_operation_validation_manifest.json
 autocount_outputs/**/inventory_operation_validation_report.md
+autocount_outputs/**/inventory_operation_extract_manifest.json
+autocount_outputs/**/inventory_operation_extract_report.md
 autocount_outputs/**/phase1_reconcile_manifest.json
 autocount_outputs/**/phase1_reconcile_report.md
 
@@ -103,3 +105,9 @@ autocount_inventory_operation_validate_outputs/
 inventory_operation_validation_outputs/
 autocount_inventory_operation_validate.local.json
 config/autocount_inventory_operation_validate.local.json
+
+# AutoCount inventory operation raw snapshot local outputs/config
+autocount_inventory_operation_extract_outputs/
+inventory_operation_extract_outputs/
+autocount_inventory_operation_extract.local.json
+config/autocount_inventory_operation_extract.local.json
