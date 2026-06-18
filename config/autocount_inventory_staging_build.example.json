@@ -1,0 +1,9 @@
+{
+  "job": "autocount_inventory_staging_build",
+  "output_root": "C:\\XB\\autocount_outputs\\staging\\inventory_operations",
+  "notes": [
+    "Local CSV staging outputs only.",
+    "No database connection or credentials are required.",
+    "No dashboard, scheduler, write-back, import/API, or production database loading is performed."
+  ]
+}

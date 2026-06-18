@@ -57,6 +57,8 @@ autocount_outputs/**/inventory_operation_extract_manifest.json
 autocount_outputs/**/inventory_operation_extract_report.md
 autocount_outputs/**/inventory_staging_readiness_manifest.json
 autocount_outputs/**/inventory_staging_readiness_report.md
+autocount_outputs/**/inventory_staging_build_manifest.json
+autocount_outputs/**/inventory_staging_build_report.md
 autocount_outputs/**/phase1_reconcile_manifest.json
 autocount_outputs/**/phase1_reconcile_report.md
 
@@ -117,3 +119,7 @@ config/autocount_inventory_operation_extract.local.json
 # AutoCount inventory staging readiness local outputs/config
 autocount_inventory_staging_readiness_outputs/
 inventory_staging_readiness_outputs/
+
+# AutoCount inventory staging build local outputs/config
+autocount_inventory_staging_build_outputs/
+inventory_staging_build_outputs/
