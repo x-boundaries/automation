@@ -129,3 +129,9 @@ autocount_inventory_staging_audit_outputs/
 inventory_staging_audit_outputs/
 autocount_outputs/**/inventory_staging_audit_manifest.json
 autocount_outputs/**/inventory_staging_audit_report.md
+
+# AutoCount inventory staging warning review local outputs/config
+autocount_inventory_staging_warning_review_outputs/
+inventory_staging_warning_review_outputs/
+autocount_outputs/**/inventory_staging_warning_review_manifest.json
+autocount_outputs/**/inventory_staging_warning_review_report.md
