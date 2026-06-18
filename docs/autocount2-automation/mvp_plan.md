@@ -2,6 +2,12 @@
 
 This plan phases the work from API discovery to dashboards and AI summaries. It keeps all production AutoCount automation read-only until the reporting foundation is stable.
 
+The current scope focus is the
+[inventory intelligence foundation](inventory_intelligence_scope.md): read-only
+inventory, PO, stock movement, and purchasing analytics. CoA, GL, bank opening,
+and full accounting cutover work are parked unless a separate finance-owned
+scope approves them later.
+
 ## Phase 0 - API Discovery
 
 Goal: confirm the safest read path before writing production automation.

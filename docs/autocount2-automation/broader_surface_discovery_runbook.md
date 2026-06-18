@@ -15,6 +15,9 @@ warehouse models.
 
 Every candidate remains `Needs reconciliation` until it is compared with
 AutoCount UI/report outputs and approved for a future extraction design.
+For the current inventory and purchasing analytics focus, use the
+[inventory intelligence scope](inventory_intelligence_scope.md) to decide which
+candidate groups matter next; CoA, GL, and bank accounting work are parked.
 
 ## Required Account
 

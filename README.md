@@ -41,6 +41,7 @@ Raw CSVs stay local and must not be committed. Paste back only reviewed manifest
 - [AutoCount stock extraction runbook](docs/autocount_stock_extraction.md)
 - [AutoCount 2 automation architecture](docs/autocount2-automation/architecture.md)
 - [AutoCount 2 API research](docs/autocount2-automation/api_research.md)
+- [Inventory intelligence scope](docs/autocount2-automation/inventory_intelligence_scope.md)
 - [AutoCount 2 MVP plan](docs/autocount2-automation/mvp_plan.md)
 - [Extraction surface decision pack](docs/autocount2-automation/extraction_surface_decision.md)
 - [AC2 read-only SQL login validation runbook](docs/autocount2-automation/readonly_sql_login_runbook.md)

@@ -6,6 +6,8 @@ Use this extractor only after the selected-surface aggregate reconciliation has
 run and the goal is to capture the current AC2 database snapshot for local
 review. This is a narrow read-only raw snapshot export for selected surfaces; it
 does not prove business correctness and it does not approve migration/import.
+For the current inventory analytics direction, see the
+[inventory intelligence scope](inventory_intelligence_scope.md).
 
 The current AC2 data may be immature, pre-go-live, test, or partial. The output
 is not business-reconciled, and every run remains `Needs reconciliation` with
