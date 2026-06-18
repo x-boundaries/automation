@@ -1,0 +1,198 @@
+{
+  "job": "autocount_inventory_operation_discovery",
+  "connection_string_env": "AUTOCOUNT_READONLY_SQL_CONNECTION_STRING",
+  "output_root": "C:\\XB\\autocount_outputs\\probe\\inventory_operations",
+  "schemas": [
+    "dbo"
+  ],
+  "expected_server": "localhost\\A2006",
+  "expected_database": "AED_XBOUNDARIES",
+  "expected_login": "xb_ac2_readonly",
+  "reject_server_patterns": [
+    "SQLEXPRESS"
+  ],
+  "reject_databases": [
+    "AED_XBoundaries",
+    "A893478"
+  ],
+  "include_row_counts": true,
+  "candidate_families": {
+    "grn_receiving": {
+      "label": "GRN / goods receiving",
+      "keyword_hints": [
+        "GRN",
+        "GoodsReceive",
+        "GoodsReceived",
+        "GoodsReceipt",
+        "Receive",
+        "Receipt",
+        "PurchaseReceive",
+        "StockReceive"
+      ],
+      "object_aliases": {
+        "GR": "GRN",
+        "GRDTL": "GRN"
+      },
+      "evidence_columns": [
+        "DocNo",
+        "DocDate",
+        "CreditorCode",
+        "Supplier",
+        "ItemCode",
+        "Qty"
+      ]
+    },
+    "stock_transfer": {
+      "label": "Stock transfer / inter-location movement",
+      "keyword_hints": [
+        "Transfer",
+        "StockTransfer",
+        "LocationTransfer",
+        "Xfer",
+        "FromLocation",
+        "ToLocation"
+      ],
+      "evidence_columns": [
+        "DocNo",
+        "DocDate",
+        "FromLocation",
+        "ToLocation",
+        "ItemCode",
+        "Qty"
+      ]
+    },
+    "stock_location": {
+      "label": "Stock location / location master",
+      "keyword_hints": [
+        "Location",
+        "StockLocation",
+        "LocationCode",
+        "Warehouse",
+        "WH",
+        "Branch"
+      ],
+      "evidence_columns": [
+        "Location",
+        "LocationCode",
+        "Warehouse",
+        "BranchCode",
+        "Description"
+      ]
+    },
+    "item_product_attributes": {
+      "label": "Richer item/product attributes",
+      "keyword_hints": [
+        "Item",
+        "ItemCode",
+        "UOM",
+        "Barcode",
+        "BarCode",
+        "Brand",
+        "Category",
+        "Class",
+        "Group",
+        "LeadTime",
+        "Supplier",
+        "Creditor"
+      ],
+      "evidence_columns": [
+        "ItemCode",
+        "UOM",
+        "Barcode",
+        "BarCode",
+        "Brand",
+        "Category",
+        "Class",
+        "Group"
+      ]
+    },
+    "movement_semantics": {
+      "label": "Stock movement document type semantics",
+      "keyword_hints": [
+        "DocType",
+        "DocNo",
+        "DocDate",
+        "SourceType",
+        "Ref",
+        "Reference",
+        "Module",
+        "TransType",
+        "MovementType",
+        "Qty",
+        "InQty",
+        "OutQty",
+        "BalanceQty"
+      ],
+      "evidence_columns": [
+        "DocType",
+        "DocNo",
+        "DocDate",
+        "SourceType",
+        "TransType",
+        "MovementType",
+        "Qty",
+        "InQty",
+        "OutQty",
+        "BalanceQty"
+      ],
+      "required_object_keywords_any": [
+        "Stock",
+        "Item",
+        "Transfer",
+        "GR",
+        "Receive",
+        "PO",
+        "Purchase"
+      ]
+    },
+    "purchasing_supplier_context": {
+      "label": "Supplier lead-time or purchasing context",
+      "keyword_hints": [
+        "Supplier",
+        "Creditor",
+        "LeadTime",
+        "Delivery",
+        "ETA",
+        "Purchase",
+        "PO",
+        "Outstanding",
+        "TransferedQty",
+        "BackOrder"
+      ],
+      "evidence_columns": [
+        "Supplier",
+        "CreditorCode",
+        "LeadTime",
+        "Delivery",
+        "ETA",
+        "Purchase",
+        "BackOrder"
+      ]
+    },
+    "outstanding_po_transit_support": {
+      "label": "Outstanding PO / stock-in-transit support",
+      "keyword_hints": [
+        "PO",
+        "Purchase",
+        "Outstanding",
+        "TransferedQty",
+        "BackOrder",
+        "Transit",
+        "InTransit"
+      ],
+      "evidence_columns": [
+        "DocNo",
+        "CreditorCode",
+        "ItemCode",
+        "OutstandingQty",
+        "TransferedQty",
+        "BackOrder"
+      ],
+      "known_surface_boosts": [
+        "dbo.PO",
+        "dbo.PODTL",
+        "dbo.vPurchaseOrder"
+      ]
+    }
+  }
+}

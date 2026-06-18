@@ -102,6 +102,11 @@ out of scope.
 - Movement document type semantics.
 - Supplier lead-time signal if available.
 
+Use the
+[inventory operation surface discovery runbook](inventory_operation_surface_discovery_runbook.md)
+to produce the next metadata-only candidate shortlist before expanding any
+extraction profile.
+
 ## Operating Guardrails
 
 - No SQL write-back.
