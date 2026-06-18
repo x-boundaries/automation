@@ -2,6 +2,12 @@
 
 This design assumes AutoCount Accounting 2.0 and Microsoft SQL Server 2019 run on the same existing Windows VM. It optimizes for low/no additional cost, read-only automation first, and a native Windows approach.
 
+Current near-term scope is narrowed by the
+[inventory intelligence scope](inventory_intelligence_scope.md): manual
+read-only inventory, PO, stock movement, and purchasing analytics foundation
+first. Scheduler, write-back, CoA, GL opening, bank opening, and full accounting
+cutover work remain future/parked unless separately approved.
+
 ## Architecture Goals
 
 - Keep AutoCount production tables protected.

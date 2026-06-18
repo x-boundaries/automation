@@ -23,6 +23,9 @@ stock rows.
 
 For the verified AC2 smoke workflow, use the
 [Phase 1 AC2 stock extraction smoke runbook](autocount2-automation/phase1_stock_extract_smoke_runbook.md).
+For the current inventory intelligence objective and parked accounting scope,
+see the
+[AutoCount 2.0 inventory intelligence scope](autocount2-automation/inventory_intelligence_scope.md).
 
 ## What Gets Extracted
 
