@@ -1,0 +1,9 @@
+{
+  "job": "autocount_inventory_staging_audit",
+  "output_root": "C:\\XB\\autocount_outputs\\review\\inventory_staging_audit",
+  "notes": [
+    "Local staging contract audit only.",
+    "No database connection or credentials are required.",
+    "No dashboard, scheduler, write-back, import/API, or production database loading is performed."
+  ]
+}
