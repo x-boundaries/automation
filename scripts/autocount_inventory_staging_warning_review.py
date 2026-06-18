@@ -69,6 +69,39 @@ OPERATIONAL_MOVEMENT_TABLES = {
     "stg_ac2_transfer_header",
     "stg_ac2_transfer_line",
 }
+SOURCE_TO_STAGING_TABLE = {
+    "dbo.GRDTL": "stg_ac2_grn_line",
+    "dbo.vGoodsReceivedNoteDetail": "stg_ac2_grn_line",
+    "dbo.vGoodsReceivedNoteSubDetail": "stg_ac2_grn_line",
+    "dbo.vStockReceiveDetail": "stg_ac2_stock_receive_line",
+    "dbo.vStockTransferDetail": "stg_ac2_transfer_line",
+    "dbo.PODTL": "stg_ac2_purchase_order_line",
+}
+SOURCE_COLUMN_TO_STAGING_FIELD = {
+    "stg_ac2_grn_line": {
+        "DocNo": ["grn_doc_no"],
+        "DtlKey": ["grn_dtl_key"],
+        "ItemCode": ["item_code"],
+    },
+    "stg_ac2_stock_receive_line": {
+        "DocNo": ["receive_doc_no"],
+        "ItemCode": ["item_code"],
+    },
+    "stg_ac2_transfer_line": {
+        "DocNo": ["transfer_doc_no"],
+        "ItemCode": ["item_code"],
+    },
+    "stg_ac2_purchase_order_line": {
+        "DocKey": ["po_doc_key"],
+        "DtlKey": ["po_dtl_key"],
+        "ItemCode": ["item_code"],
+        "Description": ["description"],
+        "UOM": ["uom"],
+        "Qty": ["qty", "outstanding_qty_candidate"],
+        "TransferedQty": ["transferred_qty", "outstanding_qty_candidate"],
+        "Location": ["location"],
+    },
+}
 
 
 def load_manifest(path):
@@ -93,6 +126,7 @@ def run_warning_review(manifest_path, output_root=None, now=None):
     header_evidence = []
     row_counts = {}
     zero_row_tables = []
+    source_column_diagnostics = []
 
     try:
         source_manifest = load_manifest(manifest_path)
@@ -107,6 +141,7 @@ def run_warning_review(manifest_path, output_root=None, now=None):
         row_counts = collect_row_counts(source_manifest, build_manifest)
         zero_row_tables = collect_zero_row_tables(source_manifest, row_counts)
         header_evidence = collect_header_evidence(build_manifest, selected_staging_run_path, row_counts, exceptions)
+        source_column_diagnostics = collect_source_column_diagnostics(build_manifest, selected_staging_run_path, exceptions)
     except Exception as exc:  # noqa: BLE001 - local review should emit a redacted failure manifest.
         exceptions.append(sanitize_text(str(exc)))
 
@@ -137,6 +172,7 @@ def run_warning_review(manifest_path, output_root=None, now=None):
         row_counts=row_counts,
         zero_row_tables=zero_row_tables,
         header_evidence=header_evidence,
+        source_column_diagnostics=source_column_diagnostics,
         warning_classifications=warning_classifications,
         dashboard_blockers=dashboard_blockers,
         carried_forward_warning_codes=carried_forward_warning_codes,
@@ -290,6 +326,65 @@ def read_csv_headers(path):
         return next(reader, [])
 
 
+def collect_source_column_diagnostics(build_manifest, staging_run_path, exceptions):
+    diagnostics = []
+    extract_manifest = load_declared_extract_manifest(build_manifest, staging_run_path)
+    for item in extract_manifest.get("schema_metadata", []) + extract_manifest.get("surface_exports", []):
+        diagnostic = build_source_column_diagnostic(item)
+        if diagnostic:
+            diagnostics.append(diagnostic)
+    return unique_preserve_order(diagnostics)
+
+
+def load_declared_extract_manifest(build_manifest, staging_run_path):
+    raw_extract_run_path = build_manifest.get("source_extract_run_path") if build_manifest else ""
+    if not raw_extract_run_path:
+        return {}
+    extract_run_path = Path(raw_extract_run_path).resolve(strict=False)
+    repo_root = Path(__file__).resolve().parents[1].resolve(strict=False)
+    if _is_relative_to(extract_run_path, repo_root):
+        return {}
+    if _is_relative_to(staging_run_path.resolve(strict=False), extract_run_path):
+        return {}
+    extract_manifest_path = extract_run_path / "inventory_operation_extract_manifest.json"
+    if not extract_manifest_path.exists():
+        return {}
+    return load_manifest(extract_manifest_path)
+
+
+def build_source_column_diagnostic(item):
+    if not isinstance(item, dict):
+        return {}
+    source_surface = sanitize_text(
+        item.get("source_surface")
+        or item.get("object_id")
+        or ".".join([part for part in [item.get("schema_name"), item.get("object_name")] if part])
+    )
+    staging_table = SOURCE_TO_STAGING_TABLE.get(source_surface)
+    if not source_surface or not staging_table:
+        return {}
+    expected = unique_list(item.get("expected_source_columns") or item.get("expected_columns") or [])
+    present = unique_list(item.get("present_source_columns") or item.get("selected_columns") or [])
+    missing = unique_list(item.get("missing_source_columns") or item.get("missing_expected_columns") or [])
+    if not (expected or present or missing):
+        return {}
+    return {
+        "source_surface": source_surface,
+        "staging_table": staging_table,
+        "expected_source_columns": expected,
+        "present_source_columns": present,
+        "missing_source_columns": missing,
+        "dependent_staging_fields": build_dependent_staging_fields(staging_table, missing),
+        "classification": "true_source_column_gap" if missing else "source_column_gap_not_confirmed",
+        "dashboard_impact": "dashboard_blocker_when_data_arrives" if missing else "review_only",
+    }
+
+
+def build_dependent_staging_fields(staging_table, source_columns):
+    mapping = SOURCE_COLUMN_TO_STAGING_FIELD.get(staging_table, {})
+    return {column: mapping.get(column, []) for column in source_columns if mapping.get(column)}
+
+
 def classify_warning_set(warnings, carried_forward_warning_codes, zero_row_tables):
     classifications = [classify_warning(warning) for warning in warnings]
     for warning in carried_forward_warning_codes:
@@ -395,6 +490,7 @@ def build_review_manifest(
     row_counts,
     zero_row_tables,
     header_evidence,
+    source_column_diagnostics,
     warning_classifications,
     dashboard_blockers,
     carried_forward_warning_codes,
@@ -416,6 +512,7 @@ def build_review_manifest(
         "row_counts": row_counts,
         "zero_row_tables": zero_row_tables,
         "header_evidence": header_evidence,
+        "source_column_diagnostics": source_column_diagnostics,
         "warning_classifications": warning_classifications,
         "dashboard_blockers": dashboard_blockers,
         "carried_forward_warning_codes": carried_forward_warning_codes,
@@ -476,6 +573,17 @@ def render_report(manifest):
         lines.append(f"- File name: `{item['file_name']}`")
         lines.append(f"- Expected headers: {', '.join(item['expected_header_names'])}")
         lines.append(f"- Present headers: {', '.join(item['present_header_names'])}")
+    lines.extend(["", "## Source Column Diagnostics", ""])
+    for item in manifest.get("source_column_diagnostics", []) or ["none"]:
+        if item == "none":
+            lines.append("- none")
+        else:
+            lines.append(
+                f"- `{item['source_surface']}` -> `{item['staging_table']}`: {item['classification']} ({item['dashboard_impact']})"
+            )
+            lines.append(f"  - Expected source columns: {', '.join(item['expected_source_columns']) or 'unknown'}")
+            lines.append(f"  - Present source columns: {', '.join(item['present_source_columns']) or 'unknown'}")
+            lines.append(f"  - Missing source columns: {', '.join(item['missing_source_columns']) or 'none'}")
     lines.extend(["", "## Dashboard Blockers When Data Arrives", ""])
     for item in manifest.get("dashboard_blockers", []) or ["none"]:
         if item == "none":
@@ -524,6 +632,10 @@ def unique_preserve_order(values):
             seen.add(marker)
             result.append(value)
     return result
+
+
+def unique_list(values):
+    return list(unique_preserve_order([sanitize_text(value) for value in values if str(value).strip()]))
 
 
 def _coerce_datetime(value):
