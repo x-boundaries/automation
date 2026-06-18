@@ -343,12 +343,51 @@ class SelectedSurfaceExtractTests(unittest.TestCase):
             self.assertEqual(saved_manifest["context"]["current_database"], "AED_XBOUNDARIES")
             self.assertEqual(saved_manifest["row_counts"]["dbo.Debtor"], 1)
             self.assertEqual(saved_manifest["row_counts"]["dbo.PODTL"], 1)
+            self.assertIn("exported_files", saved_manifest)
+            stable_exported_fields = {
+                "surface_name",
+                "surface_id",
+                "schema_name",
+                "object_name",
+                "object_id",
+                "row_count",
+                "output_path",
+                "file_name",
+                "decision",
+                "final_production_selected",
+                "data_maturity",
+                "business_reconciliation_status",
+            }
+            self.assertEqual(len(saved_manifest["exported_files"]), len(saved_manifest["selected_surfaces_exported"]))
+            for item in saved_manifest["exported_files"]:
+                self.assertTrue(stable_exported_fields.issubset(item))
+                self.assertEqual(item["object_id"], item["surface_id"])
+                self.assertEqual(item["decision"], "Needs reconciliation")
+                self.assertFalse(item["final_production_selected"])
+                self.assertEqual(item["data_maturity"], "immature_pre_go_live")
+                self.assertEqual(item["business_reconciliation_status"], "not_reconciled")
+                self.assertEqual(Path(item["output_path"]).name, item["file_name"])
+            debtor_export = next(
+                item for item in saved_manifest["exported_files"] if item["surface_id"] == "dbo.Debtor"
+            )
+            self.assertEqual(debtor_export["surface_name"], "Debtor")
+            self.assertEqual(debtor_export["schema_name"], "dbo")
+            self.assertEqual(debtor_export["object_name"], "Debtor")
+            self.assertEqual(debtor_export["object_id"], "dbo.Debtor")
+            self.assertEqual(debtor_export["row_count"], 1)
+            self.assertEqual(debtor_export["file_name"], "dbo_Debtor.csv")
             self.assertIn("dbo.GLDTL", {item["surface_id"] for item in saved_manifest["skipped_surfaces"]})
             self.assertIn("coa_account_master", {item["surface_id"] for item in saved_manifest["skipped_surfaces"]})
+            stable_skipped_fields = {"surface_name", "surface_id", "schema_name", "object_name", "reason"}
+            self.assertTrue(
+                all(stable_skipped_fields.issubset(item) for item in saved_manifest["skipped_surfaces"])
+            )
             self.assert_path_under(saved_manifest["storage"]["run_path"], tmpdir)
             self.assert_path_under(saved_manifest["storage"]["manifest"], tmpdir)
             for output_path in saved_manifest["output_files"].values():
                 self.assert_path_under(output_path, tmpdir)
+            for item in saved_manifest["exported_files"]:
+                self.assert_path_under(item["output_path"], tmpdir)
 
             debtor_path = Path(saved_manifest["output_files"]["dbo.Debtor"])
             self.assertTrue(debtor_path.read_bytes().startswith(b"\xef\xbb\xbf"))
@@ -367,6 +406,16 @@ class SelectedSurfaceExtractTests(unittest.TestCase):
             for warning in extract.WARNINGS:
                 self.assertIn(warning, report_text)
             self.assertIn("CoA/account master remains unresolved.", report_text)
+            for item in saved_manifest["exported_files"]:
+                self.assertIn(
+                    f"- `{item['surface_id']}`: {item['row_count']} rows -> {item['output_path']}",
+                    report_text,
+                )
+            manifest_text = json.dumps(saved_manifest, sort_keys=True)
+            self.assertNotIn("Formula Test", manifest_text)
+            self.assertNotIn("Widget", manifest_text)
+            self.assertNotIn("SKU-001", manifest_text)
+            self.assertNotIn("'=XB001", manifest_text)
             self.assertTrue(source.queries)
             self.assertTrue(all("SELECT *" not in query.upper() for query in source.queries))
 

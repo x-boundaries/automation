@@ -269,6 +269,7 @@ def run_extraction(config, source=None, output_root=None, now=None):
     skipped_surfaces = skipped_surface_specs(config)
     row_counts = {}
     output_files = {}
+    exported_files = []
     selected_surfaces_exported = []
     exceptions = []
     context = {}
@@ -284,8 +285,11 @@ def run_extraction(config, source=None, output_root=None, now=None):
                 write_csv(output_path, rows, surface_spec["columns"])
                 row_counts[surface_spec["surface_id"]] = len(rows)
                 output_files[surface_spec["surface_id"]] = str(output_path)
+                exported_file = build_exported_file_record(surface_spec, len(rows), output_path)
+                exported_files.append(exported_file)
                 selected_surfaces_exported.append(
                     {
+                        **exported_file,
                         "surface_id": surface_spec["surface_id"],
                         "schema_name": surface_spec["schema_name"],
                         "object_name": surface_spec["object_name"],
@@ -324,6 +328,7 @@ def run_extraction(config, source=None, output_root=None, now=None):
         "business_reconciliation_status": BUSINESS_RECONCILIATION_STATUS,
         "source_of_truth_status": SOURCE_OF_TRUTH_STATUS,
         "warnings": list(WARNINGS),
+        "exported_files": exported_files,
         "selected_surfaces_exported": selected_surfaces_exported,
         "skipped_surfaces": skipped_surfaces,
         "row_counts": row_counts,
@@ -353,6 +358,24 @@ def run_extraction(config, source=None, output_root=None, now=None):
     )
     (run_path / "selected_surface_extract_report.md").write_text(render_report(json_manifest), encoding="utf-8")
     return json_manifest
+
+
+def build_exported_file_record(surface_spec, row_count, output_path):
+    object_id = make_surface_id(surface_spec["schema_name"], surface_spec["object_name"])
+    return {
+        "surface_name": surface_spec.get("config_key") or surface_spec["object_name"],
+        "surface_id": surface_spec["surface_id"],
+        "schema_name": surface_spec["schema_name"],
+        "object_name": surface_spec["object_name"],
+        "object_id": object_id,
+        "row_count": row_count,
+        "output_path": str(output_path),
+        "file_name": output_path.name,
+        "decision": NEEDS_RECONCILIATION,
+        "final_production_selected": False,
+        "data_maturity": DATA_MATURITY,
+        "business_reconciliation_status": BUSINESS_RECONCILIATION_STATUS,
+    }
 
 
 def build_run_plan(config, output_root=None, now=None):
@@ -413,6 +436,7 @@ def skipped_surface_specs(config):
         if reason:
             skipped.append(
                 {
+                    "surface_name": surface.get("config_key", surface.get("object_name", "")),
                     "surface_id": surface["surface_id"],
                     "schema_name": surface.get("schema_name", ""),
                     "object_name": surface.get("object_name", ""),
@@ -422,6 +446,7 @@ def skipped_surface_specs(config):
     if "coa_account_master" not in {item["surface_id"] for item in skipped}:
         skipped.append(
             {
+                "surface_name": "coa_account_master",
                 "surface_id": "coa_account_master",
                 "schema_name": "",
                 "object_name": "",
@@ -617,11 +642,13 @@ def render_report(manifest):
             "",
         ]
     )
-    for surface in manifest["selected_surfaces_exported"]:
+    exported_files = manifest.get("exported_files") or manifest.get("selected_surfaces_exported", [])
+    for surface in exported_files:
         lines.append(
-            f"- `{surface['surface_id']}`: {surface['row_count']} rows -> {surface['output_file']}"
+            f"- `{surface['surface_id']}`: {surface['row_count']} rows -> "
+            f"{surface.get('output_path') or surface.get('output_file', '')}"
         )
-    if not manifest["selected_surfaces_exported"]:
+    if not exported_files:
         lines.append("- None")
     lines.extend(["", "## Skipped Surfaces", ""])
     for surface in manifest["skipped_surfaces"]:

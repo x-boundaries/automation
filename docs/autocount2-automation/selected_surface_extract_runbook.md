@@ -75,6 +75,37 @@ For a bounded dry-review sample, set `max_rows` in the local config. `business_d
 and `as_of_date` are metadata only; the extractor does not filter by date unless
 a future reviewed config explicitly changes the SQL design.
 
+## Safe Manifest Summary
+
+After a run, summarize the manifest metadata without reading or printing CSV
+contents:
+
+```powershell
+$runPath = 'C:\XB\autocount_outputs\extract\selected_surfaces\selected_surface_extract_YYYYMMDD_HHMMSS_RUNID'
+$manifestPath = Join-Path $runPath 'selected_surface_extract_manifest.json'
+$manifest = Get-Content -Raw -Path $manifestPath | ConvertFrom-Json
+
+[pscustomobject]@{
+  run_path = $manifest.storage.run_path
+  status = $manifest.status
+  exception_count = $manifest.exception_count
+  data_maturity = $manifest.data_maturity
+  business_reconciliation_status = $manifest.business_reconciliation_status
+} | Format-List
+
+'Exported files:'
+$manifest.exported_files |
+  Select-Object surface_name, surface_id, schema_name, object_name, object_id, row_count,
+    file_name, output_path, decision, final_production_selected, data_maturity,
+    business_reconciliation_status |
+  Format-Table -AutoSize -Wrap
+
+'Skipped surfaces:'
+$manifest.skipped_surfaces |
+  Select-Object surface_name, surface_id, schema_name, object_name, reason |
+  Format-Table -AutoSize -Wrap
+```
+
 ## Default Scope
 
 Enabled by default:
