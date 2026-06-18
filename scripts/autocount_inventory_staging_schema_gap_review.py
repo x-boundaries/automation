@@ -112,19 +112,20 @@ def run_schema_gap_review(manifest_path, output_root=None, now=None):
     except Exception as exc:  # noqa: BLE001 - local review writes redacted failure output.
         exceptions.append(sanitize_text(str(exc)))
 
-    headers_by_table = {item["table_name"]: item["present_header_names"] for item in header_evidence}
+    present_headers_by_table = {item["table_name"]: item["present_header_names"] for item in header_evidence}
+    expected_headers_by_table = {item["table_name"]: item["expected_header_names"] for item in header_evidence}
     source_schema_gaps = [
-        classify_schema_gap(item, headers_by_table)
+        classify_schema_gap(item, expected_headers_by_table, present_headers_by_table)
         for item in source_manifest.get("warning_classifications", [])
         if item.get("classification") == "source_schema_gap"
     ]
     numeric_candidate_reviews = [
-        classify_numeric_candidate(item.get("warning_code", ""), headers_by_table)
+        classify_numeric_candidate(item.get("warning_code", ""), present_headers_by_table)
         for item in source_manifest.get("warning_classifications", [])
         if item.get("classification") == "numeric_candidate_not_computable"
     ]
     duplicate_overlap_reviews = [
-        review_duplicate_overlap(item.get("warning_code", ""), row_counts, headers_by_table)
+        review_duplicate_overlap(item.get("warning_code", ""), row_counts, present_headers_by_table)
         for item in source_manifest.get("warning_classifications", [])
         if item.get("classification") == "review_only_duplicate_source_overlap"
     ]
@@ -228,17 +229,25 @@ def read_csv_headers(path):
         return next(csv.reader(handle), [])
 
 
-def classify_schema_gap(warning_item, headers_by_table):
+def classify_schema_gap(warning_item, expected_headers_by_table, present_headers_by_table):
     warning_code = sanitize_text(warning_item.get("warning_code", ""))
     source_surface = warning_code.split(":", 1)[1] if ":" in warning_code else sanitize_text(warning_item.get("source", ""))
     staging_table = SOURCE_TO_STAGING_TABLE.get(source_surface, "unknown")
-    present_headers = headers_by_table.get(staging_table, [])
+    expected_headers = list(expected_headers_by_table.get(staging_table, []))
+    present_headers = list(present_headers_by_table.get(staging_table, []))
+    present_header_set = set(present_headers)
+    missing_expected_headers = [header for header in expected_headers if header not in present_header_set]
     return {
         "warning_code": warning_code,
         "source_surface": source_surface,
         "staging_table": staging_table,
-        "missing_expected_headers": ["missing_expected_columns"],
+        "expected_header_names": expected_headers,
         "present_header_names": present_headers,
+        "missing_expected_headers": missing_expected_headers,
+        "source_column_gap_detail": (
+            "source warning did not include exact source column names; "
+            "review uses mapped staging table expected headers as conservative proxy"
+        ),
         "classification": "needs_source_column_mapping",
         "decision_flags": [
             "needs_source_column_mapping",
@@ -416,8 +425,11 @@ def render_report(manifest):
             lines.append("- none")
         else:
             lines.append(f"- `{item['source_surface']}` -> `{item['staging_table']}`: {', '.join(item['decision_flags'])}")
-            lines.append(f"  - Missing expected headers: {', '.join(item['missing_expected_headers'])}")
+            lines.append(f"  - Expected headers: {', '.join(item['expected_header_names'])}")
             lines.append(f"  - Present headers: {', '.join(item['present_header_names'])}")
+            lines.append(f"  - Computed missing headers: {', '.join(item['missing_expected_headers']) or 'none'}")
+            if item.get("source_column_gap_detail"):
+                lines.append(f"  - Source column gap detail: {item['source_column_gap_detail']}")
     lines.extend(["", "## Numeric Candidate Reviews", ""])
     for item in manifest.get("numeric_candidate_reviews", []) or ["none"]:
         if item == "none":

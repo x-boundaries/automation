@@ -34,7 +34,13 @@ class InventoryStagingSchemaGapReviewTests(unittest.TestCase):
         self.assertEqual(len(schema_items), 1)
         self.assertEqual(schema_items[0]["classification"], "needs_source_column_mapping")
         self.assertIn("dashboard_blocker_when_data_arrives", schema_items[0]["decision_flags"])
-        self.assertEqual(schema_items[0]["missing_expected_headers"], ["missing_expected_columns"])
+        self.assertIn("grn_dtl_key", schema_items[0]["expected_header_names"])
+        self.assertNotIn("grn_dtl_key", schema_items[0]["present_header_names"])
+        self.assertEqual(schema_items[0]["missing_expected_headers"], ["grn_dtl_key"])
+        self.assertEqual(
+            schema_items[0]["source_column_gap_detail"],
+            "source warning did not include exact source column names; review uses mapped staging table expected headers as conservative proxy",
+        )
         self.assertIn("grn_doc_no", schema_items[0]["present_header_names"])
 
     def test_numeric_candidate_not_computable_classification(self):
@@ -137,6 +143,10 @@ class InventoryStagingSchemaGapReviewTests(unittest.TestCase):
 
         for raw_value in ["SUP-001", "PO-001", "ITEM-001", "Synthetic Supplier", "Synthetic item", "MAIN"]:
             self.assertNotIn(raw_value, report_text)
+        self.assertIn("Expected headers: grn_doc_no, grn_dtl_key, item_code", report_text)
+        self.assertIn("Present headers: grn_doc_no, item_code", report_text)
+        self.assertIn("Computed missing headers: grn_dtl_key", report_text)
+        self.assertIn("Source column gap detail: source warning did not include exact source column names", report_text)
         self.assertIn("dbo.GRDTL", report_text)
         self.assertIn("stg_ac2_supplier", report_text)
 
@@ -201,13 +211,16 @@ def write_fixture_warning_review(staging_run, warning_run):
     header_evidence = []
     for table_name, headers in review.EXPECTED_STAGING_HEADERS.items():
         rows = rows_by_table[table_name]
-        write_csv(staging_run / f"{table_name}.csv", headers, rows)
+        csv_headers = list(headers)
+        if table_name == "stg_ac2_grn_line":
+            csv_headers.remove("grn_dtl_key")
+        write_csv(staging_run / f"{table_name}.csv", csv_headers, rows)
         row_counts[table_name] = len(rows)
         header_evidence.append(
             {
                 "table_name": table_name,
                 "expected_header_names": headers,
-                "present_header_names": headers,
+                "present_header_names": csv_headers,
                 "row_count": len(rows),
                 "file_name": f"{table_name}.csv",
                 "output_path": str(staging_run / f"{table_name}.csv"),
