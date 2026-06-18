@@ -135,3 +135,9 @@ autocount_inventory_staging_warning_review_outputs/
 inventory_staging_warning_review_outputs/
 autocount_outputs/**/inventory_staging_warning_review_manifest.json
 autocount_outputs/**/inventory_staging_warning_review_report.md
+
+# AutoCount inventory staging schema gap review local outputs/config
+autocount_inventory_staging_schema_gap_review_outputs/
+inventory_staging_schema_gap_review_outputs/
+autocount_outputs/**/inventory_staging_schema_gap_review_manifest.json
+autocount_outputs/**/inventory_staging_schema_gap_review_report.md
