@@ -123,3 +123,9 @@ inventory_staging_readiness_outputs/
 # AutoCount inventory staging build local outputs/config
 autocount_inventory_staging_build_outputs/
 inventory_staging_build_outputs/
+
+# AutoCount inventory staging audit local outputs/config
+autocount_inventory_staging_audit_outputs/
+inventory_staging_audit_outputs/
+autocount_outputs/**/inventory_staging_audit_manifest.json
+autocount_outputs/**/inventory_staging_audit_report.md
