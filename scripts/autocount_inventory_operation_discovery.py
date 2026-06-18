@@ -39,6 +39,131 @@ PARKED_SCOPE_OBJECT_PATTERNS = [
     r"APInvoice",
 ]
 
+STRONG_SURFACE_BOOSTS_BY_FAMILY = {
+    "grn_receiving": {
+        "dbo.vGoodsReceivedNote",
+        "dbo.vGoodsReceivedNoteDetail",
+        "dbo.vGoodsReceivedNoteSubDetail",
+        "dbo.GR",
+        "dbo.GRDTL",
+        "dbo.vStockReceive",
+        "dbo.vStockReceiveDetail",
+    },
+    "stock_transfer": {
+        "dbo.vStockTransfer",
+        "dbo.vStockTransferDetail",
+        "dbo.XFER",
+    },
+    "outstanding_po_transit_support": {
+        "dbo.vPurchaseOrder",
+        "dbo.PO",
+        "dbo.PODTL",
+    },
+    "movement_semantics": {
+        "dbo.vGoodsReceivedNote",
+        "dbo.vGoodsReceivedNoteDetail",
+        "dbo.vGoodsReceivedNoteSubDetail",
+        "dbo.GR",
+        "dbo.GRDTL",
+        "dbo.vStockReceive",
+        "dbo.vStockReceiveDetail",
+        "dbo.vStockTransfer",
+        "dbo.vStockTransferDetail",
+        "dbo.XFER",
+        "dbo.vPurchaseOrder",
+        "dbo.PO",
+        "dbo.PODTL",
+        "dbo.StockDTL",
+    },
+    "item_product_attributes": {
+        "dbo.Item",
+        "dbo.ItemUOM",
+        "dbo.ItemBarcode",
+        "dbo.vItem",
+        "dbo.vItemUOM",
+        "dbo.vItemUOMBalQty",
+    },
+    "stock_location": {
+        "dbo.Location",
+        "dbo.StockLocation",
+        "dbo.vLocation",
+        "dbo.vStockLocation",
+    },
+    "purchasing_supplier_context": {
+        "dbo.Creditor",
+        "dbo.vCreditor",
+        "dbo.SupplierItem",
+        "dbo.vPurchaseOrder",
+        "dbo.vGoodsReceivedNote",
+    },
+}
+
+STRONG_SURFACE_BOOST = 55
+PREFERRED_COLUMN_BOOST = 12
+
+PREFERRED_COLUMNS_BY_FAMILY = {
+    "movement_semantics": {
+        "FromDocType",
+        "FromDocNo",
+        "DocType",
+        "DocNo",
+        "TransferedQty",
+        "SmallestQty",
+        "LocationBalQty",
+        "BatchBalQty",
+        "PostToStock",
+    },
+    "item_product_attributes": {
+        "Item",
+        "ItemCode",
+        "UOM",
+        "BarCode",
+        "Barcode",
+        "Brand",
+        "Category",
+        "Class",
+        "Group",
+        "LeadTime",
+        "SupplierItemCode",
+        "DefaultSupplier",
+        "StockControl",
+    },
+    "stock_location": {
+        "Location",
+        "LocationCode",
+        "FromLocation",
+        "ToLocation",
+        "PurchaseLocation",
+        "SalesLocation",
+        "StockLocation",
+        "Warehouse",
+    },
+    "stock_transfer": {"FromLocation", "ToLocation", "DocNo", "DocDate", "ItemCode", "Qty", "SmallestQty"},
+    "grn_receiving": {"DocNo", "DocDate", "CreditorCode", "ItemCode", "Qty", "SmallestQty", "BatchBalQty"},
+    "outstanding_po_transit_support": {"DocNo", "ItemCode", "TransferedQty", "PostToStock", "PurchaseLocation"},
+    "purchasing_supplier_context": {"CreditorCode", "SupplierItemCode", "DefaultSupplier", "LeadTime", "ETA"},
+}
+
+NON_INVENTORY_OBJECT_PATTERNS = [
+    (r"^Pos", "pos_only_surface"),
+    (r"SetMeal", "pos_set_meal_surface"),
+    (r"CashPurchase", "cash_purchase_accounting_surface"),
+    (r"PurchaseInvoice", "purchase_invoice_accounting_surface"),
+    (r"(^|[^A-Za-z0-9])(AP|AR)([^A-Za-z0-9]|$)", "ap_ar_accounting_surface"),
+    (r"Payment|Deposit|Refund|Contra", "payment_deposit_refund_contra_surface"),
+]
+
+GENERIC_NOISE_COLUMN_PATTERNS = [
+    (r"^Category(Max|Min)Qty", "category_min_max_quantity_noise"),
+    (r"^Point", "pos_point_noise"),
+    (r"WHT|Withholding", "wht_tax_noise"),
+    (r"Tax", "generic_tax_noise"),
+    (r"PostCode|ZipCode", "postcode_noise"),
+    (r"Email", "email_contact_noise"),
+    (r"Contact|Phone|Tel|Fax|Address", "address_contact_noise"),
+    (r"Peppol|EInvoice|E-Invoice", "einvoice_peppol_noise"),
+]
+
 DEFAULT_CANDIDATE_FAMILIES = {
     "grn_receiving": {
         "label": "GRN / goods receiving",
@@ -161,6 +286,17 @@ def run_discovery(config, source=None, output_root=None, include_row_counts=None
     candidates_by_family = {family_name: [] for family_name in families}
     exceptions = []
     status = "success"
+    warnings = [
+        "This is metadata only and does not approve extraction.",
+        "No raw ERP/business rows are queried or written by this discovery step.",
+        "Every candidate remains Needs reconciliation.",
+        "No final production mapping is selected.",
+    ]
+    notes = [
+        "Use this as an inventory-intelligence shortlist for local review only.",
+        "Reconcile every candidate against AutoCount UI/report paths before extraction use.",
+        "Do not schedule extraction, write back to AC2, or revive parked accounting migration scope from this output.",
+    ]
 
     try:
         active_source = source or create_source(config)
@@ -169,7 +305,23 @@ def run_discovery(config, source=None, output_root=None, include_row_counts=None
         objects = sanitize_object_inventory(active_source.fetch_objects(plan["schemas"]))
         columns = sanitize_column_inventory(active_source.fetch_columns(plan["schemas"]))
         if include_counts:
-            row_counts = sanitize_row_counts(active_source.fetch_row_counts(objects))
+            try:
+                row_counts = sanitize_row_counts(active_source.fetch_row_counts(objects))
+            except Exception as exc:  # noqa: BLE001 - row count metadata is optional for readonly login.
+                row_counts = []
+                status = "success_with_warnings"
+                if is_row_count_permission_denied(exc):
+                    warnings.append("row_counts_unavailable_permission_denied")
+                    notes.append(
+                        "Metadata row counts were unavailable because the read-only login lacks VIEW DATABASE STATE; "
+                        "rerun with --no-row-counts to avoid the row-count query."
+                    )
+                else:
+                    warnings.append("row_counts_unavailable")
+                    notes.append(
+                        "Metadata row counts were unavailable; rerun with --no-row-counts if object and column "
+                        "metadata succeeded."
+                    )
         candidates_by_family = score_inventory_candidates(objects, columns, row_counts, families)
     except Exception as exc:  # noqa: BLE001 - safe manifest should preserve redacted failure context.
         status = "failed"
@@ -223,6 +375,8 @@ def run_discovery(config, source=None, output_root=None, include_row_counts=None
         ],
         "parked_scope": [
             "CoA/account master",
+            "GLDTL disabled by default",
+            "AR/AP detail disabled by default",
             "GL opening balances",
             "bank opening balances",
             "full accounting cutover",
@@ -236,17 +390,8 @@ def run_discovery(config, source=None, output_root=None, include_row_counts=None
             "manifest": str(run_path / "inventory_operation_discovery_manifest.json"),
             "report": str(run_path / "inventory_operation_discovery_report.md"),
         },
-        "warnings": [
-            "This is metadata only and does not approve extraction.",
-            "No raw ERP/business rows are queried or written by this discovery step.",
-            "Every candidate remains Needs reconciliation.",
-            "No final production mapping is selected.",
-        ],
-        "notes": [
-            "Use this as an inventory-intelligence shortlist for local review only.",
-            "Reconcile every candidate against AutoCount UI/report paths before extraction use.",
-            "Do not schedule extraction, write back to AC2, or revive parked accounting migration scope from this output.",
-        ],
+        "warnings": warnings,
+        "notes": notes,
     }
 
     manifest = normalize_for_json(manifest)
@@ -362,9 +507,16 @@ def score_object_for_family(obj, columns, row_count, family_name, family):
     object_id = obj.get("object_id", make_object_id(obj.get("schema_name"), object_name))
     if is_parked_scope_object(object_name):
         return None
+    if non_inventory_object_reason(object_name):
+        return None
 
     required_object_keywords = family.get("required_object_keywords_any") or []
-    if required_object_keywords and not any(keyword_matches_object(keyword, object_name) for keyword in required_object_keywords):
+    is_strong_candidate = object_id in STRONG_SURFACE_BOOSTS_BY_FAMILY.get(family_name, set())
+    if (
+        required_object_keywords
+        and not is_strong_candidate
+        and not any(keyword_matches_object(keyword, object_name) for keyword in required_object_keywords)
+    ):
         return None
 
     score = 0
@@ -392,10 +544,25 @@ def score_object_for_family(obj, columns, row_count, family_name, family):
             score += 8
             reason_codes.append(f"column_name_keyword:{column_name}")
 
+    preferred_columns = PREFERRED_COLUMNS_BY_FAMILY.get(family_name, set())
+    for column_name in matched_preferred_columns(columns, preferred_columns):
+        matched_column_names.append(column_name)
+        score += PREFERRED_COLUMN_BOOST
+        reason_codes.append(f"preferred_column:{column_name}")
+
+    if is_strong_candidate:
+        score += STRONG_SURFACE_BOOST
+        reason_codes.append(f"strong_inventory_candidate:{family_name}")
+
     known_boosts = set(family.get("known_surface_boosts") or [])
     if object_id in known_boosts or object_id in KNOWN_CONFIRMED_SURFACES and family_name == "outstanding_po_transit_support":
         score += 25
         reason_codes.append(f"known_confirmed_surface:{object_id}")
+
+    penalty, penalty_reasons = inventory_noise_penalty(object_name, columns, family_name)
+    if penalty:
+        score -= penalty
+        reason_codes.extend(penalty_reasons)
 
     if family_name == "stock_location" and object_name in {"Branch", "vBranch"} and row_count == 0:
         reason_codes.append("zero_row_location_candidate")
@@ -418,6 +585,60 @@ def score_object_for_family(obj, columns, row_count, family_name, family):
     }
 
 
+def matched_preferred_columns(columns, preferred_columns):
+    matches = []
+    normalized_preferred = [normalize_keyword(column) for column in preferred_columns]
+    for column in columns:
+        column_name = column.get("column_name", "")
+        normalized_column = normalize_keyword(column_name)
+        if any(
+            preferred and (normalized_column == preferred or preferred in normalized_column)
+            for preferred in normalized_preferred
+        ):
+            matches.append(column_name)
+    return unique_preserve_order(matches)
+
+
+def non_inventory_object_reason(object_name):
+    for pattern, reason in NON_INVENTORY_OBJECT_PATTERNS:
+        if re.search(pattern, str(object_name), flags=re.IGNORECASE):
+            return reason
+    return None
+
+
+def inventory_noise_penalty(object_name, columns, family_name):
+    penalty = 0
+    reason_codes = []
+    column_names = [str(column.get("column_name", "")) for column in columns]
+
+    for column_name in column_names:
+        for pattern, reason in GENERIC_NOISE_COLUMN_PATTERNS:
+            if re.search(pattern, column_name, flags=re.IGNORECASE):
+                penalty += 12
+                reason_codes.append(f"penalty:{reason}:{column_name}")
+
+    if family_name == "item_product_attributes" and re.search(r"Creditor|Debtor", object_name, flags=re.IGNORECASE):
+        item_columns = matched_preferred_columns(columns, PREFERRED_COLUMNS_BY_FAMILY["item_product_attributes"])
+        if not any(re.search(r"Item|UOM|Barcode|BarCode|Brand|Category|Class|Group|Stock", column) for column in item_columns):
+            penalty += 80
+            reason_codes.append("penalty:generic_creditor_debtor_product_noise")
+
+    if family_name == "stock_location" and re.search(r"Branch", object_name, flags=re.IGNORECASE):
+        contact_columns = [
+            column_name
+            for column_name in column_names
+            if re.search(r"Address|Contact|PostCode|Phone|Tel|Fax|Email", column_name, flags=re.IGNORECASE)
+        ]
+        if object_name not in {"Branch", "vBranch"}:
+            penalty += 35
+            reason_codes.append("penalty:branch_context_not_confirmed_location_master")
+        if len(contact_columns) >= 2:
+            penalty += 35
+            reason_codes.append("penalty:branch_address_contact_heavy")
+
+    return penalty, unique_preserve_order(reason_codes)
+
+
 def summarize_candidates(candidates_by_family):
     counts_by_family = {family: len(candidates) for family, candidates in candidates_by_family.items()}
     return {
@@ -428,6 +649,11 @@ def summarize_candidates(candidates_by_family):
 
 def is_parked_scope_object(object_name):
     return any(re.search(pattern, str(object_name), flags=re.IGNORECASE) for pattern in PARKED_SCOPE_OBJECT_PATTERNS)
+
+
+def is_row_count_permission_denied(exc):
+    message = sanitize_text(str(exc))
+    return bool(re.search(r"VIEW DATABASE STATE|permission denied", message, flags=re.IGNORECASE))
 
 
 def keyword_matches_object(keyword, object_name):
@@ -723,7 +949,7 @@ def main(argv=None):
             include_row_counts=False if args.no_row_counts else None,
         )
         print(json.dumps({"status": manifest["status"], "run_path": manifest["storage"]["run_path"]}, indent=2))
-        return 0 if manifest["status"] == "success" else 1
+        return 0 if manifest["status"] in {"success", "success_with_warnings"} else 1
     except Exception as exc:  # noqa: BLE001 - CLI should redact likely secret fragments.
         print(sanitize_text(str(exc)), file=sys.stderr)
         return 1
