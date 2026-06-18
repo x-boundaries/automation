@@ -77,9 +77,11 @@ Useful stock movement signal columns:
 - `LocationBalQty`
 - `BatchBalQty`
 
-### Transfer / GIT Hints
+### Transfer / GIT Column Evidence
 
-- `dbo.XFERUDF_GIT`
+Possible transfer/GIT column evidence on `dbo.vStockTransfer`:
+
+- `XFERUDF_GIT`
 - `XFERUDF_RcvDate`
 - `XFERUDF_RcvBy`
 - `XFERUDF_UseGIT`
