@@ -15,6 +15,7 @@ Task tracking, pending-work dashboards, completed-task logs, and personal planni
 - `scripts/ac2_session_auth_probe.ps1`: explicit opt-in local authentication probe for DBSetting/UserSession only, with no member reads or writes.
 - `scripts/ac2_member_type_browse_probe.ps1`: explicit opt-in read-only member type browse probe for confirmed member type values.
 - `scripts/ac2_member_no_save_schema_probe.ps1`: explicit opt-in local MemberCommand no-save schema probe for an in-memory MemberEntity only.
+- `scripts/ac2_member_no_save_assignment_probe.ps1`: explicit opt-in local MemberCommand fake-data no-save assignment probe for an in-memory MemberEntity row only.
 - `scripts/autocount_stock_extract.py`: stock extraction/archive workflow for AutoCount stock master, stock balance, and stock movement datasets.
 - `scripts/install_autocount_stock_extract_task.ps1`: Windows Task Scheduler installer for the stock extraction job.
 
@@ -59,6 +60,7 @@ Raw CSVs stay local and must not be committed. Paste back only reviewed manifest
 - [Member intake session auth probe runbook](docs/autocount2-automation/member_intake_session_auth_probe_runbook.md)
 - [Member type browse probe runbook](docs/autocount2-automation/member_type_browse_probe_runbook.md)
 - [AC2 member no-save schema probe runbook](docs/autocount2-automation/member_no_save_schema_probe_runbook.md)
+- [AC2 member no-save assignment probe runbook](docs/autocount2-automation/member_no_save_assignment_probe_runbook.md)
 - [AutoCount 2 MVP plan](docs/autocount2-automation/mvp_plan.md)
 - [Extraction surface decision pack](docs/autocount2-automation/extraction_surface_decision.md)
 - [AC2 read-only SQL login validation runbook](docs/autocount2-automation/readonly_sql_login_runbook.md)

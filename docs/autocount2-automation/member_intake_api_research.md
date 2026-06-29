@@ -156,7 +156,7 @@ The first local session/auth run proved DLL loading and DBSetting creation. Stat
 
 The instance login diagnostic also returned false with no exception: `instance_login_method_found` was true, but `instance_login_success`, `instance_is_login`, `authentication_success`, and `user_session_available` stayed false. The operator confirmed testing with an admin/root-style user. Metadata shows `AllowRootLogin` is a public writable property on `UserSession`, so PR #67 added an explicit `-AllowRootLogin` option before calling `UserSession.Login`.
 
-PR #67 confirmed the auth/session bootstrap flow works with explicit `AllowRootLogin`:
+PR #67 confirmed the auth/session bootstrap result works with explicit `AllowRootLogin`:
 
 - `authentication_success: true`
 - `user_session_available: true`
@@ -175,9 +175,26 @@ PR #68 then confirmed read-only MemberType browse through the installed API:
   - `Description: Default`
   - `Level: 1`
 
-The next safe live step is a no-save `MemberCommand` schema probe. It may create `MemberCommand`, call `GetNextMemberNo()` without outputting the actual generated number, call `NewMember(false)` to obtain an in-memory `MemberEntity`, and emit sanitized column metadata only. Existing member/customer record reads, member browse, member create/update/delete, SQL, DBSetting data methods, and any save path remain blocked.
+PR #69 confirmed no-save `MemberCommand` schema discovery through the installed API:
 
-PR #67 confirmed the auth/session bootstrap result: with explicit `AllowRootLogin`, static authentication, instance login, `IsLogin`, `SetAsCurrent`, current session availability, and `CheckHasLogined` all succeeded with no error. The next safe step is read-only MemberType browse through `MemberTypeCommand.Create(session, dbSetting)` followed only by `LoadBrowseTable()` so the actual configured member type values can be confirmed before any member creation automation.
+- `member_command_found: true`
+- `member_command_create_found: true`
+- `get_next_member_no_found: true`
+- `get_next_member_no_success: true`
+- `next_member_no_nonempty: true`
+- `next_member_no_length: 6`
+- `new_member_found: true`
+- `new_member_success: true`
+- `member_entity_available: true`
+- `member_entity_type_name: AutoCount.BonusPoint.Member.MemberEntity`
+- `member_table_available: true`
+- `member_row_available: true`
+- `default_member_type_confirmed: true`
+- `column_count: 37`
+
+Important PR #69 schema fields include `MemberNo`, `MemberType`, `Name`, `MobilePhone`, `EmailAddress`, `DOB`, `IsActive`, `RegisterDate`, `Note`, `OpeningPoints`, and `Individual`. `MemberNo`, `MemberType`, `IsActive`, `OpeningPoints`, and `Individual` are non-null fields in the in-memory table schema.
+
+The next safe live step is a fake-data no-save assignment probe. It may create `MemberCommand`, call `GetNextMemberNo()` without outputting the actual generated number, call `NewMember(false)` to obtain an in-memory `MemberEntity`, and assign synthetic fake data into the in-memory row only. Existing member/customer record reads, member browse, member create/update/delete, SQL, DBSetting data methods, and any save path remain blocked.
 
 The preferred direction remains a local desktop bridge running on the AC2 machine, using the official AutoCount assemblies and session/bootstrap path once confirmed. The next unknown is constructor/bootstrap: how to obtain the required `DBSetting`/`UserSession` context and instantiate the member command types without bypassing AutoCount application rules.
 
@@ -211,8 +228,7 @@ Until AOTG member write access is confirmed in the real X-Boundaries environment
 - Whether the account book has the API Module license enabled.
 - Whether the Bonus Point module is enabled in the target account book.
 - Whether `MemberType = Default`, now API-confirmed by read-only browse, is the approved business default for form signups.
-- Whether `GetNextMemberNo()` works without additional numbering setup in the target account book.
-- The no-save in-memory `MemberEntity` column schema and field constraints returned by the installed account book/API.
+- Whether synthetic fake intake values can be assigned to the no-save in-memory `MemberEntity` row without exceptions.
 - Whether mobile/email duplicate checks exist in AutoCount or must be enforced by the bridge.
 - Whether AOTG is subscribed, activated, and allowed to create/update members for the X-Boundaries account book.
 - Whether AOTG member create/update behavior matches the desktop assembly behavior for required fields, validation, duplicate handling, and error messages.

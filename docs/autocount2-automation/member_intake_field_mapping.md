@@ -21,6 +21,24 @@ Local reflection found `MemberEntity` in `AutoCount.Invoicing.dll` under namespa
 
 Additional writable properties exist for address, profile, debtor linkage, opening points, title, photo, and related member metadata. They are out of the current minimum intake mapping unless separately approved.
 
+## PR #69 No-Save Schema Constraints
+
+The no-save schema probe confirmed the following in-memory column constraints for fields relevant to fake-data assignment:
+
+| AutoCount field | Data type | Nullability / length | Assignment note |
+| --- | --- | --- | --- |
+| `MemberNo` | `System.String` | non-null, max_length 20 | Use generated number internally for no-save assignment; do not output it. |
+| `MemberType` | `System.String` | non-null, max_length 20 | `Default` is API-confirmed by read-only browse; business approval still pending. |
+| `Name` | `System.String` | nullable, max_length 100 | Fake assignment uses synthetic name only. |
+| `MobilePhone` | `System.String` | nullable, max_length 25 | Fake assignment uses synthetic phone only. |
+| `EmailAddress` | `System.String` | nullable, max_length 200 | Fake assignment uses `.invalid` synthetic address only. |
+| `DOB` | `System.DateTime` | nullable | Fake assignment uses a synthetic date. |
+| `IsActive` | `System.String` | non-null, max_length 1 | Prefer existing no-save row value; fallback to a one-character synthetic active flag. |
+| `RegisterDate` | `System.DateTime` | nullable | Fake assignment uses a synthetic date. |
+| `Note` | `System.String` | nullable, max_length 2147483647 | Fake assignment uses a no-save marker only. |
+| `OpeningPoints` | `System.Decimal` | non-null | Fake assignment uses zero only. |
+| `Individual` | `System.String` | non-null, max_length 1 | Prefer existing no-save row value; fallback to a one-character synthetic flag. |
+
 ## Planned Google Form Fields
 
 | Form field | Required for dry-run | Planned normalization | Target use | Status |
@@ -105,7 +123,7 @@ The current validator emits the future bridge payload shape without calling Auto
 
 MemberType unresolved for production write use: `Default` is API-confirmed, but it is not yet approved as the business default for form signups.
 
-For now, member creation remains blocked until the no-save schema probe confirms the in-memory `MemberEntity` schema and a later dry-run mapping pass proves the exact field assignment behavior without saving.
+For now, member creation remains blocked until the fake-data no-save assignment dry run proves synthetic field assignment and a later save-gated proof is separately approved.
 
 If `MemberType` is missing, the validator uses `OPEN_MEMBER_TYPE` only as a visible placeholder, returns a `member_type_unconfirmed` warning, and marks the payload `sync_eligible: false` and `dry_run_only: true`. That output is useful for planning and review, not for live member creation.
 
@@ -119,7 +137,7 @@ Checkbox-style long acknowledgement text is intentionally unsupported as direct 
 - Where should PDPA and marketing consent be stored if AutoCount has no dedicated consent fields?
 - PDPA/marketing consent storage remains open. Possible options are UDF, `Note` with a sanitized marker, or external audit sheet only. Do not decide yet.
 - Should `Remarks` be internal-only rather than synced to AutoCount?
-- No-save `MemberCommand` schema probing is the next step; writeback mapping cannot be tested until that probe and a later dry-run mapping pass are reviewed.
+- Fake-data no-save assignment probing is the next step; writeback mapping cannot be tested until that probe and a later save-gated proof are reviewed.
 
 ## Safety Notes
 
