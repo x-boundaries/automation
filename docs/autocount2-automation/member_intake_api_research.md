@@ -142,6 +142,16 @@ Follow-up local reflection found the command bootstrap shape:
 
 Do not reflect-call internal constructors. The next blocker is obtaining the official UserSession and DBSetting safely. Standard constructor/bootstrap instantiation remains open and must be resolved before any API call attempt.
 
+PR #64 confirmed bootstrap/session metadata:
+
+- `AutoCount.Authentication.UserSession` was found.
+- `AutoCount.Data.DBSetting` was found.
+- `DBSetting` exposes `CreateAutoCountDefaultDBSetting(serverName, dbName)`.
+- `UserSession` exposes `UserSession.Authenticate(dbSetting, userID, password)`.
+- `UserSession` exposes `get_CurrentUserSession()`.
+
+The next safe live step is an explicit opt-in session/auth probe using runtime-only credentials. This is auth only; member read/write blocked until a later separately approved PR.
+
 The preferred direction remains a local desktop bridge running on the AC2 machine, using the official AutoCount assemblies and session/bootstrap path once confirmed. The next unknown is constructor/bootstrap: how to obtain the required `DBSetting`/`UserSession` context and instantiate the member command types without bypassing AutoCount application rules.
 
 ## What Each Page Confirms
@@ -177,6 +187,7 @@ Until AOTG member write access is confirmed in the real X-Boundaries environment
 - Whether `MemberType = Default`, observed in the UI, is the correct production/default member type for form signups.
 - Whether `GetNextMemberNo()` works without additional numbering setup in the target account book.
 - How to obtain official `AutoCount.Authentication.UserSession` and `AutoCount.Data.DBSetting` instances for the installed `AutoCount.BonusPoint.Member.MemberCommand` and `MemberTypeCommand` public static Create factories.
+- Whether a runtime-only session/auth probe can authenticate and make a `UserSession` available without member reads, member writes, SQL queries, or command factory invocation.
 - Whether mobile/email duplicate checks exist in AutoCount or must be enforced by the bridge.
 - Whether AOTG is subscribed, activated, and allowed to create/update members for the X-Boundaries account book.
 - Whether AOTG member create/update behavior matches the desktop assembly behavior for required fields, validation, duplicate handling, and error messages.
