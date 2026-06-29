@@ -80,6 +80,33 @@ function Find-PublicStaticMethod {
     } | Select-Object -First 1)[0]
 }
 
+function Find-PublicInstanceMethod {
+    param(
+        [Type]$Type,
+        [string]$Name,
+        [int]$ParameterCount
+    )
+
+    $flags = [System.Reflection.BindingFlags]::Public -bor
+        [System.Reflection.BindingFlags]::Instance
+
+    return @($Type.GetMethods($flags) | Where-Object {
+        $_.Name -eq $Name -and $_.GetParameters().Count -eq $ParameterCount
+    } | Select-Object -First 1)[0]
+}
+
+function Find-PublicProperty {
+    param(
+        [Type]$Type,
+        [string]$Name
+    )
+
+    $flags = [System.Reflection.BindingFlags]::Public -bor
+        [System.Reflection.BindingFlags]::Instance
+
+    return $Type.GetProperty($Name, $flags)
+}
+
 function Find-PublicConstructor {
     param(
         [Type]$Type,
@@ -123,8 +150,18 @@ $result = [ordered]@{
     target_assembly_loaded = $false
     dbsetting_factory_found = $false
     authenticate_method_found = $false
+    static_auth_method_found = $false
+    static_auth_success = $false
     current_session_method_found = $false
     user_session_constructor_found = $false
+    instance_login_method_found = $false
+    instance_login_success = $false
+    instance_is_login = $false
+    set_as_current_method_found = $false
+    set_as_current_called = $false
+    current_session_available_after_set = $false
+    check_has_logined_method_found = $false
+    check_has_logined_success = $false
     authentication_success = $false
     user_session_available = $false
     error = $null
@@ -182,6 +219,7 @@ try {
 
     $authenticateMethod = Find-PublicStaticMethod $userSessionType "Authenticate" 3
     $result.authenticate_method_found = $null -ne $authenticateMethod
+    $result.static_auth_method_found = $null -ne $authenticateMethod
     if ($null -eq $authenticateMethod) {
         throw "UserSession authentication method was not found."
     }
@@ -190,20 +228,57 @@ try {
     $result.current_session_method_found = $null -ne $currentSessionMethod
     $userSessionConstructor = Find-PublicConstructor $userSessionType @($dbSettingTypeName)
     $result.user_session_constructor_found = $null -ne $userSessionConstructor
+    $instanceLoginMethod = Find-PublicInstanceMethod $userSessionType "Login" 2
+    $result.instance_login_method_found = $null -ne $instanceLoginMethod
+    $setAsCurrentMethod = Find-PublicInstanceMethod $userSessionType "SetAsCurrent" 0
+    $result.set_as_current_method_found = $null -ne $setAsCurrentMethod
+    $checkHasLoginedMethod = Find-PublicInstanceMethod $userSessionType "CheckHasLogined" 0
+    $result.check_has_logined_method_found = $null -ne $checkHasLoginedMethod
+    $isLoginProperty = Find-PublicProperty $userSessionType "IsLogin"
 
     $dbSetting = $dbSettingFactory.Invoke($null, @($serverForProbe, $databaseForProbe))
     $authResult = $authenticateMethod.Invoke($null, @($dbSetting, $userForProbe, $passwordForProbe))
-    $result.authentication_success = [bool]$authResult
+    $result.static_auth_success = [bool]$authResult
 
-    if ($result.authentication_success -and $null -ne $currentSessionMethod) {
+    if ($null -eq $userSessionConstructor) {
+        throw "UserSession DBSetting constructor was not found."
+    }
+    if ($null -eq $instanceLoginMethod) {
+        throw "UserSession instance Login method was not found."
+    }
+
+    $session = $userSessionConstructor.Invoke(@($dbSetting))
+    $loginResult = $instanceLoginMethod.Invoke($session, @($userForProbe, $passwordForProbe))
+    $result.instance_login_success = [bool]$loginResult
+    if ($null -ne $isLoginProperty) {
+        $result.instance_is_login = [bool]$isLoginProperty.GetValue($session, $null)
+    }
+
+    if ($result.instance_login_success -and $null -ne $setAsCurrentMethod) {
+        [void]$setAsCurrentMethod.Invoke($session, @())
+        $result.set_as_current_called = $true
+    }
+
+    if ($result.instance_login_success -and $null -ne $currentSessionMethod) {
         $currentSession = $currentSessionMethod.Invoke($null, @())
-        $result.user_session_available = $null -ne $currentSession
+        $result.current_session_available_after_set = $null -ne $currentSession
     }
 
-    if ($result.authentication_success -and -not $result.user_session_available -and $null -ne $userSessionConstructor) {
-        $session = $userSessionConstructor.Invoke(@($dbSetting))
-        $result.user_session_available = $null -ne $session
+    if ($result.instance_login_success -and $null -ne $checkHasLoginedMethod) {
+        try {
+            [void]$checkHasLoginedMethod.Invoke($session, @())
+            $result.check_has_logined_success = $true
+        }
+        catch {
+            $result.check_has_logined_success = $false
+        }
     }
+
+    $result.authentication_success = $result.static_auth_success -or $result.instance_login_success
+    $result.user_session_available = (
+        ($result.instance_login_success -and $null -ne $session) -or
+        $result.current_session_available_after_set
+    )
 }
 catch {
     $result.error = [ordered]@{

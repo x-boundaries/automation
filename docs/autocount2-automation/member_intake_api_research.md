@@ -152,6 +152,8 @@ PR #64 confirmed bootstrap/session metadata:
 
 The next safe live step is an explicit opt-in session/auth probe using runtime-only credentials. This is auth only; member read/write blocked until a later separately approved PR.
 
+The first local session/auth run proved DLL loading and DBSetting creation. Static Authenticate returned false with no exception and no current session. Metadata also shows an instance `UserSession.Login(userID, password)` path with `SetAsCurrent`, `CheckHasLogined`, and `IsLogin`, so the next auth-only diagnostic is to try instance `UserSession.Login` while keeping member read/write blocked.
+
 The preferred direction remains a local desktop bridge running on the AC2 machine, using the official AutoCount assemblies and session/bootstrap path once confirmed. The next unknown is constructor/bootstrap: how to obtain the required `DBSetting`/`UserSession` context and instantiate the member command types without bypassing AutoCount application rules.
 
 ## What Each Page Confirms
