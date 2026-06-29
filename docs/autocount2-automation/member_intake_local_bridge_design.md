@@ -52,6 +52,18 @@ Dry-run should check as much as possible without committing:
 
 Dry-run must not call `SaveMember`, direct SQL `INSERT/UPDATE`, import tools, or any equivalent write surface.
 
+## AutoCount Bootstrap Boundary
+
+Local reflection after PR #63 found that the installed member command factories require `AutoCount.Authentication.UserSession` and `AutoCount.Data.DBSetting`.
+
+Bridge design constraints:
+
+- Do not reflect-call internal constructors.
+- Prefer the official public Create factory once the safe `UserSession` and `DBSetting` path is confirmed.
+- No live read/list/create until the bootstrap path is understood and separately approved.
+- Do not instantiate `MemberCommand` or `MemberTypeCommand` during metadata probes.
+- Keep bootstrap/session discovery metadata-only until a sandbox validation PR explicitly enables a session probe.
+
 ## Idempotency
 
 Every request must include a stable idempotency key, preferably `IntakeID`.

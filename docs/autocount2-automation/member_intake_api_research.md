@@ -133,7 +133,14 @@ Confirmed writable `MemberTypeEntity` properties include:
 - `Description`
 - `Level`
 
-PowerShell reflection showed no public constructors for `MemberCommand` and `MemberTypeCommand`. Standard constructor/bootstrap instantiation remains open and must be resolved before any API call attempt.
+Follow-up local reflection found the command bootstrap shape:
+
+- `MemberCommand` has an internal constructor requiring `AutoCount.Authentication.UserSession` plus `AutoCount.Data.DBSetting`.
+- `MemberCommand` has a public static Create factory requiring `AutoCount.Authentication.UserSession` plus `AutoCount.Data.DBSetting`.
+- `MemberTypeCommand` has an internal constructor requiring `AutoCount.Authentication.UserSession` plus `AutoCount.Data.DBSetting`.
+- `MemberTypeCommand` has a public static Create factory requiring `AutoCount.Authentication.UserSession` plus `AutoCount.Data.DBSetting`.
+
+Do not reflect-call internal constructors. The next blocker is obtaining the official UserSession and DBSetting safely. Standard constructor/bootstrap instantiation remains open and must be resolved before any API call attempt.
 
 The preferred direction remains a local desktop bridge running on the AC2 machine, using the official AutoCount assemblies and session/bootstrap path once confirmed. The next unknown is constructor/bootstrap: how to obtain the required `DBSetting`/`UserSession` context and instantiate the member command types without bypassing AutoCount application rules.
 
@@ -169,7 +176,7 @@ Until AOTG member write access is confirmed in the real X-Boundaries environment
 - The exact configured `MemberType` values available in Bonus Point > Member Type Maintenance.
 - Whether `MemberType = Default`, observed in the UI, is the correct production/default member type for form signups.
 - Whether `GetNextMemberNo()` works without additional numbering setup in the target account book.
-- How to bootstrap the installed `AutoCount.BonusPoint.Member.MemberCommand` and `MemberTypeCommand` types, given no public constructors were visible via standard reflection.
+- How to obtain official `AutoCount.Authentication.UserSession` and `AutoCount.Data.DBSetting` instances for the installed `AutoCount.BonusPoint.Member.MemberCommand` and `MemberTypeCommand` public static Create factories.
 - Whether mobile/email duplicate checks exist in AutoCount or must be enforced by the bridge.
 - Whether AOTG is subscribed, activated, and allowed to create/update members for the X-Boundaries account book.
 - Whether AOTG member create/update behavior matches the desktop assembly behavior for required fields, validation, duplicate handling, and error messages.
@@ -194,6 +201,7 @@ Until AOTG member write access is confirmed in the real X-Boundaries environment
 ## Guardrails
 
 - Do not implement production writeback in this repo slice.
+- Do not reflect-call internal constructors or invoke command factories until the official `UserSession`/`DBSetting` path is confirmed.
 - Do not call `SaveMember`, `DeleteMember`, `SaveMemberType`, or `DeleteMemberType`.
 - Do not write directly to SQL for member intake.
 - Do not commit real member PII, screenshots, account book credentials, SQL credentials, API keys, or local runtime outputs.
