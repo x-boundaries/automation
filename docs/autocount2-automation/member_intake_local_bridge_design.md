@@ -115,6 +115,29 @@ No-save schema constraints:
 - `MemberType = Default` is API-confirmed by read-only browse, but it must not be written into an entity in this probe.
 - Member creation automation remains blocked until this no-save schema probe and a later dry-run mapping pass are reviewed.
 
+## Fake-Data No-Save Assignment Boundary
+
+After the no-save schema is confirmed, the next permitted live probe is synthetic fake-data assignment into the in-memory member row only.
+
+Allowed behavior:
+
+- Create `MemberCommand` with the proven session and DBSetting.
+- Call `GetNextMemberNo()` but return only length and nonempty flags.
+- Call `NewMember(false)` to obtain an in-memory `MemberEntity`.
+- Assign synthetic fake data only into fields needed for future intake mapping.
+- Return sanitized per-field assignment status only.
+
+Still blocked:
+
+- No real customer/member data.
+- No existing member/customer records are read.
+- No member browse is allowed.
+- No member create/update/delete is allowed.
+- No member or MemberType save path is allowed.
+- No SQL queries, direct SQL writes, or DBSetting data methods are allowed.
+- No generated member number, credentials, account book names, connection details, or runtime output in Git.
+- Member creation automation remains blocked until fake-data no-save assignment and a later save-gated proof are separately reviewed.
+
 ## Idempotency
 
 Every request must include a stable idempotency key, preferably `IntakeID`.
