@@ -73,6 +73,8 @@ Session/auth constraints:
 - Do not call member factories until authentication/session is proven.
 - No member list/read until a later read-only PR.
 - No member create/update/delete.
+- Auth/session instance login diagnostics may call `UserSession.Login`, `SetAsCurrent`, and `CheckHasLogined` only after explicit opt-in and runtime-only credentials.
+- Do not call `UserSession.Load` or `CurrentUserTable` in the auth probe.
 - No SQL queries or direct SQL writes.
 - Passwords must be supplied only through a runtime environment variable.
 - Sanitized output must not include server name, database name, user ID, password, connection strings, account book names, member data, or machine usernames.

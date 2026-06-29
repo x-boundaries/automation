@@ -4,6 +4,8 @@ This probe is the first explicit opt-in live authentication probe for the local 
 
 It does not read/list/create/update/delete members. It does not call MemberCommand.Create. It does not call MemberTypeCommand.Create. It does not run SQL.
 
+Static Authenticate returned false with no exception in the first local run. Metadata also shows an instance UserSession.Login path, so this probe now records both static authentication and instance login diagnostics.
+
 ## Output Location
 
 Write generated output under:
@@ -48,6 +50,13 @@ The probe may output only sanitized status fields:
 - target assembly loaded yes/no
 - DBSetting factory found yes/no
 - UserSession authentication method found yes/no
+- static authentication success yes/no
+- instance UserSession.Login method found yes/no
+- instance login success yes/no
+- instance IsLogin yes/no
+- SetAsCurrent found/called yes/no
+- current session available after SetAsCurrent yes/no
+- CheckHasLogined found/success yes/no
 - session probe enabled
 - authentication success yes/no
 - user session available yes/no
@@ -61,6 +70,6 @@ Auth only; no member read/list/create/update/delete.
 
 No MemberCommand.Create or MemberTypeCommand.Create.
 
-No SQL queries and no direct SQL writes.
+No SQL queries, no DBSetting data methods, and no direct SQL writes.
 
 No generated output should be committed.
