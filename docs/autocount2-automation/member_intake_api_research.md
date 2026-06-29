@@ -156,6 +156,8 @@ The first local session/auth run proved DLL loading and DBSetting creation. Stat
 
 The instance login diagnostic also returned false with no exception: `instance_login_method_found` was true, but `instance_login_success`, `instance_is_login`, `authentication_success`, and `user_session_available` stayed false. The operator confirmed testing with an admin/root-style user. Metadata shows `AllowRootLogin` is a public writable property on `UserSession`, so the next auth/session-only diagnostic is an explicit `-AllowRootLogin` option before calling `UserSession.Login`. Member factories, member read/list/write, SQL, and DBSetting data methods remain blocked.
 
+PR #67 confirmed the auth/session bootstrap result: with explicit `AllowRootLogin`, static authentication, instance login, `IsLogin`, `SetAsCurrent`, current session availability, and `CheckHasLogined` all succeeded with no error. The next safe step is read-only MemberType browse through `MemberTypeCommand.Create(session, dbSetting)` followed only by `LoadBrowseTable()` so the actual configured member type values can be confirmed before any member creation automation.
+
 The preferred direction remains a local desktop bridge running on the AC2 machine, using the official AutoCount assemblies and session/bootstrap path once confirmed. The next unknown is constructor/bootstrap: how to obtain the required `DBSetting`/`UserSession` context and instantiate the member command types without bypassing AutoCount application rules.
 
 ## What Each Page Confirms
