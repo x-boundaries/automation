@@ -74,8 +74,10 @@ Session/auth constraints:
 - No member list/read until a later read-only PR.
 - No member create/update/delete.
 - Auth/session instance login diagnostics may call `UserSession.Login`, `SetAsCurrent`, and `CheckHasLogined` only after explicit opt-in and runtime-only credentials.
+- Admin/root-style user diagnostics may set `AllowRootLogin` only when the explicit `-AllowRootLogin` switch is supplied.
 - Do not call `UserSession.Load` or `CurrentUserTable` in the auth probe.
 - No SQL queries or direct SQL writes.
+- No DBSetting data methods in the auth probe.
 - Passwords must be supplied only through a runtime environment variable.
 - Sanitized output must not include server name, database name, user ID, password, connection strings, account book names, member data, or machine usernames.
 

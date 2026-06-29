@@ -14,6 +14,7 @@ class Ac2SessionAuthProbeStaticTests(unittest.TestCase):
 
         self.assertIn("C:\\Program Files\\AutoCount\\Accounting 2.2", script)
         self.assertIn("EnableSessionProbe", script)
+        self.assertIn("AllowRootLogin", script)
         self.assertIn("AC2_PROBE_PASSWORD", script)
         self.assertIn("PasswordEnvVar", script)
         self.assertIn("GetEnvironmentVariable", script)
@@ -34,6 +35,24 @@ class Ac2SessionAuthProbeStaticTests(unittest.TestCase):
         self.assertIn("set_as_current_called", script)
         self.assertIn("current_session_available_after_set", script)
         self.assertIn("check_has_logined_success", script)
+        self.assertIn("allow_root_login_requested", script)
+        self.assertIn("allow_root_login_property_found", script)
+        self.assertIn("allow_root_login_set", script)
+
+    def test_session_auth_probe_allows_root_login_only_with_explicit_switch(self):
+        script = SCRIPT.read_text(encoding="utf-8")
+
+        self.assertRegex(script, r"\[switch\]\s*\$AllowRootLogin")
+        self.assertIn('Find-PublicProperty $userSessionType "AllowRootLogin"', script)
+        self.assertIn("allow_root_login_requested = [bool]$AllowRootLogin", script)
+        self.assertRegex(
+            script,
+            r"if\s*\(\$AllowRootLogin\s+-and\s+\$null\s+-ne\s+\$allowRootLoginProperty\s+-and\s+"
+            r"\$allowRootLoginProperty\.CanWrite\)",
+        )
+        set_index = script.index("$allowRootLoginProperty.SetValue($session, $true")
+        login_index = script.index("$instanceLoginMethod.Invoke($session")
+        self.assertLess(set_index, login_index)
 
     def test_session_auth_probe_has_no_member_factory_read_write_sql_or_secret_literals(self):
         script = SCRIPT.read_text(encoding="utf-8")
@@ -45,6 +64,7 @@ class Ac2SessionAuthProbeStaticTests(unittest.TestCase):
         )
         self.assertIsNone(forbidden_member_calls.search(script))
         self.assertNotRegex(script, r"\bCurrentUserTable\b")
+        self.assertNotRegex(script, r"\bUserSession\.Load\b")
         self.assertNotRegex(
             script,
             r"\b(CreateCommand|GetDataTable|GetFirstDataRow|ExecuteScalar|ExecuteNonQuery|"
@@ -73,12 +93,16 @@ class Ac2SessionAuthProbeStaticTests(unittest.TestCase):
         self.assertIn("does not run SQL", runbook)
         self.assertIn("instance UserSession.Login", runbook)
         self.assertIn("Static Authenticate returned false with no exception", runbook)
+        self.assertIn("AllowRootLogin", runbook)
+        self.assertIn("Previous instance login returned false with no exception", runbook)
+        self.assertIn("admin/root-style user", runbook)
         self.assertNotRegex(runbook, r"(?i)(AED_|XBOUNDARIES|xPass|localhost\\A2006)")
 
         self.assertIn("CreateAutoCountDefaultDBSetting", research)
         self.assertIn("UserSession.Authenticate", research)
         self.assertIn("UserSession.Login", research)
         self.assertIn("Static Authenticate returned false with no exception", research)
+        self.assertIn("AllowRootLogin", research)
         self.assertIn("session/auth probe", research)
         self.assertIn("member read/write blocked", research)
 
@@ -86,3 +110,4 @@ class Ac2SessionAuthProbeStaticTests(unittest.TestCase):
         self.assertIn("Do not call member factories", bridge)
         self.assertIn("No member list/read", bridge)
         self.assertIn("instance login diagnostics", bridge)
+        self.assertIn("AllowRootLogin", bridge)

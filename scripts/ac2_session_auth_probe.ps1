@@ -6,7 +6,8 @@ param(
     [string]$UserId = $env:AC2_PROBE_USER_ID,
     [string]$PasswordEnvVar = "AC2_PROBE_PASSWORD",
     [string]$JsonOut,
-    [switch]$EnableSessionProbe
+    [switch]$EnableSessionProbe,
+    [switch]$AllowRootLogin
 )
 
 Set-StrictMode -Version Latest
@@ -154,6 +155,9 @@ $result = [ordered]@{
     static_auth_success = $false
     current_session_method_found = $false
     user_session_constructor_found = $false
+    allow_root_login_requested = [bool]$AllowRootLogin
+    allow_root_login_property_found = $false
+    allow_root_login_set = $false
     instance_login_method_found = $false
     instance_login_success = $false
     instance_is_login = $false
@@ -235,6 +239,8 @@ try {
     $checkHasLoginedMethod = Find-PublicInstanceMethod $userSessionType "CheckHasLogined" 0
     $result.check_has_logined_method_found = $null -ne $checkHasLoginedMethod
     $isLoginProperty = Find-PublicProperty $userSessionType "IsLogin"
+    $allowRootLoginProperty = Find-PublicProperty $userSessionType "AllowRootLogin"
+    $result.allow_root_login_property_found = $null -ne $allowRootLoginProperty
 
     $dbSetting = $dbSettingFactory.Invoke($null, @($serverForProbe, $databaseForProbe))
     $authResult = $authenticateMethod.Invoke($null, @($dbSetting, $userForProbe, $passwordForProbe))
@@ -248,6 +254,11 @@ try {
     }
 
     $session = $userSessionConstructor.Invoke(@($dbSetting))
+    if ($AllowRootLogin -and $null -ne $allowRootLoginProperty -and $allowRootLoginProperty.CanWrite) {
+        $allowRootLoginProperty.SetValue($session, $true, $null)
+        $result.allow_root_login_set = $true
+    }
+
     $loginResult = $instanceLoginMethod.Invoke($session, @($userForProbe, $passwordForProbe))
     $result.instance_login_success = [bool]$loginResult
     if ($null -ne $isLoginProperty) {
