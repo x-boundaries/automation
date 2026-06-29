@@ -103,6 +103,8 @@ The current validator emits the future bridge payload shape without calling Auto
 
 `member_type` is intentionally not hard-coded to a production write value in docs. PR #68 confirmed `MemberType = Default` exists by read-only API browse, but using it for form signups still needs business approval.
 
+MemberType unresolved for production write use: `Default` is API-confirmed, but it is not yet approved as the business default for form signups.
+
 For now, member creation remains blocked until the no-save schema probe confirms the in-memory `MemberEntity` schema and a later dry-run mapping pass proves the exact field assignment behavior without saving.
 
 If `MemberType` is missing, the validator uses `OPEN_MEMBER_TYPE` only as a visible placeholder, returns a `member_type_unconfirmed` warning, and marks the payload `sync_eligible: false` and `dry_run_only: true`. That output is useful for planning and review, not for live member creation.

@@ -177,6 +177,8 @@ PR #68 then confirmed read-only MemberType browse through the installed API:
 
 The next safe live step is a no-save `MemberCommand` schema probe. It may create `MemberCommand`, call `GetNextMemberNo()` without outputting the actual generated number, call `NewMember(false)` to obtain an in-memory `MemberEntity`, and emit sanitized column metadata only. Existing member/customer record reads, member browse, member create/update/delete, SQL, DBSetting data methods, and any save path remain blocked.
 
+PR #67 confirmed the auth/session bootstrap result: with explicit `AllowRootLogin`, static authentication, instance login, `IsLogin`, `SetAsCurrent`, current session availability, and `CheckHasLogined` all succeeded with no error. The next safe step is read-only MemberType browse through `MemberTypeCommand.Create(session, dbSetting)` followed only by `LoadBrowseTable()` so the actual configured member type values can be confirmed before any member creation automation.
+
 The preferred direction remains a local desktop bridge running on the AC2 machine, using the official AutoCount assemblies and session/bootstrap path once confirmed. The next unknown is constructor/bootstrap: how to obtain the required `DBSetting`/`UserSession` context and instantiate the member command types without bypassing AutoCount application rules.
 
 ## What Each Page Confirms
