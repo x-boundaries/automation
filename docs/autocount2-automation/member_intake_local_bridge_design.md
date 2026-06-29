@@ -64,6 +64,19 @@ Bridge design constraints:
 - Do not instantiate `MemberCommand` or `MemberTypeCommand` during metadata probes.
 - Keep bootstrap/session discovery metadata-only until a sandbox validation PR explicitly enables a session probe.
 
+## Session/Auth Boundary
+
+The next permitted live probe is authentication only. It may create a `DBSetting` with the official `CreateAutoCountDefaultDBSetting` factory and call `UserSession.Authenticate` using runtime-only credentials.
+
+Session/auth constraints:
+
+- Do not call member factories until authentication/session is proven.
+- No member list/read until a later read-only PR.
+- No member create/update/delete.
+- No SQL queries or direct SQL writes.
+- Passwords must be supplied only through a runtime environment variable.
+- Sanitized output must not include server name, database name, user ID, password, connection strings, account book names, member data, or machine usernames.
+
 ## Idempotency
 
 Every request must include a stable idempotency key, preferably `IntakeID`.
