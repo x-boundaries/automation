@@ -10,6 +10,7 @@ Task tracking, pending-work dashboards, completed-task logs, and personal planni
 - `scripts/autocount_phase1_reconcile.py`: safe aggregate Phase 1 stock reconciliation summaries for validating candidate SQL surfaces against AutoCount UI/report outputs before scheduling extraction.
 - `scripts/autocount_broader_surface_discovery.py`: metadata-only broader AC2 surface discovery for customer, supplier, GL/accounting, AR/AP, locations, payment, PO, and stock-in-transit planning.
 - `scripts/autocount_inventory_operation_discovery.py`: metadata-only inventory-operation surface discovery for GRN, stock transfer, location, richer item attributes, movement semantics, supplier context, and outstanding PO support.
+- `scripts/ac2_member_api_probe.ps1`: local-only metadata/reflection probe for the installed AutoCount 2.2 member API surface.
 - `scripts/autocount_stock_extract.py`: stock extraction/archive workflow for AutoCount stock master, stock balance, and stock movement datasets.
 - `scripts/install_autocount_stock_extract_task.ps1`: Windows Task Scheduler installer for the stock extraction job.
 
@@ -33,6 +34,7 @@ Keep all generated AutoCount outputs under `C:\XB\autocount_outputs`:
 - SQL probe: `C:\XB\autocount_outputs\probe`
 - Broader surface discovery: `C:\XB\autocount_outputs\probe\broader_surfaces`
 - Inventory operation discovery: `C:\XB\autocount_outputs\probe\inventory_operations`
+- Member intake API discovery review: `C:\XB\autocount_outputs\review\member_intake_discovery`
 - Phase 1 reconciliation: `C:\XB\autocount_outputs\reconcile`
 - Stock extraction: `C:\XB\autocount_outputs\extract\stock`
 
@@ -46,6 +48,9 @@ Raw CSVs stay local and must not be committed. Paste back only reviewed manifest
 - [AutoCount 2 API research](docs/autocount2-automation/api_research.md)
 - [Inventory intelligence scope](docs/autocount2-automation/inventory_intelligence_scope.md)
 - [Inventory operation surface discovery runbook](docs/autocount2-automation/inventory_operation_surface_discovery_runbook.md)
+- [Member intake API research](docs/autocount2-automation/member_intake_api_research.md)
+- [Member intake field mapping](docs/autocount2-automation/member_intake_field_mapping.md)
+- [Member intake local probe runbook](docs/autocount2-automation/member_intake_local_probe_runbook.md)
 - [AutoCount 2 MVP plan](docs/autocount2-automation/mvp_plan.md)
 - [Extraction surface decision pack](docs/autocount2-automation/extraction_surface_decision.md)
 - [AC2 read-only SQL login validation runbook](docs/autocount2-automation/readonly_sql_login_runbook.md)

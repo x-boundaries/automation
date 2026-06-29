@@ -171,4 +171,3 @@ The public AOTG Swagger lists member endpoints, but X-Boundaries entitlement is 
 5. Confirm member create/update validation and duplicate behavior with synthetic data.
 
 Do not choose AOTG for production until entitlement, sandbox behavior, error handling, and audit requirements are documented.
-
