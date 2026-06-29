@@ -9,7 +9,7 @@ Local reflection found `MemberEntity` in `AutoCount.Invoicing.dll` under namespa
 | Intake field | Installed AC2 field | Status |
 | --- | --- | --- |
 | Member number | `MemberNo` | Supported. Generation path still needs bootstrap/session confirmation through `MemberCommand.GetNextMemberNo()`. |
-| Member type | `MemberType` | Supported. `MemberType = Default` was observed in the UI, but production/default usage still requires operator confirmation. |
+| Member type | `MemberType` | Supported. MemberType unresolved until read-only browse confirms the production value. `MemberType = Default` was observed in the UI, but production/default usage still requires operator confirmation. |
 | Name | `Name` | Supported. |
 | Mobile phone | `MobilePhone` | Supported. |
 | Email address | `EmailAddress` | Supported. |
@@ -103,7 +103,7 @@ The current validator emits the future bridge payload shape without calling Auto
 
 `member_type` is intentionally not hard-coded to a production value in docs. The real value must be confirmed in Bonus Point > Member Type Maintenance.
 
-`MemberType = Default` is observed in UI, but production/default usage still requires operator confirmation.
+MemberType unresolved until read-only browse confirms the production value. `MemberType = Default` is observed in UI, but production/default usage still requires operator confirmation.
 
 If `MemberType` is missing, the validator uses `OPEN_MEMBER_TYPE` only as a visible placeholder, returns a `member_type_unconfirmed` warning, and marks the payload `sync_eligible: false` and `dry_run_only: true`. That output is useful for planning and review, not for live member creation.
 
@@ -111,7 +111,7 @@ Checkbox-style long acknowledgement text is intentionally unsupported as direct 
 
 ## Open Questions
 
-- Which `MemberType` should be used for X-Boundaries form signups?
+- Which `MemberType` should be used for X-Boundaries form signups after read-only member type browse confirms the configured values?
 - Should `MemberNo` always be AutoCount auto-running, or should some legacy/external numbers be explicit?
 - Should duplicate detection use mobile, email, name, or a combination?
 - Where should PDPA and marketing consent be stored if AutoCount has no dedicated consent fields?

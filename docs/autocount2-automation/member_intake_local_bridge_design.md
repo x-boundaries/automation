@@ -81,6 +81,25 @@ Session/auth constraints:
 - Passwords must be supplied only through a runtime environment variable.
 - Sanitized output must not include server name, database name, user ID, password, connection strings, account book names, member data, or machine usernames.
 
+## First Read-Only Member API Boundary
+
+After auth/session is proven, the first read-only member API boundary is member type browse only.
+
+Allowed behavior:
+
+- Create `MemberTypeCommand` with the proven session and DBSetting.
+- Call `MemberTypeCommand.LoadBrowseTable` to confirm configured member type values.
+- Return sanitized member type summary fields only.
+
+Still blocked:
+
+- No member/customer records are read.
+- No member create/update/delete.
+- No member type create/update/delete.
+- No direct SQL.
+- No DBSetting data methods.
+- No runtime credentials, account book names, or generated browse output in Git.
+
 ## Idempotency
 
 Every request must include a stable idempotency key, preferably `IntakeID`.
