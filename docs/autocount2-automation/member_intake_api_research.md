@@ -150,11 +150,32 @@ PR #64 confirmed bootstrap/session metadata:
 - `UserSession` exposes `UserSession.Authenticate(dbSetting, userID, password)`.
 - `UserSession` exposes `get_CurrentUserSession()`.
 
-The next safe live step is an explicit opt-in session/auth probe using runtime-only credentials. This is auth only; member read/write blocked until a later separately approved PR.
+At that point, the next safe live step was an explicit opt-in session/auth probe using runtime-only credentials. That probe was auth only; member read/write remained blocked until a later separately approved PR.
 
-The first local session/auth run proved DLL loading and DBSetting creation. Static Authenticate returned false with no exception and no current session. Metadata also shows an instance `UserSession.Login(userID, password)` path with `SetAsCurrent`, `CheckHasLogined`, and `IsLogin`, so the next auth-only diagnostic is to try instance `UserSession.Login` while keeping member read/write blocked.
+The first local session/auth run proved DLL loading and DBSetting creation. Static Authenticate returned false with no exception and no current session. Metadata also shows an instance `UserSession.Login(userID, password)` path with `SetAsCurrent`, `CheckHasLogined`, and `IsLogin`, so the follow-up auth-only diagnostic tried instance `UserSession.Login` while keeping member read/write blocked.
 
-The instance login diagnostic also returned false with no exception: `instance_login_method_found` was true, but `instance_login_success`, `instance_is_login`, `authentication_success`, and `user_session_available` stayed false. The operator confirmed testing with an admin/root-style user. Metadata shows `AllowRootLogin` is a public writable property on `UserSession`, so the next auth/session-only diagnostic is an explicit `-AllowRootLogin` option before calling `UserSession.Login`. Member factories, member read/list/write, SQL, and DBSetting data methods remain blocked.
+The instance login diagnostic also returned false with no exception: `instance_login_method_found` was true, but `instance_login_success`, `instance_is_login`, `authentication_success`, and `user_session_available` stayed false. The operator confirmed testing with an admin/root-style user. Metadata shows `AllowRootLogin` is a public writable property on `UserSession`, so PR #67 added an explicit `-AllowRootLogin` option before calling `UserSession.Login`.
+
+PR #67 confirmed the auth/session bootstrap flow works with explicit `AllowRootLogin`:
+
+- `authentication_success: true`
+- `user_session_available: true`
+
+PR #68 then confirmed read-only MemberType browse through the installed API:
+
+- `member_type_command_found: true`
+- `member_type_command_create_found: true`
+- `load_browse_table_found: true`
+- `load_browse_table_success: true`
+- `row_count: 1`
+- `column_names: MemberType, Description, Level`
+- `default_member_type_seen: true`
+- confirmed row:
+  - `MemberType: Default`
+  - `Description: Default`
+  - `Level: 1`
+
+The next safe live step is a no-save `MemberCommand` schema probe. It may create `MemberCommand`, call `GetNextMemberNo()` without outputting the actual generated number, call `NewMember(false)` to obtain an in-memory `MemberEntity`, and emit sanitized column metadata only. Existing member/customer record reads, member browse, member create/update/delete, SQL, DBSetting data methods, and any save path remain blocked.
 
 The preferred direction remains a local desktop bridge running on the AC2 machine, using the official AutoCount assemblies and session/bootstrap path once confirmed. The next unknown is constructor/bootstrap: how to obtain the required `DBSetting`/`UserSession` context and instantiate the member command types without bypassing AutoCount application rules.
 
@@ -187,11 +208,9 @@ Until AOTG member write access is confirmed in the real X-Boundaries environment
 
 - Whether the account book has the API Module license enabled.
 - Whether the Bonus Point module is enabled in the target account book.
-- The exact configured `MemberType` values available in Bonus Point > Member Type Maintenance.
-- Whether `MemberType = Default`, observed in the UI, is the correct production/default member type for form signups.
+- Whether `MemberType = Default`, now API-confirmed by read-only browse, is the approved business default for form signups.
 - Whether `GetNextMemberNo()` works without additional numbering setup in the target account book.
-- How to obtain official `AutoCount.Authentication.UserSession` and `AutoCount.Data.DBSetting` instances for the installed `AutoCount.BonusPoint.Member.MemberCommand` and `MemberTypeCommand` public static Create factories.
-- Whether a runtime-only session/auth probe can authenticate and make a `UserSession` available without member reads, member writes, SQL queries, or command factory invocation.
+- The no-save in-memory `MemberEntity` column schema and field constraints returned by the installed account book/API.
 - Whether mobile/email duplicate checks exist in AutoCount or must be enforced by the bridge.
 - Whether AOTG is subscribed, activated, and allowed to create/update members for the X-Boundaries account book.
 - Whether AOTG member create/update behavior matches the desktop assembly behavior for required fields, validation, duplicate handling, and error messages.

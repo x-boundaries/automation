@@ -8,8 +8,8 @@ Local reflection found `MemberEntity` in `AutoCount.Invoicing.dll` under namespa
 
 | Intake field | Installed AC2 field | Status |
 | --- | --- | --- |
-| Member number | `MemberNo` | Supported. Generation path still needs bootstrap/session confirmation through `MemberCommand.GetNextMemberNo()`. |
-| Member type | `MemberType` | Supported. `MemberType = Default` was observed in the UI, but production/default usage still requires operator confirmation. |
+| Member number | `MemberNo` | Supported. Generation path still needs no-save confirmation through `MemberCommand.GetNextMemberNo()` without exposing the actual generated number. |
+| Member type | `MemberType` | Supported. `MemberType = Default` is API-confirmed by read-only MemberType browse; production/default usage still requires operator confirmation. |
 | Name | `Name` | Supported. |
 | Mobile phone | `MobilePhone` | Supported. |
 | Email address | `EmailAddress` | Supported. |
@@ -56,8 +56,8 @@ Additional writable properties exist for address, profile, debtor linkage, openi
 
 | AutoCount field | Evidence | Mapping candidate | Status |
 | --- | --- | --- | --- |
-| `MemberNo` | Wiki member tables; v2 create/edit/delete examples; AOTG models; installed entity. | Auto-running via desktop `GetNextMemberNo()` or explicit future value. | Confirmed field; strategy open |
-| `MemberType` | Wiki member tables; v2 examples; AOTG models; installed entity. | Configured default member type for X-Boundaries intake. | Confirmed required field; actual value open |
+| `MemberNo` | Wiki member tables; v2 create/edit/delete examples; AOTG models; installed entity. | Auto-running via desktop `GetNextMemberNo()` or explicit future value. | Confirmed field; no-save generation diagnostic pending |
+| `MemberType` | Wiki member tables; v2 examples; AOTG models; installed entity; PR #68 read-only browse. | Candidate configured default member type for intake. | Required field; `Default` API-confirmed, business approval pending |
 | `Name` | Wiki member tables; v2 examples; AOTG models; installed entity. | `FullName`. | Confirmed field, inferred mapping |
 | `ID` / `Id` | Wiki examples/tables; AOTG models; installed entity has `ID`. | Not planned for public form unless a membership identifier is later added. | Confirmed field, open usage |
 | `Address1`-`Address4` | Wiki examples/tables; AOTG models; installed entity. | Not captured in current form. | Confirmed field, not mapped |
@@ -101,9 +101,9 @@ The current validator emits the future bridge payload shape without calling Auto
 }
 ```
 
-`member_type` is intentionally not hard-coded to a production value in docs. The real value must be confirmed in Bonus Point > Member Type Maintenance.
+`member_type` is intentionally not hard-coded to a production write value in docs. PR #68 confirmed `MemberType = Default` exists by read-only API browse, but using it for form signups still needs business approval.
 
-`MemberType = Default` is observed in UI, but production/default usage still requires operator confirmation.
+For now, member creation remains blocked until the no-save schema probe confirms the in-memory `MemberEntity` schema and a later dry-run mapping pass proves the exact field assignment behavior without saving.
 
 If `MemberType` is missing, the validator uses `OPEN_MEMBER_TYPE` only as a visible placeholder, returns a `member_type_unconfirmed` warning, and marks the payload `sync_eligible: false` and `dry_run_only: true`. That output is useful for planning and review, not for live member creation.
 
@@ -111,13 +111,13 @@ Checkbox-style long acknowledgement text is intentionally unsupported as direct 
 
 ## Open Questions
 
-- Which `MemberType` should be used for X-Boundaries form signups?
+- Should API-confirmed `MemberType = Default` be the approved business default for form signups?
 - Should `MemberNo` always be AutoCount auto-running, or should some legacy/external numbers be explicit?
 - Should duplicate detection use mobile, email, name, or a combination?
 - Where should PDPA and marketing consent be stored if AutoCount has no dedicated consent fields?
 - PDPA/marketing consent storage remains open. Possible options are UDF, `Note` with a sanitized marker, or external audit sheet only. Do not decide yet.
 - Should `Remarks` be internal-only rather than synced to AutoCount?
-- Constructor/bootstrap for `MemberCommand` remains open, so writeback mapping cannot be tested until the session pattern is proven in a sandbox.
+- No-save `MemberCommand` schema probing is the next step; writeback mapping cannot be tested until that probe and a later dry-run mapping pass are reviewed.
 
 ## Safety Notes
 

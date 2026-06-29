@@ -66,7 +66,7 @@ Bridge design constraints:
 
 ## Session/Auth Boundary
 
-The next permitted live probe is authentication only. It may create a `DBSetting` with the official `CreateAutoCountDefaultDBSetting` factory and call `UserSession.Authenticate` using runtime-only credentials.
+Authentication/session bootstrap is now proven with explicit `AllowRootLogin`. Earlier auth-only probes may create a `DBSetting` with the official `CreateAutoCountDefaultDBSetting` factory and call `UserSession.Authenticate` using runtime-only credentials.
 
 Session/auth constraints:
 
@@ -80,6 +80,21 @@ Session/auth constraints:
 - No DBSetting data methods in the auth probe.
 - Passwords must be supplied only through a runtime environment variable.
 - Sanitized output must not include server name, database name, user ID, password, connection strings, account book names, member data, or machine usernames.
+
+## No-Save MemberCommand Schema Boundary
+
+The next permitted live probe is no-save schema discovery for `MemberCommand`. It may use the proven `UserSession` and `DBSetting` flow, create `MemberCommand` through the public factory, call `GetNextMemberNo()` without returning the actual generated number, and call `NewMember(false)` only to obtain an in-memory `MemberEntity`.
+
+No-save schema constraints:
+
+- No existing member/customer records are read.
+- No member browse is allowed.
+- No member create/update/delete is allowed.
+- No member or MemberType save path is allowed.
+- No SQL queries, direct SQL writes, or DBSetting data methods are allowed.
+- Output is limited to sanitized booleans, generated-number length/nonempty flags, entity availability, and column schema metadata.
+- `MemberType = Default` is API-confirmed by read-only browse, but it must not be written into an entity in this probe.
+- Member creation automation remains blocked until this no-save schema probe and a later dry-run mapping pass are reviewed.
 
 ## Idempotency
 
