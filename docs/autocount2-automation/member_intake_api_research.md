@@ -194,7 +194,28 @@ PR #69 confirmed no-save `MemberCommand` schema discovery through the installed 
 
 Important PR #69 schema fields include `MemberNo`, `MemberType`, `Name`, `MobilePhone`, `EmailAddress`, `DOB`, `IsActive`, `RegisterDate`, `Note`, `OpeningPoints`, and `Individual`. `MemberNo`, `MemberType`, `IsActive`, `OpeningPoints`, and `Individual` are non-null fields in the in-memory table schema.
 
-The next safe live step is a fake-data no-save assignment probe. It may create `MemberCommand`, call `GetNextMemberNo()` without outputting the actual generated number, call `NewMember(false)` to obtain an in-memory `MemberEntity`, and assign synthetic fake data into the in-memory row only. Existing member/customer record reads, member browse, member create/update/delete, SQL, DBSetting data methods, and any save path remain blocked.
+PR #70 confirmed synthetic fake-data no-save assignment through the installed API:
+
+- `authentication_success: true`
+- `user_session_available: true`
+- `member_command_found: true`
+- `member_command_create_found: true`
+- `get_next_member_no_success: true`
+- `next_member_no_nonempty: true`
+- `next_member_no_length: 6`
+- `new_member_success: true`
+- `member_entity_available: true`
+- `member_row_available: true`
+- `all_required_assignment_success: true`
+- `all_intake_assignment_success: true`
+- `member_type_default_assignment_success: true`
+- `no_save_confirmed: true`
+
+PR #70 proved assignment for `MemberNo`, `MemberType`, `IsActive`, `OpeningPoints`, `Individual`, `Name`, `MobilePhone`, `EmailAddress`, `DOB`, `RegisterDate`, and `Note` using synthetic values only.
+
+This completed the fake-data no-save assignment probe and kept `SaveMember` blocked for that PR.
+
+The next safe live step is a save-gated fake member create proof. It may create `MemberCommand`, call `GetNextMemberNo()` without exposing the full generated number in the safe summary, call `NewMember(false)`, assign the proven synthetic fake data shape, and call `SaveMember(MemberEntity)` exactly once. Existing member/customer record reads, member browse, delete/cleanup automation, MemberType writes, SQL, DBSetting data methods, batch mode, Google Form input, n8n input, external payload input, and production member creation remain blocked.
 
 The preferred direction remains a local desktop bridge running on the AC2 machine, using the official AutoCount assemblies and session/bootstrap path once confirmed. The next unknown is constructor/bootstrap: how to obtain the required `DBSetting`/`UserSession` context and instantiate the member command types without bypassing AutoCount application rules.
 
@@ -228,7 +249,7 @@ Until AOTG member write access is confirmed in the real X-Boundaries environment
 - Whether the account book has the API Module license enabled.
 - Whether the Bonus Point module is enabled in the target account book.
 - Whether `MemberType = Default`, now API-confirmed by read-only browse, is the approved business default for form signups.
-- Whether synthetic fake intake values can be assigned to the no-save in-memory `MemberEntity` row without exceptions.
+- Whether AutoCount accepts a separately gated one-member synthetic fake create through `SaveMember(MemberEntity)` after the proven assignment path.
 - Whether mobile/email duplicate checks exist in AutoCount or must be enforced by the bridge.
 - Whether AOTG is subscribed, activated, and allowed to create/update members for the X-Boundaries account book.
 - Whether AOTG member create/update behavior matches the desktop assembly behavior for required fields, validation, duplicate handling, and error messages.
@@ -254,7 +275,7 @@ Until AOTG member write access is confirmed in the real X-Boundaries environment
 
 - Do not implement production writeback in this repo slice.
 - Do not reflect-call internal constructors or invoke command factories until the official `UserSession`/`DBSetting` path is confirmed.
-- Do not call `SaveMember`, `DeleteMember`, `SaveMemberType`, or `DeleteMemberType`.
+- Do not call `SaveMember`, `DeleteMember`, `SaveMemberType`, or `DeleteMemberType` except inside the separately approved, explicitly gated, single synthetic fake member create proof.
 - Do not write directly to SQL for member intake.
 - Do not commit real member PII, screenshots, account book credentials, SQL credentials, API keys, or local runtime outputs.
 - Keep probes metadata/reflection-only by default.
