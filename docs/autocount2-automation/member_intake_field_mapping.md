@@ -8,7 +8,7 @@ Local reflection found `MemberEntity` in `AutoCount.Invoicing.dll` under namespa
 
 | Intake field | Installed AC2 field | Status |
 | --- | --- | --- |
-| Member number | `MemberNo` | Supported. Generation path still needs no-save confirmation through `MemberCommand.GetNextMemberNo()` without exposing the actual generated number. |
+| Member number | `MemberNo` | Supported. Generation path is confirmed through no-save `MemberCommand.GetNextMemberNo()` without exposing the actual generated number. |
 | Member type | `MemberType` | Supported. `MemberType = Default` is API-confirmed by read-only MemberType browse; production/default usage still requires operator confirmation. |
 | Name | `Name` | Supported. |
 | Mobile phone | `MobilePhone` | Supported. |
@@ -74,7 +74,7 @@ The no-save schema probe confirmed the following in-memory column constraints fo
 
 | AutoCount field | Evidence | Mapping candidate | Status |
 | --- | --- | --- | --- |
-| `MemberNo` | Wiki member tables; v2 create/edit/delete examples; AOTG models; installed entity. | Auto-running via desktop `GetNextMemberNo()` or explicit future value. | Confirmed field; no-save generation diagnostic pending |
+| `MemberNo` | Wiki member tables; v2 create/edit/delete examples; AOTG models; installed entity; PR #69 and PR #70 local probes. | Auto-running via desktop `GetNextMemberNo()` or explicit future value. | Confirmed field; no-save generation and assignment proven |
 | `MemberType` | Wiki member tables; v2 examples; AOTG models; installed entity; PR #68 read-only browse. | Candidate configured default member type for intake. | Required field; `Default` API-confirmed, business approval pending |
 | `Name` | Wiki member tables; v2 examples; AOTG models; installed entity. | `FullName`. | Confirmed field, inferred mapping |
 | `ID` / `Id` | Wiki examples/tables; AOTG models; installed entity has `ID`. | Not planned for public form unless a membership identifier is later added. | Confirmed field, open usage |
@@ -123,7 +123,7 @@ The current validator emits the future bridge payload shape without calling Auto
 
 MemberType unresolved for production write use: `Default` is API-confirmed, but it is not yet approved as the business default for form signups.
 
-For now, member creation remains blocked until the fake-data no-save assignment dry run proves synthetic field assignment and a later save-gated proof is separately approved.
+For now, production member creation remains blocked. PR #70 proved no-save synthetic field assignment, but production member creation remains blocked until the save-gated fake member proof is reviewed and separate business approval exists.
 
 If `MemberType` is missing, the validator uses `OPEN_MEMBER_TYPE` only as a visible placeholder, returns a `member_type_unconfirmed` warning, and marks the payload `sync_eligible: false` and `dry_run_only: true`. That output is useful for planning and review, not for live member creation.
 
@@ -137,11 +137,11 @@ Checkbox-style long acknowledgement text is intentionally unsupported as direct 
 - Where should PDPA and marketing consent be stored if AutoCount has no dedicated consent fields?
 - PDPA/marketing consent storage remains open. Possible options are UDF, `Note` with a sanitized marker, or external audit sheet only. Do not decide yet.
 - Should `Remarks` be internal-only rather than synced to AutoCount?
-- Fake-data no-save assignment probing is the next step; writeback mapping cannot be tested until that probe and a later save-gated proof are reviewed.
+- Save-gated fake member create probing is the next step; writeback mapping cannot be used for production member creation until that proof is reviewed and separate business approval exists.
 
 ## Safety Notes
 
 - Do not commit real member PII or consent evidence.
 - Do not store production member exports in this repository.
 - Do not use direct SQL writes for member intake.
-- Do not call `SaveMember` until a separately approved sandbox write PR exists.
+- Do not call `SaveMember` for production member creation until the save-gated fake member proof is reviewed and explicit business approval exists.

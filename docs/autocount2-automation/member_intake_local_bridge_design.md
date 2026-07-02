@@ -138,6 +138,32 @@ Still blocked:
 - No generated member number, credentials, account book names, connection details, or runtime output in Git.
 - Member creation automation remains blocked until fake-data no-save assignment and a later save-gated proof are separately reviewed.
 
+## Save-Gated Fake Member Create Boundary
+
+After fake-data no-save assignment is confirmed, the next permitted live probe is a single synthetic fake member create proof.
+
+Allowed behavior:
+
+- Require all write opt-ins before loading AutoCount assemblies.
+- Create `MemberCommand` with the proven session and DBSetting.
+- Call `GetNextMemberNo()` but return only length, nonempty, and masked-number status in the safe summary.
+- Call `NewMember(false)` to obtain a new in-memory `MemberEntity`.
+- Assign exactly one synthetic fake member with the marker `XB_AUTOMATION_FAKE_CREATE_PROBE_DELETE_ME`.
+- Find and invoke `SaveMember(MemberEntity)` exactly once.
+- Record that manual cleanup may be needed in AutoCount UI.
+
+Still blocked:
+
+- No real customer/member data.
+- No batch mode.
+- No Google Form, n8n, or external payload input.
+- No existing member/customer records are read.
+- No member browse is allowed.
+- No delete or cleanup automation is allowed.
+- No member type create/update/delete path is allowed.
+- No direct SQL, SQL queries, or DBSetting data methods are allowed.
+- No production member creation automation exists until this proof is reviewed and explicit business approval is granted.
+
 ## Idempotency
 
 Every request must include a stable idempotency key, preferably `IntakeID`.
