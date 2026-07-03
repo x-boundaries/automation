@@ -215,7 +215,9 @@ PR #70 proved assignment for `MemberNo`, `MemberType`, `IsActive`, `OpeningPoint
 
 This completed the fake-data no-save assignment probe and kept `SaveMember` blocked for that PR.
 
-The next safe live step is a save-gated fake member create proof. It may create `MemberCommand`, call `GetNextMemberNo()` without exposing the full generated number in the safe summary, call `NewMember(false)`, assign the proven synthetic fake data shape, and call `SaveMember(MemberEntity)` exactly once. Existing member/customer record reads, member browse, delete/cleanup automation, MemberType writes, SQL, DBSetting data methods, batch mode, Google Form input, n8n input, external payload input, and production member creation remain blocked.
+The save-gated fake member create proof has now been proven with one explicitly gated synthetic fake member. That proof created `MemberCommand`, called `GetNextMemberNo()` without exposing the full generated number in the safe summary, called `NewMember(false)`, assigned the proven synthetic fake data shape, and called `SaveMember(MemberEntity)` once. Existing member/customer record reads, member browse, delete/cleanup automation, MemberType writes, SQL, DBSetting data methods, batch mode, Google Form input, n8n input, external payload input, and production member creation remained blocked for that proof.
+
+After the save-gated fake member proof, the current migration reconciliation need is a read-only member browse extract review. This local-only script uses the proven `DBSetting` and `UserSession` path, creates `AutoCount.BonusPoint.Member.MemberCommand` with the public `Create` factory, and calls `LoadBrowseTable` only after authentication succeeds. It is not an intake write path. The generated CSV may contain PII and personal data, so output must stay under the local review folder and must not be committed.
 
 The preferred direction remains a local desktop bridge running on the AC2 machine, using the official AutoCount assemblies and session/bootstrap path once confirmed. The next unknown is constructor/bootstrap: how to obtain the required `DBSetting`/`UserSession` context and instantiate the member command types without bypassing AutoCount application rules.
 
@@ -249,7 +251,7 @@ Until AOTG member write access is confirmed in the real X-Boundaries environment
 - Whether the account book has the API Module license enabled.
 - Whether the Bonus Point module is enabled in the target account book.
 - Whether `MemberType = Default`, now API-confirmed by read-only browse, is the approved business default for form signups.
-- Whether AutoCount accepts a separately gated one-member synthetic fake create through `SaveMember(MemberEntity)` after the proven assignment path.
+- Which current member rows and columns are returned by a read-only `MemberCommand.LoadBrowseTable` extract for migration reconciliation.
 - Whether mobile/email duplicate checks exist in AutoCount or must be enforced by the bridge.
 - Whether AOTG is subscribed, activated, and allowed to create/update members for the X-Boundaries account book.
 - Whether AOTG member create/update behavior matches the desktop assembly behavior for required fields, validation, duplicate handling, and error messages.

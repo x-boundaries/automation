@@ -140,7 +140,7 @@ Still blocked:
 
 ## Save-Gated Fake Member Create Boundary
 
-After fake-data no-save assignment is confirmed, the next permitted live probe is a single synthetic fake member create proof.
+After fake-data no-save assignment was confirmed, a single synthetic fake member create proof was permitted and has been proven.
 
 Allowed behavior:
 
@@ -162,7 +162,29 @@ Still blocked:
 - No delete or cleanup automation is allowed.
 - No member type create/update/delete path is allowed.
 - No direct SQL, SQL queries, or DBSetting data methods are allowed.
-- No production member creation automation exists until this proof is reviewed and explicit business approval is granted.
+- No production member creation automation exists until the proof is reviewed and explicit business approval is granted.
+
+## Read-Only Member Browse Extract Review Boundary
+
+For migration reconciliation, a separate local-only review script may browse existing members after the auth/session and member command path are proven.
+
+Allowed behavior:
+
+- Require explicit opt-in before loading AutoCount assemblies.
+- Read the AutoCount password only from the runtime `AC2_PROBE_PASSWORD` environment variable.
+- Create `MemberCommand` with the proven session and DBSetting.
+- Call `LoadBrowseTable` after successful authentication.
+- Write private local CSV and summary files only under the requested output directory.
+
+Still blocked:
+
+- No member create/update/delete path.
+- No member entity creation or save path.
+- No direct SQL, SQL queries, or DBSetting data methods.
+- No generated output in Git.
+- No raw member rows in PR comments, chat, tickets, or screenshots.
+
+The output contains PII and personal data and must not be committed. Share only sanitized status fields after local review.
 
 ## Idempotency
 
