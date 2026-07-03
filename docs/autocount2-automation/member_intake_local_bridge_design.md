@@ -203,7 +203,7 @@ Allowed behavior:
 
 - Require explicit `-EnableMemberLookupReview` before loading AutoCount assemblies.
 - Read the AutoCount password only from the runtime `AC2_PROBE_PASSWORD` environment variable.
-- Normalize the submitted value the same way as the intake validator: keep digits only, canonicalize Singapore 8-digit mobile shapes to `65XXXXXXXX`, keep valid 10-digit `65` values, keep other cleaned shapes as `manual_review`, and cap at 20 characters.
+- Normalize the submitted value the same way as the intake validator: remove symbols while keeping letters and digits, canonicalize Singapore 8-digit mobile shapes to `65XXXXXXXX`, keep valid 10-digit `65` values, keep other cleaned shapes as `manual_review`, and reject cleaned values over 20 characters before lookup.
 - Create `MemberCommand` with the proven session and DBSetting.
 - Call `MemberCommand.GetMember(normalizedMemberNo)` only.
 - Return sanitized and PII-free status JSON only.

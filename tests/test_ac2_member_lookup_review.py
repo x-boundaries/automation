@@ -83,16 +83,44 @@ class Ac2MemberLookupReviewStaticTests(unittest.TestCase):
         script = SCRIPT.read_text(encoding="utf-8")
 
         self.assertIn("Normalize-MemberNo", script)
-        self.assertRegex(script, r"\[regex\]::Replace\(\$RawMemberNo,\s*['\"]\\D['\"],\s*['\"]['\"]\)")
-        self.assertRegex(script, r"\$digits\.Length\s+-eq\s+8")
-        self.assertRegex(script, r"\$digits\.StartsWith\(['\"]8['\"]\)")
-        self.assertRegex(script, r"\$digits\.StartsWith\(['\"]9['\"]\)")
-        self.assertIn('"65" + $digits', script)
-        self.assertRegex(script, r"\$digits\.Length\s+-eq\s+10")
-        self.assertRegex(script, r"\$digits\.StartsWith\(['\"]65['\"]\)")
+        self.assertIn('[regex]::Replace($RawMemberNo, "[^A-Za-z0-9]", "")', script)
+        self.assertIn('[regex]::IsMatch($cleaned, "^\\d+$")', script)
+        self.assertRegex(script, r"\$isAllDigits\s+-and\s+\$cleaned\.Length\s+-eq\s+8")
+        self.assertRegex(script, r"\$cleaned\.StartsWith\(['\"]8['\"]\)")
+        self.assertRegex(script, r"\$cleaned\.StartsWith\(['\"]9['\"]\)")
+        self.assertIn('"65" + $cleaned', script)
+        self.assertRegex(script, r"\$isAllDigits\s+-and\s+\$cleaned\.Length\s+-eq\s+10")
+        self.assertRegex(script, r"\$cleaned\.StartsWith\(['\"]65['\"]\)")
         self.assertIn("manual_review", script)
         self.assertIn("normalized_member_no_length", script)
-        self.assertRegex(script, r"\.Substring\(0,\s*20\)")
+        self.assertNotRegex(script, r"\.Substring\(0,\s*20\)")
+
+    def test_script_rejects_over_20_cleaned_member_no_before_lookup_without_truncation(self):
+        script = SCRIPT.read_text(encoding="utf-8")
+
+        self.assertIn("invalid_too_long", script)
+        self.assertIn("TooLong", script)
+        self.assertIn('Submitted value exceeds AutoCount MemberNo length after cleaning.', script)
+        self.assertNotRegex(script, r"\.Substring\(0,\s*20\)")
+
+        length_assignment_index = script.index("$result.normalized_member_no_length = $normalization.Value.Length")
+        too_long_check_index = script.index("if ($normalization.TooLong)")
+        resolver_add_index = script.index("add_AssemblyResolve")
+        core_load_index = script.index("$coreAssembly = [System.Reflection.Assembly]::LoadFrom")
+        get_member_index = script.index("getMemberMethod.Invoke")
+        self.assertLess(length_assignment_index, too_long_check_index)
+        self.assertLess(too_long_check_index, resolver_add_index)
+        self.assertLess(too_long_check_index, core_load_index)
+        self.assertLess(too_long_check_index, get_member_index)
+
+    def test_script_preserves_alphanumeric_manual_review_shapes(self):
+        script = SCRIPT.read_text(encoding="utf-8")
+
+        self.assertIn('$cleaned = [regex]::Replace($RawMemberNo, "[^A-Za-z0-9]", "")', script)
+        self.assertIn("$normalized = $cleaned", script)
+        self.assertIn("$isAllDigits", script)
+        self.assertNotIn('[regex]::Replace($RawMemberNo, "\\D", "")', script)
+        self.assertRegex(script, r"elseif\s*\(\$isAllDigits\s+-and\s+\$cleaned\.Length\s+-eq\s+10")
 
     def test_script_outputs_only_sanitized_schema_and_no_pii_fields(self):
         script = SCRIPT.read_text(encoding="utf-8")
@@ -163,12 +191,15 @@ class Ac2MemberLookupReviewStaticTests(unittest.TestCase):
         for field in OUTPUT_FIELDS:
             self.assertIn(f"`{field}`", runbook)
 
-        self.assertIn("remove spaces, plus signs, dashes, brackets, dots, symbols", runbook)
+        self.assertIn("remove spaces, plus signs, dashes, brackets, dots, underscores, and symbols", runbook)
         self.assertIn("8 digits starting with 8 or 9", runbook)
         self.assertIn("65XXXXXXXX", runbook)
         self.assertIn("10 digits starting with 65", runbook)
         self.assertIn("manual_review", runbook)
-        self.assertIn("max 20 characters", runbook)
+        self.assertIn("over 20 characters", runbook)
+        self.assertIn("rejected before lookup", runbook)
+        self.assertIn("manual-review shapes may be looked up only if they are 20 characters or fewer", runbook)
+        self.assertNotRegex(runbook, r"(?i)truncate|truncated")
 
 
 if __name__ == "__main__":

@@ -60,13 +60,13 @@ It does not use member browse output, direct SQL, write SQL, or member save/dele
 
 The submitted value is normalized before lookup:
 
-- remove spaces, plus signs, dashes, brackets, dots, symbols, and other non-digits,
+- remove spaces, plus signs, dashes, brackets, dots, underscores, and symbols while keeping letters and digits,
 - if exactly 8 digits starting with 8 or 9, canonicalize to `65XXXXXXXX`,
 - if already 10 digits starting with 65, keep as-is,
-- keep other cleaned shapes but mark `manual_review`,
-- truncate to max 20 characters for AutoCount `MemberNo`.
+- keep other digit or alphanumeric cleaned shapes but mark `manual_review`,
+- reject cleaned values over 20 characters before lookup with `submitted_member_no_status = invalid_too_long`.
 
-If the shape is `manual_review`, the script still allows lookup and sets `manual_review_required = true`.
+manual-review shapes may be looked up only if they are 20 characters or fewer, and the script sets `manual_review_required = true`. Values over 20 characters are rejected before lookup; the script does not call `MemberCommand.GetMember` for them.
 
 ## Sanitized Output
 

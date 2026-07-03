@@ -68,26 +68,28 @@ function Get-RequiredValue {
 function Normalize-MemberNo {
     param([string]$RawMemberNo)
 
-    $digits = [regex]::Replace($RawMemberNo, "\D", "")
+    $cleaned = [regex]::Replace($RawMemberNo, "[^A-Za-z0-9]", "")
+    $isAllDigits = [regex]::IsMatch($cleaned, "^\d+$")
     $status = "manual_review"
-    $normalized = $digits
+    $normalized = $cleaned
     $manualReview = $true
+    $tooLong = $false
 
-    if ($digits.Length -eq 8 -and ($digits.StartsWith("8") -or $digits.StartsWith("9"))) {
-        $normalized = "65" + $digits
+    if ($isAllDigits -and $cleaned.Length -eq 8 -and ($cleaned.StartsWith("8") -or $cleaned.StartsWith("9"))) {
+        $normalized = "65" + $cleaned
         $status = "canonical_65_mobile"
         $manualReview = $false
     }
-    elseif ($digits.Length -eq 10 -and $digits.StartsWith("65")) {
-        $normalized = $digits
+    elseif ($isAllDigits -and $cleaned.Length -eq 10 -and $cleaned.StartsWith("65")) {
+        $normalized = $cleaned
         $status = "already_65_mobile"
         $manualReview = $false
     }
 
     if ($normalized.Length -gt 20) {
-        $normalized = $normalized.Substring(0, 20)
+        $tooLong = $true
         $manualReview = $true
-        $status = "manual_review"
+        $status = "invalid_too_long"
     }
 
     if ([string]::IsNullOrWhiteSpace($normalized)) {
@@ -99,6 +101,7 @@ function Normalize-MemberNo {
         Value = $normalized
         Status = $status
         ManualReview = $manualReview
+        TooLong = $tooLong
     }
 }
 
@@ -250,30 +253,10 @@ function Find-PublicStaticMethodByTypes {
 $result = New-ConsoleResult "started"
 $warnings = @()
 $normalizedForSecretScrub = $null
-
-$assemblyResolveHandler = [System.ResolveEventHandler]{
-    param($sender, $eventArgs)
-
-    $assemblyName = [System.Reflection.AssemblyName]::new($eventArgs.Name)
-    $candidatePath = Join-Path $script:DllRootPath ($assemblyName.Name + ".dll")
-    if (Test-Path -LiteralPath $candidatePath -PathType Leaf) {
-        return [System.Reflection.Assembly]::LoadFrom($candidatePath)
-    }
-
-    return $null
-}
-[System.AppDomain]::CurrentDomain.add_AssemblyResolve($assemblyResolveHandler)
+$assemblyResolveHandler = $null
 
 try {
-    $serverForReview = Get-RequiredValue "ServerName" $ServerName "AC2_PROBE_SERVER_NAME"
-    $databaseForReview = Get-RequiredValue "DatabaseName" $DatabaseName "AC2_PROBE_DATABASE_NAME"
-    $userForReview = Get-RequiredValue "UserId" $UserId "AC2_PROBE_USER_ID"
     $memberForReview = Get-RequiredValue "MemberNo" $MemberNo "MemberNo"
-    $passwordForReview = [Environment]::GetEnvironmentVariable("AC2_PROBE_PASSWORD")
-    if ([string]::IsNullOrEmpty($passwordForReview)) {
-        throw "Environment variable 'AC2_PROBE_PASSWORD' is required for this PowerShell process."
-    }
-
     $normalization = Normalize-MemberNo $memberForReview
     $normalizedForSecretScrub = $normalization.Value
     $result.submitted_member_no_status = $normalization.Status
@@ -282,9 +265,34 @@ try {
     if ($result.manual_review_required) {
         $warnings += "Submitted value shape requires manual review."
     }
+    if ($normalization.TooLong) {
+        $warnings += "Submitted value exceeds AutoCount MemberNo length."
+        throw "Submitted value exceeds AutoCount MemberNo length after cleaning."
+    }
     if ([string]::IsNullOrWhiteSpace($normalization.Value)) {
         throw "Submitted value did not contain any lookup characters after normalization."
     }
+
+    $serverForReview = Get-RequiredValue "ServerName" $ServerName "AC2_PROBE_SERVER_NAME"
+    $databaseForReview = Get-RequiredValue "DatabaseName" $DatabaseName "AC2_PROBE_DATABASE_NAME"
+    $userForReview = Get-RequiredValue "UserId" $UserId "AC2_PROBE_USER_ID"
+    $passwordForReview = [Environment]::GetEnvironmentVariable("AC2_PROBE_PASSWORD")
+    if ([string]::IsNullOrEmpty($passwordForReview)) {
+        throw "Environment variable 'AC2_PROBE_PASSWORD' is required for this PowerShell process."
+    }
+
+    $assemblyResolveHandler = [System.ResolveEventHandler]{
+        param($sender, $eventArgs)
+
+        $assemblyName = [System.Reflection.AssemblyName]::new($eventArgs.Name)
+        $candidatePath = Join-Path $script:DllRootPath ($assemblyName.Name + ".dll")
+        if (Test-Path -LiteralPath $candidatePath -PathType Leaf) {
+            return [System.Reflection.Assembly]::LoadFrom($candidatePath)
+        }
+
+        return $null
+    }
+    [System.AppDomain]::CurrentDomain.add_AssemblyResolve($assemblyResolveHandler)
 
     if (-not (Test-Path -LiteralPath $script:DllRootPath -PathType Container)) {
         throw "AC2 DLL root path was not found."
@@ -398,7 +406,9 @@ catch {
     }
 }
 finally {
-    [System.AppDomain]::CurrentDomain.remove_AssemblyResolve($assemblyResolveHandler)
+    if ($null -ne $assemblyResolveHandler) {
+        [System.AppDomain]::CurrentDomain.remove_AssemblyResolve($assemblyResolveHandler)
+    }
     Remove-Variable passwordForReview -ErrorAction SilentlyContinue
 }
 
