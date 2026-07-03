@@ -217,6 +217,35 @@ Still blocked:
 - No raw `MemberNo`, name, email, phone, DOB, address, AutoKey, Guid, account book, credential, or local target details in output.
 - This probe must not be used as final write automation.
 
+## Dry-Run Decision Review Boundary
+
+For the next dry-run orchestration layer, a Python decision runner may combine Google Form validator results with sanitized AC2 lookup JSONL or a planned lookup pass.
+
+Business rules:
+
+- AC2 / AutoCount 2.0 remains the source of truth.
+- The Google Form mobile/member number maps to AutoCount `MemberNo`.
+- AutoCount `MobilePhone` is intentionally unused.
+- Birthday Month maps to future `DOB` as `2000-MM-01`, but DOB must not appear in row-level decision output.
+- Old POS and side sheet data are reference-only.
+- `Imported` in the PDPA field remains blocked and must not be treated as consent.
+
+Allowed behavior:
+
+- Reuse the Google Form validator's row validity and MemberNo normalization rules.
+- Consume sanitized lookup JSONL keyed by row number, or emit `planned_live_lookup` review decisions without executing live lookup.
+- Write local review artifacts containing counts, row numbers, decision codes, lookup status codes, and issue codes only.
+
+Still blocked:
+
+- No AutoCount writes.
+- No member create/update/delete path.
+- No live lookup execution inside the Python decision runner.
+- No direct SQL or SQL read/write query.
+- No n8n production workflow creation.
+- No raw name, email, phone, MemberNo, DOB, address, AutoKey, Guid, server, database, user, password, or other PII in row-level output.
+- This layer must not be used as final write automation.
+
 ## Idempotency
 
 Every request must include a stable idempotency key, preferably `IntakeID`.

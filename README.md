@@ -20,6 +20,7 @@ Task tracking, pending-work dashboards, completed-task logs, and personal planni
 - `scripts/ac2_member_browse_extract_review.ps1`: explicit opt-in read-only local member browse extract for migration reconciliation review; output contains PII and must not be committed.
 - `scripts/ac2_member_lookup_review.ps1`: explicit opt-in read-only local member lookup for future duplicate checking; AC2 is source of truth, Google Form mobile/member number maps to AutoCount `MemberNo`, AutoCount `MobilePhone` is intentionally unused, and it does not create/update/delete members.
 - `scripts/member_intake_validate.py`: dry-run-only validator/normalizer for Google Form member intake CSV rows, with optional matching against a private local AC2 member extract; it never creates, updates, or deletes AutoCount members, and its row-level outputs contain PII and must stay local.
+- `scripts/member_intake_decision_review.py`: dry-run-only decision review layer that combines validated Google Form rows with sanitized AC2 lookup JSONL or planned lookup review; AC2 remains source of truth, it does not create/update/delete members, and row-level outputs contain only row numbers, status codes, and issue codes.
 - `scripts/autocount_stock_extract.py`: stock extraction/archive workflow for AutoCount stock master, stock balance, and stock movement datasets.
 - `scripts/install_autocount_stock_extract_task.ps1`: Windows Task Scheduler installer for the stock extraction job.
 
@@ -47,10 +48,11 @@ Keep all generated AutoCount outputs under `C:\XB\autocount_outputs`:
 - Member browse extract review: `C:\XB\autocount_outputs\review\member_browse_extract`
 - Member lookup review: sanitized console JSON only; no local member data output file is required.
 - Member intake dry-run validation: `C:\XB\autocount_outputs\review\member_intake_validation`
+- Member intake dry-run decision review: `C:\XB\autocount_outputs\review\member_intake_decision`
 - Phase 1 reconciliation: `C:\XB\autocount_outputs\reconcile`
 - Stock extraction: `C:\XB\autocount_outputs\extract\stock`
 
-Raw CSVs and member browse extracts stay local and must not be committed. Member browse output contains PII and personal data; paste back only reviewed sanitized status fields or safe summaries.
+Raw CSVs and member browse extracts stay local and must not be committed. Member browse output contains PII and personal data; paste back only reviewed sanitized status fields or safe summaries. Decision-review outputs are designed to be PII-free, but they are still local review artifacts and must not be used as final write automation.
 
 ## Runbooks And Design Notes
 
@@ -72,6 +74,7 @@ Raw CSVs and member browse extracts stay local and must not be committed. Member
 - [AC2 member browse extract review runbook](docs/autocount2-automation/member_browse_extract_review_runbook.md)
 - [AC2 member lookup review runbook](docs/autocount2-automation/member_lookup_review_runbook.md)
 - [Member form intake contract (dry-run validator)](docs/autocount2-automation/member_form_intake_contract.md)
+- [Member intake decision review runbook](docs/autocount2-automation/member_intake_decision_review_runbook.md)
 - [AutoCount 2 MVP plan](docs/autocount2-automation/mvp_plan.md)
 - [Extraction surface decision pack](docs/autocount2-automation/extraction_surface_decision.md)
 - [AC2 read-only SQL login validation runbook](docs/autocount2-automation/readonly_sql_login_runbook.md)
