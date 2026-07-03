@@ -17,6 +17,7 @@ Task tracking, pending-work dashboards, completed-task logs, and personal planni
 - `scripts/ac2_member_no_save_schema_probe.ps1`: explicit opt-in local MemberCommand no-save schema probe for an in-memory MemberEntity only.
 - `scripts/ac2_member_no_save_assignment_probe.ps1`: explicit opt-in local MemberCommand fake-data no-save assignment probe for an in-memory MemberEntity row only.
 - `scripts/ac2_member_fake_create_probe.ps1`: explicitly gated local write probe that creates exactly one synthetic fake AutoCount member only after all write confirmations are supplied.
+- `scripts/ac2_member_browse_extract_review.ps1`: explicit opt-in read-only local member browse extract for migration reconciliation review; output contains PII and must not be committed.
 - `scripts/autocount_stock_extract.py`: stock extraction/archive workflow for AutoCount stock master, stock balance, and stock movement datasets.
 - `scripts/install_autocount_stock_extract_task.ps1`: Windows Task Scheduler installer for the stock extraction job.
 
@@ -41,10 +42,11 @@ Keep all generated AutoCount outputs under `C:\XB\autocount_outputs`:
 - Broader surface discovery: `C:\XB\autocount_outputs\probe\broader_surfaces`
 - Inventory operation discovery: `C:\XB\autocount_outputs\probe\inventory_operations`
 - Member intake API discovery review: `C:\XB\autocount_outputs\review\member_intake_discovery`
+- Member browse extract review: `C:\XB\autocount_outputs\review\member_browse_extract`
 - Phase 1 reconciliation: `C:\XB\autocount_outputs\reconcile`
 - Stock extraction: `C:\XB\autocount_outputs\extract\stock`
 
-Raw CSVs stay local and must not be committed. Paste back only reviewed manifests and safe summaries.
+Raw CSVs and member browse extracts stay local and must not be committed. Member browse output contains PII and personal data; paste back only reviewed sanitized status fields or safe summaries.
 
 ## Runbooks And Design Notes
 
@@ -63,6 +65,7 @@ Raw CSVs stay local and must not be committed. Paste back only reviewed manifest
 - [AC2 member no-save schema probe runbook](docs/autocount2-automation/member_no_save_schema_probe_runbook.md)
 - [AC2 member no-save assignment probe runbook](docs/autocount2-automation/member_no_save_assignment_probe_runbook.md)
 - [AC2 member fake create probe runbook](docs/autocount2-automation/member_fake_create_probe_runbook.md)
+- [AC2 member browse extract review runbook](docs/autocount2-automation/member_browse_extract_review_runbook.md)
 - [AutoCount 2 MVP plan](docs/autocount2-automation/mvp_plan.md)
 - [Extraction surface decision pack](docs/autocount2-automation/extraction_surface_decision.md)
 - [AC2 read-only SQL login validation runbook](docs/autocount2-automation/readonly_sql_login_runbook.md)
