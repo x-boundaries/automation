@@ -11,7 +11,7 @@ Google Form -> Google Sheets -> n8n validation workflow -> local bridge -> AutoC
 The first rollout should stop before live writeback:
 
 ```text
-Google Form -> Google Sheets -> n8n draft workflow/design -> dry-run validator -> manual review
+Google Form -> Google Sheets -> n8n draft workflow/design -> dry-run validator -> read-only AC2 member lookup -> manual review
 ```
 
 ## System Roles
@@ -23,6 +23,8 @@ Google Form -> Google Sheets -> n8n draft workflow/design -> dry-run validator -
 | n8n | Orchestration, validation, approval-state transitions, retry/dead-letter routing. | Not source of truth |
 | Local bridge | Future controlled adapter between n8n and official AutoCount APIs. | Not source of truth |
 | AutoCount 2.0 | Final member record, member number, member type, bonus point membership state. | Source of truth |
+
+Current duplicate-check rule: the Google Form mobile/member number maps to AutoCount `MemberNo`, AutoCount `MobilePhone` is intentionally unused, Birthday Month maps to future `DOB` as `2000-MM-01`, and old POS or side-sheet values are reference-only. The read-only member lookup review does not create/update/delete members.
 
 ## Why Google Sheet Is Intake/Audit Queue Only
 
@@ -131,10 +133,12 @@ Included:
 - Local bridge design.
 - Discovery runbook.
 - Python dry-run validator with synthetic tests.
+- Explicitly gated, sanitized, read-only AC2 `MemberNo` lookup review for future duplicate checking.
 
 Excluded:
 
 - Production AutoCount writeback.
+- Final write automation.
 - Direct SQL writes.
 - n8n production workflow creation.
 - AutoCount DLL dependency in CI.

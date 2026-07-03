@@ -1,6 +1,8 @@
 # Member Intake Field Mapping
 
-Status: planning draft, partially superseded. Confirmed fields come from AutoCount wiki pages, AOTG public Swagger, and installed AC2 2.2 local reflection. The live Google Form contract and dry-run validator behavior are now defined in [member_form_intake_contract.md](member_form_intake_contract.md); the form field tables below have been updated to match it. Inferred write mappings still require sandbox validation before use.
+Status: planning draft, partially superseded. Confirmed fields come from AutoCount wiki pages, AOTG public Swagger, installed AC2 2.2 local reflection, and local read-only probes. The live Google Form contract and dry-run validator behavior are now defined in [member_form_intake_contract.md](member_form_intake_contract.md); the form field tables below have been updated to match it. Inferred write mappings still require sandbox validation before use.
+
+Current member-intake lookup rule: AC2 / AutoCount 2.0 is the source of truth. The Google Form mobile/member number maps to AutoCount `MemberNo`; AutoCount `MobilePhone` is intentionally unused for the duplicate-check and intake identity path. The old POS member list and side sheet are reference-only. This lookup boundary does not create/update/delete members.
 
 ## Installed `MemberEntity` Support
 
@@ -11,7 +13,7 @@ Local reflection found `MemberEntity` in `AutoCount.Invoicing.dll` under namespa
 | Member number | `MemberNo` | Supported. Generation path is confirmed through no-save `MemberCommand.GetNextMemberNo()` without exposing the actual generated number. |
 | Member type | `MemberType` | Supported. `MemberType = Default` is API-confirmed by read-only MemberType browse; production/default usage still requires operator confirmation. |
 | Name | `Name` | Supported. |
-| Mobile phone | `MobilePhone` | Supported. |
+| Mobile phone | `MobilePhone` | Supported by the installed entity, but intentionally unused for the current member intake duplicate-check path. |
 | Email address | `EmailAddress` | Supported. |
 | Date of birth | `DOB` | Supported. |
 | Active flag | `IsActive` | Supported. |
@@ -117,6 +119,8 @@ The current validator normalizes each Google Form CSV row to the shape below wit
 `mobile_phone` is always empty on purpose: the phone number already serves as `MemberNo`, and AutoCount `MobilePhone` is intentionally unused. Blank is by design, not missing data.
 
 `MemberType` is not collected by the live form and is not part of the validator output. MemberType unresolved for production write use: PR #68 confirmed `MemberType = Default` exists by read-only API browse, but it is not yet approved as the business default for form signups.
+
+Read-only member lookup review: `scripts/ac2_member_lookup_review.ps1` uses the proven local API path and `MemberCommand.GetMember(normalizedMemberNo)` to check whether the submitted mobile/member number already exists as an AutoCount `MemberNo`. Output is sanitized and PII-free. It is intended for future n8n/local bridge duplicate checking, does not create/update/delete members, and must not be used as final write automation.
 
 For now, production member creation remains blocked. PR #70 proved no-save synthetic field assignment and PR #71 proved a save-gated fake create, but live writeback requires a separate approval PR/runbook.
 

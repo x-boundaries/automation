@@ -186,6 +186,37 @@ Still blocked:
 
 The output contains PII and personal data and must not be committed. Share only sanitized status fields after local review.
 
+## Read-Only Member Lookup Review Boundary
+
+For future n8n/local bridge duplicate checking, a separate local-only review script may check one submitted member number after the auth/session and `MemberCommand` path are proven.
+
+Business rules:
+
+- AC2 / AutoCount 2.0 is the source of truth.
+- The Google Form mobile/member number maps to AutoCount `MemberNo`.
+- AutoCount `MobilePhone` is intentionally unused for this duplicate-check path.
+- Birthday Month maps to future `DOB` as `2000-MM-01`, but DOB is outside this lookup probe.
+- Old POS and side sheet data are reference-only.
+- The read-only lookup review does not create/update/delete members.
+
+Allowed behavior:
+
+- Require explicit `-EnableMemberLookupReview` before loading AutoCount assemblies.
+- Read the AutoCount password only from the runtime `AC2_PROBE_PASSWORD` environment variable.
+- Normalize the submitted value the same way as the intake validator: remove symbols while keeping letters and digits, canonicalize Singapore 8-digit mobile shapes to `65XXXXXXXX`, keep valid 10-digit `65` values, keep other cleaned shapes as `manual_review`, and reject cleaned values over 20 characters before lookup.
+- Create `MemberCommand` with the proven session and DBSetting.
+- Call `MemberCommand.GetMember(normalizedMemberNo)` only.
+- Return sanitized and PII-free status JSON only.
+
+Still blocked:
+
+- No member create/update/delete path.
+- No member browse output for this lookup script.
+- No member entity creation or save path.
+- No direct SQL, SQL queries, write SQL, or DBSetting data methods.
+- No raw `MemberNo`, name, email, phone, DOB, address, AutoKey, Guid, account book, credential, or local target details in output.
+- This probe must not be used as final write automation.
+
 ## Idempotency
 
 Every request must include a stable idempotency key, preferably `IntakeID`.
