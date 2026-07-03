@@ -57,14 +57,12 @@ If AOTG is later selected, it must still follow the same approval, idempotency, 
 
 ## Privacy And PDPA Considerations
 
-Member intake contains personal data: name, mobile number, email, birth date, country, consent status, and free-text remarks. Treat every form row as sensitive.
+Member intake contains personal data: name, mobile number (used as the AutoCount member number), email, birthday month, and consent status. Treat every form row as sensitive.
 
-Google Form consent controls must be configured as **Multiple choice** fields with exact operator-facing values:
+Google Form consent controls use these live export values (full contract: [member_form_intake_contract.md](member_form_intake_contract.md)):
 
-- `PDPAAcknowledged`: `Yes` / `No`
-- `MarketingConsent`: `Yes` / `No`
-
-Do not use a checkbox-style long acknowledgement as direct validator input. Google Forms can export the full checkbox option text, which is intentionally rejected by the dry-run validator unless n8n or another normalization step converts it to exact `Yes` or `No` first.
+- `PDPA Acknowledged`: checkbox exporting `I agree`, accepted case-insensitively by the dry-run validator (legacy `Yes` also accepted). Any other value, including blank, flags the row `pdpa_blocked` and blocks sync eligibility without invalidating the row.
+- `Marketing Consent`: multiple choice with exact values `Yes` / `No`, accepted case-insensitively. `No` never blocks member registration; missing or unrecognized values make the row invalid.
 
 Minimum controls:
 
@@ -83,8 +81,8 @@ First rollout must require manual approval before any member write:
 
 1. Form submission lands in Google Sheet with `ApprovalStatus = Pending`.
 2. n8n or a local validator computes `ValidationStatus`.
-3. Operator reviews required fields, duplicate risk, consent flags, and selected `MemberType`.
-4. Operator confirms `MemberType` is a sandbox-confirmed AutoCount member type; placeholder `OPEN_MEMBER_TYPE` payloads are dry-run-only and not sync-eligible.
+3. Operator reviews required fields, dry-run match decisions (`EXISTING_MEMBER_REVIEW`, `POSSIBLE_CONFLICT_REVIEW`, `manual_review` member numbers), and consent flags.
+4. `MemberType` is not collected by the form; the operator selects a sandbox-confirmed AutoCount member type at the future write step, which still requires separate business approval.
 5. Operator sets `ApprovalStatus = Approved` only when ready.
 6. Dry-run bridge returns the proposed AutoCount payload.
 7. Live writeback remains disabled until a separate production approval PR/runbook exists.
