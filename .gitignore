@@ -153,6 +153,17 @@ autocount_outputs/**/member_intake_validation_rows.csv
 autocount_outputs/**/member_intake_validation_report.md
 autocount_outputs/**/member_intake_validation_manifest.json
 
+# Member intake dry-run decision review local outputs (PII-free but still local review artifacts)
+member_intake_decision_outputs/
+member_intake_decision_rows.csv
+member_intake_decision_report.md
+member_intake_decision_manifest.json
+PRIVATE_DO_NOT_COMMIT_MEMBER_INTAKE_DECISION.txt
+autocount_outputs/**/member_intake_decision_rows.csv
+autocount_outputs/**/member_intake_decision_report.md
+autocount_outputs/**/member_intake_decision_manifest.json
+autocount_outputs/**/PRIVATE_DO_NOT_COMMIT_MEMBER_INTAKE_DECISION.txt
+
 # Private local AC2 member extracts and form response exports must never be committed
 ac2_member_browse_extract*.csv
 ac2_member_browse_extract_summary*.json
