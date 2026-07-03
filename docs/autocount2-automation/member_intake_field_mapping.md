@@ -1,6 +1,6 @@
 # Member Intake Field Mapping
 
-Status: planning draft. Confirmed fields come from AutoCount wiki pages, AOTG public Swagger, and installed AC2 2.2 local reflection. Inferred mappings require sandbox validation before use.
+Status: planning draft, partially superseded. Confirmed fields come from AutoCount wiki pages, AOTG public Swagger, and installed AC2 2.2 local reflection. The live Google Form contract and dry-run validator behavior are now defined in [member_form_intake_contract.md](member_form_intake_contract.md); the form field tables below have been updated to match it. Inferred write mappings still require sandbox validation before use.
 
 ## Installed `MemberEntity` Support
 
@@ -39,20 +39,19 @@ The no-save schema probe confirmed the following in-memory column constraints fo
 | `OpeningPoints` | `System.Decimal` | non-null | Fake assignment uses zero only. |
 | `Individual` | `System.String` | non-null, max_length 1 | Prefer existing no-save row value; fallback to a one-character synthetic flag. |
 
-## Planned Google Form Fields
+## Live Google Form Fields
 
-| Form field | Required for dry-run | Planned normalization | Target use | Status |
+The earlier planned `FullName`/`MobileCountryCode`/`MobileNumber`/`BirthDate` form design is superseded. The live form collects the mobile number directly as the AutoCount member number and collects birthday month only. Full contract: [member_form_intake_contract.md](member_form_intake_contract.md).
+
+| Form field (exact header) | Required for dry-run | Normalization | Target use | Status |
 | --- | --- | --- | --- | --- |
-| `FullName` | Yes | Trim and collapse spaces. | AutoCount `Name`. | Inferred mapping to confirmed field |
-| `MobileCountryCode` | Yes | Digits only, stored with `+` in canonical payload. | Compose AutoCount `MobilePhone`. | Inferred |
-| `MobileNumber` | Yes | Digits only; local trunk prefix removed for canonical payload. | Compose AutoCount `MobilePhone`. | Inferred |
-| `Email` | No | Trim/lowercase; validate if present. | AutoCount `EmailAddress`. | Inferred mapping to confirmed field |
-| `BirthDate` | No | Preserve ISO date if supplied. | AutoCount `DOB` if supported in selected API path. | Confirmed in installed entity and AOTG model |
-| `CountryOfResidence` | No | Trim. | Address/country handling, reporting, or notes. | Open |
-| `SignupSource` | No | Trim. | Audit/bridge note; not confirmed AutoCount member field. | Open |
-| `MarketingConsent` | Yes | Multiple choice field with exact values `Yes` / `No`; validator accepts case-insensitive normalized values. | Consent flag for X-Boundaries process; not confirmed AutoCount field. | Open |
-| `PDPAAcknowledged` | Yes | Multiple choice field with exact values `Yes` / `No`; must be `Yes` before sync eligibility. | Compliance gate; not confirmed AutoCount field. | Open |
-| `Remarks` | No | Trim; avoid logging full text. | Potential AutoCount `Note` or internal-only review note. | Inferred |
+| `Timestamp` | No | Trim; kept as submission metadata. | Review metadata only. | Implemented |
+| `Full Name` | Yes | Trim and collapse repeated spaces. | AutoCount `Name`. | Implemented dry-run mapping |
+| `AutoCount MemberNo` | Yes | Strip symbols; canonicalize SG mobiles to `65XXXXXXXX`; other shapes kept but flagged `manual_review`; max 20 characters. | AutoCount `MemberNo` (phone-as-MemberNo business decision). | Implemented dry-run mapping |
+| `Email Address` | Yes | Trim, lowercase, basic format validation. | AutoCount `EmailAddress`. | Implemented dry-run mapping |
+| `Birthday Month` | Yes | Full month name January to December, case-insensitive. | AutoCount `DOB` as month-only sentinel `2000-MM-01`. | Implemented dry-run mapping |
+| `Marketing Consent` | Yes | Explicit `Yes` / `No`, case-insensitive. `No` never blocks registration. | Consent flag for X-Boundaries process; not a confirmed AutoCount field. | Implemented; storage open |
+| `PDPA Acknowledged` | Yes | Checkbox export `I agree` (or legacy `Yes`), case-insensitive. Not acknowledged blocks sync eligibility only. | Compliance gate; not a confirmed AutoCount field. | Implemented; storage open |
 
 ## Internal Processing Fields
 
@@ -60,7 +59,7 @@ The no-save schema probe confirmed the following in-memory column constraints fo
 | --- | --- | --- |
 | `IntakeID` | Stable idempotency key for one form submission. | Safe to log if it contains no PII. |
 | `SubmittedAt` | Original form timestamp. | Safe as metadata. |
-| `NormalizedMobile` | Canonical E.164-like phone string. | Treat as PII; do not dump in logs. |
+| `NormalizedMemberNo` | Canonical phone-as-MemberNo string (`65XXXXXXXX`). | Treat as PII; do not dump in logs. |
 | `NormalizedEmail` | Lowercase validated email. | Treat as PII; do not dump in logs. |
 | `ValidationStatus` | Validation state before approval. | Safe. |
 | `ApprovalStatus` | Human approval state. | Safe. |
@@ -74,7 +73,7 @@ The no-save schema probe confirmed the following in-memory column constraints fo
 
 | AutoCount field | Evidence | Mapping candidate | Status |
 | --- | --- | --- | --- |
-| `MemberNo` | Wiki member tables; v2 create/edit/delete examples; AOTG models; installed entity; PR #69 and PR #70 local probes. | Auto-running via desktop `GetNextMemberNo()` or explicit future value. | Confirmed field; no-save generation and assignment proven |
+| `MemberNo` | Wiki member tables; v2 create/edit/delete examples; AOTG models; installed entity; PR #69 and PR #70 local probes. | Submitted mobile number used directly as `MemberNo`, canonicalized to `65XXXXXXXX` for SG mobiles (business decision; see intake contract). | Confirmed field; phone-as-MemberNo decided for form intake |
 | `MemberType` | Wiki member tables; v2 examples; AOTG models; installed entity; PR #68 read-only browse. | Candidate configured default member type for intake. | Required field; `Default` API-confirmed, business approval pending |
 | `Name` | Wiki member tables; v2 examples; AOTG models; installed entity. | `FullName`. | Confirmed field, inferred mapping |
 | `ID` / `Id` | Wiki examples/tables; AOTG models; installed entity has `ID`. | Not planned for public form unless a membership identifier is later added. | Confirmed field, open usage |
@@ -83,9 +82,9 @@ The no-save schema probe confirmed the following in-memory column constraints fo
 | `AreaCode` | AOTG model; installed entity. | Not captured in current form. | Confirmed field, not mapped |
 | `Race` | Wiki member tables; AOTG models; installed entity. | Not captured in current form. | Confirmed field, not mapped |
 | `CompanyName` | Wiki member table; AOTG models; installed entity. | Not captured in current form. | Confirmed field, not mapped |
-| `MobilePhone` | Wiki member table; AOTG models; installed entity. | `+{MobileCountryCode}{MobileNumber}`. | Confirmed field, inferred mapping |
-| `EmailAddress` | Wiki member table; AOTG models; installed entity. | `Email`. | Confirmed field, inferred mapping |
-| `DOB` | AOTG model; installed entity. | `BirthDate`. | Confirmed field, inferred mapping |
+| `MobilePhone` | Wiki member table; AOTG models; installed entity. | Intentionally blank and unused: the phone number already serves as `MemberNo`. Blank is by design, not missing data. | Confirmed field, intentionally not mapped |
+| `EmailAddress` | Wiki member table; AOTG models; installed entity. | `Email Address` (required, trimmed, lowercased). | Confirmed field, implemented dry-run mapping |
+| `DOB` | AOTG model; installed entity. | `Birthday Month` as month-only sentinel `2000-MM-01`. | Confirmed field, implemented dry-run mapping |
 | `DebtorCode` | Wiki v2 sample; AOTG models; installed entity. | Not planned for member intake. | Confirmed field, open usage |
 | `IsActive` | Wiki v2 sample; AOTG models; installed entity. | Default active for approved new member. | Confirmed field, inferred default |
 | `Note` | AOTG model; installed entity. | Maybe sanitized `Remarks` or internal reference only. | Confirmed field, open |
@@ -95,49 +94,48 @@ The no-save schema probe confirmed the following in-memory column constraints fo
 | `OpeningPoints` | AOTG model; installed entity. | Must not be set by intake unless separately approved. | Confirmed field, out of scope |
 | `UserData` | Installed entity. | Possible UDF carrier. | Confirmed installed property; exact UDF shape open |
 
-## Dry-Run Canonical Payload
+## Dry-Run Normalized Row
 
-The current validator emits the future bridge payload shape without calling AutoCount:
+The current validator normalizes each Google Form CSV row to the shape below without calling AutoCount (synthetic example values only):
 
 ```json
 {
-  "intake_id": "INT-001",
-  "member_no_strategy": "auto",
-  "member_type": "STANDARD",
-  "full_name": "Jane Tan",
-  "mobile": "+6591234567",
-  "email": "jane.tan@example.com",
-  "birth_date": "1990-01-02",
-  "country": "Singapore",
-  "signup_source": "Google Form",
-  "sync_eligible": true,
-  "dry_run_only": false,
-  "consent_flags": {
-    "pdpa_acknowledged": true,
-    "marketing_allowed": true
-  }
+  "submitted_at": "2026/07/01 10:00:00",
+  "member_no": "6590000001",
+  "member_no_status": "canonical",
+  "name": "Synthetic Alpha",
+  "email_address": "synthetic.alpha@example.invalid",
+  "dob": "2000-03-01",
+  "birthday_month": "March",
+  "mobile_phone": "",
+  "pdpa_acknowledged": true,
+  "marketing_allowed": true,
+  "sync_eligible": true
 }
 ```
 
-`member_type` is intentionally not hard-coded to a production write value in docs. PR #68 confirmed `MemberType = Default` exists by read-only API browse, but using it for form signups still needs business approval.
+`mobile_phone` is always empty on purpose: the phone number already serves as `MemberNo`, and AutoCount `MobilePhone` is intentionally unused. Blank is by design, not missing data.
 
-MemberType unresolved for production write use: `Default` is API-confirmed, but it is not yet approved as the business default for form signups.
+`MemberType` is not collected by the live form and is not part of the validator output. MemberType unresolved for production write use: PR #68 confirmed `MemberType = Default` exists by read-only API browse, but it is not yet approved as the business default for form signups.
 
-For now, production member creation remains blocked. PR #70 proved no-save synthetic field assignment, but production member creation remains blocked until the save-gated fake member proof is reviewed and separate business approval exists.
+For now, production member creation remains blocked. PR #70 proved no-save synthetic field assignment and PR #71 proved a save-gated fake create, but live writeback requires a separate approval PR/runbook.
 
-If `MemberType` is missing, the validator uses `OPEN_MEMBER_TYPE` only as a visible placeholder, returns a `member_type_unconfirmed` warning, and marks the payload `sync_eligible: false` and `dry_run_only: true`. That output is useful for planning and review, not for live member creation.
+The PDPA checkbox on the live form exports `I agree`, which the validator accepts directly (case-insensitive; legacy `Yes` also accepted). Other values, including blank, block sync eligibility without invalidating the row. See [member_form_intake_contract.md](member_form_intake_contract.md).
 
-Checkbox-style long acknowledgement text is intentionally unsupported as direct validator input. If the Google Form uses a checkbox acknowledgement, n8n must normalize the exported text to exact `Yes` or `No` before calling the validator.
+## Resolved Decisions
+
+- `MemberNo` strategy: the member's mobile number is used directly as `MemberNo` (canonical `65XXXXXXXX` for SG mobiles). AutoCount auto-running numbers are not used for form intake.
+- `MobilePhone` is intentionally blank/unused; blank is by design, not missing data.
+- `DOB` stores birthday month only as `2000-MM-01`.
+- Dry-run duplicate detection matches on canonical `MemberNo` (phone) and email against a private local AC2 extract; AC2 stays the source of truth, and the old POS plus side records are reference-only evidence.
 
 ## Open Questions
 
 - Should API-confirmed `MemberType = Default` be the approved business default for form signups?
-- Should `MemberNo` always be AutoCount auto-running, or should some legacy/external numbers be explicit?
-- Should duplicate detection use mobile, email, name, or a combination?
 - Where should PDPA and marketing consent be stored if AutoCount has no dedicated consent fields?
 - PDPA/marketing consent storage remains open. Possible options are UDF, `Note` with a sanitized marker, or external audit sheet only. Do not decide yet.
-- Should `Remarks` be internal-only rather than synced to AutoCount?
-- Save-gated fake member create probing is the next step; writeback mapping cannot be used for production member creation until that proof is reviewed and separate business approval exists.
+- Should name similarity be added to dry-run duplicate detection, or is `MemberNo` plus email matching sufficient?
+- Live writeback remains blocked until a separate production approval PR/runbook exists.
 
 ## Safety Notes
 
