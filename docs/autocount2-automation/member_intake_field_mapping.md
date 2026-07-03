@@ -1,6 +1,8 @@
 # Member Intake Field Mapping
 
-Status: planning draft. Confirmed fields come from AutoCount wiki pages, AOTG public Swagger, and installed AC2 2.2 local reflection. Inferred mappings require sandbox validation before use.
+Status: planning draft. Confirmed fields come from AutoCount wiki pages, AOTG public Swagger, installed AC2 2.2 local reflection, and local read-only probes. Inferred mappings require sandbox validation before use.
+
+Current member-intake lookup rule: AC2 / AutoCount 2.0 is the source of truth. The Google Form mobile/member number maps to AutoCount `MemberNo`; AutoCount `MobilePhone` is intentionally unused for the duplicate-check and intake identity path. The old POS member list and side sheet are reference-only. This lookup boundary does not create/update/delete members.
 
 ## Installed `MemberEntity` Support
 
@@ -11,7 +13,7 @@ Local reflection found `MemberEntity` in `AutoCount.Invoicing.dll` under namespa
 | Member number | `MemberNo` | Supported. Generation path is confirmed through no-save `MemberCommand.GetNextMemberNo()` without exposing the actual generated number. |
 | Member type | `MemberType` | Supported. `MemberType = Default` is API-confirmed by read-only MemberType browse; production/default usage still requires operator confirmation. |
 | Name | `Name` | Supported. |
-| Mobile phone | `MobilePhone` | Supported. |
+| Mobile phone | `MobilePhone` | Supported by the installed entity, but intentionally unused for the current member intake duplicate-check path. |
 | Email address | `EmailAddress` | Supported. |
 | Date of birth | `DOB` | Supported. |
 | Active flag | `IsActive` | Supported. |
@@ -44,10 +46,11 @@ The no-save schema probe confirmed the following in-memory column constraints fo
 | Form field | Required for dry-run | Planned normalization | Target use | Status |
 | --- | --- | --- | --- | --- |
 | `FullName` | Yes | Trim and collapse spaces. | AutoCount `Name`. | Inferred mapping to confirmed field |
-| `MobileCountryCode` | Yes | Digits only, stored with `+` in canonical payload. | Compose AutoCount `MobilePhone`. | Inferred |
-| `MobileNumber` | Yes | Digits only; local trunk prefix removed for canonical payload. | Compose AutoCount `MobilePhone`. | Inferred |
+| `MobileCountryCode` | Yes | Digits only for validation display. | Reference-only for the current lookup path; not written to AutoCount `MobilePhone`. | Inferred |
+| `MobileNumber` | Yes | Remove spaces, plus signs, dashes, brackets, dots, symbols, and other non-digits; if exactly 8 digits starting with 8 or 9, canonicalize to `65XXXXXXXX`; if already 10 digits starting with 65, keep as-is; keep other cleaned shapes as `manual_review`; max 20 characters. | Lookup AutoCount `MemberNo`. AutoCount `MobilePhone` is intentionally unused. | Read-only lookup boundary |
 | `Email` | No | Trim/lowercase; validate if present. | AutoCount `EmailAddress`. | Inferred mapping to confirmed field |
-| `BirthDate` | No | Preserve ISO date if supplied. | AutoCount `DOB` if supported in selected API path. | Confirmed in installed entity and AOTG model |
+| `BirthdayMonth` | No | Month only; future DOB placeholder maps to `2000-MM-01`. | AutoCount `DOB` when a separately approved write path exists. | Confirmed field, write blocked |
+| `BirthDate` | No | Legacy draft field; avoid for the Google Form birthday-month flow unless separately approved. | AutoCount `DOB` if supported in selected API path. | Confirmed in installed entity and AOTG model |
 | `CountryOfResidence` | No | Trim. | Address/country handling, reporting, or notes. | Open |
 | `SignupSource` | No | Trim. | Audit/bridge note; not confirmed AutoCount member field. | Open |
 | `MarketingConsent` | Yes | Multiple choice field with exact values `Yes` / `No`; validator accepts case-insensitive normalized values. | Consent flag for X-Boundaries process; not confirmed AutoCount field. | Open |
@@ -102,12 +105,12 @@ The current validator emits the future bridge payload shape without calling Auto
 ```json
 {
   "intake_id": "INT-001",
-  "member_no_strategy": "auto",
+  "member_no_strategy": "submitted_mobile_member_no",
   "member_type": "STANDARD",
   "full_name": "Jane Tan",
-  "mobile": "+6591234567",
+  "mobile": null,
   "email": "jane.tan@example.com",
-  "birth_date": "1990-01-02",
+  "birth_date": "2000-01-01",
   "country": "Singapore",
   "signup_source": "Google Form",
   "sync_eligible": true,
@@ -122,6 +125,8 @@ The current validator emits the future bridge payload shape without calling Auto
 `member_type` is intentionally not hard-coded to a production write value in docs. PR #68 confirmed `MemberType = Default` exists by read-only API browse, but using it for form signups still needs business approval.
 
 MemberType unresolved for production write use: `Default` is API-confirmed, but it is not yet approved as the business default for form signups.
+
+Read-only member lookup review: `scripts/ac2_member_lookup_review.ps1` uses the proven local API path and `MemberCommand.GetMember(normalizedMemberNo)` to check whether the submitted mobile/member number already exists as an AutoCount `MemberNo`. Output is sanitized and PII-free. It is intended for future n8n/local bridge duplicate checking, does not create/update/delete members, and must not be used as final write automation.
 
 For now, production member creation remains blocked. PR #70 proved no-save synthetic field assignment, but production member creation remains blocked until the save-gated fake member proof is reviewed and separate business approval exists.
 
