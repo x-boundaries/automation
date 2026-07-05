@@ -5,6 +5,7 @@ param(
     [string]$DatabaseName = $env:AC2_PROBE_DATABASE_NAME,
     [string]$UserId = $env:AC2_PROBE_USER_ID,
     [string]$MemberNo,
+    [string]$MemberNoBase64Utf8,
     [switch]$AllowRootLogin,
     [switch]$EnableMemberLookupReview
 )
@@ -118,7 +119,8 @@ function Get-SanitizedMessage {
         $UserId,
         [Environment]::GetEnvironmentVariable("AC2_PROBE_PASSWORD"),
         $DllRoot,
-        $MemberNo
+        $MemberNo,
+        $MemberNoBase64Utf8
     ) + $ExtraSecrets) {
         if (-not [string]::IsNullOrEmpty($secret)) {
             $text = $text.Replace($secret, "<redacted>")
@@ -127,6 +129,40 @@ function Get-SanitizedMessage {
 
     $text = [regex]::Replace($text, "(?i)(password|pwd|user id|uid|server|database)\s*=\s*[^;\s]+", '$1=<redacted>')
     return $text
+}
+
+function Resolve-MemberNoInput {
+    param(
+        [bool]$HasMemberNo,
+        [bool]$HasMemberNoBase64Utf8,
+        [string]$RawMemberNo,
+        [string]$EncodedMemberNo
+    )
+
+    if ($HasMemberNo -and $HasMemberNoBase64Utf8) {
+        throw "Exactly one of MemberNo or MemberNoBase64Utf8 must be supplied."
+    }
+
+    if ((-not $HasMemberNo) -and (-not $HasMemberNoBase64Utf8)) {
+        throw "Exactly one of MemberNo or MemberNoBase64Utf8 must be supplied."
+    }
+
+    if ($HasMemberNo) {
+        return Get-RequiredValue "MemberNo" $RawMemberNo "MemberNo"
+    }
+
+    try {
+        $decodedBytes = [System.Convert]::FromBase64String($EncodedMemberNo)
+        $strictUtf8 = [System.Text.UTF8Encoding]::new($false, $true)
+        return $strictUtf8.GetString($decodedBytes)
+    }
+    catch {
+        throw "MemberNoBase64Utf8 could not be decoded as UTF-8 base64."
+    }
+    finally {
+        Remove-Variable decodedBytes -ErrorAction SilentlyContinue
+        Remove-Variable strictUtf8 -ErrorAction SilentlyContinue
+    }
 }
 
 function Find-PublicStaticMethod {
@@ -252,11 +288,16 @@ function Find-PublicStaticMethodByTypes {
 
 $result = New-ConsoleResult "started"
 $warnings = @()
+$memberForReview = $null
 $normalizedForSecretScrub = $null
 $assemblyResolveHandler = $null
 
 try {
-    $memberForReview = Get-RequiredValue "MemberNo" $MemberNo "MemberNo"
+    $memberForReview = Resolve-MemberNoInput `
+        ($PSBoundParameters.ContainsKey("MemberNo")) `
+        ($PSBoundParameters.ContainsKey("MemberNoBase64Utf8")) `
+        $MemberNo `
+        $MemberNoBase64Utf8
     $normalization = Normalize-MemberNo $memberForReview
     $normalizedForSecretScrub = $normalization.Value
     $result.submitted_member_no_status = $normalization.Status
@@ -402,7 +443,7 @@ catch {
     $result.status = "error"
     $result.error = [ordered]@{
         type = $_.Exception.GetType().FullName
-        message = Get-SanitizedMessage $_.Exception.Message @($normalizedForSecretScrub)
+        message = Get-SanitizedMessage $_.Exception.Message @($normalizedForSecretScrub, $memberForReview)
     }
 }
 finally {

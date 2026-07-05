@@ -7,6 +7,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "ac2_member_lookup_review.ps1"
 DOCS = ROOT / "docs" / "autocount2-automation"
 RUNBOOK = DOCS / "member_lookup_review_runbook.md"
+DIRECT_RUNBOOK = DOCS / "member_intake_n8n_direct_lookup_runbook.md"
 README = ROOT / "README.md"
 FIELD_MAPPING = DOCS / "member_intake_field_mapping.md"
 BRIDGE = DOCS / "member_intake_local_bridge_design.md"
@@ -33,6 +34,7 @@ class Ac2MemberLookupReviewStaticTests(unittest.TestCase):
 
         self.assertIn("EnableMemberLookupReview", script)
         self.assertIn("[string]$MemberNo", script)
+        self.assertIn("[string]$MemberNoBase64Utf8", script)
         self.assertRegex(script, r"(?i)refus|explicit opt-in|required")
 
         refusal_index = script.index("Refusing to run")
@@ -40,6 +42,36 @@ class Ac2MemberLookupReviewStaticTests(unittest.TestCase):
         first_factory_invoke_index = script.index("dbSettingFactory.Invoke")
         self.assertLess(refusal_index, first_load_index)
         self.assertLess(refusal_index, first_factory_invoke_index)
+
+    def test_script_accepts_exactly_one_member_no_input_source(self):
+        script = SCRIPT.read_text(encoding="utf-8")
+
+        self.assertIn("Resolve-MemberNoInput", script)
+        self.assertIn('$PSBoundParameters.ContainsKey("MemberNo")', script)
+        self.assertIn('$PSBoundParameters.ContainsKey("MemberNoBase64Utf8")', script)
+        self.assertRegex(script, r"\$HasMemberNo\s+-and\s+\$HasMemberNoBase64Utf8")
+        self.assertRegex(script, r"-not\s+\$HasMemberNo\)\s+-and\s+\(-not\s+\$HasMemberNoBase64Utf8")
+        self.assertEqual(script.count("Exactly one of MemberNo or MemberNoBase64Utf8 must be supplied."), 2)
+        self.assertIn('return Get-RequiredValue "MemberNo" $RawMemberNo "MemberNo"', script)
+
+    def test_script_decodes_member_no_base64_utf8_with_sanitized_failure(self):
+        script = SCRIPT.read_text(encoding="utf-8")
+
+        self.assertIn("[System.Convert]::FromBase64String($EncodedMemberNo)", script)
+        self.assertIn("[System.Text.UTF8Encoding]::new($false, $true)", script)
+        self.assertIn("$strictUtf8.GetString($decodedBytes)", script)
+        self.assertIn("MemberNoBase64Utf8 could not be decoded as UTF-8 base64.", script)
+        self.assertIn("Get-SanitizedMessage $_.Exception.Message @($normalizedForSecretScrub, $memberForReview)", script)
+        self.assertNotRegex(script, r"(?i)throw\s+\$_\.Exception\.Message")
+        self.assertNotRegex(script, r"(?i)ConvertTo-Json.{0,120}\$memberForReview")
+
+    def test_script_does_not_output_raw_decoded_member_no(self):
+        script = SCRIPT.read_text(encoding="utf-8")
+
+        self.assertNotRegex(script, r"(?i)\b(raw|decoded|normalized)_?member_?no\b\s*=")
+        self.assertNotRegex(script, r"(?i)(member_no|memberno)_?(value|raw|decoded|normalized)")
+        self.assertIn("normalized_member_no_length", script)
+        self.assertIn("submitted_member_no_status", script)
 
     def test_script_reads_password_only_from_required_environment_variable(self):
         script = SCRIPT.read_text(encoding="utf-8")
@@ -163,15 +195,19 @@ class Ac2MemberLookupReviewStaticTests(unittest.TestCase):
 
     def test_runbook_readme_and_design_docs_describe_safe_member_lookup_boundary(self):
         runbook = RUNBOOK.read_text(encoding="utf-8")
+        direct_runbook = DIRECT_RUNBOOK.read_text(encoding="utf-8")
         readme = README.read_text(encoding="utf-8")
         field_mapping = FIELD_MAPPING.read_text(encoding="utf-8")
         bridge = BRIDGE.read_text(encoding="utf-8")
 
         self.assertIn("scripts/ac2_member_lookup_review.ps1", readme)
         self.assertIn("member_lookup_review_runbook.md", readme)
+        self.assertIn("member_intake_n8n_direct_lookup_runbook.md", readme)
         self.assertIn("scripts/ac2_member_lookup_review.ps1", runbook)
+        self.assertIn("scripts/ac2_member_lookup_review.ps1", direct_runbook)
         self.assertIn("-EnableMemberLookupReview", runbook)
         self.assertIn("AC2_PROBE_PASSWORD", runbook)
+        self.assertIn("MemberNoBase64Utf8", runbook)
         self.assertIn("MemberCommand.GetMember", runbook)
         self.assertIn("read-only lookup only", runbook)
         self.assertIn("future n8n/local bridge duplicate checking", runbook)
@@ -184,6 +220,32 @@ class Ac2MemberLookupReviewStaticTests(unittest.TestCase):
             self.assertRegex(text, r"(?i)MobilePhone.*intentionally unused|intentionally unused.*MobilePhone")
             self.assertRegex(text, r"(?i)does not create/update/delete|does not create, update, or delete")
             self.assertNotRegex(text, r"(?i)(?<!not be used as )final write automation")
+
+    def test_direct_lookup_runbook_documents_local_n8n_contract_and_no_writes(self):
+        direct_runbook = DIRECT_RUNBOOK.read_text(encoding="utf-8")
+        combined = "\n".join(
+            [
+                direct_runbook,
+                RUNBOOK.read_text(encoding="utf-8"),
+                BRIDGE.read_text(encoding="utf-8"),
+                README.read_text(encoding="utf-8"),
+            ]
+        )
+
+        self.assertRegex(direct_runbook, r"(?i)local self-hosted n8n|self-hosted local n8n")
+        self.assertRegex(direct_runbook, r"(?i)Cloud n8n cannot call local AC2 PowerShell")
+        self.assertIn("MemberNoBase64Utf8", direct_runbook)
+        self.assertRegex(direct_runbook, r"(?i)not raw `MemberNo`")
+        self.assertRegex(direct_runbook, r"(?i)AC2_PROBE_PASSWORD.*local environment secret")
+        self.assertRegex(direct_runbook, r"(?i)sanitized JSON only")
+        self.assertRegex(direct_runbook, r"(?i)status != ok.*lookup error review")
+        self.assertRegex(direct_runbook, r"(?i)manual_review_required = true.*manual review")
+        self.assertRegex(direct_runbook, r"(?i)member_exists = true.*existing member review")
+        self.assertRegex(direct_runbook, r"(?i)member_exists = false.*ready for create review")
+        self.assertRegex(direct_runbook, r"(?i)Base64.*shell interpolation risk|shell interpolation risk.*Base64")
+        self.assertRegex(direct_runbook, r"(?i)not final write automation|does not authorize final write automation")
+        self.assertRegex(direct_runbook, r"(?i)does not create a production n8n workflow")
+        self.assertRegex(combined, r"(?i)does not create/update/delete|does not create, update, or delete")
 
     def test_runbook_documents_output_schema_fields_and_member_no_normalization(self):
         runbook = RUNBOOK.read_text(encoding="utf-8")
