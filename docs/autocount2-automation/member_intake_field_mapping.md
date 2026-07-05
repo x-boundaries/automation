@@ -120,7 +120,7 @@ The current validator normalizes each Google Form CSV row to the shape below wit
 
 `MemberType` is not collected by the live form and is not part of the validator output. MemberType unresolved for production write use: PR #68 confirmed `MemberType = Default` exists by read-only API browse, but it is not yet approved as the business default for form signups.
 
-Read-only member lookup review: `scripts/ac2_member_lookup_review.ps1` uses the proven local API path and `MemberCommand.GetMember(normalizedMemberNo)` to check whether the submitted mobile/member number already exists as an AutoCount `MemberNo`. Output is sanitized and PII-free. It is intended for future n8n/local bridge duplicate checking, does not create/update/delete members, and must not be used as final write automation.
+Read-only member lookup review: `scripts/ac2_member_lookup_review.ps1` uses the proven local API path and `MemberCommand.GetMember(normalizedMemberNo)` to check whether the submitted mobile/member number already exists as an AutoCount `MemberNo`. Output is sanitized and PII-free. Local self-hosted n8n should pass form values with `MemberNoBase64Utf8` for direct duplicate checking, cloud n8n requires a separately approved local bridge, and this lookup does not create/update/delete members or authorize final writes. It must not be used as final write automation.
 
 For now, production member creation remains blocked. PR #70 proved no-save synthetic field assignment and PR #71 proved a save-gated fake create, but live writeback requires a separate approval PR/runbook.
 

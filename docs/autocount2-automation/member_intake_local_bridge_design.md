@@ -199,10 +199,19 @@ Business rules:
 - Old POS and side sheet data are reference-only.
 - The read-only lookup review does not create/update/delete members.
 
+Runtime direction:
+
+- Self-hosted local n8n should call `scripts/ac2_member_lookup_review.ps1` directly for duplicate lookup review.
+- Cloud n8n cannot call local AC2 PowerShell unless routed through a separately approved local bridge.
+- n8n should pass `MemberNoBase64Utf8`, not raw `MemberNo`, for Google Form values to reduce shell quoting and interpolation risk.
+- `AC2_PROBE_PASSWORD` must be configured as a local environment secret, not passed in command arguments.
+- The script returns sanitized JSON only; n8n should parse status fields and route to lookup error review, manual review, existing member review, or ready-for-create review without performing any AutoCount write.
+
 Allowed behavior:
 
 - Require explicit `-EnableMemberLookupReview` before loading AutoCount assemblies.
 - Read the AutoCount password only from the runtime `AC2_PROBE_PASSWORD` environment variable.
+- Accept exactly one member input source: raw `-MemberNo` for manual local tests or `-MemberNoBase64Utf8` for local n8n calls.
 - Normalize the submitted value the same way as the intake validator: remove symbols while keeping letters and digits, canonicalize Singapore 8-digit mobile shapes to `65XXXXXXXX`, keep valid 10-digit `65` values, keep other cleaned shapes as `manual_review`, and reject cleaned values over 20 characters before lookup.
 - Create `MemberCommand` with the proven session and DBSetting.
 - Call `MemberCommand.GetMember(normalizedMemberNo)` only.
@@ -216,6 +225,7 @@ Still blocked:
 - No direct SQL, SQL queries, write SQL, or DBSetting data methods.
 - No raw `MemberNo`, name, email, phone, DOB, address, AutoKey, Guid, account book, credential, or local target details in output.
 - This probe must not be used as final write automation.
+- This design must not create production n8n workflows.
 
 ## Dry-Run Decision Review Boundary
 

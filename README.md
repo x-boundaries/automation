@@ -18,7 +18,7 @@ Task tracking, pending-work dashboards, completed-task logs, and personal planni
 - `scripts/ac2_member_no_save_assignment_probe.ps1`: explicit opt-in local MemberCommand fake-data no-save assignment probe for an in-memory MemberEntity row only.
 - `scripts/ac2_member_fake_create_probe.ps1`: explicitly gated local write probe that creates exactly one synthetic fake AutoCount member only after all write confirmations are supplied.
 - `scripts/ac2_member_browse_extract_review.ps1`: explicit opt-in read-only local member browse extract for migration reconciliation review; output contains PII and must not be committed.
-- `scripts/ac2_member_lookup_review.ps1`: explicit opt-in read-only local member lookup for future duplicate checking; AC2 is source of truth, Google Form mobile/member number maps to AutoCount `MemberNo`, AutoCount `MobilePhone` is intentionally unused, and it does not create/update/delete members.
+- `scripts/ac2_member_lookup_review.ps1`: explicit opt-in read-only local member lookup for future duplicate checking; local self-hosted n8n should pass form values with `MemberNoBase64Utf8`, AC2 is source of truth, Google Form mobile/member number maps to AutoCount `MemberNo`, AutoCount `MobilePhone` is intentionally unused, and it does not create/update/delete members.
 - `scripts/member_intake_validate.py`: dry-run-only validator/normalizer for Google Form member intake CSV rows, with optional matching against a private local AC2 member extract; it never creates, updates, or deletes AutoCount members, and its row-level outputs contain PII and must stay local.
 - `scripts/member_intake_decision_review.py`: dry-run-only decision review layer that combines validated Google Form rows with sanitized AC2 lookup JSONL or planned lookup review; AC2 remains source of truth, it does not create/update/delete members, and row-level outputs contain only row numbers, status codes, and issue codes.
 - `scripts/autocount_stock_extract.py`: stock extraction/archive workflow for AutoCount stock master, stock balance, and stock movement datasets.
@@ -46,7 +46,7 @@ Keep all generated AutoCount outputs under `C:\XB\autocount_outputs`:
 - Inventory operation discovery: `C:\XB\autocount_outputs\probe\inventory_operations`
 - Member intake API discovery review: `C:\XB\autocount_outputs\review\member_intake_discovery`
 - Member browse extract review: `C:\XB\autocount_outputs\review\member_browse_extract`
-- Member lookup review: sanitized console JSON only; no local member data output file is required.
+- Member lookup review: sanitized console JSON only; no local member data output file is required. Local self-hosted n8n may parse this JSON for duplicate-check routing, but it must not be used as final write automation.
 - Member intake dry-run validation: `C:\XB\autocount_outputs\review\member_intake_validation`
 - Member intake dry-run decision review: `C:\XB\autocount_outputs\review\member_intake_decision`
 - Phase 1 reconciliation: `C:\XB\autocount_outputs\reconcile`
@@ -73,6 +73,7 @@ Raw CSVs and member browse extracts stay local and must not be committed. Member
 - [AC2 member fake create probe runbook](docs/autocount2-automation/member_fake_create_probe_runbook.md)
 - [AC2 member browse extract review runbook](docs/autocount2-automation/member_browse_extract_review_runbook.md)
 - [AC2 member lookup review runbook](docs/autocount2-automation/member_lookup_review_runbook.md)
+- [Member intake n8n direct lookup runbook](docs/autocount2-automation/member_intake_n8n_direct_lookup_runbook.md)
 - [Member form intake contract (dry-run validator)](docs/autocount2-automation/member_form_intake_contract.md)
 - [Member intake decision review runbook](docs/autocount2-automation/member_intake_decision_review_runbook.md)
 - [AutoCount 2 MVP plan](docs/autocount2-automation/mvp_plan.md)

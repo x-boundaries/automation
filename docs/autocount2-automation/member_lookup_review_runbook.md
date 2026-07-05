@@ -18,12 +18,23 @@ Set the password only in the current PowerShell process:
 $env:AC2_PROBE_PASSWORD = "<runtime password>"
 ```
 
-Run the lookup with explicit opt-in:
+Run a manual local lookup with explicit opt-in:
 
 ```powershell
 .\scripts\ac2_member_lookup_review.ps1 `
   -EnableMemberLookupReview `
   -MemberNo "+65 9123 4567" `
+  -ServerName "<server>" `
+  -DatabaseName "<database>" `
+  -UserId "<user>"
+```
+
+For self-hosted local n8n form-intake calls, pass UTF-8 base64 instead of the raw form value:
+
+```powershell
+.\scripts\ac2_member_lookup_review.ps1 `
+  -EnableMemberLookupReview `
+  -MemberNoBase64Utf8 "<utf8-base64-member-number>" `
   -ServerName "<server>" `
   -DatabaseName "<database>" `
   -UserId "<user>"
@@ -35,7 +46,10 @@ Optional parameters:
 - `-ServerName`: AutoCount server name. Defaults to `AC2_PROBE_SERVER_NAME`.
 - `-DatabaseName`: AutoCount database name. Defaults to `AC2_PROBE_DATABASE_NAME`.
 - `-UserId`: AutoCount user ID. Defaults to `AC2_PROBE_USER_ID`.
+- `-MemberNoBase64Utf8`: UTF-8 base64 encoded submitted member/mobile value for local n8n calls.
 - `-AllowRootLogin`: sets `UserSession.AllowRootLogin = true` only when explicitly requested.
+
+Exactly one of `-MemberNo` or `-MemberNoBase64Utf8` must be supplied. Supplying both, supplying neither, or supplying invalid UTF-8 base64 returns sanitized JSON with `status = error`.
 
 The password must come from `AC2_PROBE_PASSWORD`. Do not pass passwords as command-line arguments.
 
@@ -96,7 +110,10 @@ If a member exists, the script reports only `member_exists=true`, `member_found_
 - Old POS and side sheet data are reference-only.
 - AutoCount `MobilePhone` is intentionally unused for this duplicate-check path.
 - This is intended for future n8n/local bridge duplicate checking.
+- Self-hosted local n8n should call this lookup directly with `MemberNoBase64Utf8`; cloud n8n cannot call local AC2 PowerShell unless routed through a separately approved local bridge.
 - It does not create/update/delete members.
 - It must not be used as final write automation.
 - Do not use this probe for production member creation.
 - Do not paste raw runtime errors if they include local secrets or member data; rerun with sanitized output only.
+
+See `docs/autocount2-automation/member_intake_n8n_direct_lookup_runbook.md` for the n8n routing contract.
