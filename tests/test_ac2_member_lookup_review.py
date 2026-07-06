@@ -210,7 +210,7 @@ class Ac2MemberLookupReviewStaticTests(unittest.TestCase):
         self.assertIn("MemberNoBase64Utf8", runbook)
         self.assertIn("MemberCommand.GetMember", runbook)
         self.assertIn("read-only lookup only", runbook)
-        self.assertIn("future n8n/local bridge duplicate checking", runbook)
+        self.assertIn("future n8n/bridge duplicate checking", runbook)
         self.assertIn("must not be used as final write automation", runbook)
         self.assertRegex(runbook, r"(?i)sanitized.*PII-free|PII-free.*sanitized")
 
@@ -221,7 +221,7 @@ class Ac2MemberLookupReviewStaticTests(unittest.TestCase):
             self.assertRegex(text, r"(?i)does not create/update/delete|does not create, update, or delete")
             self.assertNotRegex(text, r"(?i)(?<!not be used as )final write automation")
 
-    def test_direct_lookup_runbook_documents_local_n8n_contract_and_no_writes(self):
+    def test_direct_lookup_runbook_documents_bridge_contract_and_no_writes(self):
         direct_runbook = DIRECT_RUNBOOK.read_text(encoding="utf-8")
         combined = "\n".join(
             [
@@ -232,8 +232,11 @@ class Ac2MemberLookupReviewStaticTests(unittest.TestCase):
             ]
         )
 
-        self.assertRegex(direct_runbook, r"(?i)local self-hosted n8n|self-hosted local n8n")
-        self.assertRegex(direct_runbook, r"(?i)Cloud n8n cannot call local AC2 PowerShell")
+        self.assertRegex(direct_runbook, r"(?i)local proof and bridge implementation detail")
+        self.assertRegex(direct_runbook, r"(?i)not the long-term n8n hosting architecture")
+        self.assertRegex(direct_runbook, r"(?i)Cloud n8n cannot call local AC2 PowerShell directly")
+        self.assertRegex(direct_runbook, r"(?i)n8n Execute Command runs on the n8n host/container")
+        self.assertRegex(direct_runbook, r"(?i)invalid for local AC2 lookup")
         self.assertIn("MemberNoBase64Utf8", direct_runbook)
         self.assertRegex(direct_runbook, r"(?i)not raw `MemberNo`")
         self.assertRegex(direct_runbook, r"(?i)AC2_PROBE_PASSWORD.*local environment secret")
