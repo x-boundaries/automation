@@ -201,10 +201,12 @@ Business rules:
 
 Runtime direction:
 
-- Self-hosted local n8n should call `scripts/ac2_member_lookup_review.ps1` directly for duplicate lookup review. This is the main dry-run runtime path for the current lookup-only step.
-- Sanitized JSONL remains useful for offline tests and decision-review rehearsal, but it is not the main runtime path for local self-hosted n8n.
-- Cloud n8n cannot call local AC2 PowerShell unless routed through a separately approved local bridge, private route, VPN, or equivalent reviewed adapter.
-- n8n should pass `MemberNoBase64Utf8`, not raw `MemberNo`, for Google Form values to reduce shell quoting and interpolation risk.
+- Cloud/VPS/non-AC2 n8n is the preferred orchestration brain for duplicate lookup review.
+- The Windows AC2 lookup bridge should poll outbound for queued lookup jobs and call `scripts/ac2_member_lookup_review.ps1` locally. This avoids hosting n8n on the AutoCount host as the final architecture.
+- Sanitized JSONL remains useful for offline tests and decision-review rehearsal, but the long-term runtime interface is a queue plus sanitized bridge results.
+- Cloud n8n cannot call local AC2 PowerShell directly, and n8n Execute Command runs on the n8n host/container where n8n runs, not on the AutoCount host.
+- The bridge should pass `MemberNoBase64Utf8`, not raw `MemberNo`, for Google Form values to reduce shell quoting and interpolation risk.
+- Inbound local webhooks, private tunnels, reverse proxies, or VPN callback paths are non-preferred and require separate approval; a public inbound webhook on the AutoCount host is not recommended.
 - `AC2_PROBE_PASSWORD` must be configured as a local environment secret, not passed in command arguments.
 - The script returns sanitized JSON only; n8n should parse status fields and route to lookup error review, manual review, existing member review, or ready-for-create review without performing any AutoCount write.
 
@@ -212,7 +214,7 @@ Allowed behavior:
 
 - Require explicit `-EnableMemberLookupReview` before loading AutoCount assemblies.
 - Read the AutoCount password only from the runtime `AC2_PROBE_PASSWORD` environment variable.
-- Accept exactly one member input source: raw `-MemberNo` for manual local tests or `-MemberNoBase64Utf8` for local n8n calls.
+- Accept exactly one member input source: raw `-MemberNo` for manual local tests or `-MemberNoBase64Utf8` for bridge calls.
 - Normalize the submitted value the same way as the intake validator: remove symbols while keeping letters and digits, canonicalize Singapore 8-digit mobile shapes to `65XXXXXXXX`, keep valid 10-digit `65` values, keep other cleaned shapes as `manual_review`, and reject cleaned values over 20 characters before lookup.
 - Create `MemberCommand` with the proven session and DBSetting.
 - Call `MemberCommand.GetMember(normalizedMemberNo)` only.

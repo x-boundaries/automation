@@ -29,7 +29,7 @@ Run a manual local lookup with explicit opt-in:
   -UserId "<user>"
 ```
 
-For self-hosted local n8n form-intake calls, pass UTF-8 base64 instead of the raw form value:
+For Windows bridge form-intake calls, pass UTF-8 base64 instead of the raw form value:
 
 ```powershell
 .\scripts\ac2_member_lookup_review.ps1 `
@@ -46,7 +46,7 @@ Optional parameters:
 - `-ServerName`: AutoCount server name. Defaults to `AC2_PROBE_SERVER_NAME`.
 - `-DatabaseName`: AutoCount database name. Defaults to `AC2_PROBE_DATABASE_NAME`.
 - `-UserId`: AutoCount user ID. Defaults to `AC2_PROBE_USER_ID`.
-- `-MemberNoBase64Utf8`: UTF-8 base64 encoded submitted member/mobile value for local n8n calls.
+- `-MemberNoBase64Utf8`: UTF-8 base64 encoded submitted member/mobile value for bridge calls.
 - `-AllowRootLogin`: sets `UserSession.AllowRootLogin = true` only when explicitly requested.
 
 Exactly one of `-MemberNo` or `-MemberNoBase64Utf8` must be supplied. Supplying both, supplying neither, or supplying invalid UTF-8 base64 returns sanitized JSON with `status = error`.
@@ -111,8 +111,8 @@ If a member exists, the script reports only `member_exists=true`, `member_found_
 - AC2 is source of truth.
 - Old POS and side sheet data are reference-only.
 - AutoCount `MobilePhone` is intentionally unused for this duplicate-check path.
-- This is intended for future n8n/local bridge duplicate checking.
-- Self-hosted local n8n should call this lookup directly with `MemberNoBase64Utf8`; cloud n8n cannot call local AC2 PowerShell unless routed through a separately approved local bridge.
+- This is intended for future n8n/bridge duplicate checking.
+- The Windows AC2 lookup bridge should call this lookup locally with `MemberNoBase64Utf8`; cloud n8n cannot call local AC2 PowerShell directly, and n8n Execute Command runs where n8n is hosted rather than on the AutoCount host.
 - It does not create/update/delete members.
 - It must not be used as final write automation.
 - Do not use this probe for production member creation.

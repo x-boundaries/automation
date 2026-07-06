@@ -164,6 +164,13 @@ autocount_outputs/**/member_intake_decision_report.md
 autocount_outputs/**/member_intake_decision_manifest.json
 autocount_outputs/**/PRIVATE_DO_NOT_COMMIT_MEMBER_INTAKE_DECISION.txt
 
+# Member lookup bridge worker local fixture outputs (sanitized but still local review artifacts)
+ac2_member_lookup_bridge_worker_outputs/
+member_lookup_bridge_results.jsonl
+PRIVATE_DO_NOT_COMMIT_MEMBER_LOOKUP_BRIDGE.txt
+autocount_outputs/**/member_lookup_bridge_results.jsonl
+autocount_outputs/**/PRIVATE_DO_NOT_COMMIT_MEMBER_LOOKUP_BRIDGE.txt
+
 # Private local AC2 member extracts and form response exports must never be committed
 ac2_member_browse_extract*.csv
 ac2_member_browse_extract_summary*.json

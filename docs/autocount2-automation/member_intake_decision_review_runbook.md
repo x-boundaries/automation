@@ -8,7 +8,7 @@ Status: dry-run review layer only. This must not be used as final write automati
 
 AC2 / AutoCount 2.0 is the source of truth. Google Form mobile/member number maps to AutoCount `MemberNo`. AutoCount `MobilePhone` is intentionally unused. Birthday Month maps to future `DOB` as `2000-MM-01`, but DOB is not emitted by this review layer. Old POS and side sheet data are reference-only.
 
-This runner is intended as a dry-run orchestration layer for n8n/local duplicate-check review. The current runtime direction is local self-hosted n8n calling the PowerShell lookup directly; sanitized JSONL remains useful for offline tests and review rehearsal. It does not create, update, or delete members, and it must not be used as final write automation.
+This runner is intended as a dry-run review layer for n8n/bridge duplicate-check review. The preferred runtime direction is cloud/VPS/non-AC2 n8n queueing lookup jobs for the outbound-polling Windows AC2 bridge; sanitized JSONL remains useful for offline tests and review rehearsal. It does not create, update, or delete members, and it must not be used as final write automation.
 
 ## Hard Boundaries
 
