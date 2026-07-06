@@ -23,7 +23,7 @@ Run a manual local lookup with explicit opt-in:
 ```powershell
 .\scripts\ac2_member_lookup_review.ps1 `
   -EnableMemberLookupReview `
-  -MemberNo "+65 9123 4567" `
+  -MemberNo "<manual-synthetic-member-value>" `
   -ServerName "<server>" `
   -DatabaseName "<database>" `
   -UserId "<user>"
@@ -52,6 +52,8 @@ Optional parameters:
 Exactly one of `-MemberNo` or `-MemberNoBase64Utf8` must be supplied. Supplying both, supplying neither, or supplying invalid UTF-8 base64 returns sanitized JSON with `status = error`.
 
 The password must come from `AC2_PROBE_PASSWORD`. Do not pass passwords as command-line arguments.
+
+Base64 is not encryption and is not secret. For n8n form-submitted values, it is only a shell-safety measure that keeps raw form input out of command text and reduces quoting/interpolation risk.
 
 ## Lookup Path
 

@@ -8,7 +8,7 @@ Status: dry-run review layer only. This must not be used as final write automati
 
 AC2 / AutoCount 2.0 is the source of truth. Google Form mobile/member number maps to AutoCount `MemberNo`. AutoCount `MobilePhone` is intentionally unused. Birthday Month maps to future `DOB` as `2000-MM-01`, but DOB is not emitted by this review layer. Old POS and side sheet data are reference-only.
 
-This runner is intended as a dry-run orchestration layer for a future n8n/local bridge duplicate-check review. It does not create, update, or delete members, and it must not be used as final write automation.
+This runner is intended as a dry-run orchestration layer for n8n/local duplicate-check review. The current runtime direction is local self-hosted n8n calling the PowerShell lookup directly; sanitized JSONL remains useful for offline tests and review rehearsal. It does not create, update, or delete members, and it must not be used as final write automation.
 
 ## Hard Boundaries
 
@@ -53,7 +53,7 @@ Manual-review shapes may be carried forward only as sanitized status codes. They
 
 ## Decisions
 
-- `READY_FOR_CREATE_REVIEW`: valid form row, PDPA acknowledged, canonical MemberNo shape, and sanitized lookup says the member does not exist.
+- `READY_FOR_CREATE_REVIEW`: valid form row, PDPA acknowledged, canonical MemberNo shape, and sanitized lookup says the member does not exist. This is not approval to create.
 - `EXISTING_MEMBER_REVIEW`: valid form row, PDPA acknowledged, and sanitized lookup says the member exists.
 - `MANUAL_REVIEW_REQUIRED`: valid form row with manual-review MemberNo shape, non-SG/special shape, or lookup warning/manual-review status.
 - `PDPA_BLOCKED`: PDPA was not acknowledged. `Imported` is blocked and is not consent.
@@ -80,4 +80,4 @@ Row-level outputs must not contain raw names, emails, phone numbers, MemberNo va
 4. Review counts and row-number decision codes only.
 5. Keep all generated artifacts local under `C:\XB\autocount_outputs\review\member_intake_decision`.
 
-No output from this runner authorizes live member creation. Any future write automation needs a separate reviewed PR, explicit approval, and independent guardrails.
+No output from this runner authorizes live member creation. Any future write automation needs a separate reviewed PR, explicit business approval, idempotency, consent/audit handling, and independent write guardrails.
