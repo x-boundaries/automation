@@ -201,8 +201,9 @@ Business rules:
 
 Runtime direction:
 
-- Self-hosted local n8n should call `scripts/ac2_member_lookup_review.ps1` directly for duplicate lookup review.
-- Cloud n8n cannot call local AC2 PowerShell unless routed through a separately approved local bridge.
+- Self-hosted local n8n should call `scripts/ac2_member_lookup_review.ps1` directly for duplicate lookup review. This is the main dry-run runtime path for the current lookup-only step.
+- Sanitized JSONL remains useful for offline tests and decision-review rehearsal, but it is not the main runtime path for local self-hosted n8n.
+- Cloud n8n cannot call local AC2 PowerShell unless routed through a separately approved local bridge, private route, VPN, or equivalent reviewed adapter.
 - n8n should pass `MemberNoBase64Utf8`, not raw `MemberNo`, for Google Form values to reduce shell quoting and interpolation risk.
 - `AC2_PROBE_PASSWORD` must be configured as a local environment secret, not passed in command arguments.
 - The script returns sanitized JSON only; n8n should parse status fields and route to lookup error review, manual review, existing member review, or ready-for-create review without performing any AutoCount write.
@@ -226,6 +227,7 @@ Still blocked:
 - No raw `MemberNo`, name, email, phone, DOB, address, AutoKey, Guid, account book, credential, or local target details in output.
 - This probe must not be used as final write automation.
 - This design must not create production n8n workflows.
+- `READY_FOR_CREATE_REVIEW` is not approval to create. It remains a review decision until a separate PR approves the write path, idempotency, consent/audit handling, and write guardrails.
 
 ## Dry-Run Decision Review Boundary
 

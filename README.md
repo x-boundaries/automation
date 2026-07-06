@@ -74,6 +74,8 @@ Raw CSVs and member browse extracts stay local and must not be committed. Member
 - [AC2 member browse extract review runbook](docs/autocount2-automation/member_browse_extract_review_runbook.md)
 - [AC2 member lookup review runbook](docs/autocount2-automation/member_lookup_review_runbook.md)
 - [Member intake n8n direct lookup runbook](docs/autocount2-automation/member_intake_n8n_direct_lookup_runbook.md)
+- [Member intake n8n dry-run workflow](docs/autocount2-automation/member_intake_n8n_dry_run_workflow.md)
+- [Member intake n8n node contract](docs/autocount2-automation/member_intake_n8n_node_contract.md)
 - [Member form intake contract (dry-run validator)](docs/autocount2-automation/member_form_intake_contract.md)
 - [Member intake decision review runbook](docs/autocount2-automation/member_intake_decision_review_runbook.md)
 - [AutoCount 2 MVP plan](docs/autocount2-automation/mvp_plan.md)
