@@ -33,8 +33,8 @@ n8n may queue only the minimum fields needed for review routing:
 | `intake_id` | No | Internal idempotency key. Safe only if it contains no PII. |
 | `state` | Yes | Must be `PENDING_LOOKUP` for new lookup work. |
 | `submitted_member_no_base64_utf8` | Yes | Encoded submitted member value. Sensitive; never log or echo. |
-| `consent_status` | Yes | Sanitized consent category only; legacy/import markers are blocked. |
-| `pdpa_status` | Yes | Sanitized PDPA category only; `Imported` is not consent. |
+| `consent_status` | No | Optional separate consent/marketing category only; not a PDPA override. |
+| `pdpa_status` | Yes | Mandatory duplicate-check gate. Must be a valid new-form PDPA acknowledgement; `Imported` is not consent. |
 | `attempt` | No | Nonnegative retry counter. |
 | `created_at` | No | Queue metadata. |
 | `payload_hash` | No | Hash of allowed request fields for idempotency checks. |
@@ -92,13 +92,15 @@ The bridge may post only sanitized metadata:
 | `manual_review_required` | Yes | Routes to manual review when true. |
 | `warning_count` | Yes | Any warning blocks ready-for-create review. |
 | `error_code` | No | Sanitized category only; no raw exception text. |
-| `consent_status` | Yes | Sanitized category only. |
-| `pdpa_status` | Yes | Sanitized category only. |
+| `consent_status` | No | Sanitized category only; not used to satisfy PDPA. |
+| `pdpa_status` | Yes | Sanitized PDPA category only. |
 | `attempt` | No | Retry attempt metadata. |
 | `dry_run_only` | Yes | Must be true. |
 | `final_write_automation` | Yes | Must be false. |
 
 Forbidden response fields are the same as forbidden request fields. The response must not include the encoded member value.
+
+`pdpa_status` is mandatory for lookup eligibility. `consent_status` is optional sanitized metadata for separate consent or marketing categories, and it must not rescue, override, or reinterpret invalid, missing, or imported `pdpa_status`.
 
 ## Job States
 

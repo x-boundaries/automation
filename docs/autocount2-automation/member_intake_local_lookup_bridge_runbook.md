@@ -80,8 +80,8 @@ Allowed request fields:
 | `intake_id` | Optional internal idempotency key. | Safe only if non-PII. |
 | `state` | Must be `PENDING_LOOKUP` for new work. | Safe. |
 | `submitted_member_no_base64_utf8` | Encoded submitted member value. | Sensitive operational data; never log or echo. |
-| `consent_status` | Sanitized consent category. | Safe category only. |
-| `pdpa_status` | Sanitized PDPA category. | Safe category only. |
+| `consent_status` | Optional separate consent/marketing category; not a PDPA override. | Safe category only. |
+| `pdpa_status` | Mandatory valid new-form PDPA acknowledgement gate. | Safe category only. |
 | `attempt` | Retry attempt counter. | Safe. |
 | `created_at` | Queue metadata. | Safe if non-PII. |
 
@@ -185,6 +185,8 @@ Safe review modes:
 - PowerShell lookup mode additionally requires `--enable-powershell-lookup` and calls only `scripts/ac2_member_lookup_review.ps1` in lookup mode.
 
 The skeleton contains no real endpoint, credential, queue provider, tunnel, webhook, or write path. The first UAT may model a Google Sheets queue, but the fixture fields include source-agnostic references so a later custom web form or hosted intake API can reuse the bridge contract. This runbook does not implement that future form/API or synchronous duplicate rejection.
+
+`PDPA Acknowledged = Imported` must remain blocked even if `consent_status` looks acknowledged. `consent_status` is optional sanitized metadata for non-PDPA consent/marketing categories and must not rescue or override invalid, missing, or imported `pdpa_status`.
 
 ## Review-Only Routing
 

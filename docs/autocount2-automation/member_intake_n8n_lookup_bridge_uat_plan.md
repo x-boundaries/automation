@@ -101,8 +101,8 @@ Use placeholder tab names in docs and tests; configure real spreadsheet IDs only
 | `intake_id` | No | Internal non-PII intake identifier if one already exists. |
 | `state` | Yes | Starts as `PENDING_LOOKUP`. |
 | `submitted_member_no_base64_utf8` | Yes | Encoded submitted value for the bridge. Sensitive operational data; UAT-only; never copied to review/status fields. |
-| `consent_status` | Yes | Sanitized consent category only; legacy/import markers remain blocked. |
-| `pdpa_status` | Yes | Sanitized PDPA category only; `Imported` is not valid consent. |
+| `consent_status` | No | Separate sanitized consent/marketing category only; never a PDPA override. |
+| `pdpa_status` | Yes | Mandatory duplicate-check gate. Must be a valid new-form PDPA acknowledgement; `Imported` is not valid consent and remains blocked. |
 | `payload_hash` | Yes | Hash of allowed request fields used for idempotency. |
 | `attempt` | Yes | Starts at `0`; increments on retry. |
 | `max_attempts` | Yes | Small UAT retry cap configured outside the row values. |
@@ -139,8 +139,8 @@ The queue must not contain raw member numbers, normalized member numbers, names,
 | `manual_review_required` | Yes | Boolean routing flag. |
 | `warning_count` | Yes | Any warning blocks ready-for-create review. |
 | `error_code` | No | Sanitized category only. |
-| `consent_status` | Yes | Sanitized category only. |
-| `pdpa_status` | Yes | Sanitized category only. |
+| `consent_status` | No | Sanitized category only; not used to satisfy PDPA. |
+| `pdpa_status` | Yes | Sanitized PDPA category only. |
 | `attempt` | Yes | Attempt that produced the result. |
 | `dry_run_only` | Yes | Must be true. |
 | `final_write_automation` | Yes | Must be false. |
@@ -162,6 +162,8 @@ Fixture mode maps to the future tabs as follows:
 | Local mock lookup control | `member_lookup_bridge_mock_results.jsonl` | Optional sanitized mock lookup outcomes keyed by non-PII `job_id`; this is not a future queue column source. |
 
 Default invocation refuses. Fixture queue processing requires `--enable-local-lookup-bridge-review`, `--queue-mode fixture`, a local fixture input, and a local results output. Mock mode is the default lookup mode and returns sanitized result rows for review routing tests only.
+
+`pdpa_status` is mandatory and must represent valid new-form PDPA acknowledgement before lookup can proceed. `consent_status` is separate optional sanitized metadata for non-PDPA consent or marketing categories; it must not rescue, override, or reinterpret an invalid, missing, or imported `pdpa_status`.
 
 The fixture contract should still work if a future intake source is a custom web form or hosted intake API instead of Google Forms. That future intake can add pre-submit duplicate rejection later, but this PR intentionally does not implement it.
 

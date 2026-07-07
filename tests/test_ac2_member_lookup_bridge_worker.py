@@ -259,6 +259,73 @@ class BridgeWorkerCliTests(unittest.TestCase):
             self.assertEqual(result["error_code"], "request_or_lookup_contract_error")
             self.assertNotIn(ENCODED_SYNTHETIC_VALUE, result_text)
 
+    def test_imported_pdpa_status_is_blocked_even_when_consent_status_is_acknowledged(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            jobs_path = tmp_path / "jobs.jsonl"
+            results_path = tmp_path / "member_lookup_bridge_results.jsonl"
+            write_jsonl(
+                jobs_path,
+                [
+                    fixture_job(
+                        job_id="job-pdpa-imported-consent-ack",
+                        consent_status="acknowledged",
+                        pdpa_status="imported",
+                    )
+                ],
+            )
+
+            completed = self.run_cli(
+                [
+                    "--enable-local-lookup-bridge-review",
+                    "--queue-mode",
+                    "fixture",
+                    "--fixture-jobs",
+                    str(jobs_path),
+                    "--results-jsonl",
+                    str(results_path),
+                ]
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            result_text = results_path.read_text(encoding="utf-8")
+            result = json.loads(result_text)
+            self.assertEqual(result["state"], "LOOKUP_ERROR_REVIEW")
+            self.assertEqual(result["error_code"], "request_or_lookup_contract_error")
+            self.assertNotIn(ENCODED_SYNTHETIC_VALUE, result_text)
+
+    def test_valid_pdpa_status_allows_separate_imported_consent_category_in_review_only_mode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            jobs_path = tmp_path / "jobs.jsonl"
+            results_path = tmp_path / "member_lookup_bridge_results.jsonl"
+            write_jsonl(
+                jobs_path,
+                [fixture_job(job_id="job-pdpa-valid-consent-imported", consent_status="imported")],
+            )
+
+            completed = self.run_cli(
+                [
+                    "--enable-local-lookup-bridge-review",
+                    "--queue-mode",
+                    "fixture",
+                    "--fixture-jobs",
+                    str(jobs_path),
+                    "--results-jsonl",
+                    str(results_path),
+                ]
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            result_text = results_path.read_text(encoding="utf-8")
+            result = json.loads(result_text)
+            self.assertEqual(result["state"], "READY_FOR_CREATE_REVIEW")
+            self.assertEqual(result["pdpa_status"], "i_agree")
+            self.assertEqual(result["consent_status"], "imported")
+            self.assertTrue(result["dry_run_only"])
+            self.assertFalse(result["final_write_automation"])
+            self.assertNotIn(ENCODED_SYNTHETIC_VALUE, result_text)
+
     def test_fixture_job_with_forbidden_field_routes_to_lookup_error_review_without_echoing_value(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)

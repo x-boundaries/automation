@@ -29,7 +29,7 @@ ALLOWED_MEMBER_STATUS_LABELS = {
     "manual_review",
     "invalid_too_long",
 }
-ALLOWED_PDPA_STATUS_LABELS = {"i_agree", "acknowledged", "consented"}
+ALLOWED_PDPA_STATUS_LABELS = {"i_agree"}
 
 ALLOWED_QUEUE_FIELDS = {
     "job_id",
@@ -279,8 +279,10 @@ def validate_job(job):
 
     pdpa_status = job.get("pdpa_status")
     consent_status = job.get("consent_status")
-    if pdpa_status not in ALLOWED_PDPA_STATUS_LABELS and consent_status not in ALLOWED_PDPA_STATUS_LABELS:
-        raise BridgeWorkerError("PDPA/consent status must be acknowledged before lookup.")
+    if pdpa_status not in ALLOWED_PDPA_STATUS_LABELS:
+        raise BridgeWorkerError("pdpa_status must be a valid new-form PDPA acknowledgement before lookup.")
+    if consent_status is not None and safe_source_value(consent_status) is None:
+        raise BridgeWorkerError("consent_status must be a sanitized category when supplied.")
 
     if job.get("state") != PENDING_LOOKUP:
         raise BridgeWorkerError("Only PENDING_LOOKUP fixture jobs are processed by this skeleton.")
