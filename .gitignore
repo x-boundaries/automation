@@ -166,8 +166,12 @@ autocount_outputs/**/PRIVATE_DO_NOT_COMMIT_MEMBER_INTAKE_DECISION.txt
 
 # Member lookup bridge worker local fixture outputs (sanitized but still local review artifacts)
 ac2_member_lookup_bridge_worker_outputs/
+member_lookup_bridge_fixture_jobs.jsonl
+member_lookup_bridge_mock_results.jsonl
 member_lookup_bridge_results.jsonl
 PRIVATE_DO_NOT_COMMIT_MEMBER_LOOKUP_BRIDGE.txt
+autocount_outputs/**/member_lookup_bridge_fixture_jobs.jsonl
+autocount_outputs/**/member_lookup_bridge_mock_results.jsonl
 autocount_outputs/**/member_lookup_bridge_results.jsonl
 autocount_outputs/**/PRIVATE_DO_NOT_COMMIT_MEMBER_LOOKUP_BRIDGE.txt
 

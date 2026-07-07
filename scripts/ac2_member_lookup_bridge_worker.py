@@ -22,23 +22,35 @@ READY_FOR_CREATE_REVIEW = "READY_FOR_CREATE_REVIEW"
 
 BASE64_RE = re.compile(r"^[A-Za-z0-9+/]+={0,2}$")
 SAFE_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
+ALLOWED_MEMBER_STATUS_LABELS = {
+    None,
+    "canonical_65_mobile",
+    "already_65_mobile",
+    "manual_review",
+    "invalid_too_long",
+}
+ALLOWED_PDPA_STATUS_LABELS = {"i_agree"}
 
-ALLOWED_JOB_FIELDS = {
+ALLOWED_QUEUE_FIELDS = {
     "job_id",
+    "intake_source",
+    "source_reference",
+    "source_row_ref",
     "row_number",
     "intake_id",
     "state",
     "submitted_member_no_base64_utf8",
-    "attempt",
-    "created_at",
+    "consent_status",
+    "pdpa_status",
     "payload_hash",
-    "mock_status",
-    "mock_member_exists",
-    "mock_manual_review_required",
-    "mock_warning_count",
-    "mock_submitted_member_no_status",
-    "mock_normalized_member_no_length",
-    "mock_error_code",
+    "attempt",
+    "max_attempts",
+    "created_at",
+    "updated_at",
+    "lease_owner",
+    "lease_expires_at",
+    "timeout_at",
+    "last_error_code",
 }
 
 FORBIDDEN_JOB_FIELDS = {
@@ -54,8 +66,6 @@ FORBIDDEN_JOB_FIELDS = {
     "raw_phone_number",
     "dob",
     "address",
-    "autokey",
-    "guid",
     "server",
     "database",
     "user",
@@ -80,6 +90,36 @@ LOOKUP_PUBLIC_FIELDS = [
     "manual_review_required",
     "warning_count",
 ]
+
+ALLOWED_RESULT_FIELDS = {
+    "job_id",
+    "intake_source",
+    "source_reference",
+    "source_row_ref",
+    "row_number",
+    "state",
+    "status",
+    "authentication_success",
+    "user_session_available",
+    "member_command_found",
+    "get_member_found",
+    "submitted_member_no_status",
+    "normalized_member_no_length",
+    "member_exists",
+    "member_found_by",
+    "manual_review_required",
+    "warning_count",
+    "error_code",
+    "consent_status",
+    "pdpa_status",
+    "attempt",
+    "dry_run_only",
+    "final_write_automation",
+    "result_created_at",
+    "result_applied_at",
+}
+
+ALLOWED_MOCK_RESULT_FIELDS = {"job_id", "error_code", *LOOKUP_PUBLIC_FIELDS}
 
 
 class BridgeWorkerError(ValueError):
@@ -123,6 +163,48 @@ def read_fixture_jobs(path):
     return jobs
 
 
+def read_json_or_jsonl(path):
+    text = Path(path).read_text(encoding="utf-8")
+    stripped = text.strip()
+    if not stripped:
+        return []
+    if stripped.startswith("["):
+        rows = json.loads(stripped)
+        if not isinstance(rows, list):
+            raise BridgeWorkerError("Fixture JSON must contain a list of objects.")
+        return rows
+
+    rows = []
+    for line_number, line in enumerate(text.splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError as error:
+            raise BridgeWorkerError(f"Fixture line {line_number} is not valid JSON.") from error
+        rows.append(row)
+    return rows
+
+
+def read_mock_results(path):
+    if not path:
+        return {}
+    rows = read_json_or_jsonl(path)
+    mock_results = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            raise BridgeWorkerError("Mock result fixture rows must be JSON objects.")
+        unknown = sorted(set(row) - ALLOWED_MOCK_RESULT_FIELDS)
+        forbidden = sorted(set(row) & FORBIDDEN_JOB_FIELDS)
+        if unknown or forbidden:
+            raise BridgeWorkerError("Mock result fixture contains fields outside the sanitized contract.")
+        job_id = safe_job_id(row.get("job_id"))
+        if job_id is None:
+            raise BridgeWorkerError("Mock result fixture row requires a safe non-PII job_id.")
+        mock_results[job_id] = row
+    return mock_results
+
+
 def ensure_base64_shape(value):
     if not isinstance(value, str) or not value:
         return False
@@ -138,7 +220,9 @@ def safe_job_id(value):
 
 
 def safe_row_number(value):
-    if isinstance(value, int) and value >= 2:
+    if value is None:
+        return None
+    if isinstance(value, int) and value >= 1:
         return value
     return None
 
@@ -149,24 +233,56 @@ def safe_attempt(value):
     return 0
 
 
+def safe_source_value(value):
+    if value is None:
+        return None
+    if isinstance(value, str) and SAFE_ID_RE.fullmatch(value):
+        return value
+    return None
+
+
+def safe_max_attempts(job, fallback):
+    value = job.get("max_attempts", fallback) if isinstance(job, dict) else fallback
+    if isinstance(value, int) and value > 0:
+        return value
+    return fallback
+
+
 def validate_job(job):
     if not isinstance(job, dict):
         raise BridgeWorkerError("Job must be a JSON object.")
 
-    unknown = sorted(set(job) - ALLOWED_JOB_FIELDS)
     forbidden = sorted(set(job) & FORBIDDEN_JOB_FIELDS)
-    if unknown:
-        raise BridgeWorkerError("Job contains fields outside the bridge request contract.")
     if forbidden:
         raise BridgeWorkerError("Job contains forbidden sensitive fields.")
+    unknown = sorted(set(job) - ALLOWED_QUEUE_FIELDS)
+    if unknown:
+        raise BridgeWorkerError("Job contains fields outside the bridge request contract.")
 
     job_id = job.get("job_id")
     if safe_job_id(job_id) is None:
         raise BridgeWorkerError("job_id is required and must use the safe non-PII id shape.")
 
+    intake_source = job.get("intake_source")
+    if safe_source_value(intake_source) is None:
+        raise BridgeWorkerError("intake_source is required and must use the safe non-PII id shape.")
+
+    source_reference = job.get("source_reference")
+    source_row_ref = job.get("source_row_ref")
     row_number = job.get("row_number")
-    if safe_row_number(row_number) is None:
-        raise BridgeWorkerError("row_number is required and must be an integer spreadsheet row.")
+    if (
+        safe_source_value(source_reference) is None
+        and safe_source_value(source_row_ref) is None
+        and safe_row_number(row_number) is None
+    ):
+        raise BridgeWorkerError("A safe source reference or spreadsheet row number is required.")
+
+    pdpa_status = job.get("pdpa_status")
+    consent_status = job.get("consent_status")
+    if pdpa_status not in ALLOWED_PDPA_STATUS_LABELS:
+        raise BridgeWorkerError("pdpa_status must be a valid new-form PDPA acknowledgement before lookup.")
+    if consent_status is not None and safe_source_value(consent_status) is None:
+        raise BridgeWorkerError("consent_status must be a sanitized category when supplied.")
 
     if job.get("state") != PENDING_LOOKUP:
         raise BridgeWorkerError("Only PENDING_LOOKUP fixture jobs are processed by this skeleton.")
@@ -178,6 +294,10 @@ def validate_job(job):
     attempt = job.get("attempt", 0)
     if not isinstance(attempt, int) or attempt < 0:
         raise BridgeWorkerError("attempt must be a nonnegative integer.")
+
+    max_attempts = job.get("max_attempts")
+    if max_attempts is not None and (not isinstance(max_attempts, int) or max_attempts <= 0):
+        raise BridgeWorkerError("max_attempts must be a positive integer when supplied.")
 
 
 def default_lookup_result():
@@ -197,23 +317,34 @@ def default_lookup_result():
     }
 
 
-def mock_lookup(job):
+def mock_lookup(job, mock_results=None):
     result = default_lookup_result()
-    result["status"] = job.get("mock_status", result["status"])
-    result["member_exists"] = bool(job.get("mock_member_exists", result["member_exists"]))
+    mock_row = (mock_results or {}).get(job.get("job_id"), {})
+    result["status"] = mock_row.get("status", result["status"])
+    result["member_exists"] = bool(mock_row.get("member_exists", result["member_exists"]))
     result["manual_review_required"] = bool(
-        job.get("mock_manual_review_required", result["manual_review_required"])
+        mock_row.get("manual_review_required", result["manual_review_required"])
     )
-    result["warning_count"] = int(job.get("mock_warning_count", result["warning_count"]))
-    result["submitted_member_no_status"] = job.get(
-        "mock_submitted_member_no_status",
+    result["warning_count"] = int(mock_row.get("warning_count", result["warning_count"]))
+    result["submitted_member_no_status"] = mock_row.get(
+        "submitted_member_no_status",
         result["submitted_member_no_status"],
     )
     result["normalized_member_no_length"] = int(
-        job.get("mock_normalized_member_no_length", result["normalized_member_no_length"])
+        mock_row.get("normalized_member_no_length", result["normalized_member_no_length"])
     )
+    result["authentication_success"] = bool(
+        mock_row.get("authentication_success", result["authentication_success"])
+    )
+    result["user_session_available"] = bool(
+        mock_row.get("user_session_available", result["user_session_available"])
+    )
+    result["member_command_found"] = bool(
+        mock_row.get("member_command_found", result["member_command_found"])
+    )
+    result["get_member_found"] = bool(mock_row.get("get_member_found", result["get_member_found"]))
     if result["status"] != "ok":
-        result["error"] = {"type": job.get("mock_error_code", "mock_lookup_error")}
+        result["error"] = {"type": mock_row.get("error_code", "mock_lookup_error")}
     if result["member_exists"]:
         result["member_found_by"] = "MemberCommand.GetMember"
     return result
@@ -281,6 +412,8 @@ def validate_lookup_result(result):
         raise BridgeWorkerError("Lookup result warning_count must be integer.")
     if not isinstance(result.get("normalized_member_no_length"), int):
         raise BridgeWorkerError("Lookup result normalized_member_no_length must be integer.")
+    if result.get("submitted_member_no_status") not in ALLOWED_MEMBER_STATUS_LABELS:
+        raise BridgeWorkerError("Lookup result submitted_member_no_status is outside allowed labels.")
 
 
 def error_code_from_lookup(result):
@@ -306,10 +439,16 @@ def classify_lookup_result(result):
 def result_envelope(job, state, lookup_result=None, error_code=None):
     envelope = {
         "job_id": safe_job_id(job.get("job_id")),
+        "intake_source": safe_source_value(job.get("intake_source")),
+        "source_reference": safe_source_value(job.get("source_reference")),
+        "source_row_ref": safe_source_value(job.get("source_row_ref")),
         "row_number": safe_row_number(job.get("row_number")),
         "state": state,
+        "consent_status": safe_source_value(job.get("consent_status")),
+        "pdpa_status": safe_source_value(job.get("pdpa_status")),
         "attempt": safe_attempt(job.get("attempt")),
-        "processed_at": utc_now(),
+        "result_created_at": utc_now(),
+        "result_applied_at": None,
         "dry_run_only": True,
         "final_write_automation": False,
     }
@@ -333,16 +472,17 @@ def result_envelope(job, state, lookup_result=None, error_code=None):
             }
         )
     envelope["error_code"] = error_code
+    envelope = {field: envelope.get(field) for field in ALLOWED_RESULT_FIELDS}
     return envelope
 
 
-def process_job(job, args):
+def process_job(job, args, mock_results=None):
     try:
         validate_job(job)
-        if job.get("attempt", 0) >= args.max_attempts:
+        if job.get("attempt", 0) >= safe_max_attempts(job, args.max_attempts):
             return result_envelope(job, LOOKUP_ERROR_REVIEW, error_code="retry_exhausted")
         if args.lookup_mode == "mock":
-            lookup_result = mock_lookup(job)
+            lookup_result = mock_lookup(job, mock_results=mock_results)
         else:
             lookup_result = powershell_lookup(job, args)
         state, error_code = classify_lookup_result(lookup_result)
@@ -376,6 +516,7 @@ def build_parser():
     parser.add_argument("--enable-local-lookup-bridge-review", action="store_true")
     parser.add_argument("--queue-mode", choices=["fixture"], default=None)
     parser.add_argument("--fixture-jobs", default=None)
+    parser.add_argument("--fixture-mock-results", default=None)
     parser.add_argument("--results-jsonl", default=None)
     parser.add_argument("--lookup-mode", choices=["mock", "powershell"], default="mock")
     parser.add_argument("--enable-powershell-lookup", action="store_true")
@@ -425,6 +566,7 @@ def main(argv=None):
 
     try:
         jobs = read_fixture_jobs(args.fixture_jobs)
+        mock_results = read_mock_results(args.fixture_mock_results)
     except (BridgeWorkerError, OSError, json.JSONDecodeError):
         print(
             json.dumps(
@@ -440,7 +582,7 @@ def main(argv=None):
         )
         return 2
 
-    results = [process_job(job, args) for job in jobs]
+    results = [process_job(job, args, mock_results=mock_results) for job in jobs]
     write_results_jsonl(args.results_jsonl, results)
     summary = {
         "status": "ok",

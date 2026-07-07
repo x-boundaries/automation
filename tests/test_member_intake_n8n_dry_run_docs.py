@@ -104,10 +104,15 @@ class MemberIntakeN8nDryRunDocsTests(unittest.TestCase):
 
         for field in [
             "job_id",
+            "intake_source",
+            "source_reference",
+            "source_row_ref",
             "row_number",
             "intake_id",
             "state",
             "submitted_member_no_base64_utf8",
+            "consent_status",
+            "pdpa_status",
             "payload_hash",
             "normalized_member_no_length",
             "member_exists",

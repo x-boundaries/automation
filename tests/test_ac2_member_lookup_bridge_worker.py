@@ -1,4 +1,5 @@
 import json
+import re
 import subprocess
 import sys
 import tempfile
@@ -16,6 +17,54 @@ NODE_CONTRACT = DOCS / "member_intake_n8n_node_contract.md"
 
 
 ENCODED_SYNTHETIC_VALUE = "U1lOVEhFVElD"
+ALLOWED_QUEUE_FIELDS = {
+    "job_id",
+    "intake_source",
+    "source_reference",
+    "source_row_ref",
+    "row_number",
+    "intake_id",
+    "state",
+    "submitted_member_no_base64_utf8",
+    "consent_status",
+    "pdpa_status",
+    "payload_hash",
+    "attempt",
+    "max_attempts",
+    "created_at",
+    "updated_at",
+    "lease_owner",
+    "lease_expires_at",
+    "timeout_at",
+    "last_error_code",
+}
+ALLOWED_RESULT_FIELDS = {
+    "job_id",
+    "intake_source",
+    "source_reference",
+    "source_row_ref",
+    "row_number",
+    "state",
+    "status",
+    "authentication_success",
+    "user_session_available",
+    "member_command_found",
+    "get_member_found",
+    "submitted_member_no_status",
+    "normalized_member_no_length",
+    "member_exists",
+    "member_found_by",
+    "manual_review_required",
+    "warning_count",
+    "error_code",
+    "consent_status",
+    "pdpa_status",
+    "attempt",
+    "dry_run_only",
+    "final_write_automation",
+    "result_created_at",
+    "result_applied_at",
+}
 FORBIDDEN_WRITE_TOKENS = [
     "Save" + "Member",
     "New" + "Member",
@@ -27,14 +76,46 @@ FORBIDDEN_WRITE_TOKENS = [
 def fixture_job(**overrides):
     job = {
         "job_id": "job-synthetic-001",
+        "intake_source": "google_sheets_uat",
+        "source_reference": "uat-queue-row-002",
+        "source_row_ref": "row-002",
         "row_number": 2,
+        "intake_id": "intake-synthetic-001",
         "state": "PENDING_LOOKUP",
         "submitted_member_no_base64_utf8": ENCODED_SYNTHETIC_VALUE,
+        "consent_status": "acknowledged",
+        "pdpa_status": "i_agree",
         "attempt": 0,
+        "max_attempts": 3,
         "payload_hash": "hash-synthetic",
+        "created_at": "fixture-created-at",
+        "updated_at": "fixture-updated-at",
+        "lease_owner": "fixture-bridge",
+        "lease_expires_at": "fixture-lease-expires-at",
+        "timeout_at": "fixture-timeout-at",
+        "last_error_code": None,
     }
     job.update(overrides)
     return job
+
+
+def mock_result(job_id, **overrides):
+    row = {
+        "job_id": job_id,
+        "status": "ok",
+        "authentication_success": True,
+        "user_session_available": True,
+        "member_command_found": True,
+        "get_member_found": True,
+        "submitted_member_no_status": "canonical_65_mobile",
+        "normalized_member_no_length": 10,
+        "member_exists": False,
+        "member_found_by": None,
+        "manual_review_required": False,
+        "warning_count": 0,
+    }
+    row.update(overrides)
+    return row
 
 
 def write_jsonl(path, rows):
@@ -66,19 +147,23 @@ class BridgeWorkerCliTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             jobs_path = tmp_path / "jobs.jsonl"
+            mock_results_path = tmp_path / "mock_results.jsonl"
             results_path = tmp_path / "member_lookup_bridge_results.jsonl"
             write_jsonl(
                 jobs_path,
                 [
                     fixture_job(job_id="job-ready", row_number=2),
-                    fixture_job(job_id="job-existing", row_number=3, mock_member_exists=True),
-                    fixture_job(
-                        job_id="job-manual",
-                        row_number=4,
-                        mock_manual_review_required=True,
-                        mock_warning_count=1,
-                    ),
-                    fixture_job(job_id="job-error", row_number=5, mock_status="error", mock_error_code="mock_error"),
+                    fixture_job(job_id="job-existing", row_number=3),
+                    fixture_job(job_id="job-manual", row_number=4),
+                    fixture_job(job_id="job-error", row_number=5),
+                ],
+            )
+            write_jsonl(
+                mock_results_path,
+                [
+                    mock_result("job-existing", member_exists=True),
+                    mock_result("job-manual", manual_review_required=True, warning_count=1),
+                    mock_result("job-error", status="error", error_code="mock_error"),
                 ],
             )
 
@@ -89,6 +174,8 @@ class BridgeWorkerCliTests(unittest.TestCase):
                     "fixture",
                     "--fixture-jobs",
                     str(jobs_path),
+                    "--fixture-mock-results",
+                    str(mock_results_path),
                     "--results-jsonl",
                     str(results_path),
                 ]
@@ -107,13 +194,137 @@ class BridgeWorkerCliTests(unittest.TestCase):
             results = [json.loads(line) for line in results_path.read_text(encoding="utf-8").splitlines()]
             self.assertEqual({result["state"] for result in results}, set(summary["result_state_counts"]))
             for result in results:
+                self.assertEqual(set(result), ALLOWED_RESULT_FIELDS)
                 self.assertTrue(result["dry_run_only"])
                 self.assertFalse(result["final_write_automation"])
                 self.assertIn("job_id", result)
+                self.assertEqual(result["intake_source"], "google_sheets_uat")
+                self.assertIn("source_reference", result)
                 self.assertIn("row_number", result)
                 self.assertIn("normalized_member_no_length", result)
+                self.assertIn("result_created_at", result)
+                self.assertIsNone(result["result_applied_at"])
                 self.assertNotIn("submitted_member_no_base64_utf8", result)
                 self.assertNotIn(ENCODED_SYNTHETIC_VALUE, json.dumps(result, sort_keys=True))
+
+    def test_fixture_queue_rows_match_uat_lookup_queue_contract(self):
+        job = fixture_job()
+
+        self.assertEqual(set(job), ALLOWED_QUEUE_FIELDS)
+        self.assertNotIn("mock_member_exists", job)
+        self.assertNotIn("mock_status", job)
+        self.assertNotIn("raw_phone_number", job)
+        self.assertNotIn("normalized_member_no", job)
+
+    def test_fixture_queue_rows_are_source_agnostic_beyond_google_sheets_uat(self):
+        job = fixture_job(
+            intake_source="hosted_intake_api_uat",
+            source_reference="api-submission-fixture-001",
+            source_row_ref=None,
+            row_number=None,
+        )
+
+        self.assertEqual(set(job), ALLOWED_QUEUE_FIELDS)
+        self.assertEqual(job["intake_source"], "hosted_intake_api_uat")
+        self.assertEqual(job["source_reference"], "api-submission-fixture-001")
+        self.assertIsNone(job["source_row_ref"])
+        self.assertIsNone(job["row_number"])
+
+    def test_fixture_job_with_imported_pdpa_status_routes_to_lookup_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            jobs_path = tmp_path / "jobs.jsonl"
+            results_path = tmp_path / "member_lookup_bridge_results.jsonl"
+            write_jsonl(
+                jobs_path,
+                [fixture_job(job_id="job-imported-pdpa", consent_status="imported", pdpa_status="imported")],
+            )
+
+            completed = self.run_cli(
+                [
+                    "--enable-local-lookup-bridge-review",
+                    "--queue-mode",
+                    "fixture",
+                    "--fixture-jobs",
+                    str(jobs_path),
+                    "--results-jsonl",
+                    str(results_path),
+                ]
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            result_text = results_path.read_text(encoding="utf-8")
+            result = json.loads(result_text)
+            self.assertEqual(result["state"], "LOOKUP_ERROR_REVIEW")
+            self.assertEqual(result["error_code"], "request_or_lookup_contract_error")
+            self.assertNotIn(ENCODED_SYNTHETIC_VALUE, result_text)
+
+    def test_imported_pdpa_status_is_blocked_even_when_consent_status_is_acknowledged(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            jobs_path = tmp_path / "jobs.jsonl"
+            results_path = tmp_path / "member_lookup_bridge_results.jsonl"
+            write_jsonl(
+                jobs_path,
+                [
+                    fixture_job(
+                        job_id="job-pdpa-imported-consent-ack",
+                        consent_status="acknowledged",
+                        pdpa_status="imported",
+                    )
+                ],
+            )
+
+            completed = self.run_cli(
+                [
+                    "--enable-local-lookup-bridge-review",
+                    "--queue-mode",
+                    "fixture",
+                    "--fixture-jobs",
+                    str(jobs_path),
+                    "--results-jsonl",
+                    str(results_path),
+                ]
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            result_text = results_path.read_text(encoding="utf-8")
+            result = json.loads(result_text)
+            self.assertEqual(result["state"], "LOOKUP_ERROR_REVIEW")
+            self.assertEqual(result["error_code"], "request_or_lookup_contract_error")
+            self.assertNotIn(ENCODED_SYNTHETIC_VALUE, result_text)
+
+    def test_valid_pdpa_status_allows_separate_imported_consent_category_in_review_only_mode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            jobs_path = tmp_path / "jobs.jsonl"
+            results_path = tmp_path / "member_lookup_bridge_results.jsonl"
+            write_jsonl(
+                jobs_path,
+                [fixture_job(job_id="job-pdpa-valid-consent-imported", consent_status="imported")],
+            )
+
+            completed = self.run_cli(
+                [
+                    "--enable-local-lookup-bridge-review",
+                    "--queue-mode",
+                    "fixture",
+                    "--fixture-jobs",
+                    str(jobs_path),
+                    "--results-jsonl",
+                    str(results_path),
+                ]
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            result_text = results_path.read_text(encoding="utf-8")
+            result = json.loads(result_text)
+            self.assertEqual(result["state"], "READY_FOR_CREATE_REVIEW")
+            self.assertEqual(result["pdpa_status"], "i_agree")
+            self.assertEqual(result["consent_status"], "imported")
+            self.assertTrue(result["dry_run_only"])
+            self.assertFalse(result["final_write_automation"])
+            self.assertNotIn(ENCODED_SYNTHETIC_VALUE, result_text)
 
     def test_fixture_job_with_forbidden_field_routes_to_lookup_error_review_without_echoing_value(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -146,9 +357,100 @@ class BridgeWorkerCliTests(unittest.TestCase):
             result_text = results_path.read_text(encoding="utf-8")
             result = json.loads(result_text)
             self.assertEqual(result["state"], "LOOKUP_ERROR_REVIEW")
+            self.assertEqual(set(result), ALLOWED_RESULT_FIELDS)
             self.assertEqual(result["error_code"], "request_or_lookup_contract_error")
             self.assertNotIn("redacted-fixture-value", result_text)
             self.assertNotIn(ENCODED_SYNTHETIC_VALUE, result_text)
+
+    def test_fixture_job_with_mock_control_field_is_rejected_as_queue_contract_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            jobs_path = tmp_path / "jobs.jsonl"
+            results_path = tmp_path / "member_lookup_bridge_results.jsonl"
+            write_jsonl(jobs_path, [fixture_job(job_id="job-bad-mock", mock_member_exists=True)])
+
+            completed = self.run_cli(
+                [
+                    "--enable-local-lookup-bridge-review",
+                    "--queue-mode",
+                    "fixture",
+                    "--fixture-jobs",
+                    str(jobs_path),
+                    "--results-jsonl",
+                    str(results_path),
+                ]
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            result_text = results_path.read_text(encoding="utf-8")
+            result = json.loads(result_text)
+            self.assertEqual(result["state"], "LOOKUP_ERROR_REVIEW")
+            self.assertEqual(result["error_code"], "request_or_lookup_contract_error")
+            self.assertNotIn("mock_member_exists", result_text)
+
+    def test_invalid_base64_shape_routes_to_lookup_error_without_echoing_value(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            jobs_path = tmp_path / "jobs.jsonl"
+            results_path = tmp_path / "member_lookup_bridge_results.jsonl"
+            invalid_encoded_value = "not_base64!"
+            write_jsonl(
+                jobs_path,
+                [fixture_job(job_id="job-invalid-base64", submitted_member_no_base64_utf8=invalid_encoded_value)],
+            )
+
+            completed = self.run_cli(
+                [
+                    "--enable-local-lookup-bridge-review",
+                    "--queue-mode",
+                    "fixture",
+                    "--fixture-jobs",
+                    str(jobs_path),
+                    "--results-jsonl",
+                    str(results_path),
+                ]
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            result_text = results_path.read_text(encoding="utf-8")
+            result = json.loads(result_text)
+            self.assertEqual(result["state"], "LOOKUP_ERROR_REVIEW")
+            self.assertEqual(result["error_code"], "request_or_lookup_contract_error")
+            self.assertNotIn(invalid_encoded_value, result_text)
+
+    def test_mock_result_with_unbounded_status_label_is_rejected_without_echoing_value(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            jobs_path = tmp_path / "jobs.jsonl"
+            mock_results_path = tmp_path / "mock_results.jsonl"
+            results_path = tmp_path / "member_lookup_bridge_results.jsonl"
+            unsafe_label = "unsafe-fixture-label"
+            write_jsonl(jobs_path, [fixture_job(job_id="job-unsafe-label")])
+            write_jsonl(
+                mock_results_path,
+                [mock_result("job-unsafe-label", submitted_member_no_status=unsafe_label)],
+            )
+
+            completed = self.run_cli(
+                [
+                    "--enable-local-lookup-bridge-review",
+                    "--queue-mode",
+                    "fixture",
+                    "--fixture-jobs",
+                    str(jobs_path),
+                    "--fixture-mock-results",
+                    str(mock_results_path),
+                    "--results-jsonl",
+                    str(results_path),
+                ]
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            result_text = results_path.read_text(encoding="utf-8")
+            result = json.loads(result_text)
+            self.assertEqual(result["state"], "LOOKUP_ERROR_REVIEW")
+            self.assertEqual(result["error_code"], "request_or_lookup_contract_error")
+            self.assertNotIn(unsafe_label, result_text)
 
     def test_powershell_lookup_mode_requires_second_explicit_opt_in(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -188,7 +490,25 @@ class BridgeWorkerStaticGuardrailTests(unittest.TestCase):
         self.assertIn("ac2_member_lookup_review.ps1", source)
         self.assertIn("-EnableMemberLookupReview", source)
         self.assertIn("-MemberNoBase64Utf8", source)
-        self.assertNotRegex(source, r"(?i)\b(requests|urllib|socket|http://|https://|webhook)\b")
+        self.assertIn("ALLOWED_QUEUE_FIELDS", source)
+        self.assertIn("ALLOWED_RESULT_FIELDS", source)
+        self.assertIn("intake_source", source)
+        self.assertIn("source_reference", source)
+        self.assertIn("pdpa_status", source)
+        self.assertIn("--fixture-mock-results", source)
+        blocked_terms = [
+            "google" + "apiclient",
+            "g" + "spread",
+            "req" + "uests",
+            "url" + "lib",
+            "sock" + "et",
+            "http" + ".client",
+            "http" + "://",
+            "https" + "://",
+            "web" + "hook",
+        ]
+        for term in blocked_terms:
+            self.assertNotRegex(source, rf"(?i)\b{re.escape(term)}\b")
         for token in FORBIDDEN_WRITE_TOKENS:
             self.assertNotIn(token, source, token)
         self.assertNotRegex(
@@ -206,8 +526,15 @@ class BridgeWorkerStaticGuardrailTests(unittest.TestCase):
         self.assertIn("scripts/ac2_member_lookup_bridge_worker.py", readme)
         self.assertIn("member_intake_local_lookup_bridge_runbook.md", readme)
         self.assertIn("member_lookup_bridge_results.jsonl", gitignore)
+        self.assertIn("member_lookup_bridge_fixture_jobs.jsonl", gitignore)
+        self.assertIn("member_lookup_bridge_mock_results.jsonl", gitignore)
         self.assertRegex(combined, r"(?i)disabled-by-default|default invocation refuses")
         self.assertRegex(combined, r"(?i)fixture queue mode|fixture/mock mode")
+        self.assertRegex(
+            combined,
+            r"(?i)Google Sheets(?: UAT)? queue.*fixture-only|fixture-only.*Google Sheets(?: UAT)? queue",
+        )
+        self.assertRegex(combined, r"(?i)custom web form|hosted intake API")
         self.assertRegex(combined, r"(?i)PowerShell lookup mode.*requires")
         self.assertRegex(combined, r"(?i)never writes to AutoCount|never writes to AutoCount")
         self.assertRegex(combined, r"(?i)dry_run_only")

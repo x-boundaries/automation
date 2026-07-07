@@ -6,6 +6,8 @@ Status: static contract for review-only AC2 member lookup orchestration. This is
 
 n8n is the orchestration brain and may run in cloud, VPS, or another non-AC2 environment. The local Windows AC2 lookup bridge is the only component allowed to load AutoCount assemblies or invoke the existing PowerShell lookup script.
 
+Google Forms / Google Sheets are a temporary UAT intake surface only. The bridge contract should not permanently depend on Google Forms because a future custom web form or hosted intake API may need to reject duplicate mobile/member numbers before submission. That future intake and synchronous rejection behavior are not implemented here.
+
 Preferred flow:
 
 ```text
@@ -24,15 +26,20 @@ n8n may queue only the minimum fields needed for review routing:
 | Field | Required | Handling |
 | --- | --- | --- |
 | `job_id` | Yes | Stable idempotency key. Must not contain PII. |
-| `row_number` | Yes | Spreadsheet row metadata. Safe to route and log. |
+| `intake_source` | Yes | Safe source label, for example `google_sheets_uat`; must not contain PII. |
+| `source_reference` | Yes | Source-agnostic row/submission reference; must not contain PII. |
+| `source_row_ref` | No | Optional row/reference label for source systems. |
+| `row_number` | No | Spreadsheet row metadata for the first Google Sheets UAT only. |
 | `intake_id` | No | Internal idempotency key. Safe only if it contains no PII. |
 | `state` | Yes | Must be `PENDING_LOOKUP` for new lookup work. |
 | `submitted_member_no_base64_utf8` | Yes | Encoded submitted member value. Sensitive; never log or echo. |
+| `consent_status` | No | Optional separate consent/marketing category only; not a PDPA override. |
+| `pdpa_status` | Yes | Mandatory duplicate-check gate. Must be a valid new-form PDPA acknowledgement; `Imported` is not consent. |
 | `attempt` | No | Nonnegative retry counter. |
 | `created_at` | No | Queue metadata. |
 | `payload_hash` | No | Hash of allowed request fields for idempotency checks. |
 
-The queue request must not contain raw member values, normalized member values, names, emails, raw phone numbers, DOB, addresses, AutoKey, Guid, local AutoCount target details, credentials, connection strings, stderr, stdout, tokens, or arbitrary payload dumps.
+The queue request must not contain raw member values, normalized member values, names, emails, raw phone numbers, DOB, addresses, AutoCount internal identifiers, local AutoCount target details, credentials, connection strings, stderr, stdout, tokens, or arbitrary payload dumps.
 
 ## Encoded Member Value
 
@@ -68,7 +75,10 @@ The bridge may post only sanitized metadata:
 | Field | Required | Notes |
 | --- | --- | --- |
 | `job_id` | Yes | Echoes the non-PII job id. |
-| `row_number` | Yes | Spreadsheet row metadata. |
+| `intake_source` | Yes | Echoes safe source label only. |
+| `source_reference` | Yes | Echoes safe source reference only. |
+| `source_row_ref` | No | Echoes safe source row/reference label only. |
+| `row_number` | No | Spreadsheet row metadata for Google Sheets UAT only. |
 | `state` | Yes | One of the review states below. |
 | `status` | Yes | Expected `ok` for successful lookup processing. |
 | `authentication_success` | Yes | Boolean status field only. |
@@ -82,11 +92,15 @@ The bridge may post only sanitized metadata:
 | `manual_review_required` | Yes | Routes to manual review when true. |
 | `warning_count` | Yes | Any warning blocks ready-for-create review. |
 | `error_code` | No | Sanitized category only; no raw exception text. |
+| `consent_status` | No | Sanitized category only; not used to satisfy PDPA. |
+| `pdpa_status` | Yes | Sanitized PDPA category only. |
 | `attempt` | No | Retry attempt metadata. |
 | `dry_run_only` | Yes | Must be true. |
 | `final_write_automation` | Yes | Must be false. |
 
 Forbidden response fields are the same as forbidden request fields. The response must not include the encoded member value.
+
+`pdpa_status` is mandatory for lookup eligibility. `consent_status` is optional sanitized metadata for separate consent or marketing categories, and it must not rescue, override, or reinterpret invalid, missing, or imported `pdpa_status`.
 
 ## Job States
 
