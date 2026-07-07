@@ -53,8 +53,8 @@ MEMBER_NO_MAX_LENGTH = 20
 # AC2 DOB stores the birthday month only, using a fixed sentinel year/day.
 DOB_YEAR = 2000
 
-# The live Google Form exports the PDPA checkbox as "I agree". "Yes" stays
-# accepted for the earlier multiple-choice form design.
+# The live Google Form exports the PDPA checkbox as "Yes". "I agree" stays
+# accepted only for older exported rows and compatibility review.
 PDPA_ACKNOWLEDGED_VALUES = {"i agree", "yes"}
 
 MONTH_NUMBERS = {

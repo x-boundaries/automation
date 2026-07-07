@@ -31,7 +31,7 @@ def synthetic_row(**overrides):
         "Email Address": "synthetic.alpha@example.invalid",
         "Birthday Month": "March",
         "Marketing Consent": "Yes",
-        "PDPA Acknowledged": "I agree",
+        "PDPA Acknowledged": "Yes",
     }
     row.update(overrides)
     return row
@@ -202,7 +202,15 @@ class ValidateRowTests(unittest.TestCase):
         self.assertFalse(result["valid"])
         self.assertEqual(error_codes(result), ["missing_birthday_month"])
 
-    def test_pdpa_i_agree_is_acknowledged_case_insensitively(self):
+    def test_pdpa_yes_is_acknowledged_case_insensitively(self):
+        for raw in ["Yes", "yes", "YES", " Yes "]:
+            result = validator.validate_row(synthetic_row(**{"PDPA Acknowledged": raw}))
+
+            self.assertTrue(result["valid"], raw)
+            self.assertFalse(result["pdpa_blocked"], raw)
+            self.assertTrue(result["sync_eligible"], raw)
+
+    def test_legacy_pdpa_i_agree_is_acknowledged_for_older_exports_only(self):
         for raw in ["I agree", "i agree", "I AGREE", " I  agree "]:
             result = validator.validate_row(synthetic_row(**{"PDPA Acknowledged": raw}))
 

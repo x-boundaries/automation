@@ -87,7 +87,7 @@ def fixture_job(**overrides):
         "state": "PENDING_LOOKUP",
         "submitted_member_no_base64_utf8": ENCODED_SYNTHETIC_VALUE,
         "consent_status": "acknowledged",
-        "pdpa_status": "i_agree",
+        "pdpa_status": "yes",
         "attempt": 0,
         "max_attempts": 3,
         "payload_hash": "hash-synthetic",
@@ -233,6 +233,14 @@ class BridgeWorkerCliTests(unittest.TestCase):
         self.assertIsNone(job["source_row_ref"])
         self.assertIsNone(job["row_number"])
 
+    def test_valid_pdpa_status_is_normalized_yes_not_old_i_agree_label(self):
+        source = SCRIPT.read_text(encoding="utf-8")
+        job = fixture_job()
+
+        self.assertEqual(job["pdpa_status"], "yes")
+        self.assertIn('ALLOWED_PDPA_STATUS_LABELS = {"yes"}', source)
+
+
     def test_fixture_job_with_imported_pdpa_status_routes_to_lookup_error(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -323,7 +331,7 @@ class BridgeWorkerCliTests(unittest.TestCase):
             result_text = results_path.read_text(encoding="utf-8")
             result = json.loads(result_text)
             self.assertEqual(result["state"], "READY_FOR_CREATE_REVIEW")
-            self.assertEqual(result["pdpa_status"], "i_agree")
+            self.assertEqual(result["pdpa_status"], "yes")
             self.assertEqual(result["consent_status"], "imported")
             self.assertTrue(result["dry_run_only"])
             self.assertFalse(result["final_write_automation"])

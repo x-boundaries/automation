@@ -436,6 +436,20 @@ class MemberIntakeN8nDryRunDocsTests(unittest.TestCase):
         self.assertNotRegex(gate2, r"(?i)workflow export file")
         self.assertNotRegex(gate2, r"(?i)activate a schedule without a future approval")
 
+    def test_pdpa_current_form_value_is_yes_and_normalized_queue_status_is_yes(self):
+        combined = self.combined([WORKFLOW_DOC, UAT_PLAN, GATE2_RUNBOOK, NODE_CONTRACT, BRIDGE_RUNBOOK])
+
+        self.assertIn("PDPA Acknowledged = Yes", combined)
+        self.assertIn("queue value `yes`", combined)
+        self.assertIn("pdpa_status = yes", combined)
+        self.assertRegex(combined, r"(?i)Imported.*blocked|imported.*blocked")
+        self.assertRegex(combined, r"(?i)consent_status.*not.*PDPA|not a PDPA override")
+        self.assertNotIn("PDPA Acknowledged = I agree", combined)
+        self.assertNotIn("pdpa_status = i_agree", combined)
+        self.assertNotIn("`i_agree`", combined)
+        self.assertNotRegex(combined, r"(?i)current live form value.*I agree")
+
+
     def test_uat_plan_defines_exact_node_level_polling_workflow_shape(self):
         plan = self.read(UAT_PLAN)
 

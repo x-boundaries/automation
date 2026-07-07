@@ -29,7 +29,7 @@ ALLOWED_MEMBER_STATUS_LABELS = {
     "manual_review",
     "invalid_too_long",
 }
-ALLOWED_PDPA_STATUS_LABELS = {"i_agree"}
+ALLOWED_PDPA_STATUS_LABELS = {"yes"}
 
 ALLOWED_QUEUE_FIELDS = {
     "job_id",

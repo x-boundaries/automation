@@ -35,7 +35,7 @@ def synthetic_row(**overrides):
         "Email Address": "synthetic.alpha@example.invalid",
         "Birthday Month": "March",
         "Marketing Consent": "Yes",
-        "PDPA Acknowledged": "I agree",
+        "PDPA Acknowledged": "Yes",
     }
     row.update(overrides)
     return row

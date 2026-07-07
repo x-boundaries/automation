@@ -42,7 +42,7 @@ Allowed columns only:
 | `lookup_requested` | Operator marker for dummy rows that n8n may read. |
 | `already_queued` | Guard that blocks duplicate queue append. |
 | `submitted_member_no_base64_utf8` | Placeholder token only; do not commit or paste any encoded value literal. |
-| `pdpa_status` | Dummy consent category. `i_agree` is allowed; `imported` remains blocked. |
+| `pdpa_status` | Dummy consent category normalized from form `PDPA Acknowledged = Yes`. `yes` is allowed; `imported` remains blocked. |
 | `consent_status` | Optional sanitized dummy category only. |
 | `uat_lookup_job_id` | Filled by n8n with a non-PII dummy job ID. |
 | `reviewer_status` | Filled by n8n with review-only status. |
@@ -53,8 +53,8 @@ Safe dummy row shapes:
 
 | Scenario | `intake_id` | `lookup_requested` | `already_queued` | `submitted_member_no_base64_utf8` | `pdpa_status` |
 | --- | --- | --- | --- | --- | --- |
-| eligible dummy row | `dummy-intake-ready` | `yes` | `no` | `<local-placeholder-generated-outside-repo>` | `i_agree` |
-| duplicate queue guard | `dummy-intake-already-queued` | `yes` | `yes` | `<local-placeholder-generated-outside-repo>` | `i_agree` |
+| eligible dummy row | `dummy-intake-ready` | `yes` | `no` | `<local-placeholder-generated-outside-repo>` | `yes` |
+| duplicate queue guard | `dummy-intake-already-queued` | `yes` | `yes` | `<local-placeholder-generated-outside-repo>` | `yes` |
 | PDPA blocked guard | `dummy-intake-imported-pdpa` | `yes` | `no` | `<local-placeholder-generated-outside-repo>` | `imported` |
 
 The placeholder above is not an instruction to paste the generated value. It only marks where the operator-created dummy sheet cell exists locally.
@@ -74,7 +74,7 @@ Allowed columns only:
 | `state` | Queue state. Gate 2 may append only `PENDING_LOOKUP`. |
 | `submitted_member_no_base64_utf8` | Copied dummy placeholder value; never paste the literal. |
 | `consent_status` | Sanitized dummy category only. |
-| `pdpa_status` | Must be `i_agree` for queue append. `imported` remains blocked. |
+| `pdpa_status` | Must be normalized queue value `yes` for queue append. `imported` remains blocked. |
 | `payload_hash` | Non-PII dummy hash marker. |
 | `attempt` | Dummy retry count. |
 | `max_attempts` | Dummy retry limit. |
@@ -146,7 +146,7 @@ No workflow export is committed by this PR. The exact node parameters, resource 
 3. `If` named `Block Already Queued Rows`.
    - Allows only rows where `already_queued` is not `yes`.
 4. `If` named `Apply Intake And PDPA Guards`.
-   - Allows only dummy rows with `pdpa_status = i_agree`.
+   - Allows only dummy rows with `pdpa_status = yes`.
    - Blocks `pdpa_status = imported`.
    - Routes blocked rows to review-only status; it never authorizes creation.
 5. `Edit Fields` named `Build Allowed Queue Job`.

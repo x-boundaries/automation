@@ -53,7 +53,7 @@ The earlier planned `FullName`/`MobileCountryCode`/`MobileNumber`/`BirthDate` fo
 | `Email Address` | Yes | Trim, lowercase, basic format validation. | AutoCount `EmailAddress`. | Implemented dry-run mapping |
 | `Birthday Month` | Yes | Full month name January to December, case-insensitive. | AutoCount `DOB` as month-only sentinel `2000-MM-01`. | Implemented dry-run mapping |
 | `Marketing Consent` | Yes | Explicit `Yes` / `No`, case-insensitive. `No` never blocks registration. | Consent flag for X-Boundaries process; not a confirmed AutoCount field. | Implemented; storage open |
-| `PDPA Acknowledged` | Yes | Checkbox export `I agree` (or legacy `Yes`), case-insensitive. Not acknowledged blocks sync eligibility only. | Compliance gate; not a confirmed AutoCount field. | Implemented; storage open |
+| `PDPA Acknowledged` | Yes | Checkbox export `Yes` (current live form value), case-insensitive. Legacy `I agree` may be accepted only for older exported rows. Not acknowledged blocks sync eligibility only. | Compliance gate; not a confirmed AutoCount field. | Implemented; storage open |
 
 ## Internal Processing Fields
 
@@ -124,7 +124,7 @@ Read-only member lookup review: `scripts/ac2_member_lookup_review.ps1` uses the 
 
 For now, production member creation remains blocked. PR #70 proved no-save synthetic field assignment and PR #71 proved a save-gated fake create, but live writeback requires a separate approval PR/runbook.
 
-The PDPA checkbox on the live form exports `I agree`, which the validator accepts directly (case-insensitive; legacy `Yes` also accepted). Other values, including blank, block sync eligibility without invalidating the row. See [member_form_intake_contract.md](member_form_intake_contract.md).
+The PDPA checkbox on the live form exports `Yes`, which the validator accepts directly case-insensitively. Legacy `I agree` may be accepted only for older exported rows. Other values, including blank, block sync eligibility without invalidating the row. See [member_form_intake_contract.md](member_form_intake_contract.md).
 
 ## Resolved Decisions
 

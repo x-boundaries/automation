@@ -34,7 +34,7 @@ n8n may queue only the minimum fields needed for review routing:
 | `state` | Yes | Must be `PENDING_LOOKUP` for new lookup work. |
 | `submitted_member_no_base64_utf8` | Yes | Encoded submitted member value. Sensitive; never log or echo. |
 | `consent_status` | No | Optional separate consent/marketing category only; not a PDPA override. |
-| `pdpa_status` | Yes | Mandatory duplicate-check gate. Must be a valid new-form PDPA acknowledgement; `Imported` is not consent. |
+| `pdpa_status` | Yes | Mandatory duplicate-check gate. Normalize current form `PDPA Acknowledged = Yes` to queue value `yes`; `Imported` is not consent. |
 | `attempt` | No | Nonnegative retry counter. |
 | `created_at` | No | Queue metadata. |
 | `payload_hash` | No | Hash of allowed request fields for idempotency checks. |
@@ -100,7 +100,7 @@ The bridge may post only sanitized metadata:
 
 Forbidden response fields are the same as forbidden request fields. The response must not include the encoded member value.
 
-`pdpa_status` is mandatory for lookup eligibility. `consent_status` is optional sanitized metadata for separate consent or marketing categories, and it must not rescue, override, or reinterpret invalid, missing, or imported `pdpa_status`.
+`pdpa_status` is mandatory for lookup eligibility. The current live form value is `PDPA Acknowledged = Yes`; the normalized queue value is `yes`. `consent_status` is optional sanitized metadata for separate consent or marketing categories, and it must not rescue, override, or reinterpret invalid, missing, or imported `pdpa_status`.
 
 ## Job States
 
