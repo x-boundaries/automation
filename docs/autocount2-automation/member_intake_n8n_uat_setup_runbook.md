@@ -125,36 +125,46 @@ Before any real n8n queue UAT is allowed to touch AC2 lookup, the bridge worker 
 
 Requirements:
 
+- Run only on the local Windows AC2 lookup environment or approved AC2-capable Windows bridge host.
 - Use `--queue-mode fixture`.
 - Use `--lookup-mode powershell` and `--enable-powershell-lookup`.
-- Use only safe synthetic input or one manually approved lookup input.
+- Use only safe synthetic input or one manually approved lookup input that is dummy-only.
 - Keep the fixture file and result file under the local ignored output directory.
 - The bridge may call only the proven read-only lookup script with `-EnableMemberLookupReview` and `-MemberNoBase64Utf8`.
 - `AC2_PROBE_PASSWORD` and local AC2 target settings must come from local runtime configuration.
-- Paste back aggregate sanitized evidence only.
+- Verify only that the local Windows preflight environment is available, the AutoCount session/auth bootstrap path is available, `MemberCommand` is available, and `MemberCommand.GetMember` is available.
+- Keep the lookup read-only. Do not call member create, update, delete, number-generation, member browse export, direct SQL write, or final write automation paths.
+- Do not involve n8n in Gate 3. No n8n workflow activation, hosted/VPS real queue UAT, webhook, tunnel, callback, or n8n-triggered bridge call is part of Gate 3.
+- Paste back aggregate sanitized evidence only. Do not paste the bridge worker stdout, result JSONL rows, command transcript, stderr/stdout, local target values, raw member values, encoded member values, normalized member values, names, emails, phone numbers, or PII.
 
-Allowed paste-back shape:
+Required paste-back shape:
 
-```json
-{
-  "status": "ok",
-  "queue_mode": "fixture",
-  "lookup_mode": "powershell",
-  "processed_count": 1,
-  "result_state_counts": {
-    "EXISTING_MEMBER_REVIEW": 1
-  },
-  "dry_run_only": true,
-  "final_write_automation": false,
-  "sanitized_note": "Local PowerShell lookup preflight was reviewed; no raw, encoded, normalized, credential, Sheet, local target, command transcript, stderr/stdout, or row-level values are pasted."
-}
+```text
+status = ok
+gate = gate3_local_powershell_lookup_preflight
+runtime_location = local_windows_ac2_lookup_environment
+execution_mode = manual_read_only_preflight
+autocount_session_bootstrap_available = <true/false>
+member_command_found = <true/false>
+get_member_found = <true/false>
+lookup_attempt_count = <aggregate-count-only>
+lookup_success_count = <aggregate-count-only>
+lookup_manual_review_count = <aggregate-count-only>
+lookup_error_count = <aggregate-count-only>
+member_create_or_update_invoked = false
+autocount_write_attempted = false
+direct_sql_write_attempted = false
+n8n_involved = false
+bridge_called_by_n8n = false
+final_write_automation = false
+sanitized_note = No credentials, connection strings, Sheet IDs/URLs, credential IDs, row-level output, raw/encoded/normalized member values, names, emails, phone numbers, command transcripts, stderr/stdout, execution payloads, node raw input/output dumps, or PII are pasted.
 ```
 
-The state count above is an example shape only. The actual state may differ based on the approved safe input. No state authorizes member creation.
+All count fields are aggregate-only. A successful lookup, missing lookup, manual-review lookup, or lookup error must be reduced to booleans and counts only. No state authorizes member creation.
 
 ### Gate 4: Real Queue UAT Touching AC2 Lookup
 
-Only after Gates 1, 2, and 3 pass may an operator consider a real queue UAT where the Windows bridge polls outbound and touches AC2 lookup. Gate 4 is still review-only, dry-run-only, and inactive by default. It cannot create or update AutoCount members.
+Only after Gates 1, 2/2A, and 3 pass may an operator consider a real queue UAT where the Windows bridge polls outbound and touches AC2 lookup. Gate 4 is still review-only, dry-run-only, and inactive by default. It cannot create or update AutoCount members. The local operator PC n8n dummy wiring pass does not prove hosted/VPS readiness; hosted/VPS runtime readiness must still be proven before any hosted/VPS real queue UAT.
 
 ## Minimum Next Runnable n8n UAT Step
 

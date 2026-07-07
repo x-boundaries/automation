@@ -286,6 +286,57 @@ Paste back only this sanitized summary evidence after reviewing the local output
 
 Do not paste result rows, raw fixture input, encoded submitted values, raw member values, normalized member values, names, emails, raw phone numbers, credentials, real Sheet IDs or URLs, local AC2 target values, command transcripts, or full command output if it contains row-level detail. Keep the fixture and result JSONL files local under `C:\XB\autocount_outputs\review\member_lookup_bridge`.
 
+## Gate 3 Local PowerShell Lookup Preflight
+
+Use this pass after the fixture/mock bridge pass and the dummy n8n wiring rehearsal evidence are recorded. Gate 3 is still pre-production, manual, read-only, and local-only. It prepares the next AC2-facing readiness proof; it is not a production queue run and does not authorize Gate 4.
+
+Operator boundaries:
+
+- Run only on the local Windows AC2 lookup environment or approved AC2-capable Windows bridge host.
+- Use the bridge worker in fixture queue mode with PowerShell lookup mode explicitly enabled.
+- Use only safe synthetic input or one manually approved dummy-only lookup input generated and stored locally.
+- Call only `scripts/ac2_member_lookup_review.ps1` with `-EnableMemberLookupReview` and `-MemberNoBase64Utf8`.
+- Keep local runtime settings and `AC2_PROBE_PASSWORD` out of repo files and pasted evidence.
+- Review local output files only to reduce them to aggregate booleans and counts.
+- Do not paste result rows, raw fixture rows, raw member values, encoded member values, normalized member values, names, emails, raw phone numbers, local target values, command transcripts, stderr/stdout, credentials, connection strings, Sheet IDs, Sheet URLs, node payloads, or PII.
+
+Gate 3 verifies only these readiness points:
+
+- local Windows preflight environment is available,
+- AutoCount session/auth bootstrap path is available,
+- `MemberCommand` is available,
+- `MemberCommand.GetMember` lookup path is available,
+- lookup remains read-only,
+- no member create/update/delete path is invoked,
+- no AutoCount write or direct SQL write is attempted,
+- n8n is not involved and did not call the bridge,
+- output evidence is sanitized and aggregate-only.
+
+Required Gate 3 paste-back shape:
+
+```text
+status = ok
+gate = gate3_local_powershell_lookup_preflight
+runtime_location = local_windows_ac2_lookup_environment
+execution_mode = manual_read_only_preflight
+autocount_session_bootstrap_available = <true/false>
+member_command_found = <true/false>
+get_member_found = <true/false>
+lookup_attempt_count = <aggregate-count-only>
+lookup_success_count = <aggregate-count-only>
+lookup_manual_review_count = <aggregate-count-only>
+lookup_error_count = <aggregate-count-only>
+member_create_or_update_invoked = false
+autocount_write_attempted = false
+direct_sql_write_attempted = false
+n8n_involved = false
+bridge_called_by_n8n = false
+final_write_automation = false
+sanitized_note = No credentials, connection strings, Sheet IDs/URLs, credential IDs, row-level output, raw/encoded/normalized member values, names, emails, phone numbers, command transcripts, stderr/stdout, execution payloads, node raw input/output dumps, or PII are pasted.
+```
+
+Do not paste the bridge worker stdout directly as Gate 3 evidence. The worker may write local fixture/result files for operator review, but Gate 3 evidence must be the aggregate shape above. A result state such as `READY_FOR_CREATE_REVIEW` remains review-only and is not approval to create.
+
 ## Review-Only Routing
 
 The bridge posts results for review routing only:
