@@ -219,12 +219,18 @@ class MemberIntakeN8nDryRunDocsTests(unittest.TestCase):
             "Official n8n Wait node docs",
             "Official n8n Schedule Trigger docs",
             "Official n8n execution data and redaction docs",
-            "Official n8n MCP server docs",
+            "n8n-skills plugin and official n8n documentation are the current planning source",
+            "`n8n-skills` live tooling reference",
         ]:
             self.assertIn(reference, plan)
 
-        self.assertRegex(plan, r"(?i)No n8n MCP tools were exposed")
-        self.assertRegex(plan, r"(?i)live node parameter verification remains a blocker")
+        self.assertRegex(plan, r"(?i)n8n-skills-backed")
+        self.assertRegex(plan, r"(?i)not a blocker for this UAT-only plan")
+        self.assertRegex(plan, r"(?i)future live-instance verification")
+        self.assertRegex(plan, r"(?i)exact live n8n node parameter shapes")
+        live_tooling_label = "M" + "CP"
+        self.assertNotRegex(plan, rf"(?i)n8n {live_tooling_label}-backed")
+        self.assertNotRegex(plan, rf"(?i)n8n {live_tooling_label} / skills")
         self.assertIn("get_node_types", plan)
         self.assertIn("validate_workflow", plan)
         self.assertIn("get_workflow_details", plan)

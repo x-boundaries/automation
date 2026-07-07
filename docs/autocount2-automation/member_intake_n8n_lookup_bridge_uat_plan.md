@@ -8,15 +8,15 @@ This runbook defines the review-only UAT path for cloud/VPS/non-AC2 n8n to orche
 
 AC2 / AutoCount 2.0 remains the source of truth. The Google Form mobile/member number maps to AutoCount `MemberNo`. AutoCount `MobilePhone` remains intentionally unused. Birthday Month maps to future AC2 `DOB` as `2000-MM-01`, but DOB is outside this lookup-only bridge step. `PDPA Acknowledged = I agree` is valid new-form consent. `PDPA Acknowledged = Imported` is a legacy/import marker only and remains blocked. `READY_FOR_CREATE_REVIEW` is review-only and is not approval to create.
 
-## n8n Evidence Checked
+## n8n-skills Plugin Evidence Checked
 
-The plan is based on the official n8n skills and node references checked before writing this runbook:
+This plan is n8n-skills-backed. The current planning source is the n8n-skills plugin plus official n8n node/runtime documentation checked before writing this runbook. Live n8n instance tooling is a separate future verification path for exact workflow build details, not the source of this UAT plan.
 
 | Source checked | Finding used in this UAT plan |
 | --- | --- |
-| `n8n-skills:using-n8n-skills` | Do not rely on remembered node shapes. Use live MCP `get_node_types`, validation, and post-save verification before any future workflow build. |
+| `n8n-skills:using-n8n-skills` | Do not rely on remembered node shapes. Treat live instance tools such as `get_node_types`, validation, and post-save verification as future build verification, not current planning evidence. |
 | `n8n-skills:n8n-workflow-lifecycle` | Keep this as a plan/spec because validation, verification, and test execution are required before publishing. Do not publish or activate from this PR. |
-| `n8n-skills:n8n-node-configuration` | Node parameters must be verified with live `get_node_types`; this PR names node families and operations but does not claim final import-ready parameters. |
+| `n8n-skills:n8n-node-configuration` | Exact node parameters must be verified with available live n8n tooling in a future build/export/activation PR if that tooling is exposed. This PR names node families and operations but does not claim final import-ready parameters. |
 | `n8n-skills:n8n-credentials-and-security` | Google credentials and any queue/API credentials must live in n8n's credential system or local bridge configuration, never workflow text, docs, tests, or queue rows. |
 | `n8n-skills:n8n-data-tables` | Data Tables are n8n-internal, light-to-moderate storage with primitive columns and system-managed `id`, `createdAt`, and `updatedAt`; they are not a cross-system source of truth. |
 | `n8n-skills:n8n-error-handling` | Unattended scheduled/queue workflows need structured error routes, retries for transient upstream failures, and workflow-level error handling before production. |
@@ -24,21 +24,21 @@ The plan is based on the official n8n skills and node references checked before 
 | `n8n-skills:n8n-expressions` | Reference stable upstream nodes by name and avoid Set/Edit Fields nodes unless they define a reused, whitelisted boundary shape. |
 | `n8n-skills` Data Table schema and dedup references | Use explicit columns, stable non-PII idempotency keys, payload hashes, lease fields, and same-shape branches for retries/results. |
 | `n8n-skills` testing reference | `test_workflow` would pin triggers and credentialed nodes, but Data Tables, Wait, file operations, Execute Command, and Code run for real; do not run tests with side effects without a separate approval. |
-| Official n8n Google Sheets Trigger docs | Google Sheets Trigger supports row-added, row-updated, and row-added-or-updated events, but this UAT prefers a scheduled poller to avoid relying on trigger behavior that was not live-verified in this Codex session. |
+| `n8n-skills` live tooling reference | The plugin describes optional live instance tools for future workflow builds, including node type discovery, validation, workflow detail verification, and execution inspection. Those tools were not exposed in this Codex thread, which limits import-ready build details but does not block this UAT plan. |
+| Official n8n Google Sheets Trigger docs | Google Sheets Trigger supports row-added, row-updated, and row-added-or-updated events, but this UAT prefers a scheduled poller to avoid relying on trigger behavior that was not verified against a live n8n instance in this Codex session. |
 | Official n8n Google Sheets node docs | The Sheet Within Document operations include Append Row, Append or Update Row, Get Row(s), and Update Row. Get Row(s) returns only the first match by default unless configured to return all matches. Update Row updates existing rows only. Append options can misalign data if a sheet has gaps. |
 | Official n8n Data Table docs | Data tables can persist workflow-local state, support row operations, can be managed through the UI/node/API, have a default total storage limit, are project-visible, and are not directly accessible from Code node built-ins. |
 | Official n8n Wait node docs | Wait pauses execution and offloads execution data to the n8n database. Wait can resume on a runtime webhook URL, but that pattern is not recommended here because the AC2 host must not expose a public inbound callback and UAT should minimize stored execution data. |
 | Official n8n Schedule Trigger docs | Schedule Trigger supports seconds/minutes/hours/days/weeks/months/custom intervals; UAT pollers should set explicit cadence and workflow timezone before activation. |
 | Official n8n execution data and redaction docs | n8n can reduce saved execution data, prune old execution data, and redact production/manual execution payloads. This UAT must enable the most restrictive available settings before any live run. |
-| Official n8n MCP server docs | Instance-level MCP can search, interact with, trigger/test, create/edit workflows, and create/edit data tables when configured. The MCP tools were not callable in this Codex thread, so live node parameter verification remains a blocker before activation. |
 
-## Live MCP Status
+## Future Live Workflow Verification Status
 
-Codex tool discovery was attempted for n8n MCP tools such as `search_nodes`, `get_node_types`, `get_sdk_reference`, `validate_workflow`, `search_workflows`, `get_workflow_details`, `search_data_tables`, and `create_data_table`. No n8n MCP tools were exposed in this session, and no install candidate for an n8n MCP connector was offered.
+The n8n-skills plugin and official n8n documentation are the current planning source for this PR. Codex tool discovery did not expose live n8n instance tools such as `search_nodes`, `get_node_types`, `get_sdk_reference`, `validate_workflow`, `search_workflows`, `get_workflow_details`, `search_data_tables`, or `create_data_table`.
 
-Therefore this PR cannot honestly claim live MCP verification of node parameter schemas, credential IDs, resource locator values, workflow settings names, or Data Table table IDs. Those items are blockers for any future build/export/activation PR.
+That is not a blocker for this UAT-only plan. It does mean this PR cannot claim live verification of node parameter schemas, credential IDs, resource locator values, workflow settings names, execution behavior, or Data Table table IDs. Those exact build details remain blockers for any future workflow build/export/activation PR.
 
-Before any workflow is built, a separate activation PR must use live n8n MCP to run:
+A future workflow build/export/activation PR must verify exact node schemas, credentials, resource selectors, workflow settings, and execution behavior using available live n8n tooling and official n8n verification if exposed in that environment. That future verification should include, as available:
 
 - `get_sdk_reference` for workflow SDK shape.
 - `search_nodes` and `get_node_types` for Google Sheets, Schedule Trigger, If, Switch, Edit Fields, and any Data Table nodes.
@@ -68,7 +68,7 @@ Cloud/VPS/non-AC2 n8n direct Execute Command to local AC2 remains invalid becaus
 | Option | Pros | Cons | UAT decision |
 | --- | --- | --- | --- |
 | Google Sheets queue tab | Fits the current Google Form/Sheets intake surface, is easy for reviewers to inspect, requires no new queue infrastructure, and lets the local bridge poll outbound with a dedicated credential. | Stores the encoded submitted member value in a spreadsheet cell, has weaker leasing/atomicity than a real queue, needs careful hidden/protected tabs, and can be changed manually by users with sheet access. | Recommended for this UAT only. It must be disabled or replaced before production activation. |
-| n8n Data Table / internal storage | Official n8n docs support workflow-local persistent state, row operations, UI/API access, and idempotency metadata. This avoids adding queue columns to the intake spreadsheet. | The bridge must call n8n's DataTable API or another verified bridge-access path. Live MCP and API auth behavior were not available in this session, Data Tables have storage limits, and Data Table writes run for real during tests. | Candidate for a later controlled UAT after live MCP verification. Not the first UAT queue. |
+| n8n Data Table / internal storage | Official n8n docs support workflow-local persistent state, row operations, UI/API access, and idempotency metadata. This avoids adding queue columns to the intake spreadsheet. | The bridge must call n8n's DataTable API or another verified bridge-access path. Live n8n instance tooling and API auth behavior were not available in this session, Data Tables have storage limits, and Data Table writes run for real during tests. | Candidate for a later controlled UAT after future live-instance verification. Not the first UAT queue. |
 | Lightweight external queue/API | Best long-term separation for leases, retries, audit, access control, and bridge outbound polling. | Requires new infrastructure, credential management, monitoring, rate limits, and an API contract review. It is more setup than needed for the dry-run duplicate-check UAT. | Preferred direction after UAT if this flow moves beyond review-only rehearsal. |
 | Local file drop only for fixture mode | Safest for bridge worker unit tests and offline synthetic fixtures. No network or cloud dependency. | Not a cloud/VPS/non-AC2 n8n bridge, cannot prove cross-host polling, and should not be used as the runtime queue. | Fixture-only. Keep local under `C:\XB\autocount_outputs\review\...` and never commit row-level outputs. |
 
@@ -171,7 +171,7 @@ Free-text reviewer notes are out of scope for this UAT because they can accident
 
 ## Node-Level Workflow Shape
 
-No workflow export is committed. The exact resource IDs, credential IDs, column selectors, and node parameter names must be resolved through live n8n MCP before any build.
+No workflow export is committed. The exact resource IDs, credential IDs, column selectors, and node parameter names must be verified through available live n8n tooling and official n8n verification before any build/export/activation.
 
 ### Workflow A: Queue Lookup Jobs
 
@@ -293,7 +293,7 @@ Assumptions:
 
 Blockers before activation:
 
-- Live n8n MCP is unavailable in this Codex session; node parameter shapes and credential/resource selectors must be verified later.
+- Exact live n8n node parameter shapes and credential/resource selectors were not verified in this Codex session; they must be verified later before any build/export/activation.
 - Exact UTF-8 base64 implementation in n8n must be verified before a workflow is built.
 - The local bridge does not yet implement a real Google Sheets queue poller in this repo.
 - Data Table queueing remains unselected until the n8n API/DataTable access path is verified.
@@ -309,4 +309,4 @@ Blockers before activation:
 - Public inbound webhook or tunnel on the AutoCount host.
 - Real credentials, Sheet IDs, Sheet URLs, local server/database details, connection values, row-level outputs, or PII.
 
-Real create/update automation remains blocked pending a separate PR, explicit business approval, idempotency, consent/audit handling, write guardrails, activation guardrails, and a fresh n8n MCP-backed workflow build/review.
+Real create/update automation remains blocked pending a separate PR, explicit business approval, idempotency, consent/audit handling, write guardrails, activation guardrails, and a fresh n8n-skills-backed workflow build/review with future live-instance verification before activation.
