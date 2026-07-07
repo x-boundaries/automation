@@ -188,6 +188,93 @@ The skeleton contains no real endpoint, credential, queue provider, tunnel, webh
 
 `PDPA Acknowledged = Imported` must remain blocked even if `consent_status` looks acknowledged. `consent_status` is optional sanitized metadata for non-PDPA consent/marketing categories and must not rescue or override invalid, missing, or imported `pdpa_status`.
 
+## Local Fixture UAT Pass
+
+Use this pass after the worker code is reviewed and merged, while the bridge remains fixture-only, dry-run, review-only, and inactive. It does not call Google APIs, does not read a real Sheet, does not call n8n, does not run PowerShell lookup mode, and does not write to AutoCount.
+
+Create only synthetic local fixture files under:
+
+```powershell
+$root = 'C:\XB\autocount_outputs\review\member_lookup_bridge'
+New-Item -ItemType Directory -Force -Path $root | Out-Null
+$utf8NoBom = New-Object System.Text.UTF8Encoding -ArgumentList $false
+```
+
+Create `member_lookup_bridge_fixture_jobs.jsonl`:
+
+```powershell
+$fixtureJobs = @'
+{"job_id":"job-uat-ready","intake_source":"google_sheets_uat","source_reference":"uat-queue-ready","source_row_ref":"row-ready","row_number":2,"intake_id":"intake-uat-ready","state":"PENDING_LOOKUP","submitted_member_no_base64_utf8":"U1lOVEhFVElD","consent_status":"acknowledged","pdpa_status":"i_agree","payload_hash":"hash-uat-ready","attempt":0,"max_attempts":3,"created_at":"fixture-created-at","updated_at":"fixture-updated-at","lease_owner":"fixture-bridge","lease_expires_at":"fixture-lease-expires-at","timeout_at":"fixture-timeout-at","last_error_code":null}
+{"job_id":"job-uat-existing","intake_source":"google_sheets_uat","source_reference":"uat-queue-existing","source_row_ref":"row-existing","row_number":3,"intake_id":"intake-uat-existing","state":"PENDING_LOOKUP","submitted_member_no_base64_utf8":"U1lOVEhFVElD","consent_status":"acknowledged","pdpa_status":"i_agree","payload_hash":"hash-uat-existing","attempt":0,"max_attempts":3,"created_at":"fixture-created-at","updated_at":"fixture-updated-at","lease_owner":"fixture-bridge","lease_expires_at":"fixture-lease-expires-at","timeout_at":"fixture-timeout-at","last_error_code":null}
+{"job_id":"job-uat-manual","intake_source":"google_sheets_uat","source_reference":"uat-queue-manual","source_row_ref":"row-manual","row_number":4,"intake_id":"intake-uat-manual","state":"PENDING_LOOKUP","submitted_member_no_base64_utf8":"U1lOVEhFVElD","consent_status":"acknowledged","pdpa_status":"i_agree","payload_hash":"hash-uat-manual","attempt":0,"max_attempts":3,"created_at":"fixture-created-at","updated_at":"fixture-updated-at","lease_owner":"fixture-bridge","lease_expires_at":"fixture-lease-expires-at","timeout_at":"fixture-timeout-at","last_error_code":null}
+{"job_id":"job-uat-error","intake_source":"google_sheets_uat","source_reference":"uat-queue-error","source_row_ref":"row-error","row_number":5,"intake_id":"intake-uat-error","state":"PENDING_LOOKUP","submitted_member_no_base64_utf8":"U1lOVEhFVElD","consent_status":"acknowledged","pdpa_status":"i_agree","payload_hash":"hash-uat-error","attempt":0,"max_attempts":3,"created_at":"fixture-created-at","updated_at":"fixture-updated-at","lease_owner":"fixture-bridge","lease_expires_at":"fixture-lease-expires-at","timeout_at":"fixture-timeout-at","last_error_code":null}
+{"job_id":"job-uat-imported-pdpa","intake_source":"google_sheets_uat","source_reference":"uat-queue-imported-pdpa","source_row_ref":"row-imported-pdpa","row_number":6,"intake_id":"intake-uat-imported-pdpa","state":"PENDING_LOOKUP","submitted_member_no_base64_utf8":"U1lOVEhFVElD","consent_status":"acknowledged","pdpa_status":"imported","payload_hash":"hash-uat-imported-pdpa","attempt":0,"max_attempts":3,"created_at":"fixture-created-at","updated_at":"fixture-updated-at","lease_owner":"fixture-bridge","lease_expires_at":"fixture-lease-expires-at","timeout_at":"fixture-timeout-at","last_error_code":null}
+'@
+[System.IO.File]::WriteAllText(
+  (Join-Path $root 'member_lookup_bridge_fixture_jobs.jsonl'),
+  $fixtureJobs,
+  $utf8NoBom
+)
+```
+
+Create `member_lookup_bridge_mock_results.jsonl`:
+
+```powershell
+$mockResults = @'
+{"job_id":"job-uat-existing","status":"ok","authentication_success":true,"user_session_available":true,"member_command_found":true,"get_member_found":true,"submitted_member_no_status":"canonical_65_mobile","normalized_member_no_length":10,"member_exists":true,"member_found_by":null,"manual_review_required":false,"warning_count":0}
+{"job_id":"job-uat-manual","status":"ok","authentication_success":true,"user_session_available":true,"member_command_found":true,"get_member_found":true,"submitted_member_no_status":"manual_review","normalized_member_no_length":0,"member_exists":false,"member_found_by":null,"manual_review_required":true,"warning_count":1}
+{"job_id":"job-uat-error","status":"error","authentication_success":true,"user_session_available":true,"member_command_found":true,"get_member_found":true,"submitted_member_no_status":"canonical_65_mobile","normalized_member_no_length":10,"member_exists":false,"member_found_by":null,"manual_review_required":false,"warning_count":0,"error_code":"mock_lookup_error"}
+'@
+[System.IO.File]::WriteAllText(
+  (Join-Path $root 'member_lookup_bridge_mock_results.jsonl'),
+  $mockResults,
+  $utf8NoBom
+)
+```
+
+Run fixture/mock mode from the repository root:
+
+```powershell
+python scripts\ac2_member_lookup_bridge_worker.py `
+  --enable-local-lookup-bridge-review `
+  --queue-mode fixture `
+  --fixture-jobs "$root\member_lookup_bridge_fixture_jobs.jsonl" `
+  --fixture-mock-results "$root\member_lookup_bridge_mock_results.jsonl" `
+  --results-jsonl "$root\member_lookup_bridge_results.jsonl"
+```
+
+Expected local result states:
+
+| Synthetic job | Expected state | Meaning |
+| --- | --- | --- |
+| `job-uat-ready` | `READY_FOR_CREATE_REVIEW` | Review-only candidate; not approval to create. |
+| `job-uat-existing` | `EXISTING_MEMBER_REVIEW` | Duplicate review path. |
+| `job-uat-manual` | `MANUAL_REVIEW_REQUIRED` | Manual review path. |
+| `job-uat-error` | `LOOKUP_ERROR_REVIEW` | Sanitized lookup error path. |
+| `job-uat-imported-pdpa` | `LOOKUP_ERROR_REVIEW` | Imported PDPA remains blocked even when `consent_status` is `acknowledged`. |
+
+Paste back only this sanitized summary evidence after reviewing the local output file for accidental sensitive fields:
+
+```json
+{
+  "status": "ok",
+  "queue_mode": "fixture",
+  "lookup_mode": "mock",
+  "processed_count": 5,
+  "result_state_counts": {
+    "READY_FOR_CREATE_REVIEW": 1,
+    "EXISTING_MEMBER_REVIEW": 1,
+    "MANUAL_REVIEW_REQUIRED": 1,
+    "LOOKUP_ERROR_REVIEW": 2
+  },
+  "dry_run_only": true,
+  "final_write_automation": false,
+  "sanitized_note": "Local result output was reviewed; raw member values, encoded submitted values, normalized member values, credentials, Sheet IDs, Sheet URLs, and row-level result details were not present in the pasted evidence."
+}
+```
+
+Do not paste result rows, raw fixture input, encoded submitted values, raw member values, normalized member values, names, emails, raw phone numbers, credentials, real Sheet IDs or URLs, local AC2 target values, command transcripts, or full command output if it contains row-level detail. Keep the fixture and result JSONL files local under `C:\XB\autocount_outputs\review\member_lookup_bridge`.
+
 ## Review-Only Routing
 
 The bridge posts results for review routing only:

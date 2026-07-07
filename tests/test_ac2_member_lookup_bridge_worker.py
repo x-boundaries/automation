@@ -540,6 +540,62 @@ class BridgeWorkerStaticGuardrailTests(unittest.TestCase):
         self.assertRegex(combined, r"(?i)dry_run_only")
         self.assertRegex(combined, r"(?i)final_write_automation")
 
+    def test_local_fixture_uat_runbook_defines_sanitized_operator_evidence_only(self):
+        readme = README.read_text(encoding="utf-8")
+        bridge_runbook = BRIDGE_RUNBOOK.read_text(encoding="utf-8")
+
+        self.assertIn("member_intake_local_lookup_bridge_runbook.md", readme)
+        self.assertIn("Local Fixture UAT Pass", bridge_runbook)
+        self.assertIn(r"C:\XB\autocount_outputs\review\member_lookup_bridge", bridge_runbook)
+        self.assertIn("member_lookup_bridge_fixture_jobs.jsonl", bridge_runbook)
+        self.assertIn("member_lookup_bridge_mock_results.jsonl", bridge_runbook)
+        self.assertIn("member_lookup_bridge_results.jsonl", bridge_runbook)
+        self.assertIn("--enable-local-lookup-bridge-review", bridge_runbook)
+        self.assertIn("--queue-mode fixture", bridge_runbook)
+        self.assertIn("--fixture-jobs", bridge_runbook)
+        self.assertIn("--fixture-mock-results", bridge_runbook)
+        self.assertIn("--results-jsonl", bridge_runbook)
+        self.assertIn("UTF8Encoding", bridge_runbook)
+        self.assertNotIn("Set-Content -NoNewline -Encoding utf8", bridge_runbook)
+
+        for scenario in [
+            "job-uat-ready",
+            "job-uat-existing",
+            "job-uat-manual",
+            "job-uat-error",
+            "job-uat-imported-pdpa",
+            "READY_FOR_CREATE_REVIEW",
+            "EXISTING_MEMBER_REVIEW",
+            "MANUAL_REVIEW_REQUIRED",
+            "LOOKUP_ERROR_REVIEW",
+            "pdpa_status",
+            "imported",
+        ]:
+            self.assertIn(scenario, bridge_runbook)
+
+        for evidence_field in [
+            "status",
+            "queue_mode",
+            "lookup_mode",
+            "processed_count",
+            "result_state_counts",
+            "dry_run_only",
+            "final_write_automation",
+            "sanitized_note",
+        ]:
+            self.assertIn(evidence_field, bridge_runbook)
+
+        self.assertRegex(bridge_runbook, r"(?i)paste back only")
+        self.assertRegex(bridge_runbook, r"(?i)Do not paste result rows")
+        self.assertRegex(bridge_runbook, r"(?i)raw fixture input")
+        self.assertRegex(bridge_runbook, r"(?i)encoded submitted values")
+        self.assertRegex(bridge_runbook, r"(?i)raw member values")
+        self.assertRegex(bridge_runbook, r"(?i)READY_FOR_CREATE_REVIEW.*not approval to create")
+        self.assertRegex(bridge_runbook, r"(?i)Imported.*blocked")
+        self.assertNotRegex(bridge_runbook, r"https://docs\.google\.com/spreadsheets/d/")
+        self.assertNotRegex(bridge_runbook, r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b")
+        self.assertNotRegex(bridge_runbook, r"\b\d{8,}\b")
+
 
 if __name__ == "__main__":
     unittest.main()
