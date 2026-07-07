@@ -335,6 +335,59 @@ class MemberIntakeN8nDryRunDocsTests(unittest.TestCase):
         self.assertRegex(combined, r"(?i)cannot create or update AutoCount members")
         self.assertRegex(combined, r"(?i)PDPA Acknowledged = Imported.*valid consent|Imported.*valid consent")
 
+    def test_gate3_powershell_preflight_is_read_only_aggregate_only_and_blocks_gate4(self):
+        setup = self.read(UAT_SETUP_RUNBOOK)
+        bridge_runbook = self.read(BRIDGE_RUNBOOK)
+        combined = setup + "\n" + bridge_runbook
+
+        for phrase in [
+            "gate = gate3_local_powershell_lookup_preflight",
+            "runtime_location = local_windows_ac2_lookup_environment",
+            "execution_mode = manual_read_only_preflight",
+            "autocount_session_bootstrap_available = <true/false>",
+            "member_command_found = <true/false>",
+            "get_member_found = <true/false>",
+            "lookup_attempt_count = <aggregate-count-only>",
+            "lookup_success_count = <aggregate-count-only>",
+            "lookup_manual_review_count = <aggregate-count-only>",
+            "lookup_error_count = <aggregate-count-only>",
+            "member_create_or_update_invoked = false",
+            "autocount_write_attempted = false",
+            "direct_sql_write_attempted = false",
+            "n8n_involved = false",
+            "bridge_called_by_n8n = false",
+            "final_write_automation = false",
+            "local Windows AC2 lookup environment",
+            "MemberCommand.GetMember",
+            "read-only",
+            "aggregate booleans and counts",
+            "Do not paste the bridge worker stdout directly as Gate 3 evidence",
+            "does not authorize Gate 4",
+            "Only after Gates 1, 2/2A, and 3 pass",
+        ]:
+            self.assertIn(phrase, combined)
+
+        for forbidden_phrase in [
+            "raw member values",
+            "encoded member values",
+            "normalized member values",
+            "command transcripts",
+            "stderr/stdout",
+            "row-level output",
+            "names, emails, phone numbers",
+        ]:
+            self.assertIn(forbidden_phrase, combined)
+
+        self.assertRegex(combined, r"(?i)Do not involve n8n in Gate 3|n8n is not involved")
+        self.assertRegex(combined, r"(?i)no member create/update|no member create/update/delete")
+        self.assertRegex(combined, r"(?i)no AutoCount write|No AutoCount writes")
+        self.assertRegex(combined, r"(?i)no direct SQL write|direct SQL write is attempted")
+        self.assertRegex(combined, r"(?i)No state authorizes member creation|not approval to create")
+        self.assertNotRegex(combined, r"(?i)paste back raw member")
+        self.assertNotRegex(combined, r"(?i)paste back encoded member")
+        self.assertNotRegex(combined, r"(?i)paste back normalized member")
+        self.assertNotRegex(combined, r"(?i)paste back command transcript")
+
     def test_uat_setup_records_local_operator_n8n_rehearsal_without_hosted_runtime_claim(self):
         setup = self.read(UAT_SETUP_RUNBOOK)
 

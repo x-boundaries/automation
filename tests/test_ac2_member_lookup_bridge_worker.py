@@ -615,6 +615,57 @@ class BridgeWorkerStaticGuardrailTests(unittest.TestCase):
         self.assertNotRegex(bridge_runbook, r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b")
         self.assertNotRegex(bridge_runbook, r"\b\d{8,}\b")
 
+    def test_gate3_local_powershell_preflight_is_local_read_only_and_aggregate_only(self):
+        bridge_runbook = BRIDGE_RUNBOOK.read_text(encoding="utf-8")
+
+        self.assertIn("Gate 3 Local PowerShell Lookup Preflight", bridge_runbook)
+        self.assertIn("local Windows AC2 lookup environment", bridge_runbook)
+        self.assertIn("PowerShell lookup mode explicitly enabled", bridge_runbook)
+        self.assertIn("Call only `scripts/ac2_member_lookup_review.ps1`", bridge_runbook)
+        self.assertIn("MemberCommand.GetMember", bridge_runbook)
+        self.assertIn("lookup remains read-only", bridge_runbook)
+        self.assertIn("n8n is not involved and did not call the bridge", bridge_runbook)
+        self.assertIn("Required Gate 3 paste-back shape", bridge_runbook)
+
+        for evidence_field in [
+            "gate = gate3_local_powershell_lookup_preflight",
+            "runtime_location = local_windows_ac2_lookup_environment",
+            "execution_mode = manual_read_only_preflight",
+            "autocount_session_bootstrap_available = <true/false>",
+            "member_command_found = <true/false>",
+            "get_member_found = <true/false>",
+            "lookup_attempt_count = <aggregate-count-only>",
+            "lookup_success_count = <aggregate-count-only>",
+            "lookup_manual_review_count = <aggregate-count-only>",
+            "lookup_error_count = <aggregate-count-only>",
+            "member_create_or_update_invoked = false",
+            "autocount_write_attempted = false",
+            "direct_sql_write_attempted = false",
+            "n8n_involved = false",
+            "bridge_called_by_n8n = false",
+            "final_write_automation = false",
+        ]:
+            self.assertIn(evidence_field, bridge_runbook)
+
+        for forbidden_phrase in [
+            "raw member values",
+            "encoded member values",
+            "normalized member values",
+            "command transcripts",
+            "stderr/stdout",
+            "result rows",
+            "node payloads",
+            "PII",
+        ]:
+            self.assertIn(forbidden_phrase, bridge_runbook)
+
+        self.assertIn("does not authorize Gate 4", bridge_runbook)
+        self.assertIn("not approval to create", bridge_runbook)
+        self.assertRegex(bridge_runbook, r"(?i)Do not paste the bridge worker stdout directly")
+        self.assertNotRegex(bridge_runbook, r"https://docs\.google\.com/spreadsheets/d/")
+        self.assertNotRegex(bridge_runbook, r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b")
+        self.assertNotRegex(bridge_runbook, r"submitted_member_no_base64_utf8\"\s*:\s*\"[A-Za-z0-9+/]+=*\"")
+
 
 if __name__ == "__main__":
     unittest.main()
