@@ -559,6 +559,14 @@ class BridgeWorkerStaticGuardrailTests(unittest.TestCase):
         self.assertIn("--fixture-mock-results", bridge_runbook)
         self.assertIn("--results-jsonl", bridge_runbook)
         self.assertIn("UTF8Encoding", bridge_runbook)
+        self.assertIn("$safeFixturePlaintext = 'SYNTHETIC'", bridge_runbook)
+        self.assertIn("$localGeneratedSafeFixtureValue", bridge_runbook)
+        self.assertIn("[Convert]::ToBase64String", bridge_runbook)
+        self.assertIn("[System.Text.Encoding]::UTF8.GetBytes($safeFixturePlaintext)", bridge_runbook)
+        self.assertIn("$fixtureJobsTemplate", bridge_runbook)
+        self.assertIn(".Replace(", bridge_runbook)
+        self.assertIn("<local-generated-safe-fixture-value>", bridge_runbook)
+        self.assertNotIn(ENCODED_SYNTHETIC_VALUE, bridge_runbook)
         self.assertNotIn("Set-Content -NoNewline -Encoding utf8", bridge_runbook)
 
         for scenario in [

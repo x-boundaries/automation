@@ -278,14 +278,22 @@ class MemberIntakeN8nDryRunDocsTests(unittest.TestCase):
         self.assertRegex(setup, r"(?i)The Google Sheets queue is UAT-only")
         self.assertRegex(setup, r"(?i)disabled or replaced before production activation")
 
-    def test_uat_setup_runbook_requires_powershell_preflight_before_real_queue_ac2_lookup(self):
+    def test_uat_setup_runbook_orders_dummy_rehearsal_before_powershell_preflight(self):
         setup = self.read(UAT_SETUP_RUNBOOK)
         plan = self.read(UAT_PLAN)
         combined = setup + "\n" + plan
 
         for phrase in [
-            "Gate 2: Required Local PowerShell Lookup Preflight",
+            "Gate 2: Hosted n8n Dummy Queue Rehearsal",
+            "Gate 2 may proceed before the PowerShell lookup preflight",
+            "dummy n8n rehearsal may proceed before the PowerShell lookup preflight",
+            "does not touch AC2",
+            "no bridge call to AC2",
+            "Gate 3: Required Local PowerShell Lookup Preflight",
             "Before any real n8n queue UAT is allowed to touch AC2 lookup",
+            "Gate 3 does not block Gate 2",
+            "Gate 3 must pass before Gate 4",
+            "Gate 4: Real Queue UAT Touching AC2 Lookup",
             "--queue-mode fixture",
             "--lookup-mode powershell",
             "--enable-powershell-lookup",
@@ -297,6 +305,15 @@ class MemberIntakeN8nDryRunDocsTests(unittest.TestCase):
             "final_write_automation",
         ]:
             self.assertIn(phrase, combined)
+
+        self.assertLess(
+            setup.index("Gate 2: Hosted n8n Dummy Queue Rehearsal"),
+            setup.index("Gate 3: Required Local PowerShell Lookup Preflight"),
+        )
+        self.assertLess(
+            setup.index("Gate 3: Required Local PowerShell Lookup Preflight"),
+            setup.index("Gate 4: Real Queue UAT Touching AC2 Lookup"),
+        )
 
         for forbidden_phrase in [
             "raw fixture rows",
@@ -310,6 +327,9 @@ class MemberIntakeN8nDryRunDocsTests(unittest.TestCase):
             self.assertIn(forbidden_phrase, combined)
 
         self.assertRegex(combined, r"(?i)No state authorizes member creation")
+        self.assertRegex(combined, r"(?i)Gate 4.*review-only")
+        self.assertRegex(combined, r"(?i)Gate 4.*dry-run-only")
+        self.assertRegex(combined, r"(?i)cannot create or update AutoCount members")
         self.assertRegex(combined, r"(?i)PDPA Acknowledged = Imported.*valid consent|Imported.*valid consent")
 
     def test_uat_plan_defines_exact_node_level_polling_workflow_shape(self):

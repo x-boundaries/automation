@@ -66,9 +66,26 @@ The already proven local bridge fixture/mock pass remains the baseline evidence:
 
 Do not paste row-level fixture input, result rows, encoded submitted values, raw member values, normalized member values, local command transcripts, stderr/stdout, credentials, Sheet IDs, Sheet URLs, names, emails, or phone numbers.
 
-### Gate 2: Required Local PowerShell Lookup Preflight
+### Gate 2: Hosted n8n Dummy Queue Rehearsal
 
-Before any real n8n queue UAT is allowed to touch AC2 lookup, the bridge worker PowerShell lookup mode must be run locally once on the approved Windows AC2 lookup bridge host.
+Gate 2 may proceed before the PowerShell lookup preflight because it uses dummy fixture rows only and does not touch AC2.
+
+Run the first n8n UAT rehearsal with dummy fixture rows only:
+
+- hosted/VPS/non-AC2 n8n,
+- workflow left inactive/unpublished,
+- manual execution only,
+- UAT Google credential selected in the n8n UI,
+- placeholder tab names resolved only in n8n resource selectors,
+- no bridge call to AC2,
+- no public inbound webhook, tunnel, callback, or reverse proxy on the AC2 host,
+- execution data minimized and pruned before running.
+
+This proves n8n can read a marked UAT row, build an allowed queue job shape, write only allowed queue columns, read a dummy sanitized result row, and update only review/status fields.
+
+### Gate 3: Required Local PowerShell Lookup Preflight
+
+Before any real n8n queue UAT is allowed to touch AC2 lookup, the bridge worker PowerShell lookup mode must be run locally once on the approved Windows AC2 lookup bridge host. Gate 3 does not block Gate 2, but Gate 3 must pass before Gate 4.
 
 Requirements:
 
@@ -99,24 +116,9 @@ Allowed paste-back shape:
 
 The state count above is an example shape only. The actual state may differ based on the approved safe input. No state authorizes member creation.
 
-### Gate 3: Hosted n8n Dummy Queue Rehearsal
-
-After Gate 2 passes, run the first n8n UAT rehearsal with dummy fixture rows only:
-
-- hosted/VPS/non-AC2 n8n,
-- workflow left inactive/unpublished,
-- manual execution only,
-- UAT Google credential selected in the n8n UI,
-- placeholder tab names resolved only in n8n resource selectors,
-- no bridge call to AC2,
-- no public inbound webhook, tunnel, callback, or reverse proxy on the AC2 host,
-- execution data minimized and pruned before running.
-
-This proves n8n can read a marked UAT row, build an allowed queue job shape, write only allowed queue columns, read a dummy sanitized result row, and update only review/status fields.
-
 ### Gate 4: Real Queue UAT Touching AC2 Lookup
 
-Only after Gates 1, 2, and 3 pass may an operator consider a real queue UAT where the Windows bridge polls outbound and touches AC2 lookup. That step is still review-only, dry-run-only, and inactive by default. It still cannot create or update AutoCount members.
+Only after Gates 1, 2, and 3 pass may an operator consider a real queue UAT where the Windows bridge polls outbound and touches AC2 lookup. Gate 4 is still review-only, dry-run-only, and inactive by default. It cannot create or update AutoCount members.
 
 ## Minimum Next Runnable n8n UAT Step
 

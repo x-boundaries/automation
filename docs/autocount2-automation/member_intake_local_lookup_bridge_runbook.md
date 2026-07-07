@@ -200,16 +200,28 @@ New-Item -ItemType Directory -Force -Path $root | Out-Null
 $utf8NoBom = New-Object System.Text.UTF8Encoding -ArgumentList $false
 ```
 
-Create `member_lookup_bridge_fixture_jobs.jsonl` locally. Generate the encoded submitted value on the AC2 bridge host and do not commit or paste it. The placeholder below must be replaced only in the local ignored fixture file:
+Create `member_lookup_bridge_fixture_jobs.jsonl` locally. Generate the encoded submitted value on the AC2 bridge host and do not commit or paste it. The placeholder below is replaced in memory before writing the local ignored fixture file:
 
 ```powershell
-$fixtureJobs = @"
+$safeFixturePlaintext = 'SYNTHETIC'
+$localGeneratedSafeFixtureValue = [Convert]::ToBase64String(
+  [System.Text.Encoding]::UTF8.GetBytes($safeFixturePlaintext)
+)
+if ($localGeneratedSafeFixtureValue -notmatch '^[A-Za-z0-9+/]+={0,2}$') {
+  throw 'Generated fixture value failed the base64 shape check.'
+}
+
+$fixtureJobsTemplate = @"
 {"job_id":"job-uat-ready","intake_source":"google_sheets_uat","source_reference":"uat-queue-ready","source_row_ref":"row-ready","row_number":2,"intake_id":"intake-uat-ready","state":"PENDING_LOOKUP","submitted_member_no_base64_utf8":"<local-generated-safe-fixture-value>","consent_status":"acknowledged","pdpa_status":"i_agree","payload_hash":"hash-uat-ready","attempt":0,"max_attempts":3,"created_at":"fixture-created-at","updated_at":"fixture-updated-at","lease_owner":"fixture-bridge","lease_expires_at":"fixture-lease-expires-at","timeout_at":"fixture-timeout-at","last_error_code":null}
 {"job_id":"job-uat-existing","intake_source":"google_sheets_uat","source_reference":"uat-queue-existing","source_row_ref":"row-existing","row_number":3,"intake_id":"intake-uat-existing","state":"PENDING_LOOKUP","submitted_member_no_base64_utf8":"<local-generated-safe-fixture-value>","consent_status":"acknowledged","pdpa_status":"i_agree","payload_hash":"hash-uat-existing","attempt":0,"max_attempts":3,"created_at":"fixture-created-at","updated_at":"fixture-updated-at","lease_owner":"fixture-bridge","lease_expires_at":"fixture-lease-expires-at","timeout_at":"fixture-timeout-at","last_error_code":null}
 {"job_id":"job-uat-manual","intake_source":"google_sheets_uat","source_reference":"uat-queue-manual","source_row_ref":"row-manual","row_number":4,"intake_id":"intake-uat-manual","state":"PENDING_LOOKUP","submitted_member_no_base64_utf8":"<local-generated-safe-fixture-value>","consent_status":"acknowledged","pdpa_status":"i_agree","payload_hash":"hash-uat-manual","attempt":0,"max_attempts":3,"created_at":"fixture-created-at","updated_at":"fixture-updated-at","lease_owner":"fixture-bridge","lease_expires_at":"fixture-lease-expires-at","timeout_at":"fixture-timeout-at","last_error_code":null}
 {"job_id":"job-uat-error","intake_source":"google_sheets_uat","source_reference":"uat-queue-error","source_row_ref":"row-error","row_number":5,"intake_id":"intake-uat-error","state":"PENDING_LOOKUP","submitted_member_no_base64_utf8":"<local-generated-safe-fixture-value>","consent_status":"acknowledged","pdpa_status":"i_agree","payload_hash":"hash-uat-error","attempt":0,"max_attempts":3,"created_at":"fixture-created-at","updated_at":"fixture-updated-at","lease_owner":"fixture-bridge","lease_expires_at":"fixture-lease-expires-at","timeout_at":"fixture-timeout-at","last_error_code":null}
 {"job_id":"job-uat-imported-pdpa","intake_source":"google_sheets_uat","source_reference":"uat-queue-imported-pdpa","source_row_ref":"row-imported-pdpa","row_number":6,"intake_id":"intake-uat-imported-pdpa","state":"PENDING_LOOKUP","submitted_member_no_base64_utf8":"<local-generated-safe-fixture-value>","consent_status":"acknowledged","pdpa_status":"imported","payload_hash":"hash-uat-imported-pdpa","attempt":0,"max_attempts":3,"created_at":"fixture-created-at","updated_at":"fixture-updated-at","lease_owner":"fixture-bridge","lease_expires_at":"fixture-lease-expires-at","timeout_at":"fixture-timeout-at","last_error_code":null}
 "@
+$fixtureJobs = $fixtureJobsTemplate.Replace(
+  '<local-generated-safe-fixture-value>',
+  $localGeneratedSafeFixtureValue
+)
 [System.IO.File]::WriteAllText(
   (Join-Path $root 'member_lookup_bridge_fixture_jobs.jsonl'),
   $fixtureJobs,
