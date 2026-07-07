@@ -32,7 +32,7 @@ The input CSV is the Google Form response sheet export. All seven headers below 
 | `Email Address` | Required | Trim; lowercase; basic format check. | AC2 `EmailAddress` |
 | `Birthday Month` | Required | Full month name January to December, case-insensitive. | AC2 `DOB` as `2000-MM-01` |
 | `Marketing Consent` | Required | Explicit `Yes` / `No`, case-insensitive. | Consent flag (not an AC2 field) |
-| `PDPA Acknowledged` | Required | `I agree` (or legacy `Yes`), case-insensitive. | Compliance gate (not an AC2 field) |
+| `PDPA Acknowledged` | Required | `Yes` (current live form value), case-insensitive. Legacy `I agree` may be accepted only for older exported rows. | Compliance gate (not an AC2 field) |
 
 ## Member Number Normalization
 
@@ -53,7 +53,7 @@ The 20-character cap matches the AC2 `MemberNo` column constraint confirmed by t
 
 ## Consent Semantics
 
-- `PDPA Acknowledged` accepts `I agree` (the live Google Form checkbox export) or legacy `Yes`, case-insensitively. Anything else, including blank, means not acknowledged.
+- `PDPA Acknowledged` accepts `Yes` as the current live Google Form value, case-insensitively. Legacy `I agree` may be accepted only for older exported rows. Anything else, including blank, means not acknowledged.
 - PDPA not acknowledged is a compliance gate, not a data-format error: the row stays structurally valid, is flagged `pdpa_blocked`, is counted in `pdpa_blocked_count`, and can never be `sync_eligible`.
 - `Marketing Consent` must be an explicit `Yes` or `No`. Missing or unrecognized values make the row invalid.
 - `Marketing Consent = No` never blocks member registration. It only records that marketing is not allowed.

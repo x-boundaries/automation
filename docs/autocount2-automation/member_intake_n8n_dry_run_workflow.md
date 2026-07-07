@@ -32,7 +32,7 @@ No n8n workflow template is included in this PR. The repository does not yet hav
 1. Google Sheets new-row trigger or poller receives the latest Google Form response row.
 2. Row intake guard verifies the expected sheet columns exist and carries only spreadsheet row number, an internal intake ID if available, and validation status metadata forward.
 3. Form validator step applies the current member intake contract and blocks invalid rows from lookup queueing.
-4. PDPA guard allows only valid new-form consent such as `I agree`. `Imported` remains a blocked legacy/import marker.
+4. PDPA guard allows only valid new-form consent such as `Yes`. `Imported` remains a blocked legacy/import marker.
 5. Untrusted member value step reads the submitted mobile/member field for immediate lookup preparation only. It must not persist or log the raw value.
 6. UTF-8 base64 encode step encodes the submitted value. The encoded value is still sensitive operational data and must not be logged or written back to the sheet.
 7. Base64 allowlist step rejects encoded values that are empty, not length-multiple-of-four, or do not match `^[A-Za-z0-9+/]+={0,2}$`. Rejections route to `LOOKUP_ERROR_REVIEW`.

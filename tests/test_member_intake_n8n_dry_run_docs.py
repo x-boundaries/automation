@@ -9,6 +9,7 @@ README = ROOT / "README.md"
 WORKFLOW_DOC = DOCS / "member_intake_n8n_dry_run_workflow.md"
 UAT_PLAN = DOCS / "member_intake_n8n_lookup_bridge_uat_plan.md"
 UAT_SETUP_RUNBOOK = DOCS / "member_intake_n8n_uat_setup_runbook.md"
+GATE2_RUNBOOK = DOCS / "member_intake_n8n_gate2_dummy_rehearsal_runbook.md"
 NODE_CONTRACT = DOCS / "member_intake_n8n_node_contract.md"
 DIRECT_RUNBOOK = DOCS / "member_intake_n8n_direct_lookup_runbook.md"
 LOOKUP_RUNBOOK = DOCS / "member_lookup_review_runbook.md"
@@ -18,7 +19,7 @@ DECISION_RUNBOOK = DOCS / "member_intake_decision_review_runbook.md"
 TEMPLATE_PATH = DOCS / "templates" / "member_intake_n8n_dry_run_lookup.reference.json"
 
 
-DRY_RUN_DOCS = [WORKFLOW_DOC, NODE_CONTRACT, DIRECT_RUNBOOK, BRIDGE_RUNBOOK, UAT_SETUP_RUNBOOK]
+DRY_RUN_DOCS = [WORKFLOW_DOC, NODE_CONTRACT, DIRECT_RUNBOOK, BRIDGE_RUNBOOK, UAT_SETUP_RUNBOOK, GATE2_RUNBOOK]
 FORBIDDEN_WRITE_TOKENS = [
     "Save" + "Member",
     "New" + "Member",
@@ -37,7 +38,7 @@ class MemberIntakeN8nDryRunDocsTests(unittest.TestCase):
     def test_new_docs_exist_and_are_linked_from_readme(self):
         readme = self.read(README)
 
-        for path in [WORKFLOW_DOC, UAT_PLAN, UAT_SETUP_RUNBOOK, NODE_CONTRACT, DIRECT_RUNBOOK, BRIDGE_RUNBOOK]:
+        for path in [WORKFLOW_DOC, UAT_PLAN, UAT_SETUP_RUNBOOK, GATE2_RUNBOOK, NODE_CONTRACT, DIRECT_RUNBOOK, BRIDGE_RUNBOOK]:
             self.assertTrue(path.exists(), path)
             self.assertIn(path.name, readme)
 
@@ -266,6 +267,8 @@ class MemberIntakeN8nDryRunDocsTests(unittest.TestCase):
         readme = self.read(README)
 
         self.assertIn("member_intake_n8n_uat_setup_runbook.md", readme)
+        self.assertIn("member_intake_n8n_gate2_dummy_rehearsal_runbook.md", readme)
+        self.assertIn("member_intake_n8n_gate2_dummy_rehearsal_runbook.md", setup)
         self.assertRegex(setup, r"(?i)hosted/VPS/non-AC2 n8n")
         self.assertRegex(setup, r"(?i)Google Sheets UAT queue tab")
         self.assertRegex(setup, r"(?i)dummy fixture data first")
@@ -331,6 +334,121 @@ class MemberIntakeN8nDryRunDocsTests(unittest.TestCase):
         self.assertRegex(combined, r"(?i)Gate 4.*dry-run-only")
         self.assertRegex(combined, r"(?i)cannot create or update AutoCount members")
         self.assertRegex(combined, r"(?i)PDPA Acknowledged = Imported.*valid consent|Imported.*valid consent")
+
+    def test_gate2_dummy_rehearsal_runbook_defines_safe_operator_steps(self):
+        gate2 = self.read(GATE2_RUNBOOK)
+        setup = self.read(UAT_SETUP_RUNBOOK)
+        combined = gate2 + "\n" + setup
+
+        for phrase in [
+            "Gate 2 operator steps/spec only",
+            "hosted/VPS/non-AC2 n8n",
+            "workflow_activation = inactive",
+            "execution_mode = manual_dummy_rehearsal",
+            "does not call the bridge",
+            "does not run PowerShell",
+            "does not touch AC2",
+            "AC2 credentials: not required",
+            "Form Responses UAT",
+            "Lookup Queue UAT",
+            "Lookup Results UAT",
+            "UAT Audit Summary",
+            "Read Dummy UAT Rows Marked For Lookup",
+            "Block Already Queued Rows",
+            "Apply Intake And PDPA Guards",
+            "Build Allowed Queue Job",
+            "Validate Encoded Member Value",
+            "Append Dummy UAT Queue Job",
+            "Mark Dummy Form Row Queued",
+            "Read Dummy Bridge Results Ready For n8n",
+            "Validate Result Schema",
+            "Map Result To Review State",
+            "Update Dummy Form Review Fields",
+            "Mark Dummy Result Applied",
+            "ac2_touched = false",
+            "bridge_called = false",
+            "final_write_automation = false",
+            "Gate 3 PowerShell lookup preflight must still pass before any real n8n queue UAT touches AC2 lookup",
+        ]:
+            self.assertIn(phrase, combined)
+
+        self.assertRegex(gate2, r"(?i)No workflow export is committed")
+        self.assertRegex(gate2, r"(?i)no import-ready artifact")
+        self.assertRegex(gate2, r"(?i)Manual Trigger")
+        self.assertRegex(gate2, r"(?i)disabled `Schedule Trigger`")
+        self.assertRegex(gate2, r"(?i)PDPA.*imported.*blocked")
+        self.assertRegex(gate2, r"(?i)READY_FOR_CREATE_REVIEW.*review-only")
+
+    def test_gate2_dummy_rehearsal_evidence_is_aggregate_only(self):
+        gate2 = self.read(GATE2_RUNBOOK)
+
+        for phrase in [
+            "dummy_rows_read_count",
+            "queue_rows_appended_count",
+            "result_rows_read_count",
+            "review_rows_updated_count",
+            "result_state_counts",
+            "Aggregate count only",
+            "No real Sheet IDs/URLs, credentials, row-level output",
+            "raw/encoded/normalized values",
+            "node raw input/output dumps",
+            "Stop condition",
+            "do not paste it",
+        ]:
+            self.assertIn(phrase, gate2)
+
+        for forbidden in [
+            "Sheet URLs or Sheet IDs",
+            "credential IDs",
+            "screenshots with row-level data",
+            "full execution payloads",
+            "node raw input or output dumps",
+            "raw member values",
+            "encoded member values",
+            "normalized member values",
+            "names, emails, or phone numbers",
+        ]:
+            self.assertIn(forbidden, gate2)
+
+    def test_gate2_dummy_rehearsal_runbook_has_no_sensitive_literals_or_workflow_artifacts(self):
+        gate2 = self.read(GATE2_RUNBOOK)
+
+        for placeholder in [
+            "<local-placeholder-generated-outside-repo>",
+            "<aggregate-count-only>",
+            "<aggregate-counts-only>",
+        ]:
+            self.assertIn(placeholder, gate2)
+
+        for token in FORBIDDEN_WRITE_TOKENS:
+            self.assertNotIn(token, gate2, token)
+        self.assertNotRegex(gate2, r"(?i)\b(SELECT\s+\*|INSERT\s+INTO|UPDATE\s+\w+\s+SET|DELETE\s+FROM|MERGE\s+INTO)\b")
+        self.assertNotRegex(gate2, r"https://docs\.google\.com/spreadsheets/d/")
+        service_account_markers = "|".join([
+            "client" + "_email",
+            "private" + "_key",
+            "service" + "_account",
+            "-----BEGIN PRIVATE " + "KEY-----",
+        ])
+        self.assertNotRegex(gate2, rf"(?i)({service_account_markers})")
+        self.assertNotRegex(gate2, r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b")
+        self.assertNotRegex(gate2, r"submitted_member_no_base64_utf8\"\s*:\s*\"[A-Za-z0-9+/]+=*\"")
+        self.assertNotRegex(gate2, r"(?i)workflow export file")
+        self.assertNotRegex(gate2, r"(?i)activate a schedule without a future approval")
+
+    def test_pdpa_current_form_value_is_yes_and_normalized_queue_status_is_yes(self):
+        combined = self.combined([WORKFLOW_DOC, UAT_PLAN, GATE2_RUNBOOK, NODE_CONTRACT, BRIDGE_RUNBOOK])
+
+        self.assertIn("PDPA Acknowledged = Yes", combined)
+        self.assertIn("queue value `yes`", combined)
+        self.assertIn("pdpa_status = yes", combined)
+        self.assertRegex(combined, r"(?i)Imported.*blocked|imported.*blocked")
+        self.assertRegex(combined, r"(?i)consent_status.*not.*PDPA|not a PDPA override")
+        self.assertNotIn("PDPA Acknowledged = I agree", combined)
+        self.assertNotIn("pdpa_status = i_agree", combined)
+        self.assertNotIn("`i_agree`", combined)
+        self.assertNotRegex(combined, r"(?i)current live form value.*I agree")
+
 
     def test_uat_plan_defines_exact_node_level_polling_workflow_shape(self):
         plan = self.read(UAT_PLAN)

@@ -8,7 +8,7 @@ This runbook defines the review-only UAT path for cloud/VPS/non-AC2 n8n to orche
 
 Google Forms / Google Sheets are a temporary UAT intake surface only. The bridge queue contract should stay source-agnostic enough to survive a future custom web form or hosted intake API that can reject duplicate mobile/member numbers before submission. This PR does not implement that custom form, hosted intake API, or synchronous duplicate rejection.
 
-AC2 / AutoCount 2.0 remains the source of truth. The Google Form mobile/member number maps to AutoCount `MemberNo`. AutoCount `MobilePhone` remains intentionally unused. Birthday Month maps to future AC2 `DOB` as `2000-MM-01`, but DOB is outside this lookup-only bridge step. `PDPA Acknowledged = I agree` is valid new-form consent. `PDPA Acknowledged = Imported` is a legacy/import marker only and remains blocked. `READY_FOR_CREATE_REVIEW` is review-only and is not approval to create.
+AC2 / AutoCount 2.0 remains the source of truth. The Google Form mobile/member number maps to AutoCount `MemberNo`. AutoCount `MobilePhone` remains intentionally unused. Birthday Month maps to future AC2 `DOB` as `2000-MM-01`, but DOB is outside this lookup-only bridge step. `PDPA Acknowledged = Yes` is valid new-form consent. `PDPA Acknowledged = Imported` is a legacy/import marker only and remains blocked. `READY_FOR_CREATE_REVIEW` is review-only and is not approval to create.
 
 ## n8n-skills Plugin Evidence Checked
 
@@ -233,7 +233,7 @@ No workflow export is committed. The exact resource IDs, credential IDs, column 
    - Skips rows that already have `uat_lookup_job_id` or a terminal `uat_lookup_state`.
 4. `If` node named `Apply Intake And PDPA Guards`
    - Requires expected headers and valid form state.
-   - Allows only `PDPA Acknowledged = I agree`.
+   - Allows only `PDPA Acknowledged = Yes`.
    - Blocks `PDPA Acknowledged = Imported`.
 5. `Edit Fields` or verified equivalent named `Build Allowed Queue Job`
    - Whitelists only allowed queue request fields.

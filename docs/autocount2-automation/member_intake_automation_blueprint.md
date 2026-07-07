@@ -63,7 +63,7 @@ Member intake contains personal data: name, mobile number (used as the AutoCount
 
 Google Form consent controls use these live export values (full contract: [member_form_intake_contract.md](member_form_intake_contract.md)):
 
-- `PDPA Acknowledged`: checkbox exporting `I agree`, accepted case-insensitively by the dry-run validator (legacy `Yes` also accepted). Any other value, including blank, flags the row `pdpa_blocked` and blocks sync eligibility without invalidating the row.
+- `PDPA Acknowledged`: checkbox exporting `Yes`, accepted case-insensitively by the dry-run validator. Legacy `I agree` may be accepted only for older exported rows. Any other value, including blank, flags the row `pdpa_blocked` and blocks sync eligibility without invalidating the row.
 - `Marketing Consent`: multiple choice with exact values `Yes` / `No`, accepted case-insensitively. `No` never blocks member registration; missing or unrecognized values make the row invalid.
 
 Minimum controls:
