@@ -4,7 +4,7 @@ Status: design and dry-run worker skeleton only. This does not activate producti
 
 ## Purpose
 
-This runbook defines the long-term AC2 member lookup bridge pattern for Google Form duplicate-check review.
+This runbook defines the long-term AC2 member lookup bridge pattern for member-intake duplicate-check review. Google Forms / Google Sheets are a temporary UAT intake surface only; the bridge contract should also survive a future custom web form or hosted intake API.
 
 The orchestration brain may be cloud n8n, VPS n8n, or another non-AC2 n8n runtime. That orchestrator must not be expected to load AutoCount assemblies or run local AC2 PowerShell directly. A tiny locked-down Windows bridge on the AutoCount host, or on an approved Windows host with the installed AutoCount Accounting 2.x runtime, is the only component allowed to load AutoCount assemblies.
 
@@ -73,14 +73,19 @@ Allowed request fields:
 | Field | Purpose | Logging |
 | --- | --- | --- |
 | `job_id` | Queue job identity and idempotency key. | Safe if non-PII. |
-| `row_number` | Spreadsheet row metadata. | Safe review metadata. |
+| `intake_source` | Source label for the intake surface. | Safe only if non-PII. |
+| `source_reference` | Source-agnostic row/submission reference. | Safe only if non-PII. |
+| `source_row_ref` | Optional row/reference label. | Safe only if non-PII. |
+| `row_number` | Spreadsheet row metadata for Google Sheets UAT only. | Safe review metadata. |
 | `intake_id` | Optional internal idempotency key. | Safe only if non-PII. |
 | `state` | Must be `PENDING_LOOKUP` for new work. | Safe. |
 | `submitted_member_no_base64_utf8` | Encoded submitted member value. | Sensitive operational data; never log or echo. |
+| `consent_status` | Sanitized consent category. | Safe category only. |
+| `pdpa_status` | Sanitized PDPA category. | Safe category only. |
 | `attempt` | Retry attempt counter. | Safe. |
 | `created_at` | Queue metadata. | Safe if non-PII. |
 
-Forbidden request fields include raw member numbers, normalized member numbers, names, emails, raw phone numbers, DOB, addresses, AutoKey, Guid, local server/database/user details, connection strings, passwords, tokens, stderr, and arbitrary payload dumps.
+Forbidden request fields include raw member numbers, normalized member numbers, names, emails, raw phone numbers, DOB, addresses, AutoCount internal identifiers, local server/database/user details, connection strings, passwords, tokens, stderr, and arbitrary payload dumps.
 
 ## Response Contract Summary
 
@@ -89,6 +94,9 @@ Allowed response fields:
 | Field | Purpose |
 | --- | --- |
 | `job_id` |
+| `intake_source` |
+| `source_reference` |
+| `source_row_ref` |
 | `row_number` |
 | `state` |
 | `status` |
@@ -103,6 +111,8 @@ Allowed response fields:
 | `manual_review_required` |
 | `warning_count` |
 | `error_code` |
+| `consent_status` |
+| `pdpa_status` |
 | `attempt` |
 | `dry_run_only` |
 | `final_write_automation` |
@@ -156,8 +166,7 @@ Bridge logs must not contain:
 - DOB values,
 - raw phone numbers,
 - addresses,
-- AutoKey,
-- Guid,
+- AutoCount internal identifiers,
 - AutoCount host/database/user details,
 - credentials,
 - connection strings,
@@ -175,7 +184,7 @@ Safe review modes:
 - mock lookup mode returns sanitized fixture results for tests and design review,
 - PowerShell lookup mode additionally requires `--enable-powershell-lookup` and calls only `scripts/ac2_member_lookup_review.ps1` in lookup mode.
 
-The skeleton contains no real endpoint, credential, queue provider, tunnel, webhook, or write path.
+The skeleton contains no real endpoint, credential, queue provider, tunnel, webhook, or write path. The first UAT may model a Google Sheets queue, but the fixture fields include source-agnostic references so a later custom web form or hosted intake API can reuse the bridge contract. This runbook does not implement that future form/API or synchronous duplicate rejection.
 
 ## Review-Only Routing
 

@@ -6,6 +6,8 @@ Status: UAT plan only. This document does not add a workflow export, does not ac
 
 This runbook defines the review-only UAT path for cloud/VPS/non-AC2 n8n to orchestrate AC2 member duplicate-check routing through the local Windows AC2 lookup bridge.
 
+Google Forms / Google Sheets are a temporary UAT intake surface only. The bridge queue contract should stay source-agnostic enough to survive a future custom web form or hosted intake API that can reject duplicate mobile/member numbers before submission. This PR does not implement that custom form, hosted intake API, or synchronous duplicate rejection.
+
 AC2 / AutoCount 2.0 remains the source of truth. The Google Form mobile/member number maps to AutoCount `MemberNo`. AutoCount `MobilePhone` remains intentionally unused. Birthday Month maps to future AC2 `DOB` as `2000-MM-01`, but DOB is outside this lookup-only bridge step. `PDPA Acknowledged = I agree` is valid new-form consent. `PDPA Acknowledged = Imported` is a legacy/import marker only and remains blocked. `READY_FOR_CREATE_REVIEW` is review-only and is not approval to create.
 
 ## n8n-skills Plugin Evidence Checked
@@ -92,10 +94,15 @@ Use placeholder tab names in docs and tests; configure real spreadsheet IDs only
 | Field | Required | Notes |
 | --- | --- | --- |
 | `job_id` | Yes | Stable non-PII idempotency key. |
-| `row_number` | Yes | Spreadsheet row number only. |
+| `intake_source` | Yes | Safe source label such as `google_sheets_uat`; not a permanent Google Forms dependency. |
+| `source_reference` | Yes | Safe source-agnostic reference for the intake row/submission. |
+| `source_row_ref` | No | Optional source row/reference label. |
+| `row_number` | No | Spreadsheet row number for the first Google Sheets UAT only. |
 | `intake_id` | No | Internal non-PII intake identifier if one already exists. |
 | `state` | Yes | Starts as `PENDING_LOOKUP`. |
 | `submitted_member_no_base64_utf8` | Yes | Encoded submitted value for the bridge. Sensitive operational data; UAT-only; never copied to review/status fields. |
+| `consent_status` | Yes | Sanitized consent category only; legacy/import markers remain blocked. |
+| `pdpa_status` | Yes | Sanitized PDPA category only; `Imported` is not valid consent. |
 | `payload_hash` | Yes | Hash of allowed request fields used for idempotency. |
 | `attempt` | Yes | Starts at `0`; increments on retry. |
 | `max_attempts` | Yes | Small UAT retry cap configured outside the row values. |
@@ -115,7 +122,10 @@ The queue must not contain raw member numbers, normalized member numbers, names,
 | Field | Required | Notes |
 | --- | --- | --- |
 | `job_id` | Yes | Matches the queue job. |
-| `row_number` | Yes | Spreadsheet row metadata only. |
+| `intake_source` | Yes | Echoes safe source label only. |
+| `source_reference` | Yes | Echoes safe source reference only. |
+| `source_row_ref` | No | Echoes safe source row/reference label only. |
+| `row_number` | No | Spreadsheet row metadata for the first Google Sheets UAT only. |
 | `state` | Yes | One of the review states below. |
 | `status` | Yes | Expected `ok` for successful lookup processing. |
 | `authentication_success` | Yes | Boolean status only. |
@@ -129,6 +139,8 @@ The queue must not contain raw member numbers, normalized member numbers, names,
 | `manual_review_required` | Yes | Boolean routing flag. |
 | `warning_count` | Yes | Any warning blocks ready-for-create review. |
 | `error_code` | No | Sanitized category only. |
+| `consent_status` | Yes | Sanitized category only. |
+| `pdpa_status` | Yes | Sanitized category only. |
 | `attempt` | Yes | Attempt that produced the result. |
 | `dry_run_only` | Yes | Must be true. |
 | `final_write_automation` | Yes | Must be false. |
@@ -136,6 +148,26 @@ The queue must not contain raw member numbers, normalized member numbers, names,
 | `result_applied_at` | No | Set after n8n updates review/status fields. |
 
 Forbidden result fields are the same as forbidden request fields. The result must not include `submitted_member_no_base64_utf8`.
+
+## Fixture-First Bridge Poller Skeleton
+
+`scripts/ac2_member_lookup_bridge_worker.py` models the future queue bridge as a local fixture-only poller in this PR. The first UAT fixture can mirror Google Sheets queue rows, but the queue fields include source-agnostic metadata such as `intake_source`, `source_reference`, and `source_row_ref`. It does not call Google APIs, does not use a network client, does not require credentials, does not read real Sheet IDs or Sheet URLs, and does not activate a production queue.
+
+Fixture mode maps to the future tabs as follows:
+
+| Future UAT tab | Fixture file role | Contract |
+| --- | --- | --- |
+| `Lookup Queue UAT` | `member_lookup_bridge_fixture_jobs.jsonl` | Local JSON/JSONL rows using only the allowed queue request fields above; Google Sheets row metadata is UAT-only. |
+| `Lookup Results UAT` | `member_lookup_bridge_results.jsonl` | Local JSONL rows using only the allowed result fields above. |
+| Local mock lookup control | `member_lookup_bridge_mock_results.jsonl` | Optional sanitized mock lookup outcomes keyed by non-PII `job_id`; this is not a future queue column source. |
+
+Default invocation refuses. Fixture queue processing requires `--enable-local-lookup-bridge-review`, `--queue-mode fixture`, a local fixture input, and a local results output. Mock mode is the default lookup mode and returns sanitized result rows for review routing tests only.
+
+The fixture contract should still work if a future intake source is a custom web form or hosted intake API instead of Google Forms. That future intake can add pre-submit duplicate rejection later, but this PR intentionally does not implement it.
+
+PowerShell lookup mode remains optional and local-only. It requires both `--lookup-mode powershell` and `--enable-powershell-lookup`; it may call only the proven read-only lookup script with `-EnableMemberLookupReview` and `-MemberNoBase64Utf8`. `-AllowRootLogin` remains a separate local proof option when explicitly required. The skeleton never writes to AutoCount.
+
+Runtime fixture and result files remain local under `C:\XB\autocount_outputs\review\member_lookup_bridge\...` and must not be committed.
 
 ## Job States
 
