@@ -83,6 +83,8 @@ Run the first n8n UAT rehearsal with dummy fixture rows only:
 
 This proves n8n can read a marked UAT row, build an allowed queue job shape, write only allowed queue columns, read a dummy sanitized result row, and update only review/status fields.
 
+Use [member_intake_n8n_gate2_dummy_rehearsal_runbook.md](member_intake_n8n_gate2_dummy_rehearsal_runbook.md) for the exact Gate 2 operator setup steps, placeholder UAT tabs, allowed columns, dummy row shapes, manual inactive n8n node shape, safe paste-back evidence, and stop conditions.
+
 ### Gate 3: Required Local PowerShell Lookup Preflight
 
 Before any real n8n queue UAT is allowed to touch AC2 lookup, the bridge worker PowerShell lookup mode must be run locally once on the approved Windows AC2 lookup bridge host. Gate 3 does not block Gate 2, but Gate 3 must pass before Gate 4.
@@ -123,6 +125,8 @@ Only after Gates 1, 2, and 3 pass may an operator consider a real queue UAT wher
 ## Minimum Next Runnable n8n UAT Step
 
 The minimum next runnable n8n step is a manual, inactive hosted/VPS/non-AC2 workflow rehearsal against dummy Google Sheets UAT tabs.
+
+The exact operator runbook for this step is [member_intake_n8n_gate2_dummy_rehearsal_runbook.md](member_intake_n8n_gate2_dummy_rehearsal_runbook.md).
 
 It should exercise only:
 
