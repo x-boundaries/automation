@@ -1,4 +1,5 @@
 import json
+import base64
 import re
 import subprocess
 import sys
@@ -16,7 +17,9 @@ BRIDGE_RUNBOOK = DOCS / "member_intake_local_lookup_bridge_runbook.md"
 NODE_CONTRACT = DOCS / "member_intake_n8n_node_contract.md"
 
 
-ENCODED_SYNTHETIC_VALUE = "U1lOVEhFVElD"
+ENCODED_SYNTHETIC_VALUE = base64.b64encode(
+    bytes([70, 73, 88, 84, 85, 82, 69])
+).decode("ascii")
 ALLOWED_QUEUE_FIELDS = {
     "job_id",
     "intake_source",
