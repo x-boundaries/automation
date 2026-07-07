@@ -78,6 +78,7 @@ Raw CSVs and member browse extracts stay local and must not be committed. Member
 - [Member intake local lookup bridge runbook](docs/autocount2-automation/member_intake_local_lookup_bridge_runbook.md)
 - [Member intake n8n direct lookup runbook](docs/autocount2-automation/member_intake_n8n_direct_lookup_runbook.md)
 - [Member intake n8n dry-run workflow](docs/autocount2-automation/member_intake_n8n_dry_run_workflow.md)
+- [Member intake n8n UAT setup runbook](docs/autocount2-automation/member_intake_n8n_uat_setup_runbook.md)
 - [Member intake n8n lookup bridge UAT plan](docs/autocount2-automation/member_intake_n8n_lookup_bridge_uat_plan.md)
 - [Member intake n8n node contract](docs/autocount2-automation/member_intake_n8n_node_contract.md)
 - [Member form intake contract (dry-run validator)](docs/autocount2-automation/member_form_intake_contract.md)

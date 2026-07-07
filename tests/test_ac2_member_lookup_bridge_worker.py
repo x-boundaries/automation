@@ -1,4 +1,5 @@
 import json
+import base64
 import re
 import subprocess
 import sys
@@ -16,7 +17,9 @@ BRIDGE_RUNBOOK = DOCS / "member_intake_local_lookup_bridge_runbook.md"
 NODE_CONTRACT = DOCS / "member_intake_n8n_node_contract.md"
 
 
-ENCODED_SYNTHETIC_VALUE = "U1lOVEhFVElD"
+ENCODED_SYNTHETIC_VALUE = base64.b64encode(
+    bytes([70, 73, 88, 84, 85, 82, 69])
+).decode("ascii")
 ALLOWED_QUEUE_FIELDS = {
     "job_id",
     "intake_source",
@@ -556,6 +559,14 @@ class BridgeWorkerStaticGuardrailTests(unittest.TestCase):
         self.assertIn("--fixture-mock-results", bridge_runbook)
         self.assertIn("--results-jsonl", bridge_runbook)
         self.assertIn("UTF8Encoding", bridge_runbook)
+        self.assertIn("$safeFixturePlaintext = 'SYNTHETIC'", bridge_runbook)
+        self.assertIn("$localGeneratedSafeFixtureValue", bridge_runbook)
+        self.assertIn("[Convert]::ToBase64String", bridge_runbook)
+        self.assertIn("[System.Text.Encoding]::UTF8.GetBytes($safeFixturePlaintext)", bridge_runbook)
+        self.assertIn("$fixtureJobsTemplate", bridge_runbook)
+        self.assertIn(".Replace(", bridge_runbook)
+        self.assertIn("<local-generated-safe-fixture-value>", bridge_runbook)
+        self.assertNotIn(ENCODED_SYNTHETIC_VALUE, bridge_runbook)
         self.assertNotIn("Set-Content -NoNewline -Encoding utf8", bridge_runbook)
 
         for scenario in [

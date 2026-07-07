@@ -8,6 +8,7 @@ DOCS = ROOT / "docs" / "autocount2-automation"
 README = ROOT / "README.md"
 WORKFLOW_DOC = DOCS / "member_intake_n8n_dry_run_workflow.md"
 UAT_PLAN = DOCS / "member_intake_n8n_lookup_bridge_uat_plan.md"
+UAT_SETUP_RUNBOOK = DOCS / "member_intake_n8n_uat_setup_runbook.md"
 NODE_CONTRACT = DOCS / "member_intake_n8n_node_contract.md"
 DIRECT_RUNBOOK = DOCS / "member_intake_n8n_direct_lookup_runbook.md"
 LOOKUP_RUNBOOK = DOCS / "member_lookup_review_runbook.md"
@@ -17,7 +18,7 @@ DECISION_RUNBOOK = DOCS / "member_intake_decision_review_runbook.md"
 TEMPLATE_PATH = DOCS / "templates" / "member_intake_n8n_dry_run_lookup.reference.json"
 
 
-DRY_RUN_DOCS = [WORKFLOW_DOC, NODE_CONTRACT, DIRECT_RUNBOOK, BRIDGE_RUNBOOK]
+DRY_RUN_DOCS = [WORKFLOW_DOC, NODE_CONTRACT, DIRECT_RUNBOOK, BRIDGE_RUNBOOK, UAT_SETUP_RUNBOOK]
 FORBIDDEN_WRITE_TOKENS = [
     "Save" + "Member",
     "New" + "Member",
@@ -36,7 +37,7 @@ class MemberIntakeN8nDryRunDocsTests(unittest.TestCase):
     def test_new_docs_exist_and_are_linked_from_readme(self):
         readme = self.read(README)
 
-        for path in [WORKFLOW_DOC, UAT_PLAN, NODE_CONTRACT, DIRECT_RUNBOOK, BRIDGE_RUNBOOK]:
+        for path in [WORKFLOW_DOC, UAT_PLAN, UAT_SETUP_RUNBOOK, NODE_CONTRACT, DIRECT_RUNBOOK, BRIDGE_RUNBOOK]:
             self.assertTrue(path.exists(), path)
             self.assertIn(path.name, readme)
 
@@ -204,6 +205,8 @@ class MemberIntakeN8nDryRunDocsTests(unittest.TestCase):
 
     def test_uat_plan_documents_n8n_skills_and_official_references_checked(self):
         plan = self.read(UAT_PLAN)
+        setup = self.read(UAT_SETUP_RUNBOOK)
+        combined = plan + "\n" + setup
 
         for skill in [
             "n8n-skills:using-n8n-skills",
@@ -215,7 +218,7 @@ class MemberIntakeN8nDryRunDocsTests(unittest.TestCase):
             "n8n-skills:n8n-loops",
             "n8n-skills:n8n-expressions",
         ]:
-            self.assertIn(skill, plan)
+            self.assertIn(skill, combined)
 
         for reference in [
             "Official n8n Google Sheets Trigger docs",
@@ -229,16 +232,18 @@ class MemberIntakeN8nDryRunDocsTests(unittest.TestCase):
         ]:
             self.assertIn(reference, plan)
 
-        self.assertRegex(plan, r"(?i)n8n-skills-backed")
+        self.assertRegex(combined, r"(?i)n8n-skills-backed")
         self.assertRegex(plan, r"(?i)not a blocker for this UAT-only plan")
-        self.assertRegex(plan, r"(?i)future live-instance verification")
-        self.assertRegex(plan, r"(?i)exact live n8n node parameter shapes")
+        self.assertRegex(combined, r"(?i)future live-instance verification")
+        self.assertRegex(combined, r"(?i)exact live n8n node parameter shapes")
         live_tooling_label = "M" + "CP"
         self.assertNotRegex(plan, rf"(?i)n8n {live_tooling_label}-backed")
         self.assertNotRegex(plan, rf"(?i)n8n {live_tooling_label} / skills")
         self.assertIn("get_node_types", plan)
         self.assertIn("validate_workflow", plan)
         self.assertIn("get_workflow_details", plan)
+        self.assertIn("ai-agent-toolkit:n8n-agent-rules", setup)
+        self.assertIn("ai-agent-toolkit:n8n-local-setup", setup)
 
     def test_uat_plan_compares_queue_options_and_recommends_sheets_uat_only(self):
         plan = self.read(UAT_PLAN)
@@ -255,6 +260,77 @@ class MemberIntakeN8nDryRunDocsTests(unittest.TestCase):
         self.assertRegex(plan, r"(?i)explicitly UAT-only")
         self.assertRegex(plan, r"(?i)disabled or replaced before production activation")
         self.assertRegex(plan, r"(?i)Candidate for a later controlled UAT")
+
+    def test_uat_setup_runbook_selects_hosted_dummy_sheets_first_step(self):
+        setup = self.read(UAT_SETUP_RUNBOOK)
+        readme = self.read(README)
+
+        self.assertIn("member_intake_n8n_uat_setup_runbook.md", readme)
+        self.assertRegex(setup, r"(?i)hosted/VPS/non-AC2 n8n")
+        self.assertRegex(setup, r"(?i)Google Sheets UAT queue tab")
+        self.assertRegex(setup, r"(?i)dummy fixture data first")
+        self.assertRegex(setup, r"(?i)minimum next runnable n8n step")
+        self.assertRegex(setup, r"(?i)manual, inactive hosted/VPS/non-AC2")
+        self.assertRegex(setup, r"(?i)does not touch AC2")
+        self.assertRegex(setup, r"(?i)n8n-skills plugin is a Codex-side planning and build aid only")
+        self.assertRegex(setup, r"(?i)not the hosted n8n runtime")
+        self.assertRegex(setup, r"(?i)Do not use local n8n on the AutoCount host as the long-term path")
+        self.assertRegex(setup, r"(?i)The Google Sheets queue is UAT-only")
+        self.assertRegex(setup, r"(?i)disabled or replaced before production activation")
+
+    def test_uat_setup_runbook_orders_dummy_rehearsal_before_powershell_preflight(self):
+        setup = self.read(UAT_SETUP_RUNBOOK)
+        plan = self.read(UAT_PLAN)
+        combined = setup + "\n" + plan
+
+        for phrase in [
+            "Gate 2: Hosted n8n Dummy Queue Rehearsal",
+            "Gate 2 may proceed before the PowerShell lookup preflight",
+            "dummy n8n rehearsal may proceed before the PowerShell lookup preflight",
+            "does not touch AC2",
+            "no bridge call to AC2",
+            "Gate 3: Required Local PowerShell Lookup Preflight",
+            "Before any real n8n queue UAT is allowed to touch AC2 lookup",
+            "Gate 3 does not block Gate 2",
+            "Gate 3 must pass before Gate 4",
+            "Gate 4: Real Queue UAT Touching AC2 Lookup",
+            "--queue-mode fixture",
+            "--lookup-mode powershell",
+            "--enable-powershell-lookup",
+            "-EnableMemberLookupReview",
+            "-MemberNoBase64Utf8",
+            "safe synthetic input or one manually approved lookup input",
+            "aggregate sanitized evidence only",
+            "dry_run_only",
+            "final_write_automation",
+        ]:
+            self.assertIn(phrase, combined)
+
+        self.assertLess(
+            setup.index("Gate 2: Hosted n8n Dummy Queue Rehearsal"),
+            setup.index("Gate 3: Required Local PowerShell Lookup Preflight"),
+        )
+        self.assertLess(
+            setup.index("Gate 3: Required Local PowerShell Lookup Preflight"),
+            setup.index("Gate 4: Real Queue UAT Touching AC2 Lookup"),
+        )
+
+        for forbidden_phrase in [
+            "raw fixture rows",
+            "raw result rows",
+            "encoded submitted values",
+            "normalized values",
+            "command transcripts",
+            "stderr/stdout",
+            "row-level output",
+        ]:
+            self.assertIn(forbidden_phrase, combined)
+
+        self.assertRegex(combined, r"(?i)No state authorizes member creation")
+        self.assertRegex(combined, r"(?i)Gate 4.*review-only")
+        self.assertRegex(combined, r"(?i)Gate 4.*dry-run-only")
+        self.assertRegex(combined, r"(?i)cannot create or update AutoCount members")
+        self.assertRegex(combined, r"(?i)PDPA Acknowledged = Imported.*valid consent|Imported.*valid consent")
 
     def test_uat_plan_defines_exact_node_level_polling_workflow_shape(self):
         plan = self.read(UAT_PLAN)
@@ -324,6 +400,8 @@ class MemberIntakeN8nDryRunDocsTests(unittest.TestCase):
 
     def test_uat_plan_forbids_pii_secrets_sheet_ids_urls_and_direct_write_paths(self):
         plan = self.read(UAT_PLAN)
+        setup = self.read(UAT_SETUP_RUNBOOK)
+        combined = plan + "\n" + setup
 
         for phrase in [
             "raw member numbers",
@@ -338,20 +416,20 @@ class MemberIntakeN8nDryRunDocsTests(unittest.TestCase):
             "stderr/stdout",
             "PII",
         ]:
-            self.assertRegex(plan, re.escape(phrase), phrase)
+            self.assertRegex(combined, re.escape(phrase), phrase)
 
         for token in FORBIDDEN_WRITE_TOKENS:
-            self.assertNotIn(token, plan, token)
+            self.assertNotIn(token, combined, token)
         self.assertNotRegex(
-            plan,
+            combined,
             r"(?i)\b(SELECT\s+\*|INSERT\s+INTO|UPDATE\s+\w+\s+SET|DELETE\s+FROM|MERGE\s+INTO)\b",
         )
-        self.assertNotRegex(plan, r"https://docs\.google\.com/spreadsheets/d/")
-        self.assertNotRegex(plan, r"(?i)(password|secret|token)\s*[:=]\s*['\"][^'\"]+['\"]")
-        self.assertNotRegex(plan, r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b")
-        self.assertRegex(plan, r"(?i)No production activation is allowed")
-        self.assertRegex(plan, r"(?i)Real create/update automation remains blocked")
-
+        self.assertNotRegex(combined, r"https://docs\.google\.com/spreadsheets/d/")
+        self.assertNotRegex(combined, r"(?i)(password|secret|token)\s*[:=]\s*['\"][^'\"]+['\"]")
+        self.assertNotRegex(combined, r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b")
+        self.assertNotRegex(combined, r"submitted_member_no_base64_utf8\"\s*:\s*\"[A-Za-z0-9+/]+=*\"")
+        self.assertRegex(combined, r"(?i)No production activation is allowed")
+        self.assertRegex(combined, r"(?i)Real create/update automation remains blocked")
 
 if __name__ == "__main__":
     unittest.main()

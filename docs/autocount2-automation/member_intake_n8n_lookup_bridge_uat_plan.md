@@ -76,6 +76,18 @@ Cloud/VPS/non-AC2 n8n direct Execute Command to local AC2 remains invalid becaus
 
 Recommended UAT approach: use a Google Sheets queue tab, explicitly UAT-only, with protected tabs and allowed columns only. This keeps the first end-to-end rehearsal close to the existing Google Form workflow while preserving the final architecture rule that n8n stays off the AutoCount host and the bridge polls outbound.
 
+For the setup sequence and required preflight gates, see [member_intake_n8n_uat_setup_runbook.md](member_intake_n8n_uat_setup_runbook.md). The minimum next runnable n8n UAT step is a manual, inactive hosted/VPS/non-AC2 n8n rehearsal against dummy Google Sheets UAT tabs, with no AC2 lookup touch. That dummy n8n rehearsal may proceed before the PowerShell lookup preflight because it does not call AC2. Before any real n8n queue UAT is allowed to touch AC2 lookup, the local bridge worker PowerShell lookup mode must pass once with fixture input, safe synthetic or manually approved lookup input only, and aggregate sanitized paste-back evidence only.
+
+Required preflight gate before real AC2-touching queue UAT:
+
+- run locally on the approved Windows AC2 lookup bridge host,
+- use `--queue-mode fixture`,
+- use `--lookup-mode powershell` and `--enable-powershell-lookup`,
+- call only the proven read-only lookup script with `-EnableMemberLookupReview` and `-MemberNoBase64Utf8`,
+- keep local target settings and `AC2_PROBE_PASSWORD` in runtime-only local configuration,
+- paste back only aggregate sanitized status/count evidence,
+- do not paste secrets, raw fixture rows, raw result rows, encoded submitted values, normalized values, names, emails, raw phone numbers, Sheet IDs, Sheet URLs, command transcripts, stderr/stdout, local target details, or row-level output.
+
 ## UAT Sheet Tabs
 
 Use placeholder tab names in docs and tests; configure real spreadsheet IDs only in n8n credentials/resource selectors or local bridge configuration.
