@@ -66,6 +66,38 @@ The already proven local bridge fixture/mock pass remains the baseline evidence:
 
 Do not paste row-level fixture input, result rows, encoded submitted values, raw member values, normalized member values, local command transcripts, stderr/stdout, credentials, Sheet IDs, Sheet URLs, names, emails, or phone numbers.
 
+### Recorded Local n8n Dummy Wiring Rehearsal
+
+A local non-AC2 n8n dummy wiring rehearsal has passed on the operator PC. The runtime evidence label is:
+
+```text
+n8n_runtime_location = local_operator_pc_non_ac2_n8n_stack
+```
+
+This was not hosted/VPS n8n and must not be reported as `hosted_or_vps_non_ac2`.
+
+Sanitized aggregate evidence recorded for this local development rehearsal:
+
+```text
+status = ok
+n8n_runtime_location = local_operator_pc_non_ac2_n8n_stack
+workflow_activation = inactive
+execution_mode = manual_dummy_rehearsal
+dummy_rows_read_count = 3
+queue_rows_appended_count = 1
+result_rows_read_count = 4
+review_rows_updated_count = 4
+result_state_counts = READY_FOR_CREATE_REVIEW=1, EXISTING_MEMBER_REVIEW=1, MANUAL_REVIEW_REQUIRED=1, LOOKUP_ERROR_REVIEW=1
+ac2_touched = false
+bridge_called = false
+final_write_automation = false
+sanitized_note = No real Sheet IDs/URLs, credentials, row-level output, raw/encoded/normalized values, names, emails, phone numbers, command transcripts, execution payloads, node raw input/output dumps, or PII are pasted.
+```
+
+This evidence proves only the local n8n and Google Sheets queue/review wiring with dummy rows. It does not prove hosted/VPS runtime readiness, does not activate or publish a workflow, does not touch AC2, does not call the bridge, and does not authorize Gate 4.
+
+The next gate is Gate 3: local Windows PowerShell lookup preflight. Gate 3 must remain read-only, fixture-based or dummy-only, aggregate-evidence-only, with no member create/update, no AutoCount writes, and no raw, encoded, or normalized member values or PII pasted.
+
 ### Gate 2: Hosted n8n Dummy Queue Rehearsal
 
 Gate 2 may proceed before the PowerShell lookup preflight because it uses dummy fixture rows only and does not touch AC2.
@@ -82,6 +114,8 @@ Run the first n8n UAT rehearsal with dummy fixture rows only:
 - execution data minimized and pruned before running.
 
 This proves n8n can read a marked UAT row, build an allowed queue job shape, write only allowed queue columns, read a dummy sanitized result row, and update only review/status fields.
+
+The recorded local operator PC pass above is useful wiring evidence, but it is not hosted/VPS runtime evidence. Do not use it to claim hosted/VPS readiness.
 
 Use [member_intake_n8n_gate2_dummy_rehearsal_runbook.md](member_intake_n8n_gate2_dummy_rehearsal_runbook.md) for the exact Gate 2 operator setup steps, placeholder UAT tabs, allowed columns, dummy row shapes, manual inactive n8n node shape, safe paste-back evidence, and stop conditions.
 

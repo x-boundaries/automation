@@ -335,6 +335,34 @@ class MemberIntakeN8nDryRunDocsTests(unittest.TestCase):
         self.assertRegex(combined, r"(?i)cannot create or update AutoCount members")
         self.assertRegex(combined, r"(?i)PDPA Acknowledged = Imported.*valid consent|Imported.*valid consent")
 
+    def test_uat_setup_records_local_operator_n8n_rehearsal_without_hosted_runtime_claim(self):
+        setup = self.read(UAT_SETUP_RUNBOOK)
+
+        self.assertIn("Recorded Local n8n Dummy Wiring Rehearsal", setup)
+        self.assertIn("n8n_runtime_location = local_operator_pc_non_ac2_n8n_stack", setup)
+        self.assertIn("dummy_rows_read_count = 3", setup)
+        self.assertIn("queue_rows_appended_count = 1", setup)
+        self.assertIn("result_rows_read_count = 4", setup)
+        self.assertIn("review_rows_updated_count = 4", setup)
+        self.assertIn(
+            "result_state_counts = READY_FOR_CREATE_REVIEW=1, EXISTING_MEMBER_REVIEW=1, MANUAL_REVIEW_REQUIRED=1, LOOKUP_ERROR_REVIEW=1",
+            setup,
+        )
+        self.assertIn("ac2_touched = false", setup)
+        self.assertIn("bridge_called = false", setup)
+        self.assertIn("final_write_automation = false", setup)
+        self.assertIn("This was not hosted/VPS n8n", setup)
+        self.assertIn("must not be reported as `hosted_or_vps_non_ac2`", setup)
+        self.assertIn("does not prove hosted/VPS runtime readiness", setup)
+        self.assertIn("does not authorize Gate 4", setup)
+        self.assertIn("The next gate is Gate 3: local Windows PowerShell lookup preflight", setup)
+        self.assertIn("read-only, fixture-based or dummy-only, aggregate-evidence-only", setup)
+        self.assertIn("no member create/update, no AutoCount writes", setup)
+        self.assertIn("no raw, encoded, or normalized member values or PII pasted", setup)
+        self.assertNotRegex(setup, r"n8n_runtime_location = hosted_or_vps_non_ac2")
+        self.assertNotRegex(setup, r"https://docs\.google\.com/spreadsheets/d/")
+        self.assertNotRegex(setup, r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b")
+
     def test_gate2_dummy_rehearsal_runbook_defines_safe_operator_steps(self):
         gate2 = self.read(GATE2_RUNBOOK)
         setup = self.read(UAT_SETUP_RUNBOOK)
