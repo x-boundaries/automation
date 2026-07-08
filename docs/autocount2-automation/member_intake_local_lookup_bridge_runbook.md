@@ -1,6 +1,6 @@
 # Member Intake Local Lookup Bridge Runbook
 
-Status: design and dry-run worker skeleton only. Gate 3 local lookup preflight pass recorded. This does not activate production automation and does not authorize AutoCount member writes.
+Status: design and dry-run worker skeleton only. Gate 3 local lookup preflight and Gate 3B AC2 local bridge readiness passes recorded. This does not activate production automation and does not authorize AutoCount member writes.
 
 ## Purpose
 
@@ -516,6 +516,37 @@ sanitized_note = No credentials, connection strings, Sheet IDs/URLs, credential 
 ```
 
 Do not paste the local queue row, local result row, raw member value, encoded member value, decoded member value, normalized member value, command transcript, stdout/stderr transcript, node payload, credential value, server/database/user/password value, Sheet ID/URL, or screenshot with row-level data. Keep `member_lookup_bridge_gate3b_pending_queue.jsonl` and `member_lookup_bridge_gate3b_results.jsonl` local and ignored.
+
+Recorded Gate 3B sanitized evidence:
+
+```text
+status = ok
+gate = gate3b_ac2_local_bridge_readiness
+runtime_location = windows_ac2_bridge_host_only
+execution_mode = manual_local_one_row_read_only_lookup
+local_queue_row_count = 1
+local_queue_rows_loaded_count = 1
+lookup_attempt_count = 1
+lookup_success_count = 1
+lookup_ready_for_create_review_count = 0
+lookup_existing_member_review_count = 0
+lookup_manual_review_count = 1
+lookup_error_count = 0
+local_review_result_rows_written_count = 1
+n8n_required = false
+n8n_involved = false
+google_sheets_required = false
+hosted_or_vps_service_called = false
+scheduler_enabled = false
+public_inbound_to_ac2_host = false
+member_create_or_update_invoked = false
+autocount_write_attempted = false
+direct_sql_write_attempted = false
+final_write_automation = false
+no_row_values_printed = true
+```
+
+This pass used one local synthetic/manual-review-shaped value. No row-level data, raw/encoded/decoded/normalized member values, names, emails, phone numbers, command transcripts, stderr/stdout, execution payloads, screenshots, credentials, Sheet IDs/URLs, or PII are recorded.
 
 Gate 3B proves only that the Windows AC2 bridge host can safely process one local queued lookup through the read-only lookup path and produce sanitized local result evidence. It does not approve Gate 4A, n8n setup, Google Sheets lookup queue use, queue API use, Cloudflare Tunnel / `cloudflared` use, hosted/VPS runtime readiness, result mapping, member create/update, AutoCount writes, direct SQL writes, scheduler activation, webhook activation, or final write automation.
 
