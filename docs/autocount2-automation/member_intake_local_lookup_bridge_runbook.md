@@ -35,28 +35,53 @@ locked-down Windows AC2 lookup bridge
 
 Preferred pattern: outbound polling from the Windows bridge. The AC2 host does not expose a public inbound webhook. The bridge periodically asks an approved queue for `PENDING_LOOKUP` jobs, marks a job as in progress using an idempotency key or lease, runs the read-only lookup script, and posts back only sanitized status metadata.
 
-The queue can be implemented later with an approved cloud queue, private API, n8n data table, or similar service. This PR does not choose or configure a live queue provider.
+Future development and integration may use a narrow protected queue/API surface over HTTPS. Cloudflare Tunnel / reverse proxy may front that queue/API surface, including a queue API running on the operator local dev PC behind `cloudflared`, as long as the protected surface exposes only sanitized queue/result operations and never exposes AC2, AutoCount, PowerShell, SQL, RDP, or member write paths.
 
-## Explicitly Non-Preferred Inbound Pattern
+Any future tunneled queue/API surface must require Cloudflare Access/service-token or equivalent machine authentication, rate limits, audit logging, a least-privilege request/response schema, and a documented rollback/disable procedure. Do not put real tunnel config, URLs, account IDs, Access client IDs/secrets, service tokens, credentials, or secrets in this repo or PR evidence.
 
-An inbound local webhook, private tunnel, reverse proxy, or VPN callback to the Windows bridge is not the preferred design. It may be considered only as a separately approved private-network exception with documented firewall rules, authentication, rate limits, audit logging, and rollback.
+The future queue/API polling model is:
 
-A public inbound webhook on the AutoCount host is not recommended.
+```text
+n8n writes sanitized PENDING_LOOKUP jobs to the queue API over HTTPS
+AC2 bridge polls the queue API outbound over HTTPS
+AC2 bridge claims one job at a time with state/lease fields
+AC2 bridge runs read-only AutoCount lookup locally
+AC2 bridge posts sanitized result back to the queue API over HTTPS
+n8n reads/routes the sanitized result
+```
+
+For UAT, polling may be manual or run by Windows Task Scheduler every 1 minute. For production, prefer a long-running Windows service/worker polling every 15-60 seconds with idle backoff. Hourly polling is too slow for the intake duplicate-check flow and should not be the default.
+
+The queue can be implemented later with an approved cloud queue, protected queue API, n8n data table, or similar service. This PR does not choose or configure a live queue provider.
+
+## Protected Tunnel Boundary
+
+Cloudflare Tunnel / reverse proxy is allowed as future/dev architecture only for the protected queue/API surface. It must terminate on the queue/API layer, not on the AC2 runtime, AutoCount process, PowerShell runner, SQL Server, RDP, file shares, or any member create/update/delete/write path.
+
+The protected queue/API must have Cloudflare Access/service-token or equivalent machine authentication, rate limits, audit logging, a least-privilege request/response schema, and a rollback/disable procedure before any tunneled development or integration run is approved.
+
+Direct inbound webhook, tunnel, reverse proxy, VPN callback, or public route to the Windows AC2 bridge host remains forbidden for this lookup path unless a separate future security review explicitly approves a private-network exception. A public inbound webhook on the AutoCount host is not recommended.
 
 ## n8n Runtime Boundary
 
 - n8n can orchestrate Google Sheet intake, validation, queue creation, reviewer notifications, and review-only status updates.
+- n8n may later run on a dev PC, VPS, hosted machine, or other non-AC2 environment.
+- n8n does not need AC2 environment variables, AutoCount assemblies, direct SQL access, or local PowerShell execution.
+- Only the Windows AC2 bridge host has AC2 environment variables and the AutoCount runtime needed for lookup.
 - Cloud n8n cannot directly run local AC2 PowerShell.
 - n8n Execute Command runs on the n8n host/container where n8n runs, not on the AutoCount host.
 - Therefore a cloud/VPS/non-AC2 n8n Execute Command node is invalid for local AC2 lookup.
 - n8n must not store raw member values, normalized member values, AutoCount credentials, local host details, or full bridge command text in workflow data.
+- Hosted/cloud/VPS n8n must not use Execute Command for AC2 lookup.
+- No public inbound webhook, tunnel, reverse proxy, or callback should be exposed to the AC2 host for this bridge path.
+- A future protected queue/API may be exposed over HTTPS through Cloudflare Tunnel / reverse proxy, but only for sanitized queue/result operations. It must not proxy AC2, AutoCount, PowerShell, SQL, RDP, or member write paths.
 
 ## Windows Bridge Boundary
 
 The bridge is intentionally small:
 
 - runs only on the AutoCount host or an approved Windows host that can load the installed AutoCount assemblies,
-- polls outbound for pending lookup jobs,
+- polls outbound over HTTPS for pending lookup jobs when a future queue/API is approved,
 - accepts only the allowed request fields defined in [member_intake_n8n_node_contract.md](member_intake_n8n_node_contract.md),
 - calls `scripts/ac2_member_lookup_review.ps1` only with `-EnableMemberLookupReview` and `-MemberNoBase64Utf8`,
 - relies on runtime-only local configuration for AC2 target settings and password,
@@ -124,7 +149,7 @@ Forbidden response fields are the same as the forbidden request fields. The brid
 | State | Meaning |
 | --- | --- |
 | `PENDING_LOOKUP` | n8n queued a review-only lookup request. |
-| `LOOKUP_IN_PROGRESS` | Bridge leased or started the job. |
+| `LOOKUP_IN_PROGRESS` | Bridge claimed exactly one job with lease metadata before local lookup. |
 | `LOOKUP_ERROR_REVIEW` | Process failure, timeout, invalid JSON, schema mismatch, sanitized lookup error, or retry exhaustion. |
 | `MANUAL_REVIEW_REQUIRED` | Lookup or normalization requires human review before any create review state. |
 | `EXISTING_MEMBER_REVIEW` | AC2 lookup found an existing `MemberNo`; route to duplicate review. |
@@ -135,10 +160,11 @@ No state authorizes member creation.
 ## Retry And Idempotency
 
 - `job_id` or `intake_id` must be stable and non-PII.
-- The queue should lease a job before lookup so two bridge instances do not process it at the same time.
+- The queue should atomically move exactly one job from `PENDING_LOOKUP` to `LOOKUP_IN_PROGRESS` before lookup so two bridge instances do not process it at the same time.
 - The same job payload should produce the same sanitized result.
 - A job with the same idempotency key and different payload hash must be rejected or held for review.
 - Timeouts and transient local failures may retry up to a small configured limit.
+- If the `LOOKUP_IN_PROGRESS` lease expires before a result is posted, a timeout/retry sweep may return the job to `PENDING_LOOKUP` with incremented attempt metadata until the retry cap is reached.
 - Retry exhaustion routes to `LOOKUP_ERROR_REVIEW`, not to a create-review state.
 - Result posting should be idempotent; duplicate posts for the same payload hash should return the prior result.
 
@@ -368,6 +394,131 @@ This pass does not prove production automation, does not authorize member create
 
 Gate 4 remains not approved to run until the reviewed Gate 4 plan PR is merged and the operator gives explicit run approval. Passing Gate 3 is readiness evidence for the plan review, not approval to run a real queue UAT.
 
+## Gate 3B AC2 Local Bridge Readiness
+
+Status: AC2-side local bridge readiness only. This is not Gate 4A, not n8n evidence, not Google Sheets evidence, and not production activation.
+
+Gate 3B proves the local bridge path from one ignored queue row through the read-only PowerShell lookup and back to an aggregate-only evidence summary:
+
+```text
+local one-row ignored queue JSONL
+-> scripts/ac2_member_lookup_bridge_worker.py
+-> read-only PowerShell lookup
+-> local sanitized result JSONL
+-> aggregate-only evidence summary
+```
+
+Gate 3B does not require or use n8n, Google Sheets, hosted n8n, a queue API, Cloudflare Tunnel, `cloudflared`, a hosted service, a scheduler, a webhook, result mapping, a public inbound path, or final write automation. It also does not create, update, delete, or otherwise write AutoCount members, and it does not perform direct SQL writes.
+
+Later integration may link non-AC2 n8n to the bridge through a shared queue/result surface exposed by a narrow protected queue/API over HTTPS:
+
+```text
+n8n writes sanitized PENDING_LOOKUP jobs to the queue API
+AC2 bridge polls/reads the queue API outbound over HTTPS
+AC2 bridge claims one job at a time using state/lease fields
+AC2 bridge writes sanitized results back to the queue API
+n8n reads/routes the sanitized result
+```
+
+The later n8n runtime may be a dev PC, VPS, hosted machine, or other non-AC2 environment. It does not need AC2 environment variables, AutoCount assemblies, direct SQL access, or local PowerShell execution. Only the Windows AC2 bridge host has AC2 environment variables and the AutoCount runtime. Hosted/cloud/VPS n8n must not use Execute Command for AC2 lookup, and no public inbound webhook, tunnel, or reverse proxy may expose the AC2 host.
+
+Cloudflare Tunnel / reverse proxy may be used for development and likely integration only for the protected queue/API surface. For development, the queue API may run on the operator local dev PC behind `cloudflared`. The tunnel must not expose AC2, AutoCount, PowerShell, SQL, RDP, or any member write path.
+
+Use one operator-approved test member/member-number value. Do not paste the raw, encoded, decoded, or normalized value into commands, docs, PR comments, screenshots, tickets, or evidence.
+
+Prepare one local ignored queue row on the Windows AC2 bridge host:
+
+```powershell
+$root = 'C:\XB\autocount_outputs\review\member_lookup_bridge'
+New-Item -ItemType Directory -Force -Path $root | Out-Null
+$secureValue = Read-Host -AsSecureString 'Enter one approved test member/member-number value'
+$bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureValue)
+try {
+  $plainValue = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
+  $plainValue | python scripts\member_lookup_gate3b_prepare_local_queue.py `
+    --member-value-stdin `
+    --queue-jsonl "$root\member_lookup_bridge_gate3b_pending_queue.jsonl"
+} finally {
+  if ($bstr -ne [IntPtr]::Zero) {
+    [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+  }
+  Remove-Variable plainValue -ErrorAction SilentlyContinue
+}
+```
+
+The helper output must be aggregate-only:
+
+```json
+{
+  "status": "ok",
+  "gate": "gate3b_ac2_local_bridge_readiness_queue_prep",
+  "queue_file_written": true,
+  "queue_row_count": 1,
+  "encoded_present_count": 1,
+  "no_row_values_printed": true,
+  "n8n_required": false,
+  "google_sheets_required": false,
+  "dry_run_only": true,
+  "final_write_automation": false
+}
+```
+
+Run the local AC2 bridge worker in read-only PowerShell lookup mode:
+
+```powershell
+python scripts\ac2_member_lookup_bridge_worker.py `
+  --enable-local-lookup-bridge-review `
+  --queue-mode fixture `
+  --fixture-jobs "$root\member_lookup_bridge_gate3b_pending_queue.jsonl" `
+  --results-jsonl "$root\member_lookup_bridge_gate3b_results.jsonl" `
+  --lookup-mode powershell `
+  --enable-powershell-lookup `
+  --allow-root-login
+```
+
+Then reduce the local result JSONL to aggregate-only Gate 3B evidence:
+
+```powershell
+python scripts\member_lookup_gate3b_evidence_summary.py `
+  --results-jsonl "$root\member_lookup_bridge_gate3b_results.jsonl" `
+  --local-queue-row-count 1 `
+  --local-queue-rows-loaded-count 1
+```
+
+Required Gate 3B paste-back shape:
+
+```text
+status = <ok/needs_fix>
+gate = gate3b_ac2_local_bridge_readiness
+runtime_location = windows_ac2_bridge_host_only
+execution_mode = manual_local_one_row_read_only_lookup
+local_queue_row_count = <aggregate-count-only>
+local_queue_rows_loaded_count = <aggregate-count-only>
+lookup_attempt_count = <aggregate-count-only>
+lookup_success_count = <aggregate-count-only>
+lookup_ready_for_create_review_count = <aggregate-count-only>
+lookup_existing_member_review_count = <aggregate-count-only>
+lookup_manual_review_count = <aggregate-count-only>
+lookup_error_count = <aggregate-count-only>
+local_review_result_rows_written_count = <aggregate-count-only>
+n8n_required = false
+n8n_involved = false
+google_sheets_required = false
+hosted_or_vps_service_called = false
+scheduler_enabled = false
+public_inbound_to_ac2_host = false
+member_create_or_update_invoked = false
+autocount_write_attempted = false
+direct_sql_write_attempted = false
+final_write_automation = false
+no_row_values_printed = true
+sanitized_note = No credentials, connection strings, Sheet IDs/URLs, credential IDs, row-level output, raw/encoded/decoded/normalized member values, names, emails, phone numbers, command transcripts, stderr/stdout, execution payloads, node raw input/output dumps, or PII are pasted.
+```
+
+Do not paste the local queue row, local result row, raw member value, encoded member value, decoded member value, normalized member value, command transcript, stdout/stderr transcript, node payload, credential value, server/database/user/password value, Sheet ID/URL, or screenshot with row-level data. Keep `member_lookup_bridge_gate3b_pending_queue.jsonl` and `member_lookup_bridge_gate3b_results.jsonl` local and ignored.
+
+Gate 3B proves only that the Windows AC2 bridge host can safely process one local queued lookup through the read-only lookup path and produce sanitized local result evidence. It does not approve Gate 4A, n8n setup, Google Sheets lookup queue use, queue API use, Cloudflare Tunnel / `cloudflared` use, hosted/VPS runtime readiness, result mapping, member create/update, AutoCount writes, direct SQL writes, scheduler activation, webhook activation, or final write automation.
+
 ## Review-Only Routing
 
 The bridge posts results for review routing only:
@@ -382,8 +533,10 @@ Real create/update automation remains blocked pending a separate PR, explicit bu
 ## Out Of Scope
 
 - production queue provider selection,
-- public inbound webhook,
-- private tunnel activation,
+- protected queue/API deployment,
+- Cloudflare Tunnel / reverse proxy setup,
+- public inbound webhook to the AC2 host,
+- direct tunnel to AC2, AutoCount, PowerShell, SQL, RDP, or member write paths,
 - production n8n workflow export,
 - AutoCount member writes,
 - direct database write paths,

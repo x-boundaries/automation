@@ -63,6 +63,8 @@ Google Form responses in Google Sheets
 
 The local Windows AC2 lookup bridge is the only component allowed to load AutoCount assemblies or run `scripts/ac2_member_lookup_review.ps1`. The bridge polls outbound. There is no public inbound webhook, tunnel, reverse proxy, or callback on the AutoCount host in the recommended UAT path.
 
+Cloudflare Tunnel / reverse proxy may be used for development and likely integration only for a narrow protected queue/API surface over HTTPS. For development, the queue API may run on the operator local dev PC behind `cloudflared`. The tunnel must expose only sanitized queue/result API operations and must not expose AC2, AutoCount, PowerShell, SQL, RDP, or member create/update/delete/write paths. Any future tunneled queue/API surface must require Cloudflare Access/service-token or equivalent machine authentication, rate limits, audit logging, a least-privilege request/response schema, and a documented rollback/disable procedure.
+
 Cloud/VPS/non-AC2 n8n direct Execute Command to local AC2 remains invalid because Execute Command would run on the n8n host/container, not on the AutoCount Windows host.
 
 ## Queue Option Comparison
@@ -72,6 +74,7 @@ Cloud/VPS/non-AC2 n8n direct Execute Command to local AC2 remains invalid becaus
 | Google Sheets queue tab | Fits the current Google Form/Sheets intake surface, is easy for reviewers to inspect, requires no new queue infrastructure, and lets the local bridge poll outbound with a dedicated credential. | Stores the encoded submitted member value in a spreadsheet cell, has weaker leasing/atomicity than a real queue, needs careful hidden/protected tabs, and can be changed manually by users with sheet access. | Recommended for this UAT only. It must be disabled or replaced before production activation. |
 | n8n Data Table / internal storage | Official n8n docs support workflow-local persistent state, row operations, UI/API access, and idempotency metadata. This avoids adding queue columns to the intake spreadsheet. | The bridge must call n8n's DataTable API or another verified bridge-access path. Live n8n instance tooling and API auth behavior were not available in this session, Data Tables have storage limits, and Data Table writes run for real during tests. | Candidate for a later controlled UAT after future live-instance verification. Not the first UAT queue. |
 | Lightweight external queue/API | Best long-term separation for leases, retries, audit, access control, and bridge outbound polling. | Requires new infrastructure, credential management, monitoring, rate limits, and an API contract review. It is more setup than needed for the dry-run duplicate-check UAT. | Preferred direction after UAT if this flow moves beyond review-only rehearsal. |
+| Protected queue/API behind Cloudflare Tunnel / reverse proxy | Fits development and likely integration when a queue API runs on an operator local dev PC or approved host while remaining HTTPS-protected. | Must be limited to queue/result operations; requires Cloudflare Access/service-token or equivalent machine authentication, rate limits, audit logging, a least-privilege request/response schema, rollback/disable procedure, service-token handling outside Git, monitoring, and a separate API contract review. It must not expose AC2, AutoCount, PowerShell, SQL, RDP, or member write paths. | Allowed future/dev architecture. Not part of Gate 3B. |
 | Local file drop only for fixture mode | Safest for bridge worker unit tests and offline synthetic fixtures. No network or cloud dependency. | Not a cloud/VPS/non-AC2 n8n bridge, cannot prove cross-host polling, and should not be used as the runtime queue. | Fixture-only. Keep local under `C:\XB\autocount_outputs\review\...` and never commit row-level outputs. |
 
 Recommended UAT approach: use a Google Sheets queue tab, explicitly UAT-only, with protected tabs and allowed columns only. This keeps the first end-to-end rehearsal close to the existing Google Form workflow while preserving the final architecture rule that n8n stays off the AutoCount host and the bridge polls outbound.
@@ -291,7 +294,9 @@ No workflow export is committed. The exact resource IDs, credential IDs, column 
 
 ### Bridge Poller
 
-The bridge poller is outside n8n. It runs on the approved Windows AC2 host, polls `Lookup Queue UAT` outbound, leases one `PENDING_LOOKUP` job, calls the proven read-only lookup script with `-EnableMemberLookupReview`, `-AllowRootLogin` only when explicitly configured for the local proof, and `-MemberNoBase64Utf8`, then posts only allowed result fields to `Lookup Results UAT`.
+The bridge poller is outside n8n. It runs on the approved Windows AC2 host, polls `Lookup Queue UAT` or a future protected queue/API outbound over HTTPS, claims exactly one `PENDING_LOOKUP` job by moving it to `LOOKUP_IN_PROGRESS` with lease fields, calls the proven read-only lookup script with `-EnableMemberLookupReview`, `-AllowRootLogin` only when explicitly configured for the local proof, and `-MemberNoBase64Utf8`, then posts only allowed result fields to `Lookup Results UAT` or the protected queue/API.
+
+For UAT, polling may be manual or Windows Task Scheduler every 1 minute. For production, prefer a long-running Windows service/worker polling every 15-60 seconds with idle backoff. Hourly polling is too slow for intake duplicate-check flow and should not be the default.
 
 The bridge must not return raw, encoded, or normalized member values. Runtime outputs remain local under `C:\XB\autocount_outputs\review\...` and must not be committed.
 
@@ -344,6 +349,8 @@ The n8n runtime for Gate 4 must be outside the AC2 host.
 - If Gate 4 later uses hosted/VPS n8n, evidence must label it as `hosted_or_vps_non_ac2`, and hosted/VPS readiness must be separately evidenced before hosted/VPS real queue UAT.
 - n8n must remain inactive and manually run for UAT evidence. No scheduler is enabled.
 - No public inbound webhook, callback, tunnel, or reverse proxy may be exposed on the AC2 host.
+- Cloudflare Tunnel / reverse proxy may protect a future queue/API surface only; direct tunnel access to AC2, AutoCount, PowerShell, SQL, RDP, or member write paths remains forbidden.
+- Any future tunneled queue/API surface must require Cloudflare Access/service-token or equivalent machine authentication, rate limits, audit logging, a least-privilege request/response schema, and a documented rollback/disable procedure.
 - Hosted/cloud/VPS n8n must not use Execute Command for AC2 lookup because that would run on the n8n host/container, not on the Windows AC2 lookup bridge host.
 
 ### Gate 4 Queue Surface
