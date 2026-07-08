@@ -599,7 +599,7 @@ python scripts\member_lookup_gate3c_local_bridge_runtime.py `
 Required Gate 3C paste-back shape:
 
 ```text
-status = <ok/needs_fix/no_work/dry_run_only>
+status = <ok/needs_fix/no_work/dry_run_only/already_processed>
 gate = gate3c_ac2_local_bridge_runtime_hardening
 runtime_location = windows_ac2_bridge_host_only
 execution_mode = manual_local_filesystem_runtime_hardening
@@ -635,6 +635,8 @@ Real Gate 3C AC2 runtime pass evidence requires all of the following:
 - `failed_or_dead_letter_count = 0`
 
 `status = no_work` means no pending rows were loaded. `status = no_work` is not Gate 3C pass evidence. `status = dry_run_only` means the harness ran without real PowerShell lookup evidence, such as mock mode, and is not Gate 3C pass evidence.
+
+Duplicate-only rerun evidence requires `pending_rows_loaded_count >= 1`, `lookup_attempt_count = 0`, `lookup_success_count = 0`, `lookup_error_count = 0`, `processed_or_archived_count = 0`, `failed_or_dead_letter_count = 0`, and `duplicate_or_already_processed_count >= 1`. In that case the harness prints `status = already_processed`. `status = already_processed` is not fresh Gate 3C AC2 lookup pass evidence. Duplicate-only evidence proves local idempotency only. The bridge recognized already handled work, did not run another lookup, and did not append duplicate result rows.
 
 Do not paste pending rows, result rows, processed markers, failed markers, raw member values, encoded member values, decoded member values, normalized member values, names, emails, phone numbers, birthday values, command transcripts, stderr/stdout transcripts, execution payloads, credentials, AC2 environment values, Sheet IDs/URLs, screenshots, or PII. Keep `member_lookup_bridge_gate3c_pending_queue.jsonl`, `member_lookup_bridge_gate3c_results.jsonl`, `member_lookup_bridge_gate3c_processed`, and `member_lookup_bridge_gate3c_failed` local and ignored.
 

@@ -210,6 +210,13 @@ def status_from_counts(args, counts):
         return "dry_run_only"
     if counts["lookup_attempt_count"] >= 1 and counts["lookup_success_count"] >= 1:
         return "ok"
+    if (
+        counts["lookup_attempt_count"] == 0
+        and counts["lookup_success_count"] == 0
+        and counts["processed_or_archived_count"] == 0
+        and counts["duplicate_or_already_processed_count"] >= 1
+    ):
+        return "already_processed"
     return "needs_fix"
 
 
