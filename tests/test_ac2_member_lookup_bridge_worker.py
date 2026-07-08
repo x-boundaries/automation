@@ -132,6 +132,27 @@ def write_jsonl(path, rows):
             handle.write(json.dumps(row, sort_keys=True) + "\n")
 
 
+def write_fake_powershell_lookup(path):
+    lookup_json = json.dumps(
+        {
+            "status": "ok",
+            "authentication_success": True,
+            "user_session_available": True,
+            "member_command_found": True,
+            "get_member_found": True,
+            "submitted_member_no_status": "canonical_65_mobile",
+            "normalized_member_no_length": 10,
+            "member_exists": False,
+            "member_found_by": None,
+            "manual_review_required": False,
+            "warning_count": 0,
+            "error": None,
+        },
+        sort_keys=True,
+    )
+    path.write_text(f"@echo off\r\necho {lookup_json}\r\n", encoding="utf-8")
+
+
 def parse_key_value_evidence(text):
     evidence = {}
     for line in text.splitlines():
@@ -796,6 +817,93 @@ class BridgeWorkerCliTests(unittest.TestCase):
             self.assertEqual(second_evidence["duplicate_or_already_processed_count"], "2")
             self.assertEqual(len(results_path.read_text(encoding="utf-8").splitlines()), 2)
 
+    def test_gate3c_runtime_powershell_fresh_pass_then_duplicate_only_status(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            pending_path = tmp_path / "member_lookup_bridge_gate3c_pending_queue.jsonl"
+            results_path = tmp_path / "member_lookup_bridge_gate3c_results.jsonl"
+            processed_dir = tmp_path / "member_lookup_bridge_gate3c_processed"
+            failed_dir = tmp_path / "member_lookup_bridge_gate3c_failed"
+            fake_powershell = tmp_path / "fake-powershell.cmd"
+            fake_lookup_script = tmp_path / "fake-lookup-script.ps1"
+            raw_member_value = "MEMBER-FIXTURE-PRIVATE"
+            encoded_value = base64.b64encode(raw_member_value.encode("utf-8")).decode("ascii")
+            write_fake_powershell_lookup(fake_powershell)
+            fake_lookup_script.write_text("# fake lookup script path only\n", encoding="utf-8")
+            write_jsonl(
+                pending_path,
+                [
+                    fixture_job(
+                        job_id="gate3c-powershell-fresh",
+                        intake_source="ac2_local_gate3c",
+                        payload_hash="hash-powershell-fresh",
+                        submitted_member_no_base64_utf8=encoded_value,
+                    )
+                ],
+            )
+            base_args = [
+                "--enable-local-bridge-runtime-review",
+                "--pending-jsonl",
+                str(pending_path),
+                "--results-jsonl",
+                str(results_path),
+                "--processed-dir",
+                str(processed_dir),
+                "--failed-dir",
+                str(failed_dir),
+                "--lookup-mode",
+                "powershell",
+                "--enable-powershell-lookup",
+                "--powershell-exe",
+                str(fake_powershell),
+                "--lookup-script",
+                str(fake_lookup_script),
+            ]
+
+            fresh = self.run_gate3c_runtime(base_args)
+
+            self.assertEqual(fresh.returncode, 0, fresh.stderr)
+            fresh_evidence = parse_key_value_evidence(fresh.stdout)
+            self.assertEqual(fresh_evidence["status"], "ok")
+            self.assertEqual(fresh_evidence["lookup_mode"], "powershell")
+            self.assertEqual(fresh_evidence["powershell_lookup_enabled"], "true")
+            self.assertEqual(fresh_evidence["pending_rows_loaded_count"], "1")
+            self.assertEqual(fresh_evidence["lookup_attempt_count"], "1")
+            self.assertEqual(fresh_evidence["lookup_success_count"], "1")
+            self.assertEqual(fresh_evidence["lookup_error_count"], "0")
+            self.assertEqual(fresh_evidence["processed_or_archived_count"], "1")
+            self.assertEqual(fresh_evidence["failed_or_dead_letter_count"], "0")
+            self.assertEqual(fresh_evidence["duplicate_or_already_processed_count"], "0")
+
+            duplicate = self.run_gate3c_runtime(base_args)
+
+            self.assertEqual(duplicate.returncode, 0, duplicate.stderr)
+            duplicate_evidence = parse_key_value_evidence(duplicate.stdout)
+            self.assertEqual(duplicate_evidence["status"], "already_processed")
+            self.assertEqual(duplicate_evidence["pending_rows_loaded_count"], "1")
+            self.assertEqual(duplicate_evidence["lookup_attempt_count"], "0")
+            self.assertEqual(duplicate_evidence["lookup_success_count"], "0")
+            self.assertEqual(duplicate_evidence["lookup_error_count"], "0")
+            self.assertEqual(duplicate_evidence["processed_or_archived_count"], "0")
+            self.assertEqual(duplicate_evidence["failed_or_dead_letter_count"], "0")
+            self.assertEqual(duplicate_evidence["duplicate_or_already_processed_count"], "1")
+            self.assertEqual(len(results_path.read_text(encoding="utf-8").splitlines()), 1)
+
+            for forbidden in [
+                raw_member_value,
+                encoded_value,
+                "submitted_member_no_base64_utf8",
+                "normalized-member-fixture-private",
+                "Forbidden Person",
+                "forbidden@example.test",
+                "61234567",
+                "2000-01-01",
+                "AC2_PROBE_PASSWORD",
+                "stdout",
+                "stderr",
+            ]:
+                self.assertNotIn(forbidden, duplicate.stdout)
+
     def test_gate3c_runtime_empty_pending_file_is_no_work_not_pass_evidence(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -1344,6 +1452,9 @@ class BridgeWorkerStaticGuardrailTests(unittest.TestCase):
             "lookup_error_count = 0",
             "failed_or_dead_letter_count = 0",
             "`status = no_work` is not Gate 3C pass evidence.",
+            "`status = already_processed` is not fresh Gate 3C AC2 lookup pass evidence.",
+            "Duplicate-only evidence proves local idempotency only.",
+            "duplicate_or_already_processed_count >= 1",
         ]:
             self.assertIn(phrase, combined)
 
