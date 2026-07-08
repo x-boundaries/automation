@@ -11,13 +11,19 @@ Google Forms / Google Sheets are a temporary UAT intake surface only. The bridge
 Preferred flow:
 
 ```text
-n8n validates form row -> n8n queues PENDING_LOOKUP -> Windows bridge polls outbound
-Windows bridge runs read-only lookup -> bridge posts sanitized result -> n8n routes review state
+n8n validates form row -> n8n queues PENDING_LOOKUP to protected queue API
+Windows bridge polls queue API outbound over HTTPS -> bridge claims one job
+Windows bridge runs read-only lookup locally -> bridge posts sanitized result
+n8n reads/routes review state
 ```
 
 Cloud n8n cannot directly run local AC2 PowerShell. n8n Execute Command runs on the n8n host/container where n8n runs, not on the AutoCount host. A cloud/VPS/non-AC2 Execute Command node is therefore invalid for AC2 member lookup.
 
 Hosting n8n on the AutoCount host was useful for local proof work, but it is not the final architecture for this lookup bridge.
+
+Future development and integration may use Cloudflare Tunnel / reverse proxy for a narrow protected queue/API surface over HTTPS. For development, the queue API may run on the operator local dev PC behind `cloudflared`. That tunnel may expose only sanitized queue/result API operations and must not expose AC2, AutoCount, PowerShell, SQL, RDP, or member create/update/delete/write paths.
+
+Any future tunneled queue/API surface must require Cloudflare Access/service-token or equivalent machine authentication, rate limits, audit logging, a least-privilege request/response schema, and a documented rollback/disable procedure. Real tunnel config, URLs, account IDs, Access client IDs/secrets, service tokens, credentials, and secrets must stay outside Git and outside pasted evidence.
 
 ## Allowed Request Fields
 
@@ -118,7 +124,7 @@ Forbidden response fields are the same as forbidden request fields. The response
 | State | Owner | Meaning |
 | --- | --- | --- |
 | `PENDING_LOOKUP` | n8n | Job is queued for review-only duplicate lookup. |
-| `LOOKUP_IN_PROGRESS` | Bridge/queue | Job is leased or being processed. |
+| `LOOKUP_IN_PROGRESS` | Bridge/queue | Bridge has claimed exactly one job using lease metadata before local lookup. |
 | `LOOKUP_ERROR_REVIEW` | Bridge/n8n | Timeout, process failure, invalid JSON, schema mismatch, sanitized lookup error, retry exhaustion, or unexpected shape. |
 | `MANUAL_REVIEW_REQUIRED` | Bridge/n8n | Lookup or normalization requires human review. |
 | `EXISTING_MEMBER_REVIEW` | Bridge/n8n | Lookup found an existing AC2 member number. |
@@ -142,8 +148,8 @@ Evaluate routes in this order:
 ## Timeout, Retry, And Idempotency
 
 - n8n must assign a stable `job_id` or non-PII `intake_id`.
-- The queue should lease one `PENDING_LOOKUP` job to one bridge instance at a time.
-- If a bridge lease expires, the job may retry until the configured retry limit.
+- The queue API should atomically claim one `PENDING_LOOKUP` job at a time by moving it to `LOOKUP_IN_PROGRESS` with non-PII lease metadata.
+- If a bridge lease expires, a timeout/retry sweep may return the job to `PENDING_LOOKUP` with incremented attempt metadata until the configured retry limit.
 - Retry exhaustion routes to `LOOKUP_ERROR_REVIEW`.
 - Same idempotency key plus same payload hash should return the prior sanitized result.
 - Same idempotency key plus different payload hash should be blocked for review.
@@ -166,6 +172,6 @@ Allowed review outputs are row number, job id if non-PII, decision code, sanitiz
 
 ## Blocked Surfaces
 
-This contract does not permit AutoCount writes, final write automation, direct database write paths, production workflow activation, public inbound webhooks to the AutoCount host, or an enabled/import-ready n8n workflow artifact.
+This contract does not permit AutoCount writes, final write automation, direct database write paths, production workflow activation, direct POST to the AC2 bridge, public inbound webhooks to the AutoCount host, direct tunnels to AC2/AutoCount/PowerShell/SQL/RDP/member-write paths, a `/sync` write endpoint, member create/update/delete, or an enabled/import-ready n8n workflow artifact. A protected queue/API behind Cloudflare Tunnel / reverse proxy is allowed only for sanitized queue/result operations.
 
 Real create/update automation remains blocked pending a separate PR, explicit business approval, idempotency, consent/audit handling, write guardrails, and an activation plan.

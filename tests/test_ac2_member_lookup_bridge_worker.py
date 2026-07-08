@@ -10,11 +10,15 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "ac2_member_lookup_bridge_worker.py"
+GATE3B_PREP_SCRIPT = ROOT / "scripts" / "member_lookup_gate3b_prepare_local_queue.py"
+GATE3B_SUMMARY_SCRIPT = ROOT / "scripts" / "member_lookup_gate3b_evidence_summary.py"
 README = ROOT / "README.md"
 GITIGNORE = ROOT / ".gitignore"
 DOCS = ROOT / "docs" / "autocount2-automation"
 BRIDGE_RUNBOOK = DOCS / "member_intake_local_lookup_bridge_runbook.md"
 NODE_CONTRACT = DOCS / "member_intake_n8n_node_contract.md"
+BRIDGE_DESIGN = DOCS / "member_intake_local_bridge_design.md"
+UAT_PLAN = DOCS / "member_intake_n8n_lookup_bridge_uat_plan.md"
 
 
 ENCODED_SYNTHETIC_VALUE = base64.b64encode(
@@ -131,6 +135,23 @@ class BridgeWorkerCliTests(unittest.TestCase):
     def run_cli(self, arguments):
         return subprocess.run(
             [sys.executable, str(SCRIPT)] + arguments,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+    def run_gate3b_prep(self, arguments, *, input_text=None):
+        return subprocess.run(
+            [sys.executable, str(GATE3B_PREP_SCRIPT)] + arguments,
+            input=input_text,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+    def run_gate3b_summary(self, arguments):
+        return subprocess.run(
+            [sys.executable, str(GATE3B_SUMMARY_SCRIPT)] + arguments,
             text=True,
             capture_output=True,
             check=False,
@@ -489,6 +510,190 @@ class BridgeWorkerCliTests(unittest.TestCase):
             self.assertEqual(summary["error_code"], "powershell_lookup_opt_in_required")
             self.assertFalse(results_path.exists())
 
+    def test_gate3b_queue_helper_writes_one_row_and_prints_no_member_values(self):
+        raw_member_value = "MEMBER-FIXTURE-VALUE"
+        encoded_member_value = base64.b64encode(raw_member_value.encode("utf-8")).decode("ascii")
+        with tempfile.TemporaryDirectory() as tmp:
+            queue_path = Path(tmp) / "member_lookup_bridge_gate3b_pending_queue.jsonl"
+
+            completed = self.run_gate3b_prep(
+                [
+                    "--member-value-stdin",
+                    "--queue-jsonl",
+                    str(queue_path),
+                ],
+                input_text=raw_member_value,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            self.assertEqual(summary["status"], "ok")
+            self.assertEqual(summary["gate"], "gate3b_ac2_local_bridge_readiness_queue_prep")
+            self.assertTrue(summary["queue_file_written"])
+            self.assertEqual(summary["queue_row_count"], 1)
+            self.assertEqual(summary["encoded_present_count"], 1)
+            self.assertTrue(summary["no_row_values_printed"])
+            self.assertFalse(summary["n8n_required"])
+            self.assertFalse(summary["google_sheets_required"])
+            self.assertTrue(summary["dry_run_only"])
+            self.assertFalse(summary["final_write_automation"])
+            self.assertNotIn(raw_member_value, completed.stdout)
+            self.assertNotIn(encoded_member_value, completed.stdout)
+            self.assertEqual(completed.stderr, "")
+
+            rows = [json.loads(line) for line in queue_path.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(len(rows), 1)
+            row = rows[0]
+            self.assertEqual(set(row), ALLOWED_QUEUE_FIELDS)
+            self.assertEqual(row["state"], "PENDING_LOOKUP")
+            self.assertEqual(row["intake_source"], "ac2_local_gate3b")
+            self.assertEqual(row["row_number"], 1)
+            self.assertEqual(row["pdpa_status"], "yes")
+            self.assertEqual(row["submitted_member_no_base64_utf8"], encoded_member_value)
+            self.assertNotIn(raw_member_value, queue_path.read_text(encoding="utf-8"))
+
+    def test_gate3b_queue_helper_error_output_is_aggregate_only(self):
+        raw_member_value = "MEMBER-FIXTURE-VALUE"
+
+        completed = self.run_gate3b_prep(
+            [
+                "--member-value-stdin",
+                "--queue-jsonl",
+                "",
+            ],
+            input_text=raw_member_value,
+        )
+
+        self.assertEqual(completed.returncode, 2)
+        summary = json.loads(completed.stdout)
+        self.assertEqual(summary["status"], "error")
+        self.assertFalse(summary["queue_file_written"])
+        self.assertEqual(summary["queue_row_count"], 0)
+        self.assertEqual(summary["encoded_present_count"], 0)
+        self.assertTrue(summary["no_row_values_printed"])
+        self.assertNotIn(raw_member_value, completed.stdout)
+
+    def test_gate3b_summary_prints_local_bridge_readiness_evidence_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            results_path = Path(tmp) / "member_lookup_bridge_gate3b_results.jsonl"
+            write_jsonl(
+                results_path,
+                [
+                    result_envelope := {
+                        "job_id": "gate3b-local-safe",
+                        "intake_source": "ac2_local_gate3b",
+                        "source_reference": "gate3b-local-one-row",
+                        "source_row_ref": "local-one-row",
+                        "row_number": 1,
+                        "state": "MANUAL_REVIEW_REQUIRED",
+                        "status": "ok",
+                        "authentication_success": True,
+                        "user_session_available": True,
+                        "member_command_found": True,
+                        "get_member_found": True,
+                        "submitted_member_no_status": "manual_review",
+                        "normalized_member_no_length": 0,
+                        "member_exists": False,
+                        "member_found_by": None,
+                        "manual_review_required": True,
+                        "warning_count": 1,
+                        "error_code": None,
+                        "consent_status": "operator_supplied_test",
+                        "pdpa_status": "yes",
+                        "attempt": 0,
+                        "dry_run_only": True,
+                        "final_write_automation": False,
+                        "result_created_at": "fixture-time",
+                        "result_applied_at": None,
+                    }
+                ],
+            )
+            self.assertEqual(set(result_envelope), ALLOWED_RESULT_FIELDS)
+
+            completed = self.run_gate3b_summary(
+                [
+                    "--results-jsonl",
+                    str(results_path),
+                    "--local-queue-row-count",
+                    "1",
+                    "--local-queue-rows-loaded-count",
+                    "1",
+                ]
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            evidence = {}
+            for line in completed.stdout.splitlines():
+                key, value = line.split(" = ", 1)
+                evidence[key] = value
+            self.assertEqual(evidence["status"], "ok")
+            self.assertEqual(evidence["gate"], "gate3b_ac2_local_bridge_readiness")
+            self.assertEqual(evidence["runtime_location"], "windows_ac2_bridge_host_only")
+            self.assertEqual(evidence["execution_mode"], "manual_local_one_row_read_only_lookup")
+            self.assertEqual(evidence["local_queue_row_count"], "1")
+            self.assertEqual(evidence["local_queue_rows_loaded_count"], "1")
+            self.assertEqual(evidence["lookup_attempt_count"], "1")
+            self.assertEqual(evidence["lookup_success_count"], "1")
+            self.assertEqual(evidence["lookup_manual_review_count"], "1")
+            self.assertEqual(evidence["lookup_error_count"], "0")
+            self.assertEqual(evidence["n8n_required"], "false")
+            self.assertEqual(evidence["n8n_involved"], "false")
+            self.assertEqual(evidence["google_sheets_required"], "false")
+            self.assertEqual(evidence["hosted_or_vps_service_called"], "false")
+            self.assertEqual(evidence["scheduler_enabled"], "false")
+            self.assertEqual(evidence["public_inbound_to_ac2_host"], "false")
+            self.assertEqual(evidence["member_create_or_update_invoked"], "false")
+            self.assertEqual(evidence["autocount_write_attempted"], "false")
+            self.assertEqual(evidence["direct_sql_write_attempted"], "false")
+            self.assertEqual(evidence["final_write_automation"], "false")
+            self.assertEqual(evidence["no_row_values_printed"], "true")
+
+            for forbidden in [
+                "job_id",
+                "gate3b-local-safe",
+                "source_reference",
+                "source_row_ref",
+                "row_number",
+                "submitted_member_no_base64_utf8",
+                "fixture-time",
+            ]:
+                self.assertNotIn(forbidden, completed.stdout)
+
+    def test_gate3b_summary_marks_needs_fix_for_count_mismatch_or_lookup_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            results_path = Path(tmp) / "member_lookup_bridge_gate3b_results.jsonl"
+            write_jsonl(
+                results_path,
+                [
+                    {
+                        "state": "LOOKUP_ERROR_REVIEW",
+                        "status": "error",
+                        "dry_run_only": True,
+                        "final_write_automation": False,
+                    }
+                ],
+            )
+
+            completed = self.run_gate3b_summary(
+                [
+                    "--results-jsonl",
+                    str(results_path),
+                    "--local-queue-row-count",
+                    "1",
+                    "--local-queue-rows-loaded-count",
+                    "0",
+                ]
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            evidence = {}
+            for line in completed.stdout.splitlines():
+                key, value = line.split(" = ", 1)
+                evidence[key] = value
+            self.assertEqual(evidence["status"], "needs_fix")
+            self.assertEqual(evidence["lookup_error_count"], "1")
+            self.assertEqual(evidence["direct_sql_write_attempted"], "false")
+
 
 class BridgeWorkerStaticGuardrailTests(unittest.TestCase):
     def recorded_gate3_evidence(self):
@@ -565,6 +770,257 @@ class BridgeWorkerStaticGuardrailTests(unittest.TestCase):
         self.assertRegex(combined, r"(?i)never writes to AutoCount|never writes to AutoCount")
         self.assertRegex(combined, r"(?i)dry_run_only")
         self.assertRegex(combined, r"(?i)final_write_automation")
+
+    def test_gate3b_docs_define_ac2_side_local_bridge_readiness_not_gate4a_or_n8n(self):
+        readme = README.read_text(encoding="utf-8")
+        bridge_runbook = BRIDGE_RUNBOOK.read_text(encoding="utf-8")
+        node_contract = NODE_CONTRACT.read_text(encoding="utf-8")
+        combined = "\n".join([readme, bridge_runbook, node_contract])
+
+        for phrase in [
+            "Gate 3B AC2 Local Bridge Readiness",
+            "AC2-side local bridge readiness only",
+            "This is not Gate 4A",
+            "not n8n evidence",
+            "not Google Sheets evidence",
+            "local one-row ignored queue JSONL",
+            "scripts/ac2_member_lookup_bridge_worker.py",
+            "read-only PowerShell lookup",
+            "local sanitized result JSONL",
+            "aggregate-only evidence summary",
+            "scripts/member_lookup_gate3b_prepare_local_queue.py",
+            "scripts/member_lookup_gate3b_evidence_summary.py",
+            "member_lookup_bridge_gate3b_pending_queue.jsonl",
+            "member_lookup_bridge_gate3b_results.jsonl",
+            "does not require or use n8n",
+            "Google Sheets",
+            "hosted n8n",
+            "scheduler",
+            "webhook",
+            "result mapping",
+            "Gate 3B proves only",
+            "does not approve Gate 4A",
+        ]:
+            self.assertIn(phrase, combined)
+
+        for evidence_field in [
+            "gate = gate3b_ac2_local_bridge_readiness",
+            "runtime_location = windows_ac2_bridge_host_only",
+            "execution_mode = manual_local_one_row_read_only_lookup",
+            "local_queue_row_count = <aggregate-count-only>",
+            "local_queue_rows_loaded_count = <aggregate-count-only>",
+            "lookup_attempt_count = <aggregate-count-only>",
+            "lookup_success_count = <aggregate-count-only>",
+            "lookup_ready_for_create_review_count = <aggregate-count-only>",
+            "lookup_existing_member_review_count = <aggregate-count-only>",
+            "lookup_manual_review_count = <aggregate-count-only>",
+            "lookup_error_count = <aggregate-count-only>",
+            "n8n_required = false",
+            "n8n_involved = false",
+            "google_sheets_required = false",
+            "hosted_or_vps_service_called = false",
+            "scheduler_enabled = false",
+            "public_inbound_to_ac2_host = false",
+            "member_create_or_update_invoked = false",
+            "autocount_write_attempted = false",
+            "direct_sql_write_attempted = false",
+            "final_write_automation = false",
+            "no_row_values_printed = true",
+        ]:
+            self.assertIn(evidence_field, bridge_runbook)
+
+        self.assertRegex(bridge_runbook, r"(?i)Do not paste.*raw.*encoded.*decoded.*normalized")
+        self.assertRegex(bridge_runbook, r"(?i)Keep `member_lookup_bridge_gate3b_pending_queue\.jsonl` and `member_lookup_bridge_gate3b_results\.jsonl` local and ignored")
+        self.assertNotRegex(bridge_runbook, r"https://docs\.google\.com/spreadsheets/d/")
+        self.assertNotRegex(bridge_runbook, r"submitted_member_no_base64_utf8\"\s*:\s*\"[A-Za-z0-9+/]+=*\"")
+
+    def test_gate3b_docs_state_n8n_needs_no_ac2_env_and_bridge_host_owns_runtime(self):
+        bridge_runbook = BRIDGE_RUNBOOK.read_text(encoding="utf-8")
+
+        for phrase in [
+            "n8n may later run on a dev PC, VPS, hosted machine, or other non-AC2 environment",
+            "n8n does not need AC2 environment variables, AutoCount assemblies, direct SQL access, or local PowerShell execution",
+            "Only the Windows AC2 bridge host has AC2 environment variables and the AutoCount runtime",
+            "n8n writes sanitized PENDING_LOOKUP jobs to the queue API",
+            "AC2 bridge polls/reads the queue API outbound over HTTPS",
+            "AC2 bridge claims one job at a time using state/lease fields",
+            "AC2 bridge writes sanitized results back to the queue API",
+            "n8n reads/routes the sanitized result",
+            "Hosted/cloud/VPS n8n must not use Execute Command for AC2 lookup",
+            "no public inbound webhook, tunnel, or reverse proxy may expose the AC2 host",
+        ]:
+            self.assertIn(phrase, bridge_runbook)
+
+    def test_future_cloudflared_queue_api_is_allowed_but_direct_ac2_tunnels_are_forbidden(self):
+        combined = "\n".join(
+            [
+                BRIDGE_RUNBOOK.read_text(encoding="utf-8"),
+                NODE_CONTRACT.read_text(encoding="utf-8"),
+                BRIDGE_DESIGN.read_text(encoding="utf-8"),
+                UAT_PLAN.read_text(encoding="utf-8"),
+            ]
+        )
+
+        for phrase in [
+            "Cloudflare Tunnel / reverse proxy may front that queue/API surface",
+            "Cloudflare Tunnel / reverse proxy may be used for development and likely integration only for a narrow protected queue/API surface over HTTPS",
+            "the queue API may run on the operator local dev PC behind `cloudflared`",
+            "allowed as future/dev architecture",
+            "protected queue/API surface",
+            "sanitized queue/result operations",
+            "Cloudflare Access/service-token or equivalent machine authentication",
+            "rate limits",
+            "audit logging",
+            "least-privilege request/response schema",
+            "documented rollback/disable procedure",
+        ]:
+            self.assertIn(phrase, combined)
+
+        for phrase in [
+            "never exposes AC2, AutoCount, PowerShell, SQL, RDP, or member write paths",
+            "must not expose AC2, AutoCount, PowerShell, SQL, RDP, or member create/update/delete/write paths",
+            "direct tunnel access to AC2, AutoCount, PowerShell, SQL, RDP, or member write paths remains forbidden",
+            "direct tunnel to AC2, AutoCount, PowerShell, SQL, RDP, or member write paths",
+        ]:
+            self.assertIn(phrase, combined)
+
+    def test_bridge_design_replaces_stale_direct_post_flow_with_queue_polling(self):
+        bridge_design = BRIDGE_DESIGN.read_text(encoding="utf-8")
+
+        for phrase in [
+            "## Current Queue/Polling Request Flow",
+            "n8n writes sanitized PENDING_LOOKUP jobs to the protected queue/API",
+            "AC2 bridge polls the queue/API outbound over HTTPS",
+            "AC2 bridge claims one job with state/lease fields",
+            "AC2 bridge runs read-only AutoCount lookup locally",
+            "AC2 bridge posts sanitized result back",
+            "n8n reads/routes sanitized result",
+            "PR #90 does not approve direct POST to the AC2 bridge",
+            "a direct tunneled endpoint to AC2/AutoCount/PowerShell/SQL/RDP",
+            "a `/sync` write endpoint",
+            "member create/update/delete",
+            "AutoCount writes",
+            "production activation",
+        ]:
+            self.assertIn(phrase, bridge_design)
+
+        for stale_phrase in [
+            "HTTP POST /member-intake/dry-run",
+            "HTTP POST /member-intake/sync",
+            "/member-intake/dry-run",
+            "/member-intake/sync",
+            "Only the dry-run endpoint is in scope for the first implementation",
+            "live sync endpoint is a future design placeholder",
+        ]:
+            self.assertNotIn(stale_phrase, bridge_design)
+
+    def test_gate3b_stays_local_only_without_queue_api_cloudflared_or_hosted_services(self):
+        bridge_runbook = BRIDGE_RUNBOOK.read_text(encoding="utf-8")
+
+        for phrase in [
+            "Gate 3B does not require or use n8n, Google Sheets, hosted n8n, a queue API, Cloudflare Tunnel, `cloudflared`, a hosted service",
+            "does not approve Gate 4A",
+            "queue API use",
+            "Cloudflare Tunnel / `cloudflared` use",
+            "hosted/VPS runtime readiness",
+        ]:
+            self.assertIn(phrase, bridge_runbook)
+
+    def test_queue_api_polling_uses_outbound_https_claims_and_retry_semantics(self):
+        combined = "\n".join(
+            [
+                BRIDGE_RUNBOOK.read_text(encoding="utf-8"),
+                NODE_CONTRACT.read_text(encoding="utf-8"),
+                BRIDGE_DESIGN.read_text(encoding="utf-8"),
+                UAT_PLAN.read_text(encoding="utf-8"),
+            ]
+        )
+
+        for phrase in [
+            "AC2 bridge polls the queue API outbound over HTTPS",
+            "AC2 bridge claims one job at a time with state/lease fields",
+            "AC2 bridge runs read-only AutoCount lookup locally",
+            "AC2 bridge posts sanitized result back to the queue API over HTTPS",
+            "n8n reads/routes the sanitized result",
+            "moving it to `LOOKUP_IN_PROGRESS` with lease metadata",
+            "If the `LOOKUP_IN_PROGRESS` lease expires before a result is posted",
+            "return the job to `PENDING_LOOKUP` with incremented attempt metadata",
+            "Retry exhaustion routes to `LOOKUP_ERROR_REVIEW`",
+            "For UAT, polling may be manual or Windows Task Scheduler every 1 minute",
+            "For production, prefer a long-running Windows service/worker polling every 15-60 seconds with idle backoff",
+            "Hourly polling is too slow for the intake duplicate-check flow and should not be the default",
+        ]:
+            self.assertIn(phrase, combined)
+
+    def test_cloudflare_architecture_docs_do_not_contain_real_endpoint_or_secret_literals(self):
+        combined = "\n".join(
+            [
+                BRIDGE_RUNBOOK.read_text(encoding="utf-8"),
+                NODE_CONTRACT.read_text(encoding="utf-8"),
+                BRIDGE_DESIGN.read_text(encoding="utf-8"),
+                UAT_PLAN.read_text(encoding="utf-8"),
+            ]
+        )
+
+        self.assertNotRegex(combined, r"https?://")
+        self.assertNotRegex(combined, r"(?i)\b[a-z0-9-]+\.trycloudflare\.com\b")
+        self.assertNotRegex(combined, r"(?i)\b[a-z0-9-]+\.cloudflareaccess\.com\b")
+        self.assertNotRegex(combined, r"(?i)cloudflare\s+account\s+id\s*[:=]")
+        self.assertNotRegex(combined, r"(?i)access\s+client\s+id\s*[:=]")
+        self.assertNotRegex(combined, r"(?i)access\s+client\s+secret\s*[:=]")
+        self.assertNotRegex(combined, r"(?i)service\s+token\s*[:=]\s*['\"][^'\"]+['\"]")
+        self.assertNotRegex(combined, r"(?i)cloudflared\s+tunnel\s+--url")
+        self.assertNotRegex(combined, r"(?i)tunnel\s+token\s*[:=]")
+        self.assertNotRegex(combined, r"(?i)(server|database|user|password)\s*[:=]\s*['\"][^'\"]+['\"]")
+        self.assertNotRegex(combined, r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b")
+        self.assertNotRegex(combined, r"(?i)\b(?:\+?65)?[689]\d{7}\b")
+        self.assertNotRegex(combined, r"(?i)\b(stdin|stdout|stderr)\s*=")
+        self.assertNotRegex(combined, r"submitted_member_no_base64_utf8\"\s*:\s*\"[A-Za-z0-9+/]+=*\"")
+
+    def test_gate3b_scripts_and_docs_do_not_authorize_write_or_direct_sql_paths(self):
+        combined = "\n".join(
+            [
+                GATE3B_PREP_SCRIPT.read_text(encoding="utf-8"),
+                GATE3B_SUMMARY_SCRIPT.read_text(encoding="utf-8"),
+                BRIDGE_RUNBOOK.read_text(encoding="utf-8"),
+                README.read_text(encoding="utf-8"),
+            ]
+        )
+
+        for token in FORBIDDEN_WRITE_TOKENS:
+            self.assertNotIn(token, combined, token)
+        self.assertNotRegex(
+            combined,
+            r"(?i)\b(SELECT\s+\*|INSERT\s+INTO|UPDATE\s+\w+\s+SET|DELETE\s+FROM|MERGE\s+INTO)\b",
+        )
+        self.assertRegex(combined, r"(?i)does not create, update, delete, or otherwise write AutoCount members")
+        self.assertRegex(combined, r"(?i)does not perform direct SQL writes")
+
+    def test_gate3b_generated_local_queue_and_result_artifacts_are_ignored(self):
+        gitignore = GITIGNORE.read_text(encoding="utf-8")
+
+        for ignored_name in [
+            "member_lookup_bridge_gate3b_pending_queue.jsonl",
+            "member_lookup_bridge_gate3b_results.jsonl",
+            "autocount_outputs/**/member_lookup_bridge_gate3b_pending_queue.jsonl",
+            "autocount_outputs/**/member_lookup_bridge_gate3b_results.jsonl",
+        ]:
+            self.assertIn(ignored_name, gitignore)
+
+        for ignored_path in [
+            "member_lookup_bridge_gate3b_pending_queue.jsonl",
+            "member_lookup_bridge_gate3b_results.jsonl",
+            "autocount_outputs/review/member_lookup_bridge/member_lookup_bridge_gate3b_pending_queue.jsonl",
+            "autocount_outputs/review/member_lookup_bridge/member_lookup_bridge_gate3b_results.jsonl",
+        ]:
+            completed = subprocess.run(
+                ["git", "check-ignore", ignored_path],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, ignored_path)
 
     def test_local_fixture_uat_runbook_defines_sanitized_operator_evidence_only(self):
         readme = README.read_text(encoding="utf-8")

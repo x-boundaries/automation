@@ -10,17 +10,24 @@ The bridge is a future local adapter that receives an already validated, manuall
 
 - Run on the AutoCount server or a locked-down Windows host near the AutoCount Accounting 2.x installation.
 - Bind to `localhost` by default.
-- If n8n is on a separate host, expose only through a private network allowlist, reverse proxy, VPN, or equivalent controlled path.
-- Do not expose the bridge publicly.
+- Do not expose the AC2 bridge publicly.
+- If n8n is on a separate host, use a protected queue/API surface between n8n and the bridge; the bridge polls that API outbound over HTTPS.
+- Cloudflare Tunnel / reverse proxy may be used for the protected queue/API surface in development and likely integration, including a queue API running on the operator local dev PC behind `cloudflared`.
+- The tunnel or reverse proxy must not expose AC2, AutoCount, PowerShell, SQL, RDP, or member create/update/delete/write paths.
+- Any future tunneled queue/API surface must require Cloudflare Access/service-token or equivalent machine authentication, rate limits, audit logging, a least-privilege request/response schema, and a documented rollback/disable procedure.
 
-## Request Flow
+## Current Queue/Polling Request Flow
 
 ```text
-n8n approved row -> HTTP POST /member-intake/dry-run -> bridge validation -> proposed AutoCount payload
-n8n approved row -> HTTP POST /member-intake/sync -> bridge writes only after separate approval
+n8n writes sanitized PENDING_LOOKUP jobs to the protected queue/API
+AC2 bridge polls the queue/API outbound over HTTPS
+AC2 bridge claims one job with state/lease fields
+AC2 bridge runs read-only AutoCount lookup locally
+AC2 bridge posts sanitized result back
+n8n reads/routes sanitized result
 ```
 
-Only the dry-run endpoint is in scope for the first implementation. The live sync endpoint is a future design placeholder and must stay disabled until approved.
+PR #90 does not approve direct POST to the AC2 bridge, a direct tunneled endpoint to AC2/AutoCount/PowerShell/SQL/RDP, a `/sync` write endpoint, member create/update/delete, AutoCount writes, or production activation.
 
 ## Bridge Responsibilities
 
@@ -202,11 +209,14 @@ Business rules:
 Runtime direction:
 
 - Cloud/VPS/non-AC2 n8n is the preferred orchestration brain for duplicate lookup review.
-- The Windows AC2 lookup bridge should poll outbound for queued lookup jobs and call `scripts/ac2_member_lookup_review.ps1` locally. This avoids hosting n8n on the AutoCount host as the final architecture.
+- The Windows AC2 lookup bridge should poll a protected queue/API outbound over HTTPS for queued lookup jobs and call `scripts/ac2_member_lookup_review.ps1` locally. This avoids hosting n8n on the AutoCount host as the final architecture.
+- n8n writes sanitized `PENDING_LOOKUP` jobs to the queue API; the bridge claims one job at a time by moving it to `LOOKUP_IN_PROGRESS` with lease metadata; the bridge posts sanitized review results back; n8n reads/routes those sanitized results.
+- For UAT, polling may be manual or Windows Task Scheduler every 1 minute. For production, prefer a long-running Windows service/worker polling every 15-60 seconds with idle backoff. Hourly polling is too slow for intake duplicate-check flow and should not be the default.
 - Sanitized JSONL remains useful for offline tests and decision-review rehearsal, but the long-term runtime interface is a queue plus sanitized bridge results.
 - Cloud n8n cannot call local AC2 PowerShell directly, and n8n Execute Command runs on the n8n host/container where n8n runs, not on the AutoCount host.
 - The bridge should pass `MemberNoBase64Utf8`, not raw `MemberNo`, for Google Form values to reduce shell quoting and interpolation risk.
-- Inbound local webhooks, private tunnels, reverse proxies, or VPN callback paths are non-preferred and require separate approval; a public inbound webhook on the AutoCount host is not recommended.
+- Cloudflare Tunnel / reverse proxy is allowed only for the protected queue/API surface; direct inbound webhooks, private tunnels, reverse proxies, or VPN callback paths to the AC2 bridge host remain forbidden unless separately approved by a future security review. A public inbound webhook on the AutoCount host is not recommended.
+- Any protected queue/API behind Cloudflare Tunnel / reverse proxy must require Cloudflare Access/service-token or equivalent machine authentication, rate limits, audit logging, a least-privilege request/response schema, and a documented rollback/disable procedure.
 - `AC2_PROBE_PASSWORD` must be configured as a local environment secret, not passed in command arguments.
 - The script returns sanitized JSON only; n8n should parse status fields and route to lookup error review, manual review, existing member review, or ready-for-create review without performing any AutoCount write.
 
@@ -364,7 +374,7 @@ Principles:
 
 ## Rollback And Deactivation
 
-Before live sync exists, rollback is simple: stop the bridge and disable n8n calls.
+Before any production write automation exists, rollback for the lookup bridge is limited to disabling the queue/API surface, stopping the bridge worker/service, and disabling n8n queue/result workflows.
 
 For future live sync:
 
@@ -379,7 +389,10 @@ For future live sync:
 
 - bridge executable/service,
 - AutoCount DLL loading,
-- live sync endpoint,
+- direct POST endpoint to the AC2 bridge,
+- `/sync` write endpoint,
+- member create/update/delete,
+- AutoCount writes,
 - n8n production workflow,
 - real credentials/config,
 - direct database access,

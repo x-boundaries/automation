@@ -83,6 +83,80 @@ class MemberIntakeN8nDryRunDocsTests(unittest.TestCase):
         self.assertRegex(combined, r"(?i)public inbound webhook.*not recommended|not recommended.*public inbound webhook")
         self.assertRegex(combined, r"(?i)separate approval|separately approved")
 
+    def test_cloudflared_is_allowed_only_for_protected_queue_api(self):
+        combined = self.combined([UAT_PLAN, NODE_CONTRACT, BRIDGE_DESIGN, BRIDGE_RUNBOOK])
+
+        for phrase in [
+            "Cloudflare Tunnel / reverse proxy may be used for development and likely integration only for a narrow protected queue/API surface over HTTPS",
+            "the queue API may run on the operator local dev PC behind `cloudflared`",
+            "expose only sanitized queue/result API operations",
+            "must not expose AC2, AutoCount, PowerShell, SQL, RDP, or member create/update/delete/write paths",
+            "direct tunnel access to AC2, AutoCount, PowerShell, SQL, RDP, or member write paths remains forbidden",
+            "Cloudflare Access/service-token or equivalent machine authentication",
+            "rate limits",
+            "audit logging",
+            "least-privilege request/response schema",
+            "documented rollback/disable procedure",
+        ]:
+            self.assertIn(phrase, combined)
+
+    def test_local_bridge_design_has_no_obsolete_direct_post_or_sync_flow(self):
+        bridge_design = self.read(BRIDGE_DESIGN)
+
+        for phrase in [
+            "Current Queue/Polling Request Flow",
+            "n8n writes sanitized PENDING_LOOKUP jobs to the protected queue/API",
+            "AC2 bridge polls the queue/API outbound over HTTPS",
+            "AC2 bridge claims one job with state/lease fields",
+            "AC2 bridge runs read-only AutoCount lookup locally",
+            "AC2 bridge posts sanitized result back",
+            "n8n reads/routes sanitized result",
+            "PR #90 does not approve direct POST to the AC2 bridge",
+            "a `/sync` write endpoint",
+        ]:
+            self.assertIn(phrase, bridge_design)
+
+        for stale_phrase in [
+            "HTTP POST /member-intake/dry-run",
+            "HTTP POST /member-intake/sync",
+            "/member-intake/dry-run",
+            "/member-intake/sync",
+            "live sync endpoint is a future design placeholder",
+        ]:
+            self.assertNotIn(stale_phrase, bridge_design)
+
+    def test_queue_api_outbound_polling_claims_leases_and_cadence_are_documented(self):
+        combined = self.combined([UAT_PLAN, NODE_CONTRACT, BRIDGE_DESIGN, BRIDGE_RUNBOOK])
+
+        for phrase in [
+            "n8n writes sanitized PENDING_LOOKUP jobs to the queue API over HTTPS",
+            "AC2 bridge polls the queue API outbound over HTTPS",
+            "AC2 bridge claims one job at a time with state/lease fields",
+            "AC2 bridge runs read-only AutoCount lookup locally",
+            "AC2 bridge posts sanitized result back to the queue API over HTTPS",
+            "n8n reads/routes the sanitized result",
+            "PENDING_LOOKUP",
+            "LOOKUP_IN_PROGRESS",
+            "If the `LOOKUP_IN_PROGRESS` lease expires before a result is posted",
+            "Retry exhaustion routes to `LOOKUP_ERROR_REVIEW`",
+            "Windows Task Scheduler every 1 minute",
+            "long-running Windows service/worker polling every 15-60 seconds with idle backoff",
+            "Hourly polling is too slow",
+        ]:
+            self.assertIn(phrase, combined)
+
+    def test_gate3b_still_has_no_queue_api_cloudflared_or_hosted_service_requirement(self):
+        bridge_runbook = self.read(BRIDGE_RUNBOOK)
+
+        for phrase in [
+            "Gate 3B does not require or use n8n, Google Sheets, hosted n8n, a queue API, Cloudflare Tunnel, `cloudflared`, a hosted service",
+            "This is not Gate 4A",
+            "not n8n evidence",
+            "not Google Sheets evidence",
+            "does not approve Gate 4A",
+        ]:
+            self.assertIn(phrase, bridge_runbook)
+
     def test_docs_require_base64_member_input_and_explain_it_is_not_secret(self):
         combined = self.combined([WORKFLOW_DOC, NODE_CONTRACT, DIRECT_RUNBOOK, LOOKUP_RUNBOOK, BRIDGE_RUNBOOK])
 
