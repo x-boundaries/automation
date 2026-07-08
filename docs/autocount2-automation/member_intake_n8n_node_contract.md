@@ -35,11 +35,20 @@ n8n may queue only the minimum fields needed for review routing:
 | `submitted_member_no_base64_utf8` | Yes | Encoded submitted member value. Sensitive; never log or echo. |
 | `consent_status` | No | Optional separate consent/marketing category only; not a PDPA override. |
 | `pdpa_status` | Yes | Mandatory duplicate-check gate. Normalize current form `PDPA Acknowledged = Yes` to queue value `yes`; `Imported` is not consent. |
+| `payload_hash` | Yes | Hash of allowed request fields for idempotency checks. |
 | `attempt` | No | Nonnegative retry counter. |
+| `max_attempts` | No | Small retry cap for UAT/review routing. |
 | `created_at` | No | Queue metadata. |
-| `payload_hash` | No | Hash of allowed request fields for idempotency checks. |
+| `updated_at` | No | Queue metadata. |
+| `timeout_at` | No | Queue timeout for routing to lookup error review. |
 
 The queue request must not contain raw member values, normalized member values, names, emails, raw phone numbers, DOB, addresses, AutoCount internal identifiers, local AutoCount target details, credentials, connection strings, stderr, stdout, tokens, or arbitrary payload dumps.
+
+For Gate 4A real queue-write preparation, the first approved source batch is exactly one row. The source row must contain `Name`, the submitted phone/member number, `Email`, birthday when the current source includes birthday, and `PDPA Acknowledged = Yes`. n8n must normalize only the routing fields needed to append a sanitized queue row; it must not copy names, emails, raw phone numbers, birthday values, or raw submitted member values into the lookup queue.
+
+The Gate 4A real queue-write row must populate `job_id`, `intake_source`, `source_reference`, `source_row_ref`, `row_number`, `intake_id`, `state`, `submitted_member_no_base64_utf8`, `consent_status`, `pdpa_status`, `payload_hash`, `attempt`, `max_attempts`, `created_at`, `updated_at`, and `timeout_at`. It must not be a dummy Gate 2 rehearsal row, and `submitted_member_no_base64_utf8` must not be blank.
+
+Before bridge handoff, operators must reduce the queue-write check to aggregate-only counters: `queue_row_count = 1`, `queue_base64_decode_ok_count = 1`, `queue_base64_decode_fail_count = 0`, `queue_decoded_blank_count = 0`, and `queue_decoded_looks_dummy_count = 0`. These counters are queue-write prechecks only; they are not Gate 4A lookup evidence and do not authorize AC2 writes.
 
 ## Encoded Member Value
 
@@ -53,6 +62,8 @@ Before queueing, validate the encoded value:
 - it is not logged, persisted outside the lookup request, or written back to Google Sheets.
 
 Base64 is not encryption and is not secret. It is only a shell-safety measure for the local bridge and does not relax logging or data-handling rules.
+
+The decoded value must equal the submitted phone/member number that maps to AutoCount `MemberNo`. AutoCount `MobilePhone` is intentionally unused for this lookup path. The raw, encoded, decoded, and normalized values must never be committed, pasted, logged, or added to PR evidence.
 
 ## Bridge Lookup Invocation
 

@@ -304,6 +304,93 @@ class Gate4ARunbookTests(unittest.TestCase):
         self.assertNotRegex(runbook, r"(?i)real Google Sheets poller is implemented")
         self.assertNotRegex(runbook, r"(?i)production queue poller is implemented")
 
+    def test_runbook_stops_when_queue_contains_only_dummy_rehearsal_rows(self):
+        runbook = self.read(RUNBOOK)
+
+        for phrase in [
+            "The current lookup queue tab contains only dummy Gate 2 rehearsal rows",
+            "proved TSV-to-JSONL handoff mechanics only",
+            "must not be passed to AC2 lookup",
+            "must not be recorded as Gate 4A pass evidence",
+            "Stop before bridge handoff if the lookup queue tab contains only dummy Gate 2 rehearsal rows",
+            "The lookup queue tab does not contain only dummy Gate 2 rehearsal rows",
+            "Do not include dummy Gate 2 rehearsal rows",
+            "The lookup queue contains only dummy Gate 2 rehearsal rows",
+        ]:
+            self.assertIn(phrase, runbook)
+
+    def test_runbook_defines_real_one_row_queue_write_preparation(self):
+        runbook = self.read(RUNBOOK)
+
+        for phrase in [
+            "Gate 4A lookup may not start until the operator has first produced exactly one real, non-dummy, sanitized `PENDING_LOOKUP` queue row",
+            "This preparation gate is queue-write-only",
+            "does not run Gate 4A lookup",
+            "does not call AC2",
+            "does not run PowerShell",
+            "does not run the local bridge",
+            "does not run n8n result mapping",
+            "does not authorize any AutoCount write path",
+            "Initially this must be exactly one source row",
+            "Read exactly the tiny approved source batch, initially one row",
+            "Write only one sanitized non-dummy `PENDING_LOOKUP` queue row",
+            "AutoCount `MobilePhone` is intentionally unused",
+            "maps to AutoCount `MemberNo`",
+        ]:
+            self.assertIn(phrase, runbook)
+
+        for required_source_field in [
+            "`Name`",
+            "phone/member number field submitted by the user",
+            "`Email`",
+            "birthday field only when the current source includes birthday",
+            "`PDPA Acknowledged = Yes`",
+        ]:
+            self.assertIn(required_source_field, runbook)
+
+    def test_runbook_requires_pre_bridge_queue_checks_before_handoff(self):
+        runbook = self.read(RUNBOOK)
+
+        for phrase in [
+            "`queue_row_count = 1`",
+            "`queue_base64_decode_ok_count = 1`",
+            "`queue_base64_decode_fail_count = 0`",
+            "`queue_decoded_blank_count = 0`",
+            "`queue_decoded_looks_dummy_count = 0`",
+            "not as Gate 4A lookup evidence or Gate 4A pass evidence",
+            "one successful base64 decode",
+            "no decode failures",
+            "no blank decoded value",
+            "no dummy-looking decoded value",
+        ]:
+            self.assertIn(phrase, runbook)
+
+    def test_runbook_queue_row_contract_contains_required_real_fields(self):
+        runbook = self.read(RUNBOOK)
+
+        for field in [
+            "`job_id`",
+            "`intake_source`",
+            "`source_reference`",
+            "`source_row_ref`",
+            "`row_number`",
+            "`intake_id`",
+            "`state = PENDING_LOOKUP`",
+            "`submitted_member_no_base64_utf8`",
+            "`consent_status`",
+            "`pdpa_status = yes`",
+            "`payload_hash`",
+            "`attempt`",
+            "`max_attempts`",
+            "`created_at`",
+            "`updated_at`",
+            "`timeout_at`",
+        ]:
+            self.assertIn(field, runbook)
+
+        self.assertIn("must decode to the submitted phone/member number", runbook)
+        self.assertIn("raw, encoded, decoded, and normalized values must never be committed", runbook)
+
     def test_runbook_keeps_read_only_review_only_and_no_activation_boundaries(self):
         runbook = self.read(RUNBOOK)
 
