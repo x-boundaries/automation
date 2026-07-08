@@ -1,6 +1,6 @@
 # Member Intake Local Lookup Bridge Runbook
 
-Status: design and dry-run worker skeleton only. Gate 3 local lookup preflight and Gate 3B AC2 local bridge readiness passes recorded. This does not activate production automation and does not authorize AutoCount member writes.
+Status: design and dry-run worker skeleton only. Gate 3 local lookup preflight and Gate 3B AC2 local bridge readiness passes recorded. Gate 3C adds a local-only runtime hardening harness for repeated AC2 host test runs. This does not activate production automation and does not authorize AutoCount member writes.
 
 ## Purpose
 
@@ -549,6 +549,96 @@ no_row_values_printed = true
 This pass used one local synthetic/manual-review-shaped value. No row-level data, raw/encoded/decoded/normalized member values, names, emails, phone numbers, command transcripts, stderr/stdout, execution payloads, screenshots, credentials, Sheet IDs/URLs, or PII are recorded.
 
 Gate 3B proves only that the Windows AC2 bridge host can safely process one local queued lookup through the read-only lookup path and produce sanitized local result evidence. It does not approve Gate 4A, n8n setup, Google Sheets lookup queue use, queue API use, Cloudflare Tunnel / `cloudflared` use, hosted/VPS runtime readiness, result mapping, member create/update, AutoCount writes, direct SQL writes, scheduler activation, webhook activation, or final write automation.
+
+## Gate 3C AC2 Local Bridge Runtime Hardening
+
+Status: AC2-side local bridge runtime hardening only. This is not Gate 4A, not n8n evidence, not Google Sheets evidence, not a queue API, not hosted/VPS runtime readiness, not scheduler activation, and not final automation.
+
+Gate 3C wraps the existing read-only lookup bridge worker with local filesystem paths that can be run repeatedly on the AC2 machine before n8n exists:
+
+```text
+local ignored pending queue JSONL
+-> scripts/member_lookup_gate3c_local_bridge_runtime.py
+-> read-only PowerShell lookup through scripts/ac2_member_lookup_review.ps1
+-> local ignored sanitized results JSONL
+-> local ignored processed idempotency markers
+-> local ignored failed/dead-letter markers
+-> aggregate-only evidence
+```
+
+The local pending queue must use only the allowed bridge request fields. The harness rejects extra fields, forbidden sensitive fields, invalid PDPA status, invalid base64 shape, retry exhaustion, and idempotency payload-hash conflicts into local failed/dead-letter handling. It appends sanitized result rows only for newly handled jobs. Re-running the same pending file should count already handled jobs as duplicates instead of running lookup again or appending duplicate result rows.
+
+Gate 3C does not require or use n8n, Google Sheets, a queue API, Cloudflare Tunnel, `cloudflared`, a hosted service, a scheduler, a webhook, result mapping, a public inbound path, or final write automation. It also does not create, update, delete, or otherwise write AutoCount members, and it does not perform direct SQL writes.
+
+Mock mode is allowed only for local harness validation and automated tests. Mock-mode evidence is not Gate 3C AC2 runtime pass evidence.
+
+Operator local paths stay ignored under:
+
+```powershell
+$root = 'C:\XB\autocount_outputs\review\member_lookup_bridge'
+$pending = "$root\member_lookup_bridge_gate3c_pending_queue.jsonl"
+$results = "$root\member_lookup_bridge_gate3c_results.jsonl"
+$processed = "$root\member_lookup_bridge_gate3c_processed"
+$failed = "$root\member_lookup_bridge_gate3c_failed"
+```
+
+Exact operator run command for the manual local AC2 bridge runtime test:
+
+```powershell
+python scripts\member_lookup_gate3c_local_bridge_runtime.py `
+  --enable-local-bridge-runtime-review `
+  --pending-jsonl "$pending" `
+  --results-jsonl "$results" `
+  --processed-dir "$processed" `
+  --failed-dir "$failed" `
+  --lookup-mode powershell `
+  --enable-powershell-lookup `
+  --allow-root-login
+```
+
+Required Gate 3C paste-back shape:
+
+```text
+status = <ok/needs_fix/no_work/dry_run_only>
+gate = gate3c_ac2_local_bridge_runtime_hardening
+runtime_location = windows_ac2_bridge_host_only
+execution_mode = manual_local_filesystem_runtime_hardening
+lookup_mode = <mock/powershell>
+powershell_lookup_enabled = <true/false>
+pending_rows_loaded_count = <aggregate-count-only>
+lookup_attempt_count = <aggregate-count-only>
+lookup_success_count = <aggregate-count-only>
+lookup_error_count = <aggregate-count-only>
+processed_or_archived_count = <aggregate-count-only>
+failed_or_dead_letter_count = <aggregate-count-only>
+duplicate_or_already_processed_count = <aggregate-count-only>
+member_create_or_update_invoked = false
+autocount_write_attempted = false
+direct_sql_write_attempted = false
+final_write_automation = false
+n8n_required = false
+google_sheets_required = false
+hosted_or_vps_service_called = false
+scheduler_enabled = false
+public_inbound_to_ac2_host = false
+no_row_values_printed = true
+```
+
+Real Gate 3C AC2 runtime pass evidence requires all of the following:
+
+- `status = ok`
+- `lookup_mode = powershell`
+- `powershell_lookup_enabled = true`
+- `pending_rows_loaded_count >= 1`
+- for a fresh run, `lookup_attempt_count >= 1` and `lookup_success_count >= 1`
+- `lookup_error_count = 0`
+- `failed_or_dead_letter_count = 0`
+
+`status = no_work` means no pending rows were loaded. `status = no_work` is not Gate 3C pass evidence. `status = dry_run_only` means the harness ran without real PowerShell lookup evidence, such as mock mode, and is not Gate 3C pass evidence.
+
+Do not paste pending rows, result rows, processed markers, failed markers, raw member values, encoded member values, decoded member values, normalized member values, names, emails, phone numbers, birthday values, command transcripts, stderr/stdout transcripts, execution payloads, credentials, AC2 environment values, Sheet IDs/URLs, screenshots, or PII. Keep `member_lookup_bridge_gate3c_pending_queue.jsonl`, `member_lookup_bridge_gate3c_results.jsonl`, `member_lookup_bridge_gate3c_processed`, and `member_lookup_bridge_gate3c_failed` local and ignored.
+
+Gate 3C proves only that the Windows AC2 bridge host has a repeatable local queue/runtime contract with local idempotency and failed-job handling around the already-proven read-only lookup. It does not approve Gate 4A, n8n setup, Google Sheets lookup queue use, queue API use, Cloudflare Tunnel / `cloudflared` use, hosted/VPS runtime readiness, result mapping, member create/update, AutoCount writes, direct SQL writes, scheduler activation, webhook activation, or final write automation.
 
 ## Review-Only Routing
 
