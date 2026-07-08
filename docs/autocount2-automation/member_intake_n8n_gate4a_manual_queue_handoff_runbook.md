@@ -6,6 +6,8 @@ Status: Gate 4A runnable package only. This runbook does not run Gate 4A, does n
 
 Gate 4A is the manual handoff path for AC2 lookup-only review routing when no real Google Sheets poller exists in the local bridge.
 
+The current lookup queue tab contains only dummy Gate 2 rehearsal rows. Those rows proved TSV-to-JSONL handoff mechanics only. They are not real Gate 4A queue rows, must not be passed to AC2 lookup, and must not be recorded as Gate 4A pass evidence.
+
 The path is:
 
 ```text
@@ -22,6 +24,24 @@ local summarizer
 ```
 
 Gate 4A does not claim a real Google Sheets poller, production queue poller, n8n result mapping run, scheduler, webhook, tunnel, public inbound AC2 exposure, member create/update/delete path, AutoCount write path, direct SQL write path, or final write automation.
+
+## Real Queue-Write Preparation Gate
+
+Gate 4A lookup may not start until the operator has first produced exactly one real, non-dummy, sanitized `PENDING_LOOKUP` queue row from a tiny approved source batch.
+
+This preparation gate is queue-write-only. It does not run Gate 4A lookup, does not call AC2, does not run PowerShell, does not run the local bridge, does not run n8n result mapping, and does not authorize any AutoCount write path.
+
+Stop before bridge handoff if the lookup queue tab contains only dummy Gate 2 rehearsal rows, if the row count is not exactly one, if the encoded lookup value is blank or invalid, or if the decoded value only matches a dummy/rehearsal marker. Do not paste or commit the encoded or decoded value while checking this.
+
+The required pre-bridge aggregate checks are:
+
+- `queue_row_count = 1`
+- `queue_base64_decode_ok_count = 1`
+- `queue_base64_decode_fail_count = 0`
+- `queue_decoded_blank_count = 0`
+- `queue_decoded_looks_dummy_count = 0`
+
+The preparation gate may be recorded only as queue-write precheck evidence, not as Gate 4A lookup evidence or Gate 4A pass evidence.
 
 ## Local Ignored File Paths
 
@@ -56,17 +76,29 @@ Before running Gate 4A, the operator confirms:
 10. No public inbound webhook, callback, tunnel, or reverse proxy reaches the AC2 host.
 11. No Execute Command node is used for AC2 lookup on the non-AC2 n8n host.
 12. Google Sheets UAT queue/review tabs are used only as temporary UAT surfaces.
-13. Sheet URLs, Sheet IDs, credential IDs, OAuth details, service account JSON, execution payloads, node raw input/output dumps, row-level data, raw/encoded/normalized member values, names, emails, phone numbers, command transcripts, stderr/stdout, secrets, connection strings, and PII will stay out of pasted evidence.
+13. The lookup queue tab does not contain only dummy Gate 2 rehearsal rows.
+14. The real queue-write preparation gate produced exactly one non-dummy sanitized `PENDING_LOOKUP` row.
+15. Sheet URLs, Sheet IDs, credential IDs, OAuth details, service account JSON, execution payloads, node raw input/output dumps, row-level data, raw/encoded/normalized member values, names, emails, phone numbers, command transcripts, stderr/stdout, secrets, connection strings, and PII will stay out of pasted evidence.
 
 Stop if any item cannot be confirmed.
 
 ## Batch Control
 
-1. Choose a tiny approved batch only.
+1. Choose a tiny approved batch only. Initially this must be exactly one source row.
 2. Record only the aggregate approved batch count for later evidence.
 3. Mark only those approved rows for lookup in the UAT source tab.
 4. Do not paste row data, screenshots with row data, names, emails, phone numbers, raw member values, encoded member values, normalized member values, Sheet URLs, or Sheet IDs.
 5. Stop if more rows than expected are selected, queued, exported, loaded, or written.
+
+The one approved source row must include the required source fields:
+
+- `Name`
+- phone/member number field submitted by the user
+- `Email`
+- birthday field only when the current source includes birthday
+- `PDPA Acknowledged = Yes`
+
+`PDPA Acknowledged = Imported` remains blocked and must not be treated as consent. For the current live/form path, normalize only `PDPA Acknowledged = Yes` to queue value `pdpa_status = yes`.
 
 ## n8n Manual Queue-Write Step
 
@@ -77,13 +109,38 @@ Run n8n manually while inactive:
 3. Confirm no scheduler is enabled.
 4. Confirm no webhook/tunnel/public inbound AC2 callback is configured.
 5. Manually run only the queue-write path.
-6. Read only the tiny approved rows marked for lookup.
-7. Write only sanitized `PENDING_LOOKUP` queue rows to the Google Sheets UAT queue tab.
-8. Confirm the queue rows contain only the approved queue request fields from the UAT plan.
-9. Do not run n8n result mapping in Gate 4A.
-10. Do not paste raw node input/output, execution payloads, Sheet URLs, Sheet IDs, credential IDs, row-level output, command output, or PII.
+6. Read exactly the tiny approved source batch, initially one row.
+7. Require `Name`, the submitted phone/member number, `Email`, birthday when applicable to the source, and `PDPA Acknowledged = Yes`.
+8. Normalize only what is needed for queue routing.
+9. Encode the submitted phone/member number into `submitted_member_no_base64_utf8`.
+10. Write only one sanitized non-dummy `PENDING_LOOKUP` queue row to the Google Sheets UAT queue tab.
+11. Confirm the queue row contains only the approved queue request fields from the UAT plan and queue contract.
+12. Confirm AutoCount `MobilePhone` is intentionally unused; the submitted phone/member number maps to AutoCount `MemberNo`.
+13. Do not run n8n result mapping in Gate 4A.
+14. Do not paste raw node input/output, execution payloads, Sheet URLs, Sheet IDs, credential IDs, row-level output, command output, raw member values, encoded member values, decoded member values, normalized member values, or PII.
 
-Stop if the n8n run reads or writes more rows than the approved batch, writes unexpected columns, activates the workflow, enables a scheduler, exposes inbound AC2 access, or references any write/create/update/delete path.
+Stop if the n8n run reads or writes more rows than the approved batch, writes a dummy queue row, writes a blank encoded lookup value, writes unexpected columns, activates the workflow, enables a scheduler, exposes inbound AC2 access, or references any write/create/update/delete path.
+
+The appended queue row must contain:
+
+- `job_id`
+- `intake_source`
+- `source_reference`
+- `source_row_ref`
+- `row_number`
+- `intake_id`
+- `state = PENDING_LOOKUP`
+- `submitted_member_no_base64_utf8`
+- `consent_status`
+- `pdpa_status = yes`
+- `payload_hash`
+- `attempt`
+- `max_attempts`
+- `created_at`
+- `updated_at`
+- `timeout_at`
+
+The encoded lookup value must decode to the submitted phone/member number, but the raw, encoded, decoded, and normalized values must never be committed, pasted, logged, or added to PR evidence.
 
 ## Manual Local Queue Handoff Step
 
@@ -97,6 +154,9 @@ Rules:
 
 - Include only rows from the tiny approved batch.
 - Include only allowed queue request fields.
+- Include exactly one row for the initial real queue-write preparation.
+- Do not include dummy Gate 2 rehearsal rows.
+- Do not continue unless the pre-bridge aggregate checks show one row, one successful base64 decode, no decode failures, no blank decoded value, and no dummy-looking decoded value.
 - Keep the file on the Windows AC2 lookup bridge host.
 - Do not paste or commit the file.
 - Do not include Sheet URLs, Sheet IDs, credential IDs, OAuth details, service account JSON, execution payloads, node raw input/output dumps, names, emails, phone numbers, raw member values, normalized member values, command transcripts, stderr/stdout, secrets, connection strings, or PII.
@@ -167,7 +227,10 @@ Do not map result rows back to Google Sheets in Gate 4A. Do not mark form/source
 Stop Gate 4A immediately if any of these occur:
 
 - Gate prerequisites are not confirmed.
+- The lookup queue contains only dummy Gate 2 rehearsal rows.
+- The real queue-write preparation pre-bridge checks are not exactly `queue_row_count = 1`, `queue_base64_decode_ok_count = 1`, `queue_base64_decode_fail_count = 0`, `queue_decoded_blank_count = 0`, and `queue_decoded_looks_dummy_count = 0`.
 - More rows than the tiny approved batch are marked, queued, exported, loaded, processed, or written.
+- A queue row is dummy or has a blank encoded lookup value.
 - Any unexpected field appears in queue, result, or evidence.
 - Raw member values, encoded member values, normalized member values, names, emails, phone numbers, row-level data, Sheet IDs/URLs, credential IDs, command transcripts, stderr/stdout, execution payloads, node raw input/output dumps, screenshots with row data, secrets, connection strings, or PII appear in evidence.
 - Unknown state appears.

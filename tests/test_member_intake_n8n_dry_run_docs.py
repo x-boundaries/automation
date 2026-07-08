@@ -152,6 +152,50 @@ class MemberIntakeN8nDryRunDocsTests(unittest.TestCase):
         self.assertRegex(contract, r"(?i)Retry exhaustion routes to `LOOKUP_ERROR_REVIEW`")
         self.assertRegex(contract, r"(?i)Same idempotency key plus same payload hash")
 
+    def test_queue_contract_defines_gate4a_real_queue_write_preparation(self):
+        contract = self.read(NODE_CONTRACT)
+
+        for phrase in [
+            "For Gate 4A real queue-write preparation, the first approved source batch is exactly one row",
+            "The source row must contain `Name`, the submitted phone/member number, `Email`, birthday when the current source includes birthday, and `PDPA Acknowledged = Yes`",
+            "must not copy names, emails, raw phone numbers, birthday values, or raw submitted member values into the lookup queue",
+            "The Gate 4A real queue-write row must populate",
+            "It must not be a dummy Gate 2 rehearsal row",
+            "`submitted_member_no_base64_utf8` must not be blank",
+            "`queue_row_count = 1`",
+            "`queue_base64_decode_ok_count = 1`",
+            "`queue_base64_decode_fail_count = 0`",
+            "`queue_decoded_blank_count = 0`",
+            "`queue_decoded_looks_dummy_count = 0`",
+            "These counters are queue-write prechecks only",
+            "they are not Gate 4A lookup evidence",
+            "do not authorize AC2 writes",
+            "decoded value must equal the submitted phone/member number that maps to AutoCount `MemberNo`",
+            "AutoCount `MobilePhone` is intentionally unused",
+            "must never be committed, pasted, logged, or added to PR evidence",
+        ]:
+            self.assertIn(phrase, contract)
+
+        for field in [
+            "`job_id`",
+            "`intake_source`",
+            "`source_reference`",
+            "`source_row_ref`",
+            "`row_number`",
+            "`intake_id`",
+            "`state`",
+            "`submitted_member_no_base64_utf8`",
+            "`consent_status`",
+            "`pdpa_status`",
+            "`payload_hash`",
+            "`attempt`",
+            "`max_attempts`",
+            "`created_at`",
+            "`updated_at`",
+            "`timeout_at`",
+        ]:
+            self.assertIn(field, contract)
+
     def test_docs_route_sanitized_json_outcomes(self):
         combined = self.combined([WORKFLOW_DOC, NODE_CONTRACT, DIRECT_RUNBOOK, BRIDGE_RUNBOOK])
 
@@ -530,6 +574,21 @@ class MemberIntakeN8nDryRunDocsTests(unittest.TestCase):
             "real Sheet URLs, Sheet IDs, credential IDs, and resource locator values kept outside Git",
             "read only a tiny approved batch of real UAT rows explicitly marked for lookup",
             "write only sanitized `PENDING_LOOKUP` queue rows",
+            "first real queue-write preparation batch must be exactly one approved source row",
+            "append exactly one non-dummy `PENDING_LOOKUP` queue row",
+            "source row must include `Name`, the submitted phone/member number, `Email`, birthday when applicable to the current source, and `PDPA Acknowledged = Yes`",
+            "Current live/form consent is `PDPA Acknowledged = Yes`, normalized to `pdpa_status = yes`",
+            "n8n must encode the submitted phone/member number into `submitted_member_no_base64_utf8`",
+            "maps to AutoCount `MemberNo`",
+            "AutoCount `MobilePhone` is intentionally unused",
+            "operator must confirm aggregate-only queue prechecks",
+            "`queue_row_count = 1`",
+            "`queue_base64_decode_ok_count = 1`",
+            "`queue_base64_decode_fail_count = 0`",
+            "`queue_decoded_blank_count = 0`",
+            "`queue_decoded_looks_dummy_count = 0`",
+            "lookup queue contains only dummy Gate 2 rehearsal rows",
+            "must not be recorded as Gate 4 or Gate 4A pass evidence",
             "local Windows bridge may read only approved `PENDING_LOOKUP` queue rows",
             "write only sanitized review result rows",
             "map sanitized results back only to review/status fields",

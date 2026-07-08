@@ -353,9 +353,23 @@ Google Sheets UAT-only queue and review tabs are allowed for this temporary UAT 
 - Use only the preapproved UAT tabs described in this plan, with real Sheet URLs, Sheet IDs, credential IDs, and resource locator values kept outside Git and outside pasted PR evidence.
 - n8n may read only a tiny approved batch of real UAT rows explicitly marked for lookup.
 - n8n may write only sanitized `PENDING_LOOKUP` queue rows using the allowed queue request fields.
+- The first real queue-write preparation batch must be exactly one approved source row and must append exactly one non-dummy `PENDING_LOOKUP` queue row.
+- The source row must include `Name`, the submitted phone/member number, `Email`, birthday when applicable to the current source, and `PDPA Acknowledged = Yes`.
+- `PDPA Acknowledged = Imported` remains blocked. Current live/form consent is `PDPA Acknowledged = Yes`, normalized to `pdpa_status = yes`.
+- n8n must encode the submitted phone/member number into `submitted_member_no_base64_utf8`; the submitted value maps to AutoCount `MemberNo`, while AutoCount `MobilePhone` is intentionally unused.
 - The local Windows bridge may read only approved `PENDING_LOOKUP` queue rows and write only sanitized review result rows using the allowed result fields.
 - n8n may map sanitized results back only to review/status fields.
 - Google Sheets remains temporary and must be disabled or replaced before production activation.
+
+Before any bridge handoff, the operator must confirm aggregate-only queue prechecks:
+
+- `queue_row_count = 1`
+- `queue_base64_decode_ok_count = 1`
+- `queue_base64_decode_fail_count = 0`
+- `queue_decoded_blank_count = 0`
+- `queue_decoded_looks_dummy_count = 0`
+
+If the lookup queue contains only dummy Gate 2 rehearsal rows, or if any precheck differs from the expected value, stop. Dummy rows proved handoff mechanics only and must not be recorded as Gate 4 or Gate 4A pass evidence.
 
 ### Gate 4 Flow
 
@@ -363,13 +377,15 @@ The Gate 4 flow is:
 
 1. Operator confirms Gates 1, 2/2A, and 3 passed and confirms the Gate 4 batch size out of band.
 2. n8n is manually run while inactive and reads only the tiny approved batch of real UAT rows marked for lookup.
-3. n8n validates headers, PDPA status, prior queue state, and allowed field boundaries.
-4. n8n writes sanitized `PENDING_LOOKUP` queue rows only.
-5. The local Windows bridge polls/reads only approved queue rows.
-6. The bridge calls only the read-only PowerShell lookup path with `-EnableMemberLookupReview` and `-MemberNoBase64Utf8`.
-7. The bridge writes sanitized review result rows only.
-8. n8n reads sanitized review results and maps them back to review/status fields only.
-9. The operator reduces the run to aggregate-only evidence.
+3. For the first real queue-write preparation, n8n reads exactly one approved source row.
+4. n8n validates required source fields, headers, PDPA status, prior queue state, and allowed field boundaries.
+5. n8n writes sanitized non-dummy `PENDING_LOOKUP` queue rows only.
+6. The operator confirms the pre-bridge aggregate checks before any local bridge handoff.
+7. The local Windows bridge polls/reads only approved queue rows.
+8. The bridge calls only the read-only PowerShell lookup path with `-EnableMemberLookupReview` and `-MemberNoBase64Utf8`.
+9. The bridge writes sanitized review result rows only.
+10. n8n reads sanitized review results and maps them back to review/status fields only.
+11. The operator reduces the run to aggregate-only evidence.
 
 No create/update action is available in the flow. `READY_FOR_CREATE_REVIEW` remains a review state only and is not approval to create.
 
