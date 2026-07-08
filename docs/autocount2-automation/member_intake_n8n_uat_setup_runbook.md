@@ -1,6 +1,6 @@
 # Member Intake n8n UAT Setup Runbook
 
-Status: UAT setup and runbook only. This document does not add an n8n workflow export, does not activate a live workflow, does not expose the AutoCount host, and does not authorize AutoCount writes.
+Status: UAT setup and runbook only. Gate 3 local lookup preflight pass recorded. This document does not add an n8n workflow export, does not activate a live workflow, does not expose the AutoCount host, and does not authorize AutoCount writes.
 
 ## Purpose
 
@@ -162,9 +162,42 @@ sanitized_note = No credentials, connection strings, Sheet IDs/URLs, credential 
 
 All count fields are aggregate-only. A successful lookup, missing lookup, manual-review lookup, or lookup error must be reduced to booleans and counts only. No state authorizes member creation.
 
+#### Recorded Gate 3 Sanitized Evidence
+
+Gate 3 local Windows PowerShell lookup preflight has passed with aggregate-only sanitized evidence:
+
+```text
+status = ok
+gate = gate3_local_powershell_lookup_preflight
+runtime_location = local_windows_ac2_lookup_environment
+execution_mode = manual_read_only_preflight
+autocount_session_bootstrap_available = true
+member_command_found = true
+get_member_found = true
+lookup_attempt_count = 1
+lookup_success_count = 1
+lookup_manual_review_count = 1
+lookup_error_count = 0
+member_create_or_update_invoked = false
+autocount_write_attempted = false
+direct_sql_write_attempted = false
+n8n_involved = false
+bridge_called_by_n8n = false
+final_write_automation = false
+sanitized_note = No credentials, connection strings, Sheet IDs/URLs, credential IDs, row-level output, raw/encoded/normalized member values, names, emails, phone numbers, command transcripts, stderr/stdout, execution payloads, node raw input/output dumps, or PII are pasted.
+```
+
+The operator output included local PowerShell prompt wrapper noise, but no sensitive values were recorded here. Only the sanitized evidence body above is retained.
+
+This Gate 3 pass proves only that the local Windows AC2 lookup environment was available, the AutoCount session/auth bootstrap was available, `MemberCommand` was found, `MemberCommand.GetMember` was found, one lookup attempt succeeded, the lookup result was manual-review rather than an error, and no member create/update/write/direct SQL/n8n/final automation path was invoked.
+
+This Gate 3 pass does not prove production automation, does not authorize member create/update, does not authorize AutoCount writes, and does not by itself prove hosted/VPS n8n runtime readiness.
+
 ### Gate 4: Real Queue UAT Touching AC2 Lookup
 
 Only after Gates 1, 2/2A, and 3 pass may an operator consider a real queue UAT where the Windows bridge polls outbound and touches AC2 lookup. Gate 4 is still review-only, dry-run-only, and inactive by default. It cannot create or update AutoCount members. The local operator PC n8n dummy wiring pass does not prove hosted/VPS readiness; hosted/VPS runtime readiness must still be proven before any hosted/VPS real queue UAT.
+
+Gate 4 remains blocked until a separate reviewed PR defines the exact real queue UAT plan, including the queue surface, dummy-to-real transition boundary, hosted/VPS runtime readiness proof, operator evidence shape, rollback/stop conditions, and review-only status handling.
 
 ## Minimum Next Runnable n8n UAT Step
 

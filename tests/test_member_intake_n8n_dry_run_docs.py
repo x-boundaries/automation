@@ -35,6 +35,21 @@ class MemberIntakeN8nDryRunDocsTests(unittest.TestCase):
     def combined(self, paths):
         return "\n".join(self.read(path) for path in paths)
 
+    def gate3_recorded_evidence(self):
+        setup = self.read(UAT_SETUP_RUNBOOK)
+        match = re.search(
+            r"#### Recorded Gate 3 Sanitized Evidence.*?```text\n(?P<body>.*?)\n```",
+            setup,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(match)
+        body = match.group("body")
+        evidence = {}
+        for line in body.splitlines():
+            key, value = line.split(" = ", 1)
+            evidence[key] = value
+        return body, evidence
+
     def test_new_docs_exist_and_are_linked_from_readme(self):
         readme = self.read(README)
 
@@ -387,6 +402,75 @@ class MemberIntakeN8nDryRunDocsTests(unittest.TestCase):
         self.assertNotRegex(combined, r"(?i)paste back encoded member")
         self.assertNotRegex(combined, r"(?i)paste back normalized member")
         self.assertNotRegex(combined, r"(?i)paste back command transcript")
+
+    def test_gate3_pass_evidence_is_recorded_as_sanitized_aggregate_only_status(self):
+        body, evidence = self.gate3_recorded_evidence()
+
+        expected = {
+            "status": "ok",
+            "gate": "gate3_local_powershell_lookup_preflight",
+            "runtime_location": "local_windows_ac2_lookup_environment",
+            "execution_mode": "manual_read_only_preflight",
+            "autocount_session_bootstrap_available": "true",
+            "member_command_found": "true",
+            "get_member_found": "true",
+            "lookup_attempt_count": "1",
+            "lookup_success_count": "1",
+            "lookup_manual_review_count": "1",
+            "lookup_error_count": "0",
+            "member_create_or_update_invoked": "false",
+            "autocount_write_attempted": "false",
+            "direct_sql_write_attempted": "false",
+            "n8n_involved": "false",
+            "bridge_called_by_n8n": "false",
+            "final_write_automation": "false",
+        }
+        for key, value in expected.items():
+            self.assertEqual(evidence[key], value, key)
+
+        for count_key in [
+            "lookup_attempt_count",
+            "lookup_success_count",
+            "lookup_manual_review_count",
+            "lookup_error_count",
+        ]:
+            self.assertRegex(evidence[count_key], r"^\d+$")
+
+        self.assertIn("No credentials, connection strings, Sheet IDs/URLs", evidence["sanitized_note"])
+        self.assertIn("command transcripts, stderr/stdout", evidence["sanitized_note"])
+        self.assertNotIn("<aggregate-count-only>", body)
+        self.assertNotIn("<true/false>", body)
+        self.assertNotIn("result_state_counts", body)
+        self.assertNotIn("row_number", body)
+        self.assertNotIn("source_reference", body)
+        self.assertNotIn("source_row_ref", body)
+        self.assertNotIn("submitted_member_no_base64_utf8", body)
+        self.assertNotRegex(body, r"https://docs\.google\.com/spreadsheets/d/")
+        self.assertNotRegex(body, r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b")
+        self.assertNotRegex(body, r"(?i)\b(?:\+?65)?[689]\d{7}\b")
+        self.assertNotRegex(body, r"(?i)\b(credential|sheet|member|phone|email|name)_?id\s*=")
+        self.assertNotRegex(body, r"(?i)\b(stdin|stdout|stderr)\s*=")
+        self.assertNotRegex(body, r"(?m)^PS [A-Z]:\\")
+
+    def test_gate3_pass_scope_and_gate4_boundary_are_explicit(self):
+        setup = self.read(UAT_SETUP_RUNBOOK)
+
+        for phrase in [
+            "Gate 3 local Windows PowerShell lookup preflight has passed",
+            "local Windows AC2 lookup environment was available",
+            "AutoCount session/auth bootstrap was available",
+            "`MemberCommand` was found",
+            "`MemberCommand.GetMember` was found",
+            "one lookup attempt succeeded",
+            "manual-review rather than an error",
+            "no member create/update/write/direct SQL/n8n/final automation path was invoked",
+            "does not prove production automation",
+            "does not authorize member create/update",
+            "does not authorize AutoCount writes",
+            "does not by itself prove hosted/VPS n8n runtime readiness",
+            "Gate 4 remains blocked until a separate reviewed PR defines the exact real queue UAT plan",
+        ]:
+            self.assertIn(phrase, setup)
 
     def test_uat_setup_records_local_operator_n8n_rehearsal_without_hosted_runtime_claim(self):
         setup = self.read(UAT_SETUP_RUNBOOK)

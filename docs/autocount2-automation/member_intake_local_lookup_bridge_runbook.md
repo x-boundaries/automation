@@ -1,6 +1,6 @@
 # Member Intake Local Lookup Bridge Runbook
 
-Status: design and dry-run worker skeleton only. This does not activate production automation and does not authorize AutoCount member writes.
+Status: design and dry-run worker skeleton only. Gate 3 local lookup preflight pass recorded. This does not activate production automation and does not authorize AutoCount member writes.
 
 ## Purpose
 
@@ -336,6 +336,37 @@ sanitized_note = No credentials, connection strings, Sheet IDs/URLs, credential 
 ```
 
 Do not paste the bridge worker stdout directly as Gate 3 evidence. The worker may write local fixture/result files for operator review, but Gate 3 evidence must be the aggregate shape above. A result state such as `READY_FOR_CREATE_REVIEW` remains review-only and is not approval to create.
+
+Recorded Gate 3 sanitized evidence:
+
+```text
+status = ok
+gate = gate3_local_powershell_lookup_preflight
+runtime_location = local_windows_ac2_lookup_environment
+execution_mode = manual_read_only_preflight
+autocount_session_bootstrap_available = true
+member_command_found = true
+get_member_found = true
+lookup_attempt_count = 1
+lookup_success_count = 1
+lookup_manual_review_count = 1
+lookup_error_count = 0
+member_create_or_update_invoked = false
+autocount_write_attempted = false
+direct_sql_write_attempted = false
+n8n_involved = false
+bridge_called_by_n8n = false
+final_write_automation = false
+sanitized_note = No credentials, connection strings, Sheet IDs/URLs, credential IDs, row-level output, raw/encoded/normalized member values, names, emails, phone numbers, command transcripts, stderr/stdout, execution payloads, node raw input/output dumps, or PII are pasted.
+```
+
+The pasted operator output contained only local PowerShell prompt wrapper noise around the sanitized body and no sensitive values. The wrapper noise is intentionally not recorded.
+
+This pass proves only that the local Windows AC2 lookup environment was available, AutoCount session/auth bootstrap was available, `MemberCommand` was found, `MemberCommand.GetMember` was found, one lookup attempt succeeded, the result was manual-review rather than an error, and no create/update/write/direct SQL/n8n/final automation path was invoked.
+
+This pass does not prove production automation, does not authorize member create/update, does not authorize AutoCount writes, and does not by itself prove hosted/VPS n8n runtime readiness.
+
+Gate 4 remains blocked until a separate reviewed PR defines the exact real queue UAT plan. Passing Gate 3 is readiness evidence for a future plan review, not approval to run a real queue UAT.
 
 ## Review-Only Routing
 

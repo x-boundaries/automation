@@ -491,6 +491,21 @@ class BridgeWorkerCliTests(unittest.TestCase):
 
 
 class BridgeWorkerStaticGuardrailTests(unittest.TestCase):
+    def recorded_gate3_evidence(self):
+        bridge_runbook = BRIDGE_RUNBOOK.read_text(encoding="utf-8")
+        match = re.search(
+            r"Recorded Gate 3 sanitized evidence:\n\n```text\n(?P<body>.*?)\n```",
+            bridge_runbook,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(match)
+        body = match.group("body")
+        evidence = {}
+        for line in body.splitlines():
+            key, value = line.split(" = ", 1)
+            evidence[key] = value
+        return body, evidence
+
     def test_worker_is_disabled_by_default_and_has_no_network_endpoint_surface(self):
         source = SCRIPT.read_text(encoding="utf-8")
 
@@ -665,6 +680,62 @@ class BridgeWorkerStaticGuardrailTests(unittest.TestCase):
         self.assertNotRegex(bridge_runbook, r"https://docs\.google\.com/spreadsheets/d/")
         self.assertNotRegex(bridge_runbook, r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b")
         self.assertNotRegex(bridge_runbook, r"submitted_member_no_base64_utf8\"\s*:\s*\"[A-Za-z0-9+/]+=*\"")
+
+    def test_recorded_gate3_pass_keeps_lookup_counts_and_write_flags_safe(self):
+        body, evidence = self.recorded_gate3_evidence()
+
+        self.assertEqual(evidence["status"], "ok")
+        self.assertEqual(evidence["gate"], "gate3_local_powershell_lookup_preflight")
+        self.assertEqual(evidence["runtime_location"], "local_windows_ac2_lookup_environment")
+        self.assertEqual(evidence["execution_mode"], "manual_read_only_preflight")
+        self.assertEqual(evidence["autocount_session_bootstrap_available"], "true")
+        self.assertEqual(evidence["member_command_found"], "true")
+        self.assertEqual(evidence["get_member_found"], "true")
+        self.assertEqual(evidence["lookup_attempt_count"], "1")
+        self.assertEqual(evidence["lookup_success_count"], "1")
+        self.assertEqual(evidence["lookup_manual_review_count"], "1")
+        self.assertEqual(evidence["lookup_error_count"], "0")
+
+        for flag in [
+            "member_create_or_update_invoked",
+            "autocount_write_attempted",
+            "direct_sql_write_attempted",
+            "n8n_involved",
+            "bridge_called_by_n8n",
+            "final_write_automation",
+        ]:
+            self.assertEqual(evidence[flag], "false", flag)
+
+        self.assertNotIn("<aggregate-count-only>", body)
+        self.assertNotIn("<true/false>", body)
+        self.assertNotIn("result_state_counts", body)
+        self.assertNotIn("submitted_member_no_base64_utf8", body)
+        self.assertNotIn("row_number", body)
+        self.assertNotRegex(body, r"https://docs\.google\.com/spreadsheets/d/")
+        self.assertNotRegex(body, r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b")
+        self.assertNotRegex(body, r"(?i)\b(?:\+?65)?[689]\d{7}\b")
+        self.assertNotRegex(body, r"(?i)\b(stdin|stdout|stderr)\s*=")
+        self.assertNotRegex(body, r"(?m)^PS [A-Z]:\\")
+
+    def test_recorded_gate3_pass_does_not_unblock_gate4_or_writes(self):
+        bridge_runbook = BRIDGE_RUNBOOK.read_text(encoding="utf-8")
+
+        for phrase in [
+            "This pass proves only that the local Windows AC2 lookup environment was available",
+            "AutoCount session/auth bootstrap was available",
+            "`MemberCommand` was found",
+            "`MemberCommand.GetMember` was found",
+            "one lookup attempt succeeded",
+            "manual-review rather than an error",
+            "no create/update/write/direct SQL/n8n/final automation path was invoked",
+            "does not prove production automation",
+            "does not authorize member create/update",
+            "does not authorize AutoCount writes",
+            "does not by itself prove hosted/VPS n8n runtime readiness",
+            "Gate 4 remains blocked until a separate reviewed PR defines the exact real queue UAT plan",
+            "not approval to run a real queue UAT",
+        ]:
+            self.assertIn(phrase, bridge_runbook)
 
 
 if __name__ == "__main__":
