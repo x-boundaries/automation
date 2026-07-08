@@ -1,6 +1,6 @@
 # Member Intake n8n Lookup Bridge UAT Plan
 
-Status: UAT plan only. This document does not add a workflow export, does not activate n8n, does not expose the AutoCount host, and does not authorize AutoCount writes.
+Status: Gate 4 real queue UAT plan only. This document does not add a workflow export, does not activate n8n, does not run Gate 4, does not touch real queue data from this PR, does not expose the AutoCount host, and does not authorize AutoCount writes.
 
 ## Purpose
 
@@ -318,6 +318,112 @@ Before any UAT run:
 - Do not set custom execution data with member, encoded, normalized, or row-level personal fields.
 - Do not log raw form fields, encoded values, normalized values, command arguments, credentials, Sheet IDs, Sheet URLs, bridge stderr/stdout, or local target details.
 - Do not run `test_workflow` against Data Table, file, Execute Command, Wait, or Code side effects without a separate explicit approval.
+
+## Gate 4 Real Queue UAT Plan
+
+Gate 4 is a future operator-run UAT for a tiny approved batch of real intake rows. This PR defines the plan only. It must not be used as evidence that Gate 4 has run, and it must not be packaged with workflow JSON, fixture/result JSONL files, Sheet URLs, Sheet IDs, credential IDs, OAuth details, service account JSON, execution payloads, node raw input/output dumps, row-level data, raw/encoded/normalized member values, names, emails, phone numbers, command transcripts, stderr/stdout, secrets, connection strings, or PII.
+
+### Gate 4 Purpose
+
+Gate 4 proves only that the temporary real queue path can perform AC2 lookup for review routing:
+
+- real queue UAT touching AC2 lookup only,
+- read-only and review-only,
+- no member create/update/delete path,
+- no AutoCount write path,
+- no direct SQL write path,
+- no final write automation.
+
+Passing Gate 4 means only that read-only lookup UAT passed. Passing Gate 4 still does not authorize member create/update, production automation, scheduler activation, or write activation. Production automation or any write path requires a separate reviewed PR and explicit business approval.
+
+### Gate 4 Runtime Boundary
+
+The n8n runtime for Gate 4 must be outside the AC2 host.
+
+- If Gate 4 uses the already rehearsed local operator PC n8n stack, evidence must label it exactly as `local_operator_pc_non_ac2_n8n_stack` and must not claim hosted/VPS readiness.
+- If Gate 4 later uses hosted/VPS n8n, evidence must label it as `hosted_or_vps_non_ac2`, and hosted/VPS readiness must be separately evidenced before hosted/VPS real queue UAT.
+- n8n must remain inactive and manually run for UAT evidence. No scheduler is enabled.
+- No public inbound webhook, callback, tunnel, or reverse proxy may be exposed on the AC2 host.
+- Hosted/cloud/VPS n8n must not use Execute Command for AC2 lookup because that would run on the n8n host/container, not on the Windows AC2 lookup bridge host.
+
+### Gate 4 Queue Surface
+
+Google Sheets UAT-only queue and review tabs are allowed for this temporary UAT only.
+
+- Use only the preapproved UAT tabs described in this plan, with real Sheet URLs, Sheet IDs, credential IDs, and resource locator values kept outside Git and outside pasted PR evidence.
+- n8n may read only a tiny approved batch of real UAT rows explicitly marked for lookup.
+- n8n may write only sanitized `PENDING_LOOKUP` queue rows using the allowed queue request fields.
+- The local Windows bridge may read only approved `PENDING_LOOKUP` queue rows and write only sanitized review result rows using the allowed result fields.
+- n8n may map sanitized results back only to review/status fields.
+- Google Sheets remains temporary and must be disabled or replaced before production activation.
+
+### Gate 4 Flow
+
+The Gate 4 flow is:
+
+1. Operator confirms Gates 1, 2/2A, and 3 passed and confirms the Gate 4 batch size out of band.
+2. n8n is manually run while inactive and reads only the tiny approved batch of real UAT rows marked for lookup.
+3. n8n validates headers, PDPA status, prior queue state, and allowed field boundaries.
+4. n8n writes sanitized `PENDING_LOOKUP` queue rows only.
+5. The local Windows bridge polls/reads only approved queue rows.
+6. The bridge calls only the read-only PowerShell lookup path with `-EnableMemberLookupReview` and `-MemberNoBase64Utf8`.
+7. The bridge writes sanitized review result rows only.
+8. n8n reads sanitized review results and maps them back to review/status fields only.
+9. The operator reduces the run to aggregate-only evidence.
+
+No create/update action is available in the flow. `READY_FOR_CREATE_REVIEW` remains a review state only and is not approval to create.
+
+### Gate 4 Stop Conditions
+
+Stop the UAT immediately if any of these appear:
+
+- unexpected field, raw value, encoded value, normalized value, credential, Sheet ID, Sheet URL, credential ID, command transcript, stdout/stderr, PII, unknown state, write-path indication, n8n activation, scheduler, webhook/tunnel exposure, or AutoCount write attempt,
+- lookup error spike or unexpected result shape,
+- any member create/update/delete path reference,
+- any direct SQL write indication,
+- any final write automation indication,
+- any workflow activation or scheduler enablement,
+- any public inbound webhook, callback, tunnel, or reverse proxy exposure on the AC2 host,
+- any evidence request that would require row-level data, raw/encoded/normalized member values, names, emails, phone numbers, command transcripts, stderr/stdout, execution payloads, node raw input/output dumps, Sheet IDs/URLs, credential IDs, secrets, connection strings, or PII.
+
+If a stop condition occurs, do not continue the batch. Record only `status = needs_fix`, aggregate counts where safe, and the sanitized stop category.
+
+### Gate 4 Evidence Shape
+
+Evidence must be aggregate-only. It must not contain row-level data, raw/encoded/normalized member values, names, emails, phone numbers, Sheet IDs, Sheet URLs, credential IDs, credentials, command transcripts, stdout/stderr, execution payloads, node raw input/output dumps, local target details, secrets, connection strings, or PII.
+
+Suggested safe paste-back shape:
+
+```text
+status = <ok/needs_fix>
+gate = gate4_real_queue_uat_ac2_lookup_only
+runtime_location = <local_operator_pc_non_ac2_n8n_stack OR hosted_or_vps_non_ac2>
+execution_mode = manual_inactive_review_only_uat
+approved_batch_size = <aggregate-count-only>
+queue_rows_read_count = <aggregate-count-only>
+queue_rows_written_count = <aggregate-count-only>
+lookup_attempt_count = <aggregate-count-only>
+lookup_success_count = <aggregate-count-only>
+lookup_existing_member_review_count = <aggregate-count-only>
+lookup_manual_review_count = <aggregate-count-only>
+lookup_error_count = <aggregate-count-only>
+review_rows_written_count = <aggregate-count-only>
+form_or_source_rows_updated_count = <aggregate-count-only>
+member_create_or_update_invoked = false
+autocount_write_attempted = false
+direct_sql_write_attempted = false
+workflow_activation = inactive
+scheduler_enabled = false
+public_inbound_to_ac2_host = false
+final_write_automation = false
+sanitized_note = No credentials, connection strings, Sheet IDs/URLs, credential IDs, row-level output, raw/encoded/normalized member values, names, emails, phone numbers, command transcripts, stderr/stdout, execution payloads, node raw input/output dumps, or PII are pasted.
+```
+
+All count fields are aggregate-count-only. Do not include result rows, fixture rows, queue rows, source rows, node payloads, screenshots with row-level data, execution payloads, or command output.
+
+### Gate 4 Completion Boundary
+
+Gate 4 passing means read-only lookup UAT passed. It does not mean production readiness, hosted/VPS readiness unless that runtime was separately evidenced, or write authorization. Member create/update/delete, direct SQL writes, AutoCount writes, scheduler activation, production queue activation, and final write automation remain blocked until a separate reviewed PR and explicit business approval.
 
 ## Preconditions For UAT
 

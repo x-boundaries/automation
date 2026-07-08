@@ -732,7 +732,7 @@ class BridgeWorkerStaticGuardrailTests(unittest.TestCase):
             "does not authorize member create/update",
             "does not authorize AutoCount writes",
             "does not by itself prove hosted/VPS n8n runtime readiness",
-            "Gate 4 remains blocked until a separate reviewed PR defines the exact real queue UAT plan",
+            "Gate 4 remains not approved to run until the reviewed Gate 4 plan PR is merged",
             "not approval to run a real queue UAT",
         ]:
             self.assertIn(phrase, bridge_runbook)
