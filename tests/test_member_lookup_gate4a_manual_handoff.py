@@ -69,7 +69,14 @@ def parse_evidence(text):
 
 
 class Gate4ASummarizerTests(unittest.TestCase):
-    def run_summary(self, results_path, *extra_args):
+    def run_summary(
+        self,
+        results_path,
+        *,
+        approved_batch_size=3,
+        n8n_queue_rows_written_count=3,
+        local_queue_rows_loaded_count=3,
+    ):
         return subprocess.run(
             [
                 sys.executable,
@@ -77,12 +84,11 @@ class Gate4ASummarizerTests(unittest.TestCase):
                 "--results-jsonl",
                 str(results_path),
                 "--approved-batch-size",
-                "3",
+                str(approved_batch_size),
                 "--n8n-queue-rows-written-count",
-                "3",
+                str(n8n_queue_rows_written_count),
                 "--local-queue-rows-loaded-count",
-                "3",
-                *extra_args,
+                str(local_queue_rows_loaded_count),
             ],
             text=True,
             capture_output=True,
@@ -174,7 +180,12 @@ class Gate4ASummarizerTests(unittest.TestCase):
                 ],
             )
 
-            completed = self.run_summary(results_path, "--approved-batch-size", "2")
+            completed = self.run_summary(
+                results_path,
+                approved_batch_size=2,
+                n8n_queue_rows_written_count=2,
+                local_queue_rows_loaded_count=2,
+            )
 
             self.assertEqual(completed.returncode, 0, completed.stderr)
             evidence = parse_evidence(completed.stdout)
@@ -189,7 +200,12 @@ class Gate4ASummarizerTests(unittest.TestCase):
             results_path = Path(tmp) / "member_lookup_bridge_gate4a_results.jsonl"
             write_jsonl(results_path, [result_row(), {"state": "READY_FOR_CREATE_REVIEW"}])
 
-            completed = self.run_summary(results_path, "--approved-batch-size", "2")
+            completed = self.run_summary(
+                results_path,
+                approved_batch_size=2,
+                n8n_queue_rows_written_count=2,
+                local_queue_rows_loaded_count=2,
+            )
 
             self.assertEqual(completed.returncode, 0, completed.stderr)
             evidence = parse_evidence(completed.stdout)
@@ -197,6 +213,48 @@ class Gate4ASummarizerTests(unittest.TestCase):
             self.assertEqual(evidence["lookup_attempt_count"], "2")
             self.assertNotIn("READY_FOR_CREATE_REVIEW", completed.stdout)
             self.assertNotIn("job-safe", completed.stdout)
+
+    def test_summarizer_marks_needs_fix_for_count_mismatch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            results_path = Path(tmp) / "member_lookup_bridge_gate4a_results.jsonl"
+            write_jsonl(
+                results_path,
+                [
+                    result_row(state="READY_FOR_CREATE_REVIEW"),
+                    result_row(
+                        job_id="job-safe-002",
+                        source_reference="safe-ref-002",
+                        source_row_ref="safe-row-002",
+                        row_number=3,
+                        state="EXISTING_MEMBER_REVIEW",
+                        member_exists=True,
+                    ),
+                ],
+            )
+
+            completed = self.run_summary(
+                results_path,
+                approved_batch_size=2,
+                n8n_queue_rows_written_count=3,
+                local_queue_rows_loaded_count=2,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            evidence = parse_evidence(completed.stdout)
+            self.assertEqual(evidence["status"], "needs_fix")
+            self.assertEqual(evidence["approved_batch_size"], "2")
+            self.assertEqual(evidence["n8n_queue_rows_written_count"], "3")
+            self.assertEqual(evidence["local_queue_rows_loaded_count"], "2")
+            self.assertEqual(evidence["lookup_attempt_count"], "2")
+            self.assertEqual(evidence["lookup_error_count"], "0")
+            for forbidden in [
+                "job_id",
+                "job-safe",
+                "source_reference",
+                "source_row_ref",
+                "row_number",
+            ]:
+                self.assertNotIn(forbidden, completed.stdout)
 
 
 class Gate4ARunbookTests(unittest.TestCase):
@@ -235,6 +293,9 @@ class Gate4ARunbookTests(unittest.TestCase):
             "--queue-mode fixture",
             "--lookup-mode powershell",
             "--enable-powershell-lookup",
+            "--allow-root-login",
+            "carries forward the Gate 3 local lookup auth setting",
+            "is still read-only",
             "scripts\\member_lookup_gate4a_evidence_summary.py",
             "n8n result mapping is deferred",
         ]:

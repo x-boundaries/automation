@@ -119,7 +119,8 @@ python scripts\ac2_member_lookup_bridge_worker.py `
   --fixture-jobs "$queue" `
   --results-jsonl "$results" `
   --lookup-mode powershell `
-  --enable-powershell-lookup
+  --enable-powershell-lookup `
+  --allow-root-login
 ```
 
 Bridge boundaries:
@@ -127,6 +128,7 @@ Bridge boundaries:
 - The bridge reads only the local ignored JSONL handoff file.
 - The bridge uses fixture queue mode because no real Google Sheets poller exists.
 - The bridge calls only `scripts/ac2_member_lookup_review.ps1` in read-only lookup mode.
+- `--allow-root-login` carries forward the Gate 3 local lookup auth setting and is still read-only; it does not authorize member create/update/delete, AutoCount writes, direct SQL writes, or final write automation.
 - The bridge writes only local sanitized result JSONL.
 - The bridge must not create, update, delete, or write AutoCount members.
 - The bridge must not perform direct SQL writes.
@@ -152,7 +154,7 @@ python scripts\member_lookup_gate4a_evidence_summary.py `
 
 The summarizer must not print individual rows, `job_id`, `source_reference`, `source_row_ref`, `row_number`, raw/encoded/normalized member values, names, emails, phones, Sheet IDs/URLs, credentials, command output, local target details, secrets, connection strings, or PII.
 
-If `lookup_error_count > 0`, or if required safe result fields are missing, the summarizer prints `status = needs_fix`.
+If `lookup_error_count > 0`, if required safe result fields are missing, or if `approved_batch_size`, `n8n_queue_rows_written_count`, `local_queue_rows_loaded_count`, and `lookup_attempt_count` do not all match, the summarizer prints `status = needs_fix`.
 
 ## Result Mapping Boundary
 

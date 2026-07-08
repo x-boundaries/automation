@@ -150,6 +150,16 @@ def build_evidence(args, counts):
     ]
 
 
+def aggregate_counts_match(args, lookup_attempt_count):
+    expected_counts = {
+        args.approved_batch_size,
+        args.n8n_queue_rows_written_count,
+        args.local_queue_rows_loaded_count,
+        lookup_attempt_count,
+    }
+    return len(expected_counts) == 1
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
         description="Print aggregate-only Gate 4A evidence from local bridge result JSONL."
@@ -173,6 +183,8 @@ def main(argv=None):
     args = build_parser().parse_args(argv)
     line_count, rows, has_shape_error = read_result_rows(args.results_jsonl)
     counts = summarize(rows, line_count, has_shape_error)
+    if not aggregate_counts_match(args, counts["lookup_attempt_count"]):
+        counts["status"] = "needs_fix"
     for key, value in build_evidence(args, counts):
         print(f"{key} = {value}")
     return 0
