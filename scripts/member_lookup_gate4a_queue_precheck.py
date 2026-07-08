@@ -14,7 +14,7 @@ from pathlib import Path
 
 PENDING_LOOKUP = "PENDING_LOOKUP"
 
-REQUIRED_QUEUE_FIELDS = {
+ALLOWED_QUEUE_FIELDS = {
     "job_id",
     "intake_source",
     "source_reference",
@@ -94,7 +94,10 @@ def summarize(rows, line_count, has_shape_error):
     unexpected_shape_count = 1 if has_shape_error else 0
 
     for row in rows:
-        if not REQUIRED_QUEUE_FIELDS.issubset(row):
+        row_fields = set(row)
+        if ALLOWED_QUEUE_FIELDS - row_fields:
+            unexpected_shape_count += 1
+        if row_fields - ALLOWED_QUEUE_FIELDS:
             unexpected_shape_count += 1
         if row.get("state") != PENDING_LOOKUP or row.get("pdpa_status") != "yes":
             unexpected_shape_count += 1

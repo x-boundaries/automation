@@ -175,6 +175,37 @@ class Gate4AQueuePrecheckTests(unittest.TestCase):
             self.assertNotIn("dummy-rehearsal-value", completed.stdout)
             self.assertNotIn(dummy_encoded, completed.stdout)
 
+    def test_precheck_rejects_extra_forbidden_fields_without_name_or_value_echo(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            queue_path = Path(tmp) / "member_lookup_bridge_gate4a_pending_queue.jsonl"
+            forbidden_values = {
+                "name": "Forbidden Person",
+                "email": "forbidden@example.test",
+                "raw_phone": "61234567",
+                "birthday": "2000-01-01",
+                "normalized_member_no": "normalized-forbidden",
+                "sheet_url": "forbidden-sheet-url",
+                "credential_id": "forbidden-credential-id",
+                "node_raw_input": "forbidden-node-raw-input",
+            }
+            write_jsonl(queue_path, [queue_row(**forbidden_values)])
+
+            completed = self.run_precheck(queue_path)
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            evidence = parse_evidence(completed.stdout)
+            self.assertEqual(evidence["status"], "needs_fix")
+            self.assertEqual(evidence["queue_row_count"], "1")
+            self.assertEqual(evidence["queue_base64_decode_ok_count"], "1")
+            self.assertGreater(int(evidence["unexpected_queue_shape_count"]), 0)
+            self.assertEqual(evidence["bridge_handoff_approved"], "false")
+            self.assertEqual(evidence["ac2_lookup_invoked"], "false")
+
+            for forbidden_field in forbidden_values:
+                self.assertNotRegex(completed.stdout, rf"\b{re.escape(forbidden_field)}\b")
+            for forbidden_value in forbidden_values.values():
+                self.assertNotIn(forbidden_value, completed.stdout)
+
 
 class Gate4ASummarizerTests(unittest.TestCase):
     def run_summary(
