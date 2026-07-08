@@ -468,9 +468,166 @@ class MemberIntakeN8nDryRunDocsTests(unittest.TestCase):
             "does not authorize member create/update",
             "does not authorize AutoCount writes",
             "does not by itself prove hosted/VPS n8n runtime readiness",
-            "Gate 4 remains blocked until a separate reviewed PR defines the exact real queue UAT plan",
+            "Gate 4 remains plan-only in the current reviewed PR",
+            "member_intake_n8n_lookup_bridge_uat_plan.md",
         ]:
             self.assertIn(phrase, setup)
+
+    def test_gate4_real_queue_uat_plan_is_plan_only_and_lookup_only(self):
+        plan = self.read(UAT_PLAN)
+        setup = self.read(UAT_SETUP_RUNBOOK)
+        combined = plan + "\n" + setup
+
+        for phrase in [
+            "Status: Gate 4 real queue UAT plan only",
+            "does not run Gate 4",
+            "does not touch real queue data from this PR",
+            "Gate 4 Real Queue UAT Plan",
+            "real queue UAT touching AC2 lookup only",
+            "read-only and review-only",
+            "no member create/update/delete path",
+            "no AutoCount write path",
+            "no direct SQL write path",
+            "no final write automation",
+            "Passing Gate 4 means only that read-only lookup UAT passed",
+            "still does not authorize member create/update",
+            "separate reviewed PR and explicit business approval",
+        ]:
+            self.assertIn(phrase, combined)
+
+        self.assertRegex(combined, r"(?i)This PR defines the plan only")
+        self.assertRegex(combined, r"(?i)No create/update action is available in the flow")
+        self.assertRegex(combined, r"(?i)READY_FOR_CREATE_REVIEW.*review state only")
+        self.assertRegex(combined, r"(?i)does not activate n8n")
+        self.assertRegex(combined, r"(?i)does not call AC2")
+        self.assertRegex(combined, r"(?i)does not authorize scheduler or production activation")
+
+    def test_gate4_runtime_boundary_blocks_ac2_host_and_activation_surface(self):
+        plan = self.read(UAT_PLAN)
+
+        for phrase in [
+            "n8n runtime for Gate 4 must be outside the AC2 host",
+            "local_operator_pc_non_ac2_n8n_stack",
+            "must not claim hosted/VPS readiness",
+            "hosted_or_vps_non_ac2",
+            "hosted/VPS readiness must be separately evidenced",
+            "n8n must remain inactive and manually run",
+            "No scheduler is enabled",
+            "No public inbound webhook, callback, tunnel, or reverse proxy may be exposed on the AC2 host",
+            "Hosted/cloud/VPS n8n must not use Execute Command for AC2 lookup",
+        ]:
+            self.assertIn(phrase, plan)
+
+        self.assertNotRegex(plan, r"(?i)public inbound webhook.*allowed")
+        self.assertNotRegex(plan, r"(?i)scheduler_enabled = true")
+        self.assertNotRegex(plan, r"(?i)workflow_activation = active")
+
+    def test_gate4_queue_flow_and_stop_conditions_are_review_only(self):
+        plan = self.read(UAT_PLAN)
+
+        for phrase in [
+            "Google Sheets UAT-only queue and review tabs are allowed for this temporary UAT only",
+            "real Sheet URLs, Sheet IDs, credential IDs, and resource locator values kept outside Git",
+            "read only a tiny approved batch of real UAT rows explicitly marked for lookup",
+            "write only sanitized `PENDING_LOOKUP` queue rows",
+            "local Windows bridge may read only approved `PENDING_LOOKUP` queue rows",
+            "write only sanitized review result rows",
+            "map sanitized results back only to review/status fields",
+            "Google Sheets remains temporary and must be disabled or replaced before production activation",
+            "bridge calls only the read-only PowerShell lookup path",
+            "Stop the UAT immediately",
+            "lookup error spike or unexpected result shape",
+            "any member create/update/delete path reference",
+            "any direct SQL write indication",
+            "any final write automation indication",
+            "any workflow activation or scheduler enablement",
+        ]:
+            self.assertIn(phrase, plan)
+
+        for forbidden_phrase in [
+            "unexpected field",
+            "raw value",
+            "encoded value",
+            "normalized value",
+            "credential",
+            "Sheet ID",
+            "Sheet URL",
+            "credential ID",
+            "command transcript",
+            "stdout/stderr",
+            "PII",
+            "webhook/tunnel exposure",
+            "AutoCount write attempt",
+        ]:
+            self.assertIn(forbidden_phrase, plan)
+
+    def test_gate4_evidence_shape_is_aggregate_only_and_secret_free(self):
+        plan = self.read(UAT_PLAN)
+        match = re.search(
+            r"Suggested safe paste-back shape:\n\n```text\n(?P<body>.*?)\n```",
+            plan,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(match)
+        body = match.group("body")
+
+        expected_fields = [
+            "status = <ok/needs_fix>",
+            "gate = gate4_real_queue_uat_ac2_lookup_only",
+            "runtime_location = <local_operator_pc_non_ac2_n8n_stack OR hosted_or_vps_non_ac2>",
+            "execution_mode = manual_inactive_review_only_uat",
+            "approved_batch_size = <aggregate-count-only>",
+            "queue_rows_read_count = <aggregate-count-only>",
+            "queue_rows_written_count = <aggregate-count-only>",
+            "lookup_attempt_count = <aggregate-count-only>",
+            "lookup_success_count = <aggregate-count-only>",
+            "lookup_existing_member_review_count = <aggregate-count-only>",
+            "lookup_manual_review_count = <aggregate-count-only>",
+            "lookup_error_count = <aggregate-count-only>",
+            "review_rows_written_count = <aggregate-count-only>",
+            "form_or_source_rows_updated_count = <aggregate-count-only>",
+            "member_create_or_update_invoked = false",
+            "autocount_write_attempted = false",
+            "direct_sql_write_attempted = false",
+            "workflow_activation = inactive",
+            "scheduler_enabled = false",
+            "public_inbound_to_ac2_host = false",
+            "final_write_automation = false",
+        ]
+        for field in expected_fields:
+            self.assertIn(field, body)
+
+        self.assertIn("No credentials, connection strings, Sheet IDs/URLs", body)
+        self.assertIn("raw/encoded/normalized member values", body)
+        self.assertIn("command transcripts, stderr/stdout", body)
+        self.assertIn("node raw input/output dumps", body)
+        self.assertIn("PII are pasted", body)
+        self.assertIn("All count fields are aggregate-count-only", plan)
+        self.assertIn("Do not include result rows, fixture rows, queue rows, source rows", plan)
+        self.assertNotRegex(body, r"https://docs\.google\.com/spreadsheets/d/")
+        self.assertNotRegex(body, r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b")
+        self.assertNotRegex(body, r"(?i)\b(?:\+?65)?[689]\d{7}\b")
+        self.assertNotRegex(body, r"submitted_member_no_base64_utf8")
+        self.assertNotRegex(body, r"(?i)\b(stdin|stdout|stderr)\s*=")
+
+    def test_gate4_plan_has_no_workflow_artifact_or_write_path_literals(self):
+        plan = self.read(UAT_PLAN)
+        setup = self.read(UAT_SETUP_RUNBOOK)
+        combined = plan + "\n" + setup
+
+        for token in FORBIDDEN_WRITE_TOKENS:
+            self.assertNotIn(token, combined, token)
+        self.assertNotRegex(
+            combined,
+            r"(?i)\b(SELECT\s+\*|INSERT\s+INTO|UPDATE\s+\w+\s+SET|DELETE\s+FROM|MERGE\s+INTO)\b",
+        )
+        self.assertNotRegex(combined, r"https://docs\.google\.com/spreadsheets/d/")
+        self.assertNotRegex(combined, r"(?i)(client_email|private_key|service_account|-----BEGIN PRIVATE KEY-----)")
+        self.assertNotRegex(combined, r"(?i)credential_id\s*=")
+        self.assertNotRegex(combined, r"(?i)workflow export file")
+        self.assertRegex(combined, r"(?i)does not add a workflow export")
+        self.assertRegex(combined, r"(?i)does not activate n8n")
+        self.assertRegex(combined, r"(?i)does not authorize AutoCount writes")
 
     def test_uat_setup_records_local_operator_n8n_rehearsal_without_hosted_runtime_claim(self):
         setup = self.read(UAT_SETUP_RUNBOOK)

@@ -197,7 +197,9 @@ This Gate 3 pass does not prove production automation, does not authorize member
 
 Only after Gates 1, 2/2A, and 3 pass may an operator consider a real queue UAT where the Windows bridge polls outbound and touches AC2 lookup. Gate 4 is still review-only, dry-run-only, and inactive by default. It cannot create or update AutoCount members. The local operator PC n8n dummy wiring pass does not prove hosted/VPS readiness; hosted/VPS runtime readiness must still be proven before any hosted/VPS real queue UAT.
 
-Gate 4 remains blocked until a separate reviewed PR defines the exact real queue UAT plan, including the queue surface, dummy-to-real transition boundary, hosted/VPS runtime readiness proof, operator evidence shape, rollback/stop conditions, and review-only status handling.
+Gate 4 remains plan-only in the current reviewed PR. The exact real queue UAT plan is defined in [member_intake_n8n_lookup_bridge_uat_plan.md](member_intake_n8n_lookup_bridge_uat_plan.md), including the queue surface, dummy-to-real transition boundary, hosted/VPS runtime readiness proof, operator evidence shape, stop conditions, and review-only status handling.
+
+This plan definition does not run Gate 4. It does not activate n8n, does not touch real queue data from this PR, does not call AC2, does not authorize AutoCount writes, does not authorize member create/update/delete, does not authorize direct SQL writes, and does not authorize scheduler or production activation.
 
 ## Minimum Next Runnable n8n UAT Step
 

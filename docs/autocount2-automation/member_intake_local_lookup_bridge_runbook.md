@@ -366,7 +366,7 @@ This pass proves only that the local Windows AC2 lookup environment was availabl
 
 This pass does not prove production automation, does not authorize member create/update, does not authorize AutoCount writes, and does not by itself prove hosted/VPS n8n runtime readiness.
 
-Gate 4 remains blocked until a separate reviewed PR defines the exact real queue UAT plan. Passing Gate 3 is readiness evidence for a future plan review, not approval to run a real queue UAT.
+Gate 4 remains not approved to run until the reviewed Gate 4 plan PR is merged and the operator gives explicit run approval. Passing Gate 3 is readiness evidence for the plan review, not approval to run a real queue UAT.
 
 ## Review-Only Routing
 
