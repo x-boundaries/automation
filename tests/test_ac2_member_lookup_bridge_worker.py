@@ -12,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "ac2_member_lookup_bridge_worker.py"
 GATE3B_PREP_SCRIPT = ROOT / "scripts" / "member_lookup_gate3b_prepare_local_queue.py"
 GATE3B_SUMMARY_SCRIPT = ROOT / "scripts" / "member_lookup_gate3b_evidence_summary.py"
+GATE3C_RUNTIME_SCRIPT = ROOT / "scripts" / "member_lookup_gate3c_local_bridge_runtime.py"
 README = ROOT / "README.md"
 GITIGNORE = ROOT / ".gitignore"
 DOCS = ROOT / "docs" / "autocount2-automation"
@@ -131,6 +132,14 @@ def write_jsonl(path, rows):
             handle.write(json.dumps(row, sort_keys=True) + "\n")
 
 
+def parse_key_value_evidence(text):
+    evidence = {}
+    for line in text.splitlines():
+        key, value = line.split(" = ", 1)
+        evidence[key] = value
+    return evidence
+
+
 class BridgeWorkerCliTests(unittest.TestCase):
     def run_cli(self, arguments):
         return subprocess.run(
@@ -152,6 +161,14 @@ class BridgeWorkerCliTests(unittest.TestCase):
     def run_gate3b_summary(self, arguments):
         return subprocess.run(
             [sys.executable, str(GATE3B_SUMMARY_SCRIPT)] + arguments,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+    def run_gate3c_runtime(self, arguments):
+        return subprocess.run(
+            [sys.executable, str(GATE3C_RUNTIME_SCRIPT)] + arguments,
             text=True,
             capture_output=True,
             check=False,
@@ -694,6 +711,264 @@ class BridgeWorkerCliTests(unittest.TestCase):
             self.assertEqual(evidence["lookup_error_count"], "1")
             self.assertEqual(evidence["direct_sql_write_attempted"], "false")
 
+    def test_gate3c_runtime_processes_once_and_repeated_run_counts_duplicates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            pending_path = tmp_path / "member_lookup_bridge_gate3c_pending_queue.jsonl"
+            mock_results_path = tmp_path / "member_lookup_bridge_mock_results.jsonl"
+            results_path = tmp_path / "member_lookup_bridge_gate3c_results.jsonl"
+            processed_dir = tmp_path / "member_lookup_bridge_gate3c_processed"
+            failed_dir = tmp_path / "member_lookup_bridge_gate3c_failed"
+            write_jsonl(
+                pending_path,
+                [
+                    fixture_job(job_id="gate3c-ready", intake_source="ac2_local_gate3c", payload_hash="hash-ready"),
+                    fixture_job(
+                        job_id="gate3c-existing",
+                        intake_source="ac2_local_gate3c",
+                        source_reference="gate3c-existing-ref",
+                        payload_hash="hash-existing",
+                    ),
+                ],
+            )
+            write_jsonl(mock_results_path, [mock_result("gate3c-existing", member_exists=True)])
+            base_args = [
+                "--enable-local-bridge-runtime-review",
+                "--pending-jsonl",
+                str(pending_path),
+                "--results-jsonl",
+                str(results_path),
+                "--processed-dir",
+                str(processed_dir),
+                "--failed-dir",
+                str(failed_dir),
+                "--lookup-mode",
+                "mock",
+                "--fixture-mock-results",
+                str(mock_results_path),
+            ]
+
+            first = self.run_gate3c_runtime(base_args)
+
+            self.assertEqual(first.returncode, 0, first.stderr)
+            first_evidence = parse_key_value_evidence(first.stdout)
+            self.assertEqual(first_evidence["status"], "dry_run_only")
+            self.assertEqual(first_evidence["gate"], "gate3c_ac2_local_bridge_runtime_hardening")
+            self.assertEqual(first_evidence["runtime_location"], "windows_ac2_bridge_host_only")
+            self.assertEqual(first_evidence["execution_mode"], "manual_local_filesystem_runtime_hardening")
+            self.assertEqual(first_evidence["lookup_mode"], "mock")
+            self.assertEqual(first_evidence["powershell_lookup_enabled"], "false")
+            self.assertEqual(first_evidence["pending_rows_loaded_count"], "2")
+            self.assertEqual(first_evidence["lookup_attempt_count"], "2")
+            self.assertEqual(first_evidence["lookup_success_count"], "2")
+            self.assertEqual(first_evidence["lookup_error_count"], "0")
+            self.assertEqual(first_evidence["processed_or_archived_count"], "2")
+            self.assertEqual(first_evidence["failed_or_dead_letter_count"], "0")
+            self.assertEqual(first_evidence["duplicate_or_already_processed_count"], "0")
+            self.assertEqual(first_evidence["member_create_or_update_invoked"], "false")
+            self.assertEqual(first_evidence["autocount_write_attempted"], "false")
+            self.assertEqual(first_evidence["direct_sql_write_attempted"], "false")
+            self.assertEqual(first_evidence["final_write_automation"], "false")
+            self.assertEqual(first_evidence["n8n_required"], "false")
+            self.assertEqual(first_evidence["google_sheets_required"], "false")
+            self.assertEqual(first_evidence["hosted_or_vps_service_called"], "false")
+            self.assertEqual(first_evidence["scheduler_enabled"], "false")
+            self.assertEqual(first_evidence["public_inbound_to_ac2_host"], "false")
+            self.assertEqual(first_evidence["no_row_values_printed"], "true")
+
+            result_rows = [json.loads(line) for line in results_path.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(len(result_rows), 2)
+            self.assertEqual({row["state"] for row in result_rows}, {"READY_FOR_CREATE_REVIEW", "EXISTING_MEMBER_REVIEW"})
+            self.assertEqual(len(list(processed_dir.glob("*.json"))), 2)
+            self.assertFalse(failed_dir.exists())
+            self.assertNotIn(ENCODED_SYNTHETIC_VALUE, results_path.read_text(encoding="utf-8"))
+            self.assertNotIn("submitted_member_no_base64_utf8", results_path.read_text(encoding="utf-8"))
+
+            second = self.run_gate3c_runtime(base_args)
+
+            self.assertEqual(second.returncode, 0, second.stderr)
+            second_evidence = parse_key_value_evidence(second.stdout)
+            self.assertEqual(second_evidence["status"], "dry_run_only")
+            self.assertEqual(second_evidence["pending_rows_loaded_count"], "2")
+            self.assertEqual(second_evidence["lookup_attempt_count"], "0")
+            self.assertEqual(second_evidence["lookup_success_count"], "0")
+            self.assertEqual(second_evidence["processed_or_archived_count"], "0")
+            self.assertEqual(second_evidence["duplicate_or_already_processed_count"], "2")
+            self.assertEqual(len(results_path.read_text(encoding="utf-8").splitlines()), 2)
+
+    def test_gate3c_runtime_empty_pending_file_is_no_work_not_pass_evidence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            pending_path = tmp_path / "member_lookup_bridge_gate3c_pending_queue.jsonl"
+            results_path = tmp_path / "member_lookup_bridge_gate3c_results.jsonl"
+            processed_dir = tmp_path / "member_lookup_bridge_gate3c_processed"
+            failed_dir = tmp_path / "member_lookup_bridge_gate3c_failed"
+            pending_path.write_text("", encoding="utf-8")
+
+            completed = self.run_gate3c_runtime(
+                [
+                    "--enable-local-bridge-runtime-review",
+                    "--pending-jsonl",
+                    str(pending_path),
+                    "--results-jsonl",
+                    str(results_path),
+                    "--processed-dir",
+                    str(processed_dir),
+                    "--failed-dir",
+                    str(failed_dir),
+                    "--lookup-mode",
+                    "powershell",
+                    "--enable-powershell-lookup",
+                ]
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            evidence = parse_key_value_evidence(completed.stdout)
+            self.assertEqual(evidence["status"], "no_work")
+            self.assertEqual(evidence["runtime_location"], "windows_ac2_bridge_host_only")
+            self.assertEqual(evidence["execution_mode"], "manual_local_filesystem_runtime_hardening")
+            self.assertEqual(evidence["lookup_mode"], "powershell")
+            self.assertEqual(evidence["powershell_lookup_enabled"], "true")
+            self.assertEqual(evidence["pending_rows_loaded_count"], "0")
+            self.assertEqual(evidence["lookup_attempt_count"], "0")
+            self.assertEqual(evidence["lookup_success_count"], "0")
+            self.assertEqual(evidence["lookup_error_count"], "0")
+            self.assertEqual(evidence["failed_or_dead_letter_count"], "0")
+            self.assertFalse(results_path.exists())
+            self.assertFalse(processed_dir.exists())
+            self.assertFalse(failed_dir.exists())
+
+    def test_gate3c_runtime_powershell_mode_evidence_includes_metadata_without_row_values(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            pending_path = tmp_path / "member_lookup_bridge_gate3c_pending_queue.jsonl"
+            results_path = tmp_path / "member_lookup_bridge_gate3c_results.jsonl"
+            processed_dir = tmp_path / "member_lookup_bridge_gate3c_processed"
+            failed_dir = tmp_path / "member_lookup_bridge_gate3c_failed"
+            encoded_value = base64.b64encode(b"member-fixture-private").decode("ascii")
+            write_jsonl(
+                pending_path,
+                [
+                    fixture_job(
+                        job_id="gate3c-powershell-metadata",
+                        intake_source="ac2_local_gate3c",
+                        payload_hash="hash-powershell-metadata",
+                        submitted_member_no_base64_utf8=encoded_value,
+                    )
+                ],
+            )
+
+            completed = self.run_gate3c_runtime(
+                [
+                    "--enable-local-bridge-runtime-review",
+                    "--pending-jsonl",
+                    str(pending_path),
+                    "--results-jsonl",
+                    str(results_path),
+                    "--processed-dir",
+                    str(processed_dir),
+                    "--failed-dir",
+                    str(failed_dir),
+                    "--lookup-mode",
+                    "powershell",
+                    "--enable-powershell-lookup",
+                    "--lookup-script",
+                    str(tmp_path / "missing_lookup_script.ps1"),
+                ]
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            evidence = parse_key_value_evidence(completed.stdout)
+            self.assertEqual(evidence["status"], "needs_fix")
+            self.assertEqual(evidence["runtime_location"], "windows_ac2_bridge_host_only")
+            self.assertEqual(evidence["execution_mode"], "manual_local_filesystem_runtime_hardening")
+            self.assertEqual(evidence["lookup_mode"], "powershell")
+            self.assertEqual(evidence["powershell_lookup_enabled"], "true")
+            self.assertEqual(evidence["pending_rows_loaded_count"], "1")
+            self.assertEqual(evidence["lookup_attempt_count"], "1")
+            self.assertEqual(evidence["lookup_success_count"], "0")
+            self.assertEqual(evidence["lookup_error_count"], "1")
+            self.assertEqual(evidence["failed_or_dead_letter_count"], "1")
+
+            result_text = results_path.read_text(encoding="utf-8")
+            failed_marker_text = "\n".join(path.read_text(encoding="utf-8") for path in failed_dir.glob("*.json"))
+            for forbidden in [
+                "member-fixture-private",
+                encoded_value,
+                "submitted_member_no_base64_utf8",
+                "normalized-member-fixture-private",
+                "Forbidden Person",
+                "forbidden@example.test",
+                "61234567",
+                "2000-01-01",
+                "AC2_PROBE_PASSWORD",
+                "missing_lookup_script.ps1",
+                "stdout",
+                "stderr",
+            ]:
+                self.assertNotIn(forbidden, completed.stdout)
+                self.assertNotIn(forbidden, result_text)
+                self.assertNotIn(forbidden, failed_marker_text)
+
+    def test_gate3c_runtime_dead_letters_malformed_queue_rows_without_echoing_values(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            pending_path = tmp_path / "member_lookup_bridge_gate3c_pending_queue.jsonl"
+            results_path = tmp_path / "member_lookup_bridge_gate3c_results.jsonl"
+            processed_dir = tmp_path / "member_lookup_bridge_gate3c_processed"
+            failed_dir = tmp_path / "member_lookup_bridge_gate3c_failed"
+            forbidden_value = "forbidden-person@example.test"
+            write_jsonl(
+                pending_path,
+                [
+                    fixture_job(
+                        job_id="gate3c-forbidden",
+                        intake_source="ac2_local_gate3c",
+                        payload_hash="hash-forbidden",
+                        email_address=forbidden_value,
+                    )
+                ],
+            )
+
+            completed = self.run_gate3c_runtime(
+                [
+                    "--enable-local-bridge-runtime-review",
+                    "--pending-jsonl",
+                    str(pending_path),
+                    "--results-jsonl",
+                    str(results_path),
+                    "--processed-dir",
+                    str(processed_dir),
+                    "--failed-dir",
+                    str(failed_dir),
+                    "--lookup-mode",
+                    "mock",
+                ]
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            evidence = parse_key_value_evidence(completed.stdout)
+            self.assertEqual(evidence["status"], "needs_fix")
+            self.assertEqual(evidence["pending_rows_loaded_count"], "1")
+            self.assertEqual(evidence["lookup_attempt_count"], "0")
+            self.assertEqual(evidence["failed_or_dead_letter_count"], "1")
+            self.assertEqual(evidence["no_row_values_printed"], "true")
+            self.assertFalse(processed_dir.exists())
+            self.assertEqual(len(list(failed_dir.glob("*.json"))), 1)
+            result_text = results_path.read_text(encoding="utf-8")
+            failed_marker_text = "\n".join(path.read_text(encoding="utf-8") for path in failed_dir.glob("*.json"))
+            self.assertIn("LOOKUP_ERROR_REVIEW", result_text)
+            self.assertIn("request_or_lookup_contract_error", result_text)
+            for forbidden in [
+                forbidden_value,
+                "email_address",
+                ENCODED_SYNTHETIC_VALUE,
+                "submitted_member_no_base64_utf8",
+            ]:
+                self.assertNotIn(forbidden, completed.stdout)
+                self.assertNotIn(forbidden, result_text)
+                self.assertNotIn(forbidden, failed_marker_text)
+
 
 class BridgeWorkerStaticGuardrailTests(unittest.TestCase):
     def recorded_gate3_evidence(self):
@@ -1012,6 +1287,108 @@ class BridgeWorkerStaticGuardrailTests(unittest.TestCase):
             "member_lookup_bridge_gate3b_results.jsonl",
             "autocount_outputs/review/member_lookup_bridge/member_lookup_bridge_gate3b_pending_queue.jsonl",
             "autocount_outputs/review/member_lookup_bridge/member_lookup_bridge_gate3b_results.jsonl",
+        ]:
+            completed = subprocess.run(
+                ["git", "check-ignore", ignored_path],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, ignored_path)
+
+    def test_gate3c_runtime_source_docs_and_artifacts_are_local_only(self):
+        source = GATE3C_RUNTIME_SCRIPT.read_text(encoding="utf-8")
+        readme = README.read_text(encoding="utf-8")
+        gitignore = GITIGNORE.read_text(encoding="utf-8")
+        bridge_runbook = BRIDGE_RUNBOOK.read_text(encoding="utf-8")
+        combined = "\n".join([source, readme, bridge_runbook])
+
+        for phrase in [
+            "scripts/member_lookup_gate3c_local_bridge_runtime.py",
+            "Gate 3C AC2 Local Bridge Runtime Hardening",
+            "local ignored pending queue JSONL",
+            "local ignored sanitized results JSONL",
+            "local ignored processed idempotency markers",
+            "local ignored failed/dead-letter markers",
+            "aggregate-only evidence",
+            "--enable-local-bridge-runtime-review",
+            "--pending-jsonl",
+            "--results-jsonl",
+            "--processed-dir",
+            "--failed-dir",
+            "--lookup-mode powershell",
+            "--enable-powershell-lookup",
+            "gate = gate3c_ac2_local_bridge_runtime_hardening",
+            "runtime_location = windows_ac2_bridge_host_only",
+            "execution_mode = manual_local_filesystem_runtime_hardening",
+            "lookup_mode = <mock/powershell>",
+            "powershell_lookup_enabled = <true/false>",
+            "pending_rows_loaded_count = <aggregate-count-only>",
+            "processed_or_archived_count = <aggregate-count-only>",
+            "failed_or_dead_letter_count = <aggregate-count-only>",
+            "duplicate_or_already_processed_count = <aggregate-count-only>",
+            "n8n_required = false",
+            "google_sheets_required = false",
+            "hosted_or_vps_service_called = false",
+            "scheduler_enabled = false",
+            "public_inbound_to_ac2_host = false",
+            "no_row_values_printed = true",
+            "Mock mode is allowed only for local harness validation and automated tests.",
+            "Mock-mode evidence is not Gate 3C AC2 runtime pass evidence.",
+            "lookup_mode = powershell",
+            "powershell_lookup_enabled = true",
+            "pending_rows_loaded_count >= 1",
+            "lookup_attempt_count >= 1",
+            "lookup_success_count >= 1",
+            "lookup_error_count = 0",
+            "failed_or_dead_letter_count = 0",
+            "`status = no_work` is not Gate 3C pass evidence.",
+        ]:
+            self.assertIn(phrase, combined)
+
+        for phrase in [
+            "does not require or use n8n",
+            "Google Sheets",
+            "a queue API",
+            "Cloudflare Tunnel",
+            "hosted service",
+            "scheduler",
+            "public inbound path",
+            "final write automation",
+            "does not create, update, delete, or otherwise write AutoCount members",
+            "does not perform direct SQL writes",
+        ]:
+            self.assertIn(phrase, bridge_runbook)
+
+        for token in FORBIDDEN_WRITE_TOKENS:
+            self.assertNotIn(token, source, token)
+        self.assertNotRegex(
+            source,
+            r"(?i)\b(SELECT\s+\*|INSERT\s+INTO|UPDATE\s+\w+\s+SET|DELETE\s+FROM|MERGE\s+INTO)\b",
+        )
+
+        for ignored_name in [
+            "member_lookup_bridge_gate3c_pending_queue.jsonl",
+            "member_lookup_bridge_gate3c_results.jsonl",
+            "member_lookup_bridge_gate3c_processed/",
+            "member_lookup_bridge_gate3c_failed/",
+            "autocount_outputs/**/member_lookup_bridge_gate3c_pending_queue.jsonl",
+            "autocount_outputs/**/member_lookup_bridge_gate3c_results.jsonl",
+            "autocount_outputs/**/member_lookup_bridge_gate3c_processed/",
+            "autocount_outputs/**/member_lookup_bridge_gate3c_failed/",
+        ]:
+            self.assertIn(ignored_name, gitignore)
+
+        for ignored_path in [
+            "member_lookup_bridge_gate3c_pending_queue.jsonl",
+            "member_lookup_bridge_gate3c_results.jsonl",
+            "member_lookup_bridge_gate3c_processed/handled.json",
+            "member_lookup_bridge_gate3c_failed/failed.json",
+            "autocount_outputs/review/member_lookup_bridge/member_lookup_bridge_gate3c_pending_queue.jsonl",
+            "autocount_outputs/review/member_lookup_bridge/member_lookup_bridge_gate3c_results.jsonl",
+            "autocount_outputs/review/member_lookup_bridge/member_lookup_bridge_gate3c_processed/handled.json",
+            "autocount_outputs/review/member_lookup_bridge/member_lookup_bridge_gate3c_failed/failed.json",
         ]:
             completed = subprocess.run(
                 ["git", "check-ignore", ignored_path],
