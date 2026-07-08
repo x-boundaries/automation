@@ -1,3 +1,4 @@
+import base64
 import json
 import re
 import subprocess
@@ -13,6 +14,7 @@ README = ROOT / "README.md"
 GITIGNORE = ROOT / ".gitignore"
 RUNBOOK = DOCS / "member_intake_n8n_gate4a_manual_queue_handoff_runbook.md"
 SCRIPT = ROOT / "scripts" / "member_lookup_gate4a_evidence_summary.py"
+PRECHECK_SCRIPT = ROOT / "scripts" / "member_lookup_gate4a_queue_precheck.py"
 
 FORBIDDEN_WRITE_TOKENS = [
     "Save" + "Member",
@@ -54,6 +56,30 @@ def result_row(**overrides):
     return row
 
 
+def queue_row(**overrides):
+    encoded_value = base64.b64encode(b"approved-real-member-value").decode("ascii")
+    row = {
+        "job_id": "queue-safe-001",
+        "intake_source": "google_sheets_uat",
+        "source_reference": "safe-source-001",
+        "source_row_ref": "safe-row-001",
+        "row_number": 2,
+        "intake_id": "intake-safe-001",
+        "state": "PENDING_LOOKUP",
+        "submitted_member_no_base64_utf8": encoded_value,
+        "consent_status": "acknowledged",
+        "pdpa_status": "yes",
+        "payload_hash": "safe-hash-001",
+        "attempt": 0,
+        "max_attempts": 1,
+        "created_at": "safe-created-at",
+        "updated_at": "safe-updated-at",
+        "timeout_at": "safe-timeout-at",
+    }
+    row.update(overrides)
+    return row
+
+
 def write_jsonl(path, rows):
     with open(path, "w", encoding="utf-8", newline="\n") as handle:
         for row in rows:
@@ -66,6 +92,119 @@ def parse_evidence(text):
         key, value = line.split(" = ", 1)
         parsed[key] = value
     return parsed
+
+
+class Gate4AQueuePrecheckTests(unittest.TestCase):
+    def run_precheck(self, queue_path):
+        return subprocess.run(
+            [
+                sys.executable,
+                str(PRECHECK_SCRIPT),
+                "--queue-jsonl",
+                str(queue_path),
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+    def test_precheck_prints_only_aggregate_queue_write_shape(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            queue_path = Path(tmp) / "member_lookup_bridge_gate4a_pending_queue.jsonl"
+            write_jsonl(queue_path, [queue_row()])
+
+            completed = self.run_precheck(queue_path)
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            evidence = parse_evidence(completed.stdout)
+            self.assertEqual(evidence["status"], "ok")
+            self.assertEqual(evidence["gate"], "gate4a_real_queue_write_pre_bridge_check")
+            self.assertEqual(evidence["runtime_location"], "local_operator_pc_non_ac2_n8n_stack")
+            self.assertEqual(evidence["execution_mode"], "manual_inactive_queue_write_pre_bridge_check")
+            self.assertEqual(evidence["queue_row_count"], "1")
+            self.assertEqual(evidence["queue_base64_decode_ok_count"], "1")
+            self.assertEqual(evidence["queue_base64_decode_fail_count"], "0")
+            self.assertEqual(evidence["queue_decoded_blank_count"], "0")
+            self.assertEqual(evidence["queue_decoded_looks_dummy_count"], "0")
+            self.assertEqual(evidence["unexpected_queue_shape_count"], "0")
+            self.assertEqual(evidence["bridge_handoff_approved"], "false")
+            self.assertEqual(evidence["ac2_lookup_invoked"], "false")
+            self.assertEqual(evidence["workflow_activation"], "inactive")
+            self.assertEqual(evidence["scheduler_enabled"], "false")
+            self.assertEqual(evidence["public_inbound_to_ac2_host"], "false")
+            self.assertEqual(evidence["member_create_or_update_invoked"], "false")
+            self.assertEqual(evidence["autocount_write_attempted"], "false")
+            self.assertEqual(evidence["direct_sql_write_attempted"], "false")
+            self.assertEqual(evidence["final_write_automation"], "false")
+            self.assertEqual(evidence["no_row_values_printed"], "true")
+
+            for forbidden in [
+                "queue-safe",
+                "safe-source",
+                "safe-row",
+                "row_number",
+                "submitted_member_no_base64_utf8",
+                "approved-real-member-value",
+                queue_row()["submitted_member_no_base64_utf8"],
+            ]:
+                self.assertNotIn(forbidden, completed.stdout)
+
+    def test_precheck_marks_needs_fix_for_dummy_or_bad_queue_without_value_echo(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            queue_path = Path(tmp) / "member_lookup_bridge_gate4a_pending_queue.jsonl"
+            dummy_encoded = base64.b64encode(b"dummy-rehearsal-value").decode("ascii")
+            write_jsonl(
+                queue_path,
+                [
+                    queue_row(submitted_member_no_base64_utf8=dummy_encoded),
+                    queue_row(job_id="queue-safe-002", source_reference="safe-source-002"),
+                ],
+            )
+
+            completed = self.run_precheck(queue_path)
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            evidence = parse_evidence(completed.stdout)
+            self.assertEqual(evidence["status"], "needs_fix")
+            self.assertEqual(evidence["queue_row_count"], "2")
+            self.assertEqual(evidence["queue_base64_decode_ok_count"], "2")
+            self.assertEqual(evidence["queue_base64_decode_fail_count"], "0")
+            self.assertEqual(evidence["queue_decoded_looks_dummy_count"], "1")
+            self.assertEqual(evidence["bridge_handoff_approved"], "false")
+            self.assertEqual(evidence["ac2_lookup_invoked"], "false")
+            self.assertNotIn("dummy-rehearsal-value", completed.stdout)
+            self.assertNotIn(dummy_encoded, completed.stdout)
+
+    def test_precheck_rejects_extra_forbidden_fields_without_name_or_value_echo(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            queue_path = Path(tmp) / "member_lookup_bridge_gate4a_pending_queue.jsonl"
+            forbidden_values = {
+                "name": "Forbidden Person",
+                "email": "forbidden@example.test",
+                "raw_phone": "61234567",
+                "birthday": "2000-01-01",
+                "normalized_member_no": "normalized-forbidden",
+                "sheet_url": "forbidden-sheet-url",
+                "credential_id": "forbidden-credential-id",
+                "node_raw_input": "forbidden-node-raw-input",
+            }
+            write_jsonl(queue_path, [queue_row(**forbidden_values)])
+
+            completed = self.run_precheck(queue_path)
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            evidence = parse_evidence(completed.stdout)
+            self.assertEqual(evidence["status"], "needs_fix")
+            self.assertEqual(evidence["queue_row_count"], "1")
+            self.assertEqual(evidence["queue_base64_decode_ok_count"], "1")
+            self.assertGreater(int(evidence["unexpected_queue_shape_count"]), 0)
+            self.assertEqual(evidence["bridge_handoff_approved"], "false")
+            self.assertEqual(evidence["ac2_lookup_invoked"], "false")
+
+            for forbidden_field in forbidden_values:
+                self.assertNotRegex(completed.stdout, rf"\b{re.escape(forbidden_field)}\b")
+            for forbidden_value in forbidden_values.values():
+                self.assertNotIn(forbidden_value, completed.stdout)
 
 
 class Gate4ASummarizerTests(unittest.TestCase):
@@ -267,7 +406,9 @@ class Gate4ARunbookTests(unittest.TestCase):
 
         self.assertTrue(RUNBOOK.exists())
         self.assertTrue(SCRIPT.exists())
+        self.assertTrue(PRECHECK_SCRIPT.exists())
         self.assertIn(RUNBOOK.name, readme)
+        self.assertIn("scripts/member_lookup_gate4a_queue_precheck.py", readme)
         self.assertIn("scripts/member_lookup_gate4a_evidence_summary.py", readme)
         self.assertIn("member_lookup_bridge_gate4a_pending_queue.jsonl", gitignore)
         self.assertIn("member_lookup_bridge_gate4a_results.jsonl", gitignore)
@@ -276,7 +417,7 @@ class Gate4ARunbookTests(unittest.TestCase):
         runbook = self.read(RUNBOOK)
 
         for phrase in [
-            "Gate 4A runnable package only",
+            "Gate 4A queue-write preparation package only",
             "does not run Gate 4A",
             "does not run Gate 4",
             "does not activate n8n",
@@ -297,7 +438,10 @@ class Gate4ARunbookTests(unittest.TestCase):
             "carries forward the Gate 3 local lookup auth setting",
             "is still read-only",
             "scripts\\member_lookup_gate4a_evidence_summary.py",
+            "scripts\\member_lookup_gate4a_queue_precheck.py",
             "n8n result mapping is deferred",
+            "This PR stops before bridge handoff",
+            "The local bridge lookup step is deferred unless the operator explicitly approves the next step",
         ]:
             self.assertIn(phrase, runbook)
 
@@ -332,8 +476,10 @@ class Gate4ARunbookTests(unittest.TestCase):
             "does not run n8n result mapping",
             "does not authorize any AutoCount write path",
             "Initially this must be exactly one source row",
-            "Read exactly the tiny approved source batch, initially one row",
+            "n8n manually reads exactly one approved real Google Form/Sheet source row",
+            "n8n validates required fields and `PDPA Acknowledged = Yes`",
             "Write only one sanitized non-dummy `PENDING_LOOKUP` queue row",
+            "Stop before bridge handoff after the aggregate pre-bridge check",
             "AutoCount `MobilePhone` is intentionally unused",
             "maps to AutoCount `MemberNo`",
         ]:
@@ -362,6 +508,10 @@ class Gate4ARunbookTests(unittest.TestCase):
             "no decode failures",
             "no blank decoded value",
             "no dummy-looking decoded value",
+            "gate = gate4a_real_queue_write_pre_bridge_check",
+            "bridge_handoff_approved = false",
+            "ac2_lookup_invoked = false",
+            "This successful precheck does not approve local bridge handoff",
         ]:
             self.assertIn(phrase, runbook)
 
@@ -421,10 +571,55 @@ class Gate4ARunbookTests(unittest.TestCase):
             r"(?i)\b(SELECT\s+\*|INSERT\s+INTO|UPDATE\s+\w+\s+SET|DELETE\s+FROM|MERGE\s+INTO)\b",
         )
 
-    def test_runbook_evidence_shape_is_exact_and_aggregate_only(self):
+    def test_runbook_pre_bridge_queue_evidence_shape_is_exact_and_aggregate_only(self):
         runbook = self.read(RUNBOOK)
         match = re.search(
-            r"```text\n(?P<body>status = <ok/needs_fix>.*?PII are pasted\.)\n```",
+            r"Required pre-bridge paste-back shape:\n\n```text\n(?P<body>status = <ok/needs_fix>.*?PII are pasted\.)\n```",
+            runbook,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(match)
+        body = match.group("body")
+
+        expected_lines = [
+            "status = <ok/needs_fix>",
+            "gate = gate4a_real_queue_write_pre_bridge_check",
+            "runtime_location = local_operator_pc_non_ac2_n8n_stack",
+            "execution_mode = manual_inactive_queue_write_pre_bridge_check",
+            "queue_row_count = <aggregate-count-only>",
+            "queue_base64_decode_ok_count = <aggregate-count-only>",
+            "queue_base64_decode_fail_count = <aggregate-count-only>",
+            "queue_decoded_blank_count = <aggregate-count-only>",
+            "queue_decoded_looks_dummy_count = <aggregate-count-only>",
+            "unexpected_queue_shape_count = <aggregate-count-only>",
+            "bridge_handoff_approved = false",
+            "ac2_lookup_invoked = false",
+            "n8n_result_mapping_run = false",
+            "workflow_activation = inactive",
+            "scheduler_enabled = false",
+            "public_inbound_to_ac2_host = false",
+            "member_create_or_update_invoked = false",
+            "autocount_write_attempted = false",
+            "direct_sql_write_attempted = false",
+            "final_write_automation = false",
+            "no_row_values_printed = true",
+            "sanitized_note = No credentials, connection strings, Sheet IDs/URLs, credential IDs, row-level output, raw/encoded/decoded/normalized member values, names, emails, phone numbers, birthdays, command transcripts, stderr/stdout, execution payloads, node raw input/output dumps, screenshots, or PII are pasted.",
+        ]
+        self.assertEqual(body.splitlines(), expected_lines)
+
+        for forbidden in [
+            "job_id",
+            "source_reference",
+            "source_row_ref",
+            "row_number",
+            "submitted_member_no_base64_utf8",
+        ]:
+            self.assertNotIn(forbidden, body)
+
+    def test_deferred_lookup_evidence_shape_is_exact_and_aggregate_only(self):
+        runbook = self.read(RUNBOOK)
+        match = re.search(
+            r"Deferred Lookup Paste-Back Evidence.*?```text\n(?P<body>status = <ok/needs_fix>.*?PII are pasted\.)\n```",
             runbook,
             re.DOTALL,
         )
@@ -471,6 +666,7 @@ class Gate4ARunbookTests(unittest.TestCase):
             [
                 self.read(RUNBOOK),
                 self.read(SCRIPT),
+                self.read(PRECHECK_SCRIPT),
                 self.read(README),
                 self.read(GITIGNORE),
             ]

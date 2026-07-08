@@ -1,6 +1,6 @@
 # Member Intake n8n Gate 4A Manual Queue Handoff Runbook
 
-Status: Gate 4A runnable package only. This runbook does not run Gate 4A, does not run Gate 4, does not activate n8n, does not touch real Google Sheets queue data from repo work, does not call AC2 from Codex, does not run PowerShell from Codex, and does not authorize AutoCount writes.
+Status: Gate 4A queue-write preparation package only. This runbook does not run Gate 4A lookup, does not run Gate 4, does not activate n8n, does not touch real Google Sheets queue data from repo work, does not call AC2 from Codex, does not run PowerShell from Codex, and does not authorize AutoCount writes. This PR stops before bridge handoff.
 
 ## Purpose
 
@@ -8,22 +8,22 @@ Gate 4A is the manual handoff path for AC2 lookup-only review routing when no re
 
 The current lookup queue tab contains only dummy Gate 2 rehearsal rows. Those rows proved TSV-to-JSONL handoff mechanics only. They are not real Gate 4A queue rows, must not be passed to AC2 lookup, and must not be recorded as Gate 4A pass evidence.
 
-The path is:
+The next safe path in this PR is:
 
 ```text
 inactive/manual local operator PC non-AC2 n8n
-  -> writes sanitized PENDING_LOOKUP rows to Google Sheets UAT queue tab
+  -> reads exactly one approved real Google Form/Sheet source row
+  -> validates required fields and PDPA Acknowledged = Yes
+  -> writes exactly one sanitized non-dummy PENDING_LOOKUP row to Google Sheets UAT queue tab
 operator manual handoff
-  -> exports/copies only approved sanitized queue rows to local ignored JSONL
-local Windows AC2 lookup bridge
-  -> reads local JSONL using fixture queue mode
-  -> calls only the read-only PowerShell lookup path
-  -> writes local sanitized result JSONL
-local summarizer
-  -> prints aggregate-only Gate 4A evidence
+  -> exports/copies only that approved sanitized queue row to local ignored JSONL
+local queue precheck
+  -> prints aggregate-only pre-bridge queue evidence
+operator stop
+  -> no bridge handoff unless explicitly approved later
 ```
 
-Gate 4A does not claim a real Google Sheets poller, production queue poller, n8n result mapping run, scheduler, webhook, tunnel, public inbound AC2 exposure, member create/update/delete path, AutoCount write path, direct SQL write path, or final write automation.
+Gate 4A does not claim a real Google Sheets poller, production queue poller, n8n result mapping run, scheduler, webhook, tunnel, public inbound AC2 exposure, member create/update/delete path, AutoCount write path, direct SQL write path, local bridge handoff approval, AC2 lookup execution, or final write automation.
 
 ## Real Queue-Write Preparation Gate
 
@@ -41,7 +41,7 @@ The required pre-bridge aggregate checks are:
 - `queue_decoded_blank_count = 0`
 - `queue_decoded_looks_dummy_count = 0`
 
-The preparation gate may be recorded only as queue-write precheck evidence, not as Gate 4A lookup evidence or Gate 4A pass evidence.
+The preparation gate may be recorded only as queue-write precheck evidence, not as Gate 4A lookup evidence or Gate 4A pass evidence. Stop before bridge handoff after the aggregate pre-bridge check. This successful precheck does not approve local bridge handoff, AC2 lookup, result mapping, or final write automation.
 
 ## Local Ignored File Paths
 
@@ -79,6 +79,7 @@ Before running Gate 4A, the operator confirms:
 13. The lookup queue tab does not contain only dummy Gate 2 rehearsal rows.
 14. The real queue-write preparation gate produced exactly one non-dummy sanitized `PENDING_LOOKUP` row.
 15. Sheet URLs, Sheet IDs, credential IDs, OAuth details, service account JSON, execution payloads, node raw input/output dumps, row-level data, raw/encoded/normalized member values, names, emails, phone numbers, command transcripts, stderr/stdout, secrets, connection strings, and PII will stay out of pasted evidence.
+16. The operator will stop before bridge handoff unless an explicit later approval names the next bridge step.
 
 Stop if any item cannot be confirmed.
 
@@ -109,8 +110,8 @@ Run n8n manually while inactive:
 3. Confirm no scheduler is enabled.
 4. Confirm no webhook/tunnel/public inbound AC2 callback is configured.
 5. Manually run only the queue-write path.
-6. Read exactly the tiny approved source batch, initially one row.
-7. Require `Name`, the submitted phone/member number, `Email`, birthday when applicable to the source, and `PDPA Acknowledged = Yes`.
+6. n8n manually reads exactly one approved real Google Form/Sheet source row.
+7. n8n validates required fields and `PDPA Acknowledged = Yes`: `Name`, the submitted phone/member number, `Email`, birthday when applicable to the source, and `PDPA Acknowledged = Yes`.
 8. Normalize only what is needed for queue routing.
 9. Encode the submitted phone/member number into `submitted_member_no_base64_utf8`.
 10. Write only one sanitized non-dummy `PENDING_LOOKUP` queue row to the Google Sheets UAT queue tab.
@@ -119,7 +120,7 @@ Run n8n manually while inactive:
 13. Do not run n8n result mapping in Gate 4A.
 14. Do not paste raw node input/output, execution payloads, Sheet URLs, Sheet IDs, credential IDs, row-level output, command output, raw member values, encoded member values, decoded member values, normalized member values, or PII.
 
-Stop if the n8n run reads or writes more rows than the approved batch, writes a dummy queue row, writes a blank encoded lookup value, writes unexpected columns, activates the workflow, enables a scheduler, exposes inbound AC2 access, or references any write/create/update/delete path.
+Stop if the n8n run reads or writes more rows than the approved batch, reads a row without `PDPA Acknowledged = Yes`, writes a dummy queue row, writes a blank encoded lookup value, writes unexpected columns, activates the workflow, enables a scheduler, exposes inbound AC2 access, or references any write/create/update/delete path.
 
 The appended queue row must contain:
 
@@ -164,7 +165,50 @@ Rules:
 
 Stop if the local JSONL contains unexpected fields, more rows than approved, raw member values, normalized member values, names, emails, phone numbers, Sheet IDs/URLs, credentials, local target details, command output, or PII.
 
-## Local Bridge Lookup Step
+## Pre-Bridge Aggregate Queue Check
+
+Before any bridge handoff, run only the aggregate queue precheck. This command decodes the queued lookup value only in memory and prints counters only:
+
+```powershell
+$root = 'C:\XB\autocount_outputs\review\member_lookup_bridge'
+$queue = Join-Path $root 'member_lookup_bridge_gate4a_pending_queue.jsonl'
+
+python scripts\member_lookup_gate4a_queue_precheck.py `
+  --queue-jsonl "$queue"
+```
+
+Required pre-bridge paste-back shape:
+
+```text
+status = <ok/needs_fix>
+gate = gate4a_real_queue_write_pre_bridge_check
+runtime_location = local_operator_pc_non_ac2_n8n_stack
+execution_mode = manual_inactive_queue_write_pre_bridge_check
+queue_row_count = <aggregate-count-only>
+queue_base64_decode_ok_count = <aggregate-count-only>
+queue_base64_decode_fail_count = <aggregate-count-only>
+queue_decoded_blank_count = <aggregate-count-only>
+queue_decoded_looks_dummy_count = <aggregate-count-only>
+unexpected_queue_shape_count = <aggregate-count-only>
+bridge_handoff_approved = false
+ac2_lookup_invoked = false
+n8n_result_mapping_run = false
+workflow_activation = inactive
+scheduler_enabled = false
+public_inbound_to_ac2_host = false
+member_create_or_update_invoked = false
+autocount_write_attempted = false
+direct_sql_write_attempted = false
+final_write_automation = false
+no_row_values_printed = true
+sanitized_note = No credentials, connection strings, Sheet IDs/URLs, credential IDs, row-level output, raw/encoded/decoded/normalized member values, names, emails, phone numbers, birthdays, command transcripts, stderr/stdout, execution payloads, node raw input/output dumps, screenshots, or PII are pasted.
+```
+
+Continue only if the aggregate counters are exactly `queue_row_count = 1`, `queue_base64_decode_ok_count = 1`, `queue_base64_decode_fail_count = 0`, `queue_decoded_blank_count = 0`, `queue_decoded_looks_dummy_count = 0`, and `unexpected_queue_shape_count = 0`. This PR still stops here. This successful precheck does not approve local bridge handoff, AC2 lookup, result mapping, scheduler activation, webhook activation, member create/update/delete, AutoCount writes, direct SQL writes, or final write automation.
+
+## Deferred Local Bridge Lookup Step
+
+The local bridge lookup step is deferred unless the operator explicitly approves the next step after reviewing the aggregate pre-bridge queue evidence. Do not run the command below as part of this queue-write preparation PR.
 
 Run this only on the approved local Windows AC2 lookup bridge host. This command is for the operator, not Codex.
 
@@ -243,7 +287,9 @@ Stop Gate 4A immediately if any of these occur:
 - Any direct SQL write is attempted.
 - Any final write automation is referenced or invoked.
 
-## Final Paste-Back Evidence
+## Deferred Lookup Paste-Back Evidence
+
+This shape is for the later explicitly approved bridge lookup step only. It is not produced by the queue-write preparation PR.
 
 Paste back only the summarizer output in exactly this aggregate-only shape:
 
