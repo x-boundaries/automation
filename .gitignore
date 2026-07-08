@@ -169,10 +169,14 @@ ac2_member_lookup_bridge_worker_outputs/
 member_lookup_bridge_fixture_jobs.jsonl
 member_lookup_bridge_mock_results.jsonl
 member_lookup_bridge_results.jsonl
+member_lookup_bridge_gate4a_pending_queue.jsonl
+member_lookup_bridge_gate4a_results.jsonl
 PRIVATE_DO_NOT_COMMIT_MEMBER_LOOKUP_BRIDGE.txt
 autocount_outputs/**/member_lookup_bridge_fixture_jobs.jsonl
 autocount_outputs/**/member_lookup_bridge_mock_results.jsonl
 autocount_outputs/**/member_lookup_bridge_results.jsonl
+autocount_outputs/**/member_lookup_bridge_gate4a_pending_queue.jsonl
+autocount_outputs/**/member_lookup_bridge_gate4a_results.jsonl
 autocount_outputs/**/PRIVATE_DO_NOT_COMMIT_MEMBER_LOOKUP_BRIDGE.txt
 
 # Private local AC2 member extracts and form response exports must never be committed

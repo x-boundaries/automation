@@ -20,6 +20,7 @@ Task tracking, pending-work dashboards, completed-task logs, and personal planni
 - `scripts/ac2_member_browse_extract_review.ps1`: explicit opt-in read-only local member browse extract for migration reconciliation review; output contains PII and must not be committed.
 - `scripts/ac2_member_lookup_review.ps1`: explicit opt-in read-only local member lookup for future duplicate checking; the Windows AC2 lookup bridge should pass form values with `MemberNoBase64Utf8`, AC2 is source of truth, Google Form mobile/member number maps to AutoCount `MemberNo`, AutoCount `MobilePhone` is intentionally unused, and it does not create/update/delete members.
 - `scripts/ac2_member_lookup_bridge_worker.py`: disabled-by-default local polling worker skeleton for review-only AC2 member lookup bridge design; fixture/mock mode models the first Google Sheets UAT queue in fixture-only mode with source-agnostic fields for a future custom intake surface, without real Google API calls, PowerShell lookup mode is separately opt-in, and it never writes to AutoCount.
+- `scripts/member_lookup_gate4a_evidence_summary.py`: local aggregate-only Gate 4A evidence summarizer for sanitized bridge result JSONL; it prints counts and fixed false write/activation flags only, never row-level data.
 - `scripts/member_intake_validate.py`: dry-run-only validator/normalizer for Google Form member intake CSV rows, with optional matching against a private local AC2 member extract; it never creates, updates, or deletes AutoCount members, and its row-level outputs contain PII and must stay local.
 - `scripts/member_intake_decision_review.py`: dry-run-only decision review layer that combines validated Google Form rows with sanitized AC2 lookup JSONL or planned lookup review; AC2 remains source of truth, it does not create/update/delete members, and row-level outputs contain only row numbers, status codes, and issue codes.
 - `scripts/autocount_stock_extract.py`: stock extraction/archive workflow for AutoCount stock master, stock balance, and stock movement datasets.
@@ -48,7 +49,7 @@ Keep all generated AutoCount outputs under `C:\XB\autocount_outputs`:
 - Member intake API discovery review: `C:\XB\autocount_outputs\review\member_intake_discovery`
 - Member browse extract review: `C:\XB\autocount_outputs\review\member_browse_extract`
 - Member lookup review: sanitized console JSON only; no local member data output file is required. The Windows AC2 lookup bridge may parse this JSON for duplicate-check routing, but it must not be used as final write automation.
-- Member lookup bridge worker fixture outputs: `C:\XB\autocount_outputs\review\member_lookup_bridge`
+- Member lookup bridge worker fixture and Gate 4A manual handoff outputs: `C:\XB\autocount_outputs\review\member_lookup_bridge`
 - Member intake dry-run validation: `C:\XB\autocount_outputs\review\member_intake_validation`
 - Member intake dry-run decision review: `C:\XB\autocount_outputs\review\member_intake_decision`
 - Phase 1 reconciliation: `C:\XB\autocount_outputs\reconcile`
@@ -81,6 +82,7 @@ Raw CSVs and member browse extracts stay local and must not be committed. Member
 - [Member intake n8n UAT setup runbook](docs/autocount2-automation/member_intake_n8n_uat_setup_runbook.md)
 - [Member intake n8n Gate 2 dummy rehearsal runbook](docs/autocount2-automation/member_intake_n8n_gate2_dummy_rehearsal_runbook.md)
 - [Member intake n8n lookup bridge UAT plan](docs/autocount2-automation/member_intake_n8n_lookup_bridge_uat_plan.md)
+- [Member intake n8n Gate 4A manual queue handoff runbook](docs/autocount2-automation/member_intake_n8n_gate4a_manual_queue_handoff_runbook.md)
 - [Member intake n8n node contract](docs/autocount2-automation/member_intake_n8n_node_contract.md)
 - [Member form intake contract (dry-run validator)](docs/autocount2-automation/member_form_intake_contract.md)
 - [Member intake decision review runbook](docs/autocount2-automation/member_intake_decision_review_runbook.md)
