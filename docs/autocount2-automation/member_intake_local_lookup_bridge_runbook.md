@@ -1,6 +1,6 @@
 # Member Intake Local Lookup Bridge Runbook
 
-Status: design and dry-run worker skeleton only. Gate 3 local lookup preflight and Gate 3B AC2 local bridge readiness passes recorded. Gate 3C adds a local-only runtime hardening harness for repeated AC2 host test runs. This does not activate production automation and does not authorize AutoCount member writes.
+Status: design and dry-run worker skeleton only. Gate 3 local lookup preflight and Gate 3B AC2 local bridge readiness passes recorded. Gate 3C adds a local-only runtime hardening harness for repeated AC2 host test runs, with fresh and duplicate-rerun evidence recorded. Gate 3D sanitized AC2 local bridge small-batch evidence (duplicate-seed setup, mixed-batch proof, and idempotent rerun) is recorded. This does not activate production automation and does not authorize AutoCount member writes.
 
 ## Purpose
 
@@ -824,6 +824,98 @@ no_row_values_printed = true
 `status = mixed_expected` is the expected status for the deliberate Gate 3D mixed-batch proof when the run has at least one fresh successful lookup, at least one duplicate/already-processed row, and at least one malformed row routed to failed/dead-letter handling, with `lookup_error_count = 0`. It is not an all-success pass. It proves mixed-batch separation and expected failure routing.
 
 `status = ok` is for an all-success small batch with no malformed/dead-letter rows. `status = needs_fix` means an unexpected lookup/runtime failure, unsafe output, payload conflict, or other non-deliberate failure path needs review. `status = already_processed` proves idempotency only and is not fresh lookup pass evidence. Duplicate-only evidence proves local idempotency only. Malformed/dead-letter evidence proves failure routing only.
+
+Gate 3D was run manually on the Windows AC2 bridge host after the Gate 3D harness PR merged. The run was local-only and bridge-first: no n8n, no Google Sheets, no queue API, no Cloudflare Tunnel / `cloudflared`, no hosted/VPS service, no scheduler, no webhook, no public inbound AC2 exposure, no AutoCount writes, no direct SQL writes, no member create/update/delete, and no final automation were involved.
+
+Recorded Gate 3D duplicate-seed setup run evidence (setup only, not Gate 3D pass evidence):
+
+```text
+status = ok
+gate = gate3d_ac2_local_bridge_small_batch
+runtime_location = windows_ac2_bridge_host_only
+execution_mode = manual_local_filesystem_small_batch
+lookup_mode = powershell
+powershell_lookup_enabled = true
+pending_rows_loaded_count = 1
+lookup_attempt_count = 1
+lookup_success_count = 1
+lookup_error_count = 0
+processed_or_archived_count = 1
+failed_or_dead_letter_count = 0
+duplicate_or_already_processed_count = 0
+member_create_or_update_invoked = false
+autocount_write_attempted = false
+direct_sql_write_attempted = false
+final_write_automation = false
+n8n_required = false
+google_sheets_required = false
+hosted_or_vps_service_called = false
+scheduler_enabled = false
+public_inbound_to_ac2_host = false
+no_row_values_printed = true
+```
+
+Recorded Gate 3D mixed-batch evidence run:
+
+```text
+status = mixed_expected
+gate = gate3d_ac2_local_bridge_small_batch
+runtime_location = windows_ac2_bridge_host_only
+execution_mode = manual_local_filesystem_small_batch
+lookup_mode = powershell
+powershell_lookup_enabled = true
+pending_rows_loaded_count = 3
+lookup_attempt_count = 1
+lookup_success_count = 1
+lookup_error_count = 0
+processed_or_archived_count = 1
+failed_or_dead_letter_count = 1
+duplicate_or_already_processed_count = 1
+member_create_or_update_invoked = false
+autocount_write_attempted = false
+direct_sql_write_attempted = false
+final_write_automation = false
+n8n_required = false
+google_sheets_required = false
+hosted_or_vps_service_called = false
+scheduler_enabled = false
+public_inbound_to_ac2_host = false
+no_row_values_printed = true
+```
+
+Recorded Gate 3D rerun/idempotency evidence:
+
+```text
+status = already_processed
+gate = gate3d_ac2_local_bridge_small_batch
+runtime_location = windows_ac2_bridge_host_only
+execution_mode = manual_local_filesystem_small_batch
+lookup_mode = powershell
+powershell_lookup_enabled = true
+pending_rows_loaded_count = 3
+lookup_attempt_count = 0
+lookup_success_count = 0
+lookup_error_count = 0
+processed_or_archived_count = 0
+failed_or_dead_letter_count = 0
+duplicate_or_already_processed_count = 3
+member_create_or_update_invoked = false
+autocount_write_attempted = false
+direct_sql_write_attempted = false
+final_write_automation = false
+n8n_required = false
+google_sheets_required = false
+hosted_or_vps_service_called = false
+scheduler_enabled = false
+public_inbound_to_ac2_host = false
+no_row_values_printed = true
+```
+
+The duplicate-seed setup run created the initial local processed marker and is recorded for completeness only. The mixed-batch evidence run is the Gate 3D small-batch proof. Its `status = mixed_expected` is expected because the batch deliberately contains one duplicate/already-processed row, one fresh lookup row, and one malformed/dead-letter row. The malformed/dead-letter row is intentional failure-routing proof, not an unexpected runtime failure.
+
+The rerun proves idempotency only: the bridge did not rerun lookup, did not process new rows, did not dead-letter again, and counted all 3 rows as already processed. Together these runs prove the local bridge can separate fresh lookup, duplicate/idempotent handling, and malformed/dead-letter routing safely.
+
+No row-level data, raw/encoded/decoded/normalized member values, names, emails, phone numbers, birthday values, AC2 environment values, command transcripts, stdout/stderr transcripts, screenshots, Sheet IDs/URLs, credentials, secrets, or PII are recorded in this evidence.
 
 Do not paste pending rows, result rows, processed markers, failed markers, raw member values, encoded member values, decoded member values, normalized member values, names, emails, phone numbers, birthday values, AC2 environment values, command transcripts, stdout/stderr transcripts, execution payloads, credentials, Sheet IDs/URLs, screenshots, secrets, or PII. Keep `member_lookup_bridge_gate3d_pending_queue.jsonl`, `member_lookup_bridge_gate3d_results.jsonl`, `member_lookup_bridge_gate3d_processed`, and `member_lookup_bridge_gate3d_failed` local and ignored.
 
