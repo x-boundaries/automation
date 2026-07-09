@@ -13,6 +13,8 @@ SCRIPT = ROOT / "scripts" / "ac2_member_lookup_bridge_worker.py"
 GATE3B_PREP_SCRIPT = ROOT / "scripts" / "member_lookup_gate3b_prepare_local_queue.py"
 GATE3B_SUMMARY_SCRIPT = ROOT / "scripts" / "member_lookup_gate3b_evidence_summary.py"
 GATE3C_RUNTIME_SCRIPT = ROOT / "scripts" / "member_lookup_gate3c_local_bridge_runtime.py"
+GATE3D_PREP_SCRIPT = ROOT / "scripts" / "member_lookup_gate3d_prepare_small_batch.py"
+GATE3D_SMALL_BATCH_SCRIPT = ROOT / "scripts" / "member_lookup_gate3d_local_bridge_small_batch.py"
 README = ROOT / "README.md"
 GITIGNORE = ROOT / ".gitignore"
 DOCS = ROOT / "docs" / "autocount2-automation"
@@ -190,6 +192,23 @@ class BridgeWorkerCliTests(unittest.TestCase):
     def run_gate3c_runtime(self, arguments):
         return subprocess.run(
             [sys.executable, str(GATE3C_RUNTIME_SCRIPT)] + arguments,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+    def run_gate3d_prep(self, arguments, *, input_text=None):
+        return subprocess.run(
+            [sys.executable, str(GATE3D_PREP_SCRIPT)] + arguments,
+            input=input_text,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+    def run_gate3d_small_batch(self, arguments):
+        return subprocess.run(
+            [sys.executable, str(GATE3D_SMALL_BATCH_SCRIPT)] + arguments,
             text=True,
             capture_output=True,
             check=False,
@@ -1077,6 +1096,170 @@ class BridgeWorkerCliTests(unittest.TestCase):
                 self.assertNotIn(forbidden, result_text)
                 self.assertNotIn(forbidden, failed_marker_text)
 
+    def test_gate3d_small_batch_mixed_expected_and_rerun_idempotency_are_aggregate_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            pending_path = tmp_path / "member_lookup_bridge_gate3d_pending_queue.jsonl"
+            results_path = tmp_path / "member_lookup_bridge_gate3d_results.jsonl"
+            processed_dir = tmp_path / "member_lookup_bridge_gate3d_processed"
+            failed_dir = tmp_path / "member_lookup_bridge_gate3d_failed"
+            fake_powershell = tmp_path / "fake-powershell.cmd"
+            fake_lookup_script = tmp_path / "fake-lookup-script.ps1"
+            raw_member_value = "GATE3D-PRIVATE-SYNTHETIC"
+            encoded_value = base64.b64encode(raw_member_value.encode("utf-8")).decode("ascii")
+            write_fake_powershell_lookup(fake_powershell)
+            fake_lookup_script.write_text("# fake lookup script path only\n", encoding="utf-8")
+
+            seed_prep = self.run_gate3d_prep(
+                [
+                    "--enable-local-bridge-small-batch-review",
+                    "--mode",
+                    "duplicate-seed",
+                    "--member-value-stdin",
+                    "--queue-jsonl",
+                    str(pending_path),
+                ],
+                input_text=raw_member_value,
+            )
+
+            self.assertEqual(seed_prep.returncode, 0, seed_prep.stderr)
+            seed_summary = json.loads(seed_prep.stdout)
+            self.assertEqual(seed_summary["status"], "ok")
+            self.assertEqual(seed_summary["gate"], "gate3d_ac2_local_bridge_small_batch_queue_prep")
+            self.assertEqual(seed_summary["mode"], "duplicate-seed")
+            self.assertEqual(seed_summary["queue_row_count"], 1)
+            self.assertEqual(seed_summary["encoded_present_count"], 1)
+            self.assertTrue(seed_summary["no_row_values_printed"])
+            self.assertNotIn(raw_member_value, seed_prep.stdout)
+            self.assertNotIn(encoded_value, seed_prep.stdout)
+
+            base_args = [
+                "--enable-local-bridge-small-batch-review",
+                "--pending-jsonl",
+                str(pending_path),
+                "--results-jsonl",
+                str(results_path),
+                "--processed-dir",
+                str(processed_dir),
+                "--failed-dir",
+                str(failed_dir),
+                "--lookup-mode",
+                "powershell",
+                "--enable-powershell-lookup",
+                "--powershell-exe",
+                str(fake_powershell),
+                "--lookup-script",
+                str(fake_lookup_script),
+            ]
+
+            seed_run = self.run_gate3d_small_batch(base_args)
+
+            self.assertEqual(seed_run.returncode, 0, seed_run.stderr)
+            seed_evidence = parse_key_value_evidence(seed_run.stdout)
+            self.assertEqual(seed_evidence["status"], "ok")
+            self.assertEqual(seed_evidence["gate"], "gate3d_ac2_local_bridge_small_batch")
+            self.assertEqual(seed_evidence["execution_mode"], "manual_local_filesystem_small_batch")
+            self.assertEqual(seed_evidence["lookup_mode"], "powershell")
+            self.assertEqual(seed_evidence["powershell_lookup_enabled"], "true")
+            self.assertEqual(seed_evidence["pending_rows_loaded_count"], "1")
+            self.assertEqual(seed_evidence["lookup_success_count"], "1")
+            self.assertEqual(len(results_path.read_text(encoding="utf-8").splitlines()), 1)
+
+            mixed_prep = self.run_gate3d_prep(
+                [
+                    "--enable-local-bridge-small-batch-review",
+                    "--mode",
+                    "mixed-batch",
+                    "--member-value-stdin",
+                    "--queue-jsonl",
+                    str(pending_path),
+                ],
+                input_text=raw_member_value,
+            )
+
+            self.assertEqual(mixed_prep.returncode, 0, mixed_prep.stderr)
+            mixed_summary = json.loads(mixed_prep.stdout)
+            self.assertEqual(mixed_summary["status"], "ok")
+            self.assertEqual(mixed_summary["mode"], "mixed-batch")
+            self.assertEqual(mixed_summary["queue_row_count"], 3)
+            self.assertEqual(mixed_summary["encoded_present_count"], 2)
+            self.assertEqual(mixed_summary["malformed_row_count"], 1)
+            self.assertTrue(mixed_summary["no_row_values_printed"])
+            self.assertNotIn(raw_member_value, mixed_prep.stdout)
+            self.assertNotIn(encoded_value, mixed_prep.stdout)
+
+            mixed_run = self.run_gate3d_small_batch(base_args)
+
+            self.assertEqual(mixed_run.returncode, 0, mixed_run.stderr)
+            mixed_evidence = parse_key_value_evidence(mixed_run.stdout)
+            self.assertEqual(mixed_evidence["status"], "mixed_expected")
+            self.assertEqual(mixed_evidence["gate"], "gate3d_ac2_local_bridge_small_batch")
+            self.assertEqual(mixed_evidence["runtime_location"], "windows_ac2_bridge_host_only")
+            self.assertEqual(mixed_evidence["execution_mode"], "manual_local_filesystem_small_batch")
+            self.assertEqual(mixed_evidence["lookup_mode"], "powershell")
+            self.assertEqual(mixed_evidence["powershell_lookup_enabled"], "true")
+            self.assertEqual(mixed_evidence["pending_rows_loaded_count"], "3")
+            self.assertEqual(mixed_evidence["lookup_attempt_count"], "1")
+            self.assertEqual(mixed_evidence["lookup_success_count"], "1")
+            self.assertEqual(mixed_evidence["lookup_error_count"], "0")
+            self.assertEqual(mixed_evidence["processed_or_archived_count"], "1")
+            self.assertEqual(mixed_evidence["failed_or_dead_letter_count"], "1")
+            self.assertEqual(mixed_evidence["duplicate_or_already_processed_count"], "1")
+            self.assertEqual(mixed_evidence["member_create_or_update_invoked"], "false")
+            self.assertEqual(mixed_evidence["autocount_write_attempted"], "false")
+            self.assertEqual(mixed_evidence["direct_sql_write_attempted"], "false")
+            self.assertEqual(mixed_evidence["final_write_automation"], "false")
+            self.assertEqual(mixed_evidence["n8n_required"], "false")
+            self.assertEqual(mixed_evidence["google_sheets_required"], "false")
+            self.assertEqual(mixed_evidence["hosted_or_vps_service_called"], "false")
+            self.assertEqual(mixed_evidence["scheduler_enabled"], "false")
+            self.assertEqual(mixed_evidence["public_inbound_to_ac2_host"], "false")
+            self.assertEqual(mixed_evidence["no_row_values_printed"], "true")
+
+            result_text = results_path.read_text(encoding="utf-8")
+            failed_marker_text = "\n".join(path.read_text(encoding="utf-8") for path in failed_dir.glob("*.json"))
+            processed_marker_text = "\n".join(path.read_text(encoding="utf-8") for path in processed_dir.glob("*.json"))
+            self.assertEqual(len(result_text.splitlines()), 3)
+            self.assertEqual(len(list(processed_dir.glob("*.json"))), 2)
+            self.assertEqual(len(list(failed_dir.glob("*.json"))), 1)
+            self.assertIn("LOOKUP_ERROR_REVIEW", result_text)
+            self.assertIn("request_or_lookup_contract_error", result_text)
+
+            for forbidden in [
+                raw_member_value,
+                encoded_value,
+                "submitted_member_no_base64_utf8",
+                "unexpected_gate3d_field",
+                "gate3d-local-malformed-control",
+                "normalized-member-fixture-private",
+                "Forbidden Person",
+                "forbidden@example.test",
+                "61234567",
+                "2000-01-01",
+                "AC2_PROBE_PASSWORD",
+                "AC2_SERVER",
+                "stdout",
+                "stderr",
+                "secret",
+            ]:
+                self.assertNotIn(forbidden, mixed_run.stdout)
+                self.assertNotIn(forbidden, result_text)
+                self.assertNotIn(forbidden, failed_marker_text)
+                self.assertNotIn(forbidden, processed_marker_text)
+
+            rerun = self.run_gate3d_small_batch(base_args)
+
+            self.assertEqual(rerun.returncode, 0, rerun.stderr)
+            rerun_evidence = parse_key_value_evidence(rerun.stdout)
+            self.assertEqual(rerun_evidence["status"], "already_processed")
+            self.assertEqual(rerun_evidence["pending_rows_loaded_count"], "3")
+            self.assertEqual(rerun_evidence["lookup_attempt_count"], "0")
+            self.assertEqual(rerun_evidence["lookup_success_count"], "0")
+            self.assertEqual(rerun_evidence["processed_or_archived_count"], "0")
+            self.assertEqual(rerun_evidence["failed_or_dead_letter_count"], "0")
+            self.assertEqual(rerun_evidence["duplicate_or_already_processed_count"], "3")
+            self.assertEqual(len(results_path.read_text(encoding="utf-8").splitlines()), 3)
+
 
 class BridgeWorkerStaticGuardrailTests(unittest.TestCase):
     def recorded_gate3_evidence(self):
@@ -1500,6 +1683,120 @@ class BridgeWorkerStaticGuardrailTests(unittest.TestCase):
             "autocount_outputs/review/member_lookup_bridge/member_lookup_bridge_gate3c_results.jsonl",
             "autocount_outputs/review/member_lookup_bridge/member_lookup_bridge_gate3c_processed/handled.json",
             "autocount_outputs/review/member_lookup_bridge/member_lookup_bridge_gate3c_failed/failed.json",
+        ]:
+            completed = subprocess.run(
+                ["git", "check-ignore", ignored_path],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, ignored_path)
+
+    def test_gate3d_small_batch_docs_source_and_artifacts_are_local_only(self):
+        prep_source = GATE3D_PREP_SCRIPT.read_text(encoding="utf-8")
+        source = GATE3D_SMALL_BATCH_SCRIPT.read_text(encoding="utf-8")
+        readme = README.read_text(encoding="utf-8")
+        gitignore = GITIGNORE.read_text(encoding="utf-8")
+        bridge_runbook = BRIDGE_RUNBOOK.read_text(encoding="utf-8")
+        combined = "\n".join([prep_source, source, readme, bridge_runbook])
+
+        for phrase in [
+            "scripts/member_lookup_gate3d_prepare_small_batch.py",
+            "scripts/member_lookup_gate3d_local_bridge_small_batch.py",
+            "Gate 3D AC2 Local Bridge Small-Batch Proof",
+            "local ignored Gate 3D pending queue JSONL",
+            "Gate 3C runtime harness",
+            "read-only PowerShell lookup",
+            "local ignored sanitized results JSONL",
+            "local ignored processed idempotency markers",
+            "local ignored failed/dead-letter markers",
+            "aggregate-only evidence",
+            "--enable-local-bridge-small-batch-review",
+            "--mode duplicate-seed",
+            "--mode mixed-batch",
+            "--pending-jsonl",
+            "--results-jsonl",
+            "--processed-dir",
+            "--failed-dir",
+            "--lookup-mode powershell",
+            "--enable-powershell-lookup",
+            "gate = gate3d_ac2_local_bridge_small_batch",
+            "runtime_location = windows_ac2_bridge_host_only",
+            "execution_mode = manual_local_filesystem_small_batch",
+            "lookup_mode = powershell",
+            "powershell_lookup_enabled = true",
+            "pending_rows_loaded_count = <aggregate-count-only>",
+            "processed_or_archived_count = <aggregate-count-only>",
+            "failed_or_dead_letter_count = <aggregate-count-only>",
+            "duplicate_or_already_processed_count = <aggregate-count-only>",
+            "status = <ok/mixed_expected/needs_fix/no_work/dry_run_only/already_processed>",
+            "`status = mixed_expected` is the expected status",
+            "Duplicate-only evidence proves local idempotency only.",
+            "Malformed/dead-letter evidence proves failure routing only.",
+            "n8n_required = false",
+            "google_sheets_required = false",
+            "hosted_or_vps_service_called = false",
+            "scheduler_enabled = false",
+            "public_inbound_to_ac2_host = false",
+            "no_row_values_printed = true",
+        ]:
+            self.assertIn(phrase, combined)
+
+        for phrase in [
+            "Gate 3D does not require or use n8n, Google Sheets, a queue API, Cloudflare Tunnel, `cloudflared`, a hosted service",
+            "a scheduler",
+            "a Windows service activation",
+            "a webhook",
+            "a public inbound path",
+            "final write automation",
+            "does not create, update, delete, or otherwise write AutoCount members",
+            "does not perform direct SQL writes",
+            "does not approve Gate 4A",
+            "queue API use",
+            "Cloudflare Tunnel / `cloudflared` use",
+            "hosted/VPS runtime readiness",
+            "scheduler activation",
+            "webhook activation",
+            "Windows service activation",
+        ]:
+            self.assertIn(phrase, bridge_runbook)
+
+        for token in FORBIDDEN_WRITE_TOKENS:
+            self.assertNotIn(token, prep_source, token)
+            self.assertNotIn(token, source, token)
+        self.assertNotRegex(
+            "\n".join([prep_source, source]),
+            r"(?i)\b(SELECT\s+\*|INSERT\s+INTO|UPDATE\s+\w+\s+SET|DELETE\s+FROM|MERGE\s+INTO)\b",
+        )
+        self.assertNotRegex(combined, r"https://docs\.google\.com/spreadsheets/d/")
+        self.assertNotRegex(combined, r"submitted_member_no_base64_utf8\"\s*:\s*\"[A-Za-z0-9+/]+=*\"")
+        self.assertRegex(bridge_runbook, r"(?i)Do not paste pending rows, result rows, processed markers, failed markers")
+        self.assertRegex(bridge_runbook, r"(?i)raw member values, encoded member values, decoded member values, normalized member values")
+        self.assertRegex(bridge_runbook, r"(?i)names, emails, phone numbers, birthday values, AC2 environment values")
+        self.assertRegex(bridge_runbook, r"(?i)command transcripts, stdout/stderr transcripts")
+
+        for ignored_name in [
+            "member_lookup_bridge_gate3d_pending_queue.jsonl",
+            "member_lookup_bridge_gate3d_results.jsonl",
+            "member_lookup_bridge_gate3d_processed/",
+            "member_lookup_bridge_gate3d_failed/",
+            "autocount_outputs/**/member_lookup_bridge_gate3d_pending_queue.jsonl",
+            "autocount_outputs/**/member_lookup_bridge_gate3d_results.jsonl",
+            "autocount_outputs/**/member_lookup_bridge_gate3d_processed/",
+            "autocount_outputs/**/member_lookup_bridge_gate3d_failed/",
+        ]:
+            self.assertIn(ignored_name, gitignore)
+
+        for ignored_path in [
+            "member_lookup_bridge_gate3d_pending_queue.jsonl",
+            "member_lookup_bridge_gate3d_results.jsonl",
+            "member_lookup_bridge_gate3d_processed/handled.json",
+            "member_lookup_bridge_gate3d_failed/failed.json",
+            "autocount_outputs/review/member_lookup_bridge/member_lookup_bridge_gate3d_pending_queue.jsonl",
+            "autocount_outputs/review/member_lookup_bridge/member_lookup_bridge_gate3d_results.jsonl",
+            "autocount_outputs/review/member_lookup_bridge/member_lookup_bridge_gate3d_processed/handled.json",
+            "autocount_outputs/review/member_lookup_bridge/member_lookup_bridge_gate3d_failed/failed.json",
         ]:
             completed = subprocess.run(
                 ["git", "check-ignore", ignored_path],
