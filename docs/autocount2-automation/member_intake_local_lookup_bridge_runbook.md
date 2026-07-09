@@ -1,6 +1,6 @@
 # Member Intake Local Lookup Bridge Runbook
 
-Status: design and dry-run worker skeleton only. Gate 3 local lookup preflight and Gate 3B AC2 local bridge readiness passes recorded. Gate 3C adds a local-only runtime hardening harness for repeated AC2 host test runs, with fresh and duplicate-rerun evidence recorded. Gate 3D sanitized AC2 local bridge small-batch evidence (duplicate-seed setup, mixed-batch proof, and idempotent rerun) is recorded. Gate 3E adds a local-only service-readiness discipline wrapper (single-instance lock, operator stop switch, bounded cycles) without installing or activating any Windows service or scheduler; post-merge sanitized AC2 local bridge service-readiness evidence is recorded. This does not activate production automation and does not authorize AutoCount member writes.
+Status: design and dry-run worker skeleton only. Gate 3 local lookup preflight and Gate 3B AC2 local bridge readiness passes recorded. Gate 3C adds a local-only runtime hardening harness for repeated AC2 host test runs, with fresh and duplicate-rerun evidence recorded. Gate 3D sanitized AC2 local bridge small-batch evidence (duplicate-seed setup, mixed-batch proof, and idempotent rerun) is recorded. Gate 3E adds a local-only service-readiness discipline wrapper (single-instance lock, operator stop switch, bounded cycles) without installing or activating any Windows service or scheduler; post-merge sanitized AC2 local bridge service-readiness evidence is recorded. Gate 3F records the bridge-side readiness checkpoint before returning to Gate 4A queue-write proof. This does not activate production automation and does not authorize AutoCount member writes.
 
 ## Purpose
 
@@ -1151,6 +1151,44 @@ No lock file content, health file content, stop flag content, pending queue rows
 Do not paste pending rows, result rows, processed markers, failed markers, lock file content, stop flag content, health file content beyond the aggregate fields above, raw member values, encoded member values, decoded member values, normalized member values, names, emails, phone numbers, birthday values, AC2 environment values, command transcripts, stdout/stderr transcripts, execution payloads, credentials, Sheet IDs/URLs, screenshots, secrets, or PII. Keep `member_lookup_bridge_gate3e_lock.json`, `member_lookup_bridge_gate3e_stop.flag`, and `member_lookup_bridge_gate3e_health.json` local and ignored.
 
 Gate 3E proves only that the Windows AC2 bridge host can run the local bridge with worker-grade operational discipline: single-instance locking, an operator stop switch, and bounded non-daemonized cycles around the already-proven read-only lookup. It is service-readiness discipline only. It does not approve Gate 4A, n8n setup, Google Sheets lookup queue use, queue API use, Cloudflare Tunnel / `cloudflared` use, hosted/VPS runtime readiness, result mapping, member create/update/delete, AutoCount writes, direct SQL writes, scheduler activation, webhook activation, Windows service installation, Windows service activation, or final write automation.
+
+## Gate 3F Bridge-Side Readiness Checkpoint
+
+Status: bridge-side closure checkpoint only. This is a documentation checkpoint over the already recorded Gate 3B, Gate 3C, Gate 3D, and Gate 3E local evidence. It adds no runtime feature, no n8n workflow, no Google Sheets integration, no queue API, no Cloudflare Tunnel / `cloudflared`, no hosted/VPS service, no scheduler, no Windows service, no webhook, no AutoCount write path, no direct SQL write path, no member create/update/delete path, and no final automation.
+
+Gate 3F answers whether more bridge-side local hardening is required before returning to Gate 4A queue-write proof. It does not run Gate 4A and does not approve bridge handoff from a real queue row.
+
+| Gate | Evidence status | What it proves | What it does not prove | Next dependency |
+| --- | --- | --- | --- | --- |
+| Gate 3B local AC2 bridge readiness | Recorded, sanitized, aggregate-only one-row local AC2 bridge evidence. | AC2-side local one-row lookup bridge readiness through the read-only PowerShell lookup path, with one local ignored queue row reduced to sanitized aggregate evidence. | Does not prove repeatable runtime/idempotency, mixed-batch handling, service-readiness discipline, n8n, Google Sheets, queue API, tunnel, hosted/VPS runtime, scheduler, Windows service, webhook, AutoCount writes, direct SQL writes, member create/update/delete, or final automation. | Gate 3C local runtime/idempotency hardening. |
+| Gate 3C local runtime/idempotency | Recorded, sanitized, aggregate-only fresh PowerShell lookup and duplicate/idempotency rerun evidence. | Repeatable local filesystem runtime processing, sanitized output, local processed markers, duplicate suppression, and `already_processed` rerun behavior around the read-only lookup path. | Does not prove mixed-batch separation with malformed/dead-letter routing, service-readiness discipline, n8n, Google Sheets, queue API, tunnel, hosted/VPS runtime, scheduler, Windows service, webhook, AutoCount writes, direct SQL writes, member create/update/delete, or final automation. | Gate 3D mixed-batch/failure-routing proof. |
+| Gate 3D mixed-batch/failure-routing | Recorded, sanitized, aggregate-only duplicate-seed setup, mixed-batch proof, and rerun/idempotency evidence. | Small local mixed-batch separation: one fresh lookup path, duplicate/already-processed suppression, malformed/dead-letter routing, and safe idempotent rerun behavior. | Does not prove service-readiness discipline, stale-lock takeover evidence beyond code behavior, n8n, Google Sheets, queue API, tunnel, hosted/VPS runtime, scheduler, Windows service, webhook, AutoCount writes, direct SQL writes, member create/update/delete, or final automation. | Gate 3E service-readiness discipline. |
+| Gate 3E service-readiness discipline | Recorded, sanitized, aggregate-only discipline run, stop-switch rehearsal, and fresh-lock/second-instance rehearsal evidence. | Explicit opt-in, bounded cycles, single-instance fresh-lock refusal, operator stop control, aggregate-only health/readiness evidence, and no runtime queue work during the discipline-only run. | Does not prove or approve service activation, Windows service installation, scheduler activation, stale-lock takeover by manual evidence unless separately recorded, n8n, Google Sheets, queue API, tunnel, hosted/VPS runtime, webhook, public inbound exposure, AutoCount writes, direct SQL writes, member create/update/delete, or final automation. | Gate 3F checkpoint and then Gate 4A queue-write proof. |
+| Gate 4A n8n queue-write proof, not yet resumed | Not resumed in this checkpoint. Existing Gate 4A docs remain queue-write preparation only. | When separately run, it should prove exactly one real, non-dummy, sanitized `PENDING_LOOKUP` queue row can be prepared and reduced to aggregate pre-bridge counters. | This checkpoint does not run n8n, does not run Google Sheets, does not call AC2, does not run the local bridge, does not map results, does not approve bridge handoff, and does not authorize member writes or final automation. | Return to Gate 4A queue-write proof, stopping after aggregate pre-bridge evidence unless separately approved. |
+
+Bridge-side items proven by Gates 3B through 3E:
+
+- The Windows AC2 bridge host can execute a read-only one-row local lookup path and reduce it to sanitized aggregate evidence.
+- The local bridge runtime can process a local pending queue file, write sanitized local result output, create processed markers, and suppress duplicate reruns.
+- The local runtime can separate a deliberately small mixed batch into fresh lookup work, duplicate/already-processed work, and malformed/dead-letter handling.
+- The service-readiness wrapper can require explicit opt-in, run bounded cycles, refuse a second instance when a fresh lock exists, honor an operator stop flag, and emit aggregate-only readiness evidence.
+- The recorded evidence consistently keeps n8n, Google Sheets, queue API, Cloudflare Tunnel / `cloudflared`, hosted/VPS services, scheduler/webhook activation, Windows service installation/activation, AutoCount writes, direct SQL writes, member create/update/delete, and final automation out of scope.
+
+Bridge-side items still unproven:
+
+- A real Google Sheets, n8n, or external queue/API handoff into the bridge.
+- Lease/claim semantics against a real shared queue provider.
+- Protected queue/API authentication, authorization, rate limits, audit logging, rollback, and monitoring.
+- Cloudflare Tunnel / `cloudflared`, hosted/VPS, public inbound, scheduler, webhook, or Windows service operation.
+- Long-running production soak behavior, production observability, and operator runbook drills beyond the bounded local service-readiness review.
+- Manual stale-lock takeover evidence, unless a separate future evidence record explicitly records it.
+- Result mapping back to any source system and any member create/update/delete, AutoCount write, direct SQL write, or final automation path.
+
+Recommendation: bridge-side local hardening is sufficient to return to Gate 4A n8n queue-write proof. No additional bridge-side local task is required before Gate 4A if Gate 4A remains limited to producing exactly one real, non-dummy, sanitized `PENDING_LOOKUP` queue row and stopping after aggregate pre-bridge counters. Gate 4A must still not call AC2, run the local bridge, map results, activate a scheduler/webhook/service, expose a tunnel or public inbound path, write AutoCount, write SQL, create/update/delete members, or become final automation.
+
+Recommended next gate: resume Gate 4A queue-write proof as documented in [member_intake_n8n_gate4a_manual_queue_handoff_runbook.md](member_intake_n8n_gate4a_manual_queue_handoff_runbook.md). The next evidence should be queue-write precheck evidence only, with `queue_row_count = 1`, `queue_base64_decode_ok_count = 1`, `queue_base64_decode_fail_count = 0`, `queue_decoded_blank_count = 0`, and `queue_decoded_looks_dummy_count = 0`, and with no row-level values or PII pasted.
+
+Do not record lock file content, health file content, stop flag content, pending queue rows, result rows, processed marker content, failed marker content, raw member values, encoded member values, decoded member values, normalized member values, names, emails, phone numbers, birthdays, AC2 environment values, command transcripts, stdout/stderr transcripts, screenshots, Sheet IDs/URLs, credentials, secrets, or PII in this checkpoint.
 
 ## Review-Only Routing
 
