@@ -700,6 +700,135 @@ Do not paste pending rows, result rows, processed markers, failed markers, raw m
 
 Gate 3C proves only that the Windows AC2 bridge host has a repeatable local queue/runtime contract with local idempotency and failed-job handling around the already-proven read-only lookup. It does not approve Gate 4A, n8n setup, Google Sheets lookup queue use, queue API use, Cloudflare Tunnel / `cloudflared` use, hosted/VPS runtime readiness, result mapping, member create/update, AutoCount writes, direct SQL writes, scheduler activation, webhook activation, or final write automation.
 
+## Gate 3D AC2 Local Bridge Small-Batch Proof
+
+Status: AC2-side local bridge small-batch proof only. This is not Gate 4A, not n8n evidence, not Google Sheets evidence, not a queue API, not Cloudflare Tunnel / `cloudflared`, not hosted/VPS runtime readiness, not scheduler or webhook activation, and not final automation.
+
+Gate 3D reuses the Gate 3C local filesystem runtime harness through `scripts/member_lookup_gate3d_local_bridge_small_batch.py`. It proves a deliberately small mixed local batch can distinguish:
+
+- fresh successful lookup work,
+- duplicate/already-processed idempotency behavior,
+- malformed/dead-letter failure routing.
+
+The proof is local filesystem only:
+
+```text
+local ignored Gate 3D pending queue JSONL
+-> scripts/member_lookup_gate3d_local_bridge_small_batch.py
+-> Gate 3C runtime harness
+-> read-only PowerShell lookup through scripts/ac2_member_lookup_review.ps1
+-> local ignored sanitized results JSONL
+-> local ignored processed idempotency markers
+-> local ignored failed/dead-letter markers
+-> aggregate-only evidence
+```
+
+Gate 3D does not require or use n8n, Google Sheets, a queue API, Cloudflare Tunnel, `cloudflared`, a hosted service, a scheduler, a Windows service activation, a webhook, result mapping, a public inbound path, or final write automation. It also does not create, update, delete, or otherwise write AutoCount members, and it does not perform direct SQL writes.
+
+Operator local paths stay ignored under:
+
+```powershell
+$root = 'C:\XB\autocount_outputs\review\member_lookup_bridge'
+$pending = "$root\member_lookup_bridge_gate3d_pending_queue.jsonl"
+$results = "$root\member_lookup_bridge_gate3d_results.jsonl"
+$processed = "$root\member_lookup_bridge_gate3d_processed"
+$failed = "$root\member_lookup_bridge_gate3d_failed"
+```
+
+The manual local AC2 bridge small-batch proof has one setup run and one evidence run. The setup run creates a local processed marker for the duplicate seed. Do not paste the setup run as Gate 3D pass evidence. The second run is the mixed-batch evidence run.
+
+Use one operator-approved synthetic lookup value. Do not use real customer/member data. Do not paste or commit the raw, encoded, decoded, or normalized value.
+
+Exact operator commands:
+
+```powershell
+$root = 'C:\XB\autocount_outputs\review\member_lookup_bridge'
+$pending = "$root\member_lookup_bridge_gate3d_pending_queue.jsonl"
+$results = "$root\member_lookup_bridge_gate3d_results.jsonl"
+$processed = "$root\member_lookup_bridge_gate3d_processed"
+$failed = "$root\member_lookup_bridge_gate3d_failed"
+New-Item -ItemType Directory -Force -Path $root | Out-Null
+
+$secureValue = Read-Host -AsSecureString 'Enter one approved synthetic Gate 3D lookup value'
+$bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureValue)
+try {
+  $plainValue = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
+
+  $plainValue | python scripts\member_lookup_gate3d_prepare_small_batch.py `
+    --enable-local-bridge-small-batch-review `
+    --mode duplicate-seed `
+    --member-value-stdin `
+    --queue-jsonl "$pending"
+
+  python scripts\member_lookup_gate3d_local_bridge_small_batch.py `
+    --enable-local-bridge-small-batch-review `
+    --pending-jsonl "$pending" `
+    --results-jsonl "$results" `
+    --processed-dir "$processed" `
+    --failed-dir "$failed" `
+    --lookup-mode powershell `
+    --enable-powershell-lookup `
+    --allow-root-login
+
+  $plainValue | python scripts\member_lookup_gate3d_prepare_small_batch.py `
+    --enable-local-bridge-small-batch-review `
+    --mode mixed-batch `
+    --member-value-stdin `
+    --queue-jsonl "$pending"
+
+  python scripts\member_lookup_gate3d_local_bridge_small_batch.py `
+    --enable-local-bridge-small-batch-review `
+    --pending-jsonl "$pending" `
+    --results-jsonl "$results" `
+    --processed-dir "$processed" `
+    --failed-dir "$failed" `
+    --lookup-mode powershell `
+    --enable-powershell-lookup `
+    --allow-root-login
+} finally {
+  if ($bstr -ne [IntPtr]::Zero) {
+    [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+  }
+  Remove-Variable plainValue -ErrorAction SilentlyContinue
+}
+```
+
+Required Gate 3D paste-back shape from the mixed-batch evidence run:
+
+```text
+status = <ok/mixed_expected/needs_fix/no_work/dry_run_only/already_processed>
+gate = gate3d_ac2_local_bridge_small_batch
+runtime_location = windows_ac2_bridge_host_only
+execution_mode = manual_local_filesystem_small_batch
+lookup_mode = powershell
+powershell_lookup_enabled = true
+pending_rows_loaded_count = <aggregate-count-only>
+lookup_attempt_count = <aggregate-count-only>
+lookup_success_count = <aggregate-count-only>
+lookup_error_count = <aggregate-count-only>
+processed_or_archived_count = <aggregate-count-only>
+failed_or_dead_letter_count = <aggregate-count-only>
+duplicate_or_already_processed_count = <aggregate-count-only>
+member_create_or_update_invoked = false
+autocount_write_attempted = false
+direct_sql_write_attempted = false
+final_write_automation = false
+n8n_required = false
+google_sheets_required = false
+hosted_or_vps_service_called = false
+scheduler_enabled = false
+public_inbound_to_ac2_host = false
+no_row_values_printed = true
+```
+
+`status = mixed_expected` is the expected status for the deliberate Gate 3D mixed-batch proof when the run has at least one fresh successful lookup, at least one duplicate/already-processed row, and at least one malformed row routed to failed/dead-letter handling, with `lookup_error_count = 0`. It is not an all-success pass. It proves mixed-batch separation and expected failure routing.
+
+`status = ok` is for an all-success small batch with no malformed/dead-letter rows. `status = needs_fix` means an unexpected lookup/runtime failure, unsafe output, payload conflict, or other non-deliberate failure path needs review. `status = already_processed` proves idempotency only and is not fresh lookup pass evidence. Duplicate-only evidence proves local idempotency only. Malformed/dead-letter evidence proves failure routing only.
+
+Do not paste pending rows, result rows, processed markers, failed markers, raw member values, encoded member values, decoded member values, normalized member values, names, emails, phone numbers, birthday values, AC2 environment values, command transcripts, stdout/stderr transcripts, execution payloads, credentials, Sheet IDs/URLs, screenshots, secrets, or PII. Keep `member_lookup_bridge_gate3d_pending_queue.jsonl`, `member_lookup_bridge_gate3d_results.jsonl`, `member_lookup_bridge_gate3d_processed`, and `member_lookup_bridge_gate3d_failed` local and ignored.
+
+Gate 3D proves only that the Windows AC2 bridge host can handle a small local mixed batch with sanitized output, local processed markers, duplicate suppression, and expected dead-letter routing around the already-proven read-only lookup. It does not approve Gate 4A, n8n setup, Google Sheets lookup queue use, queue API use, Cloudflare Tunnel / `cloudflared` use, hosted/VPS runtime readiness, result mapping, member create/update/delete, AutoCount writes, direct SQL writes, scheduler activation, webhook activation, Windows service activation, or final write automation.
+
 ## Review-Only Routing
 
 The bridge posts results for review routing only:
