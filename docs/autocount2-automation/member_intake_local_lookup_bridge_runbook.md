@@ -1,6 +1,6 @@
 # Member Intake Local Lookup Bridge Runbook
 
-Status: design and dry-run worker skeleton only. Gate 3 local lookup preflight and Gate 3B AC2 local bridge readiness passes recorded. Gate 3C adds a local-only runtime hardening harness for repeated AC2 host test runs, with fresh and duplicate-rerun evidence recorded. Gate 3D sanitized AC2 local bridge small-batch evidence (duplicate-seed setup, mixed-batch proof, and idempotent rerun) is recorded. This does not activate production automation and does not authorize AutoCount member writes.
+Status: design and dry-run worker skeleton only. Gate 3 local lookup preflight and Gate 3B AC2 local bridge readiness passes recorded. Gate 3C adds a local-only runtime hardening harness for repeated AC2 host test runs, with fresh and duplicate-rerun evidence recorded. Gate 3D sanitized AC2 local bridge small-batch evidence (duplicate-seed setup, mixed-batch proof, and idempotent rerun) is recorded. Gate 3E adds a local-only service-readiness discipline wrapper (single-instance lock, operator stop switch, bounded cycles) without installing or activating any Windows service or scheduler. This does not activate production automation and does not authorize AutoCount member writes.
 
 ## Purpose
 
@@ -920,6 +920,122 @@ No row-level data, raw/encoded/decoded/normalized member values, names, emails, 
 Do not paste pending rows, result rows, processed markers, failed markers, raw member values, encoded member values, decoded member values, normalized member values, names, emails, phone numbers, birthday values, AC2 environment values, command transcripts, stdout/stderr transcripts, execution payloads, credentials, Sheet IDs/URLs, screenshots, secrets, or PII. Keep `member_lookup_bridge_gate3d_pending_queue.jsonl`, `member_lookup_bridge_gate3d_results.jsonl`, `member_lookup_bridge_gate3d_processed`, and `member_lookup_bridge_gate3d_failed` local and ignored.
 
 Gate 3D proves only that the Windows AC2 bridge host can handle a small local mixed batch with sanitized output, local processed markers, duplicate suppression, and expected dead-letter routing around the already-proven read-only lookup. It does not approve Gate 4A, n8n setup, Google Sheets lookup queue use, queue API use, Cloudflare Tunnel / `cloudflared` use, hosted/VPS runtime readiness, result mapping, member create/update/delete, AutoCount writes, direct SQL writes, scheduler activation, webhook activation, Windows service activation, or final write automation.
+
+## Gate 3E AC2 Local Bridge Service-Readiness Discipline
+
+Status: AC2-side local service-readiness discipline only. This is service-readiness discipline, not Windows service activation, not Windows service installation, not scheduler activation, not a queue API, not n8n, not Google Sheets, not Cloudflare Tunnel / `cloudflared`, not hosted/VPS runtime readiness, not production automation, not AutoCount writes, not member writes, and not direct SQL writes.
+
+Gate 3E purpose: before any n8n or queue API integration, prove the local bridge can be operated safely as a repeatable worker later. It wraps the Gate 3C/Gate 3D local filesystem runtime with the operational discipline a future worker/service would need, without installing or activating anything:
+
+- explicit opt-in flag: `--enable-local-bridge-service-readiness-review`,
+- single-instance lock: a local ignored lock file; a fresh lock blocks a second instance with aggregate-only evidence, and stale lock takeover is explicit and deterministic,
+- stop/kill switch: a local ignored stop flag file; if it exists the run refuses or stops cleanly with aggregate-only evidence, proving a safe operator-controlled stop mechanism exists before any service/scheduler work,
+- bounded run: no infinite loop, no daemonization, no Windows service install, no Task Scheduler install; only a bounded `--max-cycles` count (default 1, hard cap 10),
+- aggregate-only health/readiness evidence, optionally mirrored to a local ignored health JSON file.
+
+Gate 3E does not require or use n8n, Google Sheets, a queue API, Cloudflare Tunnel, `cloudflared`, a hosted service, a scheduler, a Windows service installation, a Windows service activation, a webhook, result mapping, a public inbound path, or final write automation. It also does not create, update, delete, or otherwise write AutoCount members, and it does not perform direct SQL writes. It does not require real customer/member data.
+
+`scripts/member_lookup_gate3e_service_readiness.py` runs in two shapes:
+
+- discipline-only run: no queue paths are supplied; the wrapper proves lock, stop, and bounded-cycle behavior with all lookup counts fixed at 0 and does not invoke the runtime harness,
+- bounded runtime run: the ignored Gate 3C pending/results/processed/failed paths are supplied; each bounded cycle runs the already-proven Gate 3C runtime harness and the counts aggregate across cycles.
+
+A fresh lock refuses with `status = lock_held` and leaves the other instance's lock untouched. A lock older than `--lock-stale-seconds` (default 3600), or an unreadable/malformed lock file, is deterministically treated as stale and taken over with `stale_lock_detected = true`. A stop flag present before the run exits cleanly with `status = stopped_by_operator` and `stop_requested = true`; the stop flag is operator-owned and is never deleted by the wrapper. The lock file is released at the end of every run that acquired it. No command transcripts or process details are printed or stored in the lock file.
+
+Operator local paths stay ignored under:
+
+```powershell
+$root = 'C:\XB\autocount_outputs\review\member_lookup_bridge'
+$lock = "$root\member_lookup_bridge_gate3e_lock.json"
+$stop = "$root\member_lookup_bridge_gate3e_stop.flag"
+$health = "$root\member_lookup_bridge_gate3e_health.json"
+```
+
+Exact operator commands for the manual Gate 3E local service-readiness review:
+
+```powershell
+$root = 'C:\XB\autocount_outputs\review\member_lookup_bridge'
+$lock = "$root\member_lookup_bridge_gate3e_lock.json"
+$stop = "$root\member_lookup_bridge_gate3e_stop.flag"
+$health = "$root\member_lookup_bridge_gate3e_health.json"
+New-Item -ItemType Directory -Force -Path $root | Out-Null
+
+# 1. Discipline-only bounded run (no queue work, counts stay 0).
+python scripts\member_lookup_gate3e_service_readiness.py `
+  --enable-local-bridge-service-readiness-review `
+  --lock-json "$lock" `
+  --stop-flag "$stop" `
+  --health-json "$health" `
+  --max-cycles 2
+
+# 2. Stop-switch rehearsal: create the stop flag, expect a clean stop, then remove it.
+New-Item -ItemType File -Force -Path $stop | Out-Null
+python scripts\member_lookup_gate3e_service_readiness.py `
+  --enable-local-bridge-service-readiness-review `
+  --lock-json "$lock" `
+  --stop-flag "$stop" `
+  --health-json "$health" `
+  --max-cycles 2
+Remove-Item $stop
+
+# 3. Optional bounded runtime cycle over the ignored Gate 3C local queue paths.
+$pending = "$root\member_lookup_bridge_gate3c_pending_queue.jsonl"
+$results = "$root\member_lookup_bridge_gate3c_results.jsonl"
+$processed = "$root\member_lookup_bridge_gate3c_processed"
+$failed = "$root\member_lookup_bridge_gate3c_failed"
+python scripts\member_lookup_gate3e_service_readiness.py `
+  --enable-local-bridge-service-readiness-review `
+  --lock-json "$lock" `
+  --stop-flag "$stop" `
+  --health-json "$health" `
+  --max-cycles 1 `
+  --pending-jsonl "$pending" `
+  --results-jsonl "$results" `
+  --processed-dir "$processed" `
+  --failed-dir "$failed" `
+  --lookup-mode powershell `
+  --enable-powershell-lookup `
+  --allow-root-login
+```
+
+Required Gate 3E paste-back shape:
+
+```text
+status = <ok/no_work/already_processed/dry_run_only/stopped_by_operator/lock_held/refused/needs_fix>
+gate = gate3e_ac2_local_bridge_service_readiness
+runtime_location = windows_ac2_bridge_host_only
+execution_mode = manual_local_service_readiness_review
+worker_mode = bounded_local_filesystem_worker
+lock_acquired = <true/false>
+stale_lock_detected = <true/false>
+stop_requested = <true/false>
+cycles_requested = <aggregate-count-only>
+cycles_completed = <aggregate-count-only>
+pending_rows_loaded_count = <aggregate-count-only if runtime is invoked, otherwise 0>
+lookup_attempt_count = <aggregate-count-only if runtime is invoked, otherwise 0>
+lookup_success_count = <aggregate-count-only if runtime is invoked, otherwise 0>
+lookup_error_count = <aggregate-count-only if runtime is invoked, otherwise 0>
+processed_or_archived_count = <aggregate-count-only if runtime is invoked, otherwise 0>
+failed_or_dead_letter_count = <aggregate-count-only if runtime is invoked, otherwise 0>
+duplicate_or_already_processed_count = <aggregate-count-only if runtime is invoked, otherwise 0>
+member_create_or_update_invoked = false
+autocount_write_attempted = false
+direct_sql_write_attempted = false
+final_write_automation = false
+n8n_required = false
+google_sheets_required = false
+hosted_or_vps_service_called = false
+scheduler_enabled = false
+windows_service_installed = false
+public_inbound_to_ac2_host = false
+no_row_values_printed = true
+```
+
+Gate 3E pass evidence for the discipline-only run requires `status = ok`, `lock_acquired = true`, `stale_lock_detected = false`, `stop_requested = false`, `cycles_completed = cycles_requested`, and all lookup counts at 0. The stop-switch rehearsal must separately show `status = stopped_by_operator` with `stop_requested = true` and `cycles_completed = 0`. A blocked second instance shows `status = lock_held` with `lock_acquired = false` and is refusal evidence, not failure evidence. `status = refused` means the explicit opt-in flag, a bounded cycle count, or a complete runtime path set was missing. `status = needs_fix` means an unexpected local runtime failure needs review and is not pass evidence.
+
+Do not paste pending rows, result rows, processed markers, failed markers, lock file content, stop flag content, health file content beyond the aggregate fields above, raw member values, encoded member values, decoded member values, normalized member values, names, emails, phone numbers, birthday values, AC2 environment values, command transcripts, stdout/stderr transcripts, execution payloads, credentials, Sheet IDs/URLs, screenshots, secrets, or PII. Keep `member_lookup_bridge_gate3e_lock.json`, `member_lookup_bridge_gate3e_stop.flag`, and `member_lookup_bridge_gate3e_health.json` local and ignored.
+
+Gate 3E proves only that the Windows AC2 bridge host can run the local bridge with worker-grade operational discipline: single-instance locking, an operator stop switch, and bounded non-daemonized cycles around the already-proven read-only lookup. It is service-readiness discipline only. It does not approve Gate 4A, n8n setup, Google Sheets lookup queue use, queue API use, Cloudflare Tunnel / `cloudflared` use, hosted/VPS runtime readiness, result mapping, member create/update/delete, AutoCount writes, direct SQL writes, scheduler activation, webhook activation, Windows service installation, Windows service activation, or final write automation.
 
 ## Review-Only Routing
 
