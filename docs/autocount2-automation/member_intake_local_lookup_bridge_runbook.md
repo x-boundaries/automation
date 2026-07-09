@@ -638,6 +638,64 @@ Real Gate 3C AC2 runtime pass evidence requires all of the following:
 
 Duplicate-only rerun evidence requires `pending_rows_loaded_count >= 1`, `lookup_attempt_count = 0`, `lookup_success_count = 0`, `lookup_error_count = 0`, `processed_or_archived_count = 0`, `failed_or_dead_letter_count = 0`, and `duplicate_or_already_processed_count >= 1`. In that case the harness prints `status = already_processed`. `status = already_processed` is not fresh Gate 3C AC2 lookup pass evidence. Duplicate-only evidence proves local idempotency only. The bridge recognized already handled work, did not run another lookup, and did not append duplicate result rows.
 
+Recorded Gate 3C fresh PowerShell lookup evidence:
+
+```text
+status = ok
+gate = gate3c_ac2_local_bridge_runtime_hardening
+runtime_location = windows_ac2_bridge_host_only
+execution_mode = manual_local_filesystem_runtime_hardening
+lookup_mode = powershell
+powershell_lookup_enabled = true
+pending_rows_loaded_count = 1
+lookup_attempt_count = 1
+lookup_success_count = 1
+lookup_error_count = 0
+processed_or_archived_count = 1
+failed_or_dead_letter_count = 0
+duplicate_or_already_processed_count = 0
+member_create_or_update_invoked = false
+autocount_write_attempted = false
+direct_sql_write_attempted = false
+final_write_automation = false
+n8n_required = false
+google_sheets_required = false
+hosted_or_vps_service_called = false
+scheduler_enabled = false
+public_inbound_to_ac2_host = false
+no_row_values_printed = true
+```
+
+Recorded Gate 3C duplicate/idempotency rerun evidence:
+
+```text
+status = already_processed
+gate = gate3c_ac2_local_bridge_runtime_hardening
+runtime_location = windows_ac2_bridge_host_only
+execution_mode = manual_local_filesystem_runtime_hardening
+lookup_mode = powershell
+powershell_lookup_enabled = true
+pending_rows_loaded_count = 1
+lookup_attempt_count = 0
+lookup_success_count = 0
+lookup_error_count = 0
+processed_or_archived_count = 0
+failed_or_dead_letter_count = 0
+duplicate_or_already_processed_count = 1
+member_create_or_update_invoked = false
+autocount_write_attempted = false
+direct_sql_write_attempted = false
+final_write_automation = false
+n8n_required = false
+google_sheets_required = false
+hosted_or_vps_service_called = false
+scheduler_enabled = false
+public_inbound_to_ac2_host = false
+no_row_values_printed = true
+```
+
+The fresh run is the Gate 3C AC2 local runtime pass evidence. The duplicate rerun is idempotency evidence only and is not fresh AC2 lookup pass evidence. Together they prove the local bridge can process one local pending job, write sanitized local output and a processed marker, and avoid duplicate processing on rerun.
+
 Do not paste pending rows, result rows, processed markers, failed markers, raw member values, encoded member values, decoded member values, normalized member values, names, emails, phone numbers, birthday values, command transcripts, stderr/stdout transcripts, execution payloads, credentials, AC2 environment values, Sheet IDs/URLs, screenshots, or PII. Keep `member_lookup_bridge_gate3c_pending_queue.jsonl`, `member_lookup_bridge_gate3c_results.jsonl`, `member_lookup_bridge_gate3c_processed`, and `member_lookup_bridge_gate3c_failed` local and ignored.
 
 Gate 3C proves only that the Windows AC2 bridge host has a repeatable local queue/runtime contract with local idempotency and failed-job handling around the already-proven read-only lookup. It does not approve Gate 4A, n8n setup, Google Sheets lookup queue use, queue API use, Cloudflare Tunnel / `cloudflared` use, hosted/VPS runtime readiness, result mapping, member create/update, AutoCount writes, direct SQL writes, scheduler activation, webhook activation, or final write automation.
