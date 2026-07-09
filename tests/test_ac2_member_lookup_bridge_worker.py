@@ -4,6 +4,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -15,6 +16,7 @@ GATE3B_SUMMARY_SCRIPT = ROOT / "scripts" / "member_lookup_gate3b_evidence_summar
 GATE3C_RUNTIME_SCRIPT = ROOT / "scripts" / "member_lookup_gate3c_local_bridge_runtime.py"
 GATE3D_PREP_SCRIPT = ROOT / "scripts" / "member_lookup_gate3d_prepare_small_batch.py"
 GATE3D_SMALL_BATCH_SCRIPT = ROOT / "scripts" / "member_lookup_gate3d_local_bridge_small_batch.py"
+GATE3E_SERVICE_READINESS_SCRIPT = ROOT / "scripts" / "member_lookup_gate3e_service_readiness.py"
 README = ROOT / "README.md"
 GITIGNORE = ROOT / ".gitignore"
 DOCS = ROOT / "docs" / "autocount2-automation"
@@ -213,6 +215,39 @@ class BridgeWorkerCliTests(unittest.TestCase):
             capture_output=True,
             check=False,
         )
+
+    def run_gate3e_service_readiness(self, arguments):
+        return subprocess.run(
+            [sys.executable, str(GATE3E_SERVICE_READINESS_SCRIPT)] + arguments,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+    def gate3e_paths(self, tmp_path):
+        return {
+            "lock": tmp_path / "member_lookup_bridge_gate3e_lock.json",
+            "stop": tmp_path / "member_lookup_bridge_gate3e_stop.flag",
+            "health": tmp_path / "member_lookup_bridge_gate3e_health.json",
+        }
+
+    def gate3e_discipline_args(self, paths, *, opt_in=True, max_cycles=1, extra=None):
+        arguments = []
+        if opt_in:
+            arguments.append("--enable-local-bridge-service-readiness-review")
+        arguments += [
+            "--lock-json",
+            str(paths["lock"]),
+            "--stop-flag",
+            str(paths["stop"]),
+            "--health-json",
+            str(paths["health"]),
+            "--max-cycles",
+            str(max_cycles),
+        ]
+        if extra:
+            arguments += extra
+        return arguments
 
     def test_default_invocation_refuses_before_processing_any_queue(self):
         completed = self.run_cli([])
@@ -1260,6 +1295,267 @@ class BridgeWorkerCliTests(unittest.TestCase):
             self.assertEqual(rerun_evidence["duplicate_or_already_processed_count"], "3")
             self.assertEqual(len(results_path.read_text(encoding="utf-8").splitlines()), 3)
 
+    def test_gate3e_default_invocation_refuses_without_explicit_opt_in(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = self.gate3e_paths(Path(tmp))
+
+            completed = self.run_gate3e_service_readiness(
+                self.gate3e_discipline_args(paths, opt_in=False)
+            )
+
+            self.assertEqual(completed.returncode, 2, completed.stderr)
+            evidence = parse_key_value_evidence(completed.stdout)
+            self.assertEqual(evidence["status"], "refused")
+            self.assertEqual(evidence["gate"], "gate3e_ac2_local_bridge_service_readiness")
+            self.assertEqual(evidence["worker_mode"], "bounded_local_filesystem_worker")
+            self.assertEqual(evidence["lock_acquired"], "false")
+            self.assertEqual(evidence["stop_requested"], "false")
+            self.assertEqual(evidence["cycles_completed"], "0")
+            self.assertEqual(evidence["pending_rows_loaded_count"], "0")
+            self.assertEqual(evidence["windows_service_installed"], "false")
+            self.assertFalse(paths["lock"].exists())
+            self.assertFalse(paths["health"].exists())
+
+    def test_gate3e_discipline_only_bounded_run_acquires_and_releases_lock(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = self.gate3e_paths(Path(tmp))
+
+            completed = self.run_gate3e_service_readiness(
+                self.gate3e_discipline_args(paths, max_cycles=2)
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            evidence = parse_key_value_evidence(completed.stdout)
+            self.assertEqual(evidence["status"], "ok")
+            self.assertEqual(evidence["gate"], "gate3e_ac2_local_bridge_service_readiness")
+            self.assertEqual(evidence["runtime_location"], "windows_ac2_bridge_host_only")
+            self.assertEqual(evidence["execution_mode"], "manual_local_service_readiness_review")
+            self.assertEqual(evidence["worker_mode"], "bounded_local_filesystem_worker")
+            self.assertEqual(evidence["lock_acquired"], "true")
+            self.assertEqual(evidence["stale_lock_detected"], "false")
+            self.assertEqual(evidence["stop_requested"], "false")
+            self.assertEqual(evidence["cycles_requested"], "2")
+            self.assertEqual(evidence["cycles_completed"], "2")
+            for count_key in [
+                "pending_rows_loaded_count",
+                "lookup_attempt_count",
+                "lookup_success_count",
+                "lookup_error_count",
+                "processed_or_archived_count",
+                "failed_or_dead_letter_count",
+                "duplicate_or_already_processed_count",
+            ]:
+                self.assertEqual(evidence[count_key], "0", count_key)
+            self.assertEqual(evidence["member_create_or_update_invoked"], "false")
+            self.assertEqual(evidence["autocount_write_attempted"], "false")
+            self.assertEqual(evidence["direct_sql_write_attempted"], "false")
+            self.assertEqual(evidence["final_write_automation"], "false")
+            self.assertEqual(evidence["n8n_required"], "false")
+            self.assertEqual(evidence["google_sheets_required"], "false")
+            self.assertEqual(evidence["hosted_or_vps_service_called"], "false")
+            self.assertEqual(evidence["scheduler_enabled"], "false")
+            self.assertEqual(evidence["windows_service_installed"], "false")
+            self.assertEqual(evidence["public_inbound_to_ac2_host"], "false")
+            self.assertEqual(evidence["no_row_values_printed"], "true")
+            self.assertFalse(paths["lock"].exists())
+            health = json.loads(paths["health"].read_text(encoding="utf-8"))
+            self.assertEqual(health["status"], "ok")
+            self.assertEqual(health["gate"], "gate3e_ac2_local_bridge_service_readiness")
+            self.assertEqual(set(health), set(evidence))
+
+    def test_gate3e_fresh_lock_blocks_second_instance_with_aggregate_only_evidence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = self.gate3e_paths(Path(tmp))
+            lock_content = json.dumps(
+                {
+                    "gate": "gate3e_ac2_local_bridge_service_readiness",
+                    "created_at_epoch": time.time(),
+                    "dry_run_only": True,
+                    "final_write_automation": False,
+                },
+                sort_keys=True,
+            )
+            paths["lock"].write_text(lock_content + "\n", encoding="utf-8")
+
+            completed = self.run_gate3e_service_readiness(
+                self.gate3e_discipline_args(paths)
+            )
+
+            self.assertEqual(completed.returncode, 2, completed.stderr)
+            evidence = parse_key_value_evidence(completed.stdout)
+            self.assertEqual(evidence["status"], "lock_held")
+            self.assertEqual(evidence["lock_acquired"], "false")
+            self.assertEqual(evidence["stale_lock_detected"], "false")
+            self.assertEqual(evidence["cycles_completed"], "0")
+            self.assertEqual(
+                paths["lock"].read_text(encoding="utf-8"), lock_content + "\n"
+            )
+
+    def test_gate3e_stale_and_malformed_locks_are_taken_over_deterministically(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = self.gate3e_paths(Path(tmp))
+            paths["lock"].write_text(
+                json.dumps({"gate": "gate3e_ac2_local_bridge_service_readiness", "created_at_epoch": 1000.0})
+                + "\n",
+                encoding="utf-8",
+            )
+
+            stale_run = self.run_gate3e_service_readiness(
+                self.gate3e_discipline_args(paths, extra=["--lock-stale-seconds", "60"])
+            )
+
+            self.assertEqual(stale_run.returncode, 0, stale_run.stderr)
+            stale_evidence = parse_key_value_evidence(stale_run.stdout)
+            self.assertEqual(stale_evidence["status"], "ok")
+            self.assertEqual(stale_evidence["lock_acquired"], "true")
+            self.assertEqual(stale_evidence["stale_lock_detected"], "true")
+            self.assertEqual(stale_evidence["cycles_completed"], "1")
+            self.assertFalse(paths["lock"].exists())
+
+            paths["lock"].write_text("not-json-lock-content\n", encoding="utf-8")
+
+            malformed_run = self.run_gate3e_service_readiness(
+                self.gate3e_discipline_args(paths)
+            )
+
+            self.assertEqual(malformed_run.returncode, 0, malformed_run.stderr)
+            malformed_evidence = parse_key_value_evidence(malformed_run.stdout)
+            self.assertEqual(malformed_evidence["status"], "ok")
+            self.assertEqual(malformed_evidence["lock_acquired"], "true")
+            self.assertEqual(malformed_evidence["stale_lock_detected"], "true")
+            self.assertFalse(paths["lock"].exists())
+
+    def test_gate3e_stop_flag_causes_clean_stop_without_work(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = self.gate3e_paths(Path(tmp))
+            paths["stop"].write_text("", encoding="utf-8")
+
+            completed = self.run_gate3e_service_readiness(
+                self.gate3e_discipline_args(paths, max_cycles=2)
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            evidence = parse_key_value_evidence(completed.stdout)
+            self.assertEqual(evidence["status"], "stopped_by_operator")
+            self.assertEqual(evidence["stop_requested"], "true")
+            self.assertEqual(evidence["lock_acquired"], "false")
+            self.assertEqual(evidence["cycles_completed"], "0")
+            self.assertEqual(evidence["pending_rows_loaded_count"], "0")
+            self.assertFalse(paths["lock"].exists())
+            self.assertTrue(paths["stop"].exists())
+            health = json.loads(paths["health"].read_text(encoding="utf-8"))
+            self.assertEqual(health["status"], "stopped_by_operator")
+
+    def test_gate3e_rejects_unbounded_invalid_or_partial_configurations(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = self.gate3e_paths(Path(tmp))
+
+            zero_cycles = self.run_gate3e_service_readiness(
+                self.gate3e_discipline_args(paths, max_cycles=0)
+            )
+            over_cap = self.run_gate3e_service_readiness(
+                self.gate3e_discipline_args(paths, max_cycles=9999)
+            )
+            partial_runtime = self.run_gate3e_service_readiness(
+                self.gate3e_discipline_args(
+                    paths, extra=["--pending-jsonl", str(Path(tmp) / "pending.jsonl")]
+                )
+            )
+            powershell_not_enabled = self.run_gate3e_service_readiness(
+                self.gate3e_discipline_args(
+                    paths,
+                    extra=[
+                        "--pending-jsonl",
+                        str(Path(tmp) / "pending.jsonl"),
+                        "--results-jsonl",
+                        str(Path(tmp) / "results.jsonl"),
+                        "--processed-dir",
+                        str(Path(tmp) / "processed"),
+                        "--failed-dir",
+                        str(Path(tmp) / "failed"),
+                        "--lookup-mode",
+                        "powershell",
+                    ],
+                )
+            )
+
+            for completed in [zero_cycles, over_cap, partial_runtime, powershell_not_enabled]:
+                self.assertEqual(completed.returncode, 2, completed.stderr)
+                evidence = parse_key_value_evidence(completed.stdout)
+                self.assertEqual(evidence["status"], "refused")
+                self.assertEqual(evidence["lock_acquired"], "false")
+                self.assertEqual(evidence["cycles_completed"], "0")
+            self.assertFalse(paths["lock"].exists())
+
+    def test_gate3e_bounded_runtime_cycles_process_local_queue_and_stay_sanitized(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            paths = self.gate3e_paths(tmp_path)
+            pending_path = tmp_path / "member_lookup_bridge_gate3c_pending_queue.jsonl"
+            results_path = tmp_path / "member_lookup_bridge_gate3c_results.jsonl"
+            processed_dir = tmp_path / "member_lookup_bridge_gate3c_processed"
+            failed_dir = tmp_path / "member_lookup_bridge_gate3c_failed"
+            fake_powershell = tmp_path / "fake-powershell.cmd"
+            fake_lookup_script = tmp_path / "fake-lookup-script.ps1"
+            write_fake_powershell_lookup(fake_powershell)
+            fake_lookup_script.write_text("# fake lookup script path only\n", encoding="utf-8")
+            write_jsonl(pending_path, [fixture_job()])
+
+            completed = self.run_gate3e_service_readiness(
+                self.gate3e_discipline_args(
+                    paths,
+                    max_cycles=2,
+                    extra=[
+                        "--pending-jsonl",
+                        str(pending_path),
+                        "--results-jsonl",
+                        str(results_path),
+                        "--processed-dir",
+                        str(processed_dir),
+                        "--failed-dir",
+                        str(failed_dir),
+                        "--lookup-mode",
+                        "powershell",
+                        "--enable-powershell-lookup",
+                        "--powershell-exe",
+                        str(fake_powershell),
+                        "--lookup-script",
+                        str(fake_lookup_script),
+                    ],
+                )
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            evidence = parse_key_value_evidence(completed.stdout)
+            self.assertEqual(evidence["status"], "ok")
+            self.assertEqual(evidence["lock_acquired"], "true")
+            self.assertEqual(evidence["cycles_requested"], "2")
+            self.assertEqual(evidence["cycles_completed"], "2")
+            self.assertEqual(evidence["pending_rows_loaded_count"], "2")
+            self.assertEqual(evidence["lookup_attempt_count"], "1")
+            self.assertEqual(evidence["lookup_success_count"], "1")
+            self.assertEqual(evidence["lookup_error_count"], "0")
+            self.assertEqual(evidence["processed_or_archived_count"], "1")
+            self.assertEqual(evidence["failed_or_dead_letter_count"], "0")
+            self.assertEqual(evidence["duplicate_or_already_processed_count"], "1")
+            self.assertEqual(len(results_path.read_text(encoding="utf-8").splitlines()), 1)
+            self.assertFalse(paths["lock"].exists())
+
+            health_text = paths["health"].read_text(encoding="utf-8")
+            for forbidden in [
+                ENCODED_SYNTHETIC_VALUE,
+                "submitted_member_no_base64_utf8",
+                "job-synthetic-001",
+                "AC2_PROBE_PASSWORD",
+                "AC2_SERVER",
+                "stdout",
+                "stderr",
+                "secret",
+                "@example",
+            ]:
+                self.assertNotIn(forbidden, completed.stdout)
+                self.assertNotIn(forbidden, health_text)
+
 
 class BridgeWorkerStaticGuardrailTests(unittest.TestCase):
     def recorded_gate3_evidence(self):
@@ -1797,6 +2093,107 @@ class BridgeWorkerStaticGuardrailTests(unittest.TestCase):
             "autocount_outputs/review/member_lookup_bridge/member_lookup_bridge_gate3d_results.jsonl",
             "autocount_outputs/review/member_lookup_bridge/member_lookup_bridge_gate3d_processed/handled.json",
             "autocount_outputs/review/member_lookup_bridge/member_lookup_bridge_gate3d_failed/failed.json",
+        ]:
+            completed = subprocess.run(
+                ["git", "check-ignore", ignored_path],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, ignored_path)
+
+    def test_gate3e_service_readiness_docs_source_and_artifacts_are_local_only(self):
+        source = GATE3E_SERVICE_READINESS_SCRIPT.read_text(encoding="utf-8")
+        readme = README.read_text(encoding="utf-8")
+        gitignore = GITIGNORE.read_text(encoding="utf-8")
+        bridge_runbook = BRIDGE_RUNBOOK.read_text(encoding="utf-8")
+        combined = "\n".join([source, readme, bridge_runbook])
+
+        for phrase in [
+            "scripts/member_lookup_gate3e_service_readiness.py",
+            "Gate 3E AC2 Local Bridge Service-Readiness Discipline",
+            "--enable-local-bridge-service-readiness-review",
+            "--lock-json",
+            "--stop-flag",
+            "--health-json",
+            "--max-cycles",
+            "--lock-stale-seconds",
+            "gate = gate3e_ac2_local_bridge_service_readiness",
+            "runtime_location = windows_ac2_bridge_host_only",
+            "execution_mode = manual_local_service_readiness_review",
+            "worker_mode = bounded_local_filesystem_worker",
+            "lock_acquired = <true/false>",
+            "stale_lock_detected = <true/false>",
+            "stop_requested = <true/false>",
+            "cycles_requested = <aggregate-count-only>",
+            "cycles_completed = <aggregate-count-only>",
+            "windows_service_installed = false",
+            "no_row_values_printed = true",
+            "status = stopped_by_operator",
+            "status = lock_held",
+        ]:
+            self.assertIn(phrase, combined, phrase)
+
+        for phrase in [
+            "Gate 3E does not require or use n8n, Google Sheets, a queue API, Cloudflare Tunnel, `cloudflared`, a hosted service",
+            "service-readiness discipline only",
+            "not Windows service activation",
+            "not Windows service installation",
+            "not scheduler activation",
+            "no infinite loop",
+            "no daemonization",
+            "no Windows service install",
+            "no Task Scheduler install",
+            "does not create, update, delete, or otherwise write AutoCount members",
+            "does not perform direct SQL writes",
+            "does not require real customer/member data",
+            "does not approve Gate 4A",
+            "No command transcripts or process details are printed",
+            "Do not paste pending rows, result rows, processed markers, failed markers, lock file content, stop flag content",
+        ]:
+            self.assertIn(phrase, bridge_runbook, phrase)
+
+        self.assertIn("MAX_CYCLES_LIMIT = 10", source)
+        self.assertNotIn("while True", source)
+        for token in [
+            "New-Service",
+            "Register-ScheduledTask",
+            "schtasks",
+            "win32service",
+            "nssm",
+            "import socket",
+            "import http",
+            "import urllib",
+            "import requests",
+        ]:
+            self.assertNotIn(token, source, token)
+        for token in FORBIDDEN_WRITE_TOKENS:
+            self.assertNotIn(token, source, token)
+        self.assertNotRegex(
+            source,
+            r"(?i)\b(SELECT\s+\*|INSERT\s+INTO|UPDATE\s+\w+\s+SET|DELETE\s+FROM|MERGE\s+INTO)\b",
+        )
+        self.assertNotRegex(combined, r"https://docs\.google\.com/spreadsheets/d/")
+        self.assertNotRegex(combined, r"submitted_member_no_base64_utf8\"\s*:\s*\"[A-Za-z0-9+/]+=*\"")
+
+        for ignored_name in [
+            "member_lookup_bridge_gate3e_lock.json",
+            "member_lookup_bridge_gate3e_stop.flag",
+            "member_lookup_bridge_gate3e_health.json",
+            "autocount_outputs/**/member_lookup_bridge_gate3e_lock.json",
+            "autocount_outputs/**/member_lookup_bridge_gate3e_stop.flag",
+            "autocount_outputs/**/member_lookup_bridge_gate3e_health.json",
+        ]:
+            self.assertIn(ignored_name, gitignore)
+
+        for ignored_path in [
+            "member_lookup_bridge_gate3e_lock.json",
+            "member_lookup_bridge_gate3e_stop.flag",
+            "member_lookup_bridge_gate3e_health.json",
+            "autocount_outputs/review/member_lookup_bridge/member_lookup_bridge_gate3e_lock.json",
+            "autocount_outputs/review/member_lookup_bridge/member_lookup_bridge_gate3e_stop.flag",
+            "autocount_outputs/review/member_lookup_bridge/member_lookup_bridge_gate3e_health.json",
         ]:
             completed = subprocess.run(
                 ["git", "check-ignore", ignored_path],
