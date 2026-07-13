@@ -39,7 +39,7 @@ n8n may queue only the minimum fields needed for review routing:
 | `intake_id` | No | Internal idempotency key. Safe only if it contains no PII. |
 | `state` | Yes | Must be `PENDING_LOOKUP` for new lookup work. |
 | `submitted_member_no_base64_utf8` | Yes | Encoded submitted member value. Sensitive; never log or echo. |
-| `consent_status` | No | Optional separate consent/marketing category only; not a PDPA override. |
+| `consent_status` | No | Optional sanitized separate consent/marketing category only; not a PDPA override. Do not copy raw `Marketing Consent` values to the queue. |
 | `pdpa_status` | Yes | Mandatory duplicate-check gate. Normalize current form `PDPA Acknowledged = Yes` to queue value `yes`; `Imported` is not consent. |
 | `payload_hash` | Yes | Hash of allowed request fields for idempotency checks. |
 | `attempt` | No | Nonnegative retry counter. |
@@ -48,11 +48,23 @@ n8n may queue only the minimum fields needed for review routing:
 | `updated_at` | No | Queue metadata. |
 | `timeout_at` | No | Queue timeout for routing to lookup error review. |
 
-The queue request must not contain raw member values, normalized member values, names, emails, raw phone numbers, DOB, addresses, AutoCount internal identifiers, local AutoCount target details, credentials, connection strings, stderr, stdout, tokens, or arbitrary payload dumps.
+The queue request must not contain raw member values, normalized member values, names, emails, raw phone/member values, raw `AutoCount MemberNo`, `Birthday Month`, DOB, derived DOB, raw month values, raw `Marketing Consent`, addresses, AutoCount internal identifiers, local AutoCount target details, credentials, connection strings, stderr, stdout, tokens, or arbitrary payload dumps.
 
-For Gate 4A real queue-write preparation, the first approved source batch is exactly one row. The source row must contain `Name`, the submitted phone/member number, `Email`, birthday when the current source includes birthday, and `PDPA Acknowledged = Yes`. n8n must normalize only the routing fields needed to append a sanitized queue row; it must not copy names, emails, raw phone numbers, birthday values, or raw submitted member values into the lookup queue.
+For Gate 4A real queue-write preparation, the first approved source batch is exactly one row. Do not rename the real Google Form questions or Google Sheet headers; n8n must adapt to the actual member-facing labels.
+
+The current actual source headers are `Date & Time`, `Full Name`, `AutoCount MemberNo`, `Email Address`, `Birthday Month`, `Marketing Consent`, and `PDPA Acknowledged`. Gate 4A does not require `Gate4A Source Reference` or `Gate4A Source Row Ref` sheet columns; queue `source_reference` and `source_row_ref` are derived internally from a fixed safe source label and n8n Google Sheets `row_number` metadata. The only Gate 4A operator approval marker in the sheet is `Gate4AApprovedForLookup`.
+
+Gate 4A maps `Full Name` to required source name, `AutoCount MemberNo` to the submitted member number and AutoCount `MemberNo` lookup value, `Email Address` to required source email, `Birthday Month` to the required birthday-month source field, `Marketing Consent` to optional source metadata only, and `PDPA Acknowledged` to the mandatory PDPA source field.
+
+`AutoCount MemberNo` must match `^[0-9]{6,20}$`. AutoCount `MobilePhone` is intentionally unused for this lookup path.
+
+`Birthday Month` must be one of the 12 month names, trimmed and case-insensitive. The backend/default DOB policy is `01/FORM_INPUT_MONTH/2000`, expressed internally as ISO `2000-MM-01`. Gate 4A validates the month and may derive the ISO DOB internally as policy proof, but it must not queue `Birthday Month`, DOB, derived DOB, raw month, or any birthday value. Using the derived DOB for final create/update is a later-stage policy decision and is not Gate 4A approval to write.
+
+n8n must normalize only the routing fields needed to write a sanitized queue row; it must not copy names, emails, raw phone/member values, birthday values, raw marketing consent values, or raw submitted member values into the lookup queue.
 
 The Gate 4A real queue-write row must populate `job_id`, `intake_source`, `source_reference`, `source_row_ref`, `row_number`, `intake_id`, `state`, `submitted_member_no_base64_utf8`, `consent_status`, `pdpa_status`, `payload_hash`, `attempt`, `max_attempts`, `created_at`, `updated_at`, and `timeout_at`. It must not be a dummy Gate 2 rehearsal row, and `submitted_member_no_base64_utf8` must not be blank.
+
+For the staged Gate 4A local n8n proof, n8n writes the single sanitized queue row to JSONL inside the n8n container at `/home/node/.n8n-files/member_lookup_bridge_gate4a_pending_queue.jsonl`. `/home/node/.n8n-files` is the n8n-approved local file-access staging directory; `/tmp` may be shell-writable inside the container but is blocked by n8n's node-level file-access policy, and no Docker Compose edit is required. The directory must exist before the node writes to it. The workflow should overwrite that staged file on each manual run so stale rows from previous tests cannot accumulate and violate the exactly-one-row requirement. Append must remain disabled on the writer node. The operator copies that file out with `docker compose -p n8n-local cp` to the local ignored Windows evidence path before running the aggregate precheck. Do not assume Windows paths are mounted inside the n8n container.
 
 Before bridge handoff, operators must reduce the queue-write check to aggregate-only counters: `queue_row_count = 1`, `queue_base64_decode_ok_count = 1`, `queue_base64_decode_fail_count = 0`, `queue_decoded_blank_count = 0`, and `queue_decoded_looks_dummy_count = 0`. These counters are queue-write prechecks only; they are not Gate 4A lookup evidence and do not authorize AC2 writes.
 
@@ -117,7 +129,7 @@ The bridge may post only sanitized metadata:
 
 Forbidden response fields are the same as forbidden request fields. The response must not include the encoded member value.
 
-`pdpa_status` is mandatory for lookup eligibility. The current live form value is `PDPA Acknowledged = Yes`; the normalized queue value is `yes`. `consent_status` is optional sanitized metadata for separate consent or marketing categories, and it must not rescue, override, or reinterpret invalid, missing, or imported `pdpa_status`.
+`pdpa_status` is mandatory for lookup eligibility. The current live form value is `PDPA Acknowledged = Yes`; the normalized queue value is `yes`. `Marketing Consent` is optional source metadata only. `consent_status` is optional sanitized metadata for separate consent or marketing categories, and it must not rescue, override, or reinterpret invalid, missing, or imported `pdpa_status`.
 
 ## Job States
 

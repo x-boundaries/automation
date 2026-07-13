@@ -1,6 +1,7 @@
 import base64
 import json
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -13,6 +14,8 @@ DOCS = ROOT / "docs" / "autocount2-automation"
 README = ROOT / "README.md"
 GITIGNORE = ROOT / ".gitignore"
 RUNBOOK = DOCS / "member_intake_n8n_gate4a_manual_queue_handoff_runbook.md"
+CONTRACT = DOCS / "member_intake_n8n_node_contract.md"
+TEMPLATE = ROOT / "n8n-workflows" / "member_intake_gate4a_container_queue_write.workflow.json"
 SCRIPT = ROOT / "scripts" / "member_lookup_gate4a_evidence_summary.py"
 PRECHECK_SCRIPT = ROOT / "scripts" / "member_lookup_gate4a_queue_precheck.py"
 
@@ -92,6 +95,86 @@ def parse_evidence(text):
         key, value = line.split(" = ", 1)
         parsed[key] = value
     return parsed
+
+
+def allowed_queue_fields():
+    return [
+        "job_id",
+        "intake_source",
+        "source_reference",
+        "source_row_ref",
+        "row_number",
+        "intake_id",
+        "state",
+        "submitted_member_no_base64_utf8",
+        "consent_status",
+        "pdpa_status",
+        "payload_hash",
+        "attempt",
+        "max_attempts",
+        "created_at",
+        "updated_at",
+        "timeout_at",
+    ]
+
+
+def workflow_code():
+    template = json.loads(TEMPLATE.read_text(encoding="utf-8"))
+    code = next(
+        node
+        for node in template["nodes"]
+        if node["name"] == "Validate And Build One Sanitized Queue Row"
+    )
+    return code["parameters"]["jsCode"]
+
+
+def actual_source_row(**overrides):
+    row = {
+        "Date & Time": "safe-timestamp-marker",
+        "Full Name": "source-name-present",
+        "AutoCount MemberNo": "".join(["1"] * 6),
+        "Email Address": "source-email-present",
+        "Birthday Month": "June",
+        "Marketing Consent": "optional-marketing-source-value",
+        "PDPA Acknowledged": "Yes",
+        "Gate4AApprovedForLookup": "YES",
+        "row_number": 2,
+    }
+    row.update(overrides)
+    return row
+
+
+def run_workflow_code(row):
+    node_exe = shutil.which("node")
+    if not node_exe:
+        raise unittest.SkipTest("node executable is required to execute the n8n Code node")
+    wrapper = r"""
+const fs = require('fs');
+const payload = JSON.parse(fs.readFileSync(0, 'utf8'));
+try {
+  const run = new Function('$input', 'Buffer', payload.code);
+  const items = payload.rows.map((json) => ({ json }));
+  const result = run({ all: () => items }, Buffer);
+  console.log(JSON.stringify({ ok: true, result }));
+} catch (error) {
+  console.log(JSON.stringify({ ok: false, error: String(error && error.message ? error.message : error) }));
+}
+"""
+    completed = subprocess.run(
+        [node_exe, "-e", wrapper],
+        input=json.dumps({"code": workflow_code(), "rows": [row]}),
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    return json.loads(completed.stdout)
+
+
+def decode_queue_row(code_result):
+    binary_data = code_result["result"][0]["binary"]["data"]["data"]
+    jsonl = base64.b64decode(binary_data).decode("utf-8")
+    rows = [json.loads(line) for line in jsonl.splitlines() if line.strip()]
+    return rows[0]
 
 
 class Gate4AQueuePrecheckTests(unittest.TestCase):
@@ -396,6 +479,116 @@ class Gate4ASummarizerTests(unittest.TestCase):
                 self.assertNotIn(forbidden, completed.stdout)
 
 
+class Gate4AN8nWorkflowCodeTests(unittest.TestCase):
+    def test_actual_source_headers_pass_and_queue_schema_stays_exact(self):
+        completed = run_workflow_code(actual_source_row())
+
+        self.assertTrue(completed["ok"], completed)
+        queue = decode_queue_row(completed)
+        self.assertEqual(list(queue.keys()), allowed_queue_fields())
+        self.assertEqual(queue["state"], "PENDING_LOOKUP")
+        self.assertEqual(queue["pdpa_status"], "yes")
+        self.assertEqual(queue["consent_status"], "marketing_consent_not_queued")
+        self.assertEqual(queue["source_reference"], "google_sheets_uat_gate4a")
+        self.assertEqual(queue["source_row_ref"], "row_2")
+        self.assertEqual(queue["intake_id"], "gate4a_row_2")
+
+        forbidden_fields = [
+            "Date & Time",
+            "Full Name",
+            "AutoCount MemberNo",
+            "Email Address",
+            "Birthday Month",
+            "Marketing Consent",
+            "PDPA Acknowledged",
+            "DOB",
+            "derived_dob",
+            "birthday",
+            "raw_member_no",
+            "normalized_member_no",
+        ]
+        for field in forbidden_fields:
+            self.assertNotIn(field, queue)
+
+        serialized = json.dumps(queue, sort_keys=True).lower()
+        for forbidden_value in [
+            "source-name-present",
+            "source-email-present",
+            "optional-marketing-source-value",
+            "june",
+            "2000-06-01",
+            "birthday",
+            "dob",
+        ]:
+            self.assertNotIn(forbidden_value, serialized)
+
+    def test_birthday_month_case_and_spacing_passes(self):
+        completed = run_workflow_code(actual_source_row(**{"Birthday Month": " june "}))
+
+        self.assertTrue(completed["ok"], completed)
+        queue = decode_queue_row(completed)
+        self.assertEqual(list(queue.keys()), allowed_queue_fields())
+        self.assertNotIn("2000-06-01", json.dumps(queue, sort_keys=True))
+
+    def test_invalid_birthday_month_fails(self):
+        completed = run_workflow_code(actual_source_row(**{"Birthday Month": "not-a-month"}))
+
+        self.assertFalse(completed["ok"], completed)
+        self.assertEqual(completed["error"], "gate4a_birthday_month_must_be_valid_month_name")
+
+    def test_pdpa_yes_is_mandatory_and_imported_or_missing_is_blocked(self):
+        for pdpa_value, expected_error in [
+            ("Imported", "gate4a_imported_pdpa_marker_blocked"),
+            ("No", "gate4a_pdpa_must_be_yes"),
+            ("", "gate4a_pdpa_must_be_yes"),
+        ]:
+            completed = run_workflow_code(actual_source_row(**{"PDPA Acknowledged": pdpa_value}))
+            self.assertFalse(completed["ok"], completed)
+            self.assertEqual(completed["error"], expected_error)
+
+    def test_marketing_consent_cannot_rescue_invalid_pdpa(self):
+        completed = run_workflow_code(
+            actual_source_row(
+                **{
+                    "Marketing Consent": "Yes",
+                    "PDPA Acknowledged": "No",
+                }
+            )
+        )
+
+        self.assertFalse(completed["ok"], completed)
+        self.assertEqual(completed["error"], "gate4a_pdpa_must_be_yes")
+
+    def test_autocount_member_no_must_be_numeric_6_to_20_digits(self):
+        invalid_values = [
+            "".join(["1"] * 5),
+            "".join(["1"] * 21),
+            "ABC123",
+            "123 456",
+        ]
+        for member_no in invalid_values:
+            completed = run_workflow_code(actual_source_row(**{"AutoCount MemberNo": member_no}))
+            self.assertFalse(completed["ok"], completed)
+            self.assertEqual(completed["error"], "gate4a_autocount_member_no_must_be_6_to_20_digits")
+
+    def test_dummy_source_markers_are_blocked(self):
+        for field in ["Full Name", "Email Address", "Marketing Consent"]:
+            completed = run_workflow_code(actual_source_row(**{field: "synthetic-source-marker"}))
+            self.assertFalse(completed["ok"], completed)
+            self.assertEqual(completed["error"], "gate4a_source_row_must_be_real_non_dummy")
+
+    def test_safe_queue_helper_fields_are_derived_from_row_metadata(self):
+        completed = run_workflow_code(actual_source_row())
+
+        self.assertTrue(completed["ok"], completed)
+        queue = decode_queue_row(completed)
+        self.assertEqual(queue["source_reference"], "google_sheets_uat_gate4a")
+        self.assertEqual(queue["source_row_ref"], "row_2")
+        self.assertEqual(queue["intake_id"], "gate4a_row_2")
+        self.assertNotIn("Gate4A Source Reference", workflow_code())
+        self.assertNotIn("Gate4A Source Row Ref", workflow_code())
+
+
 class Gate4ARunbookTests(unittest.TestCase):
     def read(self, path):
         return path.read_text(encoding="utf-8")
@@ -405,94 +598,117 @@ class Gate4ARunbookTests(unittest.TestCase):
         gitignore = self.read(GITIGNORE)
 
         self.assertTrue(RUNBOOK.exists())
+        self.assertTrue(CONTRACT.exists())
+        self.assertTrue(TEMPLATE.exists())
         self.assertTrue(SCRIPT.exists())
         self.assertTrue(PRECHECK_SCRIPT.exists())
         self.assertIn(RUNBOOK.name, readme)
+        self.assertIn(TEMPLATE.name, readme)
         self.assertIn("scripts/member_lookup_gate4a_queue_precheck.py", readme)
         self.assertIn("scripts/member_lookup_gate4a_evidence_summary.py", readme)
         self.assertIn("member_lookup_bridge_gate4a_pending_queue.jsonl", gitignore)
         self.assertIn("member_lookup_bridge_gate4a_results.jsonl", gitignore)
 
-    def test_runbook_defines_manual_handoff_not_real_poller_or_execution(self):
+    def test_runbook_defines_container_queue_write_only_scope(self):
         runbook = self.read(RUNBOOK)
 
         for phrase in [
-            "Gate 4A queue-write preparation package only",
+            "Gate 4A real n8n one-row queue-write proof only",
             "does not run Gate 4A",
             "does not run Gate 4",
             "does not activate n8n",
-            "does not touch real Google Sheets queue data from repo work",
-            "does not call AC2 from Codex",
-            "does not run PowerShell from Codex",
-            "manual handoff path",
-            "no real Google Sheets poller exists",
-            "does not claim a real Google Sheets poller",
-            "production queue poller",
-            "n8n result mapping run",
+            "does not call AC2",
+            "does not run PowerShell",
+            "does not run the local bridge",
+            "does not call any bridge endpoint",
+            "does not map results",
+            "writes exactly one sanitized PENDING_LOOKUP queue row to JSONL inside the n8n container",
+            "docker compose cp from the n8n container",
+            "/home/node/.n8n-files/member_lookup_bridge_gate4a_pending_queue.jsonl",
+            "C:\\Users\\xPass\\OneDrive\\Desktop\\X-Boundaries\\autocount_outputs\\review\\member_lookup_bridge\\member_lookup_bridge_gate4a_pending_queue.jsonl",
             "member_lookup_bridge_gate4a_pending_queue.jsonl",
-            "member_lookup_bridge_gate4a_results.jsonl",
-            "--queue-mode fixture",
-            "--lookup-mode powershell",
-            "--enable-powershell-lookup",
-            "--allow-root-login",
-            "carries forward the Gate 3 local lookup auth setting",
-            "is still read-only",
-            "scripts\\member_lookup_gate4a_evidence_summary.py",
             "scripts\\member_lookup_gate4a_queue_precheck.py",
-            "n8n result mapping is deferred",
-            "This PR stops before bridge handoff",
-            "The local bridge lookup step is deferred unless the operator explicitly approves the next step",
+            "operator stop",
         ]:
             self.assertIn(phrase, runbook)
 
-        self.assertNotRegex(runbook, r"(?i)real Google Sheets poller is implemented")
+        self.assertNotIn("--lookup-mode powershell", runbook)
+        self.assertNotIn("--enable-powershell-lookup", runbook)
+        self.assertNotIn("--allow-root-login", runbook)
+        self.assertNotIn("python scripts\\ac2_member_lookup_bridge_worker.py", runbook)
+        self.assertNotRegex(runbook, r"(?i)AC2 lookup execution")
         self.assertNotRegex(runbook, r"(?i)production queue poller is implemented")
-
-    def test_runbook_stops_when_queue_contains_only_dummy_rehearsal_rows(self):
-        runbook = self.read(RUNBOOK)
-
-        for phrase in [
-            "The current lookup queue tab contains only dummy Gate 2 rehearsal rows",
-            "proved TSV-to-JSONL handoff mechanics only",
-            "must not be passed to AC2 lookup",
-            "must not be recorded as Gate 4A pass evidence",
-            "Stop before bridge handoff if the lookup queue tab contains only dummy Gate 2 rehearsal rows",
-            "The lookup queue tab does not contain only dummy Gate 2 rehearsal rows",
-            "Do not include dummy Gate 2 rehearsal rows",
-            "The lookup queue contains only dummy Gate 2 rehearsal rows",
-        ]:
-            self.assertIn(phrase, runbook)
 
     def test_runbook_defines_real_one_row_queue_write_preparation(self):
         runbook = self.read(RUNBOOK)
 
         for phrase in [
-            "Gate 4A lookup may not start until the operator has first produced exactly one real, non-dummy, sanitized `PENDING_LOOKUP` queue row",
-            "This preparation gate is queue-write-only",
-            "does not run Gate 4A lookup",
-            "does not call AC2",
-            "does not run PowerShell",
-            "does not run the local bridge",
-            "does not run n8n result mapping",
-            "does not authorize any AutoCount write path",
-            "Initially this must be exactly one source row",
-            "n8n manually reads exactly one approved real Google Form/Sheet source row",
-            "n8n validates required fields and `PDPA Acknowledged = Yes`",
-            "Write only one sanitized non-dummy `PENDING_LOOKUP` queue row",
-            "Stop before bridge handoff after the aggregate pre-bridge check",
+            "The first Gate 4A run must match exactly one approved real non-dummy Google Form / Google Sheet row",
+            "Do not rename the real Google Form questions or Google Sheet headers",
+            "`Full Name` -> required source name",
+            "`AutoCount MemberNo` -> submitted member number and AutoCount `MemberNo` lookup value",
+            "`Email Address` -> required source email",
+            "`Birthday Month` -> required birthday-month source field",
+            "`Marketing Consent` -> optional marketing/consent source metadata only",
+            "`PDPA Acknowledged = Yes`",
+            "`Gate4AApprovedForLookup = YES`",
+            "`PDPA Acknowledged = Imported` is blocked",
+            "`Marketing Consent` and `consent_status` cannot rescue",
+            "`AutoCount MemberNo` must be numeric only and match `^[0-9]{6,20}$`",
             "AutoCount `MobilePhone` is intentionally unused",
-            "maps to AutoCount `MemberNo`",
+            "`Birthday Month` is required and must be one of the 12 month names",
+            "user-facing `01/FORM_INPUT_MONTH/2000`",
+            "ISO `2000-MM-01`",
+            "`June` maps to `2000-06-01`",
+            "does not write `Birthday Month`, DOB, derived DOB, raw month, or any birthday value to the Gate 4A queue row",
+            "Manually execute the workflow once in n8n",
         ]:
             self.assertIn(phrase, runbook)
 
         for required_source_field in [
-            "`Name`",
-            "phone/member number field submitted by the user",
-            "`Email`",
-            "birthday field only when the current source includes birthday",
+            "`Full Name`",
+            "`AutoCount MemberNo`",
+            "`Email Address`",
+            "`Birthday Month`",
             "`PDPA Acknowledged = Yes`",
+            "`row_number`",
         ]:
             self.assertIn(required_source_field, runbook)
+
+        for derived_helper_phrase in [
+            "Do not add or maintain `Gate4A Source Reference` or `Gate4A Source Row Ref` sheet columns",
+            "The workflow derives queue `source_reference`",
+            "queue `source_row_ref` from n8n Google Sheets row metadata",
+        ]:
+            self.assertIn(derived_helper_phrase, runbook)
+
+    def test_node_contract_accepts_actual_headers_and_birthday_month_policy(self):
+        contract = self.read(CONTRACT)
+
+        for phrase in [
+            "Do not rename the real Google Form questions or Google Sheet headers",
+            "`Date & Time`",
+            "`Full Name`",
+            "`AutoCount MemberNo`",
+            "`Email Address`",
+            "`Birthday Month`",
+            "`Marketing Consent`",
+            "`PDPA Acknowledged`",
+            "`Gate4AApprovedForLookup`",
+            "`row_number`",
+            "does not require `Gate4A Source Reference` or `Gate4A Source Row Ref` sheet columns",
+            "queue `source_reference` and `source_row_ref` are derived internally",
+            "`AutoCount MemberNo` must match `^[0-9]{6,20}$`",
+            "AutoCount `MobilePhone` is intentionally unused",
+            "`Birthday Month` must be one of the 12 month names",
+            "`01/FORM_INPUT_MONTH/2000`",
+            "`2000-MM-01`",
+            "must not queue `Birthday Month`, DOB, derived DOB, raw month, or any birthday value",
+            "later-stage policy decision and is not Gate 4A approval to write",
+            "`Marketing Consent` is optional source metadata only",
+            "must not rescue, override, or reinterpret invalid, missing, or imported `pdpa_status`",
+        ]:
+            self.assertIn(phrase, contract)
 
     def test_runbook_requires_pre_bridge_queue_checks_before_handoff(self):
         runbook = self.read(RUNBOOK)
@@ -503,15 +719,12 @@ class Gate4ARunbookTests(unittest.TestCase):
             "`queue_base64_decode_fail_count = 0`",
             "`queue_decoded_blank_count = 0`",
             "`queue_decoded_looks_dummy_count = 0`",
-            "not as Gate 4A lookup evidence or Gate 4A pass evidence",
-            "one successful base64 decode",
-            "no decode failures",
-            "no blank decoded value",
-            "no dummy-looking decoded value",
+            "`unexpected_queue_shape_count = 0`",
             "gate = gate4a_real_queue_write_pre_bridge_check",
             "bridge_handoff_approved = false",
             "ac2_lookup_invoked = false",
-            "This successful precheck does not approve local bridge handoff",
+            "This successful precheck is queue-write evidence only",
+            "does not approve local bridge handoff",
         ]:
             self.assertIn(phrase, runbook)
 
@@ -545,21 +758,13 @@ class Gate4ARunbookTests(unittest.TestCase):
         runbook = self.read(RUNBOOK)
 
         for phrase in [
-            "workflow is inactive and manual",
-            "Scheduler is disabled",
-            "No public inbound webhook, callback, tunnel, or reverse proxy reaches the AC2 host",
-            "No Execute Command node is used for AC2 lookup",
-            "read-only lookup mode",
-            "must not create, update, delete, or write AutoCount members",
-            "must not perform direct SQL writes",
-            "must not invoke final write automation",
-            "Do not map result rows back to Google Sheets in Gate 4A",
-            "Do not treat `READY_FOR_CREATE_REVIEW` as create approval",
-            "Gate 4A passing still does not authorize member create/update",
+            "workflow is inactive/manual",
+            "has no scheduler, webhook, HTTP Request, Execute Command, AC2, SQL, RDP, tunnel, bridge endpoint, result-mapping, member create/update/delete, or AutoCount write node",
+            "The workflow is activated.",
+            "A scheduler or webhook is enabled.",
+            "Any AC2, bridge endpoint, PowerShell, SQL, RDP, tunnel, AutoCount write, member create/update/delete, result-mapping, or final automation path appears.",
             "AutoCount writes",
             "direct SQL writes",
-            "production activation",
-            "scheduler activation",
             "final write automation",
         ]:
             self.assertIn(phrase, runbook)
@@ -616,55 +821,200 @@ class Gate4ARunbookTests(unittest.TestCase):
         ]:
             self.assertNotIn(forbidden, body)
 
-    def test_deferred_lookup_evidence_shape_is_exact_and_aggregate_only(self):
-        runbook = self.read(RUNBOOK)
-        match = re.search(
-            r"Deferred Lookup Paste-Back Evidence.*?```text\n(?P<body>status = <ok/needs_fix>.*?PII are pasted\.)\n```",
-            runbook,
-            re.DOTALL,
-        )
-        self.assertIsNotNone(match)
-        body = match.group("body")
+    def test_template_defines_only_manual_container_queue_write_nodes(self):
+        template = json.loads(self.read(TEMPLATE))
+        self.assertFalse(template["active"])
+        node_names = {node["name"] for node in template["nodes"]}
+        node_types = {node["type"] for node in template["nodes"]}
 
-        expected_lines = [
-            "status = <ok/needs_fix>",
-            "gate = gate4a_manual_queue_handoff_ac2_lookup_only",
-            "runtime_location = local_operator_pc_non_ac2_n8n_stack",
-            "execution_mode = manual_inactive_review_only_handoff",
-            "approved_batch_size = <aggregate-count-only>",
-            "n8n_queue_rows_written_count = <aggregate-count-only>",
-            "local_queue_rows_loaded_count = <aggregate-count-only>",
-            "lookup_attempt_count = <aggregate-count-only>",
-            "lookup_success_count = <aggregate-count-only>",
-            "lookup_existing_member_review_count = <aggregate-count-only>",
-            "lookup_manual_review_count = <aggregate-count-only>",
-            "lookup_error_count = <aggregate-count-only>",
-            "local_review_result_rows_written_count = <aggregate-count-only>",
-            "n8n_result_mapping_run = false",
-            "member_create_or_update_invoked = false",
-            "autocount_write_attempted = false",
-            "direct_sql_write_attempted = false",
-            "workflow_activation = inactive",
-            "scheduler_enabled = false",
-            "public_inbound_to_ac2_host = false",
-            "final_write_automation = false",
-            "sanitized_note = No credentials, connection strings, Sheet IDs/URLs, credential IDs, row-level output, raw/encoded/normalized member values, names, emails, phone numbers, command transcripts, stderr/stdout, execution payloads, node raw input/output dumps, or PII are pasted.",
-        ]
-        self.assertEqual(body.splitlines(), expected_lines)
-
-        for forbidden in [
-            "job_id",
-            "source_reference",
-            "source_row_ref",
-            "row_number",
-            "submitted_member_no_base64_utf8",
+        for node_name in [
+            "Manual Gate 4A Run",
+            "Read One Approved Real Source Row",
+            "Validate And Build One Sanitized Queue Row",
+            "Write Queue JSONL Inside n8n Container",
         ]:
-            self.assertNotIn(forbidden, body)
+            self.assertIn(node_name, node_names)
+
+        self.assertEqual(
+            node_types,
+            {
+                "n8n-nodes-base.manualTrigger",
+                "n8n-nodes-base.googleSheets",
+                "n8n-nodes-base.code",
+                "n8n-nodes-base.readWriteFile",
+                "n8n-nodes-base.stickyNote",
+            },
+        )
+        self.assertNotIn("n8n-nodes-base.executeCommand", node_types)
+        self.assertNotIn("n8n-nodes-base.httpRequest", node_types)
+        self.assertNotIn("n8n-nodes-base.scheduleTrigger", node_types)
+        self.assertNotIn("n8n-nodes-base.webhook", node_types)
+
+        writer = next(node for node in template["nodes"] if node["name"] == "Write Queue JSONL Inside n8n Container")
+        self.assertEqual(writer["parameters"]["operation"], "write")
+        self.assertEqual(writer["parameters"]["fileName"], "/home/node/.n8n-files/member_lookup_bridge_gate4a_pending_queue.jsonl")
+        self.assertFalse(writer["parameters"]["options"]["append"])
+        self.assertIn("stale rows", writer["notes"])
+
+        code = next(node for node in template["nodes"] if node["name"] == "Validate And Build One Sanitized Queue Row")
+        js_code = code["parameters"]["jsCode"]
+        for phrase in [
+            "Full Name",
+            "AutoCount MemberNo",
+            "Email Address",
+            "Birthday Month",
+            "Marketing Consent",
+            "PDPA Acknowledged",
+            "MONTH_TO_ISO_DOB",
+            "2000-06-01",
+            "gate4a_requires_exactly_one_approved_source_row",
+            "gate4a_autocount_member_no_must_be_6_to_20_digits",
+            "gate4a_birthday_month_must_be_valid_month_name",
+            "gate4a_pdpa_must_be_yes",
+            "gate4a_imported_pdpa_marker_blocked",
+            "gate4a_source_row_must_be_real_non_dummy",
+            "submitted_member_no_base64_utf8: submittedMemberNoBase64",
+            "state: 'PENDING_LOOKUP'",
+            "pdpa_status: 'yes'",
+        ]:
+            self.assertIn(phrase, js_code)
+
+        self.assertNotIn("derivedDobIso", "".join(allowed_queue_fields()))
+
+    def test_template_writer_uses_n8n_approved_path_and_no_stale_paths(self):
+        template_text = self.read(TEMPLATE)
+
+        self.assertIn(
+            "/home/node/.n8n-files/member_lookup_bridge_gate4a_pending_queue.jsonl",
+            template_text,
+        )
+        self.assertNotIn("/tmp/member_lookup_bridge_gate4a_pending_queue.jsonl", template_text)
+        self.assertNotIn("/home/node/.n8n/member_lookup_bridge_gate4a_pending_queue.jsonl", template_text)
+
+    def test_template_google_sheets_node_is_unbound_with_safe_filter(self):
+        template = json.loads(self.read(TEMPLATE))
+        sheets = next(
+            node for node in template["nodes"] if node["type"] == "n8n-nodes-base.googleSheets"
+        )
+
+        self.assertEqual(
+            sheets["parameters"]["filtersUI"],
+            {"values": [{"lookupColumn": "Gate4AApprovedForLookup", "lookupValue": "YES"}]},
+        )
+        self.assertEqual(sheets["parameters"]["documentId"], {"__rl": True, "value": "", "mode": "list"})
+        self.assertEqual(sheets["parameters"]["sheetName"], {"__rl": True, "value": "", "mode": "list"})
+
+    def test_template_has_no_credentials_bindings_or_execution_data(self):
+        template_text = self.read(TEMPLATE)
+        template = json.loads(template_text)
+
+        for node in template["nodes"]:
+            self.assertNotIn("credentials", node, node["name"])
+        for forbidden_key in ["pinData", "staticData", "shared", "tags", "triggerCount"]:
+            self.assertNotIn(forbidden_key, template)
+        for forbidden_text in [
+            "cachedResultName",
+            "cachedResultUrl",
+            "docs.google.com",
+            "googleSheetsOAuth2Api",
+        ]:
+            self.assertNotIn(forbidden_text, template_text)
+
+    def test_no_raw_live_workflow_export_is_tracked(self):
+        tracked = subprocess.run(
+            ["git", "-C", str(ROOT), "ls-files"],
+            text=True,
+            capture_output=True,
+            check=True,
+        ).stdout.splitlines()
+
+        for tracked_path in tracked:
+            lowered = tracked_path.lower()
+            self.assertNotIn(".live-export.json", lowered, tracked_path)
+            self.assertNotIn(".live-import.json", lowered, tracked_path)
+            self.assertNotIn("raw_local_only", lowered, tracked_path)
+
+        workflow_files = [p for p in tracked if p.startswith("n8n-workflows/")]
+        self.assertIn("n8n-workflows/member_intake_gate4a_container_queue_write.workflow.json", workflow_files)
+        for workflow_path in workflow_files:
+            text = (ROOT / workflow_path).read_text(encoding="utf-8")
+            self.assertNotIn("cachedResultUrl", text, workflow_path)
+            self.assertNotIn("docs.google.com", text, workflow_path)
+            self.assertNotIn('"credentials"', text, workflow_path)
+
+    def test_runbook_documents_directory_preparation_and_updated_copy_command(self):
+        runbook = self.read(RUNBOOK)
+
+        for phrase in [
+            "### Pre-Run Directory Preparation",
+            "docker compose -p n8n-local exec -u node n8n sh -lc",
+            "mkdir -p /home/node/.n8n-files && chmod 700 /home/node/.n8n-files",
+            "n8n:/home/node/.n8n-files/member_lookup_bridge_gate4a_pending_queue.jsonl",
+            "No Docker Compose edit is required",
+            "rejects `/tmp`",
+            "node-level",
+            "Append must remain disabled",
+        ]:
+            self.assertIn(phrase, runbook)
+
+        self.assertNotIn("/tmp/member_lookup_bridge_gate4a_pending_queue.jsonl", runbook)
+        self.assertNotIn("/home/node/.n8n/member_lookup_bridge_gate4a_pending_queue.jsonl", runbook)
+
+    def test_runbook_documents_manual_filter_verification_after_binding(self):
+        runbook = self.read(RUNBOOK)
+
+        for phrase in [
+            "verify the Google Sheets filter is still present",
+            "If the filter is absent, manually add:",
+            "Column: `Gate4AApprovedForLookup`",
+            "Value: `YES`",
+            "Exactly one row may match the filter.",
+            "Do not paste the raw exported live workflow or its configured Google selectors",
+        ]:
+            self.assertIn(phrase, runbook)
+
+    def test_runbook_warns_against_physical_row_number_helper_columns(self):
+        runbook = self.read(RUNBOOK)
+
+        for phrase in [
+            "The only Gate 4A helper/admin column the operator manually maintains is",
+            "Remove any physical Sheet columns with these headers before running Gate 4A:",
+            "automatically supplies virtual `row_number` metadata",
+            "A physical Sheet column named `row_number` overwrites that generated metadata",
+            "Members and operators must not create or manually populate a physical `row_number` column",
+            "delete the whole column so n8n's virtual `row_number` is used",
+            "the Code node fails with `gate4a_safe_row_number_required`",
+        ]:
+            self.assertIn(phrase, runbook)
+
+        # Stop condition against duplicate/physical row_number and derived-helper columns.
+        stop_section = runbook.split("## Stop Conditions", 1)[1]
+        for phrase in [
+            "physical `row_number` column",
+            "duplicate `row_number` header",
+            "`Gate4A Source Reference` or `Gate4A Source Row Ref` column",
+            "overrides n8n's virtual `row_number` metadata",
+            "delete the physical column instead of typing a value into it",
+        ]:
+            self.assertIn(phrase, stop_section)
+
+    def test_runbook_records_sanitized_technical_uat_evidence(self):
+        runbook = self.read(RUNBOOK)
+
+        for phrase in [
+            "Gate 4A technical n8n-to-container queue-write UAT: PASS",
+            "Final real non-dummy source-row evidence remains pending.",
+            "Bridge handoff remains unapproved.",
+            "AC2 lookup remains uninvoked.",
+            "No member or AutoCount write occurred.",
+        ]:
+            self.assertIn(phrase, runbook)
 
     def test_committed_gate4a_material_has_no_sensitive_literals_or_artifacts(self):
         combined = "\n".join(
             [
                 self.read(RUNBOOK),
+                self.read(TEMPLATE),
                 self.read(SCRIPT),
                 self.read(PRECHECK_SCRIPT),
                 self.read(README),
@@ -679,7 +1029,6 @@ class Gate4ARunbookTests(unittest.TestCase):
         self.assertNotRegex(combined, r"(?i)(password|secret|token)\s*[:=]\s*['\"][^'\"]+['\"]")
         self.assertNotRegex(combined, r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b")
         self.assertNotRegex(combined, r"submitted_member_no_base64_utf8\"\s*:\s*\"[A-Za-z0-9+/]+=*\"")
-        self.assertNotRegex(combined, r"(?i)workflow export file")
         self.assertNotRegex(combined, r"(?i)scheduler_enabled = true")
         self.assertNotRegex(combined, r"(?i)workflow_activation = active")
 

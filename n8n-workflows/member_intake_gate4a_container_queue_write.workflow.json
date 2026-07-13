@@ -1,0 +1,149 @@
+{
+  "id": "gate4aQueue4A01",
+  "name": "Gate 4A - Write one member lookup queue row to container JSONL",
+  "active": false,
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "f9f77747-597f-4a5d-b54f-b637994acfc6",
+      "name": "Manual Gate 4A Run",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -880,
+        128
+      ]
+    },
+    {
+      "parameters": {
+        "documentId": {
+          "__rl": true,
+          "value": "",
+          "mode": "list"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "",
+          "mode": "list"
+        },
+        "filtersUI": {
+          "values": [
+            {
+              "lookupColumn": "Gate4AApprovedForLookup",
+              "lookupValue": "YES"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "d9ef226c-3f47-48d2-b6c3-ed45a348a9f3",
+      "name": "Read One Approved Real Source Row",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        -624,
+        128
+      ],
+      "notesInFlow": true,
+      "notes": "Operator must select the real UAT spreadsheet, source tab, and Google credential in n8n UI. After selecting the document and sheet, verify the Gate4AApprovedForLookup = YES filter is still present; if the filter is absent after import or binding, add it manually. The filter column is a non-PII approval marker; the downstream guard requires exactly one matching row."
+    },
+    {
+      "parameters": {
+        "jsCode": "const QUEUE_FILE_NAME = 'member_lookup_bridge_gate4a_pending_queue.jsonl';\nconst SOURCE_LABEL = 'google_sheets_uat_gate4a';\n\nconst FIELD_ALIASES = {\n  name: ['Full Name', 'Name'],\n  memberNo: ['AutoCount MemberNo', 'Phone/Member Number', 'Phone Member Number', 'Phone Number', 'Member Number', 'Submitted Member Number', 'Submitted Member No', 'Mobile Number'],\n  email: ['Email Address', 'Email'],\n  birthdayMonth: ['Birthday Month', 'Birthday', 'Date of Birth', 'DOB'],\n  marketingConsent: ['Marketing Consent', 'consent_status', 'Consent Status'],\n  pdpa: ['PDPA Acknowledged', 'PDPA', 'PDPA Status'],\n  rowNumber: ['row_number', 'Row Number', 'RowNumber']\n};\n\nconst MONTH_TO_ISO_DOB = {\n  january: '2000-01-01',\n  february: '2000-02-01',\n  march: '2000-03-01',\n  april: '2000-04-01',\n  may: '2000-05-01',\n  june: '2000-06-01',\n  july: '2000-07-01',\n  august: '2000-08-01',\n  september: '2000-09-01',\n  october: '2000-10-01',\n  november: '2000-11-01',\n  december: '2000-12-01'\n};\n\nconst items = $input.all();\nif (items.length !== 1) throw new Error('gate4a_requires_exactly_one_approved_source_row');\n\nconst row = items[0].json;\nconst pick = (aliases) => {\n  for (const key of aliases) {\n    if (Object.prototype.hasOwnProperty.call(row, key)) return row[key];\n  }\n  return undefined;\n};\nconst clean = (value) => String(value ?? '').trim();\n\nconst requiredName = clean(pick(FIELD_ALIASES.name));\nconst submittedMemberNo = clean(pick(FIELD_ALIASES.memberNo));\nconst requiredEmail = clean(pick(FIELD_ALIASES.email));\nconst birthdayMonthRaw = clean(pick(FIELD_ALIASES.birthdayMonth));\nconst marketingConsentRaw = clean(pick(FIELD_ALIASES.marketingConsent));\nconst pdpaRaw = clean(pick(FIELD_ALIASES.pdpa));\nconst rowNumber = Number(pick(FIELD_ALIASES.rowNumber));\nconst birthdayMonthKey = birthdayMonthRaw.toLowerCase();\nconst derivedDobIso = MONTH_TO_ISO_DOB[birthdayMonthKey];\n\nif (!requiredName) throw new Error('gate4a_full_name_required');\nif (!requiredEmail) throw new Error('gate4a_email_address_required');\nif (!derivedDobIso) throw new Error('gate4a_birthday_month_must_be_valid_month_name');\nif (!/^[0-9]{6,20}$/.test(submittedMemberNo)) throw new Error('gate4a_autocount_member_no_must_be_6_to_20_digits');\nif (/imported/i.test(pdpaRaw)) throw new Error('gate4a_imported_pdpa_marker_blocked');\nif (pdpaRaw.toLowerCase() !== 'yes') throw new Error('gate4a_pdpa_must_be_yes');\nif (!Number.isInteger(rowNumber) || rowNumber < 1) throw new Error('gate4a_safe_row_number_required');\n\nconst dummySourceText = [requiredName, submittedMemberNo, requiredEmail, birthdayMonthRaw, marketingConsentRaw, pdpaRaw].join(' ').toLowerCase();\nif (/\\b(dummy|fixture|placeholder|rehearsal|sample|synthetic)\\b/.test(dummySourceText)) {\n  throw new Error('gate4a_source_row_must_be_real_non_dummy');\n}\n\nconst submittedMemberNoBase64 = Buffer.from(submittedMemberNo, 'utf8').toString('base64');\nconst now = new Date();\nconst createdAt = now.toISOString();\nconst timeoutAt = new Date(now.getTime() + 15 * 60 * 1000).toISOString();\nconst sourceReference = SOURCE_LABEL;\nconst sourceRowRef = `row_${rowNumber}`;\nconst intakeId = `gate4a_${sourceRowRef}`;\n\nconst fnv1a = (text) => {\n  let hash = 0x811c9dc5;\n  for (let index = 0; index < text.length; index += 1) {\n    hash ^= text.charCodeAt(index);\n    hash = Math.imul(hash, 0x01000193) >>> 0;\n  }\n  return hash.toString(16).padStart(8, '0');\n};\n\nconst payloadHash = `fnv1a_${fnv1a(JSON.stringify({\n  intake_source: SOURCE_LABEL,\n  source_reference: sourceReference,\n  source_row_ref: sourceRowRef,\n  row_number: rowNumber,\n  intake_id: intakeId,\n  state: 'PENDING_LOOKUP',\n  submitted_member_no_base64_utf8: submittedMemberNoBase64,\n  pdpa_status: 'yes'\n}))}`;\n\nconst queueRow = {\n  job_id: `gate4a_${payloadHash}`,\n  intake_source: SOURCE_LABEL,\n  source_reference: sourceReference,\n  source_row_ref: sourceRowRef,\n  row_number: rowNumber,\n  intake_id: intakeId,\n  state: 'PENDING_LOOKUP',\n  submitted_member_no_base64_utf8: submittedMemberNoBase64,\n  consent_status: 'marketing_consent_not_queued',\n  pdpa_status: 'yes',\n  payload_hash: payloadHash,\n  attempt: 0,\n  max_attempts: 1,\n  created_at: createdAt,\n  updated_at: createdAt,\n  timeout_at: timeoutAt\n};\n\nconst allowed = ['job_id', 'intake_source', 'source_reference', 'source_row_ref', 'row_number', 'intake_id', 'state', 'submitted_member_no_base64_utf8', 'consent_status', 'pdpa_status', 'payload_hash', 'attempt', 'max_attempts', 'created_at', 'updated_at', 'timeout_at'];\nconst orderedQueueRow = Object.fromEntries(allowed.map((field) => [field, queueRow[field]]));\nconst jsonl = `${JSON.stringify(orderedQueueRow)}\\n`;\n\nreturn [{\n  json: {\n    gate: 'gate4a_real_queue_write_pre_bridge_check',\n    queue_row_count: 1,\n    queue_file_name: QUEUE_FILE_NAME,\n    no_row_values_printed: true,\n    ac2_lookup_invoked: false,\n    n8n_result_mapping_run: false,\n    workflow_activation: 'inactive'\n  },\n  binary: {\n    data: {\n      data: Buffer.from(jsonl, 'utf8').toString('base64'),\n      mimeType: 'application/x-jsonlines',\n      fileName: QUEUE_FILE_NAME\n    }\n  }\n}];"
+      },
+      "id": "88e6f891-a463-4a3e-b13a-86cb7ef2d309",
+      "name": "Validate And Build One Sanitized Queue Row",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -368,
+        128
+      ],
+      "notesInFlow": true,
+      "notes": "Validates exactly one real non-dummy row, required actual form headers, PDPA Yes, valid birthday month, and numeric AutoCount MemberNo only. Builds only the allowed queue fields and does not emit name, email, birthday month, derived DOB, raw marketing consent, AC2, bridge, SQL, HTTP, or PowerShell data."
+    },
+    {
+      "parameters": {
+        "operation": "write",
+        "fileName": "/home/node/.n8n-files/member_lookup_bridge_gate4a_pending_queue.jsonl",
+        "options": {
+          "append": false
+        }
+      },
+      "id": "3f5a9d98-0449-4f11-b8f8-8f855c471d41",
+      "name": "Write Queue JSONL Inside n8n Container",
+      "type": "n8n-nodes-base.readWriteFile",
+      "typeVersion": 1.1,
+      "position": [
+        -80,
+        128
+      ],
+      "notesInFlow": true,
+      "notes": "Overwrites the one-row Gate 4A staging file inside the n8n container at /home/node/.n8n-files/member_lookup_bridge_gate4a_pending_queue.jsonl so stale rows from earlier manual tests cannot accumulate. Append must stay disabled. /home/node/.n8n-files is the n8n-approved file-access location and the directory must exist before the run. Operator copies the file out with docker compose cp before running the repo precheck."
+    },
+    {
+      "parameters": {
+        "content": "### Gate 4A Boundary\nManual inactive queue-write proof only. Do not activate. Do not add webhook, scheduler, bridge, AC2, SQL, RDP, tunnel, or result-mapping nodes. Copy only the container JSONL file out and run the aggregate repo precheck.",
+        "height": 180,
+        "width": 420,
+        "color": 4
+      },
+      "id": "e17710d3-50f1-414b-931c-11f6008fd869",
+      "name": "Gate 4A Boundary",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -896,
+        -144
+      ]
+    }
+  ],
+  "connections": {
+    "Manual Gate 4A Run": {
+      "main": [
+        [
+          {
+            "node": "Read One Approved Real Source Row",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read One Approved Real Source Row": {
+      "main": [
+        [
+          {
+            "node": "Validate And Build One Sanitized Queue Row",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate And Build One Sanitized Queue Row": {
+      "main": [
+        [
+          {
+            "node": "Write Queue JSONL Inside n8n Container",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "none",
+    "saveDataSuccessExecution": "none",
+    "saveManualExecutions": false,
+    "binaryMode": "separate"
+  },
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "nodeGroups": [],
+  "versionId": "ee1cbf88-9945-42f4-b45b-92381f700391",
+  "sourceWorkflowId": null
+}
