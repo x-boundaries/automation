@@ -303,12 +303,75 @@ final_write_automation = false
 no_row_values_printed = true
 ```
 
-Scope of this evidence. The source row used test-style form values, so this run proves the technical path only: Google Sheets read, exactly-one-row validation, actual header handling, `Birthday Month` validation, sanitized queue construction, n8n-approved container file write, file copy-out, and aggregate precheck. It does not satisfy the final real consenting member-row evidence requirement.
+Scope of this earlier run. The source row used test-style form values, so this run proved the technical path only: Google Sheets read, exactly-one-row validation, actual header handling, `Birthday Month` validation, sanitized queue construction, n8n-approved container file write, file copy-out, and aggregate precheck. By itself it did not yet satisfy the final real consenting member-row evidence requirement; that requirement is now separately satisfied and recorded in the next section.
 
-Remaining status:
+This technical UAT record is retained as historical evidence of the earlier test-style run. The final real consenting source-row evidence is recorded separately below.
 
-- Technical queue-write path passed.
-- Final real non-dummy source-row evidence remains pending.
+## Final Real Consenting Source-Row Evidence (2026-07-13)
+
+Final real non-dummy consenting source-row Gate 4A evidence: PASS.
+
+The operator completed the final Gate 4A manual run using exactly one genuine, non-dummy, consenting UAT Google Form response. The run:
+
+- used one genuine consented UAT Form response as the source;
+- selected exactly one row through `Gate4AApprovedForLookup = YES`;
+- kept the workflow manual and inactive;
+- wrote exactly one sanitized queue row;
+- decoded that one queue row's Base64 lookup value exactly once, with no decode failure;
+- produced no blank decoded value;
+- produced no dummy-looking decoded value;
+- produced no unexpected queue shape;
+- stopped after the aggregate precheck, before any bridge or AutoCount call.
+
+Aggregate-only result:
+
+```text
+status = ok
+gate = gate4a_real_queue_write_pre_bridge_check
+runtime_location = local_operator_pc_non_ac2_n8n_stack
+execution_mode = manual_inactive_queue_write_pre_bridge_check
+queue_row_count = 1
+queue_base64_decode_ok_count = 1
+queue_base64_decode_fail_count = 0
+queue_decoded_blank_count = 0
+queue_decoded_looks_dummy_count = 0
+unexpected_queue_shape_count = 0
+bridge_handoff_approved = false
+ac2_lookup_invoked = false
+n8n_result_mapping_run = false
+workflow_activation = inactive
+scheduler_enabled = false
+public_inbound_to_ac2_host = false
+member_create_or_update_invoked = false
+autocount_write_attempted = false
+direct_sql_write_attempted = false
+final_write_automation = false
+no_row_values_printed = true
+```
+
+Sanitized evidence note: No credentials, connection strings, Sheet IDs/URLs, credential IDs, row-level output, raw/encoded/decoded/normalized member values, names, emails, phone numbers, birthdays, command transcripts, stderr/stdout, execution payloads, node raw input/output dumps, screenshots, or PII are included.
+
+### Final Gate 4A Status
+
+- Gate 4A queue-write evidence: PASS.
+- Final real non-dummy consenting source-row evidence: PASS.
 - Bridge handoff remains unapproved.
 - AC2 lookup remains uninvoked.
-- No member or AutoCount write occurred.
+- n8n result mapping remains unrun.
+- Workflow remains inactive.
+- Scheduler remains disabled.
+- No public inbound access to the AC2 host exists.
+- No member create/update occurred.
+- No AutoCount write occurred.
+- No direct SQL write occurred.
+- Final write automation remains false.
+
+Gate 4A completion does not by itself approve the next bridge/AC2 lookup-only step. That next step requires a separate explicit gate, review, and operator approval before any bridge handoff or AC2 lookup runs.
+
+### Operator Cleanup After This Run
+
+- `Gate4AApprovedForLookup` is the only manually maintained Gate 4A helper/admin column. It is not a Google Form question.
+- It is set to `YES` for exactly one approved row before the manual run.
+- After this evidence run, the operator should clear the `Gate4AApprovedForLookup = YES` value so the same row is not selected accidentally again.
+- This is an operator cleanup instruction only; this repository did not and cannot clear the Sheet value.
+- Do not create or maintain physical Sheet columns named `row_number`, `Gate4A Source Reference`, or `Gate4A Source Row Ref`.
