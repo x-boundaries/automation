@@ -1001,14 +1001,89 @@ class Gate4ARunbookTests(unittest.TestCase):
     def test_runbook_records_sanitized_technical_uat_evidence(self):
         runbook = self.read(RUNBOOK)
 
+        # The earlier test-style technical UAT record is preserved as historical evidence.
         for phrase in [
             "Gate 4A technical n8n-to-container queue-write UAT: PASS",
-            "Final real non-dummy source-row evidence remains pending.",
+            "This technical UAT record is retained as historical evidence",
             "Bridge handoff remains unapproved.",
             "AC2 lookup remains uninvoked.",
-            "No member or AutoCount write occurred.",
         ]:
             self.assertIn(phrase, runbook)
+
+        # Current status must no longer say the final real-row evidence is pending.
+        self.assertNotIn("Final real non-dummy source-row evidence remains pending.", runbook)
+        self.assertNotIn("Final real non-dummy source-row evidence remains pending", runbook)
+
+    def test_runbook_records_final_real_consenting_row_evidence(self):
+        runbook = self.read(RUNBOOK)
+
+        for phrase in [
+            "Final real non-dummy consenting source-row Gate 4A evidence: PASS",
+            "Gate 4A queue-write evidence: PASS.",
+            "one genuine consented UAT Form response",
+            "selected exactly one row through `Gate4AApprovedForLookup = YES`",
+            "kept the workflow manual and inactive",
+            "wrote exactly one sanitized queue row",
+            "decoded that one queue row's Base64 lookup value exactly once, with no decode failure",
+            "produced no blank decoded value",
+            "produced no dummy-looking decoded value",
+            "produced no unexpected queue shape",
+            "stopped after the aggregate precheck",
+            "bridge_handoff_approved = false",
+            "ac2_lookup_invoked = false",
+            "n8n_result_mapping_run = false",
+            "workflow_activation = inactive",
+            "scheduler_enabled = false",
+            "public_inbound_to_ac2_host = false",
+            "member_create_or_update_invoked = false",
+            "autocount_write_attempted = false",
+            "direct_sql_write_attempted = false",
+            "final_write_automation = false",
+            "no_row_values_printed = true",
+        ]:
+            self.assertIn(phrase, runbook)
+
+        # Exact successful aggregate counters for the final real-row run.
+        for counter in [
+            "queue_row_count = 1",
+            "queue_base64_decode_ok_count = 1",
+            "queue_base64_decode_fail_count = 0",
+            "queue_decoded_blank_count = 0",
+            "queue_decoded_looks_dummy_count = 0",
+            "unexpected_queue_shape_count = 0",
+        ]:
+            self.assertIn(counter, runbook)
+
+        # The next bridge/AC2 lookup-only step still needs its own explicit approval.
+        self.assertIn(
+            "Gate 4A completion does not by itself approve the next bridge/AC2 lookup-only step.",
+            runbook,
+        )
+        self.assertIn(
+            "requires a separate explicit gate, review, and operator approval",
+            runbook,
+        )
+
+        # Operator must clear the approval marker after the completed run; the repo did not.
+        self.assertIn(
+            "the operator should clear the `Gate4AApprovedForLookup = YES` value",
+            runbook,
+        )
+        self.assertIn("this repository did not and cannot clear the Sheet value", runbook)
+        self.assertIn(
+            "`Gate4AApprovedForLookup` is the only manually maintained Gate 4A helper/admin column. It is not a Google Form question.",
+            runbook,
+        )
+
+        # No sensitive row-level evidence appears in the final evidence section.
+        final_section = runbook.split("## Final Real Consenting Source-Row Evidence", 1)[1]
+        self.assertNotRegex(final_section, r"https://docs\.google\.com/spreadsheets/d/")
+        self.assertNotRegex(final_section, r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b")
+        self.assertNotRegex(final_section, r"(?i)\b(?:\+?65)?[689]\d{7}\b")
+        self.assertNotRegex(
+            final_section,
+            r"submitted_member_no_base64_utf8\"\s*:\s*\"[A-Za-z0-9+/]+=*\"",
+        )
 
     def test_committed_gate4a_material_has_no_sensitive_literals_or_artifacts(self):
         combined = "\n".join(
