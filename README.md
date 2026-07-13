@@ -90,6 +90,7 @@ Raw CSVs and member browse extracts stay local and must not be committed. Member
 - [Member intake n8n Gate 2 dummy rehearsal runbook](docs/autocount2-automation/member_intake_n8n_gate2_dummy_rehearsal_runbook.md)
 - [Member intake n8n lookup bridge UAT plan](docs/autocount2-automation/member_intake_n8n_lookup_bridge_uat_plan.md)
 - [Member intake n8n Gate 4A manual queue handoff runbook](docs/autocount2-automation/member_intake_n8n_gate4a_manual_queue_handoff_runbook.md)
+- [Member intake n8n Gate 4A container queue-write workflow](n8n-workflows/member_intake_gate4a_container_queue_write.workflow.json)
 - [Member intake n8n node contract](docs/autocount2-automation/member_intake_n8n_node_contract.md)
 - [Member form intake contract (dry-run validator)](docs/autocount2-automation/member_form_intake_contract.md)
 - [Member intake decision review runbook](docs/autocount2-automation/member_intake_decision_review_runbook.md)
