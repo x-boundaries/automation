@@ -21,14 +21,33 @@ Fail-closed recovery contract:
   be exactly: one canonical approved Gate 4A queue row (revalidated with the existing
   Gate 4A precheck plus the Gate 4 canonical member-number and payload-identity
   checks), one complete ``LOOKUP_ERROR_REVIEW`` durable result row matching that queue
-  job (``dry_run_only = true``, ``final_write_automation = false``), an absent or empty
+  job and matching the exact diagnosed original failure signature (``status = error``,
+  authentication/session/command/lookup flags all false, the recorded
+  ``already_65_mobile`` length-10 lookup shape, ``error_code = runtimeexception``,
+  ``dry_run_only = true``, ``final_write_automation = false``), an absent or empty
   processed directory, and exactly one clean matching dead-letter failed marker. Any
   mismatch, extra, malformed, unreadable, temporary, unrelated, or duplicate artifact is
-  ``needs_fix`` with no authentication preflight and no lookup.
-- **Isolated recovery paths.** The retry writes only to dedicated recovery result/marker
-  paths that must be disjoint from every original path. This wrapper defines exactly one
-  recovery generation; it never derives another numbered recovery generation, and any
-  existing recovery artifact blocks another lookup fail-closed.
+  ``needs_fix`` with no authentication preflight and no lookup. Recovery is authorized
+  only for that one diagnosed incident, never for an arbitrary failed attempt.
+- **Isolated recovery paths.** The retry writes only to dedicated recovery
+  claim/result/marker paths that must be disjoint from every original path. This wrapper
+  defines exactly one recovery generation; it never derives another numbered recovery
+  generation, and any existing recovery artifact blocks another lookup fail-closed. The
+  recovery results path must be completely absent before an attempt: a zero-byte file,
+  whitespace-only file, directory, or any other existing filesystem object at that path
+  is blocking, not just a file with rows.
+- **Atomic permanent attempt claim.** After every validation and a successful
+  authentication preflight, and immediately before the member lookup, the wrapper
+  atomically and exclusively creates a permanent attempt-claim file (equivalent of
+  ``O_CREAT | O_EXCL``) holding a fixed sanitized non-PII structure, durably flushed.
+  Only the process that wins the claim may invoke the lookup, so two concurrent
+  processes can never both run it. Claim creation consumes the single approved lookup
+  attempt. The claim is never removed, reset, overwritten, renamed, or repaired by any
+  code path; any later or concurrent process that encounters it performs zero lookups
+  (terminal ``already_processed`` only for a valid claim plus a fully valid successful
+  result/processed pair, otherwise terminal ``needs_fix``), so a crash after claim
+  creation blocks every future lookup. Authentication preflight failure happens before
+  claim creation and therefore does not consume the attempt.
 - **Authentication preflight.** Before the recovery lookup, the existing
   authentication-only probe ``scripts/ac2_session_auth_probe.ps1`` runs in the inherited
   process environment with ``-JsonOut`` to a local temporary file (deleted after
@@ -100,8 +119,42 @@ FORBIDDEN_AUTH_PROBE_TRUE_FLAGS = (
     "allow_root_login_set",
 )
 
+# The exact sanitized signature of the one diagnosed original Gate 4 failure. Recovery
+# is authorized only for an original durable result that matches every field exactly;
+# any other failed attempt (including status = refused or a different error code) is
+# out of scope for this reviewed recovery and must be re-diagnosed separately.
+APPROVED_ORIGINAL_FAILURE_SIGNATURE = {
+    "state": LOOKUP_ERROR_REVIEW,
+    "status": "error",
+    "authentication_success": False,
+    "user_session_available": False,
+    "member_command_found": False,
+    "get_member_found": False,
+    "submitted_member_no_status": "already_65_mobile",
+    "normalized_member_no_length": 10,
+    "member_exists": False,
+    "member_found_by": None,
+    "manual_review_required": False,
+    "warning_count": 0,
+    "error_code": "runtimeexception",
+    "dry_run_only": True,
+    "final_write_automation": False,
+    "result_applied_at": None,
+}
+
+# Fixed sanitized non-PII content of the permanent recovery attempt claim. The claim
+# carries no job identity, hash, timestamp, or member data; its existence alone is the
+# consumed-attempt signal, and a claim file must equal this structure exactly.
+ATTEMPT_CLAIM_STRUCTURE = {
+    "claim_type": "gate4_recovery1_attempt_started",
+    "recovery_generation": RECOVERY_GENERATION,
+    "single_attempt_only": True,
+    "dry_run_only": True,
+    "final_write_automation": False,
+}
+
 # Test-only fault-injection hook, same discipline as Gate 4: it can only cause failures
-# (never a false PASS) and proves an interrupted persistence run stays detectable.
+# (never a false PASS) and proves an interrupted run stays detectable and blocking.
 FAULT_ENV = "GATE4_RECOVERY_TEST_FAULT_INJECT"
 
 
@@ -125,6 +178,9 @@ def zero_flags(*, powershell_lookup_enabled=False):
         "powershell_lookup_enabled": powershell_lookup_enabled,
         "original_failure_validated": False,
         "recovery_paths_isolated": False,
+        "recovery_attempt_claim_present": False,
+        "recovery_attempt_claim_created_by_this_run": False,
+        "recovery_attempt_consumed": False,
         "auth_preflight_invoked": False,
         "auth_preflight_success": False,
         "ac2_lookup_invoked": False,
@@ -144,6 +200,12 @@ def evidence_rows(status, counts, flags):
         ("original_failure_validated", bool_text(flags["original_failure_validated"])),
         ("original_artifacts_modified", "false"),
         ("recovery_paths_isolated", bool_text(flags["recovery_paths_isolated"])),
+        ("recovery_attempt_claim_present", bool_text(flags["recovery_attempt_claim_present"])),
+        (
+            "recovery_attempt_claim_created_by_this_run",
+            bool_text(flags["recovery_attempt_claim_created_by_this_run"]),
+        ),
+        ("recovery_attempt_consumed", bool_text(flags["recovery_attempt_consumed"])),
         ("auth_preflight_invoked", bool_text(flags["auth_preflight_invoked"])),
         ("auth_preflight_success", bool_text(flags["auth_preflight_success"])),
         ("allow_root_login_used", "false"),
@@ -196,6 +258,7 @@ def recovery_paths_are_isolated(args):
         args.original_failed_dir,
     )
     recovery_paths = (
+        args.recovery_attempt_claim_json,
         args.recovery_results_jsonl,
         args.recovery_processed_dir,
         args.recovery_failed_dir,
@@ -211,12 +274,23 @@ def recovery_paths_are_isolated(args):
     return True
 
 
+def signature_field_matches(result, field, expected):
+    """Exact type-safe match: booleans by identity, ints excluding bools, else equality."""
+    value = result.get(field)
+    if expected is None or isinstance(expected, bool):
+        return value is expected
+    if isinstance(expected, int):
+        return gate4.exact_int(value, expected)
+    return value == expected
+
+
 def original_failed_result_valid(result, job):
     """Strictly validate the single original ``LOOKUP_ERROR_REVIEW`` durable result.
 
     The result must carry the exact allowed sanitized envelope, match the approved queue
-    job identity, and be the recorded dry-run failed attempt. Nothing weaker than the
-    Gate 4 envelope discipline is accepted.
+    job identity, and match every field of the exact diagnosed original failure
+    signature. Any other failed attempt — including ``status = refused`` or a different
+    error code — is out of scope for this reviewed recovery.
     """
     if not isinstance(result, dict) or set(result) != worker.ALLOWED_RESULT_FIELDS:
         return False
@@ -232,19 +306,9 @@ def original_failed_result_valid(result, job):
         return False
     if result.get("attempt") != worker.safe_attempt(job.get("attempt")):
         return False
-    if result.get("dry_run_only") is not True:
-        return False
-    if result.get("final_write_automation") is not False:
-        return False
-    if result.get("result_applied_at") is not None:
-        return False
-    if result.get("state") != LOOKUP_ERROR_REVIEW:
-        return False
-    if result.get("status") not in {"error", "refused"}:
-        return False
-    error_code = result.get("error_code")
-    if not isinstance(error_code, str) or not error_code:
-        return False
+    for field, expected in APPROVED_ORIGINAL_FAILURE_SIGNATURE.items():
+        if not signature_field_matches(result, field, expected):
+            return False
     return True
 
 
@@ -380,6 +444,54 @@ def recovery_artifact_count(directory):
         return 0
 
 
+def recovery_results_path_absent(path):
+    """True only when nothing exists at the recovery results path.
+
+    Stricter than the Gate 4 empty-results rule on purpose: a zero-byte file,
+    whitespace-only file, malformed file, partial file, directory, broken link, or any
+    other filesystem object at this path blocks a fresh recovery attempt fail-closed.
+    """
+    return not os.path.lexists(path)
+
+
+def attempt_claim_state(path):
+    """Classify the permanent attempt claim as absent, valid, or invalid.
+
+    Aggregate classification only: no claim content, filename, or path detail is ever
+    returned for printing. Anything present that is not a regular file holding exactly
+    the fixed sanitized claim structure is ``invalid`` (still a consumed/blocking claim,
+    but never eligible for ``already_processed``).
+    """
+    if not os.path.lexists(path):
+        return "absent"
+    claim_path = Path(path)
+    if not claim_path.is_file():
+        return "invalid"
+    try:
+        payload = json.loads(claim_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return "invalid"
+    return "valid" if payload == ATTEMPT_CLAIM_STRUCTURE else "invalid"
+
+
+def create_attempt_claim(path):
+    """Atomically and exclusively create the permanent attempt claim, durably flushed.
+
+    Uses ``O_CREAT | O_EXCL`` so exactly one process can ever win the claim; every other
+    concurrent or later creation attempt raises ``FileExistsError``. The claim content is
+    the fixed sanitized non-PII structure only. Nothing ever removes or rewrites it.
+    """
+    claim_path = Path(path)
+    claim_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = (json.dumps(ATTEMPT_CLAIM_STRUCTURE, sort_keys=True) + "\n").encode("utf-8")
+    handle = os.open(str(claim_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    try:
+        os.write(handle, payload)
+        os.fsync(handle)
+    finally:
+        os.close(handle)
+
+
 def maybe_fault(point):
     if os.environ.get(FAULT_ENV) == point:
         raise RuntimeError("gate4_recovery_test_fault_injected")
@@ -401,6 +513,7 @@ def build_parser():
     parser.add_argument("--original-results-jsonl", required=True)
     parser.add_argument("--original-processed-dir", required=True)
     parser.add_argument("--original-failed-dir", required=True)
+    parser.add_argument("--recovery-attempt-claim-json", required=True)
     parser.add_argument("--recovery-results-jsonl", required=True)
     parser.add_argument("--recovery-processed-dir", required=True)
     parser.add_argument("--recovery-failed-dir", required=True)
@@ -508,16 +621,23 @@ def main(argv=None):
         return 2
     flags["original_failure_validated"] = True
 
-    # E. Recovery-state machine before authentication. Exactly one recovery generation
-    # exists: a completed successful recovery is terminal `already_processed`, and any
-    # other recovery artifact (failed marker, partial pair, malformed, temporary,
-    # unrelated, duplicate) is terminal `needs_fix`. Nothing is cleaned, reset,
-    # overwritten, or repaired, and no second lookup can start.
+    # E. Claim-first recovery-state machine before authentication. Exactly one recovery
+    # generation exists and the permanent attempt claim is its consumed-attempt signal:
+    # any present claim is terminal (`already_processed` only for a valid claim plus a
+    # fully valid successful result/processed pair, otherwise `needs_fix`), and with no
+    # claim any recovery artifact at all — including an empty or zero-byte results path
+    # or any other filesystem object at it — is terminal `needs_fix`. Nothing is
+    # cleaned, reset, overwritten, or repaired, and no second lookup can ever start.
+    claim_state = attempt_claim_state(args.recovery_attempt_claim_json)
+    claim_present = claim_state != "absent"
+    flags["recovery_attempt_claim_present"] = claim_present
+    flags["recovery_attempt_consumed"] = claim_present
+
     recovery_processed = gate4.inspect_markers(args.recovery_processed_dir, job_id)
     recovery_failed = gate4.inspect_markers(args.recovery_failed_dir, job_id)
     recovery_results = gate4.inspect_results(args.recovery_results_jsonl, job_id)
 
-    if (
+    if claim_state == "valid" and (
         gate4.marker_dir_has_exactly_one_clean(recovery_processed)
         and gate4.processed_marker_valid(recovery_processed["expected_marker"], job_id, payload_hash)
         and gate4.marker_dir_empty(recovery_failed)
@@ -534,11 +654,18 @@ def main(argv=None):
     ):
         return stopped("already_processed", 0)
 
+    if claim_present:
+        # The single approved attempt is consumed. Every non-perfect state (failed
+        # dead-letter pair, missing/partial/malformed/inconsistent artifacts, or an
+        # invalid claim) is terminal needs_fix with zero authentication and zero lookup.
+        return stopped("needs_fix", 2)
+
     if not (
-        gate4.marker_dir_empty(recovery_processed)
+        recovery_results_path_absent(args.recovery_results_jsonl)
+        and gate4.marker_dir_empty(recovery_processed)
         and gate4.marker_dir_empty(recovery_failed)
-        and not gate4.results_block_fresh_lookup(recovery_results)
     ):
+        # No claim, but recovery artifacts exist: inconsistent state, never rerun.
         return stopped("needs_fix", 2)
 
     # F. Invocation accuracy: both PowerShell scripts must exist as regular files before
@@ -562,7 +689,27 @@ def main(argv=None):
         return 2
     flags["auth_preflight_success"] = True
 
-    # I. Exactly one real read-only PowerShell lookup through the proven worker path.
+    # I. Atomic permanent attempt claim, immediately before the lookup. Only the process
+    # that exclusively creates the claim may invoke the lookup; a concurrent loser sees
+    # FileExistsError and performs zero lookups. Claim creation consumes the single
+    # approved attempt, and the claim is never removed, reset, or rewritten.
+    try:
+        create_attempt_claim(args.recovery_attempt_claim_json)
+    except FileExistsError:
+        flags["recovery_attempt_claim_present"] = True
+        flags["recovery_attempt_consumed"] = True
+        return stopped("needs_fix", 2)
+    except OSError:
+        return stopped("needs_fix", 2)
+    flags["recovery_attempt_claim_present"] = True
+    flags["recovery_attempt_claim_created_by_this_run"] = True
+    flags["recovery_attempt_consumed"] = True
+
+    # Test-only crash simulation between claim persistence and the lookup: the claim
+    # already blocks every future lookup, which the rerun tests prove.
+    maybe_fault("after_claim_before_lookup")
+
+    # J. Exactly one real read-only PowerShell lookup through the proven worker path.
     args.lookup_mode = LOOKUP_MODE
     args.max_attempts = gate4.CANONICAL_MAX_ATTEMPTS
     args.allow_root_login = False
@@ -570,6 +717,10 @@ def main(argv=None):
     state = result.get("state")
     flags["ac2_lookup_invoked"] = True
     counts["lookup_attempt_count"] = 1
+
+    # Test-only crash simulation after the lookup but before result persistence: the
+    # rerun must perform zero lookups because the claim is already consumed.
+    maybe_fault("after_lookup_before_result")
 
     if state == LOOKUP_ERROR_REVIEW or not gate4.is_valid_review_result(result):
         try:

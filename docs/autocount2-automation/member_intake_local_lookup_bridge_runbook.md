@@ -1343,15 +1343,48 @@ Status: reviewed recovery instructions for the single failed genuine Gate 4 atte
 
 The operator ran Gate 4 exactly once against the single approved Gate 4A queue row. The run reached the real PowerShell lookup, but the durable result recorded `LOOKUP_ERROR_REVIEW` with `authentication_success = false` and a sanitized `runtimeexception` error code. Subsequent diagnosis proved that the AutoCount assembly root and required assemblies exist, the queue row is structurally valid, and the four required `AC2_PROBE_*` runtime environment values were absent from the failed Gate 4 process. After restoring those four runtime-only process values, the existing authentication-only probe (`scripts/ac2_session_auth_probe.ps1`) passed without `-AllowRootLogin`: authentication was subsequently proven healthy (`static_auth_success`, `instance_login_success`, `instance_is_login`, `authentication_success`, and `user_session_available` all true with no error). The failure cause was therefore missing runtime configuration in that one process, not a defect in the queue row, the lookup path, or AutoCount authentication.
 
+Recovery is authorized only for this one diagnosed incident. The wrapper pins validation to the exact original failure signature and requires the original durable result to match every field exactly:
+
+```text
+state = LOOKUP_ERROR_REVIEW
+status = error
+authentication_success = false
+user_session_available = false
+member_command_found = false
+get_member_found = false
+submitted_member_no_status = already_65_mobile
+normalized_member_no_length = 10
+member_exists = false
+member_found_by = null
+manual_review_required = false
+warning_count = 0
+error_code = runtimeexception
+dry_run_only = true
+final_write_automation = false
+result_applied_at = null
+```
+
+Any other failed attempt — including `status = refused` or any different error code — is out of scope, reports `needs_fix` before authentication, and requires separate diagnosis and separate reviewed approval. The exact queue identity, source identity, attempt, PDPA, consent, result-schema, payload-hash, and failed-marker matching checks all still apply on top of this signature.
+
 Do not record the `AC2_PROBE_*` values, any credential, any AC2 server/database/user value, result rows, marker data, queue data, command transcripts, or PII anywhere in the repository or in pasted evidence.
 
 ### Original Evidence Preservation Rule
 
 The complete original failed attempt is valid historical evidence. The original queue file, the original Gate 4 results file, the original processed directory, and the original failed directory must be preserved byte-for-byte and are never deleted, renamed, moved, overwritten, truncated, appended to, or repaired by the recovery wrapper or by the operator. The recovery wrapper reads them only for strict aggregate structural validation; every rejection path writes nothing at all. Operators must not delete, edit, or move any original artifact to make recovery validation pass; if validation reports `needs_fix`, stop and investigate.
 
-### One-Recovery-Only Policy
+### One-Recovery-Only Policy And The Permanent Attempt Claim
 
-Exactly one recovery attempt is authorized. The wrapper defines a single `recovery1` generation of isolated ignored paths and never derives a `recovery2` or later generation. If any recovery result row or recovery marker artifact already exists — a completed success, a failed recovery marker, a partial result/marker pair, or any malformed, temporary, unrelated, or duplicate artifact — a second recovery lookup is blocked fail-closed. A completed successful recovery reports `already_processed` with zero lookups; every other preexisting recovery state reports `needs_fix` with zero lookups. No code path cleans, resets, overwrites, or repairs recovery artifacts. A further retry beyond this single reviewed recovery attempt requires a new reviewed PR, not artifact deletion.
+Exactly one recovery attempt is authorized. The wrapper defines a single `recovery1` generation of isolated ignored paths and never derives a `recovery2` or later generation.
+
+The at-most-one-lookup guarantee is enforced mechanically by a permanent recovery attempt claim file. After every validation gate and a successful authentication preflight, and immediately before the member lookup, the wrapper atomically and exclusively creates the claim (the equivalent of `O_CREAT | O_EXCL`) with a fixed sanitized non-PII structure, durably flushed. Only the process that wins the exclusive creation may invoke the lookup, so two concurrent processes observing the same clean state can never both run it — the loser sees the existing claim and performs zero lookups. Claim creation consumes the single approved lookup attempt, and a crash after claim creation (before, during, or after the lookup) blocks every future lookup, because any present claim is terminal:
+
+- valid claim plus one fully valid successful result/processed-marker pair -> `already_processed`, zero lookups;
+- valid claim plus a failed result/dead-letter pair -> `needs_fix`, zero lookups;
+- claim plus missing, partial, malformed, inconsistent, or interrupted result/marker state -> `needs_fix`, zero lookups;
+- malformed or unexpected claim content -> `needs_fix`, zero lookups, never `already_processed`;
+- no claim plus any recovery result or marker artifact -> `needs_fix`, zero lookups.
+
+No code path cleans, resets, overwrites, renames, or repairs the claim or any recovery artifact, and operators must never remove, rename, edit, or reset the claim. Authentication preflight failure happens before claim creation and therefore does not consume the attempt; a later corrected invocation may still claim and run the single lookup. A further retry beyond this single reviewed recovery attempt requires a new reviewed PR, not artifact deletion.
 
 ### Isolated Recovery Paths
 
@@ -1363,12 +1396,15 @@ $queue = "$root\member_lookup_bridge_gate4_pending_queue.jsonl"
 $origResults = "$root\member_lookup_bridge_gate4_results.jsonl"
 $origProcessed = "$root\member_lookup_bridge_gate4_processed"
 $origFailed = "$root\member_lookup_bridge_gate4_failed"
+$recClaim = "$root\member_lookup_bridge_gate4_recovery1_attempt_started.json"
 $recResults = "$root\member_lookup_bridge_gate4_recovery1_results.jsonl"
 $recProcessed = "$root\member_lookup_bridge_gate4_recovery1_processed"
 $recFailed = "$root\member_lookup_bridge_gate4_recovery1_failed"
 ```
 
-The original approved queue file is read as the immutable source input and is not modified. All recovery artifacts are ignored by Git and must never be committed.
+The original approved queue file is read as the immutable source input and is not modified. All recovery artifacts — including the attempt claim — are ignored by Git and must never be committed.
+
+Before a fresh attempt the recovery results path must be completely absent: even an empty or zero-byte recovery results file is blocking, as is a whitespace-only file, a malformed or partial file, a directory, or any other filesystem object at that path. Every blocked case is `needs_fix` with zero authentication and zero lookups.
 
 ### Authentication Preflight
 
@@ -1389,6 +1425,7 @@ python scripts\member_lookup_gate4_failed_attempt_recovery.py `
   --original-results-jsonl "$origResults" `
   --original-processed-dir "$origProcessed" `
   --original-failed-dir "$origFailed" `
+  --recovery-attempt-claim-json "$recClaim" `
   --recovery-results-jsonl "$recResults" `
   --recovery-processed-dir "$recProcessed" `
   --recovery-failed-dir "$recFailed"
@@ -1411,6 +1448,9 @@ recovery_generation = 1
 original_failure_validated = <true/false>
 original_artifacts_modified = false
 recovery_paths_isolated = <true/false>
+recovery_attempt_claim_present = <true/false>
+recovery_attempt_claim_created_by_this_run = <true/false>
+recovery_attempt_consumed = <true/false>
 auth_preflight_invoked = <true/false>
 auth_preflight_success = <true/false>
 allow_root_login_used = false
@@ -1437,17 +1477,18 @@ final_write_automation = false
 no_row_values_printed = true
 ```
 
-For one successful recovery lookup, expect `status = ok`, `original_failure_validated = true`, `original_artifacts_modified = false`, `recovery_paths_isolated = true`, `auth_preflight_invoked = true`, `auth_preflight_success = true`, `allow_root_login_used = false`, `ac2_lookup_invoked = true`, `queue_rows_read_count = 1`, `lookup_attempt_count = 1`, `lookup_success_count = 1`, exactly one of the three review routing counts equal to `1`, `lookup_error_count = 0`, `recovery_result_rows_written_count = 1`, `recovery_processed_artifact_count = 1`, and `recovery_failed_artifact_count = 0`. A rerun after a completed successful recovery reports `status = already_processed` with `lookup_attempt_count = 0` and `auth_preflight_invoked = false`. Every validation, isolation, preflight, or lookup failure reports `status = needs_fix` (or `refused` for missing opt-ins) and never becomes `already_processed`.
+For one successful recovery lookup, expect `status = ok`, `original_failure_validated = true`, `original_artifacts_modified = false`, `recovery_paths_isolated = true`, `recovery_attempt_claim_present = true`, `recovery_attempt_claim_created_by_this_run = true`, `recovery_attempt_consumed = true`, `auth_preflight_invoked = true`, `auth_preflight_success = true`, `allow_root_login_used = false`, `ac2_lookup_invoked = true`, `queue_rows_read_count = 1`, `lookup_attempt_count = 1`, `lookup_success_count = 1`, exactly one of the three review routing counts equal to `1`, `lookup_error_count = 0`, `recovery_result_rows_written_count = 1`, `recovery_processed_artifact_count = 1`, and `recovery_failed_artifact_count = 0`. A rerun after a completed successful recovery reports `status = already_processed` with `lookup_attempt_count = 0`, `auth_preflight_invoked = false`, `recovery_attempt_claim_present = true`, and `recovery_attempt_claim_created_by_this_run = false`. Every validation, isolation, preflight, claim, or lookup failure reports `status = needs_fix` (or `refused` for missing opt-ins) and never becomes `already_processed`.
 
 ### Stop Conditions
 
 Stop immediately and do not treat the run as recovery pass evidence if any of the following appear:
 
 - `status = refused` or `status = needs_fix`, `original_failure_validated = false`, `recovery_paths_isolated = false`, `auth_preflight_success = false` on an expected run, `lookup_error_count` above `0`, or an unexpected evidence shape.
-- `ac2_lookup_invoked = true` with anything other than exactly one lookup attempt and exactly one recovery result row.
+- `ac2_lookup_invoked = true` with anything other than exactly one lookup attempt and exactly one recovery result row, or `ac2_lookup_invoked = true` together with `recovery_attempt_claim_created_by_this_run = false`.
+- `recovery_attempt_claim_present = true` on what was expected to be the first attempt, or any sign the claim was removed, renamed, edited, or reset.
 - Any indication of a second recovery attempt, a `recovery2`-style path, a modified original artifact, a member create/update/delete reference, an AutoCount write attempt, a direct SQL indication, n8n activation or result mapping, scheduler enablement, or webhook/tunnel exposure of the AC2 host.
 
-If the recovery lookup itself fails (`lookup_error_count = 1`, a recovery dead-letter marker exists), the one authorized recovery attempt is consumed. Do not delete the recovery artifacts to retry; any further attempt requires a new reviewed PR.
+If the recovery lookup itself fails (`lookup_error_count = 1`, a recovery dead-letter marker exists), or the claim exists without a completed successful pair (an interrupted run), the one authorized recovery attempt is consumed. Do not delete the claim or any recovery artifact to retry; any further attempt requires a new reviewed PR.
 
 ### Recovery Boundaries
 

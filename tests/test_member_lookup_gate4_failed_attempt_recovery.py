@@ -53,6 +53,9 @@ EXPECTED_EVIDENCE_KEYS = [
     "original_failure_validated",
     "original_artifacts_modified",
     "recovery_paths_isolated",
+    "recovery_attempt_claim_present",
+    "recovery_attempt_claim_created_by_this_run",
+    "recovery_attempt_consumed",
     "auth_preflight_invoked",
     "auth_preflight_success",
     "allow_root_login_used",
@@ -211,6 +214,30 @@ def success_result_row(job, *, state="READY_FOR_CREATE_REVIEW", member_exists=Fa
     }
 
 
+# Mirror of the wrapper's fixed sanitized non-PII claim structure, for direct seeding.
+ATTEMPT_CLAIM_STRUCTURE = {
+    "claim_type": "gate4_recovery1_attempt_started",
+    "recovery_generation": 1,
+    "single_attempt_only": True,
+    "dry_run_only": True,
+    "final_write_automation": False,
+}
+
+
+def success_processed_marker(job, *, state="READY_FOR_CREATE_REVIEW"):
+    return {
+        "marker_type": "processed",
+        "job_id": job["job_id"],
+        "payload_hash": job["payload_hash"],
+        "state": state,
+        "status": "ok",
+        "error_code": None,
+        "dry_run_only": True,
+        "final_write_automation": False,
+        "marked_at": "fixture-time",
+    }
+
+
 def auth_probe_payload(**overrides):
     payload = {
         "mode": "session-auth-probe",
@@ -312,10 +339,15 @@ class Gate4FailedAttemptRecoveryTests(unittest.TestCase):
             "orig_results": tmp_path / "member_lookup_bridge_gate4_results.jsonl",
             "orig_processed": tmp_path / "member_lookup_bridge_gate4_processed",
             "orig_failed": tmp_path / "member_lookup_bridge_gate4_failed",
+            "rec_claim": tmp_path / "member_lookup_bridge_gate4_recovery1_attempt_started.json",
             "rec_results": tmp_path / "member_lookup_bridge_gate4_recovery1_results.jsonl",
             "rec_processed": tmp_path / "member_lookup_bridge_gate4_recovery1_processed",
             "rec_failed": tmp_path / "member_lookup_bridge_gate4_recovery1_failed",
         }
+
+    def write_claim(self, paths, payload=None, *, raw=None):
+        text = raw if raw is not None else json.dumps(payload or ATTEMPT_CLAIM_STRUCTURE, sort_keys=True) + "\n"
+        paths["rec_claim"].write_text(text, encoding="utf-8")
 
     def seed_original(self, tmp_path, *, row=None, result_overrides=None, marker_overrides=None):
         paths = self.paths(tmp_path)
@@ -329,13 +361,18 @@ class Gate4FailedAttemptRecoveryTests(unittest.TestCase):
         )
         return paths, row
 
-    def fake_ps(self, tmp_path, *, auth=None, auth_raw=None, lookup=None):
+    def fake_ps(self, tmp_path, *, auth=None, auth_raw=None, lookup=None, ready_file=None, wait_file=None, lookup_log=None):
         """Write one dispatching fake powershell .cmd covering probe and lookup calls.
 
         The probe call is recognised by its -JsonOut argument (auth JSON is written to
         that path); every other call is treated as the member lookup (JSON on stdout).
         Each invocation is appended to a per-mode log, and the full argument line is
         appended to an args log so tests can prove -AllowRootLogin is never forwarded.
+
+        When ready_file/wait_file are given, the auth branch announces readiness and
+        waits (bounded) for the peer flag, forming a rendezvous barrier that releases
+        two concurrent wrapper processes past authentication at approximately the same
+        time. lookup_log may be shared between two fakes to count total lookups.
         """
         exe = tmp_path / "fake-powershell.cmd"
         probe_script = tmp_path / "fake-auth-probe.ps1"
@@ -343,7 +380,7 @@ class Gate4FailedAttemptRecoveryTests(unittest.TestCase):
         probe_script.write_text("# fake auth probe script path only\n", encoding="utf-8")
         lookup_script.write_text("# fake read-only lookup script path only\n", encoding="utf-8")
         auth_log = tmp_path / "auth-invocations.log"
-        lookup_log = tmp_path / "lookup-invocations.log"
+        lookup_log = Path(lookup_log) if lookup_log else tmp_path / "lookup-invocations.log"
         args_log = tmp_path / "all-args.log"
         auth_text = auth_raw if auth_raw is not None else json.dumps(auth or auth_probe_payload(), sort_keys=True)
         lookup_text = json.dumps(lookup or lookup_payload(), sort_keys=True)
@@ -362,11 +399,25 @@ class Gate4FailedAttemptRecoveryTests(unittest.TestCase):
             "shift",
             "goto parse",
             ":run",
-            'if "%MODE%"=="auth" (',
-            f'  >> "{auth_log}" echo auth-invoked',
-            f'  > "%OUT%" echo {auth_text}',
-            "  exit /b 0",
-            ")",
+            'if "%MODE%"=="lookup" goto lookup',
+            f'>> "{auth_log}" echo auth-invoked',
+        ]
+        if ready_file is not None and wait_file is not None:
+            lines += [
+                f'> "{ready_file}" echo ready',
+                "set BARRIER_COUNT=0",
+                ":barrier",
+                f'if exist "{wait_file}" goto barrierdone',
+                "set /a BARRIER_COUNT+=1",
+                "if %BARRIER_COUNT% GEQ 30 goto barrierdone",
+                "ping -n 2 127.0.0.1 >nul",
+                "goto barrier",
+                ":barrierdone",
+            ]
+        lines += [
+            f'> "%OUT%" echo {auth_text}',
+            "exit /b 0",
+            ":lookup",
             f'>> "{lookup_log}" echo lookup-invoked',
             f"echo {lookup_text}",
             "exit /b 0",
@@ -400,6 +451,8 @@ class Gate4FailedAttemptRecoveryTests(unittest.TestCase):
             str(paths["orig_processed"]),
             "--original-failed-dir",
             str(paths["orig_failed"]),
+            "--recovery-attempt-claim-json",
+            str(paths["rec_claim"]),
             "--recovery-results-jsonl",
             str(paths["rec_results"]),
             "--recovery-processed-dir",
@@ -430,6 +483,7 @@ class Gate4FailedAttemptRecoveryTests(unittest.TestCase):
         )
 
     def assert_no_recovery_artifacts(self, paths):
+        self.assertFalse(paths["rec_claim"].exists())
         self.assertFalse(paths["rec_results"].exists())
         self.assertFalse(paths["rec_processed"].exists())
         self.assertFalse(paths["rec_failed"].exists())
@@ -490,11 +544,19 @@ class Gate4FailedAttemptRecoveryTests(unittest.TestCase):
         def collide_queue(paths):
             paths["rec_results"] = paths["queue"]
 
+        def collide_claim_with_original(paths):
+            paths["rec_claim"] = paths["orig_results"]
+
+        def collide_claim_with_recovery(paths):
+            paths["rec_claim"] = paths["rec_results"]
+
         for label, mutate in {
             "results_collide": collide_results,
             "failed_dir_collide": collide_failed_dir,
             "nested_inside_original": nest_inside_original_failed,
             "queue_collide": collide_queue,
+            "claim_collides_with_original": collide_claim_with_original,
+            "claim_collides_with_recovery": collide_claim_with_recovery,
         }.items():
             with tempfile.TemporaryDirectory() as tmp:
                 tmp_path = Path(tmp)
@@ -588,6 +650,29 @@ class Gate4FailedAttemptRecoveryTests(unittest.TestCase):
             "wrong_row_number": {"row_number": 9},
             "wrong_source_reference": {"source_reference": "safe-wrong-ref"},
             "wrong_attempt": {"attempt": 3},
+        }
+        for label, overrides in variants.items():
+            with tempfile.TemporaryDirectory() as tmp:
+                tmp_path = Path(tmp)
+                paths, _ = self.seed_original(tmp_path, result_overrides=overrides)
+                self._assert_original_validation_blocks(tmp_path, paths, label)
+
+    def test_original_result_signature_mismatches_block(self):
+        """Recovery is pinned to the one diagnosed original failure signature."""
+        variants = {
+            "status_refused": {"status": "refused"},
+            "different_error_code": {"error_code": "different_synthetic_code"},
+            "auth_success_true": {"authentication_success": True},
+            "session_available_true": {"user_session_available": True},
+            "member_command_found_true": {"member_command_found": True},
+            "get_member_found_true": {"get_member_found": True},
+            "warning_count_nonzero": {"warning_count": 1},
+            "warning_count_boolean": {"warning_count": False},
+            "member_status_mismatch": {"submitted_member_no_status": "manual_review"},
+            "length_mismatch": {"normalized_member_no_length": 8},
+            "member_exists_true": {"member_exists": True},
+            "member_found_by_nonnull": {"member_found_by": "MemberCommand.GetMember"},
+            "manual_review_true": {"manual_review_required": True},
         }
         for label, overrides in variants.items():
             with tempfile.TemporaryDirectory() as tmp:
@@ -724,6 +809,105 @@ class Gate4FailedAttemptRecoveryTests(unittest.TestCase):
                 prepare(paths)
                 self._assert_recovery_state_blocks(tmp_path, paths, label)
 
+    def test_existing_recovery_result_path_blocks_even_when_empty(self):
+        """The recovery results path must be completely absent, not merely empty."""
+        variants = {
+            "zero_byte_file": lambda paths: paths["rec_results"].write_bytes(b""),
+            "whitespace_only_file": lambda paths: paths["rec_results"].write_text("   \n\t\n", encoding="utf-8"),
+            "directory_at_result_path": lambda paths: paths["rec_results"].mkdir(parents=True),
+        }
+        for label, prepare in variants.items():
+            with tempfile.TemporaryDirectory() as tmp:
+                tmp_path = Path(tmp)
+                paths, _ = self.seed_original(tmp_path)
+                prepare(paths)
+                evidence = self._assert_recovery_state_blocks(tmp_path, paths, label)
+                self.assertEqual(evidence["recovery_attempt_claim_present"], "false", label)
+                self.assertEqual(evidence["recovery_attempt_consumed"], "false", label)
+                self.assertFalse(paths["rec_claim"].exists(), label)
+
+    # --- permanent attempt-claim state machine --------------------------------
+
+    def test_valid_claim_with_valid_success_pair_is_already_processed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            paths, row = self.seed_original(tmp_path)
+            self.write_claim(paths)
+            write_jsonl(paths["rec_results"], [success_result_row(row)])
+            write_marker_named(paths["rec_processed"], f"{row['job_id']}.json", success_processed_marker(row))
+            extra, logs = self.fake_ps(tmp_path)
+            completed = self.run_cli(self.args(paths, extra=extra))
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            evidence = parse_evidence(completed.stdout)
+            self.assertEqual(evidence["status"], "already_processed")
+            self.assertEqual(evidence["recovery_attempt_claim_present"], "true")
+            self.assertEqual(evidence["recovery_attempt_claim_created_by_this_run"], "false")
+            self.assertEqual(evidence["recovery_attempt_consumed"], "true")
+            self.assertEqual(evidence["auth_preflight_invoked"], "false")
+            self.assertEqual(evidence["ac2_lookup_invoked"], "false")
+            self.assertEqual(log_lines(logs["auth"]), 0)
+            self.assertEqual(log_lines(logs["lookup"]), 0)
+
+    def test_claim_without_result_or_with_partial_state_blocks(self):
+        row = canonical_queue_row()
+        variants = {
+            "claim_only_no_result": lambda paths: None,
+            "claim_with_partial_result": lambda paths: write_jsonl(paths["rec_results"], [success_result_row(row)]),
+            "claim_with_failed_pair": lambda paths: (
+                write_jsonl(paths["rec_results"], [success_result_row(row, state="LOOKUP_ERROR_REVIEW")]),
+                write_marker_named(
+                    paths["rec_failed"],
+                    f"{row['job_id']}.json",
+                    original_failed_marker(row, error_code="mock_lookup_error"),
+                ),
+            ),
+        }
+        for label, prepare in variants.items():
+            with tempfile.TemporaryDirectory() as tmp:
+                tmp_path = Path(tmp)
+                paths, _ = self.seed_original(tmp_path, row=row)
+                self.write_claim(paths)
+                prepare(paths)
+                evidence = self._assert_recovery_state_blocks(tmp_path, paths, label)
+                self.assertEqual(evidence["recovery_attempt_claim_present"], "true", label)
+                self.assertEqual(evidence["recovery_attempt_consumed"], "true", label)
+                # The claim is preserved, never cleaned or repaired.
+                self.assertTrue(paths["rec_claim"].exists(), label)
+
+    def test_malformed_or_unexpected_claim_blocks_even_with_valid_pair(self):
+        row = canonical_queue_row()
+        variants = {
+            "malformed_claim": {"raw": "{not valid json"},
+            "wrong_structure_claim": {"payload": {**ATTEMPT_CLAIM_STRUCTURE, "recovery_generation": 2}},
+            "non_object_claim": {"raw": '"just-a-string"'},
+        }
+        for label, spec in variants.items():
+            with tempfile.TemporaryDirectory() as tmp:
+                tmp_path = Path(tmp)
+                paths, _ = self.seed_original(tmp_path, row=row)
+                self.write_claim(paths, spec.get("payload"), raw=spec.get("raw"))
+                write_jsonl(paths["rec_results"], [success_result_row(row)])
+                write_marker_named(paths["rec_processed"], f"{row['job_id']}.json", success_processed_marker(row))
+                extra, logs = self.fake_ps(tmp_path)
+                completed = self.run_cli(self.args(paths, extra=extra))
+                self.assertEqual(completed.returncode, 2, label)
+                evidence = parse_evidence(completed.stdout)
+                self.assertEqual(evidence["status"], "needs_fix", label)
+                self.assertNotEqual(evidence["status"], "already_processed", label)
+                self.assertEqual(evidence["recovery_attempt_claim_present"], "true", label)
+                self.assertEqual(log_lines(logs["auth"]), 0, label)
+                self.assertEqual(log_lines(logs["lookup"]), 0, label)
+
+    def test_success_pair_without_claim_is_needs_fix_not_already_processed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            paths, row = self.seed_original(tmp_path)
+            write_jsonl(paths["rec_results"], [success_result_row(row)])
+            write_marker_named(paths["rec_processed"], f"{row['job_id']}.json", success_processed_marker(row))
+            evidence = self._assert_recovery_state_blocks(tmp_path, paths, "pair_without_claim")
+            self.assertEqual(evidence["recovery_attempt_claim_present"], "false")
+            self.assertEqual(evidence["recovery_attempt_consumed"], "false")
+
     # --- AC2_PROBE_* presence and auth preflight -----------------------------
 
     def test_missing_or_blank_auth_env_blocks_before_any_process(self):
@@ -815,6 +999,9 @@ class Gate4FailedAttemptRecoveryTests(unittest.TestCase):
             self.assertEqual(evidence["original_failure_validated"], "true")
             self.assertEqual(evidence["original_artifacts_modified"], "false")
             self.assertEqual(evidence["recovery_paths_isolated"], "true")
+            self.assertEqual(evidence["recovery_attempt_claim_present"], "true")
+            self.assertEqual(evidence["recovery_attempt_claim_created_by_this_run"], "true")
+            self.assertEqual(evidence["recovery_attempt_consumed"], "true")
             self.assertEqual(evidence["auth_preflight_invoked"], "true")
             self.assertEqual(evidence["auth_preflight_success"], "true")
             self.assertEqual(evidence["allow_root_login_used"], "false")
@@ -829,6 +1016,8 @@ class Gate4FailedAttemptRecoveryTests(unittest.TestCase):
             self.assertEqual(evidence["recovery_failed_artifact_count"], "0")
             self.assertEqual(log_lines(logs["auth"]), 1)
             self.assertEqual(log_lines(logs["lookup"]), 1)
+            self.assertTrue(paths["rec_claim"].is_file())
+            self.assertEqual(json.loads(paths["rec_claim"].read_text(encoding="utf-8")), ATTEMPT_CLAIM_STRUCTURE)
             self.assertEqual(nonblank_lines(paths["rec_results"]), 1)
             self.assertEqual(len(list(paths["rec_processed"].glob("*.json"))), 1)
             self.assertFalse(paths["rec_failed"].exists())
@@ -892,6 +1081,150 @@ class Gate4FailedAttemptRecoveryTests(unittest.TestCase):
         self.assertNotIn("--allow-root-login", source)
         self.assertNotIn("-AllowRootLogin", source)
 
+    def test_auth_failure_creates_no_claim_and_corrected_run_claims_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            paths, row = self.seed_original(tmp_path)
+            bad_dir = tmp_path / "bad_auth_fake"
+            bad_dir.mkdir()
+            bad_extra, bad_logs = self.fake_ps(bad_dir, auth=auth_probe_payload(authentication_success=False))
+            failed = self.run_cli(self.args(paths, extra=bad_extra))
+            self.assertEqual(parse_evidence(failed.stdout)["status"], "needs_fix")
+            self.assertFalse(paths["rec_claim"].exists())
+
+            good_dir = tmp_path / "good_auth_fake"
+            good_dir.mkdir()
+            good_extra, good_logs = self.fake_ps(good_dir)
+            corrected = self.run_cli(self.args(paths, extra=good_extra))
+            self.assertEqual(corrected.returncode, 0, corrected.stderr)
+            evidence = parse_evidence(corrected.stdout)
+            self.assertEqual(evidence["status"], "ok")
+            self.assertEqual(evidence["recovery_attempt_claim_created_by_this_run"], "true")
+            self.assertTrue(paths["rec_claim"].is_file())
+            self.assertEqual(log_lines(good_logs["lookup"]), 1)
+            self.assertEqual(log_lines(bad_logs["lookup"]), 0)
+
+    # --- atomicity and concurrency ----------------------------------------------
+
+    def test_two_concurrent_processes_perform_exactly_one_lookup(self):
+        """Two wrappers released past authentication together race the exclusive claim."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            paths, row = self.seed_original(tmp_path)
+            before = snapshot_original(paths)
+            dir_a = tmp_path / "proc_a"
+            dir_b = tmp_path / "proc_b"
+            dir_a.mkdir()
+            dir_b.mkdir()
+            ready_a = tmp_path / "ready_a.flag"
+            ready_b = tmp_path / "ready_b.flag"
+            shared_lookup_log = tmp_path / "shared-lookup-invocations.log"
+            # Rendezvous barrier: each process announces readiness inside the auth
+            # probe and waits for the peer, so both pass all validation and are
+            # released past authentication at approximately the same time.
+            extra_a, logs_a = self.fake_ps(dir_a, ready_file=ready_a, wait_file=ready_b, lookup_log=shared_lookup_log)
+            extra_b, logs_b = self.fake_ps(dir_b, ready_file=ready_b, wait_file=ready_a, lookup_log=shared_lookup_log)
+
+            run_env = {key: value for key, value in os.environ.items() if not key.startswith("AC2_PROBE_")}
+            run_env.update(SYNTHETIC_AUTH_ENV)
+            process_a = subprocess.Popen(
+                [sys.executable, str(SCRIPT)] + self.args(paths, extra=extra_a),
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=run_env,
+            )
+            process_b = subprocess.Popen(
+                [sys.executable, str(SCRIPT)] + self.args(paths, extra=extra_b),
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=run_env,
+            )
+            out_a, _ = process_a.communicate(timeout=120)
+            out_b, _ = process_b.communicate(timeout=120)
+
+            evidence_a = parse_evidence(out_a)
+            evidence_b = parse_evidence(out_b)
+            statuses = sorted([evidence_a["status"], evidence_b["status"]])
+            self.assertEqual(statuses, ["needs_fix", "ok"])
+            created_flags = sorted(
+                [
+                    evidence_a["recovery_attempt_claim_created_by_this_run"],
+                    evidence_b["recovery_attempt_claim_created_by_this_run"],
+                ]
+            )
+            # Exactly one process created the claim; both report it consumed.
+            self.assertEqual(created_flags, ["false", "true"])
+            self.assertEqual(evidence_a["recovery_attempt_consumed"], "true")
+            self.assertEqual(evidence_b["recovery_attempt_consumed"], "true")
+            loser = evidence_a if evidence_a["status"] == "needs_fix" else evidence_b
+            self.assertEqual(loser["ac2_lookup_invoked"], "false")
+            self.assertEqual(loser["lookup_attempt_count"], "0")
+            # Exactly one PowerShell member lookup across both processes, both
+            # processes ran their auth preflight, and the claim survives both exits.
+            self.assertEqual(log_lines(shared_lookup_log), 1)
+            self.assertEqual(log_lines(logs_a["auth"]), 1)
+            self.assertEqual(log_lines(logs_b["auth"]), 1)
+            self.assertTrue(paths["rec_claim"].is_file())
+            self.assertEqual(json.loads(paths["rec_claim"].read_text(encoding="utf-8")), ATTEMPT_CLAIM_STRUCTURE)
+            self.assertEqual(nonblank_lines(paths["rec_results"]), 1)
+            self.assert_original_unchanged(before, paths)
+
+    # --- crash/interruption around the claim -------------------------------------
+
+    def test_crash_after_claim_before_lookup_blocks_every_future_lookup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            paths, row = self.seed_original(tmp_path)
+            before = snapshot_original(paths)
+            extra, logs = self.fake_ps(tmp_path)
+            crashed = self.run_cli(
+                self.args(paths, extra=extra),
+                env_overrides={"GATE4_RECOVERY_TEST_FAULT_INJECT": "after_claim_before_lookup"},
+            )
+            self.assertNotEqual(crashed.returncode, 0)
+            self.assertTrue(paths["rec_claim"].is_file())
+            claim_bytes = paths["rec_claim"].read_bytes()
+            self.assertEqual(log_lines(logs["auth"]), 1)
+            self.assertEqual(log_lines(logs["lookup"]), 0)
+
+            rerun = self.run_cli(self.args(paths, extra=extra))
+            self.assertEqual(rerun.returncode, 2)
+            evidence = parse_evidence(rerun.stdout)
+            self.assertEqual(evidence["status"], "needs_fix")
+            self.assertEqual(evidence["recovery_attempt_claim_present"], "true")
+            self.assertEqual(evidence["recovery_attempt_consumed"], "true")
+            self.assertEqual(evidence["auth_preflight_invoked"], "false")
+            self.assertEqual(evidence["ac2_lookup_invoked"], "false")
+            # Zero further authentication and zero lookups; the claim is untouched.
+            self.assertEqual(log_lines(logs["auth"]), 1)
+            self.assertEqual(log_lines(logs["lookup"]), 0)
+            self.assertEqual(paths["rec_claim"].read_bytes(), claim_bytes)
+            self.assert_original_unchanged(before, paths)
+
+    def test_crash_after_lookup_before_result_blocks_rerun_lookup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            paths, row = self.seed_original(tmp_path)
+            extra, logs = self.fake_ps(tmp_path)
+            crashed = self.run_cli(
+                self.args(paths, extra=extra),
+                env_overrides={"GATE4_RECOVERY_TEST_FAULT_INJECT": "after_lookup_before_result"},
+            )
+            self.assertNotEqual(crashed.returncode, 0)
+            self.assertTrue(paths["rec_claim"].is_file())
+            self.assertEqual(log_lines(logs["lookup"]), 1)
+            self.assertFalse(paths["rec_results"].exists())
+
+            rerun = self.run_cli(self.args(paths, extra=extra))
+            evidence = parse_evidence(rerun.stdout)
+            self.assertEqual(evidence["status"], "needs_fix")
+            self.assertEqual(evidence["ac2_lookup_invoked"], "false")
+            self.assertEqual(evidence["auth_preflight_invoked"], "false")
+            # Still exactly one lookup ever, despite the interrupted persistence.
+            self.assertEqual(log_lines(logs["lookup"]), 1)
+
     # --- durability, idempotency, repeated invocation --------------------------
 
     def test_result_first_marker_second_fault_stays_needs_fix(self):
@@ -930,6 +1263,7 @@ class Gate4FailedAttemptRecoveryTests(unittest.TestCase):
             paths, row, before, extra, logs, first = self._run_success(tmp_path)
             self.assertEqual(parse_evidence(first.stdout)["status"], "ok")
 
+            claim_bytes = paths["rec_claim"].read_bytes()
             second = self.run_cli(self.args(paths, extra=extra))
             self.assertEqual(second.returncode, 0, second.stderr)
             evidence = parse_evidence(second.stdout)
@@ -940,9 +1274,14 @@ class Gate4FailedAttemptRecoveryTests(unittest.TestCase):
             self.assertEqual(evidence["recovery_processed_artifact_count"], "1")
             self.assertEqual(evidence["ac2_lookup_invoked"], "false")
             self.assertEqual(evidence["auth_preflight_invoked"], "false")
-            # Still exactly one auth preflight and one lookup across both runs.
+            self.assertEqual(evidence["recovery_attempt_claim_present"], "true")
+            self.assertEqual(evidence["recovery_attempt_claim_created_by_this_run"], "false")
+            self.assertEqual(evidence["recovery_attempt_consumed"], "true")
+            # Still exactly one auth preflight and one lookup across both runs, and the
+            # claim is byte-for-byte untouched by the rerun.
             self.assertEqual(log_lines(logs["auth"]), 1)
             self.assertEqual(log_lines(logs["lookup"]), 1)
+            self.assertEqual(paths["rec_claim"].read_bytes(), claim_bytes)
             self.assertEqual(nonblank_lines(paths["rec_results"]), 1)
             self.assert_original_unchanged(before, paths)
 
@@ -1086,6 +1425,7 @@ class Gate4FailedAttemptRecoveryTests(unittest.TestCase):
     def test_recovery_artifacts_are_gitignored_and_wired(self):
         gitignore = GITIGNORE.read_text(encoding="utf-8")
         for pattern in [
+            "member_lookup_bridge_gate4_recovery1_attempt_started.json",
             "member_lookup_bridge_gate4_recovery1_results.jsonl",
             "member_lookup_bridge_gate4_recovery1_processed/",
             "member_lookup_bridge_gate4_recovery1_failed/",
@@ -1120,6 +1460,23 @@ class Gate4FailedAttemptRecoveryTests(unittest.TestCase):
             "does not approve n8n result mapping",
             "does not approve any AutoCount member create, update, or delete",
             "READY_FOR_CREATE_REVIEW` remains review-only",
+            # Amendment: permanent attempt claim, absent-result rule, exact signature.
+            "permanent recovery attempt claim",
+            "member_lookup_bridge_gate4_recovery1_attempt_started.json",
+            "--recovery-attempt-claim-json",
+            "atomically and exclusively",
+            "Claim creation consumes the single approved lookup attempt",
+            "must never remove, rename, edit, or reset the claim",
+            "two concurrent processes",
+            "crash after claim creation",
+            "completely absent",
+            "even an empty or zero-byte recovery results file is blocking",
+            "exact original failure signature",
+            "error_code = runtimeexception",
+            "submitted_member_no_status = already_65_mobile",
+            "recovery_attempt_claim_present",
+            "recovery_attempt_claim_created_by_this_run",
+            "recovery_attempt_consumed",
         ]:
             self.assertIn(phrase, runbook, phrase)
 
