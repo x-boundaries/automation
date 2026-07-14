@@ -1,6 +1,6 @@
 # Member Intake Local Lookup Bridge Runbook
 
-Status: design and dry-run worker skeleton only. Gate 3 local lookup preflight and Gate 3B AC2 local bridge readiness passes recorded. Gate 3C adds a local-only runtime hardening harness for repeated AC2 host test runs, with fresh and duplicate-rerun evidence recorded. Gate 3D sanitized AC2 local bridge small-batch evidence (duplicate-seed setup, mixed-batch proof, and idempotent rerun) is recorded. Gate 3E adds a local-only service-readiness discipline wrapper (single-instance lock, operator stop switch, bounded cycles) without installing or activating any Windows service or scheduler; post-merge sanitized AC2 local bridge service-readiness evidence is recorded. Gate 3F records the bridge-side readiness checkpoint before returning to Gate 4A queue-write proof. This does not activate production automation and does not authorize AutoCount member writes.
+Status: design and dry-run worker skeleton only. Gate 3 local lookup preflight and Gate 3B AC2 local bridge readiness passes recorded. Gate 3C adds a local-only runtime hardening harness for repeated AC2 host test runs, with fresh and duplicate-rerun evidence recorded. Gate 3D sanitized AC2 local bridge small-batch evidence (duplicate-seed setup, mixed-batch proof, and idempotent rerun) is recorded. Gate 3E adds a local-only service-readiness discipline wrapper (single-instance lock, operator stop switch, bounded cycles) without installing or activating any Windows service or scheduler; post-merge sanitized AC2 local bridge service-readiness evidence is recorded. Gate 3F records the bridge-side readiness checkpoint before returning to Gate 4A queue-write proof. Gate 4 adds the bridge-side real-queue lookup-only handoff that runs exactly one real read-only AutoCount lookup for the single already-approved Gate 4A queue row and stops, with aggregate-only evidence; it does not map results back to n8n. This does not activate production automation and does not authorize AutoCount member writes.
 
 ## Purpose
 
@@ -1189,6 +1189,151 @@ Recommendation: bridge-side local hardening is sufficient to return to Gate 4A n
 Recommended next gate: resume Gate 4A queue-write proof as documented in [member_intake_n8n_gate4a_manual_queue_handoff_runbook.md](member_intake_n8n_gate4a_manual_queue_handoff_runbook.md). The next evidence should be queue-write precheck evidence only, with `queue_row_count = 1`, `queue_base64_decode_ok_count = 1`, `queue_base64_decode_fail_count = 0`, `queue_decoded_blank_count = 0`, and `queue_decoded_looks_dummy_count = 0`, and with no row-level values or PII pasted.
 
 Do not record lock file content, health file content, stop flag content, pending queue rows, result rows, processed marker content, failed marker content, raw member values, encoded member values, decoded member values, normalized member values, names, emails, phone numbers, birthdays, AC2 environment values, command transcripts, stdout/stderr transcripts, screenshots, Sheet IDs/URLs, credentials, secrets, or PII in this checkpoint.
+
+## Gate 4 Real Queue UAT AC2 Lookup-Only Handoff
+
+Status: bridge-side real-queue **PowerShell-only** lookup-only handoff. This runs exactly one real read-only AutoCount member lookup for the single already-approved Gate 4A `PENDING_LOOKUP` queue row on the Windows AC2 lookup bridge host, and stops. It is the AC2-side executor facet of Gate 4. The separate n8n-orchestration facet is documented in [member_intake_n8n_lookup_bridge_uat_plan.md](member_intake_n8n_lookup_bridge_uat_plan.md). This handoff is manual, inactive, lookup-only, read-only, review-only, local to the approved AC2 bridge runtime, explicit opt-in, fail-closed, and aggregate-evidence-only.
+
+**Gate 4 PASS is PowerShell-only.** Only a genuine read-only PowerShell AutoCount lookup can produce `status = ok`. There is no mock route in this wrapper: **Mock mode cannot satisfy Gate 4** and cannot produce PASS evidence. The evidence explicitly reports `lookup_mode`, `powershell_lookup_enabled`, and `ac2_lookup_invoked` so a PASS is always attributable to a real invoked lookup.
+
+This gate does not activate n8n, does not map results back to n8n, does not create, update, or delete an AutoCount member, does not call any AutoCount save path, does not perform direct SQL, and does not add a scheduler, webhook, Windows service, Task Scheduler task, daemon, tunnel, callback, or public inbound endpoint. n8n result mapping is the next separate gate and is not performed here.
+
+`scripts/member_lookup_gate4_real_queue_lookup.py` is a thin wrapper. It reuses the existing Gate 4A precheck (`scripts/member_lookup_gate4a_queue_precheck.py`) as the exact one-row schema, base64-shape, blank, and dummy/rehearsal rejection control, and it reuses the read-only lookup engine (`scripts/ac2_member_lookup_bridge_worker.py`), which calls `scripts/ac2_member_lookup_review.ps1` with `-EnableMemberLookupReview` and `-MemberNoBase64Utf8` only. It never decodes or echoes the encoded or decoded member value into evidence; the encoded value passes only through the existing approved read-only lookup path.
+
+Before invoking PowerShell, Gate 4 adds two bridge-side integrity checks and a corrected marker/result state machine (see below). It writes the sanitized result durably before committing its processed marker, so an interrupted or failed run can never later be reported as `already_processed`.
+
+### Preconditions
+
+- Gate 4A produced exactly one sanitized `PENDING_LOOKUP` queue row and the aggregate Gate 4A precheck passed with `queue_row_count = 1`, `queue_base64_decode_ok_count = 1`, `queue_base64_decode_fail_count = 0`, `queue_decoded_blank_count = 0`, `queue_decoded_looks_dummy_count = 0`, and `unexpected_queue_shape_count = 0`.
+- The operator has explicit approval to run one real read-only Gate 4 lookup for this one row.
+- Gate 3B through Gate 3F bridge-side readiness evidence is already recorded.
+- This is run only on the Windows AC2 lookup bridge host or an approved Windows host with the installed AutoCount 2.x runtime.
+
+### Bridge-Side Integrity Checks Before Lookup
+
+Before any PowerShell lookup, Gate 4 independently enforces, in addition to the Gate 4A precheck:
+
+- **Canonical numeric member-number contract.** The wrapper decodes `submitted_member_no_base64_utf8` only in memory and requires it to match exactly `^[0-9]{6,20}$`. Fewer than 6 digits, more than 20 digits, spaces, plus signs, hyphens, letters, other punctuation, blank values, invalid UTF-8/Base64, and dummy/rehearsal markers are all rejected. The decoded value is never printed, logged, stored separately, or included in evidence.
+- **Canonical Gate 4A payload identity.** The wrapper recomputes the canonical FNV-1a `payload_hash` over the same ordered fields as `n8n-workflows/member_intake_gate4a_container_queue_write.workflow.json` and verifies `payload_hash` matches, `job_id == "gate4a_" + payload_hash`, `source_row_ref == "row_" + row_number`, and `intake_id == "gate4a_row_" + row_number`. Any mismatch is rejected before PowerShell. No rejected field value is printed.
+
+Every rejection path reports `status = needs_fix`, `lookup_attempt_count = 0`, and `ac2_lookup_invoked = false`, and does not invoke the lookup.
+
+### Secure Operator-Mediated Queue Placement
+
+n8n stays on the non-AC2 operator runtime. The AC2 bridge host receives no public inbound webhook or tunnel. The operator copies the one approved Gate 4A queue JSONL onto the AC2 bridge host using an existing approved secure administrative transfer performed outside this repository. This runbook does not prescribe or automate a public share, tunnel, webhook, or new network service, and does not invent a new transport layer. Do not open, decode, print, or paste the queue file during placement.
+
+### Exact Ignored Local Paths
+
+All Gate 4 local artifacts stay ignored under the bridge review root:
+
+```powershell
+$root = 'C:\XB\autocount_outputs\review\member_lookup_bridge'
+$queue = "$root\member_lookup_bridge_gate4_pending_queue.jsonl"
+$results = "$root\member_lookup_bridge_gate4_results.jsonl"
+$processed = "$root\member_lookup_bridge_gate4_processed"
+$failed = "$root\member_lookup_bridge_gate4_failed"
+```
+
+The operator places the approved Gate 4A queue JSONL at `member_lookup_bridge_gate4_pending_queue.jsonl`. The queue, results, processed, and failed artifacts are ignored by Git and must never be committed.
+
+### Exact Opt-In Command
+
+The gate refuses to do anything without the explicit Gate 4 opt-in. The real read-only lookup additionally requires the second PowerShell opt-in:
+
+```powershell
+python scripts\member_lookup_gate4_real_queue_lookup.py `
+  --enable-gate4-real-queue-lookup `
+  --enable-powershell-lookup `
+  --queue-jsonl "$queue" `
+  --results-jsonl "$results" `
+  --processed-dir "$processed" `
+  --failed-dir "$failed" `
+  --allow-root-login
+```
+
+Both opt-ins are mandatory and are checked before the queue is read. Without `--enable-gate4-real-queue-lookup` the wrapper prints `status = refused` and does nothing. Without `--enable-powershell-lookup` it also prints `status = refused` and does nothing. There is no `--lookup-mode` option; the lookup is always the real read-only PowerShell path.
+
+### Expected Aggregate Evidence Shape
+
+The operator may paste back only this sanitized aggregate shape:
+
+```text
+status = <ok/needs_fix/already_processed/refused>
+gate = gate4_real_queue_uat_ac2_lookup_only
+runtime_location = windows_ac2_lookup_bridge_host
+execution_mode = manual_read_only_review_only
+lookup_mode = powershell
+powershell_lookup_enabled = <true/false>
+ac2_lookup_invoked = <true/false>
+approved_batch_size = 1
+queue_rows_read_count = <aggregate-count-only>
+lookup_attempt_count = <aggregate-count-only>
+lookup_success_count = <aggregate-count-only>
+lookup_existing_member_review_count = <aggregate-count-only>
+lookup_manual_review_count = <aggregate-count-only>
+lookup_ready_for_create_review_count = <aggregate-count-only>
+lookup_error_count = <aggregate-count-only>
+review_rows_written_count = <aggregate-count-only>
+member_create_or_update_invoked = false
+autocount_write_attempted = false
+direct_sql_write_attempted = false
+n8n_result_mapping_run = false
+workflow_activation = inactive
+scheduler_enabled = false
+public_inbound_to_ac2_host = false
+final_write_automation = false
+no_row_values_printed = true
+```
+
+For one successful real lookup, expect `status = ok`, `lookup_mode = powershell`, `powershell_lookup_enabled = true`, `ac2_lookup_invoked = true`, `approved_batch_size = 1`, `queue_rows_read_count = 1`, `lookup_attempt_count = 1`, `lookup_success_count = 1`, exactly one of `lookup_existing_member_review_count`, `lookup_manual_review_count`, or `lookup_ready_for_create_review_count` equal to `1` with the other two at `0`, `lookup_error_count = 0`, and `review_rows_written_count = 1`. `status = ok` is only ever emitted for a genuine PowerShell lookup that produced exactly one durable, validated sanitized review result. All count fields are aggregate-count-only. `READY_FOR_CREATE_REVIEW` remains review-only and is not approval to create.
+
+### Processed/Failed State Machine And Durability
+
+The wrapper distinguishes marker/result states explicitly rather than treating every already-handled row as a duplicate:
+
+- **Existing failed/dead-letter marker for this job** -> `status = needs_fix`, `lookup_attempt_count = 0`, exit nonzero. A failed marker never becomes `already_processed`.
+- **Existing processed marker with a matching durable sanitized result** -> `status = already_processed`, `lookup_attempt_count = 0`, `review_rows_written_count = 0`, exit zero.
+- **Existing processed marker without a matching durable sanitized result** -> `status = needs_fix`, exit nonzero.
+- **Durable result without a processed marker** -> `status = needs_fix`, exit nonzero. The lookup is not re-run automatically; recovery requires reviewed instructions.
+- **Payload-hash conflict** (a marker for this job with a different `payload_hash`) -> `status = needs_fix`, never `already_processed`.
+
+**Both marker directories and the result file must be absent or empty before a fresh Gate 4 lookup.** The wrapper inspects the dedicated processed and failed marker directories strictly (never printing filenames, job IDs, payload hashes, or content) and does not rely on the shared Gate 3C loader. **Any marker artifact at all blocks a fresh lookup**, including a malformed, unreadable, non-object, wrong-filename, wrong- or missing-content-`job_id`, unrelated, duplicate, temporary `*.json.tmp`, failed/dead-letter, or incomplete marker file, and any unexpected file in a marker directory. Every blocked case is `status = needs_fix`, `lookup_attempt_count = 0`, `ac2_lookup_invoked = false`, and the artifact is never automatically deleted, overwritten, renamed, or repaired.
+
+**The dedicated Gate 4 result file must be absent or empty before a fresh lookup.** The wrapper inspects the results file strictly (never printing row or field values): any malformed, partial, duplicate, stale, unrelated, or unexpected result content is `status = needs_fix`, `lookup_attempt_count = 0`, `ac2_lookup_invoked = false`. Such content blocks the automatic rerun; a malformed or partially written line left by an interrupted append is treated as blocking and is never silently ignored.
+
+**Processed-marker validity is mandatory.** A processed marker is honoured only when it is the single artifact in the processed directory, named exactly `<job_id>.json`, valid JSON object content, with `marker_type = processed`, `job_id` equal to the queue job, `payload_hash` equal to the queue `payload_hash`, `state` one recognised successful routing state, `dry_run_only = true`, and `final_write_automation = false`. A missing, null, blank, malformed, or different marker payload hash, a filename/content mismatch, or any incomplete marker field is `status = needs_fix`, `ac2_lookup_invoked = false`.
+
+**`already_processed` requires exactly one valid processed marker, zero failed markers, and exactly one matching valid result.** The processed directory must hold exactly one clean marker (nothing extra, temporary, unrelated, duplicate, malformed, or unexpected), the failed directory must be absent or empty, and the results file must hold exactly one fully validated durable result. The single durable result must carry the exact allowed envelope, match the queue `job_id`/`intake_source`/`source_reference`/`source_row_ref`/`row_number`/`consent_status`/`pdpa_status`/`attempt`, have `dry_run_only = true`, `final_write_automation = false`, `result_applied_at = null`, `status = ok` with successful authentication/session/command evidence and `error_code = null`, and a review routing state recomputed from `member_exists`/`manual_review_required`/`warning_count`/status that equals the stored state and the marker state. A result is never trusted merely because its stored `state` string is in the allowed set.
+
+**Fixed queue retry-contract fields.** Before any lookup the wrapper also requires the canonical Gate 4A retry-contract values `attempt = 0`, `max_attempts = 1`, and `consent_status = marketing_consent_not_queued` (validated exactly, not part of the FNV payload hash). Any different, missing, boolean, malformed, or unexpected value is `status = needs_fix`, `lookup_attempt_count = 0`, `ac2_lookup_invoked = false`, which keeps the worker's retry-exhausted branch unreachable so it can never be mis-reported as an invoked AC2 lookup.
+
+Durability invariant: a successful processed marker is never written unless its matching sanitized result is already durable. The wrapper writes the sanitized result to the results file and flushes it to disk first, then commits the processed marker via an atomic temp-file replace. If persistence is interrupted between the durable result and the marker, the next run detects a durable-result-without-marker state and returns `needs_fix` without re-running the lookup. `already_processed` is therefore valid only for a confirmed processed marker with a matching durable sanitized result; a failed marker, an incomplete result/marker pair, or a payload conflict is always `needs_fix`.
+
+**Invocation accuracy.** The configured read-only lookup script must exist as a regular file before a lookup is attempted. A missing lookup script is a precondition failure: `status = needs_fix`, `lookup_attempt_count = 0`, `ac2_lookup_invoked = false`. `ac2_lookup_invoked = true` is reported only when the PowerShell lookup subprocess was actually launched.
+
+### Stop Conditions
+
+Stop the Gate 4 handoff immediately and do not treat the run as pass evidence if any of the following appear:
+
+- `status = needs_fix` or `status = refused`, a `lookup_error_count` above `0`, `ac2_lookup_invoked = false` on an expected lookup run, or an unexpected result shape.
+- `queue_rows_read_count` is not `1`, or the input is missing, empty, has more than one row, is malformed JSON, has extra or missing fields, has a non-`PENDING_LOOKUP` state, has an invalid `pdpa_status`, a decoded value that is not `^[0-9]{6,20}$`, a payload-identity mismatch, or a blank or dummy/rehearsal decoded value.
+- Any member create/update/delete path reference, any AutoCount write attempt, any direct SQL write indication, any n8n activation or result-mapping indication, any scheduler enablement, or any webhook/tunnel exposure to the AC2 host.
+
+### Rerun And Idempotency
+
+The wrapper processes exactly one approved job. On a rerun over the same successfully processed queue row (processed marker plus matching durable result) it prints `status = already_processed` with `lookup_attempt_count = 0`, `lookup_success_count = 0`, `review_rows_written_count = 0`, and `ac2_lookup_invoked = false`. It does not run the lookup again and does not append duplicate result rows. A failed marker, an incomplete result/marker pair, or a payload conflict returns `needs_fix` on every rerun and is never `already_processed`. Malformed or rejected input follows the existing failed/dead-letter discipline under `member_lookup_bridge_gate4_failed` and does not trigger a lookup. The original queue file is never deleted automatically.
+
+### Cleanup
+
+1. Preserve the sanitized aggregate evidence only as long as required by evidence retention.
+2. Do not open, decode, print, or paste the queue file, the results file, the processed markers, or the failed markers.
+3. After the reviewed evidence retention requirement is satisfied, remove the sensitive local queue and result artifacts (`member_lookup_bridge_gate4_pending_queue.jsonl` and `member_lookup_bridge_gate4_results.jsonl`).
+4. Do not remove the processed markers until the gate is formally closed, so idempotency protection stays in place. **Operators must not delete result or marker files merely to force a rerun.** Recovery from a partial or inconsistent state (malformed result, result-without-marker, incomplete marker, or payload conflict) requires separate reviewed recovery instructions, not artifact deletion.
+5. **The real AC2 lookup must not be run during this PR amendment.** n8n result mapping is the next separate gate and is not performed here.
+
+Do not paste the queue row, result rows, processed markers, failed markers, raw member value, encoded member value, decoded member value, normalized member value, names, emails, phone numbers, birthday values, AC2 environment values, command transcripts, stdout/stderr transcripts, execution payloads, credentials, Sheet IDs/URLs, screenshots, secrets, or PII. Keep `member_lookup_bridge_gate4_pending_queue.jsonl`, `member_lookup_bridge_gate4_results.jsonl`, `member_lookup_bridge_gate4_processed`, and `member_lookup_bridge_gate4_failed` local and ignored.
+
+Gate 4 lookup-only handoff proves only that the Windows AC2 bridge host can take exactly one already-approved sanitized `PENDING_LOOKUP` queue row through the read-only lookup and produce one sanitized review result with aggregate-only evidence. It does not approve n8n result mapping, member create/update/delete, AutoCount writes, direct SQL writes, scheduler activation, webhook activation, Windows service activation, public inbound exposure, or final write automation.
 
 ## Review-Only Routing
 
