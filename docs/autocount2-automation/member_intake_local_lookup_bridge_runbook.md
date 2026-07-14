@@ -1,6 +1,6 @@
 # Member Intake Local Lookup Bridge Runbook
 
-Status: design and dry-run worker skeleton only. Gate 3 local lookup preflight and Gate 3B AC2 local bridge readiness passes recorded. Gate 3C adds a local-only runtime hardening harness for repeated AC2 host test runs, with fresh and duplicate-rerun evidence recorded. Gate 3D sanitized AC2 local bridge small-batch evidence (duplicate-seed setup, mixed-batch proof, and idempotent rerun) is recorded. Gate 3E adds a local-only service-readiness discipline wrapper (single-instance lock, operator stop switch, bounded cycles) without installing or activating any Windows service or scheduler; post-merge sanitized AC2 local bridge service-readiness evidence is recorded. Gate 3F records the bridge-side readiness checkpoint before returning to Gate 4A queue-write proof. Gate 4 adds the bridge-side real-queue lookup-only handoff that runs exactly one real read-only AutoCount lookup for the single already-approved Gate 4A queue row and stops, with aggregate-only evidence; it does not map results back to n8n. This does not activate production automation and does not authorize AutoCount member writes.
+Status: design and dry-run worker skeleton only. Gate 3 local lookup preflight and Gate 3B AC2 local bridge readiness passes recorded. Gate 3C adds a local-only runtime hardening harness for repeated AC2 host test runs, with fresh and duplicate-rerun evidence recorded. Gate 3D sanitized AC2 local bridge small-batch evidence (duplicate-seed setup, mixed-batch proof, and idempotent rerun) is recorded. Gate 3E adds a local-only service-readiness discipline wrapper (single-instance lock, operator stop switch, bounded cycles) without installing or activating any Windows service or scheduler; post-merge sanitized AC2 local bridge service-readiness evidence is recorded. Gate 3F records the bridge-side readiness checkpoint before returning to Gate 4A queue-write proof. Gate 4 adds the bridge-side real-queue lookup-only handoff that runs exactly one real read-only AutoCount lookup for the single already-approved Gate 4A queue row and stops, with aggregate-only evidence; it does not map results back to n8n. The first genuine Gate 4 attempt ended in `LOOKUP_ERROR_REVIEW` because the required `AC2_PROBE_*` runtime environment values were absent from that process; a separate reviewed failed-attempt recovery wrapper authorizes exactly one read-only retry into isolated recovery paths while preserving the original failed-attempt evidence unchanged. This does not activate production automation and does not authorize AutoCount member writes.
 
 ## Purpose
 
@@ -1334,6 +1334,169 @@ The wrapper processes exactly one approved job. On a rerun over the same success
 Do not paste the queue row, result rows, processed markers, failed markers, raw member value, encoded member value, decoded member value, normalized member value, names, emails, phone numbers, birthday values, AC2 environment values, command transcripts, stdout/stderr transcripts, execution payloads, credentials, Sheet IDs/URLs, screenshots, secrets, or PII. Keep `member_lookup_bridge_gate4_pending_queue.jsonl`, `member_lookup_bridge_gate4_results.jsonl`, `member_lookup_bridge_gate4_processed`, and `member_lookup_bridge_gate4_failed` local and ignored.
 
 Gate 4 lookup-only handoff proves only that the Windows AC2 bridge host can take exactly one already-approved sanitized `PENDING_LOOKUP` queue row through the read-only lookup and produce one sanitized review result with aggregate-only evidence. It does not approve n8n result mapping, member create/update/delete, AutoCount writes, direct SQL writes, scheduler activation, webhook activation, Windows service activation, public inbound exposure, or final write automation.
+
+## Gate 4 Failed-Attempt Recovery (One Approved Retry)
+
+Status: reviewed recovery instructions for the single failed genuine Gate 4 attempt. This section authorizes exactly one explicitly approved read-only retry through `scripts/member_lookup_gate4_failed_attempt_recovery.py` and nothing else. It does not approve n8n result mapping, does not approve any AutoCount member create, update, or delete, does not approve AutoCount writes or direct SQL, and does not activate any scheduler, service, webhook, tunnel, or public inbound path. `READY_FOR_CREATE_REVIEW` remains review-only and is not approval to create.
+
+### Why The Original Gate 4 Attempt Failed
+
+The operator ran Gate 4 exactly once against the single approved Gate 4A queue row. The run reached the real PowerShell lookup, but the durable result recorded `LOOKUP_ERROR_REVIEW` with `authentication_success = false` and a sanitized `runtimeexception` error code. Subsequent diagnosis proved that the AutoCount assembly root and required assemblies exist, the queue row is structurally valid, and the four required `AC2_PROBE_*` runtime environment values were absent from the failed Gate 4 process. After restoring those four runtime-only process values, the existing authentication-only probe (`scripts/ac2_session_auth_probe.ps1`) passed without `-AllowRootLogin`: authentication was subsequently proven healthy (`static_auth_success`, `instance_login_success`, `instance_is_login`, `authentication_success`, and `user_session_available` all true with no error). The failure cause was therefore missing runtime configuration in that one process, not a defect in the queue row, the lookup path, or AutoCount authentication.
+
+Recovery is authorized only for this one diagnosed incident. The wrapper pins validation to the exact original failure signature and requires the original durable result to match every field exactly:
+
+```text
+state = LOOKUP_ERROR_REVIEW
+status = error
+authentication_success = false
+user_session_available = false
+member_command_found = false
+get_member_found = false
+submitted_member_no_status = already_65_mobile
+normalized_member_no_length = 10
+member_exists = false
+member_found_by = null
+manual_review_required = false
+warning_count = 0
+error_code = runtimeexception
+dry_run_only = true
+final_write_automation = false
+result_applied_at = null
+```
+
+Any other failed attempt — including `status = refused` or any different error code — is out of scope, reports `needs_fix` before authentication, and requires separate diagnosis and separate reviewed approval. The exact queue identity, source identity, attempt, PDPA, consent, result-schema, payload-hash, and failed-marker matching checks all still apply on top of this signature.
+
+Do not record the `AC2_PROBE_*` values, any credential, any AC2 server/database/user value, result rows, marker data, queue data, command transcripts, or PII anywhere in the repository or in pasted evidence.
+
+### Original Evidence Preservation Rule
+
+The complete original failed attempt is valid historical evidence. The original queue file, the original Gate 4 results file, the original processed directory, and the original failed directory must be preserved byte-for-byte and are never deleted, renamed, moved, overwritten, truncated, appended to, or repaired by the recovery wrapper or by the operator. The recovery wrapper reads them only for strict aggregate structural validation; every rejection path writes nothing at all. Operators must not delete, edit, or move any original artifact to make recovery validation pass; if validation reports `needs_fix`, stop and investigate.
+
+### One-Recovery-Only Policy And The Permanent Attempt Claim
+
+Exactly one recovery attempt is authorized. The wrapper defines a single `recovery1` generation of isolated ignored paths and never derives a `recovery2` or later generation.
+
+The at-most-one-lookup guarantee is enforced mechanically by a permanent recovery attempt claim file. After every validation gate and a successful authentication preflight, and immediately before the member lookup, the wrapper atomically and exclusively creates the claim (the equivalent of `O_CREAT | O_EXCL`) with a fixed sanitized non-PII structure, durably flushed. Only the process that wins the exclusive creation may invoke the lookup, so two concurrent processes observing the same clean state can never both run it — the loser sees the existing claim and performs zero lookups. Claim creation consumes the single approved lookup attempt, and a crash after claim creation (before, during, or after the lookup) blocks every future lookup, because any present claim is terminal:
+
+- valid claim plus one fully valid successful result/processed-marker pair -> `already_processed`, zero lookups;
+- valid claim plus a failed result/dead-letter pair -> `needs_fix`, zero lookups;
+- claim plus missing, partial, malformed, inconsistent, or interrupted result/marker state -> `needs_fix`, zero lookups;
+- malformed or unexpected claim content -> `needs_fix`, zero lookups, never `already_processed`;
+- no claim plus any recovery result or marker artifact -> `needs_fix`, zero lookups.
+
+Exclusive creation alone is insufficient. Claim persistence is exact: every byte of the fixed claim payload is written with short-write handling (a raw write that reports fewer bytes is continued; a zero-byte write is a failure), the file is durably flushed, and the persisted claim is then revalidated through the same strict claim validator before the lookup may run. Any partial-write or flush failure consumes and permanently blocks the single approved attempt: the partial or complete claim object stays in place, the aggregate evidence recomputes and reports its presence accurately from the filesystem, the run ends `needs_fix` with zero lookups, and no automated repair or retry occurs — every rerun performs zero authentication and zero lookups.
+
+No code path cleans, resets, overwrites, renames, or repairs the claim or any recovery artifact, and operators must never remove, rename, edit, or reset the claim. Authentication preflight failure happens before claim creation and therefore does not consume the attempt; a later corrected invocation may still claim and run the single lookup. A further retry beyond this single reviewed recovery attempt requires a new reviewed PR, not artifact deletion.
+
+### Isolated Recovery Paths
+
+The retry writes only to dedicated ignored recovery paths that must be disjoint from every original path (the wrapper verifies this before touching the filesystem):
+
+```powershell
+$root = 'C:\XB\autocount_outputs\review\member_lookup_bridge'
+$queue = "$root\member_lookup_bridge_gate4_pending_queue.jsonl"
+$origResults = "$root\member_lookup_bridge_gate4_results.jsonl"
+$origProcessed = "$root\member_lookup_bridge_gate4_processed"
+$origFailed = "$root\member_lookup_bridge_gate4_failed"
+$recClaim = "$root\member_lookup_bridge_gate4_recovery1_attempt_started.json"
+$recResults = "$root\member_lookup_bridge_gate4_recovery1_results.jsonl"
+$recProcessed = "$root\member_lookup_bridge_gate4_recovery1_processed"
+$recFailed = "$root\member_lookup_bridge_gate4_recovery1_failed"
+```
+
+The original approved queue file is read as the immutable source input and is not modified. All recovery artifacts — including the attempt claim — are ignored by Git and must never be committed.
+
+Before a fresh attempt the recovery results path must be completely absent: even an empty or zero-byte recovery results file is blocking, as is a whitespace-only file, a malformed or partial file, a directory, or any other filesystem object at that path. Every blocked case is `needs_fix` with zero authentication and zero lookups.
+
+### Authentication Preflight
+
+Before the recovery lookup, the wrapper requires all four `AC2_PROBE_*` values (`AC2_PROBE_SERVER_NAME`, `AC2_PROBE_DATABASE_NAME`, `AC2_PROBE_USER_ID`, `AC2_PROBE_PASSWORD`) to be present and nonblank in the wrapper's own process environment. They are runtime-only process values: set them only for the current PowerShell process, never in repo files, machine/user environment persistence, command-line arguments, or pasted evidence. The wrapper checks presence only and never prints or persists the values.
+
+The wrapper then runs the existing authentication-only probe `scripts/ac2_session_auth_probe.ps1` in the same inherited process environment, without `-AllowRootLogin`, using `-JsonOut` to a local temporary file that is deleted after the sanitized booleans are read. The probe must report `authentication_success = true`, `user_session_available = true`, and `instance_login_success = true` with no error. Any preflight failure stops the recovery before `MemberCommand` or `GetMember` is invoked, writes no recovery artifact, and does not consume the single approved lookup attempt.
+
+### Exact Opt-In Recovery Command
+
+All three explicit opt-ins are mandatory; default invocation refuses before authentication or lookup. Run only on the Windows AC2 lookup bridge host, from the repository root, after setting the four `AC2_PROBE_*` process values:
+
+```powershell
+python scripts\member_lookup_gate4_failed_attempt_recovery.py `
+  --enable-gate4-failed-attempt-recovery `
+  --confirm-original-evidence-preserved `
+  --enable-powershell-lookup `
+  --queue-jsonl "$queue" `
+  --original-results-jsonl "$origResults" `
+  --original-processed-dir "$origProcessed" `
+  --original-failed-dir "$origFailed" `
+  --recovery-attempt-claim-json "$recClaim" `
+  --recovery-results-jsonl "$recResults" `
+  --recovery-processed-dir "$recProcessed" `
+  --recovery-failed-dir "$recFailed"
+```
+
+There is no `--allow-root-login` option and no mock route; the recovery lookup is always the real read-only PowerShell path through `scripts/ac2_member_lookup_review.ps1` with `-EnableMemberLookupReview` and `-MemberNoBase64Utf8` only.
+
+### Expected Aggregate Evidence Shape
+
+The operator may paste back only this sanitized aggregate shape:
+
+```text
+status = <ok/needs_fix/already_processed/refused>
+gate = gate4_failed_attempt_recovery_lookup_only
+runtime_location = windows_ac2_lookup_bridge_host
+execution_mode = manual_read_only_single_recovery_review_only
+lookup_mode = powershell
+powershell_lookup_enabled = <true/false>
+recovery_generation = 1
+original_failure_validated = <true/false>
+original_artifacts_modified = false
+recovery_paths_isolated = <true/false>
+recovery_attempt_claim_present = <true/false>
+recovery_attempt_claim_created_by_this_run = <true/false>
+recovery_attempt_consumed = <true/false>
+auth_preflight_invoked = <true/false>
+auth_preflight_success = <true/false>
+allow_root_login_used = false
+ac2_lookup_invoked = <true/false>
+approved_batch_size = 1
+queue_rows_read_count = <aggregate-count-only>
+lookup_attempt_count = <aggregate-count-only>
+lookup_success_count = <aggregate-count-only>
+lookup_existing_member_review_count = <aggregate-count-only>
+lookup_manual_review_count = <aggregate-count-only>
+lookup_ready_for_create_review_count = <aggregate-count-only>
+lookup_error_count = <aggregate-count-only>
+recovery_result_rows_written_count = <aggregate-count-only>
+recovery_processed_artifact_count = <aggregate-count-only>
+recovery_failed_artifact_count = <aggregate-count-only>
+member_create_or_update_invoked = false
+autocount_write_attempted = false
+direct_sql_write_attempted = false
+n8n_result_mapping_run = false
+workflow_activation = inactive
+scheduler_enabled = false
+public_inbound_to_ac2_host = false
+final_write_automation = false
+no_row_values_printed = true
+```
+
+For one successful recovery lookup, expect `status = ok`, `original_failure_validated = true`, `original_artifacts_modified = false`, `recovery_paths_isolated = true`, `recovery_attempt_claim_present = true`, `recovery_attempt_claim_created_by_this_run = true`, `recovery_attempt_consumed = true`, `auth_preflight_invoked = true`, `auth_preflight_success = true`, `allow_root_login_used = false`, `ac2_lookup_invoked = true`, `queue_rows_read_count = 1`, `lookup_attempt_count = 1`, `lookup_success_count = 1`, exactly one of the three review routing counts equal to `1`, `lookup_error_count = 0`, `recovery_result_rows_written_count = 1`, `recovery_processed_artifact_count = 1`, and `recovery_failed_artifact_count = 0`. A rerun after a completed successful recovery reports `status = already_processed` with `lookup_attempt_count = 0`, `auth_preflight_invoked = false`, `recovery_attempt_claim_present = true`, and `recovery_attempt_claim_created_by_this_run = false`. Every validation, isolation, preflight, claim, or lookup failure reports `status = needs_fix` (or `refused` for missing opt-ins) and never becomes `already_processed`.
+
+### Stop Conditions
+
+Stop immediately and do not treat the run as recovery pass evidence if any of the following appear:
+
+- `status = refused` or `status = needs_fix`, `original_failure_validated = false`, `recovery_paths_isolated = false`, `auth_preflight_success = false` on an expected run, `lookup_error_count` above `0`, or an unexpected evidence shape.
+- `ac2_lookup_invoked = true` with anything other than exactly one lookup attempt and exactly one recovery result row, or `ac2_lookup_invoked = true` together with `recovery_attempt_claim_created_by_this_run = false`.
+- `recovery_attempt_claim_present = true` on what was expected to be the first attempt, or any sign the claim was removed, renamed, edited, or reset.
+- Any indication of a second recovery attempt, a `recovery2`-style path, a modified original artifact, a member create/update/delete reference, an AutoCount write attempt, a direct SQL indication, n8n activation or result mapping, scheduler enablement, or webhook/tunnel exposure of the AC2 host.
+
+If the recovery lookup itself fails (`lookup_error_count = 1`, a recovery dead-letter marker exists), or the claim exists without a completed successful pair (an interrupted run), the one authorized recovery attempt is consumed. Do not delete the claim or any recovery artifact to retry; any further attempt requires a new reviewed PR.
+
+### Recovery Boundaries
+
+This recovery does not approve n8n result mapping, Google Sheets writeback, n8n activation, any scheduler, Windows service, webhook, Cloudflare Tunnel, or public inbound access, does not approve any AutoCount member create, update, or delete, no AutoCount write, no direct SQL, no final production automation, and no automatic retries beyond this single reviewed recovery attempt. n8n result mapping remains the next separate gate.
+
+Do not paste the queue row, original or recovery result rows, processed or failed markers, raw/encoded/decoded/normalized member values, names, emails, phone numbers, birthday values, `AC2_PROBE_*` values, credentials, AC2 server/database/user values, command transcripts, stdout/stderr transcripts, execution payloads, Sheet IDs/URLs, screenshots, secrets, or PII. Keep every original and `recovery1` artifact local and ignored.
 
 ## Review-Only Routing
 
