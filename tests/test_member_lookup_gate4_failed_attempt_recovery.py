@@ -1,5 +1,7 @@
 import base64
+import contextlib
 import hashlib
+import io
 import json
 import os
 import subprocess
@@ -7,10 +9,17 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "member_lookup_gate4_failed_attempt_recovery.py"
+
+# Imported for in-process claim-persistence fault injection: the module attribute is
+# patched with a narrowly scoped wrapper around the real create_attempt_claim (routing
+# only os_write/os_fsync), so production code gains no test-only bypass.
+sys.path.insert(0, str(ROOT / "scripts"))
+import member_lookup_gate4_failed_attempt_recovery as recovery_module  # noqa: E402
 GITIGNORE = ROOT / ".gitignore"
 README = ROOT / "README.md"
 BRIDGE_RUNBOOK = ROOT / "docs" / "autocount2-automation" / "member_intake_local_lookup_bridge_runbook.md"
@@ -212,6 +221,41 @@ def success_result_row(job, *, state="READY_FOR_CREATE_REVIEW", member_exists=Fa
         "result_created_at": "fixture-time",
         "result_applied_at": None,
     }
+
+
+def short_then_full_writer():
+    """First raw write returns after 1 byte (legal short write); later writes complete."""
+    calls = {"count": 0}
+
+    def writer(handle, view):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return os.write(handle, memoryview(view)[:1])
+        return os.write(handle, view)
+
+    return writer
+
+
+def zero_byte_writer(handle, view):
+    """Simulate a raw write that makes no progress without raising."""
+    return 0
+
+
+def partial_then_error_writer():
+    """First raw write persists a few bytes, then persistence fails with OSError."""
+    calls = {"count": 0}
+
+    def writer(handle, view):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return os.write(handle, memoryview(view)[:5])
+        raise OSError("synthetic write failure")
+
+    return writer
+
+
+def failing_fsync(handle):
+    raise OSError("synthetic fsync failure")
 
 
 # Mirror of the wrapper's fixed sanitized non-PII claim structure, for direct seeding.
@@ -481,6 +525,40 @@ class Gate4FailedAttemptRecoveryTests(unittest.TestCase):
             check=False,
             env=run_env,
         )
+
+    def run_inprocess(self, arguments, *, env_overrides=None, drop_env=()):
+        """Run main() in-process (for narrowly scoped mock-based fault injection).
+
+        Environment handling mirrors run_cli: strip AC2_PROBE_* then install synthetic
+        values. stdout is captured and returned; nothing is printed to the test output.
+        """
+        run_env = {key: value for key, value in os.environ.items() if not key.startswith("AC2_PROBE_")}
+        run_env.update(SYNTHETIC_AUTH_ENV)
+        for key in drop_env:
+            run_env.pop(key, None)
+        if env_overrides:
+            run_env.update(env_overrides)
+        buffer = io.StringIO()
+        with mock.patch.dict(os.environ, run_env, clear=True), contextlib.redirect_stdout(buffer):
+            exit_code = recovery_module.main(arguments)
+        return exit_code, buffer.getvalue()
+
+    def claim_persistence_patch(self, *, os_write=None, os_fsync=None):
+        """Route main()'s claim creation through injected write/fsync callables.
+
+        Wraps the real create_attempt_claim so the O_EXCL exclusive-creation behaviour,
+        the write-all loop, and the flush ordering under test are the production code.
+        """
+        real_create = recovery_module.create_attempt_claim
+
+        def injected(path):
+            return real_create(
+                path,
+                os_write=os_write if os_write is not None else os.write,
+                os_fsync=os_fsync if os_fsync is not None else os.fsync,
+            )
+
+        return mock.patch.object(recovery_module, "create_attempt_claim", injected)
 
     def assert_no_recovery_artifacts(self, paths):
         self.assertFalse(paths["rec_claim"].exists())
@@ -1104,6 +1182,139 @@ class Gate4FailedAttemptRecoveryTests(unittest.TestCase):
             self.assertEqual(log_lines(good_logs["lookup"]), 1)
             self.assertEqual(log_lines(bad_logs["lookup"]), 0)
 
+    # --- exact claim persistence -------------------------------------------------
+
+    def test_short_first_write_completes_claim_and_allows_one_lookup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            paths, row = self.seed_original(tmp_path)
+            before = snapshot_original(paths)
+            extra, logs = self.fake_ps(tmp_path)
+            with self.claim_persistence_patch(os_write=short_then_full_writer()):
+                exit_code, stdout = self.run_inprocess(self.args(paths, extra=extra))
+            self.assertEqual(exit_code, 0, stdout)
+            evidence = parse_evidence(stdout)
+            self.assertEqual(evidence["status"], "ok")
+            self.assertEqual(evidence["recovery_attempt_claim_present"], "true")
+            self.assertEqual(evidence["recovery_attempt_claim_created_by_this_run"], "true")
+            self.assertEqual(evidence["recovery_attempt_consumed"], "true")
+            self.assertEqual(evidence["lookup_attempt_count"], "1")
+            # The short first write was completed: the persisted claim is byte-exact.
+            self.assertEqual(json.loads(paths["rec_claim"].read_text(encoding="utf-8")), ATTEMPT_CLAIM_STRUCTURE)
+            self.assertEqual(log_lines(logs["lookup"]), 1)
+            self.assert_original_unchanged(before, paths)
+
+    def _assert_claim_persistence_failure(self, tmp_path, paths, extra, logs, exit_code, stdout, label):
+        self.assertEqual(exit_code, 2, label + stdout)
+        evidence = parse_evidence(stdout)
+        self.assertEqual(evidence["status"], "needs_fix", label)
+        # A claim filesystem object exists (os.open created it), so presence and
+        # consumption are reported accurately even though persistence failed.
+        self.assertTrue(paths["rec_claim"].exists(), label)
+        self.assertEqual(evidence["recovery_attempt_claim_present"], "true", label)
+        self.assertEqual(evidence["recovery_attempt_consumed"], "true", label)
+        self.assertEqual(evidence["recovery_attempt_claim_created_by_this_run"], "false", label)
+        self.assertEqual(evidence["ac2_lookup_invoked"], "false", label)
+        self.assertEqual(evidence["lookup_attempt_count"], "0", label)
+        self.assertEqual(log_lines(logs["auth"]), 1, label)
+        self.assertEqual(log_lines(logs["lookup"]), 0, label)
+
+        # Rerun (unpatched, via the CLI): zero further authentication, zero lookups,
+        # the blocking claim object is preserved byte-for-byte, never repaired.
+        claim_bytes = paths["rec_claim"].read_bytes()
+        rerun = self.run_cli(self.args(paths, extra=extra))
+        self.assertEqual(rerun.returncode, 2, label)
+        rerun_evidence = parse_evidence(rerun.stdout)
+        self.assertEqual(rerun_evidence["status"], "needs_fix", label)
+        self.assertEqual(rerun_evidence["recovery_attempt_claim_present"], "true", label)
+        self.assertEqual(rerun_evidence["auth_preflight_invoked"], "false", label)
+        self.assertEqual(rerun_evidence["ac2_lookup_invoked"], "false", label)
+        self.assertEqual(log_lines(logs["auth"]), 1, label)
+        self.assertEqual(log_lines(logs["lookup"]), 0, label)
+        self.assertEqual(paths["rec_claim"].read_bytes(), claim_bytes, label)
+        return evidence
+
+    def test_zero_byte_write_blocks_with_accurate_claim_evidence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            paths, row = self.seed_original(tmp_path)
+            before = snapshot_original(paths)
+            extra, logs = self.fake_ps(tmp_path)
+            with self.claim_persistence_patch(os_write=zero_byte_writer):
+                exit_code, stdout = self.run_inprocess(self.args(paths, extra=extra))
+            self._assert_claim_persistence_failure(tmp_path, paths, extra, logs, exit_code, stdout, "zero_byte")
+            self.assertEqual(paths["rec_claim"].read_bytes(), b"")
+            self.assert_original_unchanged(before, paths)
+
+    def test_partial_write_then_oserror_leaves_blocking_invalid_claim(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            paths, row = self.seed_original(tmp_path)
+            before = snapshot_original(paths)
+            extra, logs = self.fake_ps(tmp_path)
+            with self.claim_persistence_patch(os_write=partial_then_error_writer()):
+                exit_code, stdout = self.run_inprocess(self.args(paths, extra=extra))
+            self._assert_claim_persistence_failure(tmp_path, paths, extra, logs, exit_code, stdout, "partial_write")
+            # The truncated claim is present, invalid, and permanently blocking.
+            self.assertEqual(len(paths["rec_claim"].read_bytes()), 5)
+            self.assert_original_unchanged(before, paths)
+
+    def test_fsync_failure_after_complete_write_blocks_lookup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            paths, row = self.seed_original(tmp_path)
+            before = snapshot_original(paths)
+            extra, logs = self.fake_ps(tmp_path)
+            with self.claim_persistence_patch(os_fsync=failing_fsync):
+                exit_code, stdout = self.run_inprocess(self.args(paths, extra=extra))
+            self._assert_claim_persistence_failure(tmp_path, paths, extra, logs, exit_code, stdout, "fsync_failure")
+            self.assert_original_unchanged(before, paths)
+
+    def test_claim_validation_failure_after_exclusive_creation_blocks_lookup(self):
+        def corrupt_claim_creator(path):
+            # Exclusive creation succeeds but persists content that is not the exact
+            # fixed claim structure, so the post-creation revalidation must block.
+            claim_path = Path(path)
+            claim_path.parent.mkdir(parents=True, exist_ok=True)
+            handle = os.open(str(claim_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            try:
+                os.write(handle, b'"not-the-claim-structure"\n')
+                os.fsync(handle)
+            finally:
+                os.close(handle)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            paths, row = self.seed_original(tmp_path)
+            before = snapshot_original(paths)
+            extra, logs = self.fake_ps(tmp_path)
+            with mock.patch.object(recovery_module, "create_attempt_claim", corrupt_claim_creator):
+                exit_code, stdout = self.run_inprocess(self.args(paths, extra=extra))
+            self._assert_claim_persistence_failure(tmp_path, paths, extra, logs, exit_code, stdout, "invalid_claim")
+            self.assert_original_unchanged(before, paths)
+
+    def test_no_sensitive_values_in_claim_persistence_failure_output(self):
+        member_digits = "443322"
+        row = canonical_queue_row(member_digits=member_digits)
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            paths, seeded_row = self.seed_original(tmp_path, row=row)
+            extra, logs = self.fake_ps(tmp_path)
+            with self.claim_persistence_patch(os_write=zero_byte_writer):
+                exit_code, stdout = self.run_inprocess(self.args(paths, extra=extra))
+            forbidden = [
+                member_digits,
+                row["submitted_member_no_base64_utf8"],
+                row["job_id"],
+                row["payload_hash"],
+                str(paths["rec_claim"]),
+                "attempt_started.json",
+                "synthetic write failure",
+                *SYNTHETIC_AUTH_ENV.values(),
+            ]
+            for token in forbidden:
+                self.assertNotIn(token, stdout, token)
+
     # --- atomicity and concurrency ----------------------------------------------
 
     def test_two_concurrent_processes_perform_exactly_one_lookup(self):
@@ -1477,6 +1688,14 @@ class Gate4FailedAttemptRecoveryTests(unittest.TestCase):
             "recovery_attempt_claim_present",
             "recovery_attempt_claim_created_by_this_run",
             "recovery_attempt_consumed",
+            # Amendment: exact claim persistence.
+            "Exclusive creation alone is insufficient",
+            "every byte of the fixed claim payload",
+            "short-write handling",
+            "durably flushed",
+            "revalidated through the same strict claim validator",
+            "partial-write or flush failure consumes and permanently blocks",
+            "no automated repair or retry",
         ]:
             self.assertIn(phrase, runbook, phrase)
 

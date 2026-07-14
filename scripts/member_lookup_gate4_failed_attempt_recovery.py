@@ -39,15 +39,22 @@ Fail-closed recovery contract:
 - **Atomic permanent attempt claim.** After every validation and a successful
   authentication preflight, and immediately before the member lookup, the wrapper
   atomically and exclusively creates a permanent attempt-claim file (equivalent of
-  ``O_CREAT | O_EXCL``) holding a fixed sanitized non-PII structure, durably flushed.
-  Only the process that wins the claim may invoke the lookup, so two concurrent
-  processes can never both run it. Claim creation consumes the single approved lookup
-  attempt. The claim is never removed, reset, overwritten, renamed, or repaired by any
-  code path; any later or concurrent process that encounters it performs zero lookups
-  (terminal ``already_processed`` only for a valid claim plus a fully valid successful
-  result/processed pair, otherwise terminal ``needs_fix``), so a crash after claim
-  creation blocks every future lookup. Authentication preflight failure happens before
-  claim creation and therefore does not consume the attempt.
+  ``O_CREAT | O_EXCL``) holding a fixed sanitized non-PII structure. Exclusive creation
+  alone is insufficient: every byte of the claim payload is written with short-write
+  handling and durably flushed, and the persisted claim is then re-read through the
+  strict claim validator; only after it validates exactly may the lookup run. Only the
+  process that wins, persists, and revalidates the claim may invoke the lookup, so two
+  concurrent processes can never both run it. Claim creation consumes the single
+  approved lookup attempt — including when persistence fails partway (short write,
+  flush failure, corruption), in which case the partial claim object stays in place,
+  evidence reports its presence accurately from the filesystem, and every future lookup
+  is permanently blocked with no automated repair or retry. The claim is never removed,
+  reset, overwritten, renamed, or repaired by any code path; any later or concurrent
+  process that encounters it performs zero lookups (terminal ``already_processed`` only
+  for a valid claim plus a fully valid successful result/processed pair, otherwise
+  terminal ``needs_fix``), so a crash after claim creation blocks every future lookup.
+  Authentication preflight failure happens before claim creation and therefore does not
+  consume the attempt.
 - **Authentication preflight.** Before the recovery lookup, the existing
   authentication-only probe ``scripts/ac2_session_auth_probe.ps1`` runs in the inherited
   process environment with ``-JsonOut`` to a local temporary file (deleted after
@@ -474,20 +481,43 @@ def attempt_claim_state(path):
     return "valid" if payload == ATTEMPT_CLAIM_STRUCTURE else "invalid"
 
 
-def create_attempt_claim(path):
+def write_payload_fully(handle, payload, os_write):
+    """Write every byte of ``payload`` to ``handle``, retrying short writes.
+
+    A raw ``os.write`` may legally write fewer bytes than requested without raising, so
+    the remainder is rewritten until the payload is complete. A zero-byte (or invalid)
+    write result is treated as failure rather than looping forever.
+    """
+    view = memoryview(payload)
+    while len(view) > 0:
+        written = os_write(handle, view)
+        if not isinstance(written, int) or written <= 0:
+            raise OSError("claim payload write made no progress")
+        view = view[written:]
+
+
+def create_attempt_claim(path, *, os_write=os.write, os_fsync=os.fsync):
     """Atomically and exclusively create the permanent attempt claim, durably flushed.
 
     Uses ``O_CREAT | O_EXCL`` so exactly one process can ever win the claim; every other
-    concurrent or later creation attempt raises ``FileExistsError``. The claim content is
-    the fixed sanitized non-PII structure only. Nothing ever removes or rewrites it.
+    concurrent or later creation attempt raises ``FileExistsError``. Exclusive creation
+    alone is insufficient: every byte of the fixed sanitized non-PII payload is written
+    with short-write handling and durably flushed before creation counts as complete,
+    and the caller must still revalidate the persisted claim before any lookup. Nothing
+    ever overwrites, truncates, removes, renames, resets, or repairs an existing claim;
+    if persistence fails partway, the partial claim object stays in place and
+    permanently blocks the single attempt.
+
+    ``os_write``/``os_fsync`` exist only for dependency injection in tests (simulating
+    short writes and flush failures); production callers use the real defaults.
     """
     claim_path = Path(path)
     claim_path.parent.mkdir(parents=True, exist_ok=True)
     payload = (json.dumps(ATTEMPT_CLAIM_STRUCTURE, sort_keys=True) + "\n").encode("utf-8")
     handle = os.open(str(claim_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
     try:
-        os.write(handle, payload)
-        os.fsync(handle)
+        write_payload_fully(handle, payload, os_write)
+        os_fsync(handle)
     finally:
         os.close(handle)
 
@@ -690,20 +720,32 @@ def main(argv=None):
     flags["auth_preflight_success"] = True
 
     # I. Atomic permanent attempt claim, immediately before the lookup. Only the process
-    # that exclusively creates the claim may invoke the lookup; a concurrent loser sees
-    # FileExistsError and performs zero lookups. Claim creation consumes the single
-    # approved attempt, and the claim is never removed, reset, or rewritten.
+    # that exclusively creates AND fully persists AND revalidates the claim may invoke
+    # the lookup; a concurrent loser sees FileExistsError and performs zero lookups.
+    # Claim creation consumes the single approved attempt, and the claim is never
+    # removed, reset, or rewritten.
     try:
         create_attempt_claim(args.recovery_attempt_claim_json)
-    except FileExistsError:
-        flags["recovery_attempt_claim_present"] = True
-        flags["recovery_attempt_consumed"] = True
-        return stopped("needs_fix", 2)
     except OSError:
+        # Covers FileExistsError (concurrent/later loser) and every persistence failure
+        # (short/zero write, flush failure, ...). os.open may already have created a
+        # partial claim object, so recompute presence from the filesystem: any object
+        # now occupying the claim path is a consumed attempt that permanently blocks
+        # every future lookup. No cleanup, repair, or retry is allowed.
+        claim_object_present = os.path.lexists(args.recovery_attempt_claim_json)
+        flags["recovery_attempt_claim_present"] = claim_object_present
+        flags["recovery_attempt_consumed"] = claim_object_present
         return stopped("needs_fix", 2)
     flags["recovery_attempt_claim_present"] = True
-    flags["recovery_attempt_claim_created_by_this_run"] = True
     flags["recovery_attempt_consumed"] = True
+
+    # Exclusive creation alone is insufficient: re-read the persisted claim through the
+    # same strict validator and require it to be exactly the fixed structure before the
+    # lookup may run. A missing, truncated, malformed, or unreadable persisted claim is
+    # needs_fix with zero lookups, stays permanently in place, and is never repaired.
+    if attempt_claim_state(args.recovery_attempt_claim_json) != "valid":
+        return stopped("needs_fix", 2)
+    flags["recovery_attempt_claim_created_by_this_run"] = True
 
     # Test-only crash simulation between claim persistence and the lookup: the claim
     # already blocks every future lookup, which the rerun tests prove.

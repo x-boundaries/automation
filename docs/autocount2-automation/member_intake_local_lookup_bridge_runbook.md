@@ -1384,6 +1384,8 @@ The at-most-one-lookup guarantee is enforced mechanically by a permanent recover
 - malformed or unexpected claim content -> `needs_fix`, zero lookups, never `already_processed`;
 - no claim plus any recovery result or marker artifact -> `needs_fix`, zero lookups.
 
+Exclusive creation alone is insufficient. Claim persistence is exact: every byte of the fixed claim payload is written with short-write handling (a raw write that reports fewer bytes is continued; a zero-byte write is a failure), the file is durably flushed, and the persisted claim is then revalidated through the same strict claim validator before the lookup may run. Any partial-write or flush failure consumes and permanently blocks the single approved attempt: the partial or complete claim object stays in place, the aggregate evidence recomputes and reports its presence accurately from the filesystem, the run ends `needs_fix` with zero lookups, and no automated repair or retry occurs — every rerun performs zero authentication and zero lookups.
+
 No code path cleans, resets, overwrites, renames, or repairs the claim or any recovery artifact, and operators must never remove, rename, edit, or reset the claim. Authentication preflight failure happens before claim creation and therefore does not consume the attempt; a later corrected invocation may still claim and run the single lookup. A further retry beyond this single reviewed recovery attempt requires a new reviewed PR, not artifact deletion.
 
 ### Isolated Recovery Paths
