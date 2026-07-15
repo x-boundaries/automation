@@ -177,3 +177,19 @@ If the task involves n8n workflows, workflow templates, helper scripts, MCP, imp
 If that skill or its full rules are unavailable, stop and report the limitation instead of continuing.
 Do not run live n8n, Docker, import/export, sync, activation, execution, publish/unpublish, credential, deployment, or production actions without explicit current-turn approval naming the target and allowed operation.
 <!-- AI-AGENT-TOOLKIT:_projects/development/ai-coding-agent-rules/_main/_partials/n8n-agent-rules-adapter.md:END N8N-AGENT-RULES-ADAPTER -->
+
+## Repository Appendix (outside Toolkit-managed blocks)
+
+### n8n workflow export naming
+
+- This repository's established n8n workflow export convention is lowercase snake_case with the suffix `*.workflow.json`.
+- Existing Gate workflow filenames are canonical and must not be renamed during unrelated work.
+- For this repository, the generic hyphenated filename example in the portable playbook is illustrative only and does not override the established local convention.
+- `n8n-workflows/README.md` is the directory-level source of truth for workflow names and their associated runbooks.
+
+### n8n skill routing
+
+- Agents should load the host-qualified installed Toolkit skill equivalent to `n8n-agent-rules` (for example `ai-agent-toolkit:n8n-agent-rules`), plus the smallest relevant official `n8n-skills:*` skill set. Host-specific naming may differ.
+- An agent must not stop merely because the unqualified literal path `skills/n8n-agent-rules` is unavailable when the equivalent complete host-qualified Toolkit skill has been successfully loaded.
+- The agent must still stop when no equivalent complete Toolkit n8n safety rules are available.
+- This clarification does not weaken any approval, credential, local-only, import/export, execution, activation, or deployment safety gate.
