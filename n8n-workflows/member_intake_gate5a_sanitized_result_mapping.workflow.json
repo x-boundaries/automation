@@ -160,7 +160,7 @@
         "columns": {
           "mappingMode": "defineBelow",
           "value": {
-            "row_number": "={{ $json.row_number }}",
+            "Gate5AApprovedForMapping": "YES",
             "uat_lookup_job_id": "={{ $json.uat_lookup_job_id }}",
             "uat_lookup_state": "={{ $json.uat_lookup_state }}",
             "uat_lookup_status": "={{ $json.uat_lookup_status }}",
@@ -171,7 +171,7 @@
             "reviewer_status": "={{ $json.reviewer_status }}"
           },
           "matchingColumns": [
-            "row_number"
+            "Gate5AApprovedForMapping"
           ],
           "schema": []
         },
@@ -188,26 +188,76 @@
         32
       ],
       "notesInFlow": true,
-      "notes": "Updates only the controlled review/status columns on the one identity-verified row, matching on n8n's virtual row_number after identity verification. reviewer_status is always UNREVIEWED; no create-approved value exists in this workflow. Operator must bind the same document and tab as the read node in n8n UI. Cell format RAW so values are written as plain text."
+      "notes": "Updates only the controlled review/status columns, locating the row by the stable non-PII operator marker Gate5AApprovedForMapping = YES (the verified v4.7 implementation uses the match column only to find the row and never rewrites it; virtual row_number stays identity evidence, never the physical update selector). reviewer_status is always UNREVIEWED; no create-approved value exists in this workflow. Operator must bind the same document and tab as the read nodes in n8n UI. Cell format RAW so values are written as plain text."
     },
     {
       "parameters": {
-        "jsCode": "const verify = $('Verify Identity And Decide Mapping').first().json;\nconst decision = verify.gate5a_decision;\nconst mappedState = verify.gate5a_mapped_state;\nif (decision !== 'apply' && decision !== 'already_applied') {\n  throw new Error('gate5a_unexpected_mapping_decision');\n}\nconst REVIEW_STATES = ['LOOKUP_ERROR_REVIEW', 'MANUAL_REVIEW_REQUIRED', 'EXISTING_MEMBER_REVIEW', 'READY_FOR_CREATE_REVIEW'];\nif (!REVIEW_STATES.includes(mappedState)) {\n  throw new Error('gate5a_unexpected_mapped_state');\n}\nreturn [{\n  json: {\n    status: 'ok',\n    gate: 'gate5a_manual_inactive_n8n_result_mapping',\n    runtime_location: 'local_operator_pc_non_ac2_n8n_stack',\n    execution_mode: 'manual_inactive_single_result_review_mapping_only',\n    input_result_row_count: 1,\n    result_schema_valid_count: 1,\n    source_rows_read_count: 1,\n    source_row_match_count: 1,\n    mapping_attempt_count: 1,\n    mapping_success_count: decision === 'apply' ? 1 : 0,\n    mapping_already_applied_count: decision === 'already_applied' ? 1 : 0,\n    mapping_error_count: 0,\n    mapped_lookup_error_review_count: mappedState === 'LOOKUP_ERROR_REVIEW' ? 1 : 0,\n    mapped_manual_review_required_count: mappedState === 'MANUAL_REVIEW_REQUIRED' ? 1 : 0,\n    mapped_existing_member_review_count: mappedState === 'EXISTING_MEMBER_REVIEW' ? 1 : 0,\n    mapped_ready_for_create_review_count: mappedState === 'READY_FOR_CREATE_REVIEW' ? 1 : 0,\n    reviewer_status_unreviewed_count: 1,\n    original_gate4_artifacts_modified: false,\n    autocount_lookup_invoked: false,\n    member_create_or_update_invoked: false,\n    autocount_write_attempted: false,\n    direct_sql_write_attempted: false,\n    workflow_activation: 'inactive',\n    scheduler_enabled: false,\n    public_inbound_to_ac2_host: false,\n    final_write_automation: false,\n    no_row_values_printed: true\n  }\n}];"
+        "documentId": {
+          "__rl": true,
+          "value": "",
+          "mode": "list"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "",
+          "mode": "list"
+        },
+        "filtersUI": {
+          "values": [
+            {
+              "lookupColumn": "Gate5AApprovedForMapping",
+              "lookupValue": "YES"
+            }
+          ]
+        },
+        "options": {
+          "returnFirstMatch": false
+        }
+      },
+      "id": "af5f9e7a-7e2b-4d9c-8c4f-2b3c4f4f4f12",
+      "name": "Re-Read Mapped Row For Verification",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        688,
+        32
+      ],
+      "notesInFlow": true,
+      "notes": "Post-write read-back of the approved row using the same unbound document and tab selectors and the same non-PII marker filter. returnFirstMatch is explicitly false so every match is returned and the strict verifier can require exactly one."
+    },
+    {
+      "parameters": {
+        "jsCode": "const SOURCE_LABEL = 'google_sheets_uat_gate4a';\nconst FIELD_ALIASES = {\n  name: ['Full Name', 'Name'],\n  memberNo: ['AutoCount MemberNo', 'Phone/Member Number', 'Phone Member Number', 'Phone Number', 'Member Number', 'Submitted Member Number', 'Submitted Member No', 'Mobile Number'],\n  email: ['Email Address', 'Email'],\n  birthdayMonth: ['Birthday Month', 'Birthday', 'Date of Birth', 'DOB'],\n  pdpa: ['PDPA Acknowledged', 'PDPA', 'PDPA Status'],\n  rowNumber: ['row_number', 'Row Number', 'RowNumber']\n};\nconst REQUIRED_REVIEW_COLUMNS = [\n  'uat_lookup_job_id', 'uat_lookup_state', 'uat_lookup_status',\n  'uat_lookup_error_code', 'uat_lookup_warning_count', 'uat_lookup_attempt',\n  'uat_lookup_completed_at', 'reviewer_status'\n];\n\nconst result = $('Validate Copied Sanitized Result Strictly').first().json;\nconst intended = $('Verify Identity And Decide Mapping').first().json;\nif (intended.gate5a_decision !== 'apply') {\n  throw new Error('gate5a_postwrite_unexpected_branch');\n}\n\n// The read-back must return exactly one approved row; zero, duplicates, or a\n// filter drift after the update are terminal and never become success evidence.\nconst items = $input.all();\nif (items.length !== 1) {\n  throw new Error('gate5a_postwrite_requires_exactly_one_approved_source_row');\n}\nconst row = items[0].json;\n\n// Rebuild the full canonical Gate 4A identity from the persisted row and require\n// it to still match the sanitized result. Raw values stay in execution memory\n// only and are never echoed into errors or evidence. Any derivation failure or\n// mismatch (including row reorder/drift, which changes the recomputed identity)\n// is a single sanitized terminal error.\nconst identityFailure = () => new Error('gate5a_postwrite_identity_verification_failed');\nconst pick = (aliases) => {\n  for (const key of aliases) {\n    if (Object.prototype.hasOwnProperty.call(row, key)) return row[key];\n  }\n  return undefined;\n};\nconst clean = (value) => String(value ?? '').trim();\n\nconst submittedMemberNo = clean(pick(FIELD_ALIASES.memberNo));\nconst pdpaRaw = clean(pick(FIELD_ALIASES.pdpa));\nconst rowNumber = Number(pick(FIELD_ALIASES.rowNumber));\nif (!/^[0-9]{6,20}$/.test(submittedMemberNo)) throw identityFailure();\nif (pdpaRaw.toLowerCase() !== 'yes') throw identityFailure();\nif (!Number.isInteger(rowNumber) || rowNumber < 1) throw identityFailure();\n\nconst submittedMemberNoBase64 = Buffer.from(submittedMemberNo, 'utf8').toString('base64');\nconst sourceRowRef = `row_${rowNumber}`;\nconst intakeId = `gate4a_${sourceRowRef}`;\nconst fnv1a = (text) => {\n  let hash = 0x811c9dc5;\n  for (let index = 0; index < text.length; index += 1) {\n    hash ^= text.charCodeAt(index);\n    hash = Math.imul(hash, 0x01000193) >>> 0;\n  }\n  return hash.toString(16).padStart(8, '0');\n};\nconst payloadHash = `fnv1a_${fnv1a(JSON.stringify({\n  intake_source: SOURCE_LABEL,\n  source_reference: SOURCE_LABEL,\n  source_row_ref: sourceRowRef,\n  row_number: rowNumber,\n  intake_id: intakeId,\n  state: 'PENDING_LOOKUP',\n  submitted_member_no_base64_utf8: submittedMemberNoBase64,\n  pdpa_status: 'yes'\n}))}`;\nconst expectedJobId = `gate4a_${payloadHash}`;\nconst identityMatches = (\n  result.job_id === expectedJobId\n  && result.intake_source === SOURCE_LABEL\n  && result.source_reference === SOURCE_LABEL\n  && result.source_row_ref === sourceRowRef\n  && result.row_number === rowNumber\n  && result.consent_status === 'marketing_consent_not_queued'\n  && result.pdpa_status === 'yes'\n  && result.attempt === 0\n);\nif (!identityMatches) throw identityFailure();\n\n// Every controlled review/status field must hold exactly the intended persisted\n// value. Missing, blank, partial, extra-state, or conflicting values are terminal.\nconst cell = (name) => String(row[name] ?? '').trim();\nfor (const column of REQUIRED_REVIEW_COLUMNS) {\n  if (!Object.prototype.hasOwnProperty.call(row, column)) {\n    throw new Error('gate5a_postwrite_persisted_state_mismatch');\n  }\n  if (cell(column) !== String(intended[column]).trim()) {\n    throw new Error('gate5a_postwrite_persisted_state_mismatch');\n  }\n}\nif (cell('reviewer_status') !== 'UNREVIEWED') {\n  throw new Error('gate5a_postwrite_persisted_state_mismatch');\n}\n\nreturn [{\n  json: {\n    gate5a_persisted_verified: true,\n    gate5a_decision: 'apply',\n    gate5a_mapped_state: intended.gate5a_mapped_state\n  }\n}];"
+      },
+      "id": "bc6f0f8b-8f3c-4e8d-9d5a-3c4d5a5a5a13",
+      "name": "Verify Persisted Mapping Strictly",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        912,
+        32
+      ],
+      "notesInFlow": true,
+      "notes": "Fail-closed persisted-state verification after a fresh update: exactly one approved row, full canonical Gate 4A identity rebuilt and re-matched against the sanitized result, and every controlled review/status cell exactly equal to the intended values. Any disagreement is a terminal sanitized error with no rollback, no repair, and no automatic retry; success evidence stays unreachable."
+    },
+    {
+      "parameters": {
+        "jsCode": "const verify = $('Verify Identity And Decide Mapping').first().json;\nconst decision = verify.gate5a_decision;\nconst mappedState = verify.gate5a_mapped_state;\nif (decision !== 'apply' && decision !== 'already_applied') {\n  throw new Error('gate5a_unexpected_mapping_decision');\n}\nconst REVIEW_STATES = ['LOOKUP_ERROR_REVIEW', 'MANUAL_REVIEW_REQUIRED', 'EXISTING_MEMBER_REVIEW', 'READY_FOR_CREATE_REVIEW'];\nif (!REVIEW_STATES.includes(mappedState)) {\n  throw new Error('gate5a_unexpected_mapped_state');\n}\nif (decision === 'apply') {\n  // Success evidence is only reachable through the post-write read-back branch:\n  // referencing the verification node fails when it did not execute, and its\n  // output must confirm the exact persisted state for the same mapped state.\n  const persisted = $('Verify Persisted Mapping Strictly').first().json;\n  if (persisted.gate5a_persisted_verified !== true\n    || persisted.gate5a_decision !== 'apply'\n    || persisted.gate5a_mapped_state !== mappedState) {\n    throw new Error('gate5a_success_evidence_requires_persisted_verification');\n  }\n}\nreturn [{\n  json: {\n    status: 'ok',\n    gate: 'gate5a_manual_inactive_n8n_result_mapping',\n    runtime_location: 'local_operator_pc_non_ac2_n8n_stack',\n    execution_mode: 'manual_inactive_single_result_review_mapping_only',\n    input_result_row_count: 1,\n    result_schema_valid_count: 1,\n    source_rows_read_count: 1,\n    source_row_match_count: 1,\n    mapping_attempt_count: 1,\n    mapping_success_count: decision === 'apply' ? 1 : 0,\n    mapping_already_applied_count: decision === 'already_applied' ? 1 : 0,\n    mapping_error_count: 0,\n    mapped_lookup_error_review_count: mappedState === 'LOOKUP_ERROR_REVIEW' ? 1 : 0,\n    mapped_manual_review_required_count: mappedState === 'MANUAL_REVIEW_REQUIRED' ? 1 : 0,\n    mapped_existing_member_review_count: mappedState === 'EXISTING_MEMBER_REVIEW' ? 1 : 0,\n    mapped_ready_for_create_review_count: mappedState === 'READY_FOR_CREATE_REVIEW' ? 1 : 0,\n    reviewer_status_unreviewed_count: 1,\n    original_gate4_artifacts_modified: false,\n    autocount_lookup_invoked: false,\n    member_create_or_update_invoked: false,\n    autocount_write_attempted: false,\n    direct_sql_write_attempted: false,\n    workflow_activation: 'inactive',\n    scheduler_enabled: false,\n    public_inbound_to_ac2_host: false,\n    final_write_automation: false,\n    no_row_values_printed: true\n  }\n}];"
       },
       "id": "0e4f8c5e-5ecf-4b2a-8f2d-0f1a2d2d2d10",
       "name": "Emit Aggregate Evidence Only",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        688,
+        1136,
         128
       ],
       "notesInFlow": true,
-      "notes": "Emits the fixed aggregate-only Gate 5A evidence contract: statuses, counts, and hard-coded false write/activation flags. No IDs, hashes, row numbers, member values, timestamps, or source values."
+      "notes": "Emits the fixed aggregate-only Gate 5A evidence contract: statuses, counts, and hard-coded false write/activation flags. On the fresh-apply branch it requires the persisted-state verification output before reporting mapping success. No IDs, hashes, row numbers, member values, timestamps, or source values."
     },
     {
       "parameters": {
-        "content": "### Gate 5A Boundary\nManual inactive single-result review mapping only. Do not activate. Do not add webhook, scheduler, wait, execute-command, HTTP, SSH, SQL, AC2, bridge, tunnel, member create/update/delete, or AutoCount write nodes. The AutoCount host receives no inbound connection: the operator copies the one sanitized recovery result file into /home/node/.n8n-files/ manually. Original Gate 4 and recovery artifacts stay byte-for-byte unchanged. READY_FOR_CREATE_REVIEW stays review-only and reviewer_status stays UNREVIEWED; no state authorizes member creation.",
+        "content": "### Gate 5A Boundary\nManual inactive single-result review mapping only. Do not activate. Do not add webhook, scheduler, wait, execute-command, HTTP, SSH, SQL, AC2, bridge, tunnel, member create/update/delete, or AutoCount write nodes. The AutoCount host receives no inbound connection: the operator copies the one sanitized recovery result file into /home/node/.n8n-files/ manually. Original Gate 4 and recovery artifacts stay byte-for-byte unchanged. The Sheet update matches on the stable non-PII marker Gate5AApprovedForMapping (never on row_number alone) and mapping success is reported only after post-write read-back verification of the persisted row. READY_FOR_CREATE_REVIEW stays review-only and reviewer_status stays UNREVIEWED; no state authorizes member creation.",
         "height": 240,
         "width": 480,
         "color": 4
@@ -311,6 +361,28 @@
       "main": [
         [
           {
+            "node": "Re-Read Mapped Row For Verification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Re-Read Mapped Row For Verification": {
+      "main": [
+        [
+          {
+            "node": "Verify Persisted Mapping Strictly",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verify Persisted Mapping Strictly": {
+      "main": [
+        [
+          {
             "node": "Emit Aggregate Evidence Only",
             "type": "main",
             "index": 0
@@ -331,6 +403,6 @@
     "templateCredsSetupCompleted": false
   },
   "nodeGroups": [],
-  "versionId": "b4a1f6c2-5d3e-4f7a-8b9c-0d1e2f3a4b5c",
+  "versionId": "c5b2a7d3-6e4f-4a8b-9c0d-1e2f3a4b5c6d",
   "sourceWorkflowId": null
 }

@@ -284,11 +284,25 @@ def run_verify_code(rows, result):
     )
 
 
-def run_evidence_code(verify_output):
+def run_persisted_code(rows, result, intended):
+    return run_node_code(
+        "Verify Persisted Mapping Strictly",
+        rows,
+        node_outputs={
+            "Validate Copied Sanitized Result Strictly": result,
+            "Verify Identity And Decide Mapping": intended,
+        },
+    )
+
+
+def run_evidence_code(verify_output, persisted_output=None):
+    node_outputs = {"Verify Identity And Decide Mapping": verify_output}
+    if persisted_output is not None:
+        node_outputs["Verify Persisted Mapping Strictly"] = persisted_output
     return run_node_code(
         "Emit Aggregate Evidence Only",
         [{}],
-        node_outputs={"Verify Identity And Decide Mapping": verify_output},
+        node_outputs=node_outputs,
     )
 
 
@@ -592,16 +606,40 @@ class Gate5AWorkflowTemplateTests(unittest.TestCase):
         sheets_nodes = [
             node for node in template["nodes"] if node["type"] == "n8n-nodes-base.googleSheets"
         ]
-        self.assertEqual(len(sheets_nodes), 2)
+        self.assertEqual(len(sheets_nodes), 3)
         for node in sheets_nodes:
             self.assertEqual(node["parameters"]["documentId"], {"__rl": True, "value": "", "mode": "list"})
             self.assertEqual(node["parameters"]["sheetName"], {"__rl": True, "value": "", "mode": "list"})
 
-        read_node = next(node for node in sheets_nodes if "operation" not in node["parameters"])
-        self.assertEqual(
-            read_node["parameters"]["filtersUI"],
-            {"values": [{"lookupColumn": "Gate5AApprovedForMapping", "lookupValue": "YES"}]},
+        read_nodes = [node for node in sheets_nodes if "operation" not in node["parameters"]]
+        self.assertEqual(len(read_nodes), 2)
+        for node in read_nodes:
+            self.assertEqual(
+                node["parameters"]["filtersUI"],
+                {"values": [{"lookupColumn": "Gate5AApprovedForMapping", "lookupValue": "YES"}]},
+            )
+
+        reread_node = next(
+            node for node in read_nodes if node["name"] == "Re-Read Mapped Row For Verification"
         )
+        # All-match behaviour is explicitly retained on the post-write read-back.
+        self.assertEqual(reread_node["parameters"]["options"], {"returnFirstMatch": False})
+
+    def test_template_update_node_matches_on_stable_marker_not_row_number(self):
+        template = load_template()
+        update_node = next(
+            node
+            for node in template["nodes"]
+            if node["type"] == "n8n-nodes-base.googleSheets"
+            and node["parameters"].get("operation") == "update"
+        )
+        columns = update_node["parameters"]["columns"]
+        # The physical update selector is the stable non-PII operator marker; virtual
+        # row_number is identity evidence only and never the update match key.
+        self.assertEqual(columns["matchingColumns"], ["Gate5AApprovedForMapping"])
+        self.assertNotEqual(columns["matchingColumns"], ["row_number"])
+        self.assertNotIn("row_number", columns["value"])
+        self.assertEqual(columns["value"]["Gate5AApprovedForMapping"], "YES")
 
     def test_template_update_node_writes_only_controlled_review_columns(self):
         template = load_template()
@@ -613,12 +651,14 @@ class Gate5AWorkflowTemplateTests(unittest.TestCase):
         )
         columns = update_node["parameters"]["columns"]
         self.assertEqual(columns["mappingMode"], "defineBelow")
-        self.assertEqual(columns["matchingColumns"], ["row_number"])
         self.assertEqual(columns["schema"], [])
         self.assertEqual(update_node["parameters"]["options"], {"cellFormat": "RAW"})
 
+        # The match column is mapped only as the lookup value; the verified live v4.7
+        # implementation never rewrites the match column itself, so the written set
+        # stays the controlled review/status columns.
         written_columns = set(columns["value"].keys())
-        self.assertEqual(written_columns, set(REVIEW_COLUMNS) | {"row_number"})
+        self.assertEqual(written_columns, set(REVIEW_COLUMNS) | {"Gate5AApprovedForMapping"})
 
         for forbidden_column in [
             "Full Name",
@@ -629,6 +669,7 @@ class Gate5AWorkflowTemplateTests(unittest.TestCase):
             "PDPA Acknowledged",
             "uat_lookup_queued_at",
             "reviewer_decision_code",
+            "row_number",
         ]:
             self.assertNotIn(forbidden_column, written_columns)
 
@@ -662,10 +703,22 @@ class Gate5AWorkflowTemplateTests(unittest.TestCase):
                 ]
             },
             "Update Approved Review Fields Only": {
+                "main": [[{"node": "Re-Read Mapped Row For Verification", "type": "main", "index": 0}]]
+            },
+            "Re-Read Mapped Row For Verification": {
+                "main": [[{"node": "Verify Persisted Mapping Strictly", "type": "main", "index": 0}]]
+            },
+            "Verify Persisted Mapping Strictly": {
                 "main": [[{"node": "Emit Aggregate Evidence Only", "type": "main", "index": 0}]]
             },
         }
         self.assertEqual(template["connections"], expected)
+        # The fresh-apply branch can only reach the evidence node through the
+        # post-write read-back and persisted-state verification nodes.
+        self.assertNotIn(
+            {"node": "Emit Aggregate Evidence Only", "type": "main", "index": 0},
+            template["connections"]["Update Approved Review Fields Only"]["main"][0],
+        )
 
     def test_template_has_no_forbidden_write_tokens_or_ac2_reach(self):
         template_text = TEMPLATE.read_text(encoding="utf-8")
@@ -936,24 +989,128 @@ class Gate5AVerifyCodeTests(unittest.TestCase):
         self.assertEqual(completed["error"], "gate5a_result_does_not_match_approved_source_row")
 
 
+def intended_output(decision="apply", mapped_state="READY_FOR_CREATE_REVIEW"):
+    return {
+        "gate5a_decision": decision,
+        "gate5a_mapped_state": mapped_state,
+        "row_number": 2,
+        "uat_lookup_job_id": expected_job_id(),
+        "uat_lookup_state": mapped_state,
+        "uat_lookup_status": "ok",
+        "uat_lookup_error_code": "",
+        "uat_lookup_warning_count": "0",
+        "uat_lookup_attempt": "0",
+        "uat_lookup_completed_at": "2026-07-14T10:00:00+00:00",
+        "reviewer_status": "UNREVIEWED",
+    }
+
+
+def persisted_output(mapped_state="READY_FOR_CREATE_REVIEW", **overrides):
+    output = {
+        "gate5a_persisted_verified": True,
+        "gate5a_decision": "apply",
+        "gate5a_mapped_state": mapped_state,
+    }
+    output.update(overrides)
+    return output
+
+
+class Gate5APersistedVerificationCodeTests(unittest.TestCase):
+    def test_exact_persisted_state_verifies(self):
+        completed = run_persisted_code([applied_source_row()], result_row(), intended_output())
+        self.assertTrue(completed["ok"], completed)
+        output = completed["result"][0]["json"]
+        self.assertEqual(
+            output,
+            {
+                "gate5a_persisted_verified": True,
+                "gate5a_decision": "apply",
+                "gate5a_mapped_state": "READY_FOR_CREATE_REVIEW",
+            },
+        )
+        serialized = json.dumps(output)
+        for forbidden in [expected_job_id(), "gate4a_fnv1a", "2026-07-14", "111111", "row_number"]:
+            self.assertNotIn(forbidden, serialized)
+
+    def test_zero_or_multiple_postwrite_rows_fail_closed(self):
+        for rows in [[], [applied_source_row(), applied_source_row(row_number=3)]]:
+            completed = run_persisted_code(rows, result_row(), intended_output())
+            self.assertFalse(completed["ok"], completed)
+            self.assertEqual(
+                completed["error"], "gate5a_postwrite_requires_exactly_one_approved_source_row"
+            )
+
+    def test_postwrite_identity_mismatch_fails_closed(self):
+        # A different physical row now carries the marker: recomputed canonical
+        # identity no longer matches the sanitized result.
+        completed = run_persisted_code(
+            [applied_source_row(**{"AutoCount MemberNo": "222222"})],
+            result_row(),
+            intended_output(),
+        )
+        self.assertFalse(completed["ok"], completed)
+        self.assertEqual(completed["error"], "gate5a_postwrite_identity_verification_failed")
+
+    def test_postwrite_row_number_drift_fails_closed(self):
+        # Row reorder/insertion drift changes the virtual row number, which changes
+        # the recomputed canonical identity; the drifted row is never accepted.
+        completed = run_persisted_code(
+            [applied_source_row(row_number=3)], result_row(), intended_output()
+        )
+        self.assertFalse(completed["ok"], completed)
+        self.assertEqual(completed["error"], "gate5a_postwrite_identity_verification_failed")
+
+    def test_postwrite_invalid_source_values_fail_closed(self):
+        cases = [
+            applied_source_row(**{"AutoCount MemberNo": "ABC123"}),
+            applied_source_row(**{"PDPA Acknowledged": "No"}),
+            applied_source_row(row_number=""),
+        ]
+        for row in cases:
+            completed = run_persisted_code([row], result_row(), intended_output())
+            self.assertFalse(completed["ok"], row)
+            self.assertEqual(completed["error"], "gate5a_postwrite_identity_verification_failed")
+
+    def test_partial_or_wrong_persisted_review_fields_fail_closed(self):
+        wrong_rows = [
+            applied_source_row(uat_lookup_job_id=""),
+            applied_source_row(uat_lookup_job_id="gate4a_fnv1a_deadbeef"),
+            applied_source_row(uat_lookup_state="EXISTING_MEMBER_REVIEW"),
+            applied_source_row(uat_lookup_status="error"),
+            applied_source_row(uat_lookup_error_code="runtimeexception"),
+            applied_source_row(uat_lookup_warning_count="1"),
+            applied_source_row(uat_lookup_attempt="1"),
+            applied_source_row(uat_lookup_completed_at="2026-07-14T12:34:56+00:00"),
+            applied_source_row(uat_lookup_completed_at=""),
+            applied_source_row(reviewer_status=""),
+            applied_source_row(reviewer_status="REVIEWED_NO_CREATE_APPROVAL"),
+        ]
+        for row in wrong_rows:
+            completed = run_persisted_code([row], result_row(), intended_output())
+            self.assertFalse(completed["ok"], row)
+            self.assertEqual(completed["error"], "gate5a_postwrite_persisted_state_mismatch", row)
+
+    def test_missing_review_column_after_write_fails_closed(self):
+        row = applied_source_row()
+        row.pop("uat_lookup_state")
+        completed = run_persisted_code([row], result_row(), intended_output())
+        self.assertFalse(completed["ok"], completed)
+        self.assertEqual(completed["error"], "gate5a_postwrite_persisted_state_mismatch")
+
+    def test_already_applied_branch_never_reaches_postwrite_verification(self):
+        completed = run_persisted_code(
+            [applied_source_row()], result_row(), intended_output(decision="already_applied")
+        )
+        self.assertFalse(completed["ok"], completed)
+        self.assertEqual(completed["error"], "gate5a_postwrite_unexpected_branch")
+
+
 class Gate5AEvidenceCodeTests(unittest.TestCase):
     def verify_output(self, decision="apply", mapped_state="READY_FOR_CREATE_REVIEW"):
-        return {
-            "gate5a_decision": decision,
-            "gate5a_mapped_state": mapped_state,
-            "row_number": 2,
-            "uat_lookup_job_id": expected_job_id(),
-            "uat_lookup_state": mapped_state,
-            "uat_lookup_status": "ok",
-            "uat_lookup_error_code": "",
-            "uat_lookup_warning_count": "0",
-            "uat_lookup_attempt": "0",
-            "uat_lookup_completed_at": "2026-07-14T10:00:00+00:00",
-            "reviewer_status": "UNREVIEWED",
-        }
+        return intended_output(decision=decision, mapped_state=mapped_state)
 
     def test_fresh_apply_evidence_shape_is_exact_and_aggregate_only(self):
-        completed = run_evidence_code(self.verify_output())
+        completed = run_evidence_code(self.verify_output(), persisted_output())
         self.assertTrue(completed["ok"], completed)
         evidence = completed["result"][0]["json"]
 
@@ -1001,7 +1158,9 @@ class Gate5AEvidenceCodeTests(unittest.TestCase):
             "READY_FOR_CREATE_REVIEW": "mapped_ready_for_create_review_count",
         }
         for state, counter in counters.items():
-            completed = run_evidence_code(self.verify_output(mapped_state=state))
+            completed = run_evidence_code(
+                self.verify_output(mapped_state=state), persisted_output(mapped_state=state)
+            )
             evidence = completed["result"][0]["json"]
             for other_state, other_counter in counters.items():
                 self.assertEqual(
@@ -1016,6 +1175,39 @@ class Gate5AEvidenceCodeTests(unittest.TestCase):
         completed = run_evidence_code(self.verify_output(mapped_state="CREATED"))
         self.assertFalse(completed["ok"], completed)
         self.assertEqual(completed["error"], "gate5a_unexpected_mapped_state")
+
+    def test_success_evidence_is_unreachable_without_persisted_verification(self):
+        # Fresh-apply evidence without the post-write verification node having run at
+        # all: referencing the node fails, so success evidence can never be emitted.
+        completed = run_evidence_code(self.verify_output())
+        self.assertFalse(completed["ok"], completed)
+        self.assertEqual(
+            completed["error"], "missing_node_output_Verify Persisted Mapping Strictly"
+        )
+
+    def test_success_evidence_requires_exact_persisted_confirmation(self):
+        cases = [
+            persisted_output(gate5a_persisted_verified=False),
+            persisted_output(gate5a_decision="already_applied"),
+            persisted_output(mapped_state="EXISTING_MEMBER_REVIEW"),
+        ]
+        for persisted in cases:
+            completed = run_evidence_code(self.verify_output(), persisted)
+            self.assertFalse(completed["ok"], persisted)
+            self.assertEqual(
+                completed["error"],
+                "gate5a_success_evidence_requires_persisted_verification",
+                persisted,
+            )
+
+    def test_already_applied_branch_stays_zero_write_and_needs_no_postwrite_node(self):
+        # No persisted output is provided: the already_applied branch must not
+        # reference the post-write verification node at all.
+        completed = run_evidence_code(self.verify_output(decision="already_applied"))
+        self.assertTrue(completed["ok"], completed)
+        evidence = completed["result"][0]["json"]
+        self.assertEqual(evidence["mapping_success_count"], 0)
+        self.assertEqual(evidence["mapping_already_applied_count"], 1)
 
 
 class Gate5AWiringAndDocsTests(unittest.TestCase):
@@ -1070,6 +1262,34 @@ class Gate5AWiringAndDocsTests(unittest.TestCase):
             runbook,
         )
         self.assertIn("`reviewer_status = UNREVIEWED`", runbook)
+
+    def test_runbook_documents_match_key_and_postwrite_verification(self):
+        runbook = self.read(RUNBOOK)
+        self.assertIn("## Sheet Update Match Key", runbook)
+        self.assertIn("## Post-Write Persisted-State Verification", runbook)
+        for phrase in [
+            "Match column: `Gate5AApprovedForMapping`, match value `YES`",
+            "never the physical update selector",
+            "uses only the first `matchingColumns` entry",
+            "no atomic multiple-column match exists",
+            "never rewritten",
+            "zero matches produce zero cell updates and zero output items",
+            "all-match behaviour explicitly retained (`returnFirstMatch` disabled)",
+            "exactly one returned approved row",
+            "`reviewer_status = UNREVIEWED`",
+            "`mapping_success_count = 1` only after that persisted-state verification passes",
+            "unreachable without it",
+            "`mapping_success_count = 0` with `mapping_already_applied_count = 1`",
+        ]:
+            self.assertIn(phrase, runbook)
+
+        failure_section = runbook.split("### If The Update Ran But Read-Back Verification Fails", 1)[1]
+        for phrase in [
+            "No rollback, no automated repair, and no automatic second update",
+            "never cleared, modified",
+            "sanitized error code only",
+        ]:
+            self.assertIn(phrase, failure_section)
 
     def test_runbook_keeps_review_only_boundaries_and_stop_conditions(self):
         runbook = self.read(RUNBOOK)

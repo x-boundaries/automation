@@ -16,7 +16,8 @@ one existing sanitized Gate 4 recovery durable result (AutoCount host, unchanged
   -> reads exactly one approved source row from Google Sheets
   -> rebuilds the canonical Gate 4A identity and requires exactly one match
   -> updates controlled review/status columns only (reviewer_status stays UNREVIEWED)
-  -> emits aggregate-only evidence and stops
+  -> re-reads the approved row and verifies the exact persisted state
+  -> emits aggregate-only evidence (success only after persisted-state verification) and stops
 ```
 
 The AutoCount host receives no inbound network connection, webhook, callback, tunnel, or n8n command at any point. Every transfer is an operator-performed outbound manual copy. The original Gate 4 queue, results, markers, recovery claim, and recovery result artifacts remain byte-for-byte unchanged; the workflow and precheck open only the staging copies read-only.
@@ -51,6 +52,8 @@ The workflow is inactive/manual. It contains:
 - `Verify Identity And Decide Mapping`
 - `Apply Only Fresh Mapping`
 - `Update Approved Review Fields Only`
+- `Re-Read Mapped Row For Verification`
+- `Verify Persisted Mapping Strictly`
 - `Emit Aggregate Evidence Only`
 
 The Google Sheets credential, document, and sheet/tab must be selected in the n8n UI on both Google Sheets nodes, and both must point at the same source tab. The committed template keeps the document and sheet resource locators empty/unbound and ships a safe non-PII filter of `Gate5AApprovedForMapping = YES` on the read node. Do not commit or paste credential IDs, Sheet IDs, Sheet URLs, resource locator values, screenshots, node execution payloads, node raw input/output, or workflow exports containing credentials. Keep raw live exports outside the repository.
@@ -105,6 +108,40 @@ The workflow never updates a row based only on a row number. It rebuilds the can
 - `attempt = 0`
 
 Zero matches, more than one filtered source row, or any field mismatch refuses with no Sheet write. Raw form values are used in n8n execution memory only for this recomputation; they are never logged, returned, printed, pinned, committed, or included in any evidence, and saved execution data stays disabled.
+
+## Sheet Update Match Key
+
+The actual Update Row operation locates the physical row with the stable non-PII operator marker, not the virtual row number:
+
+- Match column: `Gate5AApprovedForMapping`, match value `YES` (the same marker the read filter uses, maintained on exactly one row).
+- Virtual `row_number` remains a verified identity property (it is part of the recomputed canonical `job_id`) and internal evidence input, but it is never the physical update selector. Rows inserted, removed, or reordered between the read and the update therefore cannot silently redirect the write to a different physical row: the write follows the marker, and the post-write verification below re-proves the marked row's canonical identity.
+- Verified against the live installed Google Sheets v4.7 implementation (n8n `2.29.8`): the update operation uses only the first `matchingColumns` entry (no atomic multiple-column match exists, so none is claimed or depended on), it locates the first row whose match-column cell equals the mapped match value, the match column itself is only used to find the row and is never rewritten, and zero matches produce zero cell updates and zero output items, so the evidence node never runs and no success evidence can be emitted.
+
+Do not add any other helper column for matching. No PII-bearing column may ever be used as a match key.
+
+## Post-Write Persisted-State Verification
+
+On the fresh-apply branch the workflow never reports success from the update node alone. After `Update Approved Review Fields Only`:
+
+1. `Re-Read Mapped Row For Verification` performs a second Google Sheets Get Row(s) with the same unbound document and sheet selectors, the same `Gate5AApprovedForMapping = YES` filter, and all-match behaviour explicitly retained (`returnFirstMatch` disabled).
+2. `Verify Persisted Mapping Strictly` then requires, from the persisted Sheet state alone:
+   - exactly one returned approved row (zero, duplicate, or drifted markers are terminal);
+   - the full canonical Gate 4A identity rebuilt from that persisted row still matches the sanitized result on every shared safe identity field;
+   - every controlled review/status field holds exactly the intended value: `uat_lookup_job_id`, `uat_lookup_state`, `uat_lookup_status`, `uat_lookup_error_code`, `uat_lookup_warning_count`, `uat_lookup_attempt`, `uat_lookup_completed_at`, and `reviewer_status = UNREVIEWED`;
+   - no partial, missing, blank, mismatched, or conflicting value in any of those fields.
+3. `Emit Aggregate Evidence Only` reports `mapping_success_count = 1` only after that persisted-state verification passes; the evidence node structurally requires the verification node's output on the fresh-apply branch, so successful aggregate evidence is unreachable without it.
+
+The exact-rerun `already_applied` branch remains zero-write: it skips the update and the post-write read-back entirely, keeps its existing pre-read exact-state validation, and reports `mapping_success_count = 0` with `mapping_already_applied_count = 1`.
+
+### If The Update Ran But Read-Back Verification Fails
+
+This is a terminal stop condition requiring manual review, never automated recovery:
+
+- The workflow fails closed with a sanitized error code only (no row values, IDs, hashes, timestamps, or PII in errors or output).
+- No mapping success is claimed and no aggregate success evidence is emitted.
+- No rollback, no automated repair, and no automatic second update is attempted.
+- Original Gate 4 and recovery artifacts are never cleared, modified, or "fixed".
+- The operator stops, records the sanitized error code only, and requests review before anything further happens.
 
 ## Mapping Rules
 
@@ -234,7 +271,7 @@ final_write_automation = false
 no_row_values_printed = true
 ```
 
-For the current recorded recovery evidence the expected successful first run shows `mapping_success_count = 1`, `mapped_ready_for_create_review_count = 1`, and `reviewer_status_unreviewed_count = 1`.
+For the current recorded recovery evidence the expected successful first run shows `mapping_success_count = 1`, `mapped_ready_for_create_review_count = 1`, and `reviewer_status_unreviewed_count = 1`. `mapping_success_count = 1` is emitted only after the post-write persisted-state verification confirms the exact intended values on the identity-verified row.
 
 ## Stop Conditions
 
@@ -247,6 +284,7 @@ Stop immediately if any of these occur:
 - Zero or more than one source row carries `Gate5AApprovedForMapping = YES`.
 - Any required review/status column is missing (add the missing headers manually, then rerun; never let the workflow create columns).
 - The identity match fails, or a conflicting prior mapping is present.
+- The update node ran but the post-write read-back verification disagrees with the intended persisted state (zero, duplicate, drifted, partial, mismatched, or conflicting read-back). Stop, record the sanitized error code only, and request manual review; never rerun the update automatically, never roll back, and never edit any artifact or Sheet value to "repair" the state.
 - Any state would be written other than the four review states, or any reviewer value other than `UNREVIEWED`.
 - Raw values, encoded/decoded/normalized member values, names, emails, birthdays, phone/member numbers, job IDs, hashes, timestamps, Sheet IDs/URLs, credential IDs, tokens, command output, screenshots, node raw input/output, execution payloads, secrets, connection strings, or PII appear in logs, evidence, docs, screenshots, or PR text.
 - Any member create/update/delete, AutoCount write, direct SQL, or reviewer auto-approval path appears.
