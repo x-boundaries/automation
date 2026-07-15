@@ -187,6 +187,13 @@ Do not run live n8n, Docker, import/export, sync, activation, execution, publish
 - For this repository, the generic hyphenated filename example in the portable playbook is illustrative only and does not override the established local convention.
 - `n8n-workflows/README.md` is the directory-level source of truth for workflow names and their associated runbooks.
 
+### n8n local runtime state
+
+- `.n8n/` and `.n8n-local/` are local n8n runtime state. They may contain databases, credentials, configuration, execution history, or other private operational data.
+- They must never be committed, staged for publication, copied into workflow exports, or treated as source-controlled workflow definitions.
+- Agents must not inspect or print their contents unless a separate explicit current-turn request safely authorises a bounded local diagnostic.
+- Source-controlled workflow definitions belong only under `n8n-workflows/`.
+
 ### n8n skill routing
 
 - Agents should load the host-qualified installed Toolkit skill equivalent to `n8n-agent-rules` (for example `ai-agent-toolkit:n8n-agent-rules`), plus the smallest relevant official `n8n-skills:*` skill set. Host-specific naming may differ.

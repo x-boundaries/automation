@@ -35,6 +35,7 @@ Workflow JSON in this directory is source-controlled evidence of workflow design
 - Real credentials, credential IDs, Sheet IDs, cached selectors, private execution data, and live exports remain local and uncommitted.
 - The approved local container file area is `/home/node/.n8n-files/`, where the relevant runbook permits it.
 - Original Gate 4 and recovery evidence must not be modified, moved, deleted, renamed, truncated, or overwritten.
+- `.n8n/` and `.n8n-local/` are local n8n runtime state (databases, credentials, configuration, execution history). They are git-ignored, must never be committed or copied into workflow exports, and are not source-controlled workflow definitions. Agents must not inspect or print their contents without a separate explicit current-turn request authorising a bounded local diagnostic. Source-controlled workflow definitions belong only in this directory.
 
 ## Helper Scripts
 
