@@ -192,6 +192,7 @@ member_lookup_bridge_gate4_recovery1_attempt_started.json
 member_lookup_bridge_gate4_recovery1_results.jsonl
 member_lookup_bridge_gate4_recovery1_processed/
 member_lookup_bridge_gate4_recovery1_failed/
+member_lookup_bridge_gate5a_result_copy.jsonl
 PRIVATE_DO_NOT_COMMIT_MEMBER_LOOKUP_BRIDGE.txt
 autocount_outputs/**/member_lookup_bridge_fixture_jobs.jsonl
 autocount_outputs/**/member_lookup_bridge_mock_results.jsonl
@@ -219,6 +220,7 @@ autocount_outputs/**/member_lookup_bridge_gate4_recovery1_attempt_started.json
 autocount_outputs/**/member_lookup_bridge_gate4_recovery1_results.jsonl
 autocount_outputs/**/member_lookup_bridge_gate4_recovery1_processed/
 autocount_outputs/**/member_lookup_bridge_gate4_recovery1_failed/
+autocount_outputs/**/member_lookup_bridge_gate5a_result_copy.jsonl
 autocount_outputs/**/PRIVATE_DO_NOT_COMMIT_MEMBER_LOOKUP_BRIDGE.txt
 
 # Private local AC2 member extracts and form response exports must never be committed

@@ -1,0 +1,336 @@
+{
+  "id": "gate5aResultMap01",
+  "name": "Gate 5A - Map one sanitized recovery result to review fields",
+  "active": false,
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "6f3f6f4a-1a58-4d4c-9d5e-9a0d3f5a5a01",
+      "name": "Manual Gate 5A Run",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -1104,
+        128
+      ]
+    },
+    {
+      "parameters": {
+        "fileSelector": "/home/node/.n8n-files/member_lookup_bridge_gate5a_result_copy.jsonl",
+        "options": {}
+      },
+      "id": "2b6f0a9e-7c4f-4f8f-8f4b-2d3f5a5a5a02",
+      "name": "Read Copied Sanitized Recovery Result",
+      "type": "n8n-nodes-base.readWriteFile",
+      "typeVersion": 1.1,
+      "position": [
+        -880,
+        128
+      ],
+      "notesInFlow": true,
+      "notes": "Reads only the operator-copied sanitized Gate 4 recovery result staging file inside the n8n container. /home/node/.n8n-files is the n8n-approved file-access location. The operator copies the file in manually with docker compose cp; the workflow never contacts the AutoCount host and never modifies the file."
+    },
+    {
+      "parameters": {
+        "operation": "text",
+        "binaryPropertyName": "data",
+        "destinationKey": "data",
+        "options": {}
+      },
+      "id": "3c7f1b8d-8d5f-4a9f-9a5c-3e4f6b6b6b03",
+      "name": "Extract Result Text",
+      "type": "n8n-nodes-base.extractFromFile",
+      "typeVersion": 1.1,
+      "position": [
+        -656,
+        128
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const ALLOWED_RESULT_FIELDS = [\n  'job_id', 'intake_source', 'source_reference', 'source_row_ref', 'row_number',\n  'state', 'status', 'authentication_success', 'user_session_available',\n  'member_command_found', 'get_member_found', 'submitted_member_no_status',\n  'normalized_member_no_length', 'member_exists', 'member_found_by',\n  'manual_review_required', 'warning_count', 'error_code', 'consent_status',\n  'pdpa_status', 'attempt', 'dry_run_only', 'final_write_automation',\n  'result_created_at', 'result_applied_at'\n];\nconst FORBIDDEN_RESULT_FIELDS = [\n  'member_no', 'member_number', 'normalized_member_no', 'decoded_member_no',\n  'raw_member_no', 'submitted_member_no_base64_utf8', 'payload_hash', 'intake_id',\n  'name', 'full_name', 'email', 'email_address', 'phone', 'mobile',\n  'raw_phone_number', 'dob', 'birthday', 'birthday_month', 'address', 'server',\n  'database', 'user', 'password', 'connection_string', 'stderr', 'stdout',\n  'token', 'secret', 'sheet_id', 'sheet_url', 'document_id', 'command',\n  'command_text', 'payload'\n];\nconst ALLOWED_MEMBER_STATUS_LABELS = [\n  null, 'canonical_65_mobile', 'already_65_mobile', 'manual_review', 'invalid_too_long'\n];\nconst SUCCESS_STATES = ['EXISTING_MEMBER_REVIEW', 'MANUAL_REVIEW_REQUIRED', 'READY_FOR_CREATE_REVIEW'];\nconst ALL_STATES = SUCCESS_STATES.concat(['LOOKUP_ERROR_REVIEW']);\nconst CANONICAL_SOURCE_LABEL = 'google_sheets_uat_gate4a';\nconst CANONICAL_JOB_ID_RE = /^gate4a_fnv1a_[0-9a-f]{8}$/;\nconst SAFE_ERROR_CODE_RE = /^[a-z0-9_]{1,64}$/;\nconst SAFE_TIMESTAMP_RE = /^[0-9T:+.Z-]{1,64}$/;\nconst SAFE_ID_RE = /^[A-Za-z0-9_.:-]{1,128}$/;\n\nconst isBool = (value) => typeof value === 'boolean';\nconst isInt = (value) => Number.isInteger(value) && typeof value === 'number';\n\nconst items = $input.all();\nif (items.length !== 1) throw new Error('gate5a_expected_one_extracted_text_item');\nconst text = items[0].json.data;\nif (typeof text !== 'string' || !text.trim()) throw new Error('gate5a_result_copy_empty');\nconst lines = text.split(/\\r?\\n/).filter((line) => line.trim());\nif (lines.length !== 1) throw new Error('gate5a_result_copy_must_contain_exactly_one_row');\n\nlet result;\ntry {\n  result = JSON.parse(lines[0]);\n} catch (error) {\n  throw new Error('gate5a_result_copy_malformed_json');\n}\nif (!result || typeof result !== 'object' || Array.isArray(result)) {\n  throw new Error('gate5a_result_copy_not_a_single_object');\n}\n\nconst keys = Object.keys(result);\nif (keys.some((key) => FORBIDDEN_RESULT_FIELDS.includes(key))) {\n  throw new Error('gate5a_result_forbidden_field_present');\n}\nif (ALLOWED_RESULT_FIELDS.some((field) => !keys.includes(field))) {\n  throw new Error('gate5a_result_required_field_missing');\n}\nif (keys.some((key) => !ALLOWED_RESULT_FIELDS.includes(key))) {\n  throw new Error('gate5a_result_unexpected_field_present');\n}\n\nconst invalid = () => new Error('gate5a_result_field_types_invalid');\nif (typeof result.job_id !== 'string' || !SAFE_ID_RE.test(result.job_id) || !CANONICAL_JOB_ID_RE.test(result.job_id)) throw invalid();\nif (result.intake_source !== CANONICAL_SOURCE_LABEL) throw invalid();\nif (result.source_reference !== CANONICAL_SOURCE_LABEL) throw invalid();\nif (!isInt(result.row_number) || result.row_number < 1) throw invalid();\nif (result.source_row_ref !== `row_${result.row_number}`) throw invalid();\nif (!ALL_STATES.includes(result.state)) throw new Error('gate5a_result_state_unrecognised');\nif (!['ok', 'error', 'refused'].includes(result.status)) throw new Error('gate5a_result_status_unrecognised');\nfor (const flag of ['authentication_success', 'user_session_available', 'member_command_found', 'get_member_found', 'member_exists', 'manual_review_required']) {\n  if (!isBool(result[flag])) throw invalid();\n}\nif (!ALLOWED_MEMBER_STATUS_LABELS.includes(result.submitted_member_no_status)) throw invalid();\nif (!isInt(result.normalized_member_no_length) || result.normalized_member_no_length < 0) throw invalid();\nif (result.member_found_by !== null && (typeof result.member_found_by !== 'string' || !SAFE_ID_RE.test(result.member_found_by))) throw invalid();\nif (!isInt(result.warning_count) || result.warning_count < 0) throw invalid();\nif (result.error_code !== null && (typeof result.error_code !== 'string' || !SAFE_ERROR_CODE_RE.test(result.error_code))) throw invalid();\nif (result.consent_status !== 'marketing_consent_not_queued') throw invalid();\nif (result.pdpa_status !== 'yes') throw invalid();\nif (result.attempt !== 0 || !isInt(result.attempt)) throw invalid();\nif (typeof result.result_created_at !== 'string' || !SAFE_TIMESTAMP_RE.test(result.result_created_at)) throw invalid();\nif (result.dry_run_only !== true) throw new Error('gate5a_result_dry_run_only_must_be_true');\nif (result.final_write_automation !== false) throw new Error('gate5a_result_final_write_automation_must_be_false');\nif (result.result_applied_at !== null) throw new Error('gate5a_result_applied_at_must_be_null');\n\n// Recompute the review state with the fixed worker precedence; never trust the string.\nlet computedState;\nif (result.status !== 'ok') computedState = 'LOOKUP_ERROR_REVIEW';\nelse if (result.manual_review_required === true || result.warning_count > 0) computedState = 'MANUAL_REVIEW_REQUIRED';\nelse if (result.member_exists === true) computedState = 'EXISTING_MEMBER_REVIEW';\nelse computedState = 'READY_FOR_CREATE_REVIEW';\nif (computedState !== result.state) throw new Error('gate5a_result_state_inconsistent');\nif (result.status === 'ok') {\n  if (result.error_code !== null) throw new Error('gate5a_result_state_inconsistent');\n  for (const flag of ['authentication_success', 'user_session_available', 'member_command_found', 'get_member_found']) {\n    if (result[flag] !== true) throw new Error('gate5a_result_state_inconsistent');\n  }\n} else {\n  if (result.error_code === null) throw new Error('gate5a_result_state_inconsistent');\n}\n\nreturn [{ json: result }];"
+      },
+      "id": "4d8f2c9e-9e6f-4b8e-8b6d-4f5a7c7c7c04",
+      "name": "Validate Copied Sanitized Result Strictly",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -432,
+        128
+      ],
+      "notesInFlow": true,
+      "notes": "Fail-closed: accepts exactly one nonblank JSON object matching the exact durable Gate 4 result contract with canonical Gate 4A identity shape, dry_run_only true, final_write_automation false, and a recomputed review state. Throws on anything else without echoing values."
+    },
+    {
+      "parameters": {
+        "documentId": {
+          "__rl": true,
+          "value": "",
+          "mode": "list"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "",
+          "mode": "list"
+        },
+        "filtersUI": {
+          "values": [
+            {
+              "lookupColumn": "Gate5AApprovedForMapping",
+              "lookupValue": "YES"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "5e9f3d0f-0f7e-4c7d-9c7e-5a6b8d8d8d05",
+      "name": "Read One Approved Source Row",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        -208,
+        128
+      ],
+      "notesInFlow": true,
+      "notes": "Operator must select the real UAT spreadsheet, source tab, and Google credential in n8n UI. After binding, verify the Gate5AApprovedForMapping = YES filter is still present; add it manually if the import dropped it. Exactly one row may match. At typeVersion 4.7 the filter returns all matches by default so the downstream guard can require exactly one."
+    },
+    {
+      "parameters": {
+        "jsCode": "const SOURCE_LABEL = 'google_sheets_uat_gate4a';\nconst FIELD_ALIASES = {\n  name: ['Full Name', 'Name'],\n  memberNo: ['AutoCount MemberNo', 'Phone/Member Number', 'Phone Member Number', 'Phone Number', 'Member Number', 'Submitted Member Number', 'Submitted Member No', 'Mobile Number'],\n  email: ['Email Address', 'Email'],\n  birthdayMonth: ['Birthday Month', 'Birthday', 'Date of Birth', 'DOB'],\n  marketingConsent: ['Marketing Consent', 'consent_status', 'Consent Status'],\n  pdpa: ['PDPA Acknowledged', 'PDPA', 'PDPA Status'],\n  rowNumber: ['row_number', 'Row Number', 'RowNumber']\n};\nconst MONTH_NAMES = ['january', 'february', 'march', 'april', 'may', 'june', 'july', 'august', 'september', 'october', 'november', 'december'];\nconst REQUIRED_REVIEW_COLUMNS = [\n  'uat_lookup_job_id', 'uat_lookup_state', 'uat_lookup_status',\n  'uat_lookup_error_code', 'uat_lookup_warning_count', 'uat_lookup_attempt',\n  'uat_lookup_completed_at', 'reviewer_status'\n];\n\nconst result = $('Validate Copied Sanitized Result Strictly').first().json;\n\nconst items = $input.all();\nif (items.length !== 1) throw new Error('gate5a_requires_exactly_one_approved_source_row');\nconst row = items[0].json;\n\nfor (const column of REQUIRED_REVIEW_COLUMNS) {\n  if (!Object.prototype.hasOwnProperty.call(row, column)) {\n    throw new Error('gate5a_required_review_column_missing_add_review_columns_before_run');\n  }\n}\n\n// Rebuild the canonical Gate 4A queue identity from raw form values. Raw values stay\n// in this execution only: they are never returned, logged, or written anywhere.\nconst pick = (aliases) => {\n  for (const key of aliases) {\n    if (Object.prototype.hasOwnProperty.call(row, key)) return row[key];\n  }\n  return undefined;\n};\nconst clean = (value) => String(value ?? '').trim();\n\nconst requiredName = clean(pick(FIELD_ALIASES.name));\nconst submittedMemberNo = clean(pick(FIELD_ALIASES.memberNo));\nconst requiredEmail = clean(pick(FIELD_ALIASES.email));\nconst birthdayMonthRaw = clean(pick(FIELD_ALIASES.birthdayMonth));\nconst marketingConsentRaw = clean(pick(FIELD_ALIASES.marketingConsent));\nconst pdpaRaw = clean(pick(FIELD_ALIASES.pdpa));\nconst rowNumber = Number(pick(FIELD_ALIASES.rowNumber));\n\nif (!requiredName) throw new Error('gate5a_full_name_required');\nif (!requiredEmail) throw new Error('gate5a_email_address_required');\nif (!MONTH_NAMES.includes(birthdayMonthRaw.toLowerCase())) throw new Error('gate5a_birthday_month_must_be_valid_month_name');\nif (!/^[0-9]{6,20}$/.test(submittedMemberNo)) throw new Error('gate5a_autocount_member_no_must_be_6_to_20_digits');\nif (/imported/i.test(pdpaRaw)) throw new Error('gate5a_imported_pdpa_marker_blocked');\nif (pdpaRaw.toLowerCase() !== 'yes') throw new Error('gate5a_pdpa_must_be_yes');\nif (!Number.isInteger(rowNumber) || rowNumber < 1) throw new Error('gate5a_safe_row_number_required');\n\nconst dummySourceText = [requiredName, submittedMemberNo, requiredEmail, birthdayMonthRaw, marketingConsentRaw, pdpaRaw].join(' ').toLowerCase();\nif (/\\b(dummy|fixture|placeholder|rehearsal|sample|synthetic)\\b/.test(dummySourceText)) {\n  throw new Error('gate5a_source_row_must_be_real_non_dummy');\n}\n\nconst submittedMemberNoBase64 = Buffer.from(submittedMemberNo, 'utf8').toString('base64');\nconst sourceRowRef = `row_${rowNumber}`;\nconst intakeId = `gate4a_${sourceRowRef}`;\n\nconst fnv1a = (text) => {\n  let hash = 0x811c9dc5;\n  for (let index = 0; index < text.length; index += 1) {\n    hash ^= text.charCodeAt(index);\n    hash = Math.imul(hash, 0x01000193) >>> 0;\n  }\n  return hash.toString(16).padStart(8, '0');\n};\n\nconst payloadHash = `fnv1a_${fnv1a(JSON.stringify({\n  intake_source: SOURCE_LABEL,\n  source_reference: SOURCE_LABEL,\n  source_row_ref: sourceRowRef,\n  row_number: rowNumber,\n  intake_id: intakeId,\n  state: 'PENDING_LOOKUP',\n  submitted_member_no_base64_utf8: submittedMemberNoBase64,\n  pdpa_status: 'yes'\n}))}`;\nconst expectedJobId = `gate4a_${payloadHash}`;\n\n// Match every safe identity field shared by the durable result and the canonical\n// queue contract. A row number alone is never sufficient.\nconst identityMatches = (\n  result.job_id === expectedJobId\n  && result.intake_source === SOURCE_LABEL\n  && result.source_reference === SOURCE_LABEL\n  && result.source_row_ref === sourceRowRef\n  && result.row_number === rowNumber\n  && result.consent_status === 'marketing_consent_not_queued'\n  && result.pdpa_status === 'yes'\n  && result.attempt === 0\n);\nif (!identityMatches) throw new Error('gate5a_result_does_not_match_approved_source_row');\n\n// Strict mapping precedence, recomputed here as well.\nlet mappedState;\nif (result.status !== 'ok') mappedState = 'LOOKUP_ERROR_REVIEW';\nelse if (result.manual_review_required === true || result.warning_count > 0) mappedState = 'MANUAL_REVIEW_REQUIRED';\nelse if (result.member_exists === true) mappedState = 'EXISTING_MEMBER_REVIEW';\nelse mappedState = 'READY_FOR_CREATE_REVIEW';\nif (mappedState !== result.state) throw new Error('gate5a_result_state_inconsistent');\n\n// Idempotency: the row must be fully pre-mapping blank (apply) or exactly and\n// completely mapped with the same values (already_applied). Anything else refuses.\nconst cell = (name) => String(row[name] ?? '').trim();\nconst wouldWrite = {\n  uat_lookup_job_id: result.job_id,\n  uat_lookup_state: mappedState,\n  uat_lookup_status: result.status,\n  uat_lookup_error_code: result.error_code === null ? '' : String(result.error_code),\n  uat_lookup_warning_count: String(result.warning_count),\n  uat_lookup_attempt: String(result.attempt),\n  uat_lookup_completed_at: result.result_created_at,\n  reviewer_status: 'UNREVIEWED'\n};\nconst existingBlank = REQUIRED_REVIEW_COLUMNS.every((column) => cell(column) === '');\nconst existingExact = REQUIRED_REVIEW_COLUMNS.every((column) => cell(column) === String(wouldWrite[column]).trim());\n\nlet decision;\nif (existingBlank) decision = 'apply';\nelse if (existingExact) decision = 'already_applied';\nelse throw new Error('gate5a_conflicting_prior_mapping_refused');\n\nreturn [{\n  json: {\n    gate5a_decision: decision,\n    gate5a_mapped_state: mappedState,\n    row_number: rowNumber,\n    uat_lookup_job_id: wouldWrite.uat_lookup_job_id,\n    uat_lookup_state: wouldWrite.uat_lookup_state,\n    uat_lookup_status: wouldWrite.uat_lookup_status,\n    uat_lookup_error_code: wouldWrite.uat_lookup_error_code,\n    uat_lookup_warning_count: wouldWrite.uat_lookup_warning_count,\n    uat_lookup_attempt: wouldWrite.uat_lookup_attempt,\n    uat_lookup_completed_at: wouldWrite.uat_lookup_completed_at,\n    reviewer_status: wouldWrite.reviewer_status\n  }\n}];"
+      },
+      "id": "6a0f4e1a-1a8d-4d6c-8d8f-6b7c9e9e9e06",
+      "name": "Verify Identity And Decide Mapping",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        16,
+        128
+      ],
+      "notesInFlow": true,
+      "notes": "Rebuilds the canonical Gate 4A queue identity from the one approved source row (raw values in memory only, never output) and requires the sanitized result to match every shared safe identity field; a row number alone is never enough. Requires the controlled review columns to exist, requires a blank pre-mapping row or an exact prior application (already_applied), and refuses conflicts."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "7b1f5f2b-2b9e-4e5b-9e9a-7c8dfafafa07",
+              "leftValue": "={{ $json.gate5a_decision }}",
+              "rightValue": "apply",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "8c2f6a3c-3caf-4f4a-af0b-8d9e0b0b0b08",
+      "name": "Apply Only Fresh Mapping",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        240,
+        128
+      ],
+      "notesInFlow": true,
+      "notes": "True: fresh blank row, apply the controlled review/status update once. False: exact rerun (already_applied), skip the update entirely and emit evidence with zero writes."
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "documentId": {
+          "__rl": true,
+          "value": "",
+          "mode": "list"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "",
+          "mode": "list"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "row_number": "={{ $json.row_number }}",
+            "uat_lookup_job_id": "={{ $json.uat_lookup_job_id }}",
+            "uat_lookup_state": "={{ $json.uat_lookup_state }}",
+            "uat_lookup_status": "={{ $json.uat_lookup_status }}",
+            "uat_lookup_error_code": "={{ $json.uat_lookup_error_code }}",
+            "uat_lookup_warning_count": "={{ $json.uat_lookup_warning_count }}",
+            "uat_lookup_attempt": "={{ $json.uat_lookup_attempt }}",
+            "uat_lookup_completed_at": "={{ $json.uat_lookup_completed_at }}",
+            "reviewer_status": "={{ $json.reviewer_status }}"
+          },
+          "matchingColumns": [
+            "row_number"
+          ],
+          "schema": []
+        },
+        "options": {
+          "cellFormat": "RAW"
+        }
+      },
+      "id": "9d3f7b4d-4dbf-4a3b-bf1c-9e0f1c1c1c09",
+      "name": "Update Approved Review Fields Only",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        464,
+        32
+      ],
+      "notesInFlow": true,
+      "notes": "Updates only the controlled review/status columns on the one identity-verified row, matching on n8n's virtual row_number after identity verification. reviewer_status is always UNREVIEWED; no create-approved value exists in this workflow. Operator must bind the same document and tab as the read node in n8n UI. Cell format RAW so values are written as plain text."
+    },
+    {
+      "parameters": {
+        "jsCode": "const verify = $('Verify Identity And Decide Mapping').first().json;\nconst decision = verify.gate5a_decision;\nconst mappedState = verify.gate5a_mapped_state;\nif (decision !== 'apply' && decision !== 'already_applied') {\n  throw new Error('gate5a_unexpected_mapping_decision');\n}\nconst REVIEW_STATES = ['LOOKUP_ERROR_REVIEW', 'MANUAL_REVIEW_REQUIRED', 'EXISTING_MEMBER_REVIEW', 'READY_FOR_CREATE_REVIEW'];\nif (!REVIEW_STATES.includes(mappedState)) {\n  throw new Error('gate5a_unexpected_mapped_state');\n}\nreturn [{\n  json: {\n    status: 'ok',\n    gate: 'gate5a_manual_inactive_n8n_result_mapping',\n    runtime_location: 'local_operator_pc_non_ac2_n8n_stack',\n    execution_mode: 'manual_inactive_single_result_review_mapping_only',\n    input_result_row_count: 1,\n    result_schema_valid_count: 1,\n    source_rows_read_count: 1,\n    source_row_match_count: 1,\n    mapping_attempt_count: 1,\n    mapping_success_count: decision === 'apply' ? 1 : 0,\n    mapping_already_applied_count: decision === 'already_applied' ? 1 : 0,\n    mapping_error_count: 0,\n    mapped_lookup_error_review_count: mappedState === 'LOOKUP_ERROR_REVIEW' ? 1 : 0,\n    mapped_manual_review_required_count: mappedState === 'MANUAL_REVIEW_REQUIRED' ? 1 : 0,\n    mapped_existing_member_review_count: mappedState === 'EXISTING_MEMBER_REVIEW' ? 1 : 0,\n    mapped_ready_for_create_review_count: mappedState === 'READY_FOR_CREATE_REVIEW' ? 1 : 0,\n    reviewer_status_unreviewed_count: 1,\n    original_gate4_artifacts_modified: false,\n    autocount_lookup_invoked: false,\n    member_create_or_update_invoked: false,\n    autocount_write_attempted: false,\n    direct_sql_write_attempted: false,\n    workflow_activation: 'inactive',\n    scheduler_enabled: false,\n    public_inbound_to_ac2_host: false,\n    final_write_automation: false,\n    no_row_values_printed: true\n  }\n}];"
+      },
+      "id": "0e4f8c5e-5ecf-4b2a-8f2d-0f1a2d2d2d10",
+      "name": "Emit Aggregate Evidence Only",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        688,
+        128
+      ],
+      "notesInFlow": true,
+      "notes": "Emits the fixed aggregate-only Gate 5A evidence contract: statuses, counts, and hard-coded false write/activation flags. No IDs, hashes, row numbers, member values, timestamps, or source values."
+    },
+    {
+      "parameters": {
+        "content": "### Gate 5A Boundary\nManual inactive single-result review mapping only. Do not activate. Do not add webhook, scheduler, wait, execute-command, HTTP, SSH, SQL, AC2, bridge, tunnel, member create/update/delete, or AutoCount write nodes. The AutoCount host receives no inbound connection: the operator copies the one sanitized recovery result file into /home/node/.n8n-files/ manually. Original Gate 4 and recovery artifacts stay byte-for-byte unchanged. READY_FOR_CREATE_REVIEW stays review-only and reviewer_status stays UNREVIEWED; no state authorizes member creation.",
+        "height": 240,
+        "width": 480,
+        "color": 4
+      },
+      "id": "1f5a9d6f-6fdf-4c1b-9a3e-1a2b3e3e3e11",
+      "name": "Gate 5A Boundary",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -1120,
+        -192
+      ]
+    }
+  ],
+  "connections": {
+    "Manual Gate 5A Run": {
+      "main": [
+        [
+          {
+            "node": "Read Copied Sanitized Recovery Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Copied Sanitized Recovery Result": {
+      "main": [
+        [
+          {
+            "node": "Extract Result Text",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Result Text": {
+      "main": [
+        [
+          {
+            "node": "Validate Copied Sanitized Result Strictly",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Copied Sanitized Result Strictly": {
+      "main": [
+        [
+          {
+            "node": "Read One Approved Source Row",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read One Approved Source Row": {
+      "main": [
+        [
+          {
+            "node": "Verify Identity And Decide Mapping",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verify Identity And Decide Mapping": {
+      "main": [
+        [
+          {
+            "node": "Apply Only Fresh Mapping",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Apply Only Fresh Mapping": {
+      "main": [
+        [
+          {
+            "node": "Update Approved Review Fields Only",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Emit Aggregate Evidence Only",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update Approved Review Fields Only": {
+      "main": [
+        [
+          {
+            "node": "Emit Aggregate Evidence Only",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "none",
+    "saveDataSuccessExecution": "none",
+    "saveManualExecutions": false,
+    "saveExecutionProgress": false,
+    "binaryMode": "separate"
+  },
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "nodeGroups": [],
+  "versionId": "b4a1f6c2-5d3e-4f7a-8b9c-0d1e2f3a4b5c",
+  "sourceWorkflowId": null
+}
