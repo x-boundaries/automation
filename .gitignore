@@ -223,6 +223,10 @@ autocount_outputs/**/member_lookup_bridge_gate4_recovery1_failed/
 autocount_outputs/**/member_lookup_bridge_gate5a_result_copy.jsonl
 autocount_outputs/**/PRIVATE_DO_NOT_COMMIT_MEMBER_LOOKUP_BRIDGE.txt
 
+# Local n8n runtime state — never commit
+.n8n/
+.n8n-local/
+
 # Private local AC2 member extracts and form response exports must never be committed
 ac2_member_browse_extract*.csv
 ac2_member_browse_extract_summary*.json
