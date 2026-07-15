@@ -70,8 +70,8 @@
         },
         "sheetName": {
           "__rl": true,
-          "value": "",
-          "mode": "list"
+          "value": "REPLACE_WITH_SOURCE_TAB_NAME",
+          "mode": "name"
         },
         "filtersUI": {
           "values": [
@@ -92,7 +92,7 @@
         128
       ],
       "notesInFlow": true,
-      "notes": "Operator must select the real UAT spreadsheet, source tab, and Google credential in n8n UI. After binding, verify the Gate5AApprovedForMapping = YES filter is still present; add it manually if the import dropped it. Exactly one row may match. At typeVersion 4.7 the filter returns all matches by default so the downstream guard can require exactly one."
+      "notes": "Operator must select the Google credential and the real UAT spreadsheet in the n8n UI. The source tab is pre-set by name from the import copy (placeholder replaced before import); never re-select the tab inside the n8n UI, because a sheet-locator change makes the v4.7 editor reset dependent parameters. After binding, verify the Gate5AApprovedForMapping = YES filter is still present. Exactly one row may match. At typeVersion 4.7 the filter returns all matches by default so the downstream guard can require exactly one."
     },
     {
       "parameters": {
@@ -154,8 +154,8 @@
         },
         "sheetName": {
           "__rl": true,
-          "value": "",
-          "mode": "list"
+          "value": "REPLACE_WITH_SOURCE_TAB_NAME",
+          "mode": "name"
         },
         "columns": {
           "mappingMode": "defineBelow",
@@ -173,7 +173,172 @@
           "matchingColumns": [
             "Gate5AApprovedForMapping"
           ],
-          "schema": []
+          "schema": [
+            {
+              "id": "Timestamp",
+              "displayName": "Timestamp",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Full Name",
+              "displayName": "Full Name",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Mobile Number",
+              "displayName": "Mobile Number",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Email Address",
+              "displayName": "Email Address",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Birthday Month",
+              "displayName": "Birthday Month",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Marketing Consent  ",
+              "displayName": "Marketing Consent  ",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "PDPA Acknowledged",
+              "displayName": "PDPA Acknowledged",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Gate4AApprovedForLookup",
+              "displayName": "Gate4AApprovedForLookup",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Gate5AApprovedForMapping",
+              "displayName": "Gate5AApprovedForMapping",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "uat_lookup_job_id",
+              "displayName": "uat_lookup_job_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "uat_lookup_state",
+              "displayName": "uat_lookup_state",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "uat_lookup_status",
+              "displayName": "uat_lookup_status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "uat_lookup_error_code",
+              "displayName": "uat_lookup_error_code",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "uat_lookup_warning_count",
+              "displayName": "uat_lookup_warning_count",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "uat_lookup_attempt",
+              "displayName": "uat_lookup_attempt",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "uat_lookup_completed_at",
+              "displayName": "uat_lookup_completed_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "reviewer_status",
+              "displayName": "reviewer_status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "row_number",
+              "displayName": "row_number",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true,
+              "readOnly": true,
+              "removed": true
+            }
+          ]
         },
         "options": {
           "cellFormat": "RAW"
@@ -188,7 +353,7 @@
         32
       ],
       "notesInFlow": true,
-      "notes": "Updates only the controlled review/status columns, locating the row by the stable non-PII operator marker Gate5AApprovedForMapping = YES (the verified v4.7 implementation uses the match column only to find the row and never rewrites it; virtual row_number stays identity evidence, never the physical update selector). reviewer_status is always UNREVIEWED; no create-approved value exists in this workflow. Operator must bind the same document and tab as the read nodes in n8n UI. Cell format RAW so values are written as plain text."
+      "notes": "Updates only the controlled review/status columns, locating the row by the stable non-PII operator marker Gate5AApprovedForMapping = YES (the verified v4.7 implementation uses the match column only to find the row and never rewrites it; virtual row_number stays identity evidence, never the physical update selector). reviewer_status is always UNREVIEWED; no create-approved value exists in this workflow. Cell format RAW so values are written as plain text. Bind only the Google credential and the spreadsheet here; the source tab is pre-set by name in the import copy and must never be changed in the n8n UI, because the v4.7 editor resets this mapping and the match column whenever the sheet selection changes. After binding, verify the match column, the nine mapped fields, and cell format RAW."
     },
     {
       "parameters": {
@@ -199,8 +364,8 @@
         },
         "sheetName": {
           "__rl": true,
-          "value": "",
-          "mode": "list"
+          "value": "REPLACE_WITH_SOURCE_TAB_NAME",
+          "mode": "name"
         },
         "filtersUI": {
           "values": [
@@ -223,7 +388,7 @@
         32
       ],
       "notesInFlow": true,
-      "notes": "Post-write read-back of the approved row using the same unbound document and tab selectors and the same non-PII marker filter. returnFirstMatch is explicitly false so every match is returned and the strict verifier can require exactly one."
+      "notes": "Post-write read-back of the approved row using the same document binding and the same non-PII marker filter. returnFirstMatch is explicitly false so every match is returned and the strict verifier can require exactly one. Bind only the credential and spreadsheet; the source tab is pre-set by name and must never be changed in the n8n UI."
     },
     {
       "parameters": {
@@ -257,8 +422,8 @@
     },
     {
       "parameters": {
-        "content": "### Gate 5A Boundary\nManual inactive single-result review mapping only. Do not activate. Do not add webhook, scheduler, wait, execute-command, HTTP, SSH, SQL, AC2, bridge, tunnel, member create/update/delete, or AutoCount write nodes. The AutoCount host receives no inbound connection: the operator copies the one sanitized recovery result file into /home/node/.n8n-files/ manually. Original Gate 4 and recovery artifacts stay byte-for-byte unchanged. The Sheet update matches on the stable non-PII marker Gate5AApprovedForMapping (never on row_number alone) and mapping success is reported only after post-write read-back verification of the persisted row. READY_FOR_CREATE_REVIEW stays review-only and reviewer_status stays UNREVIEWED; no state authorizes member creation.",
-        "height": 240,
+        "content": "### Gate 5A Boundary\nManual inactive single-result review mapping only. Do not activate. Do not add webhook, scheduler, wait, execute-command, HTTP, SSH, SQL, AC2, bridge, tunnel, member create/update/delete, or AutoCount write nodes. The AutoCount host receives no inbound connection: the operator copies the one sanitized recovery result file into /home/node/.n8n-files/ manually. Original Gate 4 and recovery artifacts stay byte-for-byte unchanged. The Sheet update matches on the stable non-PII marker Gate5AApprovedForMapping (never on row_number alone) and mapping success is reported only after post-write read-back verification of the persisted row. READY_FOR_CREATE_REVIEW stays review-only and reviewer_status stays UNREVIEWED; no state authorizes member creation.\n\nBinding rule: replace REPLACE_WITH_SOURCE_TAB_NAME with the source tab title in the local import copy before importing; in n8n bind only the Google credential and the spreadsheet on the three Google Sheets nodes. Never re-pick the tab inside the n8n UI: a sheet-locator change makes the editor reset the update column mappings, the match column, and hidden options.",
+        "height": 320,
         "width": 480,
         "color": 4
       },

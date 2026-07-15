@@ -227,6 +227,10 @@ autocount_outputs/**/PRIVATE_DO_NOT_COMMIT_MEMBER_LOOKUP_BRIDGE.txt
 .n8n/
 .n8n-local/
 
+# Local n8n live import/export staging (bound live exports may carry credential
+# IDs, spreadsheet IDs, and cached resource locator values) — never commit
+.tmp/
+
 # Private local AC2 member extracts and form response exports must never be committed
 ac2_member_browse_extract*.csv
 ac2_member_browse_extract_summary*.json

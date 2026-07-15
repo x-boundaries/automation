@@ -49,6 +49,47 @@ FORBIDDEN_WRITE_TOKENS = [
     "GetNext" + "MemberNo",
 ]
 
+# Non-secret tab-locator placeholder the operator replaces in the local import copy
+# before importing. The committed template must never ship an empty sheet locator:
+# the Google Sheets 4.7 editor resets the update resource mapper whenever
+# sheetName.value changes in the UI.
+SHEET_TAB_PLACEHOLDER = "REPLACE_WITH_SOURCE_TAB_NAME"
+
+# Exact header list fetched from the live v4.7 instance during the 2026-07-15 UAT
+# (header names and mapper flags only; no row values, IDs, URLs, or locators).
+EXPECTED_SCHEMA_COLUMNS = [
+    "Timestamp",
+    "Full Name",
+    "Mobile Number",
+    "Email Address",
+    "Birthday Month",
+    "Marketing Consent  ",
+    "PDPA Acknowledged",
+    "Gate4AApprovedForLookup",
+    "Gate5AApprovedForMapping",
+    "uat_lookup_job_id",
+    "uat_lookup_state",
+    "uat_lookup_status",
+    "uat_lookup_error_code",
+    "uat_lookup_warning_count",
+    "uat_lookup_attempt",
+    "uat_lookup_completed_at",
+    "reviewer_status",
+    "row_number",
+]
+
+ALLOWED_SCHEMA_FIELD_KEYS = {
+    "id",
+    "displayName",
+    "required",
+    "defaultMatch",
+    "display",
+    "type",
+    "canBeUsedToMatch",
+    "readOnly",
+    "removed",
+}
+
 EXPECTED_PRECHECK_EVIDENCE_KEYS = [
     "status",
     "gate",
@@ -609,7 +650,17 @@ class Gate5AWorkflowTemplateTests(unittest.TestCase):
         self.assertEqual(len(sheets_nodes), 3)
         for node in sheets_nodes:
             self.assertEqual(node["parameters"]["documentId"], {"__rl": True, "value": "", "mode": "list"})
-            self.assertEqual(node["parameters"]["sheetName"], {"__rl": True, "value": "", "mode": "list"})
+            # The tab locator ships in name mode with a non-secret placeholder that the
+            # operator replaces in the local import copy before import. It must never
+            # ship empty: the Google Sheets 4.7 editor resets the update node's column
+            # mappings, match column, and hidden options whenever sheetName.value
+            # changes in the UI, so an empty tab locator guarantees the committed
+            # mapping is destroyed at first binding (2026-07-15 live UAT regression).
+            self.assertEqual(
+                node["parameters"]["sheetName"],
+                {"__rl": True, "value": SHEET_TAB_PLACEHOLDER, "mode": "name"},
+            )
+            self.assertNotEqual(node["parameters"]["sheetName"]["value"], "")
 
         read_nodes = [node for node in sheets_nodes if "operation" not in node["parameters"]]
         self.assertEqual(len(read_nodes), 2)
@@ -651,8 +702,22 @@ class Gate5AWorkflowTemplateTests(unittest.TestCase):
         )
         columns = update_node["parameters"]["columns"]
         self.assertEqual(columns["mappingMode"], "defineBelow")
-        self.assertEqual(columns["schema"], [])
         self.assertEqual(update_node["parameters"]["options"], {"cellFormat": "RAW"})
+
+        # The committed schema is the exact header list fetched from the live v4.7
+        # instance (names and flags only, no values, no locators). It lets the
+        # resource mapper render the committed mappings immediately and makes the
+        # runtime checkForSchemaChanges guard refuse the update when any documented
+        # UAT header is missing from the bound sheet.
+        self.assertEqual([field["id"] for field in columns["schema"]], EXPECTED_SCHEMA_COLUMNS)
+        for field in columns["schema"]:
+            self.assertEqual(set(field) - ALLOWED_SCHEMA_FIELD_KEYS, set(), field["id"])
+            # No column may pre-claim the match default; the explicit matchingColumns
+            # entry is the only update selector.
+            self.assertIs(field["defaultMatch"], False, field["id"])
+        row_number_field = next(field for field in columns["schema"] if field["id"] == "row_number")
+        self.assertIs(row_number_field["readOnly"], True)
+        self.assertIs(row_number_field["removed"], True)
 
         # The match column is mapped only as the lookup value; the verified live v4.7
         # implementation never rewrites the match column itself, so the written set
