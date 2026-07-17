@@ -49,11 +49,15 @@ The `.cmd` wrappers invoke their co-located PowerShell scripts with `%~dp0<name>
 
 `import-n8n-workflows-live.ps1` never mutates live n8n as a silent default. After preflight, and immediately before the live `n8n import:workflow` loop, it lists the planned imports and requires an explicit interactive confirmation (`I` to import, `E` or Enter to exit without changes). Non-interactive runs fail closed at that gate. Pass `-ConfirmLiveImport` to pre-approve the live import for automation, ideally after reviewing a `-DryRun` preview; `-DryRun` itself never reaches the gate and never changes live n8n.
 
+## Import Dry-Run Isolation
+
+An import `-DryRun` is also non-mutating on the local filesystem for the configured persistent `PreparedDir` (default `.tmp/n8n-live-import`): it does not clear it, does not regenerate prepared/compare JSON inside it, and does not create it when it is absent. Dry-run planning artifacts are written to an isolated temporary per-run directory (`.tmp/n8n-live-import-dryrun-<random>`), which is removed again before the helper exits, including on failure paths. Only a confirmed (non-dry-run) import initializes and repopulates the configured `PreparedDir`.
+
 ## Export Confirmation Gate
 
 `export-n8n-workflows-live.ps1` never rewrites repository workflow definitions as a silent default. In both `RepoTrackedOnly` and `AllLive` modes, after live discovery, validation, and the complete planned-action summary — and immediately before the first filesystem mutation (export-directory initialization, raw live export writes, `sync-n8n-live-exports.cjs` replacing or creating tracked workflow JSON, credential-binding refresh, and any export-output hook) — it requires an explicit interactive confirmation: `X` to export and sync, `E` or Enter to exit without any write. Non-interactive runs fail closed at that gate. Pass `-ConfirmLiveExport` to pre-approve the export sync for automation, ideally after reviewing a `-DryRun` preview; `-DryRun` and `-MissingLiveMode Report` never reach the gate and never write files.
 
-Both confirmation gates are reviewed local deviations from the generated Toolkit helper package, to be reported upstream.
+Both confirmation gates and the import dry-run isolation above are reviewed local deviations from the generated Toolkit helper package, to be reported upstream.
 
 ## Import Restart Warnings
 

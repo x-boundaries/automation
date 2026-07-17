@@ -29,6 +29,9 @@ trap {
   Write-Host "Import failed" -NoNewline -ForegroundColor Red
   Write-Host " ==" -ForegroundColor DarkGray
   Write-Host ($_.Exception.Message) -ForegroundColor Red
+  if (Get-Command Remove-DryRunPlanningDirectory -ErrorAction SilentlyContinue) {
+    Remove-DryRunPlanningDirectory
+  }
   exit 1
 }
 
@@ -508,6 +511,22 @@ function Invoke-ProjectWorkflowHook($HookName, [hashtable]$Context) {
   }
 }
 
+function Remove-DryRunPlanningDirectory {
+  if ([string]::IsNullOrWhiteSpace($script:DryRunPlanningDirPath)) {
+    return
+  }
+
+  try {
+    $resolvedPath = Get-NormalizedFullPath $script:DryRunPlanningDirPath
+    $tmpRoot = Get-NormalizedFullPath (Join-Path $RepoRoot ".tmp")
+    if ((Test-PathIsStrictChild $resolvedPath $tmpRoot) -and (Test-Path -LiteralPath $resolvedPath)) {
+      Remove-Item -LiteralPath $resolvedPath -Recurse -Force
+    }
+  } catch {
+    Write-Step "WARN" "Could not remove temporary dry-run planning directory: $(Get-DisplayPath $script:DryRunPlanningDirPath)"
+  }
+}
+
 function Initialize-RunDirectory($Path) {
   $resolvedPath = Get-NormalizedFullPath $Path
   $tmpRoot = Get-NormalizedFullPath (Join-Path $RepoRoot ".tmp")
@@ -754,8 +773,8 @@ function Invoke-WorkflowPreflight($WorkflowFiles, [bool]$BindingsFileExists, $Li
   Write-Section "Workflow Check"
 
   foreach ($workflowFile in $WorkflowFiles) {
-    $preparedFile = Join-Path $PreparedDirPath "$($workflowFile.BaseName).live-import.json"
-    $liveCompareFile = Join-Path $PreparedDirPath "$($workflowFile.BaseName).live-compare.json"
+    $preparedFile = Join-Path $RunPreparedDirPath "$($workflowFile.BaseName).live-import.json"
+    $liveCompareFile = Join-Path $RunPreparedDirPath "$($workflowFile.BaseName).live-compare.json"
     $containerFile = "$ContainerDir/$($workflowFile.BaseName).live-import.json"
     $workflowInfo = Read-RepoWorkflowInfo $workflowFile
     $repoWorkflow = $workflowInfo.Workflow
@@ -1032,10 +1051,22 @@ $BindingsFilePath = Join-Path $RepoRoot $BindingsFile
 $PreparedDirPath = Join-Path $RepoRoot $PreparedDir
 $CredentialExportDirPath = Join-Path $RepoRoot $CredentialExportDir
 
+# Dry run must never touch the configured persistent prepared dir: it plans into
+# an isolated temporary directory instead, which is removed again before exit.
+$script:DryRunPlanningDirPath = $null
+$RunPreparedDirPath = $PreparedDirPath
+if ($DryRun) {
+  $script:DryRunPlanningDirPath = Join-Path $RepoRoot (".tmp/n8n-live-import-dryrun-" + [guid]::NewGuid().ToString("N"))
+  $RunPreparedDirPath = $script:DryRunPlanningDirPath
+}
+
 Write-Section "n8n workflow import"
 Write-Host ("Repo root        : {0}" -f $RepoRoot)
 Write-Host ("Workflow dir     : {0}" -f (Get-DisplayPath $WorkflowDirPath))
 Write-Host ("Prepared dir     : {0}" -f (Get-DisplayPath $PreparedDirPath))
+if ($DryRun) {
+  Write-Host ("Dry-run plan dir : {0}" -f (Get-DisplayPath $RunPreparedDirPath))
+}
 Write-Host ("Bindings file    : {0}" -f (Get-DisplayPath $BindingsFilePath))
 Write-Host ("Docker target    : {0}" -f ($(if ([string]::IsNullOrWhiteSpace($Container) -and [string]::IsNullOrWhiteSpace($ContainerName) -and [string]::IsNullOrWhiteSpace($ContainerId) -and [string]::IsNullOrWhiteSpace($ComposeProject) -and [string]::IsNullOrWhiteSpace($ComposeService)) { "auto-detect or prompt" } else { "explicit override requested" })))
 Write-Host ("Mode             : {0}" -f ($(if ($DryRun) { "Dry run" } else { "Import" })))
@@ -1075,7 +1106,7 @@ Invoke-LivePreflight
 $liveWorkflows = Get-LiveWorkflows
 Write-Step "LIVE" "Read $($liveWorkflows.Count) workflow(s) from live n8n."
 
-Initialize-RunDirectory $PreparedDirPath
+Initialize-RunDirectory $RunPreparedDirPath
 
 $preflight = Invoke-WorkflowPreflight $workflowFiles $bindingsFileExists $liveWorkflows
 
@@ -1096,6 +1127,7 @@ if (
 
 if ($preflight.BlockedWorkflows.Count -gt 0) {
   Write-BlockedSummary $preflight
+  Remove-DryRunPlanningDirectory
   exit 1
 }
 
@@ -1107,6 +1139,7 @@ if ($DryRun) {
   Write-Host ("New live          : {0}" -f $preflight.MissingLiveWorkflowCount)
   Write-Host ("Restart warnings  : {0}" -f $preflight.RestartWarningCount)
   Write-Host "Live n8n was not changed."
+  Write-Host ("The configured prepared dir was not read, cleared, created, or modified: {0}" -f (Get-DisplayPath $PreparedDirPath))
 
   Write-WorkflowActionSummary $preflight.PlannedImports "Planned"
 
@@ -1121,6 +1154,7 @@ if ($DryRun) {
     Write-Host "1. No import is needed right now."
   }
   Write-Host "Deleting archived workflows is not supported by these CLI helper scripts yet."
+  Remove-DryRunPlanningDirectory
   exit 0
 }
 
@@ -1166,7 +1200,7 @@ Invoke-ProjectWorkflowHook "before-live-import" @{
 }
 
 Write-Section "Prepared Workflow Re-Validation"
-$preparedValidationResult = Invoke-CapturedCommand "node" @((Join-Path $HelperScriptDir "validate-n8n-workflows.cjs"), "--mode", "prepared-import", $PreparedDirPath)
+$preparedValidationResult = Invoke-CapturedCommand "node" @((Join-Path $HelperScriptDir "validate-n8n-workflows.cjs"), "--mode", "prepared-import", $RunPreparedDirPath)
 if ($preparedValidationResult.ExitCode -ne 0) {
   throw "Prepared workflow JSON validation failed after before-live-import hook.`n$($preparedValidationResult.Output -join "`n")"
 }
