@@ -54,7 +54,7 @@ Bind-mounting `/home/node/.n8n-files` onto the shared folder would remove both o
 - The share holds only the contract files below (plus, transiently, the atomic publication temp file). It must not expose the AutoCount installation, AC2 runtime state, SQL Server data, credentials, `.env` values, `.n8n/` runtime state, or this repository.
 - The pending-queue file contains `submitted_member_no_base64_utf8`, which is sensitive operational data. Do not open, print, paste, or commit it; delete it per the gate evidence-retention rules after the handoff closes.
 - No tunnel, reverse proxy, queue API, webhook, scheduler, Windows service, or public inbound path to the VM is created, used, or approved by this topology.
-- Atomic publication relies on same-directory atomic rename/replace semantics in the outbox. Use an NTFS-backed hypervisor shared folder or SMB share where `os.replace` within one directory is atomic. If the selected share cannot guarantee this, do not use it; the runner fails closed on a rename error and never leaves a partial final file, but the supported expectation is an NTFS-backed private share.
+- Atomic publication relies on same-directory atomic no-replace move semantics in the outbox. The supported expectation is an NTFS-backed hypervisor shared folder or SMB share, where a same-directory rename is atomic and fails when the destination already exists (the runner deliberately does not use replace-existing semantics). On POSIX-style filesystems the runner uses an atomic hard-link create-new instead. If the selected share cannot honour these semantics, the runner fails closed on the publication error and never leaves a partial final file; do not use such a share.
 
 ## Share Layout And VM-Local State
 
@@ -108,9 +108,9 @@ The lookup never writes into the share directly. The delegated Gate 4 runner wri
 1. re-verifies that staging holds exactly one complete sanitized result row;
 2. refuses if the final outbox file already exists nonempty (see below);
 3. copies the staging content to `member_lookup_bridge_gate5a_result_copy.jsonl.tmp` inside the outbox, flushes and closes it;
-4. atomically renames the temp file to the fixed Gate 5A filename.
+4. moves the temp file to the fixed Gate 5A filename with an atomic no-replace primitive that fails when the destination already exists (Windows same-directory rename without replace-existing; POSIX hard-link create-new).
 
-The final outbox filename is never visible with partial content, is never appended to, and is never overwritten. A nonempty final outbox file is acceptable only when it is the exact idempotent copy of the validated staged result for the current job; any stale, malformed, truncated, or other-job content is `needs_fix` and the file is left untouched.
+The final outbox filename is never visible with partial content, is never appended to, and is never overwritten. The VM-local claim alone cannot stop the other share participant from creating the fixed filename during the lookup, so the publication primitive itself refuses an existing destination: a file that appears in the outbox after the pre-lookup inspection stays byte-for-byte unchanged, the temp file is left for operator diagnosis, and the run ends `needs_fix`. A nonempty final outbox file is acceptable only when it is the exact idempotent copy of the validated staged result for the current job; any stale, malformed, truncated, late-written, or other-job content is `needs_fix` and the file is left untouched.
 
 ## Incomplete-State Handling And Operator Recovery
 
@@ -126,6 +126,8 @@ The runner treats every incomplete or inconsistent state as `needs_fix` with zer
 | Corrupted or multi-row staging result | `needs_fix` |
 | Staging/marker pair complete but outbox missing or empty (interrupted publication) | `needs_fix` |
 | Outbox nonempty with no staged evidence, or not the exact staged row | `needs_fix`, outbox untouched |
+| Final outbox filename created by another share participant during the lookup | `needs_fix`, destination byte-for-byte unchanged, temp file retained for diagnosis |
+| Exclusive claim cannot be released after a completed run | `needs_fix` (never `ok`/`already_processed`), `claim_release_failed = true`, claim retained for operator recovery |
 
 `already_processed` (exit 0, zero lookups) is reported only when the delegated Gate 4 state machine confirms exactly one clean processed marker plus exactly one fully valid matching staged result for the current job, and the final outbox file contains exactly that same single row.
 
@@ -186,6 +188,7 @@ lookup_error_count = <aggregate-count-only>
 review_rows_written_count = <aggregate-count-only>
 claim_acquired = <true/false>
 preexisting_claim_detected = <true/false>
+claim_release_failed = <true/false>
 outbox_published = <true/false>
 vm_local_state_outside_share = true
 member_create_or_update_invoked = false
@@ -203,7 +206,7 @@ final_write_automation = false
 no_row_values_printed = true
 ```
 
-Handoff pass evidence requires `status = ok`, `powershell_lookup_enabled = true`, `ac2_lookup_invoked = true`, `queue_rows_read_count = 1`, `lookup_attempt_count = 1`, `lookup_success_count = 1`, exactly one of the three review routing counts equal to `1`, `lookup_error_count = 0`, `review_rows_written_count = 1`, `claim_acquired = true`, and `outbox_published = true`. `status = already_processed` proves idempotency only. `READY_FOR_CREATE_REVIEW` remains review-only and is not approval to create.
+Handoff pass evidence requires `status = ok`, `powershell_lookup_enabled = true`, `ac2_lookup_invoked = true`, `queue_rows_read_count = 1`, `lookup_attempt_count = 1`, `lookup_success_count = 1`, exactly one of the three review routing counts equal to `1`, `lookup_error_count = 0`, `review_rows_written_count = 1`, `claim_acquired = true`, `claim_release_failed = false`, and `outbox_published = true`. `status = already_processed` proves idempotency only. `READY_FOR_CREATE_REVIEW` remains review-only and is not approval to create.
 
 Do not paste pending rows, staged or published result rows, processed or failed markers, claim file content, raw/encoded/decoded/normalized member values, names, emails, phone numbers, birthday values, `AC2_PROBE_*` values, credentials, share paths/hostnames/accounts, Sheet IDs/URLs, command transcripts, stdout/stderr transcripts, screenshots, secrets, or PII.
 

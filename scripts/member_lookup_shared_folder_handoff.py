@@ -24,11 +24,18 @@ On top of that delegation this wrapper adds only the shared-folder layer:
   run causes ``needs_fix`` and never an automatic retry;
 - VM-local result staging outside the share (the Gate 4 runner never touches
   the shared outbox directly);
-- atomic publication: the validated one-row staging result is copied to a
-  same-directory temporary file in the outbox, flushed, and atomically
-  renamed to the fixed Gate 5A result-copy filename, so the final filename is
-  never visible with partial content; a nonempty final outbox file is never
-  appended to or overwritten.
+- atomic no-replace publication: the validated one-row staging result is
+  copied to a same-directory temporary file in the outbox, flushed, and moved
+  to the fixed Gate 5A result-copy filename with an atomic create-new
+  primitive (Windows ``os.rename``, which fails when the destination exists;
+  POSIX ``os.link``), so the final filename is never visible with partial
+  content, an existing destination is never overwritten -- even one created by
+  the other share participant during the lookup -- and publication fails
+  closed when the primitive is unsupported;
+- fail-closed claim release: if the exclusive claim cannot be released after
+  a completed run, the run reports ``needs_fix`` (never ``ok`` or
+  ``already_processed``), the claim stays in place for operator recovery, and
+  the evidence carries ``claim_release_failed = true``.
 
 It is lookup-only and review-only. It never writes to AutoCount, never runs
 direct SQL, never creates/updates/deletes members, never exposes a network
@@ -99,6 +106,7 @@ def evidence_rows(status, counts, flags):
         *[(key, counts[key]) for key in INNER_COUNT_KEYS],
         ("claim_acquired", bool_text(flags["claim_acquired"])),
         ("preexisting_claim_detected", bool_text(flags["preexisting_claim_detected"])),
+        ("claim_release_failed", bool_text(flags["claim_release_failed"])),
         ("outbox_published", bool_text(flags["outbox_published"])),
         ("vm_local_state_outside_share", bool_text(flags["vm_local_state_outside_share"])),
         ("member_create_or_update_invoked", "false"),
@@ -181,10 +189,21 @@ def acquire_claim(claim_path):
 
 
 def release_claim(claim_path):
+    """Release the exclusive claim; returns True only when it is verifiably gone.
+
+    A release failure is reported to the caller and must fail the run closed:
+    the claim is left in place (never retried, repaired, or force-deleted) so
+    the blocked state stays visible for operator recovery.
+    """
+    if os.environ.get(FAULT_ENV) == "fail_claim_release":
+        return False
     try:
         Path(claim_path).unlink()
+    except FileNotFoundError:
+        return True
     except OSError:
-        pass
+        return False
+    return True
 
 
 def run_gate4(args, pending_path):
@@ -275,13 +294,34 @@ def staging_has_content(path):
         return True
 
 
-def publish_atomically(staging_path, outbox_dir, final_path):
-    """Copy the validated staging content to the outbox via temp file + atomic rename.
+def atomic_create_no_replace(tmp_path, final_path):
+    """Move the temp file to the final name, atomically failing if it exists.
 
-    The fixed final filename never becomes visible with partial content. This
-    relies on same-directory atomic rename/replace semantics on the share; the
-    runbook documents the supported share/filesystem expectation. Failure leaves
-    at most the temporary file behind and never a partial final file.
+    This is deliberately NOT ``os.replace``: the VM-local claim cannot stop the
+    other share participant from creating the fixed result filename during the
+    lookup, so the publication primitive itself must refuse an existing
+    destination. On Windows/NTFS-backed shares ``os.rename`` maps to a move
+    without replace-existing and raises when the destination exists. On POSIX
+    ``os.link`` atomically creates the destination only if it does not exist
+    (then the temp name is dropped). Filesystems that cannot honour these
+    semantics make this raise, and publication fails closed.
+    """
+    if os.name == "nt":
+        os.rename(tmp_path, final_path)
+    else:
+        os.link(tmp_path, final_path)
+        os.unlink(tmp_path)
+
+
+def publish_atomically(staging_path, outbox_dir, final_path):
+    """Copy the validated staging content to the outbox via temp file + no-replace move.
+
+    The fixed final filename never becomes visible with partial content, is
+    never appended to, and an existing destination is never overwritten,
+    renamed, repaired, or deleted -- a collision leaves it byte-for-byte
+    unchanged, keeps the temp file for operator diagnosis, and raises so the
+    run fails closed. The runbook documents the supported share/filesystem
+    expectation.
     """
     text = Path(staging_path).read_text(encoding="utf-8")
     tmp_path = outbox_dir / PUBLISH_TMP_FILENAME
@@ -289,7 +329,7 @@ def publish_atomically(staging_path, outbox_dir, final_path):
         handle.write(text)
         handle.flush()
         os.fsync(handle.fileno())
-    os.replace(tmp_path, final_path)
+    atomic_create_no_replace(tmp_path, final_path)
 
 
 def build_parser():
@@ -323,6 +363,7 @@ def main(argv=None):
         "ac2_lookup_invoked": False,
         "claim_acquired": False,
         "preexisting_claim_detected": False,
+        "claim_release_failed": False,
         "outbox_published": False,
         "vm_local_state_outside_share": vm_local_state_outside_share(args, share_root),
     }
@@ -360,8 +401,15 @@ def main(argv=None):
     def finish(status, counts=None, *, exit_code):
         # Controlled completion: the run reached a deterministic terminal state,
         # so the exclusive claim is released. A hard interruption never reaches
-        # this point and leaves the claim in place (fail closed).
-        release_claim(args.claim_json)
+        # this point and leaves the claim in place (fail closed). A failed
+        # release also fails closed: it can never surface as ok or
+        # already_processed, the claim stays for operator recovery (no retry,
+        # repair, or force-delete), and the evidence reports the failure.
+        if not release_claim(args.claim_json):
+            flags["claim_release_failed"] = True
+            if status in ("ok", "already_processed"):
+                status = "needs_fix"
+            exit_code = 2
         emit(status, counts)
         return exit_code
 

@@ -4,6 +4,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -166,7 +167,14 @@ def write_jsonl(path, rows):
             handle.write(json.dumps(row, sort_keys=True) + "\n")
 
 
-def write_fake_powershell(path, *, status="ok", hits_file=None, delay=False):
+def write_fake_powershell(directory, *, status="ok", hits_file=None, delay_seconds=0):
+    """Write a platform-appropriate directly-executable fake lookup executable.
+
+    Windows uses a .cmd batch file; POSIX uses an executable Python script with
+    a shebang and 0o755 permissions. Both accept and ignore the PowerShell-style
+    arguments the Gate 4 runner passes, optionally record one hit line per
+    invocation, optionally sleep, and print the exact sanitized JSON response.
+    """
     payload = {
         "status": status,
         "authentication_success": True,
@@ -181,13 +189,33 @@ def write_fake_powershell(path, *, status="ok", hits_file=None, delay=False):
         "warning_count": 0,
         "error": None if status == "ok" else {"type": "mock_lookup_error"},
     }
-    lines = ["@echo off"]
-    if hits_file is not None:
-        lines.append(f'echo hit>> "{hits_file}"')
-    if delay:
-        lines.append("ping -n 2 127.0.0.1 >nul")
-    lines.append(f"echo {json.dumps(payload, sort_keys=True)}")
-    path.write_text("\r\n".join(lines) + "\r\n", encoding="utf-8")
+    payload_json = json.dumps(payload, sort_keys=True)
+    if os.name == "nt":
+        exe = directory / "fake-powershell.cmd"
+        lines = ["@echo off"]
+        if hits_file is not None:
+            lines.append(f'echo hit>> "{hits_file}"')
+        if delay_seconds:
+            lines.append(f"ping -n {delay_seconds + 1} 127.0.0.1 >nul")
+        lines.append(f"echo {payload_json}")
+        exe.write_text("\r\n".join(lines) + "\r\n", encoding="utf-8")
+    else:
+        exe = directory / "fake-powershell"
+        body = [
+            "#!/usr/bin/env python3",
+            "import sys, time",
+            "_ = sys.argv[1:]  # PowerShell-style arguments are accepted and ignored",
+        ]
+        if hits_file is not None:
+            body.append(
+                f"open({str(hits_file)!r}, 'a', encoding='utf-8').write('hit\\n')"
+            )
+        if delay_seconds:
+            body.append(f"time.sleep({delay_seconds})")
+        body.append(f"print({payload_json!r})")
+        exe.write_text("\n".join(body) + "\n", encoding="utf-8")
+        exe.chmod(0o755)
+    return exe
 
 
 def parse_evidence(text):
@@ -223,15 +251,14 @@ class SharedFolderHandoffBase(unittest.TestCase):
         self.final = self.outbox / RESULT_FILENAME
         self.hits = self.vm_local / "lookup_hits.txt"
 
-    def fake_ps(self, *, status="ok", count_hits=True, delay=False):
-        exe = self.vm_local / "fake-powershell.cmd"
-        script = self.vm_local / "fake-lookup-script.ps1"
-        write_fake_powershell(
-            exe,
+    def fake_ps(self, *, status="ok", count_hits=True, delay_seconds=0):
+        exe = write_fake_powershell(
+            self.vm_local,
             status=status,
             hits_file=str(self.hits) if count_hits else None,
-            delay=delay,
+            delay_seconds=delay_seconds,
         )
+        script = self.vm_local / "fake-lookup-script.ps1"
         script.write_text("# fake read-only lookup script path only\n", encoding="utf-8")
         return ["--powershell-exe", str(exe), "--lookup-script", str(script)]
 
@@ -422,7 +449,7 @@ class ClaimAndConcurrencyTests(SharedFolderHandoffBase):
     def test_concurrent_invocations_produce_at_most_one_lookup(self):
         write_jsonl(self.pending, [canonical_queue_row()])
         arguments = [sys.executable, str(SCRIPT)] + self.base_args(
-            extra=self.fake_ps(delay=True)
+            extra=self.fake_ps(delay_seconds=1)
         )
         first = subprocess.Popen(arguments, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         second = subprocess.Popen(arguments, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -591,6 +618,78 @@ class FaultInjectionTests(SharedFolderHandoffBase):
         self.assertEqual(evidence["lookup_attempt_count"], "0")
         self.assertEqual(self.hit_count(), 1)
 
+    def test_claim_release_failure_never_reports_success(self):
+        write_jsonl(self.pending, [canonical_queue_row()])
+        completed = self.run_cli(
+            self.base_args(extra=self.fake_ps()),
+            env={"SHARED_FOLDER_TEST_FAULT_INJECT": "fail_claim_release"},
+        )
+        self.assertEqual(completed.returncode, 2)
+        evidence = parse_evidence(completed.stdout)
+        self.assertEqual(evidence["status"], "needs_fix")
+        self.assertEqual(evidence["claim_release_failed"], "true")
+        self.assertNotIn("status = ok", completed.stdout)
+        self.assertNotIn("status = already_processed", completed.stdout)
+        # The lookup and publication themselves completed; only the release failed.
+        self.assertEqual(evidence["outbox_published"], "true")
+        self.assertEqual(self.hit_count(), 1)
+        self.assertEqual(nonblank_lines(self.final), 1)
+        self.assertTrue(self.claim.exists())
+
+        # The retained claim blocks the next invocation without a second lookup.
+        rerun = self.run_cli(self.base_args(extra=self.fake_ps()))
+        self.assertEqual(rerun.returncode, 2)
+        blocked = parse_evidence(rerun.stdout)
+        self.assertEqual(blocked["status"], "needs_fix")
+        self.assertEqual(blocked["preexisting_claim_detected"], "true")
+        self.assertEqual(self.hit_count(), 1)
+
+        # Documented operator recovery: remove the stale claim by hand, then the
+        # completed published run is recognised idempotently with zero lookups.
+        self.claim.unlink()
+        recovered = self.run_cli(self.base_args(extra=self.fake_ps()))
+        self.assertEqual(recovered.returncode, 0, recovered.stdout + recovered.stderr)
+        final_evidence = parse_evidence(recovered.stdout)
+        self.assertEqual(final_evidence["status"], "already_processed")
+        self.assertEqual(final_evidence["claim_release_failed"], "false")
+        self.assertEqual(self.hit_count(), 1)
+
+    def test_late_outbox_write_is_never_overwritten(self):
+        write_jsonl(self.pending, [canonical_queue_row()])
+        arguments = [sys.executable, str(SCRIPT)] + self.base_args(
+            extra=self.fake_ps(delay_seconds=3)
+        )
+        process = subprocess.Popen(
+            arguments, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+        # Wait until the lookup has started (hit recorded), then simulate the
+        # other share participant creating the fixed result filename mid-lookup,
+        # after the runner's pre-lookup outbox inspection.
+        deadline = time.time() + 60
+        while self.hit_count() == 0 and time.time() < deadline:
+            time.sleep(0.05)
+        self.assertEqual(self.hit_count(), 1)
+        late_text = '{"late": "written-by-other-share-participant"}\n'
+        self.final.write_text(late_text, encoding="utf-8")
+
+        out, err = process.communicate(timeout=120)
+        self.assertEqual(process.returncode, 2, out + err)
+        evidence = parse_evidence(out)
+        self.assertEqual(evidence["status"], "needs_fix")
+        self.assertEqual(evidence["outbox_published"], "false")
+        # The late file is byte-for-byte unchanged and the staged result stays
+        # available for operator diagnosis.
+        self.assertEqual(self.final.read_text(encoding="utf-8"), late_text)
+        self.assertEqual(nonblank_lines(self.staging), 1)
+        self.assertEqual(self.hit_count(), 1)
+
+        # Rerun: the mismatched outbox stays needs_fix with no second lookup.
+        rerun = self.run_cli(self.base_args(extra=self.fake_ps()))
+        self.assertEqual(rerun.returncode, 2)
+        self.assertEqual(parse_evidence(rerun.stdout)["status"], "needs_fix")
+        self.assertEqual(self.hit_count(), 1)
+        self.assertEqual(self.final.read_text(encoding="utf-8"), late_text)
+
     def test_gate4_fault_after_result_before_marker_never_relaunches(self):
         completed = self.run_with_fault(
             "after_result_before_marker", env_name="GATE4_TEST_FAULT_INJECT"
@@ -640,6 +739,7 @@ class SuccessAndEvidenceTests(SharedFolderHandoffBase):
         ]
         self.assertEqual(sum(routing), 1)
         self.assertEqual(evidence["claim_acquired"], "true")
+        self.assertEqual(evidence["claim_release_failed"], "false")
         self.assertEqual(evidence["outbox_published"], "true")
         self.assertEqual(evidence["vm_local_state_outside_share"], "true")
         self.assertEqual(evidence["member_create_or_update_invoked"], "false")
@@ -693,6 +793,9 @@ class SharedFolderHandoffDocsTest(unittest.TestCase):
         self.assertIn("staging", text)
         self.assertIn("atomic", text)
         self.assertIn("recovery", text)
+        self.assertIn("claim_release_failed", text)
+        self.assertIn("no-replace", text)
+        self.assertIn("never overwritten", text)
         for forbidden in ("member create", "direct SQL"):
             self.assertIn(forbidden, text)
 
