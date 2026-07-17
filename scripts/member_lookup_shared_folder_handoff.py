@@ -24,14 +24,19 @@ On top of that delegation this wrapper adds only the shared-folder layer:
   run causes ``needs_fix`` and never an automatic retry;
 - VM-local result staging outside the share (the Gate 4 runner never touches
   the shared outbox directly);
-- atomic no-replace publication: the validated one-row staging result is
-  copied to a same-directory temporary file in the outbox, flushed, and moved
-  to the fixed Gate 5A result-copy filename with an atomic create-new
-  primitive (Windows ``os.rename``, which fails when the destination exists;
-  POSIX ``os.link``), so the final filename is never visible with partial
-  content, an existing destination is never overwritten -- even one created by
-  the other share participant during the lookup -- and publication fails
-  closed when the primitive is unsupported;
+- fail-closed final-path classification: any pre-existing artifact at the
+  fixed final result path (including a zero-byte file, directory, symbolic or
+  broken link, or an unreadable/stat-failing entry) blocks the run before any
+  lookup; only a regular nonempty file can enter idempotent verification;
+- durable atomic no-replace publication: the validated one-row staging result
+  is copied to a same-directory temporary file in the outbox, flushed, and
+  moved to the fixed Gate 5A result-copy filename with a durable create-new
+  primitive (Windows ``MoveFileExW`` with write-through and without
+  replace-existing; POSIX ``os.link`` create-new plus directory fsync), so the
+  final filename is never visible with partial content, an existing
+  destination is never overwritten -- even one created by the other share
+  participant during the lookup -- success is reported only after the commit
+  is durable, and an unconfirmed commit fails closed with the claim retained;
 - fail-closed claim release: if the exclusive claim cannot be released after
   a completed run, the run reports ``needs_fix`` (never ``ok`` or
   ``already_processed``), the claim stays in place for operator recovery, and
@@ -49,6 +54,7 @@ import contextlib
 import io
 import json
 import os
+import stat
 from pathlib import Path
 
 import member_lookup_gate4_real_queue_lookup as gate4
@@ -277,11 +283,37 @@ def read_single_result_row(path):
     return rows[0]
 
 
-def outbox_nonempty(final_path):
+class PublicationDurabilityError(OSError):
+    """The final entry may exist but its durable commit or cleanup is unconfirmed.
+
+    Distinguished from a determinate publication failure (such as an existing
+    destination refusing the no-replace move, where nothing was committed) so
+    the caller can retain the execution claim and block automatic progression
+    after an uncertain commit.
+    """
+
+
+def classify_final_path(final_path):
+    """Classify the fixed final result path fail-closed before any lookup.
+
+    Returns ``absent`` (no directory entry), ``regular_nonempty`` (a plain
+    regular file with content, the only state eligible for idempotent
+    verification), or ``blocked`` for every other pre-existing artifact: a
+    zero-byte file, directory, symbolic or broken link, reparse point,
+    unreadable entry, or any metadata/stat failure. ``os.lstat`` is used so a
+    link is classified as the link itself, never followed.
+    """
     try:
-        return final_path.is_file() and final_path.stat().st_size > 0
+        info = os.lstat(final_path)
+    except FileNotFoundError:
+        return "absent"
     except OSError:
-        return True
+        return "blocked"
+    if not stat.S_ISREG(info.st_mode):
+        return "blocked"
+    if info.st_size == 0:
+        return "blocked"
+    return "regular_nonempty"
 
 
 def staging_has_content(path):
@@ -294,34 +326,74 @@ def staging_has_content(path):
         return True
 
 
-def atomic_create_no_replace(tmp_path, final_path):
-    """Move the temp file to the final name, atomically failing if it exists.
+def fsync_directory(directory):
+    """Fsync a directory through a real directory file descriptor.
 
-    This is deliberately NOT ``os.replace``: the VM-local claim cannot stop the
-    other share participant from creating the fixed result filename during the
-    lookup, so the publication primitive itself must refuse an existing
-    destination. On Windows/NTFS-backed shares ``os.rename`` maps to a move
-    without replace-existing and raises when the destination exists. On POSIX
-    ``os.link`` atomically creates the destination only if it does not exist
-    (then the temp name is dropped). Filesystems that cannot honour these
-    semantics make this raise, and publication fails closed.
+    Raises OSError when the platform or filesystem cannot open or fsync the
+    directory; the caller must fail closed rather than assume durability.
     """
-    if os.name == "nt":
-        os.rename(tmp_path, final_path)
-    else:
-        os.link(tmp_path, final_path)
+    descriptor = os.open(str(directory), os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _windows_move_no_replace_write_through(tmp_path, final_path):
+    """Windows durable no-replace move via MoveFileExW.
+
+    MOVEFILE_REPLACE_EXISTING is deliberately absent so an existing destination
+    atomically refuses the move (raised as FileExistsError, a determinate
+    failure that commits nothing). MOVEFILE_WRITE_THROUGH requires the move to
+    be flushed to disk before the call returns, which is the metadata-durability
+    guarantee plain ``os.rename`` does not provide. Any other Windows error is
+    raised as PublicationDurabilityError because the commit state is
+    unconfirmed.
+    """
+    import ctypes
+
+    movefile_write_through = 0x8
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    if not kernel32.MoveFileExW(str(tmp_path), str(final_path), movefile_write_through):
+        error = ctypes.get_last_error()
+        if error in (80, 183):  # ERROR_FILE_EXISTS, ERROR_ALREADY_EXISTS
+            raise ctypes.WinError(error)
+        raise PublicationDurabilityError(
+            0, f"windows_move_write_through_failed_error_{error}"
+        )
+
+
+def _posix_link_publish_durable(tmp_path, final_path, outbox_dir):
+    """POSIX durable no-replace publication via hard-link create-new.
+
+    ``os.link`` atomically creates the final name only when it does not exist
+    (FileExistsError and unsupported-hard-link errors propagate as determinate
+    failures that commit nothing). After the link, the containing directory is
+    fsynced so the new entry is durable, the temp name is removed, and the
+    directory is fsynced again so the cleanup is durable. Any failure after the
+    link is PublicationDurabilityError: the commit state is unconfirmed and the
+    caller must not report success.
+    """
+    os.link(tmp_path, final_path)
+    try:
+        fsync_directory(outbox_dir)
         os.unlink(tmp_path)
+        fsync_directory(outbox_dir)
+    except OSError as error:
+        raise PublicationDurabilityError(0, "publication_durability_unconfirmed") from error
 
 
 def publish_atomically(staging_path, outbox_dir, final_path):
-    """Copy the validated staging content to the outbox via temp file + no-replace move.
+    """Copy the validated staging content to the outbox via temp file + durable no-replace move.
 
     The fixed final filename never becomes visible with partial content, is
     never appended to, and an existing destination is never overwritten,
     renamed, repaired, or deleted -- a collision leaves it byte-for-byte
     unchanged, keeps the temp file for operator diagnosis, and raises so the
-    run fails closed. The runbook documents the supported share/filesystem
-    expectation.
+    run fails closed. Success is returned only after the platform primitive
+    has durably committed the final directory entry (Windows MoveFileExW with
+    write-through; POSIX hard-link create-new plus directory fsync). The
+    runbook documents the exact supported filesystem expectations.
     """
     text = Path(staging_path).read_text(encoding="utf-8")
     tmp_path = outbox_dir / PUBLISH_TMP_FILENAME
@@ -329,7 +401,13 @@ def publish_atomically(staging_path, outbox_dir, final_path):
         handle.write(text)
         handle.flush()
         os.fsync(handle.fileno())
-    atomic_create_no_replace(tmp_path, final_path)
+    # Test-only durability-failure injection; it can only cause a failure.
+    if os.environ.get(FAULT_ENV) == "fail_publication_durability":
+        raise PublicationDurabilityError(0, "test_injected_durability_failure")
+    if os.name == "nt":
+        _windows_move_no_replace_write_through(tmp_path, final_path)
+    else:
+        _posix_link_publish_durable(tmp_path, final_path, outbox_dir)
 
 
 def build_parser():
@@ -413,12 +491,22 @@ def main(argv=None):
         emit(status, counts)
         return exit_code
 
-    if outbox_nonempty(final_path):
-        # D. A nonempty final outbox is acceptable only as the exact idempotent
-        # result of a completed run. It is never appended to, overwritten, or
-        # repaired. Without staged evidence there is nothing to correlate, and
-        # delegating with empty VM-local state would run a fresh lookup, so
-        # fail closed first.
+    # D. Fail-closed final-path classification before any lookup. Any pre-existing
+    # artifact at the fixed final path -- including a zero-byte file, directory,
+    # symbolic or broken link, or an entry whose metadata cannot be read -- blocks
+    # the run, because no-replace publication could never succeed and a lookup
+    # would be consumed for nothing. The artifact is never deleted, truncated,
+    # renamed, replaced, or repaired.
+    final_state = classify_final_path(final_path)
+    if final_state == "blocked":
+        return finish("needs_fix", exit_code=2)
+
+    if final_state == "regular_nonempty":
+        # A regular nonempty final outbox is acceptable only as the exact
+        # idempotent result of a completed run. It is never appended to,
+        # overwritten, or repaired. Without staged evidence there is nothing to
+        # correlate, and delegating with empty VM-local state would run a fresh
+        # lookup, so fail closed first.
         if not staging_has_content(args.staging_results_jsonl):
             return finish("needs_fix", exit_code=2)
         inner_status, inner = run_gate4(args, pending_path)
@@ -452,7 +540,17 @@ def main(argv=None):
     maybe_fault("after_staging_before_publish")
     try:
         publish_atomically(args.staging_results_jsonl, outbox_dir, final_path)
+    except PublicationDurabilityError:
+        # The commit state is unconfirmed (write-through or directory-fsync
+        # failure). The claim is deliberately retained so the state cannot
+        # progress automatically after an uncertain commit; operator recovery
+        # per the runbook is required. Nothing is deleted or repaired.
+        emit("needs_fix", counts)
+        return 2
     except OSError:
+        # Determinate publication failure (for example an existing destination
+        # refusing the no-replace move): nothing was committed, the destination
+        # is untouched, and the claim is released via the normal terminal path.
         return finish("needs_fix", counts, exit_code=2)
     flags["outbox_published"] = True
     maybe_fault("after_publish_before_claim_cleanup")

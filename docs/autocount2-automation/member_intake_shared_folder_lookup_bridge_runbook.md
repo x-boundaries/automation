@@ -54,7 +54,7 @@ Bind-mounting `/home/node/.n8n-files` onto the shared folder would remove both o
 - The share holds only the contract files below (plus, transiently, the atomic publication temp file). It must not expose the AutoCount installation, AC2 runtime state, SQL Server data, credentials, `.env` values, `.n8n/` runtime state, or this repository.
 - The pending-queue file contains `submitted_member_no_base64_utf8`, which is sensitive operational data. Do not open, print, paste, or commit it; delete it per the gate evidence-retention rules after the handoff closes.
 - No tunnel, reverse proxy, queue API, webhook, scheduler, Windows service, or public inbound path to the VM is created, used, or approved by this topology.
-- Atomic publication relies on same-directory atomic no-replace move semantics in the outbox. The supported expectation is an NTFS-backed hypervisor shared folder or SMB share, where a same-directory rename is atomic and fails when the destination already exists (the runner deliberately does not use replace-existing semantics). On POSIX-style filesystems the runner uses an atomic hard-link create-new instead. If the selected share cannot honour these semantics, the runner fails closed on the publication error and never leaves a partial final file; do not use such a share.
+- Atomic publication relies on same-directory durable no-replace move semantics in the outbox. On Windows the runner uses `MoveFileExW` without `MOVEFILE_REPLACE_EXISTING` (an existing destination atomically refuses the move) and with `MOVEFILE_WRITE_THROUGH` (the move is flushed before success); the supported expectation is a local NTFS volume or an NTFS-backed hypervisor share where these `MoveFileExW` semantics are honoured. On POSIX-style filesystems the runner uses an atomic hard-link create-new followed by an fsync of the containing directory (through a real directory file descriptor), then temp-name cleanup and a second directory fsync; the supported expectation is a local filesystem with working hard links and directory fsync, such as ext4. Generic SMB/network-share behaviour is not assumed or verified: if the selected share cannot honour these primitives, the runner fails closed on the publication error, never leaves a partial final file, and never reports success on an unconfirmed commit.
 
 ## Share Layout And VM-Local State
 
@@ -107,8 +107,12 @@ The lookup never writes into the share directly. The delegated Gate 4 runner wri
 
 1. re-verifies that staging holds exactly one complete sanitized result row;
 2. refuses if the final outbox file already exists nonempty (see below);
-3. copies the staging content to `member_lookup_bridge_gate5a_result_copy.jsonl.tmp` inside the outbox, flushes and closes it;
-4. moves the temp file to the fixed Gate 5A filename with an atomic no-replace primitive that fails when the destination already exists (Windows same-directory rename without replace-existing; POSIX hard-link create-new).
+3. copies the staging content to `member_lookup_bridge_gate5a_result_copy.jsonl.tmp` inside the outbox, flushes and fsyncs it;
+4. moves the temp file to the fixed Gate 5A filename with a durable atomic no-replace primitive that fails when the destination already exists: on Windows `MoveFileExW` with write-through and without replace-existing; on POSIX hard-link create-new followed by directory fsync, temp cleanup, and a second directory fsync.
+
+`outbox_published = true` and `status = ok` are emitted, and the claim is released, only after the final directory entry is durably committed. If the durable commit cannot be confirmed (write-through or directory-fsync failure), the run is `needs_fix`, `outbox_published` stays `false`, and the execution claim is deliberately retained so the state cannot progress automatically after an uncertain commit; the temp file and staged result are left for operator diagnosis.
+
+Before any lookup, the fixed final path is classified fail-closed: only a completely absent directory entry allows a fresh lookup, and only a regular nonempty file enters idempotent verification. A pre-existing zero-byte file, directory, symbolic or broken link, unreadable entry, or any metadata/stat failure blocks the run with `needs_fix` and zero lookups, so an unpublishable handoff can never consume a real AC2 lookup. The artifact is never deleted, truncated, renamed, replaced, or repaired.
 
 The final outbox filename is never visible with partial content, is never appended to, and is never overwritten. The VM-local claim alone cannot stop the other share participant from creating the fixed filename during the lookup, so the publication primitive itself refuses an existing destination: a file that appears in the outbox after the pre-lookup inspection stays byte-for-byte unchanged, the temp file is left for operator diagnosis, and the run ends `needs_fix`. A nonempty final outbox file is acceptable only when it is the exact idempotent copy of the validated staged result for the current job; any stale, malformed, truncated, late-written, or other-job content is `needs_fix` and the file is left untouched.
 
@@ -126,7 +130,9 @@ The runner treats every incomplete or inconsistent state as `needs_fix` with zer
 | Corrupted or multi-row staging result | `needs_fix` |
 | Staging/marker pair complete but outbox missing or empty (interrupted publication) | `needs_fix` |
 | Outbox nonempty with no staged evidence, or not the exact staged row | `needs_fix`, outbox untouched |
+| Pre-existing final-path artifact before lookup (zero-byte file, directory, symlink/broken link, unreadable or stat-failing entry) | `needs_fix`, zero lookups, artifact untouched |
 | Final outbox filename created by another share participant during the lookup | `needs_fix`, destination byte-for-byte unchanged, temp file retained for diagnosis |
+| Publication durability unconfirmed (write-through or directory-fsync failure) | `needs_fix`, `outbox_published = false`, claim retained, temp file and staged result kept for diagnosis |
 | Exclusive claim cannot be released after a completed run | `needs_fix` (never `ok`/`already_processed`), `claim_release_failed = true`, claim retained for operator recovery |
 
 `already_processed` (exit 0, zero lookups) is reported only when the delegated Gate 4 state machine confirms exactly one clean processed marker plus exactly one fully valid matching staged result for the current job, and the final outbox file contains exactly that same single row.
@@ -136,7 +142,7 @@ Operator recovery for a stale claim or an incomplete marker/result state is manu
 1. Confirm no other handoff process is running on the VM.
 2. Record the aggregate evidence of the blocked run.
 3. Review the VM-local claim, staging, and marker artifacts without pasting their content anywhere.
-4. Only after review, remove the stale claim file by hand. Do not delete or edit staging results or markers to force a rerun; an incomplete staging/marker/publication state remains `needs_fix` by design and requires its own reviewed recovery decision, consistent with the Gate 4 recovery discipline.
+4. Only after review, remove the stale claim file by hand. For a claim retained after an unconfirmed publication commit, first confirm whether the final outbox entry actually exists and whether it matches the staged result before removing the claim. Do not delete or edit staging results, markers, temp files, or outbox artifacts to force a rerun; an incomplete staging/marker/publication state remains `needs_fix` by design and requires its own reviewed recovery decision, consistent with the Gate 4 recovery discipline.
 5. Rerun the handoff. A completed-but-unpublished or otherwise inconsistent state will still report `needs_fix` and will not run another lookup.
 
 ## Exact Operator Command

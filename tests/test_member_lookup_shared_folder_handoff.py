@@ -543,6 +543,33 @@ class MarkerResultStateTests(SharedFolderHandoffBase):
         self.assertEqual(self.hit_count(), 1)
         self.assertEqual(self.final.read_text(encoding="utf-8"), stale_text)
 
+    def test_preexisting_zero_byte_final_file_blocks_lookup(self):
+        write_jsonl(self.pending, [canonical_queue_row()])
+        self.final.write_text("", encoding="utf-8")
+        completed = self.run_cli(self.base_args(extra=self.fake_ps()))
+        self.assertEqual(completed.returncode, 2)
+        evidence = parse_evidence(completed.stdout)
+        self.assertEqual(evidence["status"], "needs_fix")
+        self.assertEqual(evidence["lookup_attempt_count"], "0")
+        self.assertEqual(evidence["ac2_lookup_invoked"], "false")
+        self.assertEqual(self.hit_count(), 0)
+        # The empty artifact is untouched: still present, still zero bytes.
+        self.assertTrue(self.final.is_file())
+        self.assertEqual(self.final.stat().st_size, 0)
+        self.assertFalse(self.staging.exists())
+
+    def test_preexisting_directory_at_final_path_blocks_lookup(self):
+        write_jsonl(self.pending, [canonical_queue_row()])
+        self.final.mkdir()
+        completed = self.run_cli(self.base_args(extra=self.fake_ps()))
+        self.assertEqual(completed.returncode, 2)
+        evidence = parse_evidence(completed.stdout)
+        self.assertEqual(evidence["status"], "needs_fix")
+        self.assertEqual(evidence["lookup_attempt_count"], "0")
+        self.assertEqual(evidence["ac2_lookup_invoked"], "false")
+        self.assertEqual(self.hit_count(), 0)
+        self.assertTrue(self.final.is_dir())
+
     def test_preseeded_nonempty_outbox_never_overwritten(self):
         write_jsonl(self.pending, [canonical_queue_row()])
         self.final.write_text('{"stale": true}\n', encoding="utf-8")
@@ -652,6 +679,34 @@ class FaultInjectionTests(SharedFolderHandoffBase):
         final_evidence = parse_evidence(recovered.stdout)
         self.assertEqual(final_evidence["status"], "already_processed")
         self.assertEqual(final_evidence["claim_release_failed"], "false")
+        self.assertEqual(self.hit_count(), 1)
+
+    def test_publication_durability_failure_never_reports_ok(self):
+        write_jsonl(self.pending, [canonical_queue_row()])
+        completed = self.run_cli(
+            self.base_args(extra=self.fake_ps()),
+            env={"SHARED_FOLDER_TEST_FAULT_INJECT": "fail_publication_durability"},
+        )
+        self.assertEqual(completed.returncode, 2)
+        evidence = parse_evidence(completed.stdout)
+        self.assertEqual(evidence["status"], "needs_fix")
+        self.assertEqual(evidence["outbox_published"], "false")
+        self.assertNotIn("status = ok", completed.stdout)
+        # The lookup ran once; the final name was never committed; the temp file
+        # and staged result stay for operator diagnosis (no silent repair).
+        self.assertEqual(self.hit_count(), 1)
+        self.assertFalse(self.final.exists())
+        self.assertTrue((self.outbox / PUBLISH_TMP_FILENAME).exists())
+        self.assertEqual(nonblank_lines(self.staging), 1)
+        # The claim is deliberately retained after an unconfirmed commit so the
+        # state cannot progress automatically.
+        self.assertTrue(self.claim.exists())
+
+        rerun = self.run_cli(self.base_args(extra=self.fake_ps()))
+        self.assertEqual(rerun.returncode, 2)
+        blocked = parse_evidence(rerun.stdout)
+        self.assertEqual(blocked["status"], "needs_fix")
+        self.assertEqual(blocked["preexisting_claim_detected"], "true")
         self.assertEqual(self.hit_count(), 1)
 
     def test_late_outbox_write_is_never_overwritten(self):
@@ -796,6 +851,10 @@ class SharedFolderHandoffDocsTest(unittest.TestCase):
         self.assertIn("claim_release_failed", text)
         self.assertIn("no-replace", text)
         self.assertIn("never overwritten", text)
+        self.assertIn("MoveFileExW", text)
+        self.assertIn("write-through", text)
+        self.assertIn("directory fsync", text)
+        self.assertIn("zero-byte", text)
         for forbidden in ("member create", "direct SQL"):
             self.assertIn(forbidden, text)
 
