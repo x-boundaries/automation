@@ -55,17 +55,14 @@ FORBIDDEN_WRITE_TOKENS = [
 # sheetName.value changes in the UI.
 SHEET_TAB_PLACEHOLDER = "REPLACE_WITH_SOURCE_TAB_NAME"
 
-# Documented Gate 4A canonical source headers plus helper and controlled review
-# columns (header names and mapper flags only; no row values, IDs, URLs, or locators).
+# The committed mapper schema is deliberately narrow: only the match column, the
+# controlled review/status columns, and the virtual row_number entry. It must never
+# pin unrelated intake/source headers, because the cached schema is a UI rendering
+# cache only (the Google Sheets v4.7 update operation stopped enforcing it in n8n
+# PR #10201) and pinned source headers previously mismatched the real operational
+# UAT tab headers (header names and mapper flags only; no row values, IDs, URLs,
+# or locators).
 EXPECTED_SCHEMA_COLUMNS = [
-    "Date & Time",
-    "Full Name",
-    "AutoCount MemberNo",
-    "Email Address",
-    "Birthday Month",
-    "Marketing Consent",
-    "PDPA Acknowledged",
-    "Gate4AApprovedForLookup",
     "Gate5AApprovedForMapping",
     "uat_lookup_job_id",
     "uat_lookup_state",
@@ -704,11 +701,13 @@ class Gate5AWorkflowTemplateTests(unittest.TestCase):
         self.assertEqual(columns["mappingMode"], "defineBelow")
         self.assertEqual(update_node["parameters"]["options"], {"cellFormat": "RAW"})
 
-        # The committed schema is the exact header list fetched from the live v4.7
-        # instance (names and flags only, no values, no locators). It lets the
-        # resource mapper render the committed mappings immediately and makes the
-        # runtime checkForSchemaChanges guard refuse the update when any documented
-        # UAT header is missing from the bound sheet.
+        # The committed schema is the narrow mapper-only column list (names and
+        # flags only, no values, no locators). It lets the resource mapper render
+        # the committed mappings immediately after import. It is a UI cache, not a
+        # runtime guard: the v4.7 update operation does not enforce the cached
+        # schema (checkForSchemaChanges was removed from update in n8n PR #10201),
+        # so it must not pin unrelated intake/source headers that can drift from
+        # the real operational UAT tab.
         self.assertEqual([field["id"] for field in columns["schema"]], EXPECTED_SCHEMA_COLUMNS)
         for field in columns["schema"]:
             self.assertEqual(set(field) - ALLOWED_SCHEMA_FIELD_KEYS, set(), field["id"])
