@@ -39,4 +39,9 @@ Workflow JSON in this directory is source-controlled evidence of workflow design
 
 ## Helper Scripts
 
-No approved n8n import/export helper-script package was included in the current Toolkit healing output, and none is installed in this directory. Do not install improvised helper scripts. Helpers must only be installed by a future Toolkit refresh or a separately reviewed PR using the approved Toolkit source (`ai-agent-toolkit:n8n-workflow-helper-scripts`).
+The approved n8n import/export helper-script package from the Toolkit source (`ai-agent-toolkit:n8n-workflow-helper-scripts`, project `n8n.workflow-toolkit`) is installed under `scripts/` in this directory, as required by the n8n workflows playbook (`docs/agent-playbooks/n8n-workflows.md`) and the package's own consumer-repo layout.
+
+- Entry points: `scripts/_import-n8n-workflows-live.cmd` and `scripts/_export-n8n-workflows-live.cmd` (manual, review-required; they never run automatically).
+- The helper files are generated from Toolkit curated output. Do not edit them directly except for reviewed local deviations; report fixes upstream so the next Toolkit sync carries them.
+- Local deviation from the generic Toolkit template: new `AllLive` export filenames follow this repository's `*.workflow.json` snake_case convention (see Directory Rules) in `export-n8n-workflows-live.ps1` and `sync-n8n-live-exports.cjs`. This deviation is reported upstream for adoption.
+- Live import/export/sync through these helpers still requires explicit current-turn approval naming the target instance and operation.

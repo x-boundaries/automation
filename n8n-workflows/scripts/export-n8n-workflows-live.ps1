@@ -624,13 +624,14 @@ function Resolve-LiveMatch($RepoWorkflow, $LiveWorkflows) {
 }
 
 function Get-SafeWorkflowFileBase($Name, $Id) {
-  $base = ([string]$Name).ToLowerInvariant() -replace '[^a-z0-9]+', '-'
-  $base = $base.Trim('-')
+  # Local repo convention: new exports use lowercase snake_case *.workflow.json names.
+  $base = ([string]$Name).ToLowerInvariant() -replace '[^a-z0-9]+', '_'
+  $base = $base.Trim('_')
   if ([string]::IsNullOrWhiteSpace($base)) {
     $base = "workflow"
   }
   if ($base.Length -gt 80) {
-    $base = $base.Substring(0, 80).Trim('-')
+    $base = $base.Substring(0, 80).Trim('_')
   }
   if ([string]::IsNullOrWhiteSpace($base)) {
     $base = "workflow"
@@ -848,14 +849,16 @@ foreach ($workflow in $liveForExport) {
 
   if ($null -eq $targetFile) {
     $baseName = Get-SafeWorkflowFileBase $workflow.name $workflow.id
-    if ($usedBaseNames.ContainsKey($baseName)) {
-      $baseName = "$baseName-$(Get-StableIdSuffix $workflow.id)"
+    # Collision keys include the .workflow suffix so they compare against
+    # existing repo file base names, which keep .workflow after .json is stripped.
+    if ($usedBaseNames.ContainsKey("$baseName.workflow")) {
+      $baseName = "${baseName}_$(Get-StableIdSuffix $workflow.id)"
     }
-    while ($usedBaseNames.ContainsKey($baseName)) {
-      $baseName = "$baseName-$(Get-StableIdSuffix $workflow.id)"
+    while ($usedBaseNames.ContainsKey("$baseName.workflow")) {
+      $baseName = "${baseName}_$(Get-StableIdSuffix $workflow.id)"
     }
-    $usedBaseNames[$baseName] = $true
-    $targetFile = Join-Path $WorkflowDirPath "$baseName.json"
+    $usedBaseNames["$baseName.workflow"] = $true
+    $targetFile = Join-Path $WorkflowDirPath "$baseName.workflow.json"
   } else {
     $existingBaseName = [System.IO.Path]::GetFileNameWithoutExtension([System.IO.Path]::GetFileName([string]$targetFile))
     $usedBaseNames[$existingBaseName] = $true

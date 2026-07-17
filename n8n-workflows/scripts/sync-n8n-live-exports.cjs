@@ -109,13 +109,19 @@ function exportBaseName(exportFile) {
   return path.basename(exportFile).replace(/\.live-export\.json$/i, '');
 }
 
+function workflowFileNameFor(baseName) {
+  // Local repo convention: committed workflow exports end with .workflow.json.
+  // Base names derived from existing exports already carry the .workflow part.
+  return /\.workflow$/i.test(baseName) ? `${baseName}.json` : `${baseName}.workflow.json`;
+}
+
 function buildTargets(exportsDir, workflowDir, createMissingWorkflows, syncExportedOnly) {
   const targetsByBaseName = new Map();
 
   if (syncExportedOnly) {
     for (const exportFile of listExportFiles(exportsDir)) {
       const baseName = exportBaseName(exportFile);
-      const workflowFile = path.join(workflowDir, `${baseName}.json`);
+      const workflowFile = path.join(workflowDir, workflowFileNameFor(baseName));
       if (!fs.existsSync(workflowFile) && !createMissingWorkflows) {
         throw new Error(`Live export ${exportFile} has no matching repo workflow file ${workflowFile}. Use --create-missing-workflows only when creating repo files is intended.`);
       }
@@ -145,7 +151,7 @@ function buildTargets(exportsDir, workflowDir, createMissingWorkflows, syncExpor
       if (!targetsByBaseName.has(baseName)) {
         targetsByBaseName.set(baseName, {
           baseName,
-          workflowFile: path.join(workflowDir, `${baseName}.json`),
+          workflowFile: path.join(workflowDir, workflowFileNameFor(baseName)),
           exportFile,
           isNewWorkflow: true,
         });
