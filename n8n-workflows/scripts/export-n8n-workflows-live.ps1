@@ -14,6 +14,7 @@ param(
   [switch]$IncludeArchived,
   [switch]$PublishedOnly,
   [switch]$PreserveTags,
+  [switch]$ConfirmLiveExport,
   [switch]$DryRun
 )
 
@@ -654,6 +655,37 @@ function Write-LiveWorkflowExportFile($Workflow, $ExportFile) {
   Write-Utf8NoBomText -Path $ExportFile -Text (($Workflow | ConvertTo-Json -Depth 100) + "`n")
 }
 
+function Read-LiveExportChoice($Prompt) {
+  while ($true) {
+    $choice = Read-Host $Prompt
+    if ([string]::IsNullOrWhiteSpace($choice)) {
+      return $false
+    }
+
+    $normalized = $choice.Trim().Substring(0, 1).ToUpperInvariant()
+    if ($normalized -eq "X") { return $true }
+    if ($normalized -eq "E") { return $false }
+    Write-Step "WARN" "Invalid choice. Press X to export and sync or E to exit without changes."
+  }
+}
+
+function Invoke-LiveExportConfirmationGate([int]$PlannedCount) {
+  if ($ConfirmLiveExport) { return }
+
+  Write-Section "Live Export Confirmation"
+  Write-Host "This will write raw live exports under '$(Get-DisplayPath $ExportDirPath)', replace or create tracked workflow JSON under '$(Get-DisplayPath $WorkflowDirPath)', and refresh credential bindings under .n8n-local."
+  Write-Host "Use -DryRun to preview without changes, or pass -ConfirmLiveExport to pre-approve this step."
+
+  if ([Console]::IsInputRedirected) {
+    throw "Live export sync requires explicit confirmation. Input is non-interactive, so rerun with -ConfirmLiveExport (after reviewing a -DryRun preview) or run interactively and answer the prompt. No files were changed."
+  }
+
+  if (-not (Read-LiveExportChoice ("Export and sync {0} workflow(s) from live n8n into the repository now? Press X to export and sync or E to exit" -f $PlannedCount))) {
+    Write-Step "STOP" "Live export cancelled before any change. No files were changed."
+    exit 0
+  }
+}
+
 $WorkflowDirPath = Resolve-WorkflowDirPath
 $ExportDirPath = Join-Path $RepoRoot $ExportDir
 $BindingsFilePath = Join-Path $RepoRoot $BindingsFile
@@ -768,6 +800,13 @@ if ($Mode -eq "RepoTrackedOnly") {
     Write-Host "No live exports were written and no workflow files were changed."
     exit 0
   }
+
+  Write-Section "Planned Actions"
+  foreach ($planned in $plannedExports) {
+    Write-Step "PLAN" "$($planned.RepoFile.Name) -> $(Get-DisplayPath $planned.ExportFile)"
+  }
+
+  Invoke-LiveExportConfirmationGate $plannedExports.Count
 
   Initialize-RunDirectory $ExportDirPath
   foreach ($planned in $plannedExports) {
@@ -897,6 +936,8 @@ if ($plannedAllLive.Count -eq 0) {
   Write-Host "No live exports were written and no workflow files were changed."
   exit 0
 }
+
+Invoke-LiveExportConfirmationGate $plannedAllLive.Count
 
 New-Item -ItemType Directory -Force -Path $WorkflowDirPath | Out-Null
 Initialize-RunDirectory $ExportDirPath
