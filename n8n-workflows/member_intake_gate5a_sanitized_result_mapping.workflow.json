@@ -175,8 +175,8 @@
           ],
           "schema": [
             {
-              "id": "Timestamp",
-              "displayName": "Timestamp",
+              "id": "Date & Time",
+              "displayName": "Date & Time",
               "required": false,
               "defaultMatch": false,
               "display": true,
@@ -193,8 +193,8 @@
               "canBeUsedToMatch": true
             },
             {
-              "id": "Mobile Number",
-              "displayName": "Mobile Number",
+              "id": "AutoCount MemberNo",
+              "displayName": "AutoCount MemberNo",
               "required": false,
               "defaultMatch": false,
               "display": true,
@@ -220,8 +220,8 @@
               "canBeUsedToMatch": true
             },
             {
-              "id": "Marketing Consent  ",
-              "displayName": "Marketing Consent  ",
+              "id": "Marketing Consent",
+              "displayName": "Marketing Consent",
               "required": false,
               "defaultMatch": false,
               "display": true,
