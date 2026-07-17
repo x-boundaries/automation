@@ -934,7 +934,12 @@ class Gate4ARunbookTests(unittest.TestCase):
             self.assertNotIn(".live-import.json", lowered, tracked_path)
             self.assertNotIn("raw_local_only", lowered, tracked_path)
 
-        workflow_files = [p for p in tracked if p.startswith("n8n-workflows/")]
+        # Only committed workflow exports are held to the raw-live-export ban;
+        # helper scripts under n8n-workflows/scripts/ legitimately name their
+        # credential-binding parameters.
+        workflow_files = [
+            p for p in tracked if p.startswith("n8n-workflows/") and p.endswith(".workflow.json")
+        ]
         self.assertIn("n8n-workflows/member_intake_gate4a_container_queue_write.workflow.json", workflow_files)
         for workflow_path in workflow_files:
             text = (ROOT / workflow_path).read_text(encoding="utf-8")
