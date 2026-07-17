@@ -43,11 +43,21 @@ function stripLiveOnlyFields(workflow, options = {}) {
   clean.active = false;
 
   if (clean.description == null) delete clean.description;
+  if (clean.meta && typeof clean.meta === 'object') {
+    // meta.instanceId identifies the private live instance and must never
+    // reach a tracked export.
+    delete clean.meta.instanceId;
+    if (Object.keys(clean.meta).length === 0) delete clean.meta;
+  }
   if (clean.meta == null) delete clean.meta;
 
   for (const node of clean.nodes || []) {
     delete node.credentials;
     delete node.webhookId;
+    if (node.meta && typeof node.meta === 'object') {
+      delete node.meta.instanceId;
+      if (Object.keys(node.meta).length === 0) delete node.meta;
+    }
   }
 
   return clean;

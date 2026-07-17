@@ -17,6 +17,7 @@ param(
   [switch]$SkipCredentialBindingRefresh,
   [switch]$RestartContainerAfterImport,
   [switch]$ForceImport,
+  [switch]$ConfirmLiveImport,
   [switch]$DryRun
 )
 
@@ -160,6 +161,20 @@ function Write-CommandOutput($Lines, [string]$DefaultStatus = "INFO") {
     }
 
     Write-Host $text
+  }
+}
+
+function Read-LiveImportChoice($Prompt) {
+  while ($true) {
+    $choice = Read-Host $Prompt
+    if ([string]::IsNullOrWhiteSpace($choice)) {
+      return $false
+    }
+
+    $normalized = $choice.Trim().Substring(0, 1).ToUpperInvariant()
+    if ($normalized -eq "I") { return $true }
+    if ($normalized -eq "E") { return $false }
+    Write-Step "WARN" "Invalid choice. Press I to import into live n8n or E to exit without changes."
   }
 }
 
@@ -1122,6 +1137,22 @@ if ($preflight.PlannedImports.Count -eq 0) {
   Write-Host "1. No import is needed right now."
   Write-Host "Deleting archived workflows is not supported by these CLI helper scripts yet."
   exit 0
+}
+
+if (-not $ConfirmLiveImport) {
+  Write-Section "Live Import Confirmation"
+  Write-WorkflowActionSummary $preflight.PlannedImports "Planned"
+  Write-Host "This will mutate live n8n workflows in container '$Container'."
+  Write-Host "Use -DryRun to preview without changes, or pass -ConfirmLiveImport to pre-approve this step."
+
+  if ([Console]::IsInputRedirected) {
+    throw "Live import requires explicit confirmation. Input is non-interactive, so rerun with -ConfirmLiveImport (after reviewing a -DryRun preview) or run interactively and answer the prompt. Live n8n was not changed."
+  }
+
+  if (-not (Read-LiveImportChoice ("Import {0} workflow(s) into live n8n now? Press I to import or E to exit" -f $preflight.PlannedImports.Count))) {
+    Write-Step "STOP" "Live import cancelled before any change. Live n8n was not changed."
+    exit 0
+  }
 }
 
 Invoke-ProjectWorkflowHook "before-live-import" @{

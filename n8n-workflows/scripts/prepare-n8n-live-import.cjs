@@ -321,6 +321,13 @@ function restoreLiveWebhookIds(workflow, liveWorkflow) {
   for (const node of workflow.nodes || []) {
     let liveNode = node.id ? byId.get(node.id) : null;
 
+    if (liveNode && nodeKey(liveNode) !== nodeKey(node)) {
+      // A reused node id with a different name/type is a changed node identity.
+      // Restoring its old webhookId could attach an unrelated live endpoint.
+      console.warn(`Ignored id-only webhookId match for node "${node.name || node.id || '(unknown)'}": the live node with the same id has a different name/type. Use an explicit migration if this endpoint must carry over.`);
+      liveNode = null;
+    }
+
     if (!liveNode) {
       const matches = byNameType.get(nodeKey(node)) || [];
       if (matches.length === 1) {

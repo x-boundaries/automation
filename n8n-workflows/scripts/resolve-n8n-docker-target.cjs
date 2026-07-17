@@ -5,7 +5,18 @@ const { spawnSync } = require('node:child_process');
 const fs = require('node:fs');
 const readline = require('node:readline/promises');
 
-const N8N_IMAGES = new Set(['n8nio/n8n', 'n8nio/n8n:stable']);
+const N8N_IMAGE_REPOSITORY = 'n8nio/n8n';
+
+function isN8nImage(image) {
+  if (typeof image !== 'string' || image === '') return false;
+  // Accept any tag or digest of the official n8nio/n8n image, e.g.
+  // n8nio/n8n, n8nio/n8n:stable, n8nio/n8n:1.99.1, n8nio/n8n@sha256:...
+  const withoutDigest = image.split('@')[0];
+  const lastSlash = withoutDigest.lastIndexOf('/');
+  const tagSeparator = withoutDigest.indexOf(':', lastSlash + 1);
+  const repository = tagSeparator === -1 ? withoutDigest : withoutDigest.slice(0, tagSeparator);
+  return repository === N8N_IMAGE_REPOSITORY;
+}
 const DEFAULT_SERVICE = 'n8n';
 
 function parseArgs(args = []) {
@@ -173,7 +184,7 @@ function findByComposeLabels(allRunning, options) {
 }
 
 function findByImageFallback(allRunning) {
-  return allRunning.filter((candidate) => N8N_IMAGES.has(candidate.image));
+  return allRunning.filter((candidate) => isN8nImage(candidate.image));
 }
 
 function candidateLines(candidates) {
@@ -344,6 +355,7 @@ module.exports = {
   findByImageFallback,
   formatCandidateList,
   invalidSelectionMessage,
+  isN8nImage,
   missingTargetMessage,
   normalizeContainer,
   overrideGuidance,
