@@ -55,15 +55,15 @@ FORBIDDEN_WRITE_TOKENS = [
 # sheetName.value changes in the UI.
 SHEET_TAB_PLACEHOLDER = "REPLACE_WITH_SOURCE_TAB_NAME"
 
-# Exact header list fetched from the live v4.7 instance during the 2026-07-15 UAT
-# (header names and mapper flags only; no row values, IDs, URLs, or locators).
+# Documented Gate 4A canonical source headers plus helper and controlled review
+# columns (header names and mapper flags only; no row values, IDs, URLs, or locators).
 EXPECTED_SCHEMA_COLUMNS = [
-    "Timestamp",
+    "Date & Time",
     "Full Name",
-    "Mobile Number",
+    "AutoCount MemberNo",
     "Email Address",
     "Birthday Month",
-    "Marketing Consent  ",
+    "Marketing Consent",
     "PDPA Acknowledged",
     "Gate4AApprovedForLookup",
     "Gate5AApprovedForMapping",
