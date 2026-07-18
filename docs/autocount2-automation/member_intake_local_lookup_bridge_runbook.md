@@ -54,6 +54,8 @@ For UAT, polling may be manual or run by Windows Task Scheduler every 1 minute. 
 
 The queue can be implemented later with an approved cloud queue, protected queue API, n8n data table, or similar service. This PR does not choose or configure a live queue provider.
 
+For the current single-machine deployment, where n8n runs on the main physical PC and AutoCount runs inside a Windows VM on that same PC, a private host-to-VM shared folder replaces the tunneled queue/API surface entirely for UAT. That topology, its boundaries, and its VM-side manual runner are documented in [member_intake_shared_folder_lookup_bridge_runbook.md](member_intake_shared_folder_lookup_bridge_runbook.md); it reuses the Gate 4A and Gate 5A contracts unchanged and introduces no network surface.
+
 ## Protected Tunnel Boundary
 
 Cloudflare Tunnel / reverse proxy is allowed as future/dev architecture only for the protected queue/API surface. It must terminate on the queue/API layer, not on the AC2 runtime, AutoCount process, PowerShell runner, SQL Server, RDP, file shares, or any member create/update/delete/write path.
