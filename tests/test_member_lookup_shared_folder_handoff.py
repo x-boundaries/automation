@@ -1,12 +1,18 @@
 import base64
+import contextlib
+import importlib
+import io
 import json
 import os
+import stat
 import subprocess
 import sys
 import tempfile
 import time
+import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -218,6 +224,25 @@ def write_fake_powershell(directory, *, status="ok", hits_file=None, delay_secon
     return exe
 
 
+def load_handoff_module():
+    """Import the runner module for direct unit-level classification tests."""
+    scripts_dir = str(ROOT / "scripts")
+    if scripts_dir not in sys.path:
+        sys.path.insert(0, scripts_dir)
+    return importlib.import_module("member_lookup_shared_folder_handoff")
+
+
+def fake_lstat_result(st_mode, *, st_size=1, st_file_attributes=None):
+    """A minimal lstat-shaped object for deterministic reparse-point modelling."""
+    result = types.SimpleNamespace(st_mode=st_mode, st_size=st_size)
+    if st_file_attributes is not None:
+        result.st_file_attributes = st_file_attributes
+    return result
+
+
+REPARSE_POINT_ATTRIBUTE = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+
+
 def parse_evidence(text):
     return dict(
         tuple(line.split(" = ", 1)) for line in text.splitlines() if " = " in line
@@ -304,6 +329,34 @@ class SharedFolderHandoffBase(unittest.TestCase):
         self.assertEqual(evidence["ac2_lookup_invoked"], "false")
         self.assertEqual(self.hit_count(), 0)
         self.assertFalse(self.final.exists())
+
+    def make_symlink(self, link_path, target):
+        try:
+            os.symlink(str(target), str(link_path))
+        except (OSError, NotImplementedError):
+            self.skipTest("symlink creation not supported in this environment")
+
+    def make_junction(self, link_path, target):
+        if os.name != "nt":
+            self.skipTest("junction creation is Windows-only")
+        completed = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(link_path), str(target)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if completed.returncode != 0:
+            self.skipTest("junction creation not supported in this environment")
+
+    def assert_blocked_before_lookup(self, completed):
+        self.assertEqual(completed.returncode, 2)
+        self.assertNotIn("Traceback", completed.stderr)
+        evidence = parse_evidence(completed.stdout)
+        self.assertEqual(evidence["status"], "needs_fix")
+        self.assertEqual(evidence["lookup_attempt_count"], "0")
+        self.assertEqual(evidence["ac2_lookup_invoked"], "false")
+        self.assertEqual(self.hit_count(), 0)
+        return evidence
 
 
 class OptInAndModeTests(SharedFolderHandoffBase):
@@ -583,22 +636,6 @@ class MarkerResultStateTests(SharedFolderHandoffBase):
 
 
 class BoundaryClassificationTests(SharedFolderHandoffBase):
-    def make_symlink(self, link_path, target):
-        try:
-            os.symlink(str(target), str(link_path))
-        except (OSError, NotImplementedError):
-            self.skipTest("symlink creation not supported in this environment")
-
-    def assert_blocked_before_lookup(self, completed):
-        self.assertEqual(completed.returncode, 2)
-        self.assertNotIn("Traceback", completed.stderr)
-        evidence = parse_evidence(completed.stdout)
-        self.assertEqual(evidence["status"], "needs_fix")
-        self.assertEqual(evidence["lookup_attempt_count"], "0")
-        self.assertEqual(evidence["ac2_lookup_invoked"], "false")
-        self.assertEqual(self.hit_count(), 0)
-        return evidence
-
     def test_preexisting_temp_regular_file_blocks_lookup(self):
         write_jsonl(self.pending, [canonical_queue_row()])
         tmp = self.outbox / PUBLISH_TMP_FILENAME
@@ -639,6 +676,799 @@ class BoundaryClassificationTests(SharedFolderHandoffBase):
         completed = self.run_cli(self.base_args(extra=self.fake_ps()))
         self.assert_blocked_before_lookup(completed)
         self.assertTrue(self.pending.is_dir())
+
+
+class ShareDirectoryBoundaryTests(SharedFolderHandoffBase):
+    """The share root, inbox, and outbox entries must be genuine directories.
+
+    A symlinked/junction/reparse-point directory entry is rejected fail-closed
+    before the claim and before any lookup, and is never followed or resolved
+    -- even when the redirect target contains a perfectly valid layout.
+    """
+
+    def build_real_share(self, base_name):
+        real_share = Path(self._tmp.name) / base_name
+        (real_share / "inbox").mkdir(parents=True)
+        (real_share / "outbox").mkdir()
+        write_jsonl(real_share / "inbox" / PENDING_FILENAME, [canonical_queue_row()])
+        return real_share
+
+    def run_with_share_root(self, share_root):
+        arguments = self.base_args(extra=self.fake_ps())
+        index = arguments.index("--share-root")
+        arguments[index + 1] = str(share_root)
+        return self.run_cli(arguments)
+
+    def assert_blocked_before_claim(self, completed):
+        self.assert_blocked_before_lookup(completed)
+        self.assertFalse(self.claim.exists())
+        self.assertFalse(self.staging.exists())
+
+    def test_symlinked_share_root_rejected(self):
+        real_share = self.build_real_share("real_share_for_root_link")
+        link = Path(self._tmp.name) / "share_root_link"
+        self.make_symlink(link, real_share)
+        self.assert_blocked_before_claim(self.run_with_share_root(link))
+        self.assertTrue(link.is_symlink())
+        self.assertFalse((real_share / "outbox" / RESULT_FILENAME).exists())
+
+    def test_symlinked_inbox_directory_rejected(self):
+        real_inbox = Path(self._tmp.name) / "real_inbox_elsewhere"
+        write_jsonl(real_inbox / PENDING_FILENAME, [canonical_queue_row()])
+        self.inbox.rmdir()
+        self.make_symlink(self.inbox, real_inbox)
+        completed = self.run_cli(self.base_args(extra=self.fake_ps()))
+        self.assert_blocked_before_claim(completed)
+        self.assertTrue(self.inbox.is_symlink())
+        self.assertFalse(self.final.exists())
+
+    def test_symlinked_outbox_directory_rejected(self):
+        write_jsonl(self.pending, [canonical_queue_row()])
+        real_outbox = Path(self._tmp.name) / "real_outbox_elsewhere"
+        real_outbox.mkdir()
+        self.outbox.rmdir()
+        self.make_symlink(self.outbox, real_outbox)
+        completed = self.run_cli(self.base_args(extra=self.fake_ps()))
+        self.assert_blocked_before_claim(completed)
+        self.assertTrue(self.outbox.is_symlink())
+        # The final result name was never created through the redirect.
+        self.assertFalse((real_outbox / RESULT_FILENAME).exists())
+
+    @unittest.skipUnless(os.name == "nt", "Windows junction behaviour")
+    def test_junction_share_root_rejected(self):
+        real_share = self.build_real_share("real_share_for_root_junction")
+        junction = Path(self._tmp.name) / "share_root_junction"
+        self.make_junction(junction, real_share)
+        self.assert_blocked_before_claim(self.run_with_share_root(junction))
+        # The junction entry itself is untouched and was never followed.
+        self.assertTrue(junction.exists())
+        self.assertFalse((real_share / "outbox" / RESULT_FILENAME).exists())
+
+    @unittest.skipUnless(os.name == "nt", "Windows junction behaviour")
+    def test_junction_inbox_directory_rejected(self):
+        real_inbox = Path(self._tmp.name) / "real_inbox_junction_target"
+        write_jsonl(real_inbox / PENDING_FILENAME, [canonical_queue_row()])
+        self.inbox.rmdir()
+        self.make_junction(self.inbox, real_inbox)
+        completed = self.run_cli(self.base_args(extra=self.fake_ps()))
+        self.assert_blocked_before_claim(completed)
+        self.assertFalse(self.final.exists())
+
+    @unittest.skipUnless(os.name == "nt", "Windows junction behaviour")
+    def test_junction_outbox_directory_rejected(self):
+        write_jsonl(self.pending, [canonical_queue_row()])
+        real_outbox = Path(self._tmp.name) / "real_outbox_junction_target"
+        real_outbox.mkdir()
+        self.outbox.rmdir()
+        self.make_junction(self.outbox, real_outbox)
+        completed = self.run_cli(self.base_args(extra=self.fake_ps()))
+        self.assert_blocked_before_claim(completed)
+        self.assertFalse((real_outbox / RESULT_FILENAME).exists())
+
+    def run_main_in_process(self, arguments):
+        """Run main() in-process so resolver invocations can be instrumented."""
+        module = load_handoff_module()
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            code = module.main(arguments)
+        return code, parse_evidence(buffer.getvalue())
+
+    def forbid_resolution(self, module):
+        """Patch the resolving containment helper so any call fails the test."""
+        return mock.patch.object(
+            module,
+            "is_inside",
+            side_effect=AssertionError(
+                "is_inside (Path.resolve) must not run for a rejected share root"
+            ),
+        )
+
+    def test_symlinked_share_root_rejected_before_resolution(self):
+        real_share = self.build_real_share("real_share_for_root_link_ordering")
+        link = Path(self._tmp.name) / "share_root_link_ordering"
+        self.make_symlink(link, real_share)
+        module = load_handoff_module()
+        arguments = self.base_args(extra=self.fake_ps())
+        arguments[arguments.index("--share-root") + 1] = str(link)
+        with self.forbid_resolution(module):
+            code, evidence = self.run_main_in_process(arguments)
+        self.assertEqual(code, 2)
+        self.assertEqual(evidence["status"], "needs_fix")
+        self.assertEqual(evidence["lookup_attempt_count"], "0")
+        self.assertEqual(evidence["ac2_lookup_invoked"], "false")
+        self.assertEqual(self.hit_count(), 0)
+        self.assertFalse(self.claim.exists())
+        self.assertTrue(link.is_symlink())
+
+    @unittest.skipUnless(os.name == "nt", "Windows junction behaviour")
+    def test_junction_share_root_rejected_before_resolution(self):
+        real_share = self.build_real_share("real_share_for_root_junction_ordering")
+        junction = Path(self._tmp.name) / "share_root_junction_ordering"
+        self.make_junction(junction, real_share)
+        module = load_handoff_module()
+        arguments = self.base_args(extra=self.fake_ps())
+        arguments[arguments.index("--share-root") + 1] = str(junction)
+        with self.forbid_resolution(module):
+            code, evidence = self.run_main_in_process(arguments)
+        self.assertEqual(code, 2)
+        self.assertEqual(evidence["status"], "needs_fix")
+        self.assertEqual(evidence["lookup_attempt_count"], "0")
+        self.assertEqual(self.hit_count(), 0)
+        self.assertFalse(self.claim.exists())
+        self.assertFalse((real_share / "outbox" / RESULT_FILENAME).exists())
+
+    def test_reparse_share_root_rejected_before_resolution_mocked(self):
+        # Deterministic on hosts without symlink or junction privileges: the
+        # share root lstat reports a reparse-point directory while every other
+        # path behaves normally, and the resolving helper must never run.
+        write_jsonl(self.pending, [canonical_queue_row()])
+        module = load_handoff_module()
+        real_lstat = os.lstat
+        share_root_text = str(self.share_root)
+
+        def reparse_root_lstat(path, *args, **kwargs):
+            if str(path) == share_root_text:
+                return fake_lstat_result(
+                    stat.S_IFDIR, st_file_attributes=REPARSE_POINT_ATTRIBUTE
+                )
+            return real_lstat(path, *args, **kwargs)
+
+        with mock.patch.object(module.os, "lstat", side_effect=reparse_root_lstat), \
+                self.forbid_resolution(module):
+            code, evidence = self.run_main_in_process(
+                self.base_args(extra=self.fake_ps())
+            )
+        self.assertEqual(code, 2)
+        self.assertEqual(evidence["status"], "needs_fix")
+        self.assertEqual(evidence["lookup_attempt_count"], "0")
+        self.assertEqual(self.hit_count(), 0)
+        self.assertFalse(self.claim.exists())
+
+    def test_plain_share_root_still_runs_outside_share_check(self):
+        # A legitimate plain-directory share root must still perform the
+        # outside-share containment validation (which resolves paths) and
+        # refuse VM-local state placed inside the share.
+        write_jsonl(self.pending, [canonical_queue_row()])
+        module = load_handoff_module()
+        arguments = self.base_args(extra=self.fake_ps())
+        arguments[arguments.index("--claim-json") + 1] = str(
+            self.share_root / "claim.json"
+        )
+        with mock.patch.object(
+            module,
+            "vm_local_state_outside_share",
+            wraps=module.vm_local_state_outside_share,
+        ) as containment:
+            code, evidence = self.run_main_in_process(arguments)
+        self.assertEqual(code, 2)
+        self.assertTrue(containment.called)
+        self.assertEqual(evidence["status"], "refused")
+        self.assertEqual(evidence["vm_local_state_outside_share"], "false")
+        self.assertEqual(self.hit_count(), 0)
+
+    def forbid_filesystem_classification(self, module):
+        """Patch lstat so any classification attempt fails the test."""
+        return mock.patch.object(
+            module.os,
+            "lstat",
+            side_effect=AssertionError(
+                "no lstat may run for a non-normal share-root pathname"
+            ),
+        )
+
+    def assert_rejected_root_evidence(self, code, evidence, supplied_root):
+        self.assertEqual(code, 2)
+        self.assertEqual(evidence["status"], "needs_fix")
+        self.assertEqual(evidence["lookup_attempt_count"], "0")
+        self.assertEqual(evidence["ac2_lookup_invoked"], "false")
+        self.assertEqual(self.hit_count(), 0)
+        self.assertFalse(self.claim.exists())
+        self.assertFalse(self.staging.exists())
+        # The sanitised aggregate evidence never exposes the supplied path.
+        self.assertNotIn(str(supplied_root), "\n".join(f"{k} = {v}" for k, v in evidence.items()))
+
+    def test_share_root_path_normality_contract(self):
+        module = load_handoff_module()
+        normal = module.share_root_path_is_normal
+        # The real (absolute, normal) test share root is accepted as-is.
+        self.assertTrue(normal(str(self.share_root)))
+        # Non-normal traversal and relative forms are rejected as pure text.
+        self.assertFalse(normal(str(self.share_root) + os.sep + ".."))
+        self.assertFalse(normal(".."))
+        self.assertFalse(normal(f"relative{os.sep}share"))
+        if os.name == "nt":
+            self.assertTrue(normal("C:\\xb_share\\member_lookup"))
+            self.assertTrue(normal("X:\\xb_member_lookup_handoff"))
+            self.assertTrue(normal("C:\\"))
+            # A UNC \\host\share prefix is the trusted anchor; components
+            # after it must still be normal.
+            self.assertTrue(normal("\\\\host\\share\\member_lookup"))
+            self.assertFalse(normal("\\\\host\\share\\member_lookup\\.."))
+            self.assertFalse(normal("C:\\share\\..\\share"))
+            self.assertFalse(normal("C:\\share\\."))
+            self.assertFalse(normal("C:\\share\\\\double_separator"))
+            self.assertFalse(normal("C:relative_to_drive"))
+        else:
+            self.assertTrue(normal("/srv/xb_share"))
+            self.assertFalse(normal("/srv/xb_share/.."))
+            self.assertFalse(normal("/srv/./xb_share"))
+            self.assertFalse(normal("//srv/xb_share"))
+
+    def test_parent_traversal_share_root_rejected_without_any_lstat(self):
+        # Plain '..' traversal must be rejected as pure text: no lstat, no
+        # containment resolution, no claim, no lookup.
+        write_jsonl(self.pending, [canonical_queue_row()])
+        module = load_handoff_module()
+        unsafe_root = f"{self.share_root}{os.sep}inbox{os.sep}.."
+        arguments = self.base_args(extra=self.fake_ps())
+        arguments[arguments.index("--share-root") + 1] = unsafe_root
+        with self.forbid_filesystem_classification(module), \
+                self.forbid_resolution(module):
+            code, evidence = self.run_main_in_process(arguments)
+        self.assert_rejected_root_evidence(code, evidence, unsafe_root)
+
+    def test_parent_traversal_share_root_rejected_end_to_end(self):
+        write_jsonl(self.pending, [canonical_queue_row()])
+        unsafe_root = f"{self.share_root}{os.sep}inbox{os.sep}.."
+        arguments = self.base_args(extra=self.fake_ps())
+        arguments[arguments.index("--share-root") + 1] = unsafe_root
+        completed = self.run_cli(arguments)
+        self.assert_blocked_before_claim(completed)
+        self.assertNotIn(unsafe_root, completed.stdout)
+
+    def test_symlink_prefix_parent_traversal_rejected(self):
+        # <symlink-to-real-share-subdirectory>/.. reaches the real share root
+        # only by traversing the symlinked prefix; it must be rejected as pure
+        # text before any lstat can perform that traversal.
+        real_share = self.build_real_share("real_share_for_link_prefix")
+        link = Path(self._tmp.name) / "link_prefix_to_share_subdir"
+        self.make_symlink(link, real_share / "inbox")
+        module = load_handoff_module()
+        unsafe_root = f"{link}{os.sep}.."
+        arguments = self.base_args(extra=self.fake_ps())
+        arguments[arguments.index("--share-root") + 1] = unsafe_root
+        with self.forbid_filesystem_classification(module), \
+                self.forbid_resolution(module):
+            code, evidence = self.run_main_in_process(arguments)
+        self.assert_rejected_root_evidence(code, evidence, unsafe_root)
+        self.assertFalse((real_share / "outbox" / RESULT_FILENAME).exists())
+
+    @unittest.skipUnless(os.name == "nt", "Windows junction behaviour")
+    def test_junction_prefix_parent_traversal_rejected(self):
+        real_share = self.build_real_share("real_share_for_junction_prefix")
+        junction = Path(self._tmp.name) / "junction_prefix_to_share_subdir"
+        self.make_junction(junction, real_share / "inbox")
+        module = load_handoff_module()
+        unsafe_root = f"{junction}{os.sep}.."
+        arguments = self.base_args(extra=self.fake_ps())
+        arguments[arguments.index("--share-root") + 1] = unsafe_root
+        with self.forbid_filesystem_classification(module), \
+                self.forbid_resolution(module):
+            code, evidence = self.run_main_in_process(arguments)
+        self.assert_rejected_root_evidence(code, evidence, unsafe_root)
+        self.assertFalse((real_share / "outbox" / RESULT_FILENAME).exists())
+
+    @unittest.skipUnless(os.name == "nt", "Windows junction behaviour")
+    def test_redirected_intermediate_component_rejected_junction(self):
+        # No '..' involved: an intermediate junction component in an otherwise
+        # normal absolute path must be detected by the component walk and the
+        # entries beneath it must never be accessed.
+        real_parent = Path(self._tmp.name) / "real_parent_for_intermediate"
+        real_parent.mkdir()
+        real_share = real_parent / "real_share"
+        (real_share / "inbox").mkdir(parents=True)
+        (real_share / "outbox").mkdir()
+        write_jsonl(real_share / "inbox" / PENDING_FILENAME, [canonical_queue_row()])
+        junction = Path(self._tmp.name) / "junction_intermediate"
+        self.make_junction(junction, real_parent)
+        completed = self.run_with_share_root(junction / "real_share")
+        self.assert_blocked_before_claim(completed)
+        self.assertFalse((real_share / "outbox" / RESULT_FILENAME).exists())
+
+    def test_redirected_intermediate_component_rejected_mocked(self):
+        # Deterministic on hosts without symlink or junction privileges: an
+        # intermediate ancestor of a normal absolute share-root path reports a
+        # reparse point; the walk must reject there and never lstat anything
+        # at or below the share root, and the resolver must never run.
+        write_jsonl(self.pending, [canonical_queue_row()])
+        module = load_handoff_module()
+        real_lstat = os.lstat
+        redirected_ancestor = str(self.share_root.parent)
+        observed_lstat_paths = []
+
+        def reparse_ancestor_lstat(path, *args, **kwargs):
+            observed_lstat_paths.append(str(path))
+            if str(path) == redirected_ancestor:
+                return fake_lstat_result(
+                    stat.S_IFDIR, st_file_attributes=REPARSE_POINT_ATTRIBUTE
+                )
+            return real_lstat(path, *args, **kwargs)
+
+        with mock.patch.object(module.os, "lstat", side_effect=reparse_ancestor_lstat), \
+                self.forbid_resolution(module):
+            code, evidence = self.run_main_in_process(
+                self.base_args(extra=self.fake_ps())
+            )
+        self.assert_rejected_root_evidence(code, evidence, self.share_root)
+        # The walk stopped at the redirected intermediate component: nothing
+        # at or below the share root was ever classified.
+        self.assertIn(redirected_ancestor, observed_lstat_paths)
+        self.assertNotIn(str(self.share_root), observed_lstat_paths)
+
+    def test_valid_share_root_components_accepted(self):
+        module = load_handoff_module()
+        # The real (plain, absolute, drive-style on Windows) share root passes
+        # the full component walk, so legitimate supported paths keep working.
+        self.assertTrue(
+            module.share_root_components_are_plain_directories(self.share_root)
+        )
+
+    def test_reparse_point_directory_entry_rejected_by_classifier(self):
+        # Deterministic reparse-point modelling on every platform: a directory
+        # entry carrying FILE_ATTRIBUTE_REPARSE_POINT (symlink, junction, or
+        # other redirection) must be rejected without being followed.
+        module = load_handoff_module()
+        reparse_dir = fake_lstat_result(
+            stat.S_IFDIR, st_file_attributes=REPARSE_POINT_ATTRIBUTE
+        )
+        with mock.patch.object(module.os, "lstat", return_value=reparse_dir):
+            self.assertFalse(module.directory_entry_is_plain_directory("any-share-dir"))
+        plain_dir = fake_lstat_result(stat.S_IFDIR, st_file_attributes=0)
+        with mock.patch.object(module.os, "lstat", return_value=plain_dir):
+            self.assertTrue(module.directory_entry_is_plain_directory("any-share-dir"))
+
+
+class ClaimDurabilityTests(SharedFolderHandoffBase):
+    def assert_unconfirmed_claim_durability_blocks_lookup(self, fault_point):
+        write_jsonl(self.pending, [canonical_queue_row()])
+        completed = self.run_cli(
+            self.base_args(extra=self.fake_ps()),
+            env={"SHARED_FOLDER_TEST_FAULT_INJECT": fault_point},
+        )
+        self.assertEqual(completed.returncode, 2)
+        self.assertNotIn("Traceback", completed.stderr)
+        evidence = parse_evidence(completed.stdout)
+        self.assertEqual(evidence["status"], "needs_fix")
+        self.assertEqual(evidence["claim_durability_unconfirmed"], "true")
+        # Acquisition is complete only once the entry is durable, so an
+        # unconfirmed claim never counts as acquired and never permits a lookup.
+        self.assertEqual(evidence["claim_acquired"], "false")
+        self.assert_no_lookup_and_no_outbox(evidence)
+        self.assertFalse((self.outbox / PUBLISH_TMP_FILENAME).exists())
+        self.assertFalse(self.staging.exists())
+        # The indeterminate claim entry is left in place: never deleted,
+        # repaired, retried, or recreated.
+        self.assertTrue(self.claim.exists())
+
+        # The retained entry blocks the next run as a preexisting claim.
+        rerun = self.run_cli(self.base_args(extra=self.fake_ps()))
+        self.assertEqual(rerun.returncode, 2)
+        blocked = parse_evidence(rerun.stdout)
+        self.assertEqual(blocked["status"], "needs_fix")
+        self.assertEqual(blocked["preexisting_claim_detected"], "true")
+        self.assertEqual(self.hit_count(), 0)
+        self.assertTrue(self.claim.exists())
+
+        # Documented operator recovery: remove the stale claim by hand, then a
+        # clean run completes normally.
+        self.claim.unlink()
+        recovered = self.run_cli(self.base_args(extra=self.fake_ps()))
+        self.assertEqual(recovered.returncode, 0, recovered.stdout + recovered.stderr)
+        final_evidence = parse_evidence(recovered.stdout)
+        self.assertEqual(final_evidence["status"], "ok")
+        self.assertEqual(final_evidence["claim_durability_unconfirmed"], "false")
+        self.assertEqual(self.hit_count(), 1)
+
+    def test_unconfirmed_directory_durability_blocks_lookup(self):
+        self.assert_unconfirmed_claim_durability_blocks_lookup("fail_claim_durability")
+
+    def test_unconfirmed_claim_file_fsync_blocks_lookup(self):
+        # Distinct from the parent-directory durability fault: the claim file
+        # itself fails to fsync after the exclusive entry was created. The
+        # failure must land in the same fail-closed durability_unconfirmed
+        # path instead of escaping as a traceback.
+        self.assert_unconfirmed_claim_durability_blocks_lookup("fail_claim_file_fsync")
+
+
+class ClaimStateDirectoryTests(SharedFolderHandoffBase):
+    """The VM-local claim-state directory is an operator setup prerequisite:
+    it must already exist as a plain directory and is never created, repaired,
+    or bootstrapped by the runner."""
+
+    def run_with_claim_path(self, claim_path):
+        arguments = self.base_args(extra=self.fake_ps())
+        arguments[arguments.index("--claim-json") + 1] = str(claim_path)
+        return self.run_cli(arguments)
+
+    def test_missing_claim_state_parent_blocks_before_claim_and_lookup(self):
+        write_jsonl(self.pending, [canonical_queue_row()])
+        missing_parent = self.vm_local / "state_dir_never_created"
+        claim_path = missing_parent / "claim.json"
+        completed = self.run_with_claim_path(claim_path)
+        self.assertEqual(completed.returncode, 2)
+        self.assertNotIn("Traceback", completed.stderr)
+        evidence = parse_evidence(completed.stdout)
+        self.assertEqual(evidence["status"], "needs_fix")
+        self.assertEqual(evidence["claim_acquired"], "false")
+        self.assertEqual(evidence["preexisting_claim_detected"], "false")
+        self.assert_no_lookup_and_no_outbox(evidence)
+        self.assertFalse(self.staging.exists())
+        # No claim was created, the missing directory was NOT silently
+        # created, and the private path never appears in the evidence.
+        self.assertFalse(claim_path.exists())
+        self.assertFalse(missing_parent.exists())
+        self.assertNotIn(str(claim_path), completed.stdout)
+
+    def test_claim_state_parent_regular_file_blocks_before_claim(self):
+        write_jsonl(self.pending, [canonical_queue_row()])
+        bogus_parent = self.vm_local / "state_entry_is_a_file"
+        bogus_parent.write_text("not-a-directory\n", encoding="utf-8")
+        completed = self.run_with_claim_path(bogus_parent / "claim.json")
+        self.assertEqual(completed.returncode, 2)
+        evidence = parse_evidence(completed.stdout)
+        self.assertEqual(evidence["status"], "needs_fix")
+        self.assertEqual(evidence["claim_acquired"], "false")
+        self.assert_no_lookup_and_no_outbox(evidence)
+        # The invalid entry is untouched.
+        self.assertEqual(
+            bogus_parent.read_text(encoding="utf-8"), "not-a-directory\n"
+        )
+
+    def test_valid_preexisting_claim_state_parent_supports_full_run(self):
+        # The operator-provisioned state directory (created in setUp, before
+        # execution) supports the complete claim/lookup/publish cycle.
+        write_jsonl(self.pending, [canonical_queue_row()])
+        completed = self.run_cli(self.base_args(extra=self.fake_ps()))
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        evidence = parse_evidence(completed.stdout)
+        self.assertEqual(evidence["status"], "ok")
+        self.assertEqual(evidence["claim_acquired"], "true")
+        self.assertEqual(self.hit_count(), 1)
+        self.assertFalse(self.claim.exists())
+
+
+class ReparsePointClassificationTests(unittest.TestCase):
+    """Deterministic Windows reparse-attribute modelling for the fixed final
+    and publication-temp artifact classifier (and the pending validator it
+    mirrors), independent of platform privileges."""
+
+    def setUp(self):
+        self.module = load_handoff_module()
+
+    def classify_with(self, lstat_result):
+        with mock.patch.object(self.module.os, "lstat", return_value=lstat_result):
+            return self.module.classify_final_path("any-final-or-temp-path")
+
+    def test_reparse_point_final_artifact_is_blocked(self):
+        reparse_file = fake_lstat_result(
+            stat.S_IFREG, st_size=42, st_file_attributes=REPARSE_POINT_ATTRIBUTE
+        )
+        self.assertEqual(self.classify_with(reparse_file), "blocked")
+
+    def test_zero_byte_reparse_point_artifact_is_blocked(self):
+        reparse_file = fake_lstat_result(
+            stat.S_IFREG, st_size=0, st_file_attributes=REPARSE_POINT_ATTRIBUTE
+        )
+        self.assertEqual(self.classify_with(reparse_file), "blocked")
+
+    def test_plain_regular_nonempty_file_still_classified_eligible(self):
+        plain_file = fake_lstat_result(stat.S_IFREG, st_size=42, st_file_attributes=0)
+        self.assertEqual(self.classify_with(plain_file), "regular_nonempty")
+
+    def test_reparse_point_pending_entry_still_rejected(self):
+        reparse_file = fake_lstat_result(
+            stat.S_IFREG, st_size=42, st_file_attributes=REPARSE_POINT_ATTRIBUTE
+        )
+        with mock.patch.object(self.module.os, "lstat", return_value=reparse_file):
+            self.assertFalse(
+                self.module.pending_entry_is_plain_regular_file("any-pending-path")
+            )
+
+
+class PublicationPreflightTests(SharedFolderHandoffBase):
+    def probe_paths(self):
+        module = load_handoff_module()
+        return (
+            self.outbox / module.PREFLIGHT_PROBE_SRC_FILENAME,
+            self.outbox / module.PREFLIGHT_PROBE_LINK_FILENAME,
+        )
+
+    @unittest.skipIf(os.name == "nt", "POSIX-only publication preflight")
+    def test_preflight_failure_blocks_lookup_posix(self):
+        write_jsonl(self.pending, [canonical_queue_row()])
+        completed = self.run_cli(
+            self.base_args(extra=self.fake_ps()),
+            env={"SHARED_FOLDER_TEST_FAULT_INJECT": "fail_publication_preflight"},
+        )
+        self.assertEqual(completed.returncode, 2)
+        self.assertNotIn("Traceback", completed.stderr)
+        evidence = parse_evidence(completed.stdout)
+        self.assertEqual(evidence["status"], "needs_fix")
+        self.assertEqual(evidence["posix_publication_preflight"], "unsupported")
+        # Zero AC2 lookups were consumed and nothing was staged or published.
+        self.assert_no_lookup_and_no_outbox(evidence)
+        self.assertFalse((self.outbox / PUBLISH_TMP_FILENAME).exists())
+        self.assertFalse(self.staging.exists())
+        # A determinate capability-unproven refusal releases the claim normally.
+        self.assertFalse(self.claim.exists())
+
+    @unittest.skipIf(os.name == "nt", "POSIX-only publication preflight")
+    def test_preflight_cleanup_failure_retains_claim_and_blocks_rerun(self):
+        write_jsonl(self.pending, [canonical_queue_row()])
+        completed = self.run_cli(
+            self.base_args(extra=self.fake_ps()),
+            env={"SHARED_FOLDER_TEST_FAULT_INJECT": "fail_preflight_cleanup"},
+        )
+        self.assertEqual(completed.returncode, 2)
+        self.assertNotIn("Traceback", completed.stderr)
+        evidence = parse_evidence(completed.stdout)
+        self.assertEqual(evidence["status"], "needs_fix")
+        self.assertEqual(evidence["posix_publication_preflight"], "cleanup_unconfirmed")
+        # Capability was proven but cleanup is indeterminate: zero lookups,
+        # nothing staged or published, and the execution claim is deliberately
+        # retained so the state cannot progress automatically.
+        self.assert_no_lookup_and_no_outbox(evidence)
+        self.assertFalse(self.staging.exists())
+        self.assertTrue(self.claim.exists())
+
+        # A rerun must not silently recreate probes and continue: it stays
+        # blocked on the retained claim with zero lookups.
+        rerun = self.run_cli(self.base_args(extra=self.fake_ps()))
+        self.assertEqual(rerun.returncode, 2)
+        blocked = parse_evidence(rerun.stdout)
+        self.assertEqual(blocked["status"], "needs_fix")
+        self.assertEqual(blocked["preexisting_claim_detected"], "true")
+        self.assertEqual(self.hit_count(), 0)
+        self.assertFalse(self.final.exists())
+
+    @unittest.skipUnless(os.name == "nt", "Windows publication path must be unaffected")
+    def test_preflight_injection_is_noop_on_windows(self):
+        # The preflight never runs on Windows, so the injected preflight fault
+        # must not weaken or exercise the Windows publication path.
+        write_jsonl(self.pending, [canonical_queue_row()])
+        completed = self.run_cli(
+            self.base_args(extra=self.fake_ps()),
+            env={"SHARED_FOLDER_TEST_FAULT_INJECT": "fail_publication_preflight"},
+        )
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        evidence = parse_evidence(completed.stdout)
+        self.assertEqual(evidence["status"], "ok")
+        self.assertEqual(evidence["posix_publication_preflight"], "not_run")
+        self.assertEqual(self.hit_count(), 1)
+        self.assertEqual(nonblank_lines(self.final), 1)
+
+    @unittest.skipIf(os.name == "nt", "POSIX-only publication preflight")
+    def test_preflight_unit_success_cleans_probes_durably(self):
+        module = load_handoff_module()
+        probe_src, probe_link = self.probe_paths()
+        self.assertEqual(
+            module.posix_publication_capability_preflight(self.outbox), "capable"
+        )
+        self.assertFalse(probe_src.exists())
+        self.assertFalse(probe_link.exists())
+
+    def test_preflight_unit_link_unsupported_fails_closed(self):
+        module = load_handoff_module()
+        probe_src, probe_link = self.probe_paths()
+        with mock.patch.object(
+            module.os, "link", side_effect=OSError(1, "hard links unsupported")
+        ):
+            self.assertEqual(
+                module.posix_publication_capability_preflight(self.outbox),
+                "unsupported",
+            )
+        # Nothing is auto-repaired: the probe the preflight created stays for
+        # operator inspection (and blocks the next exclusive create), and the
+        # never-created link name stays absent.
+        self.assertTrue(probe_src.exists())
+        self.assertEqual(probe_src.stat().st_size, 0)
+        self.assertFalse(probe_link.exists())
+
+    def test_preflight_unit_first_directory_fsync_failure_is_unsupported(self):
+        module = load_handoff_module()
+        probe_src, probe_link = self.probe_paths()
+        with mock.patch.object(
+            module, "fsync_directory", side_effect=OSError(1, "dir fsync unsupported")
+        ):
+            self.assertEqual(
+                module.posix_publication_capability_preflight(self.outbox),
+                "unsupported",
+            )
+        # Capability was never proven; both probes remain in place for operator
+        # inspection and block the next run's exclusive create.
+        self.assertTrue(probe_src.exists())
+        self.assertTrue(probe_link.exists())
+
+    def test_preflight_unit_cleanup_unlink_failure_is_cleanup_unconfirmed(self):
+        module = load_handoff_module()
+        probe_src, probe_link = self.probe_paths()
+        with mock.patch.object(module, "fsync_directory", return_value=None), \
+                mock.patch.object(
+                    module.os, "unlink", side_effect=OSError(1, "unlink failed")
+                ):
+            self.assertEqual(
+                module.posix_publication_capability_preflight(self.outbox),
+                "cleanup_unconfirmed",
+            )
+        # Nothing is retried or repaired; the probes stay for inspection.
+        self.assertTrue(probe_src.exists())
+        self.assertTrue(probe_link.exists())
+
+    def test_preflight_unit_final_fsync_failure_is_cleanup_unconfirmed(self):
+        module = load_handoff_module()
+        probe_src, probe_link = self.probe_paths()
+        with mock.patch.object(
+            module,
+            "fsync_directory",
+            side_effect=[None, OSError(1, "final dir fsync failed")],
+        ):
+            self.assertEqual(
+                module.posix_publication_capability_preflight(self.outbox),
+                "cleanup_unconfirmed",
+            )
+        # This is exactly why the caller must retain the execution claim: the
+        # probes were already unlinked before the durability confirmation
+        # failed, so leftover probe entries cannot block the next run.
+        self.assertFalse(probe_src.exists())
+        self.assertFalse(probe_link.exists())
+
+    def test_preflight_unit_file_fsync_unsupported_fails_closed(self):
+        # A POSIX-mounted outbox without working file fsync must fail the
+        # preflight before capability is considered proven (and therefore
+        # before any Gate 4 delegation could consume a lookup).
+        module = load_handoff_module()
+        probe_src, probe_link = self.probe_paths()
+        with mock.patch.object(
+            module.os, "fsync", side_effect=OSError(1, "file fsync unsupported")
+        ):
+            self.assertEqual(
+                module.posix_publication_capability_preflight(self.outbox),
+                "unsupported",
+            )
+        # Nothing is deleted: the created probe stays blocking and inspectable,
+        # and the link stage was never reached.
+        self.assertTrue(probe_src.exists())
+        self.assertFalse(probe_link.exists())
+
+    @unittest.skipIf(os.name == "nt", "POSIX-only publication preflight")
+    def test_preflight_file_fsync_failure_blocks_lookup_posix(self):
+        write_jsonl(self.pending, [canonical_queue_row()])
+        completed = self.run_cli(
+            self.base_args(extra=self.fake_ps()),
+            env={"SHARED_FOLDER_TEST_FAULT_INJECT": "fail_preflight_file_fsync"},
+        )
+        self.assertEqual(completed.returncode, 2)
+        self.assertNotIn("Traceback", completed.stderr)
+        evidence = parse_evidence(completed.stdout)
+        self.assertEqual(evidence["status"], "needs_fix")
+        self.assertEqual(evidence["posix_publication_preflight"], "unsupported")
+        self.assert_no_lookup_and_no_outbox(evidence)
+        self.assertFalse(self.staging.exists())
+        # Determinate capability-unproven refusal: claim released, retained
+        # probe blocks the rerun's exclusive create.
+        self.assertFalse(self.claim.exists())
+        probe_src, _ = self.probe_paths()
+        self.assertTrue(probe_src.exists())
+
+        rerun = self.run_cli(self.base_args(extra=self.fake_ps()))
+        self.assertEqual(rerun.returncode, 2)
+        blocked = parse_evidence(rerun.stdout)
+        self.assertEqual(blocked["status"], "needs_fix")
+        self.assertEqual(blocked["posix_publication_preflight"], "unsupported")
+        self.assertEqual(self.hit_count(), 0)
+
+    def replace_probe_on_first_directory_fsync(self, module, probe_to_replace):
+        """fsync_directory stand-in that simulates the other share participant
+        replacing a probe entry between capability proof and cleanup."""
+        state = {"calls": 0}
+
+        def fake_fsync_directory(directory):
+            state["calls"] += 1
+            if state["calls"] == 1:
+                probe_to_replace.unlink()
+                probe_to_replace.write_text(
+                    "foreign-replacement-not-owned-by-preflight\n", encoding="utf-8"
+                )
+
+        return mock.patch.object(module, "fsync_directory", fake_fsync_directory)
+
+    def test_preflight_unit_replaced_link_probe_never_unlinked(self):
+        module = load_handoff_module()
+        probe_src, probe_link = self.probe_paths()
+        with self.replace_probe_on_first_directory_fsync(module, probe_link):
+            self.assertEqual(
+                module.posix_publication_capability_preflight(self.outbox),
+                "cleanup_unconfirmed",
+            )
+        # The replacement entry is byte-for-byte untouched: identity
+        # verification refused to unlink an object the preflight did not
+        # create, and nothing was repaired, replaced, renamed, or deleted.
+        self.assertEqual(
+            probe_link.read_text(encoding="utf-8"),
+            "foreign-replacement-not-owned-by-preflight\n",
+        )
+        # The owned source probe was never reached and stays in place.
+        self.assertTrue(probe_src.exists())
+        self.assertEqual(probe_src.stat().st_size, 0)
+
+    def test_preflight_unit_replaced_src_probe_never_unlinked(self):
+        module = load_handoff_module()
+        probe_src, probe_link = self.probe_paths()
+        with self.replace_probe_on_first_directory_fsync(module, probe_src):
+            self.assertEqual(
+                module.posix_publication_capability_preflight(self.outbox),
+                "cleanup_unconfirmed",
+            )
+        # The owned link probe was legitimately removed first; the foreign
+        # replacement at the source name is byte-for-byte untouched.
+        self.assertFalse(probe_link.exists())
+        self.assertEqual(
+            probe_src.read_text(encoding="utf-8"),
+            "foreign-replacement-not-owned-by-preflight\n",
+        )
+
+    @unittest.skipIf(os.name == "nt", "POSIX-only publication preflight")
+    def test_preflight_replaced_probe_retains_claim_and_blocks_rerun_posix(self):
+        write_jsonl(self.pending, [canonical_queue_row()])
+        module = load_handoff_module()
+        probe_src, probe_link = self.probe_paths()
+        buffer = io.StringIO()
+        with self.replace_probe_on_first_directory_fsync(module, probe_link):
+            with contextlib.redirect_stdout(buffer):
+                code = module.main(self.base_args(extra=self.fake_ps()))
+        evidence = parse_evidence(buffer.getvalue())
+        self.assertEqual(code, 2)
+        self.assertEqual(evidence["status"], "needs_fix")
+        self.assertEqual(evidence["posix_publication_preflight"], "cleanup_unconfirmed")
+        self.assertEqual(evidence["lookup_attempt_count"], "0")
+        self.assertEqual(self.hit_count(), 0)
+        # The foreign replacement is untouched and the claim is retained.
+        self.assertEqual(
+            probe_link.read_text(encoding="utf-8"),
+            "foreign-replacement-not-owned-by-preflight\n",
+        )
+        self.assertTrue(self.claim.exists())
+
+        rerun = self.run_cli(self.base_args(extra=self.fake_ps()))
+        self.assertEqual(rerun.returncode, 2)
+        blocked = parse_evidence(rerun.stdout)
+        self.assertEqual(blocked["status"], "needs_fix")
+        self.assertEqual(blocked["preexisting_claim_detected"], "true")
+        self.assertEqual(self.hit_count(), 0)
+
+    def test_preflight_unit_preexisting_probe_entry_fails_closed(self):
+        module = load_handoff_module()
+        probe_src, probe_link = self.probe_paths()
+        probe_src.write_text("not-created-by-preflight\n", encoding="utf-8")
+        self.assertEqual(
+            module.posix_publication_capability_preflight(self.outbox), "unsupported"
+        )
+        # The pre-existing entry was not created by the preflight and is never
+        # cleaned up, truncated, or followed.
+        self.assertEqual(
+            probe_src.read_text(encoding="utf-8"), "not-created-by-preflight\n"
+        )
+        self.assertFalse(probe_link.exists())
 
 
 class CorruptedEncodingTests(SharedFolderHandoffBase):
@@ -930,7 +1760,12 @@ class SuccessAndEvidenceTests(SharedFolderHandoffBase):
         ]
         self.assertEqual(sum(routing), 1)
         self.assertEqual(evidence["claim_acquired"], "true")
+        self.assertEqual(evidence["claim_durability_unconfirmed"], "false")
         self.assertEqual(evidence["claim_release_failed"], "false")
+        self.assertEqual(
+            evidence["posix_publication_preflight"],
+            "not_run" if os.name == "nt" else "capable",
+        )
         self.assertEqual(evidence["outbox_published"], "true")
         self.assertEqual(evidence["vm_local_state_outside_share"], "true")
         self.assertEqual(evidence["member_create_or_update_invoked"], "false")
@@ -993,6 +1828,16 @@ class SharedFolderHandoffDocsTest(unittest.TestCase):
         self.assertIn("zero-byte", text)
         self.assertIn("non-UTF-8", text)
         self.assertIn("reparse", text)
+        self.assertIn("junction", text)
+        self.assertIn("intermediate", text)
+        self.assertIn("anchor", text)
+        self.assertIn("preflight", text)
+        self.assertIn("claim_durability_unconfirmed", text)
+        self.assertIn("posix_publication_preflight", text)
+        self.assertIn("cleanup_unconfirmed", text)
+        self.assertIn("device/inode", text)
+        self.assertIn("setup prerequisite", text)
+        self.assertIn("file fsync", text)
         self.assertIn("O_EXCL", text)
         for forbidden in ("member create", "direct SQL"):
             self.assertIn(forbidden, text)
@@ -1010,6 +1855,16 @@ class SharedFolderHandoffDocsTest(unittest.TestCase):
         self.assertIn("member_lookup_bridge_shared_folder_failed/", text)
         self.assertIn("member_lookup_bridge_shared_folder_claim.json", text)
         self.assertIn("member_lookup_bridge_shared_folder_staging_results.jsonl", text)
+        # The retained publication temp artifact and the preflight probe names
+        # are ignored both at the generic locations and under repo-local
+        # autocount_outputs/**/ paths, matching the other bridge artifacts.
+        for name in (
+            "member_lookup_bridge_gate5a_result_copy.jsonl.tmp",
+            "member_lookup_bridge_gate5a_result_copy.jsonl.preflight_probe_src.tmp",
+            "member_lookup_bridge_gate5a_result_copy.jsonl.preflight_probe_link.tmp",
+        ):
+            self.assertIn(f"\n{name}\n", text)
+            self.assertIn(f"\nautocount_outputs/**/{name}\n", text)
 
     def test_readme_mentions_handoff_script_and_runbook(self):
         text = README.read_text(encoding="utf-8")
