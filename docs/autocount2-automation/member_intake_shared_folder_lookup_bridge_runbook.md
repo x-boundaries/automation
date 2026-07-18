@@ -70,6 +70,8 @@ The `inbox` and `outbox` directories must exist before the worker runs. The file
 
 The share root, `inbox`, and `outbox` entries must themselves be genuine directories. The runner classifies each of them fail-closed with `lstat` (links never followed): a symbolic link, Windows junction, or any other reparse-point/redirection entry, a non-directory entry, or any metadata/stat failure is rejected with `needs_fix` and zero lookups -- even when the redirect target contains a perfectly valid layout -- and the rejected entry is never followed, resolved, repaired, renamed, or deleted.
 
+The share root entry is classified before any path-resolving operation involving it, including the outside-share containment check (which resolves paths): for a rejected redirected root the containment check is skipped entirely, no claim is created, no lookup runs, and `vm_local_state_outside_share` is reported fail-closed as `false` because containment cannot be verified against a root that was never resolved. For a legitimate plain-directory share root the containment check runs unchanged.
+
 All VM-local state lives outside the share and ignored by Git. The runner refuses to run if any of these paths is inside the share root (or the share root is inside one of them):
 
 ```powershell
@@ -103,7 +105,7 @@ An arbitrary file that merely satisfies the generic bridge request contract can 
 
 Before any marker/result inspection and before any lookup, the runner atomically creates the VM-local exclusive execution claim file (`O_CREAT | O_EXCL`). Exactly one process can win; a concurrent second invocation fails closed with `needs_fix`, `preexisting_claim_detected = true`, and zero lookups. The claim is held through staging, publication, and marker completion, and is removed only when the run reaches a clean deterministic terminal state (including clean rejections and idempotent reruns).
 
-Claim acquisition is complete only once the claim entry is durable for the platform contract: the claim file is fsynced on every platform, and on POSIX/local filesystems the parent directory is additionally fsynced so the new directory entry itself is durable (the Windows behaviour is unchanged). If the durable commit cannot be confirmed, the run fails closed before any lookup with `needs_fix`, `claim_acquired = false`, and `claim_durability_unconfirmed = true`; the indeterminate claim entry is deliberately left in place -- never deleted, repaired, retried, or recreated -- so the next run detects it as a preexisting claim and stays blocked until the documented manual recovery.
+Claim acquisition is complete only once the claim entry is durably persisted for the platform contract: the claim file is written, flushed, and fsynced on every platform, and on POSIX/local filesystems the parent directory is additionally fsynced so the new directory entry itself is durable (the Windows behaviour is unchanged). Once the exclusive entry has been created, any failure to confirm its durable persistence -- a failed write, flush, claim-file fsync, close-related persistence failure, or POSIX parent-directory fsync -- fails closed before any lookup with `needs_fix`, `claim_acquired = false`, and `claim_durability_unconfirmed = true`, and never escapes as an unhandled error. The indeterminate claim entry is deliberately left in place -- never deleted, repaired, retried, or recreated -- so the next run detects it as a preexisting claim and stays blocked until the documented manual recovery.
 
 A claim left behind by an interrupted run blocks every subsequent run with `needs_fix` and is never removed, inspected, repaired, or retried automatically. This is not a distributed lock; it protects a single VM host only.
 
@@ -120,7 +122,13 @@ The lookup never writes into the share directly. The delegated Gate 4 runner wri
 
 Before any lookup, the fixed final path is classified fail-closed: only a completely absent directory entry allows a fresh lookup, and only a regular nonempty file enters idempotent verification. A pre-existing zero-byte file, directory, symbolic or broken link, Windows reparse-point/redirection entry (the same `FILE_ATTRIBUTE_REPARSE_POINT` rejection the pending-entry validator applies, so a reparse artifact can never be treated as a normal regular file), unreadable entry, or any metadata/stat failure blocks the run with `needs_fix` and zero lookups, so an unpublishable handoff can never consume a real AC2 lookup. The fixed publication temp path is classified the same way: any pre-existing temp artifact blocks the run before Gate 4 with zero lookups. Neither artifact is ever read through, deleted, truncated, renamed, replaced, or repaired.
 
-On POSIX operation only, after the claim and the final/temp-path classification but before the Gate 4 delegation, the runner additionally runs a bounded no-data publication-capability preflight in the outbox: it proves exclusive create-new, hard-link create-new, and directory-fsync support using the two fixed, empty, synthetic probe entries listed in the share layout. No member data or staged result content is ever written or exposed by the preflight. When the required no-replace publication or directory-durability primitives are unsupported (or a probe name is already occupied), the run fails closed with `needs_fix` and zero AC2 lookups; the preflight deletes nothing on failure and leaves whatever exists at the probe names for operator inspection rather than automatically repairing it. On success both probes (each verifiably created by the preflight itself) are removed durably before the lookup proceeds. The preflight never runs on Windows, so the Windows publication path is neither exercised nor weakened.
+On POSIX operation only, after the claim and the final/temp-path classification but before the Gate 4 delegation, the runner additionally runs a bounded no-data publication-capability preflight in the outbox: it proves exclusive create-new, hard-link create-new, and directory-fsync support using the two fixed, empty, synthetic probe entries listed in the share layout. No member data or staged result content is ever written or exposed by the preflight, and only entries the preflight verifiably created may ever be removed by it. The preflight has exactly three outcomes, reported in the `posix_publication_preflight` evidence field (`not_run` on Windows):
+
+- `capable`: every capability primitive succeeded and both probes were removed with the cleanup durably confirmed. Only this state permits the lookup to proceed.
+- `unsupported`: a failure before publication capability was proven -- an occupied probe name, exclusive-create failure, hard-link failure, or first directory-fsync failure. The run is `needs_fix` with zero AC2 lookups; nothing is deleted, whatever exists at the probe names stays in place for operator inspection and blocks the next run's exclusive create, and the execution claim is released via the normal terminal path (a determinate refusal).
+- `cleanup_unconfirmed`: capability was proven but the probe cleanup is incomplete or its durability is unconfirmed (an unlink failure or the final directory-fsync failure). Probe entries may or may not still be visible, so leftover probes alone cannot be relied on to block a rerun. The run is `needs_fix` with zero AC2 lookups, nothing is retried or repaired, and the execution claim is deliberately retained so a subsequent run cannot silently recreate probes and continue; it stays blocked on the preexisting claim until the documented manual recovery.
+
+The preflight never runs on Windows, so the Windows publication path is neither exercised nor weakened.
 
 The fixed pending-queue entry in the inbox is also classified fail-closed (lstat-based, links never followed) before the claim and any lookup: it must itself be a plain regular file. A symbolic link -- even one pointing at a perfectly valid canonical queue file elsewhere -- a broken link, a directory, a Windows reparse-point/redirection entry, or any metadata/stat failure is rejected with `needs_fix` and zero lookups, and the rejected artifact is never read, resolved, repaired, renamed, or deleted. This filesystem-boundary check is in addition to, not instead of, the delegated Gate 4 canonical content validation.
 
@@ -135,9 +143,10 @@ The runner treats every incomplete or inconsistent state as `needs_fix` with zer
 | Observed state | Outcome |
 | --- | --- |
 | Preexisting claim file (interrupted or concurrent run) | `needs_fix`, zero lookups |
-| Share root, inbox, or outbox entry is not a genuine directory (symlink, junction, reparse point, non-directory, stat failure) | `needs_fix`, zero lookups, entry never followed or resolved |
-| Claim entry created but durable commit unconfirmed | `needs_fix`, `claim_durability_unconfirmed = true`, zero lookups, indeterminate entry retained for operator recovery |
-| POSIX publication-capability preflight failure (unsupported create-new/hard-link/directory-fsync primitive, or occupied probe name) | `needs_fix`, zero lookups, probe entries left untouched for inspection |
+| Share root, inbox, or outbox entry is not a genuine directory (symlink, junction, reparse point, non-directory, stat failure) | `needs_fix`, zero lookups, no claim, entry never followed or resolved |
+| Claim entry created but durable persistence unconfirmed (write/flush/file-fsync or POSIX parent-directory fsync failure) | `needs_fix`, `claim_durability_unconfirmed = true`, zero lookups, indeterminate entry retained for operator recovery |
+| POSIX preflight `unsupported` (capability unproven: occupied probe name, exclusive-create, hard-link, or first directory-fsync failure) | `needs_fix`, zero lookups, nothing deleted, probe entries left blocking and inspectable, claim released normally |
+| POSIX preflight `cleanup_unconfirmed` (capability proven, probe cleanup incomplete or durability unconfirmed) | `needs_fix`, zero lookups, nothing retried or repaired, execution claim retained so reruns stay blocked |
 | Processed marker without a staged result | `needs_fix` |
 | Staged result without a processed marker | `needs_fix` |
 | Failed/dead-letter marker present in any combination | `needs_fix` |
@@ -160,7 +169,7 @@ Operator recovery for a stale claim or an incomplete marker/result state is manu
 1. Confirm no other handoff process is running on the VM.
 2. Record the aggregate evidence of the blocked run.
 3. Review the VM-local claim, staging, and marker artifacts without pasting their content anywhere.
-4. Only after review, remove the stale claim file by hand. For a claim retained after an unconfirmed publication commit, first confirm whether the final outbox entry actually exists and whether it matches the staged result before removing the claim. Do not delete or edit staging results, markers, temp files, or outbox artifacts to force a rerun; an incomplete staging/marker/publication state remains `needs_fix` by design and requires its own reviewed recovery decision, consistent with the Gate 4 recovery discipline.
+4. Only after review, remove the stale claim file by hand. For a claim retained after an unconfirmed publication commit, first confirm whether the final outbox entry actually exists and whether it matches the staged result before removing the claim. For a claim retained after a `cleanup_unconfirmed` preflight, first inspect the two fixed probe names in the outbox (either or both may remain) and remove any leftover probe entries by hand before removing the claim. Do not delete or edit staging results, markers, temp files, or outbox artifacts to force a rerun; an incomplete staging/marker/publication state remains `needs_fix` by design and requires its own reviewed recovery decision, consistent with the Gate 4 recovery discipline.
 5. Rerun the handoff. A completed-but-unpublished or otherwise inconsistent state will still report `needs_fix` and will not run another lookup.
 
 ## Exact Operator Command
@@ -214,6 +223,7 @@ claim_acquired = <true/false>
 preexisting_claim_detected = <true/false>
 claim_durability_unconfirmed = <true/false>
 claim_release_failed = <true/false>
+posix_publication_preflight = <not_run/capable/unsupported/cleanup_unconfirmed>
 outbox_published = <true/false>
 vm_local_state_outside_share = true
 member_create_or_update_invoked = false
@@ -231,7 +241,7 @@ final_write_automation = false
 no_row_values_printed = true
 ```
 
-Handoff pass evidence requires `status = ok`, `powershell_lookup_enabled = true`, `ac2_lookup_invoked = true`, `queue_rows_read_count = 1`, `lookup_attempt_count = 1`, `lookup_success_count = 1`, exactly one of the three review routing counts equal to `1`, `lookup_error_count = 0`, `review_rows_written_count = 1`, `claim_acquired = true`, `claim_durability_unconfirmed = false`, `claim_release_failed = false`, and `outbox_published = true`. `status = already_processed` proves idempotency only. `READY_FOR_CREATE_REVIEW` remains review-only and is not approval to create.
+Handoff pass evidence requires `status = ok`, `powershell_lookup_enabled = true`, `ac2_lookup_invoked = true`, `queue_rows_read_count = 1`, `lookup_attempt_count = 1`, `lookup_success_count = 1`, exactly one of the three review routing counts equal to `1`, `lookup_error_count = 0`, `review_rows_written_count = 1`, `claim_acquired = true`, `claim_durability_unconfirmed = false`, `claim_release_failed = false`, `posix_publication_preflight = not_run` (Windows) or `capable` (POSIX), and `outbox_published = true`. `status = already_processed` proves idempotency only. `READY_FOR_CREATE_REVIEW` remains review-only and is not approval to create.
 
 Do not paste pending rows, staged or published result rows, processed or failed markers, claim file content, raw/encoded/decoded/normalized member values, names, emails, phone numbers, birthday values, `AC2_PROBE_*` values, credentials, share paths/hostnames/accounts, Sheet IDs/URLs, command transcripts, stdout/stderr transcripts, screenshots, secrets, or PII.
 

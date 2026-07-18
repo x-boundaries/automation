@@ -21,14 +21,16 @@ On top of that delegation this wrapper adds only the shared-folder layer:
   root, inbox, and outbox directory entries must themselves be genuine
   directories (lstat-based, reparse-point-aware): a symlink, junction, or any
   other redirected/reparse entry is rejected fail-closed and never followed or
-  resolved;
+  resolved -- the share root is classified before any path-resolving
+  operation, including the outside-share containment check;
 - one VM-local exclusive execution claim (atomic ``O_CREAT | O_EXCL``) that is
   acquired before any state inspection or lookup and held through staging,
   publication, and marker completion; acquisition is complete only once the
-  claim entry is durable for the platform contract (POSIX adds a parent
-  directory fsync), an unconfirmed durable commit fails closed before any
-  lookup with the indeterminate entry left in place, and a claim left behind
-  by an interrupted run causes ``needs_fix`` and never an automatic retry;
+  claim entry is durably persisted for the platform contract (write, flush,
+  and claim-file fsync everywhere; POSIX adds a parent directory fsync), any
+  unconfirmed persistence fails closed before any lookup with the
+  indeterminate entry left in place, and a claim left behind by an
+  interrupted run causes ``needs_fix`` and never an automatic retry;
 - VM-local result staging outside the share (the Gate 4 runner never touches
   the shared outbox directly);
 - fail-closed final-path classification: any pre-existing artifact at the
@@ -45,8 +47,13 @@ On top of that delegation this wrapper adds only the shared-folder layer:
   delegation: empty synthetic probe entries prove exclusive create-new,
   hard-link create-new, and directory-fsync support in the outbox so a
   filesystem that cannot honour durable no-replace publication fails closed
-  with zero AC2 lookups (the Windows publication path is neither exercised
-  nor weakened by the preflight);
+  with zero AC2 lookups; the preflight is tri-state (``capable`` /
+  ``unsupported`` / ``cleanup_unconfirmed``), only a durably cleaned-up
+  ``capable`` result permits the lookup, an ``unsupported`` failure deletes
+  nothing and leaves blocking probe evidence in place, and a
+  ``cleanup_unconfirmed`` state retains the execution claim so a rerun cannot
+  silently recreate probes and continue (the Windows publication path is
+  neither exercised nor weakened by the preflight);
 - durable atomic no-replace publication: the validated one-row staging result
   is copied to a same-directory temporary file in the outbox, flushed, and
   moved to the fixed Gate 5A result-copy filename with a durable create-new
@@ -135,6 +142,7 @@ def evidence_rows(status, counts, flags):
         ("preexisting_claim_detected", bool_text(flags["preexisting_claim_detected"])),
         ("claim_durability_unconfirmed", bool_text(flags["claim_durability_unconfirmed"])),
         ("claim_release_failed", bool_text(flags["claim_release_failed"])),
+        ("posix_publication_preflight", flags["posix_publication_preflight"]),
         ("outbox_published", bool_text(flags["outbox_published"])),
         ("vm_local_state_outside_share", bool_text(flags["vm_local_state_outside_share"])),
         ("member_create_or_update_invoked", "false"),
@@ -245,9 +253,12 @@ def acquire_claim(claim_path):
     behaviour is unchanged). Returns ``"exists"`` when a concurrent or
     interrupted run already holds the claim; the existing claim is never
     inspected, repaired, or removed here. Returns ``"durability_unconfirmed"``
-    when the entry was created but its durable commit could not be confirmed:
-    the caller must fail closed before any lookup and leave the indeterminate
-    entry in place -- never deleted, repaired, retried, or recreated.
+    whenever the exclusive entry was created but its durable persistence could
+    not be confirmed -- a failed write, flush, claim-file fsync,
+    close-related persistence failure, or POSIX parent-directory fsync all
+    land here, and no exception escapes once the entry exists. The caller must
+    fail closed before any lookup and leave the indeterminate entry in place
+    -- never deleted, repaired, retried, or recreated.
     """
     path = Path(claim_path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -257,22 +268,33 @@ def acquire_claim(claim_path):
         return "exists"
     except OSError:
         return "exists"
-    with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
-        handle.write(
-            json.dumps(
-                {
-                    "gate": GATE,
-                    "claim_type": "exclusive_execution",
-                    "dry_run_only": True,
-                    "final_write_automation": False,
-                },
-                sort_keys=True,
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(
+                json.dumps(
+                    {
+                        "gate": GATE,
+                        "claim_type": "exclusive_execution",
+                        "dry_run_only": True,
+                        "final_write_automation": False,
+                    },
+                    sort_keys=True,
+                )
+                + "\n"
             )
-            + "\n"
-        )
-        handle.flush()
-        os.fsync(handle.fileno())
-    # Test-only durability-failure injection; it can only cause a failure.
+            handle.flush()
+            # Test-only claim-file fsync failure injection; it can only cause
+            # a failure, exercising the real exception path below.
+            if os.environ.get(FAULT_ENV) == "fail_claim_file_fsync":
+                raise OSError(5, "test_injected_claim_file_fsync_failure")
+            os.fsync(handle.fileno())
+    except OSError:
+        # The exclusive entry exists but its content persistence is
+        # unconfirmed: an indeterminate claim state, handled fail-closed by
+        # the caller with the entry left in place.
+        return "durability_unconfirmed"
+    # Test-only directory-durability failure injection; it can only cause a
+    # failure.
     if os.environ.get(FAULT_ENV) == "fail_claim_durability":
         return "durability_unconfirmed"
     if os.name != "nt":
@@ -517,19 +539,35 @@ def posix_publication_capability_preflight(outbox_dir):
     exclusive create-new (``O_CREAT | O_EXCL``), hard-link create-new
     (``os.link``), and directory fsync. Only empty synthetic probe entries at
     fixed bridge-owned names are used; no member data or staged result content
-    is ever written or exposed. On success both probes are removed (each was
-    verifiably created by this preflight via exclusive create / create-new
-    link) and the cleanup is made durable. On any failure the preflight
-    returns False, deletes nothing, and leaves whatever exists at the probe
-    names for operator inspection -- including a pre-existing entry at a probe
-    name, which fails the preflight closed without being touched. The Windows
-    publication path is neither exercised nor weakened; this preflight never
-    runs on Windows.
+    is ever written or exposed, and only entries this preflight verifiably
+    created (exclusive create / create-new link) are ever removed.
+
+    Returns exactly one of three states:
+
+    - ``"capable"``: every capability primitive succeeded AND both probes were
+      removed with the cleanup durably confirmed. Only this state permits the
+      lookup to proceed.
+    - ``"unsupported"``: a failure before publication capability was proven
+      (pre-existing entry at a probe name, exclusive-create failure, hard-link
+      failure, or first directory-fsync failure). Nothing is deleted: whatever
+      exists at the probe names -- including entries this preflight created
+      before the failure -- stays in place for operator inspection and blocks
+      the next run's exclusive create. The caller fails closed through the
+      normal terminal path.
+    - ``"cleanup_unconfirmed"``: capability was proven but the probe cleanup
+      is incomplete or its durability is unconfirmed (unlink failure or final
+      directory-fsync failure). Probe entries may or may not still be visible,
+      so leftover probes alone cannot be relied on to block a rerun: the
+      caller must retain the execution claim so progression stays blocked
+      until documented manual recovery, and nothing is retried or repaired.
+
+    The Windows publication path is neither exercised nor weakened; this
+    preflight never runs on Windows.
     """
     # Test-only injection simulating an unsupported publication primitive; it
     # can only cause a failure.
     if os.environ.get(FAULT_ENV) == "fail_publication_preflight":
-        return False
+        return "unsupported"
     probe_src = outbox_dir / PREFLIGHT_PROBE_SRC_FILENAME
     probe_link = outbox_dir / PREFLIGHT_PROBE_LINK_FILENAME
     try:
@@ -537,12 +575,18 @@ def posix_publication_capability_preflight(outbox_dir):
             pass  # deliberately empty: the probe carries no data
         os.link(probe_src, probe_link)
         fsync_directory(outbox_dir)
+    except OSError:
+        return "unsupported"
+    try:
+        # Test-only cleanup-failure injection; it can only cause a failure.
+        if os.environ.get(FAULT_ENV) == "fail_preflight_cleanup":
+            raise OSError(5, "test_injected_preflight_cleanup_failure")
         os.unlink(probe_link)
         os.unlink(probe_src)
         fsync_directory(outbox_dir)
     except OSError:
-        return False
-    return True
+        return "cleanup_unconfirmed"
+    return "capable"
 
 
 def publish_atomically(staging_path, outbox_dir, final_path):
@@ -598,6 +642,12 @@ def build_parser():
 def main(argv=None):
     args = build_parser().parse_args(argv)
     share_root = Path(args.share_root)
+    # Fail-closed share-root entry classification before anything can resolve,
+    # follow, or traverse the share root. The outside-share containment check
+    # below resolves paths, so it is short-circuited for a rejected root: a
+    # symlinked/junction/reparse share root is never resolved or followed, and
+    # the unverifiable containment flag is reported fail-closed as false.
+    share_root_is_plain_directory = directory_entry_is_plain_directory(share_root)
     flags = {
         "powershell_lookup_enabled": bool(args.enable_powershell_lookup),
         "ac2_lookup_invoked": False,
@@ -605,8 +655,12 @@ def main(argv=None):
         "preexisting_claim_detected": False,
         "claim_durability_unconfirmed": False,
         "claim_release_failed": False,
+        "posix_publication_preflight": "not_run",
         "outbox_published": False,
-        "vm_local_state_outside_share": vm_local_state_outside_share(args, share_root),
+        "vm_local_state_outside_share": (
+            share_root_is_plain_directory
+            and vm_local_state_outside_share(args, share_root)
+        ),
     }
 
     def emit(status, counts=None):
@@ -617,7 +671,14 @@ def main(argv=None):
         emit("refused")
         return 2
 
-    # B. Every piece of VM-local state must live outside the share.
+    # B. The share root entry itself must be a genuine directory before any
+    # other validation: a redirected root was rejected above without being
+    # resolved, and blocks here with no claim and no lookup.
+    if not share_root_is_plain_directory:
+        emit("needs_fix")
+        return 2
+
+    # C. Every piece of VM-local state must live outside the share.
     if not flags["vm_local_state_outside_share"]:
         emit("refused")
         return 2
@@ -629,7 +690,7 @@ def main(argv=None):
         emit("needs_fix")
         return 2
 
-    # C. Exclusive VM-local claim, atomically, before any marker/result inspection
+    # D. Exclusive VM-local claim, atomically, before any marker/result inspection
     # and before any lookup. A claim left by an interrupted run blocks here and
     # requires the documented operator recovery; it is never auto-removed.
     claim_state = acquire_claim(args.claim_json)
@@ -665,7 +726,7 @@ def main(argv=None):
         emit(status, counts)
         return exit_code
 
-    # D. Fail-closed final-path classification before any lookup. Any pre-existing
+    # E. Fail-closed final-path classification before any lookup. Any pre-existing
     # artifact at the fixed final path -- including a zero-byte file, directory,
     # symbolic or broken link, or an entry whose metadata cannot be read -- blocks
     # the run, because no-replace publication could never succeed and a lookup
@@ -706,13 +767,29 @@ def main(argv=None):
     # final/temp-path classification but before any Gate 4 delegation: if the
     # outbox filesystem cannot honour the durable no-replace publication
     # primitives, no AC2 lookup may be consumed. The empty synthetic probes
-    # carry no data; a failed preflight deletes nothing and leaves the probe
-    # names for operator inspection. The Windows publication path is neither
-    # exercised nor weakened here.
-    if os.name != "nt" and not posix_publication_capability_preflight(outbox_dir):
-        return finish("needs_fix", exit_code=2)
+    # carry no data. The Windows publication path is neither exercised nor
+    # weakened here.
+    if os.name != "nt":
+        preflight_state = posix_publication_capability_preflight(outbox_dir)
+        flags["posix_publication_preflight"] = preflight_state
+        if preflight_state == "cleanup_unconfirmed":
+            # Capability was proven but the probe cleanup is incomplete or its
+            # durability is unconfirmed, so leftover probe entries alone cannot
+            # be relied on to block a rerun. The execution claim is
+            # deliberately retained so a later run cannot silently recreate
+            # probes and continue; operator recovery per the runbook is
+            # required. Nothing is deleted, retried, or repaired.
+            emit("needs_fix")
+            return 2
+        if preflight_state != "capable":
+            # Capability unproven ("unsupported"): nothing was deleted, and
+            # whatever exists at the probe names stays in place, blocks the
+            # next run's exclusive create, and awaits operator inspection.
+            # This is a determinate refusal, so the claim is released via the
+            # normal terminal path.
+            return finish("needs_fix", exit_code=2)
 
-    # E. Empty outbox: delegate the full canonical validation, lookup, and
+    # F. Empty outbox: delegate the full canonical validation, lookup, and
     # marker/result state machine to the Gate 4 runner against VM-local staging.
     inner_status, inner = run_gate4(args, pending_path)
     flags["ac2_lookup_invoked"] = inner.get("ac2_lookup_invoked") == "true"
@@ -726,7 +803,7 @@ def main(argv=None):
     if inner_status != "ok":
         return finish("needs_fix", counts, exit_code=2)
 
-    # F. Fresh success: Gate 4 validated exactly one sanitized result in staging.
+    # G. Fresh success: Gate 4 validated exactly one sanitized result in staging.
     if read_single_result_row(args.staging_results_jsonl) is None:
         return finish("needs_fix", counts, exit_code=2)
     maybe_fault("after_staging_before_publish")
