@@ -34,8 +34,10 @@ On top of that delegation this wrapper adds only the shared-folder layer:
   claim entry is durably persisted for the platform contract (write, flush,
   and claim-file fsync everywhere; POSIX adds a parent directory fsync), any
   unconfirmed persistence fails closed before any lookup with the
-  indeterminate entry left in place, and a claim left behind by an
-  interrupted run causes ``needs_fix`` and never an automatic retry;
+  indeterminate entry left in place, the claim-state directory is an explicit
+  operator setup prerequisite (validated fail-closed before acquisition,
+  never created automatically), and a claim left behind by an interrupted
+  run causes ``needs_fix`` and never an automatic retry;
 - VM-local result staging outside the share (the Gate 4 runner never touches
   the shared outbox directly);
 - fail-closed final-path classification: any pre-existing artifact at the
@@ -49,16 +51,18 @@ On top of that delegation this wrapper adds only the shared-folder layer:
   must itself be a non-link regular file (lstat-based, reparse-point-aware,
   links never followed);
 - a POSIX-only, no-data publication-capability preflight before the Gate 4
-  delegation: empty synthetic probe entries prove exclusive create-new,
-  hard-link create-new, and directory-fsync support in the outbox so a
+  delegation: empty synthetic probe entries prove exclusive create-new, file
+  fsync, hard-link create-new, and directory-fsync support in the outbox so a
   filesystem that cannot honour durable no-replace publication fails closed
   with zero AC2 lookups; the preflight is tri-state (``capable`` /
   ``unsupported`` / ``cleanup_unconfirmed``), only a durably cleaned-up
   ``capable`` result permits the lookup, an ``unsupported`` failure deletes
-  nothing and leaves blocking probe evidence in place, and a
-  ``cleanup_unconfirmed`` state retains the execution claim so a rerun cannot
-  silently recreate probes and continue (the Windows publication path is
-  neither exercised nor weakened by the preflight);
+  nothing and leaves blocking probe evidence in place, probe removal is
+  ownership-verified by device/inode identity so an entry replaced by the
+  other share participant is never unlinked, and a ``cleanup_unconfirmed``
+  state retains the execution claim so a rerun cannot silently recreate
+  probes and continue (the Windows publication path is neither exercised nor
+  weakened by the preflight);
 - durable atomic no-replace publication: the validated one-row staging result
   is copied to a same-directory temporary file in the outbox, flushed, and
   moved to the fixed Gate 5A result-copy filename with a durable create-new
@@ -322,9 +326,15 @@ def acquire_claim(claim_path):
     land here, and no exception escapes once the entry exists. The caller must
     fail closed before any lookup and leave the indeterminate entry in place
     -- never deleted, repaired, retried, or recreated.
+
+    The claim-state directory is an explicit operator setup prerequisite: it
+    must already exist (the caller validates it fail-closed first) and is
+    never created here. Creating durability-critical directories at claim
+    time would be unsound, because fsyncing the claim directory does not
+    persist a newly created directory entry in its own parent -- a crash
+    could lose the new directory tree and the claim together.
     """
     path = Path(claim_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
     try:
         descriptor = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
     except FileExistsError:
@@ -594,35 +604,64 @@ def _posix_link_publish_durable(tmp_path, final_path, outbox_dir):
         raise PublicationDurabilityError(0, "publication_durability_unconfirmed") from error
 
 
+def entry_identity(stat_result):
+    """Stable object identity (device, inode) for probe ownership checks."""
+    return (stat_result.st_dev, stat_result.st_ino)
+
+
+def unlink_owned_probe(probe_path, owned_identity):
+    """Unlink a probe pathname only if it still refers to the owned object.
+
+    The VM-local claim cannot stop the other share participant from modifying
+    the outbox, so pathname existence alone proves nothing. Immediately before
+    removal the entry is lstat-classified and its device/inode identity must
+    equal the identity of the probe object this preflight created. Any
+    mismatch, non-regular entry, or metadata failure raises OSError: the
+    caller classifies that as ``cleanup_unconfirmed`` and the foreign or
+    replacement entry is left untouched -- never repaired, replaced, renamed,
+    or deleted. Ordered best-effort, like every other classification here.
+    """
+    info = os.lstat(probe_path)
+    if not stat.S_ISREG(info.st_mode) or entry_identity(info) != owned_identity:
+        raise OSError(1, "preflight_probe_identity_mismatch")
+    os.unlink(probe_path)
+
+
 def posix_publication_capability_preflight(outbox_dir):
     """Bounded no-data POSIX publication-capability preflight.
 
     Proves, before any AC2 lookup can be consumed, that the outbox filesystem
     supports the exact primitives durable no-replace publication requires:
-    exclusive create-new (``O_CREAT | O_EXCL``), hard-link create-new
-    (``os.link``), and directory fsync. Only empty synthetic probe entries at
-    fixed bridge-owned names are used; no member data or staged result content
-    is ever written or exposed, and only entries this preflight verifiably
-    created (exclusive create / create-new link) are ever removed.
+    exclusive create-new (``O_CREAT | O_EXCL``), file fsync (the same file
+    durability primitive the real publication temp write uses), hard-link
+    create-new (``os.link``), and directory fsync. Only empty synthetic probe
+    entries at fixed bridge-owned names are used; no member data or staged
+    result content is ever written or exposed. Removal is ownership-verified:
+    the device/inode identity of each probe is captured at creation, the
+    hard-link relationship is validated the same way, and a pathname is
+    unlinked only while it still refers to the object this preflight created
+    -- an entry replaced by the other share participant is never touched.
 
     Returns exactly one of three states:
 
-    - ``"capable"``: every capability primitive succeeded AND both probes were
-      removed with the cleanup durably confirmed. Only this state permits the
-      lookup to proceed.
+    - ``"capable"``: every capability primitive succeeded AND both owned
+      probes were removed with the cleanup durably confirmed. Only this state
+      permits the lookup to proceed.
     - ``"unsupported"``: a failure before publication capability was proven
-      (pre-existing entry at a probe name, exclusive-create failure, hard-link
-      failure, or first directory-fsync failure). Nothing is deleted: whatever
-      exists at the probe names -- including entries this preflight created
-      before the failure -- stays in place for operator inspection and blocks
-      the next run's exclusive create. The caller fails closed through the
-      normal terminal path.
+      (pre-existing entry at a probe name, exclusive-create failure, file
+      fsync failure, hard-link failure, hard-link identity mismatch, or first
+      directory-fsync failure). Nothing is deleted: whatever exists at the
+      probe names -- including entries this preflight created before the
+      failure -- stays in place for operator inspection and blocks the next
+      run's exclusive create. The caller fails closed through the normal
+      terminal path.
     - ``"cleanup_unconfirmed"``: capability was proven but the probe cleanup
-      is incomplete or its durability is unconfirmed (unlink failure or final
-      directory-fsync failure). Probe entries may or may not still be visible,
-      so leftover probes alone cannot be relied on to block a rerun: the
-      caller must retain the execution claim so progression stays blocked
-      until documented manual recovery, and nothing is retried or repaired.
+      is incomplete, not confirmably ours (probe identity mismatch), or of
+      unconfirmed durability (unlink failure or final directory-fsync
+      failure). Probe entries may or may not still be visible, so leftover
+      probes alone cannot be relied on to block a rerun: the caller must
+      retain the execution claim so progression stays blocked until
+      documented manual recovery, and nothing is retried or repaired.
 
     The Windows publication path is neither exercised nor weakened; this
     preflight never runs on Windows.
@@ -634,9 +673,22 @@ def posix_publication_capability_preflight(outbox_dir):
     probe_src = outbox_dir / PREFLIGHT_PROBE_SRC_FILENAME
     probe_link = outbox_dir / PREFLIGHT_PROBE_LINK_FILENAME
     try:
-        with open_exclusive_no_follow(probe_src):
-            pass  # deliberately empty: the probe carries no data
+        with open_exclusive_no_follow(probe_src) as handle:
+            # Deliberately empty: the probe carries no data. Flush and fsync
+            # exercise the exact file-durability primitive the real
+            # publication temp write depends on, before any lookup.
+            handle.flush()
+            # Test-only file-fsync failure injection; it can only cause a
+            # failure, exercising the real exception path below.
+            if os.environ.get(FAULT_ENV) == "fail_preflight_file_fsync":
+                raise OSError(5, "test_injected_preflight_file_fsync_failure")
+            os.fsync(handle.fileno())
+            owned_identity = entry_identity(os.fstat(handle.fileno()))
         os.link(probe_src, probe_link)
+        # The create-new hard link must share the source object's identity;
+        # anything else means the namespace was interfered with mid-proof.
+        if entry_identity(os.lstat(probe_link)) != owned_identity:
+            raise OSError(1, "preflight_probe_link_identity_mismatch")
         fsync_directory(outbox_dir)
     except OSError:
         return "unsupported"
@@ -644,8 +696,8 @@ def posix_publication_capability_preflight(outbox_dir):
         # Test-only cleanup-failure injection; it can only cause a failure.
         if os.environ.get(FAULT_ENV) == "fail_preflight_cleanup":
             raise OSError(5, "test_injected_preflight_cleanup_failure")
-        os.unlink(probe_link)
-        os.unlink(probe_src)
+        unlink_owned_probe(probe_link, owned_identity)
+        unlink_owned_probe(probe_src, owned_identity)
         fsync_directory(outbox_dir)
     except OSError:
         return "cleanup_unconfirmed"
@@ -762,7 +814,19 @@ def main(argv=None):
         emit("needs_fix")
         return 2
 
-    # D. Exclusive VM-local claim, atomically, before any marker/result inspection
+    # D. The VM-local claim-state directory is an explicit operator setup
+    # prerequisite: it must already exist as a plain (non-reparse) directory
+    # before the claim can be acquired. It is never created, repaired, or
+    # bootstrapped here -- a directory tree created moments before the claim
+    # cannot be made durable by fsyncing the claim directory alone, because
+    # each newly created ancestor entry would also need its own parent
+    # fsynced. Missing or invalid claim-state storage fails closed before the
+    # claim and before any lookup; the private path is never printed.
+    if not directory_entry_is_plain_directory(Path(args.claim_json).parent):
+        emit("needs_fix")
+        return 2
+
+    # Exclusive VM-local claim, atomically, before any marker/result inspection
     # and before any lookup. A claim left by an interrupted run blocks here and
     # requires the documented operator recovery; it is never auto-removed.
     claim_state = acquire_claim(args.claim_json)

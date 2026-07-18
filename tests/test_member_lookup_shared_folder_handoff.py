@@ -1090,6 +1090,63 @@ class ClaimDurabilityTests(SharedFolderHandoffBase):
         self.assert_unconfirmed_claim_durability_blocks_lookup("fail_claim_file_fsync")
 
 
+class ClaimStateDirectoryTests(SharedFolderHandoffBase):
+    """The VM-local claim-state directory is an operator setup prerequisite:
+    it must already exist as a plain directory and is never created, repaired,
+    or bootstrapped by the runner."""
+
+    def run_with_claim_path(self, claim_path):
+        arguments = self.base_args(extra=self.fake_ps())
+        arguments[arguments.index("--claim-json") + 1] = str(claim_path)
+        return self.run_cli(arguments)
+
+    def test_missing_claim_state_parent_blocks_before_claim_and_lookup(self):
+        write_jsonl(self.pending, [canonical_queue_row()])
+        missing_parent = self.vm_local / "state_dir_never_created"
+        claim_path = missing_parent / "claim.json"
+        completed = self.run_with_claim_path(claim_path)
+        self.assertEqual(completed.returncode, 2)
+        self.assertNotIn("Traceback", completed.stderr)
+        evidence = parse_evidence(completed.stdout)
+        self.assertEqual(evidence["status"], "needs_fix")
+        self.assertEqual(evidence["claim_acquired"], "false")
+        self.assertEqual(evidence["preexisting_claim_detected"], "false")
+        self.assert_no_lookup_and_no_outbox(evidence)
+        self.assertFalse(self.staging.exists())
+        # No claim was created, the missing directory was NOT silently
+        # created, and the private path never appears in the evidence.
+        self.assertFalse(claim_path.exists())
+        self.assertFalse(missing_parent.exists())
+        self.assertNotIn(str(claim_path), completed.stdout)
+
+    def test_claim_state_parent_regular_file_blocks_before_claim(self):
+        write_jsonl(self.pending, [canonical_queue_row()])
+        bogus_parent = self.vm_local / "state_entry_is_a_file"
+        bogus_parent.write_text("not-a-directory\n", encoding="utf-8")
+        completed = self.run_with_claim_path(bogus_parent / "claim.json")
+        self.assertEqual(completed.returncode, 2)
+        evidence = parse_evidence(completed.stdout)
+        self.assertEqual(evidence["status"], "needs_fix")
+        self.assertEqual(evidence["claim_acquired"], "false")
+        self.assert_no_lookup_and_no_outbox(evidence)
+        # The invalid entry is untouched.
+        self.assertEqual(
+            bogus_parent.read_text(encoding="utf-8"), "not-a-directory\n"
+        )
+
+    def test_valid_preexisting_claim_state_parent_supports_full_run(self):
+        # The operator-provisioned state directory (created in setUp, before
+        # execution) supports the complete claim/lookup/publish cycle.
+        write_jsonl(self.pending, [canonical_queue_row()])
+        completed = self.run_cli(self.base_args(extra=self.fake_ps()))
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        evidence = parse_evidence(completed.stdout)
+        self.assertEqual(evidence["status"], "ok")
+        self.assertEqual(evidence["claim_acquired"], "true")
+        self.assertEqual(self.hit_count(), 1)
+        self.assertFalse(self.claim.exists())
+
+
 class ReparsePointClassificationTests(unittest.TestCase):
     """Deterministic Windows reparse-attribute modelling for the fixed final
     and publication-temp artifact classifier (and the pending validator it
@@ -1274,6 +1331,130 @@ class PublicationPreflightTests(SharedFolderHandoffBase):
         # failed, so leftover probe entries cannot block the next run.
         self.assertFalse(probe_src.exists())
         self.assertFalse(probe_link.exists())
+
+    def test_preflight_unit_file_fsync_unsupported_fails_closed(self):
+        # A POSIX-mounted outbox without working file fsync must fail the
+        # preflight before capability is considered proven (and therefore
+        # before any Gate 4 delegation could consume a lookup).
+        module = load_handoff_module()
+        probe_src, probe_link = self.probe_paths()
+        with mock.patch.object(
+            module.os, "fsync", side_effect=OSError(1, "file fsync unsupported")
+        ):
+            self.assertEqual(
+                module.posix_publication_capability_preflight(self.outbox),
+                "unsupported",
+            )
+        # Nothing is deleted: the created probe stays blocking and inspectable,
+        # and the link stage was never reached.
+        self.assertTrue(probe_src.exists())
+        self.assertFalse(probe_link.exists())
+
+    @unittest.skipIf(os.name == "nt", "POSIX-only publication preflight")
+    def test_preflight_file_fsync_failure_blocks_lookup_posix(self):
+        write_jsonl(self.pending, [canonical_queue_row()])
+        completed = self.run_cli(
+            self.base_args(extra=self.fake_ps()),
+            env={"SHARED_FOLDER_TEST_FAULT_INJECT": "fail_preflight_file_fsync"},
+        )
+        self.assertEqual(completed.returncode, 2)
+        self.assertNotIn("Traceback", completed.stderr)
+        evidence = parse_evidence(completed.stdout)
+        self.assertEqual(evidence["status"], "needs_fix")
+        self.assertEqual(evidence["posix_publication_preflight"], "unsupported")
+        self.assert_no_lookup_and_no_outbox(evidence)
+        self.assertFalse(self.staging.exists())
+        # Determinate capability-unproven refusal: claim released, retained
+        # probe blocks the rerun's exclusive create.
+        self.assertFalse(self.claim.exists())
+        probe_src, _ = self.probe_paths()
+        self.assertTrue(probe_src.exists())
+
+        rerun = self.run_cli(self.base_args(extra=self.fake_ps()))
+        self.assertEqual(rerun.returncode, 2)
+        blocked = parse_evidence(rerun.stdout)
+        self.assertEqual(blocked["status"], "needs_fix")
+        self.assertEqual(blocked["posix_publication_preflight"], "unsupported")
+        self.assertEqual(self.hit_count(), 0)
+
+    def replace_probe_on_first_directory_fsync(self, module, probe_to_replace):
+        """fsync_directory stand-in that simulates the other share participant
+        replacing a probe entry between capability proof and cleanup."""
+        state = {"calls": 0}
+
+        def fake_fsync_directory(directory):
+            state["calls"] += 1
+            if state["calls"] == 1:
+                probe_to_replace.unlink()
+                probe_to_replace.write_text(
+                    "foreign-replacement-not-owned-by-preflight\n", encoding="utf-8"
+                )
+
+        return mock.patch.object(module, "fsync_directory", fake_fsync_directory)
+
+    def test_preflight_unit_replaced_link_probe_never_unlinked(self):
+        module = load_handoff_module()
+        probe_src, probe_link = self.probe_paths()
+        with self.replace_probe_on_first_directory_fsync(module, probe_link):
+            self.assertEqual(
+                module.posix_publication_capability_preflight(self.outbox),
+                "cleanup_unconfirmed",
+            )
+        # The replacement entry is byte-for-byte untouched: identity
+        # verification refused to unlink an object the preflight did not
+        # create, and nothing was repaired, replaced, renamed, or deleted.
+        self.assertEqual(
+            probe_link.read_text(encoding="utf-8"),
+            "foreign-replacement-not-owned-by-preflight\n",
+        )
+        # The owned source probe was never reached and stays in place.
+        self.assertTrue(probe_src.exists())
+        self.assertEqual(probe_src.stat().st_size, 0)
+
+    def test_preflight_unit_replaced_src_probe_never_unlinked(self):
+        module = load_handoff_module()
+        probe_src, probe_link = self.probe_paths()
+        with self.replace_probe_on_first_directory_fsync(module, probe_src):
+            self.assertEqual(
+                module.posix_publication_capability_preflight(self.outbox),
+                "cleanup_unconfirmed",
+            )
+        # The owned link probe was legitimately removed first; the foreign
+        # replacement at the source name is byte-for-byte untouched.
+        self.assertFalse(probe_link.exists())
+        self.assertEqual(
+            probe_src.read_text(encoding="utf-8"),
+            "foreign-replacement-not-owned-by-preflight\n",
+        )
+
+    @unittest.skipIf(os.name == "nt", "POSIX-only publication preflight")
+    def test_preflight_replaced_probe_retains_claim_and_blocks_rerun_posix(self):
+        write_jsonl(self.pending, [canonical_queue_row()])
+        module = load_handoff_module()
+        probe_src, probe_link = self.probe_paths()
+        buffer = io.StringIO()
+        with self.replace_probe_on_first_directory_fsync(module, probe_link):
+            with contextlib.redirect_stdout(buffer):
+                code = module.main(self.base_args(extra=self.fake_ps()))
+        evidence = parse_evidence(buffer.getvalue())
+        self.assertEqual(code, 2)
+        self.assertEqual(evidence["status"], "needs_fix")
+        self.assertEqual(evidence["posix_publication_preflight"], "cleanup_unconfirmed")
+        self.assertEqual(evidence["lookup_attempt_count"], "0")
+        self.assertEqual(self.hit_count(), 0)
+        # The foreign replacement is untouched and the claim is retained.
+        self.assertEqual(
+            probe_link.read_text(encoding="utf-8"),
+            "foreign-replacement-not-owned-by-preflight\n",
+        )
+        self.assertTrue(self.claim.exists())
+
+        rerun = self.run_cli(self.base_args(extra=self.fake_ps()))
+        self.assertEqual(rerun.returncode, 2)
+        blocked = parse_evidence(rerun.stdout)
+        self.assertEqual(blocked["status"], "needs_fix")
+        self.assertEqual(blocked["preexisting_claim_detected"], "true")
+        self.assertEqual(self.hit_count(), 0)
 
     def test_preflight_unit_preexisting_probe_entry_fails_closed(self):
         module = load_handoff_module()
@@ -1654,6 +1835,9 @@ class SharedFolderHandoffDocsTest(unittest.TestCase):
         self.assertIn("claim_durability_unconfirmed", text)
         self.assertIn("posix_publication_preflight", text)
         self.assertIn("cleanup_unconfirmed", text)
+        self.assertIn("device/inode", text)
+        self.assertIn("setup prerequisite", text)
+        self.assertIn("file fsync", text)
         self.assertIn("O_EXCL", text)
         for forbidden in ("member create", "direct SQL"):
             self.assertIn(forbidden, text)
