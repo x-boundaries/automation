@@ -17,11 +17,18 @@ read-only PowerShell lookup can produce ``status = ok``.
 
 On top of that delegation this wrapper adds only the shared-folder layer:
 
-- fixed inbox/outbox contract paths inside the private share;
+- fixed inbox/outbox contract paths inside the private share, where the share
+  root, inbox, and outbox directory entries must themselves be genuine
+  directories (lstat-based, reparse-point-aware): a symlink, junction, or any
+  other redirected/reparse entry is rejected fail-closed and never followed or
+  resolved;
 - one VM-local exclusive execution claim (atomic ``O_CREAT | O_EXCL``) that is
   acquired before any state inspection or lookup and held through staging,
-  publication, and marker completion; a claim left behind by an interrupted
-  run causes ``needs_fix`` and never an automatic retry;
+  publication, and marker completion; acquisition is complete only once the
+  claim entry is durable for the platform contract (POSIX adds a parent
+  directory fsync), an unconfirmed durable commit fails closed before any
+  lookup with the indeterminate entry left in place, and a claim left behind
+  by an interrupted run causes ``needs_fix`` and never an automatic retry;
 - VM-local result staging outside the share (the Gate 4 runner never touches
   the shared outbox directly);
 - fail-closed final-path classification: any pre-existing artifact at the
@@ -29,9 +36,17 @@ On top of that delegation this wrapper adds only the shared-folder layer:
   broken link, or an unreadable/stat-failing entry) blocks the run before any
   lookup; only a regular nonempty file can enter idempotent verification; the
   fixed publication temp path is classified the same way (only a completely
-  absent entry permits a fresh lookup), and the fixed pending-queue entry must
-  itself be a non-link regular file (lstat-based, reparse-point-aware, links
-  never followed);
+  absent entry permits a fresh lookup), a Windows reparse-point entry at
+  either fixed path is likewise blocked (never read through, truncated,
+  replaced, renamed, repaired, or deleted), and the fixed pending-queue entry
+  must itself be a non-link regular file (lstat-based, reparse-point-aware,
+  links never followed);
+- a POSIX-only, no-data publication-capability preflight before the Gate 4
+  delegation: empty synthetic probe entries prove exclusive create-new,
+  hard-link create-new, and directory-fsync support in the outbox so a
+  filesystem that cannot honour durable no-replace publication fails closed
+  with zero AC2 lookups (the Windows publication path is neither exercised
+  nor weakened by the preflight);
 - durable atomic no-replace publication: the validated one-row staging result
   is copied to a same-directory temporary file in the outbox, flushed, and
   moved to the fixed Gate 5A result-copy filename with a durable create-new
@@ -73,6 +88,8 @@ OUTBOX_DIR_NAME = "outbox"
 PENDING_FILENAME = "member_lookup_bridge_gate4a_pending_queue.jsonl"
 RESULT_FILENAME = "member_lookup_bridge_gate5a_result_copy.jsonl"
 PUBLISH_TMP_FILENAME = RESULT_FILENAME + ".tmp"
+PREFLIGHT_PROBE_SRC_FILENAME = RESULT_FILENAME + ".preflight_probe_src.tmp"
+PREFLIGHT_PROBE_LINK_FILENAME = RESULT_FILENAME + ".preflight_probe_link.tmp"
 
 INNER_COUNT_KEYS = (
     "queue_rows_read_count",
@@ -116,6 +133,7 @@ def evidence_rows(status, counts, flags):
         *[(key, counts[key]) for key in INNER_COUNT_KEYS],
         ("claim_acquired", bool_text(flags["claim_acquired"])),
         ("preexisting_claim_detected", bool_text(flags["preexisting_claim_detected"])),
+        ("claim_durability_unconfirmed", bool_text(flags["claim_durability_unconfirmed"])),
         ("claim_release_failed", bool_text(flags["claim_release_failed"])),
         ("outbox_published", bool_text(flags["outbox_published"])),
         ("vm_local_state_outside_share", bool_text(flags["vm_local_state_outside_share"])),
@@ -180,11 +198,34 @@ def pending_entry_is_plain_regular_file(pending_path):
     return True
 
 
+def directory_entry_is_plain_directory(directory_path):
+    """Fail-closed lstat classification of an approved share directory entry.
+
+    The share root, inbox, and outbox entries must themselves be genuine
+    directories: symbolic links are never followed, and links, Windows
+    junctions and other reparse-point/redirection entries (where
+    ``st_file_attributes`` permits detection), non-directory entries, and any
+    metadata/stat failure are all rejected. The rejected entry is never
+    followed, resolved, repaired, renamed, or deleted.
+    """
+    try:
+        info = os.lstat(directory_path)
+    except OSError:
+        return False
+    if not stat.S_ISDIR(info.st_mode):
+        return False
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    attributes = getattr(info, "st_file_attributes", 0)
+    if reparse_flag and (attributes & reparse_flag):
+        return False
+    return True
+
+
 def share_layout_ready(share_root, pending_path, outbox_dir):
     return (
-        share_root.is_dir()
-        and pending_path.parent.is_dir()
-        and outbox_dir.is_dir()
+        directory_entry_is_plain_directory(share_root)
+        and directory_entry_is_plain_directory(pending_path.parent)
+        and directory_entry_is_plain_directory(outbox_dir)
         and pending_entry_is_plain_regular_file(pending_path)
     )
 
@@ -195,20 +236,27 @@ def maybe_fault(point):
 
 
 def acquire_claim(claim_path):
-    """Atomically create the VM-local exclusive execution claim.
+    """Atomically create and durably commit the VM-local exclusive claim.
 
-    Returns True when this process created the claim. An existing claim (from a
-    concurrent or interrupted run) makes acquisition fail; the claim is never
-    inspected, repaired, or removed here.
+    Returns ``"acquired"`` only when this process created the claim entry and
+    the platform durability contract is satisfied: the claim file is fsynced
+    on every platform, and on POSIX/local filesystems the parent directory is
+    additionally fsynced so the new directory entry itself is durable (Windows
+    behaviour is unchanged). Returns ``"exists"`` when a concurrent or
+    interrupted run already holds the claim; the existing claim is never
+    inspected, repaired, or removed here. Returns ``"durability_unconfirmed"``
+    when the entry was created but its durable commit could not be confirmed:
+    the caller must fail closed before any lookup and leave the indeterminate
+    entry in place -- never deleted, repaired, retried, or recreated.
     """
     path = Path(claim_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
         descriptor = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
     except FileExistsError:
-        return False
+        return "exists"
     except OSError:
-        return False
+        return "exists"
     with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
         handle.write(
             json.dumps(
@@ -224,7 +272,15 @@ def acquire_claim(claim_path):
         )
         handle.flush()
         os.fsync(handle.fileno())
-    return True
+    # Test-only durability-failure injection; it can only cause a failure.
+    if os.environ.get(FAULT_ENV) == "fail_claim_durability":
+        return "durability_unconfirmed"
+    if os.name != "nt":
+        try:
+            fsync_directory(path.parent)
+        except OSError:
+            return "durability_unconfirmed"
+    return "acquired"
 
 
 def release_claim(claim_path):
@@ -340,9 +396,12 @@ def classify_final_path(final_path):
     Returns ``absent`` (no directory entry), ``regular_nonempty`` (a plain
     regular file with content, the only state eligible for idempotent
     verification), or ``blocked`` for every other pre-existing artifact: a
-    zero-byte file, directory, symbolic or broken link, reparse point,
-    unreadable entry, or any metadata/stat failure. ``os.lstat`` is used so a
-    link is classified as the link itself, never followed.
+    zero-byte file, directory, symbolic or broken link, Windows
+    reparse-point/redirection entry (where ``st_file_attributes`` permits
+    detection), unreadable entry, or any metadata/stat failure. ``os.lstat``
+    is used so a link is classified as the link itself, never followed, and a
+    blocked artifact is never read through, truncated, replaced, renamed,
+    repaired, or deleted.
     """
     try:
         info = os.lstat(final_path)
@@ -351,6 +410,10 @@ def classify_final_path(final_path):
     except OSError:
         return "blocked"
     if not stat.S_ISREG(info.st_mode):
+        return "blocked"
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    attributes = getattr(info, "st_file_attributes", 0)
+    if reparse_flag and (attributes & reparse_flag):
         return "blocked"
     if info.st_size == 0:
         return "blocked"
@@ -446,6 +509,42 @@ def _posix_link_publish_durable(tmp_path, final_path, outbox_dir):
         raise PublicationDurabilityError(0, "publication_durability_unconfirmed") from error
 
 
+def posix_publication_capability_preflight(outbox_dir):
+    """Bounded no-data POSIX publication-capability preflight.
+
+    Proves, before any AC2 lookup can be consumed, that the outbox filesystem
+    supports the exact primitives durable no-replace publication requires:
+    exclusive create-new (``O_CREAT | O_EXCL``), hard-link create-new
+    (``os.link``), and directory fsync. Only empty synthetic probe entries at
+    fixed bridge-owned names are used; no member data or staged result content
+    is ever written or exposed. On success both probes are removed (each was
+    verifiably created by this preflight via exclusive create / create-new
+    link) and the cleanup is made durable. On any failure the preflight
+    returns False, deletes nothing, and leaves whatever exists at the probe
+    names for operator inspection -- including a pre-existing entry at a probe
+    name, which fails the preflight closed without being touched. The Windows
+    publication path is neither exercised nor weakened; this preflight never
+    runs on Windows.
+    """
+    # Test-only injection simulating an unsupported publication primitive; it
+    # can only cause a failure.
+    if os.environ.get(FAULT_ENV) == "fail_publication_preflight":
+        return False
+    probe_src = outbox_dir / PREFLIGHT_PROBE_SRC_FILENAME
+    probe_link = outbox_dir / PREFLIGHT_PROBE_LINK_FILENAME
+    try:
+        with open_exclusive_no_follow(probe_src):
+            pass  # deliberately empty: the probe carries no data
+        os.link(probe_src, probe_link)
+        fsync_directory(outbox_dir)
+        os.unlink(probe_link)
+        os.unlink(probe_src)
+        fsync_directory(outbox_dir)
+    except OSError:
+        return False
+    return True
+
+
 def publish_atomically(staging_path, outbox_dir, final_path):
     """Copy the validated staging content to the outbox via temp file + durable no-replace move.
 
@@ -504,6 +603,7 @@ def main(argv=None):
         "ac2_lookup_invoked": False,
         "claim_acquired": False,
         "preexisting_claim_detected": False,
+        "claim_durability_unconfirmed": False,
         "claim_release_failed": False,
         "outbox_published": False,
         "vm_local_state_outside_share": vm_local_state_outside_share(args, share_root),
@@ -532,8 +632,19 @@ def main(argv=None):
     # C. Exclusive VM-local claim, atomically, before any marker/result inspection
     # and before any lookup. A claim left by an interrupted run blocks here and
     # requires the documented operator recovery; it is never auto-removed.
-    if not acquire_claim(args.claim_json):
+    claim_state = acquire_claim(args.claim_json)
+    if claim_state == "exists":
         flags["preexisting_claim_detected"] = True
+        emit("needs_fix")
+        return 2
+    if claim_state != "acquired":
+        # The claim entry was created but its durable commit is unconfirmed, so
+        # acquisition is not complete: fail closed before any lookup and leave
+        # the indeterminate entry in place for operator recovery (never
+        # deleted, repaired, retried, or recreated). The next run detects it as
+        # a preexisting claim and stays blocked until the documented manual
+        # recovery.
+        flags["claim_durability_unconfirmed"] = True
         emit("needs_fix")
         return 2
     flags["claim_acquired"] = True
@@ -590,6 +701,16 @@ def main(argv=None):
         if staged_row is None or outbox_row is None or staged_row != outbox_row:
             return finish("needs_fix", counts, exit_code=2)
         return finish("already_processed", counts, exit_code=0)
+
+    # POSIX-only publication-capability preflight, after the claim and the
+    # final/temp-path classification but before any Gate 4 delegation: if the
+    # outbox filesystem cannot honour the durable no-replace publication
+    # primitives, no AC2 lookup may be consumed. The empty synthetic probes
+    # carry no data; a failed preflight deletes nothing and leaves the probe
+    # names for operator inspection. The Windows publication path is neither
+    # exercised nor weakened here.
+    if os.name != "nt" and not posix_publication_capability_preflight(outbox_dir):
+        return finish("needs_fix", exit_code=2)
 
     # E. Empty outbox: delegate the full canonical validation, lookup, and
     # marker/result state machine to the Gate 4 runner against VM-local staging.

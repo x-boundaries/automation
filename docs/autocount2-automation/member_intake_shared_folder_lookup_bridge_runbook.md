@@ -51,7 +51,7 @@ Bind-mounting `/home/node/.n8n-files` onto the shared folder would remove both o
 - The share must be private between the physical host and the VM only: a hypervisor shared folder, or an authenticated SMB share bound to a host-only/private interface. Never a guest-accessible, public, workgroup-open, or internet-reachable share.
 - Restrict share permissions to the operator account and the VM worker account. No Everyone/anonymous access.
 - The share must not sit inside a cloud-synced path (OneDrive, Dropbox, Google Drive) on either side.
-- The share holds only the contract files below (plus, transiently, the atomic publication temp file). It must not expose the AutoCount installation, AC2 runtime state, SQL Server data, credentials, `.env` values, `.n8n/` runtime state, or this repository.
+- The share holds only the contract files below (plus, transiently, the atomic publication temp file and the two empty POSIX preflight probe entries). It must not expose the AutoCount installation, AC2 runtime state, SQL Server data, credentials, `.env` values, `.n8n/` runtime state, or this repository.
 - The pending-queue file contains `submitted_member_no_base64_utf8`, which is sensitive operational data. Do not open, print, paste, or commit it; delete it per the gate evidence-retention rules after the handoff closes.
 - No tunnel, reverse proxy, queue API, webhook, scheduler, Windows service, or public inbound path to the VM is created, used, or approved by this topology.
 - Atomic publication relies on same-directory durable no-replace move semantics in the outbox. On Windows the runner uses `MoveFileExW` without `MOVEFILE_REPLACE_EXISTING` (an existing destination atomically refuses the move) and with `MOVEFILE_WRITE_THROUGH` (the move is flushed before success); the supported expectation is a local NTFS volume or an NTFS-backed hypervisor share where these `MoveFileExW` semantics are honoured. On POSIX-style filesystems the runner uses an atomic hard-link create-new followed by an fsync of the containing directory (through a real directory file descriptor), then temp-name cleanup and a second directory fsync; the supported expectation is a local filesystem with working hard links and directory fsync, such as ext4. Generic SMB/network-share behaviour is not assumed or verified: if the selected share cannot honour these primitives, the runner fails closed on the publication error, never leaves a partial final file, and never reports success on an unconfirmed commit.
@@ -62,9 +62,13 @@ Bind-mounting `/home/node/.n8n-files` onto the shared folder would remove both o
 <share-root>\inbox\member_lookup_bridge_gate4a_pending_queue.jsonl
 <share-root>\outbox\member_lookup_bridge_gate5a_result_copy.jsonl
 <share-root>\outbox\member_lookup_bridge_gate5a_result_copy.jsonl.tmp   (transient, atomic publication only)
+<share-root>\outbox\member_lookup_bridge_gate5a_result_copy.jsonl.preflight_probe_src.tmp    (transient, empty, POSIX capability preflight only)
+<share-root>\outbox\member_lookup_bridge_gate5a_result_copy.jsonl.preflight_probe_link.tmp   (transient, empty, POSIX capability preflight only)
 ```
 
 The `inbox` and `outbox` directories must exist before the worker runs. The filenames are fixed by the reused Gate 4A and Gate 5A contracts and must not be renamed.
+
+The share root, `inbox`, and `outbox` entries must themselves be genuine directories. The runner classifies each of them fail-closed with `lstat` (links never followed): a symbolic link, Windows junction, or any other reparse-point/redirection entry, a non-directory entry, or any metadata/stat failure is rejected with `needs_fix` and zero lookups -- even when the redirect target contains a perfectly valid layout -- and the rejected entry is never followed, resolved, repaired, renamed, or deleted.
 
 All VM-local state lives outside the share and ignored by Git. The runner refuses to run if any of these paths is inside the share root (or the share root is inside one of them):
 
@@ -99,6 +103,8 @@ An arbitrary file that merely satisfies the generic bridge request contract can 
 
 Before any marker/result inspection and before any lookup, the runner atomically creates the VM-local exclusive execution claim file (`O_CREAT | O_EXCL`). Exactly one process can win; a concurrent second invocation fails closed with `needs_fix`, `preexisting_claim_detected = true`, and zero lookups. The claim is held through staging, publication, and marker completion, and is removed only when the run reaches a clean deterministic terminal state (including clean rejections and idempotent reruns).
 
+Claim acquisition is complete only once the claim entry is durable for the platform contract: the claim file is fsynced on every platform, and on POSIX/local filesystems the parent directory is additionally fsynced so the new directory entry itself is durable (the Windows behaviour is unchanged). If the durable commit cannot be confirmed, the run fails closed before any lookup with `needs_fix`, `claim_acquired = false`, and `claim_durability_unconfirmed = true`; the indeterminate claim entry is deliberately left in place -- never deleted, repaired, retried, or recreated -- so the next run detects it as a preexisting claim and stays blocked until the documented manual recovery.
+
 A claim left behind by an interrupted run blocks every subsequent run with `needs_fix` and is never removed, inspected, repaired, or retried automatically. This is not a distributed lock; it protects a single VM host only.
 
 ## VM-Local Staging And Atomic Publication
@@ -112,7 +118,9 @@ The lookup never writes into the share directly. The delegated Gate 4 runner wri
 
 `outbox_published = true` and `status = ok` are emitted, and the claim is released, only after the final directory entry is durably committed. If the durable commit cannot be confirmed (write-through or directory-fsync failure), the run is `needs_fix`, `outbox_published` stays `false`, and the execution claim is deliberately retained so the state cannot progress automatically after an uncertain commit; the temp file and staged result are left for operator diagnosis.
 
-Before any lookup, the fixed final path is classified fail-closed: only a completely absent directory entry allows a fresh lookup, and only a regular nonempty file enters idempotent verification. A pre-existing zero-byte file, directory, symbolic or broken link, unreadable entry, or any metadata/stat failure blocks the run with `needs_fix` and zero lookups, so an unpublishable handoff can never consume a real AC2 lookup. The fixed publication temp path is classified the same way: any pre-existing temp artifact blocks the run before Gate 4 with zero lookups. Neither artifact is ever deleted, truncated, renamed, replaced, or repaired.
+Before any lookup, the fixed final path is classified fail-closed: only a completely absent directory entry allows a fresh lookup, and only a regular nonempty file enters idempotent verification. A pre-existing zero-byte file, directory, symbolic or broken link, Windows reparse-point/redirection entry (the same `FILE_ATTRIBUTE_REPARSE_POINT` rejection the pending-entry validator applies, so a reparse artifact can never be treated as a normal regular file), unreadable entry, or any metadata/stat failure blocks the run with `needs_fix` and zero lookups, so an unpublishable handoff can never consume a real AC2 lookup. The fixed publication temp path is classified the same way: any pre-existing temp artifact blocks the run before Gate 4 with zero lookups. Neither artifact is ever read through, deleted, truncated, renamed, replaced, or repaired.
+
+On POSIX operation only, after the claim and the final/temp-path classification but before the Gate 4 delegation, the runner additionally runs a bounded no-data publication-capability preflight in the outbox: it proves exclusive create-new, hard-link create-new, and directory-fsync support using the two fixed, empty, synthetic probe entries listed in the share layout. No member data or staged result content is ever written or exposed by the preflight. When the required no-replace publication or directory-durability primitives are unsupported (or a probe name is already occupied), the run fails closed with `needs_fix` and zero AC2 lookups; the preflight deletes nothing on failure and leaves whatever exists at the probe names for operator inspection rather than automatically repairing it. On success both probes (each verifiably created by the preflight itself) are removed durably before the lookup proceeds. The preflight never runs on Windows, so the Windows publication path is neither exercised nor weakened.
 
 The fixed pending-queue entry in the inbox is also classified fail-closed (lstat-based, links never followed) before the claim and any lookup: it must itself be a plain regular file. A symbolic link -- even one pointing at a perfectly valid canonical queue file elsewhere -- a broken link, a directory, a Windows reparse-point/redirection entry, or any metadata/stat failure is rejected with `needs_fix` and zero lookups, and the rejected artifact is never read, resolved, repaired, renamed, or deleted. This filesystem-boundary check is in addition to, not instead of, the delegated Gate 4 canonical content validation.
 
@@ -127,6 +135,9 @@ The runner treats every incomplete or inconsistent state as `needs_fix` with zer
 | Observed state | Outcome |
 | --- | --- |
 | Preexisting claim file (interrupted or concurrent run) | `needs_fix`, zero lookups |
+| Share root, inbox, or outbox entry is not a genuine directory (symlink, junction, reparse point, non-directory, stat failure) | `needs_fix`, zero lookups, entry never followed or resolved |
+| Claim entry created but durable commit unconfirmed | `needs_fix`, `claim_durability_unconfirmed = true`, zero lookups, indeterminate entry retained for operator recovery |
+| POSIX publication-capability preflight failure (unsupported create-new/hard-link/directory-fsync primitive, or occupied probe name) | `needs_fix`, zero lookups, probe entries left untouched for inspection |
 | Processed marker without a staged result | `needs_fix` |
 | Staged result without a processed marker | `needs_fix` |
 | Failed/dead-letter marker present in any combination | `needs_fix` |
@@ -134,8 +145,8 @@ The runner treats every incomplete or inconsistent state as `needs_fix` with zer
 | Corrupted or multi-row staging result | `needs_fix` |
 | Staging/marker pair complete but outbox missing or empty (interrupted publication) | `needs_fix` |
 | Outbox nonempty with no staged evidence, or not the exact staged row | `needs_fix`, outbox untouched |
-| Pre-existing final-path artifact before lookup (zero-byte file, directory, symlink/broken link, unreadable or stat-failing entry) | `needs_fix`, zero lookups, artifact untouched |
-| Pre-existing publication temp artifact at the fixed `.tmp` name | `needs_fix`, zero lookups, artifact untouched |
+| Pre-existing final-path artifact before lookup (zero-byte file, directory, symlink/broken link, reparse point, unreadable or stat-failing entry) | `needs_fix`, zero lookups, artifact untouched |
+| Pre-existing publication temp artifact at the fixed `.tmp` name (including a reparse point) | `needs_fix`, zero lookups, artifact untouched |
 | Pending-queue entry is not a plain regular file (symlink, broken link, directory, reparse point, stat failure) | `needs_fix`, zero lookups, artifact never read, resolved, or modified |
 | Corrupted (non-UTF-8) staged or published result | `needs_fix`, aggregate-only evidence, zero lookups, claim released when the state is determinate |
 | Final outbox filename created by another share participant during the lookup | `needs_fix`, destination byte-for-byte unchanged, temp file retained for diagnosis |
@@ -201,6 +212,7 @@ lookup_error_count = <aggregate-count-only>
 review_rows_written_count = <aggregate-count-only>
 claim_acquired = <true/false>
 preexisting_claim_detected = <true/false>
+claim_durability_unconfirmed = <true/false>
 claim_release_failed = <true/false>
 outbox_published = <true/false>
 vm_local_state_outside_share = true
@@ -219,7 +231,7 @@ final_write_automation = false
 no_row_values_printed = true
 ```
 
-Handoff pass evidence requires `status = ok`, `powershell_lookup_enabled = true`, `ac2_lookup_invoked = true`, `queue_rows_read_count = 1`, `lookup_attempt_count = 1`, `lookup_success_count = 1`, exactly one of the three review routing counts equal to `1`, `lookup_error_count = 0`, `review_rows_written_count = 1`, `claim_acquired = true`, `claim_release_failed = false`, and `outbox_published = true`. `status = already_processed` proves idempotency only. `READY_FOR_CREATE_REVIEW` remains review-only and is not approval to create.
+Handoff pass evidence requires `status = ok`, `powershell_lookup_enabled = true`, `ac2_lookup_invoked = true`, `queue_rows_read_count = 1`, `lookup_attempt_count = 1`, `lookup_success_count = 1`, exactly one of the three review routing counts equal to `1`, `lookup_error_count = 0`, `review_rows_written_count = 1`, `claim_acquired = true`, `claim_durability_unconfirmed = false`, `claim_release_failed = false`, and `outbox_published = true`. `status = already_processed` proves idempotency only. `READY_FOR_CREATE_REVIEW` remains review-only and is not approval to create.
 
 Do not paste pending rows, staged or published result rows, processed or failed markers, claim file content, raw/encoded/decoded/normalized member values, names, emails, phone numbers, birthday values, `AC2_PROBE_*` values, credentials, share paths/hostnames/accounts, Sheet IDs/URLs, command transcripts, stdout/stderr transcripts, screenshots, secrets, or PII.
 
