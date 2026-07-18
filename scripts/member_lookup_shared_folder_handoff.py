@@ -21,7 +21,12 @@ On top of that delegation this wrapper adds only the shared-folder layer:
   root, inbox, and outbox directory entries must themselves be genuine
   directories (lstat-based, reparse-point-aware): a symlink, junction, or any
   other redirected/reparse entry is rejected fail-closed and never followed or
-  resolved -- the share root is classified before any path-resolving
+  resolved -- the supplied share-root pathname must additionally be normal
+  (absolute, no ``..``/``.``/empty traversal components; validated as pure
+  text before any filesystem operation), every share-root path component from
+  the trusted anchor (drive root / UNC share prefix) down is lstat-classified
+  in order so a redirected intermediate component is detected without being
+  followed further, and all of this happens before any path-resolving
   operation, including the outside-share containment check;
 - one VM-local exclusive execution claim (atomic ``O_CREAT | O_EXCL``) that is
   acquired before any state inspection or lookup and held through staging,
@@ -226,6 +231,64 @@ def directory_entry_is_plain_directory(directory_path):
     attributes = getattr(info, "st_file_attributes", 0)
     if reparse_flag and (attributes & reparse_flag):
         return False
+    return True
+
+
+def share_root_path_is_normal(share_root_text):
+    """Pure string-level validation of the supplied share-root pathname.
+
+    No filesystem operation of any kind is performed here, so nothing can be
+    traversed, followed, or resolved while deciding. The supplied path must be
+    absolute, and after the platform anchor (drive root such as ``X:\\`` or a
+    UNC ``\\\\host\\share`` prefix -- the operator-supplied mount point) every
+    raw textual component must be a plain name: ``..``, ``.``, and empty
+    components are rejected. This blocks parent-traversal forms such as
+    ``<symlink-to-share-subdirectory>/..`` before any ``lstat`` could traverse
+    the redirected prefix while locating the final entry. The raw text is
+    inspected (not ``Path``-normalised parts) so a non-normal path is never
+    silently normalised and continued with.
+    """
+    text = os.fspath(share_root_text)
+    if not Path(text).is_absolute():
+        return False
+    _, tail = os.path.splitdrive(text)
+    if os.name == "nt":
+        tail = tail.replace("\\", "/")
+    components = tail.split("/")
+    if components and components[0] == "":
+        components = components[1:]
+    if components and components[-1] == "":
+        components = components[:-1]
+    return all(component not in ("", ".", "..") for component in components)
+
+
+def share_root_components_are_plain_directories(share_root):
+    """Incremental lstat classification of every share-root path component.
+
+    ``os.lstat`` protects only the final path entry: the operating system
+    still traverses (and follows) earlier components while locating it. This
+    walk therefore classifies each component in order, from the trusted
+    anchor down to the share root, with the same fail-closed lstat/reparse
+    check used for the share directories themselves. Each step's ``lstat``
+    traverses only components already classified as plain directories, so a
+    symlinked, junctioned, or reparse-point intermediate component is
+    detected and rejected without any deeper path under it ever being
+    accessed. The anchor itself (drive root, mapped-drive root, or UNC
+    ``\\\\host\\share`` prefix) is the supported trust boundary of the
+    private host-to-VM topology: redirection implemented below the filesystem
+    namespace (drive mapping / mount) is part of the approved deployment and
+    is not observable through ``lstat``. Like every other filesystem
+    classification in this runner this is ordered best-effort, not race-proof
+    against concurrent replacement of an already-classified component.
+    """
+    path = Path(share_root)
+    if len(path.parts) == 1:
+        return directory_entry_is_plain_directory(path)
+    current = Path(path.anchor)
+    for part in path.parts[1:]:
+        current = current / part
+        if not directory_entry_is_plain_directory(current):
+            return False
     return True
 
 
@@ -642,12 +705,19 @@ def build_parser():
 def main(argv=None):
     args = build_parser().parse_args(argv)
     share_root = Path(args.share_root)
-    # Fail-closed share-root entry classification before anything can resolve,
-    # follow, or traverse the share root. The outside-share containment check
-    # below resolves paths, so it is short-circuited for a rejected root: a
-    # symlinked/junction/reparse share root is never resolved or followed, and
-    # the unverifiable containment flag is reported fail-closed as false.
-    share_root_is_plain_directory = directory_entry_is_plain_directory(share_root)
+    # Fail-closed share-root boundary before anything can resolve, follow, or
+    # traverse the share root. First the supplied pathname is validated as
+    # pure text (absolute, no '..'/'.'/empty components) with zero filesystem
+    # operations, so a parent-traversal form like <symlink>/.. is rejected
+    # before any lstat could traverse its redirected prefix; only then is
+    # every path component lstat-classified in order from the trusted anchor
+    # down, so a redirected intermediate component is detected without being
+    # followed further. The outside-share containment check below resolves
+    # paths, so it is short-circuited for a rejected root, and the
+    # unverifiable containment flag is reported fail-closed as false.
+    share_root_boundary_ok = share_root_path_is_normal(
+        args.share_root
+    ) and share_root_components_are_plain_directories(share_root)
     flags = {
         "powershell_lookup_enabled": bool(args.enable_powershell_lookup),
         "ac2_lookup_invoked": False,
@@ -658,8 +728,7 @@ def main(argv=None):
         "posix_publication_preflight": "not_run",
         "outbox_published": False,
         "vm_local_state_outside_share": (
-            share_root_is_plain_directory
-            and vm_local_state_outside_share(args, share_root)
+            share_root_boundary_ok and vm_local_state_outside_share(args, share_root)
         ),
     }
 
@@ -671,10 +740,13 @@ def main(argv=None):
         emit("refused")
         return 2
 
-    # B. The share root entry itself must be a genuine directory before any
-    # other validation: a redirected root was rejected above without being
-    # resolved, and blocks here with no claim and no lookup.
-    if not share_root_is_plain_directory:
+    # B. The supplied share-root path must be normal (absolute, no traversal
+    # components) and every one of its components must be a genuine directory
+    # before any other validation: a non-normal or redirected root was
+    # rejected above without being resolved or traversed, and blocks here with
+    # no claim, no lookup, and no preflight or publication activity. The
+    # supplied private path is never printed.
+    if not share_root_boundary_ok:
         emit("needs_fix")
         return 2
 

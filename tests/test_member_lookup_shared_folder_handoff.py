@@ -866,6 +866,163 @@ class ShareDirectoryBoundaryTests(SharedFolderHandoffBase):
         self.assertEqual(evidence["vm_local_state_outside_share"], "false")
         self.assertEqual(self.hit_count(), 0)
 
+    def forbid_filesystem_classification(self, module):
+        """Patch lstat so any classification attempt fails the test."""
+        return mock.patch.object(
+            module.os,
+            "lstat",
+            side_effect=AssertionError(
+                "no lstat may run for a non-normal share-root pathname"
+            ),
+        )
+
+    def assert_rejected_root_evidence(self, code, evidence, supplied_root):
+        self.assertEqual(code, 2)
+        self.assertEqual(evidence["status"], "needs_fix")
+        self.assertEqual(evidence["lookup_attempt_count"], "0")
+        self.assertEqual(evidence["ac2_lookup_invoked"], "false")
+        self.assertEqual(self.hit_count(), 0)
+        self.assertFalse(self.claim.exists())
+        self.assertFalse(self.staging.exists())
+        # The sanitised aggregate evidence never exposes the supplied path.
+        self.assertNotIn(str(supplied_root), "\n".join(f"{k} = {v}" for k, v in evidence.items()))
+
+    def test_share_root_path_normality_contract(self):
+        module = load_handoff_module()
+        normal = module.share_root_path_is_normal
+        # The real (absolute, normal) test share root is accepted as-is.
+        self.assertTrue(normal(str(self.share_root)))
+        # Non-normal traversal and relative forms are rejected as pure text.
+        self.assertFalse(normal(str(self.share_root) + os.sep + ".."))
+        self.assertFalse(normal(".."))
+        self.assertFalse(normal(f"relative{os.sep}share"))
+        if os.name == "nt":
+            self.assertTrue(normal("C:\\xb_share\\member_lookup"))
+            self.assertTrue(normal("X:\\xb_member_lookup_handoff"))
+            self.assertTrue(normal("C:\\"))
+            # A UNC \\host\share prefix is the trusted anchor; components
+            # after it must still be normal.
+            self.assertTrue(normal("\\\\host\\share\\member_lookup"))
+            self.assertFalse(normal("\\\\host\\share\\member_lookup\\.."))
+            self.assertFalse(normal("C:\\share\\..\\share"))
+            self.assertFalse(normal("C:\\share\\."))
+            self.assertFalse(normal("C:\\share\\\\double_separator"))
+            self.assertFalse(normal("C:relative_to_drive"))
+        else:
+            self.assertTrue(normal("/srv/xb_share"))
+            self.assertFalse(normal("/srv/xb_share/.."))
+            self.assertFalse(normal("/srv/./xb_share"))
+            self.assertFalse(normal("//srv/xb_share"))
+
+    def test_parent_traversal_share_root_rejected_without_any_lstat(self):
+        # Plain '..' traversal must be rejected as pure text: no lstat, no
+        # containment resolution, no claim, no lookup.
+        write_jsonl(self.pending, [canonical_queue_row()])
+        module = load_handoff_module()
+        unsafe_root = f"{self.share_root}{os.sep}inbox{os.sep}.."
+        arguments = self.base_args(extra=self.fake_ps())
+        arguments[arguments.index("--share-root") + 1] = unsafe_root
+        with self.forbid_filesystem_classification(module), \
+                self.forbid_resolution(module):
+            code, evidence = self.run_main_in_process(arguments)
+        self.assert_rejected_root_evidence(code, evidence, unsafe_root)
+
+    def test_parent_traversal_share_root_rejected_end_to_end(self):
+        write_jsonl(self.pending, [canonical_queue_row()])
+        unsafe_root = f"{self.share_root}{os.sep}inbox{os.sep}.."
+        arguments = self.base_args(extra=self.fake_ps())
+        arguments[arguments.index("--share-root") + 1] = unsafe_root
+        completed = self.run_cli(arguments)
+        self.assert_blocked_before_claim(completed)
+        self.assertNotIn(unsafe_root, completed.stdout)
+
+    def test_symlink_prefix_parent_traversal_rejected(self):
+        # <symlink-to-real-share-subdirectory>/.. reaches the real share root
+        # only by traversing the symlinked prefix; it must be rejected as pure
+        # text before any lstat can perform that traversal.
+        real_share = self.build_real_share("real_share_for_link_prefix")
+        link = Path(self._tmp.name) / "link_prefix_to_share_subdir"
+        self.make_symlink(link, real_share / "inbox")
+        module = load_handoff_module()
+        unsafe_root = f"{link}{os.sep}.."
+        arguments = self.base_args(extra=self.fake_ps())
+        arguments[arguments.index("--share-root") + 1] = unsafe_root
+        with self.forbid_filesystem_classification(module), \
+                self.forbid_resolution(module):
+            code, evidence = self.run_main_in_process(arguments)
+        self.assert_rejected_root_evidence(code, evidence, unsafe_root)
+        self.assertFalse((real_share / "outbox" / RESULT_FILENAME).exists())
+
+    @unittest.skipUnless(os.name == "nt", "Windows junction behaviour")
+    def test_junction_prefix_parent_traversal_rejected(self):
+        real_share = self.build_real_share("real_share_for_junction_prefix")
+        junction = Path(self._tmp.name) / "junction_prefix_to_share_subdir"
+        self.make_junction(junction, real_share / "inbox")
+        module = load_handoff_module()
+        unsafe_root = f"{junction}{os.sep}.."
+        arguments = self.base_args(extra=self.fake_ps())
+        arguments[arguments.index("--share-root") + 1] = unsafe_root
+        with self.forbid_filesystem_classification(module), \
+                self.forbid_resolution(module):
+            code, evidence = self.run_main_in_process(arguments)
+        self.assert_rejected_root_evidence(code, evidence, unsafe_root)
+        self.assertFalse((real_share / "outbox" / RESULT_FILENAME).exists())
+
+    @unittest.skipUnless(os.name == "nt", "Windows junction behaviour")
+    def test_redirected_intermediate_component_rejected_junction(self):
+        # No '..' involved: an intermediate junction component in an otherwise
+        # normal absolute path must be detected by the component walk and the
+        # entries beneath it must never be accessed.
+        real_parent = Path(self._tmp.name) / "real_parent_for_intermediate"
+        real_parent.mkdir()
+        real_share = real_parent / "real_share"
+        (real_share / "inbox").mkdir(parents=True)
+        (real_share / "outbox").mkdir()
+        write_jsonl(real_share / "inbox" / PENDING_FILENAME, [canonical_queue_row()])
+        junction = Path(self._tmp.name) / "junction_intermediate"
+        self.make_junction(junction, real_parent)
+        completed = self.run_with_share_root(junction / "real_share")
+        self.assert_blocked_before_claim(completed)
+        self.assertFalse((real_share / "outbox" / RESULT_FILENAME).exists())
+
+    def test_redirected_intermediate_component_rejected_mocked(self):
+        # Deterministic on hosts without symlink or junction privileges: an
+        # intermediate ancestor of a normal absolute share-root path reports a
+        # reparse point; the walk must reject there and never lstat anything
+        # at or below the share root, and the resolver must never run.
+        write_jsonl(self.pending, [canonical_queue_row()])
+        module = load_handoff_module()
+        real_lstat = os.lstat
+        redirected_ancestor = str(self.share_root.parent)
+        observed_lstat_paths = []
+
+        def reparse_ancestor_lstat(path, *args, **kwargs):
+            observed_lstat_paths.append(str(path))
+            if str(path) == redirected_ancestor:
+                return fake_lstat_result(
+                    stat.S_IFDIR, st_file_attributes=REPARSE_POINT_ATTRIBUTE
+                )
+            return real_lstat(path, *args, **kwargs)
+
+        with mock.patch.object(module.os, "lstat", side_effect=reparse_ancestor_lstat), \
+                self.forbid_resolution(module):
+            code, evidence = self.run_main_in_process(
+                self.base_args(extra=self.fake_ps())
+            )
+        self.assert_rejected_root_evidence(code, evidence, self.share_root)
+        # The walk stopped at the redirected intermediate component: nothing
+        # at or below the share root was ever classified.
+        self.assertIn(redirected_ancestor, observed_lstat_paths)
+        self.assertNotIn(str(self.share_root), observed_lstat_paths)
+
+    def test_valid_share_root_components_accepted(self):
+        module = load_handoff_module()
+        # The real (plain, absolute, drive-style on Windows) share root passes
+        # the full component walk, so legitimate supported paths keep working.
+        self.assertTrue(
+            module.share_root_components_are_plain_directories(self.share_root)
+        )
+
     def test_reparse_point_directory_entry_rejected_by_classifier(self):
         # Deterministic reparse-point modelling on every platform: a directory
         # entry carrying FILE_ATTRIBUTE_REPARSE_POINT (symlink, junction, or
@@ -1491,6 +1648,8 @@ class SharedFolderHandoffDocsTest(unittest.TestCase):
         self.assertIn("non-UTF-8", text)
         self.assertIn("reparse", text)
         self.assertIn("junction", text)
+        self.assertIn("intermediate", text)
+        self.assertIn("anchor", text)
         self.assertIn("preflight", text)
         self.assertIn("claim_durability_unconfirmed", text)
         self.assertIn("posix_publication_preflight", text)
