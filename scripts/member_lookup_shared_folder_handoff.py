@@ -27,7 +27,11 @@ On top of that delegation this wrapper adds only the shared-folder layer:
 - fail-closed final-path classification: any pre-existing artifact at the
   fixed final result path (including a zero-byte file, directory, symbolic or
   broken link, or an unreadable/stat-failing entry) blocks the run before any
-  lookup; only a regular nonempty file can enter idempotent verification;
+  lookup; only a regular nonempty file can enter idempotent verification; the
+  fixed publication temp path is classified the same way (only a completely
+  absent entry permits a fresh lookup), and the fixed pending-queue entry must
+  itself be a non-link regular file (lstat-based, reparse-point-aware, links
+  never followed);
 - durable atomic no-replace publication: the validated one-row staging result
   is copied to a same-directory temporary file in the outbox, flushed, and
   moved to the fixed Gate 5A result-copy filename with a durable create-new
@@ -152,8 +156,37 @@ def vm_local_state_outside_share(args, share_root):
     return True
 
 
+def pending_entry_is_plain_regular_file(pending_path):
+    """Fail-closed lstat classification of the fixed pending-queue entry.
+
+    The entry must itself be a regular file: symbolic links are never followed,
+    and broken links, directories, other non-regular entries, Windows
+    reparse-point/redirection entries (where ``st_file_attributes`` permits
+    detection), and any metadata/stat failure are all rejected. The rejected
+    artifact is never read, resolved, repaired, renamed, or deleted. This is a
+    filesystem-boundary check only; the delegated Gate 4 canonical content
+    validation still applies afterwards.
+    """
+    try:
+        info = os.lstat(pending_path)
+    except OSError:
+        return False
+    if not stat.S_ISREG(info.st_mode):
+        return False
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    attributes = getattr(info, "st_file_attributes", 0)
+    if reparse_flag and (attributes & reparse_flag):
+        return False
+    return True
+
+
 def share_layout_ready(share_root, pending_path, outbox_dir):
-    return share_root.is_dir() and pending_path.parent.is_dir() and outbox_dir.is_dir() and pending_path.is_file()
+    return (
+        share_root.is_dir()
+        and pending_path.parent.is_dir()
+        and outbox_dir.is_dir()
+        and pending_entry_is_plain_regular_file(pending_path)
+    )
 
 
 def maybe_fault(point):
@@ -239,8 +272,14 @@ def run_gate4(args, pending_path):
     if args.allow_root_login:
         argv.append("--allow-root-login")
     buffer = io.StringIO()
-    with contextlib.redirect_stdout(buffer):
-        gate4.main(argv)
+    try:
+        with contextlib.redirect_stdout(buffer):
+            gate4.main(argv)
+    except (OSError, ValueError):
+        # Includes UnicodeDecodeError from corrupted (non-UTF-8) VM-local state:
+        # fail closed through the normal aggregate-only needs_fix path without
+        # letting an exception (or any byte/path content) escape.
+        return "needs_fix", {}
     inner = {}
     for line in buffer.getvalue().splitlines():
         if " = " in line:
@@ -265,7 +304,9 @@ def read_single_result_row(path):
         return None
     try:
         text = file_path.read_text(encoding="utf-8")
-    except OSError:
+    except (OSError, UnicodeError):
+        # Unreadable or non-UTF-8 (corrupted) content is a deviation, handled
+        # through the normal needs_fix path; nothing is printed or logged.
         return None
     rows = []
     for line in text.splitlines():
@@ -317,13 +358,35 @@ def classify_final_path(final_path):
 
 
 def staging_has_content(path):
+    """True when VM-local staging holds (or may hold) prior work.
+
+    An unreadable or non-UTF-8 (corrupted) staging file conservatively counts
+    as content: a fresh lookup must not run over it, and the delegated Gate 4
+    inspection then routes the corrupted state to needs_fix.
+    """
     try:
         file_path = Path(path)
         if not file_path.is_file():
             return False
         return any(line.strip() for line in file_path.read_text(encoding="utf-8").splitlines())
-    except OSError:
+    except (OSError, UnicodeError):
         return True
+
+
+def open_exclusive_no_follow(path):
+    """Open a brand-new file for writing, atomically and without following links.
+
+    ``O_CREAT | O_EXCL`` guarantees the entry is created by this call (an
+    existing regular file, symlink -- including a broken one -- directory, or
+    any other entry at the path makes the open fail without modifying it, so a
+    pre-existing artifact is never truncated or followed). ``O_NOFOLLOW`` is
+    added where the platform supports it as defence in depth. Failure raises
+    OSError and the caller fails closed.
+    """
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(str(path), flags)
+    return os.fdopen(descriptor, "w", encoding="utf-8", newline="")
 
 
 def fsync_directory(directory):
@@ -397,7 +460,7 @@ def publish_atomically(staging_path, outbox_dir, final_path):
     """
     text = Path(staging_path).read_text(encoding="utf-8")
     tmp_path = outbox_dir / PUBLISH_TMP_FILENAME
-    with open(tmp_path, "w", encoding="utf-8", newline="") as handle:
+    with open_exclusive_no_follow(tmp_path) as handle:
         handle.write(text)
         handle.flush()
         os.fsync(handle.fileno())
@@ -499,6 +562,14 @@ def main(argv=None):
     # renamed, replaced, or repaired.
     final_state = classify_final_path(final_path)
     if final_state == "blocked":
+        return finish("needs_fix", exit_code=2)
+
+    # The fixed publication temp path is classified with the same fail-closed
+    # rules: any pre-existing entry there (regular file, symlink, broken link,
+    # directory, or an unreadable/stat-failing artifact) means publication is
+    # already guaranteed to be blocked, so no lookup may be consumed and the
+    # artifact is left untouched for operator review.
+    if classify_final_path(outbox_dir / PUBLISH_TMP_FILENAME) != "absent":
         return finish("needs_fix", exit_code=2)
 
     if final_state == "regular_nonempty":

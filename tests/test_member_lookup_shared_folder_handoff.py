@@ -582,6 +582,100 @@ class MarkerResultStateTests(SharedFolderHandoffBase):
         self.assertEqual(self.final.read_text(encoding="utf-8"), '{"stale": true}\n')
 
 
+class BoundaryClassificationTests(SharedFolderHandoffBase):
+    def make_symlink(self, link_path, target):
+        try:
+            os.symlink(str(target), str(link_path))
+        except (OSError, NotImplementedError):
+            self.skipTest("symlink creation not supported in this environment")
+
+    def assert_blocked_before_lookup(self, completed):
+        self.assertEqual(completed.returncode, 2)
+        self.assertNotIn("Traceback", completed.stderr)
+        evidence = parse_evidence(completed.stdout)
+        self.assertEqual(evidence["status"], "needs_fix")
+        self.assertEqual(evidence["lookup_attempt_count"], "0")
+        self.assertEqual(evidence["ac2_lookup_invoked"], "false")
+        self.assertEqual(self.hit_count(), 0)
+        return evidence
+
+    def test_preexisting_temp_regular_file_blocks_lookup(self):
+        write_jsonl(self.pending, [canonical_queue_row()])
+        tmp = self.outbox / PUBLISH_TMP_FILENAME
+        tmp.write_text("pre-existing-temp\n", encoding="utf-8")
+        completed = self.run_cli(self.base_args(extra=self.fake_ps()))
+        self.assert_blocked_before_lookup(completed)
+        self.assertEqual(tmp.read_text(encoding="utf-8"), "pre-existing-temp\n")
+        self.assertFalse(self.final.exists())
+
+    def test_preexisting_temp_symlink_blocks_lookup(self):
+        write_jsonl(self.pending, [canonical_queue_row()])
+        tmp = self.outbox / PUBLISH_TMP_FILENAME
+        self.make_symlink(tmp, self.final)
+        completed = self.run_cli(self.base_args(extra=self.fake_ps()))
+        self.assert_blocked_before_lookup(completed)
+        # The link itself is untouched and the final name was never created.
+        self.assertTrue(tmp.is_symlink())
+        self.assertFalse(self.final.exists())
+
+    def test_symlinked_pending_queue_rejected(self):
+        # The target contains a perfectly valid canonical Gate 4A row, and the
+        # symlinked pending entry must still never trigger a lookup.
+        real_queue = self.vm_local / "real_canonical_queue.jsonl"
+        write_jsonl(real_queue, [canonical_queue_row()])
+        self.make_symlink(self.pending, real_queue)
+        completed = self.run_cli(self.base_args(extra=self.fake_ps()))
+        self.assert_blocked_before_lookup(completed)
+        self.assertTrue(self.pending.is_symlink())
+        self.assertFalse(self.final.exists())
+
+    def test_broken_symlink_pending_rejected(self):
+        self.make_symlink(self.pending, self.vm_local / "does-not-exist.jsonl")
+        completed = self.run_cli(self.base_args(extra=self.fake_ps()))
+        self.assert_blocked_before_lookup(completed)
+
+    def test_directory_at_pending_path_rejected(self):
+        self.pending.mkdir()
+        completed = self.run_cli(self.base_args(extra=self.fake_ps()))
+        self.assert_blocked_before_lookup(completed)
+        self.assertTrue(self.pending.is_dir())
+
+
+class CorruptedEncodingTests(SharedFolderHandoffBase):
+    def complete_successful_run(self):
+        write_jsonl(self.pending, [canonical_queue_row()])
+        completed = self.run_cli(self.base_args(extra=self.fake_ps()))
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        self.assertEqual(self.hit_count(), 1)
+
+    def assert_controlled_needs_fix(self, completed):
+        self.assertEqual(completed.returncode, 2)
+        self.assertNotIn("Traceback", completed.stderr)
+        evidence = parse_evidence(completed.stdout)
+        self.assertEqual(evidence["status"], "needs_fix")
+        self.assertEqual(evidence["lookup_attempt_count"], "0")
+        # Determinate corrupted state: the claim is released normally.
+        self.assertFalse(self.claim.exists())
+        self.assertEqual(self.hit_count(), 1)
+        return evidence
+
+    def test_non_utf8_final_outbox_is_controlled_needs_fix(self):
+        self.complete_successful_run()
+        corrupt = b"\xff\xfe\x00garbage\xff"
+        self.final.write_bytes(corrupt)
+        completed = self.run_cli(self.base_args(extra=self.fake_ps()))
+        self.assert_controlled_needs_fix(completed)
+        self.assertEqual(self.final.read_bytes(), corrupt)
+
+    def test_non_utf8_staging_is_controlled_needs_fix(self):
+        self.complete_successful_run()
+        corrupt = b"\xff\xfe\xfdnot-utf8\xff"
+        self.staging.write_bytes(corrupt)
+        completed = self.run_cli(self.base_args(extra=self.fake_ps()))
+        self.assert_controlled_needs_fix(completed)
+        self.assertEqual(self.staging.read_bytes(), corrupt)
+
+
 class FaultInjectionTests(SharedFolderHandoffBase):
     def run_with_fault(self, point, *, env_name="SHARED_FOLDER_TEST_FAULT_INJECT"):
         write_jsonl(self.pending, [canonical_queue_row()])
@@ -745,6 +839,48 @@ class FaultInjectionTests(SharedFolderHandoffBase):
         self.assertEqual(self.hit_count(), 1)
         self.assertEqual(self.final.read_text(encoding="utf-8"), late_text)
 
+    def test_temp_entry_created_before_exclusive_creation_fails_closed(self):
+        write_jsonl(self.pending, [canonical_queue_row()])
+        arguments = [sys.executable, str(SCRIPT)] + self.base_args(
+            extra=self.fake_ps(delay_seconds=3)
+        )
+        process = subprocess.Popen(
+            arguments, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+        # Wait until the lookup has started, then create the fixed temp entry
+        # (after the runner's pre-lookup temp classification) so the exclusive
+        # create must refuse it.
+        deadline = time.time() + 60
+        while self.hit_count() == 0 and time.time() < deadline:
+            time.sleep(0.05)
+        self.assertEqual(self.hit_count(), 1)
+        tmp = self.outbox / PUBLISH_TMP_FILENAME
+        late_temp = "late-temp-entry\n"
+        tmp.write_text(late_temp, encoding="utf-8")
+
+        out, err = process.communicate(timeout=120)
+        self.assertEqual(process.returncode, 2, out + err)
+        self.assertNotIn("Traceback", err)
+        evidence = parse_evidence(out)
+        self.assertEqual(evidence["status"], "needs_fix")
+        self.assertEqual(evidence["outbox_published"], "false")
+        # The pre-existing temp entry is byte-for-byte unchanged (no truncation,
+        # no follow), and the final result was never exposed.
+        self.assertEqual(tmp.read_text(encoding="utf-8"), late_temp)
+        self.assertFalse(self.final.exists())
+        self.assertEqual(nonblank_lines(self.staging), 1)
+        self.assertEqual(self.hit_count(), 1)
+
+        # Rerun: the pre-lookup temp classification blocks before Gate 4 and no
+        # second lookup occurs.
+        rerun = self.run_cli(self.base_args(extra=self.fake_ps()))
+        self.assertEqual(rerun.returncode, 2)
+        blocked = parse_evidence(rerun.stdout)
+        self.assertEqual(blocked["status"], "needs_fix")
+        self.assertEqual(blocked["lookup_attempt_count"], "0")
+        self.assertEqual(self.hit_count(), 1)
+        self.assertEqual(tmp.read_text(encoding="utf-8"), late_temp)
+
     def test_gate4_fault_after_result_before_marker_never_relaunches(self):
         completed = self.run_with_fault(
             "after_result_before_marker", env_name="GATE4_TEST_FAULT_INJECT"
@@ -855,6 +991,9 @@ class SharedFolderHandoffDocsTest(unittest.TestCase):
         self.assertIn("write-through", text)
         self.assertIn("directory fsync", text)
         self.assertIn("zero-byte", text)
+        self.assertIn("non-UTF-8", text)
+        self.assertIn("reparse", text)
+        self.assertIn("O_EXCL", text)
         for forbidden in ("member create", "direct SQL"):
             self.assertIn(forbidden, text)
 
