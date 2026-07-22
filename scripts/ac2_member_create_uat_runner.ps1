@@ -144,7 +144,9 @@ try {
     # ---- 1. Load and validate ONE immutable in-memory package snapshot. ----
     if (-not (Test-CreateUatSafePath -Path $PackagePath)) { throw "The package path is unsafe or a reparse point." }
     $packageRaw = Get-Content -LiteralPath $PackagePath -Raw -Encoding UTF8
-    $package = $packageRaw | ConvertFrom-Json
+    # Robust parse with no date coercion, so ISO-date-shaped fields stay strings on
+    # both Windows PowerShell 5.1 and PowerShell 7 (see the runner library).
+    $package = ConvertFrom-CreateUatJson -Raw $packageRaw
     $validation = Test-CreateUatPackage -Package $package
     $result.package_structural_valid = $validation.Valid
     $result.package_fingerprint_problem = $validation.FingerprintProblem
@@ -165,7 +167,7 @@ try {
 
     $confirmations = $null
     if (Test-Path -LiteralPath $BusinessConfigPath) {
-        try { $confirmations = (Get-Content -LiteralPath $BusinessConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json).confirmations } catch { $confirmations = $null }
+        try { $confirmations = (ConvertFrom-CreateUatJson -Raw (Get-Content -LiteralPath $BusinessConfigPath -Raw -Encoding UTF8)).confirmations } catch { $confirmations = $null }
     }
     $result.business_confirmed = Test-CreateUatBusinessConfirmed -Confirmations $confirmations
     if ($forWrite -and -not $result.business_confirmed) { return (Write-CreateUatResult "OPERATOR_CONFIG_REQUIRED") }

@@ -99,7 +99,7 @@ $ErrorActionPreference = 'Stop'
 . $Lib
 switch ($Op) {
     'hash' {
-        $pkg = Get-Content -LiteralPath $Package -Raw -Encoding UTF8 | ConvertFrom-Json
+        $pkg = ConvertFrom-CreateUatJson -Raw (Get-Content -LiteralPath $Package -Raw -Encoding UTF8)
         $v = Test-CreateUatPackage -Package $pkg
         [pscustomobject]@{
             payload_hash = Get-CreateUatPayloadHash -Package $pkg

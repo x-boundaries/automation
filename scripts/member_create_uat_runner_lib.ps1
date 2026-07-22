@@ -36,6 +36,78 @@ function Get-Sha256Hex {
     -join ($hash | ForEach-Object { $_.ToString("x2") })
 }
 
+# --------------------------------------------------------------------------- #
+# No-date-coercion JSON parsing.
+#
+# Windows PowerShell 5.1 ConvertFrom-Json keeps ISO-date-shaped strings (DOB,
+# RegisterDate, timestamps) as strings, but PowerShell 7 ConvertFrom-Json coerces
+# them to [datetime], which would corrupt the payload_hash and every string field
+# check. We parse without any date coercion on both runtimes and return ordered
+# dictionaries and arrays of primitives, so the canonical serializer and field
+# checks see exactly the original strings.
+# --------------------------------------------------------------------------- #
+function ConvertFrom-CreateUatJsonElement {
+    param($Element)
+    switch ($Element.ValueKind.ToString()) {
+        'Object' {
+            $o = [ordered]@{}
+            foreach ($p in $Element.EnumerateObject()) { $o[$p.Name] = ConvertFrom-CreateUatJsonElement $p.Value }
+            return $o
+        }
+        'Array' {
+            $a = [System.Collections.Generic.List[object]]::new()
+            foreach ($item in $Element.EnumerateArray()) { [void]$a.Add((ConvertFrom-CreateUatJsonElement $item)) }
+            return , $a.ToArray()
+        }
+        'String' { return $Element.GetString() }
+        'Number' {
+            $l = [long]0
+            if ($Element.TryGetInt64([ref]$l)) { return $l }
+            return $Element.GetDouble()
+        }
+        'True' { return $true }
+        'False' { return $false }
+        default { return $null }
+    }
+}
+
+function ConvertFrom-CreateUatLegacyJson {
+    param($Value)
+    if ($Value -is [System.Collections.IDictionary]) {
+        $o = [ordered]@{}
+        foreach ($k in $Value.Keys) { $o[[string]$k] = ConvertFrom-CreateUatLegacyJson $Value[$k] }
+        return $o
+    }
+    if ($Value -isnot [string] -and $Value -is [System.Collections.IEnumerable]) {
+        $a = [System.Collections.Generic.List[object]]::new()
+        foreach ($item in $Value) { [void]$a.Add((ConvertFrom-CreateUatLegacyJson $item)) }
+        return , $a.ToArray()
+    }
+    if ($Value -is [decimal] -or $Value -is [double]) {
+        if ($Value -eq [math]::Truncate([double]$Value)) { return [long]$Value }
+    }
+    return $Value
+}
+
+function ConvertFrom-CreateUatJson {
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Raw)
+    if ($PSVersionTable.PSVersion.Major -ge 6) {
+        $doc = [System.Text.Json.JsonDocument]::Parse($Raw)
+        try { return (ConvertFrom-CreateUatJsonElement $doc.RootElement) }
+        finally { $doc.Dispose() }
+    }
+    Add-Type -AssemblyName System.Web.Extensions
+    $js = New-Object System.Web.Script.Serialization.JavaScriptSerializer
+    $js.MaxJsonLength = [int]::MaxValue
+    return (ConvertFrom-CreateUatLegacyJson ($js.DeserializeObject($Raw)))
+}
+
+function Get-CreateUatMemberNames {
+    param($Obj)
+    if ($Obj -is [System.Collections.IDictionary]) { return @($Obj.Keys) }
+    return @($Obj.PSObject.Properties.Name)
+}
+
 function ConvertTo-CreateUatJsonString {
     # Escapes a string exactly like Python json.dumps(ensure_ascii=True).
     param([Parameter(Mandatory)][AllowEmptyString()][string]$Value)
@@ -130,18 +202,19 @@ function Get-CreateUatPayloadHash {
     # Recompute payload_hash over the package with the two derived hash mirrors removed.
     param([Parameter(Mandatory)]$Package)
     $body = [ordered]@{}
-    foreach ($prop in $Package.PSObject.Properties) {
-        if ($prop.Name -eq "payload_hash") { continue }
-        if ($prop.Name -eq "approval") {
+    foreach ($name in (Get-CreateUatMemberNames $Package)) {
+        if ($name -eq "payload_hash") { continue }
+        if ($name -eq "approval") {
             $approval = [ordered]@{}
-            foreach ($ap in $prop.Value.PSObject.Properties) {
-                if ($ap.Name -eq "bound_package_payload_hash") { continue }
-                $approval[$ap.Name] = $ap.Value
+            $approvalObj = $Package.$name
+            foreach ($an in (Get-CreateUatMemberNames $approvalObj)) {
+                if ($an -eq "bound_package_payload_hash") { continue }
+                $approval[$an] = $approvalObj.$an
             }
             $body["approval"] = $approval
             continue
         }
-        $body[$prop.Name] = $prop.Value
+        $body[$name] = $Package.$name
     }
     "sha256:" + (Get-Sha256Hex -Text (Get-CreateUatCanonicalJson -Value $body))
 }
@@ -174,7 +247,7 @@ function Test-CreateUatPackage {
 
     function Add-Reason([string]$code) { $reasons.Add($code) }
 
-    if ($null -eq $Package -or -not ($Package -is [System.Management.Automation.PSCustomObject])) {
+    if ($null -eq $Package -or -not ($Package -is [System.Collections.IDictionary] -or $Package -is [System.Management.Automation.PSCustomObject])) {
         return [pscustomobject]@{ Valid = $false; FingerprintProblem = $false; Reasons = @("package_not_object") }
     }
 
@@ -183,7 +256,7 @@ function Test-CreateUatPackage {
         "created_at", "approval", "assignable_fields", "member_payload", "desired_business_fields",
         "business_confirmation_required", "payload_hash"
     )
-    $topActual = @($Package.PSObject.Properties.Name)
+    $topActual = @(Get-CreateUatMemberNames $Package)
     if (@(Compare-Object $topExpected $topActual).Count -ne 0) {
         return [pscustomobject]@{ Valid = $false; FingerprintProblem = $false; Reasons = @("top_level_field_set_mismatch") }
     }
@@ -198,7 +271,7 @@ function Test-CreateUatPackage {
 
     # Field whitelist and exactly-one-record payload.
     $payload = $Package.member_payload
-    $payloadNames = @($payload.PSObject.Properties.Name)
+    $payloadNames = @(Get-CreateUatMemberNames $payload)
     if (@(Compare-Object $script:CreateUatAssignableFields $payloadNames).Count -ne 0) {
         Add-Reason "member_payload_field_set_mismatch"
     }
