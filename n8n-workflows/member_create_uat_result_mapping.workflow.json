@@ -1,0 +1,193 @@
+{
+  "id": "memberCreateUatMap01",
+  "name": "Member Create UAT - Map one sanitized terminal result to review fields",
+  "active": false,
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "a1111111-1111-4111-8111-111111111101",
+      "name": "Manual Create UAT Map Run",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [-1100, 128]
+    },
+    {
+      "parameters": {
+        "fileSelector": "/home/node/.n8n-files/member_create_uat_result.json",
+        "options": {}
+      },
+      "id": "a2222222-2222-4222-8222-222222222202",
+      "name": "Read Copied Sanitized Terminal Result",
+      "type": "n8n-nodes-base.readWriteFile",
+      "typeVersion": 1.1,
+      "position": [-876, 128],
+      "notesInFlow": true,
+      "notes": "Reads only the operator-copied sanitized create UAT terminal result file inside the n8n container. /home/node/.n8n-files is the n8n-approved file-access location. The operator copies the file in manually; the workflow never contacts the AutoCount host or VM and never modifies the file."
+    },
+    {
+      "parameters": {
+        "operation": "text",
+        "binaryPropertyName": "data",
+        "destinationKey": "data",
+        "options": {}
+      },
+      "id": "a3333333-3333-4333-8333-333333333303",
+      "name": "Extract Result Text",
+      "type": "n8n-nodes-base.extractFromFile",
+      "typeVersion": 1.1,
+      "position": [-652, 128]
+    },
+    {
+      "parameters": {
+        "jsCode": "const ALLOWED_FIELDS = ['mode','runtime_location','terminal_code','package_structural_valid','package_fingerprint_problem','approval_not_expired','write_confirmed','business_confirmed','lock_acquired','already_consumed','authentication_success','member_command_found','get_member_found','member_exists_initial','new_member_success','assignment_success','assigned_field_count','expiry_date_assigned','member_exists_recheck','write_intent_recorded','consumed_marker_written','save_member_attempted','save_member_confirmed','save_outcome','readback_found','readback_match','masked_member_no','operation_id','source_record_id','source_fingerprint','error'];\nconst FORBIDDEN_FIELDS = ['member_payload','desired_business_fields','MemberNo','Name','EmailAddress','MobilePhone','DOB','member_no','name','email_address','dob','birthday','birthday_month','full_name','payload_hash','approval','password','server','database','user_id','sheet_id','sheet_url'];\nconst TERMINAL_CODES = ['DRY_RUN_VALIDATED','BLOCKED_MEMBER_EXISTS','APPROVAL_INVALID','SOURCE_FINGERPRINT_MISMATCH','CREATED_VERIFIED','CREATED_READBACK_MISMATCH','FAILED_BEFORE_WRITE','WRITE_OUTCOME_UNCERTAIN','OPERATOR_CONFIG_REQUIRED','WRITE_NOT_CONFIRMED','APPROVAL_REJECTED','APPROVAL_ON_HOLD','APPROVAL_ALREADY_CONSUMED','PACKAGE_ALREADY_CONSUMED','EXECUTION_LOCKED'];\nconst OP_RE = /^mcuat_[0-9a-f]{32}$/;\nconst SRID_RE = /^srcrec_[0-9a-f]{64}$/;\nconst FP_RE = /^fp_[0-9a-f]{64}$/;\nconst MASK_RE = /^(\\*\\*\\*|.{2}\\*\\*\\*.)$/;\n\nconst items = $input.all();\nif (items.length !== 1) throw new Error('create_uat_expected_one_extracted_text_item');\nconst text = items[0].json.data;\nif (typeof text !== 'string' || !text.trim()) throw new Error('create_uat_result_empty');\nlet result;\ntry { result = JSON.parse(text); } catch (e) { throw new Error('create_uat_result_malformed_json'); }\nif (!result || typeof result !== 'object' || Array.isArray(result)) throw new Error('create_uat_result_not_a_single_object');\nconst keys = Object.keys(result);\nif (keys.some((k) => FORBIDDEN_FIELDS.includes(k))) throw new Error('create_uat_result_forbidden_field_present');\nfor (const req of ['terminal_code','operation_id','source_record_id','source_fingerprint']) { if (!keys.includes(req)) throw new Error('create_uat_result_required_field_missing'); }\nif (keys.some((k) => !ALLOWED_FIELDS.includes(k))) throw new Error('create_uat_result_unexpected_field_present');\nif (!TERMINAL_CODES.includes(result.terminal_code)) throw new Error('create_uat_terminal_code_unrecognised');\nif (!OP_RE.test(result.operation_id)) throw new Error('create_uat_operation_id_invalid');\nif (!SRID_RE.test(result.source_record_id)) throw new Error('create_uat_source_record_id_invalid');\nif (!FP_RE.test(result.source_fingerprint)) throw new Error('create_uat_source_fingerprint_invalid');\nif (result.masked_member_no !== null && result.masked_member_no !== undefined && !MASK_RE.test(String(result.masked_member_no))) throw new Error('create_uat_masked_member_no_malformed');\nreturn [{ json: result }];"
+      },
+      "id": "a4444444-4444-4444-8444-444444444404",
+      "name": "Validate Sanitized Terminal Result Strictly",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-428, 128],
+      "notesInFlow": true,
+      "notes": "Fail-closed: accepts exactly one nonblank JSON object holding only the allowed sanitized create UAT result fields (never raw member values), a recognised terminal code, and well-formed operation_id / source_record_id / source_fingerprint. Throws on anything else without echoing values. It does not approve, generate packages, check duplicates, or create members."
+    },
+    {
+      "parameters": {
+        "documentId": { "__rl": true, "value": "", "mode": "list" },
+        "sheetName": { "__rl": true, "value": "REPLACE_WITH_SOURCE_TAB_NAME", "mode": "name" },
+        "filtersUI": {
+          "values": [
+            { "lookupColumn": "MemberCreateUatApprovedForMapping", "lookupValue": "YES" }
+          ]
+        },
+        "options": {}
+      },
+      "id": "a5555555-5555-4555-8555-555555555505",
+      "name": "Read One Approved Source Row",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [-204, 128],
+      "notesInFlow": true,
+      "notes": "Operator binds only the Google credential and the real UAT spreadsheet in the n8n UI. The source tab is pre-set by name from the import copy (placeholder replaced before import); never re-select the tab in the n8n UI because the v4.7 editor resets dependent parameters on a sheet-locator change. Exactly one row may match the non-PII marker MemberCreateUatApprovedForMapping = YES."
+    },
+    {
+      "parameters": {
+        "jsCode": "const REQUIRED_EXPECTED_COLUMNS = ['uat_create_source_record_id','uat_create_source_fingerprint'];\nconst REQUIRED_REVIEW_COLUMNS = ['uat_create_operation_id','uat_create_terminal_code','uat_create_save_outcome','uat_create_reviewer_status'];\nconst result = $('Validate Sanitized Terminal Result Strictly').first().json;\nconst items = $input.all();\nif (items.length !== 1) throw new Error('create_uat_requires_exactly_one_approved_source_row');\nconst row = items[0].json;\nfor (const c of REQUIRED_EXPECTED_COLUMNS.concat(REQUIRED_REVIEW_COLUMNS)) {\n  if (!Object.prototype.hasOwnProperty.call(row, c)) throw new Error('create_uat_required_column_missing_add_columns_before_run');\n}\nconst cell = (name) => String(row[name] ?? '').trim();\n\n// Identity and fingerprint revalidation by hash comparison only (no raw PII in this\n// workflow). A row number is never used as identity. Source drift (a different\n// fingerprint recorded on the row) is rejected before any update.\nif (cell('uat_create_source_record_id') !== result.source_record_id) throw new Error('create_uat_source_record_id_mismatch');\nif (cell('uat_create_source_fingerprint') !== result.source_fingerprint) throw new Error('create_uat_source_fingerprint_mismatch');\n\nconst saveOutcome = String(result.save_outcome ?? '');\nconst wouldWrite = {\n  uat_create_operation_id: result.operation_id,\n  uat_create_terminal_code: result.terminal_code,\n  uat_create_save_outcome: saveOutcome,\n  uat_create_reviewer_status: 'UNREVIEWED'\n};\n\n// Idempotency: fully blank review cells -> apply once; exact prior values -> already_applied;\n// anything else is a conflict and is refused (never a second differing write).\nconst blank = REQUIRED_REVIEW_COLUMNS.every((c) => cell(c) === '');\nconst exact = REQUIRED_REVIEW_COLUMNS.every((c) => cell(c) === String(wouldWrite[c]).trim());\nlet decision;\nif (blank) decision = 'apply';\nelse if (exact) decision = 'already_applied';\nelse throw new Error('create_uat_conflicting_prior_mapping_refused');\n\nreturn [{ json: {\n  create_uat_decision: decision,\n  uat_create_operation_id: wouldWrite.uat_create_operation_id,\n  uat_create_terminal_code: wouldWrite.uat_create_terminal_code,\n  uat_create_save_outcome: wouldWrite.uat_create_save_outcome,\n  uat_create_reviewer_status: wouldWrite.uat_create_reviewer_status\n} }];"
+      },
+      "id": "a6666666-6666-4666-8666-666666666606",
+      "name": "Verify Identity And Decide Mapping",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [20, 128],
+      "notesInFlow": true,
+      "notes": "Revalidates the stable source_record_id and the change-detection source_fingerprint by comparing the result hashes to the values recorded on the approved row (hash compare only; no raw PII). Requires the controlled columns to exist. Blank cells -> apply once; exact prior values -> already_applied; conflict -> refuse. It never creates or updates an AutoCount member."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 2 },
+          "conditions": [
+            {
+              "id": "a7777777-7777-4777-8777-777777777707",
+              "leftValue": "={{ $json.create_uat_decision }}",
+              "rightValue": "apply",
+              "operator": { "type": "string", "operation": "equals" }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "a7777777-7777-4777-8777-777777777708",
+      "name": "Apply Only Fresh Mapping",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [244, 128],
+      "notesInFlow": true,
+      "notes": "True: fresh blank row, apply the controlled review update once. False: exact rerun (already_applied), skip the update and emit evidence with zero writes."
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "documentId": { "__rl": true, "value": "", "mode": "list" },
+        "sheetName": { "__rl": true, "value": "REPLACE_WITH_SOURCE_TAB_NAME", "mode": "name" },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "MemberCreateUatApprovedForMapping": "YES",
+            "uat_create_operation_id": "={{ $json.uat_create_operation_id }}",
+            "uat_create_terminal_code": "={{ $json.uat_create_terminal_code }}",
+            "uat_create_save_outcome": "={{ $json.uat_create_save_outcome }}",
+            "uat_create_reviewer_status": "={{ $json.uat_create_reviewer_status }}"
+          },
+          "matchingColumns": ["MemberCreateUatApprovedForMapping"],
+          "schema": [
+            { "id": "MemberCreateUatApprovedForMapping", "displayName": "MemberCreateUatApprovedForMapping", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": true },
+            { "id": "uat_create_operation_id", "displayName": "uat_create_operation_id", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": true },
+            { "id": "uat_create_terminal_code", "displayName": "uat_create_terminal_code", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": true },
+            { "id": "uat_create_save_outcome", "displayName": "uat_create_save_outcome", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": true },
+            { "id": "uat_create_reviewer_status", "displayName": "uat_create_reviewer_status", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": true }
+          ]
+        },
+        "options": { "cellFormat": "RAW" }
+      },
+      "id": "a8888888-8888-4888-8888-888888888809",
+      "name": "Update Approved Review Fields Only",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [468, 32],
+      "notesInFlow": true,
+      "notes": "Updates only the controlled create UAT review columns, locating the row by the stable non-PII marker MemberCreateUatApprovedForMapping = YES (never by row number). uat_create_reviewer_status is always UNREVIEWED; no create-approval value exists in this workflow. Cell format RAW. Bind only the Google credential and the spreadsheet; the source tab is pre-set by name in the import copy and must never be changed in the n8n UI, because the v4.7 editor resets this mapping and the match column on a sheet-locator change."
+    },
+    {
+      "parameters": {
+        "jsCode": "const verify = $('Verify Identity And Decide Mapping').first().json;\nconst decision = verify.create_uat_decision;\nif (decision !== 'apply' && decision !== 'already_applied') throw new Error('create_uat_unexpected_mapping_decision');\nreturn [{ json: {\n  status: 'ok',\n  gate: 'member_create_uat_manual_inactive_result_mapping',\n  runtime_location: 'local_operator_pc_non_ac2_n8n_stack',\n  execution_mode: 'manual_inactive_single_result_mapping_only',\n  input_result_row_count: 1,\n  result_schema_valid_count: 1,\n  source_rows_read_count: 1,\n  source_row_match_count: 1,\n  mapping_attempt_count: 1,\n  mapping_success_count: decision === 'apply' ? 1 : 0,\n  mapping_already_applied_count: decision === 'already_applied' ? 1 : 0,\n  mapping_error_count: 0,\n  autocount_lookup_invoked: false,\n  member_create_or_update_invoked: false,\n  autocount_write_attempted: false,\n  direct_sql_write_attempted: false,\n  workflow_activation: 'inactive',\n  scheduler_enabled: false,\n  public_inbound_to_ac2_host: false,\n  final_write_automation: false,\n  no_row_values_printed: true\n} }];"
+      },
+      "id": "a9999999-9999-4999-8999-999999999910",
+      "name": "Emit Aggregate Evidence Only",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [692, 128],
+      "notesInFlow": true,
+      "notes": "Emits the fixed aggregate-only evidence contract: status, counts, and hard-coded false write/activation flags. No IDs, hashes, member values, or source values."
+    },
+    {
+      "parameters": {
+        "content": "# Member Create UAT Mapping Boundary\n\n- Manual inactive single-result mapping only. Do not activate.\n- Maps one already-sanitized create UAT terminal result to controlled review columns for the exact verified source record.\n- Does NOT approve, generate packages, check duplicates, authenticate to AutoCount, or create/update/delete any member.\n- Identity is revalidated by comparing source_record_id and source_fingerprint hashes only; no raw PII enters this workflow. The row is located by the non-PII marker, never by row number.\n- Do not add webhook, scheduler, wait, execute-command, HTTP, SSH, SQL, AutoCount, bridge, or tunnel nodes.\n\n## Required manual configuration:\n\n- **Read One Approved Source Row / Update Approved Review Fields Only**\n  - `sheetName`: Replace REPLACE_WITH_SOURCE_TAB_NAME with the source tab title in the local import copy BEFORE importing; never re-pick the tab in the n8n UI.\n- **Source spreadsheet (one-time)**\n  - Add columns `MemberCreateUatApprovedForMapping`, `uat_create_source_record_id`, `uat_create_source_fingerprint`, `uat_create_operation_id`, `uat_create_terminal_code`, `uat_create_save_outcome`, `uat_create_reviewer_status` before running.",
+        "height": 340,
+        "width": 520,
+        "color": 4
+      },
+      "id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa11",
+      "name": "Create UAT Mapping Boundary",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-1120, -220]
+    }
+  ],
+  "connections": {
+    "Manual Create UAT Map Run": { "main": [[{ "node": "Read Copied Sanitized Terminal Result", "type": "main", "index": 0 }]] },
+    "Read Copied Sanitized Terminal Result": { "main": [[{ "node": "Extract Result Text", "type": "main", "index": 0 }]] },
+    "Extract Result Text": { "main": [[{ "node": "Validate Sanitized Terminal Result Strictly", "type": "main", "index": 0 }]] },
+    "Validate Sanitized Terminal Result Strictly": { "main": [[{ "node": "Read One Approved Source Row", "type": "main", "index": 0 }]] },
+    "Read One Approved Source Row": { "main": [[{ "node": "Verify Identity And Decide Mapping", "type": "main", "index": 0 }]] },
+    "Verify Identity And Decide Mapping": { "main": [[{ "node": "Apply Only Fresh Mapping", "type": "main", "index": 0 }]] },
+    "Apply Only Fresh Mapping": {
+      "main": [
+        [{ "node": "Update Approved Review Fields Only", "type": "main", "index": 0 }],
+        [{ "node": "Emit Aggregate Evidence Only", "type": "main", "index": 0 }]
+      ]
+    },
+    "Update Approved Review Fields Only": { "main": [[{ "node": "Emit Aggregate Evidence Only", "type": "main", "index": 0 }]] }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "none",
+    "saveDataSuccessExecution": "none",
+    "saveManualExecutions": false,
+    "saveExecutionProgress": false,
+    "binaryMode": "separate"
+  },
+  "meta": { "templateCredsSetupCompleted": false },
+  "nodeGroups": [],
+  "versionId": "d1e2f3a4-b5c6-4d7e-8f90-1a2b3c4d5e6f",
+  "sourceWorkflowId": null
+}

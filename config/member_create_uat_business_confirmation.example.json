@@ -1,0 +1,22 @@
+{
+  "schema_version": "member_create_uat_business_confirmation/v1",
+  "note": "EXAMPLE ONLY. This shows the shape once X-Boundaries has recorded explicit documented business decisions. Do not copy these values into the live config without a real approved decision. Even with MemberType/RegisterDate/OpeningPoints confirmed, ExpiryDate must remain excluded from the AutoCount assignment payload until its assignment and persistence behaviour is proven; confirming it here only records the business intent.",
+  "confirmations": {
+    "MemberType": {
+      "confirmed": true,
+      "reason": "EXAMPLE: business approved MemberType=Default for form signups on <date> by <approver handle>; ticket <ref>."
+    },
+    "RegisterDate": {
+      "confirmed": true,
+      "reason": "EXAMPLE: business approved membership start 2026-07-01 on <date> by <approver handle>; ticket <ref>."
+    },
+    "ExpiryDate": {
+      "confirmed": false,
+      "reason": "EXAMPLE: ExpiryDate assignment/persistence still unproven; stays out of the assignment payload."
+    },
+    "OpeningPoints": {
+      "confirmed": true,
+      "reason": "EXAMPLE: business approved OpeningPoints=0 on <date> by <approver handle>; ticket <ref>."
+    }
+  }
+}

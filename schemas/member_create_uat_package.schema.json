@@ -1,0 +1,212 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://x-boundaries.local/schemas/member_create_uat_package.schema.json",
+  "title": "Member Create UAT Package (v1)",
+  "description": "Language-neutral contract for the immutable exactly-one-record single-member creation UAT package. The PowerShell VM runner parses and validates a package against these constraints in-process; the Python tooling generates packages that conform. This schema is the source of truth for both implementations. No credentials, no raw logs, no arbitrary Sheet dump, no formulas. Row number is a non-authoritative location hint only; source_record_id plus source_fingerprint are the authoritative identity and change-detection values.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "operation_id",
+    "source_record_id",
+    "source_fingerprint",
+    "row_number_hint",
+    "created_at",
+    "approval",
+    "assignable_fields",
+    "member_payload",
+    "desired_business_fields",
+    "business_confirmation_required",
+    "payload_hash"
+  ],
+  "properties": {
+    "schema_version": {
+      "description": "Fixed contract version. A runner that does not recognise this exact value must refuse.",
+      "const": "member_create_uat_package/v1"
+    },
+    "operation_id": {
+      "description": "Authoritative, unique per build. UUIDv4 (128 crypto-random bits) rendered as mcuat_<32 lowercase hex>. Never derived from a non-cryptographic hash.",
+      "type": "string",
+      "pattern": "^mcuat_[0-9a-f]{32}$"
+    },
+    "source_record_id": {
+      "description": "Stable source record identity: SHA-256 over schema_version and the normalized member number, rendered as srcrec_<64 lowercase hex>. Stable across spreadsheet row moves and non-identity edits. One-way; exposes no member value.",
+      "type": "string",
+      "pattern": "^srcrec_[0-9a-f]{64}$"
+    },
+    "source_fingerprint": {
+      "description": "Change-detection fingerprint: SHA-256 over all approved canonical fields, rendered as fp_<64 lowercase hex>. Any change to an approved field changes this value and invalidates a prior approval.",
+      "type": "string",
+      "pattern": "^fp_[0-9a-f]{64}$"
+    },
+    "row_number_hint": {
+      "description": "Non-authoritative spreadsheet location hint only (header is row 1, first response row is row 2). Never used as identity. Result mapping revalidates source_record_id and source_fingerprint before updating anything.",
+      "type": "integer",
+      "minimum": 2
+    },
+    "created_at": {
+      "description": "Package build time, ISO 8601 UTC.",
+      "type": "string",
+      "pattern": "^[0-9T:+.Z-]{1,64}$"
+    },
+    "approval": {
+      "description": "Embedded controlled reviewer approval. Bound to the exact package content by payload_hash (which covers this block). Expiry is explicit here, not hidden in code.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "approval_id",
+        "reviewer_id",
+        "decision",
+        "approved_at",
+        "expires_at",
+        "source_record_id",
+        "source_fingerprint",
+        "bound_package_payload_hash"
+      ],
+      "properties": {
+        "approval_id": {
+          "description": "UUIDv4 rendered as appr_<32 lowercase hex>.",
+          "type": "string",
+          "pattern": "^appr_[0-9a-f]{32}$"
+        },
+        "reviewer_id": {
+          "description": "Approved non-secret operator handle. Never an email, credential, or token.",
+          "type": "string",
+          "pattern": "^[a-z0-9_-]{2,32}$"
+        },
+        "decision": {
+          "description": "Only an approved package is ever built. Rejection and hold are recorded in the laptop ledger and never produce a package.",
+          "const": "approved"
+        },
+        "approved_at": {
+          "type": "string",
+          "pattern": "^[0-9T:+.Z-]{1,64}$"
+        },
+        "expires_at": {
+          "type": "string",
+          "pattern": "^[0-9T:+.Z-]{1,64}$"
+        },
+        "source_record_id": {
+          "description": "Must equal the top-level source_record_id.",
+          "type": "string",
+          "pattern": "^srcrec_[0-9a-f]{64}$"
+        },
+        "source_fingerprint": {
+          "description": "Must equal the top-level source_fingerprint.",
+          "type": "string",
+          "pattern": "^fp_[0-9a-f]{64}$"
+        },
+        "bound_package_payload_hash": {
+          "description": "The exact package payload_hash bound into the approval record, mirrored here and in the laptop ledger. The VM verifies this equals the recomputed and stored payload_hash. Integrity and binding, not tamper-proof authentication.",
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        }
+      }
+    },
+    "assignable_fields": {
+      "description": "Exact whitelist of fields the runner may assign to the AutoCount member. ExpiryDate is intentionally absent: it has no proven assignment or persistence path and must not enter the AutoCount payload until proven.",
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "MemberNo",
+          "Name",
+          "EmailAddress",
+          "MobilePhone",
+          "DOB",
+          "MemberType",
+          "RegisterDate",
+          "OpeningPoints"
+        ]
+      }
+    },
+    "member_payload": {
+      "description": "The exactly-one-record assignable payload. Only whitelisted fields; no extra keys.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "MemberNo",
+        "Name",
+        "EmailAddress",
+        "MobilePhone",
+        "DOB",
+        "MemberType",
+        "RegisterDate",
+        "OpeningPoints"
+      ],
+      "properties": {
+        "MemberNo": {
+          "description": "Canonical submitted mobile number used directly as MemberNo. Max length 20 per the AC2 column constraint.",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 20,
+          "pattern": "^[0-9A-Za-z]{1,20}$"
+        },
+        "Name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "EmailAddress": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 200
+        },
+        "MobilePhone": {
+          "description": "Intentionally blank by contract; the mobile number already serves as MemberNo.",
+          "const": ""
+        },
+        "DOB": {
+          "description": "Birthday-month sentinel 2000-MM-01 (year 2000, day 01).",
+          "type": "string",
+          "pattern": "^2000-(0[1-9]|1[0-2])-01$"
+        },
+        "MemberType": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 20
+        },
+        "RegisterDate": {
+          "description": "Intended membership start date, yyyy-mm-dd.",
+          "type": "string",
+          "pattern": "^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])$"
+        },
+        "OpeningPoints": {
+          "description": "Zero only.",
+          "const": 0
+        }
+      }
+    },
+    "desired_business_fields": {
+      "description": "Business-desired values recorded for review and audit. These are NOT the assignment payload. ExpiryDate lives here and is never assigned while unconfirmed and unproven.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["MemberType", "RegisterDate", "ExpiryDate", "OpeningPoints"],
+      "properties": {
+        "MemberType": { "type": "string", "minLength": 1, "maxLength": 20 },
+        "RegisterDate": {
+          "type": "string",
+          "pattern": "^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])$"
+        },
+        "ExpiryDate": {
+          "type": "string",
+          "pattern": "^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])$"
+        },
+        "OpeningPoints": { "const": 0 }
+      }
+    },
+    "business_confirmation_required": {
+      "description": "Fields whose business confirmation must be recorded before any real write. With any confirmation still false the runner stops at OPERATOR_CONFIG_REQUIRED.",
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "enum": ["MemberType", "RegisterDate", "ExpiryDate", "OpeningPoints"]
+      }
+    },
+    "payload_hash": {
+      "description": "SHA-256 over the canonical JSON of this object with the payload_hash key removed, rendered as sha256:<64 lowercase hex>. Integrity and change detection, and binds the embedded approval to this exact content. Not tamper-proof authentication.",
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    }
+  }
+}

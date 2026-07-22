@@ -1,0 +1,22 @@
+{
+  "schema_version": "member_create_uat_business_confirmation/v1",
+  "note": "Fail-closed business confirmations for the single-member creation UAT. Every field is false until X-Boundaries records an explicit documented business decision. While any field is false, the VM runner stops every write attempt at OPERATOR_CONFIG_REQUIRED. This file contains no secrets or PII and is safe to commit. ExpiryDate is additionally never assigned to AutoCount until its assignment and persistence behaviour is proven, regardless of confirmation.",
+  "confirmations": {
+    "MemberType": {
+      "confirmed": false,
+      "reason": "MemberType=Default is API-confirmed to exist (read-only browse) but business approval is still pending. See docs/autocount2-automation/member_intake_field_mapping.md open questions."
+    },
+    "RegisterDate": {
+      "confirmed": false,
+      "reason": "Intended membership start date 2026-07-01 is not yet business-confirmed; the field mapping marks RegisterDate usage open."
+    },
+    "ExpiryDate": {
+      "confirmed": false,
+      "reason": "Intended membership end date 2028-06-30 has no proven AutoCount assignment or persistence path (the save-gated create probe never set ExpiryDate). Excluded from the assignment payload until proven."
+    },
+    "OpeningPoints": {
+      "confirmed": false,
+      "reason": "The field mapping states OpeningPoints must not be set by intake unless separately approved."
+    }
+  }
+}
