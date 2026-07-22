@@ -60,9 +60,11 @@ jobs:
         shell: pwsh
         run: |
           python -m unittest tests.test_member_create_uat_contract tests.test_member_create_uat_approval tests.test_member_create_uat_result_precheck tests.test_member_create_uat_runner_ps
-      - name: Full repository test suite
+      - name: Full repository test suite (excludes the Docker/n8n live-import module)
         shell: pwsh
-        run: python -m unittest discover -s tests
+        # The n8n live-import dry-run module needs a Docker/n8n environment absent on
+        # stock CI; it and the complete suite are validated locally on the dev/VM host.
+        run: python tests/_run_ci_full_suite.py
 
   ubuntu-focused:
     runs-on: ubuntu-latest
