@@ -65,6 +65,9 @@
       "type": "n8n-nodes-base.googleSheets",
       "typeVersion": 4.7,
       "position": [-204, 128],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
       "notesInFlow": true,
       "notes": "Operator binds only the Google credential and the real UAT spreadsheet in the n8n UI. The source tab is pre-set by name from the import copy (placeholder replaced before import); never re-select the tab in the n8n UI because the v4.7 editor resets dependent parameters on a sheet-locator change. Exactly one row may match the non-PII marker MemberCreateUatApprovedForMapping = YES."
     },
@@ -113,10 +116,10 @@
           "mappingMode": "defineBelow",
           "value": {
             "MemberCreateUatApprovedForMapping": "YES",
-            "uat_create_operation_id": "={{ $json.uat_create_operation_id }}",
-            "uat_create_terminal_code": "={{ $json.uat_create_terminal_code }}",
-            "uat_create_save_outcome": "={{ $json.uat_create_save_outcome }}",
-            "uat_create_reviewer_status": "={{ $json.uat_create_reviewer_status }}"
+            "uat_create_operation_id": "={{ $('Verify Identity And Decide Mapping').item.json.uat_create_operation_id }}",
+            "uat_create_terminal_code": "={{ $('Verify Identity And Decide Mapping').item.json.uat_create_terminal_code }}",
+            "uat_create_save_outcome": "={{ $('Verify Identity And Decide Mapping').item.json.uat_create_save_outcome }}",
+            "uat_create_reviewer_status": "={{ $('Verify Identity And Decide Mapping').item.json.uat_create_reviewer_status }}"
           },
           "matchingColumns": ["MemberCreateUatApprovedForMapping"],
           "schema": [
@@ -134,6 +137,9 @@
       "type": "n8n-nodes-base.googleSheets",
       "typeVersion": 4.7,
       "position": [468, 32],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
       "notesInFlow": true,
       "notes": "Updates only the controlled create UAT review columns, locating the row by the stable non-PII marker MemberCreateUatApprovedForMapping = YES (never by row number). uat_create_reviewer_status is always UNREVIEWED; no create-approval value exists in this workflow. Cell format RAW. Bind only the Google credential and the spreadsheet; the source tab is pre-set by name in the import copy and must never be changed in the n8n UI, because the v4.7 editor resets this mapping and the match column on a sheet-locator change."
     },
