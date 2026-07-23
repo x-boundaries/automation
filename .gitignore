@@ -266,6 +266,11 @@ create_uat.lock
 consumed_*.marker
 write_intent_*.marker
 PRIVATE_DO_NOT_COMMIT_MEMBER_CREATE_UAT.txt
+# Synthetic ExpiryDate capability probe private evidence (claim/result). The probe also
+# rejects a state directory inside the checkout; these patterns are defence-in-depth so a
+# stray artifact can never be committed.
+expiry_probe_claim_*.claim
+expiry_probe_result_*.json
 # Keep the committed contract/config/schema/workflow (these are not private artifacts).
 !config/member_create_uat_business_confirmation.json
 !config/member_create_uat_business_confirmation.example.json

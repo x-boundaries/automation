@@ -116,6 +116,11 @@ switch ($Op) {
         Write-Output ($o + '|' + (Get-ExpiryProbeExitCode -TerminalOutcome $o))
     }
     'redact' { Write-Output (Get-ExpiryProbePathRedacted -Text $Text) }
+    'inrepo' {
+        # $Text = "path|startdir"
+        $p = $Text.Split('|')
+        Write-Output ([string](Test-ExpiryProbePathInsideRepo -Path $p[0] -StartDir $p[1]))
+    }
     'badclaim' {
         # Inject a durable persistence failure: a path under a non-existent directory
         # cannot be created, so New-ExpiryProbeDurableArtifact must throw and leave no
@@ -318,6 +323,26 @@ class ExpiryProbeStaticTests(unittest.TestCase):
         self.assertRegex(self.lib, r"catch \[System\.NotSupportedException\]")
         self.assertRegex(self.lib, r"ExpiryProbePostCreatePersistTag")
 
+    def test_approval_reference_recorded_only_after_validation(self):
+        # Not assigned at activation; assigned only after the target-substring check.
+        activation_idx = self.script.index("$result.activated = $true")
+        substr_idx = self.script.index("must not contain the server or database")
+        assign_idx = self.script.index("$result.approval_reference = $ApprovalReference")
+        self.assertGreater(assign_idx, substr_idx, "approval_reference must be set only after validation")
+        self.assertGreater(assign_idx, activation_idx)
+        # There must be exactly one assignment (no early activation-time copy).
+        self.assertEqual(self.script.count("$result.approval_reference = $ApprovalReference"), 1)
+
+    def test_rejects_state_directory_inside_repo(self):
+        self.assertIn("Test-ExpiryProbePathInsideRepo", self.script)
+        self.assertIn("Test-ExpiryProbePathInsideRepo", self.lib)
+        self.assertRegex(self.script, r"(?i)outside the repository checkout")
+
+    def test_gitignore_covers_probe_evidence(self):
+        gi = (ROOT / ".gitignore").read_text(encoding="utf-8")
+        self.assertIn("expiry_probe_claim_*.claim", gi)
+        self.assertIn("expiry_probe_result_*.json", gi)
+
 
 @unittest.skipIf(PS is None, "no PowerShell executable available")
 class ExpiryProbeLibraryTests(unittest.TestCase):
@@ -436,6 +461,16 @@ class ExpiryProbeLibraryTests(unittest.TestCase):
         self.assertTrue(info["threw"], "a durable persistence failure must propagate")
         self.assertFalse(info["exists"], "no usable artefact may remain on failure")
 
+    def test_state_directory_inside_repo_is_detected(self):
+        # A path inside the repository (relative to a start dir in the repo) is flagged;
+        # a path outside is not, and a start dir with no enclosing repo yields false.
+        inside = self._lib("inrepo", Text=f"{ROOT}|{ROOT / 'scripts'}")
+        self.assertEqual(inside.stdout.strip(), "True")
+        outside = self._lib("inrepo", Text=f"{self.tmp}|{ROOT / 'scripts'}")
+        self.assertEqual(outside.stdout.strip(), "False")
+        norepo = self._lib("inrepo", Text=f"{self.tmp}|{self.tmp}")
+        self.assertEqual(norepo.stdout.strip(), "False")
+
     def test_claim_is_exclusive_create_and_never_deleted(self):
         d = self.tmp / "claimdir"
         d.mkdir(exist_ok=True)
@@ -470,16 +505,27 @@ class ExpiryProbeScriptExecutionTests(unittest.TestCase):
                "-File", str(SCRIPT), *args]
         return subprocess.run(cmd, capture_output=True, text=True, env=self.env)
 
-    def _active_args(self, appref="APPROVAL-TEST-001"):
+    def _active_args(self, appref="APPROVAL-TEST-001", statedir=None):
         return ("-EnableExpiryCapabilityProbe", "-ConfirmSyntheticExpiryDateTest",
                 "-ConfirmSingleSyntheticMember", "-ConfirmAutoCountWrite",
                 "-ConfirmDryRunPreflightPassed", "-ConfirmNoUpdateOrDelete",
-                "-ApprovalReference", appref, "-StateDirectory", str(self.tmp),
+                "-ApprovalReference", appref, "-StateDirectory", statedir or str(self.tmp),
                 "-ServerName", "SYN_SERVER", "-DatabaseName", "SYN_DB", "-UserId", "SYN_USER",
                 "-AcRoot", "C:\\NoSuchAcRoot")
 
     def test_approval_reference_containing_target_fails_closed(self):
         proc = self._run(*self._active_args(appref="XB-SYN_DB-01"))  # embeds the database name
+        self.assertNotEqual(proc.returncode, 0)
+        r = json.loads(proc.stdout)
+        self.assertEqual(r["terminal_outcome"], "FAILED_BEFORE_WRITE")
+        self.assertFalse(r["required_assemblies_loaded"])
+        self.assertFalse(r["claim_created"])
+        # The rejected target-bearing reference must NOT be retained or emitted.
+        self.assertIsNone(r["approval_reference"])
+        self.assertNotIn("SYN_DB", proc.stdout)
+
+    def test_state_directory_inside_repo_is_rejected(self):
+        proc = self._run(*self._active_args(statedir=str(ROOT)))  # the repository root itself
         self.assertNotEqual(proc.returncode, 0)
         r = json.loads(proc.stdout)
         self.assertEqual(r["terminal_outcome"], "FAILED_BEFORE_WRITE")
@@ -607,6 +653,16 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
         self.assertIn("Wire the runner", self.runbook)
         self.assertRegex(self.runbook, r"(?i)read-back")
         self.assertIn("member_create_uat_approval.py", self.runbook)
+
+    def test_runbook_has_separate_approval_gates_for_each_external_action(self):
+        # Distinct current-turn approvals are required for deployment, preflight, the
+        # write, and any deletion; none carries over from the SaveMember approval.
+        self.assertRegex(self.runbook, r"(?i)deployment gate")
+        self.assertRegex(self.runbook, r"(?i)preflight gate")
+        self.assertRegex(self.runbook, r"(?i)destructive mutation of live AutoCount")
+        # The deletion gate explicitly states the creation approval does not carry over.
+        self.assertRegex(self.runbook, r"(?i)carry over\s+to deletion")
+        self.assertRegex(self.runbook, r"(?i)does \*\*not\*\* authorise it|does \*\*not\*\* cover it")
 
     def test_runbook_requires_opaque_approval_reference(self):
         # The approval reference must be opaque; the placeholder must not invite target names.

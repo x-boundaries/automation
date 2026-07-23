@@ -287,7 +287,9 @@ if (-not $allConfirmed) {
     exit $script:ProbeExitCode
 }
 $result.activated = $true
-$result.approval_reference = $ApprovalReference
+# NOTE: approval_reference is deliberately NOT assigned here. It is recorded only AFTER
+# it passes validation (opaque alphabet + no embedded target), so a rejected
+# target-bearing reference is never serialised into the emitted evidence.
 
 # Advisory to stderr only; stdout is reserved for the sanitised JSON contract.
 [Console]::Error.WriteLine("AC2 synthetic ExpiryDate capability probe is explicit opt-in and write-capable. It creates exactly one synthetic member and verifies ExpiryDate persistence. It never updates, deletes, rolls back, or cleans up; the synthetic member will remain for manual owner review.")
@@ -311,11 +313,20 @@ try {
             throw "The -ApprovalReference must not contain the server or database/account-book name; use an opaque audit id."
         }
     }
+    # Only now, after it has passed the opaque-alphabet and no-embedded-target checks, is
+    # the approval reference safe to record in the emitted evidence.
+    $result.approval_reference = $ApprovalReference
     if (-not (Test-ExpiryProbeSafePath -Path $StateDirectory)) {
         throw "A safe absolute -StateDirectory is required."
     }
     if (-not (Test-Path -LiteralPath $StateDirectory -PathType Container)) {
         throw "The -StateDirectory does not exist (operator setup prerequisite; the probe never creates it)."
+    }
+    # Private evidence must never land inside a repository checkout. When the probe is run
+    # from a checkout, reject a state directory inside it; the deployed VM copy has no
+    # enclosing repo and is unaffected.
+    if (Test-ExpiryProbePathInsideRepo -Path $StateDirectory -StartDir $scriptDir) {
+        throw "The -StateDirectory must be outside the repository checkout (private evidence only)."
     }
     foreach ($pair in @(@("ServerName", $ServerName), @("DatabaseName", $DatabaseName))) {
         if ([string]::IsNullOrWhiteSpace($pair[1])) { throw "$($pair[0]) is required to bind the capability evidence to the target." }

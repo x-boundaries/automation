@@ -71,6 +71,12 @@ git pull --ff-only origin main
 
 ### 3. Deploy the reviewed probe files to the AutoCount VM
 
+**Separate current-turn owner approval required (deployment gate).** Copying to, backing
+up, and replacing files on the AutoCount VM is a change to an external system. Before this
+stage, obtain an explicit current-turn owner approval that names the VM
+(`DESKTOP-4I042L6`) and the deployment/overwrite operation. This is a distinct approval:
+the later `SaveMember` write approval (stage 5) does **not** authorise it.
+
 Deploy **both** files together (the probe dot-sources the library by relative path, so
 they must live in the same VM directory) and prove exact-version equality before any
 preflight or approval. Do not execute the probe in this step.
@@ -101,6 +107,12 @@ the deployment note — never credentials, connection values, or PII. Proceed on
 both destination hashes exactly equal the reviewed source hashes.
 
 ### 4. VM dry-run / preflight
+
+**Separate current-turn owner approval required (preflight gate).** The dry-run
+authenticates to AutoCount with runtime credentials and reads live data, so — even with
+no write switches — it is an external-service action. Before this stage, obtain an
+explicit current-turn owner approval naming the target (server and database) and the
+preflight operation. The `SaveMember` write approval (stage 5) does **not** cover it.
 
 **`AUTOCOUNT VM — DESKTOP-4I042L6`** Using the verified VM copy from stage 3, prove the
 environment with the main runner's dry-run (no write switches) per the
@@ -222,7 +234,10 @@ This PR only prepares the contract and proves persistence; it does not flip the 
 ## Residual synthetic record
 
 This probe never deletes or edits the member. After the test, a synthetic member may
-remain in AutoCount. The owner must review and remove it manually if desired; there is no
+remain in AutoCount. **Manually removing it is a destructive mutation of live AutoCount
+and requires a separate, new current-turn owner approval** that names the target and the
+deletion operation. The earlier `SaveMember` (creation) approval does **not** carry over
+to deletion. The owner may then review and remove it manually if desired; there is no
 automatic cleanup path.
 
 ## Safety boundary

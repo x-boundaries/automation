@@ -131,6 +131,33 @@ function Test-ExpiryProbeSafePath {
     return $true
 }
 
+function Get-ExpiryProbeRepoRoot {
+    # Ascend from $StartDir looking for a .git entry; return the repo root path, or $null
+    # when there is no enclosing checkout (e.g. the copy deployed to the VM).
+    param([Parameter(Mandatory)][string]$StartDir)
+    try { $dir = [System.IO.DirectoryInfo]::new(([System.IO.Path]::GetFullPath($StartDir))) } catch { return $null }
+    while ($null -ne $dir) {
+        if (Test-Path -LiteralPath (Join-Path $dir.FullName ".git")) { return $dir.FullName }
+        $dir = $dir.Parent
+    }
+    return $null
+}
+
+function Test-ExpiryProbePathInsideRepo {
+    # True if $Path is inside the repository containing $StartDir. When $StartDir has no
+    # enclosing checkout (the deployed VM copy), this returns false so the guard only
+    # bites in a source checkout, keeping private evidence out of the repository.
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$StartDir)
+    $root = Get-ExpiryProbeRepoRoot -StartDir $StartDir
+    if ([string]::IsNullOrEmpty($root)) { return $false }
+    try { $full = [System.IO.Path]::GetFullPath($Path) } catch { return $false }
+    $rootFull = ([System.IO.Path]::GetFullPath($root)).TrimEnd('\', '/')
+    $cmp = [System.StringComparison]::OrdinalIgnoreCase
+    return ($full.Equals($rootFull, $cmp) -or
+        $full.StartsWith($rootFull + [System.IO.Path]::DirectorySeparatorChar, $cmp) -or
+        $full.StartsWith($rootFull + '/', $cmp))
+}
+
 # --------------------------------------------------------------------------- #
 # Durable single-use attempt claim (P1) and non-overwriting result (P2).
 # --------------------------------------------------------------------------- #
