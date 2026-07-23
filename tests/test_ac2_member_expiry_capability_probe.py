@@ -109,16 +109,23 @@ switch ($Op) {
         Write-Output ($code + '|' + $contr)
     }
     'exit' { Write-Output ([string](Get-ExpiryProbeExitCode -TerminalOutcome $Text)) }
+    'exitNoEvidence' { Write-Output ([string](Get-ExpiryProbeExitCode -TerminalOutcome $Text -EvidencePersisted:$false)) }
     'fp' {
         $t1 = Get-ExpiryProbeTargetFingerprint -ServerName 'S' -DatabaseName 'D'
         $t2 = Get-ExpiryProbeTargetFingerprint -ServerName 'S' -DatabaseName 'D'
         $tX = Get-ExpiryProbeTargetFingerprint -ServerName 'S' -DatabaseName 'OTHER'
+        # Casing variants of the same case-insensitive target must collapse to one key.
+        $tUpper = Get-ExpiryProbeTargetFingerprint -ServerName 'SERVER\INSTANCE' -DatabaseName 'AED_DB'
+        $tLower = Get-ExpiryProbeTargetFingerprint -ServerName 'server\instance' -DatabaseName 'aed_db'
+        $afU = Get-ExpiryProbeAttemptFingerprint -TargetFingerprint $tUpper -SyntheticFingerprint (Get-ExpiryProbeSyntheticFingerprint -MemberNo 'XBEXPIRYPROBE01') -IntendedExpiry '2028-06-30'
+        $afL = Get-ExpiryProbeAttemptFingerprint -TargetFingerprint $tLower -SyntheticFingerprint (Get-ExpiryProbeSyntheticFingerprint -MemberNo 'XBEXPIRYPROBE01') -IntendedExpiry '2028-06-30'
         $sm = Get-ExpiryProbeSyntheticFingerprint -MemberNo 'XBEXPIRYPROBE01'
         $af = Get-ExpiryProbeAttemptFingerprint -TargetFingerprint $t1 -SyntheticFingerprint $sm -IntendedExpiry '2028-06-30'
         [pscustomobject]@{
             targetStable = ($t1 -eq $t2); targetDiffers = ($t1 -ne $tX)
             targetShape = ($t1 -match '^tfp_[0-9a-f]{64}$'); attemptShape = ($af -match '^afp_[0-9a-f]{64}$')
             synthShape = ($sm -match '^smf_[0-9a-f]{64}$')
+            caseInsensitiveTarget = ($tUpper -eq $tLower); caseInsensitiveAttempt = ($afU -eq $afL)
         } | ConvertTo-Json -Compress
     }
     'claim' {
@@ -250,6 +257,24 @@ class ExpiryProbeStaticTests(unittest.TestCase):
             self.assertIn("$temp", r, r)
         self.assertNotRegex(self.lib, r"Remove-Item[^\n]*claim")
 
+    def test_lib_flush_fallback_is_narrowed_to_unsupported_runtime(self):
+        # A durable-flush failure must propagate; only NotSupportedException may downgrade.
+        self.assertRegex(self.lib, r"catch \[System\.NotSupportedException\]\s*\{\s*\$stream\.Flush\(\)")
+        self.assertNotRegex(self.lib, r"catch\s*\{\s*\$stream\.Flush\(\)")
+
+    def test_lib_target_fingerprint_is_case_insensitive(self):
+        self.assertIn("ToLowerInvariant()", self.lib)
+
+    def test_evidence_persistence_failure_forces_nonzero_exit(self):
+        # Verified-but-not-persisted must not exit 0: the exit code is gated on
+        # evidence_persisted, and a write failure sets it false.
+        self.assertIn("evidence_persisted", self.script)
+        self.assertRegex(self.script, r"-EvidencePersisted\s+\$false")
+        self.assertRegex(self.script, r"\$result\.evidence_persisted\s*=\s*\$false")
+
+    def test_claim_durability_failure_fails_closed_before_save(self):
+        self.assertIn("could not be durably created", self.script)
+
 
 @unittest.skipIf(PS is None, "no PowerShell executable available")
 class ExpiryProbeLibraryTests(unittest.TestCase):
@@ -323,7 +348,12 @@ class ExpiryProbeLibraryTests(unittest.TestCase):
         proc = self._lib("exit", Text="EXPIRY_VERIFIED")
         self.assertEqual(proc.stdout.strip(), "0")
 
-    def test_fingerprints_deterministic_and_shaped(self):
+    def test_verified_without_persisted_evidence_is_nonzero(self):
+        # A verified capability whose durable evidence was not persisted must NOT pass.
+        proc = self._lib("exitNoEvidence", Text="EXPIRY_VERIFIED")
+        self.assertEqual(proc.stdout.strip(), "1")
+
+    def test_fingerprints_deterministic_shaped_and_case_insensitive(self):
         proc = self._lib("fp")
         info = json.loads(proc.stdout)
         self.assertTrue(info["targetStable"])
@@ -331,6 +361,8 @@ class ExpiryProbeLibraryTests(unittest.TestCase):
         self.assertTrue(info["targetShape"])
         self.assertTrue(info["attemptShape"])
         self.assertTrue(info["synthShape"])
+        self.assertTrue(info["caseInsensitiveTarget"], "target casing variants must collapse to one fingerprint")
+        self.assertTrue(info["caseInsensitiveAttempt"], "attempt claim key must be case-insensitive on the target")
 
     def test_claim_is_exclusive_create_and_never_deleted(self):
         d = self.tmp / "claimdir"
@@ -447,6 +479,22 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
         self.assertRegex(self.runbook, r"(?i)permanent single-use\s+attempt claim")
         self.assertRegex(self.runbook, r"(?i)exit code")
         self.assertRegex(self.runbook, r"(?i)never removes the attempt claim")
+
+    def test_runbook_deploys_both_probe_files_before_vm_stages(self):
+        # A bounded deployment/verification step for both new files must precede preflight.
+        self.assertIn("scripts/member_expiry_capability_probe_lib.ps1", self.runbook)
+        self.assertRegex(self.runbook, r"(?i)deploy both reviewed probe files")
+        self.assertIn("Get-FileHash", self.runbook)
+        deploy_idx = self.runbook.index("Deploy both reviewed probe files")
+        approval_idx = self.runbook.index("### 4.")
+        self.assertLess(deploy_idx, approval_idx, "deployment must come before the approval stage")
+
+    def test_runbook_requires_opaque_approval_reference(self):
+        # The approval reference must be opaque; the placeholder must not invite target names.
+        self.assertIn("<opaque-approval-id>", self.runbook)
+        self.assertNotIn("approval-ref-naming-target", self.runbook)
+        self.assertRegex(self.runbook, r"(?i)opaque, non-secret approval identifier")
+        self.assertRegex(self.runbook, r"(?i)put the server or database")
 
     def test_readme_references_probe_and_runbook(self):
         self.assertIn("scripts/ac2_member_expiry_capability_probe.ps1", self.readme)

@@ -69,8 +69,19 @@ git pull --ff-only origin main
 
 ### 3. VM dry-run / preflight
 
-**`AUTOCOUNT VM — DESKTOP-4I042L6`** Before running this write-capable probe, prove the
-environment with the main runner's dry-run (no write switches) per the
+**`AUTOCOUNT VM — DESKTOP-4I042L6`** **Deploy both reviewed probe files to the VM first.**
+Copy `scripts/ac2_member_expiry_capability_probe.ps1` **and** its helper library
+`scripts/member_expiry_capability_probe_lib.ps1` from the reviewed, merged `origin/main`
+to the VM working area. They must be deployed together and kept in the same directory,
+because the probe dot-sources the library by relative path. Verify each file matches the
+reviewed copy before use by comparing SHA-256 against the host checkout, and never run a
+stale or unverified copy:
+
+```powershell
+Get-FileHash .\ac2_member_expiry_capability_probe.ps1, .\member_expiry_capability_probe_lib.ps1 -Algorithm SHA256
+```
+
+Then prove the environment with the main runner's dry-run (no write switches) per the
 [Single-member creation UAT runbook](member_create_uat_runbook.md). Confirm the AutoCount
 connection through the process environment only (`AC2_PROBE_SERVER_NAME`,
 `AC2_PROBE_DATABASE_NAME`, `AC2_PROBE_USER_ID`, and the password environment variable
@@ -86,8 +97,11 @@ approval must name, in the current action:
 
 Without this explicit, current-turn approval, do not run the probe in write mode. The
 `-ApprovalReference` you pass must **correspond to that explicit current-turn owner
-approval** naming the exact AutoCount target and one synthetic record; it is a
-non-secret label recorded in the durable evidence (never a credential).
+approval**, but it must be an **opaque, non-secret approval identifier** (for example a
+ticket or approval-record ID). Do **not** put the server or database/account-book names
+into `-ApprovalReference`: it is copied verbatim into stdout and the durable evidence, and
+the target is already bound through the hashed `target_fingerprint`. The target names
+belong only in the separate current-turn approval record, never in the emitted evidence.
 
 Create the operator-owned private evidence directory once (the probe never creates it),
 outside the repository:
@@ -105,7 +119,7 @@ already exists, constructs one new member, assigns the narrow synthetic fields i
 behind one narrowly scoped function. **It never retries `SaveMember`.**
 
 ```powershell
-& scripts\ac2_member_expiry_capability_probe.ps1 -EnableExpiryCapabilityProbe -ConfirmSyntheticExpiryDateTest -ConfirmSingleSyntheticMember -ConfirmAutoCountWrite -ConfirmDryRunPreflightPassed -ConfirmNoUpdateOrDelete -ApprovalReference "<approval-ref-naming-target-and-one-record>" -StateDirectory "C:\XB\create_uat\expiry_probe_state"
+& scripts\ac2_member_expiry_capability_probe.ps1 -EnableExpiryCapabilityProbe -ConfirmSyntheticExpiryDateTest -ConfirmSingleSyntheticMember -ConfirmAutoCountWrite -ConfirmDryRunPreflightPassed -ConfirmNoUpdateOrDelete -ApprovalReference "<opaque-approval-id>" -StateDirectory "C:\XB\create_uat\expiry_probe_state"
 ```
 
 `-ApprovalReference` and `-StateDirectory` are required. The durable, non-overwriting

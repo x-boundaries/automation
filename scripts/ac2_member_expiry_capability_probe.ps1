@@ -5,8 +5,11 @@ param(
     [string]$DatabaseName = $env:AC2_PROBE_DATABASE_NAME,
     [string]$UserId = $env:AC2_PROBE_USER_ID,
     [string]$PasswordEnvVar = "AC2_PROBE_PASSWORD",
-    # Non-secret binding to the explicit current-turn owner approval (see runbook). It
-    # names the approval, never a credential. Recorded in the durable evidence.
+    # Opaque, non-secret identifier of the explicit current-turn owner approval (e.g. a
+    # ticket or approval-record ID). It is copied verbatim into the durable evidence, so
+    # it must NOT contain the server or database/account-book names (those live only in
+    # the separate approval record); the target is bound to the evidence via the hashed
+    # target_fingerprint instead. Never a credential. See the runbook.
     [string]$ApprovalReference,
     # Operator-provided private evidence directory (never in the repository). It holds
     # the permanent single-use attempt claim and the durable, non-overwriting result.
@@ -194,6 +197,7 @@ $result = [ordered]@{
     synthetic_member_may_remain   = $false
     residual_record_note          = $residualRecordNote
     terminal_outcome              = $null
+    evidence_persisted            = $true
     exit_code                     = 1
     error                         = $null
 }
@@ -209,19 +213,30 @@ function Complete-ExpiryProbeRun {
     # Derive the terminal outcome from the accumulated flags, persist durable
     # non-overwriting evidence, emit the sanitised JSON to stdout, and record the
     # truthful exit code in $script:ProbeExitCode (the caller exits on it, so this
-    # function's only pipeline output is the JSON).
+    # function's only pipeline output is the JSON). If durable evidence is required but
+    # cannot be written, the run does NOT report success: exit is forced nonzero and
+    # evidence_persisted is false, so a verified capability with no retained audit
+    # artefact can never be mistaken for a clean pass.
     param([switch]$DurableEvidence, [string]$ResultPath)
     $result.terminal_outcome = Get-ExpiryProbeTerminalOutcome -Flags $result
-    $result.exit_code = Get-ExpiryProbeExitCode -TerminalOutcome $result.terminal_outcome
-    $script:ProbeExitCode = $result.exit_code
-    $safeJson = $result | ConvertTo-Json -Depth 8
     if ($DurableEvidence -and -not [string]::IsNullOrWhiteSpace($ResultPath)) {
-        try { Write-ExpiryProbeResultAtomic -Path $ResultPath -Content $safeJson }
+        $result.evidence_persisted = $true
+        $result.exit_code = Get-ExpiryProbeExitCode -TerminalOutcome $result.terminal_outcome -EvidencePersisted $true
+        $content = $result | ConvertTo-Json -Depth 8
+        try {
+            Write-ExpiryProbeResultAtomic -Path $ResultPath -Content $content
+        }
         catch {
+            $result.evidence_persisted = $false
             if ($null -eq $result.error) { $result.error = [ordered]@{ phase = "evidence"; message = (Get-SanitizedMessage $_.Exception.Message) } }
-            $safeJson = $result | ConvertTo-Json -Depth 8
+            $result.exit_code = Get-ExpiryProbeExitCode -TerminalOutcome $result.terminal_outcome -EvidencePersisted $false
         }
     }
+    else {
+        $result.exit_code = Get-ExpiryProbeExitCode -TerminalOutcome $result.terminal_outcome -EvidencePersisted $true
+    }
+    $script:ProbeExitCode = $result.exit_code
+    $safeJson = $result | ConvertTo-Json -Depth 8
     if (-not [string]::IsNullOrWhiteSpace($JsonOut)) {
         # Optional secondary sanitised copy; also non-overwriting to protect audit evidence.
         try {
@@ -437,10 +452,16 @@ try {
         $result.claim_created = $true
     }
     catch {
-        # Another launch won the race (or a prior claim exists): fail closed, no save.
-        $result.claim_conflict = $true
-        $result.synthetic_member_may_remain = $true
-        throw "The attempt claim could not be created exclusively; refusing to write."
+        # Fail closed without any save. If a claim now exists, another launch won the
+        # race (or a prior claim exists) -> ATTEMPT_ALREADY_CLAIMED. Otherwise the claim
+        # could not be durably created (e.g. a flush that cannot confirm durability
+        # propagated), which is a pre-write failure, not a conflict.
+        if (Test-Path -LiteralPath $claimPath) {
+            $result.claim_conflict = $true
+            $result.synthetic_member_may_remain = $true
+            throw "A permanent attempt claim already exists (concurrent or prior); refusing to write."
+        }
+        throw "The attempt claim could not be durably created; refusing to write before any save."
     }
 
     # ---- The single irreversible SaveMember. No retry after this begins. ----

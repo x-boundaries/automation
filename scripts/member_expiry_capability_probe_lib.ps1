@@ -43,9 +43,15 @@ function Get-ExpiryProbeSha256Hex {
 function Get-ExpiryProbeTargetFingerprint {
     # A non-secret SHA-256 over a canonical representation of the AutoCount target
     # (server + database/account book). The raw target values are never emitted.
+    #
+    # SQL Server instance names and AutoCount database/account-book names are
+    # case-insensitive, so the canonical form is trimmed and lower-cased (invariant).
+    # This makes casing variants (SERVER\INSTANCE vs server\instance) resolve to the
+    # SAME target and attempt fingerprint, so the single-use claim is a real
+    # concurrency/no-retry boundary regardless of how the target is spelled.
     param([Parameter(Mandatory)][AllowEmptyString()][string]$ServerName,
           [Parameter(Mandatory)][AllowEmptyString()][string]$DatabaseName)
-    $canonical = "server=" + $ServerName.Trim() + "|database=" + $DatabaseName.Trim()
+    $canonical = "server=" + $ServerName.Trim().ToLowerInvariant() + "|database=" + $DatabaseName.Trim().ToLowerInvariant()
     "tfp_" + (Get-ExpiryProbeSha256Hex -Text $canonical)
 }
 
@@ -120,7 +126,12 @@ function New-ExpiryProbeDurableArtifact {
     try {
         $bytes = [System.Text.Encoding]::UTF8.GetBytes($Content)
         $stream.Write($bytes, 0, $bytes.Length)
-        try { $stream.Flush($true) } catch { $stream.Flush() }
+        # Flush(true) forces the data to the storage device. Only fall back to the
+        # ordinary Flush() for a runtime that genuinely does not support the durable
+        # overload (NotSupportedException); any other flush failure (e.g. an I/O error
+        # that cannot confirm durability) must propagate so the caller fails closed
+        # BEFORE the irreversible save rather than proceeding on a non-durable claim.
+        try { $stream.Flush($true) } catch [System.NotSupportedException] { $stream.Flush() }
     }
     finally { $stream.Dispose() }
 }
@@ -220,9 +231,12 @@ function Get-ExpiryProbeTerminalOutcome {
 }
 
 function Get-ExpiryProbeExitCode {
-    # Truthful process exit status: 0 only for EXPIRY_VERIFIED, nonzero for every other
-    # terminal outcome (including REFUSED).
-    param([Parameter(Mandatory)][string]$TerminalOutcome)
-    if ($TerminalOutcome -eq 'EXPIRY_VERIFIED') { return 0 }
+    # Truthful process exit status: 0 ONLY for EXPIRY_VERIFIED whose durable evidence was
+    # persisted; nonzero for every other terminal outcome (including REFUSED) AND for a
+    # verified run whose durable result could not be written. A wrapper that gates the
+    # follow-up capability flip on exit 0 therefore never proceeds without retained audit
+    # evidence.
+    param([Parameter(Mandatory)][string]$TerminalOutcome, [bool]$EvidencePersisted = $true)
+    if ($TerminalOutcome -eq 'EXPIRY_VERIFIED' -and $EvidencePersisted) { return 0 }
     return 1
 }
