@@ -83,6 +83,42 @@ INTENDED_BUSINESS_VALUES = {
 # assignment and persistence behaviour is proven, regardless of confirmation state.
 NEVER_ASSIGN_FIELDS = ("ExpiryDate",)
 
+# --------------------------------------------------------------------------- #
+# Prepared (but not yet active) ExpiryDate assignment/read-back contract.
+#
+# This PR PREPARES the ExpiryDate assignment and persistence capability. It does NOT
+# flip the code-level capability gate and does NOT add ExpiryDate to the active
+# ASSIGNABLE_FIELDS whitelist or the immutable package payload. Both remain exactly
+# as PR #111 shipped them, so every real write still stops at OPERATOR_CONFIG_REQUIRED
+# and the runner still never assigns ExpiryDate.
+#
+# EXPIRYDATE_ASSIGNMENT_IMPLEMENTED mirrors the PowerShell
+# $script:CreateUatExpiryDateAssignmentImplemented capability flag. While it is False,
+# ExpiryDate stays out of the active assignment path. A follow-up PR may set both to
+# True together only AFTER the synthetic capability probe proves ExpiryDate persists.
+EXPIRYDATE_ASSIGNMENT_IMPLEMENTED = False
+
+# The exact intended ExpiryDate for this bounded UAT. Named explicitly (not only
+# nested in INTENDED_BUSINESS_VALUES) so the intended value is greppable and testable.
+EXPIRYDATE_INTENDED_VALUE = "2028-06-30"
+
+# The intended AutoCount assignment contract: the full field set the runner is
+# INTENDED to assign once the ExpiryDate capability is proven and the flags above are
+# flipped. ExpiryDate is a member of this intended set even though it is deliberately
+# still excluded from the currently active ASSIGNABLE_FIELDS. The invariant
+# INTENDED_ASSIGNMENT_FIELDS == ASSIGNABLE_FIELDS + NEVER_ASSIGN_FIELDS keeps the
+# active/intended relationship explicit, so the follow-up flip is a single clean move
+# (remove ExpiryDate from NEVER_ASSIGN_FIELDS, add it to ASSIGNABLE_FIELDS).
+INTENDED_ASSIGNMENT_FIELDS = ASSIGNABLE_FIELDS + NEVER_ASSIGN_FIELDS
+
+# The normalised read-back verification contract: every field whose persisted value
+# must be read back and compared after a real SaveMember once the capability is
+# proven. ExpiryDate is included so a read-back ExpiryDate mismatch can never yield
+# CREATED_VERIFIED. The runner reads back exactly the fields it assigns, so until the
+# capability flips it verifies the active set (without ExpiryDate); the intended
+# contract already requires ExpiryDate verification for the proven state.
+READBACK_VERIFICATION_FIELDS = INTENDED_ASSIGNMENT_FIELDS
+
 # Controlled terminal result vocabulary. Every runner outcome is exactly one of
 # these. Documented in the runbook.
 TERMINAL_CODES = frozenset(

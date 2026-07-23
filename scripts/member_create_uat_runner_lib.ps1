@@ -27,6 +27,15 @@ $script:CreateUatIntended = @{
     ExpiryDate    = "2028-06-30"
     OpeningPoints = 0
 }
+# Prepared (but not yet active) ExpiryDate assignment/read-back contract; mirrors
+# member_create_uat_contract.py. ExpiryDate is part of the INTENDED assignment and
+# read-back contract, but it stays OUT of the active $script:CreateUatAssignableFields
+# whitelist until the capability flag $script:CreateUatExpiryDateAssignmentImplemented
+# (defined below) is flipped after synthetic proof. The invariant keeps the
+# active/intended relationship explicit for a clean follow-up flip.
+$script:CreateUatExpiryDateIntendedValue = "2028-06-30"
+$script:CreateUatIntendedAssignmentFields = $script:CreateUatAssignableFields + $script:CreateUatNeverAssignFields
+$script:CreateUatReadbackVerificationFields = $script:CreateUatIntendedAssignmentFields
 $script:CreateUatDateRe = '^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])$'
 $script:CreateUatTimestampRe = '^[0-9T:+.Z-]{1,64}$'
 
