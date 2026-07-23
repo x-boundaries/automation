@@ -18,10 +18,21 @@ before the real single-member creation UAT enables it.
   form-derived member is ever used in this capability probe.**
 - It is **not the permanent production member-intake workflow**. It is a one-off
   capability proof.
-- It performs **no member update, no delete, no rollback, and no automatic cleanup**.
-  The one synthetic member it may create will **remain** in AutoCount and must be
-  reviewed and removed manually by the owner.
-- An **uncertain save outcome is terminal and must never be retried automatically.**
+- It performs **no member update, no delete, no rollback, and no automatic cleanup**,
+  and it **never removes the attempt claim**. The one synthetic member it may create
+  will **remain** in AutoCount and must be reviewed and removed manually by the owner.
+- An **uncertain save outcome is terminal and must never be retried automatically.** A
+  confirmed save whose read-back then fails is reported as
+  `WRITE_CONFIRMED_READBACK_FAILED`, never as a pre-write failure.
+- Before the irreversible `SaveMember` it atomically creates a **permanent single-use
+  attempt claim** in the operator-provided `-StateDirectory` (`FileMode.CreateNew`,
+  write-through). The claim is the concurrent-execution exclusion and the permanent
+  no-retry boundary: it is never overwritten or deleted, so a crash after it is created
+  makes every future invocation **fail closed** with `ATTEMPT_ALREADY_CLAIMED`. There is
+  no automatic claim removal or stale-claim recovery.
+- The process **exit code is truthful**: `0` only for `EXPIRY_VERIFIED`; nonzero for
+  every other outcome, including a refusal. Do not rely on parsing the JSON to detect
+  failure; check `$LASTEXITCODE`.
 
 ## Prepared contract, still gated
 
@@ -73,7 +84,17 @@ approval must name, in the current action:
 - the AutoCount target (the intended server and database / account book);
 - exactly one synthetic record (this probe's single synthetic member).
 
-Without this explicit, current-turn approval, do not run the probe in write mode.
+Without this explicit, current-turn approval, do not run the probe in write mode. The
+`-ApprovalReference` you pass must **correspond to that explicit current-turn owner
+approval** naming the exact AutoCount target and one synthetic record; it is a
+non-secret label recorded in the durable evidence (never a credential).
+
+Create the operator-owned private evidence directory once (the probe never creates it),
+outside the repository:
+
+```powershell
+New-Item -ItemType Directory -Path "C:\XB\create_uat\expiry_probe_state" -Force
+```
 
 ### 5. One synthetic ExpiryDate persistence test
 
@@ -84,20 +105,50 @@ already exists, constructs one new member, assigns the narrow synthetic fields i
 behind one narrowly scoped function. **It never retries `SaveMember`.**
 
 ```powershell
-& scripts\ac2_member_expiry_capability_probe.ps1 -EnableExpiryCapabilityProbe -ConfirmSyntheticExpiryDateTest -ConfirmSingleSyntheticMember -ConfirmAutoCountWrite -ConfirmDryRunPreflightPassed -ConfirmNoUpdateOrDelete -JsonOut "C:\XB\create_uat\expiry_capability_probe_result.json"
+& scripts\ac2_member_expiry_capability_probe.ps1 -EnableExpiryCapabilityProbe -ConfirmSyntheticExpiryDateTest -ConfirmSingleSyntheticMember -ConfirmAutoCountWrite -ConfirmDryRunPreflightPassed -ConfirmNoUpdateOrDelete -ApprovalReference "<approval-ref-naming-target-and-one-record>" -StateDirectory "C:\XB\create_uat\expiry_probe_state"
 ```
 
-If the probe reports `SAVE_UNCERTAIN`, the save began but could not be confirmed. **Do
-not retry.** Treat it as terminal and perform a separate read-only check in AutoCount
-(Bonus Point > Member Maintenance, Note marker `XB_AUTOMATION_EXPIRYDATE_PROBE_SYNTHETIC`).
+`-ApprovalReference` and `-StateDirectory` are required. The durable, non-overwriting
+result is written into `-StateDirectory` as `expiry_probe_result_<operation_id>.json`
+(temporary file plus atomic move; a pre-existing result or attempt claim fails closed
+before AutoCount contact). Check `$LASTEXITCODE` after the run: `0` means
+`EXPIRY_VERIFIED`; any nonzero value means the capability was not proven.
+
+If the probe reports `WRITE_OUTCOME_UNCERTAIN`, the save began but could not be
+confirmed. **Do not retry** (the permanent attempt claim already blocks any rerun for
+this target/record). Treat it as terminal and perform a separate read-only check in
+AutoCount (Bonus Point > Member Maintenance, Note marker
+`XB_AUTOMATION_EXPIRYDATE_PROBE_SYNTHETIC`). If the probe reports
+`WRITE_CONFIRMED_READBACK_FAILED`, the write completed but the read-back could not be
+performed; the synthetic member almost certainly exists and must be reviewed manually.
+
+### Terminal outcomes, exit codes, and recovery
+
+| Terminal outcome | Exit | Meaning / recovery |
+| --- | --- | --- |
+| `EXPIRY_VERIFIED` | 0 | Synthetic member created; ExpiryDate read back and matched. Capability proven. |
+| `EXPIRY_READBACK_MISMATCH` | nonzero | Created and read back, but ExpiryDate did not match. Investigate before any flip. |
+| `WRITE_CONFIRMED_READBACK_FAILED` | nonzero | SaveMember returned but read-back failed. The member likely exists; verify manually. Never retried. |
+| `WRITE_OUTCOME_UNCERTAIN` | nonzero | SaveMember began but did not return normally. Verify manually. Never retried; claim blocks rerun. |
+| `BLOCKED_MEMBER_EXISTS` | nonzero | The synthetic member already exists. Review/remove it manually. |
+| `ATTEMPT_ALREADY_CLAIMED` | nonzero | A permanent attempt claim already exists for this target/record. Fails closed before AutoCount contact. |
+| `FAILED_BEFORE_WRITE` | nonzero | A confirmed failure before any write (config, auth, assembly, or setup). No member created. |
+| `REFUSED` | nonzero | Not all explicit switches were supplied; inactive by default. |
+
+Under any uncertain or post-save state the probe never retries automatically and never
+removes the attempt claim; recovery is a separate, read-only, owner-directed manual check.
 
 ### 6. Read-back evidence
 
 The probe performs a `GetMember` read-back and verifies `ExpiryDate` after explicit
 normalisation, then emits **sanitised aggregate evidence only**: booleans, the masked
-member number, the terminal outcome, and the normalised `ExpiryDate` values. No raw
-synthetic member number, name, or email is printed or written. Expect
-`terminal_outcome = EXPIRY_VERIFIED` and `expiry_date_readback_match = true` on success.
+member number, the terminal outcome, and the normalised `ExpiryDate` values. The
+evidence is bound to the run and target through `operation_id`, `approval_reference`,
+`executed_at_utc`, and a non-secret `target_fingerprint` (SHA-256 of the server and
+database), so an `EXPIRY_VERIFIED` record cannot be mistaken for proof of a different or
+stale target. No raw target (server/database), credential, synthetic member number,
+name, or email is ever printed or written. Expect `terminal_outcome = EXPIRY_VERIFIED`
+and `expiry_match = true` on success.
 
 ### 7. Follow-up PR (only after proof)
 

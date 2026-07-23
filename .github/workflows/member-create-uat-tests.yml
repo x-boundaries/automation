@@ -18,12 +18,18 @@ on:
       - "scripts/ac2_member_create_uat_runner.ps1"
       - "scripts/member_create_uat_runner_lib.ps1"
       - "scripts/ac2_member_expiry_capability_probe.ps1"
+      - "scripts/member_expiry_capability_probe_lib.ps1"
       - "schemas/member_create_uat_package.schema.json"
       - "config/member_create_uat_business_confirmation*.json"
       - "n8n-workflows/member_create_uat_result_mapping.workflow.json"
       - "tests/test_member_create_uat_*.py"
       - "tests/test_ac2_member_expiry_capability_probe.py"
       - "tests/_create_uat_fixtures.py"
+      # Safety documents that the focused tests read and assert; a docs-only change to
+      # any of these must still trigger this workflow so the instructions cannot regress.
+      - "docs/autocount2-automation/member_expiry_capability_probe_runbook.md"
+      - "docs/autocount2-automation/member_create_uat_runbook.md"
+      - "README.md"
       - ".github/workflows/member-create-uat-tests.yml"
   workflow_dispatch: {}
 
@@ -44,7 +50,8 @@ jobs:
           $files = @(
             "scripts/ac2_member_create_uat_runner.ps1",
             "scripts/member_create_uat_runner_lib.ps1",
-            "scripts/ac2_member_expiry_capability_probe.ps1"
+            "scripts/ac2_member_expiry_capability_probe.ps1",
+            "scripts/member_expiry_capability_probe_lib.ps1"
           )
           $failed = $false
           foreach ($f in $files) {
@@ -82,7 +89,8 @@ jobs:
           $files = @(
             "scripts/ac2_member_create_uat_runner.ps1",
             "scripts/member_create_uat_runner_lib.ps1",
-            "scripts/ac2_member_expiry_capability_probe.ps1"
+            "scripts/ac2_member_expiry_capability_probe.ps1",
+            "scripts/member_expiry_capability_probe_lib.ps1"
           )
           $failed = $false
           foreach ($f in $files) {

@@ -5,6 +5,12 @@ param(
     [string]$DatabaseName = $env:AC2_PROBE_DATABASE_NAME,
     [string]$UserId = $env:AC2_PROBE_USER_ID,
     [string]$PasswordEnvVar = "AC2_PROBE_PASSWORD",
+    # Non-secret binding to the explicit current-turn owner approval (see runbook). It
+    # names the approval, never a credential. Recorded in the durable evidence.
+    [string]$ApprovalReference,
+    # Operator-provided private evidence directory (never in the repository). It holds
+    # the permanent single-use attempt claim and the durable, non-overwriting result.
+    [string]$StateDirectory,
     # ALL of the following explicit switches are required before any AutoCount write.
     # Missing any one leaves the probe inactive: it refuses before loading AutoCount.
     [switch]$EnableExpiryCapabilityProbe,     # master enable
@@ -20,6 +26,9 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
+$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+. (Join-Path $scriptDir "member_expiry_capability_probe_lib.ps1")
+
 # --------------------------------------------------------------------------- #
 # What this probe is (and is NOT):
 #
@@ -33,10 +42,17 @@ $ErrorActionPreference = "Stop"
 # database) and exactly one synthetic record before it is ever run (see the runbook
 # docs/autocount2-automation/member_expiry_capability_probe_runbook.md).
 #
+# Before the irreversible SaveMember it atomically creates a permanent single-use
+# attempt claim in the operator-provided StateDirectory. The claim is both the
+# concurrent-execution exclusion and the permanent no-retry boundary: it is never
+# overwritten or deleted, so a crash after it is created makes every future invocation
+# fail closed. There is no automatic claim removal or stale-claim recovery.
+#
 # It performs NO member update, NO delete, NO rollback, and NO automatic cleanup. The
 # one synthetic member it may create will REMAIN in AutoCount and must be reviewed and
-# removed manually by the owner. An uncertain save outcome is terminal and is never
-# retried automatically.
+# removed manually by the owner. An uncertain save outcome is terminal and never
+# retried; a confirmed save whose read-back fails is reported as
+# WRITE_CONFIRMED_READBACK_FAILED, never as a pre-write failure.
 # --------------------------------------------------------------------------- #
 
 $script:SyntheticMemberNo = "XBEXPIRYPROBE01"
@@ -47,46 +63,9 @@ $script:SyntheticRegisterDate = "2026-07-01"
 $script:SyntheticExpiryDate = "2028-06-30"
 $script:SyntheticNoteMarker = "XB_AUTOMATION_EXPIRYDATE_PROBE_SYNTHETIC"
 
-$residualRecordNote = "No automatic member update, delete, rollback, or cleanup is performed. A synthetic member may remain in AutoCount and must be reviewed and removed manually by the owner. Search Bonus Point > Member Maintenance for Note marker $script:SyntheticNoteMarker."
+$residualRecordNote = "No automatic member update, delete, rollback, or cleanup is performed, and the attempt claim is never removed. A synthetic member may remain in AutoCount and must be reviewed and removed manually by the owner. Search Bonus Point > Member Maintenance for Note marker $script:SyntheticNoteMarker."
 
-$allConfirmed = $EnableExpiryCapabilityProbe -and $ConfirmSyntheticExpiryDateTest -and `
-    $ConfirmSingleSyntheticMember -and $ConfirmAutoCountWrite -and `
-    $ConfirmDryRunPreflightPassed -and $ConfirmNoUpdateOrDelete
-
-if (-not $allConfirmed) {
-    $refusal = [ordered]@{
-        mode                          = "member-expiry-capability-probe"
-        probe_enabled                 = [bool]$EnableExpiryCapabilityProbe
-        confirm_synthetic_expiry_test = [bool]$ConfirmSyntheticExpiryDateTest
-        confirm_single_synthetic      = [bool]$ConfirmSingleSyntheticMember
-        confirm_auto_count_write      = [bool]$ConfirmAutoCountWrite
-        confirm_dry_run_preflight     = [bool]$ConfirmDryRunPreflightPassed
-        confirm_no_update_or_delete   = [bool]$ConfirmNoUpdateOrDelete
-        save_member_attempted         = $false
-        terminal_outcome              = "REFUSED"
-        residual_record_note          = $residualRecordNote
-        refused                       = $true
-        message                       = "Explicit opt-in is required. Re-run with -EnableExpiryCapabilityProbe, -ConfirmSyntheticExpiryDateTest, -ConfirmSingleSyntheticMember, -ConfirmAutoCountWrite, -ConfirmDryRunPreflightPassed, and -ConfirmNoUpdateOrDelete to create exactly one synthetic member and verify ExpiryDate persistence. Owner approval naming the AutoCount target and exactly one synthetic record is required first."
-    }
-    $refusal | ConvertTo-Json -Depth 4
-    throw "Refusing to run the AC2 synthetic ExpiryDate capability probe without all explicit write opt-ins."
-}
-
-Write-Warning "AC2 synthetic ExpiryDate capability probe is explicit opt-in and write-capable. It creates exactly one synthetic member and verifies ExpiryDate persistence. It never updates, deletes, rolls back, or cleans up; the synthetic member will remain for manual owner review."
-
-$script:AcRootPath = [System.IO.Path]::GetFullPath($AcRoot)
-$assemblyNames = @(
-    "AutoCount.dll",
-    "AutoCount.Accounting.dll",
-    "AutoCount.Invoicing.dll",
-    "AutoCount.ImportExport.dll",
-    "AutoCount.Tools.dll"
-)
-$coreAssemblyName = "AutoCount.dll"
-$memberAssemblyName = "AutoCount.Invoicing.dll"
-$dbSettingTypeName = "AutoCount.Data.DBSetting"
-$userSessionTypeName = "AutoCount.Authentication.UserSession"
-$memberCommandTypeName = "AutoCount.BonusPoint.Member.MemberCommand"
+$approvalReferenceRe = '^[A-Za-z0-9._:#/-]{3,120}$'
 
 # --------------------------------------------------------------------------- #
 # Sanitisation: secrets and synthetic identifiers never appear in output.
@@ -110,26 +89,6 @@ function Get-ExceptionMessage {
     $current = $Exception
     while ($null -ne $current.InnerException) { $current = $current.InnerException }
     return Get-SanitizedMessage $current.Message
-}
-
-function Get-MaskedMemberNo {
-    param([string]$MemberNo)
-    if ([string]::IsNullOrEmpty($MemberNo) -or $MemberNo.Length -le 2) { return "***" }
-    $MemberNo.Substring(0, 2) + "***" + $MemberNo.Substring($MemberNo.Length - 1, 1)
-}
-
-function Get-NormalizedDateValue {
-    # Normalise an AutoCount date-shaped value to yyyy-MM-dd (or "" for null/blank), so
-    # the read-back comparison is representation-independent (DateTime vs string).
-    param([AllowNull()]$Value)
-    if ($null -eq $Value -or $Value -is [System.DBNull]) { return "" }
-    if ($Value -is [datetime]) { return $Value.ToString("yyyy-MM-dd") }
-    $text = ([string]$Value).Trim()
-    $parsed = [datetime]::MinValue
-    if ([datetime]::TryParse($text, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::None, [ref]$parsed)) {
-        return $parsed.ToString("yyyy-MM-dd")
-    }
-    return $text
 }
 
 # --------------------------------------------------------------------------- #
@@ -191,9 +150,21 @@ function Invoke-ExpiryProbeSaveMemberOnce {
     [void]$SaveMemberMethod.Invoke($MemberCommand, @($MemberEntity))
 }
 
+$operationId = "expop_" + [guid]::NewGuid().ToString("n")
+
 $result = [ordered]@{
+    schema_version                = "member_expiry_capability_probe/v1"
     mode                          = "member-expiry-capability-probe"
-    probe_enabled                 = [bool]$EnableExpiryCapabilityProbe
+    operation_id                  = $operationId
+    approval_reference            = $null
+    executed_at_utc               = [DateTime]::UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ")
+    target_fingerprint            = $null
+    synthetic_fingerprint         = $null
+    attempt_fingerprint           = $null
+    intended_expiry_date          = $script:SyntheticExpiryDate
+    claim_basename                = $null
+    result_basename               = $null
+    activated                     = $false
     confirm_synthetic_expiry_test = [bool]$ConfirmSyntheticExpiryDateTest
     confirm_single_synthetic      = [bool]$ConfirmSingleSyntheticMember
     confirm_auto_count_write      = [bool]$ConfirmAutoCountWrite
@@ -209,49 +180,153 @@ $result = [ordered]@{
     assignment_success            = $false
     expiry_date_assigned          = $false
     member_exists_recheck         = $false
+    claim_created                 = $false
+    claim_conflict                = $false
     save_member_method_found      = $false
     save_member_attempted         = $false
     save_member_confirmed         = $false
     save_outcome                  = "not_attempted"
     readback_found                = $false
-    expiry_date_expected          = $script:SyntheticExpiryDate
+    readback_error                = $null
     expiry_date_readback_value    = $null
-    expiry_date_readback_match    = $false
-    masked_member_no              = Get-MaskedMemberNo $script:SyntheticMemberNo
-    terminal_outcome              = $null
+    expiry_match                  = $false
+    masked_member_no              = (Get-ExpiryProbeMaskedMemberNo -MemberNo $script:SyntheticMemberNo)
     synthetic_member_may_remain   = $false
     residual_record_note          = $residualRecordNote
+    terminal_outcome              = $null
+    exit_code                     = 1
     error                         = $null
 }
 
-$assemblyResolveHandler = [System.ResolveEventHandler] {
-    param($s, $e)
-    $an = [System.Reflection.AssemblyName]::new($e.Name)
-    $cand = Join-Path $script:AcRootPath ($an.Name + ".dll")
-    if (Test-Path -LiteralPath $cand -PathType Leaf) { return [System.Reflection.Assembly]::LoadFrom($cand) }
-    return $null
+# --------------------------------------------------------------------------- #
+# Finalisation: derive the terminal outcome from the accumulated flags (single
+# source of truth), persist durable non-overwriting evidence, emit sanitised JSON,
+# and return the truthful exit code. Never overwrites prior evidence.
+# --------------------------------------------------------------------------- #
+$script:ProbeExitCode = 1
+
+function Complete-ExpiryProbeRun {
+    # Derive the terminal outcome from the accumulated flags, persist durable
+    # non-overwriting evidence, emit the sanitised JSON to stdout, and record the
+    # truthful exit code in $script:ProbeExitCode (the caller exits on it, so this
+    # function's only pipeline output is the JSON).
+    param([switch]$DurableEvidence, [string]$ResultPath)
+    $result.terminal_outcome = Get-ExpiryProbeTerminalOutcome -Flags $result
+    $result.exit_code = Get-ExpiryProbeExitCode -TerminalOutcome $result.terminal_outcome
+    $script:ProbeExitCode = $result.exit_code
+    $safeJson = $result | ConvertTo-Json -Depth 8
+    if ($DurableEvidence -and -not [string]::IsNullOrWhiteSpace($ResultPath)) {
+        try { Write-ExpiryProbeResultAtomic -Path $ResultPath -Content $safeJson }
+        catch {
+            if ($null -eq $result.error) { $result.error = [ordered]@{ phase = "evidence"; message = (Get-SanitizedMessage $_.Exception.Message) } }
+            $safeJson = $result | ConvertTo-Json -Depth 8
+        }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($JsonOut)) {
+        # Optional secondary sanitised copy; also non-overwriting to protect audit evidence.
+        try {
+            $p = [System.IO.Path]::GetFullPath($JsonOut)
+            $parent = [System.IO.Path]::GetDirectoryName($p)
+            if (-not [string]::IsNullOrWhiteSpace($parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
+            New-ExpiryProbeDurableArtifact -Path $p -Content $safeJson
+        }
+        catch { }
+    }
+    $safeJson
 }
-[System.AppDomain]::CurrentDomain.add_AssemblyResolve($assemblyResolveHandler)
+
+# ---- Inactive by default: refuse before anything else when a switch is missing. ----
+$allConfirmed = $EnableExpiryCapabilityProbe -and $ConfirmSyntheticExpiryDateTest -and `
+    $ConfirmSingleSyntheticMember -and $ConfirmAutoCountWrite -and `
+    $ConfirmDryRunPreflightPassed -and $ConfirmNoUpdateOrDelete
+
+if (-not $allConfirmed) {
+    # Advisory to stderr only; stdout is reserved for the sanitised JSON contract.
+    [Console]::Error.WriteLine("AC2 synthetic ExpiryDate capability probe refused: all explicit write switches are required.")
+    Complete-ExpiryProbeRun
+    exit $script:ProbeExitCode
+}
+$result.activated = $true
+$result.approval_reference = $ApprovalReference
+
+# Advisory to stderr only; stdout is reserved for the sanitised JSON contract.
+[Console]::Error.WriteLine("AC2 synthetic ExpiryDate capability probe is explicit opt-in and write-capable. It creates exactly one synthetic member and verifies ExpiryDate persistence. It never updates, deletes, rolls back, or cleans up; the synthetic member will remain for manual owner review.")
+
+$assemblyResolveHandler = $null
+$claimPath = $null
+$resultPath = $null
+$stateReady = $false
 
 try {
-    # ---- Connection inputs (from the AC2_PROBE_* environment; never printed). ----
-    $serverForProbe = $ServerName; $databaseForProbe = $DatabaseName; $userForProbe = $UserId
+    # ---- Bind evidence to approval + target (before any AutoCount contact). ----
+    if ([string]::IsNullOrWhiteSpace($ApprovalReference) -or $ApprovalReference -notmatch $approvalReferenceRe) {
+        throw "A valid non-secret -ApprovalReference is required (matching $approvalReferenceRe)."
+    }
+    if (-not (Test-ExpiryProbeSafePath -Path $StateDirectory)) {
+        throw "A safe absolute -StateDirectory is required."
+    }
+    if (-not (Test-Path -LiteralPath $StateDirectory -PathType Container)) {
+        throw "The -StateDirectory does not exist (operator setup prerequisite; the probe never creates it)."
+    }
+    foreach ($pair in @(@("ServerName", $ServerName), @("DatabaseName", $DatabaseName))) {
+        if ([string]::IsNullOrWhiteSpace($pair[1])) { throw "$($pair[0]) is required to bind the capability evidence to the target." }
+    }
+
+    $targetFingerprint = Get-ExpiryProbeTargetFingerprint -ServerName $ServerName -DatabaseName $DatabaseName
+    $syntheticFingerprint = Get-ExpiryProbeSyntheticFingerprint -MemberNo $script:SyntheticMemberNo
+    $attemptFingerprint = Get-ExpiryProbeAttemptFingerprint -TargetFingerprint $targetFingerprint -SyntheticFingerprint $syntheticFingerprint -IntendedExpiry $script:SyntheticExpiryDate
+    $result.target_fingerprint = $targetFingerprint
+    $result.synthetic_fingerprint = $syntheticFingerprint
+    $result.attempt_fingerprint = $attemptFingerprint
+
+    $claimPath = Join-Path $StateDirectory ("expiry_probe_claim_" + $attemptFingerprint + ".claim")
+    $resultPath = Join-Path $StateDirectory ("expiry_probe_result_" + $operationId + ".json")
+    $result.claim_basename = [System.IO.Path]::GetFileName($claimPath)
+    $result.result_basename = [System.IO.Path]::GetFileName($resultPath)
+    $stateReady = $true
+
+    # ---- Permanent single-use claim: refuse before AutoCount if it already exists. ----
+    if (Test-Path -LiteralPath $claimPath) {
+        $result.claim_conflict = $true
+        $result.synthetic_member_may_remain = $true
+        throw "A permanent attempt claim already exists for this target/record; refusing (no retry, no AutoCount contact)."
+    }
+    if (Test-Path -LiteralPath $resultPath) {
+        throw "A prior result artefact already exists for this operation id; refusing to overwrite evidence."
+    }
+
+    # ---- AutoCount connection inputs (from the AC2_PROBE_* environment; never printed). ----
+    $userForProbe = $UserId
     $passwordForProbe = [Environment]::GetEnvironmentVariable($PasswordEnvVar)
-    foreach ($pair in @(@("ServerName", $serverForProbe), @("DatabaseName", $databaseForProbe), @("UserId", $userForProbe), @("Password", $passwordForProbe))) {
+    foreach ($pair in @(@("UserId", $userForProbe), @("Password", $passwordForProbe))) {
         if ([string]::IsNullOrWhiteSpace($pair[1])) { throw "$($pair[0]) is required for the AutoCount connection." }
     }
 
+    $script:AcRootPath = [System.IO.Path]::GetFullPath($AcRoot)
     $result.ac_root_exists = Test-Path -LiteralPath $script:AcRootPath -PathType Container
     if (-not $result.ac_root_exists) { throw "AC2 root path was not found." }
+
+    $assemblyResolveHandler = [System.ResolveEventHandler] {
+        param($s, $e)
+        $an = [System.Reflection.AssemblyName]::new($e.Name)
+        $cand = Join-Path $script:AcRootPath ($an.Name + ".dll")
+        if (Test-Path -LiteralPath $cand -PathType Leaf) { return [System.Reflection.Assembly]::LoadFrom($cand) }
+        return $null
+    }
+    [System.AppDomain]::CurrentDomain.add_AssemblyResolve($assemblyResolveHandler)
+
+    $assemblyNames = @("AutoCount.dll", "AutoCount.Accounting.dll", "AutoCount.Invoicing.dll", "AutoCount.ImportExport.dll", "AutoCount.Tools.dll")
     foreach ($a in $assemblyNames) {
         $ap = Join-Path $script:AcRootPath $a
         if (-not (Test-Path -LiteralPath $ap -PathType Leaf)) { throw "Required AutoCount assembly was not found." }
         [void][System.Reflection.Assembly]::LoadFrom($ap)
     }
     $result.required_assemblies_loaded = $true
-    $coreAssembly = [System.Reflection.Assembly]::LoadFrom((Join-Path $script:AcRootPath $coreAssemblyName))
-    $memberAssembly = [System.Reflection.Assembly]::LoadFrom((Join-Path $script:AcRootPath $memberAssemblyName))
+    $coreAssembly = [System.Reflection.Assembly]::LoadFrom((Join-Path $script:AcRootPath "AutoCount.dll"))
+    $memberAssembly = [System.Reflection.Assembly]::LoadFrom((Join-Path $script:AcRootPath "AutoCount.Invoicing.dll"))
 
+    $dbSettingTypeName = "AutoCount.Data.DBSetting"
+    $userSessionTypeName = "AutoCount.Authentication.UserSession"
     $dbSettingType = $coreAssembly.GetType($dbSettingTypeName, $false, $false)
     $userSessionType = $coreAssembly.GetType($userSessionTypeName, $false, $false)
     if ($null -eq $dbSettingType -or $null -eq $userSessionType) { throw "Core AutoCount types were not found." }
@@ -266,7 +341,7 @@ try {
         throw "Required AutoCount authentication members were not found."
     }
 
-    $dbSetting = $dbSettingFactory.Invoke($null, @($serverForProbe, $databaseForProbe))
+    $dbSetting = $dbSettingFactory.Invoke($null, @($ServerName, $DatabaseName))
     [void]$authenticateMethod.Invoke($null, @($dbSetting, $userForProbe, $passwordForProbe))
     $session = $userSessionConstructor.Invoke(@($dbSetting))
     if ($AllowRootLogin -and $null -ne $allowRootLoginProperty -and $allowRootLoginProperty.CanWrite) {
@@ -280,7 +355,7 @@ try {
     Remove-Variable passwordForProbe -ErrorAction SilentlyContinue
 
     # ---- MemberCommand + immediate duplicate check BEFORE constructing the entity. ----
-    $memberCommandType = $memberAssembly.GetType($memberCommandTypeName, $false, $false)
+    $memberCommandType = $memberAssembly.GetType("AutoCount.BonusPoint.Member.MemberCommand", $false, $false)
     if ($null -eq $memberCommandType) { throw "MemberCommand type was not found." }
     $result.member_command_found = $true
     # MemberCommand.Create(UserSession, DBSetting) is the only command factory used here.
@@ -295,10 +370,7 @@ try {
     $existing = $getMemberMethod.Invoke($memberCommand, @($script:SyntheticMemberNo))
     $result.member_exists_initial = ($null -ne $existing)
     if ($result.member_exists_initial) {
-        # The synthetic member already exists (a prior probe run). Stop; never write,
-        # update, or delete. The residual record must be reviewed manually.
         $result.synthetic_member_may_remain = $true
-        $result.terminal_outcome = "BLOCKED_MEMBER_EXISTS"
         throw "Synthetic member already exists; refusing to write. Review/remove it manually."
     }
 
@@ -339,12 +411,11 @@ try {
     $result.assignment_success = $true
     $result.expiry_date_assigned = $true
 
-    # ---- Fresh duplicate recheck immediately before the single save. ----
+    # ---- Fresh duplicate recheck immediately before claiming + saving. ----
     $recheck = $getMemberMethod.Invoke($memberCommand, @($script:SyntheticMemberNo))
     $result.member_exists_recheck = ($null -ne $recheck)
     if ($result.member_exists_recheck) {
         $result.synthetic_member_may_remain = $true
-        $result.terminal_outcome = "BLOCKED_MEMBER_EXISTS"
         throw "Synthetic member appeared on recheck; refusing to write."
     }
 
@@ -357,8 +428,22 @@ try {
     $result.save_member_method_found = ($null -ne $saveMemberMethod)
     if ($null -eq $saveMemberMethod) { throw "SaveMember member entity method was not found." }
 
+    # ---- Atomically claim the write (concurrency exclusion + permanent no-retry). ----
+    $claimContent = New-ExpiryProbeClaimContent -OperationId $operationId -ApprovalReference $ApprovalReference `
+        -TargetFingerprint $targetFingerprint -SyntheticFingerprint $syntheticFingerprint `
+        -AttemptFingerprint $attemptFingerprint -IntendedExpiry $script:SyntheticExpiryDate
+    try {
+        New-ExpiryProbeDurableArtifact -Path $claimPath -Content $claimContent
+        $result.claim_created = $true
+    }
+    catch {
+        # Another launch won the race (or a prior claim exists): fail closed, no save.
+        $result.claim_conflict = $true
+        $result.synthetic_member_may_remain = $true
+        throw "The attempt claim could not be created exclusively; refusing to write."
+    }
+
     # ---- The single irreversible SaveMember. No retry after this begins. ----
-    # From this point a synthetic member may exist in AutoCount regardless of outcome.
     $result.synthetic_member_may_remain = $true
     $result.save_member_attempted = $true
     try {
@@ -367,41 +452,38 @@ try {
         $result.save_outcome = "confirmed"
     }
     catch {
-        # The call began; we cannot prove whether the write committed. This is terminal
-        # and is never retried. Do not delete, update, or roll back anything.
+        # The call began; we cannot prove whether the write committed. Terminal, never
+        # retried. Do not delete, update, or roll back anything.
         $result.save_outcome = "uncertain"
-        $result.terminal_outcome = "SAVE_UNCERTAIN"
         $result.error = [ordered]@{ phase = "save"; message = "Save outcome could not be confirmed; not retried." }
-        throw "SaveMember outcome uncertain; terminal, not retried."
     }
 
-    # ---- GetMember read-back + explicit ExpiryDate normalisation/verification. ----
-    $readback = $getMemberMethod.Invoke($memberCommand, @($script:SyntheticMemberNo))
-    $result.readback_found = ($null -ne $readback)
-    if (-not $result.readback_found) {
-        $result.terminal_outcome = "READBACK_NOT_FOUND"
-    }
-    else {
-        $rbRowProp = Find-PublicProperty $readback.GetType() "Row"
-        $rbRow = $null
-        if ($null -ne $rbRowProp -and $rbRowProp.CanRead) { $rbRow = $rbRowProp.GetValue($readback, $null) }
-        $rbExpiryNormalized = Get-NormalizedDateValue (Get-RowRawValue $rbRow "ExpiryDate")
-        $expectedNormalized = Get-NormalizedDateValue $script:SyntheticExpiryDate
-        $result.expiry_date_readback_value = $rbExpiryNormalized
-        $result.expiry_date_readback_match = ($rbExpiryNormalized -eq $expectedNormalized -and -not [string]::IsNullOrEmpty($rbExpiryNormalized))
-        $result.terminal_outcome = if ($result.expiry_date_readback_match) { "EXPIRY_VERIFIED" } else { "EXPIRY_READBACK_MISMATCH" }
+    # ---- Read-back is isolated: a failure here NEVER downgrades a confirmed save. ----
+    if ($result.save_outcome -eq "confirmed") {
+        try {
+            $readback = $getMemberMethod.Invoke($memberCommand, @($script:SyntheticMemberNo))
+            $result.readback_found = ($null -ne $readback)
+            if ($result.readback_found) {
+                $rbRowProp = Find-PublicProperty $readback.GetType() "Row"
+                $rbRow = $null
+                if ($null -ne $rbRowProp -and $rbRowProp.CanRead) { $rbRow = $rbRowProp.GetValue($readback, $null) }
+                $rbExpiryNormalized = Get-ExpiryProbeNormalizedDate (Get-RowRawValue $rbRow "ExpiryDate")
+                $expectedNormalized = Get-ExpiryProbeNormalizedDate $script:SyntheticExpiryDate
+                $result.expiry_date_readback_value = $rbExpiryNormalized
+                $result.expiry_match = ($rbExpiryNormalized -eq $expectedNormalized -and -not [string]::IsNullOrEmpty($rbExpiryNormalized))
+            }
+        }
+        catch {
+            # Save is CONFIRMED; only the read-back failed. Preserve a sanitised reason.
+            $result.readback_found = $false
+            $result.readback_error = Get-SanitizedMessage $_.Exception.Message
+        }
     }
 }
 catch {
-    if ($null -eq $result.terminal_outcome) {
-        if ($result.save_member_attempted -and -not $result.save_member_confirmed) {
-            $result.save_outcome = "uncertain"
-            $result.terminal_outcome = "SAVE_UNCERTAIN"
-        }
-        else {
-            $result.terminal_outcome = "FAILED_BEFORE_WRITE"
-        }
-    }
+    # This handler is only reached for pre-save failures, an uncertain save, or a claim
+    # conflict. The terminal outcome is derived from flags in Complete-ExpiryProbeRun,
+    # so a confirmed-save-with-failed-read-back is NEVER classified here.
     if ($null -eq $result.error) {
         $result.error = [ordered]@{
             type    = $_.Exception.GetType().FullName
@@ -410,18 +492,11 @@ catch {
     }
 }
 finally {
-    [System.AppDomain]::CurrentDomain.remove_AssemblyResolve($assemblyResolveHandler)
+    if ($null -ne $assemblyResolveHandler) { [System.AppDomain]::CurrentDomain.remove_AssemblyResolve($assemblyResolveHandler) }
     Remove-Variable passwordForProbe -ErrorAction SilentlyContinue
 }
 
-# Emit sanitised aggregate evidence only: no raw synthetic member number, name, or
-# email is ever written to stdout or the JSON file.
-$safeJson = $result | ConvertTo-Json -Depth 8
-if (-not [string]::IsNullOrWhiteSpace($JsonOut)) {
-    $jsonOutPath = [System.IO.Path]::GetFullPath($JsonOut)
-    $jsonOutParent = [System.IO.Path]::GetDirectoryName($jsonOutPath)
-    if (-not [string]::IsNullOrWhiteSpace($jsonOutParent)) { New-Item -ItemType Directory -Path $jsonOutParent -Force | Out-Null }
-    Set-Content -LiteralPath $jsonOutPath -Value $safeJson -Encoding UTF8
-    Write-Host "Wrote sanitized ExpiryDate capability probe JSON to $jsonOutPath"
-}
-$safeJson
+# Persist durable, non-overwriting evidence (when the state directory was resolved),
+# emit sanitised JSON, and exit with the truthful code. Cleanup already ran in finally.
+Complete-ExpiryProbeRun -DurableEvidence:$stateReady -ResultPath $resultPath
+exit $script:ProbeExitCode

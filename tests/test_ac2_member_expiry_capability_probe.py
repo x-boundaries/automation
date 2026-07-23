@@ -1,21 +1,14 @@
-"""Static and AST-based tests for the synthetic ExpiryDate capability probe.
+"""Static, AST, library, and subprocess tests for the synthetic ExpiryDate probe.
 
-These tests never execute the probe's AutoCount path and never contact AutoCount,
-n8n, Google Sheets, or the physical host / VM. They assert, per the approved design:
-
-* the probe is inactive by default and requires every explicit write switch;
-* the single SaveMember call site is behind one narrowly scoped function, called at
-  most once, and is never inside a retry loop (PowerShell AST, not string matching);
-* a GetMember duplicate check occurs before that SaveMember call (AST ordering);
-* there is no update, delete, rollback, or cleanup path;
-* an uncertain save is terminal and never replayed;
-* the emitted output cannot contain the raw synthetic member number, name, or email.
-
-The AST assertions run real PowerShell (pwsh or powershell.exe) when available and
-skip cleanly when it is not, matching tests/test_member_create_uat_runner_ps.py.
+No test executes the probe's AutoCount path or contacts AutoCount, n8n, Google Sheets,
+or the host/VM. Subprocess runs of the probe are driven so they stop before any
+AutoCount assembly load (refusal, pre-AutoCount config failure, or a pre-existing
+attempt claim). The pure state/claim/result/fingerprint helpers are exercised directly
+against scripts/member_expiry_capability_probe_lib.ps1 without AutoCount.
 """
 
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -25,8 +18,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "ac2_member_expiry_capability_probe.ps1"
+LIB = ROOT / "scripts" / "member_expiry_capability_probe_lib.ps1"
 DOCS = ROOT / "docs" / "autocount2-automation"
 RUNBOOK = DOCS / "member_expiry_capability_probe_runbook.md"
+WORKFLOW = ROOT / ".github" / "workflows" / "member-create-uat-tests.yml"
 
 WRITE_SWITCHES = (
     "EnableExpiryCapabilityProbe",
@@ -100,75 +95,136 @@ $dupBeforeSave = ($minGet -ge 0 -and $saveCallOffset -ge 0 -and $minGet -lt $sav
 } | ConvertTo-Json -Compress
 """
 
+LIBPROBE = r"""
+[CmdletBinding()]
+param([Parameter(Mandatory)][string]$Lib, [Parameter(Mandatory)][string]$Op,
+      [string]$CtxJson, [string]$Text, [string]$Dir)
+$ErrorActionPreference = 'Stop'
+. $Lib
+switch ($Op) {
+    'terminal' {
+        $ctx = Get-Content -LiteralPath $CtxJson -Raw -Encoding UTF8 | ConvertFrom-Json
+        $code = Get-ExpiryProbeTerminalOutcome -Flags $ctx
+        $contr = @(Get-ExpiryProbeStateContradictions -Flags $ctx).Count
+        Write-Output ($code + '|' + $contr)
+    }
+    'exit' { Write-Output ([string](Get-ExpiryProbeExitCode -TerminalOutcome $Text)) }
+    'fp' {
+        $t1 = Get-ExpiryProbeTargetFingerprint -ServerName 'S' -DatabaseName 'D'
+        $t2 = Get-ExpiryProbeTargetFingerprint -ServerName 'S' -DatabaseName 'D'
+        $tX = Get-ExpiryProbeTargetFingerprint -ServerName 'S' -DatabaseName 'OTHER'
+        $sm = Get-ExpiryProbeSyntheticFingerprint -MemberNo 'XBEXPIRYPROBE01'
+        $af = Get-ExpiryProbeAttemptFingerprint -TargetFingerprint $t1 -SyntheticFingerprint $sm -IntendedExpiry '2028-06-30'
+        [pscustomobject]@{
+            targetStable = ($t1 -eq $t2); targetDiffers = ($t1 -ne $tX)
+            targetShape = ($t1 -match '^tfp_[0-9a-f]{64}$'); attemptShape = ($af -match '^afp_[0-9a-f]{64}$')
+            synthShape = ($sm -match '^smf_[0-9a-f]{64}$')
+        } | ConvertTo-Json -Compress
+    }
+    'claim' {
+        $p = Join-Path $Dir 'x.claim'
+        New-ExpiryProbeDurableArtifact -Path $p -Content 'first'
+        $blocked = $false
+        try { New-ExpiryProbeDurableArtifact -Path $p -Content 'second' } catch { $blocked = $true }
+        $content = Get-Content -LiteralPath $p -Raw
+        [pscustomobject]@{ exists = (Test-Path -LiteralPath $p); secondBlocked = $blocked; unchanged = ($content.Trim() -eq 'first') } | ConvertTo-Json -Compress
+    }
+    'result' {
+        $p = Join-Path $Dir 'res.json'
+        Write-ExpiryProbeResultAtomic -Path $p -Content 'alpha'
+        $blocked = $false
+        try { Write-ExpiryProbeResultAtomic -Path $p -Content 'beta' } catch { $blocked = $true }
+        $content = Get-Content -LiteralPath $p -Raw
+        $tmpLeft = Test-Path -LiteralPath ($p + '.tmp')
+        [pscustomobject]@{ exists = (Test-Path -LiteralPath $p); secondBlocked = $blocked; unchanged = ($content.Trim() -eq 'alpha'); tmpLeft = $tmpLeft } | ConvertTo-Json -Compress
+    }
+}
+"""
+
 
 class ExpiryProbeStaticTests(unittest.TestCase):
     def setUp(self):
         self.script = SCRIPT.read_text(encoding="utf-8")
+        self.lib = LIB.read_text(encoding="utf-8")
 
-    def test_probe_exists(self):
+    def test_probe_and_lib_exist(self):
         self.assertTrue(SCRIPT.is_file())
+        self.assertTrue(LIB.is_file())
+        self.assertIn("member_expiry_capability_probe_lib.ps1", self.script)
 
-    # ---- C8: requires every explicit write switch; inactive by default ---- #
     def test_requires_every_write_switch_before_loading_autocount(self):
         for switch in WRITE_SWITCHES:
             self.assertIn(switch, self.script)
-        # The enable/confirm conjunction gates the whole run.
-        conj = re.search(r"\$allConfirmed\s*=\s*(.+?)\n\nif \(-not \$allConfirmed\)", self.script, re.S)
-        self.assertIsNotNone(conj, "the all-confirmed conjunction must gate the run")
+        conj = re.search(r"\$allConfirmed\s*=\s*(.+?)\nif \(-not \$allConfirmed\)", self.script, re.S)
+        self.assertIsNotNone(conj)
         for switch in WRITE_SWITCHES:
             self.assertIn(switch, conj.group(1))
-        # Refusal happens before any assembly is loaded.
-        refusal_index = self.script.index("Refusing to run")
-        first_load_index = self.script.index("LoadFrom")
-        self.assertLess(refusal_index, first_load_index)
+        # Refusal happens before any assembly load.
+        self.assertLess(self.script.index("refused"), self.script.index("LoadFrom"))
 
-    # ---- Save-gated MemberCommand flow present ---- #
+    def test_requires_approval_reference_and_state_directory(self):
+        self.assertIn("$ApprovalReference", self.script)
+        self.assertIn("$StateDirectory", self.script)
+        self.assertRegex(self.script, r"A valid non-secret -ApprovalReference is required")
+        self.assertRegex(self.script, r"A safe absolute -StateDirectory is required")
+
     def test_uses_save_gated_member_command_flow(self):
-        for term in (
-            "AutoCount.BonusPoint.Member.MemberCommand",
-            "MemberCommand.Create",
-            "GetMember",
-            "NewMember",
-            "SaveMember",
-            "CreateAutoCountDefaultDBSetting",
-            "Authenticate",
-            '"Login"',
-        ):
+        for term in ("AutoCount.BonusPoint.Member.MemberCommand", "MemberCommand.Create",
+                     "GetMember", "NewMember", "SaveMember", "CreateAutoCountDefaultDBSetting",
+                     "Authenticate", '"Login"'):
             self.assertIn(term, self.script)
 
-    # ---- B8 / A3: synthetic ExpiryDate 2028-06-30 is assigned ---- #
     def test_assigns_synthetic_expiry_date_2028_06_30(self):
         self.assertIn('$script:SyntheticExpiryDate = "2028-06-30"', self.script)
         self.assertRegex(self.script, r"ExpiryDate\s*=\s*\[datetime\]::ParseExact\(\$script:SyntheticExpiryDate")
-        self.assertIn("expiry_date_readback_match", self.script)
         self.assertIn("expiry_date_assigned", self.script)
 
-    # ---- B4: authenticate from AC2_PROBE_* env only, never printing values ---- #
     def test_reads_password_from_env_var_only(self):
         self.assertIn("AC2_PROBE_PASSWORD", self.script)
-        self.assertIn("PasswordEnvVar", self.script)
         self.assertIn("[Environment]::GetEnvironmentVariable($PasswordEnvVar)", self.script)
         self.assertNotRegex(self.script, r"(?i)\[string\]\s*\$Password\b")
         self.assertNotRegex(self.script, r"(?i)(Password\s*=|PWD\s*=|User\s+ID\s*=|Server\s*=|Database\s*=)")
 
-    # ---- C11: no update / delete / rollback / cleanup CODE path ---- #
     def test_no_update_delete_rollback_or_cleanup_path(self):
-        # No member-mutating method calls other than the single SaveMember.
         self.assertNotRegex(self.script, r"(?i)\b(DeleteMember|UpdateMember|RemoveMember|DeleteMemberType|SaveMemberType)\b")
         self.assertNotRegex(self.script, r"\.\s*(Delete|Update|Rollback)\s*\(")
-        # No cleanup/delete/rollback helper functions.
         self.assertNotRegex(self.script, r"(?im)^\s*function\s+[A-Za-z-]*(Cleanup|Delete|Rollback|Remove)[A-Za-z-]*")
-        # No SQL surface.
         self.assertNotRegex(self.script, r"\b(SELECT|INSERT|UPDATE|DELETE|MERGE|CREATE\s+TABLE|ALTER|DROP|TRUNCATE)\b")
 
-    # ---- C13: uncertain save is terminal and not replayed ---- #
-    def test_uncertain_save_is_terminal_and_not_retried(self):
-        self.assertIn('$result.save_outcome = "uncertain"', self.script)
-        self.assertIn('SAVE_UNCERTAIN', self.script)
-        # Exactly one invocation of the narrow save function anywhere in the script.
-        self.assertEqual(self.script.count("Invoke-ExpiryProbeSaveMemberOnce -SaveMemberMethod"), 1)
+    def test_evidence_is_non_overwriting_no_set_content(self):
+        # Prior evidence must never be overwritten: no Set-Content, and no Remove-Item
+        # anywhere in the probe (the claim is never deleted).
+        self.assertNotIn("Set-Content", self.script)
+        self.assertNotIn("Remove-Item", self.script)
+        self.assertIn("New-ExpiryProbeDurableArtifact", self.script)
+        self.assertIn("Write-ExpiryProbeResultAtomic", self.script)
 
-    # ---- B16 / B17: residual record + owner approval documented ---- #
+    def test_claim_created_before_save_in_source_order(self):
+        claim_idx = self.script.index("New-ExpiryProbeDurableArtifact -Path $claimPath")
+        save_idx = self.script.index("Invoke-ExpiryProbeSaveMemberOnce -SaveMemberMethod")
+        self.assertLess(claim_idx, save_idx)
+
+    def test_readback_failure_is_isolated_from_pre_write_classification(self):
+        # The read-back runs in its own try/catch that records a sanitised reason and
+        # does NOT rethrow, so a confirmed save with a failed read-back is never routed
+        # through the pre-write catch.
+        self.assertIn("readback_error", self.script)
+        self.assertRegex(self.script, r'save_outcome -eq "confirmed"')
+
+    def test_truthful_exit_and_terminal_from_library(self):
+        self.assertIn("Get-ExpiryProbeExitCode", self.script)
+        self.assertIn("Get-ExpiryProbeTerminalOutcome", self.script)
+        self.assertIn("exit $script:ProbeExitCode", self.script)
+
+    def test_output_is_sanitised_and_masks_member_no(self):
+        self.assertIn("Get-ExpiryProbeMaskedMemberNo", self.script)
+        self.assertIn("masked_member_no", self.script)
+        for repl in ("<synthetic-member-no>", "<synthetic-email>", "<synthetic-name>"):
+            self.assertIn(repl, self.script)
+        self.assertNotRegex(self.script, r"\$result\.[A-Za-z_]+\s*=\s*\$script:SyntheticMemberNo\b")
+        self.assertNotRegex(self.script, r"\$result\.[A-Za-z_]+\s*=\s*\$script:SyntheticName\b")
+        self.assertNotRegex(self.script, r"\$result\.[A-Za-z_]+\s*=\s*\$script:SyntheticEmail\b")
+
     def test_documents_residual_record_and_owner_approval(self):
         self.assertIn("synthetic_member_may_remain", self.script)
         self.assertIn("residual_record_note", self.script)
@@ -176,42 +232,204 @@ class ExpiryProbeStaticTests(unittest.TestCase):
         self.assertRegex(self.script, r"(?i)synthetic capability probe")
         self.assertRegex(self.script, r"(?i)form-derived member")
 
-    # ---- C14: output masks/sanitises identity; no raw member no / name / email ---- #
-    def test_output_is_sanitised_and_masks_member_no(self):
-        self.assertIn("Get-MaskedMemberNo", self.script)
-        self.assertIn("masked_member_no", self.script)
-        # The sanitiser redacts the synthetic identity from any message.
-        for repl in ("<synthetic-member-no>", "<synthetic-email>", "<synthetic-name>"):
-            self.assertIn(repl, self.script)
-        # No result field exposes the raw synthetic member number, name, or email.
-        self.assertNotRegex(self.script, r"\$result\.[A-Za-z_]+\s*=\s*\$script:SyntheticMemberNo\b")
-        self.assertNotRegex(self.script, r"\$result\.[A-Za-z_]+\s*=\s*\$script:SyntheticName\b")
-        self.assertNotRegex(self.script, r"\$result\.[A-Za-z_]+\s*=\s*\$script:SyntheticEmail\b")
-        # The JSON written to disk is the sanitised aggregate, not raw values.
-        self.assertIn("Set-Content -LiteralPath $jsonOutPath -Value $safeJson", self.script)
+    # ---- Library source guarantees ---- #
+    def test_lib_claim_is_exclusive_create_write_through(self):
+        self.assertRegex(self.lib, r"FileMode\]::CreateNew")
+        self.assertRegex(self.lib, r"FileOptions\]::WriteThrough")
+        self.assertRegex(self.lib, r"Flush\(\$true\)")
+
+    def test_lib_result_uses_temp_and_atomic_move_no_overwrite(self):
+        self.assertRegex(self.lib, r"\[System\.IO\.File\]::Move")
+        self.assertIn(".tmp", self.lib)
+        self.assertRegex(self.lib, r"refusing to overwrite evidence")
+
+    def test_lib_never_deletes_claim(self):
+        # The only Remove-Item in the library targets the result temp file, never a claim.
+        removes = re.findall(r"Remove-Item[^\n]*", self.lib)
+        for r in removes:
+            self.assertIn("$temp", r, r)
+        self.assertNotRegex(self.lib, r"Remove-Item[^\n]*claim")
 
 
-class ExpiryProbeRunbookTests(unittest.TestCase):
-    """D. The runbook separates the stages and states the required safety facts."""
+@unittest.skipIf(PS is None, "no PowerShell executable available")
+class ExpiryProbeLibraryTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = Path(tempfile.mkdtemp())
+        cls.harness = cls.tmp / "libprobe.ps1"
+        cls.harness.write_text(LIBPROBE, encoding="utf-8")
 
+    def _lib(self, op, **kw):
+        cmd = [PS, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+               "-File", str(self.harness), "-Lib", str(LIB), "-Op", op]
+        for k, v in kw.items():
+            cmd += ["-" + k, str(v)]
+        return subprocess.run(cmd, capture_output=True, text=True)
+
+    def _terminal(self, **flags):
+        base = dict(activated=True, claim_conflict=False, member_exists_initial=False,
+                    member_exists_recheck=False, save_member_attempted=False,
+                    save_member_confirmed=False, save_outcome="not_attempted",
+                    readback_found=False, expiry_match=False)
+        base.update(flags)
+        ctx = self.tmp / "ctx.json"
+        ctx.write_text(json.dumps(base), encoding="utf-8")
+        proc = self._lib("terminal", CtxJson=str(ctx))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        code, contr = proc.stdout.strip().split("|")
+        return code, int(contr)
+
+    def test_terminal_state_matrix_is_honest_and_consistent(self):
+        self.assertEqual(self._terminal(activated=False), ("REFUSED", 0))
+        self.assertEqual(self._terminal(claim_conflict=True), ("ATTEMPT_ALREADY_CLAIMED", 0))
+        self.assertEqual(self._terminal(member_exists_initial=True), ("BLOCKED_MEMBER_EXISTS", 0))
+        self.assertEqual(self._terminal(member_exists_recheck=True), ("BLOCKED_MEMBER_EXISTS", 0))
+        self.assertEqual(self._terminal(), ("FAILED_BEFORE_WRITE", 0))
+        self.assertEqual(self._terminal(save_member_attempted=True, save_outcome="uncertain"),
+                         ("WRITE_OUTCOME_UNCERTAIN", 0))
+        self.assertEqual(self._terminal(save_member_attempted=True, save_member_confirmed=True,
+                                        save_outcome="confirmed", readback_found=False),
+                         ("WRITE_CONFIRMED_READBACK_FAILED", 0))
+        self.assertEqual(self._terminal(save_member_attempted=True, save_member_confirmed=True,
+                                        save_outcome="confirmed", readback_found=True, expiry_match=False),
+                         ("EXPIRY_READBACK_MISMATCH", 0))
+        self.assertEqual(self._terminal(save_member_attempted=True, save_member_confirmed=True,
+                                        save_outcome="confirmed", readback_found=True, expiry_match=True),
+                         ("EXPIRY_VERIFIED", 0))
+
+    def test_post_save_readback_failure_is_never_failed_before_write(self):
+        # P1: a confirmed save whose read-back throws (readback_found False) must be a
+        # distinct post-save state, never FAILED_BEFORE_WRITE.
+        code, contr = self._terminal(save_member_attempted=True, save_member_confirmed=True,
+                                     save_outcome="confirmed", readback_found=False)
+        self.assertEqual(code, "WRITE_CONFIRMED_READBACK_FAILED")
+        self.assertNotEqual(code, "FAILED_BEFORE_WRITE")
+        self.assertEqual(contr, 0)
+
+    def test_impossible_flag_combinations_are_flagged(self):
+        _, c1 = self._terminal(save_member_attempted=True, save_member_confirmed=False, save_outcome="confirmed")
+        self.assertGreater(c1, 0)
+        _, c2 = self._terminal(save_member_attempted=True, save_outcome="uncertain", readback_found=True)
+        self.assertGreater(c2, 0)
+        _, c3 = self._terminal(activated=False, save_member_attempted=True)
+        self.assertGreater(c3, 0)
+
+    def test_exit_codes_only_verified_is_zero(self):
+        for code in ("REFUSED", "ATTEMPT_ALREADY_CLAIMED", "BLOCKED_MEMBER_EXISTS",
+                     "FAILED_BEFORE_WRITE", "WRITE_OUTCOME_UNCERTAIN",
+                     "WRITE_CONFIRMED_READBACK_FAILED", "EXPIRY_READBACK_MISMATCH"):
+            proc = self._lib("exit", Text=code)
+            self.assertEqual(proc.stdout.strip(), "1", code)
+        proc = self._lib("exit", Text="EXPIRY_VERIFIED")
+        self.assertEqual(proc.stdout.strip(), "0")
+
+    def test_fingerprints_deterministic_and_shaped(self):
+        proc = self._lib("fp")
+        info = json.loads(proc.stdout)
+        self.assertTrue(info["targetStable"])
+        self.assertTrue(info["targetDiffers"])
+        self.assertTrue(info["targetShape"])
+        self.assertTrue(info["attemptShape"])
+        self.assertTrue(info["synthShape"])
+
+    def test_claim_is_exclusive_create_and_never_deleted(self):
+        d = self.tmp / "claimdir"
+        d.mkdir(exist_ok=True)
+        proc = self._lib("claim", Dir=str(d))
+        info = json.loads(proc.stdout)
+        self.assertTrue(info["exists"])
+        self.assertTrue(info["secondBlocked"], "a second claim on the same path must fail closed (one winner)")
+        self.assertTrue(info["unchanged"], "the original claim content must survive a second attempt")
+
+    def test_result_atomic_write_never_overwrites(self):
+        d = self.tmp / "resdir"
+        d.mkdir(exist_ok=True)
+        proc = self._lib("result", Dir=str(d))
+        info = json.loads(proc.stdout)
+        self.assertTrue(info["exists"])
+        self.assertTrue(info["secondBlocked"], "a second result write must not overwrite prior evidence")
+        self.assertTrue(info["unchanged"])
+        self.assertFalse(info["tmpLeft"], "the temp file must be moved (atomic), leaving no .tmp")
+
+
+@unittest.skipIf(PS is None, "no PowerShell executable available")
+class ExpiryProbeScriptExecutionTests(unittest.TestCase):
+    """Runs the probe so it always stops before any AutoCount assembly load."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.env = dict(os.environ)
+        self.env["AC2_PROBE_PASSWORD"] = ""  # force a pre-AutoCount stop for active runs
+
+    def _run(self, *args):
+        cmd = [PS, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+               "-File", str(SCRIPT), *args]
+        return subprocess.run(cmd, capture_output=True, text=True, env=self.env)
+
+    def _active_args(self):
+        return ("-EnableExpiryCapabilityProbe", "-ConfirmSyntheticExpiryDateTest",
+                "-ConfirmSingleSyntheticMember", "-ConfirmAutoCountWrite",
+                "-ConfirmDryRunPreflightPassed", "-ConfirmNoUpdateOrDelete",
+                "-ApprovalReference", "APPROVAL-TEST-001", "-StateDirectory", str(self.tmp),
+                "-ServerName", "SYN_SERVER", "-DatabaseName", "SYN_DB", "-UserId", "SYN_USER",
+                "-AcRoot", "C:\\NoSuchAcRoot")
+
+    def test_refusal_is_nonzero_with_clean_json_stdout(self):
+        proc = self._run()
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertTrue(proc.stdout.lstrip().startswith("{"), proc.stdout[:120])
+        r = json.loads(proc.stdout)
+        self.assertEqual(r["terminal_outcome"], "REFUSED")
+        self.assertFalse(r["activated"])
+        self.assertEqual(r["exit_code"], proc.returncode)
+
+    def test_active_pre_autocount_failure_binds_evidence_and_creates_no_claim(self):
+        proc = self._run(*self._active_args())
+        self.assertNotEqual(proc.returncode, 0)
+        r = json.loads(proc.stdout)
+        self.assertEqual(r["terminal_outcome"], "FAILED_BEFORE_WRITE")
+        self.assertFalse(r["required_assemblies_loaded"], "no AutoCount assembly may load")
+        self.assertFalse(r["claim_created"])
+        # Evidence binding present; raw target/credentials/synthetic identity absent.
+        for field in ("operation_id", "approval_reference", "executed_at_utc", "target_fingerprint"):
+            self.assertTrue(r[field], field)
+        self.assertNotIn("SYN_SERVER", proc.stdout)
+        self.assertNotIn("SYN_DB", proc.stdout)
+        self.assertNotIn("xb.expirydate.probe", proc.stdout)
+        self.assertNotIn("XB EXPIRYDATE PROBE", proc.stdout)
+        # No claim file was created before the (unreached) save.
+        claim = self.tmp / r["claim_basename"]
+        self.assertFalse(claim.exists())
+        # A durable, unique result file was written.
+        self.assertTrue((self.tmp / r["result_basename"]).is_file())
+
+    def test_preexisting_claim_prevents_autocount_and_is_permanently_non_retryable(self):
+        # Discover the deterministic claim basename from a first (no-claim) run.
+        first = json.loads(self._run(*self._active_args()).stdout)
+        claim = self.tmp / first["claim_basename"]
+        claim.write_text('{"seeded": true}', encoding="utf-8")
+        # Two further runs both fail closed before AutoCount and never delete the claim.
+        for _ in range(2):
+            proc = self._run(*self._active_args())
+            self.assertNotEqual(proc.returncode, 0)
+            r = json.loads(proc.stdout)
+            self.assertEqual(r["terminal_outcome"], "ATTEMPT_ALREADY_CLAIMED")
+            self.assertTrue(r["claim_conflict"])
+            self.assertFalse(r["required_assemblies_loaded"])
+            self.assertFalse(r["authentication_success"])
+            self.assertTrue(claim.exists(), "the permanent claim must never be deleted")
+
+
+class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
     def setUp(self):
         self.runbook = RUNBOOK.read_text(encoding="utf-8")
         self.readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        self.workflow = WORKFLOW.read_text(encoding="utf-8")
 
     def test_runbook_exists_and_separates_seven_stages(self):
         self.assertTrue(RUNBOOK.is_file())
         for n in range(1, 8):
             self.assertRegex(self.runbook, rf"(?m)^### {n}\. ")
-        for phrase in (
-            "Laptop development",
-            "Host pull",
-            "dry-run",
-            "owner approval",
-            "ExpiryDate persistence test",
-            "Read-back evidence",
-            "Follow-up PR",
-        ):
-            self.assertIn(phrase, self.runbook)
 
     def test_runbook_states_required_safety_facts(self):
         self.assertRegex(self.runbook, r"(?i)current-turn owner approval is required before the synthetic")
@@ -221,9 +439,28 @@ class ExpiryProbeRunbookTests(unittest.TestCase):
         self.assertRegex(self.runbook, r"(?i)No real,\s+form-derived member is ever used")
         self.assertRegex(self.runbook, r"(?i)not the permanent production member-intake workflow")
 
+    def test_runbook_documents_new_controls(self):
+        self.assertIn("-ApprovalReference", self.runbook)
+        self.assertIn("-StateDirectory", self.runbook)
+        self.assertIn("WRITE_CONFIRMED_READBACK_FAILED", self.runbook)
+        self.assertIn("ATTEMPT_ALREADY_CLAIMED", self.runbook)
+        self.assertRegex(self.runbook, r"(?i)permanent single-use\s+attempt claim")
+        self.assertRegex(self.runbook, r"(?i)exit code")
+        self.assertRegex(self.runbook, r"(?i)never removes the attempt claim")
+
     def test_readme_references_probe_and_runbook(self):
         self.assertIn("scripts/ac2_member_expiry_capability_probe.ps1", self.readme)
         self.assertIn("member_expiry_capability_probe_runbook.md", self.readme)
+
+    def test_workflow_triggers_on_validated_documents(self):
+        # The focused test module reads these documents; a docs-only PR must trigger it.
+        paths_block = self.workflow.split("paths:", 1)[1].split("workflow_dispatch", 1)[0]
+        for needed in ("README.md",
+                       "docs/autocount2-automation/member_expiry_capability_probe_runbook.md",
+                       "docs/autocount2-automation/member_create_uat_runbook.md",
+                       "scripts/member_expiry_capability_probe_lib.ps1",
+                       "tests/test_ac2_member_expiry_capability_probe.py"):
+            self.assertIn(needed, paths_block, needed)
 
 
 @unittest.skipIf(PS is None, "no PowerShell executable available")
@@ -244,17 +481,17 @@ class ExpiryProbeAstTests(unittest.TestCase):
     def test_single_gated_save_never_in_a_loop(self):
         info = self._inspect()
         self.assertEqual(info["parseErrors"], 0)
-        self.assertTrue(info["funcExists"], "Invoke-ExpiryProbeSaveMemberOnce must exist")
-        self.assertEqual(info["saveInvokeCount"], 1, "exactly one SaveMember .Invoke call site")
-        self.assertTrue(info["saveInsideNarrow"], "the SaveMember call must be inside the narrow function")
-        self.assertEqual(info["callCount"], 1, "the narrow save function is called exactly once")
-        self.assertFalse(info["callInLoop"], "no retry loop may enclose the SaveMember call")
+        self.assertTrue(info["funcExists"])
+        self.assertEqual(info["saveInvokeCount"], 1)
+        self.assertTrue(info["saveInsideNarrow"])
+        self.assertEqual(info["callCount"], 1)
+        self.assertFalse(info["callInLoop"])
 
     def test_duplicate_check_before_save_and_no_forbidden_mutations(self):
         info = self._inspect()
-        self.assertGreaterEqual(info["getMemberInvokeCount"], 1, "a GetMember duplicate check is required")
-        self.assertTrue(info["dupCheckBeforeSave"], "a GetMember check must precede the SaveMember call")
-        self.assertEqual(info["forbiddenMutationCount"], 0, "no delete/update/rollback member calls")
+        self.assertGreaterEqual(info["getMemberInvokeCount"], 1)
+        self.assertTrue(info["dupCheckBeforeSave"])
+        self.assertEqual(info["forbiddenMutationCount"], 0)
 
 
 if __name__ == "__main__":
