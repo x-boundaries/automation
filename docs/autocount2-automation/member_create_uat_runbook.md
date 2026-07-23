@@ -49,11 +49,19 @@ agent or operator on the fly).
 | --- | --- | --- |
 | `MemberType` | `Default` | API-confirmed to exist by read-only browse, but business approval is still pending. |
 | `RegisterDate` | `2026-07-01` | Intended membership start date is not yet business-confirmed. |
-| `ExpiryDate` | `2028-06-30` | No proven AutoCount assignment/persistence path. Excluded from the assignment payload entirely and never assigned until proven, regardless of confirmation. |
+| `ExpiryDate` | `2028-06-30` | Part of the prepared intended assignment/read-back contract, but its AutoCount persistence is not yet proven. Excluded from the active assignment payload and never assigned until the capability flag is flipped after synthetic proof, regardless of confirmation. |
 | `OpeningPoints` | `0` | The field mapping states it must not be set by intake unless separately approved. |
 
-`ExpiryDate` is desired-only: it is recorded in the package for audit and covered by
-the fingerprint, but it is never part of the AutoCount assignment payload in this UAT.
+`ExpiryDate` is now part of the prepared intended assignment and read-back contract
+(`INTENDED_ASSIGNMENT_FIELDS` / `READBACK_VERIFICATION_FIELDS` in
+`scripts/member_create_uat_contract.py`, mirrored in the runner library), and the
+package still records it as a desired business field covered by the fingerprint and
+required to equal `2028-06-30`. It remains excluded from the **active** assignment
+payload and is never assigned while the code-level capability flag
+(`$script:CreateUatExpiryDateAssignmentImplemented`) is `false` and confirmations are
+`false`. Its persistence is proven separately by the synthetic
+[ExpiryDate capability probe](member_expiry_capability_probe_runbook.md) before any
+follow-up PR may flip the flag.
 
 ## Approval expiry
 

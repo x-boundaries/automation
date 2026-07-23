@@ -104,7 +104,7 @@
       }
     },
     "assignable_fields": {
-      "description": "Exact whitelist of fields the runner may assign to the AutoCount member. ExpiryDate is intentionally absent: it has no proven assignment or persistence path and must not enter the AutoCount payload until proven.",
+      "description": "Exact whitelist of fields the runner may ACTIVELY assign to the AutoCount member. ExpiryDate is intentionally absent from this active whitelist: it is part of the prepared INTENDED assignment contract (INTENDED_ASSIGNMENT_FIELDS in scripts/member_create_uat_contract.py) but remains gated by the code-level ExpiryDate capability flag and must not enter the AutoCount payload until its persistence is proven and the flag is flipped in a follow-up change.",
       "type": "array",
       "uniqueItems": true,
       "items": {
@@ -178,7 +178,7 @@
       }
     },
     "desired_business_fields": {
-      "description": "Business-desired values recorded for review and audit. These are NOT the assignment payload. ExpiryDate lives here and is never assigned while unconfirmed and unproven.",
+      "description": "Business-desired values recorded for review and audit. These are NOT the active assignment payload. ExpiryDate lives here, must equal the intended value 2028-06-30, and is covered by the fingerprint; it is part of the prepared intended assignment/read-back contract but is never actively assigned while its capability flag is false and confirmations are false.",
       "type": "object",
       "additionalProperties": false,
       "required": ["MemberType", "RegisterDate", "ExpiryDate", "OpeningPoints"],

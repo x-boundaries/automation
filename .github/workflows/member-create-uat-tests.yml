@@ -17,10 +17,12 @@ on:
       - "scripts/member_create_uat_*.py"
       - "scripts/ac2_member_create_uat_runner.ps1"
       - "scripts/member_create_uat_runner_lib.ps1"
+      - "scripts/ac2_member_expiry_capability_probe.ps1"
       - "schemas/member_create_uat_package.schema.json"
       - "config/member_create_uat_business_confirmation*.json"
       - "n8n-workflows/member_create_uat_result_mapping.workflow.json"
       - "tests/test_member_create_uat_*.py"
+      - "tests/test_ac2_member_expiry_capability_probe.py"
       - "tests/_create_uat_fixtures.py"
       - ".github/workflows/member-create-uat-tests.yml"
   workflow_dispatch: {}
@@ -41,7 +43,8 @@ jobs:
         run: |
           $files = @(
             "scripts/ac2_member_create_uat_runner.ps1",
-            "scripts/member_create_uat_runner_lib.ps1"
+            "scripts/member_create_uat_runner_lib.ps1",
+            "scripts/ac2_member_expiry_capability_probe.ps1"
           )
           $failed = $false
           foreach ($f in $files) {
@@ -59,7 +62,7 @@ jobs:
       - name: Focused create UAT tests
         shell: pwsh
         run: |
-          python -m unittest tests.test_member_create_uat_contract tests.test_member_create_uat_approval tests.test_member_create_uat_result_precheck tests.test_member_create_uat_runner_ps
+          python -m unittest tests.test_member_create_uat_contract tests.test_member_create_uat_approval tests.test_member_create_uat_result_precheck tests.test_member_create_uat_runner_ps tests.test_ac2_member_expiry_capability_probe
       - name: Full repository test suite (excludes the Docker/n8n live-import module)
         shell: pwsh
         # The n8n live-import dry-run module needs a Docker/n8n environment absent on
@@ -78,7 +81,8 @@ jobs:
         run: |
           $files = @(
             "scripts/ac2_member_create_uat_runner.ps1",
-            "scripts/member_create_uat_runner_lib.ps1"
+            "scripts/member_create_uat_runner_lib.ps1",
+            "scripts/ac2_member_expiry_capability_probe.ps1"
           )
           $failed = $false
           foreach ($f in $files) {
@@ -89,4 +93,4 @@ jobs:
           if ($failed) { exit 1 }
       - name: Focused create UAT tests (portable components)
         run: |
-          python -m unittest tests.test_member_create_uat_contract tests.test_member_create_uat_approval tests.test_member_create_uat_result_precheck tests.test_member_create_uat_runner_ps
+          python -m unittest tests.test_member_create_uat_contract tests.test_member_create_uat_approval tests.test_member_create_uat_result_precheck tests.test_member_create_uat_runner_ps tests.test_ac2_member_expiry_capability_probe

@@ -17,6 +17,7 @@ Task tracking, pending-work dashboards, completed-task logs, and personal planni
 - `scripts/ac2_member_no_save_schema_probe.ps1`: explicit opt-in local MemberCommand no-save schema probe for an in-memory MemberEntity only.
 - `scripts/ac2_member_no_save_assignment_probe.ps1`: explicit opt-in local MemberCommand fake-data no-save assignment probe for an in-memory MemberEntity row only.
 - `scripts/ac2_member_fake_create_probe.ps1`: explicitly gated local write probe that creates exactly one synthetic fake AutoCount member only after all write confirmations are supplied.
+- `scripts/ac2_member_expiry_capability_probe.ps1`: explicitly gated, inactive-by-default synthetic capability probe that creates exactly one synthetic member with `ExpiryDate=2028-06-30`, verifies the value after a `GetMember` read-back, and never updates, deletes, rolls back, or cleans up. It exists only to prove ExpiryDate persistence before the main creation UAT enables it; it requires owner approval naming the AutoCount target and one synthetic record, and any uncertain save is terminal and never retried. See [Synthetic ExpiryDate capability probe runbook](docs/autocount2-automation/member_expiry_capability_probe_runbook.md).
 - `scripts/ac2_member_browse_extract_review.ps1`: explicit opt-in read-only local member browse extract for migration reconciliation review; output contains PII and must not be committed.
 - `scripts/ac2_member_lookup_review.ps1`: explicit opt-in read-only local member lookup for future duplicate checking; the Windows AC2 lookup bridge should pass form values with `MemberNoBase64Utf8`, AC2 is source of truth, Google Form mobile/member number maps to AutoCount `MemberNo`, AutoCount `MobilePhone` is intentionally unused, and it does not create/update/delete members.
 - `scripts/ac2_member_lookup_bridge_worker.py`: disabled-by-default local polling worker skeleton for review-only AC2 member lookup bridge design; fixture/mock mode models the first Google Sheets UAT queue in fixture-only mode with source-agnostic fields for a future custom intake surface, without real Google API calls, PowerShell lookup mode is separately opt-in, and it never writes to AutoCount.
@@ -88,6 +89,7 @@ Raw CSVs and member browse extracts stay local and must not be committed. Member
 - [AC2 member no-save schema probe runbook](docs/autocount2-automation/member_no_save_schema_probe_runbook.md)
 - [AC2 member no-save assignment probe runbook](docs/autocount2-automation/member_no_save_assignment_probe_runbook.md)
 - [AC2 member fake create probe runbook](docs/autocount2-automation/member_fake_create_probe_runbook.md)
+- [Synthetic ExpiryDate capability probe runbook](docs/autocount2-automation/member_expiry_capability_probe_runbook.md)
 - [AC2 member browse extract review runbook](docs/autocount2-automation/member_browse_extract_review_runbook.md)
 - [AC2 member lookup review runbook](docs/autocount2-automation/member_lookup_review_runbook.md)
 - [Member intake local lookup bridge runbook](docs/autocount2-automation/member_intake_local_lookup_bridge_runbook.md)

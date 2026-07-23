@@ -307,6 +307,104 @@ class SchemaEquivalentValidationTests(unittest.TestCase):
         self.assertIn("approval_field_set_mismatch", reasons)
 
 
+class ExpiryDateContractPreparationTests(unittest.TestCase):
+    """A. Main UAT contract preparation for ExpiryDate.
+
+    ExpiryDate is added to the prepared INTENDED assignment/read-back contract with the
+    exact value 2028-06-30, while the code-level capability flag stays False, the active
+    ASSIGNABLE_FIELDS still exclude it, and every business confirmation stays False.
+    """
+
+    LIB_PS = ROOT / "scripts" / "member_create_uat_runner_lib.ps1"
+
+    def _rebuild_hash(self, pkg):
+        pkg["payload_hash"] = contract.compute_payload_hash(pkg)
+        pkg["approval"]["bound_package_payload_hash"] = pkg["payload_hash"]
+        return pkg
+
+    # ---- A1: intended assignment contract includes ExpiryDate ---- #
+    def test_expiry_date_in_intended_assignment_fields(self):
+        self.assertIn("ExpiryDate", contract.INTENDED_ASSIGNMENT_FIELDS)
+        # The intended set is exactly the active whitelist plus the never-assign set,
+        # keeping the active/intended relationship explicit for a clean follow-up flip.
+        self.assertEqual(
+            sorted(contract.INTENDED_ASSIGNMENT_FIELDS),
+            sorted(tuple(contract.ASSIGNABLE_FIELDS) + tuple(contract.NEVER_ASSIGN_FIELDS)),
+        )
+
+    # ---- A2: read-back comparison contract includes ExpiryDate ---- #
+    def test_expiry_date_in_readback_verification_fields(self):
+        self.assertIn("ExpiryDate", contract.READBACK_VERIFICATION_FIELDS)
+
+    # ---- A3: exact intended value is 2028-06-30 ---- #
+    def test_expiry_intended_value_is_exact(self):
+        self.assertEqual(contract.EXPIRYDATE_INTENDED_VALUE, "2028-06-30")
+        self.assertEqual(contract.INTENDED_BUSINESS_VALUES["ExpiryDate"], "2028-06-30")
+
+    # ---- A5: code-level capability flag remains False ---- #
+    def test_capability_flag_remains_false(self):
+        self.assertFalse(contract.EXPIRYDATE_ASSIGNMENT_IMPLEMENTED)
+        # And ExpiryDate is still excluded from the ACTIVE assignment whitelist / payload.
+        self.assertNotIn("ExpiryDate", contract.ASSIGNABLE_FIELDS)
+        self.assertIn("ExpiryDate", contract.NEVER_ASSIGN_FIELDS)
+
+    def test_powershell_lib_mirrors_intended_contract_and_capability_flag(self):
+        lib = self.LIB_PS.read_text(encoding="utf-8")
+        self.assertIn("$script:CreateUatIntendedAssignmentFields", lib)
+        self.assertIn("$script:CreateUatReadbackVerificationFields", lib)
+        self.assertIn('$script:CreateUatExpiryDateIntendedValue = "2028-06-30"', lib)
+        # The capability flag must remain explicitly false in the PowerShell source.
+        self.assertRegex(lib, r"\$script:CreateUatExpiryDateAssignmentImplemented\s*=\s*\$false")
+
+    # ---- A4: missing / malformed / different / extra ExpiryDate fail closed ---- #
+    def test_missing_expiry_date_fails_closed(self):
+        pkg = fx.build_valid_package()
+        del pkg["desired_business_fields"]["ExpiryDate"]
+        ok, reasons = contract.validate_package(pkg)
+        self.assertFalse(ok)
+        self.assertIn("desired_business_fields_mismatch", reasons)
+
+    def test_malformed_expiry_date_fails_closed(self):
+        pkg = fx.build_valid_package()
+        pkg["desired_business_fields"]["ExpiryDate"] = "2028-13-40"
+        self._rebuild_hash(pkg)
+        ok, reasons = contract.validate_package(pkg)
+        self.assertFalse(ok)
+        self.assertIn("desired_expiry_date_invalid", reasons)
+
+    def test_different_expiry_date_fails_closed(self):
+        pkg = fx.build_valid_package()
+        pkg["desired_business_fields"]["ExpiryDate"] = "2099-01-01"
+        self._rebuild_hash(pkg)
+        ok, reasons = contract.validate_package(pkg)
+        self.assertFalse(ok)
+        self.assertIn("desired_ExpiryDate_not_intended", reasons)
+
+    def test_extra_expiry_date_in_active_payload_fails_closed(self):
+        pkg = fx.build_valid_package()
+        pkg["member_payload"]["ExpiryDate"] = contract.EXPIRYDATE_INTENDED_VALUE
+        ok, reasons = contract.validate_package(pkg)
+        self.assertFalse(ok)
+        self.assertIn("member_payload_field_set_mismatch", reasons)
+
+    # ---- A2/read-back: an ExpiryDate mismatch cannot yield CREATED_VERIFIED ---- #
+    def test_readback_expiry_mismatch_cannot_be_created_verified(self):
+        # With ExpiryDate in the read-back verification set, a mismatch drives the
+        # terminal code to CREATED_READBACK_MISMATCH, never CREATED_VERIFIED.
+        code, contr = contract.recompute_terminal_state(_write_flags(readback_match=False))
+        self.assertEqual(code, "CREATED_READBACK_MISMATCH")
+        self.assertNotEqual(code, "CREATED_VERIFIED")
+        self.assertEqual(contr, [])
+
+    # ---- A6: business confirmations remain false ---- #
+    def test_committed_business_confirmations_all_false_including_expiry(self):
+        data = json.loads(BUSINESS_CONFIG.read_text(encoding="utf-8"))
+        confirmations = data["confirmations"]
+        for field in contract.BUSINESS_CONFIRMATION_REQUIRED:
+            self.assertIs(confirmations[field]["confirmed"], False, field)
+        self.assertIs(confirmations["ExpiryDate"]["confirmed"], False)
+
+
 class TerminalCodeTests(unittest.TestCase):
     def test_required_codes_present(self):
         for code in (

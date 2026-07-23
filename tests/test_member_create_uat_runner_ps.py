@@ -161,6 +161,37 @@ switch ($Op) {
         $mBad = Test-CreateUatReadbackMatch -Assigned $assigned -Readback $bad
         [pscustomobject]@{ goodMatch = $mGood.Match; badMatch = $mBad.Match; badMismatches = ($mBad.Mismatches -join ',') } | ConvertTo-Json -Compress
     }
+    'expirycontract' {
+        [pscustomobject]@{
+            intendedHasExpiry     = ($script:CreateUatIntendedAssignmentFields -contains 'ExpiryDate')
+            readbackHasExpiry     = ($script:CreateUatReadbackVerificationFields -contains 'ExpiryDate')
+            activeHasExpiry       = ($script:CreateUatAssignableFields -contains 'ExpiryDate')
+            capabilityImplemented = [bool]$script:CreateUatExpiryDateAssignmentImplemented
+            intendedValue         = [string]$script:CreateUatExpiryDateIntendedValue
+        } | ConvertTo-Json -Compress
+    }
+    'readbackexpiry' {
+        # ExpiryDate is part of the read-back verification set. A matching ExpiryDate
+        # (date vs string representation) normalises to a match; a wrong ExpiryDate
+        # makes the whole comparison fail so it can never yield CREATED_VERIFIED.
+        $assigned = [ordered]@{
+            MemberNo = '659EXPIRY01'; MemberType = 'Default'; Name = 'Synthetic Expiry'
+            EmailAddress = 'e@example.invalid'
+            RegisterDate = [datetime]::ParseExact('2026-07-01', 'yyyy-MM-dd', [System.Globalization.CultureInfo]::InvariantCulture)
+            ExpiryDate = [datetime]::ParseExact('2028-06-30', 'yyyy-MM-dd', [System.Globalization.CultureInfo]::InvariantCulture)
+        }
+        $good = @{
+            MemberNo = '659EXPIRY01'; MemberType = 'Default'; Name = 'Synthetic Expiry'
+            EmailAddress = 'e@example.invalid'
+            RegisterDate = [datetime]'2026-07-01T00:00:00'; ExpiryDate = [datetime]'2028-06-30T00:00:00'
+        }
+        $bad = @{}
+        foreach ($k in $good.Keys) { $bad[$k] = $good[$k] }
+        $bad['ExpiryDate'] = [datetime]'2099-01-01T00:00:00'
+        $mGood = Test-CreateUatReadbackMatch -Assigned $assigned -Readback $good
+        $mBad = Test-CreateUatReadbackMatch -Assigned $assigned -Readback $bad
+        [pscustomobject]@{ goodMatch = $mGood.Match; badMatch = $mBad.Match; badMismatches = ($mBad.Mismatches -join ',') } | ConvertTo-Json -Compress
+    }
 }
 """
 
@@ -341,6 +372,30 @@ class PowerShellRunnerTests(unittest.TestCase):
         self.assertTrue(info["goodMatch"], "date/decimal/blank/bool representations must normalise to a match")
         self.assertFalse(info["badMatch"])
         self.assertIn("Name", info["badMismatches"])
+
+    # ---- ExpiryDate prepared contract (PowerShell library mirror) ---- #
+    def test_lib_intended_contract_includes_expiry_but_active_excludes_it(self):
+        proc = self._ps(self.probe, "-Lib", str(LIB), "-Op", "expirycontract")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        info = json.loads(proc.stdout)
+        self.assertTrue(info["intendedHasExpiry"], "intended assignment contract must include ExpiryDate")
+        self.assertTrue(info["readbackHasExpiry"], "read-back verification contract must include ExpiryDate")
+        self.assertFalse(info["activeHasExpiry"], "active assignable whitelist must still exclude ExpiryDate")
+        self.assertFalse(info["capabilityImplemented"], "capability flag must remain false")
+        self.assertEqual(info["intendedValue"], "2028-06-30")
+
+    def test_readback_expiry_mismatch_fails_and_cannot_verify(self):
+        proc = self._ps(self.probe, "-Lib", str(LIB), "-Op", "readbackexpiry", "-Dir", str(self.tmp))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        info = json.loads(proc.stdout)
+        self.assertTrue(info["goodMatch"], "a correct ExpiryDate read-back must normalise to a match")
+        self.assertFalse(info["badMatch"], "a wrong ExpiryDate read-back must not match")
+        self.assertIn("ExpiryDate", info["badMismatches"])
+        # A non-match feeds readback_match=False, which the terminal table maps to
+        # CREATED_READBACK_MISMATCH (never CREATED_VERIFIED).
+        code, contr = self._terminal(**self._w(readback_match=False))
+        self.assertEqual(code, "CREATED_READBACK_MISMATCH")
+        self.assertEqual(contr, 0)
 
     # ---- Durable recovery (finding 2): none permits an automatic second save ---- #
     def _seed_marker(self, state_dir, name, package):
