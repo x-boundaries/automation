@@ -109,14 +109,29 @@ switch ($Op) {
         Write-Output ($code + '|' + $contr)
     }
     'exit' { Write-Output ([string](Get-ExpiryProbeExitCode -TerminalOutcome $Text)) }
-    'exitNoEvidence' { Write-Output ([string](Get-ExpiryProbeExitCode -TerminalOutcome $Text -EvidencePersisted:$false)) }
+    'final' {
+        # $Text = "underlying|durableRequired(0/1)|evidencePersisted(0/1)"
+        $parts = $Text.Split('|')
+        $o = Get-ExpiryProbeFinalOutcome -UnderlyingOutcome $parts[0] -DurableRequired ([bool][int]$parts[1]) -EvidencePersisted ([bool][int]$parts[2])
+        Write-Output ($o + '|' + (Get-ExpiryProbeExitCode -TerminalOutcome $o))
+    }
+    'redact' { Write-Output (Get-ExpiryProbePathRedacted -Text $Text) }
+    'badclaim' {
+        # Inject a durable persistence failure: a path under a non-existent directory
+        # cannot be created, so New-ExpiryProbeDurableArtifact must throw and leave no
+        # usable artefact (proving failures propagate, never a silent success).
+        $bad = Join-Path (Join-Path $Dir 'no_such_dir') 'x.claim'
+        $threw = $false
+        try { New-ExpiryProbeDurableArtifact -Path $bad -Content 'x' } catch { $threw = $true }
+        [pscustomobject]@{ threw = $threw; exists = (Test-Path -LiteralPath $bad) } | ConvertTo-Json -Compress
+    }
     'fp' {
         $t1 = Get-ExpiryProbeTargetFingerprint -ServerName 'S' -DatabaseName 'D'
         $t2 = Get-ExpiryProbeTargetFingerprint -ServerName 'S' -DatabaseName 'D'
         $tX = Get-ExpiryProbeTargetFingerprint -ServerName 'S' -DatabaseName 'OTHER'
-        # Casing variants of the same case-insensitive target must collapse to one key.
+        # Casing AND surrounding-whitespace variants of the same target must collapse.
         $tUpper = Get-ExpiryProbeTargetFingerprint -ServerName 'SERVER\INSTANCE' -DatabaseName 'AED_DB'
-        $tLower = Get-ExpiryProbeTargetFingerprint -ServerName 'server\instance' -DatabaseName 'aed_db'
+        $tLower = Get-ExpiryProbeTargetFingerprint -ServerName '  server\instance ' -DatabaseName ' aed_db '
         $afU = Get-ExpiryProbeAttemptFingerprint -TargetFingerprint $tUpper -SyntheticFingerprint (Get-ExpiryProbeSyntheticFingerprint -MemberNo 'XBEXPIRYPROBE01') -IntendedExpiry '2028-06-30'
         $afL = Get-ExpiryProbeAttemptFingerprint -TargetFingerprint $tLower -SyntheticFingerprint (Get-ExpiryProbeSyntheticFingerprint -MemberNo 'XBEXPIRYPROBE01') -IntendedExpiry '2028-06-30'
         $sm = Get-ExpiryProbeSyntheticFingerprint -MemberNo 'XBEXPIRYPROBE01'
@@ -125,7 +140,7 @@ switch ($Op) {
             targetStable = ($t1 -eq $t2); targetDiffers = ($t1 -ne $tX)
             targetShape = ($t1 -match '^tfp_[0-9a-f]{64}$'); attemptShape = ($af -match '^afp_[0-9a-f]{64}$')
             synthShape = ($sm -match '^smf_[0-9a-f]{64}$')
-            caseInsensitiveTarget = ($tUpper -eq $tLower); caseInsensitiveAttempt = ($afU -eq $afL)
+            caseWsInsensitiveTarget = ($tUpper -eq $tLower); caseWsInsensitiveAttempt = ($afU -eq $afL)
         } | ConvertTo-Json -Compress
     }
     'claim' {
@@ -172,7 +187,7 @@ class ExpiryProbeStaticTests(unittest.TestCase):
     def test_requires_approval_reference_and_state_directory(self):
         self.assertIn("$ApprovalReference", self.script)
         self.assertIn("$StateDirectory", self.script)
-        self.assertRegex(self.script, r"A valid non-secret -ApprovalReference is required")
+        self.assertRegex(self.script, r"-ApprovalReference is required")
         self.assertRegex(self.script, r"A safe absolute -StateDirectory is required")
 
     def test_uses_save_gated_member_command_flow(self):
@@ -273,7 +288,35 @@ class ExpiryProbeStaticTests(unittest.TestCase):
         self.assertRegex(self.script, r"\$result\.evidence_persisted\s*=\s*\$false")
 
     def test_claim_durability_failure_fails_closed_before_save(self):
-        self.assertIn("could not be durably created", self.script)
+        self.assertIn("could not be durably persisted", self.script)
+
+    def test_claim_persistence_failure_is_distinct_from_conflict(self):
+        # A post-create persistence failure sets claim_persist_failed (distinct outcome),
+        # NOT claim_conflict, and does not imply another save attempt.
+        self.assertIn("claim_persist_failed", self.script)
+        self.assertIn("post-create-persist-failed", self.script)
+        self.assertIn("post-create-persist-failed", self.lib)
+
+    def test_evidence_persisted_is_pessimistic_and_underlying_retained(self):
+        self.assertRegex(self.script, r"evidence_persisted\s*=\s*\$false")
+        self.assertIn("underlying_terminal_outcome", self.script)
+        self.assertIn("EVIDENCE_PERSISTENCE_FAILED", self.lib)
+
+    def test_approval_reference_alphabet_is_strict_and_rejects_target(self):
+        self.assertIn("'^[A-Za-z0-9._-]{3,64}$'", self.script)
+        # Case-insensitive rejection if the reference embeds the server/database name.
+        self.assertRegex(self.script, r"must not contain the server or database")
+        self.assertIn("ToLowerInvariant()", self.script)
+
+    def test_sanitizer_redacts_runtime_paths(self):
+        self.assertIn("Get-ExpiryProbePathRedacted", self.script)
+        self.assertIn("Get-ExpiryProbePathRedacted", self.lib)
+        # The state directory, AutoCount root, and JsonOut are redaction inputs.
+        self.assertRegex(self.script, r"\$StateDirectory,\s*\$AcRoot,\s*\$JsonOut")
+
+    def test_lib_flush_only_falls_back_on_unsupported_and_tags_persist_failures(self):
+        self.assertRegex(self.lib, r"catch \[System\.NotSupportedException\]")
+        self.assertRegex(self.lib, r"ExpiryProbePostCreatePersistTag")
 
 
 @unittest.skipIf(PS is None, "no PowerShell executable available")
@@ -292,10 +335,10 @@ class ExpiryProbeLibraryTests(unittest.TestCase):
         return subprocess.run(cmd, capture_output=True, text=True)
 
     def _terminal(self, **flags):
-        base = dict(activated=True, claim_conflict=False, member_exists_initial=False,
-                    member_exists_recheck=False, save_member_attempted=False,
-                    save_member_confirmed=False, save_outcome="not_attempted",
-                    readback_found=False, expiry_match=False)
+        base = dict(activated=True, claim_conflict=False, claim_persist_failed=False,
+                    member_exists_initial=False, member_exists_recheck=False,
+                    save_member_attempted=False, save_member_confirmed=False,
+                    save_outcome="not_attempted", readback_found=False, expiry_match=False)
         base.update(flags)
         ctx = self.tmp / "ctx.json"
         ctx.write_text(json.dumps(base), encoding="utf-8")
@@ -307,6 +350,7 @@ class ExpiryProbeLibraryTests(unittest.TestCase):
     def test_terminal_state_matrix_is_honest_and_consistent(self):
         self.assertEqual(self._terminal(activated=False), ("REFUSED", 0))
         self.assertEqual(self._terminal(claim_conflict=True), ("ATTEMPT_ALREADY_CLAIMED", 0))
+        self.assertEqual(self._terminal(claim_persist_failed=True), ("CLAIM_PERSISTENCE_FAILED", 0))
         self.assertEqual(self._terminal(member_exists_initial=True), ("BLOCKED_MEMBER_EXISTS", 0))
         self.assertEqual(self._terminal(member_exists_recheck=True), ("BLOCKED_MEMBER_EXISTS", 0))
         self.assertEqual(self._terminal(), ("FAILED_BEFORE_WRITE", 0))
@@ -340,20 +384,32 @@ class ExpiryProbeLibraryTests(unittest.TestCase):
         self.assertGreater(c3, 0)
 
     def test_exit_codes_only_verified_is_zero(self):
-        for code in ("REFUSED", "ATTEMPT_ALREADY_CLAIMED", "BLOCKED_MEMBER_EXISTS",
-                     "FAILED_BEFORE_WRITE", "WRITE_OUTCOME_UNCERTAIN",
-                     "WRITE_CONFIRMED_READBACK_FAILED", "EXPIRY_READBACK_MISMATCH"):
+        for code in ("REFUSED", "ATTEMPT_ALREADY_CLAIMED", "CLAIM_PERSISTENCE_FAILED",
+                     "BLOCKED_MEMBER_EXISTS", "FAILED_BEFORE_WRITE", "WRITE_OUTCOME_UNCERTAIN",
+                     "WRITE_CONFIRMED_READBACK_FAILED", "EXPIRY_READBACK_MISMATCH",
+                     "EVIDENCE_PERSISTENCE_FAILED"):
             proc = self._lib("exit", Text=code)
             self.assertEqual(proc.stdout.strip(), "1", code)
         proc = self._lib("exit", Text="EXPIRY_VERIFIED")
         self.assertEqual(proc.stdout.strip(), "0")
 
-    def test_verified_without_persisted_evidence_is_nonzero(self):
-        # A verified capability whose durable evidence was not persisted must NOT pass.
-        proc = self._lib("exitNoEvidence", Text="EXPIRY_VERIFIED")
-        self.assertEqual(proc.stdout.strip(), "1")
+    def _final(self, underlying, durable, persisted):
+        proc = self._lib("final", Text=f"{underlying}|{1 if durable else 0}|{1 if persisted else 0}")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        outcome, code = proc.stdout.strip().split("|")
+        return outcome, int(code)
 
-    def test_fingerprints_deterministic_shaped_and_case_insensitive(self):
+    def test_evidence_override_gates_success(self):
+        # Only a durably persisted verified run exits 0.
+        self.assertEqual(self._final("EXPIRY_VERIFIED", True, True), ("EXPIRY_VERIFIED", 0))
+        self.assertEqual(self._final("EXPIRY_VERIFIED", True, False), ("EVIDENCE_PERSISTENCE_FAILED", 1))
+        # A non-verified underlying is preserved when persisted, and never becomes success.
+        self.assertEqual(self._final("FAILED_BEFORE_WRITE", True, True), ("FAILED_BEFORE_WRITE", 1))
+        self.assertEqual(self._final("FAILED_BEFORE_WRITE", True, False), ("EVIDENCE_PERSISTENCE_FAILED", 1))
+        # Not-durable-required leaves the underlying unchanged.
+        self.assertEqual(self._final("REFUSED", False, True), ("REFUSED", 1))
+
+    def test_fingerprints_deterministic_shaped_case_and_whitespace_insensitive(self):
         proc = self._lib("fp")
         info = json.loads(proc.stdout)
         self.assertTrue(info["targetStable"])
@@ -361,8 +417,24 @@ class ExpiryProbeLibraryTests(unittest.TestCase):
         self.assertTrue(info["targetShape"])
         self.assertTrue(info["attemptShape"])
         self.assertTrue(info["synthShape"])
-        self.assertTrue(info["caseInsensitiveTarget"], "target casing variants must collapse to one fingerprint")
-        self.assertTrue(info["caseInsensitiveAttempt"], "attempt claim key must be case-insensitive on the target")
+        self.assertTrue(info["caseWsInsensitiveTarget"], "casing/whitespace variants must collapse to one target fingerprint")
+        self.assertTrue(info["caseWsInsensitiveAttempt"], "attempt claim key must be case/whitespace insensitive on the target")
+
+    def test_path_redaction_masks_private_paths(self):
+        proc = self._lib("redact", Text=r"failed at C:\Users\alice\XB\state\r.json and \\HOST\share\x tail")
+        out = proc.stdout.strip()
+        self.assertIn("<path>", out)
+        self.assertNotIn("alice", out)
+        self.assertNotIn("HOST", out)
+        self.assertIn("tail", out)
+
+    def test_durable_flush_failure_propagates_no_usable_artifact(self):
+        d = self.tmp / "badclaimdir"
+        d.mkdir(exist_ok=True)
+        proc = self._lib("badclaim", Dir=str(d))
+        info = json.loads(proc.stdout)
+        self.assertTrue(info["threw"], "a durable persistence failure must propagate")
+        self.assertFalse(info["exists"], "no usable artefact may remain on failure")
 
     def test_claim_is_exclusive_create_and_never_deleted(self):
         d = self.tmp / "claimdir"
@@ -398,13 +470,42 @@ class ExpiryProbeScriptExecutionTests(unittest.TestCase):
                "-File", str(SCRIPT), *args]
         return subprocess.run(cmd, capture_output=True, text=True, env=self.env)
 
-    def _active_args(self):
+    def _active_args(self, appref="APPROVAL-TEST-001"):
         return ("-EnableExpiryCapabilityProbe", "-ConfirmSyntheticExpiryDateTest",
                 "-ConfirmSingleSyntheticMember", "-ConfirmAutoCountWrite",
                 "-ConfirmDryRunPreflightPassed", "-ConfirmNoUpdateOrDelete",
-                "-ApprovalReference", "APPROVAL-TEST-001", "-StateDirectory", str(self.tmp),
+                "-ApprovalReference", appref, "-StateDirectory", str(self.tmp),
                 "-ServerName", "SYN_SERVER", "-DatabaseName", "SYN_DB", "-UserId", "SYN_USER",
                 "-AcRoot", "C:\\NoSuchAcRoot")
+
+    def test_approval_reference_containing_target_fails_closed(self):
+        proc = self._run(*self._active_args(appref="XB-SYN_DB-01"))  # embeds the database name
+        self.assertNotEqual(proc.returncode, 0)
+        r = json.loads(proc.stdout)
+        self.assertEqual(r["terminal_outcome"], "FAILED_BEFORE_WRITE")
+        self.assertFalse(r["required_assemblies_loaded"])
+        self.assertFalse(r["claim_created"])
+
+    def test_approval_reference_bad_characters_fail_closed(self):
+        proc = self._run(*self._active_args(appref="XB:BAD/REF"))  # forbidden characters
+        self.assertNotEqual(proc.returncode, 0)
+        r = json.loads(proc.stdout)
+        self.assertEqual(r["terminal_outcome"], "FAILED_BEFORE_WRITE")
+        self.assertFalse(r["claim_created"])
+        self.assertFalse(r["required_assemblies_loaded"])
+
+    def test_underlying_outcome_retained_and_evidence_pessimistic(self):
+        # Refusal is not activated, so durable evidence is not required and pessimistic
+        # evidence_persisted stays false (no artifact was written).
+        r = json.loads(self._run().stdout)
+        self.assertEqual(r["terminal_outcome"], "REFUSED")
+        self.assertFalse(r["evidence_persisted"])
+        # An active pre-AutoCount failure retains the underlying outcome and, since the
+        # state directory is writable, persists the failure evidence durably.
+        r2 = json.loads(self._run(*self._active_args()).stdout)
+        self.assertEqual(r2["underlying_terminal_outcome"], "FAILED_BEFORE_WRITE")
+        self.assertEqual(r2["terminal_outcome"], "FAILED_BEFORE_WRITE")
+        self.assertTrue(r2["evidence_persisted"])
 
     def test_refusal_is_nonzero_with_clean_json_stdout(self):
         proc = self._run()
@@ -458,9 +559,9 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
         self.readme = (ROOT / "README.md").read_text(encoding="utf-8")
         self.workflow = WORKFLOW.read_text(encoding="utf-8")
 
-    def test_runbook_exists_and_separates_seven_stages(self):
+    def test_runbook_exists_and_separates_eight_stages(self):
         self.assertTrue(RUNBOOK.is_file())
-        for n in range(1, 8):
+        for n in range(1, 9):
             self.assertRegex(self.runbook, rf"(?m)^### {n}\. ")
 
     def test_runbook_states_required_safety_facts(self):
@@ -479,15 +580,33 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
         self.assertRegex(self.runbook, r"(?i)permanent single-use\s+attempt claim")
         self.assertRegex(self.runbook, r"(?i)exit code")
         self.assertRegex(self.runbook, r"(?i)never removes the attempt claim")
+        # New terminal outcomes are documented.
+        self.assertIn("CLAIM_PERSISTENCE_FAILED", self.runbook)
+        self.assertIn("EVIDENCE_PERSISTENCE_FAILED", self.runbook)
 
-    def test_runbook_deploys_both_probe_files_before_vm_stages(self):
-        # A bounded deployment/verification step for both new files must precede preflight.
+    def test_runbook_has_distinct_bounded_deployment_stage(self):
+        # A distinct deployment stage precedes preflight/approval, covers both files via
+        # the private bridge, requires bidirectional SHA-256 equality and a bounded
+        # backup, and the later command uses the verified VM path (not repo-relative).
+        self.assertRegex(self.runbook, r"(?m)^### 3\. Deploy the reviewed probe files")
         self.assertIn("scripts/member_expiry_capability_probe_lib.ps1", self.runbook)
-        self.assertRegex(self.runbook, r"(?i)deploy both reviewed probe files")
         self.assertIn("Get-FileHash", self.runbook)
-        deploy_idx = self.runbook.index("Deploy both reviewed probe files")
-        approval_idx = self.runbook.index("### 4.")
-        self.assertLess(deploy_idx, approval_idx, "deployment must come before the approval stage")
+        self.assertRegex(self.runbook, r"(?i)hyper-v\s*/\s*smb|shared-folder bridge")
+        self.assertRegex(self.runbook, r"(?i)bounded[^.]*backup")
+        self.assertRegex(self.runbook, r"(?i)exact-version verification|exact equality|exactly equal")
+        self.assertIn(r"C:\XB\create_uat\probe\ac2_member_expiry_capability_probe.ps1", self.runbook)
+        deploy_idx = self.runbook.index("### 3. Deploy the reviewed probe files")
+        approval_idx = self.runbook.index("### 5.")
+        self.assertLess(deploy_idx, approval_idx, "deployment must precede the approval stage")
+
+    def test_runbook_followup_requires_runner_wiring_before_flip(self):
+        # The follow-up must wire the runner assignment/read-back, not just flip the flag.
+        self.assertRegex(self.runbook, r"(?i)not sufficient and is unsafe")
+        self.assertRegex(self.runbook, r"(?i)could save a member with")
+        self.assertIn("CREATED_VERIFIED", self.runbook)
+        self.assertIn("Wire the runner", self.runbook)
+        self.assertRegex(self.runbook, r"(?i)read-back")
+        self.assertIn("member_create_uat_approval.py", self.runbook)
 
     def test_runbook_requires_opaque_approval_reference(self):
         # The approval reference must be opaque; the placeholder must not invite target names.

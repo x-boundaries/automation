@@ -68,7 +68,10 @@ $script:SyntheticNoteMarker = "XB_AUTOMATION_EXPIRYDATE_PROBE_SYNTHETIC"
 
 $residualRecordNote = "No automatic member update, delete, rollback, or cleanup is performed, and the attempt claim is never removed. A synthetic member may remain in AutoCount and must be reviewed and removed manually by the owner. Search Bonus Point > Member Maintenance for Note marker $script:SyntheticNoteMarker."
 
-$approvalReferenceRe = '^[A-Za-z0-9._:#/-]{3,120}$'
+# Opaque audit-ID alphabet only: letters, digits, dot, underscore, hyphen. No
+# whitespace, slashes, backslashes, colon, or @, so a server\instance or host:port
+# style target cannot be smuggled into the emitted evidence.
+$approvalReferenceRe = '^[A-Za-z0-9._-]{3,64}$'
 
 # --------------------------------------------------------------------------- #
 # Sanitisation: secrets and synthetic identifiers never appear in output.
@@ -76,7 +79,10 @@ $approvalReferenceRe = '^[A-Za-z0-9._:#/-]{3,120}$'
 function Get-SanitizedMessage {
     param([object]$Message)
     $text = [string]$Message
-    foreach ($secret in @($ServerName, $DatabaseName, $UserId, [Environment]::GetEnvironmentVariable($PasswordEnvVar))) {
+    # Redact connection values AND private runtime paths (the state directory, AutoCount
+    # root, and any JsonOut path), since a .NET exception can embed a full path that
+    # discloses a machine username or an internal share.
+    foreach ($secret in @($ServerName, $DatabaseName, $UserId, [Environment]::GetEnvironmentVariable($PasswordEnvVar), $StateDirectory, $AcRoot, $JsonOut)) {
         if (-not [string]::IsNullOrEmpty($secret)) { $text = $text.Replace($secret, "<redacted>") }
     }
     $text = [regex]::Replace($text, "(?i)(password|pwd|user id|uid|server|database)\s*=\s*[^;\s]+", '$1=<redacted>')
@@ -84,6 +90,8 @@ function Get-SanitizedMessage {
     $text = $text.Replace($script:SyntheticEmail, "<synthetic-email>")
     $text = $text.Replace($script:SyntheticName, "<synthetic-name>")
     $text = $text.Replace($script:SyntheticNoteMarker, "<synthetic-marker>")
+    # Mask any remaining absolute/UNC path so private locations never leak.
+    $text = Get-ExpiryProbePathRedacted -Text $text
     return $text
 }
 
@@ -185,6 +193,7 @@ $result = [ordered]@{
     member_exists_recheck         = $false
     claim_created                 = $false
     claim_conflict                = $false
+    claim_persist_failed          = $false
     save_member_method_found      = $false
     save_member_attempted         = $false
     save_member_confirmed         = $false
@@ -196,8 +205,11 @@ $result = [ordered]@{
     masked_member_no              = (Get-ExpiryProbeMaskedMemberNo -MemberNo $script:SyntheticMemberNo)
     synthetic_member_may_remain   = $false
     residual_record_note          = $residualRecordNote
+    underlying_terminal_outcome   = $null
     terminal_outcome              = $null
-    evidence_persisted            = $true
+    # Pessimistic: only a successful durable result write sets this true, so a run that
+    # produced no result artifact never reports evidence as persisted.
+    evidence_persisted            = $false
     exit_code                     = 1
     error                         = $null
 }
@@ -218,22 +230,35 @@ function Complete-ExpiryProbeRun {
     # evidence_persisted is false, so a verified capability with no retained audit
     # artefact can never be mistaken for a clean pass.
     param([switch]$DurableEvidence, [string]$ResultPath)
-    $result.terminal_outcome = Get-ExpiryProbeTerminalOutcome -Flags $result
-    if ($DurableEvidence -and -not [string]::IsNullOrWhiteSpace($ResultPath)) {
+    # The underlying (run) outcome is derived once from the flags and preserved. The
+    # final outcome may be overridden to EVIDENCE_PERSISTENCE_FAILED if durable evidence
+    # was required but could not be persisted, so only a durably persisted verified run
+    # can ever report EXPIRY_VERIFIED / exit 0.
+    $underlying = Get-ExpiryProbeTerminalOutcome -Flags $result
+    $result.underlying_terminal_outcome = $underlying
+    $durableRequired = ($DurableEvidence -and -not [string]::IsNullOrWhiteSpace($ResultPath))
+    if ($durableRequired) {
         $result.evidence_persisted = $true
-        $result.exit_code = Get-ExpiryProbeExitCode -TerminalOutcome $result.terminal_outcome -EvidencePersisted $true
+        $result.terminal_outcome = Get-ExpiryProbeFinalOutcome -UnderlyingOutcome $underlying -DurableRequired $true -EvidencePersisted $true
+        $result.exit_code = Get-ExpiryProbeExitCode -TerminalOutcome $result.terminal_outcome
         $content = $result | ConvertTo-Json -Depth 8
         try {
             Write-ExpiryProbeResultAtomic -Path $ResultPath -Content $content
         }
         catch {
+            # The authoritative durable result could not be written: the capability is
+            # NOT proven. Override the final outcome, force a nonzero exit, keep the
+            # underlying outcome for diagnosis, and never claim durable evidence exists.
             $result.evidence_persisted = $false
+            $result.terminal_outcome = Get-ExpiryProbeFinalOutcome -UnderlyingOutcome $underlying -DurableRequired $true -EvidencePersisted $false
+            $result.exit_code = Get-ExpiryProbeExitCode -TerminalOutcome $result.terminal_outcome
             if ($null -eq $result.error) { $result.error = [ordered]@{ phase = "evidence"; message = (Get-SanitizedMessage $_.Exception.Message) } }
-            $result.exit_code = Get-ExpiryProbeExitCode -TerminalOutcome $result.terminal_outcome -EvidencePersisted $false
+            [Console]::Error.WriteLine("durable evidence persistence failed; capability not proven (terminal=EVIDENCE_PERSISTENCE_FAILED).")
         }
     }
     else {
-        $result.exit_code = Get-ExpiryProbeExitCode -TerminalOutcome $result.terminal_outcome -EvidencePersisted $true
+        $result.terminal_outcome = $underlying
+        $result.exit_code = Get-ExpiryProbeExitCode -TerminalOutcome $result.terminal_outcome
     }
     $script:ProbeExitCode = $result.exit_code
     $safeJson = $result | ConvertTo-Json -Depth 8
@@ -275,7 +300,16 @@ $stateReady = $false
 try {
     # ---- Bind evidence to approval + target (before any AutoCount contact). ----
     if ([string]::IsNullOrWhiteSpace($ApprovalReference) -or $ApprovalReference -notmatch $approvalReferenceRe) {
-        throw "A valid non-secret -ApprovalReference is required (matching $approvalReferenceRe)."
+        throw "A valid opaque non-secret -ApprovalReference is required (matching $approvalReferenceRe)."
+    }
+    # The approval reference is an opaque audit id only: it must not embed the target,
+    # because it is copied verbatim into the emitted evidence. Reject case-insensitively
+    # before any claim creation or AutoCount assembly load.
+    $approvalRefLower = $ApprovalReference.ToLowerInvariant()
+    foreach ($t in @($ServerName, $DatabaseName)) {
+        if (-not [string]::IsNullOrWhiteSpace($t) -and $approvalRefLower.Contains($t.Trim().ToLowerInvariant())) {
+            throw "The -ApprovalReference must not contain the server or database/account-book name; use an opaque audit id."
+        }
     }
     if (-not (Test-ExpiryProbeSafePath -Path $StateDirectory)) {
         throw "A safe absolute -StateDirectory is required."
@@ -452,16 +486,25 @@ try {
         $result.claim_created = $true
     }
     catch {
-        # Fail closed without any save. If a claim now exists, another launch won the
-        # race (or a prior claim exists) -> ATTEMPT_ALREADY_CLAIMED. Otherwise the claim
-        # could not be durably created (e.g. a flush that cannot confirm durability
-        # propagated), which is a pre-write failure, not a conflict.
+        # Fail closed without any save, distinguishing three cases so the evidence is
+        # honest and the partial-claim marker is preserved either way:
+        $failMsg = [string]$_.Exception.Message
+        if ($failMsg -like "post-create-persist-failed*") {
+            # We exclusively created the claim but could not durably persist it. This is
+            # our storage failure, NOT a pre-existing claim; no SaveMember was reached so
+            # no synthetic member can exist. The partial claim remains as a fail-closed
+            # marker (never deleted) and future runs will refuse.
+            $result.claim_persist_failed = $true
+            throw "The attempt claim could not be durably persisted; refusing to write before any save."
+        }
         if (Test-Path -LiteralPath $claimPath) {
+            # A claim already existed (another launch won the race, or a prior run): a
+            # genuine conflict. A prior run may have created a synthetic member.
             $result.claim_conflict = $true
             $result.synthetic_member_may_remain = $true
             throw "A permanent attempt claim already exists (concurrent or prior); refusing to write."
         }
-        throw "The attempt claim could not be durably created; refusing to write before any save."
+        throw "The attempt claim could not be created; refusing to write before any save."
     }
 
     # ---- The single irreversible SaveMember. No retry after this begins. ----

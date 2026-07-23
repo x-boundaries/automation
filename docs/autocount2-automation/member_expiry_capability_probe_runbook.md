@@ -30,9 +30,11 @@ before the real single-member creation UAT enables it.
   no-retry boundary: it is never overwritten or deleted, so a crash after it is created
   makes every future invocation **fail closed** with `ATTEMPT_ALREADY_CLAIMED`. There is
   no automatic claim removal or stale-claim recovery.
-- The process **exit code is truthful**: `0` only for `EXPIRY_VERIFIED`; nonzero for
-  every other outcome, including a refusal. Do not rely on parsing the JSON to detect
-  failure; check `$LASTEXITCODE`.
+- The process **exit code is truthful**: `0` only for a **durably persisted**
+  `EXPIRY_VERIFIED`; nonzero for every other outcome, including a refusal. If the
+  read-back verified but the durable result could not be written, the final outcome is
+  `EVIDENCE_PERSISTENCE_FAILED` (nonzero) and the capability is not proven. Do not rely on
+  parsing the JSON to detect failure; check `$LASTEXITCODE`.
 
 ## Prepared contract, still gated
 
@@ -67,27 +69,47 @@ implementation or manual edits.
 git pull --ff-only origin main
 ```
 
-### 3. VM dry-run / preflight
+### 3. Deploy the reviewed probe files to the AutoCount VM
 
-**`AUTOCOUNT VM — DESKTOP-4I042L6`** **Deploy both reviewed probe files to the VM first.**
-Copy `scripts/ac2_member_expiry_capability_probe.ps1` **and** its helper library
-`scripts/member_expiry_capability_probe_lib.ps1` from the reviewed, merged `origin/main`
-to the VM working area. They must be deployed together and kept in the same directory,
-because the probe dot-sources the library by relative path. Verify each file matches the
-reviewed copy before use by comparing SHA-256 against the host checkout, and never run a
-stale or unverified copy:
+Deploy **both** files together (the probe dot-sources the library by relative path, so
+they must live in the same VM directory) and prove exact-version equality before any
+preflight or approval. Do not execute the probe in this step.
+
+- **Source files (from the reviewed, merged physical-host checkout only):**
+  - `scripts/ac2_member_expiry_capability_probe.ps1`
+  - `scripts/member_expiry_capability_probe_lib.ps1`
+- **Source host:** `PHYSICAL HOST — DESKTOP-Q43QKQF` (the fast-forwarded `origin/main`
+  checkout from stage 2). Never the internet, a public share, or manual editing on the VM.
+- **Destination:** a documented private directory on `AUTOCOUNT VM — DESKTOP-4I042L6`,
+  e.g. `C:\XB\create_uat\probe\`.
+- **Transfer:** use the already-established private Hyper-V / SMB shared-folder bridge
+  between the host and the VM (see the shared-folder lookup bridge runbook); no public
+  network, no email, no copy-paste editing.
+- **No unverified overwrite:** if the destination files already exist and do not match,
+  take a bounded timestamped backup (e.g. copy to `...\probe\backup_<UTC>\`) before
+  replacing them; never overwrite an unverified destination in place.
+- **Exact-version verification (required before stage 4):** compute SHA-256 of both the
+  source and the destination copies and require exact equality for each file.
 
 ```powershell
+# On the physical-host checkout (source) and on the VM (destination), then compare:
 Get-FileHash .\ac2_member_expiry_capability_probe.ps1, .\member_expiry_capability_probe_lib.ps1 -Algorithm SHA256
 ```
 
-Then prove the environment with the main runner's dry-run (no write switches) per the
+Record only filenames, SHA-256 hashes, timestamps, and the host/VM machine identities in
+the deployment note — never credentials, connection values, or PII. Proceed only when
+both destination hashes exactly equal the reviewed source hashes.
+
+### 4. VM dry-run / preflight
+
+**`AUTOCOUNT VM — DESKTOP-4I042L6`** Using the verified VM copy from stage 3, prove the
+environment with the main runner's dry-run (no write switches) per the
 [Single-member creation UAT runbook](member_create_uat_runbook.md). Confirm the AutoCount
 connection through the process environment only (`AC2_PROBE_SERVER_NAME`,
 `AC2_PROBE_DATABASE_NAME`, `AC2_PROBE_USER_ID`, and the password environment variable
 named by `-PasswordEnvVar`); values are never printed or committed.
 
-### 4. Explicit owner approval for one synthetic write
+### 5. Explicit owner approval for one synthetic write
 
 **A current-turn owner approval is required before the synthetic `SaveMember`.** The
 approval must name, in the current action:
@@ -110,7 +132,7 @@ outside the repository:
 New-Item -ItemType Directory -Path "C:\XB\create_uat\expiry_probe_state" -Force
 ```
 
-### 5. One synthetic ExpiryDate persistence test
+### 6. One synthetic ExpiryDate persistence test
 
 **`AUTOCOUNT VM — DESKTOP-4I042L6`** Run the probe with every explicit switch. It
 authenticates, performs a `GetMember` duplicate check, stops if the synthetic member
@@ -119,7 +141,8 @@ already exists, constructs one new member, assigns the narrow synthetic fields i
 behind one narrowly scoped function. **It never retries `SaveMember`.**
 
 ```powershell
-& scripts\ac2_member_expiry_capability_probe.ps1 -EnableExpiryCapabilityProbe -ConfirmSyntheticExpiryDateTest -ConfirmSingleSyntheticMember -ConfirmAutoCountWrite -ConfirmDryRunPreflightPassed -ConfirmNoUpdateOrDelete -ApprovalReference "<opaque-approval-id>" -StateDirectory "C:\XB\create_uat\expiry_probe_state"
+# Use the VERIFIED VM destination path from stage 3, not a repository-relative path.
+& C:\XB\create_uat\probe\ac2_member_expiry_capability_probe.ps1 -EnableExpiryCapabilityProbe -ConfirmSyntheticExpiryDateTest -ConfirmSingleSyntheticMember -ConfirmAutoCountWrite -ConfirmDryRunPreflightPassed -ConfirmNoUpdateOrDelete -ApprovalReference "<opaque-approval-id>" -StateDirectory "C:\XB\create_uat\expiry_probe_state"
 ```
 
 `-ApprovalReference` and `-StateDirectory` are required. The durable, non-overwriting
@@ -146,13 +169,15 @@ performed; the synthetic member almost certainly exists and must be reviewed man
 | `WRITE_OUTCOME_UNCERTAIN` | nonzero | SaveMember began but did not return normally. Verify manually. Never retried; claim blocks rerun. |
 | `BLOCKED_MEMBER_EXISTS` | nonzero | The synthetic member already exists. Review/remove it manually. |
 | `ATTEMPT_ALREADY_CLAIMED` | nonzero | A permanent attempt claim already exists for this target/record. Fails closed before AutoCount contact. |
+| `CLAIM_PERSISTENCE_FAILED` | nonzero | The attempt claim was created but could not be durably persisted; no save was reached. The partial claim remains as a fail-closed marker (never deleted). |
 | `FAILED_BEFORE_WRITE` | nonzero | A confirmed failure before any write (config, auth, assembly, or setup). No member created. |
+| `EVIDENCE_PERSISTENCE_FAILED` | nonzero | The read-back may have verified, but the authoritative durable result could not be written, so the capability is NOT proven. `underlying_terminal_outcome` records the original outcome; a stderr diagnostic is emitted. |
 | `REFUSED` | nonzero | Not all explicit switches were supplied; inactive by default. |
 
 Under any uncertain or post-save state the probe never retries automatically and never
 removes the attempt claim; recovery is a separate, read-only, owner-directed manual check.
 
-### 6. Read-back evidence
+### 7. Read-back evidence
 
 The probe performs a `GetMember` read-back and verifies `ExpiryDate` after explicit
 normalisation, then emits **sanitised aggregate evidence only**: booleans, the masked
@@ -164,13 +189,35 @@ stale target. No raw target (server/database), credential, synthetic member numb
 name, or email is ever printed or written. Expect `terminal_outcome = EXPIRY_VERIFIED`
 and `expiry_match = true` on success.
 
-### 7. Follow-up PR (only after proof)
+### 8. Follow-up PR (only after proof)
 
-Only after this probe proves `ExpiryDate` persists may a **separate follow-up PR** flip
-the main runner's capability flag (`$script:CreateUatExpiryDateAssignmentImplemented`)
-and move `ExpiryDate` from `NEVER_ASSIGN_FIELDS` into the active `ASSIGNABLE_FIELDS`,
-alongside the business confirmation decision. This PR only prepares the contract; it does
-not flip the flag.
+Only after this probe proves `ExpiryDate` persists may a **separate follow-up PR** open
+the write gate. Flipping the capability flag alone is **not sufficient and is unsafe**:
+the main runner `scripts/ac2_member_create_uat_runner.ps1` currently builds a hard-coded
+`$assignments` set without `ExpiryDate`, sets `expiry_date_assigned` to `false`, and
+verifies only `$assignments.Keys` on read-back. If the gate opened without wiring the
+field through, the runner could save a member with **no** ExpiryDate and still report
+`CREATED_VERIFIED`.
+
+The follow-up PR must therefore, in one change, do **all** of the following before or with
+the flag flip, with tests:
+
+1. Flip `$script:CreateUatExpiryDateAssignmentImplemented` to `true` (and the Python
+   mirror `EXPIRYDATE_ASSIGNMENT_IMPLEMENTED`).
+2. Move `ExpiryDate` from `NEVER_ASSIGN_FIELDS` into the active `ASSIGNABLE_FIELDS`, and
+   update the package **schema and builder** (`schemas/member_create_uat_package.schema.json`,
+   `scripts/member_create_uat_approval.py`) so `ExpiryDate` is an assignable field with the
+   exact intended value.
+3. Wire the runner's **assignment** path to assign `ExpiryDate` and set
+   `expiry_date_assigned = true`.
+4. Wire the runner's **read-back** path so `ExpiryDate` is part of the verified set and a
+   read-back mismatch on `ExpiryDate` yields `CREATED_READBACK_MISMATCH`, never
+   `CREATED_VERIFIED`.
+5. Record the `ExpiryDate` business confirmation.
+6. Add tests proving a member cannot reach `CREATED_VERIFIED` without a matching
+   `ExpiryDate`.
+
+This PR only prepares the contract and proves persistence; it does not flip the flag.
 
 ## Residual synthetic record
 

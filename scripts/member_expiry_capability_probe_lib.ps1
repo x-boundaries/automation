@@ -17,13 +17,21 @@ $script:ExpiryProbeIntendedExpiry = "2028-06-30"
 $script:ExpiryProbeTerminalCodes = @(
     "REFUSED",
     "ATTEMPT_ALREADY_CLAIMED",
+    "CLAIM_PERSISTENCE_FAILED",
     "BLOCKED_MEMBER_EXISTS",
     "FAILED_BEFORE_WRITE",
     "WRITE_OUTCOME_UNCERTAIN",
     "WRITE_CONFIRMED_READBACK_FAILED",
     "EXPIRY_READBACK_MISMATCH",
-    "EXPIRY_VERIFIED"
+    "EXPIRY_VERIFIED",
+    "EVIDENCE_PERSISTENCE_FAILED"
 )
+
+# Marker prefix a durable-write helper uses when the file was created but the content
+# could not be durably persisted (write/flush failed AFTER an exclusive CreateNew), as
+# distinct from the file already existing (a conflict). Callers key fail-closed handling
+# off this so a storage failure is never mislabelled as a pre-existing claim.
+$script:ExpiryProbePostCreatePersistTag = "post-create-persist-failed"
 $script:ExpiryProbeSaveOutcomes = @("not_attempted", "confirmed", "uncertain")
 
 # --------------------------------------------------------------------------- #
@@ -82,6 +90,17 @@ function Get-ExpiryProbeMaskedMemberNo {
     $MemberNo.Substring(0, 2) + "***" + $MemberNo.Substring($MemberNo.Length - 1, 1)
 }
 
+function Get-ExpiryProbePathRedacted {
+    # Replace Windows drive-letter and UNC paths with <path> so a sanitised diagnostic
+    # cannot leak a private state directory, result path, or AutoCount root (which may
+    # embed a machine username or an internal share). Best-effort; never raises.
+    param([AllowNull()]$Text)
+    $s = "" + $Text
+    $s = [regex]::Replace($s, '\\\\[^\s"'']+', '<path>')          # UNC \\host\share\...
+    $s = [regex]::Replace($s, '[A-Za-z]:\\[^\s"'']*', '<path>')   # drive-letter C:\...
+    return $s
+}
+
 function Get-ExpiryProbeNormalizedDate {
     # Normalise a date-shaped value to yyyy-MM-dd (or "" for null/blank), so the
     # read-back comparison is representation-independent (DateTime vs string).
@@ -120,6 +139,8 @@ function New-ExpiryProbeDurableArtifact {
     # claim/result is never overwritten. WriteThrough + Flush(true) push the bytes past
     # OS caches where the platform supports it. Never deletes anything.
     param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Content)
+    # CreateNew throws IOException if the file already exists; that propagates unwrapped
+    # so the caller treats it as a conflict (the file was NOT created by us).
     $stream = [System.IO.FileStream]::new(
         $Path, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write,
         [System.IO.FileShare]::None, 4096, [System.IO.FileOptions]::WriteThrough)
@@ -132,6 +153,13 @@ function New-ExpiryProbeDurableArtifact {
         # that cannot confirm durability) must propagate so the caller fails closed
         # BEFORE the irreversible save rather than proceeding on a non-durable claim.
         try { $stream.Flush($true) } catch [System.NotSupportedException] { $stream.Flush() }
+    }
+    catch {
+        # The file was exclusively created but its content could not be durably
+        # persisted. Tag the failure so the caller distinguishes this storage error
+        # (a distinct pre-write failure) from a pre-existing/concurrent claim, while the
+        # partial file remains on disk as a fail-closed marker (never deleted here).
+        throw ($script:ExpiryProbePostCreatePersistTag + ": " + $_.Exception.Message)
     }
     finally { $stream.Dispose() }
 }
@@ -206,6 +234,9 @@ function Get-ExpiryProbeStateContradictions {
     if ($attempted -and -not $activated) { $reasons.Add('attempt_without_activation') }
     if ($attempted -and $claimConflict) { $reasons.Add('attempt_with_claim_conflict') }
     if ($attempted -and $recheck) { $reasons.Add('recheck_block_after_attempt') }
+    $claimPersistFailed = [bool](Get-ExpiryProbeFlag $Flags 'claim_persist_failed' $false)
+    if ($claimPersistFailed -and $attempted) { $reasons.Add('claim_persist_failed_after_attempt') }
+    if ($claimPersistFailed -and $claimConflict) { $reasons.Add('claim_persist_failed_and_conflict') }
     return $reasons.ToArray()
 }
 
@@ -218,6 +249,7 @@ function Get-ExpiryProbeTerminalOutcome {
     param([Parameter(Mandatory)]$Flags)
     if (-not [bool](Get-ExpiryProbeFlag $Flags 'activated' $false)) { return 'REFUSED' }
     if ([bool](Get-ExpiryProbeFlag $Flags 'claim_conflict' $false)) { return 'ATTEMPT_ALREADY_CLAIMED' }
+    if ([bool](Get-ExpiryProbeFlag $Flags 'claim_persist_failed' $false)) { return 'CLAIM_PERSISTENCE_FAILED' }
     $outcome = Get-ExpiryProbeFlag $Flags 'save_outcome' 'not_attempted'
     if ($outcome -eq 'confirmed') {
         if (-not [bool](Get-ExpiryProbeFlag $Flags 'readback_found' $false)) { return 'WRITE_CONFIRMED_READBACK_FAILED' }
@@ -230,13 +262,27 @@ function Get-ExpiryProbeTerminalOutcome {
     return 'FAILED_BEFORE_WRITE'
 }
 
+function Get-ExpiryProbeFinalOutcome {
+    # Apply the durable-evidence override to the underlying (run) outcome. When durable
+    # evidence was required but the authoritative result could not be persisted, the
+    # honest final outcome is EVIDENCE_PERSISTENCE_FAILED (the capability is NOT proven),
+    # regardless of what the read-back showed. Otherwise the final outcome is the
+    # underlying outcome unchanged.
+    param(
+        [Parameter(Mandatory)][string]$UnderlyingOutcome,
+        [bool]$DurableRequired = $false,
+        [bool]$EvidencePersisted = $true
+    )
+    if ($DurableRequired -and -not $EvidencePersisted) { return 'EVIDENCE_PERSISTENCE_FAILED' }
+    return $UnderlyingOutcome
+}
+
 function Get-ExpiryProbeExitCode {
-    # Truthful process exit status: 0 ONLY for EXPIRY_VERIFIED whose durable evidence was
-    # persisted; nonzero for every other terminal outcome (including REFUSED) AND for a
-    # verified run whose durable result could not be written. A wrapper that gates the
-    # follow-up capability flip on exit 0 therefore never proceeds without retained audit
-    # evidence.
-    param([Parameter(Mandatory)][string]$TerminalOutcome, [bool]$EvidencePersisted = $true)
-    if ($TerminalOutcome -eq 'EXPIRY_VERIFIED' -and $EvidencePersisted) { return 0 }
+    # Truthful process exit status: 0 ONLY for a final outcome of EXPIRY_VERIFIED (which,
+    # because EVIDENCE_PERSISTENCE_FAILED overrides an unpersisted verified run, means a
+    # durably persisted verified result). Every other terminal outcome, including
+    # REFUSED, CLAIM_PERSISTENCE_FAILED, and EVIDENCE_PERSISTENCE_FAILED, is nonzero.
+    param([Parameter(Mandatory)][string]$TerminalOutcome)
+    if ($TerminalOutcome -eq 'EXPIRY_VERIFIED') { return 0 }
     return 1
 }
