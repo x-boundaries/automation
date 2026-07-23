@@ -252,3 +252,22 @@ ac2_member_extract*.csv
 PRIVATE_DO_NOT_COMMIT_MEMBER_BROWSE_EXTRACT.txt
 *form_responses*.csv
 *Form Responses*.csv
+
+# Single-member creation UAT private local artifacts — never commit.
+# Approval ledgers, immutable packages, sanitized terminal results, and VM-owned
+# lock/write-intent/consumed markers bind to real member identity or VM runtime state.
+# Patterns are narrow so the committed contract/config/schema files still commit.
+member_create_uat_ledger*.jsonl
+member_create_uat_package*.json
+member_create_uat_result*.json
+autocount_outputs/**/member_create_uat_*.json
+autocount_outputs/**/member_create_uat_*.jsonl
+create_uat.lock
+consumed_*.marker
+write_intent_*.marker
+PRIVATE_DO_NOT_COMMIT_MEMBER_CREATE_UAT.txt
+# Keep the committed contract/config/schema/workflow (these are not private artifacts).
+!config/member_create_uat_business_confirmation.json
+!config/member_create_uat_business_confirmation.example.json
+!schemas/member_create_uat_package.schema.json
+!n8n-workflows/member_create_uat_result_mapping.workflow.json

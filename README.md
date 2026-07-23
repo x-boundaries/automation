@@ -34,6 +34,7 @@ Task tracking, pending-work dashboards, completed-task logs, and personal planni
 - `scripts/member_lookup_gate5a_result_precheck.py`: local aggregate-only Gate 5A precheck for the operator-copied sanitized Gate 4 recovery result staging file; it accepts exactly one durable result row matching the merged Gate 4 contract, fails closed on missing/extra/forbidden fields, invalid types, or an inconsistent recomputed review state, opens the copy read-only, and prints only aggregate counters and fixed false write/activation flags before the manual inactive n8n mapping run.
 - `scripts/member_intake_validate.py`: dry-run-only validator/normalizer for Google Form member intake CSV rows, with optional matching against a private local AC2 member extract; it never creates, updates, or deletes AutoCount members, and its row-level outputs contain PII and must stay local.
 - `scripts/member_intake_decision_review.py`: dry-run-only decision review layer that combines validated Google Form rows with sanitized AC2 lookup JSONL or planned lookup review; AC2 remains source of truth, it does not create/update/delete members, and row-level outputs contain only row numbers, status codes, and issue codes.
+- `scripts/member_create_uat_approval.py` and `scripts/ac2_member_create_uat_runner.ps1`: the bounded single-member creation UAT path. The laptop-side approval tool records a controlled reviewer decision for one `READY_FOR_CREATE_REVIEW` row and builds an immutable, single-use create package (validated against `schemas/member_create_uat_package.schema.json`); the AutoCount VM runner validates that package in-process, performs an existing-member duplicate check, assigns only whitelisted fields, and gates a single member-save call behind five explicit confirmation switches plus the fail-closed business confirmations in `config/member_create_uat_business_confirmation.json`. It is UAT scaffolding, not the production workflow, supports exactly one member, and performs no member update, deletion, or rollback. See [Single-member creation UAT runbook](docs/autocount2-automation/member_create_uat_runbook.md).
 - `scripts/autocount_stock_extract.py`: stock extraction/archive workflow for AutoCount stock master, stock balance, and stock movement datasets.
 - `scripts/install_autocount_stock_extract_task.ps1`: Windows Task Scheduler installer for the stock extraction job.
 
@@ -103,6 +104,7 @@ Raw CSVs and member browse extracts stay local and must not be committed. Member
 - [Member intake n8n node contract](docs/autocount2-automation/member_intake_n8n_node_contract.md)
 - [Member form intake contract (dry-run validator)](docs/autocount2-automation/member_form_intake_contract.md)
 - [Member intake decision review runbook](docs/autocount2-automation/member_intake_decision_review_runbook.md)
+- [Single-member creation UAT runbook](docs/autocount2-automation/member_create_uat_runbook.md)
 - [AutoCount 2 MVP plan](docs/autocount2-automation/mvp_plan.md)
 - [Extraction surface decision pack](docs/autocount2-automation/extraction_surface_decision.md)
 - [AC2 read-only SQL login validation runbook](docs/autocount2-automation/readonly_sql_login_runbook.md)

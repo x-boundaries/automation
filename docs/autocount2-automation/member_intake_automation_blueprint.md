@@ -143,3 +143,33 @@ Excluded:
 - n8n production workflow creation.
 - AutoCount DLL dependency in CI.
 - Real customer/member PII, sheet IDs, credentials, API keys, or runtime outputs.
+
+## Future production member-intake workflow boundary
+
+The single-member creation UAT (see
+[Single-member creation UAT runbook](member_create_uat_runbook.md)) is bounded UAT
+scaffolding that proves exactly one real form-derived member can be created and read
+back safely. It is deliberately not the permanent production workflow and must not be
+grown into it by repeated patching.
+
+The permanent production member-intake workflow will be newly designed and built in a
+separate, separately approved effort. It is not implemented or activated by the UAT.
+When built, it must include:
+
+- continuous intake;
+- durable claim / lease handling;
+- idempotency;
+- duplicate mobile-number protection;
+- separate existing-member, manual-review, and create routes;
+- a controlled reviewer approval mechanism;
+- crash recovery;
+- a bounded retry policy;
+- uncertain-write recovery;
+- read-back verification;
+- terminal Sheet states;
+- operational alerting;
+- credential / resource rebinding;
+- no silent update-member path.
+
+Until that workflow exists and is separately reviewed and approved, member creation
+remains a manual, single-member, fail-closed UAT only.

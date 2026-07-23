@@ -1,0 +1,92 @@
+name: member-create-uat-tests
+
+# Focused CI for the single-member creation UAT deliverable.
+#
+# Windows is the authoritative target: the laptop development machine, the physical
+# host, and the AutoCount VM are all Windows, and the runner's exclusive-create
+# locking and PowerShell behaviour are Windows-oriented. Windows therefore runs the
+# full repository suite plus a PowerShell parse check. Ubuntu runs only the portable
+# focused create-UAT tests (pure Python plus the platform-neutral PowerShell library
+# via pwsh) to prove cross-platform correctness of the portable components. No CI job
+# contacts AutoCount, n8n, Google, or any live environment; the runner's AutoCount
+# interaction is never executed here.
+
+on:
+  pull_request:
+    paths:
+      - "scripts/member_create_uat_*.py"
+      - "scripts/ac2_member_create_uat_runner.ps1"
+      - "scripts/member_create_uat_runner_lib.ps1"
+      - "schemas/member_create_uat_package.schema.json"
+      - "config/member_create_uat_business_confirmation*.json"
+      - "n8n-workflows/member_create_uat_result_mapping.workflow.json"
+      - "tests/test_member_create_uat_*.py"
+      - "tests/_create_uat_fixtures.py"
+      - ".github/workflows/member-create-uat-tests.yml"
+  workflow_dispatch: {}
+
+jobs:
+  windows-full-suite:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install tzdata (Windows Python has no system zoneinfo database)
+        shell: pwsh
+        run: python -m pip install --quiet tzdata
+      - name: PowerShell parse check (no execution)
+        shell: pwsh
+        run: |
+          $files = @(
+            "scripts/ac2_member_create_uat_runner.ps1",
+            "scripts/member_create_uat_runner_lib.ps1"
+          )
+          $failed = $false
+          foreach ($f in $files) {
+            $errs = $null
+            [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $f), [ref]$null, [ref]$errs) | Out-Null
+            if (@($errs).Count -gt 0) {
+              Write-Host "Parse errors in $f"
+              $errs | ForEach-Object { Write-Host $_.Message }
+              $failed = $true
+            } else {
+              Write-Host "OK: $f"
+            }
+          }
+          if ($failed) { exit 1 }
+      - name: Focused create UAT tests
+        shell: pwsh
+        run: |
+          python -m unittest tests.test_member_create_uat_contract tests.test_member_create_uat_approval tests.test_member_create_uat_result_precheck tests.test_member_create_uat_runner_ps
+      - name: Full repository test suite (excludes the Docker/n8n live-import module)
+        shell: pwsh
+        # The n8n live-import dry-run module needs a Docker/n8n environment absent on
+        # stock CI; it and the complete suite are validated locally on the dev/VM host.
+        run: python tests/_run_ci_full_suite.py
+
+  ubuntu-focused:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: PowerShell parse check (no execution)
+        shell: pwsh
+        run: |
+          $files = @(
+            "scripts/ac2_member_create_uat_runner.ps1",
+            "scripts/member_create_uat_runner_lib.ps1"
+          )
+          $failed = $false
+          foreach ($f in $files) {
+            $errs = $null
+            [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $f), [ref]$null, [ref]$errs) | Out-Null
+            if (@($errs).Count -gt 0) { $failed = $true; Write-Host "Parse errors in $f" }
+          }
+          if ($failed) { exit 1 }
+      - name: Focused create UAT tests (portable components)
+        run: |
+          python -m unittest tests.test_member_create_uat_contract tests.test_member_create_uat_approval tests.test_member_create_uat_result_precheck tests.test_member_create_uat_runner_ps

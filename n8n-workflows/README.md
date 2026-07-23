@@ -26,6 +26,18 @@ Workflow JSON in this directory is source-controlled evidence of workflow design
 - This JSON is evidence, not proof that the workflow is deployed, imported, activated, or has executed anywhere.
 - AutoCount writes, member creation, and final automation remain excluded unless separately reviewed and authorised.
 
+### member_create_uat_result_mapping.workflow.json
+
+- Purpose: Single-member creation UAT staged proof only. Maps exactly one previously produced sanitized create UAT terminal result (operator copy-only handoff into the approved container file area) into controlled Google Sheet review columns for the exact verified source record, then stops. It performs no reviewer approval, no package generation, no duplicate checking, no AC2 lookup, no AutoCount host or VM contact, and no member creation or update.
+- The row is located by the single-use `uat_create_operation_id` key (never a shared marker and never a row number): the operator seeds `uat_create_operation_id`, `uat_create_source_record_id`, and `uat_create_source_fingerprint` on the approved row from the built package, and the workflow reads and updates that exact row by operation id. Identity is then revalidated by comparing the result `source_record_id` and `source_fingerprint` hashes (hash compare only; no raw PII enters the workflow), and the terminal code is recomputed from the canonical state table and rejected if it contradicts the flags.
+- UAT status: manual, inactive. Never activated; runs only by explicit manual operator execution during approved UAT.
+- Runbook: [Single-member create UAT runbook](../docs/autocount2-automation/member_create_uat_runbook.md).
+- Committed selectors and credentials remain unbound. The export contains no bound credentials and no live selector values. The sheet tab locator ships in `By Name` mode with the non-secret placeholder `REPLACE_WITH_SOURCE_TAB_NAME`, replaced by the operator in a local import copy before import (same v4.7 editor binding caveat as Gate 5A).
+- Operators must add the controlled columns listed in the workflow boundary sticky note to the source tab before running.
+- Pinned data and execution data must not be committed with this export.
+- This JSON is evidence, not proof that the workflow is deployed, imported, activated, or has executed anywhere.
+- This is UAT scaffolding, not the permanent production member-intake workflow, which remains newly designed and unbuilt (see [member intake automation blueprint](../docs/autocount2-automation/member_intake_automation_blueprint.md)).
+
 ## Directory Rules
 
 - Do not rename existing workflow files during unrelated work. Existing filenames are canonical and are referenced by tests, README links, and runbooks.
