@@ -35,7 +35,8 @@ ALLOWED_RESULT_FIELDS = {
     "write_confirmed",
     "business_confirmed",
     "lock_acquired",
-    "already_consumed",
+    "recovery_state",
+    "execution_error",
     "authentication_success",
     "member_command_found",
     "get_member_found",
@@ -86,7 +87,6 @@ FORBIDDEN_RESULT_FIELDS = {
 }
 
 MASKED_MEMBER_NO_RE = re.compile(r"^(\*\*\*|.{2}\*\*\*.)$")
-SAVE_OUTCOMES = {"not_attempted", "confirmed", "uncertain"}
 
 
 def read_single_result(path):
@@ -117,6 +117,8 @@ def evaluate(result, expected_record_id=None, expected_fingerprint=None):
         "forbidden_field_count": 0,
         "terminal_code_valid": False,
         "terminal_code": "none",
+        "terminal_code_recomputed_ok": False,
+        "state_contradiction_count": 0,
         "masked_member_no_ok": False,
         "identity_revalidated": "not_requested",
         "fingerprint_revalidated": "not_requested",
@@ -168,9 +170,19 @@ def evaluate(result, expected_record_id=None, expected_fingerprint=None):
     ):
         reasons.append("source_fingerprint_invalid")
 
-    save_outcome = result.get("save_outcome")
-    if save_outcome is not None and save_outcome not in SAVE_OUTCOMES:
-        reasons.append("save_outcome_invalid")
+    # Recompute the terminal code from the emitted flags and reject any result whose
+    # stored code contradicts the canonical state table, or whose flags are internally
+    # impossible (finding 4). The precheck never trusts the stored terminal_code.
+    flags = {name: result.get(name) for name in contract.TERMINAL_STATE_FLAGS}
+    recomputed, contradictions = contract.recompute_terminal_state(flags)
+    counts["state_contradiction_count"] = len(contradictions)
+    if contradictions:
+        reasons.append("state_contradiction")
+    counts["terminal_code_recomputed_ok"] = (
+        counts["terminal_code_valid"] and not contradictions and recomputed == terminal
+    )
+    if counts["terminal_code_valid"] and not contradictions and recomputed != terminal:
+        reasons.append("terminal_code_does_not_match_recomputed")
 
     # Identity and fingerprint revalidation for result mapping (amendment #4):
     # a result may only be mapped onto the exact source record it belongs to.
@@ -199,6 +211,8 @@ def build_evidence(counts):
         ("pii_free", str(counts["pii_free"]).lower()),
         ("terminal_code", counts["terminal_code"]),
         ("terminal_code_valid", str(counts["terminal_code_valid"]).lower()),
+        ("terminal_code_recomputed_ok", str(counts["terminal_code_recomputed_ok"]).lower()),
+        ("state_contradiction_count", counts["state_contradiction_count"]),
         ("masked_member_no_ok", str(counts["masked_member_no_ok"]).lower()),
         ("identity_revalidated", counts["identity_revalidated"]),
         ("fingerprint_revalidated", counts["fingerprint_revalidated"]),

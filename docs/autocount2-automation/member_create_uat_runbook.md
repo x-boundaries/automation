@@ -197,11 +197,16 @@ approved safe fields. Map the sanitized terminal result to the Sheet:
 
 2. Operator PC n8n (non-AC2): import a local copy of
    `n8n-workflows/member_create_uat_result_mapping.workflow.json` after replacing
-   `REPLACE_WITH_SOURCE_TAB_NAME` with the source tab title, add the controlled
-   columns named in the workflow boundary sticky note, bind only the Google
-   credential and spreadsheet, copy the sanitized result file into
-   `/home/node/.n8n-files/`, and run the workflow manually. It maps the terminal
-   result onto the exact verified row only and stays inactive.
+   `REPLACE_WITH_SOURCE_TAB_NAME` with the source tab title. Add the controlled
+   columns named in the workflow boundary sticky note and, on the approved row,
+   seed `uat_create_operation_id`, `uat_create_source_record_id`, and
+   `uat_create_source_fingerprint` from the built package (leave the review columns
+   blank). Bind only the Google credential and spreadsheet, copy the sanitized
+   result file into `/home/node/.n8n-files/`, and run the workflow manually. It reads
+   and updates the one row whose `uat_create_operation_id` equals the result's
+   operation id (the single-use mapping key, never a shared marker or row number),
+   revalidates the identity and fingerprint hashes, recomputes the terminal code, and
+   stays inactive.
 
 ### 10. Recovery for `WRITE_OUTCOME_UNCERTAIN`
 
@@ -217,6 +222,15 @@ separate read-only recovery check:
    consumed marker still blocks an accidental second attempt, so a fresh, separately
    approved operation with a new package is required to proceed.
 3. Never delete or edit the member as part of recovery.
+
+The VM keeps durable state files in the state directory: `write_intent_<operation_id>.marker`,
+`consumed_<source_record_id>.marker`, and `result_<operation_id>.json` (each written
+exclusive-create, never overwritten, containing only sanitised identifiers). On any
+re-run the runner classifies these deterministically and never auto-retries a save:
+a terminal result present yields `PACKAGE_ALREADY_CONSUMED`; a consumed marker without
+a terminal result yields `WRITE_OUTCOME_UNCERTAIN`; a write-intent marker without a
+consumed marker yields `FAILED_BEFORE_WRITE`; a malformed marker yields
+`WRITE_OUTCOME_UNCERTAIN`. Do not delete these markers; they are the single-use guard.
 
 ### 11. UAT shutdown and inactivity
 

@@ -113,7 +113,8 @@ switch ($Op) {
         $ctx = Get-Content -LiteralPath $CtxJson -Raw -Encoding UTF8 | ConvertFrom-Json
         $ht = @{}
         foreach ($p in $ctx.PSObject.Properties) { $ht[$p.Name] = $p.Value }
-        Write-Output (Get-CreateUatTerminalCode -Ctx $ht)
+        $contr = @(Get-CreateUatStateContradictions -Flags $ht)
+        Write-Output ((Get-CreateUatTerminalCode -Flags $ht) + '|' + $contr.Count)
     }
     'lock' {
         $lock = Join-Path $Dir 'create_uat.lock'
@@ -124,6 +125,41 @@ switch ($Op) {
             secondBlocked  = ($null -eq $second)
         } | ConvertTo-Json -Compress
         Remove-CreateUatExclusiveLock -LockStream $first -LockPath $lock
+    }
+    'business' {
+        $cfg = ConvertFrom-CreateUatJson -Raw (Get-Content -LiteralPath $Package -Raw -Encoding UTF8)
+        $gate = Get-CreateUatBusinessGate -ConfigObject $cfg
+        [pscustomobject]@{ confirmed = $gate.Confirmed; reasons = ($gate.Reasons -join ',') } | ConvertTo-Json -Compress
+    }
+    'durable' {
+        $p = Join-Path $Dir 'artifact.marker'
+        Write-CreateUatDurableArtifact -Path $p -Content 'first'
+        $second_threw = $false
+        try { Write-CreateUatDurableArtifact -Path $p -Content 'second' } catch { $second_threw = $true }
+        [pscustomobject]@{ exists = (Test-Path -LiteralPath $p); noClobber = $second_threw } | ConvertTo-Json -Compress
+    }
+    'readback' {
+        # Assigned uses the same typed values the runner assigns; readback mimics
+        # AutoCount's returned representations (DateTime, Decimal, DBNull, string).
+        $assigned = [ordered]@{
+            MemberNo = '6590000001'; MemberType = 'Default'; Name = 'Synthetic Alpha'
+            MobilePhone = ''; EmailAddress = 'a@example.invalid'
+            DOB = [datetime]::ParseExact('2000-03-01', 'yyyy-MM-dd', [System.Globalization.CultureInfo]::InvariantCulture)
+            RegisterDate = [datetime]::ParseExact('2026-07-01', 'yyyy-MM-dd', [System.Globalization.CultureInfo]::InvariantCulture)
+            OpeningPoints = [decimal]0; IsActive = 'T'; Individual = 'T'
+        }
+        $good = @{
+            MemberNo = '6590000001'; MemberType = 'Default'; Name = 'Synthetic Alpha'
+            MobilePhone = [System.DBNull]::Value; EmailAddress = 'a@example.invalid'
+            DOB = [datetime]'2000-03-01T00:00:00'; RegisterDate = [datetime]'2026-07-01T00:00:00'
+            OpeningPoints = [decimal]0.0; IsActive = $true; Individual = 'T'
+        }
+        $bad = @{}
+        foreach ($k in $good.Keys) { $bad[$k] = $good[$k] }
+        $bad['Name'] = 'Different Name'
+        $mGood = Test-CreateUatReadbackMatch -Assigned $assigned -Readback $good
+        $mBad = Test-CreateUatReadbackMatch -Assigned $assigned -Readback $bad
+        [pscustomobject]@{ goodMatch = $mGood.Match; badMatch = $mBad.Match; badMismatches = ($mBad.Mismatches -join ',') } | ConvertTo-Json -Compress
     }
 }
 """
@@ -176,46 +212,56 @@ class PowerShellRunnerTests(unittest.TestCase):
             self.assertIn(switch, source)
 
     # ---- Pure terminal-state transitions (no AutoCount) ---- #
-    def _terminal(self, **ctx):
+    def _terminal(self, **flags):
+        # Snake_case flags matching the runner result; returns (code, contradiction_count).
         base = {
-            "PackageFingerprintProblem": False, "PackageValid": True, "ApprovalExpired": False,
-            "ForWrite": False, "WriteConfirmed": False, "BusinessConfirmed": False,
-            "LockAcquired": True, "AlreadyConsumed": False, "MemberExistsInitial": False,
-            "MemberExistsRecheck": False, "SaveOutcome": "not_attempted", "ReadbackMatch": False,
+            "mode": "dry-run", "package_fingerprint_problem": False, "package_structural_valid": True,
+            "approval_not_expired": True, "write_confirmed": False, "business_confirmed": False,
+            "lock_acquired": True, "recovery_state": "none", "execution_error": False,
+            "member_exists_initial": False, "member_exists_recheck": False,
+            "save_member_attempted": False, "save_member_confirmed": False,
+            "save_outcome": "not_attempted", "readback_found": False, "readback_match": False,
         }
-        base.update(ctx)
+        base.update(flags)
         ctx_path = self.tmp / "ctx.json"
         ctx_path.write_text(json.dumps(base), encoding="utf-8")
         proc = self._ps(self.probe, "-Lib", str(LIB), "-Op", "terminal", "-CtxJson", str(ctx_path))
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        return proc.stdout.strip()
+        code, contr = proc.stdout.strip().split("|")
+        return code, int(contr)
+
+    def _w(self, **over):
+        # A consistent WRITE-mode confirmed-save flag set, then apply overrides.
+        base = dict(
+            mode="write", write_confirmed=True, business_confirmed=True, lock_acquired=True,
+            save_member_attempted=True, save_member_confirmed=True, save_outcome="confirmed",
+            readback_found=True, readback_match=True,
+        )
+        base.update(over)
+        return base
 
     def test_terminal_state_matrix(self):
-        self.assertEqual(self._terminal(), "DRY_RUN_VALIDATED")
-        self.assertEqual(self._terminal(PackageFingerprintProblem=True), "SOURCE_FINGERPRINT_MISMATCH")
-        self.assertEqual(self._terminal(PackageValid=False), "FAILED_BEFORE_WRITE")
-        self.assertEqual(self._terminal(ApprovalExpired=True), "APPROVAL_INVALID")
-        self.assertEqual(self._terminal(ForWrite=True, WriteConfirmed=False), "WRITE_NOT_CONFIRMED")
-        self.assertEqual(self._terminal(ForWrite=True, WriteConfirmed=True, BusinessConfirmed=False), "OPERATOR_CONFIG_REQUIRED")
-        self.assertEqual(self._terminal(LockAcquired=False), "EXECUTION_LOCKED")
-        self.assertEqual(self._terminal(AlreadyConsumed=True), "PACKAGE_ALREADY_CONSUMED")
-        self.assertEqual(self._terminal(MemberExistsInitial=True), "BLOCKED_MEMBER_EXISTS")
-        self.assertEqual(
-            self._terminal(ForWrite=True, WriteConfirmed=True, BusinessConfirmed=True, MemberExistsRecheck=True),
-            "BLOCKED_MEMBER_EXISTS",
-        )
-        self.assertEqual(
-            self._terminal(ForWrite=True, WriteConfirmed=True, BusinessConfirmed=True, SaveOutcome="uncertain"),
-            "WRITE_OUTCOME_UNCERTAIN",
-        )
-        self.assertEqual(
-            self._terminal(ForWrite=True, WriteConfirmed=True, BusinessConfirmed=True, SaveOutcome="confirmed", ReadbackMatch=True),
-            "CREATED_VERIFIED",
-        )
-        self.assertEqual(
-            self._terminal(ForWrite=True, WriteConfirmed=True, BusinessConfirmed=True, SaveOutcome="confirmed", ReadbackMatch=False),
-            "CREATED_READBACK_MISMATCH",
-        )
+        # Each case is a self-consistent flag set; assert code AND zero contradictions.
+        self.assertEqual(self._terminal(), ("DRY_RUN_VALIDATED", 0))
+        self.assertEqual(self._terminal(package_fingerprint_problem=True), ("SOURCE_FINGERPRINT_MISMATCH", 0))
+        self.assertEqual(self._terminal(package_structural_valid=False), ("FAILED_BEFORE_WRITE", 0))
+        self.assertEqual(self._terminal(approval_not_expired=False), ("APPROVAL_INVALID", 0))
+        self.assertEqual(self._terminal(mode="write", write_confirmed=False), ("WRITE_NOT_CONFIRMED", 0))
+        self.assertEqual(self._terminal(mode="write", write_confirmed=True, business_confirmed=False), ("OPERATOR_CONFIG_REQUIRED", 0))
+        self.assertEqual(self._terminal(lock_acquired=False), ("EXECUTION_LOCKED", 0))
+        self.assertEqual(self._terminal(recovery_state="terminal_exists"), ("PACKAGE_ALREADY_CONSUMED", 0))
+        self.assertEqual(self._terminal(recovery_state="consumed_no_terminal"), ("WRITE_OUTCOME_UNCERTAIN", 0))
+        self.assertEqual(self._terminal(recovery_state="intent_no_consumed"), ("FAILED_BEFORE_WRITE", 0))
+        self.assertEqual(self._terminal(recovery_state="malformed"), ("WRITE_OUTCOME_UNCERTAIN", 0))
+        self.assertEqual(self._terminal(member_exists_initial=True), ("BLOCKED_MEMBER_EXISTS", 0))
+        self.assertEqual(self._terminal(**self._w(member_exists_recheck=True, save_member_attempted=False, save_member_confirmed=False, save_outcome="not_attempted", readback_found=False, readback_match=False)), ("BLOCKED_MEMBER_EXISTS", 0))
+        self.assertEqual(self._terminal(**self._w(save_member_confirmed=False, save_outcome="uncertain", readback_found=False, readback_match=False)), ("WRITE_OUTCOME_UNCERTAIN", 0))
+        self.assertEqual(self._terminal(**self._w()), ("CREATED_VERIFIED", 0))
+        self.assertEqual(self._terminal(**self._w(readback_match=False)), ("CREATED_READBACK_MISMATCH", 0))
+        self.assertEqual(self._terminal(**self._w(readback_found=False, readback_match=False)), ("WRITE_OUTCOME_UNCERTAIN", 0))
+        # A contradictory set is flagged (confirmed save in dry-run mode).
+        _, contr = self._terminal(mode="dry-run", save_member_attempted=True, save_member_confirmed=True, save_outcome="confirmed", readback_found=True, readback_match=True)
+        self.assertGreater(contr, 0)
 
     # ---- Cross-language hash agreement ---- #
     def _cross_language_hash(self, payload_overrides=None):
@@ -247,14 +293,109 @@ class PowerShellRunnerTests(unittest.TestCase):
         self.assertTrue(info["firstAcquired"])
         self.assertTrue(info["secondBlocked"])
 
-    # ---- Runner refusal / mismatch paths (pre-AutoCount) ---- #
-    def _run_runner(self, package_path, *extra):
-        state = self.tmp / "runstate"
+    # ---- Business gate (finding 1): pinned config + ExpiryDate capability ---- #
+    def _business(self, config_obj):
+        cfg_path = self.tmp / "biz.json"
+        cfg_path.write_text(json.dumps(config_obj), encoding="utf-8")
+        proc = self._ps(self.probe, "-Lib", str(LIB), "-Op", "business", "-Package", str(cfg_path))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return json.loads(proc.stdout)
+
+    def test_repo_config_is_not_confirmed_and_capability_blocks(self):
+        cfg = json.loads(BUSINESS_CONFIG.read_text(encoding="utf-8"))
+        gate = self._business(cfg)
+        self.assertFalse(gate["confirmed"])
+        self.assertIn("expiry_date_capability_unproven", gate["reasons"])
+
+    def test_all_true_config_still_blocked_by_capability(self):
+        cfg = {
+            "schema_version": "member_create_uat_business_confirmation/v1",
+            "confirmations": {
+                f: {"confirmed": True, "reason": "x"}
+                for f in ("MemberType", "RegisterDate", "ExpiryDate", "OpeningPoints")
+            },
+        }
+        gate = self._business(cfg)
+        self.assertFalse(gate["confirmed"], "four true booleans must NOT confirm while ExpiryDate is unproven")
+        self.assertIn("expiry_date_capability_unproven", gate["reasons"])
+
+    def test_wrong_schema_version_rejected(self):
+        cfg = {"schema_version": "wrong/v9", "confirmations": {}}
+        gate = self._business(cfg)
+        self.assertFalse(gate["confirmed"])
+        self.assertIn("schema_version_mismatch", gate["reasons"])
+
+    # ---- Durable write (finding 2) ---- #
+    def test_durable_artifact_never_overwrites(self):
+        d = self.tmp / "durable"
+        d.mkdir(exist_ok=True)
+        proc = self._ps(self.probe, "-Lib", str(LIB), "-Op", "durable", "-Dir", str(d))
+        info = json.loads(proc.stdout)
+        self.assertTrue(info["exists"])
+        self.assertTrue(info["noClobber"], "a second durable write to an existing path must fail closed")
+
+    # ---- Read-back (finding 3) ---- #
+    def test_readback_normalizes_date_decimal_blank_bool(self):
+        proc = self._ps(self.probe, "-Lib", str(LIB), "-Op", "readback", "-Dir", str(self.tmp))
+        info = json.loads(proc.stdout)
+        self.assertTrue(info["goodMatch"], "date/decimal/blank/bool representations must normalise to a match")
+        self.assertFalse(info["badMatch"])
+        self.assertIn("Name", info["badMismatches"])
+
+    # ---- Durable recovery (finding 2): none permits an automatic second save ---- #
+    def _seed_marker(self, state_dir, name, package):
+        marker = {
+            "operation_id": package["operation_id"], "approval_id": package["approval"]["approval_id"],
+            "payload_hash": package["payload_hash"], "source_record_id": package["source_record_id"],
+            "source_fingerprint": package["source_fingerprint"], "recorded_at_utc": "2026-07-23T00:00:00Z",
+        }
+        (Path(state_dir) / name).write_text(json.dumps(marker), encoding="utf-8")
+
+    def test_recovery_consumed_without_terminal_is_uncertain(self):
+        pkg = fx.build_valid_package()
+        pkg_path = self.tmp / "rec_pkg.json"
+        fx.write_package(pkg_path, pkg)
+        state = self.tmp / "rec_state1"
         state.mkdir(exist_ok=True)
+        self._seed_marker(state, f"consumed_{pkg['source_record_id']}.marker", pkg)
+        proc = self._run_runner(pkg_path, state_dir=state)  # dry-run reaches recovery without AutoCount
+        result = json.loads(proc.stdout)
+        self.assertEqual(result["recovery_state"], "consumed_no_terminal")
+        self.assertEqual(result["terminal_code"], "WRITE_OUTCOME_UNCERTAIN")
+        self.assertFalse(result["authentication_success"])
+
+    def test_recovery_intent_without_consumed_is_failed_before_write(self):
+        pkg = fx.build_valid_package()
+        pkg_path = self.tmp / "rec_pkg2.json"
+        fx.write_package(pkg_path, pkg)
+        state = self.tmp / "rec_state2"
+        state.mkdir(exist_ok=True)
+        self._seed_marker(state, f"write_intent_{pkg['operation_id']}.marker", pkg)
+        proc = self._run_runner(pkg_path, state_dir=state)
+        result = json.loads(proc.stdout)
+        self.assertEqual(result["recovery_state"], "intent_no_consumed")
+        self.assertEqual(result["terminal_code"], "FAILED_BEFORE_WRITE")
+
+    def test_recovery_terminal_exists_is_package_already_consumed(self):
+        pkg = fx.build_valid_package()
+        pkg_path = self.tmp / "rec_pkg3.json"
+        fx.write_package(pkg_path, pkg)
+        state = self.tmp / "rec_state3"
+        state.mkdir(exist_ok=True)
+        (state / f"result_{pkg['operation_id']}.json").write_text(json.dumps({"terminal_code": "CREATED_VERIFIED"}), encoding="utf-8")
+        proc = self._run_runner(pkg_path, state_dir=state)
+        result = json.loads(proc.stdout)
+        self.assertEqual(result["recovery_state"], "terminal_exists")
+        self.assertEqual(result["terminal_code"], "PACKAGE_ALREADY_CONSUMED")
+
+    # ---- Runner refusal / mismatch paths (pre-AutoCount) ---- #
+    def _run_runner(self, package_path, *extra, state_dir=None):
+        state = Path(state_dir) if state_dir is not None else (self.tmp / "runstate")
+        state.mkdir(exist_ok=True)
+        # The business config is PINNED inside the runner; there is no override flag.
         cmd = [
             PS, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(RUNNER),
-            "-PackagePath", str(package_path), "-StateDir", str(state),
-            "-BusinessConfigPath", str(BUSINESS_CONFIG), *extra,
+            "-PackagePath", str(package_path), "-StateDir", str(state), *extra,
         ]
         proc = subprocess.run(cmd, capture_output=True, text=True)
         return proc

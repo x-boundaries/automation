@@ -208,6 +208,105 @@ class SchemaSyncTests(unittest.TestCase):
             jsonschema.validate(bad, self.schema)
 
 
+def _write_flags(**over):
+    base = dict(
+        mode="write", package_fingerprint_problem=False, package_structural_valid=True,
+        approval_not_expired=True, write_confirmed=True, business_confirmed=True,
+        lock_acquired=True, recovery_state="none", execution_error=False,
+        member_exists_initial=False, member_exists_recheck=False,
+        save_member_attempted=True, save_member_confirmed=True, save_outcome="confirmed",
+        readback_found=True, readback_match=True,
+    )
+    base.update(over)
+    return base
+
+
+class TerminalStateTests(unittest.TestCase):
+    def test_created_verified_when_all_consistent(self):
+        code, contr = contract.recompute_terminal_state(_write_flags())
+        self.assertEqual(code, "CREATED_VERIFIED")
+        self.assertEqual(contr, [])
+
+    def test_recovery_states_map_deterministically(self):
+        blocked = dict(save_member_attempted=False, save_member_confirmed=False, save_outcome="not_attempted",
+                       readback_found=False, readback_match=False)
+        for state, expected in (
+            ("terminal_exists", "PACKAGE_ALREADY_CONSUMED"),
+            ("consumed_no_terminal", "WRITE_OUTCOME_UNCERTAIN"),
+            ("intent_no_consumed", "FAILED_BEFORE_WRITE"),
+            ("malformed", "WRITE_OUTCOME_UNCERTAIN"),
+        ):
+            code, contr = contract.recompute_terminal_state(_write_flags(recovery_state=state, **blocked))
+            self.assertEqual(code, expected, state)
+            self.assertEqual(contr, [])
+
+    def test_execution_error_maps_by_attempt(self):
+        code, _ = contract.recompute_terminal_state(
+            _write_flags(execution_error=True, save_member_attempted=False, save_member_confirmed=False,
+                         save_outcome="not_attempted", readback_found=False, readback_match=False))
+        self.assertEqual(code, "FAILED_BEFORE_WRITE")
+        code2, _ = contract.recompute_terminal_state(
+            _write_flags(execution_error=True, save_member_confirmed=False, save_outcome="uncertain",
+                         readback_found=False, readback_match=False))
+        self.assertEqual(code2, "WRITE_OUTCOME_UNCERTAIN")
+
+    def test_contradiction_detected(self):
+        # Confirmed save reported in dry-run mode is impossible.
+        _, contr = contract.recompute_terminal_state(
+            dict(mode="dry-run", package_structural_valid=True, package_fingerprint_problem=False,
+                 approval_not_expired=True, lock_acquired=True, recovery_state="none", execution_error=False,
+                 member_exists_initial=False, member_exists_recheck=False, write_confirmed=False,
+                 business_confirmed=False, save_member_attempted=True, save_member_confirmed=True,
+                 save_outcome="confirmed", readback_found=True, readback_match=True))
+        self.assertTrue(contr)
+
+    def test_created_verified_requires_readback_match(self):
+        code, _ = contract.recompute_terminal_state(_write_flags(readback_match=False))
+        self.assertEqual(code, "CREATED_READBACK_MISMATCH")
+        code2, _ = contract.recompute_terminal_state(
+            _write_flags(readback_found=False, readback_match=False))
+        self.assertEqual(code2, "WRITE_OUTCOME_UNCERTAIN")
+
+
+class SchemaEquivalentValidationTests(unittest.TestCase):
+    """Finding 6: intended values, approval ordering, and exact sets."""
+
+    def _rebuild_hash(self, pkg):
+        pkg["payload_hash"] = contract.compute_payload_hash(pkg)
+        pkg["approval"]["bound_package_payload_hash"] = pkg["payload_hash"]
+        return pkg
+
+    def test_wrong_intended_member_type_rejected(self):
+        pkg = fx.build_valid_package({"MemberType": "Gold"})
+        ok, reasons = contract.validate_package(pkg)
+        self.assertFalse(ok)
+        self.assertIn("member_payload_MemberType_not_intended", reasons)
+
+    def test_wrong_intended_expiry_date_rejected(self):
+        pkg = fx.build_valid_package()
+        pkg["desired_business_fields"]["ExpiryDate"] = "2099-01-01"
+        self._rebuild_hash(pkg)
+        ok, reasons = contract.validate_package(pkg)
+        self.assertFalse(ok)
+        self.assertIn("desired_ExpiryDate_not_intended", reasons)
+
+    def test_approval_expiry_before_approved_at_rejected(self):
+        pkg = fx.build_valid_package()
+        pkg["approval"]["expires_at"] = "2000-01-01T00:00:00+00:00"
+        self._rebuild_hash(pkg)
+        ok, reasons = contract.validate_package(pkg)
+        self.assertFalse(ok)
+        self.assertIn("approval_expiry_not_after_approved_at", reasons)
+
+    def test_extra_approval_field_rejected(self):
+        pkg = fx.build_valid_package()
+        pkg["approval"]["sneaky"] = 1
+        self._rebuild_hash(pkg)
+        ok, reasons = contract.validate_package(pkg)
+        self.assertFalse(ok)
+        self.assertIn("approval_field_set_mismatch", reasons)
+
+
 class TerminalCodeTests(unittest.TestCase):
     def test_required_codes_present(self):
         for code in (

@@ -29,7 +29,8 @@ def sample_result(**overrides):
         "write_confirmed": True,
         "business_confirmed": True,
         "lock_acquired": True,
-        "already_consumed": False,
+        "recovery_state": "none",
+        "execution_error": False,
         "authentication_success": True,
         "member_command_found": True,
         "get_member_found": True,
@@ -134,6 +135,34 @@ class ResultPrecheckTests(unittest.TestCase):
         code, out = run(["--result-json", str(self.tmp / "nope.json")])
         self.assertEqual(code, 2)
         self.assertIn("shape_error = result_file_missing", out)
+
+    def test_terminal_code_not_matching_flags_rejected(self):
+        # Flags say CREATED_VERIFIED but the stored code claims DRY_RUN_VALIDATED.
+        result, _ = sample_result(terminal_code="DRY_RUN_VALIDATED")
+        self._write(result)
+        code, out = run(["--result-json", str(self.result_path)])
+        self.assertEqual(code, 2)
+        self.assertIn("terminal_code_recomputed_ok = false", out)
+
+    def test_contradictory_flags_rejected(self):
+        # save_member_confirmed with no attempt is impossible.
+        result, _ = sample_result(save_member_attempted=False)
+        self._write(result)
+        code, out = run(["--result-json", str(self.result_path)])
+        self.assertEqual(code, 2)
+        self.assertIn("state_contradiction_count = ", out)
+        self.assertNotIn("state_contradiction_count = 0", out)
+
+    def test_recovery_result_recomputes_ok(self):
+        result, pkg = sample_result(
+            terminal_code="WRITE_OUTCOME_UNCERTAIN", recovery_state="consumed_no_terminal",
+            save_member_attempted=False, save_member_confirmed=False, save_outcome="not_attempted",
+            readback_found=False, readback_match=False,
+        )
+        self._write(result)
+        code, out = run(["--result-json", str(self.result_path)])
+        self.assertEqual(code, 0, out)
+        self.assertIn("terminal_code_recomputed_ok = true", out)
 
     def test_all_terminal_codes_accepted_in_vocabulary(self):
         for code_value in contract.TERMINAL_CODES:

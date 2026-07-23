@@ -19,6 +19,16 @@ $script:CreateUatAssignableFields = @(
 # ExpiryDate is intentionally excluded from assignment until proven.
 $script:CreateUatNeverAssignFields = @("ExpiryDate")
 $script:CreateUatBusinessConfirmationRequired = @("MemberType", "RegisterDate", "ExpiryDate", "OpeningPoints")
+$script:CreateUatDesiredBusinessFields = @("MemberType", "RegisterDate", "ExpiryDate", "OpeningPoints")
+# Intended business-desired values; must match config/member_create_uat_contract.py.
+$script:CreateUatIntended = @{
+    MemberType    = "Default"
+    RegisterDate  = "2026-07-01"
+    ExpiryDate    = "2028-06-30"
+    OpeningPoints = 0
+}
+$script:CreateUatDateRe = '^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])$'
+$script:CreateUatTimestampRe = '^[0-9T:+.Z-]{1,64}$'
 
 # --------------------------------------------------------------------------- #
 # Hashing and canonical JSON
@@ -268,6 +278,11 @@ function Test-CreateUatPackage {
     if (-not (($Package.row_number_hint -is [int] -or $Package.row_number_hint -is [long]) -and [long]$Package.row_number_hint -ge 2)) {
         Add-Reason "row_number_hint_invalid"
     }
+    if ([string]$Package.created_at -notmatch $script:CreateUatTimestampRe) { Add-Reason "created_at_invalid" }
+
+    # Fixed control arrays must match exactly (ordered-equivalent).
+    if (@(Compare-Object $script:CreateUatAssignableFields @($Package.assignable_fields)).Count -ne 0) { Add-Reason "assignable_fields_mismatch" }
+    if (@(Compare-Object $script:CreateUatBusinessConfirmationRequired @($Package.business_confirmation_required)).Count -ne 0) { Add-Reason "business_confirmation_required_mismatch" }
 
     # Field whitelist and exactly-one-record payload.
     $payload = $Package.member_payload
@@ -288,9 +303,29 @@ function Test-CreateUatPackage {
         if ($memberType.Length -lt 1 -or $memberType.Length -gt 20) { Add-Reason "member_type_invalid" }
         if ([string]$payload.RegisterDate -notmatch '^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])$') { Add-Reason "register_date_invalid" }
         if (-not (($payload.OpeningPoints -is [int] -or $payload.OpeningPoints -is [long]) -and [long]$payload.OpeningPoints -eq 0)) { Add-Reason "opening_points_not_zero" }
+        if ($memberType -ne $script:CreateUatIntended.MemberType) { Add-Reason "member_payload_MemberType_not_intended" }
+        if ([string]$payload.RegisterDate -ne $script:CreateUatIntended.RegisterDate) { Add-Reason "member_payload_RegisterDate_not_intended" }
+        if (-not (($payload.OpeningPoints -is [int] -or $payload.OpeningPoints -is [long]) -and [long]$payload.OpeningPoints -eq [long]$script:CreateUatIntended.OpeningPoints)) { Add-Reason "member_payload_OpeningPoints_not_intended" }
     }
     foreach ($never in $script:CreateUatNeverAssignFields) {
         if ($payloadNames -contains $never) { Add-Reason "forbidden_assignable_field" }
+    }
+
+    # desired_business_fields: exact field set, formats/types, and intended values.
+    $desired = $Package.desired_business_fields
+    $desiredNames = @(Get-CreateUatMemberNames $desired)
+    if (@(Compare-Object $script:CreateUatDesiredBusinessFields $desiredNames).Count -ne 0) {
+        Add-Reason "desired_business_fields_mismatch"
+    }
+    else {
+        $desiredMemberType = [string]$desired.MemberType
+        if ($desiredMemberType.Length -lt 1 -or $desiredMemberType.Length -gt 20) { Add-Reason "desired_member_type_invalid" }
+        if ([string]$desired.RegisterDate -notmatch $script:CreateUatDateRe) { Add-Reason "desired_register_date_invalid" }
+        if ([string]$desired.ExpiryDate -notmatch $script:CreateUatDateRe) { Add-Reason "desired_expiry_date_invalid" }
+        if (-not (($desired.OpeningPoints -is [int] -or $desired.OpeningPoints -is [long]) -and [long]$desired.OpeningPoints -eq 0)) { Add-Reason "desired_opening_points_not_zero" }
+        if ([string]$desired.MemberType -ne $script:CreateUatIntended.MemberType) { Add-Reason "desired_MemberType_not_intended" }
+        if ([string]$desired.RegisterDate -ne $script:CreateUatIntended.RegisterDate) { Add-Reason "desired_RegisterDate_not_intended" }
+        if ([string]$desired.ExpiryDate -ne $script:CreateUatIntended.ExpiryDate) { Add-Reason "desired_ExpiryDate_not_intended" }
     }
 
     # Approval binding and payload_hash integrity.
@@ -316,11 +351,28 @@ function Test-CreateUatPackage {
         Add-Reason "source_fingerprint_recompute_error"; $fingerprintProblem = $true
     }
 
-    # Embedded approval internal consistency.
-    if ($Package.approval.source_record_id -ne $Package.source_record_id) { Add-Reason "approval_source_record_id_mismatch"; $fingerprintProblem = $true }
-    if ($Package.approval.source_fingerprint -ne $Package.source_fingerprint) { Add-Reason "approval_source_fingerprint_mismatch"; $fingerprintProblem = $true }
-    if ($Package.approval.decision -ne "approved") { Add-Reason "approval_decision_not_approved" }
-    if ($Package.approval.reviewer_id -notmatch '^[a-z0-9_-]{2,32}$') { Add-Reason "reviewer_id_invalid" }
+    # Embedded approval: exact field set, formats, ordering, identity/fingerprint binding.
+    $approval = $Package.approval
+    $approvalExpected = @("approval_id", "reviewer_id", "decision", "approved_at", "expires_at", "source_record_id", "source_fingerprint", "bound_package_payload_hash")
+    if (@(Compare-Object $approvalExpected @(Get-CreateUatMemberNames $approval)).Count -ne 0) {
+        Add-Reason "approval_field_set_mismatch"
+    }
+    else {
+        if ([string]$approval.approval_id -notmatch '^appr_[0-9a-f]{32}$') { Add-Reason "approval_id_invalid" }
+        if ([string]$approval.reviewer_id -notmatch '^[a-z0-9_-]{2,32}$') { Add-Reason "reviewer_id_invalid" }
+        if ([string]$approval.decision -ne "approved") { Add-Reason "approval_decision_not_approved" }
+        if ([string]$approval.approved_at -notmatch $script:CreateUatTimestampRe) { Add-Reason "approval_approved_at_invalid" }
+        if ([string]$approval.expires_at -notmatch $script:CreateUatTimestampRe) { Add-Reason "approval_expires_at_invalid" }
+        if ([string]$approval.bound_package_payload_hash -notmatch '^sha256:[0-9a-f]{64}$') { Add-Reason "bound_package_payload_hash_invalid"; $fingerprintProblem = $true }
+        try {
+            $ap = [datetime]::Parse([string]$approval.approved_at, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AdjustToUniversal -bor [System.Globalization.DateTimeStyles]::AssumeUniversal)
+            $ex = [datetime]::Parse([string]$approval.expires_at, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AdjustToUniversal -bor [System.Globalization.DateTimeStyles]::AssumeUniversal)
+            if ($ap -ge $ex) { Add-Reason "approval_expiry_not_after_approved_at" }
+        }
+        catch { Add-Reason "approval_timestamp_unparseable" }
+        if ([string]$approval.source_record_id -ne [string]$Package.source_record_id) { Add-Reason "approval_source_record_id_mismatch"; $fingerprintProblem = $true }
+        if ([string]$approval.source_fingerprint -ne [string]$Package.source_fingerprint) { Add-Reason "approval_source_fingerprint_mismatch"; $fingerprintProblem = $true }
+    }
 
     [pscustomobject]@{
         Valid              = ($reasons.Count -eq 0)
@@ -343,15 +395,139 @@ function Test-CreateUatApprovalNotExpired {
     return ($NowUtc -lt $expires)
 }
 
-function Test-CreateUatBusinessConfirmed {
-    # $Confirmations is the parsed 'confirmations' object from the committed config.
-    param([Parameter(Mandatory)][AllowNull()]$Confirmations)
-    if ($null -eq $Confirmations) { return $false }
-    foreach ($field in $script:CreateUatBusinessConfirmationRequired) {
-        $entry = $Confirmations.$field
-        if ($null -eq $entry -or $entry.confirmed -ne $true) { return $false }
+# Code-level capability block (finding 1): ExpiryDate assignment and read-back are
+# not implemented/proven, so even four true confirmations must not make a real write
+# reachable. Flipping this to $true requires implementing ExpiryDate assignment AND
+# its read-back verification (finding 3) in the same change.
+$script:CreateUatExpiryDateAssignmentImplemented = $false
+$script:CreateUatBusinessConfigSchemaVersion = "member_create_uat_business_confirmation/v1"
+
+function Get-CreateUatBusinessGate {
+    # Strictly validate the committed business-confirmation config object and return
+    # whether a real write is permitted. Confirmed requires: exact schema version,
+    # exact four-field confirmations set, each a boolean-typed confirmed=true, AND the
+    # code-level ExpiryDate capability being implemented.
+    param([Parameter(Mandatory)][AllowNull()]$ConfigObject)
+    $reasons = [System.Collections.Generic.List[string]]::new()
+    if ($null -eq $ConfigObject) {
+        $reasons.Add('config_missing')
     }
-    return $true
+    else {
+        if ([string]$ConfigObject.schema_version -ne $script:CreateUatBusinessConfigSchemaVersion) { $reasons.Add('schema_version_mismatch') }
+        $conf = $ConfigObject.confirmations
+        if ($null -eq $conf) {
+            $reasons.Add('confirmations_missing')
+        }
+        elseif (@(Compare-Object $script:CreateUatBusinessConfirmationRequired @(Get-CreateUatMemberNames $conf)).Count -ne 0) {
+            $reasons.Add('confirmations_field_set_mismatch')
+        }
+        else {
+            foreach ($field in $script:CreateUatBusinessConfirmationRequired) {
+                $entry = $conf.$field
+                if ($null -eq $entry -or ($entry.confirmed -isnot [bool])) { $reasons.Add("confirmation_${field}_structure_invalid") }
+                elseif ($entry.confirmed -ne $true) { $reasons.Add("confirmation_${field}_not_confirmed") }
+            }
+        }
+    }
+    if (-not $script:CreateUatExpiryDateAssignmentImplemented) { $reasons.Add('expiry_date_capability_unproven') }
+    [pscustomobject]@{ Confirmed = ($reasons.Count -eq 0); Reasons = $reasons.ToArray() }
+}
+
+# --------------------------------------------------------------------------- #
+# Durable write state (finding 2)
+# --------------------------------------------------------------------------- #
+function Write-CreateUatDurableArtifact {
+    # Exclusive-create a durable artefact. Fails closed if it already exists so a prior
+    # intent/consumed/terminal record is never overwritten. WriteThrough + Flush(true)
+    # push the bytes past OS caches where the platform supports it.
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Content)
+    $stream = [System.IO.FileStream]::new(
+        $Path, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write,
+        [System.IO.FileShare]::None, 4096, [System.IO.FileOptions]::WriteThrough)
+    try {
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($Content)
+        $stream.Write($bytes, 0, $bytes.Length)
+        try { $stream.Flush($true) } catch { $stream.Flush() }
+    }
+    finally { $stream.Dispose() }
+}
+
+function Write-CreateUatDurableResultAtomic {
+    # Same-volume temp + atomic move for the terminal result. Never overwrites a prior
+    # terminal result.
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Content)
+    if (Test-Path -LiteralPath $Path) { throw "Terminal result artefact already exists." }
+    $temp = $Path + ".tmp"
+    if (Test-Path -LiteralPath $temp) { Remove-Item -LiteralPath $temp -Force }
+    Write-CreateUatDurableArtifact -Path $temp -Content $Content
+    [System.IO.File]::Move($temp, $Path)
+}
+
+function New-CreateUatSanitizedMarker {
+    # Sanitised marker body: only the approved identifiers plus a UTC timestamp.
+    param([Parameter(Mandatory)]$Package)
+    [ordered]@{
+        operation_id       = [string]$Package.operation_id
+        approval_id        = [string]$Package.approval.approval_id
+        payload_hash       = [string]$Package.payload_hash
+        source_record_id   = [string]$Package.source_record_id
+        source_fingerprint = [string]$Package.source_fingerprint
+        recorded_at_utc    = [DateTime]::UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ")
+    } | ConvertTo-Json -Depth 4
+}
+
+function Get-CreateUatRecoveryState {
+    # Deterministic recovery classification from the durable artefacts. Never permits
+    # an automatic second SaveMember: any non-'none' state is terminal for this run.
+    param(
+        [Parameter(Mandatory)][string]$StateDir,
+        [Parameter(Mandatory)][string]$OperationId,
+        [Parameter(Mandatory)][string]$SourceRecordId
+    )
+    $consumed = Join-Path $StateDir ("consumed_" + $SourceRecordId + ".marker")
+    $intent = Join-Path $StateDir ("write_intent_" + $OperationId + ".marker")
+    $terminal = Join-Path $StateDir ("result_" + $OperationId + ".json")
+    foreach ($p in @($consumed, $intent, $terminal)) {
+        if (Test-Path -LiteralPath $p) {
+            try { [void](ConvertFrom-CreateUatJson -Raw (Get-Content -LiteralPath $p -Raw -Encoding UTF8)) }
+            catch { return 'malformed' }
+        }
+    }
+    if (Test-Path -LiteralPath $terminal) { return 'terminal_exists' }
+    if (Test-Path -LiteralPath $consumed) { return 'consumed_no_terminal' }
+    if (Test-Path -LiteralPath $intent) { return 'intent_no_consumed' }
+    return 'none'
+}
+
+# --------------------------------------------------------------------------- #
+# Read-back verification (finding 3)
+# --------------------------------------------------------------------------- #
+function Get-CreateUatNormalizedFieldValue {
+    param([AllowNull()]$Value)
+    if ($null -eq $Value -or $Value -is [System.DBNull]) { return '' }
+    if ($Value -is [datetime]) { return $Value.ToString('yyyy-MM-dd') }
+    if ($Value -is [bool]) { if ($Value) { return 'T' } else { return 'F' } }
+    if ($Value -is [decimal] -or $Value -is [double] -or $Value -is [int] -or $Value -is [long]) {
+        # Canonical numeric string: strip trailing zeros/scale so [decimal]0.0 and 0 match.
+        return ([decimal]$Value).ToString('0.#############################', [System.Globalization.CultureInfo]::InvariantCulture)
+    }
+    return ([string]$Value).Trim()
+}
+
+function Test-CreateUatReadbackMatch {
+    # Compare every assigned field to the read-back row value, normalising AutoCount
+    # date / decimal / blank / boolean-string representations explicitly.
+    param([Parameter(Mandatory)]$Assigned, [Parameter(Mandatory)]$Readback)
+    $mismatches = [System.Collections.Generic.List[string]]::new()
+    foreach ($field in @(Get-CreateUatMemberNames $Assigned)) {
+        $a = Get-CreateUatNormalizedFieldValue $Assigned[$field]
+        $rbValue = $null
+        if ($Readback -is [System.Collections.IDictionary] -and $Readback.Contains($field)) { $rbValue = $Readback[$field] }
+        elseif ($Readback -isnot [System.Collections.IDictionary]) { $rbValue = $Readback.$field }
+        $b = Get-CreateUatNormalizedFieldValue $rbValue
+        if ($a -ne $b) { $mismatches.Add($field) }
+    }
+    [pscustomobject]@{ Match = ($mismatches.Count -eq 0); Mismatches = $mismatches.ToArray() }
 }
 
 # --------------------------------------------------------------------------- #
@@ -384,28 +560,77 @@ function Get-CreateUatMaskedMemberNo {
 }
 
 # --------------------------------------------------------------------------- #
-# Pure terminal-state decision
+# Canonical terminal-state table (finding 4).
+#
+# $Flags is a hashtable / ordered dictionary keyed exactly like the runner result
+# (snake_case), so the runner passes its $result straight in, the Python result
+# precheck recomputes the same way, and the n8n code applies the same table.
 # --------------------------------------------------------------------------- #
-function Get-CreateUatTerminalCode {
-    # Deterministic ordered decision. $Ctx is a hashtable of booleans plus SaveOutcome
-    # in { "not_attempted", "confirmed", "uncertain" }.
-    param([Parameter(Mandatory)][hashtable]$Ctx)
+function Get-CreateUatFlag { param($Flags, [string]$Name, $Default = $null)
+    if ($Flags.Contains($Name)) { return $Flags[$Name] }
+    return $Default
+}
 
-    if ($Ctx.PackageFingerprintProblem) { return "SOURCE_FINGERPRINT_MISMATCH" }
-    if (-not $Ctx.PackageValid) { return "FAILED_BEFORE_WRITE" }
-    if ($Ctx.ApprovalExpired) { return "APPROVAL_INVALID" }
-    if ($Ctx.ForWrite -and -not $Ctx.WriteConfirmed) { return "WRITE_NOT_CONFIRMED" }
-    if ($Ctx.ForWrite -and -not $Ctx.BusinessConfirmed) { return "OPERATOR_CONFIG_REQUIRED" }
-    if (-not $Ctx.LockAcquired) { return "EXECUTION_LOCKED" }
-    if ($Ctx.AlreadyConsumed) { return "PACKAGE_ALREADY_CONSUMED" }
-    if ($Ctx.MemberExistsInitial) { return "BLOCKED_MEMBER_EXISTS" }
-    if (-not $Ctx.ForWrite) { return "DRY_RUN_VALIDATED" }
-    if ($Ctx.MemberExistsRecheck) { return "BLOCKED_MEMBER_EXISTS" }
-    switch ($Ctx.SaveOutcome) {
-        "uncertain" { return "WRITE_OUTCOME_UNCERTAIN" }
-        "confirmed" {
-            if ($Ctx.ReadbackMatch) { return "CREATED_VERIFIED" } else { return "CREATED_READBACK_MISMATCH" }
-        }
-        default { return "FAILED_BEFORE_WRITE" }
+function Get-CreateUatStateContradictions {
+    param([Parameter(Mandatory)]$Flags)
+    $reasons = [System.Collections.Generic.List[string]]::new()
+    $mode = Get-CreateUatFlag $Flags 'mode'
+    $write = ($mode -eq 'write')
+    $attempted = [bool](Get-CreateUatFlag $Flags 'save_member_attempted' $false)
+    $confirmed = [bool](Get-CreateUatFlag $Flags 'save_member_confirmed' $false)
+    $outcome = Get-CreateUatFlag $Flags 'save_outcome' 'not_attempted'
+    $rbFound = [bool](Get-CreateUatFlag $Flags 'readback_found' $false)
+    $rbMatch = [bool](Get-CreateUatFlag $Flags 'readback_match' $false)
+
+    if ($mode -ne 'dry-run' -and $mode -ne 'write') { $reasons.Add('mode_invalid') }
+    if (@('none', 'terminal_exists', 'consumed_no_terminal', 'intent_no_consumed', 'malformed') -notcontains (Get-CreateUatFlag $Flags 'recovery_state' 'none')) { $reasons.Add('recovery_state_invalid') }
+    if (@('not_attempted', 'confirmed', 'uncertain') -notcontains $outcome) { $reasons.Add('save_outcome_invalid') }
+    if ($confirmed -and -not $attempted) { $reasons.Add('confirmed_without_attempt') }
+    if ($outcome -eq 'confirmed' -and -not $confirmed) { $reasons.Add('outcome_confirmed_without_confirmed_flag') }
+    if ($outcome -eq 'not_attempted' -and $attempted) { $reasons.Add('not_attempted_but_attempted') }
+    if ($outcome -eq 'uncertain' -and -not $attempted) { $reasons.Add('uncertain_without_attempt') }
+    if ($rbMatch -and -not $rbFound) { $reasons.Add('match_without_found') }
+    if (($rbFound -or $rbMatch) -and $outcome -ne 'confirmed') { $reasons.Add('readback_without_confirmed_save') }
+    if ($attempted -and -not $write) { $reasons.Add('attempt_in_non_write_mode') }
+    if ($attempted -and -not [bool](Get-CreateUatFlag $Flags 'lock_acquired' $false)) { $reasons.Add('attempt_without_lock') }
+    if (-not $write -and (
+            [bool](Get-CreateUatFlag $Flags 'write_confirmed' $false) -or
+            [bool](Get-CreateUatFlag $Flags 'member_exists_recheck' $false) -or
+            $attempted -or $confirmed -or ($outcome -ne 'not_attempted'))) {
+        $reasons.Add('dry_run_has_write_state')
     }
+    return $reasons.ToArray()
+}
+
+function Get-CreateUatTerminalCode {
+    param([Parameter(Mandatory)]$Flags)
+    $write = ((Get-CreateUatFlag $Flags 'mode') -eq 'write')
+    $recovery = Get-CreateUatFlag $Flags 'recovery_state' 'none'
+    $outcome = Get-CreateUatFlag $Flags 'save_outcome' 'not_attempted'
+
+    if ([bool](Get-CreateUatFlag $Flags 'package_fingerprint_problem' $false)) { return 'SOURCE_FINGERPRINT_MISMATCH' }
+    if (-not [bool](Get-CreateUatFlag $Flags 'package_structural_valid' $false)) { return 'FAILED_BEFORE_WRITE' }
+    if (-not [bool](Get-CreateUatFlag $Flags 'approval_not_expired' $false)) { return 'APPROVAL_INVALID' }
+    if ($write -and -not [bool](Get-CreateUatFlag $Flags 'write_confirmed' $false)) { return 'WRITE_NOT_CONFIRMED' }
+    if ($write -and -not [bool](Get-CreateUatFlag $Flags 'business_confirmed' $false)) { return 'OPERATOR_CONFIG_REQUIRED' }
+    if (-not [bool](Get-CreateUatFlag $Flags 'lock_acquired' $false)) { return 'EXECUTION_LOCKED' }
+    if ($recovery -eq 'terminal_exists') { return 'PACKAGE_ALREADY_CONSUMED' }
+    if ($recovery -eq 'consumed_no_terminal') { return 'WRITE_OUTCOME_UNCERTAIN' }
+    if ($recovery -eq 'intent_no_consumed') { return 'FAILED_BEFORE_WRITE' }
+    if ($recovery -eq 'malformed') { return 'WRITE_OUTCOME_UNCERTAIN' }
+    if ([bool](Get-CreateUatFlag $Flags 'execution_error' $false)) {
+        if ([bool](Get-CreateUatFlag $Flags 'save_member_attempted' $false)) { return 'WRITE_OUTCOME_UNCERTAIN' }
+        return 'FAILED_BEFORE_WRITE'
+    }
+    if ([bool](Get-CreateUatFlag $Flags 'member_exists_initial' $false)) { return 'BLOCKED_MEMBER_EXISTS' }
+    if (-not $write) { return 'DRY_RUN_VALIDATED' }
+    if ([bool](Get-CreateUatFlag $Flags 'member_exists_recheck' $false)) { return 'BLOCKED_MEMBER_EXISTS' }
+    if ($outcome -eq 'uncertain') { return 'WRITE_OUTCOME_UNCERTAIN' }
+    if ($outcome -eq 'not_attempted') { return 'FAILED_BEFORE_WRITE' }
+    if ($outcome -eq 'confirmed') {
+        if (-not [bool](Get-CreateUatFlag $Flags 'readback_found' $false)) { return 'WRITE_OUTCOME_UNCERTAIN' }
+        if ([bool](Get-CreateUatFlag $Flags 'readback_match' $false)) { return 'CREATED_VERIFIED' }
+        return 'CREATED_READBACK_MISMATCH'
+    }
+    return 'FAILED_BEFORE_WRITE'
 }

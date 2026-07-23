@@ -105,6 +105,140 @@ TERMINAL_CODES = frozenset(
     }
 )
 
+RECOVERY_STATES = frozenset(
+    {"none", "terminal_exists", "consumed_no_terminal", "intent_no_consumed", "malformed"}
+)
+SAVE_OUTCOMES = frozenset({"not_attempted", "confirmed", "uncertain"})
+
+# The single canonical set of result flags the terminal-state table reads. Kept here
+# so the PowerShell runner, this module (result precheck), and the n8n validation code
+# all agree on the exact relationship between state and terminal_code.
+TERMINAL_STATE_FLAGS = (
+    "mode",
+    "package_fingerprint_problem",
+    "package_structural_valid",
+    "approval_not_expired",
+    "write_confirmed",
+    "business_confirmed",
+    "lock_acquired",
+    "recovery_state",
+    "execution_error",
+    "member_exists_initial",
+    "member_exists_recheck",
+    "save_member_attempted",
+    "save_member_confirmed",
+    "save_outcome",
+    "readback_found",
+    "readback_match",
+)
+
+
+def terminal_state_contradictions(flags):
+    """Return a list of impossible-flag reasons; empty means internally consistent.
+
+    A recognised terminal code paired with a physically impossible flag combination
+    is rejected here (finding 4), independent of the recomputed code.
+    """
+    reasons = []
+    mode = flags.get("mode")
+    write = mode == "write"
+    attempted = bool(flags.get("save_member_attempted"))
+    confirmed = bool(flags.get("save_member_confirmed"))
+    outcome = flags.get("save_outcome")
+    rb_found = bool(flags.get("readback_found"))
+    rb_match = bool(flags.get("readback_match"))
+
+    if mode not in ("dry-run", "write"):
+        reasons.append("mode_invalid")
+    if flags.get("recovery_state") not in RECOVERY_STATES:
+        reasons.append("recovery_state_invalid")
+    if outcome not in SAVE_OUTCOMES:
+        reasons.append("save_outcome_invalid")
+    if confirmed and not attempted:
+        reasons.append("confirmed_without_attempt")
+    if outcome == "confirmed" and not confirmed:
+        reasons.append("outcome_confirmed_without_confirmed_flag")
+    if outcome == "not_attempted" and attempted:
+        reasons.append("not_attempted_but_attempted")
+    if outcome == "uncertain" and not attempted:
+        reasons.append("uncertain_without_attempt")
+    if rb_match and not rb_found:
+        reasons.append("match_without_found")
+    if (rb_found or rb_match) and outcome != "confirmed":
+        reasons.append("readback_without_confirmed_save")
+    if attempted and not write:
+        reasons.append("attempt_in_non_write_mode")
+    if attempted and not flags.get("lock_acquired"):
+        reasons.append("attempt_without_lock")
+    if not write and (
+        bool(flags.get("write_confirmed"))
+        or bool(flags.get("member_exists_recheck"))
+        or attempted
+        or confirmed
+        or outcome != "not_attempted"
+    ):
+        reasons.append("dry_run_has_write_state")
+    return reasons
+
+
+def recompute_terminal_state(flags):
+    """Canonical terminal-state table. Returns (code, contradictions).
+
+    The ordered rules mirror the runner's gate order exactly, so the runner can
+    derive its own terminal_code from this function, the result precheck can
+    recompute-and-compare, and the n8n validation code can apply the same table.
+    """
+    contradictions = terminal_state_contradictions(flags)
+    write = flags.get("mode") == "write"
+    recovery = flags.get("recovery_state", "none")
+    outcome = flags.get("save_outcome", "not_attempted")
+
+    if flags.get("package_fingerprint_problem"):
+        code = "SOURCE_FINGERPRINT_MISMATCH"
+    elif not flags.get("package_structural_valid"):
+        code = "FAILED_BEFORE_WRITE"
+    elif not flags.get("approval_not_expired"):
+        code = "APPROVAL_INVALID"
+    elif write and not flags.get("write_confirmed"):
+        code = "WRITE_NOT_CONFIRMED"
+    elif write and not flags.get("business_confirmed"):
+        code = "OPERATOR_CONFIG_REQUIRED"
+    elif not flags.get("lock_acquired"):
+        code = "EXECUTION_LOCKED"
+    elif recovery == "terminal_exists":
+        code = "PACKAGE_ALREADY_CONSUMED"
+    elif recovery == "consumed_no_terminal":
+        code = "WRITE_OUTCOME_UNCERTAIN"
+    elif recovery == "intent_no_consumed":
+        code = "FAILED_BEFORE_WRITE"
+    elif recovery == "malformed":
+        code = "WRITE_OUTCOME_UNCERTAIN"
+    elif flags.get("execution_error"):
+        # An unhandled runtime error: uncertain if a save had begun, otherwise a
+        # confirmed failure before any write.
+        code = "WRITE_OUTCOME_UNCERTAIN" if flags.get("save_member_attempted") else "FAILED_BEFORE_WRITE"
+    elif flags.get("member_exists_initial"):
+        code = "BLOCKED_MEMBER_EXISTS"
+    elif not write:
+        code = "DRY_RUN_VALIDATED"
+    elif flags.get("member_exists_recheck"):
+        code = "BLOCKED_MEMBER_EXISTS"
+    elif outcome == "uncertain":
+        code = "WRITE_OUTCOME_UNCERTAIN"
+    elif outcome == "not_attempted":
+        code = "FAILED_BEFORE_WRITE"
+    elif outcome == "confirmed":
+        if not flags.get("readback_found"):
+            code = "WRITE_OUTCOME_UNCERTAIN"
+        elif flags.get("readback_match"):
+            code = "CREATED_VERIFIED"
+        else:
+            code = "CREATED_READBACK_MISMATCH"
+    else:
+        code = "FAILED_BEFORE_WRITE"
+    return code, contradictions
+
+
 SAFE_TIMESTAMP_RE = re.compile(r"^[0-9T:+.Z-]{1,64}$")
 REVIEWER_ID_RE = re.compile(r"^[a-z0-9_-]{2,32}$")
 OPERATION_ID_RE = re.compile(r"^mcuat_[0-9a-f]{32}$")
@@ -269,6 +403,10 @@ def _validate_member_payload(payload, reasons):
     for forbidden in NEVER_ASSIGN_FIELDS:
         if forbidden in payload:
             reasons.append("forbidden_assignable_field")
+    # Intended business values must match the reviewed constants exactly.
+    for field in ("MemberType", "RegisterDate", "OpeningPoints"):
+        if field in payload and payload[field] != INTENDED_BUSINESS_VALUES[field]:
+            reasons.append(f"member_payload_{field}_not_intended")
 
 
 def _validate_desired_business(desired, reasons):
@@ -283,6 +421,9 @@ def _validate_desired_business(desired, reasons):
         reasons.append("desired_expiry_date_invalid")
     if desired["OpeningPoints"] != 0 or not _is_int(desired["OpeningPoints"]):
         reasons.append("desired_opening_points_not_zero")
+    for field in DESIRED_BUSINESS_FIELDS:
+        if field in desired and desired[field] != INTENDED_BUSINESS_VALUES[field]:
+            reasons.append(f"desired_{field}_not_intended")
 
 
 def _validate_approval_block(package, reasons):
@@ -312,6 +453,14 @@ def _validate_approval_block(package, reasons):
     for key in ("approved_at", "expires_at"):
         if not (isinstance(approval[key], str) and SAFE_TIMESTAMP_RE.fullmatch(approval[key])):
             reasons.append(f"approval_{key}_invalid")
+    # approved_at must strictly precede expires_at.
+    try:
+        from datetime import datetime as _dt
+
+        if _dt.fromisoformat(approval["approved_at"]) >= _dt.fromisoformat(approval["expires_at"]):
+            reasons.append("approval_expiry_not_after_approved_at")
+    except (ValueError, TypeError, KeyError):
+        reasons.append("approval_timestamp_unparseable")
     if approval.get("source_record_id") != package.get("source_record_id"):
         reasons.append("approval_source_record_id_mismatch")
     if approval.get("source_fingerprint") != package.get("source_fingerprint"):

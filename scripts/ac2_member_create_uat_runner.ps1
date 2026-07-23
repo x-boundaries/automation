@@ -2,8 +2,6 @@
 param(
     # The single immutable approved package. Loaded and validated once, in-process.
     [Parameter(Mandatory)][string]$PackagePath,
-    # Committed fail-closed business confirmation config (default: repo config).
-    [string]$BusinessConfigPath,
     # VM-owned state directory for the exclusive lock, write-intent and consumed markers.
     [Parameter(Mandatory)][string]$StateDir,
     [string]$AcRoot = "C:\Program Files\AutoCount\Accounting 2.2",
@@ -27,9 +25,9 @@ $ErrorActionPreference = "Stop"
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 . (Join-Path $scriptDir "member_create_uat_runner_lib.ps1")
 
-if ([string]::IsNullOrWhiteSpace($BusinessConfigPath)) {
-    $BusinessConfigPath = Join-Path (Split-Path -Parent $scriptDir) "config\member_create_uat_business_confirmation.json"
-}
+# The business-confirmation config is PINNED to the reviewed repository path. Write
+# mode never trusts an operator-supplied config location (finding 1).
+$businessConfigPath = Join-Path (Split-Path -Parent $scriptDir) "config\member_create_uat_business_confirmation.json"
 
 $forWrite = [bool]$EnableMemberCreateUat
 $writeConfirmed = $EnableMemberCreateUat -and $ConfirmAutoCountWrite -and $ConfirmExactlyOneMember -and `
@@ -45,7 +43,8 @@ $result = [ordered]@{
     write_confirmed             = [bool]$writeConfirmed
     business_confirmed          = $false
     lock_acquired               = $false
-    already_consumed            = $false
+    recovery_state              = "none"
+    execution_error             = $false
     authentication_success      = $false
     member_command_found        = $false
     get_member_found            = $false
@@ -108,7 +107,13 @@ function Set-MemberRowValue { param([System.Data.DataRow]$Row, [string]$Field, [
 }
 function Get-RowStringValue { param([System.Data.DataRow]$Row, [string]$Field)
     if ($null -eq $Row -or -not $Row.Table.Columns.Contains($Field)) { return "" }
-    $v = $Row[$Field]; if ($null -eq $v -or $v -eq [System.DBNull]::Value) { return "" }; [string]$v
+    $v = $Row[$Field]; if ($null -eq $v -or $v -is [System.DBNull]) { return "" }; [string]$v
+}
+function Get-RowRawValue { param([System.Data.DataRow]$Row, [string]$Field)
+    # Raw typed value (DateTime/Decimal/String) or $null; the read-back comparison
+    # normalises representations itself.
+    if ($null -eq $Row -or -not $Row.Table.Columns.Contains($Field)) { return $null }
+    $v = $Row[$Field]; if ($v -is [System.DBNull]) { return $null }; return $v
 }
 
 # --------------------------------------------------------------------------- #
@@ -124,8 +129,10 @@ function Invoke-CreateUatSaveMemberOnce {
 }
 
 function Write-CreateUatResult {
-    param([string]$TerminalCode)
-    $result.terminal_code = $TerminalCode
+    # Derive the terminal code from the canonical state table (finding 4) using the
+    # flags accumulated in $result, so the runner, the Python precheck, and the n8n
+    # code all agree. Emits the sanitised result to stdout and the optional JsonOut.
+    $result.terminal_code = Get-CreateUatTerminalCode -Flags $result
     $safe = $result | ConvertTo-Json -Depth 8
     if (-not [string]::IsNullOrWhiteSpace($JsonOut)) {
         $p = [System.IO.Path]::GetFullPath($JsonOut)
@@ -134,6 +141,18 @@ function Write-CreateUatResult {
         Set-Content -LiteralPath $p -Value $safe -Encoding UTF8
     }
     $safe
+}
+
+function Save-CreateUatTerminalArtifact {
+    # Persist the durable, write-once terminal result (atomic) so a later run sees
+    # terminal_exists and never re-attempts. Best-effort: a persistence failure must
+    # not mask the outcome, and the consumed marker already blocks a second attempt.
+    if ([string]::IsNullOrWhiteSpace($terminalResultPath)) { return }
+    try {
+        $result.terminal_code = Get-CreateUatTerminalCode -Flags $result
+        Write-CreateUatDurableResultAtomic -Path $terminalResultPath -Content ($result | ConvertTo-Json -Depth 8)
+    }
+    catch { }
 }
 
 $lockStream = $null
@@ -155,32 +174,42 @@ try {
     $result.source_fingerprint = [string]$package.source_fingerprint
     $result.masked_member_no = Get-CreateUatMaskedMemberNo -MemberNo ([string]$package.member_payload.MemberNo)
 
-    if ($validation.FingerprintProblem) { return (Write-CreateUatResult "SOURCE_FINGERPRINT_MISMATCH") }
-    if (-not $validation.Valid) { return (Write-CreateUatResult "FAILED_BEFORE_WRITE") }
+    if ($validation.FingerprintProblem) { return (Write-CreateUatResult) }
+    if (-not $validation.Valid) { return (Write-CreateUatResult) }
 
     # ---- 2. Approval expiry (uses VM wall clock). ----
     $result.approval_not_expired = Test-CreateUatApprovalNotExpired -Package $package -NowUtc ([datetime]::UtcNow)
-    if (-not $result.approval_not_expired) { return (Write-CreateUatResult "APPROVAL_INVALID") }
+    if (-not $result.approval_not_expired) { return (Write-CreateUatResult) }
 
-    # ---- 3. Write-mode confirmations and business gate: BEFORE any AutoCount load. ----
-    if ($forWrite -and -not $writeConfirmed) { return (Write-CreateUatResult "WRITE_NOT_CONFIRMED") }
+    # ---- 3. Write confirmations and the PINNED fail-closed business gate: before any
+    #         AutoCount load. The config path is fixed to the reviewed repo file; an
+    #         operator-supplied path is never trusted. The gate also enforces the
+    #         code-level ExpiryDate capability block, so four true booleans alone can
+    #         never make a real write reachable. ----
+    if ($forWrite -and -not $writeConfirmed) { return (Write-CreateUatResult) }
 
-    $confirmations = $null
-    if (Test-Path -LiteralPath $BusinessConfigPath) {
-        try { $confirmations = (ConvertFrom-CreateUatJson -Raw (Get-Content -LiteralPath $BusinessConfigPath -Raw -Encoding UTF8)).confirmations } catch { $confirmations = $null }
+    $businessConfig = $null
+    if (Test-Path -LiteralPath $businessConfigPath) {
+        try { $businessConfig = ConvertFrom-CreateUatJson -Raw (Get-Content -LiteralPath $businessConfigPath -Raw -Encoding UTF8) } catch { $businessConfig = $null }
     }
-    $result.business_confirmed = Test-CreateUatBusinessConfirmed -Confirmations $confirmations
-    if ($forWrite -and -not $result.business_confirmed) { return (Write-CreateUatResult "OPERATOR_CONFIG_REQUIRED") }
+    $gate = Get-CreateUatBusinessGate -ConfigObject $businessConfig
+    $result.business_confirmed = $gate.Confirmed
+    if ($forWrite -and -not $result.business_confirmed) { return (Write-CreateUatResult) }
 
     # ---- 4. Exclusive execution lock (VM-owned). ----
     if (-not (Test-Path -LiteralPath $StateDir)) { throw "The VM state directory does not exist (operator setup prerequisite)." }
     $lockStream = New-CreateUatExclusiveLock -LockPath $lockPath
     $result.lock_acquired = ($null -ne $lockStream)
-    if (-not $result.lock_acquired) { return (Write-CreateUatResult "EXECUTION_LOCKED") }
+    if (-not $result.lock_acquired) { return (Write-CreateUatResult) }
 
-    # ---- 5. Single-use consumed marker check (VM-owned). ----
+    # ---- 5. Durable-state recovery (VM-owned). Any prior intent/consumed/terminal
+    #         artefact for this operation or member is terminal for this run and never
+    #         permits an automatic second SaveMember. ----
     $consumedPath = Join-Path $StateDir ("consumed_" + $result.source_record_id + ".marker")
-    if (Test-Path -LiteralPath $consumedPath) { $result.already_consumed = $true; return (Write-CreateUatResult "PACKAGE_ALREADY_CONSUMED") }
+    $writeIntentPath = Join-Path $StateDir ("write_intent_" + $result.operation_id + ".marker")
+    $terminalResultPath = Join-Path $StateDir ("result_" + $result.operation_id + ".json")
+    $result.recovery_state = Get-CreateUatRecoveryState -StateDir $StateDir -OperationId $result.operation_id -SourceRecordId $result.source_record_id
+    if ($result.recovery_state -ne 'none') { return (Write-CreateUatResult) }
 
     # ---- 6. Load AutoCount and authenticate (only now). ----
     $server = $ServerName; $database = $DatabaseName; $user = $UserId
@@ -250,7 +279,7 @@ try {
 
     $existing = $getMemberMethod.Invoke($memberCommand, @($memberNo))
     $result.member_exists_initial = ($null -ne $existing)
-    if ($result.member_exists_initial) { return (Write-CreateUatResult "BLOCKED_MEMBER_EXISTS") }
+    if ($result.member_exists_initial) { return (Write-CreateUatResult) }
 
     # ---- 8. NewMember(false) + whitelisted assignment (ExpiryDate never assigned). ----
     $newMemberMethod = Find-PublicInstanceMethod $memberCommandType "NewMember" 1
@@ -294,12 +323,12 @@ try {
     $result.assignment_success = $true
 
     # ---- 9. Dry-run stops here: no SaveMember. ----
-    if (-not $forWrite) { return (Write-CreateUatResult "DRY_RUN_VALIDATED") }
+    if (-not $forWrite) { return (Write-CreateUatResult) }
 
     # ---- 10. Write path: fresh duplicate recheck immediately before save. ----
     $recheck = $getMemberMethod.Invoke($memberCommand, @($memberNo))
     $result.member_exists_recheck = ($null -ne $recheck)
-    if ($result.member_exists_recheck) { return (Write-CreateUatResult "BLOCKED_MEMBER_EXISTS") }
+    if ($result.member_exists_recheck) { return (Write-CreateUatResult) }
 
     $saveMemberMethod = $null
     foreach ($m in $memberCommandType.GetMethods([System.Reflection.BindingFlags]::Public -bor [System.Reflection.BindingFlags]::Instance)) {
@@ -309,18 +338,11 @@ try {
     }
     if ($null -eq $saveMemberMethod) { throw "SaveMember member entity method was not found." }
 
-    # Durable write-intent marker, then mark consumed BEFORE entering the irreversible section.
-    $writeIntentPath = Join-Path $StateDir ("write_intent_" + $result.operation_id + ".marker")
-    $markerBody = ($result | ConvertTo-Json -Depth 8)
-    Set-Content -LiteralPath $writeIntentPath -Value $markerBody -Encoding UTF8
+    # Durable write-intent marker (sanitised ids only), then the durable consumed marker
+    # BEFORE entering the irreversible section. Both exclusive-create and never overwrite.
+    Write-CreateUatDurableArtifact -Path $writeIntentPath -Content (New-CreateUatSanitizedMarker -Package $package)
     $result.write_intent_recorded = $true
-
-    $consumedStream = [System.IO.File]::Open($consumedPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
-    try {
-        $bytes = [System.Text.Encoding]::UTF8.GetBytes("consumed operation_id=" + $result.operation_id)
-        $consumedStream.Write($bytes, 0, $bytes.Length); $consumedStream.Flush()
-    }
-    finally { $consumedStream.Close(); $consumedStream.Dispose() }
+    Write-CreateUatDurableArtifact -Path $consumedPath -Content (New-CreateUatSanitizedMarker -Package $package)
     $result.consumed_marker_written = $true
 
     # ---- 11. The single irreversible SaveMember. No retry after this begins. ----
@@ -334,42 +356,44 @@ try {
         # The call began; we cannot prove whether the write committed. Do not retry,
         # delete, or update. Require a separate read-only recovery check.
         $result.save_outcome = "uncertain"
+        $result.execution_error = $true
         $result.error = [ordered]@{ phase = "save"; message = "Save outcome could not be confirmed." }
-        return (Write-CreateUatResult "WRITE_OUTCOME_UNCERTAIN")
+        Save-CreateUatTerminalArtifact
+        return (Write-CreateUatResult)
     }
 
-    # ---- 12. Read-back and compare approved safe fields. ----
+    # ---- 12. Read-back and normalised comparison of EVERY assigned field. ----
     $readback = $getMemberMethod.Invoke($memberCommand, @($memberNo))
     $result.readback_found = ($null -ne $readback)
-    if (-not $result.readback_found) { return (Write-CreateUatResult "WRITE_OUTCOME_UNCERTAIN") }
+    if (-not $result.readback_found) { Save-CreateUatTerminalArtifact; return (Write-CreateUatResult) }
 
     $rbRowProp = Find-PublicProperty $readback.GetType() "Row"
     $rbRow = $null
     if ($null -ne $rbRowProp -and $rbRowProp.CanRead) { $rbRow = $rbRowProp.GetValue($readback, $null) }
-    $match = $true
-    if ($null -eq $rbRow) { $match = $false }
-    else {
-        if ((Get-RowStringValue $rbRow "MemberNo") -ne [string]$package.member_payload.MemberNo) { $match = $false }
-        if ((Get-RowStringValue $rbRow "Name") -ne [string]$package.member_payload.Name) { $match = $false }
-        if ((Get-RowStringValue $rbRow "EmailAddress") -ne [string]$package.member_payload.EmailAddress) { $match = $false }
-        if ((Get-RowStringValue $rbRow "MemberType") -ne [string]$package.member_payload.MemberType) { $match = $false }
+    if ($null -eq $rbRow) {
+        $result.readback_match = $false
     }
-    $result.readback_match = $match
-    if ($match) { return (Write-CreateUatResult "CREATED_VERIFIED") }
-    return (Write-CreateUatResult "CREATED_READBACK_MISMATCH")
+    else {
+        $readbackValues = [ordered]@{}
+        foreach ($field in @($assignments.Keys)) { $readbackValues[$field] = (Get-RowRawValue $rbRow $field) }
+        $comparison = Test-CreateUatReadbackMatch -Assigned $assignments -Readback $readbackValues
+        $result.readback_match = $comparison.Match
+    }
+    Save-CreateUatTerminalArtifact
+    return (Write-CreateUatResult)
 }
 catch {
     if ($null -eq $result.terminal_code) {
+        $result.execution_error = $true
         if ($result.save_member_attempted -and -not $result.save_member_confirmed) {
             $result.save_outcome = "uncertain"
             $result.error = [ordered]@{ phase = "post_attempt"; message = "Save outcome could not be confirmed." }
-            $out = Write-CreateUatResult "WRITE_OUTCOME_UNCERTAIN"
+            Save-CreateUatTerminalArtifact
         }
         else {
             $result.error = [ordered]@{ phase = "pre_write"; message = "Runner stopped before any write." }
-            $out = Write-CreateUatResult "FAILED_BEFORE_WRITE"
         }
-        $out
+        Write-CreateUatResult
     }
 }
 finally {
