@@ -124,11 +124,34 @@ class ApprovalCliTests(unittest.TestCase):
         pkg = json.loads(self.package.read_text(encoding="utf-8"))
         self.assertRegex(pkg["approval"]["reviewer_id"], r"^[a-z0-9_-]{2,32}$")
 
-    def test_validate_package_for_write_is_operator_config_required(self):
+    def test_validate_package_for_write_passes_now_business_confirmed(self):
+        # All four business confirmations are now recorded, so the laptop-side for-write
+        # audit reports write-ready (DRY_RUN_VALIDATED). The actual irreversible write
+        # still requires the five VM switches and the separate operator step.
         self._approve()
         self._build()
         code, out = run(["validate-package", "--package", str(self.package), "--for-write",
                          "--business-config", str(ROOT / "config" / "member_create_uat_business_confirmation.json")])
+        self.assertEqual(code, 0, out)
+        self.assertIn("for_write_ok = true", out)
+        self.assertIn("DRY_RUN_VALIDATED", out)
+
+    def test_validate_package_for_write_blocked_when_business_unconfirmed(self):
+        # A config with any confirmation false still blocks fail-closed.
+        self._approve()
+        self._build()
+        unconfirmed = self.tmp / "unconfirmed_business.json"
+        unconfirmed.write_text(json.dumps({
+            "schema_version": contract.BUSINESS_CONFIRMATION_SCHEMA_VERSION,
+            "confirmations": {
+                "MemberType": {"confirmed": True, "reason": "x"},
+                "RegisterDate": {"confirmed": True, "reason": "x"},
+                "ExpiryDate": {"confirmed": False, "reason": "x"},
+                "OpeningPoints": {"confirmed": True, "reason": "x"},
+            },
+        }), encoding="utf-8")
+        code, out = run(["validate-package", "--package", str(self.package), "--for-write",
+                         "--business-config", str(unconfirmed)])
         self.assertEqual(code, 2)
         self.assertIn("OPERATOR_CONFIG_REQUIRED", out)
 

@@ -37,31 +37,47 @@ CI.
   plus the change-detection `source_fingerprint`. The spreadsheet row number is only
   a location hint and is never used as identity.
 
-## Blocking business decisions (fail-closed)
+## Business decisions (recorded, fail-closed)
 
-While any confirmation in `config/member_create_uat_business_confirmation.json` is
-`false`, every write attempt stops at `OPERATOR_CONFIG_REQUIRED` before any AutoCount
-contact. Recording a confirmation requires an explicit documented X-Boundaries
-business decision, edited into that file in a reviewed change (never invented by an
-agent or operator on the fly).
+All four business decisions are now explicitly recorded by the owner in
+`config/member_create_uat_business_confirmation.json`. While any confirmation in that
+file is `false`, every write attempt stops at `OPERATOR_CONFIG_REQUIRED` before any
+AutoCount contact. Recording a confirmation requires an explicit documented
+X-Boundaries business decision, edited into that file in a reviewed change (never
+invented by an agent or operator on the fly).
 
-| Field | Intended value | Why it is blocked |
+| Field | Confirmed value | Basis |
 | --- | --- | --- |
-| `MemberType` | `Default` | API-confirmed to exist by read-only browse, but business approval is still pending. |
-| `RegisterDate` | `2026-07-01` | Intended membership start date is not yet business-confirmed. |
-| `ExpiryDate` | `2028-06-30` | Part of the prepared intended assignment/read-back contract, but its AutoCount persistence is not yet proven. Excluded from the active assignment payload and never assigned until the capability flag is flipped after synthetic proof, regardless of confirmation. |
-| `OpeningPoints` | `0` | The field mapping states it must not be set by intake unless separately approved. |
+| `MemberType` | `Default` | Owner explicitly confirmed; API-confirmed to exist by read-only browse. |
+| `RegisterDate` | `2026-07-01` | Owner explicitly confirmed the intended membership start date. |
+| `ExpiryDate` | `2028-06-30` | Owner explicitly confirmed the intended membership end date. AutoCount ExpiryDate assignment and persistence were proven by the synthetic capability probe, so ExpiryDate is now an active assignable field. |
+| `OpeningPoints` | `0` | Owner explicitly confirmed (intake sets no opening points). |
 
-`ExpiryDate` is now part of the prepared intended assignment and read-back contract
-(`INTENDED_ASSIGNMENT_FIELDS` / `READBACK_VERIFICATION_FIELDS` in
-`scripts/member_create_uat_contract.py`, mirrored in the runner library), and the
-package still records it as a desired business field covered by the fingerprint and
-required to equal `2028-06-30`. It remains excluded from the **active** assignment
-payload and is never assigned while the code-level capability flag
-(`$script:CreateUatExpiryDateAssignmentImplemented`) is `false` and confirmations are
-`false`. Its persistence is proven separately by the synthetic
-[ExpiryDate capability probe](member_expiry_capability_probe_runbook.md) before any
-follow-up PR may flip the flag.
+`ExpiryDate` is now an **active** assignable field: it is in `ASSIGNABLE_FIELDS`,
+`INTENDED_ASSIGNMENT_FIELDS`, `READBACK_VERIFICATION_FIELDS`, and the immutable package
+`member_payload` (`scripts/member_create_uat_contract.py`, mirrored in the runner
+library), required to equal `2028-06-30`. Its AutoCount persistence was proven by the
+synthetic [ExpiryDate capability probe](member_expiry_capability_probe_runbook.md);
+that reviewed synthetic result reported `terminal_outcome = EXPIRY_VERIFIED` with a
+matching read-back, and its durable result SHA-256 is
+`48CC0185EFF59C3A21AC087BC0C120A00B70801599C3F5513675F7950CD1541B`. The code-level
+capability flag (`$script:CreateUatExpiryDateAssignmentImplemented` /
+`EXPIRYDATE_ASSIGNMENT_IMPLEMENTED`) is now `true` in exact agreement across the
+PowerShell and Python contracts.
+
+The package payload shape therefore changed, so the package schema version was bumped
+to `member_create_uat_package/v2`. A package built under the previous `v1` contract has
+a different shape (no `ExpiryDate` in the payload / whitelist) and is refused
+fail-closed: the runner rejects the unrecognised schema version and the exact
+field-set checks reject the old shape. Any package built before this change cannot be
+reused; a new reviewer decision and a freshly built immutable `v2` package are
+required.
+
+This change performs **no live write**. Recording the confirmations and flipping the
+capability flag do not create a member. The runner still performs a real `SaveMember`
+only when all five write-confirmation switches are supplied for a valid current
+package/approval on the AutoCount VM, and a real write still requires the separate
+explicit current-turn owner approval below that names the exact target and operation.
 
 ## Approval expiry
 
@@ -249,9 +265,20 @@ evidence and single-use guards; do not delete them.
 
 ## Safety boundary
 
-- No AutoCount write occurs in development, tests, or CI.
+- No AutoCount write occurs in development, tests, or CI. Enabling the ExpiryDate path
+  (recording the business confirmations and flipping the capability flag) performs no
+  live write; a real write still requires the explicit VM write step above and a
+  separate current-turn owner approval naming the exact target and operation.
 - Exactly one member is supported; there is no batch path, no update-member path, no
   delete, and no rollback automation.
-- SaveMember is called at most once and is never automatically retried.
+- SaveMember is called at most once and is never automatically retried. An uncertain
+  save outcome is terminal (`WRITE_OUTCOME_UNCERTAIN`) and is resolved only by the
+  separate read-only recovery check, never by an automatic retry.
+- A package built under the previous `member_create_uat_package/v1` contract cannot be
+  reused; the runner refuses it fail-closed. Build a fresh `v2` package after a new
+  reviewer decision.
+- The synthetic member and permanent single-use claim created by the earlier
+  [ExpiryDate capability probe](member_expiry_capability_probe_runbook.md) are left
+  exactly as they are; this UAT path does not read, modify, or clean them up.
 - All console, evidence, test, and workflow output is sanitized and PII-free; member
   numbers are masked and names, emails, and birthdays are never printed.

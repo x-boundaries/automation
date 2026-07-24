@@ -39,14 +39,22 @@ import re
 import stat
 from pathlib import Path
 
-SCHEMA_VERSION = "member_create_uat_package/v1"
+# Bumped v1 -> v2 in the "enable proven ExpiryDate" change: the package payload shape
+# changed (member_payload and assignable_fields now include ExpiryDate), so a v1 package
+# built under the previous contract is a different shape and must be refused fail-closed.
+# The runner rejects an unrecognised schema_version, so an old v1 package can never be
+# silently executed under this contract.
+SCHEMA_VERSION = "member_create_uat_package/v2"
 BUSINESS_CONFIRMATION_SCHEMA_VERSION = "member_create_uat_business_confirmation/v1"
 
 # The only decision state that may ever be approved for creation.
 READY_FOR_CREATE_REVIEW = "READY_FOR_CREATE_REVIEW"
 
-# Exact whitelist of fields the runner may assign. ExpiryDate is intentionally
-# excluded: it has no proven AutoCount assignment/persistence path.
+# Exact whitelist of fields the runner may assign. ExpiryDate is now an ACTIVE
+# assignable field: its AutoCount assignment and persistence were proven by the
+# synthetic ExpiryDate capability probe (durable result SHA-256
+# 48CC0185EFF59C3A21AC087BC0C120A00B70801599C3F5513675F7950CD1541B), so it moved out of
+# NEVER_ASSIGN_FIELDS into this whitelist and the immutable package payload.
 ASSIGNABLE_FIELDS = (
     "MemberNo",
     "Name",
@@ -55,6 +63,7 @@ ASSIGNABLE_FIELDS = (
     "DOB",
     "MemberType",
     "RegisterDate",
+    "ExpiryDate",
     "OpeningPoints",
 )
 
@@ -81,43 +90,58 @@ INTENDED_BUSINESS_VALUES = {
 
 # Fields that must never enter the actual AutoCount assignment payload until their
 # assignment and persistence behaviour is proven, regardless of confirmation state.
-NEVER_ASSIGN_FIELDS = ("ExpiryDate",)
+# ExpiryDate has now been proven (synthetic capability probe) and promoted into
+# ASSIGNABLE_FIELDS, so this set is empty. It is retained as an explicit, greppable
+# invariant surface rather than being deleted.
+NEVER_ASSIGN_FIELDS = ()
 
 # --------------------------------------------------------------------------- #
-# Prepared (but not yet active) ExpiryDate assignment/read-back contract.
+# Active ExpiryDate assignment/read-back contract.
 #
-# This PR PREPARES the ExpiryDate assignment and persistence capability. It does NOT
-# flip the code-level capability gate and does NOT add ExpiryDate to the active
-# ASSIGNABLE_FIELDS whitelist or the immutable package payload. Both remain exactly
-# as PR #111 shipped them, so every real write still stops at OPERATOR_CONFIG_REQUIRED
-# and the runner still never assigns ExpiryDate.
+# This change PROMOTES the ExpiryDate assignment and persistence capability from the
+# prepared (inactive) state that PR #112 shipped into the ACTIVE contract. ExpiryDate is
+# now in ASSIGNABLE_FIELDS and the immutable package payload, the code-level capability
+# gate is flipped True, and the runner assigns and reads back ExpiryDate. Every other
+# fail-closed gate (five write switches, business confirmation, single-use markers,
+# exclusive lock, one SaveMember, honest uncertain classification) is unchanged, so no
+# live write occurs in development, tests, or CI, and a real write still requires the
+# separate explicit operator step on the VM.
 #
 # EXPIRYDATE_ASSIGNMENT_IMPLEMENTED mirrors the PowerShell
-# $script:CreateUatExpiryDateAssignmentImplemented capability flag. While it is False,
-# ExpiryDate stays out of the active assignment path. A follow-up PR may set both to
-# True together only AFTER the synthetic capability probe proves ExpiryDate persists.
-EXPIRYDATE_ASSIGNMENT_IMPLEMENTED = False
+# $script:CreateUatExpiryDateAssignmentImplemented capability flag. Both are True only
+# because the synthetic ExpiryDate capability probe proved ExpiryDate persists
+# (terminal_outcome=EXPIRY_VERIFIED; durable result SHA-256
+# 48CC0185EFF59C3A21AC087BC0C120A00B70801599C3F5513675F7950CD1541B).
+EXPIRYDATE_ASSIGNMENT_IMPLEMENTED = True
 
 # The exact intended ExpiryDate for this bounded UAT. Named explicitly (not only
 # nested in INTENDED_BUSINESS_VALUES) so the intended value is greppable and testable.
 EXPIRYDATE_INTENDED_VALUE = "2028-06-30"
 
-# The intended AutoCount assignment contract: the full field set the runner is
-# INTENDED to assign once the ExpiryDate capability is proven and the flags above are
-# flipped. ExpiryDate is a member of this intended set even though it is deliberately
-# still excluded from the currently active ASSIGNABLE_FIELDS. The invariant
-# INTENDED_ASSIGNMENT_FIELDS == ASSIGNABLE_FIELDS + NEVER_ASSIGN_FIELDS keeps the
-# active/intended relationship explicit, so the follow-up flip is a single clean move
-# (remove ExpiryDate from NEVER_ASSIGN_FIELDS, add it to ASSIGNABLE_FIELDS).
+# The intended AutoCount assignment contract: the full field set the runner is INTENDED
+# to assign. Now that ExpiryDate is proven and active, ExpiryDate is a member of both the
+# intended set and ASSIGNABLE_FIELDS. The invariant
+# INTENDED_ASSIGNMENT_FIELDS == ASSIGNABLE_FIELDS + NEVER_ASSIGN_FIELDS (with an empty
+# never-assign set) keeps the active/intended relationship explicit.
 INTENDED_ASSIGNMENT_FIELDS = ASSIGNABLE_FIELDS + NEVER_ASSIGN_FIELDS
 
 # The normalised read-back verification contract: every field whose persisted value
-# must be read back and compared after a real SaveMember once the capability is
-# proven. ExpiryDate is included so a read-back ExpiryDate mismatch can never yield
-# CREATED_VERIFIED. The runner reads back exactly the fields it assigns, so until the
-# capability flips it verifies the active set (without ExpiryDate); the intended
-# contract already requires ExpiryDate verification for the proven state.
+# must be read back and compared after a real SaveMember. ExpiryDate is included so a
+# read-back ExpiryDate mismatch can never yield CREATED_VERIFIED. The runner reads back
+# exactly the fields it assigns, which now includes ExpiryDate.
 READBACK_VERIFICATION_FIELDS = INTENDED_ASSIGNMENT_FIELDS
+
+# Fields the runner assigns for member activation state that are runner-managed and are
+# NOT part of the reviewer-approved package payload/whitelist. Declared here so the
+# expected assigned-field count is derived from the real assignment collection rather
+# than a hard-coded literal.
+RUNNER_ACTIVATION_FIELDS = ("IsActive", "Individual")
+
+# The exact number of fields the runner assigns to the new member row: every actively
+# assignable field plus the runner-managed activation fields. With ExpiryDate active
+# this is len(9) + len(2) = 11. A sanitized result whose assigned_field_count does not
+# equal this (once a save was attempted) is treated as a stale-code contradiction.
+EXPECTED_ASSIGNED_FIELD_COUNT = len(ASSIGNABLE_FIELDS) + len(RUNNER_ACTIVATION_FIELDS)
 
 # Controlled terminal result vocabulary. Every runner outcome is exactly one of
 # these. Documented in the runbook.
@@ -166,6 +190,8 @@ TERMINAL_STATE_FLAGS = (
     "save_outcome",
     "readback_found",
     "readback_match",
+    "expiry_date_assigned",
+    "assigned_field_count",
 )
 
 
@@ -183,6 +209,8 @@ def terminal_state_contradictions(flags):
     outcome = flags.get("save_outcome")
     rb_found = bool(flags.get("readback_found"))
     rb_match = bool(flags.get("readback_match"))
+    expiry_assigned = bool(flags.get("expiry_date_assigned"))
+    assigned_count = flags.get("assigned_field_count")
 
     if mode not in ("dry-run", "write"):
         reasons.append("mode_invalid")
@@ -206,6 +234,16 @@ def terminal_state_contradictions(flags):
         reasons.append("attempt_in_non_write_mode")
     if attempted and not flags.get("lock_acquired"):
         reasons.append("attempt_without_lock")
+    # ExpiryDate is an active assignable field, so any real save is preceded by an
+    # ExpiryDate assignment and by the full expected field set. A save attempt (or a
+    # matched read-back) without expiry_date_assigned, or with a stale assigned-field
+    # count, is a contradiction: real-write success can never be accepted in that state,
+    # so CREATED_VERIFIED is structurally impossible unless ExpiryDate was assigned and
+    # the full field set (EXPECTED_ASSIGNED_FIELD_COUNT) was written.
+    if (attempted or rb_match) and not expiry_assigned:
+        reasons.append("expiry_date_not_assigned")
+    if (attempted or rb_match) and assigned_count != EXPECTED_ASSIGNED_FIELD_COUNT:
+        reasons.append("assigned_field_count_stale")
     if not write and (
         bool(flags.get("write_confirmed"))
         or bool(flags.get("member_exists_recheck"))
@@ -434,13 +472,15 @@ def _validate_member_payload(payload, reasons):
         reasons.append("member_type_invalid")
     if not (isinstance(payload["RegisterDate"], str) and DATE_RE.fullmatch(payload["RegisterDate"])):
         reasons.append("register_date_invalid")
+    if not (isinstance(payload["ExpiryDate"], str) and DATE_RE.fullmatch(payload["ExpiryDate"])):
+        reasons.append("expiry_date_invalid")
     if payload["OpeningPoints"] != 0 or not _is_int(payload["OpeningPoints"]):
         reasons.append("opening_points_not_zero")
     for forbidden in NEVER_ASSIGN_FIELDS:
         if forbidden in payload:
             reasons.append("forbidden_assignable_field")
     # Intended business values must match the reviewed constants exactly.
-    for field in ("MemberType", "RegisterDate", "OpeningPoints"):
+    for field in ("MemberType", "RegisterDate", "ExpiryDate", "OpeningPoints"):
         if field in payload and payload[field] != INTENDED_BUSINESS_VALUES[field]:
             reasons.append(f"member_payload_{field}_not_intended")
 
@@ -580,7 +620,7 @@ def validate_package(package):
     payload = package.get("member_payload")
     desired = package.get("desired_business_fields")
     if isinstance(payload, dict) and isinstance(desired, dict):
-        for field in ("MemberType", "RegisterDate", "OpeningPoints"):
+        for field in ("MemberType", "RegisterDate", "ExpiryDate", "OpeningPoints"):
             if field in payload and field in desired and payload[field] != desired[field]:
                 reasons.append("assignable_desired_value_mismatch")
                 break

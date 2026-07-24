@@ -1,22 +1,22 @@
 {
   "schema_version": "member_create_uat_business_confirmation/v1",
-  "note": "Fail-closed business confirmations for the single-member creation UAT. Every field is false until X-Boundaries records an explicit documented business decision. While any field is false, the VM runner stops every write attempt at OPERATOR_CONFIG_REQUIRED. This file contains no secrets or PII and is safe to commit. ExpiryDate is additionally never assigned to AutoCount until its assignment and persistence behaviour is proven, regardless of confirmation.",
+  "note": "Fail-closed business confirmations for the single-member creation UAT. Each field is true only when X-Boundaries has recorded an explicit documented business decision. All four are now confirmed by the owner's explicit decision for this bounded UAT (MemberType=Default, RegisterDate=2026-07-01, ExpiryDate=2028-06-30, OpeningPoints=0). This file contains no secrets or PII and is safe to commit. Recording a confirmation still does not perform any write: the VM runner only attempts a real SaveMember when all five write-confirmation switches are supplied for a valid current package/approval, and a real write requires a separate explicit operator step on the AutoCount VM.",
   "confirmations": {
     "MemberType": {
-      "confirmed": false,
-      "reason": "MemberType=Default is API-confirmed to exist (read-only browse) but business approval is still pending. See docs/autocount2-automation/member_intake_field_mapping.md open questions."
+      "confirmed": true,
+      "reason": "Owner explicitly confirmed MemberType=Default for this bounded member-create UAT. The value is API-confirmed to exist by read-only browse; see docs/autocount2-automation/member_intake_field_mapping.md."
     },
     "RegisterDate": {
-      "confirmed": false,
-      "reason": "Intended membership start date 2026-07-01 is not yet business-confirmed; the field mapping marks RegisterDate usage open."
+      "confirmed": true,
+      "reason": "Owner explicitly confirmed the intended membership start date RegisterDate=2026-07-01 for this bounded member-create UAT."
     },
     "ExpiryDate": {
-      "confirmed": false,
-      "reason": "Intended membership end date 2028-06-30 has no proven AutoCount assignment or persistence path (the save-gated create probe never set ExpiryDate). Excluded from the assignment payload until proven."
+      "confirmed": true,
+      "reason": "Owner explicitly confirmed the intended membership end date ExpiryDate=2028-06-30. AutoCount ExpiryDate assignment and persistence were proven by the reviewed synthetic capability probe (terminal_outcome=EXPIRY_VERIFIED; durable result SHA-256 48CC0185EFF59C3A21AC087BC0C120A00B70801599C3F5513675F7950CD1541B), so ExpiryDate is now an active assignable field."
     },
     "OpeningPoints": {
-      "confirmed": false,
-      "reason": "The field mapping states OpeningPoints must not be set by intake unless separately approved."
+      "confirmed": true,
+      "reason": "Owner explicitly confirmed OpeningPoints=0 for this bounded member-create UAT (intake sets no opening points)."
     }
   }
 }

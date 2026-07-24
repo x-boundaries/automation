@@ -37,8 +37,8 @@ def sample_result(**overrides):
         "member_exists_initial": False,
         "new_member_success": True,
         "assignment_success": True,
-        "assigned_field_count": 10,
-        "expiry_date_assigned": False,
+        "assigned_field_count": 11,
+        "expiry_date_assigned": True,
         "member_exists_recheck": False,
         "write_intent_recorded": True,
         "consumed_marker_written": True,
@@ -154,10 +154,14 @@ class ResultPrecheckTests(unittest.TestCase):
         self.assertNotIn("state_contradiction_count = 0", out)
 
     def test_recovery_result_recomputes_ok(self):
+        # A recovery re-run stops before assignment, so it never assigned ExpiryDate and
+        # its assigned_field_count is 0. Because no save was attempted, the ExpiryDate /
+        # count guards do not fire and the result is accepted.
         result, pkg = sample_result(
             terminal_code="WRITE_OUTCOME_UNCERTAIN", recovery_state="consumed_no_terminal",
             save_member_attempted=False, save_member_confirmed=False, save_outcome="not_attempted",
             readback_found=False, readback_match=False,
+            expiry_date_assigned=False, assigned_field_count=0,
         )
         self._write(result)
         code, out = run(["--result-json", str(self.result_path)])

@@ -223,13 +223,20 @@ class PowerShellRunnerTests(unittest.TestCase):
         self.assertEqual(info["callCount"], 1, "the narrow function is called exactly once")
         self.assertFalse(info["callInLoop"], "no retry loop may enclose the SaveMember call")
 
-    def test_runner_never_assigns_expiry_date(self):
+    def test_runner_assigns_expiry_date_from_payload(self):
         import re
         source = RUNNER.read_text(encoding="utf-8")
-        # ExpiryDate may appear in explanatory comments, but must never be assigned
-        # to the member row or read from the member payload for assignment.
-        self.assertIsNone(re.search(r"ExpiryDate\s*=", source), "ExpiryDate must never be assigned")
-        self.assertNotIn("member_payload.ExpiryDate", source)
+        # ExpiryDate is now an active assignable field: it is read from the member payload
+        # and assigned into the in-memory assignment set exactly once.
+        self.assertIn("member_payload.ExpiryDate", source)
+        self.assertIsNotNone(
+            re.search(r"ExpiryDate\s*=\s*\[datetime\]::ParseExact", source),
+            "ExpiryDate must be parsed and assigned",
+        )
+        self.assertEqual(
+            len(re.findall(r"ExpiryDate\s*=\s*\[datetime\]::ParseExact", source)), 1,
+            "ExpiryDate must be assigned exactly once",
+        )
 
     def test_runner_declares_all_five_write_confirmation_switches(self):
         source = RUNNER.read_text(encoding="utf-8")
@@ -262,11 +269,14 @@ class PowerShellRunnerTests(unittest.TestCase):
         return code, int(contr)
 
     def _w(self, **over):
-        # A consistent WRITE-mode confirmed-save flag set, then apply overrides.
+        # A consistent WRITE-mode confirmed-save flag set, then apply overrides. ExpiryDate
+        # is an active field, so a real save carries expiry_date_assigned and the full
+        # expected assigned-field count (9 assignable + 2 activation = 11).
         base = dict(
             mode="write", write_confirmed=True, business_confirmed=True, lock_acquired=True,
             save_member_attempted=True, save_member_confirmed=True, save_outcome="confirmed",
             readback_found=True, readback_match=True,
+            expiry_date_assigned=True, assigned_field_count=11,
         )
         base.update(over)
         return base
@@ -293,6 +303,18 @@ class PowerShellRunnerTests(unittest.TestCase):
         # A contradictory set is flagged (confirmed save in dry-run mode).
         _, contr = self._terminal(mode="dry-run", save_member_attempted=True, save_member_confirmed=True, save_outcome="confirmed", readback_found=True, readback_match=True)
         self.assertGreater(contr, 0)
+
+    def test_expiry_and_count_guards(self):
+        # A confirmed-save flag set missing the ExpiryDate assignment is a contradiction.
+        _, contr = self._terminal(**self._w(expiry_date_assigned=False))
+        self.assertGreater(contr, 0)
+        # A stale assigned-field count (not 11) with a save attempt is a contradiction.
+        _, contr2 = self._terminal(**self._w(assigned_field_count=10))
+        self.assertGreater(contr2, 0)
+        # The clean confirmed set (ExpiryDate assigned, count 11) verifies with none.
+        code, contr3 = self._terminal(**self._w())
+        self.assertEqual(code, "CREATED_VERIFIED")
+        self.assertEqual(contr3, 0)
 
     # ---- Cross-language hash agreement ---- #
     def _cross_language_hash(self, payload_overrides=None):
@@ -332,13 +354,14 @@ class PowerShellRunnerTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         return json.loads(proc.stdout)
 
-    def test_repo_config_is_not_confirmed_and_capability_blocks(self):
+    def test_repo_config_is_confirmed_and_capability_proven(self):
         cfg = json.loads(BUSINESS_CONFIG.read_text(encoding="utf-8"))
         gate = self._business(cfg)
-        self.assertFalse(gate["confirmed"])
-        self.assertIn("expiry_date_capability_unproven", gate["reasons"])
+        self.assertTrue(gate["confirmed"], gate["reasons"])
+        # The capability is now proven, so the block reason must be gone.
+        self.assertNotIn("expiry_date_capability_unproven", gate["reasons"])
 
-    def test_all_true_config_still_blocked_by_capability(self):
+    def test_all_true_config_now_confirms(self):
         cfg = {
             "schema_version": "member_create_uat_business_confirmation/v1",
             "confirmations": {
@@ -347,8 +370,22 @@ class PowerShellRunnerTests(unittest.TestCase):
             },
         }
         gate = self._business(cfg)
-        self.assertFalse(gate["confirmed"], "four true booleans must NOT confirm while ExpiryDate is unproven")
-        self.assertIn("expiry_date_capability_unproven", gate["reasons"])
+        self.assertTrue(gate["confirmed"], "four true booleans now confirm because ExpiryDate is proven")
+
+    def test_partial_confirmation_still_blocks(self):
+        # A false confirmation still fails closed even though the capability is proven.
+        cfg = {
+            "schema_version": "member_create_uat_business_confirmation/v1",
+            "confirmations": {
+                "MemberType": {"confirmed": True, "reason": "x"},
+                "RegisterDate": {"confirmed": True, "reason": "x"},
+                "ExpiryDate": {"confirmed": False, "reason": "x"},
+                "OpeningPoints": {"confirmed": True, "reason": "x"},
+            },
+        }
+        gate = self._business(cfg)
+        self.assertFalse(gate["confirmed"])
+        self.assertIn("confirmation_ExpiryDate_not_confirmed", gate["reasons"])
 
     def test_wrong_schema_version_rejected(self):
         cfg = {"schema_version": "wrong/v9", "confirmations": {}}
@@ -374,14 +411,14 @@ class PowerShellRunnerTests(unittest.TestCase):
         self.assertIn("Name", info["badMismatches"])
 
     # ---- ExpiryDate prepared contract (PowerShell library mirror) ---- #
-    def test_lib_intended_contract_includes_expiry_but_active_excludes_it(self):
+    def test_lib_active_contract_now_includes_expiry(self):
         proc = self._ps(self.probe, "-Lib", str(LIB), "-Op", "expirycontract")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         info = json.loads(proc.stdout)
         self.assertTrue(info["intendedHasExpiry"], "intended assignment contract must include ExpiryDate")
         self.assertTrue(info["readbackHasExpiry"], "read-back verification contract must include ExpiryDate")
-        self.assertFalse(info["activeHasExpiry"], "active assignable whitelist must still exclude ExpiryDate")
-        self.assertFalse(info["capabilityImplemented"], "capability flag must remain false")
+        self.assertTrue(info["activeHasExpiry"], "active assignable whitelist must now include ExpiryDate")
+        self.assertTrue(info["capabilityImplemented"], "capability flag must now be true")
         self.assertEqual(info["intendedValue"], "2028-06-30")
 
     def test_readback_expiry_mismatch_fails_and_cannot_verify(self):
@@ -463,18 +500,27 @@ class PowerShellRunnerTests(unittest.TestCase):
         result = json.loads(proc.stdout)
         self.assertEqual(result["terminal_code"], "WRITE_NOT_CONFIRMED")
 
-    def test_write_mode_business_unconfirmed_stops_before_autocount(self):
+    def test_write_mode_confirmed_still_never_contacts_autocount_here(self):
+        # The committed business config is now confirmed, so write mode passes the
+        # business gate. -AcRoot is pointed at a nonexistent directory so the runner can
+        # never load an AutoCount assembly or authenticate on ANY host (there is no live
+        # AutoCount in dev/CI): it must stop before any write, never attempt SaveMember,
+        # and classify honestly. This proves the flip did not open a live-write path.
         pkg = fx.build_valid_package()
-        pkg_path = self.tmp / "pkg_opcfg.json"
+        pkg_path = self.tmp / "pkg_confirmed.json"
         fx.write_package(pkg_path, pkg)
+        bogus_ac = str(self.tmp / "no_such_autocount_root")
         proc = self._run_runner(
             pkg_path, "-EnableMemberCreateUat", "-ConfirmAutoCountWrite", "-ConfirmExactlyOneMember",
-            "-ConfirmDryRunPassed", "-ConfirmNoExistingMemberUpdate",
+            "-ConfirmDryRunPassed", "-ConfirmNoExistingMemberUpdate", "-AcRoot", bogus_ac,
         )
         result = json.loads(proc.stdout)
-        self.assertEqual(result["terminal_code"], "OPERATOR_CONFIG_REQUIRED")
-        self.assertFalse(result["authentication_success"], "AutoCount must never be contacted when business is unconfirmed")
-        self.assertFalse(result["business_confirmed"])
+        self.assertTrue(result["business_confirmed"], "business gate now passes")
+        self.assertFalse(result["authentication_success"], "AutoCount must never authenticate here")
+        self.assertFalse(result["save_member_attempted"], "no SaveMember may be attempted")
+        self.assertFalse(result["save_member_confirmed"])
+        self.assertEqual(result["save_outcome"], "not_attempted")
+        self.assertEqual(result["terminal_code"], "FAILED_BEFORE_WRITE")
 
     def test_tampered_package_is_source_fingerprint_mismatch(self):
         pkg = fx.build_valid_package()
@@ -489,9 +535,12 @@ class PowerShellRunnerTests(unittest.TestCase):
         pkg = fx.build_valid_package()
         pkg_path = self.tmp / "pkg_pii.json"
         fx.write_package(pkg_path, pkg)
+        # -AcRoot is a nonexistent directory so this write-mode run (the business gate now
+        # passes) still stops before any AutoCount load/authentication on every host.
+        bogus_ac = str(self.tmp / "no_such_autocount_root")
         proc = self._run_runner(
             pkg_path, "-EnableMemberCreateUat", "-ConfirmAutoCountWrite", "-ConfirmExactlyOneMember",
-            "-ConfirmDryRunPassed", "-ConfirmNoExistingMemberUpdate",
+            "-ConfirmDryRunPassed", "-ConfirmNoExistingMemberUpdate", "-AcRoot", bogus_ac,
         )
         self.assertNotIn("6590000001", proc.stdout)
         self.assertNotIn("Synthetic Alpha", proc.stdout)

@@ -118,6 +118,7 @@ def resolve_source_row(input_path, decision_rows_path, row_number):
         "DOB": normalized["dob"],
         "MemberType": desired["MemberType"],
         "RegisterDate": desired["RegisterDate"],
+        "ExpiryDate": desired["ExpiryDate"],
         "OpeningPoints": desired["OpeningPoints"],
     }
     srid = contract.source_record_id(member_payload["MemberNo"])
@@ -295,7 +296,7 @@ def cmd_build_package(args):
             "payload_hash": payload_hash,
             "package_file_name": Path(args.package_out).name,
             "assign_fields_count": len(contract.ASSIGNABLE_FIELDS),
-            "expiry_date_assigned": False,
+            "expiry_date_assigned": True,
         }
     )
     return 0

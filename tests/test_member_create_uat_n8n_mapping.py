@@ -54,6 +54,11 @@ class N8nMappingStaticTests(unittest.TestCase):
         self.assertIn("recompute", code)
         self.assertIn("create_uat_terminal_code_does_not_match_recomputed", code)
         self.assertIn("create_uat_state_contradiction", code)
+        # The ExpiryDate activation guards must be mirrored into the canonical table so
+        # the n8n validator agrees with the Python and PowerShell contradiction checks.
+        self.assertIn("expiry_date_not_assigned", code)
+        self.assertIn("assigned_field_count_stale", code)
+        self.assertIn("EXPECTED_ASSIGNED_FIELD_COUNT", code)
 
     def test_verify_node_rejects_blank_or_conflicting_operation_id(self):
         code = self.nodes["Verify Identity And Decide Mapping"]["parameters"]["jsCode"]
