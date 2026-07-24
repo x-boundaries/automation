@@ -163,6 +163,103 @@ class ApprovalCliTests(unittest.TestCase):
         self.assertIsInstance(obj, dict)
         self.assertEqual(obj["approval"]["decision"], "approved")
 
+    # ---- Finding 3: build output must not claim an AutoCount assignment ---- #
+    def test_build_summary_does_not_claim_autocount_assignment(self):
+        self._approve()
+        code, out = self._build()
+        self.assertEqual(code, 0, out)
+        summary = json.loads(out)
+        # The laptop builder only records package payload state, never an assignment.
+        self.assertNotIn("expiry_date_assigned", summary)
+        self.assertNotIn("expiry_date_assigned", out)
+        self.assertIs(summary["expiry_date_in_payload"], True)
+
+    # ---- Finding 2: package output is strictly no-clobber ---- #
+    def _ledger_build_events(self):
+        if not self.ledger.exists():
+            return []
+        entries = [json.loads(l) for l in self.ledger.read_text(encoding="utf-8").splitlines() if l.strip()]
+        return [e for e in entries if e.get("event") == "build"]
+
+    def test_build_refuses_when_output_file_exists_and_preserves_it(self):
+        self._approve()
+        self.package.write_text("SENTINEL-DO-NOT-OVERWRITE\n", encoding="utf-8")
+        before = self.package.read_bytes()
+        builds_before = len(self._ledger_build_events())
+        code, out = self._build()
+        self.assertEqual(code, 2, out)
+        # The pre-existing file is byte-for-byte unchanged.
+        self.assertEqual(self.package.read_bytes(), before)
+        # No build ledger event was appended after the output-path collision.
+        self.assertEqual(len(self._ledger_build_events()), builds_before)
+
+    def test_build_refuses_when_output_is_directory(self):
+        self._approve()
+        self.package.mkdir()
+        code, out = self._build()
+        self.assertEqual(code, 2, out)
+        self.assertTrue(self.package.is_dir())
+        self.assertEqual(self._ledger_build_events(), [])
+
+    def test_build_refuses_when_output_is_symlink(self):
+        self._approve()
+        target = self.tmp / "sometarget.txt"
+        target.write_text("x", encoding="utf-8")
+        try:
+            self.package.symlink_to(target)
+        except (OSError, NotImplementedError):
+            self.skipTest("cannot create a symlink on this platform/privilege")
+        code, out = self._build()
+        self.assertEqual(code, 2, out)
+        self.assertEqual(self._ledger_build_events(), [])
+
+    def test_rebuild_cannot_overwrite_existing_package(self):
+        self._approve()
+        self.assertEqual(self._build()[0], 0)
+        before = self.package.read_bytes()
+        builds_before = len(self._ledger_build_events())
+        # --rebuild to the SAME (existing) path must still refuse fail-closed.
+        code, out = self._build(extra=["--rebuild"])
+        self.assertEqual(code, 2, out)
+        self.assertEqual(self.package.read_bytes(), before)
+        self.assertEqual(len(self._ledger_build_events()), builds_before)
+
+    def test_rebuild_to_new_absent_path_succeeds_and_preserves_prior(self):
+        self._approve()
+        self.assertEqual(self._build()[0], 0)
+        first = self.package.read_bytes()
+        alt = self.tmp / "member_create_uat_package_v2b.json"
+        # A trailing --package-out overrides the helper's default (argparse last-wins).
+        code, out = self._build(extra=["--rebuild", "--package-out", str(alt)])
+        self.assertEqual(code, 0, out)
+        self.assertTrue(alt.is_file())
+        # The earlier package is untouched.
+        self.assertEqual(self.package.read_bytes(), first)
+
+    # ---- Additional verification: a v1 decision cannot mint a v2 package ---- #
+    def test_v1_decision_entry_cannot_build_v2_package(self):
+        # A decision recorded under the previous schema version binds a v1-derived
+        # source_record_id. Building a v2 package recomputes source_record_id with the
+        # current (v2) SCHEMA_VERSION, so the v1 decision never matches and the build is
+        # refused. This proves the schema bump mechanically forces a fresh decision.
+        canonical_member_no = "6590000001"  # canonical form of the fixture's 90000001
+        v2_srid = contract.source_record_id(canonical_member_no)
+        v1_srid = "srcrec_" + contract.sha256_hex(
+            f"member_create_uat_package/v1|{canonical_member_no}"
+        )
+        self.assertNotEqual(v1_srid, v2_srid)
+        entry = {
+            "event": "decision", "recorded_at": "2026-07-24T00:00:00+00:00",
+            "reviewer_id": "digital", "decision": "approved",
+            "source_record_id": v1_srid, "source_fingerprint": "fp_" + ("0" * 64),
+            "row_number_hint": 2, "approval_id": "appr_" + ("0" * 32),
+            "approved_at": "2026-07-24T00:00:00+00:00", "expires_at": "2026-07-30T00:00:00+00:00",
+        }
+        self.ledger.write_text(json.dumps(entry, sort_keys=True) + "\n", encoding="utf-8")
+        code, out = self._build()
+        self.assertEqual(code, 2, out)
+        self.assertIn("No current approval", out)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -174,9 +174,8 @@
           "pattern": "^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])$"
         },
         "ExpiryDate": {
-          "description": "Intended membership end date, yyyy-mm-dd. Active assignable field; must equal the intended value 2028-06-30 for this UAT.",
-          "type": "string",
-          "pattern": "^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])$"
+          "description": "Intended membership end date, yyyy-mm-dd. Active assignable field; for this bounded UAT the only accepted value is exactly 2028-06-30 (enforced by const, not merely a date shape).",
+          "const": "2028-06-30"
         },
         "OpeningPoints": {
           "description": "Zero only.",
@@ -196,8 +195,8 @@
           "pattern": "^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])$"
         },
         "ExpiryDate": {
-          "type": "string",
-          "pattern": "^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])$"
+          "description": "For this bounded UAT the only accepted value is exactly 2028-06-30 (enforced by const, not merely a date shape).",
+          "const": "2028-06-30"
         },
         "OpeningPoints": { "const": 0 }
       }

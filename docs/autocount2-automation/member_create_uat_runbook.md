@@ -166,8 +166,21 @@ python scripts/member_create_uat_approval.py approve --reviewer <handle> --input
 ```
 
 ```bash
-python scripts/member_create_uat_approval.py build-package --input <form.csv> --decision-rows <member_intake_decision_rows.csv> --row-number <N> --ledger <ledger.jsonl> --package-out <member_create_uat_package.json>
+python scripts/member_create_uat_approval.py build-package --input <form.csv> --decision-rows <member_intake_decision_rows.csv> --row-number <N> --ledger <ledger.jsonl> --package-out <member_create_uat_package_v2.json>
 ```
+
+Use a fresh, version-distinct `--package-out` filename (for example
+`member_create_uat_package_v2.json`). The build is strictly **no-clobber**: it refuses
+fail-closed if the output path already exists as any filesystem object (file, directory,
+symlink/reparse point), never deletes, truncates, renames, or overwrites it, and appends
+no build ledger event on a collision. `--rebuild` only permits another ledger build when
+`--package-out` is a distinct, absent path; it never authorises overwriting an existing
+package. Any package built under the previous `member_create_uat_package/v1` contract,
+and its hash, are preserved as historical evidence and remain non-executable under the
+`v2` runner (the runner refuses the unrecognised schema version). Because the `v2` schema
+bump changes both `source_record_id` and `source_fingerprint` (each binds the schema
+version), a fresh reviewer decision is mechanically required; a `v1` decision or build
+cannot mint a `v2` package.
 
 Copy the package to the VM, then dry-run:
 
@@ -275,8 +288,10 @@ evidence and single-use guards; do not delete them.
   save outcome is terminal (`WRITE_OUTCOME_UNCERTAIN`) and is resolved only by the
   separate read-only recovery check, never by an automatic retry.
 - A package built under the previous `member_create_uat_package/v1` contract cannot be
-  reused; the runner refuses it fail-closed. Build a fresh `v2` package after a new
-  reviewer decision.
+  reused; the runner refuses it fail-closed. Build a fresh `v2` package at a new,
+  version-distinct path after a new reviewer decision. The package builder is strictly
+  no-clobber and never overwrites an existing package, so the old `v1` artifact and its
+  hash are preserved as historical evidence and remain non-executable under `v2`.
 - The synthetic member and permanent single-use claim created by the earlier
   [ExpiryDate capability probe](member_expiry_capability_probe_runbook.md) are left
   exactly as they are; this UAT path does not read, modify, or clean them up.

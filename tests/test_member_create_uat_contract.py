@@ -216,6 +216,51 @@ class SchemaSyncTests(unittest.TestCase):
             jsonschema.validate(bad, self.schema)
 
 
+class SchemaExpiryConstTests(unittest.TestCase):
+    """Finding 1: the source-of-truth JSON Schema enforces the exact ExpiryDate value
+    via const in both member_payload and desired_business_fields, not merely a date
+    shape, so it agrees with the Python/PowerShell exact-value validation."""
+
+    def setUp(self):
+        self.schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+
+    def test_schema_declares_expiry_const_in_both_places(self):
+        mp = self.schema["properties"]["member_payload"]["properties"]["ExpiryDate"]
+        db = self.schema["properties"]["desired_business_fields"]["properties"]["ExpiryDate"]
+        self.assertEqual(mp.get("const"), "2028-06-30")
+        self.assertEqual(db.get("const"), "2028-06-30")
+        # Must not fall back to only a permissive date regex.
+        self.assertNotIn("pattern", mp)
+        self.assertNotIn("pattern", db)
+
+    def test_intended_expiry_passes_real_jsonschema(self):
+        try:
+            import jsonschema
+        except ImportError:
+            self.skipTest("jsonschema not installed")
+        jsonschema.validate(fx.build_valid_package(), self.schema)
+
+    def test_other_expiry_in_member_payload_fails_real_jsonschema(self):
+        try:
+            import jsonschema
+        except ImportError:
+            self.skipTest("jsonschema not installed")
+        bad = fx.build_valid_package()
+        bad["member_payload"]["ExpiryDate"] = "2029-06-30"
+        with self.assertRaises(jsonschema.ValidationError):
+            jsonschema.validate(bad, self.schema)
+
+    def test_other_expiry_in_desired_fails_real_jsonschema(self):
+        try:
+            import jsonschema
+        except ImportError:
+            self.skipTest("jsonschema not installed")
+        bad = fx.build_valid_package()
+        bad["desired_business_fields"]["ExpiryDate"] = "2029-06-30"
+        with self.assertRaises(jsonschema.ValidationError):
+            jsonschema.validate(bad, self.schema)
+
+
 def _write_flags(**over):
     base = dict(
         mode="write", package_fingerprint_problem=False, package_structural_valid=True,

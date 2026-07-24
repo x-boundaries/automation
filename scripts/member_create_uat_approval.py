@@ -296,27 +296,57 @@ def cmd_build_package(args):
             "payload_hash": payload_hash,
             "package_file_name": Path(args.package_out).name,
             "assign_fields_count": len(contract.ASSIGNABLE_FIELDS),
-            "expiry_date_assigned": True,
+            # This is the LAPTOP-side package builder: it only records that ExpiryDate is
+            # present in the immutable package payload. It performs no AutoCount member
+            # assignment, so it must never emit `expiry_date_assigned` (that field is
+            # reserved for the VM runner's sanitised result, set only after the assignment
+            # loop has actually completed successfully).
+            "expiry_date_in_payload": True,
         }
     )
     return 0
 
 
 def _write_package_atomically(package_out, package):
+    """Write the immutable package with a strict no-clobber, single-write contract.
+
+    An existing output path (a historical package, e.g. a prior v1 artifact) must be
+    preserved as evidence and is NEVER deleted, truncated, replaced, renamed, or
+    overwritten. There is deliberately no ``os.replace``/rename that could clobber: the
+    package is exclusive-created directly at the final path (``O_CREAT | O_EXCL``), so an
+    existing regular file makes the create fail closed. ``assert_safe_local_path`` already
+    rejects reparse points, and the explicit ``lexists`` check rejects directories,
+    symlinks, and any other occupied entry with a clear message before the create.
+    """
     out_path = contract.assert_safe_local_path(package_out)
+    if os.path.lexists(out_path):
+        raise ApprovalError(
+            "The package output path already exists; refuse fail-closed to preserve the "
+            "existing package (never overwritten). Choose a fresh, version-distinct "
+            "output filename."
+        )
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = out_path.with_name(out_path.name + ".tmp")
-    # Exclusive-create the temp file so a stale/parallel build cannot be clobbered.
-    fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        fd = os.open(out_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError as error:
+        # Closes the check-to-create race: another writer created the path meanwhile.
+        raise ApprovalError(
+            "The package output path already exists; refuse fail-closed to preserve the "
+            "existing package (never overwritten)."
+        ) from error
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(json.dumps(package, indent=2, sort_keys=True) + "\n")
             handle.flush()
             os.fsync(handle.fileno())
     except BaseException:
-        temp_path.unlink(missing_ok=True)
+        # Remove only the partial file WE just exclusive-created this call, never a
+        # pre-existing package, so a write failure does not leave a partial package.
+        try:
+            os.unlink(out_path)
+        except OSError:
+            pass
         raise
-    os.replace(temp_path, out_path)
     _write_private_marker(out_path.parent)
 
 
@@ -409,7 +439,15 @@ def build_parser():
     build = sub.add_parser("build-package", help="Build the immutable one-record package for an approved row.")
     add_common(build)
     build.add_argument("--package-out", required=True, help="Output package JSON path (local, never commit).")
-    build.add_argument("--rebuild", action="store_true", help="Allow rebuild if a prior package was never sent.")
+    build.add_argument(
+        "--rebuild",
+        action="store_true",
+        help=(
+            "Allow another ledger build for a source record that was already built, but "
+            "only when --package-out is a fresh, absent path. It never overwrites an "
+            "existing package (the output path is always no-clobber)."
+        ),
+    )
 
     vp = sub.add_parser("validate-package", help="Laptop-side audit of a package (not used by the VM runner).")
     vp.add_argument("--package", required=True)
