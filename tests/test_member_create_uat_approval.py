@@ -1,10 +1,12 @@
 import io
 import json
+import os
 import sys
 import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "scripts"
@@ -155,7 +157,9 @@ class ApprovalCliTests(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("OPERATOR_CONFIG_REQUIRED", out)
 
-    def test_package_written_atomically_is_single_object(self):
+    def test_completed_package_is_single_object(self):
+        # Truthful claim: the COMPLETED published file is one JSON object. Atomic
+        # visibility is proven separately in AtomicPublicationTests.
         self._approve()
         self._build()
         text = self.package.read_text(encoding="utf-8")
@@ -259,6 +263,112 @@ class ApprovalCliTests(unittest.TestCase):
         code, out = self._build()
         self.assertEqual(code, 2, out)
         self.assertIn("No current approval", out)
+
+
+class AtomicPublicationTests(unittest.TestCase):
+    """Amendment 2: the builder publishes the package atomically (a reader never sees a
+    partial file at the final path, a crash cannot leave a partial final package) while
+    remaining strictly no-clobber."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.form = self.tmp / "form.csv"
+        self.rows = self.tmp / "decision_rows.csv"
+        self.ledger = self.tmp / "member_create_uat_ledger.jsonl"
+        self.package = self.tmp / "member_create_uat_package_v2.json"
+        fx.write_form_csv(self.form)
+        fx.write_decision_rows(self.rows)
+
+    def _run(self, argv):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = approval.main(argv)
+        return code, buf.getvalue()
+
+    def _approve(self):
+        return self._run(["approve", "--reviewer", "digital", "--input", str(self.form),
+                          "--decision-rows", str(self.rows), "--row-number", "2", "--ledger", str(self.ledger)])
+
+    def _build(self, extra=None):
+        argv = ["build-package", "--input", str(self.form), "--decision-rows", str(self.rows),
+                "--row-number", "2", "--ledger", str(self.ledger), "--package-out", str(self.package)]
+        return self._run(argv + (extra or []))
+
+    def _build_events(self):
+        if not self.ledger.exists():
+            return []
+        return [json.loads(l) for l in self.ledger.read_text(encoding="utf-8").splitlines()
+                if l.strip() and json.loads(l).get("event") == "build"]
+
+    def _stray_temps(self):
+        return [f for f in os.listdir(self.tmp) if "mcuat_pkg" in f]
+
+    def test_publication_is_atomic_final_absent_and_temp_complete_before_link(self):
+        # At the moment of publication (os.link), the final path must not yet exist and
+        # the temporary file must already contain the complete, valid single JSON object.
+        self._approve()
+        captured = {}
+        real_link = os.link
+
+        def spy_link(src, dst):
+            captured["final_absent"] = not os.path.lexists(dst)
+            captured["temp_obj"] = json.loads(Path(src).read_text(encoding="utf-8"))
+            return real_link(src, dst)
+
+        with mock.patch("os.link", spy_link):
+            code, out = self._build()
+        self.assertEqual(code, 0, out)
+        self.assertTrue(captured["final_absent"], "final path must be absent until atomic publication")
+        self.assertIsInstance(captured["temp_obj"], dict)
+        self.assertEqual(captured["temp_obj"]["approval"]["decision"], "approved")
+        self.assertTrue(self.package.is_file(), "publication exposes the complete package atomically")
+        self.assertEqual(self._stray_temps(), [], "no stale temporary package after success")
+        self.assertEqual(len(self._build_events()), 1)
+
+    def test_temp_write_failure_leaves_no_final_no_temp_no_ledger(self):
+        self._approve()
+        with mock.patch("os.fsync", side_effect=OSError("simulated fsync failure")):
+            code, out = self._build()
+        self.assertEqual(code, 2, out)
+        self.assertFalse(self.package.exists(), "final path must be absent on temp-write failure")
+        self.assertEqual(self._stray_temps(), [], "temporary file must be cleaned")
+        self.assertEqual(self._build_events(), [], "no build ledger event on failure")
+
+    def test_publication_failure_leaves_no_final_no_temp_no_ledger(self):
+        self._approve()
+        with mock.patch("os.link", side_effect=OSError("simulated publication failure")):
+            code, out = self._build()
+        self.assertEqual(code, 2, out)
+        self.assertFalse(self.package.exists(), "final path must be absent when no competitor exists")
+        self.assertEqual(self._stray_temps(), [], "temporary file must be cleaned")
+        self.assertEqual(self._build_events(), [], "no build ledger event on failure")
+
+    def test_final_path_race_preserves_competitor_and_fails_closed(self):
+        self._approve()
+        real_link = os.link
+        sentinel = "COMPETING-SENTINEL-DO-NOT-OVERWRITE\n"
+
+        def racing_link(src, dst):
+            # A competitor creates the final path immediately before our publication.
+            with open(dst, "x", encoding="utf-8") as fh:
+                fh.write(sentinel)
+            return real_link(src, dst)  # now fails FileExistsError against the competitor
+
+        with mock.patch("os.link", racing_link):
+            code, out = self._build()
+        self.assertEqual(code, 2, out)
+        self.assertEqual(self.package.read_text(encoding="utf-8"), sentinel,
+                         "the competing final file must be preserved byte-for-byte")
+        self.assertEqual(self._stray_temps(), [], "only the builder's temporary file is removed")
+        self.assertEqual(self._build_events(), [], "no build ledger event on a publication collision")
+
+    def test_completed_package_has_restrictive_permissions_where_supported(self):
+        if os.name != "posix":
+            self.skipTest("POSIX permission bits are not applicable on this platform")
+        self._approve()
+        code, out = self._build()
+        self.assertEqual(code, 0, out)
+        self.assertEqual(oct(self.package.stat().st_mode & 0o777), "0o600")
 
 
 if __name__ == "__main__":

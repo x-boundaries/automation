@@ -29,6 +29,7 @@ import csv
 import json
 import os
 import sys
+import tempfile
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -307,16 +308,31 @@ def cmd_build_package(args):
     return 0
 
 
-def _write_package_atomically(package_out, package):
-    """Write the immutable package with a strict no-clobber, single-write contract.
+def _unlink_quietly(path):
+    """Best-effort remove of a path we own (a temporary file); never raises."""
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
 
-    An existing output path (a historical package, e.g. a prior v1 artifact) must be
-    preserved as evidence and is NEVER deleted, truncated, replaced, renamed, or
-    overwritten. There is deliberately no ``os.replace``/rename that could clobber: the
-    package is exclusive-created directly at the final path (``O_CREAT | O_EXCL``), so an
-    existing regular file makes the create fail closed. ``assert_safe_local_path`` already
-    rejects reparse points, and the explicit ``lexists`` check rejects directories,
-    symlinks, and any other occupied entry with a clear message before the create.
+
+def _write_package_atomically(package_out, package):
+    """Publish the immutable package with BOTH strict no-clobber AND atomic visibility.
+
+    Strict no-clobber: an existing final path (a historical package, e.g. a prior v1
+    artifact) is NEVER deleted, truncated, replaced, renamed away, or overwritten. A
+    concurrent creator of the final path wins safely.
+
+    Atomic publication: the complete package is written to a unique temporary file in the
+    SAME directory (exclusive-created, non-PII name), flushed and fsynced, then published
+    at the final path with ``os.link`` - a no-replace hard link that atomically exposes
+    the already-complete inode and fails closed if the final path exists. A reader never
+    observes a partial file at the final pathname, and a crash cannot leave a partial
+    FINAL package (only a stray temporary, which never blocks a future build). If the
+    filesystem cannot provide the atomic no-replace link, the build fails closed and only
+    the temporary file is cleaned - it never falls back to progressive writing at the
+    final path. ``assert_safe_local_path`` rejects reparse points; the ``lexists`` check
+    rejects directories, symlinks, and any other occupied final entry.
     """
     out_path = contract.assert_safe_local_path(package_out)
     if os.path.lexists(out_path):
@@ -326,28 +342,47 @@ def _write_package_atomically(package_out, package):
             "output filename."
         )
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        fd = os.open(out_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    except FileExistsError as error:
-        # Closes the check-to-create race: another writer created the path meanwhile.
-        raise ApprovalError(
-            "The package output path already exists; refuse fail-closed to preserve the "
-            "existing package (never overwritten)."
-        ) from error
+    # Unique temporary file in the same directory. mkstemp exclusive-creates it with a
+    # random, PII-free name and 0600 permissions where the platform supports them.
+    fd, temp_name = tempfile.mkstemp(dir=str(out_path.parent), prefix=".mcuat_pkg_", suffix=".tmp")
+    temp_path = temp_name
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(json.dumps(package, indent=2, sort_keys=True) + "\n")
             handle.flush()
             os.fsync(handle.fileno())
-    except BaseException:
-        # Remove only the partial file WE just exclusive-created this call, never a
-        # pre-existing package, so a write failure does not leave a partial package.
         try:
-            os.unlink(out_path)
+            os.chmod(temp_path, 0o600)
         except OSError:
             pass
+        # Atomic no-clobber publication of the COMPLETE temporary file.
+        try:
+            os.link(temp_path, out_path)
+        except FileExistsError as error:
+            # A competing final path appeared; it wins. Preserve it byte-for-byte.
+            raise ApprovalError(
+                "The package output path was created concurrently; refuse fail-closed to "
+                "preserve the existing package (never overwritten)."
+            ) from error
+        except OSError as error:
+            # No atomic no-replace link available on this filesystem: fail closed. Never
+            # fall back to progressive writing at the final path.
+            raise ApprovalError(
+                "Atomic no-clobber package publication is unavailable on this filesystem; "
+                "refuse fail-closed rather than write progressively at the final path."
+            ) from error
+    except BaseException:
+        # Clean ONLY our temporary file on every unsuccessful path; never touch the final.
+        _unlink_quietly(temp_path)
         raise
-    _write_private_marker(out_path.parent)
+    # Publication succeeded: drop the temporary link so no stale temp remains.
+    _unlink_quietly(temp_path)
+    # Best-effort private marker; a marker failure must never fail a completed
+    # publication or touch the package.
+    try:
+        _write_private_marker(out_path.parent)
+    except OSError:
+        pass
 
 
 def cmd_validate_package(args):
