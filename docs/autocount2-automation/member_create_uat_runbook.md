@@ -182,6 +182,19 @@ bump changes both `source_record_id` and `source_fingerprint` (each binds the sc
 version), a fresh reviewer decision is mechanically required; a `v1` decision or build
 cannot mint a `v2` package.
 
+The builder publishes the package atomically and cleans up its own temporary file
+truthfully. If it prints `status = cleanup_incomplete` (a distinct nonzero exit), the
+temporary file could not be removed and the run reports `stale_temp_basename` (a
+PII-free `.mcuat_pkg_*.tmp` name in the output directory) with `manual_cleanup_required`:
+
+- `publication = not_published`: no package was published. Manually delete the named
+  stray temporary file, then re-run the build.
+- `publication = succeeded`: the final package WAS published and is recorded in the
+  ledger as `build_cleanup_incomplete`. Do NOT rebuild this operation (the builder
+  refuses it): manually delete the named stray temporary file, and if a new package is
+  genuinely needed, start a fresh reviewer decision. Only ordinary `status = ok`
+  (exit 0) means the temporary cleanup completed.
+
 Copy the package to the VM, then dry-run:
 
 ```powershell

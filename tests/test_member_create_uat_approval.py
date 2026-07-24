@@ -266,9 +266,11 @@ class ApprovalCliTests(unittest.TestCase):
 
 
 class AtomicPublicationTests(unittest.TestCase):
-    """Amendment 2: the builder publishes the package atomically (a reader never sees a
-    partial file at the final path, a crash cannot leave a partial final package) while
-    remaining strictly no-clobber."""
+    """Amendment 2/3: the builder publishes the package atomically (a reader never sees a
+    partial file at the final path, a crash cannot leave a partial final package), remains
+    strictly no-clobber, AND is truthful about temporary-file cleanup - a failed temp
+    unlink is never swallowed. Pre-publication and post-publication cleanup failures are
+    handled separately."""
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
@@ -294,11 +296,17 @@ class AtomicPublicationTests(unittest.TestCase):
                 "--row-number", "2", "--ledger", str(self.ledger), "--package-out", str(self.package)]
         return self._run(argv + (extra or []))
 
-    def _build_events(self):
+    def _events_of(self, event):
         if not self.ledger.exists():
             return []
         return [json.loads(l) for l in self.ledger.read_text(encoding="utf-8").splitlines()
-                if l.strip() and json.loads(l).get("event") == "build"]
+                if l.strip() and json.loads(l).get("event") == event]
+
+    def _build_events(self):
+        return self._events_of("build")
+
+    def _cleanup_incomplete_events(self):
+        return self._events_of("build_cleanup_incomplete")
 
     def _stray_temps(self):
         return [f for f in os.listdir(self.tmp) if "mcuat_pkg" in f]
@@ -369,6 +377,148 @@ class AtomicPublicationTests(unittest.TestCase):
         code, out = self._build()
         self.assertEqual(code, 0, out)
         self.assertEqual(oct(self.package.stat().st_mode & 0o777), "0o600")
+
+    # ---- Amendment 3: pre-publication failure PLUS a forced temp-cleanup failure ---- #
+    def test_temp_write_failure_with_forced_unlink_failure_is_cleanup_incomplete(self):
+        self._approve()
+        with mock.patch("os.fsync", side_effect=OSError("simulated write failure")), \
+                mock.patch("os.unlink", side_effect=OSError("simulated unlink failure")):
+            code, out = self._build()
+        self.assertEqual(code, approval.EXIT_CLEANUP_INCOMPLETE, out)
+        summary = json.loads(out)
+        self.assertEqual(summary["status"], "cleanup_incomplete")
+        self.assertNotEqual(summary["status"], "ok")
+        self.assertEqual(summary["publication"], "not_published")
+        self.assertEqual(summary["temp_cleanup"], "failed")
+        # The original write failure stays distinguishable from the cleanup failure.
+        self.assertEqual(summary["original_failure"], "package_write_or_publication_failed")
+        self.assertTrue(summary["stale_temp_basename"].endswith(".tmp"))
+        self.assertFalse(self.package.exists(), "no final on pre-publication failure")
+        self.assertTrue(self._stray_temps(), "the operation-owned temp remains")
+        self.assertEqual(self._build_events(), [], "no successful build event")
+        self.assertEqual(self._cleanup_incomplete_events(), [], "not published => no publication event")
+
+    def test_publication_failure_with_forced_unlink_failure_is_cleanup_incomplete(self):
+        self._approve()
+        with mock.patch("os.link", side_effect=OSError("simulated publication failure")), \
+                mock.patch("os.unlink", side_effect=OSError("simulated unlink failure")):
+            code, out = self._build()
+        self.assertEqual(code, approval.EXIT_CLEANUP_INCOMPLETE, out)
+        summary = json.loads(out)
+        self.assertEqual(summary["status"], "cleanup_incomplete")
+        self.assertEqual(summary["publication"], "not_published")
+        self.assertFalse(self.package.exists(), "the builder created no final path")
+        self.assertTrue(self._stray_temps(), "the complete-but-unpublished temp remains")
+        self.assertEqual(self._build_events(), [])
+        self.assertEqual(self._cleanup_incomplete_events(), [])
+
+    def test_race_with_forced_unlink_failure_preserves_competitor_and_is_cleanup_incomplete(self):
+        self._approve()
+        real_link = os.link
+        sentinel = "COMPETING-SENTINEL-DO-NOT-OVERWRITE\n"
+
+        def racing_link(src, dst):
+            with open(dst, "x", encoding="utf-8") as fh:
+                fh.write(sentinel)
+            return real_link(src, dst)  # FileExistsError against the competitor
+
+        with mock.patch("os.link", racing_link), \
+                mock.patch("os.unlink", side_effect=OSError("simulated unlink failure")):
+            code, out = self._build()
+        self.assertEqual(code, approval.EXIT_CLEANUP_INCOMPLETE, out)
+        summary = json.loads(out)
+        self.assertEqual(summary["status"], "cleanup_incomplete")
+        self.assertEqual(summary["publication"], "not_published")
+        self.assertEqual(self.package.read_text(encoding="utf-8"), sentinel,
+                         "the competing final file must be preserved byte-for-byte, not deleted or mutated")
+        self.assertTrue(self._stray_temps(), "the builder's own temp remains")
+        self.assertEqual(self._build_events(), [])
+        self.assertEqual(self._cleanup_incomplete_events(), [])
+
+    # ---- Amendment 3: post-publication cleanup failure (committed boundary crossed) ---- #
+    def test_post_publication_unlink_failure_publishes_and_ledgers_cleanup_incomplete(self):
+        self._approve()
+        with mock.patch("os.unlink", side_effect=OSError("simulated unlink failure")):
+            code, out = self._build()
+        self.assertEqual(code, approval.EXIT_CLEANUP_INCOMPLETE, out)
+        summary = json.loads(out)
+        self.assertNotEqual(summary["status"], "ok", "must not report ordinary success")
+        self.assertEqual(summary["status"], "cleanup_incomplete")
+        self.assertEqual(summary["publication"], "succeeded")
+        self.assertEqual(summary["temp_cleanup"], "failed")
+        self.assertIs(summary["manual_cleanup_required"], True)
+        self.assertIs(summary["do_not_retry"], True)
+        # The final package exists, complete and valid.
+        self.assertTrue(self.package.is_file(), "the published final package is preserved")
+        pkg = json.loads(self.package.read_text(encoding="utf-8"))
+        valid, reasons = contract.validate_package(pkg)
+        self.assertTrue(valid, reasons)
+        # The temporary link remains (cleanup failed).
+        self.assertTrue(self._stray_temps(), "the temporary link remains on a cleanup failure")
+        # Exactly one durable cleanup-incomplete publication event; no normal build event.
+        ci = self._cleanup_incomplete_events()
+        self.assertEqual(len(ci), 1)
+        self.assertEqual(self._build_events(), [])
+        # The event binds the exact published package and approval transaction.
+        event = ci[0]
+        self.assertEqual(event["operation_id"], pkg["operation_id"])
+        self.assertEqual(event["bound_package_payload_hash"], pkg["payload_hash"])
+        self.assertEqual(event["package_file_name"], self.package.name)
+        self.assertEqual(event["source_record_id"], pkg["source_record_id"])
+        self.assertIs(event.get("cleanup_incomplete"), True)
+
+    def test_second_build_after_cleanup_incomplete_fails_closed(self):
+        self._approve()
+        with mock.patch("os.unlink", side_effect=OSError("simulated unlink failure")):
+            code1, out1 = self._build()
+        self.assertEqual(code1, approval.EXIT_CLEANUP_INCOMPLETE, out1)
+        self.assertEqual(len(self._cleanup_incomplete_events()), 1)
+        first_bytes = self.package.read_bytes()
+
+        # A second plain build with the same approval must fail closed (single-use guard).
+        code2, out2 = self._build()
+        self.assertEqual(code2, 2, out2)
+        summary2 = json.loads(out2)
+        self.assertEqual(summary2["status"], "error")
+        self.assertIn("must not be retried", summary2["error"])
+
+        # Even --rebuild cannot bypass the published-but-unclean guard.
+        code3, out3 = self._build(extra=["--rebuild"])
+        self.assertEqual(code3, 2, out3)
+        self.assertIn("must not be retried", json.loads(out3)["error"])
+
+        # No second package minted, no new build event, first package unchanged.
+        self.assertEqual(len(self._cleanup_incomplete_events()), 1)
+        self.assertEqual(self._build_events(), [])
+        self.assertEqual(self.package.read_bytes(), first_bytes)
+
+    # ---- Amendment 3: marker failure is not a package cleanup failure ---- #
+    def test_marker_failure_after_clean_publication_is_still_success(self):
+        self._approve()
+        with mock.patch.object(approval, "_write_private_marker", side_effect=OSError("marker failure")):
+            code, out = self._build()
+        self.assertEqual(code, 0, out)
+        summary = json.loads(out)
+        self.assertEqual(summary["status"], "ok")
+        self.assertEqual(summary["temp_cleanup"], "complete")
+        self.assertTrue(self.package.is_file())
+        pkg = json.loads(self.package.read_text(encoding="utf-8"))
+        valid, reasons = contract.validate_package(pkg)
+        self.assertTrue(valid, reasons)
+        # A marker failure never becomes a temporary-package cleanup failure.
+        self.assertEqual(self._stray_temps(), [], "temp cleanup still completes despite marker failure")
+        self.assertEqual(len(self._build_events()), 1)
+        self.assertEqual(self._cleanup_incomplete_events(), [])
+
+    # ---- Amendment 3: no cleanup path ever sweeps unrelated temporaries ---- #
+    def test_unrelated_temp_files_are_never_swept(self):
+        self._approve()
+        unrelated = self.tmp / ".mcuat_pkg_unrelated_sentinel.tmp"
+        unrelated.write_text("UNRELATED-DO-NOT-SWEEP\n", encoding="utf-8")
+        code, out = self._build()
+        self.assertEqual(code, 0, out)
+        self.assertTrue(unrelated.is_file(), "an unrelated temporary must never be swept")
+        self.assertEqual(unrelated.read_text(encoding="utf-8"), "UNRELATED-DO-NOT-SWEEP\n")
 
 
 if __name__ == "__main__":

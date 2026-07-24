@@ -53,6 +53,15 @@ PRIVATE_MARKER_TEXT = (
     "screenshot. Keep under C:\\XB\\autocount_outputs or an ignored local folder.\n"
 )
 
+# Distinct nonzero exit code for a truthful "cleanup incomplete" terminal outcome, kept
+# separate from ordinary error (2) and success (0) so a stale temporary package can never
+# be mistaken for a clean build at the process level.
+EXIT_CLEANUP_INCOMPLETE = 3
+
+# Ledger events that mark an approval's package as already published (clean OR published
+# with an incomplete temporary cleanup). Either blocks a plain re-build (single-use).
+BUILD_LEDGER_EVENTS = ("build", "build_cleanup_incomplete")
+
 
 class ApprovalError(ValueError):
     """Local approval/package contract failure."""
@@ -139,7 +148,12 @@ def append_ledger(ledger_path, entry):
         handle.write(json.dumps(entry, sort_keys=True) + "\n")
         handle.flush()
         os.fsync(handle.fileno())
-    _write_private_marker(ledger_path.parent)
+    # The private marker is advisory only; its failure must never fail a durable ledger
+    # append (and, at the package writer, must never mask a temporary-cleanup failure).
+    try:
+        _write_private_marker(ledger_path.parent)
+    except OSError:
+        pass
 
 
 def read_ledger(ledger_path):
@@ -163,8 +177,23 @@ def latest_decision(entries, source_record_id):
 
 
 def build_already_exists(entries, source_record_id):
+    # A package counts as already built if a normal build OR a cleanup-incomplete
+    # publication event exists, so a cleanup failure never becomes a loophole that lets a
+    # plain re-build proceed.
     return any(
-        entry.get("event") == "build" and entry.get("source_record_id") == source_record_id
+        entry.get("event") in BUILD_LEDGER_EVENTS and entry.get("source_record_id") == source_record_id
+        for entry in entries
+    )
+
+
+def published_cleanup_incomplete_exists(entries, source_record_id):
+    """True if a prior publication for this source record succeeded but its temporary
+    cleanup did not complete. Such an operation must not be retried as a new package
+    build at all (not even with --rebuild): the package was published and requires manual
+    temporary cleanup plus a fresh reviewer decision."""
+    return any(
+        entry.get("event") == "build_cleanup_incomplete"
+        and entry.get("source_record_id") == source_record_id
         for entry in entries
     )
 
@@ -236,6 +265,18 @@ def cmd_build_package(args):
     expires_at = decision.get("expires_at")
     if not expires_at or datetime.fromisoformat(expires_at) <= datetime.now(timezone.utc):
         raise ApprovalError("The approval has expired; re-approval is required.")
+    # A prior publication whose temporary cleanup did not complete is terminal for this
+    # source record: the package WAS published and must not be retried as a new build
+    # (not even with --rebuild). It requires manual temporary cleanup and a fresh reviewer
+    # decision, so the same approval can never mint another package merely because cleanup
+    # failed.
+    if published_cleanup_incomplete_exists(entries, srid):
+        raise ApprovalError(
+            "A prior package for this source record was published but its temporary "
+            "cleanup did not complete; this operation must not be retried as a new package "
+            "build. Complete the manual temporary cleanup and start a fresh reviewer "
+            "decision."
+        )
     if build_already_exists(entries, srid) and not args.rebuild:
         raise ApprovalError(
             "A package was already built for that source record; refuse (pass --rebuild only "
@@ -273,66 +314,143 @@ def cmd_build_package(args):
     if not ok:
         raise ApprovalError("Internal error: generated package failed validation: " + ",".join(reasons))
 
-    _write_package_atomically(args.package_out, package)
+    result = _write_package_atomically(args.package_out, package)
+    package_file_name = Path(args.package_out).name
 
+    if result.state == _PublishState.NOT_PUBLISHED:
+        # No package was published. If the operation-owned temporary file was cleaned, the
+        # original failure is authoritative - propagate it (no success, no build event). If
+        # the temporary file could NOT be removed, emit a truthful nonzero cleanup-incomplete
+        # result and still append no build event, without masking the original failure.
+        if not result.temp_stale:
+            raise result.cause if result.cause is not None else ApprovalError(
+                "The package could not be published; refuse fail-closed."
+            )
+        _print_summary(
+            {
+                "status": "cleanup_incomplete",
+                "event": "none",
+                "publication": "not_published",
+                "temp_cleanup": "failed",
+                "original_failure": "package_write_or_publication_failed",
+                "manual_cleanup_required": True,
+                "do_not_retry": True,
+                "stale_temp_basename": result.temp_basename,
+                "source_record_id": srid,
+                "operation_id": package["operation_id"],
+            }
+        )
+        return EXIT_CLEANUP_INCOMPLETE
+
+    common = {
+        "source_record_id": srid,
+        "source_fingerprint": fingerprint,
+        "approval_id": decision["approval_id"],
+        "operation_id": package["operation_id"],
+        "bound_package_payload_hash": payload_hash,
+        "package_file_name": package_file_name,
+    }
+
+    if result.state == _PublishState.PUBLISHED_CLEANUP_COMPLETE:
+        append_ledger(args.ledger, dict(common, event="build", recorded_at=utc_now_iso()))
+        _print_summary(
+            {
+                "status": "ok",
+                "event": "build",
+                "source_record_id": srid,
+                "operation_id": package["operation_id"],
+                "payload_hash": payload_hash,
+                "package_file_name": package_file_name,
+                "assign_fields_count": len(contract.ASSIGNABLE_FIELDS),
+                "temp_cleanup": "complete",
+                # LAPTOP-side builder: records only that ExpiryDate is present in the
+                # immutable package payload. It performs no AutoCount member assignment, so
+                # it never emits `expiry_date_assigned` (that field is the VM runner's,
+                # set only after the assignment loop actually completes).
+                "expiry_date_in_payload": True,
+            }
+        )
+        return 0
+
+    # PUBLISHED_CLEANUP_INCOMPLETE: the final package IS published (committed boundary
+    # crossed). Do not roll it back or claim ordinary success. Append exactly one durable
+    # cleanup-incomplete publication event binding the published package to the approval
+    # transaction, so the same approval cannot mint another package and later validation
+    # cannot mistake this for a clean build.
     append_ledger(
         args.ledger,
-        {
-            "event": "build",
-            "recorded_at": utc_now_iso(),
-            "source_record_id": srid,
-            "source_fingerprint": fingerprint,
-            "approval_id": decision["approval_id"],
-            "operation_id": package["operation_id"],
-            "bound_package_payload_hash": payload_hash,
-            "package_file_name": Path(args.package_out).name,
-        },
+        dict(
+            common,
+            event="build_cleanup_incomplete",
+            recorded_at=utc_now_iso(),
+            cleanup_incomplete=True,
+            stale_temp_basename=result.temp_basename,
+        ),
     )
     _print_summary(
         {
-            "status": "ok",
-            "event": "build",
+            "status": "cleanup_incomplete",
+            "event": "build_cleanup_incomplete",
+            "publication": "succeeded",
+            "temp_cleanup": "failed",
+            "manual_cleanup_required": True,
+            "do_not_retry": True,
+            "stale_temp_basename": result.temp_basename,
             "source_record_id": srid,
             "operation_id": package["operation_id"],
             "payload_hash": payload_hash,
-            "package_file_name": Path(args.package_out).name,
-            "assign_fields_count": len(contract.ASSIGNABLE_FIELDS),
-            # This is the LAPTOP-side package builder: it only records that ExpiryDate is
-            # present in the immutable package payload. It performs no AutoCount member
-            # assignment, so it must never emit `expiry_date_assigned` (that field is
-            # reserved for the VM runner's sanitised result, set only after the assignment
-            # loop has actually completed successfully).
+            "package_file_name": package_file_name,
             "expiry_date_in_payload": True,
         }
     )
-    return 0
+    return EXIT_CLEANUP_INCOMPLETE
 
 
-def _unlink_quietly(path):
-    """Best-effort remove of a path we own (a temporary file); never raises."""
-    try:
-        os.unlink(path)
-    except OSError:
-        pass
+class _PublishState:
+    """The three publication/cleanup states of one package build. The distinction is
+    material: pre-publication and post-publication cleanup failures leave different
+    committed states and are handled separately by the caller."""
+
+    NOT_PUBLISHED = "not_published"
+    PUBLISHED_CLEANUP_COMPLETE = "published_cleanup_complete"
+    PUBLISHED_CLEANUP_INCOMPLETE = "published_cleanup_incomplete"
+
+
+class _PublishResult:
+    """Outcome of one publication attempt. The writer NEVER silently swallows a
+    temporary-cleanup failure: a failed unlink is surfaced via ``cleanup_error`` and the
+    ``PUBLISHED_CLEANUP_INCOMPLETE`` / ``NOT_PUBLISHED``-with-stale-temp states."""
+
+    def __init__(self, state, temp_basename=None, cause=None, cleanup_error=None):
+        self.state = state
+        self.temp_basename = temp_basename        # sanitised, PII-free basename or None
+        self.cause = cause                        # original pre-publication failure (NOT_PUBLISHED)
+        self.cleanup_error = cleanup_error        # temporary-unlink failure, if any
+        self.temp_stale = cleanup_error is not None  # an operation-owned temp remains
 
 
 def _write_package_atomically(package_out, package):
-    """Publish the immutable package with BOTH strict no-clobber AND atomic visibility.
+    """Publish the immutable package with strict no-clobber, atomic visibility, AND
+    truthful temporary-file cleanup. Returns a ``_PublishResult``; the strict no-clobber
+    precondition (an already-occupied final path) still raises before any temporary file
+    is created.
 
-    Strict no-clobber: an existing final path (a historical package, e.g. a prior v1
-    artifact) is NEVER deleted, truncated, replaced, renamed away, or overwritten. A
-    concurrent creator of the final path wins safely.
+    Strict no-clobber: an existing/competing final path (e.g. a historical v1 artifact)
+    is NEVER deleted, truncated, replaced, renamed away, or overwritten; a concurrent
+    creator wins safely.
 
-    Atomic publication: the complete package is written to a unique temporary file in the
-    SAME directory (exclusive-created, non-PII name), flushed and fsynced, then published
-    at the final path with ``os.link`` - a no-replace hard link that atomically exposes
-    the already-complete inode and fails closed if the final path exists. A reader never
-    observes a partial file at the final pathname, and a crash cannot leave a partial
-    FINAL package (only a stray temporary, which never blocks a future build). If the
-    filesystem cannot provide the atomic no-replace link, the build fails closed and only
-    the temporary file is cleaned - it never falls back to progressive writing at the
-    final path. ``assert_safe_local_path`` rejects reparse points; the ``lexists`` check
-    rejects directories, symlinks, and any other occupied final entry.
+    Atomic publication: the complete package is written to a unique, PII-free temporary
+    file in the SAME directory (exclusive-created via ``mkstemp``), flushed and fsynced,
+    then published at the final path with ``os.link`` - a no-replace hard link that
+    atomically exposes the already-complete inode and fails closed if the final path
+    exists. A reader never sees a partial file at the final pathname; a crash leaves at
+    most a stray temporary (never a partial FINAL package). No fallback to progressive
+    writing at the final path.
+
+    Truthful cleanup: after resolving publication, exactly the ONE operation-owned
+    temporary path is unlinked. A failed unlink is NOT swallowed - it is reported so the
+    caller emits a nonzero cleanup-incomplete terminal result rather than false success.
+    Never sweeps other ``.mcuat_pkg_*`` files.
     """
     out_path = contract.assert_safe_local_path(package_out)
     if os.path.lexists(out_path):
@@ -342,47 +460,62 @@ def _write_package_atomically(package_out, package):
             "output filename."
         )
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    # Unique temporary file in the same directory. mkstemp exclusive-creates it with a
-    # random, PII-free name and 0600 permissions where the platform supports them.
     fd, temp_name = tempfile.mkstemp(dir=str(out_path.parent), prefix=".mcuat_pkg_", suffix=".tmp")
-    temp_path = temp_name
+    temp_basename = os.path.basename(temp_name)
+    published = False
+    cause = None
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(json.dumps(package, indent=2, sort_keys=True) + "\n")
             handle.flush()
             os.fsync(handle.fileno())
         try:
-            os.chmod(temp_path, 0o600)
+            os.chmod(temp_name, 0o600)
         except OSError:
             pass
-        # Atomic no-clobber publication of the COMPLETE temporary file.
-        try:
-            os.link(temp_path, out_path)
-        except FileExistsError as error:
-            # A competing final path appeared; it wins. Preserve it byte-for-byte.
-            raise ApprovalError(
-                "The package output path was created concurrently; refuse fail-closed to "
-                "preserve the existing package (never overwritten)."
-            ) from error
-        except OSError as error:
-            # No atomic no-replace link available on this filesystem: fail closed. Never
-            # fall back to progressive writing at the final path.
-            raise ApprovalError(
-                "Atomic no-clobber package publication is unavailable on this filesystem; "
-                "refuse fail-closed rather than write progressively at the final path."
-            ) from error
-    except BaseException:
-        # Clean ONLY our temporary file on every unsuccessful path; never touch the final.
-        _unlink_quietly(temp_path)
-        raise
-    # Publication succeeded: drop the temporary link so no stale temp remains.
-    _unlink_quietly(temp_path)
-    # Best-effort private marker; a marker failure must never fail a completed
-    # publication or touch the package.
+        os.link(temp_name, out_path)  # atomic no-replace publication of the complete file
+        published = True
+    except FileExistsError as error:
+        cause = ApprovalError(
+            "The package output path was created concurrently; refuse fail-closed to "
+            "preserve the existing package (never overwritten)."
+        )
+        cause.__cause__ = error
+    except OSError as error:
+        # Covers temporary write, flush/fsync, and non-FileExists link failures (e.g. a
+        # filesystem without atomic no-replace hard links). Never falls back to a
+        # progressive write at the final path.
+        cause = ApprovalError(
+            "The package could not be written or atomically published; refuse fail-closed "
+            "(never falls back to progressive writing at the final path)."
+        )
+        cause.__cause__ = error
+
+    # Attempt cleanup of ONLY the operation-owned temporary path, in every case. Never
+    # touch the final/competing path; never sweep other temporaries. A failed unlink is
+    # recorded (not swallowed) so the outcome stays truthful.
+    cleanup_error = None
+    try:
+        os.unlink(temp_name)
+    except OSError as unlink_err:
+        cleanup_error = unlink_err
+
+    if not published:
+        # NOT_PUBLISHED: we never created the final path (a race competitor is untouched).
+        # If cleanup succeeded, cleanup_error is None and the caller re-raises `cause`.
+        return _PublishResult(_PublishState.NOT_PUBLISHED, temp_basename=temp_basename,
+                              cause=cause, cleanup_error=cleanup_error)
+
+    # PUBLISHED: the final package exists. Best-effort private marker; a marker failure
+    # can never change the publication/cleanup state or touch the package.
     try:
         _write_private_marker(out_path.parent)
     except OSError:
         pass
+    if cleanup_error is None:
+        return _PublishResult(_PublishState.PUBLISHED_CLEANUP_COMPLETE)
+    return _PublishResult(_PublishState.PUBLISHED_CLEANUP_INCOMPLETE,
+                          temp_basename=temp_basename, cleanup_error=cleanup_error)
 
 
 def cmd_validate_package(args):
