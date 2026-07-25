@@ -174,39 +174,76 @@ Use a fresh, version-distinct `--package-out` filename (for example
 `member_create_uat_package_v2.json`). The build is strictly **no-clobber**: it refuses
 fail-closed if the output path already exists as any filesystem object (file, directory,
 symlink/reparse point), never deletes, truncates, renames, or overwrites it, and appends
-no build ledger event on a collision. `--rebuild` only permits another ledger build when
-`--package-out` is a distinct, absent path **and** every prior durable publication
-reservation for that approval is reconciled to a clean `build` ledger event (see the
-durable reservation section below); it never authorises overwriting an existing
-package. Any package built under the previous `member_create_uat_package/v1` contract,
+no build ledger event on a collision. **One approval builds exactly one package.**
+`--rebuild` is **retired and always refused** (see the terminal reservation rule below); a
+further package requires a fresh reviewer decision, a new approval id and a fresh output
+pathname. Any package built under the previous `member_create_uat_package/v1` contract,
 and its hash, are preserved as historical evidence and remain non-executable under the
 `v2` runner (the runner refuses the unrecognised schema version). Because the `v2` schema
 bump changes both `source_record_id` and `source_fingerprint` (each binds the schema
 version), a fresh reviewer decision is mechanically required; a `v1` decision or build
 cannot mint a `v2` package.
 
-#### Durable publication reservation (single-use backstop)
+#### Durable publication reservation and the terminal reservation rule
 
 The append-only ledger is the audit log, but it is written *after* the package is
 published, so it cannot be the only durable record that an approval was consumed. Before
 any final package can be published, the builder therefore creates one **durable, exclusive
-publication reservation** for that exact build attempt, beside the ledger:
+publication reservation** for that build, beside the ledger:
 
-`member_create_uat_reservation_<approval_id>.<attempt>.reservation`
+`member_create_uat_reservation_<approval_id>.1.reservation`
 
-It is a write-ahead intent marker, not a second ledger: created exactly once per attempt
-with `O_CREAT | O_EXCL`, fsynced (plus a directory-entry fsync on POSIX; on Windows NTFS
+It is a write-ahead intent marker, not a second ledger: created exactly once with
+`O_CREAT | O_EXCL`, fsynced (plus a directory-entry fsync on POSIX; on Windows NTFS
 journals the entry with the file's own fsync, and the achieved mode is always reported as
 `reservation_durability`), then never rewritten, truncated or deleted by the tool. It binds
 `approval_id`, `source_record_id`, `source_fingerprint`, `operation_id`,
 `bound_package_payload_hash` and the output **basename** only — no member value, no
 credential, no absolute path. It is local operational state and is git-ignored.
 
-On every build the tool checks that approval's reservation slots by direct path lookup (it
-never lists, globs or sweeps the directory). A reservation that is **not** reconciled to a
-clean `build` ledger event blocks that approval completely — `status = reservation_blocked`,
-and **both** a plain build and `--rebuild` are refused, at any fresh output path. Recovery
-is a fresh reviewer decision or a controlled reconciliation, never a silent retry.
+**The terminal reservation rule.** Once a reservation object for an approval exists — or
+may exist — that approval is **permanently consumed** for package-building purposes:
+
+- a plain build is refused;
+- `--rebuild` is refused;
+- a different, absent output pathname does not bypass it;
+- a new process, or a machine restart, does not bypass it;
+- **a readable ledger build event does not release it.**
+
+That last point is the reason the rule is absolute. A ledger `flush()`/`fsync()` failure can
+leave a *complete, perfectly readable* JSON build event whose durability was never
+confirmed, and on restart that record is indistinguishable from a properly persisted one.
+Treating it as proof of a finished build would let the same approval mint a second package.
+Confirming the confirmation cannot fix this — whatever acknowledges the ledger would itself
+need acknowledging — so the ledger simply stops being authority over approval reuse. It
+remains the audit record.
+
+The rule applies whether the reservation is confirmed durable, durability-uncertain,
+reconciled to a `build` event, reconciled to a `build_cleanup_incomplete` event, unmatched,
+malformed, foreign, accompanied by a complete-but-unconfirmed ledger line, or accompanied by
+a torn one. The reported `reservation_status` is recovery guidance only, never permission.
+
+On every build the tool checks that approval's reservation slots by direct path lookup; it
+never lists, globs or sweeps the directory, and never touches an unrelated reservation,
+package or temporary file. A consumed approval reports `status = approval_consumed`
+(exit 7). Recovery is always a fresh reviewer decision, or a controlled reconciliation under
+review — never a silent retry.
+
+Single use is a property of the **approval**, not of the member row: a fresh reviewer
+decision mints a new approval id and can build once, which is what makes recovery possible.
+
+#### Ledger integrity is fail-closed
+
+The ledger is read as an intact sequence of newline-terminated JSON objects. A torn
+(partially appended) final record, a malformed record, a record that is not a JSON object,
+or a read/decode failure all produce `status = ledger_integrity_uncertain` (exit 8) with
+`approval_blocked`, `do_not_retry` and `controlled_recovery_required` — never a traceback.
+
+In that state the tool does **not** discard the malformed record, repair, truncate, rewrite
+or replace the ledger, delete any reservation, touch any published package, or continue to
+package construction. Only a fixed shape classifier is reported (`ledger_integrity`); no
+ledger content, member value, credential or absolute path is ever printed. Reconcile the
+ledger under review, then start a fresh reviewer decision.
 
 #### Build outcomes and exit codes
 
@@ -220,8 +257,10 @@ other outcome is a distinct nonzero exit so no partial state can be mistaken for
 | 2 | `error` | no | Ordinary refusal before the reservation boundary (no approval state consumed). Fix the cause and re-run. |
 | 3 | `cleanup_incomplete` | see below | Temporary file could not be removed. The ledger event **was** recorded. |
 | 4 | `ledger_record_incomplete` | yes | Published, but the durable ledger event could not be persisted. **Do not retry.** |
-| 5 | `reservation_incomplete` / `reservation_blocked` | no | Reservation not created or not durable, or a prior reservation is unreconciled. |
+| 5 | `reservation_incomplete` | no | This attempt's reservation was not created, or not confirmed durable. |
 | 6 | `publication_failed_after_reservation` | no | Reservation is durable but publication failed; the approval is blocked. |
+| 7 | `approval_consumed` / `rebuild_requires_fresh_approval` | no | The approval is terminally consumed, or `--rebuild` (retired) was passed. Nothing was created or touched. |
+| 8 | `ledger_integrity_uncertain` | no | The ledger is not an intact append-only record. Nothing was created, read further or repaired. |
 
 Exit 3 (`cleanup_incomplete`) reports `stale_temp_basename` (a PII-free `.mcuat_pkg_*.tmp`
 name in the output directory) with `manual_cleanup_required`:
@@ -234,17 +273,27 @@ name in the output directory) with `manual_cleanup_required`:
   start a fresh reviewer decision.
 
 Exit 4 (`ledger_record_incomplete`) means the final package is published and complete but
-its durable ledger event was lost. Never delete, move, rename or edit the published
-package. The durable reservation now blocks this approval from building again at any path,
-including with `--rebuild`. If `temp_cleanup = failed`, manually delete the named stray
-temporary file as well. A new package requires a fresh reviewer decision.
+its durable ledger event was lost, or landed without confirmed durability. Never delete,
+move, rename or edit the published package. The durable reservation has terminally consumed
+this approval, so it cannot build again at any path, by any invocation. If
+`temp_cleanup = failed`, manually delete the named stray temporary file as well. A new
+package requires a fresh reviewer decision.
 
 Exits 5 and 6 publish nothing. Where `reservation = uncertain` or
 `publication_failed_after_reservation` is reported, the reservation entry is deliberately
 left in place: never delete, recreate or retry it, because removing it would turn "may have
 been consumed" into "definitely free". Reconcile it under review, or start a fresh reviewer
-decision. Where `reservation = not_created`, no approval state was consumed and a re-run is
-safe once the underlying filesystem cause is resolved.
+decision. Where `reservation = not_created`, reservation creation demonstrably did not begin,
+no reservation object exists, no approval state was consumed, and a re-run is safe once the
+underlying filesystem cause is resolved.
+
+Exit 7 creates and touches nothing at all: no reservation slot, no temporary file, no output
+file and no ledger event. `approval_consumed` names the blocking reservation basename and its
+diagnostic `reservation_status`, and sets `manual_temp_cleanup_required` when the prior
+attempt also left a stray temporary. `rebuild_requires_fresh_approval` is the retired
+`--rebuild` flag being refused outright.
+
+Exit 8 also creates and touches nothing, and leaves the ledger byte-for-byte as found.
 
 Copy the package to the VM, then dry-run:
 

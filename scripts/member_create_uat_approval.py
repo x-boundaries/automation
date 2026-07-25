@@ -7,10 +7,11 @@ State ownership (per approved design):
   record only: an append-only approval ledger recording controlled approve /
   reject / hold decisions bound to a stable source identity and a change-detection
   fingerprint, plus a record of which immutable package was built.
-* It also owns a durable publication reservation per build attempt: a write-ahead
-  intent marker created exclusively BEFORE any final package can be published, so
-  the single-use approval boundary survives a ledger persistence failure. It is a
-  safety backstop, never a second mutable business ledger.
+* It also owns a durable publication reservation: a write-ahead intent marker created
+  exclusively BEFORE any final package can be published, so the single-use approval
+  boundary survives a ledger persistence failure. Its existence TERMINALLY consumes that
+  approval for package-building purposes; a readable ledger event never releases it. It
+  is a safety backstop, never a second mutable business ledger.
 * The AUTOCOUNT VM owns the exclusive execution lock, the write-intent marker, the
   consumed marker, and the terminal result. This tool never performs those.
 
@@ -68,14 +69,22 @@ PRIVATE_MARKER_TEXT = (
 #      created without confirmed durability
 #   6  nothing published: the reservation is confirmed durable but publication failed, so
 #      the approval is permanently blocked by an unmatched reservation
+#   7  nothing attempted: a reservation object already exists for this approval, so the
+#      approval is terminally consumed; also returned for the retired same-approval
+#      --rebuild request, which can never authorise a further package
+#   8  nothing attempted: the approval ledger could not be read as a structurally intact
+#      append-only record, so no decision in it may be trusted
 EXIT_CLEANUP_INCOMPLETE = 3
 EXIT_LEDGER_RECORD_INCOMPLETE = 4
 EXIT_RESERVATION_INCOMPLETE = 5
 EXIT_PUBLICATION_BLOCKED = 6
+EXIT_APPROVAL_CONSUMED = 7
+EXIT_LEDGER_INTEGRITY_UNCERTAIN = 8
 
 # Ledger events that mark an approval's package as already published (clean OR published
-# with an incomplete temporary cleanup). Either blocks a plain re-build (single-use).
+# with an incomplete temporary cleanup). Either one blocks a further build for that approval.
 BUILD_LEDGER_EVENTS = ("build", "build_cleanup_incomplete")
+CLEANUP_INCOMPLETE_LEDGER_EVENTS = ("build_cleanup_incomplete",)
 
 # --------------------------------------------------------------------------- #
 # Durable publication reservation (single-use safety backstop)
@@ -85,23 +94,47 @@ BUILD_LEDGER_EVENTS = ("build", "build_cleanup_incomplete")
 # open/write/flush/fsync failure would leave a real published package with no durable
 # build event, and a later invocation with a fresh output path could mint another package.
 #
-# Therefore every build attempt must durably and EXCLUSIVELY reserve its approval BEFORE
-# any final package can be published. The reservation is a write-ahead intent marker, not
-# a second mutable business ledger: it is created exactly once per attempt, never
-# rewritten, never truncated and never deleted by this tool.
+# Therefore a build must durably and EXCLUSIVELY reserve its approval BEFORE any final
+# package can be published. The reservation is a write-ahead intent marker, not a second
+# mutable business ledger: it is created exactly once, never rewritten, never truncated and
+# never deleted by this tool.
 #
 # A reservation lives beside the approval ledger (the approval-state home) at a path
-# derived deterministically from the approval id and a bounded attempt index, so this
+# derived deterministically from the approval id and a bounded slot index, so this
 # approval's reservations are found by direct path lookup - the directory is never listed,
 # globbed or swept.
 RESERVATION_SCHEMA_VERSION = "member_create_uat_reservation/v1"
 RESERVATION_PREFIX = "member_create_uat_reservation_"
 RESERVATION_SUFFIX = ".reservation"
 
-# One slot per build attempt for a single approval. Slot 1 is the normal build; a further
-# slot is only ever consumed by an explicitly requested --rebuild whose predecessors are
-# all reconciled to clean `build` events. Bounded so slot discovery stays a fixed, small
-# number of direct path lookups rather than a directory scan.
+# --------------------------------------------------------------------------- #
+# THE TERMINAL RESERVATION RULE
+#
+# A reservation used to be treated as spent - releasing the approval for another build - as
+# soon as a MATCHING build event was READABLE in the ledger. That is unsound, because
+# readable is not durable:
+#
+#   * A ledger flush()/fsync() failure can leave a COMPLETE, perfectly parseable JSON line
+#     whose durability was never confirmed. On restart it is indistinguishable from a
+#     properly persisted event, so it looked like proof of a finished build and authorised
+#     minting a second package from the same approval.
+#   * A torn (partial) append can leave malformed JSONL behind instead.
+#
+# Acknowledging the acknowledgement cannot fix this: whatever confirms the ledger would
+# itself need confirming. So the ledger simply stops being authority over approval reuse:
+#
+#   Once ANY reservation object for an approval exists - or may exist - that approval is
+#   TERMINALLY CONSUMED for package-building purposes.
+#
+# This holds whether the reservation is confirmed durable, durability-uncertain, reconciled
+# to a `build` event, reconciled to a `build_cleanup_incomplete` event, unmatched,
+# malformed, foreign, accompanied by a complete-but-unconfirmed ledger line, or accompanied
+# by a torn one. The ledger remains the audit record; it no longer grants reuse authority.
+#
+# Consequently exactly ONE slot is ever created. The bounded scan window is kept so a slot
+# left by an earlier tool version still blocks the approval, and so slot discovery stays a
+# fixed, small number of direct path lookups rather than a directory scan.
+RESERVATION_ATTEMPT = 1
 RESERVATION_MAX_ATTEMPTS = 16
 
 # The sanitised fields that bind a reservation to exactly one build attempt. Every value is
@@ -135,6 +168,36 @@ class ReservationError(ApprovalError):
     def __init__(self, message, *, state):
         super().__init__(message)
         self.state = state
+
+
+# The sanitised classifiers for a ledger the tool refuses to trust. Each names the SHAPE of
+# the defect only: no ledger content, no member value, no credential and no absolute path is
+# ever derived from the file for reporting.
+LEDGER_INTEGRITY_REASONS = (
+    "unreadable",            # the file exists but could not be read (OSError)
+    "undecodable_text",      # the bytes are not valid UTF-8
+    "torn_final_record",     # the last record is not newline-terminated: a partial append
+    "malformed_json_record",  # a record is not parseable JSON
+    "invalid_record_shape",  # a record parses but is not a JSON object
+)
+
+
+class LedgerIntegrityError(ApprovalError):
+    """The approval ledger could not be read as a structurally intact append-only record.
+
+    Raised for a torn (partially appended) final record, malformed JSON, a record that is
+    not a JSON object, and read/decode failures. Every one of these means the recorded
+    decisions can no longer be trusted, so the build refuses fail-closed instead of
+    tracebacking out of an uncontrolled ``json`` decoding failure.
+
+    The malformed record is never silently discarded, and the ledger is never truncated,
+    repaired, rewritten or replaced: recovery is a controlled reconciliation under review.
+    ``reason`` is one of ``LEDGER_INTEGRITY_REASONS`` and carries no ledger content.
+    """
+
+    def __init__(self, message, *, reason):
+        super().__init__(message)
+        self.reason = reason
 
 
 def utc_now_iso():
@@ -227,13 +290,63 @@ def append_ledger(ledger_path, entry):
 
 
 def read_ledger(ledger_path):
+    """Read the append-only ledger, failing closed on ANY structural integrity defect.
+
+    A missing ledger is legitimately empty. Anything else that cannot be read as an intact
+    sequence of newline-terminated JSON objects raises ``LedgerIntegrityError`` so the
+    caller can emit an explicit sanitised non-success instead of letting a ``JSONDecodeError``
+    escape as an uncontrolled traceback.
+
+    ``append_ledger`` always terminates a record with a newline, so an unterminated tail is
+    positive evidence of a torn append: those bytes are a truncated prefix of a real record
+    and are rejected even in the rare case where the prefix happens to parse.
+
+    Nothing here truncates, repairs, rewrites or replaces the ledger, and no malformed record
+    is skipped: the defect is reported, and the file is left exactly as found for a
+    controlled recovery.
+    """
     path = Path(ledger_path)
     if not path.is_file():
         return []
+    try:
+        text = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as error:
+        raise LedgerIntegrityError(
+            "The approval ledger is not valid UTF-8, so its decisions cannot be trusted; "
+            "refuse fail-closed and leave the file untouched.",
+            reason="undecodable_text",
+        ) from error
+    except OSError as error:
+        raise LedgerIntegrityError(
+            "The approval ledger exists but could not be read, so its decisions cannot be "
+            "trusted; refuse fail-closed and leave the file untouched.",
+            reason="unreadable",
+        ) from error
+    if text and not text.endswith("\n"):
+        raise LedgerIntegrityError(
+            "The approval ledger ends with an unterminated record, so a prior append was "
+            "torn; refuse fail-closed and leave the file untouched for controlled recovery.",
+            reason="torn_final_record",
+        )
     entries = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        if line.strip():
-            entries.append(json.loads(line))
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except ValueError as error:
+            raise LedgerIntegrityError(
+                "The approval ledger contains a record that is not parseable JSON; refuse "
+                "fail-closed and leave the file untouched for controlled recovery.",
+                reason="malformed_json_record",
+            ) from error
+        if not isinstance(record, dict):
+            raise LedgerIntegrityError(
+                "The approval ledger contains a record that is not a JSON object; refuse "
+                "fail-closed and leave the file untouched for controlled recovery.",
+                reason="invalid_record_shape",
+            )
+        entries.append(record)
     return entries
 
 
@@ -246,25 +359,53 @@ def latest_decision(entries, source_record_id):
     return found
 
 
-def build_already_exists(entries, source_record_id):
-    # A package counts as already built if a normal build OR a cleanup-incomplete
-    # publication event exists, so a cleanup failure never becomes a loophole that lets a
-    # plain re-build proceed.
-    return any(
-        entry.get("event") in BUILD_LEDGER_EVENTS and entry.get("source_record_id") == source_record_id
-        for entry in entries
+def _publication_events_for(entries, approval_id, source_record_id, events):
+    """Ledger publication events attributable to THIS approval.
+
+    Single use is a property of the APPROVAL, not of the source record. The documented
+    recovery from every blocked state is a fresh reviewer decision, which mints a new approval
+    id; keying these guards on the source record instead would make one publication block that
+    member's row forever and leave no recovery path at all.
+
+    Every version of this tool that has written a publication event recorded its
+    ``approval_id``, so an event with a missing or non-string approval id came from elsewhere.
+    When such an event names this source record it is treated as attributable: unattributable
+    publication evidence has to block rather than pass.
+    """
+    matched = []
+    for entry in entries:
+        if entry.get("event") not in events:
+            continue
+        recorded = entry.get("approval_id")
+        if recorded == approval_id or (
+            not isinstance(recorded, str)
+            and entry.get("source_record_id") == source_record_id
+        ):
+            matched.append(entry)
+    return matched
+
+
+def build_already_exists(entries, approval_id, source_record_id):
+    """True when the ledger already records a publication for this approval - clean OR
+    published-with-incomplete-cleanup - so a cleanup failure is never a loophole.
+
+    SECONDARY guard only. The reservation is the authority (see the terminal reservation
+    rule); this catches a ledger whose reservation object is absent, for example one recorded
+    by a tool version that predates reservations.
+    """
+    return bool(
+        _publication_events_for(entries, approval_id, source_record_id, BUILD_LEDGER_EVENTS)
     )
 
 
-def published_cleanup_incomplete_exists(entries, source_record_id):
-    """True if a prior publication for this source record succeeded but its temporary
-    cleanup did not complete. Such an operation must not be retried as a new package
-    build at all (not even with --rebuild): the package was published and requires manual
-    temporary cleanup plus a fresh reviewer decision."""
-    return any(
-        entry.get("event") == "build_cleanup_incomplete"
-        and entry.get("source_record_id") == source_record_id
-        for entry in entries
+def published_cleanup_incomplete_exists(entries, approval_id, source_record_id):
+    """True if a prior publication for this approval succeeded but its temporary cleanup did
+    not complete. Such an operation must not be retried as a new package build: the package
+    WAS published, and it requires manual temporary cleanup plus a fresh reviewer decision."""
+    return bool(
+        _publication_events_for(
+            entries, approval_id, source_record_id, CLEANUP_INCOMPLETE_LEDGER_EVENTS
+        )
     )
 
 
@@ -278,7 +419,13 @@ def _write_private_marker(directory):
 # Durable publication reservation
 # --------------------------------------------------------------------------- #
 class _ReservationStatus:
-    """How one existing reservation relates to the durable ledger."""
+    """How one existing reservation relates to the durable ledger.
+
+    DIAGNOSTIC ONLY. Every status below blocks a further build for that approval; the
+    distinction exists so the operator knows what a controlled recovery has to look at. In
+    particular ``RECONCILED_BUILD`` does NOT release the approval - see the terminal
+    reservation rule above.
+    """
 
     RECONCILED_BUILD = "reconciled_build"                          # clean, fully recorded
     RECONCILED_CLEANUP_INCOMPLETE = "reconciled_cleanup_incomplete"  # published, temp stale
@@ -394,7 +541,12 @@ def read_reservation(path):
 
 
 def reservation_reconciliation(entries, record, approval_id, source_record_id):
-    """Classify one reservation record against the durable ledger entries."""
+    """Classify one reservation record against the ledger entries, for reporting only.
+
+    A ledger match is evidence about what a prior attempt did, not permission to reuse the
+    approval: a matching event may itself be a readable-but-never-fsynced line. Callers must
+    treat every classification as blocking.
+    """
     if record is None or record.get("schema_version") != RESERVATION_SCHEMA_VERSION:
         return _ReservationStatus.MALFORMED
     for field in RESERVATION_BINDING_FIELDS:
@@ -416,30 +568,29 @@ def reservation_reconciliation(entries, record, approval_id, source_record_id):
 
 
 def survey_reservations(state_dir, approval_id, source_record_id, entries):
-    """Inspect this approval's bounded reservation slots and report what blocks a build.
+    """Return ``(basename, status)`` for EVERY reservation slot this approval already has.
 
-    Only paths derived from THIS approval's id are examined, so the state directory is
-    never listed, globbed or swept and unrelated reservations, packages, ledgers and
-    temporary files are never read or touched.
+    A non-empty result means the approval is terminally consumed. Under the terminal
+    reservation rule the mere existence of a reservation object consumes the approval, so the
+    classified ``status`` is diagnostic detail that shapes the operator's recovery decision -
+    never authority to build again. A cleanly reconciled ``build`` status therefore blocks
+    exactly as firmly as an unmatched, malformed or foreign one.
 
-    Returns ``(unreconciled, free_attempt)``: ``unreconciled`` lists
-    ``(basename, status)`` for every slot that is not a cleanly reconciled ``build``, and
-    ``free_attempt`` is the lowest unused slot index (None when every slot is used).
+    Only paths derived from THIS approval's id are examined, so the state directory is never
+    listed, globbed or swept and unrelated reservations, packages, ledgers and temporary
+    files are never read or touched. Slots beyond the single one this tool now creates are
+    still inspected, so a reservation left by an earlier tool version also blocks.
     """
-    unreconciled = []
-    free_attempt = None
+    consumed = []
     for attempt in range(1, RESERVATION_MAX_ATTEMPTS + 1):
         path = reservation_path(state_dir, approval_id, attempt)
         if not os.path.lexists(path):
-            if free_attempt is None:
-                free_attempt = attempt
             continue
         status = reservation_reconciliation(
             entries, read_reservation(path), approval_id, source_record_id
         )
-        if status != _ReservationStatus.RECONCILED_BUILD:
-            unreconciled.append((path.name, status))
-    return unreconciled, free_attempt
+        consumed.append((path.name, status))
+    return consumed
 
 
 # --------------------------------------------------------------------------- #
@@ -449,6 +600,11 @@ def cmd_decision(args, decision):
     payload, desired, srid, fingerprint = resolve_source_row(
         args.input, args.decision_rows, args.row_number
     )
+    # Confirm the ledger is structurally intact BEFORE appending to it. Appending onto an
+    # unterminated torn record would splice the new decision into those bytes, turning one
+    # recoverable partial record into a single unrecoverable malformed line - a silent loss
+    # of audit evidence. Nothing is read out of the ledger here beyond that integrity check.
+    read_ledger(args.ledger)
     now = utc_now_iso()
     entry = {
         "event": "decision",
@@ -489,6 +645,29 @@ def cmd_decision(args, decision):
 
 
 def cmd_build_package(args):
+    # ---- RETIRED SAME-APPROVAL --rebuild ------------------------------------------------ #
+    # Refused first, before any private source row is read and before any filesystem object
+    # is created, inspected or touched. Under the terminal reservation rule a second package
+    # for one approval can never be authorised, so the flag has no remaining meaning and is
+    # rejected outright rather than left as a path that sometimes appears to work. Refusing
+    # here guarantees no reservation slot, no temporary file, no output path and no ledger
+    # event is created or modified.
+    if args.rebuild:
+        _print_summary(
+            {
+                "status": "rebuild_requires_fresh_approval",
+                "event": "none",
+                "publication": "not_attempted",
+                "reservation": "not_attempted",
+                "rebuild_supported": False,
+                "approval_blocked": True,
+                "do_not_retry": True,
+                "fresh_approval_required": True,
+                "recovery": "fresh_reviewer_decision_new_approval_id_and_fresh_output_path",
+            }
+        )
+        return EXIT_APPROVAL_CONSUMED
+
     payload, desired, srid, fingerprint = resolve_source_row(
         args.input, args.decision_rows, args.row_number
     )
@@ -503,18 +682,6 @@ def cmd_build_package(args):
     expires_at = decision.get("expires_at")
     if not expires_at or datetime.fromisoformat(expires_at) <= datetime.now(timezone.utc):
         raise ApprovalError("The approval has expired; re-approval is required.")
-    # A prior publication whose temporary cleanup did not complete is terminal for this
-    # source record: the package WAS published and must not be retried as a new build
-    # (not even with --rebuild). It requires manual temporary cleanup and a fresh reviewer
-    # decision, so the same approval can never mint another package merely because cleanup
-    # failed.
-    if published_cleanup_incomplete_exists(entries, srid):
-        raise ApprovalError(
-            "A prior package for this source record was published but its temporary "
-            "cleanup did not complete; this operation must not be retried as a new package "
-            "build. Complete the manual temporary cleanup and start a fresh reviewer "
-            "decision."
-        )
     approval_id = decision.get("approval_id")
     if not (isinstance(approval_id, str) and contract.APPROVAL_ID_RE.fullmatch(approval_id)):
         raise ApprovalError(
@@ -522,42 +689,56 @@ def cmd_build_package(args):
             "publication reservation can bind to it; refuse fail-closed."
         )
 
-    # Durable reservation gate. A reservation that is not cleanly reconciled to a normal
-    # `build` ledger event means a prior attempt for THIS approval may already have
-    # published a package whose ledger record was lost, or left state that cannot be
-    # trusted. Such an approval must not progress automatically - neither as a plain build
-    # nor with --rebuild - so this gate precedes the ordinary already-built check.
+    # ---- TERMINAL RESERVATION GATE ------------------------------------------------------ #
+    # Any reservation object that exists for this approval terminally consumes it, whatever
+    # its reconciliation status. A prior attempt may already have published a package - and a
+    # readable ledger build event is NOT proof that the attempt finished durably - so the
+    # approval can never mint a second package. The reported status is recovery guidance
+    # only. This gate precedes every ledger-based check because it is the authority.
     state_dir = contract.assert_safe_local_path(args.ledger).parent
-    unreconciled, free_attempt = survey_reservations(state_dir, approval_id, srid, entries)
-    if unreconciled:
+    consumed = survey_reservations(state_dir, approval_id, srid, entries)
+    if consumed:
         _print_summary(
             {
-                "status": "reservation_blocked",
+                "status": "approval_consumed",
                 "event": "none",
                 "publication": "not_attempted",
-                "reservation": "unreconciled",
-                "unreconciled_reservations": [
+                "reservation": "terminally_consumed",
+                "consumed_reservations": [
                     {"reservation_basename": name, "reservation_status": status}
-                    for name, status in unreconciled
+                    for name, status in consumed
                 ],
                 "approval_blocked": True,
                 "do_not_retry": True,
                 "rebuild_blocked": True,
+                "rebuild_supported": False,
                 "fresh_approval_required": True,
+                # A published-but-unclean prior attempt additionally leaves a stray temporary
+                # for the operator to remove by hand; its basename was reported by that run.
+                "manual_temp_cleanup_required": published_cleanup_incomplete_exists(
+                    entries, approval_id, srid
+                ),
                 "recovery": "fresh_approval_or_controlled_recovery",
                 "source_record_id": srid,
             }
         )
-        return EXIT_RESERVATION_INCOMPLETE
-    if build_already_exists(entries, srid) and not args.rebuild:
+        return EXIT_APPROVAL_CONSUMED
+
+    # Secondary ledger guards, reached only when NO reservation object exists for this
+    # approval - i.e. legacy state recorded by a tool version that predates reservations.
+    # The approval must stay single-use even then, and --rebuild no longer bypasses either
+    # guard because it no longer exists as a build path at all.
+    if published_cleanup_incomplete_exists(entries, approval_id, srid):
         raise ApprovalError(
-            "A package was already built for that source record; refuse (pass --rebuild only "
-            "if the prior package was never sent to the VM)."
+            "A prior package for this approval was published but its temporary cleanup did "
+            "not complete; this operation must not be retried as a new package build. "
+            "Complete the manual temporary cleanup and start a fresh reviewer decision."
         )
-    if free_attempt is None:
+    if build_already_exists(entries, approval_id, srid):
         raise ApprovalError(
-            "Every durable publication reservation slot for this approval is used; refuse "
-            "fail-closed and start a fresh reviewer decision."
+            "A package was already built for that approval; refuse fail-closed. A further "
+            "package requires a fresh reviewer decision, a new approval id and a fresh "
+            "output path."
         )
 
     # Strict no-clobber precondition, checked BEFORE any reservation so an occupied output
@@ -605,7 +786,7 @@ def cmd_build_package(args):
     reservation_record = {
         "schema_version": RESERVATION_SCHEMA_VERSION,
         "reserved_at": utc_now_iso(),
-        "attempt": free_attempt,
+        "attempt": RESERVATION_ATTEMPT,
         "approval_id": approval_id,
         "source_record_id": srid,
         "source_fingerprint": fingerprint,
@@ -613,7 +794,7 @@ def cmd_build_package(args):
         "bound_package_payload_hash": payload_hash,
         "package_file_name": package_file_name,
     }
-    reservation_target = reservation_path(state_dir, approval_id, free_attempt)
+    reservation_target = reservation_path(state_dir, approval_id, RESERVATION_ATTEMPT)
     reservation_basename = reservation_target.name
 
     result = _write_package_atomically(
@@ -624,9 +805,13 @@ def cmd_build_package(args):
 
     if result.state == _PublishState.RESERVATION_FAILED:
         # Nothing was published (the reservation boundary is strictly before os.link), so no
-        # final path was created and no competitor was touched. An `uncertain` reservation
-        # entry is never deleted, recreated or retried: it keeps this approval blocked until
-        # a controller reconciles it.
+        # final path was created and no competitor was touched.
+        #
+        # This is the ONE failure class that can leave the approval retryable, and only in the
+        # `not_created` case: reservation creation demonstrably did not begin, so no
+        # reservation filesystem object exists and nothing was consumed. `uncertain` means an
+        # entry may exist, which is exactly the terminal condition - so it is never deleted,
+        # recreated or retried, and the terminal gate will block every later invocation.
         uncertain = result.reservation_state == "uncertain"
         _print_summary(
             {
@@ -737,8 +922,8 @@ def cmd_build_package(args):
         if ledger_error is not None:
             # Publication succeeded and temporary cleanup completed, but the durable build
             # event could not be persisted. Ordinary success is impossible. The durable
-            # reservation - written before publication - is now unmatched, so this approval
-            # cannot build again at ANY fresh path, including with --rebuild.
+            # reservation - written before publication - terminally consumed this approval,
+            # so it cannot build again at ANY fresh path, by any invocation.
             _print_summary(
                 dict(
                     published_common,
@@ -1103,11 +1288,11 @@ def build_parser():
         "--rebuild",
         action="store_true",
         help=(
-            "Allow another ledger build for a source record that was already built, but "
-            "only when --package-out is a fresh, absent path AND every prior durable "
-            "publication reservation for this approval is reconciled to a clean build "
-            "event. It never overwrites an existing package (the output path is always "
-            "no-clobber) and never bypasses an unmatched or uncertain reservation."
+            "RETIRED and always refused. A reservation terminally consumes its approval, so "
+            "no second package can ever be built from one approval. Passing this flag "
+            "returns rebuild_requires_fresh_approval and creates nothing: no reservation, no "
+            "temporary file, no output file and no ledger event. A further package needs a "
+            "fresh reviewer decision, a new approval id and a fresh output pathname."
         ),
     )
 
@@ -1131,6 +1316,29 @@ def main(argv=None):
             return cmd_build_package(args)
         if args.command == "validate-package":
             return cmd_validate_package(args)
+    except LedgerIntegrityError as error:
+        # Handled before the generic arm (it is an ApprovalError subclass) so a torn or
+        # malformed ledger produces an explicit sanitised terminal state rather than a
+        # traceback or a generic error that an operator might retry. Nothing was created,
+        # nothing was published, no reservation was created or deleted, no package was
+        # modified, and the ledger is left exactly as found. Only the shape classifier is
+        # reported - never a ledger record, a member value, a credential or an absolute path.
+        _print_summary(
+            {
+                "status": "ledger_integrity_uncertain",
+                "event": "none",
+                "publication": "not_attempted",
+                "reservation": "not_attempted",
+                "ledger_integrity": error.reason,
+                "ledger_modified": False,
+                "approval_blocked": True,
+                "do_not_retry": True,
+                "controlled_recovery_required": True,
+                "fresh_approval_required": True,
+                "recovery": "controlled_ledger_reconciliation_then_fresh_approval",
+            }
+        )
+        return EXIT_LEDGER_INTEGRITY_UNCERTAIN
     except (ApprovalError, contract.ContractError, validator.FormContractError, OSError) as error:
         print(json.dumps({"status": "error", "error": str(error)}, indent=2, sort_keys=True))
         return 2
