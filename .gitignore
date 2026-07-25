@@ -260,6 +260,10 @@ PRIVATE_DO_NOT_COMMIT_MEMBER_BROWSE_EXTRACT.txt
 member_create_uat_ledger*.jsonl
 member_create_uat_package*.json
 member_create_uat_result*.json
+# Durable publication reservations: the local write-ahead single-use markers that block an
+# approval after a publication or ledger persistence failure. Local operational state only.
+member_create_uat_reservation_*.reservation
+autocount_outputs/**/member_create_uat_reservation_*.reservation
 autocount_outputs/**/member_create_uat_*.json
 autocount_outputs/**/member_create_uat_*.jsonl
 create_uat.lock

@@ -29,7 +29,8 @@ CI.
 
 - The LAPTOP DEVELOPMENT MACHINE owns the human decision only: the append-only
   approval ledger (approve / reject / hold) and a record of which immutable package
-  was built. The ledger is local and never committed.
+  was built, plus one durable publication reservation per build attempt (the write-ahead
+  single-use marker described in step 5). Both are local and never committed.
 - The AUTOCOUNT VM owns the exclusive execution lock, the write-intent marker, the
   consumed marker, and the terminal result. Two runners cannot both pass the lock:
   the second attempt terminates `EXECUTION_LOCKED`.
@@ -174,7 +175,9 @@ Use a fresh, version-distinct `--package-out` filename (for example
 fail-closed if the output path already exists as any filesystem object (file, directory,
 symlink/reparse point), never deletes, truncates, renames, or overwrites it, and appends
 no build ledger event on a collision. `--rebuild` only permits another ledger build when
-`--package-out` is a distinct, absent path; it never authorises overwriting an existing
+`--package-out` is a distinct, absent path **and** every prior durable publication
+reservation for that approval is reconciled to a clean `build` ledger event (see the
+durable reservation section below); it never authorises overwriting an existing
 package. Any package built under the previous `member_create_uat_package/v1` contract,
 and its hash, are preserved as historical evidence and remain non-executable under the
 `v2` runner (the runner refuses the unrecognised schema version). Because the `v2` schema
@@ -182,18 +185,66 @@ bump changes both `source_record_id` and `source_fingerprint` (each binds the sc
 version), a fresh reviewer decision is mechanically required; a `v1` decision or build
 cannot mint a `v2` package.
 
-The builder publishes the package atomically and cleans up its own temporary file
-truthfully. If it prints `status = cleanup_incomplete` (a distinct nonzero exit), the
-temporary file could not be removed and the run reports `stale_temp_basename` (a
-PII-free `.mcuat_pkg_*.tmp` name in the output directory) with `manual_cleanup_required`:
+#### Durable publication reservation (single-use backstop)
 
-- `publication = not_published`: no package was published. Manually delete the named
-  stray temporary file, then re-run the build.
-- `publication = succeeded`: the final package WAS published and is recorded in the
-  ledger as `build_cleanup_incomplete`. Do NOT rebuild this operation (the builder
-  refuses it): manually delete the named stray temporary file, and if a new package is
-  genuinely needed, start a fresh reviewer decision. Only ordinary `status = ok`
-  (exit 0) means the temporary cleanup completed.
+The append-only ledger is the audit log, but it is written *after* the package is
+published, so it cannot be the only durable record that an approval was consumed. Before
+any final package can be published, the builder therefore creates one **durable, exclusive
+publication reservation** for that exact build attempt, beside the ledger:
+
+`member_create_uat_reservation_<approval_id>.<attempt>.reservation`
+
+It is a write-ahead intent marker, not a second ledger: created exactly once per attempt
+with `O_CREAT | O_EXCL`, fsynced (plus a directory-entry fsync on POSIX; on Windows NTFS
+journals the entry with the file's own fsync, and the achieved mode is always reported as
+`reservation_durability`), then never rewritten, truncated or deleted by the tool. It binds
+`approval_id`, `source_record_id`, `source_fingerprint`, `operation_id`,
+`bound_package_payload_hash` and the output **basename** only — no member value, no
+credential, no absolute path. It is local operational state and is git-ignored.
+
+On every build the tool checks that approval's reservation slots by direct path lookup (it
+never lists, globs or sweeps the directory). A reservation that is **not** reconciled to a
+clean `build` ledger event blocks that approval completely — `status = reservation_blocked`,
+and **both** a plain build and `--rebuild` are refused, at any fresh output path. Recovery
+is a fresh reviewer decision or a controlled reconciliation, never a silent retry.
+
+#### Build outcomes and exit codes
+
+Only `status = ok` (exit 0) means the build is complete: reservation durable, package
+published, temporary file removed, and exactly one `build` ledger event fsynced. Every
+other outcome is a distinct nonzero exit so no partial state can be mistaken for success.
+
+| Exit | `status` | Published? | Meaning and required action |
+| --- | --- | --- | --- |
+| 0 | `ok` | yes | Complete and durably recorded. Nothing to do. |
+| 2 | `error` | no | Ordinary refusal before the reservation boundary (no approval state consumed). Fix the cause and re-run. |
+| 3 | `cleanup_incomplete` | see below | Temporary file could not be removed. The ledger event **was** recorded. |
+| 4 | `ledger_record_incomplete` | yes | Published, but the durable ledger event could not be persisted. **Do not retry.** |
+| 5 | `reservation_incomplete` / `reservation_blocked` | no | Reservation not created or not durable, or a prior reservation is unreconciled. |
+| 6 | `publication_failed_after_reservation` | no | Reservation is durable but publication failed; the approval is blocked. |
+
+Exit 3 (`cleanup_incomplete`) reports `stale_temp_basename` (a PII-free `.mcuat_pkg_*.tmp`
+name in the output directory) with `manual_cleanup_required`:
+
+- `publication = not_published`: nothing was published and nothing was reserved. Manually
+  delete the named stray temporary file, then re-run the build.
+- `publication = succeeded`: the final package WAS published and is recorded in the ledger
+  as `build_cleanup_incomplete`. Do NOT rebuild this operation (the builder refuses it):
+  manually delete the named stray temporary file, and if a new package is genuinely needed,
+  start a fresh reviewer decision.
+
+Exit 4 (`ledger_record_incomplete`) means the final package is published and complete but
+its durable ledger event was lost. Never delete, move, rename or edit the published
+package. The durable reservation now blocks this approval from building again at any path,
+including with `--rebuild`. If `temp_cleanup = failed`, manually delete the named stray
+temporary file as well. A new package requires a fresh reviewer decision.
+
+Exits 5 and 6 publish nothing. Where `reservation = uncertain` or
+`publication_failed_after_reservation` is reported, the reservation entry is deliberately
+left in place: never delete, recreate or retry it, because removing it would turn "may have
+been consumed" into "definitely free". Reconcile it under review, or start a fresh reviewer
+decision. Where `reservation = not_created`, no approval state was consumed and a re-run is
+safe once the underlying filesystem cause is resolved.
 
 Copy the package to the VM, then dry-run:
 
@@ -287,7 +338,9 @@ consumed marker yields `FAILED_BEFORE_WRITE`; a malformed marker yields
 After completion, leave the result-mapping workflow inactive, remove any temporary
 copies of the package and result from shared locations, and take no further create
 action. The consumed marker and write-intent marker remain on the VM as durable
-evidence and single-use guards; do not delete them.
+evidence and single-use guards; do not delete them. The laptop-side publication
+reservations remain beside the approval ledger for the same reason; do not delete or
+sweep them either.
 
 ## Safety boundary
 
@@ -300,6 +353,10 @@ evidence and single-use guards; do not delete them.
 - SaveMember is called at most once and is never automatically retried. An uncertain
   save outcome is terminal (`WRITE_OUTCOME_UNCERTAIN`) and is resolved only by the
   separate read-only recovery check, never by an automatic retry.
+- No final package can be published before its durable publication reservation is
+  confirmed, so a publication or ledger persistence failure can never leave a published
+  package that the same approval is free to build again. An already-published package is
+  never deleted, rolled back, truncated, renamed or modified by any failure path.
 - A package built under the previous `member_create_uat_package/v1` contract cannot be
   reused; the runner refuses it fail-closed. Build a fresh `v2` package at a new,
   version-distinct path after a new reviewer decision. The package builder is strictly
