@@ -93,6 +93,9 @@ EXIT_APPROVAL_CONSUMED = 7
 EXIT_LEDGER_INTEGRITY_UNCERTAIN = 8
 EXIT_DECISION_AUTHORITY_UNCERTAIN = 9
 EXIT_DECISION_NOT_AUTHORITATIVE = 10
+#  11  nothing claimed and nothing published: the exclusive build claim was not committed, so
+#      the approval was NOT consumed and a later explicit (never automatic) retry is allowed
+EXIT_BUILD_CLAIM_NOT_RECORDED = 11
 
 # Ledger events that mark an approval's package as already published (clean OR published
 # with an incomplete temporary cleanup). Either one blocks a further build for that approval.
@@ -277,14 +280,14 @@ def _is_plain_int(value):
 
 
 def _valid_audit_timestamp(value):
-    """A safe-charset ISO-8601 timestamp that actually parses."""
-    if not isinstance(value, str) or not contract.SAFE_TIMESTAMP_RE.fullmatch(value):
-        return False
-    try:
-        datetime.fromisoformat(value)
-    except ValueError:
-        return False
-    return True
+    """A safe-charset ISO-8601 timestamp that parses AND carries a UTC offset.
+
+    Amendment 7: a naive value such as ``2026-07-28T00:00:00`` parses happily but has no
+    offset, so any later comparison against an aware "now" raises an uncontrolled
+    ``TypeError``. The single central parser in the decision store owns that rule, so the
+    audit ledger and the authority store cannot drift apart on what "a valid timestamp" means.
+    """
+    return decisions.parse_aware_timestamp(value) is not None
 
 
 def _matches(value, pattern):
@@ -1062,7 +1065,15 @@ def cmd_build_package(args):
             return EXIT_DECISION_NOT_AUTHORITATIVE
         raise
     try:
+        # NON-AUTHORITATIVE preflight. It exists only to refuse the obvious cases cheaply and
+        # without mutation; the AUTHORITATIVE resolution happens again inside the build-claim
+        # transaction, which is what closes the time-of-check/time-of-use window.
         authority = decisions.resolve_authority(conn, srid)
+        preflight_claim = (
+            decisions.fetch_claim_for_approval(conn, authority.decision["approval_id"])
+            if authority.state == decisions.AuthorityState.APPROVED
+            else None
+        )
     finally:
         conn.close()
 
@@ -1102,27 +1113,36 @@ def cmd_build_package(args):
         raise ApprovalError(
             "The source data changed after approval (fingerprint mismatch); approval is invalid."
         )
-    # `resolve_authority` has already proven this timestamp parses and the approval id is
-    # well-formed, so neither check can escape as an uncontrolled exception here.
-    if datetime.fromisoformat(decision["expires_at"]) <= datetime.now(timezone.utc):
+    # `resolve_authority` has already proven this timestamp is a valid AWARE value, so the
+    # comparison below is aware-to-aware and can never raise the naive/aware TypeError.
+    if decisions.parse_aware_timestamp(decision["expires_at"]) <= decisions.utc_now():
         raise ApprovalError("The approval has expired; re-approval is required.")
     approval_id = decision["approval_id"]
 
-    # ---- TERMINAL RESERVATION GATE ------------------------------------------------------ #
-    # Any reservation object that exists for this approval terminally consumes it, whatever
-    # its reconciliation status. A prior attempt may already have published a package - and a
-    # readable ledger build event is NOT proof that the attempt finished durably - so the
-    # approval can never mint a second package. The reported status is recovery guidance
-    # only. This gate precedes every ledger-based check because it is the authority.
+    # ---- TERMINAL CONSUMPTION GATE ---------------------------------------------------- #
+    # Two independent, non-mutating facts can each prove this approval is already spent:
+    #
+    #   * a committed BUILD CLAIM - the PRIMARY and terminal consumption fact (Amendment 7);
+    #   * any reservation object for the approval - the crash/publication backstop that also
+    #     covers state written before claims existed.
+    #
+    # Both are reported in ONE refusal so the operator sees the whole picture, and the claim is
+    # named as the authority. Neither is ever deleted, altered or swept.
     state_dir = contract.assert_safe_local_path(args.ledger).parent
     consumed = survey_reservations(state_dir, approval_id, srid, entries)
-    if consumed:
+    if preflight_claim is not None or consumed:
         _print_summary(
             {
                 "status": "approval_consumed",
                 "event": "none",
                 "publication": "not_attempted",
-                "reservation": "terminally_consumed",
+                "build_claim": (
+                    "already_committed" if preflight_claim is not None else "not_created"
+                ),
+                "claim_id": (
+                    preflight_claim["claim_id"] if preflight_claim is not None else None
+                ),
+                "reservation": "terminally_consumed" if consumed else "not_attempted",
                 "consumed_reservations": [
                     {"reservation_basename": name, "reservation_status": status}
                     for name, status in consumed
@@ -1198,7 +1218,49 @@ def cmd_build_package(args):
     ok, reasons = contract.validate_package(package)
     if not ok:
         raise ApprovalError("Internal error: generated package failed validation: " + ",".join(reasons))
+    schema_problem = _validate_against_real_json_schema(package)
+    if schema_problem is not None:
+        raise ApprovalError(
+            "Internal error: generated package failed the real JSON Schema: " + schema_problem
+        )
 
+    # ---- PRE-CLAIM BARRIER ------------------------------------------------------------- #
+    # Everything above is non-mutating: no temporary file, no reservation, no claim, no ledger
+    # event and no output path has been created or touched. This seam is the exact instant a
+    # concurrent reviewer decision is most dangerous, so tests pause here to commit one.
+    _pre_claim_barrier()
+
+    # ---- EXCLUSIVE BUILD CLAIM --------------------------------------------------------- #
+    # Re-resolves authority and inserts the claim inside ONE `BEGIN IMMEDIATE`, on the same
+    # serialisation boundary the decision writers use. A concurrent reviewer either loses the
+    # write lock (so this re-resolve observes its decision) or wins it (so this re-resolve
+    # observes it): there is no interleaving in which a stale approval authorises publication.
+    claim_record = {
+        "claim_id": "claim_" + uuid.uuid4().hex,
+        "decision_sequence": decision["sequence"],
+        "decision_id": decision["decision_id"],
+        "decision_record_hash": decision["record_hash"],
+        "approval_id": approval_id,
+        "source_record_id": srid,
+        "source_fingerprint": fingerprint,
+        "operation_id": package["operation_id"],
+        "package_payload_hash": payload_hash,
+        "package_file_name": package_file_name,
+        "claimed_at": utc_now_iso(),
+        "schema_version": decisions.SCHEMA_VERSION,
+    }
+    claim_record["record_hash"] = decisions.claim_record_hash(claim_record)
+
+    claim = _claim_build(store, srid, decision, claim_record)
+    if claim.state != _ClaimState.COMMITTED:
+        return _report_unclaimed(claim, claim_record, srid)
+
+    # ---- POST-CLAIM: the approval is now PERMANENTLY CONSUMED ------------------------- #
+    # From here on every outcome - success or any failure at any stage - leaves the approval
+    # consumed. Nothing below ever deletes or alters the claim, a reservation, a published
+    # package, a competing package, a historical package, a torn audit ledger or an unrelated
+    # temporary, and nothing sweeps a directory.
+    #
     # The reservation record binds this exact build attempt. Every value is a random
     # identifier, a one-way hash or the operator-chosen output basename: no raw member
     # value, no credential and no private absolute path is stored.
@@ -1216,108 +1278,105 @@ def cmd_build_package(args):
     reservation_target = reservation_path(state_dir, approval_id, RESERVATION_ATTEMPT)
     reservation_basename = reservation_target.name
 
-    result = _write_package_atomically(
-        args.package_out,
-        package,
-        lambda: write_reservation(reservation_target, reservation_record),
-    )
+    # Any escape from the publication writer - including a `tempfile.mkstemp` failure raised
+    # before its own try block, or a concurrent creator occupying the output path - is still a
+    # POST-CLAIM failure, so it must be reported as a consumed approval rather than escaping to
+    # the generic handler as an ordinary retryable error.
+    try:
+        result = _write_package_atomically(
+            args.package_out,
+            package,
+            lambda: write_reservation(reservation_target, reservation_record),
+        )
+    except (OSError, ApprovalError, contract.ContractError):
+        _print_summary(
+            dict(
+                _claimed_consumption(claim_record),
+                status="post_claim_publication_failed",
+                event="none",
+                publication="not_published",
+                reservation="not_attempted",
+                temp_cleanup="not_attempted",
+                failure_stage="package_temporary_creation",
+                source_record_id=srid,
+                operation_id=package["operation_id"],
+            )
+        )
+        return EXIT_PUBLICATION_BLOCKED
 
     if result.state == _PublishState.RESERVATION_FAILED:
         # Nothing was published (the reservation boundary is strictly before os.link), so no
         # final path was created and no competitor was touched.
         #
-        # `not_created` is the ONLY retryable reservation outcome, and it is claimed solely
-        # when a non-following existence re-check positively proved the slot is empty.
-        #
-        # `consumed` means a competitor's reservation definitely occupies the slot, which
-        # terminally consumed this approval - it was previously mislabelled `not_created`, so
-        # this invocation emitted retry guidance for an approval that must never be retried.
-        # `uncertain` means an entry may exist, which is the same terminal condition. Neither
-        # is ever deleted, recreated or retried, and the terminal gate blocks every later
-        # invocation.
-        # Exit codes follow the states exactly: `consumed` is the documented
-        # terminally-consumed approval (exit 7); `uncertain` is a reservation created without
-        # confirmed durability (exit 5, still blocked); `not_created` is the sole retryable
-        # outcome (exit 5).
+        # Amendment 7: the reservation is no longer the authorisation point, so NONE of its
+        # failure states can release the approval - the committed claim already consumed it.
+        # `consumed` still additionally means a competitor's reservation occupies the slot, and
+        # that competitor is left byte-for-byte untouched. No reservation entry is ever
+        # deleted, recreated or retried.
         state = result.reservation_state
-        consumed = state == ReservationError.CONSUMED
-        blocked = state != ReservationError.NOT_CREATED
         _print_summary(
-            {
-                "status": "approval_consumed" if consumed else "reservation_incomplete",
-                "event": "none",
-                "publication": "not_published",
-                "reservation": state,
-                "reservation_basename": reservation_basename,
-                "reservation_durability": "unconfirmed",
-                "competing_reservation_preserved": consumed,
-                "temp_cleanup": "failed" if result.temp_stale else "complete",
-                "stale_temp_basename": result.temp_basename if result.temp_stale else None,
-                "manual_cleanup_required": bool(result.temp_stale),
-                "approval_blocked": blocked,
-                "do_not_retry": blocked,
-                "fresh_approval_required": blocked,
-                "recovery": (
-                    "fresh_approval_or_controlled_recovery"
-                    if blocked
-                    else "resolve_reservation_failure_then_retry"
-                ),
-                "source_record_id": srid,
-                "operation_id": package["operation_id"],
-            }
+            dict(
+                _claimed_consumption(claim_record),
+                status="reservation_failed_after_claim",
+                event="none",
+                publication="not_published",
+                reservation=state,
+                reservation_basename=reservation_basename,
+                reservation_durability="unconfirmed",
+                competing_reservation_preserved=state == ReservationError.CONSUMED,
+                temp_cleanup="failed" if result.temp_stale else "complete",
+                stale_temp_basename=result.temp_basename if result.temp_stale else None,
+                manual_cleanup_required=bool(result.temp_stale),
+                failure_stage="reservation",
+                source_record_id=srid,
+                operation_id=package["operation_id"],
+            )
         )
-        return EXIT_APPROVAL_CONSUMED if consumed else EXIT_RESERVATION_INCOMPLETE
+        return EXIT_PUBLICATION_BLOCKED
 
     if result.state == _PublishState.RESERVED_NOT_PUBLISHED:
         # The reservation IS durable but publication did not complete, so no package was
-        # published and any competing final path is untouched. No ledger build event will
-        # ever match this reservation, so the approval is permanently blocked: recovery is a
-        # fresh reviewer decision or a controlled reconciliation, never a silent retry.
+        # published and any competing final path is untouched. The approval stays consumed:
+        # recovery is a fresh reviewer decision or a controlled reconciliation, never a retry.
         _print_summary(
-            {
-                "status": "publication_failed_after_reservation",
-                "event": "none",
-                "publication": "not_published",
-                "reservation": "confirmed_durable",
-                "reservation_basename": reservation_basename,
-                "reservation_durability": result.reservation_durability,
-                "temp_cleanup": "failed" if result.temp_stale else "complete",
-                "stale_temp_basename": result.temp_basename if result.temp_stale else None,
-                "manual_cleanup_required": bool(result.temp_stale),
-                "approval_blocked": True,
-                "do_not_retry": True,
-                "fresh_approval_required": True,
-                "recovery": "fresh_approval_or_controlled_recovery",
-                "source_record_id": srid,
-                "operation_id": package["operation_id"],
-            }
+            dict(
+                _claimed_consumption(claim_record),
+                status="publication_failed_after_reservation",
+                event="none",
+                publication="not_published",
+                reservation="confirmed_durable",
+                reservation_basename=reservation_basename,
+                reservation_durability=result.reservation_durability,
+                temp_cleanup="failed" if result.temp_stale else "complete",
+                stale_temp_basename=result.temp_basename if result.temp_stale else None,
+                manual_cleanup_required=bool(result.temp_stale),
+                failure_stage="atomic_publication",
+                source_record_id=srid,
+                operation_id=package["operation_id"],
+            )
         )
         return EXIT_PUBLICATION_BLOCKED
 
     if result.state == _PublishState.NOT_PUBLISHED:
-        # No package was published. If the operation-owned temporary file was cleaned, the
-        # original failure is authoritative - propagate it (no success, no build event). If
-        # the temporary file could NOT be removed, emit a truthful nonzero cleanup-incomplete
-        # result and still append no build event, without masking the original failure.
-        if not result.temp_stale:
-            raise result.cause if result.cause is not None else ApprovalError(
-                "The package could not be published; refuse fail-closed."
-            )
+        # A pre-reservation temporary write/flush/fsync failure. No package was published, and
+        # the approval remains consumed by the committed claim - the original failure is
+        # reported as a distinct stage rather than propagated as an ordinary error.
         _print_summary(
-            {
-                "status": "cleanup_incomplete",
-                "event": "none",
-                "publication": "not_published",
-                "temp_cleanup": "failed",
-                "original_failure": "package_write_or_publication_failed",
-                "manual_cleanup_required": True,
-                "do_not_retry": True,
-                "stale_temp_basename": result.temp_basename,
-                "source_record_id": srid,
-                "operation_id": package["operation_id"],
-            }
+            dict(
+                _claimed_consumption(claim_record),
+                status="post_claim_publication_failed",
+                event="none",
+                publication="not_published",
+                reservation="not_attempted",
+                temp_cleanup="failed" if result.temp_stale else "complete",
+                stale_temp_basename=result.temp_basename if result.temp_stale else None,
+                manual_cleanup_required=bool(result.temp_stale),
+                failure_stage="package_temporary_write",
+                source_record_id=srid,
+                operation_id=package["operation_id"],
+            )
         )
-        return EXIT_CLEANUP_INCOMPLETE
+        return EXIT_PUBLICATION_BLOCKED
 
     # PUBLISHED: the committed boundary is crossed and the reservation is durable. The
     # published final package is never deleted, rolled back, truncated, renamed or modified
@@ -1338,6 +1397,8 @@ def cmd_build_package(args):
         "reservation": "confirmed_durable",
         "reservation_basename": reservation_basename,
         "reservation_durability": result.reservation_durability,
+        "build_claim": "committed",
+        "claim_id": claim_record["claim_id"],
         "source_record_id": srid,
         "operation_id": package["operation_id"],
         "payload_hash": payload_hash,
@@ -1383,6 +1444,9 @@ def cmd_build_package(args):
                 "reservation": "confirmed_durable",
                 "reservation_basename": reservation_basename,
                 "reservation_durability": result.reservation_durability,
+                "build_claim": "committed",
+                "claim_id": claim_record["claim_id"],
+                "claim_durability": "transactional_commit_synchronous_full",
                 # LAPTOP-side builder: records only that ExpiryDate is present in the
                 # immutable package payload. It performs no AutoCount member assignment, so
                 # it never emits `expiry_date_assigned` (that field is the VM runner's,
@@ -1439,6 +1503,252 @@ def cmd_build_package(args):
         )
     )
     return EXIT_CLEANUP_INCOMPLETE
+
+
+SCHEMA_PATH = SCRIPT_DIR.parent / "schemas" / "member_create_uat_package.schema.json"
+
+
+def _validate_against_real_json_schema(package):
+    """Validate the in-memory package against the REAL JSON Schema, when available.
+
+    ``contract.validate_package`` mirrors the schema and the contract suite proves the two
+    equivalent, so it remains the mandatory gate. When the optional ``jsonschema`` library is
+    installed the real schema file is additionally enforced, so the mirror can never silently
+    drift from the language-neutral contract. A missing library is not treated as a pass for
+    anything the mandatory gate already covers.
+
+    Returns a sanitised reason, or None.
+    """
+    try:
+        import jsonschema
+    except ImportError:
+        return None
+    try:
+        schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return "package_schema_unreadable"
+    try:
+        jsonschema.validate(package, schema)
+    except jsonschema.ValidationError:
+        return "package_failed_real_json_schema"
+    except jsonschema.SchemaError:
+        return "package_schema_invalid"
+    return None
+
+
+def _pre_claim_barrier():
+    """The exact instant between the non-mutating preflight and the build-claim transaction.
+
+    A deliberate no-op seam. Tests patch it to commit a concurrent reviewer decision at the
+    worst possible moment, which is how the time-of-check/time-of-use window is proven closed.
+    """
+    return None
+
+
+class _ClaimState:
+    """The resolved outcome of one exclusive build-claim attempt."""
+
+    COMMITTED = "committed"            # the approval is consumed; this attempt may publish
+    SUPERSEDED = "superseded"          # a newer/different decision won the race; nothing claimed
+    ALREADY_CLAIMED = "already_claimed"  # some claim already consumed this approval
+    NOT_RECORDED = "not_recorded"      # nothing committed; a later EXPLICIT retry is allowed
+    UNCERTAIN = "uncertain"            # indeterminate; fail closed, never retry
+
+
+class _ClaimOutcome:
+    def __init__(self, state, *, authority=None, detail=None, claim=None):
+        self.state = state
+        self.authority = authority
+        self.detail = detail
+        self.claim = claim
+
+
+def _claimed_consumption(claim_record):
+    """The consumption facts every post-claim outcome must report, success or failure."""
+    return {
+        "build_claim": "committed",
+        "claim_id": claim_record["claim_id"],
+        "approval_blocked": True,
+        "do_not_retry": True,
+        "fresh_approval_required": True,
+        "recovery": "fresh_approval_or_controlled_recovery",
+    }
+
+
+def _claim_binding_mismatch(row, claim_record):
+    """None when a recovered claim row matches every intended binding, else a reason."""
+    for field in decisions.CLAIM_HASH_FIELDS:
+        if row[field] != claim_record[field]:
+            return "claim_binding_mismatch"
+    return None
+
+
+def _claim_blocker(conn, authority, expected, claim_record):
+    """Re-check, INSIDE the claim transaction, that this exact approval may still be claimed.
+
+    This is the authoritative resolution. A concurrent reviewer decision committed after the
+    preflight is observed here, because the reviewer's transaction and this one serialise on the
+    same database write boundary.
+    """
+    if authority.state != decisions.AuthorityState.APPROVED:
+        return _ClaimOutcome(
+            _ClaimState.SUPERSEDED, authority=authority, detail="decision_superseded"
+        )
+    current = authority.decision
+    for field in ("approval_id", "decision_id", "sequence", "record_hash",
+                  "source_record_id", "source_fingerprint"):
+        intended = expected[field]
+        if current[field] != intended:
+            return _ClaimOutcome(
+                _ClaimState.SUPERSEDED, authority=authority, detail="decision_superseded"
+            )
+    if decisions.parse_aware_timestamp(current["expires_at"]) <= decisions.utc_now():
+        return _ClaimOutcome(
+            _ClaimState.SUPERSEDED, authority=authority, detail="approval_expired"
+        )
+    if decisions.fetch_claim_for_approval(conn, claim_record["approval_id"]) is not None:
+        return _ClaimOutcome(_ClaimState.ALREADY_CLAIMED, detail="approval_already_claimed")
+    if decisions.operation_id_claimed(conn, claim_record["operation_id"]):
+        return _ClaimOutcome(_ClaimState.ALREADY_CLAIMED, detail="operation_id_reused")
+    return None
+
+
+def _claim_build(store, source_record_id, expected_decision, claim_record):
+    """Re-resolve authority and insert the exclusive build claim in ONE `BEGIN IMMEDIATE`.
+
+    This single transaction is what closes the build-authorisation TOCTOU: the check and the
+    irreversible consumption share one atomic boundary, on the same serialisation point the
+    decision writers use. Exactly one bounded attempt is made - lock contention never becomes a
+    retry loop.
+    """
+    conn = decisions.open_store(store, create=False)
+    commit_failed = False
+    try:
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+        except sqlite3.Error:
+            # A concurrent writer held the lock past the bounded busy timeout. Nothing was
+            # claimed, so the approval is untouched and a later explicit retry is allowed.
+            return _ClaimOutcome(_ClaimState.NOT_RECORDED, detail="lock_contended")
+        try:
+            decisions.validate_store(conn)
+            authority = decisions.resolve_authority(conn, source_record_id)
+            blocked = _claim_blocker(conn, authority, expected_decision, claim_record)
+            if blocked is not None:
+                decisions._rollback_quietly(conn)
+                return blocked
+            decisions.insert_build_claim(conn, claim_record)
+        except sqlite3.IntegrityError:
+            # A UNIQUE or trigger constraint refused the claim. The database, not Python, is the
+            # authority on "one claim per approval", so losing here means consumed.
+            decisions._rollback_quietly(conn)
+            return _ClaimOutcome(
+                _ClaimState.ALREADY_CLAIMED, detail="claim_constraint_conflict"
+            )
+        except sqlite3.Error:
+            decisions._rollback_quietly(conn)
+            return _ClaimOutcome(_ClaimState.NOT_RECORDED, detail="claim_insert_failed")
+        except Exception:
+            decisions._rollback_quietly(conn)
+            raise
+        try:
+            decisions._commit(conn)
+        except (sqlite3.Error, OSError):
+            commit_failed = True
+        if not commit_failed:
+            return _ClaimOutcome(_ClaimState.COMMITTED, claim=claim_record)
+    finally:
+        conn.close()
+
+    # COMMIT raised. The exception proves only that the client did not hear the answer, so the
+    # outcome is resolved by REOPENING the database and looking for the exact claim.
+    state, row = decisions.recover_claim_commit(
+        store, claim_record["claim_id"], claim_record["record_hash"]
+    )
+    if state == decisions.CommitState.COMMITTED:
+        mismatch = _claim_binding_mismatch(row, claim_record)
+        if mismatch is not None:
+            return _ClaimOutcome(_ClaimState.UNCERTAIN, detail=mismatch)
+        return _ClaimOutcome(_ClaimState.COMMITTED, claim=claim_record)
+    if state == decisions.CommitState.ABSENT:
+        return _ClaimOutcome(_ClaimState.NOT_RECORDED, detail="claim_commit_absent")
+    return _ClaimOutcome(_ClaimState.UNCERTAIN, detail="claim_state_uncertain")
+
+
+def _report_unclaimed(claim, claim_record, source_record_id):
+    """Report an attempt that never got a committed claim.
+
+    Every branch here created nothing: no build claim, no temporary file, no reservation, no
+    package and no build audit event.
+    """
+    base = {
+        "event": "none",
+        "publication": "not_attempted",
+        "reservation": "not_attempted",
+        "temp_cleanup": "not_attempted",
+        "build_claim": "not_created",
+        "claim_detail": claim.detail,
+        "source_record_id": source_record_id,
+    }
+    if claim.state == _ClaimState.SUPERSEDED:
+        # A reviewer decision won the race. The build must observe it and refuse rather than
+        # publish from its stale approval snapshot.
+        authority = claim.authority
+        _print_summary(
+            dict(
+                base,
+                status="decision_superseded_before_claim",
+                decision_authority=authority.state if authority is not None else "unknown",
+                newer_pending_decisions=(
+                    len(authority.pending_sequences) if authority is not None else 0
+                ),
+                approval_blocked=True,
+                do_not_retry=True,
+                controlled_recovery_required=True,
+                fresh_approval_required=True,
+                recovery="fresh_reviewer_decision",
+            )
+        )
+        return EXIT_DECISION_NOT_AUTHORITATIVE
+    if claim.state == _ClaimState.ALREADY_CLAIMED:
+        _print_summary(
+            dict(
+                base,
+                status="approval_consumed",
+                approval_blocked=True,
+                do_not_retry=True,
+                rebuild_supported=False,
+                fresh_approval_required=True,
+                recovery="fresh_approval_or_controlled_recovery",
+            )
+        )
+        return EXIT_APPROVAL_CONSUMED
+    if claim.state == _ClaimState.NOT_RECORDED:
+        # Nothing was claimed, so the approval was NOT consumed. This is the one build outcome
+        # that stays retryable - by an explicit later invocation, never automatically.
+        _print_summary(
+            dict(
+                base,
+                status="build_claim_not_recorded",
+                approval_blocked=False,
+                do_not_retry=False,
+                fresh_approval_required=False,
+                recovery="resolve_decision_store_contention_then_retry",
+            )
+        )
+        return EXIT_BUILD_CLAIM_NOT_RECORDED
+    _print_summary(
+        dict(
+            base,
+            status="build_claim_uncertain",
+            approval_blocked=True,
+            do_not_retry=True,
+            controlled_recovery_required=True,
+            fresh_approval_required=True,
+            recovery="controlled_decision_store_reconciliation_then_fresh_decision",
+        )
+    )
+    return EXIT_DECISION_AUTHORITY_UNCERTAIN
 
 
 def _append_build_event(ledger_path, entry):

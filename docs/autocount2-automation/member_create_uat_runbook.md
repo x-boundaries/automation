@@ -215,16 +215,37 @@ inside a real transaction.
 > package-building authority.** A decision authorises a package only when a committed
 > **activation row** exists for it in the decision store.
 
-**Schema (`member_create_uat_decisions/v1`).** Two append-only history tables plus schema
+**Schema (`member_create_uat_decisions/v2`).** Three append-only history tables plus schema
 metadata: `decision` (every approve, reject and hold attempt, with one shared monotonic
-`sequence`) and `decision_activation` (the decisions that became authoritative). `UPDATE`
-and `DELETE` are rejected on both by database triggers, so even a direct `sqlite3` session
-cannot rewrite or erase history. Durability settings: `journal_mode=DELETE`,
-`synchronous=FULL`, `foreign_keys=ON`, explicit `BEGIN IMMEDIATE` transactions and a bounded
-busy timeout. Before any authority is read or written the tool verifies
-`PRAGMA integrity_check`, the exact tables, the exact column sets, the required indexes, the
-immutability triggers and the schema version. A malformed or incompatible store is **never**
-recreated, replaced, migrated or repaired.
+`sequence`), `decision_activation` (the decisions that became authoritative) and `build_claim`
+(the single exclusive authorisation to build one package — see below). `UPDATE` and `DELETE`
+are rejected on all three by database triggers, so even a direct `sqlite3` session cannot
+rewrite or erase history. Durability settings: `journal_mode=DELETE`, `synchronous=FULL`,
+`foreign_keys=ON`, explicit `BEGIN IMMEDIATE` transactions and a bounded busy timeout.
+
+**Amendment 7 raised the version deliberately.** Adding transactional build claims changes the
+authority model, so it is a new version rather than a disguised v1. A v1 store — like an empty,
+zero-byte, partial or foreign one — is refused **untouched**. There is no migration.
+
+**Canonical validation before any authority is used.** Validation covers schema *meaning*, not
+just object names, through two independent mechanisms: the exact canonical `sqlite_schema` DDL
+text of every application object (which pins declared types, `NOT NULL`, defaults, primary keys,
+`AUTOINCREMENT`, `UNIQUE`, `CHECK` bodies, foreign-key columns and actions, index columns/order/
+uniqueness and trigger timing/event/target/body all at once), plus pragma-derived checks
+(`table_info`, `index_list`, `index_info`, `foreign_key_list`). Then `PRAGMA integrity_check`,
+`PRAGMA foreign_key_check`, the exact permitted application-object set, the schema-version row,
+orphan-row checks and every canonical row hash. Only SQLite's own `sqlite_sequence` and the
+implicit `sqlite_autoindex_*` indexes are tolerated. Any mismatch refuses fail-closed and the
+store is **never** recreated, replaced, migrated, augmented or repaired.
+
+**Creation is allowed only at a positively absent path.** The complete canonical store is built
+in an operation-owned temporary in the same directory and then published with an atomic,
+no-replace `os.link`. Exclusively creating the final path and *then* running DDL on it would
+leave a window in which a concurrent process opens a zero-byte file and correctly concludes it
+is not a canonical store; publishing an already-complete store removes that window, so the final
+path only ever appears fully formed. If a competitor wins the race, their store is left
+untouched and only this operation's own temporary is removed. If schema setup fails, the final
+path is never created and the temporary is deliberately left in place as evidence.
 
 **Decision state machine.** Each `approve` / `reject` / `hold` runs three ordered, separately
 committed steps:
@@ -243,6 +264,92 @@ the reopen check are the commit authority.
 If the audit append fails, the decision stays **pending**: it is not activated, not deleted
 and not rewritten, the ledger is not truncated, replaced or repaired, and the tool reports
 `decision_authority = pending` with `approval_blocked` and `do_not_retry`.
+
+#### Exclusive build claim — the terminal approval-consumption fact
+
+Resolving authority and then closing the connection left a time-of-check/time-of-use window: a
+concurrent reviewer could commit an activated hold, an activated rejection, or a pending
+hold/rejection **after** the build read its authority but **before** it reserved or published,
+and the build would proceed on a stale approval snapshot.
+
+Checking harder cannot close that window; the check and the irreversible effect must share one
+atomic boundary. So `build-package` now runs in two phases.
+
+**Phase 1 — non-mutating preflight.** Validate arguments and safe paths; read and validate the
+source record; confirm the output basename is absent (strict no-clobber); open and validate the
+store; read the current authority, any existing claim and any reservation; construct the entire
+package in memory; validate it against the contract **and**, when `jsonschema` is installed, the
+real JSON Schema; compute the canonical payload hash. **No temporary file, no reservation, no
+claim and no ledger event is created in phase 1.**
+
+**Phase 2 — one `BEGIN IMMEDIATE` transaction.** Validate the complete canonical store;
+re-resolve the newest decision state; reject any newer pending decision; require the newest
+activated decision to be the exact intended unexpired approval (approval id, decision id,
+decision sequence, canonical decision hash, source id and fingerprint all matching); confirm no
+claim exists for the approval; confirm the operation id is unused; insert the exclusive
+`build_claim`; commit.
+
+Decision writers and build claims serialise on this same boundary, so a concurrent reviewer
+either loses the write lock (and the build's re-resolve observes its decision) or wins it (and
+the build's re-resolve observes it). There is no interleaving in which a stale approval
+authorises publication.
+
+`build_claim` binds: claim id, monotonic claim sequence, decision sequence, decision id,
+canonical decision hash, approval id, source record id, source fingerprint, operation id,
+package payload hash, intended package basename, claimed timestamp, schema version and its own
+canonical record hash. SQLite — not Python — enforces the invariants: `UNIQUE` on `approval_id`,
+`claim_id`, `decision_id` and `operation_id` makes a second claim, a duplicate claim, a duplicate
+decision and a reused operation id impossible; foreign keys onto `decision(decision_id)` and
+`decision(approval_id)` make a claim on a non-existent decision impossible, and — because
+`decision` already enforces that only an approval carries an `approval_id` — a claim on a
+**non-approved** decision impossible too; and a `BEFORE INSERT` trigger requires the claim's
+decision id, approval id, sequence, canonical hash, source id and fingerprint to describe one
+single **activated** approved decision.
+
+**Winner ordering.** If a reviewer decision commits first, the build observes it and refuses with
+no claim, no temporary, no reservation, no package and no build audit event. If the claim commits
+first, that one exact attempt is authorised and the approval is consumed; a later reviewer
+decision governs subsequent work only and never retroactively releases or cancels the committed
+claim. When two builds race, exactly one claim commits and the loser is blocked before creating
+anything.
+
+**Claim commit uncertainty.** If the claim's `COMMIT` raises, the connection is closed, the
+database is **reopened**, and the exact claim is looked up by claim id and canonical claim hash:
+present with matching bindings means committed (the attempt continues); absent means nothing was
+claimed, the approval is untouched and a later **explicit** retry is allowed (exit 11); anything
+indeterminate — unreadable store, hash mismatch or binding mismatch — fails closed with
+`do_not_retry`. Lock contention makes exactly one bounded attempt; there is no retry loop.
+
+**Post-claim publication, and post-claim failure.** Only after the claim is confirmed committed
+does the build create its temporary, write/flush/fsync it, create and durably persist the
+reservation, publish atomically with the existing no-replace mechanism, clean only its own
+temporary, and append the JSONL build audit event.
+
+**Every failure after the claim commits leaves the approval permanently consumed** — temporary
+creation, write, flush or fsync; reservation create, write, flush, fsync, parent-directory
+durability or path safety; publication; temporary cleanup; and every ledger open/write/flush/
+fsync, visible-but-unconfirmed or torn-append failure. A second build with that approval is
+blocked at any fresh output path. Nothing is ever deleted or altered: not the claim, a
+reservation, a published package, a competing package, a historical package, a torn audit ledger
+or an unrelated temporary. No directory is listed, globbed or swept; only exact-path checks are
+used.
+
+The filesystem reservation remains a crash and publication backstop. It is **no longer** the
+build-authorisation point — the committed SQLite claim is.
+
+#### Timestamps must be timezone-aware
+
+One central parser validates every authority and audit timestamp. A value such as
+`2026-07-28T00:00:00` parses through `datetime.fromisoformat` but has **no UTC offset**, so
+comparing it to an aware "now" raises an uncontrolled `TypeError`. A valid timestamp must
+therefore be a supported ISO-8601 string, parse successfully, **and** return a non-null
+`utcoffset()`. Naive values are refused with a sanitised classifier and the offending value is
+never printed.
+
+This covers `recorded_at`, `approved_at`, `expires_at`, `activated_at`, `claimed_at` and every
+timestamp-bearing JSONL audit event. Ordering is checked too: an expiry may not precede its
+approval, and an activation may not precede the decision it activates. Malformed historical data
+is never normalised into acceptance.
 
 **Authoritative ordering.** The newest **activated** decision for the source record wins.
 Approve, reject and hold share one monotonic sequence. A newer committed-but-unactivated
@@ -371,7 +478,17 @@ other outcome is a distinct nonzero exit so no partial state can be mistaken for
 | 7 | `approval_consumed` / `rebuild_requires_fresh_approval` | no | The approval is terminally consumed (including by a competing reservation), or `--rebuild` (retired) was passed. Nothing was created or touched. |
 | 8 | `ledger_integrity_uncertain` | no | The audit ledger is not an intact append-only record, or a record fails its exact audit schema. Nothing was created, read further or repaired. |
 | 9 | `decision_audit_incomplete` / `decision_not_activated` / `decision_not_recorded` / `decision_store_integrity_uncertain` | no | Decision authority cannot be trusted: a decision is pending and non-authoritative, a commit outcome was unresolved, or the store is not intact. |
-| 10 | `decision_store_missing` / `no_activated_decision` / `decision_not_approved` / `decision_pending_or_uncertain` | no | No activated decision authorises a build. A fresh reviewer decision is required. |
+| 10 | `decision_store_missing` / `no_activated_decision` / `decision_not_approved` / `decision_pending_or_uncertain` / `decision_superseded_before_claim` | no | No activated decision authorises a build, or a reviewer decision won the race to the claim. A fresh reviewer decision is required. |
+| 11 | `build_claim_not_recorded` | no | The exclusive build claim was **not** committed, so the approval was **not** consumed. Nothing was created. A later **explicit** retry is allowed. |
+
+Exits 9, 10 and 11 create and touch nothing: no build claim, no temporary file, no reservation,
+no output file, no ledger event and no decision-store mutation. Exit 11 and exit 9's
+`decision_not_recorded` are the only build/decision outcomes that stay retryable; every other
+nonzero outcome after a committed claim sets `approval_blocked` and `do_not_retry`.
+
+Two post-claim statuses report a consumed approval with nothing published:
+`reservation_failed_after_claim` and `post_claim_publication_failed` (both exit 6, each naming
+the exact `failure_stage`).
 
 Exit 9 and exit 10 both create and touch nothing: no reservation slot, no temporary file, no
 output file, no ledger event and no decision-store mutation. Exit 9 with

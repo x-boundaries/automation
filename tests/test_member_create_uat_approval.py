@@ -532,7 +532,14 @@ class AtomicPublicationTests(unittest.TestCase):
         self._approve()
         with mock.patch("os.fsync", side_effect=OSError("simulated fsync failure")):
             code, out = self._build()
-        self.assertEqual(code, 2, out)
+        # Amendment 7: this failure happens AFTER the committed build claim, so it is a
+        # controlled consumed-approval outcome rather than an ordinary retryable error.
+        self.assertEqual(code, approval.EXIT_PUBLICATION_BLOCKED, out)
+        summary = json.loads(out)
+        self.assertEqual(summary["status"], "post_claim_publication_failed")
+        self.assertEqual(summary["failure_stage"], "package_temporary_write")
+        self.assertEqual(summary["build_claim"], "committed")
+        self.assertIs(summary["do_not_retry"], True)
         self.assertFalse(self.package.exists(), "final path must be absent on temp-write failure")
         self.assertEqual(self._stray_temps(), [], "temporary file must be cleaned")
         self.assertEqual(self._build_events(), [], "no build ledger event on failure")
@@ -592,14 +599,15 @@ class AtomicPublicationTests(unittest.TestCase):
         with mock.patch("os.fsync", side_effect=OSError("simulated write failure")), \
                 mock.patch("os.unlink", side_effect=OSError("simulated unlink failure")):
             code, out = self._build()
-        self.assertEqual(code, approval.EXIT_CLEANUP_INCOMPLETE, out)
+        self.assertEqual(code, approval.EXIT_PUBLICATION_BLOCKED, out)
         summary = json.loads(out)
-        self.assertEqual(summary["status"], "cleanup_incomplete")
+        self.assertEqual(summary["status"], "post_claim_publication_failed")
         self.assertNotEqual(summary["status"], "ok")
         self.assertEqual(summary["publication"], "not_published")
         self.assertEqual(summary["temp_cleanup"], "failed")
         # The original write failure stays distinguishable from the cleanup failure.
-        self.assertEqual(summary["original_failure"], "package_write_or_publication_failed")
+        self.assertEqual(summary["failure_stage"], "package_temporary_write")
+        self.assertEqual(summary["build_claim"], "committed")
         self.assertTrue(summary["stale_temp_basename"].endswith(".tmp"))
         self.assertFalse(self.package.exists(), "no final on pre-publication failure")
         self.assertTrue(self._stray_temps(), "the operation-owned temp remains")
@@ -1108,12 +1116,17 @@ class DurableReservationTests(_CreateUatBuildHarness):
 
         with mock.patch("os.open", guarded):
             code, out = self._build()
-        self.assertEqual(code, approval.EXIT_RESERVATION_INCOMPLETE, out)
+        # Amendment 7: the reservation is no longer the authorisation point, so a reservation
+        # failure after the committed claim leaves the approval CONSUMED, not retryable.
+        self.assertEqual(code, approval.EXIT_PUBLICATION_BLOCKED, out)
         summary = json.loads(out)
-        self.assertEqual(summary["status"], "reservation_incomplete")
+        self.assertEqual(summary["status"], "reservation_failed_after_claim")
         self.assertEqual(summary["reservation"], "not_created")
         self.assertEqual(summary["reservation_durability"], "unconfirmed")
         self.assertEqual(summary["publication"], "not_published")
+        self.assertEqual(summary["build_claim"], "committed")
+        self.assertIs(summary["approval_blocked"], True)
+        self.assertIs(summary["do_not_retry"], True)
         # Nothing published, nothing reserved, no build event, temp truthfully cleaned.
         self.assertFalse(self.package.exists())
         self.assertEqual(self._reservations(), [])
@@ -1139,9 +1152,10 @@ class DurableReservationTests(_CreateUatBuildHarness):
 
         with mock.patch("os.chmod", racing_chmod):
             code, out = self._build()
-        self.assertEqual(code, approval.EXIT_APPROVAL_CONSUMED, out)
+        self.assertEqual(code, approval.EXIT_PUBLICATION_BLOCKED, out)
         summary = json.loads(out)
-        self.assertEqual(summary["status"], "approval_consumed")
+        self.assertEqual(summary["status"], "reservation_failed_after_claim")
+        self.assertEqual(summary["build_claim"], "committed")
         self.assertEqual(summary["reservation"], approval.ReservationError.CONSUMED)
         self.assertIs(summary["approval_blocked"], True)
         self.assertIs(summary["do_not_retry"], True)
@@ -1175,17 +1189,19 @@ class DurableReservationTests(_CreateUatBuildHarness):
         with mock.patch.object(approval, "survey_reservations", lambda *a, **k: []), \
                 mock.patch("os.open", guarded):
             code, out = self._build()
-        self.assertEqual(code, approval.EXIT_APPROVAL_CONSUMED, out)
+        self.assertEqual(code, approval.EXIT_PUBLICATION_BLOCKED, out)
         summary = json.loads(out)
+        self.assertEqual(summary["status"], "reservation_failed_after_claim")
         self.assertEqual(summary["reservation"], approval.ReservationError.CONSUMED)
         self.assertIs(summary["do_not_retry"], True)
         self.assertIs(summary["fresh_approval_required"], True)
         self.assertFalse(self.package.exists())
         self.assertEqual(slot.read_text(encoding="utf-8"), competitor)
 
-    def test_reservation_oserror_with_absent_slot_stays_retryable(self):
-        # The mirror case: when lexists positively proves the slot is empty, `not_created`
-        # remains correct and the approval stays retryable.
+    def test_reservation_oserror_with_absent_slot_still_consumes_after_claim(self):
+        # The mirror case. `not_created` is still the correct RESERVATION classification when
+        # lexists positively proves the slot is empty - but under Amendment 7 that no longer
+        # makes the BUILD retryable, because the committed claim already consumed the approval.
         self._approve()
         real_os_open = os.open
 
@@ -1196,14 +1212,19 @@ class DurableReservationTests(_CreateUatBuildHarness):
 
         with mock.patch("os.open", guarded):
             code, out = self._build()
-        self.assertEqual(code, approval.EXIT_RESERVATION_INCOMPLETE, out)
+        self.assertEqual(code, approval.EXIT_PUBLICATION_BLOCKED, out)
         summary = json.loads(out)
-        self.assertEqual(summary["status"], "reservation_incomplete")
+        self.assertEqual(summary["status"], "reservation_failed_after_claim")
         self.assertEqual(summary["reservation"], approval.ReservationError.NOT_CREATED)
-        self.assertIs(summary["approval_blocked"], False)
-        self.assertIs(summary["do_not_retry"], False)
-        self.assertEqual(summary["recovery"], "resolve_reservation_failure_then_retry")
+        self.assertEqual(summary["build_claim"], "committed")
+        self.assertIs(summary["approval_blocked"], True)
+        self.assertIs(summary["do_not_retry"], True)
+        self.assertNotIn("then_retry", summary["recovery"])
         self.assertEqual(self._reservations(), [])
+        # A second build at a fresh path is blocked by the claim.
+        code, out = self._build(extra=self._fresh_out("after_reservation_gap.json"))
+        self.assertEqual(code, approval.EXIT_APPROVAL_CONSUMED, out)
+        self.assertEqual(json.loads(out)["build_claim"], "already_committed")
 
     def test_reservation_write_failure_is_uncertain_and_publishes_nothing(self):
         self._approve()
@@ -1218,9 +1239,10 @@ class DurableReservationTests(_CreateUatBuildHarness):
 
         with mock.patch("os.fdopen", guarded_fdopen):
             code, out = self._build()
-        self.assertEqual(code, approval.EXIT_RESERVATION_INCOMPLETE, out)
+        self.assertEqual(code, approval.EXIT_PUBLICATION_BLOCKED, out)
         summary = json.loads(out)
         self.assertEqual(summary["reservation"], "uncertain")
+        self.assertEqual(summary["build_claim"], "committed")
         self.assertEqual(summary["publication"], "not_published")
         self.assertIs(summary["approval_blocked"], True)
         self.assertIs(summary["do_not_retry"], True)
@@ -1244,8 +1266,9 @@ class DurableReservationTests(_CreateUatBuildHarness):
 
         with mock.patch("os.fsync", guarded_fsync):
             code, out = self._build()
-        self.assertEqual(code, approval.EXIT_RESERVATION_INCOMPLETE, out)
+        self.assertEqual(code, approval.EXIT_PUBLICATION_BLOCKED, out)
         self.assertEqual(json.loads(out)["reservation"], "uncertain")
+        self.assertEqual(json.loads(out)["build_claim"], "committed")
         self.assertFalse(self.package.exists(), "no package may be published without a durable reservation")
         self.assertEqual(self._events_of("build"), [])
         self.assertEqual(len(self._reservations()), 1)
@@ -1265,8 +1288,9 @@ class DurableReservationTests(_CreateUatBuildHarness):
         with mock.patch.object(os, "O_DIRECTORY", dir_flag, create=True), \
                 mock.patch("os.open", guarded):
             code, out = self._build()
-        self.assertEqual(code, approval.EXIT_RESERVATION_INCOMPLETE, out)
+        self.assertEqual(code, approval.EXIT_PUBLICATION_BLOCKED, out)
         self.assertEqual(json.loads(out)["reservation"], "uncertain")
+        self.assertEqual(json.loads(out)["build_claim"], "committed")
         self.assertFalse(self.package.exists())
         self.assertEqual(self._events_of("build"), [])
 
@@ -1292,9 +1316,10 @@ class DurableReservationTests(_CreateUatBuildHarness):
 
         with mock.patch.object(contract, "is_reparse_point", detector):
             code, out = self._build()
-        self.assertEqual(code, approval.EXIT_RESERVATION_INCOMPLETE, out)
+        self.assertEqual(code, approval.EXIT_PUBLICATION_BLOCKED, out)
         summary = json.loads(out)
         self.assertEqual(summary["reservation"], "not_created")
+        self.assertEqual(summary["build_claim"], "committed")
         self.assertFalse(self.package.exists(), "nothing may be published without a safe reservation")
         self.assertEqual(self._events_of("build"), [])
         # The temporary file is still cleaned truthfully: the conversion keeps the failure
@@ -1448,7 +1473,7 @@ class DurableReservationTests(_CreateUatBuildHarness):
 
         with mock.patch("os.fdopen", guarded_fdopen):
             code, out = self._build()
-        self.assertEqual(code, approval.EXIT_RESERVATION_INCOMPLETE, out)
+        self.assertEqual(code, approval.EXIT_PUBLICATION_BLOCKED, out)
 
         fresh = self.tmp / "member_create_uat_package_v2_unc0.json"
         code, out = self._build(extra=self._fresh_out(fresh.name))
@@ -1940,20 +1965,27 @@ class TerminalReservationContractTests(_CreateUatBuildHarness):
         self.assertEqual(self.package.read_bytes(), published)
 
     def test_legacy_ledger_build_event_without_a_reservation_still_blocks(self):
-        # Defence in depth for state written by a tool version that predates reservations: the
-        # secondary ledger guard must still refuse, and --rebuild cannot bypass it.
-        self._approve()
-        self.assertEqual(self._build()[0], 0)
-        published = self.package.read_bytes()
-        # Simulate the legacy shape by removing only the reservation object.
-        self._slot().unlink()
+        # Defence in depth for legacy state: a ledger build event with NO build claim and NO
+        # reservation must still refuse. Claims are append-only, so this state is built directly
+        # rather than by deleting a claim (which the immutability triggers correctly forbid).
+        srid, fp = self._fixture_identity()
+        record = self._insert_activated("approved", srid=srid, fingerprint=fp)
+        approval.append_ledger(self.ledger, {
+            "event": "build",
+            "recorded_at": iso(datetime.now(timezone.utc)),
+            "source_record_id": srid,
+            "source_fingerprint": fp,
+            "approval_id": record["approval_id"],
+            "operation_id": "mcuat_" + ("4" * 32),
+            "bound_package_payload_hash": "sha256:" + ("5" * 64),
+            "package_file_name": "member_create_uat_package_v2_legacy_prior.json",
+        })
         self.assertEqual(self._reservations(), [])
         fresh = self.tmp / "member_create_uat_package_v2_legacy.json"
         code, out = self._build(extra=self._fresh_out(fresh.name))
         self.assertEqual(code, 2, out)
         self.assertIn("already built", json.loads(out)["error"])
         self.assertFalse(fresh.exists())
-        self.assertEqual(self.package.read_bytes(), published)
 
     # ---- the fresh-approval recovery path ---- #
     def test_fresh_approval_builds_once_then_is_consumed_itself(self):
@@ -2029,7 +2061,7 @@ class TerminalReservationContractTests(_CreateUatBuildHarness):
             return _LostAppendHandle(handle, "write") if calls["n"] == 2 else handle
 
         with mock.patch("os.fdopen", guarded_fdopen):
-            self.assertEqual(self._build()[0], approval.EXIT_RESERVATION_INCOMPLETE)
+            self.assertEqual(self._build()[0], approval.EXIT_PUBLICATION_BLOCKED)
 
     def _state_malformed(self):
         self._approve()
@@ -2409,14 +2441,14 @@ class DecisionTransactionRecoveryTests(_CreateUatBuildHarness):
         # Proof that recovery genuinely REOPENS: the recovery connection is counted.
         wrapper, _calls = self._commit_after_n(2)
         opens = {"n": 0}
-        real_connect = decisions._connect
+        real_open = decisions._open_existing
 
-        def counting_connect(path, *, create):
+        def counting_open(path):
             opens["n"] += 1
-            return real_connect(path, create=create)
+            return real_open(path)
 
         with mock.patch.object(decisions, "_commit", wrapper), \
-                mock.patch.object(decisions, "_connect", counting_connect):
+                mock.patch.object(decisions, "_open_existing", counting_open):
             code, out = self._approve_cli()
         self.assertEqual(code, 0, out)
         self.assertGreaterEqual(opens["n"], 2, "the store is reopened for recovery")
@@ -2631,12 +2663,10 @@ class DecisionStoreIntegrityTests(_CreateUatBuildHarness):
         self._prepare_activated_approval()
         raw = sqlite3.connect(str(self._store_path()))
         try:
-            raw.execute("PRAGMA foreign_keys=OFF")
-            raw.execute("DROP TABLE schema_meta")
-            raw.execute("CREATE TABLE schema_meta (key TEXT PRIMARY KEY NOT NULL, "
-                        "value TEXT NOT NULL)")
-            raw.execute("INSERT INTO schema_meta (key, value) VALUES "
-                        "('schema_version', 'member_create_uat_decisions/v0')")
+            # Rewriting the recorded version in place (schema_meta is metadata, not
+            # append-only history) isolates the version check from the schema-shape checks.
+            raw.execute("UPDATE schema_meta SET value = 'member_create_uat_decisions/v1' "
+                        "WHERE key = 'schema_version'")
             raw.commit()
         finally:
             raw.close()
@@ -2661,7 +2691,7 @@ class DecisionStoreIntegrityTests(_CreateUatBuildHarness):
             raw.commit()
         finally:
             raw.close()
-        self._assert_store_refusal(*self._build(), reason="missing_table")
+        self._assert_store_refusal(*self._build(), reason="missing_object")
 
     def test_missing_immutability_trigger_refuses(self):
         self._prepare_activated_approval()
@@ -2671,7 +2701,7 @@ class DecisionStoreIntegrityTests(_CreateUatBuildHarness):
             raw.commit()
         finally:
             raw.close()
-        self._assert_store_refusal(*self._build(), reason="missing_trigger")
+        self._assert_store_refusal(*self._build(), reason="missing_object")
 
     def test_missing_index_refuses(self):
         self._prepare_activated_approval()
@@ -2681,7 +2711,7 @@ class DecisionStoreIntegrityTests(_CreateUatBuildHarness):
             raw.commit()
         finally:
             raw.close()
-        self._assert_store_refusal(*self._build(), reason="missing_index")
+        self._assert_store_refusal(*self._build(), reason="missing_object")
 
     def test_unexpected_column_refuses(self):
         self._prepare_activated_approval()
@@ -2691,7 +2721,9 @@ class DecisionStoreIntegrityTests(_CreateUatBuildHarness):
             raw.commit()
         finally:
             raw.close()
-        self._assert_store_refusal(*self._build(), reason="column_mismatch")
+        # An added column changes the stored canonical DDL text, which the canonical-definition
+        # comparison catches before the narrower column check runs.
+        self._assert_store_refusal(*self._build(), reason="schema_object_mismatch")
 
     def test_failed_integrity_check_refuses(self):
         self._prepare_activated_approval()
@@ -3121,6 +3153,1102 @@ class DecisionStorePreservationTests(_CreateUatBuildHarness):
                        "synthetic.alpha@example.invalid", "2000-01-01", "AC2_PROBE",
                        str(self.tmp), str(self._store_path()), "HISTORICAL-V1-EVIDENCE"):
             self.assertNotIn(leaked, combined, f"the output must not contain {leaked!r}")
+
+
+class _ClaimHarness(_CreateUatBuildHarness):
+    """Shared helpers for the Amendment 7 build-claim suites."""
+
+    def _claims(self):
+        conn = self._open_store()
+        try:
+            return conn.execute("SELECT * FROM build_claim ORDER BY claim_sequence").fetchall()
+        finally:
+            conn.close()
+
+    def _claim_count(self):
+        return len(self._claims())
+
+    def _raw(self):
+        """A RAW sqlite3 connection: no pragmas, so hostile states can be constructed exactly
+        the way a foreign writer would create them."""
+        return sqlite3.connect(str(self._store_path()))
+
+    def _raw_claim_count(self):
+        """Claim count on a RAW connection, so a deliberately invalid store can still be
+        inspected without tripping canonical validation."""
+        raw = self._raw()
+        try:
+            return raw.execute("SELECT COUNT(*) FROM build_claim").fetchone()[0]
+        finally:
+            raw.close()
+
+    def _store_approval_id(self):
+        """The newest approval id from the STORE. These fixtures seed the store directly, so the
+        JSONL ledger may hold no decision line at all."""
+        approved = [row for row in self._stored_decisions() if row["approval_id"]]
+        return approved[-1]["approval_id"]
+
+    def _store_slot(self, attempt=1):
+        return approval.reservation_path(self.tmp, self._store_approval_id(), attempt)
+
+    def _prepare_activated_approval(self):
+        srid, fingerprint = self._fixture_identity()
+        return self._insert_activated("approved", srid=srid, fingerprint=fingerprint)
+
+    def _assert_nothing_created(self, *names):
+        self.assertEqual(self._claim_count(), 0, "no build claim may exist")
+        self.assertEqual(self._reservations(), [], "no reservation may exist")
+        self.assertEqual(self._stray_temps(), [], "no temporary may exist")
+        self.assertEqual(self._events_of("build"), [], "no build audit event may exist")
+        self.assertEqual(self._events_of("build_cleanup_incomplete"), [])
+        for name in names:
+            self.assertFalse((self.tmp / name).exists(), f"{name} must not exist")
+
+
+class BuildVersusReviewerDecisionTests(_ClaimHarness):
+    """Amendment 7 P1: the build-authorisation time-of-check/time-of-use window is closed.
+
+    The build re-resolves authority and inserts its exclusive claim inside ONE
+    ``BEGIN IMMEDIATE``, on the same serialisation boundary the decision writers use. These
+    tests pause the build at ``_pre_claim_barrier`` - after its whole non-mutating preflight,
+    immediately before the claim transaction - and commit a reviewer decision at that instant.
+    """
+
+    def _build_with_barrier(self, inject, out_name="toctou.json"):
+        fired = {"n": 0}
+
+        def barrier():
+            fired["n"] += 1
+            inject()
+
+        with mock.patch.object(approval, "_pre_claim_barrier", barrier):
+            code, out = self._build(extra=self._fresh_out(out_name))
+        self.assertEqual(fired["n"], 1, "the barrier must be reached exactly once")
+        return code, out
+
+    def _assert_superseded(self, code, out):
+        self.assertEqual(code, approval.EXIT_DECISION_NOT_AUTHORITATIVE, out)
+        self.assertNotIn("Traceback", out)
+        summary = json.loads(out)
+        self.assertEqual(summary["status"], "decision_superseded_before_claim")
+        self.assertEqual(summary["build_claim"], "not_created")
+        self.assertEqual(summary["publication"], "not_attempted")
+        self.assertEqual(summary["reservation"], "not_attempted")
+        self.assertIs(summary["approval_blocked"], True)
+        self.assertIs(summary["do_not_retry"], True)
+        self.assertIs(summary["fresh_approval_required"], True)
+        return summary
+
+    def test_activated_hold_committed_at_the_barrier_blocks_the_build(self):
+        srid, fingerprint = self._fixture_identity()
+        self._prepare_activated_approval()
+        code, out = self._build_with_barrier(
+            lambda: self._insert_activated("hold", srid=srid, fingerprint=fingerprint)
+        )
+        summary = self._assert_superseded(code, out)
+        self.assertEqual(summary["decision_authority"], decisions.AuthorityState.HOLD)
+        self._assert_nothing_created("toctou.json")
+
+    def test_activated_rejection_committed_at_the_barrier_blocks_the_build(self):
+        srid, fingerprint = self._fixture_identity()
+        self._prepare_activated_approval()
+        code, out = self._build_with_barrier(
+            lambda: self._insert_activated("rejected", srid=srid, fingerprint=fingerprint)
+        )
+        summary = self._assert_superseded(code, out)
+        self.assertEqual(summary["decision_authority"], decisions.AuthorityState.REJECTED)
+        self._assert_nothing_created("toctou.json")
+
+    def test_pending_hold_committed_at_the_barrier_blocks_the_build(self):
+        srid, fingerprint = self._fixture_identity()
+        self._prepare_activated_approval()
+        code, out = self._build_with_barrier(
+            lambda: self._insert_pending(self._record("hold", srid=srid, fingerprint=fingerprint))
+        )
+        summary = self._assert_superseded(code, out)
+        self.assertEqual(summary["decision_authority"], decisions.AuthorityState.PENDING_NEWER)
+        self.assertGreaterEqual(summary["newer_pending_decisions"], 1)
+        self._assert_nothing_created("toctou.json")
+
+    def test_pending_rejection_committed_at_the_barrier_blocks_the_build(self):
+        srid, fingerprint = self._fixture_identity()
+        self._prepare_activated_approval()
+        code, out = self._build_with_barrier(
+            lambda: self._insert_pending(
+                self._record("rejected", srid=srid, fingerprint=fingerprint)
+            )
+        )
+        self._assert_superseded(code, out)
+        self._assert_nothing_created("toctou.json")
+
+    def test_no_state_beyond_the_injected_decision_is_mutated(self):
+        srid, fingerprint = self._fixture_identity()
+        self._prepare_activated_approval()
+        ledger_before = self.ledger.read_bytes() if self.ledger.exists() else None
+        code, _out = self._build_with_barrier(
+            lambda: self._insert_activated("hold", srid=srid, fingerprint=fingerprint)
+        )
+        self.assertEqual(code, approval.EXIT_DECISION_NOT_AUTHORITATIVE)
+        after = self.ledger.read_bytes() if self.ledger.exists() else None
+        self.assertEqual(after, ledger_before,
+                         "the audit ledger is untouched by a superseded build")
+        self.assertEqual(len(self._stored_decisions()), 2)
+        self.assertEqual(self._activation_count(), 2)
+        self.assertEqual(self._claim_count(), 0)
+
+    # ---- reverse order: the claim wins, and a later decision cannot cancel it ---- #
+    def test_claim_first_then_activated_hold_leaves_the_claim_and_blocks_later_builds(self):
+        srid, fingerprint = self._fixture_identity()
+        self._prepare_activated_approval()
+        code, out = self._build()
+        self.assertEqual(code, 0, out)
+        published = self.package.read_bytes()
+        claims = self._claims()
+        self.assertEqual(len(claims), 1)
+        claim_id = claims[0]["claim_id"]
+
+        # A reviewer hold committed AFTER the claim governs subsequent work only. It does not
+        # retroactively release or cancel the committed claim, and it deletes nothing.
+        self._insert_activated("hold", srid=srid, fingerprint=fingerprint)
+        self.assertEqual(self._claim_count(), 1)
+        self.assertEqual(self._claims()[0]["claim_id"], claim_id)
+        self.assertEqual(self.package.read_bytes(), published)
+
+        code, out = self._build(extra=self._fresh_out("after_hold.json"))
+        self.assertEqual(code, approval.EXIT_DECISION_NOT_AUTHORITATIVE, out)
+        self.assertEqual(json.loads(out)["decision_authority"], decisions.AuthorityState.HOLD)
+        self.assertFalse((self.tmp / "after_hold.json").exists())
+        self.assertEqual(self._claim_count(), 1)
+
+    def test_claim_first_then_activated_rejection_cannot_cancel_the_claim(self):
+        srid, fingerprint = self._fixture_identity()
+        self._prepare_activated_approval()
+        self.assertEqual(self._build()[0], 0)
+        claim_before = dict(self._claims()[0])
+        self._insert_activated("rejected", srid=srid, fingerprint=fingerprint)
+        self.assertEqual(dict(self._claims()[0]), claim_before,
+                         "the committed claim is immutable and is never retroactively cancelled")
+        code, out = self._build(extra=self._fresh_out("after_reject.json"))
+        self.assertEqual(code, approval.EXIT_DECISION_NOT_AUTHORITATIVE, out)
+        self.assertFalse((self.tmp / "after_reject.json").exists())
+
+    def test_the_claimed_attempt_completes_exactly_once(self):
+        self._prepare_activated_approval()
+        self.assertEqual(self._build()[0], 0)
+        self.assertEqual(len(self._events_of("build")), 1)
+        code, out = self._build(extra=self._fresh_out("second.json"))
+        self.assertEqual(code, approval.EXIT_APPROVAL_CONSUMED, out)
+        self.assertEqual(json.loads(out)["build_claim"], "already_committed")
+        self.assertFalse((self.tmp / "second.json").exists())
+        self.assertEqual(self._claim_count(), 1)
+        self.assertEqual(len(self._events_of("build")), 1)
+
+
+class CompetingBuildClaimTests(_ClaimHarness):
+    """Amendment 7: exactly one build claim may commit, and only the winner may publish."""
+
+    def _build_script(self, out_name):
+        return textwrap.dedent(
+            f"""
+            import sys
+            sys.path.insert(0, {str(SCRIPTS)!r})
+            import member_create_uat_approval as approval
+            raise SystemExit(approval.main([
+                "build-package",
+                "--input", {str(self.form)!r},
+                "--decision-rows", {str(self.rows)!r},
+                "--row-number", "2",
+                "--ledger", {str(self.ledger)!r},
+                "--package-out", {str(self.tmp / out_name)!r},
+            ]))
+            """
+        )
+
+    def test_two_real_processes_race_and_exactly_one_claim_commits(self):
+        self._prepare_activated_approval()
+        procs = [
+            subprocess.Popen(
+                [sys.executable, "-c", self._build_script(f"race_{index}.json")],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            )
+            for index in range(2)
+        ]
+        results = [proc.communicate(timeout=180) for proc in procs]
+        codes = [proc.returncode for proc in procs]
+        for out, err in results:
+            self.assertNotIn("Traceback", err, out + err)
+
+        self.assertEqual(self._claim_count(), 1, f"codes={codes}")
+        packages = [n for n in (f"race_{i}.json" for i in range(2)) if (self.tmp / n).exists()]
+        self.assertLessEqual(len(packages), 1, "at most one package may be published")
+        self.assertEqual(len(self._events_of("build")), len(packages))
+        self.assertEqual(len(self._reservations()), len(packages))
+        self.assertEqual(self._stray_temps(), [])
+        self.assertIn(0, codes, f"one process must win: codes={codes}")
+        loser = [code for code in codes if code != 0]
+        self.assertEqual(len(loser), 1)
+        self.assertIn(
+            loser[0],
+            (approval.EXIT_APPROVAL_CONSUMED, approval.EXIT_DECISION_NOT_AUTHORITATIVE),
+            f"codes={codes}",
+        )
+
+    def test_no_approval_can_carry_two_claims_and_no_operation_id_is_reused(self):
+        self._prepare_activated_approval()
+        self.assertEqual(self._build()[0], 0)
+        claim = self._claims()[0]
+        conn = self._open_store()
+        try:
+            for column in ("approval_id", "claim_id", "decision_id", "operation_id"):
+                with self.subTest(duplicate=column):
+                    record = {key: claim[key] for key in decisions.CLAIM_HASH_FIELDS}
+                    if column != "claim_id":
+                        record["claim_id"] = "claim_" + uuid.uuid4().hex
+                    if column != "operation_id":
+                        record["operation_id"] = "mcuat_" + uuid.uuid4().hex
+                    record[column] = claim[column]
+                    record["record_hash"] = decisions.claim_record_hash(record)
+                    with self.assertRaises(sqlite3.IntegrityError):
+                        conn.execute("BEGIN IMMEDIATE")
+                        decisions.insert_build_claim(conn, record)
+                    decisions._rollback_quietly(conn)
+        finally:
+            conn.close()
+        self.assertEqual(self._claim_count(), 1)
+
+    def test_no_directory_listing_globbing_or_sweep_occurs_during_a_claimed_build(self):
+        self._prepare_activated_approval()
+
+        def no_sweep(*args, **kwargs):
+            raise AssertionError("a build must never list, scan or glob a directory")
+
+        with mock.patch("os.listdir", no_sweep), mock.patch("os.scandir", no_sweep), \
+                mock.patch("glob.glob", no_sweep), \
+                mock.patch.object(Path, "iterdir", no_sweep), \
+                mock.patch.object(Path, "glob", no_sweep):
+            code, out = self._build()
+        self.assertEqual(code, 0, out)
+
+
+class ClaimTransactionRecoveryTests(_ClaimHarness):
+    """Amendment 7: a claim ``COMMIT`` exception is resolved by REOPENING the database.
+
+    ``build-package`` performs exactly one ``decisions._commit`` - the claim's - so the seam is
+    unambiguous. The exception is never used to infer the outcome.
+    """
+
+    def _commit_before(self):
+        def wrapper(conn):
+            raise sqlite3.OperationalError("simulated failure before the claim commit")
+        return wrapper
+
+    def _commit_then_raise(self):
+        real_commit = decisions._commit
+
+        def wrapper(conn):
+            real_commit(conn)  # the claim genuinely commits ...
+            raise sqlite3.OperationalError("simulated failure after a successful claim commit")
+        return wrapper
+
+    def test_commit_raises_before_committing_leaves_no_claim_and_stays_retryable(self):
+        self._prepare_activated_approval()
+        with mock.patch.object(decisions, "_commit", self._commit_before()):
+            code, out = self._build()
+        self.assertEqual(code, approval.EXIT_BUILD_CLAIM_NOT_RECORDED, out)
+        self.assertNotIn("Traceback", out)
+        summary = json.loads(out)
+        self.assertEqual(summary["status"], "build_claim_not_recorded")
+        self.assertEqual(summary["build_claim"], "not_created")
+        self.assertIs(summary["approval_blocked"], False)
+        self.assertIs(summary["do_not_retry"], False)
+        self._assert_nothing_created()
+        self.assertFalse(self.package.exists())
+        # A later EXPLICIT retry is allowed and succeeds.
+        code, out = self._build()
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self._claim_count(), 1)
+
+    def test_commit_succeeds_then_raises_is_recovered_as_committed(self):
+        self._prepare_activated_approval()
+        with mock.patch.object(decisions, "_commit", self._commit_then_raise()):
+            code, out = self._build()
+        self.assertEqual(code, 0, out)
+        summary = json.loads(out)
+        self.assertEqual(summary["build_claim"], "committed")
+        self.assertTrue(self.package.is_file())
+        self.assertEqual(self._claim_count(), 1)
+        self.assertEqual(self._claims()[0]["claim_id"], summary["claim_id"])
+
+    def test_recovery_uses_a_new_connection(self):
+        self._prepare_activated_approval()
+        opens = {"n": 0}
+        real_open = decisions._open_existing
+
+        def counting_open(path):
+            opens["n"] += 1
+            return real_open(path)
+
+        with mock.patch.object(decisions, "_commit", self._commit_then_raise()), \
+                mock.patch.object(decisions, "_open_existing", counting_open):
+            code, out = self._build()
+        self.assertEqual(code, 0, out)
+        self.assertGreaterEqual(opens["n"], 3, "the store is reopened for claim recovery")
+
+    def test_recovery_that_cannot_read_the_database_fails_closed(self):
+        self._prepare_activated_approval()
+        with mock.patch.object(decisions, "_commit", self._commit_then_raise()), \
+                mock.patch.object(decisions, "fetch_claim",
+                                  side_effect=sqlite3.DatabaseError("simulated unreadable store")):
+            code, out = self._build()
+        self.assertEqual(code, approval.EXIT_DECISION_AUTHORITY_UNCERTAIN, out)
+        self.assertNotIn("Traceback", out)
+        summary = json.loads(out)
+        self.assertEqual(summary["status"], "build_claim_uncertain")
+        self.assertIs(summary["do_not_retry"], True)
+        self.assertIs(summary["controlled_recovery_required"], True)
+        self.assertFalse(self.package.exists())
+        self.assertEqual(self._reservations(), [])
+        self.assertEqual(self._stray_temps(), [])
+
+    def test_recovery_finding_a_mismatched_canonical_hash_fails_closed(self):
+        self._prepare_activated_approval()
+
+        def mismatched(conn, claim_id):
+            return {"record_hash": "sha256:" + ("0" * 64)}
+
+        with mock.patch.object(decisions, "_commit", self._commit_then_raise()), \
+                mock.patch.object(decisions, "fetch_claim", mismatched):
+            code, out = self._build()
+        self.assertEqual(code, approval.EXIT_DECISION_AUTHORITY_UNCERTAIN, out)
+        self.assertEqual(json.loads(out)["status"], "build_claim_uncertain")
+        self.assertFalse(self.package.exists())
+
+    def test_recovery_finding_a_binding_mismatch_fails_closed(self):
+        self._prepare_activated_approval()
+        real_fetch = decisions.fetch_claim
+
+        def tampered(conn, claim_id):
+            row = real_fetch(conn, claim_id)
+            if row is None:
+                return None
+            # The canonical hash still matches, so recovery accepts the row as committed; the
+            # explicit per-field binding re-check is what catches the substitution.
+            record = {key: row[key] for key in decisions.CLAIM_HASH_FIELDS}
+            record["record_hash"] = row["record_hash"]
+            record["operation_id"] = "mcuat_" + ("e" * 32)
+            return record
+
+        with mock.patch.object(decisions, "_commit", self._commit_then_raise()), \
+                mock.patch.object(decisions, "fetch_claim", tampered):
+            code, out = self._build()
+        self.assertEqual(code, approval.EXIT_DECISION_AUTHORITY_UNCERTAIN, out)
+        summary = json.loads(out)
+        self.assertEqual(summary["status"], "build_claim_uncertain")
+        self.assertEqual(summary["claim_detail"], "claim_binding_mismatch")
+        self.assertFalse(self.package.exists())
+
+    def test_lock_contention_makes_exactly_one_bounded_attempt(self):
+        self._prepare_activated_approval()
+        attempts = {"n": 0}
+        real_insert = decisions.insert_build_claim
+
+        def counting_insert(conn, record):
+            attempts["n"] += 1
+            return real_insert(conn, record)
+
+        blocker = decisions.open_store(self._store_path(), create=False)
+        try:
+            blocker.execute("BEGIN IMMEDIATE")
+            blocker.execute(
+                "INSERT INTO schema_meta (key, value) VALUES ('lock_probe', 'held')"
+            )
+            with mock.patch.object(decisions, "BUSY_TIMEOUT_MS", 200), \
+                    mock.patch.object(decisions, "insert_build_claim", counting_insert):
+                code, out = self._build()
+        finally:
+            decisions._rollback_quietly(blocker)
+            blocker.close()
+        self.assertEqual(code, approval.EXIT_BUILD_CLAIM_NOT_RECORDED, out)
+        self.assertEqual(json.loads(out)["claim_detail"], "lock_contended")
+        self.assertEqual(attempts["n"], 0, "the claim insert is never reached")
+        self._assert_nothing_created()
+        self.assertFalse(self.package.exists())
+
+
+class PostClaimFailureTests(_ClaimHarness):
+    """Amendment 7: EVERY failure after the claim commits leaves the approval consumed.
+
+    The claim - not the reservation, not the ledger - is the terminal consumption fact, so no
+    post-claim failure at any stage may release the approval or permit a second package.
+    """
+
+    STAGES = (
+        "mkstemp", "temp_write", "temp_flush", "temp_fsync",
+        "reservation_create", "reservation_write", "reservation_flush", "reservation_fsync",
+        "reservation_directory_durability", "reservation_path_safety",
+        "publication", "temp_cleanup",
+        "ledger_open", "ledger_write", "ledger_flush", "ledger_fsync",
+        "ledger_visible_then_unconfirmed", "ledger_partial_append",
+    )
+
+    def _stage_contexts(self, stage):
+        """Real failure injections, one per materially different post-claim stage.
+
+        Returns ``(contexts, expected_exit, published)``.
+        """
+        real_fdopen = os.fdopen
+        real_fsync = os.fsync
+        real_open = os.open
+
+        def nth_fdopen(target, mode):
+            calls = {"n": 0}
+
+            def guarded(fd, *args, **kwargs):
+                calls["n"] += 1
+                handle = real_fdopen(fd, *args, **kwargs)
+                return _LostAppendHandle(handle, mode) if calls["n"] == target else handle
+
+            return mock.patch("os.fdopen", guarded)
+
+        def nth_fsync(target):
+            calls = {"n": 0}
+
+            def guarded(fd):
+                calls["n"] += 1
+                if calls["n"] == target:
+                    raise OSError(f"simulated fsync failure at call {target}")
+                return real_fsync(fd)
+
+            return mock.patch("os.fsync", guarded)
+
+        def reservation_create_failure():
+            def guarded(path, flags, *args, **kwargs):
+                if str(path).endswith(approval.RESERVATION_SUFFIX):
+                    raise OSError("simulated reservation create failure")
+                return real_open(path, flags, *args, **kwargs)
+
+            return (mock.patch("os.open", guarded),)
+
+        def directory_durability_failure():
+            dir_flag = getattr(os, "O_DIRECTORY", 0x10000)
+
+            def guarded(path, flags, *args, **kwargs):
+                if flags & dir_flag:
+                    raise OSError("simulated reservation directory durability failure")
+                return real_open(path, flags, *args, **kwargs)
+
+            return (
+                mock.patch.object(os, "O_DIRECTORY", dir_flag, create=True),
+                mock.patch("os.open", guarded),
+            )
+
+        def reservation_path_unsafe():
+            slot = self._store_slot()
+            real_detector = contract.is_reparse_point
+
+            def detector(path):
+                return str(path) == str(slot) or real_detector(path)
+
+            return (mock.patch.object(contract, "is_reparse_point", detector),)
+
+        blocked = approval.EXIT_PUBLICATION_BLOCKED
+        ledger_incomplete = approval.EXIT_LEDGER_RECORD_INCOMPLETE
+        # Lazy: only the requested stage is constructed, so one stage's setup can never disturb
+        # (or depend on state absent for) another.
+        table = {
+            "mkstemp": lambda: ((mock.patch(
+                "tempfile.mkstemp", side_effect=OSError("simulated mkstemp failure")),),
+                blocked, False),
+            "temp_write": lambda: ((nth_fdopen(1, "write"),), blocked, False),
+            "temp_flush": lambda: ((nth_fdopen(1, "flush"),), blocked, False),
+            "temp_fsync": lambda: ((nth_fsync(1),), blocked, False),
+            "reservation_create": lambda: (reservation_create_failure(), blocked, False),
+            "reservation_write": lambda: ((nth_fdopen(2, "write"),), blocked, False),
+            "reservation_flush": lambda: ((nth_fdopen(2, "flush"),), blocked, False),
+            "reservation_fsync": lambda: ((nth_fsync(2),), blocked, False),
+            "reservation_directory_durability": lambda: (
+                directory_durability_failure(), blocked, False),
+            "reservation_path_safety": lambda: (reservation_path_unsafe(), blocked, False),
+            "publication": lambda: ((mock.patch(
+                "os.link", side_effect=OSError("simulated publication failure")),), blocked, False),
+            "temp_cleanup": lambda: ((mock.patch(
+                "os.unlink", side_effect=OSError("simulated unlink failure")),),
+                approval.EXIT_CLEANUP_INCOMPLETE, True),
+            "ledger_open": lambda: (
+                (_LedgerAppendFailure(self.ledger, "open"),), ledger_incomplete, True),
+            "ledger_write": lambda: (
+                (_LedgerAppendFailure(self.ledger, "write"),), ledger_incomplete, True),
+            "ledger_flush": lambda: (
+                (_LedgerAppendFailure(self.ledger, "flush"),), ledger_incomplete, True),
+            "ledger_fsync": lambda: (
+                (_LedgerAppendFailure(self.ledger, "fsync"),), ledger_incomplete, True),
+            "ledger_visible_then_unconfirmed": lambda: (
+                (_VisibleLedgerAppendFailure(self.ledger, "fsync"),), ledger_incomplete, True),
+            "ledger_partial_append": lambda: (
+                (_PartialLedgerAppendFailure(self.ledger, "write"),), ledger_incomplete, True),
+        }
+        return table[stage]()
+
+    def test_every_post_claim_failure_permanently_consumes_the_approval(self):
+        import contextlib
+
+        for stage in self.STAGES:
+            with self.subTest(stage=stage):
+                self._reset()
+                historical = self.tmp / "member_create_uat_package_v1.json"
+                historical.write_text("HISTORICAL-V1-DO-NOT-TOUCH\n", encoding="utf-8")
+                historical_bytes = historical.read_bytes()
+                self._prepare_activated_approval()
+
+                contexts, expected_exit, published = self._stage_contexts(stage)
+                with contextlib.ExitStack() as stack:
+                    for context in contexts:
+                        stack.enter_context(context)
+                    code, out = self._build()
+                self.assertEqual(code, expected_exit, f"{stage}: {out}")
+                self.assertNotIn("Traceback", out)
+
+                # The claim survives and the approval is consumed.
+                self.assertEqual(self._claim_count(), 1, f"{stage}: the claim must survive")
+                claim_before = dict(self._claims()[0])
+                self.assertEqual(self.package.is_file(), published, stage)
+                package_bytes = self.package.read_bytes() if published else None
+
+                # A second build at a FRESH path is blocked and adds no claim.
+                second = f"second_{stage}.json"
+                code2, out2 = self._build(extra=self._fresh_out(second))
+                self.assertIn(
+                    code2,
+                    (approval.EXIT_APPROVAL_CONSUMED, approval.EXIT_LEDGER_INTEGRITY_UNCERTAIN),
+                    f"{stage}: {out2}",
+                )
+                self.assertNotIn("Traceback", out2)
+                self.assertFalse((self.tmp / second).exists(), stage)
+                self.assertEqual(self._claim_count(), 1, f"{stage}: no second claim")
+                self.assertEqual(dict(self._claims()[0]), claim_before,
+                                 f"{stage}: the claim is immutable")
+                self.assertEqual(historical.read_bytes(), historical_bytes, stage)
+                if published:
+                    self.assertEqual(self.package.read_bytes(), package_bytes, stage)
+
+
+class ExistingStoreHostilityTests(_ClaimHarness):
+    """Amendment 7: an existing store is NEVER given DDL, augmented, migrated or repaired.
+
+    Every case is refused byte-for-byte untouched, with a sanitised reason and no traceback, and
+    nothing is created.
+    """
+
+    def _canonical_store(self):
+        conn = self._open_store(create=True)
+        conn.close()
+        return self._store_path()
+
+    def _assert_refused_untouched(self, reason=None):
+        path = self._store_path()
+        before = path.read_bytes()
+        for create in (True, False):
+            with self.subTest(create=create):
+                with self.assertRaises(decisions.DecisionStoreError) as caught:
+                    decisions.open_store(path, create=create)
+                if reason is not None:
+                    self.assertEqual(caught.exception.reason, reason)
+                self.assertIn(caught.exception.reason, decisions.STORE_INTEGRITY_REASONS)
+                self.assertEqual(path.read_bytes(), before, "the store must be untouched")
+        code, out = self._build()
+        self.assertEqual(code, approval.EXIT_DECISION_AUTHORITY_UNCERTAIN, out)
+        self.assertNotIn("Traceback", out)
+        summary = json.loads(out)
+        self.assertEqual(summary["status"], "decision_store_integrity_uncertain")
+        self.assertIs(summary["decision_store_modified"], False)
+        self.assertEqual(path.read_bytes(), before)
+        self.assertFalse(self.package.exists())
+        self.assertEqual(self._reservations(), [])
+        self.assertEqual(self._stray_temps(), [])
+
+    def test_zero_byte_file_is_refused_untouched(self):
+        self._store_path().write_bytes(b"")
+        self._assert_refused_untouched(reason="missing_object")
+
+    def test_empty_sqlite_database_is_refused_untouched(self):
+        sqlite3.connect(str(self._store_path())).close()
+        self._assert_refused_untouched(reason="missing_object")
+
+    def test_v1_store_is_refused_untouched(self):
+        raw = sqlite3.connect(str(self._store_path()))
+        try:
+            raw.execute("CREATE TABLE schema_meta (key TEXT PRIMARY KEY NOT NULL, "
+                        "value TEXT NOT NULL)")
+            raw.execute("INSERT INTO schema_meta (key, value) VALUES "
+                        "('schema_version', 'member_create_uat_decisions/v1')")
+            raw.commit()
+        finally:
+            raw.close()
+        self._assert_refused_untouched()
+
+    def test_missing_schema_meta_is_refused_untouched(self):
+        self._canonical_store()
+        raw = self._raw()
+        try:
+            raw.execute("DROP TABLE schema_meta")
+            raw.commit()
+        finally:
+            raw.close()
+        self._assert_refused_untouched(reason="missing_object")
+
+    def test_partial_schema_is_refused_untouched(self):
+        self._canonical_store()
+        raw = self._raw()
+        try:
+            raw.execute("DROP TABLE build_claim")
+            raw.commit()
+        finally:
+            raw.close()
+        self._assert_refused_untouched(reason="missing_object")
+
+    def test_foreign_schema_is_refused_untouched(self):
+        raw = sqlite3.connect(str(self._store_path()))
+        try:
+            raw.execute("CREATE TABLE unrelated_service (id INTEGER PRIMARY KEY, blob TEXT)")
+            raw.commit()
+        finally:
+            raw.close()
+        self._assert_refused_untouched()
+
+    def _replace_object(self, drop, create):
+        self._canonical_store()
+        raw = self._raw()
+        try:
+            raw.execute(drop)
+            raw.execute(create)
+            raw.commit()
+        finally:
+            raw.close()
+        self._assert_refused_untouched(reason="schema_object_mismatch")
+
+    def test_no_op_expected_name_trigger_is_refused(self):
+        self._replace_object(
+            "DROP TRIGGER decision_block_update",
+            "CREATE TRIGGER decision_block_update BEFORE UPDATE ON decision BEGIN SELECT 1; END",
+        )
+
+    def test_trigger_on_the_wrong_table_is_refused(self):
+        self._replace_object(
+            "DROP TRIGGER decision_block_update",
+            "CREATE TRIGGER decision_block_update BEFORE UPDATE ON decision_activation "
+            "BEGIN SELECT RAISE(ABORT, 'x'); END",
+        )
+
+    def test_trigger_with_the_wrong_event_is_refused(self):
+        self._replace_object(
+            "DROP TRIGGER decision_block_delete",
+            "CREATE TRIGGER decision_block_delete BEFORE INSERT ON decision "
+            "BEGIN SELECT RAISE(ABORT, 'x'); END",
+        )
+
+    def test_trigger_with_the_wrong_timing_is_refused(self):
+        self._replace_object(
+            "DROP TRIGGER build_claim_block_update",
+            "CREATE TRIGGER build_claim_block_update AFTER UPDATE ON build_claim "
+            "BEGIN SELECT RAISE(ABORT, 'x'); END",
+        )
+
+    def test_trigger_with_the_wrong_body_is_refused(self):
+        self._replace_object(
+            "DROP TRIGGER build_claim_require_exact_activated_approval",
+            "CREATE TRIGGER build_claim_require_exact_activated_approval "
+            "BEFORE INSERT ON build_claim BEGIN SELECT 1; END",
+        )
+
+    def test_index_with_wrong_columns_is_refused(self):
+        self._replace_object(
+            "DROP INDEX idx_decision_source_sequence",
+            "CREATE INDEX idx_decision_source_sequence ON decision (decision_id)",
+        )
+
+    def test_index_with_wrong_uniqueness_is_refused(self):
+        self._replace_object(
+            "DROP INDEX idx_build_claim_source_sequence",
+            "CREATE UNIQUE INDEX idx_build_claim_source_sequence ON build_claim "
+            "(source_record_id, claim_sequence)",
+        )
+
+    def test_table_missing_unique_check_or_foreign_key_is_refused(self):
+        # Rebuilding build_claim without its UNIQUE, CHECK and foreign-key protections changes
+        # the stored canonical definition, so the whole class of weakened redefinitions refuses.
+        self._canonical_store()
+        raw = self._raw()
+        try:
+            raw.execute("DROP TABLE build_claim")
+            raw.execute(
+                "CREATE TABLE build_claim ("
+                " claim_sequence INTEGER PRIMARY KEY AUTOINCREMENT, claim_id TEXT NOT NULL,"
+                " decision_sequence INTEGER NOT NULL, decision_id TEXT NOT NULL,"
+                " decision_record_hash TEXT NOT NULL, approval_id TEXT NOT NULL,"
+                " source_record_id TEXT NOT NULL, source_fingerprint TEXT NOT NULL,"
+                " operation_id TEXT NOT NULL, package_payload_hash TEXT NOT NULL,"
+                " package_file_name TEXT NOT NULL, claimed_at TEXT NOT NULL,"
+                " schema_version TEXT NOT NULL, record_hash TEXT NOT NULL)"
+            )
+            # DROP TABLE also drops its index and triggers, so every canonical build_claim
+            # object EXCEPT the table itself is restored verbatim: the weakened TABLE definition
+            # is then the only remaining difference.
+            for statement in decisions._SCHEMA_STATEMENTS:
+                normalised = " ".join(statement.split())
+                if "build_claim" in normalised and not normalised.startswith("CREATE TABLE"):
+                    raw.execute(statement)
+            raw.commit()
+        finally:
+            raw.close()
+        self._assert_refused_untouched(reason="schema_object_mismatch")
+
+    def _add_object(self, statement):
+        self._canonical_store()
+        raw = self._raw()
+        try:
+            raw.execute(statement)
+            raw.commit()
+        finally:
+            raw.close()
+        self._assert_refused_untouched(reason="unexpected_object")
+
+    def test_extra_table_is_refused(self):
+        self._add_object("CREATE TABLE smuggled (x TEXT)")
+
+    def test_extra_view_is_refused(self):
+        self._add_object("CREATE VIEW smuggled_view AS SELECT 1 AS x")
+
+    def test_extra_trigger_is_refused(self):
+        self._add_object(
+            "CREATE TRIGGER smuggled_trigger AFTER INSERT ON decision BEGIN SELECT 1; END"
+        )
+
+    def test_extra_index_is_refused(self):
+        self._add_object("CREATE INDEX smuggled_index ON decision (reviewer_id)")
+
+    def test_orphan_activation_is_refused(self):
+        # A raw writer has foreign_keys OFF, so it can insert an activation pointing nowhere.
+        # PRAGMA foreign_key_check catches it before any authority is read.
+        self._canonical_store()
+        raw = self._raw()
+        try:
+            raw.execute(
+                "INSERT INTO decision_activation (decision_id, activated_at, record_hash) "
+                "VALUES (?, ?, ?)",
+                ("dec_" + ("f" * 32), "2026-07-25T00:00:00+00:00", "sha256:" + ("0" * 64)),
+            )
+            raw.commit()
+        finally:
+            raw.close()
+        self._assert_refused_untouched(reason="foreign_key_check_failed")
+
+    def test_a_claim_on_a_non_approved_or_unactivated_decision_is_mechanically_impossible(self):
+        # This state cannot be constructed while the canonical schema is intact: the BEFORE
+        # INSERT trigger fires even for a raw foreign writer with foreign keys off.
+        self._canonical_store()
+        srid, fingerprint = self._fixture_identity()
+        held = self._insert_activated("hold", srid=srid, fingerprint=fingerprint)
+        pending = self._insert_pending(self._record("approved", srid=srid, fingerprint=fingerprint))
+        raw = self._raw()
+        try:
+            for label, decision in (("non_approved", held), ("unactivated", pending)):
+                with self.subTest(case=label):
+                    with self.assertRaises(sqlite3.IntegrityError):
+                        raw.execute(
+                            "INSERT INTO build_claim (claim_id, decision_sequence, decision_id,"
+                            " decision_record_hash, approval_id, source_record_id,"
+                            " source_fingerprint, operation_id, package_payload_hash,"
+                            " package_file_name, claimed_at, schema_version, record_hash)"
+                            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                            (
+                                "claim_" + uuid.uuid4().hex, 1, decision["decision_id"],
+                                decision["record_hash"],
+                                decision["approval_id"] or ("appr_" + ("0" * 32)),
+                                srid, fingerprint, "mcuat_" + uuid.uuid4().hex,
+                                "sha256:" + ("1" * 64), "p.json",
+                                "2026-07-25T00:00:00+00:00", decisions.SCHEMA_VERSION,
+                                "sha256:" + ("2" * 64),
+                            ),
+                        )
+                    raw.rollback()
+        finally:
+            raw.close()
+        self.assertEqual(self._claim_count(), 0)
+
+    def test_claim_record_hash_mismatch_is_refused(self):
+        # The trigger enforces the BINDINGS; the canonical row hash is validated in Python, so a
+        # claim with correct bindings but a tampered hash is still refused.
+        record = self._prepare_activated_approval()
+        conn = self._open_store()
+        try:
+            claim = {
+                "claim_id": "claim_" + uuid.uuid4().hex,
+                "decision_sequence": decisions.decision_sequence(conn, record["decision_id"]),
+                "decision_id": record["decision_id"],
+                "decision_record_hash": record["record_hash"],
+                "approval_id": record["approval_id"],
+                "source_record_id": record["source_record_id"],
+                "source_fingerprint": record["source_fingerprint"],
+                "operation_id": "mcuat_" + uuid.uuid4().hex,
+                "package_payload_hash": "sha256:" + ("3" * 64),
+                "package_file_name": "p.json",
+                "claimed_at": iso(datetime.now(timezone.utc)),
+                "schema_version": decisions.SCHEMA_VERSION,
+                "record_hash": "sha256:" + ("0" * 64),
+            }
+            conn.execute("BEGIN IMMEDIATE")
+            decisions.insert_build_claim(conn, claim)
+            decisions._commit(conn)
+        finally:
+            conn.close()
+        self._assert_refused_untouched(reason="record_hash_mismatch")
+
+    def test_integrity_check_failure_is_refused(self):
+        self._prepare_activated_approval()
+        path = self._store_path()
+        before = path.read_bytes()
+        with mock.patch.object(decisions, "_integrity_check",
+                               return_value="*** in database main *** simulated page error"):
+            code, out = self._build()
+        self.assertEqual(code, approval.EXIT_DECISION_AUTHORITY_UNCERTAIN, out)
+        self.assertEqual(json.loads(out)["decision_store_integrity"], "integrity_check_failed")
+        self.assertEqual(path.read_bytes(), before)
+        self.assertFalse(self.package.exists())
+
+    def test_foreign_key_check_failure_is_refused(self):
+        self._prepare_activated_approval()
+        path = self._store_path()
+        before = path.read_bytes()
+        with mock.patch.object(decisions, "_foreign_key_check",
+                               return_value=[("build_claim", 1, "decision", 0)]):
+            code, out = self._build()
+        self.assertEqual(code, approval.EXIT_DECISION_AUTHORITY_UNCERTAIN, out)
+        self.assertEqual(json.loads(out)["decision_store_integrity"], "foreign_key_check_failed")
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_corrupt_database_is_refused_untouched(self):
+        path = self._store_path()
+        path.write_bytes(b"definitely not a SQLite database\n" * 8)
+        before = path.read_bytes()
+        code, out = self._build()
+        self.assertEqual(code, approval.EXIT_DECISION_AUTHORITY_UNCERTAIN, out)
+        self.assertEqual(json.loads(out)["decision_store_integrity"], "store_corrupt")
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_a_decision_command_never_runs_ddl_against_an_existing_store(self):
+        # The strongest form of the guarantee: the canonical schema-creation path is never even
+        # entered when the path already exists, whatever its contents. (``sqlite3.Connection`` is
+        # a C type and cannot be patched, so the DDL entry point itself is the assertion point.)
+        self._store_path().write_bytes(b"")
+        before = self._store_path().read_bytes()
+
+        def forbidden(_conn):
+            raise AssertionError("no schema DDL may run against an existing store")
+
+        with mock.patch.object(decisions, "_create_canonical_schema", forbidden):
+            code, _out = self._run(
+                ["approve", "--reviewer", "digital", "--input", str(self.form),
+                 "--decision-rows", str(self.rows), "--row-number", "2",
+                 "--ledger", str(self.ledger)]
+            )
+        self.assertEqual(code, approval.EXIT_DECISION_AUTHORITY_UNCERTAIN)
+        self.assertEqual(self._store_path().read_bytes(), before)
+
+    def test_a_genuinely_absent_store_is_created_atomically_and_validated(self):
+        # The positive control: creation is allowed exactly once, at an absent path, and the
+        # final path only ever appears fully formed.
+        self.assertFalse(self._store_path().exists())
+        code, _out = self._run(
+            ["approve", "--reviewer", "digital", "--input", str(self.form),
+             "--decision-rows", str(self.rows), "--row-number", "2",
+             "--ledger", str(self.ledger)]
+        )
+        self.assertEqual(code, 0)
+        self.assertTrue(self._store_path().is_file())
+        conn = self._open_store()
+        try:
+            decisions.validate_store(conn)
+            self.assertEqual(decisions._integrity_check(conn), "ok")
+            self.assertEqual(decisions._foreign_key_check(conn), [])
+        finally:
+            conn.close()
+        self.assertEqual([f for f in os.listdir(self.tmp) if "mcuat_decisions" in f], [],
+                         "no operation-owned store temporary is left behind")
+
+
+class TimestampHostilityTests(_ClaimHarness):
+    """Amendment 7: every authority and audit timestamp must parse AND carry a UTC offset.
+
+    A naive value parses happily through ``datetime.fromisoformat`` but comparing it to an aware
+    "now" raises an uncontrolled ``TypeError``. One central parser owns the rule.
+    """
+
+    NAIVE = "2026-07-28T00:00:00"
+
+    def test_the_central_parser_rejects_naive_and_invalid_values(self):
+        for bad in (self.NAIVE, "not-a-timestamp", None, 12345, "2026-07-28T00:00:00 UTC", ""):
+            with self.subTest(value=bad):
+                self.assertIsNone(decisions.parse_aware_timestamp(bad))
+        for good in ("2026-07-28T00:00:00+00:00", "2026-07-28T00:00:00Z",
+                     "2026-07-28T08:00:00+08:00"):
+            with self.subTest(value=good):
+                parsed = decisions.parse_aware_timestamp(good)
+                self.assertIsNotNone(parsed)
+                self.assertIsNotNone(parsed.utcoffset())
+
+    def _assert_store_timestamp_refusal(self, reason, expected_claims=0):
+        code, out = self._build()
+        self.assertEqual(code, approval.EXIT_DECISION_AUTHORITY_UNCERTAIN, out)
+        self.assertNotIn("Traceback", out)
+        summary = json.loads(out)
+        self.assertEqual(summary["status"], "decision_store_integrity_uncertain")
+        self.assertEqual(summary["decision_store_integrity"], reason)
+        self.assertNotIn(self.NAIVE, out, "the offending value is never exposed")
+        self.assertEqual(self._raw_claim_count(), expected_claims)
+        self.assertFalse(self.package.exists())
+        self.assertEqual(self._reservations(), [])
+        self.assertEqual(self._stray_temps(), [])
+
+    def test_naive_recorded_at_is_refused(self):
+        srid, fingerprint = self._fixture_identity()
+        self._insert_activated("approved", srid=srid, fingerprint=fingerprint,
+                               recorded_at=self.NAIVE)
+        self._assert_store_timestamp_refusal("naive_timestamp")
+
+    def test_naive_expires_at_is_refused(self):
+        srid, fingerprint = self._fixture_identity()
+        self._insert_activated("approved", srid=srid, fingerprint=fingerprint,
+                               expires_at=self.NAIVE)
+        self._assert_store_timestamp_refusal("naive_timestamp")
+
+    def test_naive_approved_at_is_refused(self):
+        srid, fingerprint = self._fixture_identity()
+        record = self._record("approved", srid=srid, fingerprint=fingerprint)
+        record["approved_at"] = self.NAIVE
+        record["record_hash"] = decisions.decision_record_hash(record)
+        self._activate(self._insert_pending(record))
+        self._assert_store_timestamp_refusal("naive_timestamp")
+
+    def test_naive_activated_at_is_refused(self):
+        srid, fingerprint = self._fixture_identity()
+        record = self._insert_pending(self._record("approved", srid=srid, fingerprint=fingerprint))
+        self._activate(record, activated_at=self.NAIVE)
+        self._assert_store_timestamp_refusal("naive_timestamp")
+
+    def test_naive_claimed_at_is_refused(self):
+        record = self._prepare_activated_approval()
+        conn = self._open_store()
+        try:
+            claim = {
+                "claim_id": "claim_" + uuid.uuid4().hex,
+                "decision_sequence": decisions.decision_sequence(conn, record["decision_id"]),
+                "decision_id": record["decision_id"],
+                "decision_record_hash": record["record_hash"],
+                "approval_id": record["approval_id"],
+                "source_record_id": record["source_record_id"],
+                "source_fingerprint": record["source_fingerprint"],
+                "operation_id": "mcuat_" + uuid.uuid4().hex,
+                "package_payload_hash": "sha256:" + ("3" * 64),
+                "package_file_name": "p.json",
+                "claimed_at": self.NAIVE,
+                "schema_version": decisions.SCHEMA_VERSION,
+            }
+            claim["record_hash"] = decisions.claim_record_hash(claim)
+            conn.execute("BEGIN IMMEDIATE")
+            decisions.insert_build_claim(conn, claim)
+            decisions._commit(conn)
+        finally:
+            conn.close()
+        # The pre-existing invalid claim is the state under test, so it is expected to remain.
+        self._assert_store_timestamp_refusal("naive_timestamp", expected_claims=1)
+
+    def test_wrong_types_and_unsafe_characters_are_refused(self):
+        for value in ("2026-07-28 00:00:00 UTC", "not-a-timestamp", "2026-13-45T99:99:99+00:00"):
+            with self.subTest(value=value):
+                self._reset()
+                srid, fingerprint = self._fixture_identity()
+                self._insert_activated("approved", srid=srid, fingerprint=fingerprint,
+                                       expires_at=value)
+                code, out = self._build()
+                self.assertEqual(code, approval.EXIT_DECISION_AUTHORITY_UNCERTAIN, out)
+                self.assertEqual(
+                    json.loads(out)["decision_store_integrity"], "timestamp_invalid"
+                )
+                self.assertNotIn(value, out)
+
+    def test_expiry_before_approval_is_refused(self):
+        srid, fingerprint = self._fixture_identity()
+        self._insert_activated(
+            "approved", srid=srid, fingerprint=fingerprint,
+            recorded_at="2026-07-25T12:00:00+00:00", expires_at="2026-07-25T11:00:00+00:00",
+        )
+        self._assert_store_timestamp_refusal("timestamp_order_invalid")
+
+    def test_activation_before_recording_is_refused(self):
+        srid, fingerprint = self._fixture_identity()
+        record = self._insert_pending(self._record(
+            "approved", srid=srid, fingerprint=fingerprint,
+            recorded_at="2026-07-25T12:00:00+00:00", expires_at="2026-07-28T12:00:00+00:00",
+        ))
+        self._activate(record, activated_at="2026-07-25T11:00:00+00:00")
+        self._assert_store_timestamp_refusal("timestamp_order_invalid")
+
+    def test_naive_timestamps_in_every_jsonl_decision_field_are_refused(self):
+        for field in ("recorded_at", "approved_at", "expires_at"):
+            with self.subTest(field=field):
+                self._reset()
+                record = {
+                    "event": "decision", "recorded_at": "2026-07-25T00:00:00+00:00",
+                    "reviewer_id": "digital", "decision": "approved",
+                    "source_record_id": "srcrec_" + ("a" * 64),
+                    "source_fingerprint": "fp_" + ("b" * 64), "row_number_hint": 2,
+                    "approval_id": "appr_" + ("c" * 32),
+                    "approved_at": "2026-07-25T00:00:00+00:00",
+                    "expires_at": "2026-07-28T00:00:00+00:00",
+                }
+                record[field] = self.NAIVE
+                with open(self.ledger, "a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(record, sort_keys=True) + "\n")
+                code, out = self._build()
+                summary = self._assert_ledger_integrity_uncertain(code, out)
+                self.assertEqual(summary["ledger_integrity"], "decision_field_invalid")
+                self.assertNotIn(self.NAIVE, out)
+
+    def test_naive_timestamp_in_a_build_audit_event_is_refused(self):
+        record = {
+            "event": "build", "recorded_at": self.NAIVE,
+            "source_record_id": "srcrec_" + ("a" * 64),
+            "source_fingerprint": "fp_" + ("b" * 64),
+            "approval_id": "appr_" + ("c" * 32),
+            "operation_id": "mcuat_" + ("d" * 32),
+            "bound_package_payload_hash": "sha256:" + ("e" * 64),
+            "package_file_name": "p.json",
+        }
+        with open(self.ledger, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, sort_keys=True) + "\n")
+        code, out = self._build()
+        summary = self._assert_ledger_integrity_uncertain(code, out)
+        self.assertEqual(summary["ledger_integrity"], "publication_field_invalid")
+        self.assertNotIn(self.NAIVE, out)
+
+    def test_naive_timestamp_in_a_cleanup_incomplete_event_is_refused(self):
+        record = {
+            "event": "build_cleanup_incomplete", "recorded_at": self.NAIVE,
+            "source_record_id": "srcrec_" + ("a" * 64),
+            "source_fingerprint": "fp_" + ("b" * 64),
+            "approval_id": "appr_" + ("c" * 32),
+            "operation_id": "mcuat_" + ("d" * 32),
+            "bound_package_payload_hash": "sha256:" + ("e" * 64),
+            "package_file_name": "p.json",
+            "cleanup_incomplete": True, "stale_temp_basename": ".mcuat_pkg_x.tmp",
+        }
+        with open(self.ledger, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, sort_keys=True) + "\n")
+        code, out = self._build()
+        self.assertEqual(
+            self._assert_ledger_integrity_uncertain(code, out)["ledger_integrity"],
+            "publication_field_invalid",
+        )
 
 
 if __name__ == "__main__":

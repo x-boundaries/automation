@@ -273,6 +273,10 @@ member_create_uat_decisions.sqlite3
 member_create_uat_decisions.sqlite3-journal
 member_create_uat_decisions.sqlite3-wal
 member_create_uat_decisions.sqlite3-shm
+# The operation-owned temporary a fully-formed store is built in before it is atomically
+# published with a no-replace link, so no concurrent process can ever observe a partial store.
+.mcuat_decisions_*.tmp
+autocount_outputs/**/.mcuat_decisions_*.tmp
 autocount_outputs/**/member_create_uat_decisions.sqlite3
 autocount_outputs/**/member_create_uat_decisions.sqlite3-journal
 autocount_outputs/**/member_create_uat_decisions.sqlite3-wal
