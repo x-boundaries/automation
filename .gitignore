@@ -264,6 +264,19 @@ member_create_uat_result*.json
 # approval after a publication or ledger persistence failure. Local operational state only.
 member_create_uat_reservation_*.reservation
 autocount_outputs/**/member_create_uat_reservation_*.reservation
+# Transactional reviewer-decision AUTHORITY store (SQLite) plus its legitimate private
+# runtime companions. Named exactly - never a broad *.sqlite3 pattern - so an unrelated
+# committed database can never be hidden by these rules. It holds sanitised decision
+# metadata only, but that metadata binds to real member identity through one-way hashes,
+# so it is local-only operational state.
+member_create_uat_decisions.sqlite3
+member_create_uat_decisions.sqlite3-journal
+member_create_uat_decisions.sqlite3-wal
+member_create_uat_decisions.sqlite3-shm
+autocount_outputs/**/member_create_uat_decisions.sqlite3
+autocount_outputs/**/member_create_uat_decisions.sqlite3-journal
+autocount_outputs/**/member_create_uat_decisions.sqlite3-wal
+autocount_outputs/**/member_create_uat_decisions.sqlite3-shm
 autocount_outputs/**/member_create_uat_*.json
 autocount_outputs/**/member_create_uat_*.jsonl
 create_uat.lock

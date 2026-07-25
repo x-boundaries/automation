@@ -4,9 +4,14 @@ single-member creation UAT.
 State ownership (per approved design):
 
 * This tool runs on the LAPTOP DEVELOPMENT MACHINE. It owns the human decision
-  record only: an append-only approval ledger recording controlled approve /
-  reject / hold decisions bound to a stable source identity and a change-detection
-  fingerprint, plus a record of which immutable package was built.
+  record only: controlled approve / reject / hold decisions bound to a stable source
+  identity and a change-detection fingerprint, plus a record of which immutable package
+  was built.
+* Reviewer AUTHORITY lives in a transactional, append-only SQLite decision store
+  (``member_create_uat_decision_store``). A decision authorises a package only when a
+  committed ACTIVATION row exists for it.
+* The JSONL approval ledger is an append-only AUDIT RECORD ONLY. A readable JSONL line -
+  including a complete one left behind by a flush/fsync failure - never grants authority.
 * It also owns a durable publication reservation: a write-ahead intent marker created
   exclusively BEFORE any final package can be published, so the single-use approval
   boundary survives a ledger persistence failure. Its existence TERMINALLY consumes that
@@ -33,6 +38,7 @@ import argparse
 import csv
 import json
 import os
+import sqlite3
 import sys
 import tempfile
 import uuid
@@ -44,6 +50,7 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 import member_create_uat_contract as contract  # noqa: E402
+import member_create_uat_decision_store as decisions  # noqa: E402
 import member_intake_validate as validator  # noqa: E402
 
 DEFAULT_BUSINESS_CONFIG = (
@@ -74,12 +81,18 @@ PRIVATE_MARKER_TEXT = (
 #      --rebuild request, which can never authorise a further package
 #   8  nothing attempted: the approval ledger could not be read as a structurally intact
 #      append-only record, so no decision in it may be trusted
+#   9  decision authority cannot be trusted: a pending decision was left non-authoritative,
+#      a commit outcome could not be resolved, or the decision store is not intact
+#  10  no activated decision authorises a build: the store is absent, the newest activated
+#      decision is a rejection or hold, or a newer decision is still pending
 EXIT_CLEANUP_INCOMPLETE = 3
 EXIT_LEDGER_RECORD_INCOMPLETE = 4
 EXIT_RESERVATION_INCOMPLETE = 5
 EXIT_PUBLICATION_BLOCKED = 6
 EXIT_APPROVAL_CONSUMED = 7
 EXIT_LEDGER_INTEGRITY_UNCERTAIN = 8
+EXIT_DECISION_AUTHORITY_UNCERTAIN = 9
+EXIT_DECISION_NOT_AUTHORITATIVE = 10
 
 # Ledger events that mark an approval's package as already published (clean OR published
 # with an incomplete temporary cleanup). Either one blocks a further build for that approval.
@@ -159,11 +172,24 @@ class ApprovalError(ValueError):
 class ReservationError(ApprovalError):
     """The durable publication reservation could not be created or confirmed durable.
 
-    ``state`` is ``"not_created"`` when nothing was created (no approval state was
-    consumed) or ``"uncertain"`` when an entry may exist but its durability could not be
-    confirmed. An uncertain reservation is deliberately left in place: removing it would
-    turn "maybe consumed" into "definitely free", which is the unsafe direction.
+    ``state`` is one of:
+
+    ``"not_created"``  the tool POSITIVELY established that no reservation object exists, so
+                       no approval state was consumed and a retry is safe. This is the only
+                       retryable reservation outcome, and it is claimed only after a
+                       non-following existence re-check.
+    ``"consumed"``     an object definitely occupies the slot - the exclusive create lost to
+                       a competitor. The approval is terminally consumed, never retryable.
+    ``"uncertain"``    an entry may exist but is not confirmed durable, or its existence
+                       could not be determined. Treated exactly like ``consumed``.
+
+    A ``consumed`` or ``uncertain`` reservation is deliberately left in place: removing it
+    would turn "maybe consumed" into "definitely free", which is the unsafe direction.
     """
+
+    NOT_CREATED = "not_created"
+    CONSUMED = "consumed"
+    UNCERTAIN = "uncertain"
 
     def __init__(self, message, *, state):
         super().__init__(message)
@@ -179,6 +205,11 @@ LEDGER_INTEGRITY_REASONS = (
     "torn_final_record",     # the last record is not newline-terminated: a partial append
     "malformed_json_record",  # a record is not parseable JSON
     "invalid_record_shape",  # a record parses but is not a JSON object
+    "unknown_event_type",    # a record's event is missing or not a supported audit event
+    "decision_field_set_mismatch",     # a decision record has missing/extra fields
+    "decision_field_invalid",          # a decision field has the wrong type or format
+    "publication_field_set_mismatch",  # a build record has missing/extra fields
+    "publication_field_invalid",       # a build field has the wrong type or format
 )
 
 
@@ -202,6 +233,148 @@ class LedgerIntegrityError(ApprovalError):
 
 def utc_now_iso():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+# --------------------------------------------------------------------------- #
+# JSONL AUDIT-RECORD SCHEMAS
+#
+# The JSONL ledger is an append-only AUDIT RECORD ONLY - it never grants package-building
+# authority (that is the transactional decision store's job). It is still validated
+# strictly, because rejecting only malformed JSON and non-object JSON left arbitrary
+# DICTIONARIES trusted: a malformed decision or publication dictionary reached downstream
+# timestamp parsing and field lookups, producing uncontrolled exceptions or partially
+# trusted state.
+#
+# Every shape below is one this repository has actually produced. Nothing is accepted "for
+# compatibility" that the tool never wrote.
+#
+#   decision                  - unchanged across every version: exactly these 10 fields.
+#   build                     - the 8 core fields every version wrote, plus
+#                               `reservation_file_name` from Amendment 4 onwards.
+#   build_cleanup_incomplete  - the same, plus `cleanup_incomplete` and
+#                               `stale_temp_basename` (introduced with Amendment 3).
+DECISION_AUDIT_FIELDS = frozenset({
+    "event", "recorded_at", "reviewer_id", "decision", "source_record_id",
+    "source_fingerprint", "row_number_hint", "approval_id", "approved_at", "expires_at",
+})
+PUBLICATION_AUDIT_REQUIRED = frozenset({
+    "event", "recorded_at", "source_record_id", "source_fingerprint", "approval_id",
+    "operation_id", "bound_package_payload_hash", "package_file_name",
+})
+PUBLICATION_AUDIT_OPTIONAL = frozenset({"reservation_file_name"})
+CLEANUP_AUDIT_REQUIRED = frozenset({"cleanup_incomplete", "stale_temp_basename"})
+
+LEDGER_DECISION_VALUES = ("approved", "rejected", "hold")
+
+# A generous upper bound on a spreadsheet row hint. Its purpose is to bound the type check,
+# not to model any real sheet.
+MAX_ROW_NUMBER_HINT = 1_048_576
+
+
+def _is_plain_int(value):
+    """True for a real integer. ``bool`` is an ``int`` subclass and is not accepted."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _valid_audit_timestamp(value):
+    """A safe-charset ISO-8601 timestamp that actually parses."""
+    if not isinstance(value, str) or not contract.SAFE_TIMESTAMP_RE.fullmatch(value):
+        return False
+    try:
+        datetime.fromisoformat(value)
+    except ValueError:
+        return False
+    return True
+
+
+def _matches(value, pattern):
+    return isinstance(value, str) and bool(pattern.fullmatch(value))
+
+
+def _validate_decision_audit(record):
+    """Return a sanitised reason when this decision audit record is not exactly the shape
+    the tool writes, else None."""
+    if set(record) != DECISION_AUDIT_FIELDS:
+        return "decision_field_set_mismatch"
+    if record["decision"] not in LEDGER_DECISION_VALUES:
+        return "decision_field_invalid"
+    if not _matches(record["reviewer_id"], contract.REVIEWER_ID_RE):
+        return "decision_field_invalid"
+    if not _matches(record["source_record_id"], contract.SOURCE_RECORD_ID_RE):
+        return "decision_field_invalid"
+    if not _matches(record["source_fingerprint"], contract.SOURCE_FINGERPRINT_RE):
+        return "decision_field_invalid"
+    if not (_is_plain_int(record["row_number_hint"])
+            and 2 <= record["row_number_hint"] <= MAX_ROW_NUMBER_HINT):
+        return "decision_field_invalid"
+    if not _valid_audit_timestamp(record["recorded_at"]):
+        return "decision_field_invalid"
+    if record["decision"] == "approved":
+        # An approval audit record must carry a well-formed approval id and two parseable
+        # timestamps; an unparseable expiry previously reached `datetime.fromisoformat` in
+        # the build path and escaped as an uncontrolled ValueError.
+        if not _matches(record["approval_id"], contract.APPROVAL_ID_RE):
+            return "decision_field_invalid"
+        if not (_valid_audit_timestamp(record["approved_at"])
+                and _valid_audit_timestamp(record["expires_at"])):
+            return "decision_field_invalid"
+    elif not (record["approval_id"] is None
+              and record["approved_at"] is None
+              and record["expires_at"] is None):
+        # A rejection or hold grants nothing, so it must carry no approval fields at all.
+        return "decision_field_invalid"
+    return None
+
+
+def _validate_publication_audit(record):
+    """Return a sanitised reason when this publication audit record is not exactly a shape
+    the tool writes, else None."""
+    required = set(PUBLICATION_AUDIT_REQUIRED)
+    allowed = required | PUBLICATION_AUDIT_OPTIONAL
+    if record["event"] == "build_cleanup_incomplete":
+        required |= CLEANUP_AUDIT_REQUIRED
+        allowed |= CLEANUP_AUDIT_REQUIRED
+    present = set(record)
+    if not required <= present or not present <= allowed:
+        return "publication_field_set_mismatch"
+    if not _matches(record["approval_id"], contract.APPROVAL_ID_RE):
+        return "publication_field_invalid"
+    if not _matches(record["operation_id"], contract.OPERATION_ID_RE):
+        return "publication_field_invalid"
+    if not _matches(record["bound_package_payload_hash"], contract.PAYLOAD_HASH_RE):
+        return "publication_field_invalid"
+    if not _matches(record["package_file_name"], contract.SAFE_BASENAME_RE):
+        return "publication_field_invalid"
+    if not _matches(record["source_record_id"], contract.SOURCE_RECORD_ID_RE):
+        return "publication_field_invalid"
+    if not _matches(record["source_fingerprint"], contract.SOURCE_FINGERPRINT_RE):
+        return "publication_field_invalid"
+    if not _valid_audit_timestamp(record["recorded_at"]):
+        return "publication_field_invalid"
+    if "reservation_file_name" in present and not _matches(
+        record["reservation_file_name"], contract.SAFE_BASENAME_RE
+    ):
+        return "publication_field_invalid"
+    if record["event"] == "build_cleanup_incomplete":
+        if record["cleanup_incomplete"] is not True:
+            return "publication_field_invalid"
+        if not _matches(record["stale_temp_basename"], contract.SAFE_BASENAME_RE):
+            return "publication_field_invalid"
+    return None
+
+
+def _validate_ledger_record(record):
+    """Classify one audit record against the exact supported schemas.
+
+    Returns None when the record matches a supported shape, otherwise a sanitised reason.
+    The offending record is never returned, logged or printed.
+    """
+    event = record.get("event")
+    if event == "decision":
+        return _validate_decision_audit(record)
+    if event in BUILD_LEDGER_EVENTS:
+        return _validate_publication_audit(record)
+    return "unknown_event_type"
 
 
 # --------------------------------------------------------------------------- #
@@ -346,20 +519,19 @@ def read_ledger(ledger_path):
                 "fail-closed and leave the file untouched for controlled recovery.",
                 reason="invalid_record_shape",
             )
+        problem = _validate_ledger_record(record)
+        if problem is not None:
+            raise LedgerIntegrityError(
+                "The approval ledger contains a record that does not match a supported "
+                "audit event schema; refuse fail-closed and leave the file untouched for "
+                "controlled recovery.",
+                reason=problem,
+            )
         entries.append(record)
     return entries
 
 
-def latest_decision(entries, source_record_id):
-    """Latest approve/reject/hold decision for a source record, or None."""
-    found = None
-    for entry in entries:
-        if entry.get("event") == "decision" and entry.get("source_record_id") == source_record_id:
-            found = entry
-    return found
-
-
-def _publication_events_for(entries, approval_id, source_record_id, events):
+def _publication_events_for(entries, approval_id, events):
     """Ledger publication events attributable to THIS approval.
 
     Single use is a property of the APPROVAL, not of the source record. The documented
@@ -367,25 +539,17 @@ def _publication_events_for(entries, approval_id, source_record_id, events):
     id; keying these guards on the source record instead would make one publication block that
     member's row forever and leave no recovery path at all.
 
-    Every version of this tool that has written a publication event recorded its
-    ``approval_id``, so an event with a missing or non-string approval id came from elsewhere.
-    When such an event names this source record it is treated as attributable: unattributable
-    publication evidence has to block rather than pass.
+    Every version of this tool that has written a publication event recorded a well-formed
+    ``approval_id``, and audit-schema validation now rejects any publication record without
+    one, so matching on the approval id alone covers the whole history.
     """
-    matched = []
-    for entry in entries:
-        if entry.get("event") not in events:
-            continue
-        recorded = entry.get("approval_id")
-        if recorded == approval_id or (
-            not isinstance(recorded, str)
-            and entry.get("source_record_id") == source_record_id
-        ):
-            matched.append(entry)
-    return matched
+    return [
+        entry for entry in entries
+        if entry.get("event") in events and entry.get("approval_id") == approval_id
+    ]
 
 
-def build_already_exists(entries, approval_id, source_record_id):
+def build_already_exists(entries, approval_id):
     """True when the ledger already records a publication for this approval - clean OR
     published-with-incomplete-cleanup - so a cleanup failure is never a loophole.
 
@@ -393,19 +557,15 @@ def build_already_exists(entries, approval_id, source_record_id):
     rule); this catches a ledger whose reservation object is absent, for example one recorded
     by a tool version that predates reservations.
     """
-    return bool(
-        _publication_events_for(entries, approval_id, source_record_id, BUILD_LEDGER_EVENTS)
-    )
+    return bool(_publication_events_for(entries, approval_id, BUILD_LEDGER_EVENTS))
 
 
-def published_cleanup_incomplete_exists(entries, approval_id, source_record_id):
+def published_cleanup_incomplete_exists(entries, approval_id):
     """True if a prior publication for this approval succeeded but its temporary cleanup did
     not complete. Such an operation must not be retried as a new package build: the package
     WAS published, and it requires manual temporary cleanup plus a fresh reviewer decision."""
     return bool(
-        _publication_events_for(
-            entries, approval_id, source_record_id, CLEANUP_INCOMPLETE_LEDGER_EVENTS
-        )
+        _publication_events_for(entries, approval_id, CLEANUP_INCOMPLETE_LEDGER_EVENTS)
     )
 
 
@@ -462,6 +622,23 @@ def _fsync_parent_directory(directory):
     return "file_and_directory_fsync"
 
 
+def _slot_absence_state(path):
+    """Classify a reservation slot after a failed create, WITHOUT following links.
+
+    ``not_created`` - and with it the only retryable reservation outcome - is returned solely
+    when ``os.path.lexists`` positively reports that no object occupies the exact slot path.
+    If an object is there, or existence cannot be determined at all, the approval must be
+    treated as consumed/uncertain. This is a single direct path lookup: the state directory is
+    never listed, globbed or swept.
+    """
+    try:
+        if os.path.lexists(path):
+            return ReservationError.CONSUMED
+    except OSError:
+        return ReservationError.UNCERTAIN
+    return ReservationError.NOT_CREATED
+
+
 def write_reservation(path, record):
     """Exclusively create ONE durable publication reservation; return the durability mode.
 
@@ -471,36 +648,43 @@ def write_reservation(path, record):
     Durable: the record is written, flushed and fsynced, then the parent directory entry is
     synced where the platform supports it.
 
-    Fail-closed: raises ``ReservationError``. ``state="not_created"`` means nothing was
-    created, so no approval state was consumed. ``state="uncertain"`` means an entry may
-    exist but is not confirmed durable; it is deliberately NOT deleted, truncated or
-    rewritten, so the approval stays blocked until a controller reconciles it.
+    Fail-closed: raises ``ReservationError``. Only ``state="not_created"`` is retryable, and
+    it is claimed solely when a non-following existence re-check positively proves no
+    reservation object is present. ``state="consumed"`` and ``state="uncertain"`` entries are
+    deliberately NOT deleted, truncated or rewritten, so the approval stays blocked until a
+    controller reconciles it.
     """
     try:
         # Converted rather than propagated: a bare ContractError would escape the publication
         # writer's typed handlers and leave the operation-owned temporary file uncleaned.
-        # Path validation precedes any create, so nothing was created.
         path = contract.assert_safe_local_path(path)
     except contract.ContractError as error:
         raise ReservationError(
             "The durable publication reservation path is unsafe (for example a reparse "
             "point created concurrently); refuse fail-closed and publish nothing.",
-            state="not_created",
+            state=_slot_absence_state(path),
         ) from error
     body = json.dumps(record, indent=2, sort_keys=True) + "\n"
     try:
         fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     except FileExistsError as error:
+        # An object DEFINITELY occupies the slot: the exclusive create lost to a competitor
+        # that already reserved this approval. Reporting this as `not_created` (retryable) was
+        # false - the competing reservation terminally consumed the approval, so retry
+        # guidance must never be emitted and the competitor is left untouched.
         raise ReservationError(
-            "A durable publication reservation already exists for this approval attempt; "
-            "refuse fail-closed (a concurrent build attempt owns it).",
-            state="not_created",
+            "A durable publication reservation already exists for this approval; the "
+            "approval is terminally consumed by the competing owner. Refuse fail-closed, "
+            "publish nothing and leave the competitor untouched.",
+            state=ReservationError.CONSUMED,
         ) from error
     except OSError as error:
+        # Any other create failure: the slot may or may not have been created. Re-check the
+        # exact path without following links before claiming anything is retryable.
         raise ReservationError(
             "The durable publication reservation could not be created; refuse fail-closed "
             "and publish nothing.",
-            state="not_created",
+            state=_slot_absence_state(path),
         ) from error
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
@@ -511,7 +695,7 @@ def write_reservation(path, record):
         raise ReservationError(
             "The durable publication reservation was created but could not be written or "
             "flushed durably; refuse fail-closed and publish nothing.",
-            state="uncertain",
+            state=ReservationError.UNCERTAIN,
         ) from error
     try:
         return _fsync_parent_directory(path.parent)
@@ -519,7 +703,7 @@ def write_reservation(path, record):
         raise ReservationError(
             "The durable publication reservation was written but its directory entry could "
             "not be made durable; refuse fail-closed and publish nothing.",
-            state="uncertain",
+            state=ReservationError.UNCERTAIN,
         ) from error
 
 
@@ -597,26 +781,41 @@ def survey_reservations(state_dir, approval_id, source_record_id, entries):
 # Subcommands
 # --------------------------------------------------------------------------- #
 def cmd_decision(args, decision):
+    """Record one controlled reviewer decision through the transactional authority store.
+
+    Three ordered, separately committed steps. A decision becomes AUTHORITATIVE only at the
+    end of step 3; until then it is durably recorded but grants nothing:
+
+      1. commit the PENDING decision row transactionally;
+      2. append the JSONL AUDIT event (audit evidence only, never authority);
+      3. commit the separate ACTIVATION row, only after step 2 returned confirmed success.
+
+    Every commit failure is resolved by closing the connection, REOPENING the database and
+    looking for the exact row - never by inferring the outcome from the exception, which
+    proves only that the client did not hear the answer.
+    """
     payload, desired, srid, fingerprint = resolve_source_row(
         args.input, args.decision_rows, args.row_number
     )
-    # Confirm the ledger is structurally intact BEFORE appending to it. Appending onto an
-    # unterminated torn record would splice the new decision into those bytes, turning one
+    # Confirm the audit ledger is structurally intact BEFORE appending to it. Appending onto
+    # an unterminated torn record would splice the new decision into those bytes, turning one
     # recoverable partial record into a single unrecoverable malformed line - a silent loss
-    # of audit evidence. Nothing is read out of the ledger here beyond that integrity check.
+    # of audit evidence. Nothing is read out of the ledger here for authority purposes.
     read_ledger(args.ledger)
+
     now = utc_now_iso()
-    entry = {
-        "event": "decision",
-        "recorded_at": now,
+    decision_id = "dec_" + uuid.uuid4().hex
+    record = {
+        "decision_id": decision_id,
+        "decision_type": decision,
         "reviewer_id": args.reviewer,
-        "decision": decision,
-        "source_record_id": srid,
-        "source_fingerprint": fingerprint,
-        "row_number_hint": args.row_number,
+        "recorded_at": now,
         "approval_id": None,
         "approved_at": None,
         "expires_at": None,
+        "source_record_id": srid,
+        "source_fingerprint": fingerprint,
+        "schema_version": decisions.SCHEMA_VERSION,
     }
     if decision == "approved":
         ttl_hours = args.ttl_hours if args.ttl_hours is not None else contract.DEFAULT_APPROVAL_TTL_HOURS
@@ -625,23 +824,182 @@ def cmd_decision(args, decision):
                 "Approval TTL must be positive and no longer than the contract default."
             )
         expires = datetime.now(timezone.utc) + timedelta(hours=ttl_hours)
-        entry["approval_id"] = "appr_" + uuid.uuid4().hex
-        entry["approved_at"] = now
-        entry["expires_at"] = expires.isoformat(timespec="seconds")
-    append_ledger(args.ledger, entry)
+        record["approval_id"] = "appr_" + uuid.uuid4().hex
+        record["approved_at"] = now
+        record["expires_at"] = expires.isoformat(timespec="seconds")
+    record["record_hash"] = decisions.decision_record_hash(record)
+
+    store = decisions.store_path_for(args.ledger)
+    common = {
+        "decision": decision,
+        "decision_id": decision_id,
+        "reviewer_id": args.reviewer,
+        "source_record_id": srid,
+        "source_fingerprint": fingerprint,
+        "approval_id": record["approval_id"],
+        "expires_at": record["expires_at"],
+    }
+
+    # ---- STEP 1: commit the PENDING decision transactionally ------------------------- #
+    # A reviewer decision command legitimately establishes the store on first use.
+    conn = decisions.open_store(store, create=True)
+    commit_state = decisions.CommitState.COMMITTED
+    try:
+        decisions.insert_pending_decision(conn, record)
+    except (sqlite3.Error, OSError):
+        commit_state = None
+    finally:
+        conn.close()
+    if commit_state is None:
+        commit_state, _row = decisions.recover_decision_commit(
+            store, decision_id, record["record_hash"]
+        )
+    if commit_state == decisions.CommitState.ABSENT:
+        # Nothing committed: no decision exists at all, so a clean retry is safe.
+        _print_summary(
+            dict(
+                common,
+                status="decision_not_recorded",
+                event="none",
+                decision_authority="none",
+                decision_activated=False,
+                decision_recorded=False,
+                audit_append="not_attempted",
+                approval_blocked=False,
+                do_not_retry=False,
+                recovery="resolve_decision_store_failure_then_retry",
+            )
+        )
+        return EXIT_DECISION_AUTHORITY_UNCERTAIN
+    if commit_state == decisions.CommitState.UNCERTAIN:
+        raise decisions.DecisionStoreError(
+            "The pending reviewer decision commit could not be resolved by reopening the "
+            "decision store; refuse fail-closed and require controlled recovery.",
+            reason="commit_state_uncertain",
+        )
+
+    sequence = _decision_sequence(store, decision_id)
+
+    # ---- STEP 2: append the JSONL AUDIT event ---------------------------------------- #
+    # Audit evidence only. A readable line here never activates the decision; activation is
+    # the separate committed row in step 3.
+    audit_entry = {
+        "event": "decision",
+        "recorded_at": now,
+        "reviewer_id": args.reviewer,
+        "decision": decision,
+        "source_record_id": srid,
+        "source_fingerprint": fingerprint,
+        "row_number_hint": args.row_number,
+        "approval_id": record["approval_id"],
+        "approved_at": record["approved_at"],
+        "expires_at": record["expires_at"],
+    }
+    try:
+        append_ledger(args.ledger, audit_entry)
+    except (OSError, contract.ContractError):
+        # The audit append did not return confirmed success. The pending decision is NOT
+        # activated, NOT deleted and NOT rewritten; the ledger is not truncated, replaced or
+        # repaired. Even a complete, readable line left behind by a flush/fsync failure
+        # leaves the decision pending and non-authoritative.
+        _print_summary(
+            dict(
+                common,
+                status="decision_audit_incomplete",
+                event="none",
+                decision_authority="pending",
+                decision_activated=False,
+                decision_recorded=True,
+                decision_sequence=sequence,
+                audit_append="unconfirmed",
+                approval_blocked=True,
+                do_not_retry=True,
+                fresh_approval_required=True,
+                controlled_recovery_required=True,
+                recovery="controlled_reconciliation_then_fresh_decision",
+            )
+        )
+        return EXIT_DECISION_AUTHORITY_UNCERTAIN
+
+    # ---- STEP 3: commit the ACTIVATION row ------------------------------------------- #
+    activated_at = utc_now_iso()
+    activation_hash = decisions.activation_record_hash(
+        decision_id, activated_at, record["record_hash"]
+    )
+    conn = decisions.open_store(store, create=False)
+    activation_state = decisions.CommitState.COMMITTED
+    try:
+        decisions.insert_activation(conn, decision_id, activated_at, activation_hash)
+    except (sqlite3.Error, OSError):
+        activation_state = None
+    finally:
+        conn.close()
+    if activation_state is None:
+        activation_state, _row = decisions.recover_activation_commit(
+            store, decision_id, activation_hash
+        )
+    if activation_state == decisions.CommitState.UNCERTAIN:
+        raise decisions.DecisionStoreError(
+            "The reviewer decision activation commit could not be resolved by reopening the "
+            "decision store; refuse fail-closed and require controlled recovery.",
+            reason="activation_state_uncertain",
+        )
+    if activation_state == decisions.CommitState.ABSENT:
+        # The audit line is durable but no activation committed, so the decision remains
+        # recorded-but-not-authoritative. It is never promoted implicitly.
+        _print_summary(
+            dict(
+                common,
+                status="decision_not_activated",
+                event="decision",
+                decision_authority="pending",
+                decision_activated=False,
+                decision_recorded=True,
+                decision_sequence=sequence,
+                audit_append="confirmed",
+                approval_blocked=True,
+                do_not_retry=True,
+                fresh_approval_required=True,
+                controlled_recovery_required=True,
+                recovery="controlled_reconciliation_then_fresh_decision",
+            )
+        )
+        return EXIT_DECISION_AUTHORITY_UNCERTAIN
+
+    # Ordinary success: pending row committed, audit append confirmed, activation committed
+    # (or transactionally recovered as committed by reopening the database).
     _print_summary(
-        {
-            "status": "ok",
-            "event": "decision",
-            "decision": decision,
-            "reviewer_id": args.reviewer,
-            "source_record_id": srid,
-            "source_fingerprint": fingerprint,
-            "approval_id": entry["approval_id"],
-            "expires_at": entry["expires_at"],
-        }
+        dict(
+            common,
+            status="ok",
+            event="decision",
+            decision_authority="activated",
+            decision_activated=True,
+            decision_recorded=True,
+            decision_sequence=sequence,
+            audit_append="confirmed",
+            decision_durability="transactional_commit_synchronous_full",
+        )
     )
     return 0
+
+
+def _decision_sequence(store, decision_id):
+    """The monotonic sequence assigned to a committed decision, read on a fresh connection.
+
+    A read failure here cannot change what was committed, so it degrades to ``None`` in the
+    report rather than turning a completed decision into a failure.
+    """
+    try:
+        conn = decisions.open_store(store, create=False)
+    except decisions.DecisionStoreError:
+        return None
+    try:
+        return decisions.decision_sequence(conn, decision_id)
+    except sqlite3.Error:
+        return None
+    finally:
+        conn.close()
 
 
 def cmd_build_package(args):
@@ -672,22 +1030,83 @@ def cmd_build_package(args):
         args.input, args.decision_rows, args.row_number
     )
     entries = read_ledger(args.ledger)
-    decision = latest_decision(entries, srid)
-    if decision is None or decision.get("decision") != "approved":
-        raise ApprovalError("No current approval exists for that source record.")
-    if decision.get("source_fingerprint") != fingerprint:
+
+    # ---- TRANSACTIONAL DECISION AUTHORITY GATE --------------------------------------- #
+    # Authority comes ONLY from a committed activation row in the decision store. A readable
+    # JSONL decision line - including a complete one left by a flush/fsync failure - grants
+    # nothing. A legacy ledger-only approval recorded before this store existed is therefore
+    # not authority either: a fresh reviewer decision is required (deliberate compatibility
+    # decision, documented in the runbook).
+    #
+    # `create=False`: build-package must never manufacture an empty store. A missing store
+    # means no transactional approval authority exists.
+    store = decisions.store_path_for(args.ledger)
+    try:
+        conn = decisions.open_store(store, create=False)
+    except decisions.DecisionStoreError as error:
+        if error.reason == "store_missing":
+            _print_summary(
+                {
+                    "status": "decision_store_missing",
+                    "event": "none",
+                    "publication": "not_attempted",
+                    "reservation": "not_attempted",
+                    "decision_authority": "none",
+                    "legacy_ledger_approval_accepted": False,
+                    "approval_blocked": True,
+                    "fresh_approval_required": True,
+                    "recovery": "fresh_reviewer_decision",
+                    "source_record_id": srid,
+                }
+            )
+            return EXIT_DECISION_NOT_AUTHORITATIVE
+        raise
+    try:
+        authority = decisions.resolve_authority(conn, srid)
+    finally:
+        conn.close()
+
+    if authority.state != decisions.AuthorityState.APPROVED:
+        # Every non-approved outcome refuses before any filesystem object is created or
+        # touched: no package, no temporary, no reservation, no ledger event.
+        pending = authority.state == decisions.AuthorityState.PENDING_NEWER
+        _print_summary(
+            {
+                "status": (
+                    "decision_pending_or_uncertain" if pending
+                    else "no_activated_decision"
+                    if authority.state == decisions.AuthorityState.NONE
+                    else "decision_not_approved"
+                ),
+                "event": "none",
+                "publication": "not_attempted",
+                "reservation": "not_attempted",
+                "decision_authority": authority.state,
+                "decision_activated": authority.activated_sequence is not None,
+                "newer_pending_decisions": len(authority.pending_sequences),
+                "legacy_ledger_approval_accepted": False,
+                "approval_blocked": True,
+                # A pending decision may have been an attempted hold or rejection, so it must
+                # never fall back to an older activated approval.
+                "do_not_retry": pending,
+                "controlled_recovery_required": pending,
+                "fresh_approval_required": True,
+                "recovery": "fresh_reviewer_decision",
+                "source_record_id": srid,
+            }
+        )
+        return EXIT_DECISION_NOT_AUTHORITATIVE
+
+    decision = authority.decision
+    if decision["source_fingerprint"] != fingerprint:
         raise ApprovalError(
             "The source data changed after approval (fingerprint mismatch); approval is invalid."
         )
-    expires_at = decision.get("expires_at")
-    if not expires_at or datetime.fromisoformat(expires_at) <= datetime.now(timezone.utc):
+    # `resolve_authority` has already proven this timestamp parses and the approval id is
+    # well-formed, so neither check can escape as an uncontrolled exception here.
+    if datetime.fromisoformat(decision["expires_at"]) <= datetime.now(timezone.utc):
         raise ApprovalError("The approval has expired; re-approval is required.")
-    approval_id = decision.get("approval_id")
-    if not (isinstance(approval_id, str) and contract.APPROVAL_ID_RE.fullmatch(approval_id)):
-        raise ApprovalError(
-            "The approval record carries no well-formed approval id, so no durable "
-            "publication reservation can bind to it; refuse fail-closed."
-        )
+    approval_id = decision["approval_id"]
 
     # ---- TERMINAL RESERVATION GATE ------------------------------------------------------ #
     # Any reservation object that exists for this approval terminally consumes it, whatever
@@ -716,7 +1135,7 @@ def cmd_build_package(args):
                 # A published-but-unclean prior attempt additionally leaves a stray temporary
                 # for the operator to remove by hand; its basename was reported by that run.
                 "manual_temp_cleanup_required": published_cleanup_incomplete_exists(
-                    entries, approval_id, srid
+                    entries, approval_id
                 ),
                 "recovery": "fresh_approval_or_controlled_recovery",
                 "source_record_id": srid,
@@ -728,13 +1147,13 @@ def cmd_build_package(args):
     # approval - i.e. legacy state recorded by a tool version that predates reservations.
     # The approval must stay single-use even then, and --rebuild no longer bypasses either
     # guard because it no longer exists as a build path at all.
-    if published_cleanup_incomplete_exists(entries, approval_id, srid):
+    if published_cleanup_incomplete_exists(entries, approval_id):
         raise ApprovalError(
             "A prior package for this approval was published but its temporary cleanup did "
             "not complete; this operation must not be retried as a new package build. "
             "Complete the manual temporary cleanup and start a fresh reviewer decision."
         )
-    if build_already_exists(entries, approval_id, srid):
+    if build_already_exists(entries, approval_id):
         raise ApprovalError(
             "A package was already built for that approval; refuse fail-closed. A further "
             "package requires a fresh reviewer decision, a new approval id and a fresh "
@@ -807,36 +1226,47 @@ def cmd_build_package(args):
         # Nothing was published (the reservation boundary is strictly before os.link), so no
         # final path was created and no competitor was touched.
         #
-        # This is the ONE failure class that can leave the approval retryable, and only in the
-        # `not_created` case: reservation creation demonstrably did not begin, so no
-        # reservation filesystem object exists and nothing was consumed. `uncertain` means an
-        # entry may exist, which is exactly the terminal condition - so it is never deleted,
-        # recreated or retried, and the terminal gate will block every later invocation.
-        uncertain = result.reservation_state == "uncertain"
+        # `not_created` is the ONLY retryable reservation outcome, and it is claimed solely
+        # when a non-following existence re-check positively proved the slot is empty.
+        #
+        # `consumed` means a competitor's reservation definitely occupies the slot, which
+        # terminally consumed this approval - it was previously mislabelled `not_created`, so
+        # this invocation emitted retry guidance for an approval that must never be retried.
+        # `uncertain` means an entry may exist, which is the same terminal condition. Neither
+        # is ever deleted, recreated or retried, and the terminal gate blocks every later
+        # invocation.
+        # Exit codes follow the states exactly: `consumed` is the documented
+        # terminally-consumed approval (exit 7); `uncertain` is a reservation created without
+        # confirmed durability (exit 5, still blocked); `not_created` is the sole retryable
+        # outcome (exit 5).
+        state = result.reservation_state
+        consumed = state == ReservationError.CONSUMED
+        blocked = state != ReservationError.NOT_CREATED
         _print_summary(
             {
-                "status": "reservation_incomplete",
+                "status": "approval_consumed" if consumed else "reservation_incomplete",
                 "event": "none",
                 "publication": "not_published",
-                "reservation": result.reservation_state,
+                "reservation": state,
                 "reservation_basename": reservation_basename,
                 "reservation_durability": "unconfirmed",
+                "competing_reservation_preserved": consumed,
                 "temp_cleanup": "failed" if result.temp_stale else "complete",
                 "stale_temp_basename": result.temp_basename if result.temp_stale else None,
                 "manual_cleanup_required": bool(result.temp_stale),
-                "approval_blocked": uncertain,
-                "do_not_retry": uncertain,
-                "fresh_approval_required": uncertain,
+                "approval_blocked": blocked,
+                "do_not_retry": blocked,
+                "fresh_approval_required": blocked,
                 "recovery": (
                     "fresh_approval_or_controlled_recovery"
-                    if uncertain
+                    if blocked
                     else "resolve_reservation_failure_then_retry"
                 ),
                 "source_record_id": srid,
                 "operation_id": package["operation_id"],
             }
         )
-        return EXIT_RESERVATION_INCOMPLETE
+        return EXIT_APPROVAL_CONSUMED if consumed else EXIT_RESERVATION_INCOMPLETE
 
     if result.state == _PublishState.RESERVED_NOT_PUBLISHED:
         # The reservation IS durable but publication did not complete, so no package was
@@ -1339,6 +1769,31 @@ def main(argv=None):
             }
         )
         return EXIT_LEDGER_INTEGRITY_UNCERTAIN
+    except decisions.DecisionStoreError as error:
+        # The transactional decision store could not be trusted, or a commit outcome could
+        # not be resolved by reopening the database. Explicit sanitised terminal state, never
+        # a traceback and never a generic error an operator might retry. Nothing was created,
+        # published, activated or repaired: the store and the ledger are left exactly as
+        # found, and only the shape classifier is reported - never a row, a member value, a
+        # credential or an absolute path.
+        _print_summary(
+            {
+                "status": "decision_store_integrity_uncertain",
+                "event": "none",
+                "publication": "not_attempted",
+                "reservation": "not_attempted",
+                "decision_store_integrity": error.reason,
+                "decision_authority": "uncertain",
+                "decision_store_modified": False,
+                "ledger_modified": False,
+                "approval_blocked": True,
+                "do_not_retry": True,
+                "controlled_recovery_required": True,
+                "fresh_approval_required": True,
+                "recovery": "controlled_decision_store_reconciliation_then_fresh_decision",
+            }
+        )
+        return EXIT_DECISION_AUTHORITY_UNCERTAIN
     except (ApprovalError, contract.ContractError, validator.FormContractError, OSError) as error:
         print(json.dumps({"status": "error", "error": str(error)}, indent=2, sort_keys=True))
         return 2

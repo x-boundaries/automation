@@ -2,10 +2,15 @@ import builtins
 import io
 import json
 import os
+import sqlite3
+import subprocess
 import sys
 import tempfile
+import textwrap
 import unittest
+import uuid
 from contextlib import redirect_stdout
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -17,6 +22,7 @@ for p in (str(SCRIPTS), str(Path(__file__).resolve().parent)):
 
 import member_create_uat_approval as approval  # noqa: E402
 import member_create_uat_contract as contract  # noqa: E402
+import member_create_uat_decision_store as decisions  # noqa: E402
 import _create_uat_fixtures as fx  # noqa: E402
 
 
@@ -28,7 +34,115 @@ def run(argv):
     return code, buf.getvalue()
 
 
-class ApprovalCliTests(unittest.TestCase):
+def iso(moment):
+    return moment.isoformat(timespec="seconds")
+
+
+class _Drop:
+    """Sentinel meaning "remove this field entirely" in an audit-record fixture override."""
+
+    def __repr__(self):
+        return "<drop>"
+
+
+_DROP = _Drop()
+
+
+class _DecisionStoreFixtureMixin:
+    """Helpers for building synthetic decision-store states.
+
+    Every helper goes through the store module's own real insert API, so the canonical record
+    hashes, CHECK constraints and append-only triggers apply exactly as they do in production.
+    History is never updated or deleted - it cannot be, the triggers forbid it - so a state
+    such as "an expired approval" is built by INSERTING a decision whose recorded expiry is
+    already in the past, which is what an aged approval really looks like.
+    """
+
+    def _store_path(self):
+        return decisions.store_path_for(self.ledger)
+
+    def _open_store(self, *, create=False):
+        return decisions.open_store(self._store_path(), create=create)
+
+    def _stored_decisions(self):
+        conn = self._open_store()
+        try:
+            return conn.execute(
+                "SELECT d.*, a.activation_sequence AS activation_sequence "
+                "FROM decision d LEFT JOIN decision_activation a "
+                "ON a.decision_id = d.decision_id ORDER BY d.sequence"
+            ).fetchall()
+        finally:
+            conn.close()
+
+    def _activation_count(self):
+        conn = self._open_store()
+        try:
+            return conn.execute("SELECT COUNT(*) FROM decision_activation").fetchone()[0]
+        finally:
+            conn.close()
+
+    def _record(self, decision_type, *, srid, fingerprint, reviewer="digital",
+                recorded_at=None, expires_at=None, approval_id=None, decision_id=None):
+        """A canonical sanitised decision record ready to insert."""
+        now = recorded_at or iso(datetime.now(timezone.utc))
+        record = {
+            "decision_id": decision_id or ("dec_" + uuid.uuid4().hex),
+            "decision_type": decision_type,
+            "reviewer_id": reviewer,
+            "recorded_at": now,
+            "approval_id": None,
+            "approved_at": None,
+            "expires_at": None,
+            "source_record_id": srid,
+            "source_fingerprint": fingerprint,
+            "schema_version": decisions.SCHEMA_VERSION,
+        }
+        if decision_type == "approved":
+            record["approval_id"] = approval_id or ("appr_" + uuid.uuid4().hex)
+            record["approved_at"] = now
+            record["expires_at"] = expires_at or iso(
+                datetime.now(timezone.utc) + timedelta(hours=1)
+            )
+        record["record_hash"] = decisions.decision_record_hash(record)
+        return record
+
+    def _insert_pending(self, record, *, create=True):
+        conn = self._open_store(create=create)
+        try:
+            decisions.insert_pending_decision(conn, record)
+        finally:
+            conn.close()
+        return record
+
+    def _activate(self, record, *, activated_at=None, activation_hash=None):
+        moment = activated_at or iso(datetime.now(timezone.utc))
+        conn = self._open_store()
+        try:
+            decisions.insert_activation(
+                conn,
+                record["decision_id"],
+                moment,
+                activation_hash or decisions.activation_record_hash(
+                    record["decision_id"], moment, record["record_hash"]
+                ),
+            )
+        finally:
+            conn.close()
+        return record
+
+    def _insert_activated(self, decision_type, **kw):
+        return self._activate(self._insert_pending(self._record(decision_type, **kw)))
+
+    def _fixture_identity(self):
+        """The (source_record_id, source_fingerprint) the synthetic form fixture resolves to."""
+        _payload, _desired, srid, fingerprint = approval.resolve_source_row(
+            self.form, self.rows, 2
+        )
+        return srid, fingerprint
+
+
+class ApprovalCliTests(_DecisionStoreFixtureMixin, unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
         self.form = self.tmp / "form.csv"
@@ -73,14 +187,20 @@ class ApprovalCliTests(unittest.TestCase):
                        "--decision-rows", str(self.rows), "--row-number", "2", "--ledger", str(self.ledger)])
         self.assertEqual(code, 0)
         code, out = self._build()
-        self.assertEqual(code, 2)
-        self.assertIn("No current approval", out)
+        self.assertEqual(code, approval.EXIT_DECISION_NOT_AUTHORITATIVE, out)
+        summary = json.loads(out)
+        self.assertEqual(summary["status"], "decision_not_approved")
+        self.assertEqual(summary["decision_authority"], decisions.AuthorityState.REJECTED)
+        self.assertIs(summary["fresh_approval_required"], True)
 
     def test_hold_blocks_build(self):
         run(["hold", "--reviewer", "digital", "--input", str(self.form),
              "--decision-rows", str(self.rows), "--row-number", "2", "--ledger", str(self.ledger)])
         code, out = self._build()
-        self.assertEqual(code, 2)
+        self.assertEqual(code, approval.EXIT_DECISION_NOT_AUTHORITATIVE, out)
+        summary = json.loads(out)
+        self.assertEqual(summary["status"], "decision_not_approved")
+        self.assertEqual(summary["decision_authority"], decisions.AuthorityState.HOLD)
 
     def test_non_ready_decision_state_refused(self):
         fx.write_decision_rows(self.rows, decision="EXISTING_MEMBER_REVIEW")
@@ -97,14 +217,42 @@ class ApprovalCliTests(unittest.TestCase):
         self.assertIn("fingerprint mismatch", out)
 
     def test_expired_approval_refused(self):
-        # Approve with a tiny TTL, then hand-edit the ledger expiry into the past.
-        self._approve()
-        entries = [json.loads(line) for line in self.ledger.read_text(encoding="utf-8").splitlines() if line.strip()]
-        entries[-1]["expires_at"] = "2000-01-01T00:00:00+00:00"
-        self.ledger.write_text("\n".join(json.dumps(e) for e in entries) + "\n", encoding="utf-8")
+        # Expiry is now read from the transactional store, so hand-editing the JSONL audit
+        # line cannot change it. An aged approval is modelled by inserting an ACTIVATED
+        # approval whose recorded expiry is already in the past - the store is append-only,
+        # so history is never rewritten to produce this state.
+        srid, fingerprint = self._fixture_identity()
+        self._insert_activated(
+            "approved", srid=srid, fingerprint=fingerprint,
+            recorded_at="2000-01-01T00:00:00+00:00",
+            expires_at="2000-01-04T00:00:00+00:00",
+        )
         code, out = self._build()
-        self.assertEqual(code, 2)
+        self.assertEqual(code, 2, out)
         self.assertIn("expired", out)
+        self.assertFalse(self.package.exists())
+
+    def test_hand_edited_audit_expiry_cannot_extend_a_stored_approval(self):
+        # The reverse direction: the JSONL audit record is not authority, so editing its
+        # expiry far into the future cannot resurrect an approval the store records as expired.
+        srid, fingerprint = self._fixture_identity()
+        self._insert_activated(
+            "approved", srid=srid, fingerprint=fingerprint,
+            recorded_at="2000-01-01T00:00:00+00:00",
+            expires_at="2000-01-04T00:00:00+00:00",
+        )
+        approval.append_ledger(self.ledger, {
+            "event": "decision", "recorded_at": "2000-01-01T00:00:00+00:00",
+            "reviewer_id": "digital", "decision": "approved", "source_record_id": srid,
+            "source_fingerprint": fingerprint, "row_number_hint": 2,
+            "approval_id": "appr_" + ("1" * 32),
+            "approved_at": "2000-01-01T00:00:00+00:00",
+            "expires_at": "2099-01-01T00:00:00+00:00",
+        })
+        code, out = self._build()
+        self.assertEqual(code, 2, out)
+        self.assertIn("expired", out)
+        self.assertFalse(self.package.exists())
 
     def test_second_build_after_success_is_terminally_refused(self):
         # Amendment 5: a completed build leaves a reservation, and a reservation terminally
@@ -276,8 +424,32 @@ class ApprovalCliTests(unittest.TestCase):
         }
         self.ledger.write_text(json.dumps(entry, sort_keys=True) + "\n", encoding="utf-8")
         code, out = self._build()
-        self.assertEqual(code, 2, out)
-        self.assertIn("No current approval", out)
+        self.assertEqual(code, approval.EXIT_DECISION_NOT_AUTHORITATIVE, out)
+        self.assertEqual(json.loads(out)["status"], "decision_store_missing")
+
+    def test_legacy_jsonl_only_approval_is_not_authority(self):
+        # DELIBERATE COMPATIBILITY DECISION (Amendment 6). A perfectly well-formed, current
+        # JSONL approval line for the CORRECT source record - exactly what a pre-Amendment-6
+        # tool wrote - grants nothing, because no transactional store and no activation row
+        # exist. After merge a fresh reviewer decision is required before a v2 package.
+        srid, fingerprint = self._fixture_identity()
+        approval.append_ledger(self.ledger, {
+            "event": "decision", "recorded_at": iso(datetime.now(timezone.utc)),
+            "reviewer_id": "digital", "decision": "approved", "source_record_id": srid,
+            "source_fingerprint": fingerprint, "row_number_hint": 2,
+            "approval_id": "appr_" + ("2" * 32),
+            "approved_at": iso(datetime.now(timezone.utc)),
+            "expires_at": iso(datetime.now(timezone.utc) + timedelta(hours=48)),
+        })
+        code, out = self._build()
+        self.assertEqual(code, approval.EXIT_DECISION_NOT_AUTHORITATIVE, out)
+        summary = json.loads(out)
+        self.assertEqual(summary["status"], "decision_store_missing")
+        self.assertIs(summary["legacy_ledger_approval_accepted"], False)
+        self.assertIs(summary["fresh_approval_required"], True)
+        # Nothing was created: build-package never manufactures an empty decision store.
+        self.assertFalse(self._store_path().exists())
+        self.assertFalse(self.package.exists())
 
 
 class AtomicPublicationTests(unittest.TestCase):
@@ -798,7 +970,7 @@ class _PartialLedgerAppendFailure(_RealBytesAppendFailure):
     STAGES = ("write", "flush")
 
 
-class _CreateUatBuildHarness(unittest.TestCase):
+class _CreateUatBuildHarness(_DecisionStoreFixtureMixin, unittest.TestCase):
     """Disposable synthetic fixture plus the shared build/inspect helpers.
 
     Every derived suite works only on a throwaway temporary directory of synthetic fixtures.
@@ -948,24 +1120,90 @@ class DurableReservationTests(_CreateUatBuildHarness):
         self.assertEqual(self._events_of("build"), [])
         self.assertEqual(self._stray_temps(), [])
 
-    def test_reservation_lost_to_concurrent_owner_publishes_nothing(self):
+    def test_reservation_lost_to_concurrent_owner_consumes_the_approval(self):
         # A competing attempt wins the slot inside the race window (between slot survey and
         # exclusive create), so O_EXCL fails closed and no package is published.
+        #
+        # Amendment 6 corrects the classification: FileExistsError was reported as
+        # `not_created` (retryable), which was false - the competing reservation DEFINITELY
+        # exists and terminally consumed the approval, so retry guidance must never be given.
         self._approve()
         slot = self._slot()
+        competitor = '{"competing-owner": true}\n'
         real_chmod = os.chmod
 
         def racing_chmod(path, mode, *args, **kwargs):
             if not slot.exists():
-                slot.write_text("{}\n", encoding="utf-8")  # concurrent owner takes the slot
+                slot.write_text(competitor, encoding="utf-8")  # concurrent owner takes the slot
             return real_chmod(path, mode, *args, **kwargs)
 
         with mock.patch("os.chmod", racing_chmod):
             code, out = self._build()
-        self.assertEqual(code, approval.EXIT_RESERVATION_INCOMPLETE, out)
-        self.assertEqual(json.loads(out)["reservation"], "not_created")
+        self.assertEqual(code, approval.EXIT_APPROVAL_CONSUMED, out)
+        summary = json.loads(out)
+        self.assertEqual(summary["status"], "approval_consumed")
+        self.assertEqual(summary["reservation"], approval.ReservationError.CONSUMED)
+        self.assertIs(summary["approval_blocked"], True)
+        self.assertIs(summary["do_not_retry"], True)
+        self.assertIs(summary["fresh_approval_required"], True)
+        self.assertIs(summary["competing_reservation_preserved"], True)
+        # No retry guidance of any kind is emitted for a consumed approval.
+        self.assertNotIn("then_retry", summary["recovery"])
+        self.assertEqual(summary["recovery"], "fresh_approval_or_controlled_recovery")
         self.assertFalse(self.package.exists(), "the loser of the reservation race publishes nothing")
         self.assertEqual(self._events_of("build"), [])
+        # The competitor's reservation is byte-for-byte untouched, and no extra slot exists.
+        self.assertEqual(slot.read_text(encoding="utf-8"), competitor)
+        self.assertEqual(self._reservations(), [slot.name])
+
+    def test_reservation_oserror_with_existing_slot_consumes_the_approval(self):
+        # A non-FileExists create failure where a non-following existence check PROVES an
+        # object occupies the slot must also be classified consumed, never retryable.
+        self._approve()
+        slot = self._slot()
+        competitor = '{"pre-existing-owner": true}\n'
+        slot.write_text(competitor, encoding="utf-8")
+        real_os_open = os.open
+
+        def guarded(path, flags, *args, **kwargs):
+            if str(path).endswith(approval.RESERVATION_SUFFIX):
+                raise OSError("simulated non-FileExists reservation create failure")
+            return real_os_open(path, flags, *args, **kwargs)
+
+        # The terminal gate would normally catch the pre-existing slot first, so the survey is
+        # neutralised to drive the writer's own create-failure classification directly.
+        with mock.patch.object(approval, "survey_reservations", lambda *a, **k: []), \
+                mock.patch("os.open", guarded):
+            code, out = self._build()
+        self.assertEqual(code, approval.EXIT_APPROVAL_CONSUMED, out)
+        summary = json.loads(out)
+        self.assertEqual(summary["reservation"], approval.ReservationError.CONSUMED)
+        self.assertIs(summary["do_not_retry"], True)
+        self.assertIs(summary["fresh_approval_required"], True)
+        self.assertFalse(self.package.exists())
+        self.assertEqual(slot.read_text(encoding="utf-8"), competitor)
+
+    def test_reservation_oserror_with_absent_slot_stays_retryable(self):
+        # The mirror case: when lexists positively proves the slot is empty, `not_created`
+        # remains correct and the approval stays retryable.
+        self._approve()
+        real_os_open = os.open
+
+        def guarded(path, flags, *args, **kwargs):
+            if str(path).endswith(approval.RESERVATION_SUFFIX):
+                raise OSError("simulated reservation create failure with no slot created")
+            return real_os_open(path, flags, *args, **kwargs)
+
+        with mock.patch("os.open", guarded):
+            code, out = self._build()
+        self.assertEqual(code, approval.EXIT_RESERVATION_INCOMPLETE, out)
+        summary = json.loads(out)
+        self.assertEqual(summary["status"], "reservation_incomplete")
+        self.assertEqual(summary["reservation"], approval.ReservationError.NOT_CREATED)
+        self.assertIs(summary["approval_blocked"], False)
+        self.assertIs(summary["do_not_retry"], False)
+        self.assertEqual(summary["recovery"], "resolve_reservation_failure_then_retry")
+        self.assertEqual(self._reservations(), [])
 
     def test_reservation_write_failure_is_uncertain_and_publishes_nothing(self):
         self._approve()
@@ -1649,12 +1887,13 @@ class LedgerIntegrityTests(_CreateUatBuildHarness):
         self.assertEqual(self.ledger.read_bytes(), before, "the ledger is left exactly as found")
 
     def test_missing_ledger_is_legitimately_empty_not_an_integrity_failure(self):
-        # The absence of a ledger is not a defect; it simply carries no decision.
+        # The absence of an audit ledger is not a defect; it simply carries no audit records.
+        # The build is refused by the decision-authority gate instead, because no store exists.
         self.assertFalse(self.ledger.exists())
         self.assertEqual(approval.read_ledger(self.ledger), [])
         code, out = self._build()
-        self.assertEqual(code, 2, out)
-        self.assertIn("No current approval", out)
+        self.assertEqual(code, approval.EXIT_DECISION_NOT_AUTHORITATIVE, out)
+        self.assertEqual(json.loads(out)["status"], "decision_store_missing")
 
 
 class TerminalReservationContractTests(_CreateUatBuildHarness):
@@ -1931,6 +2170,956 @@ class TerminalReservationContractTests(_CreateUatBuildHarness):
         for leaked in ("90000001", "6590000001", "Synthetic Alpha",
                        "synthetic.alpha@example.invalid", "2000-01-01", "AC2_PROBE",
                        str(self.tmp), "HISTORICAL-V1-EVIDENCE", "LEDGER-CONTENT-SENTINEL"):
+            self.assertNotIn(leaked, combined, f"the output must not contain {leaked!r}")
+
+
+class PendingDecisionAuthorityTests(_CreateUatBuildHarness):
+    """Amendment 6 P1: a COMPLETE, READABLE JSONL approval line is not authority.
+
+    ``append_ledger`` writes the whole line before ``flush()`` and ``os.fsync()`` return, so a
+    real persistence failure can leave a perfectly readable ``approved`` line behind even
+    though the command reported failure. Authority now requires a committed ACTIVATION row in
+    the transactional store, which that line can never supply.
+
+    Each test drives two invocations: the decision command is interrupted at a real
+    persistence stage with its bytes allowed to land, then a genuinely fresh build invocation
+    reads only what the first process left behind.
+    """
+
+    def _decide(self, decision, extra=None):
+        argv = [decision, "--reviewer", "digital", "--input", str(self.form),
+                "--decision-rows", str(self.rows), "--row-number", "2",
+                "--ledger", str(self.ledger)]
+        return self._run(argv + (extra or []))
+
+    def _decide_with_visible_audit_failure(self, decision, stage):
+        """Step 1 commits the pending decision; step 2 lands the complete real audit line and
+        then fails at the real flush/fsync stage; step 3 never runs."""
+        with _VisibleLedgerAppendFailure(self.ledger, stage):
+            code, out = self._decide(decision)
+        self.assertEqual(code, approval.EXIT_DECISION_AUTHORITY_UNCERTAIN, out)
+        summary = json.loads(out)
+        self.assertEqual(summary["status"], "decision_audit_incomplete")
+        self.assertEqual(summary["decision_authority"], "pending")
+        self.assertIs(summary["decision_activated"], False)
+        self.assertIs(summary["decision_recorded"], True)
+        self.assertIs(summary["approval_blocked"], True)
+        self.assertIs(summary["do_not_retry"], True)
+        self.assertEqual(summary["audit_append"], "unconfirmed")
+
+        # The COMPLETE audit line really landed and is readable, exactly as a real flush/fsync
+        # failure leaves it - this is the state that must NOT confer authority.
+        audit = [e for e in self._entries() if e.get("event") == "decision"]
+        self.assertTrue(audit, "the complete audit line must be present and readable")
+        expected = {"approve": "approved", "reject": "rejected", "hold": "hold"}[decision]
+        self.assertEqual(audit[-1]["decision"], expected)
+        self.assertTrue(self.ledger.read_text(encoding="utf-8").endswith("\n"))
+
+        # The pending decision committed, and NO activation row exists.
+        rows = self._stored_decisions()
+        self.assertEqual(rows[-1]["decision_id"], summary["decision_id"])
+        self.assertIsNone(rows[-1]["activation_sequence"], "no activation row may exist")
+        return summary
+
+    def _assert_build_refused_as_pending(self, *, expected_activated):
+        created_temps = []
+        real_mkstemp = tempfile.mkstemp
+
+        def spy_mkstemp(*args, **kwargs):
+            fd, name = real_mkstemp(*args, **kwargs)
+            created_temps.append(name)
+            return fd, name
+
+        with mock.patch("tempfile.mkstemp", spy_mkstemp):
+            code, out = self._build(extra=self._fresh_out("pending_block.json"))
+        self.assertEqual(code, approval.EXIT_DECISION_NOT_AUTHORITATIVE, out)
+        summary = json.loads(out)
+        self.assertEqual(summary["status"], "decision_pending_or_uncertain")
+        self.assertEqual(summary["decision_authority"], decisions.AuthorityState.PENDING_NEWER)
+        self.assertGreaterEqual(summary["newer_pending_decisions"], 1)
+        self.assertIs(summary["legacy_ledger_approval_accepted"], False)
+        self.assertIs(summary["approval_blocked"], True)
+        self.assertIs(summary["do_not_retry"], True)
+        self.assertIs(summary["decision_activated"], expected_activated)
+        # Nothing was created at all.
+        self.assertEqual(created_temps, [], "no temporary package may be created")
+        self.assertFalse((self.tmp / "pending_block.json").exists())
+        self.assertEqual(self._reservations(), [])
+        self.assertEqual(self._stray_temps(), [])
+        return summary
+
+    # ---- A: visible-but-unconfirmed approval audit line ---- #
+    def test_visible_approval_audit_line_after_flush_failure_is_not_authority(self):
+        self._decide_with_visible_audit_failure("approve", "flush")
+        self._assert_build_refused_as_pending(expected_activated=False)
+
+    def test_visible_approval_audit_line_after_fsync_failure_is_not_authority(self):
+        self._decide_with_visible_audit_failure("approve", "fsync")
+        self._assert_build_refused_as_pending(expected_activated=False)
+
+    # ---- A (ordering): a newer PENDING hold/reject never falls back to an older approval ---- #
+    def test_pending_hold_after_activated_approval_blocks_the_build(self):
+        self.assertEqual(self._approve()[0], 0, "the first approval activates normally")
+        self._decide_with_visible_audit_failure("hold", "fsync")
+        summary = self._assert_build_refused_as_pending(expected_activated=True)
+        # The older approval IS activated, and is still not used.
+        self.assertIsNotNone(summary["decision_authority"])
+
+    def test_pending_reject_after_activated_approval_blocks_the_build(self):
+        self.assertEqual(self._approve()[0], 0)
+        self._decide_with_visible_audit_failure("reject", "flush")
+        self._assert_build_refused_as_pending(expected_activated=True)
+
+    # ---- B: partial decision-audit append ---- #
+    def _decide_with_partial_audit_append(self, decision, stage):
+        with _PartialLedgerAppendFailure(self.ledger, stage):
+            code, out = self._decide(decision)
+        self.assertEqual(code, approval.EXIT_DECISION_AUTHORITY_UNCERTAIN, out)
+        self.assertEqual(json.loads(out)["status"], "decision_audit_incomplete")
+        raw = self.ledger.read_text(encoding="utf-8")
+        self.assertFalse(raw.endswith("\n"), "a torn append leaves an unterminated tail")
+        rows = self._stored_decisions()
+        self.assertIsNone(rows[-1]["activation_sequence"], "no activation row may exist")
+        return raw
+
+    def _assert_partial_audit_blocks_everything(self, raw):
+        store_bytes = self._store_path().read_bytes()
+        created_temps = []
+        real_mkstemp = tempfile.mkstemp
+
+        def spy_mkstemp(*args, **kwargs):
+            fd, name = real_mkstemp(*args, **kwargs)
+            created_temps.append(name)
+            return fd, name
+
+        with mock.patch("tempfile.mkstemp", spy_mkstemp):
+            code, out = self._build(extra=self._fresh_out("torn_block.json"))
+        summary = self._assert_ledger_integrity_uncertain(code, out)
+        self.assertNotIn("Traceback", out)
+        # Nothing retried, repaired, created or mutated.
+        self.assertEqual(created_temps, [])
+        self.assertFalse((self.tmp / "torn_block.json").exists())
+        self.assertEqual(self._reservations(), [])
+        self.assertEqual(self.ledger.read_text(encoding="utf-8"), raw,
+                         "the partial bytes remain exactly as found")
+        self.assertEqual(self._store_path().read_bytes(), store_bytes,
+                         "the decision store is not mutated")
+        # No raw ledger content reaches the output.
+        self.assertNotIn("digital", out)
+        self.assertNotIn("srcrec_", out)
+        return summary
+
+    def test_partial_approval_audit_write_failure_blocks_fail_closed(self):
+        raw = self._decide_with_partial_audit_append("approve", "write")
+        self._assert_partial_audit_blocks_everything(raw)
+
+    def test_partial_approval_audit_flush_failure_blocks_fail_closed(self):
+        raw = self._decide_with_partial_audit_append("approve", "flush")
+        self._assert_partial_audit_blocks_everything(raw)
+
+
+class DecisionTransactionRecoveryTests(_CreateUatBuildHarness):
+    """Amendment 6 section C: every commit failure is resolved by REOPENING the database and
+    looking for the exact row, never by inferring the outcome from the exception.
+
+    ``_commit`` is the seam, so a failure can be forced before the commit (nothing committed)
+    or immediately AFTER a commit that really succeeded - the case that makes reopen-and-look
+    mandatory. Recovery assertions always use a freshly opened connection.
+    """
+
+    def _approve_cli(self):
+        return self._run(["approve", "--reviewer", "digital", "--input", str(self.form),
+                          "--decision-rows", str(self.rows), "--row-number", "2",
+                          "--ledger", str(self.ledger)])
+
+    def _commit_after_n(self, failures_after):
+        """Return a ``_commit`` replacement that really commits, then raises, on call N."""
+        real_commit = decisions._commit
+        calls = {"n": 0}
+
+        def wrapper(conn):
+            calls["n"] += 1
+            if calls["n"] == failures_after:
+                real_commit(conn)          # the transaction genuinely commits ...
+                raise sqlite3.OperationalError("simulated failure after a successful commit")
+            return real_commit(conn)
+
+        return wrapper, calls
+
+    def _commit_before_n(self, fail_on):
+        """Return a ``_commit`` replacement that raises WITHOUT committing on call N."""
+        real_commit = decisions._commit
+        calls = {"n": 0}
+
+        def wrapper(conn):
+            calls["n"] += 1
+            if calls["n"] == fail_on:
+                raise sqlite3.OperationalError("simulated failure before commit")
+            return real_commit(conn)
+
+        return wrapper, calls
+
+    # ---- pending-decision commit ---- #
+    def test_pending_commit_failure_before_commit_leaves_no_row(self):
+        # Commit call 1 is the schema creation; call 2 is the pending decision.
+        wrapper, _calls = self._commit_before_n(2)
+        with mock.patch.object(decisions, "_commit", wrapper):
+            code, out = self._approve_cli()
+        self.assertEqual(code, approval.EXIT_DECISION_AUTHORITY_UNCERTAIN, out)
+        summary = json.loads(out)
+        self.assertEqual(summary["status"], "decision_not_recorded")
+        self.assertIs(summary["decision_recorded"], False)
+        self.assertIs(summary["approval_blocked"], False, "a clean retry is safe")
+        self.assertIs(summary["do_not_retry"], False)
+        self.assertEqual(summary["audit_append"], "not_attempted")
+        # A FRESH connection proves no decision row and no audit line exist.
+        self.assertEqual(self._stored_decisions(), [])
+        self.assertEqual([e for e in self._entries() if e.get("event") == "decision"], [])
+
+    def test_pending_commit_succeeds_then_raises_is_recovered_as_committed(self):
+        wrapper, _calls = self._commit_after_n(2)
+        with mock.patch.object(decisions, "_commit", wrapper):
+            code, out = self._approve_cli()
+        # The exception said "failed", but reopening found the exact row, so the decision is
+        # correctly treated as recorded and the state machine continues to activation.
+        self.assertEqual(code, 0, out)
+        summary = json.loads(out)
+        self.assertEqual(summary["status"], "ok")
+        self.assertIs(summary["decision_recorded"], True)
+        self.assertIs(summary["decision_activated"], True)
+        rows = self._stored_decisions()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["decision_id"], summary["decision_id"])
+        self.assertIsNotNone(rows[0]["activation_sequence"])
+
+    def test_pending_commit_recovery_that_cannot_read_fails_closed(self):
+        wrapper, _calls = self._commit_after_n(2)
+        with mock.patch.object(decisions, "_commit", wrapper), \
+                mock.patch.object(decisions, "fetch_decision",
+                                  side_effect=sqlite3.DatabaseError("simulated unreadable store")):
+            code, out = self._approve_cli()
+        self.assertEqual(code, approval.EXIT_DECISION_AUTHORITY_UNCERTAIN, out)
+        summary = json.loads(out)
+        self.assertEqual(summary["status"], "decision_store_integrity_uncertain")
+        self.assertEqual(summary["decision_store_integrity"], "commit_state_uncertain")
+        self.assertIs(summary["controlled_recovery_required"], True)
+        self.assertNotIn("Traceback", out)
+
+    def test_pending_commit_recovery_reopens_rather_than_trusting_the_exception(self):
+        # Proof that recovery genuinely REOPENS: the recovery connection is counted.
+        wrapper, _calls = self._commit_after_n(2)
+        opens = {"n": 0}
+        real_connect = decisions._connect
+
+        def counting_connect(path, *, create):
+            opens["n"] += 1
+            return real_connect(path, create=create)
+
+        with mock.patch.object(decisions, "_commit", wrapper), \
+                mock.patch.object(decisions, "_connect", counting_connect):
+            code, out = self._approve_cli()
+        self.assertEqual(code, 0, out)
+        self.assertGreaterEqual(opens["n"], 2, "the store is reopened for recovery")
+
+    # ---- activation commit ---- #
+    def test_activation_commit_succeeds_then_raises_is_recovered_as_committed(self):
+        # Commit calls: 1 schema, 2 pending decision, 3 activation.
+        wrapper, _calls = self._commit_after_n(3)
+        with mock.patch.object(decisions, "_commit", wrapper):
+            code, out = self._approve_cli()
+        self.assertEqual(code, 0, out)
+        summary = json.loads(out)
+        self.assertIs(summary["decision_activated"], True)
+        self.assertEqual(summary["decision_authority"], "activated")
+        self.assertEqual(self._activation_count(), 1)
+        # The recovered activation really is authority: a build now proceeds.
+        self.assertEqual(self._build()[0], 0)
+
+    def test_activation_absent_after_exception_leaves_the_decision_pending(self):
+        wrapper, _calls = self._commit_before_n(3)
+        with mock.patch.object(decisions, "_commit", wrapper):
+            code, out = self._approve_cli()
+        self.assertEqual(code, approval.EXIT_DECISION_AUTHORITY_UNCERTAIN, out)
+        summary = json.loads(out)
+        self.assertEqual(summary["status"], "decision_not_activated")
+        self.assertEqual(summary["decision_authority"], "pending")
+        self.assertIs(summary["decision_activated"], False)
+        self.assertIs(summary["approval_blocked"], True)
+        self.assertIs(summary["do_not_retry"], True)
+        self.assertEqual(summary["audit_append"], "confirmed")
+        # Fresh connection: the decision is recorded, unactivated, and grants nothing.
+        self.assertEqual(self._activation_count(), 0)
+        code, out = self._build()
+        self.assertEqual(code, approval.EXIT_DECISION_NOT_AUTHORITATIVE, out)
+        self.assertEqual(json.loads(out)["status"], "decision_pending_or_uncertain")
+
+    def test_activation_state_unreadable_fails_closed(self):
+        wrapper, _calls = self._commit_after_n(3)
+        with mock.patch.object(decisions, "_commit", wrapper), \
+                mock.patch.object(decisions, "fetch_activation",
+                                  side_effect=sqlite3.DatabaseError("simulated unreadable store")):
+            code, out = self._approve_cli()
+        self.assertEqual(code, approval.EXIT_DECISION_AUTHORITY_UNCERTAIN, out)
+        summary = json.loads(out)
+        self.assertEqual(summary["status"], "decision_store_integrity_uncertain")
+        self.assertEqual(summary["decision_store_integrity"], "activation_state_uncertain")
+        self.assertNotIn("Traceback", out)
+
+    def test_a_write_lock_held_by_another_connection_fails_closed_without_retrying(self):
+        # A concurrent writer holding the write lock past the bounded busy timeout must fail
+        # closed after exactly ONE attempt - never an automatic retry loop.
+        self.assertEqual(self._approve_cli()[0], 0)   # establish the store
+        blocker = decisions.open_store(self._store_path(), create=False)
+        attempts = {"n": 0}
+        real_insert = decisions.insert_pending_decision
+
+        def counting_insert(conn, record):
+            attempts["n"] += 1
+            return real_insert(conn, record)
+
+        try:
+            blocker.execute("BEGIN IMMEDIATE")
+            blocker.execute(
+                "INSERT INTO schema_meta (key, value) VALUES ('lock_probe', 'held')"
+            )
+            with mock.patch.object(decisions, "BUSY_TIMEOUT_MS", 200), \
+                    mock.patch.object(decisions, "insert_pending_decision", counting_insert):
+                code, out = self._approve_cli()
+        finally:
+            decisions._rollback_quietly(blocker)
+            blocker.close()
+        self.assertEqual(code, approval.EXIT_DECISION_AUTHORITY_UNCERTAIN, out)
+        self.assertEqual(json.loads(out)["status"], "decision_not_recorded")
+        self.assertEqual(attempts["n"], 1, "exactly one attempt: no automatic retry loop")
+        self.assertEqual(len(self._stored_decisions()), 1, "only the first decision exists")
+
+
+class DecisionOrderingTests(_CreateUatBuildHarness):
+    """Amendment 6 section D: the newest ACTIVATED decision is authoritative, and a newer
+    committed-but-unactivated decision blocks rather than falling back to an older approval."""
+
+    def _identity(self):
+        return self._fixture_identity()
+
+    def test_activated_approval_then_activated_hold_refuses(self):
+        srid, fp = self._identity()
+        self._insert_activated("approved", srid=srid, fingerprint=fp)
+        self._insert_activated("hold", srid=srid, fingerprint=fp)
+        code, out = self._build()
+        self.assertEqual(code, approval.EXIT_DECISION_NOT_AUTHORITATIVE, out)
+        summary = json.loads(out)
+        self.assertEqual(summary["status"], "decision_not_approved")
+        self.assertEqual(summary["decision_authority"], decisions.AuthorityState.HOLD)
+        self.assertFalse(self.package.exists())
+
+    def test_activated_approval_then_activated_reject_refuses(self):
+        srid, fp = self._identity()
+        self._insert_activated("approved", srid=srid, fingerprint=fp)
+        self._insert_activated("rejected", srid=srid, fingerprint=fp)
+        code, out = self._build()
+        self.assertEqual(code, approval.EXIT_DECISION_NOT_AUTHORITATIVE, out)
+        self.assertEqual(json.loads(out)["decision_authority"],
+                         decisions.AuthorityState.REJECTED)
+
+    def test_activated_approval_then_pending_hold_refuses(self):
+        srid, fp = self._identity()
+        self._insert_activated("approved", srid=srid, fingerprint=fp)
+        self._insert_pending(self._record("hold", srid=srid, fingerprint=fp))
+        code, out = self._build()
+        self.assertEqual(code, approval.EXIT_DECISION_NOT_AUTHORITATIVE, out)
+        summary = json.loads(out)
+        self.assertEqual(summary["status"], "decision_pending_or_uncertain")
+        self.assertEqual(summary["newer_pending_decisions"], 1)
+        self.assertIs(summary["decision_activated"], True, "an older activated approval exists")
+        self.assertFalse(self.package.exists(), "the older approval must not be used")
+
+    def test_activated_approval_then_pending_reject_refuses(self):
+        srid, fp = self._identity()
+        self._insert_activated("approved", srid=srid, fingerprint=fp)
+        self._insert_pending(self._record("rejected", srid=srid, fingerprint=fp))
+        code, out = self._build()
+        self.assertEqual(code, approval.EXIT_DECISION_NOT_AUTHORITATIVE, out)
+        self.assertEqual(json.loads(out)["status"], "decision_pending_or_uncertain")
+        self.assertFalse(self.package.exists())
+
+    def test_expired_activated_approval_refuses(self):
+        srid, fp = self._identity()
+        self._insert_activated(
+            "approved", srid=srid, fingerprint=fp,
+            recorded_at="2000-01-01T00:00:00+00:00",
+            expires_at="2000-01-04T00:00:00+00:00",
+        )
+        code, out = self._build()
+        self.assertEqual(code, 2, out)
+        self.assertIn("expired", out)
+
+    def test_source_fingerprint_drift_refuses(self):
+        srid, _fp = self._identity()
+        self._insert_activated("approved", srid=srid, fingerprint="fp_" + ("7" * 64))
+        code, out = self._build()
+        self.assertEqual(code, 2, out)
+        self.assertIn("fingerprint mismatch", out)
+        self.assertFalse(self.package.exists())
+
+    def test_activated_approval_alone_proceeds_to_the_reservation_gate(self):
+        srid, fp = self._identity()
+        self._insert_activated("approved", srid=srid, fingerprint=fp)
+        code, out = self._build()
+        self.assertEqual(code, 0, out)
+        self.assertTrue(self.package.is_file())
+
+    def test_fresh_activated_approval_after_a_consumed_one_proceeds(self):
+        srid, fp = self._identity()
+        self._insert_activated("approved", srid=srid, fingerprint=fp)
+        self.assertEqual(self._build()[0], 0)
+        first = self.package.read_bytes()
+        # The prior approval is terminally consumed by its reservation; a genuinely fresh
+        # ACTIVATED approval mints a new approval id and can build once at a fresh path.
+        self._insert_activated("approved", srid=srid, fingerprint=fp)
+        fresh = self.tmp / "member_create_uat_package_v2_fresh.json"
+        code, out = self._build(extra=self._fresh_out(fresh.name))
+        self.assertEqual(code, 0, out)
+        self.assertTrue(fresh.is_file())
+        self.assertEqual(self.package.read_bytes(), first, "the first package is preserved")
+        self.assertEqual(len(self._reservations()), 2)
+
+    def test_all_decision_types_share_one_monotonic_sequence(self):
+        srid, fp = self._identity()
+        self._insert_activated("approved", srid=srid, fingerprint=fp)
+        self._insert_activated("hold", srid=srid, fingerprint=fp)
+        self._insert_activated("rejected", srid=srid, fingerprint=fp)
+        sequences = [row["sequence"] for row in self._stored_decisions()]
+        self.assertEqual(sequences, [1, 2, 3])
+        types = [row["decision_type"] for row in self._stored_decisions()]
+        self.assertEqual(types, ["approved", "hold", "rejected"])
+
+
+class DecisionStoreIntegrityTests(_CreateUatBuildHarness):
+    """Amendment 6 section E: every way the decision store can be untrustworthy produces the
+    same explicit sanitised non-success - never a traceback, never a mutation."""
+
+    def _assert_store_refusal(self, code, out, reason):
+        self.assertEqual(code, approval.EXIT_DECISION_AUTHORITY_UNCERTAIN, out)
+        self.assertNotIn("Traceback", out)
+        summary = json.loads(out)
+        self.assertEqual(summary["status"], "decision_store_integrity_uncertain")
+        self.assertEqual(summary["decision_store_integrity"], reason)
+        self.assertIn(reason, decisions.STORE_INTEGRITY_REASONS)
+        self.assertIs(summary["approval_blocked"], True)
+        self.assertIs(summary["do_not_retry"], True)
+        self.assertIs(summary["controlled_recovery_required"], True)
+        self.assertIs(summary["decision_store_modified"], False)
+        self.assertFalse(self.package.exists())
+        self.assertEqual(self._reservations(), [])
+        return summary
+
+    def _prepare_activated_approval(self):
+        srid, fp = self._fixture_identity()
+        return self._insert_activated("approved", srid=srid, fingerprint=fp)
+
+    def test_missing_store_during_build_requires_a_fresh_decision(self):
+        self.assertFalse(self._store_path().exists())
+        code, out = self._build()
+        self.assertEqual(code, approval.EXIT_DECISION_NOT_AUTHORITATIVE, out)
+        summary = json.loads(out)
+        self.assertEqual(summary["status"], "decision_store_missing")
+        self.assertIs(summary["fresh_approval_required"], True)
+        self.assertFalse(self._store_path().exists(),
+                         "build-package must never manufacture an empty store")
+
+    def test_wrong_schema_version_refuses(self):
+        self._prepare_activated_approval()
+        raw = sqlite3.connect(str(self._store_path()))
+        try:
+            raw.execute("PRAGMA foreign_keys=OFF")
+            raw.execute("DROP TABLE schema_meta")
+            raw.execute("CREATE TABLE schema_meta (key TEXT PRIMARY KEY NOT NULL, "
+                        "value TEXT NOT NULL)")
+            raw.execute("INSERT INTO schema_meta (key, value) VALUES "
+                        "('schema_version', 'member_create_uat_decisions/v0')")
+            raw.commit()
+        finally:
+            raw.close()
+        self._assert_store_refusal(*self._build(), reason="schema_version_mismatch")
+
+    def test_missing_schema_version_row_refuses(self):
+        self._prepare_activated_approval()
+        raw = sqlite3.connect(str(self._store_path()))
+        try:
+            raw.execute("DELETE FROM schema_meta")
+            raw.commit()
+        finally:
+            raw.close()
+        self._assert_store_refusal(*self._build(), reason="schema_version_missing")
+
+    def test_missing_table_refuses(self):
+        self._prepare_activated_approval()
+        raw = sqlite3.connect(str(self._store_path()))
+        try:
+            raw.execute("PRAGMA foreign_keys=OFF")
+            raw.execute("DROP TABLE decision_activation")
+            raw.commit()
+        finally:
+            raw.close()
+        self._assert_store_refusal(*self._build(), reason="missing_table")
+
+    def test_missing_immutability_trigger_refuses(self):
+        self._prepare_activated_approval()
+        raw = sqlite3.connect(str(self._store_path()))
+        try:
+            raw.execute("DROP TRIGGER decision_block_delete")
+            raw.commit()
+        finally:
+            raw.close()
+        self._assert_store_refusal(*self._build(), reason="missing_trigger")
+
+    def test_missing_index_refuses(self):
+        self._prepare_activated_approval()
+        raw = sqlite3.connect(str(self._store_path()))
+        try:
+            raw.execute("DROP INDEX idx_decision_source_sequence")
+            raw.commit()
+        finally:
+            raw.close()
+        self._assert_store_refusal(*self._build(), reason="missing_index")
+
+    def test_unexpected_column_refuses(self):
+        self._prepare_activated_approval()
+        raw = sqlite3.connect(str(self._store_path()))
+        try:
+            raw.execute("ALTER TABLE decision ADD COLUMN smuggled TEXT")
+            raw.commit()
+        finally:
+            raw.close()
+        self._assert_store_refusal(*self._build(), reason="column_mismatch")
+
+    def test_failed_integrity_check_refuses(self):
+        self._prepare_activated_approval()
+        with mock.patch.object(decisions, "_integrity_check",
+                               return_value="*** in database main *** simulated page error"):
+            code, out = self._build()
+        self._assert_store_refusal(code, out, reason="integrity_check_failed")
+
+    def test_corrupted_store_refuses(self):
+        self._prepare_activated_approval()
+        self._store_path().write_bytes(b"this is definitely not a SQLite database\n" * 8)
+        code, out = self._build()
+        self._assert_store_refusal(code, out, reason="store_corrupt")
+
+    def test_malformed_canonical_record_hash_refuses(self):
+        # A decision row whose canonical hash does not recompute was altered outside this
+        # tool. The record hash is supplied by the caller, so a tampered value is inserted
+        # through the real API without ever updating history.
+        srid, fp = self._fixture_identity()
+        record = self._record("approved", srid=srid, fingerprint=fp)
+        record["record_hash"] = "sha256:" + ("0" * 64)
+        self._activate(self._insert_pending(record))
+        self._assert_store_refusal(*self._build(), reason="record_hash_mismatch")
+
+    def test_malformed_field_value_refuses_as_invalid_field_type(self):
+        # A value of the right storage type but the wrong FORMAT survives the round trip
+        # intact, so the format check is what catches it.
+        srid, fp = self._fixture_identity()
+        record = self._record("approved", srid=srid, fingerprint=fp)
+        record["reviewer_id"] = "NOT A REVIEWER HANDLE"   # fails REVIEWER_ID_RE
+        record["record_hash"] = decisions.decision_record_hash(record)
+        self._activate(self._insert_pending(record))
+        self._assert_store_refusal(*self._build(), reason="invalid_field_type")
+
+    def test_wrong_field_type_refuses(self):
+        # A genuinely wrong TYPE cannot survive a TEXT column: SQLite's column affinity
+        # coerces the integer to text, so the round-tripped value no longer matches the
+        # canonical hash computed over the integer. Either way the row is refused fail-closed,
+        # and the reason reported is the one that actually applies.
+        srid, fp = self._fixture_identity()
+        record = self._record("approved", srid=srid, fingerprint=fp)
+        record["reviewer_id"] = 12345
+        record["record_hash"] = decisions.decision_record_hash(record)
+        self._activate(self._insert_pending(record))
+        summary = self._assert_store_refusal(*self._build(), reason="record_hash_mismatch")
+        self.assertIs(summary["approval_blocked"], True)
+
+    def test_decision_activation_mismatch_refuses(self):
+        # An activation whose hash does not bind the exact decision content it claims to
+        # activate cannot vouch for it.
+        srid, fp = self._fixture_identity()
+        record = self._insert_pending(self._record("approved", srid=srid, fingerprint=fp))
+        self._activate(record, activation_hash="sha256:" + ("f" * 64))
+        self._assert_store_refusal(*self._build(), reason="activation_mismatch")
+
+    def test_store_history_cannot_be_updated_or_deleted(self):
+        self._prepare_activated_approval()
+        conn = self._open_store()
+        try:
+            for statement in (
+                "UPDATE decision SET reviewer_id = 'tampered'",
+                "DELETE FROM decision",
+                "UPDATE decision_activation SET activated_at = 'tampered'",
+                "DELETE FROM decision_activation",
+            ):
+                with self.subTest(statement=statement):
+                    with self.assertRaises(sqlite3.IntegrityError):
+                        conn.execute(statement)
+        finally:
+            conn.close()
+        # History survives every attempt, and the build still proceeds normally.
+        self.assertEqual(len(self._stored_decisions()), 1)
+        self.assertEqual(self._activation_count(), 1)
+        self.assertEqual(self._build()[0], 0)
+
+    def test_store_rows_contain_no_member_data_or_credentials(self):
+        self._prepare_activated_approval()
+        conn = self._open_store()
+        try:
+            dumped = "\n".join(
+                "|".join("" if value is None else str(value) for value in row)
+                for table in ("decision", "decision_activation", "schema_meta")
+                for row in conn.execute(f"SELECT * FROM {table}")
+            )
+        finally:
+            conn.close()
+        for secret in ("90000001", "6590000001", "Synthetic Alpha",
+                       "synthetic.alpha@example.invalid", "2000-01-01", "AC2_PROBE",
+                       str(self.tmp)):
+            self.assertNotIn(secret, dumped, f"the store must not contain {secret!r}")
+
+
+class ConcurrentDecisionTests(_CreateUatBuildHarness):
+    """Amendment 6 section F: two concurrent processes recording decisions for the same source
+    serialize through the transaction, each committed decision gets a unique monotonic
+    sequence, and no identifier is duplicated."""
+
+    def _decide_script(self, decision):
+        return textwrap.dedent(
+            f"""
+            import sys
+            sys.path.insert(0, {str(SCRIPTS)!r})
+            import member_create_uat_approval as approval
+            raise SystemExit(approval.main([
+                {decision!r}, "--reviewer", "digital",
+                "--input", {str(self.form)!r},
+                "--decision-rows", {str(self.rows)!r},
+                "--row-number", "2",
+                "--ledger", {str(self.ledger)!r},
+            ]))
+            """
+        )
+
+    def test_two_concurrent_decision_processes_serialize_and_stay_unique(self):
+        first = subprocess.Popen(
+            [sys.executable, "-c", self._decide_script("approve")],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        second = subprocess.Popen(
+            [sys.executable, "-c", self._decide_script("hold")],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        first_out, first_err = first.communicate(timeout=120)
+        second_out, second_err = second.communicate(timeout=120)
+        self.assertEqual(first.returncode, 0, first_out + first_err)
+        self.assertEqual(second.returncode, 0, second_out + second_err)
+        self.assertNotIn("Traceback", first_err)
+        self.assertNotIn("Traceback", second_err)
+
+        rows = self._stored_decisions()
+        self.assertEqual(len(rows), 2, "both decisions committed")
+        sequences = [row["sequence"] for row in rows]
+        self.assertEqual(sequences, sorted(sequences))
+        self.assertEqual(len(set(sequences)), 2, "sequences are unique and monotonic")
+        self.assertEqual(len(set(row["decision_id"] for row in rows)), 2)
+        approval_ids = [row["approval_id"] for row in rows if row["approval_id"] is not None]
+        self.assertEqual(len(approval_ids), len(set(approval_ids)))
+        for row in rows:
+            self.assertIsNotNone(row["activation_sequence"], "each decision activated")
+        # The newest activated decision wins. It is a hold exactly when the hold committed
+        # last, and the build outcome must agree with that ordering either way.
+        newest = rows[-1]["decision_type"]
+        code, out = self._build()
+        if newest == "hold":
+            self.assertEqual(code, approval.EXIT_DECISION_NOT_AUTHORITATIVE, out)
+            self.assertEqual(json.loads(out)["decision_authority"],
+                             decisions.AuthorityState.HOLD)
+        else:
+            self.assertEqual(code, 0, out)
+
+    def test_two_concurrent_approvals_produce_distinct_approval_ids(self):
+        procs = [
+            subprocess.Popen([sys.executable, "-c", self._decide_script("approve")],
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            for _ in range(2)
+        ]
+        outputs = [proc.communicate(timeout=120) for proc in procs]
+        for proc, (out, err) in zip(procs, outputs):
+            self.assertEqual(proc.returncode, 0, out + err)
+        rows = self._stored_decisions()
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(len({row["approval_id"] for row in rows}), 2)
+        self.assertEqual(len({row["decision_id"] for row in rows}), 2)
+        self.assertEqual([row["sequence"] for row in rows], [1, 2])
+
+
+class LedgerAuditSchemaTests(_CreateUatBuildHarness):
+    """Amendment 6 section H: the JSONL audit ledger validates EXACT supported event schemas.
+
+    Rejecting only malformed JSON and non-object JSON left arbitrary dictionaries trusted, so
+    a malformed decision or publication dictionary reached downstream timestamp parsing and
+    field lookups. Every malformed shape below now fails closed through
+    ``ledger_integrity_uncertain`` with no traceback and no printed record.
+    """
+
+    def _decision_audit(self, **overrides):
+        record = {
+            "event": "decision",
+            "recorded_at": "2026-07-25T00:00:00+00:00",
+            "reviewer_id": "digital",
+            "decision": "approved",
+            "source_record_id": "srcrec_" + ("a" * 64),
+            "source_fingerprint": "fp_" + ("b" * 64),
+            "row_number_hint": 2,
+            "approval_id": "appr_" + ("c" * 32),
+            "approved_at": "2026-07-25T00:00:00+00:00",
+            "expires_at": "2026-07-28T00:00:00+00:00",
+        }
+        record.update(overrides)
+        for key in [k for k, v in overrides.items() if v is _DROP]:
+            record.pop(key, None)
+        return record
+
+    def _build_audit(self, **overrides):
+        record = {
+            "event": "build",
+            "recorded_at": "2026-07-25T00:00:00+00:00",
+            "source_record_id": "srcrec_" + ("a" * 64),
+            "source_fingerprint": "fp_" + ("b" * 64),
+            "approval_id": "appr_" + ("c" * 32),
+            "operation_id": "mcuat_" + ("d" * 32),
+            "bound_package_payload_hash": "sha256:" + ("e" * 64),
+            "package_file_name": "member_create_uat_package_v2.json",
+            "reservation_file_name": "member_create_uat_reservation_appr_"
+                                    + ("c" * 32) + ".1.reservation",
+        }
+        record.update(overrides)
+        for key in [k for k, v in overrides.items() if v is _DROP]:
+            record.pop(key, None)
+        return record
+
+    def _append_record(self, record):
+        with open(self.ledger, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, sort_keys=True) + "\n")
+
+    def _assert_refused(self, record, reason):
+        self._append_record(record)
+        before = self.ledger.read_bytes()
+        code, out = self._build()
+        summary = self._assert_ledger_integrity_uncertain(code, out)
+        self.assertEqual(summary["ledger_integrity"], reason)
+        self.assertEqual(self.ledger.read_bytes(), before, "the ledger is never repaired")
+        self.assertFalse(self.package.exists())
+        self.assertEqual(self._reservations(), [])
+        return summary
+
+    # ---- decision audit records ---- #
+    def test_invalid_expires_at_refused(self):
+        self._assert_refused(self._decision_audit(expires_at="not-a-timestamp"),
+                             "decision_field_invalid")
+
+    def test_invalid_approved_at_refused(self):
+        self._assert_refused(self._decision_audit(approved_at="2026-13-45T99:99:99+00:00"),
+                             "decision_field_invalid")
+
+    def test_invalid_recorded_at_refused(self):
+        self._assert_refused(self._decision_audit(recorded_at="yesterday"),
+                             "decision_field_invalid")
+
+    def test_missing_approval_id_on_approval_refused(self):
+        self._assert_refused(self._decision_audit(approval_id=None),
+                             "decision_field_invalid")
+
+    def test_malformed_approval_id_refused(self):
+        self._assert_refused(self._decision_audit(approval_id="appr_not_hex"),
+                             "decision_field_invalid")
+
+    def test_wrong_decision_value_refused(self):
+        self._assert_refused(self._decision_audit(decision="maybe"),
+                             "decision_field_invalid")
+
+    def test_wrong_reviewer_type_refused(self):
+        self._assert_refused(self._decision_audit(reviewer_id=12345),
+                             "decision_field_invalid")
+
+    def test_wrong_row_number_type_refused(self):
+        self._assert_refused(self._decision_audit(row_number_hint="2"),
+                             "decision_field_invalid")
+
+    def test_boolean_row_number_refused(self):
+        # bool is an int subclass, so it must be excluded explicitly.
+        self._assert_refused(self._decision_audit(row_number_hint=True),
+                             "decision_field_invalid")
+
+    def test_missing_source_fingerprint_refused(self):
+        self._assert_refused(self._decision_audit(source_fingerprint=_DROP),
+                             "decision_field_set_mismatch")
+
+    def test_malformed_source_fingerprint_refused(self):
+        self._assert_refused(self._decision_audit(source_fingerprint="fp_short"),
+                             "decision_field_invalid")
+
+    def test_extra_undeclared_decision_field_refused(self):
+        self._assert_refused(self._decision_audit(smuggled="payload"),
+                             "decision_field_set_mismatch")
+
+    def test_rejection_carrying_approval_fields_refused(self):
+        self._assert_refused(
+            self._decision_audit(decision="rejected", approved_at=None, expires_at=None),
+            "decision_field_invalid",
+        )
+
+    # ---- publication audit records ---- #
+    def test_unknown_event_refused(self):
+        self._assert_refused(self._decision_audit(event="something_else"),
+                             "unknown_event_type")
+
+    def test_missing_event_refused(self):
+        self._assert_refused(self._decision_audit(event=_DROP), "unknown_event_type")
+
+    def test_missing_build_binding_refused(self):
+        self._assert_refused(self._build_audit(operation_id=_DROP),
+                             "publication_field_set_mismatch")
+
+    def test_malformed_payload_hash_refused(self):
+        self._assert_refused(self._build_audit(bound_package_payload_hash="sha256:zzz"),
+                             "publication_field_invalid")
+
+    def test_extra_undeclared_build_field_refused(self):
+        self._assert_refused(self._build_audit(smuggled="payload"),
+                             "publication_field_set_mismatch")
+
+    def test_malformed_package_file_name_refused(self):
+        self._assert_refused(self._build_audit(package_file_name="../escape.json"),
+                             "publication_field_invalid")
+
+    def test_cleanup_incomplete_missing_extra_fields_refused(self):
+        self._assert_refused(self._build_audit(event="build_cleanup_incomplete"),
+                             "publication_field_set_mismatch")
+
+    def test_cleanup_incomplete_false_flag_refused(self):
+        self._assert_refused(
+            self._build_audit(event="build_cleanup_incomplete", cleanup_incomplete=False,
+                              stale_temp_basename=".mcuat_pkg_x.tmp"),
+            "publication_field_invalid",
+        )
+
+    # ---- the historical shapes must still be accepted ---- #
+    def test_historical_build_record_without_reservation_name_is_accepted(self):
+        # Pre-Amendment-4 `build` records carry no reservation_file_name. They remain valid.
+        self._append_record(self._build_audit(reservation_file_name=_DROP))
+        self.assertEqual(len(approval.read_ledger(self.ledger)), 1)
+
+    def test_current_and_cleanup_incomplete_shapes_are_accepted(self):
+        self._append_record(self._build_audit())
+        self._append_record(self._build_audit(
+            event="build_cleanup_incomplete", cleanup_incomplete=True,
+            stale_temp_basename=".mcuat_pkg_abc.tmp",
+        ))
+        self._append_record(self._decision_audit())
+        self._append_record(self._decision_audit(
+            decision="hold", approval_id=None, approved_at=None, expires_at=None))
+        self._append_record(self._decision_audit(
+            decision="rejected", approval_id=None, approved_at=None, expires_at=None))
+        self.assertEqual(len(approval.read_ledger(self.ledger)), 5)
+
+    def test_a_real_end_to_end_run_produces_only_valid_audit_records(self):
+        # The strongest schema check: everything the tool itself writes must validate.
+        self.assertEqual(self._approve()[0], 0)
+        self.assertEqual(self._build()[0], 0)
+        with mock.patch("os.unlink", side_effect=OSError("simulated unlink failure")):
+            srid, fp = self._fixture_identity()
+            self._insert_activated("approved", srid=srid, fingerprint=fp)
+            self._build(extra=self._fresh_out("member_create_uat_package_v2_ci.json"))
+        entries = approval.read_ledger(self.ledger)
+        self.assertEqual(
+            sorted({e["event"] for e in entries}),
+            ["build", "build_cleanup_incomplete", "decision"],
+        )
+
+
+class DecisionStorePreservationTests(_CreateUatBuildHarness):
+    """Amendment 6 section I: every blocked path preserves its neighbours, sweeps nothing and
+    leaks nothing - now including the decision store."""
+
+    def test_blocked_paths_preserve_everything_and_leak_nothing(self):
+        historical = self.tmp / "member_create_uat_package_v1.json"
+        historical.write_text("HISTORICAL-V1-EVIDENCE-DO-NOT-TOUCH\n", encoding="utf-8")
+        competing = self.tmp / "member_create_uat_package_v2_other.json"
+        competing.write_text("COMPETING-DO-NOT-TOUCH\n", encoding="utf-8")
+        unrelated_temp = self.tmp / ".mcuat_pkg_unrelated_sentinel.tmp"
+        unrelated_temp.write_text("UNRELATED-DO-NOT-SWEEP\n", encoding="utf-8")
+        other_reservation = self.tmp / (
+            approval.RESERVATION_PREFIX + "appr_" + ("f" * 32) + ".1" + approval.RESERVATION_SUFFIX
+        )
+        other_reservation.write_text("UNRELATED-RESERVATION-DO-NOT-TOUCH\n", encoding="utf-8")
+
+        self.assertEqual(self._approve()[0], 0)
+        self.assertEqual(self._build()[0], 0)
+        existing_v2 = self.package.read_bytes()
+        ledger_bytes = self.ledger.read_bytes()
+        store_bytes = self._store_path().read_bytes()
+        before = {p: p.read_bytes()
+                  for p in (historical, competing, unrelated_temp, other_reservation)}
+
+        def no_sweep(*args, **kwargs):
+            raise AssertionError("no build path may list, scan or glob a directory")
+
+        outputs = []
+
+        def blocked_build(name, expected_code, extra=None):
+            """Run one blocked build and prove it mutated neither the store nor the ledger.
+
+            The snapshot is taken immediately before each build so that state this TEST sets
+            up between builds is never mistaken for a mutation by the tool.
+            """
+            store_before = self._store_path().read_bytes()
+            ledger_before = self.ledger.read_bytes()
+            code, out = self._build(extra=(extra or []) + self._fresh_out(name))
+            self.assertEqual(code, expected_code, out)
+            self.assertEqual(self._store_path().read_bytes(), store_before,
+                             "a blocked build must not mutate the decision store")
+            self.assertEqual(self.ledger.read_bytes(), ledger_before,
+                             "a blocked build must not touch the audit ledger")
+            outputs.append(out)
+
+        with mock.patch("os.listdir", no_sweep), mock.patch("os.scandir", no_sweep), \
+                mock.patch("glob.glob", no_sweep), \
+                mock.patch.object(Path, "iterdir", no_sweep), \
+                mock.patch.object(Path, "glob", no_sweep):
+            # Terminally consumed approval.
+            blocked_build("blocked_consumed.json", approval.EXIT_APPROVAL_CONSUMED)
+            # Retired --rebuild.
+            blocked_build("blocked_rebuild.json", approval.EXIT_APPROVAL_CONSUMED,
+                          extra=["--rebuild"])
+            # Newer pending decision (set up by the test, outside the assertions above).
+            srid, fp = self._fixture_identity()
+            self._insert_pending(self._record("hold", srid=srid, fingerprint=fp))
+            blocked_build("blocked_pending.json", approval.EXIT_DECISION_NOT_AUTHORITATIVE)
+
+        # Every neighbour, the existing v2 package and the audit ledger are byte-for-byte
+        # unchanged across the whole sequence.
+        for path, original in before.items():
+            self.assertEqual(path.read_bytes(), original, f"{path.name} must be untouched")
+        self.assertEqual(self.package.read_bytes(), existing_v2)
+        self.assertEqual(self.ledger.read_bytes(), ledger_bytes,
+                         "the audit ledger is never truncated, rewritten or replaced")
+        # The store grew only by the pending row this test inserted; its committed history is
+        # append-only and no earlier row changed.
+        self.assertGreaterEqual(len(self._stored_decisions()), 2)
+        self.assertNotEqual(self._store_path().read_bytes(), store_bytes,
+                            "the test's own pending insert is the only store change")
+        for name in ("blocked_consumed.json", "blocked_rebuild.json", "blocked_pending.json"):
+            self.assertFalse((self.tmp / name).exists())
+        combined = "".join(outputs)
+        for leaked in ("90000001", "6590000001", "Synthetic Alpha",
+                       "synthetic.alpha@example.invalid", "2000-01-01", "AC2_PROBE",
+                       str(self.tmp), str(self._store_path()), "HISTORICAL-V1-EVIDENCE"):
             self.assertNotIn(leaked, combined, f"the output must not contain {leaked!r}")
 
 

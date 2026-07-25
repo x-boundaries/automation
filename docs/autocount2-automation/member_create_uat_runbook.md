@@ -19,6 +19,7 @@ CI.
 | Package JSON Schema (language-neutral contract) | `schemas/member_create_uat_package.schema.json` | reference |
 | Contract library | `scripts/member_create_uat_contract.py` | LAPTOP DEVELOPMENT MACHINE |
 | Reviewer approval + package builder | `scripts/member_create_uat_approval.py` | LAPTOP DEVELOPMENT MACHINE |
+| Transactional reviewer-decision authority store | `scripts/member_create_uat_decision_store.py` | LAPTOP DEVELOPMENT MACHINE |
 | Business confirmation config (fail-closed) | `config/member_create_uat_business_confirmation.json` | reference |
 | Runner state-machine library (pure) | `scripts/member_create_uat_runner_lib.ps1` | AUTOCOUNT VM — DESKTOP-4I042L6 |
 | AutoCount create UAT runner | `scripts/ac2_member_create_uat_runner.ps1` | AUTOCOUNT VM — DESKTOP-4I042L6 |
@@ -27,10 +28,12 @@ CI.
 
 ## State ownership
 
-- The LAPTOP DEVELOPMENT MACHINE owns the human decision only: the append-only
-  approval ledger (approve / reject / hold) and a record of which immutable package
-  was built, plus one durable publication reservation per build attempt (the write-ahead
-  single-use marker described in step 5). Both are local and never committed.
+- The LAPTOP DEVELOPMENT MACHINE owns the human decision only. Reviewer **authority** is
+  the transactional, append-only SQLite decision store; the JSONL approval ledger
+  (approve / reject / hold, plus which immutable package was built) is an append-only
+  **audit record only** and never grants authority. There is also one durable publication
+  reservation per build (the write-ahead single-use marker described in step 5). All three
+  are local private state and are never committed.
 - The AUTOCOUNT VM owns the exclusive execution lock, the write-intent marker, the
   consumed marker, and the terminal result. Two runners cannot both pass the lock:
   the second attempt terminates `EXECUTION_LOCKED`.
@@ -86,6 +89,9 @@ Reviewer approvals expire. The default time-to-live is
 `DEFAULT_APPROVAL_TTL_HOURS = 72` (defined in `scripts/member_create_uat_contract.py`).
 An operator may shorten it per approval with `--ttl-hours`, never lengthen it beyond
 the default. An expired approval yields `APPROVAL_INVALID` and requires re-approval.
+
+Expiry is read from the **transactional decision store**, not from the JSONL audit ledger, so
+hand-editing an audit line can neither expire nor extend an approval.
 
 ## Terminal result codes
 
@@ -184,6 +190,84 @@ bump changes both `source_record_id` and `source_fingerprint` (each binds the sc
 version), a fresh reviewer decision is mechanically required; a `v1` decision or build
 cannot mint a `v2` package.
 
+#### Transactional reviewer-decision authority (SQLite) — JSONL is audit-only
+
+Reviewer **authority** lives in a private, git-ignored, append-only SQLite database beside
+the approval ledger:
+
+`member_create_uat_decisions.sqlite3`
+
+Its legitimate private runtime companions (`-journal`, `-wal`, `-shm`) are git-ignored by
+exact name. The store holds **sanitised decision metadata only** — decision sequence,
+decision id, decision type, reviewer handle, timestamps, approval id, source record id,
+source fingerprint, schema version and a canonical record hash. It contains no member
+number, name, mobile number, email address, birthday, credential or absolute path.
+
+**Why this exists.** `append_ledger` writes the complete JSON line *before* `flush()` and
+`os.fsync()` return, so a real persistence failure can leave a complete, perfectly readable
+`approved` line on disk even though the command reported failure and durability was never
+confirmed. A later process read that line back and could reserve and publish a package from
+an approval that was never durably granted. Chaining more marker files cannot fix this —
+each new file needs its own acknowledgement, indefinitely — so the decision boundary moved
+inside a real transaction.
+
+> **The JSONL approval ledger is an append-only AUDIT RECORD ONLY. It never grants
+> package-building authority.** A decision authorises a package only when a committed
+> **activation row** exists for it in the decision store.
+
+**Schema (`member_create_uat_decisions/v1`).** Two append-only history tables plus schema
+metadata: `decision` (every approve, reject and hold attempt, with one shared monotonic
+`sequence`) and `decision_activation` (the decisions that became authoritative). `UPDATE`
+and `DELETE` are rejected on both by database triggers, so even a direct `sqlite3` session
+cannot rewrite or erase history. Durability settings: `journal_mode=DELETE`,
+`synchronous=FULL`, `foreign_keys=ON`, explicit `BEGIN IMMEDIATE` transactions and a bounded
+busy timeout. Before any authority is read or written the tool verifies
+`PRAGMA integrity_check`, the exact tables, the exact column sets, the required indexes, the
+immutability triggers and the schema version. A malformed or incompatible store is **never**
+recreated, replaced, migrated or repaired.
+
+**Decision state machine.** Each `approve` / `reject` / `hold` runs three ordered, separately
+committed steps:
+
+1. commit the **pending** decision row transactionally;
+2. append the JSONL **audit** event;
+3. commit the separate **activation** row — only after step 2 returned confirmed success.
+
+If any `COMMIT` raises, the tool closes the connection, **reopens the database** and looks
+for the exact row by its unique id: present with the expected canonical hash means it
+committed; absent means it did not (a clean retry is safe); unreadable fails closed. The
+outcome is never inferred from the exception, which proves only that the client did not hear
+the answer. There is no external activation acknowledgement file — the SQLite transaction and
+the reopen check are the commit authority.
+
+If the audit append fails, the decision stays **pending**: it is not activated, not deleted
+and not rewritten, the ledger is not truncated, replaced or repaired, and the tool reports
+`decision_authority = pending` with `approval_blocked` and `do_not_retry`.
+
+**Authoritative ordering.** The newest **activated** decision for the source record wins.
+Approve, reject and hold share one monotonic sequence. A newer committed-but-unactivated
+decision **blocks** the build (`decision_pending_or_uncertain`) rather than falling back to
+an older activated approval — the pending decision may have been an attempted hold or
+rejection, and treating "we could not confirm the reviewer's latest instruction" as "use the
+previous approval" is the unsafe direction.
+
+| Store state | Build outcome |
+| --- | --- |
+| Newest activated decision is `approved` | Proceeds to the normal fingerprint, expiry and reservation gates |
+| Newest activated decision is `rejected` or `hold` | Refused (`decision_not_approved`) |
+| Any newer pending decision | Refused (`decision_pending_or_uncertain`) |
+| Malformed, inaccessible or incompatible store | Refused with sanitised integrity evidence |
+| No store, or no activated decision | Fresh reviewer decision required |
+
+`build-package` never creates the store: a missing store means no transactional approval
+authority exists.
+
+**Deliberate compatibility decision — a legacy JSONL-only approval is not authority.** A
+well-formed `approved` line written by any earlier version of this tool grants nothing,
+because no activation row exists for it. **After merge, a fresh reviewer decision is
+required before the v2 package is built.** This is intentional and is not a migration gap:
+the whole point is that a readable line can no longer authorise a package.
+
 #### Durable publication reservation and the terminal reservation rule
 
 The append-only ledger is the audit log, but it is written *after* the package is
@@ -232,18 +316,43 @@ review — never a silent retry.
 Single use is a property of the **approval**, not of the member row: a fresh reviewer
 decision mints a new approval id and can build once, which is what makes recovery possible.
 
-#### Ledger integrity is fail-closed
+Where a competing reservation **definitely** occupies the slot (the exclusive create lost the
+race), the approval is reported as `approval_consumed` with `reservation = consumed` (exit 7)
+and **no retry guidance at all** — the competitor terminally consumed the approval and its
+reservation is left byte-for-byte untouched. `not_created`, the only retryable reservation
+outcome, is claimed solely when a non-following existence re-check (`os.path.lexists` on the
+exact slot path) positively proves that no object is present. If existence cannot be
+determined, the approval is treated as consumed/uncertain. No directory is listed, globbed or
+swept at any point.
 
-The ledger is read as an intact sequence of newline-terminated JSON objects. A torn
-(partially appended) final record, a malformed record, a record that is not a JSON object,
-or a read/decode failure all produce `status = ledger_integrity_uncertain` (exit 8) with
-`approval_blocked`, `do_not_retry` and `controlled_recovery_required` — never a traceback.
+#### Ledger integrity and exact audit schemas are fail-closed
+
+The ledger is read as an intact sequence of newline-terminated JSON objects **and every
+record must match an exact supported audit schema**. Validating only "is it a JSON object"
+left arbitrary dictionaries trusted, so a malformed decision or publication dictionary
+reached downstream timestamp parsing and field lookups and produced uncontrolled exceptions
+or partially trusted state.
+
+Supported shapes (every one is a shape this tool has actually written):
+
+| Event | Fields |
+| --- | --- |
+| `decision` | exactly the 10 decision fields; permitted decision values; reviewer/source-id/fingerprint formats; integer row hint in range; parseable timestamps; an approval requires a well-formed approval id plus parseable `approved_at` and `expires_at`; a rejection or hold requires all three approval fields to be null |
+| `build` | the 8 core publication fields, plus `reservation_file_name` from Amendment 4 onwards |
+| `build_cleanup_incomplete` | the same, plus `cleanup_incomplete = true` and `stale_temp_basename` |
+
+Unknown event types, missing fields, extra undeclared fields, wrong types, malformed
+timestamps, malformed ids and invalid hashes all produce
+`status = ledger_integrity_uncertain` (exit 8) with `approval_blocked`, `do_not_retry` and
+`controlled_recovery_required` — never a traceback. So do a torn (partially appended) final
+record, a non-object record, and read/decode failures.
 
 In that state the tool does **not** discard the malformed record, repair, truncate, rewrite
-or replace the ledger, delete any reservation, touch any published package, or continue to
-package construction. Only a fixed shape classifier is reported (`ledger_integrity`); no
-ledger content, member value, credential or absolute path is ever printed. Reconcile the
-ledger under review, then start a fresh reviewer decision.
+or replace the ledger, delete any reservation, touch any published package, mutate the
+decision store, or continue to package construction. Only a fixed shape classifier is
+reported (`ledger_integrity`); the offending record is never printed, and no ledger content,
+member value, credential or absolute path is ever printed. Reconcile the ledger under review,
+then start a fresh reviewer decision.
 
 #### Build outcomes and exit codes
 
@@ -259,8 +368,16 @@ other outcome is a distinct nonzero exit so no partial state can be mistaken for
 | 4 | `ledger_record_incomplete` | yes | Published, but the durable ledger event could not be persisted. **Do not retry.** |
 | 5 | `reservation_incomplete` | no | This attempt's reservation was not created, or not confirmed durable. |
 | 6 | `publication_failed_after_reservation` | no | Reservation is durable but publication failed; the approval is blocked. |
-| 7 | `approval_consumed` / `rebuild_requires_fresh_approval` | no | The approval is terminally consumed, or `--rebuild` (retired) was passed. Nothing was created or touched. |
-| 8 | `ledger_integrity_uncertain` | no | The ledger is not an intact append-only record. Nothing was created, read further or repaired. |
+| 7 | `approval_consumed` / `rebuild_requires_fresh_approval` | no | The approval is terminally consumed (including by a competing reservation), or `--rebuild` (retired) was passed. Nothing was created or touched. |
+| 8 | `ledger_integrity_uncertain` | no | The audit ledger is not an intact append-only record, or a record fails its exact audit schema. Nothing was created, read further or repaired. |
+| 9 | `decision_audit_incomplete` / `decision_not_activated` / `decision_not_recorded` / `decision_store_integrity_uncertain` | no | Decision authority cannot be trusted: a decision is pending and non-authoritative, a commit outcome was unresolved, or the store is not intact. |
+| 10 | `decision_store_missing` / `no_activated_decision` / `decision_not_approved` / `decision_pending_or_uncertain` | no | No activated decision authorises a build. A fresh reviewer decision is required. |
+
+Exit 9 and exit 10 both create and touch nothing: no reservation slot, no temporary file, no
+output file, no ledger event and no decision-store mutation. Exit 9 with
+`decision_not_recorded` is the one decision outcome that stays retryable — nothing committed,
+so `approval_blocked` and `do_not_retry` are both false. Every other exit-9 status sets
+`approval_blocked`, `do_not_retry` and `controlled_recovery_required`.
 
 Exit 3 (`cleanup_incomplete`) reports `stale_temp_basename` (a PII-free `.mcuat_pkg_*.tmp`
 name in the output directory) with `manual_cleanup_required`:
