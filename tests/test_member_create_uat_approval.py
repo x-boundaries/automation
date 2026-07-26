@@ -2984,12 +2984,20 @@ class ConcurrentDecisionTests(_CreateUatBuildHarness):
     #   * store_locked          - the peer holds RESERVED but has written no page yet, so the
     #     bounded busy timeout expires;
     #   * store_unreadable      - on Windows the peer's in-flight no-replace publication can
-    #     make the just-appeared path briefly unopenable. Failing closed is correct; retrying
-    #     automatically is exactly what the contract forbids.
+    #     make the just-appeared path briefly unopenable;
+    #   * store_multiple_links  - on POSIX, first-use publication links the completed temporary
+    #     to the final name and only then unlinks the temporary, so for that brief window the
+    #     store legitimately has two names. A concurrent process that triages it mid-window
+    #     correctly refuses. The window exists only during creation; afterwards the link count
+    #     is one for good.
+    #
+    # Failing closed is correct in every case; retrying automatically is exactly what the
+    # contract forbids.
     _CLEAN_CONTENTION_REFUSALS = (
         "store_sidecar_present",
         "store_locked",
         "store_unreadable",
+        "store_multiple_links",
     )
 
     def _assert_contention_outcome(self, returncode, out, err):

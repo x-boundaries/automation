@@ -321,6 +321,14 @@ one at a time. Pure lock contention — a peer holding the write lock without ha
 page, so no journal exists — still reports the retryable `decision_not_recorded` /
 `build_claim_not_recorded` outcome.
 
+Three further transient refusals mean the same thing — "a peer is mid-operation, nothing was
+changed, try again deliberately": `store_locked`; `store_unreadable`, which Windows can report
+while a peer's no-replace move is in flight; and, on POSIX only, `store_multiple_links` during
+first-use creation, because the hard-link route briefly gives the completed store two names
+before the operation-owned temporary is unlinked. That window exists only while a store is being
+created; afterwards the link count is one permanently, and a persistent `store_multiple_links`
+means a real second name that an operator must remove.
+
 **Threat-model boundary.** The supported location is a stable, local, operator-controlled state
 directory, and the protections above cover malformed, foreign, partial and corrupt databases,
 WAL and sidecar residue, crash-interrupted state, ordinary path or file replacement detected by
