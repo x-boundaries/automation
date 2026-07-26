@@ -227,25 +227,107 @@ rewrite or erase history. Durability settings: `journal_mode=DELETE`, `synchrono
 authority model, so it is a new version rather than a disguised v1. A v1 store — like an empty,
 zero-byte, partial or foreign one — is refused **untouched**. There is no migration.
 
-**Canonical validation before any authority is used.** Validation covers schema *meaning*, not
-just object names, through two independent mechanisms: the exact canonical `sqlite_schema` DDL
-text of every application object (which pins declared types, `NOT NULL`, defaults, primary keys,
+**Pure pre-open triage decides before SQLite is opened (Amendment 8).** Amendment 7 opened an
+existing file with SQLite and only then decided whether it was canonical — but the first pragma
+it applied, `journal_mode=DELETE`, is *persistent*. Against a WAL-mode database it rewrote the
+header and removed the `-wal`/`-shm` companions, so a store the tool then refused had already
+been changed, and a foreign database's write-ahead log could be destroyed. Deleting a hot
+journal or WAL is the documented way to lose crash recovery.
+
+Every access to an existing store now begins with ordinary, non-following filesystem calls and
+**no SQLite call at all**:
+
+1. safe-local-path validation, and rejection of a symlink, junction or reparse point;
+2. a plain regular file with **exactly one hard link** (a multiply-named database has undefined
+   behaviour, because each name derives its own journal path);
+3. stable file identity captured, and re-checked after the header read;
+4. the complete 100-byte SQLite header read with a plain file handle, requiring the
+   `SQLite format 3\0` magic, a plausible page size, and header bytes 18 and 19 both equal to
+   `1` (rollback format; `2` means WAL);
+5. exact absence of `<store>-journal`, `<store>-wal` and `<store>-shm`, checked by exact path —
+   never by listing, globbing or sweeping a directory.
+
+> **A WAL header or any sidecar object is controlled-recovery-only.** The tool never opens,
+> checkpoints, rolls back, deletes, renames, recreates or repairs such a store — even when the
+> database otherwise looks canonical.
+
+**Read-only inspection and trusted writing are separate paths.** Non-mutating work — the build
+preflight, authority reads, decision-sequence reporting and all three COMMIT-recovery lookups —
+opens `mode=ro&cache=private`, sets only connection-local protections (`busy_timeout`,
+`foreign_keys`, and `query_only` as defence in depth *only*), **queries** `PRAGMA journal_mode`
+and requires `delete`, runs the complete global validator plus the bounded read inside one read
+transaction, closes, and then re-proves the file's identity, link count and sidecar absence.
+Writers repeat the pure triage, open `mode=rw&cache=private`, apply the same connection-local
+settings plus `synchronous=FULL`, verify the journal mode, take one `BEGIN IMMEDIATE`, re-run
+the **complete global validator inside that transaction**, and only then resolve and insert.
+`journal_mode` is assigned in exactly one place in the codebase: the brand-new temporary a
+creation operation exclusively owns. `immutable=1` is never used, because it disables change
+detection and can silently omit committed WAL-resident state.
+
+**Canonical validation is store-global.** Validation covers schema *meaning*, not just object
+names, through two independent mechanisms: the exact canonical `sqlite_schema` DDL text of every
+application object (which pins declared types, `NOT NULL`, defaults, primary keys,
 `AUTOINCREMENT`, `UNIQUE`, `CHECK` bodies, foreign-key columns and actions, index columns/order/
 uniqueness and trigger timing/event/target/body all at once), plus pragma-derived checks
-(`table_info`, `index_list`, `index_info`, `foreign_key_list`). Then `PRAGMA integrity_check`,
-`PRAGMA foreign_key_check`, the exact permitted application-object set, the schema-version row,
-orphan-row checks and every canonical row hash. Only SQLite's own `sqlite_sequence` and the
-implicit `sqlite_autoindex_*` indexes are tolerated. Any mismatch refuses fail-closed and the
-store is **never** recreated, replaced, migrated, augmented or repaired.
+(`table_info`, `index_list`, `index_info`, `foreign_key_list`). The deterministic order is:
+`integrity_check`; `foreign_key_check`; the exact permitted object set and canonical DDL;
+columns, indexes, constraints and foreign keys; the **exact** `schema_meta` row set (exactly one
+row, key `schema_version`, value `member_create_uat_decisions/v2`, no other key); every
+`decision` row in sequence order; every activation row in activation-sequence order; every claim
+row in claim-sequence order; then the cross-table orphan and binding checks. Only SQLite's own
+`sqlite_sequence` and the implicit `sqlite_autoindex_*` indexes are tolerated.
+
+Amendment 7 validated decision and activation content only inside the source-filtered authority
+query, so a malformed row under an unrelated source record survived into an authorised build.
+**A malformed row anywhere now blocks every operation**, whichever source record was requested.
+Timestamps are parsed into aware instants by one central parser and compared as instants, never
+as text: `approved_at >= recorded_at`, `expires_at >= approved_at`, `activated_at >=
+recorded_at`, and — new in Amendment 8 — `claimed_at >= approved_at` and `claimed_at >=
+activated_at`, both for every stored claim and, immediately before insertion, for the claim a
+build is about to mint. Two valid timestamps written in different UTC offsets order differently
+as strings than in time, so a lexical comparison is never the authority.
+
+Any mismatch refuses fail-closed and the store is **never** recreated, replaced, migrated,
+augmented or repaired.
 
 **Creation is allowed only at a positively absent path.** The complete canonical store is built
-in an operation-owned temporary in the same directory and then published with an atomic,
-no-replace `os.link`. Exclusively creating the final path and *then* running DDL on it would
-leave a window in which a concurrent process opens a zero-byte file and correctly concludes it
-is not a canonical store; publishing an already-complete store removes that window, so the final
-path only ever appears fully formed. If a competitor wins the race, their store is left
-untouched and only this operation's own temporary is removed. If schema setup fails, the final
-path is never created and the temporary is deliberately left in place as evidence.
+in an operation-owned temporary in the same directory, validated in full, closed, proven to have
+no sidecar and exactly one link, flushed durably, and only then published. Exclusively creating
+the final path and *then* running DDL on it would leave a window in which a concurrent process
+opens a zero-byte file and correctly concludes it is not a canonical store; publishing an
+already-complete store removes that window, so the final path only ever appears fully formed.
+Publication is platform-specific:
+
+| Platform | Primitive | Durability reported | Temporary |
+| --- | --- | --- | --- |
+| Windows | `MoveFileExW` **without** `MOVEFILE_REPLACE_EXISTING`, with `MOVEFILE_WRITE_THROUGH` | `windows_move_write_through` | none survives a move, so no second name is ever created |
+| POSIX | no-replace `os.link` with every SQLite connection closed, parent-directory fsync, unlink of the operation-owned temporary, parent-directory fsync again | `posix_link_and_directory_fsync` | `unlinked`; a failed unlink is reported, never suppressed |
+
+The published store must be a plain regular file with **exactly one link** and the identity this
+operation created, and it must pass the same locked read-only inspection before it may be used.
+If a competitor wins the race, their store is left byte-for-byte untouched and only this
+operation's own temporary is removed. If schema setup fails, the final path is never created and
+the temporary is deliberately left in place as evidence. A publication whose durability cannot
+be proven, or a temporary that cannot be removed, is reported as a controlled-recovery state —
+never silently treated as an authorised empty store. Only a durability primitive actually
+confirmed on the running platform is ever named; Windows offers no directory-handle fsync, so
+none is claimed there.
+
+**Concurrency consequence you should expect.** Because a sidecar is refused unconditionally, a
+second tool process that meets a peer *mid-transaction* now fails **closed** with
+`store_sidecar_present` instead of waiting on the busy timeout and then committing. Nothing is
+written and nothing is changed, but the second command does not succeed. Run reviewer decisions
+one at a time. Pure lock contention — a peer holding the write lock without having written a
+page, so no journal exists — still reports the retryable `decision_not_recorded` /
+`build_claim_not_recorded` outcome.
+
+**Threat-model boundary.** The supported location is a stable, local, operator-controlled state
+directory, and the protections above cover malformed, foreign, partial and corrupt databases,
+WAL and sidecar residue, crash-interrupted state, ordinary path or file replacement detected by
+ordered identity checks, cooperating concurrent tool processes, competing first-store creators,
+and post-publication cleanup and durability uncertainty. They do **not** make any sequence atomic
+against a privileged, non-cooperating process that can substitute a trusted path component
+during an open system call; that is outside the supported model and is not claimed.
 
 **Decision state machine.** Each `approve` / `reject` / `hold` runs three ordered, separately
 committed steps:
@@ -477,7 +559,7 @@ other outcome is a distinct nonzero exit so no partial state can be mistaken for
 | 6 | `publication_failed_after_reservation` | no | Reservation is durable but publication failed; the approval is blocked. |
 | 7 | `approval_consumed` / `rebuild_requires_fresh_approval` | no | The approval is terminally consumed (including by a competing reservation), or `--rebuild` (retired) was passed. Nothing was created or touched. |
 | 8 | `ledger_integrity_uncertain` | no | The audit ledger is not an intact append-only record, or a record fails its exact audit schema. Nothing was created, read further or repaired. |
-| 9 | `decision_audit_incomplete` / `decision_not_activated` / `decision_not_recorded` / `decision_store_integrity_uncertain` | no | Decision authority cannot be trusted: a decision is pending and non-authoritative, a commit outcome was unresolved, or the store is not intact. |
+| 9 | `decision_audit_incomplete` / `decision_not_activated` / `decision_not_recorded` / `decision_store_integrity_uncertain` / `claim_timestamp_order_invalid` | no | Decision authority cannot be trusted: a decision is pending and non-authoritative, a commit outcome was unresolved, the store is not intact, or a claim instant precedes the authority it binds. `decision_not_recorded` is the one retryable member of this row. |
 | 10 | `decision_store_missing` / `no_activated_decision` / `decision_not_approved` / `decision_pending_or_uncertain` / `decision_superseded_before_claim` | no | No activated decision authorises a build, or a reviewer decision won the race to the claim. A fresh reviewer decision is required. |
 | 11 | `build_claim_not_recorded` | no | The exclusive build claim was **not** committed, so the approval was **not** consumed. Nothing was created. A later **explicit** retry is allowed. |
 
@@ -495,6 +577,23 @@ output file, no ledger event and no decision-store mutation. Exit 9 with
 `decision_not_recorded` is the one decision outcome that stays retryable — nothing committed,
 so `approval_blocked` and `do_not_retry` are both false. Every other exit-9 status sets
 `approval_blocked`, `do_not_retry` and `controlled_recovery_required`.
+
+**Two exit-9 store states can leave a NEW file behind, and say so** — they are the only ones
+that report `decision_store_modified: true`:
+
+- `decision_store_integrity = store_publication_uncertain`: a first-use store was published but
+  its durability could not be proven. The store exists and is complete; nothing is rolled back
+  or deleted. Verify the state directory, then start a fresh reviewer decision.
+- `decision_store_integrity = store_temp_cleanup_incomplete`: the operation-owned creation
+  temporary could not be removed, so the store is reachable under a second name. The reported
+  `decision_store_temp_basename` names exactly one file (a basename, never a path). Delete that
+  one file by hand; until you do, the store is refused with `store_multiple_links` rather than
+  being used under two names.
+
+For `store_sidecar_present` or `store_journal_mode_unsupported`, do **not** delete, rename,
+checkpoint or roll back the journal, write-ahead log or shared-memory file. Establish why they
+are there — usually a crashed process or a concurrent writer — resolve it deliberately, and then
+start a fresh reviewer decision.
 
 Exit 3 (`cleanup_incomplete`) reports `stale_temp_basename` (a PII-free `.mcuat_pkg_*.tmp`
 name in the output directory) with `manual_cleanup_required`:

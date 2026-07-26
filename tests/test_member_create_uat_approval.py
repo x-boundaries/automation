@@ -2,7 +2,9 @@ import builtins
 import io
 import json
 import os
+import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -61,26 +63,82 @@ class _DecisionStoreFixtureMixin:
     def _store_path(self):
         return decisions.store_path_for(self.ledger)
 
-    def _open_store(self, *, create=False):
-        return decisions.open_store(self._store_path(), create=create)
+    def _raw(self):
+        """A RAW sqlite3 connection: no pragmas, so hostile states can be constructed exactly
+        the way a foreign writer would create them, and writes that the locked paths forbid can
+        still be attempted in a test. ``row_factory`` is a client-side convenience and changes
+        nothing about how the database is written."""
+        conn = sqlite3.connect(str(self._store_path()))
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def _sidecar_paths(self):
+        return [Path(str(self._store_path()) + suffix)
+                for suffix in decisions.STORE_SIDECAR_SUFFIXES]
+
+    def _store_snapshot(self):
+        """Everything a refusal must leave untouched: the main file's bytes and identity, every
+        exact sidecar's bytes and type, and the bounded fixture directory's entry list.
+
+        Amendment 8 widens the Amendment 7 snapshot, which compared the main file's bytes only
+        and so could not have detected a created `-wal`, a removed `-journal` or a replaced
+        file of identical length.
+        """
+        snapshot = {"dirents": sorted(os.listdir(self.tmp))}
+        for path in [self._store_path()] + self._sidecar_paths():
+            key = path.name
+            if not os.path.lexists(path):
+                snapshot[key] = None
+                continue
+            info = os.lstat(path)
+            snapshot[key] = {
+                "mode": stat.S_IFMT(info.st_mode),
+                "identity": (info.st_dev, info.st_ino),
+                "bytes": path.read_bytes() if stat.S_ISREG(info.st_mode) else None,
+            }
+        return snapshot
+
+    def _read_store(self, read, *, create=False):
+        """Read through the LOCKED read-only path, creating the store first when asked.
+
+        Amendment 8 removed the "open and hand back a connection" entry point: every read now
+        runs inside one validated read transaction and proves the file untouched afterwards,
+        so fixtures exercise exactly the production path.
+        """
+        if create:
+            decisions.ensure_store(self._store_path())
+        return decisions.read_validated(self._store_path(), read)
+
+    def _write_store(self, write, *, create=False):
+        """Run one write through the LOCKED trusted-writer sequence and commit once."""
+        if create:
+            decisions.ensure_store(self._store_path())
+        conn, _triage = decisions.begin_write(self._store_path())
+        try:
+            result = write(conn)
+            decisions._commit(conn)
+        except Exception:
+            decisions._rollback_quietly(conn)
+            raise
+        finally:
+            conn.close()
+        return result
 
     def _stored_decisions(self):
-        conn = self._open_store()
-        try:
-            return conn.execute(
+        return self._read_store(
+            lambda conn: conn.execute(
                 "SELECT d.*, a.activation_sequence AS activation_sequence "
                 "FROM decision d LEFT JOIN decision_activation a "
                 "ON a.decision_id = d.decision_id ORDER BY d.sequence"
             ).fetchall()
-        finally:
-            conn.close()
+        )
 
     def _activation_count(self):
-        conn = self._open_store()
-        try:
-            return conn.execute("SELECT COUNT(*) FROM decision_activation").fetchone()[0]
-        finally:
-            conn.close()
+        return self._read_store(
+            lambda conn: conn.execute(
+                "SELECT COUNT(*) FROM decision_activation"
+            ).fetchone()[0]
+        )
 
     def _record(self, decision_type, *, srid, fingerprint, reviewer="digital",
                 recorded_at=None, expires_at=None, approval_id=None, decision_id=None):
@@ -108,18 +166,15 @@ class _DecisionStoreFixtureMixin:
         return record
 
     def _insert_pending(self, record, *, create=True):
-        conn = self._open_store(create=create)
-        try:
-            decisions.insert_pending_decision(conn, record)
-        finally:
-            conn.close()
+        self._write_store(
+            lambda conn: decisions.insert_pending_decision(conn, record), create=create
+        )
         return record
 
     def _activate(self, record, *, activated_at=None, activation_hash=None):
         moment = activated_at or iso(datetime.now(timezone.utc))
-        conn = self._open_store()
-        try:
-            decisions.insert_activation(
+        self._write_store(
+            lambda conn: decisions.insert_activation(
                 conn,
                 record["decision_id"],
                 moment,
@@ -127,12 +182,50 @@ class _DecisionStoreFixtureMixin:
                     record["decision_id"], moment, record["record_hash"]
                 ),
             )
-        finally:
-            conn.close()
+        )
         return record
 
     def _insert_activated(self, decision_type, **kw):
         return self._activate(self._insert_pending(self._record(decision_type, **kw)))
+
+    # ---- hostile fixtures, written the way a FOREIGN writer would write them ---------- #
+    # Amendment 8's global validator refuses to open a write transaction against a store that
+    # already holds a malformed row, so a multi-step hostile fixture cannot be built through
+    # the production writer at all - which is precisely the property under test. These helpers
+    # therefore write directly, exactly as something other than this tool would.
+
+    def _hostile_pending(self, record, *, create=True):
+        if create:
+            decisions.ensure_store(self._store_path())
+        raw = self._raw()
+        try:
+            decisions.insert_pending_decision(raw, record)
+            raw.commit()
+        finally:
+            raw.close()
+        return record
+
+    def _hostile_activate(self, record, *, activated_at=None, activation_hash=None):
+        moment = activated_at or iso(datetime.now(timezone.utc))
+        raw = self._raw()
+        try:
+            decisions.insert_activation(
+                raw,
+                record["decision_id"],
+                moment,
+                activation_hash or decisions.activation_record_hash(
+                    record["decision_id"], moment, record["record_hash"]
+                ),
+            )
+            raw.commit()
+        finally:
+            raw.close()
+        return record
+
+    def _hostile_activated(self, decision_type, **kw):
+        return self._hostile_activate(
+            self._hostile_pending(self._record(decision_type, **kw))
+        )
 
     def _fixture_identity(self):
         """The (source_record_id, source_fingerprint) the synthetic form fixture resolves to."""
@@ -2441,14 +2534,14 @@ class DecisionTransactionRecoveryTests(_CreateUatBuildHarness):
         # Proof that recovery genuinely REOPENS: the recovery connection is counted.
         wrapper, _calls = self._commit_after_n(2)
         opens = {"n": 0}
-        real_open = decisions._open_existing
+        real_connect = decisions._connect_uri
 
-        def counting_open(path):
+        def counting_open(path, query):
             opens["n"] += 1
-            return real_open(path)
+            return real_connect(path, query)
 
         with mock.patch.object(decisions, "_commit", wrapper), \
-                mock.patch.object(decisions, "_open_existing", counting_open):
+                mock.patch.object(decisions, "_connect_uri", counting_open):
             code, out = self._approve_cli()
         self.assertEqual(code, 0, out)
         self.assertGreaterEqual(opens["n"], 2, "the store is reopened for recovery")
@@ -2501,7 +2594,7 @@ class DecisionTransactionRecoveryTests(_CreateUatBuildHarness):
         # A concurrent writer holding the write lock past the bounded busy timeout must fail
         # closed after exactly ONE attempt - never an automatic retry loop.
         self.assertEqual(self._approve_cli()[0], 0)   # establish the store
-        blocker = decisions.open_store(self._store_path(), create=False)
+        blocker = self._raw()
         attempts = {"n": 0}
         real_insert = decisions.insert_pending_decision
 
@@ -2510,9 +2603,13 @@ class DecisionTransactionRecoveryTests(_CreateUatBuildHarness):
             return real_insert(conn, record)
 
         try:
+            # RESERVED is held but no page has been written yet, so no rollback journal exists
+            # and the contention is decided by the bounded busy timeout rather than by
+            # pre-open triage.
             blocker.execute("BEGIN IMMEDIATE")
-            blocker.execute(
-                "INSERT INTO schema_meta (key, value) VALUES ('lock_probe', 'held')"
+            self.assertFalse(
+                any(os.path.lexists(p) for p in self._sidecar_paths()),
+                "BEGIN IMMEDIATE alone must not create a rollback journal",
             )
             with mock.patch.object(decisions, "BUSY_TIMEOUT_MS", 200), \
                     mock.patch.object(decisions, "insert_pending_decision", counting_insert):
@@ -2521,9 +2618,42 @@ class DecisionTransactionRecoveryTests(_CreateUatBuildHarness):
             decisions._rollback_quietly(blocker)
             blocker.close()
         self.assertEqual(code, approval.EXIT_DECISION_AUTHORITY_UNCERTAIN, out)
-        self.assertEqual(json.loads(out)["status"], "decision_not_recorded")
-        self.assertEqual(attempts["n"], 1, "exactly one attempt: no automatic retry loop")
+        # Nothing was written and no filesystem object changed, so lock contention keeps the
+        # explicit-retry boundary rather than becoming a terminal integrity failure.
+        summary = json.loads(out)
+        self.assertEqual(summary["status"], "decision_not_recorded")
+        self.assertIs(summary["do_not_retry"], False)
+        self.assertEqual(attempts["n"], 0, "the insert is never reached: no retry loop")
         self.assertEqual(len(self._stored_decisions()), 1, "only the first decision exists")
+
+    def test_a_concurrent_writers_journal_is_refused_without_being_touched(self):
+        # Amendment 8: a concurrent writer that has actually written a page leaves a rollback
+        # journal, and pure pre-open triage refuses on it BEFORE SQLite is opened. Such a store
+        # is controlled-recovery-only: the journal is never rolled back, deleted or renamed.
+        self.assertEqual(self._approve_cli()[0], 0)
+        blocker = self._raw()
+        try:
+            blocker.execute("BEGIN IMMEDIATE")
+            blocker.execute(
+                "INSERT INTO schema_meta (key, value) VALUES ('lock_probe', 'held')"
+            )
+            journal = Path(str(self._store_path()) + "-journal")
+            self.assertTrue(journal.exists(), "a written transaction leaves a journal")
+            before = journal.read_bytes()
+            code, out = self._approve_cli()
+            self.assertEqual(code, approval.EXIT_DECISION_AUTHORITY_UNCERTAIN, out)
+            summary = json.loads(out)
+            self.assertEqual(summary["status"], "decision_store_integrity_uncertain")
+            self.assertEqual(summary["decision_store_integrity"], "store_sidecar_present")
+            self.assertIs(summary["decision_store_modified"], False)
+            self.assertIs(summary["do_not_retry"], True)
+            self.assertNotIn("Traceback", out)
+            self.assertTrue(journal.exists(), "the journal is never removed")
+            self.assertEqual(journal.read_bytes(), before, "the journal is never altered")
+        finally:
+            decisions._rollback_quietly(blocker)
+            blocker.close()
+        self.assertEqual(len(self._stored_decisions()), 1, "no second decision was recorded")
 
 
 class DecisionOrderingTests(_CreateUatBuildHarness):
@@ -2733,10 +2863,12 @@ class DecisionStoreIntegrityTests(_CreateUatBuildHarness):
         self._assert_store_refusal(code, out, reason="integrity_check_failed")
 
     def test_corrupted_store_refuses(self):
+        # Overwritten with non-database bytes: pre-open triage sees no SQLite magic and refuses
+        # before opening, so the reason names the header rather than a SQLite read error.
         self._prepare_activated_approval()
         self._store_path().write_bytes(b"this is definitely not a SQLite database\n" * 8)
         code, out = self._build()
-        self._assert_store_refusal(code, out, reason="store_corrupt")
+        self._assert_store_refusal(code, out, reason="store_header_invalid")
 
     def test_malformed_canonical_record_hash_refuses(self):
         # A decision row whose canonical hash does not recompute was altered outside this
@@ -2745,7 +2877,7 @@ class DecisionStoreIntegrityTests(_CreateUatBuildHarness):
         srid, fp = self._fixture_identity()
         record = self._record("approved", srid=srid, fingerprint=fp)
         record["record_hash"] = "sha256:" + ("0" * 64)
-        self._activate(self._insert_pending(record))
+        self._hostile_activate(self._hostile_pending(record))
         self._assert_store_refusal(*self._build(), reason="record_hash_mismatch")
 
     def test_malformed_field_value_refuses_as_invalid_field_type(self):
@@ -2755,7 +2887,7 @@ class DecisionStoreIntegrityTests(_CreateUatBuildHarness):
         record = self._record("approved", srid=srid, fingerprint=fp)
         record["reviewer_id"] = "NOT A REVIEWER HANDLE"   # fails REVIEWER_ID_RE
         record["record_hash"] = decisions.decision_record_hash(record)
-        self._activate(self._insert_pending(record))
+        self._hostile_activate(self._hostile_pending(record))
         self._assert_store_refusal(*self._build(), reason="invalid_field_type")
 
     def test_wrong_field_type_refuses(self):
@@ -2767,7 +2899,7 @@ class DecisionStoreIntegrityTests(_CreateUatBuildHarness):
         record = self._record("approved", srid=srid, fingerprint=fp)
         record["reviewer_id"] = 12345
         record["record_hash"] = decisions.decision_record_hash(record)
-        self._activate(self._insert_pending(record))
+        self._hostile_activate(self._hostile_pending(record))
         summary = self._assert_store_refusal(*self._build(), reason="record_hash_mismatch")
         self.assertIs(summary["approval_blocked"], True)
 
@@ -2781,7 +2913,7 @@ class DecisionStoreIntegrityTests(_CreateUatBuildHarness):
 
     def test_store_history_cannot_be_updated_or_deleted(self):
         self._prepare_activated_approval()
-        conn = self._open_store()
+        conn = self._raw()
         try:
             for statement in (
                 "UPDATE decision SET reviewer_id = 'tampered'",
@@ -2801,7 +2933,7 @@ class DecisionStoreIntegrityTests(_CreateUatBuildHarness):
 
     def test_store_rows_contain_no_member_data_or_credentials(self):
         self._prepare_activated_approval()
-        conn = self._open_store()
+        conn = self._raw()
         try:
             dumped = "\n".join(
                 "|".join("" if value is None else str(value) for value in row)
@@ -2837,6 +2969,89 @@ class ConcurrentDecisionTests(_CreateUatBuildHarness):
             """
         )
 
+    # Amendment 8 changed what "safe under concurrency" MEANS for these processes. Pre-open
+    # triage refuses any store carrying a sidecar, and a peer that is mid-transaction has a
+    # rollback journal, so a concurrent reviewer decision now either commits cleanly or fails
+    # CLOSED - it no longer waits on the busy timeout and then commits. Both outcomes are
+    # safe; what these tests pin down is that every process ends in exactly one of them, that
+    # a refusal writes nothing at all, and that whatever does commit stays unique, ordered and
+    # globally valid.
+
+    # The three ways a peer that is mid-operation is observed, all fail-closed and all leaving
+    # the store exactly as found:
+    #   * store_sidecar_present - the peer is inside a write transaction, so its rollback
+    #     journal exists and the store is controlled-recovery-only;
+    #   * store_locked          - the peer holds RESERVED but has written no page yet, so the
+    #     bounded busy timeout expires;
+    #   * store_unreadable      - on Windows the peer's in-flight no-replace publication can
+    #     make the just-appeared path briefly unopenable. Failing closed is correct; retrying
+    #     automatically is exactly what the contract forbids.
+    _CLEAN_CONTENTION_REFUSALS = (
+        "store_sidecar_present",
+        "store_locked",
+        "store_unreadable",
+    )
+
+    def _assert_contention_outcome(self, returncode, out, err):
+        """One concurrent process either fully succeeded or fully refused.
+
+        Returns the process's own ``decision_id`` when it succeeded, else None. A refusal is
+        never allowed to be a traceback, an unclassified error, or a partially authoritative
+        decision.
+        """
+        self.assertNotIn("Traceback", err)
+        self.assertNotIn("Traceback", out)
+        summary = json.loads(out)
+        if returncode == 0:
+            self.assertEqual(summary["status"], "ok")
+            self.assertIs(summary["decision_activated"], True)
+            return summary["decision_id"]
+        self.assertEqual(returncode, approval.EXIT_DECISION_AUTHORITY_UNCERTAIN, out + err)
+        if summary["status"] == "decision_store_integrity_uncertain":
+            self.assertIn(summary["decision_store_integrity"],
+                          self._CLEAN_CONTENTION_REFUSALS, out)
+            self.assertIs(summary["decision_store_modified"], False)
+        else:
+            # The pending row committed but a later stage met the peer mid-operation. The
+            # decision stays recorded-and-non-authoritative; it is never silently promoted.
+            self.assertIn(summary["status"],
+                          ("decision_not_recorded", "decision_not_activated",
+                           "decision_audit_incomplete"), out)
+            self.assertIs(summary["decision_activated"], False)
+        return None
+
+    def _assert_store_is_globally_valid(self):
+        decisions.inspect_store(self._store_path())
+
+    def _surviving_rows(self, committed):
+        """The decision rows that exist, having first established that they may not.
+
+        Liveness under contention is deliberately NOT guaranteed: because a sidecar is refused
+        unconditionally, two processes that interleave badly enough can both fail closed and
+        leave no store at all. What is guaranteed - and what these tests pin down - is that no
+        outcome is ever partially authoritative, corrupt or ambiguous.
+        """
+        if not os.path.lexists(self._store_path()):
+            self.assertEqual(committed, [],
+                             "a reported success must leave a store behind")
+            return []
+        self._assert_store_is_globally_valid()
+        return self._stored_decisions()
+
+    def _assert_successes_are_activated(self, rows, committed_ids):
+        """Every process that reported success owns exactly one ACTIVATED row.
+
+        A process that refused may still have left a committed-but-unactivated pending row -
+        that is the honest outcome when the peer was met after step 1 - so the row count is
+        bounded, not fixed.
+        """
+        by_id = {row["decision_id"]: row for row in rows}
+        for decision_id in committed_ids:
+            self.assertIn(decision_id, by_id, "a reported success must be in the store")
+            self.assertIsNotNone(by_id[decision_id]["activation_sequence"],
+                                 "a reported success must be activated")
+        self.assertGreaterEqual(len(rows), len(committed_ids))
+
     def test_two_concurrent_decision_processes_serialize_and_stay_unique(self):
         first = subprocess.Popen(
             [sys.executable, "-c", self._decide_script("approve")],
@@ -2848,26 +3063,38 @@ class ConcurrentDecisionTests(_CreateUatBuildHarness):
         )
         first_out, first_err = first.communicate(timeout=120)
         second_out, second_err = second.communicate(timeout=120)
-        self.assertEqual(first.returncode, 0, first_out + first_err)
-        self.assertEqual(second.returncode, 0, second_out + second_err)
-        self.assertNotIn("Traceback", first_err)
-        self.assertNotIn("Traceback", second_err)
+        committed = [
+            self._assert_contention_outcome(first.returncode, first_out, first_err),
+            self._assert_contention_outcome(second.returncode, second_out, second_err),
+        ]
+        committed = [decision_id for decision_id in committed if decision_id is not None]
 
-        rows = self._stored_decisions()
-        self.assertEqual(len(rows), 2, "both decisions committed")
+        # Whatever committed is unique, monotonically sequenced and globally canonical.
+        rows = self._surviving_rows(committed)
+        self._assert_successes_are_activated(rows, committed)
         sequences = [row["sequence"] for row in rows]
         self.assertEqual(sequences, sorted(sequences))
-        self.assertEqual(len(set(sequences)), 2, "sequences are unique and monotonic")
-        self.assertEqual(len(set(row["decision_id"] for row in rows)), 2)
+        self.assertEqual(len(set(sequences)), len(sequences), "sequences stay unique")
+        self.assertEqual(len(set(row["decision_id"] for row in rows)), len(rows))
         approval_ids = [row["approval_id"] for row in rows if row["approval_id"] is not None]
         self.assertEqual(len(approval_ids), len(set(approval_ids)))
-        for row in rows:
-            self.assertIsNotNone(row["activation_sequence"], "each decision activated")
-        # The newest activated decision wins. It is a hold exactly when the hold committed
-        # last, and the build outcome must agree with that ordering either way.
-        newest = rows[-1]["decision_type"]
+        activated = [row for row in rows if row["activation_sequence"] is not None]
+        if not activated:
+            # Every process failed closed. Nothing may authorise a build.
+            code, out = self._build()
+            self.assertNotEqual(code, 0, out)
+            self.assertNotIn("Traceback", out)
+            return
+
+        # The newest ACTIVATED decision wins, and the build must agree with that ordering.
+        newest = activated[-1]
+        pending_after = [row for row in rows
+                         if row["activation_sequence"] is None
+                         and row["sequence"] > newest["sequence"]]
         code, out = self._build()
-        if newest == "hold":
+        if pending_after:
+            self.assertEqual(code, approval.EXIT_DECISION_NOT_AUTHORITATIVE, out)
+        elif newest["decision_type"] == "hold":
             self.assertEqual(code, approval.EXIT_DECISION_NOT_AUTHORITATIVE, out)
             self.assertEqual(json.loads(out)["decision_authority"],
                              decisions.AuthorityState.HOLD)
@@ -2881,13 +3108,19 @@ class ConcurrentDecisionTests(_CreateUatBuildHarness):
             for _ in range(2)
         ]
         outputs = [proc.communicate(timeout=120) for proc in procs]
-        for proc, (out, err) in zip(procs, outputs):
-            self.assertEqual(proc.returncode, 0, out + err)
-        rows = self._stored_decisions()
-        self.assertEqual(len(rows), 2)
-        self.assertEqual(len({row["approval_id"] for row in rows}), 2)
-        self.assertEqual(len({row["decision_id"] for row in rows}), 2)
-        self.assertEqual([row["sequence"] for row in rows], [1, 2])
+        committed = [
+            self._assert_contention_outcome(proc.returncode, out, err)
+            for proc, (out, err) in zip(procs, outputs)
+        ]
+        committed = [decision_id for decision_id in committed if decision_id is not None]
+        rows = self._surviving_rows(committed)
+        self._assert_successes_are_activated(rows, committed)
+        self.assertLessEqual(len(rows), len(procs), "no process contributes two rows")
+        self.assertEqual(len({row["approval_id"] for row in rows}), len(rows),
+                         "no approval identifier is ever reused")
+        self.assertEqual(len({row["decision_id"] for row in rows}), len(rows))
+        self.assertEqual([row["sequence"] for row in rows],
+                         sorted(row["sequence"] for row in rows))
 
 
 class LedgerAuditSchemaTests(_CreateUatBuildHarness):
@@ -3159,19 +3392,69 @@ class _ClaimHarness(_CreateUatBuildHarness):
     """Shared helpers for the Amendment 7 build-claim suites."""
 
     def _claims(self):
-        conn = self._open_store()
-        try:
-            return conn.execute("SELECT * FROM build_claim ORDER BY claim_sequence").fetchall()
-        finally:
-            conn.close()
+        return self._read_store(
+            lambda conn: conn.execute(
+                "SELECT * FROM build_claim ORDER BY claim_sequence"
+            ).fetchall()
+        )
 
     def _claim_count(self):
         return len(self._claims())
 
-    def _raw(self):
-        """A RAW sqlite3 connection: no pragmas, so hostile states can be constructed exactly
-        the way a foreign writer would create them."""
-        return sqlite3.connect(str(self._store_path()))
+    def _canonical_store(self):
+        decisions.ensure_store(self._store_path())
+        return self._store_path()
+
+    def _assert_refused_untouched(self, reason=None, *, decision_command=True):
+        """Every hostile existing store is refused, and the WHOLE fixture is preserved.
+
+        Amendment 8 asserts the complete snapshot - main-file bytes and identity, every exact
+        sidecar's bytes and type, and the bounded fixture directory's entries - through the
+        read-only inspection path, a reviewer decision command, `build-package` and all three
+        COMMIT-recovery entry points.
+        """
+        path = self._store_path()
+        before = self._store_snapshot()
+
+        with self.assertRaises(decisions.DecisionStoreError) as caught:
+            decisions.inspect_store(path)
+        if reason is not None:
+            self.assertEqual(caught.exception.reason, reason)
+        self.assertIn(caught.exception.reason, decisions.STORE_INTEGRITY_REASONS)
+        self.assertEqual(self._store_snapshot(), before, "inspection must change nothing")
+
+        # Every COMMIT-recovery entry point must refuse the same way, reporting UNCERTAIN
+        # rather than a false ABSENT that would wrongly permit a retry.
+        for recover, args in (
+            (decisions.recover_decision_commit, ("dec_" + ("0" * 32), "sha256:" + ("0" * 64))),
+            (decisions.recover_activation_commit, ("dec_" + ("0" * 32), "sha256:" + ("0" * 64))),
+            (decisions.recover_claim_commit, ("claim_" + ("0" * 32), "sha256:" + ("0" * 64))),
+        ):
+            with self.subTest(recovery=recover.__name__):
+                state, row = recover(path, *args)
+                self.assertEqual(state, decisions.CommitState.UNCERTAIN)
+                self.assertIsNone(row)
+                self.assertEqual(self._store_snapshot(), before,
+                                 "recovery must change nothing")
+
+        if decision_command:
+            code, out = self._approve()
+            self.assertEqual(code, approval.EXIT_DECISION_AUTHORITY_UNCERTAIN, out)
+            self.assertNotIn("Traceback", out)
+            self.assertEqual(json.loads(out)["status"], "decision_store_integrity_uncertain")
+            self.assertEqual(self._store_snapshot(), before,
+                             "a reviewer decision must change nothing")
+
+        code, out = self._build()
+        self.assertEqual(code, approval.EXIT_DECISION_AUTHORITY_UNCERTAIN, out)
+        self.assertNotIn("Traceback", out)
+        summary = json.loads(out)
+        self.assertEqual(summary["status"], "decision_store_integrity_uncertain")
+        self.assertIs(summary["decision_store_modified"], False)
+        self.assertEqual(self._store_snapshot(), before, "a build must change nothing")
+        self.assertFalse(self.package.exists())
+        self.assertEqual(self._reservations(), [])
+        self.assertEqual(self._stray_temps(), [])
 
     def _raw_claim_count(self):
         """Claim count on a RAW connection, so a deliberately invalid store can still be
@@ -3387,17 +3670,34 @@ class CompetingBuildClaimTests(_ClaimHarness):
         self.assertIn(0, codes, f"one process must win: codes={codes}")
         loser = [code for code in codes if code != 0]
         self.assertEqual(len(loser), 1)
+        # Amendment 8 adds a third safe way for the loser to be turned away. Under the locked
+        # sidecar rule, meeting the winner's rollback journal refuses the loser on pure
+        # pre-open triage - before it can claim, reserve, publish or write anything - which is
+        # exit 9 rather than the claim-time exits 7 and 10. The invariants above already
+        # proved the loser created nothing.
         self.assertIn(
             loser[0],
-            (approval.EXIT_APPROVAL_CONSUMED, approval.EXIT_DECISION_NOT_AUTHORITATIVE),
+            (approval.EXIT_APPROVAL_CONSUMED,
+             approval.EXIT_DECISION_NOT_AUTHORITATIVE,
+             approval.EXIT_DECISION_AUTHORITY_UNCERTAIN),
             f"codes={codes}",
         )
+        if loser[0] == approval.EXIT_DECISION_AUTHORITY_UNCERTAIN:
+            refusals = [json.loads(out) for out, _err in results
+                        if out.strip().startswith("{")
+                        and json.loads(out).get("status") != "ok"]
+            self.assertEqual(len(refusals), 1, f"codes={codes}")
+            summary = refusals[0]
+            self.assertEqual(summary["status"], "decision_store_integrity_uncertain")
+            self.assertIn(summary["decision_store_integrity"],
+                          ("store_sidecar_present", "store_locked", "store_unreadable"))
+            self.assertIs(summary["decision_store_modified"], False)
 
     def test_no_approval_can_carry_two_claims_and_no_operation_id_is_reused(self):
         self._prepare_activated_approval()
         self.assertEqual(self._build()[0], 0)
         claim = self._claims()[0]
-        conn = self._open_store()
+        conn = self._raw()
         try:
             for column in ("approval_id", "claim_id", "decision_id", "operation_id"):
                 with self.subTest(duplicate=column):
@@ -3482,14 +3782,14 @@ class ClaimTransactionRecoveryTests(_ClaimHarness):
     def test_recovery_uses_a_new_connection(self):
         self._prepare_activated_approval()
         opens = {"n": 0}
-        real_open = decisions._open_existing
+        real_connect = decisions._connect_uri
 
-        def counting_open(path):
+        def counting_open(path, query):
             opens["n"] += 1
-            return real_open(path)
+            return real_connect(path, query)
 
         with mock.patch.object(decisions, "_commit", self._commit_then_raise()), \
-                mock.patch.object(decisions, "_open_existing", counting_open):
+                mock.patch.object(decisions, "_connect_uri", counting_open):
             code, out = self._build()
         self.assertEqual(code, 0, out)
         self.assertGreaterEqual(opens["n"], 3, "the store is reopened for claim recovery")
@@ -3556,12 +3856,12 @@ class ClaimTransactionRecoveryTests(_ClaimHarness):
             attempts["n"] += 1
             return real_insert(conn, record)
 
-        blocker = decisions.open_store(self._store_path(), create=False)
+        blocker = self._raw()
         try:
+            # RESERVED held with no page written: no rollback journal, so the bounded busy
+            # timeout - not pre-open triage - decides the contention.
             blocker.execute("BEGIN IMMEDIATE")
-            blocker.execute(
-                "INSERT INTO schema_meta (key, value) VALUES ('lock_probe', 'held')"
-            )
+            self.assertFalse(any(os.path.lexists(p) for p in self._sidecar_paths()))
             with mock.patch.object(decisions, "BUSY_TIMEOUT_MS", 200), \
                     mock.patch.object(decisions, "insert_build_claim", counting_insert):
                 code, out = self._build()
@@ -3573,6 +3873,35 @@ class ClaimTransactionRecoveryTests(_ClaimHarness):
         self.assertEqual(attempts["n"], 0, "the claim insert is never reached")
         self._assert_nothing_created()
         self.assertFalse(self.package.exists())
+
+    def test_a_concurrent_writers_journal_blocks_the_build_before_sqlite_opens(self):
+        # Amendment 8: once a concurrent writer has written a page, its rollback journal makes
+        # the store controlled-recovery-only. The build refuses on pure triage, claims nothing,
+        # and leaves the journal byte-for-byte intact.
+        self._prepare_activated_approval()
+        blocker = self._raw()
+        try:
+            blocker.execute("BEGIN IMMEDIATE")
+            blocker.execute(
+                "INSERT INTO schema_meta (key, value) VALUES ('lock_probe', 'held')"
+            )
+            journal = Path(str(self._store_path()) + "-journal")
+            self.assertTrue(journal.exists())
+            before = journal.read_bytes()
+            code, out = self._build()
+            self.assertEqual(code, approval.EXIT_DECISION_AUTHORITY_UNCERTAIN, out)
+            summary = json.loads(out)
+            self.assertEqual(summary["decision_store_integrity"], "store_sidecar_present")
+            self.assertIs(summary["decision_store_modified"], False)
+            self.assertNotIn("Traceback", out)
+            self.assertEqual(journal.read_bytes(), before)
+        finally:
+            decisions._rollback_quietly(blocker)
+            blocker.close()
+        self.assertEqual(self._raw_claim_count(), 0)
+        self.assertFalse(self.package.exists())
+        self.assertEqual(self._reservations(), [])
+        self.assertEqual(self._stray_temps(), [])
 
 
 class PostClaimFailureTests(_ClaimHarness):
@@ -3739,39 +4068,31 @@ class ExistingStoreHostilityTests(_ClaimHarness):
     nothing is created.
     """
 
-    def _canonical_store(self):
-        conn = self._open_store(create=True)
-        conn.close()
-        return self._store_path()
-
-    def _assert_refused_untouched(self, reason=None):
-        path = self._store_path()
-        before = path.read_bytes()
-        for create in (True, False):
-            with self.subTest(create=create):
-                with self.assertRaises(decisions.DecisionStoreError) as caught:
-                    decisions.open_store(path, create=create)
-                if reason is not None:
-                    self.assertEqual(caught.exception.reason, reason)
-                self.assertIn(caught.exception.reason, decisions.STORE_INTEGRITY_REASONS)
-                self.assertEqual(path.read_bytes(), before, "the store must be untouched")
-        code, out = self._build()
-        self.assertEqual(code, approval.EXIT_DECISION_AUTHORITY_UNCERTAIN, out)
-        self.assertNotIn("Traceback", out)
-        summary = json.loads(out)
-        self.assertEqual(summary["status"], "decision_store_integrity_uncertain")
-        self.assertIs(summary["decision_store_modified"], False)
-        self.assertEqual(path.read_bytes(), before)
-        self.assertFalse(self.package.exists())
-        self.assertEqual(self._reservations(), [])
-        self.assertEqual(self._stray_temps(), [])
-
     def test_zero_byte_file_is_refused_untouched(self):
+        # Amendment 8 decides this from the bytes: there is no 100-byte SQLite header, so the
+        # file is refused before SQLite is opened at all. (SQLite itself would have opened a
+        # zero-byte file happily and even reported `integrity_check = ok`.)
         self._store_path().write_bytes(b"")
-        self._assert_refused_untouched(reason="missing_object")
+        self._assert_refused_untouched(reason="store_header_invalid")
 
     def test_empty_sqlite_database_is_refused_untouched(self):
+        # A connect-and-close leaves a zero-byte file with no header, so pre-open triage
+        # refuses it. A database with a real header but no canonical objects is covered by
+        # test_headered_empty_database_is_refused_untouched below.
         sqlite3.connect(str(self._store_path())).close()
+        self._assert_refused_untouched(reason="store_header_invalid")
+
+    def test_headered_empty_database_is_refused_untouched(self):
+        # A genuinely initialised but object-less database DOES pass triage, so the canonical
+        # object-set check is what refuses it - proving triage did not mask that stage.
+        raw = sqlite3.connect(str(self._store_path()))
+        try:
+            raw.execute("PRAGMA journal_mode=DELETE")
+            raw.execute("CREATE TABLE placeholder (id INTEGER PRIMARY KEY)")
+            raw.execute("DROP TABLE placeholder")
+            raw.commit()
+        finally:
+            raw.close()
         self._assert_refused_untouched(reason="missing_object")
 
     def test_v1_store_is_refused_untouched(self):
@@ -3979,7 +4300,7 @@ class ExistingStoreHostilityTests(_ClaimHarness):
         # The trigger enforces the BINDINGS; the canonical row hash is validated in Python, so a
         # claim with correct bindings but a tampered hash is still refused.
         record = self._prepare_activated_approval()
-        conn = self._open_store()
+        conn = self._raw()
         try:
             claim = {
                 "claim_id": "claim_" + uuid.uuid4().hex,
@@ -4032,7 +4353,22 @@ class ExistingStoreHostilityTests(_ClaimHarness):
         before = path.read_bytes()
         code, out = self._build()
         self.assertEqual(code, approval.EXIT_DECISION_AUTHORITY_UNCERTAIN, out)
-        self.assertEqual(json.loads(out)["decision_store_integrity"], "store_corrupt")
+        self.assertEqual(json.loads(out)["decision_store_integrity"], "store_header_invalid")
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_headered_but_malformed_database_is_refused_as_corrupt(self):
+        # A file that DOES carry a valid rollback-format header but whose pages are truncated
+        # passes triage and is refused by SQLite's own structural read, proving that triage
+        # does not shadow the `store_corrupt` / `integrity_check_failed` classifications.
+        self._canonical_store()
+        path = self._store_path()
+        intact = path.read_bytes()
+        path.write_bytes(intact[: len(intact) // 3])
+        before = path.read_bytes()
+        code, out = self._build()
+        self.assertEqual(code, approval.EXIT_DECISION_AUTHORITY_UNCERTAIN, out)
+        self.assertIn(json.loads(out)["decision_store_integrity"],
+                      ("store_corrupt", "integrity_check_failed"))
         self.assertEqual(path.read_bytes(), before)
 
     def test_a_decision_command_never_runs_ddl_against_an_existing_store(self):
@@ -4065,13 +4401,10 @@ class ExistingStoreHostilityTests(_ClaimHarness):
         )
         self.assertEqual(code, 0)
         self.assertTrue(self._store_path().is_file())
-        conn = self._open_store()
-        try:
-            decisions.validate_store(conn)
-            self.assertEqual(decisions._integrity_check(conn), "ok")
-            self.assertEqual(decisions._foreign_key_check(conn), [])
-        finally:
-            conn.close()
+        self._read_store(lambda conn: (
+            self.assertEqual(decisions._integrity_check(conn), "ok"),
+            self.assertEqual(decisions._foreign_key_check(conn), []),
+        ))
         self.assertEqual([f for f in os.listdir(self.tmp) if "mcuat_decisions" in f], [],
                          "no operation-owned store temporary is left behind")
 
@@ -4111,14 +4444,14 @@ class TimestampHostilityTests(_ClaimHarness):
 
     def test_naive_recorded_at_is_refused(self):
         srid, fingerprint = self._fixture_identity()
-        self._insert_activated("approved", srid=srid, fingerprint=fingerprint,
-                               recorded_at=self.NAIVE)
+        self._hostile_activated("approved", srid=srid, fingerprint=fingerprint,
+                                recorded_at=self.NAIVE)
         self._assert_store_timestamp_refusal("naive_timestamp")
 
     def test_naive_expires_at_is_refused(self):
         srid, fingerprint = self._fixture_identity()
-        self._insert_activated("approved", srid=srid, fingerprint=fingerprint,
-                               expires_at=self.NAIVE)
+        self._hostile_activated("approved", srid=srid, fingerprint=fingerprint,
+                                expires_at=self.NAIVE)
         self._assert_store_timestamp_refusal("naive_timestamp")
 
     def test_naive_approved_at_is_refused(self):
@@ -4126,7 +4459,7 @@ class TimestampHostilityTests(_ClaimHarness):
         record = self._record("approved", srid=srid, fingerprint=fingerprint)
         record["approved_at"] = self.NAIVE
         record["record_hash"] = decisions.decision_record_hash(record)
-        self._activate(self._insert_pending(record))
+        self._hostile_activate(self._hostile_pending(record))
         self._assert_store_timestamp_refusal("naive_timestamp")
 
     def test_naive_activated_at_is_refused(self):
@@ -4137,7 +4470,7 @@ class TimestampHostilityTests(_ClaimHarness):
 
     def test_naive_claimed_at_is_refused(self):
         record = self._prepare_activated_approval()
-        conn = self._open_store()
+        conn = self._raw()
         try:
             claim = {
                 "claim_id": "claim_" + uuid.uuid4().hex,
@@ -4167,8 +4500,8 @@ class TimestampHostilityTests(_ClaimHarness):
             with self.subTest(value=value):
                 self._reset()
                 srid, fingerprint = self._fixture_identity()
-                self._insert_activated("approved", srid=srid, fingerprint=fingerprint,
-                                       expires_at=value)
+                self._hostile_activated("approved", srid=srid, fingerprint=fingerprint,
+                                        expires_at=value)
                 code, out = self._build()
                 self.assertEqual(code, approval.EXIT_DECISION_AUTHORITY_UNCERTAIN, out)
                 self.assertEqual(
@@ -4178,7 +4511,7 @@ class TimestampHostilityTests(_ClaimHarness):
 
     def test_expiry_before_approval_is_refused(self):
         srid, fingerprint = self._fixture_identity()
-        self._insert_activated(
+        self._hostile_activated(
             "approved", srid=srid, fingerprint=fingerprint,
             recorded_at="2026-07-25T12:00:00+00:00", expires_at="2026-07-25T11:00:00+00:00",
         )
@@ -4249,6 +4582,1375 @@ class TimestampHostilityTests(_ClaimHarness):
             self._assert_ledger_integrity_uncertain(code, out)["ledger_integrity"],
             "publication_field_invalid",
         )
+
+
+# =========================================================================== #
+# Amendment 8 - design lock DL-113-A8-001
+# =========================================================================== #
+class _RecordingConnection:
+    """A pass-through SQLite connection that records every statement it is asked to run.
+
+    Used to prove behaviourally - not by reading the source - that no persistent database
+    property is ever assigned to a store this operation did not just create.
+    """
+
+    def __init__(self, conn, log):
+        object.__setattr__(self, "_conn", conn)
+        object.__setattr__(self, "_log", log)
+
+    def execute(self, sql, *args):
+        self._log.append(sql)
+        return self._conn.execute(sql, *args)
+
+    def close(self):
+        return self._conn.close()
+
+    def __getattr__(self, name):
+        return getattr(object.__getattribute__(self, "_conn"), name)
+
+    def __setattr__(self, name, value):
+        setattr(self._conn, name, value)
+
+
+class _TriageHarness(_ClaimHarness):
+    """Shared fixtures for the Amendment 8 pre-open triage and publication suites."""
+
+    def _wal_header_store(self):
+        """A canonical store flipped to WAL format, with NO sidecars left behind.
+
+        Closing the last connection checkpoints and removes `-wal`/`-shm`, so what remains is
+        the hardest case: a file that still looks canonical but whose header says WAL.
+        """
+        self._canonical_store()
+        raw = sqlite3.connect(str(self._store_path()))
+        try:
+            raw.execute("PRAGMA journal_mode=WAL")
+        finally:
+            raw.close()
+        return self._store_path()
+
+    def _header_bytes(self):
+        with open(self._store_path(), "rb") as handle:
+            return handle.read(100)
+
+    def _assert_wal_header(self):
+        raw = self._header_bytes()
+        self.assertEqual((raw[18], raw[19]), (2, 2), "the fixture must be WAL format")
+
+    def _write_sidecar(self, suffix, payload=b"synthetic sidecar residue\n"):
+        path = Path(str(self._store_path()) + suffix)
+        path.write_bytes(payload)
+        return path
+
+    def _assert_no_sqlite_connect(self, call):
+        """Prove a refusal is decided by pure triage: SQLite is never opened at all."""
+        def forbidden(*args, **kwargs):
+            raise AssertionError(
+                "no SQLite connection may be opened for a pre-triage refusal"
+            )
+
+        with mock.patch.object(sqlite3, "connect", forbidden):
+            with self.assertRaises(decisions.DecisionStoreError) as caught:
+                call()
+        return caught.exception
+
+    def _second_canonical_store(self, name="other"):
+        """A DIFFERENT canonical store, built in its own directory."""
+        other_dir = self.tmp / name
+        other_dir.mkdir(exist_ok=True)
+        other_path = other_dir / decisions.DECISION_STORE_NAME
+        decisions.create_store_exclusively(other_path)
+        return other_path
+
+
+class PreOpenTriageTests(_TriageHarness):
+    """Lock section 2: a WAL header or any sidecar is refused BEFORE SQLite is opened.
+
+    Amendment 7 opened the file first and applied a persistent `journal_mode=DELETE`, so a
+    WAL-mode database was rewritten - and its `-wal`/`-shm` removed - before the code decided
+    to refuse it. Removing a write-ahead log is the documented way to destroy crash recovery,
+    so the decision has to be taken from the file's own bytes, with no SQLite involvement.
+    """
+
+    def test_wal_header_without_sidecars_is_refused_before_sqlite_opens(self):
+        self._wal_header_store()
+        self._assert_wal_header()
+        before = self._store_snapshot()
+        error = self._assert_no_sqlite_connect(
+            lambda: decisions.inspect_store(self._store_path())
+        )
+        self.assertEqual(error.reason, "store_journal_mode_unsupported")
+        self.assertEqual(self._store_snapshot(), before)
+        self._assert_refused_untouched(reason="store_journal_mode_unsupported")
+
+    def test_a_live_wal_and_shm_are_refused_and_left_intact(self):
+        # A genuine, uncheckpointed write-ahead log: the case where Amendment 7 would have
+        # deleted committed data belonging to another writer.
+        self._canonical_store()
+        holder = sqlite3.connect(str(self._store_path()))
+        try:
+            holder.execute("PRAGMA journal_mode=WAL")
+            holder.execute("PRAGMA wal_autocheckpoint=0")
+            holder.execute(
+                "INSERT INTO schema_meta (key, value) VALUES ('wal_probe', 'resident')"
+            )
+            holder.commit()
+            wal = Path(str(self._store_path()) + "-wal")
+            self.assertTrue(wal.exists(), "the fixture must have a live -wal")
+            before = self._store_snapshot()
+            error = self._assert_no_sqlite_connect(
+                lambda: decisions.inspect_store(self._store_path())
+            )
+            # Sidecar presence is decided before the header is even consulted.
+            self.assertIn(error.reason,
+                          ("store_sidecar_present", "store_journal_mode_unsupported"))
+            self.assertEqual(self._store_snapshot(), before,
+                             "the write-ahead log must survive byte for byte")
+            code, out = self._build()
+            self.assertEqual(code, approval.EXIT_DECISION_AUTHORITY_UNCERTAIN, out)
+            self.assertNotIn("Traceback", out)
+            self.assertEqual(self._store_snapshot(), before)
+        finally:
+            holder.close()
+
+    def test_each_sidecar_alone_is_refused_untouched(self):
+        for suffix in decisions.STORE_SIDECAR_SUFFIXES:
+            with self.subTest(sidecar=suffix):
+                self._reset()
+                self._canonical_store()
+                self._write_sidecar(suffix)
+                before = self._store_snapshot()
+                error = self._assert_no_sqlite_connect(
+                    lambda: decisions.inspect_store(self._store_path())
+                )
+                self.assertEqual(error.reason, "store_sidecar_present")
+                self.assertEqual(self._store_snapshot(), before)
+
+    def test_stale_and_mixed_sidecar_combinations_are_refused_untouched(self):
+        combinations = (
+            ("-wal", "-shm"),
+            ("-journal", "-wal"),
+            ("-journal", "-wal", "-shm"),
+        )
+        for suffixes in combinations:
+            with self.subTest(sidecars=suffixes):
+                self._reset()
+                self._canonical_store()
+                for suffix in suffixes:
+                    self._write_sidecar(suffix, payload=b"stale " + suffix.encode())
+                before = self._store_snapshot()
+                error = self._assert_no_sqlite_connect(
+                    lambda: decisions.inspect_store(self._store_path())
+                )
+                self.assertEqual(error.reason, "store_sidecar_present")
+                self.assertEqual(self._store_snapshot(), before)
+
+    def test_a_sidecar_path_occupied_by_a_directory_is_refused(self):
+        self._canonical_store()
+        os.mkdir(str(self._store_path()) + "-wal")
+        before = self._store_snapshot()
+        error = self._assert_no_sqlite_connect(
+            lambda: decisions.inspect_store(self._store_path())
+        )
+        self.assertEqual(error.reason, "store_sidecar_present")
+        self.assertEqual(self._store_snapshot(), before)
+
+    @unittest.skipUnless(hasattr(os, "symlink"), "symlinks unavailable")
+    def test_a_sidecar_path_occupied_by_a_symlink_is_refused(self):
+        self._canonical_store()
+        link = Path(str(self._store_path()) + "-journal")
+        target = self.tmp / "symlink_target.bin"
+        target.write_bytes(b"target\n")
+        try:
+            os.symlink(str(target), str(link))
+        except (OSError, NotImplementedError) as error:
+            self.skipTest(f"symlink creation unavailable: {type(error).__name__}")
+        before = self._store_snapshot()
+        caught = self._assert_no_sqlite_connect(
+            lambda: decisions.inspect_store(self._store_path())
+        )
+        self.assertEqual(caught.reason, "store_sidecar_present")
+        self.assertEqual(self._store_snapshot(), before)
+        self.assertTrue(os.path.lexists(link), "the symlink is never removed")
+
+    def test_a_truncated_header_is_refused_before_sqlite_opens(self):
+        self._store_path().write_bytes(b"SQLite format 3\x00" + b"\x00" * 20)
+        before = self._store_snapshot()
+        error = self._assert_no_sqlite_connect(
+            lambda: decisions.inspect_store(self._store_path())
+        )
+        self.assertEqual(error.reason, "store_header_invalid")
+        self.assertEqual(self._store_snapshot(), before)
+
+    def test_an_implausible_page_size_is_refused_before_sqlite_opens(self):
+        header = bytearray(b"SQLite format 3\x00" + b"\x00" * 84)
+        header[16:18] = (777).to_bytes(2, "big")     # not a supported page size
+        header[18] = 1
+        header[19] = 1
+        self._store_path().write_bytes(bytes(header))
+        error = self._assert_no_sqlite_connect(
+            lambda: decisions.inspect_store(self._store_path())
+        )
+        self.assertEqual(error.reason, "store_header_invalid")
+
+    def test_a_multiply_linked_store_is_refused_before_sqlite_opens(self):
+        self._canonical_store()
+        alias = self.tmp / "store_alias.sqlite3"
+        try:
+            os.link(str(self._store_path()), str(alias))
+        except (OSError, NotImplementedError) as error:
+            self.skipTest(f"hard links unavailable: {type(error).__name__}")
+        before = self._store_snapshot()
+        error = self._assert_no_sqlite_connect(
+            lambda: decisions.inspect_store(self._store_path())
+        )
+        self.assertEqual(error.reason, "store_multiple_links")
+        self.assertEqual(self._store_snapshot(), before)
+        self.assertTrue(alias.exists(), "the competing name is never removed")
+
+    def test_a_foreign_wal_database_is_refused_untouched(self):
+        raw = sqlite3.connect(str(self._store_path()))
+        try:
+            raw.execute("PRAGMA journal_mode=WAL")
+            raw.execute("CREATE TABLE unrelated_service (id INTEGER PRIMARY KEY)")
+            raw.commit()
+        finally:
+            raw.close()
+        self._assert_wal_header()
+        self._assert_refused_untouched(reason="store_journal_mode_unsupported")
+
+    def test_a_wal_mode_partial_canonical_store_is_refused_untouched(self):
+        self._canonical_store()
+        raw = sqlite3.connect(str(self._store_path()))
+        try:
+            raw.execute("DROP TABLE build_claim")
+            raw.execute("PRAGMA journal_mode=WAL")
+            raw.commit()
+        finally:
+            raw.close()
+        # The header decides first: a WAL-format file is never opened to discover that it is
+        # also structurally wrong.
+        self._assert_refused_untouched(reason="store_journal_mode_unsupported")
+
+    def test_every_recovery_entry_point_refuses_a_wal_header_without_opening_sqlite(self):
+        self._wal_header_store()
+        before = self._store_snapshot()
+        for recover, args in (
+            (decisions.recover_decision_commit,
+             ("dec_" + ("0" * 32), "sha256:" + ("0" * 64))),
+            (decisions.recover_activation_commit,
+             ("dec_" + ("0" * 32), "sha256:" + ("0" * 64))),
+            (decisions.recover_claim_commit,
+             ("claim_" + ("0" * 32), "sha256:" + ("0" * 64))),
+        ):
+            with self.subTest(recovery=recover.__name__):
+                def forbidden(*a, **kw):
+                    raise AssertionError("recovery must not open SQLite for a WAL header")
+
+                with mock.patch.object(sqlite3, "connect", forbidden):
+                    state, row = recover(self._store_path(), *args)
+                self.assertEqual(state, decisions.CommitState.UNCERTAIN)
+                self.assertIsNone(row)
+                self.assertEqual(self._store_snapshot(), before)
+
+
+class RollbackModePositiveControlTests(_TriageHarness):
+    """Lock section 8: the locked paths must still do real work on a valid store."""
+
+    def test_inspection_of_a_canonical_store_changes_nothing(self):
+        self._prepare_activated_approval()
+        before = self._store_snapshot()
+        decisions.inspect_store(self._store_path())
+        self.assertEqual(self._store_snapshot(), before,
+                         "read-only inspection changes no byte and creates no sidecar")
+        for path in self._sidecar_paths():
+            self.assertFalse(os.path.lexists(path))
+
+    def test_a_canonical_store_supports_decision_activation_and_claim(self):
+        self.assertEqual(self._approve()[0], 0)
+        rows = self._stored_decisions()
+        self.assertEqual(len(rows), 1)
+        self.assertIsNotNone(rows[0]["activation_sequence"])
+        self.assertEqual(self._build()[0], 0)
+        self.assertEqual(self._claim_count(), 1)
+        decisions.inspect_store(self._store_path())
+        header = self._header_bytes()
+        self.assertEqual((header[18], header[19]), (1, 1),
+                         "the store stays rollback format throughout")
+        for path in self._sidecar_paths():
+            self.assertFalse(os.path.lexists(path), "no sidecar survives an operation")
+
+    def test_a_blocked_build_leaves_the_store_byte_for_byte_identical(self):
+        # Amendment 8 runs the whole build preflight read-only, so a refusal cannot touch the
+        # store at all - a strictly stronger property than Amendment 7 could offer.
+        self._insert_activated("hold", *[], **dict(zip(
+            ("srid", "fingerprint"), self._fixture_identity())))
+        before = self._store_snapshot()
+        code, out = self._build()
+        self.assertEqual(code, approval.EXIT_DECISION_NOT_AUTHORITATIVE, out)
+        self.assertEqual(self._store_snapshot(), before)
+
+    def test_the_read_only_session_is_genuinely_read_only(self):
+        # `query_only` is defence in depth ONLY - it does not block a persistent journal-mode
+        # assignment - so the guarantee has to come from the session itself. Turning the pragma
+        # off and still being refused is what proves `mode=ro` is doing the work.
+        self._canonical_store()
+        captured = {}
+        real_connect = decisions._connect_uri
+
+        def capturing(path, query):
+            captured["query"] = query
+            return real_connect(path, query)
+
+        with mock.patch.object(decisions, "_connect_uri", capturing):
+            decisions.inspect_store(self._store_path())
+        self.assertIn("mode=ro", captured["query"])
+        self.assertIn("cache=private", captured["query"])
+
+        before = self._store_snapshot()
+        conn, _triage = decisions.open_readonly(self._store_path())
+        try:
+            conn.execute("PRAGMA query_only=OFF")
+            with self.assertRaises(sqlite3.OperationalError):
+                conn.execute(
+                    "INSERT INTO schema_meta (key, value) VALUES ('probe', 'written')"
+                )
+        finally:
+            conn.close()
+        self.assertEqual(self._store_snapshot(), before)
+        decisions.inspect_store(self._store_path())
+
+    def test_the_writer_verifies_journal_mode_and_never_assigns_it(self):
+        # Every statement issued against an EXISTING store is recorded. `journal_mode` may be
+        # QUERIED but never assigned: the one assignment in the module happens on the brand-new
+        # temporary this operation exclusively created, and never afterwards.
+        self._canonical_store()
+        executed = []
+        real_connect = decisions._connect_uri
+
+        def recording_connect(path, query):
+            return _RecordingConnection(real_connect(path, query), executed)
+
+        with mock.patch.object(decisions, "_connect_uri", recording_connect):
+            self.assertEqual(self._approve()[0], 0)
+            self.assertEqual(self._build()[0], 0)
+
+        self.assertTrue(executed, "the recording proxy must have seen real statements")
+        self.assertIn("PRAGMA journal_mode", executed, "the mode is verified, not assumed")
+        self.assertEqual(
+            [sql for sql in executed if "journal_mode" in sql.lower() and "=" in sql],
+            [], "no journal_mode assignment may reach an existing store",
+        )
+        self.assertEqual(
+            [sql for sql in executed if "locking_mode" in sql.lower()],
+            [], "no locking-mode setting may reach an existing store",
+        )
+
+
+class CrossSourceHostilityTests(_TriageHarness):
+    """Lock section 5: a malformed row under ANY source blocks EVERY operation.
+
+    Amendment 7 validated decision and activation content only inside `resolve_authority`,
+    whose query is filtered to the requested source record, so corruption under an unrelated
+    source survived into an authorised build.
+    """
+
+    OTHER_SRID = "srcrec_" + ("b" * 64)
+    OTHER_FP = "fp_" + ("c" * 64)
+
+    def _valid_source_a(self):
+        srid, fingerprint = self._fixture_identity()
+        return self._insert_activated("approved", srid=srid, fingerprint=fingerprint)
+
+    def _other_record(self, decision_type="hold", **kw):
+        return self._record(decision_type, srid=self.OTHER_SRID,
+                            fingerprint=self.OTHER_FP, **kw)
+
+    def _assert_source_a_is_blocked(self, reason):
+        before = self._store_snapshot()
+        code, out = self._build()
+        self.assertEqual(code, approval.EXIT_DECISION_AUTHORITY_UNCERTAIN, out)
+        self.assertNotIn("Traceback", out)
+        summary = json.loads(out)
+        self.assertEqual(summary["status"], "decision_store_integrity_uncertain")
+        self.assertEqual(summary["decision_store_integrity"], reason)
+        self.assertIs(summary["decision_store_modified"], False)
+        self.assertEqual(self._store_snapshot(), before,
+                         "the whole fixture is preserved")
+        self.assertFalse(self.package.exists())
+        self.assertEqual(self._reservations(), [])
+        self.assertEqual(self._stray_temps(), [])
+        self.assertEqual(self._raw_claim_count(), 0)
+
+    def test_naive_decision_timestamp_under_source_b_blocks_source_a(self):
+        self._valid_source_a()
+        record = self._other_record(recorded_at="2026-07-20T00:00:00")
+        record["record_hash"] = decisions.decision_record_hash(record)
+        self._hostile_pending(record)
+        self._assert_source_a_is_blocked("naive_timestamp")
+
+    def test_invalid_decision_timestamp_under_source_b_blocks_source_a(self):
+        self._valid_source_a()
+        record = self._other_record(recorded_at="not-a-timestamp")
+        record["record_hash"] = decisions.decision_record_hash(record)
+        self._hostile_pending(record)
+        self._assert_source_a_is_blocked("timestamp_invalid")
+
+    def test_approval_before_recording_under_source_b_blocks_source_a(self):
+        self._valid_source_a()
+        record = self._record("approved", srid=self.OTHER_SRID, fingerprint=self.OTHER_FP,
+                              recorded_at="2026-07-25T12:00:00+00:00")
+        record["approved_at"] = "2026-07-25T09:00:00+00:00"     # earlier than recorded_at
+        record["expires_at"] = "2026-07-27T12:00:00+00:00"
+        record["record_hash"] = decisions.decision_record_hash(record)
+        self._hostile_pending(record)
+        self._assert_source_a_is_blocked("timestamp_order_invalid")
+
+    def test_expiry_before_approval_under_source_b_blocks_source_a(self):
+        self._valid_source_a()
+        record = self._record("approved", srid=self.OTHER_SRID, fingerprint=self.OTHER_FP,
+                              recorded_at="2026-07-25T12:00:00+00:00",
+                              expires_at="2026-07-25T11:00:00+00:00")
+        record["record_hash"] = decisions.decision_record_hash(record)
+        self._hostile_pending(record)
+        self._assert_source_a_is_blocked("timestamp_order_invalid")
+
+    def test_wrong_decision_hash_under_source_b_blocks_source_a(self):
+        self._valid_source_a()
+        record = self._other_record()
+        record["record_hash"] = "sha256:" + ("d" * 64)
+        self._hostile_pending(record)
+        self._assert_source_a_is_blocked("record_hash_mismatch")
+
+    def test_invalid_approved_field_combination_under_source_b_blocks_source_a(self):
+        self._valid_source_a()
+        record = self._other_record()
+        record["reviewer_id"] = "NOT A HANDLE"
+        record["record_hash"] = decisions.decision_record_hash(record)
+        self._hostile_pending(record)
+        self._assert_source_a_is_blocked("invalid_field_type")
+
+    def test_malformed_activation_timestamp_under_source_b_blocks_source_a(self):
+        self._valid_source_a()
+        record = self._hostile_pending(self._other_record())
+        self._hostile_activate(record, activated_at="2026-07-20T00:00:00")
+        self._assert_source_a_is_blocked("naive_timestamp")
+
+    def test_activation_before_recording_under_source_b_blocks_source_a(self):
+        self._valid_source_a()
+        record = self._hostile_pending(
+            self._other_record(recorded_at="2026-07-25T12:00:00+00:00")
+        )
+        self._hostile_activate(record, activated_at="2026-07-25T09:00:00+00:00")
+        self._assert_source_a_is_blocked("timestamp_order_invalid")
+
+    def test_wrong_activation_hash_under_source_b_blocks_source_a(self):
+        self._valid_source_a()
+        record = self._hostile_pending(self._other_record())
+        self._hostile_activate(record, activation_hash="sha256:" + ("e" * 64))
+        self._assert_source_a_is_blocked("activation_mismatch")
+
+    def test_activation_bound_to_the_wrong_decision_blocks_source_a(self):
+        self._valid_source_a()
+        first = self._hostile_pending(self._other_record())
+        second = self._hostile_pending(self._other_record())
+        # An activation for `second` carrying the canonical hash of `first`.
+        moment = iso(datetime.now(timezone.utc))
+        self._hostile_activate(
+            second,
+            activated_at=moment,
+            activation_hash=decisions.activation_record_hash(
+                second["decision_id"], moment, first["record_hash"]
+            ),
+        )
+        self._assert_source_a_is_blocked("activation_mismatch")
+
+    def test_a_hostile_activation_recorded_first_still_blocks_source_a(self):
+        # The hostile activation carries the LOWEST activation sequence, so a validator that
+        # skipped any single row rather than checking them all would miss exactly this one.
+        hostile = self._hostile_pending(self._other_record())
+        self._hostile_activate(hostile, activation_hash="sha256:" + ("e" * 64))
+        srid, fingerprint = self._fixture_identity()
+        good = self._hostile_pending(
+            self._record("approved", srid=srid, fingerprint=fingerprint)
+        )
+        self._hostile_activate(good)
+        self._assert_source_a_is_blocked("activation_mismatch")
+
+    def test_a_hostile_decision_recorded_last_still_blocks_source_a(self):
+        # The mirror case: the hostile DECISION carries the highest sequence, so a validator
+        # that skipped the first row rather than all of them would still have to catch it.
+        self._valid_source_a()
+        record = self._other_record()
+        record["record_hash"] = "sha256:" + ("d" * 64)
+        self._hostile_pending(record)
+        self._assert_source_a_is_blocked("record_hash_mismatch")
+
+    def test_an_extra_metadata_row_after_the_schema_version_key_is_refused(self):
+        # Sorting AFTER `schema_version` means the first row still looks perfect, so only an
+        # exact cardinality check can catch it.
+        self._valid_source_a()
+        raw = self._raw()
+        try:
+            raw.execute("INSERT INTO schema_meta (key, value) VALUES ('zz_injected', 'yes')")
+            raw.commit()
+        finally:
+            raw.close()
+        self._assert_source_a_is_blocked("metadata_row_set_invalid")
+
+    def test_an_extra_metadata_row_blocks_every_operation(self):
+        self._valid_source_a()
+        raw = self._raw()
+        try:
+            raw.execute("INSERT INTO schema_meta (key, value) VALUES ('injected', 'yes')")
+            raw.commit()
+        finally:
+            raw.close()
+        self._assert_source_a_is_blocked("metadata_row_set_invalid")
+
+    def test_a_missing_metadata_row_blocks_every_operation(self):
+        self._valid_source_a()
+        raw = self._raw()
+        try:
+            raw.execute("DELETE FROM schema_meta")
+            raw.commit()
+        finally:
+            raw.close()
+        self._assert_source_a_is_blocked("schema_version_missing")
+
+    def test_a_wrong_metadata_value_blocks_every_operation(self):
+        self._valid_source_a()
+        raw = self._raw()
+        try:
+            raw.execute("DELETE FROM schema_meta")
+            raw.execute("INSERT INTO schema_meta (key, value) VALUES "
+                        "('schema_version', 'member_create_uat_decisions/v1')")
+            raw.commit()
+        finally:
+            raw.close()
+        self._assert_source_a_is_blocked("schema_version_mismatch")
+
+    def test_a_wrong_metadata_key_blocks_every_operation(self):
+        self._valid_source_a()
+        raw = self._raw()
+        try:
+            raw.execute("DELETE FROM schema_meta")
+            raw.execute("INSERT INTO schema_meta (key, value) VALUES "
+                        "('version', 'member_create_uat_decisions/v2')")
+            raw.commit()
+        finally:
+            raw.close()
+        self._assert_source_a_is_blocked("metadata_row_set_invalid")
+
+
+class ClaimChronologyTests(_TriageHarness):
+    """Lock sections 5 and 6: a claim must follow the approval AND activation it binds.
+
+    Amendment 7 proved only that `claimed_at` was an aware timestamp and that the canonical
+    claim hash recomputed, so a correctly hashed claim stamped before its own authority was
+    accepted by both the insert trigger and the validator.
+    """
+
+    def _insert_claim(self, record, *, claimed_at):
+        """Insert a correctly hashed claim through a RAW connection at an arbitrary instant."""
+        conn = self._raw()
+        try:
+            claim = {
+                "claim_id": "claim_" + uuid.uuid4().hex,
+                "decision_sequence": decisions.decision_sequence(
+                    conn, record["decision_id"]
+                ),
+                "decision_id": record["decision_id"],
+                "decision_record_hash": record["record_hash"],
+                "approval_id": record["approval_id"],
+                "source_record_id": record["source_record_id"],
+                "source_fingerprint": record["source_fingerprint"],
+                "operation_id": "mcuat_" + uuid.uuid4().hex,
+                "package_payload_hash": "sha256:" + ("3" * 64),
+                "package_file_name": "member_create_uat_package_v2.json",
+                "claimed_at": claimed_at,
+                "schema_version": decisions.SCHEMA_VERSION,
+            }
+            claim["record_hash"] = decisions.claim_record_hash(claim)
+            conn.execute("BEGIN IMMEDIATE")
+            decisions.insert_build_claim(conn, claim)
+            conn.execute("COMMIT")
+        finally:
+            conn.close()
+        return claim
+
+    def _approved_at(self, hours_ago):
+        moment = datetime.now(timezone.utc) - timedelta(hours=hours_ago)
+        return iso(moment)
+
+    def _activated_approval(self, *, approved_hours_ago=2, activated_hours_ago=1):
+        srid, fingerprint = self._fixture_identity()
+        record = self._record(
+            "approved", srid=srid, fingerprint=fingerprint,
+            recorded_at=self._approved_at(approved_hours_ago),
+            expires_at=iso(datetime.now(timezone.utc) + timedelta(hours=48)),
+        )
+        self._insert_pending(record)
+        self._activate(record, activated_at=self._approved_at(activated_hours_ago))
+        return record
+
+    def _assert_claim_order_refused(self):
+        before = self._store_snapshot()
+        code, out = self._build()
+        self.assertEqual(code, approval.EXIT_DECISION_AUTHORITY_UNCERTAIN, out)
+        self.assertNotIn("Traceback", out)
+        summary = json.loads(out)
+        self.assertEqual(summary["decision_store_integrity"], "timestamp_order_invalid")
+        self.assertIs(summary["decision_store_modified"], False)
+        self.assertEqual(self._store_snapshot(), before)
+        self.assertFalse(self.package.exists())
+        self.assertEqual(self._reservations(), [])
+        self.assertEqual(self._stray_temps(), [])
+
+    def test_a_correctly_hashed_claim_before_its_approval_is_refused(self):
+        record = self._activated_approval()
+        claim = self._insert_claim(record, claimed_at=self._approved_at(5))
+        # The insert trigger accepts it: it compares bindings, never instants.
+        self.assertEqual(self._raw_claim_count(), 1)
+        self.assertIsNone(decisions.claim_chronology_problem(
+            claim["claimed_at"], claim["claimed_at"], claim["claimed_at"]
+        ))
+        self._assert_claim_order_refused()
+
+    def test_a_correctly_hashed_claim_before_its_activation_is_refused(self):
+        # Later than the approval, earlier than the activation: the second ordering is what
+        # catches it, so this kills a fix that only compared against `approved_at`.
+        record = self._activated_approval(approved_hours_ago=4, activated_hours_ago=2)
+        self._insert_claim(record, claimed_at=self._approved_at(3))
+        self.assertEqual(self._raw_claim_count(), 1)
+        self._assert_claim_order_refused()
+
+    def test_a_claim_at_the_activation_instant_is_accepted(self):
+        record = self._activated_approval(approved_hours_ago=2, activated_hours_ago=1)
+        self._insert_claim(record, claimed_at=self._approved_at(1))
+        decisions.inspect_store(self._store_path())
+
+    def test_the_pre_insert_check_refuses_a_backdated_claim_inside_the_transaction(self):
+        # Lock section 6: the newly minted claim is checked against the RE-RESOLVED authority
+        # inside the very `BEGIN IMMEDIATE` that would insert it.
+        self._prepare_activated_approval()
+        real_now = decisions.utc_now
+        stale = datetime.now(timezone.utc) - timedelta(hours=6)
+
+        def backdated():
+            return stale
+
+        with mock.patch.object(approval, "utc_now_iso", lambda: iso(stale)), \
+                mock.patch.object(decisions, "utc_now", real_now):
+            code, out = self._build()
+        self.assertEqual(code, approval.EXIT_DECISION_AUTHORITY_UNCERTAIN, out)
+        summary = json.loads(out)
+        self.assertEqual(summary["status"], "claim_timestamp_order_invalid")
+        self.assertEqual(summary["claim_detail"], "timestamp_order_invalid")
+        self.assertEqual(summary["build_claim"], "not_created")
+        self.assertIs(summary["do_not_retry"], True)
+        self.assertNotIn("Traceback", out)
+        self._assert_nothing_created()
+        self.assertFalse(self.package.exists())
+
+
+class OffsetChronologyTests(_TriageHarness):
+    """Lock section 5: chronology compares INSTANTS, never text.
+
+    Every pair below is chosen so that lexical ordering and chronological ordering disagree,
+    which is what makes a SQLite `TEXT` comparison the wrong authority.
+    """
+
+    # (earlier instant, later instant) whose STRING order is reversed.
+    MISLEADING = (
+        ("2026-07-26T01:00:00+08:00", "2026-07-25T18:00:00+00:00"),
+        ("2026-07-26T00:30:00+08:00", "2026-07-25T17:00:00+00:00"),
+    )
+
+    def test_the_fixtures_really_are_lexically_misleading(self):
+        for earlier, later in self.MISLEADING:
+            with self.subTest(pair=(earlier, later)):
+                self.assertGreater(earlier, later, "string order must be reversed")
+                self.assertLess(
+                    decisions.parse_aware_timestamp(earlier),
+                    decisions.parse_aware_timestamp(later),
+                    "instant order must be the opposite",
+                )
+
+    def test_activation_ordering_uses_instants_not_text(self):
+        earlier, later = self.MISLEADING[0]
+        srid, fingerprint = self._fixture_identity()
+        # recorded at the EARLIER instant, activated at the LATER instant: valid in time,
+        # but a lexical comparison would call the activation "before" the decision.
+        record = self._record("approved", srid=srid, fingerprint=fingerprint,
+                              recorded_at=earlier,
+                              expires_at=iso(datetime.now(timezone.utc) + timedelta(hours=24)))
+        self._insert_pending(record)
+        self._activate(record, activated_at=later)
+        decisions.inspect_store(self._store_path())
+
+    def test_a_chronologically_invalid_activation_is_refused_despite_lexical_order(self):
+        earlier, later = self.MISLEADING[0]
+        srid, fingerprint = self._fixture_identity()
+        # recorded at the LATER instant, activated at the EARLIER one: invalid in time even
+        # though the strings sort the other way.
+        record = self._record("approved", srid=srid, fingerprint=fingerprint,
+                              recorded_at=later,
+                              expires_at=iso(datetime.now(timezone.utc) + timedelta(hours=24)))
+        self._hostile_pending(record)
+        self._hostile_activate(record, activated_at=earlier)
+        code, out = self._build()
+        self.assertEqual(code, approval.EXIT_DECISION_AUTHORITY_UNCERTAIN, out)
+        self.assertEqual(json.loads(out)["decision_store_integrity"],
+                         "timestamp_order_invalid")
+        self.assertNotIn(earlier, out, "the offending value is never exposed")
+
+    def test_claim_chronology_uses_instants_across_offsets(self):
+        earlier, later = self.MISLEADING[0]
+        self.assertIsNone(
+            decisions.claim_chronology_problem(later, earlier, earlier),
+            "a claim after both, expressed in a different offset, is valid",
+        )
+        self.assertEqual(
+            decisions.claim_chronology_problem(earlier, later, later),
+            "timestamp_order_invalid",
+            "a claim before both is invalid however the strings sort",
+        )
+
+    def test_equal_instants_in_different_offsets_are_accepted(self):
+        self.assertIsNone(decisions.claim_chronology_problem(
+            "2026-07-26T09:00:00+08:00", "2026-07-26T01:00:00+00:00",
+            "2026-07-25T21:00:00-04:00",
+        ))
+
+
+class IdentityAndReplacementSeamTests(_TriageHarness):
+    """Lock section 1: ordinary path replacement is DETECTED by ordered identity checks.
+
+    The supported boundary is a stable, local, operator-controlled directory and cooperating
+    tool processes. These seams prove the ordered checks fire. They do not - and the contract
+    does not - claim atomicity against a privileged, non-cooperating process able to substitute
+    a path component during an open system call.
+    """
+
+    def _swap(self, replacement):
+        """Replace the store pathname with a DIFFERENT canonical store.
+
+        Returns True when the substitution actually happened. Windows refuses to replace a
+        file that is currently open, which is a stronger guarantee than detection - the
+        substitution cannot occur at all - so callers assert whichever outcome the platform
+        produced rather than assuming one of them.
+        """
+        try:
+            os.replace(str(replacement), str(self._store_path()))
+            return True
+        except OSError:
+            return False
+
+    def test_replacement_between_identity_capture_and_header_read_is_detected(self):
+        self._canonical_store()
+        replacement = self._second_canonical_store()
+        original = os.lstat(self._store_path())
+        real_header = decisions._read_store_header
+
+        def swapping_header(path):
+            self._swap(replacement)
+            return real_header(path)
+
+        with mock.patch.object(decisions, "_read_store_header", swapping_header):
+            with self.assertRaises(decisions.DecisionStoreError) as caught:
+                decisions.inspect_store(self._store_path())
+        self.assertEqual(caught.exception.reason, "store_identity_changed")
+        current = os.lstat(self._store_path())
+        self.assertNotEqual((current.st_dev, current.st_ino),
+                            (original.st_dev, original.st_ino),
+                            "the fixture really did replace the file")
+
+    def test_replacement_between_header_read_and_sqlite_open_is_detected(self):
+        self._prepare_activated_approval()
+        replacement = self._second_canonical_store()
+        real_connect = decisions._connect_uri
+
+        def swapping_connect(path, query):
+            self._swap(replacement)
+            return real_connect(path, query)
+
+        with mock.patch.object(decisions, "_connect_uri", swapping_connect):
+            with self.assertRaises(decisions.DecisionStoreError) as caught:
+                decisions.inspect_store(self._store_path())
+        # No handle is open yet at this seam, so the substitution succeeds on every platform
+        # and the post-close preservation proof is what catches it.
+        self.assertEqual(caught.exception.reason, "store_identity_changed")
+
+    def test_replacement_during_read_only_inspection_is_detected_or_prevented(self):
+        self._prepare_activated_approval()
+        replacement = self._second_canonical_store()
+        swapped = {"done": False}
+
+        def swap_during_read(conn):
+            swapped["done"] = self._swap(replacement)
+            return "read-completed"
+
+        if_swapped_reason = None
+        try:
+            value = decisions.read_validated(self._store_path(), swap_during_read)
+        except decisions.DecisionStoreError as error:
+            if_swapped_reason = error.reason
+            value = None
+        if swapped["done"]:
+            self.assertEqual(if_swapped_reason, "store_identity_changed",
+                             "a substitution under an open session must be detected")
+        else:
+            # The platform refused the substitution outright while the file was open.
+            self.assertIsNone(if_swapped_reason)
+            self.assertEqual(value, "read-completed")
+            self.assertTrue(replacement.exists(), "the replacement was never consumed")
+
+    def test_replacement_between_preflight_and_writer_open_is_detected(self):
+        self._prepare_activated_approval()
+        replacement = self._second_canonical_store()
+        swapped = {"done": False}
+        real_begin = decisions.begin_write
+
+        def swapping_begin(path):
+            if not swapped["done"]:
+                swapped["done"] = True
+                self._swap(replacement)
+            return real_begin(path)
+
+        with mock.patch.object(decisions, "begin_write", swapping_begin):
+            code, out = self._build()
+        # The replacement store is canonical but holds no approval for this source, so the
+        # build refuses rather than claiming against a store it never validated.
+        self.assertNotEqual(code, 0, out)
+        self.assertNotIn("Traceback", out)
+        self.assertFalse(self.package.exists())
+        self.assertEqual(self._reservations(), [])
+
+    def test_a_store_that_gains_a_sidecar_mid_session_fails_closed(self):
+        self._prepare_activated_approval()
+
+        def add_sidecar(conn):
+            Path(str(self._store_path()) + "-journal").write_bytes(b"appeared\n")
+            return None
+
+        with self.assertRaises(decisions.DecisionStoreError) as caught:
+            decisions.read_validated(self._store_path(), add_sidecar)
+        self.assertEqual(caught.exception.reason, "store_sidecar_present")
+        self.assertTrue(Path(str(self._store_path()) + "-journal").exists(),
+                        "the sidecar is never removed")
+
+    def test_a_competing_first_store_creator_leaves_the_winner_untouched(self):
+        # The loser's temporary is removed and the winner's store is byte-for-byte intact.
+        winner = self._second_canonical_store(name="winner")
+        real_publish = (decisions._publish_windows if decisions.IS_WINDOWS
+                        else decisions._publish_posix)
+
+        def publish_after_a_competitor_wins(temp_name, safe, identity):
+            if not os.path.lexists(safe):
+                shutil.copyfile(str(winner), str(safe))
+            return real_publish(temp_name, safe, identity)
+
+        name = "_publish_windows" if decisions.IS_WINDOWS else "_publish_posix"
+        with mock.patch.object(decisions, name, publish_after_a_competitor_wins):
+            with self.assertRaises(decisions.DecisionStoreError) as caught:
+                decisions.create_store_exclusively(self._store_path())
+        self.assertEqual(caught.exception.reason, "store_not_absent")
+        self.assertEqual(self._store_path().read_bytes(), winner.read_bytes(),
+                         "the competitor's store is never altered")
+        self.assertEqual(
+            [f for f in os.listdir(self.tmp) if f.startswith(".mcuat_decisions_")], [],
+            "only this operation's own temporary is removed",
+        )
+
+
+class _PublicationHarness(_TriageHarness):
+    """Shared assertions for first-use store creation and publication."""
+
+    def _no_sweep(self):
+        """Patches that fail the test if any code path lists, scans or globs a directory."""
+        def forbidden(*args, **kwargs):
+            raise AssertionError("no store path may list, scan or glob a directory")
+
+        return (
+            mock.patch("os.listdir", forbidden),
+            mock.patch("os.scandir", forbidden),
+            mock.patch("glob.glob", forbidden),
+            mock.patch.object(Path, "iterdir", forbidden),
+            mock.patch.object(Path, "glob", forbidden),
+        )
+
+    def _create(self):
+        return decisions.create_store_exclusively(self._store_path())
+
+    def _assert_final_is_single_named_and_canonical(self):
+        info = os.lstat(self._store_path())
+        self.assertTrue(stat.S_ISREG(info.st_mode))
+        self.assertEqual(getattr(info, "st_nlink", 1), 1,
+                         "the published store must have exactly one name")
+        self.assertEqual(
+            [f for f in os.listdir(self.tmp) if f.startswith(".mcuat_decisions_")], [],
+            "no operation-owned temporary may survive a successful publication",
+        )
+        for path in self._sidecar_paths():
+            self.assertFalse(os.path.lexists(path))
+        decisions.inspect_store(self._store_path())
+
+    def _temporaries(self):
+        return sorted(f for f in os.listdir(self.tmp) if f.startswith(".mcuat_decisions_"))
+
+
+class StoreCreationPublicationTests(_PublicationHarness):
+    """Lock section 7: creation is absent-path-only and publication is no-replace.
+
+    Platform-independent properties. The Windows and POSIX suites below cover each platform's
+    own publication primitive and its own failure modes.
+    """
+
+    def test_creation_publishes_a_complete_canonical_store(self):
+        result = self._create()
+        self.assertIn(result.durability,
+                      ("windows_move_write_through", "posix_link_and_directory_fsync"))
+        self.assertIn(result.temp_cleanup, ("not_required", "unlinked"))
+        self._assert_final_is_single_named_and_canonical()
+
+    def test_creation_never_lists_or_sweeps_a_directory(self):
+        patches = self._no_sweep()
+        for patch in patches:
+            patch.start()
+        try:
+            self._create()
+        finally:
+            for patch in patches:
+                patch.stop()
+        self.assertEqual(self._temporaries(), [])
+
+    def test_creation_is_refused_when_anything_occupies_the_final_path(self):
+        self._store_path().write_bytes(b"occupied\n")
+        before = self._store_snapshot()
+        with self.assertRaises(decisions.DecisionStoreError) as caught:
+            self._create()
+        self.assertEqual(caught.exception.reason, "store_not_absent")
+        self.assertEqual(self._store_snapshot(), before)
+        self.assertEqual(self._temporaries(), [], "no temporary is created either")
+
+    def test_a_failed_schema_transaction_leaves_the_final_path_absent(self):
+        def failing_schema(conn):
+            raise decisions.DecisionStoreError(
+                "synthetic schema failure", reason="store_create_failed"
+            )
+
+        with mock.patch.object(decisions, "_create_canonical_schema", failing_schema):
+            with self.assertRaises(decisions.DecisionStoreError) as caught:
+                self._create()
+        self.assertEqual(caught.exception.reason, "store_create_failed")
+        self.assertFalse(os.path.lexists(self._store_path()),
+                         "the final path is never created")
+        self.assertEqual(len(self._temporaries()), 1,
+                         "the temporary is deliberately preserved as evidence")
+
+    def test_a_temporary_that_gains_a_sidecar_is_refused_before_publication(self):
+        real_fsync = decisions._fsync_file
+
+        def sidecar_then_fsync(path):
+            Path(str(path) + "-wal").write_bytes(b"injected\n")
+            return real_fsync(path)
+
+        with mock.patch.object(decisions, "_fsync_file", sidecar_then_fsync):
+            with self.assertRaises(decisions.DecisionStoreError) as caught:
+                self._create()
+        self.assertEqual(caught.exception.reason, "store_sidecar_present")
+        self.assertFalse(os.path.lexists(self._store_path()))
+
+    def test_a_temporary_fsync_failure_refuses_before_publication(self):
+        def failing_fsync(path):
+            raise OSError(5, "synthetic fsync failure")
+
+        with mock.patch.object(decisions, "_fsync_file", failing_fsync):
+            with self.assertRaises(decisions.DecisionStoreError) as caught:
+                self._create()
+        self.assertEqual(caught.exception.reason, "store_create_failed")
+        self.assertFalse(os.path.lexists(self._store_path()))
+
+    def test_the_temporary_never_holds_authoritative_or_private_rows(self):
+        seen = {}
+
+        real_validate = decisions.validate_store
+
+        def capturing_validate(conn):
+            if "tables" not in seen:
+                seen["tables"] = {
+                    table: conn.execute(f"SELECT * FROM {table}").fetchall()
+                    for table in ("schema_meta", "decision", "decision_activation",
+                                  "build_claim")
+                }
+            return real_validate(conn)
+
+        with mock.patch.object(decisions, "validate_store", capturing_validate):
+            self._create()
+        self.assertEqual(len(seen["tables"]["schema_meta"]), 1)
+        for table in ("decision", "decision_activation", "build_claim"):
+            self.assertEqual(seen["tables"][table], [],
+                             f"a creation temporary must never contain {table} rows")
+
+    def test_a_required_temporary_cleanup_failure_is_raised_not_suppressed(self):
+        # Runs on every platform, so the guarantee is not left to whichever publication
+        # primitive the host happens to use.
+        temp = self.tmp / ".mcuat_decisions_probe.tmp"
+        temp.write_bytes(b"payload\n")
+        real_unlink = os.unlink
+
+        def refusing_unlink(path, *args, **kwargs):
+            if str(path) == str(temp):
+                raise OSError(13, "synthetic unlink failure")
+            return real_unlink(path, *args, **kwargs)
+
+        with mock.patch("os.unlink", refusing_unlink):
+            with self.assertRaises(decisions.DecisionStoreError) as caught:
+                decisions._unlink_own_temporary(str(temp), required=True)
+            # The lost-race path is deliberately quiet: there the final store is a
+            # competitor's and our temporary is merely litter.
+            decisions._unlink_own_temporary(str(temp), required=False)
+        self.assertEqual(caught.exception.reason, "store_temp_cleanup_incomplete")
+        self.assertEqual(caught.exception.temp_basename, temp.name)
+        self.assertTrue(temp.exists(), "the temporary is never silently discarded")
+
+    def test_the_publication_identity_check_refuses_a_multiply_linked_file(self):
+        target = self.tmp / "published_probe.bin"
+        target.write_bytes(b"payload\n")
+        alias = self.tmp / "published_probe_alias.bin"
+        try:
+            os.link(str(target), str(alias))
+        except (OSError, NotImplementedError) as error:
+            self.skipTest(f"hard links unavailable: {type(error).__name__}")
+        identity = decisions._file_identity(os.lstat(target))
+        with self.assertRaises(decisions.DecisionStoreError) as caught:
+            decisions._assert_published_identity(target, identity)
+        self.assertEqual(caught.exception.reason, "store_multiple_links")
+        self.assertTrue(alias.exists(), "the alias is never removed by the check")
+
+    def test_a_decision_command_reports_what_creation_actually_achieved(self):
+        code, out = self._approve()
+        self.assertEqual(code, 0, out)
+        summary = json.loads(out)
+        self.assertIs(summary["decision_store_created"], True)
+        self.assertIn(summary["decision_store_durability"],
+                      ("windows_move_write_through", "posix_link_and_directory_fsync"))
+        self.assertIn(summary["decision_store_temp_cleanup"], ("not_required", "unlinked"))
+        # A second decision finds the store already there and says so.
+        code, out = self._approve()
+        self.assertEqual(code, 0, out)
+        self.assertIs(json.loads(out)["decision_store_created"], False)
+
+
+@unittest.skipUnless(decisions.IS_WINDOWS, "Windows publication contract")
+class WindowsPublicationTests(_PublicationHarness):
+    """Lock section 7, Windows: a same-volume no-replace, write-through move.
+
+    A move leaves exactly one name, so the multiply-linked-database hazard never arises here.
+    Windows exposes no directory-handle fsync, so `MOVEFILE_WRITE_THROUGH` is the strongest
+    durability primitive available and is the only one reported.
+    """
+
+    def test_a_successful_move_leaves_one_name_and_no_alias(self):
+        result = self._create()
+        self.assertEqual(result.durability, "windows_move_write_through")
+        self.assertEqual(result.temp_cleanup, "not_required")
+        self._assert_final_is_single_named_and_canonical()
+
+    def test_the_real_windows_move_refuses_an_occupied_destination(self):
+        # Exercises the real MoveFileExW wrapper, not a stand-in.
+        source = self.tmp / "move_source.bin"
+        destination = self.tmp / "move_destination.bin"
+        source.write_bytes(b"source\n")
+        destination.write_bytes(b"destination\n")
+        with self.assertRaises(OSError) as caught:
+            decisions._windows_no_replace_move(source, destination)
+        self.assertTrue(decisions._is_collision(caught.exception))
+        self.assertEqual(destination.read_bytes(), b"destination\n",
+                         "an occupied destination is never overwritten")
+        self.assertTrue(source.exists(), "the source survives a refused move")
+
+    def test_the_real_windows_move_publishes_and_removes_the_source(self):
+        source = self.tmp / "move_source.bin"
+        destination = self.tmp / "move_destination.bin"
+        source.write_bytes(b"payload\n")
+        decisions._windows_no_replace_move(source, destination)
+        self.assertFalse(source.exists(), "a move leaves no second name")
+        self.assertEqual(destination.read_bytes(), b"payload\n")
+        self.assertEqual(getattr(os.lstat(destination), "st_nlink", 1), 1)
+
+    def test_a_competing_destination_is_left_byte_for_byte_untouched(self):
+        winner = self._second_canonical_store(name="winner")
+        expected = winner.read_bytes()
+
+        real_move = decisions._windows_no_replace_move
+
+        def move_after_a_competitor_wins(source, destination):
+            if not os.path.lexists(destination):
+                shutil.copyfile(str(winner), str(destination))
+            return real_move(source, destination)
+
+        with mock.patch.object(decisions, "_windows_no_replace_move",
+                               move_after_a_competitor_wins):
+            with self.assertRaises(decisions.DecisionStoreError) as caught:
+                self._create()
+        self.assertEqual(caught.exception.reason, "store_not_absent")
+        self.assertEqual(self._store_path().read_bytes(), expected)
+        self.assertEqual(self._temporaries(), [], "only our own temporary is removed")
+
+    def test_a_vanished_source_is_reported_as_a_creation_failure(self):
+        def vanished(source, destination):
+            raise FileNotFoundError(2, "synthetic missing source")
+
+        with mock.patch.object(decisions, "_windows_no_replace_move", vanished):
+            with self.assertRaises(decisions.DecisionStoreError) as caught:
+                self._create()
+        self.assertEqual(caught.exception.reason, "store_create_failed")
+        self.assertFalse(os.path.lexists(self._store_path()))
+
+    def test_a_generic_move_failure_leaves_the_final_path_absent(self):
+        def failing(source, destination):
+            raise OSError(1234, "synthetic move failure")
+
+        with mock.patch.object(decisions, "_windows_no_replace_move", failing):
+            with self.assertRaises(decisions.DecisionStoreError) as caught:
+                self._create()
+        self.assertEqual(caught.exception.reason, "store_create_failed")
+        self.assertFalse(os.path.lexists(self._store_path()))
+
+    def test_a_published_file_with_a_different_identity_is_refused(self):
+        def copying_move(source, destination):
+            # A copy, not a move: the destination is a DIFFERENT file, and the source alias
+            # survives - exactly what the identity and link-count checks exist to catch.
+            shutil.copyfile(str(source), str(destination))
+
+        with mock.patch.object(decisions, "_windows_no_replace_move", copying_move):
+            with self.assertRaises(decisions.DecisionStoreError) as caught:
+                self._create()
+        self.assertEqual(caught.exception.reason, "store_identity_changed")
+
+    def test_a_surviving_temporary_alias_is_reported_not_ignored(self):
+        real_move = decisions._windows_no_replace_move
+
+        def move_then_recreate_the_source(source, destination):
+            real_move(source, destination)
+            Path(source).write_bytes(b"resurrected alias\n")
+
+        with mock.patch.object(decisions, "_windows_no_replace_move",
+                               move_then_recreate_the_source):
+            with self.assertRaises(decisions.DecisionStoreError) as caught:
+                self._create()
+        self.assertEqual(caught.exception.reason, "store_temp_cleanup_incomplete")
+        self.assertIsNotNone(caught.exception.temp_basename)
+        self.assertTrue(caught.exception.temp_basename.startswith(".mcuat_decisions_"))
+        self.assertNotIn(str(self.tmp), caught.exception.temp_basename,
+                         "only a basename is ever surfaced")
+
+
+@unittest.skipIf(decisions.IS_WINDOWS, "POSIX publication contract")
+class PosixPublicationTests(_PublicationHarness):
+    """Lock section 7, POSIX: no-replace hard link, both directory fsyncs, one final name."""
+
+    def test_a_successful_publication_reports_both_directory_fsyncs(self):
+        result = self._create()
+        self.assertEqual(result.durability, "posix_link_and_directory_fsync")
+        self.assertEqual(result.temp_cleanup, "unlinked")
+        self._assert_final_is_single_named_and_canonical()
+
+    def test_no_sqlite_connection_is_open_during_link_publication(self):
+        real_link = os.link
+        proved = {"exclusive": False}
+
+        def link_with_lock_proof(source, destination):
+            # If any connection still held the temporary, BEGIN EXCLUSIVE would fail.
+            probe = sqlite3.connect(str(source), timeout=0.2, isolation_level=None)
+            try:
+                probe.execute("BEGIN EXCLUSIVE")
+                probe.execute("ROLLBACK")
+                proved["exclusive"] = True
+            finally:
+                probe.close()
+            for suffix in decisions.STORE_SIDECAR_SUFFIXES:
+                self.assertFalse(os.path.lexists(str(source) + suffix))
+            return real_link(source, destination)
+
+        with mock.patch("os.link", link_with_lock_proof):
+            self._create()
+        self.assertTrue(proved["exclusive"],
+                        "the temporary must be unlocked when it is published")
+
+    def test_an_occupied_destination_is_preserved_byte_for_byte(self):
+        winner = self._second_canonical_store(name="winner")
+        expected = winner.read_bytes()
+        real_link = os.link
+
+        def link_after_a_competitor_wins(source, destination):
+            if not os.path.lexists(destination):
+                shutil.copyfile(str(winner), str(destination))
+            return real_link(source, destination)
+
+        with mock.patch("os.link", link_after_a_competitor_wins):
+            with self.assertRaises(decisions.DecisionStoreError) as caught:
+                self._create()
+        self.assertEqual(caught.exception.reason, "store_not_absent")
+        self.assertEqual(self._store_path().read_bytes(), expected)
+        self.assertEqual(self._temporaries(), [])
+
+    def test_a_first_directory_fsync_failure_is_durability_uncertain(self):
+        calls = {"n": 0}
+        real_fsync = decisions._fsync_directory
+
+        def failing_first(directory):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise OSError(5, "synthetic directory fsync failure")
+            return real_fsync(directory)
+
+        with mock.patch.object(decisions, "_fsync_directory", failing_first):
+            with self.assertRaises(decisions.DecisionStoreError) as caught:
+                self._create()
+        self.assertEqual(caught.exception.reason, "store_publication_uncertain")
+        self.assertTrue(os.path.lexists(self._store_path()),
+                        "the published store is never rolled back or deleted")
+        self.assertEqual(len(self._temporaries()), 1,
+                         "the temporary is left for controlled recovery")
+
+    def test_a_second_directory_fsync_failure_is_durability_uncertain(self):
+        calls = {"n": 0}
+        real_fsync = decisions._fsync_directory
+
+        def failing_second(directory):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise OSError(5, "synthetic directory fsync failure")
+            return real_fsync(directory)
+
+        with mock.patch.object(decisions, "_fsync_directory", failing_second):
+            with self.assertRaises(decisions.DecisionStoreError) as caught:
+                self._create()
+        self.assertEqual(caught.exception.reason, "store_publication_uncertain")
+        self.assertTrue(os.path.lexists(self._store_path()))
+        self.assertEqual(self._temporaries(), [], "the temporary was already removed")
+
+    def test_a_temporary_unlink_failure_is_reported_not_suppressed(self):
+        real_unlink = os.unlink
+
+        def refusing_unlink(path, *args, **kwargs):
+            if os.path.basename(str(path)).startswith(".mcuat_decisions_"):
+                raise OSError(13, "synthetic unlink failure")
+            return real_unlink(path, *args, **kwargs)
+
+        with mock.patch("os.unlink", refusing_unlink):
+            with self.assertRaises(decisions.DecisionStoreError) as caught:
+                self._create()
+        self.assertEqual(caught.exception.reason, "store_temp_cleanup_incomplete")
+        self.assertIsNotNone(caught.exception.temp_basename)
+        self.assertTrue(caught.exception.temp_basename.startswith(".mcuat_decisions_"))
+        self.assertNotIn("/", caught.exception.temp_basename)
+        self.assertTrue(os.path.lexists(self._store_path()),
+                        "the published store is never deleted to tidy up")
+        # The store must not be usable while it is reachable under two names.
+        with self.assertRaises(decisions.DecisionStoreError) as reuse:
+            decisions.inspect_store(self._store_path())
+        self.assertEqual(reuse.exception.reason, "store_multiple_links")
+
+    def test_a_multiply_linked_final_store_is_refused_after_publication(self):
+        self._create()
+        alias = self.tmp / "second_name.sqlite3"
+        os.link(str(self._store_path()), str(alias))
+        with self.assertRaises(decisions.DecisionStoreError) as caught:
+            decisions.inspect_store(self._store_path())
+        self.assertEqual(caught.exception.reason, "store_multiple_links")
+        self.assertTrue(alias.exists(), "the alias is never removed by the tool")
+
+    def test_a_published_file_with_a_different_identity_is_refused(self):
+        def copying_link(source, destination):
+            shutil.copyfile(str(source), str(destination))
+
+        with mock.patch("os.link", copying_link):
+            with self.assertRaises(decisions.DecisionStoreError) as caught:
+                self._create()
+        self.assertEqual(caught.exception.reason, "store_identity_changed")
+
+    def test_publication_never_lists_or_sweeps_a_directory(self):
+        patches = self._no_sweep()
+        for patch in patches:
+            patch.start()
+        try:
+            self._create()
+        finally:
+            for patch in patches:
+                patch.stop()
+        self._assert_final_is_single_named_and_canonical()
+
+
+class CommitRecoveryContractTests(_TriageHarness):
+    """Lock sections 3 and 4: every COMMIT recovery goes through the locked read-only path."""
+
+    def test_recovery_returns_committed_only_for_the_exact_row_and_hash(self):
+        record = self._prepare_activated_approval()
+        state, row = decisions.recover_decision_commit(
+            self._store_path(), record["decision_id"], record["record_hash"]
+        )
+        self.assertEqual(state, decisions.CommitState.COMMITTED)
+        self.assertEqual(row["decision_id"], record["decision_id"])
+
+        state, row = decisions.recover_decision_commit(
+            self._store_path(), record["decision_id"], "sha256:" + ("0" * 64)
+        )
+        self.assertEqual(state, decisions.CommitState.UNCERTAIN,
+                         "a hash mismatch is never reported as committed or absent")
+        self.assertIsNone(row)
+
+    def test_recovery_returns_absent_only_when_definitively_absent(self):
+        self._prepare_activated_approval()
+        state, row = decisions.recover_claim_commit(
+            self._store_path(), "claim_" + ("a" * 32), "sha256:" + ("1" * 64)
+        )
+        self.assertEqual(state, decisions.CommitState.ABSENT)
+        self.assertIsNone(row)
+
+        # A store that does not exist at all is also a definite negative.
+        state, row = decisions.recover_claim_commit(
+            self.tmp / "absent_dir" / decisions.DECISION_STORE_NAME,
+            "claim_" + ("a" * 32), "sha256:" + ("1" * 64),
+        )
+        self.assertEqual(state, decisions.CommitState.ABSENT)
+
+    def test_recovery_validates_globally_before_concluding(self):
+        # A malformed row under an UNRELATED source must turn a lookup that would otherwise
+        # have said "absent" into "uncertain" - so it can never authorise a retry.
+        self._prepare_activated_approval()
+        other = self._record("hold", srid="srcrec_" + ("b" * 64),
+                             fingerprint="fp_" + ("c" * 64))
+        other["record_hash"] = "sha256:" + ("d" * 64)
+        self._hostile_pending(other)
+        before = self._store_snapshot()
+        state, row = decisions.recover_claim_commit(
+            self._store_path(), "claim_" + ("a" * 32), "sha256:" + ("1" * 64)
+        )
+        self.assertEqual(state, decisions.CommitState.UNCERTAIN)
+        self.assertIsNone(row)
+        self.assertEqual(self._store_snapshot(), before)
+
+    def test_recovery_preserves_a_sidecar_bearing_store_byte_for_byte(self):
+        self._prepare_activated_approval()
+        self._write_sidecar("-journal", payload=b"crash residue\n")
+        before = self._store_snapshot()
+        for recover, args in (
+            (decisions.recover_decision_commit,
+             ("dec_" + ("0" * 32), "sha256:" + ("0" * 64))),
+            (decisions.recover_activation_commit,
+             ("dec_" + ("0" * 32), "sha256:" + ("0" * 64))),
+            (decisions.recover_claim_commit,
+             ("claim_" + ("0" * 32), "sha256:" + ("0" * 64))),
+        ):
+            with self.subTest(recovery=recover.__name__):
+                state, row = recover(self._store_path(), *args)
+                self.assertEqual(state, decisions.CommitState.UNCERTAIN)
+                self.assertIsNone(row)
+                self.assertEqual(self._store_snapshot(), before)
 
 
 if __name__ == "__main__":

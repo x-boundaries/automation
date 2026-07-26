@@ -97,6 +97,14 @@ EXIT_DECISION_NOT_AUTHORITATIVE = 10
 #      the approval was NOT consumed and a later explicit (never automatic) retry is allowed
 EXIT_BUILD_CLAIM_NOT_RECORDED = 11
 
+# The only two store failures that can leave a NEW file behind: first-use creation published
+# the store but could not prove its durability, or could not remove its own temporary. Every
+# other store refusal leaves the path exactly as it was found.
+DECISION_STORE_CREATION_UNCERTAIN = (
+    "store_publication_uncertain",
+    "store_temp_cleanup_incomplete",
+)
+
 # Ledger events that mark an approval's package as already published (clean OR published
 # with an incomplete temporary cleanup). Either one blocks a further build for that approval.
 BUILD_LEDGER_EVENTS = ("build", "build_cleanup_incomplete")
@@ -833,26 +841,53 @@ def cmd_decision(args, decision):
     record["record_hash"] = decisions.decision_record_hash(record)
 
     store = decisions.store_path_for(args.ledger)
-    common = {
-        "decision": decision,
-        "decision_id": decision_id,
-        "reviewer_id": args.reviewer,
-        "source_record_id": srid,
-        "source_fingerprint": fingerprint,
-        "approval_id": record["approval_id"],
-        "expires_at": record["expires_at"],
-    }
+
+    # ---- STEP 0: establish the store on first use ------------------------------------ #
+    # A reviewer decision command is the only command allowed to create the store, and only
+    # at a positively absent path. Creation reports the durability primitive it actually
+    # confirmed on this platform and the fate of its own temporary; an unproven publication or
+    # a failed temporary cleanup raises instead of presenting an empty store as authorised
+    # state, so the decision below never proceeds on a store we cannot vouch for.
+    creation = decisions.ensure_store(store)
+    store_facts = (
+        {
+            "decision_store_created": True,
+            "decision_store_durability": creation.durability,
+            "decision_store_temp_cleanup": creation.temp_cleanup,
+        }
+        if creation is not None
+        else {"decision_store_created": False}
+    )
+
+    common = dict(
+        store_facts,
+        decision=decision,
+        decision_id=decision_id,
+        reviewer_id=args.reviewer,
+        source_record_id=srid,
+        source_fingerprint=fingerprint,
+        approval_id=record["approval_id"],
+        expires_at=record["expires_at"],
+    )
 
     # ---- STEP 1: commit the PENDING decision transactionally ------------------------- #
-    # A reviewer decision command legitimately establishes the store on first use.
-    conn = decisions.open_store(store, create=True)
-    commit_state = decisions.CommitState.COMMITTED
-    try:
-        decisions.insert_pending_decision(conn, record)
-    except (sqlite3.Error, OSError):
-        commit_state = None
-    finally:
-        conn.close()
+    # `begin_write` runs pure pre-open triage, opens `mode=rw`, verifies the journal mode,
+    # takes ONE `BEGIN IMMEDIATE` and globally validates the complete store inside it. The
+    # insert and the commit happen in that same transaction, so there is no window between
+    # trusting the store and writing to it.
+    conn = _begin_write_or_contended(store)
+    commit_state = (
+        decisions.CommitState.ABSENT if conn is None else decisions.CommitState.COMMITTED
+    )
+    if conn is not None:
+        try:
+            decisions.insert_pending_decision(conn, record)
+            decisions._commit(conn)
+        except (sqlite3.Error, OSError):
+            decisions._rollback_quietly(conn)
+            commit_state = None
+        finally:
+            conn.close()
     if commit_state is None:
         commit_state, _row = decisions.recover_decision_commit(
             store, decision_id, record["record_hash"]
@@ -929,14 +964,19 @@ def cmd_decision(args, decision):
     activation_hash = decisions.activation_record_hash(
         decision_id, activated_at, record["record_hash"]
     )
-    conn = decisions.open_store(store, create=False)
-    activation_state = decisions.CommitState.COMMITTED
-    try:
-        decisions.insert_activation(conn, decision_id, activated_at, activation_hash)
-    except (sqlite3.Error, OSError):
-        activation_state = None
-    finally:
-        conn.close()
+    conn = _begin_write_or_contended(store)
+    activation_state = (
+        decisions.CommitState.ABSENT if conn is None else decisions.CommitState.COMMITTED
+    )
+    if conn is not None:
+        try:
+            decisions.insert_activation(conn, decision_id, activated_at, activation_hash)
+            decisions._commit(conn)
+        except (sqlite3.Error, OSError):
+            decisions._rollback_quietly(conn)
+            activation_state = None
+        finally:
+            conn.close()
     if activation_state is None:
         activation_state, _row = decisions.recover_activation_commit(
             store, decision_id, activation_hash
@@ -987,22 +1027,38 @@ def cmd_decision(args, decision):
     return 0
 
 
-def _decision_sequence(store, decision_id):
-    """The monotonic sequence assigned to a committed decision, read on a fresh connection.
+def _begin_write_or_contended(store):
+    """Open the locked writer transaction, or None when a concurrent writer holds the lock.
 
-    A read failure here cannot change what was committed, so it degrades to ``None`` in the
+    Lock contention is the one store refusal that proves NOTHING was written and no filesystem
+    object changed, so it keeps the existing explicit-retry boundary instead of becoming a
+    terminal integrity failure. Exactly one bounded attempt is made; contention never becomes
+    an automatic retry loop. Every other refusal - a sidecar, a WAL header, a replaced file, a
+    globally invalid store - propagates and is terminal.
+    """
+    try:
+        conn, _triage = decisions.begin_write(store)
+    except decisions.DecisionStoreError as error:
+        if error.reason == "store_locked":
+            return None
+        raise
+    return conn
+
+
+def _decision_sequence(store, decision_id):
+    """The monotonic sequence assigned to a committed decision, read read-only and validated.
+
+    Uses the locked read-only inspection path: pure pre-open triage, `mode=ro`, complete
+    global validation inside one read transaction, then a post-close preservation proof. A
+    read failure here cannot change what was committed, so it degrades to ``None`` in the
     report rather than turning a completed decision into a failure.
     """
     try:
-        conn = decisions.open_store(store, create=False)
-    except decisions.DecisionStoreError:
+        return decisions.read_validated(
+            store, lambda conn: decisions.decision_sequence(conn, decision_id)
+        )
+    except (decisions.DecisionStoreError, sqlite3.Error):
         return None
-    try:
-        return decisions.decision_sequence(conn, decision_id)
-    except sqlite3.Error:
-        return None
-    finally:
-        conn.close()
 
 
 def cmd_build_package(args):
@@ -1041,11 +1097,25 @@ def cmd_build_package(args):
     # not authority either: a fresh reviewer decision is required (deliberate compatibility
     # decision, documented in the runbook).
     #
-    # `create=False`: build-package must never manufacture an empty store. A missing store
-    # means no transactional approval authority exists.
+    # `build-package` never creates anything: a missing store means no transactional approval
+    # authority exists. The preflight runs entirely through the locked READ-ONLY path, so a
+    # blocked build now leaves the store byte-for-byte and pathname-for-pathname untouched.
     store = decisions.store_path_for(args.ledger)
+
+    def _preflight(conn):
+        # NON-AUTHORITATIVE preflight. It exists only to refuse the obvious cases cheaply and
+        # without mutation; the AUTHORITATIVE resolution happens again inside the build-claim
+        # transaction, which is what closes the time-of-check/time-of-use window.
+        resolved = decisions.resolve_authority(conn, srid)
+        claim = (
+            decisions.fetch_claim_for_approval(conn, resolved.decision["approval_id"])
+            if resolved.state == decisions.AuthorityState.APPROVED
+            else None
+        )
+        return resolved, claim
+
     try:
-        conn = decisions.open_store(store, create=False)
+        authority, preflight_claim = decisions.read_validated(store, _preflight)
     except decisions.DecisionStoreError as error:
         if error.reason == "store_missing":
             _print_summary(
@@ -1064,18 +1134,6 @@ def cmd_build_package(args):
             )
             return EXIT_DECISION_NOT_AUTHORITATIVE
         raise
-    try:
-        # NON-AUTHORITATIVE preflight. It exists only to refuse the obvious cases cheaply and
-        # without mutation; the AUTHORITATIVE resolution happens again inside the build-claim
-        # transaction, which is what closes the time-of-check/time-of-use window.
-        authority = decisions.resolve_authority(conn, srid)
-        preflight_claim = (
-            decisions.fetch_claim_for_approval(conn, authority.decision["approval_id"])
-            if authority.state == decisions.AuthorityState.APPROVED
-            else None
-        )
-    finally:
-        conn.close()
 
     if authority.state != decisions.AuthorityState.APPROVED:
         # Every non-approved outcome refuses before any filesystem object is created or
@@ -1553,6 +1611,7 @@ class _ClaimState:
     ALREADY_CLAIMED = "already_claimed"  # some claim already consumed this approval
     NOT_RECORDED = "not_recorded"      # nothing committed; a later EXPLICIT retry is allowed
     UNCERTAIN = "uncertain"            # indeterminate; fail closed, never retry
+    CHRONOLOGY_INVALID = "chronology_invalid"  # the minted claim instant precedes its authority
 
 
 class _ClaimOutcome:
@@ -1606,6 +1665,17 @@ def _claim_blocker(conn, authority, expected, claim_record):
         return _ClaimOutcome(
             _ClaimState.SUPERSEDED, authority=authority, detail="approval_expired"
         )
+    # IMMEDIATE PRE-INSERT CHRONOLOGY. The global validator proves every STORED claim follows
+    # its approval and activation; this proves the same for the claim about to be minted,
+    # inside the very transaction that will insert it, against the authority just re-resolved.
+    # Both comparisons parse aware instants - a claim stamped in one UTC offset and an
+    # approval stamped in another order correctly in time but not as text.
+    if decisions.claim_chronology_problem(
+        claim_record["claimed_at"], current["approved_at"], current["activated_at"]
+    ) is not None:
+        return _ClaimOutcome(
+            _ClaimState.CHRONOLOGY_INVALID, detail="timestamp_order_invalid"
+        )
     if decisions.fetch_claim_for_approval(conn, claim_record["approval_id"]) is not None:
         return _ClaimOutcome(_ClaimState.ALREADY_CLAIMED, detail="approval_already_claimed")
     if decisions.operation_id_claimed(conn, claim_record["operation_id"]):
@@ -1621,17 +1691,17 @@ def _claim_build(store, source_record_id, expected_decision, claim_record):
     decision writers use. Exactly one bounded attempt is made - lock contention never becomes a
     retry loop.
     """
-    conn = decisions.open_store(store, create=False)
-    commit_failed = False
     try:
-        try:
-            conn.execute("BEGIN IMMEDIATE")
-        except sqlite3.Error:
+        conn, _triage = decisions.begin_write(store)
+    except decisions.DecisionStoreError as error:
+        if error.reason == "store_locked":
             # A concurrent writer held the lock past the bounded busy timeout. Nothing was
             # claimed, so the approval is untouched and a later explicit retry is allowed.
             return _ClaimOutcome(_ClaimState.NOT_RECORDED, detail="lock_contended")
+        raise
+    commit_failed = False
+    try:
         try:
-            decisions.validate_store(conn)
             authority = decisions.resolve_authority(conn, source_record_id)
             blocked = _claim_blocker(conn, authority, expected_decision, claim_record)
             if blocked is not None:
@@ -1737,6 +1807,22 @@ def _report_unclaimed(claim, claim_record, source_record_id):
             )
         )
         return EXIT_BUILD_CLAIM_NOT_RECORDED
+    if claim.state == _ClaimState.CHRONOLOGY_INVALID:
+        # The claim instant this run minted precedes the approval or the activation it binds.
+        # That is a clock or state problem, not a decision race, so it is never retried
+        # automatically and the offending values are never reported.
+        _print_summary(
+            dict(
+                base,
+                status="claim_timestamp_order_invalid",
+                approval_blocked=True,
+                do_not_retry=True,
+                controlled_recovery_required=True,
+                fresh_approval_required=True,
+                recovery="controlled_decision_store_reconciliation_then_fresh_decision",
+            )
+        )
+        return EXIT_DECISION_AUTHORITY_UNCERTAIN
     _print_summary(
         dict(
             base,
@@ -2086,23 +2172,31 @@ def main(argv=None):
         # published, activated or repaired: the store and the ledger are left exactly as
         # found, and only the shape classifier is reported - never a row, a member value, a
         # credential or an absolute path.
-        _print_summary(
-            {
-                "status": "decision_store_integrity_uncertain",
-                "event": "none",
-                "publication": "not_attempted",
-                "reservation": "not_attempted",
-                "decision_store_integrity": error.reason,
-                "decision_authority": "uncertain",
-                "decision_store_modified": False,
-                "ledger_modified": False,
-                "approval_blocked": True,
-                "do_not_retry": True,
-                "controlled_recovery_required": True,
-                "fresh_approval_required": True,
-                "recovery": "controlled_decision_store_reconciliation_then_fresh_decision",
-            }
-        )
+        summary = {
+            "status": "decision_store_integrity_uncertain",
+            "event": "none",
+            "publication": "not_attempted",
+            "reservation": "not_attempted",
+            "decision_store_integrity": error.reason,
+            "decision_authority": "uncertain",
+            # A refusal against an EXISTING store never touches it: pure pre-open triage makes
+            # no SQLite call at all, the read-only session cannot write, and the writer only
+            # ever mutates inside a transaction whose complete store it already validated. The
+            # two first-use creation outcomes below are the only ones that can leave a new file
+            # behind, and they say so rather than claiming nothing changed.
+            "decision_store_modified": error.reason in DECISION_STORE_CREATION_UNCERTAIN,
+            "ledger_modified": False,
+            "approval_blocked": True,
+            "do_not_retry": True,
+            "controlled_recovery_required": True,
+            "fresh_approval_required": True,
+            "recovery": "controlled_decision_store_reconciliation_then_fresh_decision",
+        }
+        if error.temp_basename is not None:
+            # Exactly one operator action, named by basename only: remove that one temporary.
+            summary["manual_temp_cleanup_required"] = True
+            summary["decision_store_temp_basename"] = error.temp_basename
+        _print_summary(summary)
         return EXIT_DECISION_AUTHORITY_UNCERTAIN
     except (ApprovalError, contract.ContractError, validator.FormContractError, OSError) as error:
         print(json.dumps({"status": "error", "error": str(error)}, indent=2, sort_keys=True))
