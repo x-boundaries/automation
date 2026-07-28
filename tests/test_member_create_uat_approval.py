@@ -1380,25 +1380,43 @@ class DurableReservationTests(_CreateUatBuildHarness):
         self.assertEqual(len(self._reservations()), 1)
 
     def test_reservation_parent_directory_durability_failure_publishes_nothing(self):
-        # Exercises the POSIX directory-entry fsync branch. os.O_DIRECTORY is supplied where
-        # the platform lacks it so the same real code path runs everywhere.
+        # Exercises the POSIX directory-entry fsync branch inside the REAL
+        # `approval._fsync_parent_directory`. os.O_DIRECTORY is supplied where the platform lacks
+        # it so the same real code path runs everywhere.
+        #
+        # Amendment 9: the decision store's trusted-parent walk also opens directories, so a
+        # blanket "any O_DIRECTORY open fails" injection would break store admission and the run
+        # would refuse with store_parent_untrusted long before reaching the reservation stage
+        # under test. The injection is therefore scoped to the EXACT reservation call site - a
+        # PATHNAME open of the reservation state directory itself, carrying no directory
+        # descriptor. The store's anchor open ("/") and its descriptor-relative component opens
+        # both fall outside that predicate and run normally, and `fired` proves the reservation
+        # durability call is the one that actually failed.
         self._approve()
         dir_flag = getattr(os, "O_DIRECTORY", 0x10000)
         real_os_open = os.open
+        reservation_dir = os.path.abspath(str(self.tmp))
+        fired = {"n": 0}
 
         def guarded(path, flags, *args, **kwargs):
-            if flags & dir_flag:
+            if (flags & dir_flag
+                    and kwargs.get("dir_fd") is None
+                    and os.path.abspath(str(path)) == reservation_dir):
+                fired["n"] += 1
                 raise OSError("simulated reservation directory fsync failure")
             return real_os_open(path, flags, *args, **kwargs)
 
         with mock.patch.object(os, "O_DIRECTORY", dir_flag, create=True), \
                 mock.patch("os.open", guarded):
             code, out = self._build()
+        self.assertEqual(fired["n"], 1,
+                         "the reservation directory durability call must be the one that failed")
         self.assertEqual(code, approval.EXIT_PUBLICATION_BLOCKED, out)
         self.assertEqual(json.loads(out)["reservation"], "uncertain")
         self.assertEqual(json.loads(out)["build_claim"], "committed")
         self.assertFalse(self.package.exists())
         self.assertEqual(self._events_of("build"), [])
+        self.assertEqual(self._stray_temps(), [], "no unrelated path is left behind")
 
     def test_unsafe_reservation_path_is_a_not_created_failure(self):
         # An unsafe reservation path must surface as a typed reservation failure, not as a
@@ -4012,10 +4030,18 @@ class PostClaimFailureTests(_ClaimHarness):
             return (mock.patch("os.open", guarded),)
 
         def directory_durability_failure():
+            # Amendment 9: scoped to the EXACT reservation call site - a PATHNAME open of the
+            # reservation state directory carrying no directory descriptor - so the decision
+            # store's trusted-parent traversal, exclusive creation, publication and admission all
+            # run normally. A blanket O_DIRECTORY injection would instead refuse with
+            # store_parent_untrusted before this stage was ever reached.
             dir_flag = getattr(os, "O_DIRECTORY", 0x10000)
+            reservation_dir = os.path.abspath(str(self.tmp))
 
             def guarded(path, flags, *args, **kwargs):
-                if flags & dir_flag:
+                if (flags & dir_flag
+                        and kwargs.get("dir_fd") is None
+                        and os.path.abspath(str(path)) == reservation_dir):
                     raise OSError("simulated reservation directory durability failure")
                 return real_open(path, flags, *args, **kwargs)
 
@@ -5540,6 +5566,18 @@ class IdentityAndReplacementSeamTests(_TriageHarness):
 class _PublicationHarness(_TriageHarness):
     """Shared assertions for first-use store creation and publication."""
 
+    def _link_target(self, name):
+        """Resolve a name the production link handed us into an absolute path.
+
+        Amendment 9 publishes descriptor-relatively, so ``os.link`` receives BASENAMES plus
+        ``src_dir_fd``/``dst_dir_fd`` rather than absolute pathnames. A test double that wants to
+        inspect, copy or probe the object therefore has to resolve the name against the admitted
+        state parent - resolving it against the process working directory would silently address a
+        different file. The production call is never weakened to suit the double.
+        """
+        text = str(name)
+        return Path(text) if os.path.isabs(text) else self.tmp / text
+
     def _create(self):
         return decisions.create_store_exclusively(self._store_path())
 
@@ -5865,9 +5903,12 @@ class PosixPublicationTests(_PublicationHarness):
         real_link = os.link
         proved = {"exclusive": False}
 
-        def link_with_lock_proof(source, destination):
+        def link_with_lock_proof(source, destination, *args, **kwargs):
+            # Descriptor-relative publication passes basenames plus src_dir_fd/dst_dir_fd, so the
+            # temporary is resolved against the state parent and every argument is forwarded.
+            temp = self._link_target(source)
             # If any connection still held the temporary, BEGIN EXCLUSIVE would fail.
-            probe = sqlite3.connect(str(source), timeout=0.2, isolation_level=None)
+            probe = sqlite3.connect(str(temp), timeout=0.2, isolation_level=None)
             try:
                 probe.execute("BEGIN EXCLUSIVE")
                 probe.execute("ROLLBACK")
@@ -5875,8 +5916,8 @@ class PosixPublicationTests(_PublicationHarness):
             finally:
                 probe.close()
             for suffix in decisions.STORE_SIDECAR_SUFFIXES:
-                self.assertFalse(os.path.lexists(str(source) + suffix))
-            return real_link(source, destination)
+                self.assertFalse(os.path.lexists(str(temp) + suffix))
+            return real_link(source, destination, *args, **kwargs)
 
         with mock.patch("os.link", link_with_lock_proof):
             self._create()
@@ -5888,10 +5929,14 @@ class PosixPublicationTests(_PublicationHarness):
         expected = winner.read_bytes()
         real_link = os.link
 
-        def link_after_a_competitor_wins(source, destination):
-            if not os.path.lexists(destination):
-                shutil.copyfile(str(winner), str(destination))
-            return real_link(source, destination)
+        def link_after_a_competitor_wins(source, destination, *args, **kwargs):
+            # The destination arrives as a basename under descriptor-relative publication, so the
+            # competitor's store is planted at the resolved final path before the real link runs
+            # and correctly refuses an occupied destination.
+            final = self._link_target(destination)
+            if not os.path.lexists(final):
+                shutil.copyfile(str(winner), str(final))
+            return real_link(source, destination, *args, **kwargs)
 
         with mock.patch("os.link", link_after_a_competitor_wins):
             with self.assertRaises(decisions.DecisionStoreError) as caught:
@@ -5968,8 +6013,14 @@ class PosixPublicationTests(_PublicationHarness):
         self.assertTrue(alias.exists(), "the alias is never removed by the tool")
 
     def test_a_published_file_with_a_different_identity_is_refused(self):
-        def copying_link(source, destination):
-            shutil.copyfile(str(source), str(destination))
+        def copying_link(source, destination, *args, **kwargs):
+            # The injected fault IS "copy instead of link", so the real os.link is deliberately
+            # NOT called: forwarding to it would create a genuine hard link, the identity would
+            # match, and the property under test would evaporate. The signature accepts and
+            # ignores src_dir_fd/dst_dir_fd; both names are resolved against the state parent
+            # because descriptor-relative publication supplies basenames.
+            shutil.copyfile(str(self._link_target(source)),
+                            str(self._link_target(destination)))
 
         with mock.patch("os.link", copying_link):
             with self.assertRaises(decisions.DecisionStoreError) as caught:
@@ -8425,22 +8476,83 @@ class LostRaceCleanupTests(_AdmissionHarness):
                          "the temporary really did survive, and is named exactly")
         self._assert_competitor_preserved()
 
+    REPLACEMENT_BYTES = b"a different object entirely\n"
+
+    def _stage_replacement(self, temp_path):
+        """Rebind the temporary's NAME to a genuinely different inode, deterministically.
+
+        Unlinking and recreating in place is not reliable: ext4 readily hands the just-freed inode
+        straight back, so the pathname can end up holding the SAME identity the operation captured
+        and the production check would be right to say nothing changed. Instead the replacement is
+        created as a separate file while the original still exists, its identity is proven
+        different, and ``os.replace`` rebinds the name onto that pre-existing inode.
+
+        Returns the original, replacement and post-replacement identities so the test can prove the
+        substitution really happened rather than assuming it.
+        """
+        original = decisions._file_identity(os.lstat(temp_path))
+        staging = self.tmp / "replacement_staging.bin"
+        staging.write_bytes(self.REPLACEMENT_BYTES)
+        replacement = decisions._file_identity(os.lstat(staging))
+        self.assertNotEqual(replacement, original,
+                            "the replacement must be a genuinely different object")
+        os.replace(str(staging), temp_path)
+        return {
+            "original": original,
+            "replacement": replacement,
+            "after": decisions._file_identity(os.lstat(temp_path)),
+        }
+
     def test_a_lost_race_with_a_replaced_temporary_never_unlinks_it(self):
+        observed = {}
+
         def replace_temp(temp_path):
-            os.unlink(temp_path)
-            Path(temp_path).write_bytes(b"a different object entirely\n")
+            observed.update(self._stage_replacement(temp_path))
 
         with self._patch_publish(self._competitor_wins(then=replace_temp)):
             with self.assertRaises(decisions.DecisionStoreError) as caught:
                 decisions.create_store_exclusively(self._store_path())
+
+        # The substitution is proven, not assumed: the pathname now holds the replacement inode.
+        self.assertEqual(observed["after"], observed["replacement"])
+        self.assertNotEqual(observed["after"], observed["original"])
+        # The production identity comparison is exercised unweakened and reports the mismatch.
         self.assertEqual(caught.exception.reason, "store_temp_identity_changed")
         self.assertEqual(caught.exception.final_path_state,
                          decisions.COMPETITOR_PUBLISHED_UNTOUCHED)
+        self.assertIsNotNone(caught.exception.temp_basename)
         surviving = self._temporaries()
         self.assertEqual(len(surviving), 1)
-        self.assertEqual((self.tmp / surviving[0]).read_bytes(),
-                         b"a different object entirely\n",
+        self.assertEqual((self.tmp / surviving[0]).read_bytes(), self.REPLACEMENT_BYTES,
                          "a replacement object is never unlinked")
+        self.assertEqual(decisions._file_identity(os.lstat(self.tmp / surviving[0])),
+                         observed["replacement"],
+                         "the surviving object is the replacement, untouched")
+        self.assertFalse((self.tmp / "replacement_staging.bin").exists(),
+                         "os.replace consumed the staging name")
+        self.assertFalse(self.ledger.exists(),
+                         "no reviewer decision or audit append follows")
+        self._assert_competitor_preserved()
+
+    def test_no_reviewer_decision_follows_a_replaced_temporary(self):
+        """Requirement 5 of the replaced-temporary contract, through the real CLI."""
+        def replace_temp(temp_path):
+            self._stage_replacement(temp_path)
+
+        with self._patch_publish(self._competitor_wins(then=replace_temp)):
+            code, out = self._approve()
+        self.assertEqual(code, approval.EXIT_DECISION_AUTHORITY_UNCERTAIN, out)
+        self.assertNotIn("Traceback", out)
+        summary = json.loads(out)
+        self.assertEqual(summary["status"], "decision_store_integrity_uncertain")
+        self.assertEqual(summary["decision_store_integrity"], "store_temp_identity_changed")
+        self.assertEqual(summary["decision_store_final_path_state"],
+                         decisions.COMPETITOR_PUBLISHED_UNTOUCHED)
+        # The competitor's store is intact, so THIS operation modified no store at all.
+        self.assertIs(summary["decision_store_modified"], False)
+        self.assertIs(summary["manual_temp_cleanup_required"], True)
+        self.assertEqual(summary["event"], "none")
+        self.assertEqual(self._entries(), [], "no audit line is appended")
         self._assert_competitor_preserved()
 
     def test_a_lost_race_with_an_already_absent_temporary_reports_not_absent(self):
