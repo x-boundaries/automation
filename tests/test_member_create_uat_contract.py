@@ -1,7 +1,12 @@
 import copy
 import json
+import os
+import shutil
+import stat
 import sys
+import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -162,6 +167,76 @@ class PathSafetyTests(unittest.TestCase):
     def test_unsafe_basename_rejected(self):
         with self.assertRaises(contract.ContractError):
             contract.assert_safe_local_path(str(ROOT / "bad name*.json"))
+
+
+class FailClosedStatTests(unittest.TestCase):
+    """Amendment 9: path-component classification must distinguish absent from unclassifiable.
+
+    ``is_reparse_point`` answers False both for a path that does not exist and for one that could
+    not be classified at all. That is safe only where existence and type were already established
+    elsewhere, and is exactly the "treat a classification error as safe" defect that trusted-parent
+    admission must not have. ``lstat_no_follow`` therefore returns None ONLY for a provable
+    absence and lets every other ``OSError`` propagate.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(self.tmp), True)
+
+    def test_an_absent_path_is_reported_as_absent(self):
+        self.assertIsNone(contract.lstat_no_follow(self.tmp / "not_there"))
+
+    def test_an_existing_directory_is_reported(self):
+        info = contract.lstat_no_follow(self.tmp)
+        self.assertIsNotNone(info)
+        self.assertTrue(stat.S_ISDIR(info.st_mode))
+        self.assertFalse(contract.stat_is_reparse_point(info))
+
+    def test_an_existing_file_is_reported(self):
+        target = self.tmp / "plain.bin"
+        target.write_bytes(b"x")
+        info = contract.lstat_no_follow(target)
+        self.assertIsNotNone(info)
+        self.assertTrue(stat.S_ISREG(info.st_mode))
+
+    def test_a_classification_error_propagates_rather_than_answering_absent(self):
+        real_lstat = os.lstat
+
+        def refusing(path, *args, **kwargs):
+            raise PermissionError(13, "synthetic classification failure")
+
+        with mock.patch("os.lstat", refusing):
+            with self.assertRaises(PermissionError):
+                contract.lstat_no_follow(self.tmp)
+        # The permissive predicate, by contrast, answers False - which is why it must never be
+        # used for component admission.
+        with mock.patch("os.lstat", refusing):
+            self.assertFalse(contract.is_reparse_point(self.tmp))
+        self.assertIs(os.lstat, real_lstat)
+
+    def test_the_reparse_predicate_reads_an_already_obtained_stat(self):
+        info = os.lstat(self.tmp)
+        self.assertFalse(contract.stat_is_reparse_point(info))
+        reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+
+        class _Shim:
+            st_mode = info.st_mode
+            st_file_attributes = reparse
+
+        self.assertTrue(contract.stat_is_reparse_point(_Shim()))
+
+    def test_a_real_symlink_is_detected_without_being_followed(self):
+        target = self.tmp / "real_dir"
+        target.mkdir()
+        link = self.tmp / "link_dir"
+        try:
+            os.symlink(str(target), str(link), target_is_directory=True)
+        except (OSError, NotImplementedError) as error:
+            self.skipTest(f"symlinks unavailable: {type(error).__name__}")
+        info = contract.lstat_no_follow(link)
+        self.assertIsNotNone(info)
+        self.assertTrue(contract.stat_is_reparse_point(info),
+                        "the link itself is classified, not its target")
 
 
 class RedactionTests(unittest.TestCase):

@@ -97,12 +97,16 @@ EXIT_DECISION_NOT_AUTHORITATIVE = 10
 #      the approval was NOT consumed and a later explicit (never automatic) retry is allowed
 EXIT_BUILD_CLAIM_NOT_RECORDED = 11
 
-# The only two store failures that can leave a NEW file behind: first-use creation published
-# the store but could not prove its durability, or could not remove its own temporary. Every
-# other store refusal leaves the path exactly as it was found.
-DECISION_STORE_CREATION_UNCERTAIN = (
-    "store_publication_uncertain",
-    "store_temp_cleanup_incomplete",
+# Amendment 9: whether a NEW store file exists is now reported from the store module's explicit
+# final-path classifier rather than inferred from a reason list. Both states below mean THIS
+# operation's own publication became visible, so a new file really does exist. They differ in
+# whether the admission fact was proven, which is what decides between "requires controlled
+# reconciliation" and "a later invocation simply finds an operational store". A lost race leaves
+# the competitor's store byte-for-byte intact, so it reports the store unmodified and asks only
+# for the one named temporary to be removed.
+DECISION_STORE_PUBLISHED_STATES = (
+    decisions.PUBLISHED_NOT_ADMITTED,
+    decisions.PUBLISHED_AND_ADMITTED,
 )
 
 # Ledger events that mark an approval's package as already published (clean OR published
@@ -848,15 +852,18 @@ def cmd_decision(args, decision):
     # confirmed on this platform and the fate of its own temporary; an unproven publication or
     # a failed temporary cleanup raises instead of presenting an empty store as authorised
     # state, so the decision below never proceeds on a store we cannot vouch for.
+    # Amendment 9: an EXISTING store must also prove its in-store admission fact here, so a
+    # published-but-never-admitted store blocks the decision instead of quietly accepting it.
     creation = decisions.ensure_store(store)
     store_facts = (
         {
             "decision_store_created": True,
             "decision_store_durability": creation.durability,
             "decision_store_temp_cleanup": creation.temp_cleanup,
+            "decision_store_admission": creation.admission,
         }
         if creation is not None
-        else {"decision_store_created": False}
+        else {"decision_store_created": False, "decision_store_admission": "pre_existing"}
     )
 
     common = dict(
@@ -1059,6 +1066,40 @@ def _decision_sequence(store, decision_id):
         )
     except (decisions.DecisionStoreError, sqlite3.Error):
         return None
+
+
+def cmd_reconcile_store_admission(args):
+    """Amendment 9: the ONE explicit way to admit a published-but-never-admitted store.
+
+    Never invoked automatically and never reached by an ordinary command. It mutates admission
+    state only: it does not repair, migrate, checkpoint, truncate, rewrite, rename or replace the
+    database image, and it refuses outright if any reviewer decision, activation or build claim
+    already exists.
+
+    Real use against a real store requires explicit current-turn owner authority naming that
+    exact store; the runbook states this and this command cannot grant it to itself. The
+    confirmation switch is a deliberate second action, not a convenience default.
+    """
+    store = decisions.store_path_for(args.ledger)
+    result = decisions.reconcile_store_admission(
+        store, confirmed=args.confirm_controlled_reconciliation
+    )
+    _print_summary(
+        {
+            "status": "ok",
+            "event": "none",
+            "operation": "reconcile_store_admission",
+            "decision_store_admission": result.admission,
+            "decision_store_durability": result.durability,
+            "decision_store_operation_id": result.operation_id,
+            "decision_store_image_modified": False,
+            "decision_authority": "none",
+            "ledger_modified": False,
+            "fresh_approval_required": True,
+            "recovery": "fresh_reviewer_decision",
+        }
+    )
+    return 0
 
 
 def cmd_build_package(args):
@@ -2122,6 +2163,27 @@ def build_parser():
         ),
     )
 
+    # Amendment 9: separately named, never automatic, and gated on an explicit confirmation
+    # switch. It takes only the ledger path, so the exact store path is DERIVED rather than
+    # operator-supplied, and it cannot be pointed at an arbitrary database.
+    rc = sub.add_parser(
+        "reconcile-store-admission",
+        help=(
+            "Controlled recovery ONLY: admit an existing published, zero-history, "
+            "never-admitted decision store. Requires explicit current-turn owner authority "
+            "naming the exact store (see the runbook). Mutates admission state only."
+        ),
+    )
+    rc.add_argument("--ledger", required=True, help="Local approval ledger JSONL path (never commit).")
+    rc.add_argument(
+        "--confirm-controlled-reconciliation",
+        action="store_true",
+        help=(
+            "Required. Without it the command refuses and changes nothing. Passing it asserts "
+            "that the owner has authorised reconciliation of this exact store in this turn."
+        ),
+    )
+
     vp = sub.add_parser("validate-package", help="Laptop-side audit of a package (not used by the VM runner).")
     vp.add_argument("--package", required=True)
     vp.add_argument("--for-write", action="store_true", help="Also check expiry and business confirmation.")
@@ -2138,6 +2200,8 @@ def main(argv=None):
             return cmd_decision(args, "rejected")
         if args.command == "hold":
             return cmd_decision(args, "hold")
+        if args.command == "reconcile-store-admission":
+            return cmd_reconcile_store_admission(args)
         if args.command == "build-package":
             return cmd_build_package(args)
         if args.command == "validate-package":
@@ -2181,10 +2245,10 @@ def main(argv=None):
             "decision_authority": "uncertain",
             # A refusal against an EXISTING store never touches it: pure pre-open triage makes
             # no SQLite call at all, the read-only session cannot write, and the writer only
-            # ever mutates inside a transaction whose complete store it already validated. The
-            # two first-use creation outcomes below are the only ones that can leave a new file
-            # behind, and they say so rather than claiming nothing changed.
-            "decision_store_modified": error.reason in DECISION_STORE_CREATION_UNCERTAIN,
+            # ever mutates inside a transaction whose complete store it already validated. Only
+            # a refusal raised after THIS operation's own publication became visible can leave a
+            # new file behind, and it says so rather than claiming nothing changed.
+            "decision_store_modified": error.final_path_state in DECISION_STORE_PUBLISHED_STATES,
             "ledger_modified": False,
             "approval_blocked": True,
             "do_not_retry": True,
@@ -2192,6 +2256,10 @@ def main(argv=None):
             "fresh_approval_required": True,
             "recovery": "controlled_decision_store_reconciliation_then_fresh_decision",
         }
+        if error.final_path_state is not None:
+            # A fixed shape classifier only: it distinguishes "we published a store that is not
+            # operational" from "a competitor's store is intact", which need opposite responses.
+            summary["decision_store_final_path_state"] = error.final_path_state
         if error.temp_basename is not None:
             # Exactly one operator action, named by basename only: remove that one temporary.
             summary["manual_temp_cleanup_required"] = True

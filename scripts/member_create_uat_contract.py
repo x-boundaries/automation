@@ -411,17 +411,55 @@ def redact(text, secrets=()):
 # Path safety (independent reimplementation; does NOT import the shared-folder
 # handoff module, so this PR carries no dependency on its open POSIX findings).
 # --------------------------------------------------------------------------- #
+def stat_is_reparse_point(stat_result):
+    """True if an ALREADY-OBTAINED non-following stat describes a symlink or reparse point.
+
+    Separated from ``is_reparse_point`` so a caller that has classified a path component with
+    its own ``lstat`` - and must treat a classification error as a refusal rather than as
+    "not a reparse point" - can reuse the exact same predicate without a second stat call.
+    Windows junctions and every other reparse tag are covered by the attribute bit; POSIX
+    symlinks by the mode bits.
+    """
+    if stat.S_ISLNK(stat_result.st_mode):
+        return True
+    reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    file_attributes = getattr(stat_result, "st_file_attributes", 0)
+    return bool(file_attributes & reparse)
+
+
 def is_reparse_point(path):
-    """True if the final path entry is a reparse point / symlink (never followed)."""
+    """True if the final path entry is a reparse point / symlink (never followed).
+
+    An absent path and an unclassifiable one both answer False here, so this predicate is only
+    ever used where a SEPARATE check has already established existence and type. Path-component
+    admission must not use it: an ``lstat`` failure there has to fail closed, which is what
+    ``lstat_no_follow`` plus ``stat_is_reparse_point`` provide.
+    """
     try:
         st = os.lstat(path)
     except OSError:
         return False
-    if stat.S_ISLNK(st.st_mode):
-        return True
-    reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
-    file_attributes = getattr(st, "st_file_attributes", 0)
-    return bool(file_attributes & reparse)
+    return stat_is_reparse_point(st)
+
+
+def lstat_no_follow(path, *, dir_fd=None):
+    """Non-following stat that DISTINGUISHES absent from unclassifiable.
+
+    Returns None only when the entry provably does not exist. Every other ``OSError`` -
+    permission denied, too many levels of symbolic links, an I/O error, a name that is not a
+    directory - propagates, so a caller cannot mistake "we could not tell" for "it is fine".
+
+    ``dir_fd`` is passed through where the platform supports it, so a descriptor-relative walk
+    classifies exactly the component it is about to open. ``os.lstat`` accepts ``dir_fd`` but
+    not ``follow_symlinks``, so the descriptor-relative form uses ``os.stat`` with
+    ``follow_symlinks=False``, which is the documented equivalent.
+    """
+    try:
+        if dir_fd is None:
+            return os.lstat(path)
+        return os.stat(path, dir_fd=dir_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
 
 
 def assert_safe_local_path(path, *, must_exist=False):

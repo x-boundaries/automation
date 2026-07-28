@@ -78,6 +78,13 @@ jobs:
 
   ubuntu-focused:
     runs-on: ubuntu-latest
+    env:
+      # Amendment 9's POSIX trusted-parent contract refuses a device or mount transition
+      # between the traversal anchor (`/`) and the decision store's state parent. Pinning the
+      # temporary root to the workspace temp directory keeps every synthetic fixture on the
+      # root filesystem, so the invariant is deterministic rather than dependent on whether the
+      # runner image happens to mount /tmp separately.
+      TMPDIR: ${{ runner.temp }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
