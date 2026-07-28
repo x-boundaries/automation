@@ -7723,11 +7723,40 @@ class PosixParentPlatformTests(_ParentAdmissionHarness):
         )
 
     def test_descriptor_relative_operations_are_required(self):
-        with mock.patch.object(os, "supports_dir_fd", frozenset()):
+        """Capability is proven BY USE, so an unavailable ``dir_fd`` refuses at the call itself.
+
+        Consulting ``os.supports_dir_fd`` would be the wrong test: it reports the interpreter's
+        advertised support rather than whether the call works here, and it stops describing
+        reality as soon as a caller legitimately replaces one of those functions - which several
+        suites in this file do. Python signals a genuinely unsupported ``dir_fd`` with
+        ``NotImplementedError``, so that is what is forced here.
+        """
+        real_open = os.open
+
+        def no_dir_fd(path, flags, *a, **k):
+            if k.get("dir_fd") is not None:
+                raise NotImplementedError("dir_fd unavailable on this platform")
+            return real_open(path, flags, *a, **k)
+
+        with mock.patch("os.open", no_dir_fd):
             self._assert_nothing_created_at_all(
                 lambda: decisions.create_store_exclusively(self._store_path()),
                 "store_parent_unsupported",
             )
+
+    def test_publication_refuses_rather_than_falling_back_to_a_pathname_link(self):
+        """An unavailable descriptor-relative link must NOT silently publish by pathname."""
+        def no_dir_fd_link(src, dst, **kwargs):
+            if kwargs.get("src_dir_fd") is not None:
+                raise NotImplementedError("dir_fd unavailable on this platform")
+            raise AssertionError("publication must never fall back to a pathname link")
+
+        with mock.patch("os.link", no_dir_fd_link):
+            with self.assertRaises(decisions.DecisionStoreError) as caught:
+                decisions.create_store_exclusively(self._store_path())
+        self.assertEqual(caught.exception.reason, "store_parent_unsupported")
+        self.assertFalse(os.path.lexists(self._store_path()),
+                         "the final path is never created by a fallback")
 
 
 class MountinfoClassificationTests(unittest.TestCase):

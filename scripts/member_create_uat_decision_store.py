@@ -857,6 +857,12 @@ def _classify_component(name, *, dir_fd=None, path=None):
     target = name if dir_fd is not None else path
     try:
         info = contract.lstat_no_follow(target, dir_fd=dir_fd)
+    except NotImplementedError as error:
+        raise DecisionStoreError(
+            "This platform does not support descriptor-relative classification, which this "
+            "contract requires; refuse fail-closed.",
+            reason="store_parent_unsupported",
+        ) from error
     except OSError as error:
         raise DecisionStoreError(
             "A decision store state-path component could not be classified; refuse "
@@ -954,12 +960,13 @@ def _establish_trusted_parent_posix(parent):
     is one local filesystem, and a mount point crossing invalidates the durability reasoning
     the admission fact records.
     """
-    if os.link not in os.supports_dir_fd or os.unlink not in os.supports_dir_fd:
-        _refuse_component(
-            "store_parent_unsupported",
-            "This POSIX platform does not support the descriptor-relative operations this "
-            "contract requires; refuse fail-closed.",
-        )
+    # Descriptor-relative capability is proven BY USE, never by consulting
+    # ``os.supports_dir_fd``. That set reports the interpreter's ADVERTISED support, which is a
+    # different question from whether the call works here and now, and it stops describing
+    # reality the moment a caller legitimately replaces one of those functions. Python raises
+    # ``NotImplementedError`` when a ``dir_fd`` argument is genuinely unsupported, so every
+    # descriptor-relative call in this module maps that to `store_parent_unsupported` and fails
+    # closed at the exact point the capability was required.
     try:
         fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
     except OSError as error:
@@ -981,6 +988,12 @@ def _establish_trusted_parent_posix(parent):
                 nxt = os.open(
                     name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd
                 )
+            except NotImplementedError as error:
+                raise DecisionStoreError(
+                    "This platform does not support descriptor-relative directory opening, "
+                    "which this contract requires; refuse fail-closed.",
+                    reason="store_parent_unsupported",
+                ) from error
             except OSError as error:
                 raise DecisionStoreError(
                     "A decision store state-path component could not be opened without "
@@ -1643,6 +1656,10 @@ def cleanup_own_temporary(temp_name, *, identity, dir_fd=None):
             os.unlink(target, dir_fd=dir_fd)
         else:
             os.unlink(target)
+    except NotImplementedError:
+        # The descriptor-relative removal is unavailable here. Refuse rather than quietly
+        # falling back to a pathname unlink, which is the redirection this contract rejects.
+        return TempCleanup.FAILED
     except FileNotFoundError:
         # Removed by the same operator action we were about to perform; the end state is the
         # one we wanted, so report it truthfully rather than as a failure.
@@ -1825,6 +1842,13 @@ def _publish_posix(temp_name, safe, identity, parent):
         )
     except FileExistsError:
         _raise_lost_race(temp_name, identity=identity, dir_fd=parent.dir_fd)
+    except NotImplementedError as error:
+        raise DecisionStoreError(
+            "This platform does not support descriptor-relative hard linking, which this "
+            "contract requires for publication; refuse fail-closed and leave the final path "
+            "absent rather than publishing by pathname.",
+            reason="store_parent_unsupported",
+        ) from error
     except OSError as error:
         raise DecisionStoreError(
             "The completed decision store could not be atomically published; refuse "
@@ -1982,6 +2006,12 @@ def _create_operation_temporary(parent):
                  | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0))
         try:
             fd = os.open(basename, flags, 0o600, dir_fd=parent.dir_fd)
+        except NotImplementedError as error:
+            raise DecisionStoreError(
+                "This platform does not support descriptor-relative exclusive creation, which "
+                "this contract requires; refuse fail-closed.",
+                reason="store_parent_unsupported",
+            ) from error
         except OSError as error:
             raise DecisionStoreError(
                 "The decision store could not be exclusively created; refuse fail-closed.",
@@ -2057,6 +2087,13 @@ def _initialise_and_publish(safe, parent, temp_name, identity, operation_id):
         )
     try:
         _fsync_file(temp_name, dir_fd=parent.dir_fd)
+    except NotImplementedError as error:
+        raise DecisionStoreError(
+            "This platform does not support descriptor-relative opening for the pre-publication "
+            "flush, which this contract requires; refuse fail-closed and leave the final path "
+            "absent.",
+            reason="store_parent_unsupported",
+        ) from error
     except OSError as error:
         raise DecisionStoreError(
             "The completed decision store could not be flushed durably before publication; "
@@ -2426,7 +2463,7 @@ def _reestablish_durability(safe, parent):
     """
     try:
         _fsync_file(safe, dir_fd=parent.dir_fd)
-    except OSError as error:
+    except (OSError, NotImplementedError) as error:
         raise DecisionStoreError(
             "The decision store could not be flushed durably before admission; refuse "
             "fail-closed and change nothing.",
