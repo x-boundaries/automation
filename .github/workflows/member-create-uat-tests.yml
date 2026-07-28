@@ -100,5 +100,15 @@ jobs:
           }
           if ($failed) { exit 1 }
       - name: Focused create UAT tests (portable components)
+        env:
+          # Amendment 9's POSIX trusted-parent contract refuses a device or mount transition
+          # between the traversal anchor (`/`) and the decision store's state parent. Pinning the
+          # temporary root to the workspace temp directory keeps every synthetic fixture on the
+          # root filesystem, so the invariant is deterministic rather than dependent on whether
+          # the runner image happens to mount /tmp separately.
+          #
+          # This must stay at STEP level: the `runner` context is not available in a job-level
+          # `env` block, and using it there fails workflow validation before any job starts.
+          TMPDIR: ${{ runner.temp }}
         run: |
           python -m unittest tests.test_member_create_uat_contract tests.test_member_create_uat_approval tests.test_member_create_uat_result_precheck tests.test_member_create_uat_runner_ps tests.test_ac2_member_expiry_capability_probe

@@ -1,7 +1,12 @@
 import copy
 import json
+import os
+import shutil
+import stat
 import sys
+import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -85,9 +90,11 @@ class PackageValidationRejectionTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertEqual(reasons, ["top_level_field_set_mismatch"])
 
-    def test_expiry_date_in_member_payload_rejected(self):
+    def test_member_payload_requires_expiry_date(self):
+        # ExpiryDate is now an active assignable field: a package whose member_payload
+        # omits it no longer matches the exact assignable field set.
         pkg = fx.build_valid_package()
-        pkg["member_payload"]["ExpiryDate"] = "2028-06-30"
+        del pkg["member_payload"]["ExpiryDate"]
         ok, reasons = contract.validate_package(pkg)
         self.assertFalse(ok)
         self.assertIn("member_payload_field_set_mismatch", reasons)
@@ -124,11 +131,12 @@ class PackageValidationRejectionTests(unittest.TestCase):
 
 
 class BusinessGateTests(unittest.TestCase):
-    def test_committed_config_is_all_false_fail_closed(self):
+    def test_committed_config_is_all_confirmed(self):
+        # All four business decisions are now explicitly recorded by the owner.
         confirmations = contract.load_business_confirmation(BUSINESS_CONFIG)
         all_confirmed, unconfirmed = contract.business_fields_confirmed(confirmations)
-        self.assertFalse(all_confirmed)
-        self.assertEqual(sorted(unconfirmed), sorted(contract.BUSINESS_CONFIRMATION_REQUIRED))
+        self.assertTrue(all_confirmed)
+        self.assertEqual(unconfirmed, [])
 
     def test_partial_confirmation_still_blocks(self):
         confirmations = {
@@ -161,6 +169,76 @@ class PathSafetyTests(unittest.TestCase):
             contract.assert_safe_local_path(str(ROOT / "bad name*.json"))
 
 
+class FailClosedStatTests(unittest.TestCase):
+    """Amendment 9: path-component classification must distinguish absent from unclassifiable.
+
+    ``is_reparse_point`` answers False both for a path that does not exist and for one that could
+    not be classified at all. That is safe only where existence and type were already established
+    elsewhere, and is exactly the "treat a classification error as safe" defect that trusted-parent
+    admission must not have. ``lstat_no_follow`` therefore returns None ONLY for a provable
+    absence and lets every other ``OSError`` propagate.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(self.tmp), True)
+
+    def test_an_absent_path_is_reported_as_absent(self):
+        self.assertIsNone(contract.lstat_no_follow(self.tmp / "not_there"))
+
+    def test_an_existing_directory_is_reported(self):
+        info = contract.lstat_no_follow(self.tmp)
+        self.assertIsNotNone(info)
+        self.assertTrue(stat.S_ISDIR(info.st_mode))
+        self.assertFalse(contract.stat_is_reparse_point(info))
+
+    def test_an_existing_file_is_reported(self):
+        target = self.tmp / "plain.bin"
+        target.write_bytes(b"x")
+        info = contract.lstat_no_follow(target)
+        self.assertIsNotNone(info)
+        self.assertTrue(stat.S_ISREG(info.st_mode))
+
+    def test_a_classification_error_propagates_rather_than_answering_absent(self):
+        real_lstat = os.lstat
+
+        def refusing(path, *args, **kwargs):
+            raise PermissionError(13, "synthetic classification failure")
+
+        with mock.patch("os.lstat", refusing):
+            with self.assertRaises(PermissionError):
+                contract.lstat_no_follow(self.tmp)
+        # The permissive predicate, by contrast, answers False - which is why it must never be
+        # used for component admission.
+        with mock.patch("os.lstat", refusing):
+            self.assertFalse(contract.is_reparse_point(self.tmp))
+        self.assertIs(os.lstat, real_lstat)
+
+    def test_the_reparse_predicate_reads_an_already_obtained_stat(self):
+        info = os.lstat(self.tmp)
+        self.assertFalse(contract.stat_is_reparse_point(info))
+        reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+
+        class _Shim:
+            st_mode = info.st_mode
+            st_file_attributes = reparse
+
+        self.assertTrue(contract.stat_is_reparse_point(_Shim()))
+
+    def test_a_real_symlink_is_detected_without_being_followed(self):
+        target = self.tmp / "real_dir"
+        target.mkdir()
+        link = self.tmp / "link_dir"
+        try:
+            os.symlink(str(target), str(link), target_is_directory=True)
+        except (OSError, NotImplementedError) as error:
+            self.skipTest(f"symlinks unavailable: {type(error).__name__}")
+        info = contract.lstat_no_follow(link)
+        self.assertIsNotNone(info)
+        self.assertTrue(contract.stat_is_reparse_point(info),
+                        "the link itself is classified, not its target")
+
+
 class RedactionTests(unittest.TestCase):
     def test_mask_member_no(self):
         self.assertEqual(contract.mask_member_no("6590000001"), "65***1")
@@ -191,10 +269,14 @@ class SchemaSyncTests(unittest.TestCase):
     def test_member_payload_forbids_additional_properties(self):
         self.assertFalse(self.schema["properties"]["member_payload"]["additionalProperties"])
 
-    def test_expiry_date_not_assignable(self):
+    def test_expiry_date_now_assignable(self):
         enum = self.schema["properties"]["assignable_fields"]["items"]["enum"]
-        self.assertNotIn("ExpiryDate", enum)
+        self.assertIn("ExpiryDate", enum)
+        self.assertIn("ExpiryDate", self.schema["properties"]["member_payload"]["required"])
         self.assertIn("ExpiryDate", self.schema["properties"]["desired_business_fields"]["required"])
+
+    def test_schema_version_is_v2(self):
+        self.assertEqual(self.schema["properties"]["schema_version"]["const"], "member_create_uat_package/v2")
 
     def test_jsonschema_validation_when_available(self):
         try:
@@ -202,8 +284,54 @@ class SchemaSyncTests(unittest.TestCase):
         except ImportError:
             self.skipTest("jsonschema not installed")
         jsonschema.validate(fx.build_valid_package(), self.schema)
+        # A v2 package whose member_payload omits the now-required ExpiryDate is invalid.
         bad = fx.build_valid_package()
-        bad["member_payload"]["ExpiryDate"] = "2028-06-30"
+        del bad["member_payload"]["ExpiryDate"]
+        with self.assertRaises(jsonschema.ValidationError):
+            jsonschema.validate(bad, self.schema)
+
+
+class SchemaExpiryConstTests(unittest.TestCase):
+    """Finding 1: the source-of-truth JSON Schema enforces the exact ExpiryDate value
+    via const in both member_payload and desired_business_fields, not merely a date
+    shape, so it agrees with the Python/PowerShell exact-value validation."""
+
+    def setUp(self):
+        self.schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+
+    def test_schema_declares_expiry_const_in_both_places(self):
+        mp = self.schema["properties"]["member_payload"]["properties"]["ExpiryDate"]
+        db = self.schema["properties"]["desired_business_fields"]["properties"]["ExpiryDate"]
+        self.assertEqual(mp.get("const"), "2028-06-30")
+        self.assertEqual(db.get("const"), "2028-06-30")
+        # Must not fall back to only a permissive date regex.
+        self.assertNotIn("pattern", mp)
+        self.assertNotIn("pattern", db)
+
+    def test_intended_expiry_passes_real_jsonschema(self):
+        try:
+            import jsonschema
+        except ImportError:
+            self.skipTest("jsonschema not installed")
+        jsonschema.validate(fx.build_valid_package(), self.schema)
+
+    def test_other_expiry_in_member_payload_fails_real_jsonschema(self):
+        try:
+            import jsonschema
+        except ImportError:
+            self.skipTest("jsonschema not installed")
+        bad = fx.build_valid_package()
+        bad["member_payload"]["ExpiryDate"] = "2029-06-30"
+        with self.assertRaises(jsonschema.ValidationError):
+            jsonschema.validate(bad, self.schema)
+
+    def test_other_expiry_in_desired_fails_real_jsonschema(self):
+        try:
+            import jsonschema
+        except ImportError:
+            self.skipTest("jsonschema not installed")
+        bad = fx.build_valid_package()
+        bad["desired_business_fields"]["ExpiryDate"] = "2029-06-30"
         with self.assertRaises(jsonschema.ValidationError):
             jsonschema.validate(bad, self.schema)
 
@@ -216,6 +344,7 @@ def _write_flags(**over):
         member_exists_initial=False, member_exists_recheck=False,
         save_member_attempted=True, save_member_confirmed=True, save_outcome="confirmed",
         readback_found=True, readback_match=True,
+        expiry_date_assigned=True, assigned_field_count=contract.EXPECTED_ASSIGNED_FIELD_COUNT,
     )
     base.update(over)
     return base
@@ -307,12 +436,13 @@ class SchemaEquivalentValidationTests(unittest.TestCase):
         self.assertIn("approval_field_set_mismatch", reasons)
 
 
-class ExpiryDateContractPreparationTests(unittest.TestCase):
-    """A. Main UAT contract preparation for ExpiryDate.
+class ExpiryDateActivationTests(unittest.TestCase):
+    """A. Main UAT contract activation for ExpiryDate.
 
-    ExpiryDate is added to the prepared INTENDED assignment/read-back contract with the
-    exact value 2028-06-30, while the code-level capability flag stays False, the active
-    ASSIGNABLE_FIELDS still exclude it, and every business confirmation stays False.
+    ExpiryDate is now an ACTIVE assignable field with the exact value 2028-06-30: the
+    code-level capability flag is True, ExpiryDate is in ASSIGNABLE_FIELDS and the
+    member_payload, the never-assign set is empty, and every business confirmation is
+    True. It remains in the intended assignment and read-back contracts.
     """
 
     LIB_PS = ROOT / "scripts" / "member_create_uat_runner_lib.ps1"
@@ -341,20 +471,23 @@ class ExpiryDateContractPreparationTests(unittest.TestCase):
         self.assertEqual(contract.EXPIRYDATE_INTENDED_VALUE, "2028-06-30")
         self.assertEqual(contract.INTENDED_BUSINESS_VALUES["ExpiryDate"], "2028-06-30")
 
-    # ---- A5: code-level capability flag remains False ---- #
-    def test_capability_flag_remains_false(self):
-        self.assertFalse(contract.EXPIRYDATE_ASSIGNMENT_IMPLEMENTED)
-        # And ExpiryDate is still excluded from the ACTIVE assignment whitelist / payload.
-        self.assertNotIn("ExpiryDate", contract.ASSIGNABLE_FIELDS)
-        self.assertIn("ExpiryDate", contract.NEVER_ASSIGN_FIELDS)
+    # ---- A5: code-level capability flag is now True and mirrored ---- #
+    def test_capability_flag_is_true_and_active(self):
+        self.assertTrue(contract.EXPIRYDATE_ASSIGNMENT_IMPLEMENTED)
+        # ExpiryDate is now in the ACTIVE assignment whitelist and out of never-assign.
+        self.assertIn("ExpiryDate", contract.ASSIGNABLE_FIELDS)
+        self.assertNotIn("ExpiryDate", contract.NEVER_ASSIGN_FIELDS)
+        self.assertEqual(contract.NEVER_ASSIGN_FIELDS, ())
 
     def test_powershell_lib_mirrors_intended_contract_and_capability_flag(self):
         lib = self.LIB_PS.read_text(encoding="utf-8")
         self.assertIn("$script:CreateUatIntendedAssignmentFields", lib)
         self.assertIn("$script:CreateUatReadbackVerificationFields", lib)
         self.assertIn('$script:CreateUatExpiryDateIntendedValue = "2028-06-30"', lib)
-        # The capability flag must remain explicitly false in the PowerShell source.
-        self.assertRegex(lib, r"\$script:CreateUatExpiryDateAssignmentImplemented\s*=\s*\$false")
+        # The capability flag must now be explicitly true in the PowerShell source, in
+        # exact agreement with the Python EXPIRYDATE_ASSIGNMENT_IMPLEMENTED constant.
+        self.assertRegex(lib, r"\$script:CreateUatExpiryDateAssignmentImplemented\s*=\s*\$true")
+        self.assertNotRegex(lib, r"\$script:CreateUatExpiryDateAssignmentImplemented\s*=\s*\$false")
 
     # ---- A4: missing / malformed / different / extra ExpiryDate fail closed ---- #
     def test_missing_expiry_date_fails_closed(self):
@@ -380,9 +513,20 @@ class ExpiryDateContractPreparationTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("desired_ExpiryDate_not_intended", reasons)
 
-    def test_extra_expiry_date_in_active_payload_fails_closed(self):
+    def test_wrong_member_payload_expiry_date_fails_closed(self):
+        # ExpiryDate is now in the active payload; a value other than the intended
+        # 2028-06-30 fails closed on the intended-value check.
         pkg = fx.build_valid_package()
-        pkg["member_payload"]["ExpiryDate"] = contract.EXPIRYDATE_INTENDED_VALUE
+        pkg["member_payload"]["ExpiryDate"] = "2099-01-01"
+        self._rebuild_hash(pkg)
+        ok, reasons = contract.validate_package(pkg)
+        self.assertFalse(ok)
+        self.assertIn("member_payload_ExpiryDate_not_intended", reasons)
+
+    def test_unknown_extra_field_in_active_payload_fails_closed(self):
+        # An undeclared extra field still fails the exact field-set check.
+        pkg = fx.build_valid_package()
+        pkg["member_payload"]["SurpriseField"] = "x"
         ok, reasons = contract.validate_package(pkg)
         self.assertFalse(ok)
         self.assertIn("member_payload_field_set_mismatch", reasons)
@@ -396,13 +540,93 @@ class ExpiryDateContractPreparationTests(unittest.TestCase):
         self.assertNotEqual(code, "CREATED_VERIFIED")
         self.assertEqual(contr, [])
 
-    # ---- A6: business confirmations remain false ---- #
-    def test_committed_business_confirmations_all_false_including_expiry(self):
+    # ---- A6: all four business confirmations are true and exact ---- #
+    def test_committed_business_confirmations_all_true_including_expiry(self):
         data = json.loads(BUSINESS_CONFIG.read_text(encoding="utf-8"))
         confirmations = data["confirmations"]
+        self.assertEqual(sorted(confirmations), sorted(contract.BUSINESS_CONFIRMATION_REQUIRED))
         for field in contract.BUSINESS_CONFIRMATION_REQUIRED:
-            self.assertIs(confirmations[field]["confirmed"], False, field)
-        self.assertIs(confirmations["ExpiryDate"]["confirmed"], False)
+            self.assertIs(confirmations[field]["confirmed"], True, field)
+        self.assertIs(confirmations["ExpiryDate"]["confirmed"], True)
+
+
+class OldPackageRejectionTests(unittest.TestCase):
+    """D. A package built under the previous (v1) contract must be refused fail-closed."""
+
+    def _rebuild_hash(self, pkg):
+        pkg["payload_hash"] = contract.compute_payload_hash(pkg)
+        pkg["approval"]["bound_package_payload_hash"] = pkg["payload_hash"]
+        return pkg
+
+    def test_v1_schema_version_rejected(self):
+        pkg = fx.build_valid_package()
+        pkg["schema_version"] = "member_create_uat_package/v1"
+        self._rebuild_hash(pkg)
+        ok, reasons = contract.validate_package(pkg)
+        self.assertFalse(ok)
+        self.assertIn("schema_version_mismatch", reasons)
+
+    def test_old_eight_field_payload_shape_rejected(self):
+        # An old-shape package: 8-field member_payload / assignable_fields without ExpiryDate.
+        pkg = fx.build_valid_package()
+        del pkg["member_payload"]["ExpiryDate"]
+        pkg["assignable_fields"] = [f for f in pkg["assignable_fields"] if f != "ExpiryDate"]
+        self._rebuild_hash(pkg)
+        ok, reasons = contract.validate_package(pkg)
+        self.assertFalse(ok)
+        self.assertIn("member_payload_field_set_mismatch", reasons)
+        self.assertIn("assignable_fields_mismatch", reasons)
+
+
+class PayloadHashExpiryTests(unittest.TestCase):
+    """F/6. Changing ExpiryDate changes both the payload hash and the fingerprint."""
+
+    def test_payload_hash_and_fingerprint_change_with_expiry_date(self):
+        base = fx.build_valid_package()
+        changed = fx.build_valid_package()
+        changed["member_payload"]["ExpiryDate"] = "2029-06-30"
+        changed["desired_business_fields"]["ExpiryDate"] = "2029-06-30"
+        changed["source_fingerprint"] = contract.source_fingerprint(
+            contract.build_fingerprint_fields(changed["member_payload"], changed["desired_business_fields"])
+        )
+        changed["approval"]["source_fingerprint"] = changed["source_fingerprint"]
+        changed["payload_hash"] = contract.compute_payload_hash(changed)
+        changed["approval"]["bound_package_payload_hash"] = changed["payload_hash"]
+        self.assertNotEqual(base["source_fingerprint"], changed["source_fingerprint"])
+        self.assertNotEqual(base["payload_hash"], changed["payload_hash"])
+
+
+class ExpiryDateTerminalGuardTests(unittest.TestCase):
+    """G. Real-write success is impossible without ExpiryDate assigned and the full count."""
+
+    def test_expected_count_is_eleven_and_derived(self):
+        self.assertEqual(contract.EXPECTED_ASSIGNED_FIELD_COUNT, 11)
+        self.assertEqual(
+            contract.EXPECTED_ASSIGNED_FIELD_COUNT,
+            len(contract.ASSIGNABLE_FIELDS) + len(contract.RUNNER_ACTIVATION_FIELDS),
+        )
+
+    def test_created_verified_requires_expiry_assigned(self):
+        _, contr = contract.recompute_terminal_state(_write_flags(expiry_date_assigned=False))
+        self.assertIn("expiry_date_not_assigned", contr)
+
+    def test_created_verified_requires_expected_field_count(self):
+        _, contr = contract.recompute_terminal_state(_write_flags(assigned_field_count=10))
+        self.assertIn("assigned_field_count_stale", contr)
+
+    def test_clean_created_verified_has_no_contradiction(self):
+        code, contr = contract.recompute_terminal_state(_write_flags())
+        self.assertEqual(code, "CREATED_VERIFIED")
+        self.assertEqual(contr, [])
+
+    def test_confirmed_save_then_readback_not_found_is_honest(self):
+        # A confirmed save with read-back not found stays WRITE_OUTCOME_UNCERTAIN,
+        # never CREATED_VERIFIED, and is not itself a contradiction.
+        code, contr = contract.recompute_terminal_state(
+            _write_flags(readback_found=False, readback_match=False)
+        )
+        self.assertEqual(code, "WRITE_OUTCOME_UNCERTAIN")
+        self.assertEqual(contr, [])
 
 
 class TerminalCodeTests(unittest.TestCase):

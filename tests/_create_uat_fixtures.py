@@ -25,6 +25,7 @@ SYNTHETIC_PAYLOAD = {
     "DOB": "2000-03-01",
     "MemberType": "Default",
     "RegisterDate": "2026-07-01",
+    "ExpiryDate": "2028-06-30",
     "OpeningPoints": 0,
 }
 

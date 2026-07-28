@@ -12,12 +12,16 @@
 
 Set-StrictMode -Version Latest
 
-$script:CreateUatSchemaVersion = "member_create_uat_package/v1"
+# Bumped v1 -> v2: the package payload shape changed (member_payload and
+# assignable_fields now include ExpiryDate). A v1 package built under the previous
+# contract is refused fail-closed by the schema_version check below.
+$script:CreateUatSchemaVersion = "member_create_uat_package/v2"
 $script:CreateUatAssignableFields = @(
-    "MemberNo", "Name", "EmailAddress", "MobilePhone", "DOB", "MemberType", "RegisterDate", "OpeningPoints"
+    "MemberNo", "Name", "EmailAddress", "MobilePhone", "DOB", "MemberType", "RegisterDate", "ExpiryDate", "OpeningPoints"
 )
-# ExpiryDate is intentionally excluded from assignment until proven.
-$script:CreateUatNeverAssignFields = @("ExpiryDate")
+# ExpiryDate assignment/persistence is proven (synthetic capability probe), so it is now
+# an active assignable field and the never-assign set is empty.
+$script:CreateUatNeverAssignFields = @()
 $script:CreateUatBusinessConfirmationRequired = @("MemberType", "RegisterDate", "ExpiryDate", "OpeningPoints")
 $script:CreateUatDesiredBusinessFields = @("MemberType", "RegisterDate", "ExpiryDate", "OpeningPoints")
 # Intended business-desired values; must match config/member_create_uat_contract.py.
@@ -27,15 +31,19 @@ $script:CreateUatIntended = @{
     ExpiryDate    = "2028-06-30"
     OpeningPoints = 0
 }
-# Prepared (but not yet active) ExpiryDate assignment/read-back contract; mirrors
-# member_create_uat_contract.py. ExpiryDate is part of the INTENDED assignment and
-# read-back contract, but it stays OUT of the active $script:CreateUatAssignableFields
-# whitelist until the capability flag $script:CreateUatExpiryDateAssignmentImplemented
-# (defined below) is flipped after synthetic proof. The invariant keeps the
-# active/intended relationship explicit for a clean follow-up flip.
+# Active ExpiryDate assignment/read-back contract; mirrors member_create_uat_contract.py.
+# ExpiryDate is now part of BOTH the intended assignment/read-back contract AND the active
+# $script:CreateUatAssignableFields whitelist, because the capability flag
+# $script:CreateUatExpiryDateAssignmentImplemented (defined below) is now $true after the
+# synthetic proof. The invariant keeps the active/intended relationship explicit.
 $script:CreateUatExpiryDateIntendedValue = "2028-06-30"
 $script:CreateUatIntendedAssignmentFields = $script:CreateUatAssignableFields + $script:CreateUatNeverAssignFields
 $script:CreateUatReadbackVerificationFields = $script:CreateUatIntendedAssignmentFields
+# Runner-managed activation fields assigned in addition to the package whitelist, and the
+# derived expected assigned-field count (9 assignable + 2 activation = 11). Kept as an
+# explicit surface so the count is derived, not a hard-coded literal.
+$script:CreateUatRunnerActivationFields = @("IsActive", "Individual")
+$script:CreateUatExpectedAssignedFieldCount = $script:CreateUatAssignableFields.Count + $script:CreateUatRunnerActivationFields.Count
 $script:CreateUatDateRe = '^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])$'
 $script:CreateUatTimestampRe = '^[0-9T:+.Z-]{1,64}$'
 
@@ -311,9 +319,11 @@ function Test-CreateUatPackage {
         if ([string]$payload.DOB -notmatch '^2000-(0[1-9]|1[0-2])-01$') { Add-Reason "dob_invalid" }
         if ($memberType.Length -lt 1 -or $memberType.Length -gt 20) { Add-Reason "member_type_invalid" }
         if ([string]$payload.RegisterDate -notmatch '^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])$') { Add-Reason "register_date_invalid" }
+        if ([string]$payload.ExpiryDate -notmatch $script:CreateUatDateRe) { Add-Reason "expiry_date_invalid" }
         if (-not (($payload.OpeningPoints -is [int] -or $payload.OpeningPoints -is [long]) -and [long]$payload.OpeningPoints -eq 0)) { Add-Reason "opening_points_not_zero" }
         if ($memberType -ne $script:CreateUatIntended.MemberType) { Add-Reason "member_payload_MemberType_not_intended" }
         if ([string]$payload.RegisterDate -ne $script:CreateUatIntended.RegisterDate) { Add-Reason "member_payload_RegisterDate_not_intended" }
+        if ([string]$payload.ExpiryDate -ne $script:CreateUatIntended.ExpiryDate) { Add-Reason "member_payload_ExpiryDate_not_intended" }
         if (-not (($payload.OpeningPoints -is [int] -or $payload.OpeningPoints -is [long]) -and [long]$payload.OpeningPoints -eq [long]$script:CreateUatIntended.OpeningPoints)) { Add-Reason "member_payload_OpeningPoints_not_intended" }
     }
     foreach ($never in $script:CreateUatNeverAssignFields) {
@@ -404,11 +414,13 @@ function Test-CreateUatApprovalNotExpired {
     return ($NowUtc -lt $expires)
 }
 
-# Code-level capability block (finding 1): ExpiryDate assignment and read-back are
-# not implemented/proven, so even four true confirmations must not make a real write
-# reachable. Flipping this to $true requires implementing ExpiryDate assignment AND
-# its read-back verification (finding 3) in the same change.
-$script:CreateUatExpiryDateAssignmentImplemented = $false
+# Code-level capability flag (finding 1): ExpiryDate assignment AND its read-back
+# verification are now implemented and proven (synthetic capability probe;
+# terminal_outcome=EXPIRY_VERIFIED), so this is $true. It must remain in exact agreement
+# with the Python EXPIRYDATE_ASSIGNMENT_IMPLEMENTED constant. The independent
+# business-confirmation gate and the five write-confirmation switches are unchanged, so
+# a real write still requires the explicit operator step.
+$script:CreateUatExpiryDateAssignmentImplemented = $true
 $script:CreateUatBusinessConfigSchemaVersion = "member_create_uat_business_confirmation/v1"
 
 function Get-CreateUatBusinessGate {
@@ -602,6 +614,15 @@ function Get-CreateUatStateContradictions {
     if (($rbFound -or $rbMatch) -and $outcome -ne 'confirmed') { $reasons.Add('readback_without_confirmed_save') }
     if ($attempted -and -not $write) { $reasons.Add('attempt_in_non_write_mode') }
     if ($attempted -and -not [bool](Get-CreateUatFlag $Flags 'lock_acquired' $false)) { $reasons.Add('attempt_without_lock') }
+    # ExpiryDate is an active assignable field, so any real save is preceded by an
+    # ExpiryDate assignment and the full expected field set. A save attempt (or a matched
+    # read-back) without expiry_date_assigned, or with a stale assigned-field count, is a
+    # contradiction, so CREATED_VERIFIED is impossible unless ExpiryDate was assigned and
+    # the full field set was written.
+    $expiryAssigned = [bool](Get-CreateUatFlag $Flags 'expiry_date_assigned' $false)
+    $assignedCount = Get-CreateUatFlag $Flags 'assigned_field_count' $null
+    if (($attempted -or $rbMatch) -and -not $expiryAssigned) { $reasons.Add('expiry_date_not_assigned') }
+    if (($attempted -or $rbMatch) -and ([long]($assignedCount) -ne [long]$script:CreateUatExpectedAssignedFieldCount)) { $reasons.Add('assigned_field_count_stale') }
     if (-not $write -and (
             [bool](Get-CreateUatFlag $Flags 'write_confirmed' $false) -or
             [bool](Get-CreateUatFlag $Flags 'member_exists_recheck' $false) -or

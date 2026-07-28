@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://x-boundaries.local/schemas/member_create_uat_package.schema.json",
-  "title": "Member Create UAT Package (v1)",
-  "description": "Language-neutral contract for the immutable exactly-one-record single-member creation UAT package. The PowerShell VM runner parses and validates a package against these constraints in-process; the Python tooling generates packages that conform. This schema is the source of truth for both implementations. No credentials, no raw logs, no arbitrary Sheet dump, no formulas. Row number is a non-authoritative location hint only; source_record_id plus source_fingerprint are the authoritative identity and change-detection values.",
+  "title": "Member Create UAT Package (v2)",
+  "description": "Language-neutral contract for the immutable exactly-one-record single-member creation UAT package. The PowerShell VM runner parses and validates a package against these constraints in-process; the Python tooling generates packages that conform. This schema is the source of truth for both implementations. Version v2 adds ExpiryDate as an active assignable field (its AutoCount persistence was proven by the synthetic capability probe); a v1 package built under the previous contract has a different payload shape and is refused fail-closed. No credentials, no raw logs, no arbitrary Sheet dump, no formulas. Row number is a non-authoritative location hint only; source_record_id plus source_fingerprint are the authoritative identity and change-detection values.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -21,8 +21,8 @@
   ],
   "properties": {
     "schema_version": {
-      "description": "Fixed contract version. A runner that does not recognise this exact value must refuse.",
-      "const": "member_create_uat_package/v1"
+      "description": "Fixed contract version. A runner that does not recognise this exact value must refuse, so a prior v1 package cannot be executed under the v2 contract.",
+      "const": "member_create_uat_package/v2"
     },
     "operation_id": {
       "description": "Authoritative, unique per build. UUIDv4 (128 crypto-random bits) rendered as mcuat_<32 lowercase hex>. Never derived from a non-cryptographic hash.",
@@ -104,7 +104,7 @@
       }
     },
     "assignable_fields": {
-      "description": "Exact whitelist of fields the runner may ACTIVELY assign to the AutoCount member. ExpiryDate is intentionally absent from this active whitelist: it is part of the prepared INTENDED assignment contract (INTENDED_ASSIGNMENT_FIELDS in scripts/member_create_uat_contract.py) but remains gated by the code-level ExpiryDate capability flag and must not enter the AutoCount payload until its persistence is proven and the flag is flipped in a follow-up change.",
+      "description": "Exact whitelist of fields the runner may ACTIVELY assign to the AutoCount member. ExpiryDate is now an active assignable field: its AutoCount assignment and persistence were proven by the synthetic ExpiryDate capability probe, so the code-level capability flag is flipped and ExpiryDate is part of the active whitelist and the member_payload.",
       "type": "array",
       "uniqueItems": true,
       "items": {
@@ -116,6 +116,7 @@
           "DOB",
           "MemberType",
           "RegisterDate",
+          "ExpiryDate",
           "OpeningPoints"
         ]
       }
@@ -132,6 +133,7 @@
         "DOB",
         "MemberType",
         "RegisterDate",
+        "ExpiryDate",
         "OpeningPoints"
       ],
       "properties": {
@@ -171,6 +173,10 @@
           "type": "string",
           "pattern": "^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])$"
         },
+        "ExpiryDate": {
+          "description": "Intended membership end date, yyyy-mm-dd. Active assignable field; for this bounded UAT the only accepted value is exactly 2028-06-30 (enforced by const, not merely a date shape).",
+          "const": "2028-06-30"
+        },
         "OpeningPoints": {
           "description": "Zero only.",
           "const": 0
@@ -178,7 +184,7 @@
       }
     },
     "desired_business_fields": {
-      "description": "Business-desired values recorded for review and audit. These are NOT the active assignment payload. ExpiryDate lives here, must equal the intended value 2028-06-30, and is covered by the fingerprint; it is part of the prepared intended assignment/read-back contract but is never actively assigned while its capability flag is false and confirmations are false.",
+      "description": "Business-desired values recorded for review and audit. ExpiryDate lives here, must equal the intended value 2028-06-30, and is covered by the fingerprint. ExpiryDate is now also an active assignable field mirrored in member_payload; the runner assigns and reads it back.",
       "type": "object",
       "additionalProperties": false,
       "required": ["MemberType", "RegisterDate", "ExpiryDate", "OpeningPoints"],
@@ -189,8 +195,8 @@
           "pattern": "^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])$"
         },
         "ExpiryDate": {
-          "type": "string",
-          "pattern": "^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])$"
+          "description": "For this bounded UAT the only accepted value is exactly 2028-06-30 (enforced by const, not merely a date shape).",
+          "const": "2028-06-30"
         },
         "OpeningPoints": { "const": 0 }
       }

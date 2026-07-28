@@ -281,7 +281,7 @@ try {
     $result.member_exists_initial = ($null -ne $existing)
     if ($result.member_exists_initial) { return (Write-CreateUatResult) }
 
-    # ---- 8. NewMember(false) + whitelisted assignment (ExpiryDate never assigned). ----
+    # ---- 8. NewMember(false) + whitelisted assignment (ExpiryDate now included). ----
     $newMemberMethod = Find-PublicInstanceMethod $memberCommandType "NewMember" 1
     if ($null -eq $newMemberMethod) { throw "NewMember method was not found." }
     $memberEntity = $newMemberMethod.Invoke($memberCommand, @($false))
@@ -301,7 +301,8 @@ try {
     $isActive = Get-RowStringValue $memberRow "IsActive"; if ([string]::IsNullOrWhiteSpace($isActive)) { $isActive = "T" }
     $individual = Get-RowStringValue $memberRow "Individual"; if ([string]::IsNullOrWhiteSpace($individual)) { $individual = "T" }
 
-    # Only whitelisted assignable fields. ExpiryDate is deliberately absent.
+    # Only whitelisted assignable fields, plus the runner-managed activation fields.
+    # ExpiryDate is now an active assignable field (proven persistence).
     $assignments = [ordered]@{
         MemberNo      = [string]$package.member_payload.MemberNo
         MemberType    = [string]$package.member_payload.MemberType
@@ -310,6 +311,7 @@ try {
         EmailAddress  = [string]$package.member_payload.EmailAddress
         DOB           = [datetime]::ParseExact([string]$package.member_payload.DOB, "yyyy-MM-dd", [System.Globalization.CultureInfo]::InvariantCulture)
         RegisterDate  = [datetime]::ParseExact([string]$package.member_payload.RegisterDate, "yyyy-MM-dd", [System.Globalization.CultureInfo]::InvariantCulture)
+        ExpiryDate    = [datetime]::ParseExact([string]$package.member_payload.ExpiryDate, "yyyy-MM-dd", [System.Globalization.CultureInfo]::InvariantCulture)
         OpeningPoints = [decimal]0
         IsActive      = $isActive
         Individual    = $individual
@@ -319,7 +321,9 @@ try {
         Set-MemberRowValue $memberRow $field $assignments[$field]
     }
     $result.assigned_field_count = $assignments.Count
-    $result.expiry_date_assigned = $false
+    # ExpiryDate is part of the assignment set above, so record it as assigned only after
+    # the assignment loop succeeded.
+    $result.expiry_date_assigned = ($assignments.Keys -contains "ExpiryDate")
     $result.assignment_success = $true
 
     # ---- 9. Dry-run stops here: no SaveMember. ----
