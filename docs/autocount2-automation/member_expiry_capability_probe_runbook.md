@@ -25,11 +25,29 @@ before the real single-member creation UAT enables it.
   confirmed save whose read-back then fails is reported as
   `WRITE_CONFIRMED_READBACK_FAILED`, never as a pre-write failure.
 - Before the irreversible `SaveMember` it atomically creates a **permanent single-use
-  attempt claim** in the operator-provided `-StateDirectory` (`FileMode.CreateNew`,
+  attempt claim** in the one **fixed canonical state root** (`FileMode.CreateNew`,
   write-through). The claim is the concurrent-execution exclusion and the permanent
   no-retry boundary: it is never overwritten or deleted, so a crash after it is created
   makes every future invocation **fail closed** with `ATTEMPT_ALREADY_CLAIMED`. There is
   no automatic claim removal or stale-claim recovery.
+- The claim/result root is **not selectable**. It is the reviewed code constant
+  `C:\XB\create_uat\expiry_probe_state` — not an environment variable, not derived from the
+  current or deployment directory, and not a command-line parameter. There is deliberately
+  **no `-StateDirectory` and no `-JsonOut`**: an operator-selected root would give
+  concurrent launches a private claim namespace each, and a secondary output path could
+  write live evidence somewhere publishable. Because the claim namespace is global for the
+  machine, two concurrent launches contend for the **same** claim path and exactly one can
+  win.
+- The root must **already exist**; the probe never creates, repairs, migrates, cleans or
+  redirects it. Before any assembly load, authentication or live read, every existing path
+  component from the volume root down must be a plain, present, non-redirected directory
+  (no junction, symbolic link or other reparse point, and no stat/access failure). Any
+  failure is `CLAIM_ROOT_UNAVAILABLE`, nonzero, with no AutoCount contact and no artefact
+  created. The active probe path is Windows-only and fails closed the same way elsewhere.
+- A launch that **loses the claim race after live AutoCount contact** (it authenticated and
+  performed both duplicate reads, then found the claim taken) reports
+  `ATTEMPT_CLAIM_LOST_AFTER_CONTACT`, never the pre-contact `ATTEMPT_ALREADY_CLAIMED`. The
+  losing process attempts no save and performs no update, delete, rollback or retry.
 - The process **exit code is truthful**: `0` only for a **durably persisted**
   `EXPIRY_VERIFIED`; nonzero for every other outcome, including a refusal. If the
   read-back verified but the durable result could not be written, the final outcome is
@@ -61,9 +79,20 @@ python -m unittest tests.test_member_create_uat_contract tests.test_member_creat
 
 ### 2. Host pull of reviewed `origin/main`
 
-**`PHYSICAL HOST — DESKTOP-Q43QKQF`** After the PR is reviewed and merged, the physical
-host fast-forwards to the reviewed, merged `main`. The host is never used for
-implementation or manual edits.
+**Separate current-turn owner approval required (host-sync gate).** The command below runs
+on the physical host `DESKTOP-Q43QKQF`, contacts the remote, and fast-forwards (mutates)
+that host's checkout. It is a change to an external machine, not a read-only check. Before
+running it, obtain an explicit current-turn owner approval that names the physical host
+(`DESKTOP-Q43QKQF`) and the pull/sync operation on it. This approval is distinct and is
+**not** implied by any other gate:
+
+- the VM deployment approval (stage 3) does **not** cover this host sync;
+- the VM dry-run/preflight approval (stage 4) does **not** cover this host sync;
+- the `SaveMember` write approval (stage 5) does **not** cover this host sync.
+
+**`PHYSICAL HOST — DESKTOP-Q43QKQF`** After the PR is reviewed and merged, and only after
+the host-sync approval above, the physical host fast-forwards to the reviewed, merged
+`main`. The host is never used for implementation or manual edits.
 
 ```bash
 git pull --ff-only origin main
@@ -137,12 +166,19 @@ into `-ApprovalReference`: it is copied verbatim into stdout and the durable evi
 the target is already bound through the hashed `target_fingerprint`. The target names
 belong only in the separate current-turn approval record, never in the emitted evidence.
 
-Create the operator-owned private evidence directory once (the probe never creates it),
-outside the repository:
+Create the **fixed canonical state root** once, as an ordinary local directory on the VM
+(the probe never creates, repairs or redirects it). This exact path is compiled into the
+reviewed code and cannot be overridden at run time:
 
 ```powershell
 New-Item -ItemType Directory -Path "C:\XB\create_uat\expiry_probe_state" -Force
 ```
+
+Every component of that path (`C:\`, `C:\XB`, `C:\XB\create_uat`, and the root itself) must
+be a plain local directory. If any component is missing, is not a directory, or is a
+junction, symbolic link or other reparse point, the run fails closed with
+`CLAIM_ROOT_UNAVAILABLE` before any AutoCount contact. Do not substitute a mapped drive, a
+UNC share or a redirected folder.
 
 ### 6. One synthetic ExpiryDate persistence test
 
@@ -154,14 +190,53 @@ behind one narrowly scoped function. **It never retries `SaveMember`.**
 
 ```powershell
 # Use the VERIFIED VM destination path from stage 3, not a repository-relative path.
-& C:\XB\create_uat\probe\ac2_member_expiry_capability_probe.ps1 -EnableExpiryCapabilityProbe -ConfirmSyntheticExpiryDateTest -ConfirmSingleSyntheticMember -ConfirmAutoCountWrite -ConfirmDryRunPreflightPassed -ConfirmNoUpdateOrDelete -ApprovalReference "<opaque-approval-id>" -StateDirectory "C:\XB\create_uat\expiry_probe_state"
+& C:\XB\create_uat\probe\ac2_member_expiry_capability_probe.ps1 -EnableExpiryCapabilityProbe -ConfirmSyntheticExpiryDateTest -ConfirmSingleSyntheticMember -ConfirmAutoCountWrite -ConfirmDryRunPreflightPassed -ConfirmNoUpdateOrDelete -ApprovalReference "<opaque-approval-id>"
 ```
 
-`-ApprovalReference` and `-StateDirectory` are required. The durable, non-overwriting
-result is written into `-StateDirectory` as `expiry_probe_result_<operation_id>.json`
-(temporary file plus atomic move; a pre-existing result or attempt claim fails closed
-before AutoCount contact). Check `$LASTEXITCODE` after the run: `0` means
-`EXPIRY_VERIFIED`; any nonzero value means the capability was not proven.
+`-ApprovalReference` is required. There is no state-directory or JSON-output parameter: the
+claim and the authoritative result always go to the fixed canonical state root created in
+stage 5. Check `$LASTEXITCODE` after the run: `0` means `EXPIRY_VERIFIED`; any nonzero value
+means the capability was not proven.
+
+#### How the authoritative result is published
+
+Inside the canonical state root the run uses three basenames, all derived in code:
+
+| Artefact | Basename | Notes |
+| --- | --- | --- |
+| Attempt claim | `expiry_probe_claim_<attempt_fingerprint>.claim` | Permanent, exclusive-create, never overwritten or removed. |
+| Staging | `expiry_probe_staging_<operation_id>.incomplete` | Exclusive-create, durably flushed, then moved. Never overwritten, truncated or deleted. |
+| Authoritative result | `expiry_probe_result_<operation_id>.json` | Created only by a no-replace move from staging. |
+
+The staged bytes carry a **content-borne publication contract**
+(`publication_contract_version`, `authoritative_result_basename`, `authority_rule`). The
+rule is mechanical: **the artefact is authoritative only when its current file basename is
+exactly equal to `authoritative_result_basename`.** A staging artefact therefore fails that
+test by construction, even when its bytes contain `terminal_outcome = EXPIRY_VERIFIED`,
+`evidence_persisted = true` and `exit_code = 0` — it never reached the basename it binds
+itself to.
+
+If the final move fails, the staged artefact is **left exactly as written**. The probe does
+not delete it, rename it, rewrite it or route around the failure. The run reports
+`EVIDENCE_PERSISTENCE_FAILED` with `evidence_persisted = false`,
+`non_authoritative_staging_may_remain = true` and a nonzero exit, and a stderr diagnostic
+says a non-authoritative staged artefact may remain. Treat any
+`expiry_probe_staging_*.incomplete` file as **non-authoritative diagnostic material only**;
+removing it is a separate owner-directed manual decision.
+
+When collecting or verifying evidence, do **not** rely on a filename glob alone. Validate
+each candidate with the pure library helper, which checks exact basename binding, the
+schema and publication-contract versions, run-identity consistency, and terminal-state
+consistency:
+
+```powershell
+. .\member_expiry_capability_probe_lib.ps1
+$path = "C:\XB\create_uat\expiry_probe_state\expiry_probe_result_<operation_id>.json"
+$record = Get-Content -LiteralPath $path -Raw -Encoding UTF8 | ConvertFrom-Json
+Test-ExpiryProbeAuthoritativeResult -Path $path -Record $record
+```
+
+`authoritative = True` with an empty `reasons` list is the only acceptable proof.
 
 If the probe reports `WRITE_OUTCOME_UNCERTAIN`, the save began but could not be
 confirmed. **Do not retry** (the permanent attempt claim already blocks any rerun for
@@ -180,10 +255,12 @@ performed; the synthetic member almost certainly exists and must be reviewed man
 | `WRITE_CONFIRMED_READBACK_FAILED` | nonzero | SaveMember returned but read-back failed. The member likely exists; verify manually. Never retried. |
 | `WRITE_OUTCOME_UNCERTAIN` | nonzero | SaveMember began but did not return normally. Verify manually. Never retried; claim blocks rerun. |
 | `BLOCKED_MEMBER_EXISTS` | nonzero | The synthetic member already exists. Review/remove it manually. |
-| `ATTEMPT_ALREADY_CLAIMED` | nonzero | A permanent attempt claim already exists for this target/record. Fails closed before AutoCount contact. |
+| `ATTEMPT_ALREADY_CLAIMED` | nonzero | A permanent attempt claim already exists for this target/record. Fails closed **before** AutoCount contact (`autocount_contacted = false`). |
+| `ATTEMPT_CLAIM_LOST_AFTER_CONTACT` | nonzero | This process authenticated and performed both duplicate reads, then lost the claim race to another contender that owns the permanent claim. No save was attempted; nothing is updated, deleted, rolled back or retried. `autocount_contacted = true`. |
+| `CLAIM_ROOT_UNAVAILABLE` | nonzero | The fixed canonical state root is missing, is not a directory, has a non-directory or reparse-point ancestor, could not be inspected, or the platform is not Windows. Decided before any AutoCount contact; no claim, staging or result artefact is created. `claim_root_failure_reasons` records the reason code (never the raw path). Fix the operator prerequisite; the probe never creates or repairs the root. |
 | `CLAIM_PERSISTENCE_FAILED` | nonzero | The attempt claim was created but could not be durably persisted; no save was reached. The partial claim remains as a fail-closed marker (never deleted). |
 | `FAILED_BEFORE_WRITE` | nonzero | A confirmed failure before any write (config, auth, assembly, or setup). No member created. |
-| `EVIDENCE_PERSISTENCE_FAILED` | nonzero | The read-back may have verified, but the authoritative durable result could not be written, so the capability is NOT proven. `underlying_terminal_outcome` records the original outcome; a stderr diagnostic is emitted. |
+| `EVIDENCE_PERSISTENCE_FAILED` | nonzero | The read-back may have verified, but the authoritative result could not be published, so the capability is NOT proven. A non-authoritative `expiry_probe_staging_*.incomplete` artefact may remain and is never deleted automatically. `underlying_terminal_outcome` records the original outcome; a stderr diagnostic is emitted. |
 | `REFUSED` | nonzero | Not all explicit switches were supplied; inactive by default. |
 
 Under any uncertain or post-save state the probe never retries automatically and never
@@ -247,5 +324,15 @@ automatic cleanup path.
 - Exactly one synthetic member is supported; there is no batch, update, delete, or
   rollback path.
 - `SaveMember` is called at most once and is never automatically retried.
+- Every operation on a machine other than the laptop development checkout has its **own
+  prior current-turn owner approval gate**: the host sync on `DESKTOP-Q43QKQF` (stage 2),
+  the VM deployment (stage 3), the VM dry-run/preflight (stage 4), the synthetic
+  `SaveMember` (stage 5), and any later manual deletion. None of these approvals implies
+  another.
+- The claim/result root is a fixed code constant. No parameter, environment variable,
+  working directory or deployment location can redirect it, and the probe never creates,
+  repairs, migrates or cleans it.
+- No claim, staging or result artefact is ever overwritten, truncated or deleted by the
+  probe.
 - All output is sanitised and PII-free; the member number is masked and the synthetic
   name and email are never printed.

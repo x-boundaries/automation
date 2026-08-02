@@ -31,6 +31,11 @@ on:
       - "docs/autocount2-automation/member_create_uat_runbook.md"
       - "README.md"
       - ".github/workflows/member-create-uat-tests.yml"
+      # The focused probe tests read .gitignore and assert the private-evidence patterns
+      # (claim, staging, result), so a .gitignore-only change must still trigger this
+      # workflow. tests/test_ac2_member_expiry_capability_probe.py enforces mechanically
+      # that every repository file the module reads or asserts appears in this filter.
+      - ".gitignore"
   workflow_dispatch: {}
 
 jobs:
