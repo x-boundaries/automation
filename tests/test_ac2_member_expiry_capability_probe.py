@@ -438,6 +438,16 @@ def module_repo_dependencies(module_path):
     return {rel for rel in discovered if (ROOT / rel).is_file()}
 
 
+# The single README bullet that states this probe's public contract. Amendment
+# DL-XB-115-001-A1 corrects only that bullet; every other README surface is out of scope.
+README_PROBE_BULLET_PREFIX = "- `scripts/ac2_member_expiry_capability_probe.ps1`"
+
+
+def readme_probe_bullets(text):
+    """Every README bullet describing the synthetic ExpiryDate capability probe."""
+    return [line for line in text.splitlines() if line.startswith(README_PROBE_BULLET_PREFIX)]
+
+
 def workflow_path_filters(text):
     """Map every ``on:`` event that declares a ``paths:`` filter to its pattern list."""
     lines = text.splitlines()
@@ -1538,6 +1548,65 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
     def test_readme_references_probe_and_runbook(self):
         self.assertIn("scripts/ac2_member_expiry_capability_probe.ps1", self.readme)
         self.assertIn("member_expiry_capability_probe_runbook.md", self.readme)
+
+    # ---- README probe contract (Design Lock amendment DL-XB-115-001-A1) ---- #
+    def _probe_bullet(self):
+        bullets = readme_probe_bullets(self.readme)
+        self.assertEqual(len(bullets), 1, "exactly one README bullet must describe this probe")
+        return bullets[0]
+
+    def test_readme_probe_contract_has_no_removed_path_parameter(self):
+        # The public contract must not advertise an operator-selected claim/result root or a
+        # secondary output path: both parameters were removed from the probe.
+        bullet = self._probe_bullet()
+        for removed in ("-StateDirectory", "StateDirectory", "-JsonOut", "JsonOut"):
+            self.assertNotIn(removed, bullet, removed)
+
+    def test_readme_probe_contract_names_the_fixed_canonical_root(self):
+        self.assertIn(CANONICAL_STATE_ROOT, self._probe_bullet())
+
+    def test_readme_probe_contract_states_root_is_not_operator_selectable(self):
+        bullet = self._probe_bullet()
+        self.assertRegex(bullet, r"(?i)not operator-selectable")
+        self.assertRegex(bullet, r"(?i)fixed in reviewed code")
+
+    def test_readme_probe_contract_states_the_root_must_pre_exist_and_is_never_managed(self):
+        bullet = self._probe_bullet()
+        self.assertRegex(bullet, r"(?i)must already exist")
+        self.assertRegex(bullet, r"(?i)never creates, repairs, redirects, migrates or cleans it")
+
+    def test_readme_probe_contract_states_validation_precedes_autocount_contact(self):
+        self.assertRegex(self._probe_bullet(), r"(?i)validated before any AutoCount contact")
+
+    def test_readme_probe_contract_preserves_the_permanent_claim_boundary(self):
+        bullet = self._probe_bullet()
+        self.assertRegex(bullet, r"(?i)permanent single-use attempt claim")
+        self.assertRegex(bullet, r"(?i)never overwritten or deleted")
+        self.assertRegex(bullet, r"(?i)fail closed")
+        self.assertRegex(bullet, r"(?i)exactly one synthetic member")
+        self.assertRegex(bullet, r"(?i)never updates, deletes, rolls back, or cleans up")
+        self.assertRegex(bullet, r"(?i)never retried")
+        self.assertRegex(bullet, r"(?i)owner approval")
+
+    def test_readme_probe_contract_states_path_bound_publication(self):
+        bullet = self._probe_bullet()
+        self.assertRegex(bullet, r"(?i)no-clobber")
+        self.assertRegex(bullet, r"(?i)staging")
+        self.assertRegex(bullet, r"(?i)non-authoritative")
+        self.assertRegex(bullet, r"(?i)no-replace")
+        # A failed publication is nonzero, and only an authoritative verified result exits 0.
+        self.assertRegex(bullet, r"(?i)nonzero")
+        self.assertRegex(bullet, r"exit `0` only for an authoritative `EXPIRY_VERIFIED`")
+
+    def test_readme_remains_in_the_mechanical_dependency_inventory(self):
+        self.assertIn("README.md", module_repo_dependencies(SELF))
+
+    def test_readme_remains_covered_by_every_workflow_path_filter(self):
+        filters = workflow_path_filters(self.workflow)
+        self.assertTrue(filters, "the focused workflow must declare at least one path filter")
+        for event, patterns in filters.items():
+            self.assertEqual(uncovered_dependencies({"README.md"}, patterns), [],
+                             "event '%s' does not trigger for README.md" % event)
 
     def test_workflow_triggers_on_validated_documents(self):
         paths_block = self.workflow.split("paths:", 1)[1].split("workflow_dispatch", 1)[0]
