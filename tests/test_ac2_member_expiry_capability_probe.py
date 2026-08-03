@@ -79,14 +79,21 @@ def registered_dependencies():
     return set(REPO_DEPENDENCIES.values())
 
 
-SCRIPT = repo_path("probe_script")
-LIB = repo_path("probe_lib")
-RUNBOOK = repo_path("probe_runbook")
-CREATE_UAT_RUNBOOK = repo_path("create_uat_runbook")
-README = repo_path("readme")
-GITIGNORE = repo_path("gitignore")
-WORKFLOW = repo_path("workflow")
-SELF = repo_path("focused_tests")
+def materialise_probe_scratch(directory):
+    """Copy the probe script and its helper library into a scratch directory.
+
+    Content crosses the sanctioned registry reader first, so no repository path is ever handed
+    to a subprocess or other external callable. The pair keeps its filenames and relative layout
+    because the probe dot-sources the library from its own directory. The scratch copy is never
+    activated: every test drives it into a refusal or a pre-AutoCount stop.
+    """
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    script = directory / "ac2_member_expiry_capability_probe.ps1"
+    library = directory / "member_expiry_capability_probe_lib.ps1"
+    script.write_text(read_repo_text("probe_script"), encoding="utf-8")
+    library.write_text(read_repo_text("probe_lib"), encoding="utf-8")
+    return script, library
 
 # Reads that must resolve to a registered dependency, and the helpers whose own bodies are the
 # sanctioned implementations of those reads.
@@ -98,14 +105,58 @@ def _mentions_root(node):
     return any(isinstance(sub, ast.Name) and sub.id == "ROOT" for sub in ast.walk(node))
 
 
-# Callables that may resolve a repository path without reading it. Anything not listed here,
-# and not a module-level definition or import, counts as an UNRESOLVED callable.
-SAFE_CALLABLE_NAMES = frozenset({
-    "str", "repr", "len", "int", "float", "bool", "list", "tuple", "set", "dict", "frozenset",
-    "sorted", "reversed", "enumerate", "zip", "range", "min", "max", "sum", "any", "all",
-    "next", "iter", "print", "isinstance", "getattr_safe", "format", "abs", "id", "type",
+# A4-2: the ONLY callables permitted to receive a repository-tainted value outside the
+# sanctioned helper bodies. Deliberately minimal — a pure conversion that cannot read, open,
+# copy, move, stat, hash, transmit or store file content, and whose result stays tainted so a
+# later external use is still caught. Being an attribute call, an imported name or a
+# module-level definition confers nothing.
+PURE_TAINT_SAFE_CALLABLES = frozenset({"str"})
+# Lexical operations that may be invoked ON a tainted value: they inspect the text of the path,
+# never the file. Any other method call on a tainted receiver fails closed.
+PURE_LEXICAL_METHODS = frozenset({
+    "lower", "upper", "strip", "lstrip", "rstrip", "startswith", "endswith",
+    "split", "rsplit", "replace", "format", "join", "as_posix", "count", "find",
 })
 DYNAMIC_ATTRIBUTE_CALLS = frozenset({"getattr", "attrgetter", "import_module", "__import__"})
+# Calls that must never appear inside a sanctioned helper body: they could read, copy or
+# transmit repository content while wearing the exemption.
+HELPER_FORBIDDEN_CALLS = frozenset({
+    "copyfile", "copy", "copy2", "copytree", "move", "run", "Popen", "check_call",
+    "check_output", "call", "system", "popen", "getattr", "attrgetter", "import_module",
+    "__import__", "eval", "exec", "compile",
+})
+
+
+def sanctioned_helper_contract_violations(source):
+    """Contract check for the exempt helper bodies themselves.
+
+    The exemption is only safe while the reviewed helpers stay pure: exactly one top-level
+    definition each, and no external read, copy or process call inside them. A tampered helper
+    body must fail here rather than inherit the exemption.
+    """
+    tree = ast.parse(source)
+    problems = []
+    definitions = {}
+    for stmt in tree.body:
+        if isinstance(stmt, ast.FunctionDef) and stmt.name in SANCTIONED_READ_HELPERS:
+            definitions.setdefault(stmt.name, []).append(stmt)
+    for name, defs in definitions.items():
+        if len(defs) != 1:
+            problems.append("%s:duplicate_sanctioned_definition" % name)
+    for name, defs in definitions.items():
+        for definition in defs:
+            for node in ast.walk(definition):
+                if not isinstance(node, ast.Call):
+                    continue
+                func = node.func
+                label = None
+                if isinstance(func, ast.Attribute):
+                    label = func.attr
+                elif isinstance(func, ast.Name):
+                    label = func.id
+                if label in HELPER_FORBIDDEN_CALLS:
+                    problems.append("%s:%d:helper_body_external_call" % (name, node.lineno))
+    return sorted(set(problems))
 
 
 def repository_read_violations(source):
@@ -188,10 +239,15 @@ def repository_read_violations(source):
             if isinstance(node.func, ast.Name):
                 if node.func.id == "Path":
                     return any(is_tainted(arg) for arg in node.args)
+                if node.func.id in PURE_TAINT_SAFE_CALLABLES:
+                    # str(<repo path>) is still a repository path in string form.
+                    return any(is_tainted(arg) for arg in node.args)
                 if node.func.id in funcs_returning_taint:
                     return True
             if isinstance(node.func, ast.Attribute):
                 if node.func.attr in ("resolve", "absolute", "expanduser", "joinpath"):
+                    return is_tainted(node.func.value)
+                if node.func.attr in PURE_LEXICAL_METHODS:
                     return is_tainted(node.func.value)
             return False
         if isinstance(node, ast.Attribute):
@@ -200,9 +256,26 @@ def repository_read_violations(source):
             return False
         if isinstance(node, ast.Subscript):
             return is_tainted(node.value)
-        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
-            return is_tainted(node.left) or is_tainted(node.right)
+        if isinstance(node, ast.BinOp):
+            if isinstance(node.op, (ast.Div, ast.Add, ast.Mod)):
+                return is_tainted(node.left) or is_tainted(node.right)
+            return False
+        if isinstance(node, ast.JoinedStr):
+            return any(is_tainted(part) for part in node.values)
+        if isinstance(node, ast.FormattedValue):
+            return is_tainted(node.value)
         return False
+
+    def contains_taint(node):
+        """Recursive taint search: containers, kwargs, starred args, comprehensions, f-strings."""
+        if node is None:
+            return False
+        return any(is_tainted(sub) for sub in ast.walk(node))
+
+    def contains_reader(node):
+        if node is None:
+            return False
+        return any(is_reader(sub) for sub in ast.walk(node))
 
     def dynamic_attribute_problem(node):
         """True when a dynamic-attribute or dynamic-import call could yield a repository reader.
@@ -267,9 +340,11 @@ def repository_read_violations(source):
             if id(node) in sanctioned_ids:
                 continue
             if isinstance(node, ast.Assign):
-                if is_tainted(node.value):
+                # contains_taint, not is_tainted: a list/tuple/set/dict holding a repository
+                # path taints the name, so later *args / **kwargs forwarding is still caught.
+                if contains_taint(node.value):
                     tainted_names |= assigned_names(node.targets)
-                if is_reader(node.value):
+                if contains_reader(node.value):
                     reader_names |= assigned_names(node.targets)
             elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 for sub in ast.walk(node):
@@ -293,13 +368,18 @@ def repository_read_violations(source):
             return literal_registered_key(node)
         return False
 
-    def callable_is_resolved(func):
-        if isinstance(func, ast.Attribute):
-            return True                      # a method/module call, scanned on its own merits
+    def call_may_receive_taint(node):
+        """True only for the exact permitted registry operation or a pure conversion.
+
+        Everything else — attribute calls, imported callables, module-level definitions,
+        dynamically selected callables — is ambiguous by default and fails closed.
+        """
+        func = node.func
         if isinstance(func, ast.Name):
-            return (func.id in SAFE_CALLABLE_NAMES or func.id in module_level_defs
-                    or func.id in imported_names or func.id in SANCTIONED_READ_HELPERS
-                    or func.id == "Path")
+            if func.id in PURE_TAINT_SAFE_CALLABLES:
+                return True
+            if func.id in ("repo_path", "read_repo_text"):
+                return literal_registered_key(node)
         return False
 
     # Mark attributes that are the callee of a call, so a bare reference to a reader method
@@ -352,17 +432,23 @@ def repository_read_violations(source):
             if isinstance(func, ast.Attribute) and func.attr == "joinpath" and is_tainted(func.value):
                 flag(node, "root_joinpath")
 
-            # ---- Escapes into unresolved callables ---- #
-            if not callable_is_resolved(func):
-                for arg in list(node.args) + [kw.value for kw in node.keywords]:
-                    if is_reader(arg):
-                        flag(node, "reader_callable_escape")
-                    elif is_tainted(arg):
-                        flag(node, "repository_path_escape")
-            else:
-                for arg in list(node.args) + [kw.value for kw in node.keywords]:
-                    if is_reader(arg) and not (isinstance(func, ast.Name) and func.id in SANCTIONED_READ_HELPERS):
-                        flag(node, "reader_callable_escape")
+            # ---- Any callable receiving repository taint, recursively ---- #
+            # Positional args, keyword values, *args, **kwargs, and anything nested inside
+            # lists, tuples, sets, dicts (keys and values), comprehensions, generator
+            # expressions and f-strings.
+            arguments = list(node.args) + [kw.value for kw in node.keywords]
+            if not call_may_receive_taint(node):
+                if any(contains_reader(arg) for arg in arguments):
+                    flag(node, "reader_callable_escape")
+                elif any(contains_taint(arg) for arg in arguments):
+                    flag(node, "repository_path_escape")
+
+            # ---- Method calls ON a tainted receiver ---- #
+            # Only lexical text operations are permitted; anything that could read, stat, copy
+            # or transmit the file fails closed.
+            if (isinstance(func, ast.Attribute) and is_tainted(func.value)
+                    and func.attr not in PURE_LEXICAL_METHODS):
+                flag(node, "repository_path_escape")
 
         # ---- Repository-derived path arithmetic ---- #
         if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div) and is_tainted(node.left):
@@ -951,6 +1037,40 @@ switch ($Op) {
             finalOperationId = $finalOperationId
         } | ConvertTo-Json -Compress
     }
+    'nativefailhook' {
+        # A4-1: drive the REAL production native-failure branch. The pure-library
+        # -PreNativeMoveHook seam runs after the path preflight and after staging is durably
+        # created, occupies the destination, and then the genuine no-replace MoveFileExW runs
+        # and fails. No alternative move implementation is supplied.
+        $stg = Join-Path $Dir (Get-ExpiryProbeStagingBasename -OperationId $Text)
+        $fin = Join-Path $Dir (Get-ExpiryProbeResultBasename -OperationId $Text)
+        $content = Get-Content -LiteralPath $CtxJson -Raw -Encoding UTF8
+        $script:HookRan = $false
+        $threw = $false
+        $message = ''
+        try {
+            Publish-ExpiryProbeResultAtomic -StagingPath $stg -FinalPath $fin -Content $content `
+                -PreNativeMoveHook {
+                    param($s, $d)
+                    Set-Content -LiteralPath $d -Value 'occupied by another writer' -NoNewline -Encoding UTF8
+                    $script:HookRan = $true
+                }
+        }
+        catch { $threw = $true; $message = $_.Exception.Message }
+        $stagingContent = ''
+        if (Test-Path -LiteralPath $stg) { $stagingContent = Get-Content -LiteralPath $stg -Raw -Encoding UTF8 }
+        $finalContent = ''
+        if (Test-Path -LiteralPath $fin) { $finalContent = Get-Content -LiteralPath $fin -Raw -Encoding UTF8 }
+        [pscustomobject]@{
+            threw = $threw
+            hookRan = $script:HookRan
+            message = $message
+            stagingExists = (Test-Path -LiteralPath $stg)
+            stagingContentMatches = ($stagingContent -eq $content)
+            finalExists = (Test-Path -LiteralPath $fin)
+            finalNotReplaced = ($finalContent -eq 'occupied by another writer')
+        } | ConvertTo-Json -Compress
+    }
     'nativemoveraw' {
         # Direct native-layer proof that the write-through move is NO-REPLACE: with the
         # destination already present the API must fail and leave both files untouched. This is
@@ -1159,12 +1279,12 @@ def uncovered_dependencies(dependencies, patterns):
 
 class ExpiryProbeStaticTests(unittest.TestCase):
     def setUp(self):
-        self.script = SCRIPT.read_text(encoding="utf-8")
-        self.lib = LIB.read_text(encoding="utf-8")
+        self.script = read_repo_text("probe_script")
+        self.lib = read_repo_text("probe_lib")
 
     def test_probe_and_lib_exist(self):
-        self.assertTrue(SCRIPT.is_file())
-        self.assertTrue(LIB.is_file())
+        self.assertTrue(read_repo_text("probe_script").strip())
+        self.assertTrue(read_repo_text("probe_lib").strip())
         self.assertIn("member_expiry_capability_probe_lib.ps1", self.script)
 
     def test_requires_every_write_switch_before_loading_autocount(self):
@@ -1218,11 +1338,15 @@ class ExpiryProbeStaticTests(unittest.TestCase):
         self.assertNotIn("AC2_PROBE_STATE", self.script)
 
     def test_canonical_root_is_outside_any_repository_checkout(self):
-        # The fixed root replaces the old "reject a state directory inside the repo" guard:
-        # it is absolute and cannot be inside this checkout.
+        # The fixed root replaces the old "reject a state directory inside the repo" guard: it
+        # is an absolute local-volume path, while every registered repository dependency is a
+        # checkout-relative path, so the two namespaces cannot overlap. Stated without touching
+        # a repository path, because A4-2 forbids consuming one outside the registry reader.
         self.assertTrue(re.match(r"^[A-Za-z]:\\", CANONICAL_STATE_ROOT))
-        self.assertFalse(str(ROOT).lower().startswith(CANONICAL_STATE_ROOT.lower()))
-        self.assertFalse(CANONICAL_STATE_ROOT.lower().startswith(str(ROOT).lower()))
+        for relative in registered_dependencies():
+            self.assertFalse(relative.startswith("/"), relative)
+            self.assertIsNone(re.match(r"^[A-Za-z]:", relative), relative)
+            self.assertNotIn(CANONICAL_STATE_ROOT.lower(), relative.lower())
 
     def test_probe_never_creates_repairs_or_cleans_the_state_root(self):
         self.assertNotIn("New-Item", self.script)
@@ -1567,7 +1691,7 @@ class ExpiryProbeStaticTests(unittest.TestCase):
         self.assertEqual(self.script.count("$result.approval_reference = $ApprovalReference"), 1)
 
     def test_gitignore_covers_probe_evidence(self):
-        gi = GITIGNORE.read_text(encoding="utf-8")
+        gi = read_repo_text("gitignore")
         self.assertIn("expiry_probe_claim_*.claim", gi)
         self.assertIn("expiry_probe_result_*.json", gi)
         self.assertIn("expiry_probe_staging_*.incomplete", gi)
@@ -1580,10 +1704,13 @@ class ExpiryProbeLibraryTests(unittest.TestCase):
         cls.tmp = Path(tempfile.mkdtemp())
         cls.harness = cls.tmp / "libprobe.ps1"
         cls.harness.write_text(LIBPROBE, encoding="utf-8")
+        # The helper library is dot-sourced from a scratch copy whose content crossed the
+        # sanctioned registry reader, so no repository path is handed to a subprocess.
+        _, cls.scratch_lib = materialise_probe_scratch(cls.tmp / "scratch_probe")
 
     def _cmd(self, op, **kw):
         cmd = [PS, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
-               "-File", str(self.harness), "-Lib", str(LIB), "-Op", op]
+               "-File", str(self.harness), "-Lib", str(self.scratch_lib), "-Op", op]
         for k, v in kw.items():
             cmd += ["-" + k, str(v)]
         return cmd
@@ -2288,6 +2415,43 @@ class ExpiryProbeLibraryTests(unittest.TestCase):
         self.assertEqual(info["finalOperationId"], operation_id)
         self.assertTrue(info["secondBlocked"], "an existing destination must fail no-clobber")
 
+    def test_native_status_member_is_consistent_across_the_stack(self):
+        # A4-1: the C# declaration, the native method and the PowerShell failure path must use
+        # ONE member name, or the failure branch raises a missing-property error under
+        # Set-StrictMode instead of reporting the native status.
+        lib = read_repo_text("probe_lib")
+        declared = set(re.findall(r"public int (Native\w+);", lib))
+        assigned = set(re.findall(r"result\.(Native\w+)\s*=", lib))
+        consumed = set(re.findall(r"\$move\.(Native\w+)", lib))
+        self.assertEqual(len(declared), 1, declared)
+        self.assertEqual(declared, assigned, "the native method must assign the declared member")
+        self.assertEqual(declared, consumed,
+                         "the PowerShell publication caller must read the declared member")
+
+    @unittest.skipUnless(IS_WINDOWS, "the real production failure branch is Windows-only")
+    def test_production_native_failure_branch_reports_status_only(self):
+        # A4-1: exercise the REAL production branch — staging is created, the destination is
+        # occupied after preflight, and the genuine no-replace MoveFileExW fails.
+        directory = self.tmp / "nativefail"
+        directory.mkdir(exist_ok=True)
+        operation_id = "expop_nativefail01"
+        record = self._record_file("native_fail_record.json", verified_record(operation_id))
+        info = self._json("nativefailhook", Dir=str(directory), Text=operation_id, CtxJson=str(record))
+        self.assertTrue(info["threw"], "the real native move must fail against an occupied destination")
+        self.assertTrue(info["hookRan"], "the pre-native hook must have occupied the destination")
+        self.assertTrue(info["stagingExists"], "staging must be left exactly as written")
+        self.assertEqual(info["stagingContentMatches"], True, "staging must be byte-identical")
+        self.assertTrue(info["finalExists"])
+        self.assertTrue(info["finalNotReplaced"], "the destination must not be replaced")
+        # Generic, status-only error: no missing-property/strict-mode masking and no paths.
+        self.assertNotIn("NativeErrorCode", info["message"])
+        self.assertNotIn("cannot be found on this object", info["message"])
+        self.assertRegex(info["message"], r"native status \d+")
+        self.assertNotIn(str(directory), info["message"])
+        self.assertNotIn(operation_id, info["message"])
+        self.assertNotIn(".incomplete", info["message"])
+        self.assertNotIn(".json", info["message"])
+
     @unittest.skipUnless(IS_WINDOWS, "native no-replace semantics are Windows-only")
     def test_native_move_is_no_replace_at_the_api_layer(self):
         directory = self.tmp / "nativeraw"
@@ -2323,10 +2487,11 @@ class ExpiryProbeTrustedRootLeaseTests(unittest.TestCase):
         cls.tmp = Path(tempfile.mkdtemp())
         cls.harness = cls.tmp / "leaseprobe.ps1"
         cls.harness.write_text(LIBPROBE, encoding="utf-8")
+        _, cls.scratch_lib = materialise_probe_scratch(cls.tmp / "scratch_probe")
 
     def _cmd(self, op, **kw):
         cmd = [PS, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
-               "-File", str(self.harness), "-Lib", str(LIB), "-Op", op]
+               "-File", str(self.harness), "-Lib", str(self.scratch_lib), "-Op", op]
         for k, v in kw.items():
             cmd += ["-" + k, str(v)]
         return cmd
@@ -2496,7 +2661,7 @@ class ExpiryProbeTrustedRootLeaseTests(unittest.TestCase):
         self.assertEqual(as_list(info["reasons"]), ["platform_not_windows"])
         self.assertEqual(info["heldCount"], 0)
         # The platform gate must precede any native interop in the library source.
-        lib = LIB.read_text(encoding="utf-8")
+        lib = read_repo_text("probe_lib")
         self.assertLess(lib.index("platform_not_windows"), lib.index("Add-Type"),
                         "the Windows-only gate must precede native interop")
 
@@ -2534,12 +2699,15 @@ class ExpiryProbeScriptExecutionTests(unittest.TestCase):
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
+        # The probe and its library are executed from a scratch pair whose content crossed the
+        # sanctioned registry reader; the repository copies are never handed to a subprocess.
+        self.scratch_script, self.scratch_lib = materialise_probe_scratch(self.tmp / "scratch_probe")
         self.env = dict(os.environ)
         self.env["AC2_PROBE_PASSWORD"] = ""  # force a pre-AutoCount stop for active runs
 
     def _run(self, *args, **kw):
         cmd = [PS, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
-               "-File", str(SCRIPT), *args]
+               "-File", str(self.scratch_script), *args]
         return subprocess.run(cmd, capture_output=True, text=True, env=self.env, **kw)
 
     def _active_args(self, appref="APPROVAL-TEST-001"):
@@ -2653,12 +2821,12 @@ class ExpiryProbeScriptExecutionTests(unittest.TestCase):
 
 class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
     def setUp(self):
-        self.runbook = RUNBOOK.read_text(encoding="utf-8")
-        self.readme = README.read_text(encoding="utf-8")
-        self.workflow = WORKFLOW.read_text(encoding="utf-8")
+        self.runbook = read_repo_text("probe_runbook")
+        self.readme = read_repo_text("readme")
+        self.workflow = read_repo_text("workflow")
 
     def test_runbook_exists_and_separates_eight_stages(self):
-        self.assertTrue(RUNBOOK.is_file())
+        self.assertTrue(self.runbook.strip())
         for n in range(1, 9):
             self.assertRegex(self.runbook, rf"(?m)^### {n}\. ")
 
@@ -2760,8 +2928,8 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
         # The probe runbook links the main single-member creation UAT runbook by relative
         # path; that target must exist (its contents are owned by the create-UAT lane).
         self.assertIn("(member_create_uat_runbook.md)", self.runbook)
-        self.assertTrue(CREATE_UAT_RUNBOOK.is_file())
-        self.assertTrue(CREATE_UAT_RUNBOOK.read_text(encoding="utf-8").strip())
+        self.assertTrue(read_repo_text("create_uat_runbook").strip(),
+                        "the linked main create-UAT runbook must exist and be non-empty")
 
     def test_readme_references_probe_and_runbook(self):
         self.assertIn("scripts/ac2_member_expiry_capability_probe.ps1", self.readme)
@@ -2978,6 +3146,77 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
         self.assertTrue(repository_read_violations(inner),
                         "a nested function named like a sanctioned helper must not be exempt")
 
+    def test_ast_guard_rejects_external_and_imported_repository_path_consumption(self):
+        # A4-2: an attribute call or imported callable is NOT safe merely because its syntax
+        # resolves. Any external or ambiguous callable that receives repository taint — however
+        # deeply nested — must fail closed.
+        header = ("from pathlib import Path\n"
+                  "import shutil\n"
+                  "import subprocess\n"
+                  "from helpers import slurp, reader as imported_reader\n"
+                  "ROOT = Path(__file__).resolve().parents[1]\n"
+                  "SCRIPT = repo_path('probe_script')\n"
+                  "scratch = Path('/scratch/copy.ps1')\n")
+        fixtures = {
+            "shutil_copyfile": "shutil.copyfile(SCRIPT, scratch)\n",
+            "shutil_copy2": "shutil.copy2(SCRIPT, scratch)\n",
+            "imported_slurp": "text = slurp(SCRIPT)\n",
+            "imported_reader_alias": "text = imported_reader(SCRIPT)\n",
+            "module_attribute_read": "text = imported_reader.read(SCRIPT)\n",
+            "module_callable": "text = shutil.disk_usage(SCRIPT)\n",
+            "subprocess_check_output": "out = subprocess.check_output(['tool', str(SCRIPT)])\n",
+            "subprocess_input_kwarg": "subprocess.run(['tool'], input=str(SCRIPT))\n",
+            "nested_in_list": "run_tool([SCRIPT, '--flag'])\n",
+            "nested_in_tuple": "run_tool((SCRIPT, '--flag'))\n",
+            "nested_in_set": "run_tool({SCRIPT})\n",
+            "nested_in_dict_value": "run_tool({'path': SCRIPT})\n",
+            "nested_in_dict_key": "run_tool({SCRIPT: 'path'})\n",
+            "keyword_argument": "run_tool(target=SCRIPT)\n",
+            "star_args": "args = [SCRIPT]\nrun_tool(*args)\n",
+            "star_kwargs": "options = {'target': SCRIPT}\nrun_tool(**options)\n",
+            "dynamic_callable_from_mapping": "handlers = {'a': slurp}\nhandlers['a'](SCRIPT)\n",
+            "callable_returned_from_helper": "def pick():\n    return slurp\npick()(SCRIPT)\n",
+            "wrapper_forwards_path": "def forward(p):\n    return slurp(p)\nforward(SCRIPT)\n",
+            "lambda_forwards_path": "send = lambda: slurp(SCRIPT)\nsend()\n",
+            "comprehension_external_call": "results = [slurp(SCRIPT) for _ in range(1)]\n",
+            "generator_external_call": "results = (slurp(SCRIPT) for _ in range(1))\n",
+            "closure_over_registered_path": "def outer():\n    def inner():\n        return slurp(SCRIPT)\n    return inner\n",
+            "fstring_path_to_external": "subprocess.run(f'tool {SCRIPT}', shell=False)\n",
+            "arbitrary_imported_callable": "slurp(SCRIPT, encoding='utf-8')\n",
+            "arbitrary_attribute_callable": "imported_reader.load(SCRIPT)\n",
+        }
+        self.assertGreaterEqual(len(fixtures), 24, "the A4-2 fixture matrix must stay complete")
+        accepted = []
+        for name, body in fixtures.items():
+            violations = repository_read_violations(header + body)
+            if not violations:
+                accepted.append(name)
+                continue
+            self.assertTrue(
+                any(v.endswith(("repository_path_escape", "reader_callable_escape",
+                                "unresolved_repository_read", "dynamic_attribute_access"))
+                    for v in violations),
+                "%s: unexpected categories %s" % (name, violations))
+        self.assertEqual(accepted, [], "these bypasses were silently accepted: %s" % accepted)
+
+    def test_sanctioned_helper_body_tampering_is_detected(self):
+        # A4-2: the exemption covers the exact reviewed helper bodies. A helper body that grows
+        # an external read or copy must fail the guard contract rather than inherit exemption.
+        tampered = ("from pathlib import Path\n"
+                    "import shutil\n"
+                    "ROOT = Path(__file__).resolve().parents[1]\n"
+                    "REPO_DEPENDENCIES = {}\n"
+                    "def repo_path(key):\n"
+                    "    return ROOT / key\n"
+                    "def read_repo_text(key):\n"
+                    "    shutil.copyfile(repo_path(key), Path('/scratch/leak'))\n"
+                    "    return repo_path(key).read_text(encoding='utf-8')\n")
+        self.assertTrue(sanctioned_helper_contract_violations(tampered),
+                        "a helper body that copies repository content must fail the contract")
+        clean = read_repo_text("focused_tests")
+        self.assertEqual(sanctioned_helper_contract_violations(clean), [],
+                         "the reviewed helper bodies must satisfy their own contract")
+
     def test_ast_guard_is_independent_of_the_registry_contents(self):
         # Even a REGISTERED file read through an escaping form must fail: the guard checks the
         # shape of the read expression, so closure cannot pass merely because the expected and
@@ -3097,8 +3336,10 @@ class ExpiryProbeAstTests(unittest.TestCase):
         cls.tmp = Path(tempfile.mkdtemp())
         cls.inspector = cls.tmp / "expiry_inspector.ps1"
         cls.inspector.write_text(INSPECTOR, encoding="utf-8")
+        cls.scratch_script, cls.scratch_lib = materialise_probe_scratch(cls.tmp / "scratch_probe")
 
-    def _inspect(self, target=SCRIPT):
+    def _inspect(self, target=None):
+        target = target or self.scratch_script
         cmd = [PS, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
                "-File", str(self.inspector), "-Path", str(target)]
         proc = subprocess.run(cmd, capture_output=True, text=True)
@@ -3143,17 +3384,17 @@ class ExpiryProbeAstTests(unittest.TestCase):
         self.assertEqual(info["forbiddenMutationCount"], 0)
 
     def test_no_artefact_removal_in_script_or_library(self):
-        for target in (SCRIPT, LIB):
+        for target in (self.scratch_script, self.scratch_lib):
             info = self._inspect(target)
             self.assertEqual(info["parseErrors"], 0, str(target))
             self.assertEqual(info["removeItemCount"], 0, "no Remove-Item may exist in %s" % target.name)
         # The library's only System.IO.File mutation is the single no-replace publication
         # move: never a Delete and never a Replace (which would clobber prior evidence).
-        lib_info = self._inspect(LIB)
+        lib_info = self._inspect(self.scratch_lib)
         self.assertEqual(lib_info["fileMoveCount"], 0,
                          "publication uses the native write-through move, not System.IO.File")
         self.assertEqual(lib_info["fileDeleteCount"], 0)
-        script_info = self._inspect(SCRIPT)
+        script_info = self._inspect(self.scratch_script)
         self.assertEqual(script_info["fileMoveCount"], 0)
         self.assertEqual(script_info["fileDeleteCount"], 0)
 

@@ -685,7 +685,13 @@ function Publish-ExpiryProbeResultAtomic {
         [Parameter(Mandatory)][string]$Content,
         # Pure dependency injection for deterministic move-failure unit tests ONLY. No
         # executable script parameter reaches this, so there is no live bypass.
-        [scriptblock]$MoveAction
+        [scriptblock]$MoveAction,
+        # Pure test-only seam that runs AFTER the path preflight and AFTER the staging artefact
+        # is durably created, immediately before the REAL native move. It exists so a test can
+        # create a deterministic destination race and exercise the genuine production failure
+        # branch. It cannot supply an alternative move implementation and cannot bypass native
+        # publication, and no executable script parameter reaches it.
+        [scriptblock]$PreNativeMoveHook
     )
     # Preflight the path contract BEFORE any staging bytes exist, so a cross-directory or
     # cross-volume publication is refused without leaving an artefact behind.
@@ -706,10 +712,13 @@ function Publish-ExpiryProbeResultAtomic {
             throw "Result publication requires the Windows no-replace write-through rename; refusing to publish on this platform."
         }
         Initialize-ExpiryProbeNativePublicationApi
+        if ($null -ne $PreNativeMoveHook) { & $PreNativeMoveHook $StagingPath $FinalPath }
         $move = [XbExpiryProbe.NativePublication]::MoveNoReplaceWriteThrough($StagingPath, $FinalPath)
         if (-not $move.Ok) {
-            # Generic, public-safe failure: a native status number only, never a path.
-            throw ("Result publication failed: the no-replace write-through rename did not complete (native status " + $move.NativeErrorCode + ").")
+            # Generic, public-safe failure: the declared native status number only, never a
+            # path. The member name here must match the C# declaration exactly, or strict mode
+            # would raise a missing-property error instead of reporting the native status.
+            throw ("Result publication failed: the no-replace write-through rename did not complete (native status " + $move.NativeStatus + ").")
         }
     }
     else {
