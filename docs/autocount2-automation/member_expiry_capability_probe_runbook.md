@@ -226,6 +226,21 @@ Inside the canonical state root the run uses three basenames, all derived in cod
 | Staging | `expiry_probe_staging_<operation_id>.incomplete` | Exclusive-create, durably flushed, then moved. Never overwritten, truncated or deleted. |
 | Authoritative result | `expiry_probe_result_<operation_id>.json` | Created only by a no-replace move from staging. |
 
+Staging bytes are **exclusively created** (`FileMode.CreateNew`, write-through) and **durably
+flushed** before publication. Final-name publication is then a **same-directory, same-volume,
+no-replace `MoveFileExW` rename using `MOVEFILE_WRITE_THROUGH`**. `MOVEFILE_REPLACE_EXISTING`
+and `MOVEFILE_COPY_ALLOWED` are never set, so replacement and cross-volume copying are
+forbidden and there is no fallback to an ordinary move, a copy, a delete-then-move or a second
+publication attempt. Publication is refused before any staging bytes exist unless both paths
+are absolute, share one existing parent directory on one local volume, differ by basename and
+use the reviewed basename syntax, with no final artefact already present.
+
+**Only a successful return from that write-through rename permits durable authoritative
+success** — that is, `evidence_persisted = true`, `terminal_outcome = EXPIRY_VERIFIED` and exit
+`0`. Any native failure is a publication failure: nothing is retried, deleted, rewritten or
+republished, only a non-authoritative staged artefact remains, and the run reports
+`EVIDENCE_PERSISTENCE_FAILED` with a nonzero exit.
+
 The staged bytes carry a **content-borne publication contract**
 (`publication_contract_version`, `authoritative_result_basename`, `authority_rule`). The
 rule is mechanical: **the artefact is authoritative only when its current file basename is
@@ -255,6 +270,17 @@ Test-ExpiryProbeAuthoritativeResult -Path $path -Record $record
 ```
 
 `authoritative = True` with an empty `reasons` list is the only acceptable proof.
+
+The validator applies a **strict, closed record schema before any outcome is derived**, because
+PowerShell would otherwise coerce untrusted text: `[bool]"false"` is `$true`. A candidate record
+is rejected outright unless it carries exactly the reviewed top-level field set — no missing and
+no unknown fields — with real CLR types: every runtime flag an actual Boolean (never `"true"`,
+`"false"`, `0`, `1`, null, an array or an object), `exit_code` an actual integral number
+restricted to `0` or `1` (never `"0"` or a Boolean), and every identifier, basename,
+enumeration and publication-contract value an actual non-empty string drawn from its closed
+vocabulary. Only after the whole schema passes are contradictions computed, the underlying and
+final outcomes recomputed from the recorded facts, and the exit code compared. Schema failures
+are reported as generic reason codes and never echo the offending value.
 
 If the probe reports `WRITE_OUTCOME_UNCERTAIN`, the save began but could not be
 confirmed. **Do not retry** (the permanent attempt claim already blocks any rerun for

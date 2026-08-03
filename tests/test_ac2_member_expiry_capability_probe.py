@@ -98,11 +98,23 @@ def _mentions_root(node):
     return any(isinstance(sub, ast.Name) and sub.id == "ROOT" for sub in ast.walk(node))
 
 
-def repository_read_violations(source):
-    """Fail-closed AST guard: every repository read must go through the closed registry.
+# Callables that may resolve a repository path without reading it. Anything not listed here,
+# and not a module-level definition or import, counts as an UNRESOLVED callable.
+SAFE_CALLABLE_NAMES = frozenset({
+    "str", "repr", "len", "int", "float", "bool", "list", "tuple", "set", "dict", "frozenset",
+    "sorted", "reversed", "enumerate", "zip", "range", "min", "max", "sum", "any", "all",
+    "next", "iter", "print", "isinstance", "getattr_safe", "format", "abs", "id", "type",
+})
+DYNAMIC_ATTRIBUTE_CALLS = frozenset({"getattr", "attrgetter", "import_module", "__import__"})
 
-    Returns sorted "<line>:<kind>" violations. Unresolvable or unrecognised repository reads
-    are reported rather than ignored, so a new dependency cannot slip past the inventory.
+
+def repository_read_violations(source):
+    """Fail-closed AST guard: the literal registry reader is the ONLY repository-read route.
+
+    Returns sorted "<line>:<kind>" violations. The policy is deliberately conservative: aliases
+    of ``open``, captured bound reader methods, dynamic attribute access, repository-derived
+    path taint, wrappers, lambdas, comprehensions and unresolved indirect calls are all
+    rejected. Anything that cannot be proven safe is reported rather than accepted.
     """
     tree = ast.parse(source)
     violations = []
@@ -119,13 +131,160 @@ def repository_read_violations(source):
         return (len(args) == 1 and isinstance(args[0], ast.Constant)
                 and isinstance(args[0].value, str) and args[0].value in REPO_DEPENDENCIES)
 
-    # Module-level names bound to a registered repo_path(...) result.
+    # ---- Sanctioned boundary: the exact reviewed top-level helper bodies, nothing else ---- #
+    # Nested functions, methods and arbitrary same-named definitions never inherit exemption.
+    top_level_helpers = {}
+    for stmt in tree.body:
+        if isinstance(stmt, ast.FunctionDef) and stmt.name in SANCTIONED_READ_HELPERS:
+            top_level_helpers.setdefault(stmt.name, []).append(stmt)
+    sanctioned_ids = set()
+    for defs in top_level_helpers.values():
+        if len(defs) == 1:
+            for sub in ast.walk(defs[0]):
+                sanctioned_ids.add(id(sub))
+
+    # The single module-level ROOT anchor is the one permitted checkout derivation.
+    anchor_ids = set()
+    for stmt in tree.body:
+        if (isinstance(stmt, ast.Assign) and len(stmt.targets) == 1
+                and isinstance(stmt.targets[0], ast.Name) and stmt.targets[0].id == "ROOT"):
+            for sub in ast.walk(stmt):
+                anchor_ids.add(id(sub))
+
     registered_names = set()
     for stmt in tree.body:
         if (isinstance(stmt, ast.Assign) and len(stmt.targets) == 1
                 and isinstance(stmt.targets[0], ast.Name)
                 and is_repo_path_call(stmt.value) and literal_registered_key(stmt.value)):
             registered_names.add(stmt.targets[0].id)
+
+    module_level_defs = {stmt.name for stmt in tree.body
+                         if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))}
+    imported_names = set()
+    open_aliases = {"open"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                imported_names.add(alias.asname or alias.name.split(".")[0])
+                if alias.name == "open":
+                    open_aliases.add(alias.asname or alias.name)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                imported_names.add(alias.asname or alias.name.split(".")[0])
+
+    tainted_names = {"ROOT"} | set(registered_names)
+    reader_names = set()
+    funcs_returning_taint = set()
+    funcs_returning_reader = set()
+
+    def is_tainted(node):
+        if node is None:
+            return False
+        if isinstance(node, ast.Name):
+            return node.id in tainted_names or node.id == "__file__"
+        if isinstance(node, ast.Call):
+            if is_repo_path_call(node):
+                return True
+            if isinstance(node.func, ast.Name):
+                if node.func.id == "Path":
+                    return any(is_tainted(arg) for arg in node.args)
+                if node.func.id in funcs_returning_taint:
+                    return True
+            if isinstance(node.func, ast.Attribute):
+                if node.func.attr in ("resolve", "absolute", "expanduser", "joinpath"):
+                    return is_tainted(node.func.value)
+            return False
+        if isinstance(node, ast.Attribute):
+            if node.attr in ("parent", "parents"):
+                return is_tainted(node.value)
+            return False
+        if isinstance(node, ast.Subscript):
+            return is_tainted(node.value)
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
+            return is_tainted(node.left) or is_tainted(node.right)
+        return False
+
+    def dynamic_attribute_problem(node):
+        """True when a dynamic-attribute or dynamic-import call could yield a repository reader.
+
+        Fails closed whenever the attribute name cannot be statically resolved.
+        """
+        if not isinstance(node, ast.Call):
+            return False
+        name = None
+        if isinstance(node.func, ast.Name):
+            name = node.func.id
+        elif isinstance(node.func, ast.Attribute):
+            name = node.func.attr
+        if name in ("import_module", "__import__"):
+            return True
+        if name == "getattr":
+            args = node.args
+            if len(args) < 2:
+                return True
+            attribute = args[1]
+            if not (isinstance(attribute, ast.Constant) and isinstance(attribute.value, str)):
+                return True                      # unresolvable attribute name
+            return attribute.value in REPO_READ_METHODS or is_tainted(args[0])
+        if name == "attrgetter":
+            args = node.args
+            if not args:
+                return True
+            first = args[0]
+            if not (isinstance(first, ast.Constant) and isinstance(first.value, str)):
+                return True
+            return first.value in REPO_READ_METHODS
+        return False
+
+    def is_reader(node):
+        if node is None:
+            return False
+        if isinstance(node, ast.Name):
+            return node.id in open_aliases or node.id in reader_names
+        if isinstance(node, ast.Attribute):
+            return node.attr in REPO_READ_METHODS
+        if isinstance(node, ast.Call):
+            if dynamic_attribute_problem(node):
+                return True
+            if isinstance(node.func, ast.Name) and node.func.id in funcs_returning_reader:
+                return True
+            return False
+        return False
+
+    def assigned_names(targets):
+        names = set()
+        for target in targets:
+            for sub in ast.walk(target):
+                if isinstance(sub, ast.Name):
+                    names.add(sub.id)
+        return names
+
+    # Fixpoint so alias chains and helper returns propagate.
+    for _ in range(5):
+        before = (len(tainted_names), len(reader_names),
+                  len(funcs_returning_taint), len(funcs_returning_reader))
+        for node in ast.walk(tree):
+            if id(node) in sanctioned_ids:
+                continue
+            if isinstance(node, ast.Assign):
+                if is_tainted(node.value):
+                    tainted_names |= assigned_names(node.targets)
+                if is_reader(node.value):
+                    reader_names |= assigned_names(node.targets)
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                for sub in ast.walk(node):
+                    if isinstance(sub, ast.Return):
+                        if is_tainted(sub.value):
+                            funcs_returning_taint.add(node.name)
+                        if is_reader(sub.value):
+                            funcs_returning_reader.add(node.name)
+            elif isinstance(node, ast.Lambda):
+                if is_reader(node.body) or is_tainted(node.body):
+                    pass  # reported directly in the violation pass
+        after = (len(tainted_names), len(reader_names),
+                 len(funcs_returning_taint), len(funcs_returning_reader))
+        if before == after:
+            break
 
     def receiver_is_registered(node):
         if isinstance(node, ast.Name):
@@ -134,36 +293,93 @@ def repository_read_violations(source):
             return literal_registered_key(node)
         return False
 
-    skip = set()
+    def callable_is_resolved(func):
+        if isinstance(func, ast.Attribute):
+            return True                      # a method/module call, scanned on its own merits
+        if isinstance(func, ast.Name):
+            return (func.id in SAFE_CALLABLE_NAMES or func.id in module_level_defs
+                    or func.id in imported_names or func.id in SANCTIONED_READ_HELPERS
+                    or func.id == "Path")
+        return False
+
+    # Mark attributes that are the callee of a call, so a bare reference to a reader method
+    # (capture, storage, passing, returning) is distinguishable from an immediate call.
     for node in ast.walk(tree):
-        if isinstance(node, ast.FunctionDef) and node.name in SANCTIONED_READ_HELPERS:
-            for sub in ast.walk(node):
-                skip.add(id(sub))
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            setattr(node.func, "_xb_parent_call", node)
 
     for node in ast.walk(tree):
-        if id(node) in skip:
+        if id(node) in sanctioned_ids or id(node) in anchor_ids:
             continue
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
-            if node.func.id == "open":
-                flag(node, "builtin_open")
-            elif node.func.id in ("repo_path", "read_repo_text"):
+
+        # ---- Aliases of the built-in reader ---- #
+        if isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if alias.name == "open":
+                    flag(node, "open_alias_import")
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id in open_aliases:
+            flag(node, "builtin_open")
+
+        # ---- Bound path-reader methods: captured, passed, stored or called unsafely ---- #
+        if isinstance(node, ast.Attribute) and node.attr in REPO_READ_METHODS:
+            parent_call = getattr(node, "_xb_parent_call", None)
+            if parent_call is None:
+                flag(node, "bound_reader_capture")
+
+        # ---- Dynamic attribute access ---- #
+        if isinstance(node, ast.Call):
+            func = node.func
+            if dynamic_attribute_problem(node):
+                flag(node, "dynamic_attribute_access")
+
+            # ---- Registry helper keys ---- #
+            if isinstance(func, ast.Name) and func.id in ("repo_path", "read_repo_text"):
                 if not literal_registered_key(node):
                     args = getattr(node, "args", [])
                     if len(args) == 1 and isinstance(args[0], ast.Constant) and isinstance(args[0].value, str):
                         flag(node, "unregistered_dependency_key")
                     else:
                         flag(node, "dynamic_dependency_key")
-            elif node.func.id == "Path" and any(_mentions_root(arg) for arg in node.args):
+
+            # ---- Reads ---- #
+            if isinstance(func, ast.Attribute) and func.attr in REPO_READ_METHODS:
+                if not receiver_is_registered(func.value):
+                    flag(node, "unresolved_repository_read")
+            if isinstance(func, ast.Name) and func.id in reader_names:
+                flag(node, "reader_callable_invocation")
+            if isinstance(func, ast.Name) and func.id == "Path" and any(is_tainted(a) for a in node.args):
                 flag(node, "path_constructor_from_root")
-        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div) and _mentions_root(node.left):
+            if isinstance(func, ast.Attribute) and func.attr == "joinpath" and is_tainted(func.value):
+                flag(node, "root_joinpath")
+
+            # ---- Escapes into unresolved callables ---- #
+            if not callable_is_resolved(func):
+                for arg in list(node.args) + [kw.value for kw in node.keywords]:
+                    if is_reader(arg):
+                        flag(node, "reader_callable_escape")
+                    elif is_tainted(arg):
+                        flag(node, "repository_path_escape")
+            else:
+                for arg in list(node.args) + [kw.value for kw in node.keywords]:
+                    if is_reader(arg) and not (isinstance(func, ast.Name) and func.id in SANCTIONED_READ_HELPERS):
+                        flag(node, "reader_callable_escape")
+
+        # ---- Repository-derived path arithmetic ---- #
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div) and is_tainted(node.left):
             flag(node, "root_path_derivation")
-        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-                and node.func.attr == "joinpath" and _mentions_root(node.func.value)):
-            flag(node, "root_joinpath")
-        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-                and node.func.attr in REPO_READ_METHODS
-                and not receiver_is_registered(node.func.value)):
-            flag(node, "unresolved_repository_read")
+
+        # ---- Escaping returns ---- #
+        if isinstance(node, ast.Return):
+            if is_reader(node.value):
+                flag(node, "reader_callable_escape")
+            elif is_tainted(node.value):
+                flag(node, "repository_path_escape")
+
+        # ---- Lambdas that read or hand back a reader ---- #
+        if isinstance(node, ast.Lambda):
+            if is_reader(node.body):
+                flag(node, "reader_callable_escape")
+
     return sorted(set(violations))
 
 WRITE_SWITCHES = (
@@ -229,43 +445,105 @@ def as_list(value):
     return [value]
 
 
+# ---- A3-1: the closed authoritative-result schema ---- #
+# These categories mirror the reviewed $result object emitted by the unchanged probe script.
+# test_library_schema_matches_the_probe_result_contract proves the library's declared schema and
+# this expectation both still match that script exactly.
+AUTHORITATIVE_BOOLEAN_FIELDS = (
+    "state_root_trusted", "claim_root_unavailable", "activated",
+    "confirm_synthetic_expiry_test", "confirm_single_synthetic", "confirm_auto_count_write",
+    "confirm_dry_run_preflight", "confirm_no_update_or_delete", "ac_root_exists",
+    "required_assemblies_loaded", "autocount_contacted", "authentication_success",
+    "member_command_found", "get_member_found", "initial_member_read_attempted",
+    "member_exists_initial", "new_member_success", "assignment_success", "expiry_date_assigned",
+    "member_recheck_attempted", "member_exists_recheck", "claim_created", "claim_conflict",
+    "claim_lost_after_contact", "claim_persist_failed", "save_member_method_found",
+    "save_member_attempted", "save_member_confirmed", "readback_found", "expiry_match",
+    "synthetic_member_may_remain", "evidence_persisted", "non_authoritative_staging_may_remain",
+)
+AUTHORITATIVE_STRING_FIELDS = (
+    "schema_version", "mode", "operation_id", "approval_reference", "executed_at_utc",
+    "target_fingerprint", "synthetic_fingerprint", "attempt_fingerprint",
+    "intended_expiry_date", "claim_basename", "result_basename", "staging_basename",
+    "save_outcome", "masked_member_no", "residual_record_note",
+    "underlying_terminal_outcome", "terminal_outcome",
+)
+AUTHORITATIVE_NULLABLE_STRING_FIELDS = ("readback_error", "expiry_date_readback_value")
+AUTHORITATIVE_INTEGRAL_FIELDS = ("exit_code",)
+AUTHORITATIVE_ARRAY_FIELDS = ("claim_root_failure_reasons",)
+AUTHORITATIVE_OBJECT_FIELDS = ("publication_contract",)
+AUTHORITATIVE_NULLABLE_OBJECT_FIELDS = ("error",)
+
+AUTHORITATIVE_TOP_LEVEL_FIELDS = (
+    AUTHORITATIVE_BOOLEAN_FIELDS + AUTHORITATIVE_STRING_FIELDS
+    + AUTHORITATIVE_NULLABLE_STRING_FIELDS + AUTHORITATIVE_INTEGRAL_FIELDS
+    + AUTHORITATIVE_ARRAY_FIELDS + AUTHORITATIVE_OBJECT_FIELDS
+    + AUTHORITATIVE_NULLABLE_OBJECT_FIELDS
+)
+
+PUBLICATION_CONTRACT_FIELDS = (
+    "publication_contract_version", "authoritative_result_basename", "authority_rule",
+)
+
+AUTHORITY_RULE_TEXT = (
+    "This artefact is authoritative ONLY when its current file basename is exactly equal to "
+    "authoritative_result_basename. Any other basename, including an "
+    "expiry_probe_staging_<operation_id>.incomplete staging artefact, is NON-AUTHORITATIVE "
+    "regardless of the terminal_outcome, evidence_persisted or exit_code it contains."
+)
+
+
 def verified_record(operation_id="expop_authoritative01"):
-    """A minimal, internally consistent authoritative EXPIRY_VERIFIED record."""
+    """A complete, correctly typed, internally consistent authoritative EXPIRY_VERIFIED record.
+
+    Every top-level field the reviewed probe emits is present with its real CLR type: actual
+    Booleans, an actual integral exit code and actual strings. Adversarial tests mutate exactly
+    one field at a time from this baseline.
+    """
     final_basename = "expiry_probe_result_%s.json" % operation_id
-    return {
+    record = {
         "schema_version": SCHEMA_VERSION,
+        "mode": "member-expiry-capability-probe",
         "operation_id": operation_id,
-        "claim_basename": "expiry_probe_claim_afp_test.claim",
+        "approval_reference": "APPROVAL-TEST-001",
+        "executed_at_utc": "2026-08-03T00:00:00Z",
+        "target_fingerprint": "tfp_" + ("a" * 64),
+        "synthetic_fingerprint": "smf_" + ("b" * 64),
+        "attempt_fingerprint": "afp_" + ("c" * 64),
+        "intended_expiry_date": "2028-06-30",
+        "claim_basename": "expiry_probe_claim_afp_%s.claim" % ("c" * 64),
         "result_basename": final_basename,
         "staging_basename": "expiry_probe_staging_%s.incomplete" % operation_id,
         "publication_contract": {
             "publication_contract_version": PUBLICATION_CONTRACT_VERSION,
             "authoritative_result_basename": final_basename,
-            "authority_rule": "authoritative only when the current basename equals authoritative_result_basename",
+            "authority_rule": AUTHORITY_RULE_TEXT,
         },
-        "state_root_trusted": True,
-        "claim_root_unavailable": False,
-        "activated": True,
-        "autocount_contacted": True,
-        "authentication_success": True,
-        "initial_member_read_attempted": True,
-        "member_exists_initial": False,
-        "member_recheck_attempted": True,
-        "member_exists_recheck": False,
-        "claim_created": True,
-        "claim_conflict": False,
-        "claim_lost_after_contact": False,
-        "claim_persist_failed": False,
-        "save_member_attempted": True,
-        "save_member_confirmed": True,
+        "claim_root_failure_reasons": [],
         "save_outcome": "confirmed",
-        "readback_found": True,
-        "expiry_match": True,
+        "masked_member_no": "XB***1",
+        "residual_record_note": "No automatic member update, delete, rollback, or cleanup is performed.",
+        "readback_error": None,
+        "expiry_date_readback_value": "2028-06-30",
         "underlying_terminal_outcome": "EXPIRY_VERIFIED",
         "terminal_outcome": "EXPIRY_VERIFIED",
-        "evidence_persisted": True,
         "exit_code": 0,
+        "error": None,
     }
+    true_flags = (
+        "state_root_trusted", "activated", "confirm_synthetic_expiry_test",
+        "confirm_single_synthetic", "confirm_auto_count_write", "confirm_dry_run_preflight",
+        "confirm_no_update_or_delete", "ac_root_exists", "required_assemblies_loaded",
+        "autocount_contacted", "authentication_success", "member_command_found",
+        "get_member_found", "initial_member_read_attempted", "new_member_success",
+        "assignment_success", "expiry_date_assigned", "member_recheck_attempted",
+        "claim_created", "save_member_method_found", "save_member_attempted",
+        "save_member_confirmed", "readback_found", "expiry_match",
+        "synthetic_member_may_remain", "evidence_persisted",
+    )
+    for field in AUTHORITATIVE_BOOLEAN_FIELDS:
+        record[field] = field in true_flags
+    return record
 
 
 INSPECTOR = r"""
@@ -511,6 +789,159 @@ switch ($Op) {
         $record = Get-Content -LiteralPath $CtxJson -Raw -Encoding UTF8 | ConvertFrom-Json
         $v = Test-ExpiryProbeAuthoritativeResult -Path $Text -Record $record
         [pscustomobject]@{ authoritative = $v.authoritative; reasons = @($v.reasons) } | ConvertTo-Json -Compress -Depth 4
+    }
+    'schemamatrix' {
+        # A3-1 adversarial type matrix, executed in ONE process. $CtxJson = a complete, valid
+        # baseline record; $Text = comma-separated field names; $Extra = candidate final path.
+        $baseText = Get-Content -LiteralPath $CtxJson -Raw -Encoding UTF8
+        $bad = New-Object object[] 9
+        $bad[0] = 'false'; $bad[1] = 'true'; $bad[2] = 0; $bad[3] = 1; $bad[4] = $null
+        $bad[5] = @(); $bad[6] = @(1, 2); $bad[7] = @{}; $bad[8] = @{ injected = 1 }
+        $variant = @('string_false', 'string_true', 'int_zero', 'int_one', 'null',
+                     'empty_array', 'array', 'empty_object', 'object')
+        $results = New-Object System.Collections.Generic.List[object]
+        foreach ($field in $Text.Split(',')) {
+            for ($i = 0; $i -lt $bad.Count; $i++) {
+                $record = $baseText | ConvertFrom-Json
+                $record.$field = $bad[$i]
+                $v = Test-ExpiryProbeAuthoritativeResult -Path $Extra -Record $record
+                $results.Add([pscustomobject]@{
+                    field = $field; variant = $variant[$i]
+                    authoritative = [bool]$v.authoritative; reasons = @($v.reasons)
+                })
+            }
+        }
+        ConvertTo-Json -InputObject $results.ToArray() -Compress -Depth 5
+    }
+    'exitcodematrix' {
+        # $CtxJson = valid baseline; $Extra = candidate final path.
+        $baseText = Get-Content -LiteralPath $CtxJson -Raw -Encoding UTF8
+        $bad = New-Object object[] 9
+        $bad[0] = '0'; $bad[1] = '1'; $bad[2] = $true; $bad[3] = $false; $bad[4] = 0.0
+        # Multi-element arrays: PowerShell unrolls a single-element array on property
+        # assignment, so @(0) would reach the validator as a scalar and prove nothing.
+        $bad[5] = 1.5; $bad[6] = $null; $bad[7] = @(0, 1); $bad[8] = 2
+        $variant = @('string_zero', 'string_one', 'boolean_true', 'boolean_false', 'float_zero',
+                     'float', 'null', 'array', 'out_of_range')
+        $results = New-Object System.Collections.Generic.List[object]
+        for ($i = 0; $i -lt $bad.Count; $i++) {
+            $record = $baseText | ConvertFrom-Json
+            $record.exit_code = $bad[$i]
+            $v = Test-ExpiryProbeAuthoritativeResult -Path $Extra -Record $record
+            $results.Add([pscustomobject]@{
+                variant = $variant[$i]; authoritative = [bool]$v.authoritative; reasons = @($v.reasons)
+            })
+        }
+        ConvertTo-Json -InputObject $results.ToArray() -Compress -Depth 5
+    }
+    'stringtypematrix' {
+        # Every authority-relevant string field replaced by a non-string of each shape.
+        $baseText = Get-Content -LiteralPath $CtxJson -Raw -Encoding UTF8
+        $bad = New-Object object[] 6
+        # Multi-element array for the same unrolling reason as the exit-code matrix.
+        $bad[0] = 1; $bad[1] = $true; $bad[2] = $null; $bad[3] = @('x', 'y'); $bad[4] = @{ a = 1 }; $bad[5] = ''
+        $variant = @('integer', 'boolean', 'null', 'array', 'object', 'empty_string')
+        $results = New-Object System.Collections.Generic.List[object]
+        foreach ($field in $Text.Split(',')) {
+            for ($i = 0; $i -lt $bad.Count; $i++) {
+                $record = $baseText | ConvertFrom-Json
+                $record.$field = $bad[$i]
+                $v = Test-ExpiryProbeAuthoritativeResult -Path $Extra -Record $record
+                $results.Add([pscustomobject]@{
+                    field = $field; variant = $variant[$i]
+                    authoritative = [bool]$v.authoritative; reasons = @($v.reasons)
+                })
+            }
+        }
+        ConvertTo-Json -InputObject $results.ToArray() -Compress -Depth 5
+    }
+    'schemashape' {
+        # Missing/unknown top-level and publication-contract fields. $Text selects the case.
+        $record = Get-Content -LiteralPath $CtxJson -Raw -Encoding UTF8 | ConvertFrom-Json
+        switch ($Text) {
+            'missing_top' { $record.PSObject.Properties.Remove('activated') }
+            'unknown_top' { $record | Add-Member -NotePropertyName 'injected_field' -NotePropertyValue 'x' }
+            'missing_contract' { $record.publication_contract.PSObject.Properties.Remove('authority_rule') }
+            'unknown_contract' { $record.publication_contract | Add-Member -NotePropertyName 'injected' -NotePropertyValue 'x' }
+            'scalar_contract' { $record.publication_contract = 'not-an-object' }
+            'null_contract' { $record.publication_contract = $null }
+            'array_contract' { $record.publication_contract = @(1, 2) }
+        }
+        $v = Test-ExpiryProbeAuthoritativeResult -Path $Extra -Record $record
+        [pscustomobject]@{ authoritative = [bool]$v.authoritative; reasons = @($v.reasons) } | ConvertTo-Json -Compress -Depth 4
+    }
+    'schemafields' {
+        # The library's declared closed top-level schema, for comparison against the script.
+        [pscustomobject]@{
+            topLevel = @($script:ExpiryProbeAuthoritativeTopLevelFields)
+            booleans = @($script:ExpiryProbeAuthoritativeBooleanFields)
+            contract = @($script:ExpiryProbeAuthoritativePublicationFields)
+        } | ConvertTo-Json -Compress -Depth 4
+    }
+    'publishpaths' {
+        # A3-2 path preflight. $Text = "<stagingPath>|<finalPath>"; content is never written
+        # when the preflight rejects.
+        $parts = $Text.Split('|')
+        $threw = $false
+        $message = ''
+        try { Publish-ExpiryProbeResultAtomic -StagingPath $parts[0] -FinalPath $parts[1] -Content 'bytes' `
+                -MoveAction { param($s, $d) throw 'the move must never be reached' } }
+        catch { $threw = $true; $message = $_.Exception.Message }
+        [pscustomobject]@{
+            threw = $threw
+            stagingCreated = (Test-Path -LiteralPath $parts[0])
+            finalCreated = (Test-Path -LiteralPath $parts[1])
+            message = $message
+        } | ConvertTo-Json -Compress
+    }
+    'nativemove' {
+        # A3-2 real Windows write-through publication between two temporary same-directory
+        # paths. Never the canonical root: $Dir is always a test temporary directory.
+        $stg = Join-Path $Dir (Get-ExpiryProbeStagingBasename -OperationId $Text)
+        $fin = Join-Path $Dir (Get-ExpiryProbeResultBasename -OperationId $Text)
+        $content = Get-Content -LiteralPath $CtxJson -Raw -Encoding UTF8
+        $published = $false
+        $publishError = ''
+        try { Publish-ExpiryProbeResultAtomic -StagingPath $stg -FinalPath $fin -Content $content; $published = $true }
+        catch { $publishError = $_.Exception.Message }
+        # A second publication against the now-existing destination must fail without replacing.
+        $secondBlocked = $false
+        try { Publish-ExpiryProbeResultAtomic -StagingPath $stg -FinalPath $fin -Content 'replacement bytes' }
+        catch { $secondBlocked = $true }
+        $finalOperationId = ''
+        if (Test-Path -LiteralPath $fin) {
+            $finalOperationId = (Get-Content -LiteralPath $fin -Raw -Encoding UTF8 | ConvertFrom-Json).operation_id
+        }
+        [pscustomobject]@{
+            published = $published
+            publishError = $publishError
+            finalExists = (Test-Path -LiteralPath $fin)
+            stagingLeft = (Test-Path -LiteralPath $stg)
+            secondBlocked = $secondBlocked
+            finalOperationId = $finalOperationId
+        } | ConvertTo-Json -Compress
+    }
+    'nativemoveraw' {
+        # Direct native-layer proof that the write-through move is NO-REPLACE: with the
+        # destination already present the API must fail and leave both files untouched. This is
+        # the guarantee that remains authoritative against a race after the preflight.
+        Initialize-ExpiryProbeNativePublicationApi
+        $src = Join-Path $Dir 'native_source.tmp'
+        $dst = Join-Path $Dir 'native_destination.tmp'
+        Set-Content -LiteralPath $src -Value 'source bytes' -NoNewline -Encoding UTF8
+        Set-Content -LiteralPath $dst -Value 'destination bytes' -NoNewline -Encoding UTF8
+        $blocked = [XbExpiryProbe.NativePublication]::MoveNoReplaceWriteThrough($src, $dst)
+        $fresh = Join-Path $Dir 'native_fresh.tmp'
+        $allowed = [XbExpiryProbe.NativePublication]::MoveNoReplaceWriteThrough($src, $fresh)
+        [pscustomobject]@{
+            blockedOk = $blocked.Ok
+            blockedErrorCode = $blocked.NativeStatus
+            destinationUnchanged = ((Get-Content -LiteralPath $dst -Raw) -eq 'destination bytes')
+            sourceStillPresentAfterBlock = $true
+            allowedOk = $allowed.Ok
+            freshExists = (Test-Path -LiteralPath $fresh)
+            sourceGoneAfterMove = (-not (Test-Path -LiteralPath $src))
+        } | ConvertTo-Json -Compress
     }
     'leaseacquire' {
         # Acquire and immediately dispose a trusted state-root lease over an injected root.
@@ -910,8 +1341,47 @@ class ExpiryProbeStaticTests(unittest.TestCase):
         self.assertIn("expiry_probe_staging_", self.lib)
         self.assertIn(".incomplete", self.lib)
         self.assertRegex(self.lib, r"FileMode\]::CreateNew")
-        self.assertRegex(self.lib, r"\[System\.IO\.File\]::Move\(\$StagingPath, \$FinalPath\)")
+        self.assertNotIn("[System.IO.File]::Move", self.lib)
+        self.assertIn("MoveNoReplaceWriteThrough($StagingPath, $FinalPath)", self.lib)
         self.assertRegex(self.lib, r"refusing to overwrite evidence")
+
+    # ---- A3-2: native write-through, no-replace publication ---- #
+    def test_production_publication_uses_write_through_moveedfileex_only(self):
+        code_lines = [line for line in self.lib.splitlines()
+                      if not line.lstrip().startswith(("#", "//"))]
+        code = "\n".join(code_lines)
+        for token in ("MoveFileExW", "MOVEFILE_WRITE_THROUGH", "NativePublication",
+                      "MoveNoReplaceWriteThrough"):
+            self.assertIn(token, code, token)
+        # Within the native publication type, write-through is the ONLY flag: replacement,
+        # copying and reboot-delayed scheduling are never declared or requested.
+        native = code[code.index("function Initialize-ExpiryProbeNativePublicationApi"):]
+        native = native[:native.index("\nfunction ")]
+        for forbidden in ("MOVEFILE_REPLACE_EXISTING", "MOVEFILE_COPY_ALLOWED",
+                          "MOVEFILE_DELAY_UNTIL_REBOOT", "0x00000001", "0x00000002", "0x00000004"):
+            self.assertNotIn(forbidden, native, forbidden)
+        self.assertIn("MOVEFILE_WRITE_THROUGH = 0x00000008", native)
+        self.assertEqual(native.count("MoveFileExW(source, destination,"), 1)
+        self.assertIn("MoveFileExW(source, destination, MOVEFILE_WRITE_THROUGH)", native)
+        # No ordinary-move or copy/delete/replace fallback survives anywhere in the library.
+        for fallback in ("[System.IO.File]::Move", "Move-Item", "Copy-Item",
+                         "[System.IO.File]::Copy", "[System.IO.File]::Replace",
+                         "[System.IO.File]::Delete"):
+            self.assertNotIn(fallback, code, fallback)
+        self.assertNotIn("[System.IO.File]::Move", self.script)
+
+    def test_publication_preflight_contract_is_declared(self):
+        for reason in ("staging_not_absolute", "final_not_absolute", "publication_parent_mismatch",
+                       "publication_parent_missing", "publication_same_basename",
+                       "publication_volume_mismatch", "publication_final_exists"):
+            self.assertIn("'%s'" % reason, self.lib, reason)
+        # The injected move action stays a pure-test seam and never reaches the probe script.
+        self.assertIn("[scriptblock]$MoveAction", self.lib)
+        self.assertNotIn("-MoveAction", self.script)
+        # Off Windows the production path fails closed rather than falling back.
+        publish = self.lib[self.lib.index("function Publish-ExpiryProbeResultAtomic"):]
+        publish = publish[:publish.index("\nfunction ")]
+        self.assertIn("Win32NT", publish)
 
     def test_publication_contract_is_content_borne_and_mechanical(self):
         for field in ("publication_contract_version", "authoritative_result_basename", "authority_rule"):
@@ -1536,7 +2006,7 @@ class ExpiryProbeLibraryTests(unittest.TestCase):
         path = self._record_file("validator_nocontract.json", no_contract)
         verdict = self._json("authoritative", Text=str(final), CtxJson=str(path))
         self.assertFalse(verdict["authoritative"])
-        self.assertIn("publication_contract_missing", as_list(verdict["reasons"]))
+        self.assertIn("schema_missing_field", as_list(verdict["reasons"]))
 
         wrong_exit = verified_record(operation_id)
         wrong_exit["exit_code"] = 1
@@ -1558,45 +2028,24 @@ class ExpiryProbeLibraryTests(unittest.TestCase):
         return as_list(verdict["reasons"])
 
     def test_fabricated_all_default_verified_record_is_rejected(self):
-        # The core A2-1 case: every runtime flag is false/default, yet the record declares a
-        # durably persisted EXPIRY_VERIFIED with exit 0. Deriving the outcome from the flags
-        # yields FAILED_BEFORE_WRITE (or REFUSED), so the declaration cannot be trusted.
+        # The core A2-1 case, kept meaningful under A3-1: the record is COMPLETE and correctly
+        # typed, so it clears the strict schema gate and must still be caught by runtime-fact
+        # derivation. Every runtime flag is an actual $false, yet it declares a durably
+        # persisted EXPIRY_VERIFIED with exit 0; the flags derive FAILED_BEFORE_WRITE.
         operation_id = "expop_fabricated01"
-        final_basename = "expiry_probe_result_%s.json" % operation_id
-        fabricated = {
-            "schema_version": SCHEMA_VERSION,
-            "operation_id": operation_id,
-            "result_basename": final_basename,
-            "staging_basename": "expiry_probe_staging_%s.incomplete" % operation_id,
-            "publication_contract": {
-                "publication_contract_version": PUBLICATION_CONTRACT_VERSION,
-                "authoritative_result_basename": final_basename,
-                "authority_rule": "authoritative only when the current basename equals authoritative_result_basename",
-            },
-            "activated": True,
-            "autocount_contacted": False,
-            "initial_member_read_attempted": False,
-            "member_recheck_attempted": False,
-            "member_exists_initial": False,
-            "member_exists_recheck": False,
-            "claim_created": False,
-            "claim_conflict": False,
-            "claim_lost_after_contact": False,
-            "claim_persist_failed": False,
-            "claim_root_unavailable": False,
-            "save_member_attempted": False,
-            "save_member_confirmed": False,
-            "save_outcome": "not_attempted",
-            "readback_found": False,
-            "expiry_match": False,
-            # The lie:
-            "underlying_terminal_outcome": "EXPIRY_VERIFIED",
-            "terminal_outcome": "EXPIRY_VERIFIED",
-            "evidence_persisted": True,
-            "exit_code": 0,
-        }
+        fabricated = verified_record(operation_id)
+        for field in AUTHORITATIVE_BOOLEAN_FIELDS:
+            fabricated[field] = False
+        fabricated["activated"] = True
+        fabricated["evidence_persisted"] = True
+        fabricated["save_outcome"] = "not_attempted"
+        fabricated["expiry_date_readback_value"] = None
+        # The lie:
+        fabricated["underlying_terminal_outcome"] = "EXPIRY_VERIFIED"
+        fabricated["terminal_outcome"] = "EXPIRY_VERIFIED"
+        fabricated["exit_code"] = 0
         path = self._record_file("validator_fabricated.json", fabricated)
-        final = self.tmp / final_basename
+        final = self.tmp / ("expiry_probe_result_%s.json" % operation_id)
         verdict = self._json("authoritative", Text=str(final), CtxJson=str(path))
         self.assertFalse(verdict["authoritative"],
                          "a record whose flags show no contact, claim or save must never be authoritative")
@@ -1653,6 +2102,161 @@ class ExpiryProbeLibraryTests(unittest.TestCase):
                                lambda r: r.__setitem__("evidence_persisted", False))
         self.assertIn("evidence_not_persisted", reasons)
         self.assertIn("terminal_outcome_inconsistent", reasons)
+
+    # ---- A3-1: strict authoritative-record schema and types ---- #
+    def _valid_baseline(self, operation_id="expop_schema01"):
+        record = verified_record(operation_id)
+        path = self._record_file("schema_baseline_%s.json" % operation_id, record)
+        final = self.tmp / ("expiry_probe_result_%s.json" % operation_id)
+        return path, final
+
+    def test_library_schema_matches_the_probe_result_contract(self):
+        # The library's closed schema must be exactly the reviewed $result contract emitted by
+        # the unchanged probe script, so the schema cannot drift from the producer.
+        declared = self._json("schemafields")
+        script_fields = re.findall(
+            r"^\s{4}([a-z_]+)\s*=", read_repo_text("probe_script").split("$result = [ordered]@{", 1)[1]
+            .split("\n}", 1)[0], re.M)
+        self.assertEqual(len(script_fields), 56)
+        self.assertEqual(sorted(as_list(declared["topLevel"])), sorted(script_fields))
+        self.assertEqual(sorted(as_list(declared["topLevel"])), sorted(AUTHORITATIVE_TOP_LEVEL_FIELDS))
+        self.assertEqual(sorted(as_list(declared["booleans"])), sorted(AUTHORITATIVE_BOOLEAN_FIELDS))
+        self.assertEqual(sorted(as_list(declared["contract"])), sorted(PUBLICATION_CONTRACT_FIELDS))
+
+    def test_every_boolean_authority_field_rejects_every_invalid_type(self):
+        path, final = self._valid_baseline("expop_boolmatrix")
+        results = as_list(self._json("schemamatrix", CtxJson=str(path), Extra=str(final),
+                                     Text=",".join(AUTHORITATIVE_BOOLEAN_FIELDS)))
+        self.assertEqual(len(results), len(AUTHORITATIVE_BOOLEAN_FIELDS) * 9)
+        for case in results:
+            self.assertFalse(case["authoritative"],
+                             "%s=%s must not be authoritative" % (case["field"], case["variant"]))
+            self.assertTrue(any(r.startswith("schema_") for r in as_list(case["reasons"])),
+                            "%s=%s reasons=%s" % (case["field"], case["variant"], as_list(case["reasons"])))
+
+    def test_complete_false_shaped_string_record_is_rejected_before_derivation(self):
+        # Every runtime fact is the STRING "true"/"false", which PowerShell would coerce to
+        # $true. The record declares a fully successful, persisted, exit-zero run.
+        operation_id = "expop_falseshaped"
+        record = verified_record(operation_id)
+        for field in AUTHORITATIVE_BOOLEAN_FIELDS:
+            record[field] = "true" if record[field] else "false"
+        record["save_outcome"] = "confirmed"
+        record["underlying_terminal_outcome"] = "EXPIRY_VERIFIED"
+        record["terminal_outcome"] = "EXPIRY_VERIFIED"
+        record["exit_code"] = "0"
+        path = self._record_file("schema_false_shaped.json", record)
+        final = self.tmp / ("expiry_probe_result_%s.json" % operation_id)
+        verdict = self._json("authoritative", Text=str(final), CtxJson=str(path))
+        self.assertFalse(verdict["authoritative"],
+                         "false-shaped strings must never fabricate an authoritative success")
+        reasons = as_list(verdict["reasons"])
+        self.assertTrue(any(r.startswith("schema_") for r in reasons), reasons)
+        # It must fail at the schema gate, before any terminal derivation runs.
+        for derived in ("underlying_outcome_not_derived_from_flags", "terminal_outcome_inconsistent",
+                        "state_contradiction", "verified_without_required_runtime_state"):
+            self.assertNotIn(derived, reasons,
+                             "derivation must not run on an unvalidated record: %s" % reasons)
+
+    def test_exit_code_rejects_every_non_integral_or_out_of_range_value(self):
+        path, final = self._valid_baseline("expop_exitmatrix")
+        results = as_list(self._json("exitcodematrix", CtxJson=str(path), Extra=str(final)))
+        self.assertEqual(len(results), 9)
+        for case in results:
+            self.assertFalse(case["authoritative"], case["variant"])
+            self.assertTrue(any(r.startswith("schema_") for r in as_list(case["reasons"])),
+                            "%s reasons=%s" % (case["variant"], as_list(case["reasons"])))
+
+    def test_every_authority_string_field_rejects_non_string_values(self):
+        path, final = self._valid_baseline("expop_stringmatrix")
+        results = as_list(self._json("stringtypematrix", CtxJson=str(path), Extra=str(final),
+                                     Text=",".join(AUTHORITATIVE_STRING_FIELDS)))
+        self.assertEqual(len(results), len(AUTHORITATIVE_STRING_FIELDS) * 6)
+        for case in results:
+            self.assertFalse(case["authoritative"],
+                             "%s=%s must not be authoritative" % (case["field"], case["variant"]))
+            self.assertTrue(any(r.startswith("schema_") for r in as_list(case["reasons"])),
+                            "%s=%s reasons=%s" % (case["field"], case["variant"], as_list(case["reasons"])))
+
+    def test_missing_and_unknown_schema_fields_fail_closed(self):
+        path, final = self._valid_baseline("expop_shape")
+        expected = {
+            "missing_top": "schema_missing_field",
+            "unknown_top": "schema_unknown_field",
+            "missing_contract": "schema_publication_contract_missing_field",
+            "unknown_contract": "schema_publication_contract_unknown_field",
+            "scalar_contract": "schema_publication_contract_not_object",
+            "null_contract": "schema_publication_contract_not_object",
+            "array_contract": "schema_publication_contract_not_object",
+        }
+        for case, reason in expected.items():
+            verdict = self._json("schemashape", CtxJson=str(path), Extra=str(final), Text=case)
+            self.assertFalse(verdict["authoritative"], case)
+            self.assertIn(reason, as_list(verdict["reasons"]), "%s -> %s" % (case, as_list(verdict["reasons"])))
+
+    def test_schema_reasons_never_echo_malformed_values(self):
+        operation_id = "expop_noecho"
+        record = verified_record(operation_id)
+        record["activated"] = "SENSITIVE-MARKER-VALUE"
+        record["operation_id"] = 12345
+        path = self._record_file("schema_noecho.json", record)
+        final = self.tmp / ("expiry_probe_result_%s.json" % operation_id)
+        proc = self._lib("authoritative", Text=str(final), CtxJson=str(path))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("SENSITIVE-MARKER-VALUE", proc.stdout)
+        self.assertNotIn("SENSITIVE-MARKER-VALUE", proc.stderr)
+        self.assertNotIn("12345", proc.stdout)
+        verdict = json.loads(proc.stdout)
+        self.assertFalse(verdict["authoritative"])
+        for reason in as_list(verdict["reasons"]):
+            self.assertRegex(reason, r"^[a-z0-9_]+$", "reason codes must be generic: %s" % reason)
+
+    # ---- A3-2: write-through, no-replace final publication ---- #
+    def test_publication_preflight_rejects_paths_before_writing_staging(self):
+        directory = self.tmp / "preflight"
+        other = self.tmp / "preflight_other"
+        directory.mkdir(exist_ok=True)
+        other.mkdir(exist_ok=True)
+        staging = directory / "expiry_probe_staging_expop_pf.incomplete"
+        final_elsewhere = other / "expiry_probe_result_expop_pf.json"
+        same_name = directory / "expiry_probe_staging_expop_pf.incomplete"
+
+        cross = self._json("publishpaths", Text="%s|%s" % (staging, final_elsewhere))
+        self.assertTrue(cross["threw"], "a different parent directory must be rejected")
+        self.assertFalse(cross["stagingCreated"], "staging must not be written before the preflight passes")
+        self.assertFalse(cross["finalCreated"])
+
+        identical = self._json("publishpaths", Text="%s|%s" % (staging, same_name))
+        self.assertTrue(identical["threw"], "identical source and destination must be rejected")
+        self.assertFalse(identical["stagingCreated"])
+
+        relative = self._json("publishpaths", Text="relative_staging.incomplete|relative_result.json")
+        self.assertTrue(relative["threw"], "relative paths must be rejected")
+
+    @unittest.skipUnless(IS_WINDOWS, "the production write-through publication is Windows-only")
+    def test_real_native_write_through_move_publishes_and_never_replaces(self):
+        directory = self.tmp / "nativepublish"
+        directory.mkdir(exist_ok=True)
+        operation_id = "expop_native01"
+        record = self._record_file("native_record.json", verified_record(operation_id))
+        info = self._json("nativemove", Dir=str(directory), Text=operation_id, CtxJson=str(record))
+        self.assertTrue(info["published"], info["publishError"])
+        self.assertTrue(info["finalExists"], "the write-through move must publish the final name")
+        self.assertFalse(info["stagingLeft"], "the staging name must not survive a successful move")
+        self.assertEqual(info["finalOperationId"], operation_id)
+        self.assertTrue(info["secondBlocked"], "an existing destination must fail no-clobber")
+
+    @unittest.skipUnless(IS_WINDOWS, "native no-replace semantics are Windows-only")
+    def test_native_move_is_no_replace_at_the_api_layer(self):
+        directory = self.tmp / "nativeraw"
+        directory.mkdir(exist_ok=True)
+        info = self._json("nativemoveraw", Dir=str(directory))
+        self.assertFalse(info["blockedOk"], "MoveFileExW must fail when the destination exists")
+        self.assertNotEqual(info["blockedErrorCode"], 0)
+        self.assertTrue(info["destinationUnchanged"], "the destination must never be replaced")
+        self.assertTrue(info["allowedOk"], "a fresh destination must succeed")
+        self.assertTrue(info["freshExists"])
+        self.assertTrue(info["sourceGoneAfterMove"])
 
     def test_consistent_authoritative_verified_record_still_passes(self):
         operation_id = "expop_stillgood01"
@@ -2245,6 +2849,93 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
             self.assertTrue(any(v.endswith(expected) for v in violations),
                             "%s: expected %s, got %s" % (name, expected, violations))
 
+    def test_ast_guard_rejects_alias_and_indirection_read_routes(self):
+        # A3-3: realistic indirection must fail closed, not merely the direct forms.
+        header = "from pathlib import Path\nROOT = Path(__file__).resolve().parents[1]\n"
+        derived = "target = Path(__file__).resolve().parents[1] / 'new-contract.md'\n"
+        fixtures = {
+            "bound_read_text": (header + derived + "reader = target.read_text\ntext = reader()\n",
+                                "bound_reader_capture"),
+            "bound_read_bytes": (header + derived + "reader = target.read_bytes\nblob = reader()\n",
+                                 "bound_reader_capture"),
+            "bound_path_open": (header + derived + "opener = target.open\nhandle = opener()\n",
+                                "bound_reader_capture"),
+            "imported_open_alias": ("from io import open as io_open\n" + header + derived
+                                    + "text = io_open(target).read()\n", "open_alias_import"),
+            "assigned_open_alias": (header + derived + "reader = open\ntext = reader(target).read()\n",
+                                    "builtin_open"),
+            "alias_of_alias": (header + derived + "first = open\nsecond = first\ntext = second(target).read()\n",
+                               "builtin_open"),
+            "getattr_literal": (header + derived + "reader = getattr(target, 'read_text')\ntext = reader()\n",
+                                "dynamic_attribute_access"),
+            "getattr_variable": (header + derived + "name = 'read_text'\nreader = getattr(target, name)\ntext = reader()\n",
+                                 "dynamic_attribute_access"),
+            "constructed_attribute": (header + derived + "name = 'read' + '_text'\nreader = getattr(target, name)\ntext = reader()\n",
+                                      "dynamic_attribute_access"),
+            "attrgetter": ("from operator import attrgetter\n" + header + derived
+                           + "reader = attrgetter('read_text')(target)\ntext = reader()\n",
+                           "dynamic_attribute_access"),
+            "wrapper_reads_path": (header + derived + "def load():\n    return target.read_text()\n",
+                                   "unresolved_repository_read"),
+            "wrapper_returns_path": (header + "def where():\n    return ROOT / 'new-contract.md'\n"
+                                     + "text = where().read_text()\n", "repository_path_escape"),
+            "wrapper_returns_reader": (header + derived + "def make():\n    return target.read_text\n"
+                                       + "text = make()()\n", "reader_callable_escape"),
+            "lambda_reader": (header + derived + "load = lambda: target.read_text()\ntext = load()\n",
+                              "unresolved_repository_read"),
+            "list_comprehension": (header + derived + "texts = [target.read_text() for _ in range(1)]\n",
+                                   "unresolved_repository_read"),
+            "dict_comprehension": (header + derived + "texts = {i: target.read_text() for i in range(1)}\n",
+                                   "unresolved_repository_read"),
+            "generator_reader": (header + derived + "texts = (target.read_text() for _ in range(1))\n",
+                                 "unresolved_repository_read"),
+            "closure_over_path": (header + derived + "def outer():\n    def inner():\n        return target.read_text()\n    return inner\n",
+                                  "unresolved_repository_read"),
+            "file_derived_path": ("from pathlib import Path\n"
+                                  + "base = Path(__file__).resolve().parents[1]\n"
+                                  + "text = (base / 'new-contract.md').read_text()\n",
+                                  "root_path_derivation"),
+            "file_derived_alias": ("from pathlib import Path\n"
+                                   + "base = Path(__file__).resolve().parents[1]\n"
+                                   + "alias = base\ntext = (alias / 'new-contract.md').read_text()\n",
+                                   "root_path_derivation"),
+            "helper_returned_path": (header + "def helper(n):\n    return ROOT / n\n"
+                                     + "text = helper('new-contract.md').read_text()\n",
+                                     "unresolved_repository_read"),
+            "helper_returned_reader": (header + derived + "def helper():\n    return target.read_bytes\n"
+                                       + "blob = helper()()\n", "reader_callable_escape"),
+            "unresolved_call_with_path": (header + derived + "sink(target)\n",
+                                          "repository_path_escape"),
+            "unresolved_call_with_reader": (header + derived + "reader = target.read_text\nsink(reader)\n",
+                                            "reader_callable_escape"),
+            "reader_in_collection": (header + derived + "readers = [target.read_text]\ntext = readers[0]()\n",
+                                     "bound_reader_capture"),
+            "dynamic_import_reader": ("import importlib\n" + header + derived
+                                      + "mod = importlib.import_module('io')\ntext = mod.open(target).read()\n",
+                                      "dynamic_attribute_access"),
+        }
+        self.assertGreaterEqual(len(fixtures), 25, "the A3-3 fixture matrix must stay complete")
+        for name, (source, expected) in fixtures.items():
+            violations = repository_read_violations(source)
+            self.assertTrue(violations, "%s must not be silently accepted" % name)
+            self.assertTrue(any(v.endswith(expected) for v in violations),
+                            "%s: expected %s, got %s" % (name, expected, violations))
+
+    def test_sanctioned_helper_exemption_cannot_be_borrowed(self):
+        # A nested or same-named function must not inherit the sanctioned-helper exemption.
+        header = "from pathlib import Path\nROOT = Path(__file__).resolve().parents[1]\n"
+        nested = header + ("class Sneaky:\n"
+                           "    def read_repo_text(self, key):\n"
+                           "        return (ROOT / key).read_text()\n")
+        self.assertTrue(repository_read_violations(nested),
+                        "a method named like a sanctioned helper must not be exempt")
+        inner = header + ("def outer():\n"
+                          "    def read_scratch_text(p):\n"
+                          "        return (ROOT / p).read_text()\n"
+                          "    return read_scratch_text\n")
+        self.assertTrue(repository_read_violations(inner),
+                        "a nested function named like a sanctioned helper must not be exempt")
+
     def test_ast_guard_is_independent_of_the_registry_contents(self):
         # Even a REGISTERED file read through an escaping form must fail: the guard checks the
         # shape of the read expression, so closure cannot pass merely because the expected and
@@ -2417,7 +3108,8 @@ class ExpiryProbeAstTests(unittest.TestCase):
         # The library's only System.IO.File mutation is the single no-replace publication
         # move: never a Delete and never a Replace (which would clobber prior evidence).
         lib_info = self._inspect(LIB)
-        self.assertEqual(lib_info["fileMoveCount"], 1)
+        self.assertEqual(lib_info["fileMoveCount"], 0,
+                         "publication uses the native write-through move, not System.IO.File")
         self.assertEqual(lib_info["fileDeleteCount"], 0)
         script_info = self._inspect(SCRIPT)
         self.assertEqual(script_info["fileMoveCount"], 0)

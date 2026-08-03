@@ -27,6 +27,68 @@ $script:ExpiryProbeCanonicalStateRoot = "C:\XB\create_uat\expiry_probe_state"
 $script:ExpiryProbePublicationContractVersion = "member_expiry_capability_probe_publication/v1"
 $script:ExpiryProbeAuthorityRule = "This artefact is authoritative ONLY when its current file basename is exactly equal to authoritative_result_basename. Any other basename, including an expiry_probe_staging_<operation_id>.incomplete staging artefact, is NON-AUTHORITATIVE regardless of the terminal_outcome, evidence_persisted or exit_code it contains."
 
+# --------------------------------------------------------------------------- #
+# The CLOSED authoritative-result schema.
+#
+# PowerShell coercion is unsafe on untrusted input: [bool]"false" is $true and [int]"0" is 0,
+# so a false-shaped JSON record could otherwise fabricate a complete successful runtime chain.
+# Authority therefore type-checks every record field BEFORE any coercion or derivation runs.
+#
+# This field set is exactly the reviewed $result contract emitted by
+# scripts/ac2_member_expiry_capability_probe.ps1. The focused tests compare the two
+# mechanically, so the schema cannot drift from its producer.
+# --------------------------------------------------------------------------- #
+$script:ExpiryProbeAuthoritativeBooleanFields = @(
+    "state_root_trusted", "claim_root_unavailable", "activated",
+    "confirm_synthetic_expiry_test", "confirm_single_synthetic", "confirm_auto_count_write",
+    "confirm_dry_run_preflight", "confirm_no_update_or_delete", "ac_root_exists",
+    "required_assemblies_loaded", "autocount_contacted", "authentication_success",
+    "member_command_found", "get_member_found", "initial_member_read_attempted",
+    "member_exists_initial", "new_member_success", "assignment_success", "expiry_date_assigned",
+    "member_recheck_attempted", "member_exists_recheck", "claim_created", "claim_conflict",
+    "claim_lost_after_contact", "claim_persist_failed", "save_member_method_found",
+    "save_member_attempted", "save_member_confirmed", "readback_found", "expiry_match",
+    "synthetic_member_may_remain", "evidence_persisted", "non_authoritative_staging_may_remain"
+)
+$script:ExpiryProbeAuthoritativeStringFields = @(
+    "schema_version", "mode", "operation_id", "approval_reference", "executed_at_utc",
+    "target_fingerprint", "synthetic_fingerprint", "attempt_fingerprint",
+    "intended_expiry_date", "claim_basename", "result_basename", "staging_basename",
+    "save_outcome", "masked_member_no", "residual_record_note",
+    "underlying_terminal_outcome", "terminal_outcome"
+)
+$script:ExpiryProbeAuthoritativeNullableStringFields = @("readback_error", "expiry_date_readback_value")
+$script:ExpiryProbeAuthoritativeIntegralFields = @("exit_code")
+$script:ExpiryProbeAuthoritativeArrayFields = @("claim_root_failure_reasons")
+$script:ExpiryProbeAuthoritativeObjectFields = @("publication_contract")
+$script:ExpiryProbeAuthoritativeNullableObjectFields = @("error")
+$script:ExpiryProbeAuthoritativeTopLevelFields = @(
+    $script:ExpiryProbeAuthoritativeBooleanFields +
+    $script:ExpiryProbeAuthoritativeStringFields +
+    $script:ExpiryProbeAuthoritativeNullableStringFields +
+    $script:ExpiryProbeAuthoritativeIntegralFields +
+    $script:ExpiryProbeAuthoritativeArrayFields +
+    $script:ExpiryProbeAuthoritativeObjectFields +
+    $script:ExpiryProbeAuthoritativeNullableObjectFields
+)
+$script:ExpiryProbeAuthoritativePublicationFields = @(
+    "publication_contract_version", "authoritative_result_basename", "authority_rule"
+)
+$script:ExpiryProbeMode = "member-expiry-capability-probe"
+# Exact syntax constraints for the identifier and basename fields.
+$script:ExpiryProbeFieldPatterns = @{
+    operation_id          = '^expop_[A-Za-z0-9_]{1,64}$'
+    approval_reference    = '^[A-Za-z0-9._-]{3,64}$'
+    executed_at_utc       = '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$'
+    intended_expiry_date  = '^\d{4}-\d{2}-\d{2}$'
+    target_fingerprint    = '^tfp_[0-9a-f]{64}$'
+    synthetic_fingerprint = '^smf_[0-9a-f]{64}$'
+    attempt_fingerprint   = '^afp_[0-9a-f]{64}$'
+    claim_basename        = '^expiry_probe_claim_[A-Za-z0-9_]+\.claim$'
+    result_basename       = '^expiry_probe_result_[A-Za-z0-9_]+\.json$'
+    staging_basename      = '^expiry_probe_staging_[A-Za-z0-9_]+\.incomplete$'
+}
+
 # The complete canonical terminal vocabulary. Every active-run outcome is exactly one
 # of these; only EXPIRY_VERIFIED is a success.
 $script:ExpiryProbeTerminalCodes = @(
@@ -502,6 +564,85 @@ function New-ExpiryProbeDurableArtifact {
     finally { $stream.Dispose() }
 }
 
+function Initialize-ExpiryProbeNativePublicationApi {
+    # Compiled lazily and only on the Windows production publication path, so the pure and
+    # portable helpers never depend on native interop. Deliberately a SEPARATE type from the
+    # trusted-root lease so the reviewed lease implementation is untouched.
+    if ('XbExpiryProbe.NativePublication' -as [type]) { return }
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+namespace XbExpiryProbe {
+    public class PublicationMoveResult {
+        public bool Ok;
+        public int NativeStatus;
+    }
+
+    public static class NativePublication {
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode, EntryPoint = "MoveFileExW")]
+        private static extern bool MoveFileExW(string lpExistingFileName, string lpNewFileName, uint dwFlags);
+
+        // Write-through ONLY. Replacement, cross-volume copying and reboot-delayed scheduling
+        // are never requested, so the rename is no-replace, same-volume and synchronous
+        // through the documented write-through completion boundary.
+        private const uint MOVEFILE_WRITE_THROUGH = 0x00000008;
+
+        public static PublicationMoveResult MoveNoReplaceWriteThrough(string source, string destination) {
+            PublicationMoveResult result = new PublicationMoveResult();
+            result.Ok = MoveFileExW(source, destination, MOVEFILE_WRITE_THROUGH);
+            result.NativeStatus = result.Ok ? 0 : Marshal.GetLastWin32Error();
+            return result;
+        }
+    }
+}
+'@
+}
+
+function Test-ExpiryProbePublicationPaths {
+    # Pure path contract for publication. Both paths must be absolute, share one existing
+    # parent directory on one local volume, differ by basename, use the reviewed basename
+    # syntax, and the final destination must not already exist. The native no-replace move
+    # remains authoritative against a race after this preflight.
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$StagingPath,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$FinalPath
+    )
+    $reason = ""
+    if ([string]::IsNullOrWhiteSpace($StagingPath) -or -not [System.IO.Path]::IsPathRooted($StagingPath)) {
+        $reason = 'staging_not_absolute'
+    }
+    elseif ([string]::IsNullOrWhiteSpace($FinalPath) -or -not [System.IO.Path]::IsPathRooted($FinalPath)) {
+        $reason = 'final_not_absolute'
+    }
+    else {
+        $stagingFull = $null
+        $finalFull = $null
+        try {
+            $stagingFull = [System.IO.Path]::GetFullPath($StagingPath)
+            $finalFull = [System.IO.Path]::GetFullPath($FinalPath)
+        }
+        catch { $reason = 'publication_path_unresolvable' }
+        if ($reason -eq "") {
+            $comparison = [System.StringComparison]::OrdinalIgnoreCase
+            $stagingName = [System.IO.Path]::GetFileName($stagingFull)
+            $finalName = [System.IO.Path]::GetFileName($finalFull)
+            $stagingParent = [System.IO.Path]::GetDirectoryName($stagingFull)
+            $finalParent = [System.IO.Path]::GetDirectoryName($finalFull)
+            if ($stagingName -notmatch '^expiry_probe_staging_[A-Za-z0-9_]+\.incomplete$') { $reason = 'publication_staging_basename_invalid' }
+            elseif ($finalName -notmatch '^expiry_probe_result_[A-Za-z0-9_]+\.json$') { $reason = 'publication_final_basename_invalid' }
+            elseif ($stagingName.Equals($finalName, $comparison)) { $reason = 'publication_same_basename' }
+            elseif ([string]::IsNullOrEmpty($stagingParent) -or -not $stagingParent.Equals($finalParent, $comparison)) { $reason = 'publication_parent_mismatch' }
+            elseif (-not [System.IO.Directory]::Exists($stagingParent)) { $reason = 'publication_parent_missing' }
+            elseif (-not ([System.IO.Path]::GetPathRoot($stagingFull)).Equals([System.IO.Path]::GetPathRoot($finalFull), $comparison)) { $reason = 'publication_volume_mismatch' }
+            elseif (Test-Path -LiteralPath $FinalPath) { $reason = 'publication_final_exists' }
+        }
+    }
+    $reasons = @()
+    if ($reason -ne "") { $reasons = @($reason) }
+    [pscustomobject]@{ valid = ($reason -eq ""); reasons = $reasons }
+}
+
 function New-ExpiryProbePublicationContract {
     # The content-borne publication contract embedded in the staged bytes. It binds the
     # artefact to ONE authoritative basename, so the same bytes sitting at a staging path
@@ -533,13 +674,30 @@ function Publish-ExpiryProbeResultAtomic {
         # executable script parameter reaches this, so there is no live bypass.
         [scriptblock]$MoveAction
     )
-    if (Test-Path -LiteralPath $FinalPath) { throw "Terminal result artefact already exists; refusing to overwrite evidence." }
+    # Preflight the path contract BEFORE any staging bytes exist, so a cross-directory or
+    # cross-volume publication is refused without leaving an artefact behind.
+    $paths = Test-ExpiryProbePublicationPaths -StagingPath $StagingPath -FinalPath $FinalPath
+    if (-not $paths.valid) {
+        if (@($paths.reasons) -contains 'publication_final_exists') {
+            throw "Terminal result artefact already exists; refusing to overwrite evidence."
+        }
+        throw ("Result publication refused by the path contract (" + (@($paths.reasons) -join ",") + ").")
+    }
     # CreateNew: a pre-existing staging artefact is a conflict that propagates untouched.
     New-ExpiryProbeDurableArtifact -Path $StagingPath -Content $Content
     if ($null -eq $MoveAction) {
-        # File.Move is no-replace: it throws when the destination exists, so a result created
-        # by a racing process is never clobbered.
-        [System.IO.File]::Move($StagingPath, $FinalPath)
+        # Production: the ONLY publication route. A same-directory, same-volume, no-replace
+        # rename carried through the documented write-through completion boundary. There is no
+        # fallback of any kind: no ordinary move, no copy, no delete-then-move, no retry.
+        if ([System.Environment]::OSVersion.Platform -ne [System.PlatformID]::Win32NT) {
+            throw "Result publication requires the Windows no-replace write-through rename; refusing to publish on this platform."
+        }
+        Initialize-ExpiryProbeNativePublicationApi
+        $move = [XbExpiryProbe.NativePublication]::MoveNoReplaceWriteThrough($StagingPath, $FinalPath)
+        if (-not $move.Ok) {
+            # Generic, public-safe failure: a native status number only, never a path.
+            throw ("Result publication failed: the no-replace write-through rename did not complete (native status " + $move.NativeErrorCode + ").")
+        }
     }
     else {
         & $MoveAction $StagingPath $FinalPath
@@ -703,6 +861,165 @@ function Get-ExpiryProbeExitCode {
 # the artefact's CURRENT basename must equal it exactly. A staged artefact therefore fails
 # even when its bytes contain a candidate EXPIRY_VERIFIED with exit_code 0.
 # --------------------------------------------------------------------------- #
+function Get-ExpiryProbeUnwrappedValue {
+    # Strip any PSObject wrapper so type tests see the real CLR type.
+    param([AllowNull()]$Value)
+    if ($null -eq $Value) { return $null }
+    try {
+        if ($Value -is [System.Management.Automation.PSObject]) { return $Value.PSObject.BaseObject }
+    }
+    catch { }
+    return $Value
+}
+
+function Test-ExpiryProbeRecordHasField {
+    param([Parameter(Mandatory)]$Record, [Parameter(Mandatory)][string]$Name)
+    if ($Record -is [System.Collections.IDictionary]) { return $Record.Contains($Name) }
+    if ($null -eq $Record.PSObject) { return $false }
+    return ($null -ne $Record.PSObject.Properties[$Name])
+}
+
+function Get-ExpiryProbeRecordFieldNames {
+    param([Parameter(Mandatory)]$Record)
+    if ($Record -is [System.Collections.IDictionary]) { return @($Record.Keys) }
+    if ($null -eq $Record.PSObject) { return @() }
+    return @($Record.PSObject.Properties | ForEach-Object { $_.Name })
+}
+
+function Test-ExpiryProbeIsRecordObject {
+    # A mapping-like record: an ordered dictionary/hashtable or a ConvertFrom-Json object.
+    # Strings, numbers, Booleans, arrays and $null are not records.
+    param([AllowNull()]$Value)
+    $value = Get-ExpiryProbeUnwrappedValue $Value
+    if ($null -eq $value) { return $false }
+    if ($value -is [string] -or $value -is [bool] -or $value -is [ValueType]) { return $false }
+    if ($value -is [System.Collections.IDictionary]) { return $true }
+    if ($value -is [System.Collections.IEnumerable]) { return $false }
+    return ($value -is [System.Management.Automation.PSCustomObject])
+}
+
+function Test-ExpiryProbeIsStrictBoolean {
+    param([AllowNull()]$Value)
+    return ((Get-ExpiryProbeUnwrappedValue $Value) -is [bool])
+}
+
+function Test-ExpiryProbeIsStrictInteger {
+    # An actual signed integral CLR value of the kind supported JSON parsing produces.
+    # Booleans, strings, floating point and decimal are rejected.
+    param([AllowNull()]$Value)
+    $value = Get-ExpiryProbeUnwrappedValue $Value
+    if ($null -eq $value -or $value -is [bool]) { return $false }
+    return ($value -is [int16] -or $value -is [int32] -or $value -is [int64])
+}
+
+function Test-ExpiryProbeIsStrictString {
+    param([AllowNull()]$Value)
+    return ((Get-ExpiryProbeUnwrappedValue $Value) -is [string])
+}
+
+function Test-ExpiryProbeAuthoritativeRecordSchema {
+    # Fail-closed, type-exact validation of an authoritative-result record. It runs BEFORE any
+    # contradiction check, terminal derivation, final-outcome derivation, exit-code comparison
+    # or [bool]/[int] coercion, so no untrusted value is ever reinterpreted. Reasons are
+    # generic public-safe codes and never echo a malformed value.
+    param([Parameter(Mandatory)][AllowNull()]$Record)
+    $reasons = [System.Collections.Generic.List[string]]::new()
+    if (-not (Test-ExpiryProbeIsRecordObject $Record)) {
+        return [pscustomobject]@{ valid = $false; reasons = @('schema_record_not_object') }
+    }
+
+    # ---- Closed top-level field set: every expected field, and nothing else ---- #
+    $present = @(Get-ExpiryProbeRecordFieldNames -Record $Record)
+    foreach ($field in $script:ExpiryProbeAuthoritativeTopLevelFields) {
+        if (-not (Test-ExpiryProbeRecordHasField -Record $Record -Name $field)) { $reasons.Add('schema_missing_field') }
+    }
+    foreach ($name in $present) {
+        if ($script:ExpiryProbeAuthoritativeTopLevelFields -cnotcontains $name) { $reasons.Add('schema_unknown_field') }
+    }
+
+    # ---- Exact types ---- #
+    foreach ($field in $script:ExpiryProbeAuthoritativeBooleanFields) {
+        if (-not (Test-ExpiryProbeRecordHasField -Record $Record -Name $field)) { continue }
+        if (-not (Test-ExpiryProbeIsStrictBoolean (Get-ExpiryProbeFlag $Record $field $null))) { $reasons.Add('schema_boolean_field_invalid') }
+    }
+    foreach ($field in $script:ExpiryProbeAuthoritativeStringFields) {
+        if (-not (Test-ExpiryProbeRecordHasField -Record $Record -Name $field)) { continue }
+        $value = Get-ExpiryProbeUnwrappedValue (Get-ExpiryProbeFlag $Record $field $null)
+        if (-not (Test-ExpiryProbeIsStrictString $value) -or [string]::IsNullOrWhiteSpace([string]$value)) {
+            $reasons.Add('schema_string_field_invalid')
+            continue
+        }
+        if ($script:ExpiryProbeFieldPatterns.Contains($field) -and ([string]$value) -notmatch $script:ExpiryProbeFieldPatterns[$field]) {
+            $reasons.Add('schema_string_field_invalid')
+        }
+    }
+    foreach ($field in $script:ExpiryProbeAuthoritativeNullableStringFields) {
+        if (-not (Test-ExpiryProbeRecordHasField -Record $Record -Name $field)) { continue }
+        $value = Get-ExpiryProbeUnwrappedValue (Get-ExpiryProbeFlag $Record $field $null)
+        if ($null -ne $value -and -not (Test-ExpiryProbeIsStrictString $value)) { $reasons.Add('schema_string_field_invalid') }
+    }
+    foreach ($field in $script:ExpiryProbeAuthoritativeArrayFields) {
+        if (-not (Test-ExpiryProbeRecordHasField -Record $Record -Name $field)) { continue }
+        $value = Get-ExpiryProbeUnwrappedValue (Get-ExpiryProbeFlag $Record $field $null)
+        if ($null -ne $value -and -not ($value -is [System.Array])) { $reasons.Add('schema_array_field_invalid') }
+    }
+    foreach ($field in $script:ExpiryProbeAuthoritativeNullableObjectFields) {
+        if (-not (Test-ExpiryProbeRecordHasField -Record $Record -Name $field)) { continue }
+        $value = Get-ExpiryProbeUnwrappedValue (Get-ExpiryProbeFlag $Record $field $null)
+        if ($null -ne $value -and -not (Test-ExpiryProbeIsRecordObject $value)) { $reasons.Add('schema_error_field_invalid') }
+    }
+
+    # ---- exit_code: an actual integral value restricted to the valid process-code set ---- #
+    if (Test-ExpiryProbeRecordHasField -Record $Record -Name 'exit_code') {
+        $exitValue = Get-ExpiryProbeFlag $Record 'exit_code' $null
+        if (-not (Test-ExpiryProbeIsStrictInteger $exitValue)) { $reasons.Add('schema_exit_code_invalid') }
+        else {
+            $exitNumber = [int64](Get-ExpiryProbeUnwrappedValue $exitValue)
+            if ($exitNumber -ne 0 -and $exitNumber -ne 1) { $reasons.Add('schema_exit_code_invalid') }
+        }
+    }
+
+    # ---- Closed string vocabularies ---- #
+    $vocabularies = @{
+        schema_version              = @($script:ExpiryProbeSchemaVersion)
+        mode                        = @($script:ExpiryProbeMode)
+        save_outcome                = @($script:ExpiryProbeSaveOutcomes)
+        underlying_terminal_outcome = @($script:ExpiryProbeTerminalCodes)
+        terminal_outcome            = @($script:ExpiryProbeTerminalCodes)
+    }
+    foreach ($field in @($vocabularies.Keys)) {
+        if (-not (Test-ExpiryProbeRecordHasField -Record $Record -Name $field)) { continue }
+        $value = Get-ExpiryProbeUnwrappedValue (Get-ExpiryProbeFlag $Record $field $null)
+        if (-not (Test-ExpiryProbeIsStrictString $value)) { continue }   # already reported as a type error
+        if ($vocabularies[$field] -cnotcontains [string]$value) { $reasons.Add('schema_enum_value_invalid') }
+    }
+
+    # ---- Closed publication contract ---- #
+    if (Test-ExpiryProbeRecordHasField -Record $Record -Name 'publication_contract') {
+        $contract = Get-ExpiryProbeFlag $Record 'publication_contract' $null
+        if (-not (Test-ExpiryProbeIsRecordObject $contract)) { $reasons.Add('schema_publication_contract_not_object') }
+        else {
+            $contractPresent = @(Get-ExpiryProbeRecordFieldNames -Record $contract)
+            foreach ($field in $script:ExpiryProbeAuthoritativePublicationFields) {
+                if (-not (Test-ExpiryProbeRecordHasField -Record $contract -Name $field)) {
+                    $reasons.Add('schema_publication_contract_missing_field')
+                    continue
+                }
+                $value = Get-ExpiryProbeUnwrappedValue (Get-ExpiryProbeFlag $contract $field $null)
+                if (-not (Test-ExpiryProbeIsStrictString $value) -or [string]::IsNullOrWhiteSpace([string]$value)) {
+                    $reasons.Add('schema_publication_contract_field_invalid')
+                }
+            }
+            foreach ($name in $contractPresent) {
+                if ($script:ExpiryProbeAuthoritativePublicationFields -cnotcontains $name) { $reasons.Add('schema_publication_contract_unknown_field') }
+            }
+        }
+    }
+
+    $unique = @($reasons.ToArray() | Select-Object -Unique)
+    [pscustomobject]@{ valid = ($unique.Count -eq 0); reasons = $unique }
+}
+
 function Test-ExpiryProbeAuthoritativeResult {
     param(
         # The path (or basename) the artefact is currently stored under.
@@ -710,6 +1027,15 @@ function Test-ExpiryProbeAuthoritativeResult {
         # The parsed artefact record (ConvertFrom-Json output or an ordered dictionary).
         [Parameter(Mandatory)]$Record
     )
+    # ---- STRICT SCHEMA GATE ---- #
+    # Nothing below this point may observe an unvalidated value: contradiction detection,
+    # terminal derivation, final-outcome derivation and exit-code comparison all coerce with
+    # [bool]/[int], which is unsafe on untrusted input.
+    $schema = Test-ExpiryProbeAuthoritativeRecordSchema -Record $Record
+    if (-not $schema.valid) {
+        return [pscustomobject]@{ authoritative = $false; reasons = @($schema.reasons) }
+    }
+
     $reasons = [System.Collections.Generic.List[string]]::new()
     $basename = ""
     try { $basename = [System.IO.Path]::GetFileName($Path) } catch { $reasons.Add('basename_unresolvable') }
@@ -728,7 +1054,9 @@ function Test-ExpiryProbeAuthoritativeResult {
             # bind it to, so it is not authoritative whatever it claims to contain.
             $reasons.Add('basename_not_authoritative')
         }
-        if ([string]::IsNullOrWhiteSpace([string](Get-ExpiryProbeFlag $contract 'authority_rule' ''))) { $reasons.Add('authority_rule_missing') }
+        $rule = [string](Get-ExpiryProbeFlag $contract 'authority_rule' '')
+        if ([string]::IsNullOrWhiteSpace($rule)) { $reasons.Add('authority_rule_missing') }
+        elseif ($rule -cne $script:ExpiryProbeAuthorityRule) { $reasons.Add('authority_rule_mismatch') }
     }
 
     # ---- Schema and run identity ---- #
