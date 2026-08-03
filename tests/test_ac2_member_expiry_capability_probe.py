@@ -722,7 +722,17 @@ switch ($Op) {
         $stg = Join-Path $Dir (Get-ExpiryProbeStagingBasename -OperationId $Text)
         $fin = Join-Path $Dir (Get-ExpiryProbeResultBasename -OperationId $Text)
         $content = Get-Content -LiteralPath $CtxJson -Raw -Encoding UTF8
-        Publish-ExpiryProbeResultAtomic -StagingPath $stg -FinalPath $fin -Content $content
+        # The production write-through rename is Windows-only and fails closed elsewhere, so off
+        # Windows this portable test drives the same preflight and no-clobber staging contract
+        # through the sanctioned pure-test move seam. The real native publication is covered by
+        # the Windows-only nativemove and nativemoveraw tests.
+        if ([System.Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT) {
+            Publish-ExpiryProbeResultAtomic -StagingPath $stg -FinalPath $fin -Content $content
+        }
+        else {
+            Publish-ExpiryProbeResultAtomic -StagingPath $stg -FinalPath $fin -Content $content `
+                -MoveAction { param($s, $d) [System.IO.File]::Move($s, $d) }
+        }
         $secondBlocked = $false
         try { Publish-ExpiryProbeResultAtomic -StagingPath $stg -FinalPath $fin -Content 'beta' } catch { $secondBlocked = $true }
         $published = Get-Content -LiteralPath $fin -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -854,6 +864,26 @@ switch ($Op) {
             }
         }
         ConvertTo-Json -InputObject $results.ToArray() -Compress -Depth 5
+    }
+    'datetimerecord' {
+        # PowerShell 7's ConvertFrom-Json converts ISO-8601 text to [datetime] while Windows
+        # PowerShell 5.1 leaves it as [string]. This op reproduces the 7.x shape on ANY host so
+        # the cross-version contract is covered locally, not only in hosted CI.
+        $record = Get-Content -LiteralPath $CtxJson -Raw -Encoding UTF8 | ConvertFrom-Json
+        $record.executed_at_utc = [datetime]::SpecifyKind([datetime]::ParseExact(
+            '2026-08-03T00:00:00Z', 'yyyy-MM-ddTHH:mm:ssZ',
+            [System.Globalization.CultureInfo]::InvariantCulture,
+            [System.Globalization.DateTimeStyles]::AdjustToUniversal), [System.DateTimeKind]::Utc)
+        $record.intended_expiry_date = [datetime]::ParseExact('2028-06-30', 'yyyy-MM-dd',
+            [System.Globalization.CultureInfo]::InvariantCulture)
+        $record.expiry_date_readback_value = [datetime]::ParseExact('2028-06-30', 'yyyy-MM-dd',
+            [System.Globalization.CultureInfo]::InvariantCulture)
+        $v = Test-ExpiryProbeAuthoritativeResult -Path $Extra -Record $record
+        [pscustomobject]@{
+            authoritative = [bool]$v.authoritative
+            reasons = @($v.reasons)
+            executedType = $record.executed_at_utc.GetType().Name
+        } | ConvertTo-Json -Compress -Depth 4
     }
     'schemashape' {
         # Missing/unknown top-level and publication-contract fields. $Text selects the case.
@@ -2193,6 +2223,18 @@ class ExpiryProbeLibraryTests(unittest.TestCase):
             verdict = self._json("schemashape", CtxJson=str(path), Extra=str(final), Text=case)
             self.assertFalse(verdict["authoritative"], case)
             self.assertIn(reason, as_list(verdict["reasons"]), "%s -> %s" % (case, as_list(verdict["reasons"])))
+
+    def test_schema_accepts_both_json_date_shapes_across_powershell_versions(self):
+        # Windows PowerShell 5.1 yields [string] for ISO-8601 JSON values; PowerShell 7 yields
+        # [datetime]. Both are the correct output of supported JSON parsing, so both must
+        # validate identically. Every other substitute for those fields is still rejected by
+        # test_every_authority_string_field_rejects_non_string_values.
+        path, final = self._valid_baseline("expop_datetime")
+        info = self._json("datetimerecord", CtxJson=str(path), Extra=str(final))
+        self.assertEqual(info["executedType"], "DateTime",
+                         "the fixture must actually exercise the [datetime] shape")
+        self.assertTrue(info["authoritative"], "reasons=%s" % as_list(info["reasons"]))
+        self.assertEqual(as_list(info["reasons"]), [])
 
     def test_schema_reasons_never_echo_malformed_values(self):
         operation_id = "expop_noecho"

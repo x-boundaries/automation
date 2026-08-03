@@ -51,13 +51,24 @@ $script:ExpiryProbeAuthoritativeBooleanFields = @(
     "synthetic_member_may_remain", "evidence_persisted", "non_authoritative_staging_may_remain"
 )
 $script:ExpiryProbeAuthoritativeStringFields = @(
-    "schema_version", "mode", "operation_id", "approval_reference", "executed_at_utc",
+    "schema_version", "mode", "operation_id", "approval_reference",
     "target_fingerprint", "synthetic_fingerprint", "attempt_fingerprint",
-    "intended_expiry_date", "claim_basename", "result_basename", "staging_basename",
+    "claim_basename", "result_basename", "staging_basename",
     "save_outcome", "masked_member_no", "residual_record_note",
     "underlying_terminal_outcome", "terminal_outcome"
 )
-$script:ExpiryProbeAuthoritativeNullableStringFields = @("readback_error", "expiry_date_readback_value")
+$script:ExpiryProbeAuthoritativeNullableStringFields = @("readback_error")
+# Date-shaped fields. Supported JSON parsers disagree on their CLR type: PowerShell 7's
+# ConvertFrom-Json converts ISO-8601 text to [datetime], while Windows PowerShell 5.1 leaves it
+# as [string]. Both are accepted and validated against the same canonical rendering; every other
+# substitute (numbers, Booleans, null, arrays, objects, empty text) is still rejected.
+$script:ExpiryProbeAuthoritativeDateFields = [ordered]@{
+    executed_at_utc      = 'yyyy-MM-ddTHH:mm:ssZ'
+    intended_expiry_date = 'yyyy-MM-dd'
+}
+$script:ExpiryProbeAuthoritativeNullableDateFields = [ordered]@{
+    expiry_date_readback_value = 'yyyy-MM-dd'
+}
 $script:ExpiryProbeAuthoritativeIntegralFields = @("exit_code")
 $script:ExpiryProbeAuthoritativeArrayFields = @("claim_root_failure_reasons")
 $script:ExpiryProbeAuthoritativeObjectFields = @("publication_contract")
@@ -66,6 +77,8 @@ $script:ExpiryProbeAuthoritativeTopLevelFields = @(
     $script:ExpiryProbeAuthoritativeBooleanFields +
     $script:ExpiryProbeAuthoritativeStringFields +
     $script:ExpiryProbeAuthoritativeNullableStringFields +
+    @($script:ExpiryProbeAuthoritativeDateFields.Keys) +
+    @($script:ExpiryProbeAuthoritativeNullableDateFields.Keys) +
     $script:ExpiryProbeAuthoritativeIntegralFields +
     $script:ExpiryProbeAuthoritativeArrayFields +
     $script:ExpiryProbeAuthoritativeObjectFields +
@@ -917,6 +930,22 @@ function Test-ExpiryProbeIsStrictString {
     return ((Get-ExpiryProbeUnwrappedValue $Value) -is [string])
 }
 
+function Get-ExpiryProbeCanonicalDateText {
+    # Canonical text for a date-shaped field, accepting the two CLR shapes supported JSON
+    # parsing produces: an actual [string] (Windows PowerShell 5.1) or an actual [datetime]
+    # (PowerShell 7 converts ISO-8601 automatically). Returns "" for every other type, so
+    # numbers, Booleans, null, arrays and objects all fail closed.
+    param([AllowNull()]$Value, [Parameter(Mandatory)][string]$Format)
+    $value = Get-ExpiryProbeUnwrappedValue $Value
+    if ($value -is [bool]) { return "" }
+    if ($value -is [datetime]) {
+        if ($Format -eq 'yyyy-MM-ddTHH:mm:ssZ') { return $value.ToUniversalTime().ToString($Format) }
+        return $value.ToString($Format)
+    }
+    if ($value -is [string]) { return [string]$value }
+    return ""
+}
+
 function Test-ExpiryProbeAuthoritativeRecordSchema {
     # Fail-closed, type-exact validation of an authoritative-result record. It runs BEFORE any
     # contradiction check, terminal derivation, final-outcome derivation, exit-code comparison
@@ -957,6 +986,23 @@ function Test-ExpiryProbeAuthoritativeRecordSchema {
         if (-not (Test-ExpiryProbeRecordHasField -Record $Record -Name $field)) { continue }
         $value = Get-ExpiryProbeUnwrappedValue (Get-ExpiryProbeFlag $Record $field $null)
         if ($null -ne $value -and -not (Test-ExpiryProbeIsStrictString $value)) { $reasons.Add('schema_string_field_invalid') }
+    }
+    foreach ($field in @($script:ExpiryProbeAuthoritativeDateFields.Keys)) {
+        if (-not (Test-ExpiryProbeRecordHasField -Record $Record -Name $field)) { continue }
+        $rendered = Get-ExpiryProbeCanonicalDateText -Value (Get-ExpiryProbeFlag $Record $field $null) `
+            -Format $script:ExpiryProbeAuthoritativeDateFields[$field]
+        if ([string]::IsNullOrWhiteSpace($rendered)) { $reasons.Add('schema_string_field_invalid'); continue }
+        if ($script:ExpiryProbeFieldPatterns.Contains($field) -and $rendered -notmatch $script:ExpiryProbeFieldPatterns[$field]) {
+            $reasons.Add('schema_string_field_invalid')
+        }
+    }
+    foreach ($field in @($script:ExpiryProbeAuthoritativeNullableDateFields.Keys)) {
+        if (-not (Test-ExpiryProbeRecordHasField -Record $Record -Name $field)) { continue }
+        $raw = Get-ExpiryProbeUnwrappedValue (Get-ExpiryProbeFlag $Record $field $null)
+        if ($null -eq $raw) { continue }
+        $rendered = Get-ExpiryProbeCanonicalDateText -Value $raw `
+            -Format $script:ExpiryProbeAuthoritativeNullableDateFields[$field]
+        if ([string]::IsNullOrWhiteSpace($rendered)) { $reasons.Add('schema_string_field_invalid') }
     }
     foreach ($field in $script:ExpiryProbeAuthoritativeArrayFields) {
         if (-not (Test-ExpiryProbeRecordHasField -Record $Record -Name $field)) { continue }
