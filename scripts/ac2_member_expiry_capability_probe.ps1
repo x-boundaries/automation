@@ -330,7 +330,12 @@ $claimPath = $null
 $resultPath = $null
 $stagingPath = $null
 $stateReady = $false
+# The retained trusted state-root lease. Released ONLY in the outermost finally, after the
+# terminal evidence has been published (or its publication failure handled), so the pinned
+# namespace outlives the entire irreversible operation.
+$script:ExpiryProbeRootLease = $null
 
+try {
 try {
     # ---- Bind evidence to approval + target (before any AutoCount contact). ----
     if ([string]::IsNullOrWhiteSpace($ApprovalReference) -or $ApprovalReference -notmatch $approvalReferenceRe) {
@@ -368,16 +373,19 @@ try {
     $result.staging_basename = Get-ExpiryProbeStagingBasename -OperationId $operationId
     $result.publication_contract = New-ExpiryProbePublicationContract -OperationId $operationId
 
-    # ---- Trusted canonical state root: fail closed BEFORE any live access. ----
-    # Runs before assembly loading, authentication and every live read. The root must already
-    # exist as a plain directory and every component from the volume root down must be a
-    # plain, non-redirected directory. Nothing here creates, repairs, migrates, cleans or
-    # follows a component. Only the reason code is emitted, never the raw path.
-    $rootCheck = Test-ExpiryProbeTrustedStateRoot -Root $script:ExpiryProbeStateRoot -RequireWindows
-    $result.state_root_trusted = [bool]$rootCheck.trusted
+    # ---- Trusted canonical state root: PIN it before any live access. ----
+    # Acquiring the lease validates the whole chain (present, plain, non-redirected, local
+    # volume) AND retains a Windows directory handle on every component without delete
+    # sharing, so the namespace cannot be renamed, deleted or replaced underneath this
+    # process while the claim, save, read-back and publication run on string paths.
+    # This happens before assembly loading, authentication and every live read. Nothing here
+    # creates, repairs, migrates, cleans or follows a component. Only reason codes are
+    # emitted, never the raw path or any handle/identity value.
+    $script:ExpiryProbeRootLease = New-ExpiryProbeTrustedRootLease -Root $script:ExpiryProbeStateRoot -RequireWindows
+    $result.state_root_trusted = [bool]$script:ExpiryProbeRootLease.acquired
     if (-not $result.state_root_trusted) {
         $result.claim_root_unavailable = $true
-        $result.claim_root_failure_reasons = @($rootCheck.reasons)
+        $result.claim_root_failure_reasons = @($script:ExpiryProbeRootLease.reasons)
         throw "The canonical attempt-claim root is unavailable or untrusted; refusing before any AutoCount contact. The probe never creates, repairs or redirects it (operator setup prerequisite)."
     }
 
@@ -633,7 +641,16 @@ finally {
     Remove-Variable passwordForProbe -ErrorAction SilentlyContinue
 }
 
-# Publish durable, no-clobber evidence (only when the canonical state root was validated),
-# emit sanitised JSON, and exit with the truthful code. Cleanup already ran in finally.
+# Publish durable, no-clobber evidence (only when the canonical state root was pinned),
+# emit sanitised JSON, and record the truthful exit code. Still inside the lease.
 Complete-ExpiryProbeRun -DurableEvidence:$stateReady -ResultPath $resultPath -StagingPath $stagingPath
+}
+finally {
+    # The ONLY lease release site. It runs after claim creation (or its failure), the single
+    # SaveMember attempt, read-back adjudication and final result publication (or
+    # publication-failure handling) have all completed, and it runs on every path: refusal,
+    # untrusted root, authentication failure, duplicate block, claim conflict, uncertain
+    # save, read-back failure and publication failure alike.
+    Close-ExpiryProbeTrustedRootLease -Lease $script:ExpiryProbeRootLease
+}
 exit $script:ProbeExitCode

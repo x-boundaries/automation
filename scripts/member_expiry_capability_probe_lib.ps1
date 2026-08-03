@@ -281,6 +281,195 @@ function Test-ExpiryProbeTrustedStateRoot {
 }
 
 # --------------------------------------------------------------------------- #
+# Trusted state-root LEASE.
+#
+# Validating the root once and then using ordinary string paths is not enough: between the
+# check and the irreversible SaveMember, a permitted rename or replacement of the root (or of
+# any ancestor) could redirect a contender into a second backing claim namespace, defeating the
+# global exactly-once boundary.
+#
+# The lease therefore PINS the namespace. It opens a Windows directory handle on every existing
+# component from the local volume root through the canonical directory, parent before child,
+# and RETAINS all of them. The handles are opened WITHOUT FILE_SHARE_DELETE, so while the lease
+# is held no other process can rename, delete or replace any leased component. Handles are
+# released, leaf first, only after terminal evidence handling has finished.
+#
+# Nothing here creates, repairs, migrates, cleans or deletes a directory, and no component is
+# followed: FILE_FLAG_OPEN_REPARSE_POINT opens the link itself so a redirection is detected
+# rather than traversed.
+# --------------------------------------------------------------------------- #
+function Initialize-ExpiryProbeNativeDirectoryApi {
+    # Compiled lazily and only on the Windows active path, so dot-sourcing the library for the
+    # pure/portable helpers never pays for (or depends on) native interop.
+    if ('XbExpiryProbe.NativeDirectory' -as [type]) { return }
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+
+namespace XbExpiryProbe {
+    [StructLayout(LayoutKind.Sequential)]
+    public struct BY_HANDLE_FILE_INFORMATION {
+        public uint FileAttributes;
+        public System.Runtime.InteropServices.ComTypes.FILETIME CreationTime;
+        public System.Runtime.InteropServices.ComTypes.FILETIME LastAccessTime;
+        public System.Runtime.InteropServices.ComTypes.FILETIME LastWriteTime;
+        public uint VolumeSerialNumber;
+        public uint FileSizeHigh;
+        public uint FileSizeLow;
+        public uint NumberOfLinks;
+        public uint FileIndexHigh;
+        public uint FileIndexLow;
+    }
+
+    public class DirectoryIdentity {
+        public bool Ok;
+        public uint Attributes;
+        public uint VolumeSerialNumber;
+        public ulong FileIndex;
+    }
+
+    public static class NativeDirectory {
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        private static extern SafeFileHandle CreateFileW(
+            string lpFileName, uint dwDesiredAccess, uint dwShareMode, IntPtr lpSecurityAttributes,
+            uint dwCreationDisposition, uint dwFlagsAndAttributes, IntPtr hTemplateFile);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool GetFileInformationByHandle(
+            SafeFileHandle hFile, out BY_HANDLE_FILE_INFORMATION lpFileInformation);
+
+        private const uint FILE_READ_ATTRIBUTES = 0x0080;
+        private const uint FILE_LIST_DIRECTORY  = 0x0001;
+        private const uint SYNCHRONIZE          = 0x00100000;
+        private const uint FILE_SHARE_READ      = 0x00000001;
+        private const uint FILE_SHARE_WRITE     = 0x00000002;
+        private const uint OPEN_EXISTING        = 3;
+        private const uint FILE_FLAG_BACKUP_SEMANTICS   = 0x02000000;
+        private const uint FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000;
+
+        public static SafeFileHandle OpenDirectoryNoDeleteShare(string path) {
+            // Share read and write so ordinary claim/staging/result file operations inside the
+            // directory keep working, but deliberately WITHOUT FILE_SHARE_DELETE: renaming or
+            // deleting a directory needs DELETE access, so every such attempt by another
+            // process fails with a sharing violation while this handle is retained.
+            return CreateFileW(
+                path,
+                FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY | SYNCHRONIZE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                IntPtr.Zero,
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                IntPtr.Zero);
+        }
+
+        public static DirectoryIdentity GetIdentity(SafeFileHandle handle) {
+            // Inspect the OPENED OBJECT itself, not the path that was used to reach it.
+            DirectoryIdentity identity = new DirectoryIdentity();
+            BY_HANDLE_FILE_INFORMATION info;
+            identity.Ok = GetFileInformationByHandle(handle, out info);
+            if (identity.Ok) {
+                identity.Attributes = info.FileAttributes;
+                identity.VolumeSerialNumber = info.VolumeSerialNumber;
+                identity.FileIndex = ((ulong)info.FileIndexHigh << 32) | (ulong)info.FileIndexLow;
+            }
+            return identity;
+        }
+    }
+}
+'@
+}
+
+function New-ExpiryProbeTrustedRootLease {
+    # Acquire a trusted state-root lease. Production always passes
+    # (Get-ExpiryProbeCanonicalStateRoot); the -Root parameter exists ONLY so pure unit tests
+    # can pin a temporary directory chain. No executable script parameter reaches it.
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Root,
+        [switch]$RequireWindows
+    )
+    $reasons = [System.Collections.Generic.List[string]]::new()
+    $handles = [System.Collections.Generic.List[object]]::new()
+    $identities = [System.Collections.Generic.List[string]]::new()
+    $chain = @()
+    $failed = $false
+
+    # The lease is inherently Win32. Fail closed BEFORE any native interop is even compiled.
+    if ([System.Environment]::OSVersion.Platform -ne [System.PlatformID]::Win32NT) {
+        $reasons.Add('platform_not_windows')
+        $failed = $true
+    }
+    if (-not $failed) {
+        # Reuse the single fail-closed validator so lease and validation cannot diverge.
+        $verdict = Test-ExpiryProbeTrustedStateRoot -Root $Root -RequireWindows:$RequireWindows
+        if (-not $verdict.trusted) {
+            foreach ($reason in @($verdict.reasons)) { $reasons.Add($reason) }
+            $failed = $true
+        }
+    }
+    if (-not $failed) {
+        try { $chain = @(Get-ExpiryProbePathComponents -Path $Root) }
+        catch { $reasons.Add('root_unresolvable'); $failed = $true }
+    }
+    if (-not $failed) {
+        Initialize-ExpiryProbeNativeDirectoryApi
+        foreach ($component in $chain) {
+            # Parent-before-child: the parent's handle is already retained in $handles before
+            # its child is opened, so no ancestor can be swapped mid-walk.
+            $handle = $null
+            try { $handle = [XbExpiryProbe.NativeDirectory]::OpenDirectoryNoDeleteShare($component) }
+            catch { $reasons.Add('component_open_failed'); $failed = $true; break }
+            if ($null -eq $handle) { $reasons.Add('component_open_failed'); $failed = $true; break }
+            if ($handle.IsInvalid) {
+                $handle.Dispose()
+                $reasons.Add('component_open_failed'); $failed = $true; break
+            }
+            $handles.Add($handle)
+            $identity = [XbExpiryProbe.NativeDirectory]::GetIdentity($handle)
+            if (-not $identity.Ok) { $reasons.Add('component_identity_unavailable'); $failed = $true; break }
+            if (($identity.Attributes -band [uint32]0x00000010) -eq 0) { $reasons.Add('component_not_directory'); $failed = $true; break }
+            if (($identity.Attributes -band [uint32]0x00000400) -ne 0) { $reasons.Add('component_reparse_point'); $failed = $true; break }
+            # Stable volume/file identity, retained internally only. Never emitted: it is not a
+            # path, but it still describes private machine state.
+            $identities.Add(('vol{0:x8}:idx{1:x16}' -f $identity.VolumeSerialNumber, $identity.FileIndex))
+        }
+    }
+    if ($failed) {
+        # Partial acquisition: dispose every handle already opened, in reverse order, so a
+        # failed lease never leaves the chain pinned.
+        for ($i = $handles.Count - 1; $i -ge 0; $i--) {
+            try { $handles[$i].Dispose() } catch { }
+        }
+        $handles.Clear()
+        $identities.Clear()
+    }
+    [pscustomobject]@{
+        acquired        = (-not $failed)
+        reasons         = @($reasons.ToArray())
+        component_count = @($chain).Count
+        identity_count  = $identities.Count
+        held_count      = $handles.Count
+        handles         = $handles
+        identities      = @($identities.ToArray())
+    }
+}
+
+function Close-ExpiryProbeTrustedRootLease {
+    # Dispose every retained handle in reverse order (leaf first, volume root last). The caller
+    # must invoke this ONLY from the outer cleanup path, after terminal evidence handling has
+    # finished, so the namespace stays pinned across the whole irreversible operation.
+    param([Parameter(Mandatory)][AllowNull()]$Lease)
+    if ($null -eq $Lease) { return }
+    $handles = Get-ExpiryProbeFlag $Lease 'handles' $null
+    if ($null -eq $handles) { return }
+    for ($i = $handles.Count - 1; $i -ge 0; $i--) {
+        try { $handles[$i].Dispose() } catch { }
+    }
+    $handles.Clear()
+    $Lease.held_count = 0
+}
+
+# --------------------------------------------------------------------------- #
 # Durable single-use attempt claim (P1) and path-bound no-clobber result publication (P2).
 # --------------------------------------------------------------------------- #
 function New-ExpiryProbeDurableArtifact {
@@ -557,20 +746,57 @@ function Test-ExpiryProbeAuthoritativeResult {
         elseif ($basename.Equals($declaredStaging, [System.StringComparison]::Ordinal)) { $reasons.Add('artefact_is_staging') }
     }
 
-    # ---- Terminal-state truth ---- #
+    # ---- Terminal-state truth, DERIVED from the recorded runtime flags ---- #
+    # A record's declared outcome is never trusted. The underlying outcome is recomputed with
+    # the SAME pure derivation the runtime uses, and the final outcome is recomputed from that
+    # plus the record's own durable-publication fact. A fabricated or corrupted artefact whose
+    # flags show no contact, claim or save therefore cannot declare itself verified.
     if (@(Get-ExpiryProbeStateContradictions -Flags $Record).Count -gt 0) { $reasons.Add('state_contradiction') }
-    $terminal = [string](Get-ExpiryProbeFlag $Record 'terminal_outcome' '')
-    $underlying = [string](Get-ExpiryProbeFlag $Record 'underlying_terminal_outcome' '')
-    if ($script:ExpiryProbeTerminalCodes -notcontains $terminal) { $reasons.Add('terminal_outcome_unknown') }
-    if ($script:ExpiryProbeTerminalCodes -notcontains $underlying) { $reasons.Add('underlying_outcome_unknown') }
-    elseif ($terminal -ne (Get-ExpiryProbeFinalOutcome -UnderlyingOutcome $underlying -DurableRequired $true -EvidencePersisted $true)) {
-        $reasons.Add('terminal_outcome_inconsistent')
-    }
+    $declaredTerminal = [string](Get-ExpiryProbeFlag $Record 'terminal_outcome' '')
+    $declaredUnderlying = [string](Get-ExpiryProbeFlag $Record 'underlying_terminal_outcome' '')
+    $persisted = [bool](Get-ExpiryProbeFlag $Record 'evidence_persisted' $false)
+    if ($script:ExpiryProbeTerminalCodes -notcontains $declaredTerminal) { $reasons.Add('terminal_outcome_unknown') }
+    if ($script:ExpiryProbeTerminalCodes -notcontains $declaredUnderlying) { $reasons.Add('underlying_outcome_unknown') }
+
+    $derivedUnderlying = Get-ExpiryProbeTerminalOutcome -Flags $Record
+    if ($declaredUnderlying -ne $derivedUnderlying) { $reasons.Add('underlying_outcome_not_derived_from_flags') }
+    # Use the RECORDED persistence fact, not an assumption that persistence succeeded merely
+    # because the artefact reached this validator.
+    $derivedFinal = Get-ExpiryProbeFinalOutcome -UnderlyingOutcome $derivedUnderlying -DurableRequired $true -EvidencePersisted $persisted
+    if ($declaredTerminal -ne $derivedFinal) { $reasons.Add('terminal_outcome_inconsistent') }
     # A published authoritative result is, by construction, one whose durable write succeeded.
-    if (-not [bool](Get-ExpiryProbeFlag $Record 'evidence_persisted' $false)) { $reasons.Add('evidence_not_persisted') }
+    if (-not $persisted) { $reasons.Add('evidence_not_persisted') }
     $exitCode = Get-ExpiryProbeFlag $Record 'exit_code' $null
     if ($null -eq $exitCode) { $reasons.Add('exit_code_missing') }
-    elseif ([int]$exitCode -ne (Get-ExpiryProbeExitCode -TerminalOutcome $terminal)) { $reasons.Add('exit_code_inconsistent') }
+    elseif ([int]$exitCode -ne (Get-ExpiryProbeExitCode -TerminalOutcome $derivedFinal)) { $reasons.Add('exit_code_inconsistent') }
+
+    # ---- Runtime-fact prerequisites, independent of any declared outcome ---- #
+    $attempted = [bool](Get-ExpiryProbeFlag $Record 'save_member_attempted' $false)
+    $claimCreated = [bool](Get-ExpiryProbeFlag $Record 'claim_created' $false)
+    $confirmed = [bool](Get-ExpiryProbeFlag $Record 'save_member_confirmed' $false)
+    $saveOutcome = [string](Get-ExpiryProbeFlag $Record 'save_outcome' 'not_attempted')
+    $readbackFound = [bool](Get-ExpiryProbeFlag $Record 'readback_found' $false)
+    # The irreversible save is only ever reached through an exclusively created durable claim.
+    if ($attempted -and -not $claimCreated) { $reasons.Add('save_attempted_without_claim') }
+    if (($confirmed -or $saveOutcome -eq 'confirmed') -and (-not $attempted -or -not $claimCreated)) {
+        $reasons.Add('save_success_without_attempt_or_claim')
+    }
+    if ($readbackFound -and -not $confirmed) { $reasons.Add('readback_without_confirmed_save') }
+    if ([bool](Get-ExpiryProbeFlag $Record 'expiry_match' $false) -and -not $readbackFound) { $reasons.Add('match_without_readback') }
+    # An authoritative EXPIRY_VERIFIED requires the COMPLETE runtime path to have happened.
+    if ($declaredTerminal -eq 'EXPIRY_VERIFIED' -or $derivedFinal -eq 'EXPIRY_VERIFIED') {
+        $requiredTrueFlags = @(
+            'activated', 'autocount_contacted', 'initial_member_read_attempted',
+            'member_recheck_attempted', 'claim_created', 'save_member_attempted',
+            'save_member_confirmed', 'readback_found', 'expiry_match', 'evidence_persisted'
+        )
+        foreach ($flagName in $requiredTrueFlags) {
+            if (-not [bool](Get-ExpiryProbeFlag $Record $flagName $false)) {
+                $reasons.Add('verified_without_required_runtime_state')
+                break
+            }
+        }
+    }
 
     $unique = @($reasons.ToArray() | Select-Object -Unique)
     [pscustomobject]@{ authoritative = ($unique.Count -eq 0); reasons = $unique }

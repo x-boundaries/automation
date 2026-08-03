@@ -14,9 +14,12 @@ Two deliberate boundaries:
   the script-level tests never run an active probe that could create an artefact inside the
   real canonical root. The few script tests that would otherwise do so are skipped, with a
   visible reason, on a machine where that root exists (i.e. the AutoCount VM).
-* Repository path dependencies are declared as module-level ``ROOT / ...`` constants. The
-  dependency-closure test discovers them mechanically from this module's own AST, so a new
-  direct dependency fails closure until the focused workflow filter covers it.
+* Repository dependencies are a CLOSED contract: ``REPO_DEPENDENCIES`` is the single
+  immutable registry, ``repo_path``/``read_repo_text`` are the only sanctioned readers, and
+  ``repository_read_violations`` is an independent AST guard that fails on any repository read
+  or path derivation escaping them — including unresolvable ones, which are reported rather
+  than silently dropped from the inventory. Every registered dependency must also be covered
+  by every workflow ``paths`` filter.
 """
 
 import ast
@@ -27,20 +30,141 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 
-# ---- Declared repository path dependencies (discovered mechanically; see closure test). ---- #
 ROOT = Path(__file__).resolve().parents[1]
-SCRIPT = ROOT / "scripts" / "ac2_member_expiry_capability_probe.ps1"
-LIB = ROOT / "scripts" / "member_expiry_capability_probe_lib.ps1"
-DOCS = ROOT / "docs" / "autocount2-automation"
-RUNBOOK = DOCS / "member_expiry_capability_probe_runbook.md"
-CREATE_UAT_RUNBOOK = DOCS / "member_create_uat_runbook.md"
-README = ROOT / "README.md"
-GITIGNORE = ROOT / ".gitignore"
-WORKFLOW = ROOT / ".github" / "workflows" / "member-create-uat-tests.yml"
-SELF = ROOT / "tests" / "test_ac2_member_expiry_capability_probe.py"
+
+# ---- A2-3: closed repository dependency contract ---- #
+# The single explicit, immutable registry of every repository file this module reads or
+# semantically asserts. Reads are routed through repo_path()/read_repo_text(), and an
+# INDEPENDENT AST guard (repository_read_violations) fails the suite on any repository read or
+# path derivation that escapes them. Discovery is therefore fail-closed: an unresolved or
+# unrecognised read is an error, never a silently missing inventory entry.
+REPO_DEPENDENCIES = types.MappingProxyType({
+    "probe_script": "scripts/ac2_member_expiry_capability_probe.ps1",
+    "probe_lib": "scripts/member_expiry_capability_probe_lib.ps1",
+    "probe_runbook": "docs/autocount2-automation/member_expiry_capability_probe_runbook.md",
+    "create_uat_runbook": "docs/autocount2-automation/member_create_uat_runbook.md",
+    "readme": "README.md",
+    "gitignore": ".gitignore",
+    "workflow": ".github/workflows/member-create-uat-tests.yml",
+    "focused_tests": "tests/test_ac2_member_expiry_capability_probe.py",
+})
+
+
+def repo_path(key):
+    """Resolve a REGISTERED dependency key to its path. An unregistered key fails closed."""
+    if key not in REPO_DEPENDENCIES:
+        raise KeyError("unregistered repository dependency key: %r" % (key,))
+    return ROOT / REPO_DEPENDENCIES[key]
+
+
+def read_repo_text(key):
+    """The only sanctioned repository text read; accepts a literal registered key only."""
+    return repo_path(key).read_text(encoding="utf-8")
+
+
+def read_scratch_text(path):
+    """Read a NON-repository (temporary) file. Fails closed on any repository path."""
+    resolved = Path(path).resolve()
+    if resolved == ROOT or ROOT in resolved.parents:
+        raise AssertionError("the scratch reader refuses a repository path: %s" % resolved)
+    return resolved.read_text(encoding="utf-8")
+
+
+def registered_dependencies():
+    """Every registered repository dependency, as repo-relative POSIX paths."""
+    return set(REPO_DEPENDENCIES.values())
+
+
+SCRIPT = repo_path("probe_script")
+LIB = repo_path("probe_lib")
+RUNBOOK = repo_path("probe_runbook")
+CREATE_UAT_RUNBOOK = repo_path("create_uat_runbook")
+README = repo_path("readme")
+GITIGNORE = repo_path("gitignore")
+WORKFLOW = repo_path("workflow")
+SELF = repo_path("focused_tests")
+
+# Reads that must resolve to a registered dependency, and the helpers whose own bodies are the
+# sanctioned implementations of those reads.
+REPO_READ_METHODS = ("read_text", "read_bytes", "open")
+SANCTIONED_READ_HELPERS = ("repo_path", "read_repo_text", "read_scratch_text")
+
+
+def _mentions_root(node):
+    return any(isinstance(sub, ast.Name) and sub.id == "ROOT" for sub in ast.walk(node))
+
+
+def repository_read_violations(source):
+    """Fail-closed AST guard: every repository read must go through the closed registry.
+
+    Returns sorted "<line>:<kind>" violations. Unresolvable or unrecognised repository reads
+    are reported rather than ignored, so a new dependency cannot slip past the inventory.
+    """
+    tree = ast.parse(source)
+    violations = []
+
+    def flag(node, kind):
+        violations.append("%d:%s" % (getattr(node, "lineno", 0), kind))
+
+    def is_repo_path_call(node):
+        return (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id == "repo_path")
+
+    def literal_registered_key(node):
+        args = getattr(node, "args", [])
+        return (len(args) == 1 and isinstance(args[0], ast.Constant)
+                and isinstance(args[0].value, str) and args[0].value in REPO_DEPENDENCIES)
+
+    # Module-level names bound to a registered repo_path(...) result.
+    registered_names = set()
+    for stmt in tree.body:
+        if (isinstance(stmt, ast.Assign) and len(stmt.targets) == 1
+                and isinstance(stmt.targets[0], ast.Name)
+                and is_repo_path_call(stmt.value) and literal_registered_key(stmt.value)):
+            registered_names.add(stmt.targets[0].id)
+
+    def receiver_is_registered(node):
+        if isinstance(node, ast.Name):
+            return node.id in registered_names
+        if is_repo_path_call(node):
+            return literal_registered_key(node)
+        return False
+
+    skip = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name in SANCTIONED_READ_HELPERS:
+            for sub in ast.walk(node):
+                skip.add(id(sub))
+
+    for node in ast.walk(tree):
+        if id(node) in skip:
+            continue
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            if node.func.id == "open":
+                flag(node, "builtin_open")
+            elif node.func.id in ("repo_path", "read_repo_text"):
+                if not literal_registered_key(node):
+                    args = getattr(node, "args", [])
+                    if len(args) == 1 and isinstance(args[0], ast.Constant) and isinstance(args[0].value, str):
+                        flag(node, "unregistered_dependency_key")
+                    else:
+                        flag(node, "dynamic_dependency_key")
+            elif node.func.id == "Path" and any(_mentions_root(arg) for arg in node.args):
+                flag(node, "path_constructor_from_root")
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div) and _mentions_root(node.left):
+            flag(node, "root_path_derivation")
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "joinpath" and _mentions_root(node.func.value)):
+            flag(node, "root_joinpath")
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr in REPO_READ_METHODS
+                and not receiver_is_registered(node.func.value)):
+            flag(node, "unresolved_repository_read")
+    return sorted(set(violations))
 
 WRITE_SWITCHES = (
     "EnableExpiryCapabilityProbe",
@@ -388,54 +512,38 @@ switch ($Op) {
         $v = Test-ExpiryProbeAuthoritativeResult -Path $Text -Record $record
         [pscustomobject]@{ authoritative = $v.authoritative; reasons = @($v.reasons) } | ConvertTo-Json -Compress -Depth 4
     }
+    'leaseacquire' {
+        # Acquire and immediately dispose a trusted state-root lease over an injected root.
+        # $Dir = injected root; $Text = '1' to require Windows.
+        $requireWindows = ($Text -eq '1')
+        if ($requireWindows) { $lease = New-ExpiryProbeTrustedRootLease -Root $Dir -RequireWindows }
+        else { $lease = New-ExpiryProbeTrustedRootLease -Root $Dir }
+        $result = [pscustomobject]@{
+            acquired       = $lease.acquired
+            reasons        = @($lease.reasons)
+            componentCount = $lease.component_count
+            identityCount  = $lease.identity_count
+            heldCount      = $lease.held_count
+        }
+        Close-ExpiryProbeTrustedRootLease -Lease $lease
+        $result | ConvertTo-Json -Compress -Depth 4
+    }
+    'leasehold' {
+        # Hold a trusted state-root lease across an interactive handshake so an INDEPENDENT
+        # process can attempt real filesystem renames while the Windows directory handles
+        # are retained. Nothing here touches the canonical root: $Dir is always a temporary
+        # directory supplied by the test.
+        $lease = New-ExpiryProbeTrustedRootLease -Root $Dir -RequireWindows
+        [Console]::Out.WriteLine('ACQUIRED|' + [bool]$lease.acquired + '|' + (@($lease.reasons) -join ';') + '|' + $lease.held_count)
+        [Console]::Out.Flush()
+        [void][Console]::In.ReadLine()
+        Close-ExpiryProbeTrustedRootLease -Lease $lease
+        [Console]::Out.WriteLine('RELEASED|' + $lease.held_count)
+        [Console]::Out.Flush()
+        [void][Console]::In.ReadLine()
+    }
 }
 """
-
-
-# --------------------------------------------------------------------------- #
-# Mechanical focused-CI dependency closure.
-# --------------------------------------------------------------------------- #
-def module_repo_dependencies(module_path):
-    """Every repository file this module reads or semantically asserts.
-
-    Derived from the module's own AST: any module-level constant or inline expression built
-    as ``ROOT / "..."`` (directly or through another such constant) is a declared repository
-    path dependency. Directories are dropped; only existing files are returned. Adding a new
-    ``ROOT / ...`` constant therefore extends the inventory automatically.
-    """
-    tree = ast.parse(module_path.read_text(encoding="utf-8"))
-    symbols = {"ROOT": ()}
-
-    def resolve(node):
-        if isinstance(node, ast.Name):
-            return symbols.get(node.id)
-        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
-            left = resolve(node.left)
-            if left is None:
-                return None
-            right = node.right
-            if isinstance(right, ast.Constant) and isinstance(right.value, str):
-                return left + (right.value,)
-            return None
-        return None
-
-    # Module-level assignments in source order, so later constants can build on earlier ones.
-    for stmt in tree.body:
-        if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name):
-            parts = resolve(stmt.value)
-            if parts is not None:
-                symbols[stmt.targets[0].id] = parts
-
-    discovered = set()
-    for parts in symbols.values():
-        if parts:
-            discovered.add("/".join(parts))
-    for node in ast.walk(tree):
-        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
-            parts = resolve(node)
-            if parts:
-                discovered.add("/".join(parts))
-    return {rel for rel in discovered if (ROOT / rel).is_file()}
 
 
 # The single README bullet that states this probe's public contract. Amendment
@@ -491,6 +599,76 @@ def workflow_path_filters(text):
             continue
         index += 1
     return filters
+
+
+# A2-4: the literal exact-head assertion step both jobs must run immediately after checkout.
+EXACT_HEAD_STEP_NAME = "Assert literal exact-head checkout"
+
+
+def workflow_job_blocks(text):
+    """Map each job id under `jobs:` to its raw block text."""
+    lines = text.splitlines()
+    try:
+        start = next(i for i, line in enumerate(lines) if re.match(r"^jobs:\s*$", line))
+    except StopIteration:
+        return {}
+    end_of_jobs = len(lines)
+    headers = []
+    for i in range(start + 1, len(lines)):
+        line = lines[i]
+        if line.strip() and not line.startswith(" "):
+            end_of_jobs = i
+            break
+        match = re.match(r"^  ([A-Za-z0-9_-]+):\s*$", line)
+        if match:
+            headers.append((i, match.group(1)))
+    blocks = {}
+    for index, (line_no, name) in enumerate(headers):
+        stop = headers[index + 1][0] if index + 1 < len(headers) else end_of_jobs
+        blocks[name] = "\n".join(lines[line_no:stop])
+    return blocks
+
+
+def checkout_head_binding_problems(text):
+    """Problems preventing literal exact-head binding. Empty list means compliant."""
+    problems = []
+    blocks = workflow_job_blocks(text)
+    if not blocks:
+        return ["no_jobs_found"]
+    for job, block in blocks.items():
+        if "actions/checkout@" not in block:
+            problems.append("%s:no_checkout" % job)
+            continue
+        checkout_step = block.split("actions/checkout@", 1)[1].split("\n      - ", 1)[0]
+        ref = re.search(r"^\s*ref:\s*(.+)$", checkout_step, re.M)
+        if not ref:
+            problems.append("%s:checkout_without_explicit_ref" % job)
+        else:
+            expression = ref.group(1)
+            if "github.event.pull_request.head.sha" not in expression:
+                problems.append("%s:ref_missing_pr_head_sha" % job)
+            if "github.sha" not in expression:
+                problems.append("%s:ref_missing_dispatch_sha" % job)
+            if "merge_commit_sha" in expression or "/merge" in expression:
+                problems.append("%s:ref_uses_merge_ref" % job)
+        if EXACT_HEAD_STEP_NAME not in block:
+            problems.append("%s:missing_exact_head_assertion" % job)
+            continue
+        assertion_at = block.index(EXACT_HEAD_STEP_NAME)
+        assertion_step = block[assertion_at:].split("\n      - ", 1)[0]
+        if "merge_commit_sha" in assertion_step:
+            problems.append("%s:assertion_uses_merge_sha" % job)
+        if "github.event.pull_request.head.sha" not in assertion_step:
+            problems.append("%s:assertion_missing_pr_head_sha" % job)
+        if "continue-on-error" in assertion_step:
+            problems.append("%s:assertion_continue_on_error" % job)
+        if "rev-parse HEAD" not in assertion_step:
+            problems.append("%s:assertion_does_not_read_head" % job)
+        for later in ("PowerShell parse check", "python -m unittest", "_run_ci_full_suite"):
+            position = block.find(later)
+            if position != -1 and position < assertion_at:
+                problems.append("%s:assertion_runs_after_work" % job)
+    return sorted(set(problems))
 
 
 def glob_to_regex(pattern):
@@ -592,13 +770,75 @@ class ExpiryProbeStaticTests(unittest.TestCase):
         self.assertNotIn("CreateDirectory", self.lib)
 
     def test_trusted_root_validation_precedes_all_live_access(self):
-        trust_idx = self.script.index("Test-ExpiryProbeTrustedStateRoot")
+        # The lease performs the trusted-root validation (it reuses the same validator), so
+        # acquiring it is the single point that gates every live access.
+        trust_idx = self.script.index("New-ExpiryProbeTrustedRootLease")
         self.assertLess(trust_idx, self.script.index("LoadFrom"))
         self.assertLess(trust_idx, self.script.index("$authenticateMethod.Invoke"))
         self.assertLess(trust_idx, self.script.index("$result.autocount_contacted = $true"))
         self.assertLess(trust_idx, self.script.index("$getMemberMethod.Invoke"))
         # Path derivation, and therefore any filesystem use of the root, happens after it.
         self.assertLess(trust_idx, self.script.index("Get-ExpiryProbeStatePaths"))
+        # The lease is the only caller of the validator from the executable path.
+        self.assertIn("Test-ExpiryProbeTrustedStateRoot", self.lib)
+        self.assertNotIn("Test-ExpiryProbeTrustedStateRoot", self.script)
+
+    # ---- A2-2: the trusted-root lease must span the whole irreversible operation ---- #
+    def test_lease_is_acquired_before_any_live_access(self):
+        acquire = self.script.index("New-ExpiryProbeTrustedRootLease")
+        for later in ("LoadFrom", "$authenticateMethod.Invoke",
+                      "$result.autocount_contacted = $true", "$getMemberMethod.Invoke",
+                      "New-ExpiryProbeDurableArtifact -Path $claimPath",
+                      "Invoke-ExpiryProbeSaveMemberOnce -SaveMemberMethod"):
+            self.assertLess(acquire, self.script.index(later), later)
+
+    def test_lease_is_released_only_after_terminal_evidence_handling(self):
+        release = self.script.index("Close-ExpiryProbeTrustedRootLease")
+        # Exactly one disposal site, and it is in the outer cleanup path.
+        self.assertEqual(self.script.count("Close-ExpiryProbeTrustedRootLease"), 1)
+        for earlier in ("Invoke-ExpiryProbeSaveMemberOnce -SaveMemberMethod",
+                        "New-ExpiryProbeDurableArtifact -Path $claimPath",
+                        "$result.expiry_match ="):
+            self.assertLess(self.script.index(earlier), release, earlier)
+        # The disposal must sit in the outer finally, after final publication is adjudicated,
+        # so no early release can precede the irreversible boundary.
+        publish = self.script.index("Complete-ExpiryProbeRun -DurableEvidence:$stateReady")
+        self.assertLess(publish, release,
+                        "the lease must outlive result publication and publication-failure handling")
+        tail = self.script[publish:]
+        self.assertRegex(tail, r"(?s)finally\s*\{[^}]*Close-ExpiryProbeTrustedRootLease")
+
+    def test_no_lease_or_root_override_reaches_the_executable_script(self):
+        self.assertIn("New-ExpiryProbeTrustedRootLease -Root $script:ExpiryProbeStateRoot", self.script)
+        self.assertEqual(self.script.count("New-ExpiryProbeTrustedRootLease"), 1)
+        for override in ("$Lease", "-Lease $", "LeaseRoot", "StateRoot ="):
+            if override == "-Lease $":
+                continue
+            self.assertNotIn("[string]$" + override.strip("$"), self.script, override)
+        # The lease helper is reachable only with the fixed canonical root.
+        self.assertNotRegex(self.script, r"New-ExpiryProbeTrustedRootLease\s+-Root\s+(?!\$script:ExpiryProbeStateRoot)")
+
+    def test_lease_uses_windows_handles_without_delete_sharing(self):
+        for token in ("FILE_FLAG_BACKUP_SEMANTICS", "FILE_FLAG_OPEN_REPARSE_POINT",
+                      "FILE_SHARE_READ", "FILE_SHARE_WRITE", "GetFileInformationByHandle",
+                      "CreateFileW", "SafeFileHandle"):
+            self.assertIn(token, self.lib, token)
+        # Delete sharing must never be GRANTED: that is what pins the namespace. Comments may
+        # explain its absence, so only executable lines are inspected.
+        code_lines = [line for line in self.lib.splitlines()
+                      if not line.lstrip().startswith(("#", "//"))]
+        code = "\n".join(code_lines)
+        self.assertNotIn("FILE_SHARE_DELETE", code)
+        self.assertNotIn("0x00000004", code)
+        self.assertIn("FILE_SHARE_READ | FILE_SHARE_WRITE,", code)
+        # Handles are retained and disposed in reverse order, never re-opened per use.
+        self.assertIn("function New-ExpiryProbeTrustedRootLease", self.lib)
+        self.assertIn("function Close-ExpiryProbeTrustedRootLease", self.lib)
+        self.assertRegex(self.lib, r"(?i)reverse order")
+        # Nothing in the lease creates or repairs a component.
+        lease_source = self.lib[self.lib.index("function New-ExpiryProbeTrustedRootLease"):]
+        for forbidden in ("New-Item", "CreateDirectory", "Remove-Item", "Delete("):
+            self.assertNotIn(forbidden, lease_source, forbidden)
 
     def test_trusted_root_validation_fails_closed_on_every_condition(self):
         for reason in ("platform_not_windows", "root_not_absolute", "root_unresolvable",
@@ -1187,7 +1427,7 @@ class ExpiryProbeLibraryTests(unittest.TestCase):
         self.assertEqual(created.count(True), 1, "exactly one contender may create the canonical claim")
         self.assertEqual(created.count(False), 1, "the loser must fail closed")
         self.assertTrue(claim.is_file())
-        self.assertEqual(claim.read_text(encoding="utf-8").strip(), "contender")
+        self.assertEqual(read_scratch_text(claim).strip(), "contender")
 
     # ---- Publication ---- #
     def _record_file(self, name, record):
@@ -1304,6 +1544,338 @@ class ExpiryProbeLibraryTests(unittest.TestCase):
         verdict = self._json("authoritative", Text=str(final), CtxJson=str(path))
         self.assertFalse(verdict["authoritative"])
         self.assertIn("exit_code_inconsistent", as_list(verdict["reasons"]))
+
+    # ---- A2-1: authority must be derived from runtime facts, never from declarations ---- #
+    def _reject(self, operation_id, name, mutate):
+        """Build a record from the consistent verified template, mutate it, expect rejection."""
+        record = verified_record(operation_id)
+        mutate(record)
+        path = self._record_file(name, record)
+        final = self.tmp / ("expiry_probe_result_%s.json" % operation_id)
+        verdict = self._json("authoritative", Text=str(final), CtxJson=str(path))
+        self.assertFalse(verdict["authoritative"],
+                         "%s must not validate as authoritative" % name)
+        return as_list(verdict["reasons"])
+
+    def test_fabricated_all_default_verified_record_is_rejected(self):
+        # The core A2-1 case: every runtime flag is false/default, yet the record declares a
+        # durably persisted EXPIRY_VERIFIED with exit 0. Deriving the outcome from the flags
+        # yields FAILED_BEFORE_WRITE (or REFUSED), so the declaration cannot be trusted.
+        operation_id = "expop_fabricated01"
+        final_basename = "expiry_probe_result_%s.json" % operation_id
+        fabricated = {
+            "schema_version": SCHEMA_VERSION,
+            "operation_id": operation_id,
+            "result_basename": final_basename,
+            "staging_basename": "expiry_probe_staging_%s.incomplete" % operation_id,
+            "publication_contract": {
+                "publication_contract_version": PUBLICATION_CONTRACT_VERSION,
+                "authoritative_result_basename": final_basename,
+                "authority_rule": "authoritative only when the current basename equals authoritative_result_basename",
+            },
+            "activated": True,
+            "autocount_contacted": False,
+            "initial_member_read_attempted": False,
+            "member_recheck_attempted": False,
+            "member_exists_initial": False,
+            "member_exists_recheck": False,
+            "claim_created": False,
+            "claim_conflict": False,
+            "claim_lost_after_contact": False,
+            "claim_persist_failed": False,
+            "claim_root_unavailable": False,
+            "save_member_attempted": False,
+            "save_member_confirmed": False,
+            "save_outcome": "not_attempted",
+            "readback_found": False,
+            "expiry_match": False,
+            # The lie:
+            "underlying_terminal_outcome": "EXPIRY_VERIFIED",
+            "terminal_outcome": "EXPIRY_VERIFIED",
+            "evidence_persisted": True,
+            "exit_code": 0,
+        }
+        path = self._record_file("validator_fabricated.json", fabricated)
+        final = self.tmp / final_basename
+        verdict = self._json("authoritative", Text=str(final), CtxJson=str(path))
+        self.assertFalse(verdict["authoritative"],
+                         "a record whose flags show no contact, claim or save must never be authoritative")
+        reasons = as_list(verdict["reasons"])
+        self.assertIn("underlying_outcome_not_derived_from_flags", reasons)
+        self.assertIn("verified_without_required_runtime_state", reasons)
+
+    def test_save_success_without_a_created_claim_is_rejected(self):
+        reasons = self._reject("expop_noclaim01", "validator_noclaim.json",
+                               lambda r: r.__setitem__("claim_created", False))
+        self.assertIn("save_attempted_without_claim", reasons)
+
+    def test_save_confirmation_without_a_save_attempt_is_rejected(self):
+        reasons = self._reject("expop_noattempt01", "validator_noattempt.json",
+                               lambda r: r.__setitem__("save_member_attempted", False))
+        self.assertIn("state_contradiction", reasons)
+
+    def test_readback_success_without_a_confirmed_save_is_rejected(self):
+        def mutate(record):
+            record["save_member_confirmed"] = False
+            record["save_outcome"] = "uncertain"
+        reasons = self._reject("expop_norbsave01", "validator_norbsave.json", mutate)
+        self.assertIn("state_contradiction", reasons)
+
+    def test_expiry_match_without_a_found_readback_is_rejected(self):
+        reasons = self._reject("expop_nomatchrb01", "validator_nomatchrb.json",
+                               lambda r: r.__setitem__("readback_found", False))
+        self.assertTrue(reasons)
+        self.assertTrue({"state_contradiction", "underlying_outcome_not_derived_from_flags"} & set(reasons),
+                        reasons)
+
+    def test_every_declared_underlying_outcome_must_match_the_flag_derivation(self):
+        # The flags always describe a verified run; each declared underlying outcome other
+        # than the derived one must be rejected.
+        for index, code in enumerate(c for c in TERMINAL_CODES if c != "EXPIRY_VERIFIED"):
+            operation_id = "expop_underlying%02d" % index
+            reasons = self._reject(operation_id, "validator_underlying_%s.json" % code,
+                                   lambda r, c=code: r.__setitem__("underlying_terminal_outcome", c))
+            self.assertIn("underlying_outcome_not_derived_from_flags", reasons, code)
+
+    def test_every_declared_final_outcome_must_match_the_derived_final_outcome(self):
+        for index, code in enumerate(c for c in TERMINAL_CODES if c != "EXPIRY_VERIFIED"):
+            operation_id = "expop_final%02d" % index
+            reasons = self._reject(operation_id, "validator_final_%s.json" % code,
+                                   lambda r, c=code: r.__setitem__("terminal_outcome", c))
+            self.assertIn("terminal_outcome_inconsistent", reasons, code)
+
+    def test_final_outcome_must_account_for_recorded_persistence_state(self):
+        # evidence_persisted=false means the derived final outcome is
+        # EVIDENCE_PERSISTENCE_FAILED, so a declared EXPIRY_VERIFIED is inconsistent. The
+        # validator must use the RECORD's persistence fact, not assume it is true because the
+        # artefact reached the validator.
+        reasons = self._reject("expop_persist01", "validator_persist.json",
+                               lambda r: r.__setitem__("evidence_persisted", False))
+        self.assertIn("evidence_not_persisted", reasons)
+        self.assertIn("terminal_outcome_inconsistent", reasons)
+
+    def test_consistent_authoritative_verified_record_still_passes(self):
+        operation_id = "expop_stillgood01"
+        path = self._record_file("validator_stillgood.json", verified_record(operation_id))
+        final = self.tmp / ("expiry_probe_result_%s.json" % operation_id)
+        verdict = self._json("authoritative", Text=str(final), CtxJson=str(path))
+        self.assertTrue(verdict["authoritative"], "reasons=%s" % as_list(verdict["reasons"]))
+        self.assertEqual(as_list(verdict["reasons"]), [])
+
+
+@unittest.skipIf(PS is None, "no PowerShell executable available")
+class ExpiryProbeTrustedRootLeaseTests(unittest.TestCase):
+    """A2-2: the trusted state-root namespace must be PINNED, not merely re-validated.
+
+    Every test here operates on temporary directories only. Nothing opens, inspects or
+    modifies the real canonical root (asserted mechanically by
+    test_no_lease_test_targets_the_real_canonical_root).
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = Path(tempfile.mkdtemp())
+        cls.harness = cls.tmp / "leaseprobe.ps1"
+        cls.harness.write_text(LIBPROBE, encoding="utf-8")
+
+    def _cmd(self, op, **kw):
+        cmd = [PS, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+               "-File", str(self.harness), "-Lib", str(LIB), "-Op", op]
+        for k, v in kw.items():
+            cmd += ["-" + k, str(v)]
+        return cmd
+
+    def _json(self, op, **kw):
+        proc = subprocess.run(self._cmd(op, **kw), capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return json.loads(proc.stdout)
+
+    def _chain(self, name):
+        """<tmp>/<name>/outer/inner/state, every level a plain local directory."""
+        root = self.tmp / name / "outer" / "inner" / "state"
+        root.mkdir(parents=True, exist_ok=True)
+        return root
+
+    @staticmethod
+    def _rename_fails(target):
+        """True when an independent process (this one) cannot rename `target`."""
+        moved = target.parent / (target.name + "_moved")
+        try:
+            os.rename(str(target), str(moved))
+        except OSError:
+            return True
+        os.rename(str(moved), str(target))  # undo: the rename unexpectedly succeeded
+        return False
+
+    def _hold(self, root):
+        return subprocess.Popen(self._cmd("leasehold", Dir=str(root)),
+                                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True)
+
+    @unittest.skipUnless(IS_WINDOWS, "the production lease path is Windows-only")
+    def test_lease_acquires_over_a_temporary_directory_chain(self):
+        root = self._chain("acquirechain")
+        info = self._json("leaseacquire", Dir=str(root), Text="1")
+        self.assertTrue(info["acquired"], "reasons=%s" % as_list(info["reasons"]))
+        self.assertEqual(as_list(info["reasons"]), [])
+        # One retained handle and one recorded identity per existing component, volume root
+        # through leaf.
+        self.assertGreaterEqual(info["componentCount"], 4)
+        self.assertEqual(info["heldCount"], info["componentCount"])
+        self.assertEqual(info["identityCount"], info["componentCount"])
+
+    @unittest.skipUnless(IS_WINDOWS, "real share-mode semantics are Windows-only")
+    def test_lease_blocks_root_and_ancestor_rename_until_released(self):
+        root = self._chain("holdchain")
+        marker = root / "identity.marker"
+        marker.write_text("pinned-namespace", encoding="utf-8")
+        inner, outer = root.parent, root.parent.parent
+        proc = self._hold(root)
+        try:
+            line = proc.stdout.readline().strip()
+            self.assertTrue(line.startswith("ACQUIRED|True|"),
+                            "lease not acquired: %s %s" % (line, proc.stderr.read() if proc.poll() else ""))
+            self.assertTrue(line.endswith("|%d" % int(line.rsplit("|", 1)[1])))
+            # While the lease is held, an INDEPENDENT process cannot rename the root...
+            self.assertTrue(self._rename_fails(root), "the leased root must not be renameable")
+            # ...nor any mutable ancestor in the leased chain.
+            self.assertTrue(self._rename_fails(inner), "a leased ancestor must not be renameable")
+            self.assertTrue(self._rename_fails(outer), "a leased ancestor must not be renameable")
+            # The canonical path therefore still resolves to the SAME directory: no second
+            # backing claim namespace can be swapped in underneath the running probe.
+            self.assertTrue(marker.is_file())
+            self.assertEqual(read_scratch_text(marker), "pinned-namespace")
+
+            proc.stdin.write("release\n")
+            proc.stdin.flush()
+            released = proc.stdout.readline().strip()
+            self.assertTrue(released.startswith("RELEASED"), released)
+            # After disposal the very same rename succeeds, proving the block came from the
+            # retained handles and not from some unrelated condition.
+            moved = root.parent / (root.name + "_after_release")
+            os.rename(str(root), str(moved))
+            self.assertTrue(moved.is_dir())
+            os.rename(str(moved), str(root))
+        finally:
+            try:
+                proc.stdin.write("exit\n")
+                proc.stdin.flush()
+            except (OSError, ValueError):
+                pass
+            try:
+                proc.communicate(timeout=30)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.communicate()
+
+    @unittest.skipUnless(IS_WINDOWS, "real share-mode semantics are Windows-only")
+    def test_lease_prevents_replacement_creating_a_second_claim_namespace(self):
+        root = self._chain("replacechain")
+        (root / "original.marker").write_text("original", encoding="utf-8")
+        replacement = self.tmp / "replacement_namespace"
+        replacement.mkdir(exist_ok=True)
+        (replacement / "attacker.marker").write_text("attacker", encoding="utf-8")
+        proc = self._hold(root)
+        try:
+            line = proc.stdout.readline().strip()
+            self.assertTrue(line.startswith("ACQUIRED|True|"), line)
+            # A replacement needs the leased directory out of the way first; that step fails,
+            # so the swap can never complete.
+            self.assertTrue(self._rename_fails(root))
+            with self.assertRaises(OSError):
+                os.rename(str(replacement), str(root))
+            # The canonical path still backs exactly one namespace: the original one.
+            self.assertTrue((root / "original.marker").is_file())
+            self.assertFalse((root / "attacker.marker").exists())
+            self.assertTrue((replacement / "attacker.marker").is_file())
+            # And only one exclusive claim can exist in that single namespace.
+            claim = root / "expiry_probe_claim_afp_pinned.claim"
+            first = self._json("claimrace", Text=str(claim))
+            second = self._json("claimrace", Text=str(claim))
+            self.assertTrue(first["created"])
+            self.assertFalse(second["created"],
+                             "a second contender must remain ineligible for the save boundary")
+        finally:
+            try:
+                proc.stdin.write("release\n")
+                proc.stdin.flush()
+                proc.stdout.readline()
+                proc.stdin.write("exit\n")
+                proc.stdin.flush()
+                proc.communicate(timeout=30)
+            except (OSError, ValueError, subprocess.TimeoutExpired):
+                proc.kill()
+                proc.communicate()
+
+    @unittest.skipUnless(IS_WINDOWS, "partial-acquisition handle release is Windows-specific")
+    def test_partial_acquisition_releases_already_opened_handles(self):
+        chain = self._chain("partialchain")
+        missing = chain / "absent_leaf"
+        self.assertFalse(missing.exists())
+        proc = self._hold(missing)
+        try:
+            line = proc.stdout.readline().strip()
+            self.assertTrue(line.startswith("ACQUIRED|False|"), line)
+            self.assertIn("root_missing", line)
+            self.assertTrue(line.endswith("|0"), "every partially acquired handle must be disposed: %s" % line)
+            # Because the partial handles were released, the ancestors are renameable again.
+            self.assertFalse(self._rename_fails(chain),
+                             "a failed acquisition must not leave the chain pinned")
+        finally:
+            try:
+                proc.stdin.write("release\n")
+                proc.stdin.flush()
+                proc.stdout.readline()
+                proc.stdin.write("exit\n")
+                proc.stdin.flush()
+                proc.communicate(timeout=30)
+            except (OSError, ValueError, subprocess.TimeoutExpired):
+                proc.kill()
+                proc.communicate()
+
+    def test_lease_rejects_a_missing_or_non_directory_root(self):
+        missing = self.tmp / "no_such_lease_root"
+        info = self._json("leaseacquire", Dir=str(missing), Text="0" if not IS_WINDOWS else "1")
+        self.assertFalse(info["acquired"])
+        self.assertEqual(info["heldCount"], 0)
+        expected = "platform_not_windows" if not IS_WINDOWS else "root_missing"
+        self.assertIn(expected, as_list(info["reasons"]))
+
+    @unittest.skipIf(IS_WINDOWS, "non-Windows fail-closed behaviour")
+    def test_lease_fails_closed_off_windows_without_invoking_windows_apis(self):
+        root = self._chain("posixchain")
+        info = self._json("leaseacquire", Dir=str(root), Text="1")
+        self.assertFalse(info["acquired"],
+                         "the active probe path must fail closed off Windows, not skip the contract")
+        self.assertEqual(as_list(info["reasons"]), ["platform_not_windows"])
+        self.assertEqual(info["heldCount"], 0)
+        # The platform gate must precede any native interop in the library source.
+        lib = LIB.read_text(encoding="utf-8")
+        self.assertLess(lib.index("platform_not_windows"), lib.index("Add-Type"),
+                        "the Windows-only gate must precede native interop")
+
+    def test_no_lease_test_targets_the_real_canonical_root(self):
+        # Mechanical guarantee that no lease/trust/harness invocation in this module can be
+        # pointed at the operator's real evidence root. This guard's own body necessarily
+        # names the forbidden shapes, so it is excluded from the scan.
+        guard_name = "def test_no_lease_test_targets_the_real_canonical_root"
+        lines = read_repo_text("focused_tests").splitlines()
+        start = next(i for i, line in enumerate(lines) if guard_name in line)
+        end = start + 1
+        while end < len(lines) and (not lines[end].strip() or lines[end].startswith("        ")):
+            end += 1
+        scanned = lines[:start] + lines[end:]
+        self.assertLess(start, end, "the guard body must be locatable")
+        for line in scanned:
+            if re.search(r"\b(Dir|_hold)\s*[=(]", line):
+                self.assertNotIn(CANONICAL_STATE_ROOT, line, line)
+                self.assertNotIn("CANONICAL_STATE_ROOT", line, line)
+        # The canonical root is referenced only as a constant, a static expectation and the
+        # skip guard: never as a filesystem target opened by a test.
+        joined = "\n".join(scanned)
+        for forbidden in ("Path(CANONICAL_STATE_ROOT)", "mkdir(CANONICAL_STATE_ROOT",
+                          "New-ExpiryProbeTrustedRootLease -Root " + CANONICAL_STATE_ROOT):
+            self.assertNotIn(forbidden, joined, forbidden)
 
 
 @unittest.skipIf(PS is None, "no PowerShell executable available")
@@ -1599,7 +2171,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
         self.assertRegex(bullet, r"exit `0` only for an authoritative `EXPIRY_VERIFIED`")
 
     def test_readme_remains_in_the_mechanical_dependency_inventory(self):
-        self.assertIn("README.md", module_repo_dependencies(SELF))
+        self.assertIn("README.md", registered_dependencies())
 
     def test_readme_remains_covered_by_every_workflow_path_filter(self):
         filters = workflow_path_filters(self.workflow)
@@ -1620,7 +2192,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
 
     # ---- Mechanical focused-CI dependency closure ---- #
     def test_dependency_inventory_covers_every_known_contract_file(self):
-        inventory = module_repo_dependencies(SELF)
+        inventory = registered_dependencies()
         for required in (".gitignore",
                          ".github/workflows/member-create-uat-tests.yml",
                          "tests/test_ac2_member_expiry_capability_probe.py",
@@ -1636,11 +2208,76 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
         self.assertTrue(filters, "the focused workflow must declare at least one path filter")
         # paths-ignore would invert the semantics this closure relies on.
         self.assertNotIn("paths-ignore", self.workflow)
-        inventory = module_repo_dependencies(SELF)
+        inventory = registered_dependencies()
         for event, patterns in filters.items():
             missing = uncovered_dependencies(inventory, patterns)
             self.assertEqual(missing, [],
                              "event '%s' does not trigger for: %s" % (event, missing))
+
+    # ---- A2-3: the closed contract must be fail-closed, not best-effort ---- #
+    def test_module_performs_no_repository_read_outside_the_closed_registry(self):
+        violations = repository_read_violations(read_repo_text("focused_tests"))
+        self.assertEqual(violations, [],
+                         "every repository read must resolve through repo_path/read_repo_text")
+
+    def test_ast_guard_rejects_every_escaping_repository_read_form(self):
+        header = "from pathlib import Path\nROOT = Path(__file__).resolve().parents[1]\n"
+        fixtures = {
+            "joinpath": (header + 'X = ROOT.joinpath("new-contract.md").read_text()\n',
+                         "root_joinpath"),
+            "path_constructor": (header + 'X = Path(ROOT, "new-contract.md").read_text()\n',
+                                 "path_constructor_from_root"),
+            "variable_path": (header + 'name = "new-contract.md"\nX = (ROOT / name).read_text()\n',
+                              "root_path_derivation"),
+            "helper_returned": (header + 'def helper(n):\n    return ROOT / n\n'
+                                         'X = helper("new-contract.md").read_text()\n',
+                                "unresolved_repository_read"),
+            "dynamic_key": (header + 'key = "readme"\nX = read_repo_text(key)\n',
+                            "dynamic_dependency_key"),
+            "unregistered_key": (header + 'X = read_repo_text("not_registered")\n',
+                                 "unregistered_dependency_key"),
+            "builtin_open": (header + 'X = open(str(ROOT) + "/new-contract.md").read()\n',
+                             "builtin_open"),
+        }
+        for name, (source, expected) in fixtures.items():
+            violations = repository_read_violations(source)
+            self.assertTrue(violations, "%s must not be silently ignored" % name)
+            self.assertTrue(any(v.endswith(expected) for v in violations),
+                            "%s: expected %s, got %s" % (name, expected, violations))
+
+    def test_ast_guard_is_independent_of_the_registry_contents(self):
+        # Even a REGISTERED file read through an escaping form must fail: the guard checks the
+        # shape of the read expression, so closure cannot pass merely because the expected and
+        # actual inventories came from the same incomplete resolver.
+        header = "from pathlib import Path\nROOT = Path(__file__).resolve().parents[1]\n"
+        violations = repository_read_violations(header + 'X = ROOT.joinpath("README.md").read_text()\n')
+        self.assertTrue(any(v.endswith("root_joinpath") for v in violations), violations)
+        self.assertTrue(any(v.endswith("unresolved_repository_read") for v in violations), violations)
+        # The sanctioned form for the same registered file is accepted.
+        self.assertEqual(repository_read_violations(header + 'X = read_repo_text("readme")\n'), [])
+
+    def test_registry_is_immutable(self):
+        with self.assertRaises(TypeError):
+            REPO_DEPENDENCIES["injected"] = "somewhere/else.md"
+
+    def test_unregistered_dependency_key_fails_closed_at_runtime(self):
+        # Called through an alias on purpose: a literal repo_path("<unregistered>") is itself
+        # a guard violation, and this negative self-test performs no read. The guard still
+        # catches the dangerous case, because reading from an alias-returned path is an
+        # unresolved_repository_read.
+        resolver = repo_path
+        self.assertNotIn("definitely_not_registered", REPO_DEPENDENCIES)
+        with self.assertRaises(KeyError):
+            resolver("definitely_not_registered")
+
+    def test_a_newly_registered_dependency_must_also_enter_the_workflow_filter(self):
+        # Closure in the other direction: a registry entry with no matching path pattern is
+        # reported, so adding a dependency without wiring CI cannot pass.
+        filters = workflow_path_filters(self.workflow)
+        self.assertTrue(filters)
+        new_dependency = "docs/autocount2-automation/new-contract.md"
+        for patterns in filters.values():
+            self.assertEqual(uncovered_dependencies({new_dependency}, patterns), [new_dependency])
 
     def test_closure_assertion_fails_when_a_required_path_is_dropped(self):
         # Negative control: the closure check must actually bite. Removing one required
@@ -1650,9 +2287,67 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
         self.assertNotEqual(fixture, self.workflow, "the fixture must differ from the real workflow")
         filters = workflow_path_filters(fixture)
         self.assertTrue(filters)
-        inventory = module_repo_dependencies(SELF)
+        inventory = registered_dependencies()
         for patterns in filters.values():
             self.assertIn(".gitignore", uncovered_dependencies(inventory, patterns))
+
+    # ---- A2-4: literal exact-head CI checkout ---- #
+    def test_both_jobs_check_out_the_literal_exact_head(self):
+        self.assertEqual(checkout_head_binding_problems(self.workflow), [])
+        blocks = workflow_job_blocks(self.workflow)
+        self.assertEqual(sorted(blocks), ["ubuntu-focused", "windows-full-suite"])
+
+    def test_checkout_ref_resolves_pr_head_for_pull_request_and_github_sha_otherwise(self):
+        for job, block in workflow_job_blocks(self.workflow).items():
+            checkout_step = block.split("actions/checkout@", 1)[1].split("\n      - ", 1)[0]
+            ref = re.search(r"^\s*ref:\s*(.+)$", checkout_step, re.M)
+            self.assertIsNotNone(ref, job)
+            expression = ref.group(1)
+            # One expression that selects the PR head on pull_request and github.sha on
+            # workflow_dispatch, where the pull_request context is empty.
+            self.assertIn("github.event.pull_request.head.sha", expression, job)
+            self.assertIn("github.sha", expression, job)
+            self.assertNotIn("merge_commit_sha", expression, job)
+
+    def test_exact_head_assertion_is_required_and_precedes_all_work(self):
+        for job, block in workflow_job_blocks(self.workflow).items():
+            self.assertIn(EXACT_HEAD_STEP_NAME, block, job)
+            assertion_at = block.index(EXACT_HEAD_STEP_NAME)
+            for later in ("PowerShell parse check", "python -m unittest", "_run_ci_full_suite"):
+                position = block.find(later)
+                if position != -1:
+                    self.assertLess(assertion_at, position, "%s: %s" % (job, later))
+            assertion_step = block[assertion_at:].split("\n      - ", 1)[0]
+            self.assertNotIn("continue-on-error", assertion_step, job)
+            self.assertIn("rev-parse HEAD", assertion_step, job)
+            # It reports the two SHAs and nothing else; no environment dump.
+            for dump in ("env |", "Get-ChildItem Env:", "printenv", "${{ toJSON("):
+                self.assertNotIn(dump, assertion_step, job)
+
+    def test_default_unqualified_checkout_fixture_fails(self):
+        fixture = "\n".join(line for line in self.workflow.splitlines()
+                            if not re.match(r"^\s*ref:\s*\$\{\{", line))
+        self.assertNotEqual(fixture, self.workflow)
+        problems = checkout_head_binding_problems(fixture)
+        self.assertTrue(any(p.endswith("checkout_without_explicit_ref") for p in problems), problems)
+
+    def test_merge_sha_assertion_fixture_fails(self):
+        fixture = self.workflow.replace("github.event.pull_request.head.sha",
+                                        "github.event.pull_request.merge_commit_sha")
+        self.assertNotEqual(fixture, self.workflow)
+        problems = checkout_head_binding_problems(fixture)
+        self.assertTrue(any("merge" in p for p in problems), problems)
+
+    def test_missing_or_masked_assertion_fixtures_fail(self):
+        removed = self.workflow.replace(EXACT_HEAD_STEP_NAME, "Unrelated step name")
+        self.assertTrue(any(p.endswith("missing_exact_head_assertion")
+                            for p in checkout_head_binding_problems(removed)))
+        masked = self.workflow.replace('name: %s' % EXACT_HEAD_STEP_NAME,
+                                       'name: %s\n        continue-on-error: true' % EXACT_HEAD_STEP_NAME)
+        self.assertNotEqual(masked, self.workflow)
+        self.assertTrue(any(p.endswith("assertion_continue_on_error")
+                            for p in checkout_head_binding_problems(masked)),
+                        checkout_head_binding_problems(masked))
 
     def test_glob_matcher_respects_separator_boundaries(self):
         self.assertTrue(glob_to_regex("tests/test_member_create_uat_*.py").match("tests/test_member_create_uat_x.py"))
@@ -1690,11 +2385,13 @@ class ExpiryProbeAstTests(unittest.TestCase):
             for fragment in ("statedir", "stateroot", "claimdir", "claimroot", "resultdir",
                              "resultpath", "jsonout", "outfile", "outpath", "evidence", "staging"):
                 self.assertNotIn(fragment, lowered, name)
-        # The library's injectable helpers are never bound to a script parameter.
-        script_text = SCRIPT.read_text(encoding="utf-8")
-        self.assertIn("Test-ExpiryProbeTrustedStateRoot -Root $script:ExpiryProbeStateRoot", script_text)
-        self.assertEqual(script_text.count("Test-ExpiryProbeTrustedStateRoot"), 1)
+        # The library's injectable helpers are never bound to a script parameter: every
+        # -Root argument in the executable path is the fixed canonical root.
+        script_text = read_repo_text("probe_script")
+        self.assertIn("New-ExpiryProbeTrustedRootLease -Root $script:ExpiryProbeStateRoot", script_text)
+        self.assertEqual(script_text.count("New-ExpiryProbeTrustedRootLease"), 1)
         self.assertEqual(script_text.count("-Root $script:ExpiryProbeStateRoot"), 2)
+        self.assertEqual(script_text.count("-Root "), 2)
         self.assertNotIn("-MoveAction", script_text)
 
     def test_single_gated_save_never_in_a_loop(self):

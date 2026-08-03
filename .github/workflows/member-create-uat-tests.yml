@@ -42,7 +42,24 @@ jobs:
   windows-full-suite:
     runs-on: windows-latest
     steps:
+      # Check out the LITERAL head commit, never the synthetic pull-request merge ref, so the
+      # tree under test is exactly the reviewed commit. On workflow_dispatch the pull_request
+      # context is empty and this falls back to github.sha.
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Assert literal exact-head checkout
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          ACTUAL_SHA="$(git rev-parse HEAD)"
+          echo "expected: ${EXPECTED_SHA}"
+          echo "actual:   ${ACTUAL_SHA}"
+          if [ "${ACTUAL_SHA}" != "${EXPECTED_SHA}" ]; then
+            echo "checked-out commit is not the literal event head"
+            exit 1
+          fi
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -84,7 +101,22 @@ jobs:
   ubuntu-focused:
     runs-on: ubuntu-latest
     steps:
+      # Same literal-head binding as the Windows job: never the merge ref.
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Assert literal exact-head checkout
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          ACTUAL_SHA="$(git rev-parse HEAD)"
+          echo "expected: ${EXPECTED_SHA}"
+          echo "actual:   ${ACTUAL_SHA}"
+          if [ "${ACTUAL_SHA}" != "${EXPECTED_SHA}" ]; then
+            echo "checked-out commit is not the literal event head"
+            exit 1
+          fi
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"

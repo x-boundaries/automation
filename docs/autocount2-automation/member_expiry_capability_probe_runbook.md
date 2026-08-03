@@ -44,6 +44,18 @@ before the real single-member creation UAT enables it.
   (no junction, symbolic link or other reparse point, and no stat/access failure). Any
   failure is `CLAIM_ROOT_UNAVAILABLE`, nonzero, with no AutoCount contact and no artefact
   created. The active probe path is Windows-only and fails closed the same way elsewhere.
+- While the run is active the state root is **pinned, not merely checked**. Before any
+  assembly load or AutoCount contact the probe acquires a **trusted state-root lease**: a
+  Windows directory handle on every component from the volume root down to
+  `C:\XB\create_uat\expiry_probe_state`, opened parent-before-child with
+  `FILE_FLAG_BACKUP_SEMANTICS` and `FILE_FLAG_OPEN_REPARSE_POINT` and **without**
+  `FILE_SHARE_DELETE`. While those handles are held, no process can rename, delete or replace
+  the root or any leased ancestor, so the claim, `SaveMember`, read-back and result
+  publication cannot be redirected into a second backing namespace. The handles are released,
+  leaf first, only after the terminal evidence has been published or its publication failure
+  handled. A partial acquisition releases whatever it opened and fails closed as
+  `CLAIM_ROOT_UNAVAILABLE` with no AutoCount contact. Ordinary reads and writes inside the
+  directory are unaffected — only rename/delete/replace of the leased directories is blocked.
 - A launch that **loses the claim race after live AutoCount contact** (it authenticated and
   performed both duplicate reads, then found the claim taken) reports
   `ATTEMPT_CLAIM_LOST_AFTER_CONTACT`, never the pre-contact `ATTEMPT_ALREADY_CLAIMED`. The
@@ -76,6 +88,12 @@ occurs at this stage.
 ```bash
 python -m unittest tests.test_member_create_uat_contract tests.test_member_create_uat_runner_ps tests.test_ac2_member_expiry_capability_probe
 ```
+
+Hosted CI for these files checks out the **literal head commit** of the pull request
+(`github.event.pull_request.head.sha`, falling back to `github.sha` for a manual dispatch),
+never the synthetic merge ref, and each job asserts `git rev-parse HEAD` equals that SHA before
+any parse or test step runs. When recording review or deployment evidence, quote that asserted
+SHA: a green run proves the reviewed commit itself was tested, not a byte-equivalent merge tree.
 
 ### 2. Host pull of reviewed `origin/main`
 
