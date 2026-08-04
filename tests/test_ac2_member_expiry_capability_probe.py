@@ -356,7 +356,7 @@ def _namespace_mutation_keys(call, attribute):
     return None
 
 
-def _dynamic_namespace_findings(tree):
+def _dynamic_namespace_findings(tree, scope_index=None):
     """Statically identifiable dynamic-namespace routes into the sanctioned boundary.
 
     Returns ``(problems, compromised_helpers, dependencies_compromised)``. A literal mutation of
@@ -364,17 +364,32 @@ def _dynamic_namespace_findings(tree):
     whole boundary; an unresolved key, a dynamically selected namespace, an escaping namespace
     object and any ``exec``/``eval``/``compile`` use compromise everything, because their binding
     effects are not statically controlled.
+
+    A8-2: these routes are recognised by resolved BUILTIN AUTHORITY, not by the bare label. A
+    shadowed name (a local ``def compile(...)``) is not the builtin and must not be treated as
+    one; conversely an alias or capture of the real builtin is caught by
+    _protected_authority_findings, which fails the whole boundary closed.
     """
     problems = []
     compromised = set()
     state = {"dependencies": False}
     tracked = (set(SANCTIONED_READ_HELPERS) | set(CLOSED_DEPENDENCY_NAMES)
                | set(CLOSED_DEPENDENCY_IMPLICIT))
+    scope_of, scope_parent, bindings, _definitions = scope_index or _build_scope_index(tree)
 
     parents = {}
     for parent in ast.walk(tree):
         for child in ast.iter_child_nodes(parent):
             parents[id(child)] = parent
+
+    def is_builtin(node):
+        """True when this bare Name still refers to the builtin of that name."""
+        scope = scope_of.get(id(node), tree)
+        while scope is not None:
+            if node.id in bindings.get(id(scope), {}):
+                return False
+            scope = scope_parent.get(id(scope))
+        return True
 
     def compromise_name(name):
         if name in SANCTIONED_READ_HELPERS:
@@ -412,11 +427,13 @@ def _dynamic_namespace_findings(tree):
             return is_module_registry(node)
         if isinstance(node, ast.Call):
             func = node.func
-            if isinstance(func, ast.Name) and func.id in NAMESPACE_PRODUCERS:
+            if (isinstance(func, ast.Name) and func.id in NAMESPACE_PRODUCERS
+                    and is_builtin(func)):
                 return True
             if isinstance(func, ast.Attribute) and func.attr in NAMESPACE_PRODUCERS:
                 return True
-            if isinstance(func, ast.Name) and func.id == "getattr" and len(node.args) >= 2:
+            if (isinstance(func, ast.Name) and func.id == "getattr" and is_builtin(func)
+                    and len(node.args) >= 2):
                 attribute = node.args[1]
                 # Dynamic attribute selection of __dict__, or an unresolvable selection.
                 if not (isinstance(attribute, ast.Constant) and isinstance(attribute.value, str)):
@@ -428,12 +445,14 @@ def _dynamic_namespace_findings(tree):
     for node in ast.walk(tree):
         if isinstance(node, ast.Call):
             func = node.func
-            if ((isinstance(func, ast.Name) and func.id in DYNAMIC_EXECUTION_NAMES)
+            if ((isinstance(func, ast.Name) and func.id in DYNAMIC_EXECUTION_NAMES
+                 and is_builtin(func))
                     or (isinstance(func, ast.Attribute)
                         and func.attr in DYNAMIC_EXECUTION_ATTRS)):
                 compromise_everything("dynamic_namespace_binding")
                 continue
-            if isinstance(func, ast.Name) and func.id in ("setattr", "delattr"):
+            if (isinstance(func, ast.Name) and func.id in ("setattr", "delattr")
+                    and is_builtin(func)):
                 arguments = list(node.args)
                 if arguments:
                     handled.add(id(arguments[0]))
@@ -616,6 +635,384 @@ def _default_resolver(definition, scope_of, scope_parent, bindings, tree):
         return False
 
     return resolve, is_shadowed
+
+
+def _resolve_call_definitions(node, scope_of, scope_parent, bindings, definitions, tree):
+    """(definitions, ambiguous) for a direct Name call, resolved lexically.
+
+    Only a unique statically visible definition in the innermost scope that binds the name is a
+    candidate. A name with no visible definition (an import or an unknown) resolves to no
+    candidate and keeps its existing unresolved treatment; a name that is ALSO bound another way,
+    or bound to more than one definition, is ambiguous and must not inherit a trusted summary.
+    """
+    func = node.func
+    if not isinstance(func, ast.Name):
+        return [], False
+    scope = scope_of.get(id(node), tree)
+    immediate = True
+    while scope is not None:
+        records = bindings.get(id(scope), {}).get(func.id)
+        if records and not (isinstance(scope, ast.ClassDef) and not immediate):
+            candidates = definitions.get(id(scope), {}).get(func.id, [])
+            if not candidates:
+                return [], False
+            return candidates, len(records) > len(candidates) or len(candidates) > 1
+        scope = scope_parent.get(id(scope))
+        immediate = False
+    return [], False
+
+
+# ---- A8-1: the closed dependency OBJECTS, not merely their names ---- #
+# A7 pins the exact bindings of `types`, `Path`, `ROOT` and `REPO_DEPENDENCIES`. That is not
+# enough: the bound `pathlib.Path` class and `types` module can be monkey-patched
+# (`Path.resolve = replacement`, `types.MappingProxyType = replacement`) so the reviewed root
+# anchor, the immutable registry and the exact helper bodies mean something different at runtime,
+# while every tracked name and every declaration AST stays untouched.
+# The semantics the reviewed declarations and helper bodies actually depend on. The RULE is
+# broader than this set -- ANY attribute write, delete or unresolved mutation of the protected
+# objects fails closed -- but these are the ones the reviewed code would silently inherit.
+PROTECTED_PATH_SEMANTICS = frozenset({
+    "__new__", "__init__", "__truediv__", "resolve", "parent", "parents",
+    "read_text", "read_bytes", "open", "joinpath",
+})
+PROTECTED_TYPES_SEMANTICS = frozenset({"MappingProxyType"})
+
+# ---- A8-2: dangerous callable AUTHORITY, not merely dangerous names ---- #
+# The namespace producers and dynamic executors are only fail-closed while they are recognised.
+# An alias (`g = globals`), an import alias (`from builtins import exec as run`) or a captured
+# module attribute (`builtins.exec`) replaces a sanctioned helper without the literal-name
+# detector ever firing, and a later direct `read_repo_text("probe_script")` would keep authority.
+DANGEROUS_BUILTIN_NAMES = frozenset({
+    "globals", "locals", "vars", "exec", "eval", "compile", "setattr", "delattr"})
+BUILTINS_MODULE_NAMES = frozenset({"builtins", "__builtins__"})
+# Calls that hand back the namespace or an attribute OF their first argument, so protected-object
+# authority flows through them.
+AUTHORITY_FORWARDING_CALLS = frozenset({"vars", "getattr"})
+ATTRIBUTE_MUTATION_HELPERS = frozenset({"setattr", "delattr"})
+# `object.__setattr__(Path, ...)` / `type.__setattr__(Path, ...)` reach the class regardless of
+# any descriptor protection on it.
+ATTRIBUTE_MUTATION_DUNDERS = frozenset({"__setattr__", "__delattr__"})
+
+PATH_AUTHORITY = "path"
+TYPES_AUTHORITY = "types"
+BUILTINS_AUTHORITY = "builtins"
+DANGEROUS_AUTHORITY = "dangerous"
+PROTECTED_OBJECT_AUTHORITIES = frozenset({PATH_AUTHORITY, TYPES_AUTHORITY})
+REPORTABLE_AUTHORITIES = frozenset({PATH_AUTHORITY, TYPES_AUTHORITY, DANGEROUS_AUTHORITY})
+AUTHORITY_PREFIXES = {PATH_AUTHORITY: "Path", TYPES_AUTHORITY: "types",
+                      DANGEROUS_AUTHORITY: "builtin"}
+
+
+def _protected_authority_findings(tree, scope_index=None):
+    """Protected closed-dependency objects and dangerous builtin callable authority.
+
+    Authority is tracked as a PROVENANCE label rather than a name, so an alias, container,
+    wrapper return, default or captured module attribute carries it, and so a merely similar name
+    (a local `compile`, `re.compile`) does not. Returns ``(problems, broken)``; ``broken`` means
+    the complete dependency/helper boundary is compromised, and the caller must then withhold the
+    root anchor exemption, the exact helper-body exemptions, the registry-reader authority and the
+    direct literal `repo_path`/`read_repo_text` allowance.
+    """
+    problems = []
+    state = {"broken": False}
+    scope_of, scope_parent, bindings, definitions = scope_index or _build_scope_index(tree)
+    parents = {}
+    for parent in ast.walk(tree):
+        for child in ast.iter_child_nodes(parent):
+            parents[id(child)] = parent
+
+    def report(labels, category):
+        for authority in (PATH_AUTHORITY, TYPES_AUTHORITY, DANGEROUS_AUTHORITY):
+            if authority in labels:
+                problems.append("%s:%s" % (AUTHORITY_PREFIXES[authority], category))
+                break
+        state["broken"] = True
+
+    name_authorities = {}
+    definition_authorities = {}
+
+    def add_name(name, labels):
+        current = name_authorities.setdefault(name, set())
+        if labels <= current:
+            return False
+        current |= labels
+        return True
+
+    # ---- provenance seeds ---- #
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            if node.module == "pathlib":
+                for alias in node.names:
+                    if alias.name == "Path":
+                        add_name(alias.asname or "Path", {PATH_AUTHORITY})
+            elif node.module == "builtins":
+                for alias in node.names:
+                    if alias.name in DANGEROUS_BUILTIN_NAMES:
+                        add_name(alias.asname or alias.name, {DANGEROUS_AUTHORITY})
+                        report({DANGEROUS_AUTHORITY}, "dangerous_builtin_alias")
+                    elif alias.name == "*":
+                        # A star import cannot be resolved to a safe subset.
+                        report({DANGEROUS_AUTHORITY}, "dangerous_builtin_dynamic_selection")
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                root = alias.name.split(".")[0]
+                if root == "types":
+                    add_name(alias.asname or root, {TYPES_AUTHORITY})
+                elif root == "builtins":
+                    add_name(alias.asname or root, {BUILTINS_AUTHORITY})
+
+    def shadowed(node, name):
+        scope = scope_of.get(id(node), tree)
+        while scope is not None:
+            if name in bindings.get(id(scope), {}):
+                return True
+            scope = scope_parent.get(id(scope))
+        return False
+
+    def labels_of(node):
+        if node is None:
+            return set()
+        if isinstance(node, ast.Name):
+            labels = set(name_authorities.get(node.id, ()))
+            if node.id == "__builtins__":
+                labels.add(BUILTINS_AUTHORITY)
+            if node.id in DANGEROUS_BUILTIN_NAMES and not shadowed(node, node.id):
+                labels.add(DANGEROUS_AUTHORITY)
+            return labels
+        if isinstance(node, ast.Attribute):
+            base = labels_of(node.value)
+            if BUILTINS_AUTHORITY in base:
+                return {DANGEROUS_AUTHORITY} if node.attr in DANGEROUS_BUILTIN_NAMES else set()
+            if node.attr == "__dict__":
+                # The class or module namespace carries the same mutation authority.
+                return base & PROTECTED_OBJECT_AUTHORITIES
+            return set()
+        if isinstance(node, ast.Subscript):
+            base = labels_of(node.value)
+            if BUILTINS_AUTHORITY in base:
+                key = node.slice
+                if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                    return {DANGEROUS_AUTHORITY} if key.value in DANGEROUS_BUILTIN_NAMES else set()
+                return {DANGEROUS_AUTHORITY}          # unresolved selection: fail closed
+            return set(base)                          # recovered from a container
+        if isinstance(node, ast.Call):
+            func = node.func
+            if isinstance(func, ast.Name) and func.id in AUTHORITY_FORWARDING_CALLS:
+                forwarded = labels_of(node.args[0]) if node.args else set()
+                if func.id == "getattr" and BUILTINS_AUTHORITY in forwarded:
+                    attribute = node.args[1] if len(node.args) > 1 else None
+                    if isinstance(attribute, ast.Constant) and isinstance(attribute.value, str):
+                        return ({DANGEROUS_AUTHORITY}
+                                if attribute.value in DANGEROUS_BUILTIN_NAMES else set())
+                    return {DANGEROUS_AUTHORITY}
+                return set(forwarded)
+            candidates, _ambiguous = _resolve_call_definitions(
+                node, scope_of, scope_parent, bindings, definitions, tree)
+            labels = set()
+            for definition in candidates:
+                labels |= definition_authorities.get(id(definition), set())
+            return labels
+        if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+            labels = set()
+            for element in node.elts:
+                labels |= labels_of(element)
+            return labels
+        if isinstance(node, ast.Dict):
+            labels = set()
+            for key in node.keys:
+                labels |= labels_of(key)
+            for value in node.values:
+                labels |= labels_of(value)
+            return labels
+        if isinstance(node, ast.Starred):
+            return labels_of(node.value)
+        if isinstance(node, ast.IfExp):
+            return labels_of(node.body) | labels_of(node.orelse)
+        if isinstance(node, ast.NamedExpr):
+            return labels_of(node.value)
+        return set()
+
+    def scope_definitions_of(node):
+        return [scope for scope in ast.walk(node)
+                if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))]
+
+    # Finite fixpoint: aliases, destructuring, containers, wrapper returns, lambda returns and
+    # defaults all carry authority, so long chains resolve. Monotonic over finite label sets.
+    convergence_bound = sum(1 for _ in ast.walk(tree)) + 2
+    rounds = 0
+    while True:
+        rounds += 1
+        changed = False
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Assign, ast.AnnAssign, ast.NamedExpr)):
+                labels = labels_of(getattr(node, "value", None))
+                if labels:
+                    targets = (node.targets if isinstance(node, ast.Assign) else [node.target])
+                    for target in targets:
+                        for name in _target_names(target):
+                            changed = add_name(name, labels) or changed
+            elif isinstance(node, ast.Return):
+                owner = scope_of.get(id(node))
+                if isinstance(owner, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    labels = labels_of(node.value)
+                    if labels:
+                        current = definition_authorities.setdefault(id(owner), set())
+                        if not labels <= current:
+                            current |= labels
+                            changed = True
+            elif isinstance(node, ast.Lambda):
+                labels = labels_of(node.body)
+                if labels:
+                    current = definition_authorities.setdefault(id(node), set())
+                    if not labels <= current:
+                        current |= labels
+                        changed = True
+        for scope in scope_definitions_of(tree):
+            arguments = scope.args
+            positional = list(getattr(arguments, "posonlyargs", [])) + list(arguments.args)
+            defaults = list(arguments.defaults)
+            pairs = []
+            if defaults:
+                pairs.extend(zip(positional[len(positional) - len(defaults):], defaults))
+            pairs.extend((param, default)
+                         for param, default in zip(arguments.kwonlyargs, arguments.kw_defaults)
+                         if default is not None)
+            for param, default in pairs:
+                labels = labels_of(default)
+                if labels:
+                    changed = add_name(param.arg, labels) or changed
+        if not changed or rounds >= convergence_bound:
+            break
+
+    handled = set()
+
+    def mark(node):
+        for sub in ast.walk(node):
+            handled.add(id(sub))
+
+    def literal_string(node):
+        return isinstance(node, ast.Constant) and isinstance(node.value, str)
+
+    # ---- protected-object mutation routes ---- #
+    for node in ast.walk(tree):
+        targets = []
+        if isinstance(node, (ast.Assign, ast.Delete)):
+            targets = list(node.targets)
+        elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+            targets = [node.target]
+        for target in targets:
+            if not isinstance(target, (ast.Attribute, ast.Subscript)):
+                continue
+            labels = labels_of(target.value) & PROTECTED_OBJECT_AUTHORITIES
+            if not labels:
+                continue
+            mark(target)
+            if isinstance(target, ast.Attribute):
+                report(labels, "closed_dependency_object_mutation")
+            else:
+                report(labels, "closed_dependency_object_mutation"
+                       if literal_string(target.slice)
+                       else "closed_dependency_object_dynamic_mutation")
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        # `Path.__dict__.update(...)` / `vars(types).update(...)`
+        if isinstance(func, ast.Attribute) and func.attr in NAMESPACE_MUTATORS:
+            labels = labels_of(func.value) & PROTECTED_OBJECT_AUTHORITIES
+            if labels:
+                mark(func.value)
+                report(labels, "closed_dependency_object_mutation")
+                continue
+        mutating = False
+        if isinstance(func, ast.Name):
+            mutating = (func.id in ATTRIBUTE_MUTATION_HELPERS
+                        or DANGEROUS_AUTHORITY in labels_of(func))
+        elif isinstance(func, ast.Attribute):
+            mutating = func.attr in ATTRIBUTE_MUTATION_DUNDERS
+        if not mutating or not node.args:
+            continue
+        labels = labels_of(node.args[0]) & PROTECTED_OBJECT_AUTHORITIES
+        if not labels:
+            continue
+        mark(node.args[0])
+        attribute = node.args[1] if len(node.args) > 1 else None
+        report(labels, "closed_dependency_object_mutation" if literal_string(attribute)
+               else "closed_dependency_object_dynamic_mutation")
+
+    # ---- the canonical uses the reviewed declarations and helper bodies require ---- #
+    # A call cannot mutate its callee, so construction and the registry constructor stay allowed.
+    # Every OTHER appearance of protected or dangerous authority is an alias, an escape or a
+    # mutation route, and fails closed.
+    permitted = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Name):
+            labels = labels_of(func)
+            if PATH_AUTHORITY in labels:
+                permitted.add(id(func))
+            elif (DANGEROUS_AUTHORITY in labels and func.id in DANGEROUS_BUILTIN_NAMES
+                  and func.id not in name_authorities):
+                # The exact direct-callee form the dynamic-namespace checker already fails closed.
+                permitted.add(id(func))
+        elif (isinstance(func, ast.Attribute) and func.attr in PROTECTED_TYPES_SEMANTICS
+              and TYPES_AUTHORITY in labels_of(func.value)):
+            permitted.add(id(func))
+            permitted.add(id(func.value))
+
+    for node in ast.walk(tree):
+        if id(node) in handled or id(node) in permitted:
+            continue
+        if not isinstance(node, (ast.Name, ast.Attribute, ast.Subscript, ast.Call)):
+            continue
+        if isinstance(node, ast.Name) and not isinstance(node.ctx, ast.Load):
+            continue                     # a Store of a tracked name is A7's rebinding finding
+        labels = labels_of(node) & REPORTABLE_AUTHORITIES
+        if not labels:
+            continue
+        parent = parents.get(id(node))
+        if (isinstance(parent, (ast.Attribute, ast.Subscript, ast.Call))
+                and (labels_of(parent) & labels) and id(parent) not in handled):
+            continue                     # an enclosing expression forwards it; report once there
+        protected = bool(labels & PROTECTED_OBJECT_AUTHORITIES)
+        # An unresolvable builtins selection cannot be narrowed to a safe name.
+        dynamic = False
+        if not protected:
+            if isinstance(node, ast.Subscript) and BUILTINS_AUTHORITY in labels_of(node.value):
+                dynamic = not literal_string(node.slice)
+            elif (isinstance(node, ast.Call) and node.args
+                  and BUILTINS_AUTHORITY in labels_of(node.args[0])):
+                dynamic = not (len(node.args) > 1 and literal_string(node.args[1]))
+        if dynamic:
+            report(labels, "dangerous_builtin_dynamic_selection")
+            continue
+        binder = node
+        current = parent
+        while isinstance(current, (ast.Tuple, ast.List, ast.Set, ast.Dict, ast.Starred)):
+            binder = current
+            current = parents.get(id(current))
+        bound = ((isinstance(current, (ast.Assign, ast.AnnAssign, ast.NamedExpr))
+                  and getattr(current, "value", None) is binder)
+                 or isinstance(current, ast.arguments))
+        if bound:
+            report(labels, "closed_dependency_object_alias" if protected
+                   else "dangerous_builtin_alias")
+        else:
+            report(labels, "closed_dependency_object_escape" if protected
+                   else "dangerous_builtin_escape")
+
+    return sorted(set(problems)), state["broken"]
+
+
+def protected_authority_violations(source):
+    """Public protected-object and dangerous-builtin authority check."""
+    problems, _broken = _protected_authority_findings(parse_source(source))
+    return problems
+
+
 # ---- A5-1: the independent canonical contract for the sanctioned helper bodies ---- #
 # These snippets are maintained by hand and are the AUTHORITY the live helpers are compared
 # against. They are deliberately NOT derived from the live definitions, so the comparison
@@ -919,10 +1316,16 @@ def repository_read_violations(source):
     # ones and cannot be replaced through a dynamic namespace. Until both hold, the root anchor
     # keeps no exemption, every helper is treated as compromised, and the underlying root
     # derivations and reads stay visible to the checks below.
+    scope_index = _build_scope_index(tree)
     dependency_problems, dependencies_intact = _closed_dependency_findings(tree)
     namespace_problems, namespace_compromised, namespace_broke_dependencies = (
-        _dynamic_namespace_findings(tree))
-    if namespace_broke_dependencies:
+        _dynamic_namespace_findings(tree, scope_index=scope_index))
+    # A8: the protected objects themselves, and the dangerous callable authorities, are part of
+    # the same boundary -- a patched `Path`/`types` or a captured namespace producer changes what
+    # the reviewed declarations and helper bodies mean without touching any tracked name.
+    authority_problems, authority_broke_dependencies = _protected_authority_findings(
+        tree, scope_index=scope_index)
+    if namespace_broke_dependencies or authority_broke_dependencies:
         dependencies_intact = False
 
     # ---- Sanctioned boundary: only helpers matching the EXACT reviewed definition ---- #
@@ -933,8 +1336,8 @@ def repository_read_violations(source):
     # test_real_module_requires_all_three_exact_immutable_helpers.
     helper_problems, qualified_helpers = _sanctioned_helper_findings(tree, require_all=False)
     binding_problems = _sanctioned_binding_findings(tree)
-    for problem in (dependency_problems + namespace_problems + helper_problems
-                    + binding_problems):
+    for problem in (dependency_problems + namespace_problems + authority_problems
+                    + helper_problems + binding_problems):
         violations.append("0:%s" % problem.split(":", 1)[1])
     compromised_helpers = {problem.split(":", 1)[0]
                            for problem in helper_problems + binding_problems}
@@ -942,7 +1345,7 @@ def repository_read_violations(source):
     if not dependencies_intact:
         compromised_helpers |= set(SANCTIONED_READ_HELPERS)
 
-    scope_of, scope_parent, scope_bindings, scope_definitions = _build_scope_index(tree)
+    scope_of, scope_parent, scope_bindings, scope_definitions = scope_index
 
     top_level_helpers = {}
     for stmt in tree.body:
@@ -1021,29 +1424,8 @@ def repository_read_violations(source):
         return found
 
     def resolve_call_definitions(node):
-        """(definitions, ambiguous) for a direct Name call, resolved lexically.
-
-        Only a unique statically visible definition in the innermost scope that binds the name is
-        a candidate. A name with no visible definition (an import or an unknown) resolves to no
-        candidate and keeps its existing unresolved treatment; a name that is ALSO bound another
-        way, or bound to more than one definition, is ambiguous and must not inherit a trusted
-        summary.
-        """
-        func = node.func
-        if not isinstance(func, ast.Name):
-            return [], False
-        scope = scope_of.get(id(node), tree)
-        immediate = True
-        while scope is not None:
-            records = scope_bindings.get(id(scope), {}).get(func.id)
-            if records and not (isinstance(scope, ast.ClassDef) and not immediate):
-                candidates = scope_definitions.get(id(scope), {}).get(func.id, [])
-                if not candidates:
-                    return [], False
-                return candidates, len(records) > len(candidates) or len(candidates) > 1
-            scope = scope_parent.get(id(scope))
-            immediate = False
-        return [], False
+        return _resolve_call_definitions(node, scope_of, scope_parent, scope_bindings,
+                                         scope_definitions, tree)
 
     def is_tainted(node):
         if node is None:
@@ -5103,6 +5485,271 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
             parse_source(annotated, supported=False)
         # A source with no type-comment syntax may still be analysed on such a runtime.
         self.assertTrue(parse_source("value = 1\n", supported=False).body)
+
+    # ---- A8-1: protected closed-dependency OBJECT semantics ---- #
+    def _authority_withheld(self, source):
+        """Violations proving the boundary collapsed rather than a side finding being added.
+
+        With the boundary intact these cannot appear: the root anchor and the three exact helper
+        bodies are exempt. Once a protected object can be patched or a dangerous callable
+        captured, both exemptions must be withheld and the helpers' own derivations and reads
+        must become visible again.
+        """
+        return [violation for violation in repository_read_violations(source)
+                if violation.endswith(("root_path_derivation", "unresolved_repository_read",
+                                       "path_constructor_from_root", "repository_path_escape"))]
+
+    def test_real_module_keeps_protected_object_and_builtin_authority_clean(self):
+        source = read_repo_text("focused_tests")
+        self.assertEqual(protected_authority_violations(source), [],
+                         "the live module's canonical Path and types uses must stay clean")
+        # The canonical boundary plus a literal registered-key read stays fully authorised.
+        canonical = self._dependency_module(tail='text = read_repo_text("readme")\n')
+        self.assertEqual(protected_authority_violations(canonical), [])
+        self.assertEqual(repository_read_violations(canonical), [])
+
+    def test_every_documented_protected_path_semantic_is_bound(self):
+        # The minimum protected surface: construction, resolution, parent walking, the readers,
+        # path joining -- plus any unresolved attribute, which fails closed by the same rule.
+        for attribute in sorted(PROTECTED_PATH_SEMANTICS) + ["totally_unreviewed_attribute"]:
+            source = self._dependency_module(
+                prologue="from helpers import replacement\n",
+                tail="Path.%s = replacement\n" % attribute
+                + 'text = read_repo_text("probe_script")\n')
+            problems = protected_authority_violations(source)
+            self.assertTrue(any(problem.endswith("closed_dependency_object_mutation")
+                                for problem in problems),
+                            "Path.%s must be protected: %s" % (attribute, problems))
+            self.assertTrue(self._authority_withheld(source),
+                            "Path.%s mutation must withhold every exemption" % attribute)
+        for attribute in sorted(PROTECTED_TYPES_SEMANTICS):
+            source = self._dependency_module(
+                prologue="from helpers import replacement\n",
+                tail="types.%s = replacement\n" % attribute
+                + 'text = read_repo_text("probe_script")\n')
+            self.assertTrue(any(problem.endswith("closed_dependency_object_mutation")
+                                for problem in protected_authority_violations(source)))
+            self.assertTrue(self._authority_withheld(source))
+
+    def test_every_protected_object_mutation_route_is_rejected(self):
+        prologue = "from helpers import replacement, mutate, pick\n"
+        chain = "P0 = Path\nP1 = P0\nP2 = P1\nP2.resolve = replacement\n"
+        types_chain = "T0 = types\nT1 = T0\nT1.MappingProxyType = replacement\n"
+        cases = {
+            "path_resolve_assigned": "Path.resolve = replacement\n",
+            "path_read_text_assigned": "Path.read_text = replacement\n",
+            "path_truediv_assigned": "Path.__truediv__ = replacement\n",
+            "path_new_assigned": "Path.__new__ = replacement\n",
+            "path_attribute_deleted": "del Path.resolve\n",
+            "path_attribute_augmented": "Path.resolve += replacement\n",
+            "path_alias_mutated": "P = Path\nP.resolve = replacement\n",
+            "path_alias_chain_mutated": chain,
+            "path_annotated_alias_mutated": "P: object = Path\nP.resolve = replacement\n",
+            "path_named_expression_alias": "value = (P := Path)\nP.resolve = replacement\n",
+            "path_destructured_alias": "P, other = Path, 1\nP.resolve = replacement\n",
+            "path_setattr": 'setattr(Path, "resolve", replacement)\n',
+            "path_setattr_alias": 'assign = setattr\nassign(Path, "resolve", replacement)\n',
+            "path_delattr": 'delattr(Path, "resolve")\n',
+            "path_delattr_alias": 'drop = delattr\ndrop(Path, "resolve")\n',
+            "path_object_setattr": 'object.__setattr__(Path, "resolve", replacement)\n',
+            "path_type_setattr": 'type.__setattr__(Path, "resolve", replacement)\n',
+            "path_class_dict_subscript": 'Path.__dict__["resolve"] = replacement\n',
+            "path_class_dict_update": 'Path.__dict__.update({"resolve": replacement})\n',
+            "path_vars_subscript": 'vars(Path)["resolve"] = replacement\n',
+            "path_dynamic_attribute": 'name = "resolve"\nsetattr(Path, name, replacement)\n',
+            "path_wrapper_returned": ("def source():\n    return Path\n"
+                                      "source().resolve = replacement\n"),
+            "path_container_recovered": "holder = [Path]\nholder[0].resolve = replacement\n",
+            "path_passed_to_mutator": "mutate(Path)\n",
+            "types_mapping_proxy_assigned": "types.MappingProxyType = replacement\n",
+            "types_mapping_proxy_deleted": "del types.MappingProxyType\n",
+            "types_alias_mutated": "t = types\nt.MappingProxyType = replacement\n",
+            "types_alias_chain_mutated": types_chain,
+            "types_setattr": 'setattr(types, "MappingProxyType", replacement)\n',
+            "types_module_dict_subscript": 'types.__dict__["MappingProxyType"] = replacement\n',
+            "types_vars_subscript": 'vars(types)["MappingProxyType"] = replacement\n',
+            "types_dynamic_attribute": 'name = "MappingProxyType"\nsetattr(types, name, replacement)\n',
+            "types_passed_to_mutator": "mutate(types)\n",
+        }
+        self.assertGreaterEqual(len(cases), 32, "the A8-1 protected-object matrix must stay complete")
+        expected = ("closed_dependency_object_mutation", "closed_dependency_object_escape",
+                    "closed_dependency_object_alias",
+                    "closed_dependency_object_dynamic_mutation")
+        accepted = []
+        kept_authority = []
+        for name, body in cases.items():
+            source = self._dependency_module(
+                prologue=prologue, tail=body + 'text = read_repo_text("probe_script")\n')
+            problems = protected_authority_violations(source)
+            if not problems:
+                accepted.append(name)
+                continue
+            self.assertTrue(any(problem.endswith(expected) for problem in problems),
+                            "%s: unexpected categories %s" % (name, problems))
+            guard = repository_read_violations(source)
+            self.assertTrue(any(violation.endswith(expected) for violation in guard),
+                            "%s must surface through the main guard: %s" % (name, guard))
+            if not self._authority_withheld(source):
+                kept_authority.append((name, guard))
+        self.assertEqual(accepted, [], "these protected-object routes were accepted: %s" % accepted)
+        self.assertEqual(kept_authority, [],
+                         "these routes kept anchor or helper authority: %s" % kept_authority)
+
+    def test_protected_object_mutation_withholds_literal_call_authority(self):
+        prologue = "from helpers import replacement\n"
+        clean = self._dependency_module(
+            prologue=prologue, tail='text = read_repo_text("probe_script")\n')
+        self.assertEqual(repository_read_violations(clean), [],
+                         "an unpatched boundary keeps literal registered-key authority")
+        patched = self._dependency_module(
+            prologue=prologue,
+            tail="Path.resolve = replacement\n" + 'text = read_repo_text("probe_script")\n')
+        violations = repository_read_violations(patched)
+        self.assertTrue(any(v.endswith("closed_dependency_object_mutation") for v in violations),
+                        violations)
+        self.assertTrue(any(v.endswith("root_path_derivation") for v in violations),
+                        "the helper's root derivation must become visible: %s" % violations)
+        self.assertTrue(any(v.endswith("unresolved_repository_read") for v in violations),
+                        "the helper's own read must become visible: %s" % violations)
+        registry = self._dependency_module(
+            prologue=prologue,
+            tail="types.MappingProxyType = replacement\n"
+            + 'text = read_repo_text("probe_script")\n')
+        registry_violations = repository_read_violations(registry)
+        self.assertTrue(any(v.endswith("closed_dependency_object_mutation")
+                            for v in registry_violations), registry_violations)
+        self.assertTrue(any(v.endswith("root_path_derivation") for v in registry_violations),
+                        "a replaced registry constructor must withhold authority: %s"
+                        % registry_violations)
+
+    # ---- A8-2: dangerous builtin callable authority ---- #
+    def test_every_dangerous_builtin_authority_route_is_rejected(self):
+        prologue = "import builtins\nfrom helpers import wrapper, replacement\n"
+        long_chain = ("e0 = exec\n" + "".join("e%d = e%d\n" % (i + 1, i) for i in range(5)))
+        cases = {
+            "globals_alias": "g = globals\n",
+            "globals_annotated_alias": "g: object = globals\n",
+            "globals_named_expression_alias": "value = (g := globals)\n",
+            "globals_destructured_alias": "g, other = globals, 1\n",
+            "globals_alias_chain": "g0 = globals\ng1 = g0\n",
+            "globals_import_alias": "from builtins import globals as g\n",
+            "globals_module_attribute": "g = builtins.globals\n",
+            "globals_builtins_subscript": 'g = __builtins__["globals"]\n',
+            "globals_getattr": 'g = getattr(builtins, "globals")\n',
+            "globals_dynamic_selection": 'name = "globals"\ng = getattr(builtins, name)\n',
+            "globals_wrapper_return": "def source():\n    return globals\n",
+            "globals_lambda_return": "source = lambda: globals\n",
+            "globals_container": "holder = [globals]\n",
+            "globals_default_parameter": "def load(producer=globals):\n    return producer\n",
+            "globals_closure_capture": ("def outer():\n    captured = globals\n"
+                                        "    def inner():\n        return captured()\n"
+                                        "    return inner\n"),
+            "exec_alias": "e = exec\n",
+            "exec_import_alias": "from builtins import exec as run\n",
+            "exec_module_attribute": "e = builtins.exec\n",
+            "exec_builtins_subscript": 'e = __builtins__["exec"]\n',
+            "exec_getattr": 'e = getattr(builtins, "exec")\n',
+            "exec_wrapper_return": "def source():\n    return exec\n",
+            "exec_container": "holder = (exec,)\n",
+            "exec_long_alias_chain": long_chain,
+            "eval_alias": "value = eval\n",
+            "compile_alias": "builder = compile\n",
+            "setattr_alias": "assign = setattr\n",
+            "delattr_alias": "drop = delattr\n",
+            "parameter_receives_builtin": ("def take(callable_argument):\n"
+                                           "    return callable_argument\ntake(eval)\n"),
+            "star_args_forwarding": "payload = [globals]\nwrapper(*payload)\n",
+            "star_kwargs_forwarding": 'options = {"producer": delattr}\nwrapper(**options)\n',
+            "locals_alias": "collect = locals\n",
+            "vars_alias": "inspect_namespace = vars\n",
+        }
+        self.assertGreaterEqual(len(cases), 30, "the A8-2 builtin matrix must stay complete")
+        expected = ("dangerous_builtin_alias", "dangerous_builtin_escape",
+                    "dangerous_builtin_dynamic_selection")
+        accepted = []
+        kept_authority = []
+        for name, body in cases.items():
+            source = self._dependency_module(
+                prologue=prologue, tail=body + 'text = read_repo_text("probe_script")\n')
+            problems = protected_authority_violations(source)
+            if not problems:
+                accepted.append(name)
+                continue
+            self.assertTrue(any(problem.endswith(expected) for problem in problems),
+                            "%s: unexpected categories %s" % (name, problems))
+            guard = repository_read_violations(source)
+            self.assertTrue(any(violation.endswith(expected) for violation in guard),
+                            "%s must surface through the main guard: %s" % (name, guard))
+            if not self._authority_withheld(source):
+                kept_authority.append((name, guard))
+        self.assertEqual(accepted, [], "these builtin authority routes were accepted: %s" % accepted)
+        self.assertEqual(kept_authority, [],
+                         "these routes kept anchor or helper authority: %s" % kept_authority)
+
+    def test_dangerous_builtin_alias_replacement_loses_literal_call_authority(self):
+        prologue = "from helpers import replacement\n"
+        aliased_globals = self._dependency_module(
+            prologue=prologue,
+            tail=("g = globals\n"
+                  'g()["read_repo_text"] = replacement\n'
+                  'text = read_repo_text("probe_script")\n'))
+        violations = repository_read_violations(aliased_globals)
+        self.assertTrue(any(v.endswith("dangerous_builtin_alias") for v in violations), violations)
+        self.assertTrue(any(v.endswith(("root_path_derivation", "unresolved_repository_read"))
+                            for v in violations),
+                        "the aliased namespace producer must withhold literal authority: %s"
+                        % violations)
+        aliased_exec = self._dependency_module(
+            prologue=prologue,
+            tail=("from builtins import exec as run\n"
+                  'run("read_repo_text = replacement")\n'
+                  'text = read_repo_text("probe_script")\n'))
+        exec_violations = repository_read_violations(aliased_exec)
+        self.assertTrue(any(v.endswith("dangerous_builtin_alias") for v in exec_violations),
+                        exec_violations)
+        self.assertTrue(any(v.endswith(("root_path_derivation", "unresolved_repository_read"))
+                            for v in exec_violations),
+                        "an imported exec alias must withhold literal authority: %s"
+                        % exec_violations)
+
+    def test_safe_lookalike_callables_and_attribute_calls_stay_clean(self):
+        controls = {
+            "regex_compile_attribute": "import re\npattern = re.compile('x')\n",
+            "shadowed_builtin_name": ("def compile(text):\n    return text\n"
+                                      "value = compile('x')\n"),
+            "shadowed_vars_name": ("def vars(record):\n    return record\n"
+                                   "value = vars({'a': 1})\n"),
+            "unrelated_sibling_scopes": ("def one():\n"
+                                         "    def helper():\n        return 'a'\n"
+                                         "    return helper()\n"
+                                         "def two():\n"
+                                         "    def helper():\n        return 'b'\n"
+                                         "    return helper()\n"),
+            "plain_builtins_import": "import builtins\nvalue = builtins.len('abc')\n",
+        }
+        for name, body in controls.items():
+            source = self._dependency_module(
+                tail=body + 'text = read_repo_text("readme")\n')
+            self.assertEqual(protected_authority_violations(source), [],
+                             "%s must not be treated as dangerous authority" % name)
+            self.assertEqual(repository_read_violations(source), [],
+                             "%s must stay clean end to end" % name)
+
+    def test_direct_builtin_callee_forms_keep_their_existing_treatment(self):
+        # A8-2 must not reclassify the exact direct-callee forms A7 already fails closed on.
+        for body, category in (('globals()["read_repo_text"] = replacement\n',
+                                "sanctioned_helper_dynamic_binding"),
+                               ('exec("read_repo_text = replacement")\n',
+                                "dynamic_namespace_binding")):
+            source = self._dependency_module(
+                prologue="from helpers import replacement\n",
+                tail=body + 'text = read_repo_text("probe_script")\n')
+            self.assertEqual(protected_authority_violations(source), [],
+                             "a direct builtin callee is not an alias: %s" % body.strip())
+            violations = repository_read_violations(source)
+            self.assertTrue(any(v.endswith(category) for v in violations), violations)
+            self.assertTrue(self._authority_withheld(source),
+                            "the existing dynamic-namespace route must still collapse authority")
 
     # ---- A2-4: literal exact-head CI checkout ---- #
     def test_both_jobs_check_out_the_literal_exact_head(self):
