@@ -118,6 +118,504 @@ PURE_LEXICAL_METHODS = frozenset({
     "split", "rsplit", "replace", "format", "join", "as_posix", "count", "find",
 })
 DYNAMIC_ATTRIBUTE_CALLS = frozenset({"getattr", "attrgetter", "import_module", "__import__"})
+
+
+# ---- A7-5: one type-comment-aware parser for every analysed source ---- #
+# ast.parse silently DISCARDS function type comments unless type_comments=True, so a helper could
+# otherwise declare a different signature without changing its contract. Every analysed source —
+# live module, canonical helper snippets, canonical dependency snippet and every fixture — is
+# parsed through this single entry point.
+TYPE_COMMENT_SYNTAX = re.compile(r"#\s*type\s*:")
+
+
+def _type_comments_supported():
+    """Whether the running interpreter can capture type comments at all."""
+    try:
+        ast.parse("value = 1  # type: int", type_comments=True)
+    except TypeError:
+        return False
+    return True
+
+
+TYPE_COMMENTS_SUPPORTED = _type_comments_supported()
+
+
+def parse_source(source, supported=None):
+    """Parse with function type comments captured, or fail closed.
+
+    ``supported`` is the explicit cross-version seam: an interpreter that cannot capture type
+    comments must REFUSE a source carrying type-comment syntax rather than analyse it with the
+    contract field silently dropped. A source with no such syntax is safe to parse without the
+    option, because there is then nothing to discard.
+    """
+    if TYPE_COMMENTS_SUPPORTED if supported is None else supported:
+        return ast.parse(source, type_comments=True)
+    if TYPE_COMMENT_SYNTAX.search(source):
+        raise AssertionError(
+            "this interpreter cannot capture type comments and the source contains "
+            "type-comment syntax; refusing to analyse it with the contract field discarded")
+    return ast.parse(source)
+
+
+# ---- A7-1: the independent canonical closed-dependency declarations ---- #
+# Hand-maintained and deliberately NOT derived from the live module nodes, exactly like the
+# canonical helper bodies. An exact helper body means nothing if the declarations it closes over
+# can be replaced: a widened root or an altered registry silently changes what an unchanged body
+# resolves and reads. The registry pairs are duplicated here on purpose so the comparison cannot
+# be tautological.
+CANONICAL_TYPES_IMPORT = "import types\n"
+CANONICAL_PATH_IMPORT = "from pathlib import Path\n"
+CANONICAL_ROOT_ANCHOR = "ROOT = Path(__file__).resolve().parents[1]\n"
+CANONICAL_REGISTRY = (
+    'REPO_DEPENDENCIES = types.MappingProxyType({\n'
+    '    "probe_script": "scripts/ac2_member_expiry_capability_probe.ps1",\n'
+    '    "probe_lib": "scripts/member_expiry_capability_probe_lib.ps1",\n'
+    '    "probe_runbook": "docs/autocount2-automation/member_expiry_capability_probe_runbook.md",\n'
+    '    "create_uat_runbook": "docs/autocount2-automation/member_create_uat_runbook.md",\n'
+    '    "readme": "README.md",\n'
+    '    "gitignore": ".gitignore",\n'
+    '    "workflow": ".github/workflows/member-create-uat-tests.yml",\n'
+    '    "focused_tests": "tests/test_ac2_member_expiry_capability_probe.py",\n'
+    '})\n'
+)
+CANONICAL_DEPENDENCY_SOURCE = (CANONICAL_TYPES_IMPORT + CANONICAL_PATH_IMPORT
+                               + CANONICAL_ROOT_ANCHOR + CANONICAL_REGISTRY)
+
+# Every name the root anchor and the sanctioned helper bodies close over. `types` is included
+# because the immutable registry constructor closes over it; `Path` because the anchor does.
+CLOSED_DEPENDENCY_NAMES = ("types", "Path", "ROOT", "REPO_DEPENDENCIES")
+# Declarations whose runtime semantics depend on order: the constructor needs `types`, the anchor
+# needs `Path`.
+CLOSED_DEPENDENCY_ORDER = (("types", "REPO_DEPENDENCIES"), ("Path", "ROOT"))
+# The anchor also closes over `__file__`, which has no declaration of its own: any binding of it
+# is a replacement of the checkout identity.
+CLOSED_DEPENDENCY_IMPLICIT = ("__file__",)
+
+
+def _target_names(target):
+    """Names an assignment target binds. A subscript or attribute target binds NO name."""
+    if isinstance(target, ast.Name):
+        return [target.id]
+    if isinstance(target, (ast.Tuple, ast.List)):
+        names = []
+        for element in target.elts:
+            names.extend(_target_names(element))
+        return names
+    if isinstance(target, ast.Starred):
+        return _target_names(target.value)
+    return []
+
+
+def _direct_bindings(node):
+    """(name, kind) pairs this single node binds, ignoring bindings made by its children."""
+    pairs = []
+    if isinstance(node, ast.Assign):
+        simple = len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
+        for target in node.targets:
+            for name in _target_names(target):
+                pairs.append((name, "assign" if simple else "destructured"))
+    elif isinstance(node, ast.AnnAssign):
+        pairs.extend((name, "annassign") for name in _target_names(node.target))
+    elif isinstance(node, ast.AugAssign):
+        pairs.extend((name, "augassign") for name in _target_names(node.target))
+    elif isinstance(node, ast.NamedExpr):
+        pairs.extend((name, "namedexpr") for name in _target_names(node.target))
+    elif isinstance(node, (ast.Import, ast.ImportFrom)):
+        pairs.extend(((alias.asname or alias.name.split(".")[0]), "import")
+                     for alias in node.names)
+    elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        pairs.append((node.name, "def"))
+    elif isinstance(node, ast.ClassDef):
+        pairs.append((node.name, "class"))
+    elif isinstance(node, ast.arg):
+        pairs.append((node.arg, "param"))
+    elif isinstance(node, ast.ExceptHandler) and node.name:
+        pairs.append((node.name, "except"))
+    elif isinstance(node, (ast.For, ast.AsyncFor)):
+        pairs.extend((name, "for") for name in _target_names(node.target))
+    elif isinstance(node, ast.comprehension):
+        pairs.extend((name, "comprehension") for name in _target_names(node.target))
+    elif isinstance(node, ast.withitem) and node.optional_vars is not None:
+        pairs.extend((name, "with") for name in _target_names(node.optional_vars))
+    elif isinstance(node, (ast.Global, ast.Nonlocal)):
+        pairs.extend((name, "global") for name in node.names)
+    elif hasattr(ast, "MatchAs") and isinstance(node, ast.MatchAs) and node.name:
+        pairs.append((node.name, "match"))
+    elif hasattr(ast, "MatchStar") and isinstance(node, ast.MatchStar) and node.name:
+        pairs.append((node.name, "match"))
+    elif hasattr(ast, "MatchMapping") and isinstance(node, ast.MatchMapping) and node.rest:
+        pairs.append((node.rest, "match"))
+    return pairs
+
+
+def canonical_dependency_contract():
+    """name -> (statement position, normalised AST dump) for the hand-maintained declarations."""
+    contract = {}
+    for index, statement in enumerate(parse_source(CANONICAL_DEPENDENCY_SOURCE).body):
+        for name, _kind in _direct_bindings(statement):
+            if name in CLOSED_DEPENDENCY_NAMES:
+                contract[name] = (index, ast.dump(statement, include_attributes=False))
+    return contract
+
+
+CANONICAL_DEPENDENCY_CONTRACT = canonical_dependency_contract()
+
+
+def _closed_dependency_findings(tree):
+    """Exact contract for the declarations the sanctioned boundary closes over.
+
+    Returns ``(problems, intact)``. ``intact`` is the ONLY basis on which the root anchor, the
+    exact helper bodies and the literal registry calls may be exempted: a declaration is accepted
+    because its complete normalised AST equals the independent canonical one, never because it is
+    the first statement with the right name.
+    """
+    problems = []
+    top_level = {}
+    for index, statement in enumerate(tree.body):
+        for name, _kind in _direct_bindings(statement):
+            if name in CLOSED_DEPENDENCY_NAMES:
+                top_level.setdefault(name, []).append((index, statement))
+
+    canonical_ids = set()
+    positions = {}
+    for name in CLOSED_DEPENDENCY_NAMES:
+        hits = top_level.get(name, [])
+        if not hits:
+            problems.append("%s:closed_dependency_missing" % name)
+            continue
+        expected = CANONICAL_DEPENDENCY_CONTRACT[name][1]
+        dumps = [ast.dump(statement, include_attributes=False) for _index, statement in hits]
+        if len(hits) > 1:
+            # Two exact declarations are a duplicate; a competing different one is a rebinding.
+            problems.append("%s:closed_dependency_%s"
+                            % (name, "duplicate" if all(dump == expected for dump in dumps)
+                               else "rebound"))
+            continue
+        if dumps[0] != expected:
+            problems.append("%s:closed_dependency_body_mismatch" % name)
+            continue
+        positions[name] = hits[0][0]
+        canonical_ids.add(id(hits[0][1]))
+
+    for earlier, later in CLOSED_DEPENDENCY_ORDER:
+        if earlier in positions and later in positions and positions[earlier] > positions[later]:
+            problems.append("%s:closed_dependency_out_of_order" % later)
+
+    top_level_ids = {id(statement) for statement in tree.body}
+    for node in ast.walk(tree):
+        if id(node) in canonical_ids:
+            continue
+        for name, _kind in _direct_bindings(node):
+            if name in CLOSED_DEPENDENCY_IMPLICIT:
+                problems.append("%s:closed_dependency_rebound" % name)
+            elif name in CLOSED_DEPENDENCY_NAMES and id(node) not in top_level_ids:
+                # A nested, conditional or function-local substitute declaration.
+                problems.append("%s:closed_dependency_not_top_level" % name)
+
+    problems = sorted(set(problems))
+    return problems, not problems
+
+
+def closed_dependency_violations(source):
+    """Public closed-dependency contract check."""
+    problems, _intact = _closed_dependency_findings(parse_source(source))
+    return problems
+
+
+# ---- A7-2: dynamic namespace and binding integrity ---- #
+# The static binding pass covers ordinary AST binding forms. These routes replace, delete or
+# expose a binding at RUNTIME, so a later direct literal call can reach something other than the
+# reviewed helper.
+NAMESPACE_PRODUCERS = frozenset({"globals", "locals", "vars"})
+# Bare-name calls only: these are the builtin bindings. `re.compile` is an attribute call on an
+# imported module and is not a namespace route, so `compile` is dangerous only as a bare name;
+# `exec`/`eval` have no legitimate attribute use here.
+DYNAMIC_EXECUTION_NAMES = frozenset({"exec", "eval", "compile"})
+DYNAMIC_EXECUTION_ATTRS = frozenset({"exec", "eval"})
+NAMESPACE_MUTATORS = frozenset({"update", "__setitem__", "__delitem__", "setdefault",
+                                "pop", "popitem", "clear"})
+
+
+def _namespace_mutation_keys(call, attribute):
+    """Statically resolvable literal keys a namespace-mapping method touches, else ``None``."""
+    if attribute in ("clear", "popitem"):
+        return None                                  # touches everything
+    if attribute == "update":
+        if len(call.args) == 1 and not call.keywords and isinstance(call.args[0], ast.Dict):
+            keys = []
+            for key in call.args[0].keys:
+                if not (isinstance(key, ast.Constant) and isinstance(key.value, str)):
+                    return None                      # unpacking or a non-literal key
+                keys.append(key.value)
+            return keys
+        if not call.args and call.keywords and all(keyword.arg for keyword in call.keywords):
+            return [keyword.arg for keyword in call.keywords]
+        return None
+    if call.args and isinstance(call.args[0], ast.Constant) and isinstance(call.args[0].value, str):
+        return [call.args[0].value]
+    return None
+
+
+def _dynamic_namespace_findings(tree):
+    """Statically identifiable dynamic-namespace routes into the sanctioned boundary.
+
+    Returns ``(problems, compromised_helpers, dependencies_compromised)``. A literal mutation of
+    one helper compromises that helper; a literal mutation of a closed dependency compromises the
+    whole boundary; an unresolved key, a dynamically selected namespace, an escaping namespace
+    object and any ``exec``/``eval``/``compile`` use compromise everything, because their binding
+    effects are not statically controlled.
+    """
+    problems = []
+    compromised = set()
+    state = {"dependencies": False}
+    tracked = (set(SANCTIONED_READ_HELPERS) | set(CLOSED_DEPENDENCY_NAMES)
+               | set(CLOSED_DEPENDENCY_IMPLICIT))
+
+    parents = {}
+    for parent in ast.walk(tree):
+        for child in ast.iter_child_nodes(parent):
+            parents[id(child)] = parent
+
+    def compromise_name(name):
+        if name in SANCTIONED_READ_HELPERS:
+            compromised.add(name)
+            problems.append("%s:sanctioned_helper_dynamic_binding" % name)
+        else:
+            state["dependencies"] = True
+            problems.append("%s:closed_dependency_dynamic_binding" % name)
+
+    def compromise_everything(category):
+        state["dependencies"] = True
+        compromised.update(SANCTIONED_READ_HELPERS)
+        problems.append("*:%s" % category)
+
+    def record_keys(keys, category):
+        if keys is None:
+            compromise_everything(category)
+            return
+        for key in keys:
+            if key in tracked:
+                compromise_name(key)
+            else:
+                problems.append("*:dynamic_namespace_binding")
+
+    def is_module_registry(node):
+        """`sys.modules[...]`: a live module object, whose attributes ARE its namespace."""
+        return (isinstance(node, ast.Subscript) and isinstance(node.value, ast.Attribute)
+                and node.value.attr == "modules")
+
+    def is_namespace_expression(node):
+        """An expression that is, or directly exposes, a module/namespace mapping."""
+        if isinstance(node, ast.Attribute):
+            return node.attr == "__dict__"
+        if isinstance(node, ast.Subscript):
+            return is_module_registry(node)
+        if isinstance(node, ast.Call):
+            func = node.func
+            if isinstance(func, ast.Name) and func.id in NAMESPACE_PRODUCERS:
+                return True
+            if isinstance(func, ast.Attribute) and func.attr in NAMESPACE_PRODUCERS:
+                return True
+            if isinstance(func, ast.Name) and func.id == "getattr" and len(node.args) >= 2:
+                attribute = node.args[1]
+                # Dynamic attribute selection of __dict__, or an unresolvable selection.
+                if not (isinstance(attribute, ast.Constant) and isinstance(attribute.value, str)):
+                    return False                     # reported as dynamic attribute access
+                return attribute.value == "__dict__"
+        return False
+
+    handled = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            func = node.func
+            if ((isinstance(func, ast.Name) and func.id in DYNAMIC_EXECUTION_NAMES)
+                    or (isinstance(func, ast.Attribute)
+                        and func.attr in DYNAMIC_EXECUTION_ATTRS)):
+                compromise_everything("dynamic_namespace_binding")
+                continue
+            if isinstance(func, ast.Name) and func.id in ("setattr", "delattr"):
+                arguments = list(node.args)
+                if arguments:
+                    handled.add(id(arguments[0]))
+                attribute = arguments[1] if len(arguments) > 1 else None
+                if not (isinstance(attribute, ast.Constant)
+                        and isinstance(attribute.value, str)):
+                    compromise_everything("dynamic_namespace_binding")
+                elif attribute.value in tracked:
+                    compromise_name(attribute.value)
+                elif arguments and (is_namespace_expression(arguments[0])
+                                    or is_module_registry(arguments[0])):
+                    # A module-like target: any attribute write mutates its namespace.
+                    compromise_everything("dynamic_namespace_binding")
+                continue
+            if isinstance(func, ast.Attribute) and is_namespace_expression(func.value):
+                handled.add(id(func.value))
+                if func.attr in NAMESPACE_MUTATORS:
+                    record_keys(_namespace_mutation_keys(node, func.attr),
+                                "dynamic_namespace_binding")
+                else:
+                    compromise_everything("dynamic_namespace_escape")
+                continue
+        if isinstance(node, ast.Subscript) and is_namespace_expression(node.value):
+            handled.add(id(node.value))
+            key = node.slice
+            store = isinstance(node.ctx, (ast.Store, ast.Del))
+            category = "dynamic_namespace_binding" if store else "dynamic_namespace_escape"
+            if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                record_keys([key.value], category)
+            else:
+                compromise_everything(category)
+
+    for node in ast.walk(tree):
+        if id(node) in handled or not is_namespace_expression(node):
+            continue
+        parent = parents.get(id(node))
+        if parent is not None and is_namespace_expression(parent):
+            continue                     # a namespace derived from a namespace; judged above
+        # Returned, stored, passed to an unresolved callable, or otherwise escaping.
+        compromise_everything("dynamic_namespace_escape")
+
+    return sorted(set(problems)), compromised, state["dependencies"]
+
+
+def dynamic_namespace_violations(source):
+    """Public dynamic-namespace integrity check."""
+    problems, _compromised, _dependencies = _dynamic_namespace_findings(parse_source(source))
+    return problems
+
+
+def _build_scope_index(tree):
+    """Lexical scopes, their bindings and the definitions visible in each.
+
+    Returns ``(scope_of, scope_parent, bindings, definitions)``.
+
+    ``scope_of`` maps every node to the scope it is evaluated in — decorators, argument defaults
+    and return annotations belong to the ENCLOSING scope, the body does not. ``bindings`` maps a
+    scope to ``{name: [record]}`` where a record carries the binding kind, the bound value for a
+    simple assignment, the source position and whether the binding sits directly in that scope's
+    own body rather than inside a conditional, loop or handler. ``definitions`` maps a scope to
+    the function and statically bound lambda definitions it declares, keyed by name, so a call
+    resolves to a definition IDENTITY instead of a bare name.
+    """
+    scope_of = {}
+    scope_parent = {}
+    bindings = {}
+    definitions = {}
+
+    def defaults_of(node):
+        return (list(node.args.defaults)
+                + [default for default in node.args.kw_defaults if default is not None])
+
+    def arguments_of(node):
+        collected = list(getattr(node.args, "posonlyargs", [])) + list(node.args.args)
+        collected.extend(node.args.kwonlyargs)
+        for extra in (node.args.vararg, node.args.kwarg):
+            if extra is not None:
+                collected.append(extra)
+        return collected
+
+    def enter(node, parent):
+        scope_parent[id(node)] = parent
+        bindings[id(node)] = {}
+        definitions[id(node)] = {}
+
+    def declare(scope, node, direct):
+        for name, kind in _direct_bindings(node):
+            value = node.value if kind == "assign" and isinstance(node, ast.Assign) else None
+            bindings[id(scope)].setdefault(name, []).append({
+                "kind": kind,
+                "value": value,
+                "position": (getattr(node, "lineno", 0), getattr(node, "col_offset", 0)),
+                "direct": direct,
+            })
+            definition = None
+            if kind == "def":
+                definition = node
+            elif value is not None and isinstance(value, ast.Lambda):
+                definition = value
+            if definition is not None:
+                definitions[id(scope)].setdefault(name, []).append(definition)
+
+    def visit(node, scope, direct):
+        scope_of[id(node)] = scope
+        declare(scope, node, direct)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            for expression in defaults_of(node):
+                visit(expression, scope, False)
+            if not isinstance(node, ast.Lambda):
+                for expression in list(node.decorator_list):
+                    visit(expression, scope, False)
+                if node.returns is not None:
+                    visit(node.returns, scope, False)
+            enter(node, scope)
+            for argument in arguments_of(node):
+                visit(argument, node, True)
+            for statement in (node.body if isinstance(node.body, list) else [node.body]):
+                visit(statement, node, True)
+            return
+        if isinstance(node, ast.ClassDef):
+            for expression in (list(node.decorator_list) + list(node.bases)
+                               + [keyword.value for keyword in node.keywords]):
+                visit(expression, scope, False)
+            enter(node, scope)
+            for statement in node.body:
+                visit(statement, node, True)
+            return
+        for child in ast.iter_child_nodes(node):
+            visit(child, scope, False)
+
+    enter(tree, None)
+    scope_of[id(tree)] = tree
+    for statement in tree.body:
+        visit(statement, tree, True)
+    return scope_of, scope_parent, bindings, definitions
+
+
+def _default_resolver(definition, scope_of, scope_parent, bindings, tree):
+    """Definition-time lexical lookup for the names a definition's defaults may use.
+
+    ``resolve(name)`` returns the single value expression a default may rely on, and ``None``
+    whenever the contract cannot prove it: a binding in a sibling, nested or unrelated scope, an
+    import, a parameter, a loop, handler or comprehension target, an augmented or destructured
+    assignment, a binding inside a conditional, more than one binding, a binding that is not
+    proven to execute before the definition, or no binding at all. ``is_shadowed(name)`` reports
+    whether a builtin container constructor has been rebound anywhere in the relevant chain.
+    """
+    enclosing = scope_of.get(id(definition), tree)
+    before = (getattr(definition, "lineno", 0), getattr(definition, "col_offset", 0))
+
+    def resolve(name):
+        scope = enclosing
+        immediate = True
+        while scope is not None:
+            records = bindings.get(id(scope), {}).get(name)
+            if isinstance(scope, ast.ClassDef) and not immediate:
+                # CPython skips ENCLOSING class scopes during lexical lookup; a name found there
+                # cannot be proven to be the one the default will see.
+                if records:
+                    return None
+            elif records:
+                if len(records) != 1:
+                    return None                        # multiply bound: ambiguous
+                record = records[0]
+                if record["kind"] != "assign" or record["value"] is None:
+                    return None
+                if not record["direct"] or record["position"] >= before:
+                    return None
+                return record["value"]
+            scope = scope_parent.get(id(scope))
+            immediate = False
+        return None
+
+    def is_shadowed(name):
+        scope = enclosing
+        while scope is not None:
+            if name in bindings.get(id(scope), {}):
+                return True
+            scope = scope_parent.get(id(scope))
+        return False
+
+    return resolve, is_shadowed
 # ---- A5-1: the independent canonical contract for the sanctioned helper bodies ---- #
 # These snippets are maintained by hand and are the AUTHORITY the live helpers are compared
 # against. They are deliberately NOT derived from the live definitions, so the comparison
@@ -182,7 +680,7 @@ def _helper_definition_contract(node):
 
 
 def canonical_helper_contract(name):
-    return _helper_definition_contract(ast.parse(CANONICAL_HELPER_SOURCES[name]).body[0])
+    return _helper_definition_contract(parse_source(CANONICAL_HELPER_SOURCES[name]).body[0])
 
 
 # Names the reviewed helper bodies close over. Their canonical declarations are accepted; any
@@ -249,7 +747,7 @@ def _sanctioned_helper_findings(tree, require_all=True):
 
 def sanctioned_helper_contract_violations(source, require_all=True):
     """Public contract check. ``require_all=True`` is the real-module boundary."""
-    problems, _ = _sanctioned_helper_findings(ast.parse(source), require_all=require_all)
+    problems, _ = _sanctioned_helper_findings(parse_source(source), require_all=require_all)
     return problems
 
 
@@ -338,7 +836,7 @@ def _sanctioned_binding_findings(tree):
 
 def sanctioned_helper_binding_violations(source):
     """Public binding-integrity check for the sanctioned helpers and their dependencies."""
-    return _sanctioned_binding_findings(ast.parse(source))
+    return _sanctioned_binding_findings(parse_source(source))
 
 
 # Container constructors that cannot read or transmit content; used only when every argument is
@@ -346,60 +844,13 @@ def sanctioned_helper_binding_violations(source):
 PURE_CONTAINER_CONSTRUCTORS = frozenset({"dict", "list", "tuple", "set", "frozenset"})
 
 
-def _module_level_bindings(tree):
-    """name -> list of bound value expressions. ``None`` marks a binding we cannot resolve."""
-    bindings = {}
-
-    def record(name, value):
-        bindings.setdefault(name, []).append(value)
-
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Assign):
-            if len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
-                record(node.targets[0].id, node.value)
-            else:
-                for target in node.targets:
-                    for sub in ast.walk(target):
-                        if isinstance(sub, ast.Name):
-                            record(sub.id, None)      # destructuring: not statically resolvable
-        elif isinstance(node, ast.AnnAssign):
-            if isinstance(node.target, ast.Name):
-                record(node.target.id, node.value)
-        elif isinstance(node, ast.AugAssign):
-            if isinstance(node.target, ast.Name):
-                record(node.target.id, None)
-        elif isinstance(node, ast.NamedExpr):
-            if isinstance(node.target, ast.Name):
-                record(node.target.id, node.value)
-        elif isinstance(node, (ast.Import, ast.ImportFrom)):
-            for alias in node.names:
-                record(alias.asname or alias.name.split(".")[0], None)
-        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            record(node.name, None)
-        elif isinstance(node, ast.arg):
-            record(node.arg, None)
-        elif isinstance(node, ast.ExceptHandler) and node.name:
-            record(node.name, None)
-        elif isinstance(node, (ast.For, ast.AsyncFor)):
-            for sub in ast.walk(node.target):
-                if isinstance(sub, ast.Name):
-                    record(sub.id, None)
-        elif isinstance(node, ast.comprehension):
-            for sub in ast.walk(node.target):
-                if isinstance(sub, ast.Name):
-                    record(sub.id, None)
-        elif isinstance(node, ast.withitem) and node.optional_vars is not None:
-            for sub in ast.walk(node.optional_vars):
-                if isinstance(sub, ast.Name):
-                    record(sub.id, None)
-    return bindings
-
-
-def _default_is_provably_safe(node, bindings, seen=None):
+def _default_is_provably_safe(node, resolve, is_shadowed, seen=None):
     """Positive proof that a default expression cannot carry a path or a reader.
 
-    Anything not proven — imported or unresolved names, ambiguous bindings, attributes,
-    subscripts, dynamic calls, cycles, unsupported AST forms — is unsafe.
+    ``resolve``/``is_shadowed`` come from _default_resolver, so a name is proven only through the
+    relevant lexical scope and definition-time ordering. Anything not proven — an imported,
+    unresolved, cross-scope, multiply bound, out-of-order or cyclic name, a shadowed container
+    constructor, an attribute, a subscript, a dynamic call or an unsupported AST form — is unsafe.
     """
     if node is None:
         return True
@@ -408,28 +859,34 @@ def _default_is_provably_safe(node, bindings, seen=None):
     if isinstance(node, ast.Constant):
         return True
     if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
-        return all(_default_is_provably_safe(element, bindings, seen) for element in node.elts)
+        return all(_default_is_provably_safe(element, resolve, is_shadowed, seen)
+                   for element in node.elts)
     if isinstance(node, ast.Dict):
-        return (all(_default_is_provably_safe(key, bindings, seen)
+        return (all(_default_is_provably_safe(key, resolve, is_shadowed, seen)
                     for key in node.keys if key is not None)
-                and all(_default_is_provably_safe(value, bindings, seen) for value in node.values))
+                and all(_default_is_provably_safe(value, resolve, is_shadowed, seen)
+                        for value in node.values))
     if isinstance(node, ast.JoinedStr):
-        return all(_default_is_provably_safe(part, bindings, seen) for part in node.values)
+        return all(_default_is_provably_safe(part, resolve, is_shadowed, seen)
+                   for part in node.values)
     if isinstance(node, ast.FormattedValue):
-        return _default_is_provably_safe(node.value, bindings, seen)
+        return _default_is_provably_safe(node.value, resolve, is_shadowed, seen)
     if isinstance(node, ast.Call):
-        if isinstance(node.func, ast.Name) and node.func.id in PURE_CONTAINER_CONSTRUCTORS:
-            return (all(_default_is_provably_safe(arg, bindings, seen) for arg in node.args)
-                    and all(_default_is_provably_safe(kw.value, bindings, seen)
-                            for kw in node.keywords))
+        if (isinstance(node.func, ast.Name) and node.func.id in PURE_CONTAINER_CONSTRUCTORS
+                and not is_shadowed(node.func.id)):
+            # A pure container constructor, and only while the name is still the builtin.
+            return (all(_default_is_provably_safe(argument, resolve, is_shadowed, seen)
+                        for argument in node.args)
+                    and all(_default_is_provably_safe(keyword.value, resolve, is_shadowed, seen)
+                            for keyword in node.keywords))
         return False
     if isinstance(node, ast.Name):
         if node.id in seen:
             return False                      # cyclic binding: cannot be proven
-        bound = bindings.get(node.id)
-        if not bound or len(bound) != 1 or bound[0] is None:
-            return False                      # unbound, imported or ambiguously bound
-        return _default_is_provably_safe(bound[0], bindings, seen | {node.id})
+        value = resolve(node.id)
+        if value is None:
+            return False
+        return _default_is_provably_safe(value, resolve, is_shadowed, seen | {node.id})
     return False
 
 
@@ -437,11 +894,12 @@ def repository_read_violations(source):
     """Fail-closed AST guard: the literal registry reader is the ONLY repository-read route.
 
     Returns sorted "<line>:<kind>" violations. The policy is deliberately conservative: aliases
-    of ``open``, captured bound reader methods, dynamic attribute access, repository-derived
-    path taint, wrappers, lambdas, comprehensions and unresolved indirect calls are all
-    rejected. Anything that cannot be proven safe is reported rather than accepted.
+    of ``open``, captured bound reader methods, dynamic attribute access, dynamic namespace
+    mutation, repository-derived path taint, wrappers, lambdas, comprehensions, container-wrapped
+    helper returns, cross-scope default names and unresolved indirect calls are all rejected.
+    Anything that cannot be proven safe is reported rather than accepted.
     """
-    tree = ast.parse(source)
+    tree = parse_source(source)
     violations = []
 
     def flag(node, kind):
@@ -456,18 +914,36 @@ def repository_read_violations(source):
         return (len(args) == 1 and isinstance(args[0], ast.Constant)
                 and isinstance(args[0].value, str) and args[0].value in REPO_DEPENDENCIES)
 
-    # ---- Sanctioned boundary: only helpers matching the EXACT reviewed body ---- #
+    # ---- A7-1/A7-2: the closed dependency boundary gates EVERY exemption ---- #
+    # An exact helper body proves nothing unless the declarations it closes over are the reviewed
+    # ones and cannot be replaced through a dynamic namespace. Until both hold, the root anchor
+    # keeps no exemption, every helper is treated as compromised, and the underlying root
+    # derivations and reads stay visible to the checks below.
+    dependency_problems, dependencies_intact = _closed_dependency_findings(tree)
+    namespace_problems, namespace_compromised, namespace_broke_dependencies = (
+        _dynamic_namespace_findings(tree))
+    if namespace_broke_dependencies:
+        dependencies_intact = False
+
+    # ---- Sanctioned boundary: only helpers matching the EXACT reviewed definition ---- #
     # Nested functions, methods, duplicates and same-named definitions never inherit exemption,
-    # and neither does a helper whose executable AST has drifted from its canonical contract.
-    # Generic snippets waive presence noise; the real-module boundary is the explicit
-    # require_all=True call in test_real_module_requires_all_three_exact_immutable_helpers.
+    # and neither does a helper whose full definition has drifted from its canonical contract or
+    # whose identifier can be rebound. Generic snippets waive presence noise; the real-module
+    # boundary is the explicit require_all=True call in
+    # test_real_module_requires_all_three_exact_immutable_helpers.
     helper_problems, qualified_helpers = _sanctioned_helper_findings(tree, require_all=False)
     binding_problems = _sanctioned_binding_findings(tree)
-    for problem in helper_problems + binding_problems:
+    for problem in (dependency_problems + namespace_problems + helper_problems
+                    + binding_problems):
         violations.append("0:%s" % problem.split(":", 1)[1])
     compromised_helpers = {problem.split(":", 1)[0]
                            for problem in helper_problems + binding_problems}
-    module_bindings = _module_level_bindings(tree)
+    compromised_helpers |= set(namespace_compromised)
+    if not dependencies_intact:
+        compromised_helpers |= set(SANCTIONED_READ_HELPERS)
+
+    scope_of, scope_parent, scope_bindings, scope_definitions = _build_scope_index(tree)
+
     top_level_helpers = {}
     for stmt in tree.body:
         if isinstance(stmt, ast.FunctionDef) and stmt.name in SANCTIONED_READ_HELPERS:
@@ -479,14 +955,18 @@ def repository_read_violations(source):
             for sub in ast.walk(defs[0]):
                 sanctioned_ids.add(id(sub))
 
-    # The single module-level ROOT anchor is the one permitted checkout derivation.
+    # The single module-level ROOT anchor is the one permitted checkout derivation, and only
+    # while the exact closed-dependency declarations hold: a widened anchor cannot exempt itself.
     anchor_ids = set()
-    for stmt in tree.body:
-        if (isinstance(stmt, ast.Assign) and len(stmt.targets) == 1
-                and isinstance(stmt.targets[0], ast.Name) and stmt.targets[0].id == "ROOT"):
-            for sub in ast.walk(stmt):
-                anchor_ids.add(id(sub))
+    if dependencies_intact:
+        for stmt in tree.body:
+            if (isinstance(stmt, ast.Assign) and len(stmt.targets) == 1
+                    and isinstance(stmt.targets[0], ast.Name) and stmt.targets[0].id == "ROOT"):
+                for sub in ast.walk(stmt):
+                    anchor_ids.add(id(sub))
 
+    # A literal registry resolution seeds taint unconditionally — failing closed means MORE
+    # taint, never less — but confers read authority only while the boundary is clean.
     registered_names = set()
     for stmt in tree.body:
         if (isinstance(stmt, ast.Assign) and len(stmt.targets) == 1
@@ -510,8 +990,11 @@ def repository_read_violations(source):
 
     tainted_names = {"ROOT"} | set(registered_names)
     reader_names = set()
-    funcs_returning_taint = set()
-    funcs_returning_reader = set()
+    # ---- A7-3: return summaries keyed by definition IDENTITY, not by bare name ---- #
+    # Two same-named functions in sibling scopes, and a nested definition shadowing a
+    # module-level one, must never share a summary.
+    defs_returning_taint = set()
+    defs_returning_reader = set()
 
     # ---- A5-2: lexically scoped default-bound taint ---- #
     # Parent links let a Name consult the parameters of every ENCLOSING function or lambda, so a
@@ -525,6 +1008,8 @@ def repository_read_violations(source):
               if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))]
     scope_tainted = {id(scope): set() for scope in scopes}
     scope_readers = {id(scope): set() for scope in scopes}
+    resolvers = {id(scope): _default_resolver(scope, scope_of, scope_parent, scope_bindings, tree)
+                 for scope in scopes}
 
     def enclosing_scopes(node):
         found = []
@@ -534,6 +1019,31 @@ def repository_read_violations(source):
                 found.append(current)
             current = parents.get(id(current))
         return found
+
+    def resolve_call_definitions(node):
+        """(definitions, ambiguous) for a direct Name call, resolved lexically.
+
+        Only a unique statically visible definition in the innermost scope that binds the name is
+        a candidate. A name with no visible definition (an import or an unknown) resolves to no
+        candidate and keeps its existing unresolved treatment; a name that is ALSO bound another
+        way, or bound to more than one definition, is ambiguous and must not inherit a trusted
+        summary.
+        """
+        func = node.func
+        if not isinstance(func, ast.Name):
+            return [], False
+        scope = scope_of.get(id(node), tree)
+        immediate = True
+        while scope is not None:
+            records = scope_bindings.get(id(scope), {}).get(func.id)
+            if records and not (isinstance(scope, ast.ClassDef) and not immediate):
+                candidates = scope_definitions.get(id(scope), {}).get(func.id, [])
+                if not candidates:
+                    return [], False
+                return candidates, len(records) > len(candidates) or len(candidates) > 1
+            scope = scope_parent.get(id(scope))
+            immediate = False
+        return [], False
 
     def is_tainted(node):
         if node is None:
@@ -554,8 +1064,11 @@ def repository_read_violations(source):
                 if node.func.id in PURE_TAINT_SAFE_CALLABLES:
                     # str(<repo path>) is still a repository path in string form.
                     return any(is_tainted(arg) for arg in node.args)
-                if node.func.id in funcs_returning_taint:
-                    return True
+            candidates, ambiguous = resolve_call_definitions(node)
+            if candidates and (ambiguous
+                               or any(id(definition) in defs_returning_taint
+                                      for definition in candidates)):
+                return True
             if isinstance(node.func, ast.Attribute):
                 if node.func.attr in ("resolve", "absolute", "expanduser", "joinpath"):
                     return is_tainted(node.func.value)
@@ -633,10 +1146,14 @@ def repository_read_violations(source):
             return False
         if isinstance(node, ast.Attribute):
             return node.attr in REPO_READ_METHODS
+        if isinstance(node, ast.Subscript):
+            # A reader taken back out of a container the helper handed over.
+            return is_reader(node.value)
         if isinstance(node, ast.Call):
             if dynamic_attribute_problem(node):
                 return True
-            if isinstance(node.func, ast.Name) and node.func.id in funcs_returning_reader:
+            candidates, _ambiguous = resolve_call_definitions(node)
+            if any(id(definition) in defs_returning_reader for definition in candidates):
                 return True
             return False
         return False
@@ -649,7 +1166,7 @@ def repository_read_violations(source):
                     names.add(sub.id)
         return names
 
-    # Fixpoint so alias chains and helper returns propagate.
+    # Fixpoint so alias chains and container-wrapped helper returns propagate.
     # Monotonic over finite sets, so this converges long before the bound; the bound is
     # derived from the finite AST universe purely to guarantee deterministic termination.
     convergence_bound = sum(1 for _ in ast.walk(tree)) + 2
@@ -657,7 +1174,7 @@ def repository_read_violations(source):
     while True:
         rounds += 1
         before = (len(tainted_names), len(reader_names),
-                  len(funcs_returning_taint), len(funcs_returning_reader),
+                  len(defs_returning_taint), len(defs_returning_reader),
                   sum(len(v) for v in scope_tainted.values()),
                   sum(len(v) for v in scope_readers.values()))
         for node in ast.walk(tree):
@@ -672,15 +1189,22 @@ def repository_read_violations(source):
                     tainted_names |= assigned_names(targets)
                 if contains_reader(value):
                     reader_names |= assigned_names(targets)
-            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                for sub in ast.walk(node):
-                    if isinstance(sub, ast.Return):
-                        if is_tainted(sub.value):
-                            funcs_returning_taint.add(node.name)
-                        if is_reader(sub.value):
-                            funcs_returning_reader.add(node.name)
+            elif isinstance(node, ast.Return):
+                # A7-3: recursive containment, attributed to the definition that OWNS the return.
+                owner = scope_of.get(id(node))
+                if isinstance(owner, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    if contains_taint(node.value):
+                        defs_returning_taint.add(id(owner))
+                    if contains_reader(node.value):
+                        defs_returning_reader.add(id(owner))
+            elif isinstance(node, ast.Lambda):
+                if contains_taint(node.body):
+                    defs_returning_taint.add(id(node))
+                if contains_reader(node.body):
+                    defs_returning_reader.add(id(node))
         # Default-bound parameters, mapped correctly and confined to their own scope.
         for scope in scopes:
+            resolve, is_shadowed = resolvers[id(scope)]
             arguments = scope.args
             positional = list(getattr(arguments, "posonlyargs", [])) + list(arguments.args)
             defaults = list(arguments.defaults)
@@ -695,16 +1219,19 @@ def repository_read_violations(source):
                     scope_tainted[id(scope)].add(param.arg)
                 elif contains_reader(default):
                     scope_readers[id(scope)].add(param.arg)
-                elif not _default_is_provably_safe(default, module_bindings):
+                elif not _default_is_provably_safe(default, resolve, is_shadowed):
                     scope_tainted[id(scope)].add(param.arg)   # unproven: fail closed
         after = (len(tainted_names), len(reader_names),
-                 len(funcs_returning_taint), len(funcs_returning_reader),
+                 len(defs_returning_taint), len(defs_returning_reader),
                  sum(len(v) for v in scope_tainted.values()),
                  sum(len(v) for v in scope_readers.values()))
         if before == after or rounds >= convergence_bound:
             break
 
     def receiver_is_registered(node):
+        # Registry-derived read authority requires the exact registry AND an unreplaced resolver.
+        if not dependencies_intact or "repo_path" in compromised_helpers:
+            return False
         if isinstance(node, ast.Name):
             return node.id in registered_names
         if is_repo_path_call(node):
@@ -722,16 +1249,15 @@ def repository_read_violations(source):
             if func.id in PURE_TAINT_SAFE_CALLABLES:
                 return True
             if func.id in ("repo_path", "read_repo_text"):
-                if func.id in compromised_helpers:
+                if not dependencies_intact or func.id in compromised_helpers:
                     return False          # the name no longer refers to the reviewed helper
                 return literal_registered_key(node)
         return False
 
-    # Mark attributes that are the callee of a call, so a bare reference to a reader method
-    # (capture, storage, passing, returning) is distinguishable from an immediate call.
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
-            setattr(node.func, "_xb_parent_call", node)
+    # Attributes that are the callee of a call, so a bare reference to a reader method (capture,
+    # storage, passing, returning) is distinguishable from an immediate call.
+    called_attributes = {id(node.func) for node in ast.walk(tree)
+                         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)}
 
     for node in ast.walk(tree):
         if id(node) in sanctioned_ids or id(node) in anchor_ids:
@@ -747,8 +1273,7 @@ def repository_read_violations(source):
 
         # ---- Bound path-reader methods: captured, passed, stored or called unsafely ---- #
         if isinstance(node, ast.Attribute) and node.attr in REPO_READ_METHODS:
-            parent_call = getattr(node, "_xb_parent_call", None)
-            if parent_call is None:
+            if id(node) not in called_attributes:
                 flag(node, "bound_reader_capture")
 
         # ---- Dynamic attribute access ---- #
@@ -771,6 +1296,9 @@ def repository_read_violations(source):
                 if not receiver_is_registered(func.value):
                     flag(node, "unresolved_repository_read")
             if isinstance(func, ast.Name) and func.id in reader_names:
+                flag(node, "reader_callable_invocation")
+            # A reader taken straight back out of a container or another call.
+            if isinstance(func, (ast.Subscript, ast.Call)) and is_reader(func):
                 flag(node, "reader_callable_invocation")
             if isinstance(func, ast.Name) and func.id == "Path" and any(is_tainted(a) for a in node.args):
                 flag(node, "path_constructor_from_root")
@@ -801,24 +1329,25 @@ def repository_read_violations(source):
 
         # ---- Escaping returns ---- #
         if isinstance(node, ast.Return):
-            if is_reader(node.value):
+            if contains_reader(node.value):
                 flag(node, "reader_callable_escape")
-            elif is_tainted(node.value):
+            elif contains_taint(node.value):
                 flag(node, "repository_path_escape")
 
         # ---- Lambdas that read or hand back a reader ---- #
         if isinstance(node, ast.Lambda):
-            if is_reader(node.body):
+            if contains_reader(node.body):
                 flag(node, "reader_callable_escape")
 
         # ---- Defaults that cannot be statically proven safe ---- #
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            resolve, is_shadowed = resolvers[id(node)]
             every_default = (list(node.args.defaults)
                              + [d for d in node.args.kw_defaults if d is not None])
             for default in every_default:
                 if contains_taint(default) or contains_reader(default):
                     continue              # a more specific taint category already applies
-                if not _default_is_provably_safe(default, module_bindings):
+                if not _default_is_provably_safe(default, resolve, is_shadowed):
                     flag(node, "ambiguous_default_binding")
 
     return sorted(set(violations))
@@ -3397,7 +3926,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                          "every repository read must resolve through repo_path/read_repo_text")
 
     def test_ast_guard_rejects_every_escaping_repository_read_form(self):
-        header = "from pathlib import Path\nROOT = Path(__file__).resolve().parents[1]\n"
+        header = CANONICAL_DEPENDENCY_SOURCE
         fixtures = {
             "joinpath": (header + 'X = ROOT.joinpath("new-contract.md").read_text()\n',
                          "root_joinpath"),
@@ -3423,7 +3952,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
 
     def test_ast_guard_rejects_alias_and_indirection_read_routes(self):
         # A3-3: realistic indirection must fail closed, not merely the direct forms.
-        header = "from pathlib import Path\nROOT = Path(__file__).resolve().parents[1]\n"
+        header = CANONICAL_DEPENDENCY_SOURCE
         derived = "target = Path(__file__).resolve().parents[1] / 'new-contract.md'\n"
         fixtures = {
             "bound_read_text": (header + derived + "reader = target.read_text\ntext = reader()\n",
@@ -3463,11 +3992,11 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                                  "unresolved_repository_read"),
             "closure_over_path": (header + derived + "def outer():\n    def inner():\n        return target.read_text()\n    return inner\n",
                                   "unresolved_repository_read"),
-            "file_derived_path": ("from pathlib import Path\n"
+            "file_derived_path": (header
                                   + "base = Path(__file__).resolve().parents[1]\n"
                                   + "text = (base / 'new-contract.md').read_text()\n",
                                   "root_path_derivation"),
-            "file_derived_alias": ("from pathlib import Path\n"
+            "file_derived_alias": (header
                                    + "base = Path(__file__).resolve().parents[1]\n"
                                    + "alias = base\ntext = (alias / 'new-contract.md').read_text()\n",
                                    "root_path_derivation"),
@@ -3495,7 +4024,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
 
     def test_sanctioned_helper_exemption_cannot_be_borrowed(self):
         # A nested or same-named function must not inherit the sanctioned-helper exemption.
-        header = "from pathlib import Path\nROOT = Path(__file__).resolve().parents[1]\n"
+        header = CANONICAL_DEPENDENCY_SOURCE
         nested = header + ("class Sneaky:\n"
                            "    def read_repo_text(self, key):\n"
                            "        return (ROOT / key).read_text()\n")
@@ -3512,12 +4041,11 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
         # A4-2: an attribute call or imported callable is NOT safe merely because its syntax
         # resolves. Any external or ambiguous callable that receives repository taint — however
         # deeply nested — must fail closed.
-        header = ("from pathlib import Path\n"
-                  "import shutil\n"
+        header = ("import shutil\n"
                   "import subprocess\n"
                   "from helpers import slurp, reader as imported_reader\n"
-                  "ROOT = Path(__file__).resolve().parents[1]\n"
-                  "SCRIPT = repo_path('probe_script')\n"
+                  + CANONICAL_DEPENDENCY_SOURCE
+                  + "SCRIPT = repo_path('probe_script')\n"
                   "scratch = Path('/scratch/copy.ps1')\n")
         fixtures = {
             "shutil_copyfile": "shutil.copyfile(SCRIPT, scratch)\n",
@@ -3565,9 +4093,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
     def _helper_module(self, repo_path_src=None, read_repo_text_src=None,
                        read_scratch_text_src=None, prologue="", extra=""):
         return (prologue
-                + "from pathlib import Path\n"
-                + "ROOT = Path(__file__).resolve().parents[1]\n"
-                + "REPO_DEPENDENCIES = {}\n"
+                + CANONICAL_DEPENDENCY_SOURCE
                 + (repo_path_src if repo_path_src is not None else CANONICAL_HELPER_SOURCES["repo_path"])
                 + (read_repo_text_src if read_repo_text_src is not None else CANONICAL_HELPER_SOURCES["read_repo_text"])
                 + (read_scratch_text_src if read_scratch_text_src is not None else CANONICAL_HELPER_SOURCES["read_scratch_text"])
@@ -3709,10 +4235,9 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
 
     # ---- A5-2: default-bound taint and closure propagation ---- #
     def test_ast_guard_rejects_repository_taint_bound_through_defaults(self):
-        header = ("from pathlib import Path\n"
-                  "from helpers import slurp\n"
-                  "ROOT = Path(__file__).resolve().parents[1]\n"
-                  "SCRIPT = repo_path('probe_script')\n")
+        header = ("from helpers import slurp\n"
+                  + CANONICAL_DEPENDENCY_SOURCE
+                  + "SCRIPT = repo_path('probe_script')\n")
         fixtures = {
             "positional_default": "def load(p=SCRIPT):\n    return slurp(p)\nload()\n",
             "keyword_only_default": "def load(*, p=SCRIPT):\n    return slurp(p)\nload()\n",
@@ -3760,10 +4285,9 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
     def test_default_bound_taint_does_not_leak_across_scopes(self):
         # Positive control: an unrelated function using the same parameter name with a safe
         # default must stay accepted, proving taint is lexically scoped.
-        header = ("from pathlib import Path\n"
-                  "from helpers import slurp\n"
-                  "ROOT = Path(__file__).resolve().parents[1]\n"
-                  "SCRIPT = repo_path('probe_script')\n")
+        header = ("from helpers import slurp\n"
+                  + CANONICAL_DEPENDENCY_SOURCE
+                  + "SCRIPT = repo_path('probe_script')\n")
         safe = "def unrelated(p='plain-scratch-name'):\n    return slurp(p)\nunrelated()\n"
         self.assertEqual(repository_read_violations(header + safe), [],
                          "a same-named parameter in an unrelated function must not inherit taint")
@@ -3838,9 +4362,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
         canonical = (CANONICAL_HELPER_SOURCES["repo_path"]
                      + CANONICAL_HELPER_SOURCES["read_repo_text"]
                      + CANONICAL_HELPER_SOURCES["read_scratch_text"])
-        header = ("from pathlib import Path\n"
-                  "ROOT = Path(__file__).resolve().parents[1]\n"
-                  "REPO_DEPENDENCIES = {}\n")
+        header = CANONICAL_DEPENDENCY_SOURCE
         cases = {
             "rebound_after_definition": canonical + "read_repo_text = imported_reader\n",
             "rebound_before_definition": "read_repo_text = imported_reader\n" + canonical,
@@ -3885,9 +4407,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
         self.assertEqual(accepted, [], "these rebindings were accepted: %s" % accepted)
 
     def test_rebound_helper_loses_literal_sanctioned_call_authority(self):
-        header = ("from pathlib import Path\n"
-                  "ROOT = Path(__file__).resolve().parents[1]\n"
-                  "REPO_DEPENDENCIES = {}\n")
+        header = CANONICAL_DEPENDENCY_SOURCE
         canonical = (CANONICAL_HELPER_SOURCES["repo_path"]
                      + CANONICAL_HELPER_SOURCES["read_repo_text"]
                      + CANONICAL_HELPER_SOURCES["read_scratch_text"])
@@ -3903,11 +4423,10 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
 
     # ---- A6-2: positively proven default safety and finite convergence ---- #
     def test_default_safety_requires_positive_proof(self):
-        header = ("from pathlib import Path\n"
-                  "from config import SETTINGS, CONFIG_PATH\n"
+        header = ("from config import SETTINGS, CONFIG_PATH\n"
                   "from helpers import slurp\n"
                   "import config\n"
-                  "ROOT = Path(__file__).resolve().parents[1]\n")
+                  + CANONICAL_DEPENDENCY_SOURCE)
         chain_paths = "".join("alias%d = alias%d\n" % (i + 1, i) for i in range(9))
         chain_helpers = "".join("def hop%d():\n    return hop%d()\n" % (i + 1, i) for i in range(9))
         cases = {
@@ -3959,9 +4478,8 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
         self.assertEqual(accepted, [], "these unsafe defaults were accepted: %s" % accepted)
 
     def test_provably_safe_defaults_are_accepted(self):
-        header = ("from pathlib import Path\n"
-                  "from helpers import slurp\n"
-                  "ROOT = Path(__file__).resolve().parents[1]\n")
+        header = ("from helpers import slurp\n"
+                  + CANONICAL_DEPENDENCY_SOURCE)
         controls = {
             "literal_scalar": "def load(p='plain'):\n    return slurp(p)\nload()\n",
             "literal_container": "def load(p=['a', ('b', 1), {'c': 2}]):\n    return slurp(p)\nload()\n",
@@ -3985,10 +4503,9 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                          "the fixpoint must not be bounded by an arbitrary constant")
         self.assertIn("convergence_bound", source,
                       "termination must be bounded by the finite AST universe")
-        header = ("from pathlib import Path\n"
-                  "from helpers import slurp\n"
-                  "ROOT = Path(__file__).resolve().parents[1]\n"
-                  "SCRIPT = repo_path('probe_script')\n")
+        header = ("from helpers import slurp\n"
+                  + CANONICAL_DEPENDENCY_SOURCE
+                  + "SCRIPT = repo_path('probe_script')\n")
         chain = "alias0 = SCRIPT\n" + "".join("alias%d = alias%d\n" % (i + 1, i) for i in range(12))
         violations = repository_read_violations(header + chain + "slurp(alias12)\n")
         self.assertTrue(any(v.endswith("repository_path_escape") for v in violations),
@@ -3997,11 +4514,9 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
     def test_sanctioned_helper_body_tampering_is_detected(self):
         # A4-2: the exemption covers the exact reviewed helper bodies. A helper body that grows
         # an external read or copy must fail the guard contract rather than inherit exemption.
-        tampered = ("from pathlib import Path\n"
-                    "import shutil\n"
-                    "ROOT = Path(__file__).resolve().parents[1]\n"
-                    "REPO_DEPENDENCIES = {}\n"
-                    "def repo_path(key):\n"
+        tampered = ("import shutil\n"
+                    + CANONICAL_DEPENDENCY_SOURCE
+                    + "def repo_path(key):\n"
                     "    return ROOT / key\n"
                     "def read_repo_text(key):\n"
                     "    shutil.copyfile(repo_path(key), Path('/scratch/leak'))\n"
@@ -4016,7 +4531,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
         # Even a REGISTERED file read through an escaping form must fail: the guard checks the
         # shape of the read expression, so closure cannot pass merely because the expected and
         # actual inventories came from the same incomplete resolver.
-        header = "from pathlib import Path\nROOT = Path(__file__).resolve().parents[1]\n"
+        header = CANONICAL_DEPENDENCY_SOURCE
         violations = repository_read_violations(header + 'X = ROOT.joinpath("README.md").read_text()\n')
         self.assertTrue(any(v.endswith("root_joinpath") for v in violations), violations)
         self.assertTrue(any(v.endswith("unresolved_repository_read") for v in violations), violations)
@@ -4028,16 +4543,31 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
             REPO_DEPENDENCIES["injected"] = "somewhere/else.md"
 
     def test_unregistered_dependency_key_fails_closed_at_runtime(self):
-        # Executed from the canonical contract snippet that the live helper is now pinned to
-        # byte-for-byte, so the runtime proof needs no alias of a sanctioned helper — aliasing
-        # one is itself an A6-1 binding-escape violation.
-        namespace = {"ROOT": Path("scratch-root"), "REPO_DEPENDENCIES": dict(REPO_DEPENDENCIES)}
-        exec(compile(CANONICAL_HELPER_SOURCES["repo_path"], "<canonical>", "exec"), namespace)
-        canonical_resolver = namespace["repo_path"]
+        # The canonical snippet the live helper is pinned to byte-for-byte, executed in a FRESH
+        # interpreter from a scratch file. Aliasing the live helper is an A6-1 binding escape and
+        # in-process exec/compile is an A7-2 dynamic-binding route, so the proof uses neither.
+        scratch = Path(tempfile.mkdtemp())
+        try:
+            driver = scratch / "canonical_repo_path_probe.py"
+            driver.write_text(
+                "from pathlib import Path\n"
+                'REPO_DEPENDENCIES = {"readme": "README.md"}\n'
+                'ROOT = Path("scratch-root")\n'
+                + CANONICAL_HELPER_SOURCES["repo_path"]
+                + 'assert repo_path("readme") == ROOT / "README.md"\n'
+                "try:\n"
+                '    repo_path("definitely_not_registered")\n'
+                "except KeyError:\n"
+                '    print("FAILED_CLOSED")\n'
+                "else:\n"
+                '    raise SystemExit("the unregistered key did not fail closed")\n',
+                encoding="utf-8")
+            proc = subprocess.run([sys.executable, str(driver)], capture_output=True, text=True)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("FAILED_CLOSED", proc.stdout)
+        finally:
+            shutil.rmtree(scratch, ignore_errors=True)
         self.assertNotIn("definitely_not_registered", REPO_DEPENDENCIES)
-        with self.assertRaises(KeyError):
-            canonical_resolver("definitely_not_registered")
-        self.assertEqual(canonical_resolver("readme"), Path("scratch-root") / "README.md")
 
     def test_a_newly_registered_dependency_must_also_enter_the_workflow_filter(self):
         # Closure in the other direction: a registry entry with no matching path pattern is
@@ -4059,6 +4589,520 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
         inventory = registered_dependencies()
         for patterns in filters.values():
             self.assertIn(".gitignore", uncovered_dependencies(inventory, patterns))
+
+    # ---- A7-1: the exact closed-dependency contract ---- #
+    def _dependency_module(self, prologue="", types_import=None, path_import=None,
+                           root=None, registry=None, extra="", helpers=True, tail=""):
+        """A module built from the INDEPENDENT canonical dependency declarations.
+
+        Each declaration can be replaced individually, so a fixture mutates exactly one part of
+        the boundary the sanctioned helpers close over.
+        """
+        body = ((CANONICAL_TYPES_IMPORT if types_import is None else types_import)
+                + (CANONICAL_PATH_IMPORT if path_import is None else path_import)
+                + (CANONICAL_ROOT_ANCHOR if root is None else root)
+                + (CANONICAL_REGISTRY if registry is None else registry))
+        if helpers:
+            body += (CANONICAL_HELPER_SOURCES["repo_path"]
+                     + CANONICAL_HELPER_SOURCES["read_repo_text"]
+                     + CANONICAL_HELPER_SOURCES["read_scratch_text"])
+        return prologue + body + extra + tail
+
+    def test_canonical_dependency_source_pins_all_four_declarations(self):
+        contract = canonical_dependency_contract()
+        self.assertEqual(sorted(contract), sorted(CLOSED_DEPENDENCY_NAMES))
+        # The canonical declarations are hand-maintained, not derived from the live nodes.
+        self.assertNotIn("read_repo_text(", CANONICAL_DEPENDENCY_SOURCE)
+        for key, value in (("probe_script", "scripts/ac2_member_expiry_capability_probe.ps1"),
+                           ("focused_tests", "tests/test_ac2_member_expiry_capability_probe.py")):
+            self.assertIn('"%s": "%s"' % (key, value), CANONICAL_REGISTRY)
+
+    def test_real_module_satisfies_the_exact_closed_dependency_contract(self):
+        source = read_repo_text("focused_tests")
+        self.assertEqual(closed_dependency_violations(source), [],
+                         "the live declarations must match the independent canonical contract")
+        self.assertEqual(dynamic_namespace_violations(source), [],
+                         "the live module must use no dynamic namespace route")
+
+    def test_canonical_dependency_boundary_is_accepted_end_to_end(self):
+        source = self._dependency_module(tail='text = read_repo_text("readme")\n')
+        self.assertEqual(closed_dependency_violations(source), [])
+        self.assertEqual(sanctioned_helper_contract_violations(source, require_all=True), [])
+        self.assertEqual(repository_read_violations(source), [],
+                         "the exact canonical boundary must keep its anchor and helper exemptions")
+
+    def test_every_closed_dependency_mutation_is_rejected(self):
+        alias_registry = CANONICAL_REGISTRY.replace("types.MappingProxyType", "t.MappingProxyType")
+        cases = {
+            "parents_zero": dict(root="ROOT = Path(__file__).resolve().parents[0]\n"),
+            "parents_two": dict(root="ROOT = Path(__file__).resolve().parents[2]\n"),
+            "path_cwd": dict(root="ROOT = Path.cwd()\n"),
+            "path_parent": dict(root="ROOT = Path(__file__).parent\n"),
+            "operator_selected_root": dict(
+                root="ROOT = Path('/elsewhere') if FLAG else Path(__file__).resolve().parents[1]\n"),
+            "path_import_alias": dict(path_import="from pathlib import Path as P\n",
+                                      root="ROOT = P(__file__).resolve().parents[1]\n"),
+            "module_qualified_path": dict(path_import="import pathlib\n",
+                                          root="ROOT = pathlib.Path(__file__).resolve().parents[1]\n"),
+            "path_rebound_before_anchor": dict(
+                path_import="from pathlib import Path\nPath = replacement\n"),
+            "dunder_file_rebound_before_anchor": dict(
+                path_import="from pathlib import Path\n__file__ = '/elsewhere/tests/x.py'\n"),
+            "types_import_missing": dict(types_import=""),
+            "types_import_aliased": dict(types_import="import types as t\n",
+                                         registry=alias_registry),
+            "mutable_dictionary_registry": dict(registry=CANONICAL_REGISTRY.replace(
+                "types.MappingProxyType({", "{").replace("})", "}")),
+            "dict_constructor_registry": dict(
+                registry='REPO_DEPENDENCIES = dict(readme="README.md")\n'),
+            "proxy_around_helper_dictionary": dict(
+                registry="REPO_DEPENDENCIES = types.MappingProxyType(build_registry())\n"),
+            "registry_entry_missing": dict(registry=CANONICAL_REGISTRY.replace(
+                '    "gitignore": ".gitignore",\n', "")),
+            "registry_entry_added": dict(registry=CANONICAL_REGISTRY.replace(
+                "})\n", '    "extra": "docs/extra.md",\n})\n')),
+            "registry_key_changed": dict(registry=CANONICAL_REGISTRY.replace(
+                '"readme":', '"read_me":')),
+            "registry_value_changed": dict(registry=CANONICAL_REGISTRY.replace(
+                '"readme": "README.md"', '"readme": "docs/README.md"')),
+            "registry_pairing_swapped": dict(registry=CANONICAL_REGISTRY.replace(
+                '"readme": "README.md",\n    "gitignore": ".gitignore",',
+                '"readme": ".gitignore",\n    "gitignore": "README.md",')),
+            "registry_unpacking": dict(registry=CANONICAL_REGISTRY.replace(
+                "MappingProxyType({\n", "MappingProxyType({\n        **BASE,\n")),
+            "registry_comprehension": dict(registry=(
+                "REPO_DEPENDENCIES = types.MappingProxyType(\n"
+                "    {key: value for key, value in PAIRS})\n")),
+            "registry_inside_function": dict(registry=(
+                "def build():\n"
+                "    REPO_DEPENDENCIES = types.MappingProxyType({})\n"
+                "    return REPO_DEPENDENCIES\n")),
+            "registry_inside_conditional": dict(registry=(
+                "if FLAG:\n"
+                "    REPO_DEPENDENCIES = types.MappingProxyType({})\n")),
+            "duplicate_root": dict(root=CANONICAL_ROOT_ANCHOR + CANONICAL_ROOT_ANCHOR),
+            "duplicate_registry": dict(registry=CANONICAL_REGISTRY + CANONICAL_REGISTRY),
+            "root_then_rebinding": dict(root=CANONICAL_ROOT_ANCHOR + "ROOT = Path('/elsewhere')\n"),
+            "registry_then_rebinding": dict(
+                registry=CANONICAL_REGISTRY + "REPO_DEPENDENCIES = {}\n"),
+            "registry_before_types_import": dict(types_import="", path_import="",
+                                                 root="", registry=(
+                CANONICAL_REGISTRY + CANONICAL_TYPES_IMPORT + CANONICAL_PATH_IMPORT
+                + CANONICAL_ROOT_ANCHOR)),
+            "root_before_path_import": dict(types_import=CANONICAL_TYPES_IMPORT,
+                                            path_import="", root=(
+                CANONICAL_ROOT_ANCHOR + CANONICAL_PATH_IMPORT)),
+        }
+        self.assertGreaterEqual(len(cases), 26, "the A7-1 dependency matrix must stay complete")
+        expected_categories = ("closed_dependency_missing", "closed_dependency_duplicate",
+                               "closed_dependency_body_mismatch", "closed_dependency_not_top_level",
+                               "closed_dependency_rebound", "closed_dependency_out_of_order")
+        accepted = []
+        kept_authority = []
+        for name, kwargs in cases.items():
+            source = self._dependency_module(tail='text = read_repo_text("readme")\n', **kwargs)
+            problems = closed_dependency_violations(source)
+            if not problems:
+                accepted.append(name)
+                continue
+            self.assertTrue(any(problem.endswith(expected_categories) for problem in problems),
+                            "%s: unexpected categories %s" % (name, problems))
+            # Authority gating: with the boundary broken, the anchor derivation and the helper
+            # bodies' own reads must become visible to the main guard.
+            guard = repository_read_violations(source)
+            if not any(violation.endswith(("root_path_derivation", "unresolved_repository_read",
+                                           "path_constructor_from_root", "repository_path_escape"))
+                       for violation in guard):
+                kept_authority.append((name, guard))
+        self.assertEqual(accepted, [], "these dependency mutations were accepted: %s" % accepted)
+        self.assertEqual(kept_authority, [],
+                         "these mutations kept anchor or helper authority: %s" % kept_authority)
+
+    def test_broken_dependency_boundary_withholds_literal_call_authority(self):
+        clean = self._dependency_module(tail='text = read_repo_text("readme")\n')
+        self.assertEqual(repository_read_violations(clean), [],
+                         "the exact boundary must keep literal registry-read authority")
+        widened = self._dependency_module(
+            root="ROOT = Path(__file__).resolve().parents[0]\n",
+            tail='text = read_repo_text("readme")\n')
+        violations = repository_read_violations(widened)
+        self.assertTrue(any(v.endswith("closed_dependency_body_mismatch") for v in violations),
+                        violations)
+        self.assertTrue(any(v.endswith("unresolved_repository_read") for v in violations),
+                        "a widened root must withhold read authority: %s" % violations)
+        self.assertTrue(any(v.endswith("root_path_derivation") for v in violations),
+                        "the helper's own root derivation must become visible: %s" % violations)
+
+    # ---- A7-2: dynamic namespace and binding integrity ---- #
+    def test_every_dynamic_namespace_route_is_rejected(self):
+        prologue = "import sys\nfrom helpers import replacement\n"
+        cases = {
+            "globals_subscript_reader": 'globals()["read_repo_text"] = replacement\n',
+            "globals_subscript_repo_path": 'globals()["repo_path"] = replacement\n',
+            "globals_subscript_root": 'globals()["ROOT"] = replacement\n',
+            "globals_update": 'globals().update({"read_repo_text": replacement})\n',
+            "globals_setitem": 'globals().__setitem__("read_repo_text", replacement)\n',
+            "globals_dynamic_key": 'name = "read_repo_text"\nglobals()[name] = replacement\n',
+            "exec_binding": 'exec("read_repo_text = replacement")\n',
+            "eval_binding": 'value = eval("read_repo_text")\n',
+            "compile_then_store": 'code = compile("x = 1", "<f>", "exec")\n',
+            "module_dict_subscript": 'sys.modules[__name__].__dict__["read_repo_text"] = replacement\n',
+            "module_dict_update": 'sys.modules[__name__].__dict__.update({"repo_path": replacement})\n',
+            "setattr_module": 'setattr(sys.modules[__name__], "read_repo_text", replacement)\n',
+            "delattr_module": 'delattr(sys.modules[__name__], "read_repo_text")\n',
+            "setattr_unresolved_sanctioned_attribute": 'setattr(holder, "read_repo_text", replacement)\n',
+            "namespace_passed_to_callable": "register(globals())\n",
+            "namespace_returned": "def expose():\n    return globals()\n",
+            "namespace_stored": "holders = [globals()]\n",
+            "locals_mutation": 'locals().update({"read_repo_text": replacement})\n',
+            "vars_mutation": 'vars().update({"read_repo_text": replacement})\n',
+        }
+        self.assertGreaterEqual(len(cases), 18, "the A7-2 namespace matrix must stay complete")
+        expected_categories = ("dynamic_namespace_binding", "dynamic_namespace_escape",
+                               "sanctioned_helper_dynamic_binding",
+                               "closed_dependency_dynamic_binding")
+        accepted = []
+        for name, body in cases.items():
+            source = self._dependency_module(prologue=prologue, extra=body)
+            problems = dynamic_namespace_violations(source)
+            if not problems:
+                accepted.append(name)
+                continue
+            self.assertTrue(any(problem.endswith(expected_categories) for problem in problems),
+                            "%s: unexpected categories %s" % (name, problems))
+            guard = repository_read_violations(source)
+            self.assertTrue(any(violation.endswith(expected_categories) for violation in guard),
+                            "%s must surface through the main guard: %s" % (name, guard))
+        self.assertEqual(accepted, [], "these namespace routes were accepted: %s" % accepted)
+
+    def test_dynamic_replacement_withholds_literal_sanctioned_call_authority(self):
+        prologue = "from helpers import replacement\n"
+        clean = self._dependency_module(
+            prologue=prologue, tail='text = read_repo_text("readme")\n')
+        self.assertEqual(repository_read_violations(clean), [])
+        tampered = self._dependency_module(
+            prologue=prologue,
+            tail=('globals()["repo_path"] = replacement\n'
+                  'text = read_repo_text("readme")\n'))
+        violations = repository_read_violations(tampered)
+        self.assertTrue(any(v.endswith("sanctioned_helper_dynamic_binding") for v in violations),
+                        violations)
+        self.assertTrue(any(v.endswith(("unresolved_repository_read", "root_path_derivation"))
+                            for v in violations),
+                        "a dynamically replaced helper must lose literal authority: %s" % violations)
+        literal = self._dependency_module(
+            prologue=prologue,
+            tail=('globals()["read_repo_text"] = replacement\n'
+                  'text = read_repo_text("probe_script")\n'))
+        literal_violations = repository_read_violations(literal)
+        self.assertTrue(any(v.endswith("sanctioned_helper_dynamic_binding")
+                            for v in literal_violations), literal_violations)
+        self.assertTrue(any(v.endswith(("unresolved_repository_read", "root_path_derivation"))
+                            for v in literal_violations),
+                        "the replaced helper's own body must become visible: %s"
+                        % literal_violations)
+
+    # ---- A7-3: recursive return summaries and definition identity ---- #
+    def _return_summary_module(self, body):
+        return self._dependency_module(
+            prologue="from helpers import slurp, sink\n", helpers=False,
+            extra="SCRIPT = repo_path('probe_script')\n" + body)
+
+    def test_container_returned_paths_and_readers_propagate(self):
+        hops = "".join("def hop%d():\n    return [hop%d()]\n" % (index + 1, index)
+                       for index in range(9))
+        cases = {
+            "list_of_paths": ("def box():\n    return [SCRIPT]\nslurp(box()[0])\n",
+                              "repository_path_escape"),
+            "tuple_of_paths": ("def box():\n    return (SCRIPT,)\nslurp(box()[0])\n",
+                               "repository_path_escape"),
+            "set_of_paths": ("def box():\n    return {SCRIPT}\nslurp(box())\n",
+                             "repository_path_escape"),
+            "dict_key_path": ("def box():\n    return {SCRIPT: 'k'}\nslurp(box())\n",
+                              "repository_path_escape"),
+            "dict_value_path": ("def box():\n    return {'p': SCRIPT}\nslurp(box())\n",
+                                "repository_path_escape"),
+            "nested_path_containers": ("def box():\n    return {'n': [(SCRIPT,)]}\nslurp(box())\n",
+                                       "repository_path_escape"),
+            "starred_container": ("paths = [SCRIPT]\ndef box():\n    return [*paths]\n"
+                                  "slurp(box())\n", "repository_path_escape"),
+            "comprehension_return": ("def box():\n    return [p for p in [SCRIPT]]\n"
+                                     "slurp(box())\n", "repository_path_escape"),
+            "generator_return": ("def box():\n    return (p for p in [SCRIPT])\n"
+                                 "slurp(box())\n", "repository_path_escape"),
+            "fstring_return": ("def box():\n    return f'{SCRIPT}'\nslurp(box())\n",
+                               "repository_path_escape"),
+            "conditional_return": ("def box():\n    return SCRIPT if FLAG else 'plain'\n"
+                                   "slurp(box())\n", "repository_path_escape"),
+            "named_expression_return": ("def box():\n    return (held := SCRIPT)\n"
+                                        "slurp(box())\n", "repository_path_escape"),
+            "lambda_path_container": ("box = lambda: [SCRIPT]\nslurp(box()[0])\n",
+                                      "repository_path_escape"),
+            "list_of_readers": ("def rbox():\n    return [open]\nsink(rbox())\n",
+                                "reader_callable_escape"),
+            "dict_of_readers": ("def rbox():\n    return {'reader': open}\n"
+                                "rbox()['reader'](SCRIPT)\n", "reader_callable_invocation"),
+            "nested_reader_containers": ("def rbox():\n    return [{'reader': open}]\n"
+                                         "sink(rbox())\n", "reader_callable_escape"),
+            "async_reader_container": ("async def rbox():\n    return [open]\nsink(rbox())\n",
+                                       "reader_callable_escape"),
+            "long_container_hop_chain": ("def hop0():\n    return [SCRIPT]\n" + hops
+                                         + "slurp(hop9())\n", "repository_path_escape"),
+            "mixed_path_and_reader_chain": ("def first():\n    return {'nested': [SCRIPT]}\n"
+                                            "def second():\n    return (first(),)\n"
+                                            "def third():\n    return [second(), open]\n"
+                                            "sink(third())\n", "reader_callable_escape"),
+            "mixed_chain_path_leg": ("def first():\n    return {'nested': [SCRIPT]}\n"
+                                     "def second():\n    return (first(),)\n"
+                                     "slurp(second())\n", "repository_path_escape"),
+        }
+        self.assertGreaterEqual(len(cases), 20, "the A7-3 return matrix must stay complete")
+        accepted = []
+        for name, (body, expected) in cases.items():
+            violations = repository_read_violations(self._return_summary_module(body))
+            if not violations:
+                accepted.append(name)
+                continue
+            self.assertTrue(any(violation.endswith(expected) for violation in violations),
+                            "%s: expected %s, got %s" % (name, expected, violations))
+        self.assertEqual(accepted, [], "these container returns were accepted: %s" % accepted)
+
+    def test_safe_container_returns_and_chains_stay_clean(self):
+        controls = {
+            "literal_container": "def box():\n    return ['plain', ('a', 1)]\nslurp(box()[0])\n",
+            "literal_dict": "def box():\n    return {'k': 'plain'}\nslurp(box())\n",
+            "safe_helper_chain": ("def first():\n    return 'plain'\n"
+                                  "def second():\n    return [first()]\nslurp(second())\n"),
+            "unrelated_sibling_definitions": ("def one():\n    return 'a'\n"
+                                              "def two():\n    return 'b'\n"
+                                              "slurp([one(), two()])\n"),
+        }
+        for name, body in controls.items():
+            self.assertEqual(repository_read_violations(self._return_summary_module(body)), [],
+                             "%s must stay clean" % name)
+
+    def test_lexical_definition_identity_keeps_same_named_functions_apart(self):
+        siblings = ("def one():\n"
+                    "    def load():\n        return SCRIPT\n"
+                    "    return slurp(load())\n"
+                    "def two():\n"
+                    "    def load():\n        return 'plain'\n"
+                    "    return slurp(load())\n")
+        source = self._return_summary_module(siblings)
+        violations = repository_read_violations(source)
+        reported = {int(violation.split(":", 1)[0]) for violation in violations}
+        lines = source.splitlines()
+        tainted_call = lines.index("    return slurp(load())") + 1
+        safe_call = lines.index("    return slurp(load())", lines.index("def two():")) + 1
+        self.assertIn(tainted_call, reported,
+                      "the tainted sibling's call must be reported: %s" % violations)
+        self.assertNotIn(safe_call, reported,
+                         "the safe sibling must contribute nothing: %s" % violations)
+        self.assertTrue(all(violation.endswith("repository_path_escape")
+                            for violation in violations), violations)
+        nested = ("def load():\n    return 'plain'\n"
+                  "def outer():\n"
+                  "    def load():\n        return SCRIPT\n"
+                  "    return slurp(load())\n"
+                  "safe = slurp(load())\n")
+        source = self._return_summary_module(nested)
+        violations = repository_read_violations(source)
+        reported = {int(violation.split(":", 1)[0]) for violation in violations}
+        lines = source.splitlines()
+        self.assertIn(lines.index("    return slurp(load())") + 1, reported, violations)
+        self.assertNotIn(lines.index("safe = slurp(load())") + 1, reported,
+                         "a nested definition must not mark the module function: %s" % violations)
+        rebound = ("def load():\n    return 'plain'\n"
+                   "load = chooser\n"
+                   "slurp(load())\n")
+        self.assertTrue(repository_read_violations(self._return_summary_module(rebound)),
+                        "a rebound same-name function must fail closed")
+
+    # ---- A7-4: lexical, ordered default-name proof ---- #
+    def _default_module(self, body):
+        return self._dependency_module(
+            prologue="from helpers import slurp\nfrom config import CONFIG_PATH\n",
+            helpers=False, extra=body)
+
+    def test_default_names_resolve_only_through_the_relevant_lexical_scope(self):
+        cases = {
+            "sibling_function_local": ("def other():\n    NAME = 'plain'\n    return NAME\n"
+                                       "def load(p=NAME):\n    return slurp(p)\nload()\n"),
+            "nested_function_local": ("def other():\n"
+                                      "    def inner():\n        NAME = 'plain'\n"
+                                      "    return inner\n"
+                                      "def load(p=NAME):\n    return slurp(p)\nload()\n"),
+            "later_module_assignment": ("def load(p=NAME):\n    return slurp(p)\n"
+                                        "NAME = 'plain'\nload()\n"),
+            "two_prior_module_bindings": ("NAME = 'a'\nNAME = 'b'\n"
+                                          "def load(p=NAME):\n    return slurp(p)\nload()\n"),
+            "conditional_prior_binding": ("if FLAG:\n    NAME = 'plain'\n"
+                                          "def load(p=NAME):\n    return slurp(p)\nload()\n"),
+            "enclosing_assignment_after_definition": ("def outer():\n"
+                                                      "    def load(p=NAME):\n"
+                                                      "        return slurp(p)\n"
+                                                      "    NAME = 'plain'\n"
+                                                      "    return load\n"),
+            "sibling_scope_local_for_nested_default": ("def sibling():\n    NAME = 'plain'\n"
+                                                       "def outer():\n"
+                                                       "    def load(p=NAME):\n"
+                                                       "        return slurp(p)\n"
+                                                       "    return load\n"),
+            "branch_dependent_enclosing_binding": ("def outer(flag):\n"
+                                                   "    if flag:\n        NAME = 'plain'\n"
+                                                   "    def load(p=NAME):\n"
+                                                   "        return slurp(p)\n"
+                                                   "    return load\n"),
+            "loop_assigned_enclosing_binding": ("def outer(items):\n"
+                                                "    for NAME in items:\n        pass\n"
+                                                "    def load(p=NAME):\n"
+                                                "        return slurp(p)\n"
+                                                "    return load\n"),
+            "enclosing_parameter": ("def outer(NAME):\n"
+                                    "    def load(p=NAME):\n        return slurp(p)\n"
+                                    "    return load\n"),
+            "imported_name": "def load(p=CONFIG_PATH):\n    return slurp(p)\nload()\n",
+            "cyclic_pair": ("first = second\nsecond = first\n"
+                            "def load(p=first):\n    return slurp(p)\nload()\n"),
+            "constructor_shadowed_by_assignment": ("tuple = chooser\n"
+                                                   "def load(p=tuple(['a'])):\n"
+                                                   "    return slurp(p)\nload()\n"),
+            "constructor_shadowed_by_import": ("from helpers import dict\n"
+                                               "def load(p=dict(a=1)):\n"
+                                               "    return slurp(p)\nload()\n"),
+            "constructor_shadowed_by_parameter": ("def outer(dict):\n"
+                                                  "    def load(p=dict(a=1)):\n"
+                                                  "        return slurp(p)\n"
+                                                  "    return load\n"),
+            "class_body_assignment": ("class Holder:\n    NAME = 'plain'\n"
+                                      "def load(p=NAME):\n    return slurp(p)\nload()\n"),
+        }
+        self.assertGreaterEqual(len(cases), 15, "the A7-4 default matrix must stay complete")
+        accepted = []
+        for name, body in cases.items():
+            violations = repository_read_violations(self._default_module(body))
+            if not violations:
+                accepted.append(name)
+                continue
+            self.assertTrue(any(violation.endswith(("ambiguous_default_binding",
+                                                    "repository_path_escape",
+                                                    "reader_callable_escape"))
+                                for violation in violations),
+                            "%s: unexpected categories %s" % (name, violations))
+        self.assertEqual(accepted, [], "these unresolved defaults were accepted: %s" % accepted)
+
+    def test_scope_aware_default_positive_controls_are_accepted(self):
+        controls = {
+            "unique_module_constant": ("SAFE = 'plain'\n"
+                                       "def load(p=SAFE):\n    return slurp(p)\nload()\n"),
+            "module_literal_container": ("SAFE = ['plain', ('a', 1)]\n"
+                                         "def load(p=SAFE):\n    return slurp(p)\nload()\n"),
+            "unconditional_enclosing_assignment": ("def outer():\n"
+                                                   "    NAME = 'plain'\n"
+                                                   "    def load(p=NAME):\n"
+                                                   "        return slurp(p)\n"
+                                                   "    return load\n"),
+            "sibling_scopes_share_a_name": ("def one():\n"
+                                            "    NAME = 'a'\n"
+                                            "    def load(p=NAME):\n        return slurp(p)\n"
+                                            "    return load\n"
+                                            "def two():\n"
+                                            "    NAME = 'b'\n"
+                                            "    def load(p=NAME):\n        return slurp(p)\n"
+                                            "    return load\n"),
+            "unshadowed_container_constructor": ("def load(p=tuple(['a'])):\n"
+                                                 "    return slurp(p)\nload()\n"),
+        }
+        for name, body in controls.items():
+            self.assertEqual(repository_read_violations(self._default_module(body)), [],
+                             "%s must be accepted as provably safe" % name)
+        # Real-module constant defaults remain accepted by the scope-aware resolver.
+        self.assertEqual(repository_read_violations(read_repo_text("focused_tests")), [])
+
+    # ---- A7-5: type comments are parsed and contract-bearing ---- #
+    def test_parser_captures_function_type_comments(self):
+        annotated = ("def read_repo_text(key):\n"
+                     "    # type: (str) -> str\n"
+                     '    return repo_path(key).read_text(encoding="utf-8")\n')
+        captured = parse_source(annotated).body[0]
+        self.assertEqual(captured.type_comment, "(str) -> str",
+                         "the centralised parser must capture function type comments")
+        self.assertIsNone(ast.parse(annotated).body[0].type_comment,
+                          "plain ast.parse discards the field, which is why it is not used")
+
+    def test_all_module_parsing_is_centralised_through_the_type_comment_parser(self):
+        tree = parse_source(read_repo_text("focused_tests"))
+        # parse_source and its capability probe own the option; the one test that documents what
+        # plain ast.parse discards must obviously still call it.
+        owners = ("parse_source", "_type_comments_supported",
+                  "test_parser_captures_function_type_comments")
+        allowed = set()
+        for statement in ast.walk(tree):
+            if isinstance(statement, ast.FunctionDef) and statement.name in owners:
+                for node in ast.walk(statement):
+                    allowed.add(id(node))
+        offenders = [node.lineno for node in ast.walk(tree)
+                     if isinstance(node, ast.Call) and id(node) not in allowed
+                     and isinstance(node.func, ast.Attribute) and node.func.attr == "parse"
+                     and isinstance(node.func.value, ast.Name) and node.func.value.id == "ast"]
+        self.assertEqual(offenders, [],
+                         "every analysed source must be parsed through parse_source")
+
+    def test_type_comment_mutations_invalidate_the_helper_contract(self):
+        cases = {
+            "type_comment_added": dict(read_repo_text_src=(
+                "def read_repo_text(key):\n"
+                "    # type: (str) -> str\n"
+                '    return repo_path(key).read_text(encoding="utf-8")\n')),
+            "argument_type_changed": dict(read_repo_text_src=(
+                "def read_repo_text(key):\n"
+                "    # type: (bytes) -> str\n"
+                '    return repo_path(key).read_text(encoding="utf-8")\n')),
+            "return_type_changed": dict(read_repo_text_src=(
+                "def read_repo_text(key):\n"
+                "    # type: (str) -> bytes\n"
+                '    return repo_path(key).read_text(encoding="utf-8")\n')),
+            "type_comment_moved_to_another_helper": dict(read_scratch_text_src=(
+                "def read_scratch_text(path):\n"
+                "    # type: (str) -> str\n"
+                "    resolved = Path(path).resolve()\n"
+                "    if resolved == ROOT or ROOT in resolved.parents:\n"
+                '        raise AssertionError("the scratch reader refuses a repository path: %s" % resolved)\n'
+                '    return resolved.read_text(encoding="utf-8")\n')),
+        }
+        accepted = []
+        for name, kwargs in cases.items():
+            source = self._helper_module(**kwargs)
+            problems = sanctioned_helper_contract_violations(source, require_all=True)
+            if not problems:
+                accepted.append(name)
+                continue
+            self.assertTrue(any(problem.endswith("sanctioned_helper_body_mismatch")
+                                for problem in problems), "%s: %s" % (name, problems))
+            self.assertTrue(repository_read_violations(source),
+                            "%s must lose its exemption" % name)
+        self.assertEqual(accepted, [], "these type-comment mutations were accepted: %s" % accepted)
+        # Two differing signatures must not produce equal contracts, and neither may equal the
+        # canonical (comment-free) helper.
+        first = parse_source("def read_repo_text(key):\n"
+                             "    # type: (str) -> str\n"
+                             "    return 1\n").body[0]
+        second = parse_source("def read_repo_text(key):\n"
+                              "    # type: (bytes) -> bytes\n"
+                              "    return 1\n").body[0]
+        bare = parse_source("def read_repo_text(key):\n    return 1\n").body[0]
+        contracts = [_helper_definition_contract(node) for node in (first, second, bare)]
+        self.assertEqual(len(set(contracts)), 3,
+                         "added, changed and absent type comments must all differ")
+
+    def test_parser_fails_closed_without_type_comment_support(self):
+        annotated = ("def read_repo_text(key):\n"
+                     "    # type: (str) -> str\n"
+                     "    return 1\n")
+        with self.assertRaises(AssertionError):
+            parse_source(annotated, supported=False)
+        # A source with no type-comment syntax may still be analysed on such a runtime.
+        self.assertTrue(parse_source("value = 1\n", supported=False).body)
 
     # ---- A2-4: literal exact-head CI checkout ---- #
     def test_both_jobs_check_out_the_literal_exact_head(self):
