@@ -145,28 +145,53 @@ CANONICAL_HELPER_SOURCES = {
 }
 
 
-def _helper_executable_contract(node):
-    """Normalised executable signature and body of a helper definition.
+def _helper_definition_contract(node):
+    """The complete executable and binding-relevant contract of a helper definition.
 
-    Source locations, comments, type comments and a leading docstring are ignored. Statement
-    count and order, control flow, operators, calls and call targets, positional and keyword
-    arguments, constants, registry lookups, encodings, return expressions and exception types
-    are all preserved.
+    Source positions and comments are ignored, and exactly one harmless leading docstring may be
+    removed. Everything else is significant: the node kind, the helper name, the full argument
+    structure (positional-only, positional, keyword-only, defaults, keyword defaults, *args,
+    **kwargs and annotations), the decorator list, the return annotation, the type comment, type
+    parameters where the running interpreter supports them, and every executable statement in
+    order.
     """
     body = list(node.body)
     if (body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant)
             and isinstance(body[0].value.value, str)):
         body = body[1:]
-    return (ast.dump(node.args, include_attributes=False),
-            tuple(ast.dump(stmt, include_attributes=False) for stmt in body))
+
+    def dump(value):
+        if value is None:
+            return None
+        if isinstance(value, list):
+            return tuple(dump(item) for item in value)
+        return ast.dump(value, include_attributes=False)
+
+    return (
+        type(node).__name__,
+        node.name,
+        dump(node.args),
+        dump(list(node.decorator_list)),
+        dump(node.returns),
+        getattr(node, "type_comment", None),
+        # getattr keeps the contract cross-version safe without weakening it: interpreters that
+        # support PEP 695 type parameters contribute them, older ones contribute an empty tuple.
+        dump(list(getattr(node, "type_params", []) or [])),
+        tuple(dump(stmt) for stmt in body),
+    )
 
 
 def canonical_helper_contract(name):
-    return _helper_executable_contract(ast.parse(CANONICAL_HELPER_SOURCES[name]).body[0])
+    return _helper_definition_contract(ast.parse(CANONICAL_HELPER_SOURCES[name]).body[0])
 
+
+# Names the reviewed helper bodies close over. Their canonical declarations are accepted; any
+# other binding would silently change the helpers' reviewed semantics.
+SANCTIONED_HELPER_DEPENDENCIES = ("ROOT", "REPO_DEPENDENCIES", "Path")
 
 # Calls that must never appear inside a sanctioned helper body: they could read, copy or
-# transmit repository content while wearing the exemption.
+# transmit repository content while wearing the exemption. Defence in depth only — the exact
+# definition contract above is the authority.
 HELPER_FORBIDDEN_CALLS = frozenset({
     "copyfile", "copy", "copy2", "copytree", "move", "run", "Popen", "check_call",
     "check_output", "call", "system", "popen", "getattr", "attrgetter", "import_module",
@@ -174,81 +199,237 @@ HELPER_FORBIDDEN_CALLS = frozenset({
 })
 
 
-def _sanctioned_helper_findings(tree):
-    """Exact-body contract for the sanctioned helpers.
+def _sanctioned_helper_findings(tree, require_all=True):
+    """Exact full-definition contract for the sanctioned helpers.
 
-    Returns ``(problems, qualified_names)``. Authority is an AST comparison against the
-    independently declared canonical snippets, never a blacklist of dangerous call names; the
-    blacklist is retained only as defence in depth. Only a helper whose executable body matches
-    exactly may be granted an exemption.
+    Returns ``(problems, qualified_names)``. With ``require_all`` the source must declare exactly
+    one top-level ``FunctionDef`` for each helper — that is the real-module boundary. Generic
+    fixture snippets may pass ``require_all=False`` to waive irrelevant presence noise; that
+    waiver is never evidence that the real module satisfies the contract.
     """
     problems = []
     qualified = set()
-    # A source that declares no sanctioned helper at all has no exemption to grant and no
-    # contract to breach: the contract gates the exemption, it does not require the helpers.
-    declares_any = any(isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-                       and node.name in SANCTIONED_READ_HELPERS
-                       for node in ast.walk(tree))
-    if not declares_any:
-        return [], set()
     for name in SANCTIONED_READ_HELPERS:
         top_level = [stmt for stmt in tree.body
                      if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef))
                      and stmt.name == name]
+        nested = [node for node in ast.walk(tree)
+                  if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                  and node.name == name and all(node is not top for top in top_level)]
         if not top_level:
-            problems.append("%s:sanctioned_helper_missing" % name)
-            nested = [node for node in ast.walk(tree)
-                      if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-                      and node.name == name]
             if nested:
                 problems.append("%s:sanctioned_helper_not_top_level" % name)
+            if require_all:
+                problems.append("%s:sanctioned_helper_missing" % name)
             continue
         if len(top_level) > 1:
             problems.append("%s:sanctioned_helper_duplicate" % name)
             continue
         definition = top_level[0]
-        if not isinstance(definition, ast.FunctionDef):
+        if definition.decorator_list:
+            # A decorator can replace the runtime callable even when the body is byte-identical.
+            problems.append("%s:sanctioned_helper_decorated" % name)
+            continue
+        if _helper_definition_contract(definition) != canonical_helper_contract(name):
             problems.append("%s:sanctioned_helper_body_mismatch" % name)
             continue
-        if _helper_executable_contract(definition) != canonical_helper_contract(name):
-            problems.append("%s:sanctioned_helper_body_mismatch" % name)
-            continue
-        tainted_call = False
+        forbidden = False
         for node in ast.walk(definition):
             if isinstance(node, ast.Call):
                 func = node.func
                 label = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
                 if label in HELPER_FORBIDDEN_CALLS:
                     problems.append("%s:sanctioned_helper_body_mismatch" % name)
-                    tainted_call = True
+                    forbidden = True
                     break
-        if not tainted_call:
+        if not forbidden:
             qualified.add(name)
     return sorted(set(problems)), qualified
 
 
-def sanctioned_helper_contract_violations(source):
-    """Public contract check: each sanctioned helper must be the exact reviewed implementation."""
-    problems, _ = _sanctioned_helper_findings(ast.parse(source))
+def sanctioned_helper_contract_violations(source, require_all=True):
+    """Public contract check. ``require_all=True`` is the real-module boundary."""
+    problems, _ = _sanctioned_helper_findings(ast.parse(source), require_all=require_all)
     return problems
 
 
-# A default expression that cannot be statically proven safe. Constants, containers of
-# constants and plain names are resolvable; a call to anything other than a known pure
-# container constructor is ambiguous and must fail closed rather than be assumed safe.
-_RESOLVABLE_DEFAULT_CALLS = frozenset({"dict", "list", "tuple", "set", "frozenset"})
+def _sanctioned_binding_findings(tree):
+    """Every non-canonical binding, shadowing or callable capture of a sanctioned identifier.
+
+    An exact definition is worthless if the name can later point somewhere else, so any write to
+    a helper identifier — before or after its definition — and any load that is not the callee of
+    a direct call is rejected. The helpers' closed dependencies (``ROOT``, ``REPO_DEPENDENCIES``,
+    ``Path``) may be declared exactly once in their canonical form and never rebound.
+    """
+    problems = []
+    tracked_helpers = set(SANCTIONED_READ_HELPERS)
+    tracked = tracked_helpers | set(SANCTIONED_HELPER_DEPENDENCIES)
+
+    canonical_definition_ids = set()
+    first_seen = set()
+    for stmt in tree.body:
+        if (isinstance(stmt, ast.FunctionDef) and stmt.name in tracked_helpers
+                and stmt.name not in first_seen):
+            first_seen.add(stmt.name)
+            canonical_definition_ids.add(id(stmt))
+    direct_callee_ids = {id(node.func) for node in ast.walk(tree)
+                         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                         and node.func.id in tracked_helpers}
+
+    # The single canonical declaration of each closed dependency.
+    canonical_dependency_ids = set()
+    declared = set()
+    for stmt in tree.body:
+        if (isinstance(stmt, ast.Assign) and len(stmt.targets) == 1
+                and isinstance(stmt.targets[0], ast.Name)
+                and stmt.targets[0].id in SANCTIONED_HELPER_DEPENDENCIES
+                and stmt.targets[0].id not in declared):
+            declared.add(stmt.targets[0].id)
+            canonical_dependency_ids.add(id(stmt.targets[0]))
+        elif isinstance(stmt, ast.ImportFrom) and stmt.module == "pathlib":
+            for alias in stmt.names:
+                bound = alias.asname or alias.name
+                if bound in SANCTIONED_HELPER_DEPENDENCIES and bound not in declared:
+                    declared.add(bound)
+                    canonical_dependency_ids.add(id(alias))
+
+    def rebound(name):
+        problems.append("%s:sanctioned_helper_rebound" % name)
+
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if node.name in tracked and id(node) not in canonical_definition_ids:
+                rebound(node.name)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                bound = alias.asname or alias.name.split(".")[0]
+                if bound in tracked and id(alias) not in canonical_dependency_ids:
+                    rebound(bound)
+        elif isinstance(node, ast.arg):
+            if node.arg in tracked:
+                rebound(node.arg)
+        elif isinstance(node, ast.ExceptHandler):
+            if node.name in tracked:
+                rebound(node.name)
+        elif isinstance(node, ast.Global) or isinstance(node, ast.Nonlocal):
+            for bound in node.names:
+                if bound in tracked:
+                    rebound(bound)
+        elif isinstance(node, ast.Name):
+            if node.id not in tracked:
+                continue
+            if isinstance(node.ctx, (ast.Store, ast.Del)):
+                if id(node) not in canonical_dependency_ids:
+                    rebound(node.id)
+            elif isinstance(node.ctx, ast.Load) and node.id in tracked_helpers:
+                if id(node) not in direct_callee_ids:
+                    problems.append("%s:sanctioned_helper_binding_escape" % node.id)
+        elif hasattr(ast, "MatchAs") and isinstance(node, ast.MatchAs):
+            if node.name in tracked:
+                rebound(node.name)
+        elif hasattr(ast, "MatchStar") and isinstance(node, ast.MatchStar):
+            if node.name in tracked:
+                rebound(node.name)
+        elif hasattr(ast, "MatchMapping") and isinstance(node, ast.MatchMapping):
+            if node.rest in tracked:
+                rebound(node.rest)
+    return sorted(set(problems))
 
 
-def _ambiguous_default(node):
+def sanctioned_helper_binding_violations(source):
+    """Public binding-integrity check for the sanctioned helpers and their dependencies."""
+    return _sanctioned_binding_findings(ast.parse(source))
+
+
+# Container constructors that cannot read or transmit content; used only when every argument is
+# itself proven safe.
+PURE_CONTAINER_CONSTRUCTORS = frozenset({"dict", "list", "tuple", "set", "frozenset"})
+
+
+def _module_level_bindings(tree):
+    """name -> list of bound value expressions. ``None`` marks a binding we cannot resolve."""
+    bindings = {}
+
+    def record(name, value):
+        bindings.setdefault(name, []).append(value)
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            if len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+                record(node.targets[0].id, node.value)
+            else:
+                for target in node.targets:
+                    for sub in ast.walk(target):
+                        if isinstance(sub, ast.Name):
+                            record(sub.id, None)      # destructuring: not statically resolvable
+        elif isinstance(node, ast.AnnAssign):
+            if isinstance(node.target, ast.Name):
+                record(node.target.id, node.value)
+        elif isinstance(node, ast.AugAssign):
+            if isinstance(node.target, ast.Name):
+                record(node.target.id, None)
+        elif isinstance(node, ast.NamedExpr):
+            if isinstance(node.target, ast.Name):
+                record(node.target.id, node.value)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                record(alias.asname or alias.name.split(".")[0], None)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            record(node.name, None)
+        elif isinstance(node, ast.arg):
+            record(node.arg, None)
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            record(node.name, None)
+        elif isinstance(node, (ast.For, ast.AsyncFor)):
+            for sub in ast.walk(node.target):
+                if isinstance(sub, ast.Name):
+                    record(sub.id, None)
+        elif isinstance(node, ast.comprehension):
+            for sub in ast.walk(node.target):
+                if isinstance(sub, ast.Name):
+                    record(sub.id, None)
+        elif isinstance(node, ast.withitem) and node.optional_vars is not None:
+            for sub in ast.walk(node.optional_vars):
+                if isinstance(sub, ast.Name):
+                    record(sub.id, None)
+    return bindings
+
+
+def _default_is_provably_safe(node, bindings, seen=None):
+    """Positive proof that a default expression cannot carry a path or a reader.
+
+    Anything not proven — imported or unresolved names, ambiguous bindings, attributes,
+    subscripts, dynamic calls, cycles, unsupported AST forms — is unsafe.
+    """
     if node is None:
+        return True
+    if seen is None:
+        seen = frozenset()
+    if isinstance(node, ast.Constant):
+        return True
+    if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+        return all(_default_is_provably_safe(element, bindings, seen) for element in node.elts)
+    if isinstance(node, ast.Dict):
+        return (all(_default_is_provably_safe(key, bindings, seen)
+                    for key in node.keys if key is not None)
+                and all(_default_is_provably_safe(value, bindings, seen) for value in node.values))
+    if isinstance(node, ast.JoinedStr):
+        return all(_default_is_provably_safe(part, bindings, seen) for part in node.values)
+    if isinstance(node, ast.FormattedValue):
+        return _default_is_provably_safe(node.value, bindings, seen)
+    if isinstance(node, ast.Call):
+        if isinstance(node.func, ast.Name) and node.func.id in PURE_CONTAINER_CONSTRUCTORS:
+            return (all(_default_is_provably_safe(arg, bindings, seen) for arg in node.args)
+                    and all(_default_is_provably_safe(kw.value, bindings, seen)
+                            for kw in node.keywords))
         return False
-    for sub in ast.walk(node):
-        if isinstance(sub, ast.Call):
-            func = sub.func
-            if isinstance(func, ast.Name):
-                if func.id in _RESOLVABLE_DEFAULT_CALLS or func.id in ("str", "repo_path", "Path"):
-                    continue
-            return True
+    if isinstance(node, ast.Name):
+        if node.id in seen:
+            return False                      # cyclic binding: cannot be proven
+        bound = bindings.get(node.id)
+        if not bound or len(bound) != 1 or bound[0] is None:
+            return False                      # unbound, imported or ambiguously bound
+        return _default_is_provably_safe(bound[0], bindings, seen | {node.id})
     return False
 
 
@@ -278,16 +459,23 @@ def repository_read_violations(source):
     # ---- Sanctioned boundary: only helpers matching the EXACT reviewed body ---- #
     # Nested functions, methods, duplicates and same-named definitions never inherit exemption,
     # and neither does a helper whose executable AST has drifted from its canonical contract.
-    helper_problems, qualified_helpers = _sanctioned_helper_findings(tree)
-    for problem in helper_problems:
+    # Generic snippets waive presence noise; the real-module boundary is the explicit
+    # require_all=True call in test_real_module_requires_all_three_exact_immutable_helpers.
+    helper_problems, qualified_helpers = _sanctioned_helper_findings(tree, require_all=False)
+    binding_problems = _sanctioned_binding_findings(tree)
+    for problem in helper_problems + binding_problems:
         violations.append("0:%s" % problem.split(":", 1)[1])
+    compromised_helpers = {problem.split(":", 1)[0]
+                           for problem in helper_problems + binding_problems}
+    module_bindings = _module_level_bindings(tree)
     top_level_helpers = {}
     for stmt in tree.body:
         if isinstance(stmt, ast.FunctionDef) and stmt.name in SANCTIONED_READ_HELPERS:
             top_level_helpers.setdefault(stmt.name, []).append(stmt)
     sanctioned_ids = set()
     for helper_name, defs in top_level_helpers.items():
-        if len(defs) == 1 and helper_name in qualified_helpers:
+        if (len(defs) == 1 and helper_name in qualified_helpers
+                and helper_name not in compromised_helpers):
             for sub in ast.walk(defs[0]):
                 sanctioned_ids.add(id(sub))
 
@@ -462,7 +650,12 @@ def repository_read_violations(source):
         return names
 
     # Fixpoint so alias chains and helper returns propagate.
-    for _ in range(5):
+    # Monotonic over finite sets, so this converges long before the bound; the bound is
+    # derived from the finite AST universe purely to guarantee deterministic termination.
+    convergence_bound = sum(1 for _ in ast.walk(tree)) + 2
+    rounds = 0
+    while True:
+        rounds += 1
         before = (len(tainted_names), len(reader_names),
                   len(funcs_returning_taint), len(funcs_returning_reader),
                   sum(len(v) for v in scope_tainted.values()),
@@ -470,13 +663,15 @@ def repository_read_violations(source):
         for node in ast.walk(tree):
             if id(node) in sanctioned_ids:
                 continue
-            if isinstance(node, ast.Assign):
+            if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.NamedExpr)):
                 # contains_taint, not is_tainted: a list/tuple/set/dict holding a repository
                 # path taints the name, so later *args / **kwargs forwarding is still caught.
-                if contains_taint(node.value):
-                    tainted_names |= assigned_names(node.targets)
-                if contains_reader(node.value):
-                    reader_names |= assigned_names(node.targets)
+                targets = (node.targets if isinstance(node, ast.Assign) else [node.target])
+                value = getattr(node, "value", None)
+                if contains_taint(value):
+                    tainted_names |= assigned_names(targets)
+                if contains_reader(value):
+                    reader_names |= assigned_names(targets)
             elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 for sub in ast.walk(node):
                     if isinstance(sub, ast.Return):
@@ -496,15 +691,17 @@ def repository_read_violations(source):
                          for param, default in zip(arguments.kwonlyargs, arguments.kw_defaults)
                          if default is not None)
             for param, default in pairs:
-                if contains_taint(default) or _ambiguous_default(default):
+                if contains_taint(default):
                     scope_tainted[id(scope)].add(param.arg)
-                if contains_reader(default):
+                elif contains_reader(default):
                     scope_readers[id(scope)].add(param.arg)
+                elif not _default_is_provably_safe(default, module_bindings):
+                    scope_tainted[id(scope)].add(param.arg)   # unproven: fail closed
         after = (len(tainted_names), len(reader_names),
                  len(funcs_returning_taint), len(funcs_returning_reader),
                  sum(len(v) for v in scope_tainted.values()),
                  sum(len(v) for v in scope_readers.values()))
-        if before == after:
+        if before == after or rounds >= convergence_bound:
             break
 
     def receiver_is_registered(node):
@@ -525,6 +722,8 @@ def repository_read_violations(source):
             if func.id in PURE_TAINT_SAFE_CALLABLES:
                 return True
             if func.id in ("repo_path", "read_repo_text"):
+                if func.id in compromised_helpers:
+                    return False          # the name no longer refers to the reviewed helper
                 return literal_registered_key(node)
         return False
 
@@ -617,7 +816,9 @@ def repository_read_violations(source):
             every_default = (list(node.args.defaults)
                              + [d for d in node.args.kw_defaults if d is not None])
             for default in every_default:
-                if _ambiguous_default(default) and not contains_taint(default):
+                if contains_taint(default) or contains_reader(default):
+                    continue              # a more specific taint category already applies
+                if not _default_is_provably_safe(default, module_bindings):
                     flag(node, "ambiguous_default_binding")
 
     return sorted(set(violations))
@@ -731,6 +932,13 @@ AUTHORITY_RULE_TEXT = (
     "expiry_probe_staging_<operation_id>.incomplete staging artefact, is NON-AUTHORITATIVE "
     "regardless of the terminal_outcome, evidence_persisted or exit_code it contains."
 )
+
+
+def _field_setter(field, value):
+    """Build a record mutation without binding the value through a parameter default."""
+    def mutate(record):
+        record[field] = value
+    return mutate
 
 
 def verified_record(operation_id="expop_authoritative01"):
@@ -2394,14 +2602,14 @@ class ExpiryProbeLibraryTests(unittest.TestCase):
         for index, code in enumerate(c for c in TERMINAL_CODES if c != "EXPIRY_VERIFIED"):
             operation_id = "expop_underlying%02d" % index
             reasons = self._reject(operation_id, "validator_underlying_%s.json" % code,
-                                   lambda r, c=code: r.__setitem__("underlying_terminal_outcome", c))
+                                   _field_setter("underlying_terminal_outcome", code))
             self.assertIn("underlying_outcome_not_derived_from_flags", reasons, code)
 
     def test_every_declared_final_outcome_must_match_the_derived_final_outcome(self):
         for index, code in enumerate(c for c in TERMINAL_CODES if c != "EXPIRY_VERIFIED"):
             operation_id = "expop_final%02d" % index
             reasons = self._reject(operation_id, "validator_final_%s.json" % code,
-                                   lambda r, c=code: r.__setitem__("terminal_outcome", c))
+                                   _field_setter("terminal_outcome", code))
             self.assertIn("terminal_outcome_inconsistent", reasons, code)
 
     def test_final_outcome_must_account_for_recorded_persistence_state(self):
@@ -3482,8 +3690,9 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
             self.assertTrue(any(p.endswith(expected_categories) for p in problems),
                             "%s: unexpected categories %s" % (name, problems))
             # A helper that fails its contract must receive no exemption in the main guard.
-            self.assertTrue(repository_read_violations(source),
-                            "%s: a mismatched helper must not keep its exemption" % name)
+            if not all(problem.endswith("sanctioned_helper_missing") for problem in problems):
+                self.assertTrue(repository_read_violations(source),
+                                "%s: a mismatched helper must not keep its exemption" % name)
         self.assertEqual(accepted, [], "these helper mutations were accepted: %s" % accepted)
 
     def test_mismatched_helper_loses_its_exemption_in_the_main_guard(self):
@@ -3564,6 +3773,227 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
         self.assertEqual(len(violations), 1,
                          "exactly the tainted scope must be reported: %s" % violations)
 
+    # ---- A6-1: full definition contract, required helpers and binding integrity ---- #
+    def test_real_module_requires_all_three_exact_immutable_helpers(self):
+        # The explicit require_all boundary: generic snippets may waive presence, the real
+        # module may not.
+        source = read_repo_text("focused_tests")
+        self.assertEqual(sanctioned_helper_contract_violations(source, require_all=True), [],
+                         "the real module must declare and satisfy all three exact helpers")
+        self.assertEqual(sanctioned_helper_binding_violations(source), [],
+                         "no sanctioned helper identifier may be rebound or captured")
+        self.assertEqual(repository_read_violations(source), [])
+
+    def test_missing_helpers_fail_only_under_the_required_mode(self):
+        snippet = ("from pathlib import Path\n"
+                   "ROOT = Path(__file__).resolve().parents[1]\n"
+                   "value = 1\n")
+        self.assertEqual(sanctioned_helper_contract_violations(snippet, require_all=False), [],
+                         "generic snippets may waive presence noise")
+        required = sanctioned_helper_contract_violations(snippet, require_all=True)
+        self.assertEqual(len(required), 3, required)
+        for name in ("repo_path", "read_repo_text", "read_scratch_text"):
+            self.assertTrue(any(problem.startswith(name + ":")
+                                and problem.endswith("sanctioned_helper_missing")
+                                for problem in required), required)
+
+    def test_helper_definition_contract_covers_decorators_and_annotations(self):
+        cases = {
+            "decorated_repo_path": dict(repo_path_src=(
+                "@replacement\n" + CANONICAL_HELPER_SOURCES["repo_path"])),
+            "decorated_read_repo_text": dict(read_repo_text_src=(
+                "@replacement\n" + CANONICAL_HELPER_SOURCES["read_repo_text"])),
+            "decorated_read_scratch_text": dict(read_scratch_text_src=(
+                "@replacement\n" + CANONICAL_HELPER_SOURCES["read_scratch_text"])),
+            "decorator_call_with_arguments": dict(read_repo_text_src=(
+                "@replacement(mode='swap')\n" + CANONICAL_HELPER_SOURCES["read_repo_text"])),
+            "return_annotation": dict(read_repo_text_src=(
+                'def read_repo_text(key) -> str:\n'
+                '    return repo_path(key).read_text(encoding="utf-8")\n')),
+            "argument_annotation": dict(read_repo_text_src=(
+                'def read_repo_text(key: str):\n'
+                '    return repo_path(key).read_text(encoding="utf-8")\n')),
+            "async_helper": dict(read_repo_text_src=(
+                'async def read_repo_text(key):\n'
+                '    return repo_path(key).read_text(encoding="utf-8")\n')),
+        }
+        accepted = []
+        for name, kwargs in cases.items():
+            source = self._helper_module(**kwargs)
+            problems = sanctioned_helper_contract_violations(source, require_all=True)
+            if not problems:
+                accepted.append(name)
+                continue
+            self.assertTrue(any(problem.endswith(("sanctioned_helper_body_mismatch",
+                                                  "sanctioned_helper_decorated",
+                                                  "sanctioned_helper_missing",
+                                                  "sanctioned_helper_not_top_level"))
+                                for problem in problems),
+                            "%s: %s" % (name, problems))
+            self.assertTrue(repository_read_violations(source),
+                            "%s must lose its exemption" % name)
+        self.assertEqual(accepted, [], "these definition mutations were accepted: %s" % accepted)
+
+    def test_helper_binding_integrity_rejects_every_rebinding_form(self):
+        canonical = (CANONICAL_HELPER_SOURCES["repo_path"]
+                     + CANONICAL_HELPER_SOURCES["read_repo_text"]
+                     + CANONICAL_HELPER_SOURCES["read_scratch_text"])
+        header = ("from pathlib import Path\n"
+                  "ROOT = Path(__file__).resolve().parents[1]\n"
+                  "REPO_DEPENDENCIES = {}\n")
+        cases = {
+            "rebound_after_definition": canonical + "read_repo_text = imported_reader\n",
+            "rebound_before_definition": "read_repo_text = imported_reader\n" + canonical,
+            "rebound_repo_path": canonical + "repo_path = imported_reader\n",
+            "rebound_read_scratch_text": canonical + "read_scratch_text = imported_reader\n",
+            "import_alias_shadow": "from helpers import reader as read_repo_text\n" + canonical,
+            "annotated_assignment": canonical + "read_repo_text: object = imported_reader\n",
+            "augmented_assignment": canonical + "read_repo_text += 1\n",
+            "named_expression": canonical + "value = (read_repo_text := imported_reader)\n",
+            "destructuring": canonical + "read_repo_text, other = imported_reader, 1\n",
+            "loop_target": canonical + "for read_repo_text in candidates:\n    pass\n",
+            "comprehension_target": canonical + "items = [read_repo_text for read_repo_text in candidates]\n",
+            "with_target": canonical + "with opened() as read_repo_text:\n    pass\n",
+            "except_target": canonical + "try:\n    pass\nexcept Exception as read_repo_text:\n    pass\n",
+            "parameter_shadow": canonical + "def outer(read_repo_text):\n    return 1\n",
+            "lambda_parameter_shadow": canonical + "grab = lambda read_repo_text: 1\n",
+            "class_shadow": canonical + "class read_repo_text:\n    pass\n",
+            "second_function_definition": canonical + "def read_repo_text(key):\n    return 1\n",
+            "alias_capture": canonical + "alias = read_repo_text\n",
+            "container_capture": canonical + "holders = [read_repo_text]\n",
+            "returned_capture": canonical + "def leak():\n    return read_repo_text\n",
+            "passed_capture": canonical + "wrapper(read_repo_text)\n",
+            "rebound_root": canonical + "ROOT = Path('/elsewhere')\n",
+            "rebound_registry": canonical + "REPO_DEPENDENCIES = {}\n",
+            "rebound_path": canonical + "from other import Path\n",
+        }
+        self.assertGreaterEqual(len(cases), 23, "the A6-1 binding matrix must stay complete")
+        accepted = []
+        for name, body in cases.items():
+            source = header + body
+            problems = sanctioned_helper_binding_violations(source)
+            guard = repository_read_violations(source)
+            if not problems:
+                accepted.append(name)
+                continue
+            self.assertTrue(any(problem.endswith(("sanctioned_helper_rebound",
+                                                  "sanctioned_helper_binding_escape",
+                                                  "sanctioned_helper_duplicate"))
+                                for problem in problems),
+                            "%s: %s" % (name, problems))
+            self.assertTrue(guard, "%s must surface through the main guard" % name)
+        self.assertEqual(accepted, [], "these rebindings were accepted: %s" % accepted)
+
+    def test_rebound_helper_loses_literal_sanctioned_call_authority(self):
+        header = ("from pathlib import Path\n"
+                  "ROOT = Path(__file__).resolve().parents[1]\n"
+                  "REPO_DEPENDENCIES = {}\n")
+        canonical = (CANONICAL_HELPER_SOURCES["repo_path"]
+                     + CANONICAL_HELPER_SOURCES["read_repo_text"]
+                     + CANONICAL_HELPER_SOURCES["read_scratch_text"])
+        # A literal registered key is normally the one sanctioned route; after rebinding, the
+        # name no longer refers to the reviewed helper and the allowance must be withheld.
+        clean = header + canonical + 'text = read_repo_text("readme")\n'
+        self.assertEqual(repository_read_violations(clean), [])
+        rebound = (header + canonical
+                   + "read_repo_text = imported_reader\n"
+                   + 'text = read_repo_text("readme")\n')
+        violations = repository_read_violations(rebound)
+        self.assertTrue(any(v.endswith("sanctioned_helper_rebound") for v in violations), violations)
+
+    # ---- A6-2: positively proven default safety and finite convergence ---- #
+    def test_default_safety_requires_positive_proof(self):
+        header = ("from pathlib import Path\n"
+                  "from config import SETTINGS, CONFIG_PATH\n"
+                  "from helpers import slurp\n"
+                  "import config\n"
+                  "ROOT = Path(__file__).resolve().parents[1]\n")
+        chain_paths = "".join("alias%d = alias%d\n" % (i + 1, i) for i in range(9))
+        chain_helpers = "".join("def hop%d():\n    return hop%d()\n" % (i + 1, i) for i in range(9))
+        cases = {
+            "imported_path_name": "def load(p=CONFIG_PATH):\n    return slurp(p)\nload()\n",
+            "imported_reader_name": "def load(r=slurp):\n    return r('x')\nload()\n",
+            "unresolved_name": "def load(p=MISSING_NAME):\n    return slurp(p)\nload()\n",
+            "imported_module_attribute": "def load(p=config.PATH):\n    return slurp(p)\nload()\n",
+            "nested_module_attribute": "def load(p=config.section.PATH):\n    return slurp(p)\nload()\n",
+            "imported_subscript": "def load(p=SETTINGS['path']):\n    return slurp(p)\nload()\n",
+            "annotated_path_alias": ("alias: object = CONFIG_PATH\n"
+                                     "def load(p=alias):\n    return slurp(p)\nload()\n"),
+            "annotated_reader_alias": ("reader: object = slurp\n"
+                                       "def load(r=reader):\n    return r('x')\nload()\n"),
+            "named_expression_path_alias": ("value = (alias := CONFIG_PATH)\n"
+                                            "def load(p=alias):\n    return slurp(p)\nload()\n"),
+            "named_expression_reader_alias": ("value = (reader := slurp)\n"
+                                              "def load(r=reader):\n    return r('x')\nload()\n"),
+            "destructured_path_alias": ("alias, other = CONFIG_PATH, 1\n"
+                                        "def load(p=alias):\n    return slurp(p)\nload()\n"),
+            "destructured_reader_alias": ("reader, other = slurp, 1\n"
+                                          "def load(r=reader):\n    return r('x')\nload()\n"),
+            "long_alias_chain": ("alias0 = CONFIG_PATH\n" + chain_paths
+                                 + "def load(p=alias9):\n    return slurp(p)\nload()\n"),
+            "long_helper_return_chain": ("def hop0():\n    return CONFIG_PATH\n" + chain_helpers
+                                         + "def load(p=hop9()):\n    return slurp(p)\nload()\n"),
+            "mixed_container_chain": ("def hop0():\n    return CONFIG_PATH\n" + chain_helpers
+                                      + "bundle = [hop9()]\n"
+                                      + "def load(p=bundle):\n    return slurp(p)\nload()\n"),
+            "unresolved_name_cycle": ("first = second\nsecond = first\n"
+                                      "def load(p=first):\n    return slurp(p)\nload()\n"),
+            "attribute_subscript_cycle": ("first = config.A[second]\nsecond = config.B[first]\n"
+                                          "def load(p=first):\n    return slurp(p)\nload()\n"),
+            "reader_in_nested_container": ("def load(bundle={'inner': [slurp]}):\n"
+                                           "    return bundle['inner'][0]('x')\nload()\n"),
+        }
+        self.assertGreaterEqual(len(cases), 18, "the A6-2 default matrix must stay complete")
+        accepted = []
+        for name, body in cases.items():
+            violations = repository_read_violations(header + body)
+            if not violations:
+                accepted.append(name)
+                continue
+            self.assertTrue(
+                any(v.endswith(("ambiguous_default_binding", "repository_path_escape",
+                                "reader_callable_escape", "unresolved_repository_read",
+                                "builtin_open", "bound_reader_capture"))
+                    for v in violations),
+                "%s: unexpected categories %s" % (name, violations))
+        self.assertEqual(accepted, [], "these unsafe defaults were accepted: %s" % accepted)
+
+    def test_provably_safe_defaults_are_accepted(self):
+        header = ("from pathlib import Path\n"
+                  "from helpers import slurp\n"
+                  "ROOT = Path(__file__).resolve().parents[1]\n")
+        controls = {
+            "literal_scalar": "def load(p='plain'):\n    return slurp(p)\nload()\n",
+            "literal_container": "def load(p=['a', ('b', 1), {'c': 2}]):\n    return slurp(p)\nload()\n",
+            "safe_fstring": "def load(p=f'{1}-plain'):\n    return slurp(p)\nload()\n",
+            "unique_immutable_constant": ("SAFE_NAME = 'plain'\n"
+                                          "def load(p=SAFE_NAME):\n    return slurp(p)\nload()\n"),
+            "sibling_same_parameter_name": ("def one(p='plain'):\n    return slurp(p)\n"
+                                            "def two(p='other'):\n    return slurp(p)\n"),
+            "none_default": "def load(p=None):\n    return slurp(p)\nload()\n",
+        }
+        for name, body in controls.items():
+            self.assertEqual(repository_read_violations(header + body), [],
+                             "%s must be accepted as provably safe" % name)
+
+    def test_taint_analysis_converges_without_a_fixed_pass_count(self):
+        # A monotonic fixpoint, not a hard-coded pass budget: chains far longer than the old
+        # five-iteration cap must still resolve.
+        source = read_repo_text("focused_tests")
+        fixed_pass_needle = "for _ in range(" + "5):"
+        self.assertNotIn(fixed_pass_needle, source,
+                         "the fixpoint must not be bounded by an arbitrary constant")
+        self.assertIn("convergence_bound", source,
+                      "termination must be bounded by the finite AST universe")
+        header = ("from pathlib import Path\n"
+                  "from helpers import slurp\n"
+                  "ROOT = Path(__file__).resolve().parents[1]\n"
+                  "SCRIPT = repo_path('probe_script')\n")
+        chain = "alias0 = SCRIPT\n" + "".join("alias%d = alias%d\n" % (i + 1, i) for i in range(12))
+        violations = repository_read_violations(header + chain + "slurp(alias12)\n")
+        self.assertTrue(any(v.endswith("repository_path_escape") for v in violations),
+                        "a 13-link alias chain must converge to a violation: %s" % violations)
+
     def test_sanctioned_helper_body_tampering_is_detected(self):
         # A4-2: the exemption covers the exact reviewed helper bodies. A helper body that grows
         # an external read or copy must fail the guard contract rather than inherit exemption.
@@ -3598,14 +4028,16 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
             REPO_DEPENDENCIES["injected"] = "somewhere/else.md"
 
     def test_unregistered_dependency_key_fails_closed_at_runtime(self):
-        # Called through an alias on purpose: a literal repo_path("<unregistered>") is itself
-        # a guard violation, and this negative self-test performs no read. The guard still
-        # catches the dangerous case, because reading from an alias-returned path is an
-        # unresolved_repository_read.
-        resolver = repo_path
+        # Executed from the canonical contract snippet that the live helper is now pinned to
+        # byte-for-byte, so the runtime proof needs no alias of a sanctioned helper — aliasing
+        # one is itself an A6-1 binding-escape violation.
+        namespace = {"ROOT": Path("scratch-root"), "REPO_DEPENDENCIES": dict(REPO_DEPENDENCIES)}
+        exec(compile(CANONICAL_HELPER_SOURCES["repo_path"], "<canonical>", "exec"), namespace)
+        canonical_resolver = namespace["repo_path"]
         self.assertNotIn("definitely_not_registered", REPO_DEPENDENCIES)
         with self.assertRaises(KeyError):
-            resolver("definitely_not_registered")
+            canonical_resolver("definitely_not_registered")
+        self.assertEqual(canonical_resolver("readme"), Path("scratch-root") / "README.md")
 
     def test_a_newly_registered_dependency_must_also_enter_the_workflow_filter(self):
         # Closure in the other direction: a registry entry with no matching path pattern is
