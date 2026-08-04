@@ -118,6 +118,53 @@ PURE_LEXICAL_METHODS = frozenset({
     "split", "rsplit", "replace", "format", "join", "as_posix", "count", "find",
 })
 DYNAMIC_ATTRIBUTE_CALLS = frozenset({"getattr", "attrgetter", "import_module", "__import__"})
+# ---- A5-1: the independent canonical contract for the sanctioned helper bodies ---- #
+# These snippets are maintained by hand and are the AUTHORITY the live helpers are compared
+# against. They are deliberately NOT derived from the live definitions, so the comparison
+# cannot be tautological. Docstrings, comments and source locations are normalised away; every
+# executable statement, call, argument, constant, operator, exception type and control-flow
+# construct is significant.
+CANONICAL_HELPER_SOURCES = {
+    "repo_path": (
+        'def repo_path(key):\n'
+        '    if key not in REPO_DEPENDENCIES:\n'
+        '        raise KeyError(\"unregistered repository dependency key: %r\" % (key,))\n'
+        '    return ROOT / REPO_DEPENDENCIES[key]\n'
+    ),
+    "read_repo_text": (
+        'def read_repo_text(key):\n'
+        '    return repo_path(key).read_text(encoding=\"utf-8\")\n'
+    ),
+    "read_scratch_text": (
+        'def read_scratch_text(path):\n'
+        '    resolved = Path(path).resolve()\n'
+        '    if resolved == ROOT or ROOT in resolved.parents:\n'
+        '        raise AssertionError(\"the scratch reader refuses a repository path: %s\" % resolved)\n'
+        '    return resolved.read_text(encoding=\"utf-8\")\n'
+    ),
+}
+
+
+def _helper_executable_contract(node):
+    """Normalised executable signature and body of a helper definition.
+
+    Source locations, comments, type comments and a leading docstring are ignored. Statement
+    count and order, control flow, operators, calls and call targets, positional and keyword
+    arguments, constants, registry lookups, encodings, return expressions and exception types
+    are all preserved.
+    """
+    body = list(node.body)
+    if (body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant)
+            and isinstance(body[0].value.value, str)):
+        body = body[1:]
+    return (ast.dump(node.args, include_attributes=False),
+            tuple(ast.dump(stmt, include_attributes=False) for stmt in body))
+
+
+def canonical_helper_contract(name):
+    return _helper_executable_contract(ast.parse(CANONICAL_HELPER_SOURCES[name]).body[0])
+
+
 # Calls that must never appear inside a sanctioned helper body: they could read, copy or
 # transmit repository content while wearing the exemption.
 HELPER_FORBIDDEN_CALLS = frozenset({
@@ -127,36 +174,82 @@ HELPER_FORBIDDEN_CALLS = frozenset({
 })
 
 
-def sanctioned_helper_contract_violations(source):
-    """Contract check for the exempt helper bodies themselves.
+def _sanctioned_helper_findings(tree):
+    """Exact-body contract for the sanctioned helpers.
 
-    The exemption is only safe while the reviewed helpers stay pure: exactly one top-level
-    definition each, and no external read, copy or process call inside them. A tampered helper
-    body must fail here rather than inherit the exemption.
+    Returns ``(problems, qualified_names)``. Authority is an AST comparison against the
+    independently declared canonical snippets, never a blacklist of dangerous call names; the
+    blacklist is retained only as defence in depth. Only a helper whose executable body matches
+    exactly may be granted an exemption.
     """
-    tree = ast.parse(source)
     problems = []
-    definitions = {}
-    for stmt in tree.body:
-        if isinstance(stmt, ast.FunctionDef) and stmt.name in SANCTIONED_READ_HELPERS:
-            definitions.setdefault(stmt.name, []).append(stmt)
-    for name, defs in definitions.items():
-        if len(defs) != 1:
-            problems.append("%s:duplicate_sanctioned_definition" % name)
-    for name, defs in definitions.items():
-        for definition in defs:
-            for node in ast.walk(definition):
-                if not isinstance(node, ast.Call):
-                    continue
+    qualified = set()
+    # A source that declares no sanctioned helper at all has no exemption to grant and no
+    # contract to breach: the contract gates the exemption, it does not require the helpers.
+    declares_any = any(isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                       and node.name in SANCTIONED_READ_HELPERS
+                       for node in ast.walk(tree))
+    if not declares_any:
+        return [], set()
+    for name in SANCTIONED_READ_HELPERS:
+        top_level = [stmt for stmt in tree.body
+                     if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef))
+                     and stmt.name == name]
+        if not top_level:
+            problems.append("%s:sanctioned_helper_missing" % name)
+            nested = [node for node in ast.walk(tree)
+                      if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                      and node.name == name]
+            if nested:
+                problems.append("%s:sanctioned_helper_not_top_level" % name)
+            continue
+        if len(top_level) > 1:
+            problems.append("%s:sanctioned_helper_duplicate" % name)
+            continue
+        definition = top_level[0]
+        if not isinstance(definition, ast.FunctionDef):
+            problems.append("%s:sanctioned_helper_body_mismatch" % name)
+            continue
+        if _helper_executable_contract(definition) != canonical_helper_contract(name):
+            problems.append("%s:sanctioned_helper_body_mismatch" % name)
+            continue
+        tainted_call = False
+        for node in ast.walk(definition):
+            if isinstance(node, ast.Call):
                 func = node.func
-                label = None
-                if isinstance(func, ast.Attribute):
-                    label = func.attr
-                elif isinstance(func, ast.Name):
-                    label = func.id
+                label = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", None)
                 if label in HELPER_FORBIDDEN_CALLS:
-                    problems.append("%s:%d:helper_body_external_call" % (name, node.lineno))
-    return sorted(set(problems))
+                    problems.append("%s:sanctioned_helper_body_mismatch" % name)
+                    tainted_call = True
+                    break
+        if not tainted_call:
+            qualified.add(name)
+    return sorted(set(problems)), qualified
+
+
+def sanctioned_helper_contract_violations(source):
+    """Public contract check: each sanctioned helper must be the exact reviewed implementation."""
+    problems, _ = _sanctioned_helper_findings(ast.parse(source))
+    return problems
+
+
+# A default expression that cannot be statically proven safe. Constants, containers of
+# constants and plain names are resolvable; a call to anything other than a known pure
+# container constructor is ambiguous and must fail closed rather than be assumed safe.
+_RESOLVABLE_DEFAULT_CALLS = frozenset({"dict", "list", "tuple", "set", "frozenset"})
+
+
+def _ambiguous_default(node):
+    if node is None:
+        return False
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Call):
+            func = sub.func
+            if isinstance(func, ast.Name):
+                if func.id in _RESOLVABLE_DEFAULT_CALLS or func.id in ("str", "repo_path", "Path"):
+                    continue
+            return True
+    return False
 
 
 def repository_read_violations(source):
@@ -182,15 +275,19 @@ def repository_read_violations(source):
         return (len(args) == 1 and isinstance(args[0], ast.Constant)
                 and isinstance(args[0].value, str) and args[0].value in REPO_DEPENDENCIES)
 
-    # ---- Sanctioned boundary: the exact reviewed top-level helper bodies, nothing else ---- #
-    # Nested functions, methods and arbitrary same-named definitions never inherit exemption.
+    # ---- Sanctioned boundary: only helpers matching the EXACT reviewed body ---- #
+    # Nested functions, methods, duplicates and same-named definitions never inherit exemption,
+    # and neither does a helper whose executable AST has drifted from its canonical contract.
+    helper_problems, qualified_helpers = _sanctioned_helper_findings(tree)
+    for problem in helper_problems:
+        violations.append("0:%s" % problem.split(":", 1)[1])
     top_level_helpers = {}
     for stmt in tree.body:
         if isinstance(stmt, ast.FunctionDef) and stmt.name in SANCTIONED_READ_HELPERS:
             top_level_helpers.setdefault(stmt.name, []).append(stmt)
     sanctioned_ids = set()
-    for defs in top_level_helpers.values():
-        if len(defs) == 1:
+    for helper_name, defs in top_level_helpers.items():
+        if len(defs) == 1 and helper_name in qualified_helpers:
             for sub in ast.walk(defs[0]):
                 sanctioned_ids.add(id(sub))
 
@@ -228,11 +325,38 @@ def repository_read_violations(source):
     funcs_returning_taint = set()
     funcs_returning_reader = set()
 
+    # ---- A5-2: lexically scoped default-bound taint ---- #
+    # Parent links let a Name consult the parameters of every ENCLOSING function or lambda, so a
+    # default value taints only its own scope and the closures nested inside it. A same-named
+    # parameter in a sibling scope is unaffected.
+    parents = {}
+    for parent in ast.walk(tree):
+        for child in ast.iter_child_nodes(parent):
+            parents[id(child)] = parent
+    scopes = [node for node in ast.walk(tree)
+              if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))]
+    scope_tainted = {id(scope): set() for scope in scopes}
+    scope_readers = {id(scope): set() for scope in scopes}
+
+    def enclosing_scopes(node):
+        found = []
+        current = parents.get(id(node))
+        while current is not None:
+            if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                found.append(current)
+            current = parents.get(id(current))
+        return found
+
     def is_tainted(node):
         if node is None:
             return False
         if isinstance(node, ast.Name):
-            return node.id in tainted_names or node.id == "__file__"
+            if node.id in tainted_names or node.id == "__file__":
+                return True
+            for scope in enclosing_scopes(node):
+                if node.id in scope_tainted.get(id(scope), ()):
+                    return True
+            return False
         if isinstance(node, ast.Call):
             if is_repo_path_call(node):
                 return True
@@ -313,7 +437,12 @@ def repository_read_violations(source):
         if node is None:
             return False
         if isinstance(node, ast.Name):
-            return node.id in open_aliases or node.id in reader_names
+            if node.id in open_aliases or node.id in reader_names:
+                return True
+            for scope in enclosing_scopes(node):
+                if node.id in scope_readers.get(id(scope), ()):
+                    return True
+            return False
         if isinstance(node, ast.Attribute):
             return node.attr in REPO_READ_METHODS
         if isinstance(node, ast.Call):
@@ -335,7 +464,9 @@ def repository_read_violations(source):
     # Fixpoint so alias chains and helper returns propagate.
     for _ in range(5):
         before = (len(tainted_names), len(reader_names),
-                  len(funcs_returning_taint), len(funcs_returning_reader))
+                  len(funcs_returning_taint), len(funcs_returning_reader),
+                  sum(len(v) for v in scope_tainted.values()),
+                  sum(len(v) for v in scope_readers.values()))
         for node in ast.walk(tree):
             if id(node) in sanctioned_ids:
                 continue
@@ -353,11 +484,26 @@ def repository_read_violations(source):
                             funcs_returning_taint.add(node.name)
                         if is_reader(sub.value):
                             funcs_returning_reader.add(node.name)
-            elif isinstance(node, ast.Lambda):
-                if is_reader(node.body) or is_tainted(node.body):
-                    pass  # reported directly in the violation pass
+        # Default-bound parameters, mapped correctly and confined to their own scope.
+        for scope in scopes:
+            arguments = scope.args
+            positional = list(getattr(arguments, "posonlyargs", [])) + list(arguments.args)
+            defaults = list(arguments.defaults)
+            pairs = []
+            if defaults:
+                pairs.extend(zip(positional[len(positional) - len(defaults):], defaults))
+            pairs.extend((param, default)
+                         for param, default in zip(arguments.kwonlyargs, arguments.kw_defaults)
+                         if default is not None)
+            for param, default in pairs:
+                if contains_taint(default) or _ambiguous_default(default):
+                    scope_tainted[id(scope)].add(param.arg)
+                if contains_reader(default):
+                    scope_readers[id(scope)].add(param.arg)
         after = (len(tainted_names), len(reader_names),
-                 len(funcs_returning_taint), len(funcs_returning_reader))
+                 len(funcs_returning_taint), len(funcs_returning_reader),
+                 sum(len(v) for v in scope_tainted.values()),
+                 sum(len(v) for v in scope_readers.values()))
         if before == after:
             break
 
@@ -465,6 +611,14 @@ def repository_read_violations(source):
         if isinstance(node, ast.Lambda):
             if is_reader(node.body):
                 flag(node, "reader_callable_escape")
+
+        # ---- Defaults that cannot be statically proven safe ---- #
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            every_default = (list(node.args.defaults)
+                             + [d for d in node.args.kw_defaults if d is not None])
+            for default in every_default:
+                if _ambiguous_default(default) and not contains_taint(default):
+                    flag(node, "ambiguous_default_binding")
 
     return sorted(set(violations))
 
@@ -3198,6 +3352,217 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                     for v in violations),
                 "%s: unexpected categories %s" % (name, violations))
         self.assertEqual(accepted, [], "these bypasses were silently accepted: %s" % accepted)
+
+    # ---- A5-1: the exemption is bound to the EXACT reviewed helper bodies ---- #
+    def _helper_module(self, repo_path_src=None, read_repo_text_src=None,
+                       read_scratch_text_src=None, prologue="", extra=""):
+        return (prologue
+                + "from pathlib import Path\n"
+                + "ROOT = Path(__file__).resolve().parents[1]\n"
+                + "REPO_DEPENDENCIES = {}\n"
+                + (repo_path_src if repo_path_src is not None else CANONICAL_HELPER_SOURCES["repo_path"])
+                + (read_repo_text_src if read_repo_text_src is not None else CANONICAL_HELPER_SOURCES["read_repo_text"])
+                + (read_scratch_text_src if read_scratch_text_src is not None else CANONICAL_HELPER_SOURCES["read_scratch_text"])
+                + extra)
+
+    def test_real_helpers_satisfy_the_exact_reviewed_contract(self):
+        self.assertEqual(sanctioned_helper_contract_violations(read_repo_text("focused_tests")), [],
+                         "the reviewed helper bodies must match their independent canonical contract")
+
+    def test_helper_contract_ignores_comments_docstrings_and_line_movement(self):
+        cosmetic = self._helper_module(
+            repo_path_src=('def repo_path(key):\n'
+                           '    """A different but behaviour-free docstring."""\n'
+                           '    # an added comment\n'
+                           '\n'
+                           '    if key not in REPO_DEPENDENCIES:\n'
+                           '        raise KeyError("unregistered repository dependency key: %r" % (key,))\n'
+                           '    return ROOT / REPO_DEPENDENCIES[key]\n'))
+        self.assertEqual(sanctioned_helper_contract_violations(cosmetic), [],
+                         "comments, docstrings and blank lines must not invalidate the contract")
+
+    def test_every_helper_body_mutation_is_rejected(self):
+        canonical = CANONICAL_HELPER_SOURCES
+        mutations = {
+            "second_read_text": dict(read_repo_text_src=(
+                'def read_repo_text(key):\n'
+                '    extra = repo_path(key).read_text(encoding="utf-8")\n'
+                '    return repo_path(key).read_text(encoding="utf-8")\n')),
+            "read_bytes_added": dict(read_repo_text_src=(
+                'def read_repo_text(key):\n'
+                '    blob = repo_path(key).read_bytes()\n'
+                '    return repo_path(key).read_text(encoding="utf-8")\n')),
+            "builtin_open_added": dict(read_repo_text_src=(
+                'def read_repo_text(key):\n'
+                '    handle = open(repo_path(key))\n'
+                '    return repo_path(key).read_text(encoding="utf-8")\n')),
+            "imported_open_alias_added": dict(
+                prologue="from io import open as io_open\n",
+                read_repo_text_src=('def read_repo_text(key):\n'
+                                    '    handle = io_open(repo_path(key))\n'
+                                    '    return repo_path(key).read_text(encoding="utf-8")\n')),
+            "copy_added": dict(
+                prologue="import shutil\n",
+                read_repo_text_src=('def read_repo_text(key):\n'
+                                    '    shutil.copyfile(repo_path(key), Path("/scratch/leak"))\n'
+                                    '    return repo_path(key).read_text(encoding="utf-8")\n')),
+            "subprocess_added": dict(
+                prologue="import subprocess\n",
+                read_repo_text_src=('def read_repo_text(key):\n'
+                                    '    subprocess.run(["tool", str(repo_path(key))])\n'
+                                    '    return repo_path(key).read_text(encoding="utf-8")\n')),
+            "wrapper_receiving_path": dict(read_repo_text_src=(
+                'def read_repo_text(key):\n'
+                '    forward(repo_path(key))\n'
+                '    return repo_path(key).read_text(encoding="utf-8")\n')),
+            "registry_check_changed": dict(repo_path_src=(
+                'def repo_path(key):\n'
+                '    if key in REPO_DEPENDENCIES:\n'
+                '        raise KeyError("unregistered repository dependency key: %r" % (key,))\n'
+                '    return ROOT / REPO_DEPENDENCIES[key]\n')),
+            "registry_lookup_changed": dict(repo_path_src=(
+                'def repo_path(key):\n'
+                '    if key not in REPO_DEPENDENCIES:\n'
+                '        raise KeyError("unregistered repository dependency key: %r" % (key,))\n'
+                '    return ROOT / key\n')),
+            "encoding_changed": dict(read_repo_text_src=(
+                'def read_repo_text(key):\n'
+                '    return repo_path(key).read_text(encoding="latin-1")\n')),
+            "containment_removed": dict(read_scratch_text_src=(
+                'def read_scratch_text(path):\n'
+                '    resolved = Path(path).resolve()\n'
+                '    return resolved.read_text(encoding="utf-8")\n')),
+            "statement_before": dict(read_scratch_text_src=(
+                'def read_scratch_text(path):\n'
+                '    audit = 1\n'
+                '    resolved = Path(path).resolve()\n'
+                '    if resolved == ROOT or ROOT in resolved.parents:\n'
+                '        raise AssertionError("the scratch reader refuses a repository path: %s" % resolved)\n'
+                '    return resolved.read_text(encoding="utf-8")\n')),
+            "statement_after": dict(repo_path_src=(
+                'def repo_path(key):\n'
+                '    if key not in REPO_DEPENDENCIES:\n'
+                '        raise KeyError("unregistered repository dependency key: %r" % (key,))\n'
+                '    result = ROOT / REPO_DEPENDENCIES[key]\n'
+                '    return result\n')),
+            "statements_reordered": dict(read_scratch_text_src=(
+                'def read_scratch_text(path):\n'
+                '    if resolved == ROOT or ROOT in resolved.parents:\n'
+                '        raise AssertionError("the scratch reader refuses a repository path: %s" % resolved)\n'
+                '    resolved = Path(path).resolve()\n'
+                '    return resolved.read_text(encoding="utf-8")\n')),
+            "exception_type_changed": dict(repo_path_src=(
+                'def repo_path(key):\n'
+                '    if key not in REPO_DEPENDENCIES:\n'
+                '        raise ValueError("unregistered repository dependency key: %r" % (key,))\n'
+                '    return ROOT / REPO_DEPENDENCIES[key]\n')),
+            "missing_helper": dict(read_scratch_text_src=""),
+            "duplicate_helper": dict(extra=canonical["read_repo_text"]),
+            "duplicate_plus_correct": dict(extra=canonical["repo_path"]),
+            "nested_only": dict(read_scratch_text_src=(
+                'def outer():\n'
+                '    def read_scratch_text(path):\n'
+                '        return Path(path).read_text(encoding="utf-8")\n'
+                '    return read_scratch_text\n')),
+            "method_only": dict(read_scratch_text_src=(
+                'class Holder:\n'
+                '    def read_scratch_text(self, path):\n'
+                '        return Path(path).read_text(encoding="utf-8")\n')),
+        }
+        self.assertGreaterEqual(len(mutations), 20, "the A5-1 mutation matrix must stay complete")
+        accepted = []
+        expected_categories = ("sanctioned_helper_missing", "sanctioned_helper_duplicate",
+                               "sanctioned_helper_body_mismatch", "sanctioned_helper_not_top_level")
+        for name, kwargs in mutations.items():
+            source = self._helper_module(**kwargs)
+            problems = sanctioned_helper_contract_violations(source)
+            if not problems:
+                accepted.append(name)
+                continue
+            self.assertTrue(any(p.endswith(expected_categories) for p in problems),
+                            "%s: unexpected categories %s" % (name, problems))
+            # A helper that fails its contract must receive no exemption in the main guard.
+            self.assertTrue(repository_read_violations(source),
+                            "%s: a mismatched helper must not keep its exemption" % name)
+        self.assertEqual(accepted, [], "these helper mutations were accepted: %s" % accepted)
+
+    def test_mismatched_helper_loses_its_exemption_in_the_main_guard(self):
+        tampered = self._helper_module(read_repo_text_src=(
+            'def read_repo_text(key):\n'
+            '    leaked = repo_path(key).read_bytes()\n'
+            '    return repo_path(key).read_text(encoding="utf-8")\n'))
+        violations = repository_read_violations(tampered)
+        self.assertTrue(any(v.endswith("sanctioned_helper_body_mismatch") for v in violations),
+                        violations)
+        self.assertTrue(any(v.endswith(("unresolved_repository_read", "bound_reader_capture"))
+                            for v in violations),
+                        "the unexempted body's reads must now be visible: %s" % violations)
+
+    # ---- A5-2: default-bound taint and closure propagation ---- #
+    def test_ast_guard_rejects_repository_taint_bound_through_defaults(self):
+        header = ("from pathlib import Path\n"
+                  "from helpers import slurp\n"
+                  "ROOT = Path(__file__).resolve().parents[1]\n"
+                  "SCRIPT = repo_path('probe_script')\n")
+        fixtures = {
+            "positional_default": "def load(p=SCRIPT):\n    return slurp(p)\nload()\n",
+            "keyword_only_default": "def load(*, p=SCRIPT):\n    return slurp(p)\nload()\n",
+            "lambda_default": "load = lambda p=SCRIPT: slurp(p)\nload()\n",
+            "async_default": "async def load(p=SCRIPT):\n    return slurp(p)\n",
+            "str_default": "def load(p=str(SCRIPT)):\n    return slurp(p)\nload()\n",
+            "list_default": "def load(p=[SCRIPT]):\n    return slurp(p)\nload()\n",
+            "tuple_default": "def load(p=(SCRIPT,)):\n    return slurp(p)\nload()\n",
+            "set_default": "def load(p={SCRIPT}):\n    return slurp(p)\nload()\n",
+            "dict_value_default": "def load(p={'k': SCRIPT}):\n    return slurp(p)\nload()\n",
+            "dict_key_default": "def load(p={SCRIPT: 'k'}):\n    return slurp(p)\nload()\n",
+            "helper_returned_default": ("def where():\n    return SCRIPT\n"
+                                        "def load(p=where()):\n    return slurp(p)\nload()\n"),
+            "nested_closure": ("def outer(p=SCRIPT):\n"
+                               "    def inner():\n        return slurp(p)\n    return inner\n"),
+            "returns_default_path": "def leak(p=SCRIPT):\n    return p\n",
+            "reader_default": "def load(reader=open):\n    return reader('x')\nload()\n",
+            "container_reader_default": "def load(readers=[open]):\n    return readers[0]('x')\nload()\n",
+            "callable_default_returns_reader": ("def maker():\n    return open\n"
+                                                "def load(factory=maker()):\n    return factory('x')\nload()\n"),
+            "star_args_default": "def load(p=SCRIPT):\n    return slurp(*[p])\nload()\n",
+            "star_kwargs_default": "def load(p=SCRIPT):\n    return slurp(**{'target': p})\nload()\n",
+            "zero_argument_wrapper": "def load(p=SCRIPT):\n    return slurp(p)\nresult = load()\n",
+            "zero_argument_lambda": "grab = lambda p=SCRIPT: slurp(p)\nresult = grab()\n",
+            "fstring_default": "def load(p=f'{SCRIPT}'):\n    return slurp(p)\nload()\n",
+            "comprehension_default": "def load(p=[x for x in [SCRIPT]]):\n    return slurp(p)\nload()\n",
+            "generator_default": "def load(p=(x for x in [SCRIPT])):\n    return slurp(p)\nload()\n",
+            "ambiguous_default": "def load(p=unknown_source()):\n    return slurp(p)\nload()\n",
+        }
+        self.assertGreaterEqual(len(fixtures), 24, "the A5-2 default matrix must stay complete")
+        accepted = []
+        for name, body in fixtures.items():
+            violations = repository_read_violations(header + body)
+            if not violations:
+                accepted.append(name)
+                continue
+            self.assertTrue(
+                any(v.endswith(("repository_path_escape", "reader_callable_escape",
+                                "unresolved_repository_read", "ambiguous_default_binding",
+                                "builtin_open", "bound_reader_capture"))
+                    for v in violations),
+                "%s: unexpected categories %s" % (name, violations))
+        self.assertEqual(accepted, [], "these default bypasses were accepted: %s" % accepted)
+
+    def test_default_bound_taint_does_not_leak_across_scopes(self):
+        # Positive control: an unrelated function using the same parameter name with a safe
+        # default must stay accepted, proving taint is lexically scoped.
+        header = ("from pathlib import Path\n"
+                  "from helpers import slurp\n"
+                  "ROOT = Path(__file__).resolve().parents[1]\n"
+                  "SCRIPT = repo_path('probe_script')\n")
+        safe = "def unrelated(p='plain-scratch-name'):\n    return slurp(p)\nunrelated()\n"
+        self.assertEqual(repository_read_violations(header + safe), [],
+                         "a same-named parameter in an unrelated function must not inherit taint")
+        both = ("def tainted(p=SCRIPT):\n    return slurp(p)\n"
+                "def unrelated(p='plain-scratch-name'):\n    return slurp(p)\n")
+        violations = repository_read_violations(header + both)
+        self.assertEqual(len(violations), 1,
+                         "exactly the tainted scope must be reported: %s" % violations)
 
     def test_sanctioned_helper_body_tampering_is_detected(self):
         # A4-2: the exemption covers the exact reviewed helper bodies. A helper body that grows
