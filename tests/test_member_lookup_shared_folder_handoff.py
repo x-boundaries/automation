@@ -1,5 +1,6 @@
 import base64
 import contextlib
+import errno
 import importlib
 import io
 import json
@@ -256,6 +257,20 @@ def nonblank_lines(path):
     return len([line for line in p.read_text(encoding="utf-8").splitlines() if line.strip()])
 
 
+# Content written by the simulated other share participant when it replaces a
+# bridge-owned source entry. Bridge-owned names must never end up referring to
+# the object holding it, and it must never be repaired, renamed, or deleted.
+FOREIGN_TEXT = "foreign-replacement-not-owned-by-preflight\n"
+# Content of the bridge-owned source object in descriptor-binding tests.
+OWNED_TEXT = "owned-content\n"
+
+
+def identity_of(path):
+    """Device/inode identity of a path entry, without following symlinks."""
+    info = os.lstat(path)
+    return (info.st_dev, info.st_ino)
+
+
 class SharedFolderHandoffBase(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -335,6 +350,47 @@ class SharedFolderHandoffBase(unittest.TestCase):
             os.symlink(str(target), str(link_path))
         except (OSError, NotImplementedError):
             self.skipTest("symlink creation not supported in this environment")
+
+    def require_symlink_support(self):
+        """Skip unless this environment can create symbolic links."""
+        target = self.vm_local / "symlink_support_target.txt"
+        target.write_text("support-probe\n", encoding="utf-8")
+        check = self.vm_local / "symlink_support_check"
+        self.make_symlink(check, target)
+        check.unlink()
+
+    def require_zero_link_refusal(self, module):
+        """Skip when this process may hard-link an inode whose last name is gone.
+
+        Unprivileged Linux refuses that with ENOENT, because linking an inode
+        with no remaining directory entry through ``/proc/self/fd/<fd>``
+        requires CAP_DAC_READ_SEARCH. The unlink-rebind contract depends on
+        that refusal, so a privileged environment (which legitimately behaves
+        differently) must skip rather than assert a guarantee the platform is
+        not making. This probe never requires a privileged capability itself.
+        """
+        probe = self.vm_local / "zero_link_probe_src.tmp"
+        landing = self.vm_local / "zero_link_probe_dst.tmp"
+        permitted = True
+        try:
+            with module.open_exclusive_no_follow(probe) as handle:
+                handle.flush()
+                probe.unlink()
+                try:
+                    module.link_from_owned_descriptor(
+                        handle.fileno(), self.vm_local, landing.name
+                    )
+                except OSError:
+                    permitted = False
+        finally:
+            for path in (probe, landing):
+                if os.path.lexists(path):
+                    os.unlink(path)
+        if permitted:
+            self.skipTest(
+                "environment can hard-link a zero-link inode (privileged); "
+                "the unprivileged unlink-rebind refusal cannot be asserted here"
+            )
 
     def make_junction(self, link_path, target):
         if os.name != "nt":
@@ -1267,6 +1323,7 @@ class PublicationPreflightTests(SharedFolderHandoffBase):
         self.assertFalse(probe_src.exists())
         self.assertFalse(probe_link.exists())
 
+    @unittest.skipIf(os.name == "nt", "POSIX-only publication preflight")
     def test_preflight_unit_link_unsupported_fails_closed(self):
         module = load_handoff_module()
         probe_src, probe_link = self.probe_paths()
@@ -1284,6 +1341,7 @@ class PublicationPreflightTests(SharedFolderHandoffBase):
         self.assertEqual(probe_src.stat().st_size, 0)
         self.assertFalse(probe_link.exists())
 
+    @unittest.skipIf(os.name == "nt", "POSIX-only publication preflight")
     def test_preflight_unit_first_directory_fsync_failure_is_unsupported(self):
         module = load_handoff_module()
         probe_src, probe_link = self.probe_paths()
@@ -1299,6 +1357,7 @@ class PublicationPreflightTests(SharedFolderHandoffBase):
         self.assertTrue(probe_src.exists())
         self.assertTrue(probe_link.exists())
 
+    @unittest.skipIf(os.name == "nt", "POSIX-only publication preflight")
     def test_preflight_unit_cleanup_unlink_failure_is_cleanup_unconfirmed(self):
         module = load_handoff_module()
         probe_src, probe_link = self.probe_paths()
@@ -1314,6 +1373,7 @@ class PublicationPreflightTests(SharedFolderHandoffBase):
         self.assertTrue(probe_src.exists())
         self.assertTrue(probe_link.exists())
 
+    @unittest.skipIf(os.name == "nt", "POSIX-only publication preflight")
     def test_preflight_unit_final_fsync_failure_is_cleanup_unconfirmed(self):
         module = load_handoff_module()
         probe_src, probe_link = self.probe_paths()
@@ -1332,6 +1392,7 @@ class PublicationPreflightTests(SharedFolderHandoffBase):
         self.assertFalse(probe_src.exists())
         self.assertFalse(probe_link.exists())
 
+    @unittest.skipIf(os.name == "nt", "POSIX-only publication preflight")
     def test_preflight_unit_file_fsync_unsupported_fails_closed(self):
         # A POSIX-mounted outbox without working file fsync must fail the
         # preflight before capability is considered proven (and therefore
@@ -1377,25 +1438,53 @@ class PublicationPreflightTests(SharedFolderHandoffBase):
         self.assertEqual(blocked["posix_publication_preflight"], "unsupported")
         self.assertEqual(self.hit_count(), 0)
 
-    def replace_probe_on_first_directory_fsync(self, module, probe_to_replace):
+    def replace_probe_during_publication_preflight(self, module, probe_to_replace):
         """fsync_directory stand-in that simulates the other share participant
-        replacing a probe entry between capability proof and cleanup."""
-        state = {"calls": 0}
+        replacing a probe entry between capability proof and cleanup.
+
+        The replacement is selected by the intended outbox/publication-preflight
+        directory, never by call ordinal. Under ``module.main()`` the earlier
+        claim-directory fsync must therefore pass through to the real
+        implementation so claim acquisition genuinely succeeds and the
+        publication preflight is actually reached; keying on the first call
+        instead intercepts the claim fsync and the run never gets that far.
+
+        The ordered directories, whether the intended probe existed immediately
+        before replacement, and the replacement's own identity are recorded on
+        ``self.preflight_fsync_record`` for assertion.
+        """
+        real_fsync_directory = module.fsync_directory
+        outbox = self.outbox.resolve()
+        record = {
+            "directories": [],
+            "passed_through": [],
+            "existed_before_replacement": None,
+            "replacement_identity": None,
+            "replaced": False,
+        }
 
         def fake_fsync_directory(directory):
-            state["calls"] += 1
-            if state["calls"] == 1:
+            resolved = Path(directory).resolve()
+            record["directories"].append(resolved)
+            if resolved != outbox:
+                real_fsync_directory(directory)
+                record["passed_through"].append(resolved)
+                return
+            if not record["replaced"]:
+                record["existed_before_replacement"] = os.path.lexists(probe_to_replace)
                 probe_to_replace.unlink()
-                probe_to_replace.write_text(
-                    "foreign-replacement-not-owned-by-preflight\n", encoding="utf-8"
-                )
+                probe_to_replace.write_text(FOREIGN_TEXT, encoding="utf-8")
+                record["replacement_identity"] = identity_of(probe_to_replace)
+                record["replaced"] = True
 
+        self.preflight_fsync_record = record
         return mock.patch.object(module, "fsync_directory", fake_fsync_directory)
 
+    @unittest.skipIf(os.name == "nt", "POSIX-only publication preflight")
     def test_preflight_unit_replaced_link_probe_never_unlinked(self):
         module = load_handoff_module()
         probe_src, probe_link = self.probe_paths()
-        with self.replace_probe_on_first_directory_fsync(module, probe_link):
+        with self.replace_probe_during_publication_preflight(module, probe_link):
             self.assertEqual(
                 module.posix_publication_capability_preflight(self.outbox),
                 "cleanup_unconfirmed",
@@ -1403,18 +1492,16 @@ class PublicationPreflightTests(SharedFolderHandoffBase):
         # The replacement entry is byte-for-byte untouched: identity
         # verification refused to unlink an object the preflight did not
         # create, and nothing was repaired, replaced, renamed, or deleted.
-        self.assertEqual(
-            probe_link.read_text(encoding="utf-8"),
-            "foreign-replacement-not-owned-by-preflight\n",
-        )
+        self.assertEqual(probe_link.read_text(encoding="utf-8"), FOREIGN_TEXT)
         # The owned source probe was never reached and stays in place.
         self.assertTrue(probe_src.exists())
         self.assertEqual(probe_src.stat().st_size, 0)
 
+    @unittest.skipIf(os.name == "nt", "POSIX-only publication preflight")
     def test_preflight_unit_replaced_src_probe_never_unlinked(self):
         module = load_handoff_module()
         probe_src, probe_link = self.probe_paths()
-        with self.replace_probe_on_first_directory_fsync(module, probe_src):
+        with self.replace_probe_during_publication_preflight(module, probe_src):
             self.assertEqual(
                 module.posix_publication_capability_preflight(self.outbox),
                 "cleanup_unconfirmed",
@@ -1422,10 +1509,7 @@ class PublicationPreflightTests(SharedFolderHandoffBase):
         # The owned link probe was legitimately removed first; the foreign
         # replacement at the source name is byte-for-byte untouched.
         self.assertFalse(probe_link.exists())
-        self.assertEqual(
-            probe_src.read_text(encoding="utf-8"),
-            "foreign-replacement-not-owned-by-preflight\n",
-        )
+        self.assertEqual(probe_src.read_text(encoding="utf-8"), FOREIGN_TEXT)
 
     @unittest.skipIf(os.name == "nt", "POSIX-only publication preflight")
     def test_preflight_replaced_probe_retains_claim_and_blocks_rerun_posix(self):
@@ -1433,20 +1517,34 @@ class PublicationPreflightTests(SharedFolderHandoffBase):
         module = load_handoff_module()
         probe_src, probe_link = self.probe_paths()
         buffer = io.StringIO()
-        with self.replace_probe_on_first_directory_fsync(module, probe_link):
+        with self.replace_probe_during_publication_preflight(module, probe_link):
             with contextlib.redirect_stdout(buffer):
                 code = module.main(self.base_args(extra=self.fake_ps()))
         evidence = parse_evidence(buffer.getvalue())
+        record = self.preflight_fsync_record
         self.assertEqual(code, 2)
         self.assertEqual(evidence["status"], "needs_fix")
+        # Claim acquisition must genuinely succeed first: under main() the
+        # claim-directory fsync is the earliest fsync_directory call and is
+        # passed through, so the run actually reaches the publication preflight
+        # instead of failing closed on claim durability.
+        self.assertEqual(evidence["claim_acquired"], "true")
+        self.assertEqual(evidence["claim_durability_unconfirmed"], "false")
+        self.assertEqual(record["directories"][0], self.vm_local.resolve())
+        self.assertIn(self.vm_local.resolve(), record["passed_through"])
+        self.assertIn(self.outbox.resolve(), record["directories"])
+        # The owned probe existed before the other participant replaced it, and
+        # the replacement happened during the publication preflight.
+        self.assertTrue(record["existed_before_replacement"])
+        self.assertTrue(record["replaced"])
         self.assertEqual(evidence["posix_publication_preflight"], "cleanup_unconfirmed")
         self.assertEqual(evidence["lookup_attempt_count"], "0")
+        self.assertEqual(evidence["ac2_lookup_invoked"], "false")
         self.assertEqual(self.hit_count(), 0)
-        # The foreign replacement is untouched and the claim is retained.
-        self.assertEqual(
-            probe_link.read_text(encoding="utf-8"),
-            "foreign-replacement-not-owned-by-preflight\n",
-        )
+        # The foreign replacement is byte-for-byte and identity unchanged, and
+        # the claim is retained.
+        self.assertEqual(probe_link.read_text(encoding="utf-8"), FOREIGN_TEXT)
+        self.assertEqual(identity_of(probe_link), record["replacement_identity"])
         self.assertTrue(self.claim.exists())
 
         rerun = self.run_cli(self.base_args(extra=self.fake_ps()))
@@ -1454,8 +1552,10 @@ class PublicationPreflightTests(SharedFolderHandoffBase):
         blocked = parse_evidence(rerun.stdout)
         self.assertEqual(blocked["status"], "needs_fix")
         self.assertEqual(blocked["preexisting_claim_detected"], "true")
+        self.assertEqual(blocked["lookup_attempt_count"], "0")
         self.assertEqual(self.hit_count(), 0)
 
+    @unittest.skipIf(os.name == "nt", "POSIX-only publication preflight")
     def test_preflight_unit_preexisting_probe_entry_fails_closed(self):
         module = load_handoff_module()
         probe_src, probe_link = self.probe_paths()
@@ -1469,6 +1569,511 @@ class PublicationPreflightTests(SharedFolderHandoffBase):
             probe_src.read_text(encoding="utf-8"), "not-created-by-preflight\n"
         )
         self.assertFalse(probe_link.exists())
+
+
+class DescriptorBoundLinkTests(SharedFolderHandoffBase):
+    """Direct proof of the POSIX descriptor-bound create-new link primitive.
+
+    Two distinct Linux races are modelled separately, because unprivileged
+    Linux treats them differently:
+
+    - rename-rebind: the other share participant moves the owned source entry
+      aside and installs a replacement at the original name. The owned inode
+      keeps a directory entry, so descriptor-bound linking still succeeds and
+      must select the owned inode, never the replacement.
+    - unlink-rebind: the other share participant removes the owned source entry
+      before installing the replacement, so the owned inode's link count
+      reaches zero. Linking it through ``/proc/self/fd/<fd>`` then requires
+      CAP_DAC_READ_SEARCH and an unprivileged process is refused with ENOENT
+      before any destination is created. That refusal is the expected security
+      behaviour, not an unsupported-implementation defect.
+
+    In both races no bridge-owned name may ever refer to the foreign object.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.source = self.outbox / "owned_source.tmp"
+        self.moved_source = self.outbox / "owned_source_moved_aside.tmp"
+        self.destination = self.outbox / "owned_destination.tmp"
+        self.foreign_target = self.vm_local / "foreign_symlink_target.txt"
+
+    @unittest.skipIf(os.name == "nt", "POSIX-only descriptor-bound link primitive")
+    def test_rename_rebind_regular_file_links_owned_inode(self):
+        module = load_handoff_module()
+        with module.open_exclusive_no_follow(self.source) as handle:
+            handle.write(OWNED_TEXT)
+            handle.flush()
+            owned = module.entry_identity(os.fstat(handle.fileno()))
+            # The other participant moves the owned entry aside -- its inode
+            # keeps a directory entry -- and installs a foreign regular file at
+            # the original source pathname.
+            self.source.rename(self.moved_source)
+            self.source.write_text(FOREIGN_TEXT, encoding="utf-8")
+            foreign = identity_of(self.source)
+            module.link_from_owned_descriptor(
+                handle.fileno(), self.outbox, self.destination.name
+            )
+        self.assertTrue(self.destination.exists())
+        self.assertEqual(identity_of(self.destination), owned)
+        self.assertEqual(self.destination.read_text(encoding="utf-8"), OWNED_TEXT)
+        self.assertNotEqual(identity_of(self.destination), foreign)
+        # The foreign replacement is untouched and the moved owned entry still
+        # refers to the owned inode.
+        self.assertEqual(self.source.read_text(encoding="utf-8"), FOREIGN_TEXT)
+        self.assertEqual(identity_of(self.source), foreign)
+        self.assertEqual(identity_of(self.moved_source), owned)
+
+    @unittest.skipIf(os.name == "nt", "POSIX-only descriptor-bound link primitive")
+    def test_rename_rebind_symlink_links_owned_inode(self):
+        module = load_handoff_module()
+        self.require_symlink_support()
+        self.foreign_target.write_text(FOREIGN_TEXT, encoding="utf-8")
+        with module.open_exclusive_no_follow(self.source) as handle:
+            handle.write(OWNED_TEXT)
+            handle.flush()
+            owned = module.entry_identity(os.fstat(handle.fileno()))
+            self.source.rename(self.moved_source)
+            os.symlink(str(self.foreign_target), str(self.source))
+            module.link_from_owned_descriptor(
+                handle.fileno(), self.outbox, self.destination.name
+            )
+        self.assertEqual(identity_of(self.destination), owned)
+        self.assertEqual(self.destination.read_text(encoding="utf-8"), OWNED_TEXT)
+        # Neither the symlink inode nor its target inode was linked or followed.
+        self.assertNotEqual(identity_of(self.destination), identity_of(self.source))
+        self.assertNotEqual(
+            identity_of(self.destination), identity_of(self.foreign_target)
+        )
+        self.assertTrue(self.source.is_symlink())
+        self.assertEqual(os.readlink(str(self.source)), str(self.foreign_target))
+        self.assertEqual(self.foreign_target.read_text(encoding="utf-8"), FOREIGN_TEXT)
+        self.assertEqual(identity_of(self.moved_source), owned)
+
+    @unittest.skipIf(os.name == "nt", "POSIX-only descriptor-bound link primitive")
+    def test_unlink_rebind_regular_file_refuses_to_link(self):
+        module = load_handoff_module()
+        self.require_zero_link_refusal(module)
+        with module.open_exclusive_no_follow(self.source) as handle:
+            handle.write(OWNED_TEXT)
+            handle.flush()
+            # Removing the owned entry drops its link count to zero; installing
+            # a foreign regular file at the same name cannot resurrect it.
+            self.source.unlink()
+            self.source.write_text(FOREIGN_TEXT, encoding="utf-8")
+            foreign = identity_of(self.source)
+            with self.assertRaises(OSError) as caught:
+                module.link_from_owned_descriptor(
+                    handle.fileno(), self.outbox, self.destination.name
+                )
+        self.assertNotIsInstance(caught.exception, NotImplementedError)
+        self.assertEqual(caught.exception.errno, errno.ENOENT)
+        # No destination exists, so no pathname-link fallback ran and no
+        # bridge-owned name refers to the foreign inode.
+        self.assertFalse(os.path.lexists(self.destination))
+        self.assertEqual(self.source.read_text(encoding="utf-8"), FOREIGN_TEXT)
+        self.assertEqual(identity_of(self.source), foreign)
+
+    @unittest.skipIf(os.name == "nt", "POSIX-only descriptor-bound link primitive")
+    def test_unlink_rebind_symlink_refuses_to_link(self):
+        module = load_handoff_module()
+        self.require_symlink_support()
+        self.require_zero_link_refusal(module)
+        self.foreign_target.write_text(FOREIGN_TEXT, encoding="utf-8")
+        with module.open_exclusive_no_follow(self.source) as handle:
+            handle.write(OWNED_TEXT)
+            handle.flush()
+            self.source.unlink()
+            os.symlink(str(self.foreign_target), str(self.source))
+            foreign = identity_of(self.source)
+            with self.assertRaises(OSError) as caught:
+                module.link_from_owned_descriptor(
+                    handle.fileno(), self.outbox, self.destination.name
+                )
+        self.assertNotIsInstance(caught.exception, NotImplementedError)
+        # Neither the symlink inode nor its target was linked under the
+        # destination, and the foreign objects are untouched.
+        self.assertFalse(os.path.lexists(self.destination))
+        self.assertTrue(self.source.is_symlink())
+        self.assertEqual(identity_of(self.source), foreign)
+        self.assertEqual(os.readlink(str(self.source)), str(self.foreign_target))
+        self.assertEqual(self.foreign_target.read_text(encoding="utf-8"), FOREIGN_TEXT)
+
+    @unittest.skipIf(os.name == "nt", "POSIX-only descriptor-bound link primitive")
+    def test_link_refuses_existing_destination(self):
+        module = load_handoff_module()
+        self.destination.write_text("already-here\n", encoding="utf-8")
+        with module.open_exclusive_no_follow(self.source) as handle:
+            handle.flush()
+            with self.assertRaises(FileExistsError):
+                module.link_from_owned_descriptor(
+                    handle.fileno(), self.outbox, self.destination.name
+                )
+        # Create-new/no-replace: the existing destination is untouched.
+        self.assertEqual(self.destination.read_text(encoding="utf-8"), "already-here\n")
+
+    @unittest.skipIf(os.name == "nt", "POSIX-only descriptor-bound link primitive")
+    def test_unsupported_primitive_raises_sanitised_oserror(self):
+        # A POSIX environment without linkat/dir_fd/follow_symlinks support (or
+        # without procfs descriptor binding) must fail closed through the
+        # existing OSError path, never as a NotImplementedError traceback and
+        # never by falling back to pathname linking.
+        module = load_handoff_module()
+        for error in (
+            NotImplementedError("linkat is unavailable"),
+            OSError(2, "no /proc/self/fd descriptor binding"),
+            OSError(95, "follow_symlinks unsupported"),
+        ):
+            with self.subTest(error=repr(error)):
+                if os.path.lexists(self.source):
+                    self.source.unlink()
+                with module.open_exclusive_no_follow(self.source) as handle:
+                    handle.flush()
+                    with mock.patch.object(module.os, "link", side_effect=error):
+                        with self.assertRaises(OSError) as caught:
+                            module.link_from_owned_descriptor(
+                                handle.fileno(), self.outbox, self.destination.name
+                            )
+                self.assertNotIsInstance(caught.exception, NotImplementedError)
+                self.assertFalse(os.path.lexists(self.destination))
+
+
+class PublicationSourceReplacementTests(SharedFolderHandoffBase):
+    """Ownership races where the owned source pathname is rebound before linking.
+
+    The injection seam is the owned source file's own fsync -- the real point
+    after the durable source write and before any link creation -- and it is
+    selected by the owned object's device/inode identity, never by call
+    ordinal. Every unrelated fsync (claim file, claim directory, outbox
+    directory) passes through untouched.
+
+    Rename-rebind and unlink-rebind are modelled separately: the first leaves
+    the owned inode linkable and fails only at ownership-verified cleanup, the
+    second makes the owned inode un-linkable by an unprivileged process and
+    fails before anything is created. Both are fail-closed, and neither ever
+    binds a bridge-owned name to the foreign object.
+    """
+
+    def probe_paths(self):
+        module = load_handoff_module()
+        return (
+            self.outbox / module.PREFLIGHT_PROBE_SRC_FILENAME,
+            self.outbox / module.PREFLIGHT_PROBE_LINK_FILENAME,
+        )
+
+    def replace_source_at_link_seam(self, module, source_path, install_replacement):
+        real_fsync = module.os.fsync
+        real_fstat = module.os.fstat
+        record = {
+            "owned_identity": None,
+            "replacement_identity": None,
+            "existed_before_replacement": None,
+            "replaced": False,
+        }
+
+        def fake_fsync(descriptor):
+            real_fsync(descriptor)
+            if record["replaced"]:
+                return
+            try:
+                info = real_fstat(descriptor)
+                owned = (info.st_dev, info.st_ino)
+                on_disk = identity_of(source_path)
+            except OSError:
+                return
+            if owned != on_disk:
+                return
+            record["owned_identity"] = owned
+            record["existed_before_replacement"] = True
+            install_replacement()
+            record["replacement_identity"] = identity_of(source_path)
+            record["replaced"] = True
+
+        self.link_seam_record = record
+        return mock.patch.object(module.os, "fsync", fake_fsync)
+
+    def rename_then_foreign_regular_file(self, path, moved_path):
+        """Rename-rebind: the owned inode keeps a directory entry."""
+
+        def install():
+            path.rename(moved_path)
+            path.write_text(FOREIGN_TEXT, encoding="utf-8")
+
+        return install
+
+    def rename_then_foreign_symlink(self, path, moved_path, target):
+        def install():
+            path.rename(moved_path)
+            os.symlink(str(target), str(path))
+
+        return install
+
+    def unlink_then_foreign_regular_file(self, path):
+        """Unlink-rebind: the owned inode's link count reaches zero."""
+
+        def install():
+            path.unlink()
+            path.write_text(FOREIGN_TEXT, encoding="utf-8")
+
+        return install
+
+    def assert_replacement_fired(self):
+        record = self.link_seam_record
+        self.assertTrue(record["replaced"])
+        self.assertTrue(record["existed_before_replacement"])
+        self.assertNotEqual(record["owned_identity"], record["replacement_identity"])
+        return record
+
+    @unittest.skipIf(os.name == "nt", "POSIX-only publication preflight")
+    def test_preflight_rename_rebind_regular_file_is_cleanup_unconfirmed(self):
+        module = load_handoff_module()
+        probe_src, probe_link = self.probe_paths()
+        moved = self.outbox / "owned_probe_src_moved_aside.tmp"
+        with self.replace_source_at_link_seam(
+            module, probe_src, self.rename_then_foreign_regular_file(probe_src, moved)
+        ):
+            state = module.posix_publication_capability_preflight(self.outbox)
+        record = self.assert_replacement_fired()
+        # The owned inode kept a directory entry, so the descriptor-bound link
+        # succeeded against the owned inode and capability was proven; only the
+        # ownership-verified cleanup of the rebound source name fails.
+        self.assertEqual(state, "cleanup_unconfirmed")
+        self.assertEqual(identity_of(moved), record["owned_identity"])
+        # Cleanup removed only the owned probe link.
+        self.assertFalse(os.path.lexists(probe_link))
+        # No bridge-owned name refers to the foreign inode, which is untouched.
+        self.assertEqual(probe_src.read_text(encoding="utf-8"), FOREIGN_TEXT)
+        self.assertEqual(identity_of(probe_src), record["replacement_identity"])
+
+    @unittest.skipIf(os.name == "nt", "POSIX-only publication preflight")
+    def test_preflight_rename_rebind_symlink_is_cleanup_unconfirmed(self):
+        module = load_handoff_module()
+        self.require_symlink_support()
+        probe_src, probe_link = self.probe_paths()
+        moved = self.outbox / "owned_probe_src_moved_aside.tmp"
+        target = self.vm_local / "foreign_symlink_target.txt"
+        target.write_text(FOREIGN_TEXT, encoding="utf-8")
+        with self.replace_source_at_link_seam(
+            module,
+            probe_src,
+            self.rename_then_foreign_symlink(probe_src, moved, target),
+        ):
+            state = module.posix_publication_capability_preflight(self.outbox)
+        record = self.assert_replacement_fired()
+        self.assertEqual(state, "cleanup_unconfirmed")
+        self.assertEqual(identity_of(moved), record["owned_identity"])
+        self.assertFalse(os.path.lexists(probe_link))
+        # The foreign symlink is never followed, linked, repaired or removed.
+        self.assertTrue(probe_src.is_symlink())
+        self.assertEqual(identity_of(probe_src), record["replacement_identity"])
+        self.assertEqual(os.readlink(str(probe_src)), str(target))
+        self.assertEqual(target.read_text(encoding="utf-8"), FOREIGN_TEXT)
+
+    @unittest.skipIf(os.name == "nt", "POSIX-only publication preflight")
+    def test_preflight_rename_rebind_retains_claim_and_blocks_rerun(self):
+        write_jsonl(self.pending, [canonical_queue_row()])
+        module = load_handoff_module()
+        probe_src, probe_link = self.probe_paths()
+        moved = self.outbox / "owned_probe_src_moved_aside.tmp"
+        buffer = io.StringIO()
+        with self.replace_source_at_link_seam(
+            module, probe_src, self.rename_then_foreign_regular_file(probe_src, moved)
+        ):
+            with contextlib.redirect_stdout(buffer):
+                code = module.main(self.base_args(extra=self.fake_ps()))
+        record = self.assert_replacement_fired()
+        evidence = parse_evidence(buffer.getvalue())
+        self.assertEqual(code, 2)
+        self.assertEqual(evidence["status"], "needs_fix")
+        self.assertEqual(evidence["posix_publication_preflight"], "cleanup_unconfirmed")
+        self.assertEqual(evidence["lookup_attempt_count"], "0")
+        self.assertEqual(evidence["ac2_lookup_invoked"], "false")
+        self.assertEqual(self.hit_count(), 0)
+        self.assertFalse(os.path.lexists(probe_link))
+        self.assertEqual(probe_src.read_text(encoding="utf-8"), FOREIGN_TEXT)
+        self.assertEqual(identity_of(probe_src), record["replacement_identity"])
+        # Unconfirmed cleanup deliberately retains the execution claim.
+        self.assertTrue(self.claim.exists())
+
+        rerun = self.run_cli(self.base_args(extra=self.fake_ps()))
+        self.assertEqual(rerun.returncode, 2)
+        self.assertNotIn("Traceback", rerun.stderr)
+        blocked = parse_evidence(rerun.stdout)
+        self.assertEqual(blocked["status"], "needs_fix")
+        self.assertEqual(blocked["preexisting_claim_detected"], "true")
+        self.assertEqual(blocked["lookup_attempt_count"], "0")
+        self.assertEqual(self.hit_count(), 0)
+
+    @unittest.skipIf(os.name == "nt", "POSIX-only publication preflight")
+    def test_preflight_unlink_rebind_is_unsupported_and_releases_claim(self):
+        write_jsonl(self.pending, [canonical_queue_row()])
+        module = load_handoff_module()
+        self.require_zero_link_refusal(module)
+        probe_src, probe_link = self.probe_paths()
+        buffer = io.StringIO()
+        with self.replace_source_at_link_seam(
+            module, probe_src, self.unlink_then_foreign_regular_file(probe_src)
+        ):
+            with contextlib.redirect_stdout(buffer):
+                code = module.main(self.base_args(extra=self.fake_ps()))
+        record = self.assert_replacement_fired()
+        evidence = parse_evidence(buffer.getvalue())
+        # The owned inode reached zero links, so the descriptor-bound link is
+        # refused with ENOENT before any destination exists. Capability was
+        # never proven, so this is unsupported, not cleanup_unconfirmed.
+        self.assertEqual(code, 2)
+        self.assertEqual(evidence["status"], "needs_fix")
+        self.assertEqual(evidence["posix_publication_preflight"], "unsupported")
+        self.assertEqual(evidence["lookup_attempt_count"], "0")
+        self.assertEqual(evidence["ac2_lookup_invoked"], "false")
+        self.assertEqual(self.hit_count(), 0)
+        # No probe-link destination exists and no bridge-owned name refers to
+        # the foreign inode, which is byte-for-byte and identity unchanged.
+        self.assertFalse(os.path.lexists(probe_link))
+        self.assertEqual(probe_src.read_text(encoding="utf-8"), FOREIGN_TEXT)
+        self.assertEqual(identity_of(probe_src), record["replacement_identity"])
+        # A determinate capability-unproven refusal releases the claim.
+        self.assertFalse(self.claim.exists())
+
+        # The occupied probe-source pathname blocks the next preflight's
+        # exclusive create, so the rerun stays needs_fix with zero lookups.
+        rerun = self.run_cli(self.base_args(extra=self.fake_ps()))
+        self.assertEqual(rerun.returncode, 2)
+        self.assertNotIn("Traceback", rerun.stderr)
+        blocked = parse_evidence(rerun.stdout)
+        self.assertEqual(blocked["status"], "needs_fix")
+        self.assertEqual(blocked["posix_publication_preflight"], "unsupported")
+        self.assertEqual(blocked["lookup_attempt_count"], "0")
+        self.assertEqual(self.hit_count(), 0)
+        self.assertEqual(probe_src.read_text(encoding="utf-8"), FOREIGN_TEXT)
+
+    @unittest.skipIf(os.name == "nt", "POSIX-only publication path")
+    def test_publication_rename_rebind_publishes_owned_row_and_retains_claim(self):
+        job = canonical_queue_row()
+        write_jsonl(self.pending, [job])
+        module = load_handoff_module()
+        tmp_path = self.outbox / PUBLISH_TMP_FILENAME
+        moved = self.outbox / "owned_publication_tmp_moved_aside.tmp"
+        buffer = io.StringIO()
+        with self.replace_source_at_link_seam(
+            module, tmp_path, self.rename_then_foreign_regular_file(tmp_path, moved)
+        ):
+            with contextlib.redirect_stdout(buffer):
+                code = module.main(self.base_args(extra=self.fake_ps()))
+        record = self.assert_replacement_fired()
+        evidence = parse_evidence(buffer.getvalue())
+        # The seam targets the publication temp only; the preflight is
+        # untouched and still proves capability before the single lookup.
+        self.assertEqual(evidence["posix_publication_preflight"], "capable")
+        self.assertEqual(self.hit_count(), 1)
+        # The final entry is the owned inode carrying this run's validated row.
+        self.assertTrue(self.final.exists())
+        self.assertEqual(identity_of(self.final), record["owned_identity"])
+        self.assertEqual(identity_of(moved), record["owned_identity"])
+        self.assertNotEqual(identity_of(self.final), record["replacement_identity"])
+        published = json.loads(self.final.read_text(encoding="utf-8").strip())
+        staged = json.loads(self.staging.read_text(encoding="utf-8").strip())
+        self.assertEqual(published, staged)
+        self.assertEqual(published["job_id"], job["job_id"])
+        # Cleanup saw the foreign replacement at the temp name and refused it.
+        self.assertEqual(tmp_path.read_text(encoding="utf-8"), FOREIGN_TEXT)
+        self.assertEqual(identity_of(tmp_path), record["replacement_identity"])
+        # Unconfirmed cleanup is never a success and retains the claim.
+        self.assertEqual(code, 2)
+        self.assertEqual(evidence["status"], "needs_fix")
+        self.assertEqual(evidence["outbox_published"], "false")
+        self.assertNotIn("status = ok", buffer.getvalue())
+        self.assertTrue(self.claim.exists())
+
+        rerun = self.run_cli(self.base_args(extra=self.fake_ps()))
+        self.assertEqual(rerun.returncode, 2)
+        blocked = parse_evidence(rerun.stdout)
+        self.assertEqual(blocked["status"], "needs_fix")
+        self.assertEqual(blocked["preexisting_claim_detected"], "true")
+        self.assertEqual(self.hit_count(), 1)
+
+    @unittest.skipIf(os.name == "nt", "POSIX-only publication path")
+    def test_publication_unlink_rebind_publishes_nothing_and_blocks_rerun(self):
+        write_jsonl(self.pending, [canonical_queue_row()])
+        module = load_handoff_module()
+        self.require_zero_link_refusal(module)
+        tmp_path = self.outbox / PUBLISH_TMP_FILENAME
+        buffer = io.StringIO()
+        with self.replace_source_at_link_seam(
+            module, tmp_path, self.unlink_then_foreign_regular_file(tmp_path)
+        ):
+            with contextlib.redirect_stdout(buffer):
+                code = module.main(self.base_args(extra=self.fake_ps()))
+        record = self.assert_replacement_fired()
+        evidence = parse_evidence(buffer.getvalue())
+        self.assertEqual(evidence["posix_publication_preflight"], "capable")
+        self.assertEqual(self.hit_count(), 1)
+        # The descriptor-bound link failed before any commit, so no final entry
+        # exists at all and no foreign inode was published.
+        self.assertFalse(os.path.lexists(self.final))
+        self.assertEqual(code, 2)
+        self.assertEqual(evidence["status"], "needs_fix")
+        self.assertEqual(evidence["outbox_published"], "false")
+        self.assertNotIn("status = ok", buffer.getvalue())
+        # The foreign temp replacement is byte-for-byte and identity unchanged.
+        self.assertEqual(tmp_path.read_text(encoding="utf-8"), FOREIGN_TEXT)
+        self.assertEqual(identity_of(tmp_path), record["replacement_identity"])
+        # A determinate pre-commit failure releases the claim normally; the
+        # completed staging/marker state and the occupied fixed temp path are
+        # the rerun blocker, so no second lookup can occur.
+        self.assertFalse(self.claim.exists())
+
+        rerun = self.run_cli(self.base_args(extra=self.fake_ps()))
+        self.assertEqual(rerun.returncode, 2)
+        self.assertNotIn("Traceback", rerun.stderr)
+        blocked = parse_evidence(rerun.stdout)
+        self.assertEqual(blocked["status"], "needs_fix")
+        self.assertEqual(blocked["lookup_attempt_count"], "0")
+        self.assertEqual(self.hit_count(), 1)
+        self.assertEqual(tmp_path.read_text(encoding="utf-8"), FOREIGN_TEXT)
+        self.assertFalse(os.path.lexists(self.final))
+
+    @unittest.skipIf(os.name == "nt", "POSIX-only publication preflight")
+    def test_unsupported_descriptor_link_blocks_preflight_without_traceback(self):
+        module = load_handoff_module()
+        for error in (
+            NotImplementedError("linkat is unavailable"),
+            OSError(2, "no /proc/self/fd descriptor binding"),
+        ):
+            with self.subTest(error=repr(error)):
+                self.setUp()
+                probe_src, probe_link = self.probe_paths()
+                with mock.patch.object(module.os, "link", side_effect=error):
+                    self.assertEqual(
+                        module.posix_publication_capability_preflight(self.outbox),
+                        "unsupported",
+                    )
+                # Capability unproven: nothing is deleted, the owned probe stays
+                # blocking and inspectable, and the link name was never created.
+                self.assertTrue(probe_src.exists())
+                self.assertFalse(os.path.lexists(probe_link))
+
+    @unittest.skipIf(os.name == "nt", "POSIX-only publication preflight")
+    def test_unsupported_descriptor_link_blocks_lookup_end_to_end(self):
+        write_jsonl(self.pending, [canonical_queue_row()])
+        module = load_handoff_module()
+        buffer = io.StringIO()
+        with mock.patch.object(
+            module.os, "link", side_effect=NotImplementedError("linkat is unavailable")
+        ):
+            with contextlib.redirect_stdout(buffer):
+                code = module.main(self.base_args(extra=self.fake_ps()))
+        evidence = parse_evidence(buffer.getvalue())
+        self.assertEqual(code, 2)
+        self.assertEqual(evidence["status"], "needs_fix")
+        self.assertEqual(evidence["posix_publication_preflight"], "unsupported")
+        # Zero AC2 lookups are consumed on an unsupported primitive, and the
+        # determinate refusal releases the claim through the normal path.
+        self.assertEqual(evidence["lookup_attempt_count"], "0")
+        self.assertEqual(evidence["ac2_lookup_invoked"], "false")
+        self.assertEqual(self.hit_count(), 0)
+        self.assertFalse(self.final.exists())
+        self.assertFalse(self.claim.exists())
 
 
 class CorruptedEncodingTests(SharedFolderHandoffBase):
