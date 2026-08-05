@@ -2550,6 +2550,44 @@ def uncovered_dependencies(dependencies, patterns):
     return sorted(dep for dep in dependencies if not any(rx.match(dep) for rx in compiled))
 
 
+# ---- DL-XB-121-001: delegated shared-folder lookup CI trigger closure ---- #
+# The delegated in-process dependency closure of the focused suite: modules the workflow's own
+# jobs import and execute, plus the Windows job's authoritative full-suite entrypoint, none of
+# which previously appeared in any `paths` filter. A change confined to one of them therefore
+# left the focused workflow untriggered.
+#
+# This is DELIBERATELY a separate set from REPO_DEPENDENCIES. That registry is the closed,
+# fail-closed inventory of repository files this module itself READS or semantically inspects;
+# these eight are expected workflow-filter VALUES only. They are never joined to ROOT, resolved
+# through repo_path(), opened, read or stat'ed here, so the closed repository-read contract and
+# repository_read_violations stay exactly as narrow as before.
+DELEGATED_LOOKUP_WORKFLOW_TRIGGER_PATHS = frozenset({
+    "scripts/member_lookup_gate4_real_queue_lookup.py",
+    "scripts/ac2_member_lookup_bridge_worker.py",
+    "scripts/member_lookup_gate3c_local_bridge_runtime.py",
+    "scripts/member_lookup_gate4a_queue_precheck.py",
+    "tests/test_member_lookup_gate4_real_queue_lookup.py",
+    "tests/test_ac2_member_lookup_bridge_worker.py",
+    "tests/test_member_lookup_gate4a_manual_handoff.py",
+    "tests/_run_ci_full_suite.py",
+})
+
+# Catch-all patterns that would nominally "cover" the entries above while destroying the
+# reviewed trigger surface. Coverage is not the contract here; exact membership is.
+BROAD_TRIGGER_WILDCARDS = frozenset({"*", "**", "scripts/*", "scripts/**",
+                                     "tests/*", "tests/**", ".github/**"})
+
+
+def missing_trigger_paths(required, patterns):
+    """Required trigger entries absent as EXACT literals from a workflow ``paths`` list.
+
+    Membership is literal, not glob coverage: a broad pattern that happens to match a required
+    path must not be accepted as a stand-in for the exact Design-Lock entry.
+    """
+    declared = set(patterns)
+    return sorted(path for path in required if path not in declared)
+
+
 class ExpiryProbeStaticTests(unittest.TestCase):
     def setUp(self):
         self.script = read_repo_text("probe_script")
@@ -4301,6 +4339,29 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
             self.assertEqual(missing, [],
                              "event '%s' does not trigger for: %s" % (event, missing))
 
+    # ---- DL-XB-121-001: delegated lookup trigger closure ---- #
+    def test_workflow_triggers_on_every_delegated_lookup_dependency(self):
+        # The focused jobs import and execute these modules, and the Windows job's full-suite
+        # entrypoint is itself one of them, so a change confined to any of them must trigger
+        # this workflow. Exact literal membership, not glob coverage.
+        filters = workflow_path_filters(self.workflow)
+        self.assertTrue(filters, "the focused workflow must declare at least one path filter")
+        for event, patterns in filters.items():
+            missing = missing_trigger_paths(DELEGATED_LOOKUP_WORKFLOW_TRIGGER_PATHS, patterns)
+            self.assertEqual(missing, [],
+                             "event '%s' has no exact trigger entry for: %s" % (event, missing))
+        # A broad wildcard must not be substituted for the exact entries, and paths-ignore
+        # would invert the trigger semantics this closure relies on.
+        for event, patterns in filters.items():
+            broad = sorted(set(patterns) & BROAD_TRIGGER_WILDCARDS)
+            self.assertEqual(broad, [],
+                             "event '%s' declares broad wildcard patterns: %s" % (event, broad))
+            crossing = sorted(pattern for pattern in patterns if "**" in pattern)
+            self.assertEqual(crossing, [],
+                             "event '%s' declares separator-crossing patterns: %s"
+                             % (event, crossing))
+        self.assertNotIn("paths-ignore", self.workflow)
+
     # ---- A2-3: the closed contract must be fail-closed, not best-effort ---- #
     def test_module_performs_no_repository_read_outside_the_closed_registry(self):
         violations = repository_read_violations(read_repo_text("focused_tests"))
@@ -4971,6 +5032,34 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
         inventory = registered_dependencies()
         for patterns in filters.values():
             self.assertIn(".gitignore", uncovered_dependencies(inventory, patterns))
+
+    def test_delegated_trigger_assertion_fails_when_a_required_entry_is_dropped(self):
+        # Negative control for the DL-XB-121-001 closure, run entirely in memory against a
+        # synthetic workflow so no repository file is read or written. A fixture that satisfies
+        # the requirement is degraded by exactly one required entry, and the same detection
+        # logic must report exactly that path.
+        omitted = "scripts/member_lookup_gate4_real_queue_lookup.py"
+        self.assertIn(omitted, DELEGATED_LOOKUP_WORKFLOW_TRIGGER_PATHS)
+        complete = "\n".join(
+            ["on:", "  pull_request:", "    paths:"]
+            + ['      - "%s"' % path
+               for path in sorted(DELEGATED_LOOKUP_WORKFLOW_TRIGGER_PATHS)]
+            + ["  workflow_dispatch: {}", ""])
+        complete_filters = workflow_path_filters(complete)
+        self.assertTrue(complete_filters)
+        for patterns in complete_filters.values():
+            self.assertEqual(
+                missing_trigger_paths(DELEGATED_LOOKUP_WORKFLOW_TRIGGER_PATHS, patterns), [],
+                "the complete fixture must satisfy the closure before it is degraded")
+        degraded = "\n".join(line for line in complete.splitlines()
+                             if line.strip() != '- "%s"' % omitted)
+        self.assertNotEqual(degraded, complete, "the fixture must actually lose an entry")
+        degraded_filters = workflow_path_filters(degraded)
+        self.assertTrue(degraded_filters)
+        for patterns in degraded_filters.values():
+            self.assertEqual(
+                missing_trigger_paths(DELEGATED_LOOKUP_WORKFLOW_TRIGGER_PATHS, patterns),
+                [omitted])
 
     # ---- A7-1: the exact closed-dependency contract ---- #
     def _dependency_module(self, prologue="", types_import=None, path_import=None,
