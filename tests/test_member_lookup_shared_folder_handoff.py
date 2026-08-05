@@ -1279,6 +1279,7 @@ class PublicationPreflightTests(SharedFolderHandoffBase):
         self.assertFalse(probe_src.exists())
         self.assertFalse(probe_link.exists())
 
+    @unittest.skipIf(os.name == "nt", "POSIX-only publication preflight")
     def test_preflight_unit_link_unsupported_fails_closed(self):
         module = load_handoff_module()
         probe_src, probe_link = self.probe_paths()
@@ -1296,6 +1297,7 @@ class PublicationPreflightTests(SharedFolderHandoffBase):
         self.assertEqual(probe_src.stat().st_size, 0)
         self.assertFalse(probe_link.exists())
 
+    @unittest.skipIf(os.name == "nt", "POSIX-only publication preflight")
     def test_preflight_unit_first_directory_fsync_failure_is_unsupported(self):
         module = load_handoff_module()
         probe_src, probe_link = self.probe_paths()
@@ -1311,6 +1313,7 @@ class PublicationPreflightTests(SharedFolderHandoffBase):
         self.assertTrue(probe_src.exists())
         self.assertTrue(probe_link.exists())
 
+    @unittest.skipIf(os.name == "nt", "POSIX-only publication preflight")
     def test_preflight_unit_cleanup_unlink_failure_is_cleanup_unconfirmed(self):
         module = load_handoff_module()
         probe_src, probe_link = self.probe_paths()
@@ -1326,6 +1329,7 @@ class PublicationPreflightTests(SharedFolderHandoffBase):
         self.assertTrue(probe_src.exists())
         self.assertTrue(probe_link.exists())
 
+    @unittest.skipIf(os.name == "nt", "POSIX-only publication preflight")
     def test_preflight_unit_final_fsync_failure_is_cleanup_unconfirmed(self):
         module = load_handoff_module()
         probe_src, probe_link = self.probe_paths()
@@ -1344,6 +1348,7 @@ class PublicationPreflightTests(SharedFolderHandoffBase):
         self.assertFalse(probe_src.exists())
         self.assertFalse(probe_link.exists())
 
+    @unittest.skipIf(os.name == "nt", "POSIX-only publication preflight")
     def test_preflight_unit_file_fsync_unsupported_fails_closed(self):
         # A POSIX-mounted outbox without working file fsync must fail the
         # preflight before capability is considered proven (and therefore
@@ -1431,6 +1436,7 @@ class PublicationPreflightTests(SharedFolderHandoffBase):
         self.preflight_fsync_record = record
         return mock.patch.object(module, "fsync_directory", fake_fsync_directory)
 
+    @unittest.skipIf(os.name == "nt", "POSIX-only publication preflight")
     def test_preflight_unit_replaced_link_probe_never_unlinked(self):
         module = load_handoff_module()
         probe_src, probe_link = self.probe_paths()
@@ -1447,6 +1453,7 @@ class PublicationPreflightTests(SharedFolderHandoffBase):
         self.assertTrue(probe_src.exists())
         self.assertEqual(probe_src.stat().st_size, 0)
 
+    @unittest.skipIf(os.name == "nt", "POSIX-only publication preflight")
     def test_preflight_unit_replaced_src_probe_never_unlinked(self):
         module = load_handoff_module()
         probe_src, probe_link = self.probe_paths()
@@ -1504,6 +1511,7 @@ class PublicationPreflightTests(SharedFolderHandoffBase):
         self.assertEqual(blocked["lookup_attempt_count"], "0")
         self.assertEqual(self.hit_count(), 0)
 
+    @unittest.skipIf(os.name == "nt", "POSIX-only publication preflight")
     def test_preflight_unit_preexisting_probe_entry_fails_closed(self):
         module = load_handoff_module()
         probe_src, probe_link = self.probe_paths()

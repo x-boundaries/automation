@@ -52,7 +52,9 @@ On top of that delegation this wrapper adds only the shared-folder layer:
   links never followed);
 - a POSIX-only, no-data publication-capability preflight before the Gate 4
   delegation: empty synthetic probe entries prove exclusive create-new, file
-  fsync, hard-link create-new, and directory-fsync support in the outbox so a
+  fsync, descriptor-bound hard-link create-new, and directory-fsync support
+  in the outbox (an environment without the descriptor-bound primitive is
+  ``unsupported`` before any lookup, and there is no pathname-link fallback) so a
   filesystem that cannot honour durable no-replace publication fails closed
   with zero AC2 lookups; the preflight is tri-state (``capable`` /
   ``unsupported`` / ``cleanup_unconfirmed``), only a durably cleaned-up
@@ -67,11 +69,13 @@ On top of that delegation this wrapper adds only the shared-folder layer:
   is copied to a same-directory temporary file in the outbox, flushed, and
   moved to the fixed Gate 5A result-copy filename with a durable create-new
   primitive (Windows ``MoveFileExW`` with write-through and without
-  replace-existing; POSIX ``os.link`` create-new plus directory fsync), so the
-  final filename is never visible with partial content, an existing
-  destination is never overwritten -- even one created by the other share
-  participant during the lookup -- success is reported only after the commit
-  is durable, and an unconfirmed commit fails closed with the claim retained;
+  replace-existing; POSIX create-new hard link taken from the still-open owned
+  temp descriptor plus directory fsync), so the final filename is never
+  visible with partial content, is never bound to a foreign inode occupying
+  the temp pathname, an existing destination is never overwritten -- even one
+  created by the other share participant during the lookup -- success is
+  reported only after the commit is durable, and an unconfirmed commit fails
+  closed with the claim retained;
 - fail-closed claim release: if the exclusive claim cannot be released after
   a completed run, the run reports ``needs_fix`` (never ``ok`` or
   ``already_processed``), the claim stays in place for operator recovery, and
@@ -106,6 +110,9 @@ RESULT_FILENAME = "member_lookup_bridge_gate5a_result_copy.jsonl"
 PUBLISH_TMP_FILENAME = RESULT_FILENAME + ".tmp"
 PREFLIGHT_PROBE_SRC_FILENAME = RESULT_FILENAME + ".preflight_probe_src.tmp"
 PREFLIGHT_PROBE_LINK_FILENAME = RESULT_FILENAME + ".preflight_probe_link.tmp"
+# Procfs descriptor binding used to resolve a POSIX hard-link source through the
+# owned open descriptor instead of through the rebindable source pathname.
+DESCRIPTOR_PATH_TEMPLATE = "/proc/self/fd/{descriptor}"
 
 INNER_COUNT_KEYS = (
     "queue_rows_read_count",
@@ -584,47 +591,109 @@ def _windows_move_no_replace_write_through(tmp_path, final_path):
         )
 
 
-def _posix_link_publish_durable(tmp_path, final_path, outbox_dir):
-    """POSIX durable no-replace publication via hard-link create-new.
+def _posix_link_publish_durable(text, tmp_path, final_path, outbox_dir):
+    """POSIX durable no-replace publication bound to the owned temp descriptor.
 
-    ``os.link`` atomically creates the final name only when it does not exist
-    (FileExistsError and unsupported-hard-link errors propagate as determinate
-    failures that commit nothing). After the link, the containing directory is
-    fsynced so the new entry is durable, the temp name is removed, and the
-    directory is fsynced again so the cleanup is durable. Any failure after the
-    link is PublicationDurabilityError: the commit state is unconfirmed and the
-    caller must not report success.
+    The validated staged text is written to the fixed publication temp path
+    with the exclusive-create no-follow helper, flushed and fsynced, and that
+    write descriptor is then held open through link creation: the final name is
+    created from the descriptor, never from the temp pathname, so a temp entry
+    rebound by the other share participant can never be published under the
+    fixed Gate 5A filename. The link is create-new, so an existing destination
+    (FileExistsError) and an unsupported link primitive both propagate as
+    determinate failures that commit nothing.
+
+    After the link the final entry is confirmed to refer to the owned object,
+    the containing directory is fsynced so the new entry is durable, the temp
+    name is removed only while it still refers to the owned object, and the
+    directory is fsynced again so the cleanup is durable. Any failure once the
+    final entry may exist -- including a temp-name ownership mismatch, which
+    leaves the foreign entry completely untouched -- is
+    PublicationDurabilityError: the commit state is unconfirmed and the caller
+    must not report success.
     """
-    os.link(tmp_path, final_path)
-    try:
-        fsync_directory(outbox_dir)
-        os.unlink(tmp_path)
-        fsync_directory(outbox_dir)
-    except OSError as error:
-        raise PublicationDurabilityError(0, "publication_durability_unconfirmed") from error
+    with open_exclusive_no_follow(tmp_path) as handle:
+        handle.write(text)
+        handle.flush()
+        os.fsync(handle.fileno())
+        # Test-only durability-failure injection, after the durable temp write
+        # and before any link creation; it can only cause a failure.
+        if os.environ.get(FAULT_ENV) == "fail_publication_durability":
+            raise PublicationDurabilityError(0, "test_injected_durability_failure")
+        owned_identity = entry_identity(os.fstat(handle.fileno()))
+        link_from_owned_descriptor(handle.fileno(), outbox_dir, final_path.name)
+        try:
+            if entry_identity(os.lstat(final_path)) != owned_identity:
+                raise OSError(1, "publication_final_identity_mismatch")
+            fsync_directory(outbox_dir)
+            unlink_owned_entry(tmp_path, owned_identity)
+            fsync_directory(outbox_dir)
+        except OSError as error:
+            raise PublicationDurabilityError(
+                0, "publication_durability_unconfirmed"
+            ) from error
 
 
 def entry_identity(stat_result):
-    """Stable object identity (device, inode) for probe ownership checks."""
+    """Stable object identity (device, inode) for ownership checks."""
     return (stat_result.st_dev, stat_result.st_ino)
 
 
-def unlink_owned_probe(probe_path, owned_identity):
-    """Unlink a probe pathname only if it still refers to the owned object.
+def unlink_owned_entry(entry_path, owned_identity):
+    """Unlink a pathname only if it still refers to the owned object.
 
     The VM-local claim cannot stop the other share participant from modifying
     the outbox, so pathname existence alone proves nothing. Immediately before
     removal the entry is lstat-classified and its device/inode identity must
-    equal the identity of the probe object this preflight created. Any
-    mismatch, non-regular entry, or metadata failure raises OSError: the
-    caller classifies that as ``cleanup_unconfirmed`` and the foreign or
+    equal the identity of the object this run created (a preflight probe, or
+    the publication temp file). Any mismatch, non-regular entry, or metadata
+    failure raises OSError: the caller fails closed and the foreign or
     replacement entry is left untouched -- never repaired, replaced, renamed,
     or deleted. Ordered best-effort, like every other classification here.
     """
-    info = os.lstat(probe_path)
+    info = os.lstat(entry_path)
     if not stat.S_ISREG(info.st_mode) or entry_identity(info) != owned_identity:
-        raise OSError(1, "preflight_probe_identity_mismatch")
-    os.unlink(probe_path)
+        raise OSError(1, "owned_entry_identity_mismatch")
+    os.unlink(entry_path)
+
+
+def link_from_owned_descriptor(source_descriptor, destination_dir, destination_name):
+    """Create ``destination_name`` as a create-new hard link to the inode held
+    open by ``source_descriptor``.
+
+    The source pathname is deliberately never re-resolved. The other share
+    participant can rebind an outbox source name at any time -- with a foreign
+    regular file or with a symlink -- so a pathname-based
+    ``os.link(source_path, destination)`` issued after the owned write
+    descriptor is closed can bind a bridge-owned destination name to a foreign
+    inode. Here the link source is the still-open owned descriptor, resolved
+    through ``/proc/self/fd/<fd>`` with ``linkat`` and ``AT_SYMLINK_FOLLOW``
+    (``os.link`` selects ``linkat`` and passes ``AT_SYMLINK_FOLLOW`` exactly
+    when ``dst_dir_fd`` is supplied and ``follow_symlinks`` is true), so
+    whatever now occupies the source pathname cannot affect what is linked.
+
+    ``linkat`` never replaces an existing destination, so publication stays
+    create-new/no-replace and a collision raises FileExistsError having
+    committed nothing. There is deliberately no fallback to pathname-based
+    linking: an environment without ``linkat``, ``dir_fd`` support,
+    ``follow_symlinks`` support, or procfs descriptor binding raises OSError
+    and the caller fails closed. ``NotImplementedError`` is converted to a
+    sanitised OSError so no traceback escapes.
+    """
+    directory_descriptor = os.open(
+        str(destination_dir), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    )
+    try:
+        os.link(
+            DESCRIPTOR_PATH_TEMPLATE.format(descriptor=source_descriptor),
+            destination_name,
+            dst_dir_fd=directory_descriptor,
+            follow_symlinks=True,
+        )
+    except NotImplementedError as error:
+        raise OSError(1, "descriptor_bound_link_unsupported") from error
+    finally:
+        os.close(directory_descriptor)
 
 
 def posix_publication_capability_preflight(outbox_dir):
@@ -684,20 +753,25 @@ def posix_publication_capability_preflight(outbox_dir):
                 raise OSError(5, "test_injected_preflight_file_fsync_failure")
             os.fsync(handle.fileno())
             owned_identity = entry_identity(os.fstat(handle.fileno()))
-        os.link(probe_src, probe_link)
-        # The create-new hard link must share the source object's identity;
-        # anything else means the namespace was interfered with mid-proof.
-        if entry_identity(os.lstat(probe_link)) != owned_identity:
-            raise OSError(1, "preflight_probe_link_identity_mismatch")
-        fsync_directory(outbox_dir)
+            # The source handle stays open through link creation so the link
+            # binds the owned inode, never whatever the other share participant
+            # may have rebound the probe_src pathname to in the meantime.
+            link_from_owned_descriptor(
+                handle.fileno(), outbox_dir, PREFLIGHT_PROBE_LINK_FILENAME
+            )
+            # The create-new hard link must share the source object's identity;
+            # anything else means the namespace was interfered with mid-proof.
+            if entry_identity(os.lstat(probe_link)) != owned_identity:
+                raise OSError(1, "preflight_probe_link_identity_mismatch")
+            fsync_directory(outbox_dir)
     except OSError:
         return "unsupported"
     try:
         # Test-only cleanup-failure injection; it can only cause a failure.
         if os.environ.get(FAULT_ENV) == "fail_preflight_cleanup":
             raise OSError(5, "test_injected_preflight_cleanup_failure")
-        unlink_owned_probe(probe_link, owned_identity)
-        unlink_owned_probe(probe_src, owned_identity)
+        unlink_owned_entry(probe_link, owned_identity)
+        unlink_owned_entry(probe_src, owned_identity)
         fsync_directory(outbox_dir)
     except OSError:
         return "cleanup_unconfirmed"
@@ -713,11 +787,16 @@ def publish_atomically(staging_path, outbox_dir, final_path):
     unchanged, keeps the temp file for operator diagnosis, and raises so the
     run fails closed. Success is returned only after the platform primitive
     has durably committed the final directory entry (Windows MoveFileExW with
-    write-through; POSIX hard-link create-new plus directory fsync). The
-    runbook documents the exact supported filesystem expectations.
+    write-through; POSIX descriptor-bound hard-link create-new plus directory
+    fsync). The runbook documents the exact supported filesystem expectations.
     """
     text = Path(staging_path).read_text(encoding="utf-8")
     tmp_path = outbox_dir / PUBLISH_TMP_FILENAME
+    if os.name != "nt":
+        # POSIX keeps the temp write descriptor open through link creation, so
+        # the temp write and the durable commit are one bounded sequence.
+        _posix_link_publish_durable(text, tmp_path, final_path, outbox_dir)
+        return
     with open_exclusive_no_follow(tmp_path) as handle:
         handle.write(text)
         handle.flush()
@@ -725,10 +804,7 @@ def publish_atomically(staging_path, outbox_dir, final_path):
     # Test-only durability-failure injection; it can only cause a failure.
     if os.environ.get(FAULT_ENV) == "fail_publication_durability":
         raise PublicationDurabilityError(0, "test_injected_durability_failure")
-    if os.name == "nt":
-        _windows_move_no_replace_write_through(tmp_path, final_path)
-    else:
-        _posix_link_publish_durable(tmp_path, final_path, outbox_dir)
+    _windows_move_no_replace_write_through(tmp_path, final_path)
 
 
 def build_parser():
