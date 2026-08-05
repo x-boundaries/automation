@@ -11,9 +11,12 @@ param(
     # the separate approval record); the target is bound to the evidence via the hashed
     # target_fingerprint instead. Never a credential. See the runbook.
     [string]$ApprovalReference,
-    # Operator-provided private evidence directory (never in the repository). It holds
-    # the permanent single-use attempt claim and the durable, non-overwriting result.
-    [string]$StateDirectory,
+    # There is deliberately NO parameter that selects, overrides or duplicates the
+    # claim/result location. The permanent single-use attempt claim and the authoritative
+    # result live in exactly one fixed machine-owned root
+    # (Get-ExpiryProbeCanonicalStateRoot), so concurrent launches cannot each claim a
+    # private directory and no secondary output path can leak live evidence.
+    #
     # ALL of the following explicit switches are required before any AutoCount write.
     # Missing any one leaves the probe inactive: it refuses before loading AutoCount.
     [switch]$EnableExpiryCapabilityProbe,     # master enable
@@ -22,8 +25,7 @@ param(
     [switch]$ConfirmAutoCountWrite,           # a real AutoCount write is intended
     [switch]$ConfirmDryRunPreflightPassed,    # the main runner dry-run/preflight already passed
     [switch]$ConfirmNoUpdateOrDelete,         # no update or delete of any member will occur
-    [switch]$AllowRootLogin,
-    [string]$JsonOut
+    [switch]$AllowRootLogin
 )
 
 Set-StrictMode -Version Latest
@@ -31,6 +33,11 @@ $ErrorActionPreference = "Stop"
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 . (Join-Path $scriptDir "member_expiry_capability_probe_lib.ps1")
+
+# The single fixed claim/result root, read from the reviewed library constant. Never an
+# environment value, never derived from the current or deployment directory, never a
+# parameter. It is never created, repaired, migrated, cleaned or redirected here.
+$script:ExpiryProbeStateRoot = Get-ExpiryProbeCanonicalStateRoot
 
 # --------------------------------------------------------------------------- #
 # What this probe is (and is NOT):
@@ -46,10 +53,18 @@ $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 # docs/autocount2-automation/member_expiry_capability_probe_runbook.md).
 #
 # Before the irreversible SaveMember it atomically creates a permanent single-use
-# attempt claim in the operator-provided StateDirectory. The claim is both the
+# attempt claim in the ONE fixed canonical state root. The claim is both the
 # concurrent-execution exclusion and the permanent no-retry boundary: it is never
 # overwritten or deleted, so a crash after it is created makes every future invocation
 # fail closed. There is no automatic claim removal or stale-claim recovery.
+#
+# Because the root is a fixed reviewed constant rather than an operator-selected directory,
+# the claim namespace is global for the machine: two concurrent launches contend for the
+# SAME claim path and exactly one can win. A launch that loses that race AFTER live
+# AutoCount contact reports ATTEMPT_CLAIM_LOST_AFTER_CONTACT, never the pre-contact
+# ATTEMPT_ALREADY_CLAIMED. The root must already exist and every component from the volume
+# root down must be a plain, non-redirected directory; otherwise the run fails closed with
+# CLAIM_ROOT_UNAVAILABLE before any assembly load, authentication or live read.
 #
 # It performs NO member update, NO delete, NO rollback, and NO automatic cleanup. The
 # one synthetic member it may create will REMAIN in AutoCount and must be reviewed and
@@ -79,10 +94,10 @@ $approvalReferenceRe = '^[A-Za-z0-9._-]{3,64}$'
 function Get-SanitizedMessage {
     param([object]$Message)
     $text = [string]$Message
-    # Redact connection values AND private runtime paths (the state directory, AutoCount
-    # root, and any JsonOut path), since a .NET exception can embed a full path that
-    # discloses a machine username or an internal share.
-    foreach ($secret in @($ServerName, $DatabaseName, $UserId, [Environment]::GetEnvironmentVariable($PasswordEnvVar), $StateDirectory, $AcRoot, $JsonOut)) {
+    # Redact connection values AND private runtime paths (the canonical state root and the
+    # AutoCount root), since a .NET exception can embed a full path that discloses a machine
+    # username or an internal share.
+    foreach ($secret in @($ServerName, $DatabaseName, $UserId, [Environment]::GetEnvironmentVariable($PasswordEnvVar), $script:ExpiryProbeStateRoot, $AcRoot)) {
         if (-not [string]::IsNullOrEmpty($secret)) { $text = $text.Replace($secret, "<redacted>") }
     }
     $text = [regex]::Replace($text, "(?i)(password|pwd|user id|uid|server|database)\s*=\s*[^;\s]+", '$1=<redacted>')
@@ -173,8 +188,15 @@ $result = [ordered]@{
     synthetic_fingerprint         = $null
     attempt_fingerprint           = $null
     intended_expiry_date          = $script:SyntheticExpiryDate
+    # Basenames only: the canonical state root itself is never emitted or persisted.
     claim_basename                = $null
     result_basename               = $null
+    staging_basename              = $null
+    # Content-borne publication contract binding this record to ONE authoritative basename.
+    publication_contract          = $null
+    state_root_trusted            = $false
+    claim_root_unavailable        = $false
+    claim_root_failure_reasons    = @()
     activated                     = $false
     confirm_synthetic_expiry_test = [bool]$ConfirmSyntheticExpiryDateTest
     confirm_single_synthetic      = [bool]$ConfirmSingleSyntheticMember
@@ -183,16 +205,22 @@ $result = [ordered]@{
     confirm_no_update_or_delete   = [bool]$ConfirmNoUpdateOrDelete
     ac_root_exists                = $false
     required_assemblies_loaded    = $false
+    # True from the instant the FIRST live AutoCount authentication call is made, whether or
+    # not it succeeds, so no post-contact state can be reported as a pre-contact refusal.
+    autocount_contacted           = $false
     authentication_success        = $false
     member_command_found          = $false
     get_member_found              = $false
+    initial_member_read_attempted = $false
     member_exists_initial         = $false
     new_member_success            = $false
     assignment_success            = $false
     expiry_date_assigned          = $false
+    member_recheck_attempted      = $false
     member_exists_recheck         = $false
     claim_created                 = $false
     claim_conflict                = $false
+    claim_lost_after_contact      = $false
     claim_persist_failed          = $false
     save_member_method_found      = $false
     save_member_attempted         = $false
@@ -210,6 +238,9 @@ $result = [ordered]@{
     # Pessimistic: only a successful durable result write sets this true, so a run that
     # produced no result artifact never reports evidence as persisted.
     evidence_persisted            = $false
+    # True only when publication failed after the staging artefact was written. The staged
+    # object is left untouched and is NON-AUTHORITATIVE by its own publication contract.
+    non_authoritative_staging_may_remain = $false
     exit_code                     = 1
     error                         = $null
 }
@@ -229,31 +260,42 @@ function Complete-ExpiryProbeRun {
     # cannot be written, the run does NOT report success: exit is forced nonzero and
     # evidence_persisted is false, so a verified capability with no retained audit
     # artefact can never be mistaken for a clean pass.
-    param([switch]$DurableEvidence, [string]$ResultPath)
+    param([switch]$DurableEvidence, [string]$ResultPath, [string]$StagingPath)
     # The underlying (run) outcome is derived once from the flags and preserved. The
     # final outcome may be overridden to EVIDENCE_PERSISTENCE_FAILED if durable evidence
     # was required but could not be persisted, so only a durably persisted verified run
     # can ever report EXPIRY_VERIFIED / exit 0.
     $underlying = Get-ExpiryProbeTerminalOutcome -Flags $result
     $result.underlying_terminal_outcome = $underlying
-    $durableRequired = ($DurableEvidence -and -not [string]::IsNullOrWhiteSpace($ResultPath))
+    $durableRequired = ($DurableEvidence -and
+        -not [string]::IsNullOrWhiteSpace($ResultPath) -and
+        -not [string]::IsNullOrWhiteSpace($StagingPath))
     if ($durableRequired) {
         $result.evidence_persisted = $true
         $result.terminal_outcome = Get-ExpiryProbeFinalOutcome -UnderlyingOutcome $underlying -DurableRequired $true -EvidencePersisted $true
         $result.exit_code = Get-ExpiryProbeExitCode -TerminalOutcome $result.terminal_outcome
+        # These are the exact bytes staged for publication. They already carry the
+        # publication contract, so the staged object binds itself to the final basename it
+        # has not yet reached and can never pass authoritative-result validation while it
+        # remains staged.
         $content = $result | ConvertTo-Json -Depth 8
         try {
-            Write-ExpiryProbeResultAtomic -Path $ResultPath -Content $content
+            Publish-ExpiryProbeResultAtomic -StagingPath $StagingPath -FinalPath $ResultPath -Content $content
         }
         catch {
-            # The authoritative durable result could not be written: the capability is
+            # The authoritative durable result could not be published: the capability is
             # NOT proven. Override the final outcome, force a nonzero exit, keep the
             # underlying outcome for diagnosis, and never claim durable evidence exists.
+            #
+            # The staging artefact (if it was created) is deliberately left EXACTLY as
+            # written: it is not deleted, rewritten, renamed or republished by any other
+            # route. Its own publication contract makes it non-authoritative.
             $result.evidence_persisted = $false
+            $result.non_authoritative_staging_may_remain = $true
             $result.terminal_outcome = Get-ExpiryProbeFinalOutcome -UnderlyingOutcome $underlying -DurableRequired $true -EvidencePersisted $false
             $result.exit_code = Get-ExpiryProbeExitCode -TerminalOutcome $result.terminal_outcome
             if ($null -eq $result.error) { $result.error = [ordered]@{ phase = "evidence"; message = (Get-SanitizedMessage $_.Exception.Message) } }
-            [Console]::Error.WriteLine("durable evidence persistence failed; capability not proven (terminal=EVIDENCE_PERSISTENCE_FAILED).")
+            [Console]::Error.WriteLine("durable evidence publication failed; capability not proven (terminal=EVIDENCE_PERSISTENCE_FAILED). A NON-AUTHORITATIVE staged artefact may remain in the canonical state root; it is authoritative only under its bound authoritative_result_basename, which it never reached. Do not delete, rename or republish it: recovery is a separate owner-directed manual review.")
         }
     }
     else {
@@ -261,18 +303,7 @@ function Complete-ExpiryProbeRun {
         $result.exit_code = Get-ExpiryProbeExitCode -TerminalOutcome $result.terminal_outcome
     }
     $script:ProbeExitCode = $result.exit_code
-    $safeJson = $result | ConvertTo-Json -Depth 8
-    if (-not [string]::IsNullOrWhiteSpace($JsonOut)) {
-        # Optional secondary sanitised copy; also non-overwriting to protect audit evidence.
-        try {
-            $p = [System.IO.Path]::GetFullPath($JsonOut)
-            $parent = [System.IO.Path]::GetDirectoryName($p)
-            if (-not [string]::IsNullOrWhiteSpace($parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
-            New-ExpiryProbeDurableArtifact -Path $p -Content $safeJson
-        }
-        catch { }
-    }
-    $safeJson
+    $result | ConvertTo-Json -Depth 8
 }
 
 # ---- Inactive by default: refuse before anything else when a switch is missing. ----
@@ -297,8 +328,14 @@ $result.activated = $true
 $assemblyResolveHandler = $null
 $claimPath = $null
 $resultPath = $null
+$stagingPath = $null
 $stateReady = $false
+# The retained trusted state-root lease. Released ONLY in the outermost finally, after the
+# terminal evidence has been published (or its publication failure handled), so the pinned
+# namespace outlives the entire irreversible operation.
+$script:ExpiryProbeRootLease = $null
 
+try {
 try {
     # ---- Bind evidence to approval + target (before any AutoCount contact). ----
     if ([string]::IsNullOrWhiteSpace($ApprovalReference) -or $ApprovalReference -notmatch $approvalReferenceRe) {
@@ -316,18 +353,6 @@ try {
     # Only now, after it has passed the opaque-alphabet and no-embedded-target checks, is
     # the approval reference safe to record in the emitted evidence.
     $result.approval_reference = $ApprovalReference
-    if (-not (Test-ExpiryProbeSafePath -Path $StateDirectory)) {
-        throw "A safe absolute -StateDirectory is required."
-    }
-    if (-not (Test-Path -LiteralPath $StateDirectory -PathType Container)) {
-        throw "The -StateDirectory does not exist (operator setup prerequisite; the probe never creates it)."
-    }
-    # Private evidence must never land inside a repository checkout. When the probe is run
-    # from a checkout, reject a state directory inside it; the deployed VM copy has no
-    # enclosing repo and is unaffected.
-    if (Test-ExpiryProbePathInsideRepo -Path $StateDirectory -StartDir $scriptDir) {
-        throw "The -StateDirectory must be outside the repository checkout (private evidence only)."
-    }
     foreach ($pair in @(@("ServerName", $ServerName), @("DatabaseName", $DatabaseName))) {
         if ([string]::IsNullOrWhiteSpace($pair[1])) { throw "$($pair[0]) is required to bind the capability evidence to the target." }
     }
@@ -339,13 +364,41 @@ try {
     $result.synthetic_fingerprint = $syntheticFingerprint
     $result.attempt_fingerprint = $attemptFingerprint
 
-    $claimPath = Join-Path $StateDirectory ("expiry_probe_claim_" + $attemptFingerprint + ".claim")
-    $resultPath = Join-Path $StateDirectory ("expiry_probe_result_" + $operationId + ".json")
-    $result.claim_basename = [System.IO.Path]::GetFileName($claimPath)
-    $result.result_basename = [System.IO.Path]::GetFileName($resultPath)
+    # Artefact basenames are pure functions of the schema-stable attempt fingerprint and the
+    # per-run operation id. They are recorded BEFORE the root is validated so the emitted
+    # evidence proves the claim identity even on a fail-closed run, and so no process
+    # argument, working directory or deployment path can shift the claim namespace.
+    $result.claim_basename = Get-ExpiryProbeClaimBasename -AttemptFingerprint $attemptFingerprint
+    $result.result_basename = Get-ExpiryProbeResultBasename -OperationId $operationId
+    $result.staging_basename = Get-ExpiryProbeStagingBasename -OperationId $operationId
+    $result.publication_contract = New-ExpiryProbePublicationContract -OperationId $operationId
+
+    # ---- Trusted canonical state root: PIN it before any live access. ----
+    # Acquiring the lease validates the whole chain (present, plain, non-redirected, local
+    # volume) AND retains a Windows directory handle on every component without delete
+    # sharing, so the namespace cannot be renamed, deleted or replaced underneath this
+    # process while the claim, save, read-back and publication run on string paths.
+    # This happens before assembly loading, authentication and every live read. Nothing here
+    # creates, repairs, migrates, cleans or follows a component. Only reason codes are
+    # emitted, never the raw path or any handle/identity value.
+    $script:ExpiryProbeRootLease = New-ExpiryProbeTrustedRootLease -Root $script:ExpiryProbeStateRoot -RequireWindows
+    $result.state_root_trusted = [bool]$script:ExpiryProbeRootLease.acquired
+    if (-not $result.state_root_trusted) {
+        $result.claim_root_unavailable = $true
+        $result.claim_root_failure_reasons = @($script:ExpiryProbeRootLease.reasons)
+        throw "The canonical attempt-claim root is unavailable or untrusted; refusing before any AutoCount contact. The probe never creates, repairs or redirects it (operator setup prerequisite)."
+    }
+
+    $statePaths = Get-ExpiryProbeStatePaths -Root $script:ExpiryProbeStateRoot `
+        -AttemptFingerprint $attemptFingerprint -OperationId $operationId
+    $claimPath = $statePaths.claim_path
+    $resultPath = $statePaths.result_path
+    $stagingPath = $statePaths.staging_path
     $stateReady = $true
 
     # ---- Permanent single-use claim: refuse before AutoCount if it already exists. ----
+    # This is the pre-contact check against the ONE canonical claim path, so
+    # ATTEMPT_ALREADY_CLAIMED here is always a genuine pre-contact refusal.
     if (Test-Path -LiteralPath $claimPath) {
         $result.claim_conflict = $true
         $result.synthetic_member_may_remain = $true
@@ -353,6 +406,9 @@ try {
     }
     if (Test-Path -LiteralPath $resultPath) {
         throw "A prior result artefact already exists for this operation id; refusing to overwrite evidence."
+    }
+    if (Test-Path -LiteralPath $stagingPath) {
+        throw "A staging artefact already exists for this operation id; refusing to overwrite, truncate or remove it."
     }
 
     # ---- AutoCount connection inputs (from the AC2_PROBE_* environment; never printed). ----
@@ -402,6 +458,10 @@ try {
     }
 
     $dbSetting = $dbSettingFactory.Invoke($null, @($ServerName, $DatabaseName))
+    # Live AutoCount contact begins with the next call. Record it BEFORE the call, not after
+    # it succeeds, so a failure, timeout or claim race downstream can never be reported as a
+    # pre-contact refusal.
+    $result.autocount_contacted = $true
     [void]$authenticateMethod.Invoke($null, @($dbSetting, $userForProbe, $passwordForProbe))
     $session = $userSessionConstructor.Invoke(@($dbSetting))
     if ($AllowRootLogin -and $null -ne $allowRootLoginProperty -and $allowRootLoginProperty.CanWrite) {
@@ -427,6 +487,7 @@ try {
     $result.get_member_found = ($null -ne $getMemberMethod)
     if ($null -eq $getMemberMethod) { throw "GetMember method was not found." }
 
+    $result.initial_member_read_attempted = $true
     $existing = $getMemberMethod.Invoke($memberCommand, @($script:SyntheticMemberNo))
     $result.member_exists_initial = ($null -ne $existing)
     if ($result.member_exists_initial) {
@@ -472,6 +533,7 @@ try {
     $result.expiry_date_assigned = $true
 
     # ---- Fresh duplicate recheck immediately before claiming + saving. ----
+    $result.member_recheck_attempted = $true
     $recheck = $getMemberMethod.Invoke($memberCommand, @($script:SyntheticMemberNo))
     $result.member_exists_recheck = ($null -ne $recheck)
     if ($result.member_exists_recheck) {
@@ -509,11 +571,19 @@ try {
             throw "The attempt claim could not be durably persisted; refusing to write before any save."
         }
         if (Test-Path -LiteralPath $claimPath) {
-            # A claim already existed (another launch won the race, or a prior run): a
-            # genuine conflict. A prior run may have created a synthetic member.
-            $result.claim_conflict = $true
+            # A claim already exists on the ONE canonical path: another contender owns the
+            # permanent claim for this target/record. Fail closed with no save, no update, no
+            # delete, no rollback and no retry.
             $result.synthetic_member_may_remain = $true
-            throw "A permanent attempt claim already exists (concurrent or prior); refusing to write."
+            if ($result.autocount_contacted) {
+                # This process already authenticated to AutoCount and performed both live
+                # duplicate reads, so it is NOT a pre-contact refusal and must never be
+                # reported as ATTEMPT_ALREADY_CLAIMED.
+                $result.claim_lost_after_contact = $true
+                throw "Another contender owns the permanent attempt claim for this target/record. This process had already made live AutoCount contact (authentication and both duplicate reads) before losing the claim race, so no save was attempted and nothing is retried."
+            }
+            $result.claim_conflict = $true
+            throw "A permanent attempt claim already exists (prior run); refusing to write before any AutoCount contact."
         }
         throw "The attempt claim could not be created; refusing to write before any save."
     }
@@ -571,7 +641,16 @@ finally {
     Remove-Variable passwordForProbe -ErrorAction SilentlyContinue
 }
 
-# Persist durable, non-overwriting evidence (when the state directory was resolved),
-# emit sanitised JSON, and exit with the truthful code. Cleanup already ran in finally.
-Complete-ExpiryProbeRun -DurableEvidence:$stateReady -ResultPath $resultPath
+# Publish durable, no-clobber evidence (only when the canonical state root was pinned),
+# emit sanitised JSON, and record the truthful exit code. Still inside the lease.
+Complete-ExpiryProbeRun -DurableEvidence:$stateReady -ResultPath $resultPath -StagingPath $stagingPath
+}
+finally {
+    # The ONLY lease release site. It runs after claim creation (or its failure), the single
+    # SaveMember attempt, read-back adjudication and final result publication (or
+    # publication-failure handling) have all completed, and it runs on every path: refusal,
+    # untrusted root, authentication failure, duplicate block, claim conflict, uncertain
+    # save, read-back failure and publication failure alike.
+    Close-ExpiryProbeTrustedRootLease -Lease $script:ExpiryProbeRootLease
+}
 exit $script:ProbeExitCode
