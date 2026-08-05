@@ -20,6 +20,12 @@ on:
       - "scripts/ac2_member_expiry_capability_probe.ps1"
       - "scripts/member_expiry_capability_probe_lib.ps1"
       - "scripts/member_lookup_shared_folder_handoff.py"
+      # Delegated in-process lookup dependencies: the focused suite imports and exercises
+      # these modules, so a change confined to one of them must still trigger this workflow.
+      - "scripts/member_lookup_gate4_real_queue_lookup.py"
+      - "scripts/ac2_member_lookup_bridge_worker.py"
+      - "scripts/member_lookup_gate3c_local_bridge_runtime.py"
+      - "scripts/member_lookup_gate4a_queue_precheck.py"
       - "schemas/member_create_uat_package.schema.json"
       - "config/member_create_uat_business_confirmation*.json"
       - "n8n-workflows/member_create_uat_result_mapping.workflow.json"
@@ -27,6 +33,12 @@ on:
       - "tests/test_ac2_member_expiry_capability_probe.py"
       - "tests/test_member_lookup_shared_folder_handoff.py"
       - "tests/_create_uat_fixtures.py"
+      # Test modules covering the delegated lookup closure above, plus the Windows job's own
+      # authoritative full-suite entrypoint, which previously could change untriggered.
+      - "tests/test_member_lookup_gate4_real_queue_lookup.py"
+      - "tests/test_ac2_member_lookup_bridge_worker.py"
+      - "tests/test_member_lookup_gate4a_manual_handoff.py"
+      - "tests/_run_ci_full_suite.py"
       # Safety documents that the focused tests read and assert; a docs-only change to
       # any of these must still trigger this workflow so the instructions cannot regress.
       - "docs/autocount2-automation/member_expiry_capability_probe_runbook.md"
