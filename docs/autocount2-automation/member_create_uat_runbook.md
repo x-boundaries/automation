@@ -138,8 +138,26 @@ agent and never on the physical host.
 
 ### 3. Physical host pulls reviewed `main`
 
-**`PHYSICAL HOST — DESKTOP-Q43QKQF`** The physical host only ever fast-forwards to the
-reviewed, merged `main`. It is never used for implementation or manual edits.
+**Separate current-turn owner approval required (host-sync gate).** The command below runs
+on the physical host `DESKTOP-Q43QKQF`, contacts the remote, and fast-forwards (mutates)
+that host's checkout. It is a change to an external machine, not a read-only check. Before
+running it, obtain an explicit current-turn owner approval that names the physical host
+(`DESKTOP-Q43QKQF`) and the pull/sync operation on it. This approval is distinct and is
+**not** implied by any other gate:
+
+- the PR review and merge decision (step 2) does **not** cover this host sync;
+- the VM deployment stage (step 4) does **not** cover this host sync;
+- the no-write dry-run preflight (step 5) does **not** cover this host sync;
+- the separate current-turn write approval (step 7) does **not** cover this host sync.
+
+This host-sync approval does not authorise deployment, package execution, preflight or a
+member write. A prior-turn approval is not reusable. Without the named current-turn
+approval, stop before contacting `DESKTOP-Q43QKQF` and do not run
+`git pull --ff-only origin main`.
+
+**`PHYSICAL HOST — DESKTOP-Q43QKQF`** After the PR is reviewed and merged, and only after
+the host-sync approval above, the physical host fast-forwards to the reviewed, merged
+`main`. It is never used for implementation or manual edits.
 
 ```bash
 git pull --ff-only origin main
@@ -968,6 +986,9 @@ sweep them either.
   (recording the business confirmations and flipping the capability flag) performs no
   live write; a real write still requires the explicit VM write step above and a
   separate current-turn owner approval naming the exact target and operation.
+- The host sync on `DESKTOP-Q43QKQF` in step 3 and the `SaveMember` write in step 7
+  each require their own prior current-turn owner approval. Neither implies the other,
+  and a prior-turn approval is never reusable for either.
 - Exactly one member is supported; there is no batch path, no update-member path, no
   delete, and no rollback automation.
 - SaveMember is called at most once and is never automatically retried. An uncertain
