@@ -4154,10 +4154,14 @@ HOST_SYNC_SAFETY_HEADING = "## Safety boundary"
 # bare "cover this host sync" would accept the inverted claim just as happily as the denial.
 HOST_SYNC_NON_SUBSTITUTING_STEPS = ("(step 2)", "(step 4)", "(step 5)", "(step 7)")
 HOST_SYNC_NON_SUBSTITUTION_PHRASE = "does **not** cover this host sync"
-# A clause ends at the first `;` or `.` after its step token. That syntactic bound replaces the
+# A clause ends at the first of these after its step token. This syntactic bound replaces the
 # earlier fixed character window, which was wide enough for a neighbouring compliant bullet to
-# satisfy a mutated one.
-HOST_SYNC_CLAUSE_TERMINATORS = (";", ".")
+# satisfy a mutated one. `;` and `.` alone are not enough: they belong to the bullet an editor is
+# already rewriting, so the edit that inverts a denial can delete its terminator in the same
+# stroke and let the clause run into the next list item. `_flat()` collapses the newline between
+# Markdown bullets to " - ", so that separator is a structural bound the mutated bullet does not
+# own -- removing it means deleting the NEXT bullet, which the removal controls already catch.
+HOST_SYNC_CLAUSE_TERMINATORS = (" - ", ";", ".")
 HOST_SYNC_FORWARD_PHRASE = (
     "does not authorise deployment, package execution, preflight or a member write")
 HOST_SYNC_CURRENT_TURN_PHRASE = "current-turn owner approval"
@@ -4194,11 +4198,13 @@ def _flat(text):
 
 
 def _clause_after(text, token):
-    """Return ``token``'s own clause: the token up to its first `;` or `.`, else "".
+    """Return ``token``'s own clause: the token up to its first clause terminator, else "".
 
-    This is the scope bound for a per-step assertion. Stopping at the clause terminator is what
-    keeps an adjacent compliant bullet from answering for a mutated one. Non-throwing: an absent
-    token yields an empty clause, which every phrase check then fails.
+    This is the scope bound for a per-step assertion. Stopping at the terminator is what keeps an
+    adjacent compliant bullet from answering for a mutated one, so the bound must survive a bullet
+    that drops its own punctuation: the flattened list-item separator ends the clause at the next
+    bullet even then. Non-throwing: an absent token yields an empty clause, which every phrase
+    check then fails.
     """
     at = text.find(token)
     if at == -1:
@@ -4616,6 +4622,36 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
         for neighbour in ("(step 2)", "(step 5)", "(step 7)"):
             self.assertIn(HOST_SYNC_STEP_DENIAL_BULLETS[neighbour], degraded,
                           "%s must remain compliant and adjacent" % neighbour)
+        self.assertIn("substitution_not_denied", host_sync_gate_findings(degraded))
+
+    # -- Unterminated inversion: the bound must not depend on the bullet's own punctuation -- #
+    # `;` and `.` belong to the bullet an editor is already rewriting, so the same edit that
+    # inverts a denial can delete its terminator. A clause bounded only by that punctuation then
+    # runs on into the NEXT list item, whose untouched denial answers for the mutated one.
+    def _inverted_unterminated_step_denial(self, step, neighbour):
+        """Invert one bullet AND drop its own trailing `;`, leaving ``neighbour`` intact."""
+        bullet = HOST_SYNC_STEP_DENIAL_BULLETS[step]
+        mutated = bullet.replace("does **not** cover", "does cover").replace(" sync;\n", " sync\n")
+        self.assertNotEqual(mutated, bullet, "the mutation must change %s" % step)
+        self.assertIn(step, mutated, "the mutated bullet must keep its step token")
+        self.assertNotIn(";", mutated, "%s must lose its own clause terminator" % step)
+        self.assertNotIn(HOST_SYNC_NON_SUBSTITUTION_PHRASE, mutated,
+                         "%s must no longer deny anything by itself" % step)
+        degraded = self._degraded_gate(bullet, mutated)
+        self.assertIn(HOST_SYNC_STEP_DENIAL_BULLETS[neighbour], degraded,
+                      "%s must remain present and compliant to be borrowable" % neighbour)
+        return degraded
+
+    def test_control_unterminated_inverted_step_2_cannot_borrow_step_4(self):
+        degraded = self._inverted_unterminated_step_denial("(step 2)", "(step 4)")
+        self.assertIn("substitution_not_denied", host_sync_gate_findings(degraded))
+
+    def test_control_unterminated_inverted_step_4_cannot_borrow_step_5(self):
+        degraded = self._inverted_unterminated_step_denial("(step 4)", "(step 5)")
+        self.assertIn("substitution_not_denied", host_sync_gate_findings(degraded))
+
+    def test_control_unterminated_inverted_step_5_cannot_borrow_step_7(self):
+        degraded = self._inverted_unterminated_step_denial("(step 5)", "(step 7)")
         self.assertIn("substitution_not_denied", host_sync_gate_findings(degraded))
 
     # -- Safety-boundary proposition controls -- #
