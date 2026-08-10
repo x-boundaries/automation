@@ -4159,9 +4159,11 @@ HOST_SYNC_NON_SUBSTITUTION_PHRASE = "does **not** cover this host sync"
 # satisfy a mutated one. `;` and `.` alone are not enough: they belong to the bullet an editor is
 # already rewriting, so the edit that inverts a denial can delete its terminator in the same
 # stroke and let the clause run into the next list item. `_flat()` collapses the newline between
-# Markdown bullets to " - ", so that separator is a structural bound the mutated bullet does not
-# own -- removing it means deleting the NEXT bullet, which the removal controls already catch.
-HOST_SYNC_CLAUSE_TERMINATORS = (" - ", ";", ".")
+# Markdown bullets to " <marker> ", so that separator is a structural bound the mutated bullet does
+# not own -- removing it means deleting the NEXT bullet, which the removal controls already catch.
+# All three CommonMark bullet markers must be listed: an editor may write the list with "-", "*" or
+# "+", and a bound that knows only one of them lets the mutated bullet run across the other two.
+HOST_SYNC_CLAUSE_TERMINATORS = (" - ", " * ", " + ", ";", ".")
 HOST_SYNC_FORWARD_PHRASE = (
     "does not authorise deployment, package execution, preflight or a member write")
 HOST_SYNC_CURRENT_TURN_PHRASE = "current-turn owner approval"
@@ -4329,6 +4331,11 @@ HOST_SYNC_STEP_DENIAL_BULLETS = {
     "(step 5)": "- the no-write dry-run preflight (step 5) does **not** cover this host sync;\n",
     "(step 7)": "- the separate current-turn write approval (step 7) does **not** cover this host sync.\n",
 }
+
+# CommonMark accepts `-`, `*` and `+` interchangeably as bullet markers, so an editor may rewrite
+# the list with any of them. `_flat()` renders every one of those breaks as " <marker> ", which is
+# why the clause bound must recognise all three and not just the hyphen the fixture happens to use.
+HOST_SYNC_BULLET_MARKERS = ("-", "*", "+")
 
 
 class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
@@ -4653,6 +4660,58 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
     def test_control_unterminated_inverted_step_5_cannot_borrow_step_7(self):
         degraded = self._inverted_unterminated_step_denial("(step 5)", "(step 7)")
         self.assertIn("substitution_not_denied", host_sync_gate_findings(degraded))
+
+    # -- Neighbour marker variants: the bound must not depend on WHICH bullet marker is used -- #
+    # The controls above all leave the neighbour hyphen-marked, so they only prove the " - " break
+    # is a bound. CommonMark treats `*` and `+` as equally valid, and a list rewritten with either
+    # still reads as a compliant runbook -- so an unterminated inverted bullet must not be able to
+    # run across such a break and borrow the untouched denial that follows it.
+    HOST_SYNC_ADJACENT_STEP_NEIGHBOURS = (("(step 2)", "(step 4)"),
+                                          ("(step 4)", "(step 5)"),
+                                          ("(step 5)", "(step 7)"))
+
+    def _unterminated_inversion_across_marker(self, step, neighbour, marker):
+        """Invert+unterminate ``step`` and re-mark the adjacent ``neighbour`` with ``marker``.
+
+        The mutated bullet keeps its step token and loses both its own denial and its own
+        punctuation, so nothing but a structural bound can stop its clause. ``neighbour`` stays
+        verbatim-compliant and immediately adjacent, carrying only a different bullet marker.
+        """
+        bullet = HOST_SYNC_STEP_DENIAL_BULLETS[step]
+        mutated = bullet.replace("does **not** cover", "does cover").replace(" sync;\n", " sync\n")
+        self.assertNotEqual(mutated, bullet, "the mutation must change %s" % step)
+        self.assertIn(step, mutated, "the mutated bullet must keep its step token")
+        for own in (";", "."):
+            self.assertNotIn(own, mutated,
+                             "%s must lose its own %r clause terminator" % (step, own))
+        self.assertNotIn(HOST_SYNC_NON_SUBSTITUTION_PHRASE, mutated,
+                         "%s must no longer deny anything by itself" % step)
+
+        original = HOST_SYNC_STEP_DENIAL_BULLETS[neighbour]
+        remarked = marker + original[1:]
+        self.assertIn(HOST_SYNC_NON_SUBSTITUTION_PHRASE, remarked,
+                      "%s must keep its denial verbatim to be borrowable" % neighbour)
+
+        # Replacing the adjacent PAIR in one step makes adjacency an asserted precondition: if the
+        # fixture's bullet order ever changed, this control would fail loudly rather than silently
+        # stop testing a bullet break.
+        pair = bullet + original
+        self.assertIn(pair, HOST_SYNC_CANONICAL_FIXTURE,
+                      "%s must sit immediately before %s" % (step, neighbour))
+        degraded = self._degraded_gate(pair, mutated + remarked)
+        self.assertIn(remarked, degraded,
+                      "%s must remain present, compliant and %r-marked" % (neighbour, marker))
+        return degraded
+
+    def test_control_unterminated_inversion_cannot_borrow_across_any_bullet_marker(self):
+        for step, neighbour in self.HOST_SYNC_ADJACENT_STEP_NEIGHBOURS:
+            for marker in HOST_SYNC_BULLET_MARKERS:
+                with self.subTest(step=step, neighbour=neighbour, marker=marker):
+                    degraded = self._unterminated_inversion_across_marker(step, neighbour, marker)
+                    self.assertIn(
+                        "substitution_not_denied", host_sync_gate_findings(degraded),
+                        "%s borrowed %s's denial across a %r-marked bullet break"
+                        % (step, neighbour, marker))
 
     # -- Safety-boundary proposition controls -- #
     def test_control_weakened_safety_own_approval_requirement_is_detected(self):
