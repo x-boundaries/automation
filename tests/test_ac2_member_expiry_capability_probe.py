@@ -4501,15 +4501,18 @@ VM_GATE_PREFLIGHT_UNMET = frozenset((
 VM_GATE_FINDING_KEYS = (
     "deploy_boundary_ambiguous", "deploy_boundary_missing", "deploy_execution_not_denied",
     "deploy_gate_after_mutation", "deploy_gate_marker_ambiguous", "deploy_gate_missing",
-    "deploy_not_current_turn", "deploy_operation_missing", "deploy_operation_not_bound",
+    "deploy_heading_changed", "deploy_not_current_turn", "deploy_operation_missing",
+    "deploy_operation_not_bound",
     "deploy_pre_gate_content", "deploy_prior_turn_not_denied", "deploy_state_preparation_missing",
-    "deploy_step_missing", "deploy_stop_boundary_missing", "deploy_substitution_not_denied",
+    "deploy_step_ambiguous", "deploy_step_missing", "deploy_stop_boundary_missing",
+    "deploy_substitution_not_denied",
     "deploy_vm_not_named", "preflight_boundary_ambiguous", "preflight_boundary_missing",
     "preflight_dry_run_not_bound", "preflight_gate_after_external_action",
-    "preflight_gate_marker_ambiguous", "preflight_gate_missing", "preflight_not_current_turn",
+    "preflight_gate_marker_ambiguous", "preflight_gate_missing", "preflight_heading_changed",
+    "preflight_not_current_turn",
     "preflight_operation_missing", "preflight_prefix_changed", "preflight_prior_turn_not_denied",
     "preflight_runner_invocation_missing", "preflight_save_member_not_denied",
-    "preflight_step_missing", "preflight_stop_boundary_missing",
+    "preflight_step_ambiguous", "preflight_step_missing", "preflight_stop_boundary_missing",
     "preflight_substitution_not_denied", "preflight_target_not_bound",
     "preflight_transfer_not_bound", "preflight_vm_not_named", "safety_boundary_not_four_way",
 )
@@ -4519,7 +4522,9 @@ def _numbered_step_section(text, number):
     """Return one numbered Markdown step section, bounded by the numbered step headings.
 
     Layer 1 of the structural bound. Non-throwing: an absent step yields "", which then fails
-    every requirement that lives inside it rather than raising.
+    every requirement that lives inside it rather than raising. This is section EXTRACTION only:
+    ``_resolve_numbered_step`` owns the uniqueness and heading-identity authority, because taking
+    the first of two same-number headings is exactly the accepted F-3 defect.
     """
     heading = "### %d. " % number
     starts = [match.start() for match in VM_GATE_STEP_HEADING.finditer(text)]
@@ -4533,6 +4538,48 @@ def _numbered_step_section(text, number):
 def _line_start(text, at):
     """Start of the line containing ``at``. A missing offset stays missing."""
     return -1 if at == -1 else text.rfind("\n", 0, at) + 1
+
+
+def _numbered_step_openings(text, number):
+    """Every offset at which a NUMBERED heading opens step ``number``."""
+    heading = "### %d. " % number
+    return [start for start in (match.start() for match in VM_GATE_STEP_HEADING.finditer(text))
+            if text.startswith(heading, start)]
+
+
+def _resolve_numbered_step(text, number, prefix, findings):
+    """Resolve step ``number`` to its ONE authoritative section, or fail closed.
+
+    Layer 0 of the structural bound, and the whole A2 repair. Two accepted final-G4 findings,
+    both demonstrated as false cleans:
+
+    * the step number must open EXACTLY once. Zero is the pre-existing missing-step case; MORE
+      than one is ambiguous authority, because silently taking the first occurrence is what let a
+      second same-number section orphan an ungated external instruction while the genuine section
+      stayed compliant -- accepted F-3. A harmless duplicate fails closed too: once the number
+      appears twice there is no answer to which section governs, and guessing is the defect.
+    * the heading LINE is itself immutable authority. It sits outside both pre-gate authorities
+      (step 4's blank body, step 5's frozen digest), so without this an actionable heading could
+      carry external-action semantics ahead of the gate -- accepted F-4. Exact-string authority is
+      used rather than folding the heading into the digest, so the frozen step-5 prefix digest
+      stays byte-stable.
+
+    Whitespace is non-material, matching the rest of this contract: a CRLF checkout or a reflowed
+    heading is not drift, while case, punctuation and wording changes all fail closed.
+    Non-throwing: every failure yields "", which then fails every requirement inside the step.
+    """
+    openings = _numbered_step_openings(text, number)
+    if not openings:
+        findings.add(prefix + "_step_missing")
+        return ""
+    if len(openings) > 1:
+        findings.add(prefix + "_step_ambiguous")
+        return ""
+    section = _numbered_step_section(text, number)
+    if _flat(section.partition("\n")[0]) != _flat(VM_GATE_REVIEWED_HEADINGS[number]):
+        findings.add(prefix + "_heading_changed")
+        return ""
+    return section
 
 
 def _resolve_gate_layout(section, marker, boundary, prefix, findings):
@@ -4589,9 +4636,7 @@ def _every_source_denied(prose, sources, denial):
 
 def _deployment_findings(text, findings):
     """Step 4: a current-turn approval must precede every VM mutation the step performs."""
-    section = _numbered_step_section(text, VM_GATE_DEPLOY_STEP)
-    if not section:
-        findings.add("deploy_step_missing")
+    section = _resolve_numbered_step(text, VM_GATE_DEPLOY_STEP, "deploy", findings)
     pre_gate, block, action = _resolve_gate_layout(
         section, VM_GATE_DEPLOY_MARKER, VM_GATE_DEPLOY_BOUNDARY, "deploy", findings)
     if block is None:
@@ -4634,9 +4679,7 @@ def _deployment_findings(text, findings):
 
 def _preflight_findings(text, findings):
     """Step 5: a current-turn approval must precede the package transfer AND the dry-run."""
-    section = _numbered_step_section(text, VM_GATE_PREFLIGHT_STEP)
-    if not section:
-        findings.add("preflight_step_missing")
+    section = _resolve_numbered_step(text, VM_GATE_PREFLIGHT_STEP, "preflight", findings)
     pre_gate, block, action = _resolve_gate_layout(
         section, VM_GATE_PREFLIGHT_MARKER, VM_GATE_PREFLIGHT_BOUNDARY, "preflight", findings)
     if block is None:
@@ -5301,15 +5344,19 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
     def test_vm_gate_finding_keys_are_declared_and_every_one_is_reachable(self):
         # An empty document fails every requirement that needs neither an ordering comparison nor
         # a second occurrence of a landmark, so this pins the declared key set as exhaustive. The
-        # six keys below need a document that actually contains the landmarks, and each has its
-        # own control: the two ordering keys and the four ambiguity keys.
+        # ten keys below need a document that actually contains the landmarks, and each has its
+        # own control: the two ordering keys, the four gate/boundary ambiguity keys, and the four
+        # A2 numbered-step keys (a duplicate step number and a changed heading both require a
+        # heading to exist in the first place).
         needs_a_real_document = {
             "deploy_gate_after_mutation", "preflight_gate_after_external_action",
             "deploy_gate_marker_ambiguous", "deploy_boundary_ambiguous",
             "preflight_gate_marker_ambiguous", "preflight_boundary_ambiguous",
+            "deploy_step_ambiguous", "deploy_heading_changed",
+            "preflight_step_ambiguous", "preflight_heading_changed",
         }
         self.assertLess(needs_a_real_document, set(VM_GATE_FINDING_KEYS),
-                        "the ordering and ambiguity keys must all be declared")
+                        "the ordering, ambiguity and numbered-step keys must all be declared")
         self.assertEqual(set(vm_gate_findings("")),
                          set(VM_GATE_FINDING_KEYS) - needs_a_real_document,
                          "an empty document must report every other declared finding key")
