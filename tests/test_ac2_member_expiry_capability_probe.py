@@ -4921,6 +4921,104 @@ VM_GATE_PREFLIGHT_DENIAL_BULLETS = {
 # The A1 structural landmarks (gate markers, action boundaries and post-gate operation anchors)
 # are declared beside the checker that consumes them, above.
 
+# ---- DL-XB-123-001-A3: the CommonMark numbered-ATX opening families ---- #
+# Accepted final-G4-A2 finding: numbered-step discovery recognised ONE spelling of a top-level
+# numbered ATX heading -- column 0, exactly one space after `###`, exactly one space after `<n>.`.
+# CommonMark renders an `h3` for considerably more than that: 0-3 leading spaces, any run of
+# spaces or tabs after the opening `###`, any run of spaces or tabs after `<n>.`, and an optional
+# closing `#` sequence. Every template below therefore renders the SAME heading a reviewer sees.
+#
+# A second Step 4 or Step 5 written in any of them is a real duplicate section that the narrower
+# discovery cannot enumerate. Its contents are silently absorbed into a neighbouring section --
+# in practice the genuine step's ACTION region, where only presence checks run -- so an ungated
+# deployment, transfer or preflight instruction can sit in the document while the oracle reports
+# clean. That is accepted B-1 / F-3 recurrence, and duplication is ambiguity even when the
+# duplicate prose is harmless.
+VM_GATE_A3_DUPLICATE_HEADINGS = (
+    ("one_leading_space", " ### %d. %s"),
+    ("two_leading_spaces", "  ### %d. %s"),
+    ("three_leading_spaces", "   ### %d. %s"),
+    ("two_spaces_after_hashes", "###  %d. %s"),
+    ("three_spaces_after_hashes", "###   %d. %s"),
+    ("tab_after_hashes", "###\t%d. %s"),
+    ("tab_after_step_number", "### %d.\t%s"),
+    ("indent_plus_closing_hashes", "  ### %d. %s ###"),
+)
+
+# The strict column-zero form the narrow discovery already recognised. Kept as the A3 control
+# group: it must keep failing closed exactly as A2 left it, because a grammar widened carelessly
+# could just as easily have stopped recognising the one form that already worked.
+VM_GATE_A3_STRICT_HEADING = "### %d. %s"
+
+# Four leading spaces is an indented CODE BLOCK in CommonMark, never a heading. It must stay
+# OUTSIDE top-level numbered-step authority: promoting it would let an ordinary indented Markdown
+# example inside a step silently make the real step ambiguous, which is a false positive severe
+# enough to make the contract unmaintainable.
+VM_GATE_A3_CODE_BLOCK_HEADING = "    ### %d. %s"
+
+# Whitespace-only spellings of the SINGLE genuine heading. Each renders the reviewed heading
+# exactly, so each must stay clean: the reviewed heading's identity is semantic, and a CRLF
+# checkout, a re-indent or a syntax-only closing `#` run is not drift. The closing sequence is
+# included because CommonMark strips it before rendering, so treating it as content would make a
+# purely syntactic marker look like a wording change.
+VM_GATE_A3_SEMANTIC_HEADING_VARIANTS = (
+    ("one_leading_space", " ### %d. %s"),
+    ("three_leading_spaces", "   ### %d. %s"),
+    ("two_spaces_after_hashes", "###  %d. %s"),
+    ("tab_after_hashes", "###\t%d. %s"),
+    ("tab_after_step_number", "### %d.\t%s"),
+    ("closing_hash_sequence", "### %d. %s ###"),
+    ("indent_and_padded_closing_hashes", "  ### %d. %s   ###  "),
+)
+
+# Substantive drift wearing a whitespace-valid opening. Widening the opening grammar must not
+# widen heading IDENTITY: case, punctuation and wording still have to fail closed, and a run of
+# `#` followed by further CONTENT is not a CommonMark closing sequence at all, so the trailing
+# words remain part of the heading and must be seen as drift rather than stripped as syntax.
+VM_GATE_A3_DRIFT_HEADINGS = {
+    VM_GATE_DEPLOY_STEP: (
+        ("case", "  ### %d. deploy the inactive uat components"),
+        ("punctuation", " ###  %d. Deploy the inactive UAT components."),
+        ("wording", "###\t%d. Deploy the UAT components"),
+        ("content_after_hashes", "### %d. Deploy the inactive UAT components ### and push now"),
+    ),
+    VM_GATE_PREFLIGHT_STEP: (
+        ("case", "  ### %d. NO-WRITE PREFLIGHT (DRY-RUN)"),
+        ("punctuation", " ###  %d. No write preflight (dry run)"),
+        ("wording", "###\t%d. Preflight the approved package"),
+        ("content_after_hashes", "### %d. No-write preflight (dry-run) ### then transfer"),
+    ),
+}
+
+# The rogue duplicate's own title, deliberately distinct from the reviewed heading: a duplicate
+# that reused the reviewed title verbatim could be dismissed as an accidental copy, whereas a
+# retitled section is what an editor actually writes when revising a step.
+VM_GATE_A3_DUPLICATE_TITLES = {
+    VM_GATE_DEPLOY_STEP: "Deploy the inactive UAT components (revised)",
+    VM_GATE_PREFLIGHT_STEP: "No-write preflight (dry-run) (revised)",
+}
+
+# Explicit ungated external action, so the controls prove a SAFETY consequence rather than a
+# tidiness preference. Neither body carries a gate marker or an action boundary, so neither can
+# satisfy -- or trip -- a landmark check and let a control pass for the wrong reason.
+VM_GATE_A3_UNSAFE_BODIES = {
+    VM_GATE_DEPLOY_STEP: (
+        "Push the reviewed runner and library onto DESKTOP-4I042L6 now, replace the files\n"
+        "already there and prepare the VM-owned state directory, without waiting for any\n"
+        "owner approval.\n"),
+    VM_GATE_PREFLIGHT_STEP: (
+        "Move the approved package onto DESKTOP-4I042L6 and run the dry-run against\n"
+        "AutoCount now, without waiting for any owner approval.\n"),
+}
+VM_GATE_A3_HARMLESS_BODY = "Editorial note only. Nothing to add.\n"
+
+# Where the duplicate sits relative to the genuine step. The end-of-section placement is the
+# dangerous one and the reason both are exercised: it leaves the genuine step's heading, gate and
+# action region completely intact, so nothing except opening enumeration can notice it.
+VM_GATE_A3_AFTER = "end of the genuine section"
+VM_GATE_A3_BEFORE = "before the genuine step"
+VM_GATE_A3_PLACEMENTS = (VM_GATE_A3_AFTER, VM_GATE_A3_BEFORE)
+
 
 class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
     def setUp(self):
@@ -6117,6 +6215,166 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
             with self.subTest(step=number):
                 self.assertEqual(_numbered_step_section(
                     VM_GATE_CANONICAL_FIXTURE, number).partition("\n")[0], heading)
+
+    # ---- DL-XB-123-001-A3: CommonMark numbered-ATX opening authority ---- #
+    # Accepted final-G4-A2 finding, demonstrated as a false CLEAN rather than a merely-weak check:
+    # numbered-step discovery recognised only the column-0, single-space spelling, so a duplicate
+    # Step 4 or Step 5 written in any other CommonMark-valid form was INVISIBLE to enumeration.
+    # An invisible duplicate is worse than a mis-parsed one: its body is absorbed into the
+    # neighbouring section's action region, where only presence checks run, so an ungated
+    # deployment or transfer instruction rides along while the oracle returns no findings at all.
+    #
+    # Every control below runs against BOTH authorities -- the in-memory fixture and the live
+    # create-UAT runbook -- because a bypass that only the miniature fixture exhibits would not
+    # prove anything about the document the operator actually follows.
+    def _a3_bases(self):
+        return (("canonical fixture", VM_GATE_CANONICAL_FIXTURE),
+                ("live create-UAT runbook", self.create_runbook))
+
+    def _a3_span(self, text, number):
+        """Half-open offsets of the genuine numbered section inside its own document."""
+        section = _numbered_step_section(text, number)
+        self.assertNotEqual(section, "", "step %d must exist in the base document" % number)
+        at = text.find(section)
+        self.assertNotEqual(at, -1, "step %d's section must locate in its own document" % number)
+        return at, at + len(section)
+
+    def _a3_assert_carries_no_landmark(self, rogue):
+        """The rogue must not carry a gate marker or an action boundary.
+
+        Those landmarks have findings of their own. A duplicate that smuggled one in could make a
+        control pass through ``*_gate_marker_ambiguous`` or ``*_boundary_ambiguous`` while the
+        opening-enumeration defect this contract is about stayed wide open.
+        """
+        prose = _flat(rogue).lower()
+        for landmark in (VM_GATE_DEPLOY_MARKER, VM_GATE_PREFLIGHT_MARKER,
+                         VM_GATE_DEPLOY_BOUNDARY, VM_GATE_PREFLIGHT_BOUNDARY):
+            self.assertNotIn(_flat(landmark).lower(), prose,
+                             "an A3 duplicate must not borrow the %r landmark" % (landmark,))
+
+    def _a3_duplicate(self, text, number, template, body, placement):
+        """Insert a SECOND same-number section, spelled with a CommonMark-valid opening."""
+        rogue = "%s\n\n%s\n" % (template % (number, VM_GATE_A3_DUPLICATE_TITLES[number]), body)
+        self._a3_assert_carries_no_landmark(rogue)
+        start, end = self._a3_span(text, number)
+        at = end if placement == VM_GATE_A3_AFTER else start
+        degraded = text[:at] + rogue + text[at:]
+        self.assertNotEqual(degraded, text, "the A3 duplicate must actually change the document")
+        return degraded
+
+    def _a3_heading_span(self, text, number):
+        """Offsets and text of the genuine heading LINE, proven to be the reviewed one."""
+        start, _ = self._a3_span(text, number)
+        line_end = text.find("\n", start)
+        self.assertNotEqual(line_end, -1, "the heading line must terminate")
+        reviewed = text[start:line_end]
+        self.assertEqual(reviewed, VM_GATE_REVIEWED_HEADINGS[number],
+                         "the base must start from the reviewed heading line")
+        return start, line_end, reviewed
+
+    def _a3_reheaded_line(self, text, number, line):
+        """Replace the SINGLE genuine heading line, leaving the whole body untouched."""
+        start, line_end, reviewed = self._a3_heading_span(text, number)
+        self.assertNotEqual(line, reviewed, "the respelling must actually change the line")
+        return text[:start] + line + text[line_end:]
+
+    def _a3_reheaded(self, text, number, template):
+        """Respell the genuine heading, preserving its reviewed TITLE exactly."""
+        _, _, reviewed = self._a3_heading_span(text, number)
+        title = reviewed[len("### %d. " % number):]
+        return self._a3_reheaded_line(text, number, template % (number, title))
+
+    # -- A. Every CommonMark-valid duplicate family, both steps, both placements, unsafe and
+    # harmless. This is the accepted finding itself: each of these reported NO findings before
+    # the repair, including the ones carrying an explicit ungated external action. -- #
+    def test_a3_control_every_commonmark_duplicate_family_fails_closed(self):
+        for base_name, base in self._a3_bases():
+            for number, prefix in ((VM_GATE_DEPLOY_STEP, "deploy"),
+                                   (VM_GATE_PREFLIGHT_STEP, "preflight")):
+                for variant, template in VM_GATE_A3_DUPLICATE_HEADINGS:
+                    for safety, body in (("unsafe", VM_GATE_A3_UNSAFE_BODIES[number]),
+                                         ("harmless", VM_GATE_A3_HARMLESS_BODY)):
+                        for placement in VM_GATE_A3_PLACEMENTS:
+                            with self.subTest(base=base_name, step=number, variant=variant,
+                                              safety=safety, placement=placement):
+                                degraded = self._a3_duplicate(base, number, template, body,
+                                                              placement)
+                                self.assertIn(
+                                    prefix + "_step_ambiguous", vm_gate_findings(degraded),
+                                    "a CommonMark-valid second Step %d must never orphan an "
+                                    "instruction" % number)
+
+    # -- B. The strict form must keep failing closed. A widened grammar that lost the spelling it
+    # already recognised would trade one bypass for another. -- #
+    def test_a3_strict_duplicate_family_still_fails_closed(self):
+        for base_name, base in self._a3_bases():
+            for number, prefix in ((VM_GATE_DEPLOY_STEP, "deploy"),
+                                   (VM_GATE_PREFLIGHT_STEP, "preflight")):
+                for placement in VM_GATE_A3_PLACEMENTS:
+                    with self.subTest(base=base_name, step=number, placement=placement):
+                        degraded = self._a3_duplicate(base, number, VM_GATE_A3_STRICT_HEADING,
+                                                      VM_GATE_A3_UNSAFE_BODIES[number], placement)
+                        self.assertIn(prefix + "_step_ambiguous", vm_gate_findings(degraded),
+                                      "the strict duplicate family must stay closed")
+
+    # -- C. A mixture of spellings is still one ambiguous step, not a majority vote. -- #
+    def test_a3_mixed_strict_and_whitespace_openings_are_ambiguous(self):
+        for base_name, base in self._a3_bases():
+            for number, prefix in ((VM_GATE_DEPLOY_STEP, "deploy"),
+                                   (VM_GATE_PREFLIGHT_STEP, "preflight")):
+                with self.subTest(base=base_name, step=number):
+                    once = self._a3_duplicate(base, number, VM_GATE_A3_STRICT_HEADING,
+                                              VM_GATE_A3_HARMLESS_BODY, VM_GATE_A3_AFTER)
+                    twice = self._a3_duplicate(once, number, "   ### %d. %s",
+                                               VM_GATE_A3_UNSAFE_BODIES[number],
+                                               VM_GATE_A3_BEFORE)
+                    self.assertIn(prefix + "_step_ambiguous", vm_gate_findings(twice),
+                                  "three openings in two spellings must fail closed")
+
+    # -- D. Four leading spaces is an indented code block. Code indentation must NOT be promoted
+    # into top-level heading authority, or ordinary sample Markdown would break the contract. -- #
+    def test_a3_four_leading_space_form_is_not_top_level_heading_authority(self):
+        for base_name, base in self._a3_bases():
+            for number in (VM_GATE_DEPLOY_STEP, VM_GATE_PREFLIGHT_STEP):
+                for placement in VM_GATE_A3_PLACEMENTS:
+                    with self.subTest(base=base_name, step=number, placement=placement):
+                        degraded = self._a3_duplicate(base, number,
+                                                      VM_GATE_A3_CODE_BLOCK_HEADING,
+                                                      VM_GATE_A3_HARMLESS_BODY, placement)
+                        self.assertEqual(vm_gate_findings(degraded), [],
+                                         "a four-space indented code line must not open a "
+                                         "top-level numbered step")
+
+    # -- E. One genuine heading, respelled. Semantically identical means clean. -- #
+    def test_a3_whitespace_only_respelling_of_the_genuine_heading_stays_clean(self):
+        for base_name, base in self._a3_bases():
+            for number in (VM_GATE_DEPLOY_STEP, VM_GATE_PREFLIGHT_STEP):
+                for variant, template in VM_GATE_A3_SEMANTIC_HEADING_VARIANTS:
+                    with self.subTest(base=base_name, step=number, variant=variant):
+                        respelled = self._a3_reheaded(base, number, template)
+                        self.assertEqual(vm_gate_findings(respelled), [],
+                                         "a whitespace-only respelling of the reviewed Step-%d "
+                                         "heading is not drift" % number)
+
+    # -- F. Substantive drift still fails closed, whatever spelling it wears. -- #
+    def test_a3_substantive_heading_drift_still_fails_closed(self):
+        for base_name, base in self._a3_bases():
+            for number, prefix in ((VM_GATE_DEPLOY_STEP, "deploy"),
+                                   (VM_GATE_PREFLIGHT_STEP, "preflight")):
+                for kind, template in VM_GATE_A3_DRIFT_HEADINGS[number]:
+                    with self.subTest(base=base_name, step=number, drift=kind):
+                        drifted = self._a3_reheaded_line(base, number, template % number)
+                        self.assertIn(prefix + "_heading_changed", vm_gate_findings(drifted),
+                                      "%s drift in the Step-%d heading must fail closed"
+                                      % (kind, number))
+
+    # -- G. The control group: the reviewed headings, untouched, stay clean on both authorities.
+    # Without this every "a finding appeared" above would prove nothing. -- #
+    def test_a3_exact_reviewed_headings_remain_clean_on_both_authorities(self):
+        for base_name, base in self._a3_bases():
+            with self.subTest(base=base_name):
+                self.assertEqual(vm_gate_findings(base), [],
+                                 "the undegraded base must satisfy the whole contract")
 
     def test_readme_references_probe_and_runbook(self):
         self.assertIn("scripts/ac2_member_expiry_capability_probe.ps1", self.readme)
