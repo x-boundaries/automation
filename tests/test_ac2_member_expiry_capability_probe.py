@@ -4378,20 +4378,40 @@ VM_GATE_DEPLOY_MARKER = "deployment gate"
 VM_GATE_PREFLIGHT_MARKER = "preflight gate"
 VM_GATE_SAFETY_HEADING = "## Safety boundary"
 
-# Layer 2, step 4: the first instruction that changes the VM. Both are real operator instructions
-# in the runbook today, so the boundary is the document's own, not one invented by the test.
-VM_GATE_DEPLOY_MUTATIONS = (
-    "copy the reviewed",
-    r'new-item -itemtype directory -path "c:\xb\create_uat\state"',
+# Layer 2 (A1). Ordering is no longer inferred from a vocabulary of action phrases. Accepted G4
+# finding F-1 showed that inference is unsound: a synonym before the gate goes unrecognised while
+# a listed phrase after the gate keeps satisfying the check, and the oracle reports clean. The
+# right edge of a gate is now the START of that step's post-gate operational prose, so the gate
+# block ends BEFORE the operational banner and cannot borrow its identity (accepted F-2).
+VM_GATE_DEPLOY_BOUNDARY = "Copy the reviewed"
+VM_GATE_PREFLIGHT_BOUNDARY = "**`AUTOCOUNT VM \u2014 DESKTOP-4I042L6`**"
+
+# The ordering finding each step reports when its action boundary precedes its gate. Kept under
+# the original key names so the pre-A1 ordering controls keep asserting the same contract.
+VM_GATE_ORDERING_KEYS = {"deploy": "deploy_gate_after_mutation",
+                         "preflight": "preflight_gate_after_external_action"}
+
+# Operation EXISTENCE, checked in the action region and deliberately separate from ordering. The
+# gate's own copies of these names are approval prose, not the operation, so they do not count.
+VM_GATE_DEPLOY_ACTION_FILES = (
+    "scripts/ac2_member_create_uat_runner.ps1",
+    "scripts/member_create_uat_runner_lib.ps1",
+    "config/member_create_uat_business_confirmation.json",
 )
-# Layer 2, step 5: the first instruction that leaves the laptop. The gate's own prose words the
-# same operations DIFFERENTLY ("the bounded transfer of the approved package to that VM"), so
-# describing an action inside the gate can never be read as performing it before the gate.
-VM_GATE_PREFLIGHT_EXTERNALS = (
-    "copy the approved package to the vm",
-    "copy the package to the vm",
-    "run the runner in dry-run mode",
-)
+VM_GATE_DEPLOY_STATE_ANCHOR = r'new-item -itemtype directory -path "c:\xb\create_uat\state"'
+# The executable invocation is required because the summary sentence immediately after the gate
+# must never stand in for the real operation -- that substitution is what allowed F-1 to pass a
+# document whose actual dry-run had been moved before the gate or deleted outright. The summary
+# says "copy the APPROVED package to the vm", so it cannot satisfy the transfer anchor either.
+VM_GATE_PREFLIGHT_TRANSFER_ANCHOR = "copy the package to the vm"
+VM_GATE_PREFLIGHT_RUNNER_ANCHOR = r"& scripts\ac2_member_create_uat_runner.ps1 -packagepath"
+
+# SHA-256 of _flat(prefix).lower().encode("utf-8") for the reviewed-safe step-5 pre-gate prefix,
+# derived from the UNMODIFIED reviewed head 5c922b32a0bdf837e6819c33e32843d36abb42ea before any
+# A1 checker change. The digest, not a copy of the prose, is the authority. _flat() collapses
+# every whitespace run, so it is identical for LF and CRLF checkouts and survives harmless
+# Markdown rewrapping, while any substantive wording change breaks it. See VM_GATE_SAFE_PREFIX.
+VM_GATE_SAFE_PREFIX_SHA256 = "55126dd08cb8395a68eb81b5b5f1df13917d1918b47259e39fc787471f46c198"
 
 # What the step-4 approval must actually bind. Naming the VM is not enough: an approver cannot
 # judge "deploy to the VM" without knowing which components are replaced and what state is
@@ -4449,15 +4469,36 @@ VM_GATE_SAFETY_TOKENS = (
     "a prior-turn approval is never reusable for any of them",
 )
 
+# Everything a resolved step must prove. When the structural layout CANNOT be resolved -- no
+# gate, two gates, no boundary, two boundaries, or a boundary before its gate -- the step is
+# marked wholly unmet instead of being partially evaluated against a slice that may not mean what
+# it appears to. That is the fail-closed half of the A1 contract.
+VM_GATE_DEPLOY_UNMET = frozenset((
+    "deploy_pre_gate_content", "deploy_vm_not_named", "deploy_operation_not_bound",
+    "deploy_not_current_turn", "deploy_substitution_not_denied", "deploy_prior_turn_not_denied",
+    "deploy_stop_boundary_missing", "deploy_execution_not_denied", "deploy_operation_missing",
+    "deploy_state_preparation_missing",
+))
+VM_GATE_PREFLIGHT_UNMET = frozenset((
+    "preflight_prefix_changed", "preflight_vm_not_named", "preflight_target_not_bound",
+    "preflight_transfer_not_bound", "preflight_dry_run_not_bound", "preflight_not_current_turn",
+    "preflight_substitution_not_denied", "preflight_prior_turn_not_denied",
+    "preflight_save_member_not_denied", "preflight_stop_boundary_missing",
+    "preflight_operation_missing", "preflight_runner_invocation_missing",
+))
+
 # Every finding key this contract can report.
 VM_GATE_FINDING_KEYS = (
-    "deploy_execution_not_denied", "deploy_gate_after_mutation", "deploy_gate_missing",
+    "deploy_boundary_ambiguous", "deploy_boundary_missing", "deploy_execution_not_denied",
+    "deploy_gate_after_mutation", "deploy_gate_marker_ambiguous", "deploy_gate_missing",
     "deploy_not_current_turn", "deploy_operation_missing", "deploy_operation_not_bound",
-    "deploy_prior_turn_not_denied", "deploy_step_missing", "deploy_stop_boundary_missing",
-    "deploy_substitution_not_denied", "deploy_vm_not_named", "preflight_dry_run_not_bound",
-    "preflight_gate_after_external_action", "preflight_gate_missing",
-    "preflight_not_current_turn", "preflight_operation_missing",
-    "preflight_prior_turn_not_denied", "preflight_save_member_not_denied",
+    "deploy_pre_gate_content", "deploy_prior_turn_not_denied", "deploy_state_preparation_missing",
+    "deploy_step_missing", "deploy_stop_boundary_missing", "deploy_substitution_not_denied",
+    "deploy_vm_not_named", "preflight_boundary_ambiguous", "preflight_boundary_missing",
+    "preflight_dry_run_not_bound", "preflight_gate_after_external_action",
+    "preflight_gate_marker_ambiguous", "preflight_gate_missing", "preflight_not_current_turn",
+    "preflight_operation_missing", "preflight_prefix_changed", "preflight_prior_turn_not_denied",
+    "preflight_runner_invocation_missing", "preflight_save_member_not_denied",
     "preflight_step_missing", "preflight_stop_boundary_missing",
     "preflight_substitution_not_denied", "preflight_target_not_bound",
     "preflight_transfer_not_bound", "preflight_vm_not_named", "safety_boundary_not_four_way",
@@ -4479,26 +4520,51 @@ def _numbered_step_section(text, number):
     return text[opening:closing] if closing != -1 else text[opening:]
 
 
-def _first_offset(flat, markers):
-    """Earliest offset of any ``markers`` hit in ``flat``, or -1 when none appear."""
-    hits = [idx for idx in (flat.find(marker) for marker in markers) if idx != -1]
-    return min(hits) if hits else -1
+def _line_start(text, at):
+    """Start of the line containing ``at``. A missing offset stays missing."""
+    return -1 if at == -1 else text.rfind("\n", 0, at) + 1
 
 
-def _gate_prose(section, marker, operations):
-    """Return ``(gate_offset, operation_offset, prose)`` for one step's approval gate.
+def _resolve_gate_layout(section, marker, boundary, prefix, findings):
+    """Resolve one step into ``(pre_gate, gate_block, action_region)``, or fail closed.
 
-    Layer 2 of the structural bound: the prose runs from the gate marker to the step's FIRST
-    external action. The section is flattened and lower-cased ONCE here, so ordinary Markdown line
-    wrapping can never split a required phrase and every offset comparison stays in one space.
+    This is the whole A1 repair. Three landmarks, all structural:
+
+    * the gate marker, which must occur EXACTLY once -- zero and many both fail closed, because
+      silently taking the first occurrence is how a decoy mention could shift the bounded slice;
+    * the action boundary, the START of the step's post-gate operational prose, which must also
+      occur exactly once. Ending the gate block here (rather than at some inner action verb) is
+      what stops the operational banner satisfying a gate-local proposition -- accepted F-2;
+    * their order. Ordering is judged on the EARLIEST occurrence of each and independently of
+      ambiguity, so a boundary that straddles the gate is reported as misordered as well.
+
+    Nothing here consults action vocabulary, so a synonym cannot evade it -- accepted F-1. When
+    the layout cannot be resolved every element is ``None`` and the caller marks the whole step
+    unmet rather than guessing around the gap.
     """
-    flat = _flat(section).lower()
-    gate_at = flat.find(marker)
-    operation_at = _first_offset(flat, operations)
-    if gate_at == -1:
-        return gate_at, operation_at, ""
-    stop = operation_at if operation_at > gate_at else -1
-    return gate_at, operation_at, flat[gate_at:stop] if stop != -1 else flat[gate_at:]
+    gate_at, gate_count = section.find(marker), section.count(marker)
+    boundary_at, boundary_count = section.find(boundary), section.count(boundary)
+
+    misordered = gate_at != -1 and boundary_at != -1 and boundary_at < gate_at
+    if misordered:
+        findings.add(VM_GATE_ORDERING_KEYS[prefix])
+    if gate_count == 0:
+        findings.add(prefix + "_gate_missing")
+    elif gate_count > 1:
+        findings.add(prefix + "_gate_marker_ambiguous")
+    if boundary_count == 0:
+        findings.add(prefix + "_boundary_missing")
+    elif boundary_count > 1:
+        findings.add(prefix + "_boundary_ambiguous")
+    if gate_count != 1 or boundary_count != 1 or misordered:
+        return None, None, None
+
+    # The pre-gate region is everything between the step's heading line and the gate's own line.
+    # Step 4 requires it to be blank; step 5's is the frozen reviewed-safe prefix.
+    heading_end = section.find("\n")
+    gate_line = _line_start(section, gate_at)
+    pre_gate = section[heading_end + 1:gate_line] if heading_end != -1 else ""
+    return pre_gate, section[gate_line:boundary_at], section[boundary_at:]
 
 
 def _every_source_denied(prose, sources, denial):
@@ -4516,20 +4582,21 @@ def _deployment_findings(text, findings):
     section = _numbered_step_section(text, VM_GATE_DEPLOY_STEP)
     if not section:
         findings.add("deploy_step_missing")
-    gate_at, operation_at, prose = _gate_prose(section, VM_GATE_DEPLOY_MARKER,
-                                               VM_GATE_DEPLOY_MUTATIONS)
-    if operation_at == -1:
-        # A gate guarding nothing is not a pass: it means the mutation boundary this contract
-        # anchors on has moved or vanished, and the ordering check has quietly stopped testing.
-        findings.add("deploy_operation_missing")
-    if gate_at == -1:
-        findings.update(("deploy_gate_missing", "deploy_vm_not_named",
-                         "deploy_operation_not_bound", "deploy_not_current_turn",
-                         "deploy_substitution_not_denied", "deploy_prior_turn_not_denied",
-                         "deploy_stop_boundary_missing", "deploy_execution_not_denied"))
+    pre_gate, block, action = _resolve_gate_layout(
+        section, VM_GATE_DEPLOY_MARKER, VM_GATE_DEPLOY_BOUNDARY, "deploy", findings)
+    if block is None:
+        findings.update(VM_GATE_DEPLOY_UNMET)
         return
-    if operation_at != -1 and operation_at < gate_at:
-        findings.add("deploy_gate_after_mutation")
+
+    # Ordering, structurally. Nothing may stand between the step heading and its gate, so no
+    # instruction -- transfer, place, send, move, or a verb nobody has thought of yet -- can be
+    # smuggled in ahead of the approval. Whitespace stays non-material so ordinary Markdown
+    # reflow does not fire the guard.
+    if pre_gate.strip():
+        findings.add("deploy_pre_gate_content")
+
+    # Gate propositions, judged ONLY inside the gate's own block.
+    prose = _flat(block).lower()
     if VM_GATE_VM.lower() not in prose:
         findings.add("deploy_vm_not_named")
     if any(token not in prose for token in VM_GATE_DEPLOY_BINDINGS):
@@ -4545,25 +4612,37 @@ def _deployment_findings(text, findings):
     if not _every_source_denied(prose, VM_GATE_DEPLOY_SOURCES, VM_GATE_DEPLOY_DENIAL):
         findings.add("deploy_substitution_not_denied")
 
+    # Operation existence, judged ONLY in the action region and separately from ordering. A gate
+    # guarding nothing is not a pass; equally, the approval prose naming these components is not
+    # the operation, so its copies cannot answer for a deleted instruction.
+    region = _flat(action).lower()
+    if any(path not in region for path in VM_GATE_DEPLOY_ACTION_FILES):
+        findings.add("deploy_operation_missing")
+    if VM_GATE_DEPLOY_STATE_ANCHOR not in region:
+        findings.add("deploy_state_preparation_missing")
+
 
 def _preflight_findings(text, findings):
     """Step 5: a current-turn approval must precede the package transfer AND the dry-run."""
     section = _numbered_step_section(text, VM_GATE_PREFLIGHT_STEP)
     if not section:
         findings.add("preflight_step_missing")
-    gate_at, operation_at, prose = _gate_prose(section, VM_GATE_PREFLIGHT_MARKER,
-                                               VM_GATE_PREFLIGHT_EXTERNALS)
-    if operation_at == -1:
-        findings.add("preflight_operation_missing")
-    if gate_at == -1:
-        findings.update(("preflight_gate_missing", "preflight_vm_not_named",
-                         "preflight_target_not_bound", "preflight_transfer_not_bound",
-                         "preflight_dry_run_not_bound", "preflight_not_current_turn",
-                         "preflight_substitution_not_denied", "preflight_prior_turn_not_denied",
-                         "preflight_save_member_not_denied", "preflight_stop_boundary_missing"))
+    pre_gate, block, action = _resolve_gate_layout(
+        section, VM_GATE_PREFLIGHT_MARKER, VM_GATE_PREFLIGHT_BOUNDARY, "preflight", findings)
+    if block is None:
+        findings.update(VM_GATE_PREFLIGHT_UNMET)
         return
-    if operation_at != -1 and operation_at < gate_at:
-        findings.add("preflight_gate_after_external_action")
+
+    # Ordering, structurally. Step 5 legitimately carries laptop-only package construction before
+    # its gate, so it cannot simply require emptiness; instead the reviewed-safe prefix is frozen
+    # by digest. Any substantive change fails closed regardless of the words used, and a
+    # legitimate future edit comes back through a reviewed amendment rather than silently
+    # redefining what "safe" means here.
+    if hashlib.sha256(_flat(pre_gate).lower().encode("utf-8")).hexdigest() \
+            != VM_GATE_SAFE_PREFIX_SHA256:
+        findings.add("preflight_prefix_changed")
+
+    prose = _flat(block).lower()
     if VM_GATE_VM.lower() not in prose:
         findings.add("preflight_vm_not_named")
     for key, token in VM_GATE_PREFLIGHT_BINDINGS:
@@ -4579,6 +4658,12 @@ def _preflight_findings(text, findings):
         findings.add("preflight_stop_boundary_missing")
     if not _every_source_denied(prose, VM_GATE_PREFLIGHT_SOURCES, VM_GATE_PREFLIGHT_DENIAL):
         findings.add("preflight_substitution_not_denied")
+
+    region = _flat(action).lower()
+    if VM_GATE_PREFLIGHT_TRANSFER_ANCHOR not in region:
+        findings.add("preflight_operation_missing")
+    if VM_GATE_PREFLIGHT_RUNNER_ANCHOR not in region:
+        findings.add("preflight_runner_invocation_missing")
 
 
 def _four_way_safety_findings(text, findings):
@@ -4653,12 +4738,7 @@ cannot mint a `v2` package.
 
 """
 
-# SHA-256 of _flat(prefix).lower().encode("utf-8"), derived from the UNMODIFIED reviewed head
-# 5c922b32a0bdf837e6819c33e32843d36abb42ea before any A1 checker change. Hard-coded on purpose:
-# the digest, not a copy of the prose, is the authority. _flat() collapses every whitespace run,
-# so the digest is identical for LF and CRLF checkouts and survives harmless Markdown rewrapping,
-# while any substantive wording change breaks it.
-VM_GATE_SAFE_PREFIX_SHA256 = "55126dd08cb8395a68eb81b5b5f1df13917d1918b47259e39fc787471f46c198"
+# The frozen digest itself is VM_GATE_SAFE_PREFIX_SHA256, declared beside the checker above.
 
 VM_GATE_FIXTURE_STEP_4 = r"""### 4. Deploy the inactive UAT components
 
@@ -4758,8 +4838,11 @@ VM_GATE_CANONICAL_FIXTURE = (VM_GATE_FIXTURE_STEP_4
 # truth so the relocation controls and the wording controls cannot drift apart.
 VM_GATE_DEPLOY_OPENING = "**Separate current-turn owner approval required (deployment gate).**"
 VM_GATE_PREFLIGHT_OPENING = "**Separate current-turn owner approval required (preflight gate).**"
-VM_GATE_DEPLOY_OPERATION_OPENING = "Copy the reviewed"
-VM_GATE_PREFLIGHT_OPERATION_OPENING = "Only after the preflight approval above,"
+# Aliases of the structural action boundaries, so the pre-A1 controls that split the fixture at
+# "where the operation starts" stay pinned to the same landmark the checker uses. Under A1 the
+# preflight boundary is the operational banner itself, not the inner "Only after ..." clause.
+VM_GATE_DEPLOY_OPERATION_OPENING = VM_GATE_DEPLOY_BOUNDARY
+VM_GATE_PREFLIGHT_OPERATION_OPENING = VM_GATE_PREFLIGHT_BOUNDARY
 
 # The eight locked denial bullets, verbatim from the fixture, keyed by source step.
 VM_GATE_DEPLOY_DENIAL_BULLETS = {
@@ -4782,40 +4865,8 @@ VM_GATE_PREFLIGHT_DENIAL_BULLETS = {
                 " preflight.\n",
 }
 
-# ---- DL-XB-123-001-A1: structural landmarks and real post-gate operation anchors ---- #
-# A1 replaces verb-dependent ordering authority with structural authority. Accepted G4 finding F-1
-# showed why: the old oracle inferred "the gate comes first" from a short list of exact action
-# phrases, so a synonym ("transfer", "place", "send", "move", "start the runner") could introduce
-# an ungated external action before the gate while a recognised phrase stayed after it, and the
-# oracle reported nothing. Vocabulary can never be exhaustive, so ordering stops depending on it:
-#
-#   gate marker     -- must occur EXACTLY once inside its numbered step; zero or many fails closed;
-#   action boundary -- the START of that step's post-gate operational prose. The gate block ends
-#                      there, so the operational banner is OUTSIDE the block (accepted F-2);
-#   action anchors  -- the real operations that must still exist AFTER the boundary, proving the
-#                      step still governs something, checked separately from ordering.
-#
-# Each landmark is matched verbatim against the reviewed runbook. Rewording one makes the checker
-# fail closed with a deterministic finding; it can never degrade into a silent pass.
-VM_GATE_DEPLOY_BOUNDARY = "Copy the reviewed"
-VM_GATE_PREFLIGHT_BOUNDARY = "**`AUTOCOUNT VM \u2014 DESKTOP-4I042L6`**"
-
-# The three reviewed components and the state preparation must remain in the ACTION region. The
-# gate's own copies of these names are approval prose, not the operation, and must not count.
-VM_GATE_DEPLOY_ACTION_FILES = (
-    "scripts/ac2_member_create_uat_runner.ps1",
-    "scripts/member_create_uat_runner_lib.ps1",
-    "config/member_create_uat_business_confirmation.json",
-)
-VM_GATE_DEPLOY_STATE_ANCHOR = r'new-item -itemtype directory -path "c:\xb\create_uat\state"'
-
-# Preflight action anchors. The executable invocation is required precisely because the summary
-# sentence immediately after the gate must never be able to stand in for the real operation --
-# that substitution is what let F-1 pass a document whose real dry-run had been moved or deleted.
-# "copy the package to the vm" is the real instruction; the summary says "copy the APPROVED
-# package to the vm", so the summary cannot satisfy this anchor.
-VM_GATE_PREFLIGHT_TRANSFER_ANCHOR = "copy the package to the vm"
-VM_GATE_PREFLIGHT_RUNNER_ANCHOR = r"& scripts\ac2_member_create_uat_runner.ps1 -packagepath"
+# The A1 structural landmarks (gate markers, action boundaries and post-gate operation anchors)
+# are declared beside the checker that consumes them, above.
 
 
 class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
@@ -5238,12 +5289,20 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                          "the canonical fixture must satisfy the contract before it is degraded")
 
     def test_vm_gate_finding_keys_are_declared_and_every_one_is_reachable(self):
-        # An empty document fails every requirement that does not need an ordering comparison, so
-        # this pins the declared key set as exhaustive. The two ordering keys need a document that
-        # actually contains both a gate and an operation, and have their own relocation controls.
-        ordering = {"deploy_gate_after_mutation", "preflight_gate_after_external_action"}
-        self.assertEqual(set(vm_gate_findings("")), set(VM_GATE_FINDING_KEYS) - ordering,
-                         "an empty document must report every non-ordering finding key")
+        # An empty document fails every requirement that needs neither an ordering comparison nor
+        # a second occurrence of a landmark, so this pins the declared key set as exhaustive. The
+        # six keys below need a document that actually contains the landmarks, and each has its
+        # own control: the two ordering keys and the four ambiguity keys.
+        needs_a_real_document = {
+            "deploy_gate_after_mutation", "preflight_gate_after_external_action",
+            "deploy_gate_marker_ambiguous", "deploy_boundary_ambiguous",
+            "preflight_gate_marker_ambiguous", "preflight_boundary_ambiguous",
+        }
+        self.assertLess(needs_a_real_document, set(VM_GATE_FINDING_KEYS),
+                        "the ordering and ambiguity keys must all be declared")
+        self.assertEqual(set(vm_gate_findings("")),
+                         set(VM_GATE_FINDING_KEYS) - needs_a_real_document,
+                         "an empty document must report every other declared finding key")
 
     # -- Fixture degradation helpers: in-memory only, never a repository file -- #
     def _vm_gate_replace_section(self, section, mutated):
@@ -5780,9 +5839,13 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                       "losing the real transfer instruction must fail closed, never pass")
 
     def test_a1_control_removed_executable_runner_invocation_fails_closed(self):
+        # The anchor is compared against a lower-cased view, so the mutation has to use the
+        # document's own spelling; asserting the two agree keeps them from drifting apart.
+        verbatim = "& scripts\\ac2_member_create_uat_runner.ps1 -PackagePath"
+        self.assertIn(VM_GATE_PREFLIGHT_RUNNER_ANCHOR, _flat(verbatim).lower(),
+                      "the verbatim invocation must normalise to the declared anchor")
         degraded = self._a1_degrade_action(
-            VM_GATE_PREFLIGHT_STEP, VM_GATE_PREFLIGHT_BOUNDARY,
-            VM_GATE_PREFLIGHT_RUNNER_ANCHOR, "& <the runner>")
+            VM_GATE_PREFLIGHT_STEP, VM_GATE_PREFLIGHT_BOUNDARY, verbatim, "& <the runner>")
         self.assertIn("preflight_runner_invocation_missing", vm_gate_findings(degraded),
                       "the summary sentence must not stand in for the real invocation")
 
