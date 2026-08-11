@@ -4338,6 +4338,386 @@ HOST_SYNC_STEP_DENIAL_BULLETS = {
 HOST_SYNC_BULLET_MARKERS = ("-", "*", "+")
 
 
+# ---- DL-XB-123-001: create-UAT VM deployment and no-write preflight approval gates ---- #
+# Child #123 (parent #117). Two DIFFERENT external actions sit inside the create-UAT procedure and
+# the runbook gated neither:
+#
+#   step 4 -- deployment MUTATES the AutoCount VM DESKTOP-4I042L6: reviewed files are copied or
+#             replaced there and a VM-owned state directory is created/prepared;
+#   step 5 -- preflight TRANSFERS the approved package to that VM and then AUTHENTICATES to
+#             AutoCount and reads live data.
+#
+# They are different risk classes, so they take separate current-turn approvals rather than one
+# combined one; the ExpiryDate probe runbook already treats them that way. With the step-3 host
+# sync (#118) and the step-7 SaveMember write, that makes FOUR independent approval surfaces.
+#
+# Like the #118 checker, vm_gate_findings is PURE and TEXT-ONLY: text in, finding keys out, no
+# repository read and no path derivation, and every search is non-throwing so a degraded in-memory
+# fixture yields findings rather than a ValueError. It is bounded STRUCTURALLY in two layers:
+#
+#   1. by the runbook's own NUMBERED Markdown step headings, so step 4's gate can never be
+#      answered by step 5's prose or the reverse;
+#   2. inside each step, from the gate marker to that step's FIRST external action, so a
+#      requirement stated only after the operator has already acted does not count.
+#
+# No fixed character window, no Markdown parser and no cross-bullet borrowing: per-source denials
+# reuse the same syntactic clause bound #118 established, which is the generic CommonMark bound
+# rather than anything host-sync specific.
+
+VM_GATE_VM = "DESKTOP-4I042L6"
+
+# Layer 1. Only `### <n>. ` delimits a section. Step 5 contains many UNNUMBERED `### ` subsections
+# (store admission, reconciliation, ...), so a bound that accepted any `### ` would end step 5
+# hundreds of lines early and stop covering the transfer/dry-run instruction that closes it.
+VM_GATE_STEP_HEADING = re.compile(r"(?m)^### \d+\. ")
+VM_GATE_DEPLOY_STEP = 4
+VM_GATE_PREFLIGHT_STEP = 5
+
+VM_GATE_DEPLOY_MARKER = "deployment gate"
+VM_GATE_PREFLIGHT_MARKER = "preflight gate"
+VM_GATE_SAFETY_HEADING = "## Safety boundary"
+
+# Layer 2, step 4: the first instruction that changes the VM. Both are real operator instructions
+# in the runbook today, so the boundary is the document's own, not one invented by the test.
+VM_GATE_DEPLOY_MUTATIONS = (
+    "copy the reviewed",
+    r'new-item -itemtype directory -path "c:\xb\create_uat\state"',
+)
+# Layer 2, step 5: the first instruction that leaves the laptop. The gate's own prose words the
+# same operations DIFFERENTLY ("the bounded transfer of the approved package to that VM"), so
+# describing an action inside the gate can never be read as performing it before the gate.
+VM_GATE_PREFLIGHT_EXTERNALS = (
+    "copy the approved package to the vm",
+    "copy the package to the vm",
+    "run the runner in dry-run mode",
+)
+
+# What the step-4 approval must actually bind. Naming the VM is not enough: an approver cannot
+# judge "deploy to the VM" without knowing which components are replaced and what state is
+# prepared, so each component and the state directory must appear in the gate's own prose.
+VM_GATE_DEPLOY_BINDINGS = (
+    "copying or replacing",
+    "scripts/ac2_member_create_uat_runner.ps1",
+    "scripts/member_create_uat_runner_lib.ps1",
+    "config/member_create_uat_business_confirmation.json",
+    "creating or preparing",
+    r"c:\xb\create_uat\state",
+)
+# What the step-5 approval must bind, each with its own finding so a control can prove exactly
+# which binding was lost. The target is named IN THE APPROVAL: connection values and secrets are
+# never written into the runbook, so the contract requires the phrase, never a value.
+VM_GATE_PREFLIGHT_BINDINGS = (
+    ("preflight_target_not_bound",
+     "the intended autocount target (the server and database / account book)"),
+    ("preflight_transfer_not_bound", "the bounded transfer of the approved package to that vm"),
+    ("preflight_dry_run_not_bound", "the no-write dry-run / preflight operation"),
+)
+
+VM_GATE_CURRENT_TURN = "current-turn owner approval"
+VM_GATE_PRIOR_TURN = "a prior-turn approval is not reusable"
+
+# Every other approval surface must be denied inside its OWN clause, carrying its own polarity:
+# matching a bare "authorise this deployment" would accept the inverted claim just as happily.
+VM_GATE_DEPLOY_SOURCES = ("(step 2)", "(step 3)", "(step 5)", "(step 7)")
+VM_GATE_DEPLOY_DENIAL = "does **not** authorise this deployment"
+VM_GATE_PREFLIGHT_SOURCES = ("(step 2)", "(step 3)", "(step 4)", "(step 7)")
+VM_GATE_PREFLIGHT_DENIAL = "does **not** authorise this preflight"
+
+VM_GATE_DEPLOY_STOP = ("stop before copying or replacing files or creating or preparing state "
+                       "on the vm")
+# Deployment authorises placement only. Execution and AutoCount contact belong to steps 5 and 7,
+# so the gate must say so or "deployed" quietly becomes "may now be run".
+VM_GATE_DEPLOY_NO_EXECUTION = ("this deployment approval authorises no runner execution and no "
+                               "autocount contact")
+
+VM_GATE_PREFLIGHT_STOP = "stop before transferring the package to the vm or contacting autocount"
+# The dry-run's permitted reach and its hard limit, as one proposition: stating what it MAY do
+# without stating that it still may not save would license the write this contract excludes.
+VM_GATE_PREFLIGHT_SAVE_MEMBER = (
+    "may authenticate, check the duplicate and construct the member in memory",
+    "does **not** authorise or call `savemember`",
+)
+
+# The Safety boundary must keep all four surfaces independent. These tokens are additive to the
+# #118 host-sync/write sentence, which stays exactly as it is.
+VM_GATE_SAFETY_TOKENS = (
+    "the step-3 host sync, the step-4 vm deployment, the step-5 package transfer and no-write "
+    "preflight, and the step-7 `savemember` write are four independent approval surfaces",
+    "each requires its own current-turn owner approval",
+    "none implies or covers another",
+    "a prior-turn approval is never reusable for any of them",
+)
+
+# Every finding key this contract can report.
+VM_GATE_FINDING_KEYS = (
+    "deploy_execution_not_denied", "deploy_gate_after_mutation", "deploy_gate_missing",
+    "deploy_not_current_turn", "deploy_operation_missing", "deploy_operation_not_bound",
+    "deploy_prior_turn_not_denied", "deploy_step_missing", "deploy_stop_boundary_missing",
+    "deploy_substitution_not_denied", "deploy_vm_not_named", "preflight_dry_run_not_bound",
+    "preflight_gate_after_external_action", "preflight_gate_missing",
+    "preflight_not_current_turn", "preflight_operation_missing",
+    "preflight_prior_turn_not_denied", "preflight_save_member_not_denied",
+    "preflight_step_missing", "preflight_stop_boundary_missing",
+    "preflight_substitution_not_denied", "preflight_target_not_bound",
+    "preflight_transfer_not_bound", "preflight_vm_not_named", "safety_boundary_not_four_way",
+)
+
+
+def _numbered_step_section(text, number):
+    """Return one numbered Markdown step section, bounded by the numbered step headings.
+
+    Layer 1 of the structural bound. Non-throwing: an absent step yields "", which then fails
+    every requirement that lives inside it rather than raising.
+    """
+    heading = "### %d. " % number
+    starts = [match.start() for match in VM_GATE_STEP_HEADING.finditer(text)]
+    opening = next((start for start in starts if text.startswith(heading, start)), -1)
+    if opening == -1:
+        return ""
+    closing = next((start for start in starts if start > opening), -1)
+    return text[opening:closing] if closing != -1 else text[opening:]
+
+
+def _first_offset(flat, markers):
+    """Earliest offset of any ``markers`` hit in ``flat``, or -1 when none appear."""
+    hits = [idx for idx in (flat.find(marker) for marker in markers) if idx != -1]
+    return min(hits) if hits else -1
+
+
+def _gate_prose(section, marker, operations):
+    """Return ``(gate_offset, operation_offset, prose)`` for one step's approval gate.
+
+    Layer 2 of the structural bound: the prose runs from the gate marker to the step's FIRST
+    external action. The section is flattened and lower-cased ONCE here, so ordinary Markdown line
+    wrapping can never split a required phrase and every offset comparison stays in one space.
+    """
+    flat = _flat(section).lower()
+    gate_at = flat.find(marker)
+    operation_at = _first_offset(flat, operations)
+    if gate_at == -1:
+        return gate_at, operation_at, ""
+    stop = operation_at if operation_at > gate_at else -1
+    return gate_at, operation_at, flat[gate_at:stop] if stop != -1 else flat[gate_at:]
+
+
+def _every_source_denied(prose, sources, denial):
+    """True only when EVERY other approval is denied inside its own clause.
+
+    Reusing ``_clause_after`` is deliberate: its terminator set is the generic CommonMark bullet
+    and punctuation bound, not anything host-sync specific, and duplicating that carefully
+    reasoned bound would let the two copies drift while both claim to stop clause borrowing.
+    """
+    return all(denial in _clause_after(prose, source) for source in sources)
+
+
+def _deployment_findings(text, findings):
+    """Step 4: a current-turn approval must precede every VM mutation the step performs."""
+    section = _numbered_step_section(text, VM_GATE_DEPLOY_STEP)
+    if not section:
+        findings.add("deploy_step_missing")
+    gate_at, operation_at, prose = _gate_prose(section, VM_GATE_DEPLOY_MARKER,
+                                               VM_GATE_DEPLOY_MUTATIONS)
+    if operation_at == -1:
+        # A gate guarding nothing is not a pass: it means the mutation boundary this contract
+        # anchors on has moved or vanished, and the ordering check has quietly stopped testing.
+        findings.add("deploy_operation_missing")
+    if gate_at == -1:
+        findings.update(("deploy_gate_missing", "deploy_vm_not_named",
+                         "deploy_operation_not_bound", "deploy_not_current_turn",
+                         "deploy_substitution_not_denied", "deploy_prior_turn_not_denied",
+                         "deploy_stop_boundary_missing", "deploy_execution_not_denied"))
+        return
+    if operation_at != -1 and operation_at < gate_at:
+        findings.add("deploy_gate_after_mutation")
+    if VM_GATE_VM.lower() not in prose:
+        findings.add("deploy_vm_not_named")
+    if any(token not in prose for token in VM_GATE_DEPLOY_BINDINGS):
+        findings.add("deploy_operation_not_bound")
+    if VM_GATE_CURRENT_TURN not in prose:
+        findings.add("deploy_not_current_turn")
+    if VM_GATE_PRIOR_TURN not in prose:
+        findings.add("deploy_prior_turn_not_denied")
+    if VM_GATE_DEPLOY_STOP not in prose:
+        findings.add("deploy_stop_boundary_missing")
+    if VM_GATE_DEPLOY_NO_EXECUTION not in prose:
+        findings.add("deploy_execution_not_denied")
+    if not _every_source_denied(prose, VM_GATE_DEPLOY_SOURCES, VM_GATE_DEPLOY_DENIAL):
+        findings.add("deploy_substitution_not_denied")
+
+
+def _preflight_findings(text, findings):
+    """Step 5: a current-turn approval must precede the package transfer AND the dry-run."""
+    section = _numbered_step_section(text, VM_GATE_PREFLIGHT_STEP)
+    if not section:
+        findings.add("preflight_step_missing")
+    gate_at, operation_at, prose = _gate_prose(section, VM_GATE_PREFLIGHT_MARKER,
+                                               VM_GATE_PREFLIGHT_EXTERNALS)
+    if operation_at == -1:
+        findings.add("preflight_operation_missing")
+    if gate_at == -1:
+        findings.update(("preflight_gate_missing", "preflight_vm_not_named",
+                         "preflight_target_not_bound", "preflight_transfer_not_bound",
+                         "preflight_dry_run_not_bound", "preflight_not_current_turn",
+                         "preflight_substitution_not_denied", "preflight_prior_turn_not_denied",
+                         "preflight_save_member_not_denied", "preflight_stop_boundary_missing"))
+        return
+    if operation_at != -1 and operation_at < gate_at:
+        findings.add("preflight_gate_after_external_action")
+    if VM_GATE_VM.lower() not in prose:
+        findings.add("preflight_vm_not_named")
+    for key, token in VM_GATE_PREFLIGHT_BINDINGS:
+        if token not in prose:
+            findings.add(key)
+    if VM_GATE_CURRENT_TURN not in prose:
+        findings.add("preflight_not_current_turn")
+    if VM_GATE_PRIOR_TURN not in prose:
+        findings.add("preflight_prior_turn_not_denied")
+    if any(token not in prose for token in VM_GATE_PREFLIGHT_SAVE_MEMBER):
+        findings.add("preflight_save_member_not_denied")
+    if VM_GATE_PREFLIGHT_STOP not in prose:
+        findings.add("preflight_stop_boundary_missing")
+    if not _every_source_denied(prose, VM_GATE_PREFLIGHT_SOURCES, VM_GATE_PREFLIGHT_DENIAL):
+        findings.add("preflight_substitution_not_denied")
+
+
+def _four_way_safety_findings(text, findings):
+    """The Safety boundary must keep all four approval surfaces independent of one another."""
+    at = text.find(VM_GATE_SAFETY_HEADING)
+    if at == -1:
+        findings.add("safety_boundary_not_four_way")
+        return
+    end = text.find("\n## ", at + 1)
+    section = _flat(text[at:end] if end != -1 else text[at:]).lower()
+    if any(token not in section for token in VM_GATE_SAFETY_TOKENS):
+        findings.add("safety_boundary_not_four_way")
+
+
+def vm_gate_findings(text):
+    """Return sorted contract findings for the create-UAT VM deployment and preflight gates.
+
+    Pure and text-only: no repository read, no path derivation and only non-throwing searches. An
+    empty list means the whole DL-XB-123-001 contract holds.
+    """
+    findings = set()
+    _deployment_findings(text, findings)
+    _preflight_findings(text, findings)
+    _four_way_safety_findings(text, findings)
+    return sorted(findings)
+
+
+# A minimal, self-contained COMPLIANT document. Every negative control degrades THIS rather than
+# the live runbook, so the controls stay meaningful independently of the runbook's current state
+# and any live failure localises to the single live assertion. It is not a copy of the runbook:
+# the live ``findings == []`` assertion remains the authority on the real document.
+VM_GATE_CANONICAL_FIXTURE = r"""### 4. Deploy the inactive UAT components
+
+**Separate current-turn owner approval required (deployment gate).** The instructions below
+change an external machine: they place reviewed files on the AutoCount VM `DESKTOP-4I042L6` and
+prepare a directory that the VM then owns. Before any of them, obtain an explicit current-turn
+owner approval that names the AutoCount VM (`DESKTOP-4I042L6`) and binds this exact deployment
+operation:
+
+- copying or replacing `scripts/ac2_member_create_uat_runner.ps1` on that VM;
+- copying or replacing `scripts/member_create_uat_runner_lib.ps1` on that VM;
+- copying or replacing `config/member_create_uat_business_confirmation.json` on that VM;
+- creating or preparing the VM-owned state directory `C:\XB\create_uat\state`.
+
+This approval is distinct and is **not** implied by any other gate:
+
+- the PR review and merge decision (step 2) does **not** authorise this deployment;
+- the physical-host sync approval (step 3) does **not** authorise this deployment;
+- the no-write preflight approval (step 5) does **not** authorise this deployment;
+- the separate current-turn write approval (step 7) does **not** authorise this deployment.
+
+A prior-turn approval is not reusable. This deployment approval authorises no runner execution
+and no AutoCount contact. Without the named current-turn deployment approval, stop before
+copying or replacing files or creating or preparing state on the VM.
+
+Copy the reviewed `scripts/ac2_member_create_uat_runner.ps1`,
+`scripts/member_create_uat_runner_lib.ps1`, and
+`config/member_create_uat_business_confirmation.json` to the AutoCount VM working area.
+
+**`AUTOCOUNT VM - DESKTOP-4I042L6`**
+
+```powershell
+New-Item -ItemType Directory -Path "C:\XB\create_uat\state" -Force
+```
+
+### 5. No-write preflight (dry-run)
+
+**`LAPTOP DEVELOPMENT MACHINE`** Build the approved package on the laptop first. The build is
+laptop-only: it contacts no external machine, transfers nothing, and touches no AutoCount data.
+
+**Separate current-turn owner approval required (preflight gate).** The remainder of this step
+leaves the laptop: it moves the approved package onto the AutoCount VM `DESKTOP-4I042L6` and then
+authenticates to AutoCount and reads live data, so it is an external-service action even though
+it writes nothing. Before any of it, obtain an explicit current-turn owner approval that names
+the AutoCount VM (`DESKTOP-4I042L6`) and binds:
+
+- the intended AutoCount target (the server and database / account book), named in the approval
+  itself and never written into this runbook as a connection value or secret;
+- the bounded transfer of the approved package to that VM;
+- the no-write dry-run / preflight operation.
+
+This approval is distinct and is **not** implied by any other gate:
+
+- the PR review and merge decision (step 2) does **not** authorise this preflight;
+- the physical-host sync approval (step 3) does **not** authorise this preflight;
+- the VM deployment approval (step 4) does **not** authorise this preflight;
+- the separate current-turn write approval (step 7) does **not** authorise this preflight.
+
+A prior-turn approval is not reusable. The dry-run may authenticate, check the duplicate and
+construct the member in memory, but it does **not** authorise or call `SaveMember`; that write
+remains gated by step 7. Without the named current-turn preflight approval, stop before
+transferring the package to the VM or contacting AutoCount.
+
+**`AUTOCOUNT VM - DESKTOP-4I042L6`** Only after the preflight approval above, copy the approved
+package to the VM and run the runner in dry-run mode (the default; no write switches).
+
+### 6. Review aggregate evidence
+
+The runner prints and writes a sanitized aggregate result only.
+
+## Safety boundary
+
+- The host sync on `DESKTOP-Q43QKQF` in step 3 and the `SaveMember` write in step 7
+  each require their own prior current-turn owner approval. Neither implies the other,
+  and a prior-turn approval is never reusable for either.
+- The step-3 host sync, the step-4 VM deployment, the step-5 package transfer and no-write
+  preflight, and the step-7 `SaveMember` write are four independent approval surfaces. Each
+  requires its own current-turn owner approval, none implies or covers another, and a prior-turn
+  approval is never reusable for any of them.
+"""
+
+# The gate paragraph openings and the operation openings, verbatim from the fixture. One source of
+# truth so the relocation controls and the wording controls cannot drift apart.
+VM_GATE_DEPLOY_OPENING = "**Separate current-turn owner approval required (deployment gate).**"
+VM_GATE_PREFLIGHT_OPENING = "**Separate current-turn owner approval required (preflight gate).**"
+VM_GATE_DEPLOY_OPERATION_OPENING = "Copy the reviewed"
+VM_GATE_PREFLIGHT_OPERATION_OPENING = "Only after the preflight approval above,"
+
+# The eight locked denial bullets, verbatim from the fixture, keyed by source step.
+VM_GATE_DEPLOY_DENIAL_BULLETS = {
+    "(step 2)": "- the PR review and merge decision (step 2) does **not** authorise this"
+                " deployment;\n",
+    "(step 3)": "- the physical-host sync approval (step 3) does **not** authorise this"
+                " deployment;\n",
+    "(step 5)": "- the no-write preflight approval (step 5) does **not** authorise this"
+                " deployment;\n",
+    "(step 7)": "- the separate current-turn write approval (step 7) does **not** authorise this"
+                " deployment.\n",
+}
+VM_GATE_PREFLIGHT_DENIAL_BULLETS = {
+    "(step 2)": "- the PR review and merge decision (step 2) does **not** authorise this"
+                " preflight;\n",
+    "(step 3)": "- the physical-host sync approval (step 3) does **not** authorise this"
+                " preflight;\n",
+    "(step 4)": "- the VM deployment approval (step 4) does **not** authorise this preflight;\n",
+    "(step 7)": "- the separate current-turn write approval (step 7) does **not** authorise this"
+                " preflight.\n",
+}
+
+
 class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
     def setUp(self):
         self.runbook = read_repo_text("probe_runbook")
@@ -4506,8 +4886,9 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
             self.assertIn(token, section, token)
 
     def test_create_uat_runbook_makes_no_blanket_off_laptop_gating_claim(self):
-        # Queued follow-up #123 leaves the step-4 deployment and step-5 preflight gaps open, so a
-        # broader "everything off-laptop is gated" claim would be untrue. #118 must not add one.
+        # The runbook gates the four surfaces it names (steps 3, 4, 5 and 7); it does not gate
+        # every conceivable off-laptop action, so a blanket claim would be untrue however many
+        # individual gates exist. #118 must not add one and #123 must not either.
         flat = _flat(self.create_runbook).lower()
         for claim in ("every off-laptop", "each off-laptop", "all off-laptop"):
             self.assertNotIn(claim, flat,
@@ -4740,6 +5121,381 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
     def test_control_inverted_read_only_disclosure_is_detected(self):
         degraded = self._degraded_gate("not a read-only check", "a read-only check")
         self.assertIn("mutation_disclosure_missing", host_sync_gate_findings(degraded))
+
+    # ---- DL-XB-123-001: create-UAT VM deployment and no-write preflight approval gates ---- #
+    # Exactly ONE live assertion, so a gap in the real runbook fails here once and reports what is
+    # missing. Every other test below degrades the in-memory fixture and proves the shared checker
+    # emits a specific finding, which is what shows this contract can actually fail.
+    def test_create_uat_runbook_satisfies_the_whole_vm_gate_contract(self):
+        self.assertEqual(vm_gate_findings(self.create_runbook), [],
+                         "the create-UAT runbook must satisfy every DL-XB-123-001 deployment "
+                         "and preflight approval requirement")
+
+    def test_canonical_vm_gate_fixture_is_itself_compliant(self):
+        # The control group. Without it, a degraded fixture proving "findings appear" would be
+        # worthless: the findings might have been there all along.
+        self.assertEqual(vm_gate_findings(VM_GATE_CANONICAL_FIXTURE), [],
+                         "the canonical fixture must satisfy the contract before it is degraded")
+
+    def test_vm_gate_finding_keys_are_declared_and_every_one_is_reachable(self):
+        # An empty document fails every requirement that does not need an ordering comparison, so
+        # this pins the declared key set as exhaustive. The two ordering keys need a document that
+        # actually contains both a gate and an operation, and have their own relocation controls.
+        ordering = {"deploy_gate_after_mutation", "preflight_gate_after_external_action"}
+        self.assertEqual(set(vm_gate_findings("")), set(VM_GATE_FINDING_KEYS) - ordering,
+                         "an empty document must report every non-ordering finding key")
+
+    # -- Fixture degradation helpers: in-memory only, never a repository file -- #
+    def _vm_gate_replace_section(self, section, mutated):
+        """Swap one whole fixture section for a mutated copy, proving both actually changed."""
+        self.assertNotEqual(mutated, section, "the degraded step must actually differ")
+        degraded = VM_GATE_CANONICAL_FIXTURE.replace(section, mutated, 1)
+        self.assertNotEqual(degraded, VM_GATE_CANONICAL_FIXTURE,
+                            "the degraded fixture must actually differ")
+        return degraded
+
+    def _degraded_vm_gate(self, number, boundary, old, new):
+        """Degrade only a step's GATE prose, leaving the operation it guards untouched."""
+        section = _numbered_step_section(VM_GATE_CANONICAL_FIXTURE, number)
+        self.assertNotEqual(section, "", "step %d must exist in the fixture" % number)
+        split = section.find(boundary)
+        self.assertNotEqual(split, -1, "the %r operation boundary must exist" % boundary)
+        mutated = section[:split].replace(old, new) + section[split:]
+        return self._vm_gate_replace_section(section, mutated)
+
+    def _degraded_deploy_gate(self, old, new):
+        return self._degraded_vm_gate(VM_GATE_DEPLOY_STEP, VM_GATE_DEPLOY_OPERATION_OPENING,
+                                      old, new)
+
+    def _degraded_preflight_gate(self, old, new):
+        return self._degraded_vm_gate(VM_GATE_PREFLIGHT_STEP,
+                                      VM_GATE_PREFLIGHT_OPERATION_OPENING, old, new)
+
+    @staticmethod
+    def _token_pattern(token):
+        """Match a lower-cased contract token however the document happens to spell it.
+
+        Tokens are compared against a flattened, lower-cased view, so the fixture may capitalise
+        one differently or wrap it across a line. A control that edited the token literally would
+        silently change nothing in some of those spellings and pass for the wrong reason.
+        """
+        return re.compile(r"\s+".join(re.escape(part) for part in token.split()), re.IGNORECASE)
+
+    def _degraded_vm_gate_token(self, number, boundary, token, new):
+        """Remove EVERY occurrence of one contract token before a step's operation boundary.
+
+        All of them, not the first: a phrase repeated in the step heading line and again in the
+        gate body would otherwise let an untouched copy satisfy the requirement the control is
+        supposed to have taken away.
+        """
+        section = _numbered_step_section(VM_GATE_CANONICAL_FIXTURE, number)
+        split = section.find(boundary)
+        self.assertNotEqual(split, -1, "the %r operation boundary must exist" % boundary)
+        pattern = self._token_pattern(token)
+        self.assertTrue(pattern.search(section[:split]),
+                        "the fixture must carry the token %r before its operation" % (token,))
+        mutated = pattern.sub(lambda _: new, section[:split]) + section[split:]
+        return self._vm_gate_replace_section(section, mutated)
+
+    def _degraded_deploy_gate_token(self, token, new):
+        return self._degraded_vm_gate_token(VM_GATE_DEPLOY_STEP,
+                                            VM_GATE_DEPLOY_OPERATION_OPENING, token, new)
+
+    def _degraded_preflight_gate_token(self, token, new):
+        return self._degraded_vm_gate_token(VM_GATE_PREFLIGHT_STEP,
+                                            VM_GATE_PREFLIGHT_OPERATION_OPENING, token, new)
+
+    def _degraded_four_way_safety(self, old, new):
+        split = VM_GATE_CANONICAL_FIXTURE.find(VM_GATE_SAFETY_HEADING)
+        self.assertNotEqual(split, -1, "the fixture must carry a safety boundary")
+        degraded = (VM_GATE_CANONICAL_FIXTURE[:split]
+                    + VM_GATE_CANONICAL_FIXTURE[split:].replace(old, new))
+        self.assertNotEqual(degraded, VM_GATE_CANONICAL_FIXTURE,
+                            "the degraded fixture must actually differ: %r" % (old,))
+        return degraded
+
+    def _relocated_gate_after_operation(self, number, gate_opening, operation_opening):
+        """Move a step's whole gate block to AFTER the operation it is supposed to precede.
+
+        The prose is not weakened or removed, only moved, so the ordering requirement is the only
+        thing that can still detect it.
+        """
+        section = _numbered_step_section(VM_GATE_CANONICAL_FIXTURE, number)
+        gate_at = section.find(gate_opening)
+        operation_at = section.find(operation_opening)
+        self.assertNotEqual(gate_at, -1, "the fixture must open step %d's gate" % number)
+        self.assertNotEqual(operation_at, -1, "step %d's operation must be present" % number)
+        self.assertLess(gate_at, operation_at, "the fixture must start out compliant")
+        moved = section[:gate_at] + section[operation_at:] + section[gate_at:operation_at]
+        return self._vm_gate_replace_section(section, moved)
+
+    # -- Step-4 deployment gate controls -- #
+    def test_control_missing_deployment_gate_is_detected(self):
+        degraded = self._degraded_deploy_gate("(deployment gate)", "(approval required)")
+        self.assertIn("deploy_gate_missing", vm_gate_findings(degraded))
+
+    def test_control_deployment_gate_after_the_mutation_boundary_is_detected(self):
+        degraded = self._relocated_gate_after_operation(
+            VM_GATE_DEPLOY_STEP, VM_GATE_DEPLOY_OPENING, VM_GATE_DEPLOY_OPERATION_OPENING)
+        self.assertIn("deploy_gate_after_mutation", vm_gate_findings(degraded))
+
+    def test_control_missing_deployment_step_is_detected(self):
+        section = _numbered_step_section(VM_GATE_CANONICAL_FIXTURE, VM_GATE_DEPLOY_STEP)
+        degraded = VM_GATE_CANONICAL_FIXTURE.replace(section, "", 1)
+        self.assertNotEqual(degraded, VM_GATE_CANONICAL_FIXTURE)
+        self.assertIn("deploy_step_missing", vm_gate_findings(degraded))
+
+    def test_control_removed_deployment_operation_is_detected(self):
+        # A gate that guards nothing is not a pass: the mutation boundary this contract anchors
+        # its ordering check on has gone, so the ordering check has silently stopped testing.
+        section = _numbered_step_section(VM_GATE_CANONICAL_FIXTURE, VM_GATE_DEPLOY_STEP)
+        split = section.find(VM_GATE_DEPLOY_OPERATION_OPENING)
+        mutated = section[:split]
+        self.assertIn("deploy_operation_missing",
+                      vm_gate_findings(self._vm_gate_replace_section(section, mutated)))
+
+    def test_control_deployment_vm_name_removed_is_detected(self):
+        degraded = self._degraded_deploy_gate_token(VM_GATE_VM, "the AutoCount VM")
+        self.assertIn("deploy_vm_not_named", vm_gate_findings(degraded))
+
+    def test_control_each_weakened_deployment_operation_binding_is_detected(self):
+        for binding in VM_GATE_DEPLOY_BINDINGS:
+            with self.subTest(binding=binding):
+                degraded = self._degraded_deploy_gate_token(binding,
+                                                            "the reviewed UAT components")
+                self.assertIn("deploy_operation_not_bound", vm_gate_findings(degraded))
+
+    def test_control_deployment_missing_current_turn_wording_is_detected(self):
+        degraded = self._degraded_deploy_gate_token(VM_GATE_CURRENT_TURN, "owner approval")
+        self.assertIn("deploy_not_current_turn", vm_gate_findings(degraded))
+
+    def test_control_each_removed_deployment_non_substitution_statement_is_detected(self):
+        for step, bullet in VM_GATE_DEPLOY_DENIAL_BULLETS.items():
+            with self.subTest(step=step):
+                degraded = self._degraded_deploy_gate(bullet, "")
+                self.assertIn("deploy_substitution_not_denied", vm_gate_findings(degraded))
+
+    def test_control_each_inverted_deployment_non_substitution_statement_is_detected(self):
+        # Removal only proves the checker notices an absent bullet. These bullets are still
+        # present, still carry their step token, and now say the opposite.
+        for step, bullet in VM_GATE_DEPLOY_DENIAL_BULLETS.items():
+            with self.subTest(step=step):
+                inverted = bullet.replace("does **not** authorise", "does authorise")
+                self.assertNotEqual(inverted, bullet, "the inversion must change %s" % step)
+                self.assertIn(step, inverted, "the inverted bullet must keep its step token")
+                degraded = self._degraded_deploy_gate(bullet, inverted)
+                self.assertIn("deploy_substitution_not_denied", vm_gate_findings(degraded))
+
+    def test_control_unterminated_inverted_deployment_denial_cannot_borrow_a_neighbour(self):
+        # The bypass a proximity window allows: invert one bullet, delete its own `;` in the same
+        # stroke, and let the untouched neighbour supply the denial phrase. Each must stand alone.
+        for step, neighbour in (("(step 2)", "(step 3)"), ("(step 3)", "(step 5)"),
+                                ("(step 5)", "(step 7)")):
+            with self.subTest(step=step, neighbour=neighbour):
+                bullet = VM_GATE_DEPLOY_DENIAL_BULLETS[step]
+                mutated = (bullet.replace("does **not** authorise", "does authorise")
+                           .replace(" deployment;\n", " deployment\n"))
+                self.assertNotIn(";", mutated, "%s must lose its own clause terminator" % step)
+                self.assertNotIn(VM_GATE_DEPLOY_DENIAL, mutated,
+                                 "%s must no longer deny anything by itself" % step)
+                degraded = self._degraded_deploy_gate(bullet, mutated)
+                self.assertIn(VM_GATE_DEPLOY_DENIAL_BULLETS[neighbour], degraded,
+                              "%s must remain compliant and adjacent to be borrowable" % neighbour)
+                self.assertIn("deploy_substitution_not_denied", vm_gate_findings(degraded))
+
+    def test_control_reusable_prior_turn_deployment_approval_is_detected(self):
+        degraded = self._degraded_deploy_gate("A prior-turn approval is not reusable.",
+                                              "A prior-turn approval may be reused here.")
+        self.assertIn("deploy_prior_turn_not_denied", vm_gate_findings(degraded))
+
+    def test_control_removed_deployment_stop_boundary_is_detected(self):
+        degraded = self._degraded_deploy_gate(
+            "stop before\ncopying or replacing files or creating or preparing state on the VM.",
+            "proceed.")
+        self.assertIn("deploy_stop_boundary_missing", vm_gate_findings(degraded))
+
+    def test_control_deployment_stop_boundary_stated_only_after_the_mutation_is_rejected(self):
+        # Layer 2 of the structural bound, on its own: the sentence is still in step 4 and still
+        # verbatim, but it now sits after the copy instruction, where it can no longer stop it.
+        section = _numbered_step_section(VM_GATE_CANONICAL_FIXTURE, VM_GATE_DEPLOY_STEP)
+        sentence = ("Without the named current-turn deployment approval, stop before\n"
+                    "copying or replacing files or creating or preparing state on the VM.\n")
+        self.assertIn(sentence, section, "the fixture must carry the stop sentence verbatim")
+        split = section.find(VM_GATE_DEPLOY_OPERATION_OPENING)
+        mutated = section[:split].replace(sentence, "") + section[split:] + "\n" + sentence
+        degraded = self._vm_gate_replace_section(section, mutated)
+        self.assertIn(sentence, degraded, "the sentence must be relocated, not deleted")
+        self.assertIn("deploy_stop_boundary_missing", vm_gate_findings(degraded))
+
+    def test_control_deployment_approval_extended_to_execution_or_autocount_is_detected(self):
+        degraded = self._degraded_deploy_gate(
+            "This deployment approval authorises no runner execution\nand no AutoCount contact.",
+            "This deployment approval also authorises running the runner and contacting"
+            " AutoCount.")
+        self.assertIn("deploy_execution_not_denied", vm_gate_findings(degraded))
+
+    # -- Step-5 preflight gate controls -- #
+    def test_control_missing_preflight_gate_is_detected(self):
+        degraded = self._degraded_preflight_gate("(preflight gate)", "(approval required)")
+        self.assertIn("preflight_gate_missing", vm_gate_findings(degraded))
+
+    def test_control_preflight_gate_after_the_external_boundary_is_detected(self):
+        degraded = self._relocated_gate_after_operation(
+            VM_GATE_PREFLIGHT_STEP, VM_GATE_PREFLIGHT_OPENING,
+            VM_GATE_PREFLIGHT_OPERATION_OPENING)
+        self.assertIn("preflight_gate_after_external_action", vm_gate_findings(degraded))
+
+    def test_control_missing_preflight_step_is_detected(self):
+        section = _numbered_step_section(VM_GATE_CANONICAL_FIXTURE, VM_GATE_PREFLIGHT_STEP)
+        degraded = VM_GATE_CANONICAL_FIXTURE.replace(section, "", 1)
+        self.assertNotEqual(degraded, VM_GATE_CANONICAL_FIXTURE)
+        self.assertIn("preflight_step_missing", vm_gate_findings(degraded))
+
+    def test_control_removed_preflight_operation_is_detected(self):
+        section = _numbered_step_section(VM_GATE_CANONICAL_FIXTURE, VM_GATE_PREFLIGHT_STEP)
+        split = section.find(VM_GATE_PREFLIGHT_OPERATION_OPENING)
+        mutated = section[:split]
+        self.assertIn("preflight_operation_missing",
+                      vm_gate_findings(self._vm_gate_replace_section(section, mutated)))
+
+    def test_control_preflight_vm_name_removed_is_detected(self):
+        degraded = self._degraded_preflight_gate_token(VM_GATE_VM, "the AutoCount VM")
+        self.assertIn("preflight_vm_not_named", vm_gate_findings(degraded))
+
+    def test_control_each_removed_preflight_binding_reports_its_own_finding(self):
+        # Target, transfer and dry-run are three separate bindings; losing one must not be
+        # concealed by the other two, so each carries its own finding key.
+        for key, token in VM_GATE_PREFLIGHT_BINDINGS:
+            with self.subTest(binding=key):
+                degraded = self._degraded_preflight_gate_token(
+                    token, "the usual preflight arrangements")
+                self.assertIn(key, vm_gate_findings(degraded))
+
+    def test_control_preflight_missing_current_turn_wording_is_detected(self):
+        degraded = self._degraded_preflight_gate_token(VM_GATE_CURRENT_TURN, "owner approval")
+        self.assertIn("preflight_not_current_turn", vm_gate_findings(degraded))
+
+    def test_control_each_removed_preflight_non_substitution_statement_is_detected(self):
+        for step, bullet in VM_GATE_PREFLIGHT_DENIAL_BULLETS.items():
+            with self.subTest(step=step):
+                degraded = self._degraded_preflight_gate(bullet, "")
+                self.assertIn("preflight_substitution_not_denied", vm_gate_findings(degraded))
+
+    def test_control_each_inverted_preflight_non_substitution_statement_is_detected(self):
+        for step, bullet in VM_GATE_PREFLIGHT_DENIAL_BULLETS.items():
+            with self.subTest(step=step):
+                inverted = bullet.replace("does **not** authorise", "does authorise")
+                self.assertNotEqual(inverted, bullet, "the inversion must change %s" % step)
+                self.assertIn(step, inverted, "the inverted bullet must keep its step token")
+                degraded = self._degraded_preflight_gate(bullet, inverted)
+                self.assertIn("preflight_substitution_not_denied", vm_gate_findings(degraded))
+
+    def test_control_unterminated_inverted_preflight_denial_cannot_borrow_a_neighbour(self):
+        for step, neighbour in (("(step 2)", "(step 3)"), ("(step 3)", "(step 4)"),
+                                ("(step 4)", "(step 7)")):
+            with self.subTest(step=step, neighbour=neighbour):
+                bullet = VM_GATE_PREFLIGHT_DENIAL_BULLETS[step]
+                mutated = (bullet.replace("does **not** authorise", "does authorise")
+                           .replace(" preflight;\n", " preflight\n"))
+                self.assertNotIn(";", mutated, "%s must lose its own clause terminator" % step)
+                self.assertNotIn(VM_GATE_PREFLIGHT_DENIAL, mutated,
+                                 "%s must no longer deny anything by itself" % step)
+                degraded = self._degraded_preflight_gate(bullet, mutated)
+                self.assertIn(VM_GATE_PREFLIGHT_DENIAL_BULLETS[neighbour], degraded,
+                              "%s must remain compliant and adjacent to be borrowable" % neighbour)
+                self.assertIn("preflight_substitution_not_denied", vm_gate_findings(degraded))
+
+    def test_control_reusable_prior_turn_preflight_approval_is_detected(self):
+        degraded = self._degraded_preflight_gate("A prior-turn approval is not reusable.",
+                                                 "A prior-turn approval may be reused here.")
+        self.assertIn("preflight_prior_turn_not_denied", vm_gate_findings(degraded))
+
+    def test_control_removed_preflight_save_member_non_authorisation_is_detected(self):
+        degraded = self._degraded_preflight_gate(
+            ", but it does **not** authorise or call `SaveMember`; that write\nremains gated by"
+            " step 7", "")
+        self.assertIn("preflight_save_member_not_denied", vm_gate_findings(degraded))
+
+    def test_control_inverted_preflight_save_member_non_authorisation_is_detected(self):
+        degraded = self._degraded_preflight_gate(
+            "it does **not** authorise or call `SaveMember`",
+            "it also authorises and may call `SaveMember`")
+        self.assertIn("preflight_save_member_not_denied", vm_gate_findings(degraded))
+
+    def test_control_removed_preflight_dry_run_reach_statement_is_detected(self):
+        degraded = self._degraded_preflight_gate(
+            "The dry-run may authenticate, check the duplicate and\nconstruct the member in"
+            " memory, but it", "The dry-run")
+        self.assertIn("preflight_save_member_not_denied", vm_gate_findings(degraded))
+
+    def test_control_removed_preflight_stop_boundary_is_detected(self):
+        degraded = self._degraded_preflight_gate(
+            "stop before\ntransferring the package to the VM or contacting AutoCount.",
+            "proceed.")
+        self.assertIn("preflight_stop_boundary_missing", vm_gate_findings(degraded))
+
+    # -- Step-heading isolation: neither gate may be satisfied from the other step -- #
+    def test_control_deployment_gate_relocated_into_step_5_is_still_missing_from_step_4(self):
+        deploy = _numbered_step_section(VM_GATE_CANONICAL_FIXTURE, VM_GATE_DEPLOY_STEP)
+        preflight = _numbered_step_section(VM_GATE_CANONICAL_FIXTURE, VM_GATE_PREFLIGHT_STEP)
+        gate_at = deploy.find(VM_GATE_DEPLOY_OPENING)
+        operation_at = deploy.find(VM_GATE_DEPLOY_OPERATION_OPENING)
+        block = deploy[gate_at:operation_at]
+        heading, newline, body = preflight.partition("\n")
+        degraded = (VM_GATE_CANONICAL_FIXTURE
+                    .replace(deploy, deploy[:gate_at] + deploy[operation_at:], 1)
+                    .replace(preflight, heading + newline + "\n" + block + body, 1))
+        self.assertNotEqual(degraded, VM_GATE_CANONICAL_FIXTURE)
+        self.assertIn(block, degraded, "the gate prose must be relocated, not deleted")
+        findings = vm_gate_findings(degraded)
+        self.assertIn("deploy_gate_missing", findings,
+                      "step 4's gate must not be satisfiable from step 5's section")
+        self.assertNotIn("preflight_gate_missing", findings,
+                         "step 5's own gate must remain intact and independently satisfied")
+
+    def test_control_preflight_gate_removal_leaves_the_deployment_gate_satisfied(self):
+        degraded = self._degraded_preflight_gate("(preflight gate)", "(approval required)")
+        findings = vm_gate_findings(degraded)
+        self.assertIn("preflight_gate_missing", findings)
+        self.assertNotIn("deploy_gate_missing", findings,
+                         "a step-5 regression must not be reported against step 4")
+
+    # -- Four-way safety-boundary controls -- #
+    def test_control_removed_four_way_safety_statement_is_detected(self):
+        degraded = self._degraded_four_way_safety("are four independent approval surfaces",
+                                                  "are handled together")
+        self.assertIn("safety_boundary_not_four_way", vm_gate_findings(degraded))
+
+    def test_control_weakened_four_way_own_approval_requirement_is_detected(self):
+        degraded = self._degraded_four_way_safety(
+            "Each\n  requires its own current-turn owner approval",
+            "They are covered by the owner's standing approval")
+        self.assertIn("safety_boundary_not_four_way", vm_gate_findings(degraded))
+
+    def test_control_weakened_four_way_non_implication_is_detected(self):
+        degraded = self._degraded_four_way_safety("none implies or covers another",
+                                                  "an earlier one may cover a later one")
+        self.assertIn("safety_boundary_not_four_way", vm_gate_findings(degraded))
+
+    def test_control_weakened_four_way_prior_turn_non_reuse_is_detected(self):
+        degraded = self._degraded_four_way_safety(
+            "a prior-turn\n  approval is never reusable for any of them",
+            "any of them may rely on an earlier approval")
+        self.assertIn("safety_boundary_not_four_way", vm_gate_findings(degraded))
+
+    def test_control_missing_safety_boundary_heading_is_detected(self):
+        degraded = VM_GATE_CANONICAL_FIXTURE.replace(VM_GATE_SAFETY_HEADING, "## Notes", 1)
+        self.assertNotEqual(degraded, VM_GATE_CANONICAL_FIXTURE)
+        self.assertIn("safety_boundary_not_four_way", vm_gate_findings(degraded))
+
+    def test_four_way_safety_statement_preserves_the_host_sync_independence_rule(self):
+        # #123 ADDS a fourth surface; it must not quietly relax the #118 sentence it sits beside.
+        # The fixture carries no step-3 gate, so only the safety-boundary finding is meaningful
+        # here -- and it must be absent, proving the two safety contracts coexist rather than one
+        # rewording the other's proposition away.
+        self.assertNotIn("safety_boundary_missing",
+                         host_sync_gate_findings(VM_GATE_CANONICAL_FIXTURE),
+                         "the four-way statement must not displace the #118 independence rule")
 
     def test_readme_references_probe_and_runbook(self):
         self.assertIn("scripts/ac2_member_expiry_capability_probe.ps1", self.readme)
