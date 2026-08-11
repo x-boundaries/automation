@@ -184,9 +184,10 @@ This approval is distinct and is **not** implied by any other gate:
 - the separate current-turn write approval (step 7) does **not** authorise this deployment.
 
 A prior-turn approval is not reusable. This deployment approval authorises no runner
-execution and no AutoCount contact; running the runner and reaching AutoCount are gated
-separately in step 5 and step 7. Without the named current-turn deployment approval, stop
-before copying or replacing files or creating or preparing state on the VM.
+execution, no AutoCount environment configuration and no AutoCount contact; running the
+runner, configuring the connection environment and reaching AutoCount are gated separately
+in step 5 and step 7. Without the named current-turn deployment approval, stop before
+copying or replacing files or creating or preparing state on the VM.
 
 Copy the reviewed `scripts/ac2_member_create_uat_runner.ps1`,
 `scripts/member_create_uat_runner_lib.ps1`, and
@@ -200,19 +201,44 @@ never creates it):
 New-Item -ItemType Directory -Path "C:\XB\create_uat\state" -Force
 ```
 
-Set the AutoCount connection through the process environment only (never in files,
-never in this runbook): `AC2_PROBE_SERVER_NAME`, `AC2_PROBE_DATABASE_NAME`,
-`AC2_PROBE_USER_ID`, and the password environment variable named by `-PasswordEnvVar`.
-
 ### 5. No-write preflight (dry-run)
 
-**`LAPTOP DEVELOPMENT MACHINE`** Build the approved package on the laptop first (steps
-below). The build is laptop-only: it contacts no external machine, transfers nothing to
-the VM, and touches no AutoCount data. The package transfer and the dry-run itself are
-external actions and are gated separately, below the build.
+**Separate current-turn owner approval required (preflight gate).** The whole of this step is
+gated. It reads the selected private form response and its decision row, mutates the local
+reviewer-decision store and the approval ledger, builds an immutable package, configures the
+AutoCount connection in the process environment, moves that package onto the AutoCount VM
+`DESKTOP-4I042L6`, and then authenticates to AutoCount and reads live data. Laptop locality does
+not waive the approval for the private-data work. Before any of it, obtain an explicit
+current-turn owner approval that names the AutoCount VM (`DESKTOP-4I042L6`) and binds:
 
-Laptop package build (**`LAPTOP DEVELOPMENT MACHINE`**), using the decision-review
-output that shows the chosen row as `READY_FOR_CREATE_REVIEW`:
+- the bounded access to the selected private form response and its decision row for this one
+  package, whose values are never written into this runbook;
+- the local reviewer-decision store and approval-ledger operations and the immutable package
+  build they produce;
+- the AutoCount process-environment configuration, by variable name only:
+  `AC2_PROBE_SERVER_NAME`, `AC2_PROBE_DATABASE_NAME`, `AC2_PROBE_USER_ID`, and the password
+  environment variable named by `-PasswordEnvVar`;
+- the intended AutoCount target (the server and database / account book), named in the approval
+  itself and never written into this runbook as a connection value or secret;
+- the bounded transfer of the approved package to that VM;
+- the no-write dry-run / preflight operation.
+
+This approval is distinct and is **not** implied by any other gate:
+
+- the PR review and merge decision (step 2) does **not** authorise this preflight;
+- the physical-host sync approval (step 3) does **not** authorise this preflight;
+- the VM deployment approval (step 4) does **not** authorise this preflight;
+- the separate current-turn write approval (step 7) does **not** authorise this preflight.
+
+A prior-turn approval is not reusable. The dry-run may authenticate, check the duplicate and
+construct the member in memory, but it does **not** authorise or call `SaveMember`; that write
+remains gated by step 7. Without the named current-turn preflight approval, stop before reading
+the private form response or decision row, before building the package, before setting the
+AutoCount environment, and before transferring the package to the VM or contacting AutoCount.
+
+**`LAPTOP DEVELOPMENT MACHINE`** Only after the preflight approval above, build the approved
+package on the laptop, using the decision-review output that shows the chosen row as
+`READY_FOR_CREATE_REVIEW`:
 
 ```bash
 python scripts/member_create_uat_approval.py approve --reviewer <handle> --input <form.csv> --decision-rows <member_intake_decision_rows.csv> --row-number <N> --ledger <ledger.jsonl>
@@ -236,31 +262,11 @@ bump changes both `source_record_id` and `source_fingerprint` (each binds the sc
 version), a fresh reviewer decision is mechanically required; a `v1` decision or build
 cannot mint a `v2` package.
 
-**Separate current-turn owner approval required (preflight gate).** The remainder of this
-step leaves the laptop: it moves the approved package onto the AutoCount VM
-`DESKTOP-4I042L6` and then authenticates to AutoCount and reads live data, so it is an
-external-service action even though it writes nothing. Before any of it, obtain an
-explicit current-turn owner approval that names the AutoCount VM (`DESKTOP-4I042L6`) and
-binds:
+Set the AutoCount connection through the process environment only (never in files, never in
+this runbook): `AC2_PROBE_SERVER_NAME`, `AC2_PROBE_DATABASE_NAME`, `AC2_PROBE_USER_ID`, and
+the password environment variable named by `-PasswordEnvVar`.
 
-- the intended AutoCount target (the server and database / account book), named in the
-  approval itself and never written into this runbook as a connection value or secret;
-- the bounded transfer of the approved package to that VM;
-- the no-write dry-run / preflight operation.
-
-This approval is distinct and is **not** implied by any other gate:
-
-- the PR review and merge decision (step 2) does **not** authorise this preflight;
-- the physical-host sync approval (step 3) does **not** authorise this preflight;
-- the VM deployment approval (step 4) does **not** authorise this preflight;
-- the separate current-turn write approval (step 7) does **not** authorise this preflight.
-
-A prior-turn approval is not reusable. The dry-run may authenticate, check the duplicate
-and construct the member in memory, but it does **not** authorise or call `SaveMember`;
-that write remains gated by step 7. Without the named current-turn preflight approval,
-stop before transferring the package to the VM or contacting AutoCount.
-
-**`AUTOCOUNT VM — DESKTOP-4I042L6`** Only after the preflight approval above, copy the
+**`AUTOCOUNT VM — DESKTOP-4I042L6`** Under the same preflight approval, copy the
 approved package to the VM and run the runner in dry-run mode (the default; no write
 switches). Dry-run authenticates, checks the duplicate, constructs the new member,
 assigns only the whitelisted fields, and stops without SaveMember. The build authority
