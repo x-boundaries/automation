@@ -4130,9 +4130,218 @@ class ExpiryProbeScriptExecutionTests(unittest.TestCase):
         self.assertEqual(before, after, "the probe must not write evidence into the working directory")
 
 
+# ---- DL-XB-118-001: create-UAT physical-host sync approval contract ---- #
+# The create-UAT runbook's step-3 `git pull --ff-only origin main` runs on physical host
+# DESKTOP-Q43QKQF: it contacts a remote and mutates that machine's checkout, so it needs its own
+# current-turn owner approval. No later gate (review/merge, VM deployment, no-write preflight,
+# SaveMember write) may stand in for it.
+#
+# The checker below is deliberately PURE and TEXT-ONLY: it takes runbook text and returns finding
+# keys. It performs no repository read and no path derivation, so it stays outside the closed
+# dependency contract entirely, and every search is non-throwing, so a degraded fixture yields
+# findings rather than a ValueError. The same function drives both the live assertion and every
+# in-memory negative control, which is what proves the contract can actually fail.
+
+HOST_SYNC_HOST = "DESKTOP-Q43QKQF"
+HOST_SYNC_PULL_COMMAND = "git pull --ff-only origin main"
+# The executable invocation, not a prose mention: the gate must precede the runnable command.
+HOST_SYNC_PULL_INVOCATION = "```bash\n" + HOST_SYNC_PULL_COMMAND
+HOST_SYNC_GATE_MARKER = "host-sync gate"
+HOST_SYNC_SAFETY_HEADING = "## Safety boundary"
+
+# Each later gate that must be stated as NON-substituting, plus the phrase that must appear
+# inside that step's OWN clause. The phrase carries its polarity ("does **not**"): matching the
+# bare "cover this host sync" would accept the inverted claim just as happily as the denial.
+HOST_SYNC_NON_SUBSTITUTING_STEPS = ("(step 2)", "(step 4)", "(step 5)", "(step 7)")
+HOST_SYNC_NON_SUBSTITUTION_PHRASE = "does **not** cover this host sync"
+# A clause ends at the first of these after its step token. This syntactic bound replaces the
+# earlier fixed character window, which was wide enough for a neighbouring compliant bullet to
+# satisfy a mutated one. `;` and `.` alone are not enough: they belong to the bullet an editor is
+# already rewriting, so the edit that inverts a denial can delete its terminator in the same
+# stroke and let the clause run into the next list item. `_flat()` collapses the newline between
+# Markdown bullets to " <marker> ", so that separator is a structural bound the mutated bullet does
+# not own -- removing it means deleting the NEXT bullet, which the removal controls already catch.
+# All three CommonMark bullet markers must be listed: an editor may write the list with "-", "*" or
+# "+", and a bound that knows only one of them lets the mutated bullet run across the other two.
+HOST_SYNC_CLAUSE_TERMINATORS = (" - ", " * ", " + ", ";", ".")
+HOST_SYNC_FORWARD_PHRASE = (
+    "does not authorise deployment, package execution, preflight or a member write")
+HOST_SYNC_CURRENT_TURN_PHRASE = "current-turn owner approval"
+HOST_SYNC_PRIOR_TURN_PHRASE = "prior-turn approval is not reusable"
+HOST_SYNC_STOP_PHRASE = "stop before contacting"
+# What the guarded command actually does. An approver cannot judge the request without all three,
+# so the gate's own prose must carry them. Each phrase is composite on purpose: bare
+# "fast-forwards" also occurs in the physical-host paragraph inside the same bounded slice, so
+# only the full clause proves the disclosure itself is still there. "not a read-only check"
+# likewise disappears when inverted to "a read-only check".
+HOST_SYNC_MUTATION_DISCLOSURES = (
+    "contacts the remote",
+    "fast-forwards (mutates) that host's checkout",
+    "not a read-only check",
+)
+# The Safety-boundary sentence must keep the step-3 host sync and the step-7 SaveMember write
+# independent of one another: separate approvals, neither implying the other, neither reusable.
+HOST_SYNC_SAFETY_TOKENS = ("desktop-q43qkqf", "step 3", "step 7", "savemember",
+                           "each require their own prior current-turn owner approval",
+                           "neither implies the other",
+                           "a prior-turn approval is never reusable for either")
+
+# Every finding key this contract can report.
+HOST_SYNC_FINDING_KEYS = (
+    "gate_after_pull", "gate_missing", "host_not_named", "mutation_disclosure_missing",
+    "not_current_turn", "operation_not_named", "prior_turn_not_denied", "pull_missing",
+    "safety_boundary_missing", "stop_boundary_missing", "substitution_not_denied",
+)
+
+
+def _flat(text):
+    """Whitespace-collapsed view, so harmless Markdown line wrapping cannot break a check."""
+    return " ".join(text.split())
+
+
+def _clause_after(text, token):
+    """Return ``token``'s own clause: the token up to its first clause terminator, else "".
+
+    This is the scope bound for a per-step assertion. Stopping at the terminator is what keeps an
+    adjacent compliant bullet from answering for a mutated one, so the bound must survive a bullet
+    that drops its own punctuation: the flattened list-item separator ends the clause at the next
+    bullet even then. Non-throwing: an absent token yields an empty clause, which every phrase
+    check then fails.
+    """
+    at = text.find(token)
+    if at == -1:
+        return ""
+    ends = [idx for idx in (text.find(end, at) for end in HOST_SYNC_CLAUSE_TERMINATORS)
+            if idx != -1]
+    return text[at:min(ends)] if ends else text[at:]
+
+
+def host_sync_gate_findings(text):
+    """Return sorted contract findings for the create-UAT physical-host sync approval gate.
+
+    Pure and text-only: no repository read, no path derivation, and only non-throwing ``find()``
+    searches, so a degraded in-memory fixture reports findings instead of raising. An empty list
+    means the whole contract holds.
+    """
+    findings = set()
+
+    gate_idx = text.find(HOST_SYNC_GATE_MARKER)
+    pull_idx = text.find(HOST_SYNC_PULL_INVOCATION)
+    if pull_idx == -1:
+        findings.add("pull_missing")
+
+    if gate_idx == -1:
+        # Without the gate anchor there is no bounded prose slice, so every wording requirement
+        # that lives inside the gate is unmet by definition.
+        findings.update(("gate_missing", "host_not_named", "operation_not_named",
+                         "not_current_turn", "substitution_not_denied",
+                         "prior_turn_not_denied", "stop_boundary_missing",
+                         "mutation_disclosure_missing"))
+    else:
+        if pull_idx != -1 and pull_idx < gate_idx:
+            findings.add("gate_after_pull")
+        # Bound the gate to its own prose: marker -> executable pull block when that follows,
+        # otherwise -> the next step heading. Excluding the fenced command keeps "the gate names
+        # the operation" an honest check on the prose rather than on the command it guards.
+        heading_idx = text.find("\n### ", gate_idx)
+        stops = [idx for idx in (pull_idx, heading_idx) if idx > gate_idx]
+        prose = _flat(text[gate_idx:min(stops)] if stops else text[gate_idx:])
+        lowered = prose.lower()
+
+        if HOST_SYNC_HOST not in prose:
+            findings.add("host_not_named")
+        if HOST_SYNC_PULL_COMMAND not in prose:
+            findings.add("operation_not_named")
+        if HOST_SYNC_CURRENT_TURN_PHRASE not in lowered:
+            findings.add("not_current_turn")
+        if HOST_SYNC_PRIOR_TURN_PHRASE not in lowered:
+            findings.add("prior_turn_not_denied")
+        if HOST_SYNC_STOP_PHRASE not in lowered:
+            findings.add("stop_boundary_missing")
+        # The gate must disclose that the guarded command reaches out and changes the host.
+        if any(phrase not in lowered for phrase in HOST_SYNC_MUTATION_DISCLOSURES):
+            findings.add("mutation_disclosure_missing")
+
+        # Backward non-substitution (no later gate covers this sync) and forward non-authorisation
+        # (this sync covers no later action) are one contract: either gap is a substitution.
+        # Each step is judged inside its own clause, so an absent, inverted or borrowed denial
+        # all read the same way: that step is not denied.
+        denied = HOST_SYNC_FORWARD_PHRASE in lowered
+        for step in HOST_SYNC_NON_SUBSTITUTING_STEPS:
+            if HOST_SYNC_NON_SUBSTITUTION_PHRASE not in _clause_after(lowered, step):
+                denied = False
+        if not denied:
+            findings.add("substitution_not_denied")
+
+    safety_idx = text.find(HOST_SYNC_SAFETY_HEADING)
+    if safety_idx == -1:
+        findings.add("safety_boundary_missing")
+    else:
+        next_idx = text.find("\n## ", safety_idx + 1)
+        section = text[safety_idx:next_idx] if next_idx != -1 else text[safety_idx:]
+        if any(token not in _flat(section).lower() for token in HOST_SYNC_SAFETY_TOKENS):
+            findings.add("safety_boundary_missing")
+
+    return sorted(findings)
+
+
+# A minimal, self-contained COMPLIANT document. The negative controls degrade this rather than the
+# live runbook, so they stay meaningful independently of the runbook's current state and localise
+# any live failure to the live assertions. It is not a copy of the runbook: the live
+# ``findings == []`` assertion remains the authority on the real document.
+HOST_SYNC_CANONICAL_FIXTURE = """### 3. Physical host pulls reviewed `main`
+
+**Separate current-turn owner approval required (host-sync gate).** The command below runs
+on the physical host `DESKTOP-Q43QKQF`, contacts the remote, and fast-forwards (mutates)
+that host's checkout. It is a change to an external machine, not a read-only check. Before
+running it, obtain an explicit current-turn owner approval that names the physical host
+(`DESKTOP-Q43QKQF`) and the pull/sync operation on it. This approval is distinct and is
+**not** implied by any other gate:
+
+- the PR review and merge decision (step 2) does **not** cover this host sync;
+- the VM deployment stage (step 4) does **not** cover this host sync;
+- the no-write dry-run preflight (step 5) does **not** cover this host sync;
+- the separate current-turn write approval (step 7) does **not** cover this host sync.
+
+This host-sync approval does not authorise deployment, package execution, preflight or a
+member write. A prior-turn approval is not reusable. Without the named current-turn
+approval, stop before contacting `DESKTOP-Q43QKQF` and do not run
+`git pull --ff-only origin main`.
+
+**`PHYSICAL HOST - DESKTOP-Q43QKQF`** After the PR is reviewed and merged, and only after
+the host-sync approval above, the physical host fast-forwards to the reviewed, merged
+`main`. It is never used for implementation or manual edits.
+
+```bash
+git pull --ff-only origin main
+```
+
+## Safety boundary
+
+- The host sync on `DESKTOP-Q43QKQF` in step 3 and the `SaveMember` write in step 7
+  each require their own prior current-turn owner approval. Neither implies the other,
+  and a prior-turn approval is never reusable for either.
+"""
+
+# The four locked step-denial bullets, verbatim from the fixture above, keyed by step token. One
+# source of truth so the removal controls and the polarity-inversion controls cannot drift apart.
+HOST_SYNC_STEP_DENIAL_BULLETS = {
+    "(step 2)": "- the PR review and merge decision (step 2) does **not** cover this host sync;\n",
+    "(step 4)": "- the VM deployment stage (step 4) does **not** cover this host sync;\n",
+    "(step 5)": "- the no-write dry-run preflight (step 5) does **not** cover this host sync;\n",
+    "(step 7)": "- the separate current-turn write approval (step 7) does **not** cover this host sync.\n",
+}
+
+# CommonMark accepts `-`, `*` and `+` interchangeably as bullet markers, so an editor may rewrite
+# the list with any of them. `_flat()` renders every one of those breaks as " <marker> ", which is
+# why the clause bound must recognise all three and not just the hyphen the fixture happens to use.
+HOST_SYNC_BULLET_MARKERS = ("-", "*", "+")
+
+
 class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
     def setUp(self):
         self.runbook = read_repo_text("probe_runbook")
+        self.create_runbook = read_repo_text("create_uat_runbook")
         self.readme = read_repo_text("readme")
         self.workflow = read_repo_text("workflow")
 
@@ -4241,6 +4450,296 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
         self.assertIn("(member_create_uat_runbook.md)", self.runbook)
         self.assertTrue(read_repo_text("create_uat_runbook").strip(),
                         "the linked main create-UAT runbook must exist and be non-empty")
+
+    # ---- DL-XB-118-001: create-UAT physical-host sync approval gate ---- #
+    def _create_uat_gate_prose(self):
+        """The live gate's own prose, marker -> executable pull block, whitespace-collapsed."""
+        gate_idx = self.create_runbook.find(HOST_SYNC_GATE_MARKER)
+        pull_idx = self.create_runbook.find(HOST_SYNC_PULL_INVOCATION)
+        self.assertNotEqual(gate_idx, -1, "the create-UAT host-sync gate marker must be present")
+        self.assertNotEqual(pull_idx, -1, "the fenced physical-host pull command must be present")
+        self.assertLess(gate_idx, pull_idx,
+                        "the host-sync gate must precede the physical-host pull command")
+        return _flat(self.create_runbook[gate_idx:pull_idx])
+
+    def test_create_uat_runbook_satisfies_the_whole_host_sync_gate_contract(self):
+        self.assertEqual(host_sync_gate_findings(self.create_runbook), [],
+                         "the create-UAT runbook must satisfy every host-sync gate requirement")
+
+    def test_create_uat_gate_precedes_the_pull_and_names_host_and_operation(self):
+        prose = self._create_uat_gate_prose()          # also asserts gate-before-pull ordering
+        self.assertIn(HOST_SYNC_HOST, prose, "the gate must name the physical host")
+        self.assertIn(HOST_SYNC_PULL_COMMAND, prose, "the gate must name the exact operation")
+        self.assertRegex(prose, r"(?i)pull/sync operation")
+
+    def test_create_uat_gate_requires_a_current_turn_approval(self):
+        prose = self._create_uat_gate_prose().lower()
+        self.assertIn(HOST_SYNC_CURRENT_TURN_PHRASE, prose)
+        self.assertIn(HOST_SYNC_PRIOR_TURN_PHRASE, prose,
+                      "a prior-turn approval must be stated as non-reusable")
+
+    def test_create_uat_gate_denies_substitution_in_both_directions(self):
+        prose = self._create_uat_gate_prose().lower()
+        # Backward: no later gate covers this sync. Each denial must carry its own polarity
+        # inside its own clause, so a neighbouring bullet cannot stand in for a missing one.
+        for step in HOST_SYNC_NON_SUBSTITUTING_STEPS:
+            self.assertNotEqual(prose.find(step), -1, "the gate must name %s" % step)
+            self.assertIn(HOST_SYNC_NON_SUBSTITUTION_PHRASE, _clause_after(prose, step),
+                          "%s's own clause must deny that it covers this host sync" % step)
+        # Forward: this sync authorises no later action.
+        self.assertIn(HOST_SYNC_FORWARD_PHRASE, prose)
+
+    def test_create_uat_gate_discloses_remote_contact_mutation_and_not_read_only(self):
+        prose = self._create_uat_gate_prose().lower()
+        for phrase in HOST_SYNC_MUTATION_DISCLOSURES:
+            self.assertIn(phrase, prose,
+                          "the gate must disclose that the command %r" % (phrase,))
+
+    def test_create_uat_gate_stops_execution_before_contacting_the_host(self):
+        self.assertIn(HOST_SYNC_STOP_PHRASE, self._create_uat_gate_prose().lower())
+
+    def test_create_uat_safety_boundary_keeps_host_sync_and_write_independent(self):
+        safety_idx = self.create_runbook.find(HOST_SYNC_SAFETY_HEADING)
+        self.assertNotEqual(safety_idx, -1, "the create-UAT runbook must keep a safety boundary")
+        section = _flat(self.create_runbook[safety_idx:]).lower()
+        for token in HOST_SYNC_SAFETY_TOKENS:
+            self.assertIn(token, section, token)
+
+    def test_create_uat_runbook_makes_no_blanket_off_laptop_gating_claim(self):
+        # Queued follow-up #123 leaves the step-4 deployment and step-5 preflight gaps open, so a
+        # broader "everything off-laptop is gated" claim would be untrue. #118 must not add one.
+        flat = _flat(self.create_runbook).lower()
+        for claim in ("every off-laptop", "each off-laptop", "all off-laptop"):
+            self.assertNotIn(claim, flat,
+                             "a blanket off-laptop gating claim is false while #123 is open")
+
+    def test_create_uat_runbook_read_stays_inside_the_closed_dependency_contract(self):
+        self.assertEqual(repository_read_violations(read_repo_text("focused_tests")), [],
+                         "the host-sync guardrail must add no repository read outside the registry")
+
+    # ---- Negative controls: every one degrades an IN-MEMORY fixture, never a repository file ----
+    def test_canonical_host_sync_fixture_is_itself_compliant(self):
+        # The control group. Without this, a degraded fixture proving "findings appear" would be
+        # worthless: the findings might have been there all along.
+        self.assertEqual(host_sync_gate_findings(HOST_SYNC_CANONICAL_FIXTURE), [],
+                         "the canonical fixture must satisfy the contract before it is degraded")
+
+    def _degraded_gate(self, old, new):
+        """Degrade the fixture's gate prose only, proving the fixture actually changed."""
+        split = HOST_SYNC_CANONICAL_FIXTURE.find(HOST_SYNC_PULL_INVOCATION)
+        degraded = (HOST_SYNC_CANONICAL_FIXTURE[:split].replace(old, new)
+                    + HOST_SYNC_CANONICAL_FIXTURE[split:])
+        self.assertNotEqual(degraded, HOST_SYNC_CANONICAL_FIXTURE,
+                            "the degraded fixture must actually differ: %r" % (old,))
+        return degraded
+
+    def _degraded_safety(self, old, new):
+        """Degrade the fixture's safety boundary only, proving the fixture actually changed."""
+        split = HOST_SYNC_CANONICAL_FIXTURE.find(HOST_SYNC_SAFETY_HEADING)
+        degraded = (HOST_SYNC_CANONICAL_FIXTURE[:split]
+                    + HOST_SYNC_CANONICAL_FIXTURE[split:].replace(old, new))
+        self.assertNotEqual(degraded, HOST_SYNC_CANONICAL_FIXTURE,
+                            "the degraded fixture must actually differ: %r" % (old,))
+        return degraded
+
+    def test_control_pull_moved_before_the_gate_is_detected(self):
+        fence = HOST_SYNC_PULL_INVOCATION + "\n```\n"
+        self.assertIn(fence, HOST_SYNC_CANONICAL_FIXTURE)
+        degraded = fence + HOST_SYNC_CANONICAL_FIXTURE.replace(fence, "", 1)
+        self.assertNotEqual(degraded, HOST_SYNC_CANONICAL_FIXTURE)
+        self.assertIn("gate_after_pull", host_sync_gate_findings(degraded))
+
+    def test_control_missing_pull_command_is_detected(self):
+        degraded = HOST_SYNC_CANONICAL_FIXTURE.replace(HOST_SYNC_PULL_INVOCATION, "```bash\ntrue")
+        self.assertNotEqual(degraded, HOST_SYNC_CANONICAL_FIXTURE)
+        self.assertIn("pull_missing", host_sync_gate_findings(degraded))
+
+    def test_control_unnamed_host_is_detected(self):
+        degraded = self._degraded_gate(HOST_SYNC_HOST, "the physical host")
+        self.assertIn("host_not_named", host_sync_gate_findings(degraded))
+
+    def test_control_unnamed_operation_is_detected(self):
+        degraded = self._degraded_gate("`" + HOST_SYNC_PULL_COMMAND + "`", "`the pull command`")
+        self.assertIn("operation_not_named", host_sync_gate_findings(degraded))
+
+    def test_control_generic_approval_wording_replacing_the_gate_is_detected(self):
+        degraded = self._degraded_gate(HOST_SYNC_GATE_MARKER, "approval required")
+        self.assertIn("gate_missing", host_sync_gate_findings(degraded))
+
+    def test_control_missing_current_turn_wording_is_detected(self):
+        degraded = self._degraded_gate(HOST_SYNC_CURRENT_TURN_PHRASE, "owner approval")
+        self.assertIn("not_current_turn", host_sync_gate_findings(degraded))
+
+    def test_control_each_removed_non_substitution_statement_is_detected(self):
+        for step, statement in HOST_SYNC_STEP_DENIAL_BULLETS.items():
+            with self.subTest(step=step):
+                degraded = self._degraded_gate(statement, "")
+                self.assertIn("substitution_not_denied", host_sync_gate_findings(degraded))
+
+    def test_control_removed_forward_non_authorisation_is_detected(self):
+        # Degrade against RAW fixture text: HOST_SYNC_FORWARD_PHRASE is the whitespace-collapsed
+        # form and the fixture wraps that sentence, so it is not a literal substring here.
+        degraded = self._degraded_gate("does not authorise deployment", "authorises deployment")
+        self.assertIn("substitution_not_denied", host_sync_gate_findings(degraded))
+
+    def test_control_removed_prior_turn_non_reuse_is_detected(self):
+        degraded = self._degraded_gate("A prior-turn approval is not reusable. ", "")
+        self.assertIn("prior_turn_not_denied", host_sync_gate_findings(degraded))
+
+    def test_control_removed_stop_boundary_is_detected(self):
+        degraded = self._degraded_gate(
+            "stop before contacting `DESKTOP-Q43QKQF` and do not run", "do not run")
+        self.assertIn("stop_boundary_missing", host_sync_gate_findings(degraded))
+
+    def test_control_removed_safety_boundary_independence_is_detected(self):
+        degraded = self._degraded_safety("Neither implies the other,", "")
+        self.assertIn("safety_boundary_missing", host_sync_gate_findings(degraded))
+
+    # -- Polarity controls: a denial INVERTED in place, not removed -- #
+    # Removal controls only prove the oracle notices an absent bullet. These prove it notices a
+    # bullet that is still present, still carries its step token, and now says the opposite.
+    def _inverted_step_denial(self, step):
+        """Flip one bullet's `does **not**` to `does`, leaving the rest of the bullet intact."""
+        bullet = HOST_SYNC_STEP_DENIAL_BULLETS[step]
+        inverted = bullet.replace("does **not** cover", "does cover")
+        self.assertNotEqual(inverted, bullet, "the inversion must change %s" % step)
+        self.assertIn(step, inverted, "the inverted bullet must keep its step token")
+        return self._degraded_gate(bullet, inverted)
+
+    def test_control_inverted_step_2_non_substitution_is_detected(self):
+        degraded = self._inverted_step_denial("(step 2)")
+        self.assertIn("substitution_not_denied", host_sync_gate_findings(degraded))
+
+    def test_control_inverted_step_4_non_substitution_is_detected(self):
+        degraded = self._inverted_step_denial("(step 4)")
+        self.assertIn("substitution_not_denied", host_sync_gate_findings(degraded))
+
+    def test_control_inverted_step_5_non_substitution_is_detected(self):
+        degraded = self._inverted_step_denial("(step 5)")
+        self.assertIn("substitution_not_denied", host_sync_gate_findings(degraded))
+
+    def test_control_inverted_step_7_non_substitution_is_detected(self):
+        degraded = self._inverted_step_denial("(step 7)")
+        self.assertIn("substitution_not_denied", host_sync_gate_findings(degraded))
+
+    def test_control_a_neighbouring_compliant_bullet_cannot_satisfy_an_inverted_one(self):
+        # The specific bypass a fixed proximity window allows: invert one bullet and let the
+        # untouched bullet next to it supply the denial phrase. Each denial must stand alone.
+        degraded = self._inverted_step_denial("(step 4)")
+        for neighbour in ("(step 2)", "(step 5)", "(step 7)"):
+            self.assertIn(HOST_SYNC_STEP_DENIAL_BULLETS[neighbour], degraded,
+                          "%s must remain compliant and adjacent" % neighbour)
+        self.assertIn("substitution_not_denied", host_sync_gate_findings(degraded))
+
+    # -- Unterminated inversion: the bound must not depend on the bullet's own punctuation -- #
+    # `;` and `.` belong to the bullet an editor is already rewriting, so the same edit that
+    # inverts a denial can delete its terminator. A clause bounded only by that punctuation then
+    # runs on into the NEXT list item, whose untouched denial answers for the mutated one.
+    def _inverted_unterminated_step_denial(self, step, neighbour):
+        """Invert one bullet AND drop its own trailing `;`, leaving ``neighbour`` intact."""
+        bullet = HOST_SYNC_STEP_DENIAL_BULLETS[step]
+        mutated = bullet.replace("does **not** cover", "does cover").replace(" sync;\n", " sync\n")
+        self.assertNotEqual(mutated, bullet, "the mutation must change %s" % step)
+        self.assertIn(step, mutated, "the mutated bullet must keep its step token")
+        self.assertNotIn(";", mutated, "%s must lose its own clause terminator" % step)
+        self.assertNotIn(HOST_SYNC_NON_SUBSTITUTION_PHRASE, mutated,
+                         "%s must no longer deny anything by itself" % step)
+        degraded = self._degraded_gate(bullet, mutated)
+        self.assertIn(HOST_SYNC_STEP_DENIAL_BULLETS[neighbour], degraded,
+                      "%s must remain present and compliant to be borrowable" % neighbour)
+        return degraded
+
+    def test_control_unterminated_inverted_step_2_cannot_borrow_step_4(self):
+        degraded = self._inverted_unterminated_step_denial("(step 2)", "(step 4)")
+        self.assertIn("substitution_not_denied", host_sync_gate_findings(degraded))
+
+    def test_control_unterminated_inverted_step_4_cannot_borrow_step_5(self):
+        degraded = self._inverted_unterminated_step_denial("(step 4)", "(step 5)")
+        self.assertIn("substitution_not_denied", host_sync_gate_findings(degraded))
+
+    def test_control_unterminated_inverted_step_5_cannot_borrow_step_7(self):
+        degraded = self._inverted_unterminated_step_denial("(step 5)", "(step 7)")
+        self.assertIn("substitution_not_denied", host_sync_gate_findings(degraded))
+
+    # -- Neighbour marker variants: the bound must not depend on WHICH bullet marker is used -- #
+    # The controls above all leave the neighbour hyphen-marked, so they only prove the " - " break
+    # is a bound. CommonMark treats `*` and `+` as equally valid, and a list rewritten with either
+    # still reads as a compliant runbook -- so an unterminated inverted bullet must not be able to
+    # run across such a break and borrow the untouched denial that follows it.
+    HOST_SYNC_ADJACENT_STEP_NEIGHBOURS = (("(step 2)", "(step 4)"),
+                                          ("(step 4)", "(step 5)"),
+                                          ("(step 5)", "(step 7)"))
+
+    def _unterminated_inversion_across_marker(self, step, neighbour, marker):
+        """Invert+unterminate ``step`` and re-mark the adjacent ``neighbour`` with ``marker``.
+
+        The mutated bullet keeps its step token and loses both its own denial and its own
+        punctuation, so nothing but a structural bound can stop its clause. ``neighbour`` stays
+        verbatim-compliant and immediately adjacent, carrying only a different bullet marker.
+        """
+        bullet = HOST_SYNC_STEP_DENIAL_BULLETS[step]
+        mutated = bullet.replace("does **not** cover", "does cover").replace(" sync;\n", " sync\n")
+        self.assertNotEqual(mutated, bullet, "the mutation must change %s" % step)
+        self.assertIn(step, mutated, "the mutated bullet must keep its step token")
+        for own in (";", "."):
+            self.assertNotIn(own, mutated,
+                             "%s must lose its own %r clause terminator" % (step, own))
+        self.assertNotIn(HOST_SYNC_NON_SUBSTITUTION_PHRASE, mutated,
+                         "%s must no longer deny anything by itself" % step)
+
+        original = HOST_SYNC_STEP_DENIAL_BULLETS[neighbour]
+        remarked = marker + original[1:]
+        self.assertIn(HOST_SYNC_NON_SUBSTITUTION_PHRASE, remarked,
+                      "%s must keep its denial verbatim to be borrowable" % neighbour)
+
+        # Replacing the adjacent PAIR in one step makes adjacency an asserted precondition: if the
+        # fixture's bullet order ever changed, this control would fail loudly rather than silently
+        # stop testing a bullet break.
+        pair = bullet + original
+        self.assertIn(pair, HOST_SYNC_CANONICAL_FIXTURE,
+                      "%s must sit immediately before %s" % (step, neighbour))
+        degraded = self._degraded_gate(pair, mutated + remarked)
+        self.assertIn(remarked, degraded,
+                      "%s must remain present, compliant and %r-marked" % (neighbour, marker))
+        return degraded
+
+    def test_control_unterminated_inversion_cannot_borrow_across_any_bullet_marker(self):
+        for step, neighbour in self.HOST_SYNC_ADJACENT_STEP_NEIGHBOURS:
+            for marker in HOST_SYNC_BULLET_MARKERS:
+                with self.subTest(step=step, neighbour=neighbour, marker=marker):
+                    degraded = self._unterminated_inversion_across_marker(step, neighbour, marker)
+                    self.assertIn(
+                        "substitution_not_denied", host_sync_gate_findings(degraded),
+                        "%s borrowed %s's denial across a %r-marked bullet break"
+                        % (step, neighbour, marker))
+
+    # -- Safety-boundary proposition controls -- #
+    def test_control_weakened_safety_own_approval_requirement_is_detected(self):
+        degraded = self._degraded_safety(
+            "each require their own prior current-turn owner approval",
+            "are both covered by the owner's standing approval")
+        self.assertIn("safety_boundary_missing", host_sync_gate_findings(degraded))
+
+    def test_control_weakened_safety_prior_turn_non_reuse_is_detected(self):
+        degraded = self._degraded_safety(
+            "a prior-turn approval is never reusable for either",
+            "either may rely on an earlier approval")
+        self.assertIn("safety_boundary_missing", host_sync_gate_findings(degraded))
+
+    # -- Mutation / not-read-only disclosure controls -- #
+    # The gate must say what the guarded command DOES, or a reader cannot judge the approval.
+    def test_control_removed_remote_contact_disclosure_is_detected(self):
+        degraded = self._degraded_gate("contacts the remote, and ", "")
+        self.assertIn("mutation_disclosure_missing", host_sync_gate_findings(degraded))
+
+    def test_control_removed_checkout_mutation_disclosure_is_detected(self):
+        degraded = self._degraded_gate(
+            "fast-forwards (mutates)\nthat host's checkout", "runs there")
+        self.assertIn("mutation_disclosure_missing", host_sync_gate_findings(degraded))
+
+    def test_control_inverted_read_only_disclosure_is_detected(self):
+        degraded = self._degraded_gate("not a read-only check", "a read-only check")
+        self.assertIn("mutation_disclosure_missing", host_sync_gate_findings(degraded))
 
     def test_readme_references_probe_and_runbook(self):
         self.assertIn("scripts/ac2_member_expiry_capability_probe.ps1", self.readme)
