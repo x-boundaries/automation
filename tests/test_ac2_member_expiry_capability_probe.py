@@ -4367,10 +4367,35 @@ HOST_SYNC_BULLET_MARKERS = ("-", "*", "+")
 
 VM_GATE_VM = "DESKTOP-4I042L6"
 
-# Layer 1. Only `### <n>. ` delimits a section. Step 5 contains many UNNUMBERED `### ` subsections
-# (store admission, reconciliation, ...), so a bound that accepted any `### ` would end step 5
-# hundreds of lines early and stop covering the transfer/dry-run instruction that closes it.
-VM_GATE_STEP_HEADING = re.compile(r"(?m)^### \d+\. ")
+# Layer 1. Only a NUMBERED `### <n>. ` heading delimits a section. Step 5 contains many
+# UNNUMBERED `### ` subsections (store admission, reconciliation, ...), so a bound that accepted
+# any `### ` would end step 5 hundreds of lines early and stop covering the transfer/dry-run
+# instruction that closes it.
+#
+# A3: this is the ONE numbered-ATX opening grammar. Discovery, duplicate detection and section
+# bounding all read step identity out of its `step` group, so no second, narrower encoding of
+# "what a numbered heading looks like" exists for them to drift apart on. The accepted final-G4-A2
+# finding was exactly that drift: `^### \d+\. ` plus a `startswith("### <n>. ")` probe recognised
+# one spelling, while CommonMark renders the same top-level `h3` for
+#
+#   * 0-3 leading ASCII spaces -- FOUR is an indented code block and stays excluded, so an
+#     indented Markdown example inside a step cannot make the real step ambiguous;
+#   * exactly three `#`, since `####` opens an h4 and is not a step;
+#   * one or more spaces OR TABS after `###`;
+#   * one or more spaces OR TABS after `<n>.`.
+#
+# A duplicate written in an unrecognised spelling is invisible rather than mis-parsed, and that is
+# the severity: its body is absorbed into the neighbouring section's ACTION region, where only
+# presence checks run, so an ungated instruction rides along with no findings at all.
+VM_GATE_STEP_HEADING = re.compile(r"(?m)^ {0,3}###(?!#)[ \t]+(?P<step>\d+)\.[ \t]+")
+
+# A CommonMark ATX closing sequence: a run of `#` preceded by whitespace and followed by nothing
+# but optional whitespace. It is SYNTAX -- stripped before rendering -- so it must not read as a
+# wording change. The preceding-whitespace requirement and the end anchor are what keep this from
+# becoming a bypass in the other direction: in `### 4. Title ### and push now` the run is followed
+# by content, so CommonMark keeps the whole line as heading text and this pattern declines to
+# strip it, leaving the trailing instruction visible as drift.
+VM_GATE_ATX_CLOSING = re.compile(r"[ \t]+#+[ \t]*$")
 VM_GATE_DEPLOY_STEP = 4
 VM_GATE_PREFLIGHT_STEP = 5
 
@@ -4518,6 +4543,28 @@ VM_GATE_FINDING_KEYS = (
 )
 
 
+def _semantic_heading(line):
+    """The RENDERED identity of an ATX heading line, as a reviewer sees it.
+
+    Whitespace is collapsed, as everywhere else in this contract, and a CommonMark closing `#`
+    sequence is removed because it is syntax rather than content. ``line.strip()`` first, so a
+    CRLF checkout's trailing ``\\r`` cannot sit between the closing run and the end anchor and
+    quietly defeat the strip.
+    """
+    return _flat(VM_GATE_ATX_CLOSING.sub("", line.strip()))
+
+
+def _numbered_heading_openings(text):
+    """Every top-level numbered ATX opening in ``text``, as ``(offset, step number)``.
+
+    The single enumeration every other numbered-step helper is built on. Opening discovery and
+    section bounding MUST share this grammar: a heading one of them accepted and the other did not
+    would once again orphan whatever followed it, which is the accepted A3 defect.
+    """
+    return [(match.start(), int(match.group("step")))
+            for match in VM_GATE_STEP_HEADING.finditer(text)]
+
+
 def _numbered_step_section(text, number):
     """Return one numbered Markdown step section, bounded by the numbered step headings.
 
@@ -4525,13 +4572,16 @@ def _numbered_step_section(text, number):
     every requirement that lives inside it rather than raising. This is section EXTRACTION only:
     ``_resolve_numbered_step`` owns the uniqueness and heading-identity authority, because taking
     the first of two same-number headings is exactly the accepted F-3 defect.
+
+    A3: the section closes at the next opening of ANY numbered step, drawn from the same shared
+    enumeration that found this one, so a duplicate cannot be simultaneously invisible to
+    discovery and inert as a bound.
     """
-    heading = "### %d. " % number
-    starts = [match.start() for match in VM_GATE_STEP_HEADING.finditer(text)]
-    opening = next((start for start in starts if text.startswith(heading, start)), -1)
-    if opening == -1:
+    openings = _numbered_step_openings(text, number)
+    if not openings:
         return ""
-    closing = next((start for start in starts if start > opening), -1)
+    opening = openings[0]
+    closing = next((at for at, _ in _numbered_heading_openings(text) if at > opening), -1)
     return text[opening:closing] if closing != -1 else text[opening:]
 
 
@@ -4541,10 +4591,13 @@ def _line_start(text, at):
 
 
 def _numbered_step_openings(text, number):
-    """Every offset at which a NUMBERED heading opens step ``number``."""
-    heading = "### %d. " % number
-    return [start for start in (match.start() for match in VM_GATE_STEP_HEADING.finditer(text))
-            if text.startswith(heading, start)]
+    """Every offset at which a NUMBERED heading opens step ``number``.
+
+    Step identity comes from the shared match's own ``step`` group, never from a literal probe
+    such as ``text.startswith("### 4. ", start)``. A literal probe is a second, narrower grammar,
+    and the accepted A3 finding is precisely what happens when the two disagree.
+    """
+    return [at for at, step in _numbered_heading_openings(text) if step == number]
 
 
 def _resolve_numbered_step(text, number, prefix, findings):
@@ -4567,6 +4620,12 @@ def _resolve_numbered_step(text, number, prefix, findings):
     Whitespace is non-material, matching the rest of this contract: a CRLF checkout or a reflowed
     heading is not drift, while case, punctuation and wording changes all fail closed.
     Non-throwing: every failure yields "", which then fails every requirement inside the step.
+
+    A3 widens WHICH openings count, not WHAT they must say. Any mixture of spellings for the same
+    step number is still more than one opening and still fails closed here -- there is no majority
+    vote and no "the strict one wins" -- while ``_semantic_heading`` keeps identity at the rendered
+    heading, so a respelling that renders the reviewed heading exactly stays clean and substantive
+    drift still fails closed.
     """
     openings = _numbered_step_openings(text, number)
     if not openings:
@@ -4576,7 +4635,8 @@ def _resolve_numbered_step(text, number, prefix, findings):
         findings.add(prefix + "_step_ambiguous")
         return ""
     section = _numbered_step_section(text, number)
-    if _flat(section.partition("\n")[0]) != _flat(VM_GATE_REVIEWED_HEADINGS[number]):
+    if _semantic_heading(section.partition("\n")[0]) \
+            != _semantic_heading(VM_GATE_REVIEWED_HEADINGS[number]):
         findings.add(prefix + "_heading_changed")
         return ""
     return section
