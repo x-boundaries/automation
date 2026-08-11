@@ -4374,6 +4374,16 @@ VM_GATE_STEP_HEADING = re.compile(r"(?m)^### \d+\. ")
 VM_GATE_DEPLOY_STEP = 4
 VM_GATE_PREFLIGHT_STEP = 5
 
+# The reviewed numbered heading LINES, verbatim. Accepted G4 finding F-4 was that the heading line
+# sits outside both pre-gate authorities -- step 4's blank-body rule and step 5's frozen digest --
+# so actionable external wording could ride in the heading itself and still precede the gate.
+# Exact-string authority closes that without touching the frozen prefix digest, which is derived
+# from the text AFTER this line and must stay byte-stable.
+VM_GATE_REVIEWED_HEADINGS = {
+    VM_GATE_DEPLOY_STEP: "### 4. Deploy the inactive UAT components",
+    VM_GATE_PREFLIGHT_STEP: "### 5. No-write preflight (dry-run)",
+}
+
 VM_GATE_DEPLOY_MARKER = "deployment gate"
 VM_GATE_PREFLIGHT_MARKER = "preflight gate"
 VM_GATE_SAFETY_HEADING = "## Safety boundary"
@@ -5940,6 +5950,126 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
         degraded = self._a1_swap(section, head + "\n\n" + action + "\n" + rest)
         self.assertIn("preflight_gate_after_external_action", vm_gate_findings(degraded),
                       "an action boundary before its gate must fail closed")
+
+    # ---- DL-XB-123-001-A2: numbered-step identity is structural authority ---- #
+    # Two accepted final-G4 findings, both demonstrated as false CLEANS rather than as
+    # merely-weak checks:
+    #
+    #   F-3 -- a SECOND `### 4. ` or `### 5. ` section ORPHANS whatever it contains. The section
+    #          bound silently takes the FIRST target heading and closes at the next numbered
+    #          heading, so an ungated external instruction can sit in the duplicate while the
+    #          genuine section stays perfectly compliant and the oracle reports clean.
+    #   F-4 -- the numbered heading LINE is excluded from both pre-gate authorities (step 4's
+    #          blank-body rule and step 5's frozen prefix digest), so actionable external wording
+    #          can ride in the heading itself and still precede the gate.
+    #
+    # Duplication is ambiguity even when the duplicate prose is harmless: once the target number
+    # appears twice, "which section is authoritative" has no answer, and guessing is precisely
+    # what made F-3 invisible. Fail closed and make the editor disambiguate.
+    def _a2_duplicate_step(self, number, rogue):
+        """Append a SECOND same-number section immediately after the genuine one."""
+        section = self._a1_step(number)
+        self.assertTrue(rogue.startswith("### %d. " % number),
+                        "the rogue section must reuse the same step number")
+        return self._a1_swap(section, section + rogue)
+
+    def _a2_retitle_step(self, number, heading):
+        """Rewrite ONLY a step's numbered heading line, leaving the whole body compliant."""
+        section = self._a1_step(number)
+        reviewed = section.partition("\n")[0]
+        self.assertEqual(reviewed, VM_GATE_REVIEWED_HEADINGS[number],
+                         "the fixture must start from the reviewed heading line")
+        self.assertNotEqual(heading, reviewed, "the retitle must actually change the heading")
+        return self._a1_swap(section, heading + section[len(reviewed):])
+
+    # -- A/B. A duplicate target step carrying a genuinely unsafe external instruction -- #
+    def test_a2_control_duplicate_deployment_step_hiding_an_ungated_action_fails_closed(self):
+        degraded = self._a2_duplicate_step(
+            VM_GATE_DEPLOY_STEP,
+            "### 4. Deploy the inactive UAT components (revised)\n\n"
+            "Push the reviewed runner onto DESKTOP-4I042L6 immediately, before obtaining\n"
+            "approval.\n\n")
+        self.assertIn("deploy_step_ambiguous", vm_gate_findings(degraded),
+                      "a second Step 4 must never orphan an ungated VM deployment")
+
+    def test_a2_control_duplicate_preflight_step_hiding_an_ungated_action_fails_closed(self):
+        degraded = self._a2_duplicate_step(
+            VM_GATE_PREFLIGHT_STEP,
+            "### 5. No-write preflight (dry-run) (revised)\n\n"
+            "Transfer the approved package to DESKTOP-4I042L6 and start the runner now,\n"
+            "without any approval.\n\n")
+        self.assertIn("preflight_step_ambiguous", vm_gate_findings(degraded),
+                      "a second Step 5 must never orphan an ungated transfer or dry-run")
+
+    # -- C. Harmless duplication is still ambiguous authority -- #
+    def test_a2_control_harmlessly_duplicated_target_step_still_fails_closed(self):
+        for number, prefix, rogue in (
+                (VM_GATE_DEPLOY_STEP, "deploy",
+                 "### 4. Deploy the inactive UAT components (notes)\n\nNothing to add.\n\n"),
+                (VM_GATE_PREFLIGHT_STEP, "preflight",
+                 "### 5. No-write preflight (dry-run) (notes)\n\nNothing to add.\n\n")):
+            with self.subTest(step=number):
+                degraded = self._a2_duplicate_step(number, rogue)
+                self.assertIn(prefix + "_step_ambiguous", vm_gate_findings(degraded),
+                              "ambiguous numbered-step authority must fail closed even when the "
+                              "duplicate itself is harmless")
+
+    # -- D/E. An actionable heading is an ungated instruction ahead of the gate -- #
+    def test_a2_control_actionable_deployment_heading_fails_closed(self):
+        degraded = self._a2_retitle_step(
+            VM_GATE_DEPLOY_STEP, "### 4. Push the runner onto DESKTOP-4I042L6 immediately")
+        self.assertIn("deploy_heading_changed", vm_gate_findings(degraded),
+                      "the heading must not be usable as an ungated operational instruction")
+
+    def test_a2_control_actionable_preflight_heading_fails_closed(self):
+        degraded = self._a2_retitle_step(
+            VM_GATE_PREFLIGHT_STEP,
+            "### 5. Send the package to DESKTOP-4I042L6 and preflight it")
+        self.assertIn("preflight_heading_changed", vm_gate_findings(degraded),
+                      "the heading must not be usable as an ungated operational instruction")
+
+    # -- F. Ordinary heading drift. Fail-closed is the intended answer: the reviewed heading is
+    # the authority, and a re-titled step comes back through a reviewed amendment. -- #
+    def test_a2_control_every_reviewed_heading_drift_fails_closed(self):
+        drifts = (
+            (VM_GATE_DEPLOY_STEP, "deploy", "case",
+             "### 4. deploy the inactive uat components"),
+            (VM_GATE_DEPLOY_STEP, "deploy", "punctuation",
+             "### 4. Deploy the inactive UAT components."),
+            (VM_GATE_DEPLOY_STEP, "deploy", "wording",
+             "### 4. Deploy the UAT components"),
+            (VM_GATE_PREFLIGHT_STEP, "preflight", "case",
+             "### 5. NO-WRITE PREFLIGHT (DRY-RUN)"),
+            (VM_GATE_PREFLIGHT_STEP, "preflight", "punctuation",
+             "### 5. No write preflight (dry run)"),
+            (VM_GATE_PREFLIGHT_STEP, "preflight", "wording",
+             "### 5. Preflight the approved package"),
+        )
+        for number, prefix, kind, heading in drifts:
+            with self.subTest(step=number, drift=kind):
+                degraded = self._a2_retitle_step(number, heading)
+                self.assertIn(prefix + "_heading_changed", vm_gate_findings(degraded),
+                              "%s drift in the Step-%d heading must fail closed" % (kind, number))
+
+    # -- G. The exact reviewed headings stay clean, and stay tied to the real runbook -- #
+    def test_a2_reviewed_headings_match_the_live_runbook_exactly_once_each(self):
+        lines = self.create_runbook.splitlines()
+        for number, heading in VM_GATE_REVIEWED_HEADINGS.items():
+            with self.subTest(step=number):
+                opened = [line for line in lines if line.startswith("### %d. " % number)]
+                self.assertEqual(opened, [heading],
+                                 "the runbook must open Step %d exactly once, with the reviewed "
+                                 "heading line" % number)
+
+    def test_a2_exact_reviewed_headings_remain_clean(self):
+        # The control group for every A2 mutation above: unmutated headings must report nothing,
+        # otherwise "a finding appeared" would prove nothing about the mutation.
+        self.assertEqual(vm_gate_findings(VM_GATE_CANONICAL_FIXTURE), [],
+                         "the reviewed headings must leave the fixture compliant")
+        for number, heading in VM_GATE_REVIEWED_HEADINGS.items():
+            with self.subTest(step=number):
+                self.assertEqual(_numbered_step_section(
+                    VM_GATE_CANONICAL_FIXTURE, number).partition("\n")[0], heading)
 
     def test_readme_references_probe_and_runbook(self):
         self.assertIn("scripts/ac2_member_expiry_capability_probe.ps1", self.readme)
