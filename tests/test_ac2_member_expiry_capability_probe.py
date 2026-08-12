@@ -5605,6 +5605,97 @@ VM_GATE_A5_SAFETY_STEP5_SCOPE = (
 )
 
 
+# ---- DL-XB-123-001-A6: post-A5 final-G4 remediation controls ---- #
+# Fresh final Gate 4 at exact L accepted three demonstrated false cleans and one safe-direction
+# defect. All four are reproduced against exact L before these controls are authored:
+#
+#   A6-F1  The reviewed gate-block identity A5 introduced is bounded by the step's ACTION boundary,
+#          so it sees nothing after it. Realistic operator-facing prose placed in the action region
+#          -- "The approval above is optional once these commands are reached." -- revokes the gate
+#          the document just stated, directly above the command it governs, and the COMPLETE guard
+#          reports clean. 36/36 injections across both steps, three positions and six contradiction
+#          families false-cleaned at L.
+#   A6-F2  ``_executable_line_text`` models ``<# ... #>`` but not the PowerShell here-string, so the
+#          full required command text placed inside ``@' ... '@`` or ``@" ... "@`` still satisfies
+#          the operation anchor. Verified against the real PowerShell runtime: here-string content
+#          is emitted as DATA and never executes; an indented terminator is a parse error ("White
+#          space is not allowed before the string terminator"), and an unterminated opener is a
+#          parse error too. 8/8 false-cleaned at L.
+#   A6-F3  The same gap on the shell side: ``<<EOF``, ``<<'EOF'``, ``<<"EOF"`` and ``<<-EOF`` bodies
+#          are heredoc DATA. Verified against real bash -- the command text is printed or consumed
+#          as input, never run. 8/8 false-cleaned at L.
+#   A6-F4  ``_semantic_gate_block`` canonicalises a bullet marker only when a literal SPACE follows
+#          it, so ``*\titem`` and ``+\titem`` report drift while ``- item``, ``* item``, ``+ item``
+#          and ``-\titem`` are accepted. Safe direction -- a false positive, never a false clean --
+#          but it breaks A5's own explicit `-`/`*`/`+` equivalence promise.
+#
+# A6-F1 is NOT answered with a wider negation vocabulary. That is the approach fresh G4 rejected
+# twice: an English classifier moves the boundary rather than closing it. The action region gets the
+# same treatment the gate block already has -- an explicit reviewed identity -- so any substantive
+# post-gate change fails closed whether or not a vocabulary recognises it.
+
+# Realistic operator-facing revocations, none of them present in the A5 gate-contradiction set, so
+# these controls cannot pass because the gate-block authority happens to catch them.
+VM_GATE_A6_ACTION_CONTRADICTIONS = (
+    ("optional_once_reached",
+     "The approval above is optional once these commands are reached."),
+    ("proceed_without",
+     "Operators may proceed with the steps below without obtaining that approval."),
+    ("prose_only_scope",
+     "The approval requirement applies only to the explanatory text above, not the commands."),
+    ("pre_approved",
+     "Management has pre-approved this operation, so no further approval is necessary here."),
+    ("earlier_today_reuse",
+     "An approval recorded earlier today may be reused for the commands below."),
+    ("urgency_bypass",
+     "Urgent operations may bypass the approval requirement stated above."),
+    ("retrospective",
+     "Proceed now and record the approval retrospectively."),
+    ("self_authorise",
+     "The operator may self-authorise the commands below."),
+)
+# Three positions an editor would realistically use, all strictly AFTER the action boundary: the
+# first sentence of action prose, immediately before the first required command, and later in the
+# same numbered step. The gate block itself is left byte-identical in every case.
+VM_GATE_A6_ACTION_PLACEMENTS = ("after_boundary", "before_command", "section_tail")
+
+VM_GATE_A6_ACTION_KEYS = {
+    VM_GATE_DEPLOY_STEP: "deploy_action_text_changed",
+    VM_GATE_PREFLIGHT_STEP: "preflight_action_text_changed",
+}
+VM_GATE_A6_GATE_KEYS = {
+    VM_GATE_DEPLOY_STEP: "deploy_gate_text_changed",
+    VM_GATE_PREFLIGHT_STEP: "preflight_gate_text_changed",
+}
+# A5 declared 48. A6 adds exactly the two reviewed action identities and retires nothing.
+VM_GATE_A6_FINDING_KEY_COUNT = 50
+
+# Standard PowerShell string data. Every template leaves the complete command text present and
+# line-leading while the real interpreter never executes it. The unterminated opener is included
+# deliberately: PowerShell rejects it outright, so a guard that kept scanning past it would be
+# reading lines that cannot run in any valid script.
+VM_GATE_A6_POWERSHELL_DATA_SPOOFS = (
+    ("single_here_string", "@'\n%s\n'@"),
+    ("double_here_string", '@"\n%s\n"@'),
+    ("single_here_string_assigned", "$doc = @'\n%s\n'@"),
+    ("double_here_string_assigned", '$doc = @"\n%s\n"@\nWrite-Host $doc'),
+    ("single_here_string_to_output", "@'\n%s\n'@ | Out-String | Write-Output"),
+    ("unterminated_here_string", "@'\n%s"),
+)
+# Standard shell heredoc data, including the `<<-` tab-stripped form and an unterminated opener.
+VM_GATE_A6_SHELL_DATA_SPOOFS = (
+    ("heredoc_unquoted", "cat <<EOF\n%s\nEOF"),
+    ("heredoc_single_quoted", "cat <<'EOF'\n%s\nEOF"),
+    ("heredoc_double_quoted", 'cat <<"EOF"\n%s\nEOF'),
+    ("heredoc_dash_stripped", "cat <<-EOF\n\t%s\n\tEOF"),
+    ("heredoc_as_input", "wc -l <<EOF\n%s\nEOF"),
+    ("unterminated_heredoc", "cat <<EOF\n%s"),
+)
+# The positive half of A6-F4: a line-start CommonMark marker followed by ORDINARY horizontal
+# whitespace opens the same list, so all six forms must compare equal.
+VM_GATE_A6_EQUIVALENT_BULLETS = ("- ", "* ", "+ ", "-\t", "*\t", "+\t")
+
+
 class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
     def setUp(self):
         self.runbook = read_repo_text("probe_runbook")
@@ -9073,6 +9164,164 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
         self.assertTrue(glob_to_regex("a/**/b.py").match("a/x/y/b.py"))
         self.assertTrue(glob_to_regex(".gitignore").match(".gitignore"))
         self.assertFalse(glob_to_regex(".gitignore").match("sub/.gitignore"))
+
+    # ---- DL-XB-123-001-A6: post-A5 final-G4 remediation controls ---- #
+    # Exercised against BOTH authorities, exactly as the A4 and A5 controls are. At this commit the
+    # L checker has no action-region identity, no here-string state and no heredoc state, and it
+    # canonicalises a bullet marker only before a literal space -- so the negative and
+    # safe-equivalence controls below are the intentional RED.
+    def _a6_bases(self):
+        return (("A4 target fixture", VM_GATE_A4_FIXTURE),
+                ("live create-UAT runbook", self.create_runbook))
+
+    def _a6_step_landmarks(self, number):
+        if number == VM_GATE_DEPLOY_STEP:
+            return VM_GATE_DEPLOY_MARKER, VM_GATE_DEPLOY_BOUNDARY
+        return VM_GATE_PREFLIGHT_MARKER, VM_GATE_PREFLIGHT_BOUNDARY
+
+    def _a6_layout(self, base, number):
+        """The step section, its gate block and its action region, from the checker's own resolver.
+
+        Re-derived through ``_resolve_gate_layout`` rather than from a private slice, so a control
+        cannot keep passing after the checker's own gate/action boundary has moved away from it.
+        """
+        marker, boundary = self._a6_step_landmarks(number)
+        section = _numbered_step_section(base, number)
+        self.assertNotEqual(section, "", "step %d must exist in the base document" % number)
+        _, block, action = _resolve_gate_layout(section, marker, boundary, "probe", set())
+        self.assertIsNotNone(action, "step %d gate layout must resolve" % number)
+        self.assertTrue(action.strip(), "step %d must carry an action region" % number)
+        return section, block, action
+
+    def _a6_inject_action(self, base, number, sentence, placement):
+        """Add one contradictory sentence to the ACTION region, leaving the gate block untouched.
+
+        Every placement is strictly after the action boundary, so a finding can only come from the
+        action region's own authority and never from the A5 gate-block identity.
+        """
+        section, block, action = self._a6_layout(base, number)
+        if placement == "after_boundary":
+            cut = action.find("\n\n")
+            self.assertNotEqual(cut, -1, "the action region must have a first paragraph")
+            mutated = action[:cut + 2] + sentence + "\n\n" + action[cut + 2:]
+        elif placement == "before_command":
+            cut = action.find("```")
+            self.assertNotEqual(cut, -1, "the action region must carry a fenced command")
+            mutated = action[:cut] + sentence + "\n\n" + action[cut:]
+        else:
+            mutated = action.rstrip("\n") + "\n\n" + sentence + "\n\n"
+        self.assertNotEqual(mutated, action, "the action region must actually change")
+        degraded = base.replace(section, section.replace(action, mutated, 1), 1)
+        self.assertNotEqual(degraded, base, "the degraded document must actually differ")
+        _, degraded_block, _ = self._a6_layout(degraded, number)
+        self.assertEqual(degraded_block, block,
+                         "the control must leave the reviewed gate block byte-identical")
+        return degraded
+
+    def test_a6_control_post_gate_action_contradiction_fails_closed(self):
+        for base_name, base in self._a6_bases():
+            for number in (VM_GATE_DEPLOY_STEP, VM_GATE_PREFLIGHT_STEP):
+                for kind, sentence in VM_GATE_A6_ACTION_CONTRADICTIONS:
+                    for placement in VM_GATE_A6_ACTION_PLACEMENTS:
+                        with self.subTest(base=base_name, step=number,
+                                          contradiction=kind, placement=placement):
+                            degraded = self._a6_inject_action(base, number, sentence, placement)
+                            findings = vm_gate_findings(degraded)
+                            self.assertIn(
+                                VM_GATE_A6_ACTION_KEYS[number], findings,
+                                "post-gate %s at %s in step %d must fail closed"
+                                % (kind, placement, number))
+                            self.assertNotIn(
+                                VM_GATE_A6_GATE_KEYS[number], findings,
+                                "the gate block is untouched, so the finding must be the action's")
+
+    def test_a6_control_powershell_string_data_is_not_execution(self):
+        for base_name, base in self._a6_bases():
+            for label, command, key in VM_GATE_A5_POWERSHELL_OPERATIONS:
+                for kind, template in VM_GATE_A6_POWERSHELL_DATA_SPOOFS:
+                    with self.subTest(base=base_name, operation=label, spoof=kind):
+                        degraded = self._a5_replace_command(base, command, template % command)
+                        self.assertIn(key, vm_gate_findings(degraded),
+                                      "a %s inside %s is data, so it must not satisfy %s"
+                                      % (label, kind, key))
+
+    def test_a6_control_shell_heredoc_data_is_not_execution(self):
+        for base_name, base in self._a6_bases():
+            for label, command, key in VM_GATE_A5_SHELL_OPERATIONS:
+                for kind, template in VM_GATE_A6_SHELL_DATA_SPOOFS:
+                    with self.subTest(base=base_name, operation=label, spoof=kind):
+                        degraded = self._a5_replace_command(base, command, template % command)
+                        self.assertIn(key, vm_gate_findings(degraded),
+                                      "a %s inside %s is data, so it must not satisfy %s"
+                                      % (label, kind, key))
+
+    def test_a6_genuine_commands_survive_neighbouring_inert_data(self):
+        """The positive half: closing correctly matters as much as suppressing.
+
+        A here-string or heredoc state machine that ran to the end of the region instead of to its
+        terminator would suppress the real command that follows it, which is a false guard rather
+        than a stronger one.
+        """
+        neighbours = (
+            ("after_here_string", "@'\nunrelated documentation data\n'@\n%s"),
+            ("before_here_string", "%s\n@'\nunrelated documentation data\n'@"),
+            ("after_heredoc", "cat <<'EOF'\nunrelated documentation data\nEOF\n%s"),
+            ("before_heredoc", "%s\ncat <<'EOF'\nunrelated documentation data\nEOF"),
+        )
+        operations = VM_GATE_A5_POWERSHELL_OPERATIONS + VM_GATE_A5_SHELL_OPERATIONS
+        for base_name, base in self._a6_bases():
+            for label, command, key in operations:
+                for kind, template in neighbours:
+                    with self.subTest(base=base_name, operation=label, neighbour=kind):
+                        degraded = self._a5_replace_command(base, command, template % command)
+                        self.assertNotIn(key, vm_gate_findings(degraded),
+                                         "a genuine %s next to %s must still invoke"
+                                         % (label, kind))
+
+    def _a6_rebullet_gate(self, base, number, bullet):
+        """Rewrite the gate's line-start bullets to an equivalent CommonMark marker + whitespace."""
+        section, block, _ = self._a6_layout(base, number)
+        self.assertIn("\n- ", block, "the base gate must carry '- ' bullets to rewrite")
+        swapped = "\n".join(bullet + line[2:] if line.startswith("- ") else line
+                            for line in block.splitlines())
+        return base.replace(section, section.replace(block, swapped, 1), 1)
+
+    def test_a6_control_equivalent_bullet_whitespace_stays_clean(self):
+        for base_name, base in self._a6_bases():
+            for number in (VM_GATE_DEPLOY_STEP, VM_GATE_PREFLIGHT_STEP):
+                for bullet in VM_GATE_A6_EQUIVALENT_BULLETS:
+                    with self.subTest(base=base_name, step=number, bullet=repr(bullet)):
+                        self.assertEqual(
+                            vm_gate_findings(self._a6_rebullet_gate(base, number, bullet)), [],
+                            "marker %r opens the same list, so step %d must stay clean"
+                            % (bullet, number))
+
+    def test_a6_control_finding_set_declares_the_action_identities(self):
+        self.assertEqual(len(VM_GATE_FINDING_KEYS), VM_GATE_A6_FINDING_KEY_COUNT,
+                         "A6 adds exactly the two reviewed action identities and retires nothing")
+        self.assertEqual(len(set(VM_GATE_FINDING_KEYS)), VM_GATE_A6_FINDING_KEY_COUNT)
+        self.assertIn(VM_GATE_A6_ACTION_KEYS[VM_GATE_DEPLOY_STEP], VM_GATE_FINDING_KEYS)
+        self.assertIn(VM_GATE_A6_ACTION_KEYS[VM_GATE_PREFLIGHT_STEP], VM_GATE_FINDING_KEYS)
+        self.assertIn(VM_GATE_A6_ACTION_KEYS[VM_GATE_DEPLOY_STEP], VM_GATE_DEPLOY_UNMET,
+                      "an unresolvable step-4 layout must report the action identity unmet")
+        self.assertIn(VM_GATE_A6_ACTION_KEYS[VM_GATE_PREFLIGHT_STEP], VM_GATE_PREFLIGHT_UNMET,
+                      "an unresolvable step-5 layout must report the action identity unmet")
+
+    def test_a6_control_fixture_and_runbook_share_one_action_authority(self):
+        """Both authorities must be measured against ONE reviewed action, not two paraphrases.
+
+        Stated as a property of the documents rather than by naming the repair's constants, so the
+        control is static, needs no dynamic namespace lookup, and reads the same before and after
+        the repair. Under A5 the fixture's action region was a loose miniature of the runbook's; an
+        action identity whose two consumers disagreed would make the control group meaningless in
+        exactly the way the A5 gate-block drift did.
+        """
+        for number in (VM_GATE_DEPLOY_STEP, VM_GATE_PREFLIGHT_STEP):
+            with self.subTest(step=number):
+                _, _, fixture_action = self._a6_layout(VM_GATE_A4_FIXTURE, number)
+                _, _, live_action = self._a6_layout(self.create_runbook, number)
+                self.assertEqual(fixture_action, live_action,
+                                 "step %d action must be one shared reviewed authority" % number)
 
 
 @unittest.skipIf(PS is None, "no PowerShell executable available")
