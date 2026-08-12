@@ -8,9 +8,10 @@ permanent production member-intake workflow (see
 "Future production member-intake workflow boundary").
 
 Everything ships inactive by default. Nothing here contacts the live AutoCount
-environment until the operator performs the explicit, separately approved write
-step on the AutoCount VM. No AutoCount write is performed by development, tests, or
-CI.
+environment before the separately approved step-5 no-write preflight, which runs on
+the AutoCount VM; that preflight may authenticate and read only, and it does not
+authorise `SaveMember`. No AutoCount write occurs before the separately approved
+step-7 write, and no AutoCount write is performed by development, tests, or CI.
 
 ## Components
 
@@ -1048,10 +1049,12 @@ sweep them either.
 - The host sync on `DESKTOP-Q43QKQF` in step 3 and the `SaveMember` write in step 7
   each require their own prior current-turn owner approval. Neither implies the other,
   and a prior-turn approval is never reusable for either.
-- The step-3 host sync, the step-4 VM deployment, the step-5 package transfer and
-  no-write preflight, and the step-7 `SaveMember` write are four independent approval
-  surfaces. Each requires its own current-turn owner approval, none implies or covers
-  another, and a prior-turn approval is never reusable for any of them.
+- The step-3 host sync, the step-4 VM deployment, the step-5 preflight surface (selected
+  private form/decision-row access, the reviewer-decision and approval-ledger operation,
+  the immutable package build, the AutoCount environment setup, the package transfer and
+  the no-write AutoCount preflight), and the step-7 `SaveMember` write are four
+  independent approval surfaces. Each requires its own current-turn owner approval, none
+  implies or covers another, and a prior-turn approval is never reusable for any of them.
 - Exactly one member is supported; there is no batch path, no update-member path, no
   delete, and no rollback automation.
 - SaveMember is called at most once and is never automatically retried. An uncertain

@@ -4461,6 +4461,11 @@ VM_GATE_PREFLIGHT_RUNNER_ANCHOR = r"& scripts\ac2_member_create_uat_runner.ps1 -
 # list, blockquote or container model -- A4 does not authorise one, and the accepted fenced-code
 # false positive PRRT_kwDOSbJI_s6YQTNF is left exactly as it was.
 VM_GATE_COMMENT_OPENERS = ("#", "//", "<!--")
+# A5 adds the PowerShell BLOCK comment. Its body is ordinary-looking command text on every line,
+# so a line-start test cannot see it, yet nothing inside it executes -- confirmed against the real
+# interpreter. Recognising the delimiters is a two-token text scan, not a PowerShell parser.
+VM_GATE_PS_BLOCK_OPEN = "<#"
+VM_GATE_PS_BLOCK_CLOSE = "#>"
 
 # The two argparse commands the gated step-5 build actually runs, VERBATIM and CASE-SENSITIVE.
 # Accepted finding PRRT_kwDOSbJI_s6YQTM4: the retired prefix digest folded case, so `--input`
@@ -4580,13 +4585,103 @@ VM_GATE_PREFLIGHT_SAVE_MEMBER = (
 
 # The Safety boundary must keep all four surfaces independent. These tokens are additive to the
 # #118 host-sync/write sentence, which stays exactly as it is.
+# A5 broadens the step-5 clause to what that surface actually covers. Accepted finding F-D: the
+# summary still called step 5 "package transfer and no-write preflight" after A4 moved the private
+# form/decision-row read, the reviewer-decision and ledger operation, the package build and the
+# environment setup inside the same approval, so summary and gate stated two different contracts.
 VM_GATE_SAFETY_TOKENS = (
-    "the step-3 host sync, the step-4 vm deployment, the step-5 package transfer and no-write "
-    "preflight, and the step-7 `savemember` write are four independent approval surfaces",
+    "the step-3 host sync, the step-4 vm deployment, the step-5 preflight surface (selected "
+    "private form/decision-row access, the reviewer-decision and approval-ledger operation, the "
+    "immutable package build, the autocount environment setup, the package transfer and the "
+    "no-write autocount preflight), and the step-7 `savemember` write are four independent "
+    "approval surfaces",
     "each requires its own current-turn owner approval",
     "none implies or covers another",
     "a prior-turn approval is never reusable for any of them",
 )
+
+# ---- A5: the reviewed gate blocks, verbatim ---- #
+# Accepted final-G4 finding F-A: polarity cannot be decided by vocabulary. "The current-turn owner
+# approval is optional." carries no word the negation list knows, and "This approval is optional."
+# never repeats the token the predicate scopes itself to, so neither is visible to it. Extending
+# the list only moves the boundary; the next reviewer writes "at the operator's discretion".
+#
+# Open-ended English cannot be classified. A BOUNDED REVIEWED BLOCK can be recognised. So A5 stops
+# trying to judge what a sentence means and requires the gate to still say what review approved it
+# saying: any added, removed or reworded clause -- contradictory or not, token-bearing or not --
+# changes the block and fails closed. These constants are the independent authority. They are
+# explicit and readable rather than a digest, so a reviewer can diff them by eye, and they are
+# written out here rather than derived from the runbook or the fixture, because authority derived
+# from the thing it is meant to constrain is not authority at all.
+VM_GATE_DEPLOY_REVIEWED_BLOCK = r"""**Separate current-turn owner approval required (deployment gate).** The instructions
+below change an external machine: they place reviewed files on the AutoCount VM
+`DESKTOP-4I042L6` and prepare a directory that the VM then owns. Before any of them,
+obtain an explicit current-turn owner approval that names the AutoCount VM
+(`DESKTOP-4I042L6`) and binds this exact deployment operation:
+
+- copying or replacing `scripts/ac2_member_create_uat_runner.ps1` on that VM;
+- copying or replacing `scripts/member_create_uat_runner_lib.ps1` on that VM;
+- copying or replacing `config/member_create_uat_business_confirmation.json` on that VM;
+- creating or preparing the VM-owned state directory `C:\XB\create_uat\state`.
+
+This approval is distinct and is **not** implied by any other gate:
+
+- the PR review and merge decision (step 2) does **not** authorise this deployment;
+- the physical-host sync approval (step 3) does **not** authorise this deployment;
+- the no-write preflight approval (step 5) does **not** authorise this deployment;
+- the separate current-turn write approval (step 7) does **not** authorise this deployment.
+
+A prior-turn approval is not reusable. This deployment approval authorises no runner
+execution, no AutoCount environment configuration and no AutoCount contact; running the
+runner, configuring the connection environment and reaching AutoCount are gated separately
+in step 5 and step 7. Without the named current-turn deployment approval, stop before
+copying or replacing files or creating or preparing state on the VM.
+
+"""
+
+VM_GATE_PREFLIGHT_REVIEWED_BLOCK = r"""**Separate current-turn owner approval required (preflight gate).** The whole of this step is
+gated. It reads the selected private form response and its decision row, mutates the local
+reviewer-decision store and the approval ledger, builds an immutable package, configures the
+AutoCount connection in the process environment, moves that package onto the AutoCount VM
+`DESKTOP-4I042L6`, and then authenticates to AutoCount and reads live data. Laptop locality does
+not waive the approval for the private-data work. Before any of it, obtain an explicit
+current-turn owner approval that names the AutoCount VM (`DESKTOP-4I042L6`) and binds:
+
+- the bounded access to the selected private form response and its decision row for this one
+  package, whose values are never written into this runbook;
+- the local reviewer-decision store and approval-ledger operations and the immutable package
+  build they produce;
+- the AutoCount process-environment configuration, by variable name only:
+  `AC2_PROBE_SERVER_NAME`, `AC2_PROBE_DATABASE_NAME`, `AC2_PROBE_USER_ID`, and the password
+  environment variable named by `-PasswordEnvVar`;
+- the intended AutoCount target (the server and database / account book), named in the approval
+  itself and never written into this runbook as a connection value or secret;
+- the bounded transfer of the approved package to that VM;
+- the no-write dry-run / preflight operation.
+
+This approval is distinct and is **not** implied by any other gate:
+
+- the PR review and merge decision (step 2) does **not** authorise this preflight;
+- the physical-host sync approval (step 3) does **not** authorise this preflight;
+- the VM deployment approval (step 4) does **not** authorise this preflight;
+- the separate current-turn write approval (step 7) does **not** authorise this preflight.
+
+A prior-turn approval is not reusable. The dry-run may authenticate, check the duplicate and
+construct the member in memory, but it does **not** authorise or call `SaveMember`; that write
+remains gated by step 7. Without the named current-turn preflight approval, stop before reading
+the private form response or decision row, before building the package, before setting the
+AutoCount environment, and before transferring the package to the VM or contacting AutoCount.
+
+"""
+
+VM_GATE_REVIEWED_BLOCKS = {
+    VM_GATE_DEPLOY_STEP: VM_GATE_DEPLOY_REVIEWED_BLOCK,
+    VM_GATE_PREFLIGHT_STEP: VM_GATE_PREFLIGHT_REVIEWED_BLOCK,
+}
+
+# CommonMark opens the same list with any of these, so #118 already treats the choice as syntax.
+# Gate identity must agree, or an editor normalising a list would read as a wording change.
+VM_GATE_BULLET_MARKERS = ("-", "*", "+")
 
 # Everything a resolved step must prove. When the structural layout CANNOT be resolved -- no
 # gate, two gates, no boundary, two boundaries, or a boundary before its gate -- the step is
@@ -4596,7 +4691,7 @@ VM_GATE_DEPLOY_UNMET = frozenset((
     "deploy_pre_gate_content", "deploy_vm_not_named", "deploy_operation_not_bound",
     "deploy_not_current_turn", "deploy_substitution_not_denied", "deploy_prior_turn_not_denied",
     "deploy_stop_boundary_missing", "deploy_execution_not_denied", "deploy_operation_missing",
-    "deploy_state_preparation_missing",
+    "deploy_state_preparation_missing", "deploy_gate_text_changed",
 ))
 # A4 replaces `preflight_prefix_changed` with the same structural rule step 4 already carries.
 # Once the gate moves to the top of the step there is nothing legitimate left in front of it, so
@@ -4612,15 +4707,20 @@ VM_GATE_PREFLIGHT_UNMET = frozenset((
     "preflight_approval_command_missing", "preflight_package_build_missing",
     "preflight_environment_setup_missing",
     "preflight_operation_missing", "preflight_runner_invocation_missing",
+    "preflight_gate_text_changed",
 ))
 
-# Every finding key this contract can report. A4 retires `preflight_prefix_changed` and adds
+# Every finding key this contract can report. A4 retired `preflight_prefix_changed` and added
 # eight: the step-5 blank pre-gate rule, the three new step-5 approval bindings, the three
 # post-gate operation-existence keys (package approval, package build, environment setup) and
-# safety-boundary ambiguity. 39 keys become 46.
+# safety-boundary ambiguity. 39 keys became 46. A5 adds the two reviewed gate-block identities and
+# retires nothing, so 46 become 48. No new command or safety-boundary key is introduced: F-B is
+# closed by holding the EXISTING four command keys to an honest standard, and F-D by correcting
+# the text `safety_boundary_not_four_way` already governs.
 VM_GATE_FINDING_KEYS = (
     "deploy_boundary_ambiguous", "deploy_boundary_missing", "deploy_execution_not_denied",
     "deploy_gate_after_mutation", "deploy_gate_marker_ambiguous", "deploy_gate_missing",
+    "deploy_gate_text_changed",
     "deploy_heading_changed", "deploy_not_current_turn", "deploy_operation_missing",
     "deploy_operation_not_bound",
     "deploy_pre_gate_content", "deploy_prior_turn_not_denied", "deploy_state_preparation_missing",
@@ -4630,7 +4730,8 @@ VM_GATE_FINDING_KEYS = (
     "preflight_boundary_missing",
     "preflight_dry_run_not_bound", "preflight_environment_not_bound",
     "preflight_environment_setup_missing", "preflight_gate_after_external_action",
-    "preflight_gate_marker_ambiguous", "preflight_gate_missing", "preflight_heading_changed",
+    "preflight_gate_marker_ambiguous", "preflight_gate_missing", "preflight_gate_text_changed",
+    "preflight_heading_changed",
     "preflight_not_current_turn",
     "preflight_operation_missing", "preflight_package_build_missing",
     "preflight_package_build_not_bound", "preflight_pre_gate_content",
@@ -4652,6 +4753,34 @@ def _semantic_heading(line):
     quietly defeat the strip.
     """
     return _flat(VM_GATE_ATX_CLOSING.sub("", line.strip()))
+
+
+def _semantic_gate_block(block):
+    """The RENDERED identity of a gate block, as a reviewer approved it. Pure text in, text out.
+
+    A5's answer to accepted finding F-A. Exactly two things are treated as syntax, both because
+    this contract already treats them that way everywhere else:
+
+    * ordinary whitespace, so a reflow or a CRLF checkout is not drift;
+    * the line-start CommonMark bullet marker, since `-`, `*` and `+` open the same list (#118).
+
+    Everything else is CONTENT. Case is preserved, punctuation is preserved, and no word is
+    dropped, because each of those would let contradictory prose compare equal to compliant prose
+    -- which is the defect this replaces, not a repair for it. Blank lines are dropped rather than
+    encoded, so paragraph regrouping is not drift either, while any added, removed or reworded
+    clause changes the result and fails closed.
+    """
+    lines = []
+    for line in block.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        for marker in VM_GATE_BULLET_MARKERS:
+            if stripped.startswith(marker + " "):
+                stripped = "- " + stripped[len(marker) + 1:]
+                break
+        lines.append(" ".join(stripped.split()))
+    return " ".join(lines)
 
 
 def _numbered_heading_openings(text):
@@ -4784,27 +4913,69 @@ def _resolve_gate_layout(section, marker, boundary, prefix, findings):
     return pre_gate, section[gate_line:boundary_at], section[boundary_at:]
 
 
-def _active_command_lines(region):
-    """The lines of ``region`` that could actually execute, whitespace-collapsed.
+def _executable_line_text(region):
+    """Each line of ``region`` with its comment content removed, whitespace-collapsed.
 
-    A required operation must be a live command, not a mention of one. Accepted finding
-    PRRT_kwDOSbJI_s6YQTM_ was exactly this: a commented-out
-    ``# & scripts\\ac2_member_create_uat_runner.ps1 -PackagePath ...`` still satisfied a substring
-    anchor taken over the whole flattened action region, so a runbook whose dry-run had been
-    disabled reported no findings at all.
+    A5's answer to accepted finding F-B. A4 discarded a line only when its FIRST non-space
+    characters opened a comment, which left three disabling forms untouched -- all three verified
+    against the real interpreters to produce no invocation at all:
 
-    Deliberately line-level and deliberately narrow. A line whose first non-space character opens
-    a comment cannot execute -- in PowerShell, in shell, or as an HTML comment in Markdown -- and
-    that is the entire test. This is NOT a fenced-code, list, blockquote or container model: A4
-    does not authorise one, and the accepted conservative false positive PRRT_kwDOSbJI_s6YQTNF is
-    left exactly as it was.
+    * a PowerShell ``<# ... #>`` block, whose body never runs even though every line inside it
+      begins with ordinary command text;
+    * an inline comment tail, ``Write-Host "disabled"; # & scripts\\...``, where the line executes
+      but the anchor sits entirely inside the comment;
+    * a quoted or echoed mention, ``Write-Host "& scripts\\..."``, which prints the command.
+
+    Deliberately a small, pure text scan and NOT a PowerShell parser. Block state carries across
+    lines, so a multiline block cannot smuggle an anchor back in, and the first surviving comment
+    opener truncates the remainder of the line. Truncating inside a quoted string that happens to
+    contain a comment character is FAIL-CLOSED: it can only take an operation away, never invent
+    one, so the conservative direction is also the safe one. A5 authorises no fenced-code, list or
+    blockquote model, and the accepted conservative false positive PRRT_kwDOSbJI_s6YQTNF is left
+    exactly as it was.
     """
-    return [_flat(line) for line in region.splitlines()
-            if line.strip() and not line.strip().startswith(VM_GATE_COMMENT_OPENERS)]
+    lines, in_block = [], False
+    for line in region.splitlines():
+        kept, rest = [], line
+        while rest:
+            if in_block:
+                close = rest.find(VM_GATE_PS_BLOCK_CLOSE)
+                if close == -1:
+                    break
+                rest, in_block = rest[close + len(VM_GATE_PS_BLOCK_CLOSE):], False
+                continue
+            block_at = rest.find(VM_GATE_PS_BLOCK_OPEN)
+            openers = [at for at in (rest.find(opener) for opener in VM_GATE_COMMENT_OPENERS)
+                       if at != -1]
+            line_at = min(openers) if openers else -1
+            # `<#` also contains `#`, so the block opener is resolved first whenever it starts at
+            # or before the earliest line-comment opener; otherwise the line comment wins.
+            if block_at != -1 and (line_at == -1 or block_at <= line_at):
+                kept.append(rest[:block_at])
+                rest, in_block = rest[block_at + len(VM_GATE_PS_BLOCK_OPEN):], True
+                continue
+            if line_at != -1:
+                kept.append(rest[:line_at])
+                break
+            kept.append(rest)
+            break
+        lines.append(_flat("".join(kept)))
+    return lines
+
+
+def _active_command_lines(region):
+    """The lines of ``region`` that could actually execute, whitespace-collapsed."""
+    return [line for line in _executable_line_text(region) if line]
 
 
 def _actively_invokes(region, anchor, fold_case=True):
-    """True when ``anchor`` occurs on a line of ``region`` that is not commented out.
+    """True when an executable line of ``region`` STARTS with ``anchor``.
+
+    Starting the line is the whole point of the A5 strengthening. A mention of a command is not the
+    command, and neither is a command that appears only part-way through a line which runs
+    something else: ``Write-Host "..."`` and ``echo "..."`` both leave the anchor present while
+    executing something entirely different. A genuine invocation still tolerates trailing comment
+    text, because the comment is removed before the comparison.
 
     ``fold_case`` follows the TOOL, not a house style. PowerShell parameter names really are
     case-insensitive, so folding there matches reality; ``member_create_uat_approval.py`` is
@@ -4812,7 +4983,7 @@ def _actively_invokes(region, anchor, fold_case=True):
     finding PRRT_kwDOSbJI_s6YQTM4 is what happens when the comparison is more permissive than the
     tool: ``--INPUT`` breaks the build while the guard stays clean.
     """
-    return any(anchor in (line.lower() if fold_case else line)
+    return any((line.lower() if fold_case else line).startswith(anchor)
                for line in _active_command_lines(region))
 
 
@@ -4881,6 +5052,13 @@ def _deployment_findings(text, findings):
     if pre_gate.strip():
         findings.add("deploy_pre_gate_content")
 
+    # A5: the gate must still say exactly what review approved it saying. This is the authoritative
+    # closure for open-ended optional/waiver/prohibition/advisory contradiction wording; the
+    # proposition checks below stay as defence in depth, because a document that fails identity
+    # should still report WHICH requirement it lost.
+    if _semantic_gate_block(block) != _semantic_gate_block(VM_GATE_DEPLOY_REVIEWED_BLOCK):
+        findings.add("deploy_gate_text_changed")
+
     # Gate propositions, judged ONLY inside the gate's own block.
     prose = _flat(block).lower()
     if VM_GATE_VM.lower() not in prose:
@@ -4929,6 +5107,10 @@ def _preflight_findings(text, findings):
     # case-folding finding PRRT_kwDOSbJI_s6YQTM4 disappears with the digest it was about.
     if pre_gate.strip():
         findings.add("preflight_pre_gate_content")
+
+    # A5 gate identity, exactly as step 4 carries it. See `_semantic_gate_block`.
+    if _semantic_gate_block(block) != _semantic_gate_block(VM_GATE_PREFLIGHT_REVIEWED_BLOCK):
+        findings.add("preflight_gate_text_changed")
 
     prose = _flat(block).lower()
     if VM_GATE_VM.lower() not in prose:
@@ -5207,32 +5389,15 @@ VM_GATE_A4_ENV_NAMES = VM_GATE_ENV_VARIABLE_NAMES
 # controls have to name a document the repaired checker must accept -- at this commit the
 # head-23ddf88 checker still rejects it, which is part of the RED evidence. Commit J promotes it
 # to THE canonical fixture, so these controls survive the repair unchanged.
-VM_GATE_A4_FIXTURE_STEP_4 = r"""### 4. Deploy the inactive UAT components
-
-**Separate current-turn owner approval required (deployment gate).** The instructions below
-change an external machine: they place reviewed files on the AutoCount VM `DESKTOP-4I042L6` and
-prepare a directory that the VM then owns. Before any of them, obtain an explicit current-turn
-owner approval that names the AutoCount VM (`DESKTOP-4I042L6`) and binds this exact deployment
-operation:
-
-- copying or replacing `scripts/ac2_member_create_uat_runner.ps1` on that VM;
-- copying or replacing `scripts/member_create_uat_runner_lib.ps1` on that VM;
-- copying or replacing `config/member_create_uat_business_confirmation.json` on that VM;
-- creating or preparing the VM-owned state directory `C:\XB\create_uat\state`.
-
-This approval is distinct and is **not** implied by any other gate:
-
-- the PR review and merge decision (step 2) does **not** authorise this deployment;
-- the physical-host sync approval (step 3) does **not** authorise this deployment;
-- the no-write preflight approval (step 5) does **not** authorise this deployment;
-- the separate current-turn write approval (step 7) does **not** authorise this deployment.
-
-A prior-turn approval is not reusable. This deployment approval authorises no runner execution,
-no AutoCount environment configuration and no AutoCount contact. Without the named current-turn
-deployment approval, stop before copying or replacing files or creating or preparing state on
-the VM.
-
-Copy the reviewed `scripts/ac2_member_create_uat_runner.ps1`,
+VM_GATE_A4_FIXTURE_STEP_4 = (
+    "### 4. Deploy the inactive UAT components\n\n"
+    # A5: the fixture's gate is now the reviewed constant itself, not a paraphrase of it. Under A4
+    # the two drifted -- the fixture dropped the "gated separately in step 5 and step 7" clause --
+    # which was harmless only because nothing compared them. Gate identity does compare them, and a
+    # fixture that could satisfy a DIFFERENT gate than the runbook would make the control group
+    # meaningless. The constant stays the single explicit authority; the fixture consumes it.
+    + VM_GATE_DEPLOY_REVIEWED_BLOCK
+    + r"""Copy the reviewed `scripts/ac2_member_create_uat_runner.ps1`,
 `scripts/member_create_uat_runner_lib.ps1`, and
 `config/member_create_uat_business_confirmation.json` to the AutoCount VM working area.
 
@@ -5242,44 +5407,12 @@ Copy the reviewed `scripts/ac2_member_create_uat_runner.ps1`,
 New-Item -ItemType Directory -Path "C:\XB\create_uat\state" -Force
 ```
 
-"""
+""")
 
-VM_GATE_A4_FIXTURE_STEP_5 = r"""### 5. No-write preflight (dry-run)
-
-**Separate current-turn owner approval required (preflight gate).** The whole of this step is
-gated. It reads the selected private form response and its decision row, mutates the local
-reviewer-decision store and the approval ledger, builds an immutable package, configures the
-AutoCount connection in the process environment, moves that package onto the AutoCount VM
-`DESKTOP-4I042L6`, and then authenticates to AutoCount and reads live data. Laptop locality does
-not waive the approval for the private-data work. Before any of it, obtain an explicit
-current-turn owner approval that names the AutoCount VM (`DESKTOP-4I042L6`) and binds:
-
-- the bounded access to the selected private form response and its decision row for this one
-  package, whose values are never written into this runbook;
-- the local reviewer-decision store and approval-ledger operations and the immutable package
-  build they produce;
-- the AutoCount process-environment configuration, by variable name only:
-  `AC2_PROBE_SERVER_NAME`, `AC2_PROBE_DATABASE_NAME`, `AC2_PROBE_USER_ID`, and the password
-  environment variable named by `-PasswordEnvVar`;
-- the intended AutoCount target (the server and database / account book), named in the approval
-  itself and never written into this runbook as a connection value or secret;
-- the bounded transfer of the approved package to that VM;
-- the no-write dry-run / preflight operation.
-
-This approval is distinct and is **not** implied by any other gate:
-
-- the PR review and merge decision (step 2) does **not** authorise this preflight;
-- the physical-host sync approval (step 3) does **not** authorise this preflight;
-- the VM deployment approval (step 4) does **not** authorise this preflight;
-- the separate current-turn write approval (step 7) does **not** authorise this preflight.
-
-A prior-turn approval is not reusable. The dry-run may authenticate, check the duplicate and
-construct the member in memory, but it does **not** authorise or call `SaveMember`; that write
-remains gated by step 7. Without the named current-turn preflight approval, stop before reading
-the private form response or decision row, before building the package, before setting the
-AutoCount environment, and before transferring the package to the VM or contacting AutoCount.
-
-**`LAPTOP DEVELOPMENT MACHINE`** Only after the preflight approval above, build the approved
+VM_GATE_A4_FIXTURE_STEP_5 = (
+    "### 5. No-write preflight (dry-run)\n\n"
+    + VM_GATE_PREFLIGHT_REVIEWED_BLOCK
+    + r"""**`LAPTOP DEVELOPMENT MACHINE`** Only after the preflight approval above, build the approved
 package on the laptop, using the decision-review output that shows the chosen row as
 `READY_FOR_CREATE_REVIEW`:
 
@@ -5313,11 +5446,13 @@ The runner prints and writes a sanitized aggregate result only.
 - The host sync on `DESKTOP-Q43QKQF` in step 3 and the `SaveMember` write in step 7
   each require their own prior current-turn owner approval. Neither implies the other,
   and a prior-turn approval is never reusable for either.
-- The step-3 host sync, the step-4 VM deployment, the step-5 package transfer and no-write
-  preflight, and the step-7 `SaveMember` write are four independent approval surfaces. Each
+- The step-3 host sync, the step-4 VM deployment, the step-5 preflight surface (selected private
+  form/decision-row access, the reviewer-decision and approval-ledger operation, the immutable
+  package build, the AutoCount environment setup, the package transfer and the no-write AutoCount
+  preflight), and the step-7 `SaveMember` write are four independent approval surfaces. Each
   requires its own current-turn owner approval, none implies or covers another, and a prior-turn
   approval is never reusable for any of them.
-"""
+""")
 
 VM_GATE_A4_FIXTURE = VM_GATE_A4_FIXTURE_STEP_4 + VM_GATE_A4_FIXTURE_STEP_5
 
@@ -6075,8 +6210,11 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
         self.assertIn("deploy_prior_turn_not_denied", vm_gate_findings(degraded))
 
     def test_control_removed_deployment_stop_boundary_is_detected(self):
+        # A5 re-points the quoted fragment at the reviewed gate wording the fixture now carries
+        # verbatim. The proposition under attack is unchanged: the gate must still say where to
+        # stop, and losing that sentence must still fail closed.
         degraded = self._degraded_deploy_gate(
-            "stop before copying or replacing files or creating or preparing state on\nthe VM.",
+            "stop before\ncopying or replacing files or creating or preparing state on the VM.",
             "proceed.")
         self.assertIn("deploy_stop_boundary_missing", vm_gate_findings(degraded))
 
@@ -6084,9 +6222,8 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
         # Layer 2 of the structural bound, on its own: the sentence is still in step 4 and still
         # verbatim, but it now sits after the copy instruction, where it can no longer stop it.
         section = _numbered_step_section(VM_GATE_CANONICAL_FIXTURE, VM_GATE_DEPLOY_STEP)
-        sentence = ("Without the named current-turn\n"
-                    "deployment approval, stop before copying or replacing files or creating or"
-                    " preparing state on\nthe VM.\n")
+        sentence = ("Without the named current-turn deployment approval, stop before\n"
+                    "copying or replacing files or creating or preparing state on the VM.\n")
         self.assertIn(sentence, section, "the fixture must carry the stop sentence verbatim")
         split = section.find(VM_GATE_DEPLOY_OPERATION_OPENING)
         mutated = section[:split].replace(sentence, "") + section[split:] + "\n" + sentence
@@ -6096,10 +6233,10 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
 
     def test_control_deployment_approval_extended_to_execution_or_autocount_is_detected(self):
         degraded = self._degraded_deploy_gate(
-            "This deployment approval authorises no runner execution,\n"
-            "no AutoCount environment configuration and no AutoCount contact.",
+            "This deployment approval authorises no runner\n"
+            "execution, no AutoCount environment configuration and no AutoCount contact;",
             "This deployment approval also authorises running the runner, configuring the"
-            " AutoCount environment and contacting AutoCount.")
+            " AutoCount environment and contacting AutoCount;")
         self.assertIn("deploy_execution_not_denied", vm_gate_findings(degraded))
 
     # -- Step-5 preflight gate controls -- #
