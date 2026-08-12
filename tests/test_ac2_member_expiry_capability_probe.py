@@ -5352,6 +5352,124 @@ VM_GATE_A4_POLARITY_INVERSIONS = (
 )
 
 
+# ---- DL-XB-123-001-A5: post-A4 final-G4 remediation controls ---- #
+# Fresh final Gate 4 accepted three false cleans at exact J, each demonstrated rather than argued:
+#
+#   F-A  ``_approval_is_affirmative`` proves a bounded NEGATION vocabulary, and only inside clauses
+#        that repeat the literal token. "The current-turn owner approval is optional." keeps every
+#        tested token while carrying no word that vocabulary knows, and a bare "This approval is
+#        optional." is never inspected at all because it does not repeat the token. Both gates.
+#   F-B  a required operation is proved by substring over the surviving lines, and a line is
+#        discarded only when its FIRST non-space characters open a comment. A PowerShell
+#        ``<# ... #>`` block, an inline-comment tail after another command, and a quoted, echoed or
+#        prose mention therefore satisfy an operation that demonstrably does not execute -- the
+#        same class as accepted finding PRRT_kwDOSbJI_s6YQTM_, in the forms it did not reach.
+#   F-C  the introduction claims live AutoCount is not contacted until the write step, while step 5
+#        authenticates to AutoCount and reads live data under its own separate no-write approval.
+#
+# F-D is the adjacent summary debt: the four-surface Safety boundary still describes step 5 as
+# package transfer plus no-write preflight only, which under-states the scope A4 broadened.
+#
+# A5 closes F-A by reviewed GATE-BLOCK IDENTITY rather than by a longer synonym list -- open-ended
+# English cannot be classified, but a bounded reviewed block can be recognised -- and F-B by
+# requiring a command to START a real executable line after syntax-appropriate comment handling.
+# Every control below names that contract, and at this commit every one of them is RED.
+
+# The reviewed sentence both gates end on. Injecting beside it keeps the contradiction inside the
+# bounded gate block while leaving the reviewed affirmative clause completely untouched, which is
+# what makes these controls about POLARITY rather than about a broken affirmative.
+VM_GATE_A5_GATE_ANCHOR = "A prior-turn approval is not reusable."
+
+# The first three never repeat the literal approval token -- precisely why a token-scoped predicate
+# cannot see them. The rest do repeat it, but carry no word the negation vocabulary knows.
+VM_GATE_A5_GATE_CONTRADICTIONS = (
+    ("bare_optional", "This approval is optional."),
+    ("bare_proceed_without", "You may proceed without it."),
+    ("bare_may_be_skipped", "This approval may be skipped."),
+    ("token_optional", "The current-turn owner approval is optional."),
+    ("token_may_be_skipped", "The current-turn owner approval may be skipped."),
+    ("token_waived", "The current-turn owner approval is waived."),
+    ("token_prohibited", "The current-turn owner approval is prohibited."),
+    ("token_discouraged", "The current-turn owner approval is discouraged."),
+    ("token_advisory", "The current-turn owner approval is advisory only."),
+    ("token_omittable", "The current-turn owner approval is recommended but may be omitted."),
+    ("token_discretion",
+     "Obtaining the current-turn owner approval is at the operator's discretion."),
+)
+# Where the contradiction lands. A reviewer edit is as likely to arrive as a trailing clause or a
+# new list item as a new sentence, and CommonMark accepts all three bullet markers.
+VM_GATE_A5_CONTRADICTION_PLACEMENTS = ("sentence", "semicolon",
+                                       "bullet_dash", "bullet_star", "bullet_plus")
+
+# The four required command authorities, with the finding each must report when the command is
+# present as text but cannot run. No new command finding key is authorised: these are the existing
+# four, held to a stricter and honest standard.
+VM_GATE_A5_RUNNER_LINE = (
+    r'& scripts\ac2_member_create_uat_runner.ps1'
+    r' -PackagePath "C:\XB\create_uat\member_create_uat_package.json"'
+    r' -StateDir "C:\XB\create_uat\state"'
+    r' -JsonOut "C:\XB\create_uat\member_create_uat_result.json"')
+VM_GATE_A5_NEW_ITEM_LINE = r'New-Item -ItemType Directory -Path "C:\XB\create_uat\state" -Force'
+VM_GATE_A5_POWERSHELL_OPERATIONS = (
+    ("step-4 state preparation", VM_GATE_A5_NEW_ITEM_LINE, "deploy_state_preparation_missing"),
+    ("step-5 dry-run runner", VM_GATE_A5_RUNNER_LINE, "preflight_runner_invocation_missing"),
+)
+VM_GATE_A5_SHELL_OPERATIONS = (
+    ("step-5 package approval", VM_GATE_PREFLIGHT_APPROVE_COMMAND,
+     "preflight_approval_command_missing"),
+    ("step-5 package build", VM_GATE_PREFLIGHT_BUILD_COMMAND, "preflight_package_build_missing"),
+)
+
+# Each template leaves the full anchor in the document while the command demonstrably does not
+# run. The PowerShell and shell semantics were verified against the real interpreters, not assumed:
+# a block-comment body, an inline-comment tail and a quoted mention all produce no invocation.
+VM_GATE_A5_POWERSHELL_SPOOFS = (
+    ("line_comment", "# %s"),
+    ("indented_line_comment", "    # %s"),
+    ("block_comment", "<#\n%s\n#>"),
+    ("inline_comment_tail", 'Write-Host "disabled"; # %s'),
+    ("quoted_mention", 'Write-Host "%s"'),
+    ("prose_mention", "The operator may run %s by hand."),
+)
+VM_GATE_A5_SHELL_SPOOFS = (
+    ("line_comment", "# %s"),
+    ("indented_line_comment", "    # %s"),
+    ("inline_comment_tail", "echo disabled  # %s"),
+    ("quoted_mention", 'echo "%s"'),
+    ("prose_mention", "Run %s manually."),
+)
+# The other half of the contract. A command that genuinely STARTS the executable line stays valid
+# even when harmless comment text follows it, so the repair cannot degenerate into "any line
+# mentioning # is inert", which would be a false guard rather than a stronger one.
+VM_GATE_A5_TRAILING_COMMENT = "%s  # keep this note"
+
+# F-C. The introduction is operator-facing authority in its own right: an owner who reads it and
+# then approves step 5 must not have been told step 5 stays off the live system.
+VM_GATE_A5_INTRO_REQUIRED = (
+    "Nothing here contacts the live AutoCount environment before the separately approved step-5"
+    " no-write preflight",
+    "that preflight may authenticate and read only, and it does not authorise `SaveMember`",
+    "No AutoCount write occurs before the separately approved step-7 write",
+    "no AutoCount write is performed by development, tests, or CI",
+)
+VM_GATE_A5_INTRO_FORBIDDEN = (
+    "Nothing here contacts the live AutoCount environment until the operator performs the"
+    " explicit, separately approved write step on the AutoCount VM",
+)
+
+# F-D. The four-surface summary must describe what the step-5 surface actually covers, in the same
+# terms the step-5 gate binds, so summary and gate cannot drift into two different contracts.
+VM_GATE_A5_SAFETY_STEP5_SCOPE = (
+    "the step-5 preflight surface",
+    "selected private form/decision-row access",
+    "the reviewer-decision and approval-ledger operation",
+    "the immutable package build",
+    "the AutoCount environment setup",
+    "the package transfer",
+    "the no-write AutoCount preflight",
+)
+
+
 class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
     def setUp(self):
         self.runbook = read_repo_text("probe_runbook")
@@ -6965,6 +7083,196 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                         base, section, section.replace(fragment, "other matters", 1))
                     self.assertIn(key, vm_gate_findings(degraded),
                                   "a lost %s binding must fail closed" % key)
+
+    # ---- DL-XB-123-001-A5: reviewed gate-block identity and executable command authority ---- #
+    # Exercised against BOTH authorities, exactly as the A4 controls are. At this commit neither
+    # satisfies the A5 contract -- the checker still proves polarity by vocabulary and operations
+    # by substring, and the runbook still carries the contradictory introduction and the
+    # under-described four-surface summary -- so these are the intentional RED.
+    def _a5_bases(self):
+        return (("A4 target fixture", VM_GATE_A4_FIXTURE),
+                ("live create-UAT runbook", self.create_runbook))
+
+    def _a5_gate_bounds(self, base, number, marker, boundary):
+        """The step section plus the gate block's own offsets, taken from the checker's landmarks.
+
+        Deliberately re-derived from the same marker and action boundary ``_resolve_gate_layout``
+        uses rather than from a private copy of the prose: a control that carved its own slice
+        could keep passing after the checker's bound had moved away from it.
+        """
+        section = _numbered_step_section(base, number)
+        self.assertNotEqual(section, "", "step %d must exist in the base document" % number)
+        at = section.find(marker)
+        self.assertNotEqual(at, -1, "the %r gate marker must exist" % (marker,))
+        start = section.rfind("\n", 0, at) + 1
+        end = section.find(boundary)
+        self.assertGreater(end, start,
+                           "the %r action boundary must follow the gate" % (boundary,))
+        return section, start, end
+
+    def _a5_contradict_gate(self, base, number, marker, boundary, sentence, placement):
+        """Add one contradictory clause INSIDE the gate block, leaving everything else alone.
+
+        The reviewed affirmative clause is asserted to survive, so a finding can only come from the
+        contradiction itself and never from having broken the requirement sentence.
+        """
+        section, start, end = self._a5_gate_bounds(base, number, marker, boundary)
+        block = section[start:end]
+        self.assertIn(VM_GATE_A5_GATE_ANCHOR, block,
+                      "the gate must carry the reviewed prior-turn sentence")
+        if placement == "sentence":
+            injected = "%s %s" % (VM_GATE_A5_GATE_ANCHOR, sentence)
+        elif placement == "semicolon":
+            injected = "%s; %s%s" % (VM_GATE_A5_GATE_ANCHOR[:-1], sentence[0].lower(), sentence[1:])
+        else:
+            marker_char = {"bullet_dash": "-", "bullet_star": "*", "bullet_plus": "+"}[placement]
+            injected = "%s\n\n%s %s\n" % (VM_GATE_A5_GATE_ANCHOR, marker_char, sentence)
+        mutated = block.replace(VM_GATE_A5_GATE_ANCHOR, injected, 1)
+        self.assertNotEqual(mutated, block, "the gate block must actually change")
+        self.assertIn(VM_GATE_A4_AFFIRMED_CLAUSE, _flat(mutated),
+                      "the control must leave the reviewed affirmative clause intact")
+        degraded = base.replace(section, section[:start] + mutated + section[end:], 1)
+        self.assertNotEqual(degraded, base, "the degraded document must actually differ")
+        return degraded
+
+    def test_a5_control_contradicted_deployment_gate_fails_closed(self):
+        for base_name, base in self._a5_bases():
+            for kind, sentence in VM_GATE_A5_GATE_CONTRADICTIONS:
+                for placement in VM_GATE_A5_CONTRADICTION_PLACEMENTS:
+                    with self.subTest(base=base_name, contradiction=kind, placement=placement):
+                        degraded = self._a5_contradict_gate(
+                            base, VM_GATE_DEPLOY_STEP, VM_GATE_DEPLOY_MARKER,
+                            VM_GATE_DEPLOY_BOUNDARY, sentence, placement)
+                        self.assertIn("deploy_gate_text_changed", vm_gate_findings(degraded),
+                                      "a contradicted step-4 gate (%s/%s) must fail closed"
+                                      % (kind, placement))
+
+    def test_a5_control_contradicted_preflight_gate_fails_closed(self):
+        for base_name, base in self._a5_bases():
+            for kind, sentence in VM_GATE_A5_GATE_CONTRADICTIONS:
+                for placement in VM_GATE_A5_CONTRADICTION_PLACEMENTS:
+                    with self.subTest(base=base_name, contradiction=kind, placement=placement):
+                        degraded = self._a5_contradict_gate(
+                            base, VM_GATE_PREFLIGHT_STEP, VM_GATE_PREFLIGHT_MARKER,
+                            VM_GATE_PREFLIGHT_BOUNDARY, sentence, placement)
+                        self.assertIn("preflight_gate_text_changed", vm_gate_findings(degraded),
+                                      "a contradicted step-5 gate (%s/%s) must fail closed"
+                                      % (kind, placement))
+
+    def _a5_reflow_gate(self, base, number, marker, boundary):
+        """Rewrap every gate paragraph onto one line: syntax only, not one substantive word."""
+        section, start, end = self._a5_gate_bounds(base, number, marker, boundary)
+        block = section[start:end]
+        reflowed = "\n\n".join(" ".join(part.split())
+                               for part in block.split("\n\n") if part.strip())
+        self.assertNotEqual(reflowed, block, "the reflow must actually change the source text")
+        return base.replace(section, section[:start] + reflowed + "\n\n" + section[end:], 1)
+
+    def _a5_rebullet_gate(self, base, number, marker, boundary, bullet):
+        """Rewrite the gate's line-start CommonMark bullets, which is pure syntax under #118."""
+        section, start, end = self._a5_gate_bounds(base, number, marker, boundary)
+        block = section[start:end]
+        swapped = "\n".join(bullet + line[1:] if line.startswith("- ") else line
+                            for line in block.splitlines())
+        self.assertNotEqual(swapped, block, "the base gate must carry '-' bullets to rewrite")
+        return base.replace(section, section[:start] + swapped + section[end:], 1)
+
+    def test_a5_reflowed_gate_blocks_remain_clean(self):
+        # Whitespace is non-material everywhere else in this contract, so gate identity must not
+        # fire on ordinary Markdown reflow. A guard that punishes rewrapping invites being removed.
+        for base_name, base in self._a5_bases():
+            for number, marker, boundary in (
+                    (VM_GATE_DEPLOY_STEP, VM_GATE_DEPLOY_MARKER, VM_GATE_DEPLOY_BOUNDARY),
+                    (VM_GATE_PREFLIGHT_STEP, VM_GATE_PREFLIGHT_MARKER,
+                     VM_GATE_PREFLIGHT_BOUNDARY)):
+                with self.subTest(base=base_name, step=number):
+                    self.assertEqual(
+                        vm_gate_findings(self._a5_reflow_gate(base, number, marker, boundary)), [],
+                        "an ordinary reflow of the step-%d gate must stay clean" % number)
+
+    def test_a5_rebulleted_gate_blocks_remain_clean(self):
+        # The #118 CommonMark equivalence, preserved: '-', '*' and '+' open the same list.
+        for base_name, base in self._a5_bases():
+            for bullet in ("*", "+"):
+                for number, marker, boundary in (
+                        (VM_GATE_DEPLOY_STEP, VM_GATE_DEPLOY_MARKER, VM_GATE_DEPLOY_BOUNDARY),
+                        (VM_GATE_PREFLIGHT_STEP, VM_GATE_PREFLIGHT_MARKER,
+                         VM_GATE_PREFLIGHT_BOUNDARY)):
+                    with self.subTest(base=base_name, bullet=bullet, step=number):
+                        self.assertEqual(
+                            vm_gate_findings(
+                                self._a5_rebullet_gate(base, number, marker, boundary, bullet)), [],
+                            "'%s' gate bullets must stay clean at step %d" % (bullet, number))
+
+    # -- B. A required operation must START a real executable line. Accepted F-B. -- #
+    def _a5_replace_command(self, base, command, replacement):
+        self.assertEqual(base.count(command), 1,
+                         "the base must carry exactly one %r" % (command[:56],))
+        degraded = base.replace(command, replacement, 1)
+        self.assertNotEqual(degraded, base, "the degraded document must actually differ")
+        self.assertIn(command, degraded,
+                      "the control must leave the anchor text present but non-executing")
+        return degraded
+
+    def test_a5_control_non_executing_powershell_commands_fail_closed(self):
+        for base_name, base in self._a5_bases():
+            for label, command, key in VM_GATE_A5_POWERSHELL_OPERATIONS:
+                for kind, template in VM_GATE_A5_POWERSHELL_SPOOFS:
+                    with self.subTest(base=base_name, operation=label, spoof=kind):
+                        degraded = self._a5_replace_command(base, command, template % command)
+                        self.assertIn(key, vm_gate_findings(degraded),
+                                      "a %s as %s must not satisfy %s" % (label, kind, key))
+
+    def test_a5_control_non_executing_shell_commands_fail_closed(self):
+        for base_name, base in self._a5_bases():
+            for label, command, key in VM_GATE_A5_SHELL_OPERATIONS:
+                for kind, template in VM_GATE_A5_SHELL_SPOOFS:
+                    with self.subTest(base=base_name, operation=label, spoof=kind):
+                        degraded = self._a5_replace_command(base, command, template % command)
+                        self.assertIn(key, vm_gate_findings(degraded),
+                                      "a %s as %s must not satisfy %s" % (label, kind, key))
+
+    def test_a5_genuine_commands_with_trailing_comments_remain_valid(self):
+        # The positive half: a real invocation followed by harmless comment text still invokes.
+        operations = VM_GATE_A5_POWERSHELL_OPERATIONS + VM_GATE_A5_SHELL_OPERATIONS
+        for base_name, base in self._a5_bases():
+            for label, command, key in operations:
+                with self.subTest(base=base_name, operation=label):
+                    degraded = self._a5_replace_command(
+                        base, command, VM_GATE_A5_TRAILING_COMMENT % command)
+                    self.assertNotIn(key, vm_gate_findings(degraded),
+                                     "a genuine %s with a trailing comment must stay valid" % label)
+
+    # -- C. The introduction must not contradict the step-5 live-contact boundary. Accepted F-C. --
+    def _a5_runbook_intro(self):
+        at = self.create_runbook.find("\n## Components")
+        self.assertNotEqual(at, -1, "the runbook must carry a Components section")
+        return _flat(self.create_runbook[:at])
+
+    def test_a5_control_introduction_states_truthful_live_contact_boundary(self):
+        intro = self._a5_runbook_intro()
+        for phrase in VM_GATE_A5_INTRO_REQUIRED:
+            with self.subTest(required=phrase[:56]):
+                self.assertIn(_flat(phrase), intro,
+                              "the introduction must state %r" % (phrase[:56],))
+        for phrase in VM_GATE_A5_INTRO_FORBIDDEN:
+            with self.subTest(forbidden=phrase[:56]):
+                self.assertNotIn(_flat(phrase), intro,
+                                 "the introduction must not claim %r" % (phrase[:56],))
+
+    # -- D. The four-surface summary must describe the broadened step-5 scope. Accepted F-D. -- #
+    def _a5_safety_section(self):
+        at = self.create_runbook.find(VM_GATE_SAFETY_HEADING)
+        self.assertNotEqual(at, -1, "the runbook must carry a Safety boundary")
+        end = self.create_runbook.find("\n## ", at + 1)
+        return _flat(self.create_runbook[at:end] if end != -1 else self.create_runbook[at:])
+
+    def test_a5_control_safety_boundary_states_full_step5_scope(self):
+        section = self._a5_safety_section()
+        for phrase in VM_GATE_A5_SAFETY_STEP5_SCOPE:
+            with self.subTest(scope=phrase):
+                self.assertIn(phrase, section,
+                              "the four-surface summary must name %r" % (phrase,))
 
     def test_readme_references_probe_and_runbook(self):
         self.assertIn("scripts/ac2_member_expiry_capability_probe.ps1", self.readme)
