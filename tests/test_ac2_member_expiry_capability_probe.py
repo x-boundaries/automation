@@ -4467,6 +4467,29 @@ VM_GATE_COMMENT_OPENERS = ("#", "//", "<!--")
 VM_GATE_PS_BLOCK_OPEN = "<#"
 VM_GATE_PS_BLOCK_CLOSE = "#>"
 
+# A6 adds the two standard multiline-DATA constructs, both accepted final-G4 false cleans. Every
+# line of a here-string or heredoc body is ordinary-looking command text, and a line-start test
+# cannot see the difference, yet nothing inside either one executes. Both were verified against the
+# real interpreters rather than assumed:
+#
+#   * PowerShell -- `@' ... '@` and `@" ... "@` bodies are emitted as DATA. The terminator must
+#     begin the line ("White space is not allowed before the string terminator" is a parse error),
+#     and an unterminated opener is itself a parse error, so a script that never closes one cannot
+#     run at all. The opener must end its line.
+#   * bash -- `<<WORD`, `<<'WORD'`, `<<"WORD"` and `<<-WORD` bodies are printed or consumed as
+#     input, never run. `<<-` strips leading TABS from the body and the delimiter line.
+#
+# Recognising the delimiters is a bounded lexical scan, NOT a PowerShell or Bash parser. The
+# delimiter grammar is deliberately narrow (an ordinary identifier, optionally quoted); anything
+# outside it is simply not recognised, which leaves the existing behaviour rather than guessing.
+VM_GATE_PS_HERE_STRING_OPENERS = (("@'", "'@"), ('@"', '"@'))
+# The delimiter word accepts digits anywhere, including first. An independent post-repair attack
+# found `<<9EOF` -- a perfectly ordinary bash delimiter -- slipping past an identifier-shaped
+# grammar and re-opening exactly the A6-F3 false clean, so the class is closed rather than the one
+# spelling that was controlled. Still deliberately narrow: `<<<` (a bash here-string, not a
+# heredoc) does not match, and neither does anything that is not a bare or simply-quoted word.
+VM_GATE_SHELL_HEREDOC_OPENER = re.compile(r"<<(-?)[ \t]*(['\"]?)([A-Za-z0-9_]+)\2")
+
 # The two argparse commands the gated step-5 build actually runs, VERBATIM and CASE-SENSITIVE.
 # Accepted finding PRRT_kwDOSbJI_s6YQTM4: the retired prefix digest folded case, so `--input`
 # becoming `--INPUT` left it unchanged even though `member_create_uat_approval.py` is argparse and
@@ -4679,6 +4702,764 @@ VM_GATE_REVIEWED_BLOCKS = {
     VM_GATE_PREFLIGHT_STEP: VM_GATE_PREFLIGHT_REVIEWED_BLOCK,
 }
 
+# ---- A6: the reviewed ACTION regions, verbatim ---- #
+# Accepted final-G4 finding A6-F1: the reviewed gate block above is bounded by the step's action
+# boundary, so it cannot see one word after it. "The approval above is optional once these commands
+# are reached." placed in the action region revokes the approval the gate just required, directly
+# above the command it governs, and every other check still passes -- the propositions live inside
+# the gate, and the operation checks only ask whether the commands are present.
+#
+# The answer is the one A5 already proved works, applied to the region A5 left unguarded: recognise
+# the reviewed text instead of classifying English. These constants are the independent authority
+# for everything AFTER each gate, exactly as VM_GATE_*_REVIEWED_BLOCK is for the gate itself. They
+# are explicit and readable rather than a digest so a reviewer can diff them by eye, and they are
+# written out here rather than derived from the runbook or the fixture, because authority derived
+# from the thing it is meant to constrain is not authority at all.
+#
+# The consequence is deliberate and worth stating plainly: the complete post-gate procedure of both
+# steps is now frozen against this source. Any substantive edit to step-4 or step-5 operational
+# prose -- including a legitimate one -- fails closed until a reviewer updates the constant in the
+# same change. Fresh G4 asked for fail-closed strictness over a permissive action normaliser, and
+# that is the trade this makes.
+
+VM_GATE_DEPLOY_REVIEWED_ACTION = r"""Copy the reviewed `scripts/ac2_member_create_uat_runner.ps1`,
+`scripts/member_create_uat_runner_lib.ps1`, and
+`config/member_create_uat_business_confirmation.json` to the AutoCount VM working
+area. Create the VM-owned state directory once (an operator prerequisite; the runner
+never creates it):
+
+**`AUTOCOUNT VM — DESKTOP-4I042L6`**
+
+```powershell
+New-Item -ItemType Directory -Path "C:\XB\create_uat\state" -Force
+```
+
+"""
+
+VM_GATE_PREFLIGHT_REVIEWED_ACTION = r"""**`LAPTOP DEVELOPMENT MACHINE`** Only after the preflight approval above, build the approved
+package on the laptop, using the decision-review output that shows the chosen row as
+`READY_FOR_CREATE_REVIEW`:
+
+```bash
+python scripts/member_create_uat_approval.py approve --reviewer <handle> --input <form.csv> --decision-rows <member_intake_decision_rows.csv> --row-number <N> --ledger <ledger.jsonl>
+```
+
+```bash
+python scripts/member_create_uat_approval.py build-package --input <form.csv> --decision-rows <member_intake_decision_rows.csv> --row-number <N> --ledger <ledger.jsonl> --package-out <member_create_uat_package_v2.json>
+```
+
+Use a fresh, version-distinct `--package-out` filename (for example
+`member_create_uat_package_v2.json`). The build is strictly **no-clobber**: it refuses
+fail-closed if the output path already exists as any filesystem object (file, directory,
+symlink/reparse point), never deletes, truncates, renames, or overwrites it, and appends
+no build ledger event on a collision. **One approval builds exactly one package.**
+`--rebuild` is **retired and always refused** (see the terminal reservation rule below); a
+further package requires a fresh reviewer decision, a new approval id and a fresh output
+pathname. Any package built under the previous `member_create_uat_package/v1` contract,
+and its hash, are preserved as historical evidence and remain non-executable under the
+`v2` runner (the runner refuses the unrecognised schema version). Because the `v2` schema
+bump changes both `source_record_id` and `source_fingerprint` (each binds the schema
+version), a fresh reviewer decision is mechanically required; a `v1` decision or build
+cannot mint a `v2` package.
+
+Set the AutoCount connection through the process environment only (never in files, never in
+this runbook): `AC2_PROBE_SERVER_NAME`, `AC2_PROBE_DATABASE_NAME`, `AC2_PROBE_USER_ID`, and
+the password environment variable named by `-PasswordEnvVar`.
+
+**`AUTOCOUNT VM — DESKTOP-4I042L6`** Under the same preflight approval, copy the
+approved package to the VM and run the runner in dry-run mode (the default; no write
+switches). Dry-run authenticates, checks the duplicate, constructs the new member,
+assigns only the whitelisted fields, and stops without SaveMember. The build authority
+below governs which package may be transferred at all.
+
+#### Transactional reviewer-decision authority (SQLite) — JSONL is audit-only
+
+Reviewer **authority** lives in a private, git-ignored, append-only SQLite database beside
+the approval ledger:
+
+`member_create_uat_decisions.sqlite3`
+
+Its legitimate private runtime companions (`-journal`, `-wal`, `-shm`) are git-ignored by
+exact name. The store holds **sanitised decision metadata only** — decision sequence,
+decision id, decision type, reviewer handle, timestamps, approval id, source record id,
+source fingerprint, schema version and a canonical record hash. It contains no member
+number, name, mobile number, email address, birthday, credential or absolute path.
+
+**Why this exists.** `append_ledger` writes the complete JSON line *before* `flush()` and
+`os.fsync()` return, so a real persistence failure can leave a complete, perfectly readable
+`approved` line on disk even though the command reported failure and durability was never
+confirmed. A later process read that line back and could reserve and publish a package from
+an approval that was never durably granted. Chaining more marker files cannot fix this —
+each new file needs its own acknowledgement, indefinitely — so the decision boundary moved
+inside a real transaction.
+
+> **The JSONL approval ledger is an append-only AUDIT RECORD ONLY. It never grants
+> package-building authority.** A decision authorises a package only when a committed
+> **activation row** exists for it in the decision store.
+
+**Schema (`member_create_uat_decisions/v2`).** Three append-only history tables, one singleton
+admission table, plus schema metadata: `store_admission` (the store's own operational authority —
+see below), `decision` (every approve, reject and hold attempt, with one shared monotonic
+`sequence`), `decision_activation` (the decisions that became authoritative) and `build_claim`
+(the single exclusive authorisation to build one package — see below). `UPDATE` and `DELETE`
+are rejected on all four by database triggers, so even a direct `sqlite3` session cannot
+rewrite or erase history or admission. Durability settings: `journal_mode=DELETE`,
+`synchronous=FULL`, `foreign_keys=ON`, explicit `BEGIN IMMEDIATE` transactions and a bounded
+busy timeout.
+
+### Store admission: the store's own operational authority (Amendment 9)
+
+Through Amendment 8, a decision store was operational because it *existed and looked canonical*.
+That is unsound in exactly the same shape as the JSONL defect it replaced. First-use creation
+publishes the completed store and only then proves its durability; if the process dies, the
+durability step fails, or the final acknowledgement is never heard, a **complete, perfectly
+readable, correctly versioned, singly linked, sidecar-free canonical store** is left on disk. The
+next process could not tell it apart from a fully proven one, so publication uncertainty was not
+sticky: it lasted only as long as the process that discovered it.
+
+> **A readable canonical file is never authority.** The store is operational only while it holds
+> the exact canonical **admission row** in `store_admission`, bound to the file now at that path.
+> Absence of that row is the durable blocking state, and it survives restart, reboot and any
+> number of later invocations.
+
+`store_admission` is append-only and mechanically **singleton**: `singleton INTEGER PRIMARY KEY
+CHECK (singleton = 1)`, so the primary key refuses a second row and the `CHECK` refuses any other
+key. `BEFORE UPDATE` and `BEFORE DELETE` triggers abort. There is no mutable "admitted" flag. The
+row binds:
+
+| Field | Meaning |
+| --- | --- |
+| `admission_id` | `adm_` + 32 hex; unique |
+| `operation_id` | `sop_` + 32 hex; the creation or reconciliation operation, unique |
+| `admission_mode` | closed enum: `created` or `reconciled` |
+| `admitted_at` | aware ISO-8601 instant (a naive value is an invalid admission) |
+| `schema_version` | must equal `member_create_uat_decisions/v2` |
+| `durability` | closed enum naming the primitive **actually confirmed** before admission |
+| `volume_identity` | normalised `dev:<hex>` device/volume id of the published file |
+| `file_identity` | normalised `ino:<hex>` inode / file index of the published file |
+| `record_hash` | canonical SHA-256 over **every** field above |
+
+The identity fields are **mismatch detectors, not cryptographic proof of provenance**. They
+detect that the file now at the path is not the file admission was written against — the ordinary
+replacement case in the supported threat model. A current mismatch fails closed.
+
+Admission is written **last**, in its own `BEGIN IMMEDIATE` transaction under `synchronous=FULL`,
+after publication and after the platform's durability primitive is confirmed. A raised `COMMIT` is
+resolved the same way every other commit in this tool is resolved — by closing, reopening through
+pure triage, and looking for the exact row and hash — never by inferring from the exception, and
+never with an automatic retry.
+
+**Two explicit validation modes, and no circular trust.** These are separate functions, not a
+flag a caller could forget:
+
+| Mode | Used by | Admission cardinality required |
+| --- | --- | --- |
+| Structural zero-admission (**internal only**) | a newly created operation-owned temporary; a just-published store before its first admission; controlled reconciliation; admission-COMMIT recovery | exactly **zero** (recovery alone may see zero *or* one) |
+| Operational one-admission | reviewer decisions, authority reads, build preflight, build claim, decision-sequence reads, and all three of decision / activation / claim COMMIT recovery | exactly **one**, with valid mode, aware instant, exact version, allowed durability primitive, correct canonical hash and a matching current identity binding |
+
+Both modes run the complete global validator first. Ordinary code can never reach the
+zero-admission mode. Nothing about file readability, a valid SQLite header, the canonical schema,
+the schema version, one hard link, absent sidecars, empty history or a successful publication is
+sufficient operational authority — **only the exact admission row is**.
+
+Two new sanitised classifiers report the two failures: `store_not_admitted` (canonical but no
+admission row at all) and `store_admission_invalid` (an admission row that is not the exact
+canonical fact, including an identity-binding mismatch). A third, `store_admission_uncertain`,
+reports an admission commit that could not be resolved.
+
+Alongside them, three fixed **final-path** classifiers say what happened to the store path itself —
+`published_not_admitted`, `published_and_admitted` and `competitor_published_untouched` — because
+"this operation left a non-operational store", "this operation left an operational one it could not
+re-verify" and "a competitor's store is intact" require different operator responses. They are
+tabulated under *Build outcomes and exit codes* below.
+
+**Amendment 7 raised the version deliberately.** Adding transactional build claims changes the
+authority model, so it is a new version rather than a disguised v1. A v1 store — like an empty,
+zero-byte, partial or foreign one — is refused **untouched**. There is no migration.
+
+**Pure pre-open triage decides before SQLite is opened (Amendment 8).** Amendment 7 opened an
+existing file with SQLite and only then decided whether it was canonical — but the first pragma
+it applied, `journal_mode=DELETE`, is *persistent*. Against a WAL-mode database it rewrote the
+header and removed the `-wal`/`-shm` companions, so a store the tool then refused had already
+been changed, and a foreign database's write-ahead log could be destroyed. Deleting a hot
+journal or WAL is the documented way to lose crash recovery.
+
+Every access to an existing store now begins with ordinary, non-following filesystem calls and
+**no SQLite call at all**:
+
+1. safe-local-path validation, and rejection of a symlink, junction or reparse point;
+2. a plain regular file with **exactly one hard link** (a multiply-named database has undefined
+   behaviour, because each name derives its own journal path);
+3. stable file identity captured, and re-checked after the header read;
+4. the complete 100-byte SQLite header read with a plain file handle, requiring the
+   `SQLite format 3\0` magic, a plausible page size, and header bytes 18 and 19 both equal to
+   `1` (rollback format; `2` means WAL);
+5. exact absence of `<store>-journal`, `<store>-wal` and `<store>-shm`, checked by exact path —
+   never by listing, globbing or sweeping a directory.
+
+> **A WAL header or any sidecar object is controlled-recovery-only.** The tool never opens,
+> checkpoints, rolls back, deletes, renames, recreates or repairs such a store — even when the
+> database otherwise looks canonical.
+
+**Read-only inspection and trusted writing are separate paths.** Non-mutating work — the build
+preflight, authority reads, decision-sequence reporting and all three COMMIT-recovery lookups —
+opens `mode=ro&cache=private`, sets only connection-local protections (`busy_timeout`,
+`foreign_keys`, and `query_only` as defence in depth *only*), **queries** `PRAGMA journal_mode`
+and requires `delete`, runs the complete global validator plus the bounded read inside one read
+transaction, closes, and then re-proves the file's identity, link count and sidecar absence.
+Writers repeat the pure triage, open `mode=rw&cache=private`, apply the same connection-local
+settings plus `synchronous=FULL`, verify the journal mode, take one `BEGIN IMMEDIATE`, re-run
+the **complete global validator inside that transaction**, and only then resolve and insert.
+`journal_mode` is assigned in exactly one place in the codebase: the brand-new temporary a
+creation operation exclusively owns. `immutable=1` is never used, because it disables change
+detection and can silently omit committed WAL-resident state.
+
+**Canonical validation is store-global.** Validation covers schema *meaning*, not just object
+names, through two independent mechanisms: the exact canonical `sqlite_schema` DDL text of every
+application object (which pins declared types, `NOT NULL`, defaults, primary keys,
+`AUTOINCREMENT`, `UNIQUE`, `CHECK` bodies, foreign-key columns and actions, index columns/order/
+uniqueness and trigger timing/event/target/body all at once), plus pragma-derived checks
+(`table_info`, `index_list`, `index_info`, `foreign_key_list`). The deterministic order is:
+`integrity_check`; `foreign_key_check`; the exact permitted object set and canonical DDL;
+columns, indexes, constraints and foreign keys; the **exact** `schema_meta` row set (exactly one
+row, key `schema_version`, value `member_create_uat_decisions/v2`, no other key); the admission
+row's shape and canonical hash; every `decision` row in sequence order; every activation row in
+activation-sequence order; every claim row in claim-sequence order; then the cross-table orphan
+and binding checks. Only SQLite's own `sqlite_sequence` and the implicit `sqlite_autoindex_*`
+indexes are tolerated.
+
+A store written by the earlier draft of this same `v2` version — carrying the identical
+`schema_version` value but no `store_admission` table — is refused with `missing_object` and is
+**never augmented**. Adding the admission table to a database this tool did not create is exactly
+the migration this contract forbids.
+
+Amendment 7 validated decision and activation content only inside the source-filtered authority
+query, so a malformed row under an unrelated source record survived into an authorised build.
+**A malformed row anywhere now blocks every operation**, whichever source record was requested.
+Timestamps are parsed into aware instants by one central parser and compared as instants, never
+as text: `approved_at >= recorded_at`, `expires_at >= approved_at`, `activated_at >=
+recorded_at`, and — new in Amendment 8 — `claimed_at >= approved_at` and `claimed_at >=
+activated_at`, both for every stored claim and, immediately before insertion, for the claim a
+build is about to mint. Two valid timestamps written in different UTC offsets order differently
+as strings than in time, so a lexical comparison is never the authority.
+
+Any mismatch refuses fail-closed and the store is **never** recreated, replaced, migrated,
+augmented or repaired.
+
+### The state parent is admitted before anything is created (Amendment 9)
+
+Through Amendment 8, creation called `mkdir(parents=True, exist_ok=True)` and asked whether the
+parent was a plain directory *afterwards*. That ordering cannot be made safe: recursive creation
+materialises a whole chain of directories, and a **pre-existing redirected component** — a symlink
+on POSIX, a junction or any other reparse point on Windows — is followed by every subsequent open,
+so the store could be created somewhere other than the state home the reviewer's ledger
+designates.
+
+> **The approval-ledger directory IS the required pre-existing state parent. This tooling never
+> creates it.** If it is missing, the command returns `store_parent_missing` and produces zero new
+> directories, zero files, zero temporaries, zero SQLite connections, zero audit appends and zero
+> reviewer-decision state.
+
+Before any directory creation, file creation or SQLite connection, every component from the
+platform's traversal anchor down to the state parent is classified **in order** and
+**non-following**. Refused: `.` and `..`, symlinks, junctions, any other reparse point,
+non-directories, unsupported device or volume transitions, and **any classification error** — an
+`lstat` failure is fail-closed, never "probably fine". The final parent's identity is captured and
+re-checked at four points: before the temporary is created, after it is created, before
+publication and after publication.
+
+Platform support is a narrow, closed boundary:
+
+| Platform | Supported | Refused fail-closed | Mechanism |
+| --- | --- | --- | --- |
+| Windows | fixed local **NTFS** drive-letter volume (`GetDriveTypeW == DRIVE_FIXED`, `GetVolumeInformationW` name `NTFS`) | UNC paths, mapped drives, remote/removable/CD-ROM/RAM/unknown drive classes, non-NTFS volumes, any reparse component, volume-query failures | pathname-based ordered classification; identity from the volume serial and file index |
+| POSIX | Linux local filesystems on one device from `/` (`ext2/3/4`, `xfs`, `btrfs`, `zfs`, `f2fs`, `jfs`, `reiserfs`, `bcachefs`, `ubifs`, `tmpfs`, `ramfs`, `overlay`) | every other or **unprovable** filesystem, including `nfs`, `cifs`/`smb*`, `9p`, `ceph`, `glusterfs`, `lustre`, FUSE remotes and WebDAV; any device transition | descriptor-relative walking with `O_DIRECTORY` plus `O_NOFOLLOW` and `dir_fd`, and exclusive create, `link`, `unlink` and the parent `fsync` through the verified descriptor |
+
+The filesystem type is proven from `/proc/self/mountinfo` by longest-mount-point match. An
+unrecognised type, or one that cannot be determined at all, is **unsupported** — the allowlist is
+deliberate, because an unprovable filesystem cannot support the durability and identity claims the
+admission fact records.
+
+**Documented residual race boundaries.** These are stated, not closed:
+
+- Python's `sqlite3` accepts a **pathname**, not a directory descriptor. Opening the temporary and
+  the published store is therefore pathname-based even on POSIX, so a classify-to-open race
+  remains between the identity checks and the SQLite open. No claim of descriptor-relative SQLite
+  is made anywhere in the code or in this document.
+- Windows operations are entirely pathname-based. **No Windows guarantee here is equivalent to
+  POSIX `dir_fd` or directory-fsync semantics.**
+- A privileged or otherwise non-cooperating process able to substitute a path component *during*
+  an open system call is **out of the supported threat model**. What is in scope, and detected, is
+  ordinary replacement or redirection by a cooperating or careless process.
+- `/proc/self/fd` paths, `openat2`, a custom SQLite VFS and undocumented native APIs are all
+  deliberately not used.
+
+### Creation is allowed only at a positively absent path
+
+The complete canonical store is built in an operation-owned temporary inside the **admitted**
+parent, validated in full in zero-admission structural mode, closed, proven to have no sidecar and
+exactly one link, flushed durably, and only then published. Exclusively creating the final path and
+*then* running DDL on it would leave a window in which a concurrent process opens a zero-byte file
+and correctly concludes it is not a canonical store; publishing an already-complete store removes
+that window, so the final path only ever appears fully formed. Publication is platform-specific:
+
+| Platform | Primitive | Durability reported | Temporary |
+| --- | --- | --- | --- |
+| Windows | `MoveFileExW` **without** `MOVEFILE_REPLACE_EXISTING`, with `MOVEFILE_WRITE_THROUGH` | `windows_move_write_through` | none survives a move, so no second name is ever created |
+| POSIX | no-replace `os.link` with every SQLite connection closed, parent-directory fsync, unlink of the operation-owned temporary, parent-directory fsync again — all descriptor-relative | `posix_link_and_directory_fsync` | `unlinked`; a failed unlink is reported, never suppressed |
+
+The published store must be a plain regular file with **exactly one link** and the identity this
+operation created. It is then re-validated in zero-admission structural mode, and only then is the
+**admission row** inserted and proven. Creation reports success only after that proof.
+
+If a competitor wins the race, their store is left byte-for-byte untouched and only this
+operation's own temporary is removed. If schema setup fails, the final path is never created and
+the temporary is deliberately left in place as evidence. A publication whose durability cannot
+be proven, a temporary that cannot be removed, or an admission commit that cannot be resolved is
+reported as a controlled-recovery state — never silently treated as an authorised store. Only a
+durability primitive actually confirmed on the running platform is ever named; Windows offers no
+directory-handle fsync, so none is claimed there.
+
+> **Anything that fails after the final path becomes visible but before admission completes leaves
+> the store non-operational across process restart.** No later process may treat it as ordinary
+> merely because it is readable and canonical. Recovery is the controlled reconciliation command
+> below, under explicit owner authority.
+
+### Truthful lost-race cleanup (Amendment 9)
+
+Amendment 8's cleanup helper had a quiet mode (`required=False`) used on the lost-race path, which
+**swallowed a real unlink failure** — so a surviving temporary was invisible to the operator at
+exactly the moment a competitor had become the authority. That mode is gone. There is one helper
+and every outcome is explicit.
+
+Immediately before unlinking, the exact pathname is re-classified and required to still be the
+regular file this operation exclusively created, compared by the identity captured at creation. A
+replacement object is **never** unlinked. Nothing is ever listed, globbed or swept, and no other
+pathname is touched.
+
+| Outcome | Reported as | Operator action |
+| --- | --- | --- |
+| Our temporary removed, or already absent | `store_not_absent` (lost race) / normal success (publication) | none |
+| Our temporary could not be removed after a **lost race** | `store_temp_cleanup_incomplete` with `decision_store_final_path_state = competitor_published_untouched` and `decision_store_modified: false` | delete exactly the one named `.mcuat_decisions_*` basename |
+| Our temporary could not be removed after **our own** publication | `store_temp_cleanup_incomplete` with `decision_store_final_path_state = published_not_admitted` | delete exactly that one file; until then the store is refused with `store_multiple_links` |
+| The temporary pathname now holds a different object | `store_temp_identity_changed` | review that one named basename by hand; it is never removed automatically |
+
+A losing creator's stale temporary is **operator hygiene evidence, not a global authority block**:
+the competing store keeps its own admission and its own single name. A self-published,
+multiply-linked store *is* globally blocked, by the existing one-link invariant.
+
+### Controlled reconciliation (`reconcile-store-admission`)
+
+A store that was published but never admitted is permanently blocked by design. The only way out
+is one explicit, separately named command. It is never invoked automatically and is not reachable
+from any ordinary command.
+
+```bash
+python scripts/member_create_uat_approval.py reconcile-store-admission --ledger <ledger-path> --confirm-controlled-reconciliation
+```
+
+> **Real use against a real store requires explicit current-turn owner authority naming that exact
+> store.** The confirmation switch is a deliberate second action, not a convenience default;
+> without it the command refuses and changes nothing. The exact store path is **derived** from the
+> ledger path, so the command cannot be pointed at an arbitrary database.
+
+It **mutates admission state only**. It never repairs, migrates, checkpoints, truncates, rewrites,
+renames or replaces the database image, and it never touches a sidecar-bearing store. Every
+precondition is proven before anything is written:
+
+- [ ] the state parent passes trusted-parent admission
+- [ ] pure pre-open triage passes (header, one link, no sidecar, stable identity)
+- [ ] the platform and filesystem are supported
+- [ ] the schema is exactly the canonical revised `v2`
+- [ ] admission cardinality is exactly **zero**
+- [ ] `decision`, `decision_activation` and `build_claim` are **all empty**
+- [ ] complete global validation passes
+- [ ] the file identity is unchanged across the whole precondition phase
+
+Any history at all returns `store_reconciliation_history_present` and changes nothing — admitting a
+store that already carries history would retroactively bless authority nobody proved. Then
+durability is **re-established before** admission:
+
+| Platform | Re-established | Recorded primitive |
+| --- | --- | --- |
+| POSIX | `fsync` of the final database file **and** of the verified parent directory descriptor | `posix_file_and_directory_fsync` |
+| Windows | flush of the final database file only, on a proven fixed local NTFS volume | `windows_file_flush_no_directory_fsync` — named for what it is; **no directory-fsync equivalent is claimed** |
+
+The admission COMMIT is resolved by the same exact-row lookup. If it stays unresolved, ordinary
+operations remain blocked and the command reports `store_admission_uncertain`. Reconciliation grants
+no reviewer authority: a fresh reviewer decision is still required afterwards.
+
+**Concurrency consequence you should expect.** Because a sidecar is refused unconditionally, a
+second tool process that meets a peer *mid-transaction* now fails **closed** with
+`store_sidecar_present` instead of waiting on the busy timeout and then committing. Nothing is
+written and nothing is changed, but the second command does not succeed. Run reviewer decisions
+one at a time. Pure lock contention — a peer holding the write lock without having written a
+page, so no journal exists — still reports the retryable `decision_not_recorded` /
+`build_claim_not_recorded` outcome.
+
+Three further transient refusals mean the same thing — "a peer is mid-operation, nothing was
+changed, try again deliberately": `store_locked`; `store_unreadable`, which Windows can report
+while a peer's no-replace move is in flight; and, on POSIX only, `store_multiple_links` during
+first-use creation, because the hard-link route briefly gives the completed store two names
+before the operation-owned temporary is unlinked. That window exists only while a store is being
+created; afterwards the link count is one permanently, and a persistent `store_multiple_links`
+means a real second name that an operator must remove.
+
+**Threat-model boundary.** The supported location is a stable, local, operator-controlled state
+directory, and the protections above cover malformed, foreign, partial and corrupt databases,
+WAL and sidecar residue, crash-interrupted state, ordinary path or file replacement detected by
+ordered identity checks, cooperating concurrent tool processes, competing first-store creators,
+and post-publication cleanup and durability uncertainty. They do **not** make any sequence atomic
+against a privileged, non-cooperating process that can substitute a trusted path component
+during an open system call; that is outside the supported model and is not claimed.
+
+**Decision state machine.** Each `approve` / `reject` / `hold` runs three ordered, separately
+committed steps:
+
+1. commit the **pending** decision row transactionally;
+2. append the JSONL **audit** event;
+3. commit the separate **activation** row — only after step 2 returned confirmed success.
+
+If any `COMMIT` raises, the tool closes the connection, **reopens the database** and looks
+for the exact row by its unique id: present with the expected canonical hash means it
+committed; absent means it did not (a clean retry is safe); unreadable fails closed. The
+outcome is never inferred from the exception, which proves only that the client did not hear
+the answer. There is no external activation acknowledgement file — the SQLite transaction and
+the reopen check are the commit authority.
+
+If the audit append fails, the decision stays **pending**: it is not activated, not deleted
+and not rewritten, the ledger is not truncated, replaced or repaired, and the tool reports
+`decision_authority = pending` with `approval_blocked` and `do_not_retry`.
+
+#### Exclusive build claim — the terminal approval-consumption fact
+
+Resolving authority and then closing the connection left a time-of-check/time-of-use window: a
+concurrent reviewer could commit an activated hold, an activated rejection, or a pending
+hold/rejection **after** the build read its authority but **before** it reserved or published,
+and the build would proceed on a stale approval snapshot.
+
+Checking harder cannot close that window; the check and the irreversible effect must share one
+atomic boundary. So `build-package` now runs in two phases.
+
+**Phase 1 — non-mutating preflight.** Validate arguments and safe paths; read and validate the
+source record; confirm the output basename is absent (strict no-clobber); open and validate the
+store; read the current authority, any existing claim and any reservation; construct the entire
+package in memory; validate it against the contract **and**, when `jsonschema` is installed, the
+real JSON Schema; compute the canonical payload hash. **No temporary file, no reservation, no
+claim and no ledger event is created in phase 1.**
+
+**Phase 2 — one `BEGIN IMMEDIATE` transaction.** Validate the complete canonical store;
+re-resolve the newest decision state; reject any newer pending decision; require the newest
+activated decision to be the exact intended unexpired approval (approval id, decision id,
+decision sequence, canonical decision hash, source id and fingerprint all matching); confirm no
+claim exists for the approval; confirm the operation id is unused; insert the exclusive
+`build_claim`; commit.
+
+Decision writers and build claims serialise on this same boundary, so a concurrent reviewer
+either loses the write lock (and the build's re-resolve observes its decision) or wins it (and
+the build's re-resolve observes it). There is no interleaving in which a stale approval
+authorises publication.
+
+`build_claim` binds: claim id, monotonic claim sequence, decision sequence, decision id,
+canonical decision hash, approval id, source record id, source fingerprint, operation id,
+package payload hash, intended package basename, claimed timestamp, schema version and its own
+canonical record hash. SQLite — not Python — enforces the invariants: `UNIQUE` on `approval_id`,
+`claim_id`, `decision_id` and `operation_id` makes a second claim, a duplicate claim, a duplicate
+decision and a reused operation id impossible; foreign keys onto `decision(decision_id)` and
+`decision(approval_id)` make a claim on a non-existent decision impossible, and — because
+`decision` already enforces that only an approval carries an `approval_id` — a claim on a
+**non-approved** decision impossible too; and a `BEFORE INSERT` trigger requires the claim's
+decision id, approval id, sequence, canonical hash, source id and fingerprint to describe one
+single **activated** approved decision.
+
+**Winner ordering.** If a reviewer decision commits first, the build observes it and refuses with
+no claim, no temporary, no reservation, no package and no build audit event. If the claim commits
+first, that one exact attempt is authorised and the approval is consumed; a later reviewer
+decision governs subsequent work only and never retroactively releases or cancels the committed
+claim. When two builds race, exactly one claim commits and the loser is blocked before creating
+anything.
+
+**Claim commit uncertainty.** If the claim's `COMMIT` raises, the connection is closed, the
+database is **reopened**, and the exact claim is looked up by claim id and canonical claim hash:
+present with matching bindings means committed (the attempt continues); absent means nothing was
+claimed, the approval is untouched and a later **explicit** retry is allowed (exit 11); anything
+indeterminate — unreadable store, hash mismatch or binding mismatch — fails closed with
+`do_not_retry`. Lock contention makes exactly one bounded attempt; there is no retry loop.
+
+**Post-claim publication, and post-claim failure.** Only after the claim is confirmed committed
+does the build create its temporary, write/flush/fsync it, create and durably persist the
+reservation, publish atomically with the existing no-replace mechanism, clean only its own
+temporary, and append the JSONL build audit event.
+
+**Every failure after the claim commits leaves the approval permanently consumed** — temporary
+creation, write, flush or fsync; reservation create, write, flush, fsync, parent-directory
+durability or path safety; publication; temporary cleanup; and every ledger open/write/flush/
+fsync, visible-but-unconfirmed or torn-append failure. A second build with that approval is
+blocked at any fresh output path. Nothing is ever deleted or altered: not the claim, a
+reservation, a published package, a competing package, a historical package, a torn audit ledger
+or an unrelated temporary. No directory is listed, globbed or swept; only exact-path checks are
+used.
+
+The filesystem reservation remains a crash and publication backstop. It is **no longer** the
+build-authorisation point — the committed SQLite claim is.
+
+#### Timestamps must be timezone-aware
+
+One central parser validates every authority and audit timestamp. A value such as
+`2026-07-28T00:00:00` parses through `datetime.fromisoformat` but has **no UTC offset**, so
+comparing it to an aware "now" raises an uncontrolled `TypeError`. A valid timestamp must
+therefore be a supported ISO-8601 string, parse successfully, **and** return a non-null
+`utcoffset()`. Naive values are refused with a sanitised classifier and the offending value is
+never printed.
+
+This covers `recorded_at`, `approved_at`, `expires_at`, `activated_at`, `claimed_at` and every
+timestamp-bearing JSONL audit event. Ordering is checked too: an expiry may not precede its
+approval, and an activation may not precede the decision it activates. Malformed historical data
+is never normalised into acceptance.
+
+**Authoritative ordering.** The newest **activated** decision for the source record wins.
+Approve, reject and hold share one monotonic sequence. A newer committed-but-unactivated
+decision **blocks** the build (`decision_pending_or_uncertain`) rather than falling back to
+an older activated approval — the pending decision may have been an attempted hold or
+rejection, and treating "we could not confirm the reviewer's latest instruction" as "use the
+previous approval" is the unsafe direction.
+
+| Store state | Build outcome |
+| --- | --- |
+| Newest activated decision is `approved` | Proceeds to the normal fingerprint, expiry and reservation gates |
+| Newest activated decision is `rejected` or `hold` | Refused (`decision_not_approved`) |
+| Any newer pending decision | Refused (`decision_pending_or_uncertain`) |
+| Malformed, inaccessible or incompatible store | Refused with sanitised integrity evidence |
+| No store, or no activated decision | Fresh reviewer decision required |
+
+`build-package` never creates the store: a missing store means no transactional approval
+authority exists.
+
+**Deliberate compatibility decision — a legacy JSONL-only approval is not authority.** A
+well-formed `approved` line written by any earlier version of this tool grants nothing,
+because no activation row exists for it. **After merge, a fresh reviewer decision is
+required before the v2 package is built.** This is intentional and is not a migration gap:
+the whole point is that a readable line can no longer authorise a package.
+
+#### Durable publication reservation and the terminal reservation rule
+
+The append-only ledger is the audit log, but it is written *after* the package is
+published, so it cannot be the only durable record that an approval was consumed. Before
+any final package can be published, the builder therefore creates one **durable, exclusive
+publication reservation** for that build, beside the ledger:
+
+`member_create_uat_reservation_<approval_id>.1.reservation`
+
+It is a write-ahead intent marker, not a second ledger: created exactly once with
+`O_CREAT | O_EXCL`, fsynced (plus a directory-entry fsync on POSIX; on Windows NTFS
+journals the entry with the file's own fsync, and the achieved mode is always reported as
+`reservation_durability`), then never rewritten, truncated or deleted by the tool. It binds
+`approval_id`, `source_record_id`, `source_fingerprint`, `operation_id`,
+`bound_package_payload_hash` and the output **basename** only — no member value, no
+credential, no absolute path. It is local operational state and is git-ignored.
+
+**The terminal reservation rule.** Once a reservation object for an approval exists — or
+may exist — that approval is **permanently consumed** for package-building purposes:
+
+- a plain build is refused;
+- `--rebuild` is refused;
+- a different, absent output pathname does not bypass it;
+- a new process, or a machine restart, does not bypass it;
+- **a readable ledger build event does not release it.**
+
+That last point is the reason the rule is absolute. A ledger `flush()`/`fsync()` failure can
+leave a *complete, perfectly readable* JSON build event whose durability was never
+confirmed, and on restart that record is indistinguishable from a properly persisted one.
+Treating it as proof of a finished build would let the same approval mint a second package.
+Confirming the confirmation cannot fix this — whatever acknowledges the ledger would itself
+need acknowledging — so the ledger simply stops being authority over approval reuse. It
+remains the audit record.
+
+The rule applies whether the reservation is confirmed durable, durability-uncertain,
+reconciled to a `build` event, reconciled to a `build_cleanup_incomplete` event, unmatched,
+malformed, foreign, accompanied by a complete-but-unconfirmed ledger line, or accompanied by
+a torn one. The reported `reservation_status` is recovery guidance only, never permission.
+
+On every build the tool checks that approval's reservation slots by direct path lookup; it
+never lists, globs or sweeps the directory, and never touches an unrelated reservation,
+package or temporary file. A consumed approval reports `status = approval_consumed`
+(exit 7). Recovery is always a fresh reviewer decision, or a controlled reconciliation under
+review — never a silent retry.
+
+Single use is a property of the **approval**, not of the member row: a fresh reviewer
+decision mints a new approval id and can build once, which is what makes recovery possible.
+
+Where a competing reservation **definitely** occupies the slot (the exclusive create lost the
+race), the approval is reported as `approval_consumed` with `reservation = consumed` (exit 7)
+and **no retry guidance at all** — the competitor terminally consumed the approval and its
+reservation is left byte-for-byte untouched. `not_created`, the only retryable reservation
+outcome, is claimed solely when a non-following existence re-check (`os.path.lexists` on the
+exact slot path) positively proves that no object is present. If existence cannot be
+determined, the approval is treated as consumed/uncertain. No directory is listed, globbed or
+swept at any point.
+
+#### Ledger integrity and exact audit schemas are fail-closed
+
+The ledger is read as an intact sequence of newline-terminated JSON objects **and every
+record must match an exact supported audit schema**. Validating only "is it a JSON object"
+left arbitrary dictionaries trusted, so a malformed decision or publication dictionary
+reached downstream timestamp parsing and field lookups and produced uncontrolled exceptions
+or partially trusted state.
+
+Supported shapes (every one is a shape this tool has actually written):
+
+| Event | Fields |
+| --- | --- |
+| `decision` | exactly the 10 decision fields; permitted decision values; reviewer/source-id/fingerprint formats; integer row hint in range; parseable timestamps; an approval requires a well-formed approval id plus parseable `approved_at` and `expires_at`; a rejection or hold requires all three approval fields to be null |
+| `build` | the 8 core publication fields, plus `reservation_file_name` from Amendment 4 onwards |
+| `build_cleanup_incomplete` | the same, plus `cleanup_incomplete = true` and `stale_temp_basename` |
+
+Unknown event types, missing fields, extra undeclared fields, wrong types, malformed
+timestamps, malformed ids and invalid hashes all produce
+`status = ledger_integrity_uncertain` (exit 8) with `approval_blocked`, `do_not_retry` and
+`controlled_recovery_required` — never a traceback. So do a torn (partially appended) final
+record, a non-object record, and read/decode failures.
+
+In that state the tool does **not** discard the malformed record, repair, truncate, rewrite
+or replace the ledger, delete any reservation, touch any published package, mutate the
+decision store, or continue to package construction. Only a fixed shape classifier is
+reported (`ledger_integrity`); the offending record is never printed, and no ledger content,
+member value, credential or absolute path is ever printed. Reconcile the ledger under review,
+then start a fresh reviewer decision.
+
+#### Build outcomes and exit codes
+
+Only `status = ok` (exit 0) means the build is complete: reservation durable, package
+published, temporary file removed, and exactly one `build` ledger event fsynced. Every
+other outcome is a distinct nonzero exit so no partial state can be mistaken for success.
+
+| Exit | `status` | Published? | Meaning and required action |
+| --- | --- | --- | --- |
+| 0 | `ok` | yes | Complete and durably recorded. Nothing to do. |
+| 2 | `error` | no | Ordinary refusal before the reservation boundary (no approval state consumed). Fix the cause and re-run. |
+| 3 | `cleanup_incomplete` | see below | Temporary file could not be removed. The ledger event **was** recorded. |
+| 4 | `ledger_record_incomplete` | yes | Published, but the durable ledger event could not be persisted. **Do not retry.** |
+| 5 | `reservation_incomplete` | no | This attempt's reservation was not created, or not confirmed durable. |
+| 6 | `publication_failed_after_reservation` | no | Reservation is durable but publication failed; the approval is blocked. |
+| 7 | `approval_consumed` / `rebuild_requires_fresh_approval` | no | The approval is terminally consumed (including by a competing reservation), or `--rebuild` (retired) was passed. Nothing was created or touched. |
+| 8 | `ledger_integrity_uncertain` | no | The audit ledger is not an intact append-only record, or a record fails its exact audit schema. Nothing was created, read further or repaired. |
+| 9 | `decision_audit_incomplete` / `decision_not_activated` / `decision_not_recorded` / `decision_store_integrity_uncertain` / `claim_timestamp_order_invalid` | no | Decision authority cannot be trusted: a decision is pending and non-authoritative, a commit outcome was unresolved, the store is not intact **or not admitted**, the state parent is missing, untrusted or unsupported, or a claim instant precedes the authority it binds. `decision_not_recorded` is the one retryable member of this row. |
+| 10 | `decision_store_missing` / `no_activated_decision` / `decision_not_approved` / `decision_pending_or_uncertain` / `decision_superseded_before_claim` | no | No activated decision authorises a build, or a reviewer decision won the race to the claim. A fresh reviewer decision is required. |
+| 11 | `build_claim_not_recorded` | no | The exclusive build claim was **not** committed, so the approval was **not** consumed. Nothing was created. A later **explicit** retry is allowed. |
+
+Exits 9, 10 and 11 create and touch nothing: no build claim, no temporary file, no reservation,
+no output file, no ledger event and no decision-store mutation. Exit 11 and exit 9's
+`decision_not_recorded` are the only build/decision outcomes that stay retryable; every other
+nonzero outcome after a committed claim sets `approval_blocked` and `do_not_retry`.
+
+Two post-claim statuses report a consumed approval with nothing published:
+`reservation_failed_after_claim` and `post_claim_publication_failed` (both exit 6, each naming
+the exact `failure_stage`).
+
+Exit 9 and exit 10 both create and touch nothing: no reservation slot, no temporary file, no
+output file, no ledger event and no decision-store mutation. Exit 9 with
+`decision_not_recorded` is the one decision outcome that stays retryable — nothing committed,
+so `approval_blocked` and `do_not_retry` are both false. Every other exit-9 status sets
+`approval_blocked`, `do_not_retry` and `controlled_recovery_required`.
+
+**Whether a NEW file exists is reported explicitly, not guessed from the reason.** Amendment 9
+reports `decision_store_final_path_state` whenever a refusal has something to say about the final
+store path, and derives `decision_store_modified` from it:
+
+| `decision_store_final_path_state` | `decision_store_modified` | Meaning and required action |
+| --- | --- | --- |
+| `published_not_admitted` | `true` | **This** operation published a store and then failed before its admission fact was proven. The store exists, is complete, and is **not operational**. Nothing was rolled back or deleted. Recovery is the controlled reconciliation command under owner authority, or removal of the non-operational store under review. |
+| `published_and_admitted` | `true` | This operation published a store **and** proved its admission row committed, but could not complete its own final operational verification — in practice because a peer opened a write transaction the moment the admission appeared. **No reconciliation is needed:** the admission fact exists, so the next invocation simply finds an operational store. Re-run the reviewer decision. |
+| `competitor_published_untouched` | `false` | A concurrent operation published the store first. Its store is byte-for-byte intact; only this operation's own temporary is at issue. |
+| absent | `false` | The store was left exactly as it was found. |
+
+Store states you may see at exit 9, and what to do:
+
+- `store_not_admitted`: the store is readable and canonical but carries **no admission fact**, so
+  it has never been admitted to operational use. This is the expected, correct state after any
+  interrupted first-use creation. Verify the state directory, then either remove the
+  non-operational store under review and start a fresh reviewer decision, or run the controlled
+  reconciliation command above **under explicit owner authority naming that exact store**.
+- `store_admission_invalid`: an admission row exists but is not the exact canonical fact — most
+  often because the file at that path is not the file admission was written against. Do not
+  repair it. Establish what replaced the store, then reconcile under review.
+- `store_admission_uncertain`: an admission commit could not be resolved, or reconciliation could
+  not re-establish durability. The store remains blocked. Re-run the controlled reconciliation
+  command under owner authority once the underlying cause is resolved.
+- `store_parent_missing`: the reviewer's approval-state directory does not exist. **Nothing at all
+  was created.** Create or restore that directory deliberately, then re-run.
+- `store_parent_untrusted`: a component of the state path is a symlink, junction, other reparse
+  point or not a directory, or could not be classified. Resolve the redirection deliberately;
+  never point the state path through a link.
+- `store_parent_unsupported`: the state path is on an unsupported volume or filesystem — a UNC
+  path, mapped or remote drive, removable drive, non-NTFS Windows volume, a device transition, or
+  a POSIX filesystem that is not a supported local one. Move the state directory to a fixed local
+  volume.
+- `store_parent_identity_changed`: the state directory was replaced mid-operation. Establish why
+  before re-running.
+- `store_publication_uncertain`: a first-use store was published but its durability could not be
+  proven. It is also, necessarily, not admitted.
+- `store_temp_cleanup_incomplete` / `store_temp_identity_changed`: see the cleanup table above.
+  `decision_store_temp_basename` names exactly one file (a basename, never a path).
+- `store_reconciliation_history_present`: reconciliation was attempted on a store that already
+  holds reviewer-decision, activation or claim history. Nothing was changed, and nothing should
+  be: that store's admission must not be manufactured after the fact.
+
+For `store_sidecar_present` or `store_journal_mode_unsupported`, do **not** delete, rename,
+checkpoint or roll back the journal, write-ahead log or shared-memory file. Establish why they
+are there — usually a crashed process or a concurrent writer — resolve it deliberately, and then
+start a fresh reviewer decision.
+
+Exit 3 (`cleanup_incomplete`) reports `stale_temp_basename` (a PII-free `.mcuat_pkg_*.tmp`
+name in the output directory) with `manual_cleanup_required`:
+
+- `publication = not_published`: nothing was published and nothing was reserved. Manually
+  delete the named stray temporary file, then re-run the build.
+- `publication = succeeded`: the final package WAS published and is recorded in the ledger
+  as `build_cleanup_incomplete`. Do NOT rebuild this operation (the builder refuses it):
+  manually delete the named stray temporary file, and if a new package is genuinely needed,
+  start a fresh reviewer decision.
+
+Exit 4 (`ledger_record_incomplete`) means the final package is published and complete but
+its durable ledger event was lost, or landed without confirmed durability. Never delete,
+move, rename or edit the published package. The durable reservation has terminally consumed
+this approval, so it cannot build again at any path, by any invocation. If
+`temp_cleanup = failed`, manually delete the named stray temporary file as well. A new
+package requires a fresh reviewer decision.
+
+Exits 5 and 6 publish nothing. Where `reservation = uncertain` or
+`publication_failed_after_reservation` is reported, the reservation entry is deliberately
+left in place: never delete, recreate or retry it, because removing it would turn "may have
+been consumed" into "definitely free". Reconcile it under review, or start a fresh reviewer
+decision. Where `reservation = not_created`, reservation creation demonstrably did not begin,
+no reservation object exists, no approval state was consumed, and a re-run is safe once the
+underlying filesystem cause is resolved.
+
+Exit 7 creates and touches nothing at all: no reservation slot, no temporary file, no output
+file and no ledger event. `approval_consumed` names the blocking reservation basename and its
+diagnostic `reservation_status`, and sets `manual_temp_cleanup_required` when the prior
+attempt also left a stray temporary. `rebuild_requires_fresh_approval` is the retired
+`--rebuild` flag being refused outright.
+
+Exit 8 also creates and touches nothing, and leaves the ledger byte-for-byte as found.
+
+Copy the package to the VM, then dry-run:
+
+```powershell
+& scripts\ac2_member_create_uat_runner.ps1 -PackagePath "C:\XB\create_uat\member_create_uat_package.json" -StateDir "C:\XB\create_uat\state" -JsonOut "C:\XB\create_uat\member_create_uat_result.json"
+```
+
+Expect `DRY_RUN_VALIDATED`. If it reports `BLOCKED_MEMBER_EXISTS`, stop: the member
+already exists and no creation is warranted.
+
+"""
+
+VM_GATE_REVIEWED_ACTIONS = {
+    VM_GATE_DEPLOY_STEP: VM_GATE_DEPLOY_REVIEWED_ACTION,
+    VM_GATE_PREFLIGHT_STEP: VM_GATE_PREFLIGHT_REVIEWED_ACTION,
+}
+
+
 # CommonMark opens the same list with any of these, so #118 already treats the choice as syntax.
 # Gate identity must agree, or an editor normalising a list would read as a wording change.
 VM_GATE_BULLET_MARKERS = ("-", "*", "+")
@@ -4692,6 +5473,7 @@ VM_GATE_DEPLOY_UNMET = frozenset((
     "deploy_not_current_turn", "deploy_substitution_not_denied", "deploy_prior_turn_not_denied",
     "deploy_stop_boundary_missing", "deploy_execution_not_denied", "deploy_operation_missing",
     "deploy_state_preparation_missing", "deploy_gate_text_changed",
+    "deploy_action_text_changed",
 ))
 # A4 replaces `preflight_prefix_changed` with the same structural rule step 4 already carries.
 # Once the gate moves to the top of the step there is nothing legitimate left in front of it, so
@@ -4707,7 +5489,7 @@ VM_GATE_PREFLIGHT_UNMET = frozenset((
     "preflight_approval_command_missing", "preflight_package_build_missing",
     "preflight_environment_setup_missing",
     "preflight_operation_missing", "preflight_runner_invocation_missing",
-    "preflight_gate_text_changed",
+    "preflight_gate_text_changed", "preflight_action_text_changed",
 ))
 
 # Every finding key this contract can report. A4 retired `preflight_prefix_changed` and added
@@ -4718,6 +5500,7 @@ VM_GATE_PREFLIGHT_UNMET = frozenset((
 # closed by holding the EXISTING four command keys to an honest standard, and F-D by correcting
 # the text `safety_boundary_not_four_way` already governs.
 VM_GATE_FINDING_KEYS = (
+    "deploy_action_text_changed", "preflight_action_text_changed",
     "deploy_boundary_ambiguous", "deploy_boundary_missing", "deploy_execution_not_denied",
     "deploy_gate_after_mutation", "deploy_gate_marker_ambiguous", "deploy_gate_missing",
     "deploy_gate_text_changed",
@@ -4755,32 +5538,61 @@ def _semantic_heading(line):
     return _flat(VM_GATE_ATX_CLOSING.sub("", line.strip()))
 
 
-def _semantic_gate_block(block):
-    """The RENDERED identity of a gate block, as a reviewer approved it. Pure text in, text out.
+def _semantic_markdown_region(region):
+    """The RENDERED identity of a reviewed Markdown region. Pure text in, text out.
 
-    A5's answer to accepted finding F-A. Exactly two things are treated as syntax, both because
-    this contract already treats them that way everywhere else:
+    The shared normalisation both reviewed identities use -- the gate block (A5) and the action
+    region (A6). Exactly two things are treated as syntax, both because this contract already
+    treats them that way everywhere else:
 
     * ordinary whitespace, so a reflow or a CRLF checkout is not drift;
     * the line-start CommonMark bullet marker, since `-`, `*` and `+` open the same list (#118).
 
-    Everything else is CONTENT. Case is preserved, punctuation is preserved, and no word is
-    dropped, because each of those would let contradictory prose compare equal to compliant prose
-    -- which is the defect this replaces, not a repair for it. Blank lines are dropped rather than
-    encoded, so paragraph regrouping is not drift either, while any added, removed or reworded
-    clause changes the result and fails closed.
+    Everything else is CONTENT. Case is preserved, punctuation is preserved, command tokens and
+    code-fence delimiters are preserved, and no word is dropped, because each of those would let
+    contradictory prose compare equal to compliant prose -- which is the defect this replaces, not
+    a repair for it. Blank lines are dropped rather than encoded, so paragraph regrouping is not
+    drift either, while any added, removed or reworded clause changes the result and fails closed.
+
+    A6-F4: the marker is canonicalised when ORDINARY HORIZONTAL WHITESPACE follows it, not only a
+    literal space. A5 tested ``marker + " "``, so ``*\\titem`` and ``+\\titem`` reported drift while
+    ``- item``, ``* item``, ``+ item`` and ``-\\titem`` were accepted -- ``-\\t`` passing only by
+    accident of the whitespace collapse below. CommonMark expands the tab and opens the same list
+    item either way, so the promise A5 made about `-`/`*`/`+` is now actually kept. The test stays
+    line-start only and requires the SECOND character to be whitespace, so ``--flag`` and a bare
+    ``-`` are untouched.
     """
     lines = []
-    for line in block.splitlines():
+    for line in region.splitlines():
         stripped = line.strip()
         if not stripped:
             continue
-        for marker in VM_GATE_BULLET_MARKERS:
-            if stripped.startswith(marker + " "):
-                stripped = "- " + stripped[len(marker) + 1:]
-                break
+        if len(stripped) > 1 and stripped[0] in VM_GATE_BULLET_MARKERS \
+                and stripped[1] in " \t":
+            stripped = "- " + stripped[2:]
         lines.append(" ".join(stripped.split()))
     return " ".join(lines)
+
+
+def _semantic_gate_block(block):
+    """The RENDERED identity of a gate block, as a reviewer approved it.
+
+    A5's answer to accepted finding F-A, kept as its own named authority so that a gate change and
+    an action change stay separately reportable.
+    """
+    return _semantic_markdown_region(block)
+
+
+def _semantic_action_region(action):
+    """The RENDERED identity of a step's post-gate action region, as a reviewer approved it.
+
+    A6's answer to accepted finding A6-F1. Deliberately the SAME conservative normalisation the
+    gate block uses: nothing is lowercased, no punctuation is stripped, no non-whitespace text is
+    erased and no command token is rewritten, so this cannot hide a meaningful command change. It
+    is a separate function from ``_semantic_gate_block`` because the two identities answer for
+    different regions and report different findings.
+    """
+    return _semantic_markdown_region(action)
 
 
 def _numbered_heading_openings(text):
@@ -4935,7 +5747,24 @@ def _executable_line_text(region):
     exactly as it was.
     """
     lines, in_block = [], False
+    here_terminator, heredoc_word, heredoc_strip = None, None, False
     for line in region.splitlines():
+        # A6: inert MULTILINE DATA is resolved before anything else, because a comment character or
+        # a whole command sitting inside a here-string or heredoc body is data as well. Both states
+        # close only on their own terminator, so an unterminated opener suppresses the remainder of
+        # the region and the required operation fails closed -- which matches both interpreters,
+        # where an unterminated construct is a parse error rather than a runnable script.
+        if heredoc_word is not None:
+            candidate = line.lstrip("\t") if heredoc_strip else line
+            if candidate.strip() == heredoc_word:
+                heredoc_word = None
+            lines.append("")
+            continue
+        if here_terminator is not None:
+            if line.startswith(here_terminator):
+                here_terminator = None
+            lines.append("")
+            continue
         kept, rest = [], line
         while rest:
             if in_block:
@@ -4959,7 +5788,20 @@ def _executable_line_text(region):
                 break
             kept.append(rest)
             break
-        lines.append(_flat("".join(kept)))
+        active = "".join(kept)
+        # A6: a recognised multiline-data opener in the SURVIVING text opens its state. Detected
+        # after comment removal on purpose, so a commented-out `# @'` opens nothing. The PowerShell
+        # opener must END the line, which is what the language requires.
+        for opener, terminator in VM_GATE_PS_HERE_STRING_OPENERS:
+            if active.rstrip().endswith(opener):
+                here_terminator = terminator
+                break
+        else:
+            heredoc = VM_GATE_SHELL_HEREDOC_OPENER.search(active)
+            if heredoc is not None:
+                heredoc_strip = heredoc.group(1) == "-"
+                heredoc_word = heredoc.group(3)
+        lines.append(_flat(active))
     return lines
 
 
@@ -5059,6 +5901,15 @@ def _deployment_findings(text, findings):
     if _semantic_gate_block(block) != _semantic_gate_block(VM_GATE_DEPLOY_REVIEWED_BLOCK):
         findings.add("deploy_gate_text_changed")
 
+    # A6: and the ACTION region must still say exactly what review approved it saying. Accepted
+    # finding A6-F1: the gate identity above stops at the action boundary, so "The approval above is
+    # optional once these commands are reached." placed after it revoked the gate with the whole
+    # contract clean. Polarity is not decided here either -- the reviewed text is recognised, so a
+    # revocation, a reuse claim, a retrospective approval, an urgency bypass, a deleted command or a
+    # command wrapped in inert data all fail closed alike.
+    if _semantic_action_region(action) != _semantic_action_region(VM_GATE_DEPLOY_REVIEWED_ACTION):
+        findings.add("deploy_action_text_changed")
+
     # Gate propositions, judged ONLY inside the gate's own block.
     prose = _flat(block).lower()
     if VM_GATE_VM.lower() not in prose:
@@ -5111,6 +5962,10 @@ def _preflight_findings(text, findings):
     # A5 gate identity, exactly as step 4 carries it. See `_semantic_gate_block`.
     if _semantic_gate_block(block) != _semantic_gate_block(VM_GATE_PREFLIGHT_REVIEWED_BLOCK):
         findings.add("preflight_gate_text_changed")
+
+    # A6 action identity, exactly as step 4 carries it. See `_semantic_action_region`.
+    if _semantic_action_region(action) != _semantic_action_region(VM_GATE_PREFLIGHT_REVIEWED_ACTION):
+        findings.add("preflight_action_text_changed")
 
     prose = _flat(block).lower()
     if VM_GATE_VM.lower() not in prose:
@@ -5397,47 +6252,20 @@ VM_GATE_A4_FIXTURE_STEP_4 = (
     # fixture that could satisfy a DIFFERENT gate than the runbook would make the control group
     # meaningless. The constant stays the single explicit authority; the fixture consumes it.
     + VM_GATE_DEPLOY_REVIEWED_BLOCK
-    + r"""Copy the reviewed `scripts/ac2_member_create_uat_runner.ps1`,
-`scripts/member_create_uat_runner_lib.ps1`, and
-`config/member_create_uat_business_confirmation.json` to the AutoCount VM working area.
-
-**`AUTOCOUNT VM — DESKTOP-4I042L6`**
-
-```powershell
-New-Item -ItemType Directory -Path "C:\XB\create_uat\state" -Force
-```
-
-""")
+    # A6: and the fixture's ACTION region is now the reviewed constant too, for exactly the reason
+    # A5 gave for the gate. Under A5 the two drifted again -- the fixture's step-4 action dropped the
+    # "Create the VM-owned state directory once" sentence and its step-5 action was a loose
+    # miniature -- which was harmless only because nothing compared them. Action identity does
+    # compare them, so a fixture carrying a DIFFERENT action than the runbook would either fail
+    # permanently or, worse, prove the contract against prose no reviewer approved.
+    + VM_GATE_DEPLOY_REVIEWED_ACTION
+)
 
 VM_GATE_A4_FIXTURE_STEP_5 = (
     "### 5. No-write preflight (dry-run)\n\n"
     + VM_GATE_PREFLIGHT_REVIEWED_BLOCK
-    + r"""**`LAPTOP DEVELOPMENT MACHINE`** Only after the preflight approval above, build the approved
-package on the laptop, using the decision-review output that shows the chosen row as
-`READY_FOR_CREATE_REVIEW`:
-
-```bash
-python scripts/member_create_uat_approval.py approve --reviewer <handle> --input <form.csv> --decision-rows <member_intake_decision_rows.csv> --row-number <N> --ledger <ledger.jsonl>
-```
-
-```bash
-python scripts/member_create_uat_approval.py build-package --input <form.csv> --decision-rows <member_intake_decision_rows.csv> --row-number <N> --ledger <ledger.jsonl> --package-out <member_create_uat_package_v2.json>
-```
-
-Set the AutoCount connection through the process environment only (never in files, never in this
-runbook): `AC2_PROBE_SERVER_NAME`, `AC2_PROBE_DATABASE_NAME`, `AC2_PROBE_USER_ID`, and the
-password environment variable named by `-PasswordEnvVar`.
-
-**`AUTOCOUNT VM — DESKTOP-4I042L6`** Under the same preflight approval, copy the approved package
-to the VM and run the runner in dry-run mode (the default; no write switches).
-
-Copy the package to the VM, then dry-run:
-
-```powershell
-& scripts\ac2_member_create_uat_runner.ps1 -PackagePath "C:\XB\create_uat\member_create_uat_package.json" -StateDir "C:\XB\create_uat\state" -JsonOut "C:\XB\create_uat\member_create_uat_result.json"
-```
-
-### 6. Review aggregate evidence
+    + VM_GATE_PREFLIGHT_REVIEWED_ACTION
+    + r"""### 6. Review aggregate evidence
 
 The runner prints and writes a sanitized aggregate result only.
 
@@ -5690,6 +6518,11 @@ VM_GATE_A6_SHELL_DATA_SPOOFS = (
     ("heredoc_dash_stripped", "cat <<-EOF\n\t%s\n\tEOF"),
     ("heredoc_as_input", "wc -l <<EOF\n%s\nEOF"),
     ("unterminated_heredoc", "cat <<EOF\n%s"),
+    # Added at the repair commit, and disclosed as such: an independent post-repair attack found
+    # that a digit-leading delimiter word -- ordinary bash, `<<9EOF` -- slipped past a delimiter
+    # grammar shaped like an identifier and re-opened this exact false clean. The class was already
+    # controlled; this pins the spelling that escaped it.
+    ("heredoc_digit_leading_delimiter", "cat <<9EOF\n%s\n9EOF"),
 )
 # The positive half of A6-F4: a line-start CommonMark marker followed by ORDINARY horizontal
 # whitespace opens the same list, so all six forms must compare equal.
@@ -7019,9 +7852,22 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                         degraded = self._a3_duplicate(base, number,
                                                       VM_GATE_A3_CODE_BLOCK_HEADING,
                                                       VM_GATE_A3_HARMLESS_BODY, placement)
-                        self.assertEqual(vm_gate_findings(degraded), [],
-                                         "a four-space indented code line must not open a "
-                                         "top-level numbered step")
+                        findings = vm_gate_findings(degraded)
+                        # The proposition, stated directly: the indented form carries no heading
+                        # authority at all, for either step.
+                        for prefix in ("deploy", "preflight"):
+                            for key in ("_step_ambiguous", "_step_missing", "_heading_changed",
+                                        "_gate_missing", "_boundary_missing"):
+                                self.assertNotIn(prefix + key, findings,
+                                                 "a four-space indented code line must not open a "
+                                                 "top-level numbered step")
+                        # A6: two of the three placements land inside a reviewed ACTION region, and
+                        # adding any text there fails closed by design -- that is the A6-F1 contract,
+                        # not a regression. So the action identities are the ONLY findings this
+                        # control may ever see; anything else is still a failure.
+                        self.assertEqual(set(findings) - set(VM_GATE_A6_ACTION_KEYS.values()), set(),
+                                         "the indented form may only ever change reviewed action "
+                                         "text, never any other part of the contract")
 
     # -- E. One genuine heading, respelled. Semantically identical means clean. -- #
     def test_a3_whitespace_only_respelling_of_the_genuine_heading_stays_clean(self):
