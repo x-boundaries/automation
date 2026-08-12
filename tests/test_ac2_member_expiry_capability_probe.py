@@ -6529,6 +6529,106 @@ VM_GATE_A6_SHELL_DATA_SPOOFS = (
 VM_GATE_A6_EQUIVALENT_BULLETS = ("- ", "* ", "+ ", "-\t", "*\t", "+\t")
 
 
+# ---- DL-XB-123-001-A7-C1: rendered fence-POSITION controls ---- #
+# Fresh final Gate 4 at exact N demonstrated one further complete-guard CLEAN, and it is reproduced
+# against exact N before these controls are authored:
+#
+#   A7-F1  ``_semantic_markdown_region`` treats every physical newline as ordinary whitespace, so a
+#          required command line that ABSORBS the standalone closing code fence following it
+#          normalises to the identical string. Nothing else moves: the command text stays, the fence
+#          text stays, and every following line stays where it was. CommonMark requires a closing
+#          fence to be its own line apart from permitted indentation and trailing whitespace, so
+#          after the join the block is never closed. In the real step-4 layout that fence sits
+#          immediately before `### 5. No-write preflight (dry-run)`, which means the step-5 heading,
+#          its whole approval gate and the preflight commands render as literal code while
+#          ``vm_gate_findings()`` reports clean. 4/4 required commands x 2 authorities x 3 join
+#          spellings false-cleaned at N, and the permitted 0-3-space and trailing-whitespace fence
+#          spellings false-cleaned identically.
+#
+# A7 is answered at the LINE-IDENTITY layer, not with a Markdown parser, an English classifier or a
+# new finding key. A physical line that is fence-significant carries its own syntax identity in the
+# semantic representation instead of dissolving into the surrounding prose run, so a fence that
+# moves into another line -- or a line that acquires fence text -- changes the reviewed action
+# identity and reports the EXISTING ``*_action_text_changed`` finding. Ordinary prose reflow,
+# blank-line regrouping, CRLF representation and `-`/`*`/`+` marker equivalence are untouched,
+# because none of them changes which physical lines are fences.
+#
+# C1 supersedes the earlier A7 wording on ONE point, and it is honoured here as measured rather
+# than as assumed: an OPENING-fence join is NOT part of the RED class. Exact N already fails closed
+# on it -- the joined line no longer STARTS with the required command, so the A4/A5 active-invocation
+# anchor reports the operation missing -- so it is carried below as a positive regression control
+# that must stay fail-closed through the repair, never weakened to manufacture RED.
+
+# Both CommonMark fence markers. Used only to assert that a control really is operating on a fence
+# line; the checker's own rule is stated once, at the repair.
+VM_GATE_A7_FENCE_MARKERS = ("```", "~~~")
+VM_GATE_A7_CLOSING_FENCE = "```"
+# CommonMark stops treating a line as a fence at four leading spaces, exactly as A3 already holds
+# for numbered ATX headings. Kept as a named constant so the two exclusions read as one rule.
+VM_GATE_A7_FOUR_SPACES = "    "
+VM_GATE_A7_STEP5_HEADING = VM_GATE_REVIEWED_HEADINGS[VM_GATE_PREFLIGHT_STEP]
+
+# The four required commands that are followed by a standalone closing fence, with the reviewed
+# action identity each absorption must report and the active-invocation anchor an OPENING-fence join
+# already reports at N. No new finding key is introduced: both columns are existing keys.
+VM_GATE_A7_FENCE_OPERATIONS = (
+    ("step-4 state preparation", VM_GATE_A5_NEW_ITEM_LINE,
+     "deploy_action_text_changed", "deploy_state_preparation_missing"),
+    ("step-5 package approval", VM_GATE_PREFLIGHT_APPROVE_COMMAND,
+     "preflight_action_text_changed", "preflight_approval_command_missing"),
+    ("step-5 package build", VM_GATE_PREFLIGHT_BUILD_COMMAND,
+     "preflight_action_text_changed", "preflight_package_build_missing"),
+    ("step-5 dry-run runner", VM_GATE_A5_RUNNER_LINE,
+     "preflight_action_text_changed", "preflight_runner_invocation_missing"),
+)
+# How an editor, a merge or a reflow tool actually removes the newline. Every spelling leaves the
+# fence text and the command text intact, which is the whole point: the join is invisible to a
+# normaliser that collapses horizontal whitespace and line breaks alike.
+VM_GATE_A7_JOIN_SEPARATORS = (("space", " "), ("two_spaces", "  "), ("space_tab", " \t"))
+
+# Closing-fence spellings CommonMark accepts as closing the same block, so none of them is drift.
+# They are also the baselines the absorption controls run from: a repair that only recognised the
+# bare `` ``` `` spelling would leave the identical false clean open one space to the right.
+VM_GATE_A7_PERMITTED_CLOSING_FENCES = (
+    ("bare", "```"),
+    ("one_space", " ```"),
+    ("two_spaces", "  ```"),
+    ("three_spaces", "   ```"),
+    ("trailing_whitespace", "```   "),
+    ("trailing_tab", "```\t"),
+)
+# Closing-fence spellings that CHANGE the reviewed fence line. All of them already fail closed at
+# exact N through the action identity, and the repair must not lose that: preserving the full
+# stripped fence text is what keeps a marker swap, a length change and an added info string from
+# comparing equal by accident. The longer backtick fence is a deliberate conservative
+# false positive -- it closes the block under CommonMark -- and is recorded as such.
+VM_GATE_A7_ALTERED_CLOSING_FENCES = (
+    ("longer_backtick_fence", "`````"),
+    ("tilde_marker", "~~~"),
+    ("info_string_added", "```text"),
+)
+
+# The other half of the contract, and the reason A7 is a fence-POSITION repair rather than a
+# "newlines are significant" one. Each pair rewraps ONE prose paragraph of a reviewed action region
+# outside any fence: CommonMark renders both spellings as the same paragraph, so both must stay
+# clean. They are written out verbatim, from the reviewed action constants, so a control cannot pass
+# because a generated rewrap happened to touch nothing.
+VM_GATE_A7_HARMLESS_REFLOWS = (
+    ("step-4 state-directory sentence",
+     "area. Create the VM-owned state directory once (an operator prerequisite; the runner\n"
+     "never creates it):",
+     "area. Create the VM-owned state directory once\n"
+     "(an operator prerequisite; the runner never creates it):"),
+    ("step-5 package-build sentence",
+     "**`LAPTOP DEVELOPMENT MACHINE`** Only after the preflight approval above, build the"
+     " approved\npackage on the laptop, using the decision-review output that shows the chosen"
+     " row as\n`READY_FOR_CREATE_REVIEW`:",
+     "**`LAPTOP DEVELOPMENT MACHINE`** Only after the preflight approval above,\nbuild the"
+     " approved package on the laptop, using the decision-review output that\nshows the chosen"
+     " row as `READY_FOR_CREATE_REVIEW`:"),
+)
+
+
 class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
     def setUp(self):
         self.runbook = read_repo_text("probe_runbook")
@@ -10168,6 +10268,256 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                 _, _, live_action = self._a6_layout(self.create_runbook, number)
                 self.assertEqual(fixture_action, live_action,
                                  "step %d action must be one shared reviewed authority" % number)
+
+    # ---- DL-XB-123-001-A7-C1: rendered fence-position controls ---- #
+    # Exercised against BOTH authorities, exactly as the A4, A5 and A6 controls are. At this commit
+    # the N checker normalises every physical newline as ordinary whitespace, so the absorption
+    # controls below are the intentional RED; the regression and equivalence controls are already
+    # green at N and must stay green through the repair.
+    @staticmethod
+    def _a7_is_fence(line):
+        stripped = line.strip()
+        return any(stripped.startswith(marker) for marker in VM_GATE_A7_FENCE_MARKERS)
+
+    def _a7_lines(self, base, command):
+        """The base's physical lines, and the index of the ONE line that IS ``command``.
+
+        Exactly one, so a control can never operate on a copy of the command that lives in prose
+        or in the approval's own recital of it.
+        """
+        lines = base.split("\n")
+        at = [index for index, line in enumerate(lines) if line == command]
+        self.assertEqual(len(at), 1,
+                         "the base must carry exactly one standalone %r line" % (command[:56],))
+        return lines, at[0]
+
+    def _a7_fence_neighbours(self, base, command):
+        """``(lines, index)`` for a command that is fenced on both sides in the reviewed layout."""
+        lines, at = self._a7_lines(base, command)
+        self.assertTrue(self._a7_is_fence(lines[at - 1]),
+                        "the reviewed command must open with its own fence line")
+        self.assertTrue(self._a7_is_fence(lines[at + 1]),
+                        "the reviewed command must close with its own fence line")
+        return lines, at
+
+    def _a7_set_fence(self, base, command, position, spelling):
+        """Respell the command's opening or closing fence LINE, changing nothing else.
+
+        No "must differ" assertion lives here on purpose: the CommonMark-permitted spelling set
+        legitimately includes the reviewed spelling itself, and that identity case is a control
+        group member rather than a broken control. Every caller that DOES require a change asserts
+        it for itself.
+        """
+        lines, at = self._a7_fence_neighbours(base, command)
+        lines[at - 1 if position == "opening" else at + 1] = spelling
+        return "\n".join(lines)
+
+    def _a7_absorb_fence(self, base, command, position, separator=" "):
+        """Join the command line with its adjacent fence line, removing ONE physical newline.
+
+        Nothing else changes. The fence text survives, the command text survives, and every other
+        line keeps its position -- which is exactly why the join is invisible to a normaliser that
+        treats a line break as ordinary whitespace. The standalone-fence-line count is asserted to
+        drop by exactly one, so the control cannot pass by having deleted the fence outright.
+        """
+        lines, at = self._a7_fence_neighbours(base, command)
+        fence_at = at - 1 if position == "opening" else at + 1
+        fence = lines[fence_at]
+        joined = ([fence + separator + command] if position == "opening"
+                  else [command + separator + fence])
+        degraded = "\n".join(lines[:min(at, fence_at)] + joined + lines[max(at, fence_at) + 1:])
+        self.assertNotEqual(degraded, base, "the degraded document must actually differ")
+        self.assertIn(command, degraded, "the required command text must survive the join")
+        self.assertIn(fence.strip(), degraded, "the fence text must survive the join")
+        self.assertEqual(degraded.split("\n").count(fence), base.split("\n").count(fence) - 1,
+                         "exactly one STANDALONE fence line must stop being its own line")
+        return degraded
+
+    def test_a7_control_command_absorbing_its_closing_fence_fails_closed(self):
+        """The demonstrated exact-N complete-guard CLEAN class, over both authorities.
+
+        Only a physical newline is removed. Under CommonMark the block is then never closed, so
+        everything after it renders as literal code -- which is why this must report the reviewed
+        action identity rather than clean.
+        """
+        for base_name, base in self._a6_bases():
+            for label, command, action_key, _ in VM_GATE_A7_FENCE_OPERATIONS:
+                for spelling, separator in VM_GATE_A7_JOIN_SEPARATORS:
+                    with self.subTest(base=base_name, operation=label, join=spelling):
+                        degraded = self._a7_absorb_fence(base, command, "closing", separator)
+                        self.assertIn(action_key, vm_gate_findings(degraded),
+                                      "%s absorbing its closing fence must report %s"
+                                      % (label, action_key))
+
+    def test_a7_control_step4_absorption_that_swallows_the_step5_gate_fails_closed(self):
+        """The cross-step case, stated explicitly because it is the safety-relevant one.
+
+        The step-4 closing fence sits immediately before the step-5 heading in both authorities.
+        Absorbing it leaves that heading, its whole approval gate and the preflight commands inside
+        an unterminated fence, so the control also asserts the heading is still TEXTUALLY present:
+        the finding must come from the fence moving, not from the heading having been deleted.
+        """
+        for base_name, base in self._a6_bases():
+            with self.subTest(base=base_name):
+                degraded = self._a7_absorb_fence(base, VM_GATE_A5_NEW_ITEM_LINE, "closing")
+                self.assertIn(VM_GATE_A7_STEP5_HEADING, degraded,
+                              "the step-5 heading must remain textually present")
+                standalone = "\n" + VM_GATE_A7_CLOSING_FENCE + "\n\n" + VM_GATE_A7_STEP5_HEADING
+                self.assertIn(standalone, base,
+                              "the reviewed layout must close step 4 on its own fence line")
+                self.assertNotIn(standalone, degraded,
+                                 "the standalone fence that closed step 4 must be gone")
+                self.assertIn("deploy_action_text_changed", vm_gate_findings(degraded),
+                              "an unterminated step-4 fence swallowing the step-5 gate and its"
+                              " approval must fail closed")
+
+    def test_a7_control_permitted_closing_fence_spellings_stay_clean(self):
+        """0-3 leading spaces and trailing horizontal whitespace still close the same block."""
+        for base_name, base in self._a6_bases():
+            for label, command, _, _ in VM_GATE_A7_FENCE_OPERATIONS:
+                for spelling, fence in VM_GATE_A7_PERMITTED_CLOSING_FENCES:
+                    with self.subTest(base=base_name, operation=label, fence=spelling):
+                        self.assertEqual(
+                            vm_gate_findings(self._a7_set_fence(base, command, "closing", fence)),
+                            [], "%r closes the same block, so %s must stay clean"
+                                % (fence, label))
+
+    def test_a7_control_permitted_closing_fence_spellings_still_fail_when_absorbed(self):
+        """Every permitted spelling must ALSO fail closed once it stops being its own line."""
+        for base_name, base in self._a6_bases():
+            for label, command, action_key, _ in VM_GATE_A7_FENCE_OPERATIONS:
+                for spelling, fence in VM_GATE_A7_PERMITTED_CLOSING_FENCES:
+                    with self.subTest(base=base_name, operation=label, fence=spelling):
+                        permitted = self._a7_set_fence(base, command, "closing", fence)
+                        degraded = self._a7_absorb_fence(permitted, command, "closing")
+                        self.assertIn(action_key, vm_gate_findings(degraded),
+                                      "%s absorbing a %s closing fence must report %s"
+                                      % (label, spelling, action_key))
+
+    def test_a7_control_four_space_indented_fence_fails_closed(self):
+        """Four leading spaces stop the line being a fence at all, so the block boundary moved.
+
+        The same CommonMark exclusion A3 already applies to numbered ATX headings. Indenting the
+        opening fence turns it into indented-code content and lets the ORIGINAL closing fence open
+        a new block instead of closing one, which can swallow everything after it.
+        """
+        for base_name, base in self._a6_bases():
+            for label, command, action_key, _ in VM_GATE_A7_FENCE_OPERATIONS:
+                for position in ("opening", "closing"):
+                    with self.subTest(base=base_name, operation=label, fence=position):
+                        lines, at = self._a7_fence_neighbours(base, command)
+                        fence = lines[at - 1 if position == "opening" else at + 1]
+                        degraded = self._a7_set_fence(
+                            base, command, position, VM_GATE_A7_FOUR_SPACES + fence.strip())
+                        self.assertNotEqual(degraded, base, "the indent must change the text")
+                        self.assertIn(action_key, vm_gate_findings(degraded),
+                                      "a four-space-indented %s fence for %s must report %s"
+                                      % (position, label, action_key))
+
+    def test_a7_control_opening_fence_join_remains_fail_closed(self):
+        """C1 regression/positive control: exact N ALREADY fails closed here.
+
+        The joined line no longer STARTS with the required command, so the A4/A5 active-invocation
+        anchor reports the operation missing. That behaviour is preserved rather than restated as
+        RED, and the expectation is deliberately not weakened to manufacture one.
+        """
+        for base_name, base in self._a6_bases():
+            for label, command, _, invocation_key in VM_GATE_A7_FENCE_OPERATIONS:
+                for spelling, separator in VM_GATE_A7_JOIN_SEPARATORS:
+                    with self.subTest(base=base_name, operation=label, join=spelling):
+                        degraded = self._a7_absorb_fence(base, command, "opening", separator)
+                        self.assertIn(invocation_key, vm_gate_findings(degraded),
+                                      "%s joined to its opening fence must keep reporting %s"
+                                      % (label, invocation_key))
+
+    def test_a7_control_altered_and_removed_fences_remain_fail_closed(self):
+        """Preserving the full stripped fence text is what keeps these from comparing equal.
+
+        A marker swap, a longer fence, an added info string and outright fence removal all already
+        fail closed at exact N through the reviewed action identity. The longer backtick fence is a
+        conservative false positive -- CommonMark accepts it as closing the block -- and is
+        recorded as one rather than excused.
+        """
+        for base_name, base in self._a6_bases():
+            for label, command, action_key, _ in VM_GATE_A7_FENCE_OPERATIONS:
+                for spelling, fence in VM_GATE_A7_ALTERED_CLOSING_FENCES:
+                    with self.subTest(base=base_name, operation=label, fence=spelling):
+                        altered = self._a7_set_fence(base, command, "closing", fence)
+                        self.assertNotEqual(altered, base, "the respelling must change the text")
+                        self.assertIn(action_key, vm_gate_findings(altered),
+                                      "a %s closing fence for %s must report %s"
+                                      % (spelling, label, action_key))
+                for position in ("opening", "closing"):
+                    with self.subTest(base=base_name, operation=label, removed=position):
+                        lines, at = self._a7_fence_neighbours(base, command)
+                        fence_at = at - 1 if position == "opening" else at + 1
+                        removed = "\n".join(lines[:fence_at] + lines[fence_at + 1:])
+                        self.assertIn(action_key, vm_gate_findings(removed),
+                                      "removing the %s fence for %s must report %s"
+                                      % (position, label, action_key))
+
+    def test_a7_control_opening_fence_indentation_within_three_spaces_stays_clean(self):
+        """The already-safe cases C1 requires preserved: 0-3 leading spaces still open a fence."""
+        for base_name, base in self._a6_bases():
+            for label, command, _, _ in VM_GATE_A7_FENCE_OPERATIONS:
+                for indent in range(4):
+                    with self.subTest(base=base_name, operation=label, indent=indent):
+                        lines, at = self._a7_fence_neighbours(base, command)
+                        fence = lines[at - 1].strip()
+                        self.assertEqual(
+                            vm_gate_findings(self._a7_set_fence(
+                                base, command, "opening", " " * indent + fence)), [],
+                            "a %d-space opening fence still opens the block for %s"
+                            % (indent, label))
+
+    def test_a7_control_harmless_action_reflow_stays_clean(self):
+        """A7 is a fence-POSITION repair, so ordinary paragraph rewrapping must stay non-material."""
+        for base_name, base in self._a6_bases():
+            for label, wrapped, rewrapped in VM_GATE_A7_HARMLESS_REFLOWS:
+                with self.subTest(base=base_name, reflow=label):
+                    self.assertEqual(base.count(wrapped), 1,
+                                     "the base must carry the reviewed %s once" % label)
+                    reflowed = base.replace(wrapped, rewrapped, 1)
+                    self.assertNotEqual(reflowed, base, "the reflow must actually change the text")
+                    self.assertEqual(vm_gate_findings(reflowed), [],
+                                     "rewrapping the %s must stay clean" % label)
+
+    def test_a7_control_blank_line_regrouping_around_fences_stays_clean(self):
+        """Blank lines are dropped, not encoded, so regrouping paragraphs is not drift either."""
+        for base_name, base in self._a6_bases():
+            for label, command, _, _ in VM_GATE_A7_FENCE_OPERATIONS:
+                for position in ("opening", "closing"):
+                    with self.subTest(base=base_name, operation=label, blank=position):
+                        lines, at = self._a7_fence_neighbours(base, command)
+                        cut = at - 1 if position == "opening" else at + 2
+                        regrouped = "\n".join(lines[:cut] + [""] + lines[cut:])
+                        self.assertNotEqual(regrouped, base, "the regrouping must change the text")
+                        self.assertEqual(vm_gate_findings(regrouped), [],
+                                         "an extra blank line %s the %s fence must stay clean"
+                                         % (position, label))
+
+    def test_a7_control_action_region_bullet_whitespace_stays_clean(self):
+        """The `-`/`*`/`+` equivalence, asserted in the region A7 actually changes.
+
+        A6 proved it for the gate block. The action region is what the fence repair touches, so the
+        promise is re-proved there: a line-start CommonMark marker followed by ordinary horizontal
+        whitespace opens the same list item and must still compare equal.
+        """
+        for base_name, base in self._a6_bases():
+            for number in (VM_GATE_DEPLOY_STEP, VM_GATE_PREFLIGHT_STEP):
+                section, _, action = self._a6_layout(base, number)
+                if "\n- " not in action:
+                    continue
+                for bullet in VM_GATE_A6_EQUIVALENT_BULLETS:
+                    with self.subTest(base=base_name, step=number, bullet=repr(bullet)):
+                        swapped = "\n".join(
+                            bullet + line[2:] if line.startswith("- ") else line
+                            for line in action.splitlines())
+                        degraded = base.replace(section, section.replace(action, swapped, 1), 1)
+                        self.assertNotEqual(degraded, base, "the swap must change the text")
+                        self.assertEqual(vm_gate_findings(degraded), [],
+                                         "marker %r opens the same list, so the step-%d action"
+                                         " must stay clean" % (bullet, number))
 
 
 @unittest.skipIf(PS is None, "no PowerShell executable available")
