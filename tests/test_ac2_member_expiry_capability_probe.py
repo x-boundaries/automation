@@ -5463,6 +5463,13 @@ VM_GATE_REVIEWED_ACTIONS = {
 # CommonMark opens the same list with any of these, so #118 already treats the choice as syntax.
 # Gate identity must agree, or an editor normalising a list would read as a wording change.
 VM_GATE_BULLET_MARKERS = ("-", "*", "+")
+# A7: the one line-level grammar the semantic region treats as SYNTAX rather than prose. CommonMark
+# opens and closes a fenced code block on a line whose first non-space run is three or more
+# backticks or three or more tildes, and allows at most three leading spaces -- at four the line is
+# indented-code content and not a fence, which is the same four-leading-space exclusion A3 already
+# applies to numbered ATX headings. Deliberately a fence-LINE test and nothing more: A7 authorises
+# no Markdown parser, no block model and no new finding key.
+VM_GATE_FENCE_LINE = re.compile(r"^ {0,3}(?:`{3,}|~{3,})")
 
 # Everything a resolved step must prove. When the structural layout CANNOT be resolved -- no
 # gate, two gates, no boundary, two boundaries, or a boundary before its gate -- the step is
@@ -5539,14 +5546,16 @@ def _semantic_heading(line):
 
 
 def _semantic_markdown_region(region):
-    """The RENDERED identity of a reviewed Markdown region. Pure text in, text out.
+    """The RENDERED identity of a reviewed Markdown region. Pure text in, comparable value out.
 
     The shared normalisation both reviewed identities use -- the gate block (A5) and the action
-    region (A6). Exactly two things are treated as syntax, both because this contract already
-    treats them that way everywhere else:
+    region (A6). Three things are treated as syntax, each because this contract already treats it
+    that way everywhere else:
 
     * ordinary whitespace, so a reflow or a CRLF checkout is not drift;
-    * the line-start CommonMark bullet marker, since `-`, `*` and `+` open the same list (#118).
+    * the line-start CommonMark bullet marker, since `-`, `*` and `+` open the same list (#118);
+    * the code-fence LINE, because where a fence sits is what decides whether the text after it is
+      a rendered heading and a rendered approval gate or the literal contents of a code block.
 
     Everything else is CONTENT. Case is preserved, punctuation is preserved, command tokens and
     code-fence delimiters are preserved, and no word is dropped, because each of those would let
@@ -5561,17 +5570,39 @@ def _semantic_markdown_region(region):
     item either way, so the promise A5 made about `-`/`*`/`+` is now actually kept. The test stays
     line-start only and requires the SECOND character to be whitespace, so ``--flag`` and a bare
     ``-`` are untouched.
+
+    A7-F1: the return value is a SEQUENCE OF UNITS rather than one flat string, and a
+    fence-significant physical line is its own unit. Under A6 every physical newline was ordinary
+    whitespace, so a required command line that absorbed the standalone closing fence following it
+    normalised to the identical string and the complete guard reported clean -- while CommonMark,
+    which needs a closing fence to be its own line, no longer closed the block at all. Ordinary
+    prose lines still COALESCE into one whitespace-joined run between fences, which is what keeps
+    paragraph reflow, blank-line regrouping and marker equivalence non-material: A7 is a
+    fence-POSITION repair, not a decision that newlines are significant. A fence unit carries the
+    whole stripped fence line, so the marker character, the fence length, the info string and any
+    command text joined into it are all compared rather than assumed equal.
     """
-    lines = []
+    units, prose = [], []
     for line in region.splitlines():
         stripped = line.strip()
         if not stripped:
             continue
+        # Matched against the RAW line, because indentation has to be judged before it is
+        # stripped: at four leading spaces the line is indented-code content and not a fence at
+        # all, so it becomes ordinary prose here and the moved block boundary fails closed.
+        if VM_GATE_FENCE_LINE.match(line):
+            if prose:
+                units.append(("prose", " ".join(prose)))
+                prose = []
+            units.append(("fence", " ".join(stripped.split())))
+            continue
         if len(stripped) > 1 and stripped[0] in VM_GATE_BULLET_MARKERS \
                 and stripped[1] in " \t":
             stripped = "- " + stripped[2:]
-        lines.append(" ".join(stripped.split()))
-    return " ".join(lines)
+        prose.append(" ".join(stripped.split()))
+    if prose:
+        units.append(("prose", " ".join(prose)))
+    return tuple(units)
 
 
 def _semantic_gate_block(block):
