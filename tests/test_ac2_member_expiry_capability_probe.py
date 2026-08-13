@@ -6970,6 +6970,130 @@ VM_GATE_A8_ENV_ANCHOR = VM_GATE_A4_ENV_ANCHOR
 VM_GATE_A8_VALUE_ASSIGNMENT_SPELLINGS = ("=", " =", ":=")
 
 
+# ---- DL-XB-123-001-A9-C1: inherited fenced-block state controls ---- #
+# Fresh final Gate 4 at exact R returned AMEND on one further accepted class, and it is reproduced
+# against exact R before these controls are authored:
+#
+#   A9-F1  BLOCKING-01. ``_semantic_markdown_region`` begins EVERY supplied slice with no
+#          fenced-block state open. That is sound only when the slice itself starts outside a
+#          fence, and several protected authorities are extracted from the MIDDLE of the complete
+#          document: steps 4 and 5 through ``_numbered_step_section``, the `## Safety boundary`
+#          through its own opening scan, and the step-3 host-sync gate through a bare ``find()``.
+#          A valid fenced-code opener placed BEFORE such an authority therefore makes CommonMark
+#          render the whole authority as literal code, while the checker -- starting from the false
+#          assumption that its slice begins outside a fence -- compares it as operative prose and
+#          reports clean.
+#
+#          Reproduced at exact R against BOTH bases (canonical fixture and live create-UAT
+#          runbook) for six opener spellings x four permitted indents, 24 forms per authority:
+#
+#            step-4 deployment authority   24/24 carrier absent, 24/24 COMPLETE-guard clean;
+#            `## Safety boundary`          24/24 carrier absent, 24/24 COMPLETE-guard clean;
+#            step-3 host-sync authority    24/24 `gate_missing` absent, 24/24 COMPLETE-guard clean;
+#            step-5 preflight authority    24/24 carrier absent, 0/24 complete-guard clean.
+#
+#          The step-5 line is recorded as measured rather than as assumed. There is no document
+#          position between the two VM authorities that lies OUTSIDE step 4's own section, so an
+#          opener that fences step 5 necessarily lands in step 4's ACTION region and the A6 action
+#          identity already fails closed on the added line. The step-5 AUTHORITY is nevertheless
+#          falsely clean, which is what the carrier control below proves; a fenced step-5 authority
+#          reached from a position that IS outside step 4 is the step-4 form, and that one is a
+#          complete-guard false clean.
+#
+# A9 answers ONE question -- "does required authority begin while inherited document fence state is
+# open?" -- with one bounded pure document-prefix authority over the SAME accepted fence grammar
+# A7 and A8 already use. It is not a Markdown parser, not a block model and not a heading-discovery
+# rewrite: a numbered heading or a gate marker that appears inside fenced code still counts as an
+# occurrence, so the conservative fail-closed debt recorded at PRRT_kwDOSbJI_s6YQTNF is untouched
+# and A9 can only ADD fail-closed behaviour. No new finding key is introduced: the two gate
+# identities and `safety_boundary_not_four_way` carry the VM authorities, and the host-sync gate --
+# which has no region identity of its own -- is carried by the existing `gate_missing` cascade the
+# absent-marker branch already reports.
+
+# The RED oracle. Deliberately an INDEPENDENT reading of the accepted fence grammar rather than a
+# call into the checker: a control that asked the implementation under test whether a fence was
+# open would prove only that the implementation agrees with itself. It answers the one question
+# above and nothing else -- no headings, no lists, no blockquotes, no HTML, no inline state.
+VM_GATE_A9_ORACLE_LINE = re.compile(r"^(?P<indent> {0,3})(?P<run>`{3,}|~{3,})(?P<info>.*)$")
+
+
+def _a9_fence_open_at(text, offset):
+    """The fenced block open where ``offset``'s own line begins, as ``(marker, length)`` or None.
+
+    Only text STRICTLY in front of that line is inspected, which is what "inherited" means: the
+    authority's own first line cannot be the fence that hides it. An unclosed opener stays open
+    through the end of the supplied text.
+    """
+    marker, length = None, 0
+    for line in text[:text.rfind("\n", 0, offset) + 1].splitlines():
+        found = VM_GATE_A9_ORACLE_LINE.match(line.rstrip("\r"))
+        if found is None:
+            continue
+        run, info = found.group("run"), found.group("info")
+        if marker is None:
+            marker, length = run[0], len(run)
+        elif run[0] == marker and len(run) >= length and not info.strip():
+            marker, length = None, 0
+    return None if marker is None else (marker, length)
+
+
+# Opener spellings the accepted grammar recognises: both markers, the minimum and a longer run, and
+# an info string, which CommonMark allows on an opening fence and forbids on a closing one.
+VM_GATE_A9_FENCE_OPENERS = (
+    ("backtick_three", "```"),
+    ("backtick_five", "`````"),
+    ("tilde_three", "~~~"),
+    ("tilde_five", "~~~~~"),
+    ("backtick_info_string", "```powershell"),
+    ("tilde_info_string", "~~~text"),
+)
+# The leading indentation an opening fence may carry. Four columns is the exclusion, not an option.
+VM_GATE_A9_OPENER_INDENTS = (("zero", ""), ("one", " "), ("two", "  "), ("three", "   "))
+# Line shapes that CONTAIN fence characters but open no fenced block: at four columns the line is
+# indented CODE, which is the same exclusion A3 holds for numbered ATX headings and A7 for fence
+# lines. A9 must not treat any of these as an inherited opener.
+VM_GATE_A9_NON_OPENERS = (
+    ("four_spaces", "    ```"),
+    ("eight_spaces", "        ```"),
+    ("tab", "\t```"),
+    ("space_tab", " \t```"),
+    ("four_spaces_tilde", "    ~~~"),
+)
+# Closing grammar, with what it leaves behind at the authority. `closed` is the oracle's verdict:
+# True means the earlier block really was closed before the authority began, and A9 must NOT report
+# a finding merely because a fenced block existed earlier in the document.
+VM_GATE_A9_CLOSING_FORMS = (
+    ("matching_closer", "```", "```", True),
+    ("longer_closer", "```", "`````", True),
+    ("indented_closer", "```", "   ```", True),
+    ("trailing_space_closer", "```", "```   ", True),
+    ("tilde_matching_closer", "~~~", "~~~", True),
+    ("mismatched_marker", "```", "~~~", False),
+    ("tilde_mismatched_marker", "~~~", "```", False),
+    ("too_short_closer", "`````", "```", False),
+    ("info_string_closer", "```", "```text", False),
+    ("four_space_closer", "```", "    ```", False),
+)
+# Ordinary block content, so the pair above is a real fenced block rather than an empty one.
+VM_GATE_A9_FILLER = "an ordinary example line"
+
+# Each protected VM authority: the landmark an opener is placed in front of, the truthful EXISTING
+# carrier it must report, and whether exact R reported a COMPLETE-guard clean for that placement.
+# `isolated` is measured, not assumed -- see the step-5 note above.
+VM_GATE_A9_VM_AUTHORITIES = (
+    ("step-4 deployment", VM_GATE_REVIEWED_HEADINGS[VM_GATE_DEPLOY_STEP],
+     "deploy_gate_text_changed", True),
+    ("step-5 preflight", VM_GATE_REVIEWED_HEADINGS[VM_GATE_PREFLIGHT_STEP],
+     "preflight_gate_text_changed", False),
+    ("safety boundary", VM_GATE_SAFETY_HEADING, "safety_boundary_not_four_way", True),
+)
+# The step-3 authority is the host-sync GATE MARKER itself, which is the landmark
+# `host_sync_gate_findings` bounds its prose slice from; the opener is placed in front of the step
+# heading that opens the section carrying it. The carrier is the existing absent-marker cascade.
+HOST_SYNC_A9_STEP_HEADING = "### 3. "
+HOST_SYNC_A9_CARRIER = "gate_missing"
+
+
 class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
     def setUp(self):
         self.runbook = read_repo_text("probe_runbook")
@@ -11089,6 +11213,175 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                     self.assertNotIn(name + spelling, self.create_runbook,
                                      "%r must never be assigned a value in the runbook"
                                      % (name,))
+
+    # ---- DL-XB-123-001-A9-C1: inherited fenced-block state controls ---- #
+    # Every control degrades an in-memory copy only, never a repository file, and every one runs
+    # against BOTH bases. The fence state each control depends on is established by the INDEPENDENT
+    # oracle above and never by the checker, so a repair cannot satisfy these by agreeing with
+    # itself.
+
+    def _a9_vm_bases(self):
+        return (("canonical fixture", VM_GATE_CANONICAL_FIXTURE),
+                ("live create-UAT runbook", self.create_runbook))
+
+    def _a9_host_bases(self):
+        return (("host-sync fixture", HOST_SYNC_CANONICAL_FIXTURE),
+                ("live create-UAT runbook", self.create_runbook))
+
+    def _a9_insert_before(self, base, needle, *lines):
+        """Insert whole physical lines immediately in front of the line carrying ``needle``."""
+        self.assertEqual(base.count(needle), 1,
+                         "the base must carry the landmark %r exactly once" % (needle[:48],))
+        at = base.index(needle)
+        start = base.rfind("\n", 0, at) + 1
+        degraded = base[:start] + "".join(line + "\n" for line in lines) + base[start:]
+        self.assertNotEqual(degraded, base, "the inserted lines must change the document")
+        return degraded
+
+    def _a9_authority_at(self, text, needle):
+        at = text.find(needle)
+        self.assertNotEqual(at, -1, "the degraded document must still carry the authority")
+        return at
+
+    def test_a9_control_reviewed_authorities_begin_outside_any_fence(self):
+        """The control group. Without it every RED control below could be vacuously satisfied."""
+        for base_name, base in self._a9_vm_bases():
+            for label, needle, _key, _isolated in VM_GATE_A9_VM_AUTHORITIES:
+                with self.subTest(base=base_name, authority=label):
+                    self.assertIsNone(
+                        _a9_fence_open_at(base, self._a9_authority_at(base, needle)),
+                        "the reviewed %s authority must begin outside any fence" % label)
+        for base_name, base in self._a9_host_bases():
+            with self.subTest(base=base_name, authority="step-3 host-sync"):
+                self.assertIsNone(
+                    _a9_fence_open_at(base, self._a9_authority_at(base, HOST_SYNC_GATE_MARKER)),
+                    "the reviewed host-sync gate must begin outside any fence")
+
+    def test_a9_control_inherited_fence_before_a_vm_authority_fails_closed(self):
+        """Accepted A9-F1: authority rendered as literal code is not operative authority.
+
+        Nothing is added to, removed from or reworded inside any authority. ONE valid fenced-code
+        opener is placed in front of it, which is enough for CommonMark to render the whole
+        authority as the literal contents of a code block.
+        """
+        for base_name, base in self._a9_vm_bases():
+            for label, needle, key, _isolated in VM_GATE_A9_VM_AUTHORITIES:
+                for opener_name, opener in VM_GATE_A9_FENCE_OPENERS:
+                    for indent_name, indent in VM_GATE_A9_OPENER_INDENTS:
+                        with self.subTest(base=base_name, authority=label,
+                                          opener=opener_name, indent=indent_name):
+                            degraded = self._a9_insert_before(base, needle, indent + opener)
+                            at = self._a9_authority_at(degraded, needle)
+                            self.assertIsNotNone(
+                                _a9_fence_open_at(degraded, at),
+                                "the oracle must agree the authority begins inside an open fence")
+                            self.assertIn(key, vm_gate_findings(degraded),
+                                          "a %s authority inside inherited fenced code must fail"
+                                          " closed" % label)
+
+    def test_a9_control_inherited_fence_before_the_host_sync_authority_fails_closed(self):
+        """The same rule for the step-3 gate, carried by the existing absent-marker cascade."""
+        for base_name, base in self._a9_host_bases():
+            for opener_name, opener in VM_GATE_A9_FENCE_OPENERS:
+                for indent_name, indent in VM_GATE_A9_OPENER_INDENTS:
+                    with self.subTest(base=base_name, opener=opener_name, indent=indent_name):
+                        degraded = self._a9_insert_before(
+                            base, HOST_SYNC_A9_STEP_HEADING, indent + opener)
+                        at = self._a9_authority_at(degraded, HOST_SYNC_GATE_MARKER)
+                        self.assertIsNotNone(
+                            _a9_fence_open_at(degraded, at),
+                            "the oracle must agree the gate begins inside an open fence")
+                        self.assertIn(HOST_SYNC_A9_CARRIER, host_sync_gate_findings(degraded),
+                                      "a host-sync gate inside inherited fenced code must fail"
+                                      " closed")
+
+    def test_a9_control_fence_closing_grammar_decides_inherited_state(self):
+        """A9 must follow the accepted CLOSING grammar, not a bare fence-line toggle.
+
+        A validly closed earlier block leaves nothing inherited and must not create a finding; a
+        closer that CommonMark does not accept -- different marker, shorter run, an info string, or
+        four columns of indentation -- leaves the block open and must fail closed.
+        """
+        for base_name, base in self._a9_vm_bases():
+            for label, needle, key, isolated in VM_GATE_A9_VM_AUTHORITIES:
+                for form, opener, closer, closed in VM_GATE_A9_CLOSING_FORMS:
+                    with self.subTest(base=base_name, authority=label, closing=form):
+                        degraded = self._a9_insert_before(
+                            base, needle, opener, VM_GATE_A9_FILLER, closer)
+                        at = self._a9_authority_at(degraded, needle)
+                        state = _a9_fence_open_at(degraded, at)
+                        findings = vm_gate_findings(degraded)
+                        if closed:
+                            self.assertIsNone(state, "the oracle must agree %s closes" % form)
+                            self.assertNotIn(key, findings,
+                                             "an earlier fenced block closed by %s must not make"
+                                             " the %s authority fail" % (form, label))
+                            if isolated:
+                                self.assertEqual(findings, [],
+                                                 "a closed earlier fenced block in front of the %s"
+                                                 " authority must stay clean" % label)
+                        else:
+                            self.assertIsNotNone(state,
+                                                 "the oracle must agree %s leaves the block open"
+                                                 % form)
+                            self.assertIn(key, findings,
+                                          "a block left open by %s must make the %s authority fail"
+                                          " closed" % (form, label))
+
+    def test_a9_control_host_sync_fence_closing_grammar_decides_inherited_state(self):
+        """The same closing contract on the step-3 authority."""
+        for base_name, base in self._a9_host_bases():
+            for form, opener, closer, closed in VM_GATE_A9_CLOSING_FORMS:
+                with self.subTest(base=base_name, closing=form):
+                    degraded = self._a9_insert_before(
+                        base, HOST_SYNC_A9_STEP_HEADING, opener, VM_GATE_A9_FILLER, closer)
+                    at = self._a9_authority_at(degraded, HOST_SYNC_GATE_MARKER)
+                    findings = host_sync_gate_findings(degraded)
+                    if closed:
+                        self.assertIsNone(_a9_fence_open_at(degraded, at),
+                                          "the oracle must agree %s closes" % form)
+                        self.assertEqual(findings, [],
+                                         "a closed earlier fenced block in front of the host-sync"
+                                         " authority must stay clean")
+                    else:
+                        self.assertIsNotNone(_a9_fence_open_at(degraded, at),
+                                             "the oracle must agree %s leaves the block open"
+                                             % form)
+                        self.assertIn(HOST_SYNC_A9_CARRIER, findings,
+                                      "a block left open by %s must make the host-sync authority"
+                                      " fail closed" % form)
+
+    def test_a9_control_indented_code_fence_characters_open_no_fence(self):
+        """The positive control. Four columns is indented CODE, so none of these is an opener.
+
+        A9 must not fail closed merely because a line CONTAINS fence characters, or the repair
+        would be a different defect rather than a fix for this one.
+        """
+        for base_name, base in self._a9_vm_bases():
+            for label, needle, key, isolated in VM_GATE_A9_VM_AUTHORITIES:
+                for form, line in VM_GATE_A9_NON_OPENERS:
+                    with self.subTest(base=base_name, authority=label, line=form):
+                        degraded = self._a9_insert_before(base, needle, line)
+                        at = self._a9_authority_at(degraded, needle)
+                        self.assertIsNone(_a9_fence_open_at(degraded, at),
+                                          "the oracle must agree %s opens no fence" % form)
+                        findings = vm_gate_findings(degraded)
+                        self.assertNotIn(key, findings,
+                                         "%s is indented code, not an inherited opener, so the %s"
+                                         " authority must not fail on it" % (form, label))
+                        if isolated:
+                            self.assertEqual(findings, [],
+                                             "%s in front of the %s authority must stay clean"
+                                             % (form, label))
+        for base_name, base in self._a9_host_bases():
+            for form, line in VM_GATE_A9_NON_OPENERS:
+                with self.subTest(base=base_name, authority="step-3 host-sync", line=form):
+                    degraded = self._a9_insert_before(base, HOST_SYNC_A9_STEP_HEADING, line)
+                    at = self._a9_authority_at(degraded, HOST_SYNC_GATE_MARKER)
+                    self.assertIsNone(_a9_fence_open_at(degraded, at),
+                                      "the oracle must agree %s opens no fence" % form)
+                    self.assertEqual(host_sync_gate_findings(degraded), [],
+                                     "%s is indented code, not an inherited opener" % form)
 
 
 @unittest.skipIf(PS is None, "no PowerShell executable available")
