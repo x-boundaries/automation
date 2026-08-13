@@ -7347,6 +7347,768 @@ VM_GATE_A10_CLOSING_FORMS = VM_GATE_A9_CLOSING_FORMS + (
 )
 
 
+# ---- DL-XB-123-001-A11-C1: post-ready Codex four-finding controls ---- #
+# Fresh post-ready Gate 4 at exact V returned four further accepted classes. Each is reproduced
+# against exact V by the controls below BEFORE any of them is repaired.
+#
+#   A11-F1  PRRT_kwDOSbJI_s6Y_tlx -- inherited CommonMark HTML-BLOCK state is not modelled. A9/A10
+#           carry inherited FENCED-code state, and nothing else. CommonMark has a second raw block
+#           family (spec 0.31.2 section 4.6, seven types), and an HTML block opened in front of a
+#           protected authority renders that authority as raw HTML-block content while the checker
+#           still compares it as operative approval prose and reports the complete guard clean.
+#   A11-F2  PRRT_kwDOSbJI_s6Y_tl4 -- protected operations may appear OUTSIDE their approved
+#           numbered action regions. Deployment and preflight validation is bounded to the resolved
+#           step-4 and step-5 regions, so an ADDITIONAL active protected operation somewhere else in
+#           the procedure coexists with the canonical gated one and the complete guard stays clean.
+#   A11-F3  PRRT_kwDOSbJI_s6Y_tl7 -- operator-directed destructive recovery cleanup carries no
+#           separately scoped current-turn approval. The runbook instructs real filesystem deletions
+#           in its recovery and error-handling material; a general preflight, build or write
+#           approval is not reusable for a later destructive removal.
+#   A11-F4  PRRT_kwDOSbJI_s6Y_tl_ -- later live actions sit outside the approval-surface model.
+#           Step 9 performs live n8n and result-mapping operations, step 10 a live AutoCount
+#           recovery lookup, and step 11 a destructive removal of temporary shared copies. The
+#           "exactly four approval surfaces" statement is therefore incomplete.
+#
+# Everything below is TEST-SIDE at this commit. The controls name the constants the repaired
+# checker must consume, so the control set survives the repair unchanged and cannot drift from it.
+
+# --- A11-F1: the INDEPENDENT CommonMark HTML-block oracle --- #
+# Deliberately an independent reading of CommonMark 0.31.2 section 4.6 rather than a call into the
+# production block-state model: a control that asked the implementation under test whether an HTML
+# block was open would prove only that the implementation agrees with itself. It answers exactly one
+# question -- "which raw block, if any, is open where this line begins?" -- and nothing else. No
+# inline HTML, no attributes model beyond what the spec's own start conditions need, no lists, no
+# blockquotes and no tables.
+#
+# The seven start conditions, and the end condition each one carries:
+#
+#   1  `<script`, `<pre`, `<style`, `<textarea` (case-insensitive), followed by whitespace, `>` or
+#      end of line. Ends on a line containing the matching close tag.
+#   2  `<!--`. Ends on a line containing `-->`.
+#   3  `<?`. Ends on a line containing `?>`.
+#   4  `<!` followed by an ASCII letter. Ends on a line containing `>`.
+#   5  `<![CDATA[`. Ends on a line containing `]]>`.
+#   6  `<` or `</` followed by one of the spec's block tag names, followed by whitespace, `>`, `/>`
+#      or end of line. Ends on a BLANK line.
+#   7  a complete open tag or closing tag whose name is not a type-1 raw-text tag, alone on its
+#      line. Ends on a BLANK line, and -- unlike types 1 to 6 -- cannot interrupt a paragraph.
+#
+# All seven require zero to three leading spaces, which is the same four-column exclusion A3 holds
+# for numbered ATX headings and A7 holds for fence lines. For types 1 to 5 the START line may
+# itself satisfy the end condition, so `<!-- note -->` opens and closes on one line.
+VM_GATE_A11_HTML_INDENT = re.compile(r"^ {0,3}(?=\S)")
+VM_GATE_A11_RAW_TEXT_TAGS = ("script", "pre", "style", "textarea")
+# The spec's own type-6 block tag list, verbatim for CommonMark 0.31.2.
+VM_GATE_A11_TYPE6_TAGS = frozenset("""
+address article aside base basefont blockquote body caption center col colgroup dd details
+dialog dir div dl dt fieldset figcaption figure footer form frame frameset h1 h2 h3 h4 h5 h6
+head header hr html iframe legend li link main menu menuitem nav noframes ol optgroup option
+p param search section summary table tbody td tfoot th thead title tr track ul
+""".split())
+VM_GATE_A11_TYPE1_OPEN = re.compile(
+    r"^<(?:%s)(?=[ \t>]|$)" % "|".join(VM_GATE_A11_RAW_TEXT_TAGS), re.IGNORECASE)
+VM_GATE_A11_TYPE4_OPEN = re.compile(r"^<![A-Za-z]")
+VM_GATE_A11_TYPE6_OPEN = re.compile(r"^</?(?P<tag>[A-Za-z][A-Za-z0-9-]*)(?=[ \t>]|/>|$)")
+# A COMPLETE open or closing tag alone on its line, which is all type 7 accepts.
+VM_GATE_A11_TYPE7_LINE = re.compile(
+    r"^ {0,3}(?:<(?P<open>[A-Za-z][A-Za-z0-9-]*)"
+    r"(?:[ \t]+[A-Za-z_:][A-Za-z0-9_.:-]*"
+    r"(?:[ \t]*=[ \t]*(?:[^ \t\"'=<>`]+|'[^']*'|\"[^\"]*\"))?)*[ \t]*/?>"
+    r"|</(?P<close>[A-Za-z][A-Za-z0-9-]*)[ \t]*>)[ \t]*$")
+# The end MARKERS for the five types that do not end on a blank line.
+VM_GATE_A11_HTML_END_MARKERS = {
+    1: ("</script>", "</pre>", "</style>", "</textarea>"),
+    2: ("-->",),
+    3: ("?>",),
+    4: (">",),
+    5: ("]]>",),
+}
+# The two types a blank line closes. They are also the two that end at the end of the document.
+VM_GATE_A11_BLANK_TERMINATED = (6, 7)
+# Paragraph-interrupting line shapes the oracle needs, and no more: type 7 alone among the seven
+# cannot interrupt a paragraph, so the oracle must know when a paragraph is open. A blank line, an
+# ATX heading, a thematic break and a fence opener all end one.
+VM_GATE_A11_ATX_LINE = re.compile(r"^ {0,3}#{1,6}(?:[ \t].*)?$")
+VM_GATE_A11_THEMATIC_LINE = re.compile(
+    r"^ {0,3}(?:(?:\*[ \t]*){3,}|(?:-[ \t]*){3,}|(?:_[ \t]*){3,})$")
+
+
+def _a11_html_opens(line, in_paragraph):
+    """The CommonMark HTML-block TYPE ``line`` opens, or ``None``. Independent of production."""
+    body = line.rstrip("\r")
+    if VM_GATE_A11_HTML_INDENT.match(body) is None:
+        return None
+    text = body.lstrip(" ")
+    if VM_GATE_A11_TYPE1_OPEN.match(text):
+        return 1
+    if text.startswith("<!--"):
+        return 2
+    if text.startswith("<?"):
+        return 3
+    if text.startswith("<![CDATA["):
+        return 5
+    if VM_GATE_A11_TYPE4_OPEN.match(text):
+        return 4
+    found = VM_GATE_A11_TYPE6_OPEN.match(text)
+    if found is not None and found.group("tag").lower() in VM_GATE_A11_TYPE6_TAGS:
+        return 6
+    if not in_paragraph:
+        seven = VM_GATE_A11_TYPE7_LINE.match(body)
+        if seven is not None:
+            name = (seven.group("open") or seven.group("close")).lower()
+            if name not in VM_GATE_A11_RAW_TEXT_TAGS:
+                return 7
+    return None
+
+
+def _a11_html_ends(line, kind):
+    """True when ``line`` satisfies the end condition of an open HTML block of type ``kind``."""
+    body = line.rstrip("\r")
+    if kind in VM_GATE_A11_BLANK_TERMINATED:
+        return not body.strip()
+    lowered = body.lower()
+    return any(marker in lowered for marker in VM_GATE_A11_HTML_END_MARKERS[kind])
+
+
+def _a11_breaks_paragraph(line):
+    """True when ``line`` cannot be paragraph continuation text."""
+    body = line.rstrip("\r")
+    return bool(VM_GATE_A11_ATX_LINE.match(body) or VM_GATE_A11_THEMATIC_LINE.match(body))
+
+
+def _a11_block_open_at(text, offset):
+    """The raw block open where ``offset``'s own line BEGINS, or ``None``.
+
+    ``("fence", marker, length)`` or ``("html", type)``. Only text strictly in front of that line is
+    inspected, which is what "inherited" means. Fence opening and closing validity come from the two
+    A10 predicates, so the oracle states each grammar exactly once; the HTML grammar above is the
+    only thing A11 adds to it.
+    """
+    state, in_paragraph = None, False
+    for line in text[:text.rfind("\n", 0, offset) + 1].splitlines():
+        if state is None:
+            fence = _a10_opens_fence(line)
+            if fence is not None:
+                state, in_paragraph = ("fence",) + fence, False
+                continue
+            kind = _a11_html_opens(line, in_paragraph)
+            if kind is not None:
+                in_paragraph = False
+                state = None if _a11_html_ends(line, kind) else ("html", kind)
+                continue
+            in_paragraph = bool(line.strip()) and not _a11_breaks_paragraph(line)
+            continue
+        if state[0] == "fence":
+            if _a10_closes_fence(line, state[1:]):
+                state, in_paragraph = None, False
+        elif _a11_html_ends(line, state[1]):
+            state, in_paragraph = None, False
+    return state
+
+
+# The seven families, as ``(name, type, opening line, closing line)``. A blank closing line is the
+# blank-line end condition types 6 and 7 carry; every other entry closes on its own marker.
+VM_GATE_A11_HTML_FAMILIES = (
+    ("type1_script", 1, "<script>", "</script>"),
+    ("type1_pre_attr", 1, '<pre class="note">', "</pre>"),
+    ("type1_style", 1, "<style>", "</style>"),
+    ("type1_textarea", 1, "<textarea>", "</textarea>"),
+    ("type2_comment", 2, "<!-- reviewer note", "-->"),
+    ("type3_instruction", 3, "<?editor pause", "?>"),
+    ("type4_declaration", 4, "<!DOCTYPE reviewer", ">"),
+    ("type5_cdata", 5, "<![CDATA[ reviewer", "]]>"),
+    ("type6_div", 6, "<div>", ""),
+    ("type6_table_attr", 6, '<table class="reviewed">', ""),
+    ("type6_closing", 6, "</div>", ""),
+    ("type7_open", 7, "<x-review>", ""),
+    ("type7_self_closing", 7, "<x-review />", ""),
+    ("type7_closing", 7, "</x-review>", ""),
+)
+# Leading indentation an HTML block opener may carry. Four columns is the exclusion, not an option.
+VM_GATE_A11_HTML_INDENTS = VM_GATE_A9_OPENER_INDENTS
+# Line shapes that CONTAIN HTML block syntax but open nothing: at four columns the line is indented
+# CODE, and a type-7 shape with trailing text is not a complete tag alone on its line.
+VM_GATE_A11_HTML_NON_OPENERS = (
+    ("four_spaces_div", "    <div>"),
+    ("eight_spaces_comment", "        <!-- note"),
+    ("tab_script", "\t<script>"),
+    ("space_tab_cdata", " \t<![CDATA["),
+    ("type7_with_trailing_text", "<x-review> and then ordinary prose"),
+    ("bare_less_than", "< div>"),
+    ("inline_span_only", "an ordinary sentence with <x-review> inside it"),
+)
+# Ordinary block content, so an opener/closer pair is a real block rather than an empty one.
+VM_GATE_A11_HTML_FILLER = "an ordinary example line"
+
+# The protected authorities an HTML block is placed in front of. The landmark is each authority's
+# own GATE PARAGRAPH rather than its heading, because the gate paragraph is the operative approval:
+# types 6 and 7 end at the first blank line, so an opener in front of a heading swallows only that
+# heading, while an opener in front of a gate paragraph swallows the whole affirmative approval
+# sentence. Types 1 to 5 swallow everything to their own end marker either way.
+VM_GATE_A11_HTML_AUTHORITIES = (
+    ("step-4 deployment gate", VM_GATE_DEPLOY_OPENING, "deploy_gate_text_changed"),
+    ("step-5 preflight gate", VM_GATE_PREFLIGHT_OPENING, "preflight_gate_text_changed"),
+    ("safety boundary", VM_GATE_SAFETY_HEADING, "safety_boundary_surfaces_incomplete"),
+)
+# The step-3 host-sync authority, carried by the existing absent-marker cascade exactly as A9/A10
+# carry it. Its landmark is the gate marker's own paragraph opening.
+HOST_SYNC_A11_GATE_OPENING = "**Separate current-turn owner approval required (host-sync gate).**"
+# The carrier is the same absent-marker cascade A9 established; A11 adds no host-sync key.
+HOST_SYNC_A11_CARRIER = HOST_SYNC_A9_CARRIER
+
+# --- A11-F2: the centralised protected-operation placement contract --- #
+# One classifier, one recognised operation family, and one authorised region per family, so the
+# repair cannot become a patch for the single string the review happened to name. Each entry is
+# ``(name, active-command anchor, authorised step numbers, fold case)``. Case folding follows the
+# TOOL, exactly as `_actively_invokes` already requires: PowerShell parameter names really are
+# case-insensitive, and `member_create_uat_approval.py` is argparse and genuinely case-sensitive.
+VM_GATE_A11_PROTECTED_OPERATIONS = (
+    ("host_sync_pull", HOST_SYNC_PULL_COMMAND, (3,), True),
+    ("vm_state_preparation", VM_GATE_DEPLOY_STATE_ANCHOR, (4,), True),
+    ("package_approval", VM_GATE_PREFLIGHT_APPROVE_COMMAND, (5,), False),
+    ("package_build", VM_GATE_PREFLIGHT_BUILD_COMMAND, (5,), False),
+    ("controlled_reconciliation",
+     "python scripts/member_create_uat_approval.py reconcile-store-admission", (5,), False),
+    # The runner is authorised in TWO regions and nowhere else: the step-5 no-write dry run and the
+    # step-8 single write attempt, which carries its own step-7 approval surface.
+    ("runner_invocation", VM_GATE_PREFLIGHT_RUNNER_ANCHOR, (5, 8), True),
+)
+# Positions an extra protected operation is injected at, so the control is not one hard-coded site.
+VM_GATE_A11_PLACEMENT_STEPS = (1, 2, 6, 9, 10, 11)
+# NON-OPERATIONAL spellings of the same operations. Every one of these must stay clean: a mention,
+# a quoted echo, a commented line and a prose reference are not the operation, which is the same
+# standard `_active_command_lines` already holds the reviewed regions to.
+VM_GATE_A11_PLACEMENT_INERT = (
+    ("hash_comment", "# %s"),
+    ("html_comment", "<!-- %s -->"),
+    ("powershell_echo", 'Write-Host "%s"'),
+    ("shell_echo", "echo \"%s\""),
+    ("prose_reference", "The operator may later run %s under its own approval."),
+)
+
+# --- A11-F3: the complete operator-directed destructive-cleanup inventory --- #
+# Every instruction in the reviewed runbook that directs an operator to delete or remove a real
+# filesystem object. Prohibitions ("never delete", "do not delete these markers", "do not delete or
+# sweep them either") are deliberately NOT here: they forbid a mutation rather than instructing one,
+# and a control below proves they stay non-material.
+VM_GATE_A11_DESTRUCTIVE_PHRASES = (
+    "delete exactly the one named",
+    "delete exactly that one file",
+    "remove the non-operational store under review",
+    "removal of the non-operational store under review",
+    "manually delete the named stray temporary file",
+    "remove any temporary copies of the package and result from shared locations",
+)
+# Prohibition wording that must never be mistaken for an operator-directed destructive instruction.
+VM_GATE_A11_DESTRUCTIVE_PROHIBITIONS = (
+    "never delete or edit the member as part of recovery",
+    "do not delete these markers",
+    "do not delete or sweep them either",
+    "it is never removed automatically",
+)
+VM_GATE_A11_CLEANUP_MARKER = "destructive-cleanup gate"
+# The reviewed destructive-cleanup gate, verbatim, and the ONE authority both the runbook and the
+# controls consume. Written out here rather than derived from the runbook, because authority derived
+# from the thing it is meant to constrain is not authority at all.
+VM_GATE_A11_CLEANUP_REVIEWED_GATE = r"""**Separate current-turn destructive-cleanup approval required (destructive-cleanup gate).** Before
+the deletion or removal below, obtain an explicit current-turn owner approval that names the exact
+target basename or path and the exact delete or remove operation. A step-5 preflight approval, a
+build or reviewer decision, a step-7 write approval, repository review or merge, and any prior-turn
+approval are none of them reusable for it.
+"""
+# Ways a destructive-cleanup gate can be defeated. Each must fail closed.
+VM_GATE_A11_CLEANUP_MUTATIONS = (
+    ("gate_removed", "destructive_cleanup_not_gated"),
+    ("gate_moved_after_instruction", "destructive_cleanup_not_gated"),
+    ("prior_turn_wording", "destructive_cleanup_gate_text_changed"),
+    ("target_not_named", "destructive_cleanup_gate_text_changed"),
+    ("operation_not_named", "destructive_cleanup_gate_text_changed"),
+    ("preflight_approval_substituted", "destructive_cleanup_gate_text_changed"),
+    ("write_approval_substituted", "destructive_cleanup_gate_text_changed"),
+    ("repo_review_substituted", "destructive_cleanup_gate_text_changed"),
+)
+# The replacement text each defeating mutation writes over the reviewed gate.
+VM_GATE_A11_CLEANUP_REPLACEMENTS = {
+    "prior_turn_wording": (
+        "**Separate destructive-cleanup approval required (destructive-cleanup gate).** The"
+        " approval obtained in an earlier turn already covers the deletion or removal below.\n"),
+    "target_not_named": (
+        "**Separate current-turn destructive-cleanup approval required (destructive-cleanup"
+        " gate).** Before the deletion or removal below, obtain an explicit current-turn owner"
+        " approval for the delete or remove operation.\n"),
+    "operation_not_named": (
+        "**Separate current-turn destructive-cleanup approval required (destructive-cleanup"
+        " gate).** Before the deletion or removal below, obtain an explicit current-turn owner"
+        " approval that names the exact target basename or path.\n"),
+    "preflight_approval_substituted": (
+        "**Separate current-turn destructive-cleanup approval required (destructive-cleanup"
+        " gate).** The step-5 preflight approval already covers the deletion or removal below.\n"),
+    "write_approval_substituted": (
+        "**Separate current-turn destructive-cleanup approval required (destructive-cleanup"
+        " gate).** The step-7 write approval already covers the deletion or removal below.\n"),
+    "repo_review_substituted": (
+        "**Separate current-turn destructive-cleanup approval required (destructive-cleanup"
+        " gate).** Repository review and merge already cover the deletion or removal below.\n"),
+}
+
+# --- A11-F4: the step-9 live mapping and step-10 conditional recovery surfaces --- #
+VM_GATE_A11_MAPPING_STEP = 9
+VM_GATE_A11_RECOVERY_STEP = 10
+VM_GATE_A11_MAPPING_MARKER = "result-mapping gate"
+VM_GATE_A11_RECOVERY_MARKER = "recovery gate"
+VM_GATE_A11_MAPPING_BOUNDARY = "On `CREATED_VERIFIED`, the runner has already read"
+VM_GATE_A11_RECOVERY_BOUNDARY = "If the runner returns `WRITE_OUTCOME_UNCERTAIN`, the SaveMember"
+VM_GATE_A11_REVIEWED_HEADINGS = {
+    VM_GATE_A11_MAPPING_STEP: "### 9. Read-back and terminal result mapping",
+    VM_GATE_A11_RECOVERY_STEP: "### 10. Recovery for `WRITE_OUTCOME_UNCERTAIN`",
+}
+
+# The reviewed step-9 gate block, verbatim. It binds the runbook's ACTUAL live mapping operations:
+# importing and using the local workflow copy, credential binding by identity only, placing the
+# sanitised result into the n8n file surface, manual execution, and the single spreadsheet row
+# update. No credential value and no private value is written here or anywhere in the repository.
+VM_GATE_A11_MAPPING_REVIEWED_BLOCK = r"""**Separate current-turn owner approval required (result-mapping gate).** The mapping below runs
+live operations on the operator PC n8n instance and writes to the intended Google Sheet. Before any
+of it, obtain an explicit current-turn owner approval that names the intended result-mapping
+workflow `n8n-workflows/member_create_uat_result_mapping.workflow.json` and the intended spreadsheet
+and source tab, and binds:
+
+- importing and using the local copy of that workflow on the operator PC n8n instance;
+- binding the intended Google credential by name or identity only, never by secret value;
+- copying the sanitised result file into the approved n8n file location `/home/node/.n8n-files/`;
+- running that workflow manually, with the workflow left inactive;
+- updating the one intended spreadsheet row selected by `uat_create_operation_id`.
+
+This approval is distinct and is **not** implied by any other gate:
+
+- the PR review and merge decision (step 2) does **not** authorise this result mapping;
+- the physical-host sync approval (step 3) does **not** authorise this result mapping;
+- the VM deployment approval (step 4) does **not** authorise this result mapping;
+- the no-write preflight approval (step 5) does **not** authorise this result mapping;
+- the separate current-turn write approval (step 7) does **not** authorise this result mapping.
+
+A prior-turn approval is not reusable. Repository review or merge is not this approval, and this
+approval authorises no AutoCount contact and no further member write. Without the named current-turn
+result-mapping approval, stop before importing the workflow, before binding any credential, before
+copying the result file into the n8n file location, before running the workflow and before updating
+the spreadsheet row.
+
+"""
+
+# The reviewed step-10 gate block, verbatim. Conditional by construction: it applies only when the
+# runner returned `WRITE_OUTCOME_UNCERTAIN`, and it grants read-only recovery authority only.
+VM_GATE_A11_RECOVERY_REVIEWED_BLOCK = r"""**Separate current-turn owner approval required (recovery gate).** This step is conditional and
+applies only when the runner returned `WRITE_OUTCOME_UNCERTAIN`. When it applies, and before any
+AutoCount contact, obtain an explicit current-turn owner approval that names the intended AutoCount
+account book and environment. The server and database are named in that approval itself, and are
+never written into this runbook. That approval binds the read-only member lookup and recovery
+operation for that one uncertain write outcome, and nothing else.
+
+This recovery is read-only. It grants no new `SaveMember` authority, authorises no create, update or
+delete, and authorises no second write attempt. This approval is distinct and is **not** implied by
+any other gate:
+
+- the PR review and merge decision (step 2) does **not** authorise this recovery lookup;
+- the physical-host sync approval (step 3) does **not** authorise this recovery lookup;
+- the VM deployment approval (step 4) does **not** authorise this recovery lookup;
+- the no-write preflight approval (step 5) does **not** authorise this recovery lookup;
+- the separate current-turn write approval (step 7) does **not** authorise this recovery lookup;
+- the step-9 result-mapping approval (step 9) does **not** authorise this recovery lookup.
+
+A prior-turn approval is not reusable. Repository review or merge is not this approval. Without the
+named current-turn recovery approval, stop before opening the account book and before searching for
+the member.
+
+"""
+
+# Gate propositions, as ``(finding key, token)``. The tokens are compared against the flattened,
+# lowercased gate block exactly as steps 4 and 5 already compare theirs.
+# The reviewed affirmative clause each new gate must state. `VM_GATE_AFFIRMATIVE_APPROVAL` names
+# the AutoCount VM, which steps 9 and 10 do not bind, so each declares its own and the shared
+# `_approval_is_affirmative` predicate takes it as a parameter. The A1-A10 default is unchanged.
+VM_GATE_A11_MAPPING_AFFIRMATIVE = ("obtain an explicit current-turn owner approval that names the"
+                                   " intended result-mapping workflow")
+VM_GATE_A11_RECOVERY_AFFIRMATIVE = ("obtain an explicit current-turn owner approval that names the"
+                                    " intended autocount account book and environment")
+VM_GATE_A11_MAPPING_BINDINGS = (
+    ("mapping_workflow_not_bound",
+     "n8n-workflows/member_create_uat_result_mapping.workflow.json"),
+    ("mapping_spreadsheet_not_bound", "the intended spreadsheet and source tab"),
+)
+VM_GATE_A11_MAPPING_OPERATIONS = (
+    "importing and using the local copy of that workflow on the operator pc n8n instance",
+    "binding the intended google credential by name or identity only, never by secret value",
+    "copying the sanitised result file into the approved n8n file location `/home/node/.n8n-files/`",
+    "running that workflow manually, with the workflow left inactive",
+    "updating the one intended spreadsheet row selected by `uat_create_operation_id`",
+)
+VM_GATE_A11_MAPPING_SOURCES = ("(step 2)", "(step 3)", "(step 4)", "(step 5)", "(step 7)")
+VM_GATE_A11_MAPPING_DENIAL = "does **not** authorise this result mapping"
+VM_GATE_A11_MAPPING_STOP = (
+    "without the named current-turn result-mapping approval, stop before importing the workflow,"
+    " before binding any credential, before copying the result file into the n8n file location,"
+    " before running the workflow and before updating the spreadsheet row")
+
+VM_GATE_A11_RECOVERY_BINDINGS = (
+    ("recovery_account_book_not_bound",
+     "the intended autocount account book and environment"),
+    ("recovery_read_only_not_bound",
+     "the read-only member lookup and recovery operation for that one uncertain write outcome"),
+)
+VM_GATE_A11_RECOVERY_WRITE_DENIAL = (
+    "this recovery is read-only",
+    "it grants no new `savemember` authority",
+)
+VM_GATE_A11_RECOVERY_SOURCES = ("(step 2)", "(step 3)", "(step 4)", "(step 5)", "(step 7)",
+                                "(step 9)")
+VM_GATE_A11_RECOVERY_DENIAL = "does **not** authorise this recovery lookup"
+VM_GATE_A11_RECOVERY_STOP = (
+    "without the named current-turn recovery approval, stop before opening the account book and"
+    " before searching for the member")
+
+# Everything a resolved step-9 / step-10 must prove, and the fail-closed half of the same A1
+# contract steps 4 and 5 already carry: an unresolvable layout marks the whole step unmet.
+VM_GATE_A11_MAPPING_UNMET = frozenset((
+    "mapping_pre_gate_content", "mapping_gate_text_changed", "mapping_action_text_changed",
+    "mapping_workflow_not_bound", "mapping_spreadsheet_not_bound", "mapping_operations_not_bound",
+    "mapping_not_current_turn", "mapping_prior_turn_not_denied", "mapping_substitution_not_denied",
+    "mapping_stop_boundary_missing",
+))
+VM_GATE_A11_RECOVERY_UNMET = frozenset((
+    "recovery_pre_gate_content", "recovery_gate_text_changed", "recovery_action_text_changed",
+    "recovery_account_book_not_bound", "recovery_read_only_not_bound",
+    "recovery_write_authority_not_denied", "recovery_not_current_turn",
+    "recovery_prior_turn_not_denied", "recovery_substitution_not_denied",
+    "recovery_stop_boundary_missing",
+))
+
+# --- A11: the corrected Safety boundary --- #
+# The "exactly four approval surfaces" statement is retired because it is false: destructive
+# cleanup, the step-9 live mapping and the step-10 conditional recovery are approval surfaces too.
+# The four BASELINE surfaces are preserved word for word; the conditional ones are added beside
+# them; and no fixed total is stated at all, so the next surface cannot silently falsify a count.
+VM_GATE_A11_SAFETY_REVIEWED_SECTION = r"""## Safety boundary
+
+- No AutoCount write occurs in development, tests, or CI. Enabling the ExpiryDate path
+  (recording the business confirmations and flipping the capability flag) performs no
+  live write; a real write still requires the explicit VM write step above and a
+  separate current-turn owner approval naming the exact target and operation.
+- The host sync on `DESKTOP-Q43QKQF` in step 3 and the `SaveMember` write in step 7
+  each require their own prior current-turn owner approval. Neither implies the other,
+  and a prior-turn approval is never reusable for either.
+- Four baseline approval surfaces are always required: the step-3 host sync, the step-4
+  VM deployment, the step-5 preflight surface (selected private form/decision-row access,
+  the reviewer-decision and approval-ledger operation, the immutable package build, the
+  AutoCount environment setup, the package transfer and the no-write AutoCount preflight),
+  and the step-7 `SaveMember` write.
+- Further conditional approval surfaces arise wherever the procedure reaches them: every
+  operator-directed destructive cleanup or removal, each one scoped locally to its exact
+  target and its exact delete or remove operation; the step-9 live n8n result mapping;
+  and the step-10 conditional read-only AutoCount recovery lookup.
+- This runbook states no fixed total number of approval surfaces. Each surface named
+  above requires its own current-turn owner approval, none implies or covers another, and
+  a prior-turn approval is never reusable for any of them.
+- Exactly one member is supported; there is no batch path, no update-member path, no
+  delete, and no rollback automation.
+- SaveMember is called at most once and is never automatically retried. An uncertain
+  save outcome is terminal (`WRITE_OUTCOME_UNCERTAIN`) and is resolved only by the
+  separate read-only recovery check, never by an automatic retry.
+- No final package can be published before its durable publication reservation is
+  confirmed, so a publication or ledger persistence failure can never leave a published
+  package that the same approval is free to build again. An already-published package is
+  never deleted, rolled back, truncated, renamed or modified by any failure path.
+- A package built under the previous `member_create_uat_package/v1` contract cannot be
+  reused; the runner refuses it fail-closed. Build a fresh `v2` package at a new,
+  version-distinct path after a new reviewer decision. The package builder is strictly
+  no-clobber and never overwrites an existing package, so the old `v1` artifact and its
+  hash are preserved as historical evidence and remain non-executable under `v2`.
+- The synthetic member and permanent single-use claim created by the earlier
+  [ExpiryDate capability probe](member_expiry_capability_probe_runbook.md) are left
+  exactly as they are; this UAT path does not read, modify, or clean them up.
+- All console, evidence, test, and workflow output is sanitized and PII-free; member
+  numbers are masked and names, emails, and birthdays are never printed.
+"""
+
+# The propositions kept as defence in depth under the same finding key, exactly as A8 kept the
+# four-way tokens. The baseline four are preserved verbatim so no accepted A1-A10 protection is
+# weakened by the correction.
+VM_GATE_A11_SAFETY_TOKENS = (
+    "four baseline approval surfaces are always required: the step-3 host sync, the step-4 vm"
+    " deployment, the step-5 preflight surface (selected private form/decision-row access, the"
+    " reviewer-decision and approval-ledger operation, the immutable package build, the autocount"
+    " environment setup, the package transfer and the no-write autocount preflight), and the"
+    " step-7 `savemember` write",
+    "every operator-directed destructive cleanup or removal, each one scoped locally to its exact"
+    " target and its exact delete or remove operation; the step-9 live n8n result mapping; and the"
+    " step-10 conditional read-only autocount recovery lookup",
+    "this runbook states no fixed total number of approval surfaces",
+    "each surface named above requires its own current-turn owner approval",
+    "none implies or covers another",
+    "a prior-turn approval is never reusable for any of them",
+)
+# Contradictions that must fail closed inside the ONE corrected boundary, in the same three
+# placements A8 established.
+VM_GATE_A11_SAFETY_CONTRADICTIONS = (
+    ("appended_fixed_total", "append",
+     "There are exactly four approval surfaces in total."),
+    ("appended_cleanup_merge", "append",
+     "The step-5 preflight approval also covers every destructive cleanup below."),
+    ("appended_mapping_merge", "append",
+     "The step-7 write approval also covers the step-9 live n8n result mapping."),
+    ("appended_recovery_merge", "append",
+     "The step-7 write approval also covers the step-10 recovery lookup."),
+    ("prepended_fixed_total", "prepend",
+     "There are exactly four approval surfaces in total."),
+    ("inserted_conditional_waiver", "bullet",
+     "- The conditional surfaces above need no separate current-turn owner approval."),
+)
+# Bullets whose REMOVAL must fail closed, so the correction cannot be silently rolled back.
+VM_GATE_A11_SAFETY_REQUIRED_BULLETS = (
+    ("baseline_four", "- Four baseline approval surfaces are always required:"),
+    ("conditional_surfaces", "- Further conditional approval surfaces arise wherever"),
+    ("no_fixed_total", "- This runbook states no fixed total number of approval surfaces."),
+)
+
+# --- A11: the declared finding-key surface --- #
+# A11 adds exactly these, and retires nothing. `safety_boundary_not_four_way` is RENAMED to
+# `safety_boundary_surfaces_incomplete` because the contract it carries is no longer a four-way
+# claim; the coverage it reports is unchanged and every control that asserted it still asserts it
+# under the truthful name.
+VM_GATE_A11_NEW_KEYS = (
+    "protected_operation_outside_region",
+    "destructive_cleanup_not_gated",
+    "destructive_cleanup_gate_text_changed",
+    "mapping_step_missing", "mapping_step_ambiguous", "mapping_heading_changed",
+    "mapping_gate_missing", "mapping_gate_marker_ambiguous", "mapping_boundary_missing",
+    "mapping_boundary_ambiguous", "mapping_gate_after_action", "mapping_pre_gate_content",
+    "mapping_gate_text_changed", "mapping_action_text_changed", "mapping_workflow_not_bound",
+    "mapping_spreadsheet_not_bound", "mapping_operations_not_bound", "mapping_not_current_turn",
+    "mapping_prior_turn_not_denied", "mapping_substitution_not_denied",
+    "mapping_stop_boundary_missing",
+    "recovery_step_missing", "recovery_step_ambiguous", "recovery_heading_changed",
+    "recovery_gate_missing", "recovery_gate_marker_ambiguous", "recovery_boundary_missing",
+    "recovery_boundary_ambiguous", "recovery_gate_after_action", "recovery_pre_gate_content",
+    "recovery_gate_text_changed", "recovery_action_text_changed",
+    "recovery_account_book_not_bound", "recovery_read_only_not_bound",
+    "recovery_write_authority_not_denied", "recovery_not_current_turn",
+    "recovery_prior_turn_not_denied", "recovery_substitution_not_denied",
+    "recovery_stop_boundary_missing",
+)
+# A6 declared 50; A7 to A10 added none. A11 adds the 39 above and renames one, so 50 become 89.
+VM_GATE_A11_FINDING_KEY_COUNT = 89
+# The COMPLETE set of keys an EMPTY document cannot report, because each needs a document that
+# actually contains the landmark it is about. The pre-A11 eleven are carried forward unchanged; A11
+# adds the two step-9/step-10 ambiguity, ordering and heading families, plus the three keys that
+# need a real operation, a real destructive instruction or a real cleanup gate to exist at all.
+VM_GATE_A11_NEEDS_A_REAL_DOCUMENT = frozenset((
+    "deploy_gate_after_mutation", "preflight_gate_after_external_action",
+    "deploy_gate_marker_ambiguous", "deploy_boundary_ambiguous",
+    "preflight_gate_marker_ambiguous", "preflight_boundary_ambiguous",
+    "deploy_step_ambiguous", "deploy_heading_changed",
+    "preflight_step_ambiguous", "preflight_heading_changed",
+    "safety_boundary_ambiguous",
+    "mapping_gate_after_action", "mapping_gate_marker_ambiguous", "mapping_boundary_ambiguous",
+    "mapping_step_ambiguous", "mapping_heading_changed",
+    "recovery_gate_after_action", "recovery_gate_marker_ambiguous", "recovery_boundary_ambiguous",
+    "recovery_step_ambiguous", "recovery_heading_changed",
+    "protected_operation_outside_region", "destructive_cleanup_not_gated",
+    "destructive_cleanup_gate_text_changed",
+))
+# Malformed and boundary documents the checker must handle without an uncontrolled exception. Purity
+# is a property of the contract, not of the documents it happens to be given.
+VM_GATE_A11_MALFORMED_INPUTS = (
+    ("empty", ""),
+    ("newline_only", "\n"),
+    ("crlf_only", "\r\n"),
+    ("bare_hashes", "###"),
+    ("numbered_heading_without_title", "### 9."),
+    ("unterminated_html", "<script>"),
+    ("unterminated_fence", "```"),
+    ("unterminated_comment", "<!--"),
+    ("unterminated_cdata", "<![CDATA["),
+    ("lone_marker", VM_GATE_A11_CLEANUP_MARKER),
+    ("lone_destructive_phrase", VM_GATE_A11_DESTRUCTIVE_PHRASES[0]),
+    ("tab_indented_heading", "\t### 9. Read-back and terminal result mapping\n"),
+    ("very_long_line", "x" * 20000),
+    ("null_byte", "### 10.\x00 recovery"),
+)
+
+# The reviewed step-9 and step-10 ACTION regions, verbatim, held to exactly the identity discipline
+# A6 established for steps 4 and 5: the reviewed text is recognised, so a revocation, a reuse claim,
+# a deleted operation or an operation wrapped in inert data all fail closed alike.
+VM_GATE_A11_MAPPING_REVIEWED_ACTION = r"""On `CREATED_VERIFIED`, the runner has already read the member back and compared the
+approved safe fields. Map the sanitized terminal result to the Sheet:
+
+1. **`LAPTOP DEVELOPMENT MACHINE`** or operator PC: precheck the sanitized result and
+   revalidate identity and fingerprint against the expected source record.
+
+   ```bash
+   python scripts/member_create_uat_result_precheck.py --result-json <member_create_uat_result.json> --expect-source-record-id <srcrec_...> --expect-source-fingerprint <fp_...>
+   ```
+
+2. Operator PC n8n (non-AC2): import a local copy of
+   `n8n-workflows/member_create_uat_result_mapping.workflow.json` after replacing
+   `REPLACE_WITH_SOURCE_TAB_NAME` with the source tab title. Add the controlled
+   columns named in the workflow boundary sticky note and, on the approved row,
+   seed `uat_create_operation_id`, `uat_create_source_record_id`, and
+   `uat_create_source_fingerprint` from the built package (leave the review columns
+   blank). Bind only the Google credential and spreadsheet, copy the sanitized
+   result file into `/home/node/.n8n-files/`, and run the workflow manually. It reads
+   and updates the one row whose `uat_create_operation_id` equals the result's
+   operation id (the single-use mapping key, never a shared marker or row number),
+   revalidates the identity and fingerprint hashes, recomputes the terminal code, and
+   stays inactive.
+
+"""
+
+VM_GATE_A11_RECOVERY_REVIEWED_ACTION = r"""If the runner returns `WRITE_OUTCOME_UNCERTAIN`, the SaveMember call began but success
+could not be proven. Do not retry, delete, or update anything automatically. Perform a
+separate read-only recovery check:
+
+1. **`AUTOCOUNT VM — DESKTOP-4I042L6`** In AutoCount Bonus Point > Member Maintenance,
+   search for the member number (masked in the runner output; the operator knows the
+   real number from the approved source row) and determine whether the member exists.
+2. If it exists and matches the approved safe fields, treat the operation as created;
+   record the outcome manually. If it does not exist, the write did not commit; the
+   consumed marker still blocks an accidental second attempt, so a fresh, separately
+   approved operation with a new package is required to proceed.
+3. Never delete or edit the member as part of recovery.
+
+The VM keeps durable state files in the state directory: `write_intent_<operation_id>.marker`,
+`consumed_<source_record_id>.marker`, and `result_<operation_id>.json` (each written
+exclusive-create, never overwritten, containing only sanitised identifiers). On any
+re-run the runner classifies these deterministically and never auto-retries a save:
+a terminal result present yields `PACKAGE_ALREADY_CONSUMED`; a consumed marker without
+a terminal result yields `WRITE_OUTCOME_UNCERTAIN`; a write-intent marker without a
+consumed marker yields `FAILED_BEFORE_WRITE`; a malformed marker yields
+`WRITE_OUTCOME_UNCERTAIN`. Do not delete these markers; they are the single-use guard.
+
+"""
+
+# The reviewed step-11 shutdown section, verbatim. The destructive removal of temporary shared
+# copies is separated into its own block and carries its own locally scoped cleanup gate, so a
+# step-5, step-7 or repository-review approval can never stand in for it.
+VM_GATE_A11_SHUTDOWN_REVIEWED_SECTION = (
+    "After completion, leave the result-mapping workflow inactive and take no further\n"
+    "create action.\n\n"
+    + VM_GATE_A11_CLEANUP_REVIEWED_GATE
+    + "\nThen remove any temporary copies of the package and result from shared locations.\n\n"
+    "The consumed marker and write-intent marker remain on the VM as durable\n"
+    "evidence and single-use guards; do not delete them. The laptop-side publication\n"
+    "reservations remain beside the approval ledger for the same reason; do not delete or\n"
+    "sweep them either.\n\n")
+
+# The A11 TARGET document shape, and the fixture the repaired checker must accept. It is introduced
+# here, at the controls commit, because the controls have to name a document the repair must accept:
+# at this commit the exact-V checker rejects it, which is part of the RED evidence. The repair
+# promotes it to THE canonical fixture, so these controls survive it unchanged.
+#
+# Every region is the reviewed CONSTANT itself rather than a paraphrase, for the reason A5, A6 and
+# A8 each gave in turn: a fixture that could satisfy a DIFFERENT contract than the runbook would
+# make the whole control group meaningless.
+VM_GATE_A11_FIXTURE = (
+    VM_GATE_A4_FIXTURE_STEP_4
+    + "### 5. No-write preflight (dry-run)\n\n"
+    + VM_GATE_PREFLIGHT_REVIEWED_BLOCK
+    + VM_GATE_PREFLIGHT_REVIEWED_ACTION
+    + "### 6. Review aggregate evidence\n\n"
+      "The runner prints and writes a sanitized aggregate result only.\n\n"
+    + VM_GATE_A11_REVIEWED_HEADINGS[VM_GATE_A11_MAPPING_STEP] + "\n\n"
+    + VM_GATE_A11_MAPPING_REVIEWED_BLOCK
+    + VM_GATE_A11_MAPPING_REVIEWED_ACTION
+    + VM_GATE_A11_REVIEWED_HEADINGS[VM_GATE_A11_RECOVERY_STEP] + "\n\n"
+    + VM_GATE_A11_RECOVERY_REVIEWED_BLOCK
+    + VM_GATE_A11_RECOVERY_REVIEWED_ACTION
+    + "### 11. UAT shutdown and inactivity\n\n"
+    + VM_GATE_A11_SHUTDOWN_REVIEWED_SECTION
+    + VM_GATE_A11_SAFETY_REVIEWED_SECTION)
+
+# Ways a step-9 or step-10 gate can be defeated. Each must fail closed, and each names the finding
+# the repaired checker must report for it.
+VM_GATE_A11_MAPPING_MUTATIONS = (
+    ("gate_removed", "mapping_gate_missing"),
+    ("gate_after_first_action", "mapping_gate_after_action"),
+    ("prior_turn_wording", "mapping_gate_text_changed"),
+    ("earlier_approval_reused", "mapping_gate_text_changed"),
+    ("workflow_target_removed", "mapping_workflow_not_bound"),
+    ("spreadsheet_target_removed", "mapping_spreadsheet_not_bound"),
+    ("operation_set_removed", "mapping_operations_not_bound"),
+    ("generic_authority_substituted", "mapping_not_current_turn"),
+    ("prior_turn_denial_removed", "mapping_prior_turn_not_denied"),
+    ("substitution_denial_removed", "mapping_substitution_not_denied"),
+    ("stop_boundary_removed", "mapping_stop_boundary_missing"),
+)
+VM_GATE_A11_RECOVERY_MUTATIONS = (
+    ("gate_removed", "recovery_gate_missing"),
+    ("gate_after_lookup_begins", "recovery_gate_after_action"),
+    ("prior_turn_wording", "recovery_gate_text_changed"),
+    ("write_approval_reused", "recovery_gate_text_changed"),
+    ("account_book_removed", "recovery_account_book_not_bound"),
+    ("read_only_operation_removed", "recovery_read_only_not_bound"),
+    ("write_authority_denial_removed", "recovery_write_authority_not_denied"),
+    ("generic_authority_substituted", "recovery_not_current_turn"),
+    ("prior_turn_denial_removed", "recovery_prior_turn_not_denied"),
+    ("substitution_denial_removed", "recovery_substitution_not_denied"),
+    ("stop_boundary_removed", "recovery_stop_boundary_missing"),
+)
+# The replacement wording each gate mutation writes. Every one keeps the gate MARKER, so the
+# structural landmark survives and the mutation is judged on what the gate now says.
+VM_GATE_A11_MAPPING_REPLACEMENTS = {
+    "prior_turn_wording": (
+        "obtain an explicit current-turn owner approval that names",
+        "rely on the approval already obtained in an earlier turn, which named"),
+    "earlier_approval_reused": (
+        "A prior-turn approval is not reusable.",
+        "The step-5 preflight approval is reusable here."),
+    "workflow_target_removed": (
+        "`n8n-workflows/member_create_uat_result_mapping.workflow.json`", "the mapping workflow"),
+    "spreadsheet_target_removed": (
+        "the intended spreadsheet\nand source tab", "the destination"),
+    "operation_set_removed": (
+        "- running that workflow manually, with the workflow left inactive;\n", ""),
+    "generic_authority_substituted": (
+        "obtain an explicit current-turn owner approval that names",
+        "continue once approved, which covers"),
+    "prior_turn_denial_removed": ("A prior-turn approval is not reusable. ", ""),
+    "substitution_denial_removed": (
+        "- the VM deployment approval (step 4) does **not** authorise this result mapping;\n",
+        "- the VM deployment approval (step 4) is also sufficient here;\n"),
+    "stop_boundary_removed": (
+        "Without the named current-turn\nresult-mapping approval, stop before importing the"
+        " workflow, before binding any credential, before\ncopying the result file into the n8n"
+        " file location, before running the workflow and before updating\nthe spreadsheet row.",
+        "Proceed when ready."),
+}
+VM_GATE_A11_RECOVERY_REPLACEMENTS = {
+    "prior_turn_wording": (
+        "obtain an explicit current-turn owner approval that names",
+        "rely on the approval already obtained in an earlier turn, which named"),
+    "write_approval_reused": (
+        "A prior-turn approval is not reusable.",
+        "The step-7 write approval is reusable here."),
+    "account_book_removed": (
+        "the intended AutoCount\naccount book and environment", "the environment"),
+    "read_only_operation_removed": (
+        "the read-only member lookup and recovery\noperation for that one uncertain write outcome",
+        "the recovery work"),
+    "write_authority_denial_removed": (
+        "It grants no new `SaveMember` authority, authorises no create, update or\ndelete, and"
+        " authorises no second write attempt.",
+        "It is performed carefully."),
+    "generic_authority_substituted": (
+        "obtain an explicit current-turn owner approval that names",
+        "continue once approved, which covers"),
+    "prior_turn_denial_removed": ("A prior-turn approval is not reusable. ", ""),
+    "substitution_denial_removed": (
+        "- the separate current-turn write approval (step 7) does **not** authorise this recovery"
+        " lookup;\n",
+        "- the separate current-turn write approval (step 7) is also sufficient here;\n"),
+    "stop_boundary_removed": (
+        "Without the\nnamed current-turn recovery approval, stop before opening the account book"
+        " and before searching for\nthe member.",
+        "Proceed when ready."),
+}
+
 class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
     def setUp(self):
         self.runbook = read_repo_text("probe_runbook")
@@ -11810,6 +12572,487 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                     self.assertIn(HOST_SYNC_A9_CARRIER, host_sync_gate_findings(degraded),
                                   "the host-sync gate behind the valid opener %s must fail closed"
                                   % name)
+
+
+    # ---- DL-XB-123-001-A11-C1: post-ready Codex four-finding controls ---- #
+    # Every control degrades an in-memory copy only, never a repository file, and every structural
+    # control runs against BOTH bases. The raw-block state each A11-F1 control depends on is
+    # established by the INDEPENDENT oracle above and never by the checker, so a repair cannot
+    # satisfy these by agreeing with itself.
+
+    def _a11_bases(self):
+        return (("A11 target fixture", VM_GATE_A11_FIXTURE),
+                ("live create-UAT runbook", self.create_runbook))
+
+    def _a11_replace(self, base, old, new, label):
+        self.assertIn(old, base, "the base must carry %s exactly once" % label)
+        self.assertEqual(base.count(old), 1, "%s must be unambiguous" % label)
+        degraded = base.replace(old, new, 1)
+        self.assertNotEqual(degraded, base, "the %s mutation must change the document" % label)
+        return degraded
+
+    # -- A11-F1: inherited CommonMark HTML-block state -- #
+    def test_a11_control_html_oracle_covers_all_seven_families(self):
+        """The oracle itself, before it is used to judge anything.
+
+        Seven families, four permitted indents, opening and end conditions, and the four-column
+        exclusion. A control group for a control: an oracle that recognised nothing would make every
+        RED control below vacuous.
+        """
+        seen = set()
+        for name, kind, opener, closer in VM_GATE_A11_HTML_FAMILIES:
+            seen.add(kind)
+            for indent_name, indent in VM_GATE_A11_HTML_INDENTS:
+                with self.subTest(family=name, indent=indent_name):
+                    self.assertEqual(_a11_html_opens(indent + opener, False), kind,
+                                     "%s must open a type-%d block at %s indent"
+                                     % (name, kind, indent_name))
+                    self.assertFalse(_a11_html_ends(indent + VM_GATE_A11_HTML_FILLER, kind),
+                                     "ordinary content must not end a type-%d block" % kind)
+                    self.assertTrue(_a11_html_ends(closer, kind),
+                                    "%r must satisfy the type-%d end condition" % (closer, kind))
+        self.assertEqual(seen, {1, 2, 3, 4, 5, 6, 7},
+                         "every CommonMark HTML-block family must be covered")
+        for name, line in VM_GATE_A11_HTML_NON_OPENERS:
+            with self.subTest(non_opener=name):
+                self.assertIsNone(_a11_html_opens(line, False),
+                                  "%s opens no HTML block" % name)
+        # Type 7 alone cannot interrupt a paragraph; types 1 to 6 can.
+        for name, kind, opener, _closer in VM_GATE_A11_HTML_FAMILIES:
+            with self.subTest(interrupt=name):
+                expected = None if kind == 7 else kind
+                self.assertEqual(_a11_html_opens(opener, True), expected,
+                                 "%s paragraph-interruption behaviour must match CommonMark" % name)
+        # Types 1 to 5 may satisfy their end condition on the START line.
+        self.assertTrue(_a11_html_ends("<!-- note -->", 2))
+        self.assertFalse(_a11_html_ends("<div>", 6), "only a blank line ends a type-6 block")
+
+    def test_a11_control_reviewed_authorities_begin_outside_any_raw_block(self):
+        """The control group. Without it every RED control below could be vacuously satisfied."""
+        for base_name, base in self._a11_bases():
+            for label, needle, _key in VM_GATE_A11_HTML_AUTHORITIES:
+                with self.subTest(base=base_name, authority=label):
+                    self.assertIsNone(
+                        _a11_block_open_at(base, self._a9_authority_at(base, needle)),
+                        "the reviewed %s authority must begin outside any raw block" % label)
+        with self.subTest(authority="step-3 host-sync"):
+            at = self._a9_authority_at(self.create_runbook, HOST_SYNC_A11_GATE_OPENING)
+            self.assertIsNone(_a11_block_open_at(self.create_runbook, at),
+                              "the reviewed host-sync gate must begin outside any raw block")
+
+    def test_a11_control_html_block_before_a_vm_authority_fails_closed(self):
+        """A11-F1, at every protected VM authority, for all seven HTML-block families.
+
+        Nothing is added to, removed from or reworded inside any authority. ONE physical line is
+        placed in front of it, and CommonMark renders the authority as raw HTML-block content. At
+        exact V the checker modelled fenced code only, compared the authority as operative approval
+        prose, and reported the complete guard clean.
+        """
+        for base_name, base in self._a11_bases():
+            for label, needle, key in VM_GATE_A11_HTML_AUTHORITIES:
+                for name, kind, opener, _closer in VM_GATE_A11_HTML_FAMILIES:
+                    for indent_name, indent in VM_GATE_A11_HTML_INDENTS:
+                        with self.subTest(base=base_name, authority=label, family=name,
+                                          indent=indent_name):
+                            degraded = self._a9_insert_before(base, needle, indent + opener)
+                            at = self._a9_authority_at(degraded, needle)
+                            self.assertEqual(
+                                _a11_block_open_at(degraded, at), ("html", kind),
+                                "the oracle must agree the authority begins inside a type-%d HTML"
+                                " block" % kind)
+                            self.assertIn(key, vm_gate_findings(degraded),
+                                          "a %s authority inside inherited HTML-block content must"
+                                          " fail closed" % label)
+
+    def test_a11_control_html_block_before_the_host_sync_authority_fails_closed(self):
+        """The same defect at the step-3 gate, carried by the existing absent-marker cascade."""
+        for name, kind, opener, _closer in VM_GATE_A11_HTML_FAMILIES:
+            for indent_name, indent in VM_GATE_A11_HTML_INDENTS:
+                with self.subTest(family=name, indent=indent_name):
+                    degraded = self._a9_insert_before(
+                        self.create_runbook, HOST_SYNC_A11_GATE_OPENING, indent + opener)
+                    at = self._a9_authority_at(degraded, HOST_SYNC_GATE_MARKER)
+                    self.assertEqual(_a11_block_open_at(degraded, at), ("html", kind),
+                                     "the oracle must agree the gate begins inside an HTML block")
+                    self.assertIn(HOST_SYNC_A11_CARRIER, host_sync_gate_findings(degraded),
+                                  "a host-sync gate inside inherited HTML-block content must fail"
+                                  " closed")
+
+    def test_a11_control_crlf_html_openers_still_hide_the_authority(self):
+        """A CRLF checkout must not defeat the repair: `\\r` is line-ending syntax, not content."""
+        for base_name, base in self._a11_bases():
+            for label, needle, key in VM_GATE_A11_HTML_AUTHORITIES:
+                for name, kind, opener, _closer in VM_GATE_A11_HTML_FAMILIES:
+                    with self.subTest(base=base_name, authority=label, family=name):
+                        degraded = self._a9_insert_before(base, needle, opener + "\r")
+                        at = self._a9_authority_at(degraded, needle)
+                        self.assertEqual(_a11_block_open_at(degraded, at), ("html", kind),
+                                         "the oracle must read a CRLF opener as a type-%d opener"
+                                         % kind)
+                        self.assertIn(key, vm_gate_findings(degraded),
+                                      "a CRLF %s opener must still fail the %s authority closed"
+                                      % (name, label))
+
+    def test_a11_control_html_block_closed_before_the_authority_stays_clean(self):
+        """The positive control: a block that validly ENDS before the authority is not a finding.
+
+        A repair that fired merely because HTML appeared anywhere in the document would pass every
+        RED control above and make the runbook unmaintainable.
+        """
+        for base_name, base in self._a11_bases():
+            for label, needle, key in VM_GATE_A11_HTML_AUTHORITIES:
+                for name, kind, opener, closer in VM_GATE_A11_HTML_FAMILIES:
+                    with self.subTest(base=base_name, authority=label, family=name):
+                        lines = ([opener, VM_GATE_A11_HTML_FILLER, closer, ""]
+                                 if closer else [opener, VM_GATE_A11_HTML_FILLER, ""])
+                        degraded = self._a9_insert_before(base, needle, *lines)
+                        at = self._a9_authority_at(degraded, needle)
+                        self.assertIsNone(
+                            _a11_block_open_at(degraded, at),
+                            "the oracle must agree the type-%d block closed before the authority"
+                            % kind)
+                        self.assertNotIn(key, vm_gate_findings(degraded),
+                                         "a closed %s block before the %s authority is not drift"
+                                         % (name, label))
+
+    def test_a11_control_html_after_the_authority_is_not_material(self):
+        """Harmless HTML that begins AFTER every protected authority must stay clean.
+
+        The HTML is placed under its own new top-level section, because appending it INSIDE the
+        `## Safety boundary` -- the document's last section -- would change that reviewed section,
+        which the A8 identity already fails closed on and which is not what this control is about.
+        """
+        for base_name, base in self._a11_bases():
+            for name, _kind, opener, _closer in VM_GATE_A11_HTML_FAMILIES:
+                with self.subTest(base=base_name, family=name):
+                    degraded = base + "\n## Appendix\n\n" + opener + "\n"
+                    self.assertEqual(vm_gate_findings(degraded), vm_gate_findings(base),
+                                     "%s after every authority must change nothing" % name)
+
+    def test_a11_control_raw_block_families_do_not_open_inside_one_another(self):
+        """Sequencing: a fence opener inside an HTML block is content, and the reverse."""
+        for base_name, base in self._a11_bases():
+            for label, needle, key in VM_GATE_A11_HTML_AUTHORITIES:
+                with self.subTest(base=base_name, authority=label, case="fence_inside_html"):
+                    degraded = self._a9_insert_before(base, needle, "<script>", "```", "~~~")
+                    at = self._a9_authority_at(degraded, needle)
+                    self.assertEqual(_a11_block_open_at(degraded, at), ("html", 1),
+                                     "a fence line inside a type-1 HTML block is block content")
+                    self.assertIn(key, vm_gate_findings(degraded))
+                with self.subTest(base=base_name, authority=label, case="html_inside_fence"):
+                    degraded = self._a9_insert_before(base, needle, "```", "<script>", "<div>")
+                    at = self._a9_authority_at(degraded, needle)
+                    self.assertEqual(_a11_block_open_at(degraded, at), ("fence", "`", 3),
+                                     "an HTML opener inside a fenced block is block content")
+                    self.assertIn(key, vm_gate_findings(degraded))
+                with self.subTest(base=base_name, authority=label, case="fence_closes_then_html"):
+                    degraded = self._a9_insert_before(
+                        base, needle, "```", VM_GATE_A11_HTML_FILLER, "```", "<script>")
+                    at = self._a9_authority_at(degraded, needle)
+                    self.assertEqual(_a11_block_open_at(degraded, at), ("html", 1),
+                                     "an HTML opener AFTER a closed fence opens its own block")
+                    self.assertIn(key, vm_gate_findings(degraded))
+
+    def test_a11_control_unclosed_html_block_runs_to_end_of_document(self):
+        """End-of-document behaviour, stated rather than assumed: an unclosed block stays open."""
+        for base_name, base in self._a11_bases():
+            for name, kind, opener, closer in VM_GATE_A11_HTML_FAMILIES:
+                if not closer:
+                    continue
+                with self.subTest(base=base_name, family=name):
+                    text = base + "\n" + opener + "\n"
+                    self.assertEqual(_a11_block_open_at(text, len(text)), ("html", kind),
+                                     "%s left unclosed must stay open through the end" % name)
+
+    # -- A11-F2: whole-procedure protected-operation placement -- #
+    def _a11_step_openings(self, text):
+        return {step: at for at, step in _numbered_heading_openings(text)}
+
+    def _a11_inject_operation(self, base, step, line):
+        """Append one ACTIVE protected operation line to the end of numbered step ``step``."""
+        openings = self._a11_step_openings(base)
+        self.assertIn(step, openings, "the base must carry step %d" % step)
+        following = sorted(at for at in openings.values() if at > openings[step])
+        end = following[0] if following else len(base)
+        block = "\n```powershell\n" + line + "\n```\n\n"
+        degraded = base[:end] + block + base[end:]
+        self.assertNotEqual(degraded, base, "the injected operation must change the document")
+        return degraded
+
+    def test_a11_control_canonical_protected_operations_stay_in_their_regions(self):
+        """The control group: every reviewed protected operation already sits where it belongs."""
+        for base_name, base in self._a11_bases():
+            with self.subTest(base=base_name):
+                self.assertNotIn("protected_operation_outside_region", vm_gate_findings(base),
+                                 "the reviewed document keeps every protected operation inside its"
+                                 " authorised action region")
+
+    def test_a11_control_extra_protected_operation_outside_its_region_fails_closed(self):
+        """A11-F2, for every recognised operation family at several positions.
+
+        The canonical gated operation is left completely intact; a SECOND active instance of it is
+        added somewhere else in the procedure. At exact V the deployment and preflight guards read
+        only their own resolved sections, so the complete guard stayed clean.
+        """
+        for base_name, base in self._a11_bases():
+            present = set(self._a11_step_openings(base))
+            for name, anchor, allowed, _fold in VM_GATE_A11_PROTECTED_OPERATIONS:
+                for step in VM_GATE_A11_PLACEMENT_STEPS:
+                    if step in allowed or step not in present:
+                        continue
+                    with self.subTest(base=base_name, operation=name, step=step):
+                        degraded = self._a11_inject_operation(base, step, anchor)
+                        self.assertIn("protected_operation_outside_region",
+                                      vm_gate_findings(degraded),
+                                      "an active %s outside its authorised region must fail closed"
+                                      % name)
+
+    def test_a11_control_non_operational_mentions_are_not_protected_operations(self):
+        """Positive control: a mention, an echo, a comment and prose are not the operation."""
+        for base_name, base in self._a11_bases():
+            present = set(self._a11_step_openings(base))
+            for name, anchor, allowed, _fold in VM_GATE_A11_PROTECTED_OPERATIONS:
+                for step in VM_GATE_A11_PLACEMENT_STEPS:
+                    if step in allowed or step not in present:
+                        continue
+                    for inert_name, template in VM_GATE_A11_PLACEMENT_INERT:
+                        with self.subTest(base=base_name, operation=name, step=step,
+                                          inert=inert_name):
+                            degraded = self._a11_inject_operation(
+                                base, step, template % anchor)
+                            self.assertNotIn("protected_operation_outside_region",
+                                             vm_gate_findings(degraded),
+                                             "an inert %s mention is not an operation" % name)
+
+    # -- A11-F3: operator-directed destructive cleanup -- #
+    def test_a11_control_destructive_inventory_is_complete(self):
+        """Every destructive instruction in the reviewed runbook is enumerated, and each is gated."""
+        lowered = self.create_runbook.lower()
+        for phrase in VM_GATE_A11_DESTRUCTIVE_PHRASES:
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, lowered,
+                              "the inventory must name a real runbook instruction")
+        self.assertIn(VM_GATE_A11_CLEANUP_REVIEWED_GATE, self.create_runbook,
+                      "the runbook must carry the reviewed destructive-cleanup gate")
+        self.assertNotIn("destructive_cleanup_not_gated", vm_gate_findings(self.create_runbook),
+                         "every destructive instruction must carry its own current-turn gate")
+        self.assertNotIn("destructive_cleanup_gate_text_changed",
+                         vm_gate_findings(self.create_runbook))
+
+    def _a11_move_gate_after_its_block(self, base):
+        gate = VM_GATE_A11_CLEANUP_REVIEWED_GATE
+        at = base.index(gate)
+        body_start = at + len(gate)
+        while base.startswith("\n", body_start):
+            body_start += 1
+        body_end = base.find("\n\n", body_start)
+        self.assertNotEqual(body_end, -1, "the governed block must be followed by a blank line")
+        body = base[body_start:body_end + 1]
+        return base[:at] + body + "\n" + gate + base[body_end + 1:]
+
+    def _a11_cleanup_mutate(self, base, name):
+        gate = VM_GATE_A11_CLEANUP_REVIEWED_GATE
+        self.assertIn(gate, base, "the base must carry the reviewed destructive-cleanup gate")
+        if name == "gate_removed":
+            return base.replace(gate, "", 1)
+        if name == "gate_moved_after_instruction":
+            return self._a11_move_gate_after_its_block(base)
+        return base.replace(gate, VM_GATE_A11_CLEANUP_REPLACEMENTS[name], 1)
+
+    def test_a11_control_destructive_cleanup_mutations_fail_closed(self):
+        """A11-F3: removal, relocation, prior-turn wording and every substituted authority."""
+        for base_name, base in self._a11_bases():
+            for name, key in VM_GATE_A11_CLEANUP_MUTATIONS:
+                with self.subTest(base=base_name, mutation=name):
+                    degraded = self._a11_cleanup_mutate(base, name)
+                    self.assertNotEqual(degraded, base, "the mutation must change the document")
+                    self.assertIn(key, vm_gate_findings(degraded),
+                                  "the %s mutation must fail closed" % name)
+
+    def test_a11_control_destructive_prohibitions_are_not_instructions(self):
+        """Positive control: "never delete", "do not delete" and "do not sweep" stay non-material.
+
+        The reviewed runbook deliberately RETAINS evidence, and a guard that treated a prohibition
+        as an operator-directed deletion would force a gate in front of a rule that forbids one.
+        """
+        for base_name, base in self._a11_bases():
+            for phrase in VM_GATE_A11_DESTRUCTIVE_PROHIBITIONS:
+                with self.subTest(base=base_name, prohibition=phrase):
+                    degraded = base + "\nA reminder: " + phrase + ".\n"
+                    self.assertNotIn("destructive_cleanup_not_gated", vm_gate_findings(degraded),
+                                     "a prohibition is not an operator-directed deletion")
+
+    # -- A11-F4: the step-9 live mapping and step-10 conditional recovery gates -- #
+    def _a11_gate_mutate(self, base, block, action, name, replacements):
+        self.assertIn(block, base, "the base must carry the reviewed gate block")
+        if name.startswith("gate_removed"):
+            return base.replace(block, "", 1)
+        if name.startswith("gate_after"):
+            self.assertIn(block + action, base, "the gate must immediately precede its action")
+            return base.replace(block + action, action + block, 1)
+        old, new = replacements[name]
+        self.assertIn(old, block, "the reviewed gate must carry %r" % (old[:48],))
+        return base.replace(block, block.replace(old, new, 1), 1)
+
+    def test_a11_control_canonical_mapping_and_recovery_gates_stay_clean(self):
+        """The control group for both new surfaces, on both bases."""
+        for base_name, base in self._a11_bases():
+            with self.subTest(base=base_name):
+                findings = vm_gate_findings(base)
+                self.assertEqual([key for key in findings
+                                  if key.startswith(("mapping_", "recovery_"))], [],
+                                 "the reviewed step-9 and step-10 gates must satisfy the contract")
+
+    def test_a11_control_mapping_gate_mutations_fail_closed(self):
+        """A11-F4, step 9: removal, relocation after the first live action, reuse and every
+        missing binding."""
+        for base_name, base in self._a11_bases():
+            for name, key in VM_GATE_A11_MAPPING_MUTATIONS:
+                with self.subTest(base=base_name, mutation=name):
+                    degraded = self._a11_gate_mutate(
+                        base, VM_GATE_A11_MAPPING_REVIEWED_BLOCK,
+                        VM_GATE_A11_MAPPING_REVIEWED_ACTION, name,
+                        VM_GATE_A11_MAPPING_REPLACEMENTS)
+                    self.assertNotEqual(degraded, base, "the mutation must change the document")
+                    self.assertIn(key, vm_gate_findings(degraded),
+                                  "the step-9 %s mutation must fail closed" % name)
+
+    def test_a11_control_recovery_gate_mutations_fail_closed(self):
+        """A11-F4, step 10: removal, relocation after the lookup begins, reuse and every missing
+        binding."""
+        for base_name, base in self._a11_bases():
+            for name, key in VM_GATE_A11_RECOVERY_MUTATIONS:
+                with self.subTest(base=base_name, mutation=name):
+                    degraded = self._a11_gate_mutate(
+                        base, VM_GATE_A11_RECOVERY_REVIEWED_BLOCK,
+                        VM_GATE_A11_RECOVERY_REVIEWED_ACTION, name,
+                        VM_GATE_A11_RECOVERY_REPLACEMENTS)
+                    self.assertNotEqual(degraded, base, "the mutation must change the document")
+                    self.assertIn(key, vm_gate_findings(degraded),
+                                  "the step-10 %s mutation must fail closed" % name)
+
+    def test_a11_control_mapping_and_recovery_actions_are_identity_protected(self):
+        """The action regions must carry the same identity discipline steps 4 and 5 already have."""
+        cases = ((VM_GATE_A11_MAPPING_REVIEWED_ACTION, "mapping_action_text_changed"),
+                 (VM_GATE_A11_RECOVERY_REVIEWED_ACTION, "recovery_action_text_changed"))
+        for base_name, base in self._a11_bases():
+            for action, key in cases:
+                with self.subTest(base=base_name, key=key):
+                    self.assertIn(action, base, "the base must carry the reviewed action region")
+                    degraded = base.replace(
+                        action,
+                        action.rstrip("\n") + "\nThe approval above is optional here.\n\n", 1)
+                    self.assertIn(key, vm_gate_findings(degraded),
+                                  "an action-region revocation must fail closed")
+
+    # -- A11: the corrected Safety boundary -- #
+    def test_a11_control_safety_boundary_states_no_fixed_total(self):
+        """The reviewed boundary must keep the four baseline surfaces AND name the conditional
+        ones, without asserting any fixed total."""
+        for base_name, base in self._a11_bases():
+            with self.subTest(base=base_name):
+                self.assertIn(VM_GATE_A11_SAFETY_REVIEWED_SECTION, base,
+                              "the base must carry the corrected Safety boundary")
+                flat = _flat(base).lower()
+                for token in VM_GATE_A11_SAFETY_TOKENS:
+                    self.assertIn(token, flat, "the corrected boundary must state %r" % (token[:48],))
+                self.assertNotIn("are four independent approval surfaces", flat,
+                                 "the incorrect fixed total must be retired")
+                self.assertNotIn("safety_boundary_surfaces_incomplete", vm_gate_findings(base))
+        preserved = _flat(VM_GATE_A11_SAFETY_REVIEWED_SECTION)
+        for token in VM_GATE_A5_SAFETY_STEP5_SCOPE:
+            with self.subTest(preserved=token):
+                self.assertIn(token, preserved,
+                              "the reviewed step-5 surface scope must be preserved verbatim")
+
+    def _a11_safety_mutate(self, base, position, sentence):
+        section = VM_GATE_A11_SAFETY_REVIEWED_SECTION
+        self.assertIn(section, base, "the base must carry the corrected Safety boundary")
+        if position == "prepend":
+            mutated = section.replace("## Safety boundary\n\n",
+                                      "## Safety boundary\n\n" + sentence + "\n\n", 1)
+        elif position == "append":
+            mutated = section.rstrip("\n") + " " + sentence + "\n"
+        else:
+            mutated = section.rstrip("\n") + "\n" + sentence + "\n"
+        return base.replace(section, mutated, 1)
+
+    def test_a11_control_safety_boundary_contradictions_fail_closed(self):
+        """A contradiction INSIDE the one corrected boundary must fail closed, in three placements."""
+        for base_name, base in self._a11_bases():
+            for label, position, sentence in VM_GATE_A11_SAFETY_CONTRADICTIONS:
+                with self.subTest(base=base_name, contradiction=label):
+                    degraded = self._a11_safety_mutate(base, position, sentence)
+                    self.assertNotEqual(degraded, base, "the contradiction must change the section")
+                    self.assertIn("safety_boundary_surfaces_incomplete", vm_gate_findings(degraded),
+                                  "the %s contradiction must fail closed" % label)
+
+    def test_a11_control_safety_boundary_required_bullets_cannot_be_removed(self):
+        """Removing the baseline four, the conditional surfaces or the no-fixed-total rule fails."""
+        section = VM_GATE_A11_SAFETY_REVIEWED_SECTION
+        for base_name, base in self._a11_bases():
+            for label, opening in VM_GATE_A11_SAFETY_REQUIRED_BULLETS:
+                with self.subTest(base=base_name, bullet=label):
+                    at = section.index(opening)
+                    end = section.find("\n- ", at)
+                    self.assertNotEqual(end, -1, "the bullet must be followed by another")
+                    mutated = section[:at] + section[end + 1:]
+                    degraded = self._a11_replace(base, section, mutated, "the Safety boundary")
+                    self.assertIn("safety_boundary_surfaces_incomplete", vm_gate_findings(degraded),
+                                  "removing the %s bullet must fail closed" % label)
+
+    # -- A11: declared surface, reachability, purity and the target document -- #
+    def test_a11_target_fixture_and_live_runbook_satisfy_the_whole_a11_contract(self):
+        for base_name, base in self._a11_bases():
+            with self.subTest(base=base_name):
+                self.assertEqual(vm_gate_findings(base), [],
+                                 "%s must satisfy every DL-XB-123-001-A11 requirement" % base_name)
+
+    def test_a11_control_finding_keys_are_declared_unique_and_reachable(self):
+        self.assertEqual(len(VM_GATE_FINDING_KEYS), VM_GATE_A11_FINDING_KEY_COUNT,
+                         "A11 adds exactly its declared keys and retires nothing")
+        self.assertEqual(len(set(VM_GATE_FINDING_KEYS)), VM_GATE_A11_FINDING_KEY_COUNT,
+                         "no finding key may be declared twice")
+        for key in VM_GATE_A11_NEW_KEYS:
+            with self.subTest(key=key):
+                self.assertIn(key, VM_GATE_FINDING_KEYS, "%s must be declared" % key)
+        self.assertNotIn("safety_boundary_not_four_way", VM_GATE_FINDING_KEYS,
+                         "the four-way key is renamed, because the contract is no longer four-way")
+        self.assertIn("safety_boundary_surfaces_incomplete", VM_GATE_FINDING_KEYS)
+        self.assertLess(VM_GATE_A11_NEEDS_A_REAL_DOCUMENT, set(VM_GATE_FINDING_KEYS),
+                        "every landmark-dependent key must still be declared")
+        self.assertEqual(set(vm_gate_findings("")),
+                         set(VM_GATE_FINDING_KEYS) - VM_GATE_A11_NEEDS_A_REAL_DOCUMENT,
+                         "an empty document must report every other declared finding key")
+        self.assertIn(VM_GATE_A11_MAPPING_UNMET, (VM_GATE_A11_MAPPING_UNMET,))
+        self.assertLess(VM_GATE_A11_MAPPING_UNMET, set(VM_GATE_FINDING_KEYS))
+        self.assertLess(VM_GATE_A11_RECOVERY_UNMET, set(VM_GATE_FINDING_KEYS))
+
+    def test_a11_control_checker_stays_pure_deterministic_and_total(self):
+        """Text in, findings out: repeated calls agree, and malformed input raises nothing."""
+        for base_name, base in self._a11_bases():
+            with self.subTest(base=base_name):
+                self.assertEqual(vm_gate_findings(base), vm_gate_findings(base),
+                                 "the checker must be deterministic")
+        for label, text in VM_GATE_A11_MALFORMED_INPUTS:
+            with self.subTest(malformed=label):
+                first = vm_gate_findings(text)
+                self.assertIsInstance(first, list, "%s must yield findings, not raise" % label)
+                self.assertEqual(first, vm_gate_findings(text))
+                self.assertLessEqual(set(first), set(VM_GATE_FINDING_KEYS),
+                                     "no emitted key may be undeclared")
+
+    def test_a11_control_no_emitted_key_is_undeclared(self):
+        """Across every control document this class builds, emitted keys stay inside the declaration."""
+        documents = [VM_GATE_A11_FIXTURE, self.create_runbook, "", VM_GATE_CANONICAL_FIXTURE,
+                     HOST_SYNC_CANONICAL_FIXTURE]
+        for label, needle, _key in VM_GATE_A11_HTML_AUTHORITIES:
+            for _name, _kind, opener, _closer in VM_GATE_A11_HTML_FAMILIES:
+                documents.append(self._a9_insert_before(VM_GATE_A11_FIXTURE, needle, opener))
+        for index, document in enumerate(documents):
+            with self.subTest(document=index):
+                self.assertLessEqual(set(vm_gate_findings(document)), set(VM_GATE_FINDING_KEYS),
+                                     "every emitted finding key must be declared")
 
 
 @unittest.skipIf(PS is None, "no PowerShell executable available")
