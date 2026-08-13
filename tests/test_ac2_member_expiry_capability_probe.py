@@ -4623,6 +4623,60 @@ VM_GATE_SAFETY_TOKENS = (
     "a prior-turn approval is never reusable for any of them",
 )
 
+# ---- A8: the reviewed Safety boundary, verbatim ---- #
+# Accepted finding PRRT_kwDOSbJI_s6YzUw1. A4 established that the section must be UNIQUE, and then
+# validated the unique section by ADDITIVE TOKEN PRESENCE: every required substring had to remain,
+# and nothing else was inspected. Appending "One approval may cover all four surfaces." inside that
+# single section therefore left every token present and `vm_gate_findings()` clean, while the
+# document carried an explicit waiver of the separation the section exists to state.
+#
+# The answer is the one A5 and A6 already proved works, applied to the third reviewed region:
+# recognise the text review approved instead of classifying English. There is no contradiction
+# classifier here and no negation vocabulary -- an added clause, a removed clause, a reworded
+# clause and a merged approval surface all change the section and all fail closed alike, whether
+# they carry a word any list knows or not.
+#
+# The tokens above are KEPT as defence in depth under the same finding key, so a document that
+# loses identity still reports which proposition it lost. This constant is written out here rather
+# than derived from the runbook or the fixture, because authority derived from the thing it is
+# meant to constrain is not authority at all; the fixture consumes it for the same reason the gate
+# and action fixtures consume theirs.
+VM_GATE_SAFETY_REVIEWED_SECTION = r"""## Safety boundary
+
+- No AutoCount write occurs in development, tests, or CI. Enabling the ExpiryDate path
+  (recording the business confirmations and flipping the capability flag) performs no
+  live write; a real write still requires the explicit VM write step above and a
+  separate current-turn owner approval naming the exact target and operation.
+- The host sync on `DESKTOP-Q43QKQF` in step 3 and the `SaveMember` write in step 7
+  each require their own prior current-turn owner approval. Neither implies the other,
+  and a prior-turn approval is never reusable for either.
+- The step-3 host sync, the step-4 VM deployment, the step-5 preflight surface (selected
+  private form/decision-row access, the reviewer-decision and approval-ledger operation,
+  the immutable package build, the AutoCount environment setup, the package transfer and
+  the no-write AutoCount preflight), and the step-7 `SaveMember` write are four
+  independent approval surfaces. Each requires its own current-turn owner approval, none
+  implies or covers another, and a prior-turn approval is never reusable for any of them.
+- Exactly one member is supported; there is no batch path, no update-member path, no
+  delete, and no rollback automation.
+- SaveMember is called at most once and is never automatically retried. An uncertain
+  save outcome is terminal (`WRITE_OUTCOME_UNCERTAIN`) and is resolved only by the
+  separate read-only recovery check, never by an automatic retry.
+- No final package can be published before its durable publication reservation is
+  confirmed, so a publication or ledger persistence failure can never leave a published
+  package that the same approval is free to build again. An already-published package is
+  never deleted, rolled back, truncated, renamed or modified by any failure path.
+- A package built under the previous `member_create_uat_package/v1` contract cannot be
+  reused; the runner refuses it fail-closed. Build a fresh `v2` package at a new,
+  version-distinct path after a new reviewer decision. The package builder is strictly
+  no-clobber and never overwrites an existing package, so the old `v1` artifact and its
+  hash are preserved as historical evidence and remain non-executable under `v2`.
+- The synthetic member and permanent single-use claim created by the earlier
+  [ExpiryDate capability probe](member_expiry_capability_probe_runbook.md) are left
+  exactly as they are; this UAT path does not read, modify, or clean them up.
+- All console, evidence, test, and workflow output is sanitized and PII-free; member
+  numbers are masked and names, emails, and birthdays are never printed.
+"""
+
 # ---- A5: the reviewed gate blocks, verbatim ---- #
 # Accepted final-G4 finding F-A: polarity cannot be decided by vocabulary. "The current-turn owner
 # approval is optional." carries no word the negation list knows, and "This approval is optional."
@@ -4762,13 +4816,17 @@ bump changes both `source_record_id` and `source_fingerprint` (each binds the sc
 version), a fresh reviewer decision is mechanically required; a `v1` decision or build
 cannot mint a `v2` package.
 
+**`AUTOCOUNT VM — DESKTOP-4I042L6`** Every remaining preflight operation runs on the
+AutoCount VM, under the same preflight approval, in the VM process that runs the runner.
+
 Set the AutoCount connection through the process environment only (never in files, never in
 this runbook): `AC2_PROBE_SERVER_NAME`, `AC2_PROBE_DATABASE_NAME`, `AC2_PROBE_USER_ID`, and
-the password environment variable named by `-PasswordEnvVar`.
+the password environment variable named by `-PasswordEnvVar`. `ac2_member_create_uat_runner.ps1`
+defaults `ServerName`, `DatabaseName` and `UserId` from these variables in its own VM process,
+so values set on the laptop configure nothing.
 
-**`AUTOCOUNT VM — DESKTOP-4I042L6`** Under the same preflight approval, copy the
-approved package to the VM and run the runner in dry-run mode (the default; no write
-switches). Dry-run authenticates, checks the duplicate, constructs the new member,
+Then copy the approved package to the VM and run the runner in dry-run mode (the default;
+no write switches). Dry-run authenticates, checks the duplicate, constructs the new member,
 assigns only the whitelisted fields, and stops without SaveMember. The build authority
 below governs which package may be transferred at all.
 
@@ -5469,7 +5527,47 @@ VM_GATE_BULLET_MARKERS = ("-", "*", "+")
 # indented-code content and not a fence, which is the same four-leading-space exclusion A3 already
 # applies to numbered ATX headings. Deliberately a fence-LINE test and nothing more: A7 authorises
 # no Markdown parser, no block model and no new finding key.
-VM_GATE_FENCE_LINE = re.compile(r"^ {0,3}(?:`{3,}|~{3,})")
+VM_GATE_FENCE_LINE = re.compile(r"^ {0,3}(?P<fence>`{3,}|~{3,})")
+
+# A8 adds the two things A7 deliberately stopped short of, both accepted as demonstrated false
+# cleans at exact P. Neither is a Markdown parser: each is one more LINE-LEVEL property that
+# decides how CommonMark renders the reviewed text, held to the same identity discipline A5/A6/A7
+# already apply to wording and fence position.
+#
+# 1. FENCED-BLOCK STATE (accepted A8-F2, PRRT_kwDOSbJI_s6YzUw3). A7 gave a fence LINE its own
+#    semantic unit but left every other physical line coalescing into one whitespace-joined prose
+#    run -- including the executable lines INSIDE the block a fence opens. Splitting the reviewed
+#    step-5 dry-run invocation immediately after `-PackagePath` therefore rejoined to the identical
+#    text: the guard reported clean while the documented command had become two lines, the second
+#    of which PowerShell reads as a bare string statement rather than an argument. Inside a fenced
+#    block a physical line is now its own unit, so one command line no longer compares equal to
+#    two. Outside a fence, prose still coalesces -- A8 is a fenced-LINE repair, not a decision that
+#    every document newline is authoritative.
+#
+#    Closing follows CommonMark rather than a bare toggle: a closing fence must use the SAME marker
+#    character, be at least as long as the opener, and carry no info string. Anything else stays
+#    block CONTENT, which is the fail-closed direction -- an unmatched or info-bearing fence changes
+#    the unit sequence instead of quietly ending the block.
+#
+# 2. CONTAINER INDENTATION (accepted A8-F3, PRRT_kwDOSbJI_s6YzUw7). `.strip()` erased leading
+#    indentation before comparison, so indenting a complete reviewed approval gate by four columns
+#    -- or one tab -- rendered it as an indented CODE BLOCK, literal example text rather than
+#    operative approval prose, while the gated actions stayed live and the guard reported clean.
+#
+#    Indentation is therefore CLASSIFIED rather than either erased or preserved byte-for-byte: a
+#    line carries the number of four-column indented-code steps it stands at, measured from the
+#    left edge of the block it belongs to. Zero to three columns cannot open an indented code
+#    block, so an editor's harmless re-indentation stays non-material; four columns, a tab, or any
+#    mixture reaching column four is a different rendered block and fails closed.
+VM_GATE_INDENT_TAB_STOP = 4
+VM_GATE_INDENTED_CODE_COLUMNS = 4
+# The ONE list grammar the reviewed gate and action regions actually use: a CommonMark bullet at
+# the block's left edge, whose continuation lines are indented to the marker's content column. The
+# content column is the marker plus one space, which is how every reviewed bullet is written.
+# Deliberately not a container model: no ordered lists, no nesting, no blockquotes and no tables
+# are tracked, because the reviewed grammar contains no indented instance of any of them (asserted
+# by a control), and anything unrecognised simply falls back to the block's left edge.
+VM_GATE_LIST_CONTENT_OFFSET = 2
 
 # Everything a resolved step must prove. When the structural layout CANNOT be resolved -- no
 # gate, two gates, no boundary, two boundaries, or a boundary before its gate -- the step is
@@ -5505,7 +5603,11 @@ VM_GATE_PREFLIGHT_UNMET = frozenset((
 # safety-boundary ambiguity. 39 keys became 46. A5 adds the two reviewed gate-block identities and
 # retires nothing, so 46 become 48. No new command or safety-boundary key is introduced: F-B is
 # closed by holding the EXISTING four command keys to an honest standard, and F-D by correcting
-# the text `safety_boundary_not_four_way` already governs.
+# the text `safety_boundary_not_four_way` already governs. A6 adds the two reviewed ACTION-region
+# identities, so 48 become the 50 declared below; A7 and A8 add none. Every A7 and A8 repair is
+# carried by an existing key -- the fence-position, fenced-line and container-indentation repairs
+# by the four `*_text_changed` identities, and the complete Safety-boundary authority by
+# `safety_boundary_not_four_way`.
 VM_GATE_FINDING_KEYS = (
     "deploy_action_text_changed", "preflight_action_text_changed",
     "deploy_boundary_ambiguous", "deploy_boundary_missing", "deploy_execution_not_denied",
@@ -5581,28 +5683,102 @@ def _semantic_markdown_region(region):
     fence-POSITION repair, not a decision that newlines are significant. A fence unit carries the
     whole stripped fence line, so the marker character, the fence length, the info string and any
     command text joined into it are all compared rather than assumed equal.
+
+    A8-F2: a line INSIDE the block a fence opens is its own unit too. A7 stopped at the fence line
+    itself, so the executable lines it delimits still coalesced and one command line normalised
+    identically to two -- the accepted case is written out beside ``VM_GATE_INDENT_TAB_STOP``.
+
+    A8-F3: every prose unit carries the INDENTED-CODE CLASS of the lines it was built from, and a
+    run ends when that class changes. Zero to three columns is class 0 and stays non-material;
+    four columns, a tab, or any mixture reaching column four is a different rendered block. The
+    class is measured from the left edge of the enclosing block, so re-indenting a whole gate by up
+    to three columns -- bullets and their continuations together -- stays class 0 throughout, while
+    indenting it by four turns every line into class 1 and fails closed.
     """
-    units, prose = [], []
+    units, prose, prose_class = [], [], 0
+    fence = None
+    block_edge, content_column = 0, 0
     for line in region.splitlines():
         stripped = line.strip()
         if not stripped:
             continue
+        run = VM_GATE_FENCE_LINE.match(line)
+        if fence is not None:
+            # A closing fence repeats the marker, is at least as long, and adds no info string.
+            # Anything else stays block CONTENT, which is the fail-closed direction: an unmatched
+            # or info-bearing fence changes the unit sequence rather than quietly ending the block.
+            if run is not None and run.group("fence")[0] == fence[0] \
+                    and len(run.group("fence")) >= fence[1] \
+                    and not stripped[len(run.group("fence")):].strip():
+                units.append(("fence", " ".join(stripped.split())))
+                fence = None
+            else:
+                units.append(("code", " ".join(_semantic_bullet(stripped).split())))
+            continue
         # Matched against the RAW line, because indentation has to be judged before it is
         # stripped: at four leading spaces the line is indented-code content and not a fence at
         # all, so it becomes ordinary prose here and the moved block boundary fails closed.
-        if VM_GATE_FENCE_LINE.match(line):
+        if run is not None:
             if prose:
-                units.append(("prose", " ".join(prose)))
+                units.append(("prose", prose_class, " ".join(prose)))
                 prose = []
             units.append(("fence", " ".join(stripped.split())))
+            fence = (run.group("fence")[0], len(run.group("fence")))
+            block_edge, content_column = 0, 0
             continue
-        if len(stripped) > 1 and stripped[0] in VM_GATE_BULLET_MARKERS \
-                and stripped[1] in " \t":
-            stripped = "- " + stripped[2:]
-        prose.append(" ".join(stripped.split()))
+        width = _indent_width(line)
+        if _opens_bullet(stripped):
+            indent_class = max(width - block_edge, 0) // VM_GATE_INDENTED_CODE_COLUMNS
+            block_edge, content_column = width, width + VM_GATE_LIST_CONTENT_OFFSET
+        elif content_column and width >= content_column:
+            indent_class = (width - content_column) // VM_GATE_INDENTED_CODE_COLUMNS
+        else:
+            block_edge, content_column = 0, 0
+            indent_class = width // VM_GATE_INDENTED_CODE_COLUMNS
+        if prose and indent_class != prose_class:
+            units.append(("prose", prose_class, " ".join(prose)))
+            prose = []
+        prose_class = indent_class
+        prose.append(" ".join(_semantic_bullet(stripped).split()))
     if prose:
-        units.append(("prose", " ".join(prose)))
+        units.append(("prose", prose_class, " ".join(prose)))
     return tuple(units)
+
+
+def _opens_bullet(stripped):
+    """True when a stripped line opens a CommonMark bullet item.
+
+    The ONE list-grammar predicate. A8 needs the same answer twice -- to canonicalise the marker
+    and to place the item's content column -- and the A3 finding is exactly what happens when the
+    same grammar is written down twice and the two spellings drift apart.
+    """
+    return len(stripped) > 1 and stripped[0] in VM_GATE_BULLET_MARKERS and stripped[1] in " \t"
+
+
+def _semantic_bullet(stripped):
+    """Canonicalise a line-start CommonMark bullet marker, or return the line unchanged.
+
+    ``-``, ``*`` and ``+`` open the same list (#118), and A6-F4 widened the test to any ordinary
+    horizontal whitespace after the marker, so ``*\\titem`` is the same item as ``- item``.
+    """
+    return "- " + stripped[2:] if _opens_bullet(stripped) else stripped
+
+
+def _indent_width(line):
+    """The COLUMN a line's content starts at, with tabs advanced to the CommonMark tab stop.
+
+    A8-F3's measurement and nothing more: it answers "how far in does this line begin", which is
+    what decides indented-code semantics. It reads no container state and makes no block decision.
+    """
+    width = 0
+    for char in line:
+        if char == " ":
+            width += 1
+        elif char == "\t":
+            width += VM_GATE_INDENT_TAB_STOP - (width % VM_GATE_INDENT_TAB_STOP)
+        else:
+            break
+    return width
 
 
 def _semantic_gate_block(block):
@@ -6045,6 +6221,14 @@ def _four_way_safety_findings(text, findings):
     ``_resolve_numbered_step`` already does for steps 4 and 5. A harmless duplicate fails closed
     for the same reason a harmless duplicate step does: once the authority appears twice there is
     no answer to which one governs, and guessing is the defect rather than the inconvenience.
+
+    A8 gives the unique section COMPLETE reviewed authority. Accepted finding
+    PRRT_kwDOSbJI_s6YzUw1: additive token presence let a contradiction be appended INSIDE the one
+    boundary with every required substring intact, so the checker reported clean while the document
+    waived the separation the section states. Identity is decided first, exactly as it already is
+    for both gate blocks and both action regions; the token propositions then stay as defence in
+    depth under the SAME finding key, so a section that loses identity still reports which
+    requirement it lost rather than only that something moved.
     """
     openings = [match.start() for match in VM_GATE_SAFETY_OPENING.finditer(text)]
     if not openings:
@@ -6055,7 +6239,11 @@ def _four_way_safety_findings(text, findings):
         return
     at = openings[0]
     end = text.find("\n## ", at + 1)
-    section = _flat(text[at:end] if end != -1 else text[at:]).lower()
+    reviewed = text[at:end] if end != -1 else text[at:]
+    if _semantic_markdown_region(reviewed) \
+            != _semantic_markdown_region(VM_GATE_SAFETY_REVIEWED_SECTION):
+        findings.add("safety_boundary_not_four_way")
+    section = _flat(reviewed).lower()
     if any(token not in section for token in VM_GATE_SAFETY_TOKENS):
         findings.add("safety_boundary_not_four_way")
 
@@ -6300,18 +6488,14 @@ VM_GATE_A4_FIXTURE_STEP_5 = (
 
 The runner prints and writes a sanitized aggregate result only.
 
-## Safety boundary
-
-- The host sync on `DESKTOP-Q43QKQF` in step 3 and the `SaveMember` write in step 7
-  each require their own prior current-turn owner approval. Neither implies the other,
-  and a prior-turn approval is never reusable for either.
-- The step-3 host sync, the step-4 VM deployment, the step-5 preflight surface (selected private
-  form/decision-row access, the reviewer-decision and approval-ledger operation, the immutable
-  package build, the AutoCount environment setup, the package transfer and the no-write AutoCount
-  preflight), and the step-7 `SaveMember` write are four independent approval surfaces. Each
-  requires its own current-turn owner approval, none implies or covers another, and a prior-turn
-  approval is never reusable for any of them.
-""")
+"""
+    # A8: and the fixture's Safety boundary is now the reviewed constant too, for exactly the
+    # reason A5 gave for the gate and A6 for the action region. Under A7 the two drifted -- the
+    # fixture carried a two-bullet miniature -- which was harmless only because nothing compared
+    # them. Safety-boundary identity does compare them, so a fixture carrying a DIFFERENT boundary
+    # than the runbook would either fail permanently or, worse, prove the contract against a
+    # summary no reviewer approved.
+    + VM_GATE_SAFETY_REVIEWED_SECTION)
 
 VM_GATE_A4_FIXTURE = VM_GATE_A4_FIXTURE_STEP_4 + VM_GATE_A4_FIXTURE_STEP_5
 
@@ -7549,25 +7733,28 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                          "a step-5 regression must not be reported against step 4")
 
     # -- Four-way safety-boundary controls -- #
+    # A8 promotes the reviewed section to THE fixture boundary, so each degradation below now names
+    # the reviewed line wrapping instead of the retired miniature's. Every control degrades the
+    # same proposition it always did and asserts the same finding: only the search text moved.
     def test_control_removed_four_way_safety_statement_is_detected(self):
-        degraded = self._degraded_four_way_safety("are four independent approval surfaces",
-                                                  "are handled together")
+        degraded = self._degraded_four_way_safety("independent approval surfaces",
+                                                  "surfaces handled together")
         self.assertIn("safety_boundary_not_four_way", vm_gate_findings(degraded))
 
     def test_control_weakened_four_way_own_approval_requirement_is_detected(self):
         degraded = self._degraded_four_way_safety(
-            "Each\n  requires its own current-turn owner approval",
+            "Each requires its own current-turn owner approval",
             "They are covered by the owner's standing approval")
         self.assertIn("safety_boundary_not_four_way", vm_gate_findings(degraded))
 
     def test_control_weakened_four_way_non_implication_is_detected(self):
-        degraded = self._degraded_four_way_safety("none implies or covers another",
-                                                  "an earlier one may cover a later one")
+        degraded = self._degraded_four_way_safety("implies or covers another",
+                                                  "may cover a later one")
         self.assertIn("safety_boundary_not_four_way", vm_gate_findings(degraded))
 
     def test_control_weakened_four_way_prior_turn_non_reuse_is_detected(self):
         degraded = self._degraded_four_way_safety(
-            "a prior-turn\n  approval is never reusable for any of them",
+            "a prior-turn approval is never reusable for any of them",
             "any of them may rely on an earlier approval")
         self.assertIn("safety_boundary_not_four_way", vm_gate_findings(degraded))
 

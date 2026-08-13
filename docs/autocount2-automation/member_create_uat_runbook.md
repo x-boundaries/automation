@@ -263,13 +263,17 @@ bump changes both `source_record_id` and `source_fingerprint` (each binds the sc
 version), a fresh reviewer decision is mechanically required; a `v1` decision or build
 cannot mint a `v2` package.
 
+**`AUTOCOUNT VM — DESKTOP-4I042L6`** Every remaining preflight operation runs on the
+AutoCount VM, under the same preflight approval, in the VM process that runs the runner.
+
 Set the AutoCount connection through the process environment only (never in files, never in
 this runbook): `AC2_PROBE_SERVER_NAME`, `AC2_PROBE_DATABASE_NAME`, `AC2_PROBE_USER_ID`, and
-the password environment variable named by `-PasswordEnvVar`.
+the password environment variable named by `-PasswordEnvVar`. `ac2_member_create_uat_runner.ps1`
+defaults `ServerName`, `DatabaseName` and `UserId` from these variables in its own VM process,
+so values set on the laptop configure nothing.
 
-**`AUTOCOUNT VM — DESKTOP-4I042L6`** Under the same preflight approval, copy the
-approved package to the VM and run the runner in dry-run mode (the default; no write
-switches). Dry-run authenticates, checks the duplicate, constructs the new member,
+Then copy the approved package to the VM and run the runner in dry-run mode (the default;
+no write switches). Dry-run authenticates, checks the duplicate, constructs the new member,
 assigns only the whitelisted fields, and stops without SaveMember. The build authority
 below governs which package may be transferred at all.
 
