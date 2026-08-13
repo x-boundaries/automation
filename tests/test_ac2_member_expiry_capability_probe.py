@@ -4216,6 +4216,17 @@ def _clause_after(text, token):
     return text[at:min(ends)] if ends else text[at:]
 
 
+def _unfenced(text, at):
+    """``at`` when that landmark renders as document text, else ``-1``.
+
+    A9's one adaptor for a checker whose landmarks are bare offsets rather than reviewed regions.
+    A landmark whose own line begins inside an inherited fenced code block renders as literal
+    example text, so it is reported through the SAME missing-landmark branch an absent landmark
+    already takes -- no new grammar and no new finding key. A missing offset stays missing.
+    """
+    return -1 if at == -1 or _fence_state_at(text, at) is not None else at
+
+
 def host_sync_gate_findings(text):
     """Return sorted contract findings for the create-UAT physical-host sync approval gate.
 
@@ -4225,8 +4236,14 @@ def host_sync_gate_findings(text):
     """
     findings = set()
 
-    gate_idx = text.find(HOST_SYNC_GATE_MARKER)
-    pull_idx = text.find(HOST_SYNC_PULL_INVOCATION)
+    # A9-F1: an authority that begins inside inherited fenced code is not authority -- CommonMark
+    # renders it as the literal contents of a code block. This checker bounds its slices from bare
+    # `find()` landmarks and has no region identity to carry the repair, so a landmark that renders
+    # as code is treated as ABSENT and the existing missing-landmark branches report it. Treated as
+    # absent rather than skipped over: taking the next occurrence instead would be the permissive
+    # direction, and A9 may only add fail-closed behaviour. See `_fence_state_at`.
+    gate_idx = _unfenced(text, text.find(HOST_SYNC_GATE_MARKER))
+    pull_idx = _unfenced(text, text.find(HOST_SYNC_PULL_INVOCATION))
     if pull_idx == -1:
         findings.add("pull_missing")
 
@@ -4273,7 +4290,7 @@ def host_sync_gate_findings(text):
         if not denied:
             findings.add("substitution_not_denied")
 
-    safety_idx = text.find(HOST_SYNC_SAFETY_HEADING)
+    safety_idx = _unfenced(text, text.find(HOST_SYNC_SAFETY_HEADING))
     if safety_idx == -1:
         findings.add("safety_boundary_missing")
     else:
@@ -5647,7 +5664,85 @@ def _semantic_heading(line):
     return _flat(VM_GATE_ATX_CLOSING.sub("", line.strip()))
 
 
-def _semantic_markdown_region(region):
+def _fence_opening(line):
+    """``(marker, length)`` when ``line`` OPENS a fenced block, else ``None``.
+
+    A9 states the accepted opening grammar ONCE. It was previously written inline inside
+    ``_semantic_markdown_region``, and a second document-prefix scan that spelled the same rule a
+    second way is exactly the drift the accepted A3 finding is about.
+    """
+    run = VM_GATE_FENCE_LINE.match(line)
+    return (run.group("fence")[0], len(run.group("fence"))) if run is not None else None
+
+
+def _fence_closes(line, fence):
+    """True when ``line`` CLOSES the open block ``fence``.
+
+    The accepted closing grammar, also stated once: the same marker character, a run at least as
+    long as the opener, and no info string. Anything else stays block CONTENT, which is the
+    fail-closed direction.
+    """
+    run = VM_GATE_FENCE_LINE.match(line)
+    if run is None:
+        return False
+    marker = run.group("fence")
+    return (marker[0] == fence[0] and len(marker) >= fence[1]
+            and not line.strip()[len(marker):].strip())
+
+
+def _fence_state_after(text, fence=None):
+    """The fenced-block state left open after every physical line of ``text``.
+
+    Pure text in, state out. An unclosed opener stays open through the end of ``text``, which is
+    what CommonMark does and the fail-closed direction here: an authority after it is code.
+    """
+    for line in text.splitlines():
+        if fence is None:
+            fence = _fence_opening(line)
+        elif _fence_closes(line, fence):
+            fence = None
+    return fence
+
+
+def _fence_state_at(text, offset, fence=None):
+    """The fenced-block state open where ``offset``'s own line BEGINS, or ``None``.
+
+    The whole A9 repair, and deliberately the smallest thing that answers the accepted A9-F1
+    question: "does required authority begin while inherited document fence state is open?"
+
+    Accepted finding A9-F1. ``_semantic_markdown_region`` starts every supplied slice with no
+    fence open, which is sound only when the slice itself begins outside one. Several protected
+    authorities are extracted from the MIDDLE of the complete document -- both numbered steps
+    through ``_numbered_step_section``, the `## Safety boundary` through its own opening scan, and
+    the step-3 host-sync gate through a bare ``find()`` -- so a valid opener placed in FRONT of an
+    authority renders the whole of it as literal code while the checker compares it as operative
+    prose and reports clean.
+
+    Only text strictly in front of the authority's own line is inspected, because "inherited"
+    means the state the document already carried: the authority's first line cannot be the fence
+    that hides it. ``fence`` seeds the scan when the caller already knows the state at the start of
+    the text it is passing, so a step's regions are resolved from the state its section inherited
+    rather than re-scanned from the top of the document.
+
+    Deliberately NOT a Markdown parser and not a change to heading discovery: a numbered heading or
+    a gate marker inside fenced code still COUNTS as an occurrence, so the conservative
+    fail-closed debt accepted at PRRT_kwDOSbJI_s6YQTNF stays exactly as it was and A9 can only add
+    fail-closed behaviour, never remove it. No block model, no list model, no shell parser and no
+    new finding key.
+    """
+    return _fence_state_after(text[:text.rfind("\n", 0, offset) + 1], fence)
+
+
+def _region_fence_state(section, region, fence):
+    """The state ``region`` -- a SUFFIX slice of ``section`` -- inherits, given ``section``'s own.
+
+    Both reviewed regions of a resolved step are suffix slices of that step, so the text deciding
+    what they inherit is simply the section text in front of them.
+    """
+    return _fence_state_after(section[:len(section) - len(region)], fence)
+
+
+def _semantic_markdown_region(region, fence=None):
     """The RENDERED identity of a reviewed Markdown region. Pure text in, comparable value out.
 
     The shared normalisation both reviewed identities use -- the gate block (A5) and the action
@@ -5694,22 +5789,27 @@ def _semantic_markdown_region(region):
     class is measured from the left edge of the enclosing block, so re-indenting a whole gate by up
     to three columns -- bullets and their continuations together -- stays class 0 throughout, while
     indenting it by four turns every line into class 1 and fails closed.
+
+    A9-F1: ``fence`` is the state the region INHERITS rather than an assumption that it begins
+    outside one. Every reviewed region here is a slice taken from the middle of a larger document,
+    so a fence opened in front of it decides whether its text renders as operative prose or as the
+    literal contents of a code block. Seeded with an open fence the whole region normalises to
+    ``code`` units, which cannot equal a reviewed identity built from prose, and the existing
+    identity finding fails closed. The default stays ``None`` so the reviewed CONSTANTS -- which
+    really are whole documents in themselves -- keep exactly the identity they had.
     """
     units, prose, prose_class = [], [], 0
-    fence = None
     block_edge, content_column = 0, 0
     for line in region.splitlines():
         stripped = line.strip()
         if not stripped:
             continue
-        run = VM_GATE_FENCE_LINE.match(line)
+        opening = _fence_opening(line)
         if fence is not None:
             # A closing fence repeats the marker, is at least as long, and adds no info string.
             # Anything else stays block CONTENT, which is the fail-closed direction: an unmatched
             # or info-bearing fence changes the unit sequence rather than quietly ending the block.
-            if run is not None and run.group("fence")[0] == fence[0] \
-                    and len(run.group("fence")) >= fence[1] \
-                    and not stripped[len(run.group("fence")):].strip():
+            if _fence_closes(line, fence):
                 units.append(("fence", " ".join(stripped.split())))
                 fence = None
             else:
@@ -5718,12 +5818,12 @@ def _semantic_markdown_region(region):
         # Matched against the RAW line, because indentation has to be judged before it is
         # stripped: at four leading spaces the line is indented-code content and not a fence at
         # all, so it becomes ordinary prose here and the moved block boundary fails closed.
-        if run is not None:
+        if opening is not None:
             if prose:
                 units.append(("prose", prose_class, " ".join(prose)))
                 prose = []
             units.append(("fence", " ".join(stripped.split())))
-            fence = (run.group("fence")[0], len(run.group("fence")))
+            fence = opening
             block_edge, content_column = 0, 0
             continue
         width = _indent_width(line)
@@ -5781,25 +5881,27 @@ def _indent_width(line):
     return width
 
 
-def _semantic_gate_block(block):
+def _semantic_gate_block(block, fence=None):
     """The RENDERED identity of a gate block, as a reviewer approved it.
 
     A5's answer to accepted finding F-A, kept as its own named authority so that a gate change and
-    an action change stay separately reportable.
+    an action change stay separately reportable. ``fence`` is the state the block inherits from the
+    document in front of it -- see ``_fence_state_at``.
     """
-    return _semantic_markdown_region(block)
+    return _semantic_markdown_region(block, fence)
 
 
-def _semantic_action_region(action):
+def _semantic_action_region(action, fence=None):
     """The RENDERED identity of a step's post-gate action region, as a reviewer approved it.
 
     A6's answer to accepted finding A6-F1. Deliberately the SAME conservative normalisation the
     gate block uses: nothing is lowercased, no punctuation is stripped, no non-whitespace text is
     erased and no command token is rewritten, so this cannot hide a meaningful command change. It
     is a separate function from ``_semantic_gate_block`` because the two identities answer for
-    different regions and report different findings.
+    different regions and report different findings. ``fence`` is the state the region inherits
+    from the document in front of it -- see ``_fence_state_at``.
     """
-    return _semantic_markdown_region(action)
+    return _semantic_markdown_region(action, fence)
 
 
 def _numbered_heading_openings(text):
@@ -5874,20 +5976,26 @@ def _resolve_numbered_step(text, number, prefix, findings):
     vote and no "the strict one wins" -- while ``_semantic_heading`` keeps identity at the rendered
     heading, so a respelling that renders the reviewed heading exactly stays clean and substantive
     drift still fails closed.
+
+    A9 returns the fenced-block state the resolved section INHERITS alongside it, so the regions
+    inside the step are judged from the document's real state rather than from the assumption that
+    a mid-document slice begins outside a fence. Discovery itself is untouched: a numbered heading
+    inside fenced code still counts as an opening, so the conservative ambiguity debt already
+    accepted stays exactly as it was.
     """
     openings = _numbered_step_openings(text, number)
     if not openings:
         findings.add(prefix + "_step_missing")
-        return ""
+        return "", None
     if len(openings) > 1:
         findings.add(prefix + "_step_ambiguous")
-        return ""
+        return "", None
     section = _numbered_step_section(text, number)
     if _semantic_heading(section.partition("\n")[0]) \
             != _semantic_heading(VM_GATE_REVIEWED_HEADINGS[number]):
         findings.add(prefix + "_heading_changed")
-        return ""
-    return section
+        return "", None
+    return section, _fence_state_at(text, openings[0])
 
 
 def _resolve_gate_layout(section, marker, boundary, prefix, findings):
@@ -6087,12 +6195,16 @@ def _every_source_denied(prose, sources, denial):
 
 def _deployment_findings(text, findings):
     """Step 4: a current-turn approval must precede every VM mutation the step performs."""
-    section = _resolve_numbered_step(text, VM_GATE_DEPLOY_STEP, "deploy", findings)
+    section, fence = _resolve_numbered_step(text, VM_GATE_DEPLOY_STEP, "deploy", findings)
     pre_gate, block, action = _resolve_gate_layout(
         section, VM_GATE_DEPLOY_MARKER, VM_GATE_DEPLOY_BOUNDARY, "deploy", findings)
     if block is None:
         findings.update(VM_GATE_DEPLOY_UNMET)
         return
+    # A9: what each reviewed region inherits from the document in front of it. Both are suffix
+    # slices of the resolved step, so this is the step's own inherited state carried forward.
+    block_fence = _region_fence_state(section, block + action, fence)
+    action_fence = _region_fence_state(section, action, fence)
 
     # Ordering, structurally. Nothing may stand between the step heading and its gate, so no
     # instruction -- transfer, place, send, move, or a verb nobody has thought of yet -- can be
@@ -6105,7 +6217,8 @@ def _deployment_findings(text, findings):
     # closure for open-ended optional/waiver/prohibition/advisory contradiction wording; the
     # proposition checks below stay as defence in depth, because a document that fails identity
     # should still report WHICH requirement it lost.
-    if _semantic_gate_block(block) != _semantic_gate_block(VM_GATE_DEPLOY_REVIEWED_BLOCK):
+    if _semantic_gate_block(block, block_fence) \
+            != _semantic_gate_block(VM_GATE_DEPLOY_REVIEWED_BLOCK):
         findings.add("deploy_gate_text_changed")
 
     # A6: and the ACTION region must still say exactly what review approved it saying. Accepted
@@ -6114,7 +6227,8 @@ def _deployment_findings(text, findings):
     # contract clean. Polarity is not decided here either -- the reviewed text is recognised, so a
     # revocation, a reuse claim, a retrospective approval, an urgency bypass, a deleted command or a
     # command wrapped in inert data all fail closed alike.
-    if _semantic_action_region(action) != _semantic_action_region(VM_GATE_DEPLOY_REVIEWED_ACTION):
+    if _semantic_action_region(action, action_fence) \
+            != _semantic_action_region(VM_GATE_DEPLOY_REVIEWED_ACTION):
         findings.add("deploy_action_text_changed")
 
     # Gate propositions, judged ONLY inside the gate's own block.
@@ -6149,12 +6263,15 @@ def _deployment_findings(text, findings):
 
 def _preflight_findings(text, findings):
     """Step 5: a current-turn approval must precede the package transfer AND the dry-run."""
-    section = _resolve_numbered_step(text, VM_GATE_PREFLIGHT_STEP, "preflight", findings)
+    section, fence = _resolve_numbered_step(text, VM_GATE_PREFLIGHT_STEP, "preflight", findings)
     pre_gate, block, action = _resolve_gate_layout(
         section, VM_GATE_PREFLIGHT_MARKER, VM_GATE_PREFLIGHT_BOUNDARY, "preflight", findings)
     if block is None:
         findings.update(VM_GATE_PREFLIGHT_UNMET)
         return
+    # A9 inherited fenced-block state, exactly as step 4 carries it. See `_fence_state_at`.
+    block_fence = _region_fence_state(section, block + action, fence)
+    action_fence = _region_fence_state(section, action, fence)
 
     # Ordering, structurally -- and under A4 by exactly the rule step 4 already uses. The frozen
     # reviewed-safe prefix is retired: the package build it protected is itself gated work, so it
@@ -6167,11 +6284,13 @@ def _preflight_findings(text, findings):
         findings.add("preflight_pre_gate_content")
 
     # A5 gate identity, exactly as step 4 carries it. See `_semantic_gate_block`.
-    if _semantic_gate_block(block) != _semantic_gate_block(VM_GATE_PREFLIGHT_REVIEWED_BLOCK):
+    if _semantic_gate_block(block, block_fence) \
+            != _semantic_gate_block(VM_GATE_PREFLIGHT_REVIEWED_BLOCK):
         findings.add("preflight_gate_text_changed")
 
     # A6 action identity, exactly as step 4 carries it. See `_semantic_action_region`.
-    if _semantic_action_region(action) != _semantic_action_region(VM_GATE_PREFLIGHT_REVIEWED_ACTION):
+    if _semantic_action_region(action, action_fence) \
+            != _semantic_action_region(VM_GATE_PREFLIGHT_REVIEWED_ACTION):
         findings.add("preflight_action_text_changed")
 
     prose = _flat(block).lower()
@@ -6240,7 +6359,12 @@ def _four_way_safety_findings(text, findings):
     at = openings[0]
     end = text.find("\n## ", at + 1)
     reviewed = text[at:end] if end != -1 else text[at:]
-    if _semantic_markdown_region(reviewed) \
+    # A9-F1: and the section must actually RENDER as a section. A valid fenced-code opener in front
+    # of the boundary makes CommonMark render the heading and every requirement under it as the
+    # literal contents of a code block; without the inherited state the identity below compared a
+    # code block against reviewed prose and reported clean. The section is not semantically valid
+    # merely because its in-slice text equals the reviewed constant.
+    if _semantic_markdown_region(reviewed, _fence_state_at(text, at)) \
             != _semantic_markdown_region(VM_GATE_SAFETY_REVIEWED_SECTION):
         findings.add("safety_boundary_not_four_way")
     section = _flat(reviewed).lower()
