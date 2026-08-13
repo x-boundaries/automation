@@ -6660,6 +6660,132 @@ VM_GATE_A7_HARMLESS_REFLOWS = (
 )
 
 
+# ---- DL-XB-123-001-A8-C1: post-ready Codex remediation controls ---- #
+# Four fresh Codex threads were opened against exact P (411ad46acb). Each was reproduced against
+# exact P BEFORE these controls were authored, and each reproduction returned a COMPLETE-GUARD
+# CLEAN document -- `vm_gate_findings()` == [] -- except A8-F4, which is a documentation defect the
+# guard was never asked about:
+#
+#   A8-F1  PRRT_kwDOSbJI_s6YzUw1 (P1). `_four_way_safety_findings` establishes that the
+#          `## Safety boundary` is UNIQUE and then validates it by ADDITIVE TOKEN PRESENCE only.
+#          Appending "One approval may cover all four surfaces." INSIDE that single reviewed
+#          section leaves every required token present, so the guard reports clean while the
+#          document states the opposite of the four-surface contract it is meant to carry.
+#          Reproduced at P: one boundary, all tokens present, findings == [].
+#   A8-F2  PRRT_kwDOSbJI_s6YzUw3 (P2). A7 made a FENCE line its own semantic unit, but every other
+#          physical line -- including the executable lines INSIDE a fenced block -- still coalesces
+#          into one whitespace-joined prose run. Splitting the reviewed step-5 dry-run invocation
+#          immediately after `-PackagePath` therefore normalises back to the identical joined text,
+#          `_actively_invokes()` still accepts the surviving prefix, and the guard reports clean
+#          even though the documented command no longer executes as written. Reproduced at P:
+#          findings == [] and `_actively_invokes(...)` still True.
+#   A8-F3  PRRT_kwDOSbJI_s6YzUw7 (P1). `_semantic_markdown_region` calls `.strip()` on every
+#          ordinary line, so container-significant leading indentation is erased before comparison.
+#          Indenting either complete reviewed approval gate by four spaces -- or by one tab -- makes
+#          CommonMark render that gate as an indented CODE BLOCK rather than operative approval
+#          prose, while the gated deployment and preflight actions stay live. Reproduced at P for
+#          BOTH steps, four-space and tab: findings == [].
+#   A8-F4  PRRT_kwDOSbJI_s6YzUxA (P1). The runbook sets the AutoCount process environment under the
+#          `LAPTOP DEVELOPMENT MACHINE` banner, but `ac2_member_create_uat_runner.ps1` defaults
+#          `ServerName`, `DatabaseName` and `UserId` from `$env:` inside ITS OWN process on the VM.
+#          An operator following the document literally configures the wrong machine and the VM
+#          dry-run has no connection configuration. This is a real DOCUMENTATION defect rather than
+#          a `vm_gate_findings()` false clean, so it is controlled structurally.
+#
+# No new finding key is introduced. F1 and F3 are carried by the EXISTING
+# `safety_boundary_not_four_way` and `*_gate_text_changed` keys, F2 by the existing
+# `*_action_text_changed` keys, and F4 by a direct structural runbook control plus the same action
+# identity, which fails closed if the instruction is moved back under the laptop context.
+
+# Every contradiction below keeps EXACTLY ONE `## Safety boundary` opening and keeps EVERY
+# `VM_GATE_SAFETY_TOKENS` entry present. Both invariants are asserted by the control itself, so a
+# form that stopped satisfying them could not silently decay into a weaker test: what is being
+# proved is that the section's COMPLETE semantics are authoritative, not its token inventory.
+VM_GATE_A8_SAFETY_CONTRADICTIONS = (
+    ("appended_sentence", "append", "One approval may cover all four surfaces."),
+    ("appended_merge_claim", "append",
+     "In practice the step-4 VM deployment approval also covers the step-5 preflight surface."),
+    ("appended_reuse_claim", "append",
+     "A single prior-turn approval may be relied on for all of these surfaces."),
+    ("prepended_sentence", "prepend", "One approval may cover all four surfaces."),
+    ("inserted_bullet", "bullet",
+     "- One approval may cover all four surfaces, so none of them needs a separate"
+     " current-turn owner approval."),
+    ("inserted_independence_waiver", "bullet",
+     "- The four surfaces above are independent in principle only; in practice a single"
+     " current-turn owner approval is sufficient for all of them."),
+)
+
+# EXECUTION-SIGNIFICANT split points inside reviewed fenced command lines. Every entry keeps the
+# whole command TEXT, changes nothing but one physical line break, and uses no authorised
+# continuation mechanism, which is exactly why a normaliser that coalesces newlines cannot see it.
+# The keys are existing action-identity findings.
+VM_GATE_A8_EXECUTABLE_SPLITS = (
+    ("runner_after_PackagePath", VM_GATE_A5_RUNNER_LINE,
+     ' -PackagePath "', ' -PackagePath\n"', "preflight_action_text_changed"),
+    ("runner_before_StateDir", VM_GATE_A5_RUNNER_LINE,
+     ' -StateDir "', '\n-StateDir "', "preflight_action_text_changed"),
+    ("runner_inside_JsonOut_value", VM_GATE_A5_RUNNER_LINE,
+     ' -JsonOut "C:', ' -JsonOut "\nC:', "preflight_action_text_changed"),
+    ("runner_inside_command_token", VM_GATE_A5_RUNNER_LINE,
+     "ac2_member_create_uat_runner.ps1", "ac2_member_create_uat_runner\n.ps1",
+     "preflight_action_text_changed"),
+    ("approve_after_input_flag", VM_GATE_PREFLIGHT_APPROVE_COMMAND,
+     " --input ", " --input\n", "preflight_action_text_changed"),
+    ("build_after_package_out_flag", VM_GATE_PREFLIGHT_BUILD_COMMAND,
+     " --package-out ", " --package-out\n", "preflight_action_text_changed"),
+    ("new_item_after_path_flag", VM_GATE_A5_NEW_ITEM_LINE,
+     ' -Path "', ' -Path\n"', "deploy_action_text_changed"),
+)
+
+# The normaliser's own contract, proved directly on synthetic text so the two halves of the A8-F2
+# repair are visible independently of any document: INSIDE a fence a physical line boundary is
+# semantic, OUTSIDE one ordinary prose still coalesces. The second is a positive regression control
+# -- A8 is a fenced-line repair, not a decision that every document newline is authoritative.
+VM_GATE_A8_FENCED_TWO_LINES = "```powershell\nAlpha -One 1\nBravo -Two 2\n```\n"
+VM_GATE_A8_FENCED_ONE_LINE = "```powershell\nAlpha -One 1 Bravo -Two 2\n```\n"
+VM_GATE_A8_PROSE_TWO_LINES = "Alpha one sentence.\nBravo another sentence.\n"
+VM_GATE_A8_PROSE_ONE_LINE = "Alpha one sentence. Bravo another sentence.\n"
+
+# Indentation that CHANGES the rendered block semantics of a reviewed gate. Four columns is where
+# CommonMark starts an indented code block, and a tab advances to the same column, so each of these
+# turns operative approval prose into literal example text while the gated actions stay live.
+VM_GATE_A8_CONTAINER_INDENTS = (
+    ("four_spaces", "    "),
+    ("eight_spaces", "        "),
+    ("tab", "\t"),
+    ("space_tab", " \t"),
+    ("two_spaces_tab", "  \t"),
+    ("tab_space", "\t "),
+)
+# Indentation CommonMark renders identically, which must stay non-material. Zero is the reviewed
+# form itself and is covered by the compliance controls, so it is not repeated here.
+VM_GATE_A8_RENDER_EQUIVALENT_INDENTS = (
+    ("one_space", " "),
+    ("two_spaces", "  "),
+    ("three_spaces", "   "),
+)
+# Both reviewed gates, with the identity finding each must report when its rendered block semantics
+# change. The boundary is searched for AFTER the opening, because the laptop banner that bounds
+# step 5 also appears in steps 1 and 9.
+VM_GATE_A8_GATES = (
+    ("step-4 deployment", VM_GATE_DEPLOY_OPENING, VM_GATE_DEPLOY_BOUNDARY,
+     "deploy_gate_text_changed"),
+    ("step-5 preflight", VM_GATE_PREFLIGHT_OPENING, VM_GATE_PREFLIGHT_BOUNDARY,
+     "preflight_gate_text_changed"),
+)
+
+# The two execution-context banners, derived from the constants that already name the VM so a
+# rename cannot leave the control pointing at a machine the contract no longer means.
+VM_GATE_A8_VM_BANNER = "**`AUTOCOUNT VM — %s`**" % VM_GATE_VM
+VM_GATE_A8_LAPTOP_BANNER = VM_GATE_PREFLIGHT_BOUNDARY
+# The environment instruction in the document's own case; the checker compares it lowercased.
+VM_GATE_A8_ENV_ANCHOR = VM_GATE_A4_ENV_ANCHOR
+# No connection VALUE may ever be written into the runbook -- only variable names. An assignment
+# spelling beside any contracted name would be exactly that.
+VM_GATE_A8_VALUE_ASSIGNMENT_SPELLINGS = ("=", " =", ":=")
+
+
 class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
     def setUp(self):
         self.runbook = read_repo_text("probe_runbook")
@@ -10549,6 +10675,233 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                         self.assertEqual(vm_gate_findings(degraded), [],
                                          "marker %r opens the same list, so the step-%d action"
                                          " must stay clean" % (bullet, number))
+
+    # ---- DL-XB-123-001-A8-C1: post-ready Codex remediation controls ---- #
+    # Every control degrades an in-memory copy only, never a repository file, and every one is
+    # exercised against BOTH authorities: the canonical fixture and the live create-UAT runbook.
+
+    def _a8_bases(self):
+        return (("canonical fixture", VM_GATE_CANONICAL_FIXTURE),
+                ("live create-UAT runbook", self.create_runbook))
+
+    # -- A8-F1. The unique Safety boundary must carry COMPLETE semantic authority. -- #
+    def _a8_safety_bounds(self, base):
+        openings = [match.start() for match in VM_GATE_SAFETY_OPENING.finditer(base)]
+        self.assertEqual(len(openings), 1, "the base must carry exactly one Safety boundary")
+        at = openings[0]
+        end = base.find("\n## ", at + 1)
+        return at, (len(base) if end == -1 else end)
+
+    def _a8_contradicted_safety(self, base, position, sentence):
+        at, end = self._a8_safety_bounds(base)
+        section = base[at:end]
+        if position == "prepend":
+            heading, _, rest = section.partition("\n")
+            mutated = heading + "\n\n" + sentence + "\n" + rest.lstrip("\n")
+        elif position == "bullet":
+            mutated = section.rstrip("\n") + "\n" + sentence + "\n"
+        else:
+            mutated = section.rstrip("\n") + "\n\n" + sentence + "\n"
+        degraded = base[:at] + mutated + base[end:]
+        self.assertNotEqual(degraded, base, "the contradiction must actually change the document")
+        return degraded
+
+    def test_a8_control_contradiction_inside_the_unique_safety_boundary_fails_closed(self):
+        """Accepted A8-F1: additive token presence is not semantic authority.
+
+        Each form keeps the boundary UNIQUE and keeps every required token present, so the only
+        thing that can detect it is authority over the reviewed section's complete semantics.
+        """
+        for base_name, base in self._a8_bases():
+            for label, position, sentence in VM_GATE_A8_SAFETY_CONTRADICTIONS:
+                with self.subTest(base=base_name, contradiction=label):
+                    degraded = self._a8_contradicted_safety(base, position, sentence)
+                    self.assertEqual(len(VM_GATE_SAFETY_OPENING.findall(degraded)), 1,
+                                     "the contradicted boundary must stay UNIQUE, so this is not"
+                                     " a duplicate-heading control in disguise")
+                    at, end = self._a8_safety_bounds(degraded)
+                    section = _flat(degraded[at:end]).lower()
+                    for token in VM_GATE_SAFETY_TOKENS:
+                        self.assertIn(token, section,
+                                      "every required four-way token must survive, so this is not"
+                                      " a token-removal control in disguise")
+                    self.assertIn("safety_boundary_not_four_way", vm_gate_findings(degraded),
+                                  "a contradiction inside the unique Safety boundary (%s) must"
+                                  " fail closed" % label)
+
+    def test_a8_control_reviewed_safety_boundary_stays_clean(self):
+        """The control group: the reviewed section itself must report nothing."""
+        for base_name, base in self._a8_bases():
+            with self.subTest(base=base_name):
+                self.assertNotIn("safety_boundary_not_four_way", vm_gate_findings(base))
+                self.assertNotIn("safety_boundary_ambiguous", vm_gate_findings(base))
+
+    # -- A8-F2. A physical command-line boundary inside a fence is execution-significant. -- #
+    def _a8_split_command(self, base, command, before, after):
+        self.assertEqual(base.count(command), 1,
+                         "the base must carry the reviewed command %r exactly once"
+                         % (command[:56],))
+        self.assertIn(before, command, "the split point %r must exist in the command" % (before,))
+        degraded = base.replace(command, command.replace(before, after, 1), 1)
+        self.assertNotEqual(degraded, base, "the split must actually change the document")
+        return degraded
+
+    def test_a8_control_split_fenced_command_line_fails_closed(self):
+        """Accepted A8-F2: one physical command line must not compare equal to two.
+
+        Nothing is added, removed or reworded -- a single newline is introduced at an
+        execution-significant point, with no authorised PowerShell or shell continuation.
+        """
+        for base_name, base in self._a8_bases():
+            for label, command, before, after, key in VM_GATE_A8_EXECUTABLE_SPLITS:
+                with self.subTest(base=base_name, split=label):
+                    degraded = self._a8_split_command(base, command, before, after)
+                    self.assertIn(key, vm_gate_findings(degraded),
+                                  "splitting the reviewed command line (%s) must fail closed"
+                                  % label)
+
+    def test_a8_control_rejoining_a_split_command_restores_the_reviewed_document(self):
+        """The other direction: joining the two physical lines back must restore the base exactly.
+
+        Without this, a repair could pass the split controls by rejecting the command outright.
+        """
+        for base_name, base in self._a8_bases():
+            for label, command, before, after, _key in VM_GATE_A8_EXECUTABLE_SPLITS:
+                with self.subTest(base=base_name, split=label):
+                    degraded = self._a8_split_command(base, command, before, after)
+                    self.assertEqual(degraded.replace(after, before, 1), base,
+                                     "rejoining %s must restore the reviewed document" % label)
+
+    def test_a8_control_fenced_physical_lines_are_semantically_distinguishable(self):
+        """The repair's own contract, proved directly on synthetic text."""
+        self.assertNotEqual(_semantic_markdown_region(VM_GATE_A8_FENCED_TWO_LINES),
+                            _semantic_markdown_region(VM_GATE_A8_FENCED_ONE_LINE),
+                            "two fenced command lines must not normalise to one")
+
+    def test_a8_control_unfenced_prose_still_coalesces(self):
+        """A8 is a fenced-LINE repair, not a decision that every document newline is significant."""
+        self.assertEqual(_semantic_markdown_region(VM_GATE_A8_PROSE_TWO_LINES),
+                         _semantic_markdown_region(VM_GATE_A8_PROSE_ONE_LINE),
+                         "ordinary prose reflow outside a fence must stay non-material")
+
+    # -- A8-F3. Container-significant indentation decides whether a gate is prose or code. -- #
+    def _a8_indent_gate(self, base, opening, boundary, pad, share=1.0):
+        start = base.find(opening)
+        self.assertNotEqual(start, -1, "the base must carry the gate opening %r" % (opening[:48],))
+        stop = base.find(boundary, start)
+        self.assertNotEqual(stop, -1, "the base must carry the gate's action boundary")
+        lines = base[start:stop].splitlines(keepends=True)
+        cut = max(1, int(len(lines) * share))
+        body = "".join(pad + line if index < cut and line.strip() else line
+                       for index, line in enumerate(lines))
+        degraded = base[:start] + body + base[stop:]
+        self.assertNotEqual(degraded, base, "the indentation must actually change the document")
+        return degraded
+
+    def test_a8_control_container_indented_gate_fails_closed(self):
+        """Accepted A8-F3: four columns of indentation renders the gate as an indented code block.
+
+        The gate prose is not weakened or removed, only indented, so the rendered block semantics
+        are the only thing that can still detect it.
+        """
+        for base_name, base in self._a8_bases():
+            for gate, opening, boundary, key in VM_GATE_A8_GATES:
+                for label, pad in VM_GATE_A8_CONTAINER_INDENTS:
+                    with self.subTest(base=base_name, gate=gate, indent=label):
+                        degraded = self._a8_indent_gate(base, opening, boundary, pad)
+                        self.assertIn(key, vm_gate_findings(degraded),
+                                      "a %s-indented %s gate must fail closed" % (label, gate))
+
+    def test_a8_control_partially_indented_gate_fails_closed(self):
+        """Indenting only part of a gate splits it between rendered prose and rendered code."""
+        for base_name, base in self._a8_bases():
+            for gate, opening, boundary, key in VM_GATE_A8_GATES:
+                with self.subTest(base=base_name, gate=gate):
+                    degraded = self._a8_indent_gate(base, opening, boundary, "    ", share=0.5)
+                    self.assertIn(key, vm_gate_findings(degraded),
+                                  "a partially indented %s gate must fail closed" % gate)
+
+    def test_a8_control_render_equivalent_gate_indent_stays_clean(self):
+        """0-3 columns cannot open an indented code block, so they must stay non-material."""
+        for base_name, base in self._a8_bases():
+            for gate, opening, boundary, _key in VM_GATE_A8_GATES:
+                for label, pad in VM_GATE_A8_RENDER_EQUIVALENT_INDENTS:
+                    with self.subTest(base=base_name, gate=gate, indent=label):
+                        indented = self._a8_indent_gate(base, opening, boundary, pad)
+                        self.assertEqual(vm_gate_findings(indented), [],
+                                         "a %s-indented %s gate renders identically and must stay"
+                                         " clean" % (label, gate))
+
+    # -- A8-F4. The AutoCount environment is a VM-context operation. -- #
+    def _a8_step5(self):
+        section = _numbered_step_section(self.create_runbook, VM_GATE_PREFLIGHT_STEP)
+        self.assertNotEqual(section, "", "the runbook must carry step 5")
+        return section
+
+    def test_a8_control_environment_instruction_is_a_vm_context_operation(self):
+        """Accepted A8-F4: the runner reads these variables from its OWN process, on the VM.
+
+        `ac2_member_create_uat_runner.ps1` defaults `ServerName`, `DatabaseName` and `UserId` from
+        `$env:`, so the instruction must sit under the AutoCount VM banner -- and before the VM
+        dry-run that consumes it -- or the documented procedure configures the wrong machine.
+        """
+        section = self._a8_step5()
+        env_at = section.find(VM_GATE_A8_ENV_ANCHOR)
+        self.assertNotEqual(env_at, -1, "step 5 must carry the environment instruction")
+        vm_at = section.find(VM_GATE_A8_VM_BANNER)
+        self.assertNotEqual(vm_at, -1, "step 5 must carry the AutoCount VM execution banner")
+        self.assertLess(vm_at, env_at,
+                        "the AutoCount VM banner must open the VM context BEFORE the environment"
+                        " instruction")
+        laptop_at = section.rfind(VM_GATE_A8_LAPTOP_BANNER, 0, env_at)
+        self.assertLess(laptop_at, vm_at,
+                        "the LAST execution banner before the environment instruction must be the"
+                        " AutoCount VM banner, not the laptop banner")
+        runner_at = section.find(VM_GATE_A5_RUNNER_LINE)
+        self.assertNotEqual(runner_at, -1, "step 5 must carry the dry-run runner invocation")
+        self.assertLess(env_at, runner_at,
+                        "the environment must be configured before the VM dry-run consumes it")
+
+    def _a8_env_paragraph(self, base):
+        at = base.find(VM_GATE_A8_ENV_ANCHOR)
+        self.assertNotEqual(at, -1, "the base must carry the environment instruction")
+        start = base.rfind("\n\n", 0, at) + 2
+        end = base.find("\n\n", at)
+        self.assertNotEqual(end, -1, "the environment instruction must be its own paragraph")
+        return start, end + 2
+
+    def test_a8_control_environment_instruction_moved_to_laptop_context_fails_closed(self):
+        """The regression: moving the instruction back above the VM banner must fail closed.
+
+        The paragraph is not reworded, only relocated to the laptop-context position it held
+        before this amendment, so the reviewed action identity is what must still detect it.
+        """
+        base = self.create_runbook
+        start, end = self._a8_env_paragraph(base)
+        paragraph = base[start:end]
+        removed = base[:start] + base[end:]
+        gate_at = removed.find(VM_GATE_PREFLIGHT_OPENING)
+        self.assertNotEqual(gate_at, -1, "the runbook must carry the step-5 gate")
+        banner_at = removed.find(VM_GATE_A8_VM_BANNER, gate_at)
+        self.assertNotEqual(banner_at, -1, "step 5 must carry the AutoCount VM execution banner")
+        moved = removed[:banner_at] + paragraph + removed[banner_at:]
+        self.assertNotEqual(moved, base,
+                            "relocating the instruction under the laptop banner must actually"
+                            " change the runbook")
+        self.assertIn("preflight_action_text_changed", vm_gate_findings(moved),
+                      "an environment instruction moved back under the laptop execution context"
+                      " must fail closed")
+
+    def test_a8_control_environment_instruction_names_variables_only(self):
+        """No host, database, account book, account or password VALUE belongs in this repository."""
+        section = self._a8_step5()
+        for name in VM_GATE_ENV_VARIABLE_NAMES:
+            with self.subTest(variable=name):
+                self.assertIn(name, section, "step 5 must name %r" % (name,))
+                for spelling in VM_GATE_A8_VALUE_ASSIGNMENT_SPELLINGS:
+                    self.assertNotIn(name + spelling, self.create_runbook,
+                                     "%r must never be assigned a value in the runbook"
+                                     % (name,))
 
 
 @unittest.skipIf(PS is None, "no PowerShell executable available")
