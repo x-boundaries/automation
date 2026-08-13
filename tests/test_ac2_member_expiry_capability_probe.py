@@ -5544,6 +5544,11 @@ VM_GATE_BULLET_MARKERS = ("-", "*", "+")
 # indented-code content and not a fence, which is the same four-leading-space exclusion A3 already
 # applies to numbered ATX headings. Deliberately a fence-LINE test and nothing more: A7 authorises
 # no Markdown parser, no block model and no new finding key.
+#
+# This pattern recognises the RUN only. Under A10 the run is a necessary but not sufficient
+# condition for OPENING a block -- a backtick run whose info string carries a backtick opens
+# nothing -- so opening validity lives in `_fence_opening` and must be read from there, never from
+# this pattern alone. Closing validity is unchanged and lives in `_fence_closes`.
 VM_GATE_FENCE_LINE = re.compile(r"^ {0,3}(?P<fence>`{3,}|~{3,})")
 
 # A8 adds the two things A7 deliberately stopped short of, both accepted as demonstrated false
@@ -5669,10 +5674,36 @@ def _fence_opening(line):
 
     A9 states the accepted opening grammar ONCE. It was previously written inline inside
     ``_semantic_markdown_region``, and a second document-prefix scan that spelled the same rule a
-    second way is exactly the drift the accepted A3 finding is about.
+    second way is exactly the drift the accepted A3 finding is about. Every A7/A8/A9 consumer --
+    ``_fence_state_after``, ``_fence_state_at``, ``_region_fence_state``, ``_unfenced`` and
+    ``_semantic_markdown_region`` -- therefore reaches opening validity only through here, which is
+    why the A10 repair below is one condition in one place.
+
+    A10: an opening RUN is not by itself an opening FENCE. CommonMark ends a BACKTICK fence's info
+    string at the first backtick, so a backtick run whose info string carries a backtick opens no
+    block at all and stays an ordinary paragraph line. A9 accepted any run regardless of what
+    followed it, so such a line opened a block that the next GENUINE backtick opener then satisfied
+    as a closer: inherited state cancelled to nothing and a protected authority that CommonMark
+    renders as the literal contents of a code block was compared as operative prose and reported
+    clean. Only the backtick marker is restricted -- a TILDE fence's info string may contain
+    backticks, tildes or both, and rejecting it would delete accepted A9 fail-closed behaviour
+    rather than repair this defect.
+
+    Deliberately still a fence-LINE test: no info-string model, no Markdown parser, no change to
+    closing semantics (``_fence_closes`` already admits no info string, so the restriction adds
+    nothing there and is not spelled a second time), no change to heading discovery and no new
+    finding key.
     """
     run = VM_GATE_FENCE_LINE.match(line)
-    return (run.group("fence")[0], len(run.group("fence"))) if run is not None else None
+    if run is None:
+        return None
+    marker = run.group("fence")
+    # The suffix is taken from the RAW line after the matched run, so a backtick anywhere in the
+    # info string disqualifies the opener wherever it sits. Backticks adjacent to the run were
+    # already consumed BY the run, which is a longer valid opener rather than an invalid one.
+    if marker[0] == "`" and "`" in line[run.end():]:
+        return None
+    return marker[0], len(marker)
 
 
 def _fence_closes(line, fence):
