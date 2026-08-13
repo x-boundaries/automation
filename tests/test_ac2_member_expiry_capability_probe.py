@@ -7141,24 +7141,61 @@ VM_GATE_A8_VALUE_ASSIGNMENT_SPELLINGS = ("=", " =", ":=")
 VM_GATE_A9_ORACLE_LINE = re.compile(r"^(?P<indent> {0,3})(?P<run>`{3,}|~{3,})(?P<info>.*)$")
 
 
+def _a10_opens_fence(line):
+    """``(marker, length)`` when ``line`` is a VALID OPENING fence, else ``None``.
+
+    The A10 oracle, and the ONE place the test side spells opening validity, so the independent
+    reading cannot drift from itself either -- the same discipline the accepted A3 finding imposes
+    on the production grammar. Stated as CommonMark states it:
+
+    * a BACKTICK opening fence is three or more backticks at zero to three columns, and its info
+      string MAY NOT CONTAIN A BACKTICK. A backtick fence's info string ends at the first backtick,
+      so a line carrying one opens no block at all and stays an ordinary paragraph line.
+    * a TILDE opening fence carries no such restriction. Its info string may contain backticks,
+      tildes, or both, and A10 must not reach it.
+
+    Backticks IMMEDIATELY following the opening run belong to the RUN rather than to the info
+    string, which the greedy run group already expresses and a control asserts separately.
+    """
+    found = VM_GATE_A9_ORACLE_LINE.match(line.rstrip("\r"))
+    if found is None:
+        return None
+    run, info = found.group("run"), found.group("info")
+    if run[0] == "`" and "`" in info:
+        return None
+    return run[0], len(run)
+
+
+def _a10_closes_fence(line, state):
+    """True when ``line`` CLOSES the open block ``state``. A10 changes nothing here.
+
+    The accepted closing grammar, unchanged: the same marker character, a run at least as long as
+    the opener, and no info string. A closing fence admits no info string at all, so the A10
+    backtick restriction adds nothing to it and is deliberately not applied a second time -- an
+    info-bearing line is already block CONTENT, which is the fail-closed direction.
+    """
+    found = VM_GATE_A9_ORACLE_LINE.match(line.rstrip("\r"))
+    if found is None:
+        return False
+    run, info = found.group("run"), found.group("info")
+    return run[0] == state[0] and len(run) >= state[1] and not info.strip()
+
+
 def _a9_fence_open_at(text, offset):
     """The fenced block open where ``offset``'s own line begins, as ``(marker, length)`` or None.
 
     Only text STRICTLY in front of that line is inspected, which is what "inherited" means: the
     authority's own first line cannot be the fence that hides it. An unclosed opener stays open
-    through the end of the supplied text.
+    through the end of the supplied text. Opening and closing validity come from the two A10
+    predicates above, so the oracle states each grammar exactly once.
     """
-    marker, length = None, 0
+    state = None
     for line in text[:text.rfind("\n", 0, offset) + 1].splitlines():
-        found = VM_GATE_A9_ORACLE_LINE.match(line.rstrip("\r"))
-        if found is None:
-            continue
-        run, info = found.group("run"), found.group("info")
-        if marker is None:
-            marker, length = run[0], len(run)
-        elif run[0] == marker and len(run) >= length and not info.strip():
-            marker, length = None, 0
-    return None if marker is None else (marker, length)
+        if state is None:
+            state = _a10_opens_fence(line)
+        elif _a10_closes_fence(line, state):
+            state = None
+    return state
 
 
 # Opener spellings the accepted grammar recognises: both markers, the minimum and a longer run, and
@@ -7216,6 +7253,67 @@ VM_GATE_A9_VM_AUTHORITIES = (
 # heading that opens the section carrying it. The carrier is the existing absent-marker cascade.
 HOST_SYNC_A9_STEP_HEADING = "### 3. "
 HOST_SYNC_A9_CARRIER = "gate_missing"
+
+# ---- DL-XB-123-001-A10-C1: OPENING-FENCE VALIDITY ---- #
+# A9 stated the opening grammar once and correctly carried inherited document fence state, but the
+# shared opener test accepted ANY line of zero to three leading spaces followed by three or more
+# backticks or three or more tildes, without ever looking at what follows that run. CommonMark ends
+# a BACKTICK fence's info string at the first backtick, so a line spelled as three backticks + `js`
+# + one backtick opens NO fenced block and stays an ordinary paragraph line. A TILDE fence has no
+# such restriction: its info string may contain backticks, tildes, or both.
+#
+# The asymmetry is a false clean rather than a cosmetic one. Placed in front of a protected
+# authority, that invalid line followed by a GENUINE backtick opener of equal or greater length
+# reads to the checker as "block opened, block closed" -- nothing inherited, the authority compared
+# as operative prose, the complete guard clean -- while CommonMark reads it as "paragraph line,
+# block opened" and renders the whole authority as the literal contents of a code block. Checker
+# fence state and rendered fence state therefore disagree at exactly the protected text.
+#
+# A10 corrects ONLY that opener-validity asymmetry, at the single shared production grammar, and
+# introduces no new finding key: the same existing carriers A9 established report it -- the two gate
+# identities, `safety_boundary_not_four_way`, and the host-sync absent-marker cascade. It is not a
+# widening: the repair NARROWS opener acceptance exactly where CommonMark does, so every valid
+# opener A9 recognised stays an opener and keeps failing closed.
+
+# The invalid run lengths. Three is the minimum; four and five prove the rule is not a length test.
+VM_GATE_A10_OPENING_RUNS = (("three", "```"), ("four", "````"), ("five", "`````"))
+# Info strings that INVALIDATE a backtick opening fence, at several positions within the string.
+# Each begins with a NON-backtick character on purpose: a backtick immediately after the run belongs
+# to the RUN, which is a different case and has its own control rather than being smuggled in here.
+VM_GATE_A10_INVALID_BACKTICK_INFO = (
+    ("tag_then_backtick", "js`"),
+    ("backtick_inside_tag", "j`s"),
+    ("backtick_between_tags", "js`x"),
+    ("code_span_in_info", "powershell `-PackagePath`"),
+    ("trailing_spaced_backtick", "text `"),
+    ("space_then_backtick", " `"),
+)
+# How much LONGER the genuine following opener is than the invalid run. Equal length is the exact-T
+# false clean; longer is the same false clean, because a longer run also satisfies the closing test.
+# A SHORTER following run cannot produce it -- the invalid run would stay open and already fail
+# closed -- so it is not a case A10 has to repair.
+VM_GATE_A10_GENUINE_RUN_DELTAS = (("equal", 0), ("one_longer", 1), ("three_longer", 3))
+# Info strings that keep an opening fence VALID, as ``(name, run, info)``. A10 restricts the BACKTICK
+# info string only, so every tilde spelling here -- backticks, tildes, and both -- stays an opener.
+VM_GATE_A10_VALID_INFO = (
+    ("backtick_language_tag", "```", "powershell"),
+    ("backtick_tag_with_space", "```", "powershell ignore"),
+    ("backtick_tag_with_tab", "```", "\tpowershell"),
+    ("backtick_tag_with_tilde", "```", "diff~"),
+    ("backtick_longer_run_tag", "`````", "text"),
+    ("tilde_info_with_backtick", "~~~", "js`"),
+    ("tilde_info_with_code_span", "~~~", "text `-PackagePath`"),
+    ("tilde_info_with_tilde", "~~~", "approx~"),
+    ("tilde_info_with_both", "~~~", "mix~`x"),
+)
+# Closing spellings A10 must leave exactly as A8 and A9 accepted them. The three added forms are the
+# ones a careless backtick restriction would reach: an info-bearing closer is already block CONTENT
+# because a closer admits no info string, not because of any new backtick rule.
+VM_GATE_A10_CLOSING_FORMS = VM_GATE_A9_CLOSING_FORMS + (
+    ("backtick_info_closer_with_backtick", "```", "```js`", False),
+    ("tilde_info_closer_with_backtick", "~~~", "~~~js`", False),
+    ("tab_indented_closer", "```", "\t```", False),
+)
 
 
 class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
@@ -11506,6 +11604,181 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                                       "the oracle must agree %s opens no fence" % form)
                     self.assertEqual(host_sync_gate_findings(degraded), [],
                                      "%s is indented code, not an inherited opener" % form)
+
+    # ---- DL-XB-123-001-A10-C1: opening-fence VALIDITY controls ---- #
+    # Same discipline as A9: every control degrades an in-memory copy only, never a repository file,
+    # every one runs against BOTH bases, and the fence state each depends on comes from the
+    # INDEPENDENT A10 oracle rather than from the checker, so a repair cannot satisfy these by
+    # agreeing with itself. The A9 authority table is reused deliberately -- the truthful carrier and
+    # the measured `isolated` verdict for the A10 two-line sequence are the same as for A9's single
+    # opener, and writing the table a second way is the drift the accepted A3 finding is about.
+
+    def _a10_invalid_opener(self, indent, run, suffix):
+        """The line under test, with the oracle's verdict asserted before it is used."""
+        line = indent + run + suffix
+        self.assertIsNone(_a10_opens_fence(line),
+                          "the oracle must reject %r as an opening fence" % (line,))
+        return line
+
+    def _a10_sequence_cases(self):
+        """Bounded coverage of the three A10 axes, varying one axis at a time.
+
+        Deliberately not a full cross product: each axis is exercised against a fixed, already
+        demonstrated baseline case, which keeps the control set bounded while still covering every
+        run length, every invalid info-string position, every permitted indentation and every
+        genuine-opener length the lock requires.
+        """
+        cases = []
+        for run_name, run in VM_GATE_A10_OPENING_RUNS:
+            for delta_name, delta in VM_GATE_A10_GENUINE_RUN_DELTAS:
+                cases.append(("run_%s_genuine_%s" % (run_name, delta_name), "", run, "js`", delta))
+        for info_name, suffix in VM_GATE_A10_INVALID_BACKTICK_INFO:
+            cases.append(("info_%s" % info_name, "", "```", suffix, 0))
+        for indent_name, indent in VM_GATE_A9_OPENER_INDENTS:
+            cases.append(("indent_%s" % indent_name, indent, "```", "js`", 0))
+        return tuple(cases)
+
+    def test_a10_control_independent_oracle_states_opening_validity(self):
+        """The control group. Without it every RED control below could be vacuously satisfied.
+
+        This asserts the ORACLE only -- no production helper is called -- so it states the accepted
+        CommonMark distinction independently of whatever the checker currently believes.
+        """
+        for run_name, run in VM_GATE_A10_OPENING_RUNS:
+            for indent_name, indent in VM_GATE_A9_OPENER_INDENTS:
+                for info_name, suffix in VM_GATE_A10_INVALID_BACKTICK_INFO:
+                    with self.subTest(run=run_name, indent=indent_name, info=info_name):
+                        self._a10_invalid_opener(indent, run, suffix)
+        for name, run, info in VM_GATE_A10_VALID_INFO:
+            for indent_name, indent in VM_GATE_A9_OPENER_INDENTS:
+                with self.subTest(valid=name, indent=indent_name):
+                    self.assertEqual(_a10_opens_fence(indent + run + info), (run[0], len(run)),
+                                     "%s must remain a valid opening fence" % name)
+        # Backticks ADJACENT to the run extend the run; the info string is then empty, so the line
+        # is a valid longer opener rather than an invalid one. A10 must not confuse the two.
+        self.assertEqual(_a10_opens_fence("````" + "`"), ("`", 5),
+                         "backticks after the run belong to the run")
+        self.assertEqual(_a10_opens_fence("```"), ("`", 3))
+        self.assertEqual(_a10_opens_fence("~~~"), ("~", 3))
+
+    def test_a10_control_shared_opening_grammar_matches_the_oracle(self):
+        """The shared production opener grammar must agree with the independent oracle.
+
+        RED at exact T: the production grammar accepts a backtick run followed by an info string
+        that itself contains a backtick, which CommonMark does not.
+        """
+        for run_name, run in VM_GATE_A10_OPENING_RUNS:
+            for indent_name, indent in VM_GATE_A9_OPENER_INDENTS:
+                for info_name, suffix in VM_GATE_A10_INVALID_BACKTICK_INFO:
+                    with self.subTest(run=run_name, indent=indent_name, info=info_name):
+                        line = self._a10_invalid_opener(indent, run, suffix)
+                        self.assertIsNone(_fence_opening(line),
+                                          "a backtick fence whose info string carries a backtick"
+                                          " opens nothing: %r" % (line,))
+        for name, run, info in VM_GATE_A10_VALID_INFO:
+            for indent_name, indent in VM_GATE_A9_OPENER_INDENTS:
+                with self.subTest(valid=name, indent=indent_name):
+                    line = indent + run + info
+                    self.assertEqual(_fence_opening(line), _a10_opens_fence(line),
+                                     "%s must stay an opener the shared grammar recognises" % name)
+        for name, line in VM_GATE_A9_NON_OPENERS:
+            with self.subTest(non_opener=name):
+                self.assertIsNone(_a10_opens_fence(line),
+                                  "the oracle must agree %s opens no fence" % name)
+                self.assertIsNone(_fence_opening(line),
+                                  "%s is indented code, not an opener" % name)
+        self.assertEqual(_fence_opening("`````"), ("`", 5),
+                         "adjacent backticks must still extend the opening run")
+
+    def test_a10_control_closing_grammar_is_unchanged(self):
+        """A10 touches OPENING validity only. Every closing verdict must stay exactly as accepted."""
+        for name, opener, closer, closed in VM_GATE_A10_CLOSING_FORMS:
+            with self.subTest(closing=name):
+                state = _a10_opens_fence(opener)
+                self.assertIsNotNone(state, "the %s opener must open a block" % name)
+                self.assertEqual(_fence_opening(opener), state,
+                                 "the shared grammar must open the %s block too" % name)
+                self.assertEqual(_a10_closes_fence(closer, state), closed,
+                                 "the oracle's %s closing verdict must be %r" % (name, closed))
+                self.assertEqual(_fence_closes(closer, state), closed,
+                                 "the shared grammar's %s closing verdict must be %r"
+                                 % (name, closed))
+
+    def test_a10_control_invalid_backtick_info_before_a_vm_authority_fails_closed(self):
+        """The A10 defect, at every protected VM authority.
+
+        Nothing is added to, removed from or reworded inside any authority. TWO physical lines are
+        placed in front of it: a backtick run whose info string carries a backtick, which opens
+        nothing, followed by a GENUINE opener. CommonMark renders the authority as the literal
+        contents of a code block; at exact T the checker cancelled the two against each other and
+        reported the authority as operative prose.
+        """
+        for base_name, base in self._a9_vm_bases():
+            for label, needle, key, _isolated in VM_GATE_A9_VM_AUTHORITIES:
+                for case, indent, run, suffix, delta in self._a10_sequence_cases():
+                    with self.subTest(base=base_name, authority=label, case=case):
+                        invalid = self._a10_invalid_opener(indent, run, suffix)
+                        genuine = "`" * (len(run) + delta)
+                        degraded = self._a9_insert_before(base, needle, invalid, genuine)
+                        at = self._a9_authority_at(degraded, needle)
+                        self.assertIsNotNone(
+                            _a9_fence_open_at(degraded, at),
+                            "the oracle must agree the authority begins inside an open fence")
+                        self.assertIsNotNone(
+                            _fence_state_at(degraded, at),
+                            "the checker's inherited state must agree with the rendered state")
+                        self.assertIn(key, vm_gate_findings(degraded),
+                                      "a %s authority inside inherited fenced code must fail"
+                                      " closed" % label)
+
+    def test_a10_control_invalid_backtick_info_before_the_host_sync_authority_fails_closed(self):
+        """The same defect at the step-3 gate, carried by the existing absent-marker cascade."""
+        for base_name, base in self._a9_host_bases():
+            for case, indent, run, suffix, delta in self._a10_sequence_cases():
+                with self.subTest(base=base_name, case=case):
+                    invalid = self._a10_invalid_opener(indent, run, suffix)
+                    genuine = "`" * (len(run) + delta)
+                    degraded = self._a9_insert_before(
+                        base, HOST_SYNC_A9_STEP_HEADING, invalid, genuine)
+                    at = self._a9_authority_at(degraded, HOST_SYNC_GATE_MARKER)
+                    self.assertIsNotNone(
+                        _a9_fence_open_at(degraded, at),
+                        "the oracle must agree the gate begins inside an open fence")
+                    self.assertEqual(_unfenced(degraded, at), -1,
+                                     "a gate marker rendered as code must be treated as absent")
+                    self.assertIn(HOST_SYNC_A9_CARRIER, host_sync_gate_findings(degraded),
+                                  "a host-sync gate inside inherited fenced code must fail closed")
+
+    def test_a10_control_valid_openers_still_fence_the_authority(self):
+        """The positive control: A10 narrows opener acceptance, and only where CommonMark does.
+
+        Every valid opening fence A9 recognised -- including a TILDE fence whose info string carries
+        backticks, tildes or both -- must still open a block and must still make the authority behind
+        it fail closed. A repair that rejected a line merely for CONTAINING a backtick would pass the
+        RED controls above and quietly delete this accepted A9 protection.
+        """
+        for base_name, base in self._a9_vm_bases():
+            for label, needle, key, _isolated in VM_GATE_A9_VM_AUTHORITIES:
+                for name, run, info in VM_GATE_A10_VALID_INFO:
+                    with self.subTest(base=base_name, authority=label, opener=name):
+                        degraded = self._a9_insert_before(base, needle, run + info)
+                        at = self._a9_authority_at(degraded, needle)
+                        self.assertIsNotNone(_a9_fence_open_at(degraded, at),
+                                             "the oracle must agree %s opens a fence" % name)
+                        self.assertIn(key, vm_gate_findings(degraded),
+                                      "a %s authority behind the valid opener %s must fail closed"
+                                      % (label, name))
+        for base_name, base in self._a9_host_bases():
+            for name, run, info in VM_GATE_A10_VALID_INFO:
+                with self.subTest(base=base_name, authority="step-3 host-sync", opener=name):
+                    degraded = self._a9_insert_before(
+                        base, HOST_SYNC_A9_STEP_HEADING, run + info)
+                    at = self._a9_authority_at(degraded, HOST_SYNC_GATE_MARKER)
+                    self.assertIsNotNone(_a9_fence_open_at(degraded, at),
+                                         "the oracle must agree %s opens a fence" % name)
+                    self.assertIn(HOST_SYNC_A9_CARRIER, host_sync_gate_findings(degraded),
+                                  "the host-sync gate behind the valid opener %s must fail closed"
+                                  % name)
 
 
 @unittest.skipIf(PS is None, "no PowerShell executable available")
