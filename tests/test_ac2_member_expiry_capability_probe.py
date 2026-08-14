@@ -4168,7 +4168,16 @@ class ExpiryProbeScriptExecutionTests(unittest.TestCase):
 REVIEWED_RUNBOOK_SEAL_KEY = "reviewed_runbook_seal_mismatch"
 # SHA-256 of docs/autocount2-automation/member_create_uat_runbook.md at the reviewed head, over the
 # UTF-8 bytes of its line-ending-normalised text.
-REVIEWED_RUNBOOK_SHA256 = "56f5a081145cb80719d2dec5e603381e7d8cbfbfcfeb6019e5cee59d7c564bce"
+#
+# The seal moves ONLY with a reviewed change to the sealed document, and it moved here for exactly
+# one: the R2 step-9 correction that requires the current-turn approval to name the intended n8n
+# instance or environment. Canonicalisation is unchanged, the constant stays a literal, and the
+# controls below prove the new value against an independently computed digest and prove the
+# superseded reviewed content no longer satisfies it.
+REVIEWED_RUNBOOK_SHA256 = "cf5e4011371717268915f614fd90e8b81e6a65ee1227a3a694e4c0f368f38b42"
+# The superseded R1 reviewed digest, kept so the seal's movement is provable rather than asserted:
+# the pre-R2 reviewed content must NOT satisfy the current seal.
+SUPERSEDED_R1_RUNBOOK_SHA256 = "56f5a081145cb80719d2dec5e603381e7d8cbfbfcfeb6019e5cee59d7c564bce"
 
 
 # The seal path must reach nothing but its argument. These are the names whose presence anywhere in
@@ -5846,6 +5855,13 @@ VM_GATE_A11_NEW_KEYS = (
 # public count is 90; both are declared, so neither can drift silently against the other.
 VM_GATE_A11_FINDING_KEY_COUNT = 89
 VM_GATE_R1_FINDING_KEY_COUNT = VM_GATE_A11_FINDING_KEY_COUNT + 1
+# R2 adds exactly one semantic key -- the step-9 n8n target binding -- and retires none. The A11 and
+# R1 constants above are historical and stay truthful about what those revisions declared; the R2
+# constants are derived from them rather than replacing them, so a later revision cannot silently
+# repurpose a count that an earlier control still asserts.
+VM_GATE_R2_NEW_KEYS = ("mapping_n8n_target_not_bound",)
+VM_GATE_R2_SEMANTIC_FINDING_KEY_COUNT = VM_GATE_A11_FINDING_KEY_COUNT + len(VM_GATE_R2_NEW_KEYS)
+VM_GATE_R2_FINDING_KEY_COUNT = VM_GATE_R2_SEMANTIC_FINDING_KEY_COUNT + 1
 # The COMPLETE set of keys an EMPTY document cannot report, because each needs a document that
 # actually contains the landmark it is about. The pre-A11 eleven are carried forward unchanged; A11
 # adds the two step-9/step-10 ambiguity, ordering and heading families, plus the three keys that
@@ -5906,7 +5922,7 @@ VM_GATE_SEMANTIC_FINDING_KEYS = (
     "preflight_substitution_not_denied", "preflight_target_not_bound",
     "preflight_transfer_not_bound", "preflight_vm_not_named", "safety_boundary_ambiguous",
     "safety_boundary_surfaces_incomplete",
-) + VM_GATE_A11_NEW_KEYS
+) + VM_GATE_A11_NEW_KEYS + VM_GATE_R2_NEW_KEYS
 # R1 adds exactly one key to the PUBLIC surface -- the reviewed-runbook seal -- and retires none.
 # It is deliberately NOT a member of the semantic surface: the semantic layer cannot report it, and
 # the boundary between "the parser recognised a defect" and "this is not the reviewed document"
@@ -8216,11 +8232,21 @@ VM_GATE_A11_HEADING_LINE = re.compile(r"(?m)^ {0,3}#{1,6}[ \t]")
 # importing and using the local workflow copy, credential binding by identity only, placing the
 # sanitised result into the n8n file surface, manual execution, and the single spreadsheet row
 # update. No credential value and no private value is written here or anywhere in the repository.
+#
+# R2: the required-name clause now names THREE targets, not two. Accepted post-ready finding
+# PRRT_kwDOSbJI_s6ZK7nH: naming only the workflow and the Sheet/tab left the import, the credential
+# binding, the file placement and the execution free to run against a DIFFERENT n8n instance while
+# the documented approval wording stayed satisfied. The instance identity is required in the
+# APPROVAL itself, by a non-secret operator-recognisable name -- never a URL, connection value or
+# credential value, none of which is written here or anywhere in the repository.
 VM_GATE_A11_MAPPING_REVIEWED_BLOCK = r"""**Separate current-turn owner approval required (result-mapping gate).** The mapping below runs
 live operations on the operator PC n8n instance and writes to the intended Google Sheet. Before any
 of it, obtain an explicit current-turn owner approval that names the intended result-mapping
-workflow `n8n-workflows/member_create_uat_result_mapping.workflow.json` and the intended spreadsheet
-and source tab, and binds:
+workflow `n8n-workflows/member_create_uat_result_mapping.workflow.json`, the intended spreadsheet
+and source tab, and the intended n8n instance or environment by its non-secret
+operator-recognisable name. That instance identity is named in that approval itself, and the
+instance URL, connection details and credential values are never written into this runbook. That
+approval binds:
 
 - importing and using the local copy of that workflow on the operator PC n8n instance;
 - binding the intended Google credential by name or identity only, never by secret value;
@@ -8279,11 +8305,46 @@ VM_GATE_A11_MAPPING_AFFIRMATIVE = ("obtain an explicit current-turn owner approv
                                    " intended result-mapping workflow")
 VM_GATE_A11_RECOVERY_AFFIRMATIVE = ("obtain an explicit current-turn owner approval that names the"
                                     " intended autocount account book and environment")
+# R2 adds the third target. The token is the APPROVAL clause's own wording, not the word "n8n
+# instance": the step's descriptive sentence and its first operation bullet both already say
+# "the operator PC n8n instance", so any token that generic would be satisfied by prose that never
+# requires the approval to identify anything -- which is exactly the accepted defect.
 VM_GATE_A11_MAPPING_BINDINGS = (
     ("mapping_workflow_not_bound",
      "n8n-workflows/member_create_uat_result_mapping.workflow.json"),
     ("mapping_spreadsheet_not_bound", "the intended spreadsheet and source tab"),
+    ("mapping_n8n_target_not_bound",
+     "the intended n8n instance or environment by its non-secret operator-recognisable name"),
 )
+# The R2 required-name clause and the superseded R1 clause it replaces, declared as data so the
+# target-binding controls and the seal-movement control measure exactly the same reviewed change.
+VM_GATE_R2_REVIEWED_NAME_CLAUSE = (
+    "workflow `n8n-workflows/member_create_uat_result_mapping.workflow.json`, the intended"
+    " spreadsheet\nand source tab, and the intended n8n instance or environment by its non-secret\n"
+    "operator-recognisable name. That instance identity is named in that approval itself, and the\n"
+    "instance URL, connection details and credential values are never written into this runbook."
+    " That\napproval binds:")
+VM_GATE_R2_SUPERSEDED_NAME_CLAUSE = (
+    "workflow `n8n-workflows/member_create_uat_result_mapping.workflow.json` and the intended"
+    " spreadsheet\nand source tab, and binds:")
+# The reviewed step-9 authority R2 must not weaken: the exact workflow, the spreadsheet/tab, the
+# five bound operations, and the non-reuse and no-further-authority boundaries.
+VM_GATE_R2_PRESERVED_STEP_9_AUTHORITY = (
+    "n8n-workflows/member_create_uat_result_mapping.workflow.json",
+    "the intended spreadsheet\nand source tab",
+    "- importing and using the local copy of that workflow on the operator PC n8n instance;",
+    "- binding the intended Google credential by name or identity only, never by secret value;",
+    "- copying the sanitised result file into the approved n8n file location"
+    " `/home/node/.n8n-files/`;",
+    "- running that workflow manually, with the workflow left inactive;",
+    "- updating the one intended spreadsheet row selected by `uat_create_operation_id`.",
+    "A prior-turn approval is not reusable.",
+    "authorises no AutoCount contact and no further member write",
+)
+# Spellings a private target value would take if one were ever written into the gate. The approval
+# names the instance; the repository never carries its URL, connection value or credential.
+VM_GATE_R2_FORBIDDEN_TARGET_VALUES = ("http://", "https://", "password", "api_key", "apikey",
+                                      "token=", "bearer ", "connectionstring")
 VM_GATE_A11_MAPPING_OPERATIONS = (
     "importing and using the local copy of that workflow on the operator pc n8n instance",
     "binding the intended google credential by name or identity only, never by secret value",
@@ -8319,7 +8380,8 @@ VM_GATE_A11_RECOVERY_STOP = (
 # contract steps 4 and 5 already carry: an unresolvable layout marks the whole step unmet.
 VM_GATE_A11_MAPPING_UNMET = frozenset((
     "mapping_pre_gate_content", "mapping_gate_text_changed", "mapping_action_text_changed",
-    "mapping_workflow_not_bound", "mapping_spreadsheet_not_bound", "mapping_operations_not_bound",
+    "mapping_workflow_not_bound", "mapping_spreadsheet_not_bound", "mapping_n8n_target_not_bound",
+    "mapping_operations_not_bound",
     "mapping_not_current_turn", "mapping_prior_turn_not_denied", "mapping_substitution_not_denied",
     "mapping_stop_boundary_missing",
 ))
@@ -8611,6 +8673,11 @@ VM_GATE_A11_MAPPING_MUTATIONS = (
     ("earlier_approval_reused", "mapping_gate_text_changed"),
     ("workflow_target_removed", "mapping_workflow_not_bound"),
     ("spreadsheet_target_removed", "mapping_spreadsheet_not_bound"),
+    # R2. The accepted post-ready finding, in three shapes: the requirement struck out of the
+    # approval clause, and two ways of "mentioning n8n" that identify no particular instance.
+    ("n8n_target_removed", "mapping_n8n_target_not_bound"),
+    ("n8n_target_generic_any_instance", "mapping_n8n_target_not_bound"),
+    ("n8n_target_generic_operator_pc_prose", "mapping_n8n_target_not_bound"),
     ("operation_set_removed", "mapping_operations_not_bound"),
     ("generic_authority_substituted", "mapping_not_current_turn"),
     ("prior_turn_denial_removed", "mapping_prior_turn_not_denied"),
@@ -8643,6 +8710,20 @@ VM_GATE_A11_MAPPING_REPLACEMENTS = {
         "`n8n-workflows/member_create_uat_result_mapping.workflow.json`", "the mapping workflow"),
     "spreadsheet_target_removed": (
         "the intended spreadsheet\nand source tab", "the destination"),
+    # R2. Struck out of the required-name clause entirely.
+    "n8n_target_removed": (
+        ", and the intended n8n instance or environment by its non-secret\n"
+        "operator-recognisable name", ""),
+    # R2. "n8n" is still mentioned, but no particular instance is identified.
+    "n8n_target_generic_any_instance": (
+        "the intended n8n instance or environment by its non-secret\noperator-recognisable name",
+        "any n8n instance"),
+    # R2, the decisive one. The replacement is the EXACT generic phrase the step already carries
+    # twice -- in its descriptive sentence and in its first operation bullet -- so this proves the
+    # binding cannot be satisfied by prose that merely says which kind of instance is involved.
+    "n8n_target_generic_operator_pc_prose": (
+        "the intended n8n instance or environment by its non-secret\noperator-recognisable name",
+        "the operator PC n8n instance"),
     "operation_set_removed": (
         "- running that workflow manually, with the workflow left inactive;\n", ""),
     "generic_authority_substituted": (
@@ -12319,11 +12400,15 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                             % (bullet, number))
 
     def test_a6_control_finding_set_declares_the_action_identities(self):
-        # A6's identities live on the SEMANTIC surface, which R1 leaves at its A11 size.
-        self.assertEqual(len(VM_GATE_SEMANTIC_FINDING_KEYS), VM_GATE_A11_FINDING_KEY_COUNT,
+        # A6's identities live on the SEMANTIC surface, which R1 leaves at its A11 size and R2
+        # grows by exactly its own declared key.
+        self.assertEqual(len(VM_GATE_SEMANTIC_FINDING_KEYS),
+                         VM_GATE_R2_SEMANTIC_FINDING_KEY_COUNT,
                          "A6 adds exactly the two reviewed action identities and retires nothing;"
-                         " A11 appends its own declared keys and retires nothing either")
-        self.assertEqual(len(set(VM_GATE_SEMANTIC_FINDING_KEYS)), VM_GATE_A11_FINDING_KEY_COUNT)
+                         " A11 and R2 each append their own declared keys and retire nothing"
+                         " either")
+        self.assertEqual(len(set(VM_GATE_SEMANTIC_FINDING_KEYS)),
+                         VM_GATE_R2_SEMANTIC_FINDING_KEY_COUNT)
         self.assertIn(VM_GATE_A6_ACTION_KEYS[VM_GATE_DEPLOY_STEP], VM_GATE_SEMANTIC_FINDING_KEYS)
         self.assertIn(VM_GATE_A6_ACTION_KEYS[VM_GATE_PREFLIGHT_STEP],
                       VM_GATE_SEMANTIC_FINDING_KEYS)
@@ -13613,21 +13698,31 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                          "runbook, so the public guard must report exactly the seal")
 
     def test_a11_control_finding_keys_are_declared_unique_and_reachable(self):
-        self.assertEqual(len(VM_GATE_SEMANTIC_FINDING_KEYS), VM_GATE_A11_FINDING_KEY_COUNT,
-                         "A11 adds exactly its declared keys and retires nothing")
-        self.assertEqual(len(set(VM_GATE_SEMANTIC_FINDING_KEYS)), VM_GATE_A11_FINDING_KEY_COUNT,
+        # R2 adds exactly its one key on top of the A11 surface and retires none of A11's, so both
+        # the historical A11 total and the current R2 total are asserted rather than one replacing
+        # the other.
+        self.assertEqual(len(VM_GATE_A11_NEW_KEYS) + 50, VM_GATE_A11_FINDING_KEY_COUNT,
+                         "the historical A11 semantic total must stay truthful")
+        self.assertEqual(len(VM_GATE_SEMANTIC_FINDING_KEYS),
+                         VM_GATE_R2_SEMANTIC_FINDING_KEY_COUNT,
+                         "R2 adds exactly its declared key and retires nothing")
+        self.assertEqual(len(set(VM_GATE_SEMANTIC_FINDING_KEYS)),
+                         VM_GATE_R2_SEMANTIC_FINDING_KEY_COUNT,
                          "no semantic finding key may be declared twice")
         # R1: the public surface is the semantic surface plus exactly the seal key.
-        self.assertEqual(len(VM_GATE_FINDING_KEYS), VM_GATE_R1_FINDING_KEY_COUNT,
+        self.assertEqual(len(VM_GATE_FINDING_KEYS), VM_GATE_R2_FINDING_KEY_COUNT,
                          "R1 adds exactly the seal key and retires nothing")
-        self.assertEqual(len(set(VM_GATE_FINDING_KEYS)), VM_GATE_R1_FINDING_KEY_COUNT,
+        self.assertEqual(len(set(VM_GATE_FINDING_KEYS)), VM_GATE_R2_FINDING_KEY_COUNT,
                          "no public finding key may be declared twice")
+        self.assertEqual(VM_GATE_R2_FINDING_KEY_COUNT - VM_GATE_R1_FINDING_KEY_COUNT,
+                         len(VM_GATE_R2_NEW_KEYS),
+                         "R2 must move the public total by exactly its own new keys")
         self.assertEqual(set(VM_GATE_FINDING_KEYS) - set(VM_GATE_SEMANTIC_FINDING_KEYS),
                          {REVIEWED_RUNBOOK_SEAL_KEY},
                          "the public/semantic boundary must be exactly the seal key")
         self.assertNotIn(REVIEWED_RUNBOOK_SEAL_KEY, VM_GATE_SEMANTIC_FINDING_KEYS,
                          "the semantic layer must never claim to report the seal")
-        for key in VM_GATE_A11_NEW_KEYS:
+        for key in VM_GATE_A11_NEW_KEYS + VM_GATE_R2_NEW_KEYS:
             with self.subTest(key=key):
                 self.assertIn(key, VM_GATE_SEMANTIC_FINDING_KEYS, "%s must be declared" % key)
         self.assertEqual([key for key in VM_GATE_FINDING_KEYS if "four" in key], [],
@@ -14000,6 +14095,181 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
         # And unreachable when the document IS the reviewed one.
         self.assertNotIn(REVIEWED_RUNBOOK_SEAL_KEY, vm_gate_findings(self.create_runbook))
         self.assertNotIn(REVIEWED_RUNBOOK_SEAL_KEY, host_sync_gate_findings(self.create_runbook))
+
+    # ---- DL-XB-123-001-R2: the step-9 live n8n target binding ---- #
+    # Accepted post-ready finding PRRT_kwDOSbJI_s6ZK7nH. Step 9 states plainly that it performs
+    # live operations on an n8n instance, but its required-name clause bound only the workflow and
+    # the spreadsheet/tab. The import, the Google-credential binding, the result-file placement and
+    # the manual execution could therefore each be carried out against a DIFFERENT n8n instance
+    # without departing from the documented approval wording. R2 requires the approval ITSELF to
+    # identify the intended instance, by a non-secret operator-recognisable name.
+    #
+    # This is a target-binding defect, not another CommonMark or command-enumeration one: no parser
+    # and no classifier is touched below, and the R1 residuals are left exactly as they are.
+
+    def _r2_supersede(self, base):
+        """``base`` with the R2 required-name clause rolled back to the superseded R1 wording."""
+        self.assertIn(VM_GATE_R2_REVIEWED_NAME_CLAUSE, base,
+                      "the base must carry the R2 required-name clause")
+        return base.replace(VM_GATE_R2_REVIEWED_NAME_CLAUSE,
+                            VM_GATE_R2_SUPERSEDED_NAME_CLAUSE, 1)
+
+    def test_r2_reviewed_gate_binds_all_three_target_classes(self):
+        """The control group: the reviewed step-9 approval names workflow, Sheet AND instance."""
+        self.assertEqual([key for key, _ in VM_GATE_A11_MAPPING_BINDINGS],
+                         ["mapping_workflow_not_bound", "mapping_spreadsheet_not_bound",
+                          "mapping_n8n_target_not_bound"],
+                         "step 9 must bind exactly the three reviewed target classes")
+        for base_name, base in self._a11_bases():
+            with self.subTest(base=base_name):
+                self.assertNotIn("mapping_n8n_target_not_bound",
+                                 _vm_gate_semantic_findings(base),
+                                 "the reviewed gate must satisfy the target binding")
+        self.assertEqual(vm_gate_findings(self.create_runbook), [],
+                         "the reviewed runbook must clear the public guard under R2")
+
+    def test_r2_superseded_two_target_approval_now_fails_closed(self):
+        """The accepted defect, restored verbatim: two named targets are no longer sufficient.
+
+        This wording was clean at the reviewed head that Codex reviewed. It must now report the
+        target-binding finding BY NAME, and must not report the workflow or spreadsheet bindings,
+        so the control proves what it claims rather than merely that something went wrong.
+        """
+        for base_name, base in self._a11_bases():
+            with self.subTest(base=base_name):
+                superseded = self._r2_supersede(base)
+                self.assertNotEqual(superseded, base, "the rollback must change the document")
+                findings = _vm_gate_semantic_findings(superseded)
+                self.assertIn("mapping_n8n_target_not_bound", findings,
+                              "a two-target approval must fail closed on the missing instance")
+                self.assertNotIn("mapping_workflow_not_bound", findings,
+                                 "the superseded wording still names the workflow")
+                self.assertNotIn("mapping_spreadsheet_not_bound", findings,
+                                 "the superseded wording still names the spreadsheet and tab")
+
+    def test_r2_generic_instance_wording_cannot_satisfy_the_binding(self):
+        """Mentioning n8n is not identifying an instance.
+
+        The second case is the decisive one: its replacement is the EXACT generic phrase the step
+        already carries elsewhere -- in its descriptive sentence and in its first operation bullet
+        -- so a checker that merely looked for "operator PC n8n instance" somewhere in the gate
+        would pass a document whose approval requires no target identity at all.
+        """
+        generic = ("n8n_target_generic_any_instance", "n8n_target_generic_operator_pc_prose")
+        for base_name, base in self._a11_bases():
+            for name in generic:
+                with self.subTest(base=base_name, wording=name):
+                    degraded = self._a11_gate_mutate(
+                        base, VM_GATE_A11_MAPPING_REVIEWED_BLOCK,
+                        VM_GATE_A11_MAPPING_REVIEWED_ACTION, name,
+                        VM_GATE_A11_MAPPING_REPLACEMENTS)
+                    self.assertIn("mapping_n8n_target_not_bound",
+                                  _vm_gate_semantic_findings(degraded),
+                                  "%s must not satisfy the target binding" % name)
+        # The generic phrase really is still present after the decisive mutation, so the control is
+        # about what the APPROVAL requires and not about the phrase having been deleted.
+        degraded = self._a11_gate_mutate(
+            VM_GATE_A11_FIXTURE, VM_GATE_A11_MAPPING_REVIEWED_BLOCK,
+            VM_GATE_A11_MAPPING_REVIEWED_ACTION, "n8n_target_generic_operator_pc_prose",
+            VM_GATE_A11_MAPPING_REPLACEMENTS)
+        self.assertGreaterEqual(degraded.lower().count("the operator pc n8n instance"), 3,
+                                "the generic phrase must survive the mutation three times over")
+
+    def test_r2_other_step_9_target_and_operation_bindings_still_fail_closed(self):
+        """R2 adds a binding; the three it stands beside must each still fire on their own."""
+        expected = {"workflow_target_removed": "mapping_workflow_not_bound",
+                    "spreadsheet_target_removed": "mapping_spreadsheet_not_bound",
+                    "operation_set_removed": "mapping_operations_not_bound",
+                    "n8n_target_removed": "mapping_n8n_target_not_bound"}
+        for base_name, base in self._a11_bases():
+            for name, key in sorted(expected.items()):
+                with self.subTest(base=base_name, mutation=name):
+                    degraded = self._a11_gate_mutate(
+                        base, VM_GATE_A11_MAPPING_REVIEWED_BLOCK,
+                        VM_GATE_A11_MAPPING_REVIEWED_ACTION, name,
+                        VM_GATE_A11_MAPPING_REPLACEMENTS)
+                    self.assertIn(key, _vm_gate_semantic_findings(degraded),
+                                  "the step-9 %s mutation must report %s" % (name, key))
+
+    def test_r2_preserves_every_existing_step_9_boundary(self):
+        """R2 adds a target class; it weakens no authority the reviewed step 9 already carried."""
+        block = VM_GATE_A11_MAPPING_REVIEWED_BLOCK
+        for token in VM_GATE_R2_PRESERVED_STEP_9_AUTHORITY:
+            with self.subTest(preserved=token[:48]):
+                self.assertIn(token, block, "R2 must preserve the reviewed step-9 authority")
+        self.assertIn(block, self.create_runbook,
+                      "the live runbook must carry the reviewed gate verbatim")
+        # The approval names the instance; the repository never carries its private value.
+        for forbidden in VM_GATE_R2_FORBIDDEN_TARGET_VALUES:
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, block.lower(),
+                                 "the gate must never carry a private target value")
+
+    def test_r2_seal_moved_with_the_reviewed_document_and_retired_the_old_content(self):
+        """The seal moved for exactly one reviewed change, and the superseded content now fails it.
+
+        Rolling the R2 clause back must reproduce the pre-R2 reviewed content EXACTLY -- proved by
+        its digest equalling the superseded literal -- which is what makes "the seal moved with the
+        document, and only with it" a demonstration rather than an assertion.
+        """
+        self.assertNotEqual(REVIEWED_RUNBOOK_SHA256, SUPERSEDED_R1_RUNBOOK_SHA256,
+                            "a substantive reviewed change must move the seal")
+        independent = hashlib.sha256(
+            canonical_seal_text(self.create_runbook).encode("utf-8")).hexdigest()
+        self.assertEqual(REVIEWED_RUNBOOK_SHA256, independent,
+                         "the new literal digest must equal an independently computed digest of "
+                         "the exact reviewed runbook")
+        self.assertEqual(reviewed_runbook_seal_findings(self.create_runbook), [],
+                         "the exact reviewed runbook must be seal-clean")
+        superseded = self._r2_supersede(self.create_runbook)
+        self.assertEqual(
+            hashlib.sha256(canonical_seal_text(superseded).encode("utf-8")).hexdigest(),
+            SUPERSEDED_R1_RUNBOOK_SHA256,
+            "the rollback must reproduce the superseded reviewed content byte for byte")
+        self._assert_seal_fires(superseded, "the superseded pre-R2 reviewed content")
+
+    def test_r2_finding_key_is_declared_unique_semantic_only_and_reachable(self):
+        """Key integrity for the one key R2 adds, and for the surfaces it sits inside."""
+        for key in VM_GATE_R2_NEW_KEYS:
+            with self.subTest(key=key):
+                self.assertIn(key, VM_GATE_SEMANTIC_FINDING_KEYS, "%s must be declared" % key)
+                self.assertIn(key, VM_GATE_FINDING_KEYS)
+                self.assertEqual(VM_GATE_SEMANTIC_FINDING_KEYS.count(key), 1,
+                                 "%s must be declared exactly once" % key)
+                self.assertIn(key, VM_GATE_A11_MAPPING_UNMET,
+                              "an unresolvable step-9 layout must report %s unmet" % key)
+                self.assertNotIn(key, VM_GATE_A11_NEEDS_A_REAL_DOCUMENT,
+                                 "%s is reportable on an empty document" % key)
+                self.assertIn(key, _vm_gate_semantic_findings(""),
+                              "%s must be reachable" % key)
+        self.assertNotIn(REVIEWED_RUNBOOK_SEAL_KEY, VM_GATE_R2_NEW_KEYS,
+                         "the seal key stays public-only and is not an R2 semantic key")
+        # No historical A1-A11 or R1 key is retired by R2.
+        self.assertLess(set(VM_GATE_A11_NEW_KEYS), set(VM_GATE_SEMANTIC_FINDING_KEYS),
+                        "R2 must retire no A11 key")
+        self.assertEqual(set(VM_GATE_FINDING_KEYS) - set(VM_GATE_SEMANTIC_FINDING_KEYS),
+                         {REVIEWED_RUNBOOK_SEAL_KEY},
+                         "the public/semantic boundary must still be exactly the seal key")
+
+    def test_r2_leaves_the_r1_structural_residuals_exactly_as_they_were(self):
+        """R2 adds no parser, no CommonMark case and no command spelling.
+
+        The Run-24 F1 and F2 residuals are intentional defence-in-depth debt, contained by the
+        seal. R2 must not quietly convert either into a semantic finding, because that would change
+        what the R1 convergence argument rests on.
+        """
+        self.assertEqual(VM_GATE_R1_TYPE7_OPENERS, ("<template>", "<x-review>", "<x-review />"),
+                         "R2 must add no CommonMark case")
+        self.assertNotIn("robocopy", VM_GATE_R1_COPY_ITEM_COMMAND.lower())
+        for _label, authority in VM_GATE_R1_F1_AUTHORITIES:
+            with self.subTest(authority=_label):
+                self.assertIn(authority, self.create_runbook,
+                              "the R1 F1 control authority must still exist in the runbook")
+        # F2 stays unclassified by the semantic command table, and the seal is what answers it.
+        self.assertNotIn("copy-item",
+                         " ".join(str(pattern) for pattern in VM_GATE_A11_PROTECTED_OPERATIONS
+                                  ).lower(),
+                         "R2 must not add Copy-Item to the protected-operation enumeration")
 
 
 @unittest.skipIf(PS is None, "no PowerShell executable available")

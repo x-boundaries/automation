@@ -1021,8 +1021,11 @@ irreversible section, calls `SaveMember` at most once, and never retries.
 **Separate current-turn owner approval required (result-mapping gate).** The mapping below runs
 live operations on the operator PC n8n instance and writes to the intended Google Sheet. Before any
 of it, obtain an explicit current-turn owner approval that names the intended result-mapping
-workflow `n8n-workflows/member_create_uat_result_mapping.workflow.json` and the intended spreadsheet
-and source tab, and binds:
+workflow `n8n-workflows/member_create_uat_result_mapping.workflow.json`, the intended spreadsheet
+and source tab, and the intended n8n instance or environment by its non-secret
+operator-recognisable name. That instance identity is named in that approval itself, and the
+instance URL, connection details and credential values are never written into this runbook. That
+approval binds:
 
 - importing and using the local copy of that workflow on the operator PC n8n instance;
 - binding the intended Google credential by name or identity only, never by secret value;
