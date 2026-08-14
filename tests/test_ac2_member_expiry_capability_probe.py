@@ -4170,14 +4170,19 @@ REVIEWED_RUNBOOK_SEAL_KEY = "reviewed_runbook_seal_mismatch"
 # UTF-8 bytes of its line-ending-normalised text.
 #
 # The seal moves ONLY with a reviewed change to the sealed document, and it moved here for exactly
-# one: the R2 step-9 correction that requires the current-turn approval to name the intended n8n
-# instance or environment. Canonicalisation is unchanged, the constant stays a literal, and the
-# controls below prove the new value against an independently computed digest and prove the
-# superseded reviewed content no longer satisfies it.
-REVIEWED_RUNBOOK_SHA256 = "cf5e4011371717268915f614fd90e8b81e6a65ee1227a3a694e4c0f368f38b42"
-# The superseded R1 reviewed digest, kept so the seal's movement is provable rather than asserted:
-# the pre-R2 reviewed content must NOT satisfy the current seal.
+# the R3 Step-5/Step-9 target-binding corrections: the selected private source record, the fixed VM
+# package destination and its replacement, the Google credential identity and the spreadsheet row's
+# operation id. Canonicalisation is unchanged, the constant stays a literal, and the controls below
+# prove the new value against an independently computed digest and prove that BOTH superseded
+# reviewed documents no longer satisfy it.
+REVIEWED_RUNBOOK_SHA256 = "daaf2b144a1ed7e36cf7b886b0dd350a559f966279a909fcd4a67f43e3674759"
+# The retired reviewed digests, kept so the seal's movement stays provable rather than asserted:
+# rolling the reviewed clauses back one revision at a time must reproduce each of these documents
+# byte for byte, and neither may satisfy the current seal. R1 is retained from the previous
+# revision rather than dropped, so the whole chain remains auditable.
 SUPERSEDED_R1_RUNBOOK_SHA256 = "56f5a081145cb80719d2dec5e603381e7d8cbfbfcfeb6019e5cee59d7c564bce"
+SUPERSEDED_R2_RUNBOOK_SHA256 = "cf5e4011371717268915f614fd90e8b81e6a65ee1227a3a694e4c0f368f38b42"
+SUPERSEDED_RUNBOOK_SHA256S = (SUPERSEDED_R1_RUNBOOK_SHA256, SUPERSEDED_R2_RUNBOOK_SHA256)
 
 
 # The seal path must reach nothing but its argument. These are the names whose presence anywhere in
@@ -4701,12 +4706,34 @@ VM_GATE_A4_NEW_BINDINGS = (
      "the AutoCount process-environment configuration, by variable name only",
      "the AutoCount process-environment configuration, by variable name only"),
 )
+# R3 adds the two step-5 target-binding clauses. Both are the APPROVAL clause's own wording, for
+# the reason R2 established: a token generic enough to be answered by the step's descriptive prose
+# would be satisfied by a document whose approval still binds nothing concrete.
+#
+# `preflight_source_record_not_bound`. The private-data binding above names the CATEGORY of access
+# ("the selected private form response and its decision row") but not WHICH record: the row is not
+# chosen until the later `--row-number <N>` command, so one approval could be applied to a
+# different person's private data without departing from the documented gate. The approval must
+# therefore carry the stable non-PII `source_record_id`. A row number is an ordinal into a file
+# that can be re-sorted or re-exported; it is not identity, and the contract says so.
+VM_GATE_R3_SOURCE_RECORD_BINDING = ("identified in the approval itself by its non-pii"
+                                    " `source_record_id`")
+# `preflight_transfer_destination_not_bound`. The runner always reads the FIXED VM working copy, so
+# every transfer after the first overwrites the previous package. "Bounded transfer" disclosed
+# neither the destination nor the replacement, unlike step 4's explicit copying-or-replacing
+# wording. The token binds the two together: naming the path without the replacement, or the
+# replacement without the path, leaves the destructive half of the operation unapproved.
+VM_GATE_R3_TRANSFER_DESTINATION_BINDING = (
+    "copying or replacing the fixed vm working copy"
+    " `c:\\xb\\create_uat\\member_create_uat_package.json`")
 VM_GATE_PREFLIGHT_BINDINGS = tuple(
     (key, _flat(phrase).lower()) for key, phrase, _fragment in VM_GATE_A4_NEW_BINDINGS
 ) + (
+    ("preflight_source_record_not_bound", VM_GATE_R3_SOURCE_RECORD_BINDING),
     ("preflight_target_not_bound",
      "the intended autocount target (the server and database / account book)"),
     ("preflight_transfer_not_bound", "the bounded transfer of the approved package to that vm"),
+    ("preflight_transfer_destination_not_bound", VM_GATE_R3_TRANSFER_DESTINATION_BINDING),
     ("preflight_dry_run_not_bound", "the no-write dry-run / preflight operation"),
 )
 
@@ -4872,7 +4899,8 @@ not waive the approval for the private-data work. Before any of it, obtain an ex
 current-turn owner approval that names the AutoCount VM (`DESKTOP-4I042L6`) and binds:
 
 - the bounded access to the selected private form response and its decision row for this one
-  package, whose values are never written into this runbook;
+  package, identified in the approval itself by its non-PII `source_record_id`, which a row
+  number alone does not supply; the private field values are never written into this runbook;
 - the local reviewer-decision store and approval-ledger operations and the immutable package
   build they produce;
 - the AutoCount process-environment configuration, by variable name only:
@@ -4880,7 +4908,10 @@ current-turn owner approval that names the AutoCount VM (`DESKTOP-4I042L6`) and 
   environment variable named by `-PasswordEnvVar`;
 - the intended AutoCount target (the server and database / account book), named in the approval
   itself and never written into this runbook as a connection value or secret;
-- the bounded transfer of the approved package to that VM;
+- the bounded transfer of the approved package to that VM, copying or replacing the fixed VM
+  working copy `C:\XB\create_uat\member_create_uat_package.json` that the runner always reads;
+  this replacement authority covers that one VM working copy only, never the laptop-side
+  package build, which stays strictly no-clobber;
 - the no-write dry-run / preflight operation.
 
 This approval is distinct and is **not** implied by any other gate:
@@ -5814,9 +5845,11 @@ VM_GATE_DEPLOY_UNMET = frozenset((
 # case-folding finding is answered by deleting the digest rather than by re-hashing it.
 VM_GATE_PREFLIGHT_UNMET = frozenset((
     "preflight_pre_gate_content", "preflight_vm_not_named", "preflight_private_data_not_bound",
+    "preflight_source_record_not_bound",
     "preflight_package_build_not_bound", "preflight_environment_not_bound",
     "preflight_target_not_bound",
-    "preflight_transfer_not_bound", "preflight_dry_run_not_bound", "preflight_not_current_turn",
+    "preflight_transfer_not_bound", "preflight_transfer_destination_not_bound",
+    "preflight_dry_run_not_bound", "preflight_not_current_turn",
     "preflight_substitution_not_denied", "preflight_prior_turn_not_denied",
     "preflight_save_member_not_denied", "preflight_stop_boundary_missing",
     "preflight_approval_command_missing", "preflight_package_build_missing",
@@ -5862,6 +5895,21 @@ VM_GATE_R1_FINDING_KEY_COUNT = VM_GATE_A11_FINDING_KEY_COUNT + 1
 VM_GATE_R2_NEW_KEYS = ("mapping_n8n_target_not_bound",)
 VM_GATE_R2_SEMANTIC_FINDING_KEY_COUNT = VM_GATE_A11_FINDING_KEY_COUNT + len(VM_GATE_R2_NEW_KEYS)
 VM_GATE_R2_FINDING_KEY_COUNT = VM_GATE_R2_SEMANTIC_FINDING_KEY_COUNT + 1
+# R3 closes the same root in the four remaining places the reviewed Step-5/Step-9 gates left a
+# concrete target selectable AFTER approval: the private source record, the fixed VM package
+# destination and its replacement, the Google credential, and the spreadsheet row's operation id.
+# Four semantic keys, none retired, so 90 become 94 and the public surface 95. Derived from the R2
+# constants for the same reason R2 derived from A11: a later revision must not be able to
+# repurpose a count an earlier control still asserts.
+VM_GATE_R3_NEW_KEYS = (
+    "preflight_source_record_not_bound",
+    "preflight_transfer_destination_not_bound",
+    "mapping_google_credential_not_bound",
+    "mapping_operation_id_not_bound",
+)
+VM_GATE_R3_SEMANTIC_FINDING_KEY_COUNT = (VM_GATE_R2_SEMANTIC_FINDING_KEY_COUNT
+                                         + len(VM_GATE_R3_NEW_KEYS))
+VM_GATE_R3_FINDING_KEY_COUNT = VM_GATE_R3_SEMANTIC_FINDING_KEY_COUNT + 1
 # The COMPLETE set of keys an EMPTY document cannot report, because each needs a document that
 # actually contains the landmark it is about. The pre-A11 eleven are carried forward unchanged; A11
 # adds the two step-9/step-10 ambiguity, ordering and heading families, plus the three keys that
@@ -5922,7 +5970,7 @@ VM_GATE_SEMANTIC_FINDING_KEYS = (
     "preflight_substitution_not_denied", "preflight_target_not_bound",
     "preflight_transfer_not_bound", "preflight_vm_not_named", "safety_boundary_ambiguous",
     "safety_boundary_surfaces_incomplete",
-) + VM_GATE_A11_NEW_KEYS + VM_GATE_R2_NEW_KEYS
+) + VM_GATE_A11_NEW_KEYS + VM_GATE_R2_NEW_KEYS + VM_GATE_R3_NEW_KEYS
 # R1 adds exactly one key to the PUBLIC surface -- the reviewed-runbook seal -- and retires none.
 # It is deliberately NOT a member of the semantic surface: the semantic layer cannot report it, and
 # the boundary between "the parser recognised a defect" and "this is not the reviewed document"
@@ -8243,10 +8291,12 @@ VM_GATE_A11_MAPPING_REVIEWED_BLOCK = r"""**Separate current-turn owner approval 
 live operations on the operator PC n8n instance and writes to the intended Google Sheet. Before any
 of it, obtain an explicit current-turn owner approval that names the intended result-mapping
 workflow `n8n-workflows/member_create_uat_result_mapping.workflow.json`, the intended spreadsheet
-and source tab, and the intended n8n instance or environment by its non-secret
-operator-recognisable name. That instance identity is named in that approval itself, and the
-instance URL, connection details and credential values are never written into this runbook. That
-approval binds:
+and source tab, the intended Google credential by its non-secret operator-recognisable
+credential name or identity, the exact non-secret `uat_create_operation_id` whose spreadsheet
+row is to be updated, and the intended n8n instance or environment by its non-secret
+operator-recognisable name. Those identities are named in that approval itself, and the
+instance URL, connection details, credential values, OAuth tokens and API keys are never
+written into this runbook. That approval binds:
 
 - importing and using the local copy of that workflow on the operator PC n8n instance;
 - binding the intended Google credential by name or identity only, never by secret value;
@@ -8309,15 +8359,30 @@ VM_GATE_A11_RECOVERY_AFFIRMATIVE = ("obtain an explicit current-turn owner appro
 # instance": the step's descriptive sentence and its first operation bullet both already say
 # "the operator PC n8n instance", so any token that generic would be satisfied by prose that never
 # requires the approval to identify anything -- which is exactly the accepted defect.
+# R3 adds the two remaining step-9 targets that could still be chosen AFTER approval. The
+# credential one is the sharper of the pair: the operation bullet below already says "binding the
+# intended Google credential by name or identity only", so a token drawn from the BULLET would be
+# satisfied by a gate whose approval never identifies an account at all -- the same trap R2's
+# instance token avoided. Both tokens are therefore the approval clause's own wording.
+VM_GATE_R3_GOOGLE_CREDENTIAL_BINDING = ("the intended google credential by its non-secret"
+                                        " operator-recognisable credential name or identity")
+VM_GATE_R3_OPERATION_ID_BINDING = ("the exact non-secret `uat_create_operation_id` whose"
+                                   " spreadsheet row is to be updated")
 VM_GATE_A11_MAPPING_BINDINGS = (
     ("mapping_workflow_not_bound",
      "n8n-workflows/member_create_uat_result_mapping.workflow.json"),
     ("mapping_spreadsheet_not_bound", "the intended spreadsheet and source tab"),
+    ("mapping_google_credential_not_bound", VM_GATE_R3_GOOGLE_CREDENTIAL_BINDING),
+    ("mapping_operation_id_not_bound", VM_GATE_R3_OPERATION_ID_BINDING),
     ("mapping_n8n_target_not_bound",
      "the intended n8n instance or environment by its non-secret operator-recognisable name"),
 )
-# The R2 required-name clause and the superseded R1 clause it replaces, declared as data so the
-# target-binding controls and the seal-movement control measure exactly the same reviewed change.
+# The reviewed required-name clause at each revision, declared as data so the target-binding
+# controls and the seal-movement control measure exactly the same reviewed changes.
+#
+# These are HISTORICAL and are not rewritten by a later revision: R3 declares its own clause below
+# and derives the rollback chain from them, so the R2 -> R1 step still reproduces the R1 document
+# byte for byte and the retired seals stay provable rather than merely asserted.
 VM_GATE_R2_REVIEWED_NAME_CLAUSE = (
     "workflow `n8n-workflows/member_create_uat_result_mapping.workflow.json`, the intended"
     " spreadsheet\nand source tab, and the intended n8n instance or environment by its non-secret\n"
@@ -8327,6 +8392,44 @@ VM_GATE_R2_REVIEWED_NAME_CLAUSE = (
 VM_GATE_R2_SUPERSEDED_NAME_CLAUSE = (
     "workflow `n8n-workflows/member_create_uat_result_mapping.workflow.json` and the intended"
     " spreadsheet\nand source tab, and binds:")
+# R3's clause. The n8n instance deliberately stays LAST in the list so R2's own reviewed wording
+# survives verbatim inside it: every R2 instance control still measures the exact phrase it was
+# written against, rather than a paraphrase R3 happened to leave behind.
+VM_GATE_R3_REVIEWED_NAME_CLAUSE = (
+    "workflow `n8n-workflows/member_create_uat_result_mapping.workflow.json`, the intended"
+    " spreadsheet\nand source tab, the intended Google credential by its non-secret"
+    " operator-recognisable\ncredential name or identity, the exact non-secret"
+    " `uat_create_operation_id` whose spreadsheet\nrow is to be updated, and the intended n8n"
+    " instance or environment by its non-secret\noperator-recognisable name. Those identities are"
+    " named in that approval itself, and the\ninstance URL, connection details, credential values,"
+    " OAuth tokens and API keys are never\nwritten into this runbook. That approval binds:")
+# The two step-5 clauses R3 rewrites, each paired with the R2 wording it replaces. Together with
+# the step-9 pair above these are the COMPLETE R3 runbook delta, which is what lets the seal
+# control roll the reviewed document back to its exact R2 predecessor.
+VM_GATE_R3_REVIEWED_SOURCE_RECORD_CLAUSE = (
+    "- the bounded access to the selected private form response and its decision row for this"
+    " one\n  package, identified in the approval itself by its non-PII `source_record_id`, which"
+    " a row\n  number alone does not supply; the private field values are never written into this"
+    " runbook;")
+VM_GATE_R3_SUPERSEDED_SOURCE_RECORD_CLAUSE = (
+    "- the bounded access to the selected private form response and its decision row for this"
+    " one\n  package, whose values are never written into this runbook;")
+VM_GATE_R3_REVIEWED_TRANSFER_CLAUSE = (
+    "- the bounded transfer of the approved package to that VM, copying or replacing the fixed"
+    " VM\n  working copy `C:\\XB\\create_uat\\member_create_uat_package.json` that the runner"
+    " always reads;\n  this replacement authority covers that one VM working copy only, never the"
+    " laptop-side\n  package build, which stays strictly no-clobber;")
+VM_GATE_R3_SUPERSEDED_TRANSFER_CLAUSE = (
+    "- the bounded transfer of the approved package to that VM;")
+# Reviewed -> superseded, in one place, so the rollback and the controls cannot drift apart.
+VM_GATE_R3_REVIEWED_CLAUSES = (
+    ("step-5 source record", VM_GATE_R3_REVIEWED_SOURCE_RECORD_CLAUSE,
+     VM_GATE_R3_SUPERSEDED_SOURCE_RECORD_CLAUSE),
+    ("step-5 transfer destination", VM_GATE_R3_REVIEWED_TRANSFER_CLAUSE,
+     VM_GATE_R3_SUPERSEDED_TRANSFER_CLAUSE),
+    ("step-9 required-name clause", VM_GATE_R3_REVIEWED_NAME_CLAUSE,
+     VM_GATE_R2_REVIEWED_NAME_CLAUSE),
+)
 # The reviewed step-9 authority R2 must not weaken: the exact workflow, the spreadsheet/tab, the
 # five bound operations, and the non-reuse and no-further-authority boundaries.
 VM_GATE_R2_PRESERVED_STEP_9_AUTHORITY = (
@@ -8343,8 +8446,10 @@ VM_GATE_R2_PRESERVED_STEP_9_AUTHORITY = (
 )
 # Spellings a private target value would take if one were ever written into the gate. The approval
 # names the instance; the repository never carries its URL, connection value or credential.
+# R3 names a Google credential, so the OAuth spellings of the same reach are added beside them.
 VM_GATE_R2_FORBIDDEN_TARGET_VALUES = ("http://", "https://", "password", "api_key", "apikey",
-                                      "token=", "bearer ", "connectionstring")
+                                      "token=", "bearer ", "connectionstring",
+                                      "client_secret", "refresh_token")
 VM_GATE_A11_MAPPING_OPERATIONS = (
     "importing and using the local copy of that workflow on the operator pc n8n instance",
     "binding the intended google credential by name or identity only, never by secret value",
@@ -8381,6 +8486,7 @@ VM_GATE_A11_RECOVERY_STOP = (
 VM_GATE_A11_MAPPING_UNMET = frozenset((
     "mapping_pre_gate_content", "mapping_gate_text_changed", "mapping_action_text_changed",
     "mapping_workflow_not_bound", "mapping_spreadsheet_not_bound", "mapping_n8n_target_not_bound",
+    "mapping_google_credential_not_bound", "mapping_operation_id_not_bound",
     "mapping_operations_not_bound",
     "mapping_not_current_turn", "mapping_prior_turn_not_denied", "mapping_substitution_not_denied",
     "mapping_stop_boundary_missing",
@@ -8678,6 +8784,15 @@ VM_GATE_A11_MAPPING_MUTATIONS = (
     ("n8n_target_removed", "mapping_n8n_target_not_bound"),
     ("n8n_target_generic_any_instance", "mapping_n8n_target_not_bound"),
     ("n8n_target_generic_operator_pc_prose", "mapping_n8n_target_not_bound"),
+    # R3. The credential and the row are the two step-9 targets still selectable after approval.
+    # Each gets the same treatment the instance got: the requirement struck out, and the generic
+    # wordings that mention the thing without identifying it.
+    ("google_credential_removed", "mapping_google_credential_not_bound"),
+    ("google_credential_generic_intended", "mapping_google_credential_not_bound"),
+    ("google_credential_generic_any", "mapping_google_credential_not_bound"),
+    ("operation_id_removed", "mapping_operation_id_not_bound"),
+    ("operation_id_generic_intended_row", "mapping_operation_id_not_bound"),
+    ("operation_id_generic_operation_id", "mapping_operation_id_not_bound"),
     ("operation_set_removed", "mapping_operations_not_bound"),
     ("generic_authority_substituted", "mapping_not_current_turn"),
     ("prior_turn_denial_removed", "mapping_prior_turn_not_denied"),
@@ -8724,6 +8839,32 @@ VM_GATE_A11_MAPPING_REPLACEMENTS = {
     "n8n_target_generic_operator_pc_prose": (
         "the intended n8n instance or environment by its non-secret\noperator-recognisable name",
         "the operator PC n8n instance"),
+    # R3, credential. Struck out of the required-name clause entirely; the operation bullet that
+    # says "binding the intended Google credential by name or identity only" survives untouched,
+    # which is precisely the shape the binding must refuse to accept as an approval.
+    "google_credential_removed": (
+        "the intended Google credential by its non-secret operator-recognisable\ncredential name"
+        " or identity, ", ""),
+    # The gate's own descriptive wording for the same operation, so "mentioning the credential" is
+    # proved insufficient.
+    "google_credential_generic_intended": (
+        "the intended Google credential by its non-secret operator-recognisable\ncredential name"
+        " or identity", "the intended Google credential"),
+    "google_credential_generic_any": (
+        "the intended Google credential by its non-secret operator-recognisable\ncredential name"
+        " or identity", "any Google credential"),
+    # R3, operation id. Same three shapes. The second replacement is the exact generic phrase the
+    # accepted finding said was insufficient; the third mentions the identifier without requiring
+    # the approval to carry its value.
+    "operation_id_removed": (
+        "the exact non-secret `uat_create_operation_id` whose spreadsheet\nrow is to be updated,"
+        " ", ""),
+    "operation_id_generic_intended_row": (
+        "the exact non-secret `uat_create_operation_id` whose spreadsheet\nrow is to be updated",
+        "the intended row"),
+    "operation_id_generic_operation_id": (
+        "the exact non-secret `uat_create_operation_id` whose spreadsheet\nrow is to be updated",
+        "the operation id"),
     "operation_set_removed": (
         "- running that workflow manually, with the workflow left inactive;\n", ""),
     "generic_authority_substituted": (
@@ -12400,15 +12541,15 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                             % (bullet, number))
 
     def test_a6_control_finding_set_declares_the_action_identities(self):
-        # A6's identities live on the SEMANTIC surface, which R1 leaves at its A11 size and R2
-        # grows by exactly its own declared key.
+        # A6's identities live on the SEMANTIC surface, which R1 leaves at its A11 size and which
+        # R2 and R3 each grow by exactly their own declared keys.
         self.assertEqual(len(VM_GATE_SEMANTIC_FINDING_KEYS),
-                         VM_GATE_R2_SEMANTIC_FINDING_KEY_COUNT,
+                         VM_GATE_R3_SEMANTIC_FINDING_KEY_COUNT,
                          "A6 adds exactly the two reviewed action identities and retires nothing;"
-                         " A11 and R2 each append their own declared keys and retire nothing"
+                         " A11, R2 and R3 each append their own declared keys and retire nothing"
                          " either")
         self.assertEqual(len(set(VM_GATE_SEMANTIC_FINDING_KEYS)),
-                         VM_GATE_R2_SEMANTIC_FINDING_KEY_COUNT)
+                         VM_GATE_R3_SEMANTIC_FINDING_KEY_COUNT)
         self.assertIn(VM_GATE_A6_ACTION_KEYS[VM_GATE_DEPLOY_STEP], VM_GATE_SEMANTIC_FINDING_KEYS)
         self.assertIn(VM_GATE_A6_ACTION_KEYS[VM_GATE_PREFLIGHT_STEP],
                       VM_GATE_SEMANTIC_FINDING_KEYS)
@@ -13698,31 +13839,37 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                          "runbook, so the public guard must report exactly the seal")
 
     def test_a11_control_finding_keys_are_declared_unique_and_reachable(self):
-        # R2 adds exactly its one key on top of the A11 surface and retires none of A11's, so both
-        # the historical A11 total and the current R2 total are asserted rather than one replacing
-        # the other.
+        # Each revision adds its own declared keys on top of the previous surface and retires none,
+        # so every historical total is asserted alongside the current one rather than one replacing
+        # the other. A revision that quietly reused an earlier count would fail here.
         self.assertEqual(len(VM_GATE_A11_NEW_KEYS) + 50, VM_GATE_A11_FINDING_KEY_COUNT,
                          "the historical A11 semantic total must stay truthful")
+        self.assertEqual(VM_GATE_R2_SEMANTIC_FINDING_KEY_COUNT - VM_GATE_A11_FINDING_KEY_COUNT,
+                         len(VM_GATE_R2_NEW_KEYS),
+                         "the historical R2 semantic total must stay truthful")
         self.assertEqual(len(VM_GATE_SEMANTIC_FINDING_KEYS),
-                         VM_GATE_R2_SEMANTIC_FINDING_KEY_COUNT,
-                         "R2 adds exactly its declared key and retires nothing")
+                         VM_GATE_R3_SEMANTIC_FINDING_KEY_COUNT,
+                         "R3 adds exactly its declared keys and retires nothing")
         self.assertEqual(len(set(VM_GATE_SEMANTIC_FINDING_KEYS)),
-                         VM_GATE_R2_SEMANTIC_FINDING_KEY_COUNT,
+                         VM_GATE_R3_SEMANTIC_FINDING_KEY_COUNT,
                          "no semantic finding key may be declared twice")
         # R1: the public surface is the semantic surface plus exactly the seal key.
-        self.assertEqual(len(VM_GATE_FINDING_KEYS), VM_GATE_R2_FINDING_KEY_COUNT,
+        self.assertEqual(len(VM_GATE_FINDING_KEYS), VM_GATE_R3_FINDING_KEY_COUNT,
                          "R1 adds exactly the seal key and retires nothing")
-        self.assertEqual(len(set(VM_GATE_FINDING_KEYS)), VM_GATE_R2_FINDING_KEY_COUNT,
+        self.assertEqual(len(set(VM_GATE_FINDING_KEYS)), VM_GATE_R3_FINDING_KEY_COUNT,
                          "no public finding key may be declared twice")
         self.assertEqual(VM_GATE_R2_FINDING_KEY_COUNT - VM_GATE_R1_FINDING_KEY_COUNT,
                          len(VM_GATE_R2_NEW_KEYS),
                          "R2 must move the public total by exactly its own new keys")
+        self.assertEqual(VM_GATE_R3_FINDING_KEY_COUNT - VM_GATE_R2_FINDING_KEY_COUNT,
+                         len(VM_GATE_R3_NEW_KEYS),
+                         "R3 must move the public total by exactly its own new keys")
         self.assertEqual(set(VM_GATE_FINDING_KEYS) - set(VM_GATE_SEMANTIC_FINDING_KEYS),
                          {REVIEWED_RUNBOOK_SEAL_KEY},
                          "the public/semantic boundary must be exactly the seal key")
         self.assertNotIn(REVIEWED_RUNBOOK_SEAL_KEY, VM_GATE_SEMANTIC_FINDING_KEYS,
                          "the semantic layer must never claim to report the seal")
-        for key in VM_GATE_A11_NEW_KEYS + VM_GATE_R2_NEW_KEYS:
+        for key in VM_GATE_A11_NEW_KEYS + VM_GATE_R2_NEW_KEYS + VM_GATE_R3_NEW_KEYS:
             with self.subTest(key=key):
                 self.assertIn(key, VM_GATE_SEMANTIC_FINDING_KEYS, "%s must be declared" % key)
         self.assertEqual([key for key in VM_GATE_FINDING_KEYS if "four" in key], [],
@@ -14107,26 +14254,45 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
     # This is a target-binding defect, not another CommonMark or command-enumeration one: no parser
     # and no classifier is touched below, and the R1 residuals are left exactly as they are.
 
+    def _r3_supersede(self, base):
+        """``base`` with every R3 reviewed clause rolled back to its R2 wording."""
+        rolled = base
+        for label, reviewed, superseded in VM_GATE_R3_REVIEWED_CLAUSES:
+            self.assertIn(reviewed, rolled, "the base must carry the R3 %s clause" % label)
+            self.assertEqual(rolled.count(reviewed), 1, "the R3 %s clause must be unique" % label)
+            rolled = rolled.replace(reviewed, superseded, 1)
+        self.assertNotEqual(rolled, base, "the R3 rollback must change the document")
+        return rolled
+
     def _r2_supersede(self, base):
-        """``base`` with the R2 required-name clause rolled back to the superseded R1 wording."""
+        """``base`` with the R2 required-name clause rolled back to the superseded R1 wording.
+
+        Applied to an already-R2 document: the R3 clauses must be rolled back first, which is what
+        keeps the R2 -> R1 step reproducing the R1 document byte for byte.
+        """
         self.assertIn(VM_GATE_R2_REVIEWED_NAME_CLAUSE, base,
                       "the base must carry the R2 required-name clause")
         return base.replace(VM_GATE_R2_REVIEWED_NAME_CLAUSE,
                             VM_GATE_R2_SUPERSEDED_NAME_CLAUSE, 1)
 
-    def test_r2_reviewed_gate_binds_all_three_target_classes(self):
-        """The control group: the reviewed step-9 approval names workflow, Sheet AND instance."""
+    def test_r2_reviewed_gate_binds_all_five_target_classes(self):
+        """The control group: the reviewed step-9 approval names every selectable target.
+
+        R2 established the first three; R3 adds the credential and the row's operation id. The
+        exact ordered list is asserted so a later revision cannot drop one silently.
+        """
         self.assertEqual([key for key, _ in VM_GATE_A11_MAPPING_BINDINGS],
                          ["mapping_workflow_not_bound", "mapping_spreadsheet_not_bound",
+                          "mapping_google_credential_not_bound", "mapping_operation_id_not_bound",
                           "mapping_n8n_target_not_bound"],
-                         "step 9 must bind exactly the three reviewed target classes")
+                         "step 9 must bind exactly the five reviewed target classes")
         for base_name, base in self._a11_bases():
             with self.subTest(base=base_name):
                 self.assertNotIn("mapping_n8n_target_not_bound",
                                  _vm_gate_semantic_findings(base),
                                  "the reviewed gate must satisfy the target binding")
         self.assertEqual(vm_gate_findings(self.create_runbook), [],
-                         "the reviewed runbook must clear the public guard under R2")
+                         "the reviewed runbook must clear the public guard under R3")
 
     def test_r2_superseded_two_target_approval_now_fails_closed(self):
         """The accepted defect, restored verbatim: two named targets are no longer sufficient.
@@ -14137,7 +14303,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
         """
         for base_name, base in self._a11_bases():
             with self.subTest(base=base_name):
-                superseded = self._r2_supersede(base)
+                superseded = self._r2_supersede(self._r3_supersede(base))
                 self.assertNotEqual(superseded, base, "the rollback must change the document")
                 findings = _vm_gate_semantic_findings(superseded)
                 self.assertIn("mapping_n8n_target_not_bound", findings,
@@ -14206,14 +14372,16 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                                  "the gate must never carry a private target value")
 
     def test_r2_seal_moved_with_the_reviewed_document_and_retired_the_old_content(self):
-        """The seal moved for exactly one reviewed change, and the superseded content now fails it.
+        """The seal moved with each reviewed change, and every superseded document now fails it.
 
-        Rolling the R2 clause back must reproduce the pre-R2 reviewed content EXACTLY -- proved by
-        its digest equalling the superseded literal -- which is what makes "the seal moved with the
-        document, and only with it" a demonstration rather than an assertion.
+        The rollback runs one revision at a time: R3 -> R2 -> R1. Each step must reproduce that
+        revision's reviewed content EXACTLY, proved by its digest equalling the retired literal,
+        which is what makes "the seal moved with the document, and only with it" a demonstration
+        rather than an assertion -- and it keeps the whole retired chain auditable instead of
+        letting a newer revision quietly drop the older evidence.
         """
-        self.assertNotEqual(REVIEWED_RUNBOOK_SHA256, SUPERSEDED_R1_RUNBOOK_SHA256,
-                            "a substantive reviewed change must move the seal")
+        self.assertEqual(len(set((REVIEWED_RUNBOOK_SHA256,) + SUPERSEDED_RUNBOOK_SHA256S)), 3,
+                         "each substantive reviewed change must have moved the seal")
         independent = hashlib.sha256(
             canonical_seal_text(self.create_runbook).encode("utf-8")).hexdigest()
         self.assertEqual(REVIEWED_RUNBOOK_SHA256, independent,
@@ -14221,12 +14389,18 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                          "the exact reviewed runbook")
         self.assertEqual(reviewed_runbook_seal_findings(self.create_runbook), [],
                          "the exact reviewed runbook must be seal-clean")
-        superseded = self._r2_supersede(self.create_runbook)
+        at_r2 = self._r3_supersede(self.create_runbook)
         self.assertEqual(
-            hashlib.sha256(canonical_seal_text(superseded).encode("utf-8")).hexdigest(),
+            hashlib.sha256(canonical_seal_text(at_r2).encode("utf-8")).hexdigest(),
+            SUPERSEDED_R2_RUNBOOK_SHA256,
+            "the R3 rollback must reproduce the superseded R2 content byte for byte")
+        self._assert_seal_fires(at_r2, "the superseded pre-R3 reviewed content")
+        at_r1 = self._r2_supersede(at_r2)
+        self.assertEqual(
+            hashlib.sha256(canonical_seal_text(at_r1).encode("utf-8")).hexdigest(),
             SUPERSEDED_R1_RUNBOOK_SHA256,
-            "the rollback must reproduce the superseded reviewed content byte for byte")
-        self._assert_seal_fires(superseded, "the superseded pre-R2 reviewed content")
+            "the R2 rollback must reproduce the superseded R1 content byte for byte")
+        self._assert_seal_fires(at_r1, "the superseded pre-R2 reviewed content")
 
     def test_r2_finding_key_is_declared_unique_semantic_only_and_reachable(self):
         """Key integrity for the one key R2 adds, and for the surfaces it sits inside."""
@@ -14270,6 +14444,283 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                          " ".join(str(pattern) for pattern in VM_GATE_A11_PROTECTED_OPERATIONS
                                   ).lower(),
                          "R2 must not add Copy-Item to the protected-operation enumeration")
+
+    # ---- DL-XB-123-001-R3: Step-5 / Step-9 approval target binding ---- #
+    # Accepted post-ready findings PRRT_kwDOSbJI_s6ZRDF2, PRRT_kwDOSbJI_s6ZRDGC and
+    # PRRT_kwDOSbJI_s6ZRDF9. One root cause in three places, plus the same-root neighbour the
+    # bounded inventory found beside them: an approval that names an OPERATION but leaves its
+    # concrete target selectable afterwards binds nothing that matters.
+    #
+    #   step 5  the private source record  -- chosen later by `--row-number <N>`, so one approval
+    #           could reach a different person's private data;
+    #   step 5  the VM package destination -- the runner always reads one fixed path, so every
+    #           transfer after the first REPLACES the previous package, undisclosed;
+    #   step 9  the Google credential      -- selectable after approval, so the workflow could be
+    #           bound under the wrong account identity;
+    #   step 9  the operation id           -- the mapped row is chosen after the terminal result
+    #           exists, so "the intended row" names nothing.
+    #
+    # As with R2 these are target-binding defects only: no parser, no CommonMark case and no
+    # command spelling is added, and the R1 residuals are left exactly as they are.
+
+    def _r3_step5_mutate(self, base, old, new, label):
+        """Rewrite one clause inside the reviewed step-5 gate block."""
+        block = VM_GATE_PREFLIGHT_REVIEWED_BLOCK
+        self.assertIn(block, base, "the base must carry the reviewed step-5 gate block")
+        self.assertIn(old, block, "the reviewed step-5 gate must carry %r" % (old[:48],))
+        return self._a11_replace(base, block, block.replace(old, new, 1), label)
+
+    def _r3_bases(self):
+        return self._a11_bases()
+
+    # -- R3-A: the selected private source record -- #
+    def test_r3_reviewed_step5_binds_the_source_record_identity(self):
+        """The control group: the reviewed step-5 approval carries the non-PII record identity."""
+        self.assertIn(("preflight_source_record_not_bound", VM_GATE_R3_SOURCE_RECORD_BINDING),
+                      VM_GATE_PREFLIGHT_BINDINGS,
+                      "the source-record binding must be declared with its own finding")
+        for base_name, base in self._r3_bases():
+            with self.subTest(base=base_name):
+                self.assertNotIn("preflight_source_record_not_bound",
+                                 _vm_gate_semantic_findings(base),
+                                 "the reviewed gate must satisfy the source-record binding")
+
+    def test_r3_source_record_negative_controls_fail_closed(self):
+        """Removed, row-number-only, and generic "selected row" wording each fail closed.
+
+        The generic case is the decisive one: its replacement leaves the step's own descriptive
+        phrase in place, so a checker that merely looked for "the selected private form response"
+        somewhere in the gate would pass a document whose approval identifies no record at all.
+        """
+        reviewed = ("identified in the approval itself by its non-PII `source_record_id`, which"
+                    " a row\n  number alone does not supply")
+        cases = (
+            ("requirement_removed", ", " + reviewed, ""),
+            ("row_number_only", reviewed, "identified in the approval itself by its row number"),
+            ("generic_selected_row", reviewed, "for the selected row"),
+        )
+        for base_name, base in self._r3_bases():
+            for label, old, new in cases:
+                with self.subTest(base=base_name, wording=label):
+                    degraded = self._r3_step5_mutate(base, old, new, label)
+                    findings = _vm_gate_semantic_findings(degraded)
+                    self.assertIn("preflight_source_record_not_bound", findings,
+                                  "%s must not satisfy the source-record binding" % label)
+                    self.assertNotIn("preflight_private_data_not_bound", findings,
+                                     "the generic private-data binding is still satisfied, so the"
+                                     " control proves the record identity and nothing else")
+        # No real identifier is hard-coded: the approval must supply it at execution time.
+        self.assertNotIn("srcrec_", VM_GATE_PREFLIGHT_REVIEWED_BLOCK.lower(),
+                         "the gate must require the identifier, never carry an actual value")
+
+    # -- R3-B: the fixed VM package destination and its replacement -- #
+    def test_r3_reviewed_step5_binds_the_transfer_destination_and_replacement(self):
+        """The control group, and the laptop no-clobber contract R3 must not weaken."""
+        self.assertIn(("preflight_transfer_destination_not_bound",
+                       VM_GATE_R3_TRANSFER_DESTINATION_BINDING), VM_GATE_PREFLIGHT_BINDINGS,
+                      "the destination binding must be declared with its own finding")
+        for base_name, base in self._r3_bases():
+            with self.subTest(base=base_name):
+                self.assertNotIn("preflight_transfer_destination_not_bound",
+                                 _vm_gate_semantic_findings(base),
+                                 "the reviewed gate must satisfy the destination binding")
+        block = _flat(VM_GATE_PREFLIGHT_REVIEWED_BLOCK).lower()
+        # The replacement authority is scoped to the ONE VM working copy. It must not read as
+        # licence to overwrite the laptop-side build, which stays strictly no-clobber, and it must
+        # not extend to any other path.
+        self.assertIn("this replacement authority covers that one vm working copy only, never the"
+                      " laptop-side package build, which stays strictly no-clobber", block,
+                      "the replacement authority must be scoped and the laptop build protected")
+        self.assertIn("The build is strictly **no-clobber**", self.create_runbook,
+                      "the laptop package-build no-clobber contract must survive R3 unchanged")
+        self.assertIn("**One approval builds exactly one package.**", self.create_runbook,
+                      "the one-approval-one-package contract must survive R3 unchanged")
+        replaceable = [line for line in VM_GATE_PREFLIGHT_REVIEWED_BLOCK.splitlines()
+                       if "copying or replacing" in line.lower()]
+        self.assertEqual(len(replaceable), 1,
+                         "step 5 must grant replacement on exactly one line")
+        self.assertIn("member_create_uat_package.json", "\n".join(replaceable) + block,
+                      "that one line's replacement target must be the package working copy")
+
+    def test_r3_transfer_destination_negative_controls_fail_closed(self):
+        """Path omitted, "bounded transfer" only, path without replacement, replacement without
+        path -- all four fail closed, and the plain transfer binding stays satisfied throughout."""
+        reviewed = ("copying or replacing the fixed VM\n  working copy"
+                    " `C:\\XB\\create_uat\\member_create_uat_package.json` that the runner"
+                    " always reads")
+        cases = (
+            ("destination_omitted", reviewed,
+             "copying or replacing the fixed VM\n  working copy that the runner always reads"),
+            ("bounded_transfer_only",
+             ", " + reviewed + ";\n  this replacement authority covers that one VM working copy"
+             " only, never the laptop-side\n  package build, which stays strictly no-clobber", ""),
+            ("path_without_replacement", reviewed,
+             "transferring to the fixed VM\n  working copy"
+             " `C:\\XB\\create_uat\\member_create_uat_package.json` that the runner always reads"),
+            ("replacement_without_path", reviewed,
+             "copying or replacing the approved package that the runner always reads"),
+        )
+        for base_name, base in self._r3_bases():
+            for label, old, new in cases:
+                with self.subTest(base=base_name, wording=label):
+                    degraded = self._r3_step5_mutate(base, old, new, label)
+                    findings = _vm_gate_semantic_findings(degraded)
+                    self.assertIn("preflight_transfer_destination_not_bound", findings,
+                                  "%s must not satisfy the destination binding" % label)
+                    self.assertNotIn("preflight_transfer_not_bound", findings,
+                                     "the plain transfer binding is still satisfied, so the"
+                                     " control proves the destination and nothing else")
+
+    # -- R3-C / R3-D: the step-9 credential and operation id -- #
+    def test_r3_reviewed_step9_binds_the_credential_and_the_operation_id(self):
+        """The control group for both step-9 additions."""
+        for key, token in (("mapping_google_credential_not_bound",
+                            VM_GATE_R3_GOOGLE_CREDENTIAL_BINDING),
+                           ("mapping_operation_id_not_bound", VM_GATE_R3_OPERATION_ID_BINDING)):
+            self.assertIn((key, token), VM_GATE_A11_MAPPING_BINDINGS,
+                          "%s must be declared with its own token" % key)
+            for base_name, base in self._r3_bases():
+                with self.subTest(base=base_name, key=key):
+                    self.assertNotIn(key, _vm_gate_semantic_findings(base),
+                                     "the reviewed gate must satisfy %s" % key)
+
+    def test_r3_step9_negative_controls_fail_closed(self):
+        """Each step-9 addition, in its three defeat shapes, must report its own finding by name.
+
+        The operation-bullet cases are the decisive ones: the bullets "binding the intended Google
+        credential by name or identity only" and "updating the one intended spreadsheet row
+        selected by `uat_create_operation_id`" both SURVIVE these mutations, so a checker drawing
+        its token from the bullet would pass a gate whose approval binds no identity at all.
+        """
+        expected = {
+            "google_credential_removed": "mapping_google_credential_not_bound",
+            "google_credential_generic_intended": "mapping_google_credential_not_bound",
+            "google_credential_generic_any": "mapping_google_credential_not_bound",
+            "operation_id_removed": "mapping_operation_id_not_bound",
+            "operation_id_generic_intended_row": "mapping_operation_id_not_bound",
+            "operation_id_generic_operation_id": "mapping_operation_id_not_bound",
+        }
+        for base_name, base in self._r3_bases():
+            for name, key in sorted(expected.items()):
+                with self.subTest(base=base_name, mutation=name):
+                    degraded = self._a11_gate_mutate(
+                        base, VM_GATE_A11_MAPPING_REVIEWED_BLOCK,
+                        VM_GATE_A11_MAPPING_REVIEWED_ACTION, name,
+                        VM_GATE_A11_MAPPING_REPLACEMENTS)
+                    findings = _vm_gate_semantic_findings(degraded)
+                    self.assertIn(key, _vm_gate_semantic_findings(degraded),
+                                  "the step-9 %s mutation must report %s" % (name, key))
+                    self.assertNotIn("mapping_operations_not_bound", findings,
+                                     "the operation bullets survive, so the control proves the"
+                                     " approval's own binding and nothing else")
+        # The surviving bullets really are still there, so the point above is demonstrated.
+        for name, bullet in (
+                ("google_credential_removed",
+                 "- binding the intended Google credential by name or identity only, never by"
+                 " secret value;"),
+                ("operation_id_removed",
+                 "- updating the one intended spreadsheet row selected by"
+                 " `uat_create_operation_id`.")):
+            degraded = self._a11_gate_mutate(
+                VM_GATE_A11_FIXTURE, VM_GATE_A11_MAPPING_REVIEWED_BLOCK,
+                VM_GATE_A11_MAPPING_REVIEWED_ACTION, name, VM_GATE_A11_MAPPING_REPLACEMENTS)
+            self.assertIn(bullet, degraded,
+                          "the %s mutation must leave its operation bullet intact" % name)
+        # No real operation id is hard-coded: the approval must supply it at execution time.
+        self.assertNotIn("op_", _flat(VM_GATE_A11_MAPPING_REVIEWED_BLOCK).lower(),
+                         "the gate must require the operation id, never carry an actual value")
+
+    # -- R3: key integrity, preserved authority and containment -- #
+    def test_r3_finding_keys_are_declared_unique_semantic_only_and_reachable(self):
+        """Key integrity for the four keys R3 adds, and for the surfaces they sit inside."""
+        self.assertEqual(len(VM_GATE_R3_NEW_KEYS), 4,
+                         "R3 declares exactly the four keys its Design Lock names")
+        unmet = {"preflight_source_record_not_bound": VM_GATE_PREFLIGHT_UNMET,
+                 "preflight_transfer_destination_not_bound": VM_GATE_PREFLIGHT_UNMET,
+                 "mapping_google_credential_not_bound": VM_GATE_A11_MAPPING_UNMET,
+                 "mapping_operation_id_not_bound": VM_GATE_A11_MAPPING_UNMET}
+        for key in VM_GATE_R3_NEW_KEYS:
+            with self.subTest(key=key):
+                self.assertIn(key, VM_GATE_SEMANTIC_FINDING_KEYS, "%s must be declared" % key)
+                self.assertIn(key, VM_GATE_FINDING_KEYS)
+                self.assertEqual(VM_GATE_SEMANTIC_FINDING_KEYS.count(key), 1,
+                                 "%s must be declared exactly once" % key)
+                self.assertIn(key, unmet[key],
+                              "an unresolvable layout must report %s unmet" % key)
+                self.assertNotIn(key, VM_GATE_A11_NEEDS_A_REAL_DOCUMENT,
+                                 "%s is reportable on an empty document" % key)
+                self.assertIn(key, _vm_gate_semantic_findings(""), "%s must be reachable" % key)
+        self.assertNotIn(REVIEWED_RUNBOOK_SEAL_KEY, VM_GATE_R3_NEW_KEYS,
+                         "the seal key stays public-only and is not an R3 semantic key")
+        # No historical A1-A11, R1 or R2 key is retired by R3.
+        self.assertLess(set(VM_GATE_A11_NEW_KEYS) | set(VM_GATE_R2_NEW_KEYS),
+                        set(VM_GATE_SEMANTIC_FINDING_KEYS),
+                        "R3 must retire no earlier key")
+        self.assertEqual(set(VM_GATE_FINDING_KEYS) - set(VM_GATE_SEMANTIC_FINDING_KEYS),
+                         {REVIEWED_RUNBOOK_SEAL_KEY},
+                         "the public/semantic boundary must still be exactly the seal key")
+
+    def test_r3_preserves_every_existing_step5_and_step9_boundary(self):
+        """R3 adds target classes; it weakens no authority either reviewed gate already carried."""
+        for token in VM_GATE_R2_PRESERVED_STEP_9_AUTHORITY:
+            with self.subTest(preserved=token[:48]):
+                self.assertIn(token, VM_GATE_A11_MAPPING_REVIEWED_BLOCK,
+                              "R3 must preserve the reviewed step-9 authority")
+        for _key, _phrase, fragment in VM_GATE_A4_NEW_BINDINGS:
+            with self.subTest(preserved=fragment[:48]):
+                self.assertIn(fragment, VM_GATE_PREFLIGHT_REVIEWED_BLOCK,
+                              "R3 must preserve the reviewed step-5 A4 bindings")
+        for token in (VM_GATE_PREFLIGHT_STOP, VM_GATE_PRIOR_TURN):
+            with self.subTest(preserved=token[:48]):
+                self.assertIn(token, _flat(VM_GATE_PREFLIGHT_REVIEWED_BLOCK).lower(),
+                              "R3 must preserve the reviewed step-5 boundaries")
+        # The approvals name their targets; the repository never carries a private value. Step 5 is
+        # allowed exactly one password-shaped spelling -- `-PasswordEnvVar`, the NAME of the
+        # environment variable the reviewed gate deliberately binds by name only -- so that one
+        # spelling is excluded there and asserted to be the variable reference and nothing else.
+        step5_allowed = ("password",)
+        for label, block, forbidden_values in (
+                ("step 5", VM_GATE_PREFLIGHT_REVIEWED_BLOCK,
+                 tuple(value for value in VM_GATE_R2_FORBIDDEN_TARGET_VALUES
+                       if value not in step5_allowed)),
+                ("step 9", VM_GATE_A11_MAPPING_REVIEWED_BLOCK,
+                 VM_GATE_R2_FORBIDDEN_TARGET_VALUES)):
+            self.assertIn(block, self.create_runbook,
+                          "the live runbook must carry the reviewed %s gate verbatim" % label)
+            for forbidden in forbidden_values:
+                with self.subTest(forbidden=forbidden, gate=label):
+                    self.assertNotIn(forbidden, block.lower(),
+                                     "the %s gate must never carry a private target value" % label)
+        flat_step5 = _flat(VM_GATE_PREFLIGHT_REVIEWED_BLOCK).lower()
+        self.assertIn("the password environment variable named by `-passwordenvvar`", flat_step5,
+                      "step 5's password mentions must be the variable NAME, never a value")
+        self.assertEqual(flat_step5.count("password"), 2,
+                         "exactly the two spellings of that one variable reference, and no more")
+        for value_shape in ("password:", "password =", "password=", "password is "):
+            with self.subTest(value_shape=value_shape):
+                self.assertNotIn(value_shape, flat_step5,
+                                 "step 5 must never carry a password VALUE")
+
+    def test_r3_leaves_the_r1_structural_residuals_exactly_as_they_were(self):
+        """R3 adds no parser, no CommonMark case and no command spelling either."""
+        self.assertEqual(VM_GATE_R1_TYPE7_OPENERS, ("<template>", "<x-review>", "<x-review />"),
+                         "R3 must add no CommonMark case")
+        self.assertNotIn("copy-item",
+                         " ".join(str(pattern) for pattern in VM_GATE_A11_PROTECTED_OPERATIONS
+                                  ).lower(),
+                         "R3 must not add Copy-Item to the protected-operation enumeration")
+        self.assertEqual(len(VM_GATE_A11_PROTECTED_OPERATIONS), 6,
+                         "R3 must not grow the protected-operation enumeration")
+        # The destructive-cleanup inventory is about operator-directed DELETIONS. Step 5's new
+        # replacement authority is a transfer, not a cleanup, and must not be smuggled in as one.
+        self.assertNotIn("copying or replacing",
+                         " ".join(VM_GATE_A11_DESTRUCTIVE_PHRASES).lower(),
+                         "a package transfer is not an operator-directed destructive cleanup")
+        for base_name, base in self._r3_bases():
+            with self.subTest(base=base_name):
+                self.assertNotIn("destructive_cleanup_not_gated",
+                                 _vm_gate_semantic_findings(base),
+                                 "the reviewed replacement wording must not read as a cleanup")
 
 
 @unittest.skipIf(PS is None, "no PowerShell executable available")

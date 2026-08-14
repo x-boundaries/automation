@@ -213,7 +213,8 @@ not waive the approval for the private-data work. Before any of it, obtain an ex
 current-turn owner approval that names the AutoCount VM (`DESKTOP-4I042L6`) and binds:
 
 - the bounded access to the selected private form response and its decision row for this one
-  package, whose values are never written into this runbook;
+  package, identified in the approval itself by its non-PII `source_record_id`, which a row
+  number alone does not supply; the private field values are never written into this runbook;
 - the local reviewer-decision store and approval-ledger operations and the immutable package
   build they produce;
 - the AutoCount process-environment configuration, by variable name only:
@@ -221,7 +222,10 @@ current-turn owner approval that names the AutoCount VM (`DESKTOP-4I042L6`) and 
   environment variable named by `-PasswordEnvVar`;
 - the intended AutoCount target (the server and database / account book), named in the approval
   itself and never written into this runbook as a connection value or secret;
-- the bounded transfer of the approved package to that VM;
+- the bounded transfer of the approved package to that VM, copying or replacing the fixed VM
+  working copy `C:\XB\create_uat\member_create_uat_package.json` that the runner always reads;
+  this replacement authority covers that one VM working copy only, never the laptop-side
+  package build, which stays strictly no-clobber;
 - the no-write dry-run / preflight operation.
 
 This approval is distinct and is **not** implied by any other gate:
@@ -1022,10 +1026,12 @@ irreversible section, calls `SaveMember` at most once, and never retries.
 live operations on the operator PC n8n instance and writes to the intended Google Sheet. Before any
 of it, obtain an explicit current-turn owner approval that names the intended result-mapping
 workflow `n8n-workflows/member_create_uat_result_mapping.workflow.json`, the intended spreadsheet
-and source tab, and the intended n8n instance or environment by its non-secret
-operator-recognisable name. That instance identity is named in that approval itself, and the
-instance URL, connection details and credential values are never written into this runbook. That
-approval binds:
+and source tab, the intended Google credential by its non-secret operator-recognisable
+credential name or identity, the exact non-secret `uat_create_operation_id` whose spreadsheet
+row is to be updated, and the intended n8n instance or environment by its non-secret
+operator-recognisable name. Those identities are named in that approval itself, and the
+instance URL, connection details, credential values, OAuth tokens and API keys are never
+written into this runbook. That approval binds:
 
 - importing and using the local copy of that workflow on the operator PC n8n instance;
 - binding the intended Google credential by name or identity only, never by secret value;
