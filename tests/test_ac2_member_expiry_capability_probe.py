@@ -4169,20 +4169,47 @@ REVIEWED_RUNBOOK_SEAL_KEY = "reviewed_runbook_seal_mismatch"
 # SHA-256 of docs/autocount2-automation/member_create_uat_runbook.md at the reviewed head, over the
 # UTF-8 bytes of its line-ending-normalised text.
 #
-# The seal moves ONLY with a reviewed change to the sealed document, and it moved here for exactly
-# the R3 Step-5/Step-9 target-binding corrections: the selected private source record, the fixed VM
-# package destination and its replacement, the Google credential identity and the spreadsheet row's
-# operation id. Canonicalisation is unchanged, the constant stays a literal, and the controls below
-# prove the new value against an independently computed digest and prove that BOTH superseded
-# reviewed documents no longer satisfy it.
-REVIEWED_RUNBOOK_SHA256 = "daaf2b144a1ed7e36cf7b886b0dd350a559f966279a909fcd4a67f43e3674759"
+# The seal moves ONLY with a reviewed change to the sealed document. It moved at R3 for the
+# Step-5/Step-9 target-binding corrections (the selected private source record, the fixed VM package
+# destination and its replacement, the Google credential identity and the spreadsheet row's
+# operation id), and it moves here at R4 for exactly one reviewed statement: the POSIX platform-
+# support row named `tmpfs` and `ramfs` as SUPPORTED for decision state that claims restart
+# durability. Those filesystems are memory-backed, so the store now refuses them and the row would
+# otherwise be false. Canonicalisation is unchanged, the constant stays a literal, and the controls
+# below prove the new value against an independently computed digest and prove that EVERY superseded
+# reviewed document no longer satisfies it.
+REVIEWED_RUNBOOK_SHA256 = "1421d1f5dad91a7c28fc61e2daf0b9398d1645a943640660b39ebc275724f1bb"
 # The retired reviewed digests, kept so the seal's movement stays provable rather than asserted:
 # rolling the reviewed clauses back one revision at a time must reproduce each of these documents
-# byte for byte, and neither may satisfy the current seal. R1 is retained from the previous
-# revision rather than dropped, so the whole chain remains auditable.
+# byte for byte, and none may satisfy the current seal. Earlier revisions are RETAINED rather than
+# recomputed or dropped, so the whole chain remains auditable: R4 rolls back to the exact R3
+# document, which rolls back to R2, which rolls back to R1.
 SUPERSEDED_R1_RUNBOOK_SHA256 = "56f5a081145cb80719d2dec5e603381e7d8cbfbfcfeb6019e5cee59d7c564bce"
 SUPERSEDED_R2_RUNBOOK_SHA256 = "cf5e4011371717268915f614fd90e8b81e6a65ee1227a3a694e4c0f368f38b42"
-SUPERSEDED_RUNBOOK_SHA256S = (SUPERSEDED_R1_RUNBOOK_SHA256, SUPERSEDED_R2_RUNBOOK_SHA256)
+SUPERSEDED_R3_RUNBOOK_SHA256 = "daaf2b144a1ed7e36cf7b886b0dd350a559f966279a909fcd4a67f43e3674759"
+SUPERSEDED_RUNBOOK_SHA256S = (SUPERSEDED_R1_RUNBOOK_SHA256, SUPERSEDED_R2_RUNBOOK_SHA256,
+                              SUPERSEDED_R3_RUNBOOK_SHA256)
+
+# R4's single reviewed statement, paired with the exact R3 wording it superseded, in one place so
+# the rollback control and the reviewed document cannot drift apart. Text only: nothing here reads
+# the repository, so the seal path stays pure.
+DURABLE_FILESYSTEM_R4_REVIEWED_ROW = (
+    "| POSIX | Linux local **persistent** filesystems on one device from `/` (`ext2/3/4`, `xfs`,"
+    " `btrfs`, `zfs`, `f2fs`, `jfs`, `reiserfs`, `bcachefs`, `ubifs`, `overlay`) | every other or"
+    " **unprovable** filesystem, including the memory-backed `tmpfs` and `ramfs` (whose contents do"
+    " not survive a restart, so `fsync` there cannot support the restart-safe single-use boundary),"
+    " `nfs`, `cifs`/`smb*`, `9p`, `ceph`, `glusterfs`, `lustre`, FUSE remotes and WebDAV; any device"
+    " transition | descriptor-relative walking with `O_DIRECTORY` plus `O_NOFOLLOW` and `dir_fd`,"
+    " and exclusive create, `link`, `unlink` and the parent `fsync` through the verified descriptor |"
+)
+DURABLE_FILESYSTEM_R4_SUPERSEDED_ROW = (
+    "| POSIX | Linux local filesystems on one device from `/` (`ext2/3/4`, `xfs`, `btrfs`, `zfs`,"
+    " `f2fs`, `jfs`, `reiserfs`, `bcachefs`, `ubifs`, `tmpfs`, `ramfs`, `overlay`) | every other or"
+    " **unprovable** filesystem, including `nfs`, `cifs`/`smb*`, `9p`, `ceph`, `glusterfs`,"
+    " `lustre`, FUSE remotes and WebDAV; any device transition | descriptor-relative walking with"
+    " `O_DIRECTORY` plus `O_NOFOLLOW` and `dir_fd`, and exclusive create, `link`, `unlink` and the"
+    " parent `fsync` through the verified descriptor |"
+)
 
 
 # The seal path must reach nothing but its argument. These are the names whose presence anywhere in
@@ -5209,7 +5236,7 @@ Platform support is a narrow, closed boundary:
 | Platform | Supported | Refused fail-closed | Mechanism |
 | --- | --- | --- | --- |
 | Windows | fixed local **NTFS** drive-letter volume (`GetDriveTypeW == DRIVE_FIXED`, `GetVolumeInformationW` name `NTFS`) | UNC paths, mapped drives, remote/removable/CD-ROM/RAM/unknown drive classes, non-NTFS volumes, any reparse component, volume-query failures | pathname-based ordered classification; identity from the volume serial and file index |
-| POSIX | Linux local filesystems on one device from `/` (`ext2/3/4`, `xfs`, `btrfs`, `zfs`, `f2fs`, `jfs`, `reiserfs`, `bcachefs`, `ubifs`, `tmpfs`, `ramfs`, `overlay`) | every other or **unprovable** filesystem, including `nfs`, `cifs`/`smb*`, `9p`, `ceph`, `glusterfs`, `lustre`, FUSE remotes and WebDAV; any device transition | descriptor-relative walking with `O_DIRECTORY` plus `O_NOFOLLOW` and `dir_fd`, and exclusive create, `link`, `unlink` and the parent `fsync` through the verified descriptor |
+| POSIX | Linux local **persistent** filesystems on one device from `/` (`ext2/3/4`, `xfs`, `btrfs`, `zfs`, `f2fs`, `jfs`, `reiserfs`, `bcachefs`, `ubifs`, `overlay`) | every other or **unprovable** filesystem, including the memory-backed `tmpfs` and `ramfs` (whose contents do not survive a restart, so `fsync` there cannot support the restart-safe single-use boundary), `nfs`, `cifs`/`smb*`, `9p`, `ceph`, `glusterfs`, `lustre`, FUSE remotes and WebDAV; any device transition | descriptor-relative walking with `O_DIRECTORY` plus `O_NOFOLLOW` and `dir_fd`, and exclusive create, `link`, `unlink` and the parent `fsync` through the verified descriptor |
 
 The filesystem type is proven from `/proc/self/mountinfo` by longest-mount-point match. An
 unrecognised type, or one that cannot be determined at all, is **unsupported** — the allowlist is
@@ -14264,6 +14291,21 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
         self.assertNotEqual(rolled, base, "the R3 rollback must change the document")
         return rolled
 
+    def _r4_supersede(self, base):
+        """``base`` with R4's reviewed platform-support row rolled back to its R3 wording.
+
+        Applied FIRST, so the R4 -> R3 step reproduces the R3 document byte for byte and the older
+        R3 -> R2 -> R1 steps keep reproducing the documents their retired digests already record.
+        """
+        self.assertIn(DURABLE_FILESYSTEM_R4_REVIEWED_ROW, base,
+                      "the base must carry the R4 reviewed platform-support row")
+        self.assertEqual(base.count(DURABLE_FILESYSTEM_R4_REVIEWED_ROW), 1,
+                         "the R4 reviewed platform-support row must be unique")
+        rolled = base.replace(DURABLE_FILESYSTEM_R4_REVIEWED_ROW,
+                              DURABLE_FILESYSTEM_R4_SUPERSEDED_ROW, 1)
+        self.assertNotEqual(rolled, base, "the R4 rollback must change the document")
+        return rolled
+
     def _r2_supersede(self, base):
         """``base`` with the R2 required-name clause rolled back to the superseded R1 wording.
 
@@ -14374,13 +14416,13 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
     def test_r2_seal_moved_with_the_reviewed_document_and_retired_the_old_content(self):
         """The seal moved with each reviewed change, and every superseded document now fails it.
 
-        The rollback runs one revision at a time: R3 -> R2 -> R1. Each step must reproduce that
-        revision's reviewed content EXACTLY, proved by its digest equalling the retired literal,
-        which is what makes "the seal moved with the document, and only with it" a demonstration
-        rather than an assertion -- and it keeps the whole retired chain auditable instead of
-        letting a newer revision quietly drop the older evidence.
+        The rollback runs one revision at a time: R4 -> R3 -> R2 -> R1. Each step must reproduce
+        that revision's reviewed content EXACTLY, proved by its digest equalling the retired
+        literal, which is what makes "the seal moved with the document, and only with it" a
+        demonstration rather than an assertion -- and it keeps the whole retired chain auditable
+        instead of letting a newer revision quietly drop or recompute the older evidence.
         """
-        self.assertEqual(len(set((REVIEWED_RUNBOOK_SHA256,) + SUPERSEDED_RUNBOOK_SHA256S)), 3,
+        self.assertEqual(len(set((REVIEWED_RUNBOOK_SHA256,) + SUPERSEDED_RUNBOOK_SHA256S)), 4,
                          "each substantive reviewed change must have moved the seal")
         independent = hashlib.sha256(
             canonical_seal_text(self.create_runbook).encode("utf-8")).hexdigest()
@@ -14389,7 +14431,13 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                          "the exact reviewed runbook")
         self.assertEqual(reviewed_runbook_seal_findings(self.create_runbook), [],
                          "the exact reviewed runbook must be seal-clean")
-        at_r2 = self._r3_supersede(self.create_runbook)
+        at_r3 = self._r4_supersede(self.create_runbook)
+        self.assertEqual(
+            hashlib.sha256(canonical_seal_text(at_r3).encode("utf-8")).hexdigest(),
+            SUPERSEDED_R3_RUNBOOK_SHA256,
+            "the R4 rollback must reproduce the superseded R3 content byte for byte")
+        self._assert_seal_fires(at_r3, "the superseded pre-R4 reviewed content")
+        at_r2 = self._r3_supersede(at_r3)
         self.assertEqual(
             hashlib.sha256(canonical_seal_text(at_r2).encode("utf-8")).hexdigest(),
             SUPERSEDED_R2_RUNBOOK_SHA256,

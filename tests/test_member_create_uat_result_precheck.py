@@ -1,5 +1,6 @@
 import io
 import json
+import shutil
 import sys
 import tempfile
 import unittest
@@ -174,6 +175,64 @@ class ResultPrecheckTests(unittest.TestCase):
             self._write(result)
             _, out = run(["--result-json", str(self.result_path)])
             self.assertIn("terminal_code_valid = true", out, code_value)
+
+
+class StrictBooleanFlagPrecheckTests(unittest.TestCase):
+    """Closed-PR #113 finding PRRT_kwDOSbJI_s6UdzWO, at the precheck surface.
+
+    A staged result carrying a non-boolean state flag previously produced
+    `status = ok` for an otherwise valid CREATED_VERIFIED result, because Python coerced the
+    nonempty string "false" to True. Every substitute must now be refused.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.result_path = self.tmp / "member_create_uat_result.json"
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _run(self, **overrides):
+        result, _ = sample_result(**overrides)
+        self.result_path.write_text(json.dumps(result), encoding="utf-8")
+        return run(["--result-json", str(self.result_path)])
+
+    def test_the_originating_expiry_date_assigned_string_is_refused(self):
+        code, out = self._run(expiry_date_assigned="false")
+        self.assertEqual(code, 2, out)
+        self.assertIn("status = needs_fix", out)
+        self.assertIn("terminal_code_recomputed_ok = false", out)
+        self.assertNotIn("state_contradiction_count = 0", out)
+
+    def test_every_substitute_type_is_refused(self):
+        for substitute in ("false", "true", "", 0, 1, 0.0, None, [], {}):
+            with self.subTest(substitute=repr(substitute)):
+                code, out = self._run(expiry_date_assigned=substitute)
+                self.assertEqual(code, 2, out)
+                self.assertIn("status = needs_fix", out)
+
+    def test_same_root_boolean_flags_are_refused_too(self):
+        for name in ("readback_match", "readback_found", "lock_acquired", "write_confirmed",
+                     "business_confirmed", "save_member_attempted", "save_member_confirmed",
+                     "package_structural_valid", "package_fingerprint_problem",
+                     "approval_not_expired", "execution_error", "member_exists_initial",
+                     "member_exists_recheck"):
+            with self.subTest(flag=name):
+                code, out = self._run(**{name: "false"})
+                self.assertEqual(code, 2, out)
+                self.assertIn("status = needs_fix", out)
+
+    def test_a_clean_boolean_result_is_still_accepted(self):
+        """The preserved contract: real booleans keep passing exactly as before."""
+        code, out = self._run()
+        self.assertEqual(code, 0, out)
+        self.assertIn("status = ok", out)
+        self.assertIn("terminal_code_recomputed_ok = true", out)
+
+    def test_no_flag_value_is_echoed_into_the_aggregate_evidence(self):
+        code, out = self._run(expiry_date_assigned="MEMBER-90000001-SYNTHETIC")
+        self.assertEqual(code, 2, out)
+        self.assertNotIn("MEMBER-90000001-SYNTHETIC", out)
 
 
 if __name__ == "__main__":

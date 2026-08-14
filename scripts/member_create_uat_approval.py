@@ -96,6 +96,11 @@ EXIT_DECISION_NOT_AUTHORITATIVE = 10
 #  11  nothing claimed and nothing published: the exclusive build claim was not committed, so
 #      the approval was NOT consumed and a later explicit (never automatic) retry is allowed
 EXIT_BUILD_CLAIM_NOT_RECORDED = 11
+#  12  published, but the OUTPUT-DIRECTORY entry for the final package could not be confirmed
+#      durable, so a crash may lose the package while the reservation and claim have already
+#      consumed the approval. The package is never removed and the approval is never reopened;
+#      recovery is a fresh reviewer decision or a controlled reconciliation.
+EXIT_PUBLICATION_DURABILITY_UNCONFIRMED = 12
 
 # Amendment 9: whether a NEW store file exists is now reported from the store module's explicit
 # final-path classifier rather than inferred from a reason list. Both states below mean THIS
@@ -463,12 +468,48 @@ def resolve_source_row(input_path, decision_rows_path, row_number):
 # Ledger
 # --------------------------------------------------------------------------- #
 def append_ledger(ledger_path, entry):
+    """Append ONE audit record durably, including a newly created ledger DIRECTORY ENTRY.
+
+    Append-only: the record is written with ``"a"``, and nothing here truncates, rewrites,
+    replaces or repairs an existing ledger.
+
+    Durable: the bytes are flushed and fsynced. On the FIRST append the ledger pathname does
+    not exist yet, and a file fsync persists only the bytes - it makes no promise that the new
+    NAME survives a crash, because that name lives in the parent directory's metadata. The
+    reviewer-decision writer commits the authoritative activation on the strength of this call
+    returning, so a new ledger's directory entry (and every directory this call had to create
+    to hold it) is committed with the repository's existing platform durability primitive
+    BEFORE the append is reported as confirmed.
+
+    Fail-closed: an ``OSError`` from that durability step propagates exactly like a write or
+    fsync failure, so the caller leaves the decision pending and non-authoritative instead of
+    activating it against an audit event that may not exist after a restart. Nothing is
+    retried, repaired or rolled back.
+    """
     ledger_path = contract.assert_safe_local_path(ledger_path)
-    ledger_path.parent.mkdir(parents=True, exist_ok=True)
+    parent = ledger_path.parent
+    # The directories this call is about to bring into existence, shallowest first. A newly
+    # created ledger's entry is only as durable as the directories that hold it, so each new
+    # link in that chain is committed too. A single direct lookup per component: no directory
+    # is ever listed, globbed or swept.
+    pending_dirs = []
+    probe = parent
+    while not probe.exists():
+        pending_dirs.append(probe)
+        if probe.parent == probe:
+            break
+        probe = probe.parent
+    pending_dirs.reverse()
+    ledger_is_new = not os.path.lexists(ledger_path)
+    parent.mkdir(parents=True, exist_ok=True)
     with open(ledger_path, "a", encoding="utf-8") as handle:
         handle.write(json.dumps(entry, sort_keys=True) + "\n")
         handle.flush()
         os.fsync(handle.fileno())
+    if ledger_is_new:
+        for directory in pending_dirs:
+            _fsync_parent_directory(directory.parent)
+        _fsync_parent_directory(parent)
     # The private marker is advisory only; its failure must never fail a durable ledger
     # append (and, at the package writer, must never mask a temporary-cleanup failure).
     try:
@@ -1496,6 +1537,9 @@ def cmd_build_package(args):
         "reservation": "confirmed_durable",
         "reservation_basename": reservation_basename,
         "reservation_durability": result.reservation_durability,
+        # The output-directory durability mode actually achieved for the final package entry,
+        # reported rather than assumed (the unconfirmed branch below overrides it explicitly).
+        "publication_durability": result.publication_durability,
         "build_claim": "committed",
         "claim_id": claim_record["claim_id"],
         "source_record_id": srid,
@@ -1504,6 +1548,35 @@ def cmd_build_package(args):
         "package_file_name": package_file_name,
         "expiry_date_in_payload": True,
     }
+
+    if result.state == _PublishState.PUBLISHED_DURABILITY_UNCONFIRMED:
+        # The final hard link exists but its output-directory entry was never confirmed durable,
+        # so ordinary success is impossible: a restart could lose the package while the durable
+        # reservation and the committed claim have permanently consumed the approval. The
+        # published package is NOT deleted, truncated, renamed or modified, no build event
+        # claims a clean publication, the consumed approval is never reopened to mint another
+        # package, and nothing sweeps the output directory.
+        _print_summary(
+            dict(
+                published_common,
+                status="publication_durability_unconfirmed",
+                event="none",
+                publication="published_durability_unconfirmed",
+                publication_durability="unconfirmed",
+                ledger_record="not_attempted",
+                temp_cleanup="failed" if result.temp_stale else "complete",
+                stale_temp_basename=result.temp_basename if result.temp_stale else None,
+                manual_cleanup_required=bool(result.temp_stale),
+                published_package_preserved=True,
+                do_not_retry=True,
+                approval_blocked=True,
+                fresh_approval_required=True,
+                controlled_recovery_required=True,
+                failure_stage="published_package_directory_durability",
+                recovery="fresh_approval_or_controlled_recovery",
+            )
+        )
+        return EXIT_PUBLICATION_DURABILITY_UNCONFIRMED
 
     if result.state == _PublishState.PUBLISHED_CLEANUP_COMPLETE:
         ledger_error = _append_build_event(
@@ -1543,6 +1616,7 @@ def cmd_build_package(args):
                 "reservation": "confirmed_durable",
                 "reservation_basename": reservation_basename,
                 "reservation_durability": result.reservation_durability,
+                "publication_durability": result.publication_durability,
                 "build_claim": "committed",
                 "claim_id": claim_record["claim_id"],
                 "claim_durability": "transactional_commit_synchronous_full",
@@ -1906,11 +1980,16 @@ class _PublishState:
     ``RESERVED_NOT_PUBLISHED`` the reservation is durable but publication failed. Nothing
                                was published, yet the approval is permanently blocked.
     ``PUBLISHED_*``            the final package exists and is never rolled back.
+
+    ``PUBLISHED_DURABILITY_UNCONFIRMED`` additionally means the final hard link was created but
+    its OUTPUT-DIRECTORY entry could not be confirmed durable, so a clean published package
+    must not be claimed even though the package is present and is never removed.
     """
 
     NOT_PUBLISHED = "not_published"
     RESERVATION_FAILED = "reservation_failed"
     RESERVED_NOT_PUBLISHED = "reserved_not_published"
+    PUBLISHED_DURABILITY_UNCONFIRMED = "published_durability_unconfirmed"
     PUBLISHED_CLEANUP_COMPLETE = "published_cleanup_complete"
     PUBLISHED_CLEANUP_INCOMPLETE = "published_cleanup_incomplete"
 
@@ -1921,7 +2000,8 @@ class _PublishResult:
     ``PUBLISHED_CLEANUP_INCOMPLETE`` / stale-temp states."""
 
     def __init__(self, state, temp_basename=None, cause=None, cleanup_error=None,
-                 reservation_state=None, reservation_durability=None):
+                 reservation_state=None, reservation_durability=None,
+                 publication_durability=None):
         self.state = state
         self.temp_basename = temp_basename        # sanitised, PII-free basename or None
         self.cause = cause                        # original pre-publication failure (NOT_PUBLISHED)
@@ -1929,6 +2009,9 @@ class _PublishResult:
         self.temp_stale = cleanup_error is not None  # an operation-owned temp remains
         self.reservation_state = reservation_state          # not_created | uncertain | None
         self.reservation_durability = reservation_durability  # achieved durability mode
+        # The output-directory durability mode actually achieved for the final link, or None
+        # when it was never confirmed. Reported, never assumed.
+        self.publication_durability = publication_durability
 
 
 def _assert_final_path_absent(out_path):
@@ -1968,10 +2051,21 @@ def _write_package_atomically(package_out, package, reserve):
     most a stray temporary (never a partial FINAL package). No fallback to progressive
     writing at the final path.
 
+    Durable publication: ``os.link`` makes the final name VISIBLE, but the new directory
+    entry lives in the output directory's metadata, which the temporary's own fsync does not
+    cover. The output directory is therefore committed with the platform durability primitive
+    immediately after linking, and again after the temporary is unlinked, so an exit-0 clean
+    publication never claims a directory state whose durability was never confirmed. A failure
+    to confirm it is the explicit ``PUBLISHED_DURABILITY_UNCONFIRMED`` non-success state: the
+    published package is still never deleted, truncated, renamed or modified, and the consumed
+    reservation/claim is never reopened to mint another package.
+
     Truthful cleanup: after resolving publication, exactly the ONE operation-owned
     temporary path is unlinked. A failed unlink is NOT swallowed - it is reported so the
-    caller emits a nonzero cleanup-incomplete terminal result rather than false success.
-    Never sweeps other ``.mcuat_pkg_*`` files, and never removes a reservation.
+    caller emits a nonzero cleanup-incomplete terminal result rather than false success. An
+    unlink that succeeded but whose directory durability could not be confirmed is reported the
+    same way, because the removal may not survive a restart. Never sweeps other
+    ``.mcuat_pkg_*`` files, and never removes a reservation.
     """
     out_path = contract.assert_safe_local_path(package_out)
     _assert_final_path_absent(out_path)
@@ -2020,6 +2114,20 @@ def _write_package_atomically(package_out, package, reserve):
         )
         cause.__cause__ = error
 
+    # Commit the FINAL LINK's directory entry before any clean publication can be claimed. The
+    # temporary's fsync persisted the inode's bytes; the new final NAME is directory metadata,
+    # which a crash can lose while the reservation and claim have permanently consumed the
+    # approval. Kept outside the publication try above so a durability failure can never be
+    # reported as a link/write failure, and so `published` stays true: the package exists and is
+    # never rolled back.
+    publication_durability = None
+    durability_error = None
+    if published:
+        try:
+            publication_durability = _fsync_parent_directory(out_path.parent)
+        except OSError as error:
+            durability_error = error
+
     # Attempt cleanup of ONLY the operation-owned temporary path, in every case. Never
     # touch the final/competing path, another temporary, or any reservation. A failed unlink
     # is recorded (not swallowed) so the outcome stays truthful.
@@ -2028,6 +2136,16 @@ def _write_package_atomically(package_out, package, reserve):
         os.unlink(temp_name)
     except OSError as unlink_err:
         cleanup_error = unlink_err
+    else:
+        if published:
+            # The unlink itself succeeded, but until the output directory is committed again the
+            # removal may not survive a restart, so the temporary could reappear. Recorded as a
+            # cleanup failure - the same truthful, manual-cleanup-required direction - rather
+            # than reported as a completed cleanup.
+            try:
+                _fsync_parent_directory(out_path.parent)
+            except OSError as unlink_durability_err:
+                cleanup_error = unlink_durability_err
 
     if reservation_error is not None:
         # RESERVATION_FAILED: no final path was created, so no competitor was touched. An
@@ -2054,12 +2172,21 @@ def _write_package_atomically(package_out, package, reserve):
         _write_private_marker(out_path.parent)
     except OSError:
         pass
+    if durability_error is not None:
+        # The final link exists but its output-directory entry was never confirmed durable, so
+        # no clean publication is claimed. The package is left exactly as it is, the consumed
+        # reservation and claim are untouched, and nothing is swept.
+        return _PublishResult(_PublishState.PUBLISHED_DURABILITY_UNCONFIRMED,
+                              temp_basename=temp_basename, cause=durability_error,
+                              cleanup_error=cleanup_error, reservation_durability=durability)
     if cleanup_error is None:
         return _PublishResult(_PublishState.PUBLISHED_CLEANUP_COMPLETE,
-                              reservation_durability=durability)
+                              reservation_durability=durability,
+                              publication_durability=publication_durability)
     return _PublishResult(_PublishState.PUBLISHED_CLEANUP_INCOMPLETE,
                           temp_basename=temp_basename, cleanup_error=cleanup_error,
-                          reservation_durability=durability)
+                          reservation_durability=durability,
+                          publication_durability=publication_durability)
 
 
 def cmd_validate_package(args):

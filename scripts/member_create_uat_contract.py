@@ -194,13 +194,75 @@ TERMINAL_STATE_FLAGS = (
     "assigned_field_count",
 )
 
+# The exact BOOLEAN-VALUED subset of TERMINAL_STATE_FLAGS. Named explicitly (not inferred)
+# so the Python precheck and the n8n validation code enforce the identical set, and so the
+# boolean contract is greppable and testable rather than implied by each read site.
+#
+# Every flag below is a two-state fact the terminal-state table reads through a truth test.
+# Python's `bool()` and JavaScript's `!!` accept far more than a boolean: the nonempty string
+# "false" is truthy in both, so a malformed or tampered sanitized result could satisfy an
+# ExpiryDate-assignment or read-back proof it never earned. Each of these fields is therefore
+# required to be an ACTUAL JSON/Python boolean before any coercion, terminal-state
+# recomputation or authority decision happens.
+TERMINAL_STATE_BOOLEAN_FLAGS = (
+    "package_fingerprint_problem",
+    "package_structural_valid",
+    "approval_not_expired",
+    "write_confirmed",
+    "business_confirmed",
+    "lock_acquired",
+    "execution_error",
+    "member_exists_initial",
+    "member_exists_recheck",
+    "save_member_attempted",
+    "save_member_confirmed",
+    "readback_found",
+    "readback_match",
+    "expiry_date_assigned",
+)
+
+# The remainder of TERMINAL_STATE_FLAGS, whose existing enum/string/integer contracts are
+# unchanged: `mode`, `recovery_state` and `save_outcome` are validated against their closed
+# vocabularies, and `assigned_field_count` against EXPECTED_ASSIGNED_FIELD_COUNT. Declared so
+# the boolean subset above is provably exhaustive rather than a hand-maintained guess.
+TERMINAL_STATE_NON_BOOLEAN_FLAGS = (
+    "mode",
+    "recovery_state",
+    "save_outcome",
+    "assigned_field_count",
+)
+
+
+def terminal_state_boolean_type_violations(flags):
+    """Reasons naming each PRESENT boolean-valued flag that is not a real boolean.
+
+    A flag key that is absent is left to the ordinary table below, where a missing proof is
+    already falsy and therefore fail-closed. A flag that IS present must be a genuine boolean:
+    strings (including "false" and "true"), numbers, ``None``/JSON null, arrays and objects are
+    all refused rather than coerced, because coercion is exactly how a non-boolean substitute
+    became authority.
+
+    Only the fixed flag identity is reported; no value is ever echoed.
+    """
+    return [
+        f"{name}_not_boolean"
+        for name in TERMINAL_STATE_BOOLEAN_FLAGS
+        if name in flags and not isinstance(flags[name], bool)
+    ]
+
 
 def terminal_state_contradictions(flags):
     """Return a list of impossible-flag reasons; empty means internally consistent.
 
     A recognised terminal code paired with a physically impossible flag combination
     is rejected here (finding 4), independent of the recomputed code.
+
+    The strict boolean-type gate runs FIRST and returns immediately, so no ``bool()`` call
+    below ever observes a non-boolean substitute for a two-state proof.
     """
+    type_violations = terminal_state_boolean_type_violations(flags)
+    if type_violations:
+        return type_violations
     reasons = []
     mode = flags.get("mode")
     write = mode == "write"
@@ -261,8 +323,15 @@ def recompute_terminal_state(flags):
     The ordered rules mirror the runner's gate order exactly, so the runner can
     derive its own terminal_code from this function, the result precheck can
     recompute-and-compare, and the n8n validation code can apply the same table.
+
+    When a boolean-valued flag is not a real boolean, NO code is derived: the return is
+    ``(None, reasons)``. Returning a plausible code from unvalidated flags would be the very
+    coercion this gate exists to prevent, and ``None`` can never equal a stored terminal code,
+    so a caller comparing the two cannot accidentally accept it.
     """
     contradictions = terminal_state_contradictions(flags)
+    if terminal_state_boolean_type_violations(flags):
+        return None, contradictions
     write = flags.get("mode") == "write"
     recovery = flags.get("recovery_state", "none")
     outcome = flags.get("save_outcome", "not_attempted")

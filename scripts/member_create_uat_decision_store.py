@@ -765,11 +765,23 @@ WINDOWS_REQUIRED_FILESYSTEM = "NTFS"
 # Local Linux filesystems this contract supports. The list is an ALLOWLIST on purpose: an
 # unrecognised or unprovable type refuses rather than silently weakening the durability and
 # identity guarantees the admission fact asserts.
+#
+# `tmpfs` and `ramfs` are deliberately ABSENT (see POSIX_VOLATILE_FILESYSTEMS below).
 POSIX_SUPPORTED_FILESYSTEMS = frozenset({
     "ext2", "ext3", "ext4", "ext4dev",
     "xfs", "btrfs", "zfs", "f2fs", "jfs", "reiserfs", "bcachefs", "ubifs",
-    "tmpfs", "ramfs", "overlay", "overlayfs",
+    "overlay", "overlayfs",
 })
+
+# Memory-backed filesystems whose entire contents are destroyed by a restart. `fsync` on these
+# can return successfully while guaranteeing nothing across a reboot, so admitting one would let
+# the store record a durability primitive it does not have: a reboot could erase activated
+# decisions, build claims and reservations while a package published to a persistent filesystem
+# survives, defeating the documented restart-safe single-use boundary. They are refused by the
+# ordinary `store_parent_unsupported` classification (absence from the allowlist above is what
+# actually refuses them); this set names the class so the runbook and the tests can state the
+# refusal explicitly rather than by omission.
+POSIX_VOLATILE_FILESYSTEMS = frozenset({"tmpfs", "ramfs"})
 
 # Named only so the runbook and the tests can state exactly what is refused by class rather
 # than by omission. Membership here is not required for a refusal - absence from the allowlist
