@@ -23,6 +23,7 @@ Two deliberate boundaries:
 """
 
 import ast
+import hashlib
 import json
 import os
 import re
@@ -4130,6 +4131,106 @@ class ExpiryProbeScriptExecutionTests(unittest.TestCase):
         self.assertEqual(before, after, "the probe must not write evidence into the working directory")
 
 
+# ---- DL-XB-123-001-R1: the reviewed create-UAT runbook seal ---- #
+# WHY THIS EXISTS, and why it is not another parsing patch.
+#
+# Every prior round answered a false clean by teaching the hand-written Markdown/PowerShell model
+# one more case: another CommonMark start condition, another command spelling. Run-24 showed that
+# approach has not converged, and cannot: the semantic layer models a language, and any incomplete
+# model of a language has a next counterexample. Two of them are reproduced verbatim as the R1
+# residual controls below -- a type-7 HTML opener after a setext-style transition (F1), and an
+# active `Copy-Item` deployment to the VM placed outside step 4 (F2). Both left BOTH public guards
+# clean while the runbook said something an operator must not follow.
+#
+# R1 changes the completeness architecture instead. The COMPLETE reviewed runbook -- every byte a
+# reviewer actually read -- becomes the live authority, carried as one literal SHA-256. The public
+# guards fail closed on any drift from it. The question the guards answer is no longer "does my
+# parser recognise everything dangerous in this text?" (unanswerable) but "is this text the text
+# that was reviewed?" (decidable, and total).
+#
+# The semantic diagnostics are NOT retired: they remain defence in depth and the regression surface
+# for A1-A11, and every mutation control still asserts its own named semantic finding through the
+# internal semantic-only layer. What changed is that they are no longer load-bearing for
+# completeness. A known parser shortcoming is now acceptable precisely because it cannot produce a
+# clean PUBLIC guard: the seal fires first and independently.
+#
+# Canonicalisation is line-ending normalisation and NOTHING else -- no trimming, no whitespace
+# collapsing, no case folding, no blank-line or Unicode normalisation, no reordering. A CRLF
+# checkout and an LF checkout of the same reviewed bytes seal identically; every other textual
+# difference, down to one trailing space, changes the digest.
+#
+# The expected digest is a LITERAL reviewed constant. It is deliberately NOT computed from the
+# repository at import time or at guard time: a digest recomputed from the live file would seal the
+# document to itself and authorise any edit. Nothing here reads the repository, the filesystem, the
+# environment or a subprocess, so the guards stay pure text-in/findings-out and the closed
+# dependency contract is untouched. The tests establish the constant's truthfulness by comparing it
+# against an independently computed digest of the reviewed runbook.
+REVIEWED_RUNBOOK_SEAL_KEY = "reviewed_runbook_seal_mismatch"
+# SHA-256 of docs/autocount2-automation/member_create_uat_runbook.md at the reviewed head, over the
+# UTF-8 bytes of its line-ending-normalised text.
+#
+# The seal moves ONLY with a reviewed change to the sealed document, and it moved here for exactly
+# the R3 Step-5/Step-9 target-binding corrections: the selected private source record, the fixed VM
+# package destination and its replacement, the Google credential identity and the spreadsheet row's
+# operation id. Canonicalisation is unchanged, the constant stays a literal, and the controls below
+# prove the new value against an independently computed digest and prove that BOTH superseded
+# reviewed documents no longer satisfy it.
+REVIEWED_RUNBOOK_SHA256 = "daaf2b144a1ed7e36cf7b886b0dd350a559f966279a909fcd4a67f43e3674759"
+# The retired reviewed digests, kept so the seal's movement stays provable rather than asserted:
+# rolling the reviewed clauses back one revision at a time must reproduce each of these documents
+# byte for byte, and neither may satisfy the current seal. R1 is retained from the previous
+# revision rather than dropped, so the whole chain remains auditable.
+SUPERSEDED_R1_RUNBOOK_SHA256 = "56f5a081145cb80719d2dec5e603381e7d8cbfbfcfeb6019e5cee59d7c564bce"
+SUPERSEDED_R2_RUNBOOK_SHA256 = "cf5e4011371717268915f614fd90e8b81e6a65ee1227a3a694e4c0f368f38b42"
+SUPERSEDED_RUNBOOK_SHA256S = (SUPERSEDED_R1_RUNBOOK_SHA256, SUPERSEDED_R2_RUNBOOK_SHA256)
+
+
+# The seal path must reach nothing but its argument. These are the names whose presence anywhere in
+# the seal helpers or the public guards would mean the digest could be answered by the filesystem,
+# the environment or a subprocess instead of by the supplied text.
+SEAL_FORBIDDEN_NAMES = frozenset({
+    "read_repo_text", "repo_path", "read_scratch_text", "ROOT", "REPO_DEPENDENCIES",
+    "open", "Path", "os", "sys", "subprocess", "tempfile", "shutil", "input", "eval", "exec",
+    "compile", "globals", "locals", "vars", "getattr", "__import__",
+})
+# Attribute spellings of the same reach. `read_text`/`read_bytes`/`open` are the registered repo
+# read methods; `environ`/`getenv` and the subprocess entry points are the non-file escapes.
+SEAL_FORBIDDEN_ATTRIBUTES = frozenset({
+    "read_text", "read_bytes", "open", "environ", "getenv", "run", "check_output", "Popen",
+    "resolve", "iterdir", "glob", "exists", "stat",
+})
+# The seal path itself, plus the two public guards that must fail closed through it.
+SEAL_PURE_FUNCTIONS = ("canonical_seal_text", "reviewed_runbook_digest",
+                       "reviewed_runbook_seal_findings", "vm_gate_findings",
+                       "host_sync_gate_findings")
+
+
+def canonical_seal_text(text):
+    """``text`` with line endings normalised to LF, and nothing else changed.
+
+    CRLF and a bare CR both become LF, so a Windows checkout and a POSIX checkout of identical
+    reviewed content seal identically. Every other byte is significant: a trailing space, a case
+    change, an added or removed blank line and a changed final newline all survive into the digest.
+    """
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def reviewed_runbook_digest(text):
+    """The lowercase hex SHA-256 of ``text`` in canonical form."""
+    return hashlib.sha256(canonical_seal_text(text).encode("utf-8")).hexdigest()
+
+
+def reviewed_runbook_seal_findings(text):
+    """``[]`` when ``text`` IS the reviewed runbook, else the one declared seal finding.
+
+    Evaluated from the SUPPLIED text only. The guard never rereads the repository, so the seal
+    cannot be satisfied by a document that merely happens to sit at the reviewed path.
+    """
+    if reviewed_runbook_digest(text) == REVIEWED_RUNBOOK_SHA256:
+        return []
+    return [REVIEWED_RUNBOOK_SEAL_KEY]
+
+
 # ---- DL-XB-118-001: create-UAT physical-host sync approval contract ---- #
 # The create-UAT runbook's step-3 `git pull --ff-only origin main` runs on physical host
 # DESKTOP-Q43QKQF: it contacts a remote and mutates that machine's checkout, so it needs its own
@@ -4186,12 +4287,14 @@ HOST_SYNC_SAFETY_TOKENS = ("desktop-q43qkqf", "step 3", "step 7", "savemember",
                            "neither implies the other",
                            "a prior-turn approval is never reusable for either")
 
-# Every finding key this contract can report.
-HOST_SYNC_FINDING_KEYS = (
+# Every finding key the SEMANTIC layer of this contract can report.
+HOST_SYNC_SEMANTIC_FINDING_KEYS = (
     "gate_after_pull", "gate_missing", "host_not_named", "mutation_disclosure_missing",
     "not_current_turn", "operation_not_named", "prior_turn_not_denied", "pull_missing",
     "safety_boundary_missing", "stop_boundary_missing", "substitution_not_denied",
 )
+# Every finding key the PUBLIC guard can report: the semantic surface plus the R1 seal.
+HOST_SYNC_FINDING_KEYS = HOST_SYNC_SEMANTIC_FINDING_KEYS + (REVIEWED_RUNBOOK_SEAL_KEY,)
 
 
 def _flat(text):
@@ -4216,17 +4319,39 @@ def _clause_after(text, token):
     return text[at:min(ends)] if ends else text[at:]
 
 
-def host_sync_gate_findings(text):
-    """Return sorted contract findings for the create-UAT physical-host sync approval gate.
+def _unblocked(text, at):
+    """``at`` when that landmark renders as document text, else ``-1``.
+
+    A9's one adaptor for a checker whose landmarks are bare offsets rather than reviewed regions.
+    A landmark whose own line begins inside an inherited fenced code block renders as literal
+    example text, so it is reported through the SAME missing-landmark branch an absent landmark
+    already takes -- no new grammar and no new finding key. A missing offset stays missing.
+    """
+    return -1 if at == -1 or _block_state_at(text, at) is not None else at
+
+
+def _host_sync_semantic_findings(text):
+    """Sorted SEMANTIC findings for the create-UAT physical-host sync approval gate.
 
     Pure and text-only: no repository read, no path derivation, and only non-throwing ``find()``
-    searches, so a degraded in-memory fixture reports findings instead of raising. An empty list
-    means the whole contract holds.
+    searches, so a degraded in-memory fixture reports findings instead of raising.
+
+    R1 boundary: this is defence-in-depth diagnosis, NOT the live completeness authority. An empty
+    list here means only that no MODELLED defect was recognised -- the public guard adds the
+    reviewed-runbook seal, which is what makes arbitrary live drift undecidable-free. Semantic
+    mutation controls call this layer directly, so a seal mismatch (which every mutated fixture has
+    by construction) cannot mask the named semantic finding they exist to prove.
     """
     findings = set()
 
-    gate_idx = text.find(HOST_SYNC_GATE_MARKER)
-    pull_idx = text.find(HOST_SYNC_PULL_INVOCATION)
+    # A9-F1: an authority that begins inside inherited fenced code is not authority -- CommonMark
+    # renders it as the literal contents of a code block. This checker bounds its slices from bare
+    # `find()` landmarks and has no region identity to carry the repair, so a landmark that renders
+    # as code is treated as ABSENT and the existing missing-landmark branches report it. Treated as
+    # absent rather than skipped over: taking the next occurrence instead would be the permissive
+    # direction, and A9 may only add fail-closed behaviour. See `_block_state_at`.
+    gate_idx = _unblocked(text, text.find(HOST_SYNC_GATE_MARKER))
+    pull_idx = _unblocked(text, text.find(HOST_SYNC_PULL_INVOCATION))
     if pull_idx == -1:
         findings.add("pull_missing")
 
@@ -4273,7 +4398,7 @@ def host_sync_gate_findings(text):
         if not denied:
             findings.add("substitution_not_denied")
 
-    safety_idx = text.find(HOST_SYNC_SAFETY_HEADING)
+    safety_idx = _unblocked(text, text.find(HOST_SYNC_SAFETY_HEADING))
     if safety_idx == -1:
         findings.add("safety_boundary_missing")
     else:
@@ -4283,6 +4408,17 @@ def host_sync_gate_findings(text):
             findings.add("safety_boundary_missing")
 
     return sorted(findings)
+
+
+def host_sync_gate_findings(text):
+    """The PUBLIC live host-sync guard: reviewed-runbook seal, then semantic diagnostics.
+
+    Fails closed on any drift from the reviewed runbook, whether or not the semantic layer models
+    the drift. Pure text-in/findings-out: the seal is computed from ``text``, never from the file
+    on disk, so the same input always yields the same output.
+    """
+    return sorted(set(reviewed_runbook_seal_findings(text))
+                  | set(_host_sync_semantic_findings(text)))
 
 
 # A minimal, self-contained COMPLIANT document. The negative controls degrade this rather than the
@@ -4337,6 +4473,4442 @@ HOST_SYNC_STEP_DENIAL_BULLETS = {
 # why the clause bound must recognise all three and not just the hyphen the fixture happens to use.
 HOST_SYNC_BULLET_MARKERS = ("-", "*", "+")
 
+
+# ---- DL-XB-123-001: create-UAT VM deployment and no-write preflight approval gates ---- #
+# Child #123 (parent #117). Two DIFFERENT external actions sit inside the create-UAT procedure and
+# the runbook gated neither:
+#
+#   step 4 -- deployment MUTATES the AutoCount VM DESKTOP-4I042L6: reviewed files are copied or
+#             replaced there and a VM-owned state directory is created/prepared;
+#   step 5 -- preflight TRANSFERS the approved package to that VM and then AUTHENTICATES to
+#             AutoCount and reads live data.
+#
+# They are different risk classes, so they take separate current-turn approvals rather than one
+# combined one; the ExpiryDate probe runbook already treats them that way. With the step-3 host
+# sync (#118) and the step-7 SaveMember write, that makes FOUR independent approval surfaces.
+#
+# Like the #118 checker, vm_gate_findings is PURE and TEXT-ONLY: text in, finding keys out, no
+# repository read and no path derivation, and every search is non-throwing so a degraded in-memory
+# fixture yields findings rather than a ValueError. It is bounded STRUCTURALLY in two layers:
+#
+#   1. by the runbook's own NUMBERED Markdown step headings, so step 4's gate can never be
+#      answered by step 5's prose or the reverse;
+#   2. inside each step, from the gate marker to that step's FIRST external action, so a
+#      requirement stated only after the operator has already acted does not count.
+#
+# No fixed character window, no Markdown parser and no cross-bullet borrowing: per-source denials
+# reuse the same syntactic clause bound #118 established, which is the generic CommonMark bound
+# rather than anything host-sync specific.
+
+VM_GATE_VM = "DESKTOP-4I042L6"
+
+# Layer 1. Only a NUMBERED `### <n>. ` heading delimits a section. Step 5 contains many
+# UNNUMBERED `### ` subsections (store admission, reconciliation, ...), so a bound that accepted
+# any `### ` would end step 5 hundreds of lines early and stop covering the transfer/dry-run
+# instruction that closes it.
+#
+# A3: this is the ONE numbered-ATX opening grammar. Discovery, duplicate detection and section
+# bounding all read step identity out of its `step` group, so no second, narrower encoding of
+# "what a numbered heading looks like" exists for them to drift apart on. The accepted final-G4-A2
+# finding was exactly that drift: `^### \d+\. ` plus a `startswith("### <n>. ")` probe recognised
+# one spelling, while CommonMark renders the same top-level `h3` for
+#
+#   * 0-3 leading ASCII spaces -- FOUR is an indented code block and stays excluded, so an
+#     indented Markdown example inside a step cannot make the real step ambiguous;
+#   * exactly three `#`, since `####` opens an h4 and is not a step;
+#   * one or more spaces OR TABS after `###`;
+#   * one or more spaces OR TABS after `<n>.`.
+#
+# A duplicate written in an unrecognised spelling is invisible rather than mis-parsed, and that is
+# the severity: its body is absorbed into the neighbouring section's ACTION region, where only
+# presence checks run, so an ungated instruction rides along with no findings at all.
+VM_GATE_STEP_HEADING = re.compile(r"(?m)^ {0,3}###(?!#)[ \t]+(?P<step>\d+)\.[ \t]+")
+
+# A CommonMark ATX closing sequence: a run of `#` preceded by whitespace and followed by nothing
+# but optional whitespace. It is SYNTAX -- stripped before rendering -- so it must not read as a
+# wording change. The preceding-whitespace requirement and the end anchor are what keep this from
+# becoming a bypass in the other direction: in `### 4. Title ### and push now` the run is followed
+# by content, so CommonMark keeps the whole line as heading text and this pattern declines to
+# strip it, leaving the trailing instruction visible as drift.
+VM_GATE_ATX_CLOSING = re.compile(r"[ \t]+#+[ \t]*$")
+VM_GATE_DEPLOY_STEP = 4
+VM_GATE_PREFLIGHT_STEP = 5
+
+# The reviewed numbered heading LINES, verbatim. Accepted G4 finding F-4 was that the heading line
+# sits outside both pre-gate authorities -- step 4's blank-body rule and step 5's frozen digest --
+# so actionable external wording could ride in the heading itself and still precede the gate.
+# Exact-string authority closes that without touching the frozen prefix digest, which is derived
+# from the text AFTER this line and must stay byte-stable.
+VM_GATE_REVIEWED_HEADINGS = {
+    VM_GATE_DEPLOY_STEP: "### 4. Deploy the inactive UAT components",
+    VM_GATE_PREFLIGHT_STEP: "### 5. No-write preflight (dry-run)",
+    # A11 brings two further numbered steps under the same structural authority: step 9 performs
+    # live n8n and result-mapping operations and step 10 a live AutoCount recovery lookup.
+    9: "### 9. Read-back and terminal result mapping",
+    10: "### 10. Recovery for `WRITE_OUTCOME_UNCERTAIN`",
+}
+
+VM_GATE_DEPLOY_MARKER = "deployment gate"
+VM_GATE_PREFLIGHT_MARKER = "preflight gate"
+VM_GATE_SAFETY_HEADING = "## Safety boundary"
+# The same line-anchored ATX discipline the numbered steps use, so a deeper `### Safety boundary`
+# subsection is not counted as a second top-level authority merely because the literal heading
+# text is a substring of it.
+VM_GATE_SAFETY_OPENING = re.compile(r"(?m)^ {0,3}##(?!#)[ \t]+Safety boundary")
+
+# Layer 2 (A1). Ordering is no longer inferred from a vocabulary of action phrases. Accepted G4
+# finding F-1 showed that inference is unsound: a synonym before the gate goes unrecognised while
+# a listed phrase after the gate keeps satisfying the check, and the oracle reports clean. The
+# right edge of a gate is now the START of that step's post-gate operational prose, so the gate
+# block ends BEFORE the operational banner and cannot borrow its identity (accepted F-2).
+VM_GATE_DEPLOY_BOUNDARY = "Copy the reviewed"
+# A4: the step-5 gate's right edge is now the FIRST post-gate operation -- the laptop build
+# banner -- and no longer the later AutoCount VM banner. Accepted findings
+# PRRT_kwDOSbJI_s6YQTNV and PRRT_kwDOSbJI_s6YQTMq were two instances of one mistake: treating the
+# private-data package build and the environment configuration as preparation that happens BEFORE
+# the gated part of the step. They are gated work themselves, so they belong inside the region
+# the gate governs. Moving the boundary here is what makes the ordering rule mean "nothing at all
+# precedes this approval" rather than "nothing external precedes it".
+VM_GATE_PREFLIGHT_BOUNDARY = "**`LAPTOP DEVELOPMENT MACHINE`**"
+
+# The ordering finding each step reports when its action boundary precedes its gate. Kept under
+# the original key names so the pre-A1 ordering controls keep asserting the same contract.
+VM_GATE_ORDERING_KEYS = {"deploy": "deploy_gate_after_mutation",
+                         "preflight": "preflight_gate_after_external_action",
+                         "mapping": "mapping_gate_after_action",
+                         "recovery": "recovery_gate_after_action"}
+
+# Operation EXISTENCE, checked in the action region and deliberately separate from ordering. The
+# gate's own copies of these names are approval prose, not the operation, so they do not count.
+VM_GATE_DEPLOY_ACTION_FILES = (
+    "scripts/ac2_member_create_uat_runner.ps1",
+    "scripts/member_create_uat_runner_lib.ps1",
+    "config/member_create_uat_business_confirmation.json",
+)
+VM_GATE_DEPLOY_STATE_ANCHOR = r'new-item -itemtype directory -path "c:\xb\create_uat\state"'
+# The executable invocation is required because the summary sentence immediately after the gate
+# must never stand in for the real operation -- that substitution is what allowed F-1 to pass a
+# document whose actual dry-run had been moved before the gate or deleted outright. The summary
+# says "copy the APPROVED package to the vm", so it cannot satisfy the transfer anchor either.
+VM_GATE_PREFLIGHT_TRANSFER_ANCHOR = "copy the package to the vm"
+VM_GATE_PREFLIGHT_RUNNER_ANCHOR = r"& scripts\ac2_member_create_uat_runner.ps1 -packagepath"
+
+# ---- A4: required operations must be ACTIVE, EXECUTABLE command lines ---- #
+# Accepted finding PRRT_kwDOSbJI_s6YQTM_: a required command was proven by substring over the
+# whole flattened action region, so commenting the dry-run out as
+# `# & scripts\ac2_member_create_uat_runner.ps1 -PackagePath ...` kept the anchor satisfied while
+# the document no longer invoked the preflight at all. A mention of a command is not the command.
+# These openers are the narrow, line-level test for "this line cannot execute": a comment in
+# PowerShell or shell, or an HTML comment in Markdown. It is deliberately NOT a fenced-code,
+# list, blockquote or container model -- A4 does not authorise one, and the accepted fenced-code
+# false positive PRRT_kwDOSbJI_s6YQTNF is left exactly as it was.
+VM_GATE_COMMENT_OPENERS = ("#", "//", "<!--")
+# A5 adds the PowerShell BLOCK comment. Its body is ordinary-looking command text on every line,
+# so a line-start test cannot see it, yet nothing inside it executes -- confirmed against the real
+# interpreter. Recognising the delimiters is a two-token text scan, not a PowerShell parser.
+VM_GATE_PS_BLOCK_OPEN = "<#"
+VM_GATE_PS_BLOCK_CLOSE = "#>"
+
+# A6 adds the two standard multiline-DATA constructs, both accepted final-G4 false cleans. Every
+# line of a here-string or heredoc body is ordinary-looking command text, and a line-start test
+# cannot see the difference, yet nothing inside either one executes. Both were verified against the
+# real interpreters rather than assumed:
+#
+#   * PowerShell -- `@' ... '@` and `@" ... "@` bodies are emitted as DATA. The terminator must
+#     begin the line ("White space is not allowed before the string terminator" is a parse error),
+#     and an unterminated opener is itself a parse error, so a script that never closes one cannot
+#     run at all. The opener must end its line.
+#   * bash -- `<<WORD`, `<<'WORD'`, `<<"WORD"` and `<<-WORD` bodies are printed or consumed as
+#     input, never run. `<<-` strips leading TABS from the body and the delimiter line.
+#
+# Recognising the delimiters is a bounded lexical scan, NOT a PowerShell or Bash parser. The
+# delimiter grammar is deliberately narrow (an ordinary identifier, optionally quoted); anything
+# outside it is simply not recognised, which leaves the existing behaviour rather than guessing.
+VM_GATE_PS_HERE_STRING_OPENERS = (("@'", "'@"), ('@"', '"@'))
+# The delimiter word accepts digits anywhere, including first. An independent post-repair attack
+# found `<<9EOF` -- a perfectly ordinary bash delimiter -- slipping past an identifier-shaped
+# grammar and re-opening exactly the A6-F3 false clean, so the class is closed rather than the one
+# spelling that was controlled. Still deliberately narrow: `<<<` (a bash here-string, not a
+# heredoc) does not match, and neither does anything that is not a bare or simply-quoted word.
+VM_GATE_SHELL_HEREDOC_OPENER = re.compile(r"<<(-?)[ \t]*(['\"]?)([A-Za-z0-9_]+)\2")
+
+# The two argparse commands the gated step-5 build actually runs, VERBATIM and CASE-SENSITIVE.
+# Accepted finding PRRT_kwDOSbJI_s6YQTM4: the retired prefix digest folded case, so `--input`
+# becoming `--INPUT` left it unchanged even though `member_create_uat_approval.py` is argparse and
+# would reject the mutated flag outright. These are therefore compared WITHOUT lowercasing. The
+# PowerShell runner anchor above stays folded on purpose: PowerShell parameter names really are
+# case-insensitive, so demanding exact case there would assert a contract the tool does not have,
+# which is a false guard rather than a stronger one.
+VM_GATE_PREFLIGHT_APPROVE_COMMAND = (
+    "python scripts/member_create_uat_approval.py approve --reviewer <handle>"
+    " --input <form.csv> --decision-rows <member_intake_decision_rows.csv>"
+    " --row-number <N> --ledger <ledger.jsonl>")
+VM_GATE_PREFLIGHT_BUILD_COMMAND = (
+    "python scripts/member_create_uat_approval.py build-package"
+    " --input <form.csv> --decision-rows <member_intake_decision_rows.csv>"
+    " --row-number <N> --ledger <ledger.jsonl>"
+    " --package-out <member_create_uat_package_v2.json>")
+
+# The AutoCount process-environment configuration, which accepted finding PRRT_kwDOSbJI_s6YQTMq
+# showed running under no approval at all: it sat in step 4 AFTER the deployment gate, which
+# authorises no AutoCount contact, and BEFORE the step-5 gate. A4 moves it under the step-5
+# approval. Only the variable NAMES are ever contracted -- no host, database, account book or
+# password value belongs in this repository, so the contract requires the names and nothing else.
+VM_GATE_PREFLIGHT_ENV_ANCHOR = "set the autocount connection through the process environment only"
+VM_GATE_ENV_VARIABLE_NAMES = ("AC2_PROBE_SERVER_NAME", "AC2_PROBE_DATABASE_NAME",
+                              "AC2_PROBE_USER_ID", "-PasswordEnvVar")
+
+# ---- A4: the approval must be stated AFFIRMATIVELY ---- #
+# Accepted finding PRRT_kwDOSbJI_s6YQTNO: the gates were proven by the bare presence of the token
+# `current-turn owner approval`, so "do NOT obtain an explicit current-turn owner approval" kept
+# every tested token and returned no findings. Presence is not polarity.
+#
+# The repair stays inside the NARROW reviewed gate grammar rather than attempting to judge
+# arbitrary English: the reviewed affirmative clause must be present, and no clause that mentions
+# the approval token may carry a negation. Clause bounds reuse the CommonMark terminator set the
+# #118 contract established, so a neighbouring compliant sentence cannot answer for an inverted
+# one, and an inverted one cannot hide behind a compliant neighbour.
+VM_GATE_AFFIRMATIVE_APPROVAL = ("obtain an explicit current-turn owner approval that names the"
+                                " autocount vm")
+VM_GATE_APPROVAL_NEGATIONS = (" not", "n't", " never", " without", " no ", " rather than",
+                              " instead of", " skip ", " unnecessary")
+
+# What the step-4 approval must actually bind. Naming the VM is not enough: an approver cannot
+# judge "deploy to the VM" without knowing which components are replaced and what state is
+# prepared, so each component and the state directory must appear in the gate's own prose.
+VM_GATE_DEPLOY_BINDINGS = (
+    "copying or replacing",
+    "scripts/ac2_member_create_uat_runner.ps1",
+    "scripts/member_create_uat_runner_lib.ps1",
+    "config/member_create_uat_business_confirmation.json",
+    "creating or preparing",
+    r"c:\xb\create_uat\state",
+)
+# What the step-5 approval must bind, each with its own finding so a control can prove exactly
+# which binding was lost. The target is named IN THE APPROVAL: connection values and secrets are
+# never written into the runbook, so the contract requires the phrase, never a value.
+# A4 adds the first three. Under the old layout the private-data read, the decision-store and
+# ledger mutations, the package build and the environment configuration all happened BEFORE the
+# gate, so the approval never had to mention them; now that the gate governs the whole step, an
+# approver has to be told what they are actually approving. Each entry carries the contract
+# phrase in the document's own case and a single-LINE fragment a control can rewrite, because the
+# phrase itself may span a Markdown line break. The checker lowercases at comparison rather than
+# keeping a second lower-cased copy, so the controls and the contract cannot drift apart.
+VM_GATE_A4_NEW_BINDINGS = (
+    ("preflight_private_data_not_bound",
+     "the bounded access to the selected private form response and its decision row",
+     "the bounded access to the selected private form response and its decision row"),
+    ("preflight_package_build_not_bound",
+     "the local reviewer-decision store and approval-ledger operations and the immutable"
+     " package build",
+     "the local reviewer-decision store and approval-ledger operations"),
+    ("preflight_environment_not_bound",
+     "the AutoCount process-environment configuration, by variable name only",
+     "the AutoCount process-environment configuration, by variable name only"),
+)
+# R3 adds the two step-5 target-binding clauses. Both are the APPROVAL clause's own wording, for
+# the reason R2 established: a token generic enough to be answered by the step's descriptive prose
+# would be satisfied by a document whose approval still binds nothing concrete.
+#
+# `preflight_source_record_not_bound`. The private-data binding above names the CATEGORY of access
+# ("the selected private form response and its decision row") but not WHICH record: the row is not
+# chosen until the later `--row-number <N>` command, so one approval could be applied to a
+# different person's private data without departing from the documented gate. The approval must
+# therefore carry the stable non-PII `source_record_id`. A row number is an ordinal into a file
+# that can be re-sorted or re-exported; it is not identity, and the contract says so.
+VM_GATE_R3_SOURCE_RECORD_BINDING = ("identified in the approval itself by its non-pii"
+                                    " `source_record_id`")
+# `preflight_transfer_destination_not_bound`. The runner always reads the FIXED VM working copy, so
+# every transfer after the first overwrites the previous package. "Bounded transfer" disclosed
+# neither the destination nor the replacement, unlike step 4's explicit copying-or-replacing
+# wording. The token binds the two together: naming the path without the replacement, or the
+# replacement without the path, leaves the destructive half of the operation unapproved.
+VM_GATE_R3_TRANSFER_DESTINATION_BINDING = (
+    "copying or replacing the fixed vm working copy"
+    " `c:\\xb\\create_uat\\member_create_uat_package.json`")
+VM_GATE_PREFLIGHT_BINDINGS = tuple(
+    (key, _flat(phrase).lower()) for key, phrase, _fragment in VM_GATE_A4_NEW_BINDINGS
+) + (
+    ("preflight_source_record_not_bound", VM_GATE_R3_SOURCE_RECORD_BINDING),
+    ("preflight_target_not_bound",
+     "the intended autocount target (the server and database / account book)"),
+    ("preflight_transfer_not_bound", "the bounded transfer of the approved package to that vm"),
+    ("preflight_transfer_destination_not_bound", VM_GATE_R3_TRANSFER_DESTINATION_BINDING),
+    ("preflight_dry_run_not_bound", "the no-write dry-run / preflight operation"),
+)
+
+VM_GATE_CURRENT_TURN = "current-turn owner approval"
+VM_GATE_PRIOR_TURN = "a prior-turn approval is not reusable"
+
+# Every other approval surface must be denied inside its OWN clause, carrying its own polarity:
+# matching a bare "authorise this deployment" would accept the inverted claim just as happily.
+VM_GATE_DEPLOY_SOURCES = ("(step 2)", "(step 3)", "(step 5)", "(step 7)")
+VM_GATE_DEPLOY_DENIAL = "does **not** authorise this deployment"
+VM_GATE_PREFLIGHT_SOURCES = ("(step 2)", "(step 3)", "(step 4)", "(step 7)")
+VM_GATE_PREFLIGHT_DENIAL = "does **not** authorise this preflight"
+
+VM_GATE_DEPLOY_STOP = ("stop before copying or replacing files or creating or preparing state "
+                       "on the vm")
+# Deployment authorises placement only. Execution and AutoCount contact belong to steps 5 and 7,
+# so the gate must say so or "deployed" quietly becomes "may now be run".
+# A4 adds the environment clause: accepted finding PRRT_kwDOSbJI_s6YQTMq was possible partly
+# because step 4 said nothing either way about configuring the connection, so a reader could take
+# the deployment approval to cover it.
+VM_GATE_DEPLOY_NO_EXECUTION = ("this deployment approval authorises no runner execution, no "
+                               "autocount environment configuration and no autocount contact")
+
+# A4 widens the step-5 stop boundary to the operations the gate now actually precedes. Under the
+# old layout it named only the transfer and AutoCount contact, which is exactly the reading that
+# left the private-data build and the environment setup outside any approval at all.
+VM_GATE_PREFLIGHT_STOP = ("stop before reading the private form response or decision row, before "
+                          "building the package, before setting the autocount environment, and "
+                          "before transferring the package to the vm or contacting autocount")
+# The dry-run's permitted reach and its hard limit, as one proposition: stating what it MAY do
+# without stating that it still may not save would license the write this contract excludes.
+VM_GATE_PREFLIGHT_SAVE_MEMBER = (
+    "may authenticate, check the duplicate and construct the member in memory",
+    "does **not** authorise or call `savemember`",
+)
+
+# The Safety boundary must keep all four surfaces independent. These tokens are additive to the
+# #118 host-sync/write sentence, which stays exactly as it is.
+# A5 broadens the step-5 clause to what that surface actually covers. Accepted finding F-D: the
+# summary still called step 5 "package transfer and no-write preflight" after A4 moved the private
+# form/decision-row read, the reviewer-decision and ledger operation, the package build and the
+# environment setup inside the same approval, so summary and gate stated two different contracts.
+VM_GATE_SAFETY_TOKENS = (
+    "four baseline approval surfaces are always required: the step-3 host sync, the step-4 vm"
+    " deployment, the step-5 preflight surface (selected private form/decision-row access, the"
+    " reviewer-decision and approval-ledger operation, the immutable package build, the autocount"
+    " environment setup, the package transfer and the no-write autocount preflight), and the"
+    " step-7 `savemember` write",
+    "every operator-directed destructive cleanup or removal, each one scoped locally to its exact"
+    " target and its exact delete or remove operation; the step-9 live n8n result mapping; and the"
+    " step-10 conditional read-only autocount recovery lookup",
+    "this runbook states no fixed total number of approval surfaces",
+    "each surface named above requires its own current-turn owner approval",
+    "none implies or covers another",
+    "a prior-turn approval is never reusable for any of them",
+)
+
+# ---- A8: the reviewed Safety boundary, verbatim ---- #
+# Accepted finding PRRT_kwDOSbJI_s6YzUw1. A4 established that the section must be UNIQUE, and then
+# validated the unique section by ADDITIVE TOKEN PRESENCE: every required substring had to remain,
+# and nothing else was inspected. Appending "One approval may cover all four surfaces." inside that
+# single section therefore left every token present and `vm_gate_findings()` clean, while the
+# document carried an explicit waiver of the separation the section exists to state.
+#
+# The answer is the one A5 and A6 already proved works, applied to the third reviewed region:
+# recognise the text review approved instead of classifying English. There is no contradiction
+# classifier here and no negation vocabulary -- an added clause, a removed clause, a reworded
+# clause and a merged approval surface all change the section and all fail closed alike, whether
+# they carry a word any list knows or not.
+#
+# The tokens above are KEPT as defence in depth under the same finding key, so a document that
+# loses identity still reports which proposition it lost. This constant is written out here rather
+# than derived from the runbook or the fixture, because authority derived from the thing it is
+# meant to constrain is not authority at all; the fixture consumes it for the same reason the gate
+# and action fixtures consume theirs.
+VM_GATE_SAFETY_REVIEWED_SECTION = r"""## Safety boundary
+
+- No AutoCount write occurs in development, tests, or CI. Enabling the ExpiryDate path
+  (recording the business confirmations and flipping the capability flag) performs no
+  live write; a real write still requires the explicit VM write step above and a
+  separate current-turn owner approval naming the exact target and operation.
+- The host sync on `DESKTOP-Q43QKQF` in step 3 and the `SaveMember` write in step 7
+  each require their own prior current-turn owner approval. Neither implies the other,
+  and a prior-turn approval is never reusable for either.
+- Four baseline approval surfaces are always required: the step-3 host sync, the step-4
+  VM deployment, the step-5 preflight surface (selected private form/decision-row access,
+  the reviewer-decision and approval-ledger operation, the immutable package build, the
+  AutoCount environment setup, the package transfer and the no-write AutoCount preflight),
+  and the step-7 `SaveMember` write.
+- Further conditional approval surfaces arise wherever the procedure reaches them: every
+  operator-directed destructive cleanup or removal, each one scoped locally to its exact
+  target and its exact delete or remove operation; the step-9 live n8n result mapping;
+  and the step-10 conditional read-only AutoCount recovery lookup.
+- This runbook states no fixed total number of approval surfaces. Each surface named
+  above requires its own current-turn owner approval, none implies or covers another, and
+  a prior-turn approval is never reusable for any of them.
+- Exactly one member is supported; there is no batch path, no update-member path, no
+  delete, and no rollback automation.
+- SaveMember is called at most once and is never automatically retried. An uncertain
+  save outcome is terminal (`WRITE_OUTCOME_UNCERTAIN`) and is resolved only by the
+  separate read-only recovery check, never by an automatic retry.
+- No final package can be published before its durable publication reservation is
+  confirmed, so a publication or ledger persistence failure can never leave a published
+  package that the same approval is free to build again. An already-published package is
+  never deleted, rolled back, truncated, renamed or modified by any failure path.
+- A package built under the previous `member_create_uat_package/v1` contract cannot be
+  reused; the runner refuses it fail-closed. Build a fresh `v2` package at a new,
+  version-distinct path after a new reviewer decision. The package builder is strictly
+  no-clobber and never overwrites an existing package, so the old `v1` artifact and its
+  hash are preserved as historical evidence and remain non-executable under `v2`.
+- The synthetic member and permanent single-use claim created by the earlier
+  [ExpiryDate capability probe](member_expiry_capability_probe_runbook.md) are left
+  exactly as they are; this UAT path does not read, modify, or clean them up.
+- All console, evidence, test, and workflow output is sanitized and PII-free; member
+  numbers are masked and names, emails, and birthdays are never printed.
+"""
+
+# ---- A5: the reviewed gate blocks, verbatim ---- #
+# Accepted final-G4 finding F-A: polarity cannot be decided by vocabulary. "The current-turn owner
+# approval is optional." carries no word the negation list knows, and "This approval is optional."
+# never repeats the token the predicate scopes itself to, so neither is visible to it. Extending
+# the list only moves the boundary; the next reviewer writes "at the operator's discretion".
+#
+# Open-ended English cannot be classified. A BOUNDED REVIEWED BLOCK can be recognised. So A5 stops
+# trying to judge what a sentence means and requires the gate to still say what review approved it
+# saying: any added, removed or reworded clause -- contradictory or not, token-bearing or not --
+# changes the block and fails closed. These constants are the independent authority. They are
+# explicit and readable rather than a digest, so a reviewer can diff them by eye, and they are
+# written out here rather than derived from the runbook or the fixture, because authority derived
+# from the thing it is meant to constrain is not authority at all.
+VM_GATE_DEPLOY_REVIEWED_BLOCK = r"""**Separate current-turn owner approval required (deployment gate).** The instructions
+below change an external machine: they place reviewed files on the AutoCount VM
+`DESKTOP-4I042L6` and prepare a directory that the VM then owns. Before any of them,
+obtain an explicit current-turn owner approval that names the AutoCount VM
+(`DESKTOP-4I042L6`) and binds this exact deployment operation:
+
+- copying or replacing `scripts/ac2_member_create_uat_runner.ps1` on that VM;
+- copying or replacing `scripts/member_create_uat_runner_lib.ps1` on that VM;
+- copying or replacing `config/member_create_uat_business_confirmation.json` on that VM;
+- creating or preparing the VM-owned state directory `C:\XB\create_uat\state`.
+
+This approval is distinct and is **not** implied by any other gate:
+
+- the PR review and merge decision (step 2) does **not** authorise this deployment;
+- the physical-host sync approval (step 3) does **not** authorise this deployment;
+- the no-write preflight approval (step 5) does **not** authorise this deployment;
+- the separate current-turn write approval (step 7) does **not** authorise this deployment.
+
+A prior-turn approval is not reusable. This deployment approval authorises no runner
+execution, no AutoCount environment configuration and no AutoCount contact; running the
+runner, configuring the connection environment and reaching AutoCount are gated separately
+in step 5 and step 7. Without the named current-turn deployment approval, stop before
+copying or replacing files or creating or preparing state on the VM.
+
+"""
+
+VM_GATE_PREFLIGHT_REVIEWED_BLOCK = r"""**Separate current-turn owner approval required (preflight gate).** The whole of this step is
+gated. It reads the selected private form response and its decision row, mutates the local
+reviewer-decision store and the approval ledger, builds an immutable package, configures the
+AutoCount connection in the process environment, moves that package onto the AutoCount VM
+`DESKTOP-4I042L6`, and then authenticates to AutoCount and reads live data. Laptop locality does
+not waive the approval for the private-data work. Before any of it, obtain an explicit
+current-turn owner approval that names the AutoCount VM (`DESKTOP-4I042L6`) and binds:
+
+- the bounded access to the selected private form response and its decision row for this one
+  package, identified in the approval itself by its non-PII `source_record_id`, which a row
+  number alone does not supply; the private field values are never written into this runbook;
+- the local reviewer-decision store and approval-ledger operations and the immutable package
+  build they produce;
+- the AutoCount process-environment configuration, by variable name only:
+  `AC2_PROBE_SERVER_NAME`, `AC2_PROBE_DATABASE_NAME`, `AC2_PROBE_USER_ID`, and the password
+  environment variable named by `-PasswordEnvVar`;
+- the intended AutoCount target (the server and database / account book), named in the approval
+  itself and never written into this runbook as a connection value or secret;
+- the bounded transfer of the approved package to that VM, copying or replacing the fixed VM
+  working copy `C:\XB\create_uat\member_create_uat_package.json` that the runner always reads;
+  this replacement authority covers that one VM working copy only, never the laptop-side
+  package build, which stays strictly no-clobber;
+- the no-write dry-run / preflight operation.
+
+This approval is distinct and is **not** implied by any other gate:
+
+- the PR review and merge decision (step 2) does **not** authorise this preflight;
+- the physical-host sync approval (step 3) does **not** authorise this preflight;
+- the VM deployment approval (step 4) does **not** authorise this preflight;
+- the separate current-turn write approval (step 7) does **not** authorise this preflight.
+
+A prior-turn approval is not reusable. The dry-run may authenticate, check the duplicate and
+construct the member in memory, but it does **not** authorise or call `SaveMember`; that write
+remains gated by step 7. Without the named current-turn preflight approval, stop before reading
+the private form response or decision row, before building the package, before setting the
+AutoCount environment, and before transferring the package to the VM or contacting AutoCount.
+
+"""
+
+VM_GATE_REVIEWED_BLOCKS = {
+    VM_GATE_DEPLOY_STEP: VM_GATE_DEPLOY_REVIEWED_BLOCK,
+    VM_GATE_PREFLIGHT_STEP: VM_GATE_PREFLIGHT_REVIEWED_BLOCK,
+}
+
+# ---- A6: the reviewed ACTION regions, verbatim ---- #
+# Accepted final-G4 finding A6-F1: the reviewed gate block above is bounded by the step's action
+# boundary, so it cannot see one word after it. "The approval above is optional once these commands
+# are reached." placed in the action region revokes the approval the gate just required, directly
+# above the command it governs, and every other check still passes -- the propositions live inside
+# the gate, and the operation checks only ask whether the commands are present.
+#
+# The answer is the one A5 already proved works, applied to the region A5 left unguarded: recognise
+# the reviewed text instead of classifying English. These constants are the independent authority
+# for everything AFTER each gate, exactly as VM_GATE_*_REVIEWED_BLOCK is for the gate itself. They
+# are explicit and readable rather than a digest so a reviewer can diff them by eye, and they are
+# written out here rather than derived from the runbook or the fixture, because authority derived
+# from the thing it is meant to constrain is not authority at all.
+#
+# The consequence is deliberate and worth stating plainly: the complete post-gate procedure of both
+# steps is now frozen against this source. Any substantive edit to step-4 or step-5 operational
+# prose -- including a legitimate one -- fails closed until a reviewer updates the constant in the
+# same change. Fresh G4 asked for fail-closed strictness over a permissive action normaliser, and
+# that is the trade this makes.
+
+VM_GATE_DEPLOY_REVIEWED_ACTION = r"""Copy the reviewed `scripts/ac2_member_create_uat_runner.ps1`,
+`scripts/member_create_uat_runner_lib.ps1`, and
+`config/member_create_uat_business_confirmation.json` to the AutoCount VM working
+area. Create the VM-owned state directory once (an operator prerequisite; the runner
+never creates it):
+
+**`AUTOCOUNT VM — DESKTOP-4I042L6`**
+
+```powershell
+New-Item -ItemType Directory -Path "C:\XB\create_uat\state" -Force
+```
+
+"""
+
+VM_GATE_PREFLIGHT_REVIEWED_ACTION = r"""**`LAPTOP DEVELOPMENT MACHINE`** Only after the preflight approval above, build the approved
+package on the laptop, using the decision-review output that shows the chosen row as
+`READY_FOR_CREATE_REVIEW`:
+
+```bash
+python scripts/member_create_uat_approval.py approve --reviewer <handle> --input <form.csv> --decision-rows <member_intake_decision_rows.csv> --row-number <N> --ledger <ledger.jsonl>
+```
+
+```bash
+python scripts/member_create_uat_approval.py build-package --input <form.csv> --decision-rows <member_intake_decision_rows.csv> --row-number <N> --ledger <ledger.jsonl> --package-out <member_create_uat_package_v2.json>
+```
+
+Use a fresh, version-distinct `--package-out` filename (for example
+`member_create_uat_package_v2.json`). The build is strictly **no-clobber**: it refuses
+fail-closed if the output path already exists as any filesystem object (file, directory,
+symlink/reparse point), never deletes, truncates, renames, or overwrites it, and appends
+no build ledger event on a collision. **One approval builds exactly one package.**
+`--rebuild` is **retired and always refused** (see the terminal reservation rule below); a
+further package requires a fresh reviewer decision, a new approval id and a fresh output
+pathname. Any package built under the previous `member_create_uat_package/v1` contract,
+and its hash, are preserved as historical evidence and remain non-executable under the
+`v2` runner (the runner refuses the unrecognised schema version). Because the `v2` schema
+bump changes both `source_record_id` and `source_fingerprint` (each binds the schema
+version), a fresh reviewer decision is mechanically required; a `v1` decision or build
+cannot mint a `v2` package.
+
+**`AUTOCOUNT VM — DESKTOP-4I042L6`** Every remaining preflight operation runs on the
+AutoCount VM, under the same preflight approval, in the VM process that runs the runner.
+
+Set the AutoCount connection through the process environment only (never in files, never in
+this runbook): `AC2_PROBE_SERVER_NAME`, `AC2_PROBE_DATABASE_NAME`, `AC2_PROBE_USER_ID`, and
+the password environment variable named by `-PasswordEnvVar`. `ac2_member_create_uat_runner.ps1`
+defaults `ServerName`, `DatabaseName` and `UserId` from these variables in its own VM process,
+so values set on the laptop configure nothing.
+
+Then copy the approved package to the VM and run the runner in dry-run mode (the default;
+no write switches). Dry-run authenticates, checks the duplicate, constructs the new member,
+assigns only the whitelisted fields, and stops without SaveMember. The build authority
+below governs which package may be transferred at all.
+
+#### Transactional reviewer-decision authority (SQLite) — JSONL is audit-only
+
+Reviewer **authority** lives in a private, git-ignored, append-only SQLite database beside
+the approval ledger:
+
+`member_create_uat_decisions.sqlite3`
+
+Its legitimate private runtime companions (`-journal`, `-wal`, `-shm`) are git-ignored by
+exact name. The store holds **sanitised decision metadata only** — decision sequence,
+decision id, decision type, reviewer handle, timestamps, approval id, source record id,
+source fingerprint, schema version and a canonical record hash. It contains no member
+number, name, mobile number, email address, birthday, credential or absolute path.
+
+**Why this exists.** `append_ledger` writes the complete JSON line *before* `flush()` and
+`os.fsync()` return, so a real persistence failure can leave a complete, perfectly readable
+`approved` line on disk even though the command reported failure and durability was never
+confirmed. A later process read that line back and could reserve and publish a package from
+an approval that was never durably granted. Chaining more marker files cannot fix this —
+each new file needs its own acknowledgement, indefinitely — so the decision boundary moved
+inside a real transaction.
+
+> **The JSONL approval ledger is an append-only AUDIT RECORD ONLY. It never grants
+> package-building authority.** A decision authorises a package only when a committed
+> **activation row** exists for it in the decision store.
+
+**Schema (`member_create_uat_decisions/v2`).** Three append-only history tables, one singleton
+admission table, plus schema metadata: `store_admission` (the store's own operational authority —
+see below), `decision` (every approve, reject and hold attempt, with one shared monotonic
+`sequence`), `decision_activation` (the decisions that became authoritative) and `build_claim`
+(the single exclusive authorisation to build one package — see below). `UPDATE` and `DELETE`
+are rejected on all four by database triggers, so even a direct `sqlite3` session cannot
+rewrite or erase history or admission. Durability settings: `journal_mode=DELETE`,
+`synchronous=FULL`, `foreign_keys=ON`, explicit `BEGIN IMMEDIATE` transactions and a bounded
+busy timeout.
+
+### Store admission: the store's own operational authority (Amendment 9)
+
+Through Amendment 8, a decision store was operational because it *existed and looked canonical*.
+That is unsound in exactly the same shape as the JSONL defect it replaced. First-use creation
+publishes the completed store and only then proves its durability; if the process dies, the
+durability step fails, or the final acknowledgement is never heard, a **complete, perfectly
+readable, correctly versioned, singly linked, sidecar-free canonical store** is left on disk. The
+next process could not tell it apart from a fully proven one, so publication uncertainty was not
+sticky: it lasted only as long as the process that discovered it.
+
+> **A readable canonical file is never authority.** The store is operational only while it holds
+> the exact canonical **admission row** in `store_admission`, bound to the file now at that path.
+> Absence of that row is the durable blocking state, and it survives restart, reboot and any
+> number of later invocations.
+
+`store_admission` is append-only and mechanically **singleton**: `singleton INTEGER PRIMARY KEY
+CHECK (singleton = 1)`, so the primary key refuses a second row and the `CHECK` refuses any other
+key. `BEFORE UPDATE` and `BEFORE DELETE` triggers abort. There is no mutable "admitted" flag. The
+row binds:
+
+| Field | Meaning |
+| --- | --- |
+| `admission_id` | `adm_` + 32 hex; unique |
+| `operation_id` | `sop_` + 32 hex; the creation or reconciliation operation, unique |
+| `admission_mode` | closed enum: `created` or `reconciled` |
+| `admitted_at` | aware ISO-8601 instant (a naive value is an invalid admission) |
+| `schema_version` | must equal `member_create_uat_decisions/v2` |
+| `durability` | closed enum naming the primitive **actually confirmed** before admission |
+| `volume_identity` | normalised `dev:<hex>` device/volume id of the published file |
+| `file_identity` | normalised `ino:<hex>` inode / file index of the published file |
+| `record_hash` | canonical SHA-256 over **every** field above |
+
+The identity fields are **mismatch detectors, not cryptographic proof of provenance**. They
+detect that the file now at the path is not the file admission was written against — the ordinary
+replacement case in the supported threat model. A current mismatch fails closed.
+
+Admission is written **last**, in its own `BEGIN IMMEDIATE` transaction under `synchronous=FULL`,
+after publication and after the platform's durability primitive is confirmed. A raised `COMMIT` is
+resolved the same way every other commit in this tool is resolved — by closing, reopening through
+pure triage, and looking for the exact row and hash — never by inferring from the exception, and
+never with an automatic retry.
+
+**Two explicit validation modes, and no circular trust.** These are separate functions, not a
+flag a caller could forget:
+
+| Mode | Used by | Admission cardinality required |
+| --- | --- | --- |
+| Structural zero-admission (**internal only**) | a newly created operation-owned temporary; a just-published store before its first admission; controlled reconciliation; admission-COMMIT recovery | exactly **zero** (recovery alone may see zero *or* one) |
+| Operational one-admission | reviewer decisions, authority reads, build preflight, build claim, decision-sequence reads, and all three of decision / activation / claim COMMIT recovery | exactly **one**, with valid mode, aware instant, exact version, allowed durability primitive, correct canonical hash and a matching current identity binding |
+
+Both modes run the complete global validator first. Ordinary code can never reach the
+zero-admission mode. Nothing about file readability, a valid SQLite header, the canonical schema,
+the schema version, one hard link, absent sidecars, empty history or a successful publication is
+sufficient operational authority — **only the exact admission row is**.
+
+Two new sanitised classifiers report the two failures: `store_not_admitted` (canonical but no
+admission row at all) and `store_admission_invalid` (an admission row that is not the exact
+canonical fact, including an identity-binding mismatch). A third, `store_admission_uncertain`,
+reports an admission commit that could not be resolved.
+
+Alongside them, three fixed **final-path** classifiers say what happened to the store path itself —
+`published_not_admitted`, `published_and_admitted` and `competitor_published_untouched` — because
+"this operation left a non-operational store", "this operation left an operational one it could not
+re-verify" and "a competitor's store is intact" require different operator responses. They are
+tabulated under *Build outcomes and exit codes* below.
+
+**Amendment 7 raised the version deliberately.** Adding transactional build claims changes the
+authority model, so it is a new version rather than a disguised v1. A v1 store — like an empty,
+zero-byte, partial or foreign one — is refused **untouched**. There is no migration.
+
+**Pure pre-open triage decides before SQLite is opened (Amendment 8).** Amendment 7 opened an
+existing file with SQLite and only then decided whether it was canonical — but the first pragma
+it applied, `journal_mode=DELETE`, is *persistent*. Against a WAL-mode database it rewrote the
+header and removed the `-wal`/`-shm` companions, so a store the tool then refused had already
+been changed, and a foreign database's write-ahead log could be destroyed. Deleting a hot
+journal or WAL is the documented way to lose crash recovery.
+
+Every access to an existing store now begins with ordinary, non-following filesystem calls and
+**no SQLite call at all**:
+
+1. safe-local-path validation, and rejection of a symlink, junction or reparse point;
+2. a plain regular file with **exactly one hard link** (a multiply-named database has undefined
+   behaviour, because each name derives its own journal path);
+3. stable file identity captured, and re-checked after the header read;
+4. the complete 100-byte SQLite header read with a plain file handle, requiring the
+   `SQLite format 3\0` magic, a plausible page size, and header bytes 18 and 19 both equal to
+   `1` (rollback format; `2` means WAL);
+5. exact absence of `<store>-journal`, `<store>-wal` and `<store>-shm`, checked by exact path —
+   never by listing, globbing or sweeping a directory.
+
+> **A WAL header or any sidecar object is controlled-recovery-only.** The tool never opens,
+> checkpoints, rolls back, deletes, renames, recreates or repairs such a store — even when the
+> database otherwise looks canonical.
+
+**Read-only inspection and trusted writing are separate paths.** Non-mutating work — the build
+preflight, authority reads, decision-sequence reporting and all three COMMIT-recovery lookups —
+opens `mode=ro&cache=private`, sets only connection-local protections (`busy_timeout`,
+`foreign_keys`, and `query_only` as defence in depth *only*), **queries** `PRAGMA journal_mode`
+and requires `delete`, runs the complete global validator plus the bounded read inside one read
+transaction, closes, and then re-proves the file's identity, link count and sidecar absence.
+Writers repeat the pure triage, open `mode=rw&cache=private`, apply the same connection-local
+settings plus `synchronous=FULL`, verify the journal mode, take one `BEGIN IMMEDIATE`, re-run
+the **complete global validator inside that transaction**, and only then resolve and insert.
+`journal_mode` is assigned in exactly one place in the codebase: the brand-new temporary a
+creation operation exclusively owns. `immutable=1` is never used, because it disables change
+detection and can silently omit committed WAL-resident state.
+
+**Canonical validation is store-global.** Validation covers schema *meaning*, not just object
+names, through two independent mechanisms: the exact canonical `sqlite_schema` DDL text of every
+application object (which pins declared types, `NOT NULL`, defaults, primary keys,
+`AUTOINCREMENT`, `UNIQUE`, `CHECK` bodies, foreign-key columns and actions, index columns/order/
+uniqueness and trigger timing/event/target/body all at once), plus pragma-derived checks
+(`table_info`, `index_list`, `index_info`, `foreign_key_list`). The deterministic order is:
+`integrity_check`; `foreign_key_check`; the exact permitted object set and canonical DDL;
+columns, indexes, constraints and foreign keys; the **exact** `schema_meta` row set (exactly one
+row, key `schema_version`, value `member_create_uat_decisions/v2`, no other key); the admission
+row's shape and canonical hash; every `decision` row in sequence order; every activation row in
+activation-sequence order; every claim row in claim-sequence order; then the cross-table orphan
+and binding checks. Only SQLite's own `sqlite_sequence` and the implicit `sqlite_autoindex_*`
+indexes are tolerated.
+
+A store written by the earlier draft of this same `v2` version — carrying the identical
+`schema_version` value but no `store_admission` table — is refused with `missing_object` and is
+**never augmented**. Adding the admission table to a database this tool did not create is exactly
+the migration this contract forbids.
+
+Amendment 7 validated decision and activation content only inside the source-filtered authority
+query, so a malformed row under an unrelated source record survived into an authorised build.
+**A malformed row anywhere now blocks every operation**, whichever source record was requested.
+Timestamps are parsed into aware instants by one central parser and compared as instants, never
+as text: `approved_at >= recorded_at`, `expires_at >= approved_at`, `activated_at >=
+recorded_at`, and — new in Amendment 8 — `claimed_at >= approved_at` and `claimed_at >=
+activated_at`, both for every stored claim and, immediately before insertion, for the claim a
+build is about to mint. Two valid timestamps written in different UTC offsets order differently
+as strings than in time, so a lexical comparison is never the authority.
+
+Any mismatch refuses fail-closed and the store is **never** recreated, replaced, migrated,
+augmented or repaired.
+
+### The state parent is admitted before anything is created (Amendment 9)
+
+Through Amendment 8, creation called `mkdir(parents=True, exist_ok=True)` and asked whether the
+parent was a plain directory *afterwards*. That ordering cannot be made safe: recursive creation
+materialises a whole chain of directories, and a **pre-existing redirected component** — a symlink
+on POSIX, a junction or any other reparse point on Windows — is followed by every subsequent open,
+so the store could be created somewhere other than the state home the reviewer's ledger
+designates.
+
+> **The approval-ledger directory IS the required pre-existing state parent. This tooling never
+> creates it.** If it is missing, the command returns `store_parent_missing` and produces zero new
+> directories, zero files, zero temporaries, zero SQLite connections, zero audit appends and zero
+> reviewer-decision state.
+
+Before any directory creation, file creation or SQLite connection, every component from the
+platform's traversal anchor down to the state parent is classified **in order** and
+**non-following**. Refused: `.` and `..`, symlinks, junctions, any other reparse point,
+non-directories, unsupported device or volume transitions, and **any classification error** — an
+`lstat` failure is fail-closed, never "probably fine". The final parent's identity is captured and
+re-checked at four points: before the temporary is created, after it is created, before
+publication and after publication.
+
+Platform support is a narrow, closed boundary:
+
+| Platform | Supported | Refused fail-closed | Mechanism |
+| --- | --- | --- | --- |
+| Windows | fixed local **NTFS** drive-letter volume (`GetDriveTypeW == DRIVE_FIXED`, `GetVolumeInformationW` name `NTFS`) | UNC paths, mapped drives, remote/removable/CD-ROM/RAM/unknown drive classes, non-NTFS volumes, any reparse component, volume-query failures | pathname-based ordered classification; identity from the volume serial and file index |
+| POSIX | Linux local filesystems on one device from `/` (`ext2/3/4`, `xfs`, `btrfs`, `zfs`, `f2fs`, `jfs`, `reiserfs`, `bcachefs`, `ubifs`, `tmpfs`, `ramfs`, `overlay`) | every other or **unprovable** filesystem, including `nfs`, `cifs`/`smb*`, `9p`, `ceph`, `glusterfs`, `lustre`, FUSE remotes and WebDAV; any device transition | descriptor-relative walking with `O_DIRECTORY` plus `O_NOFOLLOW` and `dir_fd`, and exclusive create, `link`, `unlink` and the parent `fsync` through the verified descriptor |
+
+The filesystem type is proven from `/proc/self/mountinfo` by longest-mount-point match. An
+unrecognised type, or one that cannot be determined at all, is **unsupported** — the allowlist is
+deliberate, because an unprovable filesystem cannot support the durability and identity claims the
+admission fact records.
+
+**Documented residual race boundaries.** These are stated, not closed:
+
+- Python's `sqlite3` accepts a **pathname**, not a directory descriptor. Opening the temporary and
+  the published store is therefore pathname-based even on POSIX, so a classify-to-open race
+  remains between the identity checks and the SQLite open. No claim of descriptor-relative SQLite
+  is made anywhere in the code or in this document.
+- Windows operations are entirely pathname-based. **No Windows guarantee here is equivalent to
+  POSIX `dir_fd` or directory-fsync semantics.**
+- A privileged or otherwise non-cooperating process able to substitute a path component *during*
+  an open system call is **out of the supported threat model**. What is in scope, and detected, is
+  ordinary replacement or redirection by a cooperating or careless process.
+- `/proc/self/fd` paths, `openat2`, a custom SQLite VFS and undocumented native APIs are all
+  deliberately not used.
+
+### Creation is allowed only at a positively absent path
+
+The complete canonical store is built in an operation-owned temporary inside the **admitted**
+parent, validated in full in zero-admission structural mode, closed, proven to have no sidecar and
+exactly one link, flushed durably, and only then published. Exclusively creating the final path and
+*then* running DDL on it would leave a window in which a concurrent process opens a zero-byte file
+and correctly concludes it is not a canonical store; publishing an already-complete store removes
+that window, so the final path only ever appears fully formed. Publication is platform-specific:
+
+| Platform | Primitive | Durability reported | Temporary |
+| --- | --- | --- | --- |
+| Windows | `MoveFileExW` **without** `MOVEFILE_REPLACE_EXISTING`, with `MOVEFILE_WRITE_THROUGH` | `windows_move_write_through` | none survives a move, so no second name is ever created |
+| POSIX | no-replace `os.link` with every SQLite connection closed, parent-directory fsync, unlink of the operation-owned temporary, parent-directory fsync again — all descriptor-relative | `posix_link_and_directory_fsync` | `unlinked`; a failed unlink is reported, never suppressed |
+
+The published store must be a plain regular file with **exactly one link** and the identity this
+operation created. It is then re-validated in zero-admission structural mode, and only then is the
+**admission row** inserted and proven. Creation reports success only after that proof.
+
+If a competitor wins the race, their store is left byte-for-byte untouched and only this
+operation's own temporary is removed. If schema setup fails, the final path is never created and
+the temporary is deliberately left in place as evidence. A publication whose durability cannot
+be proven, a temporary that cannot be removed, or an admission commit that cannot be resolved is
+reported as a controlled-recovery state — never silently treated as an authorised store. Only a
+durability primitive actually confirmed on the running platform is ever named; Windows offers no
+directory-handle fsync, so none is claimed there.
+
+> **Anything that fails after the final path becomes visible but before admission completes leaves
+> the store non-operational across process restart.** No later process may treat it as ordinary
+> merely because it is readable and canonical. Recovery is the controlled reconciliation command
+> below, under explicit owner authority.
+
+### Truthful lost-race cleanup (Amendment 9)
+
+Amendment 8's cleanup helper had a quiet mode (`required=False`) used on the lost-race path, which
+**swallowed a real unlink failure** — so a surviving temporary was invisible to the operator at
+exactly the moment a competitor had become the authority. That mode is gone. There is one helper
+and every outcome is explicit.
+
+Immediately before unlinking, the exact pathname is re-classified and required to still be the
+regular file this operation exclusively created, compared by the identity captured at creation. A
+replacement object is **never** unlinked. Nothing is ever listed, globbed or swept, and no other
+pathname is touched.
+
+**Separate current-turn destructive-cleanup approval required (destructive-cleanup gate).** Before
+the deletion or removal below, obtain an explicit current-turn owner approval that names the exact
+target basename or path and the exact delete or remove operation. A step-5 preflight approval, a
+build or reviewer decision, a step-7 write approval, repository review or merge, and any prior-turn
+approval are none of them reusable for it.
+
+| Outcome | Reported as | Operator action |
+| --- | --- | --- |
+| Our temporary removed, or already absent | `store_not_absent` (lost race) / normal success (publication) | none |
+| Our temporary could not be removed after a **lost race** | `store_temp_cleanup_incomplete` with `decision_store_final_path_state = competitor_published_untouched` and `decision_store_modified: false` | delete exactly the one named `.mcuat_decisions_*` basename |
+| Our temporary could not be removed after **our own** publication | `store_temp_cleanup_incomplete` with `decision_store_final_path_state = published_not_admitted` | delete exactly that one file; until then the store is refused with `store_multiple_links` |
+| The temporary pathname now holds a different object | `store_temp_identity_changed` | review that one named basename by hand; it is never removed automatically |
+
+A losing creator's stale temporary is **operator hygiene evidence, not a global authority block**:
+the competing store keeps its own admission and its own single name. A self-published,
+multiply-linked store *is* globally blocked, by the existing one-link invariant.
+
+### Controlled reconciliation (`reconcile-store-admission`)
+
+A store that was published but never admitted is permanently blocked by design. The only way out
+is one explicit, separately named command. It is never invoked automatically and is not reachable
+from any ordinary command.
+
+```bash
+python scripts/member_create_uat_approval.py reconcile-store-admission --ledger <ledger-path> --confirm-controlled-reconciliation
+```
+
+> **Real use against a real store requires explicit current-turn owner authority naming that exact
+> store.** The confirmation switch is a deliberate second action, not a convenience default;
+> without it the command refuses and changes nothing. The exact store path is **derived** from the
+> ledger path, so the command cannot be pointed at an arbitrary database.
+
+It **mutates admission state only**. It never repairs, migrates, checkpoints, truncates, rewrites,
+renames or replaces the database image, and it never touches a sidecar-bearing store. Every
+precondition is proven before anything is written:
+
+- [ ] the state parent passes trusted-parent admission
+- [ ] pure pre-open triage passes (header, one link, no sidecar, stable identity)
+- [ ] the platform and filesystem are supported
+- [ ] the schema is exactly the canonical revised `v2`
+- [ ] admission cardinality is exactly **zero**
+- [ ] `decision`, `decision_activation` and `build_claim` are **all empty**
+- [ ] complete global validation passes
+- [ ] the file identity is unchanged across the whole precondition phase
+
+Any history at all returns `store_reconciliation_history_present` and changes nothing — admitting a
+store that already carries history would retroactively bless authority nobody proved. Then
+durability is **re-established before** admission:
+
+| Platform | Re-established | Recorded primitive |
+| --- | --- | --- |
+| POSIX | `fsync` of the final database file **and** of the verified parent directory descriptor | `posix_file_and_directory_fsync` |
+| Windows | flush of the final database file only, on a proven fixed local NTFS volume | `windows_file_flush_no_directory_fsync` — named for what it is; **no directory-fsync equivalent is claimed** |
+
+The admission COMMIT is resolved by the same exact-row lookup. If it stays unresolved, ordinary
+operations remain blocked and the command reports `store_admission_uncertain`. Reconciliation grants
+no reviewer authority: a fresh reviewer decision is still required afterwards.
+
+**Concurrency consequence you should expect.** Because a sidecar is refused unconditionally, a
+second tool process that meets a peer *mid-transaction* now fails **closed** with
+`store_sidecar_present` instead of waiting on the busy timeout and then committing. Nothing is
+written and nothing is changed, but the second command does not succeed. Run reviewer decisions
+one at a time. Pure lock contention — a peer holding the write lock without having written a
+page, so no journal exists — still reports the retryable `decision_not_recorded` /
+`build_claim_not_recorded` outcome.
+
+Three further transient refusals mean the same thing — "a peer is mid-operation, nothing was
+changed, try again deliberately": `store_locked`; `store_unreadable`, which Windows can report
+while a peer's no-replace move is in flight; and, on POSIX only, `store_multiple_links` during
+first-use creation, because the hard-link route briefly gives the completed store two names
+before the operation-owned temporary is unlinked. That window exists only while a store is being
+created; afterwards the link count is one permanently, and a persistent `store_multiple_links`
+means a real second name that an operator must remove.
+
+**Threat-model boundary.** The supported location is a stable, local, operator-controlled state
+directory, and the protections above cover malformed, foreign, partial and corrupt databases,
+WAL and sidecar residue, crash-interrupted state, ordinary path or file replacement detected by
+ordered identity checks, cooperating concurrent tool processes, competing first-store creators,
+and post-publication cleanup and durability uncertainty. They do **not** make any sequence atomic
+against a privileged, non-cooperating process that can substitute a trusted path component
+during an open system call; that is outside the supported model and is not claimed.
+
+**Decision state machine.** Each `approve` / `reject` / `hold` runs three ordered, separately
+committed steps:
+
+1. commit the **pending** decision row transactionally;
+2. append the JSONL **audit** event;
+3. commit the separate **activation** row — only after step 2 returned confirmed success.
+
+If any `COMMIT` raises, the tool closes the connection, **reopens the database** and looks
+for the exact row by its unique id: present with the expected canonical hash means it
+committed; absent means it did not (a clean retry is safe); unreadable fails closed. The
+outcome is never inferred from the exception, which proves only that the client did not hear
+the answer. There is no external activation acknowledgement file — the SQLite transaction and
+the reopen check are the commit authority.
+
+If the audit append fails, the decision stays **pending**: it is not activated, not deleted
+and not rewritten, the ledger is not truncated, replaced or repaired, and the tool reports
+`decision_authority = pending` with `approval_blocked` and `do_not_retry`.
+
+#### Exclusive build claim — the terminal approval-consumption fact
+
+Resolving authority and then closing the connection left a time-of-check/time-of-use window: a
+concurrent reviewer could commit an activated hold, an activated rejection, or a pending
+hold/rejection **after** the build read its authority but **before** it reserved or published,
+and the build would proceed on a stale approval snapshot.
+
+Checking harder cannot close that window; the check and the irreversible effect must share one
+atomic boundary. So `build-package` now runs in two phases.
+
+**Phase 1 — non-mutating preflight.** Validate arguments and safe paths; read and validate the
+source record; confirm the output basename is absent (strict no-clobber); open and validate the
+store; read the current authority, any existing claim and any reservation; construct the entire
+package in memory; validate it against the contract **and**, when `jsonschema` is installed, the
+real JSON Schema; compute the canonical payload hash. **No temporary file, no reservation, no
+claim and no ledger event is created in phase 1.**
+
+**Phase 2 — one `BEGIN IMMEDIATE` transaction.** Validate the complete canonical store;
+re-resolve the newest decision state; reject any newer pending decision; require the newest
+activated decision to be the exact intended unexpired approval (approval id, decision id,
+decision sequence, canonical decision hash, source id and fingerprint all matching); confirm no
+claim exists for the approval; confirm the operation id is unused; insert the exclusive
+`build_claim`; commit.
+
+Decision writers and build claims serialise on this same boundary, so a concurrent reviewer
+either loses the write lock (and the build's re-resolve observes its decision) or wins it (and
+the build's re-resolve observes it). There is no interleaving in which a stale approval
+authorises publication.
+
+`build_claim` binds: claim id, monotonic claim sequence, decision sequence, decision id,
+canonical decision hash, approval id, source record id, source fingerprint, operation id,
+package payload hash, intended package basename, claimed timestamp, schema version and its own
+canonical record hash. SQLite — not Python — enforces the invariants: `UNIQUE` on `approval_id`,
+`claim_id`, `decision_id` and `operation_id` makes a second claim, a duplicate claim, a duplicate
+decision and a reused operation id impossible; foreign keys onto `decision(decision_id)` and
+`decision(approval_id)` make a claim on a non-existent decision impossible, and — because
+`decision` already enforces that only an approval carries an `approval_id` — a claim on a
+**non-approved** decision impossible too; and a `BEFORE INSERT` trigger requires the claim's
+decision id, approval id, sequence, canonical hash, source id and fingerprint to describe one
+single **activated** approved decision.
+
+**Winner ordering.** If a reviewer decision commits first, the build observes it and refuses with
+no claim, no temporary, no reservation, no package and no build audit event. If the claim commits
+first, that one exact attempt is authorised and the approval is consumed; a later reviewer
+decision governs subsequent work only and never retroactively releases or cancels the committed
+claim. When two builds race, exactly one claim commits and the loser is blocked before creating
+anything.
+
+**Claim commit uncertainty.** If the claim's `COMMIT` raises, the connection is closed, the
+database is **reopened**, and the exact claim is looked up by claim id and canonical claim hash:
+present with matching bindings means committed (the attempt continues); absent means nothing was
+claimed, the approval is untouched and a later **explicit** retry is allowed (exit 11); anything
+indeterminate — unreadable store, hash mismatch or binding mismatch — fails closed with
+`do_not_retry`. Lock contention makes exactly one bounded attempt; there is no retry loop.
+
+**Post-claim publication, and post-claim failure.** Only after the claim is confirmed committed
+does the build create its temporary, write/flush/fsync it, create and durably persist the
+reservation, publish atomically with the existing no-replace mechanism, clean only its own
+temporary, and append the JSONL build audit event.
+
+**Every failure after the claim commits leaves the approval permanently consumed** — temporary
+creation, write, flush or fsync; reservation create, write, flush, fsync, parent-directory
+durability or path safety; publication; temporary cleanup; and every ledger open/write/flush/
+fsync, visible-but-unconfirmed or torn-append failure. A second build with that approval is
+blocked at any fresh output path. Nothing is ever deleted or altered: not the claim, a
+reservation, a published package, a competing package, a historical package, a torn audit ledger
+or an unrelated temporary. No directory is listed, globbed or swept; only exact-path checks are
+used.
+
+The filesystem reservation remains a crash and publication backstop. It is **no longer** the
+build-authorisation point — the committed SQLite claim is.
+
+#### Timestamps must be timezone-aware
+
+One central parser validates every authority and audit timestamp. A value such as
+`2026-07-28T00:00:00` parses through `datetime.fromisoformat` but has **no UTC offset**, so
+comparing it to an aware "now" raises an uncontrolled `TypeError`. A valid timestamp must
+therefore be a supported ISO-8601 string, parse successfully, **and** return a non-null
+`utcoffset()`. Naive values are refused with a sanitised classifier and the offending value is
+never printed.
+
+This covers `recorded_at`, `approved_at`, `expires_at`, `activated_at`, `claimed_at` and every
+timestamp-bearing JSONL audit event. Ordering is checked too: an expiry may not precede its
+approval, and an activation may not precede the decision it activates. Malformed historical data
+is never normalised into acceptance.
+
+**Authoritative ordering.** The newest **activated** decision for the source record wins.
+Approve, reject and hold share one monotonic sequence. A newer committed-but-unactivated
+decision **blocks** the build (`decision_pending_or_uncertain`) rather than falling back to
+an older activated approval — the pending decision may have been an attempted hold or
+rejection, and treating "we could not confirm the reviewer's latest instruction" as "use the
+previous approval" is the unsafe direction.
+
+| Store state | Build outcome |
+| --- | --- |
+| Newest activated decision is `approved` | Proceeds to the normal fingerprint, expiry and reservation gates |
+| Newest activated decision is `rejected` or `hold` | Refused (`decision_not_approved`) |
+| Any newer pending decision | Refused (`decision_pending_or_uncertain`) |
+| Malformed, inaccessible or incompatible store | Refused with sanitised integrity evidence |
+| No store, or no activated decision | Fresh reviewer decision required |
+
+`build-package` never creates the store: a missing store means no transactional approval
+authority exists.
+
+**Deliberate compatibility decision — a legacy JSONL-only approval is not authority.** A
+well-formed `approved` line written by any earlier version of this tool grants nothing,
+because no activation row exists for it. **After merge, a fresh reviewer decision is
+required before the v2 package is built.** This is intentional and is not a migration gap:
+the whole point is that a readable line can no longer authorise a package.
+
+#### Durable publication reservation and the terminal reservation rule
+
+The append-only ledger is the audit log, but it is written *after* the package is
+published, so it cannot be the only durable record that an approval was consumed. Before
+any final package can be published, the builder therefore creates one **durable, exclusive
+publication reservation** for that build, beside the ledger:
+
+`member_create_uat_reservation_<approval_id>.1.reservation`
+
+It is a write-ahead intent marker, not a second ledger: created exactly once with
+`O_CREAT | O_EXCL`, fsynced (plus a directory-entry fsync on POSIX; on Windows NTFS
+journals the entry with the file's own fsync, and the achieved mode is always reported as
+`reservation_durability`), then never rewritten, truncated or deleted by the tool. It binds
+`approval_id`, `source_record_id`, `source_fingerprint`, `operation_id`,
+`bound_package_payload_hash` and the output **basename** only — no member value, no
+credential, no absolute path. It is local operational state and is git-ignored.
+
+**The terminal reservation rule.** Once a reservation object for an approval exists — or
+may exist — that approval is **permanently consumed** for package-building purposes:
+
+- a plain build is refused;
+- `--rebuild` is refused;
+- a different, absent output pathname does not bypass it;
+- a new process, or a machine restart, does not bypass it;
+- **a readable ledger build event does not release it.**
+
+That last point is the reason the rule is absolute. A ledger `flush()`/`fsync()` failure can
+leave a *complete, perfectly readable* JSON build event whose durability was never
+confirmed, and on restart that record is indistinguishable from a properly persisted one.
+Treating it as proof of a finished build would let the same approval mint a second package.
+Confirming the confirmation cannot fix this — whatever acknowledges the ledger would itself
+need acknowledging — so the ledger simply stops being authority over approval reuse. It
+remains the audit record.
+
+The rule applies whether the reservation is confirmed durable, durability-uncertain,
+reconciled to a `build` event, reconciled to a `build_cleanup_incomplete` event, unmatched,
+malformed, foreign, accompanied by a complete-but-unconfirmed ledger line, or accompanied by
+a torn one. The reported `reservation_status` is recovery guidance only, never permission.
+
+On every build the tool checks that approval's reservation slots by direct path lookup; it
+never lists, globs or sweeps the directory, and never touches an unrelated reservation,
+package or temporary file. A consumed approval reports `status = approval_consumed`
+(exit 7). Recovery is always a fresh reviewer decision, or a controlled reconciliation under
+review — never a silent retry.
+
+Single use is a property of the **approval**, not of the member row: a fresh reviewer
+decision mints a new approval id and can build once, which is what makes recovery possible.
+
+Where a competing reservation **definitely** occupies the slot (the exclusive create lost the
+race), the approval is reported as `approval_consumed` with `reservation = consumed` (exit 7)
+and **no retry guidance at all** — the competitor terminally consumed the approval and its
+reservation is left byte-for-byte untouched. `not_created`, the only retryable reservation
+outcome, is claimed solely when a non-following existence re-check (`os.path.lexists` on the
+exact slot path) positively proves that no object is present. If existence cannot be
+determined, the approval is treated as consumed/uncertain. No directory is listed, globbed or
+swept at any point.
+
+#### Ledger integrity and exact audit schemas are fail-closed
+
+The ledger is read as an intact sequence of newline-terminated JSON objects **and every
+record must match an exact supported audit schema**. Validating only "is it a JSON object"
+left arbitrary dictionaries trusted, so a malformed decision or publication dictionary
+reached downstream timestamp parsing and field lookups and produced uncontrolled exceptions
+or partially trusted state.
+
+Supported shapes (every one is a shape this tool has actually written):
+
+| Event | Fields |
+| --- | --- |
+| `decision` | exactly the 10 decision fields; permitted decision values; reviewer/source-id/fingerprint formats; integer row hint in range; parseable timestamps; an approval requires a well-formed approval id plus parseable `approved_at` and `expires_at`; a rejection or hold requires all three approval fields to be null |
+| `build` | the 8 core publication fields, plus `reservation_file_name` from Amendment 4 onwards |
+| `build_cleanup_incomplete` | the same, plus `cleanup_incomplete = true` and `stale_temp_basename` |
+
+Unknown event types, missing fields, extra undeclared fields, wrong types, malformed
+timestamps, malformed ids and invalid hashes all produce
+`status = ledger_integrity_uncertain` (exit 8) with `approval_blocked`, `do_not_retry` and
+`controlled_recovery_required` — never a traceback. So do a torn (partially appended) final
+record, a non-object record, and read/decode failures.
+
+In that state the tool does **not** discard the malformed record, repair, truncate, rewrite
+or replace the ledger, delete any reservation, touch any published package, mutate the
+decision store, or continue to package construction. Only a fixed shape classifier is
+reported (`ledger_integrity`); the offending record is never printed, and no ledger content,
+member value, credential or absolute path is ever printed. Reconcile the ledger under review,
+then start a fresh reviewer decision.
+
+#### Build outcomes and exit codes
+
+Only `status = ok` (exit 0) means the build is complete: reservation durable, package
+published, temporary file removed, and exactly one `build` ledger event fsynced. Every
+other outcome is a distinct nonzero exit so no partial state can be mistaken for success.
+
+| Exit | `status` | Published? | Meaning and required action |
+| --- | --- | --- | --- |
+| 0 | `ok` | yes | Complete and durably recorded. Nothing to do. |
+| 2 | `error` | no | Ordinary refusal before the reservation boundary (no approval state consumed). Fix the cause and re-run. |
+| 3 | `cleanup_incomplete` | see below | Temporary file could not be removed. The ledger event **was** recorded. |
+| 4 | `ledger_record_incomplete` | yes | Published, but the durable ledger event could not be persisted. **Do not retry.** |
+| 5 | `reservation_incomplete` | no | This attempt's reservation was not created, or not confirmed durable. |
+| 6 | `publication_failed_after_reservation` | no | Reservation is durable but publication failed; the approval is blocked. |
+| 7 | `approval_consumed` / `rebuild_requires_fresh_approval` | no | The approval is terminally consumed (including by a competing reservation), or `--rebuild` (retired) was passed. Nothing was created or touched. |
+| 8 | `ledger_integrity_uncertain` | no | The audit ledger is not an intact append-only record, or a record fails its exact audit schema. Nothing was created, read further or repaired. |
+| 9 | `decision_audit_incomplete` / `decision_not_activated` / `decision_not_recorded` / `decision_store_integrity_uncertain` / `claim_timestamp_order_invalid` | no | Decision authority cannot be trusted: a decision is pending and non-authoritative, a commit outcome was unresolved, the store is not intact **or not admitted**, the state parent is missing, untrusted or unsupported, or a claim instant precedes the authority it binds. `decision_not_recorded` is the one retryable member of this row. |
+| 10 | `decision_store_missing` / `no_activated_decision` / `decision_not_approved` / `decision_pending_or_uncertain` / `decision_superseded_before_claim` | no | No activated decision authorises a build, or a reviewer decision won the race to the claim. A fresh reviewer decision is required. |
+| 11 | `build_claim_not_recorded` | no | The exclusive build claim was **not** committed, so the approval was **not** consumed. Nothing was created. A later **explicit** retry is allowed. |
+
+Exits 9, 10 and 11 create and touch nothing: no build claim, no temporary file, no reservation,
+no output file, no ledger event and no decision-store mutation. Exit 11 and exit 9's
+`decision_not_recorded` are the only build/decision outcomes that stay retryable; every other
+nonzero outcome after a committed claim sets `approval_blocked` and `do_not_retry`.
+
+Two post-claim statuses report a consumed approval with nothing published:
+`reservation_failed_after_claim` and `post_claim_publication_failed` (both exit 6, each naming
+the exact `failure_stage`).
+
+Exit 9 and exit 10 both create and touch nothing: no reservation slot, no temporary file, no
+output file, no ledger event and no decision-store mutation. Exit 9 with
+`decision_not_recorded` is the one decision outcome that stays retryable — nothing committed,
+so `approval_blocked` and `do_not_retry` are both false. Every other exit-9 status sets
+`approval_blocked`, `do_not_retry` and `controlled_recovery_required`.
+
+**Whether a NEW file exists is reported explicitly, not guessed from the reason.** Amendment 9
+reports `decision_store_final_path_state` whenever a refusal has something to say about the final
+store path, and derives `decision_store_modified` from it:
+
+**Separate current-turn destructive-cleanup approval required (destructive-cleanup gate).** Before
+the deletion or removal below, obtain an explicit current-turn owner approval that names the exact
+target basename or path and the exact delete or remove operation. A step-5 preflight approval, a
+build or reviewer decision, a step-7 write approval, repository review or merge, and any prior-turn
+approval are none of them reusable for it.
+
+| `decision_store_final_path_state` | `decision_store_modified` | Meaning and required action |
+| --- | --- | --- |
+| `published_not_admitted` | `true` | **This** operation published a store and then failed before its admission fact was proven. The store exists, is complete, and is **not operational**. Nothing was rolled back or deleted. Recovery is the controlled reconciliation command under owner authority, or removal of the non-operational store under review. |
+| `published_and_admitted` | `true` | This operation published a store **and** proved its admission row committed, but could not complete its own final operational verification — in practice because a peer opened a write transaction the moment the admission appeared. **No reconciliation is needed:** the admission fact exists, so the next invocation simply finds an operational store. Re-run the reviewer decision. |
+| `competitor_published_untouched` | `false` | A concurrent operation published the store first. Its store is byte-for-byte intact; only this operation's own temporary is at issue. |
+| absent | `false` | The store was left exactly as it was found. |
+
+Store states you may see at exit 9, and what to do:
+
+**Separate current-turn destructive-cleanup approval required (destructive-cleanup gate).** Before
+the deletion or removal below, obtain an explicit current-turn owner approval that names the exact
+target basename or path and the exact delete or remove operation. A step-5 preflight approval, a
+build or reviewer decision, a step-7 write approval, repository review or merge, and any prior-turn
+approval are none of them reusable for it.
+
+- `store_not_admitted`: the store is readable and canonical but carries **no admission fact**, so
+  it has never been admitted to operational use. This is the expected, correct state after any
+  interrupted first-use creation. Verify the state directory, then either remove the
+  non-operational store under review and start a fresh reviewer decision, or run the controlled
+  reconciliation command above **under explicit owner authority naming that exact store**.
+- `store_admission_invalid`: an admission row exists but is not the exact canonical fact — most
+  often because the file at that path is not the file admission was written against. Do not
+  repair it. Establish what replaced the store, then reconcile under review.
+- `store_admission_uncertain`: an admission commit could not be resolved, or reconciliation could
+  not re-establish durability. The store remains blocked. Re-run the controlled reconciliation
+  command under owner authority once the underlying cause is resolved.
+- `store_parent_missing`: the reviewer's approval-state directory does not exist. **Nothing at all
+  was created.** Create or restore that directory deliberately, then re-run.
+- `store_parent_untrusted`: a component of the state path is a symlink, junction, other reparse
+  point or not a directory, or could not be classified. Resolve the redirection deliberately;
+  never point the state path through a link.
+- `store_parent_unsupported`: the state path is on an unsupported volume or filesystem — a UNC
+  path, mapped or remote drive, removable drive, non-NTFS Windows volume, a device transition, or
+  a POSIX filesystem that is not a supported local one. Move the state directory to a fixed local
+  volume.
+- `store_parent_identity_changed`: the state directory was replaced mid-operation. Establish why
+  before re-running.
+- `store_publication_uncertain`: a first-use store was published but its durability could not be
+  proven. It is also, necessarily, not admitted.
+- `store_temp_cleanup_incomplete` / `store_temp_identity_changed`: see the cleanup table above.
+  `decision_store_temp_basename` names exactly one file (a basename, never a path).
+- `store_reconciliation_history_present`: reconciliation was attempted on a store that already
+  holds reviewer-decision, activation or claim history. Nothing was changed, and nothing should
+  be: that store's admission must not be manufactured after the fact.
+
+For `store_sidecar_present` or `store_journal_mode_unsupported`, do **not** delete, rename,
+checkpoint or roll back the journal, write-ahead log or shared-memory file. Establish why they
+are there — usually a crashed process or a concurrent writer — resolve it deliberately, and then
+start a fresh reviewer decision.
+
+Exit 3 (`cleanup_incomplete`) reports `stale_temp_basename` (a PII-free `.mcuat_pkg_*.tmp`
+name in the output directory) with `manual_cleanup_required`:
+
+**Separate current-turn destructive-cleanup approval required (destructive-cleanup gate).** Before
+the deletion or removal below, obtain an explicit current-turn owner approval that names the exact
+target basename or path and the exact delete or remove operation. A step-5 preflight approval, a
+build or reviewer decision, a step-7 write approval, repository review or merge, and any prior-turn
+approval are none of them reusable for it.
+
+- `publication = not_published`: nothing was published and nothing was reserved. Manually
+  delete the named stray temporary file, then re-run the build.
+- `publication = succeeded`: the final package WAS published and is recorded in the ledger
+  as `build_cleanup_incomplete`. Do NOT rebuild this operation (the builder refuses it):
+  manually delete the named stray temporary file, and if a new package is genuinely needed,
+  start a fresh reviewer decision.
+
+**Separate current-turn destructive-cleanup approval required (destructive-cleanup gate).** Before
+the deletion or removal below, obtain an explicit current-turn owner approval that names the exact
+target basename or path and the exact delete or remove operation. A step-5 preflight approval, a
+build or reviewer decision, a step-7 write approval, repository review or merge, and any prior-turn
+approval are none of them reusable for it.
+
+Exit 4 (`ledger_record_incomplete`) means the final package is published and complete but
+its durable ledger event was lost, or landed without confirmed durability. Never delete,
+move, rename or edit the published package. The durable reservation has terminally consumed
+this approval, so it cannot build again at any path, by any invocation. If
+`temp_cleanup = failed`, manually delete the named stray temporary file as well. A new
+package requires a fresh reviewer decision.
+
+Exits 5 and 6 publish nothing. Where `reservation = uncertain` or
+`publication_failed_after_reservation` is reported, the reservation entry is deliberately
+left in place: never delete, recreate or retry it, because removing it would turn "may have
+been consumed" into "definitely free". Reconcile it under review, or start a fresh reviewer
+decision. Where `reservation = not_created`, reservation creation demonstrably did not begin,
+no reservation object exists, no approval state was consumed, and a re-run is safe once the
+underlying filesystem cause is resolved.
+
+Exit 7 creates and touches nothing at all: no reservation slot, no temporary file, no output
+file and no ledger event. `approval_consumed` names the blocking reservation basename and its
+diagnostic `reservation_status`, and sets `manual_temp_cleanup_required` when the prior
+attempt also left a stray temporary. `rebuild_requires_fresh_approval` is the retired
+`--rebuild` flag being refused outright.
+
+Exit 8 also creates and touches nothing, and leaves the ledger byte-for-byte as found.
+
+Copy the package to the VM, then dry-run:
+
+```powershell
+& scripts\ac2_member_create_uat_runner.ps1 -PackagePath "C:\XB\create_uat\member_create_uat_package.json" -StateDir "C:\XB\create_uat\state" -JsonOut "C:\XB\create_uat\member_create_uat_result.json"
+```
+
+Expect `DRY_RUN_VALIDATED`. If it reports `BLOCKED_MEMBER_EXISTS`, stop: the member
+already exists and no creation is warranted.
+
+"""
+
+VM_GATE_REVIEWED_ACTIONS = {
+    VM_GATE_DEPLOY_STEP: VM_GATE_DEPLOY_REVIEWED_ACTION,
+    VM_GATE_PREFLIGHT_STEP: VM_GATE_PREFLIGHT_REVIEWED_ACTION,
+}
+
+
+# CommonMark opens the same list with any of these, so #118 already treats the choice as syntax.
+# Gate identity must agree, or an editor normalising a list would read as a wording change.
+VM_GATE_BULLET_MARKERS = ("-", "*", "+")
+# A7: the one line-level grammar the semantic region treats as SYNTAX rather than prose. CommonMark
+# opens and closes a fenced code block on a line whose first non-space run is three or more
+# backticks or three or more tildes, and allows at most three leading spaces -- at four the line is
+# indented-code content and not a fence, which is the same four-leading-space exclusion A3 already
+# applies to numbered ATX headings. Deliberately a fence-LINE test and nothing more: A7 authorises
+# no Markdown parser, no block model and no new finding key.
+#
+# This pattern recognises the RUN only. Under A10 the run is a necessary but not sufficient
+# condition for OPENING a block -- a backtick run whose info string carries a backtick opens
+# nothing -- so opening validity lives in `_fence_opening` and must be read from there, never from
+# this pattern alone. Closing validity is unchanged and lives in `_fence_closes`.
+VM_GATE_FENCE_LINE = re.compile(r"^ {0,3}(?P<fence>`{3,}|~{3,})")
+
+# A11 adds the SECOND raw block family CommonMark has, and nothing else. Accepted finding A11-F1
+# (PRRT_kwDOSbJI_s6Y_tlx): A7 to A10 model inherited FENCED-code state only, so an HTML block opened
+# in front of a protected authority renders that authority as raw HTML-block content while the
+# checker still compares it as operative approval prose and reports the complete guard clean. The
+# grammar below is spec 0.31.2 section 4.6, stated ONCE, and consumed by the single shared block
+# state model exactly as the fence grammar already is. It is still not a Markdown parser: no inline
+# HTML, no list model, no blockquotes, no tables, and no new finding key.
+#
+# All seven start conditions require zero to three leading spaces -- the same four-column exclusion
+# A3 holds for numbered ATX headings and A7 for fence lines. Types 1 to 5 END on their own marker
+# and may satisfy it on the START line; types 6 and 7 end at a blank line, and type 7 alone cannot
+# interrupt a paragraph, which is why paragraph state is tracked.
+VM_GATE_HTML_OPEN_LINE = re.compile(r"^ {0,3}(?=<)")
+VM_GATE_HTML_RAW_TAGS = ("script", "pre", "style", "textarea")
+VM_GATE_HTML_TYPE1 = re.compile(
+    r"^<(?:%s)(?=[ \t>]|$)" % "|".join(VM_GATE_HTML_RAW_TAGS), re.IGNORECASE)
+VM_GATE_HTML_TYPE4 = re.compile(r"^<![A-Za-z]")
+VM_GATE_HTML_TYPE6 = re.compile(r"^</?(?P<tag>[A-Za-z][A-Za-z0-9-]*)(?=[ \t>]|/>|$)")
+VM_GATE_HTML_TYPE7 = re.compile(
+    r"^ {0,3}(?:<(?P<open>[A-Za-z][A-Za-z0-9-]*)"
+    r"(?:[ \t]+[A-Za-z_:][A-Za-z0-9_.:-]*"
+    r"(?:[ \t]*=[ \t]*(?:[^ \t\"\'=<>`]+|\'[^\']*\'|\"[^\"]*\"))?)*[ \t]*/?>"
+    r"|</(?P<close>[A-Za-z][A-Za-z0-9-]*)[ \t]*>)[ \t]*$")
+# The prefix-decided families, in the order the spec lists them.
+VM_GATE_HTML_PREFIX_TYPES = (("<!--", 2), ("<?", 3), ("<![CDATA[", 5))
+VM_GATE_HTML_END_MARKERS = {
+    1: ("</script>", "</pre>", "</style>", "</textarea>"),
+    2: ("-->",),
+    3: ("?>",),
+    4: (">",),
+    5: ("]]>",),
+}
+VM_GATE_HTML_BLANK_TERMINATED = frozenset({6, 7})
+# The spec's own type-6 block tag list for CommonMark 0.31.2.
+VM_GATE_HTML_BLOCK_TAGS = frozenset("""
+address article aside base basefont blockquote body caption center col colgroup dd details
+dialog dir div dl dt fieldset figcaption figure footer form frame frameset h1 h2 h3 h4 h5 h6
+head header hr html iframe legend li link main menu menuitem nav noframes ol optgroup option
+p param search section summary table tbody td tfoot th thead title tr track ul
+""".split())
+# Line shapes that cannot be paragraph continuation text. Needed ONLY because type 7 cannot
+# interrupt a paragraph; nothing else in this contract consults paragraph state.
+VM_GATE_ATX_ANY_LINE = re.compile(r"^ {0,3}#{1,6}(?:[ \t].*)?$")
+VM_GATE_THEMATIC_BREAK_LINE = re.compile(
+    r"^ {0,3}(?:(?:\*[ \t]*){3,}|(?:-[ \t]*){3,}|(?:_[ \t]*){3,})$")
+
+# A8 adds the two things A7 deliberately stopped short of, both accepted as demonstrated false
+# cleans at exact P. Neither is a Markdown parser: each is one more LINE-LEVEL property that
+# decides how CommonMark renders the reviewed text, held to the same identity discipline A5/A6/A7
+# already apply to wording and fence position.
+#
+# 1. FENCED-BLOCK STATE (accepted A8-F2, PRRT_kwDOSbJI_s6YzUw3). A7 gave a fence LINE its own
+#    semantic unit but left every other physical line coalescing into one whitespace-joined prose
+#    run -- including the executable lines INSIDE the block a fence opens. Splitting the reviewed
+#    step-5 dry-run invocation immediately after `-PackagePath` therefore rejoined to the identical
+#    text: the guard reported clean while the documented command had become two lines, the second
+#    of which PowerShell reads as a bare string statement rather than an argument. Inside a fenced
+#    block a physical line is now its own unit, so one command line no longer compares equal to
+#    two. Outside a fence, prose still coalesces -- A8 is a fenced-LINE repair, not a decision that
+#    every document newline is authoritative.
+#
+#    Closing follows CommonMark rather than a bare toggle: a closing fence must use the SAME marker
+#    character, be at least as long as the opener, and carry no info string. Anything else stays
+#    block CONTENT, which is the fail-closed direction -- an unmatched or info-bearing fence changes
+#    the unit sequence instead of quietly ending the block.
+#
+# 2. CONTAINER INDENTATION (accepted A8-F3, PRRT_kwDOSbJI_s6YzUw7). `.strip()` erased leading
+#    indentation before comparison, so indenting a complete reviewed approval gate by four columns
+#    -- or one tab -- rendered it as an indented CODE BLOCK, literal example text rather than
+#    operative approval prose, while the gated actions stayed live and the guard reported clean.
+#
+#    Indentation is therefore CLASSIFIED rather than either erased or preserved byte-for-byte: a
+#    line carries the number of four-column indented-code steps it stands at, measured from the
+#    left edge of the block it belongs to. Zero to three columns cannot open an indented code
+#    block, so an editor's harmless re-indentation stays non-material; four columns, a tab, or any
+#    mixture reaching column four is a different rendered block and fails closed.
+VM_GATE_INDENT_TAB_STOP = 4
+VM_GATE_INDENTED_CODE_COLUMNS = 4
+# The ONE list grammar the reviewed gate and action regions actually use: a CommonMark bullet at
+# the block's left edge, whose continuation lines are indented to the marker's content column. The
+# content column is the marker plus one space, which is how every reviewed bullet is written.
+# Deliberately not a container model: no ordered lists, no nesting, no blockquotes and no tables
+# are tracked, because the reviewed grammar contains no indented instance of any of them (asserted
+# by a control), and anything unrecognised simply falls back to the block's left edge.
+VM_GATE_LIST_CONTENT_OFFSET = 2
+
+# Everything a resolved step must prove. When the structural layout CANNOT be resolved -- no
+# gate, two gates, no boundary, two boundaries, or a boundary before its gate -- the step is
+# marked wholly unmet instead of being partially evaluated against a slice that may not mean what
+# it appears to. That is the fail-closed half of the A1 contract.
+VM_GATE_DEPLOY_UNMET = frozenset((
+    "deploy_pre_gate_content", "deploy_vm_not_named", "deploy_operation_not_bound",
+    "deploy_not_current_turn", "deploy_substitution_not_denied", "deploy_prior_turn_not_denied",
+    "deploy_stop_boundary_missing", "deploy_execution_not_denied", "deploy_operation_missing",
+    "deploy_state_preparation_missing", "deploy_gate_text_changed",
+    "deploy_action_text_changed",
+))
+# A4 replaces `preflight_prefix_changed` with the same structural rule step 4 already carries.
+# Once the gate moves to the top of the step there is nothing legitimate left in front of it, so
+# the pre-gate region is simply blank -- strictly stronger than any digest, and the reason the
+# case-folding finding is answered by deleting the digest rather than by re-hashing it.
+VM_GATE_PREFLIGHT_UNMET = frozenset((
+    "preflight_pre_gate_content", "preflight_vm_not_named", "preflight_private_data_not_bound",
+    "preflight_source_record_not_bound",
+    "preflight_package_build_not_bound", "preflight_environment_not_bound",
+    "preflight_target_not_bound",
+    "preflight_transfer_not_bound", "preflight_transfer_destination_not_bound",
+    "preflight_dry_run_not_bound", "preflight_not_current_turn",
+    "preflight_substitution_not_denied", "preflight_prior_turn_not_denied",
+    "preflight_save_member_not_denied", "preflight_stop_boundary_missing",
+    "preflight_approval_command_missing", "preflight_package_build_missing",
+    "preflight_environment_setup_missing",
+    "preflight_operation_missing", "preflight_runner_invocation_missing",
+    "preflight_gate_text_changed", "preflight_action_text_changed",
+))
+
+# --- A11: the declared finding-key surface --- #
+# A11 adds exactly these, and retires nothing. `safety_boundary_surfaces_incomplete` is RENAMED to
+# `safety_boundary_surfaces_incomplete` because the contract it carries is no longer a four-way
+# claim; the coverage it reports is unchanged and every control that asserted it still asserts it
+# under the truthful name.
+VM_GATE_A11_NEW_KEYS = (
+    "protected_operation_outside_region",
+    "destructive_cleanup_not_gated",
+    "destructive_cleanup_gate_text_changed",
+    "mapping_step_missing", "mapping_step_ambiguous", "mapping_heading_changed",
+    "mapping_gate_missing", "mapping_gate_marker_ambiguous", "mapping_boundary_missing",
+    "mapping_boundary_ambiguous", "mapping_gate_after_action", "mapping_pre_gate_content",
+    "mapping_gate_text_changed", "mapping_action_text_changed", "mapping_workflow_not_bound",
+    "mapping_spreadsheet_not_bound", "mapping_operations_not_bound", "mapping_not_current_turn",
+    "mapping_prior_turn_not_denied", "mapping_substitution_not_denied",
+    "mapping_stop_boundary_missing",
+    "recovery_step_missing", "recovery_step_ambiguous", "recovery_heading_changed",
+    "recovery_gate_missing", "recovery_gate_marker_ambiguous", "recovery_boundary_missing",
+    "recovery_boundary_ambiguous", "recovery_gate_after_action", "recovery_pre_gate_content",
+    "recovery_gate_text_changed", "recovery_action_text_changed",
+    "recovery_account_book_not_bound", "recovery_read_only_not_bound",
+    "recovery_write_authority_not_denied", "recovery_not_current_turn",
+    "recovery_prior_turn_not_denied", "recovery_substitution_not_denied",
+    "recovery_stop_boundary_missing",
+)
+# A6 declared 50; A7 to A10 added none. A11 adds the 39 above and renames one, so 50 become 89.
+# That 89 is now the SEMANTIC surface. R1 adds the seal key to the PUBLIC surface only, so the
+# public count is 90; both are declared, so neither can drift silently against the other.
+VM_GATE_A11_FINDING_KEY_COUNT = 89
+VM_GATE_R1_FINDING_KEY_COUNT = VM_GATE_A11_FINDING_KEY_COUNT + 1
+# R2 adds exactly one semantic key -- the step-9 n8n target binding -- and retires none. The A11 and
+# R1 constants above are historical and stay truthful about what those revisions declared; the R2
+# constants are derived from them rather than replacing them, so a later revision cannot silently
+# repurpose a count that an earlier control still asserts.
+VM_GATE_R2_NEW_KEYS = ("mapping_n8n_target_not_bound",)
+VM_GATE_R2_SEMANTIC_FINDING_KEY_COUNT = VM_GATE_A11_FINDING_KEY_COUNT + len(VM_GATE_R2_NEW_KEYS)
+VM_GATE_R2_FINDING_KEY_COUNT = VM_GATE_R2_SEMANTIC_FINDING_KEY_COUNT + 1
+# R3 closes the same root in the four remaining places the reviewed Step-5/Step-9 gates left a
+# concrete target selectable AFTER approval: the private source record, the fixed VM package
+# destination and its replacement, the Google credential, and the spreadsheet row's operation id.
+# Four semantic keys, none retired, so 90 become 94 and the public surface 95. Derived from the R2
+# constants for the same reason R2 derived from A11: a later revision must not be able to
+# repurpose a count an earlier control still asserts.
+VM_GATE_R3_NEW_KEYS = (
+    "preflight_source_record_not_bound",
+    "preflight_transfer_destination_not_bound",
+    "mapping_google_credential_not_bound",
+    "mapping_operation_id_not_bound",
+)
+VM_GATE_R3_SEMANTIC_FINDING_KEY_COUNT = (VM_GATE_R2_SEMANTIC_FINDING_KEY_COUNT
+                                         + len(VM_GATE_R3_NEW_KEYS))
+VM_GATE_R3_FINDING_KEY_COUNT = VM_GATE_R3_SEMANTIC_FINDING_KEY_COUNT + 1
+# The COMPLETE set of keys an EMPTY document cannot report, because each needs a document that
+# actually contains the landmark it is about. The pre-A11 eleven are carried forward unchanged; A11
+# adds the two step-9/step-10 ambiguity, ordering and heading families, plus the three keys that
+# need a real operation, a real destructive instruction or a real cleanup gate to exist at all.
+VM_GATE_A11_NEEDS_A_REAL_DOCUMENT = frozenset((
+    "deploy_gate_after_mutation", "preflight_gate_after_external_action",
+    "deploy_gate_marker_ambiguous", "deploy_boundary_ambiguous",
+    "preflight_gate_marker_ambiguous", "preflight_boundary_ambiguous",
+    "deploy_step_ambiguous", "deploy_heading_changed",
+    "preflight_step_ambiguous", "preflight_heading_changed",
+    "safety_boundary_ambiguous",
+    "mapping_gate_after_action", "mapping_gate_marker_ambiguous", "mapping_boundary_ambiguous",
+    "mapping_step_ambiguous", "mapping_heading_changed",
+    "recovery_gate_after_action", "recovery_gate_marker_ambiguous", "recovery_boundary_ambiguous",
+    "recovery_step_ambiguous", "recovery_heading_changed",
+    "protected_operation_outside_region", "destructive_cleanup_not_gated",
+    "destructive_cleanup_gate_text_changed",
+))
+# A11 appends its own declared keys to the tuple below rather than interleaving them, so the
+# pre-A11 surface stays readable as one block and the added surface as another. A11 retires nothing
+# and renames exactly one key: `safety_boundary_not_four_way` becomes
+# `safety_boundary_surfaces_incomplete`, because the contract it carries is no longer a four-way
+# claim. The coverage that key reports is unchanged and every control that asserted it still does.
+#
+# Every finding key this contract can report. A4 retired `preflight_prefix_changed` and added
+# eight: the step-5 blank pre-gate rule, the three new step-5 approval bindings, the three
+# post-gate operation-existence keys (package approval, package build, environment setup) and
+# safety-boundary ambiguity. 39 keys became 46. A5 adds the two reviewed gate-block identities and
+# retires nothing, so 46 become 48. No new command or safety-boundary key is introduced: F-B is
+# closed by holding the EXISTING four command keys to an honest standard, and F-D by correcting
+# the text `safety_boundary_surfaces_incomplete` already governs. A6 adds the two reviewed ACTION-region
+# identities, so 48 become the 50 declared below; A7 and A8 add none. Every A7 and A8 repair is
+# carried by an existing key -- the fence-position, fenced-line and container-indentation repairs
+# by the four `*_text_changed` identities, and the complete Safety-boundary authority by
+# `safety_boundary_surfaces_incomplete`.
+VM_GATE_SEMANTIC_FINDING_KEYS = (
+    "deploy_action_text_changed", "preflight_action_text_changed",
+    "deploy_boundary_ambiguous", "deploy_boundary_missing", "deploy_execution_not_denied",
+    "deploy_gate_after_mutation", "deploy_gate_marker_ambiguous", "deploy_gate_missing",
+    "deploy_gate_text_changed",
+    "deploy_heading_changed", "deploy_not_current_turn", "deploy_operation_missing",
+    "deploy_operation_not_bound",
+    "deploy_pre_gate_content", "deploy_prior_turn_not_denied", "deploy_state_preparation_missing",
+    "deploy_step_ambiguous", "deploy_step_missing", "deploy_stop_boundary_missing",
+    "deploy_substitution_not_denied",
+    "deploy_vm_not_named", "preflight_approval_command_missing", "preflight_boundary_ambiguous",
+    "preflight_boundary_missing",
+    "preflight_dry_run_not_bound", "preflight_environment_not_bound",
+    "preflight_environment_setup_missing", "preflight_gate_after_external_action",
+    "preflight_gate_marker_ambiguous", "preflight_gate_missing", "preflight_gate_text_changed",
+    "preflight_heading_changed",
+    "preflight_not_current_turn",
+    "preflight_operation_missing", "preflight_package_build_missing",
+    "preflight_package_build_not_bound", "preflight_pre_gate_content",
+    "preflight_prior_turn_not_denied", "preflight_private_data_not_bound",
+    "preflight_runner_invocation_missing", "preflight_save_member_not_denied",
+    "preflight_step_ambiguous", "preflight_step_missing", "preflight_stop_boundary_missing",
+    "preflight_substitution_not_denied", "preflight_target_not_bound",
+    "preflight_transfer_not_bound", "preflight_vm_not_named", "safety_boundary_ambiguous",
+    "safety_boundary_surfaces_incomplete",
+) + VM_GATE_A11_NEW_KEYS + VM_GATE_R2_NEW_KEYS + VM_GATE_R3_NEW_KEYS
+# R1 adds exactly one key to the PUBLIC surface -- the reviewed-runbook seal -- and retires none.
+# It is deliberately NOT a member of the semantic surface: the semantic layer cannot report it, and
+# the boundary between "the parser recognised a defect" and "this is not the reviewed document"
+# must stay visible in the declaration itself.
+VM_GATE_FINDING_KEYS = VM_GATE_SEMANTIC_FINDING_KEYS + (REVIEWED_RUNBOOK_SEAL_KEY,)
+
+
+def _semantic_heading(line):
+    """The RENDERED identity of an ATX heading line, as a reviewer sees it.
+
+    Whitespace is collapsed, as everywhere else in this contract, and a CommonMark closing `#`
+    sequence is removed because it is syntax rather than content. ``line.strip()`` first, so a
+    CRLF checkout's trailing ``\\r`` cannot sit between the closing run and the end anchor and
+    quietly defeat the strip.
+    """
+    return _flat(VM_GATE_ATX_CLOSING.sub("", line.strip()))
+
+
+def _fence_opening(line):
+    """``(marker, length)`` when ``line`` OPENS a fenced block, else ``None``.
+
+    A9 states the accepted opening grammar ONCE. It was previously written inline inside
+    ``_semantic_markdown_region``, and a second document-prefix scan that spelled the same rule a
+    second way is exactly the drift the accepted A3 finding is about. Every A7/A8/A9 consumer --
+    ``_block_state_after``, ``_block_state_at``, ``_region_block_state``, ``_unblocked`` and
+    ``_semantic_markdown_region`` -- therefore reaches opening validity only through here, which is
+    why the A10 repair below is one condition in one place.
+
+    A10: an opening RUN is not by itself an opening FENCE. CommonMark ends a BACKTICK fence's info
+    string at the first backtick, so a backtick run whose info string carries a backtick opens no
+    block at all and stays an ordinary paragraph line. A9 accepted any run regardless of what
+    followed it, so such a line opened a block that the next GENUINE backtick opener then satisfied
+    as a closer: inherited state cancelled to nothing and a protected authority that CommonMark
+    renders as the literal contents of a code block was compared as operative prose and reported
+    clean. Only the backtick marker is restricted -- a TILDE fence's info string may contain
+    backticks, tildes or both, and rejecting it would delete accepted A9 fail-closed behaviour
+    rather than repair this defect.
+
+    Deliberately still a fence-LINE test: no info-string model, no Markdown parser, no change to
+    closing semantics (``_fence_closes`` already admits no info string, so the restriction adds
+    nothing there and is not spelled a second time), no change to heading discovery and no new
+    finding key.
+    """
+    run = VM_GATE_FENCE_LINE.match(line)
+    if run is None:
+        return None
+    marker = run.group("fence")
+    # The suffix is taken from the RAW line after the matched run, so a backtick anywhere in the
+    # info string disqualifies the opener wherever it sits. Backticks adjacent to the run were
+    # already consumed BY the run, which is a longer valid opener rather than an invalid one.
+    if marker[0] == "`" and "`" in line[run.end():]:
+        return None
+    return marker[0], len(marker)
+
+
+def _fence_closes(line, fence):
+    """True when ``line`` CLOSES the open block ``fence``.
+
+    The accepted closing grammar, also stated once: the same marker character, a run at least as
+    long as the opener, and no info string. Anything else stays block CONTENT, which is the
+    fail-closed direction.
+    """
+    run = VM_GATE_FENCE_LINE.match(line)
+    if run is None:
+        return False
+    marker = run.group("fence")
+    return (marker[0] == fence[0] and len(marker) >= fence[1]
+            and not line.strip()[len(marker):].strip())
+
+
+def _html_block_opening(line, in_paragraph):
+    """The CommonMark HTML-block TYPE ``line`` opens, or ``None``.
+
+    A11 states the HTML start conditions ONCE, for exactly the reason A9 states the fence opening
+    grammar once: a second spelling of the same rule is the drift the accepted A3 finding is about.
+    Every consumer reaches HTML opening validity only through here.
+    """
+    body = line.rstrip("\r")
+    if VM_GATE_HTML_OPEN_LINE.match(body) is None:
+        return None
+    text = body.lstrip(" ")
+    if VM_GATE_HTML_TYPE1.match(text):
+        return 1
+    for prefix, kind in VM_GATE_HTML_PREFIX_TYPES:
+        if text.startswith(prefix):
+            return kind
+    if VM_GATE_HTML_TYPE4.match(text):
+        return 4
+    found = VM_GATE_HTML_TYPE6.match(text)
+    if found is not None and found.group("tag").lower() in VM_GATE_HTML_BLOCK_TAGS:
+        return 6
+    # Type 7 alone cannot interrupt a paragraph, and its tag name may not be a raw-text tag.
+    if in_paragraph:
+        return None
+    seven = VM_GATE_HTML_TYPE7.match(body)
+    if seven is None:
+        return None
+    name = (seven.group("open") or seven.group("close")).lower()
+    return None if name in VM_GATE_HTML_RAW_TAGS else 7
+
+
+def _html_block_ends(line, kind):
+    """True when ``line`` satisfies the end condition of an open HTML block of type ``kind``."""
+    body = line.rstrip("\r")
+    if kind in VM_GATE_HTML_BLANK_TERMINATED:
+        return not body.strip()
+    lowered = body.lower()
+    return any(marker in lowered for marker in VM_GATE_HTML_END_MARKERS[kind])
+
+
+def _breaks_paragraph(line):
+    """True when ``line`` cannot be paragraph continuation text.
+
+    Deliberately the smallest set the type-7 start condition needs: a blank line, an ATX heading and
+    a thematic break. A11 authorises no container model beyond that.
+    """
+    body = line.rstrip("\r")
+    return bool(VM_GATE_ATX_ANY_LINE.match(body) or VM_GATE_THEMATIC_BREAK_LINE.match(body))
+
+
+def _block_opening(line, in_paragraph=False):
+    """The RAW BLOCK ``line`` opens: ``("fence", marker, length)``, ``("html", type)`` or ``None``.
+
+    The ONE place the two raw block families are combined. A fence line begins with a backtick or
+    tilde run and an HTML block line with `<`, so the two grammars cannot both match.
+    """
+    fence = _fence_opening(line)
+    if fence is not None:
+        return ("fence",) + fence
+    kind = _html_block_opening(line, in_paragraph)
+    return None if kind is None else ("html", kind)
+
+
+def _block_closes(line, state):
+    """True when ``line`` ends the open raw block ``state``, whichever family it belongs to."""
+    if state[0] == "fence":
+        return _fence_closes(line, state[1:])
+    return _html_block_ends(line, state[1])
+
+
+def _block_state_after(text, state=None):
+    """The raw-block state left open after every physical line of ``text``.
+
+    Pure text in, state out. An unclosed opener stays open through the end of ``text``, which is
+    what CommonMark does and the fail-closed direction here: an authority after it is raw content.
+    A11 widens the state from fenced code to fenced code PLUS the seven HTML-block families; the
+    fence half is byte-for-byte the accepted A7 to A10 behaviour.
+    """
+    in_paragraph = False
+    for line in text.splitlines():
+        if state is None:
+            opening = _block_opening(line, in_paragraph)
+            if opening is None:
+                in_paragraph = bool(line.strip()) and not _breaks_paragraph(line)
+                continue
+            in_paragraph = False
+            # Types 1 to 5 may satisfy their end condition on the START line.
+            state = (None if opening[0] == "html" and _html_block_ends(line, opening[1])
+                     else opening)
+        elif _block_closes(line, state):
+            state, in_paragraph = None, False
+    return state
+
+
+def _block_state_at(text, offset, state=None):
+    """The fenced-block state open where ``offset``'s own line BEGINS, or ``None``.
+
+    The whole A9 repair, and deliberately the smallest thing that answers the accepted A9-F1
+    question: "does required authority begin while inherited document fence state is open?"
+
+    Accepted finding A9-F1. ``_semantic_markdown_region`` starts every supplied slice with no
+    fence open, which is sound only when the slice itself begins outside one. Several protected
+    authorities are extracted from the MIDDLE of the complete document -- both numbered steps
+    through ``_numbered_step_section``, the `## Safety boundary` through its own opening scan, and
+    the step-3 host-sync gate through a bare ``find()`` -- so a valid opener placed in FRONT of an
+    authority renders the whole of it as literal code while the checker compares it as operative
+    prose and reports clean.
+
+    Only text strictly in front of the authority's own line is inspected, because "inherited"
+    means the state the document already carried: the authority's first line cannot be the block
+    that hides it. ``state`` seeds the scan when the caller already knows the state at the start of
+    the text it is passing, so a step's regions are resolved from the state its section inherited
+    rather than re-scanned from the top of the document.
+
+    A11 widens "the state" from fenced code to fenced code PLUS the seven CommonMark HTML-block
+    families, at this one shared authority, so every A9/A10 consumer gains the repair at once.
+
+    Deliberately NOT a Markdown parser and not a change to heading discovery: a numbered heading or
+    a gate marker inside fenced code still COUNTS as an occurrence, so the conservative
+    fail-closed debt accepted at PRRT_kwDOSbJI_s6YQTNF stays exactly as it was and A9 can only add
+    fail-closed behaviour, never remove it. No block model, no list model, no shell parser and no
+    new finding key.
+    """
+    return _block_state_after(text[:text.rfind("\n", 0, offset) + 1], state)
+
+
+def _region_block_state(section, region, state):
+    """The state ``region`` -- a SUFFIX slice of ``section`` -- inherits, given ``section``'s own.
+
+    Both reviewed regions of a resolved step are suffix slices of that step, so the text deciding
+    what they inherit is simply the section text in front of them.
+    """
+    return _block_state_after(section[:len(section) - len(region)], state)
+
+
+def _semantic_markdown_region(region, state=None):
+    """The RENDERED identity of a reviewed Markdown region. Pure text in, comparable value out.
+
+    The shared normalisation both reviewed identities use -- the gate block (A5) and the action
+    region (A6). Three things are treated as syntax, each because this contract already treats it
+    that way everywhere else:
+
+    * ordinary whitespace, so a reflow or a CRLF checkout is not drift;
+    * the line-start CommonMark bullet marker, since `-`, `*` and `+` open the same list (#118);
+    * the code-fence LINE, because where a fence sits is what decides whether the text after it is
+      a rendered heading and a rendered approval gate or the literal contents of a code block.
+
+    Everything else is CONTENT. Case is preserved, punctuation is preserved, command tokens and
+    code-fence delimiters are preserved, and no word is dropped, because each of those would let
+    contradictory prose compare equal to compliant prose -- which is the defect this replaces, not
+    a repair for it. Blank lines are dropped rather than encoded, so paragraph regrouping is not
+    drift either, while any added, removed or reworded clause changes the result and fails closed.
+
+    A6-F4: the marker is canonicalised when ORDINARY HORIZONTAL WHITESPACE follows it, not only a
+    literal space. A5 tested ``marker + " "``, so ``*\\titem`` and ``+\\titem`` reported drift while
+    ``- item``, ``* item``, ``+ item`` and ``-\\titem`` were accepted -- ``-\\t`` passing only by
+    accident of the whitespace collapse below. CommonMark expands the tab and opens the same list
+    item either way, so the promise A5 made about `-`/`*`/`+` is now actually kept. The test stays
+    line-start only and requires the SECOND character to be whitespace, so ``--flag`` and a bare
+    ``-`` are untouched.
+
+    A7-F1: the return value is a SEQUENCE OF UNITS rather than one flat string, and a
+    fence-significant physical line is its own unit. Under A6 every physical newline was ordinary
+    whitespace, so a required command line that absorbed the standalone closing fence following it
+    normalised to the identical string and the complete guard reported clean -- while CommonMark,
+    which needs a closing fence to be its own line, no longer closed the block at all. Ordinary
+    prose lines still COALESCE into one whitespace-joined run between fences, which is what keeps
+    paragraph reflow, blank-line regrouping and marker equivalence non-material: A7 is a
+    fence-POSITION repair, not a decision that newlines are significant. A fence unit carries the
+    whole stripped fence line, so the marker character, the fence length, the info string and any
+    command text joined into it are all compared rather than assumed equal.
+
+    A8-F2: a line INSIDE the block a fence opens is its own unit too. A7 stopped at the fence line
+    itself, so the executable lines it delimits still coalesced and one command line normalised
+    identically to two -- the accepted case is written out beside ``VM_GATE_INDENT_TAB_STOP``.
+
+    A8-F3: every prose unit carries the INDENTED-CODE CLASS of the lines it was built from, and a
+    run ends when that class changes. Zero to three columns is class 0 and stays non-material;
+    four columns, a tab, or any mixture reaching column four is a different rendered block. The
+    class is measured from the left edge of the enclosing block, so re-indenting a whole gate by up
+    to three columns -- bullets and their continuations together -- stays class 0 throughout, while
+    indenting it by four turns every line into class 1 and fails closed.
+
+    A9-F1: ``state`` is the state the region INHERITS rather than an assumption that it begins
+    outside one. Every reviewed region here is a slice taken from the middle of a larger document,
+    so a fence opened in front of it decides whether its text renders as operative prose or as the
+    literal contents of a code block. Seeded with an open fence the whole region normalises to
+    ``code`` units, which cannot equal a reviewed identity built from prose, and the existing
+    identity finding fails closed. The default stays ``None`` so the reviewed CONSTANTS -- which
+    really are whole documents in themselves -- keep exactly the identity they had.
+
+    A11-F1: that inherited state now covers CommonMark's SECOND raw block family as well. An HTML
+    block opened in front of a reviewed region renders the whole of it as raw HTML-block content,
+    so every line it swallows becomes an ``html`` unit, which cannot equal a reviewed prose unit and
+    fails the existing identity closed. Types 6 and 7 end at a BLANK line, so blank lines are
+    resolved against an open HTML block before they are dropped; outside one they stay non-material
+    exactly as A6 to A8 established. Paragraph state is tracked for one reason only: type 7 alone
+    among the seven cannot interrupt a paragraph.
+    """
+    units, prose, prose_class = [], [], 0
+    block_edge, content_column = 0, 0
+    in_paragraph = False
+    for line in region.splitlines():
+        stripped = line.strip()
+        # A11-F1: an open HTML block is resolved FIRST, because for types 6 and 7 a blank line is
+        # the end condition rather than something to drop. Every line inside the block becomes an
+        # `html` unit, which cannot equal a reviewed prose unit, so an authority rendered as raw
+        # HTML-block content fails the existing identity closed.
+        if state is not None and state[0] == "html":
+            if not stripped:
+                if _html_block_ends(line, state[1]):
+                    state = None
+                continue
+            units.append(("html", " ".join(stripped.split())))
+            if _html_block_ends(line, state[1]):
+                state = None
+            continue
+        if not stripped:
+            in_paragraph = False
+            continue
+        opening = _block_opening(line, in_paragraph)
+        if state is not None:
+            # A closing fence repeats the marker, is at least as long, and adds no info string.
+            # Anything else stays block CONTENT, which is the fail-closed direction: an unmatched
+            # or info-bearing fence changes the unit sequence rather than quietly ending the block.
+            if _fence_closes(line, state[1:]):
+                units.append(("fence", " ".join(stripped.split())))
+                state = None
+            else:
+                units.append(("code", " ".join(_semantic_bullet(stripped).split())))
+            in_paragraph = False
+            continue
+        # Matched against the RAW line, because indentation has to be judged before it is
+        # stripped: at four leading spaces the line is indented-code content and not a fence at
+        # all, so it becomes ordinary prose here and the moved block boundary fails closed.
+        if opening is not None:
+            if prose:
+                units.append(("prose", prose_class, " ".join(prose)))
+                prose = []
+            if opening[0] == "fence":
+                units.append(("fence", " ".join(stripped.split())))
+                state = opening
+            else:
+                units.append(("html", " ".join(stripped.split())))
+                state = None if _html_block_ends(line, opening[1]) else opening
+            block_edge, content_column = 0, 0
+            in_paragraph = False
+            continue
+        in_paragraph = True
+        width = _indent_width(line)
+        if _opens_bullet(stripped):
+            indent_class = max(width - block_edge, 0) // VM_GATE_INDENTED_CODE_COLUMNS
+            block_edge, content_column = width, width + VM_GATE_LIST_CONTENT_OFFSET
+        elif content_column and width >= content_column:
+            indent_class = (width - content_column) // VM_GATE_INDENTED_CODE_COLUMNS
+        else:
+            block_edge, content_column = 0, 0
+            indent_class = width // VM_GATE_INDENTED_CODE_COLUMNS
+        if prose and indent_class != prose_class:
+            units.append(("prose", prose_class, " ".join(prose)))
+            prose = []
+        prose_class = indent_class
+        prose.append(" ".join(_semantic_bullet(stripped).split()))
+    if prose:
+        units.append(("prose", prose_class, " ".join(prose)))
+    return tuple(units)
+
+
+def _opens_bullet(stripped):
+    """True when a stripped line opens a CommonMark bullet item.
+
+    The ONE list-grammar predicate. A8 needs the same answer twice -- to canonicalise the marker
+    and to place the item's content column -- and the A3 finding is exactly what happens when the
+    same grammar is written down twice and the two spellings drift apart.
+    """
+    return len(stripped) > 1 and stripped[0] in VM_GATE_BULLET_MARKERS and stripped[1] in " \t"
+
+
+def _semantic_bullet(stripped):
+    """Canonicalise a line-start CommonMark bullet marker, or return the line unchanged.
+
+    ``-``, ``*`` and ``+`` open the same list (#118), and A6-F4 widened the test to any ordinary
+    horizontal whitespace after the marker, so ``*\\titem`` is the same item as ``- item``.
+    """
+    return "- " + stripped[2:] if _opens_bullet(stripped) else stripped
+
+
+def _indent_width(line):
+    """The COLUMN a line's content starts at, with tabs advanced to the CommonMark tab stop.
+
+    A8-F3's measurement and nothing more: it answers "how far in does this line begin", which is
+    what decides indented-code semantics. It reads no container state and makes no block decision.
+    """
+    width = 0
+    for char in line:
+        if char == " ":
+            width += 1
+        elif char == "\t":
+            width += VM_GATE_INDENT_TAB_STOP - (width % VM_GATE_INDENT_TAB_STOP)
+        else:
+            break
+    return width
+
+
+def _semantic_gate_block(block, state=None):
+    """The RENDERED identity of a gate block, as a reviewer approved it.
+
+    A5's answer to accepted finding F-A, kept as its own named authority so that a gate change and
+    an action change stay separately reportable. ``state`` is the raw-block state the block inherits
+    from the document in front of it -- see ``_block_state_at``.
+    """
+    return _semantic_markdown_region(block, state)
+
+
+def _semantic_action_region(action, state=None):
+    """The RENDERED identity of a step's post-gate action region, as a reviewer approved it.
+
+    A6's answer to accepted finding A6-F1. Deliberately the SAME conservative normalisation the
+    gate block uses: nothing is lowercased, no punctuation is stripped, no non-whitespace text is
+    erased and no command token is rewritten, so this cannot hide a meaningful command change. It
+    is a separate function from ``_semantic_gate_block`` because the two identities answer for
+    different regions and report different findings. ``state`` is the raw-block state the region
+    inherits from the document in front of it -- see ``_block_state_at``.
+    """
+    return _semantic_markdown_region(action, state)
+
+
+def _numbered_heading_openings(text):
+    """Every top-level numbered ATX opening in ``text``, as ``(offset, step number)``.
+
+    The single enumeration every other numbered-step helper is built on. Opening discovery and
+    section bounding MUST share this grammar: a heading one of them accepted and the other did not
+    would once again orphan whatever followed it, which is the accepted A3 defect.
+    """
+    return [(match.start(), int(match.group("step")))
+            for match in VM_GATE_STEP_HEADING.finditer(text)]
+
+
+def _numbered_step_section(text, number):
+    """Return one numbered Markdown step section, bounded by the numbered step headings.
+
+    Layer 1 of the structural bound. Non-throwing: an absent step yields "", which then fails
+    every requirement that lives inside it rather than raising. This is section EXTRACTION only:
+    ``_resolve_numbered_step`` owns the uniqueness and heading-identity authority, because taking
+    the first of two same-number headings is exactly the accepted F-3 defect.
+
+    A3: the section closes at the next opening of ANY numbered step, drawn from the same shared
+    enumeration that found this one, so a duplicate cannot be simultaneously invisible to
+    discovery and inert as a bound.
+    """
+    openings = _numbered_step_openings(text, number)
+    if not openings:
+        return ""
+    opening = openings[0]
+    closing = next((at for at, _ in _numbered_heading_openings(text) if at > opening), -1)
+    return text[opening:closing] if closing != -1 else text[opening:]
+
+
+def _line_start(text, at):
+    """Start of the line containing ``at``. A missing offset stays missing."""
+    return -1 if at == -1 else text.rfind("\n", 0, at) + 1
+
+
+def _numbered_step_openings(text, number):
+    """Every offset at which a NUMBERED heading opens step ``number``.
+
+    Step identity comes from the shared match's own ``step`` group, never from a literal probe
+    such as ``text.startswith("### 4. ", start)``. A literal probe is a second, narrower grammar,
+    and the accepted A3 finding is precisely what happens when the two disagree.
+    """
+    return [at for at, step in _numbered_heading_openings(text) if step == number]
+
+
+def _resolve_numbered_step(text, number, prefix, findings):
+    """Resolve step ``number`` to its ONE authoritative section, or fail closed.
+
+    Layer 0 of the structural bound, and the whole A2 repair. Two accepted final-G4 findings,
+    both demonstrated as false cleans:
+
+    * the step number must open EXACTLY once. Zero is the pre-existing missing-step case; MORE
+      than one is ambiguous authority, because silently taking the first occurrence is what let a
+      second same-number section orphan an ungated external instruction while the genuine section
+      stayed compliant -- accepted F-3. A harmless duplicate fails closed too: once the number
+      appears twice there is no answer to which section governs, and guessing is the defect.
+    * the heading LINE is itself immutable authority. It sits outside both pre-gate authorities
+      (step 4's blank body, step 5's frozen digest), so without this an actionable heading could
+      carry external-action semantics ahead of the gate -- accepted F-4. Exact-string authority is
+      used rather than folding the heading into the digest, so the frozen step-5 prefix digest
+      stays byte-stable.
+
+    Whitespace is non-material, matching the rest of this contract: a CRLF checkout or a reflowed
+    heading is not drift, while case, punctuation and wording changes all fail closed.
+    Non-throwing: every failure yields "", which then fails every requirement inside the step.
+
+    A3 widens WHICH openings count, not WHAT they must say. Any mixture of spellings for the same
+    step number is still more than one opening and still fails closed here -- there is no majority
+    vote and no "the strict one wins" -- while ``_semantic_heading`` keeps identity at the rendered
+    heading, so a respelling that renders the reviewed heading exactly stays clean and substantive
+    drift still fails closed.
+
+    A9 returns the fenced-block state the resolved section INHERITS alongside it, so the regions
+    inside the step are judged from the document's real state rather than from the assumption that
+    a mid-document slice begins outside a fence. Discovery itself is untouched: a numbered heading
+    inside fenced code still counts as an opening, so the conservative ambiguity debt already
+    accepted stays exactly as it was.
+    """
+    openings = _numbered_step_openings(text, number)
+    if not openings:
+        findings.add(prefix + "_step_missing")
+        return "", None
+    if len(openings) > 1:
+        findings.add(prefix + "_step_ambiguous")
+        return "", None
+    section = _numbered_step_section(text, number)
+    if _semantic_heading(section.partition("\n")[0]) \
+            != _semantic_heading(VM_GATE_REVIEWED_HEADINGS[number]):
+        findings.add(prefix + "_heading_changed")
+        return "", None
+    return section, _block_state_at(text, openings[0])
+
+
+def _resolve_gate_layout(section, marker, boundary, prefix, findings):
+    """Resolve one step into ``(pre_gate, gate_block, action_region)``, or fail closed.
+
+    This is the whole A1 repair. Three landmarks, all structural:
+
+    * the gate marker, which must occur EXACTLY once -- zero and many both fail closed, because
+      silently taking the first occurrence is how a decoy mention could shift the bounded slice;
+    * the action boundary, the START of the step's post-gate operational prose, which must also
+      occur exactly once. Ending the gate block here (rather than at some inner action verb) is
+      what stops the operational banner satisfying a gate-local proposition -- accepted F-2;
+    * their order. Ordering is judged on the EARLIEST occurrence of each and independently of
+      ambiguity, so a boundary that straddles the gate is reported as misordered as well.
+
+    Nothing here consults action vocabulary, so a synonym cannot evade it -- accepted F-1. When
+    the layout cannot be resolved every element is ``None`` and the caller marks the whole step
+    unmet rather than guessing around the gap.
+    """
+    gate_at, gate_count = section.find(marker), section.count(marker)
+    boundary_at, boundary_count = section.find(boundary), section.count(boundary)
+
+    misordered = gate_at != -1 and boundary_at != -1 and boundary_at < gate_at
+    if misordered:
+        findings.add(VM_GATE_ORDERING_KEYS[prefix])
+    if gate_count == 0:
+        findings.add(prefix + "_gate_missing")
+    elif gate_count > 1:
+        findings.add(prefix + "_gate_marker_ambiguous")
+    if boundary_count == 0:
+        findings.add(prefix + "_boundary_missing")
+    elif boundary_count > 1:
+        findings.add(prefix + "_boundary_ambiguous")
+    if gate_count != 1 or boundary_count != 1 or misordered:
+        return None, None, None
+
+    # The pre-gate region is everything between the step's heading line and the gate's own line.
+    # Step 4 requires it to be blank; step 5's is the frozen reviewed-safe prefix.
+    heading_end = section.find("\n")
+    gate_line = _line_start(section, gate_at)
+    pre_gate = section[heading_end + 1:gate_line] if heading_end != -1 else ""
+    return pre_gate, section[gate_line:boundary_at], section[boundary_at:]
+
+
+def _executable_line_text(region):
+    """Each line of ``region`` with its comment content removed, whitespace-collapsed.
+
+    A5's answer to accepted finding F-B. A4 discarded a line only when its FIRST non-space
+    characters opened a comment, which left three disabling forms untouched -- all three verified
+    against the real interpreters to produce no invocation at all:
+
+    * a PowerShell ``<# ... #>`` block, whose body never runs even though every line inside it
+      begins with ordinary command text;
+    * an inline comment tail, ``Write-Host "disabled"; # & scripts\\...``, where the line executes
+      but the anchor sits entirely inside the comment;
+    * a quoted or echoed mention, ``Write-Host "& scripts\\..."``, which prints the command.
+
+    Deliberately a small, pure text scan and NOT a PowerShell parser. Block state carries across
+    lines, so a multiline block cannot smuggle an anchor back in, and the first surviving comment
+    opener truncates the remainder of the line. Truncating inside a quoted string that happens to
+    contain a comment character is FAIL-CLOSED: it can only take an operation away, never invent
+    one, so the conservative direction is also the safe one. A5 authorises no fenced-code, list or
+    blockquote model, and the accepted conservative false positive PRRT_kwDOSbJI_s6YQTNF is left
+    exactly as it was.
+    """
+    lines, in_block = [], False
+    here_terminator, heredoc_word, heredoc_strip = None, None, False
+    for line in region.splitlines():
+        # A6: inert MULTILINE DATA is resolved before anything else, because a comment character or
+        # a whole command sitting inside a here-string or heredoc body is data as well. Both states
+        # close only on their own terminator, so an unterminated opener suppresses the remainder of
+        # the region and the required operation fails closed -- which matches both interpreters,
+        # where an unterminated construct is a parse error rather than a runnable script.
+        if heredoc_word is not None:
+            candidate = line.lstrip("\t") if heredoc_strip else line
+            if candidate.strip() == heredoc_word:
+                heredoc_word = None
+            lines.append("")
+            continue
+        if here_terminator is not None:
+            if line.startswith(here_terminator):
+                here_terminator = None
+            lines.append("")
+            continue
+        kept, rest = [], line
+        while rest:
+            if in_block:
+                close = rest.find(VM_GATE_PS_BLOCK_CLOSE)
+                if close == -1:
+                    break
+                rest, in_block = rest[close + len(VM_GATE_PS_BLOCK_CLOSE):], False
+                continue
+            block_at = rest.find(VM_GATE_PS_BLOCK_OPEN)
+            openers = [at for at in (rest.find(opener) for opener in VM_GATE_COMMENT_OPENERS)
+                       if at != -1]
+            line_at = min(openers) if openers else -1
+            # `<#` also contains `#`, so the block opener is resolved first whenever it starts at
+            # or before the earliest line-comment opener; otherwise the line comment wins.
+            if block_at != -1 and (line_at == -1 or block_at <= line_at):
+                kept.append(rest[:block_at])
+                rest, in_block = rest[block_at + len(VM_GATE_PS_BLOCK_OPEN):], True
+                continue
+            if line_at != -1:
+                kept.append(rest[:line_at])
+                break
+            kept.append(rest)
+            break
+        active = "".join(kept)
+        # A6: a recognised multiline-data opener in the SURVIVING text opens its state. Detected
+        # after comment removal on purpose, so a commented-out `# @'` opens nothing. The PowerShell
+        # opener must END the line, which is what the language requires.
+        for opener, terminator in VM_GATE_PS_HERE_STRING_OPENERS:
+            if active.rstrip().endswith(opener):
+                here_terminator = terminator
+                break
+        else:
+            heredoc = VM_GATE_SHELL_HEREDOC_OPENER.search(active)
+            if heredoc is not None:
+                heredoc_strip = heredoc.group(1) == "-"
+                heredoc_word = heredoc.group(3)
+        lines.append(_flat(active))
+    return lines
+
+
+def _active_command_lines(region):
+    """The lines of ``region`` that could actually execute, whitespace-collapsed."""
+    return [line for line in _executable_line_text(region) if line]
+
+
+def _actively_invokes(region, anchor, fold_case=True):
+    """True when an executable line of ``region`` STARTS with ``anchor``.
+
+    Starting the line is the whole point of the A5 strengthening. A mention of a command is not the
+    command, and neither is a command that appears only part-way through a line which runs
+    something else: ``Write-Host "..."`` and ``echo "..."`` both leave the anchor present while
+    executing something entirely different. A genuine invocation still tolerates trailing comment
+    text, because the comment is removed before the comparison.
+
+    ``fold_case`` follows the TOOL, not a house style. PowerShell parameter names really are
+    case-insensitive, so folding there matches reality; ``member_create_uat_approval.py`` is
+    argparse and genuinely case-sensitive, so its commands are compared verbatim. Accepted
+    finding PRRT_kwDOSbJI_s6YQTM4 is what happens when the comparison is more permissive than the
+    tool: ``--INPUT`` breaks the build while the guard stays clean.
+    """
+    return any((line.lower() if fold_case else line).startswith(anchor)
+               for line in _active_command_lines(region))
+
+
+def _clause_before(text, at):
+    """The clause ending at ``at``, back to its own opening terminator.
+
+    The mirror of ``_clause_after``, bounded by the same CommonMark terminator set, so a negation
+    in a neighbouring sentence cannot be blamed on this clause and a negation in THIS clause
+    cannot hide behind a compliant neighbour.
+    """
+    starts = [idx for idx in (text.rfind(end, 0, at) for end in HOST_SYNC_CLAUSE_TERMINATORS)
+              if idx != -1]
+    return text[max(starts):at] if starts else text[:at]
+
+
+def _approval_is_affirmative(prose, affirmative=VM_GATE_AFFIRMATIVE_APPROVAL):
+    """True only when ``prose`` REQUIRES the current-turn approval rather than mentioning it.
+
+    Accepted finding PRRT_kwDOSbJI_s6YQTNO: presence is not polarity. Testing only that the token
+    ``current-turn owner approval`` occurs accepts "do not obtain an explicit current-turn owner
+    approval", which keeps every tested token while stating the opposite of the contract.
+
+    Two conditions, both inside the narrow reviewed gate grammar rather than any attempt to decide
+    arbitrary English:
+
+    * the reviewed affirmative clause must be present, so the requirement is actually stated;
+    * no clause MENTIONING the approval token may carry a negation. Only such clauses are
+      inspected, which is what leaves the gate's own legitimate denials alone -- "authorises no
+      runner execution", "does **not** authorise this preflight", "a prior-turn approval is not
+      reusable" -- because none of them mentions the token.
+    """
+    if affirmative not in prose:
+        return False
+    at = prose.find(VM_GATE_CURRENT_TURN)
+    while at != -1:
+        clause = " " + _clause_before(prose, at) + _clause_after(prose[at:], VM_GATE_CURRENT_TURN)
+        if any(negation in clause for negation in VM_GATE_APPROVAL_NEGATIONS):
+            return False
+        at = prose.find(VM_GATE_CURRENT_TURN, at + 1)
+    return True
+
+
+def _every_source_denied(prose, sources, denial):
+    """True only when EVERY other approval is denied inside its own clause.
+
+    Reusing ``_clause_after`` is deliberate: its terminator set is the generic CommonMark bullet
+    and punctuation bound, not anything host-sync specific, and duplicating that carefully
+    reasoned bound would let the two copies drift while both claim to stop clause borrowing.
+    """
+    return all(denial in _clause_after(prose, source) for source in sources)
+
+
+def _deployment_findings(text, findings):
+    """Step 4: a current-turn approval must precede every VM mutation the step performs."""
+    section, state = _resolve_numbered_step(text, VM_GATE_DEPLOY_STEP, "deploy", findings)
+    pre_gate, block, action = _resolve_gate_layout(
+        section, VM_GATE_DEPLOY_MARKER, VM_GATE_DEPLOY_BOUNDARY, "deploy", findings)
+    if block is None:
+        findings.update(VM_GATE_DEPLOY_UNMET)
+        return
+    # A9/A11: what each reviewed region inherits from the document in front of it. Both are suffix
+    # slices of the resolved step, so this is the step's own inherited state carried forward.
+    block_state = _region_block_state(section, block + action, state)
+    action_state = _region_block_state(section, action, state)
+
+    # Ordering, structurally. Nothing may stand between the step heading and its gate, so no
+    # instruction -- transfer, place, send, move, or a verb nobody has thought of yet -- can be
+    # smuggled in ahead of the approval. Whitespace stays non-material so ordinary Markdown
+    # reflow does not fire the guard.
+    if pre_gate.strip():
+        findings.add("deploy_pre_gate_content")
+
+    # A5: the gate must still say exactly what review approved it saying. This is the authoritative
+    # closure for open-ended optional/waiver/prohibition/advisory contradiction wording; the
+    # proposition checks below stay as defence in depth, because a document that fails identity
+    # should still report WHICH requirement it lost.
+    if _semantic_gate_block(block, block_state) \
+            != _semantic_gate_block(VM_GATE_DEPLOY_REVIEWED_BLOCK):
+        findings.add("deploy_gate_text_changed")
+
+    # A6: and the ACTION region must still say exactly what review approved it saying. Accepted
+    # finding A6-F1: the gate identity above stops at the action boundary, so "The approval above is
+    # optional once these commands are reached." placed after it revoked the gate with the whole
+    # contract clean. Polarity is not decided here either -- the reviewed text is recognised, so a
+    # revocation, a reuse claim, a retrospective approval, an urgency bypass, a deleted command or a
+    # command wrapped in inert data all fail closed alike.
+    if _semantic_action_region(action, action_state) \
+            != _semantic_action_region(VM_GATE_DEPLOY_REVIEWED_ACTION):
+        findings.add("deploy_action_text_changed")
+
+    # Gate propositions, judged ONLY inside the gate's own block.
+    prose = _flat(block).lower()
+    if VM_GATE_VM.lower() not in prose:
+        findings.add("deploy_vm_not_named")
+    if any(token not in prose for token in VM_GATE_DEPLOY_BINDINGS):
+        findings.add("deploy_operation_not_bound")
+    if not _approval_is_affirmative(prose):
+        findings.add("deploy_not_current_turn")
+    if VM_GATE_PRIOR_TURN not in prose:
+        findings.add("deploy_prior_turn_not_denied")
+    if VM_GATE_DEPLOY_STOP not in prose:
+        findings.add("deploy_stop_boundary_missing")
+    if VM_GATE_DEPLOY_NO_EXECUTION not in prose:
+        findings.add("deploy_execution_not_denied")
+    if not _every_source_denied(prose, VM_GATE_DEPLOY_SOURCES, VM_GATE_DEPLOY_DENIAL):
+        findings.add("deploy_substitution_not_denied")
+
+    # Operation existence, judged ONLY in the action region and separately from ordering. A gate
+    # guarding nothing is not a pass; equally, the approval prose naming these components is not
+    # the operation, so its copies cannot answer for a deleted instruction.
+    region = _flat(action).lower()
+    if any(path not in region for path in VM_GATE_DEPLOY_ACTION_FILES):
+        findings.add("deploy_operation_missing")
+    # The state directory is created by a real PowerShell command, so it is held to the same
+    # active-command rule as the step-5 operations. Leaving it a substring would have kept an
+    # identical commented-out bypass open one step to the left of the one Codex reported.
+    if not _actively_invokes(action, VM_GATE_DEPLOY_STATE_ANCHOR):
+        findings.add("deploy_state_preparation_missing")
+
+
+def _preflight_findings(text, findings):
+    """Step 5: a current-turn approval must precede the package transfer AND the dry-run."""
+    section, state = _resolve_numbered_step(text, VM_GATE_PREFLIGHT_STEP, "preflight", findings)
+    pre_gate, block, action = _resolve_gate_layout(
+        section, VM_GATE_PREFLIGHT_MARKER, VM_GATE_PREFLIGHT_BOUNDARY, "preflight", findings)
+    if block is None:
+        findings.update(VM_GATE_PREFLIGHT_UNMET)
+        return
+    # A9/A11 inherited raw-block state, exactly as step 4 carries it. See `_block_state_at`.
+    block_state = _region_block_state(section, block + action, state)
+    action_state = _region_block_state(section, action, state)
+
+    # Ordering, structurally -- and under A4 by exactly the rule step 4 already uses. The frozen
+    # reviewed-safe prefix is retired: the package build it protected is itself gated work, so it
+    # now sits AFTER the gate and nothing legitimate remains in front of it. Accepted findings
+    # PRRT_kwDOSbJI_s6YQTNV (private form/decision-row reads and decision-store, ledger and
+    # package mutations ahead of the gate) and PRRT_kwDOSbJI_s6YQTMq (environment configuration
+    # ahead of it) are both closed by the move rather than by a better digest, and the accepted
+    # case-folding finding PRRT_kwDOSbJI_s6YQTM4 disappears with the digest it was about.
+    if pre_gate.strip():
+        findings.add("preflight_pre_gate_content")
+
+    # A5 gate identity, exactly as step 4 carries it. See `_semantic_gate_block`.
+    if _semantic_gate_block(block, block_state) \
+            != _semantic_gate_block(VM_GATE_PREFLIGHT_REVIEWED_BLOCK):
+        findings.add("preflight_gate_text_changed")
+
+    # A6 action identity, exactly as step 4 carries it. See `_semantic_action_region`.
+    if _semantic_action_region(action, action_state) \
+            != _semantic_action_region(VM_GATE_PREFLIGHT_REVIEWED_ACTION):
+        findings.add("preflight_action_text_changed")
+
+    prose = _flat(block).lower()
+    if VM_GATE_VM.lower() not in prose:
+        findings.add("preflight_vm_not_named")
+    for key, token in VM_GATE_PREFLIGHT_BINDINGS:
+        if token not in prose:
+            findings.add(key)
+    if any(name.lower() not in prose for name in VM_GATE_ENV_VARIABLE_NAMES):
+        findings.add("preflight_environment_not_bound")
+    if not _approval_is_affirmative(prose):
+        findings.add("preflight_not_current_turn")
+    if VM_GATE_PRIOR_TURN not in prose:
+        findings.add("preflight_prior_turn_not_denied")
+    if any(token not in prose for token in VM_GATE_PREFLIGHT_SAVE_MEMBER):
+        findings.add("preflight_save_member_not_denied")
+    if VM_GATE_PREFLIGHT_STOP not in prose:
+        findings.add("preflight_stop_boundary_missing")
+    if not _every_source_denied(prose, VM_GATE_PREFLIGHT_SOURCES, VM_GATE_PREFLIGHT_DENIAL):
+        findings.add("preflight_substitution_not_denied")
+
+    # Operation existence in the action region. Every load-bearing COMMAND must be an active,
+    # executable line; the transfer instruction stays a prose anchor because that is what it is in
+    # the document. The gate block is excluded from this region, so the approval's own copies of
+    # these names cannot answer for a deleted or commented-out instruction.
+    region = _flat(action).lower()
+    if VM_GATE_PREFLIGHT_TRANSFER_ANCHOR not in region:
+        findings.add("preflight_operation_missing")
+    if not _actively_invokes(action, VM_GATE_PREFLIGHT_APPROVE_COMMAND, fold_case=False):
+        findings.add("preflight_approval_command_missing")
+    if not _actively_invokes(action, VM_GATE_PREFLIGHT_BUILD_COMMAND, fold_case=False):
+        findings.add("preflight_package_build_missing")
+    if VM_GATE_PREFLIGHT_ENV_ANCHOR not in region \
+            or any(name.lower() not in region for name in VM_GATE_ENV_VARIABLE_NAMES):
+        findings.add("preflight_environment_setup_missing")
+    if not _actively_invokes(action, VM_GATE_PREFLIGHT_RUNNER_ANCHOR):
+        findings.add("preflight_runner_invocation_missing")
+
+
+def _safety_boundary_findings(text, findings):
+    """The Safety boundary must be UNIQUE, and must state every approval surface independently.
+
+    A11 corrects what the section CLAIMS, not how it is judged. The four baseline surfaces are
+    preserved word for word; the conditional surfaces A11 accepts -- operator-directed destructive
+    cleanup, the step-9 live n8n result mapping and the step-10 read-only AutoCount recovery lookup
+    -- are named beside them; and no fixed total is stated at all, so a later surface cannot
+    silently falsify a count. The finding key is renamed to match, and nothing else changes.
+
+
+    Accepted finding PRRT_kwDOSbJI_s6YQTMw: the old implementation read the FIRST raw occurrence
+    only, so appending a second boundary that contradicts or weakens the four surfaces left the
+    checker clean while the document carried two irreconcilable statements of its own safety
+    authority. Uniqueness is therefore established BEFORE any token is validated, exactly as
+    ``_resolve_numbered_step`` already does for steps 4 and 5. A harmless duplicate fails closed
+    for the same reason a harmless duplicate step does: once the authority appears twice there is
+    no answer to which one governs, and guessing is the defect rather than the inconvenience.
+
+    A8 gives the unique section COMPLETE reviewed authority. Accepted finding
+    PRRT_kwDOSbJI_s6YzUw1: additive token presence let a contradiction be appended INSIDE the one
+    boundary with every required substring intact, so the checker reported clean while the document
+    waived the separation the section states. Identity is decided first, exactly as it already is
+    for both gate blocks and both action regions; the token propositions then stay as defence in
+    depth under the SAME finding key, so a section that loses identity still reports which
+    requirement it lost rather than only that something moved.
+    """
+    openings = [match.start() for match in VM_GATE_SAFETY_OPENING.finditer(text)]
+    if not openings:
+        findings.add("safety_boundary_surfaces_incomplete")
+        return
+    if len(openings) > 1:
+        findings.add("safety_boundary_ambiguous")
+        return
+    at = openings[0]
+    end = text.find("\n## ", at + 1)
+    reviewed = text[at:end] if end != -1 else text[at:]
+    # A9-F1: and the section must actually RENDER as a section. A valid fenced-code opener in front
+    # of the boundary makes CommonMark render the heading and every requirement under it as the
+    # literal contents of a code block; without the inherited state the identity below compared a
+    # code block against reviewed prose and reported clean. The section is not semantically valid
+    # merely because its in-slice text equals the reviewed constant.
+    if _semantic_markdown_region(reviewed, _block_state_at(text, at)) \
+            != _semantic_markdown_region(VM_GATE_SAFETY_REVIEWED_SECTION):
+        findings.add("safety_boundary_surfaces_incomplete")
+    section = _flat(reviewed).lower()
+    if any(token not in section for token in VM_GATE_SAFETY_TOKENS):
+        findings.add("safety_boundary_surfaces_incomplete")
+
+
+# ---- A11-F2: whole-procedure protected-operation placement ---- #
+def _numbered_segments(text):
+    """``(step number or None, segment text)`` for the whole document, partitioned by step heading.
+
+    Placement is judged at STEP granularity because the finer bounds already exist: an active
+    command in a step's pre-gate region is reported by that step's `_pre_gate_content` rule, and one
+    inside a gate block changes that gate's reviewed identity. What no existing rule could see is an
+    active protected operation in a step that has no gate contract at all, which is accepted finding
+    A11-F2.
+    """
+    openings = _numbered_heading_openings(text)
+    if not openings:
+        return [(None, text)]
+    segments = [(None, text[:openings[0][0]])]
+    for index, (at, step) in enumerate(openings):
+        end = openings[index + 1][0] if index + 1 < len(openings) else len(text)
+        segments.append((step, text[at:end]))
+    return segments
+
+
+def _placement_findings(text, findings):
+    """Every recognised protected operation must be ACTIVE only inside an authorised step.
+
+    The classifier and the authorised regions are declared once, in
+    ``VM_GATE_A11_PROTECTED_OPERATIONS``, so this is a family rule rather than a patch for the one
+    string the review happened to name. Activity is decided by the SAME `_active_command_lines`
+    standard the reviewed regions already use, so a mention, a quoted echo, a commented line and a
+    prose reference are all correctly non-operational.
+    """
+    segments = _numbered_segments(text)
+    for _name, anchor, allowed, fold in VM_GATE_A11_PROTECTED_OPERATIONS:
+        for step, segment in segments:
+            if step in allowed:
+                continue
+            if _actively_invokes(segment, anchor, fold_case=fold):
+                findings.add("protected_operation_outside_region")
+                break
+
+
+# ---- A11-F3: operator-directed destructive cleanup ---- #
+def _text_blocks(text):
+    """Maximal runs of non-blank lines, as ``(start, end)`` offsets. Non-throwing and pure."""
+    blocks, start, at = [], None, 0
+    for line in text.splitlines(True):
+        if line.strip():
+            if start is None:
+                start = at
+        elif start is not None:
+            blocks.append((start, at))
+            start = None
+        at += len(line)
+    if start is not None:
+        blocks.append((start, at))
+    return blocks
+
+
+def _destructive_instruction_is_gated(text, blocks, at):
+    """True when the cleanup gate is IMMEDIATELY in front of the instruction at ``at``.
+
+    "Immediately" is stated structurally rather than by a line budget: the gate must sit in the
+    block directly preceding the destructive branch, or earlier in that branch's own block. A gate
+    that merely appears somewhere earlier in the section would let a relocated gate keep a later
+    instruction falsely covered, which is the mutation this rule exists to fail closed.
+    """
+    index = next((i for i, (start, end) in enumerate(blocks) if start <= at < end), -1)
+    if index == -1:
+        return False
+    start, _end = blocks[index]
+    if VM_GATE_A11_CLEANUP_MARKER_PATTERN.search(text, start, _line_start(text, at)):
+        return True
+    if index == 0:
+        return False
+    previous_start, previous_end = blocks[index - 1]
+    if not VM_GATE_A11_CLEANUP_MARKER_PATTERN.search(text, previous_start, previous_end):
+        return False
+    # A heading between the gate and the instruction means the gate governs a different region.
+    return VM_GATE_A11_HEADING_LINE.search(text, previous_start, at) is None
+
+
+def _destructive_cleanup_findings(text, findings):
+    """Accepted finding A11-F3: every operator-directed deletion needs its OWN current-turn gate.
+
+    Two propositions, both narrow. Each recognised destructive instruction must carry the reviewed
+    gate immediately in front of it, and every gate MARKER in the document must belong to a gate
+    that still says exactly what review approved it saying -- the same identity discipline A5, A6
+    and A8 already apply, so a prior-turn wording, a missing target, a missing operation or a
+    substituted step-5/step-7/repository authority all fail closed alike.
+    """
+    flat = _flat(text).lower()
+    if flat.count(VM_GATE_A11_CLEANUP_MARKER) != flat.count(
+            _flat(VM_GATE_A11_CLEANUP_REVIEWED_GATE).lower()):
+        findings.add("destructive_cleanup_gate_text_changed")
+    blocks = _text_blocks(text)
+    for pattern in VM_GATE_A11_DESTRUCTIVE_PATTERNS:
+        for found in pattern.finditer(text):
+            if not _destructive_instruction_is_gated(text, blocks, found.start()):
+                findings.add("destructive_cleanup_not_gated")
+                return
+
+
+# ---- A11-F4: the step-9 live mapping and step-10 conditional recovery surfaces ---- #
+def _gated_step_findings(text, findings, spec):
+    """One further gated numbered step, held to exactly the contract steps 4 and 5 already carry.
+
+    Written once and parameterised rather than copied twice: two spellings of the same rule is the
+    drift the accepted A3 finding is about.
+    """
+    prefix = spec["prefix"]
+    section, state = _resolve_numbered_step(text, spec["step"], prefix, findings)
+    pre_gate, block, action = _resolve_gate_layout(
+        section, spec["marker"], spec["boundary"], prefix, findings)
+    if block is None:
+        findings.update(spec["unmet"])
+        return
+    block_state = _region_block_state(section, block + action, state)
+    action_state = _region_block_state(section, action, state)
+    if pre_gate.strip():
+        findings.add(prefix + "_pre_gate_content")
+    if _semantic_gate_block(block, block_state) != _semantic_gate_block(spec["reviewed_block"]):
+        findings.add(prefix + "_gate_text_changed")
+    if _semantic_action_region(action, action_state) \
+            != _semantic_action_region(spec["reviewed_action"]):
+        findings.add(prefix + "_action_text_changed")
+    prose = _flat(block).lower()
+    for key, token in spec["bindings"]:
+        if token not in prose:
+            findings.add(key)
+    if any(token not in prose for token in spec["operations"]):
+        findings.add(spec["operations_key"])
+    if not _approval_is_affirmative(prose, spec["affirmative"]):
+        findings.add(prefix + "_not_current_turn")
+    if VM_GATE_PRIOR_TURN not in prose:
+        findings.add(prefix + "_prior_turn_not_denied")
+    if not _every_source_denied(prose, spec["sources"], spec["denial"]):
+        findings.add(prefix + "_substitution_not_denied")
+    if spec["stop"] not in prose:
+        findings.add(prefix + "_stop_boundary_missing")
+
+
+def _vm_gate_semantic_findings(text):
+    """Sorted SEMANTIC findings for the create-UAT VM deployment and preflight gates.
+
+    Pure and text-only: no repository read, no path derivation and only non-throwing searches.
+
+    R1 boundary: this is the A1-A11 defence-in-depth surface, NOT the live completeness authority.
+    Its Markdown model and its protected-operation table are both known to be incomplete -- see the
+    two R1 residual controls -- and that is now tolerable because the PUBLIC guard seals the whole
+    reviewed document independently. Semantic mutation controls call this layer directly so their
+    named findings stay provable on documents the seal necessarily rejects.
+    """
+    findings = set()
+    _deployment_findings(text, findings)
+    _preflight_findings(text, findings)
+    _gated_step_findings(text, findings, VM_GATE_A11_MAPPING_SPEC)
+    _gated_step_findings(text, findings, VM_GATE_A11_RECOVERY_SPEC)
+    _placement_findings(text, findings)
+    _destructive_cleanup_findings(text, findings)
+    _safety_boundary_findings(text, findings)
+    return sorted(findings)
+
+
+def vm_gate_findings(text):
+    """The PUBLIC live VM-gate guard: reviewed-runbook seal, then semantic diagnostics.
+
+    Fails closed on any drift from the reviewed runbook, whether or not the semantic layer models
+    the drift. Pure text-in/findings-out: the seal is computed from ``text``, never from the file
+    on disk, so the same input always yields the same output.
+    """
+    return sorted(set(reviewed_runbook_seal_findings(text))
+                  | set(_vm_gate_semantic_findings(text)))
+
+
+# A minimal, self-contained COMPLIANT document. Every negative control degrades THIS rather than
+# the live runbook, so the controls stay meaningful independently of the runbook's current state
+# and any live failure localises to the single live assertion. It is not a copy of the runbook:
+# the live ``findings == []`` assertion remains the authority on the real document.
+# ---- DL-XB-123-001-A4: the canonical fixture is the A4 target document ---- #
+# The frozen reviewed-safe step-5 prefix that used to live here is retired together with the
+# digest it fed. Under A4 nothing legitimate precedes the step-5 gate, so there is no prefix
+# left to freeze and the step-5 pre-gate rule is simply step 4's: blank. VM_GATE_A4_FIXTURE,
+# introduced at the controls commit and promoted below, is now the canonical fixture.
+
+# The gate paragraph openings and the operation openings, verbatim from the fixture. One source of
+# truth so the relocation controls and the wording controls cannot drift apart.
+VM_GATE_DEPLOY_OPENING = "**Separate current-turn owner approval required (deployment gate).**"
+VM_GATE_PREFLIGHT_OPENING = "**Separate current-turn owner approval required (preflight gate).**"
+# Aliases of the structural action boundaries, so the pre-A1 controls that split the fixture at
+# "where the operation starts" stay pinned to the same landmark the checker uses. Under A1 the
+# preflight boundary is the operational banner itself, not the inner "Only after ..." clause.
+VM_GATE_DEPLOY_OPERATION_OPENING = VM_GATE_DEPLOY_BOUNDARY
+VM_GATE_PREFLIGHT_OPERATION_OPENING = VM_GATE_PREFLIGHT_BOUNDARY
+
+# The eight locked denial bullets, verbatim from the fixture, keyed by source step.
+VM_GATE_DEPLOY_DENIAL_BULLETS = {
+    "(step 2)": "- the PR review and merge decision (step 2) does **not** authorise this"
+                " deployment;\n",
+    "(step 3)": "- the physical-host sync approval (step 3) does **not** authorise this"
+                " deployment;\n",
+    "(step 5)": "- the no-write preflight approval (step 5) does **not** authorise this"
+                " deployment;\n",
+    "(step 7)": "- the separate current-turn write approval (step 7) does **not** authorise this"
+                " deployment.\n",
+}
+VM_GATE_PREFLIGHT_DENIAL_BULLETS = {
+    "(step 2)": "- the PR review and merge decision (step 2) does **not** authorise this"
+                " preflight;\n",
+    "(step 3)": "- the physical-host sync approval (step 3) does **not** authorise this"
+                " preflight;\n",
+    "(step 4)": "- the VM deployment approval (step 4) does **not** authorise this preflight;\n",
+    "(step 7)": "- the separate current-turn write approval (step 7) does **not** authorise this"
+                " preflight.\n",
+}
+
+# The A1 structural landmarks (gate markers, action boundaries and post-gate operation anchors)
+# are declared beside the checker that consumes them, above.
+
+# ---- DL-XB-123-001-A3: the CommonMark numbered-ATX opening families ---- #
+# Accepted final-G4-A2 finding: numbered-step discovery recognised ONE spelling of a top-level
+# numbered ATX heading -- column 0, exactly one space after `###`, exactly one space after `<n>.`.
+# CommonMark renders an `h3` for considerably more than that: 0-3 leading spaces, any run of
+# spaces or tabs after the opening `###`, any run of spaces or tabs after `<n>.`, and an optional
+# closing `#` sequence. Every template below therefore renders the SAME heading a reviewer sees.
+#
+# A second Step 4 or Step 5 written in any of them is a real duplicate section that the narrower
+# discovery cannot enumerate. Its contents are silently absorbed into a neighbouring section --
+# in practice the genuine step's ACTION region, where only presence checks run -- so an ungated
+# deployment, transfer or preflight instruction can sit in the document while the oracle reports
+# clean. That is accepted B-1 / F-3 recurrence, and duplication is ambiguity even when the
+# duplicate prose is harmless.
+VM_GATE_A3_DUPLICATE_HEADINGS = (
+    ("one_leading_space", " ### %d. %s"),
+    ("two_leading_spaces", "  ### %d. %s"),
+    ("three_leading_spaces", "   ### %d. %s"),
+    ("two_spaces_after_hashes", "###  %d. %s"),
+    ("three_spaces_after_hashes", "###   %d. %s"),
+    ("tab_after_hashes", "###\t%d. %s"),
+    ("tab_after_step_number", "### %d.\t%s"),
+    ("indent_plus_closing_hashes", "  ### %d. %s ###"),
+)
+
+# The strict column-zero form the narrow discovery already recognised. Kept as the A3 control
+# group: it must keep failing closed exactly as A2 left it, because a grammar widened carelessly
+# could just as easily have stopped recognising the one form that already worked.
+VM_GATE_A3_STRICT_HEADING = "### %d. %s"
+
+# Four leading spaces is an indented CODE BLOCK in CommonMark, never a heading. It must stay
+# OUTSIDE top-level numbered-step authority: promoting it would let an ordinary indented Markdown
+# example inside a step silently make the real step ambiguous, which is a false positive severe
+# enough to make the contract unmaintainable.
+VM_GATE_A3_CODE_BLOCK_HEADING = "    ### %d. %s"
+
+# Whitespace-only spellings of the SINGLE genuine heading. Each renders the reviewed heading
+# exactly, so each must stay clean: the reviewed heading's identity is semantic, and a CRLF
+# checkout, a re-indent or a syntax-only closing `#` run is not drift. The closing sequence is
+# included because CommonMark strips it before rendering, so treating it as content would make a
+# purely syntactic marker look like a wording change.
+VM_GATE_A3_SEMANTIC_HEADING_VARIANTS = (
+    ("one_leading_space", " ### %d. %s"),
+    ("three_leading_spaces", "   ### %d. %s"),
+    ("two_spaces_after_hashes", "###  %d. %s"),
+    ("tab_after_hashes", "###\t%d. %s"),
+    ("tab_after_step_number", "### %d.\t%s"),
+    ("closing_hash_sequence", "### %d. %s ###"),
+    ("indent_and_padded_closing_hashes", "  ### %d. %s   ###  "),
+)
+
+# Substantive drift wearing a whitespace-valid opening. Widening the opening grammar must not
+# widen heading IDENTITY: case, punctuation and wording still have to fail closed, and a run of
+# `#` followed by further CONTENT is not a CommonMark closing sequence at all, so the trailing
+# words remain part of the heading and must be seen as drift rather than stripped as syntax.
+VM_GATE_A3_DRIFT_HEADINGS = {
+    VM_GATE_DEPLOY_STEP: (
+        ("case", "  ### %d. deploy the inactive uat components"),
+        ("punctuation", " ###  %d. Deploy the inactive UAT components."),
+        ("wording", "###\t%d. Deploy the UAT components"),
+        ("content_after_hashes", "### %d. Deploy the inactive UAT components ### and push now"),
+    ),
+    VM_GATE_PREFLIGHT_STEP: (
+        ("case", "  ### %d. NO-WRITE PREFLIGHT (DRY-RUN)"),
+        ("punctuation", " ###  %d. No write preflight (dry run)"),
+        ("wording", "###\t%d. Preflight the approved package"),
+        ("content_after_hashes", "### %d. No-write preflight (dry-run) ### then transfer"),
+    ),
+}
+
+# The rogue duplicate's own title, deliberately distinct from the reviewed heading: a duplicate
+# that reused the reviewed title verbatim could be dismissed as an accidental copy, whereas a
+# retitled section is what an editor actually writes when revising a step.
+VM_GATE_A3_DUPLICATE_TITLES = {
+    VM_GATE_DEPLOY_STEP: "Deploy the inactive UAT components (revised)",
+    VM_GATE_PREFLIGHT_STEP: "No-write preflight (dry-run) (revised)",
+}
+
+# Explicit ungated external action, so the controls prove a SAFETY consequence rather than a
+# tidiness preference. Neither body carries a gate marker or an action boundary, so neither can
+# satisfy -- or trip -- a landmark check and let a control pass for the wrong reason.
+VM_GATE_A3_UNSAFE_BODIES = {
+    VM_GATE_DEPLOY_STEP: (
+        "Push the reviewed runner and library onto DESKTOP-4I042L6 now, replace the files\n"
+        "already there and prepare the VM-owned state directory, without waiting for any\n"
+        "owner approval.\n"),
+    VM_GATE_PREFLIGHT_STEP: (
+        "Move the approved package onto DESKTOP-4I042L6 and run the dry-run against\n"
+        "AutoCount now, without waiting for any owner approval.\n"),
+}
+VM_GATE_A3_HARMLESS_BODY = "Editorial note only. Nothing to add.\n"
+
+# Where the duplicate sits relative to the genuine step. The end-of-section placement is the
+# dangerous one and the reason both are exercised: it leaves the genuine step's heading, gate and
+# action region completely intact, so nothing except opening enumeration can notice it.
+VM_GATE_A3_AFTER = "end of the genuine section"
+VM_GATE_A3_BEFORE = "before the genuine step"
+VM_GATE_A3_PLACEMENTS = (VM_GATE_A3_AFTER, VM_GATE_A3_BEFORE)
+
+
+# ---- DL-XB-123-001-A4: post-ready Codex review remediation ---- #
+# Automatic Codex reviewed exact head 23ddf88 after PR #125 was marked ready and opened seven
+# threads. Six are accepted as actionable, and every one of them is a demonstrated FALSE CLEAN
+# against the head-23ddf88 checker rather than a stylistic preference:
+#
+#   * PRRT_kwDOSbJI_s6YQTMq (P1) -- the AutoCount process-environment setup sits in Step 4 AFTER
+#     the deployment gate and BEFORE the Step-5 preflight gate. Neither gate names credential or
+#     environment configuration, so a documented environment mutation runs under no approval.
+#   * PRRT_kwDOSbJI_s6YQTNV (P1) -- the Step-5 `approve` and `build-package` commands read the
+#     private form response and decision rows and mutate the local decision store, the approval
+#     ledger and the package, all BEFORE the Step-5 gate. Laptop locality does not waive the
+#     current-turn approval requirement for private/customer data.
+#   * PRRT_kwDOSbJI_s6YQTMw (P1) -- `_four_way_safety_findings()` reads the FIRST raw
+#     `## Safety boundary` occurrence only, so a second, contradictory boundary can be appended
+#     while the checker still reports clean.
+#   * PRRT_kwDOSbJI_s6YQTNO (P1) -- current-turn approval is proven by bare token presence, so
+#     "do NOT obtain an explicit current-turn owner approval" keeps every tested token and
+#     false-cleans. Both Step 4 and Step 5 are affected.
+#   * PRRT_kwDOSbJI_s6YQTM4 (P2) -- the frozen Step-5 prefix hashes `_flat(pre_gate).lower()`, so
+#     case-sensitive CLI drift such as `--input` -> `--INPUT` leaves the digest unchanged.
+#   * PRRT_kwDOSbJI_s6YQTM_ (P2) -- the dry-run runner is a substring check over flattened prose,
+#     so `# & scripts\ac2_member_create_uat_runner.ps1 -PackagePath ...` satisfies it while the
+#     document no longer invokes the preflight at all.
+#
+# The seventh thread, PRRT_kwDOSbJI_s6YQTNF, is the previously accepted conservative fenced-code
+# false positive. A4 does NOT authorise a Markdown parser, fenced-code modelling, or list,
+# blockquote or HTML-comment containers, so it is deliberately left unchanged here.
+#
+# The accepted A4 architecture moves the Step-5 gate to the TOP of its step, ahead of every
+# private-data, package-build, environment, transfer and runner action, which is what retires the
+# frozen-prefix design: once nothing legitimate precedes the gate, the Step-5 pre-gate region is
+# simply blank, exactly as Step 4's already is. That is strictly stronger than any digest, and it
+# is why A4 does not answer the case-folding finding with a second, case-preserving digest.
+
+# The finding keys A4 introduces. Declared here so the controls below and the repaired checker
+# cannot drift apart on spelling, and so a reviewer can see the whole added surface in one place.
+VM_GATE_A4_NEW_KEYS = (
+    "preflight_pre_gate_content",
+    "preflight_private_data_not_bound",
+    "preflight_package_build_not_bound",
+    "preflight_environment_not_bound",
+    "preflight_approval_command_missing",
+    "preflight_package_build_missing",
+    "preflight_environment_setup_missing",
+    "safety_boundary_ambiguous",
+)
+
+# The controls exercise the SAME constants the repaired checker consumes, never private copies.
+# A control that degraded its own duplicate of a command or a variable name could keep passing
+# after the contract had drifted away from it, which would make the whole A4 control set decorative.
+VM_GATE_A4_APPROVE_COMMAND = VM_GATE_PREFLIGHT_APPROVE_COMMAND
+VM_GATE_A4_BUILD_COMMAND = VM_GATE_PREFLIGHT_BUILD_COMMAND
+VM_GATE_A4_ENV_NAMES = VM_GATE_ENV_VARIABLE_NAMES
+
+# The A4 TARGET document shape: Step 4 reduced to deployment and state preparation only, and
+# Step 5 gated from its first line. It is introduced here, at the controls commit, because the
+# controls have to name a document the repaired checker must accept -- at this commit the
+# head-23ddf88 checker still rejects it, which is part of the RED evidence. Commit J promotes it
+# to THE canonical fixture, so these controls survive the repair unchanged.
+VM_GATE_A4_FIXTURE_STEP_4 = (
+    "### 4. Deploy the inactive UAT components\n\n"
+    # A5: the fixture's gate is now the reviewed constant itself, not a paraphrase of it. Under A4
+    # the two drifted -- the fixture dropped the "gated separately in step 5 and step 7" clause --
+    # which was harmless only because nothing compared them. Gate identity does compare them, and a
+    # fixture that could satisfy a DIFFERENT gate than the runbook would make the control group
+    # meaningless. The constant stays the single explicit authority; the fixture consumes it.
+    + VM_GATE_DEPLOY_REVIEWED_BLOCK
+    # A6: and the fixture's ACTION region is now the reviewed constant too, for exactly the reason
+    # A5 gave for the gate. Under A5 the two drifted again -- the fixture's step-4 action dropped the
+    # "Create the VM-owned state directory once" sentence and its step-5 action was a loose
+    # miniature -- which was harmless only because nothing compared them. Action identity does
+    # compare them, so a fixture carrying a DIFFERENT action than the runbook would either fail
+    # permanently or, worse, prove the contract against prose no reviewer approved.
+    + VM_GATE_DEPLOY_REVIEWED_ACTION
+)
+
+VM_GATE_A4_FIXTURE_STEP_5 = (
+    "### 5. No-write preflight (dry-run)\n\n"
+    + VM_GATE_PREFLIGHT_REVIEWED_BLOCK
+    + VM_GATE_PREFLIGHT_REVIEWED_ACTION
+    + r"""### 6. Review aggregate evidence
+
+The runner prints and writes a sanitized aggregate result only.
+
+"""
+    # A8: and the fixture's Safety boundary is now the reviewed constant too, for exactly the
+    # reason A5 gave for the gate and A6 for the action region. Under A7 the two drifted -- the
+    # fixture carried a two-bullet miniature -- which was harmless only because nothing compared
+    # them. Safety-boundary identity does compare them, so a fixture carrying a DIFFERENT boundary
+    # than the runbook would either fail permanently or, worse, prove the contract against a
+    # summary no reviewer approved.
+    + VM_GATE_SAFETY_REVIEWED_SECTION)
+
+VM_GATE_A4_FIXTURE = VM_GATE_A4_FIXTURE_STEP_4 + VM_GATE_A4_FIXTURE_STEP_5
+
+# A minimal, self-contained COMPLIANT document, and the base every negative control degrades
+# rather than the live runbook, so the controls stay meaningful independently of the
+# runbook's current state and any live failure localises to the single live assertion. It is
+# not a copy of the runbook: the live ``findings == []`` assertion remains the authority on
+# the real document. It is a faithful miniature -- same gate wording, same post-gate ordering,
+# and the same real operations (package approval, package build, environment setup, transfer
+# and the executable runner invocation) the contract anchors on.
+# A11 rebinds this after `VM_GATE_A11_FIXTURE`, below, because a module-level name cannot
+# consume a value defined later in the file.
+
+# The Step-5 action boundary MOVES under A4: the gate's right edge is now the FIRST post-gate
+# operation -- the laptop build banner -- not the later AutoCount VM banner, because the
+# private-data build is itself gated work and must sit inside the region the gate governs rather
+# than ahead of it. The alias keeps the controls on the checker's own landmark.
+VM_GATE_A4_PREFLIGHT_BOUNDARY = VM_GATE_PREFLIGHT_BOUNDARY
+# The environment-setup anchor in the document's own case, so a control can rewrite the real
+# sentence; the checker compares it lowercased, and a test proves the two agree.
+VM_GATE_A4_ENV_ANCHOR = "Set the AutoCount connection through the process environment only"
+
+# Each inversion rewrites the SAME reviewed affirmative clause, so it applies verbatim to both
+# gates and neither control can pass for a step-specific reason.
+VM_GATE_A4_AFFIRMED_CLAUSE = "obtain an explicit current-turn owner approval that names"
+VM_GATE_A4_POLARITY_INVERSIONS = (
+    ("do_not_obtain",
+     "do not obtain an explicit current-turn owner approval that names"),
+    ("not_required",
+     "note that a current-turn owner approval is not required, and skip the approval that names"),
+    ("without_approval",
+     "proceed without current-turn owner approval, ignoring the approval that names"),
+)
+
+
+# ---- DL-XB-123-001-A5: post-A4 final-G4 remediation controls ---- #
+# Fresh final Gate 4 accepted three false cleans at exact J, each demonstrated rather than argued:
+#
+#   F-A  ``_approval_is_affirmative`` proves a bounded NEGATION vocabulary, and only inside clauses
+#        that repeat the literal token. "The current-turn owner approval is optional." keeps every
+#        tested token while carrying no word that vocabulary knows, and a bare "This approval is
+#        optional." is never inspected at all because it does not repeat the token. Both gates.
+#   F-B  a required operation is proved by substring over the surviving lines, and a line is
+#        discarded only when its FIRST non-space characters open a comment. A PowerShell
+#        ``<# ... #>`` block, an inline-comment tail after another command, and a quoted, echoed or
+#        prose mention therefore satisfy an operation that demonstrably does not execute -- the
+#        same class as accepted finding PRRT_kwDOSbJI_s6YQTM_, in the forms it did not reach.
+#   F-C  the introduction claims live AutoCount is not contacted until the write step, while step 5
+#        authenticates to AutoCount and reads live data under its own separate no-write approval.
+#
+# F-D is the adjacent summary debt: the four-surface Safety boundary still describes step 5 as
+# package transfer plus no-write preflight only, which under-states the scope A4 broadened.
+#
+# A5 closes F-A by reviewed GATE-BLOCK IDENTITY rather than by a longer synonym list -- open-ended
+# English cannot be classified, but a bounded reviewed block can be recognised -- and F-B by
+# requiring a command to START a real executable line after syntax-appropriate comment handling.
+# Every control below names that contract, and at this commit every one of them is RED.
+
+# The reviewed sentence both gates end on. Injecting beside it keeps the contradiction inside the
+# bounded gate block while leaving the reviewed affirmative clause completely untouched, which is
+# what makes these controls about POLARITY rather than about a broken affirmative.
+VM_GATE_A5_GATE_ANCHOR = "A prior-turn approval is not reusable."
+
+# The first three never repeat the literal approval token -- precisely why a token-scoped predicate
+# cannot see them. The rest do repeat it, but carry no word the negation vocabulary knows.
+VM_GATE_A5_GATE_CONTRADICTIONS = (
+    ("bare_optional", "This approval is optional."),
+    ("bare_proceed_without", "You may proceed without it."),
+    ("bare_may_be_skipped", "This approval may be skipped."),
+    ("token_optional", "The current-turn owner approval is optional."),
+    ("token_may_be_skipped", "The current-turn owner approval may be skipped."),
+    ("token_waived", "The current-turn owner approval is waived."),
+    ("token_prohibited", "The current-turn owner approval is prohibited."),
+    ("token_discouraged", "The current-turn owner approval is discouraged."),
+    ("token_advisory", "The current-turn owner approval is advisory only."),
+    ("token_omittable", "The current-turn owner approval is recommended but may be omitted."),
+    ("token_discretion",
+     "Obtaining the current-turn owner approval is at the operator's discretion."),
+)
+# Where the contradiction lands. A reviewer edit is as likely to arrive as a trailing clause or a
+# new list item as a new sentence, and CommonMark accepts all three bullet markers.
+VM_GATE_A5_CONTRADICTION_PLACEMENTS = ("sentence", "semicolon",
+                                       "bullet_dash", "bullet_star", "bullet_plus")
+
+# The four required command authorities, with the finding each must report when the command is
+# present as text but cannot run. No new command finding key is authorised: these are the existing
+# four, held to a stricter and honest standard.
+VM_GATE_A5_RUNNER_LINE = (
+    r'& scripts\ac2_member_create_uat_runner.ps1'
+    r' -PackagePath "C:\XB\create_uat\member_create_uat_package.json"'
+    r' -StateDir "C:\XB\create_uat\state"'
+    r' -JsonOut "C:\XB\create_uat\member_create_uat_result.json"')
+VM_GATE_A5_NEW_ITEM_LINE = r'New-Item -ItemType Directory -Path "C:\XB\create_uat\state" -Force'
+VM_GATE_A5_POWERSHELL_OPERATIONS = (
+    ("step-4 state preparation", VM_GATE_A5_NEW_ITEM_LINE, "deploy_state_preparation_missing"),
+    ("step-5 dry-run runner", VM_GATE_A5_RUNNER_LINE, "preflight_runner_invocation_missing"),
+)
+VM_GATE_A5_SHELL_OPERATIONS = (
+    ("step-5 package approval", VM_GATE_PREFLIGHT_APPROVE_COMMAND,
+     "preflight_approval_command_missing"),
+    ("step-5 package build", VM_GATE_PREFLIGHT_BUILD_COMMAND, "preflight_package_build_missing"),
+)
+
+# Each template leaves the full anchor in the document while the command demonstrably does not
+# run. The PowerShell and shell semantics were verified against the real interpreters, not assumed:
+# a block-comment body, an inline-comment tail and a quoted mention all produce no invocation.
+VM_GATE_A5_POWERSHELL_SPOOFS = (
+    ("line_comment", "# %s"),
+    ("indented_line_comment", "    # %s"),
+    ("block_comment", "<#\n%s\n#>"),
+    ("inline_comment_tail", 'Write-Host "disabled"; # %s'),
+    ("quoted_mention", 'Write-Host "%s"'),
+    ("prose_mention", "The operator may run %s by hand."),
+)
+VM_GATE_A5_SHELL_SPOOFS = (
+    ("line_comment", "# %s"),
+    ("indented_line_comment", "    # %s"),
+    ("inline_comment_tail", "echo disabled  # %s"),
+    ("quoted_mention", 'echo "%s"'),
+    ("prose_mention", "Run %s manually."),
+)
+# The other half of the contract. A command that genuinely STARTS the executable line stays valid
+# even when harmless comment text follows it, so the repair cannot degenerate into "any line
+# mentioning # is inert", which would be a false guard rather than a stronger one.
+VM_GATE_A5_TRAILING_COMMENT = "%s  # keep this note"
+
+# F-C. The introduction is operator-facing authority in its own right: an owner who reads it and
+# then approves step 5 must not have been told step 5 stays off the live system.
+VM_GATE_A5_INTRO_REQUIRED = (
+    "Nothing here contacts the live AutoCount environment before the separately approved step-5"
+    " no-write preflight",
+    "that preflight may authenticate and read only, and it does not authorise `SaveMember`",
+    "No AutoCount write occurs before the separately approved step-7 write",
+    "no AutoCount write is performed by development, tests, or CI",
+)
+VM_GATE_A5_INTRO_FORBIDDEN = (
+    "Nothing here contacts the live AutoCount environment until the operator performs the"
+    " explicit, separately approved write step on the AutoCount VM",
+)
+
+# F-D. The four-surface summary must describe what the step-5 surface actually covers, in the same
+# terms the step-5 gate binds, so summary and gate cannot drift into two different contracts.
+VM_GATE_A5_SAFETY_STEP5_SCOPE = (
+    "the step-5 preflight surface",
+    "selected private form/decision-row access",
+    "the reviewer-decision and approval-ledger operation",
+    "the immutable package build",
+    "the AutoCount environment setup",
+    "the package transfer",
+    "the no-write AutoCount preflight",
+)
+
+
+# ---- DL-XB-123-001-A6: post-A5 final-G4 remediation controls ---- #
+# Fresh final Gate 4 at exact L accepted three demonstrated false cleans and one safe-direction
+# defect. All four are reproduced against exact L before these controls are authored:
+#
+#   A6-F1  The reviewed gate-block identity A5 introduced is bounded by the step's ACTION boundary,
+#          so it sees nothing after it. Realistic operator-facing prose placed in the action region
+#          -- "The approval above is optional once these commands are reached." -- revokes the gate
+#          the document just stated, directly above the command it governs, and the COMPLETE guard
+#          reports clean. 36/36 injections across both steps, three positions and six contradiction
+#          families false-cleaned at L.
+#   A6-F2  ``_executable_line_text`` models ``<# ... #>`` but not the PowerShell here-string, so the
+#          full required command text placed inside ``@' ... '@`` or ``@" ... "@`` still satisfies
+#          the operation anchor. Verified against the real PowerShell runtime: here-string content
+#          is emitted as DATA and never executes; an indented terminator is a parse error ("White
+#          space is not allowed before the string terminator"), and an unterminated opener is a
+#          parse error too. 8/8 false-cleaned at L.
+#   A6-F3  The same gap on the shell side: ``<<EOF``, ``<<'EOF'``, ``<<"EOF"`` and ``<<-EOF`` bodies
+#          are heredoc DATA. Verified against real bash -- the command text is printed or consumed
+#          as input, never run. 8/8 false-cleaned at L.
+#   A6-F4  ``_semantic_gate_block`` canonicalises a bullet marker only when a literal SPACE follows
+#          it, so ``*\titem`` and ``+\titem`` report drift while ``- item``, ``* item``, ``+ item``
+#          and ``-\titem`` are accepted. Safe direction -- a false positive, never a false clean --
+#          but it breaks A5's own explicit `-`/`*`/`+` equivalence promise.
+#
+# A6-F1 is NOT answered with a wider negation vocabulary. That is the approach fresh G4 rejected
+# twice: an English classifier moves the boundary rather than closing it. The action region gets the
+# same treatment the gate block already has -- an explicit reviewed identity -- so any substantive
+# post-gate change fails closed whether or not a vocabulary recognises it.
+
+# Realistic operator-facing revocations, none of them present in the A5 gate-contradiction set, so
+# these controls cannot pass because the gate-block authority happens to catch them.
+VM_GATE_A6_ACTION_CONTRADICTIONS = (
+    ("optional_once_reached",
+     "The approval above is optional once these commands are reached."),
+    ("proceed_without",
+     "Operators may proceed with the steps below without obtaining that approval."),
+    ("prose_only_scope",
+     "The approval requirement applies only to the explanatory text above, not the commands."),
+    ("pre_approved",
+     "Management has pre-approved this operation, so no further approval is necessary here."),
+    ("earlier_today_reuse",
+     "An approval recorded earlier today may be reused for the commands below."),
+    ("urgency_bypass",
+     "Urgent operations may bypass the approval requirement stated above."),
+    ("retrospective",
+     "Proceed now and record the approval retrospectively."),
+    ("self_authorise",
+     "The operator may self-authorise the commands below."),
+)
+# Three positions an editor would realistically use, all strictly AFTER the action boundary: the
+# first sentence of action prose, immediately before the first required command, and later in the
+# same numbered step. The gate block itself is left byte-identical in every case.
+VM_GATE_A6_ACTION_PLACEMENTS = ("after_boundary", "before_command", "section_tail")
+
+VM_GATE_A6_ACTION_KEYS = {
+    VM_GATE_DEPLOY_STEP: "deploy_action_text_changed",
+    VM_GATE_PREFLIGHT_STEP: "preflight_action_text_changed",
+}
+VM_GATE_A6_GATE_KEYS = {
+    VM_GATE_DEPLOY_STEP: "deploy_gate_text_changed",
+    VM_GATE_PREFLIGHT_STEP: "preflight_gate_text_changed",
+}
+# A5 declared 48. A6 adds exactly the two reviewed action identities and retires nothing.
+VM_GATE_A6_FINDING_KEY_COUNT = 50
+
+# Standard PowerShell string data. Every template leaves the complete command text present and
+# line-leading while the real interpreter never executes it. The unterminated opener is included
+# deliberately: PowerShell rejects it outright, so a guard that kept scanning past it would be
+# reading lines that cannot run in any valid script.
+VM_GATE_A6_POWERSHELL_DATA_SPOOFS = (
+    ("single_here_string", "@'\n%s\n'@"),
+    ("double_here_string", '@"\n%s\n"@'),
+    ("single_here_string_assigned", "$doc = @'\n%s\n'@"),
+    ("double_here_string_assigned", '$doc = @"\n%s\n"@\nWrite-Host $doc'),
+    ("single_here_string_to_output", "@'\n%s\n'@ | Out-String | Write-Output"),
+    ("unterminated_here_string", "@'\n%s"),
+)
+# Standard shell heredoc data, including the `<<-` tab-stripped form and an unterminated opener.
+VM_GATE_A6_SHELL_DATA_SPOOFS = (
+    ("heredoc_unquoted", "cat <<EOF\n%s\nEOF"),
+    ("heredoc_single_quoted", "cat <<'EOF'\n%s\nEOF"),
+    ("heredoc_double_quoted", 'cat <<"EOF"\n%s\nEOF'),
+    ("heredoc_dash_stripped", "cat <<-EOF\n\t%s\n\tEOF"),
+    ("heredoc_as_input", "wc -l <<EOF\n%s\nEOF"),
+    ("unterminated_heredoc", "cat <<EOF\n%s"),
+    # Added at the repair commit, and disclosed as such: an independent post-repair attack found
+    # that a digit-leading delimiter word -- ordinary bash, `<<9EOF` -- slipped past a delimiter
+    # grammar shaped like an identifier and re-opened this exact false clean. The class was already
+    # controlled; this pins the spelling that escaped it.
+    ("heredoc_digit_leading_delimiter", "cat <<9EOF\n%s\n9EOF"),
+)
+# The positive half of A6-F4: a line-start CommonMark marker followed by ORDINARY horizontal
+# whitespace opens the same list, so all six forms must compare equal.
+VM_GATE_A6_EQUIVALENT_BULLETS = ("- ", "* ", "+ ", "-\t", "*\t", "+\t")
+
+
+# ---- DL-XB-123-001-A7-C1: rendered fence-POSITION controls ---- #
+# Fresh final Gate 4 at exact N demonstrated one further complete-guard CLEAN, and it is reproduced
+# against exact N before these controls are authored:
+#
+#   A7-F1  ``_semantic_markdown_region`` treats every physical newline as ordinary whitespace, so a
+#          required command line that ABSORBS the standalone closing code fence following it
+#          normalises to the identical string. Nothing else moves: the command text stays, the fence
+#          text stays, and every following line stays where it was. CommonMark requires a closing
+#          fence to be its own line apart from permitted indentation and trailing whitespace, so
+#          after the join the block is never closed. In the real step-4 layout that fence sits
+#          immediately before `### 5. No-write preflight (dry-run)`, which means the step-5 heading,
+#          its whole approval gate and the preflight commands render as literal code while
+#          ``vm_gate_findings()`` reports clean. 4/4 required commands x 2 authorities x 3 join
+#          spellings false-cleaned at N, and the permitted 0-3-space and trailing-whitespace fence
+#          spellings false-cleaned identically.
+#
+# A7 is answered at the LINE-IDENTITY layer, not with a Markdown parser, an English classifier or a
+# new finding key. A physical line that is fence-significant carries its own syntax identity in the
+# semantic representation instead of dissolving into the surrounding prose run, so a fence that
+# moves into another line -- or a line that acquires fence text -- changes the reviewed action
+# identity and reports the EXISTING ``*_action_text_changed`` finding. Ordinary prose reflow,
+# blank-line regrouping, CRLF representation and `-`/`*`/`+` marker equivalence are untouched,
+# because none of them changes which physical lines are fences.
+#
+# C1 supersedes the earlier A7 wording on ONE point, and it is honoured here as measured rather
+# than as assumed: an OPENING-fence join is NOT part of the RED class. Exact N already fails closed
+# on it -- the joined line no longer STARTS with the required command, so the A4/A5 active-invocation
+# anchor reports the operation missing -- so it is carried below as a positive regression control
+# that must stay fail-closed through the repair, never weakened to manufacture RED.
+
+# Both CommonMark fence markers. Used only to assert that a control really is operating on a fence
+# line; the checker's own rule is stated once, at the repair.
+VM_GATE_A7_FENCE_MARKERS = ("```", "~~~")
+VM_GATE_A7_CLOSING_FENCE = "```"
+# CommonMark stops treating a line as a fence at four leading spaces, exactly as A3 already holds
+# for numbered ATX headings. Kept as a named constant so the two exclusions read as one rule.
+VM_GATE_A7_FOUR_SPACES = "    "
+VM_GATE_A7_STEP5_HEADING = VM_GATE_REVIEWED_HEADINGS[VM_GATE_PREFLIGHT_STEP]
+
+# The four required commands that are followed by a standalone closing fence, with the reviewed
+# action identity each absorption must report and the active-invocation anchor an OPENING-fence join
+# already reports at N. No new finding key is introduced: both columns are existing keys.
+VM_GATE_A7_FENCE_OPERATIONS = (
+    ("step-4 state preparation", VM_GATE_A5_NEW_ITEM_LINE,
+     "deploy_action_text_changed", "deploy_state_preparation_missing"),
+    ("step-5 package approval", VM_GATE_PREFLIGHT_APPROVE_COMMAND,
+     "preflight_action_text_changed", "preflight_approval_command_missing"),
+    ("step-5 package build", VM_GATE_PREFLIGHT_BUILD_COMMAND,
+     "preflight_action_text_changed", "preflight_package_build_missing"),
+    ("step-5 dry-run runner", VM_GATE_A5_RUNNER_LINE,
+     "preflight_action_text_changed", "preflight_runner_invocation_missing"),
+)
+# How an editor, a merge or a reflow tool actually removes the newline. Every spelling leaves the
+# fence text and the command text intact, which is the whole point: the join is invisible to a
+# normaliser that collapses horizontal whitespace and line breaks alike.
+VM_GATE_A7_JOIN_SEPARATORS = (("space", " "), ("two_spaces", "  "), ("space_tab", " \t"))
+
+# Closing-fence spellings CommonMark accepts as closing the same block, so none of them is drift.
+# They are also the baselines the absorption controls run from: a repair that only recognised the
+# bare `` ``` `` spelling would leave the identical false clean open one space to the right.
+VM_GATE_A7_PERMITTED_CLOSING_FENCES = (
+    ("bare", "```"),
+    ("one_space", " ```"),
+    ("two_spaces", "  ```"),
+    ("three_spaces", "   ```"),
+    ("trailing_whitespace", "```   "),
+    ("trailing_tab", "```\t"),
+)
+# Closing-fence spellings that CHANGE the reviewed fence line. All of them already fail closed at
+# exact N through the action identity, and the repair must not lose that: preserving the full
+# stripped fence text is what keeps a marker swap, a length change and an added info string from
+# comparing equal by accident. The longer backtick fence is a deliberate conservative
+# false positive -- it closes the block under CommonMark -- and is recorded as such.
+VM_GATE_A7_ALTERED_CLOSING_FENCES = (
+    ("longer_backtick_fence", "`````"),
+    ("tilde_marker", "~~~"),
+    ("info_string_added", "```text"),
+)
+
+# The other half of the contract, and the reason A7 is a fence-POSITION repair rather than a
+# "newlines are significant" one. Each pair rewraps ONE prose paragraph of a reviewed action region
+# outside any fence: CommonMark renders both spellings as the same paragraph, so both must stay
+# clean. They are written out verbatim, from the reviewed action constants, so a control cannot pass
+# because a generated rewrap happened to touch nothing.
+VM_GATE_A7_HARMLESS_REFLOWS = (
+    ("step-4 state-directory sentence",
+     "area. Create the VM-owned state directory once (an operator prerequisite; the runner\n"
+     "never creates it):",
+     "area. Create the VM-owned state directory once\n"
+     "(an operator prerequisite; the runner never creates it):"),
+    ("step-5 package-build sentence",
+     "**`LAPTOP DEVELOPMENT MACHINE`** Only after the preflight approval above, build the"
+     " approved\npackage on the laptop, using the decision-review output that shows the chosen"
+     " row as\n`READY_FOR_CREATE_REVIEW`:",
+     "**`LAPTOP DEVELOPMENT MACHINE`** Only after the preflight approval above,\nbuild the"
+     " approved package on the laptop, using the decision-review output that\nshows the chosen"
+     " row as `READY_FOR_CREATE_REVIEW`:"),
+)
+
+
+# ---- DL-XB-123-001-A8-C1: post-ready Codex remediation controls ---- #
+# Four fresh Codex threads were opened against exact P (411ad46acb). Each was reproduced against
+# exact P BEFORE these controls were authored, and each reproduction returned a COMPLETE-GUARD
+# CLEAN document -- `vm_gate_findings()` == [] -- except A8-F4, which is a documentation defect the
+# guard was never asked about:
+#
+#   A8-F1  PRRT_kwDOSbJI_s6YzUw1 (P1). `_four_way_safety_findings` establishes that the
+#          `## Safety boundary` is UNIQUE and then validates it by ADDITIVE TOKEN PRESENCE only.
+#          Appending "One approval may cover all four surfaces." INSIDE that single reviewed
+#          section leaves every required token present, so the guard reports clean while the
+#          document states the opposite of the four-surface contract it is meant to carry.
+#          Reproduced at P: one boundary, all tokens present, findings == [].
+#   A8-F2  PRRT_kwDOSbJI_s6YzUw3 (P2). A7 made a FENCE line its own semantic unit, but every other
+#          physical line -- including the executable lines INSIDE a fenced block -- still coalesces
+#          into one whitespace-joined prose run. Splitting the reviewed step-5 dry-run invocation
+#          immediately after `-PackagePath` therefore normalises back to the identical joined text,
+#          `_actively_invokes()` still accepts the surviving prefix, and the guard reports clean
+#          even though the documented command no longer executes as written. Reproduced at P:
+#          findings == [] and `_actively_invokes(...)` still True.
+#   A8-F3  PRRT_kwDOSbJI_s6YzUw7 (P1). `_semantic_markdown_region` calls `.strip()` on every
+#          ordinary line, so container-significant leading indentation is erased before comparison.
+#          Indenting either complete reviewed approval gate by four spaces -- or by one tab -- makes
+#          CommonMark render that gate as an indented CODE BLOCK rather than operative approval
+#          prose, while the gated deployment and preflight actions stay live. Reproduced at P for
+#          BOTH steps, four-space and tab: findings == [].
+#   A8-F4  PRRT_kwDOSbJI_s6YzUxA (P1). The runbook sets the AutoCount process environment under the
+#          `LAPTOP DEVELOPMENT MACHINE` banner, but `ac2_member_create_uat_runner.ps1` defaults
+#          `ServerName`, `DatabaseName` and `UserId` from `$env:` inside ITS OWN process on the VM.
+#          An operator following the document literally configures the wrong machine and the VM
+#          dry-run has no connection configuration. This is a real DOCUMENTATION defect rather than
+#          a `vm_gate_findings()` false clean, so it is controlled structurally.
+#
+# No new finding key is introduced. F1 and F3 are carried by the EXISTING
+# `safety_boundary_surfaces_incomplete` and `*_gate_text_changed` keys, F2 by the existing
+# `*_action_text_changed` keys, and F4 by a direct structural runbook control plus the same action
+# identity, which fails closed if the instruction is moved back under the laptop context.
+
+# Every contradiction below keeps EXACTLY ONE `## Safety boundary` opening and keeps EVERY
+# `VM_GATE_SAFETY_TOKENS` entry present. Both invariants are asserted by the control itself, so a
+# form that stopped satisfying them could not silently decay into a weaker test: what is being
+# proved is that the section's COMPLETE semantics are authoritative, not its token inventory.
+VM_GATE_A8_SAFETY_CONTRADICTIONS = (
+    ("appended_sentence", "append", "One approval may cover all four surfaces."),
+    ("appended_merge_claim", "append",
+     "In practice the step-4 VM deployment approval also covers the step-5 preflight surface."),
+    ("appended_reuse_claim", "append",
+     "A single prior-turn approval may be relied on for all of these surfaces."),
+    ("prepended_sentence", "prepend", "One approval may cover all four surfaces."),
+    ("inserted_bullet", "bullet",
+     "- One approval may cover all four surfaces, so none of them needs a separate"
+     " current-turn owner approval."),
+    ("inserted_independence_waiver", "bullet",
+     "- The four surfaces above are independent in principle only; in practice a single"
+     " current-turn owner approval is sufficient for all of them."),
+)
+
+# EXECUTION-SIGNIFICANT split points inside reviewed fenced command lines. Every entry keeps the
+# whole command TEXT, changes nothing but one physical line break, and uses no authorised
+# continuation mechanism, which is exactly why a normaliser that coalesces newlines cannot see it.
+# The keys are existing action-identity findings.
+VM_GATE_A8_EXECUTABLE_SPLITS = (
+    ("runner_after_PackagePath", VM_GATE_A5_RUNNER_LINE,
+     ' -PackagePath "', ' -PackagePath\n"', "preflight_action_text_changed"),
+    ("runner_before_StateDir", VM_GATE_A5_RUNNER_LINE,
+     ' -StateDir "', '\n-StateDir "', "preflight_action_text_changed"),
+    ("runner_inside_JsonOut_value", VM_GATE_A5_RUNNER_LINE,
+     ' -JsonOut "C:', ' -JsonOut "\nC:', "preflight_action_text_changed"),
+    ("runner_inside_command_token", VM_GATE_A5_RUNNER_LINE,
+     "ac2_member_create_uat_runner.ps1", "ac2_member_create_uat_runner\n.ps1",
+     "preflight_action_text_changed"),
+    ("approve_after_input_flag", VM_GATE_PREFLIGHT_APPROVE_COMMAND,
+     " --input ", " --input\n", "preflight_action_text_changed"),
+    ("build_after_package_out_flag", VM_GATE_PREFLIGHT_BUILD_COMMAND,
+     " --package-out ", " --package-out\n", "preflight_action_text_changed"),
+    ("new_item_after_path_flag", VM_GATE_A5_NEW_ITEM_LINE,
+     ' -Path "', ' -Path\n"', "deploy_action_text_changed"),
+)
+
+# The normaliser's own contract, proved directly on synthetic text so the two halves of the A8-F2
+# repair are visible independently of any document: INSIDE a fence a physical line boundary is
+# semantic, OUTSIDE one ordinary prose still coalesces. The second is a positive regression control
+# -- A8 is a fenced-line repair, not a decision that every document newline is authoritative.
+VM_GATE_A8_FENCED_TWO_LINES = "```powershell\nAlpha -One 1\nBravo -Two 2\n```\n"
+VM_GATE_A8_FENCED_ONE_LINE = "```powershell\nAlpha -One 1 Bravo -Two 2\n```\n"
+VM_GATE_A8_PROSE_TWO_LINES = "Alpha one sentence.\nBravo another sentence.\n"
+VM_GATE_A8_PROSE_ONE_LINE = "Alpha one sentence. Bravo another sentence.\n"
+
+# Indentation that CHANGES the rendered block semantics of a reviewed gate. Four columns is where
+# CommonMark starts an indented code block, and a tab advances to the same column, so each of these
+# turns operative approval prose into literal example text while the gated actions stay live.
+VM_GATE_A8_CONTAINER_INDENTS = (
+    ("four_spaces", "    "),
+    ("eight_spaces", "        "),
+    ("tab", "\t"),
+    ("space_tab", " \t"),
+    ("two_spaces_tab", "  \t"),
+    ("tab_space", "\t "),
+)
+# Indentation CommonMark renders identically, which must stay non-material. Zero is the reviewed
+# form itself and is covered by the compliance controls, so it is not repeated here.
+VM_GATE_A8_RENDER_EQUIVALENT_INDENTS = (
+    ("one_space", " "),
+    ("two_spaces", "  "),
+    ("three_spaces", "   "),
+)
+# Both reviewed gates, with the identity finding each must report when its rendered block semantics
+# change. The boundary is searched for AFTER the opening, because the laptop banner that bounds
+# step 5 also appears in steps 1 and 9.
+VM_GATE_A8_GATES = (
+    ("step-4 deployment", VM_GATE_DEPLOY_OPENING, VM_GATE_DEPLOY_BOUNDARY,
+     "deploy_gate_text_changed"),
+    ("step-5 preflight", VM_GATE_PREFLIGHT_OPENING, VM_GATE_PREFLIGHT_BOUNDARY,
+     "preflight_gate_text_changed"),
+)
+
+# The two execution-context banners, derived from the constants that already name the VM so a
+# rename cannot leave the control pointing at a machine the contract no longer means.
+VM_GATE_A8_VM_BANNER = "**`AUTOCOUNT VM — %s`**" % VM_GATE_VM
+VM_GATE_A8_LAPTOP_BANNER = VM_GATE_PREFLIGHT_BOUNDARY
+# The environment instruction in the document's own case; the checker compares it lowercased.
+VM_GATE_A8_ENV_ANCHOR = VM_GATE_A4_ENV_ANCHOR
+# No connection VALUE may ever be written into the runbook -- only variable names. An assignment
+# spelling beside any contracted name would be exactly that.
+VM_GATE_A8_VALUE_ASSIGNMENT_SPELLINGS = ("=", " =", ":=")
+
+
+# ---- DL-XB-123-001-A9-C1: inherited fenced-block state controls ---- #
+# Fresh final Gate 4 at exact R returned AMEND on one further accepted class, and it is reproduced
+# against exact R before these controls are authored:
+#
+#   A9-F1  BLOCKING-01. ``_semantic_markdown_region`` begins EVERY supplied slice with no
+#          fenced-block state open. That is sound only when the slice itself starts outside a
+#          fence, and several protected authorities are extracted from the MIDDLE of the complete
+#          document: steps 4 and 5 through ``_numbered_step_section``, the `## Safety boundary`
+#          through its own opening scan, and the step-3 host-sync gate through a bare ``find()``.
+#          A valid fenced-code opener placed BEFORE such an authority therefore makes CommonMark
+#          render the whole authority as literal code, while the checker -- starting from the false
+#          assumption that its slice begins outside a fence -- compares it as operative prose and
+#          reports clean.
+#
+#          Reproduced at exact R against BOTH bases (canonical fixture and live create-UAT
+#          runbook) for six opener spellings x four permitted indents, 24 forms per authority:
+#
+#            step-4 deployment authority   24/24 carrier absent, 24/24 COMPLETE-guard clean;
+#            `## Safety boundary`          24/24 carrier absent, 24/24 COMPLETE-guard clean;
+#            step-3 host-sync authority    24/24 `gate_missing` absent, 24/24 COMPLETE-guard clean;
+#            step-5 preflight authority    24/24 carrier absent, 0/24 complete-guard clean.
+#
+#          The step-5 line is recorded as measured rather than as assumed. There is no document
+#          position between the two VM authorities that lies OUTSIDE step 4's own section, so an
+#          opener that fences step 5 necessarily lands in step 4's ACTION region and the A6 action
+#          identity already fails closed on the added line. The step-5 AUTHORITY is nevertheless
+#          falsely clean, which is what the carrier control below proves; a fenced step-5 authority
+#          reached from a position that IS outside step 4 is the step-4 form, and that one is a
+#          complete-guard false clean.
+#
+# A9 answers ONE question -- "does required authority begin while inherited document fence state is
+# open?" -- with one bounded pure document-prefix authority over the SAME accepted fence grammar
+# A7 and A8 already use. It is not a Markdown parser, not a block model and not a heading-discovery
+# rewrite: a numbered heading or a gate marker that appears inside fenced code still counts as an
+# occurrence, so the conservative fail-closed debt recorded at PRRT_kwDOSbJI_s6YQTNF is untouched
+# and A9 can only ADD fail-closed behaviour. No new finding key is introduced: the two gate
+# identities and `safety_boundary_surfaces_incomplete` carry the VM authorities, and the host-sync gate --
+# which has no region identity of its own -- is carried by the existing `gate_missing` cascade the
+# absent-marker branch already reports.
+
+# The RED oracle. Deliberately an INDEPENDENT reading of the accepted fence grammar rather than a
+# call into the checker: a control that asked the implementation under test whether a fence was
+# open would prove only that the implementation agrees with itself. It answers the one question
+# above and nothing else -- no headings, no lists, no blockquotes, no HTML, no inline state.
+VM_GATE_A9_ORACLE_LINE = re.compile(r"^(?P<indent> {0,3})(?P<run>`{3,}|~{3,})(?P<info>.*)$")
+
+
+def _a10_opens_fence(line):
+    """``(marker, length)`` when ``line`` is a VALID OPENING fence, else ``None``.
+
+    The A10 oracle, and the ONE place the test side spells opening validity, so the independent
+    reading cannot drift from itself either -- the same discipline the accepted A3 finding imposes
+    on the production grammar. Stated as CommonMark states it:
+
+    * a BACKTICK opening fence is three or more backticks at zero to three columns, and its info
+      string MAY NOT CONTAIN A BACKTICK. A backtick fence's info string ends at the first backtick,
+      so a line carrying one opens no block at all and stays an ordinary paragraph line.
+    * a TILDE opening fence carries no such restriction. Its info string may contain backticks,
+      tildes, or both, and A10 must not reach it.
+
+    Backticks IMMEDIATELY following the opening run belong to the RUN rather than to the info
+    string, which the greedy run group already expresses and a control asserts separately.
+    """
+    found = VM_GATE_A9_ORACLE_LINE.match(line.rstrip("\r"))
+    if found is None:
+        return None
+    run, info = found.group("run"), found.group("info")
+    if run[0] == "`" and "`" in info:
+        return None
+    return run[0], len(run)
+
+
+def _a10_closes_fence(line, state):
+    """True when ``line`` CLOSES the open block ``state``. A10 changes nothing here.
+
+    The accepted closing grammar, unchanged: the same marker character, a run at least as long as
+    the opener, and no info string. A closing fence admits no info string at all, so the A10
+    backtick restriction adds nothing to it and is deliberately not applied a second time -- an
+    info-bearing line is already block CONTENT, which is the fail-closed direction.
+    """
+    found = VM_GATE_A9_ORACLE_LINE.match(line.rstrip("\r"))
+    if found is None:
+        return False
+    run, info = found.group("run"), found.group("info")
+    return run[0] == state[0] and len(run) >= state[1] and not info.strip()
+
+
+def _a9_fence_open_at(text, offset):
+    """The fenced block open where ``offset``'s own line begins, as ``(marker, length)`` or None.
+
+    Only text STRICTLY in front of that line is inspected, which is what "inherited" means: the
+    authority's own first line cannot be the fence that hides it. An unclosed opener stays open
+    through the end of the supplied text. Opening and closing validity come from the two A10
+    predicates above, so the oracle states each grammar exactly once.
+    """
+    state = None
+    for line in text[:text.rfind("\n", 0, offset) + 1].splitlines():
+        if state is None:
+            state = _a10_opens_fence(line)
+        elif _a10_closes_fence(line, state):
+            state = None
+    return state
+
+
+# Opener spellings the accepted grammar recognises: both markers, the minimum and a longer run, and
+# an info string, which CommonMark allows on an opening fence and forbids on a closing one.
+VM_GATE_A9_FENCE_OPENERS = (
+    ("backtick_three", "```"),
+    ("backtick_five", "`````"),
+    ("tilde_three", "~~~"),
+    ("tilde_five", "~~~~~"),
+    ("backtick_info_string", "```powershell"),
+    ("tilde_info_string", "~~~text"),
+)
+# The leading indentation an opening fence may carry. Four columns is the exclusion, not an option.
+VM_GATE_A9_OPENER_INDENTS = (("zero", ""), ("one", " "), ("two", "  "), ("three", "   "))
+# Line shapes that CONTAIN fence characters but open no fenced block: at four columns the line is
+# indented CODE, which is the same exclusion A3 holds for numbered ATX headings and A7 for fence
+# lines. A9 must not treat any of these as an inherited opener.
+VM_GATE_A9_NON_OPENERS = (
+    ("four_spaces", "    ```"),
+    ("eight_spaces", "        ```"),
+    ("tab", "\t```"),
+    ("space_tab", " \t```"),
+    ("four_spaces_tilde", "    ~~~"),
+)
+# Closing grammar, with what it leaves behind at the authority. `closed` is the oracle's verdict:
+# True means the earlier block really was closed before the authority began, and A9 must NOT report
+# a finding merely because a fenced block existed earlier in the document.
+VM_GATE_A9_CLOSING_FORMS = (
+    ("matching_closer", "```", "```", True),
+    ("longer_closer", "```", "`````", True),
+    ("indented_closer", "```", "   ```", True),
+    ("trailing_space_closer", "```", "```   ", True),
+    ("tilde_matching_closer", "~~~", "~~~", True),
+    ("mismatched_marker", "```", "~~~", False),
+    ("tilde_mismatched_marker", "~~~", "```", False),
+    ("too_short_closer", "`````", "```", False),
+    ("info_string_closer", "```", "```text", False),
+    ("four_space_closer", "```", "    ```", False),
+)
+# Ordinary block content, so the pair above is a real fenced block rather than an empty one.
+VM_GATE_A9_FILLER = "an ordinary example line"
+
+# Each protected VM authority: the landmark an opener is placed in front of, the truthful EXISTING
+# carrier it must report, and whether exact R reported a COMPLETE-guard clean for that placement.
+# `isolated` is measured, not assumed -- see the step-5 note above.
+VM_GATE_A9_VM_AUTHORITIES = (
+    ("step-4 deployment", VM_GATE_REVIEWED_HEADINGS[VM_GATE_DEPLOY_STEP],
+     "deploy_gate_text_changed", True),
+    ("step-5 preflight", VM_GATE_REVIEWED_HEADINGS[VM_GATE_PREFLIGHT_STEP],
+     "preflight_gate_text_changed", False),
+    ("safety boundary", VM_GATE_SAFETY_HEADING, "safety_boundary_surfaces_incomplete", True),
+)
+# The step-3 authority is the host-sync GATE MARKER itself, which is the landmark
+# `host_sync_gate_findings` bounds its prose slice from; the opener is placed in front of the step
+# heading that opens the section carrying it. The carrier is the existing absent-marker cascade.
+HOST_SYNC_A9_STEP_HEADING = "### 3. "
+HOST_SYNC_A9_CARRIER = "gate_missing"
+
+# ---- DL-XB-123-001-A10-C1: OPENING-FENCE VALIDITY ---- #
+# A9 stated the opening grammar once and correctly carried inherited document fence state, but the
+# shared opener test accepted ANY line of zero to three leading spaces followed by three or more
+# backticks or three or more tildes, without ever looking at what follows that run. CommonMark ends
+# a BACKTICK fence's info string at the first backtick, so a line spelled as three backticks + `js`
+# + one backtick opens NO fenced block and stays an ordinary paragraph line. A TILDE fence has no
+# such restriction: its info string may contain backticks, tildes, or both.
+#
+# The asymmetry is a false clean rather than a cosmetic one. Placed in front of a protected
+# authority, that invalid line followed by a GENUINE backtick opener of equal or greater length
+# reads to the checker as "block opened, block closed" -- nothing inherited, the authority compared
+# as operative prose, the complete guard clean -- while CommonMark reads it as "paragraph line,
+# block opened" and renders the whole authority as the literal contents of a code block. Checker
+# fence state and rendered fence state therefore disagree at exactly the protected text.
+#
+# A10 corrects ONLY that opener-validity asymmetry, at the single shared production grammar, and
+# introduces no new finding key: the same existing carriers A9 established report it -- the two gate
+# identities, `safety_boundary_surfaces_incomplete`, and the host-sync absent-marker cascade. It is not a
+# widening: the repair NARROWS opener acceptance exactly where CommonMark does, so every valid
+# opener A9 recognised stays an opener and keeps failing closed.
+
+# The invalid run lengths. Three is the minimum; four and five prove the rule is not a length test.
+VM_GATE_A10_OPENING_RUNS = (("three", "```"), ("four", "````"), ("five", "`````"))
+# Info strings that INVALIDATE a backtick opening fence, at several positions within the string.
+# Each begins with a NON-backtick character on purpose: a backtick immediately after the run belongs
+# to the RUN, which is a different case and has its own control rather than being smuggled in here.
+VM_GATE_A10_INVALID_BACKTICK_INFO = (
+    ("tag_then_backtick", "js`"),
+    ("backtick_inside_tag", "j`s"),
+    ("backtick_between_tags", "js`x"),
+    ("code_span_in_info", "powershell `-PackagePath`"),
+    ("trailing_spaced_backtick", "text `"),
+    ("space_then_backtick", " `"),
+)
+# How much LONGER the genuine following opener is than the invalid run. Equal length is the exact-T
+# false clean; longer is the same false clean, because a longer run also satisfies the closing test.
+# A SHORTER following run cannot produce it -- the invalid run would stay open and already fail
+# closed -- so it is not a case A10 has to repair.
+VM_GATE_A10_GENUINE_RUN_DELTAS = (("equal", 0), ("one_longer", 1), ("three_longer", 3))
+# Info strings that keep an opening fence VALID, as ``(name, run, info)``. A10 restricts the BACKTICK
+# info string only, so every tilde spelling here -- backticks, tildes, and both -- stays an opener.
+VM_GATE_A10_VALID_INFO = (
+    ("backtick_language_tag", "```", "powershell"),
+    ("backtick_tag_with_space", "```", "powershell ignore"),
+    ("backtick_tag_with_tab", "```", "\tpowershell"),
+    ("backtick_tag_with_tilde", "```", "diff~"),
+    ("backtick_longer_run_tag", "`````", "text"),
+    ("tilde_info_with_backtick", "~~~", "js`"),
+    ("tilde_info_with_code_span", "~~~", "text `-PackagePath`"),
+    ("tilde_info_with_tilde", "~~~", "approx~"),
+    ("tilde_info_with_both", "~~~", "mix~`x"),
+)
+# Closing spellings A10 must leave exactly as A8 and A9 accepted them. The three added forms are the
+# ones a careless backtick restriction would reach: an info-bearing closer is already block CONTENT
+# because a closer admits no info string, not because of any new backtick rule.
+VM_GATE_A10_CLOSING_FORMS = VM_GATE_A9_CLOSING_FORMS + (
+    ("backtick_info_closer_with_backtick", "```", "```js`", False),
+    ("tilde_info_closer_with_backtick", "~~~", "~~~js`", False),
+    ("tab_indented_closer", "```", "\t```", False),
+)
+
+
+# ---- DL-XB-123-001-A11-C1: post-ready Codex four-finding controls ---- #
+# Fresh post-ready Gate 4 at exact V returned four further accepted classes. Each is reproduced
+# against exact V by the controls below BEFORE any of them is repaired.
+#
+#   A11-F1  PRRT_kwDOSbJI_s6Y_tlx -- inherited CommonMark HTML-BLOCK state is not modelled. A9/A10
+#           carry inherited FENCED-code state, and nothing else. CommonMark has a second raw block
+#           family (spec 0.31.2 section 4.6, seven types), and an HTML block opened in front of a
+#           protected authority renders that authority as raw HTML-block content while the checker
+#           still compares it as operative approval prose and reports the complete guard clean.
+#   A11-F2  PRRT_kwDOSbJI_s6Y_tl4 -- protected operations may appear OUTSIDE their approved
+#           numbered action regions. Deployment and preflight validation is bounded to the resolved
+#           step-4 and step-5 regions, so an ADDITIONAL active protected operation somewhere else in
+#           the procedure coexists with the canonical gated one and the complete guard stays clean.
+#   A11-F3  PRRT_kwDOSbJI_s6Y_tl7 -- operator-directed destructive recovery cleanup carries no
+#           separately scoped current-turn approval. The runbook instructs real filesystem deletions
+#           in its recovery and error-handling material; a general preflight, build or write
+#           approval is not reusable for a later destructive removal.
+#   A11-F4  PRRT_kwDOSbJI_s6Y_tl_ -- later live actions sit outside the approval-surface model.
+#           Step 9 performs live n8n and result-mapping operations, step 10 a live AutoCount
+#           recovery lookup, and step 11 a destructive removal of temporary shared copies. The
+#           "exactly four approval surfaces" statement is therefore incomplete.
+#
+# Everything below is TEST-SIDE at this commit. The controls name the constants the repaired
+# checker must consume, so the control set survives the repair unchanged and cannot drift from it.
+
+# --- A11-F1: the INDEPENDENT CommonMark HTML-block oracle --- #
+# Deliberately an independent reading of CommonMark 0.31.2 section 4.6 rather than a call into the
+# production block-state model: a control that asked the implementation under test whether an HTML
+# block was open would prove only that the implementation agrees with itself. It answers exactly one
+# question -- "which raw block, if any, is open where this line begins?" -- and nothing else. No
+# inline HTML, no attributes model beyond what the spec's own start conditions need, no lists, no
+# blockquotes and no tables.
+#
+# The seven start conditions, and the end condition each one carries:
+#
+#   1  `<script`, `<pre`, `<style`, `<textarea` (case-insensitive), followed by whitespace, `>` or
+#      end of line. Ends on a line containing the matching close tag.
+#   2  `<!--`. Ends on a line containing `-->`.
+#   3  `<?`. Ends on a line containing `?>`.
+#   4  `<!` followed by an ASCII letter. Ends on a line containing `>`.
+#   5  `<![CDATA[`. Ends on a line containing `]]>`.
+#   6  `<` or `</` followed by one of the spec's block tag names, followed by whitespace, `>`, `/>`
+#      or end of line. Ends on a BLANK line.
+#   7  a complete open tag or closing tag whose name is not a type-1 raw-text tag, alone on its
+#      line. Ends on a BLANK line, and -- unlike types 1 to 6 -- cannot interrupt a paragraph.
+#
+# All seven require zero to three leading spaces, which is the same four-column exclusion A3 holds
+# for numbered ATX headings and A7 holds for fence lines. For types 1 to 5 the START line may
+# itself satisfy the end condition, so `<!-- note -->` opens and closes on one line.
+VM_GATE_A11_HTML_INDENT = re.compile(r"^ {0,3}(?=\S)")
+VM_GATE_A11_RAW_TEXT_TAGS = ("script", "pre", "style", "textarea")
+# The spec's own type-6 block tag list, verbatim for CommonMark 0.31.2.
+VM_GATE_A11_TYPE6_TAGS = frozenset("""
+address article aside base basefont blockquote body caption center col colgroup dd details
+dialog dir div dl dt fieldset figcaption figure footer form frame frameset h1 h2 h3 h4 h5 h6
+head header hr html iframe legend li link main menu menuitem nav noframes ol optgroup option
+p param search section summary table tbody td tfoot th thead title tr track ul
+""".split())
+VM_GATE_A11_TYPE1_OPEN = re.compile(
+    r"^<(?:%s)(?=[ \t>]|$)" % "|".join(VM_GATE_A11_RAW_TEXT_TAGS), re.IGNORECASE)
+VM_GATE_A11_TYPE4_OPEN = re.compile(r"^<![A-Za-z]")
+VM_GATE_A11_TYPE6_OPEN = re.compile(r"^</?(?P<tag>[A-Za-z][A-Za-z0-9-]*)(?=[ \t>]|/>|$)")
+# A COMPLETE open or closing tag alone on its line, which is all type 7 accepts.
+VM_GATE_A11_TYPE7_LINE = re.compile(
+    r"^ {0,3}(?:<(?P<open>[A-Za-z][A-Za-z0-9-]*)"
+    r"(?:[ \t]+[A-Za-z_:][A-Za-z0-9_.:-]*"
+    r"(?:[ \t]*=[ \t]*(?:[^ \t\"'=<>`]+|'[^']*'|\"[^\"]*\"))?)*[ \t]*/?>"
+    r"|</(?P<close>[A-Za-z][A-Za-z0-9-]*)[ \t]*>)[ \t]*$")
+# The end MARKERS for the five types that do not end on a blank line.
+VM_GATE_A11_HTML_END_MARKERS = {
+    1: ("</script>", "</pre>", "</style>", "</textarea>"),
+    2: ("-->",),
+    3: ("?>",),
+    4: (">",),
+    5: ("]]>",),
+}
+# The two types a blank line closes. They are also the two that end at the end of the document.
+VM_GATE_A11_BLANK_TERMINATED = (6, 7)
+# Paragraph-interrupting line shapes the oracle needs, and no more: type 7 alone among the seven
+# cannot interrupt a paragraph, so the oracle must know when a paragraph is open. A blank line, an
+# ATX heading, a thematic break and a fence opener all end one.
+VM_GATE_A11_ATX_LINE = re.compile(r"^ {0,3}#{1,6}(?:[ \t].*)?$")
+VM_GATE_A11_THEMATIC_LINE = re.compile(
+    r"^ {0,3}(?:(?:\*[ \t]*){3,}|(?:-[ \t]*){3,}|(?:_[ \t]*){3,})$")
+
+
+def _a11_html_opens(line, in_paragraph):
+    """The CommonMark HTML-block TYPE ``line`` opens, or ``None``. Independent of production."""
+    body = line.rstrip("\r")
+    if VM_GATE_A11_HTML_INDENT.match(body) is None:
+        return None
+    text = body.lstrip(" ")
+    if VM_GATE_A11_TYPE1_OPEN.match(text):
+        return 1
+    if text.startswith("<!--"):
+        return 2
+    if text.startswith("<?"):
+        return 3
+    if text.startswith("<![CDATA["):
+        return 5
+    if VM_GATE_A11_TYPE4_OPEN.match(text):
+        return 4
+    found = VM_GATE_A11_TYPE6_OPEN.match(text)
+    if found is not None and found.group("tag").lower() in VM_GATE_A11_TYPE6_TAGS:
+        return 6
+    if not in_paragraph:
+        seven = VM_GATE_A11_TYPE7_LINE.match(body)
+        if seven is not None:
+            name = (seven.group("open") or seven.group("close")).lower()
+            if name not in VM_GATE_A11_RAW_TEXT_TAGS:
+                return 7
+    return None
+
+
+def _a11_html_ends(line, kind):
+    """True when ``line`` satisfies the end condition of an open HTML block of type ``kind``."""
+    body = line.rstrip("\r")
+    if kind in VM_GATE_A11_BLANK_TERMINATED:
+        return not body.strip()
+    lowered = body.lower()
+    return any(marker in lowered for marker in VM_GATE_A11_HTML_END_MARKERS[kind])
+
+
+def _a11_breaks_paragraph(line):
+    """True when ``line`` cannot be paragraph continuation text."""
+    body = line.rstrip("\r")
+    return bool(VM_GATE_A11_ATX_LINE.match(body) or VM_GATE_A11_THEMATIC_LINE.match(body))
+
+
+def _a11_block_open_at(text, offset):
+    """The raw block open where ``offset``'s own line BEGINS, or ``None``.
+
+    ``("fence", marker, length)`` or ``("html", type)``. Only text strictly in front of that line is
+    inspected, which is what "inherited" means. Fence opening and closing validity come from the two
+    A10 predicates, so the oracle states each grammar exactly once; the HTML grammar above is the
+    only thing A11 adds to it.
+    """
+    state, in_paragraph = None, False
+    for line in text[:text.rfind("\n", 0, offset) + 1].splitlines():
+        if state is None:
+            fence = _a10_opens_fence(line)
+            if fence is not None:
+                state, in_paragraph = ("fence",) + fence, False
+                continue
+            kind = _a11_html_opens(line, in_paragraph)
+            if kind is not None:
+                in_paragraph = False
+                state = None if _a11_html_ends(line, kind) else ("html", kind)
+                continue
+            in_paragraph = bool(line.strip()) and not _a11_breaks_paragraph(line)
+            continue
+        if state[0] == "fence":
+            if _a10_closes_fence(line, state[1:]):
+                state, in_paragraph = None, False
+        elif _a11_html_ends(line, state[1]):
+            state, in_paragraph = None, False
+    return state
+
+
+# The seven families, as ``(name, type, opening line, closing line)``. A blank closing line is the
+# blank-line end condition types 6 and 7 carry; every other entry closes on its own marker.
+VM_GATE_A11_HTML_FAMILIES = (
+    ("type1_script", 1, "<script>", "</script>"),
+    ("type1_pre_attr", 1, '<pre class="note">', "</pre>"),
+    ("type1_style", 1, "<style>", "</style>"),
+    ("type1_textarea", 1, "<textarea>", "</textarea>"),
+    ("type2_comment", 2, "<!-- reviewer note", "-->"),
+    ("type3_instruction", 3, "<?editor pause", "?>"),
+    ("type4_declaration", 4, "<!DOCTYPE reviewer", ">"),
+    ("type5_cdata", 5, "<![CDATA[ reviewer", "]]>"),
+    ("type6_div", 6, "<div>", ""),
+    ("type6_table_attr", 6, '<table class="reviewed">', ""),
+    ("type6_closing", 6, "</div>", ""),
+    ("type7_open", 7, "<x-review>", ""),
+    ("type7_self_closing", 7, "<x-review />", ""),
+    ("type7_closing", 7, "</x-review>", ""),
+)
+# Leading indentation an HTML block opener may carry. Four columns is the exclusion, not an option.
+VM_GATE_A11_HTML_INDENTS = VM_GATE_A9_OPENER_INDENTS
+# Line shapes that CONTAIN HTML block syntax but open nothing: at four columns the line is indented
+# CODE, and a type-7 shape with trailing text is not a complete tag alone on its line.
+VM_GATE_A11_HTML_NON_OPENERS = (
+    ("four_spaces_div", "    <div>"),
+    ("eight_spaces_comment", "        <!-- note"),
+    ("tab_script", "\t<script>"),
+    ("space_tab_cdata", " \t<![CDATA["),
+    ("type7_with_trailing_text", "<x-review> and then ordinary prose"),
+    ("bare_less_than", "< div>"),
+    ("inline_span_only", "an ordinary sentence with <x-review> inside it"),
+)
+# Ordinary block content, so an opener/closer pair is a real block rather than an empty one.
+VM_GATE_A11_HTML_FILLER = "an ordinary example line"
+
+# The protected authorities an HTML block is placed in front of. The landmark is each authority's
+# own GATE PARAGRAPH rather than its heading, because the gate paragraph is the operative approval:
+# types 6 and 7 end at the first blank line, so an opener in front of a heading swallows only that
+# heading, while an opener in front of a gate paragraph swallows the whole affirmative approval
+# sentence. Types 1 to 5 swallow everything to their own end marker either way.
+VM_GATE_A11_HTML_AUTHORITIES = (
+    ("step-4 deployment gate", VM_GATE_DEPLOY_OPENING, "deploy_gate_text_changed"),
+    ("step-5 preflight gate", VM_GATE_PREFLIGHT_OPENING, "preflight_gate_text_changed"),
+    ("safety boundary", VM_GATE_SAFETY_HEADING, "safety_boundary_surfaces_incomplete"),
+)
+# The step-3 host-sync authority, carried by the existing absent-marker cascade exactly as A9/A10
+# carry it. Its landmark is the gate marker's own paragraph opening.
+HOST_SYNC_A11_GATE_OPENING = "**Separate current-turn owner approval required (host-sync gate).**"
+# The carrier is the same absent-marker cascade A9 established; A11 adds no host-sync key.
+HOST_SYNC_A11_CARRIER = HOST_SYNC_A9_CARRIER
+
+# --- A11-F2: the centralised protected-operation placement contract --- #
+# One classifier, one recognised operation family, and one authorised region per family, so the
+# repair cannot become a patch for the single string the review happened to name. Each entry is
+# ``(name, active-command anchor, authorised step numbers, fold case)``. Case folding follows the
+# TOOL, exactly as `_actively_invokes` already requires: PowerShell parameter names really are
+# case-insensitive, and `member_create_uat_approval.py` is argparse and genuinely case-sensitive.
+VM_GATE_A11_PROTECTED_OPERATIONS = (
+    ("host_sync_pull", HOST_SYNC_PULL_COMMAND, (3,), True),
+    ("vm_state_preparation", VM_GATE_DEPLOY_STATE_ANCHOR, (4,), True),
+    ("package_approval", VM_GATE_PREFLIGHT_APPROVE_COMMAND, (5,), False),
+    ("package_build", VM_GATE_PREFLIGHT_BUILD_COMMAND, (5,), False),
+    ("controlled_reconciliation",
+     "python scripts/member_create_uat_approval.py reconcile-store-admission", (5,), False),
+    # The runner is authorised in TWO regions and nowhere else: the step-5 no-write dry run and the
+    # step-8 single write attempt, which carries its own step-7 approval surface.
+    ("runner_invocation", VM_GATE_PREFLIGHT_RUNNER_ANCHOR, (5, 8), True),
+)
+# Positions an extra protected operation is injected at, so the control is not one hard-coded site.
+VM_GATE_A11_PLACEMENT_STEPS = (1, 2, 6, 9, 10, 11)
+# NON-OPERATIONAL spellings of the same operations. Every one of these must stay clean: a mention,
+# a quoted echo, a commented line and a prose reference are not the operation, which is the same
+# standard `_active_command_lines` already holds the reviewed regions to.
+VM_GATE_A11_PLACEMENT_INERT = (
+    ("hash_comment", "# %s"),
+    ("html_comment", "<!-- %s -->"),
+    ("powershell_echo", 'Write-Host "%s"'),
+    ("shell_echo", "echo \"%s\""),
+    ("prose_reference", "The operator may later run %s under its own approval."),
+)
+
+# --- A11-F3: the complete operator-directed destructive-cleanup inventory --- #
+# Every instruction in the reviewed runbook that directs an operator to delete or remove a real
+# filesystem object. Prohibitions ("never delete", "do not delete these markers", "do not delete or
+# sweep them either") are deliberately NOT here: they forbid a mutation rather than instructing one,
+# and a control below proves they stay non-material.
+VM_GATE_A11_DESTRUCTIVE_PHRASES = (
+    "delete exactly the one named",
+    "delete exactly that one file",
+    "remove the non-operational store under review",
+    "removal of the non-operational store under review",
+    "manually delete the named stray temporary file",
+    "remove any temporary copies of the package and result from shared locations",
+)
+# Prohibition wording that must never be mistaken for an operator-directed destructive instruction.
+VM_GATE_A11_DESTRUCTIVE_PROHIBITIONS = (
+    "never delete or edit the member as part of recovery",
+    "do not delete these markers",
+    "do not delete or sweep them either",
+    "it is never removed automatically",
+)
+VM_GATE_A11_CLEANUP_MARKER = "destructive-cleanup gate"
+# The reviewed destructive-cleanup gate, verbatim, and the ONE authority both the runbook and the
+# controls consume. Written out here rather than derived from the runbook, because authority derived
+# from the thing it is meant to constrain is not authority at all.
+VM_GATE_A11_CLEANUP_REVIEWED_GATE = r"""**Separate current-turn destructive-cleanup approval required (destructive-cleanup gate).** Before
+the deletion or removal below, obtain an explicit current-turn owner approval that names the exact
+target basename or path and the exact delete or remove operation. A step-5 preflight approval, a
+build or reviewer decision, a step-7 write approval, repository review or merge, and any prior-turn
+approval are none of them reusable for it.
+"""
+def _whitespace_tolerant(phrase):
+    """A pattern matching ``phrase`` across any run of whitespace, including a line wrap."""
+    return re.compile(r"\s+".join(re.escape(word) for word in phrase.split()), re.IGNORECASE)
+
+
+VM_GATE_A11_DESTRUCTIVE_PATTERNS = tuple(
+    _whitespace_tolerant(phrase) for phrase in VM_GATE_A11_DESTRUCTIVE_PHRASES)
+VM_GATE_A11_CLEANUP_MARKER_PATTERN = _whitespace_tolerant(VM_GATE_A11_CLEANUP_MARKER)
+
+# Ways a destructive-cleanup gate can be defeated. Each must fail closed.
+VM_GATE_A11_CLEANUP_MUTATIONS = (
+    ("gate_removed", "destructive_cleanup_not_gated"),
+    ("gate_moved_after_instruction", "destructive_cleanup_not_gated"),
+    ("prior_turn_wording", "destructive_cleanup_gate_text_changed"),
+    ("target_not_named", "destructive_cleanup_gate_text_changed"),
+    ("operation_not_named", "destructive_cleanup_gate_text_changed"),
+    ("preflight_approval_substituted", "destructive_cleanup_gate_text_changed"),
+    ("write_approval_substituted", "destructive_cleanup_gate_text_changed"),
+    ("repo_review_substituted", "destructive_cleanup_gate_text_changed"),
+)
+# The replacement text each defeating mutation writes over the reviewed gate.
+VM_GATE_A11_CLEANUP_REPLACEMENTS = {
+    "prior_turn_wording": (
+        "**Separate destructive-cleanup approval required (destructive-cleanup gate).** The"
+        " approval obtained in an earlier turn already covers the deletion or removal below.\n"),
+    "target_not_named": (
+        "**Separate current-turn destructive-cleanup approval required (destructive-cleanup"
+        " gate).** Before the deletion or removal below, obtain an explicit current-turn owner"
+        " approval for the delete or remove operation.\n"),
+    "operation_not_named": (
+        "**Separate current-turn destructive-cleanup approval required (destructive-cleanup"
+        " gate).** Before the deletion or removal below, obtain an explicit current-turn owner"
+        " approval that names the exact target basename or path.\n"),
+    "preflight_approval_substituted": (
+        "**Separate current-turn destructive-cleanup approval required (destructive-cleanup"
+        " gate).** The step-5 preflight approval already covers the deletion or removal below.\n"),
+    "write_approval_substituted": (
+        "**Separate current-turn destructive-cleanup approval required (destructive-cleanup"
+        " gate).** The step-7 write approval already covers the deletion or removal below.\n"),
+    "repo_review_substituted": (
+        "**Separate current-turn destructive-cleanup approval required (destructive-cleanup"
+        " gate).** Repository review and merge already cover the deletion or removal below.\n"),
+}
+
+# --- A11-F4: the step-9 live mapping and step-10 conditional recovery surfaces --- #
+VM_GATE_A11_MAPPING_STEP = 9
+VM_GATE_A11_RECOVERY_STEP = 10
+VM_GATE_A11_MAPPING_MARKER = "result-mapping gate"
+VM_GATE_A11_RECOVERY_MARKER = "recovery gate"
+VM_GATE_A11_MAPPING_BOUNDARY = "On `CREATED_VERIFIED`, the runner has already read"
+VM_GATE_A11_RECOVERY_BOUNDARY = "If the runner returns `WRITE_OUTCOME_UNCERTAIN`, the SaveMember"
+# One authority, consumed here: `VM_GATE_REVIEWED_HEADINGS` is what `_resolve_numbered_step`
+# compares against, so a second literal spelling of the same two headings could drift from it.
+VM_GATE_A11_REVIEWED_HEADINGS = {step: VM_GATE_REVIEWED_HEADINGS[step]
+                                 for step in (VM_GATE_A11_MAPPING_STEP,
+                                              VM_GATE_A11_RECOVERY_STEP)}
+# The heading grammar the destructive-cleanup rule uses to decide that a gate governs a DIFFERENT
+# region than the instruction it is supposed to precede.
+VM_GATE_A11_HEADING_LINE = re.compile(r"(?m)^ {0,3}#{1,6}[ \t]")
+
+# The reviewed step-9 gate block, verbatim. It binds the runbook's ACTUAL live mapping operations:
+# importing and using the local workflow copy, credential binding by identity only, placing the
+# sanitised result into the n8n file surface, manual execution, and the single spreadsheet row
+# update. No credential value and no private value is written here or anywhere in the repository.
+#
+# R2: the required-name clause now names THREE targets, not two. Accepted post-ready finding
+# PRRT_kwDOSbJI_s6ZK7nH: naming only the workflow and the Sheet/tab left the import, the credential
+# binding, the file placement and the execution free to run against a DIFFERENT n8n instance while
+# the documented approval wording stayed satisfied. The instance identity is required in the
+# APPROVAL itself, by a non-secret operator-recognisable name -- never a URL, connection value or
+# credential value, none of which is written here or anywhere in the repository.
+VM_GATE_A11_MAPPING_REVIEWED_BLOCK = r"""**Separate current-turn owner approval required (result-mapping gate).** The mapping below runs
+live operations on the operator PC n8n instance and writes to the intended Google Sheet. Before any
+of it, obtain an explicit current-turn owner approval that names the intended result-mapping
+workflow `n8n-workflows/member_create_uat_result_mapping.workflow.json`, the intended spreadsheet
+and source tab, the intended Google credential by its non-secret operator-recognisable
+credential name or identity, the exact non-secret `uat_create_operation_id` whose spreadsheet
+row is to be updated, and the intended n8n instance or environment by its non-secret
+operator-recognisable name. Those identities are named in that approval itself, and the
+instance URL, connection details, credential values, OAuth tokens and API keys are never
+written into this runbook. That approval binds:
+
+- importing and using the local copy of that workflow on the operator PC n8n instance;
+- binding the intended Google credential by name or identity only, never by secret value;
+- copying the sanitised result file into the approved n8n file location `/home/node/.n8n-files/`;
+- running that workflow manually, with the workflow left inactive;
+- updating the one intended spreadsheet row selected by `uat_create_operation_id`.
+
+This approval is distinct and is **not** implied by any other gate:
+
+- the PR review and merge decision (step 2) does **not** authorise this result mapping;
+- the physical-host sync approval (step 3) does **not** authorise this result mapping;
+- the VM deployment approval (step 4) does **not** authorise this result mapping;
+- the no-write preflight approval (step 5) does **not** authorise this result mapping;
+- the separate current-turn write approval (step 7) does **not** authorise this result mapping.
+
+A prior-turn approval is not reusable. Repository review or merge is not this approval, and this
+approval authorises no AutoCount contact and no further member write. Without the named current-turn
+result-mapping approval, stop before importing the workflow, before binding any credential, before
+copying the result file into the n8n file location, before running the workflow and before updating
+the spreadsheet row.
+
+"""
+
+# The reviewed step-10 gate block, verbatim. Conditional by construction: it applies only when the
+# runner returned `WRITE_OUTCOME_UNCERTAIN`, and it grants read-only recovery authority only.
+VM_GATE_A11_RECOVERY_REVIEWED_BLOCK = r"""**Separate current-turn owner approval required (recovery gate).** This step is conditional and
+applies only when the runner returned `WRITE_OUTCOME_UNCERTAIN`. When it applies, and before any
+AutoCount contact, obtain an explicit current-turn owner approval that names the intended AutoCount
+account book and environment. The server and database are named in that approval itself, and are
+never written into this runbook. That approval binds the read-only member lookup and recovery
+operation for that one uncertain write outcome, and nothing else.
+
+This recovery is read-only. It grants no new `SaveMember` authority, authorises no create, update or
+delete, and authorises no second write attempt. This approval is distinct and is **not** implied by
+any other gate:
+
+- the PR review and merge decision (step 2) does **not** authorise this recovery lookup;
+- the physical-host sync approval (step 3) does **not** authorise this recovery lookup;
+- the VM deployment approval (step 4) does **not** authorise this recovery lookup;
+- the no-write preflight approval (step 5) does **not** authorise this recovery lookup;
+- the separate current-turn write approval (step 7) does **not** authorise this recovery lookup;
+- the step-9 result-mapping approval (step 9) does **not** authorise this recovery lookup.
+
+A prior-turn approval is not reusable. Repository review or merge is not this approval. Without the
+named current-turn recovery approval, stop before opening the account book and before searching for
+the member.
+
+"""
+
+# Gate propositions, as ``(finding key, token)``. The tokens are compared against the flattened,
+# lowercased gate block exactly as steps 4 and 5 already compare theirs.
+# The reviewed affirmative clause each new gate must state. `VM_GATE_AFFIRMATIVE_APPROVAL` names
+# the AutoCount VM, which steps 9 and 10 do not bind, so each declares its own and the shared
+# `_approval_is_affirmative` predicate takes it as a parameter. The A1-A10 default is unchanged.
+VM_GATE_A11_MAPPING_AFFIRMATIVE = ("obtain an explicit current-turn owner approval that names the"
+                                   " intended result-mapping workflow")
+VM_GATE_A11_RECOVERY_AFFIRMATIVE = ("obtain an explicit current-turn owner approval that names the"
+                                    " intended autocount account book and environment")
+# R2 adds the third target. The token is the APPROVAL clause's own wording, not the word "n8n
+# instance": the step's descriptive sentence and its first operation bullet both already say
+# "the operator PC n8n instance", so any token that generic would be satisfied by prose that never
+# requires the approval to identify anything -- which is exactly the accepted defect.
+# R3 adds the two remaining step-9 targets that could still be chosen AFTER approval. The
+# credential one is the sharper of the pair: the operation bullet below already says "binding the
+# intended Google credential by name or identity only", so a token drawn from the BULLET would be
+# satisfied by a gate whose approval never identifies an account at all -- the same trap R2's
+# instance token avoided. Both tokens are therefore the approval clause's own wording.
+VM_GATE_R3_GOOGLE_CREDENTIAL_BINDING = ("the intended google credential by its non-secret"
+                                        " operator-recognisable credential name or identity")
+VM_GATE_R3_OPERATION_ID_BINDING = ("the exact non-secret `uat_create_operation_id` whose"
+                                   " spreadsheet row is to be updated")
+VM_GATE_A11_MAPPING_BINDINGS = (
+    ("mapping_workflow_not_bound",
+     "n8n-workflows/member_create_uat_result_mapping.workflow.json"),
+    ("mapping_spreadsheet_not_bound", "the intended spreadsheet and source tab"),
+    ("mapping_google_credential_not_bound", VM_GATE_R3_GOOGLE_CREDENTIAL_BINDING),
+    ("mapping_operation_id_not_bound", VM_GATE_R3_OPERATION_ID_BINDING),
+    ("mapping_n8n_target_not_bound",
+     "the intended n8n instance or environment by its non-secret operator-recognisable name"),
+)
+# The reviewed required-name clause at each revision, declared as data so the target-binding
+# controls and the seal-movement control measure exactly the same reviewed changes.
+#
+# These are HISTORICAL and are not rewritten by a later revision: R3 declares its own clause below
+# and derives the rollback chain from them, so the R2 -> R1 step still reproduces the R1 document
+# byte for byte and the retired seals stay provable rather than merely asserted.
+VM_GATE_R2_REVIEWED_NAME_CLAUSE = (
+    "workflow `n8n-workflows/member_create_uat_result_mapping.workflow.json`, the intended"
+    " spreadsheet\nand source tab, and the intended n8n instance or environment by its non-secret\n"
+    "operator-recognisable name. That instance identity is named in that approval itself, and the\n"
+    "instance URL, connection details and credential values are never written into this runbook."
+    " That\napproval binds:")
+VM_GATE_R2_SUPERSEDED_NAME_CLAUSE = (
+    "workflow `n8n-workflows/member_create_uat_result_mapping.workflow.json` and the intended"
+    " spreadsheet\nand source tab, and binds:")
+# R3's clause. The n8n instance deliberately stays LAST in the list so R2's own reviewed wording
+# survives verbatim inside it: every R2 instance control still measures the exact phrase it was
+# written against, rather than a paraphrase R3 happened to leave behind.
+VM_GATE_R3_REVIEWED_NAME_CLAUSE = (
+    "workflow `n8n-workflows/member_create_uat_result_mapping.workflow.json`, the intended"
+    " spreadsheet\nand source tab, the intended Google credential by its non-secret"
+    " operator-recognisable\ncredential name or identity, the exact non-secret"
+    " `uat_create_operation_id` whose spreadsheet\nrow is to be updated, and the intended n8n"
+    " instance or environment by its non-secret\noperator-recognisable name. Those identities are"
+    " named in that approval itself, and the\ninstance URL, connection details, credential values,"
+    " OAuth tokens and API keys are never\nwritten into this runbook. That approval binds:")
+# The two step-5 clauses R3 rewrites, each paired with the R2 wording it replaces. Together with
+# the step-9 pair above these are the COMPLETE R3 runbook delta, which is what lets the seal
+# control roll the reviewed document back to its exact R2 predecessor.
+VM_GATE_R3_REVIEWED_SOURCE_RECORD_CLAUSE = (
+    "- the bounded access to the selected private form response and its decision row for this"
+    " one\n  package, identified in the approval itself by its non-PII `source_record_id`, which"
+    " a row\n  number alone does not supply; the private field values are never written into this"
+    " runbook;")
+VM_GATE_R3_SUPERSEDED_SOURCE_RECORD_CLAUSE = (
+    "- the bounded access to the selected private form response and its decision row for this"
+    " one\n  package, whose values are never written into this runbook;")
+VM_GATE_R3_REVIEWED_TRANSFER_CLAUSE = (
+    "- the bounded transfer of the approved package to that VM, copying or replacing the fixed"
+    " VM\n  working copy `C:\\XB\\create_uat\\member_create_uat_package.json` that the runner"
+    " always reads;\n  this replacement authority covers that one VM working copy only, never the"
+    " laptop-side\n  package build, which stays strictly no-clobber;")
+VM_GATE_R3_SUPERSEDED_TRANSFER_CLAUSE = (
+    "- the bounded transfer of the approved package to that VM;")
+# Reviewed -> superseded, in one place, so the rollback and the controls cannot drift apart.
+VM_GATE_R3_REVIEWED_CLAUSES = (
+    ("step-5 source record", VM_GATE_R3_REVIEWED_SOURCE_RECORD_CLAUSE,
+     VM_GATE_R3_SUPERSEDED_SOURCE_RECORD_CLAUSE),
+    ("step-5 transfer destination", VM_GATE_R3_REVIEWED_TRANSFER_CLAUSE,
+     VM_GATE_R3_SUPERSEDED_TRANSFER_CLAUSE),
+    ("step-9 required-name clause", VM_GATE_R3_REVIEWED_NAME_CLAUSE,
+     VM_GATE_R2_REVIEWED_NAME_CLAUSE),
+)
+# The reviewed step-9 authority R2 must not weaken: the exact workflow, the spreadsheet/tab, the
+# five bound operations, and the non-reuse and no-further-authority boundaries.
+VM_GATE_R2_PRESERVED_STEP_9_AUTHORITY = (
+    "n8n-workflows/member_create_uat_result_mapping.workflow.json",
+    "the intended spreadsheet\nand source tab",
+    "- importing and using the local copy of that workflow on the operator PC n8n instance;",
+    "- binding the intended Google credential by name or identity only, never by secret value;",
+    "- copying the sanitised result file into the approved n8n file location"
+    " `/home/node/.n8n-files/`;",
+    "- running that workflow manually, with the workflow left inactive;",
+    "- updating the one intended spreadsheet row selected by `uat_create_operation_id`.",
+    "A prior-turn approval is not reusable.",
+    "authorises no AutoCount contact and no further member write",
+)
+# Spellings a private target value would take if one were ever written into the gate. The approval
+# names the instance; the repository never carries its URL, connection value or credential.
+# R3 names a Google credential, so the OAuth spellings of the same reach are added beside them.
+VM_GATE_R2_FORBIDDEN_TARGET_VALUES = ("http://", "https://", "password", "api_key", "apikey",
+                                      "token=", "bearer ", "connectionstring",
+                                      "client_secret", "refresh_token")
+VM_GATE_A11_MAPPING_OPERATIONS = (
+    "importing and using the local copy of that workflow on the operator pc n8n instance",
+    "binding the intended google credential by name or identity only, never by secret value",
+    "copying the sanitised result file into the approved n8n file location `/home/node/.n8n-files/`",
+    "running that workflow manually, with the workflow left inactive",
+    "updating the one intended spreadsheet row selected by `uat_create_operation_id`",
+)
+VM_GATE_A11_MAPPING_SOURCES = ("(step 2)", "(step 3)", "(step 4)", "(step 5)", "(step 7)")
+VM_GATE_A11_MAPPING_DENIAL = "does **not** authorise this result mapping"
+VM_GATE_A11_MAPPING_STOP = (
+    "without the named current-turn result-mapping approval, stop before importing the workflow,"
+    " before binding any credential, before copying the result file into the n8n file location,"
+    " before running the workflow and before updating the spreadsheet row")
+
+VM_GATE_A11_RECOVERY_BINDINGS = (
+    ("recovery_account_book_not_bound",
+     "the intended autocount account book and environment"),
+    ("recovery_read_only_not_bound",
+     "the read-only member lookup and recovery operation for that one uncertain write outcome"),
+)
+VM_GATE_A11_RECOVERY_WRITE_DENIAL = (
+    "this recovery is read-only",
+    "it grants no new `savemember` authority",
+)
+VM_GATE_A11_RECOVERY_SOURCES = ("(step 2)", "(step 3)", "(step 4)", "(step 5)", "(step 7)",
+                                "(step 9)")
+VM_GATE_A11_RECOVERY_DENIAL = "does **not** authorise this recovery lookup"
+VM_GATE_A11_RECOVERY_STOP = (
+    "without the named current-turn recovery approval, stop before opening the account book and"
+    " before searching for the member")
+
+# Everything a resolved step-9 / step-10 must prove, and the fail-closed half of the same A1
+# contract steps 4 and 5 already carry: an unresolvable layout marks the whole step unmet.
+VM_GATE_A11_MAPPING_UNMET = frozenset((
+    "mapping_pre_gate_content", "mapping_gate_text_changed", "mapping_action_text_changed",
+    "mapping_workflow_not_bound", "mapping_spreadsheet_not_bound", "mapping_n8n_target_not_bound",
+    "mapping_google_credential_not_bound", "mapping_operation_id_not_bound",
+    "mapping_operations_not_bound",
+    "mapping_not_current_turn", "mapping_prior_turn_not_denied", "mapping_substitution_not_denied",
+    "mapping_stop_boundary_missing",
+))
+VM_GATE_A11_RECOVERY_UNMET = frozenset((
+    "recovery_pre_gate_content", "recovery_gate_text_changed", "recovery_action_text_changed",
+    "recovery_account_book_not_bound", "recovery_read_only_not_bound",
+    "recovery_write_authority_not_denied", "recovery_not_current_turn",
+    "recovery_prior_turn_not_denied", "recovery_substitution_not_denied",
+    "recovery_stop_boundary_missing",
+))
+
+# --- A11: the corrected Safety boundary --- #
+# The "exactly four approval surfaces" statement is retired because it is false: destructive
+# cleanup, the step-9 live mapping and the step-10 conditional recovery are approval surfaces too.
+# The four BASELINE surfaces are preserved word for word; the conditional ones are added beside
+# them; and no fixed total is stated at all, so the next surface cannot silently falsify a count.
+VM_GATE_A11_SAFETY_REVIEWED_SECTION = VM_GATE_SAFETY_REVIEWED_SECTION
+VM_GATE_A11_SAFETY_TOKENS = VM_GATE_SAFETY_TOKENS
+_VM_GATE_A11_RETIRED_SAFETY_LITERAL = r"""## Safety boundary
+
+- No AutoCount write occurs in development, tests, or CI. Enabling the ExpiryDate path
+  (recording the business confirmations and flipping the capability flag) performs no
+  live write; a real write still requires the explicit VM write step above and a
+  separate current-turn owner approval naming the exact target and operation.
+- The host sync on `DESKTOP-Q43QKQF` in step 3 and the `SaveMember` write in step 7
+  each require their own prior current-turn owner approval. Neither implies the other,
+  and a prior-turn approval is never reusable for either.
+- Four baseline approval surfaces are always required: the step-3 host sync, the step-4
+  VM deployment, the step-5 preflight surface (selected private form/decision-row access,
+  the reviewer-decision and approval-ledger operation, the immutable package build, the
+  AutoCount environment setup, the package transfer and the no-write AutoCount preflight),
+  and the step-7 `SaveMember` write.
+- Further conditional approval surfaces arise wherever the procedure reaches them: every
+  operator-directed destructive cleanup or removal, each one scoped locally to its exact
+  target and its exact delete or remove operation; the step-9 live n8n result mapping;
+  and the step-10 conditional read-only AutoCount recovery lookup.
+- This runbook states no fixed total number of approval surfaces. Each surface named
+  above requires its own current-turn owner approval, none implies or covers another, and
+  a prior-turn approval is never reusable for any of them.
+- Exactly one member is supported; there is no batch path, no update-member path, no
+  delete, and no rollback automation.
+- SaveMember is called at most once and is never automatically retried. An uncertain
+  save outcome is terminal (`WRITE_OUTCOME_UNCERTAIN`) and is resolved only by the
+  separate read-only recovery check, never by an automatic retry.
+- No final package can be published before its durable publication reservation is
+  confirmed, so a publication or ledger persistence failure can never leave a published
+  package that the same approval is free to build again. An already-published package is
+  never deleted, rolled back, truncated, renamed or modified by any failure path.
+- A package built under the previous `member_create_uat_package/v1` contract cannot be
+  reused; the runner refuses it fail-closed. Build a fresh `v2` package at a new,
+  version-distinct path after a new reviewer decision. The package builder is strictly
+  no-clobber and never overwrites an existing package, so the old `v1` artifact and its
+  hash are preserved as historical evidence and remain non-executable under `v2`.
+- The synthetic member and permanent single-use claim created by the earlier
+  [ExpiryDate capability probe](member_expiry_capability_probe_runbook.md) are left
+  exactly as they are; this UAT path does not read, modify, or clean them up.
+- All console, evidence, test, and workflow output is sanitized and PII-free; member
+  numbers are masked and names, emails, and birthdays are never printed.
+"""
+
+# The retired literal above and the retired token tuple below are deliberately NOT a second
+# authority: the corrected text now lives at `VM_GATE_SAFETY_REVIEWED_SECTION` and
+# `VM_GATE_SAFETY_TOKENS`, which the checker reads, and the A11 names are aliases of them. Keeping
+# two literals is exactly the drift the accepted A3 finding is about.
+_VM_GATE_A11_RETIRED_SAFETY_TOKENS = (
+    "four baseline approval surfaces are always required: the step-3 host sync, the step-4 vm"
+    " deployment, the step-5 preflight surface (selected private form/decision-row access, the"
+    " reviewer-decision and approval-ledger operation, the immutable package build, the autocount"
+    " environment setup, the package transfer and the no-write autocount preflight), and the"
+    " step-7 `savemember` write",
+    "every operator-directed destructive cleanup or removal, each one scoped locally to its exact"
+    " target and its exact delete or remove operation; the step-9 live n8n result mapping; and the"
+    " step-10 conditional read-only autocount recovery lookup",
+    "this runbook states no fixed total number of approval surfaces",
+    "each surface named above requires its own current-turn owner approval",
+    "none implies or covers another",
+    "a prior-turn approval is never reusable for any of them",
+)
+# Contradictions that must fail closed inside the ONE corrected boundary, in the same three
+# placements A8 established.
+VM_GATE_A11_SAFETY_CONTRADICTIONS = (
+    ("appended_fixed_total", "append",
+     "There are exactly four approval surfaces in total."),
+    ("appended_cleanup_merge", "append",
+     "The step-5 preflight approval also covers every destructive cleanup below."),
+    ("appended_mapping_merge", "append",
+     "The step-7 write approval also covers the step-9 live n8n result mapping."),
+    ("appended_recovery_merge", "append",
+     "The step-7 write approval also covers the step-10 recovery lookup."),
+    ("prepended_fixed_total", "prepend",
+     "There are exactly four approval surfaces in total."),
+    ("inserted_conditional_waiver", "bullet",
+     "- The conditional surfaces above need no separate current-turn owner approval."),
+)
+# Bullets whose REMOVAL must fail closed, so the correction cannot be silently rolled back.
+VM_GATE_A11_SAFETY_REQUIRED_BULLETS = (
+    ("baseline_four", "- Four baseline approval surfaces are always required:"),
+    ("conditional_surfaces", "- Further conditional approval surfaces arise wherever"),
+    ("no_fixed_total", "- This runbook states no fixed total number of approval surfaces."),
+)
+
+# Malformed and boundary documents the checker must handle without an uncontrolled exception. Purity
+# is a property of the contract, not of the documents it happens to be given.
+VM_GATE_A11_MALFORMED_INPUTS = (
+    ("empty", ""),
+    ("newline_only", "\n"),
+    ("crlf_only", "\r\n"),
+    ("bare_hashes", "###"),
+    ("numbered_heading_without_title", "### 9."),
+    ("unterminated_html", "<script>"),
+    ("unterminated_fence", "```"),
+    ("unterminated_comment", "<!--"),
+    ("unterminated_cdata", "<![CDATA["),
+    ("lone_marker", VM_GATE_A11_CLEANUP_MARKER),
+    ("lone_destructive_phrase", VM_GATE_A11_DESTRUCTIVE_PHRASES[0]),
+    ("tab_indented_heading", "\t### 9. Read-back and terminal result mapping\n"),
+    ("very_long_line", "x" * 20000),
+    ("null_byte", "### 10.\x00 recovery"),
+)
+
+# The reviewed step-9 and step-10 ACTION regions, verbatim, held to exactly the identity discipline
+# A6 established for steps 4 and 5: the reviewed text is recognised, so a revocation, a reuse claim,
+# a deleted operation or an operation wrapped in inert data all fail closed alike.
+VM_GATE_A11_MAPPING_REVIEWED_ACTION = r"""On `CREATED_VERIFIED`, the runner has already read the member back and compared the
+approved safe fields. Map the sanitized terminal result to the Sheet:
+
+1. **`LAPTOP DEVELOPMENT MACHINE`** or operator PC: precheck the sanitized result and
+   revalidate identity and fingerprint against the expected source record.
+
+   ```bash
+   python scripts/member_create_uat_result_precheck.py --result-json <member_create_uat_result.json> --expect-source-record-id <srcrec_...> --expect-source-fingerprint <fp_...>
+   ```
+
+2. Operator PC n8n (non-AC2): import a local copy of
+   `n8n-workflows/member_create_uat_result_mapping.workflow.json` after replacing
+   `REPLACE_WITH_SOURCE_TAB_NAME` with the source tab title. Add the controlled
+   columns named in the workflow boundary sticky note and, on the approved row,
+   seed `uat_create_operation_id`, `uat_create_source_record_id`, and
+   `uat_create_source_fingerprint` from the built package (leave the review columns
+   blank). Bind only the Google credential and spreadsheet, copy the sanitized
+   result file into `/home/node/.n8n-files/`, and run the workflow manually. It reads
+   and updates the one row whose `uat_create_operation_id` equals the result's
+   operation id (the single-use mapping key, never a shared marker or row number),
+   revalidates the identity and fingerprint hashes, recomputes the terminal code, and
+   stays inactive.
+
+"""
+
+VM_GATE_A11_RECOVERY_REVIEWED_ACTION = r"""If the runner returns `WRITE_OUTCOME_UNCERTAIN`, the SaveMember call began but success
+could not be proven. Do not retry, delete, or update anything automatically. Perform a
+separate read-only recovery check:
+
+1. **`AUTOCOUNT VM — DESKTOP-4I042L6`** In AutoCount Bonus Point > Member Maintenance,
+   search for the member number (masked in the runner output; the operator knows the
+   real number from the approved source row) and determine whether the member exists.
+2. If it exists and matches the approved safe fields, treat the operation as created;
+   record the outcome manually. If it does not exist, the write did not commit; the
+   consumed marker still blocks an accidental second attempt, so a fresh, separately
+   approved operation with a new package is required to proceed.
+3. Never delete or edit the member as part of recovery.
+
+The VM keeps durable state files in the state directory: `write_intent_<operation_id>.marker`,
+`consumed_<source_record_id>.marker`, and `result_<operation_id>.json` (each written
+exclusive-create, never overwritten, containing only sanitised identifiers). On any
+re-run the runner classifies these deterministically and never auto-retries a save:
+a terminal result present yields `PACKAGE_ALREADY_CONSUMED`; a consumed marker without
+a terminal result yields `WRITE_OUTCOME_UNCERTAIN`; a write-intent marker without a
+consumed marker yields `FAILED_BEFORE_WRITE`; a malformed marker yields
+`WRITE_OUTCOME_UNCERTAIN`. Do not delete these markers; they are the single-use guard.
+
+"""
+
+# The reviewed step-11 shutdown section, verbatim. The destructive removal of temporary shared
+# copies is separated into its own block and carries its own locally scoped cleanup gate, so a
+# step-5, step-7 or repository-review approval can never stand in for it.
+VM_GATE_A11_SHUTDOWN_REVIEWED_SECTION = (
+    "After completion, leave the result-mapping workflow inactive and take no further\n"
+    "create action.\n\n"
+    + VM_GATE_A11_CLEANUP_REVIEWED_GATE
+    + "\nThen remove any temporary copies of the package and result from shared locations.\n\n"
+    "The consumed marker and write-intent marker remain on the VM as durable\n"
+    "evidence and single-use guards; do not delete them. The laptop-side publication\n"
+    "reservations remain beside the approval ledger for the same reason; do not delete or\n"
+    "sweep them either.\n\n")
+
+# The A11 TARGET document shape, and the fixture the repaired checker must accept. It is introduced
+# here, at the controls commit, because the controls have to name a document the repair must accept:
+# at this commit the exact-V checker rejects it, which is part of the RED evidence. The repair
+# promotes it to THE canonical fixture, so these controls survive it unchanged.
+#
+# Every region is the reviewed CONSTANT itself rather than a paraphrase, for the reason A5, A6 and
+# A8 each gave in turn: a fixture that could satisfy a DIFFERENT contract than the runbook would
+# make the whole control group meaningless.
+VM_GATE_A11_FIXTURE = (
+    VM_GATE_A4_FIXTURE_STEP_4
+    + "### 5. No-write preflight (dry-run)\n\n"
+    + VM_GATE_PREFLIGHT_REVIEWED_BLOCK
+    + VM_GATE_PREFLIGHT_REVIEWED_ACTION
+    + "### 6. Review aggregate evidence\n\n"
+      "The runner prints and writes a sanitized aggregate result only.\n\n"
+    + VM_GATE_A11_REVIEWED_HEADINGS[VM_GATE_A11_MAPPING_STEP] + "\n\n"
+    + VM_GATE_A11_MAPPING_REVIEWED_BLOCK
+    + VM_GATE_A11_MAPPING_REVIEWED_ACTION
+    + VM_GATE_A11_REVIEWED_HEADINGS[VM_GATE_A11_RECOVERY_STEP] + "\n\n"
+    + VM_GATE_A11_RECOVERY_REVIEWED_BLOCK
+    + VM_GATE_A11_RECOVERY_REVIEWED_ACTION
+    + "### 11. UAT shutdown and inactivity\n\n"
+    + VM_GATE_A11_SHUTDOWN_REVIEWED_SECTION
+    + VM_GATE_A11_SAFETY_REVIEWED_SECTION)
+
+VM_GATE_CANONICAL_FIXTURE = VM_GATE_A11_FIXTURE
+
+# --- R1: the two accepted Run-24 residuals, reproduced verbatim as controls --- #
+# R1-F1. The structural shape Run-24 used to obtain a material false clean. In CommonMark the
+# `===` underline turns the preceding paragraph into a SETEXT heading, which closes the paragraph;
+# the following complete tag alone on its line then opens a type-7 HTML block that runs to the next
+# blank line and swallows whatever follows -- including reviewed approval authority. The semantic
+# layer's paragraph model knows only blank lines, ATX headings and thematic breaks (see
+# `_breaks_paragraph`), so it still believes a paragraph is open, and type 7 cannot interrupt a
+# paragraph -- so it opens nothing and reports nothing. That incompleteness is REAL and is left in
+# place on purpose: R1 does not answer it by teaching `_breaks_paragraph` setext headings, because
+# the next counterexample would simply be a different construct. It is answered by the seal.
+VM_GATE_R1_SETEXT_LINES = ("editor note", "===")
+# Three type-7 spellings, so the control is not one hard-coded tag. `template` is deliberately
+# included: it is NOT in the CommonMark type-6 tag list, so it can only ever be type 7.
+VM_GATE_R1_TYPE7_OPENERS = ("<template>", "<x-review>", "<x-review />")
+# The reviewed approval authorities the residual is placed in front of. The host-sync authority is
+# the one Run-24 actually used, because it is the placement at which the semantic layer stays
+# COMPLETELY clean -- no incidental structural finding masks the false clean.
+VM_GATE_R1_F1_AUTHORITIES = (
+    ("step-3 host-sync gate", HOST_SYNC_A11_GATE_OPENING),
+)
+# R1-F2. The originating review's own reproduction: an ACTIVE deployment of the reviewed runner to
+# the AutoCount VM, placed outside the step-4 deployment gate that is supposed to govern it. The
+# central protected-operation table (`VM_GATE_A11_PROTECTED_OPERATIONS`) does not classify it,
+# because it enumerates operations by command spelling and `Copy-Item` is not among them. R1 does
+# not answer this by adding `Copy-Item` -- nor `robocopy`, nor `Invoke-Command` -- because the
+# table would still be an enumeration. It is answered by the seal.
+VM_GATE_R1_COPY_ITEM_COMMAND = (
+    r"Copy-Item -Path scripts\ac2_member_create_uat_runner.ps1 "
+    r"-Destination \\DESKTOP-4I042L6\C$\XB\create_uat\ -Force")
+# Steps outside the step-4 deployment region at which the operation is injected, chosen so the
+# semantic layer stays completely clean and the false clean is unmasked by any incidental finding.
+VM_GATE_R1_F2_STEPS = (1, 2, 6)
+
+# The two gated-step specifications the shared `_gated_step_findings` consumes. Declared as data
+# so the contract for each new surface is readable in one place, and so the controls and the checker
+# cannot drift apart on any of it.
+VM_GATE_A11_MAPPING_SPEC = {
+    "prefix": "mapping",
+    "step": VM_GATE_A11_MAPPING_STEP,
+    "marker": VM_GATE_A11_MAPPING_MARKER,
+    "boundary": VM_GATE_A11_MAPPING_BOUNDARY,
+    "unmet": VM_GATE_A11_MAPPING_UNMET,
+    "reviewed_block": VM_GATE_A11_MAPPING_REVIEWED_BLOCK,
+    "reviewed_action": VM_GATE_A11_MAPPING_REVIEWED_ACTION,
+    "bindings": VM_GATE_A11_MAPPING_BINDINGS,
+    "operations": VM_GATE_A11_MAPPING_OPERATIONS,
+    "operations_key": "mapping_operations_not_bound",
+    "affirmative": VM_GATE_A11_MAPPING_AFFIRMATIVE,
+    "sources": VM_GATE_A11_MAPPING_SOURCES,
+    "denial": VM_GATE_A11_MAPPING_DENIAL,
+    "stop": VM_GATE_A11_MAPPING_STOP,
+}
+VM_GATE_A11_RECOVERY_SPEC = {
+    "prefix": "recovery",
+    "step": VM_GATE_A11_RECOVERY_STEP,
+    "marker": VM_GATE_A11_RECOVERY_MARKER,
+    "boundary": VM_GATE_A11_RECOVERY_BOUNDARY,
+    "unmet": VM_GATE_A11_RECOVERY_UNMET,
+    "reviewed_block": VM_GATE_A11_RECOVERY_REVIEWED_BLOCK,
+    "reviewed_action": VM_GATE_A11_RECOVERY_REVIEWED_ACTION,
+    "bindings": VM_GATE_A11_RECOVERY_BINDINGS,
+    "operations": VM_GATE_A11_RECOVERY_WRITE_DENIAL,
+    "operations_key": "recovery_write_authority_not_denied",
+    "affirmative": VM_GATE_A11_RECOVERY_AFFIRMATIVE,
+    "sources": VM_GATE_A11_RECOVERY_SOURCES,
+    "denial": VM_GATE_A11_RECOVERY_DENIAL,
+    "stop": VM_GATE_A11_RECOVERY_STOP,
+}
+
+
+# Ways a step-9 or step-10 gate can be defeated. Each must fail closed, and each names the finding
+# the repaired checker must report for it.
+VM_GATE_A11_MAPPING_MUTATIONS = (
+    ("gate_removed", "mapping_gate_missing"),
+    ("gate_after_first_action", "mapping_gate_after_action"),
+    ("prior_turn_wording", "mapping_gate_text_changed"),
+    ("earlier_approval_reused", "mapping_gate_text_changed"),
+    ("workflow_target_removed", "mapping_workflow_not_bound"),
+    ("spreadsheet_target_removed", "mapping_spreadsheet_not_bound"),
+    # R2. The accepted post-ready finding, in three shapes: the requirement struck out of the
+    # approval clause, and two ways of "mentioning n8n" that identify no particular instance.
+    ("n8n_target_removed", "mapping_n8n_target_not_bound"),
+    ("n8n_target_generic_any_instance", "mapping_n8n_target_not_bound"),
+    ("n8n_target_generic_operator_pc_prose", "mapping_n8n_target_not_bound"),
+    # R3. The credential and the row are the two step-9 targets still selectable after approval.
+    # Each gets the same treatment the instance got: the requirement struck out, and the generic
+    # wordings that mention the thing without identifying it.
+    ("google_credential_removed", "mapping_google_credential_not_bound"),
+    ("google_credential_generic_intended", "mapping_google_credential_not_bound"),
+    ("google_credential_generic_any", "mapping_google_credential_not_bound"),
+    ("operation_id_removed", "mapping_operation_id_not_bound"),
+    ("operation_id_generic_intended_row", "mapping_operation_id_not_bound"),
+    ("operation_id_generic_operation_id", "mapping_operation_id_not_bound"),
+    ("operation_set_removed", "mapping_operations_not_bound"),
+    ("generic_authority_substituted", "mapping_not_current_turn"),
+    ("prior_turn_denial_removed", "mapping_prior_turn_not_denied"),
+    ("substitution_denial_removed", "mapping_substitution_not_denied"),
+    ("stop_boundary_removed", "mapping_stop_boundary_missing"),
+)
+VM_GATE_A11_RECOVERY_MUTATIONS = (
+    ("gate_removed", "recovery_gate_missing"),
+    ("gate_after_lookup_begins", "recovery_gate_after_action"),
+    ("prior_turn_wording", "recovery_gate_text_changed"),
+    ("write_approval_reused", "recovery_gate_text_changed"),
+    ("account_book_removed", "recovery_account_book_not_bound"),
+    ("read_only_operation_removed", "recovery_read_only_not_bound"),
+    ("write_authority_denial_removed", "recovery_write_authority_not_denied"),
+    ("generic_authority_substituted", "recovery_not_current_turn"),
+    ("prior_turn_denial_removed", "recovery_prior_turn_not_denied"),
+    ("substitution_denial_removed", "recovery_substitution_not_denied"),
+    ("stop_boundary_removed", "recovery_stop_boundary_missing"),
+)
+# The replacement wording each gate mutation writes. Every one keeps the gate MARKER, so the
+# structural landmark survives and the mutation is judged on what the gate now says.
+VM_GATE_A11_MAPPING_REPLACEMENTS = {
+    "prior_turn_wording": (
+        "obtain an explicit current-turn owner approval that names",
+        "rely on the approval already obtained in an earlier turn, which named"),
+    "earlier_approval_reused": (
+        "A prior-turn approval is not reusable.",
+        "The step-5 preflight approval is reusable here."),
+    "workflow_target_removed": (
+        "`n8n-workflows/member_create_uat_result_mapping.workflow.json`", "the mapping workflow"),
+    "spreadsheet_target_removed": (
+        "the intended spreadsheet\nand source tab", "the destination"),
+    # R2. Struck out of the required-name clause entirely.
+    "n8n_target_removed": (
+        ", and the intended n8n instance or environment by its non-secret\n"
+        "operator-recognisable name", ""),
+    # R2. "n8n" is still mentioned, but no particular instance is identified.
+    "n8n_target_generic_any_instance": (
+        "the intended n8n instance or environment by its non-secret\noperator-recognisable name",
+        "any n8n instance"),
+    # R2, the decisive one. The replacement is the EXACT generic phrase the step already carries
+    # twice -- in its descriptive sentence and in its first operation bullet -- so this proves the
+    # binding cannot be satisfied by prose that merely says which kind of instance is involved.
+    "n8n_target_generic_operator_pc_prose": (
+        "the intended n8n instance or environment by its non-secret\noperator-recognisable name",
+        "the operator PC n8n instance"),
+    # R3, credential. Struck out of the required-name clause entirely; the operation bullet that
+    # says "binding the intended Google credential by name or identity only" survives untouched,
+    # which is precisely the shape the binding must refuse to accept as an approval.
+    "google_credential_removed": (
+        "the intended Google credential by its non-secret operator-recognisable\ncredential name"
+        " or identity, ", ""),
+    # The gate's own descriptive wording for the same operation, so "mentioning the credential" is
+    # proved insufficient.
+    "google_credential_generic_intended": (
+        "the intended Google credential by its non-secret operator-recognisable\ncredential name"
+        " or identity", "the intended Google credential"),
+    "google_credential_generic_any": (
+        "the intended Google credential by its non-secret operator-recognisable\ncredential name"
+        " or identity", "any Google credential"),
+    # R3, operation id. Same three shapes. The second replacement is the exact generic phrase the
+    # accepted finding said was insufficient; the third mentions the identifier without requiring
+    # the approval to carry its value.
+    "operation_id_removed": (
+        "the exact non-secret `uat_create_operation_id` whose spreadsheet\nrow is to be updated,"
+        " ", ""),
+    "operation_id_generic_intended_row": (
+        "the exact non-secret `uat_create_operation_id` whose spreadsheet\nrow is to be updated",
+        "the intended row"),
+    "operation_id_generic_operation_id": (
+        "the exact non-secret `uat_create_operation_id` whose spreadsheet\nrow is to be updated",
+        "the operation id"),
+    "operation_set_removed": (
+        "- running that workflow manually, with the workflow left inactive;\n", ""),
+    "generic_authority_substituted": (
+        "obtain an explicit current-turn owner approval that names",
+        "continue once approved, which covers"),
+    "prior_turn_denial_removed": ("A prior-turn approval is not reusable. ", ""),
+    "substitution_denial_removed": (
+        "- the VM deployment approval (step 4) does **not** authorise this result mapping;\n",
+        "- the VM deployment approval (step 4) is also sufficient here;\n"),
+    "stop_boundary_removed": (
+        "Without the named current-turn\nresult-mapping approval, stop before importing the"
+        " workflow, before binding any credential, before\ncopying the result file into the n8n"
+        " file location, before running the workflow and before updating\nthe spreadsheet row.",
+        "Proceed when ready."),
+}
+VM_GATE_A11_RECOVERY_REPLACEMENTS = {
+    "prior_turn_wording": (
+        "obtain an explicit current-turn owner approval that names",
+        "rely on the approval already obtained in an earlier turn, which named"),
+    "write_approval_reused": (
+        "A prior-turn approval is not reusable.",
+        "The step-7 write approval is reusable here."),
+    "account_book_removed": (
+        "the intended AutoCount\naccount book and environment", "the environment"),
+    "read_only_operation_removed": (
+        "the read-only member lookup and recovery\noperation for that one uncertain write outcome",
+        "the recovery work"),
+    "write_authority_denial_removed": (
+        "It grants no new `SaveMember` authority, authorises no create, update or\ndelete, and"
+        " authorises no second write attempt.",
+        "It is performed carefully."),
+    "generic_authority_substituted": (
+        "obtain an explicit current-turn owner approval that names",
+        "continue once approved, which covers"),
+    "prior_turn_denial_removed": ("A prior-turn approval is not reusable. ", ""),
+    "substitution_denial_removed": (
+        "- the separate current-turn write approval (step 7) does **not** authorise this recovery"
+        " lookup;\n",
+        "- the separate current-turn write approval (step 7) is also sufficient here;\n"),
+    "stop_boundary_removed": (
+        "Without the\nnamed current-turn recovery approval, stop before opening the account book"
+        " and before searching for\nthe member.",
+        "Proceed when ready."),
+}
 
 class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
     def setUp(self):
@@ -4463,8 +9035,13 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
         return _flat(self.create_runbook[gate_idx:pull_idx])
 
     def test_create_uat_runbook_satisfies_the_whole_host_sync_gate_contract(self):
+        # A LIVE-runbook integrity assertion, so it goes through the PUBLIC sealed guard: the
+        # live document must be the reviewed document AND satisfy every semantic requirement.
         self.assertEqual(host_sync_gate_findings(self.create_runbook), [],
-                         "the create-UAT runbook must satisfy every host-sync gate requirement")
+                         "the create-UAT runbook must be the reviewed document and satisfy every "
+                         "host-sync gate requirement")
+        self.assertEqual(_host_sync_semantic_findings(self.create_runbook), [],
+                         "the semantic layer must also be clean on the live runbook")
 
     def test_create_uat_gate_precedes_the_pull_and_names_host_and_operation(self):
         prose = self._create_uat_gate_prose()          # also asserts gate-before-pull ordering
@@ -4506,8 +9083,9 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
             self.assertIn(token, section, token)
 
     def test_create_uat_runbook_makes_no_blanket_off_laptop_gating_claim(self):
-        # Queued follow-up #123 leaves the step-4 deployment and step-5 preflight gaps open, so a
-        # broader "everything off-laptop is gated" claim would be untrue. #118 must not add one.
+        # The runbook gates the four surfaces it names (steps 3, 4, 5 and 7); it does not gate
+        # every conceivable off-laptop action, so a blanket claim would be untrue however many
+        # individual gates exist. #118 must not add one and #123 must not either.
         flat = _flat(self.create_runbook).lower()
         for claim in ("every off-laptop", "each off-laptop", "all off-laptop"):
             self.assertNotIn(claim, flat,
@@ -4521,7 +9099,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
     def test_canonical_host_sync_fixture_is_itself_compliant(self):
         # The control group. Without this, a degraded fixture proving "findings appear" would be
         # worthless: the findings might have been there all along.
-        self.assertEqual(host_sync_gate_findings(HOST_SYNC_CANONICAL_FIXTURE), [],
+        self.assertEqual(_host_sync_semantic_findings(HOST_SYNC_CANONICAL_FIXTURE), [],
                          "the canonical fixture must satisfy the contract before it is degraded")
 
     def _degraded_gate(self, old, new):
@@ -4547,53 +9125,53 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
         self.assertIn(fence, HOST_SYNC_CANONICAL_FIXTURE)
         degraded = fence + HOST_SYNC_CANONICAL_FIXTURE.replace(fence, "", 1)
         self.assertNotEqual(degraded, HOST_SYNC_CANONICAL_FIXTURE)
-        self.assertIn("gate_after_pull", host_sync_gate_findings(degraded))
+        self.assertIn("gate_after_pull", _host_sync_semantic_findings(degraded))
 
     def test_control_missing_pull_command_is_detected(self):
         degraded = HOST_SYNC_CANONICAL_FIXTURE.replace(HOST_SYNC_PULL_INVOCATION, "```bash\ntrue")
         self.assertNotEqual(degraded, HOST_SYNC_CANONICAL_FIXTURE)
-        self.assertIn("pull_missing", host_sync_gate_findings(degraded))
+        self.assertIn("pull_missing", _host_sync_semantic_findings(degraded))
 
     def test_control_unnamed_host_is_detected(self):
         degraded = self._degraded_gate(HOST_SYNC_HOST, "the physical host")
-        self.assertIn("host_not_named", host_sync_gate_findings(degraded))
+        self.assertIn("host_not_named", _host_sync_semantic_findings(degraded))
 
     def test_control_unnamed_operation_is_detected(self):
         degraded = self._degraded_gate("`" + HOST_SYNC_PULL_COMMAND + "`", "`the pull command`")
-        self.assertIn("operation_not_named", host_sync_gate_findings(degraded))
+        self.assertIn("operation_not_named", _host_sync_semantic_findings(degraded))
 
     def test_control_generic_approval_wording_replacing_the_gate_is_detected(self):
         degraded = self._degraded_gate(HOST_SYNC_GATE_MARKER, "approval required")
-        self.assertIn("gate_missing", host_sync_gate_findings(degraded))
+        self.assertIn("gate_missing", _host_sync_semantic_findings(degraded))
 
     def test_control_missing_current_turn_wording_is_detected(self):
         degraded = self._degraded_gate(HOST_SYNC_CURRENT_TURN_PHRASE, "owner approval")
-        self.assertIn("not_current_turn", host_sync_gate_findings(degraded))
+        self.assertIn("not_current_turn", _host_sync_semantic_findings(degraded))
 
     def test_control_each_removed_non_substitution_statement_is_detected(self):
         for step, statement in HOST_SYNC_STEP_DENIAL_BULLETS.items():
             with self.subTest(step=step):
                 degraded = self._degraded_gate(statement, "")
-                self.assertIn("substitution_not_denied", host_sync_gate_findings(degraded))
+                self.assertIn("substitution_not_denied", _host_sync_semantic_findings(degraded))
 
     def test_control_removed_forward_non_authorisation_is_detected(self):
         # Degrade against RAW fixture text: HOST_SYNC_FORWARD_PHRASE is the whitespace-collapsed
         # form and the fixture wraps that sentence, so it is not a literal substring here.
         degraded = self._degraded_gate("does not authorise deployment", "authorises deployment")
-        self.assertIn("substitution_not_denied", host_sync_gate_findings(degraded))
+        self.assertIn("substitution_not_denied", _host_sync_semantic_findings(degraded))
 
     def test_control_removed_prior_turn_non_reuse_is_detected(self):
         degraded = self._degraded_gate("A prior-turn approval is not reusable. ", "")
-        self.assertIn("prior_turn_not_denied", host_sync_gate_findings(degraded))
+        self.assertIn("prior_turn_not_denied", _host_sync_semantic_findings(degraded))
 
     def test_control_removed_stop_boundary_is_detected(self):
         degraded = self._degraded_gate(
             "stop before contacting `DESKTOP-Q43QKQF` and do not run", "do not run")
-        self.assertIn("stop_boundary_missing", host_sync_gate_findings(degraded))
+        self.assertIn("stop_boundary_missing", _host_sync_semantic_findings(degraded))
 
     def test_control_removed_safety_boundary_independence_is_detected(self):
         degraded = self._degraded_safety("Neither implies the other,", "")
-        self.assertIn("safety_boundary_missing", host_sync_gate_findings(degraded))
+        self.assertIn("safety_boundary_missing", _host_sync_semantic_findings(degraded))
 
     # -- Polarity controls: a denial INVERTED in place, not removed -- #
     # Removal controls only prove the oracle notices an absent bullet. These prove it notices a
@@ -4608,19 +9186,19 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
 
     def test_control_inverted_step_2_non_substitution_is_detected(self):
         degraded = self._inverted_step_denial("(step 2)")
-        self.assertIn("substitution_not_denied", host_sync_gate_findings(degraded))
+        self.assertIn("substitution_not_denied", _host_sync_semantic_findings(degraded))
 
     def test_control_inverted_step_4_non_substitution_is_detected(self):
         degraded = self._inverted_step_denial("(step 4)")
-        self.assertIn("substitution_not_denied", host_sync_gate_findings(degraded))
+        self.assertIn("substitution_not_denied", _host_sync_semantic_findings(degraded))
 
     def test_control_inverted_step_5_non_substitution_is_detected(self):
         degraded = self._inverted_step_denial("(step 5)")
-        self.assertIn("substitution_not_denied", host_sync_gate_findings(degraded))
+        self.assertIn("substitution_not_denied", _host_sync_semantic_findings(degraded))
 
     def test_control_inverted_step_7_non_substitution_is_detected(self):
         degraded = self._inverted_step_denial("(step 7)")
-        self.assertIn("substitution_not_denied", host_sync_gate_findings(degraded))
+        self.assertIn("substitution_not_denied", _host_sync_semantic_findings(degraded))
 
     def test_control_a_neighbouring_compliant_bullet_cannot_satisfy_an_inverted_one(self):
         # The specific bypass a fixed proximity window allows: invert one bullet and let the
@@ -4629,7 +9207,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
         for neighbour in ("(step 2)", "(step 5)", "(step 7)"):
             self.assertIn(HOST_SYNC_STEP_DENIAL_BULLETS[neighbour], degraded,
                           "%s must remain compliant and adjacent" % neighbour)
-        self.assertIn("substitution_not_denied", host_sync_gate_findings(degraded))
+        self.assertIn("substitution_not_denied", _host_sync_semantic_findings(degraded))
 
     # -- Unterminated inversion: the bound must not depend on the bullet's own punctuation -- #
     # `;` and `.` belong to the bullet an editor is already rewriting, so the same edit that
@@ -4651,15 +9229,15 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
 
     def test_control_unterminated_inverted_step_2_cannot_borrow_step_4(self):
         degraded = self._inverted_unterminated_step_denial("(step 2)", "(step 4)")
-        self.assertIn("substitution_not_denied", host_sync_gate_findings(degraded))
+        self.assertIn("substitution_not_denied", _host_sync_semantic_findings(degraded))
 
     def test_control_unterminated_inverted_step_4_cannot_borrow_step_5(self):
         degraded = self._inverted_unterminated_step_denial("(step 4)", "(step 5)")
-        self.assertIn("substitution_not_denied", host_sync_gate_findings(degraded))
+        self.assertIn("substitution_not_denied", _host_sync_semantic_findings(degraded))
 
     def test_control_unterminated_inverted_step_5_cannot_borrow_step_7(self):
         degraded = self._inverted_unterminated_step_denial("(step 5)", "(step 7)")
-        self.assertIn("substitution_not_denied", host_sync_gate_findings(degraded))
+        self.assertIn("substitution_not_denied", _host_sync_semantic_findings(degraded))
 
     # -- Neighbour marker variants: the bound must not depend on WHICH bullet marker is used -- #
     # The controls above all leave the neighbour hyphen-marked, so they only prove the " - " break
@@ -4709,7 +9287,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                 with self.subTest(step=step, neighbour=neighbour, marker=marker):
                     degraded = self._unterminated_inversion_across_marker(step, neighbour, marker)
                     self.assertIn(
-                        "substitution_not_denied", host_sync_gate_findings(degraded),
+                        "substitution_not_denied", _host_sync_semantic_findings(degraded),
                         "%s borrowed %s's denial across a %r-marked bullet break"
                         % (step, neighbour, marker))
 
@@ -4718,28 +9296,1455 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
         degraded = self._degraded_safety(
             "each require their own prior current-turn owner approval",
             "are both covered by the owner's standing approval")
-        self.assertIn("safety_boundary_missing", host_sync_gate_findings(degraded))
+        self.assertIn("safety_boundary_missing", _host_sync_semantic_findings(degraded))
 
     def test_control_weakened_safety_prior_turn_non_reuse_is_detected(self):
         degraded = self._degraded_safety(
             "a prior-turn approval is never reusable for either",
             "either may rely on an earlier approval")
-        self.assertIn("safety_boundary_missing", host_sync_gate_findings(degraded))
+        self.assertIn("safety_boundary_missing", _host_sync_semantic_findings(degraded))
 
     # -- Mutation / not-read-only disclosure controls -- #
     # The gate must say what the guarded command DOES, or a reader cannot judge the approval.
     def test_control_removed_remote_contact_disclosure_is_detected(self):
         degraded = self._degraded_gate("contacts the remote, and ", "")
-        self.assertIn("mutation_disclosure_missing", host_sync_gate_findings(degraded))
+        self.assertIn("mutation_disclosure_missing", _host_sync_semantic_findings(degraded))
 
     def test_control_removed_checkout_mutation_disclosure_is_detected(self):
         degraded = self._degraded_gate(
             "fast-forwards (mutates)\nthat host's checkout", "runs there")
-        self.assertIn("mutation_disclosure_missing", host_sync_gate_findings(degraded))
+        self.assertIn("mutation_disclosure_missing", _host_sync_semantic_findings(degraded))
 
     def test_control_inverted_read_only_disclosure_is_detected(self):
         degraded = self._degraded_gate("not a read-only check", "a read-only check")
-        self.assertIn("mutation_disclosure_missing", host_sync_gate_findings(degraded))
+        self.assertIn("mutation_disclosure_missing", _host_sync_semantic_findings(degraded))
+
+    # ---- DL-XB-123-001: create-UAT VM deployment and no-write preflight approval gates ---- #
+    # Exactly ONE live assertion, so a gap in the real runbook fails here once and reports what is
+    # missing. Every other test below degrades the in-memory fixture and proves the shared checker
+    # emits a specific finding, which is what shows this contract can actually fail.
+    def test_create_uat_runbook_satisfies_the_whole_vm_gate_contract(self):
+        # A LIVE-runbook integrity assertion, so it goes through the PUBLIC sealed guard. Under R1
+        # this is the assertion that actually converges: it holds only while the live document is
+        # byte-for-byte the reviewed one, independently of what the semantic model recognises.
+        self.assertEqual(vm_gate_findings(self.create_runbook), [],
+                         "the create-UAT runbook must be the reviewed document and satisfy every "
+                         "DL-XB-123-001 deployment and preflight approval requirement")
+        self.assertEqual(_vm_gate_semantic_findings(self.create_runbook), [],
+                         "the semantic layer must also be clean on the live runbook")
+
+    def test_canonical_vm_gate_fixture_is_itself_compliant(self):
+        # The control group. Without it, a degraded fixture proving "findings appear" would be
+        # worthless: the findings might have been there all along.
+        self.assertEqual(_vm_gate_semantic_findings(VM_GATE_CANONICAL_FIXTURE), [],
+                         "the canonical fixture must satisfy the contract before it is degraded")
+
+    def test_vm_gate_finding_keys_are_declared_and_every_one_is_reachable(self):
+        # An empty document fails every requirement that needs neither an ordering comparison nor
+        # a second occurrence of a landmark, so this pins the declared key set as exhaustive. The
+        # eleven keys below need a document that actually contains the landmarks, and each has its
+        # own control: the two ordering keys, the four gate/boundary ambiguity keys, the four A2
+        # numbered-step keys (a duplicate step number and a changed heading both require a heading
+        # to exist in the first place), and the A4 safety-boundary ambiguity key, which needs a
+        # boundary present twice rather than absent.
+        # A11 widened this set with the two new numbered-step families and the three keys that
+        # need a real operation, destructive instruction or cleanup gate to exist at all. It is
+        # declared once, beside the A11 contract, so this control and the A11 one cannot drift.
+        # R1 splits the expectation deliberately rather than exempting the empty document. The
+        # SEMANTIC surface is unchanged: an empty document still reports every semantic key that
+        # does not need a real landmark. The PUBLIC surface adds exactly the seal key, because an
+        # empty document is manifestly not the reviewed runbook.
+        needs_a_real_document = set(VM_GATE_A11_NEEDS_A_REAL_DOCUMENT)
+        self.assertLess(needs_a_real_document, set(VM_GATE_SEMANTIC_FINDING_KEYS),
+                        "the ordering, ambiguity and numbered-step keys must all be declared")
+        self.assertEqual(set(_vm_gate_semantic_findings("")),
+                         set(VM_GATE_SEMANTIC_FINDING_KEYS) - needs_a_real_document,
+                         "an empty document must report every other declared semantic finding key")
+        self.assertEqual(set(vm_gate_findings("")),
+                         (set(VM_GATE_SEMANTIC_FINDING_KEYS) - needs_a_real_document)
+                         | {REVIEWED_RUNBOOK_SEAL_KEY},
+                         "the public guard adds exactly the seal key on an empty document")
+
+    # -- Fixture degradation helpers: in-memory only, never a repository file -- #
+    def _vm_gate_replace_section(self, section, mutated):
+        """Swap one whole fixture section for a mutated copy, proving both actually changed."""
+        self.assertNotEqual(mutated, section, "the degraded step must actually differ")
+        degraded = VM_GATE_CANONICAL_FIXTURE.replace(section, mutated, 1)
+        self.assertNotEqual(degraded, VM_GATE_CANONICAL_FIXTURE,
+                            "the degraded fixture must actually differ")
+        return degraded
+
+    def _degraded_vm_gate(self, number, boundary, old, new):
+        """Degrade only a step's GATE prose, leaving the operation it guards untouched."""
+        section = _numbered_step_section(VM_GATE_CANONICAL_FIXTURE, number)
+        self.assertNotEqual(section, "", "step %d must exist in the fixture" % number)
+        split = section.find(boundary)
+        self.assertNotEqual(split, -1, "the %r operation boundary must exist" % boundary)
+        mutated = section[:split].replace(old, new) + section[split:]
+        return self._vm_gate_replace_section(section, mutated)
+
+    def _degraded_deploy_gate(self, old, new):
+        return self._degraded_vm_gate(VM_GATE_DEPLOY_STEP, VM_GATE_DEPLOY_OPERATION_OPENING,
+                                      old, new)
+
+    def _degraded_preflight_gate(self, old, new):
+        return self._degraded_vm_gate(VM_GATE_PREFLIGHT_STEP,
+                                      VM_GATE_PREFLIGHT_OPERATION_OPENING, old, new)
+
+    @staticmethod
+    def _token_pattern(token):
+        """Match a lower-cased contract token however the document happens to spell it.
+
+        Tokens are compared against a flattened, lower-cased view, so the fixture may capitalise
+        one differently or wrap it across a line. A control that edited the token literally would
+        silently change nothing in some of those spellings and pass for the wrong reason.
+        """
+        return re.compile(r"\s+".join(re.escape(part) for part in token.split()), re.IGNORECASE)
+
+    def _degraded_vm_gate_token(self, number, boundary, token, new):
+        """Remove EVERY occurrence of one contract token before a step's operation boundary.
+
+        All of them, not the first: a phrase repeated in the step heading line and again in the
+        gate body would otherwise let an untouched copy satisfy the requirement the control is
+        supposed to have taken away.
+        """
+        section = _numbered_step_section(VM_GATE_CANONICAL_FIXTURE, number)
+        split = section.find(boundary)
+        self.assertNotEqual(split, -1, "the %r operation boundary must exist" % boundary)
+        pattern = self._token_pattern(token)
+        self.assertTrue(pattern.search(section[:split]),
+                        "the fixture must carry the token %r before its operation" % (token,))
+        mutated = pattern.sub(lambda _: new, section[:split]) + section[split:]
+        return self._vm_gate_replace_section(section, mutated)
+
+    def _degraded_deploy_gate_token(self, token, new):
+        return self._degraded_vm_gate_token(VM_GATE_DEPLOY_STEP,
+                                            VM_GATE_DEPLOY_OPERATION_OPENING, token, new)
+
+    def _degraded_preflight_gate_token(self, token, new):
+        return self._degraded_vm_gate_token(VM_GATE_PREFLIGHT_STEP,
+                                            VM_GATE_PREFLIGHT_OPERATION_OPENING, token, new)
+
+    def _degraded_four_way_safety(self, old, new):
+        split = VM_GATE_CANONICAL_FIXTURE.find(VM_GATE_SAFETY_HEADING)
+        self.assertNotEqual(split, -1, "the fixture must carry a safety boundary")
+        degraded = (VM_GATE_CANONICAL_FIXTURE[:split]
+                    + VM_GATE_CANONICAL_FIXTURE[split:].replace(old, new))
+        self.assertNotEqual(degraded, VM_GATE_CANONICAL_FIXTURE,
+                            "the degraded fixture must actually differ: %r" % (old,))
+        return degraded
+
+    def _relocated_gate_after_operation(self, number, gate_opening, operation_opening):
+        """Move a step's whole gate block to AFTER the operation it is supposed to precede.
+
+        The prose is not weakened or removed, only moved, so the ordering requirement is the only
+        thing that can still detect it.
+        """
+        section = _numbered_step_section(VM_GATE_CANONICAL_FIXTURE, number)
+        gate_at = section.find(gate_opening)
+        operation_at = section.find(operation_opening)
+        self.assertNotEqual(gate_at, -1, "the fixture must open step %d's gate" % number)
+        self.assertNotEqual(operation_at, -1, "step %d's operation must be present" % number)
+        self.assertLess(gate_at, operation_at, "the fixture must start out compliant")
+        moved = section[:gate_at] + section[operation_at:] + section[gate_at:operation_at]
+        return self._vm_gate_replace_section(section, moved)
+
+    # -- Step-4 deployment gate controls -- #
+    def test_control_missing_deployment_gate_is_detected(self):
+        degraded = self._degraded_deploy_gate("(deployment gate)", "(approval required)")
+        self.assertIn("deploy_gate_missing", _vm_gate_semantic_findings(degraded))
+
+    def test_control_deployment_gate_after_the_mutation_boundary_is_detected(self):
+        degraded = self._relocated_gate_after_operation(
+            VM_GATE_DEPLOY_STEP, VM_GATE_DEPLOY_OPENING, VM_GATE_DEPLOY_OPERATION_OPENING)
+        self.assertIn("deploy_gate_after_mutation", _vm_gate_semantic_findings(degraded))
+
+    def test_control_missing_deployment_step_is_detected(self):
+        section = _numbered_step_section(VM_GATE_CANONICAL_FIXTURE, VM_GATE_DEPLOY_STEP)
+        degraded = VM_GATE_CANONICAL_FIXTURE.replace(section, "", 1)
+        self.assertNotEqual(degraded, VM_GATE_CANONICAL_FIXTURE)
+        self.assertIn("deploy_step_missing", _vm_gate_semantic_findings(degraded))
+
+    def test_control_removed_deployment_operation_is_detected(self):
+        # A gate that guards nothing is not a pass: the mutation boundary this contract anchors
+        # its ordering check on has gone, so the ordering check has silently stopped testing.
+        section = _numbered_step_section(VM_GATE_CANONICAL_FIXTURE, VM_GATE_DEPLOY_STEP)
+        split = section.find(VM_GATE_DEPLOY_OPERATION_OPENING)
+        mutated = section[:split]
+        self.assertIn("deploy_operation_missing",
+                      _vm_gate_semantic_findings(self._vm_gate_replace_section(section, mutated)))
+
+    def test_control_deployment_vm_name_removed_is_detected(self):
+        degraded = self._degraded_deploy_gate_token(VM_GATE_VM, "the AutoCount VM")
+        self.assertIn("deploy_vm_not_named", _vm_gate_semantic_findings(degraded))
+
+    def test_control_each_weakened_deployment_operation_binding_is_detected(self):
+        for binding in VM_GATE_DEPLOY_BINDINGS:
+            with self.subTest(binding=binding):
+                degraded = self._degraded_deploy_gate_token(binding,
+                                                            "the reviewed UAT components")
+                self.assertIn("deploy_operation_not_bound", _vm_gate_semantic_findings(degraded))
+
+    def test_control_deployment_missing_current_turn_wording_is_detected(self):
+        degraded = self._degraded_deploy_gate_token(VM_GATE_CURRENT_TURN, "owner approval")
+        self.assertIn("deploy_not_current_turn", _vm_gate_semantic_findings(degraded))
+
+    def test_control_each_removed_deployment_non_substitution_statement_is_detected(self):
+        for step, bullet in VM_GATE_DEPLOY_DENIAL_BULLETS.items():
+            with self.subTest(step=step):
+                degraded = self._degraded_deploy_gate(bullet, "")
+                self.assertIn("deploy_substitution_not_denied", _vm_gate_semantic_findings(degraded))
+
+    def test_control_each_inverted_deployment_non_substitution_statement_is_detected(self):
+        # Removal only proves the checker notices an absent bullet. These bullets are still
+        # present, still carry their step token, and now say the opposite.
+        for step, bullet in VM_GATE_DEPLOY_DENIAL_BULLETS.items():
+            with self.subTest(step=step):
+                inverted = bullet.replace("does **not** authorise", "does authorise")
+                self.assertNotEqual(inverted, bullet, "the inversion must change %s" % step)
+                self.assertIn(step, inverted, "the inverted bullet must keep its step token")
+                degraded = self._degraded_deploy_gate(bullet, inverted)
+                self.assertIn("deploy_substitution_not_denied", _vm_gate_semantic_findings(degraded))
+
+    def test_control_unterminated_inverted_deployment_denial_cannot_borrow_a_neighbour(self):
+        # The bypass a proximity window allows: invert one bullet, delete its own `;` in the same
+        # stroke, and let the untouched neighbour supply the denial phrase. Each must stand alone.
+        for step, neighbour in (("(step 2)", "(step 3)"), ("(step 3)", "(step 5)"),
+                                ("(step 5)", "(step 7)")):
+            with self.subTest(step=step, neighbour=neighbour):
+                bullet = VM_GATE_DEPLOY_DENIAL_BULLETS[step]
+                mutated = (bullet.replace("does **not** authorise", "does authorise")
+                           .replace(" deployment;\n", " deployment\n"))
+                self.assertNotIn(";", mutated, "%s must lose its own clause terminator" % step)
+                self.assertNotIn(VM_GATE_DEPLOY_DENIAL, mutated,
+                                 "%s must no longer deny anything by itself" % step)
+                degraded = self._degraded_deploy_gate(bullet, mutated)
+                self.assertIn(VM_GATE_DEPLOY_DENIAL_BULLETS[neighbour], degraded,
+                              "%s must remain compliant and adjacent to be borrowable" % neighbour)
+                self.assertIn("deploy_substitution_not_denied", _vm_gate_semantic_findings(degraded))
+
+    def test_control_reusable_prior_turn_deployment_approval_is_detected(self):
+        degraded = self._degraded_deploy_gate("A prior-turn approval is not reusable.",
+                                              "A prior-turn approval may be reused here.")
+        self.assertIn("deploy_prior_turn_not_denied", _vm_gate_semantic_findings(degraded))
+
+    def test_control_removed_deployment_stop_boundary_is_detected(self):
+        # A5 re-points the quoted fragment at the reviewed gate wording the fixture now carries
+        # verbatim. The proposition under attack is unchanged: the gate must still say where to
+        # stop, and losing that sentence must still fail closed.
+        degraded = self._degraded_deploy_gate(
+            "stop before\ncopying or replacing files or creating or preparing state on the VM.",
+            "proceed.")
+        self.assertIn("deploy_stop_boundary_missing", _vm_gate_semantic_findings(degraded))
+
+    def test_control_deployment_stop_boundary_stated_only_after_the_mutation_is_rejected(self):
+        # Layer 2 of the structural bound, on its own: the sentence is still in step 4 and still
+        # verbatim, but it now sits after the copy instruction, where it can no longer stop it.
+        section = _numbered_step_section(VM_GATE_CANONICAL_FIXTURE, VM_GATE_DEPLOY_STEP)
+        sentence = ("Without the named current-turn deployment approval, stop before\n"
+                    "copying or replacing files or creating or preparing state on the VM.\n")
+        self.assertIn(sentence, section, "the fixture must carry the stop sentence verbatim")
+        split = section.find(VM_GATE_DEPLOY_OPERATION_OPENING)
+        mutated = section[:split].replace(sentence, "") + section[split:] + "\n" + sentence
+        degraded = self._vm_gate_replace_section(section, mutated)
+        self.assertIn(sentence, degraded, "the sentence must be relocated, not deleted")
+        self.assertIn("deploy_stop_boundary_missing", _vm_gate_semantic_findings(degraded))
+
+    def test_control_deployment_approval_extended_to_execution_or_autocount_is_detected(self):
+        degraded = self._degraded_deploy_gate(
+            "This deployment approval authorises no runner\n"
+            "execution, no AutoCount environment configuration and no AutoCount contact;",
+            "This deployment approval also authorises running the runner, configuring the"
+            " AutoCount environment and contacting AutoCount;")
+        self.assertIn("deploy_execution_not_denied", _vm_gate_semantic_findings(degraded))
+
+    # -- Step-5 preflight gate controls -- #
+    def test_control_missing_preflight_gate_is_detected(self):
+        degraded = self._degraded_preflight_gate("(preflight gate)", "(approval required)")
+        self.assertIn("preflight_gate_missing", _vm_gate_semantic_findings(degraded))
+
+    def test_control_preflight_gate_after_the_external_boundary_is_detected(self):
+        degraded = self._relocated_gate_after_operation(
+            VM_GATE_PREFLIGHT_STEP, VM_GATE_PREFLIGHT_OPENING,
+            VM_GATE_PREFLIGHT_OPERATION_OPENING)
+        self.assertIn("preflight_gate_after_external_action", _vm_gate_semantic_findings(degraded))
+
+    def test_control_missing_preflight_step_is_detected(self):
+        section = _numbered_step_section(VM_GATE_CANONICAL_FIXTURE, VM_GATE_PREFLIGHT_STEP)
+        degraded = VM_GATE_CANONICAL_FIXTURE.replace(section, "", 1)
+        self.assertNotEqual(degraded, VM_GATE_CANONICAL_FIXTURE)
+        self.assertIn("preflight_step_missing", _vm_gate_semantic_findings(degraded))
+
+    def test_control_removed_preflight_operation_is_detected(self):
+        section = _numbered_step_section(VM_GATE_CANONICAL_FIXTURE, VM_GATE_PREFLIGHT_STEP)
+        split = section.find(VM_GATE_PREFLIGHT_OPERATION_OPENING)
+        mutated = section[:split]
+        self.assertIn("preflight_operation_missing",
+                      _vm_gate_semantic_findings(self._vm_gate_replace_section(section, mutated)))
+
+    def test_control_preflight_vm_name_removed_is_detected(self):
+        degraded = self._degraded_preflight_gate_token(VM_GATE_VM, "the AutoCount VM")
+        self.assertIn("preflight_vm_not_named", _vm_gate_semantic_findings(degraded))
+
+    def test_control_each_removed_preflight_binding_reports_its_own_finding(self):
+        # Target, transfer and dry-run are three separate bindings; losing one must not be
+        # concealed by the other two, so each carries its own finding key.
+        for key, token in VM_GATE_PREFLIGHT_BINDINGS:
+            with self.subTest(binding=key):
+                degraded = self._degraded_preflight_gate_token(
+                    token, "the usual preflight arrangements")
+                self.assertIn(key, _vm_gate_semantic_findings(degraded))
+
+    def test_control_preflight_missing_current_turn_wording_is_detected(self):
+        degraded = self._degraded_preflight_gate_token(VM_GATE_CURRENT_TURN, "owner approval")
+        self.assertIn("preflight_not_current_turn", _vm_gate_semantic_findings(degraded))
+
+    def test_control_each_removed_preflight_non_substitution_statement_is_detected(self):
+        for step, bullet in VM_GATE_PREFLIGHT_DENIAL_BULLETS.items():
+            with self.subTest(step=step):
+                degraded = self._degraded_preflight_gate(bullet, "")
+                self.assertIn("preflight_substitution_not_denied", _vm_gate_semantic_findings(degraded))
+
+    def test_control_each_inverted_preflight_non_substitution_statement_is_detected(self):
+        for step, bullet in VM_GATE_PREFLIGHT_DENIAL_BULLETS.items():
+            with self.subTest(step=step):
+                inverted = bullet.replace("does **not** authorise", "does authorise")
+                self.assertNotEqual(inverted, bullet, "the inversion must change %s" % step)
+                self.assertIn(step, inverted, "the inverted bullet must keep its step token")
+                degraded = self._degraded_preflight_gate(bullet, inverted)
+                self.assertIn("preflight_substitution_not_denied", _vm_gate_semantic_findings(degraded))
+
+    def test_control_unterminated_inverted_preflight_denial_cannot_borrow_a_neighbour(self):
+        for step, neighbour in (("(step 2)", "(step 3)"), ("(step 3)", "(step 4)"),
+                                ("(step 4)", "(step 7)")):
+            with self.subTest(step=step, neighbour=neighbour):
+                bullet = VM_GATE_PREFLIGHT_DENIAL_BULLETS[step]
+                mutated = (bullet.replace("does **not** authorise", "does authorise")
+                           .replace(" preflight;\n", " preflight\n"))
+                self.assertNotIn(";", mutated, "%s must lose its own clause terminator" % step)
+                self.assertNotIn(VM_GATE_PREFLIGHT_DENIAL, mutated,
+                                 "%s must no longer deny anything by itself" % step)
+                degraded = self._degraded_preflight_gate(bullet, mutated)
+                self.assertIn(VM_GATE_PREFLIGHT_DENIAL_BULLETS[neighbour], degraded,
+                              "%s must remain compliant and adjacent to be borrowable" % neighbour)
+                self.assertIn("preflight_substitution_not_denied", _vm_gate_semantic_findings(degraded))
+
+    def test_control_reusable_prior_turn_preflight_approval_is_detected(self):
+        degraded = self._degraded_preflight_gate("A prior-turn approval is not reusable.",
+                                                 "A prior-turn approval may be reused here.")
+        self.assertIn("preflight_prior_turn_not_denied", _vm_gate_semantic_findings(degraded))
+
+    def test_control_removed_preflight_save_member_non_authorisation_is_detected(self):
+        degraded = self._degraded_preflight_gate(
+            ", but it does **not** authorise or call `SaveMember`; that write\nremains gated by"
+            " step 7", "")
+        self.assertIn("preflight_save_member_not_denied", _vm_gate_semantic_findings(degraded))
+
+    def test_control_inverted_preflight_save_member_non_authorisation_is_detected(self):
+        degraded = self._degraded_preflight_gate(
+            "it does **not** authorise or call `SaveMember`",
+            "it also authorises and may call `SaveMember`")
+        self.assertIn("preflight_save_member_not_denied", _vm_gate_semantic_findings(degraded))
+
+    def test_control_removed_preflight_dry_run_reach_statement_is_detected(self):
+        degraded = self._degraded_preflight_gate(
+            "The dry-run may authenticate, check the duplicate and\nconstruct the member in"
+            " memory, but it", "The dry-run")
+        self.assertIn("preflight_save_member_not_denied", _vm_gate_semantic_findings(degraded))
+
+    def test_control_removed_preflight_stop_boundary_is_detected(self):
+        degraded = self._degraded_preflight_gate(
+            "stop before reading\nthe private form response or decision row, before building the"
+            " package, before setting the\nAutoCount environment, and before transferring the"
+            " package to the VM or contacting AutoCount.",
+            "proceed.")
+        self.assertIn("preflight_stop_boundary_missing", _vm_gate_semantic_findings(degraded))
+
+    # -- Step-heading isolation: neither gate may be satisfied from the other step -- #
+    def test_control_deployment_gate_relocated_into_step_5_is_still_missing_from_step_4(self):
+        deploy = _numbered_step_section(VM_GATE_CANONICAL_FIXTURE, VM_GATE_DEPLOY_STEP)
+        preflight = _numbered_step_section(VM_GATE_CANONICAL_FIXTURE, VM_GATE_PREFLIGHT_STEP)
+        gate_at = deploy.find(VM_GATE_DEPLOY_OPENING)
+        operation_at = deploy.find(VM_GATE_DEPLOY_OPERATION_OPENING)
+        block = deploy[gate_at:operation_at]
+        heading, newline, body = preflight.partition("\n")
+        degraded = (VM_GATE_CANONICAL_FIXTURE
+                    .replace(deploy, deploy[:gate_at] + deploy[operation_at:], 1)
+                    .replace(preflight, heading + newline + "\n" + block + body, 1))
+        self.assertNotEqual(degraded, VM_GATE_CANONICAL_FIXTURE)
+        self.assertIn(block, degraded, "the gate prose must be relocated, not deleted")
+        findings = _vm_gate_semantic_findings(degraded)
+        self.assertIn("deploy_gate_missing", findings,
+                      "step 4's gate must not be satisfiable from step 5's section")
+        self.assertNotIn("preflight_gate_missing", findings,
+                         "step 5's own gate must remain intact and independently satisfied")
+
+    def test_control_preflight_gate_removal_leaves_the_deployment_gate_satisfied(self):
+        degraded = self._degraded_preflight_gate("(preflight gate)", "(approval required)")
+        findings = _vm_gate_semantic_findings(degraded)
+        self.assertIn("preflight_gate_missing", findings)
+        self.assertNotIn("deploy_gate_missing", findings,
+                         "a step-5 regression must not be reported against step 4")
+
+    # -- Four-way safety-boundary controls -- #
+    # A8 promotes the reviewed section to THE fixture boundary, so each degradation below now names
+    # the reviewed line wrapping instead of the retired miniature's. Every control degrades the
+    # same proposition it always did and asserts the same finding: only the search text moved.
+    def test_control_removed_four_way_safety_statement_is_detected(self):
+        degraded = self._degraded_four_way_safety("approval surfaces are always required",
+                                                  "surfaces are handled together")
+        self.assertIn("safety_boundary_surfaces_incomplete", _vm_gate_semantic_findings(degraded))
+
+    def test_control_weakened_four_way_own_approval_requirement_is_detected(self):
+        degraded = self._degraded_four_way_safety(
+            "requires its own current-turn owner approval",
+            "is covered by the owner's standing approval")
+        self.assertIn("safety_boundary_surfaces_incomplete", _vm_gate_semantic_findings(degraded))
+
+    def test_control_weakened_four_way_non_implication_is_detected(self):
+        degraded = self._degraded_four_way_safety("implies or covers another",
+                                                  "may cover a later one")
+        self.assertIn("safety_boundary_surfaces_incomplete", _vm_gate_semantic_findings(degraded))
+
+    def test_control_weakened_four_way_prior_turn_non_reuse_is_detected(self):
+        degraded = self._degraded_four_way_safety(
+            "a prior-turn approval is never reusable for any of them",
+            "any of them may rely on an earlier approval")
+        self.assertIn("safety_boundary_surfaces_incomplete", _vm_gate_semantic_findings(degraded))
+
+    def test_control_missing_safety_boundary_heading_is_detected(self):
+        degraded = VM_GATE_CANONICAL_FIXTURE.replace(VM_GATE_SAFETY_HEADING, "## Notes", 1)
+        self.assertNotEqual(degraded, VM_GATE_CANONICAL_FIXTURE)
+        self.assertIn("safety_boundary_surfaces_incomplete", _vm_gate_semantic_findings(degraded))
+
+    def test_four_way_safety_statement_preserves_the_host_sync_independence_rule(self):
+        # #123 ADDS a fourth surface; it must not quietly relax the #118 sentence it sits beside.
+        # The fixture carries no step-3 gate, so only the safety-boundary finding is meaningful
+        # here -- and it must be absent, proving the two safety contracts coexist rather than one
+        # rewording the other's proposition away.
+        self.assertNotIn("safety_boundary_missing",
+                         _host_sync_semantic_findings(VM_GATE_CANONICAL_FIXTURE),
+                         "the surface statement must not displace the #118 independence rule")
+
+    # ---- DL-XB-123-001-A1 regression controls for accepted G4-002 findings F-1 / F-2 ---- #
+    # Every control degrades the in-memory fixture only, never a repository file. Each reproduces
+    # a case the pre-A1 checker reported clean, and each names the deterministic finding the
+    # repaired checker must emit, so RED localises to exactly what G4 accepted.
+
+    def _a1_step(self, number):
+        section = _numbered_step_section(VM_GATE_CANONICAL_FIXTURE, number)
+        self.assertNotEqual(section, "", "step %d must exist in the fixture" % number)
+        return section
+
+    def _a1_swap(self, section, mutated):
+        self.assertNotEqual(mutated, section, "the A1 mutation must change the step")
+        degraded = VM_GATE_CANONICAL_FIXTURE.replace(section, mutated, 1)
+        self.assertNotEqual(degraded, VM_GATE_CANONICAL_FIXTURE,
+                            "the degraded fixture must actually differ")
+        return degraded
+
+    def _a1_line_start(self, section, token):
+        at = section.find(token)
+        self.assertNotEqual(at, -1, "the fixture must carry %r" % (token,))
+        return section.rfind("\n", 0, at) + 1
+
+    def _a1_insert_before_gate(self, number, marker, text):
+        """Put substantive prose into a step's PRE-GATE region, leaving everything else intact."""
+        section = self._a1_step(number)
+        at = self._a1_line_start(section, marker)
+        return self._a1_swap(section, section[:at] + text + section[at:])
+
+    def _a1_split_at_boundary(self, number, boundary):
+        """Return (section, gate-side text, action-region text) split at the action boundary."""
+        section = self._a1_step(number)
+        at = section.find(boundary)
+        self.assertNotEqual(at, -1, "the fixture must carry the %r boundary" % (boundary,))
+        return section, section[:at], section[at:]
+
+    # -- A. Step-4 pre-gate region: substantive content before the gate, any vocabulary -- #
+    def test_a1_control_step4_transfer_wording_before_the_gate_is_detected(self):
+        degraded = self._a1_insert_before_gate(
+            VM_GATE_DEPLOY_STEP, VM_GATE_DEPLOY_MARKER,
+            "Transfer the reviewed `scripts/ac2_member_create_uat_runner.ps1`,\n"
+            "`scripts/member_create_uat_runner_lib.ps1`, and\n"
+            "`config/member_create_uat_business_confirmation.json` to the AutoCount VM.\n\n")
+        self.assertIn("deploy_pre_gate_content", _vm_gate_semantic_findings(degraded),
+                      "an ungated 'Transfer ...' instruction before the step-4 gate must fail")
+
+    def test_a1_control_step4_place_wording_before_the_gate_is_detected(self):
+        degraded = self._a1_insert_before_gate(
+            VM_GATE_DEPLOY_STEP, VM_GATE_DEPLOY_MARKER,
+            "Place the reviewed runner, helper library and business-confirmation file on the\n"
+            "AutoCount VM `DESKTOP-4I042L6` now.\n\n")
+        self.assertIn("deploy_pre_gate_content", _vm_gate_semantic_findings(degraded),
+                      "an ungated 'Place ... on the VM' instruction before the gate must fail")
+
+    def test_a1_control_any_substantive_step4_pre_gate_text_is_detected(self):
+        # The point of the structural rule: detection cannot depend on guessing the verb, so a
+        # future synonym -- or prose with no action verb at all -- is caught just the same.
+        for lead in ("Transfer", "Place", "Send", "Move", "Deploy", "Push", "Sync",
+                     "As a preparatory note,"):
+            with self.subTest(lead=lead):
+                degraded = self._a1_insert_before_gate(
+                    VM_GATE_DEPLOY_STEP, VM_GATE_DEPLOY_MARKER,
+                    "%s the reviewed components to the AutoCount VM working area.\n\n" % lead)
+                self.assertIn("deploy_pre_gate_content", _vm_gate_semantic_findings(degraded),
+                              "%r must not evade the step-4 pre-gate rule" % lead)
+
+    def test_a1_step4_pre_gate_whitespace_remains_acceptable(self):
+        # The rule is "no SUBSTANTIVE content", not "no change": harmless blank lines must not
+        # manufacture a finding, or the guard would fail on ordinary Markdown reflow.
+        degraded = self._a1_insert_before_gate(
+            VM_GATE_DEPLOY_STEP, VM_GATE_DEPLOY_MARKER, "\n   \n\n")
+        self.assertNotIn("deploy_pre_gate_content", _vm_gate_semantic_findings(degraded),
+                         "whitespace-only pre-gate padding must stay acceptable")
+
+    # -- B. Step-5 pre-gate region must be BLANK (A4 retires the frozen prefix) -- #
+    # The reviewed-safe prefix existed only because the laptop package build legitimately preceded
+    # the gate. Accepted finding PRRT_kwDOSbJI_s6YQTNV establishes that it never did: reading the
+    # private form response and decision row and mutating the decision store, ledger and package
+    # is gated work, so it now sits AFTER the gate. Nothing legitimate precedes the gate, so the
+    # rule becomes step 4's -- blank -- which is strictly stronger than the digest it replaces.
+    # Every accepted F-1 attack is re-run below against the new rule, so the protection is
+    # carried forward rather than dropped with the mechanism.
+    def _a1_insert_into_pre_gate(self, text):
+        """Insert prose between the step-5 heading line and its gate line."""
+        section = self._a1_step(VM_GATE_PREFLIGHT_STEP)
+        at = self._a1_line_start(section, VM_GATE_PREFLIGHT_MARKER)
+        return self._a1_swap(section, section[:at] + text + section[at:])
+
+    def test_a1_control_step5_pre_123_transfer_and_start_wording_is_detected(self):
+        # The exact regression G4 reproduced: the pre-#123 "build, move it across, run it"
+        # opening restored with vocabulary the old marker list did not know.
+        degraded = self._a1_insert_into_pre_gate(
+            "Build the approved package on the laptop first, transfer it to the VM, then\n"
+            "start the runner in preflight mode.\n\n")
+        self.assertIn("preflight_pre_gate_content", _vm_gate_semantic_findings(degraded),
+                      "an ungated transfer/start instruction before the step-5 gate must fail")
+
+    def test_a1_control_step5_send_and_start_wording_is_detected(self):
+        degraded = self._a1_insert_into_pre_gate(
+            "Send the approved package to the VM and start the runner against AutoCount now.\n\n")
+        self.assertIn("preflight_pre_gate_content", _vm_gate_semantic_findings(degraded),
+                      "an ungated 'Send ... start the runner' instruction must fail")
+
+    def test_a1_control_step5_executable_preflight_moved_before_the_gate_is_detected(self):
+        # Move the REAL executable behaviour ahead of the gate while carefully avoiding every
+        # phrase the old marker list recognised. This is the strongest form of the F-1 bypass.
+        section = self._a1_step(VM_GATE_PREFLIGHT_STEP)
+        moved = ("Move the approved package across to the VM and start the runner:\n\n"
+                 "```powershell\n"
+                 + VM_GATE_PREFLIGHT_RUNNER_ANCHOR + " <package>\n```\n\n")
+        at = self._a1_line_start(section, VM_GATE_PREFLIGHT_MARKER)
+        degraded = self._a1_swap(section, section[:at] + moved + section[at:])
+        self.assertIn("preflight_pre_gate_content", _vm_gate_semantic_findings(degraded),
+                      "an executable preflight moved before the gate must fail closed")
+
+    def test_a1_control_each_unrecognised_verb_in_the_step5_prefix_is_detected(self):
+        for lead in ("transfer", "place", "send", "move", "push", "start"):
+            with self.subTest(lead=lead):
+                degraded = self._a1_insert_into_pre_gate(
+                    "Then %s the package to the AutoCount VM.\n\n" % lead)
+                self.assertIn("preflight_pre_gate_content", _vm_gate_semantic_findings(degraded),
+                              "%r must not evade the step-5 pre-gate rule" % lead)
+
+    def test_a1_step5_pre_gate_is_blank_on_both_authorities(self):
+        # Replaces the retired digest test in the same role: it proves the rule is not vacuous.
+        # Without it, "the pre-gate region is blank" could hold simply because the checker never
+        # located a gate, and every degradation above would be proving nothing.
+        for label, text in (("runbook", self.create_runbook),
+                            ("fixture", VM_GATE_CANONICAL_FIXTURE)):
+            with self.subTest(source=label):
+                section = _numbered_step_section(text, VM_GATE_PREFLIGHT_STEP)
+                at = section.find(VM_GATE_PREFLIGHT_MARKER)
+                self.assertNotEqual(at, -1, "%s must carry the step-5 gate marker" % label)
+                prefix = section[section.find("\n") + 1:section.rfind("\n", 0, at) + 1]
+                self.assertEqual(prefix.strip(), "",
+                                 "%s step-5 pre-gate region must be blank" % label)
+
+    # -- C. F-2: no gate proposition may be satisfied from post-gate prose -- #
+    def test_a1_control_preflight_gate_cannot_borrow_the_post_gate_vm_banner(self):
+        section, gate_side, action = self._a1_split_at_boundary(
+            VM_GATE_PREFLIGHT_STEP, VM_GATE_PREFLIGHT_BOUNDARY)
+        stripped = gate_side.replace(VM_GATE_VM, "the AutoCount VM")
+        self.assertNotIn(VM_GATE_VM, stripped, "every gate-local VM name must be gone")
+        self.assertIn(VM_GATE_VM, action, "the post-gate operational banner must survive intact")
+        degraded = self._a1_swap(section, stripped + action)
+        self.assertIn("preflight_vm_not_named", _vm_gate_semantic_findings(degraded),
+                      "the gate must carry its own VM identity, not borrow the later banner")
+
+    def test_a1_control_no_gate_proposition_is_satisfiable_from_the_action_region(self):
+        for sentence in ("A prior-turn approval is not reusable.",
+                         "Without the named current-turn preflight approval, stop before reading\n"
+                         "the private form response or decision row, before building the package,"
+                         " before setting the\nAutoCount environment, and before transferring the"
+                         " package to the VM or contacting AutoCount."):
+            with self.subTest(sentence=sentence[:40]):
+                section, gate_side, action = self._a1_split_at_boundary(
+                    VM_GATE_PREFLIGHT_STEP, VM_GATE_PREFLIGHT_BOUNDARY)
+                self.assertIn(sentence, gate_side, "the sentence must start inside the gate")
+                degraded = self._a1_swap(
+                    section, gate_side.replace(sentence, "", 1) + action + "\n" + sentence + "\n")
+                self.assertNotEqual(_vm_gate_semantic_findings(degraded), [],
+                                    "relocating %r past the boundary must fail" % sentence[:40])
+
+    # -- D. Real post-gate operation existence -- #
+    def _a1_degrade_action(self, number, boundary, old, new):
+        """Mutate only a step's ACTION region, leaving its gate untouched."""
+        section, gate_side, action = self._a1_split_at_boundary(number, boundary)
+        self.assertIn(old, action, "the action region must carry %r" % (old[:48],))
+        return self._a1_swap(section, gate_side + action.replace(old, new))
+
+    def test_a1_control_removed_preflight_transfer_anchor_fails_closed(self):
+        degraded = self._a1_degrade_action(
+            VM_GATE_PREFLIGHT_STEP, VM_GATE_PREFLIGHT_BOUNDARY,
+            "Copy the package to the VM, then dry-run:", "Then dry-run:")
+        self.assertIn("preflight_operation_missing", _vm_gate_semantic_findings(degraded),
+                      "losing the real transfer instruction must fail closed, never pass")
+
+    def test_a1_control_removed_executable_runner_invocation_fails_closed(self):
+        # The anchor is compared against a lower-cased view, so the mutation has to use the
+        # document's own spelling; asserting the two agree keeps them from drifting apart.
+        verbatim = "& scripts\\ac2_member_create_uat_runner.ps1 -PackagePath"
+        self.assertIn(VM_GATE_PREFLIGHT_RUNNER_ANCHOR, _flat(verbatim).lower(),
+                      "the verbatim invocation must normalise to the declared anchor")
+        degraded = self._a1_degrade_action(
+            VM_GATE_PREFLIGHT_STEP, VM_GATE_PREFLIGHT_BOUNDARY, verbatim, "& <the runner>")
+        self.assertIn("preflight_runner_invocation_missing", _vm_gate_semantic_findings(degraded),
+                      "the summary sentence must not stand in for the real invocation")
+
+    def test_a1_control_each_removed_deployment_action_file_fails_closed(self):
+        for path in VM_GATE_DEPLOY_ACTION_FILES:
+            with self.subTest(path=path):
+                degraded = self._a1_degrade_action(
+                    VM_GATE_DEPLOY_STEP, VM_GATE_DEPLOY_BOUNDARY, path, "the reviewed component")
+                self.assertIn("deploy_operation_missing", _vm_gate_semantic_findings(degraded),
+                              "%s must remain a real deployed component" % path)
+
+    def test_a1_control_gate_prose_copies_do_not_satisfy_deployment_anchors(self):
+        # Each path is named twice: once in the approval bullets, once in the real instruction.
+        # Only the second is the operation, so the first must not answer for it.
+        section, gate_side, action = self._a1_split_at_boundary(
+            VM_GATE_DEPLOY_STEP, VM_GATE_DEPLOY_BOUNDARY)
+        for path in VM_GATE_DEPLOY_ACTION_FILES:
+            self.assertIn(path, gate_side, "%s must stay in the approval prose" % path)
+        stripped = action
+        for path in VM_GATE_DEPLOY_ACTION_FILES:
+            stripped = stripped.replace(path, "the reviewed component")
+        degraded = self._a1_swap(section, gate_side + stripped)
+        self.assertIn("deploy_operation_missing", _vm_gate_semantic_findings(degraded),
+                      "approval prose copies must not satisfy the action-region anchors")
+
+    def test_a1_control_removed_state_directory_preparation_fails_closed(self):
+        degraded = self._a1_degrade_action(
+            VM_GATE_DEPLOY_STEP, VM_GATE_DEPLOY_BOUNDARY,
+            'New-Item -ItemType Directory -Path "C:\\XB\\create_uat\\state"',
+            "New-Item -ItemType Directory -Path <somewhere>")
+        self.assertIn("deploy_state_preparation_missing", _vm_gate_semantic_findings(degraded),
+                      "losing the state preparation must fail closed")
+
+    # -- E. Gate-marker and action-boundary integrity -- #
+    def test_a1_control_duplicate_deployment_gate_marker_fails_closed(self):
+        degraded = self._a1_insert_before_gate(
+            VM_GATE_DEPLOY_STEP, VM_GATE_DEPLOY_MARKER,
+            "The deployment gate is restated below.\n\n")
+        self.assertIn("deploy_gate_marker_ambiguous", _vm_gate_semantic_findings(degraded),
+                      "two gate markers must fail closed, not silently pick one")
+
+    def test_a1_control_duplicate_preflight_gate_marker_fails_closed(self):
+        section, gate_side, action = self._a1_split_at_boundary(
+            VM_GATE_PREFLIGHT_STEP, VM_GATE_PREFLIGHT_BOUNDARY)
+        degraded = self._a1_swap(
+            section, gate_side + action + "\nSee the preflight gate above.\n")
+        self.assertIn("preflight_gate_marker_ambiguous", _vm_gate_semantic_findings(degraded),
+                      "two gate markers must fail closed, not silently pick one")
+
+    def test_a1_control_missing_deployment_boundary_fails_closed(self):
+        degraded = self._a1_degrade_action(
+            VM_GATE_DEPLOY_STEP, VM_GATE_DEPLOY_BOUNDARY,
+            VM_GATE_DEPLOY_BOUNDARY, "Transfer the reviewed")
+        self.assertIn("deploy_boundary_missing", _vm_gate_semantic_findings(degraded),
+                      "a reworded action boundary must fail closed")
+
+    def test_a1_control_duplicate_deployment_boundary_fails_closed(self):
+        section, gate_side, action = self._a1_split_at_boundary(
+            VM_GATE_DEPLOY_STEP, VM_GATE_DEPLOY_BOUNDARY)
+        degraded = self._a1_swap(section, gate_side + action + "\n" + VM_GATE_DEPLOY_BOUNDARY
+                                 + " components again.\n")
+        self.assertIn("deploy_boundary_ambiguous", _vm_gate_semantic_findings(degraded),
+                      "an ambiguous action boundary must fail closed")
+
+    def test_a1_control_missing_preflight_boundary_fails_closed(self):
+        degraded = self._a1_degrade_action(
+            VM_GATE_PREFLIGHT_STEP, VM_GATE_PREFLIGHT_BOUNDARY,
+            VM_GATE_PREFLIGHT_BOUNDARY, "**`AUTOCOUNT VM`**")
+        self.assertIn("preflight_boundary_missing", _vm_gate_semantic_findings(degraded),
+                      "a reworded operational banner must fail closed")
+
+    def test_a1_control_duplicate_preflight_boundary_fails_closed(self):
+        section, gate_side, action = self._a1_split_at_boundary(
+            VM_GATE_PREFLIGHT_STEP, VM_GATE_PREFLIGHT_BOUNDARY)
+        degraded = self._a1_swap(section, gate_side + action + "\n"
+                                 + VM_GATE_PREFLIGHT_BOUNDARY + " Repeat as needed.\n")
+        self.assertIn("preflight_boundary_ambiguous", _vm_gate_semantic_findings(degraded),
+                      "an ambiguous action boundary must fail closed")
+
+    def test_a1_control_deployment_boundary_before_its_gate_fails_closed(self):
+        section, gate_side, action = self._a1_split_at_boundary(
+            VM_GATE_DEPLOY_STEP, VM_GATE_DEPLOY_BOUNDARY)
+        head, _, rest = section.partition("\n")
+        degraded = self._a1_swap(section, head + "\n\n" + action + "\n" + rest)
+        self.assertIn("deploy_gate_after_mutation", _vm_gate_semantic_findings(degraded),
+                      "an action boundary before its gate must fail closed")
+
+    def test_a1_control_preflight_boundary_before_its_gate_fails_closed(self):
+        section, gate_side, action = self._a1_split_at_boundary(
+            VM_GATE_PREFLIGHT_STEP, VM_GATE_PREFLIGHT_BOUNDARY)
+        head, _, rest = section.partition("\n")
+        degraded = self._a1_swap(section, head + "\n\n" + action + "\n" + rest)
+        self.assertIn("preflight_gate_after_external_action", _vm_gate_semantic_findings(degraded),
+                      "an action boundary before its gate must fail closed")
+
+    # ---- DL-XB-123-001-A2: numbered-step identity is structural authority ---- #
+    # Two accepted final-G4 findings, both demonstrated as false CLEANS rather than as
+    # merely-weak checks:
+    #
+    #   F-3 -- a SECOND `### 4. ` or `### 5. ` section ORPHANS whatever it contains. The section
+    #          bound silently takes the FIRST target heading and closes at the next numbered
+    #          heading, so an ungated external instruction can sit in the duplicate while the
+    #          genuine section stays perfectly compliant and the oracle reports clean.
+    #   F-4 -- the numbered heading LINE is excluded from both pre-gate authorities (step 4's
+    #          blank-body rule and step 5's frozen prefix digest), so actionable external wording
+    #          can ride in the heading itself and still precede the gate.
+    #
+    # Duplication is ambiguity even when the duplicate prose is harmless: once the target number
+    # appears twice, "which section is authoritative" has no answer, and guessing is precisely
+    # what made F-3 invisible. Fail closed and make the editor disambiguate.
+    def _a2_duplicate_step(self, number, rogue):
+        """Append a SECOND same-number section immediately after the genuine one."""
+        section = self._a1_step(number)
+        self.assertTrue(rogue.startswith("### %d. " % number),
+                        "the rogue section must reuse the same step number")
+        return self._a1_swap(section, section + rogue)
+
+    def _a2_retitle_step(self, number, heading):
+        """Rewrite ONLY a step's numbered heading line, leaving the whole body compliant."""
+        section = self._a1_step(number)
+        reviewed = section.partition("\n")[0]
+        self.assertEqual(reviewed, VM_GATE_REVIEWED_HEADINGS[number],
+                         "the fixture must start from the reviewed heading line")
+        self.assertNotEqual(heading, reviewed, "the retitle must actually change the heading")
+        return self._a1_swap(section, heading + section[len(reviewed):])
+
+    # -- A/B. A duplicate target step carrying a genuinely unsafe external instruction -- #
+    def test_a2_control_duplicate_deployment_step_hiding_an_ungated_action_fails_closed(self):
+        degraded = self._a2_duplicate_step(
+            VM_GATE_DEPLOY_STEP,
+            "### 4. Deploy the inactive UAT components (revised)\n\n"
+            "Push the reviewed runner onto DESKTOP-4I042L6 immediately, before obtaining\n"
+            "approval.\n\n")
+        self.assertIn("deploy_step_ambiguous", _vm_gate_semantic_findings(degraded),
+                      "a second Step 4 must never orphan an ungated VM deployment")
+
+    def test_a2_control_duplicate_preflight_step_hiding_an_ungated_action_fails_closed(self):
+        degraded = self._a2_duplicate_step(
+            VM_GATE_PREFLIGHT_STEP,
+            "### 5. No-write preflight (dry-run) (revised)\n\n"
+            "Transfer the approved package to DESKTOP-4I042L6 and start the runner now,\n"
+            "without any approval.\n\n")
+        self.assertIn("preflight_step_ambiguous", _vm_gate_semantic_findings(degraded),
+                      "a second Step 5 must never orphan an ungated transfer or dry-run")
+
+    # -- C. Harmless duplication is still ambiguous authority -- #
+    def test_a2_control_harmlessly_duplicated_target_step_still_fails_closed(self):
+        for number, prefix, rogue in (
+                (VM_GATE_DEPLOY_STEP, "deploy",
+                 "### 4. Deploy the inactive UAT components (notes)\n\nNothing to add.\n\n"),
+                (VM_GATE_PREFLIGHT_STEP, "preflight",
+                 "### 5. No-write preflight (dry-run) (notes)\n\nNothing to add.\n\n")):
+            with self.subTest(step=number):
+                degraded = self._a2_duplicate_step(number, rogue)
+                self.assertIn(prefix + "_step_ambiguous", _vm_gate_semantic_findings(degraded),
+                              "ambiguous numbered-step authority must fail closed even when the "
+                              "duplicate itself is harmless")
+
+    # -- D/E. An actionable heading is an ungated instruction ahead of the gate -- #
+    def test_a2_control_actionable_deployment_heading_fails_closed(self):
+        degraded = self._a2_retitle_step(
+            VM_GATE_DEPLOY_STEP, "### 4. Push the runner onto DESKTOP-4I042L6 immediately")
+        self.assertIn("deploy_heading_changed", _vm_gate_semantic_findings(degraded),
+                      "the heading must not be usable as an ungated operational instruction")
+
+    def test_a2_control_actionable_preflight_heading_fails_closed(self):
+        degraded = self._a2_retitle_step(
+            VM_GATE_PREFLIGHT_STEP,
+            "### 5. Send the package to DESKTOP-4I042L6 and preflight it")
+        self.assertIn("preflight_heading_changed", _vm_gate_semantic_findings(degraded),
+                      "the heading must not be usable as an ungated operational instruction")
+
+    # -- F. Ordinary heading drift. Fail-closed is the intended answer: the reviewed heading is
+    # the authority, and a re-titled step comes back through a reviewed amendment. -- #
+    def test_a2_control_every_reviewed_heading_drift_fails_closed(self):
+        drifts = (
+            (VM_GATE_DEPLOY_STEP, "deploy", "case",
+             "### 4. deploy the inactive uat components"),
+            (VM_GATE_DEPLOY_STEP, "deploy", "punctuation",
+             "### 4. Deploy the inactive UAT components."),
+            (VM_GATE_DEPLOY_STEP, "deploy", "wording",
+             "### 4. Deploy the UAT components"),
+            (VM_GATE_PREFLIGHT_STEP, "preflight", "case",
+             "### 5. NO-WRITE PREFLIGHT (DRY-RUN)"),
+            (VM_GATE_PREFLIGHT_STEP, "preflight", "punctuation",
+             "### 5. No write preflight (dry run)"),
+            (VM_GATE_PREFLIGHT_STEP, "preflight", "wording",
+             "### 5. Preflight the approved package"),
+        )
+        for number, prefix, kind, heading in drifts:
+            with self.subTest(step=number, drift=kind):
+                degraded = self._a2_retitle_step(number, heading)
+                self.assertIn(prefix + "_heading_changed", _vm_gate_semantic_findings(degraded),
+                              "%s drift in the Step-%d heading must fail closed" % (kind, number))
+
+    # -- G. The exact reviewed headings stay clean, and stay tied to the real runbook -- #
+    def test_a2_reviewed_headings_match_the_live_runbook_exactly_once_each(self):
+        lines = self.create_runbook.splitlines()
+        for number, heading in VM_GATE_REVIEWED_HEADINGS.items():
+            with self.subTest(step=number):
+                opened = [line for line in lines if line.startswith("### %d. " % number)]
+                self.assertEqual(opened, [heading],
+                                 "the runbook must open Step %d exactly once, with the reviewed "
+                                 "heading line" % number)
+
+    def test_a2_exact_reviewed_headings_remain_clean(self):
+        # The control group for every A2 mutation above: unmutated headings must report nothing,
+        # otherwise "a finding appeared" would prove nothing about the mutation.
+        self.assertEqual(_vm_gate_semantic_findings(VM_GATE_CANONICAL_FIXTURE), [],
+                         "the reviewed headings must leave the fixture compliant")
+        for number, heading in VM_GATE_REVIEWED_HEADINGS.items():
+            with self.subTest(step=number):
+                self.assertEqual(_numbered_step_section(
+                    VM_GATE_CANONICAL_FIXTURE, number).partition("\n")[0], heading)
+
+    # ---- DL-XB-123-001-A3: CommonMark numbered-ATX opening authority ---- #
+    # Accepted final-G4-A2 finding, demonstrated as a false CLEAN rather than a merely-weak check:
+    # numbered-step discovery recognised only the column-0, single-space spelling, so a duplicate
+    # Step 4 or Step 5 written in any other CommonMark-valid form was INVISIBLE to enumeration.
+    # An invisible duplicate is worse than a mis-parsed one: its body is absorbed into the
+    # neighbouring section's action region, where only presence checks run, so an ungated
+    # deployment or transfer instruction rides along while the oracle returns no findings at all.
+    #
+    # Every control below runs against BOTH authorities -- the in-memory fixture and the live
+    # create-UAT runbook -- because a bypass that only the miniature fixture exhibits would not
+    # prove anything about the document the operator actually follows.
+    def _a3_bases(self):
+        return (("canonical fixture", VM_GATE_CANONICAL_FIXTURE),
+                ("live create-UAT runbook", self.create_runbook))
+
+    def _a3_span(self, text, number):
+        """Half-open offsets of the genuine numbered section inside its own document."""
+        section = _numbered_step_section(text, number)
+        self.assertNotEqual(section, "", "step %d must exist in the base document" % number)
+        at = text.find(section)
+        self.assertNotEqual(at, -1, "step %d's section must locate in its own document" % number)
+        return at, at + len(section)
+
+    def _a3_assert_carries_no_landmark(self, rogue):
+        """The rogue must not carry a gate marker or an action boundary.
+
+        Those landmarks have findings of their own. A duplicate that smuggled one in could make a
+        control pass through ``*_gate_marker_ambiguous`` or ``*_boundary_ambiguous`` while the
+        opening-enumeration defect this contract is about stayed wide open.
+        """
+        prose = _flat(rogue).lower()
+        for landmark in (VM_GATE_DEPLOY_MARKER, VM_GATE_PREFLIGHT_MARKER,
+                         VM_GATE_DEPLOY_BOUNDARY, VM_GATE_PREFLIGHT_BOUNDARY):
+            self.assertNotIn(_flat(landmark).lower(), prose,
+                             "an A3 duplicate must not borrow the %r landmark" % (landmark,))
+
+    def _a3_duplicate(self, text, number, template, body, placement):
+        """Insert a SECOND same-number section, spelled with a CommonMark-valid opening."""
+        rogue = "%s\n\n%s\n" % (template % (number, VM_GATE_A3_DUPLICATE_TITLES[number]), body)
+        self._a3_assert_carries_no_landmark(rogue)
+        start, end = self._a3_span(text, number)
+        at = end if placement == VM_GATE_A3_AFTER else start
+        degraded = text[:at] + rogue + text[at:]
+        self.assertNotEqual(degraded, text, "the A3 duplicate must actually change the document")
+        return degraded
+
+    def _a3_heading_span(self, text, number):
+        """Offsets and text of the genuine heading LINE, proven to be the reviewed one."""
+        start, _ = self._a3_span(text, number)
+        line_end = text.find("\n", start)
+        self.assertNotEqual(line_end, -1, "the heading line must terminate")
+        reviewed = text[start:line_end]
+        self.assertEqual(reviewed, VM_GATE_REVIEWED_HEADINGS[number],
+                         "the base must start from the reviewed heading line")
+        return start, line_end, reviewed
+
+    def _a3_reheaded_line(self, text, number, line):
+        """Replace the SINGLE genuine heading line, leaving the whole body untouched."""
+        start, line_end, reviewed = self._a3_heading_span(text, number)
+        self.assertNotEqual(line, reviewed, "the respelling must actually change the line")
+        return text[:start] + line + text[line_end:]
+
+    def _a3_reheaded(self, text, number, template):
+        """Respell the genuine heading, preserving its reviewed TITLE exactly."""
+        _, _, reviewed = self._a3_heading_span(text, number)
+        title = reviewed[len("### %d. " % number):]
+        return self._a3_reheaded_line(text, number, template % (number, title))
+
+    # -- A. Every CommonMark-valid duplicate family, both steps, both placements, unsafe and
+    # harmless. This is the accepted finding itself: each of these reported NO findings before
+    # the repair, including the ones carrying an explicit ungated external action. -- #
+    def test_a3_control_every_commonmark_duplicate_family_fails_closed(self):
+        for base_name, base in self._a3_bases():
+            for number, prefix in ((VM_GATE_DEPLOY_STEP, "deploy"),
+                                   (VM_GATE_PREFLIGHT_STEP, "preflight")):
+                for variant, template in VM_GATE_A3_DUPLICATE_HEADINGS:
+                    for safety, body in (("unsafe", VM_GATE_A3_UNSAFE_BODIES[number]),
+                                         ("harmless", VM_GATE_A3_HARMLESS_BODY)):
+                        for placement in VM_GATE_A3_PLACEMENTS:
+                            with self.subTest(base=base_name, step=number, variant=variant,
+                                              safety=safety, placement=placement):
+                                degraded = self._a3_duplicate(base, number, template, body,
+                                                              placement)
+                                self.assertIn(
+                                    prefix + "_step_ambiguous", _vm_gate_semantic_findings(degraded),
+                                    "a CommonMark-valid second Step %d must never orphan an "
+                                    "instruction" % number)
+
+    # -- B. The strict form must keep failing closed. A widened grammar that lost the spelling it
+    # already recognised would trade one bypass for another. -- #
+    def test_a3_strict_duplicate_family_still_fails_closed(self):
+        for base_name, base in self._a3_bases():
+            for number, prefix in ((VM_GATE_DEPLOY_STEP, "deploy"),
+                                   (VM_GATE_PREFLIGHT_STEP, "preflight")):
+                for placement in VM_GATE_A3_PLACEMENTS:
+                    with self.subTest(base=base_name, step=number, placement=placement):
+                        degraded = self._a3_duplicate(base, number, VM_GATE_A3_STRICT_HEADING,
+                                                      VM_GATE_A3_UNSAFE_BODIES[number], placement)
+                        self.assertIn(prefix + "_step_ambiguous", _vm_gate_semantic_findings(degraded),
+                                      "the strict duplicate family must stay closed")
+
+    # -- C. A mixture of spellings is still one ambiguous step, not a majority vote. -- #
+    def test_a3_mixed_strict_and_whitespace_openings_are_ambiguous(self):
+        for base_name, base in self._a3_bases():
+            for number, prefix in ((VM_GATE_DEPLOY_STEP, "deploy"),
+                                   (VM_GATE_PREFLIGHT_STEP, "preflight")):
+                with self.subTest(base=base_name, step=number):
+                    once = self._a3_duplicate(base, number, VM_GATE_A3_STRICT_HEADING,
+                                              VM_GATE_A3_HARMLESS_BODY, VM_GATE_A3_AFTER)
+                    twice = self._a3_duplicate(once, number, "   ### %d. %s",
+                                               VM_GATE_A3_UNSAFE_BODIES[number],
+                                               VM_GATE_A3_BEFORE)
+                    self.assertIn(prefix + "_step_ambiguous", _vm_gate_semantic_findings(twice),
+                                  "three openings in two spellings must fail closed")
+
+    # -- D. Four leading spaces is an indented code block. Code indentation must NOT be promoted
+    # into top-level heading authority, or ordinary sample Markdown would break the contract. -- #
+    def test_a3_four_leading_space_form_is_not_top_level_heading_authority(self):
+        for base_name, base in self._a3_bases():
+            for number in (VM_GATE_DEPLOY_STEP, VM_GATE_PREFLIGHT_STEP):
+                for placement in VM_GATE_A3_PLACEMENTS:
+                    with self.subTest(base=base_name, step=number, placement=placement):
+                        degraded = self._a3_duplicate(base, number,
+                                                      VM_GATE_A3_CODE_BLOCK_HEADING,
+                                                      VM_GATE_A3_HARMLESS_BODY, placement)
+                        findings = _vm_gate_semantic_findings(degraded)
+                        # The proposition, stated directly: the indented form carries no heading
+                        # authority at all, for either step.
+                        for prefix in ("deploy", "preflight"):
+                            for key in ("_step_ambiguous", "_step_missing", "_heading_changed",
+                                        "_gate_missing", "_boundary_missing"):
+                                self.assertNotIn(prefix + key, findings,
+                                                 "a four-space indented code line must not open a "
+                                                 "top-level numbered step")
+                        # A6: two of the three placements land inside a reviewed ACTION region, and
+                        # adding any text there fails closed by design -- that is the A6-F1 contract,
+                        # not a regression. So the action identities are the ONLY findings this
+                        # control may ever see; anything else is still a failure.
+                        self.assertEqual(set(findings) - set(VM_GATE_A6_ACTION_KEYS.values()), set(),
+                                         "the indented form may only ever change reviewed action "
+                                         "text, never any other part of the contract")
+
+    # -- E. One genuine heading, respelled. Semantically identical means clean. -- #
+    def test_a3_whitespace_only_respelling_of_the_genuine_heading_stays_clean(self):
+        for base_name, base in self._a3_bases():
+            for number in (VM_GATE_DEPLOY_STEP, VM_GATE_PREFLIGHT_STEP):
+                for variant, template in VM_GATE_A3_SEMANTIC_HEADING_VARIANTS:
+                    with self.subTest(base=base_name, step=number, variant=variant):
+                        respelled = self._a3_reheaded(base, number, template)
+                        self.assertEqual(_vm_gate_semantic_findings(respelled), [],
+                                         "a whitespace-only respelling of the reviewed Step-%d "
+                                         "heading is not drift" % number)
+
+    # -- F. Substantive drift still fails closed, whatever spelling it wears. -- #
+    def test_a3_substantive_heading_drift_still_fails_closed(self):
+        for base_name, base in self._a3_bases():
+            for number, prefix in ((VM_GATE_DEPLOY_STEP, "deploy"),
+                                   (VM_GATE_PREFLIGHT_STEP, "preflight")):
+                for kind, template in VM_GATE_A3_DRIFT_HEADINGS[number]:
+                    with self.subTest(base=base_name, step=number, drift=kind):
+                        drifted = self._a3_reheaded_line(base, number, template % number)
+                        self.assertIn(prefix + "_heading_changed", _vm_gate_semantic_findings(drifted),
+                                      "%s drift in the Step-%d heading must fail closed"
+                                      % (kind, number))
+
+    # -- G. The control group: the reviewed headings, untouched, stay clean on both authorities.
+    # Without this every "a finding appeared" above would prove nothing. -- #
+    def test_a3_exact_reviewed_headings_remain_clean_on_both_authorities(self):
+        for base_name, base in self._a3_bases():
+            with self.subTest(base=base_name):
+                self.assertEqual(_vm_gate_semantic_findings(base), [],
+                                 "the undegraded base must satisfy the whole contract")
+
+    # ---- DL-XB-123-001-A4: post-ready Codex review remediation controls ---- #
+    # Every control below is exercised against BOTH authorities: the A4 target fixture and the
+    # live create-UAT runbook. At this commit neither satisfies the A4 contract -- the runbook is
+    # still the head-23ddf88 shape and the checker still carries the six accepted defects -- so
+    # these are the intentional RED. Commit J moves the Step-5 gate, retires the frozen prefix
+    # and repairs the checker, and every control here turns GREEN without being rewritten.
+    def _a4_bases(self):
+        return (("canonical fixture", VM_GATE_CANONICAL_FIXTURE),
+                ("live create-UAT runbook", self.create_runbook))
+
+    def _a4_section(self, base, number):
+        section = _numbered_step_section(base, number)
+        self.assertNotEqual(section, "", "step %d must exist in the base document" % number)
+        return section
+
+    def _a4_swap(self, base, section, mutated):
+        self.assertNotEqual(mutated, section, "the degraded step must actually differ")
+        degraded = base.replace(section, mutated, 1)
+        self.assertNotEqual(degraded, base, "the degraded document must actually differ")
+        return degraded
+
+    def _a4_gate_line(self, section, marker):
+        """Start of the line the gate opens on, so an insertion lands strictly before it."""
+        at = section.find(marker)
+        self.assertNotEqual(at, -1, "the %r gate marker must exist" % (marker,))
+        return section.rfind("\n", 0, at) + 1
+
+    def _a4_insert_before_gate(self, base, number, marker, text):
+        section = self._a4_section(base, number)
+        at = self._a4_gate_line(section, marker)
+        return self._a4_swap(base, section, section[:at] + text + section[at:])
+
+    def _a4_move_before_gate(self, base, snippet):
+        """Move one real Step-5 operation from the action region to ahead of the gate.
+
+        The snippet must START in the post-gate region: an operation that is already ungated is
+        the defect itself, not a control, so the assertion below is deliberately load-bearing.
+        """
+        section = self._a4_section(base, VM_GATE_PREFLIGHT_STEP)
+        at = self._a4_gate_line(section, VM_GATE_PREFLIGHT_MARKER)
+        self.assertIn(snippet, section[at:],
+                      "the Step-5 action region must carry %r" % (snippet[:56],))
+        body = section[at:].replace(snippet, "", 1)
+        return self._a4_swap(base, section, section[:at] + snippet + "\n\n" + body)
+
+    # -- A. The Step-5 gate must precede every private-data, package, environment and external
+    # action. Accepted findings PRRT_kwDOSbJI_s6YQTNV and PRRT_kwDOSbJI_s6YQTMq. -- #
+    def test_a4_control_any_step5_pre_gate_content_fails_closed(self):
+        # The same structural rule Step 4 already carries, and the reason the frozen prefix can
+        # be retired: once nothing legitimate precedes the gate, "blank" is the whole contract
+        # and no vocabulary, digest or case-folding question arises at all.
+        for base_name, base in self._a4_bases():
+            for lead in ("Build", "Approve", "Read the chosen form response and", "Transfer",
+                         "As a preparatory note,"):
+                with self.subTest(base=base_name, lead=lead):
+                    degraded = self._a4_insert_before_gate(
+                        base, VM_GATE_PREFLIGHT_STEP, VM_GATE_PREFLIGHT_MARKER,
+                        "%s the approved package for the chosen row now.\n\n" % lead)
+                    self.assertIn("preflight_pre_gate_content", _vm_gate_semantic_findings(degraded),
+                                  "%r before the Step-5 gate must fail closed" % lead)
+
+    def test_a4_control_each_step5_operation_moved_before_the_gate_fails_closed(self):
+        operations = (
+            ("package approval", VM_GATE_A4_APPROVE_COMMAND),
+            ("package build", VM_GATE_A4_BUILD_COMMAND),
+            ("environment setup", VM_GATE_A4_ENV_ANCHOR),
+            ("package transfer", "Copy the package to the VM"),
+            ("dry-run runner", r"& scripts\ac2_member_create_uat_runner.ps1 -PackagePath"),
+        )
+        for base_name, base in self._a4_bases():
+            for label, snippet in operations:
+                with self.subTest(base=base_name, operation=label):
+                    degraded = self._a4_move_before_gate(base, snippet)
+                    self.assertIn("preflight_pre_gate_content", _vm_gate_semantic_findings(degraded),
+                                  "an ungated %s must fail closed" % label)
+
+    def test_a4_step5_pre_gate_whitespace_remains_acceptable(self):
+        # "No SUBSTANTIVE content", not "no change", exactly as Step 4 already reads. Without
+        # this the guard would fire on ordinary Markdown reflow and invite being switched off.
+        for base_name, base in self._a4_bases():
+            with self.subTest(base=base_name):
+                degraded = self._a4_insert_before_gate(
+                    base, VM_GATE_PREFLIGHT_STEP, VM_GATE_PREFLIGHT_MARKER, "\n   \n\n")
+                self.assertNotIn("preflight_pre_gate_content", _vm_gate_semantic_findings(degraded),
+                                 "whitespace-only Step-5 pre-gate padding must stay acceptable")
+
+    # -- B. Approval polarity must be affirmative. Accepted finding PRRT_kwDOSbJI_s6YQTNO. -- #
+    def _a4_invert_polarity(self, base, number, boundary, replacement):
+        section = self._a4_section(base, number)
+        split = section.find(boundary)
+        self.assertNotEqual(split, -1, "the %r action boundary must exist" % (boundary,))
+        gate = section[:split]
+        # Matched wrap-tolerantly: the reviewed clause spans a Markdown line break, and it breaks
+        # in a different place in each gate, so a literal search would silently test nothing.
+        pattern = re.compile(r"\s+".join(re.escape(word)
+                                         for word in VM_GATE_A4_AFFIRMED_CLAUSE.split()))
+        inverted, count = pattern.subn(replacement, gate, 1)
+        self.assertEqual(count, 1,
+                         "the step-%d gate must state the reviewed affirmative clause" % number)
+        return self._a4_swap(base, section, inverted + section[split:])
+
+    def test_a4_control_negated_deployment_approval_fails_closed(self):
+        for base_name, base in self._a4_bases():
+            for kind, replacement in VM_GATE_A4_POLARITY_INVERSIONS:
+                with self.subTest(base=base_name, inversion=kind):
+                    degraded = self._a4_invert_polarity(
+                        base, VM_GATE_DEPLOY_STEP, VM_GATE_DEPLOY_BOUNDARY, replacement)
+                    self.assertIn("deploy_not_current_turn", _vm_gate_semantic_findings(degraded),
+                                  "a negated step-4 approval (%s) must fail closed" % kind)
+
+    def test_a4_control_negated_preflight_approval_fails_closed(self):
+        for base_name, base in self._a4_bases():
+            for kind, replacement in VM_GATE_A4_POLARITY_INVERSIONS:
+                with self.subTest(base=base_name, inversion=kind):
+                    degraded = self._a4_invert_polarity(
+                        base, VM_GATE_PREFLIGHT_STEP, VM_GATE_A4_PREFLIGHT_BOUNDARY, replacement)
+                    self.assertIn("preflight_not_current_turn", _vm_gate_semantic_findings(degraded),
+                                  "a negated step-5 approval (%s) must fail closed" % kind)
+
+    # -- C. Safety-boundary authority must be unique. Accepted finding PRRT_kwDOSbJI_s6YQTMw. -- #
+    def test_a4_control_missing_safety_boundary_fails_closed(self):
+        for base_name, base in self._a4_bases():
+            with self.subTest(base=base_name):
+                at = base.find(VM_GATE_SAFETY_HEADING)
+                self.assertNotEqual(at, -1, "the base must carry a Safety boundary")
+                self.assertIn("safety_boundary_surfaces_incomplete", _vm_gate_semantic_findings(base[:at]),
+                              "a document with no Safety boundary must fail closed")
+
+    def _a4_duplicate_safety_boundary(self, base, second):
+        at = base.find(VM_GATE_SAFETY_HEADING)
+        self.assertNotEqual(at, -1, "the base must carry a Safety boundary")
+        end = base.find("\n## ", at + 1)
+        genuine = base[at:] if end == -1 else base[at:end]
+        return base[:at] + genuine.rstrip("\n") + "\n\n" + second + "\n"
+
+    def test_a4_control_duplicate_identical_safety_boundary_fails_closed(self):
+        # A harmless duplicate fails closed for the same reason a duplicate numbered step does:
+        # once the authority appears twice there is no answer to which one governs, and guessing
+        # is precisely the defect. Reading only the first occurrence is what Codex reproduced.
+        for base_name, base in self._a4_bases():
+            with self.subTest(base=base_name):
+                at = base.find(VM_GATE_SAFETY_HEADING)
+                end = base.find("\n## ", at + 1)
+                genuine = (base[at:] if end == -1 else base[at:end]).rstrip("\n")
+                degraded = self._a4_duplicate_safety_boundary(base, genuine)
+                self.assertIn("safety_boundary_ambiguous", _vm_gate_semantic_findings(degraded),
+                              "a duplicated Safety boundary must fail closed")
+
+    def test_a4_control_duplicate_contradictory_safety_boundary_fails_closed(self):
+        # The dangerous form: the second boundary weakens the four independent surfaces, and the
+        # first one keeps the checker clean.
+        contradictory = (
+            "## Safety boundary\n\n"
+            "- The step-4 VM deployment approval also covers the step-5 package transfer and\n"
+            "  no-write preflight, and a prior-turn approval may be reused for either.\n")
+        for base_name, base in self._a4_bases():
+            with self.subTest(base=base_name):
+                degraded = self._a4_duplicate_safety_boundary(base, contradictory)
+                self.assertIn("safety_boundary_ambiguous", _vm_gate_semantic_findings(degraded),
+                              "a contradictory second Safety boundary must fail closed")
+
+    # -- D. Required operations must be ACTIVE executable commands, with the case sensitivity of
+    # the tool that runs them. Accepted findings PRRT_kwDOSbJI_s6YQTM_ and PRRT_kwDOSbJI_s6YQTM4.
+    def _a4_comment_out(self, base, number, command):
+        section = self._a4_section(base, number)
+        self.assertIn(command, section, "step %d must carry %r" % (number, command[:56]))
+        return self._a4_swap(base, section, section.replace(command, "# " + command, 1))
+
+    def test_a4_control_commented_out_commands_fail_closed(self):
+        commands = (
+            (VM_GATE_PREFLIGHT_STEP, "package approval", VM_GATE_A4_APPROVE_COMMAND,
+             "preflight_approval_command_missing"),
+            (VM_GATE_PREFLIGHT_STEP, "package build", VM_GATE_A4_BUILD_COMMAND,
+             "preflight_package_build_missing"),
+            (VM_GATE_PREFLIGHT_STEP, "dry-run runner",
+             r"& scripts\ac2_member_create_uat_runner.ps1 -PackagePath",
+             "preflight_runner_invocation_missing"),
+            (VM_GATE_DEPLOY_STEP, "state preparation",
+             'New-Item -ItemType Directory -Path "C:\\XB\\create_uat\\state"',
+             "deploy_state_preparation_missing"),
+        )
+        for base_name, base in self._a4_bases():
+            for number, label, command, key in commands:
+                with self.subTest(base=base_name, command=label):
+                    degraded = self._a4_comment_out(base, number, command)
+                    self.assertIn(key, _vm_gate_semantic_findings(degraded),
+                                  "a commented-out %s must fail closed" % label)
+
+    def test_a4_control_case_changed_python_cli_flag_fails_closed(self):
+        # `member_create_uat_approval.py` is argparse: `--INPUT` is simply not `--input`, so a
+        # region lowercased before comparison cannot see the break. The PowerShell runner is
+        # deliberately excluded -- its parameter names really are case-insensitive, and pretending
+        # otherwise would be a false contract rather than a stronger one.
+        mutations = ((VM_GATE_A4_APPROVE_COMMAND, "preflight_approval_command_missing"),
+                     (VM_GATE_A4_BUILD_COMMAND, "preflight_package_build_missing"))
+        for base_name, base in self._a4_bases():
+            for command, key in mutations:
+                with self.subTest(base=base_name, command=command[:64]):
+                    section = self._a4_section(base, VM_GATE_PREFLIGHT_STEP)
+                    self.assertIn(command, section, "step 5 must carry %r" % (command[:56],))
+                    mutated = command.replace("--input", "--INPUT", 1)
+                    self.assertNotEqual(mutated, command, "the flag must actually change case")
+                    degraded = self._a4_swap(base, section,
+                                             section.replace(command, mutated, 1))
+                    self.assertIn(key, _vm_gate_semantic_findings(degraded),
+                                  "`--input` -> `--INPUT` must fail closed")
+
+    def test_a4_active_commands_remain_clean(self):
+        # The control group for section D. Without it, "a finding appeared" above would not
+        # distinguish an active-command rule from a rule that rejects the real document too.
+        for base_name, base in self._a4_bases():
+            with self.subTest(base=base_name):
+                self.assertEqual(_vm_gate_semantic_findings(base), [],
+                                 "the undegraded base must satisfy the whole A4 contract")
+
+    # -- E. The AutoCount environment configuration is bound by the gate and performed after it,
+    # by variable NAME only. Accepted finding PRRT_kwDOSbJI_s6YQTMq. -- #
+    def test_a4_control_each_removed_environment_variable_name_fails_closed(self):
+        for base_name, base in self._a4_bases():
+            for name in VM_GATE_A4_ENV_NAMES:
+                with self.subTest(base=base_name, variable=name):
+                    section = self._a4_section(base, VM_GATE_PREFLIGHT_STEP)
+                    self.assertIn(name, section,
+                                  "step 5 must name the %s connection variable" % name)
+                    degraded = self._a4_swap(base, section, section.replace(name, "REDACTED"))
+                    findings = _vm_gate_semantic_findings(degraded)
+                    self.assertIn("preflight_environment_not_bound", findings,
+                                  "the Step-5 approval must bind %s by name" % name)
+                    self.assertIn("preflight_environment_setup_missing", findings,
+                                  "the Step-5 environment setup must name %s" % name)
+
+    def test_a4_control_removed_environment_setup_fails_closed(self):
+        for base_name, base in self._a4_bases():
+            with self.subTest(base=base_name):
+                section = self._a4_section(base, VM_GATE_PREFLIGHT_STEP)
+                self.assertIn(VM_GATE_A4_ENV_ANCHOR, section,
+                              "step 5 must carry the environment-setup instruction")
+                degraded = self._a4_swap(base, section,
+                                         section.replace(VM_GATE_A4_ENV_ANCHOR, "Note only:", 1))
+                self.assertIn("preflight_environment_setup_missing", _vm_gate_semantic_findings(degraded),
+                              "a deleted environment-setup instruction must fail closed")
+
+    # -- F. The three propositions A4 adds to the Step-5 approval, each with its own finding. -- #
+    def test_a4_control_each_missing_step5_binding_fails_closed(self):
+        for base_name, base in self._a4_bases():
+            for key, phrase, fragment in VM_GATE_A4_NEW_BINDINGS:
+                with self.subTest(base=base_name, binding=key):
+                    section = self._a4_section(base, VM_GATE_PREFLIGHT_STEP)
+                    self.assertIn(_flat(phrase), _flat(section),
+                                  "the step-5 gate must bind %r" % (phrase[:56],))
+                    self.assertIn(fragment, section,
+                                  "the degradation fragment %r must be one line"
+                                  % (fragment[:56],))
+                    degraded = self._a4_swap(
+                        base, section, section.replace(fragment, "other matters", 1))
+                    self.assertIn(key, _vm_gate_semantic_findings(degraded),
+                                  "a lost %s binding must fail closed" % key)
+
+    # ---- DL-XB-123-001-A5: reviewed gate-block identity and executable command authority ---- #
+    # Exercised against BOTH authorities, exactly as the A4 controls are. At this commit neither
+    # satisfies the A5 contract -- the checker still proves polarity by vocabulary and operations
+    # by substring, and the runbook still carries the contradictory introduction and the
+    # under-described four-surface summary -- so these are the intentional RED.
+    def _a5_bases(self):
+        return (("canonical fixture", VM_GATE_CANONICAL_FIXTURE),
+                ("live create-UAT runbook", self.create_runbook))
+
+    def _a5_gate_bounds(self, base, number, marker, boundary):
+        """The step section plus the gate block's own offsets, taken from the checker's landmarks.
+
+        Deliberately re-derived from the same marker and action boundary ``_resolve_gate_layout``
+        uses rather than from a private copy of the prose: a control that carved its own slice
+        could keep passing after the checker's bound had moved away from it.
+        """
+        section = _numbered_step_section(base, number)
+        self.assertNotEqual(section, "", "step %d must exist in the base document" % number)
+        at = section.find(marker)
+        self.assertNotEqual(at, -1, "the %r gate marker must exist" % (marker,))
+        start = section.rfind("\n", 0, at) + 1
+        end = section.find(boundary)
+        self.assertGreater(end, start,
+                           "the %r action boundary must follow the gate" % (boundary,))
+        return section, start, end
+
+    def _a5_contradict_gate(self, base, number, marker, boundary, sentence, placement):
+        """Add one contradictory clause INSIDE the gate block, leaving everything else alone.
+
+        The reviewed affirmative clause is asserted to survive, so a finding can only come from the
+        contradiction itself and never from having broken the requirement sentence.
+        """
+        section, start, end = self._a5_gate_bounds(base, number, marker, boundary)
+        block = section[start:end]
+        self.assertIn(VM_GATE_A5_GATE_ANCHOR, block,
+                      "the gate must carry the reviewed prior-turn sentence")
+        if placement == "sentence":
+            injected = "%s %s" % (VM_GATE_A5_GATE_ANCHOR, sentence)
+        elif placement == "semicolon":
+            injected = "%s; %s%s" % (VM_GATE_A5_GATE_ANCHOR[:-1], sentence[0].lower(), sentence[1:])
+        else:
+            marker_char = {"bullet_dash": "-", "bullet_star": "*", "bullet_plus": "+"}[placement]
+            injected = "%s\n\n%s %s\n" % (VM_GATE_A5_GATE_ANCHOR, marker_char, sentence)
+        mutated = block.replace(VM_GATE_A5_GATE_ANCHOR, injected, 1)
+        self.assertNotEqual(mutated, block, "the gate block must actually change")
+        self.assertIn(VM_GATE_A4_AFFIRMED_CLAUSE, _flat(mutated),
+                      "the control must leave the reviewed affirmative clause intact")
+        degraded = base.replace(section, section[:start] + mutated + section[end:], 1)
+        self.assertNotEqual(degraded, base, "the degraded document must actually differ")
+        return degraded
+
+    def test_a5_control_contradicted_deployment_gate_fails_closed(self):
+        for base_name, base in self._a5_bases():
+            for kind, sentence in VM_GATE_A5_GATE_CONTRADICTIONS:
+                for placement in VM_GATE_A5_CONTRADICTION_PLACEMENTS:
+                    with self.subTest(base=base_name, contradiction=kind, placement=placement):
+                        degraded = self._a5_contradict_gate(
+                            base, VM_GATE_DEPLOY_STEP, VM_GATE_DEPLOY_MARKER,
+                            VM_GATE_DEPLOY_BOUNDARY, sentence, placement)
+                        self.assertIn("deploy_gate_text_changed", _vm_gate_semantic_findings(degraded),
+                                      "a contradicted step-4 gate (%s/%s) must fail closed"
+                                      % (kind, placement))
+
+    def test_a5_control_contradicted_preflight_gate_fails_closed(self):
+        for base_name, base in self._a5_bases():
+            for kind, sentence in VM_GATE_A5_GATE_CONTRADICTIONS:
+                for placement in VM_GATE_A5_CONTRADICTION_PLACEMENTS:
+                    with self.subTest(base=base_name, contradiction=kind, placement=placement):
+                        degraded = self._a5_contradict_gate(
+                            base, VM_GATE_PREFLIGHT_STEP, VM_GATE_PREFLIGHT_MARKER,
+                            VM_GATE_PREFLIGHT_BOUNDARY, sentence, placement)
+                        self.assertIn("preflight_gate_text_changed", _vm_gate_semantic_findings(degraded),
+                                      "a contradicted step-5 gate (%s/%s) must fail closed"
+                                      % (kind, placement))
+
+    def _a5_reflow_gate(self, base, number, marker, boundary):
+        """Rewrap every gate paragraph onto one line: syntax only, not one substantive word."""
+        section, start, end = self._a5_gate_bounds(base, number, marker, boundary)
+        block = section[start:end]
+        reflowed = "\n\n".join(" ".join(part.split())
+                               for part in block.split("\n\n") if part.strip())
+        self.assertNotEqual(reflowed, block, "the reflow must actually change the source text")
+        return base.replace(section, section[:start] + reflowed + "\n\n" + section[end:], 1)
+
+    def _a5_rebullet_gate(self, base, number, marker, boundary, bullet):
+        """Rewrite the gate's line-start CommonMark bullets, which is pure syntax under #118."""
+        section, start, end = self._a5_gate_bounds(base, number, marker, boundary)
+        block = section[start:end]
+        swapped = "\n".join(bullet + line[1:] if line.startswith("- ") else line
+                            for line in block.splitlines())
+        self.assertNotEqual(swapped, block, "the base gate must carry '-' bullets to rewrite")
+        return base.replace(section, section[:start] + swapped + section[end:], 1)
+
+    def test_a5_reflowed_gate_blocks_remain_clean(self):
+        # Whitespace is non-material everywhere else in this contract, so gate identity must not
+        # fire on ordinary Markdown reflow. A guard that punishes rewrapping invites being removed.
+        for base_name, base in self._a5_bases():
+            for number, marker, boundary in (
+                    (VM_GATE_DEPLOY_STEP, VM_GATE_DEPLOY_MARKER, VM_GATE_DEPLOY_BOUNDARY),
+                    (VM_GATE_PREFLIGHT_STEP, VM_GATE_PREFLIGHT_MARKER,
+                     VM_GATE_PREFLIGHT_BOUNDARY)):
+                with self.subTest(base=base_name, step=number):
+                    self.assertEqual(
+                        _vm_gate_semantic_findings(self._a5_reflow_gate(base, number, marker, boundary)), [],
+                        "an ordinary reflow of the step-%d gate must stay clean" % number)
+
+    def test_a5_rebulleted_gate_blocks_remain_clean(self):
+        # The #118 CommonMark equivalence, preserved: '-', '*' and '+' open the same list.
+        for base_name, base in self._a5_bases():
+            for bullet in ("*", "+"):
+                for number, marker, boundary in (
+                        (VM_GATE_DEPLOY_STEP, VM_GATE_DEPLOY_MARKER, VM_GATE_DEPLOY_BOUNDARY),
+                        (VM_GATE_PREFLIGHT_STEP, VM_GATE_PREFLIGHT_MARKER,
+                         VM_GATE_PREFLIGHT_BOUNDARY)):
+                    with self.subTest(base=base_name, bullet=bullet, step=number):
+                        self.assertEqual(
+                            _vm_gate_semantic_findings(
+                                self._a5_rebullet_gate(base, number, marker, boundary, bullet)), [],
+                            "'%s' gate bullets must stay clean at step %d" % (bullet, number))
+
+    # -- B. A required operation must START a real executable line. Accepted F-B. -- #
+    def _a5_replace_command(self, base, command, replacement):
+        self.assertEqual(base.count(command), 1,
+                         "the base must carry exactly one %r" % (command[:56],))
+        degraded = base.replace(command, replacement, 1)
+        self.assertNotEqual(degraded, base, "the degraded document must actually differ")
+        self.assertIn(command, degraded,
+                      "the control must leave the anchor text present but non-executing")
+        return degraded
+
+    def test_a5_control_non_executing_powershell_commands_fail_closed(self):
+        for base_name, base in self._a5_bases():
+            for label, command, key in VM_GATE_A5_POWERSHELL_OPERATIONS:
+                for kind, template in VM_GATE_A5_POWERSHELL_SPOOFS:
+                    with self.subTest(base=base_name, operation=label, spoof=kind):
+                        degraded = self._a5_replace_command(base, command, template % command)
+                        self.assertIn(key, _vm_gate_semantic_findings(degraded),
+                                      "a %s as %s must not satisfy %s" % (label, kind, key))
+
+    def test_a5_control_non_executing_shell_commands_fail_closed(self):
+        for base_name, base in self._a5_bases():
+            for label, command, key in VM_GATE_A5_SHELL_OPERATIONS:
+                for kind, template in VM_GATE_A5_SHELL_SPOOFS:
+                    with self.subTest(base=base_name, operation=label, spoof=kind):
+                        degraded = self._a5_replace_command(base, command, template % command)
+                        self.assertIn(key, _vm_gate_semantic_findings(degraded),
+                                      "a %s as %s must not satisfy %s" % (label, kind, key))
+
+    def test_a5_genuine_commands_with_trailing_comments_remain_valid(self):
+        # The positive half: a real invocation followed by harmless comment text still invokes.
+        operations = VM_GATE_A5_POWERSHELL_OPERATIONS + VM_GATE_A5_SHELL_OPERATIONS
+        for base_name, base in self._a5_bases():
+            for label, command, key in operations:
+                with self.subTest(base=base_name, operation=label):
+                    degraded = self._a5_replace_command(
+                        base, command, VM_GATE_A5_TRAILING_COMMENT % command)
+                    self.assertNotIn(key, _vm_gate_semantic_findings(degraded),
+                                     "a genuine %s with a trailing comment must stay valid" % label)
+
+    # -- C. The introduction must not contradict the step-5 live-contact boundary. Accepted F-C. --
+    def _a5_runbook_intro(self):
+        at = self.create_runbook.find("\n## Components")
+        self.assertNotEqual(at, -1, "the runbook must carry a Components section")
+        return _flat(self.create_runbook[:at])
+
+    def test_a5_control_introduction_states_truthful_live_contact_boundary(self):
+        intro = self._a5_runbook_intro()
+        for phrase in VM_GATE_A5_INTRO_REQUIRED:
+            with self.subTest(required=phrase[:56]):
+                self.assertIn(_flat(phrase), intro,
+                              "the introduction must state %r" % (phrase[:56],))
+        for phrase in VM_GATE_A5_INTRO_FORBIDDEN:
+            with self.subTest(forbidden=phrase[:56]):
+                self.assertNotIn(_flat(phrase), intro,
+                                 "the introduction must not claim %r" % (phrase[:56],))
+
+    # -- D. The four-surface summary must describe the broadened step-5 scope. Accepted F-D. -- #
+    def _a5_safety_section(self):
+        at = self.create_runbook.find(VM_GATE_SAFETY_HEADING)
+        self.assertNotEqual(at, -1, "the runbook must carry a Safety boundary")
+        end = self.create_runbook.find("\n## ", at + 1)
+        return _flat(self.create_runbook[at:end] if end != -1 else self.create_runbook[at:])
+
+    def test_a5_control_safety_boundary_states_full_step5_scope(self):
+        section = self._a5_safety_section()
+        for phrase in VM_GATE_A5_SAFETY_STEP5_SCOPE:
+            with self.subTest(scope=phrase):
+                self.assertIn(phrase, section,
+                              "the four-surface summary must name %r" % (phrase,))
 
     def test_readme_references_probe_and_runbook(self):
         self.assertIn("scripts/ac2_member_expiry_capability_probe.ps1", self.readme)
@@ -6403,6 +12408,2319 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
         self.assertTrue(glob_to_regex("a/**/b.py").match("a/x/y/b.py"))
         self.assertTrue(glob_to_regex(".gitignore").match(".gitignore"))
         self.assertFalse(glob_to_regex(".gitignore").match("sub/.gitignore"))
+
+    # ---- DL-XB-123-001-A6: post-A5 final-G4 remediation controls ---- #
+    # Exercised against BOTH authorities, exactly as the A4 and A5 controls are. At this commit the
+    # L checker has no action-region identity, no here-string state and no heredoc state, and it
+    # canonicalises a bullet marker only before a literal space -- so the negative and
+    # safe-equivalence controls below are the intentional RED.
+    def _a6_bases(self):
+        return (("canonical fixture", VM_GATE_CANONICAL_FIXTURE),
+                ("live create-UAT runbook", self.create_runbook))
+
+    def _a6_step_landmarks(self, number):
+        if number == VM_GATE_DEPLOY_STEP:
+            return VM_GATE_DEPLOY_MARKER, VM_GATE_DEPLOY_BOUNDARY
+        return VM_GATE_PREFLIGHT_MARKER, VM_GATE_PREFLIGHT_BOUNDARY
+
+    def _a6_layout(self, base, number):
+        """The step section, its gate block and its action region, from the checker's own resolver.
+
+        Re-derived through ``_resolve_gate_layout`` rather than from a private slice, so a control
+        cannot keep passing after the checker's own gate/action boundary has moved away from it.
+        """
+        marker, boundary = self._a6_step_landmarks(number)
+        section = _numbered_step_section(base, number)
+        self.assertNotEqual(section, "", "step %d must exist in the base document" % number)
+        _, block, action = _resolve_gate_layout(section, marker, boundary, "probe", set())
+        self.assertIsNotNone(action, "step %d gate layout must resolve" % number)
+        self.assertTrue(action.strip(), "step %d must carry an action region" % number)
+        return section, block, action
+
+    def _a6_inject_action(self, base, number, sentence, placement):
+        """Add one contradictory sentence to the ACTION region, leaving the gate block untouched.
+
+        Every placement is strictly after the action boundary, so a finding can only come from the
+        action region's own authority and never from the A5 gate-block identity.
+        """
+        section, block, action = self._a6_layout(base, number)
+        if placement == "after_boundary":
+            cut = action.find("\n\n")
+            self.assertNotEqual(cut, -1, "the action region must have a first paragraph")
+            mutated = action[:cut + 2] + sentence + "\n\n" + action[cut + 2:]
+        elif placement == "before_command":
+            cut = action.find("```")
+            self.assertNotEqual(cut, -1, "the action region must carry a fenced command")
+            mutated = action[:cut] + sentence + "\n\n" + action[cut:]
+        else:
+            mutated = action.rstrip("\n") + "\n\n" + sentence + "\n\n"
+        self.assertNotEqual(mutated, action, "the action region must actually change")
+        degraded = base.replace(section, section.replace(action, mutated, 1), 1)
+        self.assertNotEqual(degraded, base, "the degraded document must actually differ")
+        _, degraded_block, _ = self._a6_layout(degraded, number)
+        self.assertEqual(degraded_block, block,
+                         "the control must leave the reviewed gate block byte-identical")
+        return degraded
+
+    def test_a6_control_post_gate_action_contradiction_fails_closed(self):
+        for base_name, base in self._a6_bases():
+            for number in (VM_GATE_DEPLOY_STEP, VM_GATE_PREFLIGHT_STEP):
+                for kind, sentence in VM_GATE_A6_ACTION_CONTRADICTIONS:
+                    for placement in VM_GATE_A6_ACTION_PLACEMENTS:
+                        with self.subTest(base=base_name, step=number,
+                                          contradiction=kind, placement=placement):
+                            degraded = self._a6_inject_action(base, number, sentence, placement)
+                            findings = _vm_gate_semantic_findings(degraded)
+                            self.assertIn(
+                                VM_GATE_A6_ACTION_KEYS[number], findings,
+                                "post-gate %s at %s in step %d must fail closed"
+                                % (kind, placement, number))
+                            self.assertNotIn(
+                                VM_GATE_A6_GATE_KEYS[number], findings,
+                                "the gate block is untouched, so the finding must be the action's")
+
+    def test_a6_control_powershell_string_data_is_not_execution(self):
+        for base_name, base in self._a6_bases():
+            for label, command, key in VM_GATE_A5_POWERSHELL_OPERATIONS:
+                for kind, template in VM_GATE_A6_POWERSHELL_DATA_SPOOFS:
+                    with self.subTest(base=base_name, operation=label, spoof=kind):
+                        degraded = self._a5_replace_command(base, command, template % command)
+                        self.assertIn(key, _vm_gate_semantic_findings(degraded),
+                                      "a %s inside %s is data, so it must not satisfy %s"
+                                      % (label, kind, key))
+
+    def test_a6_control_shell_heredoc_data_is_not_execution(self):
+        for base_name, base in self._a6_bases():
+            for label, command, key in VM_GATE_A5_SHELL_OPERATIONS:
+                for kind, template in VM_GATE_A6_SHELL_DATA_SPOOFS:
+                    with self.subTest(base=base_name, operation=label, spoof=kind):
+                        degraded = self._a5_replace_command(base, command, template % command)
+                        self.assertIn(key, _vm_gate_semantic_findings(degraded),
+                                      "a %s inside %s is data, so it must not satisfy %s"
+                                      % (label, kind, key))
+
+    def test_a6_genuine_commands_survive_neighbouring_inert_data(self):
+        """The positive half: closing correctly matters as much as suppressing.
+
+        A here-string or heredoc state machine that ran to the end of the region instead of to its
+        terminator would suppress the real command that follows it, which is a false guard rather
+        than a stronger one.
+        """
+        neighbours = (
+            ("after_here_string", "@'\nunrelated documentation data\n'@\n%s"),
+            ("before_here_string", "%s\n@'\nunrelated documentation data\n'@"),
+            ("after_heredoc", "cat <<'EOF'\nunrelated documentation data\nEOF\n%s"),
+            ("before_heredoc", "%s\ncat <<'EOF'\nunrelated documentation data\nEOF"),
+        )
+        operations = VM_GATE_A5_POWERSHELL_OPERATIONS + VM_GATE_A5_SHELL_OPERATIONS
+        for base_name, base in self._a6_bases():
+            for label, command, key in operations:
+                for kind, template in neighbours:
+                    with self.subTest(base=base_name, operation=label, neighbour=kind):
+                        degraded = self._a5_replace_command(base, command, template % command)
+                        self.assertNotIn(key, _vm_gate_semantic_findings(degraded),
+                                         "a genuine %s next to %s must still invoke"
+                                         % (label, kind))
+
+    def _a6_rebullet_gate(self, base, number, bullet):
+        """Rewrite the gate's line-start bullets to an equivalent CommonMark marker + whitespace."""
+        section, block, _ = self._a6_layout(base, number)
+        self.assertIn("\n- ", block, "the base gate must carry '- ' bullets to rewrite")
+        swapped = "\n".join(bullet + line[2:] if line.startswith("- ") else line
+                            for line in block.splitlines())
+        return base.replace(section, section.replace(block, swapped, 1), 1)
+
+    def test_a6_control_equivalent_bullet_whitespace_stays_clean(self):
+        for base_name, base in self._a6_bases():
+            for number in (VM_GATE_DEPLOY_STEP, VM_GATE_PREFLIGHT_STEP):
+                for bullet in VM_GATE_A6_EQUIVALENT_BULLETS:
+                    with self.subTest(base=base_name, step=number, bullet=repr(bullet)):
+                        self.assertEqual(
+                            _vm_gate_semantic_findings(self._a6_rebullet_gate(base, number, bullet)), [],
+                            "marker %r opens the same list, so step %d must stay clean"
+                            % (bullet, number))
+
+    def test_a6_control_finding_set_declares_the_action_identities(self):
+        # A6's identities live on the SEMANTIC surface, which R1 leaves at its A11 size and which
+        # R2 and R3 each grow by exactly their own declared keys.
+        self.assertEqual(len(VM_GATE_SEMANTIC_FINDING_KEYS),
+                         VM_GATE_R3_SEMANTIC_FINDING_KEY_COUNT,
+                         "A6 adds exactly the two reviewed action identities and retires nothing;"
+                         " A11, R2 and R3 each append their own declared keys and retire nothing"
+                         " either")
+        self.assertEqual(len(set(VM_GATE_SEMANTIC_FINDING_KEYS)),
+                         VM_GATE_R3_SEMANTIC_FINDING_KEY_COUNT)
+        self.assertIn(VM_GATE_A6_ACTION_KEYS[VM_GATE_DEPLOY_STEP], VM_GATE_SEMANTIC_FINDING_KEYS)
+        self.assertIn(VM_GATE_A6_ACTION_KEYS[VM_GATE_PREFLIGHT_STEP],
+                      VM_GATE_SEMANTIC_FINDING_KEYS)
+        self.assertIn(VM_GATE_A6_ACTION_KEYS[VM_GATE_DEPLOY_STEP], VM_GATE_DEPLOY_UNMET,
+                      "an unresolvable step-4 layout must report the action identity unmet")
+        self.assertIn(VM_GATE_A6_ACTION_KEYS[VM_GATE_PREFLIGHT_STEP], VM_GATE_PREFLIGHT_UNMET,
+                      "an unresolvable step-5 layout must report the action identity unmet")
+
+    def test_a6_control_fixture_and_runbook_share_one_action_authority(self):
+        """Both authorities must be measured against ONE reviewed action, not two paraphrases.
+
+        Stated as a property of the documents rather than by naming the repair's constants, so the
+        control is static, needs no dynamic namespace lookup, and reads the same before and after
+        the repair. Under A5 the fixture's action region was a loose miniature of the runbook's; an
+        action identity whose two consumers disagreed would make the control group meaningless in
+        exactly the way the A5 gate-block drift did.
+        """
+        for number in (VM_GATE_DEPLOY_STEP, VM_GATE_PREFLIGHT_STEP):
+            with self.subTest(step=number):
+                _, _, fixture_action = self._a6_layout(VM_GATE_CANONICAL_FIXTURE, number)
+                _, _, live_action = self._a6_layout(self.create_runbook, number)
+                self.assertEqual(fixture_action, live_action,
+                                 "step %d action must be one shared reviewed authority" % number)
+
+    # ---- DL-XB-123-001-A7-C1: rendered fence-position controls ---- #
+    # Exercised against BOTH authorities, exactly as the A4, A5 and A6 controls are. At this commit
+    # the N checker normalises every physical newline as ordinary whitespace, so the absorption
+    # controls below are the intentional RED; the regression and equivalence controls are already
+    # green at N and must stay green through the repair.
+    @staticmethod
+    def _a7_is_fence(line):
+        stripped = line.strip()
+        return any(stripped.startswith(marker) for marker in VM_GATE_A7_FENCE_MARKERS)
+
+    def _a7_lines(self, base, command):
+        """The base's physical lines, and the index of the ONE line that IS ``command``.
+
+        Exactly one, so a control can never operate on a copy of the command that lives in prose
+        or in the approval's own recital of it.
+        """
+        lines = base.split("\n")
+        at = [index for index, line in enumerate(lines) if line == command]
+        self.assertEqual(len(at), 1,
+                         "the base must carry exactly one standalone %r line" % (command[:56],))
+        return lines, at[0]
+
+    def _a7_fence_neighbours(self, base, command):
+        """``(lines, index)`` for a command that is fenced on both sides in the reviewed layout."""
+        lines, at = self._a7_lines(base, command)
+        self.assertTrue(self._a7_is_fence(lines[at - 1]),
+                        "the reviewed command must open with its own fence line")
+        self.assertTrue(self._a7_is_fence(lines[at + 1]),
+                        "the reviewed command must close with its own fence line")
+        return lines, at
+
+    def _a7_set_fence(self, base, command, position, spelling):
+        """Respell the command's opening or closing fence LINE, changing nothing else.
+
+        No "must differ" assertion lives here on purpose: the CommonMark-permitted spelling set
+        legitimately includes the reviewed spelling itself, and that identity case is a control
+        group member rather than a broken control. Every caller that DOES require a change asserts
+        it for itself.
+        """
+        lines, at = self._a7_fence_neighbours(base, command)
+        lines[at - 1 if position == "opening" else at + 1] = spelling
+        return "\n".join(lines)
+
+    def _a7_absorb_fence(self, base, command, position, separator=" "):
+        """Join the command line with its adjacent fence line, removing ONE physical newline.
+
+        Nothing else changes. The fence text survives, the command text survives, and every other
+        line keeps its position -- which is exactly why the join is invisible to a normaliser that
+        treats a line break as ordinary whitespace. The standalone-fence-line count is asserted to
+        drop by exactly one, so the control cannot pass by having deleted the fence outright.
+        """
+        lines, at = self._a7_fence_neighbours(base, command)
+        fence_at = at - 1 if position == "opening" else at + 1
+        fence = lines[fence_at]
+        joined = ([fence + separator + command] if position == "opening"
+                  else [command + separator + fence])
+        degraded = "\n".join(lines[:min(at, fence_at)] + joined + lines[max(at, fence_at) + 1:])
+        self.assertNotEqual(degraded, base, "the degraded document must actually differ")
+        self.assertIn(command, degraded, "the required command text must survive the join")
+        self.assertIn(fence.strip(), degraded, "the fence text must survive the join")
+        self.assertEqual(degraded.split("\n").count(fence), base.split("\n").count(fence) - 1,
+                         "exactly one STANDALONE fence line must stop being its own line")
+        return degraded
+
+    def test_a7_control_command_absorbing_its_closing_fence_fails_closed(self):
+        """The demonstrated exact-N complete-guard CLEAN class, over both authorities.
+
+        Only a physical newline is removed. Under CommonMark the block is then never closed, so
+        everything after it renders as literal code -- which is why this must report the reviewed
+        action identity rather than clean.
+        """
+        for base_name, base in self._a6_bases():
+            for label, command, action_key, _ in VM_GATE_A7_FENCE_OPERATIONS:
+                for spelling, separator in VM_GATE_A7_JOIN_SEPARATORS:
+                    with self.subTest(base=base_name, operation=label, join=spelling):
+                        degraded = self._a7_absorb_fence(base, command, "closing", separator)
+                        self.assertIn(action_key, _vm_gate_semantic_findings(degraded),
+                                      "%s absorbing its closing fence must report %s"
+                                      % (label, action_key))
+
+    def test_a7_control_step4_absorption_that_swallows_the_step5_gate_fails_closed(self):
+        """The cross-step case, stated explicitly because it is the safety-relevant one.
+
+        The step-4 closing fence sits immediately before the step-5 heading in both authorities.
+        Absorbing it leaves that heading, its whole approval gate and the preflight commands inside
+        an unterminated fence, so the control also asserts the heading is still TEXTUALLY present:
+        the finding must come from the fence moving, not from the heading having been deleted.
+        """
+        for base_name, base in self._a6_bases():
+            with self.subTest(base=base_name):
+                degraded = self._a7_absorb_fence(base, VM_GATE_A5_NEW_ITEM_LINE, "closing")
+                self.assertIn(VM_GATE_A7_STEP5_HEADING, degraded,
+                              "the step-5 heading must remain textually present")
+                standalone = "\n" + VM_GATE_A7_CLOSING_FENCE + "\n\n" + VM_GATE_A7_STEP5_HEADING
+                self.assertIn(standalone, base,
+                              "the reviewed layout must close step 4 on its own fence line")
+                self.assertNotIn(standalone, degraded,
+                                 "the standalone fence that closed step 4 must be gone")
+                self.assertIn("deploy_action_text_changed", _vm_gate_semantic_findings(degraded),
+                              "an unterminated step-4 fence swallowing the step-5 gate and its"
+                              " approval must fail closed")
+
+    def test_a7_control_permitted_closing_fence_spellings_stay_clean(self):
+        """0-3 leading spaces and trailing horizontal whitespace still close the same block."""
+        for base_name, base in self._a6_bases():
+            for label, command, _, _ in VM_GATE_A7_FENCE_OPERATIONS:
+                for spelling, fence in VM_GATE_A7_PERMITTED_CLOSING_FENCES:
+                    with self.subTest(base=base_name, operation=label, fence=spelling):
+                        self.assertEqual(
+                            _vm_gate_semantic_findings(self._a7_set_fence(base, command, "closing", fence)),
+                            [], "%r closes the same block, so %s must stay clean"
+                                % (fence, label))
+
+    def test_a7_control_permitted_closing_fence_spellings_still_fail_when_absorbed(self):
+        """Every permitted spelling must ALSO fail closed once it stops being its own line."""
+        for base_name, base in self._a6_bases():
+            for label, command, action_key, _ in VM_GATE_A7_FENCE_OPERATIONS:
+                for spelling, fence in VM_GATE_A7_PERMITTED_CLOSING_FENCES:
+                    with self.subTest(base=base_name, operation=label, fence=spelling):
+                        permitted = self._a7_set_fence(base, command, "closing", fence)
+                        degraded = self._a7_absorb_fence(permitted, command, "closing")
+                        self.assertIn(action_key, _vm_gate_semantic_findings(degraded),
+                                      "%s absorbing a %s closing fence must report %s"
+                                      % (label, spelling, action_key))
+
+    def test_a7_control_four_space_indented_fence_fails_closed(self):
+        """Four leading spaces stop the line being a fence at all, so the block boundary moved.
+
+        The same CommonMark exclusion A3 already applies to numbered ATX headings. Indenting the
+        opening fence turns it into indented-code content and lets the ORIGINAL closing fence open
+        a new block instead of closing one, which can swallow everything after it.
+        """
+        for base_name, base in self._a6_bases():
+            for label, command, action_key, _ in VM_GATE_A7_FENCE_OPERATIONS:
+                for position in ("opening", "closing"):
+                    with self.subTest(base=base_name, operation=label, fence=position):
+                        lines, at = self._a7_fence_neighbours(base, command)
+                        fence = lines[at - 1 if position == "opening" else at + 1]
+                        degraded = self._a7_set_fence(
+                            base, command, position, VM_GATE_A7_FOUR_SPACES + fence.strip())
+                        self.assertNotEqual(degraded, base, "the indent must change the text")
+                        self.assertIn(action_key, _vm_gate_semantic_findings(degraded),
+                                      "a four-space-indented %s fence for %s must report %s"
+                                      % (position, label, action_key))
+
+    def test_a7_control_opening_fence_join_remains_fail_closed(self):
+        """C1 regression/positive control: exact N ALREADY fails closed here.
+
+        The joined line no longer STARTS with the required command, so the A4/A5 active-invocation
+        anchor reports the operation missing. That behaviour is preserved rather than restated as
+        RED, and the expectation is deliberately not weakened to manufacture one.
+        """
+        for base_name, base in self._a6_bases():
+            for label, command, _, invocation_key in VM_GATE_A7_FENCE_OPERATIONS:
+                for spelling, separator in VM_GATE_A7_JOIN_SEPARATORS:
+                    with self.subTest(base=base_name, operation=label, join=spelling):
+                        degraded = self._a7_absorb_fence(base, command, "opening", separator)
+                        self.assertIn(invocation_key, _vm_gate_semantic_findings(degraded),
+                                      "%s joined to its opening fence must keep reporting %s"
+                                      % (label, invocation_key))
+
+    def test_a7_control_altered_and_removed_fences_remain_fail_closed(self):
+        """Preserving the full stripped fence text is what keeps these from comparing equal.
+
+        A marker swap, a longer fence, an added info string and outright fence removal all already
+        fail closed at exact N through the reviewed action identity. The longer backtick fence is a
+        conservative false positive -- CommonMark accepts it as closing the block -- and is
+        recorded as one rather than excused.
+        """
+        for base_name, base in self._a6_bases():
+            for label, command, action_key, _ in VM_GATE_A7_FENCE_OPERATIONS:
+                for spelling, fence in VM_GATE_A7_ALTERED_CLOSING_FENCES:
+                    with self.subTest(base=base_name, operation=label, fence=spelling):
+                        altered = self._a7_set_fence(base, command, "closing", fence)
+                        self.assertNotEqual(altered, base, "the respelling must change the text")
+                        self.assertIn(action_key, _vm_gate_semantic_findings(altered),
+                                      "a %s closing fence for %s must report %s"
+                                      % (spelling, label, action_key))
+                for position in ("opening", "closing"):
+                    with self.subTest(base=base_name, operation=label, removed=position):
+                        lines, at = self._a7_fence_neighbours(base, command)
+                        fence_at = at - 1 if position == "opening" else at + 1
+                        removed = "\n".join(lines[:fence_at] + lines[fence_at + 1:])
+                        self.assertIn(action_key, _vm_gate_semantic_findings(removed),
+                                      "removing the %s fence for %s must report %s"
+                                      % (position, label, action_key))
+
+    def test_a7_control_opening_fence_indentation_within_three_spaces_stays_clean(self):
+        """The already-safe cases C1 requires preserved: 0-3 leading spaces still open a fence."""
+        for base_name, base in self._a6_bases():
+            for label, command, _, _ in VM_GATE_A7_FENCE_OPERATIONS:
+                for indent in range(4):
+                    with self.subTest(base=base_name, operation=label, indent=indent):
+                        lines, at = self._a7_fence_neighbours(base, command)
+                        fence = lines[at - 1].strip()
+                        self.assertEqual(
+                            _vm_gate_semantic_findings(self._a7_set_fence(
+                                base, command, "opening", " " * indent + fence)), [],
+                            "a %d-space opening fence still opens the block for %s"
+                            % (indent, label))
+
+    def test_a7_control_harmless_action_reflow_stays_clean(self):
+        """A7 is a fence-POSITION repair, so ordinary paragraph rewrapping must stay non-material."""
+        for base_name, base in self._a6_bases():
+            for label, wrapped, rewrapped in VM_GATE_A7_HARMLESS_REFLOWS:
+                with self.subTest(base=base_name, reflow=label):
+                    self.assertEqual(base.count(wrapped), 1,
+                                     "the base must carry the reviewed %s once" % label)
+                    reflowed = base.replace(wrapped, rewrapped, 1)
+                    self.assertNotEqual(reflowed, base, "the reflow must actually change the text")
+                    self.assertEqual(_vm_gate_semantic_findings(reflowed), [],
+                                     "rewrapping the %s must stay clean" % label)
+
+    def test_a7_control_blank_line_regrouping_around_fences_stays_clean(self):
+        """Blank lines are dropped, not encoded, so regrouping paragraphs is not drift either."""
+        for base_name, base in self._a6_bases():
+            for label, command, _, _ in VM_GATE_A7_FENCE_OPERATIONS:
+                for position in ("opening", "closing"):
+                    with self.subTest(base=base_name, operation=label, blank=position):
+                        lines, at = self._a7_fence_neighbours(base, command)
+                        cut = at - 1 if position == "opening" else at + 2
+                        regrouped = "\n".join(lines[:cut] + [""] + lines[cut:])
+                        self.assertNotEqual(regrouped, base, "the regrouping must change the text")
+                        self.assertEqual(_vm_gate_semantic_findings(regrouped), [],
+                                         "an extra blank line %s the %s fence must stay clean"
+                                         % (position, label))
+
+    def test_a7_control_action_region_bullet_whitespace_stays_clean(self):
+        """The `-`/`*`/`+` equivalence, asserted in the region A7 actually changes.
+
+        A6 proved it for the gate block. The action region is what the fence repair touches, so the
+        promise is re-proved there: a line-start CommonMark marker followed by ordinary horizontal
+        whitespace opens the same list item and must still compare equal.
+        """
+        for base_name, base in self._a6_bases():
+            for number in (VM_GATE_DEPLOY_STEP, VM_GATE_PREFLIGHT_STEP):
+                section, _, action = self._a6_layout(base, number)
+                if "\n- " not in action:
+                    continue
+                for bullet in VM_GATE_A6_EQUIVALENT_BULLETS:
+                    with self.subTest(base=base_name, step=number, bullet=repr(bullet)):
+                        swapped = "\n".join(
+                            bullet + line[2:] if line.startswith("- ") else line
+                            for line in action.splitlines())
+                        degraded = base.replace(section, section.replace(action, swapped, 1), 1)
+                        self.assertNotEqual(degraded, base, "the swap must change the text")
+                        self.assertEqual(_vm_gate_semantic_findings(degraded), [],
+                                         "marker %r opens the same list, so the step-%d action"
+                                         " must stay clean" % (bullet, number))
+
+    # ---- DL-XB-123-001-A8-C1: post-ready Codex remediation controls ---- #
+    # Every control degrades an in-memory copy only, never a repository file, and every one is
+    # exercised against BOTH authorities: the canonical fixture and the live create-UAT runbook.
+
+    def _a8_bases(self):
+        return (("canonical fixture", VM_GATE_CANONICAL_FIXTURE),
+                ("live create-UAT runbook", self.create_runbook))
+
+    # -- A8-F1. The unique Safety boundary must carry COMPLETE semantic authority. -- #
+    def _a8_safety_bounds(self, base):
+        openings = [match.start() for match in VM_GATE_SAFETY_OPENING.finditer(base)]
+        self.assertEqual(len(openings), 1, "the base must carry exactly one Safety boundary")
+        at = openings[0]
+        end = base.find("\n## ", at + 1)
+        return at, (len(base) if end == -1 else end)
+
+    def _a8_contradicted_safety(self, base, position, sentence):
+        at, end = self._a8_safety_bounds(base)
+        section = base[at:end]
+        if position == "prepend":
+            heading, _, rest = section.partition("\n")
+            mutated = heading + "\n\n" + sentence + "\n" + rest.lstrip("\n")
+        elif position == "bullet":
+            mutated = section.rstrip("\n") + "\n" + sentence + "\n"
+        else:
+            mutated = section.rstrip("\n") + "\n\n" + sentence + "\n"
+        degraded = base[:at] + mutated + base[end:]
+        self.assertNotEqual(degraded, base, "the contradiction must actually change the document")
+        return degraded
+
+    def test_a8_control_contradiction_inside_the_unique_safety_boundary_fails_closed(self):
+        """Accepted A8-F1: additive token presence is not semantic authority.
+
+        Each form keeps the boundary UNIQUE and keeps every required token present, so the only
+        thing that can detect it is authority over the reviewed section's complete semantics.
+        """
+        for base_name, base in self._a8_bases():
+            for label, position, sentence in VM_GATE_A8_SAFETY_CONTRADICTIONS:
+                with self.subTest(base=base_name, contradiction=label):
+                    degraded = self._a8_contradicted_safety(base, position, sentence)
+                    self.assertEqual(len(VM_GATE_SAFETY_OPENING.findall(degraded)), 1,
+                                     "the contradicted boundary must stay UNIQUE, so this is not"
+                                     " a duplicate-heading control in disguise")
+                    at, end = self._a8_safety_bounds(degraded)
+                    section = _flat(degraded[at:end]).lower()
+                    for token in VM_GATE_SAFETY_TOKENS:
+                        self.assertIn(token, section,
+                                      "every required four-way token must survive, so this is not"
+                                      " a token-removal control in disguise")
+                    self.assertIn("safety_boundary_surfaces_incomplete", _vm_gate_semantic_findings(degraded),
+                                  "a contradiction inside the unique Safety boundary (%s) must"
+                                  " fail closed" % label)
+
+    def test_a8_control_reviewed_safety_boundary_stays_clean(self):
+        """The control group: the reviewed section itself must report nothing."""
+        for base_name, base in self._a8_bases():
+            with self.subTest(base=base_name):
+                self.assertNotIn("safety_boundary_surfaces_incomplete", _vm_gate_semantic_findings(base))
+                self.assertNotIn("safety_boundary_ambiguous", _vm_gate_semantic_findings(base))
+
+    # -- A8-F2. A physical command-line boundary inside a fence is execution-significant. -- #
+    def _a8_split_command(self, base, command, before, after):
+        self.assertEqual(base.count(command), 1,
+                         "the base must carry the reviewed command %r exactly once"
+                         % (command[:56],))
+        self.assertIn(before, command, "the split point %r must exist in the command" % (before,))
+        degraded = base.replace(command, command.replace(before, after, 1), 1)
+        self.assertNotEqual(degraded, base, "the split must actually change the document")
+        return degraded
+
+    def test_a8_control_split_fenced_command_line_fails_closed(self):
+        """Accepted A8-F2: one physical command line must not compare equal to two.
+
+        Nothing is added, removed or reworded -- a single newline is introduced at an
+        execution-significant point, with no authorised PowerShell or shell continuation.
+        """
+        for base_name, base in self._a8_bases():
+            for label, command, before, after, key in VM_GATE_A8_EXECUTABLE_SPLITS:
+                with self.subTest(base=base_name, split=label):
+                    degraded = self._a8_split_command(base, command, before, after)
+                    self.assertIn(key, _vm_gate_semantic_findings(degraded),
+                                  "splitting the reviewed command line (%s) must fail closed"
+                                  % label)
+
+    def test_a8_control_rejoining_a_split_command_restores_the_reviewed_document(self):
+        """The other direction: joining the two physical lines back must restore the base exactly.
+
+        Without this, a repair could pass the split controls by rejecting the command outright.
+        """
+        for base_name, base in self._a8_bases():
+            for label, command, before, after, _key in VM_GATE_A8_EXECUTABLE_SPLITS:
+                with self.subTest(base=base_name, split=label):
+                    degraded = self._a8_split_command(base, command, before, after)
+                    self.assertEqual(degraded.replace(after, before, 1), base,
+                                     "rejoining %s must restore the reviewed document" % label)
+
+    def test_a8_control_fenced_physical_lines_are_semantically_distinguishable(self):
+        """The repair's own contract, proved directly on synthetic text."""
+        self.assertNotEqual(_semantic_markdown_region(VM_GATE_A8_FENCED_TWO_LINES),
+                            _semantic_markdown_region(VM_GATE_A8_FENCED_ONE_LINE),
+                            "two fenced command lines must not normalise to one")
+
+    def test_a8_control_unfenced_prose_still_coalesces(self):
+        """A8 is a fenced-LINE repair, not a decision that every document newline is significant."""
+        self.assertEqual(_semantic_markdown_region(VM_GATE_A8_PROSE_TWO_LINES),
+                         _semantic_markdown_region(VM_GATE_A8_PROSE_ONE_LINE),
+                         "ordinary prose reflow outside a fence must stay non-material")
+
+    # -- A8-F3. Container-significant indentation decides whether a gate is prose or code. -- #
+    def _a8_indent_gate(self, base, opening, boundary, pad, share=1.0):
+        start = base.find(opening)
+        self.assertNotEqual(start, -1, "the base must carry the gate opening %r" % (opening[:48],))
+        stop = base.find(boundary, start)
+        self.assertNotEqual(stop, -1, "the base must carry the gate's action boundary")
+        lines = base[start:stop].splitlines(keepends=True)
+        cut = max(1, int(len(lines) * share))
+        body = "".join(pad + line if index < cut and line.strip() else line
+                       for index, line in enumerate(lines))
+        degraded = base[:start] + body + base[stop:]
+        self.assertNotEqual(degraded, base, "the indentation must actually change the document")
+        return degraded
+
+    def test_a8_control_container_indented_gate_fails_closed(self):
+        """Accepted A8-F3: four columns of indentation renders the gate as an indented code block.
+
+        The gate prose is not weakened or removed, only indented, so the rendered block semantics
+        are the only thing that can still detect it.
+        """
+        for base_name, base in self._a8_bases():
+            for gate, opening, boundary, key in VM_GATE_A8_GATES:
+                for label, pad in VM_GATE_A8_CONTAINER_INDENTS:
+                    with self.subTest(base=base_name, gate=gate, indent=label):
+                        degraded = self._a8_indent_gate(base, opening, boundary, pad)
+                        self.assertIn(key, _vm_gate_semantic_findings(degraded),
+                                      "a %s-indented %s gate must fail closed" % (label, gate))
+
+    def test_a8_control_partially_indented_gate_fails_closed(self):
+        """Indenting only part of a gate splits it between rendered prose and rendered code."""
+        for base_name, base in self._a8_bases():
+            for gate, opening, boundary, key in VM_GATE_A8_GATES:
+                with self.subTest(base=base_name, gate=gate):
+                    degraded = self._a8_indent_gate(base, opening, boundary, "    ", share=0.5)
+                    self.assertIn(key, _vm_gate_semantic_findings(degraded),
+                                  "a partially indented %s gate must fail closed" % gate)
+
+    def test_a8_control_render_equivalent_gate_indent_stays_clean(self):
+        """0-3 columns cannot open an indented code block, so they must stay non-material."""
+        for base_name, base in self._a8_bases():
+            for gate, opening, boundary, _key in VM_GATE_A8_GATES:
+                for label, pad in VM_GATE_A8_RENDER_EQUIVALENT_INDENTS:
+                    with self.subTest(base=base_name, gate=gate, indent=label):
+                        indented = self._a8_indent_gate(base, opening, boundary, pad)
+                        self.assertEqual(_vm_gate_semantic_findings(indented), [],
+                                         "a %s-indented %s gate renders identically and must stay"
+                                         " clean" % (label, gate))
+
+    # -- A8-F4. The AutoCount environment is a VM-context operation. -- #
+    def _a8_step5(self):
+        section = _numbered_step_section(self.create_runbook, VM_GATE_PREFLIGHT_STEP)
+        self.assertNotEqual(section, "", "the runbook must carry step 5")
+        return section
+
+    def test_a8_control_environment_instruction_is_a_vm_context_operation(self):
+        """Accepted A8-F4: the runner reads these variables from its OWN process, on the VM.
+
+        `ac2_member_create_uat_runner.ps1` defaults `ServerName`, `DatabaseName` and `UserId` from
+        `$env:`, so the instruction must sit under the AutoCount VM banner -- and before the VM
+        dry-run that consumes it -- or the documented procedure configures the wrong machine.
+        """
+        section = self._a8_step5()
+        env_at = section.find(VM_GATE_A8_ENV_ANCHOR)
+        self.assertNotEqual(env_at, -1, "step 5 must carry the environment instruction")
+        vm_at = section.find(VM_GATE_A8_VM_BANNER)
+        self.assertNotEqual(vm_at, -1, "step 5 must carry the AutoCount VM execution banner")
+        self.assertLess(vm_at, env_at,
+                        "the AutoCount VM banner must open the VM context BEFORE the environment"
+                        " instruction")
+        laptop_at = section.rfind(VM_GATE_A8_LAPTOP_BANNER, 0, env_at)
+        self.assertLess(laptop_at, vm_at,
+                        "the LAST execution banner before the environment instruction must be the"
+                        " AutoCount VM banner, not the laptop banner")
+        runner_at = section.find(VM_GATE_A5_RUNNER_LINE)
+        self.assertNotEqual(runner_at, -1, "step 5 must carry the dry-run runner invocation")
+        self.assertLess(env_at, runner_at,
+                        "the environment must be configured before the VM dry-run consumes it")
+
+    def _a8_env_paragraph(self, base):
+        at = base.find(VM_GATE_A8_ENV_ANCHOR)
+        self.assertNotEqual(at, -1, "the base must carry the environment instruction")
+        start = base.rfind("\n\n", 0, at) + 2
+        end = base.find("\n\n", at)
+        self.assertNotEqual(end, -1, "the environment instruction must be its own paragraph")
+        return start, end + 2
+
+    def test_a8_control_environment_instruction_moved_to_laptop_context_fails_closed(self):
+        """The regression: moving the instruction back above the VM banner must fail closed.
+
+        The paragraph is not reworded, only relocated to the laptop-context position it held
+        before this amendment, so the reviewed action identity is what must still detect it.
+        """
+        base = self.create_runbook
+        start, end = self._a8_env_paragraph(base)
+        paragraph = base[start:end]
+        removed = base[:start] + base[end:]
+        gate_at = removed.find(VM_GATE_PREFLIGHT_OPENING)
+        self.assertNotEqual(gate_at, -1, "the runbook must carry the step-5 gate")
+        banner_at = removed.find(VM_GATE_A8_VM_BANNER, gate_at)
+        self.assertNotEqual(banner_at, -1, "step 5 must carry the AutoCount VM execution banner")
+        moved = removed[:banner_at] + paragraph + removed[banner_at:]
+        self.assertNotEqual(moved, base,
+                            "relocating the instruction under the laptop banner must actually"
+                            " change the runbook")
+        self.assertIn("preflight_action_text_changed", _vm_gate_semantic_findings(moved),
+                      "an environment instruction moved back under the laptop execution context"
+                      " must fail closed")
+
+    def test_a8_control_environment_instruction_names_variables_only(self):
+        """No host, database, account book, account or password VALUE belongs in this repository."""
+        section = self._a8_step5()
+        for name in VM_GATE_ENV_VARIABLE_NAMES:
+            with self.subTest(variable=name):
+                self.assertIn(name, section, "step 5 must name %r" % (name,))
+                for spelling in VM_GATE_A8_VALUE_ASSIGNMENT_SPELLINGS:
+                    self.assertNotIn(name + spelling, self.create_runbook,
+                                     "%r must never be assigned a value in the runbook"
+                                     % (name,))
+
+    # ---- DL-XB-123-001-A9-C1: inherited fenced-block state controls ---- #
+    # Every control degrades an in-memory copy only, never a repository file, and every one runs
+    # against BOTH bases. The fence state each control depends on is established by the INDEPENDENT
+    # oracle above and never by the checker, so a repair cannot satisfy these by agreeing with
+    # itself.
+
+    def _a9_vm_bases(self):
+        return (("canonical fixture", VM_GATE_CANONICAL_FIXTURE),
+                ("live create-UAT runbook", self.create_runbook))
+
+    def _a9_host_bases(self):
+        return (("host-sync fixture", HOST_SYNC_CANONICAL_FIXTURE),
+                ("live create-UAT runbook", self.create_runbook))
+
+    def _a9_insert_before(self, base, needle, *lines):
+        """Insert whole physical lines immediately in front of the line carrying ``needle``."""
+        self.assertEqual(base.count(needle), 1,
+                         "the base must carry the landmark %r exactly once" % (needle[:48],))
+        at = base.index(needle)
+        start = base.rfind("\n", 0, at) + 1
+        degraded = base[:start] + "".join(line + "\n" for line in lines) + base[start:]
+        self.assertNotEqual(degraded, base, "the inserted lines must change the document")
+        return degraded
+
+    def _a9_authority_at(self, text, needle):
+        at = text.find(needle)
+        self.assertNotEqual(at, -1, "the degraded document must still carry the authority")
+        return at
+
+    def test_a9_control_reviewed_authorities_begin_outside_any_fence(self):
+        """The control group. Without it every RED control below could be vacuously satisfied."""
+        for base_name, base in self._a9_vm_bases():
+            for label, needle, _key, _isolated in VM_GATE_A9_VM_AUTHORITIES:
+                with self.subTest(base=base_name, authority=label):
+                    self.assertIsNone(
+                        _a9_fence_open_at(base, self._a9_authority_at(base, needle)),
+                        "the reviewed %s authority must begin outside any fence" % label)
+        for base_name, base in self._a9_host_bases():
+            with self.subTest(base=base_name, authority="step-3 host-sync"):
+                self.assertIsNone(
+                    _a9_fence_open_at(base, self._a9_authority_at(base, HOST_SYNC_GATE_MARKER)),
+                    "the reviewed host-sync gate must begin outside any fence")
+
+    def test_a9_control_inherited_fence_before_a_vm_authority_fails_closed(self):
+        """Accepted A9-F1: authority rendered as literal code is not operative authority.
+
+        Nothing is added to, removed from or reworded inside any authority. ONE valid fenced-code
+        opener is placed in front of it, which is enough for CommonMark to render the whole
+        authority as the literal contents of a code block.
+        """
+        for base_name, base in self._a9_vm_bases():
+            for label, needle, key, _isolated in VM_GATE_A9_VM_AUTHORITIES:
+                for opener_name, opener in VM_GATE_A9_FENCE_OPENERS:
+                    for indent_name, indent in VM_GATE_A9_OPENER_INDENTS:
+                        with self.subTest(base=base_name, authority=label,
+                                          opener=opener_name, indent=indent_name):
+                            degraded = self._a9_insert_before(base, needle, indent + opener)
+                            at = self._a9_authority_at(degraded, needle)
+                            self.assertIsNotNone(
+                                _a9_fence_open_at(degraded, at),
+                                "the oracle must agree the authority begins inside an open fence")
+                            self.assertIn(key, _vm_gate_semantic_findings(degraded),
+                                          "a %s authority inside inherited fenced code must fail"
+                                          " closed" % label)
+
+    def test_a9_control_inherited_fence_before_the_host_sync_authority_fails_closed(self):
+        """The same rule for the step-3 gate, carried by the existing absent-marker cascade."""
+        for base_name, base in self._a9_host_bases():
+            for opener_name, opener in VM_GATE_A9_FENCE_OPENERS:
+                for indent_name, indent in VM_GATE_A9_OPENER_INDENTS:
+                    with self.subTest(base=base_name, opener=opener_name, indent=indent_name):
+                        degraded = self._a9_insert_before(
+                            base, HOST_SYNC_A9_STEP_HEADING, indent + opener)
+                        at = self._a9_authority_at(degraded, HOST_SYNC_GATE_MARKER)
+                        self.assertIsNotNone(
+                            _a9_fence_open_at(degraded, at),
+                            "the oracle must agree the gate begins inside an open fence")
+                        self.assertIn(HOST_SYNC_A9_CARRIER, _host_sync_semantic_findings(degraded),
+                                      "a host-sync gate inside inherited fenced code must fail"
+                                      " closed")
+
+    def test_a9_control_fence_closing_grammar_decides_inherited_state(self):
+        """A9 must follow the accepted CLOSING grammar, not a bare fence-line toggle.
+
+        A validly closed earlier block leaves nothing inherited and must not create a finding; a
+        closer that CommonMark does not accept -- different marker, shorter run, an info string, or
+        four columns of indentation -- leaves the block open and must fail closed.
+        """
+        for base_name, base in self._a9_vm_bases():
+            for label, needle, key, isolated in VM_GATE_A9_VM_AUTHORITIES:
+                for form, opener, closer, closed in VM_GATE_A9_CLOSING_FORMS:
+                    with self.subTest(base=base_name, authority=label, closing=form):
+                        degraded = self._a9_insert_before(
+                            base, needle, opener, VM_GATE_A9_FILLER, closer)
+                        at = self._a9_authority_at(degraded, needle)
+                        state = _a9_fence_open_at(degraded, at)
+                        findings = _vm_gate_semantic_findings(degraded)
+                        if closed:
+                            self.assertIsNone(state, "the oracle must agree %s closes" % form)
+                            self.assertNotIn(key, findings,
+                                             "an earlier fenced block closed by %s must not make"
+                                             " the %s authority fail" % (form, label))
+                            if isolated:
+                                self.assertEqual(findings, [],
+                                                 "a closed earlier fenced block in front of the %s"
+                                                 " authority must stay clean" % label)
+                        else:
+                            self.assertIsNotNone(state,
+                                                 "the oracle must agree %s leaves the block open"
+                                                 % form)
+                            self.assertIn(key, findings,
+                                          "a block left open by %s must make the %s authority fail"
+                                          " closed" % (form, label))
+
+    def test_a9_control_host_sync_fence_closing_grammar_decides_inherited_state(self):
+        """The same closing contract on the step-3 authority."""
+        for base_name, base in self._a9_host_bases():
+            for form, opener, closer, closed in VM_GATE_A9_CLOSING_FORMS:
+                with self.subTest(base=base_name, closing=form):
+                    degraded = self._a9_insert_before(
+                        base, HOST_SYNC_A9_STEP_HEADING, opener, VM_GATE_A9_FILLER, closer)
+                    at = self._a9_authority_at(degraded, HOST_SYNC_GATE_MARKER)
+                    findings = _host_sync_semantic_findings(degraded)
+                    if closed:
+                        self.assertIsNone(_a9_fence_open_at(degraded, at),
+                                          "the oracle must agree %s closes" % form)
+                        self.assertEqual(findings, [],
+                                         "a closed earlier fenced block in front of the host-sync"
+                                         " authority must stay clean")
+                    else:
+                        self.assertIsNotNone(_a9_fence_open_at(degraded, at),
+                                             "the oracle must agree %s leaves the block open"
+                                             % form)
+                        self.assertIn(HOST_SYNC_A9_CARRIER, findings,
+                                      "a block left open by %s must make the host-sync authority"
+                                      " fail closed" % form)
+
+    def test_a9_control_indented_code_fence_characters_open_no_fence(self):
+        """The positive control. Four columns is indented CODE, so none of these is an opener.
+
+        A9 must not fail closed merely because a line CONTAINS fence characters, or the repair
+        would be a different defect rather than a fix for this one.
+        """
+        for base_name, base in self._a9_vm_bases():
+            for label, needle, key, isolated in VM_GATE_A9_VM_AUTHORITIES:
+                for form, line in VM_GATE_A9_NON_OPENERS:
+                    with self.subTest(base=base_name, authority=label, line=form):
+                        degraded = self._a9_insert_before(base, needle, line)
+                        at = self._a9_authority_at(degraded, needle)
+                        self.assertIsNone(_a9_fence_open_at(degraded, at),
+                                          "the oracle must agree %s opens no fence" % form)
+                        findings = _vm_gate_semantic_findings(degraded)
+                        self.assertNotIn(key, findings,
+                                         "%s is indented code, not an inherited opener, so the %s"
+                                         " authority must not fail on it" % (form, label))
+                        if isolated:
+                            self.assertEqual(findings, [],
+                                             "%s in front of the %s authority must stay clean"
+                                             % (form, label))
+        for base_name, base in self._a9_host_bases():
+            for form, line in VM_GATE_A9_NON_OPENERS:
+                with self.subTest(base=base_name, authority="step-3 host-sync", line=form):
+                    degraded = self._a9_insert_before(base, HOST_SYNC_A9_STEP_HEADING, line)
+                    at = self._a9_authority_at(degraded, HOST_SYNC_GATE_MARKER)
+                    self.assertIsNone(_a9_fence_open_at(degraded, at),
+                                      "the oracle must agree %s opens no fence" % form)
+                    self.assertEqual(_host_sync_semantic_findings(degraded), [],
+                                     "%s is indented code, not an inherited opener" % form)
+
+    # ---- DL-XB-123-001-A10-C1: opening-fence VALIDITY controls ---- #
+    # Same discipline as A9: every control degrades an in-memory copy only, never a repository file,
+    # every one runs against BOTH bases, and the fence state each depends on comes from the
+    # INDEPENDENT A10 oracle rather than from the checker, so a repair cannot satisfy these by
+    # agreeing with itself. The A9 authority table is reused deliberately -- the truthful carrier and
+    # the measured `isolated` verdict for the A10 two-line sequence are the same as for A9's single
+    # opener, and writing the table a second way is the drift the accepted A3 finding is about.
+
+    def _a10_invalid_opener(self, indent, run, suffix):
+        """The line under test, with the oracle's verdict asserted before it is used."""
+        line = indent + run + suffix
+        self.assertIsNone(_a10_opens_fence(line),
+                          "the oracle must reject %r as an opening fence" % (line,))
+        return line
+
+    def _a10_sequence_cases(self):
+        """Bounded coverage of the three A10 axes, varying one axis at a time.
+
+        Deliberately not a full cross product: each axis is exercised against a fixed, already
+        demonstrated baseline case, which keeps the control set bounded while still covering every
+        run length, every invalid info-string position, every permitted indentation and every
+        genuine-opener length the lock requires.
+        """
+        cases = []
+        for run_name, run in VM_GATE_A10_OPENING_RUNS:
+            for delta_name, delta in VM_GATE_A10_GENUINE_RUN_DELTAS:
+                cases.append(("run_%s_genuine_%s" % (run_name, delta_name), "", run, "js`", delta))
+        for info_name, suffix in VM_GATE_A10_INVALID_BACKTICK_INFO:
+            cases.append(("info_%s" % info_name, "", "```", suffix, 0))
+        for indent_name, indent in VM_GATE_A9_OPENER_INDENTS:
+            cases.append(("indent_%s" % indent_name, indent, "```", "js`", 0))
+        return tuple(cases)
+
+    def test_a10_control_independent_oracle_states_opening_validity(self):
+        """The control group. Without it every RED control below could be vacuously satisfied.
+
+        This asserts the ORACLE only -- no production helper is called -- so it states the accepted
+        CommonMark distinction independently of whatever the checker currently believes.
+        """
+        for run_name, run in VM_GATE_A10_OPENING_RUNS:
+            for indent_name, indent in VM_GATE_A9_OPENER_INDENTS:
+                for info_name, suffix in VM_GATE_A10_INVALID_BACKTICK_INFO:
+                    with self.subTest(run=run_name, indent=indent_name, info=info_name):
+                        self._a10_invalid_opener(indent, run, suffix)
+        for name, run, info in VM_GATE_A10_VALID_INFO:
+            for indent_name, indent in VM_GATE_A9_OPENER_INDENTS:
+                with self.subTest(valid=name, indent=indent_name):
+                    self.assertEqual(_a10_opens_fence(indent + run + info), (run[0], len(run)),
+                                     "%s must remain a valid opening fence" % name)
+        # Backticks ADJACENT to the run extend the run; the info string is then empty, so the line
+        # is a valid longer opener rather than an invalid one. A10 must not confuse the two.
+        self.assertEqual(_a10_opens_fence("````" + "`"), ("`", 5),
+                         "backticks after the run belong to the run")
+        self.assertEqual(_a10_opens_fence("```"), ("`", 3))
+        self.assertEqual(_a10_opens_fence("~~~"), ("~", 3))
+
+    def test_a10_control_shared_opening_grammar_matches_the_oracle(self):
+        """The shared production opener grammar must agree with the independent oracle.
+
+        RED at exact T: the production grammar accepts a backtick run followed by an info string
+        that itself contains a backtick, which CommonMark does not.
+        """
+        for run_name, run in VM_GATE_A10_OPENING_RUNS:
+            for indent_name, indent in VM_GATE_A9_OPENER_INDENTS:
+                for info_name, suffix in VM_GATE_A10_INVALID_BACKTICK_INFO:
+                    with self.subTest(run=run_name, indent=indent_name, info=info_name):
+                        line = self._a10_invalid_opener(indent, run, suffix)
+                        self.assertIsNone(_fence_opening(line),
+                                          "a backtick fence whose info string carries a backtick"
+                                          " opens nothing: %r" % (line,))
+        for name, run, info in VM_GATE_A10_VALID_INFO:
+            for indent_name, indent in VM_GATE_A9_OPENER_INDENTS:
+                with self.subTest(valid=name, indent=indent_name):
+                    line = indent + run + info
+                    self.assertEqual(_fence_opening(line), _a10_opens_fence(line),
+                                     "%s must stay an opener the shared grammar recognises" % name)
+        for name, line in VM_GATE_A9_NON_OPENERS:
+            with self.subTest(non_opener=name):
+                self.assertIsNone(_a10_opens_fence(line),
+                                  "the oracle must agree %s opens no fence" % name)
+                self.assertIsNone(_fence_opening(line),
+                                  "%s is indented code, not an opener" % name)
+        self.assertEqual(_fence_opening("`````"), ("`", 5),
+                         "adjacent backticks must still extend the opening run")
+
+    def test_a10_control_closing_grammar_is_unchanged(self):
+        """A10 touches OPENING validity only. Every closing verdict must stay exactly as accepted."""
+        for name, opener, closer, closed in VM_GATE_A10_CLOSING_FORMS:
+            with self.subTest(closing=name):
+                state = _a10_opens_fence(opener)
+                self.assertIsNotNone(state, "the %s opener must open a block" % name)
+                self.assertEqual(_fence_opening(opener), state,
+                                 "the shared grammar must open the %s block too" % name)
+                self.assertEqual(_a10_closes_fence(closer, state), closed,
+                                 "the oracle's %s closing verdict must be %r" % (name, closed))
+                self.assertEqual(_fence_closes(closer, state), closed,
+                                 "the shared grammar's %s closing verdict must be %r"
+                                 % (name, closed))
+
+    def test_a10_control_invalid_backtick_info_before_a_vm_authority_fails_closed(self):
+        """The A10 defect, at every protected VM authority.
+
+        Nothing is added to, removed from or reworded inside any authority. TWO physical lines are
+        placed in front of it: a backtick run whose info string carries a backtick, which opens
+        nothing, followed by a GENUINE opener. CommonMark renders the authority as the literal
+        contents of a code block; at exact T the checker cancelled the two against each other and
+        reported the authority as operative prose.
+        """
+        for base_name, base in self._a9_vm_bases():
+            for label, needle, key, _isolated in VM_GATE_A9_VM_AUTHORITIES:
+                for case, indent, run, suffix, delta in self._a10_sequence_cases():
+                    with self.subTest(base=base_name, authority=label, case=case):
+                        invalid = self._a10_invalid_opener(indent, run, suffix)
+                        genuine = "`" * (len(run) + delta)
+                        degraded = self._a9_insert_before(base, needle, invalid, genuine)
+                        at = self._a9_authority_at(degraded, needle)
+                        self.assertIsNotNone(
+                            _a9_fence_open_at(degraded, at),
+                            "the oracle must agree the authority begins inside an open fence")
+                        self.assertIsNotNone(
+                            _block_state_at(degraded, at),
+                            "the checker's inherited state must agree with the rendered state")
+                        self.assertIn(key, _vm_gate_semantic_findings(degraded),
+                                      "a %s authority inside inherited fenced code must fail"
+                                      " closed" % label)
+
+    def test_a10_control_invalid_backtick_info_before_the_host_sync_authority_fails_closed(self):
+        """The same defect at the step-3 gate, carried by the existing absent-marker cascade."""
+        for base_name, base in self._a9_host_bases():
+            for case, indent, run, suffix, delta in self._a10_sequence_cases():
+                with self.subTest(base=base_name, case=case):
+                    invalid = self._a10_invalid_opener(indent, run, suffix)
+                    genuine = "`" * (len(run) + delta)
+                    degraded = self._a9_insert_before(
+                        base, HOST_SYNC_A9_STEP_HEADING, invalid, genuine)
+                    at = self._a9_authority_at(degraded, HOST_SYNC_GATE_MARKER)
+                    self.assertIsNotNone(
+                        _a9_fence_open_at(degraded, at),
+                        "the oracle must agree the gate begins inside an open fence")
+                    self.assertEqual(_unblocked(degraded, at), -1,
+                                     "a gate marker rendered as code must be treated as absent")
+                    self.assertIn(HOST_SYNC_A9_CARRIER, _host_sync_semantic_findings(degraded),
+                                  "a host-sync gate inside inherited fenced code must fail closed")
+
+    def test_a10_control_valid_openers_still_fence_the_authority(self):
+        """The positive control: A10 narrows opener acceptance, and only where CommonMark does.
+
+        Every valid opening fence A9 recognised -- including a TILDE fence whose info string carries
+        backticks, tildes or both -- must still open a block and must still make the authority behind
+        it fail closed. A repair that rejected a line merely for CONTAINING a backtick would pass the
+        RED controls above and quietly delete this accepted A9 protection.
+        """
+        for base_name, base in self._a9_vm_bases():
+            for label, needle, key, _isolated in VM_GATE_A9_VM_AUTHORITIES:
+                for name, run, info in VM_GATE_A10_VALID_INFO:
+                    with self.subTest(base=base_name, authority=label, opener=name):
+                        degraded = self._a9_insert_before(base, needle, run + info)
+                        at = self._a9_authority_at(degraded, needle)
+                        self.assertIsNotNone(_a9_fence_open_at(degraded, at),
+                                             "the oracle must agree %s opens a fence" % name)
+                        self.assertIn(key, _vm_gate_semantic_findings(degraded),
+                                      "a %s authority behind the valid opener %s must fail closed"
+                                      % (label, name))
+        for base_name, base in self._a9_host_bases():
+            for name, run, info in VM_GATE_A10_VALID_INFO:
+                with self.subTest(base=base_name, authority="step-3 host-sync", opener=name):
+                    degraded = self._a9_insert_before(
+                        base, HOST_SYNC_A9_STEP_HEADING, run + info)
+                    at = self._a9_authority_at(degraded, HOST_SYNC_GATE_MARKER)
+                    self.assertIsNotNone(_a9_fence_open_at(degraded, at),
+                                         "the oracle must agree %s opens a fence" % name)
+                    self.assertIn(HOST_SYNC_A9_CARRIER, _host_sync_semantic_findings(degraded),
+                                  "the host-sync gate behind the valid opener %s must fail closed"
+                                  % name)
+
+
+    # ---- DL-XB-123-001-A11-C1: post-ready Codex four-finding controls ---- #
+    # Every control degrades an in-memory copy only, never a repository file, and every structural
+    # control runs against BOTH bases. The raw-block state each A11-F1 control depends on is
+    # established by the INDEPENDENT oracle above and never by the checker, so a repair cannot
+    # satisfy these by agreeing with itself.
+
+    def _a11_bases(self):
+        return (("A11 target fixture", VM_GATE_A11_FIXTURE),
+                ("live create-UAT runbook", self.create_runbook))
+
+    def _a11_replace(self, base, old, new, label):
+        self.assertIn(old, base, "the base must carry %s exactly once" % label)
+        self.assertEqual(base.count(old), 1, "%s must be unambiguous" % label)
+        degraded = base.replace(old, new, 1)
+        self.assertNotEqual(degraded, base, "the %s mutation must change the document" % label)
+        return degraded
+
+    # -- A11-F1: inherited CommonMark HTML-block state -- #
+    def test_a11_control_html_oracle_covers_all_seven_families(self):
+        """The oracle itself, before it is used to judge anything.
+
+        Seven families, four permitted indents, opening and end conditions, and the four-column
+        exclusion. A control group for a control: an oracle that recognised nothing would make every
+        RED control below vacuous.
+        """
+        seen = set()
+        for name, kind, opener, closer in VM_GATE_A11_HTML_FAMILIES:
+            seen.add(kind)
+            for indent_name, indent in VM_GATE_A11_HTML_INDENTS:
+                with self.subTest(family=name, indent=indent_name):
+                    self.assertEqual(_a11_html_opens(indent + opener, False), kind,
+                                     "%s must open a type-%d block at %s indent"
+                                     % (name, kind, indent_name))
+                    self.assertFalse(_a11_html_ends(indent + VM_GATE_A11_HTML_FILLER, kind),
+                                     "ordinary content must not end a type-%d block" % kind)
+                    self.assertTrue(_a11_html_ends(closer, kind),
+                                    "%r must satisfy the type-%d end condition" % (closer, kind))
+        self.assertEqual(seen, {1, 2, 3, 4, 5, 6, 7},
+                         "every CommonMark HTML-block family must be covered")
+        for name, line in VM_GATE_A11_HTML_NON_OPENERS:
+            with self.subTest(non_opener=name):
+                self.assertIsNone(_a11_html_opens(line, False),
+                                  "%s opens no HTML block" % name)
+        # Type 7 alone cannot interrupt a paragraph; types 1 to 6 can.
+        for name, kind, opener, _closer in VM_GATE_A11_HTML_FAMILIES:
+            with self.subTest(interrupt=name):
+                expected = None if kind == 7 else kind
+                self.assertEqual(_a11_html_opens(opener, True), expected,
+                                 "%s paragraph-interruption behaviour must match CommonMark" % name)
+        # Types 1 to 5 may satisfy their end condition on the START line.
+        self.assertTrue(_a11_html_ends("<!-- note -->", 2))
+        self.assertFalse(_a11_html_ends("<div>", 6), "only a blank line ends a type-6 block")
+
+    def test_a11_control_reviewed_authorities_begin_outside_any_raw_block(self):
+        """The control group. Without it every RED control below could be vacuously satisfied."""
+        for base_name, base in self._a11_bases():
+            for label, needle, _key in VM_GATE_A11_HTML_AUTHORITIES:
+                with self.subTest(base=base_name, authority=label):
+                    self.assertIsNone(
+                        _a11_block_open_at(base, self._a9_authority_at(base, needle)),
+                        "the reviewed %s authority must begin outside any raw block" % label)
+        with self.subTest(authority="step-3 host-sync"):
+            at = self._a9_authority_at(self.create_runbook, HOST_SYNC_A11_GATE_OPENING)
+            self.assertIsNone(_a11_block_open_at(self.create_runbook, at),
+                              "the reviewed host-sync gate must begin outside any raw block")
+
+    def test_a11_control_html_block_before_a_vm_authority_fails_closed(self):
+        """A11-F1, at every protected VM authority, for all seven HTML-block families.
+
+        Nothing is added to, removed from or reworded inside any authority. ONE physical line is
+        placed in front of it, and CommonMark renders the authority as raw HTML-block content. At
+        exact V the checker modelled fenced code only, compared the authority as operative approval
+        prose, and reported the complete guard clean.
+        """
+        for base_name, base in self._a11_bases():
+            for label, needle, key in VM_GATE_A11_HTML_AUTHORITIES:
+                for name, kind, opener, _closer in VM_GATE_A11_HTML_FAMILIES:
+                    for indent_name, indent in VM_GATE_A11_HTML_INDENTS:
+                        with self.subTest(base=base_name, authority=label, family=name,
+                                          indent=indent_name):
+                            degraded = self._a9_insert_before(base, needle, indent + opener)
+                            at = self._a9_authority_at(degraded, needle)
+                            self.assertEqual(
+                                _a11_block_open_at(degraded, at), ("html", kind),
+                                "the oracle must agree the authority begins inside a type-%d HTML"
+                                " block" % kind)
+                            self.assertIn(key, _vm_gate_semantic_findings(degraded),
+                                          "a %s authority inside inherited HTML-block content must"
+                                          " fail closed" % label)
+
+    def test_a11_control_html_block_before_the_host_sync_authority_fails_closed(self):
+        """The same defect at the step-3 gate, carried by the existing absent-marker cascade."""
+        for name, kind, opener, _closer in VM_GATE_A11_HTML_FAMILIES:
+            for indent_name, indent in VM_GATE_A11_HTML_INDENTS:
+                with self.subTest(family=name, indent=indent_name):
+                    degraded = self._a9_insert_before(
+                        self.create_runbook, HOST_SYNC_A11_GATE_OPENING, indent + opener)
+                    at = self._a9_authority_at(degraded, HOST_SYNC_GATE_MARKER)
+                    self.assertEqual(_a11_block_open_at(degraded, at), ("html", kind),
+                                     "the oracle must agree the gate begins inside an HTML block")
+                    self.assertIn(HOST_SYNC_A11_CARRIER, _host_sync_semantic_findings(degraded),
+                                  "a host-sync gate inside inherited HTML-block content must fail"
+                                  " closed")
+
+    def test_a11_control_crlf_html_openers_still_hide_the_authority(self):
+        """A CRLF checkout must not defeat the repair: `\\r` is line-ending syntax, not content."""
+        for base_name, base in self._a11_bases():
+            for label, needle, key in VM_GATE_A11_HTML_AUTHORITIES:
+                for name, kind, opener, _closer in VM_GATE_A11_HTML_FAMILIES:
+                    with self.subTest(base=base_name, authority=label, family=name):
+                        degraded = self._a9_insert_before(base, needle, opener + "\r")
+                        at = self._a9_authority_at(degraded, needle)
+                        self.assertEqual(_a11_block_open_at(degraded, at), ("html", kind),
+                                         "the oracle must read a CRLF opener as a type-%d opener"
+                                         % kind)
+                        self.assertIn(key, _vm_gate_semantic_findings(degraded),
+                                      "a CRLF %s opener must still fail the %s authority closed"
+                                      % (name, label))
+
+    def test_a11_control_html_block_closed_before_the_authority_stays_clean(self):
+        """The positive control: a block that validly ENDS before the authority is not a finding.
+
+        A repair that fired merely because HTML appeared anywhere in the document would pass every
+        RED control above and make the runbook unmaintainable.
+        """
+        for base_name, base in self._a11_bases():
+            for label, needle, key in VM_GATE_A11_HTML_AUTHORITIES:
+                for name, kind, opener, closer in VM_GATE_A11_HTML_FAMILIES:
+                    with self.subTest(base=base_name, authority=label, family=name):
+                        lines = ([opener, VM_GATE_A11_HTML_FILLER, closer, ""]
+                                 if closer else [opener, VM_GATE_A11_HTML_FILLER, ""])
+                        degraded = self._a9_insert_before(base, needle, *lines)
+                        at = self._a9_authority_at(degraded, needle)
+                        self.assertIsNone(
+                            _a11_block_open_at(degraded, at),
+                            "the oracle must agree the type-%d block closed before the authority"
+                            % kind)
+                        self.assertNotIn(key, _vm_gate_semantic_findings(degraded),
+                                         "a closed %s block before the %s authority is not drift"
+                                         % (name, label))
+
+    def test_a11_control_html_after_the_authority_is_not_material(self):
+        """Harmless HTML that begins AFTER every protected authority must stay clean.
+
+        The HTML is placed under its own new top-level section, because appending it INSIDE the
+        `## Safety boundary` -- the document's last section -- would change that reviewed section,
+        which the A8 identity already fails closed on and which is not what this control is about.
+        """
+        for base_name, base in self._a11_bases():
+            for name, _kind, opener, _closer in VM_GATE_A11_HTML_FAMILIES:
+                with self.subTest(base=base_name, family=name):
+                    degraded = base + "\n## Appendix\n\n" + opener + "\n"
+                    self.assertEqual(_vm_gate_semantic_findings(degraded), _vm_gate_semantic_findings(base),
+                                     "%s after every authority must change nothing" % name)
+
+    def test_a11_control_raw_block_families_do_not_open_inside_one_another(self):
+        """Sequencing: a fence opener inside an HTML block is content, and the reverse."""
+        for base_name, base in self._a11_bases():
+            for label, needle, key in VM_GATE_A11_HTML_AUTHORITIES:
+                with self.subTest(base=base_name, authority=label, case="fence_inside_html"):
+                    degraded = self._a9_insert_before(base, needle, "<script>", "```", "~~~")
+                    at = self._a9_authority_at(degraded, needle)
+                    self.assertEqual(_a11_block_open_at(degraded, at), ("html", 1),
+                                     "a fence line inside a type-1 HTML block is block content")
+                    self.assertIn(key, _vm_gate_semantic_findings(degraded))
+                with self.subTest(base=base_name, authority=label, case="html_inside_fence"):
+                    degraded = self._a9_insert_before(base, needle, "```", "<script>", "<div>")
+                    at = self._a9_authority_at(degraded, needle)
+                    self.assertEqual(_a11_block_open_at(degraded, at), ("fence", "`", 3),
+                                     "an HTML opener inside a fenced block is block content")
+                    self.assertIn(key, _vm_gate_semantic_findings(degraded))
+                with self.subTest(base=base_name, authority=label, case="fence_closes_then_html"):
+                    degraded = self._a9_insert_before(
+                        base, needle, "```", VM_GATE_A11_HTML_FILLER, "```", "<script>")
+                    at = self._a9_authority_at(degraded, needle)
+                    self.assertEqual(_a11_block_open_at(degraded, at), ("html", 1),
+                                     "an HTML opener AFTER a closed fence opens its own block")
+                    self.assertIn(key, _vm_gate_semantic_findings(degraded))
+
+    def test_a11_control_unclosed_html_block_runs_to_end_of_document(self):
+        """End-of-document behaviour, stated rather than assumed: an unclosed block stays open."""
+        for base_name, base in self._a11_bases():
+            for name, kind, opener, closer in VM_GATE_A11_HTML_FAMILIES:
+                if not closer:
+                    continue
+                with self.subTest(base=base_name, family=name):
+                    text = base + "\n" + opener + "\n"
+                    self.assertEqual(_a11_block_open_at(text, len(text)), ("html", kind),
+                                     "%s left unclosed must stay open through the end" % name)
+
+    # -- A11-F2: whole-procedure protected-operation placement -- #
+    def _a11_step_openings(self, text):
+        return {step: at for at, step in _numbered_heading_openings(text)}
+
+    def _a11_inject_operation(self, base, step, line):
+        """Append one ACTIVE protected operation line to the end of numbered step ``step``."""
+        openings = self._a11_step_openings(base)
+        self.assertIn(step, openings, "the base must carry step %d" % step)
+        following = sorted(at for at in openings.values() if at > openings[step])
+        end = following[0] if following else len(base)
+        block = "\n```powershell\n" + line + "\n```\n\n"
+        degraded = base[:end] + block + base[end:]
+        self.assertNotEqual(degraded, base, "the injected operation must change the document")
+        return degraded
+
+    def test_a11_control_canonical_protected_operations_stay_in_their_regions(self):
+        """The control group: every reviewed protected operation already sits where it belongs."""
+        for base_name, base in self._a11_bases():
+            with self.subTest(base=base_name):
+                self.assertNotIn("protected_operation_outside_region", _vm_gate_semantic_findings(base),
+                                 "the reviewed document keeps every protected operation inside its"
+                                 " authorised action region")
+
+    def test_a11_control_extra_protected_operation_outside_its_region_fails_closed(self):
+        """A11-F2, for every recognised operation family at several positions.
+
+        The canonical gated operation is left completely intact; a SECOND active instance of it is
+        added somewhere else in the procedure. At exact V the deployment and preflight guards read
+        only their own resolved sections, so the complete guard stayed clean.
+        """
+        for base_name, base in self._a11_bases():
+            present = set(self._a11_step_openings(base))
+            for name, anchor, allowed, _fold in VM_GATE_A11_PROTECTED_OPERATIONS:
+                for step in VM_GATE_A11_PLACEMENT_STEPS:
+                    if step in allowed or step not in present:
+                        continue
+                    with self.subTest(base=base_name, operation=name, step=step):
+                        degraded = self._a11_inject_operation(base, step, anchor)
+                        self.assertIn("protected_operation_outside_region",
+                                      _vm_gate_semantic_findings(degraded),
+                                      "an active %s outside its authorised region must fail closed"
+                                      % name)
+
+    def test_a11_control_non_operational_mentions_are_not_protected_operations(self):
+        """Positive control: a mention, an echo, a comment and prose are not the operation."""
+        for base_name, base in self._a11_bases():
+            present = set(self._a11_step_openings(base))
+            for name, anchor, allowed, _fold in VM_GATE_A11_PROTECTED_OPERATIONS:
+                for step in VM_GATE_A11_PLACEMENT_STEPS:
+                    if step in allowed or step not in present:
+                        continue
+                    for inert_name, template in VM_GATE_A11_PLACEMENT_INERT:
+                        with self.subTest(base=base_name, operation=name, step=step,
+                                          inert=inert_name):
+                            degraded = self._a11_inject_operation(
+                                base, step, template % anchor)
+                            self.assertNotIn("protected_operation_outside_region",
+                                             _vm_gate_semantic_findings(degraded),
+                                             "an inert %s mention is not an operation" % name)
+
+    # -- A11-F3: operator-directed destructive cleanup -- #
+    def test_a11_control_destructive_inventory_is_complete(self):
+        """Every destructive instruction in the reviewed runbook is enumerated, and each is gated."""
+        for phrase, pattern in zip(VM_GATE_A11_DESTRUCTIVE_PHRASES,
+                                   VM_GATE_A11_DESTRUCTIVE_PATTERNS):
+            with self.subTest(phrase=phrase):
+                self.assertTrue(pattern.search(self.create_runbook),
+                                "the inventory must name a real runbook instruction")
+        self.assertIn(VM_GATE_A11_CLEANUP_REVIEWED_GATE, self.create_runbook,
+                      "the runbook must carry the reviewed destructive-cleanup gate")
+        self.assertNotIn("destructive_cleanup_not_gated", _vm_gate_semantic_findings(self.create_runbook),
+                         "every destructive instruction must carry its own current-turn gate")
+        self.assertNotIn("destructive_cleanup_gate_text_changed",
+                         _vm_gate_semantic_findings(self.create_runbook))
+
+    def _a11_move_gate_after_its_block(self, base):
+        gate = VM_GATE_A11_CLEANUP_REVIEWED_GATE
+        at = base.index(gate)
+        body_start = at + len(gate)
+        while base.startswith("\n", body_start):
+            body_start += 1
+        body_end = base.find("\n\n", body_start)
+        self.assertNotEqual(body_end, -1, "the governed block must be followed by a blank line")
+        body = base[body_start:body_end + 1]
+        return base[:at] + body + "\n" + gate + base[body_end + 1:]
+
+    def _a11_cleanup_mutate(self, base, name):
+        gate = VM_GATE_A11_CLEANUP_REVIEWED_GATE
+        self.assertIn(gate, base, "the base must carry the reviewed destructive-cleanup gate")
+        if name == "gate_removed":
+            return base.replace(gate, "", 1)
+        if name == "gate_moved_after_instruction":
+            return self._a11_move_gate_after_its_block(base)
+        return base.replace(gate, VM_GATE_A11_CLEANUP_REPLACEMENTS[name], 1)
+
+    def test_a11_control_destructive_cleanup_mutations_fail_closed(self):
+        """A11-F3: removal, relocation, prior-turn wording and every substituted authority."""
+        for base_name, base in self._a11_bases():
+            for name, key in VM_GATE_A11_CLEANUP_MUTATIONS:
+                with self.subTest(base=base_name, mutation=name):
+                    degraded = self._a11_cleanup_mutate(base, name)
+                    self.assertNotEqual(degraded, base, "the mutation must change the document")
+                    self.assertIn(key, _vm_gate_semantic_findings(degraded),
+                                  "the %s mutation must fail closed" % name)
+
+    def test_a11_control_destructive_prohibitions_are_not_instructions(self):
+        """Positive control: "never delete", "do not delete" and "do not sweep" stay non-material.
+
+        The reviewed runbook deliberately RETAINS evidence, and a guard that treated a prohibition
+        as an operator-directed deletion would force a gate in front of a rule that forbids one.
+        """
+        for base_name, base in self._a11_bases():
+            for phrase in VM_GATE_A11_DESTRUCTIVE_PROHIBITIONS:
+                with self.subTest(base=base_name, prohibition=phrase):
+                    degraded = base + "\nA reminder: " + phrase + ".\n"
+                    self.assertNotIn("destructive_cleanup_not_gated", _vm_gate_semantic_findings(degraded),
+                                     "a prohibition is not an operator-directed deletion")
+
+    # -- A11-F4: the step-9 live mapping and step-10 conditional recovery gates -- #
+    def _a11_gate_mutate(self, base, block, action, name, replacements):
+        self.assertIn(block, base, "the base must carry the reviewed gate block")
+        if name.startswith("gate_removed"):
+            return base.replace(block, "", 1)
+        if name.startswith("gate_after"):
+            self.assertIn(block + action, base, "the gate must immediately precede its action")
+            return base.replace(block + action, action + block, 1)
+        old, new = replacements[name]
+        self.assertIn(old, block, "the reviewed gate must carry %r" % (old[:48],))
+        return base.replace(block, block.replace(old, new, 1), 1)
+
+    def test_a11_control_canonical_mapping_and_recovery_gates_stay_clean(self):
+        """The control group for both new surfaces, on both bases."""
+        for base_name, base in self._a11_bases():
+            with self.subTest(base=base_name):
+                findings = _vm_gate_semantic_findings(base)
+                self.assertEqual([key for key in findings
+                                  if key.startswith(("mapping_", "recovery_"))], [],
+                                 "the reviewed step-9 and step-10 gates must satisfy the contract")
+
+    def test_a11_control_mapping_gate_mutations_fail_closed(self):
+        """A11-F4, step 9: removal, relocation after the first live action, reuse and every
+        missing binding."""
+        for base_name, base in self._a11_bases():
+            for name, key in VM_GATE_A11_MAPPING_MUTATIONS:
+                with self.subTest(base=base_name, mutation=name):
+                    degraded = self._a11_gate_mutate(
+                        base, VM_GATE_A11_MAPPING_REVIEWED_BLOCK,
+                        VM_GATE_A11_MAPPING_REVIEWED_ACTION, name,
+                        VM_GATE_A11_MAPPING_REPLACEMENTS)
+                    self.assertNotEqual(degraded, base, "the mutation must change the document")
+                    self.assertIn(key, _vm_gate_semantic_findings(degraded),
+                                  "the step-9 %s mutation must fail closed" % name)
+
+    def test_a11_control_recovery_gate_mutations_fail_closed(self):
+        """A11-F4, step 10: removal, relocation after the lookup begins, reuse and every missing
+        binding."""
+        for base_name, base in self._a11_bases():
+            for name, key in VM_GATE_A11_RECOVERY_MUTATIONS:
+                with self.subTest(base=base_name, mutation=name):
+                    degraded = self._a11_gate_mutate(
+                        base, VM_GATE_A11_RECOVERY_REVIEWED_BLOCK,
+                        VM_GATE_A11_RECOVERY_REVIEWED_ACTION, name,
+                        VM_GATE_A11_RECOVERY_REPLACEMENTS)
+                    self.assertNotEqual(degraded, base, "the mutation must change the document")
+                    self.assertIn(key, _vm_gate_semantic_findings(degraded),
+                                  "the step-10 %s mutation must fail closed" % name)
+
+    def test_a11_control_mapping_and_recovery_actions_are_identity_protected(self):
+        """The action regions must carry the same identity discipline steps 4 and 5 already have."""
+        cases = ((VM_GATE_A11_MAPPING_REVIEWED_ACTION, "mapping_action_text_changed"),
+                 (VM_GATE_A11_RECOVERY_REVIEWED_ACTION, "recovery_action_text_changed"))
+        for base_name, base in self._a11_bases():
+            for action, key in cases:
+                with self.subTest(base=base_name, key=key):
+                    self.assertIn(action, base, "the base must carry the reviewed action region")
+                    degraded = base.replace(
+                        action,
+                        action.rstrip("\n") + "\nThe approval above is optional here.\n\n", 1)
+                    self.assertIn(key, _vm_gate_semantic_findings(degraded),
+                                  "an action-region revocation must fail closed")
+
+    # -- A11: the corrected Safety boundary -- #
+    def test_a11_control_safety_boundary_states_no_fixed_total(self):
+        """The reviewed boundary must keep the four baseline surfaces AND name the conditional
+        ones, without asserting any fixed total."""
+        for base_name, base in self._a11_bases():
+            with self.subTest(base=base_name):
+                self.assertIn(VM_GATE_A11_SAFETY_REVIEWED_SECTION, base,
+                              "the base must carry the corrected Safety boundary")
+                flat = _flat(base).lower()
+                for token in VM_GATE_A11_SAFETY_TOKENS:
+                    self.assertIn(token, flat, "the corrected boundary must state %r" % (token[:48],))
+                self.assertNotIn("are four independent approval surfaces", flat,
+                                 "the incorrect fixed total must be retired")
+                self.assertNotIn("safety_boundary_surfaces_incomplete", _vm_gate_semantic_findings(base))
+        preserved = _flat(VM_GATE_A11_SAFETY_REVIEWED_SECTION)
+        for token in VM_GATE_A5_SAFETY_STEP5_SCOPE:
+            with self.subTest(preserved=token):
+                self.assertIn(token, preserved,
+                              "the reviewed step-5 surface scope must be preserved verbatim")
+
+    def _a11_safety_mutate(self, base, position, sentence):
+        section = VM_GATE_A11_SAFETY_REVIEWED_SECTION
+        self.assertIn(section, base, "the base must carry the corrected Safety boundary")
+        if position == "prepend":
+            mutated = section.replace("## Safety boundary\n\n",
+                                      "## Safety boundary\n\n" + sentence + "\n\n", 1)
+        elif position == "append":
+            mutated = section.rstrip("\n") + " " + sentence + "\n"
+        else:
+            mutated = section.rstrip("\n") + "\n" + sentence + "\n"
+        return base.replace(section, mutated, 1)
+
+    def test_a11_control_safety_boundary_contradictions_fail_closed(self):
+        """A contradiction INSIDE the one corrected boundary must fail closed, in three placements."""
+        for base_name, base in self._a11_bases():
+            for label, position, sentence in VM_GATE_A11_SAFETY_CONTRADICTIONS:
+                with self.subTest(base=base_name, contradiction=label):
+                    degraded = self._a11_safety_mutate(base, position, sentence)
+                    self.assertNotEqual(degraded, base, "the contradiction must change the section")
+                    self.assertIn("safety_boundary_surfaces_incomplete", _vm_gate_semantic_findings(degraded),
+                                  "the %s contradiction must fail closed" % label)
+
+    def test_a11_control_safety_boundary_required_bullets_cannot_be_removed(self):
+        """Removing the baseline four, the conditional surfaces or the no-fixed-total rule fails."""
+        section = VM_GATE_A11_SAFETY_REVIEWED_SECTION
+        for base_name, base in self._a11_bases():
+            for label, opening in VM_GATE_A11_SAFETY_REQUIRED_BULLETS:
+                with self.subTest(base=base_name, bullet=label):
+                    at = section.index(opening)
+                    end = section.find("\n- ", at)
+                    self.assertNotEqual(end, -1, "the bullet must be followed by another")
+                    mutated = section[:at] + section[end + 1:]
+                    degraded = self._a11_replace(base, section, mutated, "the Safety boundary")
+                    self.assertIn("safety_boundary_surfaces_incomplete", _vm_gate_semantic_findings(degraded),
+                                  "removing the %s bullet must fail closed" % label)
+
+    # -- A11: declared surface, reachability, purity and the target document -- #
+    def test_a11_target_fixture_and_live_runbook_satisfy_the_whole_a11_contract(self):
+        # The A11 proposition is SEMANTIC, and the miniature fixture is deliberately not the
+        # reviewed runbook, so it is asserted against the semantic layer for both bases. The live
+        # runbook additionally has to clear the PUBLIC sealed guard, which the fixture cannot.
+        for base_name, base in self._a11_bases():
+            with self.subTest(base=base_name):
+                self.assertEqual(_vm_gate_semantic_findings(base), [],
+                                 "%s must satisfy every DL-XB-123-001-A11 requirement" % base_name)
+        self.assertEqual(vm_gate_findings(self.create_runbook), [],
+                         "the live runbook must also clear the public sealed guard")
+        self.assertEqual(vm_gate_findings(VM_GATE_A11_FIXTURE), [REVIEWED_RUNBOOK_SEAL_KEY],
+                         "the miniature fixture is semantically clean but is NOT the reviewed "
+                         "runbook, so the public guard must report exactly the seal")
+
+    def test_a11_control_finding_keys_are_declared_unique_and_reachable(self):
+        # Each revision adds its own declared keys on top of the previous surface and retires none,
+        # so every historical total is asserted alongside the current one rather than one replacing
+        # the other. A revision that quietly reused an earlier count would fail here.
+        self.assertEqual(len(VM_GATE_A11_NEW_KEYS) + 50, VM_GATE_A11_FINDING_KEY_COUNT,
+                         "the historical A11 semantic total must stay truthful")
+        self.assertEqual(VM_GATE_R2_SEMANTIC_FINDING_KEY_COUNT - VM_GATE_A11_FINDING_KEY_COUNT,
+                         len(VM_GATE_R2_NEW_KEYS),
+                         "the historical R2 semantic total must stay truthful")
+        self.assertEqual(len(VM_GATE_SEMANTIC_FINDING_KEYS),
+                         VM_GATE_R3_SEMANTIC_FINDING_KEY_COUNT,
+                         "R3 adds exactly its declared keys and retires nothing")
+        self.assertEqual(len(set(VM_GATE_SEMANTIC_FINDING_KEYS)),
+                         VM_GATE_R3_SEMANTIC_FINDING_KEY_COUNT,
+                         "no semantic finding key may be declared twice")
+        # R1: the public surface is the semantic surface plus exactly the seal key.
+        self.assertEqual(len(VM_GATE_FINDING_KEYS), VM_GATE_R3_FINDING_KEY_COUNT,
+                         "R1 adds exactly the seal key and retires nothing")
+        self.assertEqual(len(set(VM_GATE_FINDING_KEYS)), VM_GATE_R3_FINDING_KEY_COUNT,
+                         "no public finding key may be declared twice")
+        self.assertEqual(VM_GATE_R2_FINDING_KEY_COUNT - VM_GATE_R1_FINDING_KEY_COUNT,
+                         len(VM_GATE_R2_NEW_KEYS),
+                         "R2 must move the public total by exactly its own new keys")
+        self.assertEqual(VM_GATE_R3_FINDING_KEY_COUNT - VM_GATE_R2_FINDING_KEY_COUNT,
+                         len(VM_GATE_R3_NEW_KEYS),
+                         "R3 must move the public total by exactly its own new keys")
+        self.assertEqual(set(VM_GATE_FINDING_KEYS) - set(VM_GATE_SEMANTIC_FINDING_KEYS),
+                         {REVIEWED_RUNBOOK_SEAL_KEY},
+                         "the public/semantic boundary must be exactly the seal key")
+        self.assertNotIn(REVIEWED_RUNBOOK_SEAL_KEY, VM_GATE_SEMANTIC_FINDING_KEYS,
+                         "the semantic layer must never claim to report the seal")
+        for key in VM_GATE_A11_NEW_KEYS + VM_GATE_R2_NEW_KEYS + VM_GATE_R3_NEW_KEYS:
+            with self.subTest(key=key):
+                self.assertIn(key, VM_GATE_SEMANTIC_FINDING_KEYS, "%s must be declared" % key)
+        self.assertEqual([key for key in VM_GATE_FINDING_KEYS if "four" in key], [],
+                         "the four-way key is renamed, because the contract is no longer four-way")
+        self.assertIn("safety_boundary_surfaces_incomplete", VM_GATE_SEMANTIC_FINDING_KEYS)
+        self.assertLess(VM_GATE_A11_NEEDS_A_REAL_DOCUMENT, set(VM_GATE_SEMANTIC_FINDING_KEYS),
+                        "every landmark-dependent key must still be declared")
+        self.assertEqual(set(_vm_gate_semantic_findings("")),
+                         set(VM_GATE_SEMANTIC_FINDING_KEYS) - VM_GATE_A11_NEEDS_A_REAL_DOCUMENT,
+                         "an empty document must report every other declared semantic key")
+        self.assertIn(VM_GATE_A11_MAPPING_UNMET, (VM_GATE_A11_MAPPING_UNMET,))
+        self.assertLess(VM_GATE_A11_MAPPING_UNMET, set(VM_GATE_SEMANTIC_FINDING_KEYS))
+        self.assertLess(VM_GATE_A11_RECOVERY_UNMET, set(VM_GATE_SEMANTIC_FINDING_KEYS))
+
+    def test_a11_control_checker_stays_pure_deterministic_and_total(self):
+        """Text in, findings out: repeated calls agree, and malformed input raises nothing.
+
+        Asserted on BOTH layers, because R1 makes the public guard the live authority and a
+        non-deterministic or throwing public guard would be the very failure the seal exists to
+        rule out.
+        """
+        for base_name, base in self._a11_bases():
+            with self.subTest(base=base_name):
+                self.assertEqual(_vm_gate_semantic_findings(base), _vm_gate_semantic_findings(base),
+                                 "the semantic checker must be deterministic")
+                self.assertEqual(vm_gate_findings(base), vm_gate_findings(base),
+                                 "the public guard must be deterministic")
+        for label, text in VM_GATE_A11_MALFORMED_INPUTS:
+            with self.subTest(malformed=label):
+                first = _vm_gate_semantic_findings(text)
+                self.assertIsInstance(first, list, "%s must yield findings, not raise" % label)
+                self.assertEqual(first, _vm_gate_semantic_findings(text))
+                self.assertLessEqual(set(first), set(VM_GATE_SEMANTIC_FINDING_KEYS),
+                                     "no emitted semantic key may be undeclared")
+                public = vm_gate_findings(text)
+                self.assertIsInstance(public, list,
+                                      "%s must yield public findings, not raise" % label)
+                self.assertEqual(public, vm_gate_findings(text))
+                self.assertLessEqual(set(public), set(VM_GATE_FINDING_KEYS),
+                                     "no emitted public key may be undeclared")
+                self.assertIn(REVIEWED_RUNBOOK_SEAL_KEY, public,
+                              "a malformed document is not the reviewed runbook")
+
+    def test_a11_control_no_emitted_key_is_undeclared(self):
+        """Across every control document this class builds, emitted keys stay inside the declaration."""
+        documents = [VM_GATE_A11_FIXTURE, self.create_runbook, "", VM_GATE_CANONICAL_FIXTURE,
+                     HOST_SYNC_CANONICAL_FIXTURE]
+        for label, needle, _key in VM_GATE_A11_HTML_AUTHORITIES:
+            for _name, _kind, opener, _closer in VM_GATE_A11_HTML_FAMILIES:
+                documents.append(self._a9_insert_before(VM_GATE_A11_FIXTURE, needle, opener))
+        for index, document in enumerate(documents):
+            with self.subTest(document=index):
+                self.assertLessEqual(set(_vm_gate_semantic_findings(document)),
+                                     set(VM_GATE_SEMANTIC_FINDING_KEYS),
+                                     "every emitted semantic finding key must be declared")
+                self.assertLessEqual(set(vm_gate_findings(document)), set(VM_GATE_FINDING_KEYS),
+                                     "every emitted public finding key must be declared")
+
+    # ---- DL-XB-123-001-R1: the reviewed-runbook structural seal ---- #
+    # Everything below judges the PUBLIC guards. The proposition is no longer "the parser
+    # recognises this defect" but "this is not the reviewed document", which is decidable for every
+    # input and is why R1 converges where A1-A11 did not.
+
+    def _public_guards(self):
+        """Both public live guards, so every seal control is proved on each of them."""
+        return (("vm_gate_findings", vm_gate_findings),
+                ("host_sync_gate_findings", host_sync_gate_findings))
+
+    def _assert_seal_fires(self, degraded, why):
+        """Both public guards must report the seal, and the semantic layer must not report it."""
+        self.assertNotEqual(degraded, self.create_runbook, "%s must change the document" % why)
+        self.assertNotEqual(reviewed_runbook_digest(degraded), REVIEWED_RUNBOOK_SHA256,
+                            "%s must change the digest" % why)
+        self.assertEqual(reviewed_runbook_seal_findings(degraded), [REVIEWED_RUNBOOK_SEAL_KEY],
+                         "%s must break the seal" % why)
+        for name, guard in self._public_guards():
+            with self.subTest(guard=name):
+                self.assertIn(REVIEWED_RUNBOOK_SEAL_KEY, guard(degraded),
+                              "%s must fail closed in %s" % (why, name))
+
+    # -- R1: the literal reviewed constant -- #
+    def test_r1_literal_seal_equals_an_independently_computed_reviewed_digest(self):
+        """The declared constant is the truth about the reviewed document, computed here afresh."""
+        independent = hashlib.sha256(
+            canonical_seal_text(self.create_runbook).encode("utf-8")).hexdigest()
+        self.assertEqual(REVIEWED_RUNBOOK_SHA256, independent,
+                         "the literal reviewed digest must equal an independently computed digest "
+                         "of the unchanged reviewed runbook")
+        self.assertEqual(reviewed_runbook_digest(self.create_runbook), REVIEWED_RUNBOOK_SHA256)
+        self.assertEqual(reviewed_runbook_seal_findings(self.create_runbook), [],
+                         "the reviewed runbook must satisfy its own seal")
+        for name, guard in self._public_guards():
+            with self.subTest(guard=name):
+                self.assertEqual(guard(self.create_runbook), [],
+                                 "%s must be clean on the reviewed runbook" % name)
+
+    def test_r1_expected_digest_is_a_literal_constant_and_never_a_runtime_computation(self):
+        """The constant is reviewed text in the module, not something read back from disk.
+
+        A digest recomputed from the live file would seal the document to itself and authorise any
+        edit at all -- the exact failure mode the seal exists to prevent. This is asserted on the
+        module's own AST rather than on its runtime value, because a runtime value cannot show
+        WHERE it came from.
+        """
+        tree = parse_source(read_repo_text("focused_tests"))
+        assignments = [node for node in tree.body
+                       if isinstance(node, ast.Assign)
+                       and any(isinstance(target, ast.Name)
+                               and target.id == "REVIEWED_RUNBOOK_SHA256"
+                               for target in node.targets)]
+        self.assertEqual(len(assignments), 1,
+                         "the reviewed digest must be declared exactly once, at module level")
+        value = assignments[0].value
+        self.assertIsInstance(value, ast.Constant,
+                              "the reviewed digest must be a literal, not an expression")
+        self.assertIsInstance(value.value, str)
+        self.assertEqual(value.value, REVIEWED_RUNBOOK_SHA256)
+        self.assertEqual(len(REVIEWED_RUNBOOK_SHA256), 64,
+                         "a SHA-256 hex digest is 64 characters")
+        self.assertEqual(REVIEWED_RUNBOOK_SHA256, REVIEWED_RUNBOOK_SHA256.lower())
+        self.assertTrue(all(char in "0123456789abcdef" for char in REVIEWED_RUNBOOK_SHA256))
+
+    def test_r1_seal_path_reaches_nothing_but_its_argument(self):
+        """No repository, filesystem, environment, subprocess or network read on the seal path."""
+        tree = parse_source(read_repo_text("focused_tests"))
+        bodies = {node.name: node for node in ast.walk(tree)
+                  if isinstance(node, ast.FunctionDef) and node.name in SEAL_PURE_FUNCTIONS}
+        self.assertEqual(set(bodies), set(SEAL_PURE_FUNCTIONS),
+                         "every seal-path function must exist exactly under its declared name")
+        for name in SEAL_PURE_FUNCTIONS:
+            with self.subTest(function=name):
+                for node in ast.walk(bodies[name]):
+                    if isinstance(node, ast.Name):
+                        self.assertNotIn(node.id, SEAL_FORBIDDEN_NAMES,
+                                         "%s must not reach %s" % (name, node.id))
+                    elif isinstance(node, ast.Attribute):
+                        self.assertNotIn(node.attr, SEAL_FORBIDDEN_ATTRIBUTES,
+                                         "%s must not reach .%s" % (name, node.attr))
+
+    def test_r1_public_guards_are_pure_and_deterministic_on_identical_text(self):
+        """Same text in, same findings out -- repeatedly, and for a detached copy of the text."""
+        samples = ("", self.create_runbook, self.create_runbook + "\n",
+                   VM_GATE_A11_FIXTURE, HOST_SYNC_CANONICAL_FIXTURE)
+        for name, guard in self._public_guards():
+            for index, text in enumerate(samples):
+                with self.subTest(guard=name, sample=index):
+                    first = guard(text)
+                    self.assertEqual(first, guard(text), "%s must be deterministic" % name)
+                    # A distinct string object with identical content must seal identically: the
+                    # seal is a function of the CONTENT, not of the object it arrived in.
+                    self.assertEqual(first, guard("".join([text])))
+
+    # -- R1: canonicalisation is line endings and nothing else -- #
+    def test_r1_seal_is_invariant_under_line_ending_representation(self):
+        reviewed = self.create_runbook
+        self.assertNotIn("\r", reviewed, "the reviewed text is read with LF line endings")
+        for label, rendered in (("crlf", reviewed.replace("\n", "\r\n")),
+                                ("bare_cr", reviewed.replace("\n", "\r"))):
+            with self.subTest(representation=label):
+                self.assertNotEqual(rendered, reviewed, "the representation must actually differ")
+                self.assertEqual(canonical_seal_text(rendered), reviewed,
+                                 "%s must canonicalise back to the reviewed text" % label)
+                self.assertEqual(reviewed_runbook_digest(rendered), REVIEWED_RUNBOOK_SHA256,
+                                 "%s must seal identically" % label)
+                self.assertEqual(reviewed_runbook_seal_findings(rendered), [])
+                for name, guard in self._public_guards():
+                    self.assertNotIn(REVIEWED_RUNBOOK_SEAL_KEY, guard(rendered),
+                                     "%s must not fail on line-ending representation alone"
+                                     % name)
+
+    def test_r1_canonicalisation_normalises_nothing_except_line_endings(self):
+        """Every other normalisation an implementation might be tempted to add is absent."""
+        probe = "  Alpha  Beta \t\n\nGamma\n"
+        self.assertEqual(canonical_seal_text(probe), probe,
+                         "LF-only text must pass through untouched")
+        for label, tempting in (("stripped", probe.strip()),
+                                ("trailing_spaces_removed", probe.replace(" \t\n", "\n")),
+                                ("spaces_collapsed", " ".join(probe.split())),
+                                ("case_folded", probe.lower()),
+                                ("blank_lines_removed", probe.replace("\n\n", "\n"))):
+            with self.subTest(normalisation=label):
+                self.assertNotEqual(canonical_seal_text(probe), canonical_seal_text(tempting),
+                                    "the seal must not apply %s normalisation" % label)
+
+    # -- R1: arbitrary whole-document drift -- #
+    def _r1_drifts(self):
+        """Named single-edit drifts of the reviewed runbook, each materially textual."""
+        text = self.create_runbook
+        at = len(text) // 2
+        line_end = text.index("\n")
+        blank = text.index("\n\n")
+        alpha = next(index for index, char in enumerate(text) if char.isalpha())
+        drifts = [
+            ("single_character", text[:at] + ("x" if text[at] != "x" else "y") + text[at + 1:]),
+            ("insertion", text[:at] + "z" + text[at:]),
+            ("deletion", text[:at] + text[at + 1:]),
+            ("trailing_space", text[:line_end] + " " + text[line_end:]),
+            ("interior_whitespace", text.replace(" ", "  ", 1)),
+            ("case_change", text[:alpha] + text[alpha].swapcase() + text[alpha + 1:]),
+            ("blank_line_added", text[:blank] + "\n" + text[blank:]),
+            ("blank_line_removed", text[:blank] + text[blank + 1:]),
+        ]
+        self.assertTrue(text.endswith("\n"), "the reviewed runbook ends with a newline")
+        drifts.append(("final_newline_removed", text[:-1]))
+        return tuple(drifts)
+
+    def test_r1_any_material_text_drift_breaks_the_seal_in_both_public_guards(self):
+        for label, degraded in self._r1_drifts():
+            with self.subTest(drift=label):
+                self._assert_seal_fires(degraded, "the %s drift" % label)
+
+    def test_r1_seal_covers_every_region_of_the_document(self):
+        """One character, in each region -- the seal is over the whole document, not a selection."""
+        text = self.create_runbook
+        preamble_end = text.index("\n## ")
+        regions = (
+            ("preamble", 0),
+            ("protected approval region", text.index(VM_GATE_DEPLOY_OPENING)),
+            ("command/example region", text.index(HOST_SYNC_PULL_COMMAND)),
+            ("step 9 region", text.index(VM_GATE_A11_REVIEWED_HEADINGS[VM_GATE_A11_MAPPING_STEP])),
+            ("step 10 region", text.index(VM_GATE_A11_REVIEWED_HEADINGS[VM_GATE_A11_RECOVERY_STEP])),
+            ("step 11 region", text.index("### 11.")),
+            ("safety boundary", text.index(VM_GATE_SAFETY_HEADING)),
+            ("trailing content", len(text.rstrip("\n")) - 1),
+        )
+        seen = set()
+        for label, at in regions:
+            with self.subTest(region=label):
+                self.assertGreaterEqual(at, 0, "%s must locate" % label)
+                seen.add(at)
+                degraded = text[:at] + ("Q" if text[at] != "Q" else "R") + text[at + 1:]
+                self._assert_seal_fires(degraded, "a one-character edit in the %s" % label)
+        self.assertEqual(len(seen), len(regions), "each region must be a distinct offset")
+        self.assertLess(regions[0][1], preamble_end, "the preamble offset must be in the preamble")
+
+    # -- R1-F1: the Run-24 setext / type-7 residual -- #
+    def _r1_f1_degraded(self, needle, opener):
+        """The reviewed runbook with the Run-24 residual placed before ``needle``'s own line."""
+        self.assertEqual(self.create_runbook.count(needle), 1,
+                         "the authority %r must occur exactly once" % (needle[:48],))
+        at = self.create_runbook.index(needle)
+        start = self.create_runbook.rfind("\n", 0, at) + 1
+        inserted = "".join(line + "\n" for line in VM_GATE_R1_SETEXT_LINES + (opener,))
+        return self.create_runbook[:start] + inserted + self.create_runbook[start:]
+
+    def test_r1_f1_semantic_layer_still_exhibits_the_known_incomplete_parser_behaviour(self):
+        """The residual is real: the semantic model does not see the HTML block it should.
+
+        Stated as an explicit control rather than left implicit, because the whole R1 argument is
+        that a KNOWN parser shortcoming is now tolerable. If this ever starts failing, the
+        shortcoming has been repaired and the F1 control below has become vacuous -- which is a
+        result worth being told about, not one worth hiding.
+        """
+        self.assertFalse(_breaks_paragraph("==="),
+                         "the semantic model does not recognise a setext underline")
+        self.assertIsNone(_html_block_opening("<template>", True),
+                          "type 7 cannot interrupt a paragraph the model believes is still open")
+        self.assertEqual(_html_block_opening("<template>", False), 7,
+                         "outside a paragraph the same line is a type-7 opener")
+        for label, needle in VM_GATE_R1_F1_AUTHORITIES:
+            for opener in VM_GATE_R1_TYPE7_OPENERS:
+                with self.subTest(authority=label, opener=opener):
+                    degraded = self._r1_f1_degraded(needle, opener)
+                    at = degraded.index(needle)
+                    self.assertIsNone(
+                        _a11_block_open_at(degraded, at),
+                        "the incomplete model still reports no open block at the authority")
+                    self.assertEqual(_vm_gate_semantic_findings(degraded), [],
+                                     "the semantic VM layer is still clean -- the residual")
+                    self.assertEqual(_host_sync_semantic_findings(degraded), [],
+                                     "the semantic host-sync layer is still clean -- the residual")
+
+    def test_r1_f1_setext_type7_residual_cannot_produce_a_clean_public_guard(self):
+        """The convergence claim: an incomplete CommonMark model can no longer read clean."""
+        for label, needle in VM_GATE_R1_F1_AUTHORITIES:
+            for opener in VM_GATE_R1_TYPE7_OPENERS:
+                with self.subTest(authority=label, opener=opener):
+                    degraded = self._r1_f1_degraded(needle, opener)
+                    self._assert_seal_fires(
+                        degraded, "the %s type-7 residual before the %s" % (opener, label))
+                    for name, guard in self._public_guards():
+                        self.assertEqual(guard(degraded), [REVIEWED_RUNBOOK_SEAL_KEY],
+                                         "%s must fail closed on the seal ALONE here, which is "
+                                         "exactly what the semantic layer could not do" % name)
+
+    # -- R1-F2: the Run-24 Copy-Item residual -- #
+    def _r1_f2_degraded(self, step):
+        """The reviewed runbook with an ACTIVE VM deployment appended to a step outside step 4."""
+        self.assertNotIn(step, (VM_GATE_DEPLOY_STEP,),
+                         "the residual must be placed OUTSIDE the step-4 deployment gate")
+        section = _numbered_step_section(self.create_runbook, step)
+        self.assertNotEqual(section, "", "step %d must exist in the reviewed runbook" % step)
+        block = "\n```powershell\n" + VM_GATE_R1_COPY_ITEM_COMMAND + "\n```\n"
+        return self.create_runbook.replace(section, section.rstrip("\n") + "\n" + block, 1)
+
+    def test_r1_f2_semantic_classifier_still_does_not_recognise_the_operation(self):
+        """The residual is real: an ACTIVE deployment the protected-operation table misses.
+
+        The command is proved ACTIVE first, so this is not a control about an inert mention: the
+        classifier sees a live command line and still does not classify it, because the table
+        enumerates spellings and `Copy-Item` is not one of them.
+        """
+        self.assertNotIn("copy-item",
+                         " ".join(anchor for _n, anchor, _s, _f
+                                  in VM_GATE_A11_PROTECTED_OPERATIONS).lower(),
+                         "R1 must NOT answer F2 by adding another command spelling")
+        for step in VM_GATE_R1_F2_STEPS:
+            with self.subTest(step=step):
+                degraded = self._r1_f2_degraded(step)
+                active = "\n".join(_active_command_lines(degraded)).lower()
+                self.assertIn(VM_GATE_R1_COPY_ITEM_COMMAND.lower(), active,
+                              "the injected deployment must be an ACTIVE command line")
+                self.assertNotIn("protected_operation_outside_region",
+                                 _vm_gate_semantic_findings(degraded),
+                                 "the classifier still does not recognise the operation")
+                self.assertEqual(_vm_gate_semantic_findings(degraded), [],
+                                 "the semantic VM layer is still clean -- the residual")
+                self.assertEqual(_host_sync_semantic_findings(degraded), [],
+                                 "the semantic host-sync layer is still clean -- the residual")
+
+    def test_r1_f2_copy_item_outside_step_four_cannot_produce_a_clean_public_guard(self):
+        """The convergence claim: an unclassified live deployment can no longer read clean."""
+        for step in VM_GATE_R1_F2_STEPS:
+            with self.subTest(step=step):
+                degraded = self._r1_f2_degraded(step)
+                self._assert_seal_fires(
+                    degraded, "an active Copy-Item deployment inside step %d" % step)
+                for name, guard in self._public_guards():
+                    self.assertEqual(guard(degraded), [REVIEWED_RUNBOOK_SEAL_KEY],
+                                     "%s must fail closed on the seal ALONE here, which is "
+                                     "exactly what the semantic layer could not do" % name)
+
+    # -- R1: the public/semantic boundary is explicit, not incidental -- #
+    def test_r1_public_and_semantic_layers_are_explicitly_distinct(self):
+        """A semantically clean document that is not the reviewed runbook is NOT publicly clean."""
+        for label, fixture, semantic in (
+                ("VM canonical fixture", VM_GATE_CANONICAL_FIXTURE, _vm_gate_semantic_findings),
+                ("host-sync canonical fixture", HOST_SYNC_CANONICAL_FIXTURE,
+                 _host_sync_semantic_findings)):
+            with self.subTest(fixture=label):
+                self.assertEqual(semantic(fixture), [],
+                                 "%s must remain semantically compliant" % label)
+                self.assertNotEqual(fixture, self.create_runbook,
+                                    "%s is deliberately not the reviewed runbook" % label)
+        # Each public guard adds exactly the seal to its own semantic verdict, and nothing else.
+        for name, guard, semantic in (
+                ("vm_gate_findings", vm_gate_findings, _vm_gate_semantic_findings),
+                ("host_sync_gate_findings", host_sync_gate_findings,
+                 _host_sync_semantic_findings)):
+            for index, text in enumerate(("", VM_GATE_A11_FIXTURE, HOST_SYNC_CANONICAL_FIXTURE,
+                                          self.create_runbook)):
+                with self.subTest(guard=name, sample=index):
+                    self.assertEqual(
+                        set(guard(text)),
+                        set(semantic(text)) | set(reviewed_runbook_seal_findings(text)),
+                        "%s must be exactly its semantic verdict plus the seal" % name)
+
+    def test_r1_seal_key_is_declared_unique_and_reachable_in_both_contracts(self):
+        self.assertIn(REVIEWED_RUNBOOK_SEAL_KEY, VM_GATE_FINDING_KEYS)
+        self.assertIn(REVIEWED_RUNBOOK_SEAL_KEY, HOST_SYNC_FINDING_KEYS)
+        self.assertNotIn(REVIEWED_RUNBOOK_SEAL_KEY, VM_GATE_SEMANTIC_FINDING_KEYS)
+        self.assertNotIn(REVIEWED_RUNBOOK_SEAL_KEY, HOST_SYNC_SEMANTIC_FINDING_KEYS)
+        self.assertEqual(len(set(HOST_SYNC_FINDING_KEYS)), len(HOST_SYNC_FINDING_KEYS),
+                         "no host-sync key may be declared twice")
+        self.assertEqual(set(HOST_SYNC_FINDING_KEYS) - set(HOST_SYNC_SEMANTIC_FINDING_KEYS),
+                         {REVIEWED_RUNBOOK_SEAL_KEY})
+        # Reachable in both, from a document that is simply not the reviewed one.
+        self.assertIn(REVIEWED_RUNBOOK_SEAL_KEY, vm_gate_findings(""))
+        self.assertIn(REVIEWED_RUNBOOK_SEAL_KEY, host_sync_gate_findings(""))
+        # And unreachable when the document IS the reviewed one.
+        self.assertNotIn(REVIEWED_RUNBOOK_SEAL_KEY, vm_gate_findings(self.create_runbook))
+        self.assertNotIn(REVIEWED_RUNBOOK_SEAL_KEY, host_sync_gate_findings(self.create_runbook))
+
+    # ---- DL-XB-123-001-R2: the step-9 live n8n target binding ---- #
+    # Accepted post-ready finding PRRT_kwDOSbJI_s6ZK7nH. Step 9 states plainly that it performs
+    # live operations on an n8n instance, but its required-name clause bound only the workflow and
+    # the spreadsheet/tab. The import, the Google-credential binding, the result-file placement and
+    # the manual execution could therefore each be carried out against a DIFFERENT n8n instance
+    # without departing from the documented approval wording. R2 requires the approval ITSELF to
+    # identify the intended instance, by a non-secret operator-recognisable name.
+    #
+    # This is a target-binding defect, not another CommonMark or command-enumeration one: no parser
+    # and no classifier is touched below, and the R1 residuals are left exactly as they are.
+
+    def _r3_supersede(self, base):
+        """``base`` with every R3 reviewed clause rolled back to its R2 wording."""
+        rolled = base
+        for label, reviewed, superseded in VM_GATE_R3_REVIEWED_CLAUSES:
+            self.assertIn(reviewed, rolled, "the base must carry the R3 %s clause" % label)
+            self.assertEqual(rolled.count(reviewed), 1, "the R3 %s clause must be unique" % label)
+            rolled = rolled.replace(reviewed, superseded, 1)
+        self.assertNotEqual(rolled, base, "the R3 rollback must change the document")
+        return rolled
+
+    def _r2_supersede(self, base):
+        """``base`` with the R2 required-name clause rolled back to the superseded R1 wording.
+
+        Applied to an already-R2 document: the R3 clauses must be rolled back first, which is what
+        keeps the R2 -> R1 step reproducing the R1 document byte for byte.
+        """
+        self.assertIn(VM_GATE_R2_REVIEWED_NAME_CLAUSE, base,
+                      "the base must carry the R2 required-name clause")
+        return base.replace(VM_GATE_R2_REVIEWED_NAME_CLAUSE,
+                            VM_GATE_R2_SUPERSEDED_NAME_CLAUSE, 1)
+
+    def test_r2_reviewed_gate_binds_all_five_target_classes(self):
+        """The control group: the reviewed step-9 approval names every selectable target.
+
+        R2 established the first three; R3 adds the credential and the row's operation id. The
+        exact ordered list is asserted so a later revision cannot drop one silently.
+        """
+        self.assertEqual([key for key, _ in VM_GATE_A11_MAPPING_BINDINGS],
+                         ["mapping_workflow_not_bound", "mapping_spreadsheet_not_bound",
+                          "mapping_google_credential_not_bound", "mapping_operation_id_not_bound",
+                          "mapping_n8n_target_not_bound"],
+                         "step 9 must bind exactly the five reviewed target classes")
+        for base_name, base in self._a11_bases():
+            with self.subTest(base=base_name):
+                self.assertNotIn("mapping_n8n_target_not_bound",
+                                 _vm_gate_semantic_findings(base),
+                                 "the reviewed gate must satisfy the target binding")
+        self.assertEqual(vm_gate_findings(self.create_runbook), [],
+                         "the reviewed runbook must clear the public guard under R3")
+
+    def test_r2_superseded_two_target_approval_now_fails_closed(self):
+        """The accepted defect, restored verbatim: two named targets are no longer sufficient.
+
+        This wording was clean at the reviewed head that Codex reviewed. It must now report the
+        target-binding finding BY NAME, and must not report the workflow or spreadsheet bindings,
+        so the control proves what it claims rather than merely that something went wrong.
+        """
+        for base_name, base in self._a11_bases():
+            with self.subTest(base=base_name):
+                superseded = self._r2_supersede(self._r3_supersede(base))
+                self.assertNotEqual(superseded, base, "the rollback must change the document")
+                findings = _vm_gate_semantic_findings(superseded)
+                self.assertIn("mapping_n8n_target_not_bound", findings,
+                              "a two-target approval must fail closed on the missing instance")
+                self.assertNotIn("mapping_workflow_not_bound", findings,
+                                 "the superseded wording still names the workflow")
+                self.assertNotIn("mapping_spreadsheet_not_bound", findings,
+                                 "the superseded wording still names the spreadsheet and tab")
+
+    def test_r2_generic_instance_wording_cannot_satisfy_the_binding(self):
+        """Mentioning n8n is not identifying an instance.
+
+        The second case is the decisive one: its replacement is the EXACT generic phrase the step
+        already carries elsewhere -- in its descriptive sentence and in its first operation bullet
+        -- so a checker that merely looked for "operator PC n8n instance" somewhere in the gate
+        would pass a document whose approval requires no target identity at all.
+        """
+        generic = ("n8n_target_generic_any_instance", "n8n_target_generic_operator_pc_prose")
+        for base_name, base in self._a11_bases():
+            for name in generic:
+                with self.subTest(base=base_name, wording=name):
+                    degraded = self._a11_gate_mutate(
+                        base, VM_GATE_A11_MAPPING_REVIEWED_BLOCK,
+                        VM_GATE_A11_MAPPING_REVIEWED_ACTION, name,
+                        VM_GATE_A11_MAPPING_REPLACEMENTS)
+                    self.assertIn("mapping_n8n_target_not_bound",
+                                  _vm_gate_semantic_findings(degraded),
+                                  "%s must not satisfy the target binding" % name)
+        # The generic phrase really is still present after the decisive mutation, so the control is
+        # about what the APPROVAL requires and not about the phrase having been deleted.
+        degraded = self._a11_gate_mutate(
+            VM_GATE_A11_FIXTURE, VM_GATE_A11_MAPPING_REVIEWED_BLOCK,
+            VM_GATE_A11_MAPPING_REVIEWED_ACTION, "n8n_target_generic_operator_pc_prose",
+            VM_GATE_A11_MAPPING_REPLACEMENTS)
+        self.assertGreaterEqual(degraded.lower().count("the operator pc n8n instance"), 3,
+                                "the generic phrase must survive the mutation three times over")
+
+    def test_r2_other_step_9_target_and_operation_bindings_still_fail_closed(self):
+        """R2 adds a binding; the three it stands beside must each still fire on their own."""
+        expected = {"workflow_target_removed": "mapping_workflow_not_bound",
+                    "spreadsheet_target_removed": "mapping_spreadsheet_not_bound",
+                    "operation_set_removed": "mapping_operations_not_bound",
+                    "n8n_target_removed": "mapping_n8n_target_not_bound"}
+        for base_name, base in self._a11_bases():
+            for name, key in sorted(expected.items()):
+                with self.subTest(base=base_name, mutation=name):
+                    degraded = self._a11_gate_mutate(
+                        base, VM_GATE_A11_MAPPING_REVIEWED_BLOCK,
+                        VM_GATE_A11_MAPPING_REVIEWED_ACTION, name,
+                        VM_GATE_A11_MAPPING_REPLACEMENTS)
+                    self.assertIn(key, _vm_gate_semantic_findings(degraded),
+                                  "the step-9 %s mutation must report %s" % (name, key))
+
+    def test_r2_preserves_every_existing_step_9_boundary(self):
+        """R2 adds a target class; it weakens no authority the reviewed step 9 already carried."""
+        block = VM_GATE_A11_MAPPING_REVIEWED_BLOCK
+        for token in VM_GATE_R2_PRESERVED_STEP_9_AUTHORITY:
+            with self.subTest(preserved=token[:48]):
+                self.assertIn(token, block, "R2 must preserve the reviewed step-9 authority")
+        self.assertIn(block, self.create_runbook,
+                      "the live runbook must carry the reviewed gate verbatim")
+        # The approval names the instance; the repository never carries its private value.
+        for forbidden in VM_GATE_R2_FORBIDDEN_TARGET_VALUES:
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, block.lower(),
+                                 "the gate must never carry a private target value")
+
+    def test_r2_seal_moved_with_the_reviewed_document_and_retired_the_old_content(self):
+        """The seal moved with each reviewed change, and every superseded document now fails it.
+
+        The rollback runs one revision at a time: R3 -> R2 -> R1. Each step must reproduce that
+        revision's reviewed content EXACTLY, proved by its digest equalling the retired literal,
+        which is what makes "the seal moved with the document, and only with it" a demonstration
+        rather than an assertion -- and it keeps the whole retired chain auditable instead of
+        letting a newer revision quietly drop the older evidence.
+        """
+        self.assertEqual(len(set((REVIEWED_RUNBOOK_SHA256,) + SUPERSEDED_RUNBOOK_SHA256S)), 3,
+                         "each substantive reviewed change must have moved the seal")
+        independent = hashlib.sha256(
+            canonical_seal_text(self.create_runbook).encode("utf-8")).hexdigest()
+        self.assertEqual(REVIEWED_RUNBOOK_SHA256, independent,
+                         "the new literal digest must equal an independently computed digest of "
+                         "the exact reviewed runbook")
+        self.assertEqual(reviewed_runbook_seal_findings(self.create_runbook), [],
+                         "the exact reviewed runbook must be seal-clean")
+        at_r2 = self._r3_supersede(self.create_runbook)
+        self.assertEqual(
+            hashlib.sha256(canonical_seal_text(at_r2).encode("utf-8")).hexdigest(),
+            SUPERSEDED_R2_RUNBOOK_SHA256,
+            "the R3 rollback must reproduce the superseded R2 content byte for byte")
+        self._assert_seal_fires(at_r2, "the superseded pre-R3 reviewed content")
+        at_r1 = self._r2_supersede(at_r2)
+        self.assertEqual(
+            hashlib.sha256(canonical_seal_text(at_r1).encode("utf-8")).hexdigest(),
+            SUPERSEDED_R1_RUNBOOK_SHA256,
+            "the R2 rollback must reproduce the superseded R1 content byte for byte")
+        self._assert_seal_fires(at_r1, "the superseded pre-R2 reviewed content")
+
+    def test_r2_finding_key_is_declared_unique_semantic_only_and_reachable(self):
+        """Key integrity for the one key R2 adds, and for the surfaces it sits inside."""
+        for key in VM_GATE_R2_NEW_KEYS:
+            with self.subTest(key=key):
+                self.assertIn(key, VM_GATE_SEMANTIC_FINDING_KEYS, "%s must be declared" % key)
+                self.assertIn(key, VM_GATE_FINDING_KEYS)
+                self.assertEqual(VM_GATE_SEMANTIC_FINDING_KEYS.count(key), 1,
+                                 "%s must be declared exactly once" % key)
+                self.assertIn(key, VM_GATE_A11_MAPPING_UNMET,
+                              "an unresolvable step-9 layout must report %s unmet" % key)
+                self.assertNotIn(key, VM_GATE_A11_NEEDS_A_REAL_DOCUMENT,
+                                 "%s is reportable on an empty document" % key)
+                self.assertIn(key, _vm_gate_semantic_findings(""),
+                              "%s must be reachable" % key)
+        self.assertNotIn(REVIEWED_RUNBOOK_SEAL_KEY, VM_GATE_R2_NEW_KEYS,
+                         "the seal key stays public-only and is not an R2 semantic key")
+        # No historical A1-A11 or R1 key is retired by R2.
+        self.assertLess(set(VM_GATE_A11_NEW_KEYS), set(VM_GATE_SEMANTIC_FINDING_KEYS),
+                        "R2 must retire no A11 key")
+        self.assertEqual(set(VM_GATE_FINDING_KEYS) - set(VM_GATE_SEMANTIC_FINDING_KEYS),
+                         {REVIEWED_RUNBOOK_SEAL_KEY},
+                         "the public/semantic boundary must still be exactly the seal key")
+
+    def test_r2_leaves_the_r1_structural_residuals_exactly_as_they_were(self):
+        """R2 adds no parser, no CommonMark case and no command spelling.
+
+        The Run-24 F1 and F2 residuals are intentional defence-in-depth debt, contained by the
+        seal. R2 must not quietly convert either into a semantic finding, because that would change
+        what the R1 convergence argument rests on.
+        """
+        self.assertEqual(VM_GATE_R1_TYPE7_OPENERS, ("<template>", "<x-review>", "<x-review />"),
+                         "R2 must add no CommonMark case")
+        self.assertNotIn("robocopy", VM_GATE_R1_COPY_ITEM_COMMAND.lower())
+        for _label, authority in VM_GATE_R1_F1_AUTHORITIES:
+            with self.subTest(authority=_label):
+                self.assertIn(authority, self.create_runbook,
+                              "the R1 F1 control authority must still exist in the runbook")
+        # F2 stays unclassified by the semantic command table, and the seal is what answers it.
+        self.assertNotIn("copy-item",
+                         " ".join(str(pattern) for pattern in VM_GATE_A11_PROTECTED_OPERATIONS
+                                  ).lower(),
+                         "R2 must not add Copy-Item to the protected-operation enumeration")
+
+    # ---- DL-XB-123-001-R3: Step-5 / Step-9 approval target binding ---- #
+    # Accepted post-ready findings PRRT_kwDOSbJI_s6ZRDF2, PRRT_kwDOSbJI_s6ZRDGC and
+    # PRRT_kwDOSbJI_s6ZRDF9. One root cause in three places, plus the same-root neighbour the
+    # bounded inventory found beside them: an approval that names an OPERATION but leaves its
+    # concrete target selectable afterwards binds nothing that matters.
+    #
+    #   step 5  the private source record  -- chosen later by `--row-number <N>`, so one approval
+    #           could reach a different person's private data;
+    #   step 5  the VM package destination -- the runner always reads one fixed path, so every
+    #           transfer after the first REPLACES the previous package, undisclosed;
+    #   step 9  the Google credential      -- selectable after approval, so the workflow could be
+    #           bound under the wrong account identity;
+    #   step 9  the operation id           -- the mapped row is chosen after the terminal result
+    #           exists, so "the intended row" names nothing.
+    #
+    # As with R2 these are target-binding defects only: no parser, no CommonMark case and no
+    # command spelling is added, and the R1 residuals are left exactly as they are.
+
+    def _r3_step5_mutate(self, base, old, new, label):
+        """Rewrite one clause inside the reviewed step-5 gate block."""
+        block = VM_GATE_PREFLIGHT_REVIEWED_BLOCK
+        self.assertIn(block, base, "the base must carry the reviewed step-5 gate block")
+        self.assertIn(old, block, "the reviewed step-5 gate must carry %r" % (old[:48],))
+        return self._a11_replace(base, block, block.replace(old, new, 1), label)
+
+    def _r3_bases(self):
+        return self._a11_bases()
+
+    # -- R3-A: the selected private source record -- #
+    def test_r3_reviewed_step5_binds_the_source_record_identity(self):
+        """The control group: the reviewed step-5 approval carries the non-PII record identity."""
+        self.assertIn(("preflight_source_record_not_bound", VM_GATE_R3_SOURCE_RECORD_BINDING),
+                      VM_GATE_PREFLIGHT_BINDINGS,
+                      "the source-record binding must be declared with its own finding")
+        for base_name, base in self._r3_bases():
+            with self.subTest(base=base_name):
+                self.assertNotIn("preflight_source_record_not_bound",
+                                 _vm_gate_semantic_findings(base),
+                                 "the reviewed gate must satisfy the source-record binding")
+
+    def test_r3_source_record_negative_controls_fail_closed(self):
+        """Removed, row-number-only, and generic "selected row" wording each fail closed.
+
+        The generic case is the decisive one: its replacement leaves the step's own descriptive
+        phrase in place, so a checker that merely looked for "the selected private form response"
+        somewhere in the gate would pass a document whose approval identifies no record at all.
+        """
+        reviewed = ("identified in the approval itself by its non-PII `source_record_id`, which"
+                    " a row\n  number alone does not supply")
+        cases = (
+            ("requirement_removed", ", " + reviewed, ""),
+            ("row_number_only", reviewed, "identified in the approval itself by its row number"),
+            ("generic_selected_row", reviewed, "for the selected row"),
+        )
+        for base_name, base in self._r3_bases():
+            for label, old, new in cases:
+                with self.subTest(base=base_name, wording=label):
+                    degraded = self._r3_step5_mutate(base, old, new, label)
+                    findings = _vm_gate_semantic_findings(degraded)
+                    self.assertIn("preflight_source_record_not_bound", findings,
+                                  "%s must not satisfy the source-record binding" % label)
+                    self.assertNotIn("preflight_private_data_not_bound", findings,
+                                     "the generic private-data binding is still satisfied, so the"
+                                     " control proves the record identity and nothing else")
+        # No real identifier is hard-coded: the approval must supply it at execution time.
+        self.assertNotIn("srcrec_", VM_GATE_PREFLIGHT_REVIEWED_BLOCK.lower(),
+                         "the gate must require the identifier, never carry an actual value")
+
+    # -- R3-B: the fixed VM package destination and its replacement -- #
+    def test_r3_reviewed_step5_binds_the_transfer_destination_and_replacement(self):
+        """The control group, and the laptop no-clobber contract R3 must not weaken."""
+        self.assertIn(("preflight_transfer_destination_not_bound",
+                       VM_GATE_R3_TRANSFER_DESTINATION_BINDING), VM_GATE_PREFLIGHT_BINDINGS,
+                      "the destination binding must be declared with its own finding")
+        for base_name, base in self._r3_bases():
+            with self.subTest(base=base_name):
+                self.assertNotIn("preflight_transfer_destination_not_bound",
+                                 _vm_gate_semantic_findings(base),
+                                 "the reviewed gate must satisfy the destination binding")
+        block = _flat(VM_GATE_PREFLIGHT_REVIEWED_BLOCK).lower()
+        # The replacement authority is scoped to the ONE VM working copy. It must not read as
+        # licence to overwrite the laptop-side build, which stays strictly no-clobber, and it must
+        # not extend to any other path.
+        self.assertIn("this replacement authority covers that one vm working copy only, never the"
+                      " laptop-side package build, which stays strictly no-clobber", block,
+                      "the replacement authority must be scoped and the laptop build protected")
+        self.assertIn("The build is strictly **no-clobber**", self.create_runbook,
+                      "the laptop package-build no-clobber contract must survive R3 unchanged")
+        self.assertIn("**One approval builds exactly one package.**", self.create_runbook,
+                      "the one-approval-one-package contract must survive R3 unchanged")
+        replaceable = [line for line in VM_GATE_PREFLIGHT_REVIEWED_BLOCK.splitlines()
+                       if "copying or replacing" in line.lower()]
+        self.assertEqual(len(replaceable), 1,
+                         "step 5 must grant replacement on exactly one line")
+        self.assertIn("member_create_uat_package.json", "\n".join(replaceable) + block,
+                      "that one line's replacement target must be the package working copy")
+
+    def test_r3_transfer_destination_negative_controls_fail_closed(self):
+        """Path omitted, "bounded transfer" only, path without replacement, replacement without
+        path -- all four fail closed, and the plain transfer binding stays satisfied throughout."""
+        reviewed = ("copying or replacing the fixed VM\n  working copy"
+                    " `C:\\XB\\create_uat\\member_create_uat_package.json` that the runner"
+                    " always reads")
+        cases = (
+            ("destination_omitted", reviewed,
+             "copying or replacing the fixed VM\n  working copy that the runner always reads"),
+            ("bounded_transfer_only",
+             ", " + reviewed + ";\n  this replacement authority covers that one VM working copy"
+             " only, never the laptop-side\n  package build, which stays strictly no-clobber", ""),
+            ("path_without_replacement", reviewed,
+             "transferring to the fixed VM\n  working copy"
+             " `C:\\XB\\create_uat\\member_create_uat_package.json` that the runner always reads"),
+            ("replacement_without_path", reviewed,
+             "copying or replacing the approved package that the runner always reads"),
+        )
+        for base_name, base in self._r3_bases():
+            for label, old, new in cases:
+                with self.subTest(base=base_name, wording=label):
+                    degraded = self._r3_step5_mutate(base, old, new, label)
+                    findings = _vm_gate_semantic_findings(degraded)
+                    self.assertIn("preflight_transfer_destination_not_bound", findings,
+                                  "%s must not satisfy the destination binding" % label)
+                    self.assertNotIn("preflight_transfer_not_bound", findings,
+                                     "the plain transfer binding is still satisfied, so the"
+                                     " control proves the destination and nothing else")
+
+    # -- R3-C / R3-D: the step-9 credential and operation id -- #
+    def test_r3_reviewed_step9_binds_the_credential_and_the_operation_id(self):
+        """The control group for both step-9 additions."""
+        for key, token in (("mapping_google_credential_not_bound",
+                            VM_GATE_R3_GOOGLE_CREDENTIAL_BINDING),
+                           ("mapping_operation_id_not_bound", VM_GATE_R3_OPERATION_ID_BINDING)):
+            self.assertIn((key, token), VM_GATE_A11_MAPPING_BINDINGS,
+                          "%s must be declared with its own token" % key)
+            for base_name, base in self._r3_bases():
+                with self.subTest(base=base_name, key=key):
+                    self.assertNotIn(key, _vm_gate_semantic_findings(base),
+                                     "the reviewed gate must satisfy %s" % key)
+
+    def test_r3_step9_negative_controls_fail_closed(self):
+        """Each step-9 addition, in its three defeat shapes, must report its own finding by name.
+
+        The operation-bullet cases are the decisive ones: the bullets "binding the intended Google
+        credential by name or identity only" and "updating the one intended spreadsheet row
+        selected by `uat_create_operation_id`" both SURVIVE these mutations, so a checker drawing
+        its token from the bullet would pass a gate whose approval binds no identity at all.
+        """
+        expected = {
+            "google_credential_removed": "mapping_google_credential_not_bound",
+            "google_credential_generic_intended": "mapping_google_credential_not_bound",
+            "google_credential_generic_any": "mapping_google_credential_not_bound",
+            "operation_id_removed": "mapping_operation_id_not_bound",
+            "operation_id_generic_intended_row": "mapping_operation_id_not_bound",
+            "operation_id_generic_operation_id": "mapping_operation_id_not_bound",
+        }
+        for base_name, base in self._r3_bases():
+            for name, key in sorted(expected.items()):
+                with self.subTest(base=base_name, mutation=name):
+                    degraded = self._a11_gate_mutate(
+                        base, VM_GATE_A11_MAPPING_REVIEWED_BLOCK,
+                        VM_GATE_A11_MAPPING_REVIEWED_ACTION, name,
+                        VM_GATE_A11_MAPPING_REPLACEMENTS)
+                    findings = _vm_gate_semantic_findings(degraded)
+                    self.assertIn(key, _vm_gate_semantic_findings(degraded),
+                                  "the step-9 %s mutation must report %s" % (name, key))
+                    self.assertNotIn("mapping_operations_not_bound", findings,
+                                     "the operation bullets survive, so the control proves the"
+                                     " approval's own binding and nothing else")
+        # The surviving bullets really are still there, so the point above is demonstrated.
+        for name, bullet in (
+                ("google_credential_removed",
+                 "- binding the intended Google credential by name or identity only, never by"
+                 " secret value;"),
+                ("operation_id_removed",
+                 "- updating the one intended spreadsheet row selected by"
+                 " `uat_create_operation_id`.")):
+            degraded = self._a11_gate_mutate(
+                VM_GATE_A11_FIXTURE, VM_GATE_A11_MAPPING_REVIEWED_BLOCK,
+                VM_GATE_A11_MAPPING_REVIEWED_ACTION, name, VM_GATE_A11_MAPPING_REPLACEMENTS)
+            self.assertIn(bullet, degraded,
+                          "the %s mutation must leave its operation bullet intact" % name)
+        # No real operation id is hard-coded: the approval must supply it at execution time.
+        self.assertNotIn("op_", _flat(VM_GATE_A11_MAPPING_REVIEWED_BLOCK).lower(),
+                         "the gate must require the operation id, never carry an actual value")
+
+    # -- R3: key integrity, preserved authority and containment -- #
+    def test_r3_finding_keys_are_declared_unique_semantic_only_and_reachable(self):
+        """Key integrity for the four keys R3 adds, and for the surfaces they sit inside."""
+        self.assertEqual(len(VM_GATE_R3_NEW_KEYS), 4,
+                         "R3 declares exactly the four keys its Design Lock names")
+        unmet = {"preflight_source_record_not_bound": VM_GATE_PREFLIGHT_UNMET,
+                 "preflight_transfer_destination_not_bound": VM_GATE_PREFLIGHT_UNMET,
+                 "mapping_google_credential_not_bound": VM_GATE_A11_MAPPING_UNMET,
+                 "mapping_operation_id_not_bound": VM_GATE_A11_MAPPING_UNMET}
+        for key in VM_GATE_R3_NEW_KEYS:
+            with self.subTest(key=key):
+                self.assertIn(key, VM_GATE_SEMANTIC_FINDING_KEYS, "%s must be declared" % key)
+                self.assertIn(key, VM_GATE_FINDING_KEYS)
+                self.assertEqual(VM_GATE_SEMANTIC_FINDING_KEYS.count(key), 1,
+                                 "%s must be declared exactly once" % key)
+                self.assertIn(key, unmet[key],
+                              "an unresolvable layout must report %s unmet" % key)
+                self.assertNotIn(key, VM_GATE_A11_NEEDS_A_REAL_DOCUMENT,
+                                 "%s is reportable on an empty document" % key)
+                self.assertIn(key, _vm_gate_semantic_findings(""), "%s must be reachable" % key)
+        self.assertNotIn(REVIEWED_RUNBOOK_SEAL_KEY, VM_GATE_R3_NEW_KEYS,
+                         "the seal key stays public-only and is not an R3 semantic key")
+        # No historical A1-A11, R1 or R2 key is retired by R3.
+        self.assertLess(set(VM_GATE_A11_NEW_KEYS) | set(VM_GATE_R2_NEW_KEYS),
+                        set(VM_GATE_SEMANTIC_FINDING_KEYS),
+                        "R3 must retire no earlier key")
+        self.assertEqual(set(VM_GATE_FINDING_KEYS) - set(VM_GATE_SEMANTIC_FINDING_KEYS),
+                         {REVIEWED_RUNBOOK_SEAL_KEY},
+                         "the public/semantic boundary must still be exactly the seal key")
+
+    def test_r3_preserves_every_existing_step5_and_step9_boundary(self):
+        """R3 adds target classes; it weakens no authority either reviewed gate already carried."""
+        for token in VM_GATE_R2_PRESERVED_STEP_9_AUTHORITY:
+            with self.subTest(preserved=token[:48]):
+                self.assertIn(token, VM_GATE_A11_MAPPING_REVIEWED_BLOCK,
+                              "R3 must preserve the reviewed step-9 authority")
+        for _key, _phrase, fragment in VM_GATE_A4_NEW_BINDINGS:
+            with self.subTest(preserved=fragment[:48]):
+                self.assertIn(fragment, VM_GATE_PREFLIGHT_REVIEWED_BLOCK,
+                              "R3 must preserve the reviewed step-5 A4 bindings")
+        for token in (VM_GATE_PREFLIGHT_STOP, VM_GATE_PRIOR_TURN):
+            with self.subTest(preserved=token[:48]):
+                self.assertIn(token, _flat(VM_GATE_PREFLIGHT_REVIEWED_BLOCK).lower(),
+                              "R3 must preserve the reviewed step-5 boundaries")
+        # The approvals name their targets; the repository never carries a private value. Step 5 is
+        # allowed exactly one password-shaped spelling -- `-PasswordEnvVar`, the NAME of the
+        # environment variable the reviewed gate deliberately binds by name only -- so that one
+        # spelling is excluded there and asserted to be the variable reference and nothing else.
+        step5_allowed = ("password",)
+        for label, block, forbidden_values in (
+                ("step 5", VM_GATE_PREFLIGHT_REVIEWED_BLOCK,
+                 tuple(value for value in VM_GATE_R2_FORBIDDEN_TARGET_VALUES
+                       if value not in step5_allowed)),
+                ("step 9", VM_GATE_A11_MAPPING_REVIEWED_BLOCK,
+                 VM_GATE_R2_FORBIDDEN_TARGET_VALUES)):
+            self.assertIn(block, self.create_runbook,
+                          "the live runbook must carry the reviewed %s gate verbatim" % label)
+            for forbidden in forbidden_values:
+                with self.subTest(forbidden=forbidden, gate=label):
+                    self.assertNotIn(forbidden, block.lower(),
+                                     "the %s gate must never carry a private target value" % label)
+        flat_step5 = _flat(VM_GATE_PREFLIGHT_REVIEWED_BLOCK).lower()
+        self.assertIn("the password environment variable named by `-passwordenvvar`", flat_step5,
+                      "step 5's password mentions must be the variable NAME, never a value")
+        self.assertEqual(flat_step5.count("password"), 2,
+                         "exactly the two spellings of that one variable reference, and no more")
+        for value_shape in ("password:", "password =", "password=", "password is "):
+            with self.subTest(value_shape=value_shape):
+                self.assertNotIn(value_shape, flat_step5,
+                                 "step 5 must never carry a password VALUE")
+
+    def test_r3_leaves_the_r1_structural_residuals_exactly_as_they_were(self):
+        """R3 adds no parser, no CommonMark case and no command spelling either."""
+        self.assertEqual(VM_GATE_R1_TYPE7_OPENERS, ("<template>", "<x-review>", "<x-review />"),
+                         "R3 must add no CommonMark case")
+        self.assertNotIn("copy-item",
+                         " ".join(str(pattern) for pattern in VM_GATE_A11_PROTECTED_OPERATIONS
+                                  ).lower(),
+                         "R3 must not add Copy-Item to the protected-operation enumeration")
+        self.assertEqual(len(VM_GATE_A11_PROTECTED_OPERATIONS), 6,
+                         "R3 must not grow the protected-operation enumeration")
+        # The destructive-cleanup inventory is about operator-directed DELETIONS. Step 5's new
+        # replacement authority is a transfer, not a cleanup, and must not be smuggled in as one.
+        self.assertNotIn("copying or replacing",
+                         " ".join(VM_GATE_A11_DESTRUCTIVE_PHRASES).lower(),
+                         "a package transfer is not an operator-directed destructive cleanup")
+        for base_name, base in self._r3_bases():
+            with self.subTest(base=base_name):
+                self.assertNotIn("destructive_cleanup_not_gated",
+                                 _vm_gate_semantic_findings(base),
+                                 "the reviewed replacement wording must not read as a cleanup")
 
 
 @unittest.skipIf(PS is None, "no PowerShell executable available")

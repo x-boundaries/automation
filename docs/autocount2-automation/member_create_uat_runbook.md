@@ -8,9 +8,10 @@ permanent production member-intake workflow (see
 "Future production member-intake workflow boundary").
 
 Everything ships inactive by default. Nothing here contacts the live AutoCount
-environment until the operator performs the explicit, separately approved write
-step on the AutoCount VM. No AutoCount write is performed by development, tests, or
-CI.
+environment before the separately approved step-5 no-write preflight, which runs on
+the AutoCount VM; that preflight may authenticate and read only, and it does not
+authorise `SaveMember`. No AutoCount write occurs before the separately approved
+step-7 write, and no AutoCount write is performed by development, tests, or CI.
 
 ## Components
 
@@ -165,6 +166,30 @@ git pull --ff-only origin main
 
 ### 4. Deploy the inactive UAT components
 
+**Separate current-turn owner approval required (deployment gate).** The instructions
+below change an external machine: they place reviewed files on the AutoCount VM
+`DESKTOP-4I042L6` and prepare a directory that the VM then owns. Before any of them,
+obtain an explicit current-turn owner approval that names the AutoCount VM
+(`DESKTOP-4I042L6`) and binds this exact deployment operation:
+
+- copying or replacing `scripts/ac2_member_create_uat_runner.ps1` on that VM;
+- copying or replacing `scripts/member_create_uat_runner_lib.ps1` on that VM;
+- copying or replacing `config/member_create_uat_business_confirmation.json` on that VM;
+- creating or preparing the VM-owned state directory `C:\XB\create_uat\state`.
+
+This approval is distinct and is **not** implied by any other gate:
+
+- the PR review and merge decision (step 2) does **not** authorise this deployment;
+- the physical-host sync approval (step 3) does **not** authorise this deployment;
+- the no-write preflight approval (step 5) does **not** authorise this deployment;
+- the separate current-turn write approval (step 7) does **not** authorise this deployment.
+
+A prior-turn approval is not reusable. This deployment approval authorises no runner
+execution, no AutoCount environment configuration and no AutoCount contact; running the
+runner, configuring the connection environment and reaching AutoCount are gated separately
+in step 5 and step 7. Without the named current-turn deployment approval, stop before
+copying or replacing files or creating or preparing state on the VM.
+
 Copy the reviewed `scripts/ac2_member_create_uat_runner.ps1`,
 `scripts/member_create_uat_runner_lib.ps1`, and
 `config/member_create_uat_business_confirmation.json` to the AutoCount VM working
@@ -177,19 +202,48 @@ never creates it):
 New-Item -ItemType Directory -Path "C:\XB\create_uat\state" -Force
 ```
 
-Set the AutoCount connection through the process environment only (never in files,
-never in this runbook): `AC2_PROBE_SERVER_NAME`, `AC2_PROBE_DATABASE_NAME`,
-`AC2_PROBE_USER_ID`, and the password environment variable named by `-PasswordEnvVar`.
-
 ### 5. No-write preflight (dry-run)
 
-**`AUTOCOUNT VM — DESKTOP-4I042L6`** Build the approved package on the laptop first
-(steps below), copy it to the VM, then run the runner in dry-run mode (the default;
-no write switches). Dry-run authenticates, checks the duplicate, constructs the new
-member, assigns only the whitelisted fields, and stops without SaveMember.
+**Separate current-turn owner approval required (preflight gate).** The whole of this step is
+gated. It reads the selected private form response and its decision row, mutates the local
+reviewer-decision store and the approval ledger, builds an immutable package, configures the
+AutoCount connection in the process environment, moves that package onto the AutoCount VM
+`DESKTOP-4I042L6`, and then authenticates to AutoCount and reads live data. Laptop locality does
+not waive the approval for the private-data work. Before any of it, obtain an explicit
+current-turn owner approval that names the AutoCount VM (`DESKTOP-4I042L6`) and binds:
 
-Laptop package build (**`LAPTOP DEVELOPMENT MACHINE`**), using the decision-review
-output that shows the chosen row as `READY_FOR_CREATE_REVIEW`:
+- the bounded access to the selected private form response and its decision row for this one
+  package, identified in the approval itself by its non-PII `source_record_id`, which a row
+  number alone does not supply; the private field values are never written into this runbook;
+- the local reviewer-decision store and approval-ledger operations and the immutable package
+  build they produce;
+- the AutoCount process-environment configuration, by variable name only:
+  `AC2_PROBE_SERVER_NAME`, `AC2_PROBE_DATABASE_NAME`, `AC2_PROBE_USER_ID`, and the password
+  environment variable named by `-PasswordEnvVar`;
+- the intended AutoCount target (the server and database / account book), named in the approval
+  itself and never written into this runbook as a connection value or secret;
+- the bounded transfer of the approved package to that VM, copying or replacing the fixed VM
+  working copy `C:\XB\create_uat\member_create_uat_package.json` that the runner always reads;
+  this replacement authority covers that one VM working copy only, never the laptop-side
+  package build, which stays strictly no-clobber;
+- the no-write dry-run / preflight operation.
+
+This approval is distinct and is **not** implied by any other gate:
+
+- the PR review and merge decision (step 2) does **not** authorise this preflight;
+- the physical-host sync approval (step 3) does **not** authorise this preflight;
+- the VM deployment approval (step 4) does **not** authorise this preflight;
+- the separate current-turn write approval (step 7) does **not** authorise this preflight.
+
+A prior-turn approval is not reusable. The dry-run may authenticate, check the duplicate and
+construct the member in memory, but it does **not** authorise or call `SaveMember`; that write
+remains gated by step 7. Without the named current-turn preflight approval, stop before reading
+the private form response or decision row, before building the package, before setting the
+AutoCount environment, and before transferring the package to the VM or contacting AutoCount.
+
+**`LAPTOP DEVELOPMENT MACHINE`** Only after the preflight approval above, build the approved
+package on the laptop, using the decision-review output that shows the chosen row as
+`READY_FOR_CREATE_REVIEW`:
 
 ```bash
 python scripts/member_create_uat_approval.py approve --reviewer <handle> --input <form.csv> --decision-rows <member_intake_decision_rows.csv> --row-number <N> --ledger <ledger.jsonl>
@@ -212,6 +266,20 @@ and its hash, are preserved as historical evidence and remain non-executable und
 bump changes both `source_record_id` and `source_fingerprint` (each binds the schema
 version), a fresh reviewer decision is mechanically required; a `v1` decision or build
 cannot mint a `v2` package.
+
+**`AUTOCOUNT VM — DESKTOP-4I042L6`** Every remaining preflight operation runs on the
+AutoCount VM, under the same preflight approval, in the VM process that runs the runner.
+
+Set the AutoCount connection through the process environment only (never in files, never in
+this runbook): `AC2_PROBE_SERVER_NAME`, `AC2_PROBE_DATABASE_NAME`, `AC2_PROBE_USER_ID`, and
+the password environment variable named by `-PasswordEnvVar`. `ac2_member_create_uat_runner.ps1`
+defaults `ServerName`, `DatabaseName` and `UserId` from these variables in its own VM process,
+so values set on the laptop configure nothing.
+
+Then copy the approved package to the VM and run the runner in dry-run mode (the default;
+no write switches). Dry-run authenticates, checks the duplicate, constructs the new member,
+assigns only the whitelisted fields, and stops without SaveMember. The build authority
+below governs which package may be transferred at all.
 
 #### Transactional reviewer-decision authority (SQLite) — JSONL is audit-only
 
@@ -477,6 +545,12 @@ Immediately before unlinking, the exact pathname is re-classified and required t
 regular file this operation exclusively created, compared by the identity captured at creation. A
 replacement object is **never** unlinked. Nothing is ever listed, globbed or swept, and no other
 pathname is touched.
+
+**Separate current-turn destructive-cleanup approval required (destructive-cleanup gate).** Before
+the deletion or removal below, obtain an explicit current-turn owner approval that names the exact
+target basename or path and the exact delete or remove operation. A step-5 preflight approval, a
+build or reviewer decision, a step-7 write approval, repository review or merge, and any prior-turn
+approval are none of them reusable for it.
 
 | Outcome | Reported as | Operator action |
 | --- | --- | --- |
@@ -807,6 +881,12 @@ so `approval_blocked` and `do_not_retry` are both false. Every other exit-9 stat
 reports `decision_store_final_path_state` whenever a refusal has something to say about the final
 store path, and derives `decision_store_modified` from it:
 
+**Separate current-turn destructive-cleanup approval required (destructive-cleanup gate).** Before
+the deletion or removal below, obtain an explicit current-turn owner approval that names the exact
+target basename or path and the exact delete or remove operation. A step-5 preflight approval, a
+build or reviewer decision, a step-7 write approval, repository review or merge, and any prior-turn
+approval are none of them reusable for it.
+
 | `decision_store_final_path_state` | `decision_store_modified` | Meaning and required action |
 | --- | --- | --- |
 | `published_not_admitted` | `true` | **This** operation published a store and then failed before its admission fact was proven. The store exists, is complete, and is **not operational**. Nothing was rolled back or deleted. Recovery is the controlled reconciliation command under owner authority, or removal of the non-operational store under review. |
@@ -815,6 +895,12 @@ store path, and derives `decision_store_modified` from it:
 | absent | `false` | The store was left exactly as it was found. |
 
 Store states you may see at exit 9, and what to do:
+
+**Separate current-turn destructive-cleanup approval required (destructive-cleanup gate).** Before
+the deletion or removal below, obtain an explicit current-turn owner approval that names the exact
+target basename or path and the exact delete or remove operation. A step-5 preflight approval, a
+build or reviewer decision, a step-7 write approval, repository review or merge, and any prior-turn
+approval are none of them reusable for it.
 
 - `store_not_admitted`: the store is readable and canonical but carries **no admission fact**, so
   it has never been admitted to operational use. This is the expected, correct state after any
@@ -854,12 +940,24 @@ start a fresh reviewer decision.
 Exit 3 (`cleanup_incomplete`) reports `stale_temp_basename` (a PII-free `.mcuat_pkg_*.tmp`
 name in the output directory) with `manual_cleanup_required`:
 
+**Separate current-turn destructive-cleanup approval required (destructive-cleanup gate).** Before
+the deletion or removal below, obtain an explicit current-turn owner approval that names the exact
+target basename or path and the exact delete or remove operation. A step-5 preflight approval, a
+build or reviewer decision, a step-7 write approval, repository review or merge, and any prior-turn
+approval are none of them reusable for it.
+
 - `publication = not_published`: nothing was published and nothing was reserved. Manually
   delete the named stray temporary file, then re-run the build.
 - `publication = succeeded`: the final package WAS published and is recorded in the ledger
   as `build_cleanup_incomplete`. Do NOT rebuild this operation (the builder refuses it):
   manually delete the named stray temporary file, and if a new package is genuinely needed,
   start a fresh reviewer decision.
+
+**Separate current-turn destructive-cleanup approval required (destructive-cleanup gate).** Before
+the deletion or removal below, obtain an explicit current-turn owner approval that names the exact
+target basename or path and the exact delete or remove operation. A step-5 preflight approval, a
+build or reviewer decision, a step-7 write approval, repository review or merge, and any prior-turn
+approval are none of them reusable for it.
 
 Exit 4 (`ledger_record_incomplete`) means the final package is published and complete but
 its durable ledger event was lost, or landed without confirmed durability. Never delete,
@@ -924,6 +1022,37 @@ irreversible section, calls `SaveMember` at most once, and never retries.
 
 ### 9. Read-back and terminal result mapping
 
+**Separate current-turn owner approval required (result-mapping gate).** The mapping below runs
+live operations on the operator PC n8n instance and writes to the intended Google Sheet. Before any
+of it, obtain an explicit current-turn owner approval that names the intended result-mapping
+workflow `n8n-workflows/member_create_uat_result_mapping.workflow.json`, the intended spreadsheet
+and source tab, the intended Google credential by its non-secret operator-recognisable
+credential name or identity, the exact non-secret `uat_create_operation_id` whose spreadsheet
+row is to be updated, and the intended n8n instance or environment by its non-secret
+operator-recognisable name. Those identities are named in that approval itself, and the
+instance URL, connection details, credential values, OAuth tokens and API keys are never
+written into this runbook. That approval binds:
+
+- importing and using the local copy of that workflow on the operator PC n8n instance;
+- binding the intended Google credential by name or identity only, never by secret value;
+- copying the sanitised result file into the approved n8n file location `/home/node/.n8n-files/`;
+- running that workflow manually, with the workflow left inactive;
+- updating the one intended spreadsheet row selected by `uat_create_operation_id`.
+
+This approval is distinct and is **not** implied by any other gate:
+
+- the PR review and merge decision (step 2) does **not** authorise this result mapping;
+- the physical-host sync approval (step 3) does **not** authorise this result mapping;
+- the VM deployment approval (step 4) does **not** authorise this result mapping;
+- the no-write preflight approval (step 5) does **not** authorise this result mapping;
+- the separate current-turn write approval (step 7) does **not** authorise this result mapping.
+
+A prior-turn approval is not reusable. Repository review or merge is not this approval, and this
+approval authorises no AutoCount contact and no further member write. Without the named current-turn
+result-mapping approval, stop before importing the workflow, before binding any credential, before
+copying the result file into the n8n file location, before running the workflow and before updating
+the spreadsheet row.
+
 On `CREATED_VERIFIED`, the runner has already read the member back and compared the
 approved safe fields. Map the sanitized terminal result to the Sheet:
 
@@ -949,6 +1078,28 @@ approved safe fields. Map the sanitized terminal result to the Sheet:
 
 ### 10. Recovery for `WRITE_OUTCOME_UNCERTAIN`
 
+**Separate current-turn owner approval required (recovery gate).** This step is conditional and
+applies only when the runner returned `WRITE_OUTCOME_UNCERTAIN`. When it applies, and before any
+AutoCount contact, obtain an explicit current-turn owner approval that names the intended AutoCount
+account book and environment. The server and database are named in that approval itself, and are
+never written into this runbook. That approval binds the read-only member lookup and recovery
+operation for that one uncertain write outcome, and nothing else.
+
+This recovery is read-only. It grants no new `SaveMember` authority, authorises no create, update or
+delete, and authorises no second write attempt. This approval is distinct and is **not** implied by
+any other gate:
+
+- the PR review and merge decision (step 2) does **not** authorise this recovery lookup;
+- the physical-host sync approval (step 3) does **not** authorise this recovery lookup;
+- the VM deployment approval (step 4) does **not** authorise this recovery lookup;
+- the no-write preflight approval (step 5) does **not** authorise this recovery lookup;
+- the separate current-turn write approval (step 7) does **not** authorise this recovery lookup;
+- the step-9 result-mapping approval (step 9) does **not** authorise this recovery lookup.
+
+A prior-turn approval is not reusable. Repository review or merge is not this approval. Without the
+named current-turn recovery approval, stop before opening the account book and before searching for
+the member.
+
 If the runner returns `WRITE_OUTCOME_UNCERTAIN`, the SaveMember call began but success
 could not be proven. Do not retry, delete, or update anything automatically. Perform a
 separate read-only recovery check:
@@ -973,9 +1124,18 @@ consumed marker yields `FAILED_BEFORE_WRITE`; a malformed marker yields
 
 ### 11. UAT shutdown and inactivity
 
-After completion, leave the result-mapping workflow inactive, remove any temporary
-copies of the package and result from shared locations, and take no further create
-action. The consumed marker and write-intent marker remain on the VM as durable
+After completion, leave the result-mapping workflow inactive and take no further
+create action.
+
+**Separate current-turn destructive-cleanup approval required (destructive-cleanup gate).** Before
+the deletion or removal below, obtain an explicit current-turn owner approval that names the exact
+target basename or path and the exact delete or remove operation. A step-5 preflight approval, a
+build or reviewer decision, a step-7 write approval, repository review or merge, and any prior-turn
+approval are none of them reusable for it.
+
+Then remove any temporary copies of the package and result from shared locations.
+
+The consumed marker and write-intent marker remain on the VM as durable
 evidence and single-use guards; do not delete them. The laptop-side publication
 reservations remain beside the approval ledger for the same reason; do not delete or
 sweep them either.
@@ -989,6 +1149,18 @@ sweep them either.
 - The host sync on `DESKTOP-Q43QKQF` in step 3 and the `SaveMember` write in step 7
   each require their own prior current-turn owner approval. Neither implies the other,
   and a prior-turn approval is never reusable for either.
+- Four baseline approval surfaces are always required: the step-3 host sync, the step-4
+  VM deployment, the step-5 preflight surface (selected private form/decision-row access,
+  the reviewer-decision and approval-ledger operation, the immutable package build, the
+  AutoCount environment setup, the package transfer and the no-write AutoCount preflight),
+  and the step-7 `SaveMember` write.
+- Further conditional approval surfaces arise wherever the procedure reaches them: every
+  operator-directed destructive cleanup or removal, each one scoped locally to its exact
+  target and its exact delete or remove operation; the step-9 live n8n result mapping;
+  and the step-10 conditional read-only AutoCount recovery lookup.
+- This runbook states no fixed total number of approval surfaces. Each surface named
+  above requires its own current-turn owner approval, none implies or covers another, and
+  a prior-turn approval is never reusable for any of them.
 - Exactly one member is supported; there is no batch path, no update-member path, no
   delete, and no rollback automation.
 - SaveMember is called at most once and is never automatically retried. An uncertain
