@@ -23,6 +23,7 @@ Two deliberate boundaries:
 """
 
 import ast
+import hashlib
 import json
 import os
 import re
@@ -4130,6 +4131,92 @@ class ExpiryProbeScriptExecutionTests(unittest.TestCase):
         self.assertEqual(before, after, "the probe must not write evidence into the working directory")
 
 
+# ---- DL-XB-123-001-R1: the reviewed create-UAT runbook seal ---- #
+# WHY THIS EXISTS, and why it is not another parsing patch.
+#
+# Every prior round answered a false clean by teaching the hand-written Markdown/PowerShell model
+# one more case: another CommonMark start condition, another command spelling. Run-24 showed that
+# approach has not converged, and cannot: the semantic layer models a language, and any incomplete
+# model of a language has a next counterexample. Two of them are reproduced verbatim as the R1
+# residual controls below -- a type-7 HTML opener after a setext-style transition (F1), and an
+# active `Copy-Item` deployment to the VM placed outside step 4 (F2). Both left BOTH public guards
+# clean while the runbook said something an operator must not follow.
+#
+# R1 changes the completeness architecture instead. The COMPLETE reviewed runbook -- every byte a
+# reviewer actually read -- becomes the live authority, carried as one literal SHA-256. The public
+# guards fail closed on any drift from it. The question the guards answer is no longer "does my
+# parser recognise everything dangerous in this text?" (unanswerable) but "is this text the text
+# that was reviewed?" (decidable, and total).
+#
+# The semantic diagnostics are NOT retired: they remain defence in depth and the regression surface
+# for A1-A11, and every mutation control still asserts its own named semantic finding through the
+# internal semantic-only layer. What changed is that they are no longer load-bearing for
+# completeness. A known parser shortcoming is now acceptable precisely because it cannot produce a
+# clean PUBLIC guard: the seal fires first and independently.
+#
+# Canonicalisation is line-ending normalisation and NOTHING else -- no trimming, no whitespace
+# collapsing, no case folding, no blank-line or Unicode normalisation, no reordering. A CRLF
+# checkout and an LF checkout of the same reviewed bytes seal identically; every other textual
+# difference, down to one trailing space, changes the digest.
+#
+# The expected digest is a LITERAL reviewed constant. It is deliberately NOT computed from the
+# repository at import time or at guard time: a digest recomputed from the live file would seal the
+# document to itself and authorise any edit. Nothing here reads the repository, the filesystem, the
+# environment or a subprocess, so the guards stay pure text-in/findings-out and the closed
+# dependency contract is untouched. The tests establish the constant's truthfulness by comparing it
+# against an independently computed digest of the reviewed runbook.
+REVIEWED_RUNBOOK_SEAL_KEY = "reviewed_runbook_seal_mismatch"
+# SHA-256 of docs/autocount2-automation/member_create_uat_runbook.md at the reviewed head, over the
+# UTF-8 bytes of its line-ending-normalised text.
+REVIEWED_RUNBOOK_SHA256 = "56f5a081145cb80719d2dec5e603381e7d8cbfbfcfeb6019e5cee59d7c564bce"
+
+
+# The seal path must reach nothing but its argument. These are the names whose presence anywhere in
+# the seal helpers or the public guards would mean the digest could be answered by the filesystem,
+# the environment or a subprocess instead of by the supplied text.
+SEAL_FORBIDDEN_NAMES = frozenset({
+    "read_repo_text", "repo_path", "read_scratch_text", "ROOT", "REPO_DEPENDENCIES",
+    "open", "Path", "os", "sys", "subprocess", "tempfile", "shutil", "input", "eval", "exec",
+    "compile", "globals", "locals", "vars", "getattr", "__import__",
+})
+# Attribute spellings of the same reach. `read_text`/`read_bytes`/`open` are the registered repo
+# read methods; `environ`/`getenv` and the subprocess entry points are the non-file escapes.
+SEAL_FORBIDDEN_ATTRIBUTES = frozenset({
+    "read_text", "read_bytes", "open", "environ", "getenv", "run", "check_output", "Popen",
+    "resolve", "iterdir", "glob", "exists", "stat",
+})
+# The seal path itself, plus the two public guards that must fail closed through it.
+SEAL_PURE_FUNCTIONS = ("canonical_seal_text", "reviewed_runbook_digest",
+                       "reviewed_runbook_seal_findings", "vm_gate_findings",
+                       "host_sync_gate_findings")
+
+
+def canonical_seal_text(text):
+    """``text`` with line endings normalised to LF, and nothing else changed.
+
+    CRLF and a bare CR both become LF, so a Windows checkout and a POSIX checkout of identical
+    reviewed content seal identically. Every other byte is significant: a trailing space, a case
+    change, an added or removed blank line and a changed final newline all survive into the digest.
+    """
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def reviewed_runbook_digest(text):
+    """The lowercase hex SHA-256 of ``text`` in canonical form."""
+    return hashlib.sha256(canonical_seal_text(text).encode("utf-8")).hexdigest()
+
+
+def reviewed_runbook_seal_findings(text):
+    """``[]`` when ``text`` IS the reviewed runbook, else the one declared seal finding.
+
+    Evaluated from the SUPPLIED text only. The guard never rereads the repository, so the seal
+    cannot be satisfied by a document that merely happens to sit at the reviewed path.
+    """
+    if reviewed_runbook_digest(text) == REVIEWED_RUNBOOK_SHA256:
+        return []
+    return [REVIEWED_RUNBOOK_SEAL_KEY]
+
+
 # ---- DL-XB-118-001: create-UAT physical-host sync approval contract ---- #
 # The create-UAT runbook's step-3 `git pull --ff-only origin main` runs on physical host
 # DESKTOP-Q43QKQF: it contacts a remote and mutates that machine's checkout, so it needs its own
@@ -4186,12 +4273,14 @@ HOST_SYNC_SAFETY_TOKENS = ("desktop-q43qkqf", "step 3", "step 7", "savemember",
                            "neither implies the other",
                            "a prior-turn approval is never reusable for either")
 
-# Every finding key this contract can report.
-HOST_SYNC_FINDING_KEYS = (
+# Every finding key the SEMANTIC layer of this contract can report.
+HOST_SYNC_SEMANTIC_FINDING_KEYS = (
     "gate_after_pull", "gate_missing", "host_not_named", "mutation_disclosure_missing",
     "not_current_turn", "operation_not_named", "prior_turn_not_denied", "pull_missing",
     "safety_boundary_missing", "stop_boundary_missing", "substitution_not_denied",
 )
+# Every finding key the PUBLIC guard can report: the semantic surface plus the R1 seal.
+HOST_SYNC_FINDING_KEYS = HOST_SYNC_SEMANTIC_FINDING_KEYS + (REVIEWED_RUNBOOK_SEAL_KEY,)
 
 
 def _flat(text):
@@ -4227,12 +4316,17 @@ def _unblocked(text, at):
     return -1 if at == -1 or _block_state_at(text, at) is not None else at
 
 
-def host_sync_gate_findings(text):
-    """Return sorted contract findings for the create-UAT physical-host sync approval gate.
+def _host_sync_semantic_findings(text):
+    """Sorted SEMANTIC findings for the create-UAT physical-host sync approval gate.
 
     Pure and text-only: no repository read, no path derivation, and only non-throwing ``find()``
-    searches, so a degraded in-memory fixture reports findings instead of raising. An empty list
-    means the whole contract holds.
+    searches, so a degraded in-memory fixture reports findings instead of raising.
+
+    R1 boundary: this is defence-in-depth diagnosis, NOT the live completeness authority. An empty
+    list here means only that no MODELLED defect was recognised -- the public guard adds the
+    reviewed-runbook seal, which is what makes arbitrary live drift undecidable-free. Semantic
+    mutation controls call this layer directly, so a seal mismatch (which every mutated fixture has
+    by construction) cannot mask the named semantic finding they exist to prove.
     """
     findings = set()
 
@@ -4300,6 +4394,17 @@ def host_sync_gate_findings(text):
             findings.add("safety_boundary_missing")
 
     return sorted(findings)
+
+
+def host_sync_gate_findings(text):
+    """The PUBLIC live host-sync guard: reviewed-runbook seal, then semantic diagnostics.
+
+    Fails closed on any drift from the reviewed runbook, whether or not the semantic layer models
+    the drift. Pure text-in/findings-out: the seal is computed from ``text``, never from the file
+    on disk, so the same input always yields the same output.
+    """
+    return sorted(set(reviewed_runbook_seal_findings(text))
+                  | set(_host_sync_semantic_findings(text)))
 
 
 # A minimal, self-contained COMPLIANT document. The negative controls degrade this rather than the
@@ -5737,7 +5842,10 @@ VM_GATE_A11_NEW_KEYS = (
     "recovery_stop_boundary_missing",
 )
 # A6 declared 50; A7 to A10 added none. A11 adds the 39 above and renames one, so 50 become 89.
+# That 89 is now the SEMANTIC surface. R1 adds the seal key to the PUBLIC surface only, so the
+# public count is 90; both are declared, so neither can drift silently against the other.
 VM_GATE_A11_FINDING_KEY_COUNT = 89
+VM_GATE_R1_FINDING_KEY_COUNT = VM_GATE_A11_FINDING_KEY_COUNT + 1
 # The COMPLETE set of keys an EMPTY document cannot report, because each needs a document that
 # actually contains the landmark it is about. The pre-A11 eleven are carried forward unchanged; A11
 # adds the two step-9/step-10 ambiguity, ordering and heading families, plus the three keys that
@@ -5773,7 +5881,7 @@ VM_GATE_A11_NEEDS_A_REAL_DOCUMENT = frozenset((
 # carried by an existing key -- the fence-position, fenced-line and container-indentation repairs
 # by the four `*_text_changed` identities, and the complete Safety-boundary authority by
 # `safety_boundary_surfaces_incomplete`.
-VM_GATE_FINDING_KEYS = (
+VM_GATE_SEMANTIC_FINDING_KEYS = (
     "deploy_action_text_changed", "preflight_action_text_changed",
     "deploy_boundary_ambiguous", "deploy_boundary_missing", "deploy_execution_not_denied",
     "deploy_gate_after_mutation", "deploy_gate_marker_ambiguous", "deploy_gate_missing",
@@ -5799,6 +5907,11 @@ VM_GATE_FINDING_KEYS = (
     "preflight_transfer_not_bound", "preflight_vm_not_named", "safety_boundary_ambiguous",
     "safety_boundary_surfaces_incomplete",
 ) + VM_GATE_A11_NEW_KEYS
+# R1 adds exactly one key to the PUBLIC surface -- the reviewed-runbook seal -- and retires none.
+# It is deliberately NOT a member of the semantic surface: the semantic layer cannot report it, and
+# the boundary between "the parser recognised a defect" and "this is not the reviewed document"
+# must stay visible in the declaration itself.
+VM_GATE_FINDING_KEYS = VM_GATE_SEMANTIC_FINDING_KEYS + (REVIEWED_RUNBOOK_SEAL_KEY,)
 
 
 def _semantic_heading(line):
@@ -6805,11 +6918,16 @@ def _gated_step_findings(text, findings, spec):
         findings.add(prefix + "_stop_boundary_missing")
 
 
-def vm_gate_findings(text):
-    """Return sorted contract findings for the create-UAT VM deployment and preflight gates.
+def _vm_gate_semantic_findings(text):
+    """Sorted SEMANTIC findings for the create-UAT VM deployment and preflight gates.
 
-    Pure and text-only: no repository read, no path derivation and only non-throwing searches. An
-    empty list means the whole DL-XB-123-001 contract holds.
+    Pure and text-only: no repository read, no path derivation and only non-throwing searches.
+
+    R1 boundary: this is the A1-A11 defence-in-depth surface, NOT the live completeness authority.
+    Its Markdown model and its protected-operation table are both known to be incomplete -- see the
+    two R1 residual controls -- and that is now tolerable because the PUBLIC guard seals the whole
+    reviewed document independently. Semantic mutation controls call this layer directly so their
+    named findings stay provable on documents the seal necessarily rejects.
     """
     findings = set()
     _deployment_findings(text, findings)
@@ -6820,6 +6938,17 @@ def vm_gate_findings(text):
     _destructive_cleanup_findings(text, findings)
     _safety_boundary_findings(text, findings)
     return sorted(findings)
+
+
+def vm_gate_findings(text):
+    """The PUBLIC live VM-gate guard: reviewed-runbook seal, then semantic diagnostics.
+
+    Fails closed on any drift from the reviewed runbook, whether or not the semantic layer models
+    the drift. Pure text-in/findings-out: the seal is computed from ``text``, never from the file
+    on disk, so the same input always yields the same output.
+    """
+    return sorted(set(reviewed_runbook_seal_findings(text))
+                  | set(_vm_gate_semantic_findings(text)))
 
 
 # A minimal, self-contained COMPLIANT document. Every negative control degrades THIS rather than
@@ -8403,6 +8532,39 @@ VM_GATE_A11_FIXTURE = (
 
 VM_GATE_CANONICAL_FIXTURE = VM_GATE_A11_FIXTURE
 
+# --- R1: the two accepted Run-24 residuals, reproduced verbatim as controls --- #
+# R1-F1. The structural shape Run-24 used to obtain a material false clean. In CommonMark the
+# `===` underline turns the preceding paragraph into a SETEXT heading, which closes the paragraph;
+# the following complete tag alone on its line then opens a type-7 HTML block that runs to the next
+# blank line and swallows whatever follows -- including reviewed approval authority. The semantic
+# layer's paragraph model knows only blank lines, ATX headings and thematic breaks (see
+# `_breaks_paragraph`), so it still believes a paragraph is open, and type 7 cannot interrupt a
+# paragraph -- so it opens nothing and reports nothing. That incompleteness is REAL and is left in
+# place on purpose: R1 does not answer it by teaching `_breaks_paragraph` setext headings, because
+# the next counterexample would simply be a different construct. It is answered by the seal.
+VM_GATE_R1_SETEXT_LINES = ("editor note", "===")
+# Three type-7 spellings, so the control is not one hard-coded tag. `template` is deliberately
+# included: it is NOT in the CommonMark type-6 tag list, so it can only ever be type 7.
+VM_GATE_R1_TYPE7_OPENERS = ("<template>", "<x-review>", "<x-review />")
+# The reviewed approval authorities the residual is placed in front of. The host-sync authority is
+# the one Run-24 actually used, because it is the placement at which the semantic layer stays
+# COMPLETELY clean -- no incidental structural finding masks the false clean.
+VM_GATE_R1_F1_AUTHORITIES = (
+    ("step-3 host-sync gate", HOST_SYNC_A11_GATE_OPENING),
+)
+# R1-F2. The originating review's own reproduction: an ACTIVE deployment of the reviewed runner to
+# the AutoCount VM, placed outside the step-4 deployment gate that is supposed to govern it. The
+# central protected-operation table (`VM_GATE_A11_PROTECTED_OPERATIONS`) does not classify it,
+# because it enumerates operations by command spelling and `Copy-Item` is not among them. R1 does
+# not answer this by adding `Copy-Item` -- nor `robocopy`, nor `Invoke-Command` -- because the
+# table would still be an enumeration. It is answered by the seal.
+VM_GATE_R1_COPY_ITEM_COMMAND = (
+    r"Copy-Item -Path scripts\ac2_member_create_uat_runner.ps1 "
+    r"-Destination \\DESKTOP-4I042L6\C$\XB\create_uat\ -Force")
+# Steps outside the step-4 deployment region at which the operation is injected, chosen so the
+# semantic layer stays completely clean and the false clean is unmasked by any incidental finding.
+VM_GATE_R1_F2_STEPS = (1, 2, 6)
+
 # The two gated-step specifications the shared `_gated_step_findings` consumes. Declared as data
 # so the contract for each new surface is readable in one place, and so the controls and the checker
 # cannot drift apart on any of it.
@@ -8651,8 +8813,13 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
         return _flat(self.create_runbook[gate_idx:pull_idx])
 
     def test_create_uat_runbook_satisfies_the_whole_host_sync_gate_contract(self):
+        # A LIVE-runbook integrity assertion, so it goes through the PUBLIC sealed guard: the
+        # live document must be the reviewed document AND satisfy every semantic requirement.
         self.assertEqual(host_sync_gate_findings(self.create_runbook), [],
-                         "the create-UAT runbook must satisfy every host-sync gate requirement")
+                         "the create-UAT runbook must be the reviewed document and satisfy every "
+                         "host-sync gate requirement")
+        self.assertEqual(_host_sync_semantic_findings(self.create_runbook), [],
+                         "the semantic layer must also be clean on the live runbook")
 
     def test_create_uat_gate_precedes_the_pull_and_names_host_and_operation(self):
         prose = self._create_uat_gate_prose()          # also asserts gate-before-pull ordering
@@ -8710,7 +8877,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
     def test_canonical_host_sync_fixture_is_itself_compliant(self):
         # The control group. Without this, a degraded fixture proving "findings appear" would be
         # worthless: the findings might have been there all along.
-        self.assertEqual(host_sync_gate_findings(HOST_SYNC_CANONICAL_FIXTURE), [],
+        self.assertEqual(_host_sync_semantic_findings(HOST_SYNC_CANONICAL_FIXTURE), [],
                          "the canonical fixture must satisfy the contract before it is degraded")
 
     def _degraded_gate(self, old, new):
@@ -8736,53 +8903,53 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
         self.assertIn(fence, HOST_SYNC_CANONICAL_FIXTURE)
         degraded = fence + HOST_SYNC_CANONICAL_FIXTURE.replace(fence, "", 1)
         self.assertNotEqual(degraded, HOST_SYNC_CANONICAL_FIXTURE)
-        self.assertIn("gate_after_pull", host_sync_gate_findings(degraded))
+        self.assertIn("gate_after_pull", _host_sync_semantic_findings(degraded))
 
     def test_control_missing_pull_command_is_detected(self):
         degraded = HOST_SYNC_CANONICAL_FIXTURE.replace(HOST_SYNC_PULL_INVOCATION, "```bash\ntrue")
         self.assertNotEqual(degraded, HOST_SYNC_CANONICAL_FIXTURE)
-        self.assertIn("pull_missing", host_sync_gate_findings(degraded))
+        self.assertIn("pull_missing", _host_sync_semantic_findings(degraded))
 
     def test_control_unnamed_host_is_detected(self):
         degraded = self._degraded_gate(HOST_SYNC_HOST, "the physical host")
-        self.assertIn("host_not_named", host_sync_gate_findings(degraded))
+        self.assertIn("host_not_named", _host_sync_semantic_findings(degraded))
 
     def test_control_unnamed_operation_is_detected(self):
         degraded = self._degraded_gate("`" + HOST_SYNC_PULL_COMMAND + "`", "`the pull command`")
-        self.assertIn("operation_not_named", host_sync_gate_findings(degraded))
+        self.assertIn("operation_not_named", _host_sync_semantic_findings(degraded))
 
     def test_control_generic_approval_wording_replacing_the_gate_is_detected(self):
         degraded = self._degraded_gate(HOST_SYNC_GATE_MARKER, "approval required")
-        self.assertIn("gate_missing", host_sync_gate_findings(degraded))
+        self.assertIn("gate_missing", _host_sync_semantic_findings(degraded))
 
     def test_control_missing_current_turn_wording_is_detected(self):
         degraded = self._degraded_gate(HOST_SYNC_CURRENT_TURN_PHRASE, "owner approval")
-        self.assertIn("not_current_turn", host_sync_gate_findings(degraded))
+        self.assertIn("not_current_turn", _host_sync_semantic_findings(degraded))
 
     def test_control_each_removed_non_substitution_statement_is_detected(self):
         for step, statement in HOST_SYNC_STEP_DENIAL_BULLETS.items():
             with self.subTest(step=step):
                 degraded = self._degraded_gate(statement, "")
-                self.assertIn("substitution_not_denied", host_sync_gate_findings(degraded))
+                self.assertIn("substitution_not_denied", _host_sync_semantic_findings(degraded))
 
     def test_control_removed_forward_non_authorisation_is_detected(self):
         # Degrade against RAW fixture text: HOST_SYNC_FORWARD_PHRASE is the whitespace-collapsed
         # form and the fixture wraps that sentence, so it is not a literal substring here.
         degraded = self._degraded_gate("does not authorise deployment", "authorises deployment")
-        self.assertIn("substitution_not_denied", host_sync_gate_findings(degraded))
+        self.assertIn("substitution_not_denied", _host_sync_semantic_findings(degraded))
 
     def test_control_removed_prior_turn_non_reuse_is_detected(self):
         degraded = self._degraded_gate("A prior-turn approval is not reusable. ", "")
-        self.assertIn("prior_turn_not_denied", host_sync_gate_findings(degraded))
+        self.assertIn("prior_turn_not_denied", _host_sync_semantic_findings(degraded))
 
     def test_control_removed_stop_boundary_is_detected(self):
         degraded = self._degraded_gate(
             "stop before contacting `DESKTOP-Q43QKQF` and do not run", "do not run")
-        self.assertIn("stop_boundary_missing", host_sync_gate_findings(degraded))
+        self.assertIn("stop_boundary_missing", _host_sync_semantic_findings(degraded))
 
     def test_control_removed_safety_boundary_independence_is_detected(self):
         degraded = self._degraded_safety("Neither implies the other,", "")
-        self.assertIn("safety_boundary_missing", host_sync_gate_findings(degraded))
+        self.assertIn("safety_boundary_missing", _host_sync_semantic_findings(degraded))
 
     # -- Polarity controls: a denial INVERTED in place, not removed -- #
     # Removal controls only prove the oracle notices an absent bullet. These prove it notices a
@@ -8797,19 +8964,19 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
 
     def test_control_inverted_step_2_non_substitution_is_detected(self):
         degraded = self._inverted_step_denial("(step 2)")
-        self.assertIn("substitution_not_denied", host_sync_gate_findings(degraded))
+        self.assertIn("substitution_not_denied", _host_sync_semantic_findings(degraded))
 
     def test_control_inverted_step_4_non_substitution_is_detected(self):
         degraded = self._inverted_step_denial("(step 4)")
-        self.assertIn("substitution_not_denied", host_sync_gate_findings(degraded))
+        self.assertIn("substitution_not_denied", _host_sync_semantic_findings(degraded))
 
     def test_control_inverted_step_5_non_substitution_is_detected(self):
         degraded = self._inverted_step_denial("(step 5)")
-        self.assertIn("substitution_not_denied", host_sync_gate_findings(degraded))
+        self.assertIn("substitution_not_denied", _host_sync_semantic_findings(degraded))
 
     def test_control_inverted_step_7_non_substitution_is_detected(self):
         degraded = self._inverted_step_denial("(step 7)")
-        self.assertIn("substitution_not_denied", host_sync_gate_findings(degraded))
+        self.assertIn("substitution_not_denied", _host_sync_semantic_findings(degraded))
 
     def test_control_a_neighbouring_compliant_bullet_cannot_satisfy_an_inverted_one(self):
         # The specific bypass a fixed proximity window allows: invert one bullet and let the
@@ -8818,7 +8985,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
         for neighbour in ("(step 2)", "(step 5)", "(step 7)"):
             self.assertIn(HOST_SYNC_STEP_DENIAL_BULLETS[neighbour], degraded,
                           "%s must remain compliant and adjacent" % neighbour)
-        self.assertIn("substitution_not_denied", host_sync_gate_findings(degraded))
+        self.assertIn("substitution_not_denied", _host_sync_semantic_findings(degraded))
 
     # -- Unterminated inversion: the bound must not depend on the bullet's own punctuation -- #
     # `;` and `.` belong to the bullet an editor is already rewriting, so the same edit that
@@ -8840,15 +9007,15 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
 
     def test_control_unterminated_inverted_step_2_cannot_borrow_step_4(self):
         degraded = self._inverted_unterminated_step_denial("(step 2)", "(step 4)")
-        self.assertIn("substitution_not_denied", host_sync_gate_findings(degraded))
+        self.assertIn("substitution_not_denied", _host_sync_semantic_findings(degraded))
 
     def test_control_unterminated_inverted_step_4_cannot_borrow_step_5(self):
         degraded = self._inverted_unterminated_step_denial("(step 4)", "(step 5)")
-        self.assertIn("substitution_not_denied", host_sync_gate_findings(degraded))
+        self.assertIn("substitution_not_denied", _host_sync_semantic_findings(degraded))
 
     def test_control_unterminated_inverted_step_5_cannot_borrow_step_7(self):
         degraded = self._inverted_unterminated_step_denial("(step 5)", "(step 7)")
-        self.assertIn("substitution_not_denied", host_sync_gate_findings(degraded))
+        self.assertIn("substitution_not_denied", _host_sync_semantic_findings(degraded))
 
     # -- Neighbour marker variants: the bound must not depend on WHICH bullet marker is used -- #
     # The controls above all leave the neighbour hyphen-marked, so they only prove the " - " break
@@ -8898,7 +9065,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                 with self.subTest(step=step, neighbour=neighbour, marker=marker):
                     degraded = self._unterminated_inversion_across_marker(step, neighbour, marker)
                     self.assertIn(
-                        "substitution_not_denied", host_sync_gate_findings(degraded),
+                        "substitution_not_denied", _host_sync_semantic_findings(degraded),
                         "%s borrowed %s's denial across a %r-marked bullet break"
                         % (step, neighbour, marker))
 
@@ -8907,42 +9074,47 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
         degraded = self._degraded_safety(
             "each require their own prior current-turn owner approval",
             "are both covered by the owner's standing approval")
-        self.assertIn("safety_boundary_missing", host_sync_gate_findings(degraded))
+        self.assertIn("safety_boundary_missing", _host_sync_semantic_findings(degraded))
 
     def test_control_weakened_safety_prior_turn_non_reuse_is_detected(self):
         degraded = self._degraded_safety(
             "a prior-turn approval is never reusable for either",
             "either may rely on an earlier approval")
-        self.assertIn("safety_boundary_missing", host_sync_gate_findings(degraded))
+        self.assertIn("safety_boundary_missing", _host_sync_semantic_findings(degraded))
 
     # -- Mutation / not-read-only disclosure controls -- #
     # The gate must say what the guarded command DOES, or a reader cannot judge the approval.
     def test_control_removed_remote_contact_disclosure_is_detected(self):
         degraded = self._degraded_gate("contacts the remote, and ", "")
-        self.assertIn("mutation_disclosure_missing", host_sync_gate_findings(degraded))
+        self.assertIn("mutation_disclosure_missing", _host_sync_semantic_findings(degraded))
 
     def test_control_removed_checkout_mutation_disclosure_is_detected(self):
         degraded = self._degraded_gate(
             "fast-forwards (mutates)\nthat host's checkout", "runs there")
-        self.assertIn("mutation_disclosure_missing", host_sync_gate_findings(degraded))
+        self.assertIn("mutation_disclosure_missing", _host_sync_semantic_findings(degraded))
 
     def test_control_inverted_read_only_disclosure_is_detected(self):
         degraded = self._degraded_gate("not a read-only check", "a read-only check")
-        self.assertIn("mutation_disclosure_missing", host_sync_gate_findings(degraded))
+        self.assertIn("mutation_disclosure_missing", _host_sync_semantic_findings(degraded))
 
     # ---- DL-XB-123-001: create-UAT VM deployment and no-write preflight approval gates ---- #
     # Exactly ONE live assertion, so a gap in the real runbook fails here once and reports what is
     # missing. Every other test below degrades the in-memory fixture and proves the shared checker
     # emits a specific finding, which is what shows this contract can actually fail.
     def test_create_uat_runbook_satisfies_the_whole_vm_gate_contract(self):
+        # A LIVE-runbook integrity assertion, so it goes through the PUBLIC sealed guard. Under R1
+        # this is the assertion that actually converges: it holds only while the live document is
+        # byte-for-byte the reviewed one, independently of what the semantic model recognises.
         self.assertEqual(vm_gate_findings(self.create_runbook), [],
-                         "the create-UAT runbook must satisfy every DL-XB-123-001 deployment "
-                         "and preflight approval requirement")
+                         "the create-UAT runbook must be the reviewed document and satisfy every "
+                         "DL-XB-123-001 deployment and preflight approval requirement")
+        self.assertEqual(_vm_gate_semantic_findings(self.create_runbook), [],
+                         "the semantic layer must also be clean on the live runbook")
 
     def test_canonical_vm_gate_fixture_is_itself_compliant(self):
         # The control group. Without it, a degraded fixture proving "findings appear" would be
         # worthless: the findings might have been there all along.
-        self.assertEqual(vm_gate_findings(VM_GATE_CANONICAL_FIXTURE), [],
+        self.assertEqual(_vm_gate_semantic_findings(VM_GATE_CANONICAL_FIXTURE), [],
                          "the canonical fixture must satisfy the contract before it is degraded")
 
     def test_vm_gate_finding_keys_are_declared_and_every_one_is_reachable(self):
@@ -8956,12 +9128,20 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
         # A11 widened this set with the two new numbered-step families and the three keys that
         # need a real operation, destructive instruction or cleanup gate to exist at all. It is
         # declared once, beside the A11 contract, so this control and the A11 one cannot drift.
+        # R1 splits the expectation deliberately rather than exempting the empty document. The
+        # SEMANTIC surface is unchanged: an empty document still reports every semantic key that
+        # does not need a real landmark. The PUBLIC surface adds exactly the seal key, because an
+        # empty document is manifestly not the reviewed runbook.
         needs_a_real_document = set(VM_GATE_A11_NEEDS_A_REAL_DOCUMENT)
-        self.assertLess(needs_a_real_document, set(VM_GATE_FINDING_KEYS),
+        self.assertLess(needs_a_real_document, set(VM_GATE_SEMANTIC_FINDING_KEYS),
                         "the ordering, ambiguity and numbered-step keys must all be declared")
+        self.assertEqual(set(_vm_gate_semantic_findings("")),
+                         set(VM_GATE_SEMANTIC_FINDING_KEYS) - needs_a_real_document,
+                         "an empty document must report every other declared semantic finding key")
         self.assertEqual(set(vm_gate_findings("")),
-                         set(VM_GATE_FINDING_KEYS) - needs_a_real_document,
-                         "an empty document must report every other declared finding key")
+                         (set(VM_GATE_SEMANTIC_FINDING_KEYS) - needs_a_real_document)
+                         | {REVIEWED_RUNBOOK_SEAL_KEY},
+                         "the public guard adds exactly the seal key on an empty document")
 
     # -- Fixture degradation helpers: in-memory only, never a repository file -- #
     def _vm_gate_replace_section(self, section, mutated):
@@ -9050,18 +9230,18 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
     # -- Step-4 deployment gate controls -- #
     def test_control_missing_deployment_gate_is_detected(self):
         degraded = self._degraded_deploy_gate("(deployment gate)", "(approval required)")
-        self.assertIn("deploy_gate_missing", vm_gate_findings(degraded))
+        self.assertIn("deploy_gate_missing", _vm_gate_semantic_findings(degraded))
 
     def test_control_deployment_gate_after_the_mutation_boundary_is_detected(self):
         degraded = self._relocated_gate_after_operation(
             VM_GATE_DEPLOY_STEP, VM_GATE_DEPLOY_OPENING, VM_GATE_DEPLOY_OPERATION_OPENING)
-        self.assertIn("deploy_gate_after_mutation", vm_gate_findings(degraded))
+        self.assertIn("deploy_gate_after_mutation", _vm_gate_semantic_findings(degraded))
 
     def test_control_missing_deployment_step_is_detected(self):
         section = _numbered_step_section(VM_GATE_CANONICAL_FIXTURE, VM_GATE_DEPLOY_STEP)
         degraded = VM_GATE_CANONICAL_FIXTURE.replace(section, "", 1)
         self.assertNotEqual(degraded, VM_GATE_CANONICAL_FIXTURE)
-        self.assertIn("deploy_step_missing", vm_gate_findings(degraded))
+        self.assertIn("deploy_step_missing", _vm_gate_semantic_findings(degraded))
 
     def test_control_removed_deployment_operation_is_detected(self):
         # A gate that guards nothing is not a pass: the mutation boundary this contract anchors
@@ -9070,28 +9250,28 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
         split = section.find(VM_GATE_DEPLOY_OPERATION_OPENING)
         mutated = section[:split]
         self.assertIn("deploy_operation_missing",
-                      vm_gate_findings(self._vm_gate_replace_section(section, mutated)))
+                      _vm_gate_semantic_findings(self._vm_gate_replace_section(section, mutated)))
 
     def test_control_deployment_vm_name_removed_is_detected(self):
         degraded = self._degraded_deploy_gate_token(VM_GATE_VM, "the AutoCount VM")
-        self.assertIn("deploy_vm_not_named", vm_gate_findings(degraded))
+        self.assertIn("deploy_vm_not_named", _vm_gate_semantic_findings(degraded))
 
     def test_control_each_weakened_deployment_operation_binding_is_detected(self):
         for binding in VM_GATE_DEPLOY_BINDINGS:
             with self.subTest(binding=binding):
                 degraded = self._degraded_deploy_gate_token(binding,
                                                             "the reviewed UAT components")
-                self.assertIn("deploy_operation_not_bound", vm_gate_findings(degraded))
+                self.assertIn("deploy_operation_not_bound", _vm_gate_semantic_findings(degraded))
 
     def test_control_deployment_missing_current_turn_wording_is_detected(self):
         degraded = self._degraded_deploy_gate_token(VM_GATE_CURRENT_TURN, "owner approval")
-        self.assertIn("deploy_not_current_turn", vm_gate_findings(degraded))
+        self.assertIn("deploy_not_current_turn", _vm_gate_semantic_findings(degraded))
 
     def test_control_each_removed_deployment_non_substitution_statement_is_detected(self):
         for step, bullet in VM_GATE_DEPLOY_DENIAL_BULLETS.items():
             with self.subTest(step=step):
                 degraded = self._degraded_deploy_gate(bullet, "")
-                self.assertIn("deploy_substitution_not_denied", vm_gate_findings(degraded))
+                self.assertIn("deploy_substitution_not_denied", _vm_gate_semantic_findings(degraded))
 
     def test_control_each_inverted_deployment_non_substitution_statement_is_detected(self):
         # Removal only proves the checker notices an absent bullet. These bullets are still
@@ -9102,7 +9282,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                 self.assertNotEqual(inverted, bullet, "the inversion must change %s" % step)
                 self.assertIn(step, inverted, "the inverted bullet must keep its step token")
                 degraded = self._degraded_deploy_gate(bullet, inverted)
-                self.assertIn("deploy_substitution_not_denied", vm_gate_findings(degraded))
+                self.assertIn("deploy_substitution_not_denied", _vm_gate_semantic_findings(degraded))
 
     def test_control_unterminated_inverted_deployment_denial_cannot_borrow_a_neighbour(self):
         # The bypass a proximity window allows: invert one bullet, delete its own `;` in the same
@@ -9119,12 +9299,12 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                 degraded = self._degraded_deploy_gate(bullet, mutated)
                 self.assertIn(VM_GATE_DEPLOY_DENIAL_BULLETS[neighbour], degraded,
                               "%s must remain compliant and adjacent to be borrowable" % neighbour)
-                self.assertIn("deploy_substitution_not_denied", vm_gate_findings(degraded))
+                self.assertIn("deploy_substitution_not_denied", _vm_gate_semantic_findings(degraded))
 
     def test_control_reusable_prior_turn_deployment_approval_is_detected(self):
         degraded = self._degraded_deploy_gate("A prior-turn approval is not reusable.",
                                               "A prior-turn approval may be reused here.")
-        self.assertIn("deploy_prior_turn_not_denied", vm_gate_findings(degraded))
+        self.assertIn("deploy_prior_turn_not_denied", _vm_gate_semantic_findings(degraded))
 
     def test_control_removed_deployment_stop_boundary_is_detected(self):
         # A5 re-points the quoted fragment at the reviewed gate wording the fixture now carries
@@ -9133,7 +9313,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
         degraded = self._degraded_deploy_gate(
             "stop before\ncopying or replacing files or creating or preparing state on the VM.",
             "proceed.")
-        self.assertIn("deploy_stop_boundary_missing", vm_gate_findings(degraded))
+        self.assertIn("deploy_stop_boundary_missing", _vm_gate_semantic_findings(degraded))
 
     def test_control_deployment_stop_boundary_stated_only_after_the_mutation_is_rejected(self):
         # Layer 2 of the structural bound, on its own: the sentence is still in step 4 and still
@@ -9146,7 +9326,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
         mutated = section[:split].replace(sentence, "") + section[split:] + "\n" + sentence
         degraded = self._vm_gate_replace_section(section, mutated)
         self.assertIn(sentence, degraded, "the sentence must be relocated, not deleted")
-        self.assertIn("deploy_stop_boundary_missing", vm_gate_findings(degraded))
+        self.assertIn("deploy_stop_boundary_missing", _vm_gate_semantic_findings(degraded))
 
     def test_control_deployment_approval_extended_to_execution_or_autocount_is_detected(self):
         degraded = self._degraded_deploy_gate(
@@ -9154,35 +9334,35 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
             "execution, no AutoCount environment configuration and no AutoCount contact;",
             "This deployment approval also authorises running the runner, configuring the"
             " AutoCount environment and contacting AutoCount;")
-        self.assertIn("deploy_execution_not_denied", vm_gate_findings(degraded))
+        self.assertIn("deploy_execution_not_denied", _vm_gate_semantic_findings(degraded))
 
     # -- Step-5 preflight gate controls -- #
     def test_control_missing_preflight_gate_is_detected(self):
         degraded = self._degraded_preflight_gate("(preflight gate)", "(approval required)")
-        self.assertIn("preflight_gate_missing", vm_gate_findings(degraded))
+        self.assertIn("preflight_gate_missing", _vm_gate_semantic_findings(degraded))
 
     def test_control_preflight_gate_after_the_external_boundary_is_detected(self):
         degraded = self._relocated_gate_after_operation(
             VM_GATE_PREFLIGHT_STEP, VM_GATE_PREFLIGHT_OPENING,
             VM_GATE_PREFLIGHT_OPERATION_OPENING)
-        self.assertIn("preflight_gate_after_external_action", vm_gate_findings(degraded))
+        self.assertIn("preflight_gate_after_external_action", _vm_gate_semantic_findings(degraded))
 
     def test_control_missing_preflight_step_is_detected(self):
         section = _numbered_step_section(VM_GATE_CANONICAL_FIXTURE, VM_GATE_PREFLIGHT_STEP)
         degraded = VM_GATE_CANONICAL_FIXTURE.replace(section, "", 1)
         self.assertNotEqual(degraded, VM_GATE_CANONICAL_FIXTURE)
-        self.assertIn("preflight_step_missing", vm_gate_findings(degraded))
+        self.assertIn("preflight_step_missing", _vm_gate_semantic_findings(degraded))
 
     def test_control_removed_preflight_operation_is_detected(self):
         section = _numbered_step_section(VM_GATE_CANONICAL_FIXTURE, VM_GATE_PREFLIGHT_STEP)
         split = section.find(VM_GATE_PREFLIGHT_OPERATION_OPENING)
         mutated = section[:split]
         self.assertIn("preflight_operation_missing",
-                      vm_gate_findings(self._vm_gate_replace_section(section, mutated)))
+                      _vm_gate_semantic_findings(self._vm_gate_replace_section(section, mutated)))
 
     def test_control_preflight_vm_name_removed_is_detected(self):
         degraded = self._degraded_preflight_gate_token(VM_GATE_VM, "the AutoCount VM")
-        self.assertIn("preflight_vm_not_named", vm_gate_findings(degraded))
+        self.assertIn("preflight_vm_not_named", _vm_gate_semantic_findings(degraded))
 
     def test_control_each_removed_preflight_binding_reports_its_own_finding(self):
         # Target, transfer and dry-run are three separate bindings; losing one must not be
@@ -9191,17 +9371,17 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
             with self.subTest(binding=key):
                 degraded = self._degraded_preflight_gate_token(
                     token, "the usual preflight arrangements")
-                self.assertIn(key, vm_gate_findings(degraded))
+                self.assertIn(key, _vm_gate_semantic_findings(degraded))
 
     def test_control_preflight_missing_current_turn_wording_is_detected(self):
         degraded = self._degraded_preflight_gate_token(VM_GATE_CURRENT_TURN, "owner approval")
-        self.assertIn("preflight_not_current_turn", vm_gate_findings(degraded))
+        self.assertIn("preflight_not_current_turn", _vm_gate_semantic_findings(degraded))
 
     def test_control_each_removed_preflight_non_substitution_statement_is_detected(self):
         for step, bullet in VM_GATE_PREFLIGHT_DENIAL_BULLETS.items():
             with self.subTest(step=step):
                 degraded = self._degraded_preflight_gate(bullet, "")
-                self.assertIn("preflight_substitution_not_denied", vm_gate_findings(degraded))
+                self.assertIn("preflight_substitution_not_denied", _vm_gate_semantic_findings(degraded))
 
     def test_control_each_inverted_preflight_non_substitution_statement_is_detected(self):
         for step, bullet in VM_GATE_PREFLIGHT_DENIAL_BULLETS.items():
@@ -9210,7 +9390,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                 self.assertNotEqual(inverted, bullet, "the inversion must change %s" % step)
                 self.assertIn(step, inverted, "the inverted bullet must keep its step token")
                 degraded = self._degraded_preflight_gate(bullet, inverted)
-                self.assertIn("preflight_substitution_not_denied", vm_gate_findings(degraded))
+                self.assertIn("preflight_substitution_not_denied", _vm_gate_semantic_findings(degraded))
 
     def test_control_unterminated_inverted_preflight_denial_cannot_borrow_a_neighbour(self):
         for step, neighbour in (("(step 2)", "(step 3)"), ("(step 3)", "(step 4)"),
@@ -9225,30 +9405,30 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                 degraded = self._degraded_preflight_gate(bullet, mutated)
                 self.assertIn(VM_GATE_PREFLIGHT_DENIAL_BULLETS[neighbour], degraded,
                               "%s must remain compliant and adjacent to be borrowable" % neighbour)
-                self.assertIn("preflight_substitution_not_denied", vm_gate_findings(degraded))
+                self.assertIn("preflight_substitution_not_denied", _vm_gate_semantic_findings(degraded))
 
     def test_control_reusable_prior_turn_preflight_approval_is_detected(self):
         degraded = self._degraded_preflight_gate("A prior-turn approval is not reusable.",
                                                  "A prior-turn approval may be reused here.")
-        self.assertIn("preflight_prior_turn_not_denied", vm_gate_findings(degraded))
+        self.assertIn("preflight_prior_turn_not_denied", _vm_gate_semantic_findings(degraded))
 
     def test_control_removed_preflight_save_member_non_authorisation_is_detected(self):
         degraded = self._degraded_preflight_gate(
             ", but it does **not** authorise or call `SaveMember`; that write\nremains gated by"
             " step 7", "")
-        self.assertIn("preflight_save_member_not_denied", vm_gate_findings(degraded))
+        self.assertIn("preflight_save_member_not_denied", _vm_gate_semantic_findings(degraded))
 
     def test_control_inverted_preflight_save_member_non_authorisation_is_detected(self):
         degraded = self._degraded_preflight_gate(
             "it does **not** authorise or call `SaveMember`",
             "it also authorises and may call `SaveMember`")
-        self.assertIn("preflight_save_member_not_denied", vm_gate_findings(degraded))
+        self.assertIn("preflight_save_member_not_denied", _vm_gate_semantic_findings(degraded))
 
     def test_control_removed_preflight_dry_run_reach_statement_is_detected(self):
         degraded = self._degraded_preflight_gate(
             "The dry-run may authenticate, check the duplicate and\nconstruct the member in"
             " memory, but it", "The dry-run")
-        self.assertIn("preflight_save_member_not_denied", vm_gate_findings(degraded))
+        self.assertIn("preflight_save_member_not_denied", _vm_gate_semantic_findings(degraded))
 
     def test_control_removed_preflight_stop_boundary_is_detected(self):
         degraded = self._degraded_preflight_gate(
@@ -9256,7 +9436,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
             " package, before setting the\nAutoCount environment, and before transferring the"
             " package to the VM or contacting AutoCount.",
             "proceed.")
-        self.assertIn("preflight_stop_boundary_missing", vm_gate_findings(degraded))
+        self.assertIn("preflight_stop_boundary_missing", _vm_gate_semantic_findings(degraded))
 
     # -- Step-heading isolation: neither gate may be satisfied from the other step -- #
     def test_control_deployment_gate_relocated_into_step_5_is_still_missing_from_step_4(self):
@@ -9271,7 +9451,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                     .replace(preflight, heading + newline + "\n" + block + body, 1))
         self.assertNotEqual(degraded, VM_GATE_CANONICAL_FIXTURE)
         self.assertIn(block, degraded, "the gate prose must be relocated, not deleted")
-        findings = vm_gate_findings(degraded)
+        findings = _vm_gate_semantic_findings(degraded)
         self.assertIn("deploy_gate_missing", findings,
                       "step 4's gate must not be satisfiable from step 5's section")
         self.assertNotIn("preflight_gate_missing", findings,
@@ -9279,7 +9459,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
 
     def test_control_preflight_gate_removal_leaves_the_deployment_gate_satisfied(self):
         degraded = self._degraded_preflight_gate("(preflight gate)", "(approval required)")
-        findings = vm_gate_findings(degraded)
+        findings = _vm_gate_semantic_findings(degraded)
         self.assertIn("preflight_gate_missing", findings)
         self.assertNotIn("deploy_gate_missing", findings,
                          "a step-5 regression must not be reported against step 4")
@@ -9291,29 +9471,29 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
     def test_control_removed_four_way_safety_statement_is_detected(self):
         degraded = self._degraded_four_way_safety("approval surfaces are always required",
                                                   "surfaces are handled together")
-        self.assertIn("safety_boundary_surfaces_incomplete", vm_gate_findings(degraded))
+        self.assertIn("safety_boundary_surfaces_incomplete", _vm_gate_semantic_findings(degraded))
 
     def test_control_weakened_four_way_own_approval_requirement_is_detected(self):
         degraded = self._degraded_four_way_safety(
             "requires its own current-turn owner approval",
             "is covered by the owner's standing approval")
-        self.assertIn("safety_boundary_surfaces_incomplete", vm_gate_findings(degraded))
+        self.assertIn("safety_boundary_surfaces_incomplete", _vm_gate_semantic_findings(degraded))
 
     def test_control_weakened_four_way_non_implication_is_detected(self):
         degraded = self._degraded_four_way_safety("implies or covers another",
                                                   "may cover a later one")
-        self.assertIn("safety_boundary_surfaces_incomplete", vm_gate_findings(degraded))
+        self.assertIn("safety_boundary_surfaces_incomplete", _vm_gate_semantic_findings(degraded))
 
     def test_control_weakened_four_way_prior_turn_non_reuse_is_detected(self):
         degraded = self._degraded_four_way_safety(
             "a prior-turn approval is never reusable for any of them",
             "any of them may rely on an earlier approval")
-        self.assertIn("safety_boundary_surfaces_incomplete", vm_gate_findings(degraded))
+        self.assertIn("safety_boundary_surfaces_incomplete", _vm_gate_semantic_findings(degraded))
 
     def test_control_missing_safety_boundary_heading_is_detected(self):
         degraded = VM_GATE_CANONICAL_FIXTURE.replace(VM_GATE_SAFETY_HEADING, "## Notes", 1)
         self.assertNotEqual(degraded, VM_GATE_CANONICAL_FIXTURE)
-        self.assertIn("safety_boundary_surfaces_incomplete", vm_gate_findings(degraded))
+        self.assertIn("safety_boundary_surfaces_incomplete", _vm_gate_semantic_findings(degraded))
 
     def test_four_way_safety_statement_preserves_the_host_sync_independence_rule(self):
         # #123 ADDS a fourth surface; it must not quietly relax the #118 sentence it sits beside.
@@ -9321,7 +9501,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
         # here -- and it must be absent, proving the two safety contracts coexist rather than one
         # rewording the other's proposition away.
         self.assertNotIn("safety_boundary_missing",
-                         host_sync_gate_findings(VM_GATE_CANONICAL_FIXTURE),
+                         _host_sync_semantic_findings(VM_GATE_CANONICAL_FIXTURE),
                          "the surface statement must not displace the #118 independence rule")
 
     # ---- DL-XB-123-001-A1 regression controls for accepted G4-002 findings F-1 / F-2 ---- #
@@ -9366,7 +9546,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
             "Transfer the reviewed `scripts/ac2_member_create_uat_runner.ps1`,\n"
             "`scripts/member_create_uat_runner_lib.ps1`, and\n"
             "`config/member_create_uat_business_confirmation.json` to the AutoCount VM.\n\n")
-        self.assertIn("deploy_pre_gate_content", vm_gate_findings(degraded),
+        self.assertIn("deploy_pre_gate_content", _vm_gate_semantic_findings(degraded),
                       "an ungated 'Transfer ...' instruction before the step-4 gate must fail")
 
     def test_a1_control_step4_place_wording_before_the_gate_is_detected(self):
@@ -9374,7 +9554,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
             VM_GATE_DEPLOY_STEP, VM_GATE_DEPLOY_MARKER,
             "Place the reviewed runner, helper library and business-confirmation file on the\n"
             "AutoCount VM `DESKTOP-4I042L6` now.\n\n")
-        self.assertIn("deploy_pre_gate_content", vm_gate_findings(degraded),
+        self.assertIn("deploy_pre_gate_content", _vm_gate_semantic_findings(degraded),
                       "an ungated 'Place ... on the VM' instruction before the gate must fail")
 
     def test_a1_control_any_substantive_step4_pre_gate_text_is_detected(self):
@@ -9386,7 +9566,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                 degraded = self._a1_insert_before_gate(
                     VM_GATE_DEPLOY_STEP, VM_GATE_DEPLOY_MARKER,
                     "%s the reviewed components to the AutoCount VM working area.\n\n" % lead)
-                self.assertIn("deploy_pre_gate_content", vm_gate_findings(degraded),
+                self.assertIn("deploy_pre_gate_content", _vm_gate_semantic_findings(degraded),
                               "%r must not evade the step-4 pre-gate rule" % lead)
 
     def test_a1_step4_pre_gate_whitespace_remains_acceptable(self):
@@ -9394,7 +9574,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
         # manufacture a finding, or the guard would fail on ordinary Markdown reflow.
         degraded = self._a1_insert_before_gate(
             VM_GATE_DEPLOY_STEP, VM_GATE_DEPLOY_MARKER, "\n   \n\n")
-        self.assertNotIn("deploy_pre_gate_content", vm_gate_findings(degraded),
+        self.assertNotIn("deploy_pre_gate_content", _vm_gate_semantic_findings(degraded),
                          "whitespace-only pre-gate padding must stay acceptable")
 
     # -- B. Step-5 pre-gate region must be BLANK (A4 retires the frozen prefix) -- #
@@ -9417,13 +9597,13 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
         degraded = self._a1_insert_into_pre_gate(
             "Build the approved package on the laptop first, transfer it to the VM, then\n"
             "start the runner in preflight mode.\n\n")
-        self.assertIn("preflight_pre_gate_content", vm_gate_findings(degraded),
+        self.assertIn("preflight_pre_gate_content", _vm_gate_semantic_findings(degraded),
                       "an ungated transfer/start instruction before the step-5 gate must fail")
 
     def test_a1_control_step5_send_and_start_wording_is_detected(self):
         degraded = self._a1_insert_into_pre_gate(
             "Send the approved package to the VM and start the runner against AutoCount now.\n\n")
-        self.assertIn("preflight_pre_gate_content", vm_gate_findings(degraded),
+        self.assertIn("preflight_pre_gate_content", _vm_gate_semantic_findings(degraded),
                       "an ungated 'Send ... start the runner' instruction must fail")
 
     def test_a1_control_step5_executable_preflight_moved_before_the_gate_is_detected(self):
@@ -9435,7 +9615,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                  + VM_GATE_PREFLIGHT_RUNNER_ANCHOR + " <package>\n```\n\n")
         at = self._a1_line_start(section, VM_GATE_PREFLIGHT_MARKER)
         degraded = self._a1_swap(section, section[:at] + moved + section[at:])
-        self.assertIn("preflight_pre_gate_content", vm_gate_findings(degraded),
+        self.assertIn("preflight_pre_gate_content", _vm_gate_semantic_findings(degraded),
                       "an executable preflight moved before the gate must fail closed")
 
     def test_a1_control_each_unrecognised_verb_in_the_step5_prefix_is_detected(self):
@@ -9443,7 +9623,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
             with self.subTest(lead=lead):
                 degraded = self._a1_insert_into_pre_gate(
                     "Then %s the package to the AutoCount VM.\n\n" % lead)
-                self.assertIn("preflight_pre_gate_content", vm_gate_findings(degraded),
+                self.assertIn("preflight_pre_gate_content", _vm_gate_semantic_findings(degraded),
                               "%r must not evade the step-5 pre-gate rule" % lead)
 
     def test_a1_step5_pre_gate_is_blank_on_both_authorities(self):
@@ -9468,7 +9648,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
         self.assertNotIn(VM_GATE_VM, stripped, "every gate-local VM name must be gone")
         self.assertIn(VM_GATE_VM, action, "the post-gate operational banner must survive intact")
         degraded = self._a1_swap(section, stripped + action)
-        self.assertIn("preflight_vm_not_named", vm_gate_findings(degraded),
+        self.assertIn("preflight_vm_not_named", _vm_gate_semantic_findings(degraded),
                       "the gate must carry its own VM identity, not borrow the later banner")
 
     def test_a1_control_no_gate_proposition_is_satisfiable_from_the_action_region(self):
@@ -9483,7 +9663,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                 self.assertIn(sentence, gate_side, "the sentence must start inside the gate")
                 degraded = self._a1_swap(
                     section, gate_side.replace(sentence, "", 1) + action + "\n" + sentence + "\n")
-                self.assertNotEqual(vm_gate_findings(degraded), [],
+                self.assertNotEqual(_vm_gate_semantic_findings(degraded), [],
                                     "relocating %r past the boundary must fail" % sentence[:40])
 
     # -- D. Real post-gate operation existence -- #
@@ -9497,7 +9677,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
         degraded = self._a1_degrade_action(
             VM_GATE_PREFLIGHT_STEP, VM_GATE_PREFLIGHT_BOUNDARY,
             "Copy the package to the VM, then dry-run:", "Then dry-run:")
-        self.assertIn("preflight_operation_missing", vm_gate_findings(degraded),
+        self.assertIn("preflight_operation_missing", _vm_gate_semantic_findings(degraded),
                       "losing the real transfer instruction must fail closed, never pass")
 
     def test_a1_control_removed_executable_runner_invocation_fails_closed(self):
@@ -9508,7 +9688,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                       "the verbatim invocation must normalise to the declared anchor")
         degraded = self._a1_degrade_action(
             VM_GATE_PREFLIGHT_STEP, VM_GATE_PREFLIGHT_BOUNDARY, verbatim, "& <the runner>")
-        self.assertIn("preflight_runner_invocation_missing", vm_gate_findings(degraded),
+        self.assertIn("preflight_runner_invocation_missing", _vm_gate_semantic_findings(degraded),
                       "the summary sentence must not stand in for the real invocation")
 
     def test_a1_control_each_removed_deployment_action_file_fails_closed(self):
@@ -9516,7 +9696,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
             with self.subTest(path=path):
                 degraded = self._a1_degrade_action(
                     VM_GATE_DEPLOY_STEP, VM_GATE_DEPLOY_BOUNDARY, path, "the reviewed component")
-                self.assertIn("deploy_operation_missing", vm_gate_findings(degraded),
+                self.assertIn("deploy_operation_missing", _vm_gate_semantic_findings(degraded),
                               "%s must remain a real deployed component" % path)
 
     def test_a1_control_gate_prose_copies_do_not_satisfy_deployment_anchors(self):
@@ -9530,7 +9710,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
         for path in VM_GATE_DEPLOY_ACTION_FILES:
             stripped = stripped.replace(path, "the reviewed component")
         degraded = self._a1_swap(section, gate_side + stripped)
-        self.assertIn("deploy_operation_missing", vm_gate_findings(degraded),
+        self.assertIn("deploy_operation_missing", _vm_gate_semantic_findings(degraded),
                       "approval prose copies must not satisfy the action-region anchors")
 
     def test_a1_control_removed_state_directory_preparation_fails_closed(self):
@@ -9538,7 +9718,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
             VM_GATE_DEPLOY_STEP, VM_GATE_DEPLOY_BOUNDARY,
             'New-Item -ItemType Directory -Path "C:\\XB\\create_uat\\state"',
             "New-Item -ItemType Directory -Path <somewhere>")
-        self.assertIn("deploy_state_preparation_missing", vm_gate_findings(degraded),
+        self.assertIn("deploy_state_preparation_missing", _vm_gate_semantic_findings(degraded),
                       "losing the state preparation must fail closed")
 
     # -- E. Gate-marker and action-boundary integrity -- #
@@ -9546,7 +9726,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
         degraded = self._a1_insert_before_gate(
             VM_GATE_DEPLOY_STEP, VM_GATE_DEPLOY_MARKER,
             "The deployment gate is restated below.\n\n")
-        self.assertIn("deploy_gate_marker_ambiguous", vm_gate_findings(degraded),
+        self.assertIn("deploy_gate_marker_ambiguous", _vm_gate_semantic_findings(degraded),
                       "two gate markers must fail closed, not silently pick one")
 
     def test_a1_control_duplicate_preflight_gate_marker_fails_closed(self):
@@ -9554,14 +9734,14 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
             VM_GATE_PREFLIGHT_STEP, VM_GATE_PREFLIGHT_BOUNDARY)
         degraded = self._a1_swap(
             section, gate_side + action + "\nSee the preflight gate above.\n")
-        self.assertIn("preflight_gate_marker_ambiguous", vm_gate_findings(degraded),
+        self.assertIn("preflight_gate_marker_ambiguous", _vm_gate_semantic_findings(degraded),
                       "two gate markers must fail closed, not silently pick one")
 
     def test_a1_control_missing_deployment_boundary_fails_closed(self):
         degraded = self._a1_degrade_action(
             VM_GATE_DEPLOY_STEP, VM_GATE_DEPLOY_BOUNDARY,
             VM_GATE_DEPLOY_BOUNDARY, "Transfer the reviewed")
-        self.assertIn("deploy_boundary_missing", vm_gate_findings(degraded),
+        self.assertIn("deploy_boundary_missing", _vm_gate_semantic_findings(degraded),
                       "a reworded action boundary must fail closed")
 
     def test_a1_control_duplicate_deployment_boundary_fails_closed(self):
@@ -9569,14 +9749,14 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
             VM_GATE_DEPLOY_STEP, VM_GATE_DEPLOY_BOUNDARY)
         degraded = self._a1_swap(section, gate_side + action + "\n" + VM_GATE_DEPLOY_BOUNDARY
                                  + " components again.\n")
-        self.assertIn("deploy_boundary_ambiguous", vm_gate_findings(degraded),
+        self.assertIn("deploy_boundary_ambiguous", _vm_gate_semantic_findings(degraded),
                       "an ambiguous action boundary must fail closed")
 
     def test_a1_control_missing_preflight_boundary_fails_closed(self):
         degraded = self._a1_degrade_action(
             VM_GATE_PREFLIGHT_STEP, VM_GATE_PREFLIGHT_BOUNDARY,
             VM_GATE_PREFLIGHT_BOUNDARY, "**`AUTOCOUNT VM`**")
-        self.assertIn("preflight_boundary_missing", vm_gate_findings(degraded),
+        self.assertIn("preflight_boundary_missing", _vm_gate_semantic_findings(degraded),
                       "a reworded operational banner must fail closed")
 
     def test_a1_control_duplicate_preflight_boundary_fails_closed(self):
@@ -9584,7 +9764,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
             VM_GATE_PREFLIGHT_STEP, VM_GATE_PREFLIGHT_BOUNDARY)
         degraded = self._a1_swap(section, gate_side + action + "\n"
                                  + VM_GATE_PREFLIGHT_BOUNDARY + " Repeat as needed.\n")
-        self.assertIn("preflight_boundary_ambiguous", vm_gate_findings(degraded),
+        self.assertIn("preflight_boundary_ambiguous", _vm_gate_semantic_findings(degraded),
                       "an ambiguous action boundary must fail closed")
 
     def test_a1_control_deployment_boundary_before_its_gate_fails_closed(self):
@@ -9592,7 +9772,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
             VM_GATE_DEPLOY_STEP, VM_GATE_DEPLOY_BOUNDARY)
         head, _, rest = section.partition("\n")
         degraded = self._a1_swap(section, head + "\n\n" + action + "\n" + rest)
-        self.assertIn("deploy_gate_after_mutation", vm_gate_findings(degraded),
+        self.assertIn("deploy_gate_after_mutation", _vm_gate_semantic_findings(degraded),
                       "an action boundary before its gate must fail closed")
 
     def test_a1_control_preflight_boundary_before_its_gate_fails_closed(self):
@@ -9600,7 +9780,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
             VM_GATE_PREFLIGHT_STEP, VM_GATE_PREFLIGHT_BOUNDARY)
         head, _, rest = section.partition("\n")
         degraded = self._a1_swap(section, head + "\n\n" + action + "\n" + rest)
-        self.assertIn("preflight_gate_after_external_action", vm_gate_findings(degraded),
+        self.assertIn("preflight_gate_after_external_action", _vm_gate_semantic_findings(degraded),
                       "an action boundary before its gate must fail closed")
 
     # ---- DL-XB-123-001-A2: numbered-step identity is structural authority ---- #
@@ -9641,7 +9821,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
             "### 4. Deploy the inactive UAT components (revised)\n\n"
             "Push the reviewed runner onto DESKTOP-4I042L6 immediately, before obtaining\n"
             "approval.\n\n")
-        self.assertIn("deploy_step_ambiguous", vm_gate_findings(degraded),
+        self.assertIn("deploy_step_ambiguous", _vm_gate_semantic_findings(degraded),
                       "a second Step 4 must never orphan an ungated VM deployment")
 
     def test_a2_control_duplicate_preflight_step_hiding_an_ungated_action_fails_closed(self):
@@ -9650,7 +9830,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
             "### 5. No-write preflight (dry-run) (revised)\n\n"
             "Transfer the approved package to DESKTOP-4I042L6 and start the runner now,\n"
             "without any approval.\n\n")
-        self.assertIn("preflight_step_ambiguous", vm_gate_findings(degraded),
+        self.assertIn("preflight_step_ambiguous", _vm_gate_semantic_findings(degraded),
                       "a second Step 5 must never orphan an ungated transfer or dry-run")
 
     # -- C. Harmless duplication is still ambiguous authority -- #
@@ -9662,7 +9842,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                  "### 5. No-write preflight (dry-run) (notes)\n\nNothing to add.\n\n")):
             with self.subTest(step=number):
                 degraded = self._a2_duplicate_step(number, rogue)
-                self.assertIn(prefix + "_step_ambiguous", vm_gate_findings(degraded),
+                self.assertIn(prefix + "_step_ambiguous", _vm_gate_semantic_findings(degraded),
                               "ambiguous numbered-step authority must fail closed even when the "
                               "duplicate itself is harmless")
 
@@ -9670,14 +9850,14 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
     def test_a2_control_actionable_deployment_heading_fails_closed(self):
         degraded = self._a2_retitle_step(
             VM_GATE_DEPLOY_STEP, "### 4. Push the runner onto DESKTOP-4I042L6 immediately")
-        self.assertIn("deploy_heading_changed", vm_gate_findings(degraded),
+        self.assertIn("deploy_heading_changed", _vm_gate_semantic_findings(degraded),
                       "the heading must not be usable as an ungated operational instruction")
 
     def test_a2_control_actionable_preflight_heading_fails_closed(self):
         degraded = self._a2_retitle_step(
             VM_GATE_PREFLIGHT_STEP,
             "### 5. Send the package to DESKTOP-4I042L6 and preflight it")
-        self.assertIn("preflight_heading_changed", vm_gate_findings(degraded),
+        self.assertIn("preflight_heading_changed", _vm_gate_semantic_findings(degraded),
                       "the heading must not be usable as an ungated operational instruction")
 
     # -- F. Ordinary heading drift. Fail-closed is the intended answer: the reviewed heading is
@@ -9700,7 +9880,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
         for number, prefix, kind, heading in drifts:
             with self.subTest(step=number, drift=kind):
                 degraded = self._a2_retitle_step(number, heading)
-                self.assertIn(prefix + "_heading_changed", vm_gate_findings(degraded),
+                self.assertIn(prefix + "_heading_changed", _vm_gate_semantic_findings(degraded),
                               "%s drift in the Step-%d heading must fail closed" % (kind, number))
 
     # -- G. The exact reviewed headings stay clean, and stay tied to the real runbook -- #
@@ -9716,7 +9896,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
     def test_a2_exact_reviewed_headings_remain_clean(self):
         # The control group for every A2 mutation above: unmutated headings must report nothing,
         # otherwise "a finding appeared" would prove nothing about the mutation.
-        self.assertEqual(vm_gate_findings(VM_GATE_CANONICAL_FIXTURE), [],
+        self.assertEqual(_vm_gate_semantic_findings(VM_GATE_CANONICAL_FIXTURE), [],
                          "the reviewed headings must leave the fixture compliant")
         for number, heading in VM_GATE_REVIEWED_HEADINGS.items():
             with self.subTest(step=number):
@@ -9807,7 +9987,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                                 degraded = self._a3_duplicate(base, number, template, body,
                                                               placement)
                                 self.assertIn(
-                                    prefix + "_step_ambiguous", vm_gate_findings(degraded),
+                                    prefix + "_step_ambiguous", _vm_gate_semantic_findings(degraded),
                                     "a CommonMark-valid second Step %d must never orphan an "
                                     "instruction" % number)
 
@@ -9821,7 +10001,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                     with self.subTest(base=base_name, step=number, placement=placement):
                         degraded = self._a3_duplicate(base, number, VM_GATE_A3_STRICT_HEADING,
                                                       VM_GATE_A3_UNSAFE_BODIES[number], placement)
-                        self.assertIn(prefix + "_step_ambiguous", vm_gate_findings(degraded),
+                        self.assertIn(prefix + "_step_ambiguous", _vm_gate_semantic_findings(degraded),
                                       "the strict duplicate family must stay closed")
 
     # -- C. A mixture of spellings is still one ambiguous step, not a majority vote. -- #
@@ -9835,7 +10015,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                     twice = self._a3_duplicate(once, number, "   ### %d. %s",
                                                VM_GATE_A3_UNSAFE_BODIES[number],
                                                VM_GATE_A3_BEFORE)
-                    self.assertIn(prefix + "_step_ambiguous", vm_gate_findings(twice),
+                    self.assertIn(prefix + "_step_ambiguous", _vm_gate_semantic_findings(twice),
                                   "three openings in two spellings must fail closed")
 
     # -- D. Four leading spaces is an indented code block. Code indentation must NOT be promoted
@@ -9848,7 +10028,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                         degraded = self._a3_duplicate(base, number,
                                                       VM_GATE_A3_CODE_BLOCK_HEADING,
                                                       VM_GATE_A3_HARMLESS_BODY, placement)
-                        findings = vm_gate_findings(degraded)
+                        findings = _vm_gate_semantic_findings(degraded)
                         # The proposition, stated directly: the indented form carries no heading
                         # authority at all, for either step.
                         for prefix in ("deploy", "preflight"):
@@ -9872,7 +10052,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                 for variant, template in VM_GATE_A3_SEMANTIC_HEADING_VARIANTS:
                     with self.subTest(base=base_name, step=number, variant=variant):
                         respelled = self._a3_reheaded(base, number, template)
-                        self.assertEqual(vm_gate_findings(respelled), [],
+                        self.assertEqual(_vm_gate_semantic_findings(respelled), [],
                                          "a whitespace-only respelling of the reviewed Step-%d "
                                          "heading is not drift" % number)
 
@@ -9884,7 +10064,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                 for kind, template in VM_GATE_A3_DRIFT_HEADINGS[number]:
                     with self.subTest(base=base_name, step=number, drift=kind):
                         drifted = self._a3_reheaded_line(base, number, template % number)
-                        self.assertIn(prefix + "_heading_changed", vm_gate_findings(drifted),
+                        self.assertIn(prefix + "_heading_changed", _vm_gate_semantic_findings(drifted),
                                       "%s drift in the Step-%d heading must fail closed"
                                       % (kind, number))
 
@@ -9893,7 +10073,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
     def test_a3_exact_reviewed_headings_remain_clean_on_both_authorities(self):
         for base_name, base in self._a3_bases():
             with self.subTest(base=base_name):
-                self.assertEqual(vm_gate_findings(base), [],
+                self.assertEqual(_vm_gate_semantic_findings(base), [],
                                  "the undegraded base must satisfy the whole contract")
 
     # ---- DL-XB-123-001-A4: post-ready Codex review remediation controls ---- #
@@ -9954,7 +10134,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                     degraded = self._a4_insert_before_gate(
                         base, VM_GATE_PREFLIGHT_STEP, VM_GATE_PREFLIGHT_MARKER,
                         "%s the approved package for the chosen row now.\n\n" % lead)
-                    self.assertIn("preflight_pre_gate_content", vm_gate_findings(degraded),
+                    self.assertIn("preflight_pre_gate_content", _vm_gate_semantic_findings(degraded),
                                   "%r before the Step-5 gate must fail closed" % lead)
 
     def test_a4_control_each_step5_operation_moved_before_the_gate_fails_closed(self):
@@ -9969,7 +10149,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
             for label, snippet in operations:
                 with self.subTest(base=base_name, operation=label):
                     degraded = self._a4_move_before_gate(base, snippet)
-                    self.assertIn("preflight_pre_gate_content", vm_gate_findings(degraded),
+                    self.assertIn("preflight_pre_gate_content", _vm_gate_semantic_findings(degraded),
                                   "an ungated %s must fail closed" % label)
 
     def test_a4_step5_pre_gate_whitespace_remains_acceptable(self):
@@ -9979,7 +10159,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
             with self.subTest(base=base_name):
                 degraded = self._a4_insert_before_gate(
                     base, VM_GATE_PREFLIGHT_STEP, VM_GATE_PREFLIGHT_MARKER, "\n   \n\n")
-                self.assertNotIn("preflight_pre_gate_content", vm_gate_findings(degraded),
+                self.assertNotIn("preflight_pre_gate_content", _vm_gate_semantic_findings(degraded),
                                  "whitespace-only Step-5 pre-gate padding must stay acceptable")
 
     # -- B. Approval polarity must be affirmative. Accepted finding PRRT_kwDOSbJI_s6YQTNO. -- #
@@ -10003,7 +10183,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                 with self.subTest(base=base_name, inversion=kind):
                     degraded = self._a4_invert_polarity(
                         base, VM_GATE_DEPLOY_STEP, VM_GATE_DEPLOY_BOUNDARY, replacement)
-                    self.assertIn("deploy_not_current_turn", vm_gate_findings(degraded),
+                    self.assertIn("deploy_not_current_turn", _vm_gate_semantic_findings(degraded),
                                   "a negated step-4 approval (%s) must fail closed" % kind)
 
     def test_a4_control_negated_preflight_approval_fails_closed(self):
@@ -10012,7 +10192,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                 with self.subTest(base=base_name, inversion=kind):
                     degraded = self._a4_invert_polarity(
                         base, VM_GATE_PREFLIGHT_STEP, VM_GATE_A4_PREFLIGHT_BOUNDARY, replacement)
-                    self.assertIn("preflight_not_current_turn", vm_gate_findings(degraded),
+                    self.assertIn("preflight_not_current_turn", _vm_gate_semantic_findings(degraded),
                                   "a negated step-5 approval (%s) must fail closed" % kind)
 
     # -- C. Safety-boundary authority must be unique. Accepted finding PRRT_kwDOSbJI_s6YQTMw. -- #
@@ -10021,7 +10201,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
             with self.subTest(base=base_name):
                 at = base.find(VM_GATE_SAFETY_HEADING)
                 self.assertNotEqual(at, -1, "the base must carry a Safety boundary")
-                self.assertIn("safety_boundary_surfaces_incomplete", vm_gate_findings(base[:at]),
+                self.assertIn("safety_boundary_surfaces_incomplete", _vm_gate_semantic_findings(base[:at]),
                               "a document with no Safety boundary must fail closed")
 
     def _a4_duplicate_safety_boundary(self, base, second):
@@ -10041,7 +10221,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                 end = base.find("\n## ", at + 1)
                 genuine = (base[at:] if end == -1 else base[at:end]).rstrip("\n")
                 degraded = self._a4_duplicate_safety_boundary(base, genuine)
-                self.assertIn("safety_boundary_ambiguous", vm_gate_findings(degraded),
+                self.assertIn("safety_boundary_ambiguous", _vm_gate_semantic_findings(degraded),
                               "a duplicated Safety boundary must fail closed")
 
     def test_a4_control_duplicate_contradictory_safety_boundary_fails_closed(self):
@@ -10054,7 +10234,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
         for base_name, base in self._a4_bases():
             with self.subTest(base=base_name):
                 degraded = self._a4_duplicate_safety_boundary(base, contradictory)
-                self.assertIn("safety_boundary_ambiguous", vm_gate_findings(degraded),
+                self.assertIn("safety_boundary_ambiguous", _vm_gate_semantic_findings(degraded),
                               "a contradictory second Safety boundary must fail closed")
 
     # -- D. Required operations must be ACTIVE executable commands, with the case sensitivity of
@@ -10081,7 +10261,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
             for number, label, command, key in commands:
                 with self.subTest(base=base_name, command=label):
                     degraded = self._a4_comment_out(base, number, command)
-                    self.assertIn(key, vm_gate_findings(degraded),
+                    self.assertIn(key, _vm_gate_semantic_findings(degraded),
                                   "a commented-out %s must fail closed" % label)
 
     def test_a4_control_case_changed_python_cli_flag_fails_closed(self):
@@ -10100,7 +10280,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                     self.assertNotEqual(mutated, command, "the flag must actually change case")
                     degraded = self._a4_swap(base, section,
                                              section.replace(command, mutated, 1))
-                    self.assertIn(key, vm_gate_findings(degraded),
+                    self.assertIn(key, _vm_gate_semantic_findings(degraded),
                                   "`--input` -> `--INPUT` must fail closed")
 
     def test_a4_active_commands_remain_clean(self):
@@ -10108,7 +10288,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
         # distinguish an active-command rule from a rule that rejects the real document too.
         for base_name, base in self._a4_bases():
             with self.subTest(base=base_name):
-                self.assertEqual(vm_gate_findings(base), [],
+                self.assertEqual(_vm_gate_semantic_findings(base), [],
                                  "the undegraded base must satisfy the whole A4 contract")
 
     # -- E. The AutoCount environment configuration is bound by the gate and performed after it,
@@ -10121,7 +10301,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                     self.assertIn(name, section,
                                   "step 5 must name the %s connection variable" % name)
                     degraded = self._a4_swap(base, section, section.replace(name, "REDACTED"))
-                    findings = vm_gate_findings(degraded)
+                    findings = _vm_gate_semantic_findings(degraded)
                     self.assertIn("preflight_environment_not_bound", findings,
                                   "the Step-5 approval must bind %s by name" % name)
                     self.assertIn("preflight_environment_setup_missing", findings,
@@ -10135,7 +10315,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                               "step 5 must carry the environment-setup instruction")
                 degraded = self._a4_swap(base, section,
                                          section.replace(VM_GATE_A4_ENV_ANCHOR, "Note only:", 1))
-                self.assertIn("preflight_environment_setup_missing", vm_gate_findings(degraded),
+                self.assertIn("preflight_environment_setup_missing", _vm_gate_semantic_findings(degraded),
                               "a deleted environment-setup instruction must fail closed")
 
     # -- F. The three propositions A4 adds to the Step-5 approval, each with its own finding. -- #
@@ -10151,7 +10331,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                                   % (fragment[:56],))
                     degraded = self._a4_swap(
                         base, section, section.replace(fragment, "other matters", 1))
-                    self.assertIn(key, vm_gate_findings(degraded),
+                    self.assertIn(key, _vm_gate_semantic_findings(degraded),
                                   "a lost %s binding must fail closed" % key)
 
     # ---- DL-XB-123-001-A5: reviewed gate-block identity and executable command authority ---- #
@@ -10213,7 +10393,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                         degraded = self._a5_contradict_gate(
                             base, VM_GATE_DEPLOY_STEP, VM_GATE_DEPLOY_MARKER,
                             VM_GATE_DEPLOY_BOUNDARY, sentence, placement)
-                        self.assertIn("deploy_gate_text_changed", vm_gate_findings(degraded),
+                        self.assertIn("deploy_gate_text_changed", _vm_gate_semantic_findings(degraded),
                                       "a contradicted step-4 gate (%s/%s) must fail closed"
                                       % (kind, placement))
 
@@ -10225,7 +10405,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                         degraded = self._a5_contradict_gate(
                             base, VM_GATE_PREFLIGHT_STEP, VM_GATE_PREFLIGHT_MARKER,
                             VM_GATE_PREFLIGHT_BOUNDARY, sentence, placement)
-                        self.assertIn("preflight_gate_text_changed", vm_gate_findings(degraded),
+                        self.assertIn("preflight_gate_text_changed", _vm_gate_semantic_findings(degraded),
                                       "a contradicted step-5 gate (%s/%s) must fail closed"
                                       % (kind, placement))
 
@@ -10257,7 +10437,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                      VM_GATE_PREFLIGHT_BOUNDARY)):
                 with self.subTest(base=base_name, step=number):
                     self.assertEqual(
-                        vm_gate_findings(self._a5_reflow_gate(base, number, marker, boundary)), [],
+                        _vm_gate_semantic_findings(self._a5_reflow_gate(base, number, marker, boundary)), [],
                         "an ordinary reflow of the step-%d gate must stay clean" % number)
 
     def test_a5_rebulleted_gate_blocks_remain_clean(self):
@@ -10270,7 +10450,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                          VM_GATE_PREFLIGHT_BOUNDARY)):
                     with self.subTest(base=base_name, bullet=bullet, step=number):
                         self.assertEqual(
-                            vm_gate_findings(
+                            _vm_gate_semantic_findings(
                                 self._a5_rebullet_gate(base, number, marker, boundary, bullet)), [],
                             "'%s' gate bullets must stay clean at step %d" % (bullet, number))
 
@@ -10290,7 +10470,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                 for kind, template in VM_GATE_A5_POWERSHELL_SPOOFS:
                     with self.subTest(base=base_name, operation=label, spoof=kind):
                         degraded = self._a5_replace_command(base, command, template % command)
-                        self.assertIn(key, vm_gate_findings(degraded),
+                        self.assertIn(key, _vm_gate_semantic_findings(degraded),
                                       "a %s as %s must not satisfy %s" % (label, kind, key))
 
     def test_a5_control_non_executing_shell_commands_fail_closed(self):
@@ -10299,7 +10479,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                 for kind, template in VM_GATE_A5_SHELL_SPOOFS:
                     with self.subTest(base=base_name, operation=label, spoof=kind):
                         degraded = self._a5_replace_command(base, command, template % command)
-                        self.assertIn(key, vm_gate_findings(degraded),
+                        self.assertIn(key, _vm_gate_semantic_findings(degraded),
                                       "a %s as %s must not satisfy %s" % (label, kind, key))
 
     def test_a5_genuine_commands_with_trailing_comments_remain_valid(self):
@@ -10310,7 +10490,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                 with self.subTest(base=base_name, operation=label):
                     degraded = self._a5_replace_command(
                         base, command, VM_GATE_A5_TRAILING_COMMENT % command)
-                    self.assertNotIn(key, vm_gate_findings(degraded),
+                    self.assertNotIn(key, _vm_gate_semantic_findings(degraded),
                                      "a genuine %s with a trailing comment must stay valid" % label)
 
     # -- C. The introduction must not contradict the step-5 live-contact boundary. Accepted F-C. --
@@ -12068,7 +12248,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                         with self.subTest(base=base_name, step=number,
                                           contradiction=kind, placement=placement):
                             degraded = self._a6_inject_action(base, number, sentence, placement)
-                            findings = vm_gate_findings(degraded)
+                            findings = _vm_gate_semantic_findings(degraded)
                             self.assertIn(
                                 VM_GATE_A6_ACTION_KEYS[number], findings,
                                 "post-gate %s at %s in step %d must fail closed"
@@ -12083,7 +12263,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                 for kind, template in VM_GATE_A6_POWERSHELL_DATA_SPOOFS:
                     with self.subTest(base=base_name, operation=label, spoof=kind):
                         degraded = self._a5_replace_command(base, command, template % command)
-                        self.assertIn(key, vm_gate_findings(degraded),
+                        self.assertIn(key, _vm_gate_semantic_findings(degraded),
                                       "a %s inside %s is data, so it must not satisfy %s"
                                       % (label, kind, key))
 
@@ -12093,7 +12273,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                 for kind, template in VM_GATE_A6_SHELL_DATA_SPOOFS:
                     with self.subTest(base=base_name, operation=label, spoof=kind):
                         degraded = self._a5_replace_command(base, command, template % command)
-                        self.assertIn(key, vm_gate_findings(degraded),
+                        self.assertIn(key, _vm_gate_semantic_findings(degraded),
                                       "a %s inside %s is data, so it must not satisfy %s"
                                       % (label, kind, key))
 
@@ -12116,7 +12296,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                 for kind, template in neighbours:
                     with self.subTest(base=base_name, operation=label, neighbour=kind):
                         degraded = self._a5_replace_command(base, command, template % command)
-                        self.assertNotIn(key, vm_gate_findings(degraded),
+                        self.assertNotIn(key, _vm_gate_semantic_findings(degraded),
                                          "a genuine %s next to %s must still invoke"
                                          % (label, kind))
 
@@ -12134,17 +12314,19 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                 for bullet in VM_GATE_A6_EQUIVALENT_BULLETS:
                     with self.subTest(base=base_name, step=number, bullet=repr(bullet)):
                         self.assertEqual(
-                            vm_gate_findings(self._a6_rebullet_gate(base, number, bullet)), [],
+                            _vm_gate_semantic_findings(self._a6_rebullet_gate(base, number, bullet)), [],
                             "marker %r opens the same list, so step %d must stay clean"
                             % (bullet, number))
 
     def test_a6_control_finding_set_declares_the_action_identities(self):
-        self.assertEqual(len(VM_GATE_FINDING_KEYS), VM_GATE_A11_FINDING_KEY_COUNT,
+        # A6's identities live on the SEMANTIC surface, which R1 leaves at its A11 size.
+        self.assertEqual(len(VM_GATE_SEMANTIC_FINDING_KEYS), VM_GATE_A11_FINDING_KEY_COUNT,
                          "A6 adds exactly the two reviewed action identities and retires nothing;"
                          " A11 appends its own declared keys and retires nothing either")
-        self.assertEqual(len(set(VM_GATE_FINDING_KEYS)), VM_GATE_A11_FINDING_KEY_COUNT)
-        self.assertIn(VM_GATE_A6_ACTION_KEYS[VM_GATE_DEPLOY_STEP], VM_GATE_FINDING_KEYS)
-        self.assertIn(VM_GATE_A6_ACTION_KEYS[VM_GATE_PREFLIGHT_STEP], VM_GATE_FINDING_KEYS)
+        self.assertEqual(len(set(VM_GATE_SEMANTIC_FINDING_KEYS)), VM_GATE_A11_FINDING_KEY_COUNT)
+        self.assertIn(VM_GATE_A6_ACTION_KEYS[VM_GATE_DEPLOY_STEP], VM_GATE_SEMANTIC_FINDING_KEYS)
+        self.assertIn(VM_GATE_A6_ACTION_KEYS[VM_GATE_PREFLIGHT_STEP],
+                      VM_GATE_SEMANTIC_FINDING_KEYS)
         self.assertIn(VM_GATE_A6_ACTION_KEYS[VM_GATE_DEPLOY_STEP], VM_GATE_DEPLOY_UNMET,
                       "an unresolvable step-4 layout must report the action identity unmet")
         self.assertIn(VM_GATE_A6_ACTION_KEYS[VM_GATE_PREFLIGHT_STEP], VM_GATE_PREFLIGHT_UNMET,
@@ -12242,7 +12424,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                 for spelling, separator in VM_GATE_A7_JOIN_SEPARATORS:
                     with self.subTest(base=base_name, operation=label, join=spelling):
                         degraded = self._a7_absorb_fence(base, command, "closing", separator)
-                        self.assertIn(action_key, vm_gate_findings(degraded),
+                        self.assertIn(action_key, _vm_gate_semantic_findings(degraded),
                                       "%s absorbing its closing fence must report %s"
                                       % (label, action_key))
 
@@ -12264,7 +12446,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                               "the reviewed layout must close step 4 on its own fence line")
                 self.assertNotIn(standalone, degraded,
                                  "the standalone fence that closed step 4 must be gone")
-                self.assertIn("deploy_action_text_changed", vm_gate_findings(degraded),
+                self.assertIn("deploy_action_text_changed", _vm_gate_semantic_findings(degraded),
                               "an unterminated step-4 fence swallowing the step-5 gate and its"
                               " approval must fail closed")
 
@@ -12275,7 +12457,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                 for spelling, fence in VM_GATE_A7_PERMITTED_CLOSING_FENCES:
                     with self.subTest(base=base_name, operation=label, fence=spelling):
                         self.assertEqual(
-                            vm_gate_findings(self._a7_set_fence(base, command, "closing", fence)),
+                            _vm_gate_semantic_findings(self._a7_set_fence(base, command, "closing", fence)),
                             [], "%r closes the same block, so %s must stay clean"
                                 % (fence, label))
 
@@ -12287,7 +12469,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                     with self.subTest(base=base_name, operation=label, fence=spelling):
                         permitted = self._a7_set_fence(base, command, "closing", fence)
                         degraded = self._a7_absorb_fence(permitted, command, "closing")
-                        self.assertIn(action_key, vm_gate_findings(degraded),
+                        self.assertIn(action_key, _vm_gate_semantic_findings(degraded),
                                       "%s absorbing a %s closing fence must report %s"
                                       % (label, spelling, action_key))
 
@@ -12307,7 +12489,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                         degraded = self._a7_set_fence(
                             base, command, position, VM_GATE_A7_FOUR_SPACES + fence.strip())
                         self.assertNotEqual(degraded, base, "the indent must change the text")
-                        self.assertIn(action_key, vm_gate_findings(degraded),
+                        self.assertIn(action_key, _vm_gate_semantic_findings(degraded),
                                       "a four-space-indented %s fence for %s must report %s"
                                       % (position, label, action_key))
 
@@ -12323,7 +12505,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                 for spelling, separator in VM_GATE_A7_JOIN_SEPARATORS:
                     with self.subTest(base=base_name, operation=label, join=spelling):
                         degraded = self._a7_absorb_fence(base, command, "opening", separator)
-                        self.assertIn(invocation_key, vm_gate_findings(degraded),
+                        self.assertIn(invocation_key, _vm_gate_semantic_findings(degraded),
                                       "%s joined to its opening fence must keep reporting %s"
                                       % (label, invocation_key))
 
@@ -12341,7 +12523,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                     with self.subTest(base=base_name, operation=label, fence=spelling):
                         altered = self._a7_set_fence(base, command, "closing", fence)
                         self.assertNotEqual(altered, base, "the respelling must change the text")
-                        self.assertIn(action_key, vm_gate_findings(altered),
+                        self.assertIn(action_key, _vm_gate_semantic_findings(altered),
                                       "a %s closing fence for %s must report %s"
                                       % (spelling, label, action_key))
                 for position in ("opening", "closing"):
@@ -12349,7 +12531,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                         lines, at = self._a7_fence_neighbours(base, command)
                         fence_at = at - 1 if position == "opening" else at + 1
                         removed = "\n".join(lines[:fence_at] + lines[fence_at + 1:])
-                        self.assertIn(action_key, vm_gate_findings(removed),
+                        self.assertIn(action_key, _vm_gate_semantic_findings(removed),
                                       "removing the %s fence for %s must report %s"
                                       % (position, label, action_key))
 
@@ -12362,7 +12544,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                         lines, at = self._a7_fence_neighbours(base, command)
                         fence = lines[at - 1].strip()
                         self.assertEqual(
-                            vm_gate_findings(self._a7_set_fence(
+                            _vm_gate_semantic_findings(self._a7_set_fence(
                                 base, command, "opening", " " * indent + fence)), [],
                             "a %d-space opening fence still opens the block for %s"
                             % (indent, label))
@@ -12376,7 +12558,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                                      "the base must carry the reviewed %s once" % label)
                     reflowed = base.replace(wrapped, rewrapped, 1)
                     self.assertNotEqual(reflowed, base, "the reflow must actually change the text")
-                    self.assertEqual(vm_gate_findings(reflowed), [],
+                    self.assertEqual(_vm_gate_semantic_findings(reflowed), [],
                                      "rewrapping the %s must stay clean" % label)
 
     def test_a7_control_blank_line_regrouping_around_fences_stays_clean(self):
@@ -12389,7 +12571,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                         cut = at - 1 if position == "opening" else at + 2
                         regrouped = "\n".join(lines[:cut] + [""] + lines[cut:])
                         self.assertNotEqual(regrouped, base, "the regrouping must change the text")
-                        self.assertEqual(vm_gate_findings(regrouped), [],
+                        self.assertEqual(_vm_gate_semantic_findings(regrouped), [],
                                          "an extra blank line %s the %s fence must stay clean"
                                          % (position, label))
 
@@ -12412,7 +12594,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                             for line in action.splitlines())
                         degraded = base.replace(section, section.replace(action, swapped, 1), 1)
                         self.assertNotEqual(degraded, base, "the swap must change the text")
-                        self.assertEqual(vm_gate_findings(degraded), [],
+                        self.assertEqual(_vm_gate_semantic_findings(degraded), [],
                                          "marker %r opens the same list, so the step-%d action"
                                          " must stay clean" % (bullet, number))
 
@@ -12465,7 +12647,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                         self.assertIn(token, section,
                                       "every required four-way token must survive, so this is not"
                                       " a token-removal control in disguise")
-                    self.assertIn("safety_boundary_surfaces_incomplete", vm_gate_findings(degraded),
+                    self.assertIn("safety_boundary_surfaces_incomplete", _vm_gate_semantic_findings(degraded),
                                   "a contradiction inside the unique Safety boundary (%s) must"
                                   " fail closed" % label)
 
@@ -12473,8 +12655,8 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
         """The control group: the reviewed section itself must report nothing."""
         for base_name, base in self._a8_bases():
             with self.subTest(base=base_name):
-                self.assertNotIn("safety_boundary_surfaces_incomplete", vm_gate_findings(base))
-                self.assertNotIn("safety_boundary_ambiguous", vm_gate_findings(base))
+                self.assertNotIn("safety_boundary_surfaces_incomplete", _vm_gate_semantic_findings(base))
+                self.assertNotIn("safety_boundary_ambiguous", _vm_gate_semantic_findings(base))
 
     # -- A8-F2. A physical command-line boundary inside a fence is execution-significant. -- #
     def _a8_split_command(self, base, command, before, after):
@@ -12496,7 +12678,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
             for label, command, before, after, key in VM_GATE_A8_EXECUTABLE_SPLITS:
                 with self.subTest(base=base_name, split=label):
                     degraded = self._a8_split_command(base, command, before, after)
-                    self.assertIn(key, vm_gate_findings(degraded),
+                    self.assertIn(key, _vm_gate_semantic_findings(degraded),
                                   "splitting the reviewed command line (%s) must fail closed"
                                   % label)
 
@@ -12549,7 +12731,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                 for label, pad in VM_GATE_A8_CONTAINER_INDENTS:
                     with self.subTest(base=base_name, gate=gate, indent=label):
                         degraded = self._a8_indent_gate(base, opening, boundary, pad)
-                        self.assertIn(key, vm_gate_findings(degraded),
+                        self.assertIn(key, _vm_gate_semantic_findings(degraded),
                                       "a %s-indented %s gate must fail closed" % (label, gate))
 
     def test_a8_control_partially_indented_gate_fails_closed(self):
@@ -12558,7 +12740,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
             for gate, opening, boundary, key in VM_GATE_A8_GATES:
                 with self.subTest(base=base_name, gate=gate):
                     degraded = self._a8_indent_gate(base, opening, boundary, "    ", share=0.5)
-                    self.assertIn(key, vm_gate_findings(degraded),
+                    self.assertIn(key, _vm_gate_semantic_findings(degraded),
                                   "a partially indented %s gate must fail closed" % gate)
 
     def test_a8_control_render_equivalent_gate_indent_stays_clean(self):
@@ -12568,7 +12750,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                 for label, pad in VM_GATE_A8_RENDER_EQUIVALENT_INDENTS:
                     with self.subTest(base=base_name, gate=gate, indent=label):
                         indented = self._a8_indent_gate(base, opening, boundary, pad)
-                        self.assertEqual(vm_gate_findings(indented), [],
+                        self.assertEqual(_vm_gate_semantic_findings(indented), [],
                                          "a %s-indented %s gate renders identically and must stay"
                                          " clean" % (label, gate))
 
@@ -12628,7 +12810,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
         self.assertNotEqual(moved, base,
                             "relocating the instruction under the laptop banner must actually"
                             " change the runbook")
-        self.assertIn("preflight_action_text_changed", vm_gate_findings(moved),
+        self.assertIn("preflight_action_text_changed", _vm_gate_semantic_findings(moved),
                       "an environment instruction moved back under the laptop execution context"
                       " must fail closed")
 
@@ -12704,7 +12886,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                             self.assertIsNotNone(
                                 _a9_fence_open_at(degraded, at),
                                 "the oracle must agree the authority begins inside an open fence")
-                            self.assertIn(key, vm_gate_findings(degraded),
+                            self.assertIn(key, _vm_gate_semantic_findings(degraded),
                                           "a %s authority inside inherited fenced code must fail"
                                           " closed" % label)
 
@@ -12720,7 +12902,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                         self.assertIsNotNone(
                             _a9_fence_open_at(degraded, at),
                             "the oracle must agree the gate begins inside an open fence")
-                        self.assertIn(HOST_SYNC_A9_CARRIER, host_sync_gate_findings(degraded),
+                        self.assertIn(HOST_SYNC_A9_CARRIER, _host_sync_semantic_findings(degraded),
                                       "a host-sync gate inside inherited fenced code must fail"
                                       " closed")
 
@@ -12739,7 +12921,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                             base, needle, opener, VM_GATE_A9_FILLER, closer)
                         at = self._a9_authority_at(degraded, needle)
                         state = _a9_fence_open_at(degraded, at)
-                        findings = vm_gate_findings(degraded)
+                        findings = _vm_gate_semantic_findings(degraded)
                         if closed:
                             self.assertIsNone(state, "the oracle must agree %s closes" % form)
                             self.assertNotIn(key, findings,
@@ -12765,7 +12947,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                     degraded = self._a9_insert_before(
                         base, HOST_SYNC_A9_STEP_HEADING, opener, VM_GATE_A9_FILLER, closer)
                     at = self._a9_authority_at(degraded, HOST_SYNC_GATE_MARKER)
-                    findings = host_sync_gate_findings(degraded)
+                    findings = _host_sync_semantic_findings(degraded)
                     if closed:
                         self.assertIsNone(_a9_fence_open_at(degraded, at),
                                           "the oracle must agree %s closes" % form)
@@ -12794,7 +12976,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                         at = self._a9_authority_at(degraded, needle)
                         self.assertIsNone(_a9_fence_open_at(degraded, at),
                                           "the oracle must agree %s opens no fence" % form)
-                        findings = vm_gate_findings(degraded)
+                        findings = _vm_gate_semantic_findings(degraded)
                         self.assertNotIn(key, findings,
                                          "%s is indented code, not an inherited opener, so the %s"
                                          " authority must not fail on it" % (form, label))
@@ -12809,7 +12991,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                     at = self._a9_authority_at(degraded, HOST_SYNC_GATE_MARKER)
                     self.assertIsNone(_a9_fence_open_at(degraded, at),
                                       "the oracle must agree %s opens no fence" % form)
-                    self.assertEqual(host_sync_gate_findings(degraded), [],
+                    self.assertEqual(_host_sync_semantic_findings(degraded), [],
                                      "%s is indented code, not an inherited opener" % form)
 
     # ---- DL-XB-123-001-A10-C1: opening-fence VALIDITY controls ---- #
@@ -12934,7 +13116,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                         self.assertIsNotNone(
                             _block_state_at(degraded, at),
                             "the checker's inherited state must agree with the rendered state")
-                        self.assertIn(key, vm_gate_findings(degraded),
+                        self.assertIn(key, _vm_gate_semantic_findings(degraded),
                                       "a %s authority inside inherited fenced code must fail"
                                       " closed" % label)
 
@@ -12953,7 +13135,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                         "the oracle must agree the gate begins inside an open fence")
                     self.assertEqual(_unblocked(degraded, at), -1,
                                      "a gate marker rendered as code must be treated as absent")
-                    self.assertIn(HOST_SYNC_A9_CARRIER, host_sync_gate_findings(degraded),
+                    self.assertIn(HOST_SYNC_A9_CARRIER, _host_sync_semantic_findings(degraded),
                                   "a host-sync gate inside inherited fenced code must fail closed")
 
     def test_a10_control_valid_openers_still_fence_the_authority(self):
@@ -12972,7 +13154,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                         at = self._a9_authority_at(degraded, needle)
                         self.assertIsNotNone(_a9_fence_open_at(degraded, at),
                                              "the oracle must agree %s opens a fence" % name)
-                        self.assertIn(key, vm_gate_findings(degraded),
+                        self.assertIn(key, _vm_gate_semantic_findings(degraded),
                                       "a %s authority behind the valid opener %s must fail closed"
                                       % (label, name))
         for base_name, base in self._a9_host_bases():
@@ -12983,7 +13165,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                     at = self._a9_authority_at(degraded, HOST_SYNC_GATE_MARKER)
                     self.assertIsNotNone(_a9_fence_open_at(degraded, at),
                                          "the oracle must agree %s opens a fence" % name)
-                    self.assertIn(HOST_SYNC_A9_CARRIER, host_sync_gate_findings(degraded),
+                    self.assertIn(HOST_SYNC_A9_CARRIER, _host_sync_semantic_findings(degraded),
                                   "the host-sync gate behind the valid opener %s must fail closed"
                                   % name)
 
@@ -13074,7 +13256,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                                 _a11_block_open_at(degraded, at), ("html", kind),
                                 "the oracle must agree the authority begins inside a type-%d HTML"
                                 " block" % kind)
-                            self.assertIn(key, vm_gate_findings(degraded),
+                            self.assertIn(key, _vm_gate_semantic_findings(degraded),
                                           "a %s authority inside inherited HTML-block content must"
                                           " fail closed" % label)
 
@@ -13088,7 +13270,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                     at = self._a9_authority_at(degraded, HOST_SYNC_GATE_MARKER)
                     self.assertEqual(_a11_block_open_at(degraded, at), ("html", kind),
                                      "the oracle must agree the gate begins inside an HTML block")
-                    self.assertIn(HOST_SYNC_A11_CARRIER, host_sync_gate_findings(degraded),
+                    self.assertIn(HOST_SYNC_A11_CARRIER, _host_sync_semantic_findings(degraded),
                                   "a host-sync gate inside inherited HTML-block content must fail"
                                   " closed")
 
@@ -13103,7 +13285,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                         self.assertEqual(_a11_block_open_at(degraded, at), ("html", kind),
                                          "the oracle must read a CRLF opener as a type-%d opener"
                                          % kind)
-                        self.assertIn(key, vm_gate_findings(degraded),
+                        self.assertIn(key, _vm_gate_semantic_findings(degraded),
                                       "a CRLF %s opener must still fail the %s authority closed"
                                       % (name, label))
 
@@ -13125,7 +13307,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                             _a11_block_open_at(degraded, at),
                             "the oracle must agree the type-%d block closed before the authority"
                             % kind)
-                        self.assertNotIn(key, vm_gate_findings(degraded),
+                        self.assertNotIn(key, _vm_gate_semantic_findings(degraded),
                                          "a closed %s block before the %s authority is not drift"
                                          % (name, label))
 
@@ -13140,7 +13322,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
             for name, _kind, opener, _closer in VM_GATE_A11_HTML_FAMILIES:
                 with self.subTest(base=base_name, family=name):
                     degraded = base + "\n## Appendix\n\n" + opener + "\n"
-                    self.assertEqual(vm_gate_findings(degraded), vm_gate_findings(base),
+                    self.assertEqual(_vm_gate_semantic_findings(degraded), _vm_gate_semantic_findings(base),
                                      "%s after every authority must change nothing" % name)
 
     def test_a11_control_raw_block_families_do_not_open_inside_one_another(self):
@@ -13152,20 +13334,20 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                     at = self._a9_authority_at(degraded, needle)
                     self.assertEqual(_a11_block_open_at(degraded, at), ("html", 1),
                                      "a fence line inside a type-1 HTML block is block content")
-                    self.assertIn(key, vm_gate_findings(degraded))
+                    self.assertIn(key, _vm_gate_semantic_findings(degraded))
                 with self.subTest(base=base_name, authority=label, case="html_inside_fence"):
                     degraded = self._a9_insert_before(base, needle, "```", "<script>", "<div>")
                     at = self._a9_authority_at(degraded, needle)
                     self.assertEqual(_a11_block_open_at(degraded, at), ("fence", "`", 3),
                                      "an HTML opener inside a fenced block is block content")
-                    self.assertIn(key, vm_gate_findings(degraded))
+                    self.assertIn(key, _vm_gate_semantic_findings(degraded))
                 with self.subTest(base=base_name, authority=label, case="fence_closes_then_html"):
                     degraded = self._a9_insert_before(
                         base, needle, "```", VM_GATE_A11_HTML_FILLER, "```", "<script>")
                     at = self._a9_authority_at(degraded, needle)
                     self.assertEqual(_a11_block_open_at(degraded, at), ("html", 1),
                                      "an HTML opener AFTER a closed fence opens its own block")
-                    self.assertIn(key, vm_gate_findings(degraded))
+                    self.assertIn(key, _vm_gate_semantic_findings(degraded))
 
     def test_a11_control_unclosed_html_block_runs_to_end_of_document(self):
         """End-of-document behaviour, stated rather than assumed: an unclosed block stays open."""
@@ -13197,7 +13379,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
         """The control group: every reviewed protected operation already sits where it belongs."""
         for base_name, base in self._a11_bases():
             with self.subTest(base=base_name):
-                self.assertNotIn("protected_operation_outside_region", vm_gate_findings(base),
+                self.assertNotIn("protected_operation_outside_region", _vm_gate_semantic_findings(base),
                                  "the reviewed document keeps every protected operation inside its"
                                  " authorised action region")
 
@@ -13217,7 +13399,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                     with self.subTest(base=base_name, operation=name, step=step):
                         degraded = self._a11_inject_operation(base, step, anchor)
                         self.assertIn("protected_operation_outside_region",
-                                      vm_gate_findings(degraded),
+                                      _vm_gate_semantic_findings(degraded),
                                       "an active %s outside its authorised region must fail closed"
                                       % name)
 
@@ -13235,7 +13417,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                             degraded = self._a11_inject_operation(
                                 base, step, template % anchor)
                             self.assertNotIn("protected_operation_outside_region",
-                                             vm_gate_findings(degraded),
+                                             _vm_gate_semantic_findings(degraded),
                                              "an inert %s mention is not an operation" % name)
 
     # -- A11-F3: operator-directed destructive cleanup -- #
@@ -13248,10 +13430,10 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                                 "the inventory must name a real runbook instruction")
         self.assertIn(VM_GATE_A11_CLEANUP_REVIEWED_GATE, self.create_runbook,
                       "the runbook must carry the reviewed destructive-cleanup gate")
-        self.assertNotIn("destructive_cleanup_not_gated", vm_gate_findings(self.create_runbook),
+        self.assertNotIn("destructive_cleanup_not_gated", _vm_gate_semantic_findings(self.create_runbook),
                          "every destructive instruction must carry its own current-turn gate")
         self.assertNotIn("destructive_cleanup_gate_text_changed",
-                         vm_gate_findings(self.create_runbook))
+                         _vm_gate_semantic_findings(self.create_runbook))
 
     def _a11_move_gate_after_its_block(self, base):
         gate = VM_GATE_A11_CLEANUP_REVIEWED_GATE
@@ -13280,7 +13462,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                 with self.subTest(base=base_name, mutation=name):
                     degraded = self._a11_cleanup_mutate(base, name)
                     self.assertNotEqual(degraded, base, "the mutation must change the document")
-                    self.assertIn(key, vm_gate_findings(degraded),
+                    self.assertIn(key, _vm_gate_semantic_findings(degraded),
                                   "the %s mutation must fail closed" % name)
 
     def test_a11_control_destructive_prohibitions_are_not_instructions(self):
@@ -13293,7 +13475,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
             for phrase in VM_GATE_A11_DESTRUCTIVE_PROHIBITIONS:
                 with self.subTest(base=base_name, prohibition=phrase):
                     degraded = base + "\nA reminder: " + phrase + ".\n"
-                    self.assertNotIn("destructive_cleanup_not_gated", vm_gate_findings(degraded),
+                    self.assertNotIn("destructive_cleanup_not_gated", _vm_gate_semantic_findings(degraded),
                                      "a prohibition is not an operator-directed deletion")
 
     # -- A11-F4: the step-9 live mapping and step-10 conditional recovery gates -- #
@@ -13312,7 +13494,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
         """The control group for both new surfaces, on both bases."""
         for base_name, base in self._a11_bases():
             with self.subTest(base=base_name):
-                findings = vm_gate_findings(base)
+                findings = _vm_gate_semantic_findings(base)
                 self.assertEqual([key for key in findings
                                   if key.startswith(("mapping_", "recovery_"))], [],
                                  "the reviewed step-9 and step-10 gates must satisfy the contract")
@@ -13328,7 +13510,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                         VM_GATE_A11_MAPPING_REVIEWED_ACTION, name,
                         VM_GATE_A11_MAPPING_REPLACEMENTS)
                     self.assertNotEqual(degraded, base, "the mutation must change the document")
-                    self.assertIn(key, vm_gate_findings(degraded),
+                    self.assertIn(key, _vm_gate_semantic_findings(degraded),
                                   "the step-9 %s mutation must fail closed" % name)
 
     def test_a11_control_recovery_gate_mutations_fail_closed(self):
@@ -13342,7 +13524,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                         VM_GATE_A11_RECOVERY_REVIEWED_ACTION, name,
                         VM_GATE_A11_RECOVERY_REPLACEMENTS)
                     self.assertNotEqual(degraded, base, "the mutation must change the document")
-                    self.assertIn(key, vm_gate_findings(degraded),
+                    self.assertIn(key, _vm_gate_semantic_findings(degraded),
                                   "the step-10 %s mutation must fail closed" % name)
 
     def test_a11_control_mapping_and_recovery_actions_are_identity_protected(self):
@@ -13356,7 +13538,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                     degraded = base.replace(
                         action,
                         action.rstrip("\n") + "\nThe approval above is optional here.\n\n", 1)
-                    self.assertIn(key, vm_gate_findings(degraded),
+                    self.assertIn(key, _vm_gate_semantic_findings(degraded),
                                   "an action-region revocation must fail closed")
 
     # -- A11: the corrected Safety boundary -- #
@@ -13372,7 +13554,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                     self.assertIn(token, flat, "the corrected boundary must state %r" % (token[:48],))
                 self.assertNotIn("are four independent approval surfaces", flat,
                                  "the incorrect fixed total must be retired")
-                self.assertNotIn("safety_boundary_surfaces_incomplete", vm_gate_findings(base))
+                self.assertNotIn("safety_boundary_surfaces_incomplete", _vm_gate_semantic_findings(base))
         preserved = _flat(VM_GATE_A11_SAFETY_REVIEWED_SECTION)
         for token in VM_GATE_A5_SAFETY_STEP5_SCOPE:
             with self.subTest(preserved=token):
@@ -13398,7 +13580,7 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                 with self.subTest(base=base_name, contradiction=label):
                     degraded = self._a11_safety_mutate(base, position, sentence)
                     self.assertNotEqual(degraded, base, "the contradiction must change the section")
-                    self.assertIn("safety_boundary_surfaces_incomplete", vm_gate_findings(degraded),
+                    self.assertIn("safety_boundary_surfaces_incomplete", _vm_gate_semantic_findings(degraded),
                                   "the %s contradiction must fail closed" % label)
 
     def test_a11_control_safety_boundary_required_bullets_cannot_be_removed(self):
@@ -13412,49 +13594,82 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                     self.assertNotEqual(end, -1, "the bullet must be followed by another")
                     mutated = section[:at] + section[end + 1:]
                     degraded = self._a11_replace(base, section, mutated, "the Safety boundary")
-                    self.assertIn("safety_boundary_surfaces_incomplete", vm_gate_findings(degraded),
+                    self.assertIn("safety_boundary_surfaces_incomplete", _vm_gate_semantic_findings(degraded),
                                   "removing the %s bullet must fail closed" % label)
 
     # -- A11: declared surface, reachability, purity and the target document -- #
     def test_a11_target_fixture_and_live_runbook_satisfy_the_whole_a11_contract(self):
+        # The A11 proposition is SEMANTIC, and the miniature fixture is deliberately not the
+        # reviewed runbook, so it is asserted against the semantic layer for both bases. The live
+        # runbook additionally has to clear the PUBLIC sealed guard, which the fixture cannot.
         for base_name, base in self._a11_bases():
             with self.subTest(base=base_name):
-                self.assertEqual(vm_gate_findings(base), [],
+                self.assertEqual(_vm_gate_semantic_findings(base), [],
                                  "%s must satisfy every DL-XB-123-001-A11 requirement" % base_name)
+        self.assertEqual(vm_gate_findings(self.create_runbook), [],
+                         "the live runbook must also clear the public sealed guard")
+        self.assertEqual(vm_gate_findings(VM_GATE_A11_FIXTURE), [REVIEWED_RUNBOOK_SEAL_KEY],
+                         "the miniature fixture is semantically clean but is NOT the reviewed "
+                         "runbook, so the public guard must report exactly the seal")
 
     def test_a11_control_finding_keys_are_declared_unique_and_reachable(self):
-        self.assertEqual(len(VM_GATE_FINDING_KEYS), VM_GATE_A11_FINDING_KEY_COUNT,
+        self.assertEqual(len(VM_GATE_SEMANTIC_FINDING_KEYS), VM_GATE_A11_FINDING_KEY_COUNT,
                          "A11 adds exactly its declared keys and retires nothing")
-        self.assertEqual(len(set(VM_GATE_FINDING_KEYS)), VM_GATE_A11_FINDING_KEY_COUNT,
-                         "no finding key may be declared twice")
+        self.assertEqual(len(set(VM_GATE_SEMANTIC_FINDING_KEYS)), VM_GATE_A11_FINDING_KEY_COUNT,
+                         "no semantic finding key may be declared twice")
+        # R1: the public surface is the semantic surface plus exactly the seal key.
+        self.assertEqual(len(VM_GATE_FINDING_KEYS), VM_GATE_R1_FINDING_KEY_COUNT,
+                         "R1 adds exactly the seal key and retires nothing")
+        self.assertEqual(len(set(VM_GATE_FINDING_KEYS)), VM_GATE_R1_FINDING_KEY_COUNT,
+                         "no public finding key may be declared twice")
+        self.assertEqual(set(VM_GATE_FINDING_KEYS) - set(VM_GATE_SEMANTIC_FINDING_KEYS),
+                         {REVIEWED_RUNBOOK_SEAL_KEY},
+                         "the public/semantic boundary must be exactly the seal key")
+        self.assertNotIn(REVIEWED_RUNBOOK_SEAL_KEY, VM_GATE_SEMANTIC_FINDING_KEYS,
+                         "the semantic layer must never claim to report the seal")
         for key in VM_GATE_A11_NEW_KEYS:
             with self.subTest(key=key):
-                self.assertIn(key, VM_GATE_FINDING_KEYS, "%s must be declared" % key)
+                self.assertIn(key, VM_GATE_SEMANTIC_FINDING_KEYS, "%s must be declared" % key)
         self.assertEqual([key for key in VM_GATE_FINDING_KEYS if "four" in key], [],
                          "the four-way key is renamed, because the contract is no longer four-way")
-        self.assertIn("safety_boundary_surfaces_incomplete", VM_GATE_FINDING_KEYS)
-        self.assertLess(VM_GATE_A11_NEEDS_A_REAL_DOCUMENT, set(VM_GATE_FINDING_KEYS),
+        self.assertIn("safety_boundary_surfaces_incomplete", VM_GATE_SEMANTIC_FINDING_KEYS)
+        self.assertLess(VM_GATE_A11_NEEDS_A_REAL_DOCUMENT, set(VM_GATE_SEMANTIC_FINDING_KEYS),
                         "every landmark-dependent key must still be declared")
-        self.assertEqual(set(vm_gate_findings("")),
-                         set(VM_GATE_FINDING_KEYS) - VM_GATE_A11_NEEDS_A_REAL_DOCUMENT,
-                         "an empty document must report every other declared finding key")
+        self.assertEqual(set(_vm_gate_semantic_findings("")),
+                         set(VM_GATE_SEMANTIC_FINDING_KEYS) - VM_GATE_A11_NEEDS_A_REAL_DOCUMENT,
+                         "an empty document must report every other declared semantic key")
         self.assertIn(VM_GATE_A11_MAPPING_UNMET, (VM_GATE_A11_MAPPING_UNMET,))
-        self.assertLess(VM_GATE_A11_MAPPING_UNMET, set(VM_GATE_FINDING_KEYS))
-        self.assertLess(VM_GATE_A11_RECOVERY_UNMET, set(VM_GATE_FINDING_KEYS))
+        self.assertLess(VM_GATE_A11_MAPPING_UNMET, set(VM_GATE_SEMANTIC_FINDING_KEYS))
+        self.assertLess(VM_GATE_A11_RECOVERY_UNMET, set(VM_GATE_SEMANTIC_FINDING_KEYS))
 
     def test_a11_control_checker_stays_pure_deterministic_and_total(self):
-        """Text in, findings out: repeated calls agree, and malformed input raises nothing."""
+        """Text in, findings out: repeated calls agree, and malformed input raises nothing.
+
+        Asserted on BOTH layers, because R1 makes the public guard the live authority and a
+        non-deterministic or throwing public guard would be the very failure the seal exists to
+        rule out.
+        """
         for base_name, base in self._a11_bases():
             with self.subTest(base=base_name):
+                self.assertEqual(_vm_gate_semantic_findings(base), _vm_gate_semantic_findings(base),
+                                 "the semantic checker must be deterministic")
                 self.assertEqual(vm_gate_findings(base), vm_gate_findings(base),
-                                 "the checker must be deterministic")
+                                 "the public guard must be deterministic")
         for label, text in VM_GATE_A11_MALFORMED_INPUTS:
             with self.subTest(malformed=label):
-                first = vm_gate_findings(text)
+                first = _vm_gate_semantic_findings(text)
                 self.assertIsInstance(first, list, "%s must yield findings, not raise" % label)
-                self.assertEqual(first, vm_gate_findings(text))
-                self.assertLessEqual(set(first), set(VM_GATE_FINDING_KEYS),
-                                     "no emitted key may be undeclared")
+                self.assertEqual(first, _vm_gate_semantic_findings(text))
+                self.assertLessEqual(set(first), set(VM_GATE_SEMANTIC_FINDING_KEYS),
+                                     "no emitted semantic key may be undeclared")
+                public = vm_gate_findings(text)
+                self.assertIsInstance(public, list,
+                                      "%s must yield public findings, not raise" % label)
+                self.assertEqual(public, vm_gate_findings(text))
+                self.assertLessEqual(set(public), set(VM_GATE_FINDING_KEYS),
+                                     "no emitted public key may be undeclared")
+                self.assertIn(REVIEWED_RUNBOOK_SEAL_KEY, public,
+                              "a malformed document is not the reviewed runbook")
 
     def test_a11_control_no_emitted_key_is_undeclared(self):
         """Across every control document this class builds, emitted keys stay inside the declaration."""
@@ -13465,8 +13680,326 @@ class ExpiryProbeRunbookAndCiTests(unittest.TestCase):
                 documents.append(self._a9_insert_before(VM_GATE_A11_FIXTURE, needle, opener))
         for index, document in enumerate(documents):
             with self.subTest(document=index):
+                self.assertLessEqual(set(_vm_gate_semantic_findings(document)),
+                                     set(VM_GATE_SEMANTIC_FINDING_KEYS),
+                                     "every emitted semantic finding key must be declared")
                 self.assertLessEqual(set(vm_gate_findings(document)), set(VM_GATE_FINDING_KEYS),
-                                     "every emitted finding key must be declared")
+                                     "every emitted public finding key must be declared")
+
+    # ---- DL-XB-123-001-R1: the reviewed-runbook structural seal ---- #
+    # Everything below judges the PUBLIC guards. The proposition is no longer "the parser
+    # recognises this defect" but "this is not the reviewed document", which is decidable for every
+    # input and is why R1 converges where A1-A11 did not.
+
+    def _public_guards(self):
+        """Both public live guards, so every seal control is proved on each of them."""
+        return (("vm_gate_findings", vm_gate_findings),
+                ("host_sync_gate_findings", host_sync_gate_findings))
+
+    def _assert_seal_fires(self, degraded, why):
+        """Both public guards must report the seal, and the semantic layer must not report it."""
+        self.assertNotEqual(degraded, self.create_runbook, "%s must change the document" % why)
+        self.assertNotEqual(reviewed_runbook_digest(degraded), REVIEWED_RUNBOOK_SHA256,
+                            "%s must change the digest" % why)
+        self.assertEqual(reviewed_runbook_seal_findings(degraded), [REVIEWED_RUNBOOK_SEAL_KEY],
+                         "%s must break the seal" % why)
+        for name, guard in self._public_guards():
+            with self.subTest(guard=name):
+                self.assertIn(REVIEWED_RUNBOOK_SEAL_KEY, guard(degraded),
+                              "%s must fail closed in %s" % (why, name))
+
+    # -- R1: the literal reviewed constant -- #
+    def test_r1_literal_seal_equals_an_independently_computed_reviewed_digest(self):
+        """The declared constant is the truth about the reviewed document, computed here afresh."""
+        independent = hashlib.sha256(
+            canonical_seal_text(self.create_runbook).encode("utf-8")).hexdigest()
+        self.assertEqual(REVIEWED_RUNBOOK_SHA256, independent,
+                         "the literal reviewed digest must equal an independently computed digest "
+                         "of the unchanged reviewed runbook")
+        self.assertEqual(reviewed_runbook_digest(self.create_runbook), REVIEWED_RUNBOOK_SHA256)
+        self.assertEqual(reviewed_runbook_seal_findings(self.create_runbook), [],
+                         "the reviewed runbook must satisfy its own seal")
+        for name, guard in self._public_guards():
+            with self.subTest(guard=name):
+                self.assertEqual(guard(self.create_runbook), [],
+                                 "%s must be clean on the reviewed runbook" % name)
+
+    def test_r1_expected_digest_is_a_literal_constant_and_never_a_runtime_computation(self):
+        """The constant is reviewed text in the module, not something read back from disk.
+
+        A digest recomputed from the live file would seal the document to itself and authorise any
+        edit at all -- the exact failure mode the seal exists to prevent. This is asserted on the
+        module's own AST rather than on its runtime value, because a runtime value cannot show
+        WHERE it came from.
+        """
+        tree = parse_source(read_repo_text("focused_tests"))
+        assignments = [node for node in tree.body
+                       if isinstance(node, ast.Assign)
+                       and any(isinstance(target, ast.Name)
+                               and target.id == "REVIEWED_RUNBOOK_SHA256"
+                               for target in node.targets)]
+        self.assertEqual(len(assignments), 1,
+                         "the reviewed digest must be declared exactly once, at module level")
+        value = assignments[0].value
+        self.assertIsInstance(value, ast.Constant,
+                              "the reviewed digest must be a literal, not an expression")
+        self.assertIsInstance(value.value, str)
+        self.assertEqual(value.value, REVIEWED_RUNBOOK_SHA256)
+        self.assertEqual(len(REVIEWED_RUNBOOK_SHA256), 64,
+                         "a SHA-256 hex digest is 64 characters")
+        self.assertEqual(REVIEWED_RUNBOOK_SHA256, REVIEWED_RUNBOOK_SHA256.lower())
+        self.assertTrue(all(char in "0123456789abcdef" for char in REVIEWED_RUNBOOK_SHA256))
+
+    def test_r1_seal_path_reaches_nothing_but_its_argument(self):
+        """No repository, filesystem, environment, subprocess or network read on the seal path."""
+        tree = parse_source(read_repo_text("focused_tests"))
+        bodies = {node.name: node for node in ast.walk(tree)
+                  if isinstance(node, ast.FunctionDef) and node.name in SEAL_PURE_FUNCTIONS}
+        self.assertEqual(set(bodies), set(SEAL_PURE_FUNCTIONS),
+                         "every seal-path function must exist exactly under its declared name")
+        for name in SEAL_PURE_FUNCTIONS:
+            with self.subTest(function=name):
+                for node in ast.walk(bodies[name]):
+                    if isinstance(node, ast.Name):
+                        self.assertNotIn(node.id, SEAL_FORBIDDEN_NAMES,
+                                         "%s must not reach %s" % (name, node.id))
+                    elif isinstance(node, ast.Attribute):
+                        self.assertNotIn(node.attr, SEAL_FORBIDDEN_ATTRIBUTES,
+                                         "%s must not reach .%s" % (name, node.attr))
+
+    def test_r1_public_guards_are_pure_and_deterministic_on_identical_text(self):
+        """Same text in, same findings out -- repeatedly, and for a detached copy of the text."""
+        samples = ("", self.create_runbook, self.create_runbook + "\n",
+                   VM_GATE_A11_FIXTURE, HOST_SYNC_CANONICAL_FIXTURE)
+        for name, guard in self._public_guards():
+            for index, text in enumerate(samples):
+                with self.subTest(guard=name, sample=index):
+                    first = guard(text)
+                    self.assertEqual(first, guard(text), "%s must be deterministic" % name)
+                    # A distinct string object with identical content must seal identically: the
+                    # seal is a function of the CONTENT, not of the object it arrived in.
+                    self.assertEqual(first, guard("".join([text])))
+
+    # -- R1: canonicalisation is line endings and nothing else -- #
+    def test_r1_seal_is_invariant_under_line_ending_representation(self):
+        reviewed = self.create_runbook
+        self.assertNotIn("\r", reviewed, "the reviewed text is read with LF line endings")
+        for label, rendered in (("crlf", reviewed.replace("\n", "\r\n")),
+                                ("bare_cr", reviewed.replace("\n", "\r"))):
+            with self.subTest(representation=label):
+                self.assertNotEqual(rendered, reviewed, "the representation must actually differ")
+                self.assertEqual(canonical_seal_text(rendered), reviewed,
+                                 "%s must canonicalise back to the reviewed text" % label)
+                self.assertEqual(reviewed_runbook_digest(rendered), REVIEWED_RUNBOOK_SHA256,
+                                 "%s must seal identically" % label)
+                self.assertEqual(reviewed_runbook_seal_findings(rendered), [])
+                for name, guard in self._public_guards():
+                    self.assertNotIn(REVIEWED_RUNBOOK_SEAL_KEY, guard(rendered),
+                                     "%s must not fail on line-ending representation alone"
+                                     % name)
+
+    def test_r1_canonicalisation_normalises_nothing_except_line_endings(self):
+        """Every other normalisation an implementation might be tempted to add is absent."""
+        probe = "  Alpha  Beta \t\n\nGamma\n"
+        self.assertEqual(canonical_seal_text(probe), probe,
+                         "LF-only text must pass through untouched")
+        for label, tempting in (("stripped", probe.strip()),
+                                ("trailing_spaces_removed", probe.replace(" \t\n", "\n")),
+                                ("spaces_collapsed", " ".join(probe.split())),
+                                ("case_folded", probe.lower()),
+                                ("blank_lines_removed", probe.replace("\n\n", "\n"))):
+            with self.subTest(normalisation=label):
+                self.assertNotEqual(canonical_seal_text(probe), canonical_seal_text(tempting),
+                                    "the seal must not apply %s normalisation" % label)
+
+    # -- R1: arbitrary whole-document drift -- #
+    def _r1_drifts(self):
+        """Named single-edit drifts of the reviewed runbook, each materially textual."""
+        text = self.create_runbook
+        at = len(text) // 2
+        line_end = text.index("\n")
+        blank = text.index("\n\n")
+        alpha = next(index for index, char in enumerate(text) if char.isalpha())
+        drifts = [
+            ("single_character", text[:at] + ("x" if text[at] != "x" else "y") + text[at + 1:]),
+            ("insertion", text[:at] + "z" + text[at:]),
+            ("deletion", text[:at] + text[at + 1:]),
+            ("trailing_space", text[:line_end] + " " + text[line_end:]),
+            ("interior_whitespace", text.replace(" ", "  ", 1)),
+            ("case_change", text[:alpha] + text[alpha].swapcase() + text[alpha + 1:]),
+            ("blank_line_added", text[:blank] + "\n" + text[blank:]),
+            ("blank_line_removed", text[:blank] + text[blank + 1:]),
+        ]
+        self.assertTrue(text.endswith("\n"), "the reviewed runbook ends with a newline")
+        drifts.append(("final_newline_removed", text[:-1]))
+        return tuple(drifts)
+
+    def test_r1_any_material_text_drift_breaks_the_seal_in_both_public_guards(self):
+        for label, degraded in self._r1_drifts():
+            with self.subTest(drift=label):
+                self._assert_seal_fires(degraded, "the %s drift" % label)
+
+    def test_r1_seal_covers_every_region_of_the_document(self):
+        """One character, in each region -- the seal is over the whole document, not a selection."""
+        text = self.create_runbook
+        preamble_end = text.index("\n## ")
+        regions = (
+            ("preamble", 0),
+            ("protected approval region", text.index(VM_GATE_DEPLOY_OPENING)),
+            ("command/example region", text.index(HOST_SYNC_PULL_COMMAND)),
+            ("step 9 region", text.index(VM_GATE_A11_REVIEWED_HEADINGS[VM_GATE_A11_MAPPING_STEP])),
+            ("step 10 region", text.index(VM_GATE_A11_REVIEWED_HEADINGS[VM_GATE_A11_RECOVERY_STEP])),
+            ("step 11 region", text.index("### 11.")),
+            ("safety boundary", text.index(VM_GATE_SAFETY_HEADING)),
+            ("trailing content", len(text.rstrip("\n")) - 1),
+        )
+        seen = set()
+        for label, at in regions:
+            with self.subTest(region=label):
+                self.assertGreaterEqual(at, 0, "%s must locate" % label)
+                seen.add(at)
+                degraded = text[:at] + ("Q" if text[at] != "Q" else "R") + text[at + 1:]
+                self._assert_seal_fires(degraded, "a one-character edit in the %s" % label)
+        self.assertEqual(len(seen), len(regions), "each region must be a distinct offset")
+        self.assertLess(regions[0][1], preamble_end, "the preamble offset must be in the preamble")
+
+    # -- R1-F1: the Run-24 setext / type-7 residual -- #
+    def _r1_f1_degraded(self, needle, opener):
+        """The reviewed runbook with the Run-24 residual placed before ``needle``'s own line."""
+        self.assertEqual(self.create_runbook.count(needle), 1,
+                         "the authority %r must occur exactly once" % (needle[:48],))
+        at = self.create_runbook.index(needle)
+        start = self.create_runbook.rfind("\n", 0, at) + 1
+        inserted = "".join(line + "\n" for line in VM_GATE_R1_SETEXT_LINES + (opener,))
+        return self.create_runbook[:start] + inserted + self.create_runbook[start:]
+
+    def test_r1_f1_semantic_layer_still_exhibits_the_known_incomplete_parser_behaviour(self):
+        """The residual is real: the semantic model does not see the HTML block it should.
+
+        Stated as an explicit control rather than left implicit, because the whole R1 argument is
+        that a KNOWN parser shortcoming is now tolerable. If this ever starts failing, the
+        shortcoming has been repaired and the F1 control below has become vacuous -- which is a
+        result worth being told about, not one worth hiding.
+        """
+        self.assertFalse(_breaks_paragraph("==="),
+                         "the semantic model does not recognise a setext underline")
+        self.assertIsNone(_html_block_opening("<template>", True),
+                          "type 7 cannot interrupt a paragraph the model believes is still open")
+        self.assertEqual(_html_block_opening("<template>", False), 7,
+                         "outside a paragraph the same line is a type-7 opener")
+        for label, needle in VM_GATE_R1_F1_AUTHORITIES:
+            for opener in VM_GATE_R1_TYPE7_OPENERS:
+                with self.subTest(authority=label, opener=opener):
+                    degraded = self._r1_f1_degraded(needle, opener)
+                    at = degraded.index(needle)
+                    self.assertIsNone(
+                        _a11_block_open_at(degraded, at),
+                        "the incomplete model still reports no open block at the authority")
+                    self.assertEqual(_vm_gate_semantic_findings(degraded), [],
+                                     "the semantic VM layer is still clean -- the residual")
+                    self.assertEqual(_host_sync_semantic_findings(degraded), [],
+                                     "the semantic host-sync layer is still clean -- the residual")
+
+    def test_r1_f1_setext_type7_residual_cannot_produce_a_clean_public_guard(self):
+        """The convergence claim: an incomplete CommonMark model can no longer read clean."""
+        for label, needle in VM_GATE_R1_F1_AUTHORITIES:
+            for opener in VM_GATE_R1_TYPE7_OPENERS:
+                with self.subTest(authority=label, opener=opener):
+                    degraded = self._r1_f1_degraded(needle, opener)
+                    self._assert_seal_fires(
+                        degraded, "the %s type-7 residual before the %s" % (opener, label))
+                    for name, guard in self._public_guards():
+                        self.assertEqual(guard(degraded), [REVIEWED_RUNBOOK_SEAL_KEY],
+                                         "%s must fail closed on the seal ALONE here, which is "
+                                         "exactly what the semantic layer could not do" % name)
+
+    # -- R1-F2: the Run-24 Copy-Item residual -- #
+    def _r1_f2_degraded(self, step):
+        """The reviewed runbook with an ACTIVE VM deployment appended to a step outside step 4."""
+        self.assertNotIn(step, (VM_GATE_DEPLOY_STEP,),
+                         "the residual must be placed OUTSIDE the step-4 deployment gate")
+        section = _numbered_step_section(self.create_runbook, step)
+        self.assertNotEqual(section, "", "step %d must exist in the reviewed runbook" % step)
+        block = "\n```powershell\n" + VM_GATE_R1_COPY_ITEM_COMMAND + "\n```\n"
+        return self.create_runbook.replace(section, section.rstrip("\n") + "\n" + block, 1)
+
+    def test_r1_f2_semantic_classifier_still_does_not_recognise_the_operation(self):
+        """The residual is real: an ACTIVE deployment the protected-operation table misses.
+
+        The command is proved ACTIVE first, so this is not a control about an inert mention: the
+        classifier sees a live command line and still does not classify it, because the table
+        enumerates spellings and `Copy-Item` is not one of them.
+        """
+        self.assertNotIn("copy-item",
+                         " ".join(anchor for _n, anchor, _s, _f
+                                  in VM_GATE_A11_PROTECTED_OPERATIONS).lower(),
+                         "R1 must NOT answer F2 by adding another command spelling")
+        for step in VM_GATE_R1_F2_STEPS:
+            with self.subTest(step=step):
+                degraded = self._r1_f2_degraded(step)
+                active = "\n".join(_active_command_lines(degraded)).lower()
+                self.assertIn(VM_GATE_R1_COPY_ITEM_COMMAND.lower(), active,
+                              "the injected deployment must be an ACTIVE command line")
+                self.assertNotIn("protected_operation_outside_region",
+                                 _vm_gate_semantic_findings(degraded),
+                                 "the classifier still does not recognise the operation")
+                self.assertEqual(_vm_gate_semantic_findings(degraded), [],
+                                 "the semantic VM layer is still clean -- the residual")
+                self.assertEqual(_host_sync_semantic_findings(degraded), [],
+                                 "the semantic host-sync layer is still clean -- the residual")
+
+    def test_r1_f2_copy_item_outside_step_four_cannot_produce_a_clean_public_guard(self):
+        """The convergence claim: an unclassified live deployment can no longer read clean."""
+        for step in VM_GATE_R1_F2_STEPS:
+            with self.subTest(step=step):
+                degraded = self._r1_f2_degraded(step)
+                self._assert_seal_fires(
+                    degraded, "an active Copy-Item deployment inside step %d" % step)
+                for name, guard in self._public_guards():
+                    self.assertEqual(guard(degraded), [REVIEWED_RUNBOOK_SEAL_KEY],
+                                     "%s must fail closed on the seal ALONE here, which is "
+                                     "exactly what the semantic layer could not do" % name)
+
+    # -- R1: the public/semantic boundary is explicit, not incidental -- #
+    def test_r1_public_and_semantic_layers_are_explicitly_distinct(self):
+        """A semantically clean document that is not the reviewed runbook is NOT publicly clean."""
+        for label, fixture, semantic in (
+                ("VM canonical fixture", VM_GATE_CANONICAL_FIXTURE, _vm_gate_semantic_findings),
+                ("host-sync canonical fixture", HOST_SYNC_CANONICAL_FIXTURE,
+                 _host_sync_semantic_findings)):
+            with self.subTest(fixture=label):
+                self.assertEqual(semantic(fixture), [],
+                                 "%s must remain semantically compliant" % label)
+                self.assertNotEqual(fixture, self.create_runbook,
+                                    "%s is deliberately not the reviewed runbook" % label)
+        # Each public guard adds exactly the seal to its own semantic verdict, and nothing else.
+        for name, guard, semantic in (
+                ("vm_gate_findings", vm_gate_findings, _vm_gate_semantic_findings),
+                ("host_sync_gate_findings", host_sync_gate_findings,
+                 _host_sync_semantic_findings)):
+            for index, text in enumerate(("", VM_GATE_A11_FIXTURE, HOST_SYNC_CANONICAL_FIXTURE,
+                                          self.create_runbook)):
+                with self.subTest(guard=name, sample=index):
+                    self.assertEqual(
+                        set(guard(text)),
+                        set(semantic(text)) | set(reviewed_runbook_seal_findings(text)),
+                        "%s must be exactly its semantic verdict plus the seal" % name)
+
+    def test_r1_seal_key_is_declared_unique_and_reachable_in_both_contracts(self):
+        self.assertIn(REVIEWED_RUNBOOK_SEAL_KEY, VM_GATE_FINDING_KEYS)
+        self.assertIn(REVIEWED_RUNBOOK_SEAL_KEY, HOST_SYNC_FINDING_KEYS)
+        self.assertNotIn(REVIEWED_RUNBOOK_SEAL_KEY, VM_GATE_SEMANTIC_FINDING_KEYS)
+        self.assertNotIn(REVIEWED_RUNBOOK_SEAL_KEY, HOST_SYNC_SEMANTIC_FINDING_KEYS)
+        self.assertEqual(len(set(HOST_SYNC_FINDING_KEYS)), len(HOST_SYNC_FINDING_KEYS),
+                         "no host-sync key may be declared twice")
+        self.assertEqual(set(HOST_SYNC_FINDING_KEYS) - set(HOST_SYNC_SEMANTIC_FINDING_KEYS),
+                         {REVIEWED_RUNBOOK_SEAL_KEY})
+        # Reachable in both, from a document that is simply not the reviewed one.
+        self.assertIn(REVIEWED_RUNBOOK_SEAL_KEY, vm_gate_findings(""))
+        self.assertIn(REVIEWED_RUNBOOK_SEAL_KEY, host_sync_gate_findings(""))
+        # And unreachable when the document IS the reviewed one.
+        self.assertNotIn(REVIEWED_RUNBOOK_SEAL_KEY, vm_gate_findings(self.create_runbook))
+        self.assertNotIn(REVIEWED_RUNBOOK_SEAL_KEY, host_sync_gate_findings(self.create_runbook))
 
 
 @unittest.skipIf(PS is None, "no PowerShell executable available")
