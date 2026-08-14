@@ -542,6 +542,12 @@ regular file this operation exclusively created, compared by the identity captur
 replacement object is **never** unlinked. Nothing is ever listed, globbed or swept, and no other
 pathname is touched.
 
+**Separate current-turn destructive-cleanup approval required (destructive-cleanup gate).** Before
+the deletion or removal below, obtain an explicit current-turn owner approval that names the exact
+target basename or path and the exact delete or remove operation. A step-5 preflight approval, a
+build or reviewer decision, a step-7 write approval, repository review or merge, and any prior-turn
+approval are none of them reusable for it.
+
 | Outcome | Reported as | Operator action |
 | --- | --- | --- |
 | Our temporary removed, or already absent | `store_not_absent` (lost race) / normal success (publication) | none |
@@ -871,6 +877,12 @@ so `approval_blocked` and `do_not_retry` are both false. Every other exit-9 stat
 reports `decision_store_final_path_state` whenever a refusal has something to say about the final
 store path, and derives `decision_store_modified` from it:
 
+**Separate current-turn destructive-cleanup approval required (destructive-cleanup gate).** Before
+the deletion or removal below, obtain an explicit current-turn owner approval that names the exact
+target basename or path and the exact delete or remove operation. A step-5 preflight approval, a
+build or reviewer decision, a step-7 write approval, repository review or merge, and any prior-turn
+approval are none of them reusable for it.
+
 | `decision_store_final_path_state` | `decision_store_modified` | Meaning and required action |
 | --- | --- | --- |
 | `published_not_admitted` | `true` | **This** operation published a store and then failed before its admission fact was proven. The store exists, is complete, and is **not operational**. Nothing was rolled back or deleted. Recovery is the controlled reconciliation command under owner authority, or removal of the non-operational store under review. |
@@ -879,6 +891,12 @@ store path, and derives `decision_store_modified` from it:
 | absent | `false` | The store was left exactly as it was found. |
 
 Store states you may see at exit 9, and what to do:
+
+**Separate current-turn destructive-cleanup approval required (destructive-cleanup gate).** Before
+the deletion or removal below, obtain an explicit current-turn owner approval that names the exact
+target basename or path and the exact delete or remove operation. A step-5 preflight approval, a
+build or reviewer decision, a step-7 write approval, repository review or merge, and any prior-turn
+approval are none of them reusable for it.
 
 - `store_not_admitted`: the store is readable and canonical but carries **no admission fact**, so
   it has never been admitted to operational use. This is the expected, correct state after any
@@ -918,12 +936,24 @@ start a fresh reviewer decision.
 Exit 3 (`cleanup_incomplete`) reports `stale_temp_basename` (a PII-free `.mcuat_pkg_*.tmp`
 name in the output directory) with `manual_cleanup_required`:
 
+**Separate current-turn destructive-cleanup approval required (destructive-cleanup gate).** Before
+the deletion or removal below, obtain an explicit current-turn owner approval that names the exact
+target basename or path and the exact delete or remove operation. A step-5 preflight approval, a
+build or reviewer decision, a step-7 write approval, repository review or merge, and any prior-turn
+approval are none of them reusable for it.
+
 - `publication = not_published`: nothing was published and nothing was reserved. Manually
   delete the named stray temporary file, then re-run the build.
 - `publication = succeeded`: the final package WAS published and is recorded in the ledger
   as `build_cleanup_incomplete`. Do NOT rebuild this operation (the builder refuses it):
   manually delete the named stray temporary file, and if a new package is genuinely needed,
   start a fresh reviewer decision.
+
+**Separate current-turn destructive-cleanup approval required (destructive-cleanup gate).** Before
+the deletion or removal below, obtain an explicit current-turn owner approval that names the exact
+target basename or path and the exact delete or remove operation. A step-5 preflight approval, a
+build or reviewer decision, a step-7 write approval, repository review or merge, and any prior-turn
+approval are none of them reusable for it.
 
 Exit 4 (`ledger_record_incomplete`) means the final package is published and complete but
 its durable ledger event was lost, or landed without confirmed durability. Never delete,
@@ -988,6 +1018,32 @@ irreversible section, calls `SaveMember` at most once, and never retries.
 
 ### 9. Read-back and terminal result mapping
 
+**Separate current-turn owner approval required (result-mapping gate).** The mapping below runs
+live operations on the operator PC n8n instance and writes to the intended Google Sheet. Before any
+of it, obtain an explicit current-turn owner approval that names the intended result-mapping
+workflow `n8n-workflows/member_create_uat_result_mapping.workflow.json` and the intended spreadsheet
+and source tab, and binds:
+
+- importing and using the local copy of that workflow on the operator PC n8n instance;
+- binding the intended Google credential by name or identity only, never by secret value;
+- copying the sanitised result file into the approved n8n file location `/home/node/.n8n-files/`;
+- running that workflow manually, with the workflow left inactive;
+- updating the one intended spreadsheet row selected by `uat_create_operation_id`.
+
+This approval is distinct and is **not** implied by any other gate:
+
+- the PR review and merge decision (step 2) does **not** authorise this result mapping;
+- the physical-host sync approval (step 3) does **not** authorise this result mapping;
+- the VM deployment approval (step 4) does **not** authorise this result mapping;
+- the no-write preflight approval (step 5) does **not** authorise this result mapping;
+- the separate current-turn write approval (step 7) does **not** authorise this result mapping.
+
+A prior-turn approval is not reusable. Repository review or merge is not this approval, and this
+approval authorises no AutoCount contact and no further member write. Without the named current-turn
+result-mapping approval, stop before importing the workflow, before binding any credential, before
+copying the result file into the n8n file location, before running the workflow and before updating
+the spreadsheet row.
+
 On `CREATED_VERIFIED`, the runner has already read the member back and compared the
 approved safe fields. Map the sanitized terminal result to the Sheet:
 
@@ -1013,6 +1069,28 @@ approved safe fields. Map the sanitized terminal result to the Sheet:
 
 ### 10. Recovery for `WRITE_OUTCOME_UNCERTAIN`
 
+**Separate current-turn owner approval required (recovery gate).** This step is conditional and
+applies only when the runner returned `WRITE_OUTCOME_UNCERTAIN`. When it applies, and before any
+AutoCount contact, obtain an explicit current-turn owner approval that names the intended AutoCount
+account book and environment. The server and database are named in that approval itself, and are
+never written into this runbook. That approval binds the read-only member lookup and recovery
+operation for that one uncertain write outcome, and nothing else.
+
+This recovery is read-only. It grants no new `SaveMember` authority, authorises no create, update or
+delete, and authorises no second write attempt. This approval is distinct and is **not** implied by
+any other gate:
+
+- the PR review and merge decision (step 2) does **not** authorise this recovery lookup;
+- the physical-host sync approval (step 3) does **not** authorise this recovery lookup;
+- the VM deployment approval (step 4) does **not** authorise this recovery lookup;
+- the no-write preflight approval (step 5) does **not** authorise this recovery lookup;
+- the separate current-turn write approval (step 7) does **not** authorise this recovery lookup;
+- the step-9 result-mapping approval (step 9) does **not** authorise this recovery lookup.
+
+A prior-turn approval is not reusable. Repository review or merge is not this approval. Without the
+named current-turn recovery approval, stop before opening the account book and before searching for
+the member.
+
 If the runner returns `WRITE_OUTCOME_UNCERTAIN`, the SaveMember call began but success
 could not be proven. Do not retry, delete, or update anything automatically. Perform a
 separate read-only recovery check:
@@ -1037,9 +1115,18 @@ consumed marker yields `FAILED_BEFORE_WRITE`; a malformed marker yields
 
 ### 11. UAT shutdown and inactivity
 
-After completion, leave the result-mapping workflow inactive, remove any temporary
-copies of the package and result from shared locations, and take no further create
-action. The consumed marker and write-intent marker remain on the VM as durable
+After completion, leave the result-mapping workflow inactive and take no further
+create action.
+
+**Separate current-turn destructive-cleanup approval required (destructive-cleanup gate).** Before
+the deletion or removal below, obtain an explicit current-turn owner approval that names the exact
+target basename or path and the exact delete or remove operation. A step-5 preflight approval, a
+build or reviewer decision, a step-7 write approval, repository review or merge, and any prior-turn
+approval are none of them reusable for it.
+
+Then remove any temporary copies of the package and result from shared locations.
+
+The consumed marker and write-intent marker remain on the VM as durable
 evidence and single-use guards; do not delete them. The laptop-side publication
 reservations remain beside the approval ledger for the same reason; do not delete or
 sweep them either.
@@ -1053,12 +1140,18 @@ sweep them either.
 - The host sync on `DESKTOP-Q43QKQF` in step 3 and the `SaveMember` write in step 7
   each require their own prior current-turn owner approval. Neither implies the other,
   and a prior-turn approval is never reusable for either.
-- The step-3 host sync, the step-4 VM deployment, the step-5 preflight surface (selected
-  private form/decision-row access, the reviewer-decision and approval-ledger operation,
-  the immutable package build, the AutoCount environment setup, the package transfer and
-  the no-write AutoCount preflight), and the step-7 `SaveMember` write are four
-  independent approval surfaces. Each requires its own current-turn owner approval, none
-  implies or covers another, and a prior-turn approval is never reusable for any of them.
+- Four baseline approval surfaces are always required: the step-3 host sync, the step-4
+  VM deployment, the step-5 preflight surface (selected private form/decision-row access,
+  the reviewer-decision and approval-ledger operation, the immutable package build, the
+  AutoCount environment setup, the package transfer and the no-write AutoCount preflight),
+  and the step-7 `SaveMember` write.
+- Further conditional approval surfaces arise wherever the procedure reaches them: every
+  operator-directed destructive cleanup or removal, each one scoped locally to its exact
+  target and its exact delete or remove operation; the step-9 live n8n result mapping;
+  and the step-10 conditional read-only AutoCount recovery lookup.
+- This runbook states no fixed total number of approval surfaces. Each surface named
+  above requires its own current-turn owner approval, none implies or covers another, and
+  a prior-turn approval is never reusable for any of them.
 - Exactly one member is supported; there is no batch path, no update-member path, no
   delete, and no rollback automation.
 - SaveMember is called at most once and is never automatically retried. An uncertain
