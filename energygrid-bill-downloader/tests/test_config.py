@@ -21,6 +21,7 @@ class ConfigTests(unittest.TestCase):
         return {
             "portal_url": "http://127.0.0.1:1",
             "archive_root": str(self.root / "archive"),
+            "account_identity": "SYNTHETIC-INTENDED-ACCOUNT",
             "state_path": str(self.root / "state" / "bills.sqlite3"),
             "temp_root": str(self.root / "temp"),
             "log_root": str(self.root / "logs"),
@@ -110,6 +111,24 @@ class ConfigTests(unittest.TestCase):
         self.assertTrue(config.temp_root.is_dir())
         self.assertTrue(config.log_root.is_dir())
 
+
+    def test_account_identity_is_required_and_non_empty_string(self) -> None:
+        for value in (None, "", "   ", 123, ["SYNTHETIC-INTENDED-ACCOUNT"]):
+            raw = self.raw()
+            raw["account_identity"] = value
+            with self.subTest(value=value), self.assertRaises(ConfigError):
+                load_runtime_config(raw, checkout_root=Path.cwd())
+
+    def test_with_overrides_preserves_account_identity(self) -> None:
+        config = load_runtime_config(self.raw(), checkout_root=Path.cwd())
+        overridden = config.with_overrides({"timeout_seconds": 10})
+        self.assertEqual(overridden.account_identity, "SYNTHETIC-INTENDED-ACCOUNT")
+
+    def test_example_config_uses_only_synthetic_account_identity(self) -> None:
+        example = Path(__file__).parents[1] / "config" / "energygrid.example.json"
+        raw = json.loads(example.read_text(encoding="utf-8"))
+        self.assertEqual(raw["account_identity"], "REPLACE_WITH_PRIVATE_ACCOUNT_IDENTITY")
+        self.assertNotIn("C&W", raw["account_identity"])
 
 if __name__ == "__main__":
     unittest.main()

@@ -74,6 +74,12 @@ def _validate_url(value: str) -> str:
     return value
 
 
+def _validate_account_identity(value: Any) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ConfigError("account_identity must be a non-empty string")
+    return value
+
+
 @dataclass(frozen=True)
 class RuntimeConfig:
     portal_url: str
@@ -81,6 +87,7 @@ class RuntimeConfig:
     state_path: Path
     temp_root: Path
     log_root: Path
+    account_identity: str = ""
     timeout_seconds: int = 30
     max_attempts: int = 2
     inventory_safety_ceiling: int = 1000
@@ -100,6 +107,7 @@ class RuntimeConfig:
         return load_runtime_config(
             {
                 "portal_url": self.portal_url,
+                "account_identity": self.account_identity,
                 "archive_root": str(values.get("archive_root", self.archive_root)),
                 "state_path": str(values.get("state_path", self.state_path)),
                 "temp_root": str(values.get("temp_root", self.temp_root)),
@@ -135,6 +143,7 @@ def load_config_file(path: Path) -> dict[str, Any]:
 def load_runtime_config(raw: dict[str, Any], checkout_root: Path | None = None) -> RuntimeConfig:
     if not isinstance(raw, dict):
         raise ConfigError("config must be a JSON object")
+    account_identity = _validate_account_identity(raw.get("account_identity"))
     checkout = resolved(checkout_root) if checkout_root is not None else find_checkout_root()
     required = ("archive_root", "state_path", "temp_root", "log_root")
     for key in required:
@@ -171,6 +180,7 @@ def load_runtime_config(raw: dict[str, Any], checkout_root: Path | None = None) 
     )
     return RuntimeConfig(
         portal_url=_validate_url(raw.get("portal_url")),
+        account_identity=account_identity,
         archive_root=archive_root,
         state_path=state_path,
         temp_root=temp_root,

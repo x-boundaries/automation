@@ -30,6 +30,9 @@ only; it is not a live configuration and contains no credential values.
 - Runtime-only `ENERGYGRID_USERNAME` and `ENERGYGRID_PASSWORD` environment
   values supplied by a later approved host mechanism. Values must not be stored
   in this repository, in the config JSON, in CLI arguments, or in logs.
+- `account_identity` set in the private JSON to the exact intended tenant/account
+  identity. It is required operational data, not a credential, and must not be
+  passed on the CLI or written to logs.
 
 The repository implementation does not provision a password manager profile,
 browser profile, cookies, storage state, or scheduler credentials.

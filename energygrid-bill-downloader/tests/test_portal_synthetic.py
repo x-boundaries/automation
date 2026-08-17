@@ -32,6 +32,7 @@ class SyntheticPortalTests(unittest.TestCase):
         raw = {
             "portal_url": server.base_url,
             "archive_root": str(root / "archive"),
+            "account_identity": "SYNTHETIC-INTENDED-ACCOUNT",
             "state_path": str(root / "state" / "state.sqlite3"),
             "temp_root": str(root / "temp"),
             "log_root": str(root / "logs"),
@@ -211,6 +212,156 @@ class SyntheticPortalTests(unittest.TestCase):
                 second = main(["run", "--config", str(config_path)])
                 self.assertEqual(second, 0)
                 self.assertTrue((root / "archive" / bill.filename).exists())
+            finally:
+                self.restore_credentials(old)
+
+    def test_stable_url_client_side_pagination_restores_later_page_download(self) -> None:
+        bills = [
+            SyntheticBill("2026-05-01_SYNTHETIC-A.pdf"),
+            SyntheticBill("2026-06-01_SYNTHETIC-B.pdf"),
+            SyntheticBill("2026-07-01_SYNTHETIC-C.pdf"),
+        ]
+        with tempfile.TemporaryDirectory() as directory, SyntheticPortalServer(
+            bills, page_size=2, client_side_pagination=True
+        ) as server:
+            root = Path(directory)
+            config = self.config_for(server, root)
+            old, _values = self.with_credentials()
+            try:
+                with PlaywrightPortal(config) as portal:
+                    portal.login()
+                    inventory = portal.inventory(20)
+                    self.assertEqual([bill.filename for bill in inventory], [bill.filename for bill in bills])
+                    self.assertEqual(len({bill.page_url for bill in inventory}), 1)
+                    target = root / "later-page.bin"
+                    suggested = portal.download(inventory[-1], target)
+                    self.assertEqual(suggested, bills[-1].filename)
+                    self.assertEqual(target.read_bytes(), bills[-1].payload)
+            finally:
+                self.restore_credentials(old)
+
+    def test_url_addressable_later_page_download_remains_supported(self) -> None:
+        bills = [
+            SyntheticBill("2026-08-01_SYNTHETIC-A.pdf"),
+            SyntheticBill("2026-08-02_SYNTHETIC-B.pdf"),
+            SyntheticBill("2026-08-03_SYNTHETIC-C.pdf"),
+        ]
+        with tempfile.TemporaryDirectory() as directory, SyntheticPortalServer(bills, page_size=2) as server:
+            root = Path(directory)
+            config = self.config_for(server, root)
+            old, _values = self.with_credentials()
+            try:
+                with PlaywrightPortal(config) as portal:
+                    portal.login()
+                    inventory = portal.inventory(20)
+                    self.assertIn("page=2", inventory[-1].page_url)
+                    target = root / "url-page.bin"
+                    self.assertEqual(portal.download(inventory[-1], target), bills[-1].filename)
+            finally:
+                self.restore_credentials(old)
+
+    def test_wrong_default_account_is_not_authoritative(self) -> None:
+        default = "SYNTHETIC-DEFAULT-ACCOUNT"
+        intended = "SYNTHETIC-INTENDED-ACCOUNT"
+        wrong = SyntheticBill("2026-09-01_SYNTHETIC-WRONG.pdf")
+        right = SyntheticBill("2026-09-02_SYNTHETIC-RIGHT.pdf")
+        with tempfile.TemporaryDirectory() as directory, SyntheticPortalServer(
+            [wrong],
+            account_options=[default, intended],
+            default_account=default,
+            account_bills={default: [wrong], intended: [right]},
+        ) as server:
+            root = Path(directory)
+            config = self.config_for(server, root)
+            old, _values = self.with_credentials()
+            try:
+                with PlaywrightPortal(config) as portal:
+                    portal.login()
+                    inventory = portal.inventory(20)
+                    self.assertEqual([bill.filename for bill in inventory], [right.filename])
+                    target = root / "intended.bin"
+                    portal.download(inventory[0], target)
+                    self.assertEqual(server.download_counts.get(wrong.filename, 0), 0)
+                    self.assertEqual(target.read_bytes(), right.payload)
+            finally:
+                self.restore_credentials(old)
+
+    def test_intended_account_absent_fails_closed(self) -> None:
+        default = "SYNTHETIC-DEFAULT-ACCOUNT"
+        with tempfile.TemporaryDirectory() as directory, SyntheticPortalServer(
+            [SyntheticBill("2026-09-03_SYNTHETIC-WRONG.pdf")],
+            account_options=[default],
+            default_account=default,
+        ) as server:
+            root = Path(directory)
+            config = self.config_for(server, root)
+            old, _values = self.with_credentials()
+            try:
+                with PlaywrightPortal(config) as portal:
+                    portal.login()
+                    with self.assertRaises(LayoutChangedError):
+                        portal.inventory(20)
+            finally:
+                self.restore_credentials(old)
+
+    def test_ambiguous_intended_account_fails_closed(self) -> None:
+        intended = "SYNTHETIC-INTENDED-ACCOUNT"
+        with tempfile.TemporaryDirectory() as directory, SyntheticPortalServer(
+            [SyntheticBill("2026-09-04_SYNTHETIC-AMBIGUOUS.pdf")],
+            account_options=[intended, intended],
+            default_account=intended,
+        ) as server:
+            root = Path(directory)
+            config = self.config_for(server, root)
+            old, _values = self.with_credentials()
+            try:
+                with PlaywrightPortal(config) as portal:
+                    portal.login()
+                    with self.assertRaises(LayoutChangedError):
+                        portal.inventory(20)
+            finally:
+                self.restore_credentials(old)
+
+    def test_selected_displayed_account_mismatch_fails_closed(self) -> None:
+        bill = SyntheticBill("2026-09-05_SYNTHETIC-MISMATCH.pdf")
+        with tempfile.TemporaryDirectory() as directory, SyntheticPortalServer(
+            [bill], variant="account_mismatch"
+        ) as server:
+            root = Path(directory)
+            config = self.config_for(server, root)
+            old, _values = self.with_credentials()
+            try:
+                with PlaywrightPortal(config) as portal:
+                    portal.login()
+                    with self.assertRaises(LayoutChangedError):
+                        portal.inventory(20)
+            finally:
+                self.restore_credentials(old)
+
+    def test_pre_search_blank_state_requires_explicit_search(self) -> None:
+        bill = SyntheticBill("2026-09-06_SYNTHETIC-PRESEARCH.pdf")
+        with tempfile.TemporaryDirectory() as directory, SyntheticPortalServer([bill]) as server:
+            root = Path(directory)
+            config = self.config_for(server, root)
+            old, _values = self.with_credentials()
+            try:
+                with PlaywrightPortal(config) as portal:
+                    portal.login()
+                    inventory = portal.inventory(20)
+                    self.assertEqual([item.filename for item in inventory], [bill.filename])
+            finally:
+                self.restore_credentials(old)
+
+    def test_verified_post_search_empty_state_is_authoritative(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, SyntheticPortalServer([]) as server:
+            root = Path(directory)
+            config = self.config_for(server, root)
+            old, _values = self.with_credentials()
+            try:
+                with PlaywrightPortal(config) as portal:
+                    portal.login()
+                    self.assertEqual(portal.inventory(20), [])
+                    self.assertEqual(server.search_count, 1)
             finally:
                 self.restore_credentials(old)
 

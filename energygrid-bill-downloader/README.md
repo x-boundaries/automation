@@ -24,8 +24,11 @@ Copy `config/energygrid.example.json` to a private path outside the checkout.
 The final PDF archive may be outside the checkout or under the checkout-relative
 private root `_MandarinGallery\`. SQLite state, temporary downloads, logs, and
 browser cache must be absolute paths outside the checkout and must not overlap.
-The archive and temp root must be on the same local Windows volume. The archive
-directory must exist before a run; the program creates only private runtime parents.
+The archive and temp root must be on the same local Windows volume. The archive directory must exist before a run; the program creates only private runtime parents.
+Set `account_identity` in the private JSON to the exact intended tenant/account
+identity. It is operational configuration, not a credential: it is required,
+is not a CLI option, is never written to logs, and must remain outside this
+repository. The committed example contains only a replace-me placeholder.
 
 Inject `ENERGYGRID_USERNAME` and `ENERGYGRID_PASSWORD` only at runtime through
 an approved host mechanism. They are never accepted as CLI arguments, stored in
