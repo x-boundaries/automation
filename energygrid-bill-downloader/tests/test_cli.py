@@ -40,6 +40,42 @@ class CliTests(unittest.TestCase):
         workflow = (Path(__file__).parents[2] / ".github" / "workflows" / "energygrid-bill-downloader-tests.yml").read_text(
             encoding="utf-8"
         )
+        lines = workflow.splitlines()
+
+        def indentation(line: str) -> int:
+            return len(line) - len(line.lstrip(" "))
+
+        def block_for(source: list[str], marker: str, line_indent: int) -> list[str]:
+            start = next(
+                index for index, line in enumerate(source)
+                if indentation(line) == line_indent and line.strip() == marker
+            )
+            end = next(
+                (
+                    index
+                    for index in range(start + 1, len(source))
+                    if source[index].strip() and indentation(source[index]) <= line_indent
+                ),
+                len(source),
+            )
+            return source[start:end]
+
+        job_lines = block_for(lines, "synthetic-windows:", 2)
+        job_level_env = (
+            block_for(job_lines, "env:", 4)
+            if any(indentation(line) == 4 and line.strip() == "env:" for line in job_lines)
+            else []
+        )
+        self.assertNotIn("runner.temp", "\n".join(job_level_env))
+
+        browser_path = "PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/energygrid-playwright"
+        expected_env = ["        env:", f"          {browser_path}"]
+        for step_name in (
+            "Provision Chromium with official Playwright mechanism",
+            "Project synthetic test suite",
+        ):
+            step = block_for(job_lines, f"- name: {step_name}", 6)
+            self.assertEqual(block_for(step, "env:", 8), expected_env)
         self.assertIn("ref: ${{ github.event.pull_request.head.sha || github.sha }}", workflow)
         self.assertIn("EXPECTED_SHA", workflow)
         self.assertIn("$base = (git merge-base HEAD origin/main).Trim()", workflow)
