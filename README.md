@@ -4,6 +4,8 @@ This repository is for AutoCount 2 automation work only: local extraction script
 
 Task tracking, pending-work dashboards, completed-task logs, and personal planning notes are intentionally kept outside this repo.
 
+The isolated Energy@Grid utility surface is documented in [energygrid-bill-downloader/](energygrid-bill-downloader/README.md) and does not change the AutoCount integration surfaces above.
+
 ## Current Automation Surfaces
 
 - `scripts/autocount_sql_probe.py`: read-only SQL metadata probe for discovering AutoCount database objects, columns, role memberships, and risky permissions.
