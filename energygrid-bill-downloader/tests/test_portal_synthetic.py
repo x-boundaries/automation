@@ -178,6 +178,25 @@ class SyntheticPortalTests(unittest.TestCase):
             finally:
                 self.restore_credentials(old)
 
+    def test_browser_suggested_filename_mismatch_fails_closed(self) -> None:
+        bill = SyntheticBill(
+            "2026-05-18_account_identity.pdf",
+            suggested_filename="2026-05-18_other_identity.pdf",
+        )
+        with tempfile.TemporaryDirectory() as directory, SyntheticPortalServer([bill]) as server:
+            root = Path(directory)
+            (root / "archive").mkdir()
+            config_path = root / "config.json"
+            write_config(config_path, server, root)
+            old, _values = self.with_credentials()
+            try:
+                result = main(["run", "--config", str(config_path)])
+                self.assertEqual(result, 20)
+                self.assertFalse((root / "archive" / bill.filename).exists())
+                self.assertEqual(server.download_counts[bill.filename], 1)
+            finally:
+                self.restore_credentials(old)
+
     def test_cli_run_logs_in_and_reconciles_synthetic_bill(self) -> None:
         bill = SyntheticBill("2026-05-09_account_ref.pdf")
         with tempfile.TemporaryDirectory() as directory, SyntheticPortalServer([bill]) as server:

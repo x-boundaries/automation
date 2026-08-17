@@ -6,9 +6,9 @@ import unittest
 import uuid
 
 from energygrid_bill_downloader.config import RuntimeConfig
-from energygrid_bill_downloader.errors import DownloadError, AppError
+from energygrid_bill_downloader.errors import AppError, DownloadError, StateError
 from energygrid_bill_downloader.portal import BillRef
-from energygrid_bill_downloader.publication import filename_key, validate_pdf
+from energygrid_bill_downloader.publication import FileInfo, filename_key, validate_pdf
 from energygrid_bill_downloader.reconcile import reconcile_inventory
 from energygrid_bill_downloader.state import StateStore
 from tests.fixtures.synthetic_portal import SyntheticBill, synthetic_pdf
@@ -23,9 +23,12 @@ class RecordingLogger:
 
 
 class FakePortal:
-    def __init__(self, bills: list[SyntheticBill], failure_mode: str | None = None) -> None:
+    def __init__(
+        self, bills: list[SyntheticBill], failure_mode: str | None = None, payload_overrides: dict[str, bytes] | None = None
+    ) -> None:
         self.bills = bills
         self.failure_mode = failure_mode
+        self.payload_overrides = payload_overrides or {}
         self.download_calls = 0
 
     def inventory(self, safety_ceiling: int) -> list[BillRef]:
@@ -41,8 +44,27 @@ class FakePortal:
             destination.write_bytes(synthetic_pdf())
             return "other.pdf"
         matching = next(item for item in self.bills if item.filename == bill.filename)
-        destination.write_bytes(matching.payload)
+        destination.write_bytes(self.payload_overrides.get(bill.filename, matching.payload))
         return matching.filename
+
+
+class FailingArchiveCommitState(StateStore):
+    def __init__(self, path: Path) -> None:
+        super().__init__(path)
+        self.fail_next_archive_commit = True
+
+    def record_archived(
+        self,
+        filename_key: str,
+        portal_filename: str,
+        info: FileInfo,
+        completion_source: str = "downloaded",
+        now: str | None = None,
+    ) -> None:
+        if self.fail_next_archive_commit and completion_source == "downloaded":
+            self.fail_next_archive_commit = False
+            raise StateError("synthetic archive-state commit failure")
+        super().record_archived(filename_key, portal_filename, info, completion_source, now)
 
 
 class ReconcileTests(unittest.TestCase):
@@ -65,9 +87,9 @@ class ReconcileTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
 
-    def run_once(self, portal: FakePortal, *, list_only: bool = False):
+    def run_once(self, portal: FakePortal, *, list_only: bool = False, state_factory: type[StateStore] = StateStore):
         logger = RecordingLogger()
-        with StateStore(self.config.state_path) as state:
+        with state_factory(self.config.state_path) as state:
             summary = reconcile_inventory(
                 self.config,
                 portal,
@@ -89,6 +111,109 @@ class ReconcileTests(unittest.TestCase):
         self.assertEqual(second.status, "ALREADY_PRESENT")
         self.assertEqual(second.present_count, 1)
         self.assertEqual(second_portal.download_calls, 0)
+    def test_multiple_new_bills_archive_all_and_record_all(self) -> None:
+        bills = [
+            SyntheticBill("2026-05-11_account_a.pdf"),
+            SyntheticBill("2026-05-12_account_b.pdf"),
+        ]
+        summary, _ = self.run_once(FakePortal(bills))
+        self.assertEqual(summary.status, "DOWNLOADED")
+        self.assertEqual(summary.exit_code, 0)
+        self.assertEqual(summary.downloaded_count, len(bills))
+        self.assertEqual(summary.failure_count, 0)
+        with StateStore(self.config.state_path) as state:
+            records = {record.filename_key: record for record in state.records()}
+        self.assertEqual(len(records), len(bills))
+        for bill in bills:
+            self.assertTrue((self.archive / bill.filename).exists())
+            self.assertEqual(records[filename_key(bill.filename)].status, "ARCHIVED")
+
+    def test_suggested_filename_identity_mismatch_fails_closed(self) -> None:
+        bill = SyntheticBill("2026-05-13_account_ref.pdf")
+        portal = FakePortal([bill], failure_mode="wrong-name")
+        summary, _ = self.run_once(portal)
+        self.assertEqual(summary.status, "PORTAL_LAYOUT_CHANGED")
+        self.assertEqual(summary.exit_code, 20)
+        self.assertFalse((self.archive / bill.filename).exists())
+
+    def test_publication_state_commit_failure_preserves_final_for_next_run(self) -> None:
+        bill = SyntheticBill("2026-05-14_account_ref.pdf")
+        first, _ = self.run_once(FakePortal([bill]), state_factory=FailingArchiveCommitState)
+        final = self.archive / bill.filename
+        self.assertEqual(first.status, "STATE_INCONSISTENT")
+        self.assertEqual(first.exit_code, 20)
+        self.assertTrue(final.exists())
+        original_info = validate_pdf(final)
+
+        second_portal = FakePortal([bill])
+        second, _ = self.run_once(second_portal)
+        self.assertEqual(second.status, "ALREADY_PRESENT")
+        self.assertEqual(second_portal.download_calls, 0)
+        self.assertEqual(validate_pdf(final), original_info)
+        with StateStore(self.config.state_path) as state:
+            record = state.get(filename_key(bill.filename))
+            self.assertIsNotNone(record)
+            assert record is not None
+            self.assertEqual(record.status, "PRESENT_RECONCILED")
+
+    def test_retained_conflict_does_not_block_later_invoice(self) -> None:
+        first_bill = SyntheticBill("2026-05-15_account_conflict.pdf")
+        second_bill = SyntheticBill("2026-05-16_account_new.pdf")
+        first_final = self.archive / first_bill.filename
+        first_final.write_bytes(first_bill.payload)
+        with StateStore(self.config.state_path) as state:
+            state.mark_seen(filename_key(first_bill.filename), first_bill.filename)
+            state.record_archived(filename_key(first_bill.filename), first_bill.filename, validate_pdf(first_final))
+        first_final.unlink()
+        unrelated = self.config.temp_root / "unrelated-artifact"
+        unrelated.mkdir()
+        marker = unrelated / "keep.txt"
+        marker.write_text("synthetic", encoding="utf-8")
+
+        portal = FakePortal(
+            [first_bill, second_bill],
+            payload_overrides={first_bill.filename: synthetic_pdf(b"changed-first-invoice")},
+        )
+        summary, _ = self.run_once(portal)
+        self.assertEqual(summary.status, "ARCHIVE_CONFLICT")
+        self.assertEqual(summary.exit_code, 20)
+        self.assertEqual(summary.downloaded_count, 1)
+        self.assertEqual(summary.failure_count, 1)
+        self.assertFalse(first_final.exists())
+        self.assertTrue((self.archive / second_bill.filename).exists())
+        self.assertEqual(marker.read_text(encoding="utf-8"), "synthetic")
+        retained = [path for path in self.config.temp_root.iterdir() if path.name.startswith("run-")]
+        self.assertEqual(len(retained), 1)
+        self.assertRegex(retained[0].name, r"^run-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+        with StateStore(self.config.state_path) as state:
+            first_record = state.get(filename_key(first_bill.filename))
+            second_record = state.get(filename_key(second_bill.filename))
+        self.assertIsNotNone(first_record)
+        self.assertIsNotNone(second_record)
+        assert first_record is not None and second_record is not None
+        self.assertEqual(first_record.status, "CONFLICT")
+        self.assertEqual(second_record.status, "ARCHIVED")
+
+    def test_archived_state_missing_final_redownload_hash_mismatch_is_conflict(self) -> None:
+        bill = SyntheticBill("2026-05-17_account_repair.pdf")
+        final = self.archive / bill.filename
+        final.write_bytes(bill.payload)
+        with StateStore(self.config.state_path) as state:
+            state.mark_seen(filename_key(bill.filename), bill.filename)
+            state.record_archived(filename_key(bill.filename), bill.filename, validate_pdf(final))
+        final.unlink()
+        portal = FakePortal([bill], payload_overrides={bill.filename: synthetic_pdf(b"different-repair")})
+        summary, _ = self.run_once(portal)
+        self.assertEqual(summary.status, "ARCHIVE_CONFLICT")
+        self.assertEqual(summary.exit_code, 20)
+        self.assertFalse(final.exists())
+        self.assertEqual(len(list(self.config.temp_root.glob("run-*"))), 1)
+        with StateStore(self.config.state_path) as state:
+            record = state.get(filename_key(bill.filename))
+            self.assertIsNotNone(record)
+            assert record is not None
+            self.assertEqual(record.status, "CONFLICT")
+
 
     def test_existing_file_without_state_is_reconciled(self) -> None:
         bill = SyntheticBill("2026-05-02_account_ref.pdf")

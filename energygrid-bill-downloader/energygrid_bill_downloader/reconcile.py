@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
+import uuid
 
 from .config import RuntimeConfig
 from .errors import (
@@ -182,7 +183,8 @@ def _download_and_publish(
     run_id: str,
     expected_hash: str | None,
 ) -> str:
-    run_dir = create_run_directory(config.temp_root, run_id)
+    operation_id = str(uuid.uuid4())
+    run_dir = create_run_directory(config.temp_root, operation_id)
     temp_path = run_dir / "download.bin"
     keep_temp = False
     try:

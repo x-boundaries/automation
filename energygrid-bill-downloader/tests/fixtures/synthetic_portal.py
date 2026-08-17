@@ -34,6 +34,7 @@ class SyntheticBill:
     filename: str
     payload: bytes = field(default_factory=synthetic_pdf)
     mode: str = "success"
+    suggested_filename: str | None = None
 
 
 class SyntheticPortalServer:
@@ -220,30 +221,31 @@ class SyntheticPortalServer:
                         self._send(b"not found", status=HTTPStatus.NOT_FOUND, content_type="text/plain")
                         return
                     fixture.download_counts[bill.filename] = fixture.download_counts.get(bill.filename, 0) + 1
+                    download_name = bill.suggested_filename or bill.filename
                     if bill.mode == "error":
                         self._send(b"temporary download failure", status=HTTPStatus.INTERNAL_SERVER_ERROR, content_type="text/plain")
                     elif bill.mode == "html":
                         self._send(
                             b"<html>not a bill</html>",
-                            headers={"Content-Disposition": f'attachment; filename="{bill.filename}"'},
+                            headers={"Content-Disposition": f'attachment; filename="{download_name}"'},
                         )
                     elif bill.mode == "zero":
                         self._send(
                             b"",
                             content_type="application/pdf",
-                            headers={"Content-Disposition": f'attachment; filename="{bill.filename}"'},
+                            headers={"Content-Disposition": f'attachment; filename="{download_name}"'},
                         )
                     elif bill.mode == "truncated":
                         self._send(
                             b"%PDF-1.7\ntruncated",
                             content_type="application/pdf",
-                            headers={"Content-Disposition": f'attachment; filename="{bill.filename}"'},
+                            headers={"Content-Disposition": f'attachment; filename="{download_name}"'},
                         )
                     else:
                         self._send(
                             bill.payload,
                             content_type="application/pdf",
-                            headers={"Content-Disposition": f'attachment; filename="{bill.filename}"'},
+                            headers={"Content-Disposition": f'attachment; filename="{download_name}"'},
                         )
                     return
                 self._send(b"not found", status=HTTPStatus.NOT_FOUND, content_type="text/plain")

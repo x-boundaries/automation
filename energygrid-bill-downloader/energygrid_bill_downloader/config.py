@@ -52,6 +52,19 @@ def require_external(path: Path, checkout_root: Path | None, label: str) -> Path
     return value
 
 
+def require_archive_location(path: Path, checkout_root: Path | None) -> Path:
+    if not path.is_absolute():
+        raise ConfigError("archive_root must be an absolute path")
+    value = resolved(path)
+    if checkout_root is not None and is_within(value, checkout_root):
+        private_archive_root = resolved(checkout_root / "_MandarinGallery")
+        if not is_within(value, private_archive_root):
+            raise ConfigError(
+                "archive_root must resolve outside the Git checkout or beneath the checkout-private _MandarinGallery root"
+            )
+    return value
+
+
 def _validate_url(value: str) -> str:
     if not isinstance(value, str) or not value:
         raise ConfigError("portal_url must be a non-empty string")
@@ -127,7 +140,7 @@ def load_runtime_config(raw: dict[str, Any], checkout_root: Path | None = None) 
     for key in required:
         if not isinstance(raw.get(key), str) or not raw[key]:
             raise ConfigError(f"{key} must be a non-empty absolute path")
-    archive_root = require_external(Path(raw["archive_root"]), checkout, "archive_root")
+    archive_root = require_archive_location(Path(raw["archive_root"]), checkout)
     state_path = require_external(Path(raw["state_path"]), checkout, "state_path")
     temp_root = require_external(Path(raw["temp_root"]), checkout, "temp_root")
     log_root = require_external(Path(raw["log_root"]), checkout, "log_root")

@@ -88,15 +88,21 @@ def validate_pdf(path: Path) -> FileInfo:
         raise InvalidPdfError("download could not be read") from exc
 
 
-def ensure_same_volume(source: Path, destination: Path) -> None:
+def volume_identity(path: Path) -> tuple[int, str]:
     try:
-        source_device = os.stat(source).st_dev
-        destination_device = os.stat(destination.parent).st_dev
+        device = os.stat(path).st_dev
     except OSError as exc:
         raise ConfigError("publication volume could not be inspected") from exc
+    drive = os.path.splitdrive(str(path))[0].casefold()
+    return device, drive
+
+
+def ensure_same_volume(source: Path, destination: Path) -> None:
+    source_device, source_drive = volume_identity(source)
+    destination_device, destination_drive = volume_identity(destination.parent)
     if source_device != destination_device:
         raise ConfigError("cross-volume publication is forbidden")
-    if os.name == "nt" and os.path.splitdrive(str(source))[0].casefold() != os.path.splitdrive(str(destination))[0].casefold():
+    if os.name == "nt" and source_drive != destination_drive:
         raise ConfigError("source and destination drives differ")
 
 

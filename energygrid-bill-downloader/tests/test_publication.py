@@ -6,6 +6,8 @@ import tempfile
 import time
 import unittest
 import uuid
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 from energygrid_bill_downloader.errors import ArchiveConflictError, ConfigError, InvalidPdfError
 from energygrid_bill_downloader.publication import (
@@ -82,6 +84,39 @@ class PublicationTests(unittest.TestCase):
         self.assertEqual(cleanup_stale_owned_temp(self.temp, older_than_seconds=0), 1)
         self.assertFalse(stale.exists())
 
+
+    def test_cross_volume_identity_rejects_before_move(self) -> None:
+        source = self.temp / "cross-volume.bin"
+        destination = self.archive / "cross-volume.pdf"
+        source.write_bytes(synthetic_pdf())
+        with patch(
+            "energygrid_bill_downloader.publication.volume_identity",
+            side_effect=[(101, "c:"), (202, "c:")],
+        ), patch("energygrid_bill_downloader.publication.ctypes.WinDLL") as win_dll:
+            with self.assertRaises(ConfigError):
+                publish_no_replace(source, destination)
+        win_dll.assert_not_called()
+        self.assertTrue(source.exists())
+        self.assertFalse(destination.exists())
+
+    def test_destination_appearing_during_move_is_archive_conflict(self) -> None:
+        source = self.temp / "race.bin"
+        destination = self.archive / "race.pdf"
+        source.write_bytes(synthetic_pdf())
+
+        def appear_during_move(_source: str, destination_name: str, flags: int) -> int:
+            self.assertEqual(flags, 0x00000008)
+            Path(destination_name).write_bytes(b"preexisting-race-object")
+            return 0
+
+        move_file_ex = Mock(side_effect=appear_during_move)
+        fake_kernel32 = SimpleNamespace(MoveFileExW=move_file_ex)
+        with patch("energygrid_bill_downloader.publication.ctypes.WinDLL", return_value=fake_kernel32):
+            with self.assertRaises(ArchiveConflictError):
+                publish_no_replace(source, destination)
+        move_file_ex.assert_called_once()
+        self.assertEqual(destination.read_bytes(), b"preexisting-race-object")
+        self.assertTrue(source.exists())
 
 
 if __name__ == "__main__":

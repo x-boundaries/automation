@@ -9,10 +9,11 @@ normal path.
 ## Repository and private runtime boundary
 
 The checkout contains code, synthetic fixtures, tests, documentation, and example
-configuration only. Bills, SQLite state, temporary downloads, logs, and the
-Playwright browser cache must be outside the Git checkout and on the same local
-Windows volume as the archive. The program rejects configured paths that resolve
-inside the checkout or overlap one another.
+configuration only. The final PDF archive may be outside the Git checkout or
+under the checkout-relative private root `_MandarinGallery\`. SQLite state,
+temporary downloads, logs, and the Playwright browser cache must be outside the
+Git checkout and on the same local Windows volume as the archive. The program
+rejects arbitrary in-checkout archive/runtime paths and overlapping paths.
 
 The eventual archive target is an owner-controlled path such as
 `C:\XB\_MandarinGallery\Utilities\EnergyGrid`. The example config is a shape
@@ -67,8 +68,9 @@ headers, tokens, PDF contents, or exact private filenames.
 Before unattended scheduling, the owner must separately approve and perform the
 following sequence:
 
-1. Validate the private directories and browser provisioning on the Windows
-   host without placing them inside the checkout.
+1. Validate the private directories and browser provisioning on the Windows host;
+   only the checkout-relative `_MandarinGallery\` archive exception is allowed,
+   while state, temp, logs, and browser cache remain outside the checkout.
 2. Inject runtime credentials through the approved host mechanism.
 3. Run a headed `list` only, inspect the aggregate result, and confirm the login,
    Billing Manager, EB Bill, invoice-list, filename, download-button, and

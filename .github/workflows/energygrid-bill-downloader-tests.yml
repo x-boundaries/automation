@@ -14,6 +14,8 @@ permissions:
 jobs:
   synthetic-windows:
     runs-on: windows-latest
+    env:
+      PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/energygrid-playwright
     steps:
       - uses: actions/checkout@v4
         with:
@@ -54,8 +56,8 @@ jobs:
       - name: Scope and whitespace check
         shell: pwsh
         run: |
-          git diff --check
           $base = (git merge-base HEAD origin/main).Trim()
+          git diff --check $base HEAD
           $files = @(git diff --name-only $base HEAD)
           foreach ($file in $files) {
             if ($file -notmatch '^energygrid-bill-downloader/' -and

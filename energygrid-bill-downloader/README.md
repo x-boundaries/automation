@@ -21,10 +21,11 @@ python -m playwright install chromium
 ```
 
 Copy `config/energygrid.example.json` to a private path outside the checkout.
-The archive, SQLite state, temporary downloads, logs, and browser cache must be
-absolute paths outside the checkout and must not overlap. The archive and temp
-root must be on the same local Windows volume. The archive directory must exist
-before a run; the program creates only its private state/temp/log parents.
+The final PDF archive may be outside the checkout or under the checkout-relative
+private root `_MandarinGallery\`. SQLite state, temporary downloads, logs, and
+browser cache must be absolute paths outside the checkout and must not overlap.
+The archive and temp root must be on the same local Windows volume. The archive
+directory must exist before a run; the program creates only private runtime parents.
 
 Inject `ENERGYGRID_USERNAME` and `ENERGYGRID_PASSWORD` only at runtime through
 an approved host mechanism. They are never accepted as CLI arguments, stored in

@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import tempfile
 import unittest
 
-from energygrid_bill_downloader.config import load_runtime_config
+from energygrid_bill_downloader.config import is_within, load_runtime_config
 from energygrid_bill_downloader.errors import ConfigError
 
 
@@ -56,6 +57,48 @@ class ConfigTests(unittest.TestCase):
         raw["timeout_seconds"] = 0
         with self.assertRaises(ConfigError):
             load_runtime_config(raw, checkout_root=Path.cwd())
+    def test_checkout_private_archive_exception_is_narrow_and_portable(self) -> None:
+        checkout = self.root / "synthetic-checkout"
+        raw = self.raw()
+        private_archive = checkout / "_MandarinGallery" / "Utilities" / "EnergyGrid"
+        raw["archive_root"] = str(private_archive)
+        config = load_runtime_config(raw, checkout_root=checkout)
+        self.assertEqual(config.archive_root, private_archive.resolve())
+
+        raw = self.raw()
+        raw["archive_root"] = str(checkout / "other-private-root")
+        with self.assertRaises(ConfigError):
+            load_runtime_config(raw, checkout_root=checkout)
+
+        for key in ("state_path", "temp_root", "log_root"):
+            raw = self.raw()
+            raw[key] = str(checkout / "_MandarinGallery" / key)
+            with self.assertRaises(ConfigError, msg=key):
+                load_runtime_config(raw, checkout_root=checkout)
+
+        raw = self.raw()
+        raw["browser_cache_path"] = str(checkout / "_MandarinGallery" / "browser")
+        with self.assertRaises(ConfigError):
+            load_runtime_config(raw, checkout_root=checkout)
+
+    def test_example_config_keeps_archive_exception_separate_from_runtime(self) -> None:
+        example = Path(__file__).parents[1] / "config" / "energygrid.example.json"
+        raw = json.loads(example.read_text(encoding="utf-8"))
+        checkout = self.root / "portable-checkout"
+        raw["archive_root"] = str(checkout / "_MandarinGallery" / "Utilities" / "EnergyGrid")
+        for key, value in {
+            "state_path": self.root / "runtime-state" / "state.sqlite3",
+            "temp_root": self.root / "runtime-temp",
+            "log_root": self.root / "runtime-logs",
+            "browser_cache_path": self.root / "runtime-browser" / "ms-playwright",
+        }.items():
+            raw[key] = str(value)
+        config = load_runtime_config(raw, checkout_root=checkout)
+        self.assertTrue(is_within(config.archive_root, checkout / "_MandarinGallery"))
+        for path in (config.state_path, config.temp_root, config.log_root, config.browser_cache_path):
+            assert path is not None
+            self.assertFalse(is_within(path, checkout))
+
 
     def test_preflight_creates_only_runtime_parents_and_requires_archive(self) -> None:
         config = load_runtime_config(self.raw(), checkout_root=Path.cwd())

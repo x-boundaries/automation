@@ -17,6 +17,9 @@ __pycache__/
 .pytest_cache/
 .env.*
 
+# Private Energy@Grid archive under the production checkout; runtime paths stay external.
+/_MandarinGallery/
+
 # AutoCount SQL probe local outputs/config
 AutoCountSqlProbe/
 probe_outputs/
