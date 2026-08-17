@@ -6,6 +6,7 @@ on:
       - "energygrid-bill-downloader/**"
       - ".github/workflows/energygrid-bill-downloader-tests.yml"
       - "README.md"
+      - ".gitignore"
   workflow_dispatch: {}
 
 permissions:
@@ -64,7 +65,8 @@ jobs:
           foreach ($file in $files) {
             if ($file -notmatch '^energygrid-bill-downloader/' -and
                 $file -ne '.github/workflows/energygrid-bill-downloader-tests.yml' -and
-                $file -ne 'README.md') {
+                $file -ne 'README.md' -and
+                $file -ne '.gitignore') {
               throw "Out-of-scope changed path: $file"
             }
           }

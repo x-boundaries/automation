@@ -61,6 +61,31 @@ class CliTests(unittest.TestCase):
             return source[start:end]
 
         job_lines = block_for(lines, "synthetic-windows:", 2)
+        pull_request = block_for(lines, "pull_request:", 2)
+        self.assertEqual(
+            block_for(pull_request, "paths:", 4),
+            [
+                "    paths:",
+                '      - "energygrid-bill-downloader/**"',
+                '      - ".github/workflows/energygrid-bill-downloader-tests.yml"',
+                '      - "README.md"',
+                '      - ".gitignore"',
+            ],
+        )
+
+        scope_guard = block_for(lines, "foreach ($file in $files) {", 10)
+        scope_text = "\n".join(scope_guard)
+        self.assertIn("$file -notmatch '^energygrid-bill-downloader/'", scope_text)
+        self.assertEqual(
+            [line.strip() for line in scope_guard if "$file -ne " in line],
+            [
+                "$file -ne '.github/workflows/energygrid-bill-downloader-tests.yml' -and",
+                "$file -ne 'README.md' -and",
+                "$file -ne '.gitignore') {",
+            ],
+        )
+        self.assertNotIn("$file -notmatch '.*'", scope_text)
+        self.assertNotIn("*.pdf", scope_text)
         job_level_env = (
             block_for(job_lines, "env:", 4)
             if any(indentation(line) == 4 and line.strip() == "env:" for line in job_lines)
