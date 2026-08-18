@@ -62,11 +62,19 @@ jobs:
           $base = (git merge-base HEAD origin/main).Trim()
           git diff --check $base HEAD
           $files = @(git diff --name-only $base HEAD)
-          foreach ($file in $files) {
-            if ($file -notmatch '^energygrid-bill-downloader/' -and
-                $file -ne '.github/workflows/energygrid-bill-downloader-tests.yml' -and
-                $file -ne 'README.md' -and
-                $file -ne '.gitignore') {
-              throw "Out-of-scope changed path: $file"
+          $owned = @($files | Where-Object {
+            $_ -match '^energygrid-bill-downloader/' -or
+            $_ -eq '.github/workflows/energygrid-bill-downloader-tests.yml'
+          })
+          if ($owned.Count -eq 0) {
+            Write-Host "No EnergyGrid-owned path changed; EnergyGrid scope guard not applicable."
+          } else {
+            foreach ($file in $files) {
+              if ($file -notmatch '^energygrid-bill-downloader/' -and
+                  $file -ne '.github/workflows/energygrid-bill-downloader-tests.yml' -and
+                  $file -ne 'README.md' -and
+                  $file -ne '.gitignore') {
+                throw "Out-of-scope changed path: $file"
+              }
             }
           }
