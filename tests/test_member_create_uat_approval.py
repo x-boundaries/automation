@@ -8681,5 +8681,781 @@ class LostRaceCleanupTests(_AdmissionHarness):
         )
 
 
+class VolatileFilesystemRefusalTests(unittest.TestCase):
+    """Closed-PR #113 finding PRRT_kwDOSbJI_s6UdzWR.
+
+    `tmpfs` and `ramfs` were in the supported POSIX allowlist for state that claims RESTART
+    durability. `fsync` there can return successfully while the whole filesystem disappears on
+    reboot, so a restart could erase activated decisions, build claims and reservations while a
+    package published to a persistent filesystem survived - defeating the documented restart-safe
+    single-use boundary.
+
+    Portable: the classifier seam is a pure function, so these controls do not depend on what the
+    host happens to have mounted, and they run identically on Windows and POSIX.
+    """
+
+    VOLATILE = ("tmpfs", "ramfs")
+
+    def test_the_volatile_class_is_named_and_is_exactly_the_two_memory_filesystems(self):
+        self.assertEqual(decisions.POSIX_VOLATILE_FILESYSTEMS, frozenset(self.VOLATILE))
+
+    def test_no_volatile_filesystem_remains_in_the_supported_allowlist(self):
+        self.assertEqual(
+            decisions.POSIX_SUPPORTED_FILESYSTEMS & decisions.POSIX_VOLATILE_FILESYSTEMS,
+            frozenset(),
+            "a memory-backed filesystem can never support the durability claim",
+        )
+        for name in self.VOLATILE:
+            with self.subTest(filesystem=name):
+                self.assertNotIn(name, decisions.POSIX_SUPPORTED_FILESYSTEMS)
+
+    def test_each_volatile_filesystem_refuses_with_the_existing_classification(self):
+        """The refusal reuses `store_parent_unsupported`; no new classification was invented."""
+        for name in self.VOLATILE:
+            with self.subTest(filesystem=name):
+                with mock.patch.object(decisions, "_posix_filesystem_type",
+                                       lambda path, _n=name: _n):
+                    with self.assertRaises(decisions.DecisionStoreError) as caught:
+                        decisions._require_supported_posix_filesystem("/synthetic/state")
+                self.assertEqual(caught.exception.reason, "store_parent_unsupported")
+
+    def test_case_and_whitespace_variants_of_the_volatile_names_also_refuse(self):
+        for name in ("TMPFS", "Tmpfs", "RamFS"):
+            with self.subTest(filesystem=name):
+                with mock.patch.object(decisions, "_posix_filesystem_type",
+                                       lambda path, _n=name: _n):
+                    with self.assertRaises(decisions.DecisionStoreError) as caught:
+                        decisions._require_supported_posix_filesystem("/synthetic/state")
+                self.assertEqual(caught.exception.reason, "store_parent_unsupported")
+
+    def test_every_currently_supported_persistent_filesystem_is_still_admitted(self):
+        """The narrow-change control: nothing else was removed from the allowlist."""
+        expected = {
+            "ext2", "ext3", "ext4", "ext4dev", "xfs", "btrfs", "zfs", "f2fs", "jfs",
+            "reiserfs", "bcachefs", "ubifs", "overlay", "overlayfs",
+        }
+        self.assertEqual(set(decisions.POSIX_SUPPORTED_FILESYSTEMS), expected)
+        for name in sorted(expected):
+            with self.subTest(filesystem=name):
+                with mock.patch.object(decisions, "_posix_filesystem_type",
+                                       lambda path, _n=name: _n):
+                    self.assertEqual(
+                        decisions._require_supported_posix_filesystem("/synthetic/state"), name
+                    )
+
+    def test_the_volatile_class_is_disjoint_from_the_named_remote_class(self):
+        self.assertEqual(
+            decisions.POSIX_VOLATILE_FILESYSTEMS & decisions.POSIX_KNOWN_REMOTE_FILESYSTEMS,
+            frozenset(),
+        )
+
+
+@unittest.skipIf(decisions.IS_WINDOWS, "POSIX platform boundary")
+class PosixVolatileFilesystemParentTests(_ParentAdmissionHarness):
+    """The same refusal at the real admission call site: nothing at all is created."""
+
+    def test_a_volatile_state_parent_creates_nothing_at_all(self):
+        for name in ("tmpfs", "ramfs"):
+            with self.subTest(filesystem=name):
+                with mock.patch.object(decisions, "_posix_filesystem_type",
+                                       lambda path, _n=name: _n):
+                    self._assert_nothing_created_at_all(
+                        lambda: decisions.create_store_exclusively(self._store_path()),
+                        "store_parent_unsupported",
+                    )
+
+
+class PrivatePackageTemporaryIgnoreTests(unittest.TestCase):
+    """Closed-PR #113 finding PRRT_kwDOSbJI_s6UdzWV.
+
+    `.mcuat_pkg_*.tmp` holds the COMPLETE package - member number, name, email and DOB - and a
+    crash or a failed cleanup deliberately leaves it in place. Outside the wholly-ignored
+    `autocount_outputs/` tree it was unignored, so an approved `--package-out` inside the
+    checkout exposed that private artifact to accidental staging.
+    """
+
+    PATTERNS = (".mcuat_pkg_*.tmp", "autocount_outputs/**/.mcuat_pkg_*.tmp")
+    GITIGNORE = ROOT / ".gitignore"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.text = cls.GITIGNORE.read_text(encoding="utf-8")
+
+    def _git(self, *args, stdin=None):
+        git = shutil.which("git")
+        if not git:
+            raise unittest.SkipTest("git is required to evaluate real ignore rules")
+        return subprocess.run([git, "-C", str(ROOT), *args], input=stdin,
+                              text=True, capture_output=True)
+
+    def test_the_narrow_patterns_are_declared(self):
+        for pattern in self.PATTERNS:
+            with self.subTest(pattern=pattern):
+                self.assertIn(pattern, self.text)
+
+    def test_no_broad_temporary_pattern_was_introduced(self):
+        lines = [line.strip() for line in self.text.splitlines()]
+        for broad in ("*.tmp", "**/*.tmp", "*.json", "*"):
+            self.assertNotIn(broad, lines,
+                             "the private-temporary rule must stay narrow")
+
+    def test_the_package_temporary_is_ignored_at_the_repository_root(self):
+        done = self._git("check-ignore", "-v", "--no-index", ".mcuat_pkg_abcd1234.tmp")
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertIn(".mcuat_pkg_*.tmp", done.stdout)
+
+    def test_the_package_temporary_is_ignored_in_nested_output_locations(self):
+        """An approved `--package-out` may legitimately sit in a subdirectory of the checkout."""
+        for rel in (
+            "scripts/.mcuat_pkg_abcd1234.tmp",
+            "docs/autocount2-automation/.mcuat_pkg_abcd1234.tmp",
+            "tests/nested/deeper/.mcuat_pkg_abcd1234.tmp",
+            "autocount_outputs/uat/.mcuat_pkg_abcd1234.tmp",
+        ):
+            with self.subTest(path=rel):
+                done = self._git("check-ignore", "-v", "--no-index", rel)
+                self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+
+    def test_an_unrelated_temporary_name_is_not_ignored_by_these_rules(self):
+        """Proof the rule is narrow: neighbouring temporary names stay visible."""
+        for rel in (
+            "unrelated.tmp",
+            "scripts/build_output.tmp",
+            "mcuat_pkg_no_leading_dot.tmp",
+            ".mcuat_pkg_abcd1234.json",
+            ".mcuat_pkg_abcd1234.tmp.bak",
+        ):
+            with self.subTest(path=rel):
+                done = self._git("check-ignore", "-v", "--no-index", rel)
+                matched = [line for line in done.stdout.splitlines()
+                           if any(pattern in line for pattern in self.PATTERNS)]
+                self.assertEqual(matched, [], "the new rules must not match %s" % rel)
+
+    def test_no_tracked_repository_file_is_hidden_by_these_rules(self):
+        """The decisive control: the new patterns can never mask a committed file."""
+        listed = self._git("ls-files")
+        self.assertEqual(listed.returncode, 0, listed.stderr)
+        tracked = [line for line in listed.stdout.splitlines() if line.strip()]
+        self.assertGreater(len(tracked), 50, "the tracked-file listing must be real")
+        checked = self._git("check-ignore", "-v", "--stdin", stdin="\n".join(tracked) + "\n")
+        hidden = [line for line in checked.stdout.splitlines()
+                  if any(pattern in line for pattern in self.PATTERNS)]
+        self.assertEqual(hidden, [], "no tracked file may be ignored by the new patterns")
+
+
+class NewLedgerDirectoryDurabilityTests(_CreateUatBuildHarness):
+    """Closed-PR #113 finding PRRT_kwDOSbJI_s6UdzWd.
+
+    On the FIRST decision in a fresh state directory, `append_ledger` created and fsynced the
+    ledger file but never committed its new parent-directory ENTRY, then reported the append as
+    confirmed and the writer committed the authoritative activation. A power loss in that window
+    could remove the new ledger entry while leaving the SQLite activation durable, so a restarted
+    build could use an approved decision whose mandatory audit event no longer existed.
+    """
+
+    def _entry(self):
+        return {
+            "event": "decision", "recorded_at": "2026-08-14T00:00:00+00:00",
+            "reviewer_id": "digital", "decision": "approved",
+            "source_record_id": "srcrec_" + "0" * 64,
+            "source_fingerprint": "fp_" + "0" * 64, "row_number_hint": 2,
+            "approval_id": "appr_" + "0" * 32,
+            "approved_at": "2026-08-14T00:00:00+00:00",
+            "expires_at": "2026-08-17T00:00:00+00:00",
+        }
+
+    def test_a_first_append_commits_the_new_directory_entry(self):
+        ledger = self.tmp / "fresh" / "member_create_uat_ledger.jsonl"
+        seen = []
+        real = approval._fsync_parent_directory
+
+        def recording(directory):
+            seen.append(str(directory))
+            return real(directory)
+
+        with mock.patch.object(approval, "_fsync_parent_directory", recording):
+            approval.append_ledger(ledger, self._entry())
+        self.assertTrue(ledger.is_file())
+        self.assertIn(str(ledger.parent), seen,
+                      "the new ledger's own parent entry must be committed")
+        self.assertIn(str(ledger.parent.parent), seen,
+                      "a directory this call created is only as durable as its own entry")
+
+    def test_a_later_append_does_not_repeat_the_directory_commit(self):
+        """The entry already exists, so only the bytes need committing."""
+        ledger = self.tmp / "member_create_uat_ledger.jsonl"
+        approval.append_ledger(ledger, self._entry())
+        seen = []
+        real = approval._fsync_parent_directory
+        with mock.patch.object(approval, "_fsync_parent_directory",
+                               lambda d: seen.append(str(d)) or real(d)):
+            approval.append_ledger(ledger, self._entry())
+        self.assertEqual(seen, [])
+        self.assertEqual(len(self._entries()), 2, "the append stays append-only")
+
+    def test_a_directory_durability_failure_propagates_rather_than_claiming_success(self):
+        ledger = self.tmp / "fresh" / "member_create_uat_ledger.jsonl"
+        with mock.patch.object(approval, "_fsync_parent_directory",
+                               mock.Mock(side_effect=OSError(5, "synthetic dir fsync failure"))):
+            with self.assertRaises(OSError):
+                approval.append_ledger(ledger, self._entry())
+
+    def test_no_activation_is_committed_when_the_new_ledger_entry_is_not_durable(self):
+        """The required fault injection: file write/flush/fsync succeed, directory commit fails.
+
+        The reviewer decision must stay pending and non-authoritative, with an explicit sanitised
+        non-success, no traceback and no ledger content leaked.
+        """
+        with mock.patch.object(approval, "_fsync_parent_directory",
+                               mock.Mock(side_effect=OSError(5, "synthetic dir fsync failure"))):
+            code, out = self._approve()
+        self.assertEqual(code, approval.EXIT_DECISION_AUTHORITY_UNCERTAIN, out)
+        self.assertNotIn("Traceback", out)
+        summary = json.loads(out)
+        self.assertEqual(summary["status"], "decision_audit_incomplete")
+        self.assertEqual(summary["decision_authority"], "pending")
+        self.assertIs(summary["decision_activated"], False)
+        self.assertEqual(summary["audit_append"], "unconfirmed")
+        self.assertIs(summary["approval_blocked"], True)
+        self.assertIs(summary["do_not_retry"], True)
+        self.assertIs(summary["fresh_approval_required"], True)
+        self.assertIs(summary["controlled_recovery_required"], True)
+        # No private value and no ledger content reaches the operator-visible summary.
+        for forbidden in ("synthetic dir fsync failure", "90000001", "synthetic.alpha"):
+            self.assertNotIn(forbidden, out)
+        # And the decisive consequence: nothing downstream can treat the decision as authority.
+        code, build_out = self._build()
+        self.assertEqual(code, approval.EXIT_DECISION_NOT_AUTHORITATIVE, build_out)
+        self.assertFalse(self.package.exists(), "no package may be built from a pending decision")
+
+    def test_the_ledger_is_never_truncated_or_repaired_by_the_failure(self):
+        with mock.patch.object(approval, "_fsync_parent_directory",
+                               mock.Mock(side_effect=OSError(5, "synthetic dir fsync failure"))):
+            self._approve()
+        # The line the failed append had already written is left EXACTLY as found: no repair,
+        # no rewrite, no truncation, and no automatic retry loop.
+        self.assertTrue(self.ledger.is_file())
+        text = self.ledger.read_text(encoding="utf-8")
+        self.assertTrue(text.endswith("\n"))
+        self.assertEqual(len(self._events_of("decision")), 1)
+
+
+class PublishedPackageDirectoryDurabilityTests(_CreateUatBuildHarness):
+    """Closed-PR #113 finding PRRT_kwDOSbJI_s6UdzWm.
+
+    The publication fsynced the complete temporary and then used no-replace `os.link`, but never
+    committed the OUTPUT-DIRECTORY entry for the final name or for the later temporary removal. A
+    crash immediately after an exit-0 build could therefore lose the supposedly published package
+    even though its reservation and claim had permanently consumed the approval.
+    """
+
+    def setUp(self):
+        super().setUp()
+        # A competing/historical artifact that must be preserved byte-for-byte throughout.
+        self.competitor = self.tmp / "member_create_uat_package_v1.json"
+        self.competitor.write_text('{"historical": true}\n', encoding="utf-8")
+        self.competitor_bytes = self.competitor.read_bytes()
+
+    def _temps(self):
+        return sorted(f for f in os.listdir(self.tmp) if "mcuat_pkg" in f)
+
+    def _fail_when(self, predicate):
+        """Raise from the PACKAGE durability barrier only at the call the predicate identifies.
+
+        Order-independent on purpose: the arm is selected by observable filesystem state rather
+        than a call index. DL-XB-127-001-A1 injects at `_commit_package_publication`, the single
+        package-side entry point on both platforms - POSIX fsyncs the output directory handle
+        through it, Windows flushes the package path itself - so this fault injection stays
+        platform-correct instead of only reaching the POSIX helper.
+        """
+        real = approval._commit_package_publication
+
+        def hook(out_path):
+            if predicate():
+                raise OSError(5, "synthetic package publication durability failure")
+            return real(out_path)
+
+        return mock.patch.object(approval, "_commit_package_publication", hook)
+
+    def _after_link(self):
+        return self.package.exists() and bool(self._temps())
+
+    def _after_cleanup(self):
+        return self.package.exists() and not self._temps()
+
+    def test_a_clean_build_reports_the_achieved_publication_durability(self):
+        self._approve()
+        code, out = self._build()
+        self.assertEqual(code, 0, out)
+        expected = (approval.PACKAGE_DURABILITY_POSIX if approval._supports_directory_fsync()
+                    else approval.PACKAGE_DURABILITY_WINDOWS)
+        self.assertEqual(json.loads(out)["publication_durability"], expected)
+
+    def test_a_clean_build_commits_the_output_directory_after_link_and_after_cleanup(self):
+        self._approve()
+        reservation_commits = []
+        package_commits = []
+        real_helper = approval._fsync_parent_directory
+        real_package = approval._commit_package_publication
+        with mock.patch.object(approval, "_fsync_parent_directory",
+                               lambda d: reservation_commits.append(str(d)) or real_helper(d)),                 mock.patch.object(approval, "_commit_package_publication",
+                                  lambda p: package_commits.append(str(p)) or real_package(p)):
+            code, out = self._build()
+        self.assertEqual(code, 0, out)
+        self.assertGreaterEqual(
+            reservation_commits.count(str(self.package.parent)), 1,
+            "the reservation's own directory entry must still be committed",
+        )
+        self.assertEqual(
+            package_commits, [str(self.package)] * 2,
+            "the final link and the temporary removal must each commit the package output",
+        )
+
+    def test_a_post_link_durability_failure_is_an_explicit_non_success(self):
+        """The required fault injection: complete temp durable, link succeeds, directory fails."""
+        self._approve()
+        with self._fail_when(self._after_link):
+            code, out = self._build()
+        self.assertEqual(code, approval.EXIT_PUBLICATION_DURABILITY_UNCONFIRMED, out)
+        self.assertNotIn("Traceback", out)
+        summary = json.loads(out)
+        self.assertEqual(summary["status"], "publication_durability_unconfirmed")
+        self.assertEqual(summary["publication"], "published_durability_unconfirmed")
+        self.assertEqual(summary["publication_durability"], "unconfirmed")
+        self.assertEqual(summary["reservation"], "confirmed_durable")
+        self.assertEqual(summary["build_claim"], "committed")
+        self.assertEqual(summary["ledger_record"], "not_attempted")
+        self.assertEqual(summary["failure_stage"], "published_package_directory_durability")
+        self.assertIs(summary["published_package_preserved"], True)
+        self.assertIs(summary["do_not_retry"], True)
+        self.assertIs(summary["approval_blocked"], True)
+        self.assertIs(summary["fresh_approval_required"], True)
+        self.assertIs(summary["controlled_recovery_required"], True)
+        self.assertNotIn("synthetic package publication durability failure", out)
+
+    def test_no_clean_build_event_claims_the_unconfirmed_publication(self):
+        self._approve()
+        with self._fail_when(self._after_link):
+            self._build()
+        self.assertEqual(self._events_of("build"), [],
+                         "an unconfirmed publication must never record a clean build event")
+        self.assertEqual(self._events_of("build_cleanup_incomplete"), [])
+
+    def test_the_published_package_is_preserved_and_never_rolled_back(self):
+        self._approve()
+        with self._fail_when(self._after_link):
+            self._build()
+        self.assertTrue(self.package.is_file(),
+                        "the published package is never deleted to tidy up")
+        published = json.loads(self.package.read_text(encoding="utf-8"))
+        self.assertEqual(published["schema_version"], contract.SCHEMA_VERSION)
+        ok, reasons = contract.validate_package(published)
+        self.assertTrue(ok, reasons)
+        self.assertEqual(self.competitor.read_bytes(), self.competitor_bytes,
+                         "a competing/historical package is never deleted or modified")
+
+    def test_the_consumed_claim_cannot_mint_another_package(self):
+        """The approval stays terminally consumed; a fresh output path is refused too."""
+        self._approve()
+        with self._fail_when(self._after_link):
+            self._build()
+        second = self.tmp / "member_create_uat_package_second.json"
+        code, out = self._build(["--package-out", str(second)])
+        self.assertEqual(code, approval.EXIT_APPROVAL_CONSUMED, out)
+        self.assertFalse(second.exists(), "no second package may be minted from the same claim")
+        self.assertEqual(self._reservations(), [self._slot().name],
+                         "the reservation is neither removed nor recreated")
+
+    def test_the_residual_temporary_state_is_reported_truthfully(self):
+        self._approve()
+        real_unlink = os.unlink
+
+        def refusing_unlink(path, *args, **kwargs):
+            if "mcuat_pkg" in str(path):
+                raise OSError(13, "synthetic unlink refusal")
+            return real_unlink(path, *args, **kwargs)
+
+        with mock.patch("os.unlink", refusing_unlink):
+            with self._fail_when(self._after_link):
+                code, out = self._build()
+        self.assertEqual(code, approval.EXIT_PUBLICATION_DURABILITY_UNCONFIRMED, out)
+        summary = json.loads(out)
+        self.assertEqual(summary["temp_cleanup"], "failed")
+        self.assertIs(summary["manual_cleanup_required"], True)
+        self.assertIn("mcuat_pkg", summary["stale_temp_basename"])
+        # The reported basename is the real residual temporary, and only ONE remains.
+        self.assertEqual(self._temps(), [summary["stale_temp_basename"]])
+        self.assertNotIn("synthetic unlink refusal", out)
+
+    def test_a_post_cleanup_durability_failure_is_not_reported_as_a_clean_build(self):
+        """The removal may not survive a restart, so exit-0 must not claim a tidy directory."""
+        self._approve()
+        with self._fail_when(self._after_cleanup):
+            code, out = self._build()
+        self.assertEqual(code, approval.EXIT_CLEANUP_INCOMPLETE, out)
+        self.assertNotIn("Traceback", out)
+        summary = json.loads(out)
+        self.assertEqual(summary["status"], "cleanup_incomplete")
+        self.assertEqual(summary["temp_cleanup"], "failed")
+        self.assertIs(summary["manual_cleanup_required"], True)
+        self.assertIs(summary["do_not_retry"], True)
+        self.assertTrue(self.package.is_file())
+        self.assertEqual(len(self._events_of("build_cleanup_incomplete")), 1)
+        self.assertEqual(self._events_of("build"), [])
+
+    def test_no_directory_sweep_or_glob_cleanup_was_introduced(self):
+        """Only the ONE operation-owned temporary is ever touched."""
+        unrelated = self.tmp / ".mcuat_pkg_unrelated_sentinel.tmp"
+        unrelated.write_text("unrelated\n", encoding="utf-8")
+        self._approve()
+        with self._fail_when(self._after_link):
+            self._build()
+        self.assertTrue(unrelated.is_file(),
+                        "an unrelated temporary is never swept by the publication writer")
+        self.assertEqual(unrelated.read_text(encoding="utf-8"), "unrelated\n")
+
+    def test_the_publish_state_vocabulary_names_the_new_outcome_exactly_once(self):
+        states = {value for name, value in vars(approval._PublishState).items()
+                  if not name.startswith("_")}
+        self.assertEqual(
+            states,
+            {"not_published", "reservation_failed", "reserved_not_published",
+             "published_durability_unconfirmed", "published_cleanup_complete",
+             "published_cleanup_incomplete"},
+        )
+        self.assertEqual(approval.EXIT_PUBLICATION_DURABILITY_UNCONFIRMED, 12)
+
+
+class WindowsPackageVolumeDurabilityTests(_CreateUatBuildHarness):
+    """DL-XB-127-001-A1: the residual WINDOWS half of finding PRRT_kwDOSbJI_s6UdzWm.
+
+    `_fsync_parent_directory` performs no directory I/O at all on Windows - it returns
+    ``file_fsync_only`` immediately - so before this amendment a Windows build could reach a
+    clean exit 0 having never flushed anything on the package output's OWN volume. The only
+    real flush after `os.link` was the later approval-ledger fsync, and that cannot stand in
+    for it: `contract.assert_safe_local_path` validates one path at a time and imposes no
+    same-volume relation between `--ledger` and `--package-out`, so the two may legitimately
+    sit on different fixed local NTFS volumes.
+
+    The amendment therefore commits the package output's own path, on the package volume, both
+    after the final link and after the operation-owned temporary is removed, and fails closed
+    when that barrier cannot be established.
+
+    Every test below works only on a throwaway temporary directory of synthetic fixtures.
+    Nothing here touches AutoCount, the AutoCount VM, live n8n, Google, SMB/shared-folder
+    state, a real approval ledger or package, real member data, or any credential.
+    """
+
+    def setUp(self):
+        super().setUp()
+        # A competing/historical artifact that must stay byte-identical throughout.
+        self.competitor = self.tmp / "member_create_uat_package_v1.json"
+        self.competitor.write_text('{"historical": true}\n', encoding="utf-8")
+        self.competitor_bytes = self.competitor.read_bytes()
+
+    def _temps(self):
+        return sorted(f for f in os.listdir(self.tmp) if "mcuat_pkg" in f)
+
+    def _after_link(self):
+        return self.package.exists() and bool(self._temps())
+
+    def _after_cleanup(self):
+        return self.package.exists() and not self._temps()
+
+    def _windows_mode(self):
+        """Force the Windows package-durability branch deterministically on any host."""
+        return mock.patch.object(approval, "_supports_directory_fsync", lambda: False)
+
+    def _barrier(self, seen=None, fail_when=None):
+        """Substitute the Windows package barrier, recording targets and forcing failures.
+
+        The real ctypes primitive is exercised separately on Windows only; here the arm is
+        selected by observable filesystem state so the assertion is order-independent.
+        """
+        def hook(out_path):
+            if seen is not None:
+                seen.append(str(out_path))
+            if fail_when is not None and fail_when():
+                raise OSError(5, "synthetic package-volume durability barrier failure")
+            return approval.PACKAGE_DURABILITY_WINDOWS
+
+        return mock.patch.object(approval, "_flush_windows_package_path", hook)
+
+    # ---------------------------------------------------------------- #
+    # A. the barrier exists, runs on the package volume, and runs twice
+    # ---------------------------------------------------------------- #
+    def test_a_clean_build_never_reports_the_no_io_windows_placeholder(self):
+        """Behavioural root-cause proof: `file_fsync_only` performs no I/O, so it can never be
+        the durability mode of a CLEAN package publication."""
+        self._approve()
+        code, out = self._build()
+        self.assertEqual(code, 0, out)
+        self.assertNotEqual(
+            json.loads(out)["publication_durability"], "file_fsync_only",
+            "a clean publication must never report the no-I/O Windows placeholder mode",
+        )
+
+    def test_a_clean_build_reports_the_platform_package_barrier_actually_achieved(self):
+        self._approve()
+        code, out = self._build()
+        self.assertEqual(code, 0, out)
+        expected = (approval.PACKAGE_DURABILITY_POSIX if approval._supports_directory_fsync()
+                    else approval.PACKAGE_DURABILITY_WINDOWS)
+        self.assertEqual(json.loads(out)["publication_durability"], expected)
+
+    def test_the_windows_barrier_is_invoked_after_the_final_link(self):
+        self._approve()
+        seen = []
+        after_link = []
+        real_link = os.link
+
+        def watched_link(src, dst):
+            result = real_link(src, dst)
+            after_link.append(len(seen))
+            return result
+
+        with self._windows_mode(), self._barrier(seen=seen), \
+                mock.patch.object(os, "link", watched_link):
+            code, out = self._build()
+        self.assertEqual(code, 0, out)
+        self.assertEqual(after_link, [0],
+                         "no package barrier may run before the final link exists")
+        self.assertGreaterEqual(len(seen), 1, "the package barrier must run after the link")
+
+    def test_the_windows_barrier_targets_the_package_path_not_the_ledger(self):
+        self._approve()
+        seen = []
+        with self._windows_mode(), self._barrier(seen=seen):
+            code, out = self._build()
+        self.assertEqual(code, 0, out)
+        self.assertTrue(seen, "the package barrier must be invoked")
+        for target in seen:
+            self.assertEqual(
+                Path(target), self.package,
+                "the barrier target must be derived from the package output, never the ledger",
+            )
+            self.assertNotEqual(Path(target), self.ledger)
+
+    def test_the_windows_barrier_is_invoked_again_after_the_temporary_unlink(self):
+        self._approve()
+        seen = []
+        stages = []
+        real_unlink = os.unlink
+
+        def watched_unlink(path):
+            result = real_unlink(path)
+            if "mcuat_pkg" in os.path.basename(str(path)):
+                stages.append(len(seen))
+            return result
+
+        with self._windows_mode(), self._barrier(seen=seen), \
+                mock.patch.object(os, "unlink", watched_unlink):
+            code, out = self._build()
+        self.assertEqual(code, 0, out)
+        self.assertEqual(len(stages), 1, "exactly one operation-owned temporary is removed")
+        self.assertGreaterEqual(stages[0], 1, "the post-link barrier runs before the unlink")
+        self.assertGreater(
+            len(seen), stages[0],
+            "the package barrier must run AGAIN after the temporary removal, before success",
+        )
+
+    # ---------------------------------------------------------------- #
+    # B. post-link barrier failure: explicit non-success, nothing rolled back
+    # ---------------------------------------------------------------- #
+    def _post_link_failure(self):
+        self._approve()
+        with self._windows_mode(), self._barrier(fail_when=self._after_link):
+            return self._build()
+
+    def test_a_post_link_barrier_failure_cannot_reach_clean_success(self):
+        code, out = self._post_link_failure()
+        self.assertEqual(code, approval.EXIT_PUBLICATION_DURABILITY_UNCONFIRMED, out)
+        self.assertNotIn("Traceback", out)
+        summary = json.loads(out)
+        self.assertEqual(summary["status"], "publication_durability_unconfirmed")
+        self.assertEqual(summary["publication"], "published_durability_unconfirmed")
+        self.assertEqual(summary["publication_durability"], "unconfirmed")
+        self.assertEqual(summary["failure_stage"], "published_package_directory_durability")
+        self.assertEqual(summary["build_claim"], "committed")
+        self.assertIs(summary["published_package_preserved"], True)
+        self.assertIs(summary["approval_blocked"], True)
+        self.assertIs(summary["do_not_retry"], True)
+        self.assertIs(summary["fresh_approval_required"], True)
+        self.assertNotIn("synthetic package-volume durability barrier failure", out)
+
+    def test_a_post_link_barrier_failure_emits_no_clean_build_event(self):
+        self._post_link_failure()
+        self.assertEqual(self._events_of("build"), [],
+                         "an unconfirmed package publication never records a clean build event")
+        self.assertEqual(self._events_of("build_cleanup_incomplete"), [])
+
+    def test_a_post_link_barrier_failure_preserves_the_published_package(self):
+        self._post_link_failure()
+        self.assertTrue(self.package.is_file(),
+                        "the published package is never deleted, rolled back or renamed")
+        published = json.loads(self.package.read_text(encoding="utf-8"))
+        ok, reasons = contract.validate_package(published)
+        self.assertTrue(ok, reasons)
+
+    def test_a_post_link_barrier_failure_cannot_mint_a_second_package(self):
+        self._post_link_failure()
+        second = self.tmp / "member_create_uat_package_second.json"
+        code, out = self._build(["--package-out", str(second)])
+        self.assertEqual(code, approval.EXIT_APPROVAL_CONSUMED, out)
+        self.assertFalse(second.exists(), "a consumed claim can never mint a second package")
+        self.assertEqual(self._reservations(), [self._slot().name],
+                         "the consumed reservation is neither removed nor recreated")
+
+    # ---------------------------------------------------------------- #
+    # C. post-unlink barrier failure: truthful cleanup/durability uncertainty
+    # ---------------------------------------------------------------- #
+    def _post_unlink_failure(self):
+        self._approve()
+        with self._windows_mode(), self._barrier(fail_when=self._after_cleanup):
+            return self._build()
+
+    def test_a_post_unlink_barrier_failure_cannot_reach_exit_zero(self):
+        code, out = self._post_unlink_failure()
+        self.assertNotEqual(code, 0, "durability uncertainty is never reported as success")
+        self.assertEqual(code, approval.EXIT_CLEANUP_INCOMPLETE, out)
+        self.assertNotIn("Traceback", out)
+        summary = json.loads(out)
+        self.assertEqual(summary["status"], "cleanup_incomplete")
+        self.assertEqual(summary["temp_cleanup"], "failed")
+        self.assertIs(summary["manual_cleanup_required"], True)
+        self.assertEqual(summary["event"], "build_cleanup_incomplete")
+        self.assertTrue(self.package.is_file(),
+                        "the published package is preserved through a cleanup/durability doubt")
+        self.assertNotIn("synthetic package-volume durability barrier failure", out)
+
+    def test_a_post_unlink_barrier_failure_records_no_clean_build_event(self):
+        self._post_unlink_failure()
+        self.assertEqual(self._events_of("build"), [],
+                         "a cleanup/durability-uncertain publication is never a clean build")
+        self.assertEqual(len(self._events_of("build_cleanup_incomplete")), 1)
+
+    def test_a_post_unlink_barrier_failure_cannot_mint_a_second_package(self):
+        self._post_unlink_failure()
+        second = self.tmp / "member_create_uat_package_second.json"
+        code, out = self._build(["--package-out", str(second)])
+        self.assertEqual(code, approval.EXIT_APPROVAL_CONSUMED, out)
+        self.assertFalse(second.exists(), "a consumed claim can never mint a second package")
+
+    # ---------------------------------------------------------------- #
+    # D. mandatory cross-volume negative control
+    # ---------------------------------------------------------------- #
+    def test_flushing_only_the_ledger_volume_cannot_obtain_clean_success(self):
+        """Ledger/state on synthetic volume A, package output on synthetic volume B.
+
+        Volume A's own durability calls - the reservation directory helper and the real ledger
+        append fsync - are left fully working. Only volume B's package barrier is unavailable.
+        Clean success must still be impossible, which is exactly what a later ledger-volume
+        flush could never prove.
+        """
+        self._approve()
+        volume_a = []
+        real_helper = approval._fsync_parent_directory
+        real_fsync = os.fsync
+        ledger_flushes = []
+
+        def volume_a_helper(directory):
+            volume_a.append(str(directory))
+            return real_helper(directory)
+
+        def counted_fsync(fd):
+            ledger_flushes.append(fd)
+            return real_fsync(fd)
+
+        with self._windows_mode(), \
+                self._barrier(fail_when=self._after_link), \
+                mock.patch.object(approval, "_fsync_parent_directory", volume_a_helper), \
+                mock.patch.object(os, "fsync", counted_fsync):
+            code, out = self._build()
+
+        self.assertTrue(volume_a, "the ledger/state volume helper must still have been used")
+        self.assertTrue(ledger_flushes, "real volume-A file flushes must still have succeeded")
+        self.assertEqual(
+            code, approval.EXIT_PUBLICATION_DURABILITY_UNCONFIRMED,
+            "a working ledger volume can never substitute for the package volume barrier: "
+            + out,
+        )
+        self.assertEqual(json.loads(out)["publication_durability"], "unconfirmed")
+        self.assertEqual(self._events_of("build"), [])
+
+    def test_the_package_barrier_target_is_independent_of_the_ledger_location(self):
+        """The barrier target is derived from --package-out even when --ledger is elsewhere."""
+        self._approve()
+        other_dir = self.tmp / "volume_b"
+        other_dir.mkdir()
+        elsewhere = other_dir / "member_create_uat_package_v2.json"
+        seen = []
+        with self._windows_mode(), self._barrier(seen=seen):
+            code, out = self._build(["--package-out", str(elsewhere)])
+        self.assertEqual(code, 0, out)
+        self.assertTrue(seen)
+        for target in seen:
+            self.assertEqual(Path(target), elsewhere)
+            self.assertNotEqual(Path(target).parent, self.ledger.parent)
+
+    # ---------------------------------------------------------------- #
+    # E. nothing else is touched
+    # ---------------------------------------------------------------- #
+    def test_a_competing_historical_package_stays_byte_identical(self):
+        self._post_link_failure()
+        self.assertEqual(self.competitor.read_bytes(), self.competitor_bytes,
+                         "a competing/historical package is never deleted or modified")
+
+    def test_an_unrelated_temporary_is_never_swept(self):
+        unrelated = self.tmp / ".mcuat_pkg_unrelated.tmp"
+        unrelated.write_text("unrelated\n", encoding="utf-8")
+        self._post_link_failure()
+        self.assertTrue(unrelated.is_file(),
+                        "the publication writer never sweeps or globs other temporaries")
+        self.assertEqual(unrelated.read_text(encoding="utf-8"), "unrelated\n")
+
+    # ---------------------------------------------------------------- #
+    # F. POSIX non-regression and reservation/ledger preservation
+    # ---------------------------------------------------------------- #
+    @unittest.skipUnless(hasattr(os, "O_DIRECTORY"), "POSIX directory fsync only")
+    def test_posix_publication_durability_is_unchanged(self):
+        self._approve()
+        seen = []
+        real_helper = approval._fsync_parent_directory
+        with mock.patch.object(approval, "_fsync_parent_directory",
+                               lambda d: seen.append(str(d)) or real_helper(d)):
+            code, out = self._build()
+        self.assertEqual(code, 0, out)
+        self.assertEqual(json.loads(out)["publication_durability"], "file_and_directory_fsync")
+        self.assertGreaterEqual(
+            seen.count(str(self.package.parent)), 3,
+            "POSIX still commits the reservation, the final link and the temporary removal",
+        )
+
+    def test_the_reservation_durability_reporting_is_preserved(self):
+        """Toolkit #342: the shared reservation/ledger helper's behaviour is untouched."""
+        self._approve()
+        code, out = self._build()
+        self.assertEqual(code, 0, out)
+        expected = ("file_and_directory_fsync" if hasattr(os, "O_DIRECTORY")
+                    else "file_fsync_only")
+        self.assertEqual(json.loads(out)["reservation_durability"], expected,
+                         "reservation durability reporting is deliberately untouched")
+
+    @unittest.skipUnless(os.name == "nt", "the real Windows primitive requires Windows")
+    def test_the_real_windows_primitive_commits_the_package_path(self):
+        """Exercise the actual documented primitive against a real NTFS package file."""
+        target = self.tmp / "real_barrier_probe.json"
+        target.write_text('{"probe": true}\n', encoding="utf-8")
+        self.assertEqual(approval._flush_windows_package_path(target),
+                         approval.PACKAGE_DURABILITY_WINDOWS)
+        self.assertEqual(target.read_text(encoding="utf-8"), '{"probe": true}\n',
+                         "the barrier never truncates or modifies the package")
+
+    @unittest.skipUnless(os.name == "nt", "the real Windows primitive requires Windows")
+    def test_the_real_windows_primitive_fails_closed_on_a_missing_path(self):
+        missing = self.tmp / "absent_package.json"
+        with self.assertRaises(OSError):
+            approval._flush_windows_package_path(missing)
+
 if __name__ == "__main__":
     unittest.main()

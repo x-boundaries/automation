@@ -280,6 +280,14 @@ member_create_uat_decisions.sqlite3-shm
 # published with a no-replace link, so no concurrent process can ever observe a partial store.
 .mcuat_decisions_*.tmp
 autocount_outputs/**/.mcuat_decisions_*.tmp
+# The operation-owned temporary the complete package is written into before its no-replace
+# hard-link publication. It holds the FULL package - member number, name, email and DOB - and a
+# crash or a failed cleanup deliberately leaves it in place, so it must never be stageable from
+# any approved output location inside the checkout. Matched by basename (no leading slash), so
+# the rule covers nested output directories as well as the repository root. Narrow on purpose:
+# never a broad `*.tmp`, and it can never hide a committed repository file.
+.mcuat_pkg_*.tmp
+autocount_outputs/**/.mcuat_pkg_*.tmp
 autocount_outputs/**/member_create_uat_decisions.sqlite3
 autocount_outputs/**/member_create_uat_decisions.sqlite3-journal
 autocount_outputs/**/member_create_uat_decisions.sqlite3-wal

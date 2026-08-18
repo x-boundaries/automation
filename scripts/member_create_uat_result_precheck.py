@@ -173,7 +173,12 @@ def evaluate(result, expected_record_id=None, expected_fingerprint=None):
     # Recompute the terminal code from the emitted flags and reject any result whose
     # stored code contradicts the canonical state table, or whose flags are internally
     # impossible (finding 4). The precheck never trusts the stored terminal_code.
-    flags = {name: result.get(name) for name in contract.TERMINAL_STATE_FLAGS}
+    #
+    # Only PRESENT keys are passed through, so the contract can tell an omitted flag (already
+    # fail-closed as falsy by the table) apart from a flag the result explicitly supplied as a
+    # non-boolean substitute such as "false", 1 or null. The strict boolean-type gate inside
+    # the contract runs before any coercion, so `bool("false")` can never become authority.
+    flags = {name: result[name] for name in contract.TERMINAL_STATE_FLAGS if name in result}
     recomputed, contradictions = contract.recompute_terminal_state(flags)
     counts["state_contradiction_count"] = len(contradictions)
     if contradictions:

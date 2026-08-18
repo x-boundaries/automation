@@ -1,9 +1,79 @@
 import json
+import shutil
+import subprocess
+import sys
 import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / "n8n-workflows" / "member_create_uat_result_mapping.workflow.json"
+for _p in (str(ROOT / "scripts"), str(Path(__file__).resolve().parent)):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+import member_create_uat_contract as contract  # noqa: E402
+import _create_uat_fixtures as fx  # noqa: E402
+
+# Executes the workflow's Code node exactly as the repository's other n8n mapping suites do, so
+# the n8n validation surface is proved by RUNNING it rather than by reading its text. No n8n
+# instance, container, credential, Google or AutoCount access is involved: this is `node -e` over
+# the committed jsCode with a synthetic in-memory item.
+NODE_WRAPPER = r"""
+const fs = require('fs');
+const payload = JSON.parse(fs.readFileSync(0, 'utf8'));
+try {
+  const run = new Function('$input', '$', 'Buffer', payload.code);
+  const items = payload.items.map((json) => ({ json }));
+  const result = run({ all: () => items, first: () => items[0] }, () => ({}), Buffer);
+  console.log(JSON.stringify({ ok: true, result }));
+} catch (error) {
+  console.log(JSON.stringify({ ok: false, error: String(error && error.message ? error.message : error) }));
+}
+"""
+
+
+def workflow_code(node_name):
+    workflow = json.loads(WORKFLOW.read_text(encoding="utf-8"))
+    node = next(n for n in workflow["nodes"] if n["name"] == node_name)
+    return node["parameters"]["jsCode"]
+
+
+def run_validate_node(result):
+    node_exe = shutil.which("node")
+    if not node_exe:
+        raise unittest.SkipTest("node executable is required to execute the n8n Code node")
+    completed = subprocess.run(
+        [node_exe, "-e", NODE_WRAPPER],
+        input=json.dumps(
+            {
+                "code": workflow_code("Validate Sanitized Terminal Result Strictly"),
+                "items": [{"data": json.dumps(result)}],
+            }
+        ),
+        text=True, capture_output=True, check=True,
+    )
+    return json.loads(completed.stdout)
+
+
+def sample_result(**overrides):
+    """A clean CREATED_VERIFIED sanitized result, synthetic and disposable throughout."""
+    pkg = fx.build_valid_package()
+    result = {
+        "mode": "write", "runtime_location": "autocount_vm", "terminal_code": "CREATED_VERIFIED",
+        "package_structural_valid": True, "package_fingerprint_problem": False,
+        "approval_not_expired": True, "write_confirmed": True, "business_confirmed": True,
+        "lock_acquired": True, "recovery_state": "none", "execution_error": False,
+        "authentication_success": True, "member_command_found": True, "get_member_found": True,
+        "member_exists_initial": False, "new_member_success": True, "assignment_success": True,
+        "assigned_field_count": 11, "expiry_date_assigned": True, "member_exists_recheck": False,
+        "write_intent_recorded": True, "consumed_marker_written": True,
+        "save_member_attempted": True, "save_member_confirmed": True, "save_outcome": "confirmed",
+        "readback_found": True, "readback_match": True, "masked_member_no": "65***1",
+        "operation_id": pkg["operation_id"], "source_record_id": pkg["source_record_id"],
+        "source_fingerprint": pkg["source_fingerprint"], "error": None,
+    }
+    result.update(overrides)
+    return result
 
 
 class N8nMappingStaticTests(unittest.TestCase):
@@ -72,6 +142,79 @@ class N8nMappingStaticTests(unittest.TestCase):
     def test_google_sheets_nodes_have_retry(self):
         for name in ("Read Row By Operation Id", "Update Review Fields By Operation Id"):
             self.assertTrue(self.nodes[name]["retryOnFail"])
+
+    def test_validate_node_declares_the_strict_boolean_contract(self):
+        """Closed-PR #113 finding PRRT_kwDOSbJI_s6UdzWO, statically.
+
+        The n8n boolean subset must be the SAME identities the Python contract declares, so the
+        two validation surfaces cannot drift apart.
+        """
+        code = self.nodes["Validate Sanitized Terminal Result Strictly"]["parameters"]["jsCode"]
+        self.assertIn("booleanTypeViolations", code)
+        self.assertIn("create_uat_boolean_flag_type_invalid", code)
+        self.assertIn("typeof f[n] !== 'boolean'", code)
+        for name in contract.TERMINAL_STATE_BOOLEAN_FLAGS:
+            with self.subTest(flag=name):
+                self.assertIn("'%s'" % name, code)
+        # The type gate must be applied before the truthiness-based table can recompute.
+        self.assertLess(code.index("booleanTypeViolations(result)"), code.index("recompute(result)"))
+
+
+class N8nStrictBooleanExecutionTests(unittest.TestCase):
+    """Closed-PR #113 finding PRRT_kwDOSbJI_s6UdzWO, at the executed n8n validation surface.
+
+    JavaScript `!!'false'` is true, so the validator previously PASSED a tampered result whose
+    ExpiryDate-assignment proof was the string "false". Each control below runs the committed
+    Code node and asserts the refusal by its own error name.
+    """
+
+    def test_a_clean_boolean_result_still_passes(self):
+        outcome = run_validate_node(sample_result())
+        self.assertTrue(outcome["ok"], outcome)
+        self.assertEqual(outcome["result"][0]["json"]["terminal_code"], "CREATED_VERIFIED")
+
+    def test_the_originating_expiry_date_assigned_string_is_refused(self):
+        outcome = run_validate_node(sample_result(expiry_date_assigned="false"))
+        self.assertFalse(outcome["ok"], outcome)
+        self.assertEqual(outcome["error"], "create_uat_boolean_flag_type_invalid")
+
+    def test_every_substitute_type_is_refused(self):
+        for substitute in ("false", "true", "", 0, 1, 0.0, None, [], {}):
+            with self.subTest(substitute=repr(substitute)):
+                outcome = run_validate_node(sample_result(expiry_date_assigned=substitute))
+                self.assertFalse(outcome["ok"], outcome)
+                self.assertEqual(outcome["error"], "create_uat_boolean_flag_type_invalid")
+
+    def test_every_same_root_boolean_flag_is_refused(self):
+        for name in contract.TERMINAL_STATE_BOOLEAN_FLAGS:
+            with self.subTest(flag=name):
+                outcome = run_validate_node(sample_result(**{name: "false"}))
+                self.assertFalse(outcome["ok"], outcome)
+                self.assertEqual(outcome["error"], "create_uat_boolean_flag_type_invalid")
+
+    def test_the_two_validation_surfaces_agree_on_every_substitute(self):
+        """Python and n8n must reach the same verdict, which is what keeps them one contract."""
+        for name in contract.TERMINAL_STATE_BOOLEAN_FLAGS:
+            for substitute in ("false", 1, None):
+                with self.subTest(flag=name, substitute=repr(substitute)):
+                    result = sample_result(**{name: substitute})
+                    flags = {k: result[k] for k in contract.TERMINAL_STATE_FLAGS if k in result}
+                    self.assertTrue(contract.terminal_state_boolean_type_violations(flags))
+                    self.assertFalse(run_validate_node(result)["ok"])
+
+    def test_a_real_boolean_false_is_still_evaluated_by_the_table(self):
+        """Not "reject everything falsy": a genuine False remains an ordinary table input."""
+        outcome = run_validate_node(sample_result(expiry_date_assigned=False))
+        self.assertFalse(outcome["ok"], outcome)
+        self.assertEqual(outcome["error"], "create_uat_state_contradiction",
+                         "a real False must reach the contradiction table, not the type gate")
+
+    def test_no_flag_value_is_echoed_in_the_refusal(self):
+        outcome = run_validate_node(
+            sample_result(expiry_date_assigned="MEMBER-90000001-SYNTHETIC")
+        )
+        self.assertFalse(outcome["ok"], outcome)
+        self.assertNotIn("MEMBER-90000001-SYNTHETIC", outcome["error"])
 
 
 if __name__ == "__main__":

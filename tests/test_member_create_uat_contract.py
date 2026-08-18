@@ -629,6 +629,115 @@ class ExpiryDateTerminalGuardTests(unittest.TestCase):
         self.assertEqual(contr, [])
 
 
+class StrictTerminalBooleanTypeTests(unittest.TestCase):
+    """Closed-PR #113 finding PRRT_kwDOSbJI_s6UdzWO.
+
+    A boolean-valued terminal-state flag must be an ACTUAL boolean. `bool("false")` is True, so
+    before this gate a staged result carrying `"expiry_date_assigned": "false"` recomputed to
+    CREATED_VERIFIED with no contradiction at all, and the same coercion applied to every other
+    two-state proof in the table. The originating exploit and the whole same-root class are
+    covered here, on both the contradiction surface and the recompute surface.
+    """
+
+    # Every substitute the finding admits: the originating string, its inverse, false- and
+    # true-shaped numbers, JSON null, and container types.
+    SUBSTITUTES = ("false", "true", "", 0, 1, 0.0, None, [], {}, ["true"], {"value": True})
+
+    def test_the_boolean_subset_is_exact_and_exhaustive(self):
+        self.assertEqual(
+            set(contract.TERMINAL_STATE_BOOLEAN_FLAGS)
+            | set(contract.TERMINAL_STATE_NON_BOOLEAN_FLAGS),
+            set(contract.TERMINAL_STATE_FLAGS),
+            "the boolean and non-boolean subsets must together be exactly the flag set",
+        )
+        self.assertEqual(
+            set(contract.TERMINAL_STATE_BOOLEAN_FLAGS)
+            & set(contract.TERMINAL_STATE_NON_BOOLEAN_FLAGS),
+            set(),
+            "no flag may be declared both boolean and non-boolean",
+        )
+        # The non-boolean remainder keeps its existing enum/integer contract, unchanged.
+        self.assertEqual(
+            contract.TERMINAL_STATE_NON_BOOLEAN_FLAGS,
+            ("mode", "recovery_state", "save_outcome", "assigned_field_count"),
+        )
+        self.assertIn("expiry_date_assigned", contract.TERMINAL_STATE_BOOLEAN_FLAGS)
+
+    def test_the_originating_exploit_fails_closed(self):
+        flags = _write_flags(expiry_date_assigned="false")
+        self.assertEqual(
+            contract.terminal_state_boolean_type_violations(flags),
+            ["expiry_date_assigned_not_boolean"],
+        )
+        code, contr = contract.recompute_terminal_state(flags)
+        self.assertIsNone(code, "no terminal code may be derived from an unvalidated flag")
+        self.assertIn("expiry_date_assigned_not_boolean", contr)
+        self.assertNotEqual(code, "CREATED_VERIFIED")
+
+    def test_every_substitute_for_every_boolean_flag_fails_closed(self):
+        """The same-root class, not one field: each boolean flag, each substitute type."""
+        for name in contract.TERMINAL_STATE_BOOLEAN_FLAGS:
+            for substitute in self.SUBSTITUTES:
+                with self.subTest(flag=name, substitute=repr(substitute)):
+                    flags = _write_flags(**{name: substitute})
+                    self.assertEqual(
+                        contract.terminal_state_boolean_type_violations(flags),
+                        ["%s_not_boolean" % name],
+                    )
+                    code, contr = contract.recompute_terminal_state(flags)
+                    self.assertIsNone(code)
+                    self.assertIn("%s_not_boolean" % name, contr)
+
+    def test_a_same_root_flag_other_than_expiry_date_assigned_is_covered(self):
+        """The decisive control: patching only the originating field would leave these open."""
+        for name in ("readback_match", "readback_found", "lock_acquired",
+                     "save_member_confirmed", "package_structural_valid"):
+            with self.subTest(flag=name):
+                code, contr = contract.recompute_terminal_state(_write_flags(**{name: "false"}))
+                self.assertIsNone(code)
+                self.assertEqual(contr, ["%s_not_boolean" % name])
+
+    def test_the_type_gate_runs_before_any_coercion(self):
+        """A non-boolean flag suppresses the ordinary table reasons rather than being coerced."""
+        flags = _write_flags(expiry_date_assigned="false", save_outcome="not_attempted")
+        contr = contract.terminal_state_contradictions(flags)
+        self.assertEqual(contr, ["expiry_date_assigned_not_boolean"])
+        self.assertNotIn("not_attempted_but_attempted", contr)
+
+    def test_several_non_boolean_flags_are_all_named(self):
+        contr = contract.terminal_state_contradictions(
+            _write_flags(expiry_date_assigned="false", readback_match=1)
+        )
+        self.assertEqual(contr, ["readback_match_not_boolean", "expiry_date_assigned_not_boolean"])
+
+    def test_real_booleans_are_unaffected(self):
+        """The preserved contract: genuine booleans still drive the canonical table exactly."""
+        code, contr = contract.recompute_terminal_state(_write_flags())
+        self.assertEqual(code, "CREATED_VERIFIED")
+        self.assertEqual(contr, [])
+        code, contr = contract.recompute_terminal_state(_write_flags(expiry_date_assigned=False))
+        self.assertEqual(code, "CREATED_VERIFIED")
+        self.assertEqual(contr, ["expiry_date_not_assigned"])
+
+    def test_an_absent_flag_key_keeps_its_existing_fail_closed_behaviour(self):
+        """Omission is not a substitute: it stays falsy in the table, exactly as before."""
+        flags = _write_flags()
+        del flags["expiry_date_assigned"]
+        self.assertEqual(contract.terminal_state_boolean_type_violations(flags), [])
+        code, contr = contract.recompute_terminal_state(flags)
+        self.assertEqual(code, "CREATED_VERIFIED")
+        self.assertIn("expiry_date_not_assigned", contr)
+
+    def test_no_flag_value_is_ever_echoed_in_a_reason(self):
+        sentinel = "MEMBER-90000001-SYNTHETIC"
+        contr = contract.terminal_state_contradictions(
+            _write_flags(expiry_date_assigned=sentinel)
+        )
+        self.assertEqual(contr, ["expiry_date_assigned_not_boolean"])
+        for reason in contr:
+            self.assertNotIn(sentinel, reason)
+
+
 class TerminalCodeTests(unittest.TestCase):
     def test_required_codes_present(self):
         for code in (
