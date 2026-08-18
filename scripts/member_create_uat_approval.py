@@ -678,6 +678,104 @@ def _fsync_parent_directory(directory):
     return "file_and_directory_fsync"
 
 
+# ---- package-publication durability (DL-XB-127-001-A1) ------------------------------- #
+# The mode `_fsync_parent_directory` reports once it has fsynced a real directory handle.
+PACKAGE_DURABILITY_POSIX = "file_and_directory_fsync"
+# The Windows mode: the published package's OWN path is opened write-through and flushed. The
+# name deliberately does not claim a directory fsync, which Windows does not offer.
+PACKAGE_DURABILITY_WINDOWS = "windows_package_path_flush_write_through"
+
+
+def _supports_directory_fsync():
+    """Whether this platform offers a directory-handle fsync (POSIX) or not (Windows).
+
+    Deliberately a SEPARATE predicate from the one inside `_fsync_parent_directory`: the
+    reservation and new-ledger directory-durability contracts are already settled and must keep
+    their exact behaviour, so this amendment adds a package-only branch rather than editing
+    that shared helper.
+    """
+    return hasattr(os, "O_DIRECTORY")
+
+
+def _flush_windows_package_path(out_path):
+    """Commit the published package's own path on the PACKAGE OUTPUT's own NTFS volume.
+
+    Why the package path rather than the ledger: `--ledger` and `--package-out` are validated
+    independently by `contract.assert_safe_local_path`, which takes one path and imposes no
+    same-volume relation, so they may legitimately sit on two different fixed local NTFS
+    volumes. A later approval-ledger fsync therefore proves nothing about the package volume.
+    Opening the package path itself makes the barrier's target the package volume BY
+    CONSTRUCTION, whatever the ledger location is.
+
+    Why not a directory or volume handle: Windows exposes no documented directory-handle fsync
+    (see `_fsync_parent_directory`), and Microsoft documents that flushing a whole volume with
+    `FlushFileBuffers` requires a handle to the volume whose "caller must have administrative
+    privileges" - which a UAT operator does not have.
+
+    Microsoft-documented basis for the primitive actually used:
+      * `CreateFileW` opens the published package with `GENERIC_WRITE` - the access right
+        `FlushFileBuffers` documents as required - plus `FILE_FLAG_WRITE_THROUGH`, which
+        "also causes NTFS to flush any metadata changes, such as a time stamp update or a
+        rename operation, that result from processing the request".
+      * `FlushFileBuffers` "writes all the buffered information for a specified file to the
+        device", and CreateFile's remarks name it explicitly as the metadata barrier: "the
+        file metadata may still be cached ... To ensure that the metadata is flushed to disk,
+        use the FlushFileBuffers function".
+
+    `OPEN_EXISTING` never creates, truncates, replaces or renames, so the barrier itself can
+    never alter the published package. Raises `OSError` (via `ctypes.WinError`) when the handle
+    cannot be opened or the flush fails, so the caller fails closed instead of claiming a
+    durability it never achieved.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    generic_write = 0x40000000
+    share_read_write_delete = 0x00000001 | 0x00000002 | 0x00000004
+    open_existing = 3
+    file_flag_write_through = 0x80000000
+    invalid_handle = ctypes.c_void_p(-1).value
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = (wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                            wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE)
+    create_file.restype = wintypes.HANDLE
+    flush_buffers = kernel32.FlushFileBuffers
+    flush_buffers.argtypes = (wintypes.HANDLE,)
+    flush_buffers.restype = wintypes.BOOL
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = (wintypes.HANDLE,)
+    close_handle.restype = wintypes.BOOL
+
+    handle = create_file(str(out_path), generic_write, share_read_write_delete, None,
+                         open_existing, file_flag_write_through, None)
+    if not handle or handle == invalid_handle:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        if not flush_buffers(handle):
+            raise ctypes.WinError(ctypes.get_last_error())
+    finally:
+        close_handle(handle)
+    return PACKAGE_DURABILITY_WINDOWS
+
+
+def _commit_package_publication(out_path):
+    """Make the package output's namespace change durable; report the mode actually achieved.
+
+    POSIX: unchanged - fsync the output DIRECTORY handle, exactly as before this amendment.
+    Windows: flush the published package's own path on the package volume, because the
+    platform offers no directory-handle fsync and the approval ledger may legitimately live on
+    a different fixed local NTFS volume.
+
+    Raises `OSError` when the barrier cannot be established, which the publication writer turns
+    into the explicit `PUBLISHED_DURABILITY_UNCONFIRMED` non-success rather than a clean build.
+    """
+    if _supports_directory_fsync():
+        return _fsync_parent_directory(out_path.parent)
+    return _flush_windows_package_path(out_path)
+
+
 def _slot_absence_state(path):
     """Classify a reservation slot after a failed create, WITHOUT following links.
 
@@ -1537,8 +1635,8 @@ def cmd_build_package(args):
         "reservation": "confirmed_durable",
         "reservation_basename": reservation_basename,
         "reservation_durability": result.reservation_durability,
-        # The output-directory durability mode actually achieved for the final package entry,
-        # reported rather than assumed (the unconfirmed branch below overrides it explicitly).
+        # The package-publication durability mode actually achieved for the final package
+        # entry, reported rather than assumed (the unconfirmed branch below overrides it).
         "publication_durability": result.publication_durability,
         "build_claim": "committed",
         "claim_id": claim_record["claim_id"],
@@ -1550,8 +1648,9 @@ def cmd_build_package(args):
     }
 
     if result.state == _PublishState.PUBLISHED_DURABILITY_UNCONFIRMED:
-        # The final hard link exists but its output-directory entry was never confirmed durable,
-        # so ordinary success is impossible: a restart could lose the package while the durable
+        # The final hard link exists but the package output's own namespace entry was never
+        # confirmed durable on the package volume, so ordinary success is impossible: a restart
+        # could lose the package while the durable
         # reservation and the committed claim have permanently consumed the approval. The
         # published package is NOT deleted, truncated, renamed or modified, no build event
         # claims a clean publication, the consumed approval is never reopened to mint another
@@ -1982,8 +2081,9 @@ class _PublishState:
     ``PUBLISHED_*``            the final package exists and is never rolled back.
 
     ``PUBLISHED_DURABILITY_UNCONFIRMED`` additionally means the final hard link was created but
-    its OUTPUT-DIRECTORY entry could not be confirmed durable, so a clean published package
-    must not be claimed even though the package is present and is never removed.
+    the package output's own namespace entry could not be confirmed durable - the output
+    directory handle on POSIX, the package path itself on Windows - so a clean published
+    package must not be claimed even though the package is present and is never removed.
     """
 
     NOT_PUBLISHED = "not_published"
@@ -2009,8 +2109,8 @@ class _PublishResult:
         self.temp_stale = cleanup_error is not None  # an operation-owned temp remains
         self.reservation_state = reservation_state          # not_created | uncertain | None
         self.reservation_durability = reservation_durability  # achieved durability mode
-        # The output-directory durability mode actually achieved for the final link, or None
-        # when it was never confirmed. Reported, never assumed.
+        # The package-publication durability mode actually achieved for the final link, or
+        # None when it was never confirmed. Reported, never assumed.
         self.publication_durability = publication_durability
 
 
@@ -2053,12 +2153,14 @@ def _write_package_atomically(package_out, package, reserve):
 
     Durable publication: ``os.link`` makes the final name VISIBLE, but the new directory
     entry lives in the output directory's metadata, which the temporary's own fsync does not
-    cover. The output directory is therefore committed with the platform durability primitive
-    immediately after linking, and again after the temporary is unlinked, so an exit-0 clean
-    publication never claims a directory state whose durability was never confirmed. A failure
-    to confirm it is the explicit ``PUBLISHED_DURABILITY_UNCONFIRMED`` non-success state: the
-    published package is still never deleted, truncated, renamed or modified, and the consumed
-    reservation/claim is never reopened to mint another package.
+    cover. ``_commit_package_publication`` is therefore called immediately after linking, and
+    again after the temporary is unlinked, so an exit-0 clean publication never claims a
+    namespace state whose durability was never confirmed. That barrier always targets the
+    PACKAGE OUTPUT's own path/volume - the output directory handle on POSIX, the package path
+    itself on Windows - never the approval ledger, which may sit on a different volume. A
+    failure to confirm it is the explicit ``PUBLISHED_DURABILITY_UNCONFIRMED`` non-success
+    state: the published package is still never deleted, truncated, renamed or modified, and
+    the consumed reservation/claim is never reopened to mint another package.
 
     Truthful cleanup: after resolving publication, exactly the ONE operation-owned
     temporary path is unlinked. A failed unlink is NOT swallowed - it is reported so the
@@ -2114,17 +2216,19 @@ def _write_package_atomically(package_out, package, reserve):
         )
         cause.__cause__ = error
 
-    # Commit the FINAL LINK's directory entry before any clean publication can be claimed. The
-    # temporary's fsync persisted the inode's bytes; the new final NAME is directory metadata,
-    # which a crash can lose while the reservation and claim have permanently consumed the
-    # approval. Kept outside the publication try above so a durability failure can never be
-    # reported as a link/write failure, and so `published` stays true: the package exists and is
-    # never rolled back.
+    # Commit the FINAL LINK on the PACKAGE OUTPUT's own volume before any clean publication can
+    # be claimed. The temporary's fsync persisted the inode's bytes; the new final NAME is
+    # namespace metadata, which a crash can lose while the reservation and claim have
+    # permanently consumed the approval. The later approval-ledger fsync cannot stand in for
+    # this: `--ledger` and `--package-out` are validated independently, so they may legitimately
+    # sit on different fixed local NTFS volumes. Kept outside the publication try above so a
+    # durability failure can never be reported as a link/write failure, and so `published` stays
+    # true: the package exists and is never rolled back.
     publication_durability = None
     durability_error = None
     if published:
         try:
-            publication_durability = _fsync_parent_directory(out_path.parent)
+            publication_durability = _commit_package_publication(out_path)
         except OSError as error:
             durability_error = error
 
@@ -2138,12 +2242,12 @@ def _write_package_atomically(package_out, package, reserve):
         cleanup_error = unlink_err
     else:
         if published:
-            # The unlink itself succeeded, but until the output directory is committed again the
+            # The unlink itself succeeded, but until the package output is committed again the
             # removal may not survive a restart, so the temporary could reappear. Recorded as a
             # cleanup failure - the same truthful, manual-cleanup-required direction - rather
             # than reported as a completed cleanup.
             try:
-                _fsync_parent_directory(out_path.parent)
+                _commit_package_publication(out_path)
             except OSError as unlink_durability_err:
                 cleanup_error = unlink_durability_err
 
