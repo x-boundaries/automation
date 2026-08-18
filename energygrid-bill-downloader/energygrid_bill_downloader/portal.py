@@ -71,15 +71,74 @@ class PlaywrightPortal:
         page = self._require_page()
         try:
             page.goto(self.config.portal_url, wait_until="domcontentloaded")
-            page.get_by_role("link", name="Login", exact=True).click()
+            self._enter_public_semantics(page).click()
             page.get_by_label("Username", exact=True).fill(username)
             page.get_by_label("Password", exact=True).fill(password)
             page.get_by_role("button", name="Login", exact=True).click()
             page.get_by_role("link", name="Billing Manager", exact=True).wait_for(state="visible")
+        except LayoutChangedError:
+            # A proven pre-auth contract failure must not be reclassified as a
+            # credential rejection just because the page also renders an alert.
+            raise
         except Exception as exc:
             if self._visible(page, page.get_by_role("alert")):
                 raise LoginError("portal rejected the login") from exc
             raise LayoutChangedError("required login control is missing or ambiguous") from exc
+
+    def _enter_public_semantics(self, page: Any) -> Any:
+        """Open the public Flutter semantics gate and return the Login entry.
+
+        The public pre-auth page is a Flutter surface whose only initially
+        exposed control is the accessibility semantics activation button.
+        Application semantics -- and with them the Login entry -- appear only
+        after exactly one dispatched click. Every precondition is proven before
+        that dispatch, so a changed public contract fails closed without the
+        page being interacted with at all.
+        """
+
+        activation = page.get_by_role("button", name="Enable accessibility", exact=True)
+        self._await_control(activation, "Flutter semantics activation control")
+        self._require_single_ready_control(activation, "Flutter semantics activation control")
+
+        # Exactly one activation per login attempt: no retry, no fallback
+        # activation mechanism, and no second dispatch on any path below.
+        activation.dispatch_event("click")
+
+        try:
+            page.locator("flt-semantics-placeholder").wait_for(state="detached")
+        except Exception as exc:
+            raise LayoutChangedError(
+                "Flutter semantics placeholder remained after activation"
+            ) from exc
+
+        login_entry = page.get_by_role("button", name="Login", exact=True)
+        self._await_control(login_entry, "post-activation Login control")
+        self._require_single_ready_control(login_entry, "post-activation Login control")
+        return login_entry
+
+    @staticmethod
+    def _await_control(locator: Any, description: str) -> None:
+        """Wait, within the configured page timeout, for at least one match."""
+
+        try:
+            locator.first.wait_for(state="attached")
+        except Exception as exc:
+            raise LayoutChangedError(f"{description} did not appear") from exc
+
+    @staticmethod
+    def _require_single_ready_control(locator: Any, description: str) -> None:
+        """Fail closed unless exactly one match is present, visible and enabled."""
+
+        try:
+            count = locator.count()
+            # Short-circuits so an ambiguous match is never asked for state.
+            ready = count == 1 and locator.is_visible() and locator.is_enabled()
+        except Exception as exc:
+            raise LayoutChangedError(f"{description} could not be resolved") from exc
+        if count != 1:
+            raise LayoutChangedError(f"{description} is missing or ambiguous")
+        if not ready:
+            raise LayoutChangedError(f"{description} is hidden or disabled")
 
     def inventory(self, safety_ceiling: int) -> list[BillRef]:
         page = self._require_page()
