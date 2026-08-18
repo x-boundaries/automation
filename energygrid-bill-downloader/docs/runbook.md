@@ -21,7 +21,7 @@ only; it is not a live configuration and contains no credential values.
 
 ## Runtime prerequisites
 
-- Windows host with Python 3.12.x.
+- Windows host with Python 3.14.x.
 - The pinned `playwright==1.61.0` package installed in the approved runtime.
 - Chromium provisioned separately with the official Playwright mechanism. The
   daily job does not install packages or browsers.

@@ -1,7 +1,7 @@
 # Energy@Grid daily bill downloader
 
 Deterministic Windows downloader for the Energy@Grid tenant portal. The normal
-runtime is Python 3.12.x plus pinned Playwright and a freshly created browser
+runtime is Python 3.14.x plus pinned Playwright and a freshly created browser
 context. It inventories the complete available bill list, validates PDFs, and
 publishes each new bill exactly once to a private archive.
 
@@ -12,7 +12,7 @@ client. The browser is used only through the selectors in
 
 ## Install and configure
 
-Use a dedicated Python 3.12.x environment. Install the pinned package and
+Use a dedicated Python 3.14.x environment. Install the pinned package and
 provision Chromium separately with the official Playwright mechanism:
 
 ```powershell
