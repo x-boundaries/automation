@@ -819,6 +819,40 @@ function Get-ExpiryProbeStateContradictions {
     if ($attempted -and -not $contacted) { $reasons.Add('save_without_contact') }
     if ($initialExists -and -not $initialRead) { $reasons.Add('member_exists_without_read_attempt') }
     if ($recheck -and -not $recheckRead) { $reasons.Add('recheck_without_read_attempt') }
+
+    # ---- Initial-duplicate chronology (closed-PR #119 finding PRRT_kwDOSbJI_s6WhZdN) ---- #
+    # The runtime records member_exists_initial from the FIRST GetMember read and then throws
+    # immediately, so every flag below is set strictly AFTER that throw point: NewMember, the
+    # narrow synthetic assignment, the recheck read, the SaveMember method lookup, the attempt
+    # claim, the save itself and the read-back all follow it. A record carrying the initial
+    # duplicate together with any of them describes a runtime path that cannot have executed,
+    # and it must not be able to derive or declare a post-block outcome - least of all
+    # EXPIRY_VERIFIED, which is what the finding proved was reachable.
+    #
+    # Each impossible companion is named individually so an operator sees exactly which fact
+    # contradicts the block; every reason is a fixed public-safe identity and no value is echoed.
+    #
+    # synthetic_member_may_remain is deliberately NOT listed: the runtime sets it INSIDE the
+    # initial-duplicate block itself, so a truthful BLOCKED_MEMBER_EXISTS record legitimately
+    # carries it. autocount_contacted and initial_member_read_attempted are likewise required
+    # to be true, and are already enforced above. A legitimate initial duplicate therefore still
+    # produces zero contradictions and still derives BLOCKED_MEMBER_EXISTS.
+    if ($initialExists) {
+        $afterInitialDuplicate = @(
+            'new_member_success', 'assignment_success', 'expiry_date_assigned',
+            'member_recheck_attempted', 'member_exists_recheck', 'save_member_method_found',
+            'claim_created', 'claim_conflict', 'claim_persist_failed', 'claim_lost_after_contact',
+            'save_member_attempted', 'save_member_confirmed', 'readback_found', 'expiry_match'
+        )
+        foreach ($name in $afterInitialDuplicate) {
+            if ([bool](Get-ExpiryProbeFlag $Flags $name $false)) {
+                $reasons.Add('initial_duplicate_with_' + $name)
+            }
+        }
+        # The save outcome is a closed vocabulary, so anything other than the pre-save value is
+        # equally impossible here. An invalid value is already reported as save_outcome_invalid.
+        if ($outcome -ne 'not_attempted') { $reasons.Add('initial_duplicate_with_save_outcome') }
+    }
     return $reasons.ToArray()
 }
 
@@ -1129,6 +1163,47 @@ function Test-ExpiryProbeAuthoritativeResult {
         elseif ($basename.Equals($declaredStaging, [System.StringComparison]::Ordinal)) { $reasons.Add('artefact_is_staging') }
     }
 
+    # ---- Attempt/claim BINDING, recomputed (closed-PR #119 finding PRRT_kwDOSbJI_s6WhZdM) ---- #
+    # The schema only checks the SYNTAX of these identifiers, so a pattern-valid substitute could
+    # previously re-attribute an artefact to a different AutoCount target, a different synthetic
+    # record, a different intended ExpiryDate or a different single-use claim while every success
+    # flag still read as authoritative. That breaks exactly the attribution operators rely on.
+    #
+    # The stable attempt key is therefore RECOMPUTED here with the SAME production helper the
+    # probe used, from the record's own target/synthetic/intended fields, and the claim basename
+    # is recomputed from that EXPECTED key with the SAME production helper. Deriving the claim
+    # from the expected key (not from the stored one) binds the claim namespace transitively to
+    # the target as well, so a consistently rewritten pair still fails.
+    #
+    # Neither the fingerprint algorithm/format nor the claim-basename algorithm/format is altered;
+    # both helpers are reused exactly as locked. The producer records all five fields before the
+    # state root is even validated, so every truthful artefact - including a fail-closed one -
+    # already carries a bound set and is unaffected.
+    $recordTarget = [string](Get-ExpiryProbeFlag $Record 'target_fingerprint' '')
+    $recordSynthetic = [string](Get-ExpiryProbeFlag $Record 'synthetic_fingerprint' '')
+    $recordIntended = Get-ExpiryProbeCanonicalDateText -Value (Get-ExpiryProbeFlag $Record 'intended_expiry_date' $null) `
+        -Format $script:ExpiryProbeAuthoritativeDateFields['intended_expiry_date']
+    $storedAttempt = [string](Get-ExpiryProbeFlag $Record 'attempt_fingerprint' '')
+    $storedClaim = [string](Get-ExpiryProbeFlag $Record 'claim_basename' '')
+    if ([string]::IsNullOrWhiteSpace($recordTarget) -or [string]::IsNullOrWhiteSpace($recordSynthetic) -or
+        [string]::IsNullOrWhiteSpace($recordIntended) -or [string]::IsNullOrWhiteSpace($storedAttempt) -or
+        [string]::IsNullOrWhiteSpace($storedClaim)) {
+        # The schema gate already reports the underlying type/pattern failure. Recomputation is
+        # skipped rather than attempted with an unusable input, and the binding is NOT asserted.
+        $reasons.Add('attempt_binding_fields_unusable')
+    }
+    else {
+        $expectedAttempt = Get-ExpiryProbeAttemptFingerprint -TargetFingerprint $recordTarget `
+            -SyntheticFingerprint $recordSynthetic -IntendedExpiry $recordIntended
+        if (-not $storedAttempt.Equals($expectedAttempt, [System.StringComparison]::Ordinal)) {
+            $reasons.Add('attempt_fingerprint_not_bound')
+        }
+        $expectedClaim = Get-ExpiryProbeClaimBasename -AttemptFingerprint $expectedAttempt
+        if (-not $storedClaim.Equals($expectedClaim, [System.StringComparison]::Ordinal)) {
+            $reasons.Add('claim_basename_not_bound')
+        }
+    }
+
     # ---- Terminal-state truth, DERIVED from the recorded runtime flags ---- #
     # A record's declared outcome is never trusted. The underlying outcome is recomputed with
     # the SAME pure derivation the runtime uses, and the final outcome is recomputed from that
@@ -1177,6 +1252,34 @@ function Test-ExpiryProbeAuthoritativeResult {
             if (-not [bool](Get-ExpiryProbeFlag $Record $flagName $false)) {
                 $reasons.Add('verified_without_required_runtime_state')
                 break
+            }
+        }
+
+        # ---- The read-back VALUE (closed-PR #119 finding PRRT_kwDOSbJI_s6WhZdL) ---- #
+        # expiry_match is only a Boolean the producer computed; it is not itself the proof. This
+        # validator gates the claim that ExpiryDate actually PERSISTED, so an authoritative
+        # EXPIRY_VERIFIED must carry the read-back DATE it matched, and that date must be the
+        # intended one. Previously a null, divergent or malformed read-back value could stand
+        # behind expiry_match=true and still be accepted.
+        #
+        # The value is judged under the SAME canonical date contract the schema applies to
+        # intended_expiry_date - the shared Get-ExpiryProbeCanonicalDateText rendering plus the
+        # shared yyyy-MM-dd pattern - so no new date representation is introduced. The nullable
+        # date field is deliberately allowed to be null by the schema (a run that never read back
+        # has no value), which is exactly why the requirement belongs here, bound to the verified
+        # outcome, rather than in the schema.
+        $readbackRaw = Get-ExpiryProbeUnwrappedValue (Get-ExpiryProbeFlag $Record 'expiry_date_readback_value' $null)
+        if ($null -eq $readbackRaw) { $reasons.Add('verified_without_readback_value') }
+        else {
+            $readbackCanonical = Get-ExpiryProbeCanonicalDateText -Value $readbackRaw `
+                -Format $script:ExpiryProbeAuthoritativeNullableDateFields['expiry_date_readback_value']
+            if ($readbackCanonical -notmatch $script:ExpiryProbeFieldPatterns['intended_expiry_date']) {
+                # A substitute the nullable-date schema check lets through (it only requires a
+                # non-blank rendering) is refused here rather than compared.
+                $reasons.Add('readback_value_not_canonical_date')
+            }
+            elseif (-not $readbackCanonical.Equals($recordIntended, [System.StringComparison]::Ordinal)) {
+                $reasons.Add('readback_value_not_intended_date')
             }
         }
     }

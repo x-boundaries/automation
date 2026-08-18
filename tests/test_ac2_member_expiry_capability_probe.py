@@ -1853,25 +1853,56 @@ def _field_setter(field, value):
     return mutate
 
 
+def bound_attempt_fingerprint(target_fingerprint, synthetic_fingerprint, intended_expiry_date):
+    """The attempt fingerprint Get-ExpiryProbeAttemptFingerprint derives for these three fields.
+
+    #128 finding PRRT_kwDOSbJI_s6WhZdM makes the attempt key a BOUND value rather than a merely
+    pattern-valid one, so a fixture can no longer use an arbitrary `afp_ccc...` placeholder. The
+    canonical pre-image below is the reviewed library's own, and
+    `test_the_bound_fixture_matches_the_production_attempt_binding` proves this derivation equals
+    what the production helper returns, so the two cannot drift apart.
+    """
+    canonical = "%s|%s|%s|%s" % (
+        SCHEMA_VERSION, target_fingerprint, synthetic_fingerprint, intended_expiry_date)
+    return "afp_" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def bound_claim_basename(attempt_fingerprint):
+    """The claim basename Get-ExpiryProbeClaimBasename derives for an attempt fingerprint."""
+    return "expiry_probe_claim_%s.claim" % attempt_fingerprint
+
+
 def verified_record(operation_id="expop_authoritative01"):
     """A complete, correctly typed, internally consistent authoritative EXPIRY_VERIFIED record.
 
     Every top-level field the reviewed probe emits is present with its real CLR type: actual
     Booleans, an actual integral exit code and actual strings. Adversarial tests mutate exactly
     one field at a time from this baseline.
+
+    The attempt fingerprint and claim basename are DERIVED, not invented: #128 finding
+    PRRT_kwDOSbJI_s6WhZdM requires the authoritative validator to recompute both from the
+    record's own target/synthetic/intended fields, so a positive control has to carry a genuinely
+    bound set. `expiry_date_readback_value` likewise equals `intended_expiry_date` exactly, which
+    finding PRRT_kwDOSbJI_s6WhZdL now requires of a verified record, and `member_exists_initial`
+    stays false, which finding PRRT_kwDOSbJI_s6WhZdN requires of any post-block state.
     """
     final_basename = "expiry_probe_result_%s.json" % operation_id
+    target_fingerprint = "tfp_" + ("a" * 64)
+    synthetic_fingerprint = "smf_" + ("b" * 64)
+    intended_expiry_date = "2028-06-30"
+    attempt_fingerprint = bound_attempt_fingerprint(
+        target_fingerprint, synthetic_fingerprint, intended_expiry_date)
     record = {
         "schema_version": SCHEMA_VERSION,
         "mode": "member-expiry-capability-probe",
         "operation_id": operation_id,
         "approval_reference": "APPROVAL-TEST-001",
         "executed_at_utc": "2026-08-03T00:00:00Z",
-        "target_fingerprint": "tfp_" + ("a" * 64),
-        "synthetic_fingerprint": "smf_" + ("b" * 64),
-        "attempt_fingerprint": "afp_" + ("c" * 64),
-        "intended_expiry_date": "2028-06-30",
-        "claim_basename": "expiry_probe_claim_afp_%s.claim" % ("c" * 64),
+        "target_fingerprint": target_fingerprint,
+        "synthetic_fingerprint": synthetic_fingerprint,
+        "attempt_fingerprint": attempt_fingerprint,
+        "intended_expiry_date": intended_expiry_date,
+        "claim_basename": bound_claim_basename(attempt_fingerprint),
         "result_basename": final_basename,
         "staging_basename": "expiry_probe_staging_%s.incomplete" % operation_id,
         "publication_contract": {
@@ -1884,7 +1915,7 @@ def verified_record(operation_id="expop_authoritative01"):
         "masked_member_no": "XB***1",
         "residual_record_note": "No automatic member update, delete, rollback, or cleanup is performed.",
         "readback_error": None,
-        "expiry_date_readback_value": "2028-06-30",
+        "expiry_date_readback_value": intended_expiry_date,
         "underlying_terminal_outcome": "EXPIRY_VERIFIED",
         "terminal_outcome": "EXPIRY_VERIFIED",
         "exit_code": 0,
@@ -1989,6 +2020,43 @@ switch ($Op) {
     'contradictions' {
         $ctx = Get-Content -LiteralPath $CtxJson -Raw -Encoding UTF8 | ConvertFrom-Json
         Write-Output (@(Get-ExpiryProbeStateContradictions -Flags $ctx) -join ',')
+    }
+    'canondate' {
+        # #128 finding PRRT_kwDOSbJI_s6WhZdL. Report the canonical yyyy-MM-dd rendering the
+        # PRODUCTION helper produces for a record's expiry_date_readback_value AS THIS HOST'S
+        # JSON parser delivered it. PowerShell 7 converts ISO-8601 text to [datetime] while
+        # Windows PowerShell 5.1 leaves it a [string]; the reviewed date contract accepts both
+        # and judges them by this one rendering, so a test must derive its expectation from it
+        # rather than assume a single platform's CLR shape.
+        $ctx = Get-Content -LiteralPath $CtxJson -Raw -Encoding UTF8 | ConvertFrom-Json
+        $raw = $ctx.expiry_date_readback_value
+        # Written as a statement, not an inline if-expression: statements-as-expressions are a
+        # PowerShell 7 feature and this harness must also parse under Windows PowerShell 5.1.
+        $clrType = 'null'
+        if ($null -ne $raw) { $clrType = $raw.GetType().Name }
+        [pscustomobject]@{
+            clr_type  = $clrType
+            canonical = (Get-ExpiryProbeCanonicalDateText -Value $raw -Format 'yyyy-MM-dd')
+        } | ConvertTo-Json -Compress
+    }
+    'bindattempt' {
+        # #128 finding PRRT_kwDOSbJI_s6WhZdM. Report the attempt fingerprint and claim basename
+        # the PRODUCTION helpers derive for a record's own target/synthetic/intended fields, so
+        # the Python fixture's bound values are proved against the real algorithm rather than a
+        # restatement of it. $CtxJson = any record carrying the three source fields.
+        $ctx = Get-Content -LiteralPath $CtxJson -Raw -Encoding UTF8 | ConvertFrom-Json
+        # The intended date goes through the SAME canonical renderer the validator uses, never a
+        # bare [string] cast: if a host's JSON parser delivered it as [datetime], casting would
+        # produce a culture-formatted value instead of yyyy-MM-dd and this harness would compare
+        # the fixture against the wrong pre-image.
+        $af = Get-ExpiryProbeAttemptFingerprint `
+            -TargetFingerprint ([string]$ctx.target_fingerprint) `
+            -SyntheticFingerprint ([string]$ctx.synthetic_fingerprint) `
+            -IntendedExpiry (Get-ExpiryProbeCanonicalDateText -Value $ctx.intended_expiry_date -Format 'yyyy-MM-dd')
+        [pscustomobject]@{
+            attempt_fingerprint = $af
+            claim_basename      = (Get-ExpiryProbeClaimBasename -AttemptFingerprint $af)
+        } | ConvertTo-Json -Compress
     }
     'exit' { Write-Output ([string](Get-ExpiryProbeExitCode -TerminalOutcome $Text)) }
     'final' {
@@ -3188,8 +3256,14 @@ class ExpiryProbeLibraryTests(unittest.TestCase):
                          ("ATTEMPT_CLAIM_LOST_AFTER_CONTACT", 0))
         self.assertEqual(self._terminal(**self._contacted(claim_persist_failed=True)),
                          ("CLAIM_PERSISTENCE_FAILED", 0))
-        self.assertEqual(self._terminal(**self._contacted(member_exists_initial=True)),
-                         ("BLOCKED_MEMBER_EXISTS", 0))
+        # A TRUTHFUL initial duplicate performed the first read and then threw, so it never
+        # reached the recheck read. #128 finding PRRT_kwDOSbJI_s6WhZdN makes that chronology
+        # enforceable, so the fixture states it exactly: contacted, initial read done, no
+        # recheck. It still derives BLOCKED_MEMBER_EXISTS with zero contradictions.
+        self.assertEqual(
+            self._terminal(**self._contacted(member_exists_initial=True,
+                                             member_recheck_attempted=False)),
+            ("BLOCKED_MEMBER_EXISTS", 0))
         self.assertEqual(self._terminal(**self._contacted(member_exists_recheck=True)),
                          ("BLOCKED_MEMBER_EXISTS", 0))
         self.assertEqual(self._terminal(), ("FAILED_BEFORE_WRITE", 0))
@@ -3783,6 +3857,329 @@ class ExpiryProbeLibraryTests(unittest.TestCase):
         verdict = self._json("authoritative", Text=str(final), CtxJson=str(path))
         self.assertTrue(verdict["authoritative"], "reasons=%s" % as_list(verdict["reasons"]))
         self.assertEqual(as_list(verdict["reasons"]), [])
+
+    # ------------------------------------------------------------------ #
+    # #128 / DL-XB-128-001-R1: the three residual closed-PR #119 evidence-integrity findings.
+    #
+    # Every case below drives the REAL Test-ExpiryProbeAuthoritativeResult (or the real
+    # Get-ExpiryProbeStateContradictions) through the library harness against a bounded
+    # SYNTHETIC record. Nothing here contacts AutoCount, and no private value is used: the
+    # fingerprints are literal test constants and the member number is only ever masked.
+    # ------------------------------------------------------------------ #
+    def _verdict(self, name, record, operation_id):
+        path = self._record_file(name, record)
+        final = self.tmp / ("expiry_probe_result_%s.json" % operation_id)
+        return self._json("authoritative", Text=str(final), CtxJson=str(path))
+
+    # ---- A. Verified read-back VALUE integrity (PRRT_kwDOSbJI_s6WhZdL) ---- #
+    def test_verified_record_requires_a_readback_value_equal_to_the_intended_date(self):
+        """Positive control: the exact intended/read-back date is accepted."""
+        operation_id = "expop_rbvalue_ok"
+        record = verified_record(operation_id)
+        self.assertEqual(record["expiry_date_readback_value"], record["intended_expiry_date"])
+        verdict = self._verdict("rb_ok.json", record, operation_id)
+        self.assertTrue(verdict["authoritative"], "reasons=%s" % as_list(verdict["reasons"]))
+        self.assertEqual(as_list(verdict["reasons"]), [])
+
+    def test_verified_record_with_a_null_readback_value_is_refused(self):
+        """The originating exploit: expiry_match=true standing alone with no read-back date."""
+        operation_id = "expop_rbvalue_null"
+        record = verified_record(operation_id)
+        record["expiry_date_readback_value"] = None
+        self.assertTrue(record["expiry_match"], "the exploit keeps the Boolean true")
+        verdict = self._verdict("rb_null.json", record, operation_id)
+        self.assertFalse(verdict["authoritative"])
+        self.assertIn("verified_without_readback_value", as_list(verdict["reasons"]))
+
+    def test_verified_record_with_a_different_well_formed_date_is_refused(self):
+        operation_id = "expop_rbvalue_other"
+        record = verified_record(operation_id)
+        record["expiry_date_readback_value"] = "2031-01-01"
+        verdict = self._verdict("rb_other.json", record, operation_id)
+        self.assertFalse(verdict["authoritative"])
+        self.assertIn("readback_value_not_intended_date", as_list(verdict["reasons"]))
+
+    def test_verified_record_with_a_malformed_readback_substitute_is_refused(self):
+        """The nullable-date schema check only requires a non-blank rendering, so a text
+        substitute reaches semantic validation. It must be refused, not compared.
+
+        Every substitute below is refused on BOTH supported JSON parsers. `2031-01-01T00:00:00Z`
+        is deliberately a DIFFERENT date in ISO-8601 form, so it fails whichever CLR shape the
+        host produces: Windows PowerShell 5.1 keeps it a string that is not canonical
+        `yyyy-MM-dd`, and PowerShell 7 converts it to a [datetime] that canonicalises to a date
+        which is not the intended one. An ISO form of the SAME date is parser-dependent by
+        design and is covered separately by
+        test_an_iso_readback_value_follows_the_documented_date_contract.
+        """
+        operation_id = "expop_rbvalue_bad"
+        for substitute in ("not-a-date", "2028-6-30", "2031-01-01T00:00:00Z", " ", "30/06/2028"):
+            with self.subTest(substitute=substitute):
+                record = verified_record(operation_id)
+                record["expiry_date_readback_value"] = substitute
+                verdict = self._verdict("rb_bad.json", record, operation_id)
+                self.assertFalse(verdict["authoritative"])
+                reasons = as_list(verdict["reasons"])
+                self.assertTrue(
+                    any(r in reasons for r in ("readback_value_not_canonical_date",
+                                               "readback_value_not_intended_date",
+                                               "schema_string_field_invalid")),
+                    "a malformed read-back substitute must fail closed; reasons=%s" % reasons)
+
+    def test_an_iso_readback_value_follows_the_documented_date_contract(self):
+        """An ISO-8601 read-back value is judged by the library's ONE canonical rendering.
+
+        The reviewed date contract states that supported JSON parsers disagree on CLR type -
+        PowerShell 7 converts ISO-8601 text to [datetime], Windows PowerShell 5.1 leaves it a
+        [string] - and that both are accepted and validated against the same canonical rendering.
+        So `2028-06-30T00:00:00Z` is NOT a divergent value: on a host whose parser normalises it,
+        it denotes exactly the intended date and must be accepted; on a host that does not, it is
+        not canonical `yyyy-MM-dd` and must be refused.
+
+        Rather than assume one platform, this derives the expectation from the production
+        renderer itself, so the case is deterministic on both hosts and cannot pass for the
+        wrong reason.
+        """
+        operation_id = "expop_rbvalue_iso"
+        record = verified_record(operation_id)
+        record["expiry_date_readback_value"] = "2028-06-30T00:00:00Z"
+        path = self._record_file("rb_iso.json", record)
+        rendered = self._json("canondate", CtxJson=str(path))
+        verdict = self._verdict("rb_iso.json", record, operation_id)
+        if rendered["canonical"] == record["intended_expiry_date"]:
+            # The host's parser normalised it to the intended date (PowerShell 7 behaviour).
+            self.assertIn(rendered["clr_type"], ("DateTime",), rendered)
+            self.assertTrue(verdict["authoritative"], "reasons=%s" % as_list(verdict["reasons"]))
+        else:
+            # The host left it as text (Windows PowerShell 5.1 behaviour), so it is not a
+            # canonical date and the verified outcome must fail closed.
+            self.assertEqual(rendered["clr_type"], "String", rendered)
+            self.assertFalse(verdict["authoritative"])
+            self.assertIn("readback_value_not_canonical_date", as_list(verdict["reasons"]))
+
+    def test_an_equivalent_iso_value_never_launders_a_different_date(self):
+        """The parser-dependent shape must not become a bypass: whichever CLR shape the host
+        produces, an ISO value denoting a DIFFERENT date is refused."""
+        operation_id = "expop_rbvalue_isowrong"
+        record = verified_record(operation_id)
+        record["expiry_date_readback_value"] = "2031-01-01T00:00:00Z"
+        verdict = self._verdict("rb_isowrong.json", record, operation_id)
+        self.assertFalse(verdict["authoritative"])
+        reasons = as_list(verdict["reasons"])
+        self.assertTrue(
+            any(r in reasons for r in ("readback_value_not_canonical_date",
+                                       "readback_value_not_intended_date")),
+            "reasons=%s" % reasons)
+
+    def test_a_truthful_non_verified_outcome_still_needs_no_readback_value(self):
+        """The requirement is bound to EXPIRY_VERIFIED only: a run that never read back
+        legitimately records a null value, and that truthful outcome is preserved."""
+        operation_id = "expop_rbvalue_notverified"
+        record = verified_record(operation_id)
+        record["expiry_match"] = False
+        record["readback_found"] = False
+        record["expiry_date_readback_value"] = None
+        record["underlying_terminal_outcome"] = "WRITE_CONFIRMED_READBACK_FAILED"
+        record["terminal_outcome"] = "WRITE_CONFIRMED_READBACK_FAILED"
+        record["exit_code"] = 1
+        verdict = self._verdict("rb_notverified.json", record, operation_id)
+        self.assertTrue(verdict["authoritative"], "reasons=%s" % as_list(verdict["reasons"]))
+        self.assertNotIn("verified_without_readback_value", as_list(verdict["reasons"]))
+
+    def test_no_readback_reason_echoes_the_offending_value(self):
+        operation_id = "expop_rbvalue_noecho"
+        sentinel = "SENTINEL-90000001-SYNTHETIC"
+        record = verified_record(operation_id)
+        record["expiry_date_readback_value"] = sentinel
+        verdict = self._verdict("rb_noecho.json", record, operation_id)
+        self.assertFalse(verdict["authoritative"])
+        self.assertNotIn(sentinel, json.dumps(as_list(verdict["reasons"])))
+
+    # ---- B. Attempt/claim BINDING integrity (PRRT_kwDOSbJI_s6WhZdM) ---- #
+    def test_the_bound_fixture_matches_the_production_attempt_binding(self):
+        """The Python fixture derivation and the PRODUCTION helpers must agree exactly.
+
+        This is what stops the fixture from drifting into a restatement of the algorithm: the
+        expected values come from Get-ExpiryProbeAttemptFingerprint / Get-ExpiryProbeClaimBasename
+        themselves, run in PowerShell against the record's own three source fields.
+        """
+        operation_id = "expop_bind_parity"
+        record = verified_record(operation_id)
+        path = self._record_file("bind_parity.json", record)
+        produced = self._json("bindattempt", CtxJson=str(path))
+        self.assertEqual(record["attempt_fingerprint"], produced["attempt_fingerprint"])
+        self.assertEqual(record["claim_basename"], produced["claim_basename"])
+        # The locked formats are unchanged.
+        self.assertRegex(record["attempt_fingerprint"], r"^afp_[0-9a-f]{64}$")
+        self.assertRegex(record["claim_basename"], r"^expiry_probe_claim_[A-Za-z0-9_]+\.claim$")
+
+    def test_a_bound_attempt_and_claim_are_accepted(self):
+        operation_id = "expop_bind_ok"
+        verdict = self._verdict("bind_ok.json", verified_record(operation_id), operation_id)
+        self.assertTrue(verdict["authoritative"], "reasons=%s" % as_list(verdict["reasons"]))
+        self.assertEqual(as_list(verdict["reasons"]), [])
+
+    def test_a_pattern_valid_but_unbound_attempt_fingerprint_is_refused(self):
+        operation_id = "expop_bind_afp"
+        record = verified_record(operation_id)
+        record["attempt_fingerprint"] = "afp_" + ("d" * 64)
+        # Still syntactically perfect, which is exactly why the schema alone could not catch it.
+        self.assertRegex(record["attempt_fingerprint"], r"^afp_[0-9a-f]{64}$")
+        verdict = self._verdict("bind_afp.json", record, operation_id)
+        self.assertFalse(verdict["authoritative"])
+        self.assertIn("attempt_fingerprint_not_bound", as_list(verdict["reasons"]))
+
+    def test_a_pattern_valid_but_unbound_claim_basename_is_refused(self):
+        operation_id = "expop_bind_claim"
+        record = verified_record(operation_id)
+        record["claim_basename"] = bound_claim_basename("afp_" + ("e" * 64))
+        self.assertRegex(record["claim_basename"], r"^expiry_probe_claim_[A-Za-z0-9_]+\.claim$")
+        verdict = self._verdict("bind_claim.json", record, operation_id)
+        self.assertFalse(verdict["authoritative"])
+        self.assertIn("claim_basename_not_bound", as_list(verdict["reasons"]))
+
+    def test_a_substituted_target_or_synthetic_or_intended_field_breaks_the_binding(self):
+        """The attribution the finding protects: re-pointing the evidence at another target,
+        another synthetic record or another intended date must fail closed."""
+        operation_id = "expop_bind_source"
+        cases = {
+            "target_fingerprint": "tfp_" + ("9" * 64),
+            "synthetic_fingerprint": "smf_" + ("7" * 64),
+            "intended_expiry_date": "2029-12-31",
+        }
+        for field, substitute in cases.items():
+            with self.subTest(field=field):
+                record = verified_record(operation_id)
+                record[field] = substitute
+                if field == "intended_expiry_date":
+                    # Keep the read-back consistent so this case isolates the BINDING failure.
+                    record["expiry_date_readback_value"] = substitute
+                verdict = self._verdict("bind_source.json", record, operation_id)
+                self.assertFalse(verdict["authoritative"])
+                reasons = as_list(verdict["reasons"])
+                self.assertIn("attempt_fingerprint_not_bound", reasons)
+                self.assertIn("claim_basename_not_bound", reasons)
+
+    def test_a_consistently_rewritten_attempt_and_claim_pair_still_fails(self):
+        """Rewriting BOTH so they agree with each other does not help: the claim basename is
+        recomputed from the EXPECTED attempt key, not from the stored one."""
+        operation_id = "expop_bind_pair"
+        record = verified_record(operation_id)
+        forged = "afp_" + ("f" * 64)
+        record["attempt_fingerprint"] = forged
+        record["claim_basename"] = bound_claim_basename(forged)
+        verdict = self._verdict("bind_pair.json", record, operation_id)
+        self.assertFalse(verdict["authoritative"])
+        reasons = as_list(verdict["reasons"])
+        self.assertIn("attempt_fingerprint_not_bound", reasons)
+        self.assertIn("claim_basename_not_bound", reasons)
+
+    def test_the_binding_is_asserted_for_a_non_verified_outcome_too(self):
+        """Attribution matters for every authoritative artefact, not only a verified one: the
+        producer records all five fields before the state root is validated."""
+        operation_id = "expop_bind_blocked"
+        record = verified_record(operation_id)
+        record["attempt_fingerprint"] = "afp_" + ("1" * 64)
+        record["underlying_terminal_outcome"] = "WRITE_CONFIRMED_READBACK_FAILED"
+        record["terminal_outcome"] = "WRITE_CONFIRMED_READBACK_FAILED"
+        record["exit_code"] = 1
+        record["expiry_match"] = False
+        record["readback_found"] = False
+        record["expiry_date_readback_value"] = None
+        verdict = self._verdict("bind_blocked.json", record, operation_id)
+        self.assertFalse(verdict["authoritative"])
+        self.assertIn("attempt_fingerprint_not_bound", as_list(verdict["reasons"]))
+
+    def test_no_binding_reason_echoes_a_fingerprint_or_basename(self):
+        operation_id = "expop_bind_noecho"
+        record = verified_record(operation_id)
+        forged = "afp_" + ("b" * 64)
+        record["attempt_fingerprint"] = forged
+        verdict = self._verdict("bind_noecho.json", record, operation_id)
+        reasons = json.dumps(as_list(verdict["reasons"]))
+        self.assertNotIn(forged, reasons)
+        self.assertNotIn(record["target_fingerprint"], reasons)
+        self.assertNotIn(record["claim_basename"], reasons)
+
+    # ---- C. Initial-duplicate chronology integrity (PRRT_kwDOSbJI_s6WhZdN) ---- #
+    def _initial_duplicate_flags(self, **overrides):
+        """A TRUTHFUL initial-duplicate run: contacted, first read done, then it threw.
+
+        synthetic_member_may_remain is true because the runtime sets it inside that very block.
+        """
+        base = dict(activated=True, autocount_contacted=True,
+                    initial_member_read_attempted=True, member_exists_initial=True,
+                    member_recheck_attempted=False, member_exists_recheck=False,
+                    claim_root_unavailable=False, claim_conflict=False,
+                    claim_lost_after_contact=False, claim_persist_failed=False,
+                    claim_created=False, save_member_attempted=False,
+                    save_member_confirmed=False, save_outcome="not_attempted",
+                    readback_found=False, expiry_match=False)
+        base.update(overrides)
+        return base
+
+    def test_a_truthful_initial_duplicate_is_blocked_member_exists_with_no_contradiction(self):
+        """Positive control: legitimate BLOCKED_MEMBER_EXISTS semantics are preserved."""
+        self.assertEqual(self._terminal(**self._initial_duplicate_flags()),
+                         ("BLOCKED_MEMBER_EXISTS", 0))
+        self.assertEqual(self._contradiction_reasons(**self._initial_duplicate_flags()), [])
+
+    def test_each_post_block_flag_contradicts_the_initial_duplicate(self):
+        """Every flag the runtime can only set AFTER the initial-duplicate throw."""
+        after_block = (
+            "new_member_success", "assignment_success", "expiry_date_assigned",
+            "member_recheck_attempted", "member_exists_recheck", "save_member_method_found",
+            "claim_created", "claim_conflict", "claim_persist_failed",
+            "claim_lost_after_contact", "save_member_attempted", "save_member_confirmed",
+            "readback_found", "expiry_match",
+        )
+        for name in after_block:
+            with self.subTest(flag=name):
+                reasons = self._contradiction_reasons(**self._initial_duplicate_flags(**{name: True}))
+                self.assertIn("initial_duplicate_with_" + name, reasons)
+
+    def test_a_save_outcome_other_than_not_attempted_contradicts_the_initial_duplicate(self):
+        for outcome in ("confirmed", "uncertain"):
+            with self.subTest(save_outcome=outcome):
+                reasons = self._contradiction_reasons(
+                    **self._initial_duplicate_flags(save_outcome=outcome))
+                self.assertIn("initial_duplicate_with_save_outcome", reasons)
+
+    def test_the_initial_duplicate_block_does_not_flag_its_own_residual_marker(self):
+        """synthetic_member_may_remain is set INSIDE the block, so it must stay legitimate."""
+        reasons = self._contradiction_reasons(
+            **self._initial_duplicate_flags(synthetic_member_may_remain=True))
+        self.assertEqual([r for r in reasons if r.startswith("initial_duplicate_with_")], [])
+
+    def test_an_initial_duplicate_cannot_be_an_authoritative_verified_record(self):
+        """The originating exploit: a full verified chain carrying the initial duplicate."""
+        operation_id = "expop_dup_verified"
+        record = verified_record(operation_id)
+        record["member_exists_initial"] = True
+        verdict = self._verdict("dup_verified.json", record, operation_id)
+        self.assertFalse(verdict["authoritative"])
+        self.assertIn("state_contradiction", as_list(verdict["reasons"]))
+
+    def test_an_initial_duplicate_with_a_confirmed_save_is_not_authoritative(self):
+        operation_id = "expop_dup_saved"
+        record = verified_record(operation_id)
+        record["member_exists_initial"] = True
+        record["expiry_match"] = False
+        record["readback_found"] = False
+        record["expiry_date_readback_value"] = None
+        record["underlying_terminal_outcome"] = "WRITE_CONFIRMED_READBACK_FAILED"
+        record["terminal_outcome"] = "WRITE_CONFIRMED_READBACK_FAILED"
+        record["exit_code"] = 1
+        verdict = self._verdict("dup_saved.json", record, operation_id)
+        self.assertFalse(verdict["authoritative"])
+        self.assertIn("state_contradiction", as_list(verdict["reasons"]))
+
+    def test_no_initial_duplicate_reason_echoes_a_value(self):
+        reasons = self._contradiction_reasons(
+            **self._initial_duplicate_flags(claim_created=True, save_member_attempted=True,
+                                            save_outcome="uncertain"))
+        for reason in reasons:
+            self.assertRegex(reason, r"^[a-z0-9_]+$",
+                             "contradiction reasons must stay fixed public-safe identities")
 
 
 @unittest.skipIf(PS is None, "no PowerShell executable available")
