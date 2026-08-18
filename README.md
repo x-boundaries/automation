@@ -1,8 +1,10 @@
 # X-Boundaries AutoCount 2 Automation
 
-This repository is for AutoCount 2 automation work only: local extraction scripts, SQL/API investigation notes, configuration templates, and runbooks for safe read-only automation around the AutoCount 2 environment.
+This repository contains AutoCount 2 automation work: local extraction scripts, SQL/API investigation notes, configuration templates, and runbooks for safe read-only automation around the AutoCount 2 environment. It also contains the isolated Energy@Grid bill downloader documented below.
 
 Task tracking, pending-work dashboards, completed-task logs, and personal planning notes are intentionally kept outside this repo.
+
+The isolated Energy@Grid utility surface is documented in [energygrid-bill-downloader/](energygrid-bill-downloader/README.md) and does not change the AutoCount integration surfaces above.
 
 ## Current Automation Surfaces
 

@@ -1,0 +1,12 @@
+{
+  "portal_url": "https://cwepcbill2.web-ems.com/",
+  "account_identity": "REPLACE_WITH_PRIVATE_ACCOUNT_IDENTITY",
+  "archive_root": "C:\\XB\\_MandarinGallery\\Utilities\\EnergyGrid",
+  "state_path": "C:\\XB_Runtime\\energygrid-bill-downloader\\state\\state.sqlite3",
+  "temp_root": "C:\\XB_Runtime\\energygrid-bill-downloader\\temp",
+  "log_root": "C:\\XB_Runtime\\energygrid-bill-downloader\\logs",
+  "browser_cache_path": "C:\\XB_Runtime\\energygrid-bill-downloader\\ms-playwright",
+  "timeout_seconds": 30,
+  "max_attempts": 2,
+  "inventory_safety_ceiling": 1000
+}
