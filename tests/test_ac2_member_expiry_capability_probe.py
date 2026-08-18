@@ -2021,16 +2021,38 @@ switch ($Op) {
         $ctx = Get-Content -LiteralPath $CtxJson -Raw -Encoding UTF8 | ConvertFrom-Json
         Write-Output (@(Get-ExpiryProbeStateContradictions -Flags $ctx) -join ',')
     }
+    'canondate' {
+        # #128 finding PRRT_kwDOSbJI_s6WhZdL. Report the canonical yyyy-MM-dd rendering the
+        # PRODUCTION helper produces for a record's expiry_date_readback_value AS THIS HOST'S
+        # JSON parser delivered it. PowerShell 7 converts ISO-8601 text to [datetime] while
+        # Windows PowerShell 5.1 leaves it a [string]; the reviewed date contract accepts both
+        # and judges them by this one rendering, so a test must derive its expectation from it
+        # rather than assume a single platform's CLR shape.
+        $ctx = Get-Content -LiteralPath $CtxJson -Raw -Encoding UTF8 | ConvertFrom-Json
+        $raw = $ctx.expiry_date_readback_value
+        # Written as a statement, not an inline if-expression: statements-as-expressions are a
+        # PowerShell 7 feature and this harness must also parse under Windows PowerShell 5.1.
+        $clrType = 'null'
+        if ($null -ne $raw) { $clrType = $raw.GetType().Name }
+        [pscustomobject]@{
+            clr_type  = $clrType
+            canonical = (Get-ExpiryProbeCanonicalDateText -Value $raw -Format 'yyyy-MM-dd')
+        } | ConvertTo-Json -Compress
+    }
     'bindattempt' {
         # #128 finding PRRT_kwDOSbJI_s6WhZdM. Report the attempt fingerprint and claim basename
         # the PRODUCTION helpers derive for a record's own target/synthetic/intended fields, so
         # the Python fixture's bound values are proved against the real algorithm rather than a
         # restatement of it. $CtxJson = any record carrying the three source fields.
         $ctx = Get-Content -LiteralPath $CtxJson -Raw -Encoding UTF8 | ConvertFrom-Json
+        # The intended date goes through the SAME canonical renderer the validator uses, never a
+        # bare [string] cast: if a host's JSON parser delivered it as [datetime], casting would
+        # produce a culture-formatted value instead of yyyy-MM-dd and this harness would compare
+        # the fixture against the wrong pre-image.
         $af = Get-ExpiryProbeAttemptFingerprint `
             -TargetFingerprint ([string]$ctx.target_fingerprint) `
             -SyntheticFingerprint ([string]$ctx.synthetic_fingerprint) `
-            -IntendedExpiry ([string]$ctx.intended_expiry_date)
+            -IntendedExpiry (Get-ExpiryProbeCanonicalDateText -Value $ctx.intended_expiry_date -Format 'yyyy-MM-dd')
         [pscustomobject]@{
             attempt_fingerprint = $af
             claim_basename      = (Get-ExpiryProbeClaimBasename -AttemptFingerprint $af)
@@ -3879,9 +3901,18 @@ class ExpiryProbeLibraryTests(unittest.TestCase):
 
     def test_verified_record_with_a_malformed_readback_substitute_is_refused(self):
         """The nullable-date schema check only requires a non-blank rendering, so a text
-        substitute reaches semantic validation. It must be refused, not compared."""
+        substitute reaches semantic validation. It must be refused, not compared.
+
+        Every substitute below is refused on BOTH supported JSON parsers. `2031-01-01T00:00:00Z`
+        is deliberately a DIFFERENT date in ISO-8601 form, so it fails whichever CLR shape the
+        host produces: Windows PowerShell 5.1 keeps it a string that is not canonical
+        `yyyy-MM-dd`, and PowerShell 7 converts it to a [datetime] that canonicalises to a date
+        which is not the intended one. An ISO form of the SAME date is parser-dependent by
+        design and is covered separately by
+        test_an_iso_readback_value_follows_the_documented_date_contract.
+        """
         operation_id = "expop_rbvalue_bad"
-        for substitute in ("not-a-date", "2028-6-30", "2028-06-30T00:00:00Z", " ", "30/06/2028"):
+        for substitute in ("not-a-date", "2028-6-30", "2031-01-01T00:00:00Z", " ", "30/06/2028"):
             with self.subTest(substitute=substitute):
                 record = verified_record(operation_id)
                 record["expiry_date_readback_value"] = substitute
@@ -3893,6 +3924,51 @@ class ExpiryProbeLibraryTests(unittest.TestCase):
                                                "readback_value_not_intended_date",
                                                "schema_string_field_invalid")),
                     "a malformed read-back substitute must fail closed; reasons=%s" % reasons)
+
+    def test_an_iso_readback_value_follows_the_documented_date_contract(self):
+        """An ISO-8601 read-back value is judged by the library's ONE canonical rendering.
+
+        The reviewed date contract states that supported JSON parsers disagree on CLR type -
+        PowerShell 7 converts ISO-8601 text to [datetime], Windows PowerShell 5.1 leaves it a
+        [string] - and that both are accepted and validated against the same canonical rendering.
+        So `2028-06-30T00:00:00Z` is NOT a divergent value: on a host whose parser normalises it,
+        it denotes exactly the intended date and must be accepted; on a host that does not, it is
+        not canonical `yyyy-MM-dd` and must be refused.
+
+        Rather than assume one platform, this derives the expectation from the production
+        renderer itself, so the case is deterministic on both hosts and cannot pass for the
+        wrong reason.
+        """
+        operation_id = "expop_rbvalue_iso"
+        record = verified_record(operation_id)
+        record["expiry_date_readback_value"] = "2028-06-30T00:00:00Z"
+        path = self._record_file("rb_iso.json", record)
+        rendered = self._json("canondate", CtxJson=str(path))
+        verdict = self._verdict("rb_iso.json", record, operation_id)
+        if rendered["canonical"] == record["intended_expiry_date"]:
+            # The host's parser normalised it to the intended date (PowerShell 7 behaviour).
+            self.assertIn(rendered["clr_type"], ("DateTime",), rendered)
+            self.assertTrue(verdict["authoritative"], "reasons=%s" % as_list(verdict["reasons"]))
+        else:
+            # The host left it as text (Windows PowerShell 5.1 behaviour), so it is not a
+            # canonical date and the verified outcome must fail closed.
+            self.assertEqual(rendered["clr_type"], "String", rendered)
+            self.assertFalse(verdict["authoritative"])
+            self.assertIn("readback_value_not_canonical_date", as_list(verdict["reasons"]))
+
+    def test_an_equivalent_iso_value_never_launders_a_different_date(self):
+        """The parser-dependent shape must not become a bypass: whichever CLR shape the host
+        produces, an ISO value denoting a DIFFERENT date is refused."""
+        operation_id = "expop_rbvalue_isowrong"
+        record = verified_record(operation_id)
+        record["expiry_date_readback_value"] = "2031-01-01T00:00:00Z"
+        verdict = self._verdict("rb_isowrong.json", record, operation_id)
+        self.assertFalse(verdict["authoritative"])
+        reasons = as_list(verdict["reasons"])
+        self.assertTrue(
+            any(r in reasons for r in ("readback_value_not_canonical_date",
+                                       "readback_value_not_intended_date")),
+            "reasons=%s" % reasons)
 
     def test_a_truthful_non_verified_outcome_still_needs_no_readback_value(self):
         """The requirement is bound to EXPIRY_VERIFIED only: a run that never read back
