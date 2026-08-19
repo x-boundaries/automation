@@ -1,11 +1,28 @@
 from __future__ import annotations
 
+import contextlib
+import io
+import json
 from pathlib import Path
+import re
 import shutil
 import subprocess
+import tempfile
 import unittest
 
+from energygrid_bill_downloader import cli
 from energygrid_bill_downloader.cli import build_parser, main
+from energygrid_bill_downloader.errors import (
+    ACTION_REQUIRED,
+    DOWNLOAD_FAILED,
+    LOGIN_FAILED,
+    NO_NEW_BILLS,
+    PORTAL_LAYOUT_CHANGED,
+    AppError,
+    DownloadError,
+    LayoutChangedError,
+    LoginError,
+)
 
 
 class CliTests(unittest.TestCase):
@@ -239,6 +256,295 @@ class CliTests(unittest.TestCase):
 
     def test_invalid_cli_returns_contract_exit_code(self) -> None:
         self.assertEqual(main([]), 64)
+
+
+# ---- DL-XB-141-OBS-001: terminal failure evidence ---- #
+#
+# Before this repair a caught AppError produced a coarse stdout line and nothing
+# in the JSONL, so a failed run left no local record of WHERE it failed. These
+# cases drive the committed handler and mapping rather than restating them, and
+# they hold the privacy line: the raw exception message is never an output.
+
+
+def stub_portal(error: BaseException | None = None, bills: tuple = ()):
+    """Return a portal class that satisfies the CLI's contract without a browser.
+
+    No Playwright, no network, no credentials: `login` either succeeds or raises
+    the failure under test, which is the only behaviour these cases need.
+    """
+
+    class StubPortal:
+        def __init__(self, config, headed: bool = False) -> None:
+            self.config = config
+
+        def __enter__(self) -> "StubPortal":
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        def login(self) -> None:
+            if error is not None:
+                raise error
+
+        def inventory(self, safety_ceiling: int) -> list:
+            return list(bills)
+
+    return StubPortal
+
+
+class TerminalFailureEvidenceTests(unittest.TestCase):
+    HOSTILE_FRAGMENTS = (
+        "hunter2",
+        "tok_live_abcd1234",
+        "C:/private/energygrid/secrets.json",
+        "https://portal.example.invalid/session",
+        "2026-05-01_account_a.pdf",
+    )
+    HOSTILE_MESSAGE = (
+        "unmapped future failure: password=hunter2 token=tok_live_abcd1234 "
+        "config C:/private/energygrid/secrets.json at "
+        "https://portal.example.invalid/session downloading 2026-05-01_account_a.pdf"
+    )
+
+    def write_config(self, root: Path) -> Path:
+        """Write a synthetic config whose private roots are all inside `root`."""
+        (root / "archive").mkdir()
+        config_path = root / "config.json"
+        config_path.write_text(
+            json.dumps(
+                {
+                    # Never contacted: every case replaces the portal class.
+                    "portal_url": "http://127.0.0.1:1/synthetic",
+                    "account_identity": "SYNTHETIC-INTENDED-ACCOUNT",
+                    "archive_root": str(root / "archive"),
+                    "state_path": str(root / "state" / "state.sqlite3"),
+                    "temp_root": str(root / "temp"),
+                    "log_root": str(root / "logs"),
+                    "timeout_seconds": 5,
+                    "max_attempts": 2,
+                    "inventory_safety_ceiling": 50,
+                }
+            ),
+            encoding="utf-8",
+        )
+        return config_path
+
+    def run_cli(self, root: Path, portal_cls, command: str = "run") -> tuple[int, str]:
+        config_path = self.write_config(root)
+        original = cli.PlaywrightPortal
+        cli.PlaywrightPortal = portal_cls
+        buffer = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buffer):
+                exit_code = cli.main([command, "--config", str(config_path)])
+        finally:
+            cli.PlaywrightPortal = original
+        return exit_code, buffer.getvalue()
+
+    @staticmethod
+    def log_text(root: Path) -> str:
+        return "".join(
+            path.read_text(encoding="utf-8") for path in sorted((root / "logs").glob("run-*.jsonl"))
+        )
+
+    def events(self, root: Path) -> list[dict]:
+        return [json.loads(line) for line in self.log_text(root).splitlines() if line.strip()]
+
+    def phases(self, root: Path) -> list[str]:
+        return [event["phase"] for event in self.events(root)]
+
+    def terminal_events(self, root: Path) -> list[dict]:
+        return [event for event in self.events(root) if event["phase"] == cli.RUN_FAILED_PHASE]
+
+    # ---- B: the handler itself ---- #
+
+    def test_caught_app_error_logs_one_terminal_event_and_preserves_exit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            exit_code, stdout = self.run_cli(
+                root,
+                stub_portal(LayoutChangedError("post-activation Login control is hidden or disabled")),
+            )
+
+            self.assertEqual(exit_code, 20)
+            self.assertEqual(
+                json.loads(stdout),
+                {"status": PORTAL_LAYOUT_CHANGED, "error_class": PORTAL_LAYOUT_CHANGED},
+            )
+
+            terminal = self.terminal_events(root)
+            self.assertEqual(len(terminal), 1)
+            self.assertEqual(terminal[0]["status"], PORTAL_LAYOUT_CHANGED)
+            self.assertEqual(terminal[0]["support_ref"], "EG_LOGIN_POST_ACTIVATION_NOT_READY")
+            self.assertEqual(
+                set(terminal[0]), {"run_id", "phase", "status", "support_ref"},
+                "the terminal event carries no payload beyond the locked public-safe fields",
+            )
+
+            # It records a login that started and never completed, and the raw
+            # structural message stays out of both surfaces.
+            self.assertIn("login_start", self.phases(root))
+            self.assertNotIn("login_complete", self.phases(root))
+            self.assertNotIn("hidden or disabled", self.log_text(root))
+            self.assertNotIn("hidden or disabled", stdout)
+
+    def test_login_failure_and_retryable_failure_keep_their_own_status_and_exit(self) -> None:
+        for error, status, expected_exit, expected_ref in (
+            (LoginError("portal rejected the login"), LOGIN_FAILED, 20, "EG_LOGIN_PORTAL_REJECTED"),
+            (LoginError("runtime credentials are unavailable"), LOGIN_FAILED, 20, "EG_LOGIN_CREDENTIALS_UNAVAILABLE"),
+            (DownloadError("browser download timed out"), DOWNLOAD_FAILED, 10, cli.UNCLASSIFIED_SUPPORT_REF),
+        ):
+            with self.subTest(status=status, exit_code=expected_exit):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    exit_code, stdout = self.run_cli(root, stub_portal(error))
+
+                    self.assertEqual(exit_code, expected_exit)
+                    self.assertEqual(json.loads(stdout)["status"], status)
+                    terminal = self.terminal_events(root)
+                    self.assertEqual(len(terminal), 1)
+                    self.assertEqual(terminal[0]["status"], status)
+                    self.assertEqual(terminal[0]["support_ref"], expected_ref)
+
+    # ---- C: unknown and hostile future messages ---- #
+
+    def test_unknown_hostile_message_is_classified_generically_and_never_echoed(self) -> None:
+        error = AppError(self.HOSTILE_MESSAGE, status=PORTAL_LAYOUT_CHANGED, exit_code=20)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            exit_code, stdout = self.run_cli(root, stub_portal(error))
+
+            self.assertEqual(exit_code, 20)
+            self.assertEqual(json.loads(stdout)["status"], PORTAL_LAYOUT_CHANGED)
+
+            terminal = self.terminal_events(root)
+            self.assertEqual(len(terminal), 1)
+            self.assertEqual(terminal[0]["support_ref"], cli.UNCLASSIFIED_SUPPORT_REF)
+
+            log_text = self.log_text(root)
+            for fragment in self.HOSTILE_FRAGMENTS:
+                self.assertNotIn(fragment, log_text, fragment)
+                self.assertNotIn(fragment, stdout, fragment)
+            self.assertNotIn(self.HOSTILE_MESSAGE, log_text)
+            self.assertNotIn(self.HOSTILE_MESSAGE, stdout)
+
+    def test_unknown_message_never_reaches_the_log_file_name(self) -> None:
+        error = AppError(self.HOSTILE_MESSAGE, status=PORTAL_LAYOUT_CHANGED, exit_code=20)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.run_cli(root, stub_portal(error))
+            for path in (root / "logs").iterdir():
+                for fragment in self.HOSTILE_FRAGMENTS:
+                    self.assertNotIn(fragment, path.name)
+
+    # ---- D: the evidence write itself fails ---- #
+
+    def test_failure_to_write_the_terminal_event_preserves_the_canonical_result(self) -> None:
+        original_event = cli.SafeLogger.event
+
+        def failing_event(self, phase, status=None, **fields):
+            if phase == cli.RUN_FAILED_PHASE:
+                raise OSError("synthetic log write failure")
+            return original_event(self, phase, status=status, **fields)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cli.SafeLogger.event = failing_event
+            try:
+                exit_code, stdout = self.run_cli(
+                    root,
+                    stub_portal(LayoutChangedError("Flutter semantics placeholder remained after activation")),
+                )
+            finally:
+                cli.SafeLogger.event = original_event
+
+            # The lost evidence line must not become a different outcome.
+            self.assertEqual(exit_code, 20)
+            self.assertEqual(json.loads(stdout)["status"], PORTAL_LAYOUT_CHANGED)
+            self.assertEqual(self.terminal_events(root), [])
+            self.assertNotIn("placeholder remained", self.log_text(root))
+            self.assertNotIn("synthetic log write failure", stdout)
+
+    # ---- E: failing before a logger exists ---- #
+
+    def test_failure_before_the_logger_exists_does_not_invent_a_log(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                exit_code = cli.main(["run", "--config", str(root / "absent.json")])
+            stdout = buffer.getvalue()
+
+            self.assertEqual(exit_code, 64)
+            self.assertEqual(
+                json.loads(stdout),
+                {"status": ACTION_REQUIRED, "error_class": "CONFIG_OR_DEPENDENCY"},
+            )
+            # No log root was established, so none may be fabricated to carry evidence.
+            self.assertEqual(list(root.iterdir()), [])
+            self.assertNotIn("absent.json", stdout)
+            self.assertNotIn("Traceback", stdout)
+
+    # ---- F: the successful path is untouched ---- #
+
+    def test_successful_run_keeps_its_phases_and_adds_no_terminal_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            exit_code, stdout = self.run_cli(root, stub_portal())
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(json.loads(stdout)["status"], NO_NEW_BILLS)
+
+            phases = self.phases(root)
+            self.assertEqual(phases[:2], ["login_start", "login_complete"])
+            self.assertEqual(phases[-1], "run_complete")
+            self.assertEqual(self.terminal_events(root), [])
+
+    # ---- G: exactly one terminal event per caught AppError ---- #
+
+    def test_one_caught_app_error_produces_exactly_one_terminal_event(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.run_cli(root, stub_portal(LayoutChangedError("required login control is missing or ambiguous")))
+
+            phases = self.phases(root)
+            self.assertEqual(
+                phases.count(cli.RUN_FAILED_PHASE), 1,
+                "a single caught AppError must not be recorded twice",
+            )
+            self.assertNotIn("run_complete", phases)
+
+
+class SupportReferenceContractTests(unittest.TestCase):
+    """The reference vocabulary itself must stay bounded and disclosure-free."""
+
+    IDENTIFIER = re.compile(r"\A[A-Z][A-Z0-9_]{0,63}\Z")
+
+    def test_every_reference_is_a_bounded_ascii_identifier(self) -> None:
+        for message, ref in cli.SUPPORT_REFS_BY_MESSAGE.items():
+            with self.subTest(ref=ref):
+                self.assertRegex(ref, self.IDENTIFIER)
+                self.assertTrue(ref.isascii())
+                # A reference must be a code, not a restatement of the message.
+                self.assertNotIn(ref.casefold(), message.casefold())
+        self.assertRegex(cli.UNCLASSIFIED_SUPPORT_REF, self.IDENTIFIER)
+
+    def test_known_messages_map_to_distinct_non_generic_references(self) -> None:
+        refs = list(cli.SUPPORT_REFS_BY_MESSAGE.values())
+        self.assertEqual(len(refs), len(set(refs)), "each known failure needs its own reference")
+        self.assertNotIn(cli.UNCLASSIFIED_SUPPORT_REF, refs)
+
+    def test_classification_is_exact_so_a_longer_future_message_stays_generic(self) -> None:
+        known = "post-activation Login control did not appear"
+        self.assertEqual(
+            cli.support_ref_for(LayoutChangedError(known)), "EG_LOGIN_POST_ACTIVATION_NOT_APPEAR"
+        )
+        for near_miss in (known + " within the configured timeout", "  " + known, known.upper()):
+            with self.subTest(near_miss=near_miss):
+                self.assertEqual(
+                    cli.support_ref_for(LayoutChangedError(near_miss)), cli.UNCLASSIFIED_SUPPORT_REF
+                )
 
 
 if __name__ == "__main__":
