@@ -28,6 +28,38 @@ ALLOWED_LOG_FIELDS = {
     "support_ref",
 }
 
+RUN_FAILED_PHASE = "run_failed"
+UNCLASSIFIED_SUPPORT_REF = "APP_ERROR_UNCLASSIFIED"
+
+# Every message the pre-auth login path can currently raise, mapped to a bounded
+# ASCII reference. portal.py owns the wording, so a change there fails the
+# reachability tests instead of silently degrading a known failure to generic.
+SUPPORT_REFS_BY_MESSAGE = {
+    "Flutter semantics activation control did not appear": "EG_LOGIN_SEMANTICS_ACTIVATION_NOT_APPEAR",
+    "Flutter semantics activation control could not be resolved": "EG_LOGIN_SEMANTICS_ACTIVATION_UNRESOLVED",
+    "Flutter semantics activation control is missing or ambiguous": "EG_LOGIN_SEMANTICS_ACTIVATION_AMBIGUOUS",
+    "Flutter semantics activation control is hidden or disabled": "EG_LOGIN_SEMANTICS_ACTIVATION_NOT_READY",
+    "Flutter semantics placeholder remained after activation": "EG_LOGIN_SEMANTICS_PLACEHOLDER_REMAINS",
+    "post-activation Login control did not appear": "EG_LOGIN_POST_ACTIVATION_NOT_APPEAR",
+    "post-activation Login control could not be resolved": "EG_LOGIN_POST_ACTIVATION_UNRESOLVED",
+    "post-activation Login control is missing or ambiguous": "EG_LOGIN_POST_ACTIVATION_AMBIGUOUS",
+    "post-activation Login control is hidden or disabled": "EG_LOGIN_POST_ACTIVATION_NOT_READY",
+    "required login control is missing or ambiguous": "EG_LOGIN_REQUIRED_CONTROL_UNRESOLVED",
+    "runtime credentials are unavailable": "EG_LOGIN_CREDENTIALS_UNAVAILABLE",
+    "portal rejected the login": "EG_LOGIN_PORTAL_REJECTED",
+}
+
+
+def support_ref_for(error: AppError) -> str:
+    """Return the stable public-safe reference for a failure.
+
+    An unrecognised message - a future portal contract, or any text this build
+    does not know - yields the generic reference. The message is only ever a
+    lookup key, so nothing it carries can reach an output surface.
+    """
+
+    return SUPPORT_REFS_BY_MESSAGE.get(error.message, UNCLASSIFIED_SUPPORT_REF)
+
 
 def redact_sensitive(message: str) -> str:
     result = str(message)
@@ -69,6 +101,29 @@ class SafeLogger:
             handle.write(json.dumps(payload, sort_keys=True, ensure_ascii=True) + "\n")
 
 
+def log_terminal_failure(logger: SafeLogger | None, error: AppError) -> None:
+    """Append the one terminal failure event, when a logger already exists.
+
+    This is evidence, not a result. A failure raised before the logger was built
+    has no established log root to write to, and a write that fails must not
+    change what the caller returns, so both cases leave the canonical status and
+    exit code untouched.
+    """
+
+    if logger is None:
+        return
+    try:
+        logger.event(
+            RUN_FAILED_PHASE,
+            status=error.status,
+            support_ref=support_ref_for(error),
+        )
+    except Exception:
+        # Losing the evidence line is strictly less harmful than converting a
+        # known failure into a different result or surfacing raw exception text.
+        pass
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = ContractArgumentParser(description="Reconcile synthetic or approved Energy@Grid bill inventories.")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -87,6 +142,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
+    logger: SafeLogger | None = None
     try:
         args = parser.parse_args(argv)
         raw = load_config_file(args.config)
@@ -131,9 +187,11 @@ def main(argv: list[str] | None = None) -> int:
     except argparse.ArgumentError:
         return 64
     except (ConfigError, DependencyError) as exc:
+        log_terminal_failure(logger, exc)
         print(json.dumps({"status": ACTION_REQUIRED, "error_class": "CONFIG_OR_DEPENDENCY"}, sort_keys=True))
         return 64
     except AppError as exc:
+        log_terminal_failure(logger, exc)
         print(json.dumps({"status": exc.status, "error_class": exc.status}, sort_keys=True))
         return exc.exit_code or exit_code_for(exc.status)
     except (OSError, ValueError, TypeError):
