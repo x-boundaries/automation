@@ -6,9 +6,16 @@ import tempfile
 import unittest
 import uuid
 
+from energygrid_bill_downloader import cli
 from energygrid_bill_downloader.config import load_runtime_config
 from energygrid_bill_downloader.cli import main
-from energygrid_bill_downloader.errors import DownloadError, InvalidPdfError, LayoutChangedError, LoginError
+from energygrid_bill_downloader.errors import (
+    AppError,
+    DownloadError,
+    InvalidPdfError,
+    LayoutChangedError,
+    LoginError,
+)
 from energygrid_bill_downloader.portal import PlaywrightPortal
 from energygrid_bill_downloader.publication import validate_pdf
 from tests.fixtures.synthetic_portal import SyntheticBill, SyntheticPortalServer, write_config
@@ -438,6 +445,288 @@ class SyntheticPortalTests(unittest.TestCase):
                     self.assertEqual(server.search_count, 1)
             finally:
                 self.restore_credentials(old)
+
+
+# ---- DL-XB-141-OBS-001: pre-auth failure localisation ---- #
+#
+# portal.py deliberately raises generic messages, so the CLI needs a mapping to
+# turn them into support references. These cases drive the COMMITTED portal
+# branches with a minimal locator double and feed whatever message each branch
+# actually raises into the COMMITTED mapping. The wording therefore stays owned
+# by portal.py: reword a branch there and the coverage case fails rather than
+# the failure silently degrading to the generic reference. No browser, no
+# server, and no credentials are needed to prove this.
+
+
+class FakeLocator:
+    """The slice of the Playwright locator surface the login path touches."""
+
+    def __init__(
+        self,
+        *,
+        count: int = 1,
+        visible: bool = True,
+        enabled: bool = True,
+        wait_error: Exception | None = None,
+        state_error: Exception | None = None,
+    ) -> None:
+        self._count = count
+        self._visible = visible
+        self._enabled = enabled
+        self._wait_error = wait_error
+        self._state_error = state_error
+        self.dispatched = 0
+        self.clicks = 0
+
+    @property
+    def first(self) -> "FakeLocator":
+        return self
+
+    def wait_for(self, state: str | None = None) -> None:
+        if self._wait_error is not None:
+            raise self._wait_error
+
+    def count(self) -> int:
+        if self._state_error is not None:
+            raise self._state_error
+        return self._count
+
+    def is_visible(self, timeout: int | None = None) -> bool:
+        return self._visible
+
+    def is_enabled(self) -> bool:
+        return self._enabled
+
+    def dispatch_event(self, name: str) -> None:
+        self.dispatched += 1
+
+    def click(self) -> None:
+        self.clicks += 1
+
+    def fill(self, value: str) -> None:
+        return None
+
+
+class FakePage:
+    """A page whose only job is to hand the login path the locators under test."""
+
+    def __init__(
+        self,
+        activation: FakeLocator,
+        placeholder: FakeLocator,
+        login_entry: FakeLocator,
+        *,
+        label_error: Exception | None = None,
+        alert_visible: bool = False,
+    ) -> None:
+        self.activation = activation
+        self.placeholder = placeholder
+        self.login_entry = login_entry
+        self.label_error = label_error
+        self.alert_visible = alert_visible
+        self.goto_calls = 0
+
+    def goto(self, url: str, wait_until: str | None = None) -> None:
+        self.goto_calls += 1
+
+    def get_by_role(self, role: str, name: str | None = None, exact: bool = False):
+        if name == "Enable accessibility":
+            return self.activation
+        if name == "Login":
+            return self.login_entry
+        if role == "alert":
+            return FakeLocator(visible=self.alert_visible)
+        if name == "Billing Manager":
+            return FakeLocator()
+        raise AssertionError(f"unexpected role lookup: {role}/{name}")
+
+    def locator(self, selector: str):
+        assert selector == "flt-semantics-placeholder", selector
+        return self.placeholder
+
+    def get_by_label(self, name: str, exact: bool = False):
+        if self.label_error is not None:
+            raise self.label_error
+        return FakeLocator()
+
+
+class FakeConfig:
+    """Only the field the login path reads; the URL is never fetched."""
+
+    portal_url = "http://127.0.0.1:1/synthetic"
+    timeout_seconds = 5
+
+
+# (case id, locator keyword arguments, expected support reference)
+UNREADY_CONTROL_CASES = (
+    ("not_appear", {"wait_error": RuntimeError("locator never attached")}, "NOT_APPEAR"),
+    ("unresolved", {"state_error": RuntimeError("strict mode violation")}, "UNRESOLVED"),
+    ("ambiguous", {"count": 2}, "AMBIGUOUS"),
+    ("hidden", {"visible": False}, "NOT_READY"),
+    ("disabled", {"enabled": False}, "NOT_READY"),
+)
+
+
+class PreAuthLoginFailureReferenceTests(unittest.TestCase):
+    def portal_for(self, page: FakePage) -> PlaywrightPortal:
+        portal = PlaywrightPortal(FakeConfig(), headed=False)
+        portal.page = page
+        return portal
+
+    def assert_maps_non_generically(self, error: LayoutChangedError, expected_ref: str) -> str:
+        """Assert the raised message classifies to `expected_ref`, and return it."""
+        ref = cli.support_ref_for(error)
+        self.assertEqual(ref, expected_ref, error.message)
+        self.assertNotEqual(ref, cli.UNCLASSIFIED_SUPPORT_REF, error.message)
+        return error.message
+
+    def test_activation_control_failures_are_individually_referenced(self) -> None:
+        seen = []
+        for case_id, kwargs, outcome in UNREADY_CONTROL_CASES:
+            with self.subTest(case=case_id):
+                activation = FakeLocator(**kwargs)
+                page = FakePage(activation, FakeLocator(), FakeLocator())
+                with self.assertRaises(LayoutChangedError) as caught:
+                    self.portal_for(page)._enter_public_semantics(page)
+                seen.append(
+                    self.assert_maps_non_generically(
+                        caught.exception, f"EG_LOGIN_SEMANTICS_ACTIVATION_{outcome}"
+                    )
+                )
+                # Fail closed still means the gate was never dispatched.
+                self.assertEqual(activation.dispatched, 0)
+        self.assertEqual(len(set(seen)), 4, "hidden and disabled share one reference by design")
+
+    def test_placeholder_persisting_after_activation_is_referenced(self) -> None:
+        activation = FakeLocator()
+        placeholder = FakeLocator(wait_error=RuntimeError("still attached"))
+        page = FakePage(activation, placeholder, FakeLocator())
+        with self.assertRaises(LayoutChangedError) as caught:
+            self.portal_for(page)._enter_public_semantics(page)
+        self.assert_maps_non_generically(caught.exception, "EG_LOGIN_SEMANTICS_PLACEHOLDER_REMAINS")
+        self.assertEqual(activation.dispatched, 1)
+
+    def test_post_activation_login_control_failures_are_individually_referenced(self) -> None:
+        seen = []
+        for case_id, kwargs, outcome in UNREADY_CONTROL_CASES:
+            with self.subTest(case=case_id):
+                activation = FakeLocator()
+                login_entry = FakeLocator(**kwargs)
+                page = FakePage(activation, FakeLocator(), login_entry)
+                with self.assertRaises(LayoutChangedError) as caught:
+                    self.portal_for(page)._enter_public_semantics(page)
+                seen.append(
+                    self.assert_maps_non_generically(
+                        caught.exception, f"EG_LOGIN_POST_ACTIVATION_{outcome}"
+                    )
+                )
+                # Activation is attempted at most once per login attempt.
+                self.assertEqual(activation.dispatched, 1)
+        self.assertEqual(len(set(seen)), 4, "hidden and disabled share one reference by design")
+
+    def run_login(self, page: FakePage, credentials: bool = True) -> AppError:
+        """Run the committed `login()` against `page` and return what it raised."""
+        old = {name: os.environ.get(name) for name in ("ENERGYGRID_USERNAME", "ENERGYGRID_PASSWORD")}
+        if credentials:
+            os.environ.update(runtime_credentials())
+        else:
+            for name in old:
+                os.environ.pop(name, None)
+        try:
+            with self.assertRaises(AppError) as caught:
+                self.portal_for(page).login()
+        finally:
+            for name, value in old.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+        return caught.exception
+
+    def test_downstream_login_control_fallback_is_referenced(self) -> None:
+        """The generic arm of `login()`, reached once the semantics gate is open."""
+        page = FakePage(
+            FakeLocator(),
+            FakeLocator(),
+            FakeLocator(),
+            label_error=RuntimeError("Username field is gone"),
+            alert_visible=False,
+        )
+        error = self.run_login(page)
+        self.assertIsInstance(error, LayoutChangedError)
+        self.assert_maps_non_generically(error, "EG_LOGIN_REQUIRED_CONTROL_UNRESOLVED")
+
+    def test_portal_rejection_stays_distinct_from_layout_drift(self) -> None:
+        """Same broken step, but a visible alert means credentials, not layout."""
+        page = FakePage(
+            FakeLocator(),
+            FakeLocator(),
+            FakeLocator(),
+            label_error=RuntimeError("Username field is gone"),
+            alert_visible=True,
+        )
+        error = self.run_login(page)
+        self.assertIsInstance(error, LoginError)
+        self.assertEqual(cli.support_ref_for(error), "EG_LOGIN_PORTAL_REJECTED")
+
+    def test_credential_absence_is_referenced_without_touching_the_page(self) -> None:
+        page = FakePage(FakeLocator(), FakeLocator(), FakeLocator())
+        error = self.run_login(page, credentials=False)
+        self.assertIsInstance(error, LoginError)
+        self.assertEqual(cli.support_ref_for(error), "EG_LOGIN_CREDENTIALS_UNAVAILABLE")
+        self.assertEqual(page.goto_calls, 0)
+
+    def test_no_committed_login_reference_is_unreachable_and_none_is_unmapped(self) -> None:
+        """Completeness in both directions for the pre-auth login vocabulary.
+
+        Every reference the CLI knows about is produced here by a real portal
+        branch, and every message those branches raise is known to the CLI. A
+        new portal message with no reference, or a reference nothing can raise,
+        fails this case.
+        """
+        reached: set[str] = set()
+
+        def record(error: AppError) -> None:
+            self.assertIn(error.message, cli.SUPPORT_REFS_BY_MESSAGE, error.message)
+            reached.add(cli.support_ref_for(error))
+
+        for _case_id, kwargs, _outcome in UNREADY_CONTROL_CASES:
+            for slot in ("activation", "login_entry"):
+                locators = {
+                    "activation": FakeLocator(),
+                    "placeholder": FakeLocator(),
+                    "login_entry": FakeLocator(),
+                }
+                locators[slot] = FakeLocator(**kwargs)
+                page = FakePage(locators["activation"], locators["placeholder"], locators["login_entry"])
+                with self.assertRaises(LayoutChangedError) as caught:
+                    self.portal_for(page)._enter_public_semantics(page)
+                record(caught.exception)
+
+        placeholder_page = FakePage(
+            FakeLocator(), FakeLocator(wait_error=RuntimeError("still attached")), FakeLocator()
+        )
+        with self.assertRaises(LayoutChangedError) as caught:
+            self.portal_for(placeholder_page)._enter_public_semantics(placeholder_page)
+        record(caught.exception)
+
+        broken_form = RuntimeError("Username field is gone")
+        record(self.run_login(FakePage(FakeLocator(), FakeLocator(), FakeLocator(), label_error=broken_form)))
+        record(
+            self.run_login(
+                FakePage(
+                    FakeLocator(), FakeLocator(), FakeLocator(), label_error=broken_form, alert_visible=True
+                )
+            )
+        )
+        record(self.run_login(FakePage(FakeLocator(), FakeLocator(), FakeLocator()), credentials=False))
+
+        self.assertEqual(
+            reached,
+            set(cli.SUPPORT_REFS_BY_MESSAGE.values()),
+            "the committed reference vocabulary and the reachable login branches must match",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -66,6 +66,18 @@ status, and generic failure classes. Local JSONL logs contain the same
 privacy-minimised operational fields. They do not contain credentials, cookies,
 headers, tokens, PDF contents, or exact private filenames.
 
+A run that ends on a caught application error appends exactly one terminal
+`run_failed` event to the local JSONL before returning its usual status and exit
+code. The event is evidence, not a new status, and carries only the run
+identifier, the phase, the status, and a `support_ref` code. The code identifies
+which checkpoint failed, so a `PORTAL_LAYOUT_CHANGED` run can be told apart at,
+for example, `EG_LOGIN_SEMANTICS_ACTIVATION_NOT_APPEAR` (the accessibility gate
+never appeared) versus `EG_LOGIN_POST_ACTIVATION_NOT_READY` (the gate opened but
+the Login control was hidden or disabled). A failure this build does not
+recognise records `APP_ERROR_UNCLASSIFIED`. The underlying exception text is
+never written to the log, the console, or any filename, so quote the
+`support_ref` when escalating rather than looking for a message.
+
 ## Controlled first validation
 
 Before unattended scheduling, the owner must separately approve and perform the
