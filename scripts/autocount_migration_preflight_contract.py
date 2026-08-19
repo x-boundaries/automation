@@ -30,6 +30,12 @@ Three finding states exist and they are kept distinct on purpose:
 ``UNKNOWN`` and ``MISMATCH`` both block. Only an all-``PASS`` gate set yields
 ``PREPARED_VALIDATION_PASS``.
 
+Numeric authority is finite decimal only, and finiteness of the inputs is not
+the same as representability of the result. Control-total accumulation is
+decimal arithmetic, so it is performed through ``_decimal_add``, which converts
+any trapped decimal arithmetic signal into a deterministic blocking finding
+rather than letting it raise out of ``run_preflight_safe``.
+
 Qualified field identity (lock L43-L46)
 ---------------------------------------
 
@@ -57,7 +63,7 @@ content.
 import hashlib
 import json
 import re
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, DecimalException, InvalidOperation
 
 # --------------------------------------------------------------------------- #
 # Contract versions
@@ -288,6 +294,22 @@ class ContractError(ValueError):
     """
 
 
+class DecimalRangeError(ContractError):
+    """Raised when a decimal arithmetic step is not representable.
+
+    Refusing non-finite specials at the parse boundary is necessary but not
+    sufficient: individually finite values can still sum past the decimal
+    context range, and the default context traps that as ``decimal.Overflow``.
+    An escaping arithmetic signal would leave ``run_preflight_safe`` raising
+    instead of returning, so the signal is converted at the shared arithmetic
+    boundary and handled as a deterministic blocking finding by its caller.
+
+    It subclasses ``ContractError`` only as defence in depth, so that an
+    instance which ever reaches an outer boundary still degrades to a
+    fail-closed structural refusal result rather than a traceback.
+    """
+
+
 # --------------------------------------------------------------------------- #
 # Canonical serialization and hashing
 # --------------------------------------------------------------------------- #
@@ -446,6 +468,27 @@ def _decimal(value, where):
             raise ContractError(f"{where} is not a finite decimal value")
         return parsed
     raise ContractError(f"{where} must be a decimal string or number")
+
+
+def _decimal_add(total, addend, where):
+    """Add one finite decimal into a running total, failing closed on a signal.
+
+    ``_decimal`` guarantees both operands are finite, which is not the same as
+    guaranteeing the RESULT is representable: two values whose adjusted
+    exponents each sit inside the decimal context range can sum past it, and the
+    default context traps that as ``decimal.Overflow``. Every trapped decimal
+    arithmetic signal is converted here, at the single shared arithmetic
+    boundary, instead of at individual call sites.
+
+    Nothing is clamped, saturated, rounded or substituted, and neither the
+    decimal context, the precision, the rounding mode nor the accepted finite
+    grammar is altered to avoid the condition: an unrepresentable accumulation
+    is refused, never approximated. The message never echoes the operand.
+    """
+    try:
+        return total + addend
+    except DecimalException as exc:
+        raise DecimalRangeError(f"{where} is not a representable decimal accumulation") from exc
 
 
 def column_letter_to_index(letter):
@@ -1007,12 +1050,19 @@ def _gate_source_authority(manifest, dataset):
             continue
         total = Decimal(0)
         numeric = True
+        representable = True
         for row in dataset["rows"]:
             raw = _cell(row, column)
             if raw == "":
                 continue
             try:
-                total += _decimal(raw, "control total row")
+                total = _decimal_add(total, _decimal(raw, "control total row"), "control total")
+            except DecimalRangeError:
+                # Must precede the ContractError clause: an unrepresentable
+                # accumulation is a distinct condition from a non-numeric cell,
+                # and every row here parsed as a finite decimal.
+                representable = False
+                break
             except ContractError:
                 numeric = False
                 break
@@ -1024,6 +1074,16 @@ def _gate_source_authority(manifest, dataset):
                     STATE_MISMATCH,
                     target_identity,
                     "a row carries a non-numeric value in a control-total column",
+                )
+            )
+        elif not representable:
+            findings.append(
+                finding(
+                    GATE_SOURCE_AUTHORITY,
+                    "control_total_not_representable",
+                    STATE_MISMATCH,
+                    target_identity,
+                    "the control-total column does not accumulate to a representable decimal total",
                 )
             )
         elif total != declared:

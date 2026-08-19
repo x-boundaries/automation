@@ -51,6 +51,15 @@ ordered at all. They are refused at the shared parse boundary, so every numeric
 consumer treats them as a blocking finding rather than passing them through or
 raising out of the fail-closed result contract.
 
+Finite inputs are necessary but not sufficient. Control-total accumulation is
+decimal arithmetic, and two individually finite row values can sum past the
+decimal context range, which the default context traps as `decimal.Overflow`.
+That signal is converted at the shared arithmetic boundary into the blocking
+`control_total_not_representable` finding, so an unrepresentable total is
+refused rather than clamped, saturated, rounded, substituted or allowed to raise
+out of the fail-closed result contract. Precision, rounding, the decimal context
+and the accepted finite grammar are unchanged.
+
 ## Gates
 
 | Gate | What must hold |

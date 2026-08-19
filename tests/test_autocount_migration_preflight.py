@@ -1145,6 +1145,106 @@ class QuantityTests(PreflightAssertions):
 
 
 # --------------------------------------------------------------------------- #
+# Control-total decimal arithmetic
+#
+# Finiteness at the parse boundary is not representability of the result. These
+# values are all FINITE, so a parse-boundary guard alone cannot satisfy this
+# section: the failure is produced by the accumulation itself, which the default
+# decimal context traps as decimal.Overflow. An escaping signal would leave
+# run_preflight_safe raising instead of returning.
+# --------------------------------------------------------------------------- #
+
+
+class ControlTotalDecimalArithmeticTests(PreflightAssertions):
+    LARGE_POSITIVE = "1E1000000"
+    LARGE_NEGATIVE = "-1E1000000"
+    ACCUMULATING = "9E999999"
+
+    def _case(self, values, declared="9"):
+        """Build an opening fixture whose control-total column holds ``values``."""
+        dataset = opening_dataset()
+        for index, raw in enumerate(values):
+            dataset["rows"][index]["values"]["Qty"] = raw
+        manifest = opening_manifest(dataset)
+        manifest["source"]["control_totals"]["stock_item_opening.Qty"] = declared
+        manifest["source"]["content_sha256"] = contract.dataset_content_sha256(dataset)
+        return manifest, dataset
+
+    def assertEveryValueParsesFinite(self, *values):
+        for raw in values:
+            self.assertTrue(contract._decimal(raw, "probe").is_finite(), msg=raw)
+
+    def assertNotRepresentable(self, result):
+        self.assertBlocked(result)
+        gate_codes = codes(result, contract.GATE_SOURCE_AUTHORITY)
+        self.assertIn("control_total_not_representable", gate_codes)
+        self.assertNotIn("source_authority_bound", gate_codes)
+        # An unrepresentable accumulation is not a non-numeric cell, and it is
+        # never resolved into a value comparison either.
+        self.assertNotIn("control_total_non_numeric_row", gate_codes)
+        self.assertNotIn("control_total_mismatch", gate_codes)
+
+    def test_single_large_positive_finite_value_blocks_without_escaping(self):
+        self.assertEveryValueParsesFinite(self.LARGE_POSITIVE, "4")
+        manifest, dataset = self._case([self.LARGE_POSITIVE, "4"])
+        result = preflight(manifest, dataset)
+        self.assertNotRepresentable(result)
+        self.assertNotIn(self.LARGE_POSITIVE, contract.canonical_json(result["canonical"]))
+
+    def test_single_large_negative_finite_value_blocks_without_escaping(self):
+        self.assertEveryValueParsesFinite(self.LARGE_NEGATIVE, "4")
+        manifest, dataset = self._case([self.LARGE_NEGATIVE, "4"])
+        result = preflight(manifest, dataset)
+        self.assertNotRepresentable(result)
+        self.assertNotIn(self.LARGE_NEGATIVE, contract.canonical_json(result["canonical"]))
+
+    def test_multi_row_finite_accumulation_overflow_blocks_without_escaping(self):
+        # The load-bearing case: each value is individually representable, and a
+        # single one of them accumulates cleanly. Only the SUM is unrepresentable,
+        # so no parse-boundary or is_finite() guard can satisfy this test.
+        self.assertEveryValueParsesFinite(self.ACCUMULATING, self.ACCUMULATING)
+        single_manifest, single_dataset = self._case([self.ACCUMULATING, ""])
+        single_codes = codes(preflight(single_manifest, single_dataset), contract.GATE_SOURCE_AUTHORITY)
+        self.assertNotIn("control_total_not_representable", single_codes)
+        self.assertIn("control_total_mismatch", single_codes)
+
+        manifest, dataset = self._case([self.ACCUMULATING, self.ACCUMULATING])
+        result = preflight(manifest, dataset)
+        self.assertNotRepresentable(result)
+        self.assertNotIn(self.ACCUMULATING, contract.canonical_json(result["canonical"]))
+
+    def test_run_preflight_safe_returns_a_valid_result_for_an_accumulation_overflow(self):
+        manifest, dataset = self._case([self.ACCUMULATING, self.ACCUMULATING])
+        # No decimal signal may escape the always-return contract.
+        result = contract.run_preflight_safe(manifest, dataset)
+        self.assertEqual(result["canonical"]["preflight_status"], contract.PREFLIGHT_BLOCKED)
+        self.assertEqual(result["canonical"]["import_readiness"], contract.NOT_IMPORT_READY)
+        self.assertEqual(result["canonical_hash"], contract.sha256_of(result["canonical"]))
+        self.assertFalse(result["canonical"]["import_performed"])
+        self.assertIn("control_total_not_representable", codes(result, contract.GATE_SOURCE_AUTHORITY))
+
+    def test_shared_arithmetic_boundary_refuses_rather_than_clamps(self):
+        from decimal import Decimal
+
+        with self.assertRaises(contract.DecimalRangeError) as caught:
+            contract._decimal_add(Decimal(self.ACCUMULATING), Decimal(self.ACCUMULATING), "control total")
+        # Defence in depth: an instance reaching an outer boundary still degrades
+        # to a fail-closed structural refusal instead of a traceback.
+        self.assertIsInstance(caught.exception, contract.ContractError)
+        self.assertNotIn(self.ACCUMULATING, str(caught.exception))
+        # Ordinary representable arithmetic is untouched and is not rounded.
+        self.assertEqual(contract._decimal_add(Decimal("5"), Decimal("4.25"), "control total"), Decimal("9.25"))
+
+    def test_representable_finite_values_including_an_exponent_form_still_pass(self):
+        for values, declared in ((("5", "4"), "9"), (("5.0", "4.00"), "9.0"), (("5E5", "4"), "500004")):
+            with self.subTest(values=values):
+                manifest, dataset = self._case(list(values), declared)
+                result = preflight(manifest, dataset)
+                self.assertPassed(result)
+                self.assertIn("source_authority_bound", codes(result, contract.GATE_SOURCE_AUTHORITY))
+
+
+# --------------------------------------------------------------------------- #
 # Item Opening grain
 # --------------------------------------------------------------------------- #
 
@@ -1602,6 +1702,29 @@ class CliTests(PreflightAssertions):
         self.assertNotIn("InvalidOperation", completed.stderr)
         self.assertIn(contract.NOT_IMPORT_READY, completed.stdout)
         self.assertEqual(written, [cli.REPORT_FILENAME, cli.RESULT_FILENAME])
+
+    def test_cli_does_not_traceback_on_a_control_total_accumulation_overflow(self):
+        # Two individually finite rows whose SUM is unrepresentable. Before the
+        # amendment this exact input raised decimal.Overflow out of the contract,
+        # printed a traceback carrying internal module paths, and wrote neither
+        # output file.
+        dataset = opening_dataset()
+        dataset["rows"][0]["values"]["Qty"] = ControlTotalDecimalArithmeticTests.ACCUMULATING
+        dataset["rows"][1]["values"]["Qty"] = ControlTotalDecimalArithmeticTests.ACCUMULATING
+        manifest = opening_manifest(dataset)
+        manifest["source"]["content_sha256"] = contract.dataset_content_sha256(dataset)
+        completed, written = self._run_cli(manifest, dataset)
+        self.assertEqual(completed.returncode, 1, completed.stderr)
+        self.assertNotIn("Traceback", completed.stderr)
+        self.assertNotIn("Overflow", completed.stderr)
+        self.assertEqual(completed.stderr, "")
+        self.assertIn(contract.NOT_IMPORT_READY, completed.stdout)
+        self.assertNotIn(ControlTotalDecimalArithmeticTests.ACCUMULATING, completed.stdout)
+        self.assertEqual(written, [cli.REPORT_FILENAME, cli.RESULT_FILENAME])
+        # The rendered public-safe report never echoes the offending cell value.
+        report = cli.render_report(contract.run_preflight_safe(manifest, dataset))
+        self.assertIn("control_total_not_representable", report)
+        self.assertNotIn(ControlTotalDecimalArithmeticTests.ACCUMULATING, report)
 
     def test_cli_does_not_traceback_on_conflicting_routing_evidence(self):
         dataset = stock_item_dataset()
