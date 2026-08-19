@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://x-boundaries.local/schemas/autocount_migration_routing_evidence.schema.json",
+  "title": "AutoCount migration effective import-time field-routing evidence (v1)",
+  "description": "External input contract for the effective import-time field-routing state that applies to one import operation, under final design lock DL-XB-140-001-A4. Repository tooling MUST NOT inspect live AutoCount settings; an operator or a later separately authorised lane observes the actual import-time configuration and records it here, and the repository only validates the document. Recognised headers do not prove routing: any import-time configuration capable of changing source-header to AutoCount-destination routing is contract authority. Absence of this document is never 'disabled' - it is UNKNOWN and NOT IMPORT READY. A previously saved mapping is not standing authority, which is why the evidence is bound to a single import_operation_id. Workbook shape, a New/Update preview, row counts, amount totals and a previous successful import are not routing proof and have no representation here. Contains no credentials and no private business rows.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "import_operation_id", "state"],
+  "properties": {
+    "schema_version": {
+      "description": "Fixed contract version. An unrecognised value is refused fail-closed.",
+      "const": "autocount_migration_routing_evidence/v1"
+    },
+    "import_operation_id": {
+      "description": "Must equal the manifest import_operation_id. A different value means the observation belongs to another import operation, so it is treated as not current and blocks with UNKNOWN rather than being reused as standing authority.",
+      "type": "string",
+      "pattern": "^imop_[0-9a-f]{32}$"
+    },
+    "state": {
+      "description": "Exactly one recorded effective routing state. 'enabled' requires a complete mapping that binds every declared qualified source identity to the qualified destination the contract declares; a partial mapping blocks UNKNOWN and a differing destination blocks MISMATCH. 'disabled' and 'unavailable_not_applicable' are POSITIVE observations that satisfy this gate on their own. 'UNKNOWN' blocks. There is no implicit fourth reading: not supplying the document at all is also UNKNOWN.",
+      "enum": ["enabled", "disabled", "unavailable_not_applicable", "UNKNOWN"]
+    },
+    "observation_ref": {
+      "description": "Non-secret reference to how the state was observed (for example an operator evidence note identifier). Required for every state other than UNKNOWN, so a positive 'disabled' claim always carries provenance.",
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9 ._:/#-]{0,127}$"
+    },
+    "mappings": {
+      "description": "The effective source-to-destination binding observed when state is 'enabled'. Both sides are contract-qualified identities: a bare field name never becomes a routing identity merely because its spelling matches. A binding for a source outside the declared contract blocks MISMATCH.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["source", "destination"],
+        "properties": {
+          "source": { "type": "string", "pattern": "^[a-z][a-z0-9_]{1,63}\\.[A-Za-z][A-Za-z0-9_]{0,63}$" },
+          "destination": { "type": "string", "pattern": "^[a-z][a-z0-9_]{1,63}\\.[A-Za-z][A-Za-z0-9_]{0,63}$" }
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "state": { "const": "enabled" } }, "required": ["state"] },
+      "then": { "required": ["schema_version", "import_operation_id", "state", "observation_ref", "mappings"] }
+    },
+    {
+      "if": { "properties": { "state": { "const": "disabled" } }, "required": ["state"] },
+      "then": { "required": ["schema_version", "import_operation_id", "state", "observation_ref"] }
+    },
+    {
+      "if": { "properties": { "state": { "const": "unavailable_not_applicable" } }, "required": ["state"] },
+      "then": { "required": ["schema_version", "import_operation_id", "state", "observation_ref"] }
+    }
+  ]
+}

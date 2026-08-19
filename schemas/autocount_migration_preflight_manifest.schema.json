@@ -1,0 +1,238 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://x-boundaries.local/schemas/autocount_migration_preflight_manifest.schema.json",
+  "title": "AutoCount migration preflight manifest (v1)",
+  "description": "Language-neutral contract for the deterministic AutoCount 2.0 migration preflight manifest under final design lock DL-XB-140-001-A4. The manifest declares what is intended: the source dataset and its cryptographic hash, the template identity, the bounded paste range, the qualified source-to-destination field mappings, the intended account-book/company fingerprint and import surface, the selected Duplicate Item Code Action, the explicitly configured location reference set, and the disposition of every load-bearing conditional authority. It never asserts that an import happened. Effective import-time field routing and actual import execution context are separate external evidence documents with their own schemas, because a declaration is not an attestation. Unknown, partial or unverifiable authority fails closed as UNKNOWN and NOT_IMPORT_READY; no value, importer behaviour, routing configuration or execution context is ever guessed. Repository tooling validating this manifest must not contact AutoCount. Contains no credentials, connection strings, private customer or supplier rows, invoice values, or raw company identity: the account-book target appears only as a one-way non-secret fingerprint.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "design_lock",
+    "import_operation_id",
+    "target",
+    "source",
+    "paste_range",
+    "field_mappings",
+    "duplicate_item_code_action",
+    "location_reference",
+    "conditional_authorities"
+  ],
+  "properties": {
+    "schema_version": {
+      "description": "Fixed contract version. A validator that does not recognise this exact value must refuse fail-closed rather than guess a compatible shape.",
+      "const": "autocount_migration_preflight_manifest/v1"
+    },
+    "design_lock": {
+      "description": "The final design lock this manifest is written against. A manifest naming any other lock is refused.",
+      "const": "DL-XB-140-001-A4"
+    },
+    "import_operation_id": {
+      "description": "Identity of one intended import operation. UUIDv4 rendered as imop_<32 lowercase hex>. Both external evidence documents must carry the same value, which is what makes an attestation current to this operation: an unchanged workbook, template or mapping never turns a prior attestation into standing authority.",
+      "type": "string",
+      "pattern": "^imop_[0-9a-f]{32}$"
+    },
+    "target": {
+      "description": "The intended import target. Declaration only; the actual target is attested separately.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["surface", "account_book_fingerprint"],
+      "properties": {
+        "surface": {
+          "description": "Qualified import operation/surface/entity this manifest targets.",
+          "enum": ["stock_item", "stock_item_opening", "debtor", "creditor", "ar_invoice", "ap_invoice"]
+        },
+        "account_book_fingerprint": {
+          "description": "Intended account-book/company target as a stable one-way non-secret fingerprint: SHA-256 over the schema version and the account-book seed, rendered as acctbk_<64 lowercase hex>. The raw company or account-book identity never enters the repository.",
+          "type": "string",
+          "pattern": "^acctbk_[0-9a-f]{64}$"
+        }
+      }
+    },
+    "source": {
+      "description": "Frozen deterministic source authority. Repeated identical input reproduces identical canonical validation content.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["dataset_id", "template_id", "template_identity", "content_sha256", "row_count", "control_totals"],
+      "properties": {
+        "dataset_id": {
+          "description": "Non-secret identity of the frozen source dataset.",
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9 ._:/#-]{0,127}$"
+        },
+        "template_id": {
+          "description": "Owner used to qualify every source field identity. A source identity is written template_id.Column; there is no unqualified form.",
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]{1,63}$"
+        },
+        "template_identity": {
+          "description": "Identity of the template the generated import-ready output conforms to. A mismatch against the dataset blocks.",
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9 ._:/#-]{0,127}$"
+        },
+        "content_sha256": {
+          "description": "SHA-256 over the canonical JSON of the dataset content. Recomputed at preflight time; a mismatch blocks.",
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "row_count": {
+          "description": "Deterministic row count. Must equal both the dataset row count and the declared paste-range row span.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "control_totals": {
+          "description": "Deterministic control totals keyed by QUALIFIED destination identity (for example stock_item_opening.Qty). A bare field name is not a key. Each total is recomputed from the mapped source column and a mismatch blocks.",
+          "type": "object",
+          "propertyNames": { "pattern": "^[a-z][a-z0-9_]{1,63}\\.[A-Za-z][A-Za-z0-9_]{0,63}$" },
+          "additionalProperties": {
+            "oneOf": [
+              { "type": "string", "pattern": "^-?[0-9]+(\\.[0-9]+)?$" },
+              { "type": "integer" }
+            ]
+          }
+        }
+      }
+    },
+    "paste_range": {
+      "description": "Explicit bounded paste range. Whole-sheet or Select All authority is forbidden, so the range is always stated as concrete bounds and is never inferred from sheet dimensions, which could otherwise sweep in vendor sample, blank or partial rows.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["worksheet", "header_row", "first_row", "last_row", "first_column", "last_column"],
+      "properties": {
+        "worksheet": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9 ._-]{0,63}$" },
+        "header_row": { "type": "integer", "minimum": 1 },
+        "first_row": {
+          "description": "First data row. Must be below header_row, and the span first_row..last_row must equal the validated row count.",
+          "type": "integer",
+          "minimum": 1
+        },
+        "last_row": { "type": "integer", "minimum": 1 },
+        "first_column": { "type": "string", "pattern": "^[A-Z]{1,3}$" },
+        "last_column": { "type": "string", "pattern": "^[A-Z]{1,3}$" }
+      }
+    },
+    "field_mappings": {
+      "description": "The declared contract. Cross-surface correspondence exists only through an explicit mapping between two qualified identities, never because two fields are spelled the same. Any input column not bound here is blocking UNKNOWN rather than silently dropped.",
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["source", "target"],
+        "properties": {
+          "source": {
+            "description": "Qualified source identity, owned by source.template_id.",
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_]{1,63}\\.[A-Za-z][A-Za-z0-9_]{0,63}$"
+          },
+          "target": {
+            "description": "Qualified destination identity, owned by a known import surface. A target owned by a surface other than target.surface blocks.",
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_]{1,63}\\.[A-Za-z][A-Za-z0-9_]{0,63}$"
+          }
+        }
+      }
+    },
+    "duplicate_item_code_action": {
+      "description": "Explicit evidence of the selected Duplicate Item Code Action for an ItemCode-keyed surface. OverWrite and Expand are the official option names; no product-wide default is proven, so an unselected action is blocking UNKNOWN and a silent default overwrite is never authority.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state"],
+      "properties": {
+        "state": { "enum": ["selected", "UNKNOWN"] },
+        "action": { "enum": ["OverWrite", "Expand"] },
+        "evidence_ref": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9 ._:/#-]{0,127}$" }
+      },
+      "if": { "properties": { "state": { "const": "selected" } }, "required": ["state"] },
+      "then": { "required": ["state", "action", "evidence_ref"] }
+    },
+    "location_reference": {
+      "description": "Explicitly configured location reference set, freshly reconciled to the relevant AutoCount setup by an operator. Historically observed codes are not permanent authority and are never hardcoded. When a dataset requires Location validation and no configured set is supplied, the location gate fails closed. Repository tooling never contacts AutoCount to refresh this set.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state"],
+      "properties": {
+        "state": { "enum": ["configured", "UNKNOWN"] },
+        "source_ref": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9 ._:/#-]{0,127}$" },
+        "codes": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "string", "minLength": 1 } }
+      },
+      "if": { "properties": { "state": { "const": "configured" } }, "required": ["state"] },
+      "then": { "required": ["state", "source_ref", "codes"] }
+    },
+    "conditional_authorities": {
+      "description": "Disposition of every load-bearing authority that remains vendor, accountant or owner owned. Only the locked register of keys may appear. RESOLVED requires both a resolver and a non-secret evidence reference; anything else is blocking UNKNOWN. Nothing in the tooling ever promotes an authority to RESOLVED on its own, and no guessed default converts UNKNOWN to PASS.",
+      "type": "object",
+      "propertyNames": {
+        "enum": [
+          "anomalous_ap_partial_rows",
+          "ar_projno",
+          "base_uom_rate_one",
+          "costing",
+          "duplicate_item_code_runtime_behaviour",
+          "excel_zero_negative_behaviour",
+          "import_api_licensing_applicability",
+          "installed_runtime_applicability",
+          "item_opening_excel_seq",
+          "mandatory_columns",
+          "opening_doc_date_mechanism",
+          "production_import_order",
+          "sandbox_test_company_evidence",
+          "stock_item_qty_semantics",
+          "udf_availability_licensing",
+          "update_reimport_semantics"
+        ]
+      },
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["state"],
+        "properties": {
+          "state": { "enum": ["RESOLVED", "UNKNOWN"] },
+          "resolved_by": { "enum": ["vendor", "accountant", "owner"] },
+          "evidence_ref": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9 ._:/#-]{0,127}$" }
+        },
+        "if": { "properties": { "state": { "const": "RESOLVED" } }, "required": ["state"] },
+        "then": { "required": ["state", "resolved_by", "evidence_ref"] }
+      }
+    },
+    "item_opening": {
+      "description": "Required for the stock_item_opening surface. logical_key must equal the documented uniqueness grain ItemCode x UOM x Location x BatchNo x Seq exactly; SerialNo is not part of that key and must not be promoted into it. Seq is structurally part of the key, but its Excel-path representation remains a vendor gate, so the item_opening_excel_seq authority must be resolved before the gate can pass.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["logical_key", "quantity_target"],
+      "properties": {
+        "logical_key": { "type": "array", "minItems": 1, "items": { "type": "string", "pattern": "^[A-Za-z][A-Za-z0-9_]{0,63}$" } },
+        "quantity_target": {
+          "description": "Qualified opening-quantity destination. Zero and negative rows are surfaced as blocking findings requiring explicit disposition; the Excel importer is never assumed to drop them.",
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]{1,63}\\.[A-Za-z][A-Za-z0-9_]{0,63}$"
+        }
+      }
+    },
+    "sku_identity": {
+      "description": "Required for the stock_item surface. PrimarySKU maps to AutoCount ItemCode as X-Boundaries policy. InternalProductID stays external and SKU_History stays external and append-only, so neither appears here. Every alias must resolve deterministically to exactly one current PrimarySKU, and alias uniqueness holds per namespace.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["primary_sku_target", "require_unique_primary_sku", "require_alias_resolution"],
+      "properties": {
+        "primary_sku_target": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]{1,63}\\.[A-Za-z][A-Za-z0-9_]{0,63}$"
+        },
+        "require_unique_primary_sku": { "type": "boolean" },
+        "require_alias_resolution": { "type": "boolean" }
+      }
+    },
+    "arap_ordering": {
+      "description": "Required for an AR or AP surface. Master and detail continuation ordering is load-bearing: the preflight detects re-sorted or interleaved document groups and never silently reorders data into something that looks valid. Debtor and Creditor master data stay distinct from AR/AP opening documents and are never converted to GL opening balances.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["document_column", "row_type_column", "header_value", "detail_value"],
+      "properties": {
+        "document_column": { "type": "string", "pattern": "^[A-Za-z][A-Za-z0-9_]{0,63}$" },
+        "row_type_column": { "type": "string", "pattern": "^[A-Za-z][A-Za-z0-9_]{0,63}$" },
+        "header_value": { "type": "string", "minLength": 1 },
+        "detail_value": { "type": "string", "minLength": 1 }
+      }
+    }
+  }
+}
