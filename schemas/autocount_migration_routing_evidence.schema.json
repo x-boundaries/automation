@@ -26,7 +26,7 @@
       "pattern": "^[A-Za-z0-9][A-Za-z0-9 ._:/#-]{0,127}$"
     },
     "mappings": {
-      "description": "The effective source-to-destination binding observed when state is 'enabled'. Both sides are contract-qualified identities: a bare field name never becomes a routing identity merely because its spelling matches. A binding for a source outside the declared contract blocks MISMATCH.",
+      "description": "The effective source-to-destination binding observed when state is 'enabled'. Both sides are contract-qualified identities: a bare field name never becomes a routing identity merely because its spelling matches. A binding for a source outside the declared contract blocks MISMATCH. Exactly one unambiguous effective binding may be recorded per qualified identity: a repeated source is refused whether the destinations agree or conflict, and a destination claimed by two distinct sources is refused as non-bijective. JSON Schema cannot express that - two objects sharing a source but differing in destination are not duplicates under JSON equality, so uniqueItems would not catch them - therefore the validating implementation enforces it, which is what stops the array order deciding the verdict.",
       "type": "array",
       "items": {
         "type": "object",

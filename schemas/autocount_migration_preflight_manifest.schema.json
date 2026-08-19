@@ -209,7 +209,7 @@
       }
     },
     "sku_identity": {
-      "description": "Required for the stock_item surface. PrimarySKU maps to AutoCount ItemCode as X-Boundaries policy. InternalProductID stays external and SKU_History stays external and append-only, so neither appears here. Every alias must resolve deterministically to exactly one current PrimarySKU, and alias uniqueness holds per namespace.",
+      "description": "Required for the stock_item surface. PrimarySKU maps to AutoCount ItemCode as X-Boundaries policy. InternalProductID stays external and SKU_History stays external and append-only, so neither appears here. Every alias must resolve deterministically to exactly one current PrimarySKU, and alias uniqueness holds per namespace. Current PrimarySKU uniqueness and deterministic alias resolution are unconditional invariants, not operator-selectable policy: the two affirmation fields may only be true, and a manifest asserting false is refused rather than silently coerced.",
       "type": "object",
       "additionalProperties": false,
       "required": ["primary_sku_target", "require_unique_primary_sku", "require_alias_resolution"],
@@ -218,8 +218,14 @@
           "type": "string",
           "pattern": "^[a-z][a-z0-9_]{1,63}\\.[A-Za-z][A-Za-z0-9_]{0,63}$"
         },
-        "require_unique_primary_sku": { "type": "boolean" },
-        "require_alias_resolution": { "type": "boolean" }
+        "require_unique_primary_sku": {
+          "description": "Mandatory affirmation that current PrimarySKU uniqueness is required. Only true is legal; the preflight checks uniqueness unconditionally and never accepts an opt-out.",
+          "const": true
+        },
+        "require_alias_resolution": {
+          "description": "Mandatory affirmation that deterministic alias resolution is required. Only true is legal; the preflight resolves every supplied alias lookup unconditionally and never accepts an opt-out.",
+          "const": true
+        }
       }
     },
     "arap_ordering": {

@@ -168,6 +168,12 @@ DUPLICATE_ITEM_CODE_ACTIONS = ("OverWrite", "Expand")
 # leave it unused/blank until Ingenious confirms.
 STOCK_ITEM_UNRESOLVED_FIELDS = ("Qty",)
 
+# Lock D14/D16: current PrimarySKU uniqueness and deterministic alias
+# resolution are unconditional. These manifest fields stay in the contract as an
+# explicit operator affirmation, but they are not policy switches: the only
+# legal value is true, and the gate performs both checks regardless.
+SKU_MANDATORY_AFFIRMATIONS = ("require_unique_primary_sku", "require_alias_resolution")
+
 # Lock C11: exactly one effective import-time field-routing state is recorded.
 ROUTING_ENABLED = "enabled"
 ROUTING_DISABLED = "disabled"
@@ -413,16 +419,32 @@ def _reject_unknown_keys(mapping, allowed, where):
 
 
 def _decimal(value, where):
-    """Parse a control-total style value without float rounding surprises."""
+    """Parse a control-total style value without float rounding surprises.
+
+    Only a FINITE decimal is numeric authority. ``Decimal`` also accepts the
+    special values ``NaN``, ``sNaN`` and ``Infinity``, and none of them may ever
+    reach a numeric comparison: an infinite value would satisfy a positivity
+    test, and a NaN raises ``decimal.InvalidOperation`` out of an ordering
+    comparison, which would escape the fail-closed result contract entirely.
+    Both are refused here, at the single shared parse boundary, so every
+    consumer is protected identically instead of at individual call sites.
+
+    This restricts non-finite specials only. The accepted finite grammar is
+    unchanged, so an ordinary integer, a plain decimal string and a finite
+    exponent form all behave exactly as before.
+    """
     if isinstance(value, bool):
         raise ContractError(f"{where} must be a decimal string or number")
     if isinstance(value, int):
         return Decimal(value)
     if isinstance(value, str):
         try:
-            return Decimal(value.strip())
+            parsed = Decimal(value.strip())
         except InvalidOperation as exc:
             raise ContractError(f"{where} is not a decimal value") from exc
+        if not parsed.is_finite():
+            raise ContractError(f"{where} is not a finite decimal value")
+        return parsed
     raise ContractError(f"{where} must be a decimal string or number")
 
 
@@ -658,12 +680,17 @@ def _validate_item_opening_block(block):
 
 def _validate_sku_identity_block(block):
     where = "manifest.sku_identity"
-    _reject_unknown_keys(block, ("primary_sku_target", "require_unique_primary_sku", "require_alias_resolution"), where)
+    _reject_unknown_keys(block, ("primary_sku_target",) + SKU_MANDATORY_AFFIRMATIONS, where)
     _require_str(block, "primary_sku_target", where, QUALIFIED_RE)
-    for flag in ("require_unique_primary_sku", "require_alias_resolution"):
+    for flag in SKU_MANDATORY_AFFIRMATIONS:
         value = _require(block, flag, where)
         if not isinstance(value, bool):
             raise ContractError(f"{where}.{flag} must be a boolean")
+        # Lock D14/D16 makes these invariants unconditional, so the only legal
+        # value is true. A manifest asserting false is refused outright rather
+        # than silently coerced, which would hide the declared intent.
+        if value is not True:
+            raise ContractError(f"{where}.{flag} is a mandatory invariant and must be true")
     return block
 
 
@@ -792,11 +819,37 @@ def validate_routing_evidence(evidence):
         raise ContractError(f"{where}.state must be one of {list(ROUTING_STATES)}")
     if state != ROUTING_UNKNOWN:
         _require_str(evidence, "observation_ref", where, REF_RE)
+    # Semantic uniqueness is enforced HERE, before any caller can fold the
+    # array into a source-keyed index, because folding is lossy: a repeated
+    # source would silently overwrite a positively observed binding and let the
+    # ORDER of the evidence array decide the verdict. JSON Schema cannot express
+    # this - two objects sharing a source but differing in destination are not
+    # duplicates under JSON equality - so the check lives in Python, using the
+    # same seen-sources/seen-targets shape manifest.field_mappings already uses.
+    seen_sources = set()
+    seen_destinations = set()
     for index, mapping in enumerate(evidence.get("mappings", []) or []):
         item_where = f"{where}.mappings[{index}]"
         _reject_unknown_keys(mapping, ("source", "destination"), item_where)
-        split_qualified(_require(mapping, "source", item_where))
-        split_qualified(_require(mapping, "destination", item_where))
+        source = _require(mapping, "source", item_where)
+        destination = _require(mapping, "destination", item_where)
+        split_qualified(source)
+        split_qualified(destination)
+        # C11 requires ONE unambiguous effective binding per qualified identity.
+        # A repeated source is refused whether the destinations agree or
+        # conflict: a duplicate observation of the same binding is not harmless
+        # standing authority, it is an ambiguous observation. The message names
+        # only the offending qualified identity and never the array position, so
+        # the refusal is identical whichever order the observations were in.
+        if source in seen_sources:
+            raise ContractError(f"{where}.mappings declares source {source!r} more than once")
+        # A destination claimed by two distinct sources is non-bijective and can
+        # never match a declared contract whose targets are unique, so it is
+        # refused rather than collapsed or guessed.
+        if destination in seen_destinations:
+            raise ContractError(f"{where}.mappings declares destination {destination!r} more than once")
+        seen_sources.add(source)
+        seen_destinations.add(destination)
     return evidence
 
 
@@ -1439,15 +1492,16 @@ def _gate_sku_alias(manifest, dataset):
             seen_alias_keys.add(key)
             alias_entries.append((key, primary))
 
-    if block["require_unique_primary_sku"]:
-        seen = set()
-        for index, primary in enumerate(current_skus):
-            if primary in seen:
-                findings.append(
-                    finding(gate, "duplicate_current_primary_sku", STATE_MISMATCH, f"current_sku[{index}]",
-                            "the same current PrimarySKU appears on more than one identity record")
-                )
-            seen.add(primary)
+    # Unconditional (lock D16). The manifest affirms this invariant; it cannot
+    # switch it off, so the check runs for every sku_identity contract.
+    seen = set()
+    for index, primary in enumerate(current_skus):
+        if primary in seen:
+            findings.append(
+                finding(gate, "duplicate_current_primary_sku", STATE_MISMATCH, f"current_sku[{index}]",
+                        "the same current PrimarySKU appears on more than one identity record")
+            )
+        seen.add(primary)
 
     current_set = set(current_skus)
 
@@ -1472,32 +1526,35 @@ def _gate_sku_alias(manifest, dataset):
                             "row PrimarySKU does not resolve to a current identity record")
                 )
 
-    if block["require_alias_resolution"]:
-        for index, lookup in enumerate(dataset.get("alias_lookups", []) or []):
-            subject = f"alias_lookups[{index}]"
-            if lookup["namespace"] in ALIAS_UOM_SCOPED_NAMESPACES and not lookup.get("uom"):
-                findings.append(
-                    finding(gate, "alias_lookup_uom_qualification_missing", STATE_UNKNOWN, subject,
-                            "lookup omits the UOM qualification a UOM-scoped alias namespace requires")
-                )
-                continue
-            matches = sorted(
-                {
-                    primary
-                    for key, primary in alias_entries
-                    if key == _alias_key(lookup) and primary in current_set
-                }
+    # Unconditional (lock D16). Every supplied lookup must resolve to exactly
+    # one current PrimarySKU. alias_entries keeps every alias OCCURRENCE rather
+    # than a key-to-SKU map, which is what keeps the >1 resolution branch below
+    # genuinely reachable instead of masked by the duplicate-alias check above.
+    for index, lookup in enumerate(dataset.get("alias_lookups", []) or []):
+        subject = f"alias_lookups[{index}]"
+        if lookup["namespace"] in ALIAS_UOM_SCOPED_NAMESPACES and not lookup.get("uom"):
+            findings.append(
+                finding(gate, "alias_lookup_uom_qualification_missing", STATE_UNKNOWN, subject,
+                        "lookup omits the UOM qualification a UOM-scoped alias namespace requires")
             )
-            if not matches:
-                findings.append(
-                    finding(gate, "alias_resolves_to_no_current_sku", STATE_MISMATCH, subject,
-                            "alias does not resolve to any current PrimarySKU")
-                )
-            elif len(matches) > 1:
-                findings.append(
-                    finding(gate, "alias_resolves_to_multiple_current_skus", STATE_MISMATCH, subject,
-                            "alias resolves to more than one current PrimarySKU")
-                )
+            continue
+        matches = sorted(
+            {
+                primary
+                for key, primary in alias_entries
+                if key == _alias_key(lookup) and primary in current_set
+            }
+        )
+        if not matches:
+            findings.append(
+                finding(gate, "alias_resolves_to_no_current_sku", STATE_MISMATCH, subject,
+                        "alias does not resolve to any current PrimarySKU")
+            )
+        elif len(matches) > 1:
+            findings.append(
+                finding(gate, "alias_resolves_to_multiple_current_skus", STATE_MISMATCH, subject,
+                        "alias resolves to more than one current PrimarySKU")
+            )
 
     if not findings:
         findings.append(

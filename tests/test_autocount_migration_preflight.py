@@ -583,6 +583,121 @@ class RoutingTests(PreflightAssertions):
         self.assertBlocked(result)
         self.assertIn("routing_evidence_not_current", codes(result, contract.GATE_ROUTING))
 
+    # --------------------------------------------------------------------- #
+    # Semantic uniqueness of the effective binding (lock C11/L46).
+    #
+    # A repeated qualified source used to be folded last-wins into a mapping
+    # index, so the ORDER of the evidence array decided whether contradictory
+    # observations passed or blocked. These tests pin the order-independent
+    # refusal.
+    # --------------------------------------------------------------------- #
+
+    def _conflicting_pair(self):
+        """Return (wrong, correct) observations for one declared source."""
+        declared = self.manifest["field_mappings"][0]
+        wrong_destination = self.manifest["field_mappings"][1]["target"]
+        return (
+            {"source": declared["source"], "destination": wrong_destination},
+            {"source": declared["source"], "destination": declared["target"]},
+        )
+
+    def _enabled_with(self, mappings):
+        routing = routing_evidence(self.manifest, contract.ROUTING_ENABLED)
+        routing["mappings"] = mappings
+        return routing
+
+    def _remaining_observations(self):
+        return [
+            {"source": mapping["source"], "destination": mapping["target"]}
+            for mapping in self.manifest["field_mappings"][1:]
+        ]
+
+    def test_repeated_source_with_conflicting_destination_is_refused(self):
+        wrong, correct = self._conflicting_pair()
+        routing = self._enabled_with([wrong, correct] + self._remaining_observations())
+        with self.assertRaises(contract.ContractError):
+            contract.validate_routing_evidence(routing)
+        result = contract.run_preflight_safe(
+            self.manifest, self.dataset, routing, execution_context_evidence(self.manifest)
+        )
+        self.assertBlocked(result)
+        self.assertIn("input_contract_structural_refusal", codes(result))
+
+    def test_conflicting_routing_observations_block_identically_in_either_order(self):
+        wrong, correct = self._conflicting_pair()
+        rest = self._remaining_observations()
+        forward = contract.run_preflight_safe(
+            self.manifest,
+            self.dataset,
+            self._enabled_with([wrong, correct] + rest),
+            execution_context_evidence(self.manifest),
+        )
+        reversed_order = contract.run_preflight_safe(
+            self.manifest,
+            self.dataset,
+            self._enabled_with([correct, wrong] + rest),
+            execution_context_evidence(self.manifest),
+        )
+        self.assertBlocked(forward)
+        self.assertBlocked(reversed_order)
+        # Byte-identical outcome: no last-wins and no first-wins authority.
+        self.assertEqual(forward["canonical"], reversed_order["canonical"])
+        self.assertEqual(forward["canonical_hash"], reversed_order["canonical_hash"])
+
+    def test_repeated_source_with_identical_destination_is_also_refused(self):
+        # A duplicate observation of the same binding is an ambiguous
+        # observation, not harmless standing authority.
+        _, correct = self._conflicting_pair()
+        routing = self._enabled_with([correct, dict(correct)] + self._remaining_observations())
+        with self.assertRaises(contract.ContractError):
+            contract.validate_routing_evidence(routing)
+        self.assertBlocked(
+            contract.run_preflight_safe(
+                self.manifest, self.dataset, routing, execution_context_evidence(self.manifest)
+            )
+        )
+
+    def test_one_destination_claimed_by_two_sources_is_refused_as_non_bijective(self):
+        first, second = self.manifest["field_mappings"][0], self.manifest["field_mappings"][1]
+        routing = self._enabled_with(
+            [
+                {"source": first["source"], "destination": first["target"]},
+                {"source": second["source"], "destination": first["target"]},
+            ]
+            + [
+                {"source": mapping["source"], "destination": mapping["target"]}
+                for mapping in self.manifest["field_mappings"][2:]
+            ]
+        )
+        with self.assertRaises(contract.ContractError):
+            contract.validate_routing_evidence(routing)
+        self.assertBlocked(
+            contract.run_preflight_safe(
+                self.manifest, self.dataset, routing, execution_context_evidence(self.manifest)
+            )
+        )
+
+    def test_refusal_message_names_the_identity_and_never_the_array_position(self):
+        wrong, correct = self._conflicting_pair()
+        rest = self._remaining_observations()
+        messages = []
+        for mappings in ([wrong, correct] + rest, [correct, wrong] + rest):
+            with self.assertRaises(contract.ContractError) as caught:
+                contract.validate_routing_evidence(self._enabled_with(mappings))
+            messages.append(str(caught.exception))
+        self.assertEqual(messages[0], messages[1])
+        self.assertNotIn("[0]", messages[0])
+        self.assertNotIn("[1]", messages[0])
+
+    def test_unique_complete_matching_routing_still_passes_its_gate(self):
+        # Regression guard: the uniqueness check must not disturb valid evidence.
+        result = self._run(self._enabled_with(
+            [{"source": mapping["source"], "destination": mapping["target"]}
+             for mapping in self.manifest["field_mappings"]]
+        ))
+        self.assertPassed(result)
+        self.assertEqual(gate_state(result, contract.GATE_ROUTING), contract.STATE_PASS)
+
 
 # --------------------------------------------------------------------------- #
 # Execution context
@@ -817,6 +932,95 @@ class SkuAliasTests(PreflightAssertions):
         self.assertNotIn("InternalProductID", source.split('"""', 2)[2])
         self.assertNotIn("SKU_History", source.split('"""', 2)[2])
 
+    # --------------------------------------------------------------------- #
+    # Unconditional invariants (lock D14/D16).
+    #
+    # The two manifest affirmations used to be plain booleans, so false
+    # disabled the check while the gate still emitted PASS text claiming
+    # deterministic SKU identity. They are invariants, not policy switches.
+    # --------------------------------------------------------------------- #
+
+    def test_uniqueness_affirmation_cannot_be_switched_off(self):
+        dataset = stock_item_dataset()
+        manifest = stock_item_manifest(dataset)
+        manifest["sku_identity"]["require_unique_primary_sku"] = False
+        with self.assertRaises(contract.ContractError):
+            contract.validate_manifest(manifest)
+        self.assertBlocked(contract.run_preflight_safe(manifest, dataset))
+
+    def test_alias_resolution_affirmation_cannot_be_switched_off(self):
+        dataset = stock_item_dataset()
+        manifest = stock_item_manifest(dataset)
+        manifest["sku_identity"]["require_alias_resolution"] = False
+        with self.assertRaises(contract.ContractError):
+            contract.validate_manifest(manifest)
+        self.assertBlocked(contract.run_preflight_safe(manifest, dataset))
+
+    def test_a_false_affirmation_is_refused_rather_than_coerced_to_true(self):
+        dataset = stock_item_dataset()
+        manifest = stock_item_manifest(dataset)
+        manifest["sku_identity"]["require_unique_primary_sku"] = False
+        with self.assertRaises(contract.ContractError):
+            contract.validate_manifest(manifest)
+        # The refusal must not have rewritten the operator's declaration.
+        self.assertIs(manifest["sku_identity"]["require_unique_primary_sku"], False)
+
+    def test_duplicate_current_primary_sku_blocks_with_no_opt_out_available(self):
+        dataset = stock_item_dataset()
+        dataset["sku_records"][1]["primary_sku"] = "SKU-A"
+        dataset["sku_records"][1]["aliases"] = [
+            {"namespace": "barcode", "value": "9990000000002", "uom": "UNIT"}
+        ]
+        dataset["rows"][1]["values"]["PrimarySKU"] = "SKU-A"
+        manifest = stock_item_manifest(dataset)
+        manifest["source"]["content_sha256"] = contract.dataset_content_sha256(dataset)
+        result = preflight(manifest, dataset)
+        self.assertBlocked(result)
+        self.assertIn("duplicate_current_primary_sku", codes(result, contract.GATE_SKU_ALIAS))
+
+    def test_multi_resolution_alias_path_survives_the_unconditional_correction(self):
+        # Guard the genuinely reachable >1 resolution branch: making the
+        # uniqueness check unconditional must not mask it. The two records here
+        # carry DISTINCT current PrimarySKUs, so no duplicate-PrimarySKU finding
+        # is involved and the ambiguity can only come from alias resolution.
+        dataset = stock_item_dataset()
+        dataset["sku_records"][1]["aliases"] = [
+            {"namespace": "barcode", "value": "9990000000001", "uom": "UNIT"}
+        ]
+        dataset["alias_lookups"] = [{"namespace": "barcode", "value": "9990000000001", "uom": "UNIT"}]
+        manifest = stock_item_manifest(dataset)
+        manifest["source"]["content_sha256"] = contract.dataset_content_sha256(dataset)
+        result = preflight(manifest, dataset)
+        self.assertBlocked(result)
+        found = codes(result, contract.GATE_SKU_ALIAS)
+        self.assertIn("alias_resolves_to_multiple_current_skus", found)
+        self.assertNotIn("duplicate_current_primary_sku", found)
+
+    def test_zero_resolution_alias_still_blocks_unconditionally(self):
+        dataset = stock_item_dataset()
+        dataset["alias_lookups"] = [{"namespace": "barcode", "value": "9990000009999", "uom": "UNIT"}]
+        manifest = stock_item_manifest(dataset)
+        manifest["source"]["content_sha256"] = contract.dataset_content_sha256(dataset)
+        result = preflight(manifest, dataset)
+        self.assertBlocked(result)
+        self.assertIn("alias_resolves_to_no_current_sku", codes(result, contract.GATE_SKU_ALIAS))
+
+    def test_pass_detail_is_only_emitted_after_both_checks_actually_ran(self):
+        dataset = stock_item_dataset()
+        manifest = stock_item_manifest(dataset)
+        result = preflight(manifest, dataset)
+        self.assertPassed(result)
+        detail = [
+            item
+            for item in result["canonical"]["findings"]
+            if item["code"] == "sku_identity_deterministic"
+        ]
+        self.assertEqual(len(detail), 1)
+        # The only legal manifest is one that affirms both invariants, and the
+        # gate runs both checks unconditionally, so the claim is now truthful.
+        self.assertIs(manifest["sku_identity"]["require_unique_primary_sku"], True)
+        self.assertIs(manifest["sku_identity"]["require_alias_resolution"], True)
+
 
 # --------------------------------------------------------------------------- #
 # Quantity
@@ -862,6 +1066,82 @@ class QuantityTests(PreflightAssertions):
         result = preflight(manifest, dataset)
         self.assertBlocked(result)
         self.assertIn("opening_quantity_negative_requires_disposition", codes(result, contract.GATE_QUANTITY))
+
+    # --------------------------------------------------------------------- #
+    # Non-finite decimals (lock C9/F23).
+    #
+    # Decimal accepts NaN, sNaN and Infinity. Infinity used to satisfy the
+    # positivity test and reach PASS, and NaN used to raise
+    # decimal.InvalidOperation out of the ordering comparison and escape the
+    # fail-closed result contract entirely. Only finite decimals are authority.
+    # --------------------------------------------------------------------- #
+
+    NON_FINITE = ("Infinity", "-Infinity", "inf", "-inf", "NaN", "nan", "sNaN")
+
+    def test_no_non_finite_opening_quantity_passes(self):
+        for raw in self.NON_FINITE:
+            with self.subTest(quantity=raw):
+                dataset = opening_dataset()
+                dataset["rows"][0]["values"]["Qty"] = raw
+                manifest = opening_manifest(dataset)
+                manifest["source"]["control_totals"] = {}
+                manifest["source"]["content_sha256"] = contract.dataset_content_sha256(dataset)
+                result = preflight(manifest, dataset)
+                self.assertBlocked(result)
+                self.assertIn("opening_quantity_non_numeric", codes(result, contract.GATE_QUANTITY))
+                self.assertNotIn("opening_quantities_positive", codes(result, contract.GATE_QUANTITY))
+
+    def test_no_non_finite_control_total_row_passes(self):
+        for raw in ("Infinity", "NaN"):
+            with self.subTest(cell=raw):
+                dataset = opening_dataset()
+                dataset["rows"][0]["values"]["Qty"] = raw
+                manifest = opening_manifest(dataset)
+                manifest["source"]["content_sha256"] = contract.dataset_content_sha256(dataset)
+                result = preflight(manifest, dataset)
+                self.assertBlocked(result)
+                self.assertIn("control_total_non_numeric_row", codes(result, contract.GATE_SOURCE_AUTHORITY))
+
+    def test_declared_non_finite_control_total_is_refused_structurally(self):
+        dataset = opening_dataset()
+        manifest = opening_manifest(dataset)
+        manifest["source"]["control_totals"] = {"stock_item_opening.Qty": "Infinity"}
+        with self.assertRaises(contract.ContractError):
+            contract.validate_manifest(manifest)
+        self.assertBlocked(contract.run_preflight_safe(manifest, dataset))
+
+    def test_no_decimal_invalid_operation_escapes_the_safe_result_contract(self):
+        for raw in self.NON_FINITE:
+            with self.subTest(quantity=raw):
+                dataset = opening_dataset()
+                dataset["rows"][0]["values"]["Qty"] = raw
+                manifest = opening_manifest(dataset)
+                manifest["source"]["content_sha256"] = contract.dataset_content_sha256(dataset)
+                # run_preflight_safe must honour its always-return contract.
+                result = contract.run_preflight_safe(manifest, dataset)
+                self.assertEqual(result["canonical"]["preflight_status"], contract.PREFLIGHT_BLOCKED)
+                self.assertEqual(result["canonical_hash"], contract.sha256_of(result["canonical"]))
+
+    def test_non_finite_findings_never_echo_the_offending_cell_value(self):
+        dataset = opening_dataset()
+        dataset["rows"][0]["values"]["Qty"] = "sNaN"
+        manifest = opening_manifest(dataset)
+        manifest["source"]["content_sha256"] = contract.dataset_content_sha256(dataset)
+        serialized = contract.canonical_json(contract.run_preflight_safe(manifest, dataset)["canonical"])
+        self.assertNotIn("sNaN", serialized)
+
+    def test_finite_decimal_forms_are_unaffected(self):
+        # The amendment restricts non-finite specials only; the accepted finite
+        # grammar, including a finite exponent form, is unchanged.
+        for raw, total in (("5", "9"), ("5.0", "9.0"), ("5e0", "9")):
+            with self.subTest(quantity=raw):
+                dataset = opening_dataset()
+                dataset["rows"][0]["values"]["Qty"] = raw
+                manifest = opening_manifest(dataset)
+                manifest["source"]["control_totals"]["stock_item_opening.Qty"] = total
+                manifest["source"]["content_sha256"] = contract.dataset_content_sha256(dataset)
+                result = preflight(manifest, dataset)
+                self.assertIn("opening_quantities_positive", codes(result, contract.GATE_QUANTITY))
 
 
 # --------------------------------------------------------------------------- #
@@ -1114,6 +1394,26 @@ class SchemaTests(unittest.TestCase):
         schema = self._schema(ROUTING_SCHEMA_PATH)
         self.assertEqual(tuple(schema["properties"]["state"]["enum"]), contract.ROUTING_STATES)
 
+    def test_schema_pins_the_sku_affirmations_to_true(self):
+        schema = self._schema(MANIFEST_SCHEMA_PATH)
+        properties = schema["properties"]["sku_identity"]["properties"]
+        for flag in contract.SKU_MANDATORY_AFFIRMATIONS:
+            with self.subTest(flag=flag):
+                self.assertIs(properties[flag]["const"], True)
+
+    def test_routing_schema_documents_the_python_enforced_uniqueness(self):
+        # JSON Schema cannot express same-source/different-destination
+        # duplication, so the routing schema records the requirement and Python
+        # enforces it. Assert both halves stay in place together.
+        schema = self._schema(ROUTING_SCHEMA_PATH)
+        description = schema["properties"]["mappings"]["description"]
+        self.assertIn("one unambiguous effective binding", description)
+        # No uniqueItems keyword: it would not catch the real defect class.
+        self.assertNotIn("uniqueItems", schema["properties"]["mappings"])
+        source = (SCRIPTS / "autocount_migration_preflight_contract.py").read_text(encoding="utf-8")
+        self.assertIn("declares source", source)
+        self.assertIn("declares destination", source)
+
     def test_manifest_fixture_validates_against_the_real_schema(self):
         try:
             import jsonschema
@@ -1258,6 +1558,72 @@ class CliTests(PreflightAssertions):
                 self._write(tmp, "dataset.json", dataset),
             ]
             self.assertEqual(cli.main(argv), 2)
+
+    def _run_cli(self, manifest, dataset, routing=None, execution=None):
+        """Run the CLI with complete positive evidence unless overridden.
+
+        Both evidence documents are supplied by default so that the input under
+        test is the only thing that can block; otherwise an unrelated UNKNOWN
+        gate would mask whether the defect class itself was caught.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            routing = routing_evidence(manifest) if routing is None else routing
+            execution = execution_context_evidence(manifest) if execution is None else execution
+            argv = [
+                "--manifest",
+                self._write(tmp, "manifest.json", manifest),
+                "--dataset",
+                self._write(tmp, "dataset.json", dataset),
+                "--output-dir",
+                str(Path(tmp) / "run"),
+                "--routing-evidence",
+                self._write(tmp, "routing.json", routing),
+                "--execution-context-evidence",
+                self._write(tmp, "execution.json", execution),
+            ]
+            completed = subprocess.run(
+                [sys.executable, str(SCRIPTS / "autocount_migration_preflight.py")] + argv,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            written = sorted(p.name for p in (Path(tmp) / "run").iterdir()) if (Path(tmp) / "run").is_dir() else []
+        return completed, written
+
+    def test_cli_does_not_traceback_on_a_non_finite_quantity(self):
+        dataset = opening_dataset()
+        dataset["rows"][0]["values"]["Qty"] = "NaN"
+        manifest = opening_manifest(dataset)
+        manifest["source"]["control_totals"] = {}
+        manifest["source"]["content_sha256"] = contract.dataset_content_sha256(dataset)
+        completed, written = self._run_cli(manifest, dataset)
+        self.assertEqual(completed.returncode, 1, completed.stderr)
+        self.assertNotIn("Traceback", completed.stderr)
+        self.assertNotIn("InvalidOperation", completed.stderr)
+        self.assertIn(contract.NOT_IMPORT_READY, completed.stdout)
+        self.assertEqual(written, [cli.REPORT_FILENAME, cli.RESULT_FILENAME])
+
+    def test_cli_does_not_traceback_on_conflicting_routing_evidence(self):
+        dataset = stock_item_dataset()
+        manifest = stock_item_manifest(dataset)
+        declared = manifest["field_mappings"][0]
+        routing = routing_evidence(manifest, contract.ROUTING_ENABLED)
+        # Every OTHER declared source is bound correctly, so the duplicated
+        # source is the only defect in the document. The conflicting observation
+        # is listed first on purpose: under a last-wins fold this exact document
+        # reported a clean pass, so a passing exit here would be the defect.
+        routing["mappings"] = [
+            {"source": declared["source"], "destination": manifest["field_mappings"][1]["target"]},
+            {"source": declared["source"], "destination": declared["target"]},
+        ] + [
+            {"source": mapping["source"], "destination": mapping["target"]}
+            for mapping in manifest["field_mappings"][1:]
+        ]
+        completed, written = self._run_cli(manifest, dataset, routing)
+        self.assertEqual(completed.returncode, 1, completed.stderr)
+        self.assertNotIn("Traceback", completed.stderr)
+        self.assertIn(contract.NOT_IMPORT_READY, completed.stdout)
+        self.assertEqual(written, [cli.REPORT_FILENAME, cli.RESULT_FILENAME])
 
 
 if __name__ == "__main__":

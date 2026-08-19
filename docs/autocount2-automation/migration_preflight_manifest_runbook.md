@@ -44,6 +44,13 @@ Three states are kept distinct on purpose:
 `UNKNOWN` and `MISMATCH` both block. Absence of evidence is never converted into
 a negative fact: a missing routing observation is `UNKNOWN`, never `disabled`.
 
+Numeric authority is **finite decimal only**. `Decimal` also parses the special
+values `NaN`, `sNaN` and `Infinity`, and none of them is a quantity or a control
+total: an infinite value would satisfy a positivity test and a `NaN` cannot be
+ordered at all. They are refused at the shared parse boundary, so every numeric
+consumer treats them as a blocking finding rather than passing them through or
+raising out of the fail-closed result contract.
+
 ## Gates
 
 | Gate | What must hold |
@@ -52,11 +59,11 @@ a negative fact: a missing routing observation is `UNKNOWN`, never `disabled`.
 | `paste_range` | An explicit bounded range is declared and spans exactly the validated rows; no row falls outside it. Whole-sheet or Select All authority is forbidden. |
 | `columns` | Every input column is bound to exactly one declared mapping. Anything else is blocking `UNKNOWN`, never silently dropped. |
 | `field_identity` | Every mapping targets the declared surface, using contract-qualified identities on both sides. |
-| `routing` | External routing evidence is current and either positively not applicable or completely and correctly mapped. |
+| `routing` | External routing evidence is current and either positively not applicable or completely and correctly mapped, with exactly one unambiguous effective binding recorded per qualified identity. |
 | `execution_context` | Both the account-book/company and the import surface/entity are positively attested, current, and match the declaration. |
 | `duplicate_item_code_action` | An official action is explicitly selected and evidenced on an ItemCode-keyed surface. |
 | `location` | Where `Location` is mapped, an explicitly configured reference set exists and every row falls inside it. |
-| `sku_alias` | `PrimarySKU` uniqueness holds and every alias resolves to exactly one current SKU. |
+| `sku_alias` | `PrimarySKU` uniqueness holds and every alias resolves to exactly one current SKU. Both are unconditional invariants, checked on every `sku_identity` contract. |
 | `quantity` | Unresolved Stock Item fields are unused; zero and negative opening rows are surfaced for disposition. |
 | `item_opening_key` | The declared logical key equals the documented grain, and Excel-path `Seq` authority is evidenced. |
 | `arap_ordering` | Document and detail continuation ordering matches the declared input ordering contract. |
@@ -93,8 +100,20 @@ State is exactly one of `enabled`, `disabled`, `unavailable_not_applicable` or
 | State `UNKNOWN` | `UNKNOWN` / not import ready |
 | Enabled, mapping incomplete | `UNKNOWN` / not import ready |
 | Enabled, destination differs from contract | `MISMATCH` / not import ready |
+| Enabled, one source observed more than once | Refused / not import ready |
+| Enabled, one destination claimed by two sources | Refused / not import ready |
 | Positively `disabled` or `unavailable_not_applicable` | Gate passes, subject to every other gate |
 | Enabled, complete and matching | Gate passes, subject to every other gate |
+
+Exactly one unambiguous effective binding may be recorded per qualified
+identity. A repeated source is refused whether the two destinations agree or
+conflict, and a destination claimed by two distinct sources is refused as
+non-bijective, because such a document can never match a declared contract whose
+targets are unique. This is enforced in the validating implementation rather than
+in JSON Schema: two objects that share a source but differ in destination are not
+duplicates under JSON equality, so `uniqueItems` would not catch them. Enforcing
+it before the evidence is folded into a source-keyed index is what stops the
+order of the array deciding the verdict.
 
 Workbook shape, a `New`/`Update` preview, row counts, amount totals and a
 previous successful import are not routing proof and have no representation in
@@ -168,7 +187,25 @@ until `item_opening_excel_seq` is resolved.
 
 Zero and negative opening quantities are surfaced as blocking findings requiring
 explicit disposition. The Excel importer is never assumed to drop zero rows, and
-the opening document-date mechanism is never inferred.
+the opening document-date mechanism is never inferred. A quantity that is not a
+finite decimal is not a quantity: `NaN`, `sNaN` and `Infinity` are blocking, and
+are never read as a valid positive opening balance.
+
+## SKU identity
+
+`PrimarySKU` maps to AutoCount `ItemCode` as X-Boundaries policy. Current
+`PrimarySKU` uniqueness and deterministic alias resolution are **unconditional
+invariants, not operator-selectable policy**. The manifest carries the two
+affirmations `require_unique_primary_sku` and `require_alias_resolution`, but the
+only legal value for either is `true`: a manifest asserting `false` is refused
+outright rather than silently coerced, and the gate performs both checks on every
+`sku_identity` contract. A `PASS` claiming deterministic SKU identity is therefore
+only ever emitted after both checks actually ran and passed.
+
+Two identity records sharing one current `PrimarySKU` would collapse two
+X-Boundaries products onto one AutoCount `ItemCode`, which under a selected
+`OverWrite` Duplicate Item Code Action is exactly the data-loss class the lock
+exists to prevent. `ItemCode` update semantics are not invented here.
 
 ## AR/AP
 
