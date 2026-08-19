@@ -115,6 +115,80 @@ class SyntheticPortalTests(unittest.TestCase):
             finally:
                 self.restore_credentials(old)
 
+    def test_public_page_is_semantics_gated_and_exposes_an_exact_login_button(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, SyntheticPortalServer() as server:
+            root = Path(directory)
+            config = self.config_for(server, root)
+            with PlaywrightPortal(config) as portal:
+                page = portal.page
+                page.goto(config.portal_url, wait_until="domcontentloaded")
+
+                # Pre-activation the only exposed control is the semantics gate.
+                self.assertEqual(
+                    page.get_by_role("button", name="Enable accessibility", exact=True).count(), 1
+                )
+                self.assertEqual(page.locator("flt-semantics-placeholder").count(), 1)
+                self.assertEqual(page.get_by_role("button", name="Login", exact=True).count(), 0)
+
+                login_entry = portal._enter_public_semantics(page)
+
+                # Exactly one dispatch, placeholder gone, Login is a button.
+                self.assertEqual(server.activation_count, 1)
+                self.assertEqual(page.locator("flt-semantics-placeholder").count(), 0)
+                self.assertEqual(login_entry.count(), 1)
+                self.assertTrue(login_entry.is_visible())
+                self.assertTrue(login_entry.is_enabled())
+                # The superseded pre-auth link contract must not reappear.
+                self.assertEqual(page.get_by_role("link", name="Login", exact=True).count(), 0)
+
+    def test_activation_affordance_drift_fails_closed_before_dispatch(self) -> None:
+        for variant in (
+            "missing_activation",
+            "ambiguous_activation",
+            "hidden_activation",
+            "disabled_activation",
+        ):
+            with self.subTest(variant=variant):
+                with tempfile.TemporaryDirectory() as directory, SyntheticPortalServer(
+                    variant=variant
+                ) as server:
+                    root = Path(directory)
+                    config = self.config_for(server, root)
+                    old, _values = self.with_credentials()
+                    try:
+                        with PlaywrightPortal(config) as portal:
+                            with self.assertRaises(LayoutChangedError):
+                                portal.login()
+                    finally:
+                        self.restore_credentials(old)
+                    # Fail closed means the gate was never dispatched at all.
+                    self.assertEqual(server.activation_count, 0)
+
+    def test_post_activation_contract_drift_fails_closed_after_one_dispatch(self) -> None:
+        for variant in (
+            "placeholder_persists",
+            "missing_login",
+            "ambiguous_login",
+            "hidden_login",
+            "disabled_login",
+            "wrong_role_login",
+        ):
+            with self.subTest(variant=variant):
+                with tempfile.TemporaryDirectory() as directory, SyntheticPortalServer(
+                    variant=variant
+                ) as server:
+                    root = Path(directory)
+                    config = self.config_for(server, root)
+                    old, _values = self.with_credentials()
+                    try:
+                        with PlaywrightPortal(config) as portal:
+                            with self.assertRaises(LayoutChangedError):
+                                portal.login()
+                    finally:
+                        self.restore_credentials(old)
+                    # Activation is attempted at most once per login attempt.
+                    self.assertEqual(server.activation_count, 1)
+
     def test_ui_drift_and_ambiguous_controls_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as directory, SyntheticPortalServer(variant="missing_invoice_list") as server:
             root = Path(directory)

@@ -75,6 +75,7 @@ class SyntheticPortalServer:
                     self.bills.append(bill)
         self.download_counts: dict[str, int] = {}
         self.search_count = 0
+        self.activation_count = 0
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
 
@@ -130,13 +131,95 @@ class SyntheticPortalServer:
                 ).encode("utf-8")
 
             def _login_page(self, error: str = "") -> bytes:
-                login_link = "" if fixture.variant == "missing_login" else (
-                    '<a href="/login" role="link">Login</a>'
-                )
+                """Model the public Flutter semantics gate, not an open Login link.
+
+                The activation control lives inside the semantics placeholder, as
+                on the live surface, so a successful activation removes both and
+                exposes a single semantic Login button.
+                """
+
+                variant = fixture.variant
+                attributes = ' type="button" data-testid="semantics-activation"'
+                if variant == "hidden_activation":
+                    # Still in the accessibility tree, but with a genuinely empty
+                    # bounding box, so the visibility gate is what must fail --
+                    # visibility:hidden would instead drop it from the tree.
+                    attributes += (
+                        ' style="width:0;height:0;padding:0;border:0;overflow:hidden"'
+                    )
+                if variant == "disabled_activation":
+                    attributes += " disabled"
+                activation = f"<button{attributes}>Enable accessibility</button>"
+                if variant == "missing_activation":
+                    activation_markup = ""
+                elif variant == "ambiguous_activation":
+                    activation_markup = activation * 2
+                else:
+                    activation_markup = activation
+                login_variant = variant if variant in {
+                    "missing_login",
+                    "ambiguous_login",
+                    "hidden_login",
+                    "disabled_login",
+                    "wrong_role_login",
+                } else "normal"
                 alert = f'<div role="alert">{escape(error)}</div>' if error else ""
+                script = """
+                <script>
+                const placeholder = document.querySelector('flt-semantics-placeholder');
+                const host = document.querySelector('flt-semantics-host');
+                const keepPlaceholder = %(keep_placeholder)s;
+                const loginVariant = '%(login_variant)s';
+                function recordActivation() {
+                    // Synchronous so the server count is recorded before the
+                    // dispatched handler returns; no race with the assertion.
+                    const request = new XMLHttpRequest();
+                    request.open('GET', '/synthetic-activate', false);
+                    request.send();
+                }
+                function loginControl() {
+                    if (loginVariant === 'wrong_role_login') {
+                        const anchor = document.createElement('a');
+                        anchor.setAttribute('role', 'link');
+                        anchor.href = '/login';
+                        anchor.textContent = 'Login';
+                        return anchor;
+                    }
+                    const button = document.createElement('button');
+                    button.type = 'button';
+                    button.textContent = 'Login';
+                    if (loginVariant === 'hidden_login') {
+                        // Empty bounding box, still in the accessibility tree.
+                        button.style.cssText =
+                            'width:0;height:0;padding:0;border:0;overflow:hidden';
+                    }
+                    if (loginVariant === 'disabled_login') button.disabled = true;
+                    button.addEventListener('click', () => window.location.href = '/login');
+                    return button;
+                }
+                function activate() {
+                    recordActivation();
+                    if (!keepPlaceholder && placeholder) placeholder.remove();
+                    if (loginVariant === 'missing_login') return;
+                    host.appendChild(loginControl());
+                    if (loginVariant === 'ambiguous_login') host.appendChild(loginControl());
+                }
+                for (const control of document.querySelectorAll('[data-testid="semantics-activation"]')) {
+                    control.addEventListener('click', activate);
+                }
+                </script>
+                """ % {
+                    "keep_placeholder": "true" if variant == "placeholder_persists" else "false",
+                    "login_variant": login_variant,
+                }
                 return self._page(
                     "Energy@Grid",
-                    login_link + alert,
+                    "<flt-semantics-placeholder>"
+                    + activation_markup
+                    + "</flt-semantics-placeholder>"
+                    + "<flt-semantics-host></flt-semantics-host>"
+                    + alert
+                    + script,
                 )
 
             def _login_form(self) -> bytes:
@@ -382,6 +465,10 @@ class SyntheticPortalServer:
                     return
                 if parsed.path == "/login":
                     self._send(self._login_form())
+                    return
+                if parsed.path == "/synthetic-activate":
+                    fixture.activation_count += 1
+                    self._send(b"ok", content_type="text/plain")
                     return
                 if not self._authed():
                     self._send(self._login_page("Session expired"), status=HTTPStatus.UNAUTHORIZED)
