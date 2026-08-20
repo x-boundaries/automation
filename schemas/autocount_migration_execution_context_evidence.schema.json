@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://x-boundaries.local/schemas/autocount_migration_execution_context_evidence.schema.json",
+  "title": "AutoCount migration import execution-context attestation (v1)",
+  "description": "External input contract for the ACTUAL import execution context at the relevant test or production import point, under final design lock DL-XB-140-001-A4. Repository tooling MUST NOT inspect a live AutoCount session; an operator or a later separately authorised lane attests the actual context and records it here, and the repository only validates the document. Two independent dimensions are bound and neither can substitute for the other: (a) the actual account-book/company, compared against the manifest's declared non-secret fingerprint, and (b) the exact actual import operation/surface/entity, compared against the manifest's declared qualified target. They are separate objects here precisely so a single 'looks right' signal cannot satisfy both. A dimension is ATTESTED only on positive current evidence; anything else is UNKNOWN and NOT IMPORT READY, and a declared-versus-actual difference is MISMATCH. A prior import, an unchanged workbook, template or mapping, a worksheet name, a structurally valid preview, and row or amount control totals are not execution-context proof and have no representation here. Attestation freshness is enforced by import_operation_id: a previous attestation never becomes general standing authority. This repository-only gate defines and validates the evidence contract; it does not implement the future live evidence-acquisition mechanism. The document stays public-safe in structure and carries no credentials, no raw company or account-book identity, and no private business rows.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "import_operation_id"],
+  "properties": {
+    "schema_version": {
+      "description": "Fixed contract version. An unrecognised value is refused fail-closed.",
+      "const": "autocount_migration_execution_context_evidence/v1"
+    },
+    "import_operation_id": {
+      "description": "Must equal the manifest import_operation_id, which is what makes this attestation current to the relevant import operation. A different value means the attestation belongs to another operation and both dimensions block with UNKNOWN.",
+      "type": "string",
+      "pattern": "^imop_[0-9a-f]{32}$"
+    },
+    "account_book": {
+      "description": "Dimension (a): the account-book/company the import would actually run against. Omitting this object is UNKNOWN, not a pass.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state"],
+      "properties": {
+        "state": { "enum": ["ATTESTED", "UNKNOWN"] },
+        "actual_fingerprint": {
+          "description": "Actual account-book/company as the same one-way non-secret fingerprint shape the manifest declares. Comparing fingerprints keeps raw company identity out of the repository while still detecting a wrong-book import.",
+          "type": "string",
+          "pattern": "^acctbk_[0-9a-f]{64}$"
+        },
+        "attestation_ref": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9 ._:/#-]{0,127}$" }
+      },
+      "if": { "properties": { "state": { "const": "ATTESTED" } }, "required": ["state"] },
+      "then": { "required": ["state", "actual_fingerprint", "attestation_ref"] }
+    },
+    "import_surface": {
+      "description": "Dimension (b): the import operation/surface/entity actually selected. Omitting this object is UNKNOWN, not a pass. The actual selection must be attested directly and is never inferred from workbook type, worksheet name, recognised headers, effective column mapping, a New/Update preview, or row and control totals.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state"],
+      "properties": {
+        "state": { "enum": ["ATTESTED", "UNKNOWN"] },
+        "actual_surface": {
+          "description": "Actual selected qualified import surface/entity.",
+          "enum": ["stock_item", "stock_item_opening", "debtor", "creditor", "ar_invoice", "ap_invoice"]
+        },
+        "attestation_ref": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9 ._:/#-]{0,127}$" }
+      },
+      "if": { "properties": { "state": { "const": "ATTESTED" } }, "required": ["state"] },
+      "then": { "required": ["state", "actual_surface", "attestation_ref"] }
+    }
+  }
+}
