@@ -51,6 +51,19 @@ on:
       # workflow. tests/test_ac2_member_expiry_capability_probe.py enforces mechanically
       # that every repository file the module reads or asserts appears in this filter.
       - ".gitignore"
+      # AC2 migration-preflight surfaces (#140). The Windows job's full-repository suite
+      # exercises tests/test_autocount_migration_preflight.py, so a pull request confined to
+      # these scripts, schemas, test or runbook must still trigger this workflow instead of
+      # depending on README.md happening to change alongside them. Exact entries, not globs:
+      # a broad docs/, scripts/ or tests/ wildcard would widen the reviewed trigger surface
+      # and break the existing exact-membership closure.
+      - "docs/autocount2-automation/migration_preflight_manifest_runbook.md"
+      - "schemas/autocount_migration_execution_context_evidence.schema.json"
+      - "schemas/autocount_migration_preflight_manifest.schema.json"
+      - "schemas/autocount_migration_routing_evidence.schema.json"
+      - "scripts/autocount_migration_preflight.py"
+      - "scripts/autocount_migration_preflight_contract.py"
+      - "tests/test_autocount_migration_preflight.py"
   workflow_dispatch: {}
 
 jobs:
