@@ -78,6 +78,10 @@ Weekly later:
 
 5. Use a read-only SQL connection. Prefer Windows authentication with a dedicated read-only Windows account. If SQL authentication is required, store it only on the VM, never in this repo.
 
+   SQL source mode also requires the expected SQL execution context described in
+   [Expected SQL Execution Context Guard](#expected-sql-execution-context-guard).
+   Extraction fails closed without it.
+
    Example user-level environment variable:
 
    ```powershell
@@ -148,6 +152,61 @@ Weekly later:
      -LogonType S4U `
      -StartTime "02:00"
    ```
+
+## Expected SQL Execution Context Guard
+
+`Trusted_Connection=yes` proves only that integrated authentication was used. It does not
+identify which Windows account, SQL login, database user, or database the session actually
+resolved to. A connection-string label is not proof of a read-only identity.
+
+SQL source mode therefore refuses to run any business query until the expected execution
+context is supplied locally and matches what the server reports on the same connection.
+
+### Required Environment Variable Names
+
+Set these three on the VM. Only the NAMES belong in this repository:
+
+| Variable name | Must contain |
+|---|---|
+| `AUTOCOUNT_EXPECTED_SQL_LOGIN` | the SQL login the extraction process must resolve to |
+| `AUTOCOUNT_EXPECTED_SQL_USER` | the mapped database user in the AutoCount database |
+| `AUTOCOUNT_EXPECTED_SQL_DATABASE` | the explicit AutoCount database the extractor must be bound to |
+
+### Handling Rules
+
+- The values are private operational identity values. Never commit them, never paste them into
+  documentation, pull requests, issue comments, chat, logs, or screenshots.
+- The values must correspond to the intended dedicated future task identity, its one-to-one
+  mapped database user, and the explicit target database — not to an interactive administrator
+  account.
+- Comparison is exact, so each value must match what the server reports character for
+  character. Read the three values yourself on the VM using
+  `SELECT SUSER_SNAME(), USER_NAME(), DB_NAME();` while connected as the intended identity, and
+  keep the result local.
+- Set them for the account that will actually run the extractor. Values placed only in a
+  different account's user scope will not be visible to an unattended task.
+
+### Behaviour
+
+- If any of the three is missing or blank, SQL extraction fails closed before opening a
+  connection. No business query runs and no run manifest is written.
+- The extractor reads `SUSER_SNAME()`, `USER_NAME()`, and `DB_NAME()` on the same connection
+  and cursor that will run the dataset query, immediately before that query. Every dataset
+  opens its own connection and is asserted independently, so a context proven on one connection
+  never authorises a query on another.
+- On any mismatch, the run aborts before the business query. It does not retry, does not fall
+  back to the interactive or administrative account, and does not continue to the remaining
+  datasets.
+- Failure messages name only the contract class that failed, for example
+  `Expected SQL execution context is not configured: ...` or
+  `SQL execution context mismatch: login`. They never include observed or expected logins,
+  users, databases, server names, connection strings, or credentials. To diagnose a mismatch,
+  compare the values locally on the VM.
+- Sample source mode and `--dry-run` do not require these variables. `--dry-run` remains
+  non-connecting and non-persisting.
+
+Current production extraction and Windows Task Scheduler activation remain unapproved under
+issue #149. This guard is a prerequisite control, not an approval.
 
 ## Output Contract
 

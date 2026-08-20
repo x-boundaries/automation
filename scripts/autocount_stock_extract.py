@@ -21,6 +21,32 @@ from csv_safety import safe_csv_row
 DEFAULT_TIMEZONE = "Asia/Singapore"
 DEFAULT_OVERLAP_DAYS = 3
 
+# Expected SQL execution context, supplied locally on the VM. Only these variable NAMES belong
+# in the repository; their values are private operational identities and must never be
+# committed, printed, logged or pasted anywhere.
+#
+# Trusted_Connection=yes proves only that integrated authentication was used - it does not
+# identify which Windows account, SQL login, database user or database the session resolved to.
+# The read-only contract is therefore asserted explicitly, per connection, before any business
+# query runs.
+EXPECTED_SQL_CONTEXT_ENV = {
+    "login": "AUTOCOUNT_EXPECTED_SQL_LOGIN",
+    "user": "AUTOCOUNT_EXPECTED_SQL_USER",
+    "database": "AUTOCOUNT_EXPECTED_SQL_DATABASE",
+}
+SQL_EXECUTION_CONTEXT_QUERY = (
+    "SELECT SUSER_SNAME() AS actual_login, USER_NAME() AS actual_user, DB_NAME() AS actual_database"
+)
+
+
+class SqlExecutionContextError(RuntimeError):
+    """Fail-closed SQL identity guard.
+
+    Raised before any business query when the expected read-only execution context is not
+    configured, cannot be read, or does not match. Messages name only the contract class that
+    failed - never an observed or expected login, user, database, server or connection value.
+    """
+
 
 def build_run_context(
     business_date=None,
@@ -74,6 +100,11 @@ def run_extraction(config, source=None, notifier=None, business_date=None, now=N
             row_counts[dataset_name] = len(rows)
             dataset_files[dataset_name] = str(dataset_path)
             storage_files[dataset_name] = describe_file(dataset_path)
+        except SqlExecutionContextError:
+            # Fail closed. An identity failure aborts the run instead of degrading into a
+            # per-dataset exception that the remaining datasets would continue past, and no
+            # manifest is written that could be mistaken for an ordinary source outage.
+            raise
         except Exception as exc:  # noqa: BLE001 - manifest should capture source failures.
             row_counts[dataset_name] = 0
             exceptions.append(
@@ -166,6 +197,8 @@ class SqlServerSource:
             raise ValueError(f"Dataset {dataset_name} has no query configured")
 
         connection_string = resolve_connection_string(self.connection_config)
+        # Fail closed before opening anything: no locally supplied expected authority, no read.
+        expected_context = resolve_expected_sql_context()
         parameters = resolve_query_parameters(dataset_config.get("parameters", []), context)
 
         try:
@@ -175,6 +208,9 @@ class SqlServerSource:
 
         with pyodbc.connect(connection_string, autocommit=True) as connection:
             cursor = connection.cursor()
+            # Same connection, same cursor, immediately before the configured dataset query.
+            # Each dataset opens its own connection, so each one is asserted independently.
+            assert_sql_execution_context(cursor, expected_context)
             cursor.execute(query, parameters)
             columns = [column[0] for column in cursor.description or []]
             return [dict(zip(columns, row)) for row in cursor.fetchall()]
@@ -241,6 +277,55 @@ def resolve_connection_string(connection_config):
     raise RuntimeError("Configure source_connection.connection_string_env for the read-only SQL login")
 
 
+def resolve_expected_sql_context(environ=None):
+    """Read the locally supplied expected SQL execution context, or fail closed.
+
+    Returns the expected login, database user and database. Only the variable NAMES appear in
+    the error text; the values are private and are never included.
+    """
+    environ = os.environ if environ is None else environ
+    expected = {}
+    missing = []
+    for field, env_name in EXPECTED_SQL_CONTEXT_ENV.items():
+        value = (environ.get(env_name) or "").strip()
+        if value:
+            expected[field] = value
+        else:
+            missing.append(env_name)
+    if missing:
+        raise SqlExecutionContextError(
+            "Expected SQL execution context is not configured: " + ", ".join(sorted(missing))
+        )
+    return expected
+
+
+def assert_sql_execution_context(cursor, expected):
+    """Verify login, database user and database on THIS cursor before any business query.
+
+    The assertion must share the connection it authorises: a context proven on one connection
+    says nothing about another, so every separately opened dataset connection is checked.
+    """
+    cursor.execute(SQL_EXECUTION_CONTEXT_QUERY)
+    row = cursor.fetchone()
+    if row is None:
+        raise SqlExecutionContextError("SQL execution context could not be verified")
+
+    actual = {
+        "login": _context_value(row[0]),
+        "user": _context_value(row[1]),
+        "database": _context_value(row[2]),
+    }
+    mismatched = sorted(field for field, value in expected.items() if actual[field] != value)
+    if mismatched:
+        # Contract classes only. Never the observed or expected identity values.
+        raise SqlExecutionContextError("SQL execution context mismatch: " + ", ".join(mismatched))
+    return True
+
+
+def _context_value(value):
+    return "" if value is None else str(value).strip()
+
+
 def resolve_query_parameters(parameter_names, context):
     return [_coerce_query_parameter(context[name]) for name in parameter_names]
 
@@ -303,7 +388,13 @@ def main(argv=None):
         print(json.dumps(context, indent=2, sort_keys=True))
         return 0
 
-    manifest = run_extraction(config, business_date=args.business_date)
+    try:
+        manifest = run_extraction(config, business_date=args.business_date)
+    except SqlExecutionContextError as exc:
+        # Generic, contract-class-only failure. No identity, server or connection detail.
+        print(json.dumps({"status": "failed", "error": sanitize_error(str(exc))}, indent=2))
+        return 1
+
     print(json.dumps({"status": manifest["status"], "storage_batch_id": manifest["storage_batch_id"]}, indent=2))
     return 1 if manifest["status"] == "failed" else 0
 

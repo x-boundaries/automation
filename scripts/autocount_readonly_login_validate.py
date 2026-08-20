@@ -17,7 +17,44 @@ DEFAULT_SMOKE_SURFACES = [
     {"schema_name": "dbo", "object_name": "vItemBalQty"},
     {"schema_name": "dbo", "object_name": "StockDTL"},
 ]
-WRITE_LIKE_PERMISSIONS = ["INSERT", "UPDATE", "DELETE", "ALTER", "CONTROL", "TAKE OWNERSHIP"]
+# Write-like authority is probed per securable scope. SQL Server does not accept every
+# permission name against every securable class, and HAS_PERMS_BY_NAME returns NULL for an
+# unsupported combination - which would read as a clean result. Each scope therefore lists only
+# the permissions that are actually meaningful for that class.
+DATABASE_WRITE_LIKE_PERMISSIONS = [
+    "INSERT",
+    "UPDATE",
+    "DELETE",
+    "ALTER",
+    "CONTROL",
+    "TAKE OWNERSHIP",
+    "CREATE TABLE",
+    "EXECUTE",
+]
+# CREATE TABLE is a database-scope permission only; it is deliberately absent here. EXECUTE is
+# meaningful when a configured surface is a programmable object, and returns NULL - not a
+# positive - for tables and views.
+OBJECT_WRITE_LIKE_PERMISSIONS = [
+    "INSERT",
+    "UPDATE",
+    "DELETE",
+    "ALTER",
+    "CONTROL",
+    "TAKE OWNERSHIP",
+    "EXECUTE",
+]
+# Broad schema-scope EXECUTE is the posting-procedure authority the read-only contract must
+# never hold, so it is checked once per distinct schema represented by the configured surfaces.
+SCHEMA_WRITE_LIKE_PERMISSIONS = ["EXECUTE"]
+# Preserved public identity: the flat set the advisory evaluator flags on, whichever scope a
+# positive row came from.
+WRITE_LIKE_PERMISSIONS = list(
+    dict.fromkeys(
+        DATABASE_WRITE_LIKE_PERMISSIONS
+        + OBJECT_WRITE_LIKE_PERMISSIONS
+        + SCHEMA_WRITE_LIKE_PERMISSIONS
+    )
+)
 DANGEROUS_DATABASE_ROLES = {
     "db_accessadmin": "can add or remove database access",
     "db_backupoperator": "can back up database contents",
@@ -61,7 +98,7 @@ def run_validation(config, source=None, now=None):
     try:
         context = source.fetch_context()
         surface_results = [source.check_surface(surface) for surface in surfaces]
-        permission_rows = source.fetch_permission_advisory(surfaces, WRITE_LIKE_PERMISSIONS)
+        permission_rows = source.fetch_permission_advisory(surfaces, DATABASE_WRITE_LIKE_PERMISSIONS)
         permission_advisory = evaluate_permission_advisory(permission_rows)
     except Exception as exc:  # noqa: BLE001 - validation manifest should capture safe failure detail.
         exceptions.append(sanitize_text(str(exc)))
@@ -177,6 +214,12 @@ class SqlServerReadonlyValidationSource:
         }
 
     def fetch_permission_advisory(self, surfaces, permissions):
+        """Advisory permission rows across database, object and schema securable scopes.
+
+        ``permissions`` is the database-scope list. Object and schema scopes use their own
+        module-level lists because the permission names that are valid differ by securable
+        class.
+        """
         rows = []
         for permission in permissions:
             result = self.query(
@@ -193,7 +236,7 @@ class SqlServerReadonlyValidationSource:
             )
         for surface in surfaces:
             entity_name = f"{quote_identifier(surface['schema_name'])}.{quote_identifier(surface['object_name'])}"
-            for permission in permissions:
+            for permission in OBJECT_WRITE_LIKE_PERMISSIONS:
                 result = self.query(
                     "SELECT CAST(? AS nvarchar(256)) AS surface, CAST(? AS nvarchar(128)) AS permission_name, HAS_PERMS_BY_NAME(?, 'OBJECT', ?) AS has_permission",
                     [surface_id(surface), permission, entity_name, permission],
@@ -206,8 +249,28 @@ class SqlServerReadonlyValidationSource:
                         "has_permission": result[0].get("has_permission") if result else None,
                     }
                 )
+        rows.extend(self.fetch_schema_permission_advisory(surfaces))
         rows.extend(self.fetch_database_role_advisory())
         rows.extend(self.fetch_server_role_advisory())
+        return rows
+
+    def fetch_schema_permission_advisory(self, surfaces):
+        rows = []
+        for schema_name in distinct_schema_names(surfaces):
+            for permission in SCHEMA_WRITE_LIKE_PERMISSIONS:
+                result = self.query(
+                    "SELECT CAST(? AS nvarchar(128)) AS surface, CAST(? AS nvarchar(128)) AS permission_name, HAS_PERMS_BY_NAME(?, 'SCHEMA', ?) AS has_permission",
+                    [schema_name, permission, quote_identifier(schema_name), permission],
+                )
+                rows.append(
+                    {
+                        "scope": "schema",
+                        # For schema scope the reported surface is the schema securable itself.
+                        "surface": schema_name,
+                        "permission_name": permission,
+                        "has_permission": result[0].get("has_permission") if result else None,
+                    }
+                )
         return rows
 
     def fetch_database_role_advisory(self):
@@ -352,6 +415,10 @@ def build_check_definitions():
             "sql": "SELECT CAST(? AS nvarchar(256)) AS surface, CAST(? AS nvarchar(128)) AS permission_name, HAS_PERMS_BY_NAME(?, 'OBJECT', ?) AS has_permission",
         },
         {
+            "name": "schema_permission_advisory",
+            "sql": "SELECT CAST(? AS nvarchar(128)) AS surface, CAST(? AS nvarchar(128)) AS permission_name, HAS_PERMS_BY_NAME(?, 'SCHEMA', ?) AS has_permission",
+        },
+        {
             "name": "database_role_advisory",
             "sql": "SELECT CAST(? AS nvarchar(128)) AS role_name, USER_NAME() AS member_name, CAST('IS_ROLEMEMBER' AS nvarchar(64)) AS source, IS_ROLEMEMBER(?) AS is_member",
         },
@@ -377,6 +444,15 @@ def normalize_surfaces(surfaces):
 
 def surface_id(surface):
     return f"{surface['schema_name']}.{surface['object_name']}"
+
+
+def distinct_schema_names(surfaces):
+    """Schema names represented by the configured surfaces, deduplicated, order preserved.
+
+    Deduplicating keeps the schema-scope probe bounded to the configured schema set rather
+    than repeating one check per surface.
+    """
+    return list(dict.fromkeys(surface["schema_name"] for surface in surfaces))
 
 
 def quote_identifier(value):

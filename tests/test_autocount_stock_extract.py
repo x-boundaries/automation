@@ -3,6 +3,7 @@ import contextlib
 import io
 import hashlib
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -33,6 +34,120 @@ class FakeNotifier:
 
     def send(self, payload):
         self.payloads.append(payload)
+
+
+# Synthetic identities only. No real AutoCount server, database, login or Windows account name
+# appears in this repository.
+SYNTHETIC_LOGIN = "SYNTHHOST\\svc_synthetic_readonly"
+SYNTHETIC_USER = "svc_synthetic_readonly"
+SYNTHETIC_DATABASE = "SYNTHETIC_STOCK_DB"
+SYNTHETIC_OTHER_LOGIN = "SYNTHHOST\\svc_synthetic_admin"
+SYNTHETIC_OTHER_USER = "dbo"
+SYNTHETIC_OTHER_DATABASE = "SYNTHETIC_OTHER_DB"
+SYNTHETIC_QUERY = "SELECT ItemCode FROM synthetic_item"
+SYNTHETIC_SECOND_QUERY = "SELECT ItemCode, BalQty FROM synthetic_balance"
+
+
+class FakeSqlCursor:
+    def __init__(self, connection):
+        self.connection = connection
+        self.description = None
+        self._rows = []
+
+    def execute(self, sql, params=None):
+        self.connection.executed.append(sql)
+        if sql == extract.SQL_EXECUTION_CONTEXT_QUERY:
+            self.description = [("actual_login",), ("actual_user",), ("actual_database",)]
+            self._rows = [tuple(self.connection.context_row)]
+            return self
+        self.connection.business_queries.append(sql)
+        self.description = [("ItemCode",)]
+        self._rows = [("SYNTH-ITEM-1",)]
+        return self
+
+    def fetchone(self):
+        return self._rows[0] if self._rows else None
+
+    def fetchall(self):
+        return list(self._rows)
+
+
+class FakeSqlConnection:
+    def __init__(self, context_row):
+        self.context_row = context_row
+        self.executed = []
+        self.business_queries = []
+
+    def cursor(self):
+        return FakeSqlCursor(self)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        # Never swallow: a fail-closed identity error must propagate out of the with block.
+        return False
+
+
+class FakePyodbcModule:
+    def __init__(self, context_row):
+        self.context_row = context_row
+        self.connections = []
+
+    def connect(self, connection_string, autocommit=False):
+        connection = FakeSqlConnection(self.context_row)
+        self.connections.append(connection)
+        return connection
+
+
+@contextlib.contextmanager
+def fake_pyodbc(module):
+    """Serve the extractor's in-function ``import pyodbc`` from a fake, never a live driver."""
+    previous = sys.modules.get("pyodbc")
+    sys.modules["pyodbc"] = module
+    try:
+        yield module
+    finally:
+        if previous is None:
+            sys.modules.pop("pyodbc", None)
+        else:
+            sys.modules["pyodbc"] = previous
+
+
+@contextlib.contextmanager
+def expected_sql_context_env(login=None, user=None, database=None):
+    """Set or clear the expected-context environment for one test. Synthetic values only."""
+    names = [
+        extract.EXPECTED_SQL_CONTEXT_ENV["login"],
+        extract.EXPECTED_SQL_CONTEXT_ENV["user"],
+        extract.EXPECTED_SQL_CONTEXT_ENV["database"],
+    ]
+    values = [login, user, database]
+    previous = {name: os.environ.get(name) for name in names}
+    try:
+        for name, value in zip(names, values):
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        yield
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+def sqlserver_config(archive_root, datasets=None):
+    config = base_config(archive_root)
+    config["source_connection"] = {
+        "kind": "sqlserver",
+        # Synthetic placeholder; the fake driver never parses it.
+        "connection_string": "synthetic-test-connection",
+    }
+    config["datasets"] = datasets or {"stock_master": {"mode": "full", "query": SYNTHETIC_QUERY}}
+    return config
 
 
 def base_config(archive_root):
@@ -264,6 +379,246 @@ class AutoCountStockExtractTests(unittest.TestCase):
         self.assertEqual(context["business_date"], "2026-06-04")
         self.assertEqual(context["movement_from"], "2026-06-01T00:00:00+08:00")
         self.assertEqual(context["movement_to"], "2026-06-05T00:00:00+08:00")
+
+    # ---- #149: fail-closed SQL execution context guard ---- #
+
+    def assertNoPrivateIdentity(self, text):
+        """No observed or expected identity, nor any connection detail, may reach the operator."""
+        for private in (
+            SYNTHETIC_LOGIN,
+            SYNTHETIC_USER,
+            SYNTHETIC_DATABASE,
+            SYNTHETIC_OTHER_LOGIN,
+            SYNTHETIC_OTHER_DATABASE,
+            "synthetic-test-connection",
+        ):
+            self.assertNotIn(private, text, private)
+        self.assertNotRegex(text, r"(?i)(Driver=|Server=|Password=|PWD=|Trusted_Connection=)")
+
+    def test_expected_context_env_names_are_the_canonical_contract(self):
+        self.assertEqual(
+            extract.EXPECTED_SQL_CONTEXT_ENV,
+            {
+                "login": "AUTOCOUNT_EXPECTED_SQL_LOGIN",
+                "user": "AUTOCOUNT_EXPECTED_SQL_USER",
+                "database": "AUTOCOUNT_EXPECTED_SQL_DATABASE",
+            },
+        )
+
+    def test_resolve_expected_context_rejects_missing_and_blank_values(self):
+        with expected_sql_context_env():
+            with self.assertRaises(extract.SqlExecutionContextError) as caught:
+                extract.resolve_expected_sql_context()
+        message = str(caught.exception)
+        self.assertIn("not configured", message)
+        # The variable NAMES are a committed contract and may be named; values never are.
+        for env_name in extract.EXPECTED_SQL_CONTEXT_ENV.values():
+            self.assertIn(env_name, message)
+
+        with expected_sql_context_env(SYNTHETIC_LOGIN, "   ", SYNTHETIC_DATABASE):
+            with self.assertRaises(extract.SqlExecutionContextError) as blank:
+                extract.resolve_expected_sql_context()
+        self.assertIn("AUTOCOUNT_EXPECTED_SQL_USER", str(blank.exception))
+        self.assertNoPrivateIdentity(str(blank.exception))
+
+    def test_sqlserver_mode_without_expected_context_fails_before_any_connection(self):
+        module = FakePyodbcModule((SYNTHETIC_LOGIN, SYNTHETIC_USER, SYNTHETIC_DATABASE))
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with expected_sql_context_env(), fake_pyodbc(module):
+                with self.assertRaises(extract.SqlExecutionContextError) as caught:
+                    extract.run_extraction(
+                        sqlserver_config(Path(tmpdir)),
+                        business_date="2026-06-04",
+                        now=datetime.fromisoformat("2026-06-05T02:00:00+08:00"),
+                    )
+
+            self.assertEqual(module.connections, [])
+            self.assertFalse((Path(tmpdir) / "ac2_stock_2026-06-04" / "run_manifest.json").exists())
+        self.assertIn("not configured", str(caught.exception))
+        self.assertNoPrivateIdentity(str(caught.exception))
+
+    def test_sqlserver_mode_login_mismatch_fails_before_business_query(self):
+        module = FakePyodbcModule((SYNTHETIC_OTHER_LOGIN, SYNTHETIC_USER, SYNTHETIC_DATABASE))
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with expected_sql_context_env(SYNTHETIC_LOGIN, SYNTHETIC_USER, SYNTHETIC_DATABASE), fake_pyodbc(module):
+                with self.assertRaises(extract.SqlExecutionContextError) as caught:
+                    extract.run_extraction(
+                        sqlserver_config(Path(tmpdir)),
+                        business_date="2026-06-04",
+                        now=datetime.fromisoformat("2026-06-05T02:00:00+08:00"),
+                    )
+
+            self.assertFalse((Path(tmpdir) / "ac2_stock_2026-06-04" / "run_manifest.json").exists())
+        self.assertEqual(len(module.connections), 1)
+        self.assertEqual(module.connections[0].business_queries, [])
+        self.assertEqual(module.connections[0].executed, [extract.SQL_EXECUTION_CONTEXT_QUERY])
+        self.assertEqual(str(caught.exception), "SQL execution context mismatch: login")
+        self.assertNoPrivateIdentity(str(caught.exception))
+
+    def test_sqlserver_mode_database_user_mismatch_fails_before_business_query(self):
+        module = FakePyodbcModule((SYNTHETIC_LOGIN, SYNTHETIC_OTHER_USER, SYNTHETIC_DATABASE))
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with expected_sql_context_env(SYNTHETIC_LOGIN, SYNTHETIC_USER, SYNTHETIC_DATABASE), fake_pyodbc(module):
+                with self.assertRaises(extract.SqlExecutionContextError) as caught:
+                    extract.run_extraction(
+                        sqlserver_config(Path(tmpdir)),
+                        business_date="2026-06-04",
+                        now=datetime.fromisoformat("2026-06-05T02:00:00+08:00"),
+                    )
+
+        self.assertEqual(module.connections[0].business_queries, [])
+        self.assertEqual(str(caught.exception), "SQL execution context mismatch: user")
+        self.assertNoPrivateIdentity(str(caught.exception))
+
+    def test_sqlserver_mode_database_mismatch_fails_before_business_query(self):
+        module = FakePyodbcModule((SYNTHETIC_LOGIN, SYNTHETIC_USER, SYNTHETIC_OTHER_DATABASE))
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with expected_sql_context_env(SYNTHETIC_LOGIN, SYNTHETIC_USER, SYNTHETIC_DATABASE), fake_pyodbc(module):
+                with self.assertRaises(extract.SqlExecutionContextError) as caught:
+                    extract.run_extraction(
+                        sqlserver_config(Path(tmpdir)),
+                        business_date="2026-06-04",
+                        now=datetime.fromisoformat("2026-06-05T02:00:00+08:00"),
+                    )
+
+        self.assertEqual(module.connections[0].business_queries, [])
+        self.assertEqual(str(caught.exception), "SQL execution context mismatch: database")
+        self.assertNoPrivateIdentity(str(caught.exception))
+
+    def test_sqlserver_mode_exact_context_match_permits_configured_query(self):
+        module = FakePyodbcModule((SYNTHETIC_LOGIN, SYNTHETIC_USER, SYNTHETIC_DATABASE))
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with expected_sql_context_env(SYNTHETIC_LOGIN, SYNTHETIC_USER, SYNTHETIC_DATABASE), fake_pyodbc(module):
+                manifest = extract.run_extraction(
+                    sqlserver_config(Path(tmpdir)),
+                    business_date="2026-06-04",
+                    now=datetime.fromisoformat("2026-06-05T02:00:00+08:00"),
+                )
+
+            self.assertEqual(manifest["status"], "success")
+            self.assertEqual(manifest["row_counts"]["stock_master"], 1)
+            self.assertTrue((Path(tmpdir) / "ac2_stock_2026-06-04" / "stock_master.csv").exists())
+        self.assertEqual(module.connections[0].business_queries, [SYNTHETIC_QUERY])
+
+    def test_context_assertion_runs_first_on_every_separately_opened_connection(self):
+        module = FakePyodbcModule((SYNTHETIC_LOGIN, SYNTHETIC_USER, SYNTHETIC_DATABASE))
+        datasets = {
+            "stock_master": {"mode": "full", "query": SYNTHETIC_QUERY},
+            "stock_balance": {"mode": "snapshot", "query": SYNTHETIC_SECOND_QUERY},
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with expected_sql_context_env(SYNTHETIC_LOGIN, SYNTHETIC_USER, SYNTHETIC_DATABASE), fake_pyodbc(module):
+                manifest = extract.run_extraction(
+                    sqlserver_config(Path(tmpdir), datasets=datasets),
+                    business_date="2026-06-04",
+                    now=datetime.fromisoformat("2026-06-05T02:00:00+08:00"),
+                )
+
+        self.assertEqual(manifest["status"], "success")
+        # Each dataset opens its own connection; a context proven on one never authorises
+        # a business query on another.
+        self.assertEqual(len(module.connections), 2)
+        self.assertEqual(
+            [connection.executed for connection in module.connections],
+            [
+                [extract.SQL_EXECUTION_CONTEXT_QUERY, SYNTHETIC_QUERY],
+                [extract.SQL_EXECUTION_CONTEXT_QUERY, SYNTHETIC_SECOND_QUERY],
+            ],
+        )
+
+    def test_unreadable_context_row_fails_closed(self):
+        class EmptyContextCursor(FakeSqlCursor):
+            def fetchone(self):
+                return None
+
+        class EmptyContextConnection(FakeSqlConnection):
+            def cursor(self):
+                return EmptyContextCursor(self)
+
+        class EmptyContextModule(FakePyodbcModule):
+            def connect(self, connection_string, autocommit=False):
+                connection = EmptyContextConnection(self.context_row)
+                self.connections.append(connection)
+                return connection
+
+        module = EmptyContextModule((SYNTHETIC_LOGIN, SYNTHETIC_USER, SYNTHETIC_DATABASE))
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with expected_sql_context_env(SYNTHETIC_LOGIN, SYNTHETIC_USER, SYNTHETIC_DATABASE), fake_pyodbc(module):
+                with self.assertRaises(extract.SqlExecutionContextError) as caught:
+                    extract.run_extraction(
+                        sqlserver_config(Path(tmpdir)),
+                        business_date="2026-06-04",
+                        now=datetime.fromisoformat("2026-06-05T02:00:00+08:00"),
+                    )
+
+        self.assertEqual(module.connections[0].business_queries, [])
+        self.assertIn("could not be verified", str(caught.exception))
+        self.assertNoPrivateIdentity(str(caught.exception))
+
+    def test_sample_source_is_unaffected_by_expected_context_requirement(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = base_config(Path(tmpdir))
+            config["source_connection"] = {"kind": "sample"}
+            config["datasets"] = {"stock_master": {"mode": "full", "query": SYNTHETIC_QUERY}}
+            config["sample_rows"] = {"stock_master": [{"ItemCode": "SYNTH-ITEM-1"}]}
+
+            with expected_sql_context_env():
+                manifest = extract.run_extraction(
+                    config,
+                    business_date="2026-06-04",
+                    now=datetime.fromisoformat("2026-06-05T02:00:00+08:00"),
+                )
+
+            self.assertEqual(manifest["status"], "success")
+            self.assertEqual(manifest["row_counts"]["stock_master"], 1)
+
+    def test_dry_run_needs_no_expected_context_values_and_never_connects(self):
+        module = FakePyodbcModule((SYNTHETIC_LOGIN, SYNTHETIC_USER, SYNTHETIC_DATABASE))
+        stdout = io.StringIO()
+
+        with expected_sql_context_env(), fake_pyodbc(module):
+            with contextlib.redirect_stdout(stdout):
+                exit_code = extract.main(
+                    [
+                        "--config",
+                        str(ROOT / "config" / "autocount_stock_extract.ac2_smoke.example.json"),
+                        "--business-date",
+                        "2026-06-04",
+                        "--dry-run",
+                    ]
+                )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(module.connections, [])
+        self.assertEqual(json.loads(stdout.getvalue())["business_date"], "2026-06-04")
+
+    def test_cli_reports_generic_failure_when_expected_context_is_missing(self):
+        module = FakePyodbcModule((SYNTHETIC_LOGIN, SYNTHETIC_USER, SYNTHETIC_DATABASE))
+        stdout = io.StringIO()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "autocount_stock_extract.local.json"
+            config_path.write_text(json.dumps(sqlserver_config(Path(tmpdir))), encoding="utf-8")
+
+            with expected_sql_context_env(), fake_pyodbc(module):
+                with contextlib.redirect_stdout(stdout):
+                    exit_code = extract.main(
+                        ["--config", str(config_path), "--business-date", "2026-06-04"]
+                    )
+
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(payload["status"], "failed")
+        self.assertIn("not configured", payload["error"])
+        self.assertEqual(module.connections, [])
+        self.assertNoPrivateIdentity(stdout.getvalue())
 
 
 if __name__ == "__main__":
