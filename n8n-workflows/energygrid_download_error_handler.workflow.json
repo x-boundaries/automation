@@ -1,0 +1,209 @@
+{
+  "id": "energygridErrHandler01",
+  "name": "Error Handler - EnergyGrid Download",
+  "active": false,
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "39331ae3-ae88-4d7f-b99e-c51dab19a8da",
+      "name": "Error Trigger",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        816,
+        624
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "__SET_BUILD_ERROR_ROW_ID__",
+              "name": "logged_date",
+              "value": "={{ $now.setZone('Asia/Singapore').toFormat('yyyy-MM-dd') }}",
+              "type": "string"
+            },
+            {
+              "id": "__SET_BUILD_ERROR_ROW_ID__",
+              "name": "logged_time",
+              "value": "={{ $now.setZone('Asia/Singapore').toFormat('HH:mm:ss') }}",
+              "type": "string"
+            },
+            {
+              "id": "__SET_BUILD_ERROR_ROW_ID__",
+              "name": "contact_id",
+              "value": "={{ $json.execution?.error?.context?.metadata?.contact_id || $json.execution?.error?.contact_id || $json.contact_id || '' }}",
+              "type": "string"
+            },
+            {
+              "id": "__SET_BUILD_ERROR_ROW_ID__",
+              "name": "error_type",
+              "value": "={{ $json.execution?.error?.name || $json.trigger?.error?.name || $json.execution?.error?.context?.metadata?.error_type || $json.error_type || 'workflow_error' }}",
+              "type": "string"
+            },
+            {
+              "id": "__SET_BUILD_ERROR_ROW_ID__",
+              "name": "error_message",
+              "value": "={{ $json.execution?.error?.message || $json.trigger?.error?.message || $json.execution?.error?.context?.metadata?.error_message || $json.error_message || 'Unknown workflow error' }}",
+              "type": "string"
+            },
+            {
+              "id": "__SET_BUILD_ERROR_ROW_ID__",
+              "name": "error_workflow_name",
+              "value": "={{ $json.workflow?.name || $json.execution?.error?.context?.metadata?.error_workflow_name || $json.error_workflow_name || 'Unknown workflow' }}",
+              "type": "string"
+            },
+            {
+              "id": "__SET_BUILD_ERROR_ROW_ID__",
+              "name": "last_node_executed",
+              "value": "={{ $json.execution?.lastNodeExecuted || $json.trigger?.error?.node?.name || $json.execution?.error?.context?.metadata?.last_node_executed || $json.last_node_executed || '' }}",
+              "type": "string"
+            },
+            {
+              "id": "__SET_BUILD_ERROR_ROW_ID__",
+              "name": "execution_id",
+              "value": "={{ $json.execution?.id || '' }}",
+              "type": "string"
+            },
+            {
+              "id": "__SET_BUILD_ERROR_ROW_ID__",
+              "name": "execution_url",
+              "value": "={{ $json.execution?.url || '' }}",
+              "type": "string"
+            },
+            {
+              "id": "__SET_BUILD_ERROR_ROW_ID__",
+              "name": "source",
+              "value": "={{ $json.execution?.error?.context?.metadata?.source || $json.source || 'energygrid' }}",
+              "type": "string"
+            },
+            {
+              "id": "__SET_BUILD_ERROR_ROW_ID__",
+              "name": "event_type",
+              "value": "={{ $json.execution?.error?.context?.metadata?.event_type || $json.event_type || 'execution_failure' }}",
+              "type": "string"
+            },
+            {
+              "id": "__SET_BUILD_ERROR_ROW_ID__",
+              "name": "failure_stage",
+              "value": "={{ $json.execution?.error?.context?.metadata?.failure_stage || $json.failure_stage || $json.execution?.lastNodeExecuted || $json.trigger?.error?.node?.name || 'unknown' }}",
+              "type": "string"
+            },
+            {
+              "id": "__SET_BUILD_ERROR_ROW_ID__",
+              "name": "support_ref",
+              "value": "={{ $json.execution?.error?.context?.metadata?.support_ref || $json.support_ref || '' }}",
+              "type": "string"
+            },
+            {
+              "id": "__SET_BUILD_ERROR_ROW_ID__",
+              "name": "run_id",
+              "value": "={{ $json.execution?.error?.context?.metadata?.run_id || $json.run_id || '' }}",
+              "type": "string"
+            },
+            {
+              "id": "__SET_BUILD_ERROR_ROW_ID__",
+              "name": "exit_code",
+              "value": "={{ (() => { const raw = $json.execution?.error?.context?.metadata?.exit_code ?? $json.exit_code; return raw === undefined || raw === null || raw === '' ? '' : String(raw); })() }}",
+              "type": "string"
+            },
+            {
+              "id": "__SET_BUILD_ERROR_ROW_ID__",
+              "name": "failure_feedback_enabled",
+              "value": "={{ $json.execution?.error?.context?.metadata?.failure_feedback_enabled ?? $json.failure_feedback_enabled ?? true }}",
+              "type": "boolean"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "0446fd2b-b49f-4976-bf22-07d7a03e21bb",
+      "name": "Build Error Row",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        1040,
+        624
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all();\n\nfunction toDisplayText(value) {\n  if (value === undefined || value === null) return '';\n  if (typeof value === 'string') return value;\n  if (typeof value === 'number' || typeof value === 'boolean' || typeof value === 'bigint') return String(value);\n  try {\n    return JSON.stringify(value);\n  } catch (error) {\n    return String(value);\n  }\n}\n\nfunction escapeHtml(value) {\n  return toDisplayText(value)\n    .replace(/&/g, '&amp;')\n    .replace(/</g, '&lt;')\n    .replace(/>/g, '&gt;')\n    .replace(/\"/g, '&quot;')\n    .replace(/'/g, '&#39;');\n}\n\nfunction safeSheetValue(value) {\n  const text = toDisplayText(value);\n  if (/^[=+\\-@]/.test(text)) return \"'\" + text;\n  return text;\n}\n\nfunction safeSubjectText(value, fallback) {\n  const fallbackText = toDisplayText(fallback || 'n8n workflow error')\n    .split('')\n    .map((char) => {\n      const code = char.charCodeAt(0);\n      return code < 32 || code === 127 ? ' ' : char;\n    })\n    .join('')\n    .replace(/[<>\"]/g, ' ')\n    .replace(/\\s+/g, ' ')\n    .trim();\n\n  const text = toDisplayText(value)\n    .split('')\n    .map((char) => {\n      const code = char.charCodeAt(0);\n      return code < 32 || code === 127 ? ' ' : char;\n    })\n    .join('')\n    .replace(/[<>\"]/g, ' ')\n    .replace(/\\s+/g, ' ')\n    .trim();\n\n  const normalized = text || fallbackText || 'n8n workflow error';\n  return normalized.length > 120 ? normalized.slice(0, 117).trimEnd() + '...' : normalized;\n}\n\nreturn items.map((item) => {\n  const json = item && item.json && typeof item.json === 'object' ? item.json : {};\n\n  return {\n    json: {\n      ...json,\n      safe_contact_id: escapeHtml(json.contact_id),\n      safe_source: escapeHtml(json.source),\n      safe_event_type: escapeHtml(json.event_type),\n      safe_failure_stage: escapeHtml(json.failure_stage),\n      safe_error_type: escapeHtml(json.error_type),\n      safe_error_message: escapeHtml(json.error_message),\n      safe_error_workflow_name: escapeHtml(json.error_workflow_name),\n      safe_last_node_executed: escapeHtml(json.last_node_executed),\n      safe_execution_id: escapeHtml(json.execution_id),\n      safe_execution_url: escapeHtml(json.execution_url),\n      safe_support_ref: escapeHtml(json.support_ref),\n      safe_run_id: escapeHtml(json.run_id),\n      safe_exit_code: escapeHtml(json.exit_code),\n      sheet_contact_id: safeSheetValue(json.contact_id),\n      sheet_error_type: safeSheetValue(json.error_type),\n      sheet_error_message: safeSheetValue(json.error_message),\n      sheet_error_workflow_name: safeSheetValue(json.error_workflow_name),\n      sheet_last_node_executed: safeSheetValue(json.last_node_executed),\n      sheet_execution_id: safeSheetValue(json.execution_id),\n      sheet_execution_url: safeSheetValue(json.execution_url),\n      subject_error_type: safeSubjectText(json.error_type, 'workflow_error'),\n      subject_error_workflow_name: safeSubjectText(json.error_workflow_name, ''),\n    },\n  };\n});"
+      },
+      "id": "a518809a-2bc9-4fa6-9ee5-a18dbbe28715",
+      "name": "Build Safe Error Alert Context",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1264,
+        624
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "REPLACE_WITH_TELEGRAM_CHAT_ID",
+        "text": "={{ (() => {\n  const j = $json;\n  const escapeHtml = (value) => String(value === undefined || value === null ? '' : value)\n    .replace(/&/g, '&amp;')\n    .replace(/</g, '&lt;')\n    .replace(/>/g, '&gt;')\n    .replace(/\"/g, '&quot;');\n  const text = (value) => String(value === undefined || value === null ? '' : value).trim();\n\n  const eventLabel = text(j.event_type) === 'scheduler_heartbeat_missing'\n    ? 'Scheduled job did not run / heartbeat missing'\n    : 'Download job failed';\n\n  const stage = text(j.safe_failure_stage) || 'unknown';\n  const message = text(j.safe_error_message) || 'Unknown workflow error';\n  const supportRef = text(j.safe_support_ref);\n  const runId = text(j.safe_run_id);\n  const exitCode = text(j.safe_exit_code);\n  const workflowName = text(j.safe_error_workflow_name);\n  const executionId = text(j.safe_execution_id);\n  const stamp = (escapeHtml(text(j.logged_date)) + ' ' + escapeHtml(text(j.logged_time))).trim();\n\n  const lines = ['<b>\\ud83d\\udea8 EnergyGrid Download Error</b>', ''];\n  lines.push('Event: ' + eventLabel);\n  lines.push('Stage: <code>' + stage + '</code>');\n  lines.push('Error: ' + message);\n  if (supportRef) lines.push('Reference: <code>' + supportRef + '</code>');\n  if (runId) lines.push('Run: <code>' + runId + '</code>');\n  if (exitCode) lines.push('Exit code: <code>' + exitCode + '</code>');\n  if (stamp) lines.push('Time: ' + stamp + ' SGT');\n  if (workflowName && workflowName !== 'Unknown workflow') lines.push('n8n workflow: ' + workflowName);\n  if (executionId) lines.push('n8n execution: <code>' + executionId + '</code>');\n\n  return lines.join('\\n');\n})() }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "disable_web_page_preview": true,
+          "parse_mode": "HTML"
+        }
+      },
+      "id": "3bbd55d3-00e3-4067-b268-5dadebc5b9e6",
+      "name": "Send EnergyGrid Failure Alert",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1488,
+        624
+      ]
+    }
+  ],
+  "connections": {
+    "Error Trigger": {
+      "main": [
+        [
+          {
+            "node": "Build Error Row",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Error Row": {
+      "main": [
+        [
+          {
+            "node": "Build Safe Error Alert Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Safe Error Alert Context": {
+      "main": [
+        [
+          {
+            "node": "Send EnergyGrid Failure Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false
+  },
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "nodeGroups": [],
+  "versionId": "a1b2c3d4-5e6f-4a7b-8c9d-0e1f2a3b4c5d",
+  "sourceWorkflowId": null
+}

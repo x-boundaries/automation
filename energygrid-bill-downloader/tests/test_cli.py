@@ -87,6 +87,13 @@ class CliTests(unittest.TestCase):
                 "    paths:",
                 '      - "energygrid-bill-downloader/**"',
                 '      - ".github/workflows/energygrid-bill-downloader-tests.yml"',
+                "      # EnergyGrid n8n error handler (#141): the source-controlled export, its focused",
+                "      # offline test, and the directory README that documents it. Exact entries, not a",
+                "      # broad n8n-workflows/** or tests/** glob, which would widen the reviewed trigger",
+                "      # surface beyond what this workflow owns.",
+                '      - "n8n-workflows/energygrid_download_error_handler.workflow.json"',
+                '      - "tests/test_energygrid_n8n_error_handler.py"',
+                '      - "n8n-workflows/README.md"',
                 '      - "README.md"',
                 '      - ".gitignore"',
             ],
@@ -99,6 +106,9 @@ class CliTests(unittest.TestCase):
             [line.strip() for line in scope_guard if "$file -ne " in line],
             [
                 "$file -ne '.github/workflows/energygrid-bill-downloader-tests.yml' -and",
+                "$file -ne 'n8n-workflows/energygrid_download_error_handler.workflow.json' -and",
+                "$file -ne 'tests/test_energygrid_n8n_error_handler.py' -and",
+                "$file -ne 'n8n-workflows/README.md' -and",
                 "$file -ne 'README.md' -and",
                 "$file -ne '.gitignore') {",
             ],
@@ -116,6 +126,14 @@ class CliTests(unittest.TestCase):
         self.assertIn(
             "$_ -eq '.github/workflows/energygrid-bill-downloader-tests.yml'", ownership_text
         )
+        # The n8n error handler export and its focused test are EnergyGrid-owned, so either
+        # one alone arms the guard. `n8n-workflows/README.md` is a shared companion: it
+        # triggers the workflow and is permitted, but it never confers ownership.
+        self.assertIn(
+            "$_ -eq 'n8n-workflows/energygrid_download_error_handler.workflow.json'",
+            ownership_text,
+        )
+        self.assertIn("$_ -eq 'tests/test_energygrid_n8n_error_handler.py'", ownership_text)
         self.assertNotIn("README.md", ownership_text)
         self.assertNotIn(".gitignore", ownership_text)
         self.assertIn("if ($owned.Count -eq 0) {", workflow)
@@ -253,6 +271,37 @@ class CliTests(unittest.TestCase):
         ])
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("Out-of-scope changed path", result.stdout + result.stderr)
+
+    # ---- #141: the n8n error handler arm of the same ownership rule ---- #
+
+    def test_n8n_error_handler_change_with_its_test_and_directory_readme_is_accepted(self) -> None:
+        """The three authorised handler paths must not become false out-of-scope failures."""
+        result = self._run_scope_case([
+            "n8n-workflows/energygrid_download_error_handler.workflow.json",
+            "tests/test_energygrid_n8n_error_handler.py",
+            "n8n-workflows/README.md",
+        ])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("Out-of-scope changed path", result.stdout + result.stderr)
+
+    def test_n8n_error_handler_change_with_an_unrelated_path_still_fails_closed(self) -> None:
+        """The new ownership arm arms the guard just as the subtree arm does."""
+        result = self._run_scope_case([
+            "n8n-workflows/energygrid_download_error_handler.workflow.json",
+            "scripts/member_create_uat_approval.py",
+        ])
+        self.assertNotEqual(result.returncode, 0, "an out-of-scope path must fail closed")
+        self.assertIn("Out-of-scope changed path", result.stdout + result.stderr)
+
+    def test_n8n_directory_readme_alone_does_not_confer_energygrid_ownership(self) -> None:
+        """It triggers the workflow as a shared companion, but owns nothing on its own."""
+        result = self._run_scope_case([
+            "n8n-workflows/README.md",
+            "n8n-workflows/member_create_uat_result_mapping.workflow.json",
+        ])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("Out-of-scope changed path", result.stdout + result.stderr)
+        self.assertIn("not applicable", result.stdout)
 
     def test_invalid_cli_returns_contract_exit_code(self) -> None:
         self.assertEqual(main([]), 64)

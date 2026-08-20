@@ -38,6 +38,21 @@ Workflow JSON in this directory is source-controlled evidence of workflow design
 - This JSON is evidence, not proof that the workflow is deployed, imported, activated, or has executed anywhere.
 - This is UAT scaffolding, not the permanent production member-intake workflow, which remains newly designed and unbuilt (see [member intake automation blueprint](../docs/autocount2-automation/member_intake_automation_blueprint.md)).
 
+### energygrid_download_error_handler.workflow.json
+
+- Purpose: dedicated internal error notification handler for the Energy@Grid bill downloader. It is selected as the n8n Error Workflow for EnergyGrid workflows and sends one bounded operations alert to the owner/operator. It is not a customer-facing notice.
+- Architecture: `Error Trigger` -> `Build Error Row` (bounded normalisation) -> `Build Safe Error Alert Context` (HTML-safe conversion) -> `Send EnergyGrid Failure Alert` (Telegram).
+- Status: source-controlled, inactive. This file is design evidence only; it is not proof of deployment, import, activation, or execution on any n8n instance.
+- The Telegram destination and credential are deliberately unbound in source control. The export carries no credential binding, no webhook id, and no instance id, and the `chatId` ships as the non-secret placeholder `REPLACE_WITH_TELEGRAM_CHAT_ID`.
+- The operator binds the approved Telegram credential and the real destination only in a separately authorised local import copy, never in this repository.
+- Supported events: ordinary EnergyGrid execution failures (`event_type: execution_failure`), and missing Scheduler heartbeat (`event_type: scheduler_heartbeat_missing`), which renders its own event label instead of the generic download-failure label.
+- Only bounded operational metadata is retained: `source`, `event_type`, `failure_stage`, `support_ref`, `run_id`, `exit_code`, alongside the existing n8n error fields. The raw Error Trigger payload is deliberately not retained, and no replacement whole-payload field may be added.
+- The Telegram node carries no `onError`, `continueOnFail`, or `alwaysOutputData`: a failed alert delivery must fail the handler execution and stay visible in n8n rather than being reported as a success. For the same reason this export deliberately does not adopt the sibling exports' `saveDataErrorExecution: none` setting, which would hide that failed execution.
+- This workflow must never be configured as its own error workflow.
+- The future Windows ingress workflow and the missing-heartbeat watchdog workflow are separate workflows and are not included here.
+- Committing this file performs no live n8n action. Import, credential binding, activation, and execution each require separate explicit current-turn approval.
+- Focused offline coverage: [tests/test_energygrid_n8n_error_handler.py](../tests/test_energygrid_n8n_error_handler.py).
+
 ## Directory Rules
 
 - Do not rename existing workflow files during unrelated work. Existing filenames are canonical and are referenced by tests, README links, and runbooks.
