@@ -394,6 +394,20 @@ class TerminalFailureEvidenceTests(unittest.TestCase):
             (LoginError("portal rejected the login"), LOGIN_FAILED, 20, "EG_LOGIN_PORTAL_REJECTED"),
             (LoginError("runtime credentials are unavailable"), LOGIN_FAILED, 20, "EG_LOGIN_CREDENTIALS_UNAVAILABLE"),
             (DownloadError("browser download timed out"), DOWNLOAD_FAILED, 10, cli.UNCLASSIFIED_SUPPORT_REF),
+            # One per-step layout reference, end to end: the finer reference
+            # changes nothing about the status or the exit code it travels with.
+            (
+                LayoutChangedError("portal navigation did not complete"),
+                PORTAL_LAYOUT_CHANGED,
+                20,
+                "EG_LOGIN_NAVIGATION_FAILED",
+            ),
+            (
+                LayoutChangedError("Billing Manager entry did not appear after login"),
+                PORTAL_LAYOUT_CHANGED,
+                20,
+                "EG_LOGIN_BILLING_MANAGER_WAIT_FAILED",
+            ),
         ):
             with self.subTest(status=status, exit_code=expected_exit):
                 with tempfile.TemporaryDirectory() as directory:
@@ -506,7 +520,7 @@ class TerminalFailureEvidenceTests(unittest.TestCase):
     def test_one_caught_app_error_produces_exactly_one_terminal_event(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            self.run_cli(root, stub_portal(LayoutChangedError("required login control is missing or ambiguous")))
+            self.run_cli(root, stub_portal(LayoutChangedError("login submission did not complete")))
 
             phases = self.phases(root)
             self.assertEqual(
@@ -534,6 +548,33 @@ class SupportReferenceContractTests(unittest.TestCase):
         refs = list(cli.SUPPORT_REFS_BY_MESSAGE.values())
         self.assertEqual(len(refs), len(set(refs)), "each known failure needs its own reference")
         self.assertNotIn(cli.UNCLASSIFIED_SUPPORT_REF, refs)
+
+    def test_retired_references_stay_mapped_and_stay_out_of_the_live_vocabulary(self) -> None:
+        """A retired reference reads old evidence; it never classifies new work.
+
+        Keeping the mapping is what lets an operator interpret a log written
+        before the login steps were told apart. Declaring it retired is what
+        stops a future step from quietly reusing the coarse reference instead
+        of earning its own.
+        """
+        committed = set(cli.SUPPORT_REFS_BY_MESSAGE.values())
+        self.assertTrue(cli.RETIRED_SUPPORT_REFS.issubset(committed))
+        self.assertIn("EG_LOGIN_REQUIRED_CONTROL_UNRESOLVED", cli.RETIRED_SUPPORT_REFS)
+        for ref in cli.RETIRED_SUPPORT_REFS:
+            with self.subTest(ref=ref):
+                self.assertRegex(ref, self.IDENTIFIER)
+        # The per-step references that replaced it are all live, and distinct.
+        replacements = {
+            "EG_LOGIN_NAVIGATION_FAILED",
+            "EG_LOGIN_SEMANTICS_ACTIVATION_DISPATCH_FAILED",
+            "EG_LOGIN_ENTRY_CLICK_FAILED",
+            "EG_LOGIN_USERNAME_FILL_FAILED",
+            "EG_LOGIN_PASSWORD_FILL_FAILED",
+            "EG_LOGIN_SUBMIT_FAILED",
+            "EG_LOGIN_BILLING_MANAGER_WAIT_FAILED",
+        }
+        self.assertTrue(replacements.issubset(committed))
+        self.assertTrue(replacements.isdisjoint(cli.RETIRED_SUPPORT_REFS))
 
     def test_classification_is_exact_so_a_longer_future_message_stays_generic(self) -> None:
         known = "post-activation Login control did not appear"

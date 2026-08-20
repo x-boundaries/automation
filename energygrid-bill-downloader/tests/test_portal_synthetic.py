@@ -10,6 +10,7 @@ from energygrid_bill_downloader import cli
 from energygrid_bill_downloader.config import load_runtime_config
 from energygrid_bill_downloader.cli import main
 from energygrid_bill_downloader.errors import (
+    PORTAL_LAYOUT_CHANGED,
     AppError,
     DownloadError,
     InvalidPdfError,
@@ -459,7 +460,13 @@ class SyntheticPortalTests(unittest.TestCase):
 
 
 class FakeLocator:
-    """The slice of the Playwright locator surface the login path touches."""
+    """The slice of the Playwright locator surface the login path touches.
+
+    The `*_error` hooks let one login step fail generically while every other
+    step stays healthy, which is what proves each step carries its own
+    reference. `journal` records interactions in the order they happen, so the
+    successful path can be asserted as a sequence and not only as counts.
+    """
 
     def __init__(
         self,
@@ -469,20 +476,38 @@ class FakeLocator:
         enabled: bool = True,
         wait_error: Exception | None = None,
         state_error: Exception | None = None,
+        dispatch_error: Exception | None = None,
+        click_error: Exception | None = None,
+        fill_error: Exception | None = None,
+        journal: list[str] | None = None,
+        label: str = "locator",
     ) -> None:
         self._count = count
         self._visible = visible
         self._enabled = enabled
         self._wait_error = wait_error
         self._state_error = state_error
+        self._dispatch_error = dispatch_error
+        self._click_error = click_error
+        self._fill_error = fill_error
+        self._journal = journal
+        self._label = label
         self.dispatched = 0
         self.clicks = 0
+        self.fills = 0
+        self.waits = 0
+
+    def _record(self, action: str) -> None:
+        if self._journal is not None:
+            self._journal.append(self._label + ":" + action)
 
     @property
     def first(self) -> "FakeLocator":
         return self
 
     def wait_for(self, state: str | None = None) -> None:
+        self.waits += 1
+        self._record("wait_for")
         if self._wait_error is not None:
             raise self._wait_error
 
@@ -499,16 +524,32 @@ class FakeLocator:
 
     def dispatch_event(self, name: str) -> None:
         self.dispatched += 1
+        self._record("dispatch_event")
+        if self._dispatch_error is not None:
+            raise self._dispatch_error
 
     def click(self) -> None:
         self.clicks += 1
+        self._record("click")
+        if self._click_error is not None:
+            raise self._click_error
 
     def fill(self, value: str) -> None:
-        return None
+        self.fills += 1
+        self._record("fill")
+        if self._fill_error is not None:
+            raise self._fill_error
 
 
 class FakePage:
-    """A page whose only job is to hand the login path the locators under test."""
+    """A page whose only job is to hand the login path the locators under test.
+
+    The portal resolves the semantics-gate Login entry and the login submit
+    control through the same role and name, so this page hands the first such
+    lookup to `login_entry` and any later one to `submit`. That mirrors the
+    committed sequence while still letting a click failure be attributed to the
+    step that made it. Every optional slot defaults to a healthy locator.
+    """
 
     def __init__(
         self,
@@ -518,26 +559,48 @@ class FakePage:
         *,
         label_error: Exception | None = None,
         alert_visible: bool = False,
+        goto_error: Exception | None = None,
+        submit: FakeLocator | None = None,
+        username_field: FakeLocator | None = None,
+        password_field: FakeLocator | None = None,
+        billing_manager: FakeLocator | None = None,
+        journal: list[str] | None = None,
     ) -> None:
         self.activation = activation
         self.placeholder = placeholder
         self.login_entry = login_entry
         self.label_error = label_error
         self.alert_visible = alert_visible
+        self.goto_error = goto_error
+        self.submit = submit
+        self.username_field = username_field
+        self.password_field = password_field
+        self.billing_manager = billing_manager
+        self.journal = journal
         self.goto_calls = 0
+        self.login_lookups = 0
+        self.alert_lookups = 0
 
     def goto(self, url: str, wait_until: str | None = None) -> None:
         self.goto_calls += 1
+        if self.journal is not None:
+            self.journal.append("page:goto")
+        if self.goto_error is not None:
+            raise self.goto_error
 
     def get_by_role(self, role: str, name: str | None = None, exact: bool = False):
         if name == "Enable accessibility":
             return self.activation
         if name == "Login":
+            self.login_lookups += 1
+            if self.login_lookups > 1 and self.submit is not None:
+                return self.submit
             return self.login_entry
         if role == "alert":
+            self.alert_lookups += 1
             return FakeLocator(visible=self.alert_visible)
         if name == "Billing Manager":
-            return FakeLocator()
+            return self.billing_manager if self.billing_manager is not None else FakeLocator()
         raise AssertionError(f"unexpected role lookup: {role}/{name}")
 
     def locator(self, selector: str):
@@ -547,7 +610,11 @@ class FakePage:
     def get_by_label(self, name: str, exact: bool = False):
         if self.label_error is not None:
             raise self.label_error
-        return FakeLocator()
+        if name == "Username":
+            return self.username_field if self.username_field is not None else FakeLocator()
+        if name == "Password":
+            return self.password_field if self.password_field is not None else FakeLocator()
+        raise AssertionError(f"unexpected label lookup: {name}")
 
 
 class FakeConfig:
@@ -565,6 +632,80 @@ UNREADY_CONTROL_CASES = (
     ("hidden", {"visible": False}, "NOT_READY"),
     ("disabled", {"enabled": False}, "NOT_READY"),
 )
+
+# Deliberately carries a credential-shaped token and a URL, so any case that
+# lets raw exception text reach a reference or a message fails loudly.
+STEP_FAILURE_TEXT = "synthetic step failure: password=hunter2 at https://portal.example.invalid/x"
+
+
+def step_failure() -> RuntimeError:
+    """A fresh generic exception, of the kind only the broad arm can classify."""
+    return RuntimeError(STEP_FAILURE_TEXT)
+
+
+def login_page(**overrides) -> FakePage:
+    """A page whose login path succeeds unless `overrides` break exactly one step."""
+    slots = {"activation": FakeLocator(), "placeholder": FakeLocator(), "login_entry": FakeLocator()}
+    for name in tuple(slots):
+        if name in overrides:
+            slots[name] = overrides.pop(name)
+    return FakePage(slots["activation"], slots["placeholder"], slots["login_entry"], **overrides)
+
+
+# Every operation the broad generic arm of `login()` can currently cover, with
+# the one page override that breaks it and the reference it must now report.
+# (case id, override builder, expected support reference)
+LOGIN_STEP_CASES = (
+    (
+        "portal_navigation",
+        lambda exc: {"goto_error": exc},
+        "EG_LOGIN_NAVIGATION_FAILED",
+    ),
+    (
+        "semantics_activation_dispatch",
+        lambda exc: {"activation": FakeLocator(dispatch_error=exc)},
+        "EG_LOGIN_SEMANTICS_ACTIVATION_DISPATCH_FAILED",
+    ),
+    (
+        "post_activation_entry_click",
+        lambda exc: {"login_entry": FakeLocator(click_error=exc)},
+        "EG_LOGIN_ENTRY_CLICK_FAILED",
+    ),
+    (
+        "username_fill",
+        lambda exc: {"username_field": FakeLocator(fill_error=exc)},
+        "EG_LOGIN_USERNAME_FILL_FAILED",
+    ),
+    (
+        "password_fill",
+        lambda exc: {"password_field": FakeLocator(fill_error=exc)},
+        "EG_LOGIN_PASSWORD_FILL_FAILED",
+    ),
+    (
+        "login_submit",
+        lambda exc: {"submit": FakeLocator(click_error=exc)},
+        "EG_LOGIN_SUBMIT_FAILED",
+    ),
+    (
+        "billing_manager_wait",
+        lambda exc: {"billing_manager": FakeLocator(wait_error=exc)},
+        "EG_LOGIN_BILLING_MANAGER_WAIT_FAILED",
+    ),
+)
+
+# The committed order of portal interactions for one successful login attempt.
+SUCCESSFUL_LOGIN_SEQUENCE = [
+    "page:goto",
+    "activation:wait_for",
+    "activation:dispatch_event",
+    "placeholder:wait_for",
+    "login_entry:wait_for",
+    "login_entry:click",
+    "username:fill",
+    "password:fill",
+    "submit:click",
+    "billing_manager:wait_for",
+]
 
 
 class PreAuthLoginFailureReferenceTests(unittest.TestCase):
@@ -643,31 +784,103 @@ class PreAuthLoginFailureReferenceTests(unittest.TestCase):
                     os.environ[name] = value
         return caught.exception
 
-    def test_downstream_login_control_fallback_is_referenced(self) -> None:
-        """The generic arm of `login()`, reached once the semantics gate is open."""
-        page = FakePage(
-            FakeLocator(),
-            FakeLocator(),
-            FakeLocator(),
-            label_error=RuntimeError("Username field is gone"),
-            alert_visible=False,
-        )
-        error = self.run_login(page)
-        self.assertIsInstance(error, LayoutChangedError)
-        self.assert_maps_non_generically(error, "EG_LOGIN_REQUIRED_CONTROL_UNRESOLVED")
+    def test_each_generic_login_step_reports_its_own_reference(self) -> None:
+        """The broad arm of `login()`, one currently identified step at a time.
 
-    def test_portal_rejection_stays_distinct_from_layout_drift(self) -> None:
-        """Same broken step, but a visible alert means credentials, not layout."""
-        page = FakePage(
-            FakeLocator(),
-            FakeLocator(),
-            FakeLocator(),
-            label_error=RuntimeError("Username field is gone"),
-            alert_visible=True,
+        Every case breaks exactly one operation with an ordinary exception, so
+        the reference it produces is the only thing that can tell an operator
+        where a `PORTAL_LAYOUT_CHANGED` run stopped.
+        """
+        seen = []
+        for case_id, break_step, expected_ref in LOGIN_STEP_CASES:
+            with self.subTest(case=case_id):
+                error = self.run_login(login_page(**break_step(step_failure())))
+                self.assertIsInstance(error, LayoutChangedError)
+                seen.append(self.assert_maps_non_generically(error, expected_ref))
+                # The class, status and exit semantics of this family are unchanged.
+                self.assertEqual(error.status, PORTAL_LAYOUT_CHANGED)
+                self.assertEqual(error.exit_code, 20)
+                # The retired coarse reference is no longer reachable from here.
+                self.assertNotIn(expected_ref, cli.RETIRED_SUPPORT_REFS)
+                # Nothing the raised exception carried may survive into the message.
+                self.assertNotIn("hunter2", error.message)
+                self.assertNotIn("portal.example.invalid", error.message)
+                self.assertNotIn(STEP_FAILURE_TEXT, error.message)
+        self.assertEqual(len(set(seen)), len(LOGIN_STEP_CASES), "each step needs its own message")
+
+    def test_visible_alert_outranks_every_step_reference(self) -> None:
+        """A visible alert still means rejected credentials, at any broken step."""
+        for case_id, break_step, layout_ref in LOGIN_STEP_CASES:
+            with self.subTest(case=case_id):
+                overrides = break_step(step_failure())
+                overrides["alert_visible"] = True
+                error = self.run_login(login_page(**overrides))
+                self.assertIsInstance(error, LoginError)
+                self.assertEqual(cli.support_ref_for(error), "EG_LOGIN_PORTAL_REJECTED")
+                self.assertNotEqual(cli.support_ref_for(error), layout_ref)
+                self.assertNotIn("hunter2", error.message)
+
+    def test_specific_semantics_failures_outrank_the_step_marker(self) -> None:
+        """A classified semantics failure keeps its own reference and class.
+
+        These reach `login()` through the same call the activation-dispatch
+        marker covers, so they are the case that proves the marker never
+        reclassifies a failure the semantics gate already named.
+        """
+        for case_id, kwargs, outcome in UNREADY_CONTROL_CASES:
+            for slot, family in (("activation", "SEMANTICS_ACTIVATION"), ("login_entry", "POST_ACTIVATION")):
+                with self.subTest(case=case_id, slot=slot):
+                    # A visible alert must not reclassify a proven contract failure.
+                    error = self.run_login(login_page(alert_visible=True, **{slot: FakeLocator(**kwargs)}))
+                    self.assertIsInstance(error, LayoutChangedError)
+                    self.assert_maps_non_generically(error, f"EG_LOGIN_{family}_{outcome}")
+                    self.assertEqual(error.status, PORTAL_LAYOUT_CHANGED)
+
+        placeholder_error = self.run_login(
+            login_page(placeholder=FakeLocator(wait_error=RuntimeError("still attached")), alert_visible=True)
         )
-        error = self.run_login(page)
-        self.assertIsInstance(error, LoginError)
-        self.assertEqual(cli.support_ref_for(error), "EG_LOGIN_PORTAL_REJECTED")
+        self.assertIsInstance(placeholder_error, LayoutChangedError)
+        self.assert_maps_non_generically(placeholder_error, "EG_LOGIN_SEMANTICS_PLACEHOLDER_REMAINS")
+
+    def test_successful_login_keeps_its_interaction_order_and_count(self) -> None:
+        """The committed sequence: same interactions, same order, none added."""
+        journal: list[str] = []
+        locators = {
+            name: FakeLocator(journal=journal, label=name)
+            for name in ("activation", "placeholder", "login_entry", "submit", "username", "password", "billing_manager")
+        }
+        page = FakePage(
+            locators["activation"],
+            locators["placeholder"],
+            locators["login_entry"],
+            submit=locators["submit"],
+            username_field=locators["username"],
+            password_field=locators["password"],
+            billing_manager=locators["billing_manager"],
+            journal=journal,
+        )
+        old = {name: os.environ.get(name) for name in ("ENERGYGRID_USERNAME", "ENERGYGRID_PASSWORD")}
+        os.environ.update(runtime_credentials())
+        try:
+            self.portal_for(page).login()
+        finally:
+            for name, value in old.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+
+        self.assertEqual(journal, SUCCESSFUL_LOGIN_SEQUENCE)
+        self.assertEqual(page.goto_calls, 1)
+        self.assertEqual(page.login_lookups, 2, "the entry and the submit control resolve as before")
+        self.assertEqual(locators["activation"].dispatched, 1)
+        self.assertEqual(locators["login_entry"].clicks, 1)
+        self.assertEqual(locators["submit"].clicks, 1)
+        self.assertEqual(locators["username"].fills, 1)
+        self.assertEqual(locators["password"].fills, 1)
+        self.assertEqual(locators["billing_manager"].waits, 1)
+        # A success never consults the alert, so it never takes the rejection arm.
+        self.assertEqual(page.alert_lookups, 0)
 
     def test_credential_absence_is_referenced_without_touching_the_page(self) -> None:
         page = FakePage(FakeLocator(), FakeLocator(), FakeLocator())
@@ -710,22 +923,23 @@ class PreAuthLoginFailureReferenceTests(unittest.TestCase):
             self.portal_for(placeholder_page)._enter_public_semantics(placeholder_page)
         record(caught.exception)
 
-        broken_form = RuntimeError("Username field is gone")
-        record(self.run_login(FakePage(FakeLocator(), FakeLocator(), FakeLocator(), label_error=broken_form)))
-        record(
-            self.run_login(
-                FakePage(
-                    FakeLocator(), FakeLocator(), FakeLocator(), label_error=broken_form, alert_visible=True
-                )
-            )
-        )
-        record(self.run_login(FakePage(FakeLocator(), FakeLocator(), FakeLocator()), credentials=False))
+        for _case_id, break_step, _expected_ref in LOGIN_STEP_CASES:
+            record(self.run_login(login_page(**break_step(step_failure()))))
 
+        record(self.run_login(login_page(goto_error=step_failure(), alert_visible=True)))
+        record(self.run_login(login_page(), credentials=False))
+
+        live = set(cli.SUPPORT_REFS_BY_MESSAGE.values()) - cli.RETIRED_SUPPORT_REFS
         self.assertEqual(
             reached,
-            set(cli.SUPPORT_REFS_BY_MESSAGE.values()),
-            "the committed reference vocabulary and the reachable login branches must match",
+            live,
+            "the live reference vocabulary and the reachable login branches must match",
         )
+        # A retired reference stays mapped so old evidence reads, and stays
+        # unreachable so no step can quietly fall back onto it again.
+        self.assertTrue(cli.RETIRED_SUPPORT_REFS)
+        self.assertTrue(cli.RETIRED_SUPPORT_REFS.isdisjoint(reached))
+        self.assertTrue(cli.RETIRED_SUPPORT_REFS.issubset(set(cli.SUPPORT_REFS_BY_MESSAGE.values())))
 
 
 if __name__ == "__main__":

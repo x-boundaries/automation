@@ -69,12 +69,27 @@ class PlaywrightPortal:
         if not username or not password:
             raise LoginError("runtime credentials are unavailable")
         page = self._require_page()
+        # Names the step that is about to run, so the generic arm below reports
+        # which one failed instead of one message for the whole sequence. It is
+        # a fixed internal marker: never a selector, URL, credential, account
+        # identity, or anything read back from the page. The sequence itself is
+        # unchanged -- the Login entry is resolved and clicked in two statements
+        # rather than one so that a generic failure inside the semantics gate
+        # stays distinguishable from a failure to click what it returned.
+        stage_failure = "portal navigation did not complete"
         try:
             page.goto(self.config.portal_url, wait_until="domcontentloaded")
-            self._enter_public_semantics(page).click()
+            stage_failure = "Flutter semantics activation dispatch did not complete"
+            login_entry = self._enter_public_semantics(page)
+            stage_failure = "post-activation Login control click did not complete"
+            login_entry.click()
+            stage_failure = "login username entry did not complete"
             page.get_by_label("Username", exact=True).fill(username)
+            stage_failure = "login password entry did not complete"
             page.get_by_label("Password", exact=True).fill(password)
+            stage_failure = "login submission did not complete"
             page.get_by_role("button", name="Login", exact=True).click()
+            stage_failure = "Billing Manager entry did not appear after login"
             page.get_by_role("link", name="Billing Manager", exact=True).wait_for(state="visible")
         except LayoutChangedError:
             # A proven pre-auth contract failure must not be reclassified as a
@@ -83,7 +98,7 @@ class PlaywrightPortal:
         except Exception as exc:
             if self._visible(page, page.get_by_role("alert")):
                 raise LoginError("portal rejected the login") from exc
-            raise LayoutChangedError("required login control is missing or ambiguous") from exc
+            raise LayoutChangedError(stage_failure) from exc
 
     def _enter_public_semantics(self, page: Any) -> Any:
         """Open the public Flutter semantics gate and return the Login entry.

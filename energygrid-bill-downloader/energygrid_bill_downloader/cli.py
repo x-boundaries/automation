@@ -44,10 +44,24 @@ SUPPORT_REFS_BY_MESSAGE = {
     "post-activation Login control could not be resolved": "EG_LOGIN_POST_ACTIVATION_UNRESOLVED",
     "post-activation Login control is missing or ambiguous": "EG_LOGIN_POST_ACTIVATION_AMBIGUOUS",
     "post-activation Login control is hidden or disabled": "EG_LOGIN_POST_ACTIVATION_NOT_READY",
+    "portal navigation did not complete": "EG_LOGIN_NAVIGATION_FAILED",
+    "Flutter semantics activation dispatch did not complete": "EG_LOGIN_SEMANTICS_ACTIVATION_DISPATCH_FAILED",
+    "post-activation Login control click did not complete": "EG_LOGIN_ENTRY_CLICK_FAILED",
+    "login username entry did not complete": "EG_LOGIN_USERNAME_FILL_FAILED",
+    "login password entry did not complete": "EG_LOGIN_PASSWORD_FILL_FAILED",
+    "login submission did not complete": "EG_LOGIN_SUBMIT_FAILED",
+    "Billing Manager entry did not appear after login": "EG_LOGIN_BILLING_MANAGER_WAIT_FAILED",
     "required login control is missing or ambiguous": "EG_LOGIN_REQUIRED_CONTROL_UNRESOLVED",
     "runtime credentials are unavailable": "EG_LOGIN_CREDENTIALS_UNAVAILABLE",
     "portal rejected the login": "EG_LOGIN_PORTAL_REJECTED",
 }
+
+# Kept so evidence written by an earlier build stays readable, not because any
+# step can still raise it: every operation that once shared this one coarse
+# reference now reports its own. Retiring a reference means moving it here, so
+# the reachability tests can require the live vocabulary to be fully reachable
+# and a retired one to be unreachable.
+RETIRED_SUPPORT_REFS = frozenset({"EG_LOGIN_REQUIRED_CONTROL_UNRESOLVED"})
 
 
 def support_ref_for(error: AppError) -> str:
