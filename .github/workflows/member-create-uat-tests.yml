@@ -64,6 +64,20 @@ on:
       - "scripts/autocount_migration_preflight.py"
       - "scripts/autocount_migration_preflight_contract.py"
       - "tests/test_autocount_migration_preflight.py"
+      # AC2 read-only source-authority guardrails (#149). The Windows job's full-repository
+      # suite exercises tests/test_autocount_readonly_login_validate.py and
+      # tests/test_autocount_stock_extract.py, so a pull request confined to the read-only SQL
+      # validator, the stock extractor's fail-closed SQL context guard, their tests, or the
+      # operator runbook that documents the expected-context contract must still trigger this
+      # workflow instead of depending on another file happening to change alongside them.
+      # Exact entries, not globs: a broad docs/, scripts/ or tests/ wildcard would widen the
+      # reviewed trigger surface and is rejected mechanically by
+      # tests/test_ac2_member_expiry_capability_probe.py.
+      - "scripts/autocount_readonly_login_validate.py"
+      - "tests/test_autocount_readonly_login_validate.py"
+      - "scripts/autocount_stock_extract.py"
+      - "tests/test_autocount_stock_extract.py"
+      - "docs/autocount_stock_extraction.md"
   workflow_dispatch: {}
 
 jobs:

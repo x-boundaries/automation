@@ -215,6 +215,166 @@ class AutoCountReadonlyLoginValidateTests(unittest.TestCase):
         self.assertIn("server_role_advisory", names)
 
 
+    def test_database_scope_covers_create_table_and_execute(self):
+        for permission in (
+            "INSERT",
+            "UPDATE",
+            "DELETE",
+            "ALTER",
+            "CONTROL",
+            "TAKE OWNERSHIP",
+            "CREATE TABLE",
+            "EXECUTE",
+        ):
+            self.assertIn(permission, validator.DATABASE_WRITE_LIKE_PERMISSIONS, permission)
+        # The evaluator flags on the flat set, so both additions must be recognised there too.
+        self.assertIn("CREATE TABLE", validator.WRITE_LIKE_PERMISSIONS)
+        self.assertIn("EXECUTE", validator.WRITE_LIKE_PERMISSIONS)
+
+    def test_object_scope_preserves_write_control_checks_without_invalid_create_table(self):
+        # CREATE TABLE is not an object-level securable permission. Probing it there returns
+        # NULL, which would read as a clean result rather than an unsupported combination.
+        self.assertNotIn("CREATE TABLE", validator.OBJECT_WRITE_LIKE_PERMISSIONS)
+        for permission in ("INSERT", "UPDATE", "DELETE", "ALTER", "CONTROL", "TAKE OWNERSHIP"):
+            self.assertIn(permission, validator.OBJECT_WRITE_LIKE_PERMISSIONS, permission)
+
+    def test_schema_scope_checks_broad_execute(self):
+        self.assertEqual(validator.SCHEMA_WRITE_LIKE_PERMISSIONS, ["EXECUTE"])
+
+    def test_permission_evaluator_flags_database_create_table(self):
+        result = validator.evaluate_permission_advisory(
+            [{"scope": "database", "permission_name": "CREATE TABLE", "has_permission": True}]
+        )
+
+        self.assertTrue(result["write_like_permission_detected"])
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["flagged_permissions"][0]["permission_name"], "CREATE TABLE")
+
+    def test_permission_evaluator_flags_database_execute(self):
+        result = validator.evaluate_permission_advisory(
+            [{"scope": "database", "permission_name": "EXECUTE", "has_permission": True}]
+        )
+
+        self.assertTrue(result["write_like_permission_detected"])
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["flagged_permissions"][0]["permission_name"], "EXECUTE")
+
+    def test_permission_evaluator_flags_schema_execute(self):
+        result = validator.evaluate_permission_advisory(
+            [{"scope": "schema", "surface": "dbo", "permission_name": "EXECUTE", "has_permission": True}]
+        )
+
+        self.assertTrue(result["write_like_permission_detected"])
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["flagged_permissions"][0]["scope"], "schema")
+        self.assertEqual(result["flagged_permissions"][0]["surface"], "dbo")
+        self.assertEqual(result["flagged_permissions"][0]["permission_name"], "EXECUTE")
+
+    def test_permission_evaluator_ignores_unsupported_null_results(self):
+        # HAS_PERMS_BY_NAME returns NULL for a permission that does not apply to the securable.
+        result = validator.evaluate_permission_advisory(
+            [
+                {"scope": "object", "surface": "dbo.Item", "permission_name": "EXECUTE", "has_permission": None},
+                {"scope": "schema", "surface": "dbo", "permission_name": "EXECUTE", "has_permission": None},
+            ]
+        )
+
+        self.assertFalse(result["write_like_permission_detected"])
+        self.assertEqual(result["flagged_permissions"], [])
+
+    def test_validation_fails_when_database_create_table_is_detected(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manifest = validator.run_validation(
+                base_config(tmpdir),
+                source=FakeValidationSource(
+                    permission_rows=[
+                        {"scope": "database", "permission_name": "CREATE TABLE", "has_permission": True}
+                    ]
+                ),
+            )
+
+            self.assertEqual(manifest["status"], "failed")
+            self.assertTrue(manifest["write_permission_advisory"]["write_like_permission_detected"])
+            self.assertEqual(manifest["exception_count"], 0)
+
+    def test_validation_fails_when_schema_execute_is_detected(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manifest = validator.run_validation(
+                base_config(tmpdir),
+                source=FakeValidationSource(
+                    permission_rows=[
+                        {"scope": "schema", "surface": "dbo", "permission_name": "EXECUTE", "has_permission": True}
+                    ]
+                ),
+            )
+
+            self.assertEqual(manifest["status"], "failed")
+            self.assertTrue(manifest["write_permission_advisory"]["write_like_permission_detected"])
+            self.assertEqual(manifest["write_permission_advisory"]["flagged_permissions"][0]["scope"], "schema")
+            self.assertEqual(manifest["exception_count"], 0)
+
+    def test_distinct_schema_names_deduplicates_configured_schema_set(self):
+        surfaces = [
+            {"schema_name": "dbo", "object_name": "Item"},
+            {"schema_name": "dbo", "object_name": "ItemUOM"},
+            {"schema_name": "rpt", "object_name": "Balance"},
+        ]
+
+        self.assertEqual(validator.distinct_schema_names(surfaces), ["dbo", "rpt"])
+
+    def test_sql_source_probes_each_scope_with_valid_permission_combinations(self):
+        source = RecordingSqlValidationSource()
+        surfaces = [
+            {"schema_name": "dbo", "object_name": "Item"},
+            {"schema_name": "dbo", "object_name": "StockDTL"},
+            {"schema_name": "rpt", "object_name": "Balance"},
+        ]
+
+        rows = source.fetch_permission_advisory(surfaces, validator.DATABASE_WRITE_LIKE_PERMISSIONS)
+
+        database_rows = [row for row in rows if row["scope"] == "database"]
+        self.assertEqual(
+            [row["permission_name"] for row in database_rows],
+            validator.DATABASE_WRITE_LIKE_PERMISSIONS,
+        )
+
+        object_rows = [row for row in rows if row["scope"] == "object"]
+        self.assertEqual(len(object_rows), len(surfaces) * len(validator.OBJECT_WRITE_LIKE_PERMISSIONS))
+        self.assertNotIn("CREATE TABLE", {row["permission_name"] for row in object_rows})
+
+        schema_rows = [row for row in rows if row["scope"] == "schema"]
+        # One probe per DISTINCT configured schema, not one per surface.
+        self.assertEqual([row["surface"] for row in schema_rows], ["dbo", "rpt"])
+        self.assertEqual({row["permission_name"] for row in schema_rows}, {"EXECUTE"})
+
+        schema_queries = [query for query in source.queries if "'SCHEMA'" in query["sql"]]
+        self.assertEqual(len(schema_queries), 2)
+
+    def test_sql_source_preserves_every_dangerous_fixed_role_check(self):
+        source = RecordingSqlValidationSource()
+
+        rows = source.fetch_permission_advisory(
+            [{"schema_name": "dbo", "object_name": "Item"}],
+            validator.DATABASE_WRITE_LIKE_PERMISSIONS,
+        )
+
+        self.assertEqual(
+            {row["role_name"] for row in rows if row["scope"] == "database_role"},
+            set(validator.DANGEROUS_DATABASE_ROLES),
+        )
+        self.assertEqual(
+            {row["role_name"] for row in rows if row["scope"] == "server_role"},
+            set(validator.DANGEROUS_SERVER_ROLES),
+        )
+
+    def test_check_sql_definitions_include_every_permission_scope(self):
+        names = {query["name"] for query in validator.build_check_definitions()}
+
+        self.assertIn("database_permission_advisory", names)
+        self.assertIn("object_permission_advisory", names)
+        self.assertIn("schema_permission_advisory", names)
+
+
 def base_config(output_root):
     return {
         "job": "autocount_readonly_login_validate",
