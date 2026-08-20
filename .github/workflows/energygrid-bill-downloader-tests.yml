@@ -5,6 +5,13 @@ on:
     paths:
       - "energygrid-bill-downloader/**"
       - ".github/workflows/energygrid-bill-downloader-tests.yml"
+      # EnergyGrid n8n error handler (#141): the source-controlled export, its focused
+      # offline test, and the directory README that documents it. Exact entries, not a
+      # broad n8n-workflows/** or tests/** glob, which would widen the reviewed trigger
+      # surface beyond what this workflow owns.
+      - "n8n-workflows/energygrid_download_error_handler.workflow.json"
+      - "tests/test_energygrid_n8n_error_handler.py"
+      - "n8n-workflows/README.md"
       - "README.md"
       - ".gitignore"
   workflow_dispatch: {}
@@ -56,6 +63,12 @@ jobs:
         shell: pwsh
         working-directory: energygrid-bill-downloader
         run: python -m unittest discover -s tests -v
+      - name: EnergyGrid n8n error handler focused test
+        # The project suite above discovers only energygrid-bill-downloader/tests, so the
+        # root-level focused test needs its own step. Standard library plus the runner's
+        # Node, which executes the committed n8n expressions offline; no n8n instance.
+        shell: pwsh
+        run: python -m unittest discover -s tests -p "test_energygrid_n8n_error_handler.py" -v
       - name: Scope and whitespace check
         shell: pwsh
         run: |
@@ -64,7 +77,9 @@ jobs:
           $files = @(git diff --name-only $base HEAD)
           $owned = @($files | Where-Object {
             $_ -match '^energygrid-bill-downloader/' -or
-            $_ -eq '.github/workflows/energygrid-bill-downloader-tests.yml'
+            $_ -eq '.github/workflows/energygrid-bill-downloader-tests.yml' -or
+            $_ -eq 'n8n-workflows/energygrid_download_error_handler.workflow.json' -or
+            $_ -eq 'tests/test_energygrid_n8n_error_handler.py'
           })
           if ($owned.Count -eq 0) {
             Write-Host "No EnergyGrid-owned path changed; EnergyGrid scope guard not applicable."
@@ -72,6 +87,9 @@ jobs:
             foreach ($file in $files) {
               if ($file -notmatch '^energygrid-bill-downloader/' -and
                   $file -ne '.github/workflows/energygrid-bill-downloader-tests.yml' -and
+                  $file -ne 'n8n-workflows/energygrid_download_error_handler.workflow.json' -and
+                  $file -ne 'tests/test_energygrid_n8n_error_handler.py' -and
+                  $file -ne 'n8n-workflows/README.md' -and
                   $file -ne 'README.md' -and
                   $file -ne '.gitignore') {
                 throw "Out-of-scope changed path: $file"
