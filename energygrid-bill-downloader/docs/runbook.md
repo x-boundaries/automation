@@ -78,6 +78,15 @@ recognise records `APP_ERROR_UNCLASSIFIED`. The underlying exception text is
 never written to the log, the console, or any filename, so quote the
 `support_ref` when escalating rather than looking for a message.
 
+Each step of the login sequence carries its own code, so a failed login is
+attributable to portal navigation, the semantics activation dispatch, the Login
+entry click, the username entry, the password entry, the login submission, or
+the Billing Manager wait. A visible portal alert still takes precedence over all
+of them and records `EG_LOGIN_PORTAL_REJECTED`. Evidence written before those
+steps were told apart records the retired `EG_LOGIN_REQUIRED_CONTROL_UNRESOLVED`
+instead: no current build emits it, and it narrows a failure only to that login
+sequence as a whole.
+
 ## Controlled first validation
 
 Before unattended scheduling, the owner must separately approve and perform the
