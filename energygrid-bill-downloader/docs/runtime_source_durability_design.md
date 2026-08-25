@@ -1246,19 +1246,21 @@ runtimes.
 | `EGRT-T56` | If `launcher.ps1`, `launcher_lib.ps1`, or the manifest is missing or invalid, recognised residue cannot satisfy the missing member and preflight fails | A |
 | `EGRT-T57` | No recognised residue path is ever dot-sourced, invoked, imported, or selected as a fallback, and the launcher never enumerates the root to locate a script or library | A and C |
 | `EGRT-T58` | An authorised write-capable trustee, supplied as an exact SID, passes `launcher_root_write_trustees_authorised` against a synthetic scratch launcher root and each of its package members | A and B |
-| `EGRT-T59` | `launcher_root_not_writable_by_run_principal` reports a scratch root that grants the checking token no write-capable right as non-writable, and reports one that grants it any write-capable right as writable | A and B |
+| `EGRT-T59` | `launcher_root_not_writable_by_run_principal` reports writable whenever the checking token is granted **exactly one** write-capable right, proven separately for a file-specific right such as `FILE_WRITE_DATA` and for a directory-specific right such as `FILE_DELETE_CHILD`, and reports non-writable only where the granted mask intersects the write-capable mask in no bit. This is the union/all-rights false-negative guard: an implementation that requests the union of every write-capable right and reads a denied access status as safe fails this assertion | A and B |
 | `EGRT-T60` | A write-capable access-allowed entry for a trustee outside the supplied set fails closed, on the directory and on a package member independently | A |
 | `EGRT-T61` | A write-capable entry for an unrelated service SID beneath `S-1-5-80-` fails closed, and no prefix, pattern, range, or wildcard form is accepted anywhere in the supplied set | A and C |
 | `EGRT-T62` | Same-account separation is proven rather than assumed: against one scratch root whose only write-capable grant is a group identity, a token in which that identity is deny-only is reported non-writable while the same token before restriction is reported writable | A and B |
 | `EGRT-T63` | No SID string, trustee name, owner identity, or count derived from them appears in `-ValidateOnly` output, the terminal event, the result object, or any committed runtime file, example settings file, or test | A and C |
 | `EGRT-T64` | An inherited write-capable access-allowed entry is evaluated exactly as an explicit one, and fails closed when its trustee is outside the supplied set | A |
 | `EGRT-T65` | An access-denied entry never authorises a trustee: a root carrying both a write-capable allow entry for an unauthorised trustee and a deny entry for that same trustee still fails `launcher_root_write_trustees_authorised`, in either entry order | A |
-| `EGRT-T66` | `WRITE_DAC`, `WRITE_OWNER`, and `DELETE` are each treated as write-capable independently, and an examined object whose owner is outside the supplied set fails closed even when no explicit write-capable entry exists | A |
+| `EGRT-T66` | `WRITE_DAC`, `WRITE_OWNER`, and `DELETE` are each treated as write-capable independently by both launcher-root write checks, so a token granted exactly one of those standard rights and nothing else is reported writable; and an examined object whose owner is outside the supplied set fails closed even where no explicit write-capable entry exists | A |
 | `EGRT-T67` | An object carrying no discretionary access control list fails both launcher-root write checks rather than passing them | A |
 | `EGRT-T68` | An inheritable write-capable `CREATOR OWNER` entry fails closed, and `S-1-3-0` is refused if it is supplied in the authorised set | A |
 | `EGRT-T69` | A checking token holding `SeTakeOwnershipPrivilege` or `SeRestorePrivilege` fails `launcher_root_not_writable_by_run_principal` even where the access control list grants it nothing | A |
+| `EGRT-T70` | The access check is performed against an impersonation token duplicated from the primary token of the process actually running the launcher, at `SecurityIdentification` level, and the launcher never impersonates with it, never passes the primary token to the access check, and never derives the context from an account name or a SID | A and C |
+| `EGRT-T71` | The write-capable mask is passed through generic mapping before it is intersected with the granted mask, so a descriptor expressed only in generic rights is still detected as write-capable | A and C |
 
-`EGRT-T58` to `EGRT-T69` are offline synthetic tests. They construct scratch directories
+`EGRT-T58` to `EGRT-T71` are offline synthetic tests. They construct scratch directories
 carrying deliberately shaped security descriptors, and where a case needs a token with a
 deny-only group identity they derive it from the test process's own token by restricting
 it, which is an operation any process may perform on itself. That is what makes the
@@ -1271,11 +1273,14 @@ run principal satisfy the two checks. That is host state. It is proven only by
 the unattended job, and it is recorded separately as `EGRT-I31` rather than being claimed
 here.
 
-These twelve identifiers are appended rather than folded into existing ones because no
+These fourteen identifiers are appended rather than folded into existing ones because no
 existing assertion evaluates a security descriptor or an access token at all. `EGRT-T48`
 asserts only that a failing non-secret check stops the run before the credential import;
-it says nothing about whether the security check itself is correct. `EGRT-T01` to
-`EGRT-T57` are unchanged and are not renumbered.
+it says nothing about whether the security check itself is correct. `EGRT-T70` and
+`EGRT-T71` are separate from `EGRT-T59` because they constrain how the access check is
+constructed rather than what it concludes, and a conforming conclusion reached by a
+non-conforming construction would still be a defect. `EGRT-T01` to `EGRT-T57` are
+unchanged and are not renumbered.
 
 ### 12.3 Testability without production fallbacks
 
@@ -1631,6 +1636,10 @@ enough.
 **Rights treated as write-capable.** After generic mapping, any of `FILE_WRITE_DATA` /
 `FILE_ADD_FILE`, `FILE_APPEND_DATA` / `FILE_ADD_SUBDIRECTORY`, `FILE_WRITE_EA`,
 `FILE_WRITE_ATTRIBUTES`, `FILE_DELETE_CHILD`, `DELETE`, `WRITE_DAC`, and `WRITE_OWNER`.
+`FILE_ADD_FILE` and `FILE_ADD_SUBDIRECTORY` are the directory readings of the same bits as
+`FILE_WRITE_DATA` and `FILE_APPEND_DATA`, so the mask is bit-identical for both object
+kinds and the object type changes only how a granted bit is described;
+`FILE_DELETE_CHILD` is meaningful on the directory.
 `WRITE_DAC` and `WRITE_OWNER` are included deliberately. Windows defines them as the right
 to modify the discretionary access control list and the right to change the owner, so a
 trustee holding either can grant itself every other right at will; treating them as
@@ -1679,10 +1688,64 @@ read-level rights would make both checks decorative.
 
 - *Inputs.* The access token of the process actually running the launcher, and the
   security descriptor of each examined object.
-- *Evaluation.* A Windows access check of the write-capable mask against each object's
-  security descriptor, using that token. The token is supplied to the check as a token. It
-  is never reconstructed from an account name or from a SID.
-- *Why a token and not a trustee.* This is the whole point of the check. A security
+- *Evaluation, exactly.* One algorithm is prescribed. An implementation that substitutes a
+  different formulation of the requested access is non-conforming. For the launcher-root
+  directory, and then for each Class A package member:
+
+  1. Open the primary access token of the process actually running `launcher.ps1`, with at
+     least `TOKEN_DUPLICATE` and `TOKEN_QUERY` access.
+  2. Duplicate it with `DuplicateTokenEx`, passing `TokenType` = `TokenImpersonation` and
+     `ImpersonationLevel` = `SecurityIdentification`. `AccessCheck` is documented to take
+     an impersonation token, so the primary token is never passed to it directly.
+     `SecurityIdentification` is the least-privilege level Windows documents as sufficient
+     for a server to make access-validation decisions from a client's security
+     information. The duplicate exists to be evaluated; the launcher never impersonates
+     with it and never starts anything under it.
+  3. Retrieve the object's security descriptor including its owner, its group, and its
+     discretionary access control list. All three are required, because `AccessCheck`
+     fails with `ERROR_INVALID_SECURITY_DESCR` when the descriptor carries no owner and
+     group SIDs.
+  4. Build the `GENERIC_MAPPING` for file-system objects from the documented
+     `FILE_GENERIC_READ`, `FILE_GENERIC_WRITE`, `FILE_GENERIC_EXECUTE`, and
+     `FILE_ALL_ACCESS` values.
+  5. Call `AccessCheck` with the duplicated token and `DesiredAccess` = `MAXIMUM_ALLOWED`.
+     Windows then returns, in `GrantedAccess`, the maximum access rights the security
+     descriptor allows that token.
+  6. Any failure of any call in steps 1 to 5, an unreadable token, or an unreadable
+     security descriptor is terminal. The check never falls back to another method, never
+     retries at a different impersonation level, and never treats an error as a pass.
+  7. Apply `MapGenericMask` to the write-capable mask defined above, so that the mask being
+     compared contains no generic rights, and then compute
+
+     `any_write_granted = (GrantedAccess AND write_capable_mask) != 0`
+
+     `AreAnyAccessesGranted(GrantedAccess, write_capable_mask)` is the documented
+     equivalent of that intersection and may be used in its place. Nothing else may be.
+  8. `any_write_granted` true on any examined object fails the check immediately.
+
+  The check passes only where the intersection is zero on the launcher-root directory *and*
+  on every Class A package member.
+
+- *Why `MAXIMUM_ALLOWED` and an intersection, and not a requested write mask.* This is the
+  one place the algorithm must not be left to the implementer, because the obvious
+  formulation is wrong in the unsafe direction. Windows grants an access check only when
+  the descriptor allows *all* of the requested rights: it walks entries until every
+  requested right has been allowed, or until a requested right is denied or is simply never
+  granted, in which case access is denied. Passing the union of every write-capable bit as
+  `DesiredAccess` and reading `AccessStatus` false as "not writable" is therefore a false
+  negative by construction. A token holding exactly one of those rights — enough to append
+  to, delete, or re-permission the launcher — yields `AccessStatus` false under that
+  formulation, and the run would proceed. Requesting `MAXIMUM_ALLOWED` and intersecting the
+  returned mask is what makes a single granted write right observable. An equivalent
+  algorithm that checks each write-capable right individually would also be correct, but
+  the design deliberately prescribes one rather than leaving the choice open.
+
+- *Null discretionary access control list.* Windows grants access when an object has no
+  such list, so `GrantedAccess` comes back carrying every right and the intersection is
+  non-zero. The fail-closed outcome required below therefore falls out of this algorithm
+  rather than needing to be handled as a special case.
+- *Why a token and not a trustee.* The token is evaluated as a token and is never
+  reconstructed from an account name or from a SID. A security
   context rebuilt from a SID recomposes group membership as enabled, which is precisely
   the information a filtered token does not carry. The trustee-based effective-rights
   helper additionally ignores the owner's implicit rights, ignores privileges, ignores
@@ -1717,16 +1780,26 @@ full administrator token, and a filtered standard-user token that contains the s
 user-specific information but from which the administrative privileges and SIDs have been
 removed. In the filtered token the Administrators group identity is present as a deny-only
 identity, and Windows ignores access-allowed entries for a deny-only identity while still
-honouring access-denied entries for it. The account's own *user* SID is not filtered. It is
-enabled in both tokens, and Windows does not permit a token's user SID to be disabled.
+honouring access-denied entries for it. The account's own *user* SID is not among what that
+filtering removes: Windows documents the standard user token as carrying the same
+user-specific information as the administrator token, and `AdjustTokenGroups` cannot
+disable a token's user SID, so both of that account's ordinary running contexts carry it
+enabled.
+
+This design needs no claim stronger than that, and no stronger claim would be true.
+`CreateRestrictedToken` can mark any SID deny-only, the user SID included. A deliberately
+restricted token is a different construction from the split token UAC produces, and the
+reasoning below is scoped to normal UAC split-token behaviour rather than to the platform
+in general.
 
 Three consequences follow, and together they decide the design.
 
 1. Binding write authority to the installing account's **user SID** does not separate the
-   two contexts at all. The same user SID is enabled in the elevated installer token and in
-   the unattended token, so an allow entry keyed to it grants write to the unattended run
-   as well. Where installer and run principal are the same account, that binding alone
-   fails the very property it was meant to establish.
+   two contexts at all. Under normal UAC split-token behaviour the same user SID is enabled
+   in the elevated installer token and in the unattended token, so an allow entry keyed to
+   it grants write to the unattended run as well. Where installer and run principal are
+   the same account, that binding alone fails the very property it was meant to
+   establish.
 2. Binding write authority to an **administrative group identity** does separate them, but
    only while the host keeps the conditions that produce a filtered token. A scheduled task
    set to run with highest privileges receives the full token; the run-level setting is
@@ -1823,7 +1896,7 @@ prohibited. Only the behaviour they proved is carried forward, in the form above
 | `EGRT-I04` | `Invoke-AtomicFileReplace` implements every rule in section 7.2, with a mandatory explicit backup path |
 | `EGRT-I05` | `Invoke-GovernedGit` implements the section 10 result contract and environment neutralisation |
 | `EGRT-I06` | `-ValidateOnly` satisfies section 8, including deterministic output and zero mutation |
-| `EGRT-I07` | All sixty-nine assertions `EGRT-T01` to `EGRT-T69` are implemented and pass |
+| `EGRT-I07` | All seventy-one assertions `EGRT-T01` to `EGRT-T71` are implemented and pass |
 | `EGRT-I08` | The full project suite passes on Windows via `python -m unittest discover -s tests -v` |
 | `EGRT-I09` | No GitHub Actions workflow is modified |
 | `EGRT-I10` | No secret, credential, private absolute path, or private identity is committed |
