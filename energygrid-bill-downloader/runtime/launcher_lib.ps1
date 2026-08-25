@@ -23,6 +23,55 @@
 
 Set-StrictMode -Version Latest
 
+# --------------------------------------------------------------------------------------
+# Native no-replace publication interop (design section 7.4)
+# --------------------------------------------------------------------------------------
+# Windows MoveFileExW WITHOUT MOVEFILE_REPLACE_EXISTING is the primitive that fails rather
+# than overwrites if the destination has appeared in the meantime. It is the same
+# no-replace move discipline the application already uses when publishing a validated PDF
+# (energygrid_bill_downloader/publication.py) and the AutoCount capability probe
+# (scripts/member_expiry_capability_probe_lib.ps1).
+#
+# This is a TYPE DEFINITION emitted once, guarded by a type-presence test so a second
+# dot-source in the same session does not throw a duplicate-type error. It performs no
+# filesystem action, so the pure-library rule in EGRT-I01 is preserved.
+$script:EgNativePublicationInteropSource = @'
+using System;
+using System.Runtime.InteropServices;
+
+namespace EgRuntime {
+    public class NativeMoveResult {
+        public bool Ok;
+        public int LastError;
+    }
+
+    public static class NativePublication {
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode, EntryPoint = "MoveFileExW")]
+        private static extern bool MoveFileExW(string lpExistingFileName, string lpNewFileName, uint dwFlags);
+
+        // Write-through ONLY. Replacement, cross-volume copying, and reboot-delayed
+        // scheduling are never requested, so the rename is no-replace, same-volume, and
+        // synchronous through the documented write-through completion boundary. A losing
+        // race is reported to the caller, never resolved by replacing.
+        private const uint MOVEFILE_WRITE_THROUGH = 0x00000008;
+
+        public static NativeMoveResult MoveNoReplaceWriteThrough(string source, string destination) {
+            NativeMoveResult result = new NativeMoveResult();
+            result.Ok = MoveFileExW(source, destination, MOVEFILE_WRITE_THROUGH);
+            result.LastError = 0;
+            if (result.Ok == false) {
+                result.LastError = Marshal.GetLastWin32Error();
+            }
+            return result;
+        }
+    }
+}
+'@
+
+if (-not ([System.Management.Automation.PSTypeName]'EgRuntime.NativePublication').Type) {
+    Add-Type -TypeDefinition $script:EgNativePublicationInteropSource
+}
+
 function Get-EgLauncherLibraryContract {
     # The library's own bounded self-description. Pure; no side effect.
     [CmdletBinding()]
@@ -253,6 +302,123 @@ function Invoke-AtomicFileReplace {
         -PreimageState 'Existing' -PreimageSha256 $preimageSha `
         -PostimageSha256 $postimageSha -PublicationOccurred $publicationOccurred `
         -BackupCreated $backupCreated -BackupRetained $backupCreated
+}
+
+function Test-EgPowerShellFileParsesCleanly {
+    # Whether a .ps1 file parses with zero errors. Read-only; the file is never executed,
+    # dot-sourced, or imported by this check.
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return $false
+    }
+    $parseErrors = $null
+    $parseTokens = $null
+    try {
+        [void][System.Management.Automation.Language.Parser]::ParseFile(
+            $Path, [ref]$parseTokens, [ref]$parseErrors)
+    }
+    catch {
+        return $false
+    }
+    if ($null -eq $parseErrors) {
+        return $true
+    }
+    return (@($parseErrors).Count -eq 0)
+}
+
+function Invoke-EgNoReplaceMove {
+    # Same-directory move that will NOT clobber. Returns the observed native outcome; the
+    # caller decides what a failure means.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$SourcePath,
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$DestinationPath
+    )
+
+    $native = [EgRuntime.NativePublication]::MoveNoReplaceWriteThrough($SourcePath, $DestinationPath)
+    [pscustomobject]@{
+        Ok        = $native.Ok
+        LastError = [int]$native.LastError
+    }
+}
+
+function Invoke-PublishToAbsentDestination {
+    # Publish a staging file to a destination whose ABSENCE has been positively
+    # established. This is the clean-first-install path and it never calls
+    # [System.IO.File]::Replace, which requires the destination to already exist.
+    #
+    # There is no backup, because there was nothing to back up. This primitive never rolls
+    # back: undoing a publication is the installer transaction's responsibility, and means
+    # returning the destination to absence (design section 7.4 step 6).
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$SourcePath,
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$DestinationPath,
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$ExpectedSha256
+    )
+
+    # Step 1. Absence is established first, not assumed. An unexpectedly present
+    # destination file means the caller's preimage classification was wrong, and that is
+    # terminal rather than something to recover from by overwriting.
+    if (Test-Path -LiteralPath $DestinationPath -PathType Leaf) {
+        return New-EgPublicationResult -Success $false `
+            -SupportRef 'EG_LAUNCHER_PUBLISH_DESTINATION_UNEXPECTEDLY_PRESENT' `
+            -PreimageState 'Absent' `
+            -PostimageSha256 (Get-EgFileSha256 -Path $DestinationPath) `
+            -PublicationOccurred $false -BackupCreated $false -BackupRetained $false
+    }
+
+    # Step 2. The staging file is complete before publication: it exists, parses cleanly
+    # when it is a PowerShell file, and hashes to the expected value. Nothing partially
+    # written is ever published. A staging file that fails any of these is a staging
+    # failure, reported as such rather than attempted.
+    $stagingOk = (Test-Path -LiteralPath $SourcePath -PathType Leaf)
+    if ($stagingOk) {
+        if ([System.IO.Path]::GetExtension($SourcePath) -ieq '.ps1') {
+            $stagingOk = (Test-EgPowerShellFileParsesCleanly -Path $SourcePath)
+        }
+    }
+    if ($stagingOk) {
+        $stagingOk = ((Get-EgFileSha256 -Path $SourcePath) -ceq $ExpectedSha256)
+    }
+    if (-not $stagingOk) {
+        return New-EgPublicationResult -Success $false `
+            -SupportRef 'EG_LAUNCHER_INSTALL_STAGING_FAILED' `
+            -PreimageState 'Absent' `
+            -PublicationOccurred $false -BackupCreated $false -BackupRetained $false
+    }
+
+    # Step 3. A same-directory move that will not clobber. A losing race is reported,
+    # never resolved by replacing.
+    $moved = Invoke-EgNoReplaceMove -SourcePath $SourcePath -DestinationPath $DestinationPath
+    if (-not $moved.Ok) {
+        if (Test-Path -LiteralPath $DestinationPath) {
+            return New-EgPublicationResult -Success $false `
+                -SupportRef 'EG_LAUNCHER_PUBLISH_RACE_LOST' `
+                -PreimageState 'Absent' `
+                -PostimageSha256 (Get-EgFileSha256 -Path $DestinationPath) `
+                -PublicationOccurred $false -BackupCreated $false -BackupRetained $false
+        }
+        return New-EgPublicationResult -Success $false `
+            -SupportRef 'EG_LAUNCHER_PUBLISH_POSTIMAGE_MISMATCH' `
+            -PreimageState 'Absent' `
+            -PublicationOccurred $false -BackupCreated $false -BackupRetained $false
+    }
+
+    # Step 4. The postimage is verified. Publication is not treated as successful until
+    # the destination hash matches.
+    $postimageSha = Get-EgFileSha256 -Path $DestinationPath
+    if ($postimageSha -ceq $ExpectedSha256) {
+        return New-EgPublicationResult -Success $true `
+            -PreimageState 'Absent' -PostimageSha256 $postimageSha `
+            -PublicationOccurred $true -BackupCreated $false -BackupRetained $false
+    }
+    return New-EgPublicationResult -Success $false `
+        -SupportRef 'EG_LAUNCHER_PUBLISH_POSTIMAGE_MISMATCH' `
+        -PreimageState 'Absent' -PostimageSha256 $postimageSha `
+        -PublicationOccurred $true -BackupCreated $false -BackupRetained $false
 }
 
 # --------------------------------------------------------------------------------------

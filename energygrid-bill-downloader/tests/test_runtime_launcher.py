@@ -453,6 +453,70 @@ switch ($Op) {
             fieldNames          = @($result.PSObject.Properties.Name)
         } | ConvertTo-Json -Depth 8 -Compress
     }
+    'publish' {
+        # The publish-to-absent primitive. -Value selects the destination precondition.
+        $source = Join-Path $Dir 'staging.ps1'
+        $destination = Join-Path $Dir 'published.ps1'
+        $utf8 = New-Object System.Text.UTF8Encoding($false)
+        [System.IO.File]::WriteAllText($source, "# staging content`r`nGet-Date | Out-Null`r`n", $utf8)
+        $sourceSha = Get-EgFileSha256 -Path $source
+        $expected = $sourceSha
+        if ($Value -eq 'stagingbad') {
+            $expected = '1111111111111111111111111111111111111111111111111111111111111111'
+        }
+        if ($Value -eq 'presentfile') {
+            [System.IO.File]::WriteAllText($destination, '# OCCUPYING FILE', $utf8)
+        }
+        if ($Value -eq 'occupieddirectory') {
+            [void](New-Item -ItemType Directory -Path $destination)
+            [System.IO.File]::WriteAllText((Join-Path $destination 'occupant.txt'), 'OCCUPANT', $utf8)
+        }
+
+        $result = Invoke-PublishToAbsentDestination -SourcePath $source -DestinationPath $destination -ExpectedSha256 $expected
+
+        $emitted = [ordered]@{
+            sourceSha           = $sourceSha
+            success             = $result.Success
+            supportRef          = $result.SupportRef
+            exceptionTypeName   = $result.ExceptionTypeName
+            hresult             = $result.HResult
+            preimageState       = $result.PreimageState
+            preimageSha256      = $result.PreimageSha256
+            postimageSha256     = $result.PostimageSha256
+            publicationOccurred = $result.PublicationOccurred
+            backupCreated       = $result.BackupCreated
+            backupRetained      = $result.BackupRetained
+            fieldNames          = @($result.PSObject.Properties.Name)
+            sourceStillThere    = (Test-Path -LiteralPath $source -PathType Leaf)
+            destinationIsFile   = (Test-Path -LiteralPath $destination -PathType Leaf)
+            destinationIsDir    = (Test-Path -LiteralPath $destination -PathType Container)
+            destinationText     = ''
+            occupantText        = ''
+        }
+        if (Test-Path -LiteralPath $destination -PathType Leaf) {
+            $emitted['destinationText'] = [System.IO.File]::ReadAllText($destination)
+        }
+        $occupant = Join-Path $destination 'occupant.txt'
+        if (Test-Path -LiteralPath $occupant -PathType Leaf) {
+            $emitted['occupantText'] = [System.IO.File]::ReadAllText($occupant)
+        }
+        $emitted | ConvertTo-Json -Depth 8 -Compress
+    }
+    'movenoreplace' {
+        # The no-replace move helper, driven DIRECTLY against a pre-seeded destination.
+        $source = Join-Path $Dir 'staging.txt'
+        $destination = Join-Path $Dir 'published.txt'
+        $utf8 = New-Object System.Text.UTF8Encoding($false)
+        [System.IO.File]::WriteAllText($source, 'STAGING', $utf8)
+        [System.IO.File]::WriteAllText($destination, 'OCCUPANT', $utf8)
+        $moved = Invoke-EgNoReplaceMove -SourcePath $source -DestinationPath $destination
+        [ordered]@{
+            ok               = $moved.Ok
+            lastError        = $moved.LastError
+            destinationText  = [System.IO.File]::ReadAllText($destination)
+            sourceStillThere = (Test-Path -LiteralPath $source -PathType Leaf)
+        } | ConvertTo-Json -Depth 8 -Compress
+    }
     default {
         throw ('unknown probe operation: ' + $Op)
     }
@@ -1340,6 +1404,124 @@ class AtomicFileReplaceBackupSemantics(TierABase):
             case_a["backupCreated"],
             "BackupCreated reports what was observed on disk, not what was requested",
         )
+
+
+ERROR_ALREADY_EXISTS = 183
+
+
+def publish_probe(exe, case):
+    """Run one publish-to-absent fixture case and return its observation."""
+    with TemporaryScratch() as tmp:
+        work = tmp / "work"
+        work.mkdir()
+        return probe_json(exe, "publish", tmp, dir=work, value=case)
+
+
+class PublishToAbsentDestinationMixin:
+    """Design section 7.4, the clean-first-install path, asserted on one interpreter."""
+
+    exe = None
+
+    def test_publish_to_absent_destination_succeeds_and_verifies(self):
+        """A bare destination publishes through the no-replace move and verifies."""
+        observed = publish_probe(self.exe, "absent")
+        self.assertTrue(observed["success"], observed["supportRef"])
+        self.assertEqual("", observed["supportRef"])
+        self.assertEqual("Absent", observed["preimageState"])
+        self.assertEqual(
+            "",
+            observed["preimageSha256"],
+            "there was nothing to back up, so there is no preimage hash",
+        )
+        self.assertFalse(observed["backupCreated"])
+        self.assertFalse(
+            observed["backupRetained"],
+            "there is no backup on the publish-to-absent path",
+        )
+        self.assertTrue(observed["publicationOccurred"])
+        self.assertEqual(observed["sourceSha"], observed["postimageSha256"])
+        self.assertTrue(observed["destinationIsFile"])
+        self.assertFalse(
+            observed["sourceStillThere"],
+            "a move, not a copy: the staging file is consumed",
+        )
+        self.assertEqual(list(PUBLICATION_RESULT_FIELDS), observed["fieldNames"])
+
+
+class PublishToAbsentDestinationTierA(PublishToAbsentDestinationMixin, TierABase):
+    """Task 6, Tier A."""
+
+    @classmethod
+    def setUpClass(cls):
+        TierABase.setUpClass()
+        cls.exe = ANY_PS
+
+    def test_unexpectedly_present_destination_fails_rather_than_overwriting(self):
+        """EGRT-T50: an unexpectedly present destination is terminal, never overwritten."""
+        observed = publish_probe(ANY_PS, "presentfile")
+        self.assertFalse(observed["success"])
+        self.assertEqual(
+            "EG_LAUNCHER_PUBLISH_DESTINATION_UNEXPECTEDLY_PRESENT",
+            observed["supportRef"],
+        )
+        self.assertFalse(observed["publicationOccurred"])
+        self.assertEqual(
+            "# OCCUPYING FILE",
+            observed["destinationText"],
+            "the pre-existing destination must be byte-identical afterwards",
+        )
+        self.assertTrue(
+            observed["sourceStillThere"],
+            "nothing was published, so the staging file is untouched",
+        )
+
+    def test_destination_appearing_mid_publication_fails_rather_than_overwriting(self):
+        """EGRT-T50: a move that cannot complete reports a lost race and clobbers nothing.
+
+        Induced deterministically by an entry occupying the destination path that is not a
+        published file, so the leaf-absence check passes and the no-replace move is what
+        refuses. That exercises exactly the mid-publication-appearance branch, without a
+        test-only hook in production code and without a timing-dependent fixture.
+        """
+        observed = publish_probe(ANY_PS, "occupieddirectory")
+        self.assertFalse(observed["success"])
+        self.assertEqual("EG_LAUNCHER_PUBLISH_RACE_LOST", observed["supportRef"])
+        self.assertFalse(observed["publicationOccurred"])
+        self.assertTrue(
+            observed["destinationIsDir"],
+            "the occupying entry must survive unchanged",
+        )
+        self.assertEqual("OCCUPANT", observed["occupantText"])
+        self.assertTrue(observed["sourceStillThere"])
+
+    def test_the_no_replace_move_helper_refuses_to_clobber(self):
+        """EGRT-T50 support: MoveFileExW without MOVEFILE_REPLACE_EXISTING never replaces."""
+        with TemporaryScratch() as tmp:
+            work = tmp / "work"
+            work.mkdir()
+            observed = probe_json(ANY_PS, "movenoreplace", tmp, dir=work)
+        self.assertFalse(observed["ok"])
+        self.assertEqual(ERROR_ALREADY_EXISTS, observed["lastError"])
+        self.assertEqual("OCCUPANT", observed["destinationText"])
+        self.assertTrue(observed["sourceStillThere"])
+
+    def test_an_unverified_staging_file_is_never_published(self):
+        """Nothing partially written or unverified is ever published."""
+        observed = publish_probe(ANY_PS, "stagingbad")
+        self.assertFalse(observed["success"])
+        self.assertEqual("EG_LAUNCHER_INSTALL_STAGING_FAILED", observed["supportRef"])
+        self.assertFalse(observed["publicationOccurred"])
+        self.assertFalse(observed["destinationIsFile"])
+        self.assertTrue(observed["sourceStillThere"])
+
+
+class PublishToAbsentDestinationTierB(PublishToAbsentDestinationMixin, TierBBase):
+    """Task 6, Tier B: the same path on the Windows PowerShell 5.1 boundary."""
+
+    @classmethod
+    def setUpClass(cls):
+        TierBBase.setUpClass()
+        cls.exe = DESKTOP_PS
 
 
 if __name__ == "__main__":
