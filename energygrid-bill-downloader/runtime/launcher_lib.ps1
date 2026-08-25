@@ -425,6 +425,147 @@ function New-EgTransactionMember {
     }
 }
 
+function Get-EgTouchedSet {
+    # The member entries whose publication ADVANCED the destination, in REVERSE
+    # publication order.
+    #
+    # Membership is decided by PublicationOccurred, NOT by which member failed. The member
+    # whose failure ended the transaction is included only if it actually advanced: a Case
+    # A failure (threw before publication) did not advance and is not restored, while a
+    # Case B failure (returned, postimage verification failed) did advance and is the most
+    # recent entry, so it is restored first.
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$TransactionState)
+
+    $advanced = @()
+    foreach ($entry in @($TransactionState.Members)) {
+        if ($entry.PublicationOccurred) {
+            $advanced = $advanced + $entry
+        }
+    }
+    if (@($advanced).Count -le 1) {
+        return $advanced
+    }
+    $reversed = @()
+    for ($index = @($advanced).Count - 1; $index -ge 0; $index--) {
+        $reversed = $reversed + $advanced[$index]
+    }
+    return $reversed
+}
+
+function Invoke-EgPackageRollback {
+    # The SOLE rollback authority in this design (design section 6.5). Neither publish
+    # primitive restores anything, so only this function undoes a transaction, and it
+    # walks the touched set in reverse publication order.
+    #
+    # After the walk it re-verifies that the ENTIRE installed package equals its
+    # pre-transaction state: every previously present member restored to its preimage hash,
+    # and every member that was absent beforehand absent again.
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$TransactionState)
+
+    $verified = $true
+    $supportRef = ''
+
+    foreach ($entry in @(Get-EgTouchedSet -TransactionState $TransactionState)) {
+        if ($entry.PreimageState -ceq 'Existing') {
+            # A destination that advanced with no preimage backup on disk is the one state
+            # this design cannot restore. It is reported rather than left implicit.
+            if (-not (Test-Path -LiteralPath $entry.BackupPath -PathType Leaf)) {
+                $verified = $false
+                $supportRef = 'EG_LAUNCHER_REPLACE_PREIMAGE_UNRECOVERABLE'
+                continue
+            }
+            # Restore through the explicit-backup replacement semantics of section 7.2. The
+            # advanced bytes are retained as recognised rollback residue, so the evidence
+            # survives for inspection and the launcher's next preflight still passes.
+            $rollbackResiduePath = Join-Path `
+                ([System.IO.Path]::GetDirectoryName($entry.DestinationPath)) `
+                (New-EgResidueName -Kind 'rollback' -Member $entry.Name `
+                    -OperationId $TransactionState.OperationId)
+            $restored = Invoke-AtomicFileReplace -SourcePath $entry.BackupPath `
+                -DestinationPath $entry.DestinationPath -BackupPath $rollbackResiduePath `
+                -ExpectedSha256 $entry.PreimageSha256
+            if (-not $restored.Success) {
+                $verified = $false
+                if ([string]::IsNullOrEmpty($supportRef)) {
+                    $supportRef = 'EG_LAUNCHER_INSTALL_ROLLBACK_INCOMPLETE'
+                }
+                continue
+            }
+            # A restoration that cannot be positively verified is not treated as successful.
+            if ((Get-EgFileSha256 -Path $entry.DestinationPath) -cne $entry.PreimageSha256) {
+                $verified = $false
+                if ([string]::IsNullOrEmpty($supportRef)) {
+                    $supportRef = 'EG_LAUNCHER_INSTALL_ROLLBACK_INCOMPLETE'
+                }
+            }
+            continue
+        }
+
+        # Preimage Absent: remove exactly the destination THIS transaction created, then
+        # positively confirm it is absent again. A destination whose current content no
+        # longer matches what this transaction published means something else has taken
+        # ownership, so it is never removed.
+        if (-not (Test-Path -LiteralPath $entry.DestinationPath -PathType Leaf)) {
+            continue
+        }
+        if ((Get-EgFileSha256 -Path $entry.DestinationPath) -cne $entry.SourceSha256) {
+            $verified = $false
+            if ([string]::IsNullOrEmpty($supportRef)) {
+                $supportRef = 'EG_LAUNCHER_INSTALL_ROLLBACK_INCOMPLETE'
+            }
+            continue
+        }
+        try {
+            Remove-Item -LiteralPath $entry.DestinationPath -Force
+        }
+        catch {
+            $verified = $false
+            if ([string]::IsNullOrEmpty($supportRef)) {
+                $supportRef = 'EG_LAUNCHER_INSTALL_ROLLBACK_INCOMPLETE'
+            }
+            continue
+        }
+        if (Test-Path -LiteralPath $entry.DestinationPath -PathType Leaf) {
+            $verified = $false
+            if ([string]::IsNullOrEmpty($supportRef)) {
+                $supportRef = 'EG_LAUNCHER_INSTALL_ROLLBACK_INCOMPLETE'
+            }
+        }
+    }
+
+    # Whole-package re-verification over every prepared member, advanced or not.
+    foreach ($entry in @($TransactionState.Members)) {
+        if ($entry.PreimageState -ceq 'Existing') {
+            if ((Get-EgFileSha256 -Path $entry.DestinationPath) -cne $entry.PreimageSha256) {
+                $verified = $false
+                if ([string]::IsNullOrEmpty($supportRef)) {
+                    $supportRef = 'EG_LAUNCHER_INSTALL_ROLLBACK_INCOMPLETE'
+                }
+            }
+        }
+        elseif (Test-Path -LiteralPath $entry.DestinationPath -PathType Leaf) {
+            $verified = $false
+            if ([string]::IsNullOrEmpty($supportRef)) {
+                $supportRef = 'EG_LAUNCHER_INSTALL_ROLLBACK_INCOMPLETE'
+            }
+        }
+    }
+
+    if ($verified) {
+        $supportRef = ''
+    }
+    elseif ([string]::IsNullOrEmpty($supportRef)) {
+        $supportRef = 'EG_LAUNCHER_INSTALL_ROLLBACK_INCOMPLETE'
+    }
+
+    [pscustomobject]@{
+        Verified   = $verified
+        SupportRef = $supportRef
+    }
+}
+
 function New-EgOperationId {
     # The installer transaction identifier used in the Class B operation-id field. One per
     # installer invocation. -ValidateOnly generates none, because it creates no residue and

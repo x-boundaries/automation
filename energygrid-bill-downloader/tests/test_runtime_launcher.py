@@ -614,6 +614,93 @@ switch ($Op) {
             deterministic   = ($serialised -ceq $again)
         } | ConvertTo-Json -Depth 8 -Compress
     }
+    'rollback' {
+        # A scratch installer harness. It dot-sources the library and drives the publish
+        # primitives with a deliberately WRONG -ExpectedSha256, which is a legitimate
+        # caller error and the only way to produce a genuine Case B (a File.Replace that
+        # returned while verification failed) without adding a test-only branch, a mock
+        # seam, or a compatibility fallback to production code.
+        #
+        # -Value selects the variant: 'caseb' drives Case B and then rolls back;
+        # 'unrecoverable' deletes the retained backup out from under the transaction first.
+        $memberName = 'launcher_lib.ps1'
+        $destination = Join-Path $Dir $memberName
+        $utf8 = New-Object System.Text.UTF8Encoding($false)
+        [System.IO.File]::WriteAllText($destination, 'PREIMAGE-BYTES', $utf8)
+        $preimageSha = Get-EgFileSha256 -Path $destination
+
+        $operationId = New-EgOperationId
+        $stagingPath = Join-Path $Dir (New-EgResidueName -Kind 'staging' -Member $memberName -OperationId $operationId)
+        $backupPath = Join-Path $Dir (New-EgResidueName -Kind 'backup' -Member $memberName -OperationId $operationId)
+        [System.IO.File]::WriteAllText($stagingPath, 'ADVANCED-BYTES', $utf8)
+        $stagingSha = Get-EgFileSha256 -Path $stagingPath
+
+        $published = Invoke-AtomicFileReplace -SourcePath $stagingPath `
+            -DestinationPath $destination -BackupPath $backupPath `
+            -ExpectedSha256 '2222222222222222222222222222222222222222222222222222222222222222'
+
+        $transaction = New-EgTransactionState -OperationId $operationId
+        $entry = New-EgTransactionMember -Name $memberName -DestinationPath $destination `
+            -PreimageState 'Existing' -PreimageSha256 $preimageSha `
+            -StagingPath $stagingPath -BackupPath $backupPath -SourceSha256 $stagingSha
+        $entry.PublicationOccurred = $published.PublicationOccurred
+        $entry.BackupCreated = $published.BackupCreated
+        $transaction.Members = $transaction.Members + $entry
+
+        if ($Value -eq 'unrecoverable') {
+            if (Test-Path -LiteralPath $backupPath -PathType Leaf) {
+                Remove-Item -LiteralPath $backupPath -Force
+            }
+        }
+
+        $touched = @(Get-EgTouchedSet -TransactionState $transaction)
+        $rollback = Invoke-EgPackageRollback -TransactionState $transaction
+
+        $rollbackResidue = @()
+        foreach ($item in @(Get-ChildItem -LiteralPath $Dir -Force)) {
+            if ((Test-EgResidueName -Name $item.Name).Kind -ceq 'rollback') {
+                $rollbackResidue = $rollbackResidue + $item.Name
+            }
+        }
+
+        [ordered]@{
+            publishSuccess       = $published.Success
+            publishSupportRef    = $published.SupportRef
+            publicationOccurred  = $published.PublicationOccurred
+            backupCreated        = $published.BackupCreated
+            touchedCount         = $touched.Count
+            touchedNames         = @($touched | ForEach-Object { $_.Name })
+            rollbackVerified     = $rollback.Verified
+            rollbackSupportRef   = $rollback.SupportRef
+            preimageSha          = $preimageSha
+            destinationSha       = (Get-EgFileSha256 -Path $destination)
+            destinationText      = ''
+            backupStillThere     = (Test-Path -LiteralPath $backupPath -PathType Leaf)
+            rollbackResidueCount = @($rollbackResidue).Count
+        } | ConvertTo-Json -Depth 8 -Compress
+    }
+    'touchedorder' {
+        # Membership of the touched set is decided by PublicationOccurred, NOT by which
+        # member failed, and the walk order is REVERSE publication order.
+        $operationId = New-EgOperationId
+        $transaction = New-EgTransactionState -OperationId $operationId
+        foreach ($name in (Get-EgPublicationOrder)) {
+            $entry = New-EgTransactionMember -Name $name `
+                -DestinationPath (Join-Path $Dir $name) -PreimageState 'Absent'
+            $entry.PublicationOccurred = $true
+            $transaction.Members = $transaction.Members + $entry
+        }
+        $notAdvanced = New-EgTransactionMember -Name $script:EgManifestFileName `
+            -DestinationPath (Join-Path $Dir $script:EgManifestFileName) -PreimageState 'Absent'
+        $notAdvanced.PublicationOccurred = $false
+        $transaction.Members = $transaction.Members + $notAdvanced
+
+        $touched = @(Get-EgTouchedSet -TransactionState $transaction)
+        [ordered]@{
+            publicationOrder = @(Get-EgPublicationOrder)
+            touchedNames     = @($touched | ForEach-Object { $_.Name })
+        } | ConvertTo-Json -Depth 8 -Compress
+    }
     default {
         throw ('unknown probe operation: ' + $Op)
     }
@@ -2602,49 +2689,6 @@ class InstallerTransactionTierA(InstallerTransactionMixin, TierABase):
             for name, entry in described.items():
                 self.assertEqual(sha256_of(root / name), entry["sha256"])
 
-    def test_existing_member_backups_survive_every_per_file_verification(self):
-        """EGRT-T45: a retained preimage backup exists for every Existing member.
-
-        Proven at a point BEFORE Phase 4 acceptance by holding the manifest destination
-        with an exclusive share from another process, which fails Phase 3. The executable
-        members have advanced and their backups must still be on disk, because authority
-        to reap belongs to the Phase 4 commit step and to nothing else.
-        """
-        with TemporaryScratch() as tmp:
-            checkout, commit = build_scratch_checkout(tmp)
-            root = tmp / "launcher_root"
-            root.mkdir()
-            first = run_installer(ANY_PS, checkout, root, commit)
-            self.assertEqual(0, first.returncode, first.stderr)
-
-            # A second, DIFFERENT source revision, so both executables actually publish.
-            runtime = checkout / "energygrid-bill-downloader" / "runtime"
-            (runtime / "launcher.ps1").write_text(
-                SCRATCH_LAUNCHER_SOURCE + "# revised\r\n", encoding="utf-8", newline=""
-            )
-            (runtime / "launcher_lib.ps1").write_text(
-                SCRATCH_LIB_SOURCE + "# revised\r\n", encoding="utf-8", newline=""
-            )
-            run_git(checkout, "add", "-A")
-            run_git(checkout, "commit", "-m", "revised runtime source")
-            revised = run_git(checkout, "rev-parse", "HEAD").stdout.strip()
-
-            with ExclusiveLockHolder(ANY_PS, tmp, root / MANIFEST_FILE_NAME):
-                completed = run_installer(ANY_PS, checkout, root, revised)
-
-            self.assertNotEqual(
-                0, completed.returncode,
-                "a Phase 3 manifest failure must not be reported as success",
-            )
-            backups = class_b_entries(root, "backup")
-            for member in MANIFEST_MEMBER_NAMES:
-                with self.subTest(member=member):
-                    self.assertTrue(
-                        any(("--%s--" % member) in name for name in backups),
-                        "no retained backup for %s; backups present: %r"
-                        % (member, backups),
-                    )
-
     def test_an_admission_commit_that_is_not_the_checkout_head_is_refused(self):
         """-AdmissionCommit is the operator-controlled admission lane and is verified."""
         with TemporaryScratch() as tmp:
@@ -2708,6 +2752,329 @@ class DeployableSourceSetStaticGuard(TierCBase):
             result["forbiddenCount"],
             "Get-EgDeployableSourceSet must not enumerate the runtime directory",
         )
+
+
+def revise_scratch_source(checkout, suffix="# revised\r\n"):
+    """Advance the scratch checkout to a new commit with different runtime source bytes."""
+    runtime = checkout / "energygrid-bill-downloader" / "runtime"
+    (runtime / "launcher.ps1").write_text(
+        SCRATCH_LAUNCHER_SOURCE + suffix, encoding="utf-8", newline=""
+    )
+    (runtime / "launcher_lib.ps1").write_text(
+        SCRATCH_LIB_SOURCE + suffix, encoding="utf-8", newline=""
+    )
+    run_git(checkout, "add", "-A")
+    run_git(checkout, "commit", "-m", "revised runtime source")
+    return run_git(checkout, "rev-parse", "HEAD").stdout.strip()
+
+
+def set_read_only(path, read_only=True):
+    """Set or clear the read-only attribute on a scratch file."""
+    import stat
+
+    path = Path(path)
+    mode = path.stat().st_mode
+    if read_only:
+        path.chmod(mode & ~stat.S_IWRITE)
+    else:
+        path.chmod(mode | stat.S_IWRITE)
+
+
+def snapshot_package(root):
+    """Record the exact state of the three package members in a launcher root."""
+    root = Path(root)
+    state = {}
+    for name in CLASS_A_MEMBER_NAMES:
+        member = root / name
+        if member.is_file():
+            state[name] = ("file", sha256_of(member))
+        elif member.is_dir():
+            state[name] = ("directory", "")
+        else:
+            state[name] = ("absent", "")
+    return state
+
+
+def assert_no_forbidden_end_state(case, root, pre_transaction):
+    """The four end states design section 6.5 declares unreachable.
+
+    A new launcher with an old library, an old launcher with a new library, executable
+    files that disagree with the manifest, or a manifest describing bytes that are not
+    installed.
+    """
+    root = Path(root)
+    observed = snapshot_package(root)
+    failures = []
+
+    launcher_changed = observed["launcher.ps1"] != pre_transaction["launcher.ps1"]
+    lib_changed = observed["launcher_lib.ps1"] != pre_transaction["launcher_lib.ps1"]
+    if launcher_changed != lib_changed:
+        failures.append(
+            "mixed installation: launcher.ps1 changed=%s, launcher_lib.ps1 changed=%s"
+            % (launcher_changed, lib_changed)
+        )
+
+    manifest_path = root / MANIFEST_FILE_NAME
+    if manifest_path.is_file():
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except ValueError:
+            manifest = None
+        if manifest is not None and isinstance(manifest.get("members"), list):
+            for entry in manifest["members"]:
+                member = root / entry.get("name", "")
+                if not member.is_file():
+                    failures.append(
+                        "manifest describes bytes that are not installed: %r"
+                        % entry.get("name")
+                    )
+                elif sha256_of(member) != entry.get("sha256"):
+                    failures.append(
+                        "installed bytes disagree with the manifest: %r"
+                        % entry.get("name")
+                    )
+    if failures:
+        raise AssertionError("%s reached a forbidden end state: %s" % (case, failures))
+
+
+class InstallerOwnedPackageRollback(TierABase):
+    """Task 11: design sections 6.5 and 7.2.1.
+
+    The installer transaction is the ONLY rollback authority in this design. Neither
+    publish primitive restores anything: they publish and report, and the installer
+    decides. That single-owner rule is what keeps reverse-order restoration correct,
+    because only the installer knows which members advanced and in what order.
+    """
+
+    def test_the_touched_set_is_reverse_publication_order_and_excludes_non_advanced(self):
+        """Membership is decided by PublicationOccurred, not by which member failed."""
+        with TemporaryScratch() as tmp:
+            work = tmp / "work"
+            work.mkdir()
+            observed = probe_json(ANY_PS, "touchedorder", tmp, dir=work)
+        self.assertEqual(["launcher_lib.ps1", "launcher.ps1"], observed["publicationOrder"])
+        self.assertEqual(
+            ["launcher.ps1", "launcher_lib.ps1"],
+            observed["touchedNames"],
+            "rollback walks the touched set in REVERSE publication order",
+        )
+        self.assertNotIn(
+            MANIFEST_FILE_NAME,
+            observed["touchedNames"],
+            "a member that did not advance is not in the touched set",
+        )
+
+    def test_a_returned_replace_with_a_wrong_expected_hash_rolls_back_to_the_preimage(self):
+        """EGRT-T12: a genuine Case B, restored by the installer and positively verified.
+
+        -ExpectedSha256 is a mandatory PRODUCTION parameter, not a test hook. Passing a
+        deliberately wrong value is a legitimate caller error, which is what lets this case
+        exercise installer-owned rollback against a member that really did advance.
+        """
+        with TemporaryScratch() as tmp:
+            work = tmp / "work"
+            work.mkdir()
+            observed = probe_json(ANY_PS, "rollback", tmp, dir=work, value="caseb")
+
+        self.assertFalse(observed["publishSuccess"])
+        self.assertEqual(
+            "EG_LAUNCHER_REPLACE_POSTIMAGE_MISMATCH", observed["publishSupportRef"]
+        )
+        self.assertTrue(
+            observed["publicationOccurred"], "Case B means the destination advanced"
+        )
+        self.assertTrue(observed["backupCreated"])
+        self.assertEqual(1, observed["touchedCount"])
+
+        self.assertTrue(observed["rollbackVerified"], observed["rollbackSupportRef"])
+        self.assertEqual("", observed["rollbackSupportRef"])
+        self.assertEqual(
+            observed["preimageSha"],
+            observed["destinationSha"],
+            "the destination is restored to the EXACT recorded preimage",
+        )
+        self.assertGreaterEqual(
+            observed["rollbackResidueCount"],
+            1,
+            "restoring through the explicit-backup path retains the advanced bytes as "
+            "recognised rollback residue",
+        )
+
+    def test_an_unrecoverable_advanced_member_is_not_reported_as_rolled_back(self):
+        """PublicationOccurred true with no backup on disk is the one unrecoverable state."""
+        with TemporaryScratch() as tmp:
+            work = tmp / "work"
+            work.mkdir()
+            observed = probe_json(ANY_PS, "rollback", tmp, dir=work, value="unrecoverable")
+        self.assertTrue(observed["publicationOccurred"])
+        self.assertFalse(observed["backupStillThere"])
+        self.assertFalse(
+            observed["rollbackVerified"],
+            "a restoration that cannot be positively verified is not successful",
+        )
+        self.assertEqual(
+            "EG_LAUNCHER_REPLACE_PREIMAGE_UNRECOVERABLE",
+            observed["rollbackSupportRef"],
+        )
+
+
+class InstallerRollbackAgainstTheRealInstaller(TierABase):
+    """Task 11: rollback driven through the committed installer entry script."""
+
+    def test_first_install_failure_returns_created_destinations_to_absent(self):
+        """EGRT-T42: every newly created owned destination is removed and confirmed absent.
+
+        A destination whose preimage was Absent is removed after a verified rollback and
+        is NOT kept behind for diagnosis.
+        """
+        with TemporaryScratch() as tmp:
+            checkout, commit = build_scratch_checkout(tmp)
+            root = tmp / "launcher_root"
+            root.mkdir()
+            # An entry occupying the second-published member's path makes its no-replace
+            # move fail after the first member has already advanced.
+            (root / "launcher.ps1").mkdir()
+            pre = snapshot_package(root)
+
+            completed = run_installer(ANY_PS, checkout, root, commit)
+            status = installer_status(completed)
+
+            self.assertEqual(EXIT_INSTALL_ROLLED_BACK, completed.returncode,
+                             "%s\n%s" % (completed.stdout, completed.stderr))
+            self.assertEqual("FAILED_ROLLED_BACK", status["status"])
+            self.assertFalse(
+                (root / "launcher_lib.ps1").exists(),
+                "the member this transaction created must be removed and confirmed absent",
+            )
+            self.assertFalse((root / MANIFEST_FILE_NAME).exists())
+            self.assertTrue(
+                (root / "launcher.ps1").is_dir(),
+                "the installer never removes an entry it did not create",
+            )
+            assert_no_forbidden_end_state("first-install failure", root, pre)
+
+    def test_a_later_member_failure_restores_every_earlier_member_byte_for_byte(self):
+        """EGRT-T43: the earlier member's post-rollback bytes equal its pre-transaction bytes."""
+        with TemporaryScratch() as tmp:
+            checkout, commit = build_scratch_checkout(tmp)
+            root = tmp / "launcher_root"
+            root.mkdir()
+            first = run_installer(ANY_PS, checkout, root, commit)
+            self.assertEqual(0, first.returncode, first.stderr)
+
+            revised = revise_scratch_source(checkout)
+            pre = snapshot_package(root)
+            original_lib = (root / "launcher_lib.ps1").read_bytes()
+
+            # A read-only destination on the SECOND published member is a genuine Case A
+            # mid-package failure: it throws before publication and does not advance.
+            set_read_only(root / "launcher.ps1", True)
+            try:
+                completed = run_installer(ANY_PS, checkout, root, revised)
+            finally:
+                set_read_only(root / "launcher.ps1", False)
+
+            status = installer_status(completed)
+            self.assertEqual(EXIT_INSTALL_ROLLED_BACK, completed.returncode,
+                             "%s\n%s" % (completed.stdout, completed.stderr))
+            self.assertEqual("FAILED_ROLLED_BACK", status["status"])
+            self.assertEqual(
+                original_lib,
+                (root / "launcher_lib.ps1").read_bytes(),
+                "the earlier member must be restored byte for byte",
+            )
+            self.assertEqual(pre, snapshot_package(root))
+            assert_no_forbidden_end_state("later-member failure", root, pre)
+
+    def test_manifest_failure_rolls_back_executables_and_restores_the_prior_manifest(self):
+        """EGRT-T44: with a pre-existing manifest it is restored to its preimage."""
+        with TemporaryScratch() as tmp:
+            checkout, commit = build_scratch_checkout(tmp)
+            root = tmp / "launcher_root"
+            root.mkdir()
+            first = run_installer(ANY_PS, checkout, root, commit)
+            self.assertEqual(0, first.returncode, first.stderr)
+
+            revised = revise_scratch_source(checkout)
+            pre = snapshot_package(root)
+
+            set_read_only(root / MANIFEST_FILE_NAME, True)
+            try:
+                completed = run_installer(ANY_PS, checkout, root, revised)
+            finally:
+                set_read_only(root / MANIFEST_FILE_NAME, False)
+
+            status = installer_status(completed)
+            self.assertEqual(EXIT_INSTALL_ROLLED_BACK, completed.returncode,
+                             "%s\n%s" % (completed.stdout, completed.stderr))
+            self.assertEqual("FAILED_ROLLED_BACK", status["status"])
+            self.assertEqual(
+                pre,
+                snapshot_package(root),
+                "the entire package must equal its pre-transaction state",
+            )
+            assert_no_forbidden_end_state("manifest failure", root, pre)
+
+    def test_manifest_failure_on_a_clean_install_confirms_the_manifest_absent_again(self):
+        """EGRT-T44: with no pre-existing manifest, the destination is confirmed absent."""
+        with TemporaryScratch() as tmp:
+            checkout, commit = build_scratch_checkout(tmp)
+            root = tmp / "launcher_root"
+            root.mkdir()
+            (root / MANIFEST_FILE_NAME).mkdir()
+            pre = snapshot_package(root)
+
+            completed = run_installer(ANY_PS, checkout, root, commit)
+            status = installer_status(completed)
+
+            self.assertEqual(EXIT_INSTALL_ROLLED_BACK, completed.returncode,
+                             "%s\n%s" % (completed.stdout, completed.stderr))
+            self.assertEqual("FAILED_ROLLED_BACK", status["status"])
+            self.assertFalse((root / "launcher.ps1").exists())
+            self.assertFalse((root / "launcher_lib.ps1").exists())
+            self.assertTrue((root / MANIFEST_FILE_NAME).is_dir())
+            self.assertEqual(pre, snapshot_package(root))
+            assert_no_forbidden_end_state("clean-install manifest failure", root, pre)
+
+    def test_existing_member_backups_survive_every_per_file_verification(self):
+        """EGRT-T45: the preimage backup is still present when rollback needs it.
+
+        Restoring every Existing member to its exact preimage is only possible because the
+        retained backup was still on disk when rollback ran, which proves the backup
+        survived every per-file verification and was not reaped before acceptance.
+        Authority to reap belongs to the Phase 4 commit step and to nothing else.
+        """
+        with TemporaryScratch() as tmp:
+            checkout, commit = build_scratch_checkout(tmp)
+            root = tmp / "launcher_root"
+            root.mkdir()
+            first = run_installer(ANY_PS, checkout, root, commit)
+            self.assertEqual(0, first.returncode, first.stderr)
+
+            revised = revise_scratch_source(checkout)
+            pre = snapshot_package(root)
+
+            set_read_only(root / MANIFEST_FILE_NAME, True)
+            try:
+                completed = run_installer(ANY_PS, checkout, root, revised)
+            finally:
+                set_read_only(root / MANIFEST_FILE_NAME, False)
+
+            self.assertEqual(EXIT_INSTALL_ROLLED_BACK, completed.returncode,
+                             "%s\n%s" % (completed.stdout, completed.stderr))
+            self.assertEqual(
+                pre,
+                snapshot_package(root),
+                "both executables were restored, which required their retained backups",
+            )
+            rollback_residue = class_b_entries(root, "rollback")
+            for member in MANIFEST_MEMBER_NAMES:
+                with self.subTest(member=member):
+                    self.assertTrue(
+                        any(("--%s--" % member) in name for name in rollback_residue),
+                        "no rollback residue for %s, so no backup was consumed to restore "
+                        "it; residue present: %r" % (member, rollback_residue),
+                    )
 
 
 if __name__ == "__main__":

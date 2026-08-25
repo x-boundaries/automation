@@ -312,6 +312,19 @@ if ($stagingOk) {
     }
 }
 
+# The manifest joins the transaction record here, in Phase 1, rather than in Phase 3. It is
+# a package member, so the whole-package re-verification rollback performs must know its
+# preimage even when the transaction fails before the manifest is ever published.
+if ($stagingOk) {
+    $manifestMemberEntry = New-EgTransactionMember -Name $script:EgManifestFileName `
+        -DestinationPath $manifestDestination `
+        -PreimageState $preimages[$script:EgManifestFileName].PreimageState `
+        -PreimageSha256 $preimages[$script:EgManifestFileName].PreimageSha256 `
+        -StagingPath $manifestStagingPath -BackupPath $manifestBackupPath `
+        -SourceSha256 $manifestStagingSha
+    $transaction.Members = $transaction.Members + $manifestMemberEntry
+}
+
 if (-not $stagingOk) {
     # A staging failure is still pre-mutation with respect to the installed package: no
     # destination has advanced. Staging residue is retained for inspection and carries a
@@ -333,6 +346,7 @@ $failureRef = ''
 $transactionFailed = $false
 
 foreach ($entry in $transaction.Members) {
+    if ($entry.Name -ceq $script:EgManifestFileName) { continue }
     $published = $null
     if ($entry.PreimageState -ceq 'Existing') {
         $published = Invoke-AtomicFileReplace -SourcePath $entry.StagingPath `
@@ -368,13 +382,10 @@ foreach ($entry in $transaction.Members) {
 # other member's.
 
 if (-not $transactionFailed) {
-    $manifestEntry = New-EgTransactionMember -Name $script:EgManifestFileName `
-        -DestinationPath $manifestDestination `
-        -PreimageState $preimages[$script:EgManifestFileName].PreimageState `
-        -PreimageSha256 $preimages[$script:EgManifestFileName].PreimageSha256 `
-        -StagingPath $manifestStagingPath -BackupPath $manifestBackupPath `
-        -SourceSha256 $manifestStagingSha
-    $transaction.Members = $transaction.Members + $manifestEntry
+    $manifestEntry = $null
+    foreach ($entry in $transaction.Members) {
+        if ($entry.Name -ceq $script:EgManifestFileName) { $manifestEntry = $entry }
+    }
 
     $publishedManifest = $null
     if ($manifestEntry.PreimageState -ceq 'Existing') {
@@ -436,19 +447,38 @@ if (-not $transactionFailed) {
 }
 
 # --------------------------------------------------------------------------------------
-# Failure before acceptance
+# Failure before acceptance: installer-owned package rollback
 # --------------------------------------------------------------------------------------
-# Installer-owned package rollback is added by the next task. Until then a pre-acceptance
-# failure is reported fail-closed as requiring manual owner action, and every artefact is
-# retained for inspection. It is never reported as a success and never silently abandoned.
+# Any failure after the first destination mutation and before package acceptance triggers
+# reverse-order rollback over the touched set. None of the outcomes below is permitted to
+# leave a new launcher with an old library, an old launcher with a new library, executable
+# files that disagree with the manifest, or a manifest describing bytes that are not
+# installed.
 
 if ($transactionFailed) {
     if ([string]::IsNullOrEmpty($failureRef)) {
         $failureRef = 'EG_LAUNCHER_UNCLASSIFIED'
     }
+
+    $rollback = Invoke-EgPackageRollback -TransactionState $transaction
     $retained = @(Get-ChildItem -LiteralPath $resolvedLauncherRoot -Force |
         Where-Object { (Test-EgResidueName -Name $_.Name).Kind -ceq 'backup' })
-    Write-EgInstallerStatus -Status 'FAILED_ROLLBACK_INCOMPLETE' -SupportRef $failureRef `
+
+    if ($rollback.Verified) {
+        # The reported reference is the failure that ENDED the transaction, not the rollback
+        # itself, because the rollback succeeded and the operator needs to know what failed.
+        Write-EgInstallerStatus -Status 'FAILED_ROLLED_BACK' -SupportRef $failureRef `
+            -BackupsRemaining @($retained).Count
+        exit $script:EgLauncherExitCodes['InstallRolledBack']
+    }
+
+    # Rollback could not be positively verified. The installer stops rather than attempting
+    # further repair, and every artefact is retained for inspection.
+    $incompleteRef = $rollback.SupportRef
+    if ([string]::IsNullOrEmpty($incompleteRef)) {
+        $incompleteRef = 'EG_LAUNCHER_INSTALL_ROLLBACK_INCOMPLETE'
+    }
+    Write-EgInstallerStatus -Status 'FAILED_ROLLBACK_INCOMPLETE' -SupportRef $incompleteRef `
         -BackupsRemaining @($retained).Count
     exit $script:EgLauncherExitCodes['InstallRollbackIncomplete']
 }
