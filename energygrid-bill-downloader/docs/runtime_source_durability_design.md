@@ -1323,7 +1323,9 @@ Migration proceeds in this order.
 
 1. **Record the baseline.** Under owner control, record the SHA-256 of the installed
    launcher and of the `.energygrid-launcher.run119a1.rollback` artefact, privately on
-   the host. Both are expected to be the accepted preimage.
+   the host. Both are expected to be the accepted preimage. That recorded hash is the
+   reference the recovery copy is verified against in step 7, so recording it is a
+   precondition of the sequence rather than a formality.
 2. **Reconcile behaviour.** Compare the installed launcher's behaviour to the
    source-controlled implementation, and classify every difference as one of: reusable
    and non-secret, so it moves into the repository; host-specific, so it moves into the
@@ -1332,34 +1334,117 @@ Migration proceeds in this order.
    migration.
 3. **Publish.** Merge the implementation, which by then encodes every reusable
    behaviour from step 2.
-4. **Validate.** Run `install_or_update_launcher.ps1 -ValidateOnly` on the host and
-   confirm its checks pass against the real deployment. The launcher's own
-   `-ValidateOnly` is deferred to step 7 for the reason in the note below.
+4. **Validate the installer.** Run `install_or_update_launcher.ps1 -ValidateOnly` on the
+   host and confirm its checks pass against the real deployment. The launcher's own
+   `-ValidateOnly` is deferred to step 9, for the reason in section 15.4.
 5. **Install under approval.** Perform the first source-controlled installation through
    the sanctioned installer, per section 14.
 6. **Verify the installed bytes.** Confirm each installed member's hash matches the
    reviewed source hash and that the manifest reads back correctly. This is a direct
    hash comparison and does not depend on the launcher running.
-7. **Retire the bridge artefact.** Only after step 6, and only under a separate explicit
-   approval naming the artefact, may `.energygrid-launcher.run119a1.rollback` be removed.
-   It is the last remaining rollback to the accepted preimage until then, so it is
-   retained through every earlier step.
-8. **Verify the launcher.** Run `launcher.ps1 -ValidateOnly` and confirm every check
-   passes.
+7. **Hold the recovery copy outside the launcher root.** Under a separate explicit
+   approval, place a copy of the historical artefact at the owner-controlled recovery
+   holding location of section 15.1, and positively verify it as section 15.2 requires.
+   Nothing inside the launcher root changes in this step.
+8. **Retire the in-root artefact.** Only after that external copy has been positively
+   verified, and only under a separate explicit approval naming the artefact, may
+   `.energygrid-launcher.run119a1.rollback` be removed from the launcher root.
+   Afterwards, positively confirm it is absent.
+9. **Verify the launcher.** Run `launcher.ps1 -ValidateOnly` and confirm every check
+   passes. The verified external recovery copy still exists throughout this step, and
+   that is the point of the ordering.
+10. **Retire the recovery copy.** Only after step 9 has passed does the external copy
+    become eligible for retirement. Removing it is a separate owner-controlled cleanup
+    action, never an automatic consequence of a passing validation.
 
-**Why the launcher check moved after retirement.** The Run119 artefact predates the
-reserved residue contract and does not satisfy it: its name begins `.energygrid-launcher.`
-rather than the reserved `.eglauncher-` prefix, and it carries no `--` delimited kind,
-member, and transaction fields. Section 6.7 therefore classifies it as Class C, and the
-launcher fails closed while it is present. That is the correct behaviour for an
-unrecognised file beside the launcher, and it is not a reason to widen the Class B parser
-to accommodate one historical artefact.
+### 15.1 The migration recovery holding location
 
-The consequence is only an ordering one, and the safety property is unchanged: the
-artefact is still retained until the new package is verified present and correct by hash
-at step 6, and it is still removed only under its own explicit approval. What changed is
-that the launcher's own preflight is confirmed at step 8, after retirement, instead of
-before it.
+The recovery copy lives in a location this repository describes but never names. Git owns
+the procedure; the server owns the path.
+
+- It is owner-controlled private deployment state on the host.
+- It resolves outside the launcher root, and outside the deployed Git checkout.
+- It is never committed. This document records no default, no example value, and no
+  hard-coded absolute path for it, in keeping with section 3.3 and section 17.1.
+- It is selected and supplied only at the later, separately authorised live migration. It
+  does not exist as a standing host location.
+- It is outside the classification domain of section 6.7, because that domain is the
+  launcher root and nothing else. Holding the copy outside the root is precisely what
+  lets it survive without becoming a Class C entry, and it is why no Class B exception is
+  needed for it.
+- No committed script gains a parameter for it. The installer parameter surface in
+  section 6.1 is unchanged and still has no cleanup or recovery parameter; the transfer is
+  an approved owner action, not an installer feature.
+
+### 15.2 Safe transfer, verified before removal
+
+The order of operations matters more than the mechanism.
+
+1. The accepted-preimage SHA-256 is already recorded under owner control, from step 1.
+2. Under the separate live approval, create the copy at the approved private holding path.
+3. Never overwrite an existing destination. An unexpectedly present destination means the
+   holding path was not what the operator believed it was, and that is terminal rather
+   than something to resolve by overwriting.
+4. Re-read the external copy from disk and hash it.
+5. That hash must equal the recorded accepted-preimage SHA-256 exactly.
+6. Only after that positive byte-for-byte verification may the in-root artefact be
+   removed.
+7. Positively confirm the in-root Class C artefact is absent afterwards.
+
+If the copy cannot be created, or cannot be verified, the migration fails closed: the
+original in-root artefact is left untouched, `launcher.ps1 -ValidateOnly` is not run, and
+the sequence stops for owner attention. The design never depends on an unverified copy,
+and a copy that cannot be verified is treated as no copy at all.
+
+### 15.3 What the recovery copy is, and what a failed validation does
+
+The copy is a byte-identical copy of the accepted pre-migration launcher preimage, held as
+bounded migration recovery material. Stating what it is not matters just as much:
+
+- it is not Class B transaction residue, and the Class B parser is not involved in
+  recognising it;
+- it is not a member of the new three-member installed package;
+- it is never executed, dot-sourced, imported, or selected as a fallback from the holding
+  location, or from anywhere else;
+- it does not alter, relax, or participate in launcher-root classification;
+- it remains private deployment state and never enters Git.
+
+**Retaining a copy is not a rollback.** Holding a verified copy preserves the option to
+recover; it performs no restoration and asserts no automatic recovery. Claiming otherwise
+would be the same category of error as treating a hash comparison as functional proof.
+
+If step 9 fails, the sequence stops with the external copy retained and nothing restored.
+Recovery from that state is a new live mutation: it requires explicit current owner
+authority, and that later gate must define the complete safe pre-migration topology it is
+restoring, including the intended installed-launcher content, the intended launcher-root
+state, and the scheduler position. This design change neither performs nor authorises that
+restoration. A failed validation is never automatically converted into an unreviewed
+rollback mutation.
+
+### 15.4 Why the launcher check follows retirement
+
+The Run119 artefact predates the reserved residue contract and does not satisfy it: its
+name begins `.energygrid-launcher.` rather than the reserved `.eglauncher-` prefix, and it
+carries no `--` delimited kind, member, and transaction fields. Section 6.7 therefore
+classifies it as Class C, and the launcher fails closed while it is present. That is the
+correct behaviour for an unrecognised file beside the launcher, and it is not a reason to
+widen the Class B parser to accommodate one historical artefact.
+
+What an earlier ordering of this section got wrong was treating step 6 as sufficient cover
+for retiring the artefact. Byte verification proves the installed members are the reviewed
+bytes; it does not prove the launcher works against the real host. Section 5.2
+additionally gates on the private configuration, the interpreter version, governed source
+integrity over the runtime-critical surface, browser-cache readiness, the launcher-root
+ACL, reparse-point, and read-only expectations, and the DPAPI credential import. None of
+those is detectable by a hash comparison, so retiring the last accepted-preimage copy
+before `launcher.ps1 -ValidateOnly` removed the recovery asset before the first evidence
+that the new package actually functions.
+
+Steps 7 to 10 close that window without weakening anything. The copy moves out of the
+classification domain instead of being destroyed, so all three properties hold together:
+the launcher still fails closed on the in-root Class C artefact, the launcher still proves
+its own preflight against the real host, and a verified way back still exists while that
+proof is being obtained.
 
 ## 16. Recovery And Disaster-Rebuild Procedure
 
@@ -1370,6 +1455,13 @@ private launcher and settings paths, the private application configuration, and 
 approved Python and browser installation. It needs no GitHub issue comment, no chat
 history, no retired bridge, no `%TEMP%` script, and no recollection of the original
 server setup.
+
+The migration recovery copy of section 15.1 is deliberately not part of this procedure.
+It is bounded migration material with a defined end of life at section 15 step 10, and the
+steady-state rebuild must never acquire a dependency on it, on the Run119 artefact it
+copies, or on any other retired bridge residue. Once migration is final, a clean-host
+rebuild still requires only the reviewed Git source plus separately provisioned private
+host state, exactly as stated above.
 
 Everything reusable and secret-free that the rebuild depends on comes from the
 repository: importing the credential, injecting it at process scope, restoring and
@@ -1505,6 +1597,7 @@ prohibited. Only the behaviour they proved is carried forward, in the form above
 | `EGRT-D05` | No unresolved `TBD`, `TODO`, or placeholder remains |
 | `EGRT-D06` | Option 2 is preserved exactly: Git canonical for reusable non-secret runtime behaviour, the server canonical for private deployment state |
 | `EGRT-D07` | Both Run119 defects appear as reusable requirements with named regression assertions, not as historical notes |
+| `EGRT-D08` | The migration sequence retains a positively SHA-256-verified accepted-preimage recovery copy outside the launcher-root verification domain until `launcher.ps1 -ValidateOnly` passes; the in-root historical Class C artefact is removed only after that external copy is verified, and a failed `-ValidateOnly` retains the external copy and grants no automatic restore |
 
 ### 19.2 For the later implementation change
 
@@ -1539,6 +1632,7 @@ prohibited. Only the behaviour they proved is carried forward, in the form above
 | `EGRT-I27` | Launcher-root entries are deterministically classified as exact package members, recognised installer-owned residue, or unexpected, per section 6.7 |
 | `EGRT-I28` | Manifest completeness is scoped to the deployed package while arbitrary unexpected root entries still fail closed |
 | `EGRT-I29` | Recognised installer residue never participates in execution, import, fallback, or package membership |
+| `EGRT-I30` | The implementation and runbook migration procedure encodes the `EGRT-D08` ordering and keeps four concerns clearly separate: installer transaction backup cleanup, migration recovery holding, launcher functional validation, and later separately authorised recovery-copy retirement or restoration |
 
 Acceptance of this document is an architectural decision only. It does not approve the
 implementation change, the first installation, the scheduler, or any live run. Each of
