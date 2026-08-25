@@ -6,22 +6,32 @@ later, separately approved implementation change must follow.
 
 Design lock: `DL-XB-141-RUNTIME-005-SOURCE-DURABILITY`.
 Controlling specification: `energygrid-bill-downloader/docs/runtime_source_durability_design.md`.
-Canonical base at authoring time: `main` at
-`0e3d53c57682e345d2889b7f9e860c658ee450c0`, tree
-`d306d0162ea217fd1f97cb4c86c785af6a025909`, sole parent
-`e43efacfbd2016873ac78720c3a6874b3268910d`.
+Current canonical authority for this plan: `main` at
+`2c42725dd3c717828153f7efe5aec10663ba1cd7`, tree
+`084f90a8b408b78e6767ae1ca09f3c4579bb306d`, sole parent
+`0e3d53c57682e345d2889b7f9e860c658ee450c0`.
+
+Provenance, stated exactly rather than implied. This plan was first authored against the
+earlier canonical base `main` `0e3d53c57682e345d2889b7f9e860c658ee450c0`, tree
+`d306d0162ea217fd1f97cb4c86c785af6a025909`. The installer-principal binding amendment to
+the controlling specification was accepted and merged afterwards as
+`2c42725dd3c717828153f7efe5aec10663ba1cd7`, current `main` was then merged into this plan
+branch, and only then was the plan reconciled to the merged specification. The original
+plan commit was not authored from `2c42725...`; reconciliation to it is this amendment.
 
 ## Goal
 
 Implement the accepted Option 2 runtime source-durability architecture so that the
 reusable, non-secret Energy@Grid launcher, installer, and runtime-binding behaviour is
 canonical in Git, is offline-regression-tested, and satisfies every acceptance criterion
-`EGRT-I01` through `EGRT-I30` and every assertion `EGRT-T01` through `EGRT-T57`, while
+`EGRT-I01` through `EGRT-I31` and every assertion `EGRT-T01` through `EGRT-T71`, while
 every private value stays on the server.
 
 The work is complete when `python -m unittest discover -s tests -v` run from
-`energygrid-bill-downloader` on Windows passes with all fifty-seven assertions present,
-and no GitHub Actions workflow has been modified.
+`energygrid-bill-downloader` on Windows passes with all seventy-one assertions present,
+and no GitHub Actions workflow has been modified. `EGRT-I31` additionally has a host half
+that hosted CI cannot prove; it is discharged by the operator step in Task 21 and is never
+claimed by Task 22.
 
 ## Architecture
 
@@ -57,10 +67,17 @@ never dot-sources an entry script and never reads a caller's `$PSScriptRoot`.
 
 The single controlling specification is
 `energygrid-bill-downloader/docs/runtime_source_durability_design.md` at canonical `main`
-`0e3d53c57682e345d2889b7f9e860c658ee450c0`. No task may weaken, broaden, reinterpret, or
+`2c42725dd3c717828153f7efe5aec10663ba1cd7`. No task may weaken, broaden, reinterpret, or
 redesign it. Where this plan resolves an implementation choice the design left open, that
 resolution is recorded in **Derived decisions** below with the design sections it follows
 from.
+
+Design section 17.2.1 is a deliberate exception to that division of labour and is read as
+prescriptive rather than as a choice left open. It states one algorithm for
+`launcher_root_not_writable_by_run_principal` and declares any substituted formulation of
+the requested access non-conforming, so this plan reproduces that algorithm instead of
+deriving one. `DD-02` and `DD-03` carry it verbatim in intent, and no task may replace it
+with a trustee-based, account-name-based, or SID-reconstructed equivalent.
 
 ## Global Constraints
 
@@ -155,16 +172,164 @@ so the executing engineer does not have to invent them.
 | ID | Decision | Derived from |
 | --- | --- | --- |
 | `DD-01` | The launcher root is the `$PSScriptRoot` of `launcher.ps1`. There is no launcher-root parameter on the launcher, and package-member paths are fixed joins of that root with the three Class A names. | 5.1 parameter table is exhaustive; 6.7 security boundary requires fixed joins |
-| `DD-02` | `launcher_root_not_writable_by_run_principal` is evaluated against the currently running identity and its group SIDs via `[System.Security.Principal.WindowsIdentity]::GetCurrent()`. No principal parameter is added. | 5.1 has no principal parameter; 17.2 says the principal is supplied at deployment, and at run time the deployed run principal is the current identity |
-| `DD-03` | `launcher_root_write_restricted_to_install_principal` asserts that every write, modify, or full-control ACE on the launcher root resolves to a well-known administrative SID: `S-1-5-32-544` (Administrators), `S-1-5-18` (SYSTEM), `S-1-3-0` (CREATOR OWNER), or a SID beginning `S-1-5-80-` (service/TrustedInstaller class). Well-known SIDs are universal, not host-specific, so nothing private is committed. | 17.2 heading "Expressed without private identities"; 3.3 host-specific values are never committed; 9.1 no private-identity default |
+| `DD-02` | `launcher_root_not_writable_by_run_principal` is the single prescribed run-token access check set out in **`DD-02` in full** below. It is evaluated against the primary access token of the process actually running `launcher.ps1`, against the launcher-root directory and against every Class A member individually. No principal parameter is added, the token is never reconstructed from an account name or a SID, and no trustee-based effective-rights formulation is permitted. | 17.2.1 evaluation steps 1 to 8, its `MAXIMUM_ALLOWED` rationale, and its "why a token and not a trustee" rule; 5.1 has no principal parameter |
+| `DD-03` | `launcher_root_write_trustees_authorised` compares every write-capable access-allowed trustee, and every examined object's owner, against the exhaustive exact-SID set supplied on `-AuthorisedLauncherRootWriteSid`, on the launcher-root directory and on every Class A member individually. Its evaluation rules are set out in **`DD-03` in full** below. There is no built-in allow-list of any kind: an administrative, SYSTEM, or service SID is accepted only where the operator supplied that exact SID. | 17.2.1 `launcher_root_write_trustees_authorised`; 17.2 retirement of the older check name; 9.1 the host-supplied SID set |
 | `DD-04` | `launcher_root_entries_classified` is not re-evaluated inside the security group. It reports the result already computed at preflight step 1, so classification runs exactly once per run. | 5.2 step 1 runs first and is terminal; 17.2 records the same property as a named check |
 | `DD-05` | The application-required configuration keys the launcher checks for are exactly `portal_url`, `account_identity`, `archive_root`, `state_path`, `temp_root`, and `log_root`. The launcher checks presence and non-empty string only; it does not re-validate the application's path rules. | 5.2 step 4; `energygrid_bill_downloader/config.py` `load_runtime_config` required set plus `_validate_url` and `_validate_account_identity` |
 | `DD-06` | The installer's real-path stdout and its `-ValidateOnly` stdout are two distinct bounded JSON shapes. `ALREADY_CURRENT` is a real-path `status`, not a validation check, so it never appears in the checks map. | 6.2 Phase 1 step 5 is a real-install outcome; section 8 defines the validation shape |
 | `DD-07` | `HResult` is emitted as a string in exact `0x%08X` form, and is the empty string when no exception occurred. `ExceptionTypeName` is likewise the empty string when no exception occurred. Both fields are always present on every result object. | 7.2 rule 5; 11.1 |
-| `DD-08` | `RETIRED_EG_LAUNCHER_SUPPORT_REFS` is introduced as an empty closed set at first implementation. The reachability test asserts both halves; the retired half is vacuously satisfied until a reference is retired. | 11.4; `cli.py` `RETIRED_SUPPORT_REFS` precedent |
+| `DD-08` | `RETIRED_EG_LAUNCHER_SUPPORT_REFS` is introduced as an empty closed set at first implementation. The reachability test asserts both halves; the retired half is vacuously satisfied until a reference is retired. This stays empty despite this amendment replacing a planned reference name: `EG_LAUNCHER_ROOT_ACL_WRITE_NOT_RESTRICTED` existed only in an earlier revision of this plan, was never implemented and never emitted by any build, so there is no earlier evidence to keep readable and nothing to retire. Task 18 instead guards it, and the retired check name, as strings that must appear nowhere. | 11.4; 17.2 retired-vocabulary rule; `cli.py` `RETIRED_SUPPORT_REFS` precedent |
 | `DD-09` | The installer transaction identifier used in the Class B `operation-id` field is generated once per installer invocation with `[guid]::NewGuid().ToString('D').ToLowerInvariant()`. `-ValidateOnly` generates none, because it creates no residue and must stay byte-deterministic. | 6.3, 6.7, section 8 determinism |
 | `DD-10` | Publication order within Phase 2 is the fixed recorded order `launcher_lib.ps1` first, then `launcher.ps1`. The library is published before the entry script that dot-sources it, so a mid-transaction crash leaves an old entry script with a new library rather than a new entry script calling a missing library function. Reverse publication order for rollback is therefore `launcher.ps1` first, then `launcher_lib.ps1`. | 6.2 Phase 2 "in a recorded order"; 6.5 reverse publication order |
 | `DD-11` | `Test-EgGovernedSourceIntegrity` detects a `.gitignore`-hidden untracked overlay by running `ls-files --others --exclude-standard` and `ls-files --others --ignored --exclude-standard` over the governed executable pathspec, then subtracting the sanctioned Python bytecode exception. Both are read-only allowlisted `ls-files` invocations. | 10.3 overlay detection and the one legitimate exception; 10.3 read-only allowlist |
+| `DD-12` | The value supplied on `-AuthorisedLauncherRootWriteSid` is admitted by `Test-EgAuthorisedWriteSidSet` before either launcher-root write check runs. The set must be non-empty, every element must parse as a `System.Security.Principal.SecurityIdentifier` from its standard textual form, `S-1-3-0` is refused outright, and anything that is not a SID string, including an account name, is refused. A failed admission is terminal, is reported as a FAIL of ordered check 16 `launcher_root_write_trustees_authorised`, and records `EG_LAUNCHER_ROOT_AUTHORISED_SID_SET_INVALID`. One check name carrying several bounded references for distinct causes is the pattern `governed_source_integrity` already uses. There is no default, no environment-variable route, no committed example value, and no file the launcher reads the set from. | 9.1 accepted representation, no default and no alternative route; 17.2.1 no-wildcards rule and `S-1-3-0` refusal; `EGRT-T61`, `EGRT-T68` |
+| `DD-13` | The Win32 calls `DD-02` requires are unavailable to managed code on the Windows PowerShell 5.1 boundary, so `launcher_lib.ps1` carries the interop declaration as a `$script:` here-string constant and compiles it lazily through `Initialize-EgWin32SecurityInterop` on first use, guarded by a `[System.Management.Automation.PSTypeName]` presence test so repeat calls compile nothing. Declaring the constant is not a side effect, so `EGRT-I01` is preserved; compiling on first use writes only into the host's own temporary compilation location, never into the launcher root, the deployed checkout, the configuration directory, the browser cache, or the log root, which is the exact domain `EGRT-T14` snapshots. | 17.2.1 requires `AccessCheck` and `DuplicateTokenEx`, which .NET exposes no managed equivalent of; `EGRT-I01` pure-library rule; section 8 zero-mutation contract |
+
+### Write-capable rights, defined once
+
+Both launcher-root write checks share one definition of a write-capable right, and both
+evaluate it against the launcher-root directory *and* each Class A package member
+individually. A member's own discretionary access control list can differ from the
+directory's, and directory-level authority to add or delete children is by itself enough
+to replace a member, so neither object alone is sufficient.
+
+After generic mapping, a right is write-capable if it is any of `FILE_WRITE_DATA` /
+`FILE_ADD_FILE`, `FILE_APPEND_DATA` / `FILE_ADD_SUBDIRECTORY`, `FILE_WRITE_EA`,
+`FILE_WRITE_ATTRIBUTES`, `FILE_DELETE_CHILD`, `DELETE`, `WRITE_DAC`, or `WRITE_OWNER`.
+`FILE_ADD_FILE` and `FILE_ADD_SUBDIRECTORY` are the directory readings of the same bits as
+`FILE_WRITE_DATA` and `FILE_APPEND_DATA`, so the mask is bit-identical for both object
+kinds and the object type changes only how a granted bit is described; `FILE_DELETE_CHILD`
+is meaningful on the directory. `WRITE_DAC` and `WRITE_OWNER` are included deliberately,
+because a trustee holding either can grant itself every other right at will, and treating
+them as read-level rights would make both checks decorative.
+
+The mask is declared once, as `$script:EgWriteCapableAccessMask`, and is the sole source
+for both checks and for every test that asserts against it.
+
+### `DD-02` in full: the prescribed run-token access-check algorithm
+
+This is design section 17.2.1 reproduced as an implementation instruction. It is one
+algorithm, not a family of acceptable ones. For the launcher-root directory, and then for
+each Class A package member:
+
+1. Open the primary access token of the process actually running `launcher.ps1`, with at
+   least `TOKEN_DUPLICATE` and `TOKEN_QUERY` access.
+2. Duplicate it with `DuplicateTokenEx`, passing `TokenType` = `TokenImpersonation` and
+   `ImpersonationLevel` = `SecurityIdentification`. `AccessCheck` is documented to take an
+   impersonation token, so the primary token is never passed to it directly. The duplicate
+   exists only to be evaluated: the launcher never impersonates with it and never starts
+   anything under it.
+3. Retrieve the object's security descriptor including its owner, its group, and its
+   discretionary access control list. All three are required, because `AccessCheck` fails
+   with `ERROR_INVALID_SECURITY_DESCR` when the descriptor carries no owner and group SIDs.
+4. Build the `GENERIC_MAPPING` for file-system objects from the documented
+   `FILE_GENERIC_READ`, `FILE_GENERIC_WRITE`, `FILE_GENERIC_EXECUTE`, and
+   `FILE_ALL_ACCESS` values.
+5. Call `AccessCheck` with the duplicated token and `DesiredAccess` = `MAXIMUM_ALLOWED`, so
+   that Windows returns in `GrantedAccess` the maximum access the descriptor allows that
+   token.
+6. Any failure of any call in steps 1 to 5, an unreadable token, or an unreadable security
+   descriptor is terminal. The check never falls back to another method, never retries at a
+   different impersonation level, and never treats an error as a pass.
+7. Apply `MapGenericMask` to `$script:EgWriteCapableAccessMask` so the compared mask carries
+   no generic rights, then compute
+
+   `any_write_granted = (GrantedAccess -band $mappedWriteCapableMask) -ne 0`
+
+   `AreAnyAccessesGranted(GrantedAccess, mappedWriteCapableMask)` is the documented
+   equivalent of that intersection and may be used in its place. Nothing else may be.
+8. `any_write_granted` true on any examined object fails the check immediately.
+
+The check passes only where the intersection is zero on the launcher-root directory and on
+every Class A package member, and where neither bypass privilege below is present.
+
+**The formulation this plan prohibits.** No task may implement the check as
+
+```text
+AccessCheck(DesiredAccess = union_of_all_write_rights)
+AccessStatus == FALSE  =>  safe
+```
+
+Windows grants an access check only when the descriptor allows *all* of the requested
+rights, so passing the union of every write-capable bit and reading a denied access status
+as "not writable" is a false negative by construction. A token holding exactly one of those
+rights, which is enough to append to, delete, or re-permission the launcher, yields a
+denied status under that formulation and the run would proceed. `EGRT-T59` exists to fail
+any implementation that does this.
+
+**Null discretionary access control list.** Windows grants all access when an object has
+none, so `GrantedAccess` returns carrying every right and the intersection is non-zero. The
+fail-closed outcome therefore falls out of the algorithm and is not a special case.
+
+**Privilege bypass, fail-closed.** A token holding `SeTakeOwnershipPrivilege` or
+`SeRestorePrivilege` can reach the object whatever the list says, so the check also fails
+when either privilege is *present* in the running token, whether enabled or disabled. This
+is a bounded rule and not an exhaustive one: no discretionary-access-list check can fully
+constrain a principal granted list-bypassing privileges.
+
+**Operational consequence carried forward from the design review.** Because privilege
+presence alone fails the check, an execution token that holds either privilege by
+construction can never pass it. `LocalSystem` is such a token. No task in this plan, and no
+documentation this plan writes, may present `LocalSystem` as a valid unattended run
+principal for `launcher.ps1`. This is a documentation and implementation-clarity constraint
+only. It selects no run account, requires no dedicated account, and does not reopen the
+design's position that separation by account and separation by elevation within one account
+are both permitted deployments.
+
+**Support reference.** `EG_LAUNCHER_ROOT_ACL_RUN_PRINCIPAL_WRITABLE`.
+
+### `DD-03` in full: the authorised write-trustee evaluation
+
+Inputs are the admitted set from `-AuthorisedLauncherRootWriteSid` (`DD-12`) and the
+security descriptor of each examined object. For the launcher-root directory and each
+Class A package member:
+
+1. Enumerate every access-allowed entry whose access mask intersects
+   `$script:EgWriteCapableAccessMask` after generic mapping.
+2. Every such entry's trustee SID must be a member of the supplied set.
+3. Separately, each examined object's owner SID must also be a member of the supplied set,
+   because an owner implicitly holds `WRITE_DAC` and can restore write access to itself at
+   will. An owner outside the set fails even where no explicit write-capable entry exists.
+4. An inherited access-allowed write-capable entry is treated exactly as an explicit one.
+   Inheritance describes where an entry came from, not how much access it grants.
+5. Access-denied entries are ignored by this check. A deny entry can only reduce access,
+   never authorise it, and whether a given deny actually neutralises a given allow depends
+   on their order in the list. Cancelling an allow against a deny here would let a badly
+   ordered list conceal a real grant.
+6. A write-capable `CREATOR OWNER` (`S-1-3-0`) entry is terminal. Windows replaces that
+   placeholder on inheritance with the SID of whoever created the new object, so an
+   inheritable write-capable entry for it describes an unbounded future write set rather
+   than a principal. `S-1-3-0` may not be placed in the supplied set either (`DD-12`).
+7. The supplied set is exhaustive and exact. No prefix, pattern, range, or wildcard form is
+   accepted, and no comparison in any committed runtime file may be a prefix or pattern
+   match against a trustee SID. A rule of the form "any SID beginning with the service
+   prefix" is specifically prohibited, because such a rule would authorise every service
+   configured on the host rather than a named authority.
+8. Well-known SIDs carry no implicit authority. Administrators, SYSTEM, and every other
+   well-known SID are accepted only where the operator supplied that exact SID.
+
+PASS is every write-capable allow trustee and every examined owner inside the supplied set.
+FAIL is any other write-capable allow trustee; any examined owner outside the set; a
+write-capable `CREATOR OWNER` entry; an object with no discretionary access control list at
+all, because Windows grants all access in that case; or a security descriptor that cannot
+be read.
+
+**Support reference.** `EG_LAUNCHER_ROOT_ACL_WRITE_TRUSTEE_UNAUTHORISED`.
+
+**Why both checks exist.** Preflight check 15 asks Windows to evaluate the running token.
+Preflight check 16 inspects the discretionary access control list. They are different
+questions, neither implies the other, and both are terminal. Where installer and run
+principal are the same Windows account, binding write authority to that account's user SID
+separates nothing, because normal split-token behaviour carries the same user SID enabled in
+both contexts; binding to an administrative group identity separates them only while the
+host keeps producing a filtered token, which the access control list cannot show. The
+trustee binding is kept because it stops an unexpected writer, and the run-token check is
+what makes the residual case observable rather than asserted.
+
+**Emission boundary.** Neither check emits a SID, a trustee name, an owner identity, a
+path, or any count derived from them. Only the check name, the pass or fail outcome, and
+the bounded support reference reach any surface (design sections 8 and 11.2, asserted by
+`EGRT-T63`).
 
 ## Support-reference vocabulary
 
@@ -214,8 +379,9 @@ records `EG_LAUNCHER_UNCLASSIFIED`.
 | `EG_LAUNCHER_CONFIG_KEY_MISSING` | derived (5.2 step 4) | `launcher.ps1` preflight |
 | `EG_LAUNCHER_PYTHON_VERSION_UNSUPPORTED` | derived (5.2 step 5) | `launcher.ps1` preflight |
 | `EG_LAUNCHER_ROOT_INSIDE_CHECKOUT` | derived (17.2) | `Test-EgLauncherRootSecurity` |
-| `EG_LAUNCHER_ROOT_ACL_RUN_PRINCIPAL_WRITABLE` | derived (17.2) | `Test-EgLauncherRootSecurity` |
-| `EG_LAUNCHER_ROOT_ACL_WRITE_NOT_RESTRICTED` | derived (17.2) | `Test-EgLauncherRootSecurity` |
+| `EG_LAUNCHER_ROOT_ACL_RUN_PRINCIPAL_WRITABLE` | design 17.2.1 | `Test-EgTokenWriteAccessToPath` |
+| `EG_LAUNCHER_ROOT_ACL_WRITE_TRUSTEE_UNAUTHORISED` | design 17.2.1 | `Test-EgPathWriteTrusteesAuthorised` |
+| `EG_LAUNCHER_ROOT_AUTHORISED_SID_SET_INVALID` | derived (9.1, 17.2.1 `DD-12`) | `Test-EgAuthorisedWriteSidSet` |
 | `EG_LAUNCHER_ROOT_REPARSE_POINT` | derived (17.2) | `Test-EgLauncherRootSecurity` |
 | `EG_LAUNCHER_FILE_UNEXPECTEDLY_READONLY` | derived (17.2) | `Test-EgLauncherRootSecurity` |
 | `EG_LAUNCHER_INSTALL_ADMISSION_INVALID` | derived (6.1 mandatory) | installer Phase 1 |
@@ -224,6 +390,17 @@ records `EG_LAUNCHER_UNCLASSIFIED`.
 | `EG_LAUNCHER_INSTALL_ROLLBACK_INCOMPLETE` | derived (6.5 exit 73) | installer rollback |
 | `EG_LAUNCHER_INSTALL_BACKUP_CLEANUP_INCOMPLETE` | design 6.6 | installer Phase 4 |
 | `EG_LAUNCHER_UNCLASSIFIED` | design 11.4 | any unrecognised failure |
+
+The live set counted from this table is **forty-nine** references. It was forty-eight
+before the installer-principal binding amendment. The change is one replacement plus one
+addition:
+`EG_LAUNCHER_ROOT_ACL_WRITE_NOT_RESTRICTED` is replaced by
+`EG_LAUNCHER_ROOT_ACL_WRITE_TRUSTEE_UNAUTHORISED`, which is net zero, and
+`EG_LAUNCHER_ROOT_AUTHORISED_SID_SET_INVALID` is added because `DD-12` introduces a
+bounded, foreseeable, terminal admission failure that would otherwise fall to
+`EG_LAUNCHER_UNCLASSIFIED`, and design section 11.4 reserves that reference for
+*unrecognised* failures only. Task 18 asserts the declared set equals this table exactly,
+so the count is verified by the suite rather than by this sentence.
 
 ## Shared object shapes
 
@@ -327,13 +504,23 @@ positions 1 to 18 all complete before position 19 is attempted.
 | 12 | `governed_source_integrity` | 5.2 step 6, 10.3 |
 | 13 | `browser_cache_ready` | 5.2 step 7, 9.3 |
 | 14 | `launcher_root_outside_checkout` | 5.2 step 8, 17.2 |
-| 15 | `launcher_root_not_writable_by_run_principal` | 17.2, `DD-02` |
-| 16 | `launcher_root_write_restricted_to_install_principal` | 17.2, `DD-03` |
+| 15 | `launcher_root_not_writable_by_run_principal` | 17.2, 17.2.1, `DD-02` |
+| 16 | `launcher_root_write_trustees_authorised` | 17.2, 17.2.1, `DD-03` |
 | 17 | `launcher_files_not_reparse_points` | 17.2 |
 | 18 | `launcher_files_not_unexpectedly_readonly` | 17.2 |
 | 19 | `credential_import_ok` | 5.2 step 9, 9.2, section 8 |
 | 20 | `username_nonempty` | 5.2 step 9, section 8 |
 | 21 | `password_nonempty` | 5.2 step 9, section 8 |
+
+The count stays twenty-one. Check 16 is a replacement in the same ordered position, not an
+addition: `launcher_root_write_trustees_authorised` supersedes the earlier planned name
+`launcher_root_write_restricted_to_install_principal`, which design section 17.2 records as
+retired vocabulary that must not be emitted. Task 18 guards the retired string.
+
+The admission of `-AuthorisedLauncherRootWriteSid` under `DD-12` adds no ordered check
+either. It is the input admission for check 16, so a refused set is reported as a FAIL of
+check 16 carrying its own bounded reference, following the same one-check-many-references
+pattern as `governed_source_integrity`.
 
 ## Task index and assertion coverage
 
@@ -355,15 +542,26 @@ positions 1 to 18 all complete before position 19 is attempted.
 | 14 | Private Playwright browser-cache binding | `EGRT-T27` to `EGRT-T30` |
 | 15 | Path-scoped governed source integrity | `EGRT-T32` to `EGRT-T38`, `EGRT-T40` |
 | 16 | Launcher entry script, preflight order, exit bands, terminal event | `EGRT-T19`, `EGRT-T20`, `EGRT-T48`, `EGRT-T56`, `EGRT-T57` |
+| 16 | Launcher-root write authority, the two write checks (`DD-02`, `DD-03`, `DD-12`, `DD-13`) | `EGRT-T58` to `EGRT-T71` |
 | 17 | `-ValidateOnly` on both entry scripts | `EGRT-T14`, `EGRT-T15`, `EGRT-T31` |
 | 18 | Bounded support-reference vocabulary and reachability | `EGRT-T18` |
 | 19 | Privacy static guard over committed files | `EGRT-T13` |
 | 20 | `launcher.settings.example.json` placeholder shape | supports `EGRT-T13` |
-| 21 | Runtime README, runbook, project README, scheduler example correction | `EGRT-I30`, run-instruction items P and Q |
+| 21 | Runtime README, runbook, project README, scheduler example correction | `EGRT-I30`, `EGRT-I31` host half, run-instruction items P and Q |
 | 22 | Full-suite validation, CI verification, no-workflow-change proof | `EGRT-I07`, `EGRT-I08`, `EGRT-I09` |
 
-Every assertion `EGRT-T01` through `EGRT-T57` appears exactly once as a closing task
-above. Task 22 re-runs the whole set.
+Every assertion `EGRT-T01` through `EGRT-T71` appears exactly once as a closing task
+above. Task 22 re-runs the whole set. Task 16 is listed twice because the installer-principal
+binding amendment added a second, self-contained subject to the same task: the launcher
+entry script and its ordered preflight, and the two launcher-root write checks that
+preflight positions 15 and 16 evaluate. They stay in one task because
+`Test-EgLauncherRootSecurity` is already a Task 16 interface and the checks have no meaning
+outside the launcher preflight; no existing task is renumbered and no existing assertion
+moves.
+
+`EGRT-I31` is the only criterion with a half hosted CI cannot discharge. Task 16 proves the
+binding and both algorithms offline; the host half is an operator action on the production
+host, documented by Task 21 and explicitly not claimed by Task 22.
 
 ---
 
@@ -1696,7 +1894,15 @@ function Test-EgIsSanctionedBytecodeArtefact {
 
 ## Task 16 - Launcher entry script, preflight order, exit bands, terminal event
 
-Design sections 5.1, 5.2, 5.3, 11.3.
+Design sections 5.1, 5.2, 5.3, 11.3, 17.2, and 17.2.1.
+
+This task has two subjects. The first is the launcher entry script, its ordered preflight,
+its exit bands, and its terminal event. The second is the launcher-root write authority the
+installer-principal binding amendment introduced: preflight checks 15 and 16, the interop
+they need, and the fourteen assertions `EGRT-T58` to `EGRT-T71`. The second subject stays
+here because `Test-EgLauncherRootSecurity` is already this task's interface and the two
+checks have no meaning outside this preflight. Its steps are the separately numbered block
+at the end of **Steps**.
 
 ### Files
 
@@ -1717,6 +1923,7 @@ param(
     [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$CredentialPath,
     [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$BrowserCachePath,
     [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$ExpectedBranch,
+    [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string[]]$AuthorisedLauncherRootWriteSid,
     [ValidateSet('run', 'list')][string]$Command = 'run',
     [string]$LogRoot,
     [switch]$ValidateOnly,
@@ -1728,6 +1935,16 @@ There is no parameter accepting a credential value, no portal parameter, no
 browser-install parameter, no commit-pin parameter, and no headed switch. `-ExpectedBranch`
 is mandatory with the explicit `ANY_BRANCH` sentinel, so branch binding can never be
 disabled by omitting an argument.
+
+`-AuthorisedLauncherRootWriteSid` is mandatory for the same reason: omitting an argument
+must never silently disable a security expectation. It carries one or more exact SID
+strings, it has no default and no fallback, and it is the only route by which the
+authorised write-trustee set reaches the launcher. There is no environment-variable form,
+no committed example value, and no file the launcher reads the set from (design section
+9.1, `DD-12`). The value is never logged, never written to the terminal event, and never
+placed in `-ValidateOnly` output. The installer takes no equivalent parameter, because
+design section 6.1 defines the installer surface without one and this amendment does not
+widen it.
 
 Library additions:
 
@@ -1769,18 +1986,164 @@ function Test-EgLauncherRootSecurity {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$LauncherRootPath,
-        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$CheckoutRootPath
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$CheckoutRootPath,
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string[]]$AuthorisedLauncherRootWriteSid
     )
     # Returns CheckResult with check names, in order:
-    #   launcher_root_outside_checkout                      -> EG_LAUNCHER_ROOT_INSIDE_CHECKOUT
-    #   launcher_root_not_writable_by_run_principal (DD-02) -> EG_LAUNCHER_ROOT_ACL_RUN_PRINCIPAL_WRITABLE
-    #   launcher_root_write_restricted_to_install_principal (DD-03)
-    #                                                       -> EG_LAUNCHER_ROOT_ACL_WRITE_NOT_RESTRICTED
-    #   launcher_files_not_reparse_points                   -> EG_LAUNCHER_ROOT_REPARSE_POINT
-    #   launcher_files_not_unexpectedly_readonly            -> EG_LAUNCHER_FILE_UNEXPECTEDLY_READONLY
+    #   launcher_root_outside_checkout               -> EG_LAUNCHER_ROOT_INSIDE_CHECKOUT
+    #   launcher_root_not_writable_by_run_principal  -> EG_LAUNCHER_ROOT_ACL_RUN_PRINCIPAL_WRITABLE
+    #       DD-02. Test-EgTokenWriteAccessToPath over the launcher root and every Class A
+    #       member, plus Test-EgBypassPrivilegePresent once over the running token.
+    #   launcher_root_write_trustees_authorised      -> EG_LAUNCHER_ROOT_ACL_WRITE_TRUSTEE_UNAUTHORISED
+    #       DD-03. Test-EgPathWriteTrusteesAuthorised over the same object set.
+    #                                                -> EG_LAUNCHER_ROOT_AUTHORISED_SID_SET_INVALID
+    #       when Test-EgAuthorisedWriteSidSet refuses the supplied set (DD-12). The check
+    #       name is unchanged and the reference distinguishes the cause, exactly as
+    #       governed_source_integrity already carries several references under one name.
+    #   launcher_files_not_reparse_points             -> EG_LAUNCHER_ROOT_REPARSE_POINT
+    #   launcher_files_not_unexpectedly_readonly      -> EG_LAUNCHER_FILE_UNEXPECTEDLY_READONLY
     #
-    # No principal name, SID, or path is ever emitted. Only the check name and the bounded
-    # support reference reach any surface.
+    # The examined object set is $LauncherRootPath plus every name returned by
+    # Get-EgDeployedPackageMemberNames (Task 8) joined to it (DD-01). Both write checks are
+    # evaluated against every member of that set, and one failing object fails the check.
+    #
+    # No principal name, SID, owner identity, path, or count derived from them is ever
+    # emitted. Only the check name and the bounded support reference reach any surface
+    # (EGRT-T63).
+}
+
+$script:EgWriteCapableAccessMask =
+    0x00000002 -bor `
+    0x00000004 -bor `
+    0x00000010 -bor `
+    0x00000040 -bor `
+    0x00000100 -bor `
+    0x00010000 -bor `
+    0x00040000 -bor `
+    0x00080000
+# In declared order: FILE_WRITE_DATA / FILE_ADD_FILE, FILE_APPEND_DATA /
+# FILE_ADD_SUBDIRECTORY, FILE_WRITE_EA, FILE_DELETE_CHILD, FILE_WRITE_ATTRIBUTES, DELETE,
+# WRITE_DAC, WRITE_OWNER. Declared once; the sole source for both write checks and for
+# every test that asserts against the mask.
+
+$script:EgBypassPrivilegeNames = @('SeTakeOwnershipPrivilege', 'SeRestorePrivilege')
+$script:EgRefusedAuthorisedSid = 'S-1-3-0'
+
+function Initialize-EgWin32SecurityInterop {
+    [CmdletBinding()]
+    param()
+    # Compiles $script:EgWin32SecurityInteropSource on FIRST USE ONLY, guarded by
+    #   if (-not ([System.Management.Automation.PSTypeName]'EgWin32.Security').Type) { ... }
+    # so repeat calls compile nothing. Never invoked at load time, so the library stays
+    # pure and dot-sourceable (EGRT-I01, DD-13).
+    #
+    # The here-string declares exactly these imports and nothing else:
+    #   GetCurrentProcess, OpenProcessToken, DuplicateTokenEx, CloseHandle,
+    #   GetTokenInformation, AccessCheck, MapGenericMask.
+    #
+    # No security-descriptor import is declared. The descriptor is read through managed
+    # .NET as GetSecurityDescriptorBinaryForm() on a FileSecurity or DirectorySecurity
+    # obtained with AccessControlSections Owner, Group, and Access, which is what design
+    # section 17.2.1 step 3 requires and is why AccessCheck does not fail with
+    # ERROR_INVALID_SECURITY_DESCR.
+    #
+    # Returns nothing.
+}
+
+function Get-EgMappedWriteCapableMask {
+    [CmdletBinding()]
+    param()
+    # Returns [int]. Calls Initialize-EgWin32SecurityInterop, then applies MapGenericMask to
+    # $script:EgWriteCapableAccessMask with the file-system GENERIC_MAPPING built from
+    # FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_GENERIC_EXECUTE, and FILE_ALL_ACCESS.
+    # The returned mask carries no generic rights (design 17.2.1 steps 4 and 7, EGRT-T71).
+}
+
+function Test-EgAuthorisedWriteSidSet {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][ValidateNotNullOrEmpty()][string[]]$AuthorisedSid)
+    # Admits the value supplied on -AuthorisedLauncherRootWriteSid (DD-12). Pure.
+    # Returns:
+    #   [pscustomobject]@{
+    #       Pass       = [bool]
+    #       SupportRef = [string]   # '' on pass, else EG_LAUNCHER_ROOT_AUTHORISED_SID_SET_INVALID
+    #       Sids       = [System.Security.Principal.SecurityIdentifier[]]  # @() on failure
+    #   }
+    # Refuses an empty set; refuses any element that does not construct a
+    # SecurityIdentifier from its standard textual form, which is what refuses an account
+    # name without performing a name-resolution lookup; and refuses the literal
+    # $script:EgRefusedAuthorisedSid. Sids is always a forced array subexpression. No
+    # supplied value is echoed into the result, a log, or an exception surface.
+}
+
+function Test-EgBypassPrivilegePresent {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][AllowEmptyCollection()][string[]]$PrivilegeName)
+    # Pure predicate. Returns [bool] $true when $PrivilegeName contains any member of
+    # $script:EgBypassPrivilegeNames, compared case-insensitively. Presence alone is
+    # sufficient; enabled state is irrelevant (design 17.2.1 privilege-bypass rule).
+}
+
+function Get-EgTokenPrivilegeNames {
+    [CmdletBinding()]
+    param()
+    # Returns [string[]] of privilege names present in the running process token, read
+    # through GetTokenInformation with TOKEN_PRIVILEGES and LookupPrivilegeName. Always a
+    # forced array subexpression.
+    #
+    # FAIL-CLOSED: a failure to read token privileges returns
+    # $script:EgBypassPrivilegeNames, so an unreadable token is treated as bypass
+    # privilege present rather than absent. This is the one place the function reports
+    # something it did not observe, and it does so only in the safe direction.
+}
+
+function Test-EgTokenWriteAccessToPath {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Path)
+    # DD-02 steps 1 to 8 against exactly one object.
+    # Returns:
+    #   [pscustomobject]@{
+    #       AnyWriteGranted = [bool]
+    #       Evaluated       = [bool]   # $false when a call in steps 1 to 5 failed
+    #       SupportRef      = [string] # '' only when Evaluated and not AnyWriteGranted
+    #   }
+    # Evaluated $false is TERMINAL and yields
+    # EG_LAUNCHER_ROOT_ACL_RUN_PRINCIPAL_WRITABLE. The caller must never read it as a
+    # pass, must not retry at another impersonation level, and must not fall back to
+    # another method (design 17.2.1 step 6).
+    #
+    # DesiredAccess is MAXIMUM_ALLOWED and the verdict is the intersection from
+    # Get-EgMappedWriteCapableMask. The union-of-all-write-rights formulation is
+    # prohibited (DD-02 in full, EGRT-T59).
+    #
+    # Never impersonates with the duplicated token, never passes the primary token to
+    # AccessCheck, and never derives the context from an account name or a SID
+    # (EGRT-T70). Emits no path and no identity.
+}
+
+function Test-EgPathWriteTrusteesAuthorised {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Path,
+        [Parameter(Mandatory)][ValidateNotNull()][System.Security.Principal.SecurityIdentifier[]]$AuthorisedSid
+    )
+    # DD-03 steps 1 to 8 against exactly one object.
+    # Returns:
+    #   [pscustomobject]@{
+    #       Authorised = [bool]
+    #       Evaluated  = [bool]   # $false when the security descriptor cannot be read
+    #       SupportRef = [string] # '' only when Evaluated and Authorised
+    #   }
+    # Authorised $false and Evaluated $false both yield
+    # EG_LAUNCHER_ROOT_ACL_WRITE_TRUSTEE_UNAUTHORISED, so an unreadable descriptor fails
+    # closed rather than passing.
+    #
+    # Comparison is exact SecurityIdentifier equality only. No prefix, pattern, range, or
+    # wildcard match against a trustee SID appears anywhere in the implementation
+    # (EGRT-T61). Access-denied entries are ignored (DD-03 step 5); inherited allow entries
+    # are treated exactly as explicit ones (DD-03 step 4); a null discretionary access
+    # control list fails (EGRT-T67); a write-capable CREATOR OWNER entry fails (EGRT-T68);
+    # an owner outside the set fails even with no explicit write-capable entry (EGRT-T66).
 }
 
 function Write-EgLauncherTerminalEvent {
@@ -1811,10 +2174,144 @@ Invocation contract, on success only:
 
 ### Steps
 
-1. Add a child-stub builder to the test module: a scratch `.ps1` or `.cmd` that records the
+The write-authority sub-block runs first. `launcher.ps1` composes the two write checks, so
+they must exist before the entry script that calls them; implementing the entry script
+against unfinished checks would leave `Test-EgLauncherRootSecurity` reporting an outcome it
+had not computed, which the fallback discipline in Global Constraints forbids.
+
+#### Steps 1 to 7 - launcher-root write authority (`DD-02`, `DD-03`, `DD-12`, `DD-13`)
+
+1. Add the synthetic security-descriptor fixtures to the test module:
+
+   ```python
+   SYNTHETIC_SIDS: tuple[str, ...]
+   # Every SID literal this module is permitted to contain. Members are constructed or
+   # well-known values only, none read from the host: the World SID, an unrelated
+   # service-class SID used as the unauthorised trustee in EGRT-T61, and the CREATOR OWNER
+   # placeholder S-1-3-0 used by EGRT-T68. Task 19's guard asserts that no SID literal
+   # appears in this module outside this declaration.
+
+   def build_scratch_launcher_root(
+       tmp: Path,
+       *,
+       owner_sid: str | None = None,
+       allow: tuple[tuple[str, str, bool], ...] = (),   # (sid, right_name, inheritable)
+       deny: tuple[tuple[str, str], ...] = (),
+       null_dacl: bool = False,
+       protect_inheritance: bool = True,
+   ) -> Path:
+       """Create a scratch root plus the three Class A members and stamp the requested
+       descriptor on the directory and on each member. Right names resolve through the
+       same eight write-capable rights the library declares, plus a read-only right for
+       the negative cases."""
+
+   def restricted_self_token_probe(exe: str, *, deny_only_group: str) -> dict:
+       """Drive the PROBE script under a token derived from the test process's own token
+       with CreateRestrictedToken marking one group identity deny-only. Restricting one's
+       own token needs no elevation, no second account, and no production launcher root,
+       which is what makes EGRT-T62 provable in hosted CI."""
+   ```
+
+2. Write the failing write-authority tests. Each drives the library functions directly
+   through the shared PROBE script, against scratch roots only:
+   - `test_an_authorised_exact_trustee_passes_on_the_root_and_on_every_member`
+     (`EGRT-T58`, Tier A and B): a scratch root whose only write-capable allow entry and
+     whose owner are one supplied exact SID passes
+     `launcher_root_write_trustees_authorised`, asserted on the directory and on each of
+     the three Class A members individually.
+   - `test_exactly_one_granted_write_right_is_reported_writable` (`EGRT-T59`, Tier A and
+     B): with the checking token granted exactly one write-capable right,
+     `launcher_root_not_writable_by_run_principal` reports writable. Proven separately for
+     a file-specific right, `FILE_WRITE_DATA` on a member, and for a directory-specific
+     right, `FILE_DELETE_CHILD` on the root. A token whose granted mask intersects the
+     write-capable mask in no bit reports non-writable. This is the union false-negative
+     guard: an implementation that requests the union of every write-capable right and
+     reads a denied access status as safe fails here.
+   - `test_a_write_capable_trustee_outside_the_supplied_set_fails_closed` (`EGRT-T60`,
+     Tier A): asserted on the directory and on a member independently, so neither object
+     can be skipped.
+   - `test_an_unrelated_service_class_trustee_fails_and_no_wildcard_form_is_accepted`
+     (`EGRT-T61`, Tier A and C): the dynamic half fails closed for a service-class SID
+     outside the supplied set; the static half asserts that no committed runtime file
+     performs a `StartsWith`, `-like`, `-match`, or other prefix or pattern comparison
+     against a trustee SID, an owner SID, or a member of the supplied set.
+   - `test_same_account_separation_is_proven_not_assumed` (`EGRT-T62`, Tier A and B):
+     against one scratch root whose only write-capable grant is a group identity, the
+     token with that identity restricted to deny-only reports non-writable while the same
+     token before restriction reports writable.
+   - `test_no_sid_trustee_or_owner_material_reaches_any_surface` (`EGRT-T63`, Tier A and
+     C): the dynamic half asserts that no member of `SYNTHETIC_SIDS`, no trustee or owner
+     name, and no count derived from them appears in `-ValidateOnly` stdout, in the
+     terminal event, or in either write check's returned object, on pass and on fail; the
+     static half asserts the same over every committed runtime file, the example settings
+     file, and this test module outside the `SYNTHETIC_SIDS` declaration.
+   - `test_an_inherited_write_capable_allow_entry_is_treated_as_explicit` (`EGRT-T64`,
+     Tier A): an inherited allow entry for a trustee outside the supplied set fails closed
+     exactly as an explicit one does.
+   - `test_a_deny_entry_never_authorises_a_trustee` (`EGRT-T65`, Tier A): a root carrying
+     both a write-capable allow entry for an unauthorised trustee and a deny entry for
+     that same trustee still fails `launcher_root_write_trustees_authorised`, asserted in
+     both entry orders.
+   - `test_write_dac_write_owner_and_delete_are_each_write_capable_and_owner_is_checked`
+     (`EGRT-T66`, Tier A): a token granted exactly one of `WRITE_DAC`, `WRITE_OWNER`, or
+     `DELETE` and nothing else is reported writable by both checks, asserted once per
+     right; and an examined object whose owner is outside the supplied set fails closed
+     even where the list carries no explicit write-capable entry.
+   - `test_a_null_discretionary_access_control_list_fails_both_checks` (`EGRT-T67`,
+     Tier A): built with `null_dacl=True`, both checks fail rather than pass.
+   - `test_an_inheritable_creator_owner_entry_fails_and_the_placeholder_cannot_be_supplied`
+     (`EGRT-T68`, Tier A): an inheritable write-capable `S-1-3-0` entry fails closed, and
+     `Test-EgAuthorisedWriteSidSet` refuses `S-1-3-0` in the supplied set with
+     `EG_LAUNCHER_ROOT_AUTHORISED_SID_SET_INVALID`.
+   - `test_a_bypass_privilege_fails_the_run_principal_check` (`EGRT-T69`, Tier A):
+     `Test-EgBypassPrivilegePresent` returns `$true` for `SeTakeOwnershipPrivilege` alone,
+     `$true` for `SeRestorePrivilege` alone, and `$false` for a list holding neither, and
+     `Get-EgTokenPrivilegeNames` returns the bypass names when the token read fails, so an
+     unreadable token fails closed. The same test AST-asserts that
+     `Test-EgLauncherRootSecurity` fails `launcher_root_not_writable_by_run_principal`
+     whenever the predicate is `$true`, with no branch that can reach a PASS from a `$true`
+     predicate, so the composition is closed on any host regardless of what privileges the
+     runner's own token happens to hold.
+   - `test_the_access_check_uses_a_duplicated_impersonation_token` (`EGRT-T70`, Tier A and
+     C): the static half asserts that `DuplicateTokenEx` is called with
+     `TokenImpersonation` and `SecurityIdentification`, that the primary token handle is
+     never the token argument to `AccessCheck`, that no committed runtime file calls
+     `ImpersonateLoggedOnUser`, `RevertToSelf`, `WindowsIdentity::Impersonate`, or
+     `LookupAccountName`, and that no `SecurityIdentifier` used as the checking context is
+     constructed from an account name or a SID string; the dynamic half asserts the
+     duplicated handle is closed on every path including failure.
+   - `test_the_write_capable_mask_is_generic_mapped_before_intersection` (`EGRT-T71`,
+     Tier A and C): the dynamic half asserts a descriptor expressed only in generic rights
+     is still detected as write-capable, and that `Get-EgMappedWriteCapableMask` returns a
+     mask with no generic bit set; the static half asserts `MapGenericMask` is applied
+     before any intersection with `GrantedAccess`.
+3. Run the module. Prove RED:
+
+   ```powershell
+   python -m unittest tests.test_runtime_launcher -v
+   ```
+
+   Expected failure: the fourteen write-authority tests error because
+   `$script:EgWriteCapableAccessMask`, `Initialize-EgWin32SecurityInterop`,
+   `Get-EgMappedWriteCapableMask`, `Test-EgAuthorisedWriteSidSet`,
+   `Test-EgBypassPrivilegePresent`, `Get-EgTokenPrivilegeNames`,
+   `Test-EgTokenWriteAccessToPath`, and `Test-EgPathWriteTrusteesAuthorised` do not exist.
+4. Implement the three constants and the seven functions above, in the order they are
+   declared: the mask and the two name constants, the interop here-string and its lazy
+   compiler, the mapped-mask helper, the SID-set admission, the privilege predicate and its
+   token reader, then the two per-object checks.
+5. Re-run the same command. Prove GREEN on all fourteen.
+6. Regression: the full project suite, plus Task 1's parse and 5.1-compatibility guards,
+   because the interop here-string is the largest committed PowerShell literal in the
+   library and must still parse cleanly on the Desktop boundary.
+7. Commit: `Add launcher-root write-authority checks and their Win32 access check`.
+
+#### Steps 8 to 14 - launcher entry script and ordered preflight
+
+8. Add a child-stub builder to the test module: a scratch `.ps1` or `.cmd` that records the
    three environment variables plus its working directory to a scratch JSON file and exits
    with a caller-chosen code. The application is never invoked; only the stub is.
-2. Write failing tests:
+9. Write failing tests:
    - `test_the_launcher_exit_band_is_disjoint_from_the_application_band` (`EGRT-T19`,
      Tier C): assert `{70,71,72,73}` and `{0,10,20,64}` are disjoint as read from the
      committed constants, not from convention.
@@ -1825,7 +2322,8 @@ Invocation contract, on success only:
    - `test_a_failing_non_secret_preflight_causes_zero_credential_import_attempt`
      (`EGRT-T48`, Tier A and C): a sentinel-instrumented scratch credential path that
      records any open attempt shows zero opens when any of checks 1 to 18 fails; run once
-     per failing check, including each of the four launcher-root security checks. The
+     per failing check, including each of the five launcher-root security checks at
+     ordered positions 14 to 18. The
      static half AST-asserts that the single `Import-EgLauncherCredential` call site in
      `launcher.ps1` lexically follows every non-secret check call site.
    - `test_a_missing_or_invalid_class_a_member_cannot_be_satisfied_by_residue`
@@ -1849,12 +2347,25 @@ Invocation contract, on success only:
    - `test_the_child_exit_code_is_propagated_verbatim` (Tier A): stub exit codes `0`,
      `10`, `20`, and `64` each reach the caller unchanged, and a preflight failure yields
      `70`.
-3. Run the module. Prove RED.
-4. Implement the four library functions, the two constants, and `launcher.ps1`.
-5. Re-run. Prove GREEN on all eight.
-6. Regression: full project suite, plus Tasks 8, 9, 13, 14, and 15, because the launcher
-   is the first consumer of all five.
-7. Commit: `Add the launcher entry script and ordered preflight`.
+10. Run the module. Prove RED:
+
+    ```powershell
+    python -m unittest tests.test_runtime_launcher -v
+    ```
+
+    Expected failure: `launcher.ps1` does not exist, so every launcher-invoking test errors
+    and the two static tests report no entry script to parse.
+11. Implement `Test-EgPythonVersionSupported`, `Test-EgLauncherConfigContract`,
+    `Test-EgLauncherRootSecurity`, and `Write-EgLauncherTerminalEvent`, the two exit-code
+    constants, and `launcher.ps1`. `Test-EgLauncherRootSecurity` composes the write checks
+    built in steps 1 to 7 and adds nothing to them; it passes
+    `-AuthorisedLauncherRootWriteSid` straight through from the entry script and never
+    defaults, caches, or re-derives it.
+12. Re-run the same command. Prove GREEN on all eight, and confirm the fourteen
+    write-authority tests still pass.
+13. Regression: full project suite, plus Tasks 8, 9, 13, 14, and 15, because the launcher
+    is the first consumer of all five.
+14. Commit: `Add the launcher entry script and ordered preflight`.
 
 ---
 
@@ -1907,6 +2418,19 @@ function ConvertTo-EgValidationJson {
   check by its stable name.
 - The installer's `-ValidateOnly` generates no transaction identifier (`DD-09`) and emits
   no `ALREADY_CURRENT` check (`DD-06`).
+- It never emits the value supplied on `-AuthorisedLauncherRootWriteSid`, any other SID,
+  any trustee or owner name, or any count derived from them. The two launcher-root write
+  checks reach the output as a check name and a `PASS` or `FAIL`, nothing more.
+- Every launcher `-ValidateOnly` invocation in this task supplies
+  `-AuthorisedLauncherRootWriteSid`, because the parameter is mandatory. The installer
+  `-ValidateOnly` invocations supply no such parameter, because design section 6.1 gives
+  the installer no equivalent surface.
+- `launcher_root_not_writable_by_run_principal` is evaluated against the token of the
+  process actually running the launcher, so a `-ValidateOnly` run from an elevated prompt,
+  or under any account other than the one the unattended job uses, tests a principal the
+  job will not use. It may legitimately fail, and a pass obtained that way is not evidence
+  about the job. The operator requirement that follows is design section 14 step 6, encoded
+  by Task 21.
 
 ### Steps
 
@@ -1928,7 +2452,9 @@ function ConvertTo-EgValidationJson {
    - `test_validate_only_emits_exactly_one_json_object_with_no_private_content` (Tier A):
      stdout parses as exactly one JSON object; its keys are exactly `checks`, `status`,
      and optionally `support_ref`; and it contains no `^[A-Za-z]:\\` substring, no `\\\\`
-     substring, no environment value, and no account identity.
+     substring, no environment value, and no account identity. Supporting `EGRT-T63`, it
+     additionally contains no member of `SYNTHETIC_SIDS`, no SID-shaped substring, and no
+     trustee or owner name, on a passing run and on a run failing each of checks 15 and 16.
    - `test_validate_only_failure_exits_70_and_names_the_first_failing_check` (Tier A).
    - `test_installer_validate_only_generates_no_transaction_identifier` (Tier A and C):
      no Class B residue name appears in the output and the launcher root gains no entry;
@@ -1955,7 +2481,7 @@ Design section 11.
 ### Interfaces
 
 ```powershell
-$script:EgLauncherSupportRefs = @( <the 48 live references from the vocabulary table> )
+$script:EgLauncherSupportRefs = @( <the 49 live references from the vocabulary table> )
 $script:EgLauncherRetiredSupportRefs = @()   # empty at first implementation (DD-08)
 
 function Get-EgLauncherSupportRefs {
@@ -1992,7 +2518,16 @@ function Test-EgLauncherSupportRefLive {
      (`DD-08`); the assertion is still present so the first retirement is regressed.
    - `test_no_support_reference_outside_the_bounded_vocabulary_is_emitted` (Tier C):
      regex-extract every `EG_LAUNCHER_[A-Z0-9_]+` literal from every committed runtime
-     file and assert the set equals the live set exactly.
+     file and assert the set equals the live set exactly, and that its cardinality is
+     forty-nine, so the vocabulary count is verified by the suite rather than asserted in
+     prose.
+   - `test_the_superseded_launcher_root_write_names_appear_nowhere` (Tier C): assert the
+     strings `launcher_root_write_restricted_to_install_principal` and
+     `EG_LAUNCHER_ROOT_ACL_WRITE_NOT_RESTRICTED` appear in no committed runtime file, in
+     the example settings file, in `runtime/README.md`, or in the test module. Design
+     section 17.2 records the first as retired vocabulary that must not be emitted; the
+     second was only ever planned, never implemented and never emitted, so it is guarded as
+     an absent string rather than entered in the retired set (`DD-08`).
    - `test_the_two_vocabularies_cannot_collide` (Tier C): assert no `EG_LAUNCHER_*`
      reference appears in `energygrid_bill_downloader/cli.py`, and no `EG_LOGIN_*` or
      `APP_ERROR_*` reference appears in any committed runtime file.
@@ -2032,9 +2567,17 @@ FORBIDDEN_PATTERNS: dict[str, str] = {
     "unc_path":             r"^\\\\\\\\|[^\\\\]\\\\\\\\[A-Za-z0-9]",
     "credential_assignment": r"(?i)(password|passwd|pwd|secret|token|apikey|api_key)\s*=\s*['\"][^'\"]+['\"]",
     "http_url":             r"https?://",
+    "sid_literal":          r"S-1-(?:\d+-)+\d+",
 }
 
 ALLOWED_PLACEHOLDER_PREFIX = "REPLACE_WITH_"
+
+RUNTIME_ALLOWED_SID_LITERALS = ("S-1-3-0",)
+# The single SID literal a committed runtime file may contain: the CREATOR OWNER
+# placeholder that Test-EgAuthorisedWriteSidSet refuses (DD-12). It names no host
+# principal. Every other SID-shaped literal in a runtime file is a defect.
+# In the test module the permitted set is SYNTHETIC_SIDS from Task 16 instead, and each
+# literal must appear inside that declaration."
 ```
 
 ### Steps
@@ -2050,11 +2593,18 @@ ALLOWED_PLACEHOLDER_PREFIX = "REPLACE_WITH_"
 2. Add companion assertions in the same test:
    `test_no_account_identity_or_host_identity_literal_is_committed` (assert the literal
    token `account_identity` appears only as a JSON key name in the config-contract check
-   and never with a value), and
-   `test_the_example_settings_file_carries_placeholders_only`.
+   and never with a value),
+   `test_the_example_settings_file_carries_placeholders_only`, and
+   `test_no_principal_identity_reaches_a_committed_file` (supporting `EGRT-T63`: every
+   `sid_literal` match in a committed runtime file is a member of
+   `RUNTIME_ALLOWED_SID_LITERALS`; every match in the test module appears inside the
+   `SYNTHETIC_SIDS` declaration; and no match anywhere is a domain or machine account SID,
+   which is what a host-derived SID would be).
 3. Run the module. Prove RED by temporarily adding a scratch copy of a runtime file
    carrying a `C:\\` literal and confirming the guard reports it, then discarding the
-   scratch copy. The guard must be proven to fail on the defect it exists to catch.
+   scratch copy. Repeat with a scratch copy carrying an arbitrary SID literal outside
+   `RUNTIME_ALLOWED_SID_LITERALS` and confirm the `sid_literal` pattern reports it. The
+   guard must be proven to fail on each defect it exists to catch.
 4. Implement the guard.
 5. Re-run. Prove GREEN.
 6. Regression: full project suite.
@@ -2084,6 +2634,7 @@ Exact committed content, placeholders only, following the precedent set by
   "credential_path": "REPLACE_WITH_PRIVATE_DPAPI_PSCREDENTIAL_CLIXML_PATH",
   "browser_cache_path": "REPLACE_WITH_PRIVATE_PLAYWRIGHT_BROWSER_CACHE_PATH",
   "expected_branch": "REPLACE_WITH_EXPECTED_BRANCH_OR_ANY_BRANCH",
+  "authorised_launcher_root_write_sid": ["REPLACE_WITH_AUTHORISED_LAUNCHER_ROOT_WRITE_SID"],
   "log_root": "REPLACE_WITH_PRIVATE_DIAGNOSTICS_ROOT"
 }
 ```
@@ -2092,13 +2643,22 @@ The file is a **shape**, superseded on the host by real private settings. It is 
 deployed to the launcher root (`EGRT-T47`), no committed script reads it at runtime, and
 its key set corresponds one-to-one with the launcher's host-supplied parameters.
 
+`authorised_launcher_root_write_sid` is an array because the launcher parameter is
+`[string[]]` and the design's authorised set is one or more SIDs. Carrying the key here is
+not a committed example value and does not create a second route into the launcher: the
+value is a `REPLACE_WITH_` placeholder, never a SID, and design section 9.1's rule that no
+file supplies the set is preserved because no committed script reads this file at runtime.
+The key exists so that a host-supplied parameter can never gain a parameter without
+gaining a documented slot, which is the drift the second test below catches.
+
 ### Steps
 
 1. Write failing tests `test_the_example_settings_file_parses_and_is_placeholder_only`
-   (every value starts with `REPLACE_WITH_`, no value matches a Windows absolute path or
-   a UNC path) and
+   (every value is either a string starting with `REPLACE_WITH_` or a non-empty array whose
+   every element is such a string; no value matches a Windows absolute path, a UNC path, or
+   the `sid_literal` pattern from Task 19) and
    `test_the_example_settings_keys_match_the_launcher_host_supplied_parameters` (the key
-   set equals the seven host-supplied launcher parameters lowercased and snake_cased, so a
+   set equals the eight host-supplied launcher parameters lowercased and snake_cased, so a
    parameter added later without a settings key fails the test).
 2. Run the module. Prove RED.
 3. Create the file with exactly the content above.
@@ -2129,8 +2689,11 @@ sections, each stating a contract rather than a narrative:
 2. **The three-member deployed package** - the exact Class A names, and the explicit
    statement that `install_or_update_launcher.ps1`, `launcher.settings.example.json`, and
    this README are never deployed.
-3. **Launcher parameter surface** - the ten parameters, with the note that
-   `-ExpectedBranch` is mandatory and takes the literal `ANY_BRANCH` sentinel.
+3. **Launcher parameter surface** - the eleven parameters, with the note that
+   `-ExpectedBranch` is mandatory and takes the literal `ANY_BRANCH` sentinel, and that
+   `-AuthorisedLauncherRootWriteSid` is mandatory, carries one or more exact SID strings,
+   has no default, and is the only route by which the authorised write-trustee set reaches
+   the launcher. The README states the parameter and its contract; it carries no SID.
 4. **Exit bands** - `0`, `10`, `20`, `64` propagated from the application; `70` to `73`
    owned by the runtime layer, with the meaning of each.
 5. **Launcher-root entry classes** - Class A, the exact Class B reserved-name syntax
@@ -2141,7 +2704,16 @@ sections, each stating a contract rather than a narrative:
    operator-controlled admission lane, and installer-only rollback authority.
 8. **What the runtime never does** - no Scheduler action, no Git network or state
    mutation, no browser provisioning, no credential creation or rotation, no portal
-   contact.
+   contact, and no access-control-list mutation. The runtime observes launcher-root
+   security and fails closed; it never grants, revokes, or repairs a permission.
+9. **Launcher-root write authority** - that two independent expectations are checked, one
+   against the running token and one against the discretionary access control list, that
+   neither implies the other, that both are terminal, and that the authorised set is
+   host-supplied and never committed. It records that a run principal holding
+   `SeTakeOwnershipPrivilege` or `SeRestorePrivilege` fails by construction, so
+   `LocalSystem` is not a valid unattended run principal for `launcher.ps1`, and that the
+   design permits either separation by account or separation by elevation within one
+   account without requiring a dedicated account.
 
 `docs/runbook.md` gains one new section, **Runtime launcher installation and validation**,
 placed after "Controlled first validation" and before "Recovery guidance". It encodes the
@@ -2169,6 +2741,27 @@ The runbook section must state, without naming any private path:
 - every mutating step is a live-system action requiring separate explicit current-turn
   approval.
 
+The same runbook section encodes design section 14 step 6, which is the host half of
+`EGRT-I31` and the only part of this plan hosted CI cannot discharge:
+
+- the operator supplies `-AuthorisedLauncherRootWriteSid` from the launcher root's intended
+  administrative ownership on that host, as one or more exact SID strings. It is recorded
+  with the other private deployment state, outside Git, and the runbook names the
+  requirement without carrying a value;
+- `launcher.ps1 -ValidateOnly` is run in a context equivalent to the one the unattended job
+  will use: the same account and the same elevation state. The runbook states plainly that
+  `launcher_root_not_writable_by_run_principal` is evaluated against the token of the
+  process running the launcher, so validating from an elevated prompt exercises a principal
+  the scheduled job will not use and a pass obtained that way proves nothing about the job;
+- the runbook does not present `LocalSystem` as a candidate unattended run principal, and
+  states why: the fail-closed presence check for `SeTakeOwnershipPrivilege` and
+  `SeRestorePrivilege` means such a token fails by construction. This is a documentation
+  constraint only. It selects no account, requires no dedicated account, and opens no
+  parent-directory or host-hardening work, which the design review recorded as a residual
+  host observation outside this plan;
+- both launcher-root write checks passing on the production host is owner-verified evidence
+  recorded against `EGRT-I31`, never a claim made by the hosted suite.
+
 `energygrid-bill-downloader/README.md` gains a short **Runtime layer** paragraph pointing
 at `runtime/README.md` and stating that the approved host mechanism the existing
 credential paragraph refers to is now the source-controlled DPAPI import in
@@ -2195,13 +2788,27 @@ makes the launcher "the only thing the Scheduled Task will ever invoke".
      `Register-ScheduledTask`, `New-ScheduledTask`, `Start-ScheduledTask`,
      `Set-ScheduledTask`, or `Unregister-ScheduledTask` command, and still parses cleanly.
    - `test_the_runtime_readme_documents_every_required_contract_section`: assert
-     `runtime/README.md` exists and contains each of the eight required section headings.
+     `runtime/README.md` exists and contains each of the nine required section headings.
    - `test_the_runtime_readme_states_the_exact_class_b_syntax`: assert the reserved prefix
      `.eglauncher-`, the three kinds, and the canonical lowercase GUID pattern all appear
      verbatim, so the documented contract cannot drift from `Test-EgResidueName`.
    - `test_the_runbook_keeps_the_four_migration_concerns_separate` (`EGRT-I30`): assert
      the runbook contains a heading for the new section and names all four concerns as
      distinct items.
+   - `test_the_runbook_encodes_the_equivalent_context_validation_requirement`
+     (`EGRT-I31` host half): assert the runbook's new section states that
+     `launcher.ps1 -ValidateOnly` is run under the same account and elevation state as the
+     unattended job, that a pass from an elevated prompt is not evidence about the job, and
+     that the authorised SID set is operator-supplied on the parameter and recorded outside
+     Git.
+   - `test_no_documentation_file_presents_localsystem_as_the_run_principal`: assert that
+     neither `runtime/README.md`, `docs/runbook.md`, nor
+     `task-scheduler/register_task.example.ps1` names `LocalSystem`, the `NT AUTHORITY`
+     SYSTEM account, or the well-known SYSTEM SID as a candidate unattended run principal,
+     and that `runtime/README.md` states the privilege-presence reason. The assertion matches
+     on those tokens without this plan or the test module carrying the SID literal.
+   - `test_no_documentation_file_carries_a_sid_literal`: assert the `sid_literal` pattern
+     from Task 19 matches nothing in `runtime/README.md` or in the runbook's new section.
    - `test_no_documentation_file_carries_a_private_path` : extend
      `PRIVACY_SCANNED_FILES` from Task 19 to include `runtime/README.md` and assert the
      runbook's new section adds no `^[A-Za-z]:\\` literal beyond the pre-existing
@@ -2237,10 +2844,17 @@ Consumed: the committed workflow
    python -m unittest discover -s tests -v
    ```
 
-   Confirm every `EGRT-T01` to `EGRT-T57` assertion is present and passing (`EGRT-I07`,
-   `EGRT-I08`). Confirm Tier B tests **executed** rather than skipped; a skip on the
-   development host is acceptable only if `powershell.exe` is genuinely absent, and the
-   `CI` companion test guarantees they cannot be silently unexercised in the gate.
+   Confirm every `EGRT-T01` to `EGRT-T71` assertion is present and passing (`EGRT-I07`,
+   `EGRT-I08`), which is seventy-one assertions, not fifty-seven. Confirm Tier B tests
+   **executed** rather than skipped; a skip on the development host is acceptable only if
+   `powershell.exe` is genuinely absent, and the `CI` companion test guarantees they cannot
+   be silently unexercised in the gate. `EGRT-T58`, `EGRT-T59`, and `EGRT-T62` are among the
+   Tier B set, so the Desktop boundary must genuinely run the write-authority checks.
+
+   `EGRT-I31` is **not** claimed by this task. Its offline half is closed by Task 16; its
+   host half is production host state, discharged by the operator step Task 21 documents and
+   recorded as owner-verified evidence. Reporting this suite as green must never be written
+   up as `EGRT-I31` satisfied.
 2. Run the root focused test that shares the workflow trigger, so the n8n error-handler
    boundary is confirmed untouched:
 
@@ -2299,7 +2913,7 @@ Every material design section maps to at least one task, and every acceptance cr
 | 7.3 observed failure classes | 5 |
 | 7.4 publish to absent | 6 |
 | 8 ValidateOnly | 17 |
-| 9.1 host-supplied values | 20 |
+| 9.1 host-supplied values | 16, 20, 21 |
 | 9.2 credential contract | 13 |
 | 9.3 browser-cache binding | 14 |
 | 10.1 governed Git result | 2 |
@@ -2311,7 +2925,8 @@ Every material design section maps to at least one task, and every acceptance cr
 | 14 deployment flow | 21 |
 | 15 migration and recovery ordering | 21 |
 | 16 disaster rebuild | 21 |
-| 17 security and privacy | 16, 19 |
+| 17 security and privacy | 16, 19, 21 |
+| 17.2.1 launcher-root write authority | 16, 19, 21 |
 | 18 Run119 defects | 2, 3, 5, 7 |
 
 | Criterion | Task |
@@ -2322,7 +2937,7 @@ Every material design section maps to at least one task, and every acceptance cr
 | `EGRT-I04` atomic replace rules | 5 |
 | `EGRT-I05` governed Git contract | 2, 3 |
 | `EGRT-I06` ValidateOnly | 17 |
-| `EGRT-I07` all fifty-seven assertions | 22 |
+| `EGRT-I07` all seventy-one assertions | 22 |
 | `EGRT-I08` full suite on Windows | 22 |
 | `EGRT-I09` no workflow modified | 22 |
 | `EGRT-I10` nothing private committed | 19 |
@@ -2346,6 +2961,7 @@ Every material design section maps to at least one task, and every acceptance cr
 | `EGRT-I28` scoped completeness, extras fail closed | 8, 9 |
 | `EGRT-I29` residue never participates | 8, 16 |
 | `EGRT-I30` four migration concerns separate | 21 |
+| `EGRT-I31` launcher-root write authority bound as section 17.2.1 requires | 16 offline; 21 for the host half, which hosted CI does not claim |
 
 Run-instruction contract families A to Q all map: A to Tasks 3, 15, 19, 20; B to Task 10;
 C to Global Constraints and Task 1; D to Tasks 2 and 3; E to Task 13; F to Task 14; G to
@@ -2354,9 +2970,10 @@ Task 5; K to Task 8; L to Task 17; M to Task 21; N preserved throughout (no `EGR
 `EGRT-I` identifier is renumbered anywhere in this plan); O to Task 22; P to Task 21; Q to
 Task 21.
 
-**Result: PASS.** All fifty-seven `EGRT-T` assertions, all thirty `EGRT-I` criteria, all
-thirty-two design sections listed, and all seventeen run-instruction contract families are
-covered.
+**Result: PASS.** All seventy-one `EGRT-T` assertions, all thirty-one `EGRT-I` criteria,
+all thirty-three design sections listed, and all seventeen run-instruction contract families
+are covered. The `EGRT-I31` host half is mapped to an owner action rather than to a suite
+run, and is stated as such rather than counted as covered by CI.
 
 ### 2. Placeholder scan
 
@@ -2366,6 +2983,10 @@ Create, Modify, and Test paths; every function is given an exact signature with 
 parameter attributes; every failure path names its bounded support reference; and every
 test is named. The `REPLACE_WITH_...` tokens in Task 20 are the required committed
 placeholder content mandated by design section 9.1, not plan placeholders.
+
+The `REPLACE_WITH_AUTHORISED_LAUNCHER_ROOT_WRITE_SID` token added by this amendment is the
+same kind of required committed placeholder content, not a plan placeholder, and it is
+never a SID.
 
 **Result: PASS.**
 
@@ -2383,6 +3004,27 @@ placeholder content mandated by design section 9.1, not plan placeholders.
   `Test-EgPythonVersionSupported`, `Test-EgLauncherConfigContract`, and
   `Test-EgLauncherRootSecurity` (Task 16). Its `Checks` ordered dictionary feeds
   `ConvertTo-EgValidationJson` (Task 17).
+- The launcher-root write authority introduced by the installer-principal binding amendment
+  has one declaration of each shared value and one consumer chain.
+  `$script:EgWriteCapableAccessMask` is declared once (Task 16) and is the sole source for
+  `Get-EgMappedWriteCapableMask`, `Test-EgTokenWriteAccessToPath`,
+  `Test-EgPathWriteTrusteesAuthorised`, and every test that asserts against the mask.
+  `$script:EgBypassPrivilegeNames` is declared once and consumed by
+  `Test-EgBypassPrivilegePresent` and by the fail-closed return in
+  `Get-EgTokenPrivilegeNames`. `$script:EgRefusedAuthorisedSid` is declared once and
+  consumed only by `Test-EgAuthorisedWriteSidSet`.
+- The authorised SID set has exactly one route and one shape at every hop:
+  `-AuthorisedLauncherRootWriteSid` as `[string[]]` on `launcher.ps1`, passed unchanged to
+  `Test-EgLauncherRootSecurity` as `[string[]]`, admitted once by
+  `Test-EgAuthorisedWriteSidSet`, and consumed by `Test-EgPathWriteTrusteesAuthorised` as
+  `[System.Security.Principal.SecurityIdentifier[]]`. No task defaults it, caches it,
+  re-derives it, reads it from a file or an environment variable, or emits it.
+- The examined object set for both write checks is the launcher root plus every name from
+  `Get-EgDeployedPackageMemberNames` (Task 8) joined to it under `DD-01`, so the Class A
+  names still have exactly one declaration and the write checks add no second list.
+- `Initialize-EgWin32SecurityInterop` is the only compilation site, is called only from
+  `Get-EgMappedWriteCapableMask` and `Test-EgTokenWriteAccessToPath`, and is never reached
+  at load, so `EGRT-I01` holds with the interop present (`DD-13`).
 - The three Class A fixed names are declared once as
   `$script:EgDeployedPackageMemberNames` (Task 8) and are the sole source for
   `Get-EgDeployedPackageMemberNames` (Task 8), the `Member` field of `Test-EgResidueName`
@@ -2391,9 +3033,10 @@ placeholder content mandated by design section 9.1, not plan placeholders.
 - The twenty-one stable preflight check names in the Ordered preflight check names table
   are the same strings produced by Task 16's `CheckResult` objects and asserted by Task
   16's order test and Task 17's determinism tests.
-- The forty-eight live support references in the vocabulary table are the same set
-  declared as `$script:EgLauncherSupportRefs` (Task 18) and raised by the functions named
-  in that table's third column.
+- The forty-nine live support references in the vocabulary table are the same set declared
+  as `$script:EgLauncherSupportRefs` (Task 18) and raised by the functions named in that
+  table's third column. Task 18 asserts the declared set, the extracted set, and the count
+  agree, so the number is verified rather than asserted.
 - Publication order `DD-10` is used identically by Task 10 Phase 2 and, reversed, by Task
   11 `Get-EgTouchedSet`.
 - The environment-snapshot pair `Get-EgProcessEnvironmentSnapshot` and
@@ -2411,8 +3054,36 @@ a different shape anywhere.
 - Exactly one document is added:
   `energygrid-bill-downloader/docs/runtime_source_durability_implementation_plan.md`.
 - No secret, credential, private absolute path, UNC path, account identity, host identity,
-  or principal identity appears in this document.
+  or principal identity appears in this document. The only SID-shaped literal it contains is
+  `S-1-3-0`, the `CREATOR OWNER` placeholder the design names as refused, which identifies
+  no host principal.
 - `git diff --check` passes.
+
+**Result: PASS.**
+
+### 5. Installer-principal binding amendment reconciliation
+
+This subsection records what the amendment to the controlling specification changed in this
+plan, so a reviewer can check the reconciliation without diffing the whole document.
+
+| Reconciled | From | To |
+| --- | --- | --- |
+| Canonical authority | `main` `0e3d53c...`, tree `d306d016...` | `main` `2c42725...`, tree `084f90a8...`, sole parent `0e3d53c...`, with the original authoring base stated as provenance |
+| `DD-02` | current-identity and group-SID evaluation via `WindowsIdentity::GetCurrent()` | the single prescribed run-token algorithm, reproduced in full, with the union-of-write-rights formulation explicitly prohibited |
+| `DD-03` | a committed allow-list of well-known administrative and service SIDs | exact membership of the host-supplied set, with no built-in allow-list and no prefix, pattern, range, or wildcard form |
+| Ordered check 16 | `launcher_root_write_restricted_to_install_principal` | `launcher_root_write_trustees_authorised`, same position, old name guarded as an absent string |
+| Support reference | `EG_LAUNCHER_ROOT_ACL_WRITE_NOT_RESTRICTED` | `EG_LAUNCHER_ROOT_ACL_WRITE_TRUSTEE_UNAUTHORISED`, plus `EG_LAUNCHER_ROOT_AUTHORISED_SID_SET_INVALID` for `DD-12` admission |
+| Launcher parameter surface | ten parameters | eleven, adding mandatory `-AuthorisedLauncherRootWriteSid`; the installer surface is unchanged, because design section 6.1 gives it no equivalent |
+| Assertions | `EGRT-T01` to `EGRT-T57`, `EGRT-I01` to `EGRT-I30` | `EGRT-T01` to `EGRT-T71`, `EGRT-I01` to `EGRT-I31`; no existing identifier renumbered |
+| Vocabulary count | forty-eight | forty-nine, recomputed from the table and asserted by Task 18 |
+| New derived decisions | `DD-01` to `DD-11` | `DD-12` SID-set admission and `DD-13` lazy Win32 interop appended; no existing entry renumbered |
+
+Deliberately unchanged: Option 2, the Class A, B, and C boundary, manifest verification, the
+installer transaction, explicit-backup `File.Replace`, rollback semantics, the Run119 Git
+result shape, DPAPI, browser-cache binding, source integrity, migration recovery, the
+Scheduler gates, the n8n boundary, and the existing publication contract. The design review's
+residual parent-directory and host-hardening observation is recorded as outside this plan and
+is not reopened here.
 
 **Result: PASS.**
 
