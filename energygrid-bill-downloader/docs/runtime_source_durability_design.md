@@ -183,6 +183,7 @@ approved.
 | `-CredentialPath` | yes | Absolute path to the private DPAPI PSCredential CLIXML artefact, section 9.2 |
 | `-BrowserCachePath` | yes | Absolute path to the approved private Playwright browser cache, section 9.3 |
 | `-ExpectedBranch` | yes | Branch the deployed checkout must be on, or the literal `ANY_BRANCH`, section 10.3 |
+| `-AuthorisedLauncherRootWriteSid` | yes | One or more SID strings naming the exhaustive set of trustees permitted to hold write-capable access on the launcher root, section 17.2.1 |
 | `-Command` | no | `run` (default) or `list` |
 | `-LogRoot` | no | Private diagnostics root for the launcher's own terminal event |
 | `-ValidateOnly` | no | Switch, contract in section 8 |
@@ -195,6 +196,12 @@ disabled by omitting an argument. There is no parameter that accepts a credentia
 value, no portal parameter, no browser-install parameter, no commit-pin parameter, and
 no headed switch. `--headed` remains an application concern reached through a
 separately approved manual invocation, not through the launcher.
+
+`-AuthorisedLauncherRootWriteSid` is the launcher root's write-authority binding. It is
+mandatory for the same reason `-ExpectedBranch` is: omitting an argument must never
+silently disable a security expectation. It carries SID strings rather than principal
+names, it has no default, and its contract is section 9.1 with its evaluation in section
+17.2.1.
 
 The launcher deliberately has no `-ExpectedCommit`. Pinning normal unattended execution
 to one fixed whole-repository commit is the wrong contract for a monorepo, and section
@@ -227,8 +234,19 @@ launcher never continues past a failed check, and never downgrades one to a warn
 6. Governed source integrity over the EnergyGrid runtime-critical surface passes
    (section 10.3).
 7. The private browser cache resolves and passes its readiness check (section 9.3).
-8. Security expectations on the launcher root hold: ACL, reparse-point, and read-only
-   checks (section 17.2).
+8. Security expectations on the launcher root hold, in the order the section 17.2
+   table lists them (section 17.2.1 defines the exact semantics):
+   a. `launcher_root_not_writable_by_run_principal`: the token this launcher process
+      is actually running under has no write-capable effective access to the launcher
+      root or to any package member.
+   b. `launcher_root_write_trustees_authorised`: every trustee holding a write-capable
+      grant on the launcher root or on a package member, and each examined object's
+      owner, is inside the set supplied on `-AuthorisedLauncherRootWriteSid`.
+   c. `launcher_files_not_reparse_points` and
+      `launcher_files_not_unexpectedly_readonly`.
+   Check 8a asks Windows to evaluate the running token. Check 8b inspects the
+   discretionary access control list. They are different questions, neither implies
+   the other, and both are terminal.
 9. The private DPAPI credential artefact imports and yields a non-empty username and a
    non-empty password (section 9.2).
 
@@ -826,6 +844,15 @@ without owner approval for a mutating action.
 - It records only `credential_import_ok`, `username_nonempty`, and `password_nonempty`
   as booleans. It never emits, logs, hashes, measures, or otherwise derives a reportable
   quantity from either credential value.
+- It never emits the value supplied on `-AuthorisedLauncherRootWriteSid`, any other SID,
+  any trustee or owner name, or any count derived from them. The two launcher-root write
+  checks reach the output as a check name and a pass or fail outcome, nothing more.
+- `launcher_root_not_writable_by_run_principal` is evaluated against the token of the
+  process actually running the launcher. A `-ValidateOnly` run performed from an elevated
+  prompt, or under any account other than the one the unattended job uses, therefore
+  tests a principal the job will not use; it may legitimately fail, and a pass obtained
+  that way is not evidence about the job. Section 14 step 6 states the operator
+  requirement that follows.
 - It emits exactly one JSON object on standard output: a `checks` map of check name to
   outcome, an overall `status`, and a `support_ref` when the overall status is not a
   pass. The object contains no path, no environment value, no credential value, no
@@ -850,6 +877,18 @@ without owner approval for a mutating action.
   a command line, never in a log, never in the repository.
 - The launcher writes only to the private diagnostics root supplied by `-LogRoot`, and
   only the single terminal event described in section 11.
+- The exhaustive set of trustees permitted to hold write-capable access on the launcher
+  root is host-specific, so it is supplied explicitly, on
+  `-AuthorisedLauncherRootWriteSid`. The operator who performs the installation supplies
+  it, from the launcher root's intended administrative ownership on that host. Its
+  accepted representation is one or more SID strings in the standard `S-R-I-S-S...`
+  textual form. Account names are not accepted: names are ambiguous, locale-dependent,
+  and accepting them would make a security check depend on a name-resolution lookup
+  performed at check time. The parameter is the only route by which the value reaches
+  the launcher; there is no default, no committed example value, no environment-variable
+  form, and no file the launcher reads it from. Any private operator record of the value
+  lives with the other private deployment state, outside Git. The value is never written
+  to a log, to the terminal event, or to `-ValidateOnly` output.
 
 ### 9.2 DPAPI credential loading, injection, and cleanup
 
@@ -1206,6 +1245,37 @@ runtimes.
 | `EGRT-T55` | A lookalike residue name fails closed for each malformation independently: wrong prefix, wrong field count, unknown kind, unrecognised member, and non-canonical GUID | A |
 | `EGRT-T56` | If `launcher.ps1`, `launcher_lib.ps1`, or the manifest is missing or invalid, recognised residue cannot satisfy the missing member and preflight fails | A |
 | `EGRT-T57` | No recognised residue path is ever dot-sourced, invoked, imported, or selected as a fallback, and the launcher never enumerates the root to locate a script or library | A and C |
+| `EGRT-T58` | An authorised write-capable trustee, supplied as an exact SID, passes `launcher_root_write_trustees_authorised` against a synthetic scratch launcher root and each of its package members | A and B |
+| `EGRT-T59` | `launcher_root_not_writable_by_run_principal` reports a scratch root that grants the checking token no write-capable right as non-writable, and reports one that grants it any write-capable right as writable | A and B |
+| `EGRT-T60` | A write-capable access-allowed entry for a trustee outside the supplied set fails closed, on the directory and on a package member independently | A |
+| `EGRT-T61` | A write-capable entry for an unrelated service SID beneath `S-1-5-80-` fails closed, and no prefix, pattern, range, or wildcard form is accepted anywhere in the supplied set | A and C |
+| `EGRT-T62` | Same-account separation is proven rather than assumed: against one scratch root whose only write-capable grant is a group identity, a token in which that identity is deny-only is reported non-writable while the same token before restriction is reported writable | A and B |
+| `EGRT-T63` | No SID string, trustee name, owner identity, or count derived from them appears in `-ValidateOnly` output, the terminal event, the result object, or any committed runtime file, example settings file, or test | A and C |
+| `EGRT-T64` | An inherited write-capable access-allowed entry is evaluated exactly as an explicit one, and fails closed when its trustee is outside the supplied set | A |
+| `EGRT-T65` | An access-denied entry never authorises a trustee: a root carrying both a write-capable allow entry for an unauthorised trustee and a deny entry for that same trustee still fails `launcher_root_write_trustees_authorised`, in either entry order | A |
+| `EGRT-T66` | `WRITE_DAC`, `WRITE_OWNER`, and `DELETE` are each treated as write-capable independently, and an examined object whose owner is outside the supplied set fails closed even when no explicit write-capable entry exists | A |
+| `EGRT-T67` | An object carrying no discretionary access control list fails both launcher-root write checks rather than passing them | A |
+| `EGRT-T68` | An inheritable write-capable `CREATOR OWNER` entry fails closed, and `S-1-3-0` is refused if it is supplied in the authorised set | A |
+| `EGRT-T69` | A checking token holding `SeTakeOwnershipPrivilege` or `SeRestorePrivilege` fails `launcher_root_not_writable_by_run_principal` even where the access control list grants it nothing | A |
+
+`EGRT-T58` to `EGRT-T69` are offline synthetic tests. They construct scratch directories
+carrying deliberately shaped security descriptors, and where a case needs a token with a
+deny-only group identity they derive it from the test process's own token by restricting
+it, which is an operation any process may perform on itself. That is what makes the
+deny-only case in `EGRT-T62` provable in hosted CI without an elevated host, a second
+account, or the production launcher root.
+
+What hosted CI cannot prove is that the *production* launcher root and the *production*
+run principal satisfy the two checks. That is host state. It is proven only by
+`launcher.ps1 -ValidateOnly` executed under section 14 step 6, in a context equivalent to
+the unattended job, and it is recorded separately as `EGRT-I31` rather than being claimed
+here.
+
+These twelve identifiers are appended rather than folded into existing ones because no
+existing assertion evaluates a security descriptor or an access token at all. `EGRT-T48`
+asserts only that a failing non-secret check stops the run before the credential import;
+it says nothing about whether the security check itself is correct. `EGRT-T01` to
+`EGRT-T57` are unchanged and are not renumbered.
 
 ### 12.3 Testability without production fallbacks
 
@@ -1300,7 +1370,12 @@ the scope and whitespace guard, which accepts the changed path because it is und
    installer-owned reverse-order package rollback under section 6.5. Not every install
    uses `File.Replace`: on a clean host every member is `Absent` and none of them do.
 6. `launcher.ps1 -ValidateOnly` is run to confirm runtime binding, security
-   expectations, and configuration reachability on the host.
+   expectations, and configuration reachability on the host. It is run in a context
+   equivalent to the one the unattended job will use: the same account, and the same
+   elevation state. `launcher_root_not_writable_by_run_principal` is evaluated against
+   the token of the process running the launcher, so validating from an elevated prompt
+   exercises a principal the scheduled job will not use, and a pass obtained that way
+   proves nothing about the scheduled job.
 7. Scheduling remains blocked. Task Scheduler registration, headed validation, and any
    live run each require their own separate approval and are out of scope here.
 
@@ -1514,13 +1589,17 @@ of this list over the committed runtime files, the example settings file, and th
 
 ### 17.2 Expressed without private identities
 
-Security expectations are recorded as named checks with expected outcomes. The
-principal, SID, and paths they are evaluated against are supplied at deployment.
+Security expectations are recorded as named checks with expected outcomes. The paths
+they are evaluated against, and the authorised write-trustee set the launcher-root
+checks compare against, are supplied at deployment: the paths on their existing
+parameters, and the trustee set on `-AuthorisedLauncherRootWriteSid`. No principal or
+SID is committed, defaulted, or inferred from a name. Section 17.2.1 states exactly
+how the two launcher-root write checks are evaluated.
 
 | Check name | Expected outcome |
 | --- | --- |
-| `launcher_root_not_writable_by_run_principal` | The principal the scheduled job runs as has no write, modify, or full-control grant on the launcher root, so a compromised run cannot rewrite its own launcher |
-| `launcher_root_write_restricted_to_install_principal` | Write access is limited to the administrative principal that performs installation |
+| `launcher_root_not_writable_by_run_principal` | The token the launcher is actually running under has no write-capable effective access to the launcher root or to any package member, so a compromised run cannot rewrite its own launcher |
+| `launcher_root_write_trustees_authorised` | Every trustee holding a write-capable access-allowed grant on the launcher root or on a package member, and every examined object's owner, is inside the exhaustive set supplied on `-AuthorisedLauncherRootWriteSid`; any other write-capable trustee is terminal |
 | `launcher_root_entries_classified` | Every launcher-root entry is an exact Class A package member or a valid Class B reserved residue name; any Class C entry is terminal, per section 6.7 |
 | `launcher_files_not_reparse_points` | Neither installed file, nor the destination directory, is a symlink, junction, or other reparse point |
 | `launcher_files_not_unexpectedly_readonly` | No installed file carries an unexplained read-only attribute |
@@ -1529,6 +1608,141 @@ principal, SID, and paths they are evaluated against are supplied at deployment.
 
 A failed security check is a terminal preflight failure. It is never downgraded to a
 warning and never bypassed by a switch.
+
+`launcher_root_write_trustees_authorised` supersedes the earlier check name
+`launcher_root_write_restricted_to_install_principal`, which is retired vocabulary and
+must not be emitted. The replacement occupies the same position in the ordered preflight.
+The old name was narrowed rather than kept because it was misleading twice over: the
+check cannot observe which principal actually performed an installation, and on a real
+host the authorised write set is not necessarily a single principal.
+
+### 17.2.1 Launcher-root write authority, exactly
+
+Two different questions are being asked about the launcher root, and Windows answers them
+by two different mechanisms. Conflating them is the defect this subsection exists to
+prevent.
+
+**Security objects examined.** Both checks are evaluated against the launcher-root
+directory *and* each Class A package member individually. A member's own discretionary
+access control list can differ from the directory's, and directory-level authority to add
+or delete children is by itself sufficient to replace a member, so neither object alone is
+enough.
+
+**Rights treated as write-capable.** After generic mapping, any of `FILE_WRITE_DATA` /
+`FILE_ADD_FILE`, `FILE_APPEND_DATA` / `FILE_ADD_SUBDIRECTORY`, `FILE_WRITE_EA`,
+`FILE_WRITE_ATTRIBUTES`, `FILE_DELETE_CHILD`, `DELETE`, `WRITE_DAC`, and `WRITE_OWNER`.
+`WRITE_DAC` and `WRITE_OWNER` are included deliberately. Windows defines them as the right
+to modify the discretionary access control list and the right to change the owner, so a
+trustee holding either can grant itself every other right at will; treating them as
+read-level rights would make both checks decorative.
+
+**`launcher_root_write_trustees_authorised`.**
+
+- *Inputs.* The set supplied on `-AuthorisedLauncherRootWriteSid`, and the security
+  descriptor of each examined object.
+- *Evaluation.* Enumerate every access-allowed entry whose access mask intersects the
+  write-capable set. Each such entry's trustee SID must be a member of the supplied set.
+  Separately, each examined object's owner SID must also be a member of the supplied set,
+  because an owner implicitly holds `WRITE_DAC` and can therefore restore write access to
+  itself whenever it chooses.
+- *Inherited entries.* An inherited access-allowed write-capable entry is treated exactly
+  as an explicit one. Inheritance describes where an entry came from, not how much access
+  it grants.
+- *Access-denied entries.* Ignored by this check. A deny entry can only reduce access,
+  never authorise it, and whether a given deny entry actually neutralises a given allow
+  entry depends on their order in the list, which Windows walks in sequence. Cancelling an
+  allow against a deny here would let a badly ordered list conceal a real grant.
+- *`CREATOR OWNER` (`S-1-3-0`).* Windows defines this as a placeholder replaced, when an
+  inheritable entry is inherited, by the SID of whoever created the new object. An
+  inheritable write-capable `CREATOR OWNER` entry therefore describes an unbounded future
+  write set rather than a principal. It is terminal, and `S-1-3-0` may not be placed in
+  the supplied set.
+- *No wildcards.* The supplied set is an exhaustive list of exact SID strings. No prefix,
+  pattern, range, or wildcard form is accepted. A rule of the form "any SID beginning
+  `S-1-5-80-`" is specifically prohibited: `S-1-5-80` is the service-account SID prefix,
+  so such a rule would authorise every service configured on the host rather than a named
+  authority.
+- *Well-known SIDs are not implicitly authorised.* `S-1-5-32-544` (Administrators),
+  `S-1-5-18` (SYSTEM, which Windows documents as a hidden member of Administrators), and
+  every other well-known SID are accepted only where the operator has supplied them
+  explicitly. A principal that merely happens to be an administrator is not a principal
+  this design trusts by default.
+- *PASS.* Every write-capable allow trustee, and every examined object's owner, is in the
+  supplied set.
+- *FAIL.* Any other write-capable allow trustee; any examined owner outside the set; a
+  write-capable `CREATOR OWNER` entry; an object with no discretionary access control list
+  at all, because Windows grants all access in that case; or a security descriptor that
+  cannot be read.
+- *Support reference.* `EG_LAUNCHER_ROOT_ACL_WRITE_TRUSTEE_UNAUTHORISED`.
+
+**`launcher_root_not_writable_by_run_principal`.**
+
+- *Inputs.* The access token of the process actually running the launcher, and the
+  security descriptor of each examined object.
+- *Evaluation.* A Windows access check of the write-capable mask against each object's
+  security descriptor, using that token. The token is supplied to the check as a token. It
+  is never reconstructed from an account name or from a SID.
+- *Why a token and not a trustee.* This is the whole point of the check. A security
+  context rebuilt from a SID recomposes group membership as enabled, which is precisely
+  the information a filtered token does not carry. The trustee-based effective-rights
+  helper additionally ignores the owner's implicit rights, ignores privileges, ignores
+  logon-session identities such as `Batch` and `Interactive`, is documented as superseded,
+  and fails outright when the list contains an inherited access-denied entry. Only a
+  token-based access check observes deny-only group attributes, access-denied entries,
+  entry order, and logon-session identities together.
+- *Privilege bypass.* A token holding `SeTakeOwnershipPrivilege` or `SeRestorePrivilege`
+  can reach the object whatever the list says, so the check also fails when either is
+  present in the running token. This is a bounded rule, not an exhaustive one: no
+  discretionary-access-list check can fully constrain a principal that has been granted
+  list-bypassing privileges, and claiming otherwise would be dishonest.
+- *PASS.* No write-capable right is granted on the launcher-root directory or on any
+  package member, and neither bypass privilege is present.
+- *FAIL.* Any write-capable right granted on any examined object; either bypass privilege
+  present; an object with no discretionary access control list; or a token or security
+  descriptor that cannot be read.
+- *Support reference.* `EG_LAUNCHER_ROOT_ACL_RUN_PRINCIPAL_WRITABLE`.
+
+Neither check emits a SID, a trustee name, an owner identity, a path, or any count derived
+from them. Only the check name, the pass or fail outcome, and the bounded support
+reference reach any surface, per sections 8 and 11.2.
+
+**The same-account case, which is why this subsection exists.**
+
+On this host the human who installs and the identity the unattended job runs as may be the
+same Windows account. That case has to be reasoned about directly, because the obvious
+binding is wrong.
+
+When a member of the local Administrators group signs in, Windows builds two tokens: a
+full administrator token, and a filtered standard-user token that contains the same
+user-specific information but from which the administrative privileges and SIDs have been
+removed. In the filtered token the Administrators group identity is present as a deny-only
+identity, and Windows ignores access-allowed entries for a deny-only identity while still
+honouring access-denied entries for it. The account's own *user* SID is not filtered. It is
+enabled in both tokens, and Windows does not permit a token's user SID to be disabled.
+
+Three consequences follow, and together they decide the design.
+
+1. Binding write authority to the installing account's **user SID** does not separate the
+   two contexts at all. The same user SID is enabled in the elevated installer token and in
+   the unattended token, so an allow entry keyed to it grants write to the unattended run
+   as well. Where installer and run principal are the same account, that binding alone
+   fails the very property it was meant to establish.
+2. Binding write authority to an **administrative group identity** does separate them, but
+   only while the host keeps the conditions that produce a filtered token. A scheduled task
+   set to run with highest privileges receives the full token; the run-level setting is
+   documented as ignored entirely when User Account Control is turned off; and the
+   local-account token-filter policy can be set to build an elevated token instead. None of
+   that is visible in the launcher root's access control list.
+3. The trustee binding therefore cannot be trusted on its own, whichever principal form the
+   host uses. The design keeps it, because it is what stops an unexpected writer, and pairs
+   it with a check that asks Windows directly whether *this* token can write. Where the
+   host is configured such that the unattended run really can write the launcher root, that
+   second check fails and the run stops, however defensible the access control list looked.
+
+This also means the design does not force a dedicated run account. A host may separate
+installer and run principals by account, or may rely on elevation separation within one
+account. Both are permitted deployments, neither is assumed, and the run-principal check is
+what makes the difference observable rather than asserted.
 
 ### 17.3 Diagnosability without disclosure
 
@@ -1609,7 +1823,7 @@ prohibited. Only the behaviour they proved is carried forward, in the form above
 | `EGRT-I04` | `Invoke-AtomicFileReplace` implements every rule in section 7.2, with a mandatory explicit backup path |
 | `EGRT-I05` | `Invoke-GovernedGit` implements the section 10 result contract and environment neutralisation |
 | `EGRT-I06` | `-ValidateOnly` satisfies section 8, including deterministic output and zero mutation |
-| `EGRT-I07` | All fifty-seven assertions `EGRT-T01` to `EGRT-T57` are implemented and pass |
+| `EGRT-I07` | All sixty-nine assertions `EGRT-T01` to `EGRT-T69` are implemented and pass |
 | `EGRT-I08` | The full project suite passes on Windows via `python -m unittest discover -s tests -v` |
 | `EGRT-I09` | No GitHub Actions workflow is modified |
 | `EGRT-I10` | No secret, credential, private absolute path, or private identity is committed |
@@ -1633,6 +1847,7 @@ prohibited. Only the behaviour they proved is carried forward, in the form above
 | `EGRT-I28` | Manifest completeness is scoped to the deployed package while arbitrary unexpected root entries still fail closed |
 | `EGRT-I29` | Recognised installer residue never participates in execution, import, fallback, or package membership |
 | `EGRT-I30` | The implementation and runbook migration procedure encodes the `EGRT-D08` ordering and keeps four concerns clearly separate: installer transaction backup cleanup, migration recovery holding, launcher functional validation, and later separately authorised recovery-copy retirement or restoration |
+| `EGRT-I31` | Launcher-root write authority is bound as section 17.2.1 requires: the authorised write-trustee set arrives only on `-AuthorisedLauncherRootWriteSid`, the run-principal check is evaluated against the running token rather than a reconstructed trustee, and both checks pass on the production host under `launcher.ps1 -ValidateOnly` executed in a context equivalent to the unattended job. The host half of this criterion is host state and is not claimed by hosted CI |
 
 Acceptance of this document is an architectural decision only. It does not approve the
 implementation change, the first installation, the scheduler, or any live run. Each of
