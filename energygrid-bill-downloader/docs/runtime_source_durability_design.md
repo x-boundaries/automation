@@ -88,7 +88,7 @@ constrained by it.
 | ValidateOnly behaviour | A switch on both entry scripts, contract in section 8 |
 | Runtime binding and validation rules | Pure library predicates, contract in section 5 |
 | Atomic replacement semantics | `Invoke-AtomicFileReplace`, contract in section 7 |
-| Rollback semantics | Same function's failure path, contract in section 7 |
+| Rollback semantics | Installer transaction only, contract in section 6.5 |
 | Exception and diagnostic reporting | Bounded `EG_LAUNCHER_*` vocabulary, section 11 |
 | Security and ACL expectations | Named checks with expected outcomes, section 17 |
 | Reusable environment hardening | Governed Git invocation, section 10 |
@@ -256,9 +256,9 @@ status:
 | --- | --- |
 | `0`, `10`, `20`, `64` | Propagated unchanged from the application child process |
 | `70` | Launcher preflight or validation failed; no child process was started |
-| `71` | Installation or update failed; destination left at its accepted preimage |
-| `72` | Post-replacement verification failed; rollback performed and verified |
-| `73` | Rollback failed; manual owner action required |
+| `71` | Installation failed before any destination was mutated; the installed package is unchanged |
+| `72` | Installation or package verification failed before acceptance; installer-owned package rollback completed and was positively verified |
+| `73` | Package rollback failed, could not be verified, or an advanced destination had no recoverable preimage; manual owner action required |
 
 The disjointness of the two bands is asserted by a test, not left to convention.
 
@@ -378,8 +378,13 @@ section 6.6. Any failure before acceptance triggers package rollback under secti
 - Staging and backup files are created in the destination directory only, are owned by
   the operation (a GUID-shaped component in the name), and are never created in a
   shared temporary directory.
-- A file the installer did not create is never deleted. On any failure path, artefacts
-  are retained for inspection rather than cleaned up.
+- A file the installer did not create is never deleted.
+- Failure-path retention is scoped, not blanket. Installed package destinations are
+  restored or removed exactly as section 6.5 requires: a destination whose preimage was
+  `Absent` is removed and confirmed absent after a verified rollback, and is **not** kept
+  behind for diagnosis. What may be retained for inspection is transaction-owned residue
+  that rollback did not consume: staging files, unused backups, and diagnostic artefacts.
+  Retention must never obstruct restoring the package to its exact pre-transaction state.
 
 ### 6.4 Installed-launcher integrity manifest
 
@@ -413,10 +418,27 @@ against an attacker who already has write access to the launcher root.
 
 ### 6.5 Package rollback
 
+The installer transaction is the **only** rollback authority in this design. Neither
+section 7 primitive restores anything; they publish and report, and section 6.5 decides.
+That single-owner rule is what keeps reverse-order restoration correct, because only the
+installer knows which members advanced and in what order.
+
 Any failure after the first destination mutation and before package acceptance triggers
-package rollback. Rollback proceeds in **reverse publication order**, using the recorded
-transaction state from Phase 2, and it covers the manifest exactly as it covers the
-executable members.
+package rollback. Rollback proceeds in **reverse publication order** over the **touched
+set**, using the recorded transaction state from Phase 2, and it covers the manifest
+exactly as it covers the executable members.
+
+**Membership of the touched set is decided by `PublicationOccurred`, not by which member
+failed.** A member enters the touched set when its publication advanced the destination.
+The member whose failure ended the transaction is therefore included only if it actually
+advanced:
+
+- Current member, Case A of section 7.2.1 (threw before publication): it did not advance.
+  Do not attempt to restore it. Verify it still hashes to its recorded preimage, then roll
+  back only the earlier members that did advance.
+- Current member, Case B (returned, postimage verification failed): it advanced. It is the
+  most recent entry in the touched set, so it is restored first, then the earlier members
+  in reverse order.
 
 - **Preimage `Existing`.** Restore the exact retained backup over the destination using
   the explicit-backup replacement semantics of section 7.2, then re-hash the restored
@@ -504,8 +526,14 @@ Invoke-PublishToAbsentDestination # preimage ABSENT, contract in section 7.4
 
 Both return a structured result object carrying `Success`, `SupportRef`,
 `ExceptionTypeName`, `HResult`, `PreimageState` (`Existing` or `Absent`),
-`PreimageSha256` (empty when absent), `PostimageSha256`, `BackupRetained`, and
-`RolledBack`.
+`PreimageSha256` (empty when absent), `PostimageSha256`, `PublicationOccurred`,
+`BackupCreated`, and `BackupRetained`.
+
+There is no `RolledBack` field, because neither primitive ever rolls back. The fields
+that matter to a failed caller are `PublicationOccurred`, which says whether the
+destination advanced and therefore whether the member joins the transaction's touched
+set, and `BackupCreated`, which says whether a preimage backup actually exists to restore
+from. Section 7.2.1 defines both precisely.
 
 ### 7.2 Mandatory rules
 
@@ -518,21 +546,81 @@ Both return a structured result object carrying `Success`, `SupportRef`,
 2. **Success is positively verified, never assumed.** After the call returns, the
    destination is re-hashed and compared to `-ExpectedSha256`. A returned call is not
    treated as a successful replacement until that comparison passes.
-3. **The primitive never deletes the backup.** Per-file verification proves one
-   publication; it does not prove the package is consistent. `Invoke-AtomicFileReplace`
-   therefore always returns with `BackupRetained` true and leaves the backup in place,
-   whether it succeeded or failed, and reports the backup path in its result. Authority
-   to reap a backup belongs to the installer's transaction commit phase (section 6.6)
-   and to nothing else. A caller publishing a single file outside a package transaction
-   owns that decision explicitly rather than inheriting it silently.
-4. **Rollback restores the accepted preimage.** If verification fails, the backup is
-   restored over the destination using the same explicit-backup mechanism (a second,
-   distinct same-directory backup path), the restored destination is re-hashed and
-   compared to the recorded preimage hash, and the result is `72` on a verified
-   restore or `73` when the restore itself cannot be verified.
+3. **The primitive never deletes a backup, and never fabricates one.** Per-file
+   verification proves one publication; it does not prove the package is consistent, so
+   authority to reap belongs to the installer's transaction commit phase (section 6.6)
+   and to nothing else. Retention is therefore unconditional but existence is not:
+   whenever the destination actually advanced, `ReplaceFileW` created the preimage
+   backup, and that backup is left in place and reported. When the call threw before the
+   destination advanced, Windows may never have created a backup at all, and the
+   primitive does not pretend otherwise. `BackupCreated` reports what was observed on
+   disk, not what `-BackupPath` requested; supplying a backup path is not evidence that a
+   backup file exists. A caller publishing a single file outside a package transaction
+   owns the reap decision explicitly rather than inheriting it silently.
+4. **The primitive never rolls back.** It publishes and reports; it does not restore. On
+   any failure it leaves the destination exactly as the failure left it, leaves any
+   created backup in place, and returns the state the caller needs to decide what to do.
+   Restoring a preimage is the installer transaction's exclusive responsibility under
+   section 6.5, because only the installer knows which other package members have already
+   advanced and in what order they must be undone. A primitive that quietly restored
+   itself would race the installer's own rollback for the same member and could leave the
+   package half-undone.
 5. **Exceptions are classified, never swallowed.** Every failure records the exception
    type name and the HRESULT formatted as `0x%08X`, mapped to a bounded support
-   reference (section 11). No exception message text reaches any output surface.
+   reference (section 11). No exception message text reaches any output surface, and no
+   control-flow decision anywhere is made by reading exception text.
+
+### 7.2.1 The two existing-destination failure states
+
+A failed replacement is not one condition but two, and conflating them is what makes a
+package transaction incoherent. The distinction is drawn from explicit execution and
+observed filesystem state, never from an exception message.
+
+**Precondition that makes this decidable.** A member reaches publication only when its
+source hash differs from its installed preimage hash; Phase 1 classifies anything else as
+already current and publishes nothing. Preimage and postimage hashes are therefore always
+distinguishable for any member that is actually published.
+
+**Determination.** `PublicationOccurred` is true when the `File.Replace` call returned
+normally, a flag set immediately after the call and before any verification work. It is
+also true when the call threw but the destination's observed hash no longer equals the
+recorded preimage, which means the destination advanced regardless of the exception. It
+is false only when the call did not return normally **and** the destination still hashes
+to its recorded preimage.
+
+**Case A, threw before publication.** The sharing-violation, access-denied, and
+invalid-argument classes in section 7.3 all behave this way.
+
+| Field | Value |
+| --- | --- |
+| `Success` | false |
+| `PublicationOccurred` | false |
+| Destination | still the recorded preimage, verified by hash |
+| `BackupCreated` | whatever was observed, normally false |
+| `BackupRetained` | equals `BackupCreated`; nothing is created to satisfy the contract |
+
+The member did **not** advance, so the installer does not add it to the touched set and
+does not attempt to restore it. The installer still rolls back every earlier member that
+did advance.
+
+**Case B, returned but postimage verification failed.**
+
+| Field | Value |
+| --- | --- |
+| `Success` | false |
+| `PublicationOccurred` | true |
+| Destination | advanced; no longer the preimage |
+| `BackupCreated` | true |
+| `BackupRetained` | true; the primitive does not restore or reap it |
+
+The member **did** advance, so the installer adds it to the touched set and section 6.5
+restores it first, then walks the earlier touched members in reverse publication order.
+
+**The one unrecoverable combination.** If `PublicationOccurred` is true but the preimage
+backup is not present on disk, the destination has advanced with no way back. That is
+reported as `EG_LAUNCHER_REPLACE_PREIMAGE_UNRECOVERABLE` and drives exit `73`, manual
+owner action required. It is called out rather than left implicit because it is the only
+state in which the design cannot restore what it changed.
 
 ### 7.3 Observed failure classes the contract must handle
 
@@ -549,8 +637,14 @@ compatibility boundary, Windows PowerShell 5.1 on .NET Framework 4.x:
 
 Because the invalid-argument rejection happens before the filesystem is touched, the
 destination is byte-identical afterwards. The design turns that observation into an
-asserted post-condition: on every failure class above, the destination hash equals the
-recorded preimage hash.
+asserted post-condition, scoped precisely: every failure class in the table above throws
+before publication, so each is a Case A failure under section 7.2.1, and for each the
+destination hash equals the recorded preimage hash and `PublicationOccurred` is false.
+
+That post-condition belongs to these throw-before-publication classes only. It is
+explicitly **not** claimed for a post-publication verification failure, where
+`File.Replace` returned and the destination has already advanced. Asserting it there
+would be false, and the earlier wording of `EGRT-T10` came close to implying it.
 
 A compatibility note that the implementation must respect: the null-backup rejection is
 an observed behaviour of the Windows PowerShell 5.1 and .NET Framework 4.x boundary.
@@ -951,9 +1045,9 @@ runtimes.
 | `EGRT-T07` | `$null` and `''` backup arguments are refused by the mandatory-parameter contract, on every runtime | A and B |
 | `EGRT-T08` | No committed `File.Replace` call site passes a literal `$null`, a literal `''`, or a variable not proven non-empty as the third argument | C |
 | `EGRT-T09` | Replacement exception type name and HRESULT are surfaced for the sharing-violation (`0x80070020`) and access-denied (`0x80070005`) classes | B |
-| `EGRT-T10` | Every replacement failure class leaves the destination hash equal to the recorded preimage hash | A and B |
-| `EGRT-T11` | The primitive verifies the post-replacement hash before returning and never removes the backup itself: the backup is present after success and after failure, and the result reports it retained | A |
-| `EGRT-T12` | A deliberately wrong `-ExpectedSha256` triggers rollback, the destination is restored to the recorded preimage hash, and the result is `72` | A |
+| `EGRT-T10` | Every throw-before-publication failure class leaves the destination hash equal to the recorded preimage and reports `PublicationOccurred` false; the assertion is scoped to those classes and is not claimed for a post-publication verification failure | A and B |
+| `EGRT-T11` | Backup semantics are conditional and the primitive never reaps: after a verified publication the preimage backup is retained, after a post-publication verification failure it is retained, and after a throw before publication the destination remains at its preimage with no backup required to exist | A |
+| `EGRT-T12` | A deliberately wrong `-ExpectedSha256` after a returned `File.Replace` fails with `PublicationOccurred` true and the preimage backup retained, the primitive performs no self-rollback, and the installer transaction then restores the destination to the exact recorded preimage and reports the verified rolled-back result with exit `72` | A |
 | `EGRT-T13` | No credential value, account identity, private absolute path (`^[A-Za-z]:\\`), or UNC path (`^\\\\`) appears in any committed runtime file, example settings file, or test | C |
 | `EGRT-T14` | `-ValidateOnly` mutates nothing: a full recursive snapshot of path, size, modification time, and hash across the scratch launcher root, config path, and runtime roots is identical before and after, with no file created or removed | A |
 | `EGRT-T15` | Repeated validation is idempotent: two consecutive `-ValidateOnly` runs produce byte-identical standard output and identical filesystem snapshots | A |
@@ -997,10 +1091,17 @@ runtimes.
 
 `-ExpectedSha256` is a mandatory production parameter, not a test hook. Passing a
 deliberately wrong value is a legitimate caller error, and it is what lets `EGRT-T12`
-exercise the rollback path without adding a test-only branch, a mock seam, or a
-compatibility fallback to production code. Similarly, the ordering assertion in
-`EGRT-T11` is made against observable post-conditions (backup present or absent) rather
-than against injected instrumentation.
+drive a genuine Case B failure, a `File.Replace` that returned while verification fails,
+without adding a test-only branch, a mock seam, or a compatibility fallback to production
+code. That is the only way to exercise installer-owned rollback against a member that
+really did advance.
+
+`EGRT-T11` is likewise asserted against observable post-conditions, the presence or
+absence of the backup file and the reported `BackupCreated` and `PublicationOccurred`
+state, rather than against injected instrumentation. Because those two booleans come from
+explicit execution state and observed filesystem state, `EGRT-T10` and `EGRT-T12` together
+distinguish the two failure cases deterministically, which is why this amendment needs no
+additional test identifier.
 
 ### 12.4 The DPAPI testability boundary, stated honestly
 
@@ -1069,8 +1170,15 @@ the scope and whitespace guard, which accepts the changed path because it is und
 4. The owner gives explicit current-turn approval for the mutating install, naming the
    launcher root and the operation. This is a live-system action and is gated by
    `AGENTS.md`.
-5. The installer is run for real. It stages, replaces atomically with an explicit
-   backup, verifies the hash, and reaps the backup only on verified success.
+5. The installer is run for real, as the package transaction of section 6.2. It prepares
+   and verifies every staging file with no destination mutation, classifies each
+   destination as `Existing` or `Absent`, publishes existing members through
+   explicit-backup `File.Replace` and absent members through the publish-to-absent path,
+   publishes and reads back the manifest inside the same transaction, re-verifies the
+   complete installed package, and only then accepts the transaction. Backup cleanup
+   happens after acceptance and never before it. Any pre-acceptance failure triggers
+   installer-owned reverse-order package rollback under section 6.5. Not every install
+   uses `File.Replace`: on a clean host every member is `Absent` and none of them do.
 6. `launcher.ps1 -ValidateOnly` is run to confirm runtime binding, security
    expectations, and configuration reachability on the host.
 7. Scheduling remains blocked. Task Scheduler registration, headed validation, and any
@@ -1234,10 +1342,10 @@ with .NET Framework 4.x this is deterministically rejected with
 filesystem. The synthetic proof also established the behaviour of the explicit-backup,
 empty-string, sharing-violation, and read-only cases recorded in section 7.3.
 
-Reusable requirement: section 7's replacement and rollback contract, asserted by
-`EGRT-T06` through `EGRT-T12`, with the structural prohibition on null and empty backup
-arguments asserted by `EGRT-T08` so that the rule holds on runtimes that would accept
-them.
+Reusable requirement: section 7's replacement contract together with the installer-owned
+rollback contract in section 6.5, asserted by `EGRT-T06` through `EGRT-T12`, with the
+structural prohibition on null and empty backup arguments asserted by `EGRT-T08` so that
+the rule holds on runtimes that would accept them.
 
 ### 18.3 What Run119 does not contribute
 
