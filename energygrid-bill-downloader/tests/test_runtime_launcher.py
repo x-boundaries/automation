@@ -320,6 +320,23 @@ switch ($Op) {
             presentValue      = ([string]$presentAfter)
         } | ConvertTo-Json -Depth 8 -Compress
     }
+    'gitforbidden' {
+        # A forbidden subcommand must be refused BEFORE any process is started.
+        $forbidden = Invoke-GovernedGit -RepositoryRootPath $Dir -Arguments @('fetch', '--all')
+        $allowed = @(Get-EgGitAllowedSubcommands)
+        [ordered]@{
+            forbiddenSuccess    = $forbidden.Success
+            forbiddenExit       = $forbidden.ExitCode
+            forbiddenLineCount  = $forbidden.Lines.Count
+            forbiddenSupportRef = $forbidden.SupportRef
+            allowed             = $allowed
+            allowedCount        = $allowed.Count
+            revParseAllowed     = (Test-EgGitSubcommandAllowed -Subcommand 'rev-parse')
+            fetchAllowed        = (Test-EgGitSubcommandAllowed -Subcommand 'fetch')
+            emptyAllowed        = (Test-EgGitSubcommandAllowed -Subcommand '')
+            upperCaseAllowed    = (Test-EgGitSubcommandAllowed -Subcommand 'REV-PARSE')
+        } | ConvertTo-Json -Depth 8 -Compress
+    }
     default {
         throw ('unknown probe operation: ' + $Op)
     }
@@ -378,6 +395,99 @@ $tokens = $null
 $count = 0
 if ($null -ne $errors) { $count = @($errors).Count }
 [pscustomobject]@{ parseErrors = $count } | ConvertTo-Json -Depth 4 -Compress
+"""
+
+
+GIT_GUARD_INSPECTOR = r"""
+[CmdletBinding()]
+param([Parameter(Mandatory)][string]$Target)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+$errors = $null
+$tokens = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($Target, [ref]$tokens, [ref]$errors)
+$parseErrors = 0
+if ($null -ne $errors) { $parseErrors = @($errors).Count }
+
+$commands = @($ast.FindAll(
+    { param($node) $node -is [System.Management.Automation.Language.CommandAst] }, $true))
+
+# Plain arrays, deliberately not System.Collections.Generic.List: on Windows PowerShell
+# 5.1 the array subexpression over an empty List[object] breaks the [ordered] cast that
+# builds the emitted result.
+$gitCommandNames = @()
+$callSites = @()
+
+foreach ($command in $commands) {
+    $commandName = $command.GetCommandName()
+    if ($null -ne $commandName) {
+        $lowered = $commandName.ToLowerInvariant()
+        $leaf = $lowered
+        $normalised = $lowered.Replace('/', '\')
+        $separator = $normalised.LastIndexOf('\')
+        if ($separator -ge 0) { $leaf = $normalised.Substring($separator + 1) }
+        if ($leaf -eq 'git' -or $leaf -eq 'git.exe') {
+            $gitCommandNames = $gitCommandNames + $commandName
+        }
+    }
+
+    if ($null -ne $commandName -and $commandName -eq 'Invoke-GovernedGit') {
+        $elements = @($command.CommandElements)
+        $argumentsValue = $null
+        for ($index = 0; $index -lt $elements.Count; $index++) {
+            $element = $elements[$index]
+            if ($element -is [System.Management.Automation.Language.CommandParameterAst]) {
+                if ($element.ParameterName -eq 'Arguments') {
+                    if ($null -ne $element.Argument) {
+                        $argumentsValue = $element.Argument
+                    }
+                    elseif ($index + 1 -lt $elements.Count) {
+                        $argumentsValue = $elements[$index + 1]
+                    }
+                }
+            }
+        }
+
+        $isArrayShaped = $false
+        $firstElement = ''
+        $hasFirstElement = $false
+        if ($null -ne $argumentsValue) {
+            $candidate = $argumentsValue
+            if ($candidate -is [System.Management.Automation.Language.BinaryExpressionAst]) {
+                $candidate = $candidate.Left
+            }
+            if ($candidate -is [System.Management.Automation.Language.ArrayExpressionAst] -or
+                $candidate -is [System.Management.Automation.Language.ArrayLiteralAst]) {
+                $isArrayShaped = $true
+            }
+            $constants = @($argumentsValue.FindAll(
+                { param($node) $node -is [System.Management.Automation.Language.StringConstantExpressionAst] },
+                $true))
+            if ($constants.Count -ge 1) {
+                $ordered = @($constants | Sort-Object { $_.Extent.StartOffset })
+                $firstElement = $ordered[0].Value
+                $hasFirstElement = $true
+            }
+        }
+
+        $siteEntry = [ordered]@{
+            isArrayShaped   = $isArrayShaped
+            hasFirstElement = $hasFirstElement
+            firstElement    = $firstElement
+        }
+        $callSites = $callSites + $siteEntry
+    }
+}
+
+[ordered]@{
+    parseErrors     = $parseErrors
+    gitCommandCount = @($gitCommandNames).Count
+    gitCommandNames = @($gitCommandNames)
+    callSiteCount   = @($callSites).Count
+    callSites       = @($callSites)
+} | ConvertTo-Json -Depth 8 -Compress
 """
 
 
@@ -677,6 +787,114 @@ class AmbientGitEnvironmentIsolation(TierABase):
             "a name recorded absent must be REMOVED, never set to an empty string",
         )
         self.assertEqual("original", result["presentValue"])
+
+
+GIT_ALLOWED_SUBCOMMANDS = ("rev-parse", "symbolic-ref", "ls-files", "diff", "status")
+
+# Design section 10.3: every Git operation that fetches, updates, moves, or rewrites state
+# is prohibited outright from the runtime layer.
+GIT_PROHIBITED_SUBCOMMANDS = (
+    "fetch", "pull", "clone", "remote", "reset", "rebase", "merge", "checkout",
+    "switch", "restore", "cherry-pick", "revert", "stash", "clean", "add", "rm",
+    "commit", "tag", "push", "gc", "worktree",
+)
+
+
+class ReadOnlyGitAllowlist(TierABase):
+    """Task 4: the runtime layer performs zero Git network operations and zero mutations."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls._scratch = TemporaryScratch()
+        tmp = cls._scratch.__enter__()
+        cls.tmp = tmp
+        cls.repo = init_scratch_repo(tmp / "repo")
+        cls.result = probe_json(ANY_PS, "gitforbidden", tmp, dir=cls.repo)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._scratch.__exit__(None, None, None)
+
+    def test_forbidden_git_subcommand_is_refused_without_a_process(self):
+        """A prohibited subcommand is refused by the gate before any process starts."""
+        self.assertFalse(self.result["forbiddenSuccess"])
+        self.assertEqual(-1, self.result["forbiddenExit"])
+        self.assertEqual(0, self.result["forbiddenLineCount"])
+        self.assertEqual(
+            "EG_LAUNCHER_GIT_SUBCOMMAND_FORBIDDEN", self.result["forbiddenSupportRef"]
+        )
+
+    def test_the_allowlist_is_exactly_the_five_read_only_subcommands(self):
+        """Design section 10.3 permits only rev-parse, symbolic-ref, ls-files, diff, status."""
+        self.assertEqual(5, self.result["allowedCount"])
+        self.assertEqual(list(GIT_ALLOWED_SUBCOMMANDS), self.result["allowed"])
+        self.assertTrue(self.result["revParseAllowed"])
+        self.assertFalse(self.result["fetchAllowed"])
+        self.assertFalse(self.result["emptyAllowed"])
+        self.assertFalse(
+            self.result["upperCaseAllowed"],
+            "membership must be exact and case-sensitive",
+        )
+
+
+class ReadOnlyGitAllowlistStaticGuard(TierCBase):
+    """Task 4, Tier C: EGRT-T39 over the committed runtime files."""
+
+    def _inspect(self):
+        if ANY_PS is None:
+            self.skipTest("no PowerShell host found (pwsh or powershell)")
+        results = {}
+        with TemporaryScratch() as tmp:
+            for target in existing_runtime_ps1_files():
+                results[target.name] = run_inspector(
+                    ANY_PS, tmp, GIT_GUARD_INSPECTOR, target=target
+                )
+        return results
+
+    def test_no_committed_runtime_file_invokes_a_forbidden_git_subcommand(self):
+        """EGRT-T39: git is reachable only through the governed function and its allowlist."""
+        results = self._inspect()
+        self.assertTrue(results, "at least runtime/launcher_lib.ps1 must exist")
+        for name, result in results.items():
+            with self.subTest(runtime_file=name):
+                self.assertEqual(0, result["parseErrors"])
+                self.assertEqual(
+                    0,
+                    result["gitCommandCount"],
+                    "%s invokes git directly as a command: %r"
+                    % (name, result["gitCommandNames"]),
+                )
+                for site in result["callSites"]:
+                    self.assertTrue(
+                        site["isArrayShaped"],
+                        "%s passes -Arguments in a shape that is not an array" % name,
+                    )
+                    self.assertTrue(
+                        site["hasFirstElement"],
+                        "%s passes -Arguments whose first element is not a string constant"
+                        % name,
+                    )
+                    self.assertIn(
+                        site["firstElement"],
+                        GIT_ALLOWED_SUBCOMMANDS,
+                        "%s passes the non-allowlisted subcommand %r"
+                        % (name, site["firstElement"]),
+                    )
+                    self.assertNotIn(
+                        site["firstElement"],
+                        GIT_PROHIBITED_SUBCOMMANDS,
+                        "%s passes the prohibited subcommand %r"
+                        % (name, site["firstElement"]),
+                    )
+
+    def test_the_prohibited_subcommand_list_is_disjoint_from_the_allowlist(self):
+        """The two lists are read from the design and must not overlap."""
+        self.assertEqual(21, len(GIT_PROHIBITED_SUBCOMMANDS))
+        self.assertEqual(
+            set(),
+            set(GIT_ALLOWED_SUBCOMMANDS) & set(GIT_PROHIBITED_SUBCOMMANDS),
+        )
 
 
 if __name__ == "__main__":

@@ -138,6 +138,35 @@ function Get-EgGovernedGitEnvironmentNames {
     )
 }
 
+# The exhaustive READ-ONLY Git subcommand allowlist (design section 10.3). Every Git
+# operation that fetches, updates, moves, or rewrites state is prohibited outright: the
+# runtime layer performs zero Git network operations and zero Git state mutations.
+# Bringing the deployed checkout to a newer source revision is a separately controlled
+# operator or repository action, never something the unattended job does to itself.
+$script:EgGitAllowedSubcommands = @('rev-parse', 'symbolic-ref', 'ls-files', 'diff', 'status')
+
+function Get-EgGitAllowedSubcommands {
+    # The allowlist, enumerated explicitly.
+    [CmdletBinding()]
+    param()
+
+    @($script:EgGitAllowedSubcommands)
+}
+
+function Test-EgGitSubcommandAllowed {
+    # Exact, case-sensitive membership of the allowlist. A prefix, pattern, or
+    # case-insensitive match is deliberately NOT accepted.
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Subcommand)
+
+    foreach ($allowed in $script:EgGitAllowedSubcommands) {
+        if ($allowed -ceq $Subcommand) {
+            return $true
+        }
+    }
+    return $false
+}
+
 function ConvertTo-EgNativeArgumentString {
     # Build a Windows command line from an argument vector.
     #
@@ -212,6 +241,17 @@ function Invoke-GovernedGit {
         [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$RepositoryRootPath,
         [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string[]]$Arguments
     )
+
+    # The allowlist gate runs first and starts no process. A prohibited subcommand can
+    # therefore never reach the filesystem or the network, whatever else the caller passed.
+    if (-not (Test-EgGitSubcommandAllowed -Subcommand $Arguments[0])) {
+        return [pscustomobject]@{
+            Success    = $false
+            ExitCode   = [int](-1)
+            Lines      = [string[]]@()
+            SupportRef = 'EG_LAUNCHER_GIT_SUBCOMMAND_FORBIDDEN'
+        }
+    }
 
     $fullArguments = @('-C', $RepositoryRootPath, '--no-optional-locks') + $Arguments
 
