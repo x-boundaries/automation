@@ -27,6 +27,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -337,6 +338,121 @@ switch ($Op) {
             upperCaseAllowed    = (Test-EgGitSubcommandAllowed -Subcommand 'REV-PARSE')
         } | ConvertTo-Json -Depth 8 -Compress
     }
+    'replace' {
+        # One fixture, one publication attempt, one emitted observation. -Value selects
+        # the failure class to induce; every case shares the same fixture shape so the
+        # emitted observation is directly comparable across cases.
+        $sourceText = 'SOURCE-CONTENT'
+        $destText = 'DESTINATION-PREIMAGE'
+        $source = Join-Path $Dir 'staging.txt'
+        $destination = Join-Path $Dir 'destination.txt'
+        $backup = Join-Path $Dir 'destination.backup'
+        $utf8 = New-Object System.Text.UTF8Encoding($false)
+        [System.IO.File]::WriteAllText($source, $sourceText, $utf8)
+        [System.IO.File]::WriteAllText($destination, $destText, $utf8)
+
+        $preimageSha = Get-EgFileSha256 -Path $destination
+        $sourceSha = Get-EgFileSha256 -Path $source
+        $expected = $sourceSha
+        if ($Value -eq 'wronghash') {
+            $expected = '0000000000000000000000000000000000000000000000000000000000000000'
+        }
+
+        $refused = $false
+        $refusedType = ''
+        $result = $null
+        $readOnlyItem = $null
+        try {
+            if ($Value -eq 'readonly') {
+                $readOnlyItem = Get-Item -LiteralPath $destination
+                $readOnlyItem.IsReadOnly = $true
+            }
+
+            if ($Value -eq 'nullbackup') {
+                $result = Invoke-AtomicFileReplace -SourcePath $source -DestinationPath $destination -BackupPath $null -ExpectedSha256 $expected
+            }
+            elseif ($Value -eq 'emptybackup') {
+                $result = Invoke-AtomicFileReplace -SourcePath $source -DestinationPath $destination -BackupPath '' -ExpectedSha256 $expected
+            }
+            elseif ($Value -eq 'otherdirbackup') {
+                $elsewhere = Join-Path $Dir 'elsewhere'
+                if (-not (Test-Path -LiteralPath $elsewhere -PathType Container)) {
+                    [void](New-Item -ItemType Directory -Path $elsewhere)
+                }
+                $result = Invoke-AtomicFileReplace -SourcePath $source -DestinationPath $destination -BackupPath (Join-Path $elsewhere 'destination.backup') -ExpectedSha256 $expected
+            }
+            else {
+                $result = Invoke-AtomicFileReplace -SourcePath $source -DestinationPath $destination -BackupPath $backup -ExpectedSha256 $expected
+            }
+        }
+        catch {
+            $refused = $true
+            $refusedType = $_.Exception.GetType().FullName
+        }
+        finally {
+            if ($null -ne $readOnlyItem) {
+                $readOnlyItem.Refresh()
+                if (Test-Path -LiteralPath $destination -PathType Leaf) {
+                    $clear = Get-Item -LiteralPath $destination
+                    $clear.IsReadOnly = $false
+                }
+            }
+        }
+
+        $emitted = [ordered]@{
+            refused          = $refused
+            refusedType      = $refusedType
+            sourceSha        = $sourceSha
+            preimageShaSetup = $preimageSha
+            destShaAfter     = (Get-EgFileSha256 -Path $destination)
+            destTextAfter    = ''
+            backupExists     = (Test-Path -LiteralPath $backup -PathType Leaf)
+            backupShaAfter   = (Get-EgFileSha256 -Path $backup)
+            sourceStillThere = (Test-Path -LiteralPath $source -PathType Leaf)
+        }
+        if (Test-Path -LiteralPath $destination -PathType Leaf) {
+            $emitted['destTextAfter'] = [System.IO.File]::ReadAllText($destination)
+        }
+        if ($null -ne $result) {
+            $emitted['success'] = $result.Success
+            $emitted['supportRef'] = $result.SupportRef
+            $emitted['exceptionTypeName'] = $result.ExceptionTypeName
+            $emitted['hresult'] = $result.HResult
+            $emitted['preimageState'] = $result.PreimageState
+            $emitted['preimageSha256'] = $result.PreimageSha256
+            $emitted['postimageSha256'] = $result.PostimageSha256
+            $emitted['publicationOccurred'] = $result.PublicationOccurred
+            $emitted['backupCreated'] = $result.BackupCreated
+            $emitted['backupRetained'] = $result.BackupRetained
+            $emitted['fieldNames'] = @($result.PSObject.Properties.Name)
+        }
+        $emitted | ConvertTo-Json -Depth 8 -Compress
+    }
+    'replaceheld' {
+        # The sharing-violation case. The fixture is prepared by the caller and the
+        # destination is held with an exclusive share by a SEPARATE process, which is how
+        # a real sharing violation arises. This operation therefore writes no fixture file
+        # and observes no destination state of its own: the caller does that after the
+        # holder has released.
+        $source = Join-Path $Dir 'staging.txt'
+        $destination = Join-Path $Dir 'destination.txt'
+        $backup = Join-Path $Dir 'destination.backup'
+        $expected = Get-EgFileSha256 -Path $source
+        $result = Invoke-AtomicFileReplace -SourcePath $source -DestinationPath $destination -BackupPath $backup -ExpectedSha256 $expected
+        [ordered]@{
+            success             = $result.Success
+            supportRef          = $result.SupportRef
+            exceptionTypeName   = $result.ExceptionTypeName
+            hresult             = $result.HResult
+            preimageState       = $result.PreimageState
+            preimageSha256      = $result.PreimageSha256
+            postimageSha256     = $result.PostimageSha256
+            publicationOccurred = $result.PublicationOccurred
+            backupCreated       = $result.BackupCreated
+            backupRetained      = $result.BackupRetained
+            fieldNames          = @($result.PSObject.Properties.Name)
+        } | ConvertTo-Json -Depth 8 -Compress
+    }
     default {
         throw ('unknown probe operation: ' + $Op)
     }
@@ -376,6 +492,98 @@ def probe_json(exe, op, tmp, **kwargs):
             % (op, completed.returncode, completed.stdout, completed.stderr)
         )
     return json.loads(completed.stdout)
+
+
+# --------------------------------------------------------------------------------------
+# Separate-process exclusive lock holder
+# --------------------------------------------------------------------------------------
+# The sharing-violation class must be induced from ANOTHER process. Holding the exclusive
+# share in the same process that then calls the library is not a faithful fixture: the
+# library's own preimage hash of the locked destination was observed to disturb the
+# in-process handle, so the replacement could succeed against a destination the fixture
+# believed it had locked. A separate holder process also models production, where a
+# sharing violation comes from a different process altogether.
+
+LOCK_HOLDER_SCRIPT = r"""
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory)][string]$Path,
+    [Parameter(Mandatory)][string]$ReadyPath,
+    [Parameter(Mandatory)][string]$ReleasePath,
+    [int]$TimeoutSeconds = 300
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+$utf8 = New-Object System.Text.UTF8Encoding($false)
+$stream = [System.IO.File]::Open($Path, 'Open', 'ReadWrite', 'None')
+try {
+    [System.IO.File]::WriteAllText($ReadyPath, 'ready', $utf8)
+    $deadline = [System.DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    while ((-not (Test-Path -LiteralPath $ReleasePath)) -and ([System.DateTime]::UtcNow -lt $deadline)) {
+        Start-Sleep -Milliseconds 40
+    }
+}
+finally {
+    $stream.Dispose()
+}
+"""
+
+
+class ExclusiveLockHolder:
+    """Hold an exclusive share on a path from a separate PowerShell process."""
+
+    def __init__(self, exe, tmp, target):
+        self.exe = exe
+        self.tmp = Path(tmp)
+        self.target = Path(target)
+        self.ready = self.tmp / "lock_ready.sentinel"
+        self.release = self.tmp / "lock_release.sentinel"
+        self.process = None
+
+    def __enter__(self):
+        script = self.tmp / "eg_lock_holder.ps1"
+        script.write_text(LOCK_HOLDER_SCRIPT, encoding="utf-8")
+        for sentinel in (self.ready, self.release):
+            if sentinel.exists():
+                sentinel.unlink()
+        self.process = subprocess.Popen(
+            [
+                self.exe, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                "-File", str(script),
+                "-Path", str(self.target),
+                "-ReadyPath", str(self.ready),
+                "-ReleasePath", str(self.release),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        deadline = time.monotonic() + 120
+        while time.monotonic() < deadline:
+            if self.ready.exists():
+                return self
+            if self.process.poll() is not None:
+                out, err = self.process.communicate()
+                raise AssertionError(
+                    "the lock holder exited before signalling ready\nstdout:\n%s\nstderr:\n%s"
+                    % (out, err)
+                )
+            time.sleep(0.02)
+        raise AssertionError("the lock holder did not signal ready in time")
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            self.release.write_text("release", encoding="utf-8")
+        finally:
+            if self.process is not None:
+                try:
+                    self.process.communicate(timeout=120)
+                except subprocess.TimeoutExpired:
+                    self.process.kill()
+                    self.process.communicate(timeout=60)
+        return False
 
 
 # --------------------------------------------------------------------------------------
@@ -894,6 +1102,243 @@ class ReadOnlyGitAllowlistStaticGuard(TierCBase):
         self.assertEqual(
             set(),
             set(GIT_ALLOWED_SUBCOMMANDS) & set(GIT_PROHIBITED_SUBCOMMANDS),
+        )
+
+
+PUBLICATION_RESULT_FIELDS = (
+    "Success",
+    "SupportRef",
+    "ExceptionTypeName",
+    "HResult",
+    "PreimageState",
+    "PreimageSha256",
+    "PostimageSha256",
+    "PublicationOccurred",
+    "BackupCreated",
+    "BackupRetained",
+)
+
+# Design section 7.3: every one of these classes throws BEFORE publication, so each is a
+# Case A failure under design section 7.2.1 and each leaves the destination byte-identical.
+# The sharing-violation class is induced separately, because it needs a holder process.
+THROW_BEFORE_PUBLICATION_CASES = ("readonly", "otherdirbackup")
+
+SOURCE_TEXT = "SOURCE-CONTENT"
+DESTINATION_PREIMAGE_TEXT = "DESTINATION-PREIMAGE"
+
+
+def sha256_of(path):
+    """Lowercase hexadecimal SHA-256 of a file, or the empty string when it is absent."""
+    import hashlib
+
+    path = Path(path)
+    if not path.is_file():
+        return ""
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def replace_probe(exe, case):
+    """Run one atomic-replacement fixture case and return its observation."""
+    with TemporaryScratch() as tmp:
+        work = tmp / "work"
+        work.mkdir()
+        return probe_json(exe, "replace", tmp, dir=work, value=case)
+
+
+def replace_probe_with_held_destination(exe):
+    """Induce the sharing-violation class with the destination held by another process."""
+    with TemporaryScratch() as tmp:
+        work = tmp / "work"
+        work.mkdir()
+        source = work / "staging.txt"
+        destination = work / "destination.txt"
+        backup = work / "destination.backup"
+        source.write_text(SOURCE_TEXT, encoding="utf-8")
+        destination.write_text(DESTINATION_PREIMAGE_TEXT, encoding="utf-8")
+        preimage_sha = sha256_of(destination)
+        source_sha = sha256_of(source)
+
+        with ExclusiveLockHolder(exe, tmp, destination):
+            observed = probe_json(exe, "replaceheld", tmp, dir=work)
+
+        # Disk state is observed only after the holder has released, so the observation
+        # itself never contends with the lock it is describing.
+        observed["preimageShaSetup"] = preimage_sha
+        observed["sourceSha"] = source_sha
+        observed["destShaAfter"] = sha256_of(destination)
+        observed["destTextAfter"] = (
+            destination.read_text(encoding="utf-8") if destination.is_file() else ""
+        )
+        observed["backupExists"] = backup.is_file()
+        observed["backupShaAfter"] = sha256_of(backup)
+        observed["refused"] = False
+        return observed
+
+
+class AtomicFileReplaceContractMixin:
+    """The design section 7.2 replacement contract, asserted on one interpreter."""
+
+    exe = None
+
+    def test_valid_explicit_backup_replacement_succeeds(self):
+        """EGRT-T06: a valid explicit-backup replacement succeeds and carries the source."""
+        observed = replace_probe(self.exe, "ok")
+        self.assertFalse(observed["refused"])
+        self.assertTrue(observed["success"], observed.get("supportRef"))
+        self.assertEqual("", observed["supportRef"])
+        self.assertEqual("", observed["exceptionTypeName"])
+        self.assertEqual("", observed["hresult"])
+        self.assertEqual("Existing", observed["preimageState"])
+        self.assertEqual(SOURCE_TEXT, observed["destTextAfter"])
+        self.assertEqual(observed["sourceSha"], observed["destShaAfter"])
+        self.assertTrue(observed["publicationOccurred"])
+        self.assertTrue(observed["backupCreated"])
+        self.assertTrue(observed["backupRetained"])
+        self.assertTrue(observed["backupExists"])
+        self.assertEqual(
+            observed["preimageShaSetup"],
+            observed["backupShaAfter"],
+            "the retained backup must carry the exact preimage bytes",
+        )
+        self.assertEqual(list(PUBLICATION_RESULT_FIELDS), observed["fieldNames"])
+
+    def test_null_and_empty_backup_arguments_are_refused(self):
+        """EGRT-T07: the mandatory-parameter contract refuses both, on every runtime."""
+        for case in ("nullbackup", "emptybackup"):
+            with self.subTest(backup_argument=case):
+                observed = replace_probe(self.exe, case)
+                self.assertTrue(
+                    observed["refused"],
+                    "a %s backup argument must be refused by the parameter contract" % case,
+                )
+                self.assertNotIn(
+                    "success",
+                    observed,
+                    "no PublicationResult may be produced: File.Replace is never reached",
+                )
+                self.assertEqual(
+                    observed["preimageShaSetup"],
+                    observed["destShaAfter"],
+                    "the destination must be byte-identical after a refused call",
+                )
+                self.assertFalse(observed["backupExists"])
+
+    def test_throw_before_publication_leaves_the_preimage_intact(self):
+        """EGRT-T10: scoped to the throw-before-publication classes only.
+
+        The assertion is deliberately NOT claimed for a post-publication verification
+        failure, where File.Replace returned and the destination has already advanced.
+        """
+        observations = [(case, replace_probe(self.exe, case))
+                        for case in THROW_BEFORE_PUBLICATION_CASES]
+        observations.append(
+            ("sharing", replace_probe_with_held_destination(self.exe))
+        )
+        for case, observed in observations:
+            with self.subTest(failure_class=case):
+                self.assertFalse(observed["refused"])
+                self.assertFalse(observed["success"])
+                self.assertFalse(
+                    observed["publicationOccurred"],
+                    "%s must not advance the destination" % case,
+                )
+                self.assertEqual(
+                    observed["preimageShaSetup"],
+                    observed["destShaAfter"],
+                    "%s must leave the destination at its recorded preimage" % case,
+                )
+                self.assertEqual(
+                    DESTINATION_PREIMAGE_TEXT, observed["destTextAfter"]
+                )
+                self.assertEqual(
+                    observed["backupCreated"],
+                    observed["backupRetained"],
+                    "nothing is created to satisfy the contract",
+                )
+
+
+class AtomicFileReplaceTierA(AtomicFileReplaceContractMixin, TierABase):
+    """Task 5, Tier A: the portable half of the replacement contract."""
+
+    @classmethod
+    def setUpClass(cls):
+        TierABase.setUpClass()
+        cls.exe = ANY_PS
+
+
+class AtomicFileReplaceTierB(AtomicFileReplaceContractMixin, TierBBase):
+    """Task 5, Tier B: the same contract on the Windows PowerShell 5.1 boundary.
+
+    This is the runtime on which the design section 7.3 failure classes were observed, so
+    running these cases anywhere else would prove nothing about production.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        TierBBase.setUpClass()
+        cls.exe = DESKTOP_PS
+
+    def test_replacement_exception_type_and_hresult_are_surfaced(self):
+        """EGRT-T09: the sharing-violation and access-denied classes, by type and HRESULT."""
+        sharing = replace_probe_with_held_destination(self.exe)
+        self.assertEqual("System.IO.IOException", sharing["exceptionTypeName"])
+        self.assertEqual("0x80070020", sharing["hresult"])
+        self.assertEqual(
+            "EG_LAUNCHER_REPLACE_SHARING_VIOLATION", sharing["supportRef"]
+        )
+
+        readonly = replace_probe(self.exe, "readonly")
+        self.assertEqual(
+            "System.UnauthorizedAccessException", readonly["exceptionTypeName"]
+        )
+        self.assertEqual("0x80070005", readonly["hresult"])
+        self.assertEqual("EG_LAUNCHER_REPLACE_ACCESS_DENIED", readonly["supportRef"])
+
+
+class AtomicFileReplaceBackupSemantics(TierABase):
+    """Task 5: EGRT-T11, conditional backup semantics with no reaping by the primitive."""
+
+    def test_backup_semantics_are_conditional_and_never_reaped(self):
+        """After a verified publication and after a Case B failure, the backup is retained."""
+        verified = replace_probe(ANY_PS, "ok")
+        self.assertTrue(verified["success"])
+        self.assertTrue(
+            verified["backupExists"],
+            "the primitive proves one publication; it has no authority to reap",
+        )
+
+        case_b = replace_probe(ANY_PS, "wronghash")
+        self.assertFalse(case_b["success"])
+        self.assertEqual(
+            "EG_LAUNCHER_REPLACE_POSTIMAGE_MISMATCH", case_b["supportRef"]
+        )
+        self.assertTrue(
+            case_b["publicationOccurred"],
+            "a returned File.Replace advanced the destination: this is Case B",
+        )
+        self.assertTrue(case_b["backupCreated"])
+        self.assertTrue(case_b["backupRetained"])
+        self.assertTrue(
+            case_b["backupExists"],
+            "the primitive performs no self-rollback and no reap after Case B",
+        )
+        self.assertEqual(
+            case_b["preimageShaSetup"],
+            case_b["backupShaAfter"],
+            "the retained backup is the exact preimage the installer will restore",
+        )
+        self.assertEqual(
+            SOURCE_TEXT,
+            case_b["destTextAfter"],
+            "Case B means the destination advanced and was NOT restored by the primitive",
+        )
+
+        case_a = replace_probe_with_held_destination(ANY_PS)
+        self.assertFalse(case_a["publicationOccurred"])
+        self.assertEqual(case_a["preimageShaSetup"], case_a["destShaAfter"])
+        self.assertFalse(
+            case_a["backupCreated"],
+            "BackupCreated reports what was observed on disk, not what was requested",
         )
 
 

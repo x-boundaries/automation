@@ -35,6 +35,227 @@ function Get-EgLauncherLibraryContract {
 }
 
 # --------------------------------------------------------------------------------------
+# Hashing and bounded exception classification
+# --------------------------------------------------------------------------------------
+
+function Get-EgFileSha256 {
+    # Lowercase hexadecimal SHA-256 of a file, or the empty string when the path does not
+    # exist as a file. Every hash in this library is normalised the same way, so a hash
+    # comparison never depends on the casing a provider happened to return.
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return ''
+    }
+    try {
+        $computed = Get-FileHash -LiteralPath $Path -Algorithm SHA256 -ErrorAction Stop
+        return $computed.Hash.ToLowerInvariant()
+    }
+    catch {
+        # The file exists but could not be opened for reading, which is what a destination
+        # held with an exclusive share looks like. This function must not throw, because
+        # both publish primitives are contractually required to RETURN a structured result
+        # rather than raise (design section 7.1), and a primitive that threw here would
+        # never surface the real File.Replace exception type and HRESULT.
+        #
+        # The empty string is a fail-closed signal, not a swallowed failure: it can never
+        # equal an expected 64-character hash, so every verification that consumes it
+        # fails. It is also never mistaken for a matching preimage, because an unreadable
+        # preimage compares equal only to an equally unreadable postimage, which is
+        # exactly the case where the destination provably did not advance.
+        return ''
+    }
+}
+
+function Get-EgUnderlyingException {
+    # Unwrap the exception PowerShell wraps around a failed .NET method invocation, so
+    # classification sees the real type and HRESULT rather than the wrapper's.
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][System.Exception]$Exception)
+
+    $candidate = $Exception
+    while ($candidate -is [System.Management.Automation.MethodInvocationException]) {
+        if ($null -eq $candidate.InnerException) {
+            break
+        }
+        $candidate = $candidate.InnerException
+    }
+    return $candidate
+}
+
+function Get-EgExceptionHResultString {
+    # The HRESULT in exact 0x%08X form. Never any message text (design section 11.2).
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][System.Exception]$Exception)
+
+    return [string]::Format('0x{0:X8}', $Exception.HResult)
+}
+
+function Get-EgReplaceSupportRef {
+    # Map a replacement failure to its bounded support reference by exception TYPE and
+    # HRESULT ONLY. Exception message text is never read, and no control-flow decision
+    # anywhere in this library is made by reading it (design section 7.2 rule 5).
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][System.Exception]$Exception)
+
+    if ($Exception -is [System.UnauthorizedAccessException]) {
+        return 'EG_LAUNCHER_REPLACE_ACCESS_DENIED'
+    }
+    if ($Exception -is [System.ArgumentException]) {
+        return 'EG_LAUNCHER_REPLACE_ARGUMENT_INVALID'
+    }
+    if ($Exception -is [System.IO.IOException]) {
+        if ((Get-EgExceptionHResultString -Exception $Exception) -eq '0x80070020') {
+            return 'EG_LAUNCHER_REPLACE_SHARING_VIOLATION'
+        }
+    }
+    return 'EG_LAUNCHER_UNCLASSIFIED'
+}
+
+# --------------------------------------------------------------------------------------
+# Publication result shape (design section 7.1)
+# --------------------------------------------------------------------------------------
+
+function New-EgPublicationResult {
+    # Internal factory. Guarantees all ten PublicationResult fields are ALWAYS present,
+    # in a fixed order, on every path including failure. ExceptionTypeName and HResult are
+    # the empty string when no exception occurred; there is no RolledBack field, because
+    # neither publish primitive ever rolls back.
+    [CmdletBinding()]
+    param(
+        [bool]$Success,
+        [AllowEmptyString()][string]$SupportRef = '',
+        [AllowEmptyString()][string]$ExceptionTypeName = '',
+        [AllowEmptyString()][string]$HResult = '',
+        [Parameter(Mandatory)][ValidateSet('Existing', 'Absent')][string]$PreimageState,
+        [AllowEmptyString()][string]$PreimageSha256 = '',
+        [AllowEmptyString()][string]$PostimageSha256 = '',
+        [bool]$PublicationOccurred,
+        [bool]$BackupCreated,
+        [bool]$BackupRetained
+    )
+
+    [pscustomobject]@{
+        Success             = $Success
+        SupportRef          = $SupportRef
+        ExceptionTypeName   = $ExceptionTypeName
+        HResult             = $HResult
+        PreimageState       = $PreimageState
+        PreimageSha256      = $PreimageSha256
+        PostimageSha256     = $PostimageSha256
+        PublicationOccurred = $PublicationOccurred
+        BackupCreated       = $BackupCreated
+        BackupRetained      = $BackupRetained
+    }
+}
+
+function Test-EgSameDirectory {
+    # Whether two paths resolve to the same containing directory. The same-directory rule
+    # is stronger than the same-volume requirement ReplaceFileW imposes, and is enforced
+    # because it is mechanically checkable (design section 7.2 rule 1).
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$FirstPath,
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$SecondPath
+    )
+
+    $firstDirectory = [System.IO.Path]::GetDirectoryName([System.IO.Path]::GetFullPath($FirstPath))
+    $secondDirectory = [System.IO.Path]::GetDirectoryName([System.IO.Path]::GetFullPath($SecondPath))
+    return ([string]::Equals($firstDirectory, $secondDirectory, [System.StringComparison]::OrdinalIgnoreCase))
+}
+
+function Invoke-AtomicFileReplace {
+    # Publish a staging file over an EXISTING destination, through
+    # [System.IO.File]::Replace with a mandatory explicit same-directory backup path.
+    #
+    # This primitive NEVER rolls back and NEVER deletes a backup. It publishes and
+    # reports; restoring a preimage is the installer transaction's exclusive
+    # responsibility (design sections 6.5 and 7.2 rules 3 and 4), because only the
+    # installer knows which other package members have already advanced and in what order
+    # they must be undone.
+    #
+    # The mandatory, non-empty -BackupPath is the structural closure of the Run119
+    # null-backup defect (design section 18.2). The prohibition does not rely on any
+    # runtime rejecting a null argument, because the parameter contract refuses it first.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$SourcePath,
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$DestinationPath,
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$BackupPath,
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$ExpectedSha256
+    )
+
+    # Step 1. A backup path outside the destination directory is refused before any call
+    # reaches the filesystem, so the destination is byte-identical afterwards.
+    if (-not (Test-EgSameDirectory -FirstPath $BackupPath -SecondPath $DestinationPath)) {
+        return New-EgPublicationResult -Success $false `
+            -SupportRef 'EG_LAUNCHER_REPLACE_ARGUMENT_INVALID' `
+            -PreimageState 'Existing' `
+            -PreimageSha256 (Get-EgFileSha256 -Path $DestinationPath) `
+            -PostimageSha256 (Get-EgFileSha256 -Path $DestinationPath) `
+            -PublicationOccurred $false -BackupCreated $false -BackupRetained $false
+    }
+
+    # Step 2. The preimage hash is recorded before anything is attempted. It is what makes
+    # the two failure states of design section 7.2.1 decidable from observed state.
+    $preimageSha = Get-EgFileSha256 -Path $DestinationPath
+
+    $publicationOccurred = $false
+    $exceptionTypeName = ''
+    $hresult = ''
+    $supportRef = ''
+    $threw = $false
+
+    try {
+        [System.IO.File]::Replace($SourcePath, $DestinationPath, $BackupPath)
+        # Set immediately after the call returns and before any verification work.
+        $publicationOccurred = $true
+    }
+    catch {
+        $threw = $true
+        $underlying = Get-EgUnderlyingException -Exception $_.Exception
+        $exceptionTypeName = $underlying.GetType().FullName
+        $hresult = Get-EgExceptionHResultString -Exception $underlying
+        $supportRef = Get-EgReplaceSupportRef -Exception $underlying
+        # Design section 7.2.1 determination: the call threw, so the destination advanced
+        # only if its observed hash no longer equals the recorded preimage.
+        if ((Get-EgFileSha256 -Path $DestinationPath) -ne $preimageSha) {
+            $publicationOccurred = $true
+        }
+    }
+
+    # Observed on disk, never inferred from the requested path: supplying a backup path is
+    # not evidence that a backup file exists.
+    $backupCreated = (Test-Path -LiteralPath $BackupPath -PathType Leaf)
+    $postimageSha = Get-EgFileSha256 -Path $DestinationPath
+
+    if (-not $threw) {
+        # Step 6. Success is positively verified, never assumed. A returned call is not a
+        # successful replacement until the destination hash matches.
+        if ($postimageSha -ceq $ExpectedSha256) {
+            return New-EgPublicationResult -Success $true `
+                -PreimageState 'Existing' -PreimageSha256 $preimageSha `
+                -PostimageSha256 $postimageSha -PublicationOccurred $true `
+                -BackupCreated $backupCreated -BackupRetained $backupCreated
+        }
+        # Case B: the destination advanced and verification failed. The backup is retained
+        # and the primitive performs no self-rollback.
+        return New-EgPublicationResult -Success $false `
+            -SupportRef 'EG_LAUNCHER_REPLACE_POSTIMAGE_MISMATCH' `
+            -PreimageState 'Existing' -PreimageSha256 $preimageSha `
+            -PostimageSha256 $postimageSha -PublicationOccurred $true `
+            -BackupCreated $backupCreated -BackupRetained $backupCreated
+    }
+
+    return New-EgPublicationResult -Success $false -SupportRef $supportRef `
+        -ExceptionTypeName $exceptionTypeName -HResult $hresult `
+        -PreimageState 'Existing' -PreimageSha256 $preimageSha `
+        -PostimageSha256 $postimageSha -PublicationOccurred $publicationOccurred `
+        -BackupCreated $backupCreated -BackupRetained $backupCreated
+}
+
+# --------------------------------------------------------------------------------------
 # Process-scope environment snapshot and exact restoration
 # --------------------------------------------------------------------------------------
 
