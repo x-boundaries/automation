@@ -155,8 +155,14 @@ function Exit-EgLauncher {
 }
 
 function Exit-EgPreflightFailure {
-    Write-EgLauncherTerminalEvent -LogRoot ([string]$LogRoot) -RunId ([string]$RunId) `
-        -Phase 'preflight' -Status 'FAILED' -SupportRef $script:EgFirstFailureRef
+    # The terminal event is written on the REAL path only. A validation run creates,
+    # modifies, deletes, and renames nothing, and design section 8 names a log file
+    # explicitly among the things it must not create, so validation emits its bounded
+    # JSON document and nothing else.
+    if (-not $ValidateOnly) {
+        Write-EgLauncherTerminalEvent -LogRoot ([string]$LogRoot) -RunId ([string]$RunId) `
+            -Phase 'preflight' -Status 'FAILED' -SupportRef $script:EgFirstFailureRef
+    }
     Exit-EgLauncher -ExitCode $script:EgLauncherExitCodes['PreflightFailed']
 }
 

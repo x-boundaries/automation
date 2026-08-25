@@ -6369,5 +6369,253 @@ class LauncherStaticGuards(TierCBase):
         )
 
 
+class ValidateOnlyContract(TierABase):
+    """Task 17: design section 8.
+
+    -ValidateOnly exists so that every preflight, binding, security, and installation check
+    can be exercised on the production host without any production mutation, and without
+    owner approval for a mutating action.
+    """
+
+    def _snapshot_domain(self, environment):
+        """Every root the zero-mutation contract covers."""
+        return {
+            "launcher_root": snapshot_tree(environment.launcher_root),
+            "checkout": snapshot_tree(environment.checkout),
+            "config_directory": snapshot_tree(environment.config_path.parent),
+            "browser_cache": snapshot_tree(environment.browser_cache),
+            "log_root": snapshot_tree(environment.log_root),
+        }
+
+    def test_validate_only_mutates_nothing(self):
+        """EGRT-T14: identical snapshots across the whole domain, on BOTH entry scripts."""
+        with TemporaryScratch() as tmp:
+            environment = LauncherEnvironment(tmp, ANY_PS).build()
+            before = self._snapshot_domain(environment)
+
+            launcher = environment.run(log_root=environment.log_root)
+            self.assertIn("checks", launcher.stdout)
+            after_launcher = self._snapshot_domain(environment)
+
+            installer = run_installer(
+                ANY_PS, environment.checkout, environment.launcher_root,
+                environment.commit, "-ValidateOnly",
+            )
+            self.assertEqual(0, installer.returncode, installer.stderr)
+            after_installer = self._snapshot_domain(environment)
+
+        for root in before:
+            with self.subTest(root=root, entry_script="launcher.ps1"):
+                self.assertEqual(before[root], after_launcher[root])
+            with self.subTest(root=root, entry_script="install_or_update_launcher.ps1"):
+                self.assertEqual(before[root], after_installer[root])
+
+    def test_repeated_validation_is_byte_identical_and_idempotent(self):
+        """EGRT-T15: two consecutive runs, byte-identical output and identical state."""
+        with TemporaryScratch() as tmp:
+            environment = LauncherEnvironment(tmp, ANY_PS).build()
+
+            first = environment.run()
+            second = environment.run()
+            self.assertEqual(
+                first.stdout,
+                second.stdout,
+                "launcher validation output carries no timestamp and no generated "
+                "identifier, so it must be byte-identical",
+            )
+            snapshot_after_launcher = self._snapshot_domain(environment)
+
+            first_install = run_installer(
+                ANY_PS, environment.checkout, environment.launcher_root,
+                environment.commit, "-ValidateOnly",
+            )
+            second_install = run_installer(
+                ANY_PS, environment.checkout, environment.launcher_root,
+                environment.commit, "-ValidateOnly",
+            )
+            self.assertEqual(0, first_install.returncode, first_install.stderr)
+            self.assertEqual(first_install.stdout, second_install.stdout)
+            self.assertEqual(snapshot_after_launcher, self._snapshot_domain(environment))
+
+    def test_validate_only_launches_no_browser_and_performs_no_cache_write(self):
+        """EGRT-T31: the cache is read, never written, and no browser is started."""
+        with TemporaryScratch() as tmp:
+            environment = LauncherEnvironment(tmp, ANY_PS).build()
+            before = snapshot_tree(environment.browser_cache)
+            completed = environment.run()
+            after = snapshot_tree(environment.browser_cache)
+        self.assertEqual(before, after)
+        observed = launcher_validation(completed)
+        self.assertEqual("PASS", observed["checks"]["browser_cache_ready"])
+
+    def test_validate_only_emits_exactly_one_json_object_with_no_private_content(self):
+        """One object, three keys, and nothing private on the surface."""
+        with TemporaryScratch() as tmp:
+            environment = LauncherEnvironment(tmp, ANY_PS).build()
+            completed = environment.run()
+            emitted = completed.stdout.strip()
+            observed = launcher_validation(completed)
+
+            self.assertEqual({"checks", "status", "support_ref"}, set(observed.keys()))
+            self.assertIsNone(
+                re.search(r"[A-Za-z]:\\\\", emitted),
+                "no Windows absolute path may reach the validation surface",
+            )
+            self.assertIsNone(
+                re.search(r"^\\\\\\\\", emitted), "no UNC path may reach the surface"
+            )
+            self.assertIsNone(
+                re.search(r"S-1-(?:\d+-)+\d+", emitted),
+                "no security identifier may reach the surface",
+            )
+            for sid in SYNTHETIC_SIDS:
+                self.assertNotIn(sid, emitted)
+            self.assertNotIn(str(environment.checkout), emitted)
+            self.assertNotIn(str(environment.config_path), emitted)
+            self.assertNotIn(str(environment.browser_cache), emitted)
+            self.assertNotIn("account_identity", emitted)
+            if environment.credential_username:
+                self.assertNotIn(environment.credential_username, emitted)
+                self.assertNotIn(environment.credential_password, emitted)
+
+    def test_validate_only_output_stays_clean_when_a_write_check_fails(self):
+        """EGRT-T63: on a run failing checks 15 and 16, still nothing identifying."""
+        with TemporaryScratch() as tmp:
+            environment = LauncherEnvironment(tmp, ANY_PS).build()
+            completed = environment.run(authorised=["S-1-5-80-0"])
+            emitted = completed.stdout.strip()
+        observed = launcher_validation(completed)
+        self.assertEqual(
+            "FAIL", observed["checks"]["launcher_root_not_writable_by_run_principal"]
+        )
+        self.assertIsNone(re.search(r"S-1-(?:\d+-)+\d+", emitted))
+        self.assertNotIn("S-1-5-80-0", emitted)
+
+    def test_validate_only_failure_exits_seventy_and_names_the_first_failing_check(self):
+        """Exit 0 means every check passed; a failure exits 70 with a bounded reference."""
+        with TemporaryScratch() as tmp:
+            environment = LauncherEnvironment(tmp, ANY_PS).build(
+                provision_browser_cache=False
+            )
+            completed = environment.run()
+        self.assertEqual(EXIT_PREFLIGHT_FAILED, completed.returncode)
+        observed = launcher_validation(completed)
+        self.assertEqual("FAIL", observed["status"])
+        self.assertEqual("EG_LAUNCHER_BROWSER_CACHE_NOT_READY", observed["support_ref"])
+        self.assertEqual(
+            "FAIL",
+            observed["checks"]["browser_cache_ready"],
+            "the reported reference belongs to the FIRST failing position",
+        )
+        for earlier in ORDERED_PREFLIGHT_CHECK_NAMES[:12]:
+            with self.subTest(earlier_check=earlier):
+                self.assertEqual("PASS", observed["checks"][earlier])
+
+    def test_installer_validate_only_generates_no_transaction_identifier(self):
+        """DD-09: validation creates no residue, so it needs no transaction identifier."""
+        with TemporaryScratch() as tmp:
+            environment = LauncherEnvironment(tmp, ANY_PS).build()
+            before = launcher_root_entries(environment.launcher_root)
+            completed = run_installer(
+                ANY_PS, environment.checkout, environment.launcher_root,
+                environment.commit, "-ValidateOnly",
+            )
+            after = launcher_root_entries(environment.launcher_root)
+            residue = class_b_entries(environment.launcher_root)
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        self.assertEqual(before, after, "the launcher root gains no entry")
+        self.assertEqual([], residue)
+        self.assertIsNone(
+            re.search(
+                r"\.eglauncher-", completed.stdout
+            ),
+            "no reserved residue name may appear in validation output",
+        )
+        observed = json.loads(completed.stdout.strip().splitlines()[-1])
+        self.assertEqual({"checks", "status"}, set(observed.keys()))
+        self.assertNotIn(
+            "ALREADY_CURRENT",
+            json.dumps(observed["checks"]),
+            "ALREADY_CURRENT is a real-path status and never a validation check outcome",
+        )
+
+    def test_installer_validate_only_reports_a_refusal_without_mutating(self):
+        """A failing admission still emits the validation shape and mutates nothing."""
+        with TemporaryScratch() as tmp:
+            environment = LauncherEnvironment(tmp, ANY_PS).build()
+            before = snapshot_tree(environment.launcher_root)
+            completed = run_installer(
+                ANY_PS, environment.checkout, environment.launcher_root,
+                "0" * 40, "-ValidateOnly",
+            )
+            after = snapshot_tree(environment.launcher_root)
+        self.assertEqual(EXIT_INSTALL_PRE_MUTATION_FAILED, completed.returncode)
+        self.assertEqual(before, after)
+        observed = json.loads(completed.stdout.strip().splitlines()[-1])
+        self.assertEqual("FAIL", observed["status"])
+        self.assertEqual(
+            "EG_LAUNCHER_INSTALL_ADMISSION_INVALID", observed["support_ref"]
+        )
+
+
+class ValidateOnlyStaticGuards(TierCBase):
+    """Task 17, Tier C: EGRT-T31's static half and the determinism constraints."""
+
+    def test_no_validation_path_can_reach_a_mutating_command(self):
+        """The validation branch on each entry script returns before any mutation."""
+        launcher = LAUNCHER.read_text(encoding="utf-8")
+        installer = INSTALLER.read_text(encoding="utf-8")
+
+        # On the installer, every mutating call site must appear AFTER the validation
+        # branch exits, so validation is structurally incapable of reaching one.
+        validate_exit = installer.index(
+            "Write-Output (ConvertTo-EgValidationJson -Checks $script:EgInstallerChecks `\n"
+            "        -Status 'PASS' -SupportRef '')"
+        )
+        for mutating in ("WriteAllBytes", "Invoke-AtomicFileReplace",
+                         "Invoke-PublishToAbsentDestination", "New-EgOperationId",
+                         "Invoke-EgPostAcceptanceBackupCleanup"):
+            with self.subTest(mutating=mutating):
+                first = installer.index(mutating)
+                self.assertGreater(
+                    first,
+                    validate_exit,
+                    "%s must not be reachable from the validation branch" % mutating,
+                )
+
+        # On the launcher, the child process is started only after the validation exit.
+        launcher_validate_exit = launcher.index("Exit-EgLauncher -ExitCode 0")
+        for mutating in ("$child.Start()", "Invoke-EgWithInjectedProcessEnvironment"):
+            with self.subTest(mutating=mutating):
+                self.assertGreater(
+                    launcher.index(mutating),
+                    launcher_validate_exit,
+                    "%s must not be reachable from the validation branch" % mutating,
+                )
+
+    def test_the_validation_document_is_built_deterministically(self):
+        """No timestamp, no generated identifier, and an ordered dictionary throughout."""
+        library = LIB.read_text(encoding="utf-8")
+        serialiser_start = library.index("function ConvertTo-EgValidationJson")
+        serialiser_end = library.index("function Write-EgUtf8NoBomText")
+        serialiser = library[serialiser_start:serialiser_end]
+        self.assertIn("[ordered]@{}", serialiser)
+        self.assertIn("ConvertTo-Json -Depth 8 -Compress", serialiser)
+        for forbidden in ("Get-Date", "NewGuid", "DateTime", "Now", "Stopwatch"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, serialiser)
+
+    def test_no_runtime_file_emits_a_timestamp_or_generated_identifier_in_validation(self):
+        """Determinism is what makes the idempotency assertion a strict byte comparison."""
+        for path in existing_runtime_ps1_files():
+            text = path.read_text(encoding="utf-8")
+            for number, line in non_comment_lines(text):
+                if "ConvertTo-EgValidationJson" not in line:
+                    continue
+                with self.subTest(runtime_file=path.name, line=number):
+                    for forbidden in ("Get-Date", "NewGuid", "[datetime]"):
+                        self.assertNotIn(forbidden, line)
+
+
 if __name__ == "__main__":
     unittest.main()
