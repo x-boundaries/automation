@@ -35,8 +35,108 @@ function Get-EgLauncherLibraryContract {
 }
 
 # --------------------------------------------------------------------------------------
+# Process-scope environment snapshot and exact restoration
+# --------------------------------------------------------------------------------------
+
+# The two credential variable names the application reads from its environment. Declared
+# once here because Restore-EgProcessEnvironmentSnapshot needs them to select its bounded
+# support reference; the credential import path consumes the same constant.
+$script:EgCredentialVariableNames = @('ENERGYGRID_USERNAME', 'ENERGYGRID_PASSWORD')
+
+function Get-EgProcessEnvironmentSnapshot {
+    # Record the exact process-scope state of the named variables.
+    #
+    # Present is $false for a variable that does not exist, which is a DIFFERENT state
+    # from a variable that exists and holds an empty string. Restoration depends on the
+    # distinction (design sections 9.2 and 10.2).
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Names)
+
+    $snapshot = [ordered]@{}
+    foreach ($name in $Names) {
+        $observed = [System.Environment]::GetEnvironmentVariable($name, 'Process')
+        $snapshot[$name] = [pscustomobject]@{
+            Present = ($null -ne $observed)
+            Value   = ([string]$observed)
+        }
+    }
+    return $snapshot
+}
+
+function Restore-EgProcessEnvironmentSnapshot {
+    # Restore a snapshot EXACTLY. A name recorded Present $false is REMOVED, never set to
+    # an empty string. A failed restoration is terminal rather than silent.
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$Snapshot)
+
+    $checks = [ordered]@{}
+    $pass = $true
+    $supportRef = ''
+
+    $names = @($Snapshot.Keys)
+    foreach ($name in $names) {
+        $entry = $Snapshot[$name]
+        $desired = $null
+        if ($entry.Present) {
+            $desired = $entry.Value
+        }
+        try {
+            [System.Environment]::SetEnvironmentVariable($name, $desired, 'Process')
+            $observed = [System.Environment]::GetEnvironmentVariable($name, 'Process')
+            if ($entry.Present) {
+                if ($null -eq $observed -or $observed -ne $entry.Value) {
+                    $pass = $false
+                }
+            }
+            else {
+                if ($null -ne $observed) {
+                    $pass = $false
+                }
+            }
+        }
+        catch {
+            $pass = $false
+        }
+    }
+
+    if (-not $pass) {
+        $supportRef = 'EG_LAUNCHER_UNCLASSIFIED'
+        foreach ($credentialName in $script:EgCredentialVariableNames) {
+            if ($names -contains $credentialName) {
+                $supportRef = 'EG_LAUNCHER_CREDENTIAL_RESTORE_FAILED'
+            }
+        }
+    }
+
+    $outcome = 'FAIL'
+    if ($pass) { $outcome = 'PASS' }
+    $checks['process_environment_restored'] = $outcome
+
+    [pscustomobject]@{
+        Pass       = $pass
+        SupportRef = $supportRef
+        Checks     = $checks
+    }
+}
+
+# --------------------------------------------------------------------------------------
 # Governed Git invocation (design sections 10.1, 10.2, 10.3)
 # --------------------------------------------------------------------------------------
+
+function Get-EgGovernedGitEnvironmentNames {
+    # The exact nineteen ambient Git variables design section 10.2 names, in a fixed
+    # order. Each is neutralised before a governed read and exactly restored afterwards.
+    [CmdletBinding()]
+    param()
+
+    @(
+        'GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_INDEX_FILE',
+        'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_CONFIG',
+        'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM', 'GIT_CONFIG_NOSYSTEM',
+        'GIT_CEILING_DIRECTORIES', 'GIT_NAMESPACE', 'GIT_ATTR_NOSYSTEM', 'GIT_PAGER',
+        'GIT_EDITOR', 'GIT_ASKPASS', 'GIT_SSH', 'GIT_SSH_COMMAND', 'GIT_TERMINAL_PROMPT'
+    )
+}
 
 function ConvertTo-EgNativeArgumentString {
     # Build a Windows command line from an argument vector.
@@ -123,10 +223,19 @@ function Invoke-GovernedGit {
     $startInfo.RedirectStandardError = $true
     $startInfo.CreateNoWindow = $true
 
+    # Ambient Git variables are neutralised for the duration of the read and restored
+    # exactly in the finally block. The repository is selected explicitly with -C, and
+    # --no-optional-locks keeps a governed read from mutating the repository.
+    $governedNames = @(Get-EgGovernedGitEnvironmentNames)
+    $environmentSnapshot = Get-EgProcessEnvironmentSnapshot -Names $governedNames
+
     $exitCode = -1
     $standardOutput = ''
     $process = $null
     try {
+        foreach ($governedName in $governedNames) {
+            [System.Environment]::SetEnvironmentVariable($governedName, $null, 'Process')
+        }
         $process = New-Object System.Diagnostics.Process
         $process.StartInfo = $startInfo
         [void]$process.Start()
@@ -145,6 +254,7 @@ function Invoke-GovernedGit {
         if ($null -ne $process) {
             $process.Dispose()
         }
+        [void](Restore-EgProcessEnvironmentSnapshot -Snapshot $environmentSnapshot)
     }
 
     $lines = @(Split-EgProcessOutputLines -Text $standardOutput)

@@ -249,6 +249,77 @@ switch ($Op) {
             failSupportRef    = $failing.SupportRef
         } | ConvertTo-Json -Depth 8 -Compress
     }
+    'gitambient' {
+        # Seed ambient Git variables at the decoy repository, then take a governed read
+        # against the real one. Neutralisation must make the decoy unreachable, and the
+        # finally block must restore the process environment exactly.
+        $names = @(Get-EgGovernedGitEnvironmentNames)
+        $seeded = [ordered]@{}
+        $seeded['GIT_DIR'] = (Join-Path $Dir2 '.git')
+        $seeded['GIT_WORK_TREE'] = $Dir2
+        $seeded['GIT_CONFIG_GLOBAL'] = (Join-Path $Dir2 'decoy.gitconfig')
+        foreach ($seededName in @($seeded.Keys)) {
+            [System.Environment]::SetEnvironmentVariable($seededName, $seeded[$seededName], 'Process')
+        }
+
+        $before = [ordered]@{}
+        foreach ($name in $names) {
+            $observed = [System.Environment]::GetEnvironmentVariable($name, 'Process')
+            $before[$name] = [ordered]@{
+                present = ($null -ne $observed)
+                value   = ([string]$observed)
+            }
+        }
+
+        $bound = Invoke-GovernedGit -RepositoryRootPath $Dir -Arguments @('rev-parse', '--show-toplevel')
+
+        $after = [ordered]@{}
+        foreach ($name in $names) {
+            $observed = [System.Environment]::GetEnvironmentVariable($name, 'Process')
+            $after[$name] = [ordered]@{
+                present = ($null -ne $observed)
+                value   = ([string]$observed)
+            }
+        }
+
+        $topLevel = ''
+        if ($bound.Lines.Count -ge 1) { $topLevel = $bound.Lines[0] }
+
+        [ordered]@{
+            boundSuccess  = $bound.Success
+            boundTopLevel = $topLevel
+            names         = $names
+            nameCount     = $names.Count
+            before        = $before
+            after         = $after
+        } | ConvertTo-Json -Depth 8 -Compress
+    }
+    'envsnapshot' {
+        # Restoration of a snapshot must REMOVE a name recorded absent rather than set it
+        # to an empty string.
+        $names = @('EG_PROBE_ABSENT_NAME', 'EG_PROBE_PRESENT_NAME')
+        [System.Environment]::SetEnvironmentVariable('EG_PROBE_ABSENT_NAME', $null, 'Process')
+        [System.Environment]::SetEnvironmentVariable('EG_PROBE_PRESENT_NAME', 'original', 'Process')
+
+        $snapshot = Get-EgProcessEnvironmentSnapshot -Names $names
+
+        # Disturb both names in opposite directions.
+        [System.Environment]::SetEnvironmentVariable('EG_PROBE_ABSENT_NAME', 'appeared', 'Process')
+        [System.Environment]::SetEnvironmentVariable('EG_PROBE_PRESENT_NAME', 'overwritten', 'Process')
+
+        $restore = Restore-EgProcessEnvironmentSnapshot -Snapshot $snapshot
+
+        $absentAfter = [System.Environment]::GetEnvironmentVariable('EG_PROBE_ABSENT_NAME', 'Process')
+        $presentAfter = [System.Environment]::GetEnvironmentVariable('EG_PROBE_PRESENT_NAME', 'Process')
+
+        [ordered]@{
+            restorePass       = $restore.Pass
+            restoreSupportRef = $restore.SupportRef
+            absentPresent     = ($null -ne $absentAfter)
+            absentValue       = ([string]$absentAfter)
+            presentValue      = ([string]$presentAfter)
+        } | ConvertTo-Json -Depth 8 -Compress
+    }
     default {
         throw ('unknown probe operation: ' + $Op)
     }
@@ -488,6 +559,124 @@ class GovernedGitResultContract(TierABase):
             self.result["failSuccess"],
             "a successful empty read must remain distinguishable from a failure",
         )
+
+
+GOVERNED_GIT_ENVIRONMENT_NAMES = (
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_CONFIG",
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_SYSTEM",
+    "GIT_CONFIG_NOSYSTEM",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_NAMESPACE",
+    "GIT_ATTR_NOSYSTEM",
+    "GIT_PAGER",
+    "GIT_EDITOR",
+    "GIT_ASKPASS",
+    "GIT_SSH",
+    "GIT_SSH_COMMAND",
+    "GIT_TERMINAL_PROMPT",
+)
+
+SEEDED_AMBIENT_NAMES = ("GIT_DIR", "GIT_WORK_TREE", "GIT_CONFIG_GLOBAL")
+
+
+def same_path(left, right):
+    """Compare two filesystem paths for identity, tolerating separator and case form."""
+    return Path(str(left)).resolve() == Path(str(right)).resolve()
+
+
+class AmbientGitEnvironmentIsolation(TierABase):
+    """Task 3: ambient Git variables cannot redirect a governed read, and are restored exactly.
+
+    Git binding is security-sensitive: an ambient variable can silently redirect a
+    governed read to a different repository, which would let a runtime-binding check pass
+    against the wrong tree (design section 10.2).
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls._scratch = TemporaryScratch()
+        tmp = cls._scratch.__enter__()
+        cls.tmp = tmp
+        cls.real = init_scratch_repo(tmp / "real")
+        cls.decoy = init_scratch_repo(tmp / "decoy")
+        (cls.decoy / "decoy.gitconfig").write_text("[core]\n\tquotepath = false\n", encoding="utf-8")
+        cls.result = probe_json(ANY_PS, "gitambient", tmp, dir=cls.real, dir2=cls.decoy)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._scratch.__exit__(None, None, None)
+
+    def test_the_governed_environment_name_set_matches_the_design(self):
+        """Design section 10.2 names exactly nineteen variables, in a fixed order."""
+        self.assertEqual(19, self.result["nameCount"])
+        self.assertEqual(list(GOVERNED_GIT_ENVIRONMENT_NAMES), self.result["names"])
+
+    def test_ambient_git_variables_cannot_redirect_a_governed_read(self):
+        """EGRT-T04: GIT_DIR, GIT_WORK_TREE, and GIT_CONFIG_GLOBAL at a decoy are inert."""
+        self.assertTrue(self.result["boundSuccess"])
+        self.assertTrue(
+            same_path(self.result["boundTopLevel"], self.real),
+            "the governed read resolved to %r rather than the real repository %r"
+            % (self.result["boundTopLevel"], str(self.real)),
+        )
+        self.assertFalse(
+            same_path(self.result["boundTopLevel"], self.decoy),
+            "the governed read must never resolve to the decoy repository",
+        )
+
+    def test_git_environment_is_restored_exactly_including_absent_names(self):
+        """EGRT-T05: exact restoration, with absent names staying absent."""
+        before = self.result["before"]
+        after = self.result["after"]
+        for name in GOVERNED_GIT_ENVIRONMENT_NAMES:
+            with self.subTest(variable=name):
+                self.assertEqual(
+                    before[name]["present"],
+                    after[name]["present"],
+                    "%s presence changed across the governed read" % name,
+                )
+                self.assertEqual(
+                    before[name]["value"],
+                    after[name]["value"],
+                    "%s value changed across the governed read" % name,
+                )
+        for name in SEEDED_AMBIENT_NAMES:
+            with self.subTest(seeded=name):
+                self.assertTrue(after[name]["present"], "%s must be restored" % name)
+                self.assertNotEqual("", after[name]["value"])
+        absent_before = [
+            name for name in GOVERNED_GIT_ENVIRONMENT_NAMES if not before[name]["present"]
+        ]
+        self.assertTrue(
+            absent_before,
+            "the fixture must include names that were absent before the call",
+        )
+        for name in absent_before:
+            with self.subTest(absent=name):
+                self.assertFalse(
+                    after[name]["present"],
+                    "%s was absent beforehand and must not be present and empty" % name,
+                )
+
+    def test_a_snapshot_restores_an_absent_name_by_removing_it(self):
+        """EGRT-T05 support: restoration removes rather than blanks an absent name."""
+        with TemporaryScratch() as tmp:
+            result = probe_json(ANY_PS, "envsnapshot", tmp)
+        self.assertTrue(result["restorePass"])
+        self.assertEqual("", result["restoreSupportRef"])
+        self.assertFalse(
+            result["absentPresent"],
+            "a name recorded absent must be REMOVED, never set to an empty string",
+        )
+        self.assertEqual("original", result["presentValue"])
 
 
 if __name__ == "__main__":
