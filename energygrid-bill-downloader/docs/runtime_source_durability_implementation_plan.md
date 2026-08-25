@@ -267,6 +267,13 @@ when either privilege is *present* in the running token, whether enabled or disa
 is a bounded rule and not an exhaustive one: no discretionary-access-list check can fully
 constrain a principal granted list-bypassing privileges.
 
+Failure to read the token's privilege information is a step 6 failure and is terminal in
+its own right. It is represented as a read error, never as a fabricated privilege
+membership: no task may synthesise `SeTakeOwnershipPrivilege`, `SeRestorePrivilege`, or any
+other privilege name in order to reach the fail-closed outcome. "The privilege list could
+not be read" and "the privilege list was read and holds neither bypass privilege" are
+distinct states, and only the second may reach the privilege predicate.
+
 **Operational consequence carried forward from the design review.** Because privilege
 presence alone fails the check, an execution token that holds either privilege by
 construction can never pass it. `LocalSystem` is such a token. No task in this plan, and no
@@ -1993,7 +2000,13 @@ function Test-EgLauncherRootSecurity {
     #   launcher_root_outside_checkout               -> EG_LAUNCHER_ROOT_INSIDE_CHECKOUT
     #   launcher_root_not_writable_by_run_principal  -> EG_LAUNCHER_ROOT_ACL_RUN_PRINCIPAL_WRITABLE
     #       DD-02. Test-EgTokenWriteAccessToPath over the launcher root and every Class A
-    #       member, plus Test-EgBypassPrivilegePresent once over the running token.
+    #       member, plus one Get-EgTokenPrivilegeNames read of the running token whose
+    #       observed PrivilegeNames are passed once to Test-EgBypassPrivilegePresent.
+    #       A ReadOk $false result from Get-EgTokenPrivilegeNames fails this check
+    #       terminally under this same name and reference: the run does not continue to
+    #       the privilege predicate or to any remaining AccessCheck, and the empty
+    #       PrivilegeNames array is never read as absence of a bypass privilege
+    #       (design 17.2.1 step 6).
     #   launcher_root_write_trustees_authorised      -> EG_LAUNCHER_ROOT_ACL_WRITE_TRUSTEE_UNAUTHORISED
     #       DD-03. Test-EgPathWriteTrusteesAuthorised over the same object set.
     #                                                -> EG_LAUNCHER_ROOT_AUTHORISED_SID_SET_INVALID
@@ -2079,22 +2092,43 @@ function Test-EgAuthorisedWriteSidSet {
 function Test-EgBypassPrivilegePresent {
     [CmdletBinding()]
     param([Parameter(Mandatory)][AllowEmptyCollection()][string[]]$PrivilegeName)
-    # Pure predicate. Returns [bool] $true when $PrivilegeName contains any member of
-    # $script:EgBypassPrivilegeNames, compared case-insensitively. Presence alone is
-    # sufficient; enabled state is irrelevant (design 17.2.1 privilege-bypass rule).
+    # Pure predicate over ACTUALLY OBSERVED names. Returns [bool] $true when
+    # $PrivilegeName contains any member of $script:EgBypassPrivilegeNames, compared
+    # case-insensitively. Presence alone is sufficient; enabled state is irrelevant
+    # (design 17.2.1 privilege-bypass rule).
+    #
+    # $PrivilegeName is only ever the PrivilegeNames of a Get-EgTokenPrivilegeNames result
+    # whose ReadOk is $true. The predicate has no knowledge of token-read failure, never
+    # receives a fabricated name, and never manufactures failure state: an empty list is
+    # simply $false, and the terminal handling of ReadOk $false belongs to the caller.
 }
 
 function Get-EgTokenPrivilegeNames {
     [CmdletBinding()]
     param()
-    # Returns [string[]] of privilege names present in the running process token, read
-    # through GetTokenInformation with TOKEN_PRIVILEGES and LookupPrivilegeName. Always a
-    # forced array subexpression.
+    # Reads the privilege names present in the running process token through
+    # GetTokenInformation with TOKEN_PRIVILEGES and LookupPrivilegeName.
+    # Returns:
+    #   [pscustomobject]@{
+    #       ReadOk         = [bool]
+    #       PrivilegeNames = [string[]]
+    #   }
+    # ReadOk $true means the token privilege information was read: PrivilegeNames carries
+    # exactly the names OBSERVED in the token, always a forced array subexpression.
+    # ReadOk $false means the read FAILED: PrivilegeNames is @().
     #
-    # FAIL-CLOSED: a failure to read token privileges returns
-    # $script:EgBypassPrivilegeNames, so an unreadable token is treated as bypass
-    # privilege present rather than absent. This is the one place the function reports
-    # something it did not observe, and it does so only in the safe direction.
+    # The function never reports a privilege name it did not observe. A read failure is
+    # never expressed as a synthetic SeTakeOwnershipPrivilege, SeRestorePrivilege, or any
+    # other privilege membership, so this function does not consume
+    # $script:EgBypassPrivilegeNames at all.
+    #
+    # FAIL-CLOSED, in the caller: ReadOk $false is TERMINAL at
+    # Test-EgLauncherRootSecurity, which fails
+    # launcher_root_not_writable_by_run_principal with
+    # EG_LAUNCHER_ROOT_ACL_RUN_PRINCIPAL_WRITABLE and never reads the empty
+    # PrivilegeNames array as evidence that no bypass privilege is present (design
+    # 17.2.1 step 6). "Read failed" and "read succeeded, neither bypass privilege
+    # present" are distinct states and are never collapsed.
 }
 
 function Test-EgTokenWriteAccessToPath {
@@ -2115,6 +2149,12 @@ function Test-EgTokenWriteAccessToPath {
     # DesiredAccess is MAXIMUM_ALLOWED and the verdict is the intersection from
     # Get-EgMappedWriteCapableMask. The union-of-all-write-rights formulation is
     # prohibited (DD-02 in full, EGRT-T59).
+    #
+    # AccessCheck's PrivilegeSet and PrivilegeSetLength arguments are Win32 call mechanics,
+    # not part of the verdict: the call must supply a correctly sized PRIVILEGE_SET buffer
+    # as the documented signature requires. An insufficient or invalid buffer is an API
+    # failure, so it sets Evaluated $false and is terminal under DD-02 step 6. It is never
+    # interpreted as an access verdict in either direction.
     #
     # Never impersonates with the duplicated token, never passes the primary token to
     # AccessCheck, and never derives the context from an account name or a SID
@@ -2263,15 +2303,29 @@ had not computed, which the fallback discipline in Global Constraints forbids.
      (`EGRT-T68`, Tier A): an inheritable write-capable `S-1-3-0` entry fails closed, and
      `Test-EgAuthorisedWriteSidSet` refuses `S-1-3-0` in the supplied set with
      `EG_LAUNCHER_ROOT_AUTHORISED_SID_SET_INVALID`.
-   - `test_a_bypass_privilege_fails_the_run_principal_check` (`EGRT-T69`, Tier A):
-     `Test-EgBypassPrivilegePresent` returns `$true` for `SeTakeOwnershipPrivilege` alone,
-     `$true` for `SeRestorePrivilege` alone, and `$false` for a list holding neither, and
-     `Get-EgTokenPrivilegeNames` returns the bypass names when the token read fails, so an
-     unreadable token fails closed. The same test AST-asserts that
-     `Test-EgLauncherRootSecurity` fails `launcher_root_not_writable_by_run_principal`
-     whenever the predicate is `$true`, with no branch that can reach a PASS from a `$true`
-     predicate, so the composition is closed on any host regardless of what privileges the
-     runner's own token happens to hold.
+   - `test_a_bypass_privilege_or_an_unreadable_privilege_list_fails_the_run_principal_check`
+     (`EGRT-T69`, Tier A) proves five things independently:
+     (a) an actually observed `SeTakeOwnershipPrivilege` fails
+     `launcher_root_not_writable_by_run_principal`;
+     (b) an actually observed `SeRestorePrivilege` fails the same check;
+     (c) a privilege list read successfully and holding neither name makes
+     `Test-EgBypassPrivilegePresent` return `$false`, so a successful read is not itself a
+     failure;
+     (d) a `Get-EgTokenPrivilegeNames` result carrying `ReadOk` `$false` fails the same
+     check terminally on its own, without the predicate being consulted and without the
+     empty `PrivilegeNames` array being read as absence of a bypass privilege; and
+     (e) the read-failure path fabricates neither bypass privilege name, asserted over the
+     returned object and over every surface the failure reaches.
+     Cases (a) to (c) drive `Test-EgBypassPrivilegePresent` directly over supplied observed
+     name lists; case (d) drives the caller with the read reporting failure; case (e)
+     asserts the returned `PrivilegeNames` is empty and that neither literal appears in the
+     result, in `-ValidateOnly` stdout, or in the terminal event. The same test AST-asserts
+     that `Test-EgLauncherRootSecurity` fails
+     `launcher_root_not_writable_by_run_principal` both whenever the predicate is `$true`
+     and whenever `ReadOk` is `$false`, with no branch that can reach a PASS from either,
+     and that `$script:EgBypassPrivilegeNames` is not referenced inside
+     `Get-EgTokenPrivilegeNames`. The composition is therefore closed on any host
+     regardless of what privileges the runner's own token happens to hold.
    - `test_the_access_check_uses_a_duplicated_impersonation_token` (`EGRT-T70`, Tier A and
      C): the static half asserts that `DuplicateTokenEx` is called with
      `TokenImpersonation` and `SecurityIdentification`, that the primary token handle is
@@ -3009,9 +3063,11 @@ never a SID.
   `$script:EgWriteCapableAccessMask` is declared once (Task 16) and is the sole source for
   `Get-EgMappedWriteCapableMask`, `Test-EgTokenWriteAccessToPath`,
   `Test-EgPathWriteTrusteesAuthorised`, and every test that asserts against the mask.
-  `$script:EgBypassPrivilegeNames` is declared once and consumed by
-  `Test-EgBypassPrivilegePresent` and by the fail-closed return in
-  `Get-EgTokenPrivilegeNames`. `$script:EgRefusedAuthorisedSid` is declared once and
+  `$script:EgBypassPrivilegeNames` is declared once and consumed only by
+  `Test-EgBypassPrivilegePresent`, which compares it against observed privilege names;
+  `Get-EgTokenPrivilegeNames` does not consume it, because a token-read failure is
+  reported as `ReadOk` `$false` with an empty `PrivilegeNames` array rather than as a
+  synthesised privilege name. `$script:EgRefusedAuthorisedSid` is declared once and
   consumed only by `Test-EgAuthorisedWriteSidSet`.
 - The authorised SID set has exactly one route and one shape at every hop:
   `-AuthorisedLauncherRootWriteSid` as `[string[]]` on `launcher.ps1`, passed unchanged to
