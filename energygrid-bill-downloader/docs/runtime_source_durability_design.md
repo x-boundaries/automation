@@ -541,9 +541,11 @@ by `EGRT-T17` inside the Python suite instead of by extending that step, so pars
 grows with the directory without a workflow edit. If a future need genuinely requires a
 workflow change, moving the check into the suite is the preferred resolution.
 
-This design change itself touches only `docs/superpowers/specs/`, which matches no
-workflow trigger path. No GitHub Actions run is therefore expected for the design pull
-request, and its absence is not a failure.
+This design document itself lives under `energygrid-bill-downloader/docs/`, so it matches
+the `energygrid-bill-downloader/**` trigger above. The design pull request therefore runs
+the same EnergyGrid job an implementation change would: the project synthetic suite plus
+the scope and whitespace guard, which accepts the changed path because it is under
+`^energygrid-bill-downloader/`. No workflow was edited to obtain that coverage.
 
 ## 14. Deployment And Update Flow
 
