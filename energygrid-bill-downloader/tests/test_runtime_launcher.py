@@ -5794,5 +5794,580 @@ class WriteAuthorityTierB(WriteAuthorityMixin, TierBBase):
         cls.exe = DESKTOP_PS
 
 
+ORDERED_PREFLIGHT_CHECK_NAMES = (
+    "launcher_root_entries_classified",
+    "launcher_package_members_present",
+    "launcher_package_parse_clean",
+    "launcher_package_manifest_match",
+    "checkout_root_exists_absolute",
+    "config_path_exists_absolute",
+    "python_exe_exists_absolute",
+    "config_path_outside_checkout",
+    "config_parses_json",
+    "config_required_keys_present",
+    "python_version_is_3_14",
+    "governed_source_integrity",
+    "browser_cache_ready",
+    "launcher_root_outside_checkout",
+    "launcher_root_not_writable_by_run_principal",
+    "launcher_root_write_trustees_authorised",
+    "launcher_files_not_reparse_points",
+    "launcher_files_not_unexpectedly_readonly",
+    "credential_import_ok",
+    "username_nonempty",
+    "password_nonempty",
+)
+
+NON_SECRET_CHECK_NAMES = ORDERED_PREFLIGHT_CHECK_NAMES[:18]
+CREDENTIAL_CHECK_NAMES = ORDERED_PREFLIGHT_CHECK_NAMES[18:]
+
+REQUIRED_CONFIG_KEYS = (
+    "portal_url",
+    "account_identity",
+    "archive_root",
+    "state_path",
+    "temp_root",
+    "log_root",
+)
+
+EXIT_PREFLIGHT_FAILED = 70
+
+PYTHON_STUB_SCRIPT = r"""
+@echo off
+if "%~1"=="--version" (
+  echo Python 3.14.7
+  exit /b 0
+)
+exit /b 0
+"""
+
+
+class LauncherEnvironment:
+    """A complete scratch deployment: a checkout, an installed launcher root, and host state.
+
+    The launcher root is this script's own directory by contract, so the tests install the
+    REAL committed runtime files into a scratch root through the REAL installer and then
+    invoke the installed copy. Nothing here touches a production path.
+    """
+
+    def __init__(self, tmp, exe):
+        self.tmp = Path(tmp)
+        self.exe = exe
+        self.checkout = None
+        self.commit = None
+        self.launcher_root = None
+        self.config_path = None
+        self.credential_path = None
+        self.browser_cache = None
+        self.log_root = None
+        self.credential_username = None
+        self.credential_password = None
+
+    def build(self, config_overrides=None, omit_config_keys=(),
+              provision_browser_cache=True, create_credential=True,
+              config_inside_checkout=False):
+        host = self.tmp / "private_host_state"
+        host.mkdir()
+
+        self.checkout = init_scratch_repo(self.tmp / "checkout")
+        runtime = self.checkout / "energygrid-bill-downloader" / "runtime"
+        runtime.mkdir(parents=True)
+        for name in ("launcher.ps1", "launcher_lib.ps1"):
+            shutil.copyfile(RUNTIME_DIR / name, runtime / name)
+        package = self.checkout / GOVERNED_EXECUTABLE_SURFACE
+        package.mkdir(parents=True)
+        (package / "__init__.py").write_text("", encoding="utf-8", newline="")
+        (package / "cli.py").write_text("# scratch cli\r\n", encoding="utf-8", newline="")
+        (self.checkout / "energygrid-bill-downloader" / "requirements.txt").write_text(
+            "playwright==1.61.0\r\n", encoding="utf-8", newline=""
+        )
+        run_git(self.checkout, "add", "-A")
+        run_git(self.checkout, "commit", "-m", "scratch runtime deployment")
+        self.commit = run_git(self.checkout, "rev-parse", "HEAD").stdout.strip()
+
+        self.launcher_root = self.tmp / "launcher_root"
+        self.launcher_root.mkdir()
+        installed = run_installer(
+            self.exe, self.checkout, self.launcher_root, self.commit
+        )
+        if installed.returncode != 0:
+            raise AssertionError(
+                "scratch installation failed\nstdout:\n%s\nstderr:\n%s"
+                % (installed.stdout, installed.stderr)
+            )
+
+        config = {
+            "portal_url": "https://portal.invalid.test/login",
+            "account_identity": "REPLACE_WITH_ACCOUNT_IDENTITY",
+            "archive_root": str(host / "archive"),
+            "state_path": str(host / "state" / "operations.sqlite"),
+            "temp_root": str(host / "temp"),
+            "log_root": str(host / "logs"),
+        }
+        for key in omit_config_keys:
+            config.pop(key, None)
+        if config_overrides:
+            config.update(config_overrides)
+        if config_inside_checkout:
+            self.config_path = self.checkout / "inside_checkout_config.json"
+        else:
+            self.config_path = host / "energygrid.private.json"
+        self.config_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
+
+        self.log_root = host / "logs"
+        self.log_root.mkdir()
+
+        self.browser_cache = host / "browser_cache"
+        build_scratch_browser_cache(
+            self.browser_cache, provisioned=provision_browser_cache
+        )
+
+        self.credential_path = host / "synthetic.credential.xml"
+        if create_credential:
+            _artefact, username, password = make_synthetic_credential_artefact(
+                self.exe, self.tmp, artefact_path=self.credential_path
+            )
+            self.credential_username = username
+            self.credential_password = password
+
+        self.python_exe = host / "python_stub.cmd"
+        self.python_exe.write_text(PYTHON_STUB_SCRIPT, encoding="utf-8", newline="")
+        return self
+
+    def installed_launcher(self):
+        return self.launcher_root / "launcher.ps1"
+
+    def run(self, *extra, validate_only=True, authorised=None, expected_branch="ANY_BRANCH",
+            python_exe=None, config_path=None, credential_path=None,
+            browser_cache=None, log_root=None):
+        if authorised is None:
+            authorised = ["S-1-1-0"]
+        args = [
+            "-ConfigPath", str(config_path or self.config_path),
+            "-PythonExe", str(python_exe or self.python_exe),
+            "-CheckoutRoot", str(self.checkout),
+            "-CredentialPath", str(credential_path or self.credential_path),
+            "-BrowserCachePath", str(browser_cache or self.browser_cache),
+            "-ExpectedBranch", expected_branch,
+            "-AuthorisedLauncherRootWriteSid",
+        ]
+        args.append(",".join(str(sid) for sid in authorised))
+        if log_root is not None:
+            args.extend(["-LogRoot", str(log_root)])
+        if validate_only:
+            args.append("-ValidateOnly")
+        args.extend(extra)
+        return run_ps(self.exe, self.installed_launcher(), *args)
+
+
+def launcher_validation(completed):
+    """Parse the launcher's single deterministic validation JSON object."""
+    text = completed.stdout.strip()
+    if not text:
+        raise AssertionError(
+            "the launcher emitted no validation object\nstdout:\n%s\nstderr:\n%s"
+            % (completed.stdout, completed.stderr)
+        )
+    lines = [line for line in text.splitlines() if line.strip()]
+    if len(lines) != 1:
+        raise AssertionError(
+            "expected exactly one JSON object on standard output, got %d lines:\n%s"
+            % (len(lines), text)
+        )
+    return json.loads(lines[0])
+
+
+class LauncherPreflightContract(TierABase):
+    """Task 16, steps 8 to 14: design sections 5.1, 5.2, 5.3, and 11.3."""
+
+    def test_the_preflight_check_order_matches_the_committed_contract(self):
+        """The emitted checks map carries the twenty-one stable names in exact order."""
+        with TemporaryScratch() as tmp:
+            environment = LauncherEnvironment(tmp, ANY_PS).build()
+            completed = environment.run()
+        observed = launcher_validation(completed)
+        self.assertEqual(
+            list(ORDERED_PREFLIGHT_CHECK_NAMES),
+            list(observed["checks"].keys()),
+            "the checks map key order is part of the contract",
+        )
+        self.assertEqual({"checks", "status", "support_ref"}, set(observed.keys()))
+
+    def test_the_non_secret_preflight_reaches_the_launcher_root_security_group(self):
+        """Positions 1 to 13 pass against a correctly prepared scratch deployment."""
+        with TemporaryScratch() as tmp:
+            environment = LauncherEnvironment(tmp, ANY_PS).build()
+            completed = environment.run()
+        observed = launcher_validation(completed)
+        for name in ORDERED_PREFLIGHT_CHECK_NAMES[:13]:
+            with self.subTest(check=name):
+                self.assertEqual(
+                    "PASS",
+                    observed["checks"][name],
+                    "%s failed; first failure was %r"
+                    % (name, observed.get("support_ref")),
+                )
+
+    def test_a_failing_non_secret_preflight_causes_zero_credential_import_attempt(self):
+        """EGRT-T48: the credential artefact is never opened when an earlier check fails.
+
+        The artefact path is pointed at a file that does not exist, so any attempt to open
+        it would be visible as a credential support reference. Each case below fails a
+        DIFFERENT non-secret position.
+        """
+        sentinel = "does_not_exist.credential.xml"
+        cases = {
+            "browser_cache_ready": {"provision_browser_cache": False},
+            "config_required_keys_present": {"omit_config_keys": ("portal_url",)},
+            "config_path_outside_checkout": {"config_inside_checkout": True},
+        }
+        for expected_check, build_kwargs in cases.items():
+            with self.subTest(failing_check=expected_check):
+                with TemporaryScratch() as tmp:
+                    environment = LauncherEnvironment(tmp, ANY_PS).build(**build_kwargs)
+                    absent = Path(tmp) / sentinel
+                    completed = environment.run(credential_path=absent)
+                observed = launcher_validation(completed)
+                self.assertEqual("FAIL", observed["checks"][expected_check])
+                for name in CREDENTIAL_CHECK_NAMES:
+                    self.assertEqual(
+                        "FAIL",
+                        observed["checks"][name],
+                        "an unevaluated credential position must report FAIL, never PASS",
+                    )
+                self.assertNotIn(
+                    "CREDENTIAL",
+                    observed["support_ref"],
+                    "no credential reference may be reported when a non-secret check "
+                    "failed first: the artefact was never opened",
+                )
+
+    def test_a_failing_launcher_root_security_check_precedes_the_credential_import(self):
+        """EGRT-T48: including each launcher-root security position, 14 to 18."""
+        with TemporaryScratch() as tmp:
+            environment = LauncherEnvironment(tmp, ANY_PS).build()
+            absent = Path(tmp) / "does_not_exist.credential.xml"
+            # The scratch launcher root is owned and writable by the running account, so
+            # position 15 fails by construction here.
+            completed = environment.run(credential_path=absent)
+        observed = launcher_validation(completed)
+        self.assertEqual(
+            "FAIL", observed["checks"]["launcher_root_not_writable_by_run_principal"]
+        )
+        self.assertEqual(
+            "EG_LAUNCHER_ROOT_ACL_RUN_PRINCIPAL_WRITABLE", observed["support_ref"]
+        )
+        for name in CREDENTIAL_CHECK_NAMES:
+            self.assertEqual("FAIL", observed["checks"][name])
+
+    def test_a_refused_authorised_identifier_set_fails_the_trustee_check(self):
+        """DD-12: a refused set is reported under check 16 with its own reference."""
+        with TemporaryScratch() as tmp:
+            environment = LauncherEnvironment(tmp, ANY_PS).build()
+            completed = environment.run(authorised=["not-a-sid"])
+        observed = launcher_validation(completed)
+        self.assertEqual(
+            "FAIL", observed["checks"]["launcher_root_write_trustees_authorised"]
+        )
+
+    def test_a_missing_or_invalid_class_a_member_cannot_be_satisfied_by_residue(self):
+        """EGRT-T56: recognised residue can never satisfy a missing package member."""
+        for missing in ("launcher_lib.ps1", MANIFEST_FILE_NAME):
+            with self.subTest(missing_member=missing):
+                with TemporaryScratch() as tmp:
+                    environment = LauncherEnvironment(tmp, ANY_PS).build()
+                    target = environment.launcher_root / missing
+                    residue = environment.launcher_root / residue_name("backup", missing)
+                    shutil.move(str(target), str(residue))
+                    completed = environment.run()
+                if missing == "launcher_lib.ps1":
+                    # The entry script dot-sources the library by a fixed join, so a
+                    # missing library cannot be replaced by residue and the run cannot
+                    # even reach its own preflight.
+                    self.assertNotEqual(0, completed.returncode)
+                    self.assertNotIn(
+                        residue.name,
+                        completed.stdout,
+                        "residue must never be selected as a library",
+                    )
+                else:
+                    observed = launcher_validation(completed)
+                    self.assertEqual(
+                        "FAIL", observed["checks"]["launcher_package_members_present"]
+                    )
+                    self.assertEqual(
+                        "EG_LAUNCHER_PACKAGE_MEMBER_MISSING", observed["support_ref"]
+                    )
+
+    def test_an_unexpected_launcher_root_entry_fails_closed(self):
+        """Class C is terminal, and it is the first position evaluated."""
+        with TemporaryScratch() as tmp:
+            environment = LauncherEnvironment(tmp, ANY_PS).build()
+            (environment.launcher_root / "launcher-old.ps1").write_text(
+                "# intruder\r\n", encoding="utf-8", newline=""
+            )
+            completed = environment.run()
+        observed = launcher_validation(completed)
+        self.assertEqual("FAIL", observed["checks"]["launcher_root_entries_classified"])
+        self.assertEqual("EG_LAUNCHER_ROOT_UNEXPECTED_ENTRY", observed["support_ref"])
+
+    def test_recognised_residue_is_never_executed_imported_or_selected(self):
+        """EGRT-T57, dynamic half: executable-content residue never runs."""
+        with TemporaryScratch() as tmp:
+            environment = LauncherEnvironment(tmp, ANY_PS).build()
+            marker = Path(tmp) / "residue_executed.marker"
+            residue = environment.launcher_root / residue_name("staging", "launcher_lib.ps1")
+            residue.write_text(
+                "New-Item -ItemType File -Path '%s'\r\n" % str(marker).replace("\\", "\\\\"),
+                encoding="utf-8", newline="",
+            )
+            completed = environment.run()
+            self.assertFalse(
+                marker.exists(), "recognised residue must never be executed"
+            )
+        observed = launcher_validation(completed)
+        self.assertEqual(
+            "PASS",
+            observed["checks"]["launcher_root_entries_classified"],
+            "correctly named residue is tolerated, not executed",
+        )
+
+    def test_a_manifest_mismatch_fails_closed(self):
+        """An installed member that no longer matches the manifest is terminal."""
+        with TemporaryScratch() as tmp:
+            environment = LauncherEnvironment(tmp, ANY_PS).build()
+            member = environment.launcher_root / "launcher_lib.ps1"
+            member.write_text(
+                member.read_text(encoding="utf-8") + "\r\n# tampered\r\n",
+                encoding="utf-8", newline="",
+            )
+            completed = environment.run()
+        observed = launcher_validation(completed)
+        self.assertEqual("FAIL", observed["checks"]["launcher_package_manifest_match"])
+        self.assertEqual("EG_LAUNCHER_MANIFEST_MISMATCH", observed["support_ref"])
+
+    def test_the_terminal_event_is_written_once_and_carries_no_private_data(self):
+        """One launcher_failed line, exactly four keys, and never a changed exit code."""
+        with TemporaryScratch() as tmp:
+            environment = LauncherEnvironment(tmp, ANY_PS).build()
+            with_log = environment.run(
+                validate_only=False, log_root=environment.log_root, authorised=["S-1-1-0"]
+            )
+            self.assertEqual(EXIT_PREFLIGHT_FAILED, with_log.returncode)
+            event_file = environment.log_root / "launcher_failed.jsonl"
+            self.assertTrue(event_file.is_file(), "a failing run must append one event")
+            lines = [line for line in event_file.read_text(encoding="utf-8").splitlines()
+                     if line.strip()]
+            self.assertEqual(1, len(lines), "exactly one event per failing run")
+            event = json.loads(lines[0])
+            self.assertEqual(
+                ["run_id", "phase", "status", "support_ref"], list(event.keys())
+            )
+            self.assertIsNone(
+                re.search(r"[A-Za-z]:\\\\", json.dumps(event)),
+                "no private path may reach the terminal event",
+            )
+
+            without_log = environment.run(validate_only=False)
+            self.assertEqual(
+                EXIT_PREFLIGHT_FAILED,
+                without_log.returncode,
+                "a run with no log root returns the same exit code",
+            )
+
+            unwritable = Path(tmp) / "no_such_log_root"
+            with_bad_log = environment.run(validate_only=False, log_root=unwritable)
+            self.assertEqual(
+                EXIT_PREFLIGHT_FAILED,
+                with_bad_log.returncode,
+                "an unresolvable log root never changes the exit code",
+            )
+
+    def test_a_preflight_failure_exits_seventy_and_starts_no_child(self):
+        """The launcher never continues past a failed check."""
+        with TemporaryScratch() as tmp:
+            environment = LauncherEnvironment(tmp, ANY_PS).build()
+            completed = environment.run(validate_only=False)
+        self.assertEqual(EXIT_PREFLIGHT_FAILED, completed.returncode)
+        self.assertEqual(
+            "", completed.stdout.strip(),
+            "the real path emits no validation document",
+        )
+
+    def test_the_required_configuration_key_set_is_exactly_the_application_contract(self):
+        """DD-05: each required key, omitted individually, fails position 10."""
+        for key in REQUIRED_CONFIG_KEYS:
+            with self.subTest(missing_key=key):
+                with TemporaryScratch() as tmp:
+                    environment = LauncherEnvironment(tmp, ANY_PS).build(
+                        omit_config_keys=(key,)
+                    )
+                    completed = environment.run()
+                observed = launcher_validation(completed)
+                self.assertEqual(
+                    "FAIL", observed["checks"]["config_required_keys_present"]
+                )
+                self.assertEqual(
+                    "EG_LAUNCHER_CONFIG_KEY_MISSING", observed["support_ref"]
+                )
+
+    def test_an_unsupported_interpreter_version_fails_closed(self):
+        """Position 11 requires a 3.14.x interpreter."""
+        with TemporaryScratch() as tmp:
+            environment = LauncherEnvironment(tmp, ANY_PS).build()
+            stub = Path(tmp) / "wrong_python.cmd"
+            stub.write_text(
+                "@echo off\r\nif \"%~1\"==\"--version\" (\r\n  echo Python 3.12.4\r\n"
+                "  exit /b 0\r\n)\r\nexit /b 0\r\n",
+                encoding="utf-8", newline="",
+            )
+            completed = environment.run(python_exe=stub)
+        observed = launcher_validation(completed)
+        self.assertEqual("FAIL", observed["checks"]["python_version_is_3_14"])
+        self.assertEqual(
+            "EG_LAUNCHER_PYTHON_VERSION_UNSUPPORTED", observed["support_ref"]
+        )
+
+    def test_a_branch_mismatch_fails_the_governed_source_check(self):
+        """Position 12 carries the branch binding when the sentinel is not supplied."""
+        with TemporaryScratch() as tmp:
+            environment = LauncherEnvironment(tmp, ANY_PS).build()
+            completed = environment.run(expected_branch="release")
+        observed = launcher_validation(completed)
+        self.assertEqual("FAIL", observed["checks"]["governed_source_integrity"])
+        self.assertEqual("EG_LAUNCHER_SOURCE_BRANCH_MISMATCH", observed["support_ref"])
+
+
+class LauncherStaticGuards(TierCBase):
+    """Task 16, Tier C: EGRT-T19, EGRT-T20, EGRT-T57 static half, and the ordering guard."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.launcher = LAUNCHER.read_text(encoding="utf-8")
+        cls.library = LIB.read_text(encoding="utf-8")
+
+    def test_the_launcher_exit_band_is_disjoint_from_the_application_band(self):
+        """EGRT-T19: read from the committed constants, not from convention."""
+        runtime_band = set()
+        for match in re.finditer(
+            r"(?:PreflightFailed|InstallPreMutationFailed|InstallRolledBack|"
+            r"InstallRollbackIncomplete)\s*=\s*(\d+)",
+            self.library,
+        ):
+            runtime_band.add(int(match.group(1)))
+        self.assertEqual({70, 71, 72, 73}, runtime_band)
+
+        application_match = re.search(
+            r"\$script:EgApplicationExitCodes\s*=\s*@\(([^)]*)\)", self.library
+        )
+        self.assertIsNotNone(application_match)
+        application_band = {
+            int(value.strip())
+            for value in application_match.group(1).split(",")
+            if value.strip()
+        }
+        self.assertEqual({0, 10, 20, 64}, application_band)
+        self.assertEqual(
+            set(), runtime_band & application_band, "the two bands must be disjoint"
+        )
+
+    def test_no_committed_runtime_file_contains_a_portal_url_literal(self):
+        """EGRT-T20: no http or https string constant reaches a committed runtime file."""
+        for path in existing_runtime_ps1_files():
+            text = path.read_text(encoding="utf-8")
+            for number, line in non_comment_lines(text):
+                with self.subTest(runtime_file=path.name, line=number):
+                    self.assertIsNone(
+                        re.search(r"https?://", line),
+                        "%s line %d carries a URL literal" % (path.name, number),
+                    )
+
+    def test_the_only_dot_source_is_a_fixed_join_of_the_script_root(self):
+        """EGRT-T57: the launcher never dot-sources a path derived from an enumeration."""
+        dot_sources = re.findall(r"^\s*\.\s+(.+)$", self.launcher, re.M)
+        self.assertEqual(
+            1, len(dot_sources), "there must be exactly one dot-source in the launcher"
+        )
+        self.assertEqual(
+            "(Join-Path $PSScriptRoot 'launcher_lib.ps1')", dot_sources[0].strip()
+        )
+
+    def test_no_runtime_file_invokes_or_imports_an_enumerated_path(self):
+        """EGRT-T57: classification never yields a path that is executed or imported."""
+        for path in existing_runtime_ps1_files():
+            text = path.read_text(encoding="utf-8")
+            for number, line in non_comment_lines(text):
+                if "ClassA" not in line and "ClassB" not in line and "ClassC" not in line:
+                    continue
+                for forbidden in (". $", "& $", "Import-Module", "Invoke-Expression"):
+                    with self.subTest(runtime_file=path.name, line=number, token=forbidden):
+                        self.assertNotIn(forbidden, line)
+
+    def test_the_credential_import_lexically_follows_every_non_secret_check(self):
+        """EGRT-T48, static half: ordering is structural, not a matter of reading order."""
+        import_index = self.launcher.index("Import-EgLauncherCredential")
+        self.assertEqual(
+            1,
+            self.launcher.count("Import-EgLauncherCredential"),
+            "there must be exactly one credential import call site",
+        )
+        for predicate in (
+            "Get-EgLauncherRootClassification",
+            "Test-EgPowerShellFileParsesCleanly",
+            "Compare-EgInstalledPackageToManifest",
+            "Test-EgLauncherConfigContract",
+            "Test-EgPythonVersionSupported",
+            "Test-EgGovernedSourceIntegrity",
+            "Test-EgBrowserCacheReady",
+            "Test-EgLauncherRootSecurity",
+        ):
+            with self.subTest(predicate=predicate):
+                self.assertLess(
+                    self.launcher.index(predicate),
+                    import_index,
+                    "%s must be called before the credential import" % predicate,
+                )
+
+    def test_the_launcher_parameter_surface_is_exactly_the_design_contract(self):
+        """Design section 5.1: eleven parameters and no more."""
+        block = self.launcher[self.launcher.index("param("):self.launcher.index(")\n\nSet-StrictMode")]
+        declared = re.findall(r"\$(\w+)\s*(?:=|,|\n|\))", block)
+        names = []
+        for name in declared:
+            if name not in names:
+                names.append(name)
+        self.assertEqual(
+            [
+                "ConfigPath", "PythonExe", "CheckoutRoot", "CredentialPath",
+                "BrowserCachePath", "ExpectedBranch", "AuthorisedLauncherRootWriteSid",
+                "Command", "LogRoot", "ValidateOnly", "RunId",
+            ],
+            names,
+        )
+        for forbidden in ("-Headed", "PortalUrl", "ExpectedCommit", "Password"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, block)
+        # DD-01: the launcher root is this script's own directory, so there is no
+        # launcher-root parameter. Matched as a whole parameter name, because
+        # -AuthorisedLauncherRootWriteSid legitimately contains the same substring.
+        self.assertNotIn(
+            "LauncherRoot",
+            names,
+            "the launcher root is $PSScriptRoot and is never a parameter",
+        )
+
+    def test_the_authorised_identifier_set_is_mandatory_with_no_default(self):
+        """Design section 9.1: no default, no environment route, and no file route."""
+        self.assertIn(
+            "[Parameter(Mandatory)][ValidateNotNullOrEmpty()][string[]]"
+            "$AuthorisedLauncherRootWriteSid",
+            self.launcher,
+        )
+        self.assertIn(
+            "[Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$ExpectedBranch",
+            self.launcher,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

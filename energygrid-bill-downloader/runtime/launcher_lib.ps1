@@ -1397,6 +1397,318 @@ function Invoke-EgWithInjectedProcessEnvironment {
 }
 
 # --------------------------------------------------------------------------------------
+# Launcher preflight predicates (design sections 5.2, 11.3, 17.2)
+# --------------------------------------------------------------------------------------
+
+# The application's own exit codes. The runtime band 70 to 73 is disjoint from these, so a
+# launcher or installer failure can never be mistaken for an application status.
+$script:EgApplicationExitCodes = @(0, 10, 20, 64)
+
+# The configuration keys the launcher checks for presence and non-emptiness (DD-05). The
+# launcher does NOT re-validate the application's own path rules: the application already
+# enforces them, and duplicating them here would create two sources of truth.
+$script:EgRequiredConfigKeys = @(
+    'portal_url', 'account_identity', 'archive_root', 'state_path', 'temp_root', 'log_root'
+)
+
+$script:EgPythonVersionPattern = '^Python 3\.14\.'
+$script:EgTerminalEventFileName = 'launcher_failed.jsonl'
+
+function Invoke-EgReadOnlyProcessProbe {
+    # Run a read-only external probe and capture both streams. Used only for the
+    # interpreter version probe, which is the sole non-Git child a validation run starts.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$FilePath,
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Arguments
+    )
+
+    $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $startInfo.FileName = $FilePath
+    $startInfo.Arguments = ConvertTo-EgNativeArgumentString -Argument $Arguments
+    $startInfo.UseShellExecute = $false
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $startInfo.CreateNoWindow = $true
+
+    $exitCode = -1
+    $combined = ''
+    $process = $null
+    try {
+        $process = New-Object System.Diagnostics.Process
+        $process.StartInfo = $startInfo
+        [void]$process.Start()
+        $outputTask = $process.StandardOutput.ReadToEndAsync()
+        $errorTask = $process.StandardError.ReadToEndAsync()
+        $process.WaitForExit()
+        $combined = [string]$outputTask.Result + [string]$errorTask.Result
+        $exitCode = $process.ExitCode
+    }
+    catch {
+        return [pscustomobject]@{ Started = $false; ExitCode = -1; Output = '' }
+    }
+    finally {
+        if ($null -ne $process) { $process.Dispose() }
+    }
+
+    [pscustomobject]@{
+        Started  = $true
+        ExitCode = [int]$exitCode
+        Output   = [string]$combined
+    }
+}
+
+function Test-EgPythonVersionSupported {
+    # Read-only interpreter version probe. Returns a CheckResult named
+    # python_version_is_3_14. No interpreter output text reaches any surface.
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$PythonExe)
+
+    $checkName = 'python_version_is_3_14'
+    $probe = Invoke-EgReadOnlyProcessProbe -FilePath $PythonExe -Arguments @('--version')
+    if (-not $probe.Started) {
+        return (New-EgSingleCheckResult -CheckName $checkName -Pass $false `
+            -SupportRef 'EG_LAUNCHER_PYTHON_VERSION_UNSUPPORTED')
+    }
+    if ($probe.ExitCode -ne 0) {
+        return (New-EgSingleCheckResult -CheckName $checkName -Pass $false `
+            -SupportRef 'EG_LAUNCHER_PYTHON_VERSION_UNSUPPORTED')
+    }
+    foreach ($line in @(Split-EgProcessOutputLines -Text $probe.Output)) {
+        if ($line.Trim() -match $script:EgPythonVersionPattern) {
+            return (New-EgSingleCheckResult -CheckName $checkName -Pass $true)
+        }
+    }
+    return (New-EgSingleCheckResult -CheckName $checkName -Pass $false `
+        -SupportRef 'EG_LAUNCHER_PYTHON_VERSION_UNSUPPORTED')
+}
+
+function Test-EgLauncherConfigContract {
+    # The private configuration must resolve OUTSIDE the deployed checkout, parse as JSON,
+    # and carry every key the application requires. No configuration VALUE is ever emitted,
+    # logged, or placed in a result object.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$ConfigPath,
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$CheckoutRootPath
+    )
+
+    $checks = [ordered]@{}
+    $checks['config_path_outside_checkout'] = 'FAIL'
+    $checks['config_parses_json'] = 'FAIL'
+    $checks['config_required_keys_present'] = 'FAIL'
+
+    if (Test-EgPathIsWithin -CandidatePath $ConfigPath -ContainerPath $CheckoutRootPath) {
+        return (New-EgCheckResult -Pass $false -SupportRef 'EG_LAUNCHER_CONFIG_INSIDE_CHECKOUT' -Checks $checks)
+    }
+    $checks['config_path_outside_checkout'] = 'PASS'
+
+    $parsed = $null
+    try {
+        $raw = [System.IO.File]::ReadAllText($ConfigPath)
+        if ([string]::IsNullOrWhiteSpace($raw)) {
+            return (New-EgCheckResult -Pass $false -SupportRef 'EG_LAUNCHER_CONFIG_UNPARSABLE' -Checks $checks)
+        }
+        $parsed = $raw | ConvertFrom-Json
+    }
+    catch {
+        return (New-EgCheckResult -Pass $false -SupportRef 'EG_LAUNCHER_CONFIG_UNPARSABLE' -Checks $checks)
+    }
+    if ($null -eq $parsed) {
+        return (New-EgCheckResult -Pass $false -SupportRef 'EG_LAUNCHER_CONFIG_UNPARSABLE' -Checks $checks)
+    }
+    $checks['config_parses_json'] = 'PASS'
+
+    $propertyNames = @()
+    foreach ($property in @($parsed.PSObject.Properties)) {
+        $propertyNames = $propertyNames + $property.Name
+    }
+    foreach ($required in $script:EgRequiredConfigKeys) {
+        $present = $false
+        foreach ($name in $propertyNames) {
+            if ($name -ceq $required) { $present = $true }
+        }
+        if (-not $present) {
+            return (New-EgCheckResult -Pass $false -SupportRef 'EG_LAUNCHER_CONFIG_KEY_MISSING' -Checks $checks)
+        }
+        $value = $parsed.$required
+        if ($null -eq $value) {
+            return (New-EgCheckResult -Pass $false -SupportRef 'EG_LAUNCHER_CONFIG_KEY_MISSING' -Checks $checks)
+        }
+        if ([string]::IsNullOrWhiteSpace([string]$value)) {
+            return (New-EgCheckResult -Pass $false -SupportRef 'EG_LAUNCHER_CONFIG_KEY_MISSING' -Checks $checks)
+        }
+    }
+    $checks['config_required_keys_present'] = 'PASS'
+
+    return (New-EgCheckResult -Pass $true -SupportRef '' -Checks $checks)
+}
+
+function Test-EgLauncherRootSecurity {
+    # Ordered preflight positions 14 to 18. The examined object set is the launcher root
+    # plus every Class A member joined to it (DD-01), and BOTH write checks are evaluated
+    # against every member of that set: one failing object fails the check.
+    #
+    # launcher_root_entries_classified is deliberately NOT re-evaluated here. It is
+    # computed once, at preflight position 1 (DD-04).
+    #
+    # No principal name, identifier, owner identity, path, or count derived from them is
+    # ever emitted. Only the check name and the bounded support reference reach any surface.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$LauncherRootPath,
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$CheckoutRootPath,
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string[]]$AuthorisedLauncherRootWriteSid
+    )
+
+    $checks = [ordered]@{}
+    $checks['launcher_root_outside_checkout'] = 'FAIL'
+    $checks['launcher_root_not_writable_by_run_principal'] = 'FAIL'
+    $checks['launcher_root_write_trustees_authorised'] = 'FAIL'
+    $checks['launcher_files_not_reparse_points'] = 'FAIL'
+    $checks['launcher_files_not_unexpectedly_readonly'] = 'FAIL'
+
+    if (Test-EgPathIsWithin -CandidatePath $LauncherRootPath -ContainerPath $CheckoutRootPath) {
+        return (New-EgCheckResult -Pass $false -SupportRef 'EG_LAUNCHER_ROOT_INSIDE_CHECKOUT' -Checks $checks)
+    }
+    $checks['launcher_root_outside_checkout'] = 'PASS'
+
+    $examined = @($LauncherRootPath)
+    foreach ($memberName in (Get-EgDeployedPackageMemberNames)) {
+        $examined = $examined + (Join-Path $LauncherRootPath $memberName)
+    }
+
+    # Position 15. The privilege read happens ONCE. A failed read is terminal under this
+    # same check and reference: the run does not continue to the privilege predicate or to
+    # any remaining access check, and the empty name list is never read as absence of a
+    # bypass privilege.
+    $privileges = Get-EgTokenPrivilegeNames
+    if (-not $privileges.ReadOk) {
+        return (New-EgCheckResult -Pass $false `
+            -SupportRef 'EG_LAUNCHER_ROOT_ACL_RUN_PRINCIPAL_WRITABLE' -Checks $checks)
+    }
+    if (Test-EgBypassPrivilegePresent -PrivilegeName $privileges.PrivilegeNames) {
+        return (New-EgCheckResult -Pass $false `
+            -SupportRef 'EG_LAUNCHER_ROOT_ACL_RUN_PRINCIPAL_WRITABLE' -Checks $checks)
+    }
+    foreach ($objectPath in $examined) {
+        $tokenCheck = Test-EgTokenWriteAccessToPath -Path $objectPath
+        if (-not $tokenCheck.Evaluated) {
+            return (New-EgCheckResult -Pass $false `
+                -SupportRef 'EG_LAUNCHER_ROOT_ACL_RUN_PRINCIPAL_WRITABLE' -Checks $checks)
+        }
+        if ($tokenCheck.AnyWriteGranted) {
+            return (New-EgCheckResult -Pass $false `
+                -SupportRef 'EG_LAUNCHER_ROOT_ACL_RUN_PRINCIPAL_WRITABLE' -Checks $checks)
+        }
+    }
+    $checks['launcher_root_not_writable_by_run_principal'] = 'PASS'
+
+    # Position 16. The supplied set is admitted once, and a refused set is reported as a
+    # failure of this same check under its own bounded reference (DD-12).
+    $admission = Test-EgAuthorisedWriteSidSet -AuthorisedSid $AuthorisedLauncherRootWriteSid
+    if (-not $admission.Pass) {
+        return (New-EgCheckResult -Pass $false `
+            -SupportRef 'EG_LAUNCHER_ROOT_AUTHORISED_SID_SET_INVALID' -Checks $checks)
+    }
+    foreach ($objectPath in $examined) {
+        $trusteeCheck = Test-EgPathWriteTrusteesAuthorised -Path $objectPath `
+            -AuthorisedSid $admission.Sids
+        if (-not $trusteeCheck.Evaluated) {
+            return (New-EgCheckResult -Pass $false `
+                -SupportRef 'EG_LAUNCHER_ROOT_ACL_WRITE_TRUSTEE_UNAUTHORISED' -Checks $checks)
+        }
+        if (-not $trusteeCheck.Authorised) {
+            return (New-EgCheckResult -Pass $false `
+                -SupportRef 'EG_LAUNCHER_ROOT_ACL_WRITE_TRUSTEE_UNAUTHORISED' -Checks $checks)
+        }
+    }
+    $checks['launcher_root_write_trustees_authorised'] = 'PASS'
+
+    # Position 17. Neither installed file, nor the destination directory, is a symlink,
+    # junction, or other reparse point.
+    foreach ($objectPath in $examined) {
+        if (-not (Test-Path -LiteralPath $objectPath)) {
+            return (New-EgCheckResult -Pass $false -SupportRef 'EG_LAUNCHER_ROOT_REPARSE_POINT' -Checks $checks)
+        }
+        $item = $null
+        try {
+            $item = Get-Item -LiteralPath $objectPath -Force
+        }
+        catch {
+            return (New-EgCheckResult -Pass $false -SupportRef 'EG_LAUNCHER_ROOT_REPARSE_POINT' -Checks $checks)
+        }
+        if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            return (New-EgCheckResult -Pass $false -SupportRef 'EG_LAUNCHER_ROOT_REPARSE_POINT' -Checks $checks)
+        }
+    }
+    $checks['launcher_files_not_reparse_points'] = 'PASS'
+
+    # Position 18. No installed file carries an unexplained read-only attribute.
+    foreach ($memberName in (Get-EgDeployedPackageMemberNames)) {
+        $memberPath = Join-Path $LauncherRootPath $memberName
+        $item = $null
+        try {
+            $item = Get-Item -LiteralPath $memberPath -Force
+        }
+        catch {
+            return (New-EgCheckResult -Pass $false `
+                -SupportRef 'EG_LAUNCHER_FILE_UNEXPECTEDLY_READONLY' -Checks $checks)
+        }
+        if (($item.Attributes -band [System.IO.FileAttributes]::ReadOnly) -ne 0) {
+            return (New-EgCheckResult -Pass $false `
+                -SupportRef 'EG_LAUNCHER_FILE_UNEXPECTEDLY_READONLY' -Checks $checks)
+        }
+    }
+    $checks['launcher_files_not_unexpectedly_readonly'] = 'PASS'
+
+    return (New-EgCheckResult -Pass $true -SupportRef '' -Checks $checks)
+}
+
+function Write-EgLauncherTerminalEvent {
+    # Append EXACTLY ONE launcher_failed event carrying run_id, phase, status, and
+    # support_ref, and nothing else.
+    #
+    # The event is EVIDENCE, not a result: a failure to write it never changes the exit
+    # code, and a failure raised before the log root is resolved simply has no event. This
+    # mirrors log_terminal_failure in energygrid_bill_downloader/cli.py.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$LogRoot,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$RunId,
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Phase,
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Status,
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$SupportRef
+    )
+
+    if ([string]::IsNullOrWhiteSpace($LogRoot)) {
+        return
+    }
+    if (-not (Test-Path -LiteralPath $LogRoot -PathType Container)) {
+        return
+    }
+
+    $event = [ordered]@{}
+    $event['run_id'] = $RunId
+    $event['phase'] = $Phase
+    $event['status'] = $Status
+    $event['support_ref'] = $SupportRef
+
+    try {
+        $line = ($event | ConvertTo-Json -Depth 8 -Compress)
+        $encoding = New-Object System.Text.UTF8Encoding($false)
+        [System.IO.File]::AppendAllText(
+            (Join-Path $LogRoot $script:EgTerminalEventFileName),
+            ($line + "`r`n"),
+            $encoding)
+    }
+    catch {
+        # Evidence, not a result. A failed write never changes the exit code.
+        return
+    }
+}
+
+# --------------------------------------------------------------------------------------
 # Launcher-root write authority (design section 17.2.1, DD-02, DD-03, DD-12, DD-13)
 # --------------------------------------------------------------------------------------
 # TWO different questions are asked about the launcher root, and Windows answers them by
