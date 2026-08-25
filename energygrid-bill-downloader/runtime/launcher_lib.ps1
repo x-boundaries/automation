@@ -1397,6 +1397,701 @@ function Invoke-EgWithInjectedProcessEnvironment {
 }
 
 # --------------------------------------------------------------------------------------
+# Launcher-root write authority (design section 17.2.1, DD-02, DD-03, DD-12, DD-13)
+# --------------------------------------------------------------------------------------
+# TWO different questions are asked about the launcher root, and Windows answers them by
+# two different mechanisms. Conflating them is the defect this section exists to prevent.
+#
+#   launcher_root_not_writable_by_run_principal  asks Windows to evaluate the RUNNING TOKEN
+#   launcher_root_write_trustees_authorised      inspects the DISCRETIONARY ACCESS LIST
+#
+# Neither implies the other and both are terminal. Where installer and run principal are
+# the same Windows account, binding write authority to that account's user SID separates
+# nothing, because normal split-token behaviour carries the same user SID enabled in both
+# contexts; binding to an administrative group identity separates them only while the host
+# keeps producing a filtered token, which the access list cannot show. The trustee binding
+# is kept because it stops an unexpected writer, and the run-token check is what makes the
+# residual case observable rather than asserted.
+#
+# Neither check ever emits a security identifier, a trustee name, an owner identity, a
+# path, or any count derived from them. Only the check name, the pass or fail outcome, and
+# the bounded support reference reach any surface.
+
+# Rights treated as write-capable, declared ONCE and the sole source for both checks and
+# for every test that asserts against the mask. In declared order: FILE_WRITE_DATA /
+# FILE_ADD_FILE, FILE_APPEND_DATA / FILE_ADD_SUBDIRECTORY, FILE_WRITE_EA,
+# FILE_DELETE_CHILD, FILE_WRITE_ATTRIBUTES, DELETE, WRITE_DAC, WRITE_OWNER.
+#
+# FILE_ADD_FILE and FILE_ADD_SUBDIRECTORY are the directory readings of the same bits as
+# FILE_WRITE_DATA and FILE_APPEND_DATA, so the mask is bit-identical for both object kinds
+# and the object type changes only how a granted bit is described. WRITE_DAC and
+# WRITE_OWNER are included deliberately: Windows defines them as the right to modify the
+# access list and the right to change the owner, so a trustee holding either can grant
+# itself every other right at will, and treating them as read-level rights would make both
+# checks decorative.
+$script:EgWriteCapableAccessMask =
+    0x00000002 -bor `
+    0x00000004 -bor `
+    0x00000010 -bor `
+    0x00000040 -bor `
+    0x00000100 -bor `
+    0x00010000 -bor `
+    0x00040000 -bor `
+    0x00080000
+
+# A token holding either privilege can reach the object whatever the access list says, so
+# presence alone fails the run-principal check, whether enabled or disabled. This is a
+# bounded rule and not an exhaustive one: no discretionary-access-list check can fully
+# constrain a principal granted list-bypassing privileges, and claiming otherwise would be
+# dishonest. LocalSystem holds them by construction and therefore fails by construction.
+$script:EgBypassPrivilegeNames = @('SeTakeOwnershipPrivilege', 'SeRestorePrivilege')
+
+# CREATOR OWNER. Windows replaces this placeholder on inheritance with the security
+# identifier of whoever created the new object, so an inheritable write-capable entry for it
+# describes an unbounded future write set rather than a principal. It is terminal as an
+# entry and refused in the supplied authorised set.
+$script:EgRefusedAuthorisedSid = 'S-1-3-0'
+
+# Documented file-system GENERIC_MAPPING values (design section 17.2.1 step 4).
+$script:EgFileGenericRead = 0x00120089
+$script:EgFileGenericWrite = 0x00120116
+$script:EgFileGenericExecute = 0x001200A0
+$script:EgFileAllAccess = 0x001F01FF
+
+# The Win32 calls DD-02 requires have no managed equivalent, so the interop is declared
+# here as a constant and compiled lazily on first use (DD-13). Declaring a here-string is
+# not a side effect, and compiling on first use writes only into the host's own temporary
+# compilation location, never into the launcher root, the deployed checkout, the
+# configuration directory, the browser cache, or the log root, which is the exact domain
+# the zero-mutation contract snapshots.
+#
+# The DllImport surface is COMPLETE AND CLOSED by contract: every native function any
+# security helper in this library calls appears below, and nothing appears below that no
+# helper calls. LookupPrivilegeNameW is required because GetTokenInformation with
+# TOKEN_PRIVILEGES returns locally unique identifiers rather than names, and neither the
+# translation nor the enumeration has a managed equivalent.
+#
+# No security-descriptor import is declared. The descriptor is read through managed .NET as
+# GetSecurityDescriptorBinaryForm() over Owner, Group, and Access sections, which is what
+# design section 17.2.1 step 3 requires and is why AccessCheck does not fail with
+# ERROR_INVALID_SECURITY_DESCR.
+$script:EgWin32SecurityInteropSource = @'
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+
+namespace EgWin32 {
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct LUID {
+        public uint LowPart;
+        public int HighPart;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct LUID_AND_ATTRIBUTES {
+        public LUID Luid;
+        public uint Attributes;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct GENERIC_MAPPING {
+        public uint GenericRead;
+        public uint GenericWrite;
+        public uint GenericExecute;
+        public uint GenericAll;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct PRIVILEGE_SET {
+        public uint PrivilegeCount;
+        public uint Control;
+        public LUID_AND_ATTRIBUTES Privilege;
+    }
+
+    public class TokenPrivilegeReadResult {
+        public bool ReadOk;
+        public string[] PrivilegeNames;
+    }
+
+    public class AccessCheckOutcome {
+        public bool Evaluated;
+        public uint GrantedAccess;
+        public bool AccessStatus;
+        public int LastError;
+    }
+
+    public static class Security {
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr GetCurrentProcess();
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        private static extern bool OpenProcessToken(IntPtr ProcessHandle, uint DesiredAccess, out IntPtr TokenHandle);
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        private static extern bool DuplicateTokenEx(IntPtr hExistingToken, uint dwDesiredAccess, IntPtr lpTokenAttributes, int ImpersonationLevel, int TokenType, out IntPtr phNewToken);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool CloseHandle(IntPtr hObject);
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        private static extern bool GetTokenInformation(IntPtr TokenHandle, int TokenInformationClass, IntPtr TokenInformation, int TokenInformationLength, out int ReturnLength);
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        private static extern bool AccessCheck(byte[] pSecurityDescriptor, IntPtr ClientToken, uint DesiredAccess, ref GENERIC_MAPPING GenericMapping, IntPtr PrivilegeSet, ref int PrivilegeSetLength, out uint GrantedAccess, out bool AccessStatus);
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        private static extern void MapGenericMask(ref uint AccessMask, ref GENERIC_MAPPING GenericMapping);
+
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true, EntryPoint = "LookupPrivilegeNameW")]
+        private static extern bool LookupPrivilegeNameW([MarshalAs(UnmanagedType.LPWStr)] string lpSystemName, ref LUID lpLuid, StringBuilder lpName, ref int cchName);
+
+        private const uint TOKEN_DUPLICATE = 0x0002;
+        private const uint TOKEN_QUERY = 0x0008;
+        private const uint MAXIMUM_ALLOWED = 0x02000000;
+        private const int SECURITY_IDENTIFICATION = 2;
+        private const int TOKEN_IMPERSONATION = 2;
+        private const int TOKEN_PRIVILEGES_CLASS = 3;
+        private const int ERROR_INSUFFICIENT_BUFFER = 122;
+        private const int PRIVILEGE_SET_SLACK_ENTRIES = 32;
+
+        private static GENERIC_MAPPING BuildMapping(uint genericRead, uint genericWrite, uint genericExecute, uint genericAll) {
+            GENERIC_MAPPING mapping = new GENERIC_MAPPING();
+            mapping.GenericRead = genericRead;
+            mapping.GenericWrite = genericWrite;
+            mapping.GenericExecute = genericExecute;
+            mapping.GenericAll = genericAll;
+            return mapping;
+        }
+
+        // Apply MapGenericMask so the compared mask carries no generic rights.
+        public static uint MapMask(uint mask, uint genericRead, uint genericWrite, uint genericExecute, uint genericAll) {
+            GENERIC_MAPPING mapping = BuildMapping(genericRead, genericWrite, genericExecute, genericAll);
+            uint working = mask;
+            MapGenericMask(ref working, ref mapping);
+            return working;
+        }
+
+        // The prescribed run-token access check. DesiredAccess is MAXIMUM_ALLOWED, so
+        // Windows returns the maximum access the descriptor allows that token, and the
+        // caller intersects the returned mask. Requesting the union of every write-capable
+        // right and reading a denied access status as safe is a false negative by
+        // construction and is never done.
+        //
+        // PrivilegeSet and PrivilegeSetLength are call mechanics, not part of any verdict.
+        // A correctly sized buffer is supplied; an insufficient or invalid buffer is an API
+        // failure, so it sets Evaluated false and is terminal in the caller.
+        public static AccessCheckOutcome CheckMaximumAllowed(byte[] securityDescriptor, uint genericRead, uint genericWrite, uint genericExecute, uint genericAll) {
+            AccessCheckOutcome outcome = new AccessCheckOutcome();
+            outcome.Evaluated = false;
+            outcome.GrantedAccess = 0;
+            outcome.AccessStatus = false;
+            outcome.LastError = 0;
+
+            IntPtr processToken = IntPtr.Zero;
+            IntPtr impersonationToken = IntPtr.Zero;
+            IntPtr privilegeSet = IntPtr.Zero;
+            try {
+                if (OpenProcessToken(GetCurrentProcess(), TOKEN_DUPLICATE | TOKEN_QUERY, out processToken) == false) {
+                    outcome.LastError = Marshal.GetLastWin32Error();
+                    return outcome;
+                }
+                // AccessCheck is documented to take an IMPERSONATION token, so the primary
+                // token is never passed to it. SecurityIdentification is the least
+                // privileged level Windows documents as sufficient for a server to make
+                // access-validation decisions. The duplicate exists only to be evaluated.
+                if (DuplicateTokenEx(processToken, TOKEN_QUERY, IntPtr.Zero, SECURITY_IDENTIFICATION, TOKEN_IMPERSONATION, out impersonationToken) == false) {
+                    outcome.LastError = Marshal.GetLastWin32Error();
+                    return outcome;
+                }
+
+                GENERIC_MAPPING mapping = BuildMapping(genericRead, genericWrite, genericExecute, genericAll);
+                int privilegeSetLength = Marshal.SizeOf(typeof(PRIVILEGE_SET)) + (PRIVILEGE_SET_SLACK_ENTRIES * Marshal.SizeOf(typeof(LUID_AND_ATTRIBUTES)));
+                privilegeSet = Marshal.AllocHGlobal(privilegeSetLength);
+
+                uint granted = 0;
+                bool status = false;
+                if (AccessCheck(securityDescriptor, impersonationToken, MAXIMUM_ALLOWED, ref mapping, privilegeSet, ref privilegeSetLength, out granted, out status) == false) {
+                    outcome.LastError = Marshal.GetLastWin32Error();
+                    return outcome;
+                }
+                outcome.Evaluated = true;
+                outcome.GrantedAccess = granted;
+                outcome.AccessStatus = status;
+                return outcome;
+            }
+            finally {
+                if (privilegeSet != IntPtr.Zero) { Marshal.FreeHGlobal(privilegeSet); }
+                if (impersonationToken != IntPtr.Zero) { CloseHandle(impersonationToken); }
+                if (processToken != IntPtr.Zero) { CloseHandle(processToken); }
+            }
+        }
+
+        // Read the privilege names PRESENT in the running process token.
+        //
+        // ReadOk true means the information was read and PrivilegeNames carries exactly
+        // the names OBSERVED. ReadOk false means the read FAILED and PrivilegeNames is
+        // empty. One unresolved locally unique identifier fails the WHOLE read: no entry is
+        // ever silently skipped, no partial list is ever returned, and a lookup error is
+        // never read as that privilege being absent. No privilege name is ever fabricated.
+        public static TokenPrivilegeReadResult ReadTokenPrivilegeNames() {
+            TokenPrivilegeReadResult result = new TokenPrivilegeReadResult();
+            result.ReadOk = false;
+            result.PrivilegeNames = new string[0];
+
+            IntPtr processToken = IntPtr.Zero;
+            IntPtr buffer = IntPtr.Zero;
+            try {
+                if (OpenProcessToken(GetCurrentProcess(), TOKEN_DUPLICATE | TOKEN_QUERY, out processToken) == false) {
+                    return result;
+                }
+                int required = 0;
+                if (GetTokenInformation(processToken, TOKEN_PRIVILEGES_CLASS, IntPtr.Zero, 0, out required) == false) {
+                    if (Marshal.GetLastWin32Error() != ERROR_INSUFFICIENT_BUFFER) {
+                        return result;
+                    }
+                }
+                if (required <= 0) {
+                    return result;
+                }
+                buffer = Marshal.AllocHGlobal(required);
+                int returned = 0;
+                if (GetTokenInformation(processToken, TOKEN_PRIVILEGES_CLASS, buffer, required, out returned) == false) {
+                    return result;
+                }
+
+                int count = Marshal.ReadInt32(buffer);
+                if (count < 0) {
+                    return result;
+                }
+                string[] names = new string[count];
+                int entrySize = Marshal.SizeOf(typeof(LUID_AND_ATTRIBUTES));
+                for (int index = 0; index < count; index++) {
+                    IntPtr entryPointer = new IntPtr(buffer.ToInt64() + 4 + (index * entrySize));
+                    LUID_AND_ATTRIBUTES entry = (LUID_AND_ATTRIBUTES)Marshal.PtrToStructure(entryPointer, typeof(LUID_AND_ATTRIBUTES));
+                    LUID luid = entry.Luid;
+
+                    // Two-call sizing. The first call reports the required length; the
+                    // retry is given a buffer of that length plus one, and cchName is set
+                    // to the real capacity so Windows is told the true buffer size.
+                    int cchName = 0;
+                    if (LookupPrivilegeNameW(null, ref luid, null, ref cchName) == false) {
+                        if (Marshal.GetLastWin32Error() != ERROR_INSUFFICIENT_BUFFER) {
+                            return result;
+                        }
+                    }
+                    if (cchName <= 0) {
+                        return result;
+                    }
+                    int capacity = cchName + 1;
+                    StringBuilder builder = new StringBuilder(capacity);
+                    int cchRetry = capacity;
+                    if (LookupPrivilegeNameW(null, ref luid, builder, ref cchRetry) == false) {
+                        return result;
+                    }
+                    names[index] = builder.ToString();
+                }
+                result.ReadOk = true;
+                result.PrivilegeNames = names;
+                return result;
+            }
+            finally {
+                if (buffer != IntPtr.Zero) { Marshal.FreeHGlobal(buffer); }
+                if (processToken != IntPtr.Zero) { CloseHandle(processToken); }
+            }
+        }
+    }
+}
+'@
+
+function Initialize-EgWin32SecurityInterop {
+    # Compile the security interop on FIRST USE ONLY, guarded by a type-presence test so
+    # repeat calls compile nothing. Never invoked at load, so the library stays pure and
+    # dot-sourceable (EGRT-I01, DD-13).
+    [CmdletBinding()]
+    param()
+
+    if (-not ([System.Management.Automation.PSTypeName]'EgWin32.Security').Type) {
+        Add-Type -TypeDefinition $script:EgWin32SecurityInteropSource
+    }
+}
+
+function Get-EgMappedWriteCapableMask {
+    # The write-capable mask AFTER generic mapping, so the compared mask carries no generic
+    # rights (design section 17.2.1 steps 4 and 7, EGRT-T71).
+    [CmdletBinding()]
+    param()
+
+    Initialize-EgWin32SecurityInterop
+    return [int][EgWin32.Security]::MapMask(
+        [uint32]$script:EgWriteCapableAccessMask,
+        [uint32]$script:EgFileGenericRead,
+        [uint32]$script:EgFileGenericWrite,
+        [uint32]$script:EgFileGenericExecute,
+        [uint32]$script:EgFileAllAccess)
+}
+
+function Test-EgAuthorisedWriteSidSet {
+    # Admit the value supplied on the authorised-write-trustee parameter (DD-12). Pure.
+    #
+    # Refuses an empty set; refuses any element that does not construct a
+    # SecurityIdentifier from its standard textual form, which is what refuses an account
+    # name WITHOUT performing a name-resolution lookup; and refuses the CREATOR OWNER
+    # placeholder. No supplied value is echoed into the result, a log, or an exception
+    # surface.
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][ValidateNotNullOrEmpty()][string[]]$AuthorisedSid)
+
+    $refused = [pscustomobject]@{
+        Pass       = $false
+        SupportRef = 'EG_LAUNCHER_ROOT_AUTHORISED_SID_SET_INVALID'
+        Sids       = @()
+    }
+
+    $supplied = @($AuthorisedSid)
+    if ($supplied.Count -eq 0) {
+        return $refused
+    }
+
+    $admitted = @()
+    foreach ($candidate in $supplied) {
+        if ([string]::IsNullOrWhiteSpace($candidate)) {
+            return $refused
+        }
+        if ($candidate -ceq $script:EgRefusedAuthorisedSid) {
+            return $refused
+        }
+        $parsed = $null
+        try {
+            $parsed = New-Object System.Security.Principal.SecurityIdentifier($candidate)
+        }
+        catch {
+            return $refused
+        }
+        if ($null -eq $parsed) {
+            return $refused
+        }
+        # The textual form must round-trip, so a value that merely happens to construct is
+        # not admitted as a security identifier.
+        if ($parsed.Value -cne $candidate.Trim()) {
+            return $refused
+        }
+        $admitted = $admitted + $parsed
+    }
+
+    [pscustomobject]@{
+        Pass       = $true
+        SupportRef = ''
+        Sids       = @($admitted)
+    }
+}
+
+function Test-EgBypassPrivilegePresent {
+    # Pure predicate over ACTUALLY OBSERVED privilege names. Presence alone is sufficient;
+    # enabled state is irrelevant.
+    #
+    # The supplied list is only ever the observed names of a successful token read. This
+    # predicate has no knowledge of read failure, never receives a fabricated name, and
+    # never manufactures failure state: an empty list is simply false, and the terminal
+    # handling of a failed read belongs to the caller.
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][AllowEmptyCollection()][string[]]$PrivilegeName)
+
+    foreach ($observed in @($PrivilegeName)) {
+        foreach ($bypass in $script:EgBypassPrivilegeNames) {
+            if ([string]::Equals($observed, $bypass, [System.StringComparison]::OrdinalIgnoreCase)) {
+                return $true
+            }
+        }
+    }
+    return $false
+}
+
+function Get-EgTokenPrivilegeNames {
+    # Read the privilege names present in the running process token.
+    #
+    # ReadOk true means the information was read and PrivilegeNames carries exactly the
+    # names OBSERVED. ReadOk false means the read FAILED and PrivilegeNames is empty. The
+    # two are DISTINCT states and are never collapsed: the caller must treat a failed read
+    # as terminal and must never read the empty array as evidence that no bypass privilege
+    # is present.
+    #
+    # This function deliberately does not consume the bypass-privilege name constant, so a
+    # read failure can never be expressed as a synthesised privilege membership.
+    [CmdletBinding()]
+    param()
+
+    $failed = [pscustomobject]@{
+        ReadOk         = $false
+        PrivilegeNames = [string[]]@()
+    }
+
+    try {
+        Initialize-EgWin32SecurityInterop
+    }
+    catch {
+        return $failed
+    }
+
+    $read = $null
+    try {
+        $read = [EgWin32.Security]::ReadTokenPrivilegeNames()
+    }
+    catch {
+        return $failed
+    }
+    if ($null -eq $read) {
+        return $failed
+    }
+    if (-not $read.ReadOk) {
+        return $failed
+    }
+
+    [pscustomobject]@{
+        ReadOk         = $true
+        PrivilegeNames = [string[]]@($read.PrivilegeNames)
+    }
+}
+
+function Get-EgSecurityDescriptorForPath {
+    # Read a file-system object's security descriptor including its OWNER, its GROUP, and
+    # its discretionary access list. All three are required, because AccessCheck fails with
+    # ERROR_INVALID_SECURITY_DESCR when the descriptor carries no owner and group.
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Path)
+
+    $sections = [System.Security.AccessControl.AccessControlSections]::Owner -bor
+        [System.Security.AccessControl.AccessControlSections]::Group -bor
+        [System.Security.AccessControl.AccessControlSections]::Access
+
+    $descriptor = $null
+    try {
+        if (Test-Path -LiteralPath $Path -PathType Container) {
+            $descriptor = New-Object System.Security.AccessControl.DirectorySecurity($Path, $sections)
+        }
+        else {
+            $descriptor = New-Object System.Security.AccessControl.FileSecurity($Path, $sections)
+        }
+    }
+    catch {
+        return $null
+    }
+    return $descriptor
+}
+
+function Test-EgTokenWriteAccessToPath {
+    # DD-02 steps 1 to 8 against exactly ONE object.
+    #
+    # Evaluated false is TERMINAL. The caller must never read it as a pass, must not retry
+    # at another impersonation level, and must not fall back to another method.
+    #
+    # A null discretionary access list needs no special case: Windows grants all access when
+    # an object has none, so GrantedAccess returns carrying every right and the intersection
+    # is non-zero, which fails the check.
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Path)
+
+    $terminal = [pscustomobject]@{
+        AnyWriteGranted = $false
+        Evaluated       = $false
+        SupportRef      = 'EG_LAUNCHER_ROOT_ACL_RUN_PRINCIPAL_WRITABLE'
+    }
+
+    $descriptor = Get-EgSecurityDescriptorForPath -Path $Path
+    if ($null -eq $descriptor) {
+        return $terminal
+    }
+
+    $binaryForm = $null
+    try {
+        $binaryForm = $descriptor.GetSecurityDescriptorBinaryForm()
+    }
+    catch {
+        return $terminal
+    }
+    if ($null -eq $binaryForm) {
+        return $terminal
+    }
+
+    $mappedMask = 0
+    $outcome = $null
+    try {
+        Initialize-EgWin32SecurityInterop
+        $mappedMask = Get-EgMappedWriteCapableMask
+        $outcome = [EgWin32.Security]::CheckMaximumAllowed(
+            $binaryForm,
+            [uint32]$script:EgFileGenericRead,
+            [uint32]$script:EgFileGenericWrite,
+            [uint32]$script:EgFileGenericExecute,
+            [uint32]$script:EgFileAllAccess)
+    }
+    catch {
+        return $terminal
+    }
+    if ($null -eq $outcome) {
+        return $terminal
+    }
+    if (-not $outcome.Evaluated) {
+        return $terminal
+    }
+
+    # ANY-BIT intersection of the returned maximum access with the mapped write-capable
+    # mask. AccessStatus is deliberately not consulted for the verdict: under
+    # MAXIMUM_ALLOWED the granted mask IS the answer.
+    $anyWriteGranted = ((([int]$outcome.GrantedAccess) -band $mappedMask) -ne 0)
+
+    $supportRef = ''
+    if ($anyWriteGranted) {
+        $supportRef = 'EG_LAUNCHER_ROOT_ACL_RUN_PRINCIPAL_WRITABLE'
+    }
+
+    [pscustomobject]@{
+        AnyWriteGranted = $anyWriteGranted
+        Evaluated       = $true
+        SupportRef      = $supportRef
+    }
+}
+
+function Test-EgPathWriteTrusteesAuthorised {
+    # DD-03 steps 1 to 8 against exactly ONE object.
+    #
+    # Comparison is EXACT SecurityIdentifier equality only. No prefix, pattern, range, or
+    # wildcard match against a trustee identifier appears anywhere. Access-denied entries
+    # are ignored, because a deny entry can only reduce access and whether it neutralises a
+    # given allow depends on list order, so cancelling one against the other here would let
+    # a badly ordered list conceal a real grant. An inherited allow entry is treated exactly
+    # as an explicit one, because inheritance describes where an entry came from, not how
+    # much access it grants.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Path,
+        [Parameter(Mandatory)][ValidateNotNull()][System.Security.Principal.SecurityIdentifier[]]$AuthorisedSid
+    )
+
+    $terminal = [pscustomobject]@{
+        Authorised = $false
+        Evaluated  = $false
+        SupportRef = 'EG_LAUNCHER_ROOT_ACL_WRITE_TRUSTEE_UNAUTHORISED'
+    }
+
+    $descriptor = Get-EgSecurityDescriptorForPath -Path $Path
+    if ($null -eq $descriptor) {
+        return $terminal
+    }
+
+    $binaryForm = $null
+    $raw = $null
+    try {
+        $binaryForm = $descriptor.GetSecurityDescriptorBinaryForm()
+        $raw = New-Object System.Security.AccessControl.RawSecurityDescriptor($binaryForm, 0)
+    }
+    catch {
+        return $terminal
+    }
+    if ($null -eq $raw) {
+        return $terminal
+    }
+
+    # An object with NO discretionary access list fails, because Windows grants all access
+    # in that case.
+    $listPresent = (($raw.ControlFlags -band
+        [System.Security.AccessControl.ControlFlags]::DiscretionaryAclPresent) -ne 0)
+    if (-not $listPresent) {
+        return [pscustomobject]@{
+            Authorised = $false
+            Evaluated  = $true
+            SupportRef = 'EG_LAUNCHER_ROOT_ACL_WRITE_TRUSTEE_UNAUTHORISED'
+        }
+    }
+    if ($null -eq $raw.DiscretionaryAcl) {
+        return [pscustomobject]@{
+            Authorised = $false
+            Evaluated  = $true
+            SupportRef = 'EG_LAUNCHER_ROOT_ACL_WRITE_TRUSTEE_UNAUTHORISED'
+        }
+    }
+
+    $mappedMask = 0
+    try {
+        $mappedMask = Get-EgMappedWriteCapableMask
+    }
+    catch {
+        return $terminal
+    }
+
+    $unauthorised = [pscustomobject]@{
+        Authorised = $false
+        Evaluated  = $true
+        SupportRef = 'EG_LAUNCHER_ROOT_ACL_WRITE_TRUSTEE_UNAUTHORISED'
+    }
+
+    # Every examined object's OWNER must also be in the supplied set, because an owner
+    # implicitly holds WRITE_DAC and can restore write access to itself at will. An owner
+    # outside the set fails even where no explicit write-capable entry exists.
+    $owner = $null
+    try {
+        $owner = $raw.Owner
+    }
+    catch {
+        return $terminal
+    }
+    if ($null -eq $owner) {
+        return $terminal
+    }
+    if (-not (Test-EgSidInSet -Candidate $owner -AuthorisedSid $AuthorisedSid)) {
+        return $unauthorised
+    }
+
+    foreach ($ace in @($raw.DiscretionaryAcl)) {
+        if ($ace -isnot [System.Security.AccessControl.CommonAce]) {
+            continue
+        }
+        if ($ace.AceType -ne [System.Security.AccessControl.AceType]::AccessAllowed) {
+            if ($ace.AceType -ne [System.Security.AccessControl.AceType]::AccessAllowedObject) {
+                continue
+            }
+        }
+        if ((([int]$ace.AccessMask) -band $mappedMask) -eq 0) {
+            continue
+        }
+        # A write-capable CREATOR OWNER entry describes an unbounded future write set
+        # rather than a principal, so it is terminal.
+        if ($ace.SecurityIdentifier.Value -ceq $script:EgRefusedAuthorisedSid) {
+            return $unauthorised
+        }
+        if (-not (Test-EgSidInSet -Candidate $ace.SecurityIdentifier -AuthorisedSid $AuthorisedSid)) {
+            return $unauthorised
+        }
+    }
+
+    [pscustomobject]@{
+        Authorised = $true
+        Evaluated  = $true
+        SupportRef = ''
+    }
+}
+
+function Test-EgSidInSet {
+    # Exact SecurityIdentifier equality against the supplied exhaustive set. No prefix,
+    # pattern, range, or wildcard form is accepted, and well-known identifiers carry no
+    # implicit authority: they are accepted only where the operator supplied that exact
+    # value.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][ValidateNotNull()][System.Security.Principal.SecurityIdentifier]$Candidate,
+        [Parameter(Mandatory)][ValidateNotNull()][System.Security.Principal.SecurityIdentifier[]]$AuthorisedSid
+    )
+
+    foreach ($authorised in @($AuthorisedSid)) {
+        if ($Candidate.Equals($authorised)) {
+            return $true
+        }
+    }
+    return $false
+}
+
+# --------------------------------------------------------------------------------------
 # Path-scoped governed source integrity (design section 10.3)
 # --------------------------------------------------------------------------------------
 # The unit of protection is the EnergyGrid runtime-critical surface, NOT the repository.

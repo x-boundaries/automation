@@ -1408,6 +1408,35 @@ foreach ($function in $functions) {
 """
 
 
+FUNCTION_BODY_TEXT_INSPECTOR = r"""
+[CmdletBinding()]
+param([Parameter(Mandatory)][string]$Target)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+$errors = $null
+$tokens = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($Target, [ref]$tokens, [ref]$errors)
+$parseErrors = 0
+if ($null -ne $errors) { $parseErrors = @($errors).Count }
+
+$bodies = @()
+foreach ($function in @($ast.FindAll(
+    { param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true))) {
+    $bodies = $bodies + ([ordered]@{
+        name = $function.Name
+        body = $function.Body.Extent.Text
+    })
+}
+
+[ordered]@{
+    parseErrors = $parseErrors
+    functions   = @($bodies)
+} | ConvertTo-Json -Depth 8 -Compress
+"""
+
+
 def run_inspector(exe, tmp, source, **kwargs):
     """Write an inspector script into a scratch directory, run it, and parse its JSON."""
     script = Path(tmp) / "eg_inspector.ps1"
@@ -4138,6 +4167,688 @@ class BrowserCacheStaticGuard(TierCBase):
                         )
 
 
+# --------------------------------------------------------------------------------------
+# Launcher-root write authority fixtures (design section 17.2.1)
+# --------------------------------------------------------------------------------------
+# Every security identifier literal this module is permitted to contain. All are
+# CONSTRUCTED or WELL-KNOWN values; none is read from the host, and no host identity is
+# ever committed. The current user's identifier and the disable-candidate group are
+# discovered at runtime inside the fixture and never travel through this module.
+SYNTHETIC_SIDS = (
+    "S-1-1-0",              # World, used as an unauthorised write-capable trustee
+    "S-1-5-80-0",           # an unrelated service-class identifier, for the no-wildcard case
+    "S-1-3-0",              # CREATOR OWNER, the refused placeholder
+    "S-1-3-4",              # OWNER RIGHTS, which bounds an owner's implicit rights
+)
+
+# Well-known logon-session and authentication identities that are safe to mark deny-only in
+# a restricted token: no system file grants access through them, so the child process still
+# starts. The fixture picks the first one actually present in the running token.
+DISABLE_CANDIDATE_SIDS = (
+    "S-1-5-4",      # INTERACTIVE
+    "S-1-2-1",      # CONSOLE LOGON
+    "S-1-5-3",      # BATCH
+    "S-1-5-2",      # NETWORK
+    "S-1-5-64-36",  # Cloud Account Authentication
+    "S-1-5-64-10",  # NTLM Authentication
+    "S-1-5-113",    # Local account
+    "S-1-5-15",     # This Organization
+    "S-1-2-0",      # LOCAL
+)
+
+# The eight write-capable rights, as the .NET FileSystemRights names the fixture applies.
+# The library declares the mask; these are the names that produce each bit.
+WRITE_CAPABLE_RIGHT_NAMES = (
+    "WriteData",                     # FILE_WRITE_DATA / FILE_ADD_FILE
+    "AppendData",                    # FILE_APPEND_DATA / FILE_ADD_SUBDIRECTORY
+    "WriteExtendedAttributes",       # FILE_WRITE_EA
+    "DeleteSubdirectoriesAndFiles",  # FILE_DELETE_CHILD
+    "WriteAttributes",               # FILE_WRITE_ATTRIBUTES
+    "Delete",                        # DELETE
+    "ChangePermissions",             # WRITE_DAC
+    "TakeOwnership",                 # WRITE_OWNER
+)
+
+EXPECTED_WRITE_CAPABLE_MASK = 0x000D0156
+
+ACL_PROBE_SCRIPT = r"""
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory)][string]$Lib,
+    [Parameter(Mandatory)][string]$Op,
+    [Parameter(Mandatory)][string]$Root,
+    [string]$Shape = '',
+    [string]$Right = '',
+    [string]$Json = '',
+    [string]$OutFile = ''
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+. $Lib
+
+$Rights = [System.Security.AccessControl.FileSystemRights]
+$selfSid = ([System.Security.Principal.WindowsIdentity]::GetCurrent()).User
+$worldSid = New-Object System.Security.Principal.SecurityIdentifier('S-1-1-0')
+$serviceSid = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-80-0')
+$creatorOwnerSid = New-Object System.Security.Principal.SecurityIdentifier('S-1-3-0')
+$ownerRightsSid = New-Object System.Security.Principal.SecurityIdentifier('S-1-3-4')
+$readOnlyRights = $Rights::ReadAndExecute -bor $Rights::ReadPermissions
+
+function Get-DisableCandidateSid {
+    $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+    $present = @()
+    foreach ($group in $identity.Groups) { $present = $present + $group.Value }
+    foreach ($candidate in @('S-1-5-4', 'S-1-2-1', 'S-1-5-3', 'S-1-5-2', 'S-1-5-64-36',
+                             'S-1-5-64-10', 'S-1-5-113', 'S-1-5-15', 'S-1-2-0')) {
+        if ($present -contains $candidate) {
+            return (New-Object System.Security.Principal.SecurityIdentifier($candidate))
+        }
+    }
+    return $null
+}
+
+function Resolve-SidTokenString([string]$Token) {
+    # Placeholders resolve to a runtime-discovered identifier; anything else is passed
+    # through VERBATIM, so a malformed value reaches the library's admission check rather
+    # than being rejected by the fixture.
+    if ($Token -ceq 'SELF') { return $selfSid.Value }
+    if ($Token -ceq 'WORLD') { return $worldSid.Value }
+    if ($Token -ceq 'SERVICE') { return $serviceSid.Value }
+    if ($Token -ceq 'CREATOR_OWNER') { return $creatorOwnerSid.Value }
+    if ($Token -ceq 'GROUP') {
+        $candidate = Get-DisableCandidateSid
+        if ($null -eq $candidate) { return '' }
+        return $candidate.Value
+    }
+    return $Token
+}
+
+function Get-ObjectSecurity([string]$Path) {
+    if (Test-Path -LiteralPath $Path -PathType Container) {
+        return [System.IO.Directory]::GetAccessControl($Path)
+    }
+    return [System.IO.File]::GetAccessControl($Path)
+}
+
+function Save-ObjectSecurity([string]$Path, $Acl) {
+    if (Test-Path -LiteralPath $Path -PathType Container) {
+        [System.IO.Directory]::SetAccessControl($Path, $Acl)
+    }
+    else {
+        [System.IO.File]::SetAccessControl($Path, $Acl)
+    }
+}
+
+function New-Rule([string]$Path, $Sid, $RightsValue, [bool]$Inheritable, [string]$Type) {
+    if (Test-Path -LiteralPath $Path -PathType Container) {
+        $inheritance = 'None'
+        if ($Inheritable) { $inheritance = 'ContainerInherit, ObjectInherit' }
+        return (New-Object System.Security.AccessControl.FileSystemAccessRule(
+            $Sid, $RightsValue, $inheritance, 'None', $Type))
+    }
+    return (New-Object System.Security.AccessControl.FileSystemAccessRule($Sid, $RightsValue, $Type))
+}
+
+function Set-ProtectedDescriptor([string]$Path, [array]$Entries) {
+    # Entries are ordered, and the order is preserved in the emitted list, which is what
+    # makes the deny-before-allow and allow-before-deny cases distinguishable.
+    $acl = Get-ObjectSecurity -Path $Path
+    $acl.SetAccessRuleProtection($true, $false)
+    foreach ($existing in @($acl.GetAccessRules($true, $false, [System.Security.Principal.SecurityIdentifier]))) {
+        [void]$acl.RemoveAccessRuleSpecific($existing)
+    }
+    foreach ($entry in $Entries) {
+        $acl.AddAccessRule((New-Rule -Path $Path -Sid $entry.Sid -RightsValue $entry.Rights `
+            -Inheritable $entry.Inheritable -Type $entry.Type))
+    }
+    Save-ObjectSecurity -Path $Path -Acl $acl
+}
+
+function Set-NullDescriptor([string]$Path) {
+    # Windows grants ALL access when an object has no discretionary access list, so this is
+    # the fail-closed case both checks must reject.
+    $raw = New-Object System.Security.AccessControl.RawSecurityDescriptor(
+        ("O:{0}G:{0}" -f $selfSid.Value))
+    $bytes = New-Object byte[] $raw.BinaryLength
+    $raw.GetBinaryForm($bytes, 0)
+    $acl = Get-ObjectSecurity -Path $Path
+    $acl.SetSecurityDescriptorBinaryForm($bytes,
+        [System.Security.AccessControl.AccessControlSections]::Access)
+    Save-ObjectSecurity -Path $Path -Acl $acl
+}
+
+function New-Entry($Sid, $RightsValue, [bool]$Inheritable = $false, [string]$Type = 'Allow') {
+    return [pscustomobject]@{ Sid = $Sid; Rights = $RightsValue; Inheritable = $Inheritable; Type = $Type }
+}
+
+$emitted = switch ($Op) {
+    'build' {
+        # Build a scratch launcher root and stamp the requested descriptor shape.
+        #
+        # CLEANUP SAFETY, which constrains every shape below: the OWNER RIGHTS entry removes
+        # the owner's implicit WRITE_DAC permanently for a principal without
+        # SeTakeOwnershipPrivilege, so a directory carrying it could never be re-permissioned
+        # or emptied again. It is therefore applied ONLY to FILES, and only inside a root
+        # that keeps full control, so the parent's FILE_DELETE_CHILD always permits teardown.
+        if (-not (Test-Path -LiteralPath $Root -PathType Container)) {
+            [void](New-Item -ItemType Directory -Path $Root)
+        }
+        $utf8 = New-Object System.Text.UTF8Encoding($false)
+        $memberNames = @(Get-EgDeployedPackageMemberNames)
+        foreach ($memberName in $memberNames) {
+            $memberPath = Join-Path $Root $memberName
+            if (-not (Test-Path -LiteralPath $memberPath -PathType Leaf)) {
+                [System.IO.File]::WriteAllText($memberPath, ('# ' + $memberName), $utf8)
+            }
+        }
+
+        $groupSid = Get-DisableCandidateSid
+        $fullSelf = @(New-Entry $selfSid $Rights::FullControl)
+        $restrictedMember = $null
+
+        if ($Shape -ceq 'authorised_self') {
+            Set-ProtectedDescriptor -Path $Root -Entries $fullSelf
+            foreach ($memberName in $memberNames) {
+                Set-ProtectedDescriptor -Path (Join-Path $Root $memberName) -Entries $fullSelf
+            }
+        }
+        elseif ($Shape -ceq 'world_write_root') {
+            Set-ProtectedDescriptor -Path $Root -Entries (
+                $fullSelf + @(New-Entry $worldSid $Rights::WriteData))
+            foreach ($memberName in $memberNames) {
+                Set-ProtectedDescriptor -Path (Join-Path $Root $memberName) -Entries $fullSelf
+            }
+        }
+        elseif ($Shape -ceq 'world_write_member') {
+            Set-ProtectedDescriptor -Path $Root -Entries $fullSelf
+            foreach ($memberName in $memberNames) {
+                Set-ProtectedDescriptor -Path (Join-Path $Root $memberName) -Entries $fullSelf
+            }
+            Set-ProtectedDescriptor -Path (Join-Path $Root 'launcher_lib.ps1') -Entries (
+                $fullSelf + @(New-Entry $worldSid $Rights::WriteData))
+        }
+        elseif ($Shape -ceq 'world_read_root') {
+            Set-ProtectedDescriptor -Path $Root -Entries (
+                $fullSelf + @(New-Entry $worldSid $Rights::ReadAndExecute))
+            foreach ($memberName in $memberNames) {
+                Set-ProtectedDescriptor -Path (Join-Path $Root $memberName) -Entries $fullSelf
+            }
+        }
+        elseif ($Shape -ceq 'service_write_root') {
+            Set-ProtectedDescriptor -Path $Root -Entries (
+                $fullSelf + @(New-Entry $serviceSid $Rights::WriteData))
+            foreach ($memberName in $memberNames) {
+                Set-ProtectedDescriptor -Path (Join-Path $Root $memberName) -Entries $fullSelf
+            }
+        }
+        elseif ($Shape -ceq 'inherited_world_write') {
+            # The write-capable entry is INHERITED by the members from the root, never
+            # declared on them explicitly.
+            Set-ProtectedDescriptor -Path $Root -Entries (
+                $fullSelf + @(New-Entry $worldSid $Rights::WriteData $true))
+            foreach ($memberName in $memberNames) {
+                $memberAcl = Get-ObjectSecurity -Path (Join-Path $Root $memberName)
+                $memberAcl.SetAccessRuleProtection($false, $true)
+                Save-ObjectSecurity -Path (Join-Path $Root $memberName) -Acl $memberAcl
+            }
+        }
+        elseif ($Shape -ceq 'deny_then_allow_world') {
+            Set-ProtectedDescriptor -Path $Root -Entries (
+                @(New-Entry $worldSid $Rights::WriteData $false 'Deny') +
+                $fullSelf + @(New-Entry $worldSid $Rights::WriteData))
+            foreach ($memberName in $memberNames) {
+                Set-ProtectedDescriptor -Path (Join-Path $Root $memberName) -Entries $fullSelf
+            }
+        }
+        elseif ($Shape -ceq 'allow_then_deny_world') {
+            Set-ProtectedDescriptor -Path $Root -Entries (
+                $fullSelf + @(New-Entry $worldSid $Rights::WriteData) +
+                @(New-Entry $worldSid $Rights::WriteData $false 'Deny'))
+            foreach ($memberName in $memberNames) {
+                Set-ProtectedDescriptor -Path (Join-Path $Root $memberName) -Entries $fullSelf
+            }
+        }
+        elseif ($Shape -ceq 'creator_owner_inheritable') {
+            Set-ProtectedDescriptor -Path $Root -Entries (
+                $fullSelf + @(New-Entry $creatorOwnerSid $Rights::WriteData $true))
+            foreach ($memberName in $memberNames) {
+                Set-ProtectedDescriptor -Path (Join-Path $Root $memberName) -Entries $fullSelf
+            }
+        }
+        elseif ($Shape -ceq 'null_dacl_member') {
+            Set-ProtectedDescriptor -Path $Root -Entries $fullSelf
+            foreach ($memberName in $memberNames) {
+                Set-ProtectedDescriptor -Path (Join-Path $Root $memberName) -Entries $fullSelf
+            }
+            Set-NullDescriptor -Path (Join-Path $Root 'launcher_lib.ps1')
+            $restrictedMember = 'launcher_lib.ps1'
+        }
+        elseif ($Shape -ceq 'member_no_write') {
+            # A package member the running token gets NO write-capable right on. The OWNER
+            # RIGHTS entry is what makes that reachable at all, because an owner otherwise
+            # always holds WRITE_DAC.
+            Set-ProtectedDescriptor -Path $Root -Entries $fullSelf
+            foreach ($memberName in $memberNames) {
+                Set-ProtectedDescriptor -Path (Join-Path $Root $memberName) -Entries $fullSelf
+            }
+            Set-ProtectedDescriptor -Path (Join-Path $Root 'launcher_lib.ps1') -Entries (
+                @(New-Entry $selfSid $readOnlyRights) +
+                @(New-Entry $ownerRightsSid $Rights::ReadPermissions))
+            $restrictedMember = 'launcher_lib.ps1'
+        }
+        elseif ($Shape -ceq 'member_one_write_right') {
+            # Exactly ONE write-capable right on top of read access. The descriptor never
+            # grants all eight, which is what makes a union-of-all-write-rights
+            # implementation report the object as safe and therefore fail the assertion.
+            Set-ProtectedDescriptor -Path $Root -Entries $fullSelf
+            foreach ($memberName in $memberNames) {
+                Set-ProtectedDescriptor -Path (Join-Path $Root $memberName) -Entries $fullSelf
+            }
+            $singleRight = [System.Security.AccessControl.FileSystemRights]$Right
+            Set-ProtectedDescriptor -Path (Join-Path $Root 'launcher_lib.ps1') -Entries (
+                @(New-Entry $selfSid ($readOnlyRights -bor $singleRight)) +
+                @(New-Entry $ownerRightsSid $Rights::ReadPermissions))
+            $restrictedMember = 'launcher_lib.ps1'
+        }
+        elseif ($Shape -ceq 'member_group_write') {
+            # The member's ONLY write-capable grant is a group identity, and the owner's
+            # implicit rights are bounded, so the verdict turns entirely on whether that
+            # group identity is enabled in the evaluating token.
+            Set-ProtectedDescriptor -Path $Root -Entries $fullSelf
+            foreach ($memberName in $memberNames) {
+                Set-ProtectedDescriptor -Path (Join-Path $Root $memberName) -Entries $fullSelf
+            }
+            if ($null -eq $groupSid) {
+                throw 'no disable-candidate group identity is present in this token'
+            }
+            Set-ProtectedDescriptor -Path (Join-Path $Root 'launcher_lib.ps1') -Entries (
+                @(New-Entry $selfSid $readOnlyRights) +
+                @(New-Entry $ownerRightsSid $Rights::ReadPermissions) +
+                @(New-Entry $groupSid $Rights::FullControl))
+            $restrictedMember = 'launcher_lib.ps1'
+        }
+        else {
+            throw ('unknown fixture shape: ' + $Shape)
+        }
+
+        $groupPresent = ($null -ne $groupSid)
+        $emitted = [ordered]@{
+            shape            = $Shape
+            groupPresent     = $groupPresent
+            restrictedMember = ([string]$restrictedMember)
+        }
+        $emitted | ConvertTo-Json -Depth 8 -Compress
+    }
+    'check' {
+        # Evaluate both write checks over the launcher root and every package member.
+        # -Json is the PATH to a JSON file carrying { authorised: [tokens...] }.
+        $spec = Get-Content -LiteralPath $Json -Raw | ConvertFrom-Json
+        $tokens = @($spec.authorised)
+        $resolved = @()
+        foreach ($token in $tokens) {
+            $resolved = $resolved + (Resolve-SidTokenString -Token $token)
+        }
+
+        # An empty or null set is refused by the mandatory parameter contract before the
+        # function body runs, which is itself the refusal DD-12 requires. The fixture
+        # reports that as the same bounded refusal rather than letting it escape.
+        $admission = $null
+        try {
+            $admission = Test-EgAuthorisedWriteSidSet -AuthorisedSid ([string[]]@($resolved))
+        }
+        catch {
+            $admission = [pscustomobject]@{
+                Pass       = $false
+                SupportRef = 'EG_LAUNCHER_ROOT_AUTHORISED_SID_SET_INVALID'
+                Sids       = @()
+            }
+        }
+
+        $objects = @([pscustomobject]@{ Name = '(root)'; Path = $Root })
+        foreach ($memberName in @(Get-EgDeployedPackageMemberNames)) {
+            $objects = $objects + ([pscustomobject]@{
+                Name = $memberName
+                Path = (Join-Path $Root $memberName)
+            })
+        }
+
+        $tokenResults = @()
+        $trusteeResults = @()
+        foreach ($object in $objects) {
+            $tokenCheck = Test-EgTokenWriteAccessToPath -Path $object.Path
+            $tokenResults = $tokenResults + ([ordered]@{
+                name            = $object.Name
+                anyWriteGranted = $tokenCheck.AnyWriteGranted
+                evaluated       = $tokenCheck.Evaluated
+                supportRef      = $tokenCheck.SupportRef
+            })
+            if ($admission.Pass) {
+                $trusteeCheck = Test-EgPathWriteTrusteesAuthorised -Path $object.Path `
+                    -AuthorisedSid $admission.Sids
+                $trusteeResults = $trusteeResults + ([ordered]@{
+                    name       = $object.Name
+                    authorised = $trusteeCheck.Authorised
+                    evaluated  = $trusteeCheck.Evaluated
+                    supportRef = $trusteeCheck.SupportRef
+                })
+            }
+        }
+
+        $privileges = Get-EgTokenPrivilegeNames
+        [ordered]@{
+            admissionPass       = $admission.Pass
+            admissionSupportRef = $admission.SupportRef
+            admittedCount       = @($admission.Sids).Count
+            mappedMask          = (Get-EgMappedWriteCapableMask)
+            declaredMask        = $script:EgWriteCapableAccessMask
+            tokenChecks         = @($tokenResults)
+            trusteeChecks       = @($trusteeResults)
+            privilegeReadOk     = $privileges.ReadOk
+            privilegeCount      = @($privileges.PrivilegeNames).Count
+            bypassPresent       = (Test-EgBypassPrivilegePresent -PrivilegeName $privileges.PrivilegeNames)
+        } | ConvertTo-Json -Depth 8 -Compress
+    }
+    'predicate' {
+        # The bypass-privilege predicate over SUPPLIED observed name lists, plus the
+        # constructed-name assertions. -Json is the PATH to { lists: [[names...], ...] }.
+        $spec = Get-Content -LiteralPath $Json -Raw | ConvertFrom-Json
+        $verdicts = @()
+        foreach ($list in @($spec.lists)) {
+            $names = [string[]]@($list)
+            $verdicts = $verdicts + ([ordered]@{
+                names   = @($names)
+                present = (Test-EgBypassPrivilegePresent -PrivilegeName $names)
+            })
+        }
+        $observed = Get-EgTokenPrivilegeNames
+        [ordered]@{
+            verdicts          = @($verdicts)
+            bypassNames       = @($script:EgBypassPrivilegeNames)
+            observedReadOk    = $observed.ReadOk
+            observedCount     = @($observed.PrivilegeNames).Count
+            observedHasBypass = (Test-EgBypassPrivilegePresent -PrivilegeName $observed.PrivilegeNames)
+        } | ConvertTo-Json -Depth 8 -Compress
+    }
+    default {
+        throw ('unknown acl probe operation: ' + $Op)
+    }
+}
+
+# A probe launched under a derived token cannot have its standard output piped back by the
+# launcher, so the emitted document is additionally written to -OutFile when one is given.
+if ($OutFile -ne '') {
+    Write-EgUtf8NoBomText -Path $OutFile -Text ([string]$emitted)
+}
+Write-Output $emitted
+"""
+
+
+RESTRICTED_TOKEN_RUNNER = r"""
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory)][string]$CommandLine,
+    [Parameter(Mandatory)][string]$ReportPath
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+# TEST-SIDE interop only. Restricting one's OWN token needs no elevation, no second
+# account, and no production launcher root, which is what makes the same-account
+# separation case provable in hosted continuous integration. None of this appears in, or
+# is reachable from, the committed runtime library: a static guard asserts that the
+# runtime never calls CreateRestrictedToken, CreateProcessAsUser, or any impersonation
+# entry point.
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+namespace EgTestToken {
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct SID_AND_ATTRIBUTES {
+        public IntPtr Sid;
+        public uint Attributes;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct STARTUPINFO {
+        public int cb;
+        public string lpReserved;
+        public string lpDesktop;
+        public string lpTitle;
+        public int dwX;
+        public int dwY;
+        public int dwXSize;
+        public int dwYSize;
+        public int dwXCountChars;
+        public int dwYCountChars;
+        public int dwFillAttribute;
+        public int dwFlags;
+        public short wShowWindow;
+        public short cbReserved2;
+        public IntPtr lpReserved2;
+        public IntPtr hStdInput;
+        public IntPtr hStdOutput;
+        public IntPtr hStdError;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct PROCESS_INFORMATION {
+        public IntPtr hProcess;
+        public IntPtr hThread;
+        public int dwProcessId;
+        public int dwThreadId;
+    }
+
+    public class LaunchOutcome {
+        public bool Ok;
+        public int ExitCode;
+        public int LastError;
+        public string Stage;
+    }
+
+    public static class Runner {
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern IntPtr GetCurrentProcess();
+        [DllImport("advapi32.dll", SetLastError = true)]
+        static extern bool OpenProcessToken(IntPtr handle, uint access, out IntPtr token);
+        [DllImport("advapi32.dll", SetLastError = true)]
+        static extern bool CreateRestrictedToken(IntPtr existing, uint flags,
+            uint disableCount, SID_AND_ATTRIBUTES[] sidsToDisable, uint deleteCount,
+            IntPtr privilegesToDelete, uint restrictCount, IntPtr sidsToRestrict,
+            out IntPtr newToken);
+        [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        static extern bool CreateProcessAsUser(IntPtr token, string applicationName,
+            string commandLine, IntPtr processAttributes, IntPtr threadAttributes,
+            bool inheritHandles, uint creationFlags, IntPtr environment,
+            string currentDirectory, ref STARTUPINFO startupInfo,
+            out PROCESS_INFORMATION processInformation);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool GetExitCodeProcess(IntPtr handle, out int exitCode);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool CloseHandle(IntPtr handle);
+
+        const uint TOKEN_ALL_ACCESS = 0xF01FF;
+
+        public static LaunchOutcome Run(byte[] sidBytes, string commandLine) {
+            LaunchOutcome outcome = new LaunchOutcome();
+            outcome.Ok = false;
+            outcome.ExitCode = -1;
+            outcome.LastError = 0;
+            outcome.Stage = "start";
+            IntPtr token = IntPtr.Zero;
+            IntPtr restricted = IntPtr.Zero;
+            IntPtr sidBuffer = IntPtr.Zero;
+            PROCESS_INFORMATION info = new PROCESS_INFORMATION();
+            try {
+                if (OpenProcessToken(GetCurrentProcess(), TOKEN_ALL_ACCESS, out token) == false) {
+                    outcome.Stage = "OpenProcessToken";
+                    outcome.LastError = Marshal.GetLastWin32Error();
+                    return outcome;
+                }
+                sidBuffer = Marshal.AllocHGlobal(sidBytes.Length);
+                Marshal.Copy(sidBytes, 0, sidBuffer, sidBytes.Length);
+                SID_AND_ATTRIBUTES[] disable = new SID_AND_ATTRIBUTES[1];
+                disable[0].Sid = sidBuffer;
+                disable[0].Attributes = 0;
+                if (CreateRestrictedToken(token, 0, 1, disable, 0, IntPtr.Zero, 0, IntPtr.Zero, out restricted) == false) {
+                    outcome.Stage = "CreateRestrictedToken";
+                    outcome.LastError = Marshal.GetLastWin32Error();
+                    return outcome;
+                }
+                STARTUPINFO startup = new STARTUPINFO();
+                startup.cb = Marshal.SizeOf(typeof(STARTUPINFO));
+                startup.lpDesktop = null;
+                if (CreateProcessAsUser(restricted, null, commandLine, IntPtr.Zero, IntPtr.Zero, false, 0, IntPtr.Zero, null, ref startup, out info) == false) {
+                    outcome.Stage = "CreateProcessAsUser";
+                    outcome.LastError = Marshal.GetLastWin32Error();
+                    return outcome;
+                }
+                WaitForSingleObject(info.hProcess, 0xFFFFFFFF);
+                int code = -1;
+                GetExitCodeProcess(info.hProcess, out code);
+                outcome.Ok = true;
+                outcome.ExitCode = code;
+                outcome.Stage = "done";
+                return outcome;
+            }
+            finally {
+                if (info.hThread != IntPtr.Zero) { CloseHandle(info.hThread); }
+                if (info.hProcess != IntPtr.Zero) { CloseHandle(info.hProcess); }
+                if (sidBuffer != IntPtr.Zero) { Marshal.FreeHGlobal(sidBuffer); }
+                if (restricted != IntPtr.Zero) { CloseHandle(restricted); }
+                if (token != IntPtr.Zero) { CloseHandle(token); }
+            }
+        }
+    }
+}
+'@
+
+# Pick the first well-known logon-session or authentication identity actually present in
+# this token. No system file grants access through any of them, so the child still starts.
+$identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+$present = @()
+foreach ($group in $identity.Groups) { $present = $present + $group.Value }
+$chosen = ''
+foreach ($candidate in @('S-1-5-4', 'S-1-2-1', 'S-1-5-3', 'S-1-5-2', 'S-1-5-64-36',
+                         'S-1-5-64-10', 'S-1-5-113', 'S-1-5-15', 'S-1-2-0')) {
+    if ($present -contains $candidate) { $chosen = $candidate; break }
+}
+
+$report = [ordered]@{ chosen = $chosen; ok = $false; exitCode = -1; stage = 'no-candidate'; lastError = 0 }
+if ($chosen -ne '') {
+    $sid = New-Object System.Security.Principal.SecurityIdentifier($chosen)
+    $bytes = New-Object byte[] $sid.BinaryLength
+    $sid.GetBinaryForm($bytes, 0)
+    $outcome = [EgTestToken.Runner]::Run($bytes, $CommandLine)
+    $report['ok'] = $outcome.Ok
+    $report['exitCode'] = $outcome.ExitCode
+    $report['stage'] = $outcome.Stage
+    $report['lastError'] = $outcome.LastError
+}
+
+$utf8 = New-Object System.Text.UTF8Encoding($false)
+[System.IO.File]::WriteAllText($ReportPath, ($report | ConvertTo-Json -Depth 8 -Compress), $utf8)
+Write-Output ($report | ConvertTo-Json -Depth 8 -Compress)
+"""
+
+
+def quote_for_command_line(value):
+    """Quote one argument for a single Windows command-line string."""
+    text = str(value)
+    trailing = len(text) - len(text.rstrip("\\"))
+    return '"%s%s"' % (text, "\\" * trailing)
+
+
+def run_acl_probe_under_restricted_token(exe, tmp, root, authorised=("SELF",)):
+    """Evaluate the write checks under a token with one group identity marked deny-only."""
+    runner = Path(tmp) / "eg_restricted_runner.ps1"
+    runner.write_text(RESTRICTED_TOKEN_RUNNER, encoding="utf-8")
+    acl_script = write_acl_probe(tmp)
+    spec = write_json(tmp, "restricted_authorised.json", {"authorised": list(authorised)})
+    out_file = Path(tmp) / "restricted_check.json"
+    report_path = Path(tmp) / "restricted_report.json"
+
+    parts = [
+        quote_for_command_line(exe),
+        "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+        "-File", quote_for_command_line(acl_script),
+        "-Lib", quote_for_command_line(LIB),
+        "-Op", "check",
+        "-Root", quote_for_command_line(root),
+        "-Json", quote_for_command_line(spec),
+        "-OutFile", quote_for_command_line(out_file),
+    ]
+    completed = run_ps(
+        exe, runner,
+        "-CommandLine", " ".join(parts),
+        "-ReportPath", str(report_path),
+    )
+    if completed.returncode != 0:
+        raise AssertionError(
+            "restricted runner exited %d\nstdout:\n%s\nstderr:\n%s"
+            % (completed.returncode, completed.stdout, completed.stderr)
+        )
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    observed = None
+    if out_file.is_file():
+        text = out_file.read_text(encoding="utf-8").strip()
+        if text:
+            observed = json.loads(text)
+    return report, observed
+
+
+def write_acl_probe(tmp):
+    """Materialise the write-authority probe inside a scratch directory."""
+    path = Path(tmp) / "eg_acl_probe.ps1"
+    path.write_text(ACL_PROBE_SCRIPT, encoding="utf-8")
+    return path
+
+
+def acl_probe(exe, op, tmp, root, **kwargs):
+    """Run the write-authority probe and return its parsed JSON."""
+    script = write_acl_probe(tmp)
+    args = ["-Lib", str(LIB), "-Op", op, "-Root", str(root)]
+    args.extend(_named_args(kwargs))
+    completed = run_ps(exe, script, *args)
+    if completed.returncode != 0:
+        raise AssertionError(
+            "acl probe %r/%r exited %d\nstdout:\n%s\nstderr:\n%s"
+            % (op, kwargs.get("shape", ""), completed.returncode,
+               completed.stdout, completed.stderr)
+        )
+    return json.loads(completed.stdout)
+
+
+def build_scratch_launcher_root(exe, tmp, shape, right=""):
+    """Create a scratch launcher root carrying a deliberately shaped security descriptor."""
+    root = Path(tmp) / "launcher_root"
+    kwargs = {"shape": shape}
+    if right:
+        kwargs["right"] = right
+    built = acl_probe(exe, "build", tmp, root, **kwargs)
+    return root, built
+
+
+def check_write_authority(exe, tmp, root, authorised=("SELF",)):
+    """Evaluate both launcher-root write checks over a prepared scratch root."""
+    spec = write_json(tmp, "authorised_spec.json", {"authorised": list(authorised)})
+    return acl_probe(exe, "check", tmp, root, json=spec)
+
+
+def outcome_for(results, name):
+    """Pick one named object's outcome out of a probe result list."""
+    for entry in results:
+        if entry["name"] == name:
+            return entry
+    raise AssertionError("no outcome reported for %r" % name)
+
+
 GOVERNED_SOURCE_PATHS = (
     "energygrid-bill-downloader/energygrid_bill_downloader",
     "energygrid-bill-downloader/requirements.txt",
@@ -4438,6 +5149,649 @@ class SanctionedBytecodeException(TierABase):
         for path, expected in cases.items():
             with self.subTest(path=path):
                 self.assertEqual(expected, actual[path])
+
+
+RUN_PRINCIPAL_REF = "EG_LAUNCHER_ROOT_ACL_RUN_PRINCIPAL_WRITABLE"
+TRUSTEE_REF = "EG_LAUNCHER_ROOT_ACL_WRITE_TRUSTEE_UNAUTHORISED"
+SID_SET_REF = "EG_LAUNCHER_ROOT_AUTHORISED_SID_SET_INVALID"
+
+
+class WriteAuthorityMixin:
+    """Design section 17.2.1, DD-02 and DD-03, asserted on one interpreter."""
+
+    exe = None
+
+    def test_an_authorised_exact_trustee_passes_on_the_root_and_on_every_member(self):
+        """EGRT-T58: asserted on the directory AND on each member individually.
+
+        A member's own access list can differ from the directory's, and directory-level
+        authority to add or delete children is by itself enough to replace a member, so
+        neither object alone is sufficient.
+        """
+        with TemporaryScratch() as tmp:
+            root, _built = build_scratch_launcher_root(self.exe, tmp, "authorised_self")
+            observed = check_write_authority(self.exe, tmp, root, authorised=("SELF",))
+        self.assertTrue(observed["admissionPass"], observed["admissionSupportRef"])
+        self.assertEqual(1, observed["admittedCount"])
+        self.assertEqual(
+            4,
+            len(observed["trusteeChecks"]),
+            "the root and all three members must each be examined",
+        )
+        for entry in observed["trusteeChecks"]:
+            with self.subTest(examined=entry["name"]):
+                self.assertTrue(entry["evaluated"])
+                self.assertTrue(entry["authorised"], entry["supportRef"])
+                self.assertEqual("", entry["supportRef"])
+
+    def test_exactly_one_granted_write_right_is_reported_writable(self):
+        """EGRT-T59: the union false-negative guard.
+
+        Windows grants an access check only when the descriptor allows ALL of the requested
+        rights. Passing the union of every write-capable bit as DesiredAccess and reading a
+        denied access status as "not writable" is therefore a false negative by
+        construction: a token holding exactly one of those rights, enough to append to,
+        delete, or re-permission the launcher, yields a denied status under that
+        formulation and the run would proceed.
+
+        Each case below grants a strict SUBSET of the write-capable rights, so a union
+        implementation reports the object safe and fails this assertion.
+        """
+        for right in ("WriteData", "DeleteSubdirectoriesAndFiles"):
+            with self.subTest(single_right=right):
+                with TemporaryScratch() as tmp:
+                    root, _built = build_scratch_launcher_root(
+                        self.exe, tmp, "member_one_write_right", right=right
+                    )
+                    observed = check_write_authority(self.exe, tmp, root)
+                member = outcome_for(observed["tokenChecks"], "launcher_lib.ps1")
+                self.assertTrue(member["evaluated"])
+                self.assertTrue(
+                    member["anyWriteGranted"],
+                    "a single granted %s must be observable as writable" % right,
+                )
+                self.assertEqual(RUN_PRINCIPAL_REF, member["supportRef"])
+
+    def test_a_granted_mask_with_no_write_bit_is_reported_non_writable(self):
+        """EGRT-T59: the control half. The check is an intersection, not a constant."""
+        with TemporaryScratch() as tmp:
+            root, built = build_scratch_launcher_root(self.exe, tmp, "member_no_write")
+            self.assertEqual("launcher_lib.ps1", built["restrictedMember"])
+            observed = check_write_authority(self.exe, tmp, root)
+        member = outcome_for(observed["tokenChecks"], "launcher_lib.ps1")
+        self.assertTrue(
+            member["evaluated"], "an unreadable descriptor would be terminal, not a pass"
+        )
+        self.assertFalse(
+            member["anyWriteGranted"],
+            "a granted mask intersecting the write-capable mask in no bit is non-writable",
+        )
+        self.assertEqual("", member["supportRef"])
+
+    def test_same_account_separation_is_proven_not_assumed(self):
+        """EGRT-T62: the same token before and after restricting one group identity.
+
+        Where installer and run principal are the same Windows account, binding write
+        authority to that account's user identifier separates nothing, because normal
+        split-token behaviour carries the same user identifier enabled in both contexts.
+        Binding to a group identity separates them only while the host keeps producing a
+        filtered token, which the access list cannot show. This asserts the difference is
+        OBSERVABLE rather than assumed: one scratch member whose only write-capable grant
+        is a group identity is writable under the unrestricted token and non-writable once
+        that identity is deny-only.
+        """
+        with TemporaryScratch() as tmp:
+            root, built = build_scratch_launcher_root(
+                self.exe, tmp, "member_group_write"
+            )
+            self.assertTrue(
+                built["groupPresent"],
+                "no well-known logon-session identity is present in this token, so the "
+                "same-account separation case cannot be constructed here",
+            )
+            unrestricted = check_write_authority(self.exe, tmp, root)
+            report, restricted = run_acl_probe_under_restricted_token(
+                self.exe, tmp, root
+            )
+
+        before = outcome_for(unrestricted["tokenChecks"], "launcher_lib.ps1")
+        self.assertTrue(before["evaluated"])
+        self.assertTrue(
+            before["anyWriteGranted"],
+            "the unrestricted token must be writable through the group grant",
+        )
+
+        self.assertTrue(
+            report["ok"],
+            "the restricted-token launch failed at %r with error %d"
+            % (report["stage"], report["lastError"]),
+        )
+        self.assertEqual(
+            0, report["exitCode"],
+            "the child must run to completion under the restricted token",
+        )
+        self.assertIsNotNone(
+            restricted, "the restricted child produced no observation document"
+        )
+        after = outcome_for(restricted["tokenChecks"], "launcher_lib.ps1")
+        self.assertTrue(
+            after["evaluated"],
+            "the descriptor must still be readable under the restricted token",
+        )
+        self.assertFalse(
+            after["anyWriteGranted"],
+            "with the group identity deny-only the same object must be non-writable",
+        )
+
+    def test_the_write_capable_mask_is_generic_mapped_before_intersection(self):
+        """EGRT-T71, dynamic half: the compared mask carries no generic right."""
+        with TemporaryScratch() as tmp:
+            root, _built = build_scratch_launcher_root(self.exe, tmp, "authorised_self")
+            observed = check_write_authority(self.exe, tmp, root)
+        self.assertEqual(EXPECTED_WRITE_CAPABLE_MASK, observed["declaredMask"])
+        self.assertEqual(EXPECTED_WRITE_CAPABLE_MASK, observed["mappedMask"])
+        self.assertEqual(
+            0,
+            observed["mappedMask"] & 0xF0000000,
+            "no generic right may survive into the compared mask",
+        )
+
+
+class WriteAuthorityTierA(WriteAuthorityMixin, TierABase):
+    """Task 16, Tier A: the launcher-root write authority."""
+
+    @classmethod
+    def setUpClass(cls):
+        TierABase.setUpClass()
+        cls.exe = ANY_PS
+
+    def test_a_write_capable_trustee_outside_the_supplied_set_fails_closed(self):
+        """EGRT-T60: asserted on the directory and on a member independently."""
+        with TemporaryScratch() as tmp:
+            root, _built = build_scratch_launcher_root(ANY_PS, tmp, "world_write_root")
+            observed = check_write_authority(ANY_PS, tmp, root)
+        entry = outcome_for(observed["trusteeChecks"], "(root)")
+        self.assertTrue(entry["evaluated"])
+        self.assertFalse(entry["authorised"])
+        self.assertEqual(TRUSTEE_REF, entry["supportRef"])
+
+        with TemporaryScratch() as tmp:
+            root, _built = build_scratch_launcher_root(ANY_PS, tmp, "world_write_member")
+            observed = check_write_authority(ANY_PS, tmp, root)
+        self.assertTrue(
+            outcome_for(observed["trusteeChecks"], "(root)")["authorised"],
+            "the directory itself is clean in this case",
+        )
+        member = outcome_for(observed["trusteeChecks"], "launcher_lib.ps1")
+        self.assertFalse(
+            member["authorised"], "a member's own access list must be examined"
+        )
+        self.assertEqual(TRUSTEE_REF, member["supportRef"])
+
+    def test_a_read_only_trustee_outside_the_set_is_not_write_capable(self):
+        """Only WRITE-capable grants are constrained; a read grant is not a violation."""
+        with TemporaryScratch() as tmp:
+            root, _built = build_scratch_launcher_root(ANY_PS, tmp, "world_read_root")
+            observed = check_write_authority(ANY_PS, tmp, root)
+        self.assertTrue(
+            outcome_for(observed["trusteeChecks"], "(root)")["authorised"],
+            "a read-only entry for an unlisted trustee is not write-capable",
+        )
+
+    def test_an_unrelated_service_class_trustee_fails_closed(self):
+        """EGRT-T61: a service-class identifier carries no implicit authority."""
+        with TemporaryScratch() as tmp:
+            root, _built = build_scratch_launcher_root(ANY_PS, tmp, "service_write_root")
+            observed = check_write_authority(ANY_PS, tmp, root)
+        entry = outcome_for(observed["trusteeChecks"], "(root)")
+        self.assertFalse(
+            entry["authorised"],
+            "a rule of the form 'any identifier beginning with the service prefix' would "
+            "authorise every service configured on the host rather than a named authority",
+        )
+        self.assertEqual(TRUSTEE_REF, entry["supportRef"])
+
+    def test_an_inherited_write_capable_allow_entry_is_treated_as_explicit(self):
+        """EGRT-T64: inheritance describes where an entry came from, not how much it grants."""
+        with TemporaryScratch() as tmp:
+            root, _built = build_scratch_launcher_root(ANY_PS, tmp, "inherited_world_write")
+            observed = check_write_authority(ANY_PS, tmp, root)
+        member = outcome_for(observed["trusteeChecks"], "launcher_lib.ps1")
+        self.assertFalse(
+            member["authorised"],
+            "an INHERITED write-capable entry for an unlisted trustee must fail closed",
+        )
+        self.assertEqual(TRUSTEE_REF, member["supportRef"])
+
+    def test_a_deny_entry_never_authorises_a_trustee(self):
+        """EGRT-T65: asserted in BOTH entry orders.
+
+        Whether a given deny entry actually neutralises a given allow entry depends on
+        their order in the list, which Windows walks in sequence. Cancelling an allow
+        against a deny here would let a badly ordered list conceal a real grant.
+        """
+        for shape in ("deny_then_allow_world", "allow_then_deny_world"):
+            with self.subTest(entry_order=shape):
+                with TemporaryScratch() as tmp:
+                    root, _built = build_scratch_launcher_root(ANY_PS, tmp, shape)
+                    observed = check_write_authority(ANY_PS, tmp, root)
+                entry = outcome_for(observed["trusteeChecks"], "(root)")
+                self.assertFalse(entry["authorised"])
+                self.assertEqual(TRUSTEE_REF, entry["supportRef"])
+
+    def test_write_dac_write_owner_and_delete_are_each_write_capable(self):
+        """EGRT-T66: each standard right alone is observable as writable."""
+        for right in ("ChangePermissions", "TakeOwnership", "Delete"):
+            with self.subTest(single_right=right):
+                with TemporaryScratch() as tmp:
+                    root, _built = build_scratch_launcher_root(
+                        ANY_PS, tmp, "member_one_write_right", right=right
+                    )
+                    observed = check_write_authority(ANY_PS, tmp, root)
+                member = outcome_for(observed["tokenChecks"], "launcher_lib.ps1")
+                self.assertTrue(
+                    member["anyWriteGranted"],
+                    "%s alone must be treated as write-capable" % right,
+                )
+
+    def test_every_declared_write_capable_right_is_observable_as_writable(self):
+        """The mask is the sole source, so each of its eight bits must be reachable."""
+        for right in WRITE_CAPABLE_RIGHT_NAMES:
+            with self.subTest(single_right=right):
+                with TemporaryScratch() as tmp:
+                    root, _built = build_scratch_launcher_root(
+                        ANY_PS, tmp, "member_one_write_right", right=right
+                    )
+                    observed = check_write_authority(ANY_PS, tmp, root)
+                member = outcome_for(observed["tokenChecks"], "launcher_lib.ps1")
+                self.assertTrue(member["anyWriteGranted"], right)
+
+    def test_an_examined_owner_outside_the_supplied_set_fails_closed(self):
+        """EGRT-T66: an owner implicitly holds WRITE_DAC and can restore write at will.
+
+        The scratch root is owned by the running account, so supplying only an unrelated
+        identifier makes every examined object's owner fall outside the set, with no
+        explicit write-capable entry required to reach the failure.
+        """
+        with TemporaryScratch() as tmp:
+            root, _built = build_scratch_launcher_root(ANY_PS, tmp, "authorised_self")
+            observed = check_write_authority(ANY_PS, tmp, root, authorised=("WORLD",))
+        entry = outcome_for(observed["trusteeChecks"], "(root)")
+        self.assertFalse(
+            entry["authorised"], "an owner outside the supplied set must fail closed"
+        )
+        self.assertEqual(TRUSTEE_REF, entry["supportRef"])
+
+    def test_a_null_discretionary_access_control_list_fails_both_checks(self):
+        """EGRT-T67: Windows grants ALL access when an object has none."""
+        with TemporaryScratch() as tmp:
+            root, built = build_scratch_launcher_root(ANY_PS, tmp, "null_dacl_member")
+            self.assertEqual("launcher_lib.ps1", built["restrictedMember"])
+            observed = check_write_authority(ANY_PS, tmp, root)
+        token_entry = outcome_for(observed["tokenChecks"], "launcher_lib.ps1")
+        self.assertTrue(token_entry["anyWriteGranted"], "a null list grants every right")
+        self.assertEqual(RUN_PRINCIPAL_REF, token_entry["supportRef"])
+
+        trustee_entry = outcome_for(observed["trusteeChecks"], "launcher_lib.ps1")
+        self.assertFalse(
+            trustee_entry["authorised"], "a null list must fail rather than pass"
+        )
+        self.assertEqual(TRUSTEE_REF, trustee_entry["supportRef"])
+
+    def test_an_inheritable_creator_owner_entry_fails_closed(self):
+        """EGRT-T68: the placeholder describes an unbounded future write set."""
+        with TemporaryScratch() as tmp:
+            root, _built = build_scratch_launcher_root(
+                ANY_PS, tmp, "creator_owner_inheritable"
+            )
+            observed = check_write_authority(ANY_PS, tmp, root)
+        entry = outcome_for(observed["trusteeChecks"], "(root)")
+        self.assertFalse(entry["authorised"])
+        self.assertEqual(TRUSTEE_REF, entry["supportRef"])
+
+    def test_the_creator_owner_placeholder_cannot_be_supplied_in_the_authorised_set(self):
+        """EGRT-T68: the placeholder is refused at admission."""
+        with TemporaryScratch() as tmp:
+            root, _built = build_scratch_launcher_root(ANY_PS, tmp, "authorised_self")
+            observed = check_write_authority(
+                ANY_PS, tmp, root, authorised=("SELF", "CREATOR_OWNER")
+            )
+        self.assertFalse(observed["admissionPass"])
+        self.assertEqual(SID_SET_REF, observed["admissionSupportRef"])
+        self.assertEqual(0, observed["admittedCount"])
+        self.assertEqual(
+            [],
+            observed["trusteeChecks"],
+            "a refused set must not be used for any comparison",
+        )
+
+    def test_an_empty_or_non_sid_authorised_set_is_refused(self):
+        """DD-12: an account name is refused WITHOUT a name-resolution lookup."""
+        for authorised in ((), ("BUILTIN\\Administrators",), ("not-a-sid",), ("S-1-",)):
+            with self.subTest(authorised=authorised):
+                with TemporaryScratch() as tmp:
+                    root, _built = build_scratch_launcher_root(
+                        ANY_PS, tmp, "authorised_self"
+                    )
+                    observed = check_write_authority(
+                        ANY_PS, tmp, root, authorised=authorised
+                    )
+                self.assertFalse(observed["admissionPass"])
+                self.assertEqual(SID_SET_REF, observed["admissionSupportRef"])
+
+    def test_a_bypass_privilege_fails_the_run_principal_check(self):
+        """EGRT-T69, cases (a) to (c): the predicate over OBSERVED names.
+
+        Presence alone is sufficient, whether the privilege is enabled or disabled, and a
+        list read successfully that holds neither name is not itself a failure.
+        """
+        lists = [
+            ["SeTakeOwnershipPrivilege"],
+            ["SeRestorePrivilege"],
+            ["SeChangeNotifyPrivilege", "SeRestorePrivilege"],
+            ["setakeownershipprivilege"],
+            ["SeChangeNotifyPrivilege", "SeShutdownPrivilege"],
+            [],
+        ]
+        with TemporaryScratch() as tmp:
+            root, _built = build_scratch_launcher_root(ANY_PS, tmp, "authorised_self")
+            spec = write_json(tmp, "predicate_spec.json", {"lists": lists})
+            observed = acl_probe(ANY_PS, "predicate", tmp, root, json=spec)
+
+        self.assertEqual(
+            ["SeTakeOwnershipPrivilege", "SeRestorePrivilege"], observed["bypassNames"]
+        )
+        verdicts = [entry["present"] for entry in observed["verdicts"]]
+        self.assertEqual([True, True, True, True, False, False], verdicts)
+        self.assertTrue(
+            observed["observedReadOk"],
+            "the running token's privilege information must be readable",
+        )
+        self.assertGreater(observed["observedCount"], 0)
+
+    def test_the_privilege_reader_never_fabricates_a_name(self):
+        """EGRT-T69, case (e): a read failure yields an EMPTY list, never a synthetic name."""
+        with TemporaryScratch() as tmp:
+            root, _built = build_scratch_launcher_root(ANY_PS, tmp, "authorised_self")
+            observed = check_write_authority(ANY_PS, tmp, root)
+        self.assertTrue(observed["privilegeReadOk"])
+        self.assertGreater(observed["privilegeCount"], 0)
+        self.assertFalse(
+            observed["bypassPresent"],
+            "this host's non-elevated token must not hold a bypass privilege, otherwise "
+            "the fixture cannot distinguish presence from absence",
+        )
+
+    def test_no_security_identifier_material_reaches_any_returned_surface(self):
+        """EGRT-T63, dynamic half: only a check name, an outcome, and a bounded reference."""
+        with TemporaryScratch() as tmp:
+            root, _built = build_scratch_launcher_root(ANY_PS, tmp, "world_write_root")
+            spec = write_json(tmp, "authorised_spec.json", {"authorised": ["SELF"]})
+            completed = run_ps(
+                ANY_PS, write_acl_probe(tmp),
+                "-Lib", str(LIB), "-Op", "check", "-Root", str(root),
+                "-Json", str(spec),
+            )
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        observed = json.loads(completed.stdout)
+        emitted = json.dumps(observed["tokenChecks"]) + json.dumps(observed["trusteeChecks"])
+        self.assertIsNone(
+            re.search(r"S-1-(?:\d+-)+\d+", emitted),
+            "no security identifier may appear in either check's returned object",
+        )
+        for sid in SYNTHETIC_SIDS:
+            with self.subTest(sid=sid):
+                self.assertNotIn(sid, emitted)
+
+
+REQUIRED_INTEROP_IMPORTS = (
+    "GetCurrentProcess",
+    "OpenProcessToken",
+    "DuplicateTokenEx",
+    "CloseHandle",
+    "GetTokenInformation",
+    "AccessCheck",
+    "MapGenericMask",
+    "LookupPrivilegeNameW",
+)
+
+
+class WriteAuthorityStaticGuards(TierCBase):
+    """Task 16, Tier C: EGRT-T61, EGRT-T63, EGRT-T70, and EGRT-T71 static halves.
+
+    These constrain how the access check is CONSTRUCTED rather than what it concludes,
+    because a conforming conclusion reached by a non-conforming construction would still be
+    a defect.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.library = LIB.read_text(encoding="utf-8")
+
+    def _function_bodies(self):
+        if ANY_PS is None:
+            self.skipTest("no PowerShell host found (pwsh or powershell)")
+        with TemporaryScratch() as tmp:
+            result = run_inspector(
+                ANY_PS, tmp, FUNCTION_BODY_TEXT_INSPECTOR, target=LIB
+            )
+        self.assertEqual(0, result["parseErrors"])
+        return {entry["name"]: entry["body"] for entry in result["functions"]}
+
+    def test_the_interop_surface_is_complete_and_closed(self):
+        """EGRT-T70: every required native function is declared and nothing else is."""
+        declarations = re.findall(
+            r"\[DllImport\([^\]]*\)\][^;]*?\b(\w+)\s*\(", self.library, re.S
+        )
+        security_source_start = self.library.index("$script:EgWin32SecurityInteropSource")
+        security_source_end = self.library.index(
+            "function Initialize-EgWin32SecurityInterop"
+        )
+        security_source = self.library[security_source_start:security_source_end]
+        security_declarations = re.findall(
+            r"\[DllImport\([^\]]*\)\][^;]*?\b(\w+)\s*\(", security_source, re.S
+        )
+        self.assertEqual(
+            sorted(REQUIRED_INTEROP_IMPORTS),
+            sorted(security_declarations),
+            "the security interop surface must be exactly the eight required imports",
+        )
+        for required in REQUIRED_INTEROP_IMPORTS:
+            with self.subTest(native=required):
+                self.assertIn(required, declarations)
+
+    def test_lookup_privilege_name_is_declared_with_an_explicit_entry_point(self):
+        """EGRT-T70: charset name mangling must not decide which entry point is bound."""
+        match = re.search(
+            r"\[DllImport\(\"advapi32\.dll\"([^\]]*)\)\]\s*\n\s*private static extern bool LookupPrivilegeNameW",
+            self.library,
+        )
+        self.assertIsNotNone(
+            match, "LookupPrivilegeNameW must carry its own DllImport declaration"
+        )
+        attributes = match.group(1)
+        self.assertIn("SetLastError = true", attributes)
+        self.assertIn('EntryPoint = "LookupPrivilegeNameW"', attributes)
+        self.assertIn("CharSet = CharSet.Unicode", attributes)
+
+    def test_the_privilege_reader_uses_the_declared_lookup_and_never_a_substitute(self):
+        """EGRT-T70: the privilege name is resolved only through the declared import."""
+        self.assertIn("LookupPrivilegeNameW(null, ref luid, null, ref cchName)", self.library)
+        self.assertIn(
+            "LookupPrivilegeNameW(null, ref luid, builder, ref cchRetry)", self.library
+        )
+        self.assertNotIn("LookupPrivilegeValue", self.library)
+        self.assertNotIn("LookupAccountName", self.library)
+        self.assertNotIn("LookupAccountSid", self.library)
+
+    def test_the_lookup_retry_buffer_is_sized_from_the_reported_length(self):
+        """The retry is given the reported length plus one, and told the real capacity."""
+        self.assertIn("int capacity = cchName + 1;", self.library)
+        self.assertIn("StringBuilder builder = new StringBuilder(capacity);", self.library)
+        self.assertIn("int cchRetry = capacity;", self.library)
+
+    def test_the_access_check_uses_a_duplicated_impersonation_token(self):
+        """EGRT-T70: the primary token is never the token argument to AccessCheck."""
+        self.assertIn(
+            "DuplicateTokenEx(processToken, TOKEN_QUERY, IntPtr.Zero, "
+            "SECURITY_IDENTIFICATION, TOKEN_IMPERSONATION, out impersonationToken)",
+            self.library,
+        )
+        self.assertIn("private const int SECURITY_IDENTIFICATION = 2;", self.library)
+        self.assertIn("private const int TOKEN_IMPERSONATION = 2;", self.library)
+
+        access_check_calls = re.findall(
+            r"AccessCheck\(\s*securityDescriptor,\s*(\w+),", self.library
+        )
+        self.assertEqual(
+            ["impersonationToken"],
+            access_check_calls,
+            "AccessCheck must be given the duplicated impersonation token only",
+        )
+
+    def test_the_launcher_never_impersonates_and_never_rebuilds_the_context(self):
+        """EGRT-T70: the duplicate exists to be evaluated, never to be impersonated with."""
+        forbidden = (
+            "ImpersonateLoggedOnUser",
+            "RevertToSelf",
+            "SetThreadToken",
+            "WindowsIdentity]::Impersonate",
+            ".Impersonate(",
+            "CreateProcessAsUser",
+            "CreateRestrictedToken",
+            "LogonUser",
+        )
+        for path in existing_runtime_ps1_files():
+            text = path.read_text(encoding="utf-8")
+            for token in forbidden:
+                with self.subTest(runtime_file=path.name, token=token):
+                    self.assertNotIn(token, text)
+
+    def test_every_duplicated_handle_is_closed_on_every_path(self):
+        """EGRT-T70, dynamic support: handles are released in a finally block."""
+        self.assertIn("if (impersonationToken != IntPtr.Zero) { CloseHandle(impersonationToken); }",
+                      self.library)
+        self.assertIn("if (processToken != IntPtr.Zero) { CloseHandle(processToken); }",
+                      self.library)
+        self.assertIn("if (privilegeSet != IntPtr.Zero) { Marshal.FreeHGlobal(privilegeSet); }",
+                      self.library)
+        self.assertIn("if (buffer != IntPtr.Zero) { Marshal.FreeHGlobal(buffer); }",
+                      self.library)
+
+    def test_the_prohibited_union_formulation_does_not_appear(self):
+        """DD-02: DesiredAccess is MAXIMUM_ALLOWED and the verdict is an intersection."""
+        self.assertIn("private const uint MAXIMUM_ALLOWED = 0x02000000;", self.library)
+        self.assertIn(
+            "AccessCheck(securityDescriptor, impersonationToken, MAXIMUM_ALLOWED,",
+            self.library,
+        )
+        self.assertNotIn(
+            "outcome.AccessStatus == false",
+            self.library,
+            "the access status must never drive the writability verdict",
+        )
+
+    def test_generic_mapping_is_applied_before_any_intersection(self):
+        """EGRT-T71, static half: the compared mask is mapped first."""
+        bodies = self._function_bodies()
+        self.assertIn("Get-EgMappedWriteCapableMask", bodies)
+        self.assertIn("MapGenericMask", bodies["Get-EgMappedWriteCapableMask"] +
+                      self.library)
+
+        check_body = bodies["Test-EgTokenWriteAccessToPath"]
+        mapped_index = check_body.index("Get-EgMappedWriteCapableMask")
+        band_index = check_body.index("-band")
+        self.assertLess(
+            mapped_index,
+            band_index,
+            "the mask must be generic-mapped before it is intersected",
+        )
+        self.assertIn("-band $mappedMask", check_body)
+
+    def test_no_trustee_comparison_is_a_prefix_or_pattern_match(self):
+        """EGRT-T61, static half: the supplied set is exhaustive and exact."""
+        pattern_operators = ("-like", "-clike", "-match", "-cmatch", "StartsWith(",
+                             "EndsWith(", "Contains(", "-in ", "-notlike")
+        sid_markers = ("SecurityIdentifier", "AuthorisedSid", "$owner", "Owner",
+                       "trustee", "Trustee")
+        for path in existing_runtime_ps1_files():
+            text = path.read_text(encoding="utf-8")
+            for number, line in non_comment_lines(text):
+                if not any(marker in line for marker in sid_markers):
+                    continue
+                for operator in pattern_operators:
+                    with self.subTest(runtime_file=path.name, line=number, operator=operator):
+                        self.assertNotIn(
+                            operator,
+                            line,
+                            "%s line %d compares a trustee identifier with %r: %s"
+                            % (path.name, number, operator, line.strip()),
+                        )
+
+    def test_the_bypass_name_constant_is_not_reachable_from_the_token_reader(self):
+        """EGRT-T69: a read failure can never be expressed as a synthesised privilege."""
+        bodies = self._function_bodies()
+        self.assertIn("Get-EgTokenPrivilegeNames", bodies)
+        self.assertNotIn(
+            "EgBypassPrivilegeNames",
+            bodies["Get-EgTokenPrivilegeNames"],
+            "the token reader must not consume the bypass-privilege names at all",
+        )
+        self.assertIn(
+            "EgBypassPrivilegeNames",
+            bodies["Test-EgBypassPrivilegePresent"],
+            "the predicate is the only consumer of the bypass-privilege names",
+        )
+        for literal in ("SeTakeOwnershipPrivilege", "SeRestorePrivilege"):
+            with self.subTest(literal=literal):
+                self.assertNotIn(
+                    literal,
+                    bodies["Get-EgTokenPrivilegeNames"],
+                    "no privilege name may be fabricated by the reader",
+                )
+
+    def test_no_security_identifier_literal_other_than_the_refused_placeholder(self):
+        """EGRT-T63, static half: no host principal is committed."""
+        for path in existing_runtime_ps1_files():
+            text = path.read_text(encoding="utf-8")
+            for match in re.finditer(r"S-1-(?:\d+-)+\d+", text):
+                with self.subTest(runtime_file=path.name, sid=match.group(0)):
+                    self.assertEqual(
+                        "S-1-3-0",
+                        match.group(0),
+                        "the only permitted identifier literal is the refused "
+                        "CREATOR OWNER placeholder",
+                    )
+
+    def test_the_authorised_set_has_exactly_one_route_into_the_runtime(self):
+        """DD-12: no default, no environment route, and no file the launcher reads it from."""
+        self.assertNotIn(
+            "AuthorisedLauncherRootWriteSid'",
+            self.library,
+            "the library takes the admitted set as a parameter, never by name lookup",
+        )
+        for path in existing_runtime_ps1_files():
+            text = path.read_text(encoding="utf-8")
+            for number, line in non_comment_lines(text):
+                if "AuthorisedLauncherRootWriteSid" not in line:
+                    continue
+                with self.subTest(runtime_file=path.name, line=number):
+                    self.assertNotIn("GetEnvironmentVariable", line)
+                    self.assertNotIn("= @(", line)
+                    self.assertNotIn("Get-Content", line)
+
+
+class WriteAuthorityTierB(WriteAuthorityMixin, TierBBase):
+    """Task 16, Tier B: the write checks on the Windows PowerShell 5.1 boundary.
+
+    The interop is compiled by that runtime here, so the here-string, its marshalling, and
+    the access check are all proven against the production compatibility boundary.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        TierBBase.setUpClass()
+        cls.exe = DESKTOP_PS
 
 
 if __name__ == "__main__":
