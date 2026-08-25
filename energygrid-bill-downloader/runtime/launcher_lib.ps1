@@ -72,6 +72,29 @@ if (-not ([System.Management.Automation.PSTypeName]'EgRuntime.NativePublication'
     Add-Type -TypeDefinition $script:EgNativePublicationInteropSource
 }
 
+# --------------------------------------------------------------------------------------
+# Launcher-root entry classes (design section 6.7)
+# --------------------------------------------------------------------------------------
+# Every entry in the launcher root belongs to exactly one of three classes, and the
+# classification is deterministic:
+#
+#   Class A  the three deployed package members, at fixed names. The set is EXACT.
+#   Class B  recognised installer-owned transaction residue, recognised ONLY by the exact
+#            reserved-name contract below. A generic *.bak or *.tmp rule is explicitly NOT
+#            sufficient and is never used: it would wave through any file dropped into the
+#            launcher root, which is the opposite of the intent.
+#   Class C  everything else. Fails closed. The rule is never relaxed to "ignore extras".
+#
+# Security boundary: package-member paths are produced ONLY by joining the launcher root
+# with a fixed Class A name. The root is enumerated to CLASSIFY, never to FIND a script or
+# library, and recognised residue is never dot-sourced, invoked, imported, or selected as
+# a fallback, and can never satisfy a missing Class A member.
+$script:EgDeployedPackageMemberNames = @('launcher.ps1', 'launcher_lib.ps1', 'installation_manifest.json')
+$script:EgResidueKinds = @('staging', 'backup', 'rollback')
+$script:EgResiduePrefix = '.eglauncher-'
+$script:EgResidueFieldDelimiter = '--'
+$script:EgCanonicalGuidPattern = '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+
 function Get-EgLauncherLibraryContract {
     # The library's own bounded self-description. Pure; no side effect.
     [CmdletBinding()]
@@ -79,7 +102,182 @@ function Get-EgLauncherLibraryContract {
 
     [pscustomobject]@{
         SchemaVersion       = 'eg_launcher_lib/v1'
-        DeployedMemberNames = @('launcher.ps1', 'launcher_lib.ps1', 'installation_manifest.json')
+        DeployedMemberNames = @($script:EgDeployedPackageMemberNames)
+    }
+}
+
+function Get-EgDeployedPackageMemberNames {
+    # The exact three fixed Class A names, enumerated explicitly and NEVER derived from a
+    # directory listing, so a file added to the runtime directory later cannot become
+    # deployable by accident (design section 6.2, asserted by EGRT-T47).
+    [CmdletBinding()]
+    param()
+
+    @($script:EgDeployedPackageMemberNames)
+}
+
+function Get-EgResidueKinds {
+    # The fixed residue-kind vocabulary.
+    [CmdletBinding()]
+    param()
+
+    @($script:EgResidueKinds)
+}
+
+function Test-EgResidueName {
+    # Parse a launcher-root entry name against the exact reserved residue contract:
+    #
+    #   .eglauncher-<kind>--<member>--<operation-id>
+    #
+    # ALL of the following must hold, and any single failure means the name is not
+    # residue: the reserved prefix is present; the remainder splits on the two-hyphen
+    # delimiter into EXACTLY three fields; the kind is one of the fixed vocabulary; the
+    # member is one of the three Class A fixed names; and the operation identifier is a
+    # canonical LOWERCASE GUID. Package member names contain a dot but never the two-hyphen
+    # delimiter, so the split is unambiguous.
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Name)
+
+    $notResidue = [pscustomobject]@{
+        IsResidue   = $false
+        Kind        = ''
+        Member      = ''
+        OperationId = ''
+    }
+
+    if ([string]::IsNullOrEmpty($Name)) {
+        return $notResidue
+    }
+    if (-not $Name.StartsWith($script:EgResiduePrefix, [System.StringComparison]::Ordinal)) {
+        return $notResidue
+    }
+
+    $remainder = $Name.Substring($script:EgResiduePrefix.Length)
+    $fields = @($remainder -split $script:EgResidueFieldDelimiter)
+    if ($fields.Count -ne 3) {
+        return $notResidue
+    }
+
+    $kind = $fields[0]
+    $member = $fields[1]
+    $operationId = $fields[2]
+
+    $kindRecognised = $false
+    foreach ($candidate in $script:EgResidueKinds) {
+        if ($candidate -ceq $kind) { $kindRecognised = $true }
+    }
+    if (-not $kindRecognised) {
+        return $notResidue
+    }
+
+    $memberRecognised = $false
+    foreach ($candidate in $script:EgDeployedPackageMemberNames) {
+        if ($candidate -ceq $member) { $memberRecognised = $true }
+    }
+    if (-not $memberRecognised) {
+        return $notResidue
+    }
+
+    if ($operationId -cnotmatch $script:EgCanonicalGuidPattern) {
+        return $notResidue
+    }
+
+    [pscustomobject]@{
+        IsResidue   = $true
+        Kind        = $kind
+        Member      = $member
+        OperationId = $operationId
+    }
+}
+
+function New-EgResidueName {
+    # The installer's ONLY sanctioned residue-name source. The name carries no private
+    # path, host name, principal, or other private value: the member names are public, the
+    # kinds are a fixed vocabulary, and the operation identifier is random. It also cannot
+    # be executed by accident, because it begins with a dot and ends in no executable
+    # extension.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][ValidateSet('staging', 'backup', 'rollback')][string]$Kind,
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Member,
+        [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')][string]$OperationId
+    )
+
+    $memberRecognised = $false
+    foreach ($candidate in $script:EgDeployedPackageMemberNames) {
+        if ($candidate -ceq $Member) { $memberRecognised = $true }
+    }
+    if (-not $memberRecognised) {
+        throw 'a residue name may only be constructed for a deployed package member'
+    }
+
+    return ($script:EgResiduePrefix + $Kind + $script:EgResidueFieldDelimiter + $Member +
+        $script:EgResidueFieldDelimiter + $OperationId)
+}
+
+function Get-EgLauncherRootClassification {
+    # Classify every entry in the launcher root. Enumeration is for CLASSIFICATION ONLY:
+    # this function never returns a path to be dot-sourced, invoked, or imported, and
+    # never selects a substitute for a package member.
+    #
+    # A Class A name is satisfied only by a FILE, so a directory cannot impersonate a
+    # package member: it is reported both as Class C and as a missing member.
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$LauncherRootPath)
+
+    $classA = @()
+    $classB = @()
+    $classC = @()
+
+    if (Test-Path -LiteralPath $LauncherRootPath -PathType Container) {
+        $entries = @(Get-ChildItem -LiteralPath $LauncherRootPath -Force)
+        foreach ($entry in $entries) {
+            $isFile = (-not $entry.PSIsContainer)
+            $isMember = $false
+            if ($isFile) {
+                foreach ($candidate in $script:EgDeployedPackageMemberNames) {
+                    if ($candidate -ceq $entry.Name) { $isMember = $true }
+                }
+            }
+            if ($isMember) {
+                $classA = $classA + $entry.Name
+                continue
+            }
+            $residue = Test-EgResidueName -Name $entry.Name
+            if ($isFile -and $residue.IsResidue) {
+                $classB = $classB + $entry.Name
+                continue
+            }
+            $classC = $classC + $entry.Name
+        }
+    }
+
+    $missingMembers = @()
+    foreach ($candidate in $script:EgDeployedPackageMemberNames) {
+        $present = $false
+        foreach ($found in $classA) {
+            if ($found -ceq $candidate) { $present = $true }
+        }
+        if (-not $present) {
+            $missingMembers = $missingMembers + $candidate
+        }
+    }
+
+    $supportRef = ''
+    if (@($classC).Count -gt 0) {
+        $supportRef = 'EG_LAUNCHER_ROOT_UNEXPECTED_ENTRY'
+    }
+    elseif (@($missingMembers).Count -gt 0) {
+        $supportRef = 'EG_LAUNCHER_PACKAGE_MEMBER_MISSING'
+    }
+
+    [pscustomobject]@{
+        ClassA         = [string[]]@($classA)
+        ClassB         = [string[]]@($classB)
+        ClassC         = [string[]]@($classC)
+        MissingMembers = [string[]]@($missingMembers)
+        Pass           = ((@($classC).Count -eq 0) -and (@($missingMembers).Count -eq 0))
+        SupportRef     = $supportRef
     }
 }
 

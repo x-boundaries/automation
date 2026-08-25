@@ -517,6 +517,50 @@ switch ($Op) {
             sourceStillThere = (Test-Path -LiteralPath $source -PathType Leaf)
         } | ConvertTo-Json -Depth 8 -Compress
     }
+    'classify' {
+        # Build a scratch launcher root from the caller's entry manifest, then classify it.
+        # -Json is the PATH to a JSON file carrying { files: [...], dirs: [...] }.
+        $spec = Get-Content -LiteralPath $Json -Raw | ConvertFrom-Json
+        $utf8 = New-Object System.Text.UTF8Encoding($false)
+        foreach ($fileName in @($spec.files)) {
+            [System.IO.File]::WriteAllText((Join-Path $Dir $fileName), ('# ' + $fileName), $utf8)
+        }
+        foreach ($dirName in @($spec.dirs)) {
+            [void](New-Item -ItemType Directory -Path (Join-Path $Dir $dirName))
+        }
+
+        $classification = Get-EgLauncherRootClassification -LauncherRootPath $Dir
+        [ordered]@{
+            classA         = @($classification.ClassA)
+            classB         = @($classification.ClassB)
+            classC         = @($classification.ClassC)
+            missingMembers = @($classification.MissingMembers)
+            pass           = $classification.Pass
+            supportRef     = $classification.SupportRef
+            memberNames    = @(Get-EgDeployedPackageMemberNames)
+        } | ConvertTo-Json -Depth 8 -Compress
+    }
+    'residuename' {
+        # Parse and construct reserved residue names. -Json is the PATH to a JSON file
+        # carrying { names: [...] }.
+        $spec = Get-Content -LiteralPath $Json -Raw | ConvertFrom-Json
+        $parsed = @()
+        foreach ($name in @($spec.names)) {
+            $verdict = Test-EgResidueName -Name $name
+            $parsed = $parsed + ([ordered]@{
+                name        = $name
+                isResidue   = $verdict.IsResidue
+                kind        = $verdict.Kind
+                member      = $verdict.Member
+                operationId = $verdict.OperationId
+            })
+        }
+        [ordered]@{
+            parsed      = @($parsed)
+            constructed = (New-EgResidueName -Kind 'backup' -Member 'launcher.ps1' -OperationId $Value)
+            kinds       = @(Get-EgResidueKinds)
+        } | ConvertTo-Json -Depth 8 -Compress
+    }
     default {
         throw ('unknown probe operation: ' + $Op)
     }
@@ -545,6 +589,17 @@ def probe(exe, op, tmp, **kwargs):
     args = ["-Lib", str(LIB), "-Op", op]
     args.extend(_named_args(kwargs))
     return run_ps(exe, script, *args)
+
+
+def write_json(tmp, name, payload):
+    """Write a JSON payload to a scratch file and return its path.
+
+    Complex probe inputs travel as a FILE path rather than as a command-line argument, so
+    no test depends on how a shell happens to quote embedded double quotes.
+    """
+    path = Path(tmp) / name
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
 
 
 def probe_json(exe, op, tmp, **kwargs):
@@ -1736,6 +1791,222 @@ class NullBackupArgumentStaticGuard(TierCBase):
             result["provenNames"],
             "-BackupPath must be declared [Parameter(Mandatory)][ValidateNotNullOrEmpty()]",
         )
+
+
+CLASS_A_MEMBER_NAMES = ("launcher.ps1", "launcher_lib.ps1", "installation_manifest.json")
+RESIDUE_PREFIX = ".eglauncher-"
+RESIDUE_KINDS = ("staging", "backup", "rollback")
+SAMPLE_OPERATION_ID = "3f2504e0-4f89-11d3-9a0c-0305e82c3301"
+
+
+def residue_name(kind, member, operation_id=SAMPLE_OPERATION_ID):
+    """Compose a reserved Class B residue name from its three fields."""
+    return "%s%s--%s--%s" % (RESIDUE_PREFIX, kind, member, operation_id)
+
+
+def classify_probe(exe, files=(), dirs=(), include_package=True):
+    """Classify a scratch launcher root built from the given entries."""
+    entries = list(CLASS_A_MEMBER_NAMES) if include_package else []
+    entries.extend(files)
+    with TemporaryScratch() as tmp:
+        root = tmp / "launcher_root"
+        root.mkdir()
+        spec = write_json(tmp, "classify_spec.json", {"files": entries, "dirs": list(dirs)})
+        return probe_json(exe, "classify", tmp, dir=root, json=spec)
+
+
+class LauncherRootClassification(TierABase):
+    """Task 8: design section 6.7, deterministic Class A, B, and C classification.
+
+    Read as "every file in the launcher root must be a manifest member", the integrity
+    rule would turn a valid installed package whose backup cleanup failed into an outage.
+    The resolution is not to tolerate extra files: it is to classify them.
+    """
+
+    def test_the_class_a_member_set_is_exactly_the_three_fixed_names(self):
+        """The set is exact, enumerated explicitly, never derived from a directory listing."""
+        observed = classify_probe(ANY_PS)
+        self.assertEqual(list(CLASS_A_MEMBER_NAMES), observed["memberNames"])
+
+    def test_valid_package_plus_a_named_backup_residue_classifies_and_passes(self):
+        """EGRT-T51: a correctly named retained preimage backup is recognised residue."""
+        backup = residue_name("backup", "launcher.ps1")
+        observed = classify_probe(ANY_PS, files=[backup])
+        self.assertTrue(observed["pass"], observed["supportRef"])
+        self.assertEqual("", observed["supportRef"])
+        self.assertEqual([backup], observed["classB"])
+        self.assertEqual([], observed["classC"])
+        self.assertEqual([], observed["missingMembers"])
+        self.assertEqual(sorted(CLASS_A_MEMBER_NAMES), sorted(observed["classA"]))
+
+    def test_valid_package_plus_staging_or_rollback_residue_passes_and_never_substitutes(self):
+        """EGRT-T52: staging and rollback residue classify Class B and never join Class A."""
+        for kind in ("staging", "rollback"):
+            for member in CLASS_A_MEMBER_NAMES:
+                name = residue_name(kind, member)
+                with self.subTest(kind=kind, member=member):
+                    observed = classify_probe(ANY_PS, files=[name])
+                    self.assertTrue(observed["pass"], observed["supportRef"])
+                    self.assertEqual([name], observed["classB"])
+                    self.assertEqual([], observed["classC"])
+                    self.assertEqual(
+                        sorted(CLASS_A_MEMBER_NAMES),
+                        sorted(observed["classA"]),
+                        "residue must never appear in Class A",
+                    )
+                    self.assertNotIn(name, observed["classA"])
+
+    def test_an_arbitrary_extra_ps1_fails_closed(self):
+        """EGRT-T53: another .ps1 in the launcher root is Class C, whatever it is called."""
+        for extra in ("launcher-old.ps1", "launcher_lib_copy.ps1", "anything.ps1"):
+            with self.subTest(extra=extra):
+                observed = classify_probe(ANY_PS, files=[extra])
+                self.assertFalse(observed["pass"])
+                self.assertEqual([extra], observed["classC"])
+                self.assertEqual(
+                    "EG_LAUNCHER_ROOT_UNEXPECTED_ENTRY", observed["supportRef"]
+                )
+
+    def test_generic_bak_or_tmp_entries_fail_closed(self):
+        """EGRT-T54: a generic extension rule is explicitly NOT sufficient and is not used."""
+        for extra in ("launcher.ps1.bak", "staging.tmp", "launcher_lib.ps1.old"):
+            with self.subTest(extra=extra):
+                observed = classify_probe(ANY_PS, files=[extra])
+                self.assertFalse(observed["pass"])
+                self.assertEqual([extra], observed["classC"])
+                self.assertEqual(
+                    "EG_LAUNCHER_ROOT_UNEXPECTED_ENTRY", observed["supportRef"]
+                )
+
+    def test_each_residue_name_malformation_fails_closed_independently(self):
+        """EGRT-T55: one malformation per case, each asserted alone."""
+        malformations = {
+            "wrong_prefix": ".eg-launcher-backup--launcher.ps1--" + SAMPLE_OPERATION_ID,
+            "wrong_field_count_short": RESIDUE_PREFIX + "backup--launcher.ps1",
+            "wrong_field_count_long": residue_name("backup", "launcher.ps1") + "--extra",
+            "unknown_kind": residue_name("archive", "launcher.ps1"),
+            "unrecognised_member": residue_name("backup", "notamember.ps1"),
+            "uppercase_guid": residue_name(
+                "backup", "launcher.ps1", SAMPLE_OPERATION_ID.upper()
+            ),
+            "braced_guid": residue_name(
+                "backup", "launcher.ps1", "{%s}" % SAMPLE_OPERATION_ID
+            ),
+            "truncated_guid": residue_name("backup", "launcher.ps1", "3f2504e0-4f89"),
+        }
+        for label, name in malformations.items():
+            with self.subTest(malformation=label):
+                observed = classify_probe(ANY_PS, files=[name])
+                self.assertFalse(
+                    observed["pass"], "%s must fail closed" % label
+                )
+                self.assertEqual(
+                    [name],
+                    observed["classC"],
+                    "%s is not residue; it is Class C" % label,
+                )
+                self.assertEqual(
+                    "EG_LAUNCHER_ROOT_UNEXPECTED_ENTRY", observed["supportRef"]
+                )
+
+    def test_an_unexpected_directory_fails_closed(self):
+        """EGRT-T53 support: the locked architecture requires no subdirectory."""
+        observed = classify_probe(ANY_PS, dirs=["unexpected_subdirectory"])
+        self.assertFalse(observed["pass"])
+        self.assertEqual(["unexpected_subdirectory"], observed["classC"])
+        self.assertEqual("EG_LAUNCHER_ROOT_UNEXPECTED_ENTRY", observed["supportRef"])
+
+    def test_a_directory_named_like_a_package_member_is_not_a_package_member(self):
+        """A Class A name is satisfied only by a FILE, so a directory cannot impersonate one."""
+        with TemporaryScratch() as tmp:
+            root = tmp / "launcher_root"
+            root.mkdir()
+            spec = write_json(
+                tmp,
+                "classify_spec.json",
+                {
+                    "files": ["launcher_lib.ps1", "installation_manifest.json"],
+                    "dirs": ["launcher.ps1"],
+                },
+            )
+            observed = probe_json(ANY_PS, "classify", tmp, dir=root, json=spec)
+        self.assertFalse(observed["pass"])
+        self.assertIn("launcher.ps1", observed["classC"])
+        self.assertIn("launcher.ps1", observed["missingMembers"])
+
+    def test_a_missing_package_member_fails_closed(self):
+        """EGRT-T56 support: a missing Class A member is terminal."""
+        with TemporaryScratch() as tmp:
+            root = tmp / "launcher_root"
+            root.mkdir()
+            spec = write_json(
+                tmp,
+                "classify_spec.json",
+                {"files": ["launcher.ps1", "launcher_lib.ps1"], "dirs": []},
+            )
+            observed = probe_json(ANY_PS, "classify", tmp, dir=root, json=spec)
+        self.assertFalse(observed["pass"])
+        self.assertEqual(["installation_manifest.json"], observed["missingMembers"])
+        self.assertEqual([], observed["classC"])
+        self.assertEqual("EG_LAUNCHER_PACKAGE_MEMBER_MISSING", observed["supportRef"])
+
+    def test_class_c_takes_precedence_in_the_reported_support_reference(self):
+        """An unexpected entry is reported even when a member is also missing."""
+        with TemporaryScratch() as tmp:
+            root = tmp / "launcher_root"
+            root.mkdir()
+            spec = write_json(
+                tmp,
+                "classify_spec.json",
+                {"files": ["launcher.ps1", "intruder.ps1"], "dirs": []},
+            )
+            observed = probe_json(ANY_PS, "classify", tmp, dir=root, json=spec)
+        self.assertFalse(observed["pass"])
+        self.assertEqual("EG_LAUNCHER_ROOT_UNEXPECTED_ENTRY", observed["supportRef"])
+        self.assertEqual(["intruder.ps1"], observed["classC"])
+
+
+class ReservedResidueNameContract(TierABase):
+    """Task 8: the exact reserved-name parser, deliberately narrow."""
+
+    def _parse(self, names):
+        with TemporaryScratch() as tmp:
+            spec = write_json(tmp, "residue_spec.json", {"names": list(names)})
+            return probe_json(
+                ANY_PS, "residuename", tmp, json=spec, value=SAMPLE_OPERATION_ID
+            )
+
+    def test_a_valid_reserved_name_parses_into_its_three_fields(self):
+        """Package member names contain a dot but never the two-hyphen delimiter."""
+        names = [residue_name(kind, member)
+                 for kind in RESIDUE_KINDS for member in CLASS_A_MEMBER_NAMES]
+        observed = self._parse(names)
+        self.assertEqual(list(RESIDUE_KINDS), observed["kinds"])
+        for entry in observed["parsed"]:
+            with self.subTest(name=entry["name"]):
+                self.assertTrue(entry["isResidue"])
+                self.assertIn(entry["kind"], RESIDUE_KINDS)
+                self.assertIn(entry["member"], CLASS_A_MEMBER_NAMES)
+                self.assertEqual(SAMPLE_OPERATION_ID, entry["operationId"])
+
+    def test_the_constructor_is_the_only_sanctioned_residue_name_source(self):
+        """New-EgResidueName composes exactly what Test-EgResidueName accepts."""
+        observed = self._parse([])
+        self.assertEqual(
+            residue_name("backup", "launcher.ps1"), observed["constructed"]
+        )
+
+    def test_a_generic_extension_is_never_treated_as_residue(self):
+        """A *.bak or *.tmp rule would wave through any dropped file. It is not used."""
+        observed = self._parse(
+            ["launcher.ps1.bak", "launcher.ps1.tmp", "backup.bak", "", "launcher.ps1"]
+        )
+        for entry in observed["parsed"]:
+            with self.subTest(name=entry["name"]):
+                self.assertFalse(entry["isResidue"])
+                self.assertEqual("", entry["kind"])
+                self.assertEqual("", entry["member"])
+                self.assertEqual("", entry["operationId"])
 
 
 if __name__ == "__main__":
