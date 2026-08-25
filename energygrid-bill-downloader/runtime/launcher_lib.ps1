@@ -297,6 +297,145 @@ function Get-EgLauncherRootClassification {
 }
 
 # --------------------------------------------------------------------------------------
+# Exit bands (design section 5.3)
+# --------------------------------------------------------------------------------------
+# The application returns 0, 10, 20, or 64. The runtime layer's own failures therefore use
+# a DISJOINT band, so a launcher or installer failure can never be mistaken for an
+# application status. The disjointness is asserted by a test, not left to convention.
+$script:EgLauncherExitCodes = [ordered]@{
+    PreflightFailed           = 70
+    InstallPreMutationFailed  = 71
+    InstallRolledBack         = 72
+    InstallRollbackIncomplete = 73
+}
+
+# --------------------------------------------------------------------------------------
+# Deployable source set and transaction state (design sections 6.2 and 6.3)
+# --------------------------------------------------------------------------------------
+
+# The fixed recorded publication order (DD-10). The library is published BEFORE the entry
+# script that dot-sources it, so a mid-transaction crash leaves an old entry script with a
+# new library rather than a new entry script calling a missing library function. Rollback
+# therefore walks this order in reverse.
+$script:EgPublicationOrder = @('launcher_lib.ps1', 'launcher.ps1')
+
+function Get-EgPublicationOrder {
+    # The recorded publication order, which must be a permutation of the manifest member
+    # set. The two constants are cross-checked here so they cannot drift apart.
+    [CmdletBinding()]
+    param()
+
+    if (@($script:EgPublicationOrder).Count -ne @($script:EgManifestMemberNames).Count) {
+        throw 'the publication order must cover exactly the manifest member set'
+    }
+    foreach ($name in $script:EgPublicationOrder) {
+        $known = $false
+        foreach ($candidate in $script:EgManifestMemberNames) {
+            if ($candidate -ceq $name) { $known = $true }
+        }
+        if (-not $known) {
+            throw 'the publication order must cover exactly the manifest member set'
+        }
+    }
+    @($script:EgPublicationOrder)
+}
+
+function Get-EgDeployableSourceSet {
+    # The ordered deployable source set, ENUMERATED EXPLICITLY from the recorded
+    # publication order and never derived from a directory listing, so a file added to the
+    # runtime directory later cannot become deployable by accident (design section 6.2,
+    # asserted by EGRT-T47).
+    #
+    # The manifest is not in this set: it is generated during installation rather than
+    # copied from source, and it is published in Phase 3.
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$RuntimeSourceDirectory)
+
+    $ordered = @()
+    foreach ($name in (Get-EgPublicationOrder)) {
+        $ordered = $ordered + ([pscustomobject]@{
+            Name       = $name
+            SourcePath = (Join-Path $RuntimeSourceDirectory $name)
+        })
+    }
+    return $ordered
+}
+
+function Get-EgDestinationPreimage {
+    # Establish a destination's preimage state BEFORE anything is written. This
+    # classification selects the publish primitive and is what makes the two failure
+    # states of design section 7.2.1 decidable.
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$DestinationPath)
+
+    if (Test-Path -LiteralPath $DestinationPath -PathType Leaf) {
+        $item = Get-Item -LiteralPath $DestinationPath
+        return [pscustomobject]@{
+            PreimageState  = 'Existing'
+            PreimageSha256 = (Get-EgFileSha256 -Path $DestinationPath)
+            ByteLength     = [int64]$item.Length
+        }
+    }
+    return [pscustomobject]@{
+        PreimageState  = 'Absent'
+        PreimageSha256 = ''
+        ByteLength     = [int64](-1)
+    }
+}
+
+function New-EgTransactionState {
+    # The transaction record Phase 4 and rollback both depend on. Members are appended in
+    # publication order as they are prepared.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [ValidatePattern('^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')]
+        [string]$OperationId
+    )
+
+    [pscustomobject]@{
+        OperationId = $OperationId
+        Members     = @()
+    }
+}
+
+function New-EgTransactionMember {
+    # One member entry of the transaction record.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Name,
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$DestinationPath,
+        [Parameter(Mandatory)][ValidateSet('Existing', 'Absent')][string]$PreimageState,
+        [AllowEmptyString()][string]$PreimageSha256 = '',
+        [AllowEmptyString()][string]$StagingPath = '',
+        [AllowEmptyString()][string]$BackupPath = '',
+        [AllowEmptyString()][string]$SourceSha256 = ''
+    )
+
+    [pscustomobject]@{
+        Name                = $Name
+        DestinationPath     = $DestinationPath
+        PreimageState       = $PreimageState
+        PreimageSha256      = $PreimageSha256
+        StagingPath         = $StagingPath
+        BackupPath          = $BackupPath
+        SourceSha256        = $SourceSha256
+        PublicationOccurred = $false
+        BackupCreated       = $false
+    }
+}
+
+function New-EgOperationId {
+    # The installer transaction identifier used in the Class B operation-id field. One per
+    # installer invocation. -ValidateOnly generates none, because it creates no residue and
+    # must stay byte-deterministic (DD-09).
+    [CmdletBinding()]
+    param()
+
+    return ([guid]::NewGuid().ToString('D').ToLowerInvariant())
+}
+
+# --------------------------------------------------------------------------------------
 # Installation-integrity manifest (design section 6.4)
 # --------------------------------------------------------------------------------------
 # Git is canonical for the manifest's SHAPE and for the comparison rules: which fields
@@ -317,6 +456,49 @@ $script:EgManifestSchema = 'eg_launcher_installation_manifest/v1'
 $script:EgManifestMemberNames = @('launcher.ps1', 'launcher_lib.ps1')
 $script:EgSha256Pattern = '^[0-9a-f]{64}$'
 $script:EgCommitPattern = '^[0-9a-f]{40}$'
+
+function Test-EgPathIsWithin {
+    # Whether a candidate path resolves inside a container path. Comparison is on fully
+    # resolved paths with a trailing separator, so a sibling whose name merely starts with
+    # the container's name is not treated as being inside it.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$CandidatePath,
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$ContainerPath
+    )
+
+    $candidate = [System.IO.Path]::GetFullPath($CandidatePath).TrimEnd('\', '/')
+    $container = [System.IO.Path]::GetFullPath($ContainerPath).TrimEnd('\', '/')
+    if ([string]::Equals($candidate, $container, [System.StringComparison]::OrdinalIgnoreCase)) {
+        return $true
+    }
+    $prefix = $container + [System.IO.Path]::DirectorySeparatorChar
+    return $candidate.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)
+}
+
+function ConvertTo-EgValidationJson {
+    # The single deterministic validation output shape (design section 8). It carries no
+    # timestamp and no generated identifier, so two consecutive runs against unchanged
+    # state produce byte-identical standard output. support_ref is OMITTED on a pass.
+    #
+    # Nothing private reaches this surface: no path, no environment value, no credential
+    # value, no account identity, no security identifier, no trustee or owner name, and no
+    # Git output text.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Checks,
+        [Parameter(Mandatory)][ValidateSet('PASS', 'FAIL')][string]$Status,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$SupportRef
+    )
+
+    $payload = [ordered]@{}
+    $payload['checks'] = $Checks
+    $payload['status'] = $Status
+    if ($Status -cne 'PASS') {
+        $payload['support_ref'] = $SupportRef
+    }
+    return ($payload | ConvertTo-Json -Depth 8 -Compress)
+}
 
 function Write-EgUtf8NoBomText {
     # The single sanctioned text write. Set-Content and Add-Content are never used, because

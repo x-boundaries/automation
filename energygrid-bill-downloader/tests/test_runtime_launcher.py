@@ -977,6 +977,49 @@ foreach ($invocation in $invocations) {
 """
 
 
+FUNCTION_BODY_COMMAND_INSPECTOR = r"""
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory)][string]$Target,
+    [Parameter(Mandatory)][string]$FunctionName,
+    [Parameter(Mandatory)][string]$ForbiddenCommand
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+$errors = $null
+$tokens = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($Target, [ref]$tokens, [ref]$errors)
+$parseErrors = 0
+if ($null -ne $errors) { $parseErrors = @($errors).Count }
+
+$functions = @($ast.FindAll(
+    { param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true))
+
+$found = $false
+$forbiddenCount = 0
+foreach ($function in $functions) {
+    if ($function.Name -ne $FunctionName) { continue }
+    $found = $true
+    $commands = @($function.Body.FindAll(
+        { param($node) $node -is [System.Management.Automation.Language.CommandAst] }, $true))
+    foreach ($command in $commands) {
+        $name = $command.GetCommandName()
+        if ($null -ne $name) {
+            if ($name -ieq $ForbiddenCommand) { $forbiddenCount++ }
+        }
+    }
+}
+
+[ordered]@{
+    parseErrors     = $parseErrors
+    functionFound   = $found
+    forbiddenCount  = $forbiddenCount
+} | ConvertTo-Json -Depth 4 -Compress
+"""
+
+
 def run_inspector(exe, tmp, source, **kwargs):
     """Write an inspector script into a scratch directory, run it, and parse its JSON."""
     script = Path(tmp) / "eg_inspector.ps1"
@@ -2329,6 +2372,341 @@ class InstallationManifestConstruction(TierABase):
         self.assertFalse(observed["shapePass"])
         self.assertEqual(
             "EG_LAUNCHER_MANIFEST_MISMATCH", observed["shapeSupportRef"]
+        )
+
+
+EXIT_INSTALL_PRE_MUTATION_FAILED = 71
+EXIT_INSTALL_ROLLED_BACK = 72
+EXIT_INSTALL_ROLLBACK_INCOMPLETE = 73
+
+SCRATCH_LAUNCHER_SOURCE = (
+    "# scratch launcher entry script for the installer transaction tests\r\n"
+    "[CmdletBinding()]\r\n"
+    "param()\r\n"
+    "Set-StrictMode -Version Latest\r\n"
+    "exit 0\r\n"
+)
+SCRATCH_LIB_SOURCE = (
+    "# scratch launcher library for the installer transaction tests\r\n"
+    "Set-StrictMode -Version Latest\r\n"
+    "function Get-EgScratchMarker { 'scratch' }\r\n"
+)
+
+# Files that share the runtime directory but are NEVER deployed to the launcher root
+# (design section 6.2). Sharing the directory does not make a file deployable.
+NEVER_DEPLOYED_NAMES = (
+    "install_or_update_launcher.ps1",
+    "launcher.settings.example.json",
+    "README.md",
+)
+
+
+def build_scratch_checkout(tmp, launcher_text=SCRATCH_LAUNCHER_SOURCE,
+                           lib_text=SCRATCH_LIB_SOURCE, extra_runtime_files=True):
+    """Create a scratch Git checkout carrying runtime source. Returns (root, head_commit)."""
+    root = init_scratch_repo(tmp / "checkout")
+    runtime = root / "energygrid-bill-downloader" / "runtime"
+    runtime.mkdir(parents=True)
+    (runtime / "launcher.ps1").write_text(launcher_text, encoding="utf-8", newline="")
+    (runtime / "launcher_lib.ps1").write_text(lib_text, encoding="utf-8", newline="")
+    if extra_runtime_files:
+        # Present in the runtime directory on purpose: EGRT-T47 requires that none of
+        # these reaches the launcher root.
+        (runtime / "install_or_update_launcher.ps1").write_text(
+            "# scratch installer, never deployed\r\n", encoding="utf-8", newline=""
+        )
+        (runtime / "launcher.settings.example.json").write_text(
+            '{"config_path": "REPLACE_WITH_PRIVATE_CONFIG_JSON_PATH"}\r\n',
+            encoding="utf-8", newline="",
+        )
+        (runtime / "README.md").write_text(
+            "# scratch runtime readme, never deployed\r\n", encoding="utf-8", newline=""
+        )
+    run_git(root, "add", "-A")
+    run_git(root, "commit", "-m", "scratch runtime source")
+    head = run_git(root, "rev-parse", "HEAD").stdout.strip()
+    return root, head
+
+
+def run_installer(exe, checkout, launcher_root, commit, *extra):
+    """Invoke the committed installer entry script against scratch paths."""
+    return run_ps(
+        exe,
+        INSTALLER,
+        "-CheckoutRoot", str(checkout),
+        "-LauncherRoot", str(launcher_root),
+        "-AdmissionCommit", str(commit),
+        *extra,
+    )
+
+
+def installer_status(completed):
+    """Parse the installer's bounded real-path JSON from standard output."""
+    text = completed.stdout.strip()
+    if not text:
+        raise AssertionError(
+            "the installer emitted no status\nstdout:\n%s\nstderr:\n%s"
+            % (completed.stdout, completed.stderr)
+        )
+    return json.loads(text.splitlines()[-1])
+
+
+def launcher_root_entries(root):
+    """Every entry name in a scratch launcher root."""
+    return sorted(entry.name for entry in Path(root).iterdir())
+
+
+def class_b_entries(root, kind=None):
+    """Recognised residue names in a scratch launcher root, optionally filtered by kind."""
+    prefix = RESIDUE_PREFIX if kind is None else "%s%s--" % (RESIDUE_PREFIX, kind)
+    return sorted(
+        name for name in launcher_root_entries(root) if name.startswith(prefix)
+    )
+
+
+class InstallerTransactionMixin:
+    """Design sections 6.1, 6.2, and 6.3: the four-phase package transaction."""
+
+    exe = None
+
+    def test_clean_first_install_publishes_all_three_members_through_the_absent_path(self):
+        """EGRT-T41: the bare-root case, end to end.
+
+        On a clean host the launcher root contains no launcher.ps1, no launcher_lib.ps1,
+        and no manifest, so all three members classify as Absent in Phase 1 and publish
+        through the publish-to-absent path. Not every install uses File.Replace.
+        """
+        with TemporaryScratch() as tmp:
+            checkout, commit = build_scratch_checkout(tmp)
+            root = tmp / "launcher_root"
+            root.mkdir()
+            completed = run_installer(self.exe, checkout, root, commit)
+            self.assertEqual(
+                0, completed.returncode,
+                "installer failed\nstdout:\n%s\nstderr:\n%s"
+                % (completed.stdout, completed.stderr),
+            )
+            status = installer_status(completed)
+            self.assertEqual("INSTALLED", status["status"])
+            self.assertEqual("", status["support_ref"])
+
+            entries = launcher_root_entries(root)
+            self.assertEqual(sorted(CLASS_A_MEMBER_NAMES), entries)
+            self.assertEqual(
+                [],
+                class_b_entries(root, "backup"),
+                "a clean install creates no preimage backup, because File.Replace was "
+                "never called against a missing destination",
+            )
+            self.assertEqual([], class_b_entries(root, "staging"))
+
+            self.assertEqual(
+                SCRATCH_LAUNCHER_SOURCE,
+                (root / "launcher.ps1").read_text(encoding="utf-8", newline=""),
+            )
+            self.assertEqual(
+                SCRATCH_LIB_SOURCE,
+                (root / "launcher_lib.ps1").read_text(encoding="utf-8", newline=""),
+            )
+
+            manifest = json.loads(
+                (root / MANIFEST_FILE_NAME).read_text(encoding="utf-8")
+            )
+            self.assertEqual(MANIFEST_SCHEMA, manifest["schema_version"])
+            self.assertEqual(commit, manifest["admission_commit"])
+            self.assertEqual(
+                list(MANIFEST_MEMBER_NAMES),
+                sorted(entry["name"] for entry in manifest["members"]),
+            )
+            for entry in manifest["members"]:
+                installed = root / entry["name"]
+                self.assertEqual(sha256_of(installed), entry["sha256"])
+                self.assertEqual(installed.stat().st_size, entry["byte_length"])
+
+
+class InstallerTransactionTierA(InstallerTransactionMixin, TierABase):
+    """Task 10, Tier A."""
+
+    @classmethod
+    def setUpClass(cls):
+        TierABase.setUpClass()
+        cls.exe = ANY_PS
+
+    def test_second_install_against_a_current_destination_reports_already_current(self):
+        """EGRT-T16: installation is idempotent by HASH, not by timestamp."""
+        with TemporaryScratch() as tmp:
+            checkout, commit = build_scratch_checkout(tmp)
+            root = tmp / "launcher_root"
+            root.mkdir()
+            first = run_installer(ANY_PS, checkout, root, commit)
+            self.assertEqual(0, first.returncode, first.stderr)
+            self.assertEqual("INSTALLED", installer_status(first)["status"])
+
+            before = {
+                name: (
+                    (root / name).stat().st_mtime_ns,
+                    sha256_of(root / name),
+                )
+                for name in launcher_root_entries(root)
+            }
+
+            second = run_installer(ANY_PS, checkout, root, commit)
+            self.assertEqual(0, second.returncode, second.stderr)
+            status = installer_status(second)
+            self.assertEqual("ALREADY_CURRENT", status["status"])
+            self.assertEqual("", status["support_ref"])
+
+            after = {
+                name: (
+                    (root / name).stat().st_mtime_ns,
+                    sha256_of(root / name),
+                )
+                for name in launcher_root_entries(root)
+            }
+            self.assertEqual(
+                before, after,
+                "ALREADY_CURRENT must mutate nothing at all, including modification times",
+            )
+
+    def test_only_the_enumerated_deployed_set_reaches_the_launcher_root(self):
+        """EGRT-T47: sharing the runtime directory does not make a file deployable."""
+        with TemporaryScratch() as tmp:
+            checkout, commit = build_scratch_checkout(tmp)
+            root = tmp / "launcher_root"
+            root.mkdir()
+            completed = run_installer(ANY_PS, checkout, root, commit)
+            self.assertEqual(0, completed.returncode, completed.stderr)
+            entries = launcher_root_entries(root)
+        for name in NEVER_DEPLOYED_NAMES:
+            with self.subTest(never_deployed=name):
+                self.assertNotIn(name, entries)
+        self.assertEqual(sorted(CLASS_A_MEMBER_NAMES), entries)
+
+    def test_installed_bytes_and_manifest_are_mutually_consistent_after_commit(self):
+        """EGRT-T46: no extra or missing member, and hashes agree in both directions."""
+        with TemporaryScratch() as tmp:
+            checkout, commit = build_scratch_checkout(tmp)
+            root = tmp / "launcher_root"
+            root.mkdir()
+            completed = run_installer(ANY_PS, checkout, root, commit)
+            self.assertEqual(0, completed.returncode, completed.stderr)
+            manifest = json.loads(
+                (root / MANIFEST_FILE_NAME).read_text(encoding="utf-8")
+            )
+            described = {entry["name"]: entry for entry in manifest["members"]}
+            installed = {
+                name for name in launcher_root_entries(root)
+                if name in MANIFEST_MEMBER_NAMES
+            }
+            self.assertEqual(set(described), installed)
+            for name, entry in described.items():
+                self.assertEqual(sha256_of(root / name), entry["sha256"])
+
+    def test_existing_member_backups_survive_every_per_file_verification(self):
+        """EGRT-T45: a retained preimage backup exists for every Existing member.
+
+        Proven at a point BEFORE Phase 4 acceptance by holding the manifest destination
+        with an exclusive share from another process, which fails Phase 3. The executable
+        members have advanced and their backups must still be on disk, because authority
+        to reap belongs to the Phase 4 commit step and to nothing else.
+        """
+        with TemporaryScratch() as tmp:
+            checkout, commit = build_scratch_checkout(tmp)
+            root = tmp / "launcher_root"
+            root.mkdir()
+            first = run_installer(ANY_PS, checkout, root, commit)
+            self.assertEqual(0, first.returncode, first.stderr)
+
+            # A second, DIFFERENT source revision, so both executables actually publish.
+            runtime = checkout / "energygrid-bill-downloader" / "runtime"
+            (runtime / "launcher.ps1").write_text(
+                SCRATCH_LAUNCHER_SOURCE + "# revised\r\n", encoding="utf-8", newline=""
+            )
+            (runtime / "launcher_lib.ps1").write_text(
+                SCRATCH_LIB_SOURCE + "# revised\r\n", encoding="utf-8", newline=""
+            )
+            run_git(checkout, "add", "-A")
+            run_git(checkout, "commit", "-m", "revised runtime source")
+            revised = run_git(checkout, "rev-parse", "HEAD").stdout.strip()
+
+            with ExclusiveLockHolder(ANY_PS, tmp, root / MANIFEST_FILE_NAME):
+                completed = run_installer(ANY_PS, checkout, root, revised)
+
+            self.assertNotEqual(
+                0, completed.returncode,
+                "a Phase 3 manifest failure must not be reported as success",
+            )
+            backups = class_b_entries(root, "backup")
+            for member in MANIFEST_MEMBER_NAMES:
+                with self.subTest(member=member):
+                    self.assertTrue(
+                        any(("--%s--" % member) in name for name in backups),
+                        "no retained backup for %s; backups present: %r"
+                        % (member, backups),
+                    )
+
+    def test_an_admission_commit_that_is_not_the_checkout_head_is_refused(self):
+        """-AdmissionCommit is the operator-controlled admission lane and is verified."""
+        with TemporaryScratch() as tmp:
+            checkout, _commit = build_scratch_checkout(tmp)
+            root = tmp / "launcher_root"
+            root.mkdir()
+            completed = run_installer(ANY_PS, checkout, root, "0" * 40)
+            self.assertEqual(EXIT_INSTALL_PRE_MUTATION_FAILED, completed.returncode)
+            status = installer_status(completed)
+            self.assertEqual("FAILED_PREFLIGHT", status["status"])
+            self.assertEqual(
+                "EG_LAUNCHER_INSTALL_ADMISSION_INVALID", status["support_ref"]
+            )
+            self.assertEqual(
+                [], launcher_root_entries(root),
+                "a Phase 1 failure leaves ZERO destination mutation",
+            )
+
+    def test_a_malformed_admission_commit_is_refused_by_the_parameter_contract(self):
+        """The admission commit is mandatory and must be forty lowercase hex characters."""
+        with TemporaryScratch() as tmp:
+            checkout, _commit = build_scratch_checkout(tmp)
+            root = tmp / "launcher_root"
+            root.mkdir()
+            completed = run_installer(ANY_PS, checkout, root, "not-a-commit")
+            self.assertNotEqual(0, completed.returncode)
+            self.assertEqual([], launcher_root_entries(root))
+
+
+class InstallerTransactionTierB(InstallerTransactionMixin, TierBBase):
+    """Task 10, Tier B: the clean first install on the Windows PowerShell 5.1 boundary."""
+
+    @classmethod
+    def setUpClass(cls):
+        TierBBase.setUpClass()
+        cls.exe = DESKTOP_PS
+
+
+class DeployableSourceSetStaticGuard(TierCBase):
+    """Task 10, Tier C: EGRT-T47's static half."""
+
+    def test_the_deployable_set_is_not_derived_from_a_directory_listing(self):
+        """The set is enumerated explicitly, so a file added later cannot become deployable."""
+        if ANY_PS is None:
+            self.skipTest("no PowerShell host found (pwsh or powershell)")
+        with TemporaryScratch() as tmp:
+            result = run_inspector(
+                ANY_PS,
+                tmp,
+                FUNCTION_BODY_COMMAND_INSPECTOR,
+                target=LIB,
+                functionName="Get-EgDeployableSourceSet",
+                forbiddenCommand="Get-ChildItem",
+            )
+        self.assertEqual(0, result["parseErrors"])
+        self.assertTrue(
+            result["functionFound"], "Get-EgDeployableSourceSet must exist in the library"
+        )
+        self.assertEqual(
+            0,
+            result["forbiddenCount"],
+            "Get-EgDeployableSourceSet must not enumerate the runtime directory",
         )
 
 
