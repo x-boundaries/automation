@@ -220,6 +220,18 @@ $ErrorActionPreference = 'Stop'
 
 . $Lib
 
+function Test-ProbeVariablePresent([string]$Name) {
+    # Presence is read through BOTH the framework getter and the environment provider. A
+    # variable left present with an EMPTY value reads back as $null through the getter
+    # while still occupying the process environment block a child process inherits, and an
+    # empty GIT_DIR is not the same thing as an absent one: it breaks every subsequent Git
+    # invocation. Reading only the getter would let that state pass unnoticed.
+    if ($null -ne [System.Environment]::GetEnvironmentVariable($Name, 'Process')) {
+        return $true
+    }
+    return (Test-Path -LiteralPath ('Env:\' + $Name))
+}
+
 switch ($Op) {
     'contract' {
         Get-EgLauncherLibraryContract | ConvertTo-Json -Depth 8 -Compress
@@ -267,7 +279,7 @@ switch ($Op) {
         foreach ($name in $names) {
             $observed = [System.Environment]::GetEnvironmentVariable($name, 'Process')
             $before[$name] = [ordered]@{
-                present = ($null -ne $observed)
+                present = (Test-ProbeVariablePresent -Name $name)
                 value   = ([string]$observed)
             }
         }
@@ -278,7 +290,7 @@ switch ($Op) {
         foreach ($name in $names) {
             $observed = [System.Environment]::GetEnvironmentVariable($name, 'Process')
             $after[$name] = [ordered]@{
-                present = ($null -ne $observed)
+                present = (Test-ProbeVariablePresent -Name $name)
                 value   = ([string]$observed)
             }
         }
@@ -316,7 +328,7 @@ switch ($Op) {
         [ordered]@{
             restorePass       = $restore.Pass
             restoreSupportRef = $restore.SupportRef
-            absentPresent     = ($null -ne $absentAfter)
+            absentPresent     = (Test-ProbeVariablePresent -Name 'EG_PROBE_ABSENT_NAME')
             absentValue       = ([string]$absentAfter)
             presentValue      = ([string]$presentAfter)
         } | ConvertTo-Json -Depth 8 -Compress
@@ -807,7 +819,7 @@ switch ($Op) {
         $before = [ordered]@{}
         foreach ($name in $names) {
             $observed = [System.Environment]::GetEnvironmentVariable($name, 'Process')
-            $before[$name] = [ordered]@{ present = ($null -ne $observed); value = ([string]$observed) }
+            $before[$name] = [ordered]@{ present = (Test-ProbeVariablePresent -Name $name); value = ([string]$observed) }
         }
 
         $imported = Import-EgLauncherCredential -CredentialPath $Path
@@ -852,7 +864,7 @@ switch ($Op) {
         $after = [ordered]@{}
         foreach ($name in $names) {
             $observed = [System.Environment]::GetEnvironmentVariable($name, 'Process')
-            $after[$name] = [ordered]@{ present = ($null -ne $observed); value = ([string]$observed) }
+            $after[$name] = [ordered]@{ present = (Test-ProbeVariablePresent -Name $name); value = ([string]$observed) }
         }
 
         $userScope = [ordered]@{}
@@ -908,7 +920,7 @@ switch ($Op) {
 
         $observedBefore = [System.Environment]::GetEnvironmentVariable($name, 'Process')
         $before = [ordered]@{
-            present = ($null -ne $observedBefore)
+            present = (Test-ProbeVariablePresent -Name $name)
             value   = ([string]$observedBefore)
         }
 
@@ -945,7 +957,7 @@ switch ($Op) {
             childObserved = $childObserved
             restorePass   = $restorePass
             before        = $before
-            afterPresent  = ($null -ne $observedAfter)
+            afterPresent  = (Test-ProbeVariablePresent -Name $name)
             afterValue    = ([string]$observedAfter)
         } | ConvertTo-Json -Depth 8 -Compress
     }

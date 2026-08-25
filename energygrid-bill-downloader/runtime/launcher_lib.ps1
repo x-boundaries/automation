@@ -1414,7 +1414,15 @@ function Restore-EgProcessEnvironmentSnapshot {
                 }
             }
             else {
+                # Absence is verified through BOTH the framework getter and the environment
+                # provider. A variable left present with an empty value can read back as
+                # $null through the getter while still occupying the process environment
+                # block that child processes inherit, and an empty GIT_DIR is not the same
+                # thing as an absent one: it breaks every subsequent Git invocation.
                 if ($null -ne $observed) {
+                    $pass = $false
+                }
+                elseif (Test-Path -LiteralPath ('Env:\' + $name)) {
                     $pass = $false
                 }
             }
@@ -1453,14 +1461,39 @@ function Set-EgProcessEnvironmentVariable {
     # committed runtime, so no persistent EnergyGrid credential variable is ever created on
     # the host and the existing absence of those persistent variables is preserved
     # (EGRT-T25). A $null value REMOVES the variable rather than setting it to an empty
-    # string.
+    # string, which the exact-restoration contract in design sections 9.2 and 10.2 depends
+    # on: a variable that was absent before a call must be absent after it, not present and
+    # empty.
+    #
+    # $Value is deliberately UNTYPED. Declaring it [string] lets the parameter binder
+    # convert $null into an empty string on some PowerShell editions, which silently turns
+    # "remove this variable" into "set it to empty" and breaks that contract. This was
+    # observed as a real divergence: Windows PowerShell 5.1 preserved the null while
+    # PowerShell 7 did not, so every neutralised ambient variable came back present and
+    # empty on a PowerShell 7 host.
+    #
+    # Removal is then completed through the environment provider when the framework call
+    # has not produced absence. That is not a fallback that hides a failure: absence is the
+    # contracted post-condition, it is checked here, and every caller independently verifies
+    # the resulting state and reports a bounded failure reference when it is wrong.
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Name,
-        [Parameter(Mandatory)][AllowEmptyString()][AllowNull()][string]$Value
+        [Parameter(Mandatory)][AllowEmptyString()][AllowNull()]$Value
     )
 
-    [System.Environment]::SetEnvironmentVariable($Name, $Value, 'Process')
+    if ($null -eq $Value) {
+        [System.Environment]::SetEnvironmentVariable($Name, $null, 'Process')
+        if ($null -ne [System.Environment]::GetEnvironmentVariable($Name, 'Process')) {
+            $providerPath = 'Env:\' + $Name
+            if (Test-Path -LiteralPath $providerPath) {
+                Remove-Item -LiteralPath $providerPath -Force
+            }
+        }
+        return
+    }
+
+    [System.Environment]::SetEnvironmentVariable($Name, [string]$Value, 'Process')
 }
 
 function Invoke-EgWithInjectedProcessEnvironment {
