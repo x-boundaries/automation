@@ -561,6 +561,59 @@ switch ($Op) {
             kinds       = @(Get-EgResidueKinds)
         } | ConvertTo-Json -Depth 8 -Compress
     }
+    'manifest' {
+        # Build a scratch launcher root with caller-controlled member bytes and manifest
+        # text, then compare the installed package to the manifest.
+        $spec = Get-Content -LiteralPath $Json -Raw | ConvertFrom-Json
+        $utf8 = New-Object System.Text.UTF8Encoding($false)
+        foreach ($member in @($spec.members)) {
+            [System.IO.File]::WriteAllText((Join-Path $Dir $member.name), $member.content, $utf8)
+        }
+        foreach ($residueName in @($spec.residue)) {
+            [System.IO.File]::WriteAllText((Join-Path $Dir $residueName), 'RESIDUE', $utf8)
+        }
+        if ($spec.writeManifest) {
+            [System.IO.File]::WriteAllText(
+                (Join-Path $Dir $script:EgManifestFileName), $spec.manifestRaw, $utf8)
+        }
+
+        $result = Compare-EgInstalledPackageToManifest -LauncherRootPath $Dir
+        [ordered]@{
+            pass             = $result.Pass
+            supportRef       = $result.SupportRef
+            checkNames       = @($result.Checks.Keys)
+            checkOutcomes    = @($result.Checks.Values)
+            manifestFileName = $script:EgManifestFileName
+            manifestSchema   = $script:EgManifestSchema
+            manifestMembers  = @($script:EgManifestMemberNames)
+        } | ConvertTo-Json -Depth 8 -Compress
+    }
+    'manifestbuild' {
+        # Construct and serialise a manifest from member entries, then validate its shape.
+        $spec = Get-Content -LiteralPath $Json -Raw | ConvertFrom-Json
+        $entries = @()
+        foreach ($member in @($spec.members)) {
+            $entries = $entries + ([ordered]@{
+                name        = $member.name
+                sha256      = $member.sha256
+                byte_length = [int]$member.byte_length
+            })
+        }
+        $manifest = New-EgInstallationManifestObject -MemberEntries $entries -AdmissionCommit $Value
+        $shape = Test-EgInstallationManifestShape -ManifestObject $manifest
+        $serialised = ConvertTo-EgManifestJson -ManifestObject $manifest
+        $again = ConvertTo-EgManifestJson -ManifestObject $manifest
+        [ordered]@{
+            shapePass       = $shape.Pass
+            shapeSupportRef = $shape.SupportRef
+            shapeCheckNames = @($shape.Checks.Keys)
+            memberOrder     = @($manifest.members | ForEach-Object { $_.name })
+            schemaVersion   = $manifest.schema_version
+            admissionCommit = $manifest.admission_commit
+            serialised      = $serialised
+            deterministic   = ($serialised -ceq $again)
+        } | ConvertTo-Json -Depth 8 -Compress
+    }
     default {
         throw ('unknown probe operation: ' + $Op)
     }
@@ -2007,6 +2060,276 @@ class ReservedResidueNameContract(TierABase):
                 self.assertEqual("", entry["kind"])
                 self.assertEqual("", entry["member"])
                 self.assertEqual("", entry["operationId"])
+
+
+MANIFEST_FILE_NAME = "installation_manifest.json"
+MANIFEST_SCHEMA = "eg_launcher_installation_manifest/v1"
+MANIFEST_MEMBER_NAMES = ("launcher.ps1", "launcher_lib.ps1")
+SAMPLE_ADMISSION_COMMIT = "0123456789abcdef0123456789abcdef01234567"
+
+DEFAULT_MEMBER_CONTENT = {
+    "launcher.ps1": "# scratch launcher entry script\r\n",
+    "launcher_lib.ps1": "# scratch launcher library\r\n",
+}
+
+
+def _sha256_of_text(text):
+    import hashlib
+
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def build_manifest_payload(content=None, overrides=None, omit=(), extra_entries=()):
+    """Build a manifest object describing the given member content."""
+    content = dict(DEFAULT_MEMBER_CONTENT if content is None else content)
+    entries = []
+    for name in sorted(MANIFEST_MEMBER_NAMES):
+        if name in omit:
+            continue
+        text = content[name]
+        entries.append(
+            {
+                "name": name,
+                "sha256": _sha256_of_text(text),
+                "byte_length": len(text.encode("utf-8")),
+            }
+        )
+    entries.extend(dict(entry) for entry in extra_entries)
+    manifest = {
+        "schema_version": MANIFEST_SCHEMA,
+        "admission_commit": SAMPLE_ADMISSION_COMMIT,
+        "members": entries,
+    }
+    if overrides:
+        manifest.update(overrides)
+    return manifest
+
+
+def manifest_probe(
+    exe,
+    content=None,
+    manifest=None,
+    manifest_raw=None,
+    write_manifest=True,
+    residue=(),
+    omit_members=(),
+):
+    """Compare a scratch installed package to a caller-controlled manifest."""
+    content = dict(DEFAULT_MEMBER_CONTENT if content is None else content)
+    members = [
+        {"name": name, "content": text}
+        for name, text in sorted(content.items())
+        if name not in omit_members
+    ]
+    if manifest_raw is None:
+        payload = build_manifest_payload(content) if manifest is None else manifest
+        manifest_raw = json.dumps(payload, indent=2)
+    with TemporaryScratch() as tmp:
+        root = tmp / "launcher_root"
+        root.mkdir()
+        spec = write_json(
+            tmp,
+            "manifest_spec.json",
+            {
+                "members": members,
+                "residue": list(residue),
+                "writeManifest": bool(write_manifest),
+                "manifestRaw": manifest_raw,
+            },
+        )
+        return probe_json(exe, "manifest", tmp, dir=root, json=spec)
+
+
+class InstallationManifestComparison(TierABase):
+    """Task 9: design section 6.4, the installed-launcher integrity manifest.
+
+    Git is canonical for the manifest's SHAPE and for the comparison rules. The manifest
+    RECORD is private deployment state, generated by the installer from reviewed source,
+    and is never committed.
+
+    An honest limitation the design states and this test does not pretend to close: the
+    manifest sits beside the files it describes, so a writer who can modify the launcher
+    can also modify the manifest. It is tamper-evident only to the extent the launcher-root
+    access-control expectations hold.
+    """
+
+    def test_the_manifest_constants_match_the_design(self):
+        """The manifest describes exactly the two EXECUTABLE members, never itself."""
+        observed = manifest_probe(ANY_PS)
+        self.assertEqual(MANIFEST_FILE_NAME, observed["manifestFileName"])
+        self.assertEqual(MANIFEST_SCHEMA, observed["manifestSchema"])
+        self.assertEqual(list(MANIFEST_MEMBER_NAMES), observed["manifestMembers"])
+        self.assertNotIn(
+            MANIFEST_FILE_NAME,
+            observed["manifestMembers"],
+            "the manifest never describes itself",
+        )
+
+    def test_manifest_matching_the_installed_members_passes(self):
+        """EGRT-T46: installed bytes and the record of them are mutually consistent."""
+        observed = manifest_probe(ANY_PS)
+        self.assertTrue(observed["pass"], observed["supportRef"])
+        self.assertEqual("", observed["supportRef"])
+        self.assertEqual(["launcher_package_manifest_match"], observed["checkNames"])
+        self.assertEqual(["PASS"], observed["checkOutcomes"])
+
+    def test_missing_manifest_is_terminal(self):
+        """A missing manifest is terminal rather than a warning."""
+        observed = manifest_probe(ANY_PS, write_manifest=False)
+        self.assertFalse(observed["pass"])
+        self.assertEqual("EG_LAUNCHER_MANIFEST_MISSING", observed["supportRef"])
+        self.assertEqual(["FAIL"], observed["checkOutcomes"])
+
+    def test_unparsable_manifest_is_terminal(self):
+        """An unparsable manifest is terminal and distinguishable from a missing one."""
+        for raw in ("{ not json at all", "", "[1,2,3"):
+            with self.subTest(raw=raw):
+                observed = manifest_probe(ANY_PS, manifest_raw=raw)
+                self.assertFalse(observed["pass"])
+                self.assertEqual(
+                    "EG_LAUNCHER_MANIFEST_UNPARSABLE", observed["supportRef"]
+                )
+
+    def test_hash_or_length_mismatch_is_terminal(self):
+        """A hash or byte-length mismatch fails closed."""
+        payload = build_manifest_payload()
+        payload["members"][0]["sha256"] = "f" * 64
+        observed = manifest_probe(ANY_PS, manifest=payload)
+        self.assertFalse(observed["pass"])
+        self.assertEqual("EG_LAUNCHER_MANIFEST_MISMATCH", observed["supportRef"])
+
+        payload = build_manifest_payload()
+        payload["members"][0]["byte_length"] = payload["members"][0]["byte_length"] + 1
+        observed = manifest_probe(ANY_PS, manifest=payload)
+        self.assertFalse(observed["pass"])
+        self.assertEqual("EG_LAUNCHER_MANIFEST_MISMATCH", observed["supportRef"])
+
+    def test_manifest_entry_without_a_member_is_terminal(self):
+        """A manifest entry describing bytes that are not installed fails closed."""
+        observed = manifest_probe(ANY_PS, omit_members=("launcher.ps1",))
+        self.assertFalse(observed["pass"])
+        self.assertEqual("EG_LAUNCHER_MANIFEST_MISMATCH", observed["supportRef"])
+
+    def test_member_without_a_manifest_entry_is_terminal(self):
+        """An installed executable member the manifest does not describe fails closed."""
+        payload = build_manifest_payload(omit=("launcher_lib.ps1",))
+        observed = manifest_probe(ANY_PS, manifest=payload)
+        self.assertFalse(observed["pass"])
+        self.assertEqual("EG_LAUNCHER_MANIFEST_MISMATCH", observed["supportRef"])
+
+    def test_an_unrecognised_manifest_entry_is_terminal(self):
+        """The member name set must be exactly the two executable members."""
+        payload = build_manifest_payload(
+            extra_entries=[{"name": "intruder.ps1", "sha256": "a" * 64, "byte_length": 1}]
+        )
+        observed = manifest_probe(ANY_PS, manifest=payload)
+        self.assertFalse(observed["pass"])
+        self.assertEqual("EG_LAUNCHER_MANIFEST_MISMATCH", observed["supportRef"])
+
+    def test_an_invalid_shape_is_terminal(self):
+        """Schema version, admission commit, and hash casing are all part of the shape."""
+        cases = {
+            "wrong_schema": {"schema_version": "something/else"},
+            "short_commit": {"admission_commit": "0123abc"},
+            "uppercase_commit": {"admission_commit": SAMPLE_ADMISSION_COMMIT.upper()},
+        }
+        for label, override in cases.items():
+            with self.subTest(shape_defect=label):
+                payload = build_manifest_payload(overrides=override)
+                observed = manifest_probe(ANY_PS, manifest=payload)
+                self.assertFalse(observed["pass"])
+                self.assertEqual(
+                    "EG_LAUNCHER_MANIFEST_MISMATCH", observed["supportRef"]
+                )
+
+        payload = build_manifest_payload()
+        payload["members"][0]["sha256"] = payload["members"][0]["sha256"].upper()
+        observed = manifest_probe(ANY_PS, manifest=payload)
+        self.assertFalse(observed["pass"])
+        self.assertEqual("EG_LAUNCHER_MANIFEST_MISMATCH", observed["supportRef"])
+
+    def test_class_b_residue_does_not_break_manifest_completeness(self):
+        """EGRT-T51 and EGRT-T52 support: completeness is scoped to the package domain.
+
+        Residue is not a package member and is not described by the manifest. Its absence
+        from the manifest is therefore NOT a completeness failure.
+        """
+        residue = [
+            residue_name("backup", "launcher.ps1"),
+            residue_name("staging", "launcher_lib.ps1"),
+            residue_name("rollback", MANIFEST_FILE_NAME),
+        ]
+        observed = manifest_probe(ANY_PS, residue=residue)
+        self.assertTrue(observed["pass"], observed["supportRef"])
+        self.assertEqual("", observed["supportRef"])
+
+
+class InstallationManifestConstruction(TierABase):
+    """Task 9: manifest construction, ordering, shape validation, and determinism."""
+
+    def _build(self, members, commit=SAMPLE_ADMISSION_COMMIT):
+        with TemporaryScratch() as tmp:
+            spec = write_json(tmp, "build_spec.json", {"members": members})
+            return probe_json(ANY_PS, "manifestbuild", tmp, json=spec, value=commit)
+
+    def test_members_are_sorted_by_name_ascending(self):
+        """The members array is sorted by name, so identical input yields identical bytes."""
+        members = [
+            {"name": "launcher_lib.ps1", "sha256": "b" * 64, "byte_length": 20},
+            {"name": "launcher.ps1", "sha256": "a" * 64, "byte_length": 10},
+        ]
+        observed = self._build(members)
+        self.assertTrue(observed["shapePass"], observed["shapeSupportRef"])
+        self.assertEqual(["launcher.ps1", "launcher_lib.ps1"], observed["memberOrder"])
+        self.assertEqual(MANIFEST_SCHEMA, observed["schemaVersion"])
+        self.assertEqual(SAMPLE_ADMISSION_COMMIT, observed["admissionCommit"])
+        self.assertEqual(
+            ["installation_manifest_shape"], observed["shapeCheckNames"]
+        )
+
+    def test_serialisation_is_deterministic_for_identical_input(self):
+        """Hash idempotency is only decidable if serialisation is deterministic."""
+        members = [
+            {"name": "launcher.ps1", "sha256": "a" * 64, "byte_length": 10},
+            {"name": "launcher_lib.ps1", "sha256": "b" * 64, "byte_length": 20},
+        ]
+        observed = self._build(members)
+        self.assertTrue(observed["deterministic"])
+
+    def test_the_manifest_carries_no_date_shaped_field(self):
+        """ConvertFrom-Json coerces date-shaped strings on PowerShell 7 but not on 5.1.
+
+        The manifest therefore carries no date-shaped field, so parsing is identical on
+        both editions.
+        """
+        members = [
+            {"name": "launcher.ps1", "sha256": "a" * 64, "byte_length": 10},
+            {"name": "launcher_lib.ps1", "sha256": "b" * 64, "byte_length": 20},
+        ]
+        observed = self._build(members)
+        parsed = json.loads(observed["serialised"])
+        self.assertEqual(
+            {"schema_version", "admission_commit", "members"}, set(parsed.keys())
+        )
+        for entry in parsed["members"]:
+            self.assertEqual({"name", "sha256", "byte_length"}, set(entry.keys()))
+        self.assertNotRegex(
+            observed["serialised"],
+            r"\d{4}-\d{2}-\d{2}",
+            "no field may be date-shaped",
+        )
+
+    def test_a_malformed_admission_commit_is_refused_by_the_shape_check(self):
+        """The admission commit must be exactly forty lowercase hexadecimal characters."""
+        members = [
+            {"name": "launcher.ps1", "sha256": "a" * 64, "byte_length": 10},
+            {"name": "launcher_lib.ps1", "sha256": "b" * 64, "byte_length": 20},
+        ]
+        observed = self._build(members, commit="not-a-commit")
+        self.assertFalse(observed["shapePass"])
+        self.assertEqual(
+            "EG_LAUNCHER_MANIFEST_MISMATCH", observed["shapeSupportRef"]
+        )
 
 
 if __name__ == "__main__":
