@@ -763,6 +763,112 @@ foreach ($command in $commands) {
 """
 
 
+BACKUP_GUARD_INSPECTOR = r"""
+[CmdletBinding()]
+param([Parameter(Mandatory)][string]$Target)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+$errors = $null
+$tokens = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($Target, [ref]$tokens, [ref]$errors)
+$parseErrors = 0
+if ($null -ne $errors) { $parseErrors = @($errors).Count }
+
+# A backup argument is PROVEN when it is a parameter declared both [Parameter(Mandatory)]
+# and [ValidateNotNullOrEmpty()], or a variable assigned from such a parameter, or a
+# non-empty string literal. Anything else is unproven and is a defect.
+$proven = @()
+$parameters = @($ast.FindAll(
+    { param($node) $node -is [System.Management.Automation.Language.ParameterAst] }, $true))
+foreach ($parameter in $parameters) {
+    $hasMandatory = $false
+    $hasNotNullOrEmpty = $false
+    foreach ($attribute in @($parameter.Attributes)) {
+        if ($attribute -is [System.Management.Automation.Language.AttributeAst]) {
+            $attributeName = $attribute.TypeName.Name
+            if ($attributeName -eq 'ValidateNotNullOrEmpty') { $hasNotNullOrEmpty = $true }
+            if ($attributeName -eq 'Parameter') {
+                foreach ($named in @($attribute.NamedArguments)) {
+                    if ($named.ArgumentName -eq 'Mandatory') { $hasMandatory = $true }
+                }
+            }
+        }
+    }
+    if ($hasMandatory) {
+        if ($hasNotNullOrEmpty) {
+            $proven = $proven + $parameter.Name.VariablePath.UserPath
+        }
+    }
+}
+
+$assignments = @($ast.FindAll(
+    { param($node) $node -is [System.Management.Automation.Language.AssignmentStatementAst] }, $true))
+foreach ($assignment in $assignments) {
+    if ($assignment.Left -is [System.Management.Automation.Language.VariableExpressionAst]) {
+        $rightText = $assignment.Right.Extent.Text.TrimStart('$')
+        foreach ($provenName in $proven) {
+            if ($rightText -eq $provenName) {
+                $proven = $proven + $assignment.Left.VariablePath.UserPath
+            }
+        }
+    }
+}
+
+$replaceCallCount = 0
+$literalNullThird = 0
+$literalEmptyThird = 0
+$unprovenThird = 0
+
+$invocations = @($ast.FindAll(
+    { param($node) $node -is [System.Management.Automation.Language.InvokeMemberExpressionAst] }, $true))
+foreach ($invocation in $invocations) {
+    $memberName = ''
+    if ($invocation.Member -is [System.Management.Automation.Language.StringConstantExpressionAst]) {
+        $memberName = $invocation.Member.Value
+    }
+    if ($memberName -ne 'Replace') { continue }
+    if ($invocation.Expression.Extent.Text -notmatch '\[System\.IO\.File\]') { continue }
+
+    $replaceCallCount++
+    $arguments = @($invocation.Arguments)
+    if ($arguments.Count -lt 3) {
+        $unprovenThird++
+        continue
+    }
+    $third = $arguments[2]
+    if ($third -is [System.Management.Automation.Language.VariableExpressionAst]) {
+        $name = $third.VariablePath.UserPath
+        if ($name -eq 'null') {
+            $literalNullThird++
+            continue
+        }
+        if ($proven -contains $name) { continue }
+        $unprovenThird++
+        continue
+    }
+    if ($third -is [System.Management.Automation.Language.StringConstantExpressionAst]) {
+        if ($third.Value -eq '') {
+            $literalEmptyThird++
+            continue
+        }
+        continue
+    }
+    $unprovenThird++
+}
+
+[ordered]@{
+    parseErrors       = $parseErrors
+    provenNames       = @($proven)
+    replaceCallCount  = $replaceCallCount
+    literalNullThird  = $literalNullThird
+    literalEmptyThird = $literalEmptyThird
+    unprovenThird     = $unprovenThird
+} | ConvertTo-Json -Depth 8 -Compress
+"""
+
+
 def run_inspector(exe, tmp, source, **kwargs):
     """Write an inspector script into a scratch directory, run it, and parse its JSON."""
     script = Path(tmp) / "eg_inspector.ps1"
@@ -1522,6 +1628,114 @@ class PublishToAbsentDestinationTierB(PublishToAbsentDestinationMixin, TierBBase
     def setUpClass(cls):
         TierBBase.setUpClass()
         cls.exe = DESKTOP_PS
+
+
+class NullBackupArgumentStaticGuard(TierCBase):
+    """Task 7: EGRT-T08, the structural prohibition on a null or unproven backup argument.
+
+    Design section 7.3 records that the null-backup rejection is an observed behaviour of
+    the Windows PowerShell 5.1 and .NET Framework 4.x boundary. Other runtimes may accept
+    a null backup argument, so the design deliberately does not rely on any runtime
+    rejecting it: the prohibition is enforced structurally by the mandatory parameter and
+    by this guard over the committed call sites.
+    """
+
+    def _inspect(self, target):
+        if ANY_PS is None:
+            self.skipTest("no PowerShell host found (pwsh or powershell)")
+        with TemporaryScratch() as tmp:
+            return run_inspector(ANY_PS, tmp, BACKUP_GUARD_INSPECTOR, target=target)
+
+    def test_no_committed_file_replace_call_site_passes_a_null_or_unproven_backup(self):
+        """EGRT-T08 over every committed runtime .ps1."""
+        targets = existing_runtime_ps1_files()
+        self.assertTrue(targets, "at least runtime/launcher_lib.ps1 must exist")
+        total_call_sites = 0
+        for target in targets:
+            with self.subTest(runtime_file=target.name):
+                result = self._inspect(target)
+                self.assertEqual(0, result["parseErrors"])
+                self.assertEqual(
+                    0,
+                    result["literalNullThird"],
+                    "%s passes a literal $null as the backup argument" % target.name,
+                )
+                self.assertEqual(
+                    0,
+                    result["literalEmptyThird"],
+                    "%s passes a literal empty string as the backup argument" % target.name,
+                )
+                self.assertEqual(
+                    0,
+                    result["unprovenThird"],
+                    "%s passes a backup argument that is not proven non-empty"
+                    % target.name,
+                )
+                total_call_sites += result["replaceCallCount"]
+        self.assertEqual(
+            1,
+            total_call_sites,
+            "there must be exactly one committed [System.IO.File]::Replace call site, "
+            "inside Invoke-AtomicFileReplace",
+        )
+
+    def test_the_guard_detects_each_defect_it_exists_to_catch(self):
+        """The guard is proven to FAIL on the defect, not merely to pass on clean source.
+
+        Each defect is injected into a scratch copy of the library, never into the
+        committed file, and the scratch copy is discarded with its scratch directory.
+        """
+        if ANY_PS is None:
+            self.skipTest("no PowerShell host found (pwsh or powershell)")
+        baseline = LIB.read_text(encoding="utf-8")
+        injections = {
+            "literalNullThird": (
+                "\nfunction Test-EgScratchNullBackupDefect {\n"
+                "    param($a, $b)\n"
+                "    [System.IO.File]::Replace($a, $b, $null)\n"
+                "}\n"
+            ),
+            "literalEmptyThird": (
+                "\nfunction Test-EgScratchEmptyBackupDefect {\n"
+                "    param($a, $b)\n"
+                "    [System.IO.File]::Replace($a, $b, '')\n"
+                "}\n"
+            ),
+            "unprovenThird": (
+                "\nfunction Test-EgScratchUnprovenBackupDefect {\n"
+                "    param($a, $b, $maybeEmpty)\n"
+                "    [System.IO.File]::Replace($a, $b, $maybeEmpty)\n"
+                "}\n"
+            ),
+        }
+        with TemporaryScratch() as tmp:
+            for field, injection in injections.items():
+                with self.subTest(defect=field):
+                    scratch = tmp / ("scratch_lib_%s.ps1" % field)
+                    scratch.write_text(baseline + injection, encoding="utf-8")
+                    result = run_inspector(
+                        ANY_PS, tmp, BACKUP_GUARD_INSPECTOR, target=scratch
+                    )
+                    self.assertEqual(0, result["parseErrors"])
+                    self.assertEqual(
+                        2,
+                        result["replaceCallCount"],
+                        "the injected call site must be seen by the inspector",
+                    )
+                    self.assertGreaterEqual(
+                        result[field],
+                        1,
+                        "the guard failed to report the %s defect" % field,
+                    )
+
+    def test_the_mandatory_backup_parameter_is_recognised_as_proven(self):
+        """The one committed call site passes a parameter the guard can prove non-empty."""
+        result = self._inspect(LIB)
+        self.assertIn(
+            "BackupPath",
+            result["provenNames"],
+            "-BackupPath must be declared [Parameter(Mandatory)][ValidateNotNullOrEmpty()]",
+        )
 
 
 if __name__ == "__main__":
