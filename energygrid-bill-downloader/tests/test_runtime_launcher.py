@@ -949,6 +949,39 @@ switch ($Op) {
             afterValue    = ([string]$observedAfter)
         } | ConvertTo-Json -Depth 8 -Compress
     }
+    'sourceintegrity' {
+        # Path-scoped governed source integrity over a scratch checkout. -Dir is the
+        # checkout root, -Value the expected branch, and -Dir2 an optional decoy repository
+        # to seed ambient Git variables at.
+        if ($Dir2 -ne '') {
+            Set-EgProcessEnvironmentVariable -Name 'GIT_DIR' -Value (Join-Path $Dir2 '.git')
+            Set-EgProcessEnvironmentVariable -Name 'GIT_WORK_TREE' -Value $Dir2
+            Set-EgProcessEnvironmentVariable -Name 'GIT_CONFIG_GLOBAL' -Value (Join-Path $Dir2 'decoy.gitconfig')
+        }
+
+        $result = Test-EgGovernedSourceIntegrity -CheckoutRootPath $Dir -ExpectedBranch $Value
+        [ordered]@{
+            pass           = $result.Pass
+            supportRef     = $result.SupportRef
+            checkNames     = @($result.Checks.Keys)
+            checkOutcomes  = @($result.Checks.Values)
+            governedPaths  = @(Get-EgGovernedSourcePaths)
+            anyBranch      = $script:EgAnyBranchSentinel
+        } | ConvertTo-Json -Depth 8 -Compress
+    }
+    'bytecode' {
+        # The ONE sanctioned overlay exception. -Json is the PATH to a JSON file carrying
+        # { paths: [...] }.
+        $spec = Get-Content -LiteralPath $Json -Raw | ConvertFrom-Json
+        $verdicts = @()
+        foreach ($relativePath in @($spec.paths)) {
+            $verdicts = $verdicts + ([ordered]@{
+                path      = $relativePath
+                sanctioned = (Test-EgIsSanctionedBytecodeArtefact -RelativePath $relativePath)
+            })
+        }
+        [ordered]@{ verdicts = @($verdicts) } | ConvertTo-Json -Depth 8 -Compress
+    }
     default {
         throw ('unknown probe operation: ' + $Op)
     }
@@ -1169,9 +1202,29 @@ foreach ($command in $commands) {
         $firstElement = ''
         $hasFirstElement = $false
         if ($null -ne $argumentsValue) {
+            # Unwrap parentheses and array concatenation until the leftmost expression is
+            # reached, so a parenthesised array plus array still reads as array-shaped.
             $candidate = $argumentsValue
-            if ($candidate -is [System.Management.Automation.Language.BinaryExpressionAst]) {
-                $candidate = $candidate.Left
+            $unwrapping = $true
+            while ($unwrapping) {
+                $unwrapping = $false
+                if ($candidate -is [System.Management.Automation.Language.ParenExpressionAst]) {
+                    $inner = $candidate.Pipeline
+                    if ($inner -is [System.Management.Automation.Language.PipelineAst]) {
+                        $elements = @($inner.PipelineElements)
+                        if ($elements.Count -eq 1) {
+                            if ($elements[0] -is [System.Management.Automation.Language.CommandExpressionAst]) {
+                                $candidate = $elements[0].Expression
+                                $unwrapping = $true
+                                continue
+                            }
+                        }
+                    }
+                }
+                if ($candidate -is [System.Management.Automation.Language.BinaryExpressionAst]) {
+                    $candidate = $candidate.Left
+                    $unwrapping = $true
+                }
             }
             if ($candidate -is [System.Management.Automation.Language.ArrayExpressionAst] -or
                 $candidate -is [System.Management.Automation.Language.ArrayLiteralAst]) {
@@ -4083,6 +4136,308 @@ class BrowserCacheStaticGuard(TierCBase):
                             "%s line %d applies %s to a browser-cache path"
                             % (path.name, number, command),
                         )
+
+
+GOVERNED_SOURCE_PATHS = (
+    "energygrid-bill-downloader/energygrid_bill_downloader",
+    "energygrid-bill-downloader/requirements.txt",
+)
+GOVERNED_EXECUTABLE_SURFACE = "energygrid-bill-downloader/energygrid_bill_downloader"
+ANY_BRANCH_SENTINEL = "ANY_BRANCH"
+
+GOVERNED_CHECK_NAMES = (
+    "source_repository_binding",
+    "source_branch_binding",
+    "source_paths_exist",
+    "source_paths_tracked",
+    "source_no_staged_modification",
+    "source_no_unstaged_modification",
+    "source_no_tracked_deletion",
+    "source_no_untracked_overlay",
+)
+
+
+def build_governed_scratch_repo(tmp, branch="main"):
+    """A scratch checkout shaped like the monorepo's EnergyGrid runtime-critical surface."""
+    root = init_scratch_repo(tmp / "governed_checkout", branch=branch)
+    package = root / GOVERNED_EXECUTABLE_SURFACE
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("", encoding="utf-8", newline="")
+    (package / "cli.py").write_text("# scratch cli\r\n", encoding="utf-8", newline="")
+    (root / "energygrid-bill-downloader" / "requirements.txt").write_text(
+        "playwright==1.61.0\r\n", encoding="utf-8", newline=""
+    )
+    scripts = root / "scripts"
+    scripts.mkdir()
+    (scripts / "unrelated_tool.py").write_text(
+        "# unrelated to EnergyGrid\r\n", encoding="utf-8", newline=""
+    )
+    (root / ".gitignore").write_text("*.ignored\r\n", encoding="utf-8", newline="")
+    run_git(root, "add", "-A")
+    run_git(root, "commit", "-m", "governed scratch surface")
+    return root
+
+
+class GovernedSourceIntegrity(TierABase):
+    """Task 15: design section 10.3, reconciled with DL-XB-141-SCHEDULER-005.
+
+    The repository is a monorepo. Requiring the deployed checkout to sit at one permanently
+    fixed whole-repository HEAD would mean any accepted, unrelated merge stops the daily
+    job, and any unrelated dirty file elsewhere does the same. That converts routine
+    repository activity into an outage. The correct unit of protection is the EnergyGrid
+    runtime-critical surface, not the repository.
+    """
+
+    def _check(self, root, branch=ANY_BRANCH_SENTINEL, decoy=""):
+        with TemporaryScratch() as tmp:
+            kwargs = {"dir": root, "value": branch}
+            if decoy:
+                kwargs["dir2"] = decoy
+            return probe_json(ANY_PS, "sourceintegrity", tmp, **kwargs)
+
+    def test_the_governed_surface_is_exactly_two_paths(self):
+        """runtime/, tests/, docs/, task-scheduler/, and the example config are excluded.
+
+        runtime/ is deliberately excluded because the launcher executes from the launcher
+        root outside the checkout, so its integrity is covered by the installation manifest
+        instead. Broadening to the whole monorepo because it is easier is exactly the
+        failure this section exists to prevent.
+        """
+        with TemporaryScratch() as tmp:
+            root = build_governed_scratch_repo(tmp)
+            observed = self._check(root)
+        self.assertEqual(list(GOVERNED_SOURCE_PATHS), observed["governedPaths"])
+        self.assertEqual(ANY_BRANCH_SENTINEL, observed["anyBranch"])
+        self.assertEqual(list(GOVERNED_CHECK_NAMES), observed["checkNames"])
+
+    def test_a_clean_tracked_governed_surface_passes(self):
+        """EGRT-T32."""
+        with TemporaryScratch() as tmp:
+            root = build_governed_scratch_repo(tmp)
+            observed = self._check(root)
+        self.assertTrue(observed["pass"], observed["supportRef"])
+        self.assertEqual("", observed["supportRef"])
+        self.assertEqual(["PASS"] * 8, observed["checkOutcomes"])
+
+    def test_a_staged_modification_under_a_governed_path_fails(self):
+        """EGRT-T33."""
+        with TemporaryScratch() as tmp:
+            root = build_governed_scratch_repo(tmp)
+            target = root / GOVERNED_EXECUTABLE_SURFACE / "cli.py"
+            target.write_text("# staged change\r\n", encoding="utf-8", newline="")
+            run_git(root, "add", str(target))
+            observed = self._check(root)
+        self.assertFalse(observed["pass"])
+        self.assertEqual(
+            "EG_LAUNCHER_SOURCE_STAGED_MODIFICATION", observed["supportRef"]
+        )
+
+    def test_an_unstaged_modification_under_a_governed_path_fails(self):
+        """EGRT-T34."""
+        with TemporaryScratch() as tmp:
+            root = build_governed_scratch_repo(tmp)
+            target = root / "energygrid-bill-downloader" / "requirements.txt"
+            target.write_text("playwright==0.0.0\r\n", encoding="utf-8", newline="")
+            observed = self._check(root)
+        self.assertFalse(observed["pass"])
+        self.assertEqual(
+            "EG_LAUNCHER_SOURCE_UNSTAGED_MODIFICATION", observed["supportRef"]
+        )
+
+    def test_a_deletion_of_a_tracked_governed_file_fails(self):
+        """EGRT-T35: reported as a deletion, distinguishably from a modification."""
+        with TemporaryScratch() as tmp:
+            root = build_governed_scratch_repo(tmp)
+            (root / GOVERNED_EXECUTABLE_SURFACE / "cli.py").unlink()
+            observed = self._check(root)
+        self.assertFalse(observed["pass"])
+        self.assertEqual("EG_LAUNCHER_SOURCE_DELETED", observed["supportRef"])
+
+        with TemporaryScratch() as tmp:
+            root = build_governed_scratch_repo(tmp)
+            run_git(root, "rm", "--cached", "%s/cli.py" % GOVERNED_EXECUTABLE_SURFACE)
+            (root / GOVERNED_EXECUTABLE_SURFACE / "cli.py").unlink()
+            observed = self._check(root)
+        self.assertFalse(observed["pass"])
+        self.assertEqual("EG_LAUNCHER_SOURCE_DELETED", observed["supportRef"])
+
+    def test_untracked_overlay_rules_including_the_bytecode_exception(self):
+        """EGRT-T36: an ignored overlay ALSO fails; Python bytecode does not."""
+        failing = {
+            "plain_untracked_python": "overlay.py",
+            "gitignore_hidden_overlay": "overlay.ignored",
+            "untracked_non_python": "overlay.txt",
+        }
+        for label, name in failing.items():
+            with self.subTest(overlay=label):
+                with TemporaryScratch() as tmp:
+                    root = build_governed_scratch_repo(tmp)
+                    (root / GOVERNED_EXECUTABLE_SURFACE / name).write_text(
+                        "# overlay\r\n", encoding="utf-8", newline=""
+                    )
+                    observed = self._check(root)
+                self.assertFalse(
+                    observed["pass"],
+                    "%s inside the governed executable surface must fail" % label,
+                )
+                self.assertEqual(
+                    "EG_LAUNCHER_SOURCE_UNTRACKED_OVERLAY", observed["supportRef"]
+                )
+
+        with TemporaryScratch() as tmp:
+            root = build_governed_scratch_repo(tmp)
+            cache = root / GOVERNED_EXECUTABLE_SURFACE / "__pycache__"
+            cache.mkdir()
+            (cache / "cli.cpython-314.pyc").write_bytes(b"\x00")
+            (root / GOVERNED_EXECUTABLE_SURFACE / "stray.pyc").write_bytes(b"\x00")
+            observed = self._check(root)
+        self.assertTrue(
+            observed["pass"],
+            "Python bytecode is created by normal execution and must not fail the run: %s"
+            % observed["supportRef"],
+        )
+
+    def test_a_dirty_file_outside_the_governed_paths_does_not_fail_the_run(self):
+        """EGRT-T37: scope is the point. Routine repository activity is not an outage."""
+        with TemporaryScratch() as tmp:
+            root = build_governed_scratch_repo(tmp)
+            (root / "scripts" / "unrelated_tool.py").write_text(
+                "# modified elsewhere\r\n", encoding="utf-8", newline=""
+            )
+            (root / "untracked_at_the_root.txt").write_text(
+                "untracked\r\n", encoding="utf-8", newline=""
+            )
+            (root / "energygrid-bill-downloader" / "docs_note.md").write_text(
+                "not governed\r\n", encoding="utf-8", newline=""
+            )
+            observed = self._check(root)
+        self.assertTrue(observed["pass"], observed["supportRef"])
+
+    def test_a_moved_head_with_a_clean_governed_surface_does_not_fail_the_run(self):
+        """EGRT-T38: no fixed whole-repository HEAD is required."""
+        with TemporaryScratch() as tmp:
+            root = build_governed_scratch_repo(tmp)
+            (root / "scripts" / "unrelated_tool.py").write_text(
+                "# a later accepted commit\r\n", encoding="utf-8", newline=""
+            )
+            run_git(root, "add", "-A")
+            run_git(root, "commit", "-m", "unrelated accepted movement")
+            observed = self._check(root)
+        self.assertTrue(observed["pass"], observed["supportRef"])
+
+    def test_ambient_git_variables_cannot_redirect_the_integrity_checks(self):
+        """EGRT-T40: a decoy whose governed surface is dirty cannot capture the checks."""
+        with TemporaryScratch() as tmp:
+            root = build_governed_scratch_repo(tmp)
+            decoy = init_scratch_repo(tmp / "decoy")
+            decoy_package = decoy / GOVERNED_EXECUTABLE_SURFACE
+            decoy_package.mkdir(parents=True)
+            (decoy_package / "cli.py").write_text(
+                "# decoy, deliberately untracked\r\n", encoding="utf-8", newline=""
+            )
+            (decoy / "decoy.gitconfig").write_text(
+                "[core]\r\n\tquotepath = false\r\n", encoding="utf-8", newline=""
+            )
+            observed = self._check(root, decoy=decoy)
+        self.assertTrue(
+            observed["pass"],
+            "the checks must evaluate the real repository: %s" % observed["supportRef"],
+        )
+
+    def test_branch_binding_and_the_any_branch_sentinel(self):
+        """Binding is never disabled by omission: the sentinel is explicit."""
+        with TemporaryScratch() as tmp:
+            root = build_governed_scratch_repo(tmp)
+            observed = self._check(root, branch="main")
+            self.assertTrue(observed["pass"], observed["supportRef"])
+
+            mismatched = self._check(root, branch="release")
+            self.assertFalse(mismatched["pass"])
+            self.assertEqual(
+                "EG_LAUNCHER_SOURCE_BRANCH_MISMATCH", mismatched["supportRef"]
+            )
+
+    def test_the_any_branch_sentinel_disables_only_branch_binding(self):
+        """Every other check still runs under the sentinel."""
+        with TemporaryScratch() as tmp:
+            root = build_governed_scratch_repo(tmp)
+            run_git(root, "checkout", "-q", "-b", "some-other-branch")
+            observed = self._check(root, branch=ANY_BRANCH_SENTINEL)
+            self.assertTrue(observed["pass"], observed["supportRef"])
+
+            (root / GOVERNED_EXECUTABLE_SURFACE / "cli.py").write_text(
+                "# dirty\r\n", encoding="utf-8", newline=""
+            )
+            dirty = self._check(root, branch=ANY_BRANCH_SENTINEL)
+            self.assertFalse(
+                dirty["pass"], "the sentinel must not disable the other checks"
+            )
+            self.assertEqual(
+                "EG_LAUNCHER_SOURCE_UNSTAGED_MODIFICATION", dirty["supportRef"]
+            )
+
+    def test_a_repository_binding_mismatch_fails_closed(self):
+        """EGRT-T40 support: the resolved top level must equal the supplied checkout root."""
+        with TemporaryScratch() as tmp:
+            root = build_governed_scratch_repo(tmp)
+            nested = root / "energygrid-bill-downloader"
+            observed = self._check(nested)
+        self.assertFalse(observed["pass"])
+        self.assertEqual("EG_LAUNCHER_SOURCE_BINDING_FAILED", observed["supportRef"])
+
+    def test_a_missing_governed_path_fails_closed(self):
+        """Each governed path must exist on disk."""
+        with TemporaryScratch() as tmp:
+            root = build_governed_scratch_repo(tmp)
+            (root / "energygrid-bill-downloader" / "requirements.txt").unlink()
+            run_git(root, "add", "-A")
+            run_git(root, "commit", "-m", "remove requirements")
+            observed = self._check(root)
+        self.assertFalse(observed["pass"])
+        self.assertEqual("EG_LAUNCHER_SOURCE_PATH_MISSING", observed["supportRef"])
+
+    def test_an_untracked_governed_path_fails_closed(self):
+        """A governed path present on disk but untracked fails closed."""
+        with TemporaryScratch() as tmp:
+            root = init_scratch_repo(tmp / "untracked_checkout")
+            package = root / GOVERNED_EXECUTABLE_SURFACE
+            package.mkdir(parents=True)
+            (package / "cli.py").write_text("# untracked\r\n", encoding="utf-8", newline="")
+            (root / "energygrid-bill-downloader" / "requirements.txt").write_text(
+                "playwright==1.61.0\r\n", encoding="utf-8", newline=""
+            )
+            observed = self._check(root)
+        self.assertFalse(observed["pass"])
+        self.assertIn(
+            observed["supportRef"],
+            ("EG_LAUNCHER_SOURCE_PATH_UNTRACKED", "EG_LAUNCHER_SOURCE_UNTRACKED_OVERLAY"),
+        )
+
+
+class SanctionedBytecodeException(TierABase):
+    """Task 15: the ONE sanctioned overlay exception, asserted directly."""
+
+    def test_only_python_bytecode_is_sanctioned(self):
+        """Every OTHER untracked entry inside the governed surface is a substitution."""
+        cases = {
+            "energygrid_bill_downloader/__pycache__/cli.cpython-314.pyc": True,
+            "energygrid_bill_downloader/__pycache__": True,
+            "energygrid_bill_downloader/stray.pyc": True,
+            "energygrid_bill_downloader/nested/__pycache__/x.pyc": True,
+            "energygrid_bill_downloader/overlay.py": False,
+            "energygrid_bill_downloader/overlay.ignored": False,
+            "energygrid_bill_downloader/pycache/x.py": False,
+            "energygrid_bill_downloader/__pycache__extra/x.py": False,
+            "energygrid_bill_downloader/notpyc.pycx": False,
+            "": False,
+        }
+        with TemporaryScratch() as tmp:
+            spec = write_json(tmp, "bytecode_spec.json", {"paths": list(cases)})
+            observed = probe_json(ANY_PS, "bytecode", tmp, json=spec)
+        actual = {entry["path"]: entry["sanctioned"] for entry in observed["verdicts"]}
+        for path, expected in cases.items():
+            with self.subTest(path=path):
+                self.assertEqual(expected, actual[path])
 
 
 if __name__ == "__main__":

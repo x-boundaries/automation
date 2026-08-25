@@ -1397,6 +1397,194 @@ function Invoke-EgWithInjectedProcessEnvironment {
 }
 
 # --------------------------------------------------------------------------------------
+# Path-scoped governed source integrity (design section 10.3)
+# --------------------------------------------------------------------------------------
+# The unit of protection is the EnergyGrid runtime-critical surface, NOT the repository.
+# This repository is a monorepo: requiring the deployed checkout to sit at one permanently
+# fixed whole-repository HEAD would mean any accepted, unrelated merge stops the daily job,
+# and any unrelated dirty file elsewhere in the tree does the same. That converts routine
+# repository activity into an outage, which is what DL-XB-141-SCHEDULER-005 forbids.
+#
+# Exactly two paths are governed. runtime/ is deliberately EXCLUDED: the launcher executes
+# from the launcher root outside the checkout, so its integrity is covered by the
+# installation manifest and the checkout copy is install-source rather than execution
+# surface. tests/, docs/, task-scheduler/, and the example configuration are excluded
+# because a normal run neither executes nor reads them. Broadening to the whole monorepo
+# because it is easier is exactly the failure this section exists to prevent.
+$script:EgGovernedSourcePaths = @(
+    'energygrid-bill-downloader/energygrid_bill_downloader',
+    'energygrid-bill-downloader/requirements.txt'
+)
+$script:EgGovernedExecutableSurface = 'energygrid-bill-downloader/energygrid_bill_downloader'
+$script:EgAnyBranchSentinel = 'ANY_BRANCH'
+
+function Get-EgGovernedSourcePaths {
+    # The exact two governed paths, enumerated explicitly.
+    [CmdletBinding()]
+    param()
+
+    @($script:EgGovernedSourcePaths)
+}
+
+function Test-EgIsSanctionedBytecodeArtefact {
+    # The ONE sanctioned overlay exception. Python bytecode is created by normal execution
+    # and must not fail the run. EVERY other untracked entry inside the governed executable
+    # surface, ignored or not, is a substitution and is terminal.
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$RelativePath)
+
+    if ([string]::IsNullOrEmpty($RelativePath)) {
+        return $false
+    }
+    $normalised = $RelativePath.Replace('\', '/')
+    foreach ($segment in @($normalised -split '/')) {
+        if ($segment -ceq '__pycache__') {
+            return $true
+        }
+    }
+    return $normalised.EndsWith('.pyc', [System.StringComparison]::Ordinal)
+}
+
+function Test-EgGovernedSourceIntegrity {
+    # The eight ordered, read-only, path-scoped integrity checks. Every read goes through
+    # Invoke-GovernedGit, so ambient variable neutralisation and the read-only subcommand
+    # allowlist both apply, and every check is scoped with an explicit Git pathspec.
+    #
+    # Evaluation stops at the first failing check and the remaining checks are reported
+    # FAIL, because a governed read taken after a failed repository binding would be
+    # evaluating something other than what the caller asked about.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$CheckoutRootPath,
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$ExpectedBranch
+    )
+
+    $orderedNames = @(
+        'source_repository_binding',
+        'source_branch_binding',
+        'source_paths_exist',
+        'source_paths_tracked',
+        'source_no_staged_modification',
+        'source_no_unstaged_modification',
+        'source_no_tracked_deletion',
+        'source_no_untracked_overlay'
+    )
+    $checks = [ordered]@{}
+    foreach ($name in $orderedNames) {
+        $checks[$name] = 'FAIL'
+    }
+
+    $governedPaths = @(Get-EgGovernedSourcePaths)
+    $resolvedRoot = [System.IO.Path]::GetFullPath($CheckoutRootPath).TrimEnd('\', '/')
+
+    # Check 1. Repository binding. This also proves ambient redirection did not silently
+    # move the checks to another tree.
+    $topLevel = Invoke-GovernedGit -RepositoryRootPath $resolvedRoot -Arguments @('rev-parse', '--show-toplevel')
+    $bound = $false
+    if ($topLevel.Success) {
+        if ($topLevel.Lines.Count -eq 1) {
+            $reported = [System.IO.Path]::GetFullPath($topLevel.Lines[0].Trim()).TrimEnd('\', '/')
+            $bound = [string]::Equals($reported, $resolvedRoot, [System.StringComparison]::OrdinalIgnoreCase)
+        }
+    }
+    if (-not $bound) {
+        return (New-EgCheckResult -Pass $false -SupportRef 'EG_LAUNCHER_SOURCE_BINDING_FAILED' -Checks $checks)
+    }
+    $checks['source_repository_binding'] = 'PASS'
+
+    # Check 2. Branch binding, unless the explicit sentinel is supplied. The sentinel means
+    # binding is never disabled by omitting an argument.
+    if ($ExpectedBranch -ceq $script:EgAnyBranchSentinel) {
+        $checks['source_branch_binding'] = 'PASS'
+    }
+    else {
+        $branch = Invoke-GovernedGit -RepositoryRootPath $resolvedRoot -Arguments @('symbolic-ref', '--short', 'HEAD')
+        $branchOk = $false
+        if ($branch.Success) {
+            if ($branch.Lines.Count -eq 1) {
+                $branchOk = ($branch.Lines[0].Trim() -ceq $ExpectedBranch)
+            }
+        }
+        if (-not $branchOk) {
+            return (New-EgCheckResult -Pass $false -SupportRef 'EG_LAUNCHER_SOURCE_BRANCH_MISMATCH' -Checks $checks)
+        }
+        $checks['source_branch_binding'] = 'PASS'
+    }
+
+    # Check 3. Each governed path exists on disk.
+    foreach ($governed in $governedPaths) {
+        $onDisk = Join-Path $resolvedRoot ($governed.Replace('/', [string][System.IO.Path]::DirectorySeparatorChar))
+        if (-not (Test-Path -LiteralPath $onDisk)) {
+            return (New-EgCheckResult -Pass $false -SupportRef 'EG_LAUNCHER_SOURCE_PATH_MISSING' -Checks $checks)
+        }
+    }
+    $checks['source_paths_exist'] = 'PASS'
+
+    # Check 4. Each governed path is tracked, proven by a non-empty tracked-file listing
+    # scoped to that path.
+    foreach ($governed in $governedPaths) {
+        $tracked = Invoke-GovernedGit -RepositoryRootPath $resolvedRoot -Arguments (@('ls-files', '--') + @($governed))
+        if (-not $tracked.Success) {
+            return (New-EgCheckResult -Pass $false -SupportRef 'EG_LAUNCHER_SOURCE_PATH_UNTRACKED' -Checks $checks)
+        }
+        if ($tracked.Lines.Count -eq 0) {
+            return (New-EgCheckResult -Pass $false -SupportRef 'EG_LAUNCHER_SOURCE_PATH_UNTRACKED' -Checks $checks)
+        }
+    }
+    $checks['source_paths_tracked'] = 'PASS'
+
+    # Checks 5 and 6. Staged and unstaged modification, scoped to modification and type
+    # change only. Deletion is a DISTINCT terminal condition with its own reference, so it
+    # is excluded here rather than reported as a modification.
+    $staged = Invoke-GovernedGit -RepositoryRootPath $resolvedRoot -Arguments (@('diff', '--cached', '--name-only', '--diff-filter=MT', '--') + $governedPaths)
+    if ((-not $staged.Success) -or ($staged.Lines.Count -ne 0)) {
+        return (New-EgCheckResult -Pass $false -SupportRef 'EG_LAUNCHER_SOURCE_STAGED_MODIFICATION' -Checks $checks)
+    }
+    $checks['source_no_staged_modification'] = 'PASS'
+
+    $unstaged = Invoke-GovernedGit -RepositoryRootPath $resolvedRoot -Arguments (@('diff', '--name-only', '--diff-filter=MT', '--') + $governedPaths)
+    if ((-not $unstaged.Success) -or ($unstaged.Lines.Count -ne 0)) {
+        return (New-EgCheckResult -Pass $false -SupportRef 'EG_LAUNCHER_SOURCE_UNSTAGED_MODIFICATION' -Checks $checks)
+    }
+    $checks['source_no_unstaged_modification'] = 'PASS'
+
+    # Check 7. No deletion of a tracked file, staged or unstaged.
+    $deletedWorktree = Invoke-GovernedGit -RepositoryRootPath $resolvedRoot -Arguments (@('diff', '--name-only', '--diff-filter=D', '--') + $governedPaths)
+    if ((-not $deletedWorktree.Success) -or ($deletedWorktree.Lines.Count -ne 0)) {
+        return (New-EgCheckResult -Pass $false -SupportRef 'EG_LAUNCHER_SOURCE_DELETED' -Checks $checks)
+    }
+    $deletedStaged = Invoke-GovernedGit -RepositoryRootPath $resolvedRoot -Arguments (@('diff', '--cached', '--name-only', '--diff-filter=D', '--') + $governedPaths)
+    if ((-not $deletedStaged.Success) -or ($deletedStaged.Lines.Count -ne 0)) {
+        return (New-EgCheckResult -Pass $false -SupportRef 'EG_LAUNCHER_SOURCE_DELETED' -Checks $checks)
+    }
+    $checks['source_no_tracked_deletion'] = 'PASS'
+
+    # Check 8. No untracked substitution or overlay inside the governed executable surface.
+    # An untracked file that shadows a module name is a real substitution risk, so the
+    # listing must see untracked files even when .gitignore would hide them (DD-11). The
+    # ONLY sanctioned exception is Python bytecode.
+    $overlaySurface = @($script:EgGovernedExecutableSurface)
+    $untracked = Invoke-GovernedGit -RepositoryRootPath $resolvedRoot -Arguments (@('ls-files', '--others', '--exclude-standard', '--') + $overlaySurface)
+    $ignored = Invoke-GovernedGit -RepositoryRootPath $resolvedRoot -Arguments (@('ls-files', '--others', '--ignored', '--exclude-standard', '--') + $overlaySurface)
+    if ((-not $untracked.Success) -or (-not $ignored.Success)) {
+        return (New-EgCheckResult -Pass $false -SupportRef 'EG_LAUNCHER_SOURCE_UNTRACKED_OVERLAY' -Checks $checks)
+    }
+    $observedOverlays = @($untracked.Lines) + @($ignored.Lines)
+    foreach ($candidate in $observedOverlays) {
+        if ([string]::IsNullOrWhiteSpace($candidate)) {
+            continue
+        }
+        if (Test-EgIsSanctionedBytecodeArtefact -RelativePath $candidate) {
+            continue
+        }
+        return (New-EgCheckResult -Pass $false -SupportRef 'EG_LAUNCHER_SOURCE_UNTRACKED_OVERLAY' -Checks $checks)
+    }
+    $checks['source_no_untracked_overlay'] = 'PASS'
+
+    return (New-EgCheckResult -Pass $true -SupportRef '' -Checks $checks)
+}
+
+# --------------------------------------------------------------------------------------
 # Private browser-cache binding (design section 9.3)
 # --------------------------------------------------------------------------------------
 # The launcher must POSITIVELY bind the approved private browser cache and fail closed. It
