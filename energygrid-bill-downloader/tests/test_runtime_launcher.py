@@ -881,6 +881,74 @@ switch ($Op) {
             machineScope      = $machineScope
         } | ConvertTo-Json -Depth 8 -Compress
     }
+    'browsercache' {
+        # The positive readiness check over a scratch cache. Read-only by contract:
+        # nothing is created, downloaded, or repaired.
+        $result = Test-EgBrowserCacheReady -BrowserCachePath $Path
+        [ordered]@{
+            pass          = $result.Pass
+            supportRef    = $result.SupportRef
+            checkNames    = @($result.Checks.Keys)
+            checkOutcomes = @($result.Checks.Values)
+            variableName  = $script:EgBrowserCacheVariableName
+        } | ConvertTo-Json -Depth 8 -Compress
+    }
+    'cachebind' {
+        # Bind the supplied cache explicitly for a bounded child execution, then restore
+        # the prior process-scope value exactly. -Value2 optionally pre-sets a CONFLICTING
+        # ambient value, which must be overridden rather than honoured.
+        $name = $script:EgBrowserCacheVariableName
+
+        if ($Value2 -ne '') {
+            Set-EgProcessEnvironmentVariable -Name $name -Value $Value2
+        }
+        else {
+            Set-EgProcessEnvironmentVariable -Name $name -Value $null
+        }
+
+        $observedBefore = [System.Environment]::GetEnvironmentVariable($name, 'Process')
+        $before = [ordered]@{
+            present = ($null -ne $observedBefore)
+            value   = ([string]$observedBefore)
+        }
+
+        $ready = Test-EgBrowserCacheReady -BrowserCachePath $Path
+        $childOutPath = Join-Path $Dir 'child_observed.json'
+        $childExit = -1
+        $restorePass = $false
+
+        if ($ready.Pass) {
+            $stubArguments = @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+                '-File', $Path3, '-OutPath', $childOutPath)
+            $variables = [ordered]@{}
+            $variables[$name] = $Path
+            $injected = Invoke-EgWithInjectedProcessEnvironment -Variables $variables -Body {
+                $started = Start-Process -FilePath $Path2 -ArgumentList $stubArguments `
+                    -NoNewWindow -Wait -PassThru
+                $started.ExitCode
+            }
+            $childExit = $injected.BodyResult
+            $restorePass = $injected.Restore.Pass
+        }
+
+        $observedAfter = [System.Environment]::GetEnvironmentVariable($name, 'Process')
+        $childObserved = ''
+        if (Test-Path -LiteralPath $childOutPath -PathType Leaf) {
+            $childObserved = [System.IO.File]::ReadAllText($childOutPath)
+        }
+
+        [ordered]@{
+            readyPass     = $ready.Pass
+            readySupport  = $ready.SupportRef
+            childStubRan  = (Test-Path -LiteralPath $childOutPath -PathType Leaf)
+            childExit     = $childExit
+            childObserved = $childObserved
+            restorePass   = $restorePass
+            before        = $before
+            afterPresent  = ($null -ne $observedAfter)
+            afterValue    = ([string]$observedAfter)
+        } | ConvertTo-Json -Depth 8 -Compress
+    }
     default {
         throw ('unknown probe operation: ' + $Op)
     }
@@ -3775,6 +3843,246 @@ class CredentialStaticGuards(TierCBase):
                         "%s appears to derive a reportable quantity from a credential"
                         % name,
                     )
+
+
+BROWSER_CACHE_VARIABLE = "PLAYWRIGHT_BROWSERS_PATH"
+
+
+def snapshot_tree(root):
+    """Map each relative path under root to its size, modification time, and hash."""
+    root = Path(root)
+    if not root.exists():
+        return {}
+    state = {}
+    for path in sorted(root.rglob("*")):
+        relative = path.relative_to(root).as_posix()
+        if path.is_dir():
+            state[relative] = ("dir", 0, 0.0, "")
+        else:
+            stat = path.stat()
+            state[relative] = ("file", stat.st_size, stat.st_mtime, sha256_of(path))
+    return state
+
+
+def build_scratch_browser_cache(root, provisioned=True, executable="chrome.exe",
+                                child="chromium-1234"):
+    """Create a scratch cache that LOOKS provisioned without downloading anything."""
+    root = Path(root)
+    root.mkdir(parents=True, exist_ok=True)
+    if not provisioned:
+        return root
+    target = root / child / "chrome-win"
+    target.mkdir(parents=True, exist_ok=True)
+    (target / executable).write_bytes(b"")
+    return root
+
+
+class BrowserCacheBinding(TierABase):
+    """Task 14: design section 9.3.
+
+    The launcher must positively bind the approved private browser cache and fail closed.
+    It must never silently fall through to an ambient or default Playwright cache, because
+    a run that quietly uses an unreviewed browser cache is a run whose behaviour nobody
+    approved. The launcher never installs, updates, repairs, or downloads into the cache:
+    provisioning stays an operator action.
+    """
+
+    def _readiness(self, cache_path):
+        with TemporaryScratch() as tmp:
+            return probe_json(ANY_PS, "browsercache", tmp, path=cache_path)
+
+    def test_the_bound_variable_is_the_playwright_browsers_path(self):
+        """The cache reaches the child through the variable the application expects."""
+        with TemporaryScratch() as tmp:
+            cache = build_scratch_browser_cache(tmp / "cache")
+            observed = probe_json(ANY_PS, "browsercache", tmp, path=cache)
+        self.assertEqual(BROWSER_CACHE_VARIABLE, observed["variableName"])
+        self.assertEqual(["browser_cache_ready"], observed["checkNames"])
+
+    def test_a_provisioned_cache_passes_the_positive_readiness_check(self):
+        """Readiness confirms a provisioned Chromium is present, not merely a directory."""
+        for executable in ("chrome.exe", "headless_shell.exe"):
+            for child in ("chromium-1234", "chromium_1234"):
+                with self.subTest(executable=executable, child=child):
+                    with TemporaryScratch() as tmp:
+                        cache = build_scratch_browser_cache(
+                            tmp / "cache", executable=executable, child=child
+                        )
+                        observed = probe_json(ANY_PS, "browsercache", tmp, path=cache)
+                    self.assertTrue(observed["pass"], observed["supportRef"])
+                    self.assertEqual("", observed["supportRef"])
+                    self.assertEqual(["PASS"], observed["checkOutcomes"])
+
+    def test_a_missing_unreadable_or_unprovisioned_cache_fails_closed(self):
+        """EGRT-T29: three sub-cases, each terminal, with no fallback to the default."""
+        with TemporaryScratch() as tmp:
+            observed = probe_json(ANY_PS, "browsercache", tmp, path=(tmp / "absent_cache"))
+        self.assertFalse(observed["pass"])
+        self.assertEqual("EG_LAUNCHER_BROWSER_CACHE_UNRESOLVED", observed["supportRef"])
+
+        with TemporaryScratch() as tmp:
+            cache = build_scratch_browser_cache(tmp / "cache", provisioned=False)
+            observed = probe_json(ANY_PS, "browsercache", tmp, path=cache)
+        self.assertFalse(observed["pass"])
+        self.assertEqual("EG_LAUNCHER_BROWSER_CACHE_NOT_READY", observed["supportRef"])
+
+        with TemporaryScratch() as tmp:
+            cache = tmp / "cache"
+            (cache / "chromium-1234" / "chrome-win").mkdir(parents=True)
+            observed = probe_json(ANY_PS, "browsercache", tmp, path=cache)
+        self.assertFalse(observed["pass"])
+        self.assertEqual("EG_LAUNCHER_BROWSER_CACHE_NOT_READY", observed["supportRef"])
+
+        with TemporaryScratch() as tmp:
+            cache = tmp / "cache"
+            (cache / "firefox-1234").mkdir(parents=True)
+            (cache / "firefox-1234" / "firefox.exe").write_bytes(b"")
+            observed = probe_json(ANY_PS, "browsercache", tmp, path=cache)
+        self.assertFalse(
+            observed["pass"], "a non-Chromium browser directory is not readiness"
+        )
+        self.assertEqual("EG_LAUNCHER_BROWSER_CACHE_NOT_READY", observed["supportRef"])
+
+    def test_an_explicit_private_cache_path_reaches_the_child_stub(self):
+        """EGRT-T27: the child observes the supplied path as the browser-cache variable."""
+        with TemporaryScratch() as tmp:
+            cache = build_scratch_browser_cache(tmp / "cache")
+            work = tmp / "work"
+            work.mkdir()
+            stub = write_child_stub(tmp)
+            observed = probe_json(
+                ANY_PS, "cachebind", tmp,
+                dir=work, path=cache, path2=ANY_PS, path3=stub,
+            )
+        self.assertTrue(observed["readyPass"])
+        self.assertTrue(observed["childStubRan"])
+        self.assertEqual(0, observed["childExit"])
+        child = json.loads(observed["childObserved"])
+        self.assertTrue(
+            same_path(child["browserCacheValue"], cache),
+            "the child observed %r rather than the supplied cache"
+            % child["browserCacheValue"],
+        )
+
+    def test_a_conflicting_ambient_value_cannot_override_the_supplied_binding(self):
+        """EGRT-T28: an ambient value pointing elsewhere is overridden, never honoured."""
+        with TemporaryScratch() as tmp:
+            cache = build_scratch_browser_cache(tmp / "cache")
+            decoy = build_scratch_browser_cache(tmp / "decoy_cache")
+            work = tmp / "work"
+            work.mkdir()
+            stub = write_child_stub(tmp)
+            observed = probe_json(
+                ANY_PS, "cachebind", tmp,
+                dir=work, path=cache, path2=ANY_PS, path3=stub, value2=str(decoy),
+            )
+        child = json.loads(observed["childObserved"])
+        self.assertTrue(
+            same_path(child["browserCacheValue"], cache),
+            "the supplied binding must win over the ambient value",
+        )
+        self.assertFalse(same_path(child["browserCacheValue"], decoy))
+        self.assertTrue(observed["afterPresent"])
+        self.assertTrue(
+            same_path(observed["afterValue"], decoy),
+            "the prior ambient value must be restored exactly",
+        )
+
+    def test_the_prior_browser_cache_value_is_restored_exactly(self):
+        """EGRT-T30: previously absent stays absent; previously present is restored."""
+        with TemporaryScratch() as tmp:
+            cache = build_scratch_browser_cache(tmp / "cache")
+            work = tmp / "work"
+            work.mkdir()
+            stub = write_child_stub(tmp)
+            observed = probe_json(
+                ANY_PS, "cachebind", tmp,
+                dir=work, path=cache, path2=ANY_PS, path3=stub,
+            )
+        self.assertTrue(observed["restorePass"])
+        self.assertFalse(observed["before"]["present"])
+        self.assertFalse(
+            observed["afterPresent"],
+            "an absent variable is REMOVED, never left set to an empty string",
+        )
+        self.assertEqual("", observed["afterValue"])
+
+    def test_a_failing_readiness_check_starts_no_child_and_does_not_fall_back(self):
+        """There is no fallback. An unprovisioned cache fails the run."""
+        with TemporaryScratch() as tmp:
+            cache = build_scratch_browser_cache(tmp / "cache", provisioned=False)
+            work = tmp / "work"
+            work.mkdir()
+            stub = write_child_stub(tmp)
+            observed = probe_json(
+                ANY_PS, "cachebind", tmp,
+                dir=work, path=cache, path2=ANY_PS, path3=stub,
+            )
+        self.assertFalse(observed["readyPass"])
+        self.assertEqual("EG_LAUNCHER_BROWSER_CACHE_NOT_READY", observed["readySupport"])
+        self.assertFalse(observed["childStubRan"], "no child may start")
+        self.assertFalse(observed["afterPresent"])
+
+    def test_the_readiness_probe_never_writes_into_the_browser_cache(self):
+        """The launcher binds and validates the cache; it never writes into it."""
+        with TemporaryScratch() as tmp:
+            cache = build_scratch_browser_cache(tmp / "cache")
+            work = tmp / "work"
+            work.mkdir()
+            stub = write_child_stub(tmp)
+            before = snapshot_tree(cache)
+            probe_json(
+                ANY_PS, "cachebind", tmp,
+                dir=work, path=cache, path2=ANY_PS, path3=stub,
+            )
+            after = snapshot_tree(cache)
+        self.assertEqual(
+            before, after, "the browser cache must be byte-identical afterwards"
+        )
+
+
+class BrowserCacheStaticGuard(TierCBase):
+    """Task 14, Tier C: the runtime never provisions, installs, or downloads a browser."""
+
+    def test_no_committed_runtime_file_provisions_or_downloads_a_browser(self):
+        """Provisioning stays an operator action, exactly as the runbook already requires."""
+        # The cache VARIABLE name legitimately contains the word playwright, so the guard
+        # targets provisioning invocations and network transports rather than the name.
+        forbidden = (
+            "playwright install",
+            "-m playwright",
+            "Invoke-WebRequest",
+            "Invoke-RestMethod",
+            "Start-BitsTransfer",
+            "System.Net.WebClient",
+            "System.Net.Http",
+        )
+        for path in existing_runtime_ps1_files():
+            text = path.read_text(encoding="utf-8")
+            for token in forbidden:
+                with self.subTest(runtime_file=path.name, token=token):
+                    self.assertNotIn(
+                        token.lower(),
+                        text.lower(),
+                        "%s must not reference %r" % (path.name, token),
+                    )
+
+    def test_no_committed_runtime_file_mutates_a_browser_cache_path(self):
+        """No mutating command is applied to a path derived from the cache binding."""
+        mutating = ("New-Item", "Copy-Item", "Remove-Item", "Move-Item", "Rename-Item")
+        for path in existing_runtime_ps1_files():
+            text = path.read_text(encoding="utf-8")
+            for number, line in non_comment_lines(text):
+                if "BrowserCache" not in line:
+                    continue
+                for command in mutating:
+                    with self.subTest(runtime_file=path.name, line=number, command=command):
+                        self.assertNotIn(
+                            command,
+                            line,
+                            "%s line %d applies %s to a browser-cache path"
+                            % (path.name, number, command),
+                        )
 
 
 if __name__ == "__main__":

@@ -1397,6 +1397,68 @@ function Invoke-EgWithInjectedProcessEnvironment {
 }
 
 # --------------------------------------------------------------------------------------
+# Private browser-cache binding (design section 9.3)
+# --------------------------------------------------------------------------------------
+# The launcher must POSITIVELY bind the approved private browser cache and fail closed. It
+# must never silently fall through to an ambient or default cache, because a run that
+# quietly uses an unreviewed browser cache is a run whose behaviour nobody approved.
+#
+# The launcher never installs, updates, repairs, or downloads into the cache. Provisioning
+# stays an operator action, exactly as the project runbook already requires. There is no
+# fallback: a cache that is missing, unreadable, or not provisioned fails the run.
+$script:EgBrowserCacheVariableName = 'PLAYWRIGHT_BROWSERS_PATH'
+$script:EgBrowserCacheChildPattern = '^chromium(-|_).+'
+$script:EgBrowserCacheExecutableNames = @('chrome.exe', 'headless_shell.exe')
+
+function Test-EgBrowserCacheReady {
+    # A POSITIVE readiness check, not merely a directory-existence test: the path must
+    # contain at least one immediate child directory whose name matches the Chromium
+    # pattern, and that child must contain a recognised browser executable at any depth.
+    #
+    # The probe is READ-ONLY. Nothing is created, downloaded, or repaired.
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$BrowserCachePath)
+
+    $checkName = 'browser_cache_ready'
+
+    if (-not (Test-Path -LiteralPath $BrowserCachePath -PathType Container)) {
+        return (New-EgSingleCheckResult -CheckName $checkName -Pass $false `
+            -SupportRef 'EG_LAUNCHER_BROWSER_CACHE_UNRESOLVED')
+    }
+
+    $children = @()
+    try {
+        $children = @(Get-ChildItem -LiteralPath $BrowserCachePath -Directory)
+    }
+    catch {
+        return (New-EgSingleCheckResult -CheckName $checkName -Pass $false `
+            -SupportRef 'EG_LAUNCHER_BROWSER_CACHE_UNRESOLVED')
+    }
+
+    foreach ($child in $children) {
+        if ($child.Name -notmatch $script:EgBrowserCacheChildPattern) {
+            continue
+        }
+        foreach ($executableName in $script:EgBrowserCacheExecutableNames) {
+            $found = @()
+            try {
+                $found = @(Get-ChildItem -LiteralPath $child.FullName -Filter $executableName `
+                    -File -Recurse -ErrorAction SilentlyContinue)
+            }
+            catch {
+                $found = @()
+            }
+            if (@($found).Count -gt 0) {
+                return (New-EgSingleCheckResult -CheckName $checkName -Pass $true)
+            }
+        }
+    }
+
+    return (New-EgSingleCheckResult -CheckName $checkName -Pass $false `
+        -SupportRef 'EG_LAUNCHER_BROWSER_CACHE_NOT_READY')
+}
+
+# --------------------------------------------------------------------------------------
 # DPAPI credential import and viability (design section 9.2)
 # --------------------------------------------------------------------------------------
 # What stays private: the DPAPI artefact itself, its absolute path, the Windows user
