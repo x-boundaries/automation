@@ -1035,8 +1035,29 @@ function Get-EgFileSha256 {
         return ''
     }
     try {
-        $computed = Get-FileHash -LiteralPath $Path -Algorithm SHA256 -ErrorAction Stop
-        return $computed.Hash.ToLowerInvariant()
+        # Hashed through .NET directly rather than through Get-FileHash. Hashing is on the
+        # critical path of every integrity, idempotency, and rollback decision, so it must
+        # not depend on a module being autoloadable: a host whose module path does not
+        # resolve the Windows PowerShell module directory would otherwise turn every hash
+        # into the empty string and every verification into a failure.
+        $algorithm = [System.Security.Cryptography.SHA256]::Create()
+        try {
+            $stream = [System.IO.File]::Open(
+                $Path,
+                [System.IO.FileMode]::Open,
+                [System.IO.FileAccess]::Read,
+                [System.IO.FileShare]::Read)
+            try {
+                $digest = $algorithm.ComputeHash($stream)
+            }
+            finally {
+                $stream.Dispose()
+            }
+        }
+        finally {
+            $algorithm.Dispose()
+        }
+        return ([System.BitConverter]::ToString($digest).Replace('-', '').ToLowerInvariant())
     }
     catch {
         # The file exists but could not be opened for reading, which is what a destination
@@ -1484,11 +1505,13 @@ function Set-EgProcessEnvironmentVariable {
 
     if ($null -eq $Value) {
         [System.Environment]::SetEnvironmentVariable($Name, $null, 'Process')
-        if ($null -ne [System.Environment]::GetEnvironmentVariable($Name, 'Process')) {
-            $providerPath = 'Env:\' + $Name
-            if (Test-Path -LiteralPath $providerPath) {
-                Remove-Item -LiteralPath $providerPath -Force
-            }
+        # Checked through the PROVIDER unconditionally. A variable left present with an
+        # empty value reads back as $null through the framework getter while still
+        # occupying the process environment block a child inherits, so gating this on the
+        # getter would leave exactly the state the contract forbids.
+        $providerPath = 'Env:\' + $Name
+        if (Test-Path -LiteralPath $providerPath) {
+            Remove-Item -LiteralPath $providerPath -Force
         }
         return
     }

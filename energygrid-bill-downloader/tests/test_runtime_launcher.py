@@ -780,7 +780,15 @@ switch ($Op) {
         # JSON file carrying { username, password }. The values are never real credentials
         # and never leave the runner's temporary directory.
         $spec = Get-Content -LiteralPath $Json -Raw | ConvertFrom-Json
-        $secure = ConvertTo-SecureString -String $spec.password -AsPlainText -Force
+        # Constructed through .NET rather than ConvertTo-SecureString, so the fixture does
+        # not depend on the Microsoft.PowerShell.Security module being autoloadable. A host
+        # whose module path does not resolve it would otherwise fail here rather than
+        # exercising the credential contract.
+        $secure = New-Object System.Security.SecureString
+        foreach ($character in ([string]$spec.password).ToCharArray()) {
+            $secure.AppendChar($character)
+        }
+        $secure.MakeReadOnly()
         $credential = New-Object System.Management.Automation.PSCredential($spec.username, $secure)
         $credential | Export-Clixml -LiteralPath $Path
         [ordered]@{ exported = (Test-Path -LiteralPath $Path -PathType Leaf) } |
@@ -1937,6 +1945,7 @@ def replace_probe_with_held_destination(exe):
         observed["backupExists"] = backup.is_file()
         observed["backupShaAfter"] = sha256_of(backup)
         observed["refused"] = False
+        observed["refusedType"] = ""
         return observed
 
 
@@ -1948,7 +1957,10 @@ class AtomicFileReplaceContractMixin:
     def test_valid_explicit_backup_replacement_succeeds(self):
         """EGRT-T06: a valid explicit-backup replacement succeeds and carries the source."""
         observed = replace_probe(self.exe, "ok")
-        self.assertFalse(observed["refused"])
+        self.assertFalse(
+            observed["refused"],
+            "the fixture threw before producing a result: %s" % observed["refusedType"],
+        )
         self.assertTrue(observed["success"], observed.get("supportRef"))
         self.assertEqual("", observed["supportRef"])
         self.assertEqual("", observed["exceptionTypeName"])
@@ -2001,7 +2013,11 @@ class AtomicFileReplaceContractMixin:
         )
         for case, observed in observations:
             with self.subTest(failure_class=case):
-                self.assertFalse(observed["refused"])
+                self.assertFalse(
+                    observed["refused"],
+                    "the fixture threw before producing a result: %s"
+                    % observed["refusedType"],
+                )
                 self.assertFalse(observed["success"])
                 self.assertFalse(
                     observed["publicationOccurred"],
@@ -4276,11 +4292,25 @@ function Get-DisableCandidateSid {
     return $null
 }
 
+function Get-ObservedOwnerSid([string]$Path) {
+    # The owner Windows actually assigned. Creating a directory under an elevated token
+    # makes the Administrators group the owner rather than the running user, so the trustee
+    # fixture must read the owner instead of assuming it.
+    $descriptor = Get-EgSecurityDescriptorForPath -Path $Path
+    if ($null -eq $descriptor) { return $null }
+    return $descriptor.GetOwner([System.Security.Principal.SecurityIdentifier])
+}
+
 function Resolve-SidTokenString([string]$Token) {
     # Placeholders resolve to a runtime-discovered identifier; anything else is passed
     # through VERBATIM, so a malformed value reaches the library's admission check rather
     # than being rejected by the fixture.
     if ($Token -ceq 'SELF') { return $selfSid.Value }
+    if ($Token -ceq 'OWNER') {
+        $owner = Get-ObservedOwnerSid -Path $Root
+        if ($null -eq $owner) { return '' }
+        return $owner.Value
+    }
     if ($Token -ceq 'WORLD') { return $worldSid.Value }
     if ($Token -ceq 'SERVICE') { return $serviceSid.Value }
     if ($Token -ceq 'CREATOR_OWNER') { return $creatorOwnerSid.Value }
@@ -4372,7 +4402,12 @@ $emitted = switch ($Op) {
         }
 
         $groupSid = Get-DisableCandidateSid
-        $fullSelf = @(New-Entry $selfSid $Rights::FullControl)
+        $ownerSid = Get-ObservedOwnerSid -Path $Root
+        if ($null -eq $ownerSid) { throw 'the scratch launcher root has no readable owner' }
+        # Granted to the OBSERVED owner. Under an elevated token the owner is the
+        # Administrators group rather than the running user, and the trustee check requires
+        # every examined object's owner to be inside the supplied set.
+        $fullSelf = @(New-Entry $ownerSid $Rights::FullControl)
         $restrictedMember = $null
 
         if ($Shape -ceq 'authorised_self') {
@@ -4792,7 +4827,7 @@ def quote_for_command_line(value):
     return '"%s%s"' % (text, "\\" * trailing)
 
 
-def run_acl_probe_under_restricted_token(exe, tmp, root, authorised=("SELF",)):
+def run_acl_probe_under_restricted_token(exe, tmp, root, authorised=("OWNER",)):
     """Evaluate the write checks under a token with one group identity marked deny-only."""
     runner = Path(tmp) / "eg_restricted_runner.ps1"
     runner.write_text(RESTRICTED_TOKEN_RUNNER, encoding="utf-8")
@@ -4862,8 +4897,15 @@ def build_scratch_launcher_root(exe, tmp, shape, right=""):
     return root, built
 
 
-def check_write_authority(exe, tmp, root, authorised=("SELF",)):
-    """Evaluate both launcher-root write checks over a prepared scratch root."""
+def check_write_authority(exe, tmp, root, authorised=("OWNER",)):
+    """Evaluate both launcher-root write checks over a prepared scratch root.
+
+    The default authorised set is the OBSERVED owner of the scratch root, not the running
+    user. Creating a directory under an elevated token makes the Administrators group the
+    owner, and the trustee check requires every examined object's owner to be inside the
+    supplied set, so assuming the running user would make the fixture pass only on
+    non-elevated hosts.
+    """
     spec = write_json(tmp, "authorised_spec.json", {"authorised": list(authorised)})
     return acl_probe(exe, "check", tmp, root, json=spec)
 
@@ -5197,7 +5239,7 @@ class WriteAuthorityMixin:
         """
         with TemporaryScratch() as tmp:
             root, _built = build_scratch_launcher_root(self.exe, tmp, "authorised_self")
-            observed = check_write_authority(self.exe, tmp, root, authorised=("SELF",))
+            observed = check_write_authority(self.exe, tmp, root, authorised=("OWNER",))
         self.assertTrue(observed["admissionPass"], observed["admissionSupportRef"])
         self.assertEqual(1, observed["admittedCount"])
         self.assertEqual(
