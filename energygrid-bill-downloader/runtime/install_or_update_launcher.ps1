@@ -491,8 +491,7 @@ if ($transactionFailed) {
 # passed. Only AFTER acceptance may retained backups be reaped, which the next task
 # implements. Staging files this transaction created are consumed by publication.
 
-$remainingBackups = @(Get-ChildItem -LiteralPath $resolvedLauncherRoot -Force |
-    Where-Object { (Test-EgResidueName -Name $_.Name).Kind -ceq 'backup' })
-Write-EgInstallerStatus -Status 'INSTALLED' -SupportRef '' `
-    -BackupsRemaining @($remainingBackups).Count
+$cleanup = Invoke-EgPostAcceptanceBackupCleanup -TransactionState $transaction
+Write-EgInstallerStatus -Status 'INSTALLED' -SupportRef $cleanup.SupportRef `
+    -BackupsRemaining $cleanup.BackupsRemaining
 exit 0

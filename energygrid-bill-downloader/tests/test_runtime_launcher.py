@@ -701,6 +701,67 @@ switch ($Op) {
             touchedNames     = @($touched | ForEach-Object { $_.Name })
         } | ConvertTo-Json -Depth 8 -Compress
     }
+    'cleanup' {
+        # Post-acceptance backup cleanup, driven directly against a scratch transaction
+        # record. -Value 'locked' holds the first recorded backup with a share mode that
+        # forbids deletion, which makes the reap of that one file fail deterministically.
+        $operationId = New-EgOperationId
+        $utf8 = New-Object System.Text.UTF8Encoding($false)
+        $transaction = New-EgTransactionState -OperationId $operationId
+        $backupPaths = @()
+        foreach ($name in (Get-EgPublicationOrder)) {
+            $backupPath = Join-Path $Dir (New-EgResidueName -Kind 'backup' -Member $name -OperationId $operationId)
+            [System.IO.File]::WriteAllText($backupPath, ('PREIMAGE-OF-' + $name), $utf8)
+            $entry = New-EgTransactionMember -Name $name `
+                -DestinationPath (Join-Path $Dir $name) -PreimageState 'Existing' `
+                -PreimageSha256 ('0' * 64) -BackupPath $backupPath
+            $transaction.Members = $transaction.Members + $entry
+            $backupPaths = $backupPaths + $backupPath
+        }
+
+        # A validly named backup from a DIFFERENT transaction. Cleanup must never touch it.
+        $foreignName = New-EgResidueName -Kind 'backup' -Member 'launcher.ps1' `
+            -OperationId '11111111-2222-3333-4444-555555555555'
+        $foreignPath = Join-Path $Dir $foreignName
+        [System.IO.File]::WriteAllText($foreignPath, 'FOREIGN-RESIDUE', $utf8)
+
+        $held = $null
+        $backupsRemaining = -1
+        $supportRef = ''
+        $firstStillThere = $false
+        $secondStillThere = $false
+        $foreignStillThere = $false
+        $foreignText = ''
+        try {
+            if ($Value -eq 'locked') {
+                $held = [System.IO.File]::Open($backupPaths[0], [System.IO.FileMode]::Open,
+                    [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+            }
+            $cleanup = Invoke-EgPostAcceptanceBackupCleanup -TransactionState $transaction
+            $backupsRemaining = $cleanup.BackupsRemaining
+            $supportRef = $cleanup.SupportRef
+            $firstStillThere = (Test-Path -LiteralPath $backupPaths[0] -PathType Leaf)
+            $secondStillThere = (Test-Path -LiteralPath $backupPaths[1] -PathType Leaf)
+            $foreignStillThere = (Test-Path -LiteralPath $foreignPath -PathType Leaf)
+            if ($foreignStillThere) {
+                $foreignText = [System.IO.File]::ReadAllText($foreignPath)
+            }
+        }
+        finally {
+            if ($null -ne $held) { $held.Dispose() }
+        }
+
+        [ordered]@{
+            backupsRemaining  = $backupsRemaining
+            supportRef        = $supportRef
+            firstStillThere   = $firstStillThere
+            secondStillThere  = $secondStillThere
+            foreignStillThere = $foreignStillThere
+            foreignText       = $foreignText
+            retainedName      = [System.IO.Path]::GetFileName($backupPaths[0])
+            retainedIsClassB  = (Test-EgResidueName -Name ([System.IO.Path]::GetFileName($backupPaths[0]))).IsResidue
+        } | ConvertTo-Json -Depth 8 -Compress
+    }
     default {
         throw ('unknown probe operation: ' + $Op)
     }
@@ -3075,6 +3136,159 @@ class InstallerRollbackAgainstTheRealInstaller(TierABase):
                         "no rollback residue for %s, so no backup was consumed to restore "
                         "it; residue present: %r" % (member, rollback_residue),
                     )
+
+
+class PostAcceptanceBackupCleanup(TierABase):
+    """Task 12: design section 6.6, the single sanctioned narrow fail-closed exception.
+
+    Reaping a backup is a transaction-commit action, never a per-file one. The section 7
+    primitives prove one publication and have no view of the package, so they have no
+    authority to reap. The installer holds every retained preimage until Phase 4
+    acceptance, because until the manifest has been read back and the package re-verified,
+    any of those preimages might still be needed by rollback.
+    """
+
+    def test_a_successful_update_leaves_no_backup_residue(self):
+        """Backups are reaped, but only after whole-package acceptance."""
+        with TemporaryScratch() as tmp:
+            checkout, commit = build_scratch_checkout(tmp)
+            root = tmp / "launcher_root"
+            root.mkdir()
+            first = run_installer(ANY_PS, checkout, root, commit)
+            self.assertEqual(0, first.returncode, first.stderr)
+
+            revised = revise_scratch_source(checkout)
+            completed = run_installer(ANY_PS, checkout, root, revised)
+            self.assertEqual(0, completed.returncode,
+                             "%s\n%s" % (completed.stdout, completed.stderr))
+            status = installer_status(completed)
+            self.assertEqual("INSTALLED", status["status"])
+            self.assertEqual("", status["support_ref"])
+            self.assertEqual(0, status["backups_remaining"])
+            self.assertEqual([], class_b_entries(root, "backup"))
+            self.assertEqual([], class_b_entries(root, "staging"))
+            self.assertEqual(sorted(CLASS_A_MEMBER_NAMES), launcher_root_entries(root))
+
+            # The accepted installation is still internally consistent afterwards.
+            manifest = json.loads(
+                (root / MANIFEST_FILE_NAME).read_text(encoding="utf-8")
+            )
+            self.assertEqual(revised, manifest["admission_commit"])
+            for entry in manifest["members"]:
+                self.assertEqual(sha256_of(root / entry["name"]), entry["sha256"])
+
+    def test_a_failed_cleanup_keeps_the_accepted_install_and_reports_it_visibly(self):
+        """A redundant artefact after a verified success is never turned into an outage.
+
+        Rolling back a fully accepted installation because a now-redundant backup could not
+        be deleted would replace a good outcome with a worse one. The failure is not
+        swallowed: absence is verified after every delete attempt and what remains is
+        counted and reported under a bounded reference.
+        """
+        with TemporaryScratch() as tmp:
+            work = tmp / "work"
+            work.mkdir()
+            observed = probe_json(ANY_PS, "cleanup", tmp, dir=work, value="locked")
+        self.assertEqual(1, observed["backupsRemaining"])
+        self.assertEqual(
+            "EG_LAUNCHER_INSTALL_BACKUP_CLEANUP_INCOMPLETE", observed["supportRef"]
+        )
+        self.assertTrue(
+            observed["firstStillThere"], "the undeletable backup is retained as inert residue"
+        )
+        self.assertFalse(
+            observed["secondStillThere"],
+            "one failure must not abandon the rest of the reap",
+        )
+
+    def test_retained_cleanup_residue_still_satisfies_the_class_b_contract(self):
+        """The installer never leaves an arbitrary filename in the launcher root.
+
+        A retained backup must still parse as recognised residue, so the next launcher
+        preflight passes rather than failing closed on a file the installer itself
+        deliberately left and called inert.
+        """
+        with TemporaryScratch() as tmp:
+            work = tmp / "work"
+            work.mkdir()
+            observed = probe_json(ANY_PS, "cleanup", tmp, dir=work, value="locked")
+        self.assertTrue(observed["retainedIsClassB"])
+        self.assertTrue(observed["retainedName"].startswith(RESIDUE_PREFIX))
+        self.assertFalse(observed["retainedName"].endswith(".ps1"))
+
+    def test_cleanup_never_deletes_a_file_this_transaction_did_not_create(self):
+        """Only backups identified by THIS transaction's exact reserved name are reaped."""
+        for variant in ("clean", "locked"):
+            with self.subTest(variant=variant):
+                with TemporaryScratch() as tmp:
+                    work = tmp / "work"
+                    work.mkdir()
+                    observed = probe_json(
+                        ANY_PS, "cleanup", tmp, dir=work, value=variant
+                    )
+                self.assertTrue(
+                    observed["foreignStillThere"],
+                    "a validly named backup from a different transaction must survive",
+                )
+                self.assertEqual("FOREIGN-RESIDUE", observed["foreignText"])
+
+    def test_a_clean_cleanup_reaps_every_backup_and_reports_none_remaining(self):
+        """The ordinary post-acceptance path reaps exactly this transaction's backups."""
+        with TemporaryScratch() as tmp:
+            work = tmp / "work"
+            work.mkdir()
+            observed = probe_json(ANY_PS, "cleanup", tmp, dir=work, value="clean")
+        self.assertEqual(0, observed["backupsRemaining"])
+        self.assertEqual("", observed["supportRef"])
+        self.assertFalse(observed["firstStillThere"])
+        self.assertFalse(observed["secondStillThere"])
+
+
+class PostAcceptanceCleanupStructuralGuard(TierCBase):
+    """Task 12, Tier C: cleanup authority belongs to the Phase 4 commit step alone."""
+
+    def test_cleanup_is_called_once_and_only_after_the_failure_path_has_exited(self):
+        """A cleanup failure cannot reach a rollback, because rollback has already exited.
+
+        The installer's pre-acceptance failure block exits before the cleanup call site is
+        reached, so the design's rule that an accepted installation is never rolled back
+        over a redundant artefact is structural rather than a matter of ordering luck.
+        """
+        text = INSTALLER.read_text(encoding="utf-8")
+        call_sites = [
+            index for index in range(len(text))
+            if text.startswith("Invoke-EgPostAcceptanceBackupCleanup", index)
+        ]
+        self.assertEqual(
+            1, len(call_sites), "there must be exactly one cleanup call site"
+        )
+        rollback_sites = [
+            index for index in range(len(text))
+            if text.startswith("Invoke-EgPackageRollback", index)
+        ]
+        self.assertEqual(1, len(rollback_sites))
+        self.assertLess(
+            rollback_sites[0],
+            call_sites[0],
+            "cleanup must be reachable only after the failure path has already exited",
+        )
+        tail = text[call_sites[0]:]
+        self.assertNotIn(
+            "Invoke-EgPackageRollback",
+            tail,
+            "no rollback may follow the cleanup call site",
+        )
+        self.assertIn(
+            "exit 0",
+            tail,
+            "a committed installation exits 0 even when cleanup left residue",
+        )
+        for forbidden in ("InstallRolledBack", "InstallRollbackIncomplete"):
+            self.assertNotIn(
+                forbidden,
+                tail,
+                "a cleanup failure must not reach a rollback exit band",
+            )
 
 
 if __name__ == "__main__":

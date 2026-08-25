@@ -566,6 +566,64 @@ function Invoke-EgPackageRollback {
     }
 }
 
+function Invoke-EgPostAcceptanceBackupCleanup {
+    # Reap the retained preimage backups of an ACCEPTED transaction (design section 6.6).
+    #
+    # Only a backup THIS transaction created is ever reaped, identified by the exact
+    # reserved name recorded in the transaction state. A file this transaction did not
+    # create is never deleted, including a validly named backup left by a different
+    # transaction.
+    #
+    # This is the design's single sanctioned narrow exception to the fail-closed default,
+    # and it is bounded exactly as written. If a delete fails the package is already
+    # committed, verified, and correct on disk, so rolling it back over a now-redundant
+    # artefact would replace a good outcome with a worse one. Instead the accepted
+    # installation is kept, the undeleted backup is retained as inert residue that still
+    # satisfies the Class B contract, and the caller exits 0.
+    #
+    # The failure is NEVER swallowed. Absence is positively verified after every delete
+    # attempt, and whatever remains is counted and reported under a bounded,
+    # operator-visible reference. A caught delete error is therefore not a silent
+    # continue: it is converted into observed filesystem state that the caller reports.
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$TransactionState)
+
+    $remaining = 0
+    foreach ($entry in @($TransactionState.Members)) {
+        if ([string]::IsNullOrEmpty($entry.BackupPath)) {
+            continue
+        }
+        # The recorded path must be exactly the name this transaction would have produced.
+        $expectedName = New-EgResidueName -Kind 'backup' -Member $entry.Name `
+            -OperationId $TransactionState.OperationId
+        if ([System.IO.Path]::GetFileName($entry.BackupPath) -cne $expectedName) {
+            continue
+        }
+        if (-not (Test-Path -LiteralPath $entry.BackupPath -PathType Leaf)) {
+            continue
+        }
+        try {
+            Remove-Item -LiteralPath $entry.BackupPath -Force -ErrorAction Stop
+        }
+        catch {
+            # Deliberately not rethrown; the outcome is decided by the absence check below.
+        }
+        if (Test-Path -LiteralPath $entry.BackupPath -PathType Leaf) {
+            $remaining++
+        }
+    }
+
+    $supportRef = ''
+    if ($remaining -gt 0) {
+        $supportRef = 'EG_LAUNCHER_INSTALL_BACKUP_CLEANUP_INCOMPLETE'
+    }
+
+    [pscustomobject]@{
+        BackupsRemaining = [int]$remaining
+        SupportRef       = $supportRef
+    }
+}
+
 function New-EgOperationId {
     # The installer transaction identifier used in the Class B operation-id field. One per
     # installer invocation. -ValidateOnly generates none, because it creates no residue and
