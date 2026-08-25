@@ -762,6 +762,125 @@ switch ($Op) {
             retainedIsClassB  = (Test-EgResidueName -Name ([System.IO.Path]::GetFileName($backupPaths[0]))).IsResidue
         } | ConvertTo-Json -Depth 8 -Compress
     }
+    'credmake' {
+        # Build a synthetic PSCredential from per-run throwaway values and export it with
+        # the SAME user-bound mechanism the launcher imports with. -Json is the PATH to a
+        # JSON file carrying { username, password }. The values are never real credentials
+        # and never leave the runner's temporary directory.
+        $spec = Get-Content -LiteralPath $Json -Raw | ConvertFrom-Json
+        $secure = ConvertTo-SecureString -String $spec.password -AsPlainText -Force
+        $credential = New-Object System.Management.Automation.PSCredential($spec.username, $secure)
+        $credential | Export-Clixml -LiteralPath $Path
+        [ordered]@{ exported = (Test-Path -LiteralPath $Path -PathType Leaf) } |
+            ConvertTo-Json -Depth 4 -Compress
+    }
+    'credimport' {
+        # Import the artefact at -Path and derive the three viability booleans. No
+        # credential value, length, prefix, suffix, or hash is ever emitted.
+        $imported = Import-EgLauncherCredential -CredentialPath $Path
+        $viability = Test-EgCredentialViability -Credential $imported.Credential
+        [ordered]@{
+            importSuccess       = $imported.Success
+            importSupportRef    = $imported.SupportRef
+            credentialIsNull    = ($null -eq $imported.Credential)
+            credentialImportOk  = $viability.CredentialImportOk
+            usernameNonEmpty    = $viability.UsernameNonEmpty
+            passwordNonEmpty    = $viability.PasswordNonEmpty
+            viabilitySupportRef = $viability.SupportRef
+        } | ConvertTo-Json -Depth 8 -Compress
+    }
+    'credinject' {
+        # The full injection sequence: snapshot, set at PROCESS SCOPE ONLY, run a child
+        # stub, then restore exactly on the finally-equivalent path. -Path is the credential
+        # artefact, -Path2 the PowerShell host to run the stub with, -Path3 the stub,
+        # -Dir the scratch directory, and -Value2 an optional pre-set username value.
+        $names = @($script:EgCredentialVariableNames)
+
+        if ($Value2 -ne '') {
+            [System.Environment]::SetEnvironmentVariable($names[0], $Value2, 'Process')
+        }
+        else {
+            [System.Environment]::SetEnvironmentVariable($names[0], $null, 'Process')
+        }
+        [System.Environment]::SetEnvironmentVariable($names[1], $null, 'Process')
+
+        $before = [ordered]@{}
+        foreach ($name in $names) {
+            $observed = [System.Environment]::GetEnvironmentVariable($name, 'Process')
+            $before[$name] = [ordered]@{ present = ($null -ne $observed); value = ([string]$observed) }
+        }
+
+        $imported = Import-EgLauncherCredential -CredentialPath $Path
+        $viability = Test-EgCredentialViability -Credential $imported.Credential
+
+        $childOutPath = Join-Path $Dir 'child_observed.json'
+        $childExit = -1
+        $restorePass = $false
+        $restoreSupportRef = ''
+
+        if ($viability.CredentialImportOk -and $viability.UsernameNonEmpty -and $viability.PasswordNonEmpty) {
+            $plainUser = $imported.Credential.UserName
+            $bstr = [System.IntPtr]::Zero
+            $plainPassword = ''
+            try {
+                $bstr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($imported.Credential.Password)
+                $plainPassword = [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
+            }
+            finally {
+                if ($bstr -ne [System.IntPtr]::Zero) {
+                    [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+                }
+            }
+
+            $variables = [ordered]@{}
+            $variables[$names[0]] = $plainUser
+            $variables[$names[1]] = $plainPassword
+
+            $stubArguments = @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+                '-File', $Path3, '-OutPath', $childOutPath)
+            $injected = Invoke-EgWithInjectedProcessEnvironment -Variables $variables -Body {
+                $started = Start-Process -FilePath $Path2 -ArgumentList $stubArguments `
+                    -NoNewWindow -Wait -PassThru
+                $started.ExitCode
+            }
+            $childExit = $injected.BodyResult
+            $restorePass = $injected.Restore.Pass
+            $restoreSupportRef = $injected.Restore.SupportRef
+            $plainPassword = ''
+        }
+
+        $after = [ordered]@{}
+        foreach ($name in $names) {
+            $observed = [System.Environment]::GetEnvironmentVariable($name, 'Process')
+            $after[$name] = [ordered]@{ present = ($null -ne $observed); value = ([string]$observed) }
+        }
+
+        $userScope = [ordered]@{}
+        $machineScope = [ordered]@{}
+        foreach ($name in $names) {
+            $userScope[$name] = ($null -ne [System.Environment]::GetEnvironmentVariable($name, 'User'))
+            $machineScope[$name] = ($null -ne [System.Environment]::GetEnvironmentVariable($name, 'Machine'))
+        }
+
+        $childObserved = ''
+        if (Test-Path -LiteralPath $childOutPath -PathType Leaf) {
+            $childObserved = [System.IO.File]::ReadAllText($childOutPath)
+        }
+
+        [ordered]@{
+            importSuccess     = $imported.Success
+            importSupportRef  = $imported.SupportRef
+            childExit         = $childExit
+            childObserved     = $childObserved
+            childStubRan      = (Test-Path -LiteralPath $childOutPath -PathType Leaf)
+            restorePass       = $restorePass
+            restoreSupportRef = $restoreSupportRef
+            before            = $before
+            after             = $after
+            userScope         = $userScope
+            machineScope      = $machineScope
+        } | ConvertTo-Json -Depth 8 -Compress
+    }
     default {
         throw ('unknown probe operation: ' + $Op)
     }
@@ -3289,6 +3408,373 @@ class PostAcceptanceCleanupStructuralGuard(TierCBase):
                 tail,
                 "a cleanup failure must not reach a rollback exit band",
             )
+
+
+CHILD_STUB_SCRIPT = r"""
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory)][string]$OutPath,
+    [int]$ExitCode = 0
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+function Get-ProcessVariable([string]$Name) {
+    return [System.Environment]::GetEnvironmentVariable($Name, 'Process')
+}
+
+$username = Get-ProcessVariable 'ENERGYGRID_USERNAME'
+$password = Get-ProcessVariable 'ENERGYGRID_PASSWORD'
+$cache = Get-ProcessVariable 'PLAYWRIGHT_BROWSERS_PATH'
+
+# PRESENCE and non-emptiness only for the credential variables. Their VALUES are never
+# written to disk, emitted, measured, or hashed by this stub. The browser-cache value is a
+# path rather than a secret, so it is recorded so the binding can be asserted.
+$observed = [ordered]@{
+    usernamePresent   = ($null -ne $username)
+    passwordPresent   = ($null -ne $password)
+    usernameNonEmpty  = (-not [string]::IsNullOrEmpty($username))
+    passwordNonEmpty  = (-not [string]::IsNullOrEmpty($password))
+    browserCacheValue = ([string]$cache)
+    workingDirectory  = (Get-Location).Path
+}
+
+$utf8 = New-Object System.Text.UTF8Encoding($false)
+[System.IO.File]::WriteAllText($OutPath, ($observed | ConvertTo-Json -Depth 8 -Compress), $utf8)
+exit $ExitCode
+"""
+
+
+def write_child_stub(tmp):
+    """Materialise the scratch child stub. The application itself is never invoked."""
+    path = Path(tmp) / "eg_child_stub.ps1"
+    path.write_text(CHILD_STUB_SCRIPT, encoding="utf-8")
+    return path
+
+
+def synthetic_credential_values():
+    """Per-run throwaway values. Never real credentials, never reused."""
+    import secrets
+
+    return (
+        "eg-synthetic-user-%s" % secrets.token_hex(8),
+        "eg-synthetic-secret-%s" % secrets.token_hex(16),
+    )
+
+
+def make_synthetic_credential_artefact(exe, tmp, artefact_path=None):
+    """Export a synthetic same-user DPAPI PSCredential CLIXML into a scratch path."""
+    username, password = synthetic_credential_values()
+    artefact = Path(artefact_path) if artefact_path else (Path(tmp) / "synthetic.credential.xml")
+    spec = write_json(tmp, "cred_spec.json", {"username": username, "password": password})
+    result = probe_json(exe, "credmake", tmp, path=artefact, json=spec)
+    if not result["exported"]:
+        raise AssertionError("the synthetic credential artefact was not written")
+    return artefact, username, password
+
+
+class DpapiCredentialContractMixin:
+    """Design section 9.2, asserted on one interpreter.
+
+    Git owns the import, injection, and cleanup BEHAVIOUR. The DPAPI artefact itself, its
+    absolute path, the Windows user identity it is bound to, and every value it yields stay
+    private and outside the repository.
+    """
+
+    exe = None
+
+    def test_a_synthetic_same_user_dpapi_credential_imports_successfully(self):
+        """EGRT-T21: the real DPAPI path, end to end, with throwaway values."""
+        with TemporaryScratch() as tmp:
+            artefact, username, password = make_synthetic_credential_artefact(self.exe, tmp)
+            completed = probe(self.exe, "credimport", tmp, path=artefact)
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        observed = json.loads(completed.stdout)
+        self.assertTrue(observed["importSuccess"], observed["importSupportRef"])
+        self.assertEqual("", observed["importSupportRef"])
+        self.assertFalse(observed["credentialIsNull"])
+        self.assertTrue(observed["credentialImportOk"])
+        self.assertTrue(observed["usernameNonEmpty"])
+        self.assertTrue(observed["passwordNonEmpty"])
+        self.assertEqual("", observed["viabilitySupportRef"])
+
+        for stream_name, stream in (("stdout", completed.stdout), ("stderr", completed.stderr)):
+            with self.subTest(stream=stream_name):
+                self.assertNotIn(username, stream)
+                self.assertNotIn(password, stream)
+
+    def test_a_corrupted_or_unreadable_artefact_fails_closed(self):
+        """EGRT-T22: absent, truncated, and non-PSCredential artefacts each fail closed."""
+        with TemporaryScratch() as tmp:
+            absent = tmp / "does_not_exist.credential.xml"
+            observed = probe_json(self.exe, "credimport", tmp, path=absent)
+            self.assertFalse(observed["importSuccess"])
+            self.assertEqual(
+                "EG_LAUNCHER_CREDENTIAL_ARTEFACT_MISSING", observed["importSupportRef"]
+            )
+            self.assertTrue(observed["credentialIsNull"])
+            self.assertFalse(observed["credentialImportOk"])
+
+        with TemporaryScratch() as tmp:
+            artefact, _user, _password = make_synthetic_credential_artefact(self.exe, tmp)
+            raw = artefact.read_bytes()
+            artefact.write_bytes(raw[: len(raw) // 3])
+            observed = probe_json(self.exe, "credimport", tmp, path=artefact)
+            self.assertFalse(observed["importSuccess"])
+            self.assertEqual(
+                "EG_LAUNCHER_CREDENTIAL_IMPORT_FAILED", observed["importSupportRef"]
+            )
+            self.assertTrue(observed["credentialIsNull"])
+
+        with TemporaryScratch() as tmp:
+            artefact = tmp / "not_a_credential.xml"
+            # Valid CLIXML that deserialises to something other than a PSCredential.
+            run_ps(
+                self.exe,
+                _write_scratch_script(
+                    tmp,
+                    "export_string.ps1",
+                    "param([Parameter(Mandatory)][string]$Path)\r\n"
+                    "'not-a-credential' | Export-Clixml -LiteralPath $Path\r\n",
+                ),
+                "-Path", str(artefact),
+            )
+            observed = probe_json(self.exe, "credimport", tmp, path=artefact)
+            self.assertFalse(observed["importSuccess"])
+            self.assertEqual(
+                "EG_LAUNCHER_CREDENTIAL_IMPORT_FAILED", observed["importSupportRef"]
+            )
+            self.assertTrue(observed["credentialIsNull"])
+
+
+def _write_scratch_script(tmp, name, body):
+    """Write a tiny scratch helper script and return its path."""
+    path = Path(tmp) / name
+    path.write_text(body, encoding="utf-8")
+    return path
+
+
+class DpapiCredentialTierA(DpapiCredentialContractMixin, TierABase):
+    """Task 13, Tier A."""
+
+    @classmethod
+    def setUpClass(cls):
+        TierABase.setUpClass()
+        cls.exe = ANY_PS
+
+    def _inject(self, tmp, artefact, preset_username=""):
+        stub = write_child_stub(tmp)
+        work = tmp / "work"
+        if not work.exists():
+            work.mkdir()
+        kwargs = {
+            "dir": work,
+            "path": artefact,
+            "path2": ANY_PS,
+            "path3": stub,
+        }
+        if preset_username:
+            kwargs["value2"] = preset_username
+        return probe(ANY_PS, "credinject", tmp, **kwargs)
+
+    def test_the_child_stub_observes_both_credential_variables_only_during_execution(self):
+        """EGRT-T23: injection is scoped to the bounded child execution."""
+        with TemporaryScratch() as tmp:
+            artefact, username, password = make_synthetic_credential_artefact(ANY_PS, tmp)
+            completed = self._inject(tmp, artefact)
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        observed = json.loads(completed.stdout)
+        self.assertTrue(observed["childStubRan"])
+        self.assertEqual(0, observed["childExit"])
+
+        child = json.loads(observed["childObserved"])
+        self.assertTrue(child["usernamePresent"], "the child must observe the username")
+        self.assertTrue(child["passwordPresent"], "the child must observe the password")
+        self.assertTrue(child["usernameNonEmpty"])
+        self.assertTrue(child["passwordNonEmpty"])
+
+        for name in ("ENERGYGRID_USERNAME", "ENERGYGRID_PASSWORD"):
+            with self.subTest(variable=name):
+                self.assertFalse(
+                    observed["before"][name]["present"],
+                    "%s must not be present before injection" % name,
+                )
+                self.assertFalse(
+                    observed["after"][name]["present"],
+                    "%s must not be present after the child exits" % name,
+                )
+
+    def test_both_credential_variables_are_restored_exactly_afterwards(self):
+        """EGRT-T24: previously absent stays absent; previously present is restored exactly."""
+        with TemporaryScratch() as tmp:
+            artefact, _user, _password = make_synthetic_credential_artefact(ANY_PS, tmp)
+            completed = self._inject(tmp, artefact)
+        observed = json.loads(completed.stdout)
+        self.assertTrue(observed["restorePass"], observed["restoreSupportRef"])
+        self.assertEqual("", observed["restoreSupportRef"])
+        for name in ("ENERGYGRID_USERNAME", "ENERGYGRID_PASSWORD"):
+            with self.subTest(variable=name, case="previously absent"):
+                self.assertFalse(observed["after"][name]["present"])
+                self.assertEqual(
+                    "",
+                    observed["after"][name]["value"],
+                    "an absent variable is REMOVED, never left set to an empty string",
+                )
+
+        preset = "eg-preexisting-username-value"
+        with TemporaryScratch() as tmp:
+            artefact, _user, _password = make_synthetic_credential_artefact(ANY_PS, tmp)
+            completed = self._inject(tmp, artefact, preset_username=preset)
+        observed = json.loads(completed.stdout)
+        self.assertTrue(observed["restorePass"], observed["restoreSupportRef"])
+        self.assertTrue(observed["before"]["ENERGYGRID_USERNAME"]["present"])
+        self.assertEqual(preset, observed["before"]["ENERGYGRID_USERNAME"]["value"])
+        self.assertTrue(observed["after"]["ENERGYGRID_USERNAME"]["present"])
+        self.assertEqual(
+            preset,
+            observed["after"]["ENERGYGRID_USERNAME"]["value"],
+            "a previously present variable is restored to its EXACT original value",
+        )
+        self.assertFalse(observed["after"]["ENERGYGRID_PASSWORD"]["present"])
+
+    def test_no_user_or_machine_scope_credential_variable_is_ever_written(self):
+        """EGRT-T25, dynamic half: the persistent scopes stay untouched on every path."""
+        with TemporaryScratch() as tmp:
+            artefact, _user, _password = make_synthetic_credential_artefact(ANY_PS, tmp)
+            success = json.loads(self._inject(tmp, artefact).stdout)
+        with TemporaryScratch() as tmp:
+            absent = tmp / "does_not_exist.credential.xml"
+            stub = write_child_stub(tmp)
+            work = tmp / "work"
+            work.mkdir()
+            failure = json.loads(
+                probe(
+                    ANY_PS, "credinject", tmp,
+                    dir=work, path=absent, path2=ANY_PS, path3=stub,
+                ).stdout
+            )
+        self.assertFalse(failure["importSuccess"])
+        self.assertFalse(
+            failure["childStubRan"],
+            "a failed import must not start the child at all",
+        )
+        for observed, label in ((success, "success"), (failure, "failure")):
+            for name in ("ENERGYGRID_USERNAME", "ENERGYGRID_PASSWORD"):
+                with self.subTest(path=label, variable=name):
+                    self.assertFalse(observed["userScope"][name])
+                    self.assertFalse(observed["machineScope"][name])
+
+    def test_no_credential_value_reaches_any_output_surface(self):
+        """EGRT-T26, dynamic half: neither value appears anywhere, on success or failure."""
+        with TemporaryScratch() as tmp:
+            artefact, username, password = make_synthetic_credential_artefact(ANY_PS, tmp)
+            completed = self._inject(tmp, artefact)
+            surfaces = {
+                "stdout": completed.stdout,
+                "stderr": completed.stderr,
+                "child_observation_file": (tmp / "work" / "child_observed.json").read_text(
+                    encoding="utf-8"
+                ),
+            }
+        for surface, text in surfaces.items():
+            for label, secret in (("username", username), ("password", password)):
+                with self.subTest(surface=surface, value=label):
+                    self.assertNotIn(secret, text)
+
+
+class DpapiCredentialTierB(DpapiCredentialContractMixin, TierBBase):
+    """Task 13, Tier B: the DPAPI path on the Windows PowerShell 5.1 boundary.
+
+    SecureString export is not encrypted outside Windows, so the credential tests are
+    pinned to the Windows boundary.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        TierBBase.setUpClass()
+        cls.exe = DESKTOP_PS
+
+
+class CredentialStaticGuards(TierCBase):
+    """Task 13, Tier C: EGRT-T25, EGRT-T26, and EGRT-T49 over the committed runtime.
+
+    On the testability boundary, stated honestly: cross-user and cross-machine rejection
+    are NOT testable in hosted CI, because proving the artefact fails to import under a
+    different Windows user needs a second interactive account. That gap is covered two
+    ways, neither of which pretends to be the missing test. DPAPI CurrentUser protection
+    supplies the property by construction rather than through code the launcher could get
+    wrong, and the -Key/-SecureKey guard below regresses the part that is actually ours.
+    """
+
+    def _runtime_text(self):
+        return {path.name: path.read_text(encoding="utf-8")
+                for path in existing_runtime_ps1_files()}
+
+    def test_no_committed_runtime_file_writes_a_persistent_environment_scope(self):
+        """EGRT-T25, static half: only the Process scope is ever used."""
+        for name, text in self._runtime_text().items():
+            for number, line in non_comment_lines(text):
+                if "SetEnvironmentVariable" not in line:
+                    continue
+                with self.subTest(runtime_file=name, line=number):
+                    self.assertNotIn("'User'", line)
+                    self.assertNotIn('"User"', line)
+                    self.assertNotIn("'Machine'", line)
+                    self.assertNotIn('"Machine"', line)
+                    self.assertIn(
+                        "'Process'",
+                        line,
+                        "every environment write must name the Process scope explicitly",
+                    )
+
+    def test_no_committed_cleanup_path_disposes_a_pscredential(self):
+        """EGRT-T49: PSCredential does not implement IDisposable, so Dispose would throw."""
+        for name, text in self._runtime_text().items():
+            for number, line in non_comment_lines(text):
+                if ".Dispose()" not in line:
+                    continue
+                with self.subTest(runtime_file=name, line=number):
+                    lowered = line.lower()
+                    for forbidden in ("credential", "pscredential"):
+                        self.assertNotIn(
+                            forbidden,
+                            lowered,
+                            "no cleanup path may dispose a PSCredential",
+                        )
+
+    def test_the_committed_import_path_uses_the_user_bound_mechanism_only(self):
+        """EGRT-T49 support: a keyed export would silently void the DPAPI binding."""
+        found_import = False
+        for name, text in self._runtime_text().items():
+            for number, line in non_comment_lines(text):
+                if "Import-Clixml" not in line:
+                    continue
+                found_import = True
+                with self.subTest(runtime_file=name, line=number):
+                    self.assertNotIn("-Key", line)
+                    self.assertNotIn("-SecureKey", line)
+        self.assertTrue(
+            found_import,
+            "the credential import path must use Import-Clixml",
+        )
+
+    def test_no_committed_runtime_file_emits_a_credential_derived_quantity(self):
+        """EGRT-T26, static half: no length, prefix, suffix, or hash of a credential value."""
+        forbidden_patterns = (
+            r"ENERGYGRID_PASSWORD['\"]?\s*\)?\s*\.Length",
+            r"Get-FileHash[^\r\n]*Password",
+            r"\$plainPassword\s*\|",
+            r"Write-(Host|Output|Verbose|Warning|Error)[^\r\n]*\$?\w*[Pp]assword",
+        )
+        for name, text in self._runtime_text().items():
+            for pattern in forbidden_patterns:
+                with self.subTest(runtime_file=name, pattern=pattern):
+                    self.assertIsNone(
+                        re.search(pattern, text),
+                        "%s appears to derive a reportable quantity from a credential"
+                        % name,
+                    )
 
 
 if __name__ == "__main__":

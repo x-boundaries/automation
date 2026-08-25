@@ -1302,7 +1302,7 @@ function Restore-EgProcessEnvironmentSnapshot {
             $desired = $entry.Value
         }
         try {
-            [System.Environment]::SetEnvironmentVariable($name, $desired, 'Process')
+            Set-EgProcessEnvironmentVariable -Name $name -Value $desired
             $observed = [System.Environment]::GetEnvironmentVariable($name, 'Process')
             if ($entry.Present) {
                 if ($null -eq $observed -or $observed -ne $entry.Value) {
@@ -1343,6 +1343,179 @@ function Restore-EgProcessEnvironmentSnapshot {
 # --------------------------------------------------------------------------------------
 # Governed Git invocation (design sections 10.1, 10.2, 10.3)
 # --------------------------------------------------------------------------------------
+
+function Set-EgProcessEnvironmentVariable {
+    # PROCESS SCOPE ONLY. The User and Machine scopes are never used anywhere in the
+    # committed runtime, so no persistent EnergyGrid credential variable is ever created on
+    # the host and the existing absence of those persistent variables is preserved
+    # (EGRT-T25). A $null value REMOVES the variable rather than setting it to an empty
+    # string.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Name,
+        [Parameter(Mandatory)][AllowEmptyString()][AllowNull()][string]$Value
+    )
+
+    [System.Environment]::SetEnvironmentVariable($Name, $Value, 'Process')
+}
+
+function Invoke-EgWithInjectedProcessEnvironment {
+    # Snapshot the named variables, set them at PROCESS SCOPE ONLY for the bounded body,
+    # then restore the exact prior process state on a finally-equivalent path reached
+    # whether the body succeeded, failed, or never started.
+    #
+    # This is the single implementation of the injection sequence, so the launcher entry
+    # script and the offline tests exercise the same code rather than two copies of it.
+    #
+    # Values passed in may be credential-derived. They exist in memory only: this function
+    # never writes them to disk, never logs them, never places them in the returned object,
+    # and never derives any reportable quantity from them.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Variables,
+        [Parameter(Mandatory)][scriptblock]$Body
+    )
+
+    $names = @($Variables.Keys)
+    $snapshot = Get-EgProcessEnvironmentSnapshot -Names $names
+    $bodyResult = $null
+    $restore = $null
+    try {
+        foreach ($name in $names) {
+            Set-EgProcessEnvironmentVariable -Name $name -Value $Variables[$name]
+        }
+        $bodyResult = & $Body
+    }
+    finally {
+        $restore = Restore-EgProcessEnvironmentSnapshot -Snapshot $snapshot
+    }
+
+    [pscustomobject]@{
+        BodyResult = $bodyResult
+        Restore    = $restore
+    }
+}
+
+# --------------------------------------------------------------------------------------
+# DPAPI credential import and viability (design section 9.2)
+# --------------------------------------------------------------------------------------
+# What stays private: the DPAPI artefact itself, its absolute path, the Windows user
+# identity it is bound to, and every value it yields. The artefact is never committed,
+# never copied into the checkout, and never reconstructed by the repository. Its location
+# reaches the launcher only through a parameter, supplied from private host settings.
+#
+# What Git owns: the import, injection, and cleanup behaviour, expressed without any
+# private value.
+#
+# This design makes no claim of cryptographic erasure of managed memory. .NET string
+# interning and garbage collection make that claim false, and a false guarantee is worse
+# than a bounded one. What is guaranteed is bounded lifetime, exact environment
+# restoration, and no persistence to disk or to any durable environment scope.
+
+function Import-EgLauncherCredential {
+    # Import the private DPAPI PSCredential CLIXML artefact.
+    #
+    # Uses Import-Clixml ONLY, and passes NO -Key and NO -SecureKey argument. A keyed
+    # export would silently convert the artefact into something portable between users and
+    # void the DPAPI CurrentUser binding, which is the property that makes cross-user
+    # rejection a construction guarantee rather than a check this code has to write.
+    #
+    # No exception message text is recorded anywhere, and nothing is emitted on any path.
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$CredentialPath)
+
+    if (-not (Test-Path -LiteralPath $CredentialPath -PathType Leaf)) {
+        return [pscustomobject]@{
+            Success    = $false
+            SupportRef = 'EG_LAUNCHER_CREDENTIAL_ARTEFACT_MISSING'
+            Credential = $null
+        }
+    }
+
+    $imported = $null
+    try {
+        $imported = Import-Clixml -LiteralPath $CredentialPath
+    }
+    catch {
+        return [pscustomobject]@{
+            Success    = $false
+            SupportRef = 'EG_LAUNCHER_CREDENTIAL_IMPORT_FAILED'
+            Credential = $null
+        }
+    }
+
+    if ($imported -isnot [System.Management.Automation.PSCredential]) {
+        return [pscustomobject]@{
+            Success    = $false
+            SupportRef = 'EG_LAUNCHER_CREDENTIAL_IMPORT_FAILED'
+            Credential = $null
+        }
+    }
+
+    [pscustomobject]@{
+        Success    = $true
+        SupportRef = ''
+        Credential = $imported
+    }
+}
+
+function Test-EgCredentialViability {
+    # Require a non-empty username and a non-empty password. Either being empty is
+    # terminal, and this happens BEFORE the child process starts, so there is no path on
+    # which the application is launched with absent, partial, or unverified credentials.
+    #
+    # Password non-emptiness is derived by marshalling the SecureString inside a
+    # try/finally that ALWAYS zeroes and frees the unmanaged buffer, testing only whether
+    # the length exceeds zero. The length itself is never recorded, returned, logged, or
+    # emitted in any form: only the boolean leaves this function.
+    #
+    # Dispose is NEVER called on the PSCredential. PSCredential does not implement
+    # IDisposable and the call would throw at runtime.
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][AllowNull()]$Credential)
+
+    if ($null -eq $Credential) {
+        return [pscustomobject]@{
+            CredentialImportOk = $false
+            UsernameNonEmpty   = $false
+            PasswordNonEmpty   = $false
+            SupportRef         = 'EG_LAUNCHER_CREDENTIAL_INCOMPLETE'
+        }
+    }
+
+    $usernameNonEmpty = (-not [string]::IsNullOrEmpty($Credential.UserName))
+
+    $passwordNonEmpty = $false
+    $secure = $Credential.Password
+    if ($null -ne $secure) {
+        $unmanaged = [System.IntPtr]::Zero
+        try {
+            $unmanaged = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
+            $plain = [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR($unmanaged)
+            if ($null -ne $plain) {
+                $passwordNonEmpty = ($plain.Length -gt 0)
+            }
+            $plain = ''
+        }
+        finally {
+            if ($unmanaged -ne [System.IntPtr]::Zero) {
+                [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($unmanaged)
+            }
+        }
+    }
+
+    $supportRef = ''
+    if (-not ($usernameNonEmpty -and $passwordNonEmpty)) {
+        $supportRef = 'EG_LAUNCHER_CREDENTIAL_INCOMPLETE'
+    }
+
+    [pscustomobject]@{
+        CredentialImportOk = $true
+        UsernameNonEmpty   = $usernameNonEmpty
+        PasswordNonEmpty   = $passwordNonEmpty
+        SupportRef         = $supportRef
+    }
+}
 
 function Get-EgGovernedGitEnvironmentNames {
     # The exact nineteen ambient Git variables design section 10.2 names, in a fixed
@@ -1495,7 +1668,7 @@ function Invoke-GovernedGit {
     $process = $null
     try {
         foreach ($governedName in $governedNames) {
-            [System.Environment]::SetEnvironmentVariable($governedName, $null, 'Process')
+            Set-EgProcessEnvironmentVariable -Name $governedName -Value $null
         }
         $process = New-Object System.Diagnostics.Process
         $process.StartInfo = $startInfo
