@@ -2052,7 +2052,7 @@ class AtomicFileReplaceBackupSemantics(TierABase):
     """Task 5: EGRT-T11, conditional backup semantics with no reaping by the primitive."""
 
     def test_backup_semantics_are_conditional_and_never_reaped(self):
-        """After a verified publication and after a Case B failure, the backup is retained."""
+        """EGRT-T11: after a verified publication and after Case B, the backup is retained."""
         verified = replace_probe(ANY_PS, "ok")
         self.assertTrue(verified["success"])
         self.assertTrue(
@@ -6838,6 +6838,555 @@ class SupportReferenceStaticGuards(TierCBase):
                     mapper,
                     "classification must read TYPE and HRESULT only, never message text",
                 )
+
+
+# --------------------------------------------------------------------------------------
+# Privacy guard over committed files (design section 17.1)
+# --------------------------------------------------------------------------------------
+# Never committed: username; password; credential blob or DPAPI material; connection
+# string; private account identity; private absolute server path; UNC path; host or
+# principal identity; any host-specific secret value. This guard enforces the mechanically
+# checkable subset over the committed runtime files, the example settings file, the runtime
+# README, and this test module itself.
+
+FORBIDDEN_PATTERNS = {
+    "windows_absolute_path": r"[A-Za-z]:\\\\",
+    "unc_path": r"\\\\\\\\[A-Za-z0-9]",
+    "credential_assignment":
+        r"(?i)(password|passwd|pwd|secret|token|apikey|api_key)\s*=\s*['\"][^'\"]+['\"]",
+    "http_url": r"https?://",
+    "sid_literal": r"S-1-(?:\d+-)+\d+",
+}
+_FORBIDDEN_PATTERN_DECLARATION_MARKER = "FORBIDDEN_PATTERNS = {"
+
+ALLOWED_PLACEHOLDER_PREFIX = "REPLACE_WITH_"
+
+# The single identifier literal a committed runtime file may contain: the CREATOR OWNER
+# placeholder the admission check refuses. It names no host principal.
+RUNTIME_ALLOWED_SID_LITERALS = ("S-1-3-0",)
+
+# In this test module the permitted identifiers are the declared well-known and constructed
+# sets. None is read from the host.
+TEST_MODULE_ALLOWED_SID_LITERALS = tuple(SYNTHETIC_SIDS) + tuple(DISABLE_CANDIDATE_SIDS)
+
+# A machine or domain account identifier always carries the machine-authority prefix. That
+# is what a host-derived identifier would look like, and it must appear nowhere at all.
+#
+# Composed from fragments deliberately: written as one literal it would itself be a
+# host-shaped identifier in this file, and the guard below would correctly flag it. That is
+# the guard working, not a false positive, so the constant avoids being one.
+HOST_ACCOUNT_SID_PREFIX = "S-1-" + "5-" + "21-"
+
+# RFC 2606 reserves .invalid, so a host under it cannot resolve. Test fixtures may name
+# such a host; a committed runtime file may name no host at all.
+RESERVED_TEST_HOST_SUFFIX = ".invalid"
+
+
+def privacy_scanned_runtime_files():
+    """Committed runtime surfaces: every runtime .ps1, the settings example, the README."""
+    scanned = list(existing_runtime_ps1_files())
+    for extra in (EXAMPLE_SETTINGS, RUNTIME_README):
+        if extra.is_file():
+            scanned.append(extra)
+    return tuple(scanned)
+
+
+def scannable_lines(text, skip_declaration_marker=None):
+    """Yield (number, line), optionally skipping this guard's own pattern declaration."""
+    in_declaration = False
+    for number, line in enumerate(text.splitlines(), start=1):
+        if skip_declaration_marker and skip_declaration_marker in line:
+            in_declaration = True
+            continue
+        if in_declaration:
+            if line.startswith("}"):
+                in_declaration = False
+            continue
+        yield number, line
+
+
+class CommittedFilePrivacyGuard(TierCBase):
+    """Task 19: EGRT-T13 over every committed surface this change touches."""
+
+    def test_no_committed_runtime_file_carries_private_or_secret_material(self):
+        """EGRT-T13: no private absolute path, UNC path, credential, URL, or identifier."""
+        scanned = privacy_scanned_runtime_files()
+        self.assertTrue(scanned, "at least runtime/launcher_lib.ps1 must exist")
+        for path in scanned:
+            text = path.read_text(encoding="utf-8")
+            for name, pattern in FORBIDDEN_PATTERNS.items():
+                compiled = re.compile(pattern)
+                for number, line in scannable_lines(text):
+                    match = compiled.search(line)
+                    if match is None:
+                        continue
+                    if name == "sid_literal" and match.group(0) in RUNTIME_ALLOWED_SID_LITERALS:
+                        continue
+                    if (path == EXAMPLE_SETTINGS
+                            and ALLOWED_PLACEHOLDER_PREFIX in line):
+                        # A placeholder-only value in the example settings file is the
+                        # required committed content, not private material.
+                        continue
+                    with self.subTest(committed_file=path.name, pattern=name, line=number):
+                        self.fail(
+                            "%s line %d carries %s material: %s"
+                            % (path.name, number, name, line.strip())
+                        )
+
+    def test_no_account_identity_or_host_identity_literal_is_committed(self):
+        """account_identity may appear only as a key name, never with a value."""
+        for path in privacy_scanned_runtime_files():
+            text = path.read_text(encoding="utf-8")
+            for number, line in scannable_lines(text):
+                if "account_identity" not in line:
+                    continue
+                with self.subTest(committed_file=path.name, line=number):
+                    stripped = line.strip()
+                    permitted = (
+                        stripped.startswith("#")
+                        or "'account_identity'" in stripped
+                        or "`account_identity`" in stripped
+                        or '"account_identity"' in stripped
+                        or ALLOWED_PLACEHOLDER_PREFIX in stripped
+                    )
+                    self.assertTrue(
+                        permitted,
+                        "%s line %d appears to carry an account identity value: %s"
+                        % (path.name, number, stripped),
+                    )
+
+    def test_no_principal_identity_reaches_a_committed_file(self):
+        """EGRT-T63 support: no host-derived identifier anywhere, in any scanned file."""
+        scanned = list(privacy_scanned_runtime_files()) + [Path(__file__)]
+        for path in scanned:
+            text = path.read_text(encoding="utf-8")
+            for match in re.finditer(FORBIDDEN_PATTERNS["sid_literal"], text):
+                with self.subTest(committed_file=path.name, sid=match.group(0)):
+                    self.assertFalse(
+                        match.group(0).startswith(HOST_ACCOUNT_SID_PREFIX),
+                        "a machine or domain account identifier must never be committed",
+                    )
+
+    def test_this_test_module_carries_only_declared_well_known_identifiers(self):
+        """Every identifier literal in the test module is a declared well-known value."""
+        text = Path(__file__).read_text(encoding="utf-8")
+        permitted = set(TEST_MODULE_ALLOWED_SID_LITERALS)
+        # Truncated and malformed values the admission check is asserted to refuse.
+        permitted.update({"S-1-", "S-1-5-80-0"})
+        for match in re.finditer(FORBIDDEN_PATTERNS["sid_literal"], text):
+            with self.subTest(sid=match.group(0)):
+                self.assertIn(
+                    match.group(0),
+                    permitted,
+                    "an undeclared identifier literal appears in the test module",
+                )
+
+    def test_this_test_module_names_no_resolvable_host(self):
+        """Any host a fixture names is under the reserved .invalid top-level domain."""
+        text = Path(__file__).read_text(encoding="utf-8")
+        for number, line in scannable_lines(text, _FORBIDDEN_PATTERN_DECLARATION_MARKER):
+            for match in re.finditer(r"https?://([A-Za-z0-9.\-]+)", line):
+                host = match.group(1)
+                with self.subTest(line=number, host=host):
+                    self.assertTrue(
+                        host.endswith(RESERVED_TEST_HOST_SUFFIX)
+                        or RESERVED_TEST_HOST_SUFFIX + "." in host,
+                        "a fixture host must be under the reserved .invalid domain",
+                    )
+
+    def test_no_committed_file_carries_a_windows_absolute_path_literal(self):
+        """A private absolute server path is never committed, in any scanned file."""
+        scanned = list(privacy_scanned_runtime_files()) + [Path(__file__)]
+        for path in scanned:
+            text = path.read_text(encoding="utf-8")
+            marker = None
+            if path == Path(__file__):
+                marker = _FORBIDDEN_PATTERN_DECLARATION_MARKER
+            for number, line in scannable_lines(text, marker):
+                with self.subTest(committed_file=path.name, line=number):
+                    self.assertIsNone(
+                        re.search(r"[A-Za-z]:\\\\", line),
+                        "%s line %d carries an absolute path literal: %s"
+                        % (path.name, number, line.strip()),
+                    )
+
+    def test_the_guard_detects_each_defect_it_exists_to_catch(self):
+        """The guard is proven to FAIL on the defect, not merely to pass on clean source.
+
+        Each defect is injected into a scratch copy inside a scratch directory, never into
+        a committed file, and the copy is discarded with the directory.
+        """
+        baseline = LIB.read_text(encoding="utf-8")
+        injections = {
+            "windows_absolute_path": "\n# a private path such as C:\\\\Private\\\\EnergyGrid\n",
+            "unc_path": "\n# a private share such as \\\\\\\\fileserver\\\\energygrid\n",
+            "sid_literal": (
+                "\n$script:EgScratchDefect = '"
+                + HOST_ACCOUNT_SID_PREFIX
+                + "1111111111-2222222222-3333333333-1001'\n"
+            ),
+            "http_url": "\n$script:EgScratchPortal = 'https://portal.example.com/login'\n",
+            "credential_assignment": "\n$script:EgScratchSecret = ''\npassword = 'not-a-real-secret'\n",
+        }
+        with TemporaryScratch() as tmp:
+            for name, injection in injections.items():
+                with self.subTest(defect=name):
+                    scratch = tmp / ("scratch_%s.ps1" % name)
+                    scratch.write_text(baseline + injection, encoding="utf-8")
+                    compiled = re.compile(FORBIDDEN_PATTERNS[name])
+                    hits = []
+                    for number, line in scannable_lines(
+                        scratch.read_text(encoding="utf-8")
+                    ):
+                        match = compiled.search(line)
+                        if match is None:
+                            continue
+                        if (name == "sid_literal"
+                                and match.group(0) in RUNTIME_ALLOWED_SID_LITERALS):
+                            continue
+                        hits.append((number, match.group(0)))
+                    self.assertTrue(
+                        hits, "the guard failed to report the %s defect" % name
+                    )
+
+
+HOST_SUPPLIED_LAUNCHER_PARAMETERS = (
+    "ConfigPath",
+    "PythonExe",
+    "CheckoutRoot",
+    "CredentialPath",
+    "BrowserCachePath",
+    "ExpectedBranch",
+    "AuthorisedLauncherRootWriteSid",
+    "LogRoot",
+)
+
+
+def to_snake_case(name):
+    """Convert a PowerShell Verb-Noun style parameter name to a settings key."""
+    return re.sub(r"(?<!^)(?=[A-Z])", "_", name).lower()
+
+
+class ExampleSettingsShape(TierCBase):
+    """Task 20: design section 9.1. The file is a SHAPE, never a configuration.
+
+    It is superseded on the host by real private settings, it is not deployed to the
+    launcher root, and no committed script reads it at runtime. Carrying a key here
+    therefore creates no second route into the launcher: the launcher's only route for the
+    authorised write-trustee set remains its mandatory parameter.
+    """
+
+    def test_the_example_settings_file_parses_and_is_placeholder_only(self):
+        """Every value is a REPLACE_WITH_ placeholder, or an array of them."""
+        self.assertTrue(
+            EXAMPLE_SETTINGS.is_file(), "runtime/launcher.settings.example.json must exist"
+        )
+        parsed = json.loads(EXAMPLE_SETTINGS.read_text(encoding="utf-8"))
+        self.assertIsInstance(parsed, dict)
+        for key, value in parsed.items():
+            with self.subTest(key=key):
+                if isinstance(value, list):
+                    self.assertTrue(value, "an array value must not be empty")
+                    for element in value:
+                        self.assertIsInstance(element, str)
+                        self.assertTrue(
+                            element.startswith(ALLOWED_PLACEHOLDER_PREFIX),
+                            "%r is not a placeholder" % element,
+                        )
+                else:
+                    self.assertIsInstance(value, str)
+                    self.assertTrue(
+                        value.startswith(ALLOWED_PLACEHOLDER_PREFIX),
+                        "%r is not a placeholder" % value,
+                    )
+
+    def test_no_example_value_is_a_path_or_an_identifier(self):
+        """A placeholder shape carries no private absolute path, UNC path, or identifier."""
+        text = EXAMPLE_SETTINGS.read_text(encoding="utf-8")
+        for name in ("windows_absolute_path", "unc_path", "sid_literal", "http_url"):
+            with self.subTest(pattern=name):
+                self.assertIsNone(
+                    re.search(FORBIDDEN_PATTERNS[name], text),
+                    "the example settings file carries %s material" % name,
+                )
+
+    def test_the_example_settings_keys_match_the_launcher_host_supplied_parameters(self):
+        """A parameter added later without a documented slot fails this test."""
+        parsed = json.loads(EXAMPLE_SETTINGS.read_text(encoding="utf-8"))
+        expected = {to_snake_case(name) for name in HOST_SUPPLIED_LAUNCHER_PARAMETERS}
+        self.assertEqual(
+            expected,
+            set(parsed.keys()),
+            "the key set must equal the host-supplied launcher parameters",
+        )
+        self.assertEqual(8, len(parsed))
+
+    def test_the_authorised_identifier_key_is_an_array(self):
+        """The launcher parameter is a string array, so the documented slot is too."""
+        parsed = json.loads(EXAMPLE_SETTINGS.read_text(encoding="utf-8"))
+        self.assertIsInstance(
+            parsed["authorised_launcher_root_write_sid"],
+            list,
+            "the authorised set is one or more identifiers",
+        )
+
+    def test_the_example_settings_file_is_never_deployed(self):
+        """EGRT-T47: sharing the runtime directory does not make a file deployable."""
+        library = LIB.read_text(encoding="utf-8")
+        self.assertNotIn("launcher.settings.example.json", library)
+        installer = INSTALLER.read_text(encoding="utf-8")
+        self.assertNotIn("launcher.settings.example.json", installer)
+
+    def test_no_committed_script_reads_the_example_settings_file_at_runtime(self):
+        """Design section 9.1: no file is a route by which the authorised set arrives."""
+        for path in existing_runtime_ps1_files():
+            with self.subTest(runtime_file=path.name):
+                self.assertNotIn(
+                    "settings.example", path.read_text(encoding="utf-8")
+                )
+
+
+def normalised_prose(text):
+    """Collapse whitespace so a phrase search is not defeated by a line break."""
+    return re.sub(r"\s+", " ", text).lower()
+
+
+SCHEDULER_EXAMPLE = PROJECT_ROOT / "task-scheduler" / "register_task.example.ps1"
+PROJECT_RUNBOOK = PROJECT_ROOT / "docs" / "runbook.md"
+PROJECT_README = PROJECT_ROOT / "README.md"
+
+RUNTIME_README_REQUIRED_SECTIONS = (
+    "What is canonical here and what is not",
+    "The three-member deployed package",
+    "Launcher parameter surface",
+    "Exit bands",
+    "Launcher-root entry classes",
+    "ValidateOnly",
+    "Installation",
+    "What the runtime never does",
+    "Launcher-root write authority",
+)
+
+RUNBOOK_SECTION_HEADING = "## Runtime launcher installation and validation"
+
+# The four concerns EGRT-I30 requires the runbook to keep clearly separate and named.
+MIGRATION_CONCERNS = (
+    "installer transaction backup cleanup",
+    "migration recovery holding",
+    "launcher functional validation",
+    "recovery-copy retirement or restoration",
+)
+
+SCHEDULER_MUTATING_COMMANDS = (
+    "Register-ScheduledTask",
+    "New-ScheduledTask",
+    "Start-ScheduledTask",
+    "Set-ScheduledTask",
+    "Unregister-ScheduledTask",
+    "New-ScheduledTaskAction",
+    "New-ScheduledTaskTrigger",
+    "schtasks",
+)
+
+
+class RuntimeDocumentation(TierCBase):
+    """Task 21: design sections 4, 14, 15, and 16. Repository documentation only.
+
+    Describing a separately gated host action is not authority to perform it. The scheduler
+    example stays inert, and the host half of the launcher-root write-authority criterion
+    is documented as an owner action rather than claimed by this suite.
+    """
+
+    def test_the_scheduler_example_names_the_accepted_python_314_contract(self):
+        """The stale interpreter placeholder is corrected; the file stays a shape."""
+        text = SCHEDULER_EXAMPLE.read_text(encoding="utf-8")
+        self.assertNotIn("<PYTHON_3_12_EXE>", text)
+        self.assertEqual(1, text.count("<PYTHON_3_14_EXE>"))
+
+    def test_the_scheduler_example_names_the_launcher_as_the_scheduled_shape(self):
+        """The launcher is the only thing the Scheduled Task will ever invoke."""
+        text = SCHEDULER_EXAMPLE.read_text(encoding="utf-8")
+        self.assertIn("runtime/launcher.ps1", text.replace("\\", "/"))
+
+    def test_the_scheduler_example_remains_inert(self):
+        """It registers, starts, alters, and removes nothing, and still parses cleanly."""
+        text = SCHEDULER_EXAMPLE.read_text(encoding="utf-8")
+        for command in SCHEDULER_MUTATING_COMMANDS:
+            with self.subTest(command=command):
+                self.assertNotIn(command, text)
+        if ANY_PS is None:
+            self.skipTest("no PowerShell host found (pwsh or powershell)")
+        with TemporaryScratch() as tmp:
+            result = run_inspector(
+                ANY_PS, tmp, PARSE_INSPECTOR, target=SCHEDULER_EXAMPLE
+            )
+        self.assertEqual(0, result["parseErrors"])
+
+    def test_the_runtime_readme_documents_every_required_contract_section(self):
+        """The directory-level runtime contract states contracts, not narrative."""
+        self.assertTrue(RUNTIME_README.is_file(), "runtime/README.md must exist")
+        text = RUNTIME_README.read_text(encoding="utf-8")
+        for heading in RUNTIME_README_REQUIRED_SECTIONS:
+            with self.subTest(section=heading):
+                self.assertIn(heading, text)
+
+    def test_the_runtime_readme_states_the_exact_class_b_syntax(self):
+        """The documented contract cannot drift from the residue-name parser."""
+        text = RUNTIME_README.read_text(encoding="utf-8")
+        self.assertIn(RESIDUE_PREFIX, text)
+        for kind in RESIDUE_KINDS:
+            with self.subTest(kind=kind):
+                self.assertIn(kind, text)
+        self.assertIn(
+            "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", text
+        )
+        for member in CLASS_A_MEMBER_NAMES:
+            with self.subTest(member=member):
+                self.assertIn(member, text)
+
+    def test_the_runtime_readme_states_the_exit_bands(self):
+        """Both bands, and the fact that they are disjoint."""
+        text = RUNTIME_README.read_text(encoding="utf-8")
+        for code in ("70", "71", "72", "73", "0", "10", "20", "64"):
+            with self.subTest(code=code):
+                self.assertIn(code, text)
+
+    def test_the_runtime_readme_states_the_write_authority_contract(self):
+        """Two independent expectations, both terminal, neither implying the other."""
+        text = RUNTIME_README.read_text(encoding="utf-8")
+        self.assertIn("launcher_root_not_writable_by_run_principal", text)
+        self.assertIn("launcher_root_write_trustees_authorised", text)
+        self.assertIn("SeTakeOwnershipPrivilege", text)
+        self.assertIn("SeRestorePrivilege", text)
+        self.assertIn("AuthorisedLauncherRootWriteSid", text)
+
+    def test_the_runbook_keeps_the_four_migration_concerns_separate(self):
+        """EGRT-I30: four distinct, explicitly named concerns."""
+        text = PROJECT_RUNBOOK.read_text(encoding="utf-8")
+        self.assertIn(RUNBOOK_SECTION_HEADING, text)
+        section = text[text.index(RUNBOOK_SECTION_HEADING):]
+        end = section.find("\n## ", len(RUNBOOK_SECTION_HEADING))
+        if end != -1:
+            section = section[:end]
+        prose = normalised_prose(section)
+        for concern in MIGRATION_CONCERNS:
+            with self.subTest(concern=concern):
+                self.assertIn(concern.lower(), prose)
+
+    def test_the_runbook_section_is_placed_between_the_documented_neighbours(self):
+        """Placed after Controlled first validation and before Recovery guidance."""
+        text = PROJECT_RUNBOOK.read_text(encoding="utf-8")
+        self.assertLess(
+            text.index("## Controlled first validation"),
+            text.index(RUNBOOK_SECTION_HEADING),
+        )
+        self.assertLess(
+            text.index(RUNBOOK_SECTION_HEADING), text.index("## Recovery guidance")
+        )
+
+    def test_the_runbook_encodes_the_equivalent_context_validation_requirement(self):
+        """EGRT-I31 host half: same account, same elevation state, and why it matters."""
+        text = PROJECT_RUNBOOK.read_text(encoding="utf-8")
+        section = text[text.index(RUNBOOK_SECTION_HEADING):]
+        end = section.find("\n## ", len(RUNBOOK_SECTION_HEADING))
+        if end != -1:
+            section = section[:end]
+        prose = normalised_prose(section)
+        for phrase in (
+            "same account",
+            "elevation",
+            "token of the process",
+            "proves nothing",
+            "AuthorisedLauncherRootWriteSid",
+            "outside Git",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase.lower(), prose)
+
+    def test_the_runbook_states_the_verified_before_removal_ordering(self):
+        """EGRT-D08: the recovery copy is verified BEFORE the in-root artefact is removed."""
+        text = PROJECT_RUNBOOK.read_text(encoding="utf-8")
+        section = text[text.index(RUNBOOK_SECTION_HEADING):]
+        end = section.find("\n## ", len(RUNBOOK_SECTION_HEADING))
+        if end != -1:
+            section = section[:end]
+        prose = normalised_prose(section)
+        for phrase in ("SHA-256", "before", "Class C", "fails closed", "no copy at all"):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase.lower(), prose)
+
+    def test_no_documentation_file_presents_localsystem_as_the_run_principal(self):
+        """A token holding a bypass privilege fails by construction."""
+        documents = {
+            "runtime/README.md": RUNTIME_README,
+            "docs/runbook.md": PROJECT_RUNBOOK,
+            "task-scheduler/register_task.example.ps1": SCHEDULER_EXAMPLE,
+        }
+        for label, path in documents.items():
+            text = path.read_text(encoding="utf-8")
+            for token in ("LocalSystem", "NT AUTHORITY\\SYSTEM", "NT AUTHORITY\\\\SYSTEM"):
+                if token not in text:
+                    continue
+                lines = text.splitlines()
+                for index, line in enumerate(lines):
+                    if token not in line:
+                        continue
+                    window = normalised_prose(
+                        " ".join(lines[max(0, index - 2):index + 3])
+                    )
+                    with self.subTest(document=label, line=index + 1, token=token):
+                        self.assertTrue(
+                            " not " in window or "never" in window
+                            or "cannot" in window or "fails" in window,
+                            "%s line %d names %s without excluding it: %s"
+                            % (label, index + 1, token, line.strip()),
+                        )
+        readme = RUNTIME_README.read_text(encoding="utf-8")
+        self.assertIn(
+            "LocalSystem",
+            readme,
+            "the runtime README must state why LocalSystem cannot be the run principal",
+        )
+
+    def test_no_documentation_file_carries_a_sid_literal(self):
+        """No principal identity reaches the documentation."""
+        for path in (RUNTIME_README,):
+            with self.subTest(document=path.name):
+                self.assertIsNone(
+                    re.search(
+                        FORBIDDEN_PATTERNS["sid_literal"],
+                        path.read_text(encoding="utf-8"),
+                    )
+                )
+        text = PROJECT_RUNBOOK.read_text(encoding="utf-8")
+        section = text[text.index(RUNBOOK_SECTION_HEADING):]
+        end = section.find("\n## ", len(RUNBOOK_SECTION_HEADING))
+        if end != -1:
+            section = section[:end]
+        self.assertIsNone(re.search(FORBIDDEN_PATTERNS["sid_literal"], section))
+
+    def test_no_documentation_file_carries_a_private_path(self):
+        """The runtime README carries no absolute or UNC path at all."""
+        text = RUNTIME_README.read_text(encoding="utf-8")
+        self.assertIsNone(re.search(r"[A-Za-z]:\\", text))
+        self.assertIsNone(re.search(r"\\\\[A-Za-z0-9]", text))
+
+        runbook = PROJECT_RUNBOOK.read_text(encoding="utf-8")
+        section = runbook[runbook.index(RUNBOOK_SECTION_HEADING):]
+        end = section.find("\n## ", len(RUNBOOK_SECTION_HEADING))
+        if end != -1:
+            section = section[:end]
+        self.assertIsNone(
+            re.search(r"[A-Za-z]:\\", section),
+            "the new runbook section adds no absolute path literal",
+        )
+
+    def test_the_project_readme_points_at_the_runtime_layer(self):
+        """The approved host mechanism the README refers to is now source-controlled."""
+        text = PROJECT_README.read_text(encoding="utf-8")
+        self.assertIn("## Runtime layer", text)
+        self.assertIn("runtime/README.md", text)
+        self.assertIn("runtime/launcher_lib.ps1", text)
 
 
 if __name__ == "__main__":

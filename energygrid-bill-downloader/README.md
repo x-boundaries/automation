@@ -73,6 +73,21 @@ reconciled without new publication, not that the portal contained zero bills.
 - The program never silently overwrites a different existing file. It removes
   only owned temp directories after successful cleanup checks.
 
+## Runtime layer
+
+The operational layer that starts this application on the production Windows host is
+source-controlled under `runtime/`, and `runtime/README.md` is its directory-level
+contract: the deployed package, the launcher parameter surface, the exit bands, the
+launcher-root entry classes, the installation transaction, and the launcher-root write
+authority.
+
+The "approved host mechanism" the credential paragraph above refers to is now the
+source-controlled DPAPI import in `runtime/launcher_lib.ps1`. That behaviour is written
+down rather than assumed, so no application behaviour changes: the application still reads
+only `ENERGYGRID_USERNAME` and `ENERGYGRID_PASSWORD` from its environment. The private
+credential artefact, its path, and the identity it is bound to stay on the host and are
+never committed.
+
 ## Tests
 
 The suite is standard-library `unittest` plus browser-backed tests against a
