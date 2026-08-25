@@ -87,6 +87,54 @@ class TemporaryScratch:
 
 
 # --------------------------------------------------------------------------------------
+# Scratch Git repository construction
+# --------------------------------------------------------------------------------------
+# Scratch repositories are built with raw git from Python, deliberately never through the
+# runtime library. The library's Git surface is a READ-ONLY allowlist (design section
+# 10.3), so init, add, and commit are not reachable from it and must not be.
+
+GIT_EXE = shutil.which("git")
+
+
+def run_git(repo, *args, check=True):
+    """Run raw git inside a scratch repository. Test-side setup only."""
+    if GIT_EXE is None:
+        raise unittest.SkipTest("git is not available on this host")
+    completed = subprocess.run(
+        [GIT_EXE, "-C", str(repo)] + [str(arg) for arg in args],
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    if check and completed.returncode != 0:
+        raise AssertionError(
+            "git %s exited %d\nstdout:\n%s\nstderr:\n%s"
+            % (" ".join(str(a) for a in args), completed.returncode,
+               completed.stdout, completed.stderr)
+        )
+    return completed
+
+
+def init_scratch_repo(root, branch="main"):
+    """Create a scratch Git repository with one commit on the named branch."""
+    if GIT_EXE is None:
+        raise unittest.SkipTest("git is not available on this host")
+    root = Path(root)
+    root.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        [GIT_EXE, "init", "-b", branch, str(root)],
+        capture_output=True, text=True, timeout=300, check=True,
+    )
+    run_git(root, "config", "user.email", "runtime-tests@invalid.test")
+    run_git(root, "config", "user.name", "EnergyGrid Runtime Tests")
+    run_git(root, "config", "commit.gpgsign", "false")
+    (root / "seed.txt").write_text("seed\n", encoding="utf-8")
+    run_git(root, "add", "seed.txt")
+    run_git(root, "commit", "-m", "seed")
+    return root
+
+
+# --------------------------------------------------------------------------------------
 # Interpreter discovery
 # --------------------------------------------------------------------------------------
 
@@ -174,6 +222,32 @@ $ErrorActionPreference = 'Stop'
 switch ($Op) {
     'contract' {
         Get-EgLauncherLibraryContract | ConvertTo-Json -Depth 8 -Compress
+    }
+    'git' {
+        # Three governed reads against the scratch repository the caller prepared:
+        # a one-line success, a zero-line success, and a non-zero exit.
+        $oneLine  = Invoke-GovernedGit -RepositoryRootPath $Dir -Arguments @('rev-parse', '--abbrev-ref', 'HEAD')
+        $zeroLine = Invoke-GovernedGit -RepositoryRootPath $Dir -Arguments @('ls-files', '--', 'no_such_pathspec')
+        $failing  = Invoke-GovernedGit -RepositoryRootPath $Dir -Arguments @('rev-parse', '--verify', 'refs/heads/definitely_absent')
+
+        $oneLineFirst = ''
+        if ($oneLine.Lines.Count -ge 1) { $oneLineFirst = $oneLine.Lines[0] }
+
+        [ordered]@{
+            oneLineSuccess    = $oneLine.Success
+            oneLineCount      = $oneLine.Lines.Count
+            oneLineFirst      = $oneLineFirst
+            oneLineIsBareString = ($oneLine.Lines -is [string])
+            oneLineSupportRef = $oneLine.SupportRef
+            zeroLineSuccess   = $zeroLine.Success
+            zeroLineCount     = $zeroLine.Lines.Count
+            zeroLineIsNull    = ($null -eq $zeroLine.Lines)
+            zeroLineExit      = $zeroLine.ExitCode
+            failExit          = $failing.ExitCode
+            failSuccess       = $failing.Success
+            failLineCount     = $failing.Lines.Count
+            failSupportRef    = $failing.SupportRef
+        } | ConvertTo-Json -Depth 8 -Compress
     }
     default {
         throw ('unknown probe operation: ' + $Op)
@@ -353,6 +427,67 @@ class RuntimeHarnessAndStructuralGuards(TierCBase):
                             "%s line %d uses the PowerShell 7 only construct %r: %s"
                             % (target.name, number, name, line.strip()),
                         )
+
+
+class GovernedGitResultContract(TierABase):
+    """Task 2: the structured Git result contract that closes the Run119 output-shape defect.
+
+    Design sections 10.1 and 18.1. A helper that returns native command output without
+    preserving collection shape collapsed single-line output to a scalar string, so
+    indexing [0] on the branch name main produced m, and collapsed successful zero-line
+    output to $null, making a successful empty read indistinguishable from a failure.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls._scratch = TemporaryScratch()
+        tmp = cls._scratch.__enter__()
+        cls.tmp = tmp
+        cls.repo = init_scratch_repo(tmp / "repo")
+        cls.result = probe_json(ANY_PS, "git", tmp, dir=cls.repo)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._scratch.__exit__(None, None, None)
+
+    def test_governed_git_preserves_one_line_output(self):
+        """EGRT-T01: Lines.Count is 1 and Lines[0] is main, never the character m."""
+        self.assertTrue(self.result["oneLineSuccess"])
+        self.assertEqual(1, self.result["oneLineCount"])
+        self.assertEqual("main", self.result["oneLineFirst"])
+        self.assertNotEqual(
+            "m",
+            self.result["oneLineFirst"],
+            "indexing [0] must not yield the first character of a collapsed scalar",
+        )
+        self.assertFalse(
+            self.result["oneLineIsBareString"],
+            "Lines must always be a collection, never a bare string",
+        )
+        self.assertEqual("", self.result["oneLineSupportRef"])
+
+    def test_governed_git_preserves_successful_zero_line_output(self):
+        """EGRT-T02: a zero-line success stays a success and is never $null."""
+        self.assertTrue(self.result["zeroLineSuccess"])
+        self.assertEqual(0, self.result["zeroLineCount"])
+        self.assertFalse(self.result["zeroLineIsNull"], "Lines must never be $null")
+        self.assertEqual(0, self.result["zeroLineExit"])
+
+    def test_governed_git_distinguishes_a_non_zero_exit(self):
+        """EGRT-T03: a non-zero exit is distinguishable from a successful empty read."""
+        self.assertFalse(self.result["failSuccess"])
+        self.assertNotEqual(0, self.result["failExit"])
+        self.assertEqual(0, self.result["failLineCount"])
+        self.assertEqual(
+            "EG_LAUNCHER_GIT_INVOCATION_FAILED", self.result["failSupportRef"]
+        )
+        # Both carry zero lines, so Success and SupportRef are what separate them.
+        self.assertNotEqual(
+            self.result["zeroLineSuccess"],
+            self.result["failSuccess"],
+            "a successful empty read must remain distinguishable from a failure",
+        )
 
 
 if __name__ == "__main__":
