@@ -206,8 +206,17 @@ only in the operator-controlled install lane, section 6.1.
 Every check runs before any child process is started. A failure is terminal; the
 launcher never continues past a failed check, and never downgrades one to a warning.
 
-1. Both `launcher.ps1` and `launcher_lib.ps1` in the launcher root parse cleanly and
-   hash-match the values recorded by the last accepted installation.
+1. Launcher-root integrity, in this order (section 6.7 defines the classes, section 6.4
+   the manifest rules):
+   a. Enumerate the launcher-root entries and classify each as Class A package member,
+      Class B recognised installer-owned residue, or Class C unexpected.
+   b. Any Class C entry is terminal. Recognised residue is tolerated but never treated as
+      a warning that could mask another integrity failure.
+   c. All three Class A members are present at their fixed names.
+   d. `launcher.ps1` and `launcher_lib.ps1` parse cleanly and hash-match the manifest
+      recorded by the last accepted installation, and the manifest describes exactly those
+      two executable members.
+   If the package itself is invalid, the run fails regardless of how residue classified.
 2. `-CheckoutRoot`, `-ConfigPath`, and `-PythonExe` exist and are absolute.
 3. `-ConfigPath` resolves outside `-CheckoutRoot`.
 4. The private configuration parses as JSON and carries every key the application
@@ -375,9 +384,11 @@ section 6.6. Any failure before acceptance triggers package rollback under secti
 - The installer never writes into the Git checkout, never reads private configuration,
   never reads or decrypts credentials, and never touches the archive, the SQLite state,
   the logs, or the Scheduled Task.
-- Staging and backup files are created in the destination directory only, are owned by
-  the operation (a GUID-shaped component in the name), and are never created in a
-  shared temporary directory.
+- Staging and backup files are created in the destination directory only, are never
+  created in a shared temporary directory, and are named strictly according to the
+  reserved Class B contract in section 6.7. That contract is what makes them recognisable
+  later; a staging or backup file created under any other name would be classified Class C
+  by the launcher and would fail the next run.
 - A file the installer did not create is never deleted.
 - Failure-path retention is scoped, not blanket. Installed package destinations are
   restored or removed exactly as section 6.5 requires: a destination whose preimage was
@@ -404,9 +415,18 @@ boundary matters: the verification **method** is reusable and belongs in Git, wh
 - Git is canonical for the manifest's **shape** and for the comparison rules: which
   fields exist, how the hash is computed, and that a missing, unparsable, or
   non-matching manifest is terminal rather than a warning.
-- The launcher recomputes each installed file's hash and compares it to the manifest. A
-  mismatch, a manifest entry with no corresponding file, or a runtime file with no
-  manifest entry each fail closed.
+- **Manifest completeness is evaluated over the deployed package-member domain only**, not
+  over every file present in the launcher root. The launcher recomputes each executable
+  member's hash and compares it to the manifest. A hash or length mismatch, a manifest
+  entry with no corresponding package member, or a package member with no manifest entry
+  each fail closed.
+- Unexpected files are caught by a separate step, not by manifest membership. The
+  launcher-root inventory is classified under section 6.7 and any Class C entry is
+  terminal. Splitting the two concerns is what lets the manifest stay an exact description
+  of the deployed package while arbitrary extra files still fail closed.
+- The manifest never describes transaction residue. Residue is Class B, is excluded from
+  manifest membership by design, and its absence from the manifest is therefore not a
+  completeness failure.
 
 An honest limitation, stated because a reader will otherwise assume more: the manifest
 sits beside the files it describes, so a writer who can modify the launcher can also
@@ -493,6 +513,99 @@ exactly that, and removing the residue is a separate, safe operator action. This
 narrow, visible exception to the fail-closed default, permitted because it concerns a
 redundant artefact after a verified success rather than any part of the installed
 package.
+
+Any residue the installer leaves, on this path or after a verified rollback, must carry a
+name that satisfies the reserved contract in section 6.7. The installer never leaves an
+arbitrary filename in the launcher root and expects the launcher to tolerate it.
+
+### 6.7 Launcher-root entry classes
+
+Two rules in this document would otherwise collide. Section 6.6 permits an accepted
+installation to leave an inert retained backup, exiting `0`. Section 6.4 requires an
+unexpected runtime file to fail closed. Read as "every file in the launcher root must be a
+manifest member", the second turns the first into an outage: a valid installed package
+whose backup cleanup failed would fail every subsequent launcher preflight, including the
+unattended daily job, over a file the installer itself deliberately left and called inert.
+
+The resolution is not to tolerate extra files. It is to classify them. Every entry in the
+launcher root belongs to exactly one of three classes, and the classification is
+deterministic.
+
+#### Class A - deployed package members
+
+Exactly three, at fixed names, joined to the launcher root:
+
+| Member | Fixed name |
+| --- | --- |
+| Entry script | `launcher.ps1` |
+| Pure library | `launcher_lib.ps1` |
+| Integrity manifest | `installation_manifest.json` |
+
+The set is exact. A missing member fails closed, an extra member is impossible by
+definition, and no substitution is tolerated. The manifest describes exactly the two
+executable members, per section 6.4.
+
+#### Class B - recognised installer-owned transaction residue
+
+Residue is **not** a package member and is **not** described by the manifest. It is
+recognised only by an exact reserved-name contract, deliberately narrow enough that an
+ordinary file cannot drift into it:
+
+```text
+.eglauncher-<kind>--<member>--<operation-id>
+```
+
+- The entry name begins with the literal reserved prefix `.eglauncher-`.
+- The remainder splits on the two-hyphen delimiter `--` into **exactly three** fields.
+  Package member names contain `.` but never `--`, so the split is unambiguous.
+- `<kind>` is exactly one of `staging`, `backup`, or `rollback`.
+- `<member>` is exactly one of the three Class A fixed names.
+- `<operation-id>` is a canonical lowercase GUID matching
+  `^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`, the transaction
+  identifier the installer already owns under section 6.3.
+
+Every field must parse. A name that fails any one of them is not residue; it is Class C.
+
+A generic extension rule such as `*.bak` or `*.tmp` is explicitly **not** sufficient and
+must never be used. Those patterns would let any file a user or attacker drops into the
+launcher root be waved through, which is the opposite of the intent. The reserved name
+binds residue to a specific member and a specific transaction, and it carries no private
+path, host name, principal, or other private value: the member names are public, the kinds
+are a fixed vocabulary, and the GUID is random.
+
+The name also cannot be executed by accident. It begins with a dot and does not end in
+`.ps1`, `.psm1`, or any executable extension.
+
+#### Class C - everything else
+
+Any entry that is neither an exact Class A member nor a valid Class B residue name fails
+closed. This preserves the integrity intent in full. Each of the following is Class C and
+terminal:
+
+- another `.ps1` script, whatever it is called, including `launcher-old.ps1`;
+- a copy of the library under a different name;
+- a `.bak` or `.tmp` file that does not satisfy the Class B parser;
+- a lookalike residue name with a malformed prefix, wrong field count, unknown kind,
+  unrecognised member, or non-canonical GUID;
+- any unexpected executable, script, or other file;
+- any unexpected directory, since the locked architecture requires none.
+
+The rule is never relaxed to "ignore extra files".
+
+#### Security boundary
+
+- Residue can never influence which code runs. Package-member paths are fixed by joining
+  the launcher root with the three Class A names.
+- The launcher never enumerates the root to *find* a script or library. It enumerates only
+  to *classify*, and Class C is fatal.
+- Recognised residue is never dot-sourced, invoked, imported, or searched as an alternate
+  launcher or library, and never acts as a fallback.
+- Recognised residue can never satisfy or replace a missing Class A member. A missing or
+  invalid member fails regardless of what residue is present.
+- The launcher-root ACL, reparse-point, and read-only expectations in section 17.2 remain
+  in force and are unaffected by classification.
+
+`EGRT-T51` through `EGRT-T57` assert each of these properties.
 
 ## 7. Atomic Replacement And Rollback Contract
 
@@ -1086,6 +1199,13 @@ runtimes.
 | `EGRT-T48` | A deliberately failing non-secret preflight check, including the launcher-root security checks, causes zero credential import attempt | A and C |
 | `EGRT-T49` | No committed cleanup path invokes `Dispose` on a `PSCredential`, and the bounded-lifetime and no-persistence contract is preserved | C |
 | `EGRT-T50` | An unexpectedly present destination on the publish-to-absent path, and a destination that appears mid-publication, both fail rather than overwrite | A |
+| `EGRT-T51` | A valid installed package plus one correctly named Class B retained preimage backup passes launcher-root classification and manifest completeness | A |
+| `EGRT-T52` | A valid installed package plus a correctly named Class B staging or rollback residue entry passes, does not substitute for a package member, and does not break manifest completeness | A |
+| `EGRT-T53` | An arbitrary extra `.ps1` file in the launcher root, including one named `launcher-old.ps1`, fails closed | A |
+| `EGRT-T54` | A generic `*.bak` or `*.tmp` entry that does not satisfy the exact Class B parser fails closed | A |
+| `EGRT-T55` | A lookalike residue name fails closed for each malformation independently: wrong prefix, wrong field count, unknown kind, unrecognised member, and non-canonical GUID | A |
+| `EGRT-T56` | If `launcher.ps1`, `launcher_lib.ps1`, or the manifest is missing or invalid, recognised residue cannot satisfy the missing member and preflight fails | A |
+| `EGRT-T57` | No recognised residue path is ever dot-sourced, invoked, imported, or selected as a fallback, and the launcher never enumerates the root to locate a script or library | A and C |
 
 ### 12.3 Testability without production fallbacks
 
@@ -1212,16 +1332,34 @@ Migration proceeds in this order.
    migration.
 3. **Publish.** Merge the implementation, which by then encodes every reusable
    behaviour from step 2.
-4. **Validate.** Run both `-ValidateOnly` paths on the host and confirm the checks pass
-   against the real deployment.
+4. **Validate.** Run `install_or_update_launcher.ps1 -ValidateOnly` on the host and
+   confirm its checks pass against the real deployment. The launcher's own
+   `-ValidateOnly` is deferred to step 7 for the reason in the note below.
 5. **Install under approval.** Perform the first source-controlled installation through
    the sanctioned installer, per section 14.
-6. **Verify.** Confirm the installed hash matches the reviewed source hash and that
-   `launcher.ps1 -ValidateOnly` passes.
+6. **Verify the installed bytes.** Confirm each installed member's hash matches the
+   reviewed source hash and that the manifest reads back correctly. This is a direct
+   hash comparison and does not depend on the launcher running.
 7. **Retire the bridge artefact.** Only after step 6, and only under a separate explicit
-   approval naming the artefact, may `.energygrid-launcher.run119a1.rollback` be
-   removed. It is the last remaining rollback to the accepted preimage until then, so
-   it is retained through every earlier step.
+   approval naming the artefact, may `.energygrid-launcher.run119a1.rollback` be removed.
+   It is the last remaining rollback to the accepted preimage until then, so it is
+   retained through every earlier step.
+8. **Verify the launcher.** Run `launcher.ps1 -ValidateOnly` and confirm every check
+   passes.
+
+**Why the launcher check moved after retirement.** The Run119 artefact predates the
+reserved residue contract and does not satisfy it: its name begins `.energygrid-launcher.`
+rather than the reserved `.eglauncher-` prefix, and it carries no `--` delimited kind,
+member, and transaction fields. Section 6.7 therefore classifies it as Class C, and the
+launcher fails closed while it is present. That is the correct behaviour for an
+unrecognised file beside the launcher, and it is not a reason to widen the Class B parser
+to accommodate one historical artefact.
+
+The consequence is only an ordering one, and the safety property is unchanged: the
+artefact is still retained until the new package is verified present and correct by hash
+at step 6, and it is still removed only under its own explicit approval. What changed is
+that the launcher's own preflight is confirmed at step 8, after retirement, instead of
+before it.
 
 ## 16. Recovery And Disaster-Rebuild Procedure
 
@@ -1291,6 +1429,7 @@ principal, SID, and paths they are evaluated against are supplied at deployment.
 | --- | --- |
 | `launcher_root_not_writable_by_run_principal` | The principal the scheduled job runs as has no write, modify, or full-control grant on the launcher root, so a compromised run cannot rewrite its own launcher |
 | `launcher_root_write_restricted_to_install_principal` | Write access is limited to the administrative principal that performs installation |
+| `launcher_root_entries_classified` | Every launcher-root entry is an exact Class A package member or a valid Class B reserved residue name; any Class C entry is terminal, per section 6.7 |
 | `launcher_files_not_reparse_points` | Neither installed file, nor the destination directory, is a symlink, junction, or other reparse point |
 | `launcher_files_not_unexpectedly_readonly` | No installed file carries an unexplained read-only attribute |
 | `config_path_outside_checkout` | The private configuration resolves outside the deployed checkout |
@@ -1377,7 +1516,7 @@ prohibited. Only the behaviour they proved is carried forward, in the form above
 | `EGRT-I04` | `Invoke-AtomicFileReplace` implements every rule in section 7.2, with a mandatory explicit backup path |
 | `EGRT-I05` | `Invoke-GovernedGit` implements the section 10 result contract and environment neutralisation |
 | `EGRT-I06` | `-ValidateOnly` satisfies section 8, including deterministic output and zero mutation |
-| `EGRT-I07` | All fifty assertions `EGRT-T01` to `EGRT-T50` are implemented and pass |
+| `EGRT-I07` | All fifty-seven assertions `EGRT-T01` to `EGRT-T57` are implemented and pass |
 | `EGRT-I08` | The full project suite passes on Windows via `python -m unittest discover -s tests -v` |
 | `EGRT-I09` | No GitHub Actions workflow is modified |
 | `EGRT-I10` | No secret, credential, private absolute path, or private identity is committed |
@@ -1397,6 +1536,9 @@ prohibited. Only the behaviour they proved is carried forward, in the form above
 | `EGRT-I24` | Manifest publication and full package re-verification occur inside the transaction, before any backup cleanup is authorised |
 | `EGRT-I25` | Every non-secret and security preflight check precedes the DPAPI import, with no credential import attempted when an earlier check fails |
 | `EGRT-I26` | Credential cleanup uses bounded lifetime and reference removal, never requires `PSCredential.Dispose()`, and makes no memory-erasure claim |
+| `EGRT-I27` | Launcher-root entries are deterministically classified as exact package members, recognised installer-owned residue, or unexpected, per section 6.7 |
+| `EGRT-I28` | Manifest completeness is scoped to the deployed package while arbitrary unexpected root entries still fail closed |
+| `EGRT-I29` | Recognised installer residue never participates in execution, import, fallback, or package membership |
 
 Acceptance of this document is an architectural decision only. It does not approve the
 implementation change, the first installation, the scheduler, or any live run. Each of
