@@ -88,6 +88,110 @@ function Initialize-EgNativePublicationInterop {
 }
 
 # --------------------------------------------------------------------------------------
+# Bounded support-reference vocabulary (design section 11)
+# --------------------------------------------------------------------------------------
+# The vocabulary is BOUNDED and CLOSED. It uses an EG_LAUNCHER_ prefix so it cannot collide
+# with the application's own EG_LOGIN_ and APP_ERROR_ vocabularies.
+#
+# What may be reported: the support reference, the phase that failed, the exception type
+# name, the HRESULT as 0x%08X, and boolean or integer outcome fields.
+#
+# What may NEVER be reported: any path, any file name, any environment variable value, any
+# credential value, length, prefix, or hash, any account identity, any raw Git output, any
+# exception message text, and any host or principal identity.
+#
+# Retiring a reference means MOVING it to the retired set rather than deleting it, so
+# evidence written by an earlier build stays readable. An unrecognised failure records
+# EG_LAUNCHER_UNCLASSIFIED rather than leaking detail.
+$script:EgLauncherSupportRefs = @(
+    'EG_LAUNCHER_REPLACE_ARGUMENT_INVALID',
+    'EG_LAUNCHER_REPLACE_SHARING_VIOLATION',
+    'EG_LAUNCHER_REPLACE_ACCESS_DENIED',
+    'EG_LAUNCHER_REPLACE_POSTIMAGE_MISMATCH',
+    'EG_LAUNCHER_REPLACE_PREIMAGE_UNRECOVERABLE',
+    'EG_LAUNCHER_PUBLISH_DESTINATION_UNEXPECTEDLY_PRESENT',
+    'EG_LAUNCHER_PUBLISH_RACE_LOST',
+    'EG_LAUNCHER_PUBLISH_POSTIMAGE_MISMATCH',
+    'EG_LAUNCHER_CREDENTIAL_ARTEFACT_MISSING',
+    'EG_LAUNCHER_CREDENTIAL_IMPORT_FAILED',
+    'EG_LAUNCHER_CREDENTIAL_INCOMPLETE',
+    'EG_LAUNCHER_CREDENTIAL_RESTORE_FAILED',
+    'EG_LAUNCHER_BROWSER_CACHE_UNRESOLVED',
+    'EG_LAUNCHER_BROWSER_CACHE_NOT_READY',
+    'EG_LAUNCHER_BROWSER_CACHE_BIND_FAILED',
+    'EG_LAUNCHER_SOURCE_BINDING_FAILED',
+    'EG_LAUNCHER_SOURCE_BRANCH_MISMATCH',
+    'EG_LAUNCHER_SOURCE_PATH_MISSING',
+    'EG_LAUNCHER_SOURCE_PATH_UNTRACKED',
+    'EG_LAUNCHER_SOURCE_STAGED_MODIFICATION',
+    'EG_LAUNCHER_SOURCE_UNSTAGED_MODIFICATION',
+    'EG_LAUNCHER_SOURCE_DELETED',
+    'EG_LAUNCHER_SOURCE_UNTRACKED_OVERLAY',
+    'EG_LAUNCHER_GIT_INVOCATION_FAILED',
+    'EG_LAUNCHER_GIT_SUBCOMMAND_FORBIDDEN',
+    'EG_LAUNCHER_ROOT_UNEXPECTED_ENTRY',
+    'EG_LAUNCHER_PACKAGE_MEMBER_MISSING',
+    'EG_LAUNCHER_PACKAGE_PARSE_FAILED',
+    'EG_LAUNCHER_MANIFEST_MISSING',
+    'EG_LAUNCHER_MANIFEST_UNPARSABLE',
+    'EG_LAUNCHER_MANIFEST_MISMATCH',
+    'EG_LAUNCHER_PATH_NOT_ABSOLUTE',
+    'EG_LAUNCHER_PATH_MISSING',
+    'EG_LAUNCHER_CONFIG_INSIDE_CHECKOUT',
+    'EG_LAUNCHER_CONFIG_UNPARSABLE',
+    'EG_LAUNCHER_CONFIG_KEY_MISSING',
+    'EG_LAUNCHER_PYTHON_VERSION_UNSUPPORTED',
+    'EG_LAUNCHER_ROOT_INSIDE_CHECKOUT',
+    'EG_LAUNCHER_ROOT_ACL_RUN_PRINCIPAL_WRITABLE',
+    'EG_LAUNCHER_ROOT_ACL_WRITE_TRUSTEE_UNAUTHORISED',
+    'EG_LAUNCHER_ROOT_AUTHORISED_SID_SET_INVALID',
+    'EG_LAUNCHER_ROOT_REPARSE_POINT',
+    'EG_LAUNCHER_FILE_UNEXPECTEDLY_READONLY',
+    'EG_LAUNCHER_INSTALL_ADMISSION_INVALID',
+    'EG_LAUNCHER_INSTALL_STAGING_FAILED',
+    'EG_LAUNCHER_INSTALL_MANIFEST_VERIFY_FAILED',
+    'EG_LAUNCHER_INSTALL_ROLLBACK_INCOMPLETE',
+    'EG_LAUNCHER_INSTALL_BACKUP_CLEANUP_INCOMPLETE',
+    'EG_LAUNCHER_UNCLASSIFIED'
+)
+
+# Empty at first implementation (DD-08). The reachability assertion covers both halves, so
+# the retired half is vacuously satisfied until a reference is actually retired, and the
+# first retirement is regressed the moment it happens.
+$script:EgLauncherRetiredSupportRefs = @()
+
+function Get-EgLauncherSupportRefs {
+    # The live set. The vocabulary is bounded and closed.
+    [CmdletBinding()]
+    param()
+
+    @($script:EgLauncherSupportRefs)
+}
+
+function Get-EgLauncherRetiredSupportRefs {
+    # Retiring a reference means MOVING it here, never deleting it, so evidence written by
+    # an earlier build stays readable.
+    [CmdletBinding()]
+    param()
+
+    @($script:EgLauncherRetiredSupportRefs)
+}
+
+function Test-EgLauncherSupportRefLive {
+    # Exact membership of the live set. An unrecognised reference is NEVER emitted:
+    # callers substitute EG_LAUNCHER_UNCLASSIFIED rather than leaking detail.
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$SupportRef)
+
+    foreach ($live in $script:EgLauncherSupportRefs) {
+        if ($live -ceq $SupportRef) {
+            return $true
+        }
+    }
+    return $false
+}
+
+# --------------------------------------------------------------------------------------
 # Launcher-root entry classes (design section 6.7)
 # --------------------------------------------------------------------------------------
 # Every entry in the launcher root belongs to exactly one of three classes, and the

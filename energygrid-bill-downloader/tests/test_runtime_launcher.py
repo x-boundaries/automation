@@ -982,6 +982,21 @@ switch ($Op) {
         }
         [ordered]@{ verdicts = @($verdicts) } | ConvertTo-Json -Depth 8 -Compress
     }
+    'supportrefs' {
+        # The bounded, closed vocabulary and its exact-membership predicate.
+        $live = @(Get-EgLauncherSupportRefs)
+        $retired = @(Get-EgLauncherRetiredSupportRefs)
+        [ordered]@{
+            live            = @($live)
+            liveCount       = @($live).Count
+            retired         = @($retired)
+            retiredCount    = @($retired).Count
+            knownIsLive     = (Test-EgLauncherSupportRefLive -SupportRef 'EG_LAUNCHER_UNCLASSIFIED')
+            unknownIsLive   = (Test-EgLauncherSupportRefLive -SupportRef 'EG_LAUNCHER_NOT_A_REAL_REFERENCE')
+            lowercaseIsLive = (Test-EgLauncherSupportRefLive -SupportRef 'eg_launcher_unclassified')
+            emptyIsLive     = (Test-EgLauncherSupportRefLive -SupportRef '')
+        } | ConvertTo-Json -Depth 8 -Compress
+    }
     default {
         throw ('unknown probe operation: ' + $Op)
     }
@@ -6615,6 +6630,214 @@ class ValidateOnlyStaticGuards(TierCBase):
                 with self.subTest(runtime_file=path.name, line=number):
                     for forbidden in ("Get-Date", "NewGuid", "[datetime]"):
                         self.assertNotIn(forbidden, line)
+
+
+LIVE_SUPPORT_REFS = (
+    "EG_LAUNCHER_REPLACE_ARGUMENT_INVALID",
+    "EG_LAUNCHER_REPLACE_SHARING_VIOLATION",
+    "EG_LAUNCHER_REPLACE_ACCESS_DENIED",
+    "EG_LAUNCHER_REPLACE_POSTIMAGE_MISMATCH",
+    "EG_LAUNCHER_REPLACE_PREIMAGE_UNRECOVERABLE",
+    "EG_LAUNCHER_PUBLISH_DESTINATION_UNEXPECTEDLY_PRESENT",
+    "EG_LAUNCHER_PUBLISH_RACE_LOST",
+    "EG_LAUNCHER_PUBLISH_POSTIMAGE_MISMATCH",
+    "EG_LAUNCHER_CREDENTIAL_ARTEFACT_MISSING",
+    "EG_LAUNCHER_CREDENTIAL_IMPORT_FAILED",
+    "EG_LAUNCHER_CREDENTIAL_INCOMPLETE",
+    "EG_LAUNCHER_CREDENTIAL_RESTORE_FAILED",
+    "EG_LAUNCHER_BROWSER_CACHE_UNRESOLVED",
+    "EG_LAUNCHER_BROWSER_CACHE_NOT_READY",
+    "EG_LAUNCHER_BROWSER_CACHE_BIND_FAILED",
+    "EG_LAUNCHER_SOURCE_BINDING_FAILED",
+    "EG_LAUNCHER_SOURCE_BRANCH_MISMATCH",
+    "EG_LAUNCHER_SOURCE_PATH_MISSING",
+    "EG_LAUNCHER_SOURCE_PATH_UNTRACKED",
+    "EG_LAUNCHER_SOURCE_STAGED_MODIFICATION",
+    "EG_LAUNCHER_SOURCE_UNSTAGED_MODIFICATION",
+    "EG_LAUNCHER_SOURCE_DELETED",
+    "EG_LAUNCHER_SOURCE_UNTRACKED_OVERLAY",
+    "EG_LAUNCHER_GIT_INVOCATION_FAILED",
+    "EG_LAUNCHER_GIT_SUBCOMMAND_FORBIDDEN",
+    "EG_LAUNCHER_ROOT_UNEXPECTED_ENTRY",
+    "EG_LAUNCHER_PACKAGE_MEMBER_MISSING",
+    "EG_LAUNCHER_PACKAGE_PARSE_FAILED",
+    "EG_LAUNCHER_MANIFEST_MISSING",
+    "EG_LAUNCHER_MANIFEST_UNPARSABLE",
+    "EG_LAUNCHER_MANIFEST_MISMATCH",
+    "EG_LAUNCHER_PATH_NOT_ABSOLUTE",
+    "EG_LAUNCHER_PATH_MISSING",
+    "EG_LAUNCHER_CONFIG_INSIDE_CHECKOUT",
+    "EG_LAUNCHER_CONFIG_UNPARSABLE",
+    "EG_LAUNCHER_CONFIG_KEY_MISSING",
+    "EG_LAUNCHER_PYTHON_VERSION_UNSUPPORTED",
+    "EG_LAUNCHER_ROOT_INSIDE_CHECKOUT",
+    "EG_LAUNCHER_ROOT_ACL_RUN_PRINCIPAL_WRITABLE",
+    "EG_LAUNCHER_ROOT_ACL_WRITE_TRUSTEE_UNAUTHORISED",
+    "EG_LAUNCHER_ROOT_AUTHORISED_SID_SET_INVALID",
+    "EG_LAUNCHER_ROOT_REPARSE_POINT",
+    "EG_LAUNCHER_FILE_UNEXPECTEDLY_READONLY",
+    "EG_LAUNCHER_INSTALL_ADMISSION_INVALID",
+    "EG_LAUNCHER_INSTALL_STAGING_FAILED",
+    "EG_LAUNCHER_INSTALL_MANIFEST_VERIFY_FAILED",
+    "EG_LAUNCHER_INSTALL_ROLLBACK_INCOMPLETE",
+    "EG_LAUNCHER_INSTALL_BACKUP_CLEANUP_INCOMPLETE",
+    "EG_LAUNCHER_UNCLASSIFIED",
+)
+
+LIVE_SUPPORT_REF_COUNT = 49
+
+# Design section 17.2 records the first as retired vocabulary that must not be emitted. The
+# second existed only in an earlier revision of the plan, was never implemented and never
+# emitted by any build, so there is no earlier evidence to keep readable: it is guarded as
+# an absent string rather than entered in the retired set (DD-08).
+SUPERSEDED_NAMES = (
+    "launcher_root_write_restricted_to_install_principal",
+    "EG_LAUNCHER_ROOT_ACL_WRITE_NOT_RESTRICTED",
+)
+
+
+class SupportReferenceVocabulary(TierABase):
+    """Task 18: design section 11.4. The vocabulary is bounded and closed."""
+
+    def test_the_declared_live_set_matches_the_design_exactly(self):
+        """The count is verified by the suite rather than asserted in prose."""
+        with TemporaryScratch() as tmp:
+            observed = probe_json(ANY_PS, "supportrefs", tmp)
+        self.assertEqual(list(LIVE_SUPPORT_REFS), observed["live"])
+        self.assertEqual(LIVE_SUPPORT_REF_COUNT, observed["liveCount"])
+        self.assertEqual([], observed["retired"])
+        self.assertEqual(0, observed["retiredCount"])
+
+    def test_membership_is_exact_and_case_sensitive(self):
+        """An unrecognised reference is never treated as live."""
+        with TemporaryScratch() as tmp:
+            observed = probe_json(ANY_PS, "supportrefs", tmp)
+        self.assertTrue(observed["knownIsLive"])
+        self.assertFalse(observed["unknownIsLive"])
+        self.assertFalse(observed["lowercaseIsLive"])
+        self.assertFalse(observed["emptyIsLive"])
+
+
+class SupportReferenceStaticGuards(TierCBase):
+    """Task 18, Tier C: EGRT-T18 reachability over the committed runtime files."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.sources = {
+            path.name: path.read_text(encoding="utf-8")
+            for path in existing_runtime_ps1_files()
+        }
+        cls.combined = "\n".join(cls.sources.values())
+
+    def _extracted(self):
+        found = set()
+        for text in self.sources.values():
+            found.update(re.findall(r"EG_LAUNCHER_[A-Z0-9_]+", text))
+        return found
+
+    def test_no_support_reference_outside_the_bounded_vocabulary_is_emitted(self):
+        """EGRT-T18: the extracted set equals the live set exactly."""
+        extracted = self._extracted()
+        self.assertEqual(
+            set(LIVE_SUPPORT_REFS),
+            extracted,
+            "extra: %r; missing: %r"
+            % (sorted(extracted - set(LIVE_SUPPORT_REFS)),
+               sorted(set(LIVE_SUPPORT_REFS) - extracted)),
+        )
+        self.assertEqual(LIVE_SUPPORT_REF_COUNT, len(extracted))
+
+    def test_every_live_support_reference_is_reachable_at_a_raising_site(self):
+        """EGRT-T18: each reference appears somewhere other than the declaration itself."""
+        library = self.sources["launcher_lib.ps1"]
+        declaration_start = library.index("$script:EgLauncherSupportRefs = @(")
+        declaration_end = library.index(
+            "$script:EgLauncherRetiredSupportRefs", declaration_start
+        )
+        declaration = library[declaration_start:declaration_end]
+        outside_declaration = (
+            library[:declaration_start] + library[declaration_end:]
+            + "\n".join(
+                text for name, text in self.sources.items()
+                if name != "launcher_lib.ps1"
+            )
+        )
+        for reference in LIVE_SUPPORT_REFS:
+            with self.subTest(reference=reference):
+                self.assertIn(
+                    reference, declaration, "the reference must be declared"
+                )
+                self.assertIn(
+                    reference,
+                    outside_declaration,
+                    "%s is declared but never raised anywhere" % reference,
+                )
+
+    def test_every_retired_support_reference_is_unreachable(self):
+        """EGRT-T18: vacuously satisfied while the retired set is empty (DD-08)."""
+        library = self.sources["launcher_lib.ps1"]
+        retired_declaration = re.search(
+            r"\$script:EgLauncherRetiredSupportRefs\s*=\s*@\(([^)]*)\)", library
+        )
+        self.assertIsNotNone(retired_declaration)
+        retired = re.findall(r"EG_LAUNCHER_[A-Z0-9_]+", retired_declaration.group(1))
+        self.assertEqual([], retired, "the retired set is empty at first implementation")
+        for reference in retired:
+            with self.subTest(retired=reference):
+                self.assertNotIn(reference, LIVE_SUPPORT_REFS)
+
+    def test_the_superseded_launcher_root_write_names_appear_nowhere(self):
+        """Retired vocabulary must not be emitted, and a never-implemented name must not exist."""
+        scanned = dict(self.sources)
+        for extra in (EXAMPLE_SETTINGS, RUNTIME_README, Path(__file__)):
+            if extra.is_file():
+                scanned[extra.name] = extra.read_text(encoding="utf-8")
+        for name in SUPERSEDED_NAMES:
+            for source_name, text in scanned.items():
+                with self.subTest(superseded=name, source=source_name):
+                    if source_name == Path(__file__).name:
+                        # This module names them in order to guard them; the guard itself
+                        # is the only permitted occurrence.
+                        occurrences = text.count(name)
+                        self.assertLessEqual(
+                            occurrences,
+                            2,
+                            "the superseded name may appear only in its own guard",
+                        )
+                        continue
+                    self.assertNotIn(name, text)
+
+    def test_the_two_vocabularies_cannot_collide(self):
+        """The application's vocabulary and the runtime's stay disjoint."""
+        cli = (PROJECT_ROOT / "energygrid_bill_downloader" / "cli.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIsNone(
+            re.search(r"EG_LAUNCHER_[A-Z0-9_]+", cli),
+            "no runtime reference may appear in the application",
+        )
+        for text in self.sources.values():
+            self.assertIsNone(re.search(r"\bEG_LOGIN_[A-Z0-9_]+", text))
+            self.assertIsNone(re.search(r"\bAPP_ERROR_[A-Z0-9_]+", text))
+
+    def test_the_unclassified_reference_is_the_only_fallback(self):
+        """An unrecognised failure records EG_LAUNCHER_UNCLASSIFIED rather than leaking."""
+        self.assertIn("EG_LAUNCHER_UNCLASSIFIED", self.combined)
+        mapper_start = self.sources["launcher_lib.ps1"].index(
+            "function Get-EgReplaceSupportRef"
+        )
+        mapper_end = self.sources["launcher_lib.ps1"].index(
+            "function New-EgPublicationResult"
+        )
+        mapper = self.sources["launcher_lib.ps1"][mapper_start:mapper_end]
+        self.assertIn("EG_LAUNCHER_UNCLASSIFIED", mapper)
+        for forbidden in (".Message", "Exception.Message", "-match '"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(
+                    forbidden,
+                    mapper,
+                    "classification must read TYPE and HRESULT only, never message text",
+                )
 
 
 if __name__ == "__main__":

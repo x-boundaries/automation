@@ -349,28 +349,41 @@ $childArguments = @('-m', 'energygrid_bill_downloader', $Command, '--config', $C
 
 $childExitCode = $script:EgLauncherExitCodes['PreflightFailed']
 $restoreResult = $null
+$bindOk = $false
 try {
     $outcome = Invoke-EgWithInjectedProcessEnvironment -Variables $injected -Body {
-        $startInfo = New-Object System.Diagnostics.ProcessStartInfo
-        $startInfo.FileName = $PythonExe
-        $startInfo.Arguments = ConvertTo-EgNativeArgumentString -Argument $childArguments
-        $startInfo.WorkingDirectory = $workingDirectory
-        $startInfo.UseShellExecute = $false
-        $startInfo.CreateNoWindow = $true
-
-        $child = $null
-        try {
-            $child = New-Object System.Diagnostics.Process
-            $child.StartInfo = $startInfo
-            [void]$child.Start()
-            $child.WaitForExit()
-            $child.ExitCode
+        # The browser-cache binding is verified POSITIVELY before the child starts. An
+        # ambient value pointing elsewhere is overridden rather than honoured, and a
+        # binding that cannot be established is terminal rather than a silent fall-through
+        # to the default cache location.
+        $boundCache = [System.Environment]::GetEnvironmentVariable(
+            $script:EgBrowserCacheVariableName, 'Process')
+        if ($boundCache -cne $BrowserCachePath) {
+            [pscustomobject]@{ BindOk = $false; ExitCode = -1 }
         }
-        finally {
-            if ($null -ne $child) { $child.Dispose() }
+        else {
+            $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+            $startInfo.FileName = $PythonExe
+            $startInfo.Arguments = ConvertTo-EgNativeArgumentString -Argument $childArguments
+            $startInfo.WorkingDirectory = $workingDirectory
+            $startInfo.UseShellExecute = $false
+            $startInfo.CreateNoWindow = $true
+
+            $child = $null
+            try {
+                $child = New-Object System.Diagnostics.Process
+                $child.StartInfo = $startInfo
+                [void]$child.Start()
+                $child.WaitForExit()
+                [pscustomobject]@{ BindOk = $true; ExitCode = $child.ExitCode }
+            }
+            finally {
+                if ($null -ne $child) { $child.Dispose() }
+            }
         }
     }
-    $childExitCode = [int]$outcome.BodyResult
+    $bindOk = [bool]$outcome.BodyResult.BindOk
+    $childExitCode = [int]$outcome.BodyResult.ExitCode
     $restoreResult = $outcome.Restore
 }
 finally {
@@ -389,6 +402,12 @@ if ($null -ne $restoreResult) {
         $script:EgFirstFailureRef = $restoreResult.SupportRef
         Exit-EgPreflightFailure
     }
+}
+
+if (-not $bindOk) {
+    $script:EgFirstFailure = 'browser_cache_ready'
+    $script:EgFirstFailureRef = 'EG_LAUNCHER_BROWSER_CACHE_BIND_FAILED'
+    Exit-EgPreflightFailure
 }
 
 exit $childExitCode
