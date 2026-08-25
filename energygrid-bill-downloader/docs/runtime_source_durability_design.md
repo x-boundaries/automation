@@ -218,13 +218,21 @@ launcher never continues past a failed check, and never downgrades one to a warn
 6. Governed source integrity over the EnergyGrid runtime-critical surface passes
    (section 10.3).
 7. The private browser cache resolves and passes its readiness check (section 9.3).
-8. The private DPAPI credential artefact imports and yields a non-empty username and a
+8. Security expectations on the launcher root hold: ACL, reparse-point, and read-only
+   checks (section 17.2).
+9. The private DPAPI credential artefact imports and yields a non-empty username and a
    non-empty password (section 9.2).
-9. Security expectations on the launcher root hold (section 17).
 
-The credential import is deliberately last. It is the only check that materialises
-secret-derived values in memory, so every cheaper failure is reached before any
-credential is decrypted, and a run that will fail anyway never touches the artefact.
+Steps 1 to 8 are the non-secret preflight. Every one of them completes and passes before
+step 9 runs, so credential import is literally the last check and the only one that
+materialises secret-derived values in memory. A run that will fail for any other reason
+never opens the credential artefact at all.
+
+The ordering is a security property, not a performance preference, and it is asserted by
+`EGRT-T48` rather than left to reading order. Placing the launcher-root ACL and
+reparse-point checks after a credential import would mean decrypting a credential on a
+host whose launcher root had already failed its integrity expectations, which is exactly
+backwards.
 
 ### 5.3 Invocation and exit codes
 
@@ -279,21 +287,88 @@ execution, which uses section 10.3 instead. Conflating the two would make every
 unrelated merge on `main` block the daily EnergyGrid job, which is precisely what
 `DL-XB-141-SCHEDULER-005` forbids.
 
-### 6.2 Sequence
+### 6.2 Deployed package set and transaction sequence
 
-1. Resolve the source files under the `energygrid-bill-downloader/runtime/` directory
-   beneath `-CheckoutRoot`.
-2. Assert each source file parses cleanly with
-   `[System.Management.Automation.Language.Parser]::ParseFile`, and compute its
-   SHA-256.
-3. Compute the SHA-256 of each currently installed file, when present.
-4. If every installed file already matches its source hash, report `ALREADY_CURRENT`,
-   perform no replacement, and exit `0`. Installation is idempotent by hash, not by
-   timestamp.
-5. Otherwise, for each file that differs: record the installed preimage hash, write the
-   source bytes to an owned staging file in the destination directory, and publish it
-   with the atomic replacement contract in section 7.
-6. Report a per-file result object and exit `0` only when every file verified.
+**The deployed package is exactly three members**, and the installer publishes nothing
+else into the launcher root:
+
+| Member | Role |
+| --- | --- |
+| `launcher.ps1` | The entry script the Scheduled Task invokes |
+| `launcher_lib.ps1` | The pure library the entry script dot-sources |
+| Installation-integrity manifest | Generated, describes the other two, section 6.4 |
+
+Sharing the `runtime/` directory does not make a file deployable. These stay checkout,
+source, or operator material and are never copied to the launcher root:
+`install_or_update_launcher.ps1` (the operator runs it from the checkout, and deploying
+it would place an installer inside the surface it installs),
+`launcher.settings.example.json` (a placeholder shape, superseded on the host by real
+private settings), and `runtime/README.md` (documentation). The set is enumerated
+explicitly in source rather than derived from a directory listing, so a file added to
+`runtime/` later cannot become deployable by accident. `EGRT-T47` asserts this.
+
+**The three members are one transaction.** Publishing `launcher.ps1` successfully and
+committing before `launcher_lib.ps1` or the manifest succeeds would leave a mixed
+installation: a new entry script dot-sourcing an old library, or executable bytes that
+the manifest does not describe. Section 5.2 step 1 would then fail every subsequent run,
+having been made to fail by the installer itself. The four phases below exist to make
+that outcome unreachable.
+
+#### Phase 1 - Admission and prepare (no destination mutation whatsoever)
+
+1. Verify `-AdmissionCommit` and the source checkout.
+2. Resolve the exact deployable source set from the explicit enumeration above.
+3. Parse-check and SHA-256 every source file.
+4. Classify every destination as `Existing` (recording its preimage hash and byte length)
+   or `Absent`. This classification selects the publish primitive in section 7.1 and is
+   established before anything is written.
+5. If every deployed member already matches its source hash and the manifest already
+   agrees, report `ALREADY_CURRENT`, mutate nothing, and exit `0`. Installation stays
+   idempotent by hash, not by timestamp.
+6. Write and fully verify every staging file, for all changed members, before publishing
+   any of them.
+7. Construct the candidate manifest contents from the admitted source set, the source
+   hashes, and `-AdmissionCommit`.
+8. Validate the candidate manifest against its shape rules.
+
+Any failure in Phase 1 leaves **zero destination mutation**. The installer exits `71`
+with the destination package byte-identical to its pre-transaction state.
+
+#### Phase 2 - Publish the executable members
+
+For each changed executable member, in a recorded order:
+
+- `Existing` preimage: publish through `Invoke-AtomicFileReplace` (section 7.2) with an
+  explicit same-directory backup path.
+- `Absent` preimage: publish through `Invoke-PublishToAbsentDestination` (section 7.4).
+
+After each publication the destination hash is verified immediately. **No backup is
+deleted in this phase.** The installer records, for every touched destination, its
+preimage state, its preimage hash where one existed, its backup path where one exists,
+and whether it has been published. That record is the transaction state that Phase 4 and
+section 6.5 both depend on.
+
+#### Phase 3 - Publish and verify the manifest, inside the same transaction
+
+The manifest is a package member, not an epilogue.
+
+1. Publish it only after every executable member has individually verified.
+2. If a manifest already exists, publish it through the explicit-backup replacement path
+   and retain that backup exactly like any other member's. If none exists, record
+   `PreimageState = Absent` and use the publish-to-absent path.
+3. Re-read the published manifest from disk and verify: the exact expected entry set, the
+   exact expected hashes, the exact expected byte lengths, the admitted commit, and no
+   extra or missing deployed member.
+4. Re-verify every deployed executable file against the manifest just read back, so the
+   installed bytes and the record of them are proven mutually consistent rather than
+   assumed to be.
+
+#### Phase 4 - Commit
+
+The transaction is accepted only when every executable member has verified, the manifest
+has been published and read back correctly, and the full package re-verification in
+Phase 3 step 4 has passed. Only after acceptance may retained backups be reaped, under
+section 6.6. Any failure before acceptance triggers package rollback under section 6.5.
 
 ### 6.3 Constraints
 
@@ -313,9 +388,11 @@ the last accepted installation. That expected state has to come from somewhere, 
 boundary matters: the verification **method** is reusable and belongs in Git, while the
 **record** is private deployment state.
 
-- The installer generates an installation manifest in the launcher root as the final
-  act of a verified installation. It records, for each installed file, the relative file
-  name, its SHA-256, its byte length, and the `-AdmissionCommit` the bytes came from.
+- The installer generates an installation manifest in the launcher root as a member of
+  the same transaction, published in Phase 3 after every executable member has verified
+  and before package acceptance. It records, for each deployed executable file, the
+  relative file name, its SHA-256, its byte length, and the `-AdmissionCommit` the bytes
+  came from.
 - The manifest is generated from the reviewed source during installation. It is never
   hand-authored, never copied from a GitHub issue comment, never reconstructed from a
   Run119 bridge or a `%TEMP%` script, and never committed to Git.
@@ -334,24 +411,101 @@ trusting the manifest, and both are terminal. The manifest defends against accid
 drift, partial installation, and unreviewed hand-editing; it does not by itself defend
 against an attacker who already has write access to the launcher root.
 
+### 6.5 Package rollback
+
+Any failure after the first destination mutation and before package acceptance triggers
+package rollback. Rollback proceeds in **reverse publication order**, using the recorded
+transaction state from Phase 2, and it covers the manifest exactly as it covers the
+executable members.
+
+- **Preimage `Existing`.** Restore the exact retained backup over the destination using
+  the explicit-backup replacement semantics of section 7.2, then re-hash the restored
+  destination and confirm it equals the recorded preimage hash. A restoration that
+  cannot be positively verified is not treated as successful.
+- **Preimage `Absent`.** Remove exactly the destination this transaction created, then
+  positively confirm it is absent again. The installer never removes a file it did not
+  create in this transaction, and never removes a destination whose current content no
+  longer matches what it published, since that means something else has taken ownership.
+
+After rollback the installer re-verifies that the **entire** installed package equals its
+pre-transaction state: every previously present member restored to its preimage hash, and
+every member that was absent beforehand absent again.
+
+- Rollback verified complete: exit `72`, the bounded installation-failed-and-rolled-back
+  status.
+- Rollback not completely verifiable: exit `73`, manual owner action required. The
+  installer stops rather than attempting further repair, and every artefact is retained
+  for inspection.
+
+None of these outcomes is permitted to leave a new launcher with an old library, an old
+launcher with a new library, executable files that disagree with the manifest, or a
+manifest describing bytes that are not installed. `EGRT-T42` through `EGRT-T44` assert
+those four states are unreachable.
+
+### 6.6 Backup cleanup and post-commit residue
+
+Reaping a backup is a transaction-commit action, never a per-file one. The split of
+authority is deliberate:
+
+- The section 7 primitives prove one publication and always return with the backup
+  retained. They have no view of the package and therefore no authority to reap.
+- The installer holds every retained preimage until Phase 4 acceptance, because until the
+  manifest has been read back and the package re-verified, any of those preimages might
+  still be needed by section 6.5.
+- Only the Phase 4 commit step authorises cleanup, and only for backups this transaction
+  created.
+
+**If cleanup itself fails after acceptance**, the package is already committed, verified,
+and correct on disk. Rolling back a fully accepted installation because a now-redundant
+backup file could not be deleted would replace a good outcome with a worse one, so the
+installer does not do that. Instead it:
+
+- keeps the accepted installation;
+- retains the undeleted backup as inert residue;
+- reports a bounded, operator-visible status
+  (`EG_LAUNCHER_INSTALL_BACKUP_CLEANUP_INCOMPLETE`) naming how many backups remain;
+- exits `0`, because the installation genuinely succeeded.
+
+The failure is never swallowed. A committed installation with residue is reported as
+exactly that, and removing the residue is a separate, safe operator action. This is a
+narrow, visible exception to the fail-closed default, permitted because it concerns a
+redundant artefact after a verified success rather than any part of the installed
+package.
+
 ## 7. Atomic Replacement And Rollback Contract
 
 This section is the direct, reusable consequence of the Run119 `File.Replace` defect
 (section 18.2). It is a contract on a library function, not a patch to one host.
 
-### 7.1 Function shape
+### 7.1 Two publish primitives, chosen by preimage state
+
+`[System.IO.File]::Replace` requires the destination to already exist. It is a
+replacement primitive, not a creation primitive, and calling it against a missing
+destination fails. A design that routed every publication through it could therefore
+never perform a clean first installation, which is precisely the disaster-rebuild case
+this document exists to make reproducible.
+
+There are consequently two primitives, and the installer selects between them by
+positively establishing the destination's preimage state first. There is no third path,
+no overwrite-style fallback, and no copy-over-existing fallback.
 
 ```text
-Invoke-AtomicFileReplace
+Invoke-AtomicFileReplace          # preimage EXISTS
   -SourcePath        # the fully written staging file, mandatory
   -DestinationPath   # the file being replaced, mandatory
   -BackupPath        # explicit backup destination, mandatory, non-empty
   -ExpectedSha256    # hash the destination must have after replacement, mandatory
+
+Invoke-PublishToAbsentDestination # preimage ABSENT, contract in section 7.4
+  -SourcePath        # the fully written, parse-clean, hash-verified staging file
+  -DestinationPath   # the destination, which must be absent, mandatory
+  -ExpectedSha256    # hash the destination must have after publication, mandatory
 ```
 
-Returns a structured result object carrying `Success`, `SupportRef`,
-`ExceptionTypeName`, `HResult`, `PreimageSha256`, `PostimageSha256`, `BackupRetained`,
-and `RolledBack`.
+Both return a structured result object carrying `Success`, `SupportRef`,
+`ExceptionTypeName`, `HResult`, `PreimageState` (`Existing` or `Absent`),
+`PreimageSha256` (empty when absent), `PostimageSha256`, `BackupRetained`, and
+`RolledBack`.
 
 ### 7.2 Mandatory rules
 
@@ -364,9 +518,13 @@ and `RolledBack`.
 2. **Success is positively verified, never assumed.** After the call returns, the
    destination is re-hashed and compared to `-ExpectedSha256`. A returned call is not
    treated as a successful replacement until that comparison passes.
-3. **Rollback capability is retained until verification passes.** The backup is removed
-   only after the post-replacement hash comparison succeeds. On any failure the backup
-   is retained and reported.
+3. **The primitive never deletes the backup.** Per-file verification proves one
+   publication; it does not prove the package is consistent. `Invoke-AtomicFileReplace`
+   therefore always returns with `BackupRetained` true and leaves the backup in place,
+   whether it succeeded or failed, and reports the backup path in its result. Authority
+   to reap a backup belongs to the installer's transaction commit phase (section 6.6)
+   and to nothing else. A caller publishing a single file outside a package transaction
+   owns that decision explicitly rather than inheriting it silently.
 4. **Rollback restores the accepted preimage.** If verification fails, the backup is
    restored over the destination using the same explicit-backup mechanism (a second,
    distinct same-directory backup path), the restored destination is re-hashed and
@@ -400,6 +558,46 @@ Other runtimes may accept a null backup argument. The design therefore does not 
 any runtime rejecting it. The prohibition is enforced structurally by the mandatory
 parameter and by a static guard over the committed call sites, so the contract holds
 regardless of which runtime executes it.
+
+### 7.4 Publishing to an absent destination
+
+This is the clean-first-install path. It is reached only when the destination's absence
+has been positively established, and it never calls `[System.IO.File]::Replace`.
+
+1. **Absence is established first, not assumed.** The destination is confirmed absent
+   before anything is published. An unexpectedly present destination means the caller's
+   preimage classification was wrong, and that is terminal
+   (`EG_LAUNCHER_PUBLISH_DESTINATION_UNEXPECTEDLY_PRESENT`) rather than something to
+   recover from by overwriting.
+2. **The staging file is complete before publication.** It is fully written, flushed,
+   parse-clean, and hash-verified in the destination directory before the move begins.
+   Nothing partially written is ever published.
+3. **Publication is a same-directory move that will not clobber.** The staging file is
+   moved to the destination with a primitive that fails rather than overwrites if the
+   destination has appeared in the meantime. Windows `MoveFileExW` without
+   `MOVEFILE_REPLACE_EXISTING` provides exactly that, and it is the same no-replace move
+   discipline the application already uses when publishing a validated PDF. A losing race
+   is reported (`EG_LAUNCHER_PUBLISH_RACE_LOST`), never resolved by replacing.
+4. **The postimage is verified.** After the move, the destination is re-hashed and must
+   equal `-ExpectedSha256`. Publication is not treated as successful until it does.
+5. **The result records `PreimageState = Absent`.** There is no backup, because there was
+   nothing to back up. `PreimageSha256` is empty and `BackupRetained` is false.
+6. **Rollback means returning to absence.** If package verification later fails, undoing
+   this publication is the removal of exactly the destination this transaction created,
+   after which the destination is positively confirmed absent again. The installer never
+   removes a file it did not create in this transaction, and never removes a destination
+   whose content no longer matches what it published, since that would mean something
+   else has taken ownership.
+
+**A deliberate limit on what is claimed.** A no-replace move is atomic with respect to
+concurrent observers on the same volume: the destination is either absent or the complete
+file, never a partial one. It is not a crash-consistency guarantee. This design does not
+claim that an operating-system crash mid-transaction leaves the package in a committed or
+fully rolled-back state, because the primitive does not provide that and asserting it
+would be false. What the design does provide is that a crash leaves the installed
+package's prior members untouched, leaves retained backups in place, and leaves any
+partially advanced transaction detectable on the next run through the manifest
+verification in section 6.4. Recovery from that state is an operator action.
 
 ## 8. ValidateOnly Contract
 
@@ -490,13 +688,32 @@ that was absent beforehand is removed rather than left set to an empty string, a
 variable that was present is restored to its exact original value. A failed restoration
 is terminal (`EG_LAUNCHER_CREDENTIAL_RESTORE_FAILED`) rather than silent.
 
-**Cleanup.** Credential-derived temporaries are cleared and disposed as far as PowerShell
-reasonably permits once the child completes or fails: the `PSCredential` and any
-`SecureString` are disposed, plaintext-bearing variables are removed from scope, and no
-reference is retained past the finally block. This design does not claim guaranteed
-erasure of managed string memory, because .NET string interning and garbage collection
-make that claim false. The honest contract is bounded lifetime and no persistence, not
-cryptographic scrubbing.
+**Cleanup.** The contract is bounded lifetime and reference removal, stated in terms the
+platform can actually honour:
+
+- The `PSCredential` reference is held for the minimum lifetime required, and is removed
+  or nulled as soon as the child no longer needs it.
+- Plaintext-bearing temporaries are removed from scope promptly, and no credential-derived
+  reference is retained past the finally block.
+- The process environment is restored exactly, on the finally-equivalent path described
+  above.
+- `Dispose` is called only on an object that genuinely implements `IDisposable` and whose
+  lifetime the launcher owns.
+
+Two things this design explicitly does **not** require, because requiring them would
+produce code that cannot work:
+
+`System.Management.Automation.PSCredential` does **not** implement `IDisposable`. The
+launcher must never call `$credential.Dispose()` or any equivalent; doing so would throw
+at runtime. `EGRT-T49` asserts that no committed cleanup path attempts it. Disposing the
+`SecureString` reached through `.Password` is permitted only where the launcher genuinely
+owns that instance and no still-live object depends on it; where ownership is not clear,
+reference removal is the correct and sufficient action.
+
+Nor does this design claim cryptographic erasure of managed memory. .NET string interning
+and garbage collection make that claim false, and a false guarantee is worse than a
+bounded one. What is guaranteed is bounded lifetime, exact environment restoration, and
+no persistence to disk or to any durable environment scope.
 
 **Application interface is unchanged.** The application still reads only
 `ENERGYGRID_USERNAME` and `ENERGYGRID_PASSWORD` from its environment, exactly as
@@ -735,7 +952,7 @@ runtimes.
 | `EGRT-T08` | No committed `File.Replace` call site passes a literal `$null`, a literal `''`, or a variable not proven non-empty as the third argument | C |
 | `EGRT-T09` | Replacement exception type name and HRESULT are surfaced for the sharing-violation (`0x80070020`) and access-denied (`0x80070005`) classes | B |
 | `EGRT-T10` | Every replacement failure class leaves the destination hash equal to the recorded preimage hash | A and B |
-| `EGRT-T11` | On success the post-replacement hash is verified before the backup is removed: the backup is absent after success and present after any failure | A |
+| `EGRT-T11` | The primitive verifies the post-replacement hash before returning and never removes the backup itself: the backup is present after success and after failure, and the result reports it retained | A |
 | `EGRT-T12` | A deliberately wrong `-ExpectedSha256` triggers rollback, the destination is restored to the recorded preimage hash, and the result is `72` | A |
 | `EGRT-T13` | No credential value, account identity, private absolute path (`^[A-Za-z]:\\`), or UNC path (`^\\\\`) appears in any committed runtime file, example settings file, or test | C |
 | `EGRT-T14` | `-ValidateOnly` mutates nothing: a full recursive snapshot of path, size, modification time, and hash across the scratch launcher root, config path, and runtime roots is identical before and after, with no file created or removed | A |
@@ -765,6 +982,16 @@ runtimes.
 | `EGRT-T38` | A local HEAD moved to a newer commit that leaves the governed surface clean and tracked does not fail the run | A |
 | `EGRT-T39` | No Git subcommand outside the read-only allowlist appears in any committed runtime file, and no network or state-mutating Git command is invoked at runtime | A and C |
 | `EGRT-T40` | Ambient `GIT_DIR`, `GIT_WORK_TREE`, and `GIT_CONFIG_GLOBAL` cannot redirect the governed-path integrity checks to another repository | A |
+| `EGRT-T41` | A clean first install, with launcher, library, and manifest all absent, succeeds through the publish-to-absent path and yields a package whose bytes and manifest verify | A and B |
+| `EGRT-T42` | A first-install failure after publication returns every newly created owned destination to absent, confirmed absent afterwards | A |
+| `EGRT-T43` | A failure while publishing a later deployed member restores every earlier changed member to its exact pre-transaction state, byte for byte | A |
+| `EGRT-T44` | A manifest publication or manifest read-back verification failure rolls back every already published executable member and restores or removes the prior manifest according to its recorded preimage state | A |
+| `EGRT-T45` | Existing-file backups remain present through every per-file verification and are reaped only after whole-package acceptance | A |
+| `EGRT-T46` | After a successful commit the installed executable bytes and the manifest are mutually consistent, with no extra or missing member | A |
+| `EGRT-T47` | Only the enumerated deployed set reaches the launcher root; `install_or_update_launcher.ps1`, `launcher.settings.example.json`, and `runtime/README.md` are not deployed | A and C |
+| `EGRT-T48` | A deliberately failing non-secret preflight check, including the launcher-root security checks, causes zero credential import attempt | A and C |
+| `EGRT-T49` | No committed cleanup path invokes `Dispose` on a `PSCredential`, and the bounded-lifetime and no-persistence contract is preserved | C |
+| `EGRT-T50` | An unexpectedly present destination on the publish-to-absent path, and a destination that appears mid-publication, both fail rather than overwrite | A |
 
 ### 12.3 Testability without production fallbacks
 
@@ -921,7 +1148,11 @@ behaviour.
    be copied from another machine or another user. The repository supplies the import
    behaviour, not the artefact.
 7. Run `install_or_update_launcher.ps1 -ValidateOnly` with the reviewed commit as
-   `-AdmissionCommit`, then the approved install.
+   `-AdmissionCommit`, then the approved install. On a clean host the launcher root
+   contains no `launcher.ps1`, no `launcher_lib.ps1`, and no manifest, so all three
+   members classify as `Absent` in Phase 1 and publish through the publish-to-absent
+   path in section 7.4. No destination preimage is assumed to exist anywhere in this
+   procedure, and `EGRT-T41` asserts the bare-root case end to end.
 8. Run `launcher.ps1 -ValidateOnly` and confirm every check passes, including
    `credential_import_ok`, the browser-cache readiness check, and the governed
    source-integrity checks.
@@ -1038,7 +1269,7 @@ prohibited. Only the behaviour they proved is carried forward, in the form above
 | `EGRT-I04` | `Invoke-AtomicFileReplace` implements every rule in section 7.2, with a mandatory explicit backup path |
 | `EGRT-I05` | `Invoke-GovernedGit` implements the section 10 result contract and environment neutralisation |
 | `EGRT-I06` | `-ValidateOnly` satisfies section 8, including deterministic output and zero mutation |
-| `EGRT-I07` | All forty assertions `EGRT-T01` to `EGRT-T40` are implemented and pass |
+| `EGRT-I07` | All fifty assertions `EGRT-T01` to `EGRT-T50` are implemented and pass |
 | `EGRT-I08` | The full project suite passes on Windows via `python -m unittest discover -s tests -v` |
 | `EGRT-I09` | No GitHub Actions workflow is modified |
 | `EGRT-I10` | No secret, credential, private absolute path, or private identity is committed |
@@ -1052,6 +1283,12 @@ prohibited. Only the behaviour they proved is carried forward, in the form above
 | `EGRT-I18` | The launcher performs zero Git network operations and zero Git state mutations, enforced by the read-only allowlist and its static guard |
 | `EGRT-I19` | Exact-commit admission exists only in the operator-controlled install lane as `-AdmissionCommit`, and never in the unattended path |
 | `EGRT-I20` | Installed-launcher integrity is reproducible from reviewed Git source plus the installer-generated private manifest, with no dependence on issue comments or retired bridges |
+| `EGRT-I21` | Clean first installation is supported without calling `File.Replace` against a missing destination, using the publish-to-absent primitive in section 7.4 |
+| `EGRT-I22` | The launcher, library, and manifest form one package transaction, with every preimage retained until package acceptance |
+| `EGRT-I23` | Any pre-commit later-member or manifest failure restores the exact complete pre-transaction package state, verified before the failure status is returned |
+| `EGRT-I24` | Manifest publication and full package re-verification occur inside the transaction, before any backup cleanup is authorised |
+| `EGRT-I25` | Every non-secret and security preflight check precedes the DPAPI import, with no credential import attempted when an earlier check fails |
+| `EGRT-I26` | Credential cleanup uses bounded lifetime and reference removal, never requires `PSCredential.Dispose()`, and makes no memory-erasure claim |
 
 Acceptance of this document is an architectural decision only. It does not approve the
 implementation change, the first installation, the scheduler, or any live run. Each of
