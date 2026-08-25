@@ -183,7 +183,7 @@ so the executing engineer does not have to invent them.
 | `DD-10` | Publication order within Phase 2 is the fixed recorded order `launcher_lib.ps1` first, then `launcher.ps1`. The library is published before the entry script that dot-sources it, so a mid-transaction crash leaves an old entry script with a new library rather than a new entry script calling a missing library function. Reverse publication order for rollback is therefore `launcher.ps1` first, then `launcher_lib.ps1`. | 6.2 Phase 2 "in a recorded order"; 6.5 reverse publication order |
 | `DD-11` | `Test-EgGovernedSourceIntegrity` detects a `.gitignore`-hidden untracked overlay by running `ls-files --others --exclude-standard` and `ls-files --others --ignored --exclude-standard` over the governed executable pathspec, then subtracting the sanctioned Python bytecode exception. Both are read-only allowlisted `ls-files` invocations. | 10.3 overlay detection and the one legitimate exception; 10.3 read-only allowlist |
 | `DD-12` | The value supplied on `-AuthorisedLauncherRootWriteSid` is admitted by `Test-EgAuthorisedWriteSidSet` before either launcher-root write check runs. The set must be non-empty, every element must parse as a `System.Security.Principal.SecurityIdentifier` from its standard textual form, `S-1-3-0` is refused outright, and anything that is not a SID string, including an account name, is refused. A failed admission is terminal, is reported as a FAIL of ordered check 16 `launcher_root_write_trustees_authorised`, and records `EG_LAUNCHER_ROOT_AUTHORISED_SID_SET_INVALID`. One check name carrying several bounded references for distinct causes is the pattern `governed_source_integrity` already uses. There is no default, no environment-variable route, no committed example value, and no file the launcher reads the set from. | 9.1 accepted representation, no default and no alternative route; 17.2.1 no-wildcards rule and `S-1-3-0` refusal; `EGRT-T61`, `EGRT-T68` |
-| `DD-13` | The Win32 calls `DD-02` requires are unavailable to managed code on the Windows PowerShell 5.1 boundary, so `launcher_lib.ps1` carries the interop declaration as a `$script:` here-string constant and compiles it lazily through `Initialize-EgWin32SecurityInterop` on first use, guarded by a `[System.Management.Automation.PSTypeName]` presence test so repeat calls compile nothing. Declaring the constant is not a side effect, so `EGRT-I01` is preserved; compiling on first use writes only into the host's own temporary compilation location, never into the launcher root, the deployed checkout, the configuration directory, the browser cache, or the log root, which is the exact domain `EGRT-T14` snapshots. | 17.2.1 requires `AccessCheck` and `DuplicateTokenEx`, which .NET exposes no managed equivalent of; `EGRT-I01` pure-library rule; section 8 zero-mutation contract |
+| `DD-13` | The Win32 calls `DD-02` requires are unavailable to managed code on the Windows PowerShell 5.1 boundary, so `launcher_lib.ps1` carries the interop declaration as a `$script:` here-string constant and compiles it lazily through `Initialize-EgWin32SecurityInterop` on first use, guarded by a `[System.Management.Automation.PSTypeName]` presence test so repeat calls compile nothing. Declaring the constant is not a side effect, so `EGRT-I01` is preserved; compiling on first use writes only into the host's own temporary compilation location, never into the launcher root, the deployed checkout, the configuration directory, the browser cache, or the log root, which is the exact domain `EGRT-T14` snapshots. | 17.2.1 requires `AccessCheck` and `DuplicateTokenEx`, and its privilege-bypass rule requires `LookupPrivilegeNameW` because `GetTokenInformation` with `TOKEN_PRIVILEGES` returns locally unique identifiers rather than names, none of which .NET exposes a managed equivalent of; `EGRT-I01` pure-library rule; section 8 zero-mutation contract |
 
 ### Write-capable rights, defined once
 
@@ -2050,9 +2050,32 @@ function Initialize-EgWin32SecurityInterop {
     # so repeat calls compile nothing. Never invoked at load time, so the library stays
     # pure and dot-sourceable (EGRT-I01, DD-13).
     #
-    # The here-string declares exactly these imports and nothing else:
+    # The here-string declares exactly these DllImport entries and nothing else, the
+    # supporting value types they marshal through being declarations rather than imports:
     #   GetCurrentProcess, OpenProcessToken, DuplicateTokenEx, CloseHandle,
-    #   GetTokenInformation, AccessCheck, MapGenericMask.
+    #   GetTokenInformation, AccessCheck, MapGenericMask, LookupPrivilegeNameW.
+    #
+    # That list is complete by contract: every native function any security helper in this
+    # library calls appears in it, and nothing appears in it that no helper calls.
+    # LookupPrivilegeNameW is required because GetTokenInformation with TOKEN_PRIVILEGES
+    # returns LUID_AND_ATTRIBUTES entries carrying locally unique identifiers, not names,
+    # and neither the LUID-to-name translation nor the privilege enumeration has a managed
+    # .NET equivalent (DD-13).
+    #
+    # LookupPrivilegeNameW is declared for the Windows PowerShell 5.1 boundary as, in the
+    # here-string's C#:
+    #   [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true,
+    #              EntryPoint = "LookupPrivilegeNameW")]
+    #   public static extern bool LookupPrivilegeNameW(
+    #       [MarshalAs(UnmanagedType.LPWStr)] string lpSystemName,
+    #       ref LUID lpLuid,
+    #       System.Text.StringBuilder lpName,
+    #       ref int cchName);
+    # The entry point is named explicitly rather than left to charset name mangling, which
+    # is what keeps the declaration unambiguous on the Desktop boundary; lpSystemName is
+    # always $null, so the local system is queried and no machine name is ever formed;
+    # StringBuilder marshalling is used for the out buffer, and cchName is passed by
+    # reference because Windows both reads and writes it.
     #
     # No security-descriptor import is declared. The descriptor is read through managed
     # .NET as GetSecurityDescriptorBinaryForm() on a FileSecurity or DirectorySecurity
@@ -2106,8 +2129,20 @@ function Test-EgBypassPrivilegePresent {
 function Get-EgTokenPrivilegeNames {
     [CmdletBinding()]
     param()
-    # Reads the privilege names present in the running process token through
-    # GetTokenInformation with TOKEN_PRIVILEGES and LookupPrivilegeName.
+    # Calls Initialize-EgWin32SecurityInterop, then reads the privilege names present in
+    # the running process token through the declared GetTokenInformation with
+    # TOKEN_PRIVILEGES and the declared LookupPrivilegeNameW. Both are members of the
+    # exact import surface above; this function calls no native function that surface does
+    # not declare.
+    #
+    # Buffer sizing follows normal Win32 two-call semantics on both calls. For
+    # GetTokenInformation, a first call sized zero fails with ERROR_INSUFFICIENT_BUFFER
+    # and reports the required TOKEN_PRIVILEGES length, which is then allocated and read.
+    # For each LUID_AND_ATTRIBUTES entry returned, LookupPrivilegeNameW is called with
+    # lpSystemName $null and cchName 0, which fails with ERROR_INSUFFICIENT_BUFFER and
+    # sets cchName to the name length excluding the terminating null; a StringBuilder of
+    # cchName + 1 is then allocated and the call repeated to obtain the name.
+    #
     # Returns:
     #   [pscustomobject]@{
     #       ReadOk         = [bool]
@@ -2116,6 +2151,13 @@ function Get-EgTokenPrivilegeNames {
     # ReadOk $true means the token privilege information was read: PrivilegeNames carries
     # exactly the names OBSERVED in the token, always a forced array subexpression.
     # ReadOk $false means the read FAILED: PrivilegeNames is @().
+    #
+    # A read failure is ANY Win32 failure on that path: interop compilation,
+    # OpenProcessToken, either GetTokenInformation call, or either LookupPrivilegeNameW
+    # call on ANY entry, including a second call that still fails after the reported size
+    # was allocated. One unresolved LUID fails the whole read. No entry is ever silently
+    # skipped, no partial list is ever returned, and a LookupPrivilegeNameW error is never
+    # read as "that privilege is absent".
     #
     # The function never reports a privilege name it did not observe. A read failure is
     # never expressed as a synthetic SeTakeOwnershipPrivilege, SeRestorePrivilege, or any
@@ -2313,7 +2355,10 @@ had not computed, which the fallback discipline in Global Constraints forbids.
      failure;
      (d) a `Get-EgTokenPrivilegeNames` result carrying `ReadOk` `$false` fails the same
      check terminally on its own, without the predicate being consulted and without the
-     empty `PrivilegeNames` array being read as absence of a bypass privilege; and
+     empty `PrivilegeNames` array being read as absence of a bypass privilege, proven for a
+     `GetTokenInformation` failure and independently for a `LookupPrivilegeNameW` failure on
+     a single entry, so an unresolved locally unique identifier can neither be skipped nor
+     yield a partial list; and
      (e) the read-failure path fabricates neither bypass privilege name, asserted over the
      returned object and over every surface the failure reaches.
      Cases (a) to (c) drive `Test-EgBypassPrivilegePresent` directly over supplied observed
@@ -2334,6 +2379,19 @@ had not computed, which the fallback discipline in Global Constraints forbids.
      `LookupAccountName`, and that no `SecurityIdentifier` used as the checking context is
      constructed from an account name or a SID string; the dynamic half asserts the
      duplicated handle is closed on every path including failure.
+
+     The static half also asserts the interop surface is complete and closed, by
+     enumerating the required native names - `GetCurrentProcess`, `OpenProcessToken`,
+     `DuplicateTokenEx`, `CloseHandle`, `GetTokenInformation`, `AccessCheck`,
+     `MapGenericMask`, and `LookupPrivilegeNameW` - and asserting that each has a
+     `DllImport` declaration in `$script:EgWin32SecurityInteropSource`, that the
+     here-string's `DllImport` set contains nothing beyond those eight, that
+     `LookupPrivilegeNameW` is declared with `SetLastError` and an explicit `EntryPoint`,
+     and that `Get-EgTokenPrivilegeNames` actually calls the declared
+     `LookupPrivilegeNameW` rather than resolving a privilege name any other way. A future
+     implementation therefore cannot omit `LookupPrivilegeNameW` while still claiming the
+     privilege-reader path is complete, and cannot reach a native function the surface does
+     not declare.
    - `test_the_write_capable_mask_is_generic_mapped_before_intersection` (`EGRT-T71`,
      Tier A and C): the dynamic half asserts a descriptor expressed only in generic rights
      is still detected as write-capable, and that `Get-EgMappedWriteCapableMask` returns a
@@ -3079,8 +3137,12 @@ never a SID.
   `Get-EgDeployedPackageMemberNames` (Task 8) joined to it under `DD-01`, so the Class A
   names still have exactly one declaration and the write checks add no second list.
 - `Initialize-EgWin32SecurityInterop` is the only compilation site, is called only from
-  `Get-EgMappedWriteCapableMask` and `Test-EgTokenWriteAccessToPath`, and is never reached
-  at load, so `EGRT-I01` holds with the interop present (`DD-13`).
+  `Get-EgMappedWriteCapableMask`, `Test-EgTokenWriteAccessToPath`, and
+  `Get-EgTokenPrivilegeNames`, and is never reached at load, so `EGRT-I01` holds with the
+  interop present (`DD-13`). Its declared import surface and the native functions those
+  three consumers call are one list, not two: `LookupPrivilegeNameW` is declared because
+  `Get-EgTokenPrivilegeNames` calls it, and `EGRT-T70`'s static half asserts the surface is
+  both complete and closed against that consumer set.
 - The three Class A fixed names are declared once as
   `$script:EgDeployedPackageMemberNames` (Task 8) and are the sole source for
   `Get-EgDeployedPackageMemberNames` (Task 8), the `Member` field of `Test-EgResidueName`
