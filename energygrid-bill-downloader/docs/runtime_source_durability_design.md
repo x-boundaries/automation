@@ -60,7 +60,13 @@ runtime layer has no equivalent. This design closes that gap.
 This design does not authorise, and the implementation change must not include:
 
 - registering, altering, starting, or removing a Scheduled Task;
-- implementing or changing a credential or DPAPI mechanism;
+- creating, rotating, replacing, relocating, or inspecting the private DPAPI credential
+  artefact, or changing how the host protects it. The implementation adds the
+  secret-free import, injection, and cleanup behaviour of section 9.2 and nothing more;
+- provisioning, installing, updating, or repairing the private browser cache. The
+  implementation binds and validates it, per section 9.3, and never writes into it;
+- updating the deployed checkout, or any Git operation that fetches or mutates state,
+  per section 10.3;
 - contacting the live Energy@Grid portal, or any headed or live run;
 - replacing, editing, or cleaning up anything on the live server;
 - changing the Python application, its status vocabulary, or its exit codes;
@@ -86,6 +92,10 @@ constrained by it.
 | Exception and diagnostic reporting | Bounded `EG_LAUNCHER_*` vocabulary, section 11 |
 | Security and ACL expectations | Named checks with expected outcomes, section 17 |
 | Reusable environment hardening | Governed Git invocation, section 10 |
+| Credential import, injection, and cleanup behaviour | Secret-free logic in the pure library, contract in section 9.2 |
+| Private browser-cache binding behaviour | Secret-free logic in the pure library, contract in section 9.3 |
+| Unattended source-integrity rules | Path-scoped governed checks, contract in section 10.3 |
+| Installed-launcher verification method | Manifest shape and comparison, contract in section 6.4 |
 | Scheduler integration contract | The action shape only, once separately approved |
 | Tests | `energygrid-bill-downloader/tests/` |
 | Operator and runbook documentation | `energygrid-bill-downloader/docs/` and `runtime/README.md` |
@@ -170,15 +180,26 @@ approved.
 | `-ConfigPath` | yes | Absolute path to the external private JSON configuration |
 | `-PythonExe` | yes | Absolute path to the approved Python 3.14.x interpreter |
 | `-CheckoutRoot` | yes | Absolute path to the deployed checkout root |
+| `-CredentialPath` | yes | Absolute path to the private DPAPI PSCredential CLIXML artefact, section 9.2 |
+| `-BrowserCachePath` | yes | Absolute path to the approved private Playwright browser cache, section 9.3 |
+| `-ExpectedBranch` | yes | Branch the deployed checkout must be on, or the literal `ANY_BRANCH`, section 10.3 |
 | `-Command` | no | `run` (default) or `list` |
-| `-ExpectedCommit` | no | Full 40-character commit the deployed checkout must be at |
 | `-LogRoot` | no | Private diagnostics root for the launcher's own terminal event |
 | `-ValidateOnly` | no | Switch, contract in section 8 |
 | `-RunId` | no | Correlation identifier for the terminal event only |
 
-There is no credential parameter, no portal parameter, no browser-install parameter,
-and no headed switch. `--headed` remains an application concern reached through a
+`-CredentialPath` and `-BrowserCachePath` locate private host artefacts; they never
+carry a credential value or a committed path. `-ExpectedBranch` is mandatory with an
+explicit `ANY_BRANCH` sentinel rather than optional, so branch binding is never
+disabled by omitting an argument. There is no parameter that accepts a credential
+value, no portal parameter, no browser-install parameter, no commit-pin parameter, and
+no headed switch. `--headed` remains an application concern reached through a
 separately approved manual invocation, not through the launcher.
+
+The launcher deliberately has no `-ExpectedCommit`. Pinning normal unattended execution
+to one fixed whole-repository commit is the wrong contract for a monorepo, and section
+10.3 replaces it with a path-scoped integrity check. Exact-commit admission survives
+only in the operator-controlled install lane, section 6.1.
 
 ### 5.2 Preflight, in order
 
@@ -194,19 +215,30 @@ launcher never continues past a failed check, and never downgrades one to a warn
    application already enforces them in `energygrid_bill_downloader/config.py` and
    duplicating them here would create two sources of truth.
 5. The interpreter reports a 3.14.x version.
-6. `ENERGYGRID_USERNAME` and `ENERGYGRID_PASSWORD` are present and non-empty in the
-   process environment. Presence only, per section 9.
-7. Runtime binding: if `-ExpectedCommit` is supplied, a governed Git read (section 10)
-   confirms the deployed checkout is at exactly that commit with a clean worktree.
-8. Security expectations on the launcher root hold (section 17).
+6. Governed source integrity over the EnergyGrid runtime-critical surface passes
+   (section 10.3).
+7. The private browser cache resolves and passes its readiness check (section 9.3).
+8. The private DPAPI credential artefact imports and yields a non-empty username and a
+   non-empty password (section 9.2).
+9. Security expectations on the launcher root hold (section 17).
+
+The credential import is deliberately last. It is the only check that materialises
+secret-derived values in memory, so every cheaper failure is reached before any
+credential is decrypted, and a run that will fail anyway never touches the artefact.
 
 ### 5.3 Invocation and exit codes
 
 On success the launcher invokes
 `<PythonExe> -m energygrid_bill_downloader <Command> --config <ConfigPath>` with the
 `energygrid-bill-downloader` directory beneath `-CheckoutRoot` as the working
-directory, passes the process environment through unchanged, and propagates the child's
-exit code verbatim.
+directory, and propagates the child's exit code verbatim.
+
+The environment is not passed through unchanged. Immediately before the child starts,
+the launcher sets exactly three process-scope variables from the values established in
+preflight: `ENERGYGRID_USERNAME` and `ENERGYGRID_PASSWORD` from the imported credential
+(section 9.2), and the Playwright browser-cache variable from `-BrowserCachePath`
+(section 9.3). Each is restored to its exact prior process state in a finally-equivalent
+path once the child exits or fails to start. No other environment change is made.
 
 The application returns `0`, `10`, `20`, or `64`. The launcher's own failures therefore
 use a disjoint band, so a launcher failure can never be mistaken for an application
@@ -231,8 +263,21 @@ launcher ever changes.
 ### 6.1 Parameters
 
 `-CheckoutRoot` (source, required), `-LauncherRoot` (destination, required),
-`-ValidateOnly` (switch), `-LogRoot` (optional), `-RunId` (optional). No credential,
-scheduler, ACL-mutation, or cleanup parameter exists.
+`-AdmissionCommit` (required, full 40-character hex), `-ValidateOnly` (switch),
+`-LogRoot` (optional), `-RunId` (optional). No credential, browser-cache, scheduler,
+ACL-mutation, or cleanup parameter exists.
+
+`-AdmissionCommit` is the operator-controlled admission lane, and it is where an exact
+reviewed source commit legitimately belongs. Installation is a supervised action that
+publishes reviewed bytes outside the checkout, so requiring the operator to name the
+exact commit being published is proportionate, and it is what the Run119 repair lane
+historically enforced. It is mandatory rather than optional so that admission can never
+be skipped by omitting an argument.
+
+That requirement stops at this lane. It is not inherited by normal unattended
+execution, which uses section 10.3 instead. Conflating the two would make every
+unrelated merge on `main` block the daily EnergyGrid job, which is precisely what
+`DL-XB-141-SCHEDULER-005` forbids.
 
 ### 6.2 Sequence
 
@@ -260,6 +305,34 @@ scheduler, ACL-mutation, or cleanup parameter exists.
   shared temporary directory.
 - A file the installer did not create is never deleted. On any failure path, artefacts
   are retained for inspection rather than cleaned up.
+
+### 6.4 Installed-launcher integrity manifest
+
+Section 5.2 step 1 requires the launcher to confirm that the installed files still match
+the last accepted installation. That expected state has to come from somewhere, and the
+boundary matters: the verification **method** is reusable and belongs in Git, while the
+**record** is private deployment state.
+
+- The installer generates an installation manifest in the launcher root as the final
+  act of a verified installation. It records, for each installed file, the relative file
+  name, its SHA-256, its byte length, and the `-AdmissionCommit` the bytes came from.
+- The manifest is generated from the reviewed source during installation. It is never
+  hand-authored, never copied from a GitHub issue comment, never reconstructed from a
+  Run119 bridge or a `%TEMP%` script, and never committed to Git.
+- Git is canonical for the manifest's **shape** and for the comparison rules: which
+  fields exist, how the hash is computed, and that a missing, unparsable, or
+  non-matching manifest is terminal rather than a warning.
+- The launcher recomputes each installed file's hash and compares it to the manifest. A
+  mismatch, a manifest entry with no corresponding file, or a runtime file with no
+  manifest entry each fail closed.
+
+An honest limitation, stated because a reader will otherwise assume more: the manifest
+sits beside the files it describes, so a writer who can modify the launcher can also
+modify the manifest. It is tamper-evident only to the extent that the launcher-root ACL
+expectations in section 17.2 hold. Those checks are therefore a precondition for
+trusting the manifest, and both are terminal. The manifest defends against accidental
+drift, partial installation, and unreviewed hand-editing; it does not by itself defend
+against an attacker who already has write access to the launcher root.
 
 ## 7. Atomic Replacement And Rollback Contract
 
@@ -340,10 +413,18 @@ without owner approval for a mutating action.
   process.
 - It starts no child process other than the read-only interpreter version probe and the
   governed Git reads, and it never invokes `run` or `list`.
+- It launches no browser, installs or updates no browser cache, and contacts no portal.
+- It may import the private DPAPI credential artefact in-process to prove viability,
+  because an artefact that cannot be imported is exactly the failure an operator needs
+  to find before scheduling. The import is read-only, the imported object is discarded
+  immediately after the three booleans below are derived, and no value survives it.
+- It records only `credential_import_ok`, `username_nonempty`, and `password_nonempty`
+  as booleans. It never emits, logs, hashes, measures, or otherwise derives a reportable
+  quantity from either credential value.
 - It emits exactly one JSON object on standard output: a `checks` map of check name to
   outcome, an overall `status`, and a `support_ref` when the overall status is not a
-  pass. The object contains no path, no environment value, no account identity, and no
-  Git output text.
+  pass. The object contains no path, no environment value, no credential value, no
+  account identity, and no Git output text.
 - Its output is deterministic. It carries no timestamp and no generated identifier, so
   two consecutive runs against unchanged host state produce byte-identical output. This
   is what makes the idempotency assertion in section 12 a strict byte comparison rather
@@ -351,7 +432,9 @@ without owner approval for a mutating action.
 - Exit `0` means every check passed. A failure exits `70` and names the first failing
   check by its stable name.
 
-## 9. Private Configuration Boundary
+## 9. Private Configuration And Credential Boundary
+
+### 9.1 Host-supplied values
 
 - The launcher receives every host-specific value as an explicit parameter. There is no
   default that encodes a private path, a private identity, or a host name.
@@ -360,15 +443,92 @@ without owner approval for a mutating action.
   `config/energygrid.example.json`.
 - `account_identity` stays where it already is: in the external private JSON, never on
   a command line, never in a log, never in the repository.
-- Credentials are read from `ENERGYGRID_USERNAME` and `ENERGYGRID_PASSWORD` in the
-  process environment by the application. The launcher asserts that each is present and
-  non-empty and does nothing else with them. It never accepts them as parameters, never
-  writes them, never includes them in a result object, never passes them as command-line
-  arguments, and never emits their length, prefix, or hash.
-- DPAPI material and any host credential store stay on the host. The launcher never
-  decrypts, never enumerates, and never persists credential material.
 - The launcher writes only to the private diagnostics root supplied by `-LogRoot`, and
   only the single terminal event described in section 11.
+
+### 9.2 DPAPI credential loading, injection, and cleanup
+
+The production launcher already loads credentials itself, from a Windows-user-bound
+DPAPI `PSCredential` CLIXML artefact. That is accepted runtime architecture, and it is
+reusable, secret-free logic. Leaving it on the server would defeat the whole point of
+this design, so Git becomes canonical for the behaviour while the artefact stays
+private.
+
+**What stays private.** The DPAPI artefact itself, its absolute path, the Windows user
+identity it is bound to, and every value it yields. The artefact is never committed,
+never copied into the checkout, and never reconstructed by the repository. Its location
+reaches the launcher only through `-CredentialPath`, supplied from private host
+settings.
+
+**What Git owns.** The import, injection, and cleanup behaviour, expressed without any
+private value:
+
+1. Resolve `-CredentialPath`. A missing or unreadable artefact is terminal
+   (`EG_LAUNCHER_CREDENTIAL_ARTEFACT_MISSING`).
+2. Import it locally with the platform CLIXML import. DPAPI binds the artefact to the
+   Windows user, so an import under any other user fails by construction rather than by
+   a check the launcher has to write. A failed or non-`PSCredential` import is terminal
+   (`EG_LAUNCHER_CREDENTIAL_IMPORT_FAILED`).
+3. Require a non-empty username and a non-empty password. Either being empty is terminal
+   (`EG_LAUNCHER_CREDENTIAL_INCOMPLETE`).
+4. Every failure above happens before the Python child starts. There is no path on which
+   the application is launched with absent, partial, or unverified credentials.
+5. Values exist in memory only. They are never written to disk, never passed as
+   command-line arguments, never placed in a result object, never logged, and never
+   emitted in any derived form, including length, prefix, suffix, or hash.
+
+**Injection scope.** Immediately before the child starts, the launcher captures the
+prior process-scope state of `ENERGYGRID_USERNAME` and `ENERGYGRID_PASSWORD`, then sets
+both at **process scope only** for the bounded child execution. It never writes User-scope
+or Machine-scope environment variables, so no persistent EnergyGrid credential variable
+is ever created on the host and the existing absence of those persistent variables is
+preserved.
+
+**Restoration.** In a finally-equivalent path, reached whether the child succeeded,
+failed, or never started, the launcher restores the exact prior process state: a variable
+that was absent beforehand is removed rather than left set to an empty string, and a
+variable that was present is restored to its exact original value. A failed restoration
+is terminal (`EG_LAUNCHER_CREDENTIAL_RESTORE_FAILED`) rather than silent.
+
+**Cleanup.** Credential-derived temporaries are cleared and disposed as far as PowerShell
+reasonably permits once the child completes or fails: the `PSCredential` and any
+`SecureString` are disposed, plaintext-bearing variables are removed from scope, and no
+reference is retained past the finally block. This design does not claim guaranteed
+erasure of managed string memory, because .NET string interning and garbage collection
+make that claim false. The honest contract is bounded lifetime and no persistence, not
+cryptographic scrubbing.
+
+**Application interface is unchanged.** The application still reads only
+`ENERGYGRID_USERNAME` and `ENERGYGRID_PASSWORD` from its environment, exactly as
+`energygrid-bill-downloader/README.md` documents. The DPAPI import is the "approved host
+mechanism" that README refers to, now written down rather than assumed, so no
+application change is implied.
+
+### 9.3 Private Playwright browser-cache binding
+
+The launcher must positively bind the approved private browser cache and fail closed. It
+must never silently fall through to an ambient or default Playwright cache, because a
+run that quietly uses an unreviewed browser cache is a run whose behaviour nobody
+approved.
+
+- The cache location arrives through `-BrowserCachePath`, from private host settings. No
+  cache path is committed, and there is no default.
+- Before the child starts, the path must resolve
+  (`EG_LAUNCHER_BROWSER_CACHE_UNRESOLVED`) and must pass a positive readiness check that
+  confirms a provisioned Chromium is actually present, not merely that a directory exists
+  (`EG_LAUNCHER_BROWSER_CACHE_NOT_READY`). Both failures are terminal.
+- The launcher captures the prior process-scope value of `PLAYWRIGHT_BROWSERS_PATH`, then
+  sets it explicitly to `-BrowserCachePath` for the child. It never relies on whatever
+  the PowerShell process inherited, and an ambient value pointing elsewhere is overridden
+  rather than honoured (`EG_LAUNCHER_BROWSER_CACHE_BIND_FAILED` if the binding cannot be
+  established).
+- The prior process-scope value is restored exactly afterwards, on the same
+  finally-equivalent path as the credential variables, with absent restored as absent.
+- There is no fallback. A cache that is missing, unreadable, or not provisioned fails the
+  run; it never degrades to the default location.
+- The launcher never installs, updates, repairs, or downloads into the cache. Provisioning
+  stays an operator action, exactly as
+  `energygrid-bill-downloader/docs/runbook.md` already requires.
 
 ## 10. Git And Environment Hermeticity
 
@@ -421,6 +581,80 @@ against the wrong tree. Before each governed read the function neutralises, and 
 Restoration is exact: a variable that was absent before the call is absent after it,
 not present and empty. The repository is selected explicitly with `-C <path>`, and
 reads use `--no-optional-locks` so a governed read never mutates the repository.
+
+### 10.3 Path-scoped source integrity for unattended execution
+
+This section reconciles the design with `DL-XB-141-SCHEDULER-005`.
+
+**Why not a fixed commit.** `x-boundaries/automation` is a monorepo. Requiring the
+deployed checkout to sit at one permanently fixed whole-repository HEAD would mean any
+accepted, unrelated merge stops the daily EnergyGrid job, and any unrelated dirty file
+elsewhere in the tree does the same. That converts routine repository activity into an
+outage. The correct unit of protection is the EnergyGrid runtime-critical surface, not
+the repository.
+
+**Governed surface.** Exactly two paths, relative to the checkout root:
+
+- `energygrid-bill-downloader/energygrid_bill_downloader`
+- `energygrid-bill-downloader/requirements.txt`
+
+The first is the code the child process actually executes. The second is the pinned
+dependency contract the approved environment was built from. Nothing else is added.
+`runtime/` is deliberately excluded: the launcher executes from the launcher root
+outside the checkout, and its integrity is covered by the installation manifest in
+section 6.4, so the checkout copy is install-source rather than execution surface.
+`tests/`, `docs/`, `task-scheduler/`, and `config/energygrid.example.json` are excluded
+because a normal run does not execute or read them. Broadening to the whole monorepo
+because it is easier is exactly the failure this section exists to prevent.
+
+**Required checks**, all read-only, all through `Invoke-GovernedGit` from section 10.1
+with the neutralisation from section 10.2:
+
+1. Repository binding: the resolved top level equals the supplied `-CheckoutRoot`. This
+   also proves ambient `GIT_DIR` or `GIT_WORK_TREE` redirection did not silently move
+   the checks to another tree (`EG_LAUNCHER_SOURCE_BINDING_FAILED`).
+2. Branch binding: unless `-ExpectedBranch` is the literal `ANY_BRANCH`, the current
+   branch equals it. The sentinel is explicit, so binding is never disabled by omission.
+3. Each governed path exists (`EG_LAUNCHER_SOURCE_PATH_MISSING`).
+4. Each governed path is tracked, proven by a non-empty tracked-file listing scoped to
+   that path (`EG_LAUNCHER_SOURCE_PATH_UNTRACKED`).
+5. No staged modification under the governed paths
+   (`EG_LAUNCHER_SOURCE_STAGED_MODIFICATION`).
+6. No unstaged modification under the governed paths
+   (`EG_LAUNCHER_SOURCE_UNSTAGED_MODIFICATION`).
+7. No deletion of a tracked file under the governed paths
+   (`EG_LAUNCHER_SOURCE_DELETED`).
+8. No untracked substitution or overlay inside the governed executable surface
+   (`EG_LAUNCHER_SOURCE_UNTRACKED_OVERLAY`).
+
+**Scope is the point.** Every check above is scoped to the governed paths with an
+explicit Git pathspec. A dirty file anywhere else in the monorepo does not fail the run,
+and a HEAD that has moved to a newer accepted commit does not fail the run so long as
+the governed surface is still clean and tracked. Both tolerances are asserted by tests,
+not left implicit.
+
+**Overlay detection and the one legitimate exception.** An untracked `.py` file dropped
+into the package directory would be imported by Python ahead of nothing at all, and an
+untracked file that shadows a module name is a real substitution risk, so the overlay
+check must see untracked files even when `.gitignore` would hide them. That means the
+listing cannot rely on the standard exclusions alone. The single sanctioned exception is
+Python bytecode: `__pycache__` directories and `.pyc` files are created by normal
+execution and must not fail the run. Every other untracked entry inside the governed
+executable surface, ignored or not, is a substitution and is terminal.
+
+**Read-only, always.** The launcher may invoke only this allowlist of Git subcommands:
+`rev-parse`, `symbolic-ref`, `ls-files`, `diff`, and `status`. Any Git operation that
+fetches, updates, moves, or rewrites state is prohibited outright:
+
+`fetch`, `pull`, `clone`, `remote update`, `reset`, `rebase`, `merge`, `checkout`,
+`switch`, `restore`, `cherry-pick`, `revert`, `stash`, `clean`, `add`, `rm`, `commit`,
+`tag`, `push`, `gc`, and `worktree`.
+
+The launcher performs zero Git network operations and zero Git state mutations.
+Bringing the deployed checkout to a newer source revision is a separately controlled
+operator or repository action, never something the unattended job does to itself. A
+static guard test enforces the allowlist over the committed runtime files, so the
+prohibition cannot erode through a later edit.
 
 ## 11. Exception And Diagnostic Contract
 
@@ -511,6 +745,26 @@ runtimes.
 | `EGRT-T18` | Every live `EG_LAUNCHER_*` reference is reachable and every retired reference is unreachable | A and C |
 | `EGRT-T19` | The launcher exit band `70` to `73` is disjoint from the application's `0`, `10`, `20`, `64` | C |
 | `EGRT-T20` | No test path invokes the application's `run` or `list` against anything but a stubbed child executable, and no committed runtime file contains a portal URL literal | C |
+| `EGRT-T21` | An ephemeral synthetic same-user DPAPI `PSCredential` CLIXML imports successfully through the launcher helper, and neither value is printed | A and B |
+| `EGRT-T22` | A corrupted, truncated, or unreadable credential artefact fails closed before the child stub is started | A and B |
+| `EGRT-T23` | The child stub observes `ENERGYGRID_USERNAME` and `ENERGYGRID_PASSWORD` during its execution and only then | A |
+| `EGRT-T24` | Both credential variables are restored exactly afterwards: previously absent stays absent, previously present is restored to the original value | A |
+| `EGRT-T25` | No User-scope or Machine-scope environment variable is written for either credential name, on any path including failure | A and C |
+| `EGRT-T26` | No credential value appears in stdout, stderr, the result object, the JSONL event, or any exception surface, on success or failure | A and C |
+| `EGRT-T27` | An explicit private scratch cache path reaches the child stub as the Playwright browser-cache variable | A |
+| `EGRT-T28` | A conflicting ambient `PLAYWRIGHT_BROWSERS_PATH` cannot override the supplied binding; the child stub observes the supplied path | A |
+| `EGRT-T29` | A missing, unreadable, or unprovisioned supplied cache fails closed with no child start and no fallback to the default location | A |
+| `EGRT-T30` | The prior process-scope browser-cache value is restored exactly afterwards, with absent restored as absent | A |
+| `EGRT-T31` | `-ValidateOnly` launches no browser and performs no cache install, update, or download | A and C |
+| `EGRT-T32` | A scratch repository with clean, tracked governed paths passes the integrity contract | A |
+| `EGRT-T33` | A staged modification under a governed path fails the run | A |
+| `EGRT-T34` | An unstaged modification under a governed path fails the run | A |
+| `EGRT-T35` | A deletion of a tracked file under a governed path fails the run | A |
+| `EGRT-T36` | An untracked overlay inside the governed executable surface fails the run, including a `.gitignore`-ignored one, while a `__pycache__` directory or `.pyc` artefact does not | A |
+| `EGRT-T37` | A dirty file outside the governed paths does not fail the run | A |
+| `EGRT-T38` | A local HEAD moved to a newer commit that leaves the governed surface clean and tracked does not fail the run | A |
+| `EGRT-T39` | No Git subcommand outside the read-only allowlist appears in any committed runtime file, and no network or state-mutating Git command is invoked at runtime | A and C |
+| `EGRT-T40` | Ambient `GIT_DIR`, `GIT_WORK_TREE`, and `GIT_CONFIG_GLOBAL` cannot redirect the governed-path integrity checks to another repository | A |
 
 ### 12.3 Testability without production fallbacks
 
@@ -520,6 +774,38 @@ exercise the rollback path without adding a test-only branch, a mock seam, or a
 compatibility fallback to production code. Similarly, the ordering assertion in
 `EGRT-T11` is made against observable post-conditions (backup present or absent) rather
 than against injected instrumentation.
+
+### 12.4 The DPAPI testability boundary, stated honestly
+
+Some of the credential contract is provable in hosted CI and some is not. Claiming
+otherwise would be worse than the gap itself, so the split is recorded here.
+
+**What is faithfully testable.** A `windows-latest` job runs as a real Windows user, so
+the test can create a synthetic `PSCredential` from throwaway values, export it to a
+scratch CLIXML with the same user-bound mechanism the launcher uses, and import it back
+in the same job. That exercises the real DPAPI path end to end and covers `EGRT-T21`,
+`EGRT-T22`, and the injection, restoration, and non-disclosure assertions `EGRT-T23`
+through `EGRT-T26`. The synthetic values are generated per run, are never real
+credentials, and the scratch artefact is confined to the runner's temporary directory.
+
+**What is not testable in hosted CI.** Cross-user rejection. Proving that the artefact
+fails to import under a *different* Windows user needs a second interactive account,
+which a hosted runner does not provide, and creating one would be a system-settings
+change this design has no authority for. The same applies to cross-machine rejection.
+
+**How that gap is covered instead.** Two ways, neither of which pretends to be the
+missing test. First, the property is supplied by the platform rather than by our code:
+DPAPI `CurrentUser` protection is what binds the artefact, so cross-user failure is a
+construction guarantee, not a behaviour the launcher implements and could get wrong.
+Second, a static guard asserts that the committed import path uses the user-bound
+mechanism only, and passes no `-Key` or `-SecureKey` argument, since a keyed export
+would silently convert the artefact into something portable between users and quietly
+void the binding. That guard is the part we can actually regress against.
+
+**Non-Windows hosts.** SecureString export is not encrypted outside Windows, so the
+credential tests are Tier B and pinned to the Windows boundary. Where the boundary
+interpreter is absent they skip explicitly, and the companion CI assertion from section
+12.1 turns that skip into a hard failure inside the gate.
 
 ## 13. CI Strategy
 
@@ -605,23 +891,40 @@ Migration proceeds in this order.
 ## 16. Recovery And Disaster-Rebuild Procedure
 
 The acceptance test for this design is that the following sequence needs the reviewed
-commit and separately supplied private host configuration, and nothing else. It needs
-no GitHub issue comment, no chat history, no retired bridge, no `%TEMP%` script, and no
-recollection of the original server setup.
+commit plus separately provisioned private host state, and nothing else. Specifically it
+needs the reviewed Git commit, a provisioned private DPAPI credential artefact, the
+private launcher and settings paths, the private application configuration, and an
+approved Python and browser installation. It needs no GitHub issue comment, no chat
+history, no retired bridge, no `%TEMP%` script, and no recollection of the original
+server setup.
+
+Everything reusable and secret-free that the rebuild depends on comes from the
+repository: importing the credential, injecting it at process scope, restoring and
+clearing it, binding the private browser cache, validating the governed source surface,
+and launching the application. The host supplies only values and artefacts, never
+behaviour.
 
 1. Clone `x-boundaries/automation` at the reviewed commit onto a clean Windows host.
 2. Install Python 3.14.x and the pinned dependencies with
    `python -m pip install --requirement requirements.txt` from
    `energygrid-bill-downloader`.
-3. Provision Chromium with the official mechanism, `python -m playwright install chromium`.
+3. Provision Chromium into the private browser cache with the official mechanism,
+   `python -m playwright install chromium`, with the cache location set to the private
+   path the launcher will later bind (section 9.3).
 4. Create the private runtime roots (archive, SQLite state parent, temp, logs, browser
    cache) per the path rules the application enforces and the project README documents.
 5. Copy `config/energygrid.example.json` to an external private path and set
    `account_identity` and every path to the real private values.
-6. Supply `ENERGYGRID_USERNAME` and `ENERGYGRID_PASSWORD` through the approved host
-   mechanism.
-7. Run `install_or_update_launcher.ps1 -ValidateOnly`, then the approved install.
-8. Run `launcher.ps1 -ValidateOnly` and confirm every check passes.
+6. Provision the private DPAPI `PSCredential` CLIXML artefact as the Windows user the
+   job will run as, and record its path in the private launcher settings. The artefact
+   is user-bound, so it must be created on the target host under that account; it cannot
+   be copied from another machine or another user. The repository supplies the import
+   behaviour, not the artefact.
+7. Run `install_or_update_launcher.ps1 -ValidateOnly` with the reviewed commit as
+   `-AdmissionCommit`, then the approved install.
+8. Run `launcher.ps1 -ValidateOnly` and confirm every check passes, including
+   `credential_import_ok`, the browser-cache readiness check, and the governed
+   source-integrity checks.
 9. Perform the controlled first validation already documented in
    `energygrid-bill-downloader/docs/runbook.md`: a headed `list`, then a controlled
    `run`, then an idempotency re-run, each under its own approval.
@@ -735,12 +1038,20 @@ prohibited. Only the behaviour they proved is carried forward, in the form above
 | `EGRT-I04` | `Invoke-AtomicFileReplace` implements every rule in section 7.2, with a mandatory explicit backup path |
 | `EGRT-I05` | `Invoke-GovernedGit` implements the section 10 result contract and environment neutralisation |
 | `EGRT-I06` | `-ValidateOnly` satisfies section 8, including deterministic output and zero mutation |
-| `EGRT-I07` | All twenty assertions `EGRT-T01` to `EGRT-T20` are implemented and pass |
+| `EGRT-I07` | All forty assertions `EGRT-T01` to `EGRT-T40` are implemented and pass |
 | `EGRT-I08` | The full project suite passes on Windows via `python -m unittest discover -s tests -v` |
 | `EGRT-I09` | No GitHub Actions workflow is modified |
 | `EGRT-I10` | No secret, credential, private absolute path, or private identity is committed |
 | `EGRT-I11` | The `EG_LAUNCHER_*` vocabulary is bounded, closed, and reachability-tested |
 | `EGRT-I12` | The implementation performs no live server, scheduler, portal, or credential action |
+| `EGRT-I13` | The DPAPI import, process-scope injection, exact restoration, and cleanup contract in section 9.2 is implemented in source-controlled, secret-free logic |
+| `EGRT-I14` | The private credential artefact, its path, and its bound identity remain outside Git, and no credential value reaches any output surface |
+| `EGRT-I15` | The private browser cache is positively bound and fails closed, with no fallback to an ambient or default Playwright cache |
+| `EGRT-I16` | Unattended execution uses the path-scoped governed integrity contract in section 10.3 and requires no fixed whole-repository commit |
+| `EGRT-I17` | Unrelated dirty paths elsewhere in the monorepo, and unrelated accepted repository movement, do not block the daily run |
+| `EGRT-I18` | The launcher performs zero Git network operations and zero Git state mutations, enforced by the read-only allowlist and its static guard |
+| `EGRT-I19` | Exact-commit admission exists only in the operator-controlled install lane as `-AdmissionCommit`, and never in the unattended path |
+| `EGRT-I20` | Installed-launcher integrity is reproducible from reviewed Git source plus the installer-generated private manifest, with no dependence on issue comments or retired bridges |
 
 Acceptance of this document is an architectural decision only. It does not approve the
 implementation change, the first installation, the scheduler, or any live run. Each of
