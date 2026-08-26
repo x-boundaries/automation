@@ -113,6 +113,107 @@ Those steps are later live-system gates. This repository implementation run did
 not contact the portal, use live credentials, download a bill, create the target
 directory, provision Chromium, or create a Scheduled Task.
 
+## Runtime launcher installation and validation
+
+The source-controlled runtime layer lives under `runtime/`, and `runtime/README.md` is its
+directory-level contract. Every mutating step below is a live-system action requiring
+separate explicit current-turn approval. Describing a step here is not authority to perform
+it.
+
+### Deployment and update flow
+
+1. The implementation pull request is reviewed and merged.
+2. Under owner control, the deployed checkout is updated to the reviewed commit.
+3. Run `install_or_update_launcher.ps1 -ValidateOnly` and inspect its JSON. It mutates
+   nothing.
+4. Obtain explicit current-turn owner approval for the mutating install, naming the launcher
+   root and the operation.
+5. Run the installer for real. It prepares and verifies every staging file with no
+   destination mutation, classifies each destination, publishes the library before the entry
+   script, publishes and reads back the manifest inside the same transaction, re-verifies the
+   complete package, and only then accepts. Any pre-acceptance failure triggers
+   installer-owned reverse-order rollback. On a clean host every member is absent and none of
+   them uses `File.Replace`.
+6. Run `launcher.ps1 -ValidateOnly` to confirm runtime binding, security expectations, and
+   configuration reachability on the host, in a context equivalent to the unattended job.
+7. Scheduling remains blocked. Task Scheduler registration, headed validation, and any live
+   run each require their own separate approval.
+
+Every subsequent update repeats steps 2 to 6. There is no in-place edit path, and no step in
+which a human edits the installed launcher directly.
+
+### Validating in a context equivalent to the unattended job
+
+`launcher_root_not_writable_by_run_principal` is evaluated against the access token of the
+process actually running the launcher. Validating from an elevated prompt, or under any
+account other than the one the unattended job uses, therefore exercises a principal the job
+will not use: such a run may legitimately fail, and a pass obtained that way proves nothing
+about the job. Run step 6 under the same account and the same elevation state as the
+scheduled job.
+
+The operator supplies `-AuthorisedLauncherRootWriteSid` from the launcher root's intended
+administrative ownership on that host, as one or more exact security identifier strings. It
+is recorded with the other private deployment state, outside Git. This runbook names the
+requirement and carries no value. The parameter is the only route by which the set reaches
+the launcher: there is no default, no environment-variable form, and no file it is read
+from.
+
+A run principal holding `SeTakeOwnershipPrivilege` or `SeRestorePrivilege` fails that check
+by construction, so `LocalSystem` is not a candidate unattended run principal for
+`launcher.ps1`. The design does not require a dedicated account: separation by account and
+separation by elevation within one account are both permitted deployments.
+
+Both launcher-root write checks passing on the production host is owner-verified evidence
+recorded against the implementation criteria. It is never a claim made by the offline test
+suite, which cannot observe production host state.
+
+### Migration from the current server-only launcher
+
+Four concerns are kept separate and must not be confused with one another.
+
+- **Installer transaction backup cleanup** is automatic and post-acceptance. The installer
+  reaps only the preimage backups it created, only after the whole package has been accepted,
+  and reports a bounded status if a redundant backup could not be removed.
+- **Migration recovery holding** is an owner action. The recovery copy lives at an
+  owner-controlled private location that resolves outside both the launcher root and the
+  deployed checkout. It is never committed, this repository records no default or example
+  value for it, and no committed script gains a parameter for it.
+- **Launcher functional validation** is `launcher.ps1 -ValidateOnly` run against the real
+  host, which is the first evidence that the new package actually functions. A byte-for-byte
+  hash comparison of the installed members does not establish that.
+- **Later separately authorised recovery-copy retirement or restoration** is a distinct
+  gate. It is never an automatic consequence of a passing validation, and a failed validation
+  is never automatically converted into an unreviewed rollback mutation.
+
+The ordering matters more than the mechanism.
+
+1. Under owner control, record the SHA-256 of the installed launcher and of the historical
+   in-root rollback artefact, privately on the host.
+2. The historical in-root rollback artefact predates the reserved residue contract and does
+   not satisfy it, so it remains Class C and the launcher fails closed while it is present.
+   That is the correct behaviour for an unrecognised file beside the launcher, and it is not a
+   reason to widen the residue parser to accommodate one historical artefact.
+3. Under a separate approval, create the recovery copy at the approved private holding path.
+   Never overwrite an existing destination: an unexpectedly present destination means the
+   holding path was not what the operator believed it was.
+4. Re-read the external copy from disk, hash it, and confirm it equals the recorded
+   accepted-preimage SHA-256 exactly. This verification happens **before** the in-root
+   artefact is removed.
+5. A copy that cannot be created or cannot be verified is treated as no copy at all. The
+   migration then fails closed: the in-root artefact is left untouched, `launcher.ps1
+   -ValidateOnly` is not run, and the sequence stops for owner attention.
+6. Only after that positive verification, and only under a separate approval naming the
+   artefact, may the in-root artefact be removed. Confirm it is absent afterwards.
+7. Run `launcher.ps1 -ValidateOnly` and confirm every check passes. The verified external
+   copy still exists throughout this step, and that is the point of the ordering.
+8. Only after step 7 passes does the external copy become eligible for retirement. Removing
+   it is a separate owner-controlled cleanup action. If step 7 fails, the sequence stops with
+   the copy retained and nothing restored; any restoration requires separate owner authority
+   that must first define the complete safe pre-migration topology it is restoring.
+
+Retaining a verified copy preserves the option to recover. It performs no restoration and
+asserts no automatic recovery.
+
 ## Recovery guidance
 
 `ARCHIVE_CONFLICT`, `STATE_INCONSISTENT`, `PORTAL_LAYOUT_CHANGED`, and
