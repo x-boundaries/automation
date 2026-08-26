@@ -816,6 +816,56 @@ function Write-EgUtf8NoBomText {
     [System.IO.File]::WriteAllText($Path, $Text, $encoding)
 }
 
+function Sort-EgOrdinalStringList {
+    # Sort strings by ORDINAL comparison.
+    #
+    # Sort-Object uses culture-aware comparison, which orders punctuation differently
+    # between PowerShell editions: 'launcher.ps1' and 'launcher_lib.ps1' swap places
+    # between Windows PowerShell 5.1 and PowerShell 7. Manifest member order is part of the
+    # serialised bytes, so a culture-dependent order would make identical input produce
+    # different bytes on different editions and break the hash-idempotency contract that
+    # installation determinism rests on.
+    #
+    # An explicit insertion sort over [string]::CompareOrdinal is used rather than a
+    # comparer-based sort so the ordering is identical on both editions by construction and
+    # depends on no collection type, culture, or cmdlet behaviour. The member set is two
+    # entries, so the algorithm's cost is irrelevant.
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Value)
+
+    $items = @($Value)
+    for ($index = 1; $index -lt $items.Count; $index++) {
+        $current = $items[$index]
+        $scan = $index - 1
+        while ($scan -ge 0 -and [string]::CompareOrdinal([string]$items[$scan], $current) -gt 0) {
+            $items[$scan + 1] = $items[$scan]
+            $scan--
+        }
+        $items[$scan + 1] = $current
+    }
+    return $items
+}
+
+function Sort-EgOrdinalByName {
+    # Sort member entries by their name field, ordinally. Same reasoning as above; this is
+    # the ordering that reaches the serialised manifest.
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][AllowEmptyCollection()]$Entry)
+
+    $items = @($Entry)
+    for ($index = 1; $index -lt $items.Count; $index++) {
+        $current = $items[$index]
+        $scan = $index - 1
+        while ($scan -ge 0 -and
+               [string]::CompareOrdinal([string]$items[$scan].name, [string]$current.name) -gt 0) {
+            $items[$scan + 1] = $items[$scan]
+            $scan--
+        }
+        $items[$scan + 1] = $current
+    }
+    return $items
+}
+
 function New-EgInstallationManifestObject {
     # Build the manifest from admitted source hashes and the admitted commit. The members
     # array is sorted by name ascending and describes exactly the two EXECUTABLE members,
@@ -826,7 +876,7 @@ function New-EgInstallationManifestObject {
         [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$AdmissionCommit
     )
 
-    $sorted = @(@($MemberEntries) | Sort-Object -Property @{ Expression = { $_.name } })
+    $sorted = @(Sort-EgOrdinalByName -Entry @($MemberEntries))
     $members = @()
     foreach ($entry in $sorted) {
         $members = $members + ([ordered]@{
@@ -936,8 +986,9 @@ function Test-EgInstallationManifestShape {
         $observedNames = $observedNames + $name
     }
 
-    $expectedNames = @(@($script:EgManifestMemberNames) | Sort-Object)
-    $sortedObserved = @(@($observedNames) | Sort-Object)
+    # Ordinal on both sides, so the name-set comparison cannot depend on culture either.
+    $expectedNames = @(Sort-EgOrdinalStringList -Value @($script:EgManifestMemberNames))
+    $sortedObserved = @(Sort-EgOrdinalStringList -Value @($observedNames))
     if ($sortedObserved.Count -ne $expectedNames.Count) {
         return (New-EgSingleCheckResult -CheckName $checkName -Pass $false -SupportRef $mismatch)
     }
@@ -978,7 +1029,30 @@ function Compare-EgInstalledPackageToManifest {
         return (New-EgSingleCheckResult -CheckName $checkName -Pass $false `
             -SupportRef 'EG_LAUNCHER_MANIFEST_UNPARSABLE')
     }
+    # The manifest document is defined as a single JSON OBJECT. A document that does not
+    # parse to exactly one object is not a readable manifest at all, and is reported as
+    # unparsable rather than as a content mismatch.
+    #
+    # This is decided from the parse RESULT rather than from whether ConvertFrom-Json threw,
+    # because the two editions disagree about that: Windows PowerShell 5.1 throws on a
+    # truncated document while PowerShell 7 can accept it and yield a value. Relying on the
+    # throw alone therefore classified the same malformed file differently on each edition.
+    # Checking the shape of the result gives one answer on both.
+    #
+    # The distinction is preserved in full and both outcomes stay terminal: a syntactically
+    # unreadable document is UNPARSABLE, while a syntactically valid object whose fields do
+    # not match the accepted shape or the installed bytes is MISMATCH.
+    $parsed = @($manifest)
+    if ($parsed.Count -ne 1) {
+        return (New-EgSingleCheckResult -CheckName $checkName -Pass $false `
+            -SupportRef 'EG_LAUNCHER_MANIFEST_UNPARSABLE')
+    }
+    $manifest = $parsed[0]
     if ($null -eq $manifest) {
+        return (New-EgSingleCheckResult -CheckName $checkName -Pass $false `
+            -SupportRef 'EG_LAUNCHER_MANIFEST_UNPARSABLE')
+    }
+    if ($manifest -isnot [System.Management.Automation.PSCustomObject]) {
         return (New-EgSingleCheckResult -CheckName $checkName -Pass $false `
             -SupportRef 'EG_LAUNCHER_MANIFEST_UNPARSABLE')
     }

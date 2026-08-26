@@ -272,7 +272,7 @@ switch ($Op) {
         $seeded['GIT_WORK_TREE'] = $Dir2
         $seeded['GIT_CONFIG_GLOBAL'] = (Join-Path $Dir2 'decoy.gitconfig')
         foreach ($seededName in @($seeded.Keys)) {
-            [System.Environment]::SetEnvironmentVariable($seededName, $seeded[$seededName], 'Process')
+            Set-EgProcessEnvironmentVariable -Name $seededName -Value $seeded[$seededName]
         }
 
         $before = [ordered]@{}
@@ -311,14 +311,18 @@ switch ($Op) {
         # Restoration of a snapshot must REMOVE a name recorded absent rather than set it
         # to an empty string.
         $names = @('EG_PROBE_ABSENT_NAME', 'EG_PROBE_PRESENT_NAME')
-        [System.Environment]::SetEnvironmentVariable('EG_PROBE_ABSENT_NAME', $null, 'Process')
-        [System.Environment]::SetEnvironmentVariable('EG_PROBE_PRESENT_NAME', 'original', 'Process')
+        # Absence is established through the library's exact-removal helper. Assigning
+        # $null directly through the framework leaves the name PRESENT with an empty value
+        # on PowerShell 7, so the fixture would then be measuring its own artefact rather
+        # than the restoration contract.
+        Set-EgProcessEnvironmentVariable -Name 'EG_PROBE_ABSENT_NAME' -Value $null
+        Set-EgProcessEnvironmentVariable -Name 'EG_PROBE_PRESENT_NAME' -Value 'original'
 
         $snapshot = Get-EgProcessEnvironmentSnapshot -Names $names
 
         # Disturb both names in opposite directions.
-        [System.Environment]::SetEnvironmentVariable('EG_PROBE_ABSENT_NAME', 'appeared', 'Process')
-        [System.Environment]::SetEnvironmentVariable('EG_PROBE_PRESENT_NAME', 'overwritten', 'Process')
+        Set-EgProcessEnvironmentVariable -Name 'EG_PROBE_ABSENT_NAME' -Value 'appeared'
+        Set-EgProcessEnvironmentVariable -Name 'EG_PROBE_PRESENT_NAME' -Value 'overwritten'
 
         $restore = Restore-EgProcessEnvironmentSnapshot -Snapshot $snapshot
 
@@ -600,6 +604,16 @@ switch ($Op) {
             manifestMembers  = @($script:EgManifestMemberNames)
         } | ConvertTo-Json -Depth 8 -Compress
     }
+    'ordinalsort' {
+        # Ordinal ordering, asserted directly. -Json is the PATH to a JSON file carrying
+        # { names: [...] }. The expected order is fixed by character code, so it is the
+        # same answer on every PowerShell edition and in every culture.
+        $spec = Get-Content -LiteralPath $Json -Raw | ConvertFrom-Json
+        $supplied = [string[]]@($spec.names)
+        [ordered]@{
+            ordinal = @(Sort-EgOrdinalStringList -Value $supplied)
+        } | ConvertTo-Json -Depth 8 -Compress
+    }
     'manifestbuild' {
         # Construct and serialise a manifest from member entries, then validate its shape.
         $spec = Get-Content -LiteralPath $Json -Raw | ConvertFrom-Json
@@ -817,12 +831,12 @@ switch ($Op) {
         $names = @($script:EgCredentialVariableNames)
 
         if ($Value2 -ne '') {
-            [System.Environment]::SetEnvironmentVariable($names[0], $Value2, 'Process')
+            Set-EgProcessEnvironmentVariable -Name $names[0] -Value $Value2
         }
         else {
-            [System.Environment]::SetEnvironmentVariable($names[0], $null, 'Process')
+            Set-EgProcessEnvironmentVariable -Name $names[0] -Value $null
         }
-        [System.Environment]::SetEnvironmentVariable($names[1], $null, 'Process')
+        Set-EgProcessEnvironmentVariable -Name $names[1] -Value $null
 
         $before = [ordered]@{}
         foreach ($name in $names) {
@@ -2684,14 +2698,55 @@ class InstallationManifestComparison(TierABase):
         self.assertEqual(["FAIL"], observed["checkOutcomes"])
 
     def test_unparsable_manifest_is_terminal(self):
-        """An unparsable manifest is terminal and distinguishable from a missing one."""
-        for raw in ("{ not json at all", "", "[1,2,3"):
-            with self.subTest(raw=raw):
+        """An unparsable manifest is terminal and distinguishable from a missing one.
+
+        A manifest document is defined as a single JSON OBJECT, so anything that does not
+        parse to exactly one object is not a readable manifest and is reported as
+        unparsable rather than as a content mismatch. That verdict is decided from the
+        parse RESULT rather than from whether the parser threw, because the two PowerShell
+        editions disagree about which malformed documents throw: 5.1 rejects a truncated
+        array while 7 can accept it. Checking the result gives one answer on both.
+        """
+        cases = {
+            "truncated_object": "{ not json at all",
+            "empty_document": "",
+            "truncated_array": "[1,2,3",
+            "valid_array": "[1,2,3]",
+            "empty_array": "[]",
+            "bare_string": '"scalar"',
+            "bare_number": "5",
+            "bare_boolean": "true",
+        }
+        for label, raw in cases.items():
+            with self.subTest(document=label):
                 observed = manifest_probe(ANY_PS, manifest_raw=raw)
                 self.assertFalse(observed["pass"])
                 self.assertEqual(
-                    "EG_LAUNCHER_MANIFEST_UNPARSABLE", observed["supportRef"]
+                    "EG_LAUNCHER_MANIFEST_UNPARSABLE",
+                    observed["supportRef"],
+                    "%r is not a readable manifest document" % label,
                 )
+
+    def test_a_syntactically_valid_object_with_wrong_content_is_a_mismatch(self):
+        """The distinction is preserved: a readable object with wrong fields is MISMATCH.
+
+        This is the other half of the classification. If the unparsable verdict were
+        widened carelessly it would swallow this case, and the two causes would stop being
+        distinguishable on any edition.
+        """
+        payload = build_manifest_payload()
+        payload["members"][0]["sha256"] = "f" * 64
+        observed = manifest_probe(ANY_PS, manifest=payload)
+        self.assertFalse(observed["pass"])
+        self.assertEqual("EG_LAUNCHER_MANIFEST_MISMATCH", observed["supportRef"])
+
+        observed = manifest_probe(ANY_PS, manifest_raw='{"unexpected": "object"}')
+        self.assertFalse(observed["pass"])
+        self.assertEqual(
+            "EG_LAUNCHER_MANIFEST_MISMATCH",
+            observed["supportRef"],
+            "a readable JSON object is a mismatch, never unparsable",
+        )
 
     def test_hash_or_length_mismatch_is_terminal(self):
         """A hash or byte-length mismatch fails closed."""
@@ -2789,6 +2844,37 @@ class InstallationManifestConstruction(TierABase):
         self.assertEqual(
             ["installation_manifest_shape"], observed["shapeCheckNames"]
         )
+
+    def test_member_ordering_is_ordinal_and_not_culture_dependent(self):
+        """Manifest order is part of the serialised bytes, so it must not vary by edition.
+
+        Culture-aware comparison orders punctuation differently between Windows PowerShell
+        5.1 and PowerShell 7, which would make identical input produce different bytes on
+        different hosts and break hash idempotency. Ordinal ordering is fixed by character
+        code, so the expected answer below is the same everywhere.
+        """
+        cases = {
+            # '-' 45, '.' 46, 'X' 88, '_' 95
+            "punctuation_spread": (
+                ["a_b", "aXb", "a.b", "a-b"],
+                ["a-b", "a.b", "aXb", "a_b"],
+            ),
+            # The real member pair, whose order actually diverged between editions.
+            "manifest_members": (
+                ["launcher_lib.ps1", "launcher.ps1"],
+                ["launcher.ps1", "launcher_lib.ps1"],
+            ),
+            # Ordinal is case-sensitive: uppercase sorts before lowercase.
+            "case_sensitivity": (["b", "A", "a", "B"], ["A", "B", "a", "b"]),
+            "already_ordered": (["a", "b"], ["a", "b"]),
+            "single": (["only"], ["only"]),
+        }
+        for label, (supplied, expected) in cases.items():
+            with self.subTest(case=label):
+                with TemporaryScratch() as tmp:
+                    spec = write_json(tmp, "ordinal_spec.json", {"names": supplied})
+                    observed = probe_json(ANY_PS, "ordinalsort", tmp, json=spec)
+                self.assertEqual(expected, observed["ordinal"])
 
     def test_serialisation_is_deterministic_for_identical_input(self):
         """Hash idempotency is only decidable if serialisation is deterministic."""
@@ -4322,20 +4408,62 @@ function Resolve-SidTokenString([string]$Token) {
     return $Token
 }
 
+# FIXTURE MECHANISM ONLY. The accepted production security algorithm is not involved in,
+# and is not changed by, anything below: the launcher reads descriptors through
+# Get-EgSecurityDescriptorForPath and never writes one.
+#
+# [System.IO.Directory]::GetAccessControl and its SetAccessControl counterpart are .NET
+# FRAMEWORK statics. They do not exist on the modern .NET that PowerShell 7 runs on, so the
+# fixture could not even build its scratch descriptors there. The read path now uses the
+# DirectorySecurity and FileSecurity constructors, which exist on both editions and are the
+# same mechanism the production library already relies on. The write path has no single
+# API present on both, so the fixture selects whichever this runtime actually provides,
+# by capability rather than by exception handling, and fails loudly if neither exists.
+#
+# The ACL test semantics are unchanged: the same descriptors are constructed and the same
+# assertions run against them.
+
 function Get-ObjectSecurity([string]$Path) {
+    $sections = [System.Security.AccessControl.AccessControlSections]::Owner -bor
+        [System.Security.AccessControl.AccessControlSections]::Group -bor
+        [System.Security.AccessControl.AccessControlSections]::Access
     if (Test-Path -LiteralPath $Path -PathType Container) {
-        return [System.IO.Directory]::GetAccessControl($Path)
+        return (New-Object System.Security.AccessControl.DirectorySecurity($Path, $sections))
     }
-    return [System.IO.File]::GetAccessControl($Path)
+    return (New-Object System.Security.AccessControl.FileSecurity($Path, $sections))
 }
 
 function Save-ObjectSecurity([string]$Path, $Acl) {
     if (Test-Path -LiteralPath $Path -PathType Container) {
-        [System.IO.Directory]::SetAccessControl($Path, $Acl)
+        $info = New-Object System.IO.DirectoryInfo($Path)
     }
     else {
-        [System.IO.File]::SetAccessControl($Path, $Acl)
+        $info = New-Object System.IO.FileInfo($Path)
     }
+
+    # Windows PowerShell 5.1 on .NET Framework exposes the instance method.
+    if ($null -ne $info.PSObject.Methods['SetAccessControl']) {
+        $info.SetAccessControl($Acl)
+        return
+    }
+
+    # Modern .NET moved the same operation onto FileSystemAclExtensions.
+    if ($null -ne ([System.Management.Automation.PSTypeName]'System.IO.FileSystemAclExtensions').Type) {
+        [System.IO.FileSystemAclExtensions]::SetAccessControl($info, $Acl)
+        return
+    }
+
+    # Last resort, still the same operation: the provider cmdlet. Reached only when neither
+    # framework surface exists, and guarded by a command lookup because this module has
+    # been observed to be unavailable for autoload on some hosts.
+    if ($null -ne (Get-Command -Name 'Set-Acl' -ErrorAction SilentlyContinue)) {
+        Set-Acl -LiteralPath $Path -AclObject $Acl
+        return
+    }
+
+    # Never silently skipped. If no mechanism exists the fixture fails loudly, so a missing
+    # capability can never be mistaken for a passing security assertion.
+    throw 'no access-control write mechanism is available on this PowerShell runtime'
 }
 
 function New-Rule([string]$Path, $Sid, $RightsValue, [bool]$Inheritable, [string]$Type) {
