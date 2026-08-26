@@ -4728,6 +4728,7 @@ $emitted = switch ($Op) {
 
         $privileges = Get-EgTokenPrivilegeNames
         [ordered]@{
+            privilegeNames      = @($privileges.PrivilegeNames)
             admissionPass       = $admission.Pass
             admissionSupportRef = $admission.SupportRef
             admittedCount       = @($admission.Sids).Count
@@ -5707,16 +5708,53 @@ class WriteAuthorityTierA(WriteAuthorityMixin, TierABase):
         self.assertGreater(observed["observedCount"], 0)
 
     def test_the_privilege_reader_never_fabricates_a_name(self):
-        """EGRT-T69, case (e): a read failure yields an EMPTY list, never a synthetic name."""
+        """EGRT-T69, case (e): the reported verdict follows the OBSERVED list exactly.
+
+        The reader must report only names it actually observed, and the bypass predicate
+        must agree with that list rather than inventing or suppressing a membership.
+
+        This asserts agreement rather than a fixed expectation, because whether the running
+        token holds a bypass privilege is a property of the HOST, not of this code: an
+        elevated administrator token legitimately holds both, which is exactly why such a
+        principal fails the run-principal check by construction. Asserting "no bypass
+        privilege here" would encode a non-elevation assumption and would fail on a
+        correctly behaving elevated host. Agreement holds on every host and is the stronger
+        property, because it catches a fabricated membership in either direction.
+        """
         with TemporaryScratch() as tmp:
             root, _built = build_scratch_launcher_root(ANY_PS, tmp, "authorised_self")
             observed = check_write_authority(ANY_PS, tmp, root)
+
         self.assertTrue(observed["privilegeReadOk"])
         self.assertGreater(observed["privilegeCount"], 0)
-        self.assertFalse(
+
+        names = observed["privilegeNames"]
+        self.assertEqual(
+            observed["privilegeCount"],
+            len(names),
+            "the reported count must describe the reported list",
+        )
+        for name in names:
+            with self.subTest(privilege=name):
+                self.assertTrue(
+                    isinstance(name, str) and name.strip(),
+                    "no reported privilege name may be empty or non-textual",
+                )
+                self.assertTrue(
+                    name.startswith("Se"),
+                    "%r is not a Windows privilege name" % name,
+                )
+
+        lowered = {name.lower() for name in names}
+        expected_bypass = any(
+            candidate.lower() in lowered
+            for candidate in ("SeTakeOwnershipPrivilege", "SeRestorePrivilege")
+        )
+        self.assertEqual(
+            expected_bypass,
             observed["bypassPresent"],
-            "this host's non-elevated token must not hold a bypass privilege, otherwise "
-            "the fixture cannot distinguish presence from absence",
+            "the bypass verdict must follow the observed list exactly, neither "
+            "fabricating a membership nor suppressing one",
         )
 
     def test_no_security_identifier_material_reaches_any_returned_surface(self):
