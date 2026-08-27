@@ -4,9 +4,11 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 import uuid
 
 from energygrid_bill_downloader import cli
+from energygrid_bill_downloader import portal as portal_module
 from energygrid_bill_downloader.config import load_runtime_config
 from energygrid_bill_downloader.cli import main
 from energygrid_bill_downloader.errors import (
@@ -478,6 +480,7 @@ class FakeLocator:
         state_error: Exception | None = None,
         dispatch_error: Exception | None = None,
         click_error: Exception | None = None,
+        trial_click_error: Exception | None = None,
         fill_error: Exception | None = None,
         journal: list[str] | None = None,
         label: str = "locator",
@@ -489,11 +492,13 @@ class FakeLocator:
         self._state_error = state_error
         self._dispatch_error = dispatch_error
         self._click_error = click_error
+        self._trial_click_error = trial_click_error
         self._fill_error = fill_error
         self._journal = journal
         self._label = label
         self.dispatched = 0
         self.clicks = 0
+        self.trial_clicks = 0
         self.fills = 0
         self.waits = 0
 
@@ -528,7 +533,20 @@ class FakeLocator:
         if self._dispatch_error is not None:
             raise self._dispatch_error
 
-    def click(self) -> None:
+    def click(self, trial: bool = False) -> None:
+        """Only a normal click submits; a trial click proves actionability.
+
+        The two failure hooks are separate so a transient actionability
+        timeout can be modelled without also breaking the one real submit,
+        and so a case that breaks the real submit is not intercepted by the
+        trial that precedes it.
+        """
+        if trial:
+            self.trial_clicks += 1
+            self._record("click_trial")
+            if self._trial_click_error is not None:
+                raise self._trial_click_error
+            return
         self.clicks += 1
         self._record("click")
         if self._click_error is not None:
@@ -561,6 +579,7 @@ class FakePage:
         alert_visible: bool = False,
         goto_error: Exception | None = None,
         submit: FakeLocator | None = None,
+        submits: list[FakeLocator] | None = None,
         username_field: FakeLocator | None = None,
         password_field: FakeLocator | None = None,
         billing_manager: FakeLocator | None = None,
@@ -573,6 +592,10 @@ class FakePage:
         self.alert_visible = alert_visible
         self.goto_error = goto_error
         self.submit = submit
+        # Successive submit-stage resolutions, so a re-resolving caller can be
+        # handed a different locator each time. The last entry repeats once the
+        # sequence is exhausted, which models a control that stays as it is.
+        self.submits = submits
         self.username_field = username_field
         self.password_field = password_field
         self.billing_manager = billing_manager
@@ -580,6 +603,7 @@ class FakePage:
         self.goto_calls = 0
         self.login_lookups = 0
         self.alert_lookups = 0
+        self.waited_ms: list[int] = []
 
     def goto(self, url: str, wait_until: str | None = None) -> None:
         self.goto_calls += 1
@@ -593,6 +617,8 @@ class FakePage:
             return self.activation
         if name == "Login":
             self.login_lookups += 1
+            if self.login_lookups > 1 and self.submits is not None:
+                return self.submits[min(self.login_lookups - 2, len(self.submits) - 1)]
             if self.login_lookups > 1 and self.submit is not None:
                 return self.submit
             return self.login_entry
@@ -602,6 +628,21 @@ class FakePage:
         if name == "Billing Manager":
             return self.billing_manager if self.billing_manager is not None else FakeLocator()
         raise AssertionError(f"unexpected role lookup: {role}/{name}")
+
+    def wait_for_timeout(self, milliseconds: int) -> None:
+        """Record a browser-event-loop yield instead of spending the time."""
+        self.waited_ms.append(int(milliseconds))
+        if self.journal is not None:
+            self.journal.append("page:wait_for_timeout")
+
+    def simulated_monotonic(self) -> float:
+        """A clock that advances only by the yields this page was asked for.
+
+        Patched over `portal.time.monotonic`, this makes a deadline-bounded
+        loop terminate deterministically and lets a test assert the simulated
+        elapsed recovery without any real waiting.
+        """
+        return sum(self.waited_ms) / 1000.0
 
     def locator(self, selector: str):
         assert selector == "flt-semantics-placeholder", selector
@@ -694,6 +735,9 @@ LOGIN_STEP_CASES = (
 )
 
 # The committed order of portal interactions for one successful login attempt.
+# A healthy submit control is proven actionable by one trial click and is then
+# clicked once for real; it costs no extra resolution and no event-loop yield,
+# so an unlagged portal keeps the sequence it always had plus that one proof.
 SUCCESSFUL_LOGIN_SEQUENCE = [
     "page:goto",
     "activation:wait_for",
@@ -703,6 +747,7 @@ SUCCESSFUL_LOGIN_SEQUENCE = [
     "login_entry:click",
     "username:fill",
     "password:fill",
+    "submit:click_trial",
     "submit:click",
     "billing_manager:wait_for",
 ]
@@ -876,9 +921,12 @@ class PreAuthLoginFailureReferenceTests(unittest.TestCase):
         self.assertEqual(locators["activation"].dispatched, 1)
         self.assertEqual(locators["login_entry"].clicks, 1)
         self.assertEqual(locators["submit"].clicks, 1)
+        self.assertEqual(locators["submit"].trial_clicks, 1)
         self.assertEqual(locators["username"].fills, 1)
         self.assertEqual(locators["password"].fills, 1)
         self.assertEqual(locators["billing_manager"].waits, 1)
+        # A healthy control needs no recovery, so nothing is spent waiting.
+        self.assertEqual(page.waited_ms, [])
         # A success never consults the alert, so it never takes the rejection arm.
         self.assertEqual(page.alert_lookups, 0)
 
@@ -940,6 +988,142 @@ class PreAuthLoginFailureReferenceTests(unittest.TestCase):
         self.assertTrue(cli.RETIRED_SUPPORT_REFS)
         self.assertTrue(cli.RETIRED_SUPPORT_REFS.isdisjoint(reached))
         self.assertTrue(cli.RETIRED_SUPPORT_REFS.issubset(set(cli.SUPPORT_REFS_BY_MESSAGE.values())))
+
+
+class SyntheticTimeoutError(Exception):
+    """Named so the portal's bounded timeout classification recognises it."""
+
+
+def synthetic_timeout() -> SyntheticTimeoutError:
+    return SyntheticTimeoutError("Timeout 30000ms exceeded")
+
+
+class LoginSubmitRecoveryTests(unittest.TestCase):
+    """Bounded pre-submit recovery for the Flutter login route (#141, G3).
+
+    Every case drives the committed `login()` rather than a helper in
+    isolation, so what is proven is the production path. The clock the
+    recovery reads is replaced by one that advances only by the yields the
+    page was actually asked for, which makes a deadline-bounded loop
+    terminate deterministically without any real waiting.
+    """
+
+    def attempt_login(self, page: FakePage) -> AppError | None:
+        """Run `login()` against `page`; return what it raised, or None."""
+        portal = PlaywrightPortal(FakeConfig(), headed=False)
+        portal.page = page
+        old = {name: os.environ.get(name) for name in ("ENERGYGRID_USERNAME", "ENERGYGRID_PASSWORD")}
+        os.environ.update(runtime_credentials())
+        try:
+            # `create=True` keeps these cases failing on behaviour rather than
+            # on the absence of a clock, which is what makes them meaningful
+            # regressions against a revision that has no recovery loop at all.
+            with mock.patch.object(portal_module, "time", create=True) as clock:
+                clock.monotonic.side_effect = page.simulated_monotonic
+                portal.login()
+        except AppError as exc:
+            return exc
+        finally:
+            for name, value in old.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+        return None
+
+    def test_fresh_re_resolution_recovers_a_lagging_login_control(self) -> None:
+        """The defect case: the control is unresolvable for a short window.
+
+        Holding the first locator and blocking on it is what consumed the
+        whole page timeout in production. Resolving a new locator after a
+        yield finds the same canonical control ready.
+        """
+        lagging = FakeLocator(count=0, click_error=synthetic_timeout(), label="lagging")
+        ready = FakeLocator(label="ready")
+        page = login_page(submits=[lagging, ready])
+
+        self.assertIsNone(self.attempt_login(page))
+        self.assertGreaterEqual(page.login_lookups, 3, "the submit control must be resolved afresh")
+        self.assertEqual(lagging.clicks, 0, "a control that is not ready is never clicked")
+        self.assertEqual(ready.trial_clicks, 1)
+        self.assertEqual(ready.clicks, 1)
+        self.assertTrue(page.waited_ms, "recovery yields the browser event loop")
+
+    def test_ambiguous_login_control_fails_immediately_without_retrying(self) -> None:
+        """More than one exact Login control is drift, and drift is terminal."""
+        ambiguous = FakeLocator(count=2, label="ambiguous")
+        page = login_page(submits=[ambiguous])
+
+        error = self.attempt_login(page)
+        self.assertIsInstance(error, LayoutChangedError)
+        self.assertEqual(error.status, PORTAL_LAYOUT_CHANGED)
+        self.assertEqual(page.waited_ms, [], "ambiguity is not retryable")
+        self.assertEqual(ambiguous.trial_clicks, 0)
+        self.assertEqual(ambiguous.clicks, 0)
+
+    def test_recovery_is_bounded_by_a_monotonic_deadline(self) -> None:
+        """A control that never becomes ready still ends inside the ceiling."""
+        never = FakeLocator(count=0, label="never")
+        page = login_page(submits=[never])
+
+        error = self.attempt_login(page)
+        self.assertIsInstance(error, LayoutChangedError)
+        self.assert_submit_stage(error)
+        self.assertEqual(never.clicks, 0)
+        self.assertTrue(page.waited_ms)
+        self.assertLessEqual(max(page.waited_ms), 30_000, "no single wait may exceed 30 s")
+        self.assertLessEqual(sum(page.waited_ms), 60_000, "total recovery stays inside the ceiling")
+        self.assertEqual(page.waited_ms, sorted(page.waited_ms), "the backoff increases")
+        self.assertGreater(page.login_lookups, 3, "every attempt resolves a new locator")
+
+    def test_transient_trial_failure_is_retried_with_a_fresh_locator(self) -> None:
+        """A bounded actionability timeout is transient, not a contract failure."""
+        flaky = FakeLocator(trial_click_error=synthetic_timeout(), label="flaky")
+        ready = FakeLocator(label="ready")
+        page = login_page(submits=[flaky, ready])
+
+        self.assertIsNone(self.attempt_login(page))
+        self.assertEqual(flaky.trial_clicks, 1)
+        self.assertEqual(flaky.clicks, 0, "a control that never proved actionable is not submitted")
+        self.assertEqual(ready.trial_clicks, 1)
+        self.assertEqual(ready.clicks, 1)
+
+    def test_a_non_timeout_trial_failure_is_not_treated_as_transient(self) -> None:
+        """Only a timeout is transient; anything else stops the recovery."""
+        broken = FakeLocator(trial_click_error=step_failure(), label="broken")
+        page = login_page(submits=[broken])
+
+        error = self.attempt_login(page)
+        self.assertIsInstance(error, LayoutChangedError)
+        self.assert_submit_stage(error)
+        self.assertEqual(page.waited_ms, [])
+        self.assertEqual(broken.clicks, 0)
+        self.assertNotIn("hunter2", error.message)
+        self.assertNotIn("portal.example.invalid", error.message)
+
+    def test_the_one_normal_submit_click_is_never_retried(self) -> None:
+        """A dispatched submit may have landed; clicking again could duplicate it."""
+        failing = FakeLocator(click_error=synthetic_timeout(), label="failing")
+        page = login_page(submits=[failing])
+
+        error = self.attempt_login(page)
+        self.assertIsInstance(error, LayoutChangedError)
+        self.assert_submit_stage(error)
+        self.assertEqual(failing.clicks, 1, "an ambiguous post-dispatch outcome is never re-submitted")
+
+    def test_a_portal_rejection_after_submission_is_still_a_login_error(self) -> None:
+        """Recovery must not turn a credential rejection into drift."""
+        failing = FakeLocator(click_error=synthetic_timeout(), label="failing")
+        page = login_page(submits=[failing], alert_visible=True)
+
+        error = self.attempt_login(page)
+        self.assertIsInstance(error, LoginError)
+        self.assertEqual(cli.support_ref_for(error), "EG_LOGIN_PORTAL_REJECTED")
+
+    def assert_submit_stage(self, error: AppError) -> None:
+        """The submit stage keeps its committed marker and its reference."""
+        self.assertEqual(error.message, "login submission did not complete")
+        self.assertEqual(cli.support_ref_for(error), "EG_LOGIN_SUBMIT_FAILED")
 
 
 if __name__ == "__main__":
