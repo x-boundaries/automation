@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+from dataclasses import dataclass
 import os
 from pathlib import Path
 import tempfile
@@ -34,6 +36,24 @@ def runtime_credentials() -> dict[str, str]:
         "ENERGYGRID_USERNAME": "synthetic-" + uuid.uuid4().hex,
         "ENERGYGRID_PASSWORD": "synthetic-" + uuid.uuid4().hex,
     }
+
+
+@contextlib.contextmanager
+def fast_portal_recovery(attempts_ms=(0, 50, 150), deadline_seconds: float = 2.0):
+    """Shrink the shared recovery ladder for browser-backed drift cases.
+
+    A drifted control is drifted for good, so these cases only need the
+    fail-closed outcome -- and a real 60-second window per variant would
+    dominate the suite. The committed production ladder and its hard deadline
+    are asserted separately, against the constants themselves, so shrinking
+    them here cannot hide a widened ceiling.
+    """
+
+    with mock.patch.object(portal_module, "PORTAL_RECOVERY_ATTEMPTS_MS", tuple(attempts_ms)), \
+            mock.patch.object(
+                portal_module, "PORTAL_RECOVERY_DEADLINE_SECONDS", deadline_seconds
+            ):
+        yield
 
 
 @unittest.skipUnless(sync_playwright is not None, "Playwright Python package is not installed")
@@ -119,7 +139,7 @@ class SyntheticPortalTests(unittest.TestCase):
             config = self.config_for(server, root)
             old, _values = self.with_credentials()
             try:
-                with PlaywrightPortal(config) as portal:
+                with PlaywrightPortal(config) as portal, fast_portal_recovery():
                     with self.assertRaises(LayoutChangedError):
                         portal.login()
             finally:
@@ -166,7 +186,7 @@ class SyntheticPortalTests(unittest.TestCase):
                     config = self.config_for(server, root)
                     old, _values = self.with_credentials()
                     try:
-                        with PlaywrightPortal(config) as portal:
+                        with PlaywrightPortal(config) as portal, fast_portal_recovery():
                             with self.assertRaises(LayoutChangedError):
                                 portal.login()
                     finally:
@@ -191,7 +211,7 @@ class SyntheticPortalTests(unittest.TestCase):
                     config = self.config_for(server, root)
                     old, _values = self.with_credentials()
                     try:
-                        with PlaywrightPortal(config) as portal:
+                        with PlaywrightPortal(config) as portal, fast_portal_recovery():
                             with self.assertRaises(LayoutChangedError):
                                 portal.login()
                     finally:
@@ -205,7 +225,7 @@ class SyntheticPortalTests(unittest.TestCase):
             config = self.config_for(server, root)
             old, _values = self.with_credentials()
             try:
-                with PlaywrightPortal(config) as portal:
+                with PlaywrightPortal(config) as portal, fast_portal_recovery():
                     portal.login()
                     with self.assertRaises(LayoutChangedError):
                         portal.inventory(20)
@@ -499,6 +519,9 @@ class FakeLocator:
         self._journal = journal
         self._label = label
         self._clock: "FakePage | None" = None
+        # Set by the page when it hands this locator out as the login entry, so
+        # the one real entry click is what ends the entry stage.
+        self._on_click_hook = None
         self.dispatched = 0
         self.clicks = 0
         self.trial_clicks = 0
@@ -507,6 +530,7 @@ class FakeLocator:
         self.enabled_timeouts: list[int | None] = []
         self.fills = 0
         self.waits = 0
+        self.wait_timeouts: list[int | None] = []
 
     def _record(self, action: str) -> None:
         if self._journal is not None:
@@ -516,10 +540,20 @@ class FakeLocator:
     def first(self) -> "FakeLocator":
         return self
 
-    def wait_for(self, state: str | None = None) -> None:
+    def wait_for(self, state: str | None = None, timeout: int | None = None) -> None:
+        """Model a state wait whose timeout is live, like the real locator's.
+
+        A postcondition probe that leaves the timeout implicit inherits
+        `page.set_default_timeout()`, so a failing wait is charged whatever it
+        was actually given -- the page default when it was given nothing.
+        """
         self.waits += 1
+        self.wait_timeouts.append(timeout)
         self._record("wait_for")
         if self._wait_error is not None:
+            if self._clock is not None:
+                spent = timeout if timeout is not None else self._clock.default_timeout_ms
+                self._clock.charge_probe_ms(spent)
             raise self._wait_error
 
     def count(self) -> int:
@@ -581,6 +615,8 @@ class FakeLocator:
             return
         self.clicks += 1
         self._record("click")
+        if self._on_click_hook is not None:
+            self._on_click_hook()
         if self._click_error is not None:
             raise self._click_error
 
@@ -615,6 +651,12 @@ class FakePage:
         username_field: FakeLocator | None = None,
         password_field: FakeLocator | None = None,
         billing_manager: FakeLocator | None = None,
+        activations: list[FakeLocator] | None = None,
+        placeholders: list[FakeLocator] | None = None,
+        entries: list[FakeLocator] | None = None,
+        username_fields: list[FakeLocator] | None = None,
+        password_fields: list[FakeLocator] | None = None,
+        billing_managers: list[FakeLocator] | None = None,
         journal: list[str] | None = None,
         default_timeout_ms: int = 5_000,
     ) -> None:
@@ -632,10 +674,26 @@ class FakePage:
         self.username_field = username_field
         self.password_field = password_field
         self.billing_manager = billing_manager
+        # Successive resolutions of one surface, so a caller that re-resolves at
+        # every recovery checkpoint can be handed a different locator each time.
+        # The last entry repeats, which models a surface that stays as it is.
+        self.activations = activations
+        self.placeholders = placeholders
+        self.entries = entries
+        self.username_fields = username_fields
+        self.password_fields = password_fields
+        self.billing_managers = billing_managers
         self.journal = journal
         self.goto_calls = 0
         self.login_lookups = 0
         self.alert_lookups = 0
+        # The Login role serves the semantics-gate entry and then the submit
+        # control. The one real entry click is what moves the page on, so a
+        # re-resolved entry is never mistaken for the submit control.
+        self.entry_phase = True
+        self.entry_lookups = 0
+        self.submit_lookups = 0
+        self._sequence_lookups: dict[str, int] = {}
         # What `page.set_default_timeout()` would have installed. An
         # unbounded call inherits it, so it is what a missing explicit
         # timeout costs.
@@ -644,8 +702,17 @@ class FakePage:
         # Every simulated cost in the order it was incurred, so a case can
         # prove a probe never outlasted the budget remaining at that moment.
         self.ledger: list[tuple[str, int]] = []
-        for locator in self.submits or ():
-            locator._clock = self
+        for sequence in (
+            self.submits,
+            self.activations,
+            self.placeholders,
+            self.entries,
+            self.username_fields,
+            self.password_fields,
+            self.billing_managers,
+        ):
+            for locator in sequence or ():
+                locator._clock = self
         if self.submit is not None:
             self.submit._clock = self
 
@@ -656,20 +723,42 @@ class FakePage:
         if self.goto_error is not None:
             raise self.goto_error
 
+    def _from_sequence(self, key: str, sequence: list[FakeLocator]) -> FakeLocator:
+        index = self._sequence_lookups.get(key, 0)
+        self._sequence_lookups[key] = index + 1
+        return sequence[min(index, len(sequence) - 1)]
+
+    def _end_entry_stage(self) -> None:
+        self.entry_phase = False
+
     def get_by_role(self, role: str, name: str | None = None, exact: bool = False):
         if name == "Enable accessibility":
+            if self.activations is not None:
+                return self._from_sequence("activation", self.activations)
             return self.activation
         if name == "Login":
             self.login_lookups += 1
-            if self.login_lookups > 1 and self.submits is not None:
-                return self.submits[min(self.login_lookups - 2, len(self.submits) - 1)]
-            if self.login_lookups > 1 and self.submit is not None:
+            if self.entry_phase:
+                self.entry_lookups += 1
+                locator = (
+                    self._from_sequence("entry", self.entries)
+                    if self.entries is not None
+                    else self.login_entry
+                )
+                locator._on_click_hook = self._end_entry_stage
+                return locator
+            self.submit_lookups += 1
+            if self.submits is not None:
+                return self._from_sequence("submit", self.submits)
+            if self.submit is not None:
                 return self.submit
             return self.login_entry
         if role == "alert":
             self.alert_lookups += 1
             return FakeLocator(visible=self.alert_visible)
         if name == "Billing Manager":
+            if self.billing_managers is not None:
+                return self._from_sequence("billing_manager", self.billing_managers)
             return self.billing_manager if self.billing_manager is not None else FakeLocator()
         raise AssertionError(f"unexpected role lookup: {role}/{name}")
 
@@ -700,14 +789,20 @@ class FakePage:
 
     def locator(self, selector: str):
         assert selector == "flt-semantics-placeholder", selector
+        if self.placeholders is not None:
+            return self._from_sequence("placeholder", self.placeholders)
         return self.placeholder
 
     def get_by_label(self, name: str, exact: bool = False):
         if self.label_error is not None:
             raise self.label_error
         if name == "Username":
+            if self.username_fields is not None:
+                return self._from_sequence("username", self.username_fields)
             return self.username_field if self.username_field is not None else FakeLocator()
         if name == "Password":
+            if self.password_fields is not None:
+                return self._from_sequence("password", self.password_fields)
             return self.password_field if self.password_field is not None else FakeLocator()
         raise AssertionError(f"unexpected label lookup: {name}")
 
@@ -719,9 +814,12 @@ class FakeConfig:
     timeout_seconds = 5
 
 
+# Each case is a control that stays in one non-interactive state for the whole
+# bounded recovery window, so what it proves is the fail-closed classification
+# at the deadline rather than any single probe.
 # (case id, locator keyword arguments, expected support reference)
 UNREADY_CONTROL_CASES = (
-    ("not_appear", {"wait_error": RuntimeError("locator never attached")}, "NOT_APPEAR"),
+    ("not_appear", {"count": 0}, "NOT_APPEAR"),
     ("unresolved", {"state_error": RuntimeError("strict mode violation")}, "UNRESOLVED"),
     ("ambiguous", {"count": 2}, "AMBIGUOUS"),
     ("hidden", {"visible": False}, "NOT_READY"),
@@ -789,15 +887,15 @@ LOGIN_STEP_CASES = (
 )
 
 # The committed order of portal interactions for one successful login attempt.
-# A healthy submit control is proven actionable by one trial click and is then
-# clicked once for real; it costs no extra resolution and no event-loop yield,
-# so an unlagged portal keeps the sequence it always had plus that one proof.
+# Every control that is about to be clicked for real is proven actionable by
+# one trial click first; readiness itself is proven by current-state reads that
+# dispatch nothing. A healthy portal is ready at the immediate checkpoint, so it
+# costs no extra resolution and no event-loop yield.
 SUCCESSFUL_LOGIN_SEQUENCE = [
     "page:goto",
-    "activation:wait_for",
     "activation:dispatch_event",
     "placeholder:wait_for",
-    "login_entry:wait_for",
+    "login_entry:click_trial",
     "login_entry:click",
     "username:fill",
     "password:fill",
@@ -974,6 +1072,7 @@ class PreAuthLoginFailureReferenceTests(unittest.TestCase):
         self.assertEqual(page.login_lookups, 2, "the entry and the submit control resolve as before")
         self.assertEqual(locators["activation"].dispatched, 1)
         self.assertEqual(locators["login_entry"].clicks, 1)
+        self.assertEqual(locators["login_entry"].trial_clicks, 1)
         self.assertEqual(locators["submit"].clicks, 1)
         self.assertEqual(locators["submit"].trial_clicks, 1)
         self.assertEqual(locators["username"].fills, 1)
@@ -1109,17 +1208,27 @@ class LoginSubmitRecoveryTests(unittest.TestCase):
         self.assertEqual(ready.clicks, 1)
         self.assertTrue(page.waited_ms, "recovery yields the browser event loop")
 
-    def test_ambiguous_login_control_fails_immediately_without_retrying(self) -> None:
-        """More than one exact Login control is drift, and drift is terminal."""
+    def test_persistent_ambiguity_fails_closed_without_ever_interacting(self) -> None:
+        """Ambiguity is re-checked but never acted on, and never survives.
+
+        DL-XB-141-PORTAL-RESILIENCE-002 supersedes the rule that any momentary
+        second match is immediately terminal: a mid-transition frame can show
+        two matches. What it does not permit is acting on the ambiguity, so the
+        control is looked at again from a fresh locator and never clicked,
+        never narrowed with `.first`, and never reached by a weaker selector.
+        """
         ambiguous = FakeLocator(count=2, label="ambiguous")
         page = login_page(submits=[ambiguous])
 
         error = self.attempt_login(page)
         self.assertIsInstance(error, LayoutChangedError)
         self.assertEqual(error.status, PORTAL_LAYOUT_CHANGED)
-        self.assertEqual(page.waited_ms, [], "ambiguity is not retryable")
+        self.assert_submit_stage(error)
+        self.assertTrue(page.waited_ms, "transient ambiguity is re-checked, not terminal on sight")
+        self.assertGreater(page.login_lookups, 3, "every re-check resolved a fresh locator")
         self.assertEqual(ambiguous.trial_clicks, 0)
         self.assertEqual(ambiguous.clicks, 0)
+        self.assert_within_budget(page)
 
     def test_recovery_is_bounded_by_a_monotonic_deadline(self) -> None:
         """A control that never becomes ready still ends inside the ceiling."""
@@ -1261,7 +1370,10 @@ class LoginSubmitRecoveryTests(unittest.TestCase):
         self.assertIsNone(self.attempt_login(page))
         self.assertEqual(stalling.enabled_checks, 1)
         self.assertEqual(stalling.clicks, 0, "the locator that timed out is never submitted")
-        self.assertTrue(page.waited_ms, "a transient readiness timeout yields before retrying")
+        # The checkpoints are elapsed offsets, not additive sleeps: a probe that
+        # already spent the first checkpoint's worth of budget has nothing left
+        # to yield before the next look, so the retry is immediate.
+        self.assertEqual(page.waited_ms, [], "a probe that already elapsed past a checkpoint adds no sleep")
         self.assertGreaterEqual(page.login_lookups, 3, "the retry resolved a fresh locator")
         self.assertEqual(ready.trial_clicks, 1)
         self.assertEqual(ready.clicks, 1)
@@ -1317,6 +1429,1075 @@ class LoginSubmitRecoveryTests(unittest.TestCase):
         """The submit stage keeps its committed marker and its reference."""
         self.assertEqual(error.message, "login submission did not complete")
         self.assertEqual(cli.support_ref_for(error), "EG_LOGIN_SUBMIT_FAILED")
+
+
+
+# ---- DL-XB-141-PORTAL-RESILIENCE-002: the shared readiness primitive ---- #
+#
+# These cases drive the committed recovery mechanism itself rather than one
+# surface that happens to use it, because what the owner approved is one
+# pattern reused everywhere: retry readiness, never the real action. The clock
+# and the checkpoint ladder are simulated, so the production 60-second contract
+# is proven without anything actually waiting.
+
+
+@dataclass(frozen=True)
+class Frame:
+    """One observation of a control, as a single fresh resolution sees it."""
+
+    count: int = 1
+    visible: bool = True
+    enabled: bool = True
+    enabled_timeout: bool = False
+    actionable: bool = True
+
+
+READY_FRAME = Frame()
+
+
+class RecoveryClock:
+    """Simulated elapsed time: only what the portal actually asked to spend.
+
+    Yields and bounded probes are charged to the same ledger, so a probe that
+    parks cannot be free and one ceiling covers both.
+    """
+
+    def __init__(self, default_timeout_ms: int = 300_000) -> None:
+        self.default_timeout_ms = default_timeout_ms
+        self.ledger: list[tuple[str, int]] = []
+
+    def charge_yield(self, milliseconds: int) -> None:
+        self.ledger.append(("yield", int(milliseconds)))
+
+    def charge_probe(self, milliseconds: int | None) -> None:
+        """Charge a probe its whole budget: the page default if it had none."""
+        spent = self.default_timeout_ms if milliseconds is None else milliseconds
+        self.ledger.append(("probe", int(spent)))
+
+    @property
+    def yields(self) -> list[int]:
+        return [cost for kind, cost in self.ledger if kind == "yield"]
+
+    @property
+    def probes(self) -> list[int]:
+        return [cost for kind, cost in self.ledger if kind == "probe"]
+
+    def elapsed_ms(self) -> int:
+        return sum(cost for _kind, cost in self.ledger)
+
+    def monotonic(self) -> float:
+        return self.elapsed_ms() / 1000.0
+
+
+@contextlib.contextmanager
+def simulated_clock(clock: RecoveryClock):
+    """Patch the clock the recovery reads so a deadline loop is deterministic.
+
+    `create=True` keeps these cases failing on behaviour rather than on the
+    absence of a clock, which is what makes them meaningful regressions against
+    a revision with no bounded recovery at all.
+    """
+
+    with mock.patch.object(portal_module, "time", create=True) as fake:
+        fake.monotonic.side_effect = clock.monotonic
+        yield
+
+
+class ScriptedLocator:
+    """One resolution of a scripted control, frozen at the frame it observed."""
+
+    def __init__(self, control: "ScriptedControl", frame: Frame) -> None:
+        self.control = control
+        self.frame = frame
+
+    def count(self) -> int:
+        return self.frame.count
+
+    def is_visible(self, timeout: int | None = None) -> bool:
+        return self.frame.visible
+
+    def is_enabled(self, timeout: int | None = None) -> bool:
+        self.control.enabled_timeouts.append(timeout)
+        if self.frame.enabled_timeout:
+            self.control.clock.charge_probe(timeout)
+            raise synthetic_timeout()
+        return self.frame.enabled
+
+    def click(self, trial: bool = False, timeout: int | None = None) -> None:
+        if trial:
+            self.control.trial_clicks += 1
+            self.control.trial_timeouts.append(timeout)
+            if not self.frame.actionable:
+                self.control.clock.charge_probe(timeout)
+                raise synthetic_timeout()
+            return
+        self.control.clicks += 1
+
+
+class ScriptedControl:
+    """A control whose observable state advances with every fresh resolution.
+
+    `frames` is consumed one entry per resolution and the last entry repeats,
+    so a surface that settles after a known number of fresh looks is
+    deterministic -- and "a freshly resolved locator is what found it" becomes
+    directly countable.
+    """
+
+    def __init__(self, clock: RecoveryClock, frames) -> None:
+        self.clock = clock
+        self.frames = list(frames)
+        self.resolutions = 0
+        self.clicks = 0
+        self.trial_clicks = 0
+        self.enabled_timeouts: list[int | None] = []
+        self.trial_timeouts: list[int | None] = []
+
+    def resolve(self) -> ScriptedLocator:
+        frame = self.frames[min(self.resolutions, len(self.frames) - 1)]
+        self.resolutions += 1
+        return ScriptedLocator(self, frame)
+
+
+class RecoveryPage:
+    """A page whose only job is to hand a fresh scripted locator to each look."""
+
+    def __init__(self, control: ScriptedControl, clock: RecoveryClock) -> None:
+        self.control = control
+        self.clock = clock
+
+    def wait_for_timeout(self, milliseconds: int) -> None:
+        self.clock.charge_yield(milliseconds)
+
+    def get_by_role(self, role: str, name: str | None = None, exact: bool = False):
+        return self.control.resolve()
+
+
+class PortalReadinessRecoveryTests(unittest.TestCase):
+    """One reusable readiness primitive, independent of any single surface."""
+
+    def resolve(self, frames, **kwargs):
+        """Recover readiness for a scripted control and report the outcome."""
+
+        clock = RecoveryClock()
+        control = ScriptedControl(clock, frames)
+        page = RecoveryPage(control, clock)
+        portal = PlaywrightPortal(FakeConfig(), headed=False)
+        portal.page = page
+        error: AppError | None = None
+        locator = None
+        with simulated_clock(clock):
+            try:
+                locator = portal._resolve_ready_control(
+                    page,
+                    lambda: page.get_by_role("button", name="Synthetic", exact=True),
+                    "synthetic control",
+                    **kwargs,
+                )
+            except AppError as exc:
+                error = exc
+        return control, clock, locator, error
+
+    def assert_bounded(self, clock: RecoveryClock, control: ScriptedControl) -> None:
+        """Every probe is explicit, capped, and inside the budget it started with."""
+
+        elapsed = 0
+        for kind, cost in clock.ledger:
+            if kind == "probe":
+                self.assertLessEqual(cost, MAX_TRIAL_PROBE_MS, "a probe stays inside the shared cap")
+                self.assertLessEqual(
+                    cost,
+                    RECOVERY_CEILING_MS - elapsed,
+                    "a probe may not outlast the remaining recovery budget",
+                )
+            elapsed += cost
+        self.assertLessEqual(
+            elapsed, RECOVERY_CEILING_MS, "probes and yields share one hard ceiling"
+        )
+        for value in control.enabled_timeouts + control.trial_timeouts:
+            self.assertIsNotNone(value, "every waiting probe carries an explicit timeout")
+            self.assertNotEqual(value, 0, "a zero timeout would mean waiting forever")
+            self.assertLessEqual(value, MAX_TRIAL_PROBE_MS)
+
+    def assert_deadline_respected(self, clock: RecoveryClock, control: ScriptedControl) -> None:
+        """A surface that never settles still ends inside the hard ceiling."""
+
+        attempts = len(portal_module.PORTAL_RECOVERY_ATTEMPTS_MS)
+        self.assertEqual(
+            control.resolutions, attempts, "every checkpoint resolved its own fresh locator"
+        )
+        self.assertLessEqual(clock.elapsed_ms(), RECOVERY_CEILING_MS)
+        self.assertTrue(clock.yields, "a bounded window yields between looks")
+        self.assertEqual(clock.yields, sorted(clock.yields), "the elapsed ladder increases")
+        self.assert_bounded(clock, control)
+
+    def test_the_committed_recovery_contract_is_the_owner_approved_one(self) -> None:
+        """The production ladder, ceiling and probe cap, asserted literally.
+
+        The browser-backed drift cases shrink these constants so the suite does
+        not spend a real minute per variant, so the committed values are pinned
+        here rather than inferred from any case's behaviour.
+        """
+        self.assertEqual(
+            portal_module.PORTAL_RECOVERY_CHECKPOINTS_MS, (250, 1000, 5000, 10000, 30000)
+        )
+        self.assertEqual(portal_module.PORTAL_RECOVERY_DEADLINE_SECONDS, 60.0)
+        self.assertEqual(portal_module.MAX_PORTAL_PROBE_TIMEOUT_MS, MAX_TRIAL_PROBE_MS)
+
+        attempts = portal_module.PORTAL_RECOVERY_ATTEMPTS_MS
+        self.assertEqual(
+            attempts[0], 0, "the first look is immediate, so a healthy portal pays nothing"
+        )
+        self.assertEqual(attempts[1:-1], portal_module.PORTAL_RECOVERY_CHECKPOINTS_MS)
+        self.assertEqual(
+            list(attempts), sorted(attempts), "the checkpoints are increasing elapsed offsets"
+        )
+        self.assertLess(
+            attempts[-1], RECOVERY_CEILING_MS, "a final fresh look happens inside the deadline"
+        )
+        self.assertGreaterEqual(
+            RECOVERY_CEILING_MS - attempts[-1],
+            2 * MAX_TRIAL_PROBE_MS,
+            "the final look leaves room for the bounded probes it will run",
+        )
+
+    def test_an_absent_control_that_appears_later_is_recovered(self) -> None:
+        control, clock, locator, error = self.resolve([Frame(count=0), READY_FRAME])
+        self.assertIsNone(error)
+        self.assertIsNotNone(locator)
+        self.assertEqual(control.resolutions, 2, "the second look resolved a fresh locator")
+        self.assertEqual(clock.yields, [250], "the first elapsed checkpoint is a quarter second")
+        self.assert_bounded(clock, control)
+
+    def test_a_hidden_control_that_becomes_visible_is_recovered(self) -> None:
+        control, clock, locator, error = self.resolve(
+            [Frame(visible=False), Frame(visible=False), READY_FRAME]
+        )
+        self.assertIsNone(error)
+        self.assertIsNotNone(locator)
+        self.assertEqual(control.resolutions, 3)
+        self.assertEqual(
+            len(control.enabled_timeouts),
+            1,
+            "an invisible control is never asked for its enabled state",
+        )
+        self.assert_bounded(clock, control)
+
+    def test_a_disabled_control_that_becomes_enabled_is_recovered(self) -> None:
+        control, clock, locator, error = self.resolve([Frame(enabled=False), READY_FRAME])
+        self.assertIsNone(error)
+        self.assertIsNotNone(locator)
+        self.assertEqual(len(control.enabled_timeouts), 2, "each look asked afresh")
+        self.assert_bounded(clock, control)
+
+    def test_an_enabled_probe_timeout_is_transient_not_terminal(self) -> None:
+        control, clock, locator, error = self.resolve([Frame(enabled_timeout=True), READY_FRAME])
+        self.assertIsNone(error)
+        self.assertIsNotNone(locator)
+        self.assertEqual(clock.probes, [MAX_TRIAL_PROBE_MS], "the stalled check was charged its cap")
+        self.assert_bounded(clock, control)
+
+    def test_a_trial_actionability_timeout_that_later_clears_is_recovered(self) -> None:
+        control, clock, locator, error = self.resolve(
+            [Frame(actionable=False), Frame(actionable=False), READY_FRAME],
+            require_trial_actionable=True,
+        )
+        self.assertIsNone(error)
+        self.assertIsNotNone(locator)
+        self.assertEqual(control.trial_clicks, 3, "actionability was re-proven, never assumed")
+        self.assertEqual(control.clicks, 0, "the primitive never dispatches the real action")
+        self.assert_bounded(clock, control)
+
+    def test_transient_ambiguity_is_re_resolved_and_never_interacted_with(self) -> None:
+        """Two matches may be a mid-transition frame; acting on them never is."""
+        control, clock, locator, error = self.resolve(
+            [Frame(count=2), Frame(count=2), READY_FRAME], require_trial_actionable=True
+        )
+        self.assertIsNone(error)
+        self.assertIsNotNone(locator)
+        self.assertEqual(control.resolutions, 3)
+        self.assertEqual(
+            control.trial_clicks, 1, "only the unambiguous look was probed for actionability"
+        )
+        self.assertEqual(
+            len(control.enabled_timeouts), 1, "an ambiguous look is never asked for state"
+        )
+        self.assertEqual(control.clicks, 0)
+        self.assert_bounded(clock, control)
+
+    def test_persistent_ambiguity_fails_closed_at_the_deadline(self) -> None:
+        control, clock, locator, error = self.resolve(
+            [Frame(count=2)], require_trial_actionable=True
+        )
+        self.assertIsInstance(error, LayoutChangedError)
+        self.assertEqual(error.message, "synthetic control is missing or ambiguous")
+        self.assertIsNone(locator)
+        self.assertEqual(control.trial_clicks, 0)
+        self.assertEqual(control.clicks, 0)
+        self.assert_deadline_respected(clock, control)
+
+    def test_persistent_absence_fails_closed_at_the_deadline(self) -> None:
+        control, clock, locator, error = self.resolve([Frame(count=0)])
+        self.assertIsInstance(error, LayoutChangedError)
+        self.assertEqual(error.message, "synthetic control did not appear")
+        self.assertIsNone(locator)
+        self.assert_deadline_respected(clock, control)
+
+    def test_a_control_that_never_becomes_actionable_fails_closed(self) -> None:
+        control, clock, locator, error = self.resolve(
+            [Frame(actionable=False)], require_trial_actionable=True
+        )
+        self.assertIsInstance(error, LayoutChangedError)
+        self.assertEqual(error.message, "synthetic control is hidden or disabled")
+        self.assertIsNone(locator)
+        self.assertEqual(control.clicks, 0, "an unactionable control is never really clicked")
+        self.assert_deadline_respected(clock, control)
+
+    def test_an_unresolvable_locator_is_drift_and_is_not_waited_out(self) -> None:
+        """A locator that cannot resolve at all never becomes correct by waiting."""
+
+        clock = RecoveryClock()
+        page = RecoveryPage(ScriptedControl(clock, [READY_FRAME]), clock)
+
+        def broken():
+            raise RuntimeError("strict mode violation")
+
+        portal = PlaywrightPortal(FakeConfig(), headed=False)
+        portal.page = page
+        with simulated_clock(clock):
+            with self.assertRaises(LayoutChangedError) as caught:
+                portal._resolve_ready_control(page, broken, "synthetic control")
+        self.assertEqual(caught.exception.message, "synthetic control could not be resolved")
+        self.assertEqual(clock.yields, [], "drift is terminal on sight, not retried")
+
+    def test_a_long_page_default_cannot_extend_the_shared_window(self) -> None:
+        """No probe may inherit `page.set_default_timeout()` inside a recovery.
+
+        The simulated clock charges an implicit probe the 300 s page default,
+        so a single unbounded readiness check would blow the ceiling on its
+        first attempt instead of ending inside it.
+        """
+
+        control, clock, _locator, error = self.resolve([Frame(enabled_timeout=True)])
+        self.assertIsInstance(error, LayoutChangedError)
+        self.assertTrue(control.enabled_timeouts)
+        self.assertTrue(all(value == MAX_TRIAL_PROBE_MS for value in control.enabled_timeouts))
+        self.assert_deadline_respected(clock, control)
+
+
+
+# ---- DL-XB-141-PORTAL-RESILIENCE-002: post-action settling downstream ---- #
+#
+# The results route is where a duplicated dispatch is most expensive: a second
+# Search discards the first result, a second Next page skips a page of
+# inventory, and a second Download re-bills the portal. These cases drive the
+# committed `inventory()` and `download()` with a page whose surfaces settle
+# only after a known number of fresh looks, and assert both that the flow
+# recovers and that every real dispatch happened exactly once.
+
+
+class ResultsConfig:
+    """Only the fields the results route reads; no URL is ever fetched."""
+
+    portal_url = "http://127.0.0.1:1/synthetic"
+    timeout_seconds = 5
+    account_identity = "SYNTHETIC-INTENDED-ACCOUNT"
+
+
+class _ResultsControl:
+    """One resolution of a results-route control."""
+
+    def __init__(
+        self,
+        page: "FakeResultsPage",
+        key: str,
+        *,
+        present: bool = True,
+        visible: bool = True,
+        enabled: bool = True,
+        disabled: bool = False,
+        actionable: bool = True,
+        on_click=None,
+    ) -> None:
+        self._page = page
+        self._key = key
+        self._present = present
+        self._visible = visible
+        self._enabled = enabled
+        self._disabled = disabled
+        self._actionable = actionable
+        self._on_click = on_click
+
+    def count(self) -> int:
+        return 1 if self._present else 0
+
+    def is_visible(self, timeout: int | None = None) -> bool:
+        return self._visible
+
+    def is_enabled(self, timeout: int | None = None) -> bool:
+        self._page.probe_timeouts.append(timeout)
+        return self._enabled
+
+    def is_disabled(self, timeout: int | None = None) -> bool:
+        self._page.probe_timeouts.append(timeout)
+        return self._disabled
+
+    def click(self, trial: bool = False, timeout: int | None = None) -> None:
+        if trial:
+            self._page.probe_timeouts.append(timeout)
+            self._page.trial_clicks[self._key] = self._page.trial_clicks.get(self._key, 0) + 1
+            if not self._actionable:
+                self._page.clock.charge_probe(timeout)
+                raise synthetic_timeout()
+            return
+        self._page.clicks[self._key] = self._page.clicks.get(self._key, 0) + 1
+        self._page.events.append(self._key)
+        if self._on_click is not None:
+            self._on_click()
+
+
+class _TextMarker:
+    """A read-only identity marker the account binding compares against."""
+
+    def __init__(self, text: str, present: bool = True) -> None:
+        self._text = text
+        self._present = present
+
+    def count(self) -> int:
+        return 1 if self._present else 0
+
+    @property
+    def first(self) -> "_TextMarker":
+        return self
+
+    def text_content(self) -> str:
+        return self._text
+
+
+class _Option:
+    def __init__(self, value: str) -> None:
+        self._value = value
+
+    def get_attribute(self, name: str) -> str | None:
+        return self._value if name == "value" else None
+
+
+class _Options:
+    def __init__(self, texts: list[str]) -> None:
+        self._texts = texts
+
+    def all_text_contents(self) -> list[str]:
+        return list(self._texts)
+
+    def nth(self, index: int) -> _Option:
+        return _Option(f"synthetic-account-{index}")
+
+
+class _AccountControl:
+    """The tenant/account selector, whose identity contract stays terminal."""
+
+    def __init__(self, page: "FakeResultsPage", present: bool) -> None:
+        self._page = page
+        self._present = present
+
+    def count(self) -> int:
+        return 1 if self._present else 0
+
+    def is_visible(self, timeout: int | None = None) -> bool:
+        return True
+
+    def is_enabled(self, timeout: int | None = None) -> bool:
+        self._page.probe_timeouts.append(timeout)
+        return True
+
+    def locator(self, selector: str):
+        if selector == "option":
+            return _Options(list(self._page.account_options))
+        if selector == "option:checked":
+            return _TextMarker(self._page.selected_account)
+        raise AssertionError(f"unexpected selector: {selector}")
+
+    def select_option(self, value: str | None = None) -> None:
+        self._page.selected_account = self._page.account
+        self._page.events.append("select_account")
+
+
+class _StateMarker:
+    """The result-state marker, which reports pre-search until it settles."""
+
+    def __init__(self, page: "FakeResultsPage") -> None:
+        self._page = page
+
+    def count(self) -> int:
+        return 1
+
+    def get_attribute(self, name: str) -> str | None:
+        assert name == "data-state", name
+        if self._page.post_search_pending > 0:
+            self._page.post_search_pending -= 1
+            return "pre-search"
+        return "post-search" if self._page.searched else "pre-search"
+
+
+class _ListContainer:
+    def __init__(self, page: "FakeResultsPage", present: bool) -> None:
+        self._page = page
+        self._present = present
+
+    def count(self) -> int:
+        return 1 if self._present else 0
+
+    def is_visible(self, timeout: int | None = None) -> bool:
+        return True
+
+    def get_attribute(self, name: str) -> str | None:
+        assert name == "data-page", name
+        return f"page-{self._page.page_index + 1}"
+
+
+class _Row:
+    def __init__(self, page: "FakeResultsPage", filename: str) -> None:
+        self._page = page
+        self._filename = filename
+
+    def get_attribute(self, name: str) -> str | None:
+        return self._filename if name == "data-filename" else None
+
+    def get_by_role(self, role: str, name: str | None = None, exact: bool = False):
+        assert name == "Download", name
+        looks = self._page.bump("download")
+        filename = self._filename
+        return _ResultsControl(
+            self._page,
+            "download",
+            present=looks > self._page.download_delay,
+            on_click=lambda: setattr(self._page, "last_download", filename),
+        )
+
+
+class _Rows:
+    def __init__(self, page: "FakeResultsPage", filenames: list[str]) -> None:
+        self._page = page
+        self._filenames = filenames
+
+    def count(self) -> int:
+        return len(self._filenames)
+
+    def all(self) -> list[_Row]:
+        return [_Row(self._page, name) for name in self._filenames]
+
+
+class _Download:
+    def __init__(self, filename: str | None) -> None:
+        self._filename = filename
+
+    def failure(self):
+        return None
+
+    @property
+    def suggested_filename(self) -> str | None:
+        return self._filename
+
+    def save_as(self, destination) -> None:
+        target = Path(destination)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"%PDF-1.7\nsynthetic\n%%EOF\n")
+
+
+class _DownloadInfo:
+    def __init__(self, page: "FakeResultsPage") -> None:
+        self._page = page
+
+    @property
+    def value(self) -> _Download:
+        return _Download(self._page.last_download)
+
+
+class FakeResultsPage:
+    """The results route as the portal drives it, with settling knobs.
+
+    Every knob counts fresh looks rather than milliseconds, so a delayed
+    transition is deterministic and costs no real time. `clicks` and `events`
+    are what the single-dispatch and owner-sequence cases assert; no browser,
+    no server and no credentials are involved.
+    """
+
+    def __init__(
+        self,
+        *,
+        pages=(("2026-01-01_synthetic.pdf",),),
+        account: str = "SYNTHETIC-INTENDED-ACCOUNT",
+        billing_manager_delay: int = 0,
+        eb_bill_delay: int = 0,
+        account_delay: int = 0,
+        post_search_delay: int = 0,
+        list_delay: int = 0,
+        advance_delay: int = 0,
+        download_delay: int = 0,
+        clock: RecoveryClock | None = None,
+    ) -> None:
+        self.clock = clock or RecoveryClock()
+        self.pages = [list(names) for names in pages]
+        self.account = account
+        self.account_options = [account]
+        self.selected_account = account
+        self.billing_manager_delay = billing_manager_delay
+        self.eb_bill_delay = eb_bill_delay
+        self.account_delay = account_delay
+        self.post_search_delay = post_search_delay
+        self.list_delay = list_delay
+        self.advance_delay = advance_delay
+        self.download_delay = download_delay
+        self.route = "app"
+        self.page_index = 0
+        self.searched = False
+        self.post_search_pending = 0
+        self.last_download: str | None = None
+        self.looks: dict[str, int] = {}
+        self.clicks: dict[str, int] = {}
+        self.trial_clicks: dict[str, int] = {}
+        self.probe_timeouts: list[int | None] = []
+        self.events: list[str] = []
+        self.rows_read_before_search = False
+        self._advance_after = 0
+        self._advance_target: int | None = None
+
+    # -- fixture helpers -- #
+
+    def bump(self, key: str) -> int:
+        self.looks[key] = self.looks.get(key, 0) + 1
+        return self.looks[key]
+
+    def reset_looks(self, key: str) -> None:
+        self.looks[key] = 0
+
+    def delay_download(self, looks: int) -> None:
+        """Delay the download control from the next look onward."""
+        self.download_delay = looks
+        self.reset_looks("download")
+
+    def _open_billing(self) -> None:
+        self.route = "billing"
+
+    def _open_results(self) -> None:
+        self.route = "results"
+
+    def _run_search(self) -> None:
+        self.searched = True
+        self.post_search_pending = self.post_search_delay
+        self.page_index = 0
+        self.reset_looks("invoice-list")
+
+    def _has_next(self) -> bool:
+        return self.page_index + 1 < len(self.pages)
+
+    def _click_next(self) -> None:
+        self._advance_after = self.advance_delay
+        self._advance_target = self.page_index + 1
+
+    # -- the slice of the page surface the results route touches -- #
+
+    @property
+    def url(self) -> str:
+        return f"http://synthetic.invalid/results?page={self.page_index + 1}"
+
+    def goto(self, url: str, wait_until: str | None = None) -> None:
+        self.events.append("goto")
+        self.route = "results"
+        self.searched = False
+        self.post_search_pending = 0
+        for key in ("account", "invoice-list", "search"):
+            self.reset_looks(key)
+        index = int(url.rsplit("=", 1)[1]) - 1
+        self.page_index = max(0, min(index, len(self.pages) - 1))
+
+    def wait_for_timeout(self, milliseconds: int) -> None:
+        self.clock.charge_yield(milliseconds)
+
+    def get_by_label(self, name: str, exact: bool = False):
+        assert name == "Tenant/account", name
+        looks = self.bump("account")
+        return _AccountControl(self, self.route == "results" and looks > self.account_delay)
+
+    def get_by_role(self, role: str, name: str | None = None, exact: bool = False):
+        if name == "Billing Manager":
+            looks = self.bump("billing_manager")
+            return _ResultsControl(
+                self,
+                "billing_manager",
+                present=self.route == "app" and looks > self.billing_manager_delay,
+                on_click=self._open_billing,
+            )
+        if name == "EB Bill":
+            looks = self.bump("eb_bill")
+            return _ResultsControl(
+                self,
+                "eb_bill",
+                present=self.route == "billing" and looks > self.eb_bill_delay,
+                on_click=self._open_results,
+            )
+        if name == "Search":
+            self.bump("search")
+            return _ResultsControl(
+                self, "search", present=self.route == "results", on_click=self._run_search
+            )
+        if name == "Next page":
+            self.bump("next_page")
+            return _ResultsControl(
+                self,
+                "next_page",
+                present=True,
+                disabled=not self._has_next(),
+                on_click=self._click_next,
+            )
+        raise AssertionError(f"unexpected role lookup: {role}/{name}")
+
+    def get_by_test_id(self, test_id: str):
+        if test_id == "invoice-list":
+            looks = self.bump("invoice-list")
+            return _ListContainer(self, looks > self.list_delay)
+        if test_id == "invoice-row":
+            if not self.searched:
+                self.rows_read_before_search = True
+            return _Rows(self, list(self.pages[self.page_index]) if self.searched else [])
+        if test_id == "invoice-list-empty":
+            empty = not (self.searched and self.pages[self.page_index])
+            return _ResultsControl(self, "invoice-list-empty", present=empty, visible=empty)
+        if test_id == "invoice-results-state":
+            return _StateMarker(self)
+        if test_id == "selected-account":
+            return _TextMarker(self.selected_account)
+        raise AssertionError(f"unexpected test id: {test_id}")
+
+    def wait_for_function(self, script: str, arg=None, timeout: int | None = None) -> None:
+        self.probe_timeouts.append(timeout)
+        if self._advance_after > 0:
+            self._advance_after -= 1
+            self.clock.charge_probe(timeout)
+            raise synthetic_timeout()
+        if self._advance_target is not None:
+            self.page_index = self._advance_target
+            self._advance_target = None
+            self.reset_looks("invoice-list")
+
+    def expect_download(self):
+        page = self
+
+        @contextlib.contextmanager
+        def manager():
+            yield _DownloadInfo(page)
+
+        return manager()
+
+
+class PortalResultsSettlingTests(unittest.TestCase):
+    """One dispatch, then settle: the results route under eventual consistency."""
+
+    def route(self, **kwargs):
+        clock = RecoveryClock()
+        page = FakeResultsPage(clock=clock, **kwargs)
+        portal = PlaywrightPortal(ResultsConfig(), headed=False)
+        portal.page = page
+        return portal, page, clock
+
+    def assert_probes_bounded(self, page: FakeResultsPage) -> None:
+        """Every waiting call on this route carried an explicit small timeout."""
+
+        self.assertTrue(page.probe_timeouts, "the route must actually probe")
+        for value in page.probe_timeouts:
+            self.assertIsNotNone(value, "no probe may inherit the page default")
+            self.assertNotEqual(value, 0, "a zero timeout would mean waiting forever")
+            self.assertLessEqual(value, MAX_TRIAL_PROBE_MS)
+
+    def test_the_owner_confirmed_downstream_sequence_is_preserved(self) -> None:
+        """Billing Manager, EB Bill, account, Search, and only then invoices."""
+        portal, page, clock = self.route()
+        with simulated_clock(clock):
+            inventory = portal.inventory(20)
+
+        self.assertEqual([bill.filename for bill in inventory], ["2026-01-01_synthetic.pdf"])
+        self.assertEqual(page.events, ["billing_manager", "eb_bill", "select_account", "search"])
+        self.assertFalse(
+            page.rows_read_before_search,
+            "an empty EB Bill surface before Search is never read as no invoices",
+        )
+        self.assertEqual(page.clicks, {"billing_manager": 1, "eb_bill": 1, "search": 1})
+        self.assertEqual(clock.yields, [], "a settled route pays nothing for recovery")
+        self.assert_probes_bounded(page)
+
+    def test_a_delayed_billing_manager_is_recovered_and_clicked_once(self) -> None:
+        portal, page, clock = self.route(billing_manager_delay=3)
+        with simulated_clock(clock):
+            inventory = portal.inventory(20)
+
+        self.assertEqual(len(inventory), 1)
+        self.assertEqual(page.clicks["billing_manager"], 1)
+        self.assertGreater(page.looks["billing_manager"], 3, "each look resolved a fresh locator")
+        self.assertTrue(clock.yields)
+        self.assert_probes_bounded(page)
+
+    def test_a_delayed_eb_bill_surface_is_recovered_and_clicked_once(self) -> None:
+        portal, page, clock = self.route(eb_bill_delay=3)
+        with simulated_clock(clock):
+            inventory = portal.inventory(20)
+
+        self.assertEqual(len(inventory), 1)
+        self.assertEqual(page.clicks["billing_manager"], 1, "a slow EB Bill never re-opens Billing")
+        self.assertEqual(page.clicks["eb_bill"], 1)
+        self.assert_probes_bounded(page)
+
+    def test_a_delayed_account_surface_settles_before_selection(self) -> None:
+        portal, page, clock = self.route(account_delay=3)
+        with simulated_clock(clock):
+            inventory = portal.inventory(20)
+
+        self.assertEqual(len(inventory), 1)
+        self.assertEqual(page.clicks["eb_bill"], 1, "a slow account surface never re-clicks EB Bill")
+        self.assertEqual(page.events.count("select_account"), 1)
+        self.assert_probes_bounded(page)
+
+    def test_a_delayed_post_search_state_is_settled_not_re_searched(self) -> None:
+        portal, page, clock = self.route(post_search_delay=4)
+        with simulated_clock(clock):
+            inventory = portal.inventory(20)
+
+        self.assertEqual(len(inventory), 1)
+        self.assertEqual(page.clicks["search"], 1, "a slow result is never re-requested")
+        self.assertTrue(clock.yields)
+        self.assert_probes_bounded(page)
+
+    def test_a_delayed_invoice_list_becomes_visible_without_re_searching(self) -> None:
+        portal, page, clock = self.route(list_delay=3)
+        with simulated_clock(clock):
+            inventory = portal.inventory(20)
+
+        self.assertEqual(len(inventory), 1)
+        self.assertEqual(page.clicks["search"], 1)
+        self.assert_probes_bounded(page)
+
+    def test_a_delayed_pagination_advance_is_waited_for_not_re_clicked(self) -> None:
+        portal, page, clock = self.route(
+            pages=(("2026-01-01_a.pdf",), ("2026-02-01_b.pdf",)), advance_delay=4
+        )
+        with simulated_clock(clock):
+            inventory = portal.inventory(20)
+
+        self.assertEqual([bill.filename for bill in inventory], ["2026-01-01_a.pdf", "2026-02-01_b.pdf"])
+        self.assertEqual(
+            page.clicks["next_page"], 1, "one real click per intended page transition"
+        )
+        self.assertTrue(clock.yields)
+        self.assert_probes_bounded(page)
+
+    def test_a_post_search_state_that_never_settles_never_re_searches(self) -> None:
+        portal, page, clock = self.route(post_search_delay=10 ** 6)
+        with simulated_clock(clock):
+            with self.assertRaises(LayoutChangedError) as caught:
+                portal.inventory(20)
+
+        self.assertEqual(caught.exception.message, "invoice results are not confirmed post-search")
+        self.assertEqual(page.clicks["search"], 1, "a postcondition timeout never duplicates the action")
+        self.assertLessEqual(clock.elapsed_ms(), RECOVERY_CEILING_MS)
+
+    def test_pagination_that_never_advances_never_re_clicks(self) -> None:
+        portal, page, clock = self.route(
+            pages=(("2026-01-01_a.pdf",), ("2026-02-01_b.pdf",)), advance_delay=10 ** 6
+        )
+        with simulated_clock(clock):
+            with self.assertRaises(LayoutChangedError) as caught:
+                portal.inventory(20)
+
+        self.assertEqual(caught.exception.message, "invoice pagination did not advance")
+        self.assertEqual(page.clicks["next_page"], 1, "a slow transition is never re-requested")
+        self.assertLessEqual(clock.elapsed_ms(), RECOVERY_CEILING_MS)
+
+    def test_end_of_inventory_is_still_a_disabled_next_page(self) -> None:
+        """A disabled Next page stays the committed end signal, not lag."""
+        portal, page, clock = self.route()
+        with simulated_clock(clock):
+            inventory = portal.inventory(20)
+
+        self.assertEqual(len(inventory), 1)
+        self.assertEqual(page.clicks.get("next_page", 0), 0)
+        self.assertEqual(clock.yields, [], "the end of inventory is read once and trusted")
+
+    def test_a_confirmed_post_search_empty_surface_is_authoritative(self) -> None:
+        portal, page, clock = self.route(pages=([],))
+        with simulated_clock(clock):
+            self.assertEqual(portal.inventory(20), [])
+        self.assertEqual(page.clicks["search"], 1)
+        self.assertFalse(page.rows_read_before_search)
+
+    def test_a_delayed_download_control_is_dispatched_exactly_once(self) -> None:
+        portal, page, clock = self.route()
+        with tempfile.TemporaryDirectory() as directory:
+            with simulated_clock(clock):
+                inventory = portal.inventory(20)
+                page.delay_download(3)
+                target = Path(directory) / "download.bin"
+                suggested = portal.download(inventory[0], target)
+
+            self.assertEqual(suggested, "2026-01-01_synthetic.pdf")
+            self.assertTrue(target.exists())
+        self.assertEqual(page.clicks["download"], 1)
+        self.assertGreater(page.looks["download"], 3, "readiness was re-resolved, not the click")
+        self.assert_probes_bounded(page)
+
+    def test_a_download_control_that_never_settles_is_never_clicked(self) -> None:
+        portal, page, clock = self.route()
+        with tempfile.TemporaryDirectory() as directory:
+            with simulated_clock(clock):
+                inventory = portal.inventory(20)
+                page.delay_download(10 ** 6)
+                with self.assertRaises(LayoutChangedError) as caught:
+                    portal.download(inventory[0], Path(directory) / "download.bin")
+
+        self.assertEqual(
+            caught.exception.message, "invoice row download control is missing or ambiguous"
+        )
+        self.assertEqual(page.clicks.get("download", 0), 0)
+
+
+
+# ---- DL-XB-141-PORTAL-RESILIENCE-002: single dispatch on the login route ---- #
+#
+# The pre-auth route is where a duplicated dispatch is least recoverable: a
+# second semantics activation, entry click or submit can commit something the
+# portal has already accepted. These cases lag one surface at a time and prove
+# that recovery only ever re-checks readiness, never re-sends the action.
+
+
+class PortalLoginDispatchTests(unittest.TestCase):
+    """A lagging login route still dispatches each action exactly once."""
+
+    def attempt(self, page: FakePage) -> AppError | None:
+        """Run the committed `login()` against `page` on a simulated clock."""
+
+        portal = PlaywrightPortal(FakeConfig(), headed=False)
+        portal.page = page
+        old = {name: os.environ.get(name) for name in ("ENERGYGRID_USERNAME", "ENERGYGRID_PASSWORD")}
+        os.environ.update(runtime_credentials())
+        try:
+            with mock.patch.object(portal_module, "time", create=True) as clock:
+                clock.monotonic.side_effect = page.simulated_monotonic
+                portal.login()
+        except AppError as exc:
+            return exc
+        finally:
+            for name, value in old.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+        return None
+
+    def assert_waits_bounded(self, *locators: FakeLocator) -> None:
+        """A postcondition probe never inherits the page default timeout."""
+
+        for locator in locators:
+            for value in locator.wait_timeouts:
+                self.assertIsNotNone(value, "every postcondition wait carries an explicit timeout")
+                self.assertNotEqual(value, 0, "a zero timeout would mean waiting forever")
+                self.assertLessEqual(value, MAX_TRIAL_PROBE_MS)
+
+    def test_a_lagging_semantics_gate_is_dispatched_exactly_once(self) -> None:
+        absent = FakeLocator(count=0, label="absent_gate")
+        ready = FakeLocator(label="gate")
+        page = login_page(activations=[absent, absent, ready])
+
+        self.assertIsNone(self.attempt(page))
+        self.assertEqual(absent.dispatched, 0, "a gate that is not ready is never dispatched")
+        self.assertEqual(ready.dispatched, 1, "exactly one activation per login attempt")
+        self.assertTrue(page.waited_ms, "the lagging gate cost a bounded yield")
+
+    def test_a_placeholder_slow_to_detach_never_re_dispatches_activation(self) -> None:
+        activation = FakeLocator(label="gate")
+        stuck = FakeLocator(wait_error=synthetic_timeout(), label="stuck_placeholder")
+        gone = FakeLocator(label="placeholder")
+        page = login_page(activation=activation, placeholders=[stuck, stuck, gone])
+
+        self.assertIsNone(self.attempt(page))
+        self.assertEqual(activation.dispatched, 1, "a slow placeholder is waited out, not re-clicked")
+        self.assertEqual(stuck.waits, 2)
+        self.assert_waits_bounded(stuck, gone)
+
+    def test_a_placeholder_that_never_detaches_keeps_its_one_dispatch(self) -> None:
+        activation = FakeLocator(label="gate")
+        stuck = FakeLocator(wait_error=synthetic_timeout(), label="stuck_placeholder")
+        page = login_page(activation=activation, placeholders=[stuck])
+
+        error = self.attempt(page)
+        self.assertIsInstance(error, LayoutChangedError)
+        self.assertEqual(
+            cli.support_ref_for(error), "EG_LOGIN_SEMANTICS_PLACEHOLDER_REMAINS"
+        )
+        self.assertEqual(activation.dispatched, 1)
+        self.assertEqual(
+            stuck.waits,
+            len(portal_module.PORTAL_RECOVERY_ATTEMPTS_MS),
+            "the placeholder was re-probed at every checkpoint",
+        )
+        self.assert_waits_bounded(stuck)
+
+    def test_a_lagging_login_entry_is_clicked_exactly_once(self) -> None:
+        absent = FakeLocator(count=0, label="absent_entry")
+        ready = FakeLocator(label="entry")
+        page = login_page(entries=[absent, ready])
+
+        self.assertIsNone(self.attempt(page))
+        self.assertEqual(absent.clicks, 0)
+        self.assertEqual(ready.clicks, 1, "one real entry click, after one actionability proof")
+        self.assertEqual(ready.trial_clicks, 1)
+
+    def test_lagging_credential_fields_are_each_filled_once(self) -> None:
+        absent_username = FakeLocator(count=0, label="absent_username")
+        username = FakeLocator(label="username")
+        hidden_password = FakeLocator(visible=False, label="hidden_password")
+        password = FakeLocator(label="password")
+        page = login_page(
+            username_fields=[absent_username, username],
+            password_fields=[hidden_password, password],
+        )
+
+        self.assertIsNone(self.attempt(page))
+        self.assertEqual(absent_username.fills, 0)
+        self.assertEqual(username.fills, 1, "a credential value is never appended twice")
+        self.assertEqual(hidden_password.fills, 0)
+        self.assertEqual(password.fills, 1)
+
+    def test_a_delayed_billing_manager_postcondition_never_re_submits(self) -> None:
+        submit = FakeLocator(label="submit")
+        pending = FakeLocator(wait_error=synthetic_timeout(), label="pending_billing")
+        settled = FakeLocator(label="billing_manager")
+        page = login_page(submits=[submit], billing_managers=[pending, pending, settled])
+
+        self.assertIsNone(self.attempt(page))
+        self.assertEqual(submit.clicks, 1, "a slow post-login surface never re-submits the login")
+        self.assertEqual(pending.waits, 2)
+        self.assert_waits_bounded(pending, settled)
+
+    def test_a_billing_manager_that_never_appears_never_re_submits(self) -> None:
+        submit = FakeLocator(label="submit")
+        pending = FakeLocator(wait_error=synthetic_timeout(), label="pending_billing")
+        page = login_page(submits=[submit], billing_managers=[pending])
+
+        error = self.attempt(page)
+        self.assertIsInstance(error, LayoutChangedError)
+        self.assertEqual(error.message, "Billing Manager entry did not appear after login")
+        self.assertEqual(cli.support_ref_for(error), "EG_LOGIN_BILLING_MANAGER_WAIT_FAILED")
+        self.assertEqual(submit.clicks, 1, "a postcondition timeout never duplicates the submit")
+        self.assert_waits_bounded(pending)
+
+    def test_an_ambiguous_post_login_surface_never_re_submits(self) -> None:
+        """Two Billing Manager entries are re-checked, never acted on."""
+        submit = FakeLocator(label="submit")
+        ambiguous = FakeLocator(count=2, label="ambiguous_billing")
+        page = login_page(submits=[submit], billing_managers=[ambiguous])
+
+        error = self.attempt(page)
+        self.assertIsInstance(error, LayoutChangedError)
+        self.assertEqual(cli.support_ref_for(error), "EG_LOGIN_BILLING_MANAGER_WAIT_FAILED")
+        self.assertEqual(submit.clicks, 1)
+        self.assertEqual(ambiguous.waits, 0, "an ambiguous surface is never asked to wait")
 
 
 if __name__ == "__main__":

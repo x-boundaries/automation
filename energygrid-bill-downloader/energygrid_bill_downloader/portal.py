@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import time
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -15,26 +16,79 @@ from .errors import DependencyError, DownloadError, LayoutChangedError, LoginErr
 # keeps a proven pre-submit failure mapping to the same support reference.
 LOGIN_SUBMIT_STAGE = "login submission did not complete"
 
-# Bounded pre-submit recovery for the Flutter login route
-# (DL-XB-141-LOGIN-RECOVERY-001). The canonical Login control can be briefly
-# unresolvable while the login route settles, and a blocking action started
-# inside that window spends the whole page timeout instead of looking again.
-# The ladder increases, no single yield reaches _MAX_SUBMIT_RECOVERY_YIELD_MS,
-# and the sum stays inside _SUBMIT_RECOVERY_DEADLINE_SECONDS, so the worst
-# case is a bounded recovery rather than a multi-minute hold.
-_SUBMIT_RECOVERY_YIELDS_MS = (100, 200, 400, 800, 1600, 3200, 6400, 12800, 25600)
-_MAX_SUBMIT_RECOVERY_YIELD_MS = 30000
-_SUBMIT_RECOVERY_DEADLINE_SECONDS = 60.0
+# One shared bounded readiness and post-action settling contract for every
+# portal surface (DL-XB-141-PORTAL-RESILIENCE-002, superseding the login-only
+# ladder of DL-XB-141-LOGIN-RECOVERY-001). The portal is eventually consistent:
+# a control can be briefly unresolvable, ambiguous, hidden, disabled or
+# not-yet-actionable while a Flutter route settles, and a blocking action
+# started inside that window spends the whole page timeout instead of looking
+# again.
+#
+# The checkpoints are ABSOLUTE ELAPSED offsets, not additive sleeps: the first
+# look is immediate, so a healthy interaction pays nothing, and a later look
+# happens once that much time has passed since the recovery began. A probe that
+# already consumed a checkpoint therefore yields nothing extra.
+PORTAL_RECOVERY_CHECKPOINTS_MS = (250, 1000, 5000, 10000, 30000)
+PORTAL_RECOVERY_DEADLINE_SECONDS = 60.0
 
 # Every probe that can wait is bounded explicitly, and they share one cap so a
 # second waiting call cannot appear with a budget of its own. Without a timeout
-# argument a trial click or an enabled check inherits
-# `page.set_default_timeout()`, and `RuntimeConfig` allows
-# `timeout_seconds` up to MAX_TIMEOUT_SECONDS, so one probe could park for
-# minutes -- a monotonic deadline cannot interrupt a call that is already
-# blocking. The cap is deliberately small: the recovery is supposed to yield
-# and re-resolve, not sit inside a single Playwright wait.
-_MAX_SUBMIT_TRIAL_TIMEOUT_MS = 1000
+# argument a trial click, an enabled check or a `wait_for` inherits
+# `page.set_default_timeout()`, and `RuntimeConfig` allows `timeout_seconds` up
+# to MAX_TIMEOUT_SECONDS, so one probe could park for minutes -- a monotonic
+# deadline cannot interrupt a call that is already blocking. The cap is
+# deliberately small: recovery is supposed to yield and re-resolve, not sit
+# inside a single Playwright wait.
+MAX_PORTAL_PROBE_TIMEOUT_MS = 1000
+
+# Room for the bounded probes the final look will run, so that last fresh check
+# completes inside the hard deadline instead of straddling it.
+_PORTAL_FINAL_CHECK_MARGIN_MS = 2 * MAX_PORTAL_PROBE_TIMEOUT_MS
+PORTAL_RECOVERY_ATTEMPTS_MS = (
+    (0,)
+    + PORTAL_RECOVERY_CHECKPOINTS_MS
+    + (int(PORTAL_RECOVERY_DEADLINE_SECONDS * 1000) - _PORTAL_FINAL_CHECK_MARGIN_MS,)
+)
+
+# What a checkpoint observed. Only READY ends a recovery successfully; the rest
+# are transient inside the window and name the fail-closed message once the
+# deadline passes. UNRESOLVED is the exception: a locator that cannot be
+# resolved at all is drift, and drift never becomes correct by waiting.
+_PORTAL_READY = "ready"
+_PORTAL_ABSENT = "absent"
+_PORTAL_AMBIGUOUS = "ambiguous"
+_PORTAL_NOT_READY = "not ready"
+_PORTAL_UNRESOLVED = "unresolved"
+
+_PORTAL_FAILURE_SUFFIXES = {
+    _PORTAL_ABSENT: "did not appear",
+    _PORTAL_AMBIGUOUS: "is missing or ambiguous",
+    _PORTAL_NOT_READY: "is hidden or disabled",
+    _PORTAL_UNRESOLVED: "could not be resolved",
+}
+
+
+def _uniform_messages(text: str) -> dict[str, str]:
+    """Report one committed message whatever the recovery last observed."""
+
+    return {verdict: text for verdict in _PORTAL_FAILURE_SUFFIXES}
+
+
+class _ControlUnresolved(Exception):
+    """A locator that could not be resolved at all: drift, not lag."""
+
+    def __init__(self, cause: Exception) -> None:
+        super().__init__("portal control could not be resolved")
+        self.cause = cause
+
+
+class _PortalNotSettled(Exception):
+    """A bounded readiness or postcondition window that never materialised.
+
+    Raised instead of `LayoutChangedError` where the caller owns the
+    classification -- `login()` names the step that failed and lets a visible
+    alert outrank it -- so a recovery never pre-empts that decision.
+    """
 
 
 @dataclass(frozen=True)
@@ -91,6 +145,192 @@ class PlaywrightPortal:
         self.browser = None
         self.playwright = None
 
+    # ---- shared bounded recovery ---- #
+
+    def _probe_timeout_ms(self, remaining_ms: int) -> int:
+        """Bound one waiting Playwright call by the cap and by what is left."""
+
+        # Never zero: in Playwright a zero timeout means "wait forever", which
+        # is the opposite of what a bounded probe is for.
+        return max(1, min(remaining_ms, MAX_PORTAL_PROBE_TIMEOUT_MS))
+
+    def _recover(
+        self,
+        page: Any,
+        probe: Callable[[int], tuple[str, Any]],
+        description: str,
+        *,
+        messages: Mapping[str, str] | None = None,
+        classified: bool = True,
+    ) -> Any:
+        """Run `probe` at bounded elapsed checkpoints until it reports ready.
+
+        `probe` is handed the remaining budget and must only inspect: it may
+        never dispatch an externally meaningful action, because a recovery can
+        run it many times. One monotonic deadline covers the whole window, so a
+        surface that never settles fails closed rather than holding.
+        """
+
+        start = time.monotonic()
+        deadline = start + PORTAL_RECOVERY_DEADLINE_SECONDS
+        verdict = _PORTAL_ABSENT
+        for target_ms in PORTAL_RECOVERY_ATTEMPTS_MS:
+            remaining_ms = int((deadline - time.monotonic()) * 1000)
+            if remaining_ms <= 0:
+                break
+            pending_ms = min(target_ms - int((time.monotonic() - start) * 1000), remaining_ms)
+            if pending_ms > 0:
+                page.wait_for_timeout(pending_ms)
+                remaining_ms = int((deadline - time.monotonic()) * 1000)
+                if remaining_ms <= 0:
+                    break
+            try:
+                verdict, value = probe(remaining_ms)
+            except _ControlUnresolved as exc:
+                raise self._recovery_failure(
+                    description, messages, _PORTAL_UNRESOLVED, classified
+                ) from exc.cause
+            if verdict == _PORTAL_READY:
+                return value
+        raise self._recovery_failure(description, messages, verdict, classified)
+
+    @staticmethod
+    def _recovery_failure(
+        description: str,
+        messages: Mapping[str, str] | None,
+        verdict: str,
+        classified: bool,
+    ) -> Exception:
+        """Build the fail-closed error for a recovery that ran out of budget."""
+
+        text = (messages or {}).get(verdict) or f"{description} {_PORTAL_FAILURE_SUFFIXES[verdict]}"
+        return LayoutChangedError(text) if classified else _PortalNotSettled(text)
+
+    def _resolve_ready_control(
+        self,
+        page: Any,
+        locator_factory: Callable[[], Any],
+        description: str,
+        *,
+        require_enabled: bool = True,
+        require_trial_actionable: bool = False,
+        messages: Mapping[str, str] | None = None,
+        classified: bool = True,
+    ) -> Any:
+        """Return a freshly resolved control once it is proven interactable.
+
+        The factory -- not a locator object -- is what this takes, because the
+        failure being recovered from is a stale handle held across a long
+        auto-wait while a route is still settling. Every checkpoint therefore
+        builds a new locator and inspects it without starting a wait that could
+        swallow the whole page timeout.
+
+        More than one exact match is treated as transient, never as usable: it
+        is never interacted with, never narrowed with `.first`, and the
+        selector is never weakened. Ambiguity that survives the deadline is
+        drift and fails closed.
+        """
+
+        def probe(remaining_ms: int) -> tuple[str, Any]:
+            try:
+                locator = locator_factory()
+                count = locator.count()
+            except Exception as exc:
+                raise _ControlUnresolved(exc) from exc
+            if count == 0:
+                return _PORTAL_ABSENT, None
+            if count > 1:
+                return _PORTAL_AMBIGUOUS, None
+            try:
+                visible = locator.is_visible()
+            except Exception as exc:
+                raise _ControlUnresolved(exc) from exc
+            if not visible:
+                return _PORTAL_NOT_READY, None
+            if require_enabled and not self._probe_enabled(locator, remaining_ms):
+                return _PORTAL_NOT_READY, None
+            if require_trial_actionable and not self._probe_actionable(locator, remaining_ms):
+                return _PORTAL_NOT_READY, None
+            return _PORTAL_READY, locator
+
+        return self._recover(page, probe, description, messages=messages, classified=classified)
+
+    def _probe_enabled(self, locator: Any, remaining_ms: int) -> bool:
+        """Report enabled-ness without letting the check outlast the budget.
+
+        `locator.is_enabled(timeout=...)` is not `locator.is_visible()`: its
+        timeout is live and defaults to `page.set_default_timeout()`, so left
+        implicit it could hold a bounded recovery for minutes.
+        """
+
+        try:
+            return bool(locator.is_enabled(timeout=self._probe_timeout_ms(remaining_ms)))
+        except Exception as exc:
+            # Only a timeout is transient. Anything else is a real failure and
+            # must reach the caller unaltered rather than becoming a retry.
+            if not self._looks_like_timeout(exc):
+                raise
+            return False
+
+    def _probe_actionable(self, locator: Any, remaining_ms: int) -> bool:
+        """Prove Playwright can act on the control without acting on it."""
+
+        try:
+            locator.click(trial=True, timeout=self._probe_timeout_ms(remaining_ms))
+        except Exception as exc:
+            if not self._looks_like_timeout(exc):
+                raise
+            return False
+        return True
+
+    def _await_condition(
+        self,
+        page: Any,
+        condition: Callable[[int], bool],
+        description: str,
+        *,
+        messages: Mapping[str, str] | None = None,
+        classified: bool = True,
+    ) -> None:
+        """Settle a postcondition on the same ladder as control readiness.
+
+        This is what follows a single dispatched action: the expected next
+        state is waited for and re-resolved, and the action is never sent again
+        because the first transition looked slow.
+        """
+
+        def probe(remaining_ms: int) -> tuple[str, Any]:
+            return (_PORTAL_READY if condition(remaining_ms) else _PORTAL_ABSENT), None
+
+        self._recover(page, probe, description, messages=messages, classified=classified)
+
+    def _await_visible_control(
+        self,
+        page: Any,
+        locator_factory: Callable[[], Any],
+        description: str,
+        *,
+        messages: Mapping[str, str] | None = None,
+        classified: bool = True,
+    ) -> None:
+        """Settle on exactly one visible match, re-resolved each checkpoint."""
+
+        def condition(remaining_ms: int) -> bool:
+            locator = locator_factory()
+            if locator.count() != 1:
+                return False
+            try:
+                locator.wait_for(state="visible", timeout=self._probe_timeout_ms(remaining_ms))
+            except Exception:
+                return False
+            return True
+
+        self._await_condition(
+            page, condition, description, messages=messages, classified=classified
+        )
+
+    # ---- login ---- #
+
     def login(self) -> None:
         username = os.environ.get("ENERGYGRID_USERNAME")
         password = os.environ.get("ENERGYGRID_PASSWORD")
@@ -112,13 +352,13 @@ class PlaywrightPortal:
             stage_failure = "post-activation Login control click did not complete"
             login_entry.click()
             stage_failure = "login username entry did not complete"
-            page.get_by_label("Username", exact=True).fill(username)
+            self._fill_login_field(page, "Username", username)
             stage_failure = "login password entry did not complete"
-            page.get_by_label("Password", exact=True).fill(password)
+            self._fill_login_field(page, "Password", password)
             stage_failure = LOGIN_SUBMIT_STAGE
             self._submit_login(page)
             stage_failure = "Billing Manager entry did not appear after login"
-            page.get_by_role("link", name="Billing Manager", exact=True).wait_for(state="visible")
+            self._await_billing_manager(page)
         except LayoutChangedError:
             # A proven pre-auth contract failure must not be reclassified as a
             # credential rejection just because the page also renders an alert.
@@ -128,97 +368,57 @@ class PlaywrightPortal:
                 raise LoginError("portal rejected the login") from exc
             raise LayoutChangedError(stage_failure) from exc
 
+    def _fill_login_field(self, page: Any, label: str, value: str) -> None:
+        """Fill one exact labelled credential field after proving it ready.
+
+        Readiness is recovered; the fill is not. A `fill()` that raises may
+        already have committed part of its value, so it is dispatched once and
+        the failure goes to the caller's classification. The value is never
+        logged, echoed, or read back.
+        """
+
+        field = self._resolve_ready_control(
+            page,
+            lambda: page.get_by_label(label, exact=True),
+            f"login {label} field",
+            classified=False,
+        )
+        field.fill(value)
+
     def _submit_login(self, page: Any) -> None:
         """Click the canonical Login control exactly once, after proving it ready.
 
-        The selector never changes. What changes between attempts is the
-        locator object: the failure this recovers from is a stale handle held
-        across a long auto-wait while the login route is still settling, so
-        every attempt resolves a new one and inspects it without starting a
-        wait that could swallow the whole page timeout.
-
-        Exactly one normal click is ever dispatched. A submit that has already
-        been sent may have landed even if the call raises, so retrying it
-        could duplicate the submission; that failure goes to the caller's
-        classification instead.
+        The selector never changes, and there is no alternate or fallback
+        selector. Exactly one normal click is ever dispatched: a submit that
+        has already been sent may have landed even if the call raises, so
+        retrying it could duplicate the submission; that failure goes to the
+        caller's classification instead.
         """
 
-        deadline = time.monotonic() + _SUBMIT_RECOVERY_DEADLINE_SECONDS
-        attempt = 0
-        while True:
-            remaining_ms = int((deadline - time.monotonic()) * 1000)
-            if remaining_ms <= 0:
-                break
-            submit = page.get_by_role("button", name="Login", exact=True)
-            if self._submit_control_is_ready(submit, remaining_ms):
-                # Recomputed: the readiness check above can wait, so the trial
-                # must be bounded by what is left rather than by what was left
-                # before it ran.
-                remaining_ms = int((deadline - time.monotonic()) * 1000)
-                if remaining_ms <= 0:
-                    break
-                try:
-                    # Proves Playwright can act on the control without
-                    # submitting anything, so a control that is present but
-                    # not yet actionable is retried rather than blocked on.
-                    # The timeout is explicit: an inherited page default could
-                    # outlast the whole recovery budget on its own.
-                    submit.click(
-                        trial=True,
-                        timeout=min(remaining_ms, _MAX_SUBMIT_TRIAL_TIMEOUT_MS),
-                    )
-                except Exception as exc:
-                    # Only a timeout is transient here. Anything else is a real
-                    # failure and must reach the caller unaltered.
-                    if not self._looks_like_timeout(exc):
-                        raise
-                else:
-                    submit.click()
-                    return
-            if attempt >= len(_SUBMIT_RECOVERY_YIELDS_MS):
-                break
-            # Recomputed: the probe above consumed part of the same budget.
-            remaining_ms = int((deadline - time.monotonic()) * 1000)
-            if remaining_ms <= 0:
-                break
-            page.wait_for_timeout(
-                min(_SUBMIT_RECOVERY_YIELDS_MS[attempt], _MAX_SUBMIT_RECOVERY_YIELD_MS, remaining_ms)
-            )
-            attempt += 1
-        raise LayoutChangedError(LOGIN_SUBMIT_STAGE)
+        submit = self._resolve_ready_control(
+            page,
+            lambda: page.get_by_role("button", name="Login", exact=True),
+            "login submit control",
+            require_trial_actionable=True,
+            messages=_uniform_messages(LOGIN_SUBMIT_STAGE),
+        )
+        submit.click()
 
-    def _submit_control_is_ready(self, locator: Any, remaining_ms: int) -> bool:
-        """Report readiness without letting any check outlast the budget.
+    def _await_billing_manager(self, page: Any) -> None:
+        """Settle on the post-login surface without submitting anything again.
 
-        Ambiguity is drift, not lag: more than one exact match can never
-        become correct by waiting, so it fails closed on the spot rather than
-        consuming the recovery budget. Count and visibility are current-state
-        reads that return whatever is on the page right now.
-
-        The enabled check is the one that can wait: unlike `is_visible()`,
-        whose timeout option is ignored, `is_enabled()` takes a live timeout
-        that defaults to `page.set_default_timeout()`. Left implicit it would
-        inherit the configured page timeout and could hold the recovery for
-        minutes, so it is bounded here the same way the trial click is. A
-        control that is merely slow to report reads as not-yet-ready, which
-        sends the caller back to resolve a new locator.
+        The failure is left unclassified on purpose: `login()` owns the step
+        marker for this stage and lets a visible alert outrank it, so a slow
+        surface must not pre-empt a credential rejection.
         """
 
-        count = locator.count()
-        if count > 1:
-            raise LayoutChangedError(LOGIN_SUBMIT_STAGE)
-        if count == 0:
-            return False
-        if not locator.is_visible():
-            return False
-        try:
-            return bool(locator.is_enabled(timeout=min(remaining_ms, _MAX_SUBMIT_TRIAL_TIMEOUT_MS)))
-        except Exception as exc:
-            # Only a timeout is transient. Anything else is a real failure and
-            # must reach the caller unaltered rather than becoming a retry.
-            if not self._looks_like_timeout(exc):
-                raise
-            return False
+        self._await_visible_control(
+            page,
+            lambda: page.get_by_role("link", name="Billing Manager", exact=True),
+            "Billing Manager entry",
+            messages=_uniform_messages("Billing Manager control is missing or ambiguous"),
+            classified=False,
+        )
 
     def _enter_public_semantics(self, page: Any) -> Any:
         """Open the public Flutter semantics gate and return the Login entry.
@@ -231,49 +431,48 @@ class PlaywrightPortal:
         page being interacted with at all.
         """
 
-        activation = page.get_by_role("button", name="Enable accessibility", exact=True)
-        self._await_control(activation, "Flutter semantics activation control")
-        self._require_single_ready_control(activation, "Flutter semantics activation control")
+        activation = self._resolve_ready_control(
+            page,
+            lambda: page.get_by_role("button", name="Enable accessibility", exact=True),
+            "Flutter semantics activation control",
+        )
 
         # Exactly one activation per login attempt: no retry, no fallback
-        # activation mechanism, and no second dispatch on any path below.
+        # activation mechanism, and no second dispatch on any path below, not
+        # even when the placeholder is slow to detach.
         activation.dispatch_event("click")
 
-        try:
-            page.locator("flt-semantics-placeholder").wait_for(state="detached")
-        except Exception as exc:
-            raise LayoutChangedError(
+        self._await_condition(
+            page,
+            lambda remaining_ms: self._placeholder_detached(page, remaining_ms),
+            "Flutter semantics placeholder",
+            messages=_uniform_messages(
                 "Flutter semantics placeholder remained after activation"
-            ) from exc
+            ),
+        )
 
-        login_entry = page.get_by_role("button", name="Login", exact=True)
-        self._await_control(login_entry, "post-activation Login control")
-        self._require_single_ready_control(login_entry, "post-activation Login control")
-        return login_entry
+        return self._resolve_ready_control(
+            page,
+            lambda: page.get_by_role("button", name="Login", exact=True),
+            "post-activation Login control",
+            require_trial_actionable=True,
+        )
 
-    @staticmethod
-    def _await_control(locator: Any, description: str) -> None:
-        """Wait, within the configured page timeout, for at least one match."""
-
-        try:
-            locator.first.wait_for(state="attached")
-        except Exception as exc:
-            raise LayoutChangedError(f"{description} did not appear") from exc
-
-    @staticmethod
-    def _require_single_ready_control(locator: Any, description: str) -> None:
-        """Fail closed unless exactly one match is present, visible and enabled."""
+    def _placeholder_detached(self, page: Any, remaining_ms: int) -> bool:
+        """Report whether the semantics placeholder has gone, within one probe."""
 
         try:
-            count = locator.count()
-            # Short-circuits so an ambiguous match is never asked for state.
-            ready = count == 1 and locator.is_visible() and locator.is_enabled()
-        except Exception as exc:
-            raise LayoutChangedError(f"{description} could not be resolved") from exc
-        if count != 1:
-            raise LayoutChangedError(f"{description} is missing or ambiguous")
-        if not ready:
-            raise LayoutChangedError(f"{description} is hidden or disabled")
+            page.locator("flt-semantics-placeholder").wait_for(
+                state="detached", timeout=self._probe_timeout_ms(remaining_ms)
+            )
+        except Exception:
+            # Attachment is re-probed from a fresh locator each checkpoint, so
+            # any failure to observe detachment is simply "not yet"; the
+            # deadline is what turns persistence into a fail-closed.
+            return False
+        return True
+
+    # ---- inventory ---- #
 
     def inventory(self, safety_ceiling: int) -> list[BillRef]:
         page = self._require_page()
@@ -285,15 +484,7 @@ class PlaywrightPortal:
         seen_pages: set[str] = set()
         page_ordinal = 1
         while True:
-            list_container = page.get_by_test_id("invoice-list")
-            try:
-                if list_container.count() != 1:
-                    raise LayoutChangedError("invoice list container is missing or ambiguous")
-                list_container.wait_for(state="visible")
-            except Exception as exc:
-                if isinstance(exc, LayoutChangedError):
-                    raise
-                raise LayoutChangedError("invoice list container is missing") from exc
+            list_container = self._await_invoice_list(page)
             page_marker = self._page_marker(page, list_container)
             if page_marker in seen_pages:
                 raise LayoutChangedError("invoice pagination repeated a page")
@@ -320,26 +511,95 @@ class PlaywrightPortal:
                 if len(bills) > safety_ceiling:
                     raise LayoutChangedError("inventory safety ceiling exceeded")
 
-            next_button = page.get_by_role("button", name="Next page", exact=True)
-            if next_button.count() != 1:
-                raise LayoutChangedError("invoice pagination control is missing or ambiguous")
-            if next_button.is_disabled():
+            _control, disabled = self._resolve_pagination_control(
+                page, "invoice pagination control is missing or ambiguous"
+            )
+            if disabled:
+                # A disabled Next page is the committed end-of-inventory
+                # signal, not lag: the results are already confirmed
+                # post-search and this page's list is visible, so it is read
+                # once and trusted rather than waited out.
                 return bills
-            old_marker = page_marker
-            old_url = page.url
-            next_button.click()
-            try:
-                page.wait_for_function(
-                    """([selector, old_marker, old_url]) => {
-                        const list = document.querySelector(selector);
-                        const marker = list?.getAttribute('data-page') || window.location.href;
-                        return marker !== old_marker || window.location.href !== old_url;
-                    }""",
-                    arg=["[data-testid='invoice-list']", old_marker, old_url],
-                )
-            except Exception as exc:
-                raise LayoutChangedError("invoice pagination did not advance") from exc
+            self._advance_page(page, page_marker, page.url, "invoice pagination did not advance")
             page_ordinal += 1
+
+    def _await_invoice_list(self, page: Any) -> Any:
+        """Settle on the one visible invoice list container for this page."""
+
+        return self._resolve_ready_control(
+            page,
+            lambda: page.get_by_test_id("invoice-list"),
+            "invoice list container",
+            require_enabled=False,
+            messages={
+                _PORTAL_ABSENT: "invoice list container is missing",
+                _PORTAL_AMBIGUOUS: "invoice list container is missing or ambiguous",
+                _PORTAL_NOT_READY: "invoice list container is missing",
+                _PORTAL_UNRESOLVED: "invoice list container is missing",
+            },
+        )
+
+    def _resolve_pagination_control(self, page: Any, missing_message: str) -> tuple[Any, bool]:
+        """Return the unique settled Next-page control and whether it is disabled.
+
+        Enabled-ness is deliberately not part of readiness here, because a
+        disabled control is a legitimate answer rather than a lagging one.
+        """
+
+        control = self._resolve_ready_control(
+            page,
+            lambda: page.get_by_role("button", name="Next page", exact=True),
+            "invoice pagination control",
+            require_enabled=False,
+            messages=_uniform_messages(missing_message),
+        )
+        try:
+            disabled = bool(control.is_disabled(timeout=MAX_PORTAL_PROBE_TIMEOUT_MS))
+        except Exception as exc:
+            raise LayoutChangedError("invoice pagination control state could not be read") from exc
+        return control, disabled
+
+    def _advance_page(self, page: Any, old_marker: str, old_url: str, failure: str) -> None:
+        """Click Next page exactly once and settle on the advanced page.
+
+        The click is proven actionable on a freshly resolved control first, and
+        it is never sent again: advancement that looks slow is waited for, not
+        re-requested, because a second click would skip a page of inventory.
+        """
+
+        control = self._resolve_ready_control(
+            page,
+            lambda: page.get_by_role("button", name="Next page", exact=True),
+            "invoice pagination control",
+            require_trial_actionable=True,
+            messages=_uniform_messages(failure),
+        )
+        control.click()
+        self._await_condition(
+            page,
+            lambda remaining_ms: self._page_advanced(page, old_marker, old_url, remaining_ms),
+            "invoice pagination",
+            messages=_uniform_messages(failure),
+        )
+
+    def _page_advanced(self, page: Any, old_marker: str, old_url: str, remaining_ms: int) -> bool:
+        """Report whether the marker or the URL has moved on, within one probe."""
+
+        try:
+            page.wait_for_function(
+                """([selector, old_marker, old_url]) => {
+                    const list = document.querySelector(selector);
+                    const marker = list?.getAttribute('data-page') || window.location.href;
+                    return marker !== old_marker || window.location.href !== old_url;
+                }""",
+                arg=["[data-testid='invoice-list']", old_marker, old_url],
+                timeout=self._probe_timeout_ms(remaining_ms),
+            )
+        except Exception:
+            return False
+        return True
+
+    # ---- download ---- #
 
     def download(self, bill: BillRef, destination: Path) -> str:
         page = self._require_page()
@@ -356,11 +616,20 @@ class PlaywrightPortal:
                     matching_rows.append(row)
             if len(matching_rows) != 1:
                 raise LayoutChangedError("invoice row identity is missing or ambiguous")
-            download_controls = matching_rows[0].get_by_role("button", name="Download", exact=True)
-            if download_controls.count() != 1:
-                raise LayoutChangedError("invoice row download control is missing or ambiguous")
+            # Only the control is re-resolved, not the row: the row's identity
+            # has already been proven, and recovering it too could settle on a
+            # different row than the one that was proven.
+            download_control = self._resolve_ready_control(
+                page,
+                lambda: matching_rows[0].get_by_role("button", name="Download", exact=True),
+                "invoice row download control",
+                require_trial_actionable=True,
+                messages=_uniform_messages("invoice row download control is missing or ambiguous"),
+            )
             with page.expect_download() as download_info:
-                download_controls.click()
+                # Exactly one real download dispatch per attempt. An ambiguous
+                # or timed-out outcome is classified below, never re-clicked.
+                download_control.click()
             download = download_info.value
             if download.failure():
                 raise DownloadError("browser download failed")
@@ -376,24 +645,47 @@ class PlaywrightPortal:
                 raise DownloadError("browser download timed out") from exc
             raise DownloadError("browser download could not be completed") from exc
 
+    # ---- verified results route ---- #
+
     def _open_verified_results(self, entry_url: str | None = None) -> Any:
         page = self._require_page()
         try:
             if entry_url is not None:
                 page.goto(entry_url, wait_until="domcontentloaded")
-            account_control = page.get_by_label("Tenant/account", exact=True)
-            if account_control.count() != 1:
-                billing_manager = page.get_by_role("link", name="Billing Manager", exact=True)
-                if billing_manager.count() != 1:
-                    raise LayoutChangedError("Billing Manager control is missing or ambiguous")
+
+            def account_locator() -> Any:
+                return page.get_by_label("Tenant/account", exact=True)
+
+            if account_locator().count() != 1:
+                # Each click is dispatched once, and the readiness recovery for
+                # the next surface is that click's postcondition: Billing
+                # Manager settles into EB Bill, and EB Bill into the
+                # tenant/account selector.
+                billing_manager = self._resolve_ready_control(
+                    page,
+                    lambda: page.get_by_role("link", name="Billing Manager", exact=True),
+                    "Billing Manager control",
+                    require_trial_actionable=True,
+                    messages=_uniform_messages("Billing Manager control is missing or ambiguous"),
+                )
                 billing_manager.click()
-                eb_bill = page.get_by_role("link", name="EB Bill", exact=True)
-                if eb_bill.count() != 1:
-                    raise LayoutChangedError("EB Bill control is missing or ambiguous")
+                eb_bill = self._resolve_ready_control(
+                    page,
+                    lambda: page.get_by_role("link", name="EB Bill", exact=True),
+                    "EB Bill control",
+                    require_trial_actionable=True,
+                    messages=_uniform_messages("EB Bill control is missing or ambiguous"),
+                )
                 eb_bill.click()
-                account_control = page.get_by_label("Tenant/account", exact=True)
-            if account_control.count() != 1:
-                raise LayoutChangedError("tenant/account selector is missing or ambiguous")
+            account_control = self._resolve_ready_control(
+                page,
+                account_locator,
+                "tenant/account selector",
+                messages=_uniform_messages("tenant/account selector is missing or ambiguous"),
+            )
+            # Account identity is a configuration contract, not a timing
+            # question: exactly one configured option, a stable option value and
+            # a matching read-back all stay terminal on failure.
             options = account_control.locator("option")
             option_texts = options.all_text_contents()
             matches = [index for index, text in enumerate(option_texts) if text.strip() == self.config.account_identity]
@@ -405,29 +697,47 @@ class PlaywrightPortal:
             account_control.select_option(value=option_value)
             self._verify_account_binding(page, account_control)
 
-            search = page.get_by_role("button", name="Search", exact=True)
-            if search.count() != 1:
-                raise LayoutChangedError("Search control is missing or ambiguous")
-            search.click()
-            state = page.get_by_test_id("invoice-results-state")
-            if state.count() != 1:
-                raise LayoutChangedError("invoice result state marker is missing or ambiguous")
-            page.wait_for_function(
-                "selector => document.querySelector(selector)?.getAttribute('data-state') === 'post-search'",
-                arg="[data-testid='invoice-results-state']",
+            search = self._resolve_ready_control(
+                page,
+                lambda: page.get_by_role("button", name="Search", exact=True),
+                "Search control",
+                require_trial_actionable=True,
+                messages=_uniform_messages("Search control is missing or ambiguous"),
             )
-            if state.get_attribute("data-state") != "post-search":
-                raise LayoutChangedError("invoice results are not confirmed post-search")
+            # Exactly one Search dispatch. A slow result is settled for below,
+            # never re-requested: an empty surface before the confirmed
+            # post-search state is not an answer about invoices at all.
+            search.click()
+            self._await_post_search_state(page)
             self._verify_account_binding(page, account_control)
-            list_container = page.get_by_test_id("invoice-list")
-            if list_container.count() != 1:
-                raise LayoutChangedError("invoice list container is missing or ambiguous")
-            list_container.wait_for(state="visible")
-            return list_container
+            return self._await_invoice_list(page)
         except LayoutChangedError:
             raise
         except Exception as exc:
             raise LayoutChangedError("tenant/account search result contract changed") from exc
+
+    def _await_post_search_state(self, page: Any) -> None:
+        """Settle on the confirmed post-search result state after one Search."""
+
+        def probe(remaining_ms: int) -> tuple[str, Any]:
+            state = page.get_by_test_id("invoice-results-state")
+            if state.count() != 1:
+                return _PORTAL_AMBIGUOUS, None
+            if state.get_attribute("data-state") != "post-search":
+                return _PORTAL_NOT_READY, None
+            return _PORTAL_READY, None
+
+        self._recover(
+            page,
+            probe,
+            "invoice result state marker",
+            messages={
+                _PORTAL_ABSENT: "invoice result state marker is missing or ambiguous",
+                _PORTAL_AMBIGUOUS: "invoice result state marker is missing or ambiguous",
+                _PORTAL_NOT_READY: "invoice results are not confirmed post-search",
+                _PORTAL_UNRESOLVED: "invoice result state marker is missing or ambiguous",
+            },
+        )
 
     def _verify_account_binding(self, page: Any, account_control: Any) -> None:
         checked = account_control.locator("option:checked")
@@ -452,30 +762,18 @@ class PlaywrightPortal:
         page_ordinal, expected_marker = binding
         if page_ordinal < 1:
             raise LayoutChangedError("invoice page binding has an invalid ordinal")
-        list_container = page.get_by_test_id("invoice-list")
-        if list_container.count() != 1:
-            raise LayoutChangedError("invoice list container is missing or ambiguous")
+        list_container = self._await_invoice_list(page)
         current_marker = self._page_marker(page, list_container)
         seen_markers = {current_marker}
         for _ in range(1, page_ordinal):
-            next_button = page.get_by_role("button", name="Next page", exact=True)
-            if next_button.count() != 1 or next_button.is_disabled():
+            _control, disabled = self._resolve_pagination_control(
+                page, "invoice page binding cannot be replayed"
+            )
+            if disabled:
                 raise LayoutChangedError("invoice page binding cannot be replayed")
             old_marker = current_marker
-            old_url = page.url
-            next_button.click()
-            try:
-                page.wait_for_function(
-                    """([selector, old_marker, old_url]) => {
-                        const list = document.querySelector(selector);
-                        const marker = list?.getAttribute('data-page') || window.location.href;
-                        return marker !== old_marker || window.location.href !== old_url;
-                    }""",
-                    arg=["[data-testid='invoice-list']", old_marker, old_url],
-                )
-            except Exception as exc:
-                raise LayoutChangedError("invoice page replay did not advance") from exc
-            list_container = page.get_by_test_id("invoice-list")
+            self._advance_page(page, old_marker, page.url, "invoice page replay did not advance")
+            list_container = self._await_invoice_list(page)
             current_marker = self._page_marker(page, list_container)
             if current_marker == old_marker or current_marker in seen_markers:
                 raise LayoutChangedError("invoice page replay repeated or lost its marker")
