@@ -1922,7 +1922,14 @@ class _AccountControl:
 
 
 class _StateMarker:
-    """The result-state marker, which reports pre-search until it settles."""
+    """The result-state marker, which reports pre-search until it settles.
+
+    `get_attribute` auto-waits in Playwright, so the fake takes the timeout the
+    production probe must pass and records it separately from every other
+    probe. A stalled read is charged the timeout it was actually given, which is
+    what makes an omitted argument cost the whole page default instead of
+    nothing.
+    """
 
     def __init__(self, page: "FakeResultsPage") -> None:
         self._page = page
@@ -1930,8 +1937,16 @@ class _StateMarker:
     def count(self) -> int:
         return 1
 
-    def get_attribute(self, name: str) -> str | None:
+    def get_attribute(self, name: str, timeout: int | None = None) -> str | None:
         assert name == "data-state", name
+        self._page.state_attribute_timeouts.append(timeout)
+        self._page.probe_timeouts.append(timeout)
+        if self._page.state_attribute_error is not None:
+            raise self._page.state_attribute_error
+        if self._page.state_attribute_stalls > 0:
+            self._page.state_attribute_stalls -= 1
+            self._page.clock.charge_probe(timeout)
+            raise synthetic_timeout()
         if self._page.post_search_pending > 0:
             self._page.post_search_pending -= 1
             return "pre-search"
@@ -2033,6 +2048,8 @@ class FakeResultsPage:
         list_delay: int = 0,
         advance_delay: int = 0,
         download_delay: int = 0,
+        state_attribute_stalls: int = 0,
+        state_attribute_error: Exception | None = None,
         clock: RecoveryClock | None = None,
     ) -> None:
         self.clock = clock or RecoveryClock()
@@ -2047,6 +2064,8 @@ class FakeResultsPage:
         self.list_delay = list_delay
         self.advance_delay = advance_delay
         self.download_delay = download_delay
+        self.state_attribute_stalls = state_attribute_stalls
+        self.state_attribute_error = state_attribute_error
         self.route = "app"
         self.page_index = 0
         self.searched = False
@@ -2056,6 +2075,10 @@ class FakeResultsPage:
         self.clicks: dict[str, int] = {}
         self.trial_clicks: dict[str, int] = {}
         self.probe_timeouts: list[int | None] = []
+        # Kept apart from `probe_timeouts` so a case can require the state
+        # marker's own attribute read to be bounded, rather than passing
+        # because some unrelated probe happened to be.
+        self.state_attribute_timeouts: list[int | None] = []
         self.events: list[str] = []
         self.rows_read_before_search = False
         self._advance_after = 0
@@ -2163,6 +2186,7 @@ class FakeResultsPage:
             empty = not (self.searched and self.pages[self.page_index])
             return _ResultsControl(self, "invoice-list-empty", present=empty, visible=empty)
         if test_id == "invoice-results-state":
+            self.bump("results_state")
             return _StateMarker(self)
         if test_id == "selected-account":
             return _TextMarker(self.selected_account)
@@ -2207,6 +2231,39 @@ class PortalResultsSettlingTests(unittest.TestCase):
             self.assertIsNotNone(value, "no probe may inherit the page default")
             self.assertNotEqual(value, 0, "a zero timeout would mean waiting forever")
             self.assertLessEqual(value, MAX_TRIAL_PROBE_MS)
+
+    def assert_state_attribute_bounded(self, page: FakeResultsPage) -> None:
+        """The state marker's own attribute read is explicitly bounded.
+
+        Asserted against the state-marker evidence specifically, so dropping
+        the timeout from that one call fails here even though other probes on
+        the route are still bounded.
+        """
+
+        self.assertTrue(
+            page.state_attribute_timeouts, "the state marker must actually be read"
+        )
+        for value in page.state_attribute_timeouts:
+            self.assertIsNotNone(
+                value, "the attribute read may not inherit the page default"
+            )
+            self.assertNotEqual(value, 0, "a zero timeout would mean waiting forever")
+            self.assertLessEqual(value, MAX_TRIAL_PROBE_MS)
+
+    def assert_charged_probes_fit_the_ceiling(self, clock: RecoveryClock) -> None:
+        """No charged probe outlasted the budget remaining when it started."""
+
+        elapsed = 0
+        for kind, cost in clock.ledger:
+            if kind == "probe":
+                self.assertLessEqual(cost, MAX_TRIAL_PROBE_MS)
+                self.assertLessEqual(
+                    cost,
+                    RECOVERY_CEILING_MS - elapsed,
+                    "a probe may not outlast the remaining recovery budget",
+                )
+            elapsed += cost
+        self.assertLessEqual(elapsed, RECOVERY_CEILING_MS)
 
     def test_the_owner_confirmed_downstream_sequence_is_preserved(self) -> None:
         """Billing Manager, EB Bill, account, Search, and only then invoices."""
@@ -2326,6 +2383,76 @@ class PortalResultsSettlingTests(unittest.TestCase):
             self.assertEqual(portal.inventory(20), [])
         self.assertEqual(page.clicks["search"], 1)
         self.assertFalse(page.rows_read_before_search)
+
+    def test_a_stalled_post_search_attribute_read_is_recovered(self) -> None:
+        """A marker that detaches mid-read is lag, and is re-read afresh.
+
+        `count()` can see exactly one marker and the surface can still rerender
+        before the attribute is read, which is when a Playwright attribute read
+        starts waiting. That wait is bounded, so the checkpoint ends and the
+        next one resolves the marker again.
+        """
+        portal, page, clock = self.route(state_attribute_stalls=2)
+        with simulated_clock(clock):
+            inventory = portal.inventory(20)
+
+        self.assertEqual([bill.filename for bill in inventory], ["2026-01-01_synthetic.pdf"])
+        self.assertEqual(page.clicks["search"], 1, "a stalled read never re-searches")
+        self.assertGreaterEqual(
+            page.looks["results_state"], 3, "each read resolved a fresh marker"
+        )
+        self.assertEqual(len(page.state_attribute_timeouts), 3)
+        self.assert_state_attribute_bounded(page)
+        self.assert_charged_probes_fit_the_ceiling(clock)
+
+    def test_a_post_search_attribute_read_cannot_extend_the_shared_window(self) -> None:
+        """No attribute read may inherit `page.set_default_timeout()`.
+
+        The simulated clock charges a stalled read exactly the timeout it was
+        given, so an unbounded one would be charged the 300 s page default and
+        blow the ceiling on its first checkpoint instead of ending inside it.
+        """
+        portal, page, clock = self.route(state_attribute_stalls=10 ** 6)
+        with simulated_clock(clock):
+            with self.assertRaises(LayoutChangedError) as caught:
+                portal.inventory(20)
+
+        self.assertEqual(caught.exception.message, "invoice results are not confirmed post-search")
+        self.assertEqual(page.clicks["search"], 1, "a deadline is never a second Search")
+        self.assertEqual(
+            len(page.state_attribute_timeouts),
+            len(portal_module.PORTAL_RECOVERY_ATTEMPTS_MS),
+            "the marker was re-read at every checkpoint",
+        )
+        self.assert_state_attribute_bounded(page)
+        self.assert_charged_probes_fit_the_ceiling(clock)
+
+    def test_a_non_timeout_post_search_attribute_failure_is_terminal(self) -> None:
+        """A structural read failure is not the lag this recovery waits for."""
+        portal, page, clock = self.route(
+            state_attribute_error=RuntimeError("synthetic structural failure")
+        )
+        with simulated_clock(clock):
+            with self.assertRaises(LayoutChangedError) as caught:
+                portal.inventory(20)
+
+        self.assertEqual(
+            caught.exception.message, "tenant/account search result contract changed"
+        )
+        self.assertEqual(
+            len(page.state_attribute_timeouts), 1, "a real failure is not re-probed"
+        )
+        self.assertEqual(page.clicks["search"], 1, "a real failure never re-searches")
+        self.assertEqual(clock.yields, [], "a real failure is not waited out")
+
+    def test_the_post_search_attribute_read_carries_its_own_timeout(self) -> None:
+        """The bound is asserted on this read, not on the route in general."""
+        portal, page, clock = self.route()
+        with simulated_clock(clock):
+            portal.inventory(20)
+
+        self.assert_state_attribute_bounded(page)
+        self.assertEqual(len(page.state_attribute_timeouts), 1, "a settled marker is read once")
 
     def test_a_delayed_download_control_is_dispatched_exactly_once(self) -> None:
         portal, page, clock = self.route()

@@ -721,7 +721,7 @@ class PlaywrightPortal:
             state = page.get_by_test_id("invoice-results-state")
             if state.count() != 1:
                 return _PORTAL_AMBIGUOUS, None
-            if state.get_attribute("data-state") != "post-search":
+            if self._probe_result_state(state, remaining_ms) != "post-search":
                 return _PORTAL_NOT_READY, None
             return _PORTAL_READY, None
 
@@ -736,6 +736,29 @@ class PlaywrightPortal:
                 _PORTAL_UNRESOLVED: "invoice result state marker is missing or ambiguous",
             },
         )
+
+    def _probe_result_state(self, state: Any, remaining_ms: int) -> str | None:
+        """Read the result-state marker without outlasting the shared budget.
+
+        `locator.get_attribute()` auto-waits, so left implicit it inherits
+        `page.set_default_timeout()` -- and the marker can detach between the
+        count above and this read while the surface rerenders, which is exactly
+        when that wait would start. A blocking call the monotonic deadline
+        cannot interrupt is what would make the ceiling nominal rather than
+        hard, so this read is bounded like every other probe.
+        """
+
+        try:
+            return state.get_attribute(
+                "data-state", timeout=self._probe_timeout_ms(remaining_ms)
+            )
+        except Exception as exc:
+            # Only a timeout is the rerender lag this recovery exists for.
+            # Anything else is a real failure and must reach the caller
+            # unaltered rather than becoming another checkpoint.
+            if not self._looks_like_timeout(exc):
+                raise
+            return None
 
     def _verify_account_binding(self, page: Any, account_control: Any) -> None:
         checked = account_control.locator("option:checked")
