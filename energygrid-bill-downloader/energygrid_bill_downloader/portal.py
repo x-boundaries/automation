@@ -26,6 +26,14 @@ _SUBMIT_RECOVERY_YIELDS_MS = (100, 200, 400, 800, 1600, 3200, 6400, 12800, 25600
 _MAX_SUBMIT_RECOVERY_YIELD_MS = 30000
 _SUBMIT_RECOVERY_DEADLINE_SECONDS = 60.0
 
+# Every actionability probe is bounded explicitly. Without a timeout argument a
+# trial click inherits `page.set_default_timeout()`, and `RuntimeConfig` allows
+# `timeout_seconds` up to MAX_TIMEOUT_SECONDS, so one probe could park for
+# minutes -- a monotonic deadline cannot interrupt a call that is already
+# blocking. The cap is deliberately small: the recovery is supposed to yield
+# and re-resolve, not sit inside a single Playwright wait.
+_MAX_SUBMIT_TRIAL_TIMEOUT_MS = 1000
+
 
 @dataclass(frozen=True)
 class BillRef:
@@ -136,13 +144,21 @@ class PlaywrightPortal:
         deadline = time.monotonic() + _SUBMIT_RECOVERY_DEADLINE_SECONDS
         attempt = 0
         while True:
+            remaining_ms = int((deadline - time.monotonic()) * 1000)
+            if remaining_ms <= 0:
+                break
             submit = page.get_by_role("button", name="Login", exact=True)
             if self._submit_control_is_ready(submit):
                 try:
                     # Proves Playwright can act on the control without
                     # submitting anything, so a control that is present but
                     # not yet actionable is retried rather than blocked on.
-                    submit.click(trial=True)
+                    # The timeout is explicit: an inherited page default could
+                    # outlast the whole recovery budget on its own.
+                    submit.click(
+                        trial=True,
+                        timeout=min(remaining_ms, _MAX_SUBMIT_TRIAL_TIMEOUT_MS),
+                    )
                 except Exception as exc:
                     # Only a timeout is transient here. Anything else is a real
                     # failure and must reach the caller unaltered.
@@ -153,6 +169,7 @@ class PlaywrightPortal:
                     return
             if attempt >= len(_SUBMIT_RECOVERY_YIELDS_MS):
                 break
+            # Recomputed: the probe above consumed part of the same budget.
             remaining_ms = int((deadline - time.monotonic()) * 1000)
             if remaining_ms <= 0:
                 break

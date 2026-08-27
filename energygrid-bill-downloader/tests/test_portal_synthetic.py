@@ -496,9 +496,11 @@ class FakeLocator:
         self._fill_error = fill_error
         self._journal = journal
         self._label = label
+        self._clock: "FakePage | None" = None
         self.dispatched = 0
         self.clicks = 0
         self.trial_clicks = 0
+        self.trial_timeouts: list[int | None] = []
         self.fills = 0
         self.waits = 0
 
@@ -533,18 +535,28 @@ class FakeLocator:
         if self._dispatch_error is not None:
             raise self._dispatch_error
 
-    def click(self, trial: bool = False) -> None:
+    def click(self, trial: bool = False, timeout: int | None = None) -> None:
         """Only a normal click submits; a trial click proves actionability.
 
         The two failure hooks are separate so a transient actionability
         timeout can be modelled without also breaking the one real submit,
         and so a case that breaks the real submit is not intercepted by the
         trial that precedes it.
+
+        A trial that fails is charged its whole budget against the clock,
+        which is the worst case and the only one worth bounding. A trial with
+        no explicit timeout is charged the page default instead -- that is
+        exactly what an unbounded probe inherits, and the deadline cannot
+        interrupt a Playwright call that is already blocking.
         """
         if trial:
             self.trial_clicks += 1
+            self.trial_timeouts.append(timeout)
             self._record("click_trial")
             if self._trial_click_error is not None:
+                if self._clock is not None:
+                    spent = timeout if timeout is not None else self._clock.default_timeout_ms
+                    self._clock.charge_probe_ms(spent)
                 raise self._trial_click_error
             return
         self.clicks += 1
@@ -584,6 +596,7 @@ class FakePage:
         password_field: FakeLocator | None = None,
         billing_manager: FakeLocator | None = None,
         journal: list[str] | None = None,
+        default_timeout_ms: int = 5_000,
     ) -> None:
         self.activation = activation
         self.placeholder = placeholder
@@ -603,7 +616,18 @@ class FakePage:
         self.goto_calls = 0
         self.login_lookups = 0
         self.alert_lookups = 0
+        # What `page.set_default_timeout()` would have installed. An
+        # unbounded call inherits it, so it is what a missing explicit
+        # timeout costs.
+        self.default_timeout_ms = default_timeout_ms
         self.waited_ms: list[int] = []
+        # Every simulated cost in the order it was incurred, so a case can
+        # prove a probe never outlasted the budget remaining at that moment.
+        self.ledger: list[tuple[str, int]] = []
+        for locator in self.submits or ():
+            locator._clock = self
+        if self.submit is not None:
+            self.submit._clock = self
 
     def goto(self, url: str, wait_until: str | None = None) -> None:
         self.goto_calls += 1
@@ -632,17 +656,27 @@ class FakePage:
     def wait_for_timeout(self, milliseconds: int) -> None:
         """Record a browser-event-loop yield instead of spending the time."""
         self.waited_ms.append(int(milliseconds))
+        self.ledger.append(("yield", int(milliseconds)))
         if self.journal is not None:
             self.journal.append("page:wait_for_timeout")
 
+    def charge_probe_ms(self, milliseconds: int) -> None:
+        """Charge a bounded actionability probe against the same clock."""
+        self.ledger.append(("probe", int(milliseconds)))
+
+    def simulated_elapsed_ms(self) -> int:
+        """Total simulated recovery cost: yields and probes alike."""
+        return sum(cost for _kind, cost in self.ledger)
+
     def simulated_monotonic(self) -> float:
-        """A clock that advances only by the yields this page was asked for.
+        """A clock that advances only by what this page was actually asked to spend.
 
         Patched over `portal.time.monotonic`, this makes a deadline-bounded
         loop terminate deterministically and lets a test assert the simulated
-        elapsed recovery without any real waiting.
+        elapsed recovery without any real waiting. Probes count as well as
+        yields, so a probe that parks cannot be free.
         """
-        return sum(self.waited_ms) / 1000.0
+        return self.simulated_elapsed_ms() / 1000.0
 
     def locator(self, selector: str):
         assert selector == "flt-semantics-placeholder", selector
@@ -998,6 +1032,12 @@ def synthetic_timeout() -> SyntheticTimeoutError:
     return SyntheticTimeoutError("Timeout 30000ms exceeded")
 
 
+# Asserted independently of the production constants, so a case fails if the
+# committed ceiling or per-probe cap is widened rather than silently tracking it.
+RECOVERY_CEILING_MS = 60_000
+MAX_TRIAL_PROBE_MS = 1_000
+
+
 class LoginSubmitRecoveryTests(unittest.TestCase):
     """Bounded pre-submit recovery for the Flutter login route (#141, G3).
 
@@ -1119,6 +1159,63 @@ class LoginSubmitRecoveryTests(unittest.TestCase):
         error = self.attempt_login(page)
         self.assertIsInstance(error, LoginError)
         self.assertEqual(cli.support_ref_for(error), "EG_LOGIN_PORTAL_REJECTED")
+
+    def test_a_long_page_timeout_cannot_extend_the_bounded_recovery(self) -> None:
+        """A trial probe must not inherit `page.set_default_timeout()`.
+
+        `RuntimeConfig` permits `timeout_seconds` up to `MAX_TIMEOUT_SECONDS`,
+        so an unbounded probe can park for minutes, and the monotonic deadline
+        cannot interrupt a Playwright call that is already blocking. Each
+        probe therefore carries its own small explicit timeout and is charged
+        against the same ceiling as the yields.
+        """
+        probe = FakeLocator(trial_click_error=synthetic_timeout(), label="probe")
+        page = login_page(submits=[probe], default_timeout_ms=300_000)
+
+        error = self.attempt_login(page)
+        self.assertIsInstance(error, LayoutChangedError)
+        self.assert_submit_stage(error)
+
+        self.assertTrue(probe.trial_timeouts, "the actionability probe must actually run")
+        self.assertTrue(
+            all(value is not None for value in probe.trial_timeouts),
+            "every trial click must carry an explicit timeout",
+        )
+        self.assertLessEqual(
+            max(probe.trial_timeouts),
+            MAX_TRIAL_PROBE_MS,
+            "a probe stays far below any configured page default",
+        )
+        self.assert_within_budget(page)
+        self.assertGreater(page.login_lookups, 3, "each probe used a freshly resolved locator")
+        self.assertEqual(probe.clicks, 0, "recovery exhausted, so nothing was submitted")
+
+    def test_a_bounded_probe_that_later_succeeds_still_submits_exactly_once(self) -> None:
+        """Bounding the probe must not cost the recovery its one real submit."""
+        slow = FakeLocator(trial_click_error=synthetic_timeout(), label="slow")
+        ready = FakeLocator(label="ready")
+        page = login_page(submits=[slow, ready], default_timeout_ms=300_000)
+
+        self.assertIsNone(self.attempt_login(page))
+        self.assertEqual(slow.clicks, 0, "a control that never proved actionable is not submitted")
+        self.assertEqual(ready.clicks, 1)
+        self.assertLessEqual(max(slow.trial_timeouts), MAX_TRIAL_PROBE_MS)
+        self.assert_within_budget(page)
+
+    def assert_within_budget(self, page: FakePage) -> None:
+        """No probe outlasts the budget left when it started, nor the ceiling."""
+        elapsed = 0
+        for kind, cost in page.ledger:
+            if kind == "probe":
+                self.assertLessEqual(
+                    cost,
+                    RECOVERY_CEILING_MS - elapsed,
+                    "a probe may not outlast the remaining recovery budget",
+                )
+            elapsed += cost
+        self.assertLessEqual(
+            elapsed, RECOVERY_CEILING_MS, "probes and yields share one hard ceiling"
+        )
 
     def assert_submit_stage(self, error: AppError) -> None:
         """The submit stage keeps its committed marker and its reference."""
