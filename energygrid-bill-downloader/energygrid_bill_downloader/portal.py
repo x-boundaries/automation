@@ -1,12 +1,40 @@
 from __future__ import annotations
 
 import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from .config import RuntimeConfig
 from .errors import DependencyError, DownloadError, LayoutChangedError, LoginError
+
+
+# The fixed marker for the login submit stage. Defined once so the recovery
+# below and the step marker in `login()` can never drift apart, which is what
+# keeps a proven pre-submit failure mapping to the same support reference.
+LOGIN_SUBMIT_STAGE = "login submission did not complete"
+
+# Bounded pre-submit recovery for the Flutter login route
+# (DL-XB-141-LOGIN-RECOVERY-001). The canonical Login control can be briefly
+# unresolvable while the login route settles, and a blocking action started
+# inside that window spends the whole page timeout instead of looking again.
+# The ladder increases, no single yield reaches _MAX_SUBMIT_RECOVERY_YIELD_MS,
+# and the sum stays inside _SUBMIT_RECOVERY_DEADLINE_SECONDS, so the worst
+# case is a bounded recovery rather than a multi-minute hold.
+_SUBMIT_RECOVERY_YIELDS_MS = (100, 200, 400, 800, 1600, 3200, 6400, 12800, 25600)
+_MAX_SUBMIT_RECOVERY_YIELD_MS = 30000
+_SUBMIT_RECOVERY_DEADLINE_SECONDS = 60.0
+
+# Every probe that can wait is bounded explicitly, and they share one cap so a
+# second waiting call cannot appear with a budget of its own. Without a timeout
+# argument a trial click or an enabled check inherits
+# `page.set_default_timeout()`, and `RuntimeConfig` allows
+# `timeout_seconds` up to MAX_TIMEOUT_SECONDS, so one probe could park for
+# minutes -- a monotonic deadline cannot interrupt a call that is already
+# blocking. The cap is deliberately small: the recovery is supposed to yield
+# and re-resolve, not sit inside a single Playwright wait.
+_MAX_SUBMIT_TRIAL_TIMEOUT_MS = 1000
 
 
 @dataclass(frozen=True)
@@ -87,8 +115,8 @@ class PlaywrightPortal:
             page.get_by_label("Username", exact=True).fill(username)
             stage_failure = "login password entry did not complete"
             page.get_by_label("Password", exact=True).fill(password)
-            stage_failure = "login submission did not complete"
-            page.get_by_role("button", name="Login", exact=True).click()
+            stage_failure = LOGIN_SUBMIT_STAGE
+            self._submit_login(page)
             stage_failure = "Billing Manager entry did not appear after login"
             page.get_by_role("link", name="Billing Manager", exact=True).wait_for(state="visible")
         except LayoutChangedError:
@@ -99,6 +127,98 @@ class PlaywrightPortal:
             if self._visible(page, page.get_by_role("alert")):
                 raise LoginError("portal rejected the login") from exc
             raise LayoutChangedError(stage_failure) from exc
+
+    def _submit_login(self, page: Any) -> None:
+        """Click the canonical Login control exactly once, after proving it ready.
+
+        The selector never changes. What changes between attempts is the
+        locator object: the failure this recovers from is a stale handle held
+        across a long auto-wait while the login route is still settling, so
+        every attempt resolves a new one and inspects it without starting a
+        wait that could swallow the whole page timeout.
+
+        Exactly one normal click is ever dispatched. A submit that has already
+        been sent may have landed even if the call raises, so retrying it
+        could duplicate the submission; that failure goes to the caller's
+        classification instead.
+        """
+
+        deadline = time.monotonic() + _SUBMIT_RECOVERY_DEADLINE_SECONDS
+        attempt = 0
+        while True:
+            remaining_ms = int((deadline - time.monotonic()) * 1000)
+            if remaining_ms <= 0:
+                break
+            submit = page.get_by_role("button", name="Login", exact=True)
+            if self._submit_control_is_ready(submit, remaining_ms):
+                # Recomputed: the readiness check above can wait, so the trial
+                # must be bounded by what is left rather than by what was left
+                # before it ran.
+                remaining_ms = int((deadline - time.monotonic()) * 1000)
+                if remaining_ms <= 0:
+                    break
+                try:
+                    # Proves Playwright can act on the control without
+                    # submitting anything, so a control that is present but
+                    # not yet actionable is retried rather than blocked on.
+                    # The timeout is explicit: an inherited page default could
+                    # outlast the whole recovery budget on its own.
+                    submit.click(
+                        trial=True,
+                        timeout=min(remaining_ms, _MAX_SUBMIT_TRIAL_TIMEOUT_MS),
+                    )
+                except Exception as exc:
+                    # Only a timeout is transient here. Anything else is a real
+                    # failure and must reach the caller unaltered.
+                    if not self._looks_like_timeout(exc):
+                        raise
+                else:
+                    submit.click()
+                    return
+            if attempt >= len(_SUBMIT_RECOVERY_YIELDS_MS):
+                break
+            # Recomputed: the probe above consumed part of the same budget.
+            remaining_ms = int((deadline - time.monotonic()) * 1000)
+            if remaining_ms <= 0:
+                break
+            page.wait_for_timeout(
+                min(_SUBMIT_RECOVERY_YIELDS_MS[attempt], _MAX_SUBMIT_RECOVERY_YIELD_MS, remaining_ms)
+            )
+            attempt += 1
+        raise LayoutChangedError(LOGIN_SUBMIT_STAGE)
+
+    def _submit_control_is_ready(self, locator: Any, remaining_ms: int) -> bool:
+        """Report readiness without letting any check outlast the budget.
+
+        Ambiguity is drift, not lag: more than one exact match can never
+        become correct by waiting, so it fails closed on the spot rather than
+        consuming the recovery budget. Count and visibility are current-state
+        reads that return whatever is on the page right now.
+
+        The enabled check is the one that can wait: unlike `is_visible()`,
+        whose timeout option is ignored, `is_enabled()` takes a live timeout
+        that defaults to `page.set_default_timeout()`. Left implicit it would
+        inherit the configured page timeout and could hold the recovery for
+        minutes, so it is bounded here the same way the trial click is. A
+        control that is merely slow to report reads as not-yet-ready, which
+        sends the caller back to resolve a new locator.
+        """
+
+        count = locator.count()
+        if count > 1:
+            raise LayoutChangedError(LOGIN_SUBMIT_STAGE)
+        if count == 0:
+            return False
+        if not locator.is_visible():
+            return False
+        try:
+            return bool(locator.is_enabled(timeout=min(remaining_ms, _MAX_SUBMIT_TRIAL_TIMEOUT_MS)))
+        except Exception as exc:
+            # Only a timeout is transient. Anything else is a real failure and
+            # must reach the caller unaltered rather than becoming a retry.
+            if not self._looks_like_timeout(exc):
+                raise
+            return False
 
     def _enter_public_semantics(self, page: Any) -> Any:
         """Open the public Flutter semantics gate and return the Login entry.
