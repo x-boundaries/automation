@@ -304,31 +304,6 @@ class PlaywrightPortal:
 
         self._recover(page, probe, description, messages=messages, classified=classified)
 
-    def _await_visible_control(
-        self,
-        page: Any,
-        locator_factory: Callable[[], Any],
-        description: str,
-        *,
-        messages: Mapping[str, str] | None = None,
-        classified: bool = True,
-    ) -> None:
-        """Settle on exactly one visible match, re-resolved each checkpoint."""
-
-        def condition(remaining_ms: int) -> bool:
-            locator = locator_factory()
-            if locator.count() != 1:
-                return False
-            try:
-                locator.wait_for(state="visible", timeout=self._probe_timeout_ms(remaining_ms))
-            except Exception:
-                return False
-            return True
-
-        self._await_condition(
-            page, condition, description, messages=messages, classified=classified
-        )
-
     # ---- login ---- #
 
     def login(self) -> None:
@@ -412,13 +387,36 @@ class PlaywrightPortal:
         surface must not pre-empt a credential rejection.
         """
 
-        self._await_visible_control(
+        def condition(remaining_ms: int) -> bool:
+            if self._entry_is_visible(page, remaining_ms):
+                return True
+            # A visible alert is a settled answer, not lag. Spending the rest of
+            # the window on it could not change the outcome and would delay a
+            # credential rejection by a minute, so the window stops here and the
+            # caller classifies it exactly as it always has.
+            if self._visible(page, page.get_by_role("alert")):
+                raise _PortalNotSettled("Billing Manager entry did not appear after login")
+            return False
+
+        self._await_condition(
             page,
-            lambda: page.get_by_role("link", name="Billing Manager", exact=True),
+            condition,
             "Billing Manager entry",
             messages=_uniform_messages("Billing Manager control is missing or ambiguous"),
             classified=False,
         )
+
+    def _entry_is_visible(self, page: Any, remaining_ms: int) -> bool:
+        """Report whether exactly one Billing Manager entry is visible yet."""
+
+        entry = page.get_by_role("link", name="Billing Manager", exact=True)
+        if entry.count() != 1:
+            return False
+        try:
+            entry.wait_for(state="visible", timeout=self._probe_timeout_ms(remaining_ms))
+        except Exception:
+            return False
+        return True
 
     def _enter_public_semantics(self, page: Any) -> Any:
         """Open the public Flutter semantics gate and return the Login entry.

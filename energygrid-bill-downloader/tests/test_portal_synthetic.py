@@ -2487,6 +2487,23 @@ class PortalLoginDispatchTests(unittest.TestCase):
         self.assertEqual(submit.clicks, 1, "a postcondition timeout never duplicates the submit")
         self.assert_waits_bounded(pending)
 
+    def test_a_settled_rejection_stops_the_post_login_window_early(self) -> None:
+        """A visible alert is an answer, so the window does not run its course.
+
+        Waiting the whole minute out could not change the classification and
+        would delay every rejected credential run by that minute.
+        """
+        submit = FakeLocator(label="submit")
+        never = FakeLocator(count=0, label="never_billing")
+        page = login_page(submits=[submit], billing_managers=[never], alert_visible=True)
+
+        error = self.attempt(page)
+        self.assertIsInstance(error, LoginError)
+        self.assertEqual(cli.support_ref_for(error), "EG_LOGIN_PORTAL_REJECTED")
+        self.assertEqual(submit.clicks, 1, "a rejection is never re-submitted")
+        self.assertEqual(page.waited_ms, [], "a settled rejection is not waited out")
+        self.assertEqual(never.waits, 0)
+
     def test_an_ambiguous_post_login_surface_never_re_submits(self) -> None:
         """Two Billing Manager entries are re-checked, never acted on."""
         submit = FakeLocator(label="submit")
