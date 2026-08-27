@@ -26,8 +26,10 @@ _SUBMIT_RECOVERY_YIELDS_MS = (100, 200, 400, 800, 1600, 3200, 6400, 12800, 25600
 _MAX_SUBMIT_RECOVERY_YIELD_MS = 30000
 _SUBMIT_RECOVERY_DEADLINE_SECONDS = 60.0
 
-# Every actionability probe is bounded explicitly. Without a timeout argument a
-# trial click inherits `page.set_default_timeout()`, and `RuntimeConfig` allows
+# Every probe that can wait is bounded explicitly, and they share one cap so a
+# second waiting call cannot appear with a budget of its own. Without a timeout
+# argument a trial click or an enabled check inherits
+# `page.set_default_timeout()`, and `RuntimeConfig` allows
 # `timeout_seconds` up to MAX_TIMEOUT_SECONDS, so one probe could park for
 # minutes -- a monotonic deadline cannot interrupt a call that is already
 # blocking. The cap is deliberately small: the recovery is supposed to yield
@@ -148,7 +150,13 @@ class PlaywrightPortal:
             if remaining_ms <= 0:
                 break
             submit = page.get_by_role("button", name="Login", exact=True)
-            if self._submit_control_is_ready(submit):
+            if self._submit_control_is_ready(submit, remaining_ms):
+                # Recomputed: the readiness check above can wait, so the trial
+                # must be bounded by what is left rather than by what was left
+                # before it ran.
+                remaining_ms = int((deadline - time.monotonic()) * 1000)
+                if remaining_ms <= 0:
+                    break
                 try:
                     # Proves Playwright can act on the control without
                     # submitting anything, so a control that is present but
@@ -179,13 +187,21 @@ class PlaywrightPortal:
             attempt += 1
         raise LayoutChangedError(LOGIN_SUBMIT_STAGE)
 
-    @staticmethod
-    def _submit_control_is_ready(locator: Any) -> bool:
-        """Report readiness immediately, without starting a long auto-wait.
+    def _submit_control_is_ready(self, locator: Any, remaining_ms: int) -> bool:
+        """Report readiness without letting any check outlast the budget.
 
         Ambiguity is drift, not lag: more than one exact match can never
         become correct by waiting, so it fails closed on the spot rather than
-        consuming the recovery budget.
+        consuming the recovery budget. Count and visibility are current-state
+        reads that return whatever is on the page right now.
+
+        The enabled check is the one that can wait: unlike `is_visible()`,
+        whose timeout option is ignored, `is_enabled()` takes a live timeout
+        that defaults to `page.set_default_timeout()`. Left implicit it would
+        inherit the configured page timeout and could hold the recovery for
+        minutes, so it is bounded here the same way the trial click is. A
+        control that is merely slow to report reads as not-yet-ready, which
+        sends the caller back to resolve a new locator.
         """
 
         count = locator.count()
@@ -193,7 +209,16 @@ class PlaywrightPortal:
             raise LayoutChangedError(LOGIN_SUBMIT_STAGE)
         if count == 0:
             return False
-        return bool(locator.is_visible() and locator.is_enabled())
+        if not locator.is_visible():
+            return False
+        try:
+            return bool(locator.is_enabled(timeout=min(remaining_ms, _MAX_SUBMIT_TRIAL_TIMEOUT_MS)))
+        except Exception as exc:
+            # Only a timeout is transient. Anything else is a real failure and
+            # must reach the caller unaltered rather than becoming a retry.
+            if not self._looks_like_timeout(exc):
+                raise
+            return False
 
     def _enter_public_semantics(self, page: Any) -> Any:
         """Open the public Flutter semantics gate and return the Login entry.

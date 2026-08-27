@@ -481,6 +481,7 @@ class FakeLocator:
         dispatch_error: Exception | None = None,
         click_error: Exception | None = None,
         trial_click_error: Exception | None = None,
+        enabled_error: Exception | None = None,
         fill_error: Exception | None = None,
         journal: list[str] | None = None,
         label: str = "locator",
@@ -493,6 +494,7 @@ class FakeLocator:
         self._dispatch_error = dispatch_error
         self._click_error = click_error
         self._trial_click_error = trial_click_error
+        self._enabled_error = enabled_error
         self._fill_error = fill_error
         self._journal = journal
         self._label = label
@@ -501,6 +503,8 @@ class FakeLocator:
         self.clicks = 0
         self.trial_clicks = 0
         self.trial_timeouts: list[int | None] = []
+        self.enabled_checks = 0
+        self.enabled_timeouts: list[int | None] = []
         self.fills = 0
         self.waits = 0
 
@@ -526,7 +530,23 @@ class FakeLocator:
     def is_visible(self, timeout: int | None = None) -> bool:
         return self._visible
 
-    def is_enabled(self) -> bool:
+    def is_enabled(self, timeout: int | None = None) -> bool:
+        """Model the real signature: unlike `is_visible`, this one waits.
+
+        For pinned Playwright 1.61.0 `locator.is_enabled(timeout=...)` carries
+        a live timeout whose default follows `page.set_default_timeout()`,
+        while `locator.is_visible()`'s timeout option is ignored. So a
+        readiness check with no explicit timeout inherits the page default,
+        and a check that has to wait is charged that whole amount -- which is
+        exactly what an unbounded readiness probe costs a bounded recovery.
+        """
+        self.enabled_checks += 1
+        self.enabled_timeouts.append(timeout)
+        if self._enabled_error is not None:
+            if self._clock is not None:
+                spent = timeout if timeout is not None else self._clock.default_timeout_ms
+                self._clock.charge_probe_ms(spent)
+            raise self._enabled_error
         return self._enabled
 
     def dispatch_event(self, name: str) -> None:
@@ -1200,6 +1220,82 @@ class LoginSubmitRecoveryTests(unittest.TestCase):
         self.assertEqual(slow.clicks, 0, "a control that never proved actionable is not submitted")
         self.assertEqual(ready.clicks, 1)
         self.assertLessEqual(max(slow.trial_timeouts), MAX_TRIAL_PROBE_MS)
+        self.assert_within_budget(page)
+
+    def test_an_enabled_readiness_check_is_explicitly_bounded(self) -> None:
+        """The readiness probe must not inherit `page.set_default_timeout()`.
+
+        `locator.is_enabled()` is not `locator.is_visible()`: its timeout is
+        live and defaults to the page default, so an unbounded readiness check
+        can park for minutes inside a recovery region that is supposed to be
+        bounded. It therefore carries its own small explicit timeout and is
+        charged against the same ceiling as the trials and the yields.
+        """
+        stalling = FakeLocator(enabled_error=synthetic_timeout(), label="stalling")
+        page = login_page(submits=[stalling], default_timeout_ms=300_000)
+
+        error = self.attempt_login(page)
+        self.assertIsInstance(error, LayoutChangedError)
+        self.assert_submit_stage(error)
+
+        self.assertTrue(stalling.enabled_timeouts, "the readiness check must actually run")
+        self.assertTrue(
+            all(value is not None for value in stalling.enabled_timeouts),
+            "every enabled check must carry an explicit timeout",
+        )
+        self.assertLessEqual(
+            max(stalling.enabled_timeouts),
+            MAX_TRIAL_PROBE_MS,
+            "a readiness check stays far below any configured page default",
+        )
+        self.assert_within_budget(page)
+        self.assertEqual(stalling.clicks, 0, "recovery exhausted, so nothing was submitted")
+        self.assertEqual(stalling.trial_clicks, 0, "a control that is not enabled is never probed")
+
+    def test_enabled_readiness_timeout_re_resolves_and_then_submits_once(self) -> None:
+        """A readiness timeout is transient: look again with a new locator."""
+        stalling = FakeLocator(enabled_error=synthetic_timeout(), label="stalling")
+        ready = FakeLocator(label="ready")
+        page = login_page(submits=[stalling, ready], default_timeout_ms=300_000)
+
+        self.assertIsNone(self.attempt_login(page))
+        self.assertEqual(stalling.enabled_checks, 1)
+        self.assertEqual(stalling.clicks, 0, "the locator that timed out is never submitted")
+        self.assertTrue(page.waited_ms, "a transient readiness timeout yields before retrying")
+        self.assertGreaterEqual(page.login_lookups, 3, "the retry resolved a fresh locator")
+        self.assertEqual(ready.trial_clicks, 1)
+        self.assertEqual(ready.clicks, 1)
+        self.assertLessEqual(max(stalling.enabled_timeouts), MAX_TRIAL_PROBE_MS)
+        self.assert_within_budget(page)
+
+    def test_a_non_timeout_enabled_failure_is_not_treated_as_transient(self) -> None:
+        """Only a timeout is transient; a real readiness failure stops recovery."""
+        broken = FakeLocator(enabled_error=step_failure(), label="broken")
+        page = login_page(submits=[broken])
+
+        error = self.attempt_login(page)
+        self.assertIsInstance(error, LayoutChangedError)
+        self.assert_submit_stage(error)
+        self.assertEqual(broken.enabled_checks, 1, "a real failure is not retried")
+        self.assertEqual(page.waited_ms, [], "no yield follows a terminal readiness failure")
+        self.assertEqual(broken.trial_clicks, 0)
+        self.assertEqual(broken.clicks, 0)
+        self.assertNotIn("hunter2", error.message)
+        self.assertNotIn("portal.example.invalid", error.message)
+
+    def test_ambiguity_and_invisibility_never_reach_the_enabled_check(self) -> None:
+        """The cheap short-circuits still run before the one waiting check."""
+        ambiguous = FakeLocator(count=2, label="ambiguous")
+        self.assertIsInstance(self.attempt_login(login_page(submits=[ambiguous])), LayoutChangedError)
+        self.assertEqual(ambiguous.enabled_checks, 0, "ambiguity is terminal before any wait")
+
+        hidden = FakeLocator(visible=False, label="hidden")
+        page = login_page(submits=[hidden])
+        error = self.attempt_login(page)
+        self.assertIsInstance(error, LayoutChangedError)
+        self.assert_submit_stage(error)
+        self.assertEqual(hidden.enabled_checks, 0, "an invisible control is not asked for state")
+        self.assertEqual(hidden.clicks, 0)
         self.assert_within_budget(page)
 
     def assert_within_budget(self, page: FakePage) -> None:
