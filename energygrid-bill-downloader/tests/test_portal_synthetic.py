@@ -877,7 +877,7 @@ LOGIN_STEP_CASES = (
     (
         "login_submit",
         lambda exc: {"submit": FakeLocator(click_error=exc)},
-        "EG_LOGIN_SUBMIT_FAILED",
+        "EG_LOGIN_SUBMIT_DISPATCH_UNCERTAIN",
     ),
     (
         "billing_manager_wait",
@@ -1006,15 +1006,21 @@ class PreAuthLoginFailureReferenceTests(unittest.TestCase):
         self.assertEqual(len(set(seen)), len(LOGIN_STEP_CASES), "each step needs its own message")
 
     def test_visible_alert_outranks_every_step_reference(self) -> None:
-        """A visible alert still means rejected credentials, at any broken step."""
+        """A visible alert cannot override the uncertain submit-click boundary."""
         for case_id, break_step, layout_ref in LOGIN_STEP_CASES:
             with self.subTest(case=case_id):
                 overrides = break_step(step_failure())
                 overrides["alert_visible"] = True
                 error = self.run_login(login_page(**overrides))
-                self.assertIsInstance(error, LoginError)
-                self.assertEqual(cli.support_ref_for(error), "EG_LOGIN_PORTAL_REJECTED")
-                self.assertNotEqual(cli.support_ref_for(error), layout_ref)
+                if case_id == "login_submit":
+                    # Once normal submit.click() begins, an alert cannot prove
+                    # whether the click's outcome is safe to repeat.
+                    self.assertIsInstance(error, LayoutChangedError)
+                    self.assert_maps_non_generically(error, layout_ref)
+                else:
+                    self.assertIsInstance(error, LoginError)
+                    self.assertEqual(cli.support_ref_for(error), "EG_LOGIN_PORTAL_REJECTED")
+                    self.assertNotEqual(cli.support_ref_for(error), layout_ref)
                 self.assertNotIn("hunter2", error.message)
 
     def test_specific_semantics_failures_outrank_the_step_marker(self) -> None:
@@ -1127,6 +1133,14 @@ class PreAuthLoginFailureReferenceTests(unittest.TestCase):
         for _case_id, break_step, _expected_ref in LOGIN_STEP_CASES:
             record(self.run_login(login_page(**break_step(step_failure()))))
 
+        # Submit readiness uses the same bounded primitive but has its own
+        # public-safe vocabulary. Every case must finish before a normal click.
+        for _case_id, kwargs, _outcome in UNREADY_CONTROL_CASES:
+            submit = FakeLocator(**kwargs)
+            error = self.run_login(login_page(submits=[submit]))
+            record(error)
+            self.assertEqual(submit.clicks, 0)
+
         record(self.run_login(login_page(goto_error=step_failure(), alert_visible=True)))
         record(self.run_login(login_page(), credentials=False))
 
@@ -1223,7 +1237,11 @@ class LoginSubmitRecoveryTests(unittest.TestCase):
         error = self.attempt_login(page)
         self.assertIsInstance(error, LayoutChangedError)
         self.assertEqual(error.status, PORTAL_LAYOUT_CHANGED)
-        self.assert_submit_stage(error)
+        self.assert_submit_stage(
+            error,
+            "login submit control is missing or ambiguous",
+            "EG_LOGIN_SUBMIT_AMBIGUOUS",
+        )
         self.assertTrue(page.waited_ms, "transient ambiguity is re-checked, not terminal on sight")
         self.assertGreater(page.login_lookups, 3, "every re-check resolved a fresh locator")
         self.assertEqual(ambiguous.trial_clicks, 0)
@@ -1237,7 +1255,11 @@ class LoginSubmitRecoveryTests(unittest.TestCase):
 
         error = self.attempt_login(page)
         self.assertIsInstance(error, LayoutChangedError)
-        self.assert_submit_stage(error)
+        self.assert_submit_stage(
+            error,
+            "login submit control did not appear",
+            "EG_LOGIN_SUBMIT_NOT_APPEAR",
+        )
         self.assertEqual(never.clicks, 0)
         self.assertTrue(page.waited_ms)
         self.assertLessEqual(max(page.waited_ms), 30_000, "no single wait may exceed 30 s")
@@ -1264,7 +1286,11 @@ class LoginSubmitRecoveryTests(unittest.TestCase):
 
         error = self.attempt_login(page)
         self.assertIsInstance(error, LayoutChangedError)
-        self.assert_submit_stage(error)
+        self.assert_submit_stage(
+            error,
+            "login submit control could not be resolved",
+            "EG_LOGIN_SUBMIT_UNRESOLVED",
+        )
         self.assertEqual(page.waited_ms, [])
         self.assertEqual(broken.clicks, 0)
         self.assertNotIn("hunter2", error.message)
@@ -1277,17 +1303,26 @@ class LoginSubmitRecoveryTests(unittest.TestCase):
 
         error = self.attempt_login(page)
         self.assertIsInstance(error, LayoutChangedError)
-        self.assert_submit_stage(error)
+        self.assert_submit_stage(
+            error,
+            "login submit dispatch outcome uncertain",
+            "EG_LOGIN_SUBMIT_DISPATCH_UNCERTAIN",
+        )
         self.assertEqual(failing.clicks, 1, "an ambiguous post-dispatch outcome is never re-submitted")
 
-    def test_a_portal_rejection_after_submission_is_still_a_login_error(self) -> None:
-        """Recovery must not turn a credential rejection into drift."""
+    def test_a_submit_click_exception_is_uncertain_even_with_a_visible_alert(self) -> None:
+        """An alert cannot prove a normal click's outcome after invocation."""
         failing = FakeLocator(click_error=synthetic_timeout(), label="failing")
         page = login_page(submits=[failing], alert_visible=True)
 
         error = self.attempt_login(page)
-        self.assertIsInstance(error, LoginError)
-        self.assertEqual(cli.support_ref_for(error), "EG_LOGIN_PORTAL_REJECTED")
+        self.assertIsInstance(error, LayoutChangedError)
+        self.assert_submit_stage(
+            error,
+            "login submit dispatch outcome uncertain",
+            "EG_LOGIN_SUBMIT_DISPATCH_UNCERTAIN",
+        )
+        self.assertEqual(failing.clicks, 1)
 
     def test_a_long_page_timeout_cannot_extend_the_bounded_recovery(self) -> None:
         """A trial probe must not inherit `page.set_default_timeout()`.
@@ -1303,7 +1338,11 @@ class LoginSubmitRecoveryTests(unittest.TestCase):
 
         error = self.attempt_login(page)
         self.assertIsInstance(error, LayoutChangedError)
-        self.assert_submit_stage(error)
+        self.assert_submit_stage(
+            error,
+            "login submit control is hidden or disabled",
+            "EG_LOGIN_SUBMIT_NOT_READY",
+        )
 
         self.assertTrue(probe.trial_timeouts, "the actionability probe must actually run")
         self.assertTrue(
@@ -1345,7 +1384,11 @@ class LoginSubmitRecoveryTests(unittest.TestCase):
 
         error = self.attempt_login(page)
         self.assertIsInstance(error, LayoutChangedError)
-        self.assert_submit_stage(error)
+        self.assert_submit_stage(
+            error,
+            "login submit control is hidden or disabled",
+            "EG_LOGIN_SUBMIT_NOT_READY",
+        )
 
         self.assertTrue(stalling.enabled_timeouts, "the readiness check must actually run")
         self.assertTrue(
@@ -1387,7 +1430,11 @@ class LoginSubmitRecoveryTests(unittest.TestCase):
 
         error = self.attempt_login(page)
         self.assertIsInstance(error, LayoutChangedError)
-        self.assert_submit_stage(error)
+        self.assert_submit_stage(
+            error,
+            "login submit control could not be resolved",
+            "EG_LOGIN_SUBMIT_UNRESOLVED",
+        )
         self.assertEqual(broken.enabled_checks, 1, "a real failure is not retried")
         self.assertEqual(page.waited_ms, [], "no yield follows a terminal readiness failure")
         self.assertEqual(broken.trial_clicks, 0)
@@ -1405,7 +1452,11 @@ class LoginSubmitRecoveryTests(unittest.TestCase):
         page = login_page(submits=[hidden])
         error = self.attempt_login(page)
         self.assertIsInstance(error, LayoutChangedError)
-        self.assert_submit_stage(error)
+        self.assert_submit_stage(
+            error,
+            "login submit control is hidden or disabled",
+            "EG_LOGIN_SUBMIT_NOT_READY",
+        )
         self.assertEqual(hidden.enabled_checks, 0, "an invisible control is not asked for state")
         self.assertEqual(hidden.clicks, 0)
         self.assert_within_budget(page)
@@ -1425,10 +1476,12 @@ class LoginSubmitRecoveryTests(unittest.TestCase):
             elapsed, RECOVERY_CEILING_MS, "probes and yields share one hard ceiling"
         )
 
-    def assert_submit_stage(self, error: AppError) -> None:
-        """The submit stage keeps its committed marker and its reference."""
-        self.assertEqual(error.message, "login submission did not complete")
-        self.assertEqual(cli.support_ref_for(error), "EG_LOGIN_SUBMIT_FAILED")
+    def assert_submit_stage(
+        self, error: AppError, expected_message: str, expected_ref: str
+    ) -> None:
+        """The submit outcome maps to its exact fixed message and reference."""
+        self.assertEqual(error.message, expected_message)
+        self.assertEqual(cli.support_ref_for(error), expected_ref)
 
 
 

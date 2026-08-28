@@ -31,9 +31,10 @@ ALLOWED_LOG_FIELDS = {
 RUN_FAILED_PHASE = "run_failed"
 UNCLASSIFIED_SUPPORT_REF = "APP_ERROR_UNCLASSIFIED"
 
-# Every message the pre-auth login path can currently raise, mapped to a bounded
-# ASCII reference. portal.py owns the wording, so a change there fails the
-# reachability tests instead of silently degrading a known failure to generic.
+# Every message the pre-auth login path can raise, mapped to a bounded ASCII
+# reference. portal.py owns the wording, so a change there fails the reachability
+# tests instead of silently degrading a known failure to generic. The one coarse
+# submit message is retained below only for historical evidence.
 SUPPORT_REFS_BY_MESSAGE = {
     "Flutter semantics activation control did not appear": "EG_LOGIN_SEMANTICS_ACTIVATION_NOT_APPEAR",
     "Flutter semantics activation control could not be resolved": "EG_LOGIN_SEMANTICS_ACTIVATION_UNRESOLVED",
@@ -49,6 +50,11 @@ SUPPORT_REFS_BY_MESSAGE = {
     "post-activation Login control click did not complete": "EG_LOGIN_ENTRY_CLICK_FAILED",
     "login username entry did not complete": "EG_LOGIN_USERNAME_FILL_FAILED",
     "login password entry did not complete": "EG_LOGIN_PASSWORD_FILL_FAILED",
+    "login submit control did not appear": "EG_LOGIN_SUBMIT_NOT_APPEAR",
+    "login submit control is missing or ambiguous": "EG_LOGIN_SUBMIT_AMBIGUOUS",
+    "login submit control is hidden or disabled": "EG_LOGIN_SUBMIT_NOT_READY",
+    "login submit control could not be resolved": "EG_LOGIN_SUBMIT_UNRESOLVED",
+    "login submit dispatch outcome uncertain": "EG_LOGIN_SUBMIT_DISPATCH_UNCERTAIN",
     "login submission did not complete": "EG_LOGIN_SUBMIT_FAILED",
     "Billing Manager entry did not appear after login": "EG_LOGIN_BILLING_MANAGER_WAIT_FAILED",
     "required login control is missing or ambiguous": "EG_LOGIN_REQUIRED_CONTROL_UNRESOLVED",
@@ -61,7 +67,9 @@ SUPPORT_REFS_BY_MESSAGE = {
 # reference now reports its own. Retiring a reference means moving it here, so
 # the reachability tests can require the live vocabulary to be fully reachable
 # and a retired one to be unreachable.
-RETIRED_SUPPORT_REFS = frozenset({"EG_LOGIN_REQUIRED_CONTROL_UNRESOLVED"})
+RETIRED_SUPPORT_REFS = frozenset(
+    {"EG_LOGIN_REQUIRED_CONTROL_UNRESOLVED", "EG_LOGIN_SUBMIT_FAILED"}
+)
 
 
 def support_ref_for(error: AppError) -> str:
