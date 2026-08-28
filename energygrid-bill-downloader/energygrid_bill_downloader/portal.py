@@ -11,11 +11,6 @@ from .config import RuntimeConfig
 from .errors import DependencyError, DownloadError, LayoutChangedError, LoginError
 
 
-# The fixed marker for the login submit stage. Defined once so the recovery
-# below and the step marker in `login()` can never drift apart, which is what
-# keeps a proven pre-submit failure mapping to the same support reference.
-LOGIN_SUBMIT_STAGE = "login submission did not complete"
-
 # One shared bounded readiness and post-action settling contract for every
 # portal surface (DL-XB-141-PORTAL-RESILIENCE-002, superseding the login-only
 # ladder of DL-XB-141-LOGIN-RECOVERY-001). The portal is eventually consistent:
@@ -330,7 +325,10 @@ class PlaywrightPortal:
             self._fill_login_field(page, "Username", username)
             stage_failure = "login password entry did not complete"
             self._fill_login_field(page, "Password", password)
-            stage_failure = LOGIN_SUBMIT_STAGE
+            # Readiness failures are proven before the normal submit call. Keep
+            # this fallback pre-dispatch so an unexpected readiness exception
+            # cannot be mistaken for an uncertain click outcome.
+            stage_failure = "login submit control could not be resolved"
             self._submit_login(page)
             stage_failure = "Billing Manager entry did not appear after login"
             self._await_billing_manager(page)
@@ -370,14 +368,28 @@ class PlaywrightPortal:
         caller's classification instead.
         """
 
-        submit = self._resolve_ready_control(
-            page,
-            lambda: page.get_by_role("button", name="Login", exact=True),
-            "login submit control",
-            require_trial_actionable=True,
-            messages=_uniform_messages(LOGIN_SUBMIT_STAGE),
-        )
-        submit.click()
+        # Keep pre-dispatch readiness separate from the one real click. Trial
+        # actionability proves the locator without submitting anything; a
+        # non-timeout probe failure is therefore still pre-dispatch.
+        try:
+            submit = self._resolve_ready_control(
+                page,
+                lambda: page.get_by_role("button", name="Login", exact=True),
+                "login submit control",
+                require_trial_actionable=True,
+            )
+        except LayoutChangedError:
+            raise
+        except Exception as exc:
+            raise LayoutChangedError("login submit control could not be resolved") from exc
+
+        # This is the explicit dispatch boundary. Once normal click invocation
+        # begins, an exception cannot prove whether the browser acted, so the
+        # outcome is uncertain and the call must never be retried.
+        try:
+            submit.click()
+        except Exception as exc:
+            raise LayoutChangedError("login submit dispatch outcome uncertain") from exc
 
     def _await_billing_manager(self, page: Any) -> None:
         """Settle on the post-login surface without submitting anything again.

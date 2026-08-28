@@ -457,6 +457,12 @@ class TerminalFailureEvidenceTests(unittest.TestCase):
                 20,
                 "EG_LOGIN_BILLING_MANAGER_WAIT_FAILED",
             ),
+            (
+                LayoutChangedError("login submit dispatch outcome uncertain"),
+                PORTAL_LAYOUT_CHANGED,
+                20,
+                "EG_LOGIN_SUBMIT_DISPATCH_UNCERTAIN",
+            ),
         ):
             with self.subTest(status=status, exit_code=expected_exit):
                 with tempfile.TemporaryDirectory() as directory:
@@ -569,7 +575,7 @@ class TerminalFailureEvidenceTests(unittest.TestCase):
     def test_one_caught_app_error_produces_exactly_one_terminal_event(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            self.run_cli(root, stub_portal(LayoutChangedError("login submission did not complete")))
+            self.run_cli(root, stub_portal(LayoutChangedError("login submit dispatch outcome uncertain")))
 
             phases = self.phases(root)
             self.assertEqual(
@@ -577,6 +583,10 @@ class TerminalFailureEvidenceTests(unittest.TestCase):
                 "a single caught AppError must not be recorded twice",
             )
             self.assertNotIn("run_complete", phases)
+            self.assertEqual(
+                self.terminal_events(root)[0]["support_ref"],
+                "EG_LOGIN_SUBMIT_DISPATCH_UNCERTAIN",
+            )
 
 
 class SupportReferenceContractTests(unittest.TestCase):
@@ -609,6 +619,7 @@ class SupportReferenceContractTests(unittest.TestCase):
         committed = set(cli.SUPPORT_REFS_BY_MESSAGE.values())
         self.assertTrue(cli.RETIRED_SUPPORT_REFS.issubset(committed))
         self.assertIn("EG_LOGIN_REQUIRED_CONTROL_UNRESOLVED", cli.RETIRED_SUPPORT_REFS)
+        self.assertIn("EG_LOGIN_SUBMIT_FAILED", cli.RETIRED_SUPPORT_REFS)
         for ref in cli.RETIRED_SUPPORT_REFS:
             with self.subTest(ref=ref):
                 self.assertRegex(ref, self.IDENTIFIER)
@@ -619,11 +630,20 @@ class SupportReferenceContractTests(unittest.TestCase):
             "EG_LOGIN_ENTRY_CLICK_FAILED",
             "EG_LOGIN_USERNAME_FILL_FAILED",
             "EG_LOGIN_PASSWORD_FILL_FAILED",
-            "EG_LOGIN_SUBMIT_FAILED",
+            "EG_LOGIN_SUBMIT_NOT_APPEAR",
+            "EG_LOGIN_SUBMIT_AMBIGUOUS",
+            "EG_LOGIN_SUBMIT_NOT_READY",
+            "EG_LOGIN_SUBMIT_UNRESOLVED",
+            "EG_LOGIN_SUBMIT_DISPATCH_UNCERTAIN",
             "EG_LOGIN_BILLING_MANAGER_WAIT_FAILED",
         }
         self.assertTrue(replacements.issubset(committed))
         self.assertTrue(replacements.isdisjoint(cli.RETIRED_SUPPORT_REFS))
+
+    def test_historical_submit_message_remains_mapped_but_retired(self) -> None:
+        error = LayoutChangedError("login submission did not complete")
+        self.assertEqual(cli.support_ref_for(error), "EG_LOGIN_SUBMIT_FAILED")
+        self.assertIn("EG_LOGIN_SUBMIT_FAILED", cli.RETIRED_SUPPORT_REFS)
 
     def test_classification_is_exact_so_a_longer_future_message_stays_generic(self) -> None:
         known = "post-activation Login control did not appear"
