@@ -223,18 +223,53 @@ class SyntheticPortalServer:
                 )
 
             def _login_form(self) -> bytes:
+                """Model the observed credential-entry contract, not a plain form.
+
+                The live portal's text-editing host only adopts a credential it
+                observed being edited, and it renders no submit control until
+                both credentials are present. A directly assigned value reaches
+                the DOM input but not the widget, so the form stays incomplete
+                and the Login button never appears -- which is what the live
+                `EG_LOGIN_SUBMIT_NOT_APPEAR` terminal was reporting.
+
+                Keying off `keydown` reproduces exactly that distinction: a
+                value assignment fires `input` but no key events, while real
+                typing fires both. The submit control is therefore withheld
+                until both fields have been genuinely typed into.
+                """
+
                 password_label = "Password"
                 if fixture.variant == "login_label_drift":
                     password_label = "Passcode"
+                script = """
+                <script>
+                const typed = {username: false, password: false};
+                function renderSubmit() {
+                    if (!typed.username || !typed.password) return;
+                    if (document.getElementById('login-submit')) return;
+                    const button = document.createElement('button');
+                    button.id = 'login-submit';
+                    button.type = 'submit';
+                    button.textContent = 'Login';
+                    document.getElementById('login-form').appendChild(button);
+                }
+                for (const name of ['username', 'password']) {
+                    const input = document.getElementById(name);
+                    input.addEventListener('keydown', () => {
+                        typed[name] = true;
+                        renderSubmit();
+                    });
+                }
+                </script>
+                """
                 return self._page(
                     "Login",
-                    "<form method=post action=/login>"
+                    '<form id="login-form" method=post action=/login>'
                     '<label for="username">Username</label>'
                     '<input id="username" name="username" type="text">'
                     f'<label for="password">{password_label}</label>'
                     '<input id="password" name="password" type="password">'
-                    '<button type="submit">Login</button>'
-                    "</form>",
+                    "</form>" + script,
                 )
 
             def _app_page(self) -> bytes:

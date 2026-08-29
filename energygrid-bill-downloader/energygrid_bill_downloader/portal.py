@@ -45,6 +45,16 @@ PORTAL_RECOVERY_ATTEMPTS_MS = (
     + (int(PORTAL_RECOVERY_DEADLINE_SECONDS * 1000) - _PORTAL_FINAL_CHECK_MARGIN_MS,)
 )
 
+# Credential entry is typed, not assigned. The portal's Flutter text-editing host
+# owns the credential inputs and only adopts a value it observed being edited: a
+# direct value assignment reaches the DOM input but not the widget, and the input
+# it was written to is replaced when the host takes over the next field, so the
+# first credential is silently discarded. A discarded credential leaves the form
+# incomplete, and an incomplete form never renders the submit control at all --
+# which is what `EG_LOGIN_SUBMIT_NOT_APPEAR` was actually reporting. The delay is
+# a per-key pacing hint for that host, never a settle or a retry budget.
+LOGIN_KEY_ENTRY_DELAY_MS = 25
+
 # What a checkpoint observed. Only READY ends a recovery successfully; the rest
 # are transient inside the window and name the fail-closed message once the
 # deadline passes. UNRESOLVED is the exception: a locator that cannot be
@@ -342,12 +352,21 @@ class PlaywrightPortal:
             raise LayoutChangedError(stage_failure) from exc
 
     def _fill_login_field(self, page: Any, label: str, value: str) -> None:
-        """Fill one exact labelled credential field after proving it ready.
+        """Type one exact labelled credential field after proving it ready.
 
-        Readiness is recovered; the fill is not. A `fill()` that raises may
-        already have committed part of its value, so it is dispatched once and
-        the failure goes to the caller's classification. The value is never
-        logged, echoed, or read back.
+        The field is focused and then typed, because the portal's text-editing
+        host only adopts a value it observed being edited (see
+        `LOGIN_KEY_ENTRY_DELAY_MS`). Assigning the value instead leaves the
+        widget empty, and the resulting incomplete form never renders the
+        submit control -- a failure that surfaces at the submit step rather
+        than here, which is exactly what made it hard to place.
+
+        Readiness is recovered; the entry is not. Focus and typing may each
+        have partially committed before raising, so they are dispatched once
+        and the failure goes to the caller's classification. The locator is
+        re-queried by each action, so a host that replaces the input between
+        focus and typing is followed rather than held stale. The value is
+        never logged, echoed, or read back.
         """
 
         field = self._resolve_ready_control(
@@ -356,7 +375,8 @@ class PlaywrightPortal:
             f"login {label} field",
             classified=False,
         )
-        field.fill(value)
+        field.click()
+        field.press_sequentially(value, delay=LOGIN_KEY_ENTRY_DELAY_MS)
 
     def _submit_login(self, page: Any) -> None:
         """Click the canonical Login control exactly once, after proving it ready.
