@@ -2655,12 +2655,15 @@ class PortalLoginDispatchTests(unittest.TestCase):
         self.assertEqual(password.typed, 1)
 
     def test_each_credential_is_focused_then_typed_never_assigned(self) -> None:
-        """The entry contract the live portal actually requires.
+        """The observed entry contract: focused and typed, never assigned.
 
-        Assigning a credential reaches the DOM input but not the portal's
-        editing widget, so the form stays incomplete and no submit control is
-        ever rendered. Each field is therefore focused once and typed once, in
-        that order, and nothing is assigned.
+        Observed live: assignment-based credential entry left the canonical
+        Login control stably absent, while user-like typed entry on the same
+        path produced exactly one visible, enabled, actionable Login control.
+        The internal reason for that difference was not measured, so any
+        editing-widget or incomplete-form account of it stays hypothesis. Each
+        field is therefore focused once and typed once, in that order, and
+        nothing is assigned.
         """
         journal: list[str] = []
         username = FakeLocator(journal=journal, label="username")

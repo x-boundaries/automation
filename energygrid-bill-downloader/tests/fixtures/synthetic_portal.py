@@ -223,19 +223,26 @@ class SyntheticPortalServer:
                 )
 
             def _login_form(self) -> bytes:
-                """Model the observed credential-entry contract, not a plain form.
+                """Model the observed credential-entry distinction.
 
-                The live portal's text-editing host only adopts a credential it
-                observed being edited, and it renders no submit control until
-                both credentials are present. A directly assigned value reaches
-                the DOM input but not the widget, so the form stays incomplete
-                and the Login button never appears -- which is what the live
-                `EG_LOGIN_SUBMIT_NOT_APPEAR` terminal was reporting.
+                This fixture models the observed typed-vs-assigned distinction,
+                not the portal's internals. What was observed live is that
+                assignment-based entry left the canonical Login control stably
+                absent, while user-like typed entry on the same path produced
+                exactly one visible, enabled, actionable Login control. Any
+                account of why -- an editing host that ignores a value it did
+                not observe being edited, or an incomplete form as the sole
+                reason the live `EG_LOGIN_SUBMIT_NOT_APPEAR` terminal was
+                reported -- is hypothesis, not measured portal behaviour.
 
-                Keying off `keydown` reproduces exactly that distinction: a
-                value assignment fires `input` but no key events, while real
-                typing fires both. The submit control is therefore withheld
-                until both fields have been genuinely typed into.
+                Keying off `keydown` reproduces that distinction
+                deterministically, because a value assignment fires `input` but
+                no key events while real typing fires both. Withholding the
+                submit control until both fields have been typed into is a
+                deliberate conservative regression-model choice: it fails on a
+                regression to assignment for either credential. It is not
+                asserted as the live portal's exact internal implementation or
+                as a live invariant.
                 """
 
                 password_label = "Password"
