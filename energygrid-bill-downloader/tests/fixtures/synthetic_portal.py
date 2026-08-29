@@ -223,18 +223,60 @@ class SyntheticPortalServer:
                 )
 
             def _login_form(self) -> bytes:
+                """Model the observed credential-entry distinction.
+
+                This fixture models the observed typed-vs-assigned distinction,
+                not the portal's internals. What was observed live is that
+                assignment-based entry left the canonical Login control stably
+                absent, while user-like typed entry on the same path produced
+                exactly one visible, enabled, actionable Login control. Any
+                account of why -- an editing host that ignores a value it did
+                not observe being edited, or an incomplete form as the sole
+                reason the live `EG_LOGIN_SUBMIT_NOT_APPEAR` terminal was
+                reported -- is hypothesis, not measured portal behaviour.
+
+                Keying off `keydown` reproduces that distinction
+                deterministically, because a value assignment fires `input` but
+                no key events while real typing fires both. Withholding the
+                submit control until both fields have been typed into is a
+                deliberate conservative regression-model choice: it fails on a
+                regression to assignment for either credential. It is not
+                asserted as the live portal's exact internal implementation or
+                as a live invariant.
+                """
+
                 password_label = "Password"
                 if fixture.variant == "login_label_drift":
                     password_label = "Passcode"
+                script = """
+                <script>
+                const typed = {username: false, password: false};
+                function renderSubmit() {
+                    if (!typed.username || !typed.password) return;
+                    if (document.getElementById('login-submit')) return;
+                    const button = document.createElement('button');
+                    button.id = 'login-submit';
+                    button.type = 'submit';
+                    button.textContent = 'Login';
+                    document.getElementById('login-form').appendChild(button);
+                }
+                for (const name of ['username', 'password']) {
+                    const input = document.getElementById(name);
+                    input.addEventListener('keydown', () => {
+                        typed[name] = true;
+                        renderSubmit();
+                    });
+                }
+                </script>
+                """
                 return self._page(
                     "Login",
-                    "<form method=post action=/login>"
+                    '<form id="login-form" method=post action=/login>'
                     '<label for="username">Username</label>'
                     '<input id="username" name="username" type="text">'
                     f'<label for="password">{password_label}</label>'
                     '<input id="password" name="password" type="password">'
-                    '<button type="submit">Login</button>'
-                    "</form>",
+                    "</form>" + script,
                 )
 
             def _app_page(self) -> bytes:

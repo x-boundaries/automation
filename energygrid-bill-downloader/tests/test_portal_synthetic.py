@@ -502,7 +502,7 @@ class FakeLocator:
         click_error: Exception | None = None,
         trial_click_error: Exception | None = None,
         enabled_error: Exception | None = None,
-        fill_error: Exception | None = None,
+        type_error: Exception | None = None,
         journal: list[str] | None = None,
         label: str = "locator",
     ) -> None:
@@ -515,7 +515,7 @@ class FakeLocator:
         self._click_error = click_error
         self._trial_click_error = trial_click_error
         self._enabled_error = enabled_error
-        self._fill_error = fill_error
+        self._type_error = type_error
         self._journal = journal
         self._label = label
         self._clock: "FakePage | None" = None
@@ -528,7 +528,8 @@ class FakeLocator:
         self.trial_timeouts: list[int | None] = []
         self.enabled_checks = 0
         self.enabled_timeouts: list[int | None] = []
-        self.fills = 0
+        self.typed = 0
+        self.type_delays: list[int | None] = []
         self.waits = 0
         self.wait_timeouts: list[int | None] = []
 
@@ -620,11 +621,18 @@ class FakeLocator:
         if self._click_error is not None:
             raise self._click_error
 
-    def fill(self, value: str) -> None:
-        self.fills += 1
-        self._record("fill")
-        if self._fill_error is not None:
-            raise self._fill_error
+    def press_sequentially(self, value: str, delay: int | None = None) -> None:
+        """Model typed credential entry: real key events, not value assignment.
+
+        The production path types because the portal's editing host ignores an
+        assigned value. Counting the typed entries separately keeps "entered
+        once" assertable without ever holding the credential itself.
+        """
+        self.typed += 1
+        self.type_delays.append(delay)
+        self._record("press_sequentially")
+        if self._type_error is not None:
+            raise self._type_error
 
 
 class FakePage:
@@ -866,12 +874,12 @@ LOGIN_STEP_CASES = (
     ),
     (
         "username_fill",
-        lambda exc: {"username_field": FakeLocator(fill_error=exc)},
+        lambda exc: {"username_field": FakeLocator(type_error=exc)},
         "EG_LOGIN_USERNAME_FILL_FAILED",
     ),
     (
         "password_fill",
-        lambda exc: {"password_field": FakeLocator(fill_error=exc)},
+        lambda exc: {"password_field": FakeLocator(type_error=exc)},
         "EG_LOGIN_PASSWORD_FILL_FAILED",
     ),
     (
@@ -897,8 +905,10 @@ SUCCESSFUL_LOGIN_SEQUENCE = [
     "placeholder:wait_for",
     "login_entry:click_trial",
     "login_entry:click",
-    "username:fill",
-    "password:fill",
+    "username:click",
+    "username:press_sequentially",
+    "password:click",
+    "password:press_sequentially",
     "submit:click_trial",
     "submit:click",
     "billing_manager:wait_for",
@@ -1081,8 +1091,8 @@ class PreAuthLoginFailureReferenceTests(unittest.TestCase):
         self.assertEqual(locators["login_entry"].trial_clicks, 1)
         self.assertEqual(locators["submit"].clicks, 1)
         self.assertEqual(locators["submit"].trial_clicks, 1)
-        self.assertEqual(locators["username"].fills, 1)
-        self.assertEqual(locators["password"].fills, 1)
+        self.assertEqual(locators["username"].typed, 1)
+        self.assertEqual(locators["password"].typed, 1)
         self.assertEqual(locators["billing_manager"].waits, 1)
         # A healthy control needs no recovery, so nothing is spent waiting.
         self.assertEqual(page.waited_ms, [])
@@ -2628,7 +2638,7 @@ class PortalLoginDispatchTests(unittest.TestCase):
         self.assertEqual(ready.clicks, 1, "one real entry click, after one actionability proof")
         self.assertEqual(ready.trial_clicks, 1)
 
-    def test_lagging_credential_fields_are_each_filled_once(self) -> None:
+    def test_lagging_credential_fields_are_each_typed_once(self) -> None:
         absent_username = FakeLocator(count=0, label="absent_username")
         username = FakeLocator(label="username")
         hidden_password = FakeLocator(visible=False, label="hidden_password")
@@ -2639,10 +2649,47 @@ class PortalLoginDispatchTests(unittest.TestCase):
         )
 
         self.assertIsNone(self.attempt(page))
-        self.assertEqual(absent_username.fills, 0)
-        self.assertEqual(username.fills, 1, "a credential value is never appended twice")
-        self.assertEqual(hidden_password.fills, 0)
-        self.assertEqual(password.fills, 1)
+        self.assertEqual(absent_username.typed, 0)
+        self.assertEqual(username.typed, 1, "a credential value is never appended twice")
+        self.assertEqual(hidden_password.typed, 0)
+        self.assertEqual(password.typed, 1)
+
+    def test_each_credential_is_focused_then_typed_never_assigned(self) -> None:
+        """The observed entry contract: focused and typed, never assigned.
+
+        Observed live: assignment-based credential entry left the canonical
+        Login control stably absent, while user-like typed entry on the same
+        path produced exactly one visible, enabled, actionable Login control.
+        The internal reason for that difference was not measured, so any
+        editing-widget or incomplete-form account of it stays hypothesis. Each
+        field is therefore focused once and typed once, in that order, and
+        nothing is assigned.
+        """
+        journal: list[str] = []
+        username = FakeLocator(journal=journal, label="username")
+        password = FakeLocator(journal=journal, label="password")
+        page = login_page(username_field=username, password_field=password, journal=journal)
+
+        self.assertIsNone(self.attempt(page))
+        for field, name in ((username, "username"), (password, "password")):
+            self.assertEqual(field.clicks, 1, f"{name} is focused exactly once")
+            self.assertEqual(field.typed, 1, f"{name} is typed exactly once")
+            self.assertEqual(
+                field.type_delays,
+                [portal_module.LOGIN_KEY_ENTRY_DELAY_MS],
+                f"{name} is typed with the per-key pacing the editing host needs",
+            )
+        credential_steps = [step for step in journal if step.startswith(("username:", "password:"))]
+        self.assertEqual(
+            credential_steps,
+            [
+                "username:click",
+                "username:press_sequentially",
+                "password:click",
+                "password:press_sequentially",
+            ],
+            "focus precedes typing for each field, and no value is ever assigned",
+        )
 
     def test_a_delayed_billing_manager_postcondition_never_re_submits(self) -> None:
         submit = FakeLocator(label="submit")
