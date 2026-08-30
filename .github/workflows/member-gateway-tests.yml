@@ -157,7 +157,7 @@ jobs:
           python -m unittest             tests.test_member_intake_validate             tests.test_member_intake_decision_review             tests.test_member_create_uat_contract             tests.test_member_create_uat_result_precheck             tests.test_member_create_uat_n8n_mapping             tests.test_member_intake_n8n_dry_run_docs
 
   full-offline-regression:
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
     needs: [gateway-tests, powershell-static, n8n-offline, existing-member-regression]
     steps:
       - uses: actions/checkout@v4
