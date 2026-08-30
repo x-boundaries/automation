@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/schemas/member_gateway_result.v1.schema.json",
+  "title": "XB member gateway result v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "job_id", "operation", "result_hash", "status", "member_no", "dispatch_fence_id", "save_invocation_count", "readback_found", "readback_match", "reconciliation_required", "error_code", "acknowledged_at"],
+  "properties": {
+    "schema_version": {"const": "xb.member.gateway.result.v1"},
+    "job_id": {"type": "string", "pattern": "^job-[A-Za-z0-9]{16,64}$"},
+    "operation": {"const": "member.create"},
+    "result_hash": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "status": {"type": "string", "enum": ["CREATED_VERIFIED", "WRITE_OUTCOME_UNCERTAIN", "CONFIRMED_NOT_CREATED", "CREATED_READBACK_MISMATCH"]},
+    "member_no": {"type": "string", "pattern": "^65[89][0-9]{7}(?:X[1-9][0-9]*)?$"},
+    "dispatch_fence_id": {"type": "string", "pattern": "^fence-[A-Za-z0-9]{16,64}$"},
+    "save_invocation_count": {"type": "integer", "const": 1},
+    "readback_found": {"type": "boolean"},
+    "readback_match": {"type": "boolean"},
+    "reconciliation_required": {"type": "boolean"},
+    "error_code": {"type": ["string", "null"]},
+    "acknowledged_at": {"type": "string", "format": "date-time"}
+  }
+}

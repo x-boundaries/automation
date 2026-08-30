@@ -1,0 +1,180 @@
+name: member-gateway-tests
+
+on:
+  pull_request:
+    paths:
+      - "member_gateway/**"
+      - "schemas/member_gateway_source_event.v1.schema.json"
+      - "schemas/member_gateway_job.v1.schema.json"
+      - "schemas/member_gateway_result.v1.schema.json"
+      - "schemas/member_gateway_error.v1.schema.json"
+      - "config/member_gateway.production.example.json"
+      - "scripts/ac2_member_gateway_worker.ps1"
+      - "scripts/ac2_member_gateway_worker_lib.ps1"
+      - "scripts/ac2_member_gateway_autocount_adapter.ps1"
+      - "tests/test_member_gateway_worker_static.py"
+      - "tests/test_member_gateway_n8n.py"
+      - "tests/test_member_gateway_ci.py"
+      - "tests/test_member_gateway_privacy.py"
+      - "docs/autocount2-automation/member_gateway_production_contract.md"
+      - "docs/autocount2-automation/member_gateway_production_runbook.md"
+      - "docs/ci-cd/CURRENT_CICD_STATUS.md"
+      - "n8n-workflows/member_forms_gateway_ingest.workflow.json"
+      - ".github/workflows/member-gateway-tests.yml"
+  push:
+    branches:
+      - "main"
+    paths:
+      - "member_gateway/**"
+      - "schemas/member_gateway_source_event.v1.schema.json"
+      - "schemas/member_gateway_job.v1.schema.json"
+      - "schemas/member_gateway_result.v1.schema.json"
+      - "schemas/member_gateway_error.v1.schema.json"
+      - "config/member_gateway.production.example.json"
+      - "scripts/ac2_member_gateway_worker.ps1"
+      - "scripts/ac2_member_gateway_worker_lib.ps1"
+      - "scripts/ac2_member_gateway_autocount_adapter.ps1"
+      - "tests/test_member_gateway_worker_static.py"
+      - "tests/test_member_gateway_n8n.py"
+      - "tests/test_member_gateway_ci.py"
+      - "tests/test_member_gateway_privacy.py"
+      - "docs/autocount2-automation/member_gateway_production_contract.md"
+      - "docs/autocount2-automation/member_gateway_production_runbook.md"
+      - "docs/ci-cd/CURRENT_CICD_STATUS.md"
+      - "n8n-workflows/member_forms_gateway_ingest.workflow.json"
+      - ".github/workflows/member-gateway-tests.yml"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+env:
+  PYTHONPATH: member_gateway/src
+
+jobs:
+  gateway-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Assert literal exact-head checkout
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          ACTUAL_SHA="$(git rev-parse HEAD)"
+          test "${ACTUAL_SHA}" = "${EXPECTED_SHA}"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Compile and run gateway contracts
+        shell: bash
+        run: |
+          python -m compileall -q member_gateway/src member_gateway/tests
+          python -m unittest discover -s member_gateway/tests -p "test_*.py" -v
+      - name: Run offline repository/static/privacy checks
+        shell: bash
+        run: |
+          python -m unittest tests.test_member_gateway_n8n tests.test_member_gateway_ci tests.test_member_gateway_privacy tests.test_member_gateway_worker_static -v
+      - name: Check whitespace
+        shell: bash
+        run: git diff --check HEAD^ HEAD
+
+  powershell-static:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Assert literal exact-head checkout
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          ACTUAL_SHA="$(git rev-parse HEAD)"
+          test "${ACTUAL_SHA}" = "${EXPECTED_SHA}"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Parse worker and adapter without executing them
+        shell: pwsh
+        run: python -m unittest tests.test_member_gateway_worker_static -v
+
+  n8n-offline:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Assert literal exact-head checkout
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          ACTUAL_SHA="$(git rev-parse HEAD)"
+          test "${ACTUAL_SHA}" = "${EXPECTED_SHA}"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Validate repository n8n exports offline
+        shell: bash
+        run: node n8n-workflows/scripts/validate-n8n-workflows.cjs
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Validate inactive export shape
+        shell: bash
+        run: python -m unittest tests.test_member_gateway_n8n -v
+
+  existing-member-regression:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Assert literal exact-head checkout
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          ACTUAL_SHA="$(git rev-parse HEAD)"
+          test "${ACTUAL_SHA}" = "${EXPECTED_SHA}"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run relevant synthetic member regression tests
+        shell: bash
+        run: |
+          python -m unittest             tests.test_member_intake_validate             tests.test_member_intake_decision_review             tests.test_member_create_uat_contract             tests.test_member_create_uat_result_precheck             tests.test_member_create_uat_n8n_mapping             tests.test_member_intake_n8n_dry_run_docs
+
+  full-offline-regression:
+    runs-on: ubuntu-latest
+    needs: [gateway-tests, powershell-static, n8n-offline, existing-member-regression]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Assert literal exact-head checkout
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          ACTUAL_SHA="$(git rev-parse HEAD)"
+          test "${ACTUAL_SHA}" = "${EXPECTED_SHA}"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run repository offline suite
+        shell: bash
+        run: python tests/_run_ci_full_suite.py

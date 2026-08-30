@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/schemas/member_gateway_source_event.v1.schema.json",
+  "title": "XB member source event v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "source_system",
+    "form_alias",
+    "response_id",
+    "create_time",
+    "mapping_version",
+    "request_id",
+    "payload",
+    "payload_hash",
+    "operation"
+  ],
+  "properties": {
+    "schema_version": {"const": "xb.member.source_event.v1"},
+    "source_system": {"const": "google_forms"},
+    "form_alias": {"type": "string", "pattern": "^[A-Za-z0-9._:-]{1,100}$"},
+    "response_id": {"type": "string", "pattern": "^[A-Za-z0-9._:-]{1,200}$"},
+    "create_time": {"type": "string", "format": "date-time"},
+    "mapping_version": {"type": "string", "pattern": "^[A-Za-z0-9._:-]{1,100}$"},
+    "request_id": {"type": "string", "pattern": "^[A-Za-z0-9._:-]{1,200}$"},
+    "payload_hash": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "operation": {"const": "member.create"},
+    "payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "phone", "email", "birthday_month", "marketing_consent", "pdpa_acknowledged"],
+      "properties": {
+        "name": {"type": "string", "minLength": 1, "maxLength": 200},
+        "phone": {"type": "string", "pattern": "^65[89][0-9]{7}$"},
+        "email": {"type": "string", "format": "email", "maxLength": 254},
+        "birthday_month": {
+          "type": "string",
+          "enum": ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"]
+        },
+        "marketing_consent": {"type": "string", "enum": ["Yes", "No"]},
+        "pdpa_acknowledged": {"type": "boolean"}
+      }
+    }
+  }
+}

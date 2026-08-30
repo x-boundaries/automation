@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "xb-member-gateway"
+version = "0.1.0"
+description = "Bounded X-Boundaries member.create gateway boundary"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+postgres = ["psycopg[binary]>=3.2,<4"]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

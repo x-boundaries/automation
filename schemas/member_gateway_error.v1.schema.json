@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/schemas/member_gateway_error.v1.schema.json",
+  "title": "XB member gateway safe error v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "trace_id", "error_code", "message"],
+  "properties": {
+    "schema_version": {"const": "xb.member.gateway.error.v1"},
+    "trace_id": {"type": "string", "pattern": "^trace-[A-Za-z0-9]{16,64}$"},
+    "error_code": {"type": "string", "pattern": "^[a-z0-9_.:-]{1,80}$"},
+    "message": {"const": "Request rejected; use trace_id for support."}
+  }
+}
