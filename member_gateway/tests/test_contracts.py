@@ -143,6 +143,7 @@ class ContractSurfaceTests(unittest.TestCase):
         self.assertNotIn("6581234567X10", values)
         self.assertFalse(allocator.validate_candidate("6581234567", "658123456"))
         self.assertFalse(allocator.validate_candidate("6581234567", "6581234567-1"))
+        self.assertFalse(allocator.validate_candidate("6581234567", "6581234567X01"))
 
 
 if __name__ == "__main__":

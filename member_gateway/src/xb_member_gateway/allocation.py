@@ -66,7 +66,7 @@ class MemberNoAllocator:
         if not candidate.startswith(f"{base_phone}X"):
             return False
         suffix = candidate[len(base_phone) + 1 :]
-        return suffix.isdigit() and int(suffix) >= 1 and len(candidate) <= self.max_length
+        return suffix.isdigit() and not suffix.startswith("0") and int(suffix) >= 1 and len(candidate) <= self.max_length
 
     def allocate(
         self,
