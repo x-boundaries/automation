@@ -36,8 +36,15 @@ and claim size at one for this initial topology.
 
 ## Operating sequence after a separately approved activation
 
-1. Keep the kill switch set until readiness, source mapping, and adapter checks
-   are green.
+The kill switch defaults to ON. To engage it, use the separately scoped
+`POST /v1/control/kill-switch/enable` operation with the `control.kill_switch`
+scope and an empty body. Engagement fails closed for new claims and dispatch.
+Clearing is separate: use `POST /v1/control/kill-switch/disable` only after the
+owner has verified the remaining predicates and is observing the approved
+window.
+
+1. Keep the kill switch engaged until readiness, source mapping, and adapter
+   checks are green.
 2. Enable only the approved private source/gateway transport and verify that
    the workflow remains inactive until the explicit activation procedure.
 3. Enable gateway activation through the scoped control endpoint with an
@@ -57,11 +64,13 @@ automatic recreation. Any mismatch or ambiguous lookup stays in manual review.
 
 ## Stop and disable
 
-Use the scoped kill-switch control on any source, mapping, readiness, lease,
-allocation, adapter, database, or readback anomaly. The worker must stop
-claiming while the switch is set. Do not delete history or reset a job to make a
-retry appear clean; preserve the source, allocation, intent, fence, result, and
-reconciliation lineage.
+Use the scoped `POST /v1/control/kill-switch/enable` operation on any source,
+mapping, readiness, lease, allocation, adapter, database, or readback anomaly.
+The worker must stop claiming and no new dispatch fence may be recorded while
+the switch is set. Do not delete history or reset a job to make a retry appear
+clean; preserve the source, allocation, intent, fence, result, and
+reconciliation lineage. Only the separately scoped `.../disable` operation may
+clear the switch after controlled review.
 
 ## Recovery boundaries
 

@@ -123,8 +123,10 @@ function Invoke-XbMemberGatewayWorkerCycle {
 
     try {
         $writeOutcome = & $CreateMember $job $allocation
+        $readbackFound = [bool]$writeOutcome.readback_found
         $readbackMatch = [bool]$writeOutcome.readback_match
-        $status = if ($readbackMatch) { "CREATED_VERIFIED" } else { "CREATED_READBACK_MISMATCH" }
+        $status = if (-not $readbackFound) { "WRITE_OUTCOME_UNCERTAIN" } elseif ($readbackMatch) { "CREATED_VERIFIED" } else { "CREATED_READBACK_MISMATCH" }
+        $errorCode = if (-not $readbackFound) { "readback_absent" } elseif (-not $readbackMatch) { "readback_mismatch_manual_review" } else { $null }
         & $GatewayRequest $GatewayBaseUrl ("/v1/jobs/{0}/result" -f $jobId) "POST" @{
             schema_version = "xb.member.gateway.result.v1"
             job_id = $jobId
@@ -133,9 +135,9 @@ function Invoke-XbMemberGatewayWorkerCycle {
             status = $status
             member_no = [string]$allocation.member_no
             save_invocation_count = [int]$writeOutcome.save_invocation_count
-            readback_found = $true
+            readback_found = $readbackFound
             readback_match = $readbackMatch
-            error_code = if ($readbackMatch) { $null } else { "readback_mismatch_manual_review" }
+            error_code = $errorCode
         } | Out-Null
         return [pscustomobject]@{ status = $status; writes = 1; dispatch_fence = $true }
     }

@@ -50,6 +50,28 @@ class MemberGatewayWorkerStaticTests(unittest.TestCase):
         self.assertNotIn("UPDATE ", adapter.upper())
         self.assertNotIn("DELETE ", adapter.upper())
 
+    def test_adapter_exposes_reviewed_session_and_exact_readback_seams(self):
+        adapter = (ROOT / "scripts/ac2_member_gateway_autocount_adapter.ps1").read_text(
+            encoding="utf-8"
+        )
+        for marker in (
+            "CreateAutoCountDefaultDBSetting",
+            "UserSession",
+            "Authenticate",
+            "-Name \"Login\"",
+            "System.Data.DataRow",
+            "SessionFactory",
+            "ReadBackFound",
+        ):
+            self.assertIn(marker, adapter)
+        self.assertNotIn("autocount_session_factory_binding_required", adapter)
+
+        worker_lib = (ROOT / "scripts/ac2_member_gateway_worker_lib.ps1").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("$readbackFound", worker_lib)
+        self.assertNotIn("readback_found = $true", worker_lib)
+
     def test_powershell_parser_accepts_new_worker_files_when_available(self):
         pwsh = shutil.which("pwsh") or shutil.which("powershell")
         if pwsh is None:

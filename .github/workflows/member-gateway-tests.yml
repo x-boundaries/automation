@@ -16,6 +16,9 @@ on:
       - "tests/test_member_gateway_n8n.py"
       - "tests/test_member_gateway_ci.py"
       - "tests/test_member_gateway_privacy.py"
+      - "tests/test_member_gateway_adapter_ps.py"
+      - "tests/test_member_gateway_worker_cycle_ps.py"
+      - "tests/fixtures/member_forms_google_v1.fixture"
       - "docs/autocount2-automation/member_gateway_production_contract.md"
       - "docs/autocount2-automation/member_gateway_production_runbook.md"
       - "docs/ci-cd/CURRENT_CICD_STATUS.md"
@@ -38,6 +41,9 @@ on:
       - "tests/test_member_gateway_n8n.py"
       - "tests/test_member_gateway_ci.py"
       - "tests/test_member_gateway_privacy.py"
+      - "tests/test_member_gateway_adapter_ps.py"
+      - "tests/test_member_gateway_worker_cycle_ps.py"
+      - "tests/fixtures/member_forms_google_v1.fixture"
       - "docs/autocount2-automation/member_gateway_production_contract.md"
       - "docs/autocount2-automation/member_gateway_production_runbook.md"
       - "docs/ci-cd/CURRENT_CICD_STATUS.md"
@@ -101,9 +107,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Parse worker and adapter without executing them
+      - name: Run worker and adapter offline behavioral tests
         shell: pwsh
-        run: python -m unittest tests.test_member_gateway_worker_static -v
+        run: >-
+          python -m unittest tests.test_member_gateway_worker_static
+          tests.test_member_gateway_adapter_ps
+          tests.test_member_gateway_worker_cycle_ps -v
 
   n8n-offline:
     runs-on: ubuntu-latest

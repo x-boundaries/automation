@@ -257,5 +257,27 @@ class ApiBoundaryTests(unittest.TestCase):
         self.assertFalse(repository.get_control()["kill_switch_enabled"])
 
 
+
+    def test_kill_switch_engage_blocks_claim_and_controlled_clear_restores_eligibility(self):
+        engaged = self.call("POST", "/v1/control/kill-switch/enable", {})
+        self.assertEqual(engaged.status, 200)
+        self.assertTrue(engaged.body["kill_switch_enabled"])
+        self.assertTrue(self.repository.get_control()["kill_switch_enabled"])
+
+        ingested = self.call(
+            "POST", "/v1/source-events", make_event("api-kill-switch-response")
+        )
+        self.assertEqual(ingested.status, 202)
+        blocked = self.call("POST", "/v1/worker/claim", {})
+        self.assertEqual(blocked.status, 423)
+        self.assertEqual(blocked.body["error_code"], "kill_switch_enabled")
+
+        cleared = self.call("POST", "/v1/control/kill-switch/disable", {})
+        self.assertEqual(cleared.status, 200)
+        self.assertFalse(cleared.body["kill_switch_enabled"])
+        claimed = self.call("POST", "/v1/worker/claim", {})
+        self.assertEqual(claimed.status, 200)
+        self.assertTrue(claimed.body["claimed"])
+
 if __name__ == "__main__":
     unittest.main()

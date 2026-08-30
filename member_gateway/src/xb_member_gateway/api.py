@@ -392,6 +392,10 @@ class GatewayService:
         self.repository.set_control("kill_switch_enabled", False)
         return {"status": "disabled", "kill_switch_enabled": False}
 
+    def enable_kill_switch(self) -> dict[str, Any]:
+        self.repository.set_control("kill_switch_enabled", True)
+        return {"status": "enabled", "kill_switch_enabled": True}
+
     def enable_activation(self, body: Mapping[str, Any]) -> dict[str, Any]:
         _exact_fields(body, {"enabled", "environment", "approval_reference"})
         if body["enabled"] is not True or body["environment"] != self.config.expected_environment:
@@ -516,6 +520,11 @@ class GatewayApp:
                 if value:
                     _exact_fields(value, set())
                 return ApiResponse(200, self.service.disable_kill_switch())
+            if method == "POST" and route == "/v1/control/kill-switch/enable":
+                self._principal(headers, "control.kill_switch")
+                if value:
+                    _exact_fields(value, set())
+                return ApiResponse(200, self.service.enable_kill_switch())
             if method == "POST" and route == "/v1/control/activation":
                 self._principal(headers, "control.activate")
                 return ApiResponse(200, self.service.enable_activation(value))

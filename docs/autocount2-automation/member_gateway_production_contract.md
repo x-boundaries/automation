@@ -26,9 +26,11 @@ insignificant whitespace is hashed before ingest.
 
 `response_id` is immutable. A same-ID/same-hash replay returns the original job;
 a same-ID/different-hash observation is a conflict; a different ID remains a
-different signup even when its customer fields match. Poll pagination rejects
-repeated or malformed page tokens and the overlap helper removes duplicate
-observations before ingest.
+different signup even when its customer fields match. The checked-in inactive
+adapter consumes the Google Forms v1 `responses` shape and maps required values
+only through the versioned question-ID allowlist; it follows `nextPageToken`
+with a bounded `pageToken` request, rejects malformed or repeated tokens, and
+de-duplicates overlapping `responseId` observations before ingest.
 
 ## Member semantics
 
@@ -65,6 +67,16 @@ constraint, no prior fence/result/uncertain state, attempt/deadline limits,
 gateway/adapter readiness, valid worker credential, immediate kill-switch
 recheck, and zero prior SaveMember invocations.
 
+## Kill-switch control
+
+The repository control plane exposes only the scoped member-gateway kill-switch
+operations: `POST /v1/control/kill-switch/enable` engages
+`kill_switch_enabled=true` and `POST /v1/control/kill-switch/disable` clears it.
+The default is ON. Engaging the switch fails closed for new claims and for the
+dispatch fence; clearing it is a separately authorised operation and does not
+bypass any other eligibility predicate. These endpoints are not generic database
+or administrator controls.
+
 ## State and irreversible boundary
 
 The validated state machine includes `RECEIVED`, `VALIDATED`, `QUEUED`,
@@ -90,9 +102,14 @@ exactly one `SaveMember(MemberEntity)`. It assigns and verifies:
 `RegisterDate`, `ExpiryDate`, `OpeningPoints`, `IsActive`, and `Individual`.
 
 `IsActive` and `Individual` are adapter-managed defaults. Update, delete, direct
-SQL, batch writes, and fallback creation are outside this contract. Runtime
-session construction is intentionally an external deployment prerequisite and
-is not represented by a repository credential.
+SQL, batch writes, and fallback creation are outside this contract. The adapter
+has an executable reviewed session boundary: it loads the established AutoCount
+assemblies, creates `DBSetting`, runs the established `UserSession`
+authentication/login sequence, and accepts a private deployment-bound session
+factory when supplied. Server, database, user, password-environment name, and
+assembly path are process-scoped deployment values; secrets remain outside Git
+and are never printed. No repository credential or new credential topology is
+introduced.
 
 ## Persistence and trust boundary
 

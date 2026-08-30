@@ -197,13 +197,13 @@ class GatewayTests(unittest.TestCase):
         service.ingest(event())
         with self.assertRaises(ApiError):
             service.claim("worker-1")
-        repo.set_control("kill_switch_enabled", False)
+        service.disable_kill_switch()
         repo.set_control("production_activation_enabled", True)
         job = service.claim("worker-1")["job"]
         service.precheck(job["job_id"], "worker-1")
         self.bind_base(job, service=service)
         service.write_intent(job["job_id"], "worker-1", {"operation": "member.create", "member_no": job["member_payload"]["phone"], "payload_hash": job["payload_hash"]}, principal_valid=True)
-        repo.set_control("kill_switch_enabled", True)
+        service.enable_kill_switch()
         with self.assertRaises(ApiError):
             service.dispatch_fence(job["job_id"], "worker-1", {"operation": "member.create", "member_no": job["member_payload"]["phone"]}, principal_valid=True)
 
