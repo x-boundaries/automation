@@ -23,9 +23,9 @@ $probe = {
     param([string]$Candidate)
     $member = Get-XbAutoCountMember -Session $session -MemberNo $Candidate -MemberCommandFactory $MemberCommandFactory
     if ($null -eq $member) {
-        [pscustomobject]@{ status = "FREE"; probe_reference = "local-read-only" }
+        [pscustomobject]@{ status = "FREE" }
     } else {
-        [pscustomobject]@{ status = "OCCUPIED"; probe_reference = "local-read-only" }
+        [pscustomobject]@{ status = "OCCUPIED" }
     }
 }
 $create = {

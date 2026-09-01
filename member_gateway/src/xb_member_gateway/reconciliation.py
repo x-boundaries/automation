@@ -6,7 +6,6 @@ from datetime import datetime
 from typing import Any, Mapping, Protocol
 
 from .models import AllocationRecord, DispatchFenceRecord, JobRecord, JobState, ResultRecord, ResultStatus
-from .repository import InMemoryRepository
 from .results import build_member_record, compare_readback, make_result
 
 
@@ -21,16 +20,17 @@ def reconcile_uncertain_write(
     allocation: AllocationRecord,
     fence: DispatchFenceRecord,
     adapter: ReconciliationAdapter,
-    repository: InMemoryRepository,
+    repository: Any,
     worker_id: str | None = None,
     now: datetime | None = None,
 ) -> ResultRecord:
     """Use only the already bound MemberNo; this function never calls SaveMember."""
 
-    if job.state not in {JobState.WRITE_OUTCOME_UNCERTAIN, JobState.MANUAL_REVIEW}:
+    if job.state != JobState.WRITE_OUTCOME_UNCERTAIN:
         raise ValueError("reconciliation_requires_uncertain_state")
     if allocation.member_no != fence.member_no or job.allocation_member_no != fence.member_no:
         raise ValueError("reconciliation_member_binding_invalid")
+    case = repository.open_reconciliation_case(job.job_id, fence.member_no, now=now)
     try:
         actual = adapter.get_member(fence.member_no)
     except Exception:
@@ -44,12 +44,20 @@ def reconcile_uncertain_write(
             error_code="reconciliation_lookup_uncertain",
             acknowledged_at=now,
         )
-        repository.acknowledge_result(result, worker_id=worker_id, require_lease=False, now=now)
+        repository.record_reconciliation_check(case.case_id, "ambiguous", False, False, now=now)
+        repository.acknowledge_result(
+            result,
+            worker_id=worker_id,
+            require_lease=False,
+            reconciliation_case_id=case.case_id,
+            now=now,
+        )
         return result
 
     expected = build_member_record(job, fence.member_no)
     if actual is None:
         # Positive absence does not authorize a second create.
+        lookup_status = "absent"
         result = make_result(
             job=job,
             fence=fence,
@@ -63,6 +71,7 @@ def reconcile_uncertain_write(
     else:
         check = compare_readback(expected, actual)
         if check.match:
+            lookup_status = "exact_match"
             result = make_result(
                 job=job,
                 fence=fence,
@@ -83,5 +92,19 @@ def reconcile_uncertain_write(
                 error_code="readback_mismatch_manual_review",
                 acknowledged_at=now,
             )
-    repository.acknowledge_result(result, worker_id=worker_id, require_lease=False, now=now)
+            lookup_status = "mismatch"
+    repository.record_reconciliation_check(
+        case.case_id,
+        lookup_status,
+        result.readback_found,
+        result.readback_match,
+        now=now,
+    )
+    repository.acknowledge_result(
+        result,
+        worker_id=worker_id,
+        require_lease=False,
+        reconciliation_case_id=case.case_id,
+        now=now,
+    )
     return result

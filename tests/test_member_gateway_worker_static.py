@@ -35,6 +35,29 @@ class MemberGatewayWorkerStaticTests(unittest.TestCase):
         self.assertIn("GatewayBaseUrl -notmatch '^https://'", text)
         self.assertIn("if (-not $EnableProductionWorker)", text)
 
+    def test_worker_session_and_probe_references_are_public_safe_and_run_scoped(self):
+        worker = (ROOT / "scripts/ac2_member_gateway_worker.ps1").read_text(encoding="utf-8")
+        library = (ROOT / "scripts/ac2_member_gateway_worker_lib.ps1").read_text(encoding="utf-8")
+        text = worker + "\n" + library
+        self.assertIn("X-XB-Worker-Session", library)
+        self.assertIn("New-XbMemberGatewayWorkerSession", library)
+        self.assertIn("New-XbMemberGatewayProbeReference", library)
+        self.assertIn("'^ws-[0-9a-f]{32}$'", library)
+        self.assertIn("'^[0-9a-f]{32}$'", library)
+        self.assertNotIn("local-read-only", text)
+        self.assertNotIn("-WorkerSession $WorkerId", text)
+        for private_identity in (
+            "MachineName",
+            "ComputerName",
+            "COMPUTERNAME",
+            "UserName",
+            "USERNAME",
+            "USERDOMAIN",
+            "WindowsIdentity",
+            "SecurityIdentifier",
+        ):
+            self.assertNotIn(private_identity, text)
+
     def test_adapter_uses_only_the_reviewed_member_create_surface(self):
         adapter = (ROOT / "scripts/ac2_member_gateway_autocount_adapter.ps1").read_text(
             encoding="utf-8"

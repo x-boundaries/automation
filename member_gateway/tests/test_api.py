@@ -84,7 +84,10 @@ class ApiBoundaryTests(unittest.TestCase):
                 }
             ),
         )
-        self.headers = {"Authorization": "Bearer synthetic-worker-token"}
+        self.headers = {
+            "Authorization": "Bearer synthetic-worker-token",
+            "X-XB-Worker-Session": "ws-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        }
 
     def call(self, method, path, body=None, headers=None):
         return self.app.handle(
@@ -121,6 +124,27 @@ class ApiBoundaryTests(unittest.TestCase):
         self.assertEqual(response.status, 403)
         self.assertEqual(response.body["error_code"], "scope_denied")
 
+    def test_worker_session_header_is_required_and_strictly_bounded(self):
+        missing = self.call(
+            "POST",
+            "/v1/worker/claim",
+            {},
+            headers={"Authorization": "Bearer synthetic-worker-token"},
+        )
+        self.assertEqual(missing.status, 400)
+        self.assertEqual(missing.body["error_code"], "worker_session_invalid")
+        uppercase = self.call(
+            "POST",
+            "/v1/worker/claim",
+            {},
+            headers={
+                "Authorization": "Bearer synthetic-worker-token",
+                "X-XB-Worker-Session": "ws-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            },
+        )
+        self.assertEqual(uppercase.status, 400)
+        self.assertEqual(uppercase.body["error_code"], "worker_session_invalid")
+
     def test_member_vertical_slice_routes_and_safe_status(self):
         ingested = self.call("POST", "/v1/source-events", make_event())
         self.assertEqual(ingested.status, 202)
@@ -147,6 +171,12 @@ class ApiBoundaryTests(unittest.TestCase):
             },
         )
         self.assertEqual(probed.status, 200)
+        rechecked = self.call(
+            "POST",
+            f"/v1/jobs/{job_id}/allocation/recheck",
+            {"status": "FREE", "probe_reference": "api-synthetic-recheck-001"},
+        )
+        self.assertEqual(rechecked.status, 200)
         intent = self.call(
             "POST",
             f"/v1/jobs/{job_id}/write-intent",

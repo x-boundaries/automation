@@ -49,6 +49,16 @@ def _header(headers: Mapping[str, str], name: str) -> str | None:
 
 _SUBJECT_RE = re.compile(r"^[A-Za-z0-9._:-]{1,100}$")
 _DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+WORKER_SESSION_HEADER = "X-XB-Worker-Session"
+WORKER_SESSION_RE = re.compile(r"^ws-[0-9a-f]{32}$")
+
+
+def worker_session(value: str) -> str:
+    """Validate the public-safe per-process lease/session identifier."""
+
+    if not isinstance(value, str) or not WORKER_SESSION_RE.fullmatch(value):
+        raise AuthenticationError("worker_session_invalid")
+    return value
 
 
 class BearerTokenAuthenticator:

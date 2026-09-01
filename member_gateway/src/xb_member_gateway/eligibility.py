@@ -23,12 +23,13 @@ class EligibilityContext:
     worker_id: str | None = None
     lease_owner: str | None = None
     positive_free_evidence: bool | None = None
+    fresh_bound_member_no_recheck: bool | None = None
     gateway_ready: bool | None = None
     autocount_adapter_ready: bool | None = None
     worker_credential_valid: bool | None = None
     kill_switch_rechecked: bool | None = None
     save_invocation_count: int | None = None
-    rate_allowed: bool | None = True
+    rate_allowed: bool | None = None
     source_conflict: bool | None = False
     now: datetime | None = None
 
@@ -103,6 +104,7 @@ def evaluate_eligibility(context: EligibilityContext) -> EligibilityDecision:
         and job.lease_owner == context.worker_id,
         "bound_allocation": allocation is not None and job.allocation_member_no == allocation.member_no,
         "positive_free_candidate_evidence": context.positive_free_evidence,
+        "fresh_bound_member_no_recheck": context.fresh_bound_member_no_recheck,
         "production_member_no_constraint_valid": config.member_no_constraint_valid
         and allocation is not None
         and len(allocation.member_no) <= (config.member_no_max_length or 0),

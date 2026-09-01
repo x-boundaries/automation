@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import re
 from typing import Any, Mapping
 
 from .canonical import birthday_month_to_dob, canonical_json, derive_register_and_expiry
@@ -15,6 +16,7 @@ ASSIGNED_FIELDS = (
     "RegisterDate", "ExpiryDate", "OpeningPoints", "IsActive", "Individual",
 )
 ADAPTER_MANAGED_FIELDS = ("IsActive", "Individual")
+FENCE_ID_RE = re.compile(r"^fence-[A-Za-z0-9]{16,64}$")
 
 
 class ResultValidationError(ValueError):
@@ -63,6 +65,8 @@ def _validate_error_code(value: str | None) -> str | None:
 def make_result(*, job: JobRecord, fence: DispatchFenceRecord, status: ResultStatus, save_invocation_count: int, readback_found: bool, readback_match: bool, error_code: str | None = None, acknowledged_at: datetime | None = None) -> ResultRecord:
     if job.operation != "member.create" or fence.operation != "member.create" or job.allocation_member_no != fence.member_no:
         raise ResultValidationError("member_no_binding_invalid")
+    if not FENCE_ID_RE.fullmatch(fence.fence_id):
+        raise ResultValidationError("dispatch_fence_id_invalid")
     if isinstance(save_invocation_count, bool) or save_invocation_count != 1:
         raise ResultValidationError("save_invocation_count_must_be_one")
     if not isinstance(readback_found, bool) or not isinstance(readback_match, bool):
@@ -105,6 +109,8 @@ def result_contract(value: Mapping[str, Any]) -> dict[str, Any]:
         raise ResultValidationError("result_schema_or_operation_invalid")
     if not isinstance(value["job_id"], str) or not isinstance(value["dispatch_fence_id"], str) or not isinstance(value["member_no"], str):
         raise ResultValidationError("result_identity_invalid")
+    if not FENCE_ID_RE.fullmatch(value["dispatch_fence_id"]):
+        raise ResultValidationError("dispatch_fence_id_invalid")
     if isinstance(value["save_invocation_count"], bool) or value["save_invocation_count"] != 1:
         raise ResultValidationError("save_invocation_count_must_be_one")
     if not isinstance(value["readback_found"], bool) or not isinstance(value["readback_match"], bool):

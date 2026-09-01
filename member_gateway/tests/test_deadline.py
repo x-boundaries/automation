@@ -57,6 +57,11 @@ class AttemptDeadlineTests(unittest.TestCase):
                 "probe_reference": "deadline-free-001",
             },
         )
+        service.allocation_recheck(
+            job["job_id"],
+            "worker-1",
+            {"status": "FREE", "probe_reference": "deadline-recheck-001"},
+        )
         service.clock = NOW + timedelta(seconds=301)
         with self.assertRaises(ApiError):
             service.write_intent(

@@ -17,11 +17,15 @@ param(
 $ErrorActionPreference = "Stop"
 . $Lib
 
-$state = @{ result = $null; paths = @() }
+$state = @{ result = $null; paths = @(); sessions = @(); probe_refs = @() }
 $gateway = {
-    param($Base, $Path, $Method, $Body)
+    param($Base, $Path, $Method, $Body, $WorkerSession)
     $thisState = $state
     $thisState.paths += $Path
+    $thisState.sessions += $WorkerSession
+    if ($Path -like "*/allocation/probe" -or $Path -like "*/allocation/recheck") {
+        $thisState.probe_refs += [string]$Body.probe_reference
+    }
     if ($Path -eq "/readyz") { return [pscustomobject]@{ ready = $true } }
     if ($Path -eq "/v1/worker/claim") {
         return [pscustomobject]@{
@@ -37,7 +41,7 @@ $gateway = {
     }
     if ($Path -like "*/allocation/recheck") { return [pscustomobject]@{ state = "ALLOCATION_BOUND" } }
     if ($Path -like "*/dispatch-fence") {
-        return [pscustomobject]@{ state = "WRITING"; dispatch_fence_id = "fence-1" }
+        return [pscustomobject]@{ state = "WRITING"; dispatch_fence_id = "fence-1234567890abcdef" }
     }
     if ($Path -like "*/result") {
         $thisState.result = $Body
@@ -48,7 +52,7 @@ $gateway = {
 
 $probe = {
     param([string]$Candidate)
-    [pscustomobject]@{ status = "FREE"; probe_reference = "synthetic-free" }
+    [pscustomobject]@{ status = "FREE" }
 }
 $create = {
     param($Job, $Allocation)
@@ -69,6 +73,9 @@ $result = Invoke-XbMemberGatewayWorkerCycle -GatewayBaseUrl "https://gateway.exa
     readback_found = $state.result.readback_found
     readback_match = $state.result.readback_match
     error_code = $state.result.error_code
+    session_valid = (@($state.sessions | Where-Object { $_ -notmatch '^ws-[0-9a-f]{32}$' }).Count -eq 0)
+    session_count = @($state.sessions | Select-Object -Unique).Count
+    probe_refs_distinct = (@($state.probe_refs | Select-Object -Unique).Count -eq 2)
 } | ConvertTo-Json -Compress
 """
 
@@ -126,6 +133,10 @@ class MemberGatewayWorkerCyclePowerShellTests(unittest.TestCase):
         self.assertFalse(absent["readback_match"])
         self.assertEqual(absent["error_code"], "readback_absent")
         self.assertEqual(absent["writes"], 1)
+
+        self.assertTrue(exact["session_valid"])
+        self.assertEqual(exact["session_count"], 1)
+        self.assertTrue(exact["probe_refs_distinct"])
 
 
 if __name__ == "__main__":

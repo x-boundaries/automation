@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import uuid
 from dataclasses import dataclass
 from typing import Callable
 
@@ -90,7 +91,7 @@ class MemberNoAllocator:
                 continue
             if status != ProbeStatus.FREE:
                 raise AllocationAmbiguous("member_no_probe_not_positive")
-            probe_reference = f"probe-{candidate}-{len(candidate)}"
+            probe_reference = f"probe-{uuid.uuid4().hex}"
             try:
                 bind(candidate, probe_reference)
             except AllocationRace:

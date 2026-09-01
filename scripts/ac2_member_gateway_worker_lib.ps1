@@ -5,6 +5,18 @@
 
 Set-StrictMode -Version Latest
 
+function New-XbMemberGatewayWorkerSession {
+    $value = ([Guid]::NewGuid().ToString("N")).ToLowerInvariant()
+    if ($value -cnotmatch '^[0-9a-f]{32}$') { throw "worker_session_generation_failed" }
+    return "ws-$value"
+}
+
+function New-XbMemberGatewayProbeReference {
+    $value = ([Guid]::NewGuid().ToString("N")).ToLowerInvariant()
+    if ($value -cnotmatch '^[0-9a-f]{32}$') { throw "probe_reference_generation_failed" }
+    return "probe-$value"
+}
+
 function Get-XbMemberGatewayRuntimeToken {
     param([string]$EnvironmentVariable = "XB_MEMBER_GATEWAY_WORKER_TOKEN")
     $token = [Environment]::GetEnvironmentVariable($EnvironmentVariable, "Process")
@@ -23,11 +35,13 @@ function Invoke-XbMemberGatewayRequest {
         [Parameter(Mandatory)][string]$Path,
         [Parameter(Mandatory)][ValidateSet("GET", "POST")][string]$Method,
         [AllowNull()]$Body,
+        [Parameter(Mandatory)][ValidatePattern('^ws-[0-9a-f]{32}$')][string]$WorkerSession,
         [string]$WorkerTokenEnvironmentVariable = "XB_MEMBER_GATEWAY_WORKER_TOKEN"
     )
     if ($GatewayBaseUrl -notmatch '^https://') { throw "gateway_https_required" }
+    if ($WorkerSession -cnotmatch '^ws-[0-9a-f]{32}$') { throw "worker_session_invalid" }
     $token = Get-XbMemberGatewayRuntimeToken -EnvironmentVariable $WorkerTokenEnvironmentVariable
-    $headers = @{ Authorization = "Bearer $token"; Accept = "application/json" }
+    $headers = @{ Authorization = "Bearer $token"; Accept = "application/json"; "X-XB-Worker-Session" = $WorkerSession }
     try {
         $params = @{
             Uri = ($GatewayBaseUrl.TrimEnd('/') + $Path)
@@ -55,6 +69,7 @@ function Invoke-XbMemberGatewayWorkerCycle {
         [Parameter(Mandatory)][switch]$EnableProductionAdapter,
         [Parameter(Mandatory)][scriptblock]$ProbeMember,
         [Parameter(Mandatory)][scriptblock]$CreateMember,
+        [string]$WorkerSession,
         [scriptblock]$GatewayRequest
     )
     if (-not $EnableProductionWorker) {
@@ -62,22 +77,28 @@ function Invoke-XbMemberGatewayWorkerCycle {
     }
     if ($null -eq $GatewayRequest) {
         $GatewayRequest = {
-            param($base, $path, $method, $body)
-            Invoke-XbMemberGatewayRequest -GatewayBaseUrl $base -Path $path -Method $method -Body $body
+            param($base, $path, $method, $body, $session)
+            Invoke-XbMemberGatewayRequest -GatewayBaseUrl $base -Path $path -Method $method -Body $body -WorkerSession $session
         }
     }
+    if ([string]::IsNullOrWhiteSpace($WorkerSession)) {
+        $WorkerSession = New-XbMemberGatewayWorkerSession
+    }
+    elseif ($WorkerSession -cnotmatch '^ws-[0-9a-f]{32}$') {
+        throw "worker_session_invalid"
+    }
 
-    $ready = & $GatewayRequest $GatewayBaseUrl "/readyz" "GET" $null
+    $ready = & $GatewayRequest $GatewayBaseUrl "/readyz" "GET" $null $WorkerSession
     if ($ready.ready -ne $true) { throw "gateway_not_ready" }
-    $claim = & $GatewayRequest $GatewayBaseUrl "/v1/worker/claim" "POST" @{}
+    $claim = & $GatewayRequest $GatewayBaseUrl "/v1/worker/claim" "POST" @{} $WorkerSession
     if ($claim.claimed -ne $true) {
         return [pscustomobject]@{ status = "idle"; writes = 0; dispatch_fence = $false }
     }
 
     $job = $claim.job
     $jobId = [string]$job.job_id
-    & $GatewayRequest $GatewayBaseUrl ("/v1/jobs/{0}/precheck" -f $jobId) "POST" @{} | Out-Null
-    $candidateResponse = & $GatewayRequest $GatewayBaseUrl ("/v1/jobs/{0}/allocation/candidate" -f $jobId) "POST" @{}
+    & $GatewayRequest $GatewayBaseUrl ("/v1/jobs/{0}/precheck" -f $jobId) "POST" @{} $WorkerSession | Out-Null
+    $candidateResponse = & $GatewayRequest $GatewayBaseUrl ("/v1/jobs/{0}/allocation/candidate" -f $jobId) "POST" @{} $WorkerSession
     $allocation = $null
     for ($index = 0; $index -lt 10000; $index++) {
         if ($candidateResponse.bound -eq $true) {
@@ -90,9 +111,9 @@ function Invoke-XbMemberGatewayWorkerCycle {
         $probeBody = @{
             candidate = $candidate
             status = $probeStatus
-            probe_reference = [string]$probe.probe_reference
+            probe_reference = New-XbMemberGatewayProbeReference
         }
-        $candidateResponse = & $GatewayRequest $GatewayBaseUrl ("/v1/jobs/{0}/allocation/probe" -f $jobId) "POST" $probeBody
+        $candidateResponse = & $GatewayRequest $GatewayBaseUrl ("/v1/jobs/{0}/allocation/probe" -f $jobId) "POST" $probeBody $WorkerSession
         if ($candidateResponse.bound -eq $true) {
             $allocation = $candidateResponse
             break
@@ -106,19 +127,19 @@ function Invoke-XbMemberGatewayWorkerCycle {
     $boundProbe = & $ProbeMember ([string]$allocation.member_no)
     $recheck = & $GatewayRequest $GatewayBaseUrl ("/v1/jobs/{0}/allocation/recheck" -f $jobId) "POST" @{
         status = [string]$boundProbe.status
-        probe_reference = [string]$boundProbe.probe_reference
-    }
+        probe_reference = New-XbMemberGatewayProbeReference
+    } $WorkerSession
     if ([string]$recheck.state -ne "ALLOCATION_BOUND") { throw "bound_member_no_recheck_failed" }
 
     & $GatewayRequest $GatewayBaseUrl ("/v1/jobs/{0}/write-intent" -f $jobId) "POST" @{
         operation = "member.create"
         member_no = [string]$allocation.member_no
         payload_hash = [string]$job.payload_hash
-    } | Out-Null
+    } $WorkerSession | Out-Null
     $fence = & $GatewayRequest $GatewayBaseUrl ("/v1/jobs/{0}/dispatch-fence" -f $jobId) "POST" @{
         operation = "member.create"
         member_no = [string]$allocation.member_no
-    }
+    } $WorkerSession
     if ([string]$fence.state -ne "WRITING") { throw "dispatch_fence_not_created" }
 
     try {
@@ -138,7 +159,7 @@ function Invoke-XbMemberGatewayWorkerCycle {
             readback_found = $readbackFound
             readback_match = $readbackMatch
             error_code = $errorCode
-        } | Out-Null
+        } $WorkerSession | Out-Null
         return [pscustomobject]@{ status = $status; writes = 1; dispatch_fence = $true }
     }
     catch {
@@ -155,7 +176,7 @@ function Invoke-XbMemberGatewayWorkerCycle {
             readback_found = $false
             readback_match = $false
             error_code = "save_outcome_uncertain"
-        } | Out-Null
+        } $WorkerSession | Out-Null
         return [pscustomobject]@{ status = "WRITE_OUTCOME_UNCERTAIN"; writes = 1; dispatch_fence = $true }
     }
 }

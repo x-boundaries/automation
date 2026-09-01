@@ -65,7 +65,25 @@ environment/source/mapping identity, valid hash and fields, exact operation,
 lease ownership, positive-free evidence, bound allocation, production length
 constraint, no prior fence/result/uncertain state, attempt/deadline limits,
 gateway/adapter readiness, valid worker credential, immediate kill-switch
-recheck, and zero prior SaveMember invocations.
+recheck, a repository-owned singleton rate/claim decision, and zero prior
+SaveMember invocations. The rate predicate is deliberately not an owner-facing
+throughput number: it is true only when the current durable lease is valid and
+is the sole active non-expired worker lease. Missing or unavailable evidence
+is ineligible.
+
+Claim transactions also hold the existing `kill_switch_enabled` control row
+lock for the complete claim transaction. That row is the durable singleton
+mutex: separate PostgreSQL connections cannot both observe an empty active-lease
+set and claim parallel jobs.
+
+The bearer credential authenticates the worker capability; it is not the lease
+identity. Every worker request carries `X-XB-Worker-Session` with a generated
+`ws-` plus 32 lower-case hexadecimal characters. The value is generated locally
+for one worker process/run, is validated against that closed pattern, and is
+not a secret, hostname, Windows/account identity, SID, or private path. The
+same bearer used with another session cannot inherit or operate the first
+session's lease. The session is bound to claim, lease/heartbeat, allocation,
+write-intent, dispatch-fence, and result operations.
 
 ## Kill-switch control
 
@@ -75,7 +93,11 @@ operations: `POST /v1/control/kill-switch/enable` engages
 The default is ON. Engaging the switch fails closed for new claims and for the
 dispatch fence; clearing it is a separately authorised operation and does not
 bypass any other eligibility predicate. These endpoints are not generic database
-or administrator controls.
+or administrator controls. The repository owns the final safety boundary:
+the in-memory implementation checks the flag and mutates under one
+repository lock; PostgreSQL locks the `control_flags` row with `FOR UPDATE`
+in the same transaction that creates a lease or dispatch fence. A missing
+control row also fails closed.
 
 ## State and irreversible boundary
 
@@ -85,12 +107,30 @@ The validated state machine includes `RECEIVED`, `VALIDATED`, `QUEUED`,
 ambiguity, retry, uncertain, mismatch, manual-review, and dead-letter states.
 
 The durable dispatch fence is the irreversible boundary. It is unique per job,
-requires the bound allocation and write intent, and records zero SaveMember
-invocations before the worker call. After it exists, there is no automatic
-retry, no new suffix, and no return to the normal create queue. A timeout,
-exception, or crash is uncertain. Reconciliation calls only `GetMember` for
-the same bound MemberNo. Positive absence does not authorize recreation;
-mismatch or ambiguous lookup remains manual/reconciliation work.
+requires the bound allocation, write intent, and a successful fresh recheck of
+that same bound MemberNo, and records zero SaveMember invocations before the
+worker call. Allocation probing and the fresh pre-dispatch recheck are distinct
+durable observations. The recheck marker records only public-safe lineage for
+the job, attempt, worker session, operation reference, and `FREE` status; it
+does not log MemberNo. A missing, stale, occupied, ambiguous, unavailable, or
+conflicting recheck fails closed without allocating another suffix.
+
+After the fence exists, there is no automatic retry, no new suffix, and no
+return to the normal create queue. A timeout, exception, or crash is uncertain.
+Reconciliation may begin only for exactly `WRITE_OUTCOME_UNCERTAIN`, with the
+same bound MemberNo and fence, after the original writer lease is no longer
+active through durable expiry/reclaim. An existing reconciliation case and
+read-only check must be recorded before a result projection can be replaced;
+`WRITING` and a live writer lease are rejected. Positive absence does not
+authorize recreation; mismatch or ambiguous lookup remains manual/reconciliation
+work, and a late writer result cannot overwrite a completed reconciliation.
+
+The public dispatch-fence identifier is always `fence-` followed by the
+published safe identifier shape. Both repositories and result construction
+expose that representation. PostgreSQL retains its existing internal UUID
+columns and converts them at the repository boundary, so a plain UUID is never
+emitted as a versioned result fence ID. No additional migration is needed for
+this boundary-only representation.
 
 ## AutoCount adapter contract
 

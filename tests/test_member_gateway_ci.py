@@ -8,8 +8,22 @@ WORKFLOW = ROOT / ".github/workflows/member-gateway-tests.yml"
 
 
 class MemberGatewayCiTests(unittest.TestCase):
+    TZDATA_COMMAND = "python -m pip install --quiet tzdata"
+
     def setUp(self):
         self.text = WORKFLOW.read_text(encoding="utf-8")
+
+    def _assert_exact_tzdata_allowance(self, text):
+        job = text.split("  full-offline-regression:", 1)[1]
+        command_line = re.compile(r"(?m)^[ \t]*run:[ \t]*" + re.escape(self.TZDATA_COMMAND) + r"[ \t]*$")
+        self.assertEqual(command_line.findall(job), ["        run: " + self.TZDATA_COMMAND])
+        setup_index = job.index("      - uses: actions/setup-python@v5")
+        install_index = job.index("        run: " + self.TZDATA_COMMAND)
+        suite_index = job.index("run: python tests/_run_ci_full_suite.py")
+        self.assertLess(setup_index, install_index)
+        self.assertLess(install_index, suite_index)
+        remaining = text.replace("        run: " + self.TZDATA_COMMAND, "", 1)
+        self.assertIsNone(re.search(r"\bpip\s+install\b", remaining, re.IGNORECASE))
 
     def test_workflow_has_narrow_triggers_and_read_only_permissions(self):
         self.assertIn("pull_request:", self.text)
@@ -35,18 +49,35 @@ class MemberGatewayCiTests(unittest.TestCase):
         self.assertIn("persist-credentials: false", self.text)
 
     def test_windows_full_offline_regression_provisions_tzdata_before_suite(self):
-        job = self.text.split("  full-offline-regression:", 1)[1]
-        setup_index = job.index("      - uses: actions/setup-python@v5")
-        install_index = job.index(
-            "      - name: Install tzdata (Windows Python has no system zoneinfo database)"
+        self._assert_exact_tzdata_allowance(self.text)
+
+    def test_tzdata_allowance_rejects_appended_package(self):
+        mutated = self.text.replace(self.TZDATA_COMMAND, self.TZDATA_COMMAND + " requests", 1)
+        with self.assertRaises(AssertionError):
+            self._assert_exact_tzdata_allowance(mutated)
+
+    def test_tzdata_allowance_rejects_second_install(self):
+        mutated = self.text.replace(
+            "  full-offline-regression:\n",
+            "  gateway-tests:\n    steps:\n      - run: " + self.TZDATA_COMMAND + "\n\n  full-offline-regression:\n",
+            1,
         )
-        suite_index = job.index("run: python tests/_run_ci_full_suite.py")
-        self.assertLess(setup_index, install_index)
-        self.assertLess(install_index, suite_index)
-        self.assertIn(
-            "shell: pwsh\n        run: python -m pip install --quiet tzdata",
-            job,
+        with self.assertRaises(AssertionError):
+            self._assert_exact_tzdata_allowance(mutated)
+
+    def test_tzdata_allowance_rejects_install_in_another_job(self):
+        mutated = self.text.replace(
+            "  full-offline-regression:\n",
+            "  another-job:\n    steps:\n      - run: " + self.TZDATA_COMMAND + "\n\n  full-offline-regression:\n",
+            1,
         )
+        with self.assertRaises(AssertionError):
+            self._assert_exact_tzdata_allowance(mutated)
+
+    def test_tzdata_allowance_rejects_altered_authorised_command(self):
+        mutated = self.text.replace(self.TZDATA_COMMAND, "python -m pip install tzdata", 1)
+        with self.assertRaises(AssertionError):
+            self._assert_exact_tzdata_allowance(mutated)
 
     def test_ci_contains_no_live_or_mutating_operation(self):
         for forbidden in (
@@ -57,9 +88,9 @@ class MemberGatewayCiTests(unittest.TestCase):
             r"\bdeployment\b",
             r"\bdeploy(?:ment)?\b",
             r"\bnpm\s+install\b",
-            r"\bpip\s+install\b(?!\s+--quiet\s+tzdata(?:\s|$))",
         ):
             self.assertIsNone(re.search(forbidden, self.text, re.IGNORECASE), forbidden)
+        self._assert_exact_tzdata_allowance(self.text)
         self.assertIn("offline", self.text.lower())
         self.assertIn("member-gateway-tests.yml", self.text)
 

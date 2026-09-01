@@ -58,6 +58,11 @@ def prepare(service, response_id="additional-response", worker="worker-1"):
             "probe_reference": f"additional-free-{response_id}",
         },
     )
+    service.allocation_recheck(
+        job["job_id"],
+        worker,
+        {"status": "FREE", "probe_reference": f"additional-recheck-{response_id}"},
+    )
     return service.repository.get_job(job["job_id"])
 
 

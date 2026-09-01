@@ -67,6 +67,7 @@ class GatewayTests(unittest.TestCase):
 
     def fence(self, job, worker="worker-1"):
         self.bind_base(job, worker)
+        self.service.allocation_recheck(job["job_id"], worker, {"status": "FREE", "probe_reference": f"synthetic-recheck-{job['job_id']}"})
         self.service.write_intent(job["job_id"], worker, {"operation": "member.create", "member_no": job["member_payload"]["phone"], "payload_hash": job["payload_hash"]}, principal_valid=True)
         return self.service.dispatch_fence(job["job_id"], worker, {"operation": "member.create", "member_no": job["member_payload"]["phone"]}, principal_valid=True)
 
@@ -90,7 +91,9 @@ class GatewayTests(unittest.TestCase):
     def test_marketing_no_is_eligible_but_false_pdpa_blocks(self):
         _, job = self.ingest_claim(event("resp-no", marketing_consent="No"))
         self.bind_base(job)
+        self.service.allocation_recheck(job["job_id"], "worker-1", {"status": "FREE", "probe_reference": "marketing-recheck"})
         self.assertTrue(self.service._eligibility(job["job_id"], "worker-1", principal_valid=True).eligible)
+        self.repository.reclaim_expired(now=NOW + timedelta(seconds=601))
         _, blocked = self.ingest_claim(event("resp-pdpa", phone="89876543", pdpa_acknowledged=False), worker="worker-2")
         self.bind_base(blocked, worker="worker-2")
         decision = self.service._eligibility(blocked["job_id"], "worker-2", principal_valid=True)
@@ -115,6 +118,7 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(response["candidate"], base + "X1")
         bound = self.service.allocation_probe(first["job_id"], "worker-a", {"candidate": base + "X1", "status": "FREE", "probe_reference": "read-x1"})
         self.assertEqual(bound["member_no"], base + "X1")
+        self.assertEqual(self.repository.reclaim_expired(now=NOW + timedelta(seconds=601)), 1)
         _, second = self.ingest_claim(event("resp-b"), "worker-b")
         base2 = self.service.allocation_candidate(second["job_id"])["candidate"]
         self.service.allocation_probe(second["job_id"], "worker-b", {"candidate": base2, "status": "OCCUPIED", "probe_reference": "read-b"})
@@ -156,11 +160,13 @@ class GatewayTests(unittest.TestCase):
         _, job = self.ingest_claim()
         self.bind_base(job)
         job_id = job["job_id"]
+        self.service.allocation_recheck(job_id, "worker-1", {"status": "FREE", "probe_reference": "crash-recheck-1"})
         self.service.write_intent(job_id, "worker-1", {"operation": "member.create", "member_no": job["member_payload"]["phone"], "payload_hash": job["payload_hash"]}, principal_valid=True)
         self.assertEqual(self.repository.reclaim_expired(now=NOW + timedelta(seconds=601)), 1)
         self.repository.claim_job("worker-2", now=NOW + timedelta(seconds=602))
         self.repository.begin_prechecking(job_id, "worker-2", now=NOW + timedelta(seconds=602))
         self.service.clock = NOW + timedelta(seconds=602)
+        self.service.allocation_recheck(job_id, "worker-2", {"status": "FREE", "probe_reference": "crash-recheck-2"})
         self.service.write_intent(job_id, "worker-2", {"operation": "member.create", "member_no": job["member_payload"]["phone"], "payload_hash": job["payload_hash"]}, principal_valid=True)
         self.assertEqual(self.repository.get_write_intent(job_id).member_no, job["member_payload"]["phone"])
 
@@ -202,6 +208,7 @@ class GatewayTests(unittest.TestCase):
         job = service.claim("worker-1")["job"]
         service.precheck(job["job_id"], "worker-1")
         self.bind_base(job, service=service)
+        service.allocation_recheck(job["job_id"], "worker-1", {"status": "FREE", "probe_reference": "kill-recheck"})
         service.write_intent(job["job_id"], "worker-1", {"operation": "member.create", "member_no": job["member_payload"]["phone"], "payload_hash": job["payload_hash"]}, principal_valid=True)
         service.enable_kill_switch()
         with self.assertRaises(ApiError):

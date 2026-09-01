@@ -11,7 +11,15 @@ from typing import Any, Mapping
 from urllib.parse import unquote, urlsplit
 
 from .allocation import AllocationError, MemberNoAllocator
-from .auth import Authenticator, AuthenticationError, DenyAllAuthenticator, Principal, require_scope
+from .auth import (
+    Authenticator,
+    AuthenticationError,
+    DenyAllAuthenticator,
+    Principal,
+    WORKER_SESSION_HEADER,
+    require_scope,
+    worker_session,
+)
 from .canonical import CanonicalizationError, canonicalize_source_event
 from .config import GatewayConfig
 from .eligibility import EligibilityContext, evaluate_eligibility
@@ -187,8 +195,10 @@ class GatewayService:
             raise ApiError(400, "allocation_candidate_invalid")
         return candidate
 
-    def allocation_candidate(self, job_id: str) -> dict[str, Any]:
+    def allocation_candidate(self, job_id: str, worker_id: str | None = None) -> dict[str, Any]:
         job = self.repository.get_job(job_id)
+        if worker_id is not None:
+            self.repository.assert_lease(job_id, worker_id, now=self.clock)
         allocation = self.repository.get_allocation(job_id)
         if allocation is not None:
             return {"job_id": job_id, "bound": True, "member_no": allocation.member_no}
@@ -222,11 +232,11 @@ class GatewayService:
                     # The candidate was free when probed but was durably claimed
                     # by another pre-fence job. The next suffix is deterministic
                     # and still pre-fence; a bound candidate is never reallocated.
-                    return self.allocation_candidate(job_id)
+                    return self.allocation_candidate(job_id, worker_id)
                 raise
             return {"job_id": job_id, "state": JobState.ALLOCATION_BOUND.value, "bound": True, "member_no": allocation.member_no}
         if status == ProbeStatus.OCCUPIED:
-            return self.allocation_candidate(job_id)
+            return self.allocation_candidate(job_id, worker_id)
         self.repository.mark_state(
             job_id,
             JobState.AMBIGUOUS_LOOKUP,
@@ -239,7 +249,7 @@ class GatewayService:
 
     def allocation_recheck(self, job_id: str, worker_id: str, body: Mapping[str, Any]) -> dict[str, Any]:
         _exact_fields(body, {"status", "probe_reference"})
-        if not isinstance(body["probe_reference"], str) or not body["probe_reference"]:
+        if not isinstance(body["probe_reference"], str) or not body["probe_reference"] or len(body["probe_reference"]) > 200:
             raise ApiError(400, "allocation_probe_identity_invalid")
         try:
             status = ProbeStatus(body["status"])
@@ -272,6 +282,14 @@ class GatewayService:
                 for probe in self.repository.get_probes(job_id)
             )
         )
+        try:
+            rate_allowed = self.repository.rate_allowed(job_id, worker_id, now=self.clock)
+        except (LeaseConflict, RepositoryError):
+            rate_allowed = None
+        try:
+            fresh_recheck = self.repository.get_fresh_recheck(job_id, worker_id, now=self.clock) is not None
+        except (LeaseConflict, RepositoryError):
+            fresh_recheck = None
         return evaluate_eligibility(
             EligibilityContext(
                 config=config,
@@ -280,11 +298,13 @@ class GatewayService:
                 worker_id=worker_id,
                 lease_owner=job.lease_owner,
                 positive_free_evidence=positive_free,
+                fresh_bound_member_no_recheck=fresh_recheck,
                 gateway_ready=config.gateway_ready,
                 autocount_adapter_ready=self.adapter_ready,
                 worker_credential_valid=principal_valid,
-                kill_switch_rechecked=not self._runtime_config().kill_switch_enabled,
+                kill_switch_rechecked=not config.kill_switch_enabled,
                 save_invocation_count=job.save_invocation_count,
+                rate_allowed=rate_allowed,
                 now=self.clock,
             )
         )
@@ -359,9 +379,7 @@ class GatewayService:
         job = self.repository.get_job(job_id)
         fence = self.repository.get_dispatch_fence(job_id)
         allocation = self.repository.get_allocation(job_id)
-        if fence is None or allocation is None or body["member_no"] != fence.member_no or job.state not in {
-            JobState.WRITE_OUTCOME_UNCERTAIN, JobState.WRITING
-        }:
+        if fence is None or allocation is None or body["member_no"] != fence.member_no or job.state != JobState.WRITE_OUTCOME_UNCERTAIN:
             raise ApiError(409, "reconciliation_member_binding_invalid")
         try:
             status = {
@@ -372,6 +390,17 @@ class GatewayService:
             }[body["lookup_status"]]
         except (KeyError, TypeError) as exc:
             raise ApiError(400, "reconciliation_status_invalid") from exc
+        case = self.repository.open_reconciliation_case(job_id, body["member_no"], now=self.clock)
+        try:
+            self.repository.record_reconciliation_check(
+                case.case_id,
+                body["lookup_status"],
+                readback_found,
+                readback_match,
+                now=self.clock,
+            )
+        except RepositoryError as exc:
+            raise ApiError(409, _safe_code(str(exc))) from exc
         result = make_result(
             job=job,
             fence=fence,
@@ -382,8 +411,13 @@ class GatewayService:
             error_code=body["error_code"],
             acknowledged_at=self.clock,
         )
-        stored, duplicate = self.repository.acknowledge_result(result, require_lease=False, now=self.clock)
-        return {"job_id": job_id, "state": stored.status.value, "duplicate": duplicate}
+        stored, duplicate = self.repository.acknowledge_result(
+            result,
+            require_lease=False,
+            reconciliation_case_id=case.case_id,
+            now=self.clock,
+        )
+        return {"job_id": job_id, "state": stored.status.value, "duplicate": duplicate, "case_id": case.case_id}
 
     def status(self, job_id: str) -> dict[str, Any]:
         return self.repository.get_job(job_id).safe_dict()
@@ -423,6 +457,16 @@ class GatewayApp:
         except AuthenticationError as exc:
             raise ApiError(403 if exc.code == "scope_denied" else 401, exc.code) from exc
 
+    def _worker_session(self, headers: Mapping[str, str]) -> str:
+        value = next(
+            (str(candidate) for key, candidate in headers.items() if str(key).lower() == WORKER_SESSION_HEADER.lower()),
+            None,
+        )
+        try:
+            return worker_session(value)  # type: ignore[arg-type]
+        except AuthenticationError as exc:
+            raise ApiError(400, exc.code) from exc
+
     def _error(self, error: Exception) -> ApiResponse:
         code = _safe_code(getattr(error, "code", None), "request_rejected")
         status = getattr(error, "status", 500)
@@ -432,6 +476,8 @@ class GatewayApp:
             status, code = 409, "source_identity_conflict"
         elif isinstance(error, ResultConflict):
             status, code = 409, "result_conflict"
+        elif isinstance(error, RepositoryError) and str(error) == "kill_switch_enabled":
+            status, code = 423, "kill_switch_enabled"
         elif isinstance(error, (LeaseConflict, AllocationConflict, InvalidTransition, RepositoryError)):
             status, code = 409, _safe_code(str(error))
         elif isinstance(error, CanonicalizationError):
@@ -469,44 +515,45 @@ class GatewayApp:
                 self._principal(headers, "source.ingest")
                 return ApiResponse(202, self.service.ingest(value))
             if method == "POST" and route == "/v1/worker/claim":
-                principal = self._principal(headers, "worker.claim")
-                return ApiResponse(200, self.service.claim(principal.subject))
+                self._principal(headers, "worker.claim")
+                return ApiResponse(200, self.service.claim(self._worker_session(headers)))
             match = re.fullmatch(r"/v1/jobs/([^/]+)/precheck", route)
             if method == "POST" and match:
-                principal = self._principal(headers, "worker.claim")
-                return ApiResponse(200, self.service.precheck(unquote(match.group(1)), principal.subject))
+                self._principal(headers, "worker.claim")
+                return ApiResponse(200, self.service.precheck(unquote(match.group(1)), self._worker_session(headers)))
             match = re.fullmatch(r"/v1/jobs/([^/]+)/lease", route)
             if method == "POST" and match:
-                principal = self._principal(headers, "worker.heartbeat")
-                return ApiResponse(200, self.service.heartbeat(unquote(match.group(1)), principal.subject, value))
+                self._principal(headers, "worker.heartbeat")
+                return ApiResponse(200, self.service.heartbeat(unquote(match.group(1)), self._worker_session(headers), value))
             match = re.fullmatch(r"/v1/jobs/([^/]+)/allocation/candidate", route)
             if method == "POST" and match:
                 self._principal(headers, "worker.allocation")
-                return ApiResponse(200, self.service.allocation_candidate(unquote(match.group(1))))
+                session = self._worker_session(headers)
+                return ApiResponse(200, self.service.allocation_candidate(unquote(match.group(1)), session))
             match = re.fullmatch(r"/v1/jobs/([^/]+)/allocation/probe", route)
             if method == "POST" and match:
-                principal = self._principal(headers, "worker.allocation")
-                return ApiResponse(200, self.service.allocation_probe(unquote(match.group(1)), principal.subject, value))
+                self._principal(headers, "worker.allocation")
+                return ApiResponse(200, self.service.allocation_probe(unquote(match.group(1)), self._worker_session(headers), value))
             match = re.fullmatch(r"/v1/jobs/([^/]+)/allocation/recheck", route)
             if method == "POST" and match:
-                principal = self._principal(headers, "worker.allocation")
-                return ApiResponse(200, self.service.allocation_recheck(unquote(match.group(1)), principal.subject, value))
+                self._principal(headers, "worker.allocation")
+                return ApiResponse(200, self.service.allocation_recheck(unquote(match.group(1)), self._worker_session(headers), value))
             match = re.fullmatch(r"/v1/jobs/([^/]+)/allocation", route)
             if method == "POST" and match:
-                principal = self._principal(headers, "worker.allocation")
-                return ApiResponse(200, self.service.bind_allocation(unquote(match.group(1)), principal.subject, value))
+                self._principal(headers, "worker.allocation")
+                return ApiResponse(200, self.service.bind_allocation(unquote(match.group(1)), self._worker_session(headers), value))
             match = re.fullmatch(r"/v1/jobs/([^/]+)/write-intent", route)
             if method == "POST" and match:
-                principal = self._principal(headers, "worker.write_intent")
-                return ApiResponse(200, self.service.write_intent(unquote(match.group(1)), principal.subject, value, principal_valid=True))
+                self._principal(headers, "worker.write_intent")
+                return ApiResponse(200, self.service.write_intent(unquote(match.group(1)), self._worker_session(headers), value, principal_valid=True))
             match = re.fullmatch(r"/v1/jobs/([^/]+)/dispatch-fence", route)
             if method == "POST" and match:
-                principal = self._principal(headers, "worker.dispatch")
-                return ApiResponse(200, self.service.dispatch_fence(unquote(match.group(1)), principal.subject, value, principal_valid=True))
+                self._principal(headers, "worker.dispatch")
+                return ApiResponse(200, self.service.dispatch_fence(unquote(match.group(1)), self._worker_session(headers), value, principal_valid=True))
             match = re.fullmatch(r"/v1/jobs/([^/]+)/result", route)
             if method == "POST" and match:
-                principal = self._principal(headers, "worker.result")
-                return ApiResponse(200, self.service.acknowledge_result(unquote(match.group(1)), principal.subject, value))
+                self._principal(headers, "worker.result")
+                return ApiResponse(200, self.service.acknowledge_result(unquote(match.group(1)), self._worker_session(headers), value))
             match = re.fullmatch(r"/v1/jobs/([^/]+)/reconcile", route)
             if method == "POST" and match:
                 self._principal(headers, "worker.reconcile")

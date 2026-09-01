@@ -8,18 +8,21 @@ from this module or while a repository transaction is open.
 from __future__ import annotations
 
 import copy
+import json
 import os
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
+from dataclasses import replace
 from threading import RLock
 from typing import Any, Callable, Iterator, Mapping, Protocol
 
 from .canonical import canonical_json
 from .crypto import hmac_reference
 from .models import (
-    AllocationProbe, AllocationRecord, DispatchFenceRecord, IngestOutcome,
+    AllocationProbe, AllocationRecord, AllocationRecheck, DispatchFenceRecord, IngestOutcome,
     JobRecord, JobState, LeaseRecord, ProbeStatus, ResultRecord, ResultStatus,
+    ReconciliationCaseRecord, ReconciliationCaseState, ReconciliationCheckRecord,
     SourceEvent, WriteIntentRecord,
 )
 from .state_machine import TERMINAL_STATES, next_state
@@ -66,6 +69,28 @@ def parse_timestamp(value: str | datetime) -> datetime:
     return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc)
 
 
+def new_fence_id() -> str:
+    return f"fence-{uuid.uuid4().hex}"
+
+
+def public_fence_id(value: Any) -> str:
+    text = str(value)
+    raw = text[6:] if text.startswith("fence-") else text
+    try:
+        return f"fence-{uuid.UUID(raw).hex}"
+    except (ValueError, AttributeError, TypeError) as exc:
+        raise RepositoryError("dispatch_fence_id_invalid") from exc
+
+
+def internal_fence_id(value: str) -> str:
+    if not isinstance(value, str) or not value.startswith("fence-"):
+        raise RepositoryError("dispatch_fence_id_invalid")
+    try:
+        return str(uuid.UUID(value[6:]))
+    except (ValueError, AttributeError) as exc:
+        raise RepositoryError("dispatch_fence_id_invalid") from exc
+
+
 class MemberProbe(Protocol):
     def __call__(self, candidate: str) -> ProbeStatus:
         ...
@@ -88,6 +113,9 @@ class InMemoryRepository:
         self._allocations_by_member: dict[str, str] = {}
         self._write_intents: dict[str, WriteIntentRecord] = {}
         self._fences: dict[str, DispatchFenceRecord] = {}
+        self._rechecks: dict[str, list[AllocationRecheck]] = {}
+        self._reconciliation_cases: dict[str, ReconciliationCaseRecord] = {}
+        self._reconciliation_checks: dict[str, list[ReconciliationCheckRecord]] = {}
         self._results: dict[str, ResultRecord] = {}
         self._result_history: dict[str, list[ResultRecord]] = {}
         self._result_conflicts: list[dict[str, str]] = []
@@ -109,6 +137,38 @@ class InMemoryRepository:
         lease = self._leases.get(job.job_id)
         if lease is None or lease.worker_id != worker_id or lease.state_version != job.state_version or parse_timestamp(lease.expires_at) <= now:
             raise LeaseConflict("lease_not_owned_or_expired")
+
+    def _assert_kill_switch_clear(self) -> None:
+        """Must be called while _lock is held, at the mutation boundary."""
+        if self._control.get("kill_switch_enabled", True):
+            raise RepositoryError("kill_switch_enabled")
+
+    def _active_leases(self, now: datetime) -> list[LeaseRecord]:
+        return [
+            lease for job_id, lease in self._leases.items()
+            if parse_timestamp(lease.expires_at) > now
+            and self._jobs.get(job_id) is not None
+            and self._jobs[job_id].state not in TERMINAL_STATES
+        ]
+
+    def _fresh_recheck(self, job: JobRecord, worker_id: str, now: datetime) -> AllocationRecheck | None:
+        allocation = self._allocations.get(job.job_id)
+        records = self._rechecks.get(job.job_id, [])
+        lease = self._leases.get(job.job_id)
+        if allocation is None or lease is None or not records or job.state not in {JobState.ALLOCATION_BOUND, JobState.WRITE_INTENT_RECORDED}:
+            return None
+        latest = records[-1]
+        if (
+            job.state not in {JobState.ALLOCATION_BOUND, JobState.WRITE_INTENT_RECORDED}
+            or latest.attempt != job.attempt
+            or latest.worker_id != worker_id
+            or latest.member_no != allocation.member_no
+            or latest.status != ProbeStatus.FREE
+            or latest.probe_reference == allocation.probe_reference
+            or parse_timestamp(latest.observed_at) > now
+        ):
+            return None
+        return latest
 
     def _move(self, job: JobRecord, target: JobState) -> None:
         job.state = next_state(job.state, target, dispatch_fenced=job.dispatch_fenced)
@@ -208,7 +268,10 @@ class InMemoryRepository:
             raise RepositoryError("worker_id_invalid")
         current = utc_now(now)
         with self._lock:
+            self._assert_kill_switch_clear()
             self.reclaim_expired(now=current)
+            if self._active_leases(current):
+                return None
             jobs = [job for job in self._jobs.values() if job.state in {JobState.QUEUED, JobState.RETRY_WAIT} and (not job.next_attempt_at or parse_timestamp(job.next_attempt_at) <= current) and job.attempt < job.max_attempts]
             if not jobs:
                 return None
@@ -253,6 +316,28 @@ class InMemoryRepository:
     def get_job(self, job_id: str) -> JobRecord:
         with self._lock:
             return self._copy(self._job(job_id))
+
+    def assert_lease(self, job_id: str, worker_id: str, *, now: datetime | None = None) -> None:
+        current = utc_now(now)
+        with self._lock:
+            self._lease(self._job(job_id), worker_id, current)
+
+    def rate_allowed(self, job_id: str, worker_id: str, *, now: datetime | None = None) -> bool:
+        """Return true only when the durable singleton lease is current."""
+        current = utc_now(now)
+        with self._lock:
+            job = self._job(job_id)
+            try:
+                self._lease(job, worker_id, current)
+            except LeaseConflict:
+                return False
+            active = self._active_leases(current)
+            return (
+                len(active) == 1
+                and job.state not in TERMINAL_STATES
+                and 0 < job.attempt <= job.max_attempts
+                and job.attempt_started_at is not None
+            )
 
     def record_probe(self, job_id: str, candidate: str, status: ProbeStatus, probe_reference: str, worker_id: str, *, now: datetime | None = None) -> AllocationProbe:
         current = utc_now(now)
@@ -306,9 +391,41 @@ class InMemoryRepository:
             allocation = self._allocations.get(job_id)
             if allocation is None or job.state != JobState.ALLOCATION_BOUND:
                 raise AllocationConflict("bound_allocation_required")
-            if ProbeStatus(status) == ProbeStatus.FREE and probe_reference == allocation.probe_reference:
+            status = ProbeStatus(status)
+            prior = self._rechecks.get(job_id, [])
+            current_prior = next(
+                (
+                    item for item in reversed(prior)
+                    if item.attempt == job.attempt
+                    and item.worker_id == worker_id
+                    and item.member_no == allocation.member_no
+                ),
+                None,
+            )
+            if prior:
+                latest = prior[-1]
+                if (
+                    latest.attempt == job.attempt
+                    and latest.worker_id == worker_id
+                    and latest.member_no == allocation.member_no
+                    and latest.status == status
+                    and latest.probe_reference == probe_reference
+                ):
+                    return self._copy(job)
+            recheck = AllocationRecheck(
+                recheck_id=f"recheck-{uuid.uuid4().hex}",
+                job_id=job_id,
+                attempt=job.attempt,
+                worker_id=worker_id,
+                member_no=allocation.member_no,
+                status=status,
+                probe_reference=probe_reference,
+                observed_at=timestamp(current),
+            )
+            self._rechecks.setdefault(job_id, []).append(recheck)
+            if status == ProbeStatus.FREE and probe_reference != allocation.probe_reference and current_prior is None:
                 return self._copy(job)
-            self._probes[job_id].append(AllocationProbe(job_id, allocation.member_no, ProbeStatus(status), probe_reference, timestamp(current)))
+            self._probes[job_id].append(AllocationProbe(job_id, allocation.member_no, status, probe_reference, timestamp(current)))
             self._move(job, JobState.MANUAL_REVIEW)
             job.last_error_code = "bound_member_no_recheck_not_free"
             self._audit("allocation_recheck_failed", job, error_code=job.last_error_code)
@@ -318,6 +435,13 @@ class InMemoryRepository:
         with self._lock:
             self._job(job_id)
             return self._copy(self._allocations.get(job_id))
+
+    def get_fresh_recheck(self, job_id: str, worker_id: str, *, now: datetime | None = None) -> AllocationRecheck | None:
+        current = utc_now(now)
+        with self._lock:
+            job = self._job(job_id)
+            self._lease(job, worker_id, current)
+            return self._copy(self._fresh_recheck(job, worker_id, current))
 
     def record_write_intent(self, job_id: str, member_no: str, operation: str, payload_hash_value: str, worker_id: str, *, now: datetime | None = None) -> WriteIntentRecord:
         current = utc_now(now)
@@ -329,16 +453,22 @@ class InMemoryRepository:
             allocation = self._allocations.get(job_id)
             if allocation is None or allocation.member_no != member_no:
                 raise RepositoryError("allocation_binding_required")
+            fresh = self._fresh_recheck(job, worker_id, current)
+            if fresh is None:
+                raise RepositoryError("fresh_bound_member_no_recheck_required")
             existing = self._write_intents.get(job_id)
             if existing is not None:
                 if existing.member_no != member_no or existing.payload_hash != payload_hash_value:
                     raise SourceConflict("write_intent_payload_conflict")
+                if existing.recheck_id != fresh.recheck_id:
+                    existing = replace(existing, recheck_id=fresh.recheck_id)
+                    self._write_intents[job_id] = existing
                 if job.state == JobState.ALLOCATION_BOUND:
                     self._move(job, JobState.WRITE_INTENT_RECORDED)
                 return self._copy(existing)
             if job.state != JobState.ALLOCATION_BOUND:
                 raise RepositoryError("write_intent_state_invalid")
-            intent = WriteIntentRecord(job_id, f"intent-{uuid.uuid4().hex}", member_no, payload_hash_value, timestamp(current))
+            intent = WriteIntentRecord(job_id, f"intent-{uuid.uuid4().hex}", member_no, payload_hash_value, timestamp(current), fresh.recheck_id)
             self._write_intents[job_id] = intent
             job.write_intent_id = intent.intent_id
             self._move(job, JobState.WRITE_INTENT_RECORDED)
@@ -353,17 +483,23 @@ class InMemoryRepository:
     def record_dispatch_fence(self, job_id: str, member_no: str, operation: str, worker_id: str, *, now: datetime | None = None) -> DispatchFenceRecord:
         current = utc_now(now)
         with self._lock:
+            self._assert_kill_switch_clear()
             job = self._job(job_id)
+            self._lease(job, worker_id, current)
             existing = self._fences.get(job_id)
             if existing is not None:
                 if existing.member_no != member_no or existing.operation != operation:
                     raise AllocationConflict("dispatch_fence_binding_invalid")
                 return self._copy(existing)
-            self._lease(job, worker_id, current)
             intent = self._write_intents.get(job_id)
-            if intent is None or intent.member_no != member_no or operation != "member.create" or job.state != JobState.WRITE_INTENT_RECORDED or job.save_invocation_count != 0:
+            fresh = self._fresh_recheck(job, worker_id, current)
+            if (
+                intent is None or intent.member_no != member_no or operation != "member.create"
+                or job.state != JobState.WRITE_INTENT_RECORDED or job.save_invocation_count != 0
+                or fresh is None or intent.recheck_id != fresh.recheck_id
+            ):
                 raise RepositoryError("write_intent_required")
-            fence = DispatchFenceRecord(job_id, f"fence-{uuid.uuid4().hex}", member_no, operation, timestamp(current))
+            fence = DispatchFenceRecord(job_id, new_fence_id(), member_no, operation, timestamp(current), fresh.recheck_id)
             self._fences[job_id] = fence
             job.dispatch_fence_id = fence.fence_id
             self._move(job, JobState.WRITING)
@@ -375,7 +511,132 @@ class InMemoryRepository:
             self._job(job_id)
             return self._copy(self._fences.get(job_id))
 
-    def acknowledge_result(self, result: ResultRecord, *, worker_id: str | None = None, require_lease: bool = True, now: datetime | None = None) -> tuple[ResultRecord, bool]:
+    def open_reconciliation_case(self, job_id: str, member_no: str, *, now: datetime | None = None) -> ReconciliationCaseRecord:
+        current = utc_now(now)
+        with self._lock:
+            job = self._job(job_id)
+            if job.state != JobState.WRITE_OUTCOME_UNCERTAIN:
+                raise RepositoryError("reconciliation_requires_uncertain_state")
+            allocation = self._allocations.get(job_id)
+            fence = self._fences.get(job_id)
+            if allocation is None or fence is None or allocation.member_no != member_no or fence.member_no != member_no:
+                raise RepositoryError("reconciliation_member_binding_invalid")
+            lease = self._leases.get(job_id)
+            if lease is not None:
+                if parse_timestamp(lease.expires_at) > current:
+                    raise LeaseConflict("reconciliation_writer_lease_active")
+                self._leases.pop(job_id, None)
+                job.lease_owner = None
+                job.lease_expires_at = None
+            existing = next((case for case in self._reconciliation_cases.values() if case.job_id == job_id), None)
+            if existing is not None:
+                if existing.state != ReconciliationCaseState.OPEN:
+                    raise RepositoryError("reconciliation_case_closed")
+                return self._copy(existing)
+            case = ReconciliationCaseRecord(
+                case_id=f"case-{uuid.uuid4().hex}",
+                job_id=job_id,
+                member_no=member_no,
+                state=ReconciliationCaseState.OPEN,
+                opened_at=timestamp(current),
+            )
+            self._reconciliation_cases[case.case_id] = case
+            self._reconciliation_checks[case.case_id] = []
+            self._audit("reconciliation_case_opened", job)
+            return self._copy(case)
+
+    def record_reconciliation_check(
+        self,
+        case_id: str,
+        lookup_status: str,
+        readback_found: bool,
+        readback_match: bool,
+        *,
+        now: datetime | None = None,
+    ) -> ReconciliationCheckRecord:
+        current = utc_now(now)
+        with self._lock:
+            case = self._reconciliation_cases.get(case_id)
+            if case is None:
+                raise RepositoryError("reconciliation_case_required")
+            if case.state != ReconciliationCaseState.OPEN:
+                raise RepositoryError("reconciliation_case_not_open")
+            job = self._job(case.job_id)
+            if job.state != JobState.WRITE_OUTCOME_UNCERTAIN:
+                raise RepositoryError("reconciliation_requires_uncertain_state")
+            lease = self._leases.get(job.job_id)
+            if lease is not None and parse_timestamp(lease.expires_at) > current:
+                raise LeaseConflict("reconciliation_writer_lease_active")
+            if lease is not None:
+                self._leases.pop(job.job_id, None)
+                job.lease_owner = None
+                job.lease_expires_at = None
+            if lookup_status not in {"exact_match", "absent", "mismatch", "ambiguous"}:
+                raise RepositoryError("reconciliation_status_invalid")
+            if not isinstance(readback_found, bool) or not isinstance(readback_match, bool):
+                raise RepositoryError("reconciliation_flags_invalid")
+            required_flags = {
+                "exact_match": (True, True),
+                "absent": (False, False),
+                "mismatch": (True, False),
+            }
+            if lookup_status in required_flags and (readback_found, readback_match) != required_flags[lookup_status]:
+                raise RepositoryError("reconciliation_flags_invalid")
+            if lookup_status == "ambiguous" and readback_match:
+                raise RepositoryError("reconciliation_flags_invalid")
+            state = {
+                "exact_match": ReconciliationCaseState.EXACT_MATCH,
+                "absent": ReconciliationCaseState.ABSENT,
+                "mismatch": ReconciliationCaseState.MISMATCH,
+                "ambiguous": ReconciliationCaseState.AMBIGUOUS,
+            }[lookup_status]
+            check = ReconciliationCheckRecord(
+                check_id=f"check-{uuid.uuid4().hex}",
+                case_id=case_id,
+                lookup_status=lookup_status,
+                readback_found=readback_found,
+                readback_match=readback_match,
+                checked_at=timestamp(current),
+            )
+            self._reconciliation_checks.setdefault(case_id, []).append(check)
+            self._reconciliation_cases[case_id] = replace(
+                case,
+                state=state,
+                closed_at=timestamp(current) if state in {ReconciliationCaseState.EXACT_MATCH, ReconciliationCaseState.ABSENT} else None,
+            )
+            return self._copy(check)
+
+    def get_reconciliation_case(self, case_id: str) -> ReconciliationCaseRecord:
+        with self._lock:
+            case = self._reconciliation_cases.get(case_id)
+            if case is None:
+                raise RepositoryError("reconciliation_case_required")
+            return self._copy(case)
+
+    def get_reconciliation_checks(self, case_id: str) -> tuple[ReconciliationCheckRecord, ...]:
+        with self._lock:
+            if case_id not in self._reconciliation_cases:
+                raise RepositoryError("reconciliation_case_required")
+            return tuple(self._copy(self._reconciliation_checks.get(case_id, [])))
+
+    def _require_reconciliation_evidence(self, result: ResultRecord, case_id: str) -> None:
+        case = self._reconciliation_cases.get(case_id)
+        if case is None or case.job_id != result.job_id or case.member_no != result.member_no:
+            raise RepositoryError("reconciliation_case_required")
+        expected = {
+            ResultStatus.CREATED_VERIFIED: (ReconciliationCaseState.EXACT_MATCH, "exact_match"),
+            ResultStatus.CONFIRMED_NOT_CREATED: (ReconciliationCaseState.ABSENT, "absent"),
+            ResultStatus.CREATED_READBACK_MISMATCH: (ReconciliationCaseState.MISMATCH, "mismatch"),
+            ResultStatus.WRITE_OUTCOME_UNCERTAIN: (ReconciliationCaseState.AMBIGUOUS, "ambiguous"),
+        }[result.status]
+        checks = self._reconciliation_checks.get(case_id, [])
+        if case.state != expected[0] or not checks or checks[-1].lookup_status != expected[1]:
+            raise RepositoryError("reconciliation_check_required")
+        check = checks[-1]
+        if (check.readback_found, check.readback_match) != (result.readback_found, result.readback_match):
+            raise RepositoryError("reconciliation_check_conflict")
+
+    def acknowledge_result(self, result: ResultRecord, *, worker_id: str | None = None, require_lease: bool = True, reconciliation_case_id: str | None = None, now: datetime | None = None) -> tuple[ResultRecord, bool]:
         current = utc_now(now)
         with self._lock:
             job = self._job(result.job_id)
@@ -384,18 +645,42 @@ class InMemoryRepository:
                 raise RepositoryError("dispatch_fence_binding_invalid")
             if result.save_invocation_count != 1:
                 raise ResultConflict("save_invocation_count_must_be_one")
+            existing = self._results.get(result.job_id)
+            if existing is not None and existing.result_hash == result.result_hash:
+                if not require_lease:
+                    if reconciliation_case_id is None:
+                        raise RepositoryError("reconciliation_case_required")
+                    self._require_reconciliation_evidence(result, reconciliation_case_id)
+                return self._copy(existing), True
+            reconciliation_projection = (
+                existing is not None
+                and not require_lease
+                and existing.status == ResultStatus.WRITE_OUTCOME_UNCERTAIN
+            )
+            reconciliation_replacement = (
+                reconciliation_projection
+                and result.status != ResultStatus.WRITE_OUTCOME_UNCERTAIN
+            )
+            if existing is not None and not reconciliation_projection and (
+                existing.status != ResultStatus.WRITE_OUTCOME_UNCERTAIN
+                or result.status == ResultStatus.WRITE_OUTCOME_UNCERTAIN
+            ):
+                self._result_conflicts.append({"job_id": result.job_id, "code": "result_payload_conflict"})
+                raise ResultConflict("result_payload_conflict")
             if require_lease:
                 if not worker_id:
                     raise LeaseConflict("worker_identity_required")
                 self._lease(job, worker_id, current)
-            existing = self._results.get(result.job_id)
-            if existing is not None:
-                if existing.result_hash == result.result_hash:
-                    return self._copy(existing), True
+            else:
+                if reconciliation_case_id is None:
+                    raise RepositoryError("reconciliation_case_required")
+                self._require_reconciliation_evidence(result, reconciliation_case_id)
+            if reconciliation_projection and result.status == ResultStatus.WRITE_OUTCOME_UNCERTAIN:
+                return self._copy(existing), True
+            if existing is not None and not reconciliation_replacement:
                 if existing.status != ResultStatus.WRITE_OUTCOME_UNCERTAIN or result.status == ResultStatus.WRITE_OUTCOME_UNCERTAIN:
                     self._result_conflicts.append({"job_id": result.job_id, "code": "result_payload_conflict"})
                     raise ResultConflict("result_payload_conflict")
-                self._result_history.setdefault(result.job_id, []).append(self._copy(existing))
             if result.status == ResultStatus.CREATED_VERIFIED and job.state == JobState.WRITING:
                 self._move(job, JobState.READBACK)
             target = {
@@ -411,6 +696,10 @@ class InMemoryRepository:
             job.last_error_code = result.error_code
             self._results[result.job_id] = self._copy(result)
             self._result_history.setdefault(result.job_id, []).append(self._copy(result))
+            if require_lease:
+                self._leases.pop(result.job_id, None)
+                job.lease_owner = None
+                job.lease_expires_at = None
             self._audit("result_acknowledged", job, error_code=result.error_code)
             return self._copy(result), False
 
@@ -524,7 +813,7 @@ class PostgresRepository:
             state=JobState(row[8]),state_version=int(row[9]),attempt=int(row[10]),max_attempts=int(row[11]),
             next_attempt_at=cls._dt(row[12]),lease_owner=row[13],lease_expires_at=cls._dt(row[14]),
             allocation_member_no=row[15],allocation_probe_reference=row[16],write_intent_id=row[17],
-            dispatch_fence_id=str(row[18]) if row[18] is not None else None,save_invocation_count=int(row[19]),
+            dispatch_fence_id=public_fence_id(row[18]) if row[18] is not None else None,save_invocation_count=int(row[19]),
             result_status=ResultStatus(row[20]) if row[20] else None,last_error_code=row[21],
             source_system=row[22],form_alias=row[23],mapping_version=row[24],
             attempt_started_at=cls._dt(row[25]),
@@ -542,6 +831,65 @@ class PostgresRepository:
         row = cursor.fetchone()
         if row is None or row[0] != worker_id or int(row[1]) != job.state_version or parse_timestamp(row[2]) <= now:
             raise LeaseConflict("lease_not_owned_or_expired")
+
+    def _lock_kill_switch(self, cursor: Any) -> None:
+        """Lock the control row before any claim or irreversible fence mutation."""
+        cursor.execute(
+            "SELECT enabled FROM xb_member_gateway.control_flags "
+            "WHERE flag_name='kill_switch_enabled' FOR UPDATE"
+        )
+        row = cursor.fetchone()
+        if row is None:
+            raise RepositoryError("kill_switch_state_unavailable")
+        if bool(row[0]):
+            raise RepositoryError("kill_switch_enabled")
+
+    def _fresh_recheck_cursor(self, cursor: Any, job: JobRecord, worker_id: str, now: datetime) -> AllocationRecheck | None:
+        latest = self._latest_recheck_cursor(cursor, job)
+        if latest is None:
+            return None
+        if (
+            job.state not in {JobState.ALLOCATION_BOUND, JobState.WRITE_INTENT_RECORDED}
+            or latest.attempt != job.attempt
+            or latest.worker_id != worker_id
+            or latest.member_no != job.allocation_member_no
+            or latest.status != ProbeStatus.FREE
+            or latest.probe_reference == job.allocation_probe_reference
+            or parse_timestamp(latest.observed_at) > now
+        ):
+            return None
+        return latest
+
+    def _latest_recheck_cursor(self, cursor: Any, job: JobRecord) -> AllocationRecheck | None:
+        cursor.execute(
+            "SELECT safe_reference,metadata,recorded_at FROM xb_member_gateway.audit_events "
+            "WHERE job_id=%s AND event_type='allocation_recheck' "
+            "ORDER BY audit_event_id DESC LIMIT 1",
+            (job.job_id,),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            return None
+        metadata = row[1]
+        if isinstance(metadata, str):
+            try:
+                metadata = json.loads(metadata)
+            except (TypeError, ValueError):
+                return None
+        if not isinstance(metadata, Mapping):
+            return None
+        try:
+            status = ProbeStatus(metadata["status"])
+            attempt = int(metadata["attempt"])
+            worker_id = str(metadata["worker_session"])
+            probe_reference = str(metadata["probe_reference"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        return AllocationRecheck(
+            str(row[0]), job.job_id, attempt, worker_id,
+            job.allocation_member_no or "", status, probe_reference,
+            self._dt(row[2]) or "",
+        )
 
     def _advance(self, cursor: Any, job: JobRecord, target: JobState, now: datetime, values: Mapping[str, Any] | None = None) -> JobRecord:
         next_state(job.state, target, dispatch_fenced=job.dispatch_fenced)
@@ -616,6 +964,36 @@ class PostgresRepository:
             with connection.cursor() as cursor:
                 return self._select_job(cursor, job_id)
 
+    def assert_lease(self, job_id: str, worker_id: str, *, now: datetime | None = None) -> None:
+        current = utc_now(now)
+        with self._transaction() as connection:
+            with connection.cursor() as cursor:
+                job = self._select_job(cursor, job_id, for_update=True)
+                self._require_lease(cursor, job, worker_id, current)
+
+    def rate_allowed(self, job_id: str, worker_id: str, *, now: datetime | None = None) -> bool:
+        """Use the current durable singleton lease as the only rate evidence."""
+        current = utc_now(now)
+        with self._transaction() as connection:
+            with connection.cursor() as cursor:
+                job = self._select_job(cursor, job_id, for_update=True)
+                try:
+                    self._require_lease(cursor, job, worker_id, current)
+                except LeaseConflict:
+                    return False
+                cursor.execute(
+                    "SELECT count(*) FROM xb_member_gateway.leases "
+                    "WHERE active=TRUE AND expires_at>%s",
+                    (current,),
+                )
+                active_count = int(cursor.fetchone()[0])
+                return (
+                    active_count == 1
+                    and job.state not in TERMINAL_STATES
+                    and 0 < job.attempt <= job.max_attempts
+                    and job.attempt_started_at is not None
+                )
+
     def _reclaim_expired_cursor(self, cursor: Any, current: datetime) -> int:
         cursor.execute("SELECT j.job_id,j.state,j.dispatch_fence_id,j.attempt_count,j.max_attempts FROM xb_member_gateway.jobs j JOIN xb_member_gateway.leases l ON l.job_id=j.job_id WHERE l.active=TRUE AND l.expires_at<=%s FOR UPDATE OF j,l", (current,))
         rows = cursor.fetchall()
@@ -653,7 +1031,15 @@ class PostgresRepository:
         current = utc_now(now)
         with self._transaction() as connection:
             with connection.cursor() as cursor:
+                self._lock_kill_switch(cursor)
                 self._reclaim_expired_cursor(cursor, current)
+                cursor.execute(
+                    "SELECT lease_id FROM xb_member_gateway.leases "
+                    "WHERE active=TRUE AND expires_at>%s LIMIT 1 FOR UPDATE",
+                    (current,),
+                )
+                if cursor.fetchone() is not None:
+                    return None
                 cursor.execute("SELECT job_id FROM xb_member_gateway.jobs WHERE state IN ('QUEUED','RETRY_WAIT') AND (next_attempt_at IS NULL OR next_attempt_at<=%s) AND attempt_count<max_attempts ORDER BY created_at,job_id FOR UPDATE SKIP LOCKED LIMIT 1", (current,))
                 row = cursor.fetchone()
                 if row is None:
@@ -755,10 +1141,29 @@ class PostgresRepository:
                 self._require_lease(cursor,job,worker_id,current)
                 if job.state != JobState.ALLOCATION_BOUND or not job.allocation_member_no:
                     raise AllocationConflict("bound_allocation_required")
-                if ProbeStatus(status) == ProbeStatus.FREE and probe_reference == job.allocation_probe_reference:
+                status = ProbeStatus(status)
+                prior = self._latest_recheck_cursor(cursor, job)
+                current_prior = prior is not None and prior.attempt == job.attempt and prior.worker_id == worker_id and prior.member_no == job.allocation_member_no
+                if current_prior and prior.status == status and prior.probe_reference == probe_reference:
                     return job
-                cursor.execute("INSERT INTO xb_member_gateway.allocation_probes(job_id,candidate,probe_status,probe_reference,observed_at) VALUES(%s,%s,%s,%s,%s)", (job_id,job.allocation_member_no,ProbeStatus(status).value,probe_reference,current))
+                recheck_id = f"recheck-{uuid.uuid4().hex}"
+                cursor.execute(
+                    "INSERT INTO xb_member_gateway.audit_events(event_type,job_id,operation,state,safe_reference,metadata,recorded_at) "
+                    "VALUES('allocation_recheck',%s,'member.create','ALLOCATION_BOUND',%s,%s::jsonb,%s)",
+                    (job_id,recheck_id,json.dumps({"attempt":job.attempt,"worker_session":worker_id,"status":status.value,"probe_reference":probe_reference},separators=(",",":")),current),
+                )
+                cursor.execute("INSERT INTO xb_member_gateway.allocation_probes(job_id,candidate,probe_status,probe_reference,observed_at) VALUES(%s,%s,%s,%s,%s) ON CONFLICT(job_id,candidate,probe_reference) DO NOTHING", (job_id,job.allocation_member_no,status.value,probe_reference,current))
+                if status == ProbeStatus.FREE and probe_reference != job.allocation_probe_reference and not current_prior:
+                    return job
                 return self._advance(cursor,job,JobState.MANUAL_REVIEW,current,{"last_error_code":"bound_member_no_recheck_not_free"})
+
+    def get_fresh_recheck(self, job_id: str, worker_id: str, *, now: datetime | None = None) -> AllocationRecheck | None:
+        current = utc_now(now)
+        with self._transaction() as connection:
+            with connection.cursor() as cursor:
+                job = self._select_job(cursor, job_id, for_update=True)
+                self._require_lease(cursor, job, worker_id, current)
+                return self._fresh_recheck_cursor(cursor, job, worker_id, current)
 
     def record_write_intent(self, job_id: str, member_no: str, operation: str, payload_hash_value: str, worker_id: str, *, now: datetime | None = None) -> WriteIntentRecord:
         current = utc_now(now)
@@ -772,6 +1177,9 @@ class PostgresRepository:
                 allocation = cursor.fetchone()
                 if allocation is None or allocation[0] != member_no:
                     raise RepositoryError("allocation_binding_required")
+                fresh = self._fresh_recheck_cursor(cursor, job, worker_id, current)
+                if fresh is None:
+                    raise RepositoryError("fresh_bound_member_no_recheck_required")
                 cursor.execute("SELECT intent_id,member_no,payload_hash,recorded_at FROM xb_member_gateway.write_intents WHERE job_id=%s FOR UPDATE", (job_id,))
                 existing = cursor.fetchone()
                 if existing is not None:
@@ -779,13 +1187,13 @@ class PostgresRepository:
                         raise SourceConflict("write_intent_payload_conflict")
                     if job.state == JobState.ALLOCATION_BOUND:
                         self._advance(cursor,job,JobState.WRITE_INTENT_RECORDED,current,{"write_intent_id":str(existing[0])})
-                    return WriteIntentRecord(job_id,str(existing[0]),existing[1],existing[2],self._dt(existing[3]) or "")
+                    return WriteIntentRecord(job_id,str(existing[0]),existing[1],existing[2],self._dt(existing[3]) or "",fresh.recheck_id)
                 if job.state != JobState.ALLOCATION_BOUND:
                     raise RepositoryError("write_intent_state_invalid")
                 intent_id = str(uuid.uuid4())
                 cursor.execute("INSERT INTO xb_member_gateway.write_intents(intent_id,job_id,operation,member_no,payload_hash,recorded_at) VALUES(%s,%s,%s,%s,%s,%s)", (intent_id,job_id,operation,member_no,payload_hash_value,current))
                 self._advance(cursor,job,JobState.WRITE_INTENT_RECORDED,current,{"write_intent_id":intent_id})
-                return WriteIntentRecord(job_id,intent_id,member_no,payload_hash_value,timestamp(current))
+                return WriteIntentRecord(job_id,intent_id,member_no,payload_hash_value,timestamp(current),fresh.recheck_id)
 
     def get_write_intent(self, job_id: str) -> WriteIntentRecord | None:
         with self._transaction() as connection:
@@ -793,28 +1201,38 @@ class PostgresRepository:
                 self._select_job(cursor,job_id)
                 cursor.execute("SELECT intent_id,member_no,payload_hash,recorded_at FROM xb_member_gateway.write_intents WHERE job_id=%s", (job_id,))
                 row = cursor.fetchone()
-                return None if row is None else WriteIntentRecord(job_id,str(row[0]),row[1],row[2],self._dt(row[3]) or "")
+                if row is None:
+                    return None
+                latest = self._latest_recheck_cursor(cursor, self._select_job(cursor, job_id))
+                return WriteIntentRecord(job_id,str(row[0]),row[1],row[2],self._dt(row[3]) or "",latest.recheck_id if latest else None)
 
     def record_dispatch_fence(self, job_id: str, member_no: str, operation: str, worker_id: str, *, now: datetime | None = None) -> DispatchFenceRecord:
         current = utc_now(now)
         with self._transaction() as connection:
             with connection.cursor() as cursor:
+                self._lock_kill_switch(cursor)
                 job = self._select_job(cursor,job_id,for_update=True)
+                self._require_lease(cursor,job,worker_id,current)
                 cursor.execute("SELECT fence_id,member_no,operation,created_at FROM xb_member_gateway.dispatch_fences WHERE job_id=%s FOR UPDATE", (job_id,))
                 existing = cursor.fetchone()
                 if existing is not None:
                     if existing[1] != member_no or existing[2] != operation:
                         raise AllocationConflict("dispatch_fence_binding_invalid")
-                    return DispatchFenceRecord(job_id,str(existing[0]),existing[1],existing[2],self._dt(existing[3]) or "")
-                self._require_lease(cursor,job,worker_id,current)
+                    latest = self._latest_recheck_cursor(cursor, job)
+                    return DispatchFenceRecord(job_id,public_fence_id(existing[0]),existing[1],existing[2],self._dt(existing[3]) or "",latest.recheck_id if latest else None)
+                fresh = self._fresh_recheck_cursor(cursor, job, worker_id, current)
                 cursor.execute("SELECT member_no FROM xb_member_gateway.write_intents WHERE job_id=%s", (job_id,))
                 intent = cursor.fetchone()
-                if intent is None or intent[0] != member_no or operation != "member.create" or job.state != JobState.WRITE_INTENT_RECORDED or job.save_invocation_count != 0:
+                if (
+                    intent is None or intent[0] != member_no or operation != "member.create"
+                    or job.state != JobState.WRITE_INTENT_RECORDED or job.save_invocation_count != 0
+                    or fresh is None
+                ):
                     raise RepositoryError("write_intent_required")
-                fence_id = str(uuid.uuid4())
-                cursor.execute("INSERT INTO xb_member_gateway.dispatch_fences(fence_id,job_id,operation,member_no,created_at,save_invocation_count) VALUES(%s,%s,%s,%s,%s,0)", (fence_id,job_id,operation,member_no,current))
+                fence_id = new_fence_id()
+                cursor.execute("INSERT INTO xb_member_gateway.dispatch_fences(fence_id,job_id,operation,member_no,created_at,save_invocation_count) VALUES(%s,%s,%s,%s,%s,0)", (internal_fence_id(fence_id),job_id,operation,member_no,current))
                 self._advance(cursor,job,JobState.WRITING,current,{"dispatch_fence_id":fence_id})
-                return DispatchFenceRecord(job_id,fence_id,member_no,operation,timestamp(current))
+                return DispatchFenceRecord(job_id,fence_id,member_no,operation,timestamp(current),fresh.recheck_id)
 
     def get_dispatch_fence(self, job_id: str) -> DispatchFenceRecord | None:
         with self._transaction() as connection:
@@ -822,9 +1240,103 @@ class PostgresRepository:
                 self._select_job(cursor,job_id)
                 cursor.execute("SELECT fence_id,member_no,operation,created_at FROM xb_member_gateway.dispatch_fences WHERE job_id=%s", (job_id,))
                 row = cursor.fetchone()
-                return None if row is None else DispatchFenceRecord(job_id,str(row[0]),row[1],row[2],self._dt(row[3]) or "")
+                if row is None:
+                    return None
+                latest = self._latest_recheck_cursor(cursor, self._select_job(cursor, job_id))
+                return DispatchFenceRecord(job_id,public_fence_id(row[0]),row[1],row[2],self._dt(row[3]) or "",latest.recheck_id if latest else None)
 
-    def acknowledge_result(self, result: ResultRecord, *, worker_id: str | None = None, require_lease: bool = True, now: datetime | None = None) -> tuple[ResultRecord, bool]:
+    def open_reconciliation_case(self, job_id: str, member_no: str, *, now: datetime | None = None) -> ReconciliationCaseRecord:
+        current = utc_now(now)
+        with self._transaction() as connection:
+            with connection.cursor() as cursor:
+                job = self._select_job(cursor, job_id, for_update=True)
+                if job.state != JobState.WRITE_OUTCOME_UNCERTAIN:
+                    raise RepositoryError("reconciliation_requires_uncertain_state")
+                cursor.execute("SELECT member_no FROM xb_member_gateway.member_allocations WHERE job_id=%s FOR UPDATE", (job_id,))
+                allocation = cursor.fetchone()
+                cursor.execute("SELECT member_no FROM xb_member_gateway.dispatch_fences WHERE job_id=%s FOR UPDATE", (job_id,))
+                fence = cursor.fetchone()
+                if allocation is None or fence is None or allocation[0] != member_no or fence[0] != member_no:
+                    raise RepositoryError("reconciliation_member_binding_invalid")
+                cursor.execute("SELECT expires_at FROM xb_member_gateway.leases WHERE job_id=%s AND active=TRUE FOR UPDATE", (job_id,))
+                lease = cursor.fetchone()
+                if lease is not None:
+                    if parse_timestamp(lease[0]) > current:
+                        raise LeaseConflict("reconciliation_writer_lease_active")
+                    cursor.execute("UPDATE xb_member_gateway.leases SET active=FALSE WHERE job_id=%s AND active=TRUE", (job_id,))
+                    cursor.execute("UPDATE xb_member_gateway.jobs SET lease_owner=NULL,lease_expires_at=NULL,updated_at=%s WHERE job_id=%s", (current,job_id))
+                cursor.execute("SELECT case_id,job_id,member_no,case_state,opened_at,closed_at FROM xb_member_gateway.reconciliation_cases WHERE job_id=%s FOR UPDATE", (job_id,))
+                existing = cursor.fetchone()
+                if existing is not None:
+                    if existing[3] != ReconciliationCaseState.OPEN.value:
+                        raise RepositoryError("reconciliation_case_closed")
+                    return ReconciliationCaseRecord(str(existing[0]),existing[1],existing[2],ReconciliationCaseState(existing[3]),self._dt(existing[4]) or "",self._dt(existing[5]))
+                case_id = str(uuid.uuid4())
+                cursor.execute("INSERT INTO xb_member_gateway.reconciliation_cases(case_id,job_id,member_no,case_state,opened_at) VALUES(%s,%s,%s,'OPEN',%s)", (case_id,job_id,member_no,current))
+                return ReconciliationCaseRecord(case_id,job_id,member_no,ReconciliationCaseState.OPEN,timestamp(current))
+
+    def record_reconciliation_check(self, case_id: str, lookup_status: str, readback_found: bool, readback_match: bool, *, now: datetime | None = None) -> ReconciliationCheckRecord:
+        current = utc_now(now)
+        with self._transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT job_id,member_no,case_state FROM xb_member_gateway.reconciliation_cases WHERE case_id=%s", (case_id,))
+                case = cursor.fetchone()
+                if case is None:
+                    raise RepositoryError("reconciliation_case_required")
+                job = self._select_job(cursor, case[0], for_update=True)
+                cursor.execute("SELECT job_id,member_no,case_state FROM xb_member_gateway.reconciliation_cases WHERE case_id=%s FOR UPDATE", (case_id,))
+                case = cursor.fetchone()
+                if case is None:
+                    raise RepositoryError("reconciliation_case_required")
+                if case[2] != ReconciliationCaseState.OPEN.value:
+                    raise RepositoryError("reconciliation_case_not_open")
+                if job.state != JobState.WRITE_OUTCOME_UNCERTAIN:
+                    raise RepositoryError("reconciliation_requires_uncertain_state")
+                cursor.execute("SELECT expires_at FROM xb_member_gateway.leases WHERE job_id=%s AND active=TRUE FOR UPDATE", (job.job_id,))
+                lease = cursor.fetchone()
+                if lease is not None and parse_timestamp(lease[0]) > current:
+                    raise LeaseConflict("reconciliation_writer_lease_active")
+                if lease is not None:
+                    cursor.execute("UPDATE xb_member_gateway.leases SET active=FALSE WHERE job_id=%s AND active=TRUE", (job.job_id,))
+                    cursor.execute("UPDATE xb_member_gateway.jobs SET lease_owner=NULL,lease_expires_at=NULL,updated_at=%s WHERE job_id=%s", (current,job.job_id))
+                if lookup_status not in {"exact_match", "absent", "mismatch", "ambiguous"}:
+                    raise RepositoryError("reconciliation_status_invalid")
+                if not isinstance(readback_found, bool) or not isinstance(readback_match, bool):
+                    raise RepositoryError("reconciliation_flags_invalid")
+                required_flags = {"exact_match":(True,True),"absent":(False,False),"mismatch":(True,False)}
+                if lookup_status in required_flags and (readback_found,readback_match) != required_flags[lookup_status]:
+                    raise RepositoryError("reconciliation_flags_invalid")
+                if lookup_status == "ambiguous" and readback_match:
+                    raise RepositoryError("reconciliation_flags_invalid")
+                case_state = {
+                    "exact_match": ReconciliationCaseState.EXACT_MATCH.value,
+                    "absent": ReconciliationCaseState.ABSENT.value,
+                    "mismatch": ReconciliationCaseState.MISMATCH.value,
+                    "ambiguous": ReconciliationCaseState.AMBIGUOUS.value,
+                }[lookup_status]
+                closed_at = current if lookup_status in {"exact_match", "absent"} else None
+                cursor.execute("UPDATE xb_member_gateway.reconciliation_cases SET case_state=%s,closed_at=%s WHERE case_id=%s", (case_state,closed_at,case_id))
+                cursor.execute("INSERT INTO xb_member_gateway.reconciliation_checks(case_id,lookup_status,readback_found,readback_match,checked_at) VALUES(%s,%s,%s,%s,%s) RETURNING check_id,checked_at", (case_id,lookup_status,readback_found,readback_match,current))
+                row = cursor.fetchone()
+                return ReconciliationCheckRecord(str(row[0]),case_id,lookup_status,readback_found,readback_match,self._dt(row[1]) or timestamp(current))
+
+    def _require_reconciliation_evidence(self, cursor: Any, result: ResultRecord, case_id: str) -> None:
+        cursor.execute("SELECT job_id,member_no,case_state FROM xb_member_gateway.reconciliation_cases WHERE case_id=%s FOR UPDATE", (case_id,))
+        case = cursor.fetchone()
+        if case is None or case[0] != result.job_id or case[1] != result.member_no:
+            raise RepositoryError("reconciliation_case_required")
+        expected = {
+            ResultStatus.CREATED_VERIFIED:(ReconciliationCaseState.EXACT_MATCH.value,"exact_match"),
+            ResultStatus.CONFIRMED_NOT_CREATED:(ReconciliationCaseState.ABSENT.value,"absent"),
+            ResultStatus.CREATED_READBACK_MISMATCH:(ReconciliationCaseState.MISMATCH.value,"mismatch"),
+            ResultStatus.WRITE_OUTCOME_UNCERTAIN:(ReconciliationCaseState.AMBIGUOUS.value,"ambiguous"),
+        }[result.status]
+        cursor.execute("SELECT lookup_status,readback_found,readback_match FROM xb_member_gateway.reconciliation_checks WHERE case_id=%s ORDER BY check_id DESC LIMIT 1", (case_id,))
+        check = cursor.fetchone()
+        if case[2] != expected[0] or check is None or check[0] != expected[1] or (bool(check[1]),bool(check[2])) != (result.readback_found,result.readback_match):
+            raise RepositoryError("reconciliation_check_required")
+
+    def acknowledge_result(self, result: ResultRecord, *, worker_id: str | None = None, require_lease: bool = True, reconciliation_case_id: str | None = None, now: datetime | None = None) -> tuple[ResultRecord, bool]:
         current = utc_now(now)
         if result.save_invocation_count != 1:
             raise ResultConflict("save_invocation_count_must_be_one")
@@ -833,24 +1345,49 @@ class PostgresRepository:
                 job = self._select_job(cursor,result.job_id,for_update=True)
                 cursor.execute("SELECT fence_id,member_no FROM xb_member_gateway.dispatch_fences WHERE job_id=%s FOR UPDATE", (result.job_id,))
                 fence = cursor.fetchone()
-                if fence is None or str(fence[0]) != result.dispatch_fence_id or fence[1] != result.member_no:
+                if fence is None or public_fence_id(fence[0]) != result.dispatch_fence_id or fence[1] != result.member_no:
                     raise RepositoryError("dispatch_fence_binding_invalid")
+                cursor.execute("SELECT result_hash,status FROM xb_member_gateway.results WHERE job_id=%s FOR UPDATE", (result.job_id,))
+                existing = cursor.fetchone()
+                if existing is not None and existing[0] == result.result_hash:
+                    if not require_lease:
+                        if reconciliation_case_id is None:
+                            raise RepositoryError("reconciliation_case_required")
+                        self._require_reconciliation_evidence(cursor, result, reconciliation_case_id)
+                    return result, True
+                reconciliation_projection = (
+                    existing is not None
+                    and not require_lease
+                    and existing[1] == ResultStatus.WRITE_OUTCOME_UNCERTAIN.value
+                )
+                reconciliation_replacement = (
+                    reconciliation_projection
+                    and result.status != ResultStatus.WRITE_OUTCOME_UNCERTAIN
+                )
+                if existing is not None and not reconciliation_projection and (
+                    existing[1] != ResultStatus.WRITE_OUTCOME_UNCERTAIN.value
+                    or result.status == ResultStatus.WRITE_OUTCOME_UNCERTAIN
+                ):
+                    cursor.execute("INSERT INTO xb_member_gateway.result_conflicts(job_id,expected_hash,observed_hash) VALUES(%s,%s,%s)", (result.job_id,existing[0],result.result_hash))
+                    raise ResultConflict("result_payload_conflict")
                 if require_lease:
                     if not worker_id:
                         raise LeaseConflict("worker_identity_required")
                     self._require_lease(cursor,job,worker_id,current)
-                cursor.execute("SELECT result_hash,status FROM xb_member_gateway.results WHERE job_id=%s FOR UPDATE", (result.job_id,))
-                existing = cursor.fetchone()
-                if existing is not None:
-                    if existing[0] == result.result_hash:
-                        return result, True
+                else:
+                    if reconciliation_case_id is None:
+                        raise RepositoryError("reconciliation_case_required")
+                    self._require_reconciliation_evidence(cursor, result, reconciliation_case_id)
+                if reconciliation_projection and result.status == ResultStatus.WRITE_OUTCOME_UNCERTAIN:
+                    return result, True
+                if existing is not None and not reconciliation_replacement:
                     if existing[1] != ResultStatus.WRITE_OUTCOME_UNCERTAIN.value or result.status == ResultStatus.WRITE_OUTCOME_UNCERTAIN:
                         cursor.execute("INSERT INTO xb_member_gateway.result_conflicts(job_id,expected_hash,observed_hash) VALUES(%s,%s,%s)", (result.job_id,existing[0],result.result_hash))
                         raise ResultConflict("result_payload_conflict")
-                    cursor.execute("INSERT INTO xb_member_gateway.result_events(job_id,result_hash,status,member_no,dispatch_fence_id,save_invocation_count,readback_found,readback_match,reconciliation_required,error_code,acknowledged_at) SELECT job_id,result_hash,status,member_no,dispatch_fence_id,save_invocation_count,readback_found,readback_match,reconciliation_required,error_code,acknowledged_at FROM xb_member_gateway.results WHERE job_id=%s", (result.job_id,))
                     cursor.execute("DELETE FROM xb_member_gateway.results WHERE job_id=%s", (result.job_id,))
-                cursor.execute("INSERT INTO xb_member_gateway.result_events(job_id,result_hash,status,member_no,dispatch_fence_id,save_invocation_count,readback_found,readback_match,reconciliation_required,error_code,acknowledged_at) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", (result.job_id,result.result_hash,result.status.value,result.member_no,result.dispatch_fence_id,result.save_invocation_count,result.readback_found,result.readback_match,result.reconciliation_required,result.error_code,current))
-                cursor.execute("INSERT INTO xb_member_gateway.results(job_id,result_hash,status,member_no,dispatch_fence_id,save_invocation_count,readback_found,readback_match,reconciliation_required,error_code,acknowledged_at) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", (result.job_id,result.result_hash,result.status.value,result.member_no,result.dispatch_fence_id,result.save_invocation_count,result.readback_found,result.readback_match,result.reconciliation_required,result.error_code,current))
+                internal_fence = internal_fence_id(result.dispatch_fence_id)
+                cursor.execute("INSERT INTO xb_member_gateway.result_events(job_id,result_hash,status,member_no,dispatch_fence_id,save_invocation_count,readback_found,readback_match,reconciliation_required,error_code,acknowledged_at) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", (result.job_id,result.result_hash,result.status.value,result.member_no,internal_fence,result.save_invocation_count,result.readback_found,result.readback_match,result.reconciliation_required,result.error_code,current))
+                cursor.execute("INSERT INTO xb_member_gateway.results(job_id,result_hash,status,member_no,dispatch_fence_id,save_invocation_count,readback_found,readback_match,reconciliation_required,error_code,acknowledged_at) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", (result.job_id,result.result_hash,result.status.value,result.member_no,internal_fence,result.save_invocation_count,result.readback_found,result.readback_match,result.reconciliation_required,result.error_code,current))
                 if result.status == ResultStatus.CREATED_VERIFIED and job.state == JobState.WRITING:
                     self._advance(cursor,job,JobState.READBACK,current)
                 target = {ResultStatus.CREATED_VERIFIED:JobState.CREATED_VERIFIED,ResultStatus.WRITE_OUTCOME_UNCERTAIN:JobState.WRITE_OUTCOME_UNCERTAIN,ResultStatus.CONFIRMED_NOT_CREATED:JobState.CONFIRMED_NOT_CREATED,ResultStatus.CREATED_READBACK_MISMATCH:JobState.CREATED_READBACK_MISMATCH}[result.status]
@@ -858,6 +1395,9 @@ class PostgresRepository:
                     self._advance(cursor,job,target,current,{"result_status":result.status.value,"save_invocation_count":1,"last_error_code":result.error_code})
                 else:
                     cursor.execute("UPDATE xb_member_gateway.jobs SET result_status=%s,save_invocation_count=1,last_error_code=%s,updated_at=%s WHERE job_id=%s", (result.status.value,result.error_code,current,result.job_id))
+                if require_lease:
+                    cursor.execute("UPDATE xb_member_gateway.leases SET active=FALSE WHERE job_id=%s AND active=TRUE", (result.job_id,))
+                    cursor.execute("UPDATE xb_member_gateway.jobs SET lease_owner=NULL,lease_expires_at=NULL,updated_at=%s WHERE job_id=%s", (current,result.job_id))
                 return result, False
 
     def get_result(self, job_id: str) -> ResultRecord | None:
@@ -866,7 +1406,7 @@ class PostgresRepository:
                 self._select_job(cursor,job_id)
                 cursor.execute("SELECT result_hash,status,member_no,dispatch_fence_id,save_invocation_count,readback_found,readback_match,reconciliation_required,error_code,acknowledged_at FROM xb_member_gateway.results WHERE job_id=%s", (job_id,))
                 row = cursor.fetchone()
-                return None if row is None else ResultRecord(job_id,row[0],ResultStatus(row[1]),row[2],str(row[3]),int(row[4]),bool(row[5]),bool(row[6]),bool(row[7]),row[8],self._dt(row[9]) or "")
+                return None if row is None else ResultRecord(job_id,row[0],ResultStatus(row[1]),row[2],public_fence_id(row[3]),int(row[4]),bool(row[5]),bool(row[6]),bool(row[7]),row[8],self._dt(row[9]) or "")
 
     def mark_state(self, job_id: str, target: JobState, *, worker_id: str | None = None, require_lease: bool = False, error_code: str | None = None, now: datetime | None = None) -> JobRecord:
         current = utc_now(now)

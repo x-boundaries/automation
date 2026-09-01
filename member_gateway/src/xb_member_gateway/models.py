@@ -42,6 +42,15 @@ class ResultStatus(str, Enum):
     CREATED_READBACK_MISMATCH = "CREATED_READBACK_MISMATCH"
 
 
+class ReconciliationCaseState(str, Enum):
+    OPEN = "OPEN"
+    EXACT_MATCH = "EXACT_MATCH"
+    ABSENT = "ABSENT"
+    MISMATCH = "MISMATCH"
+    AMBIGUOUS = "AMBIGUOUS"
+    MANUAL_REVIEW = "MANUAL_REVIEW"
+
+
 def iso_utc(value: Any) -> str:
     if hasattr(value, "tzinfo") and hasattr(value, "isoformat"):
         if value.tzinfo is None:
@@ -188,12 +197,27 @@ class AllocationProbe:
 
 
 @dataclass(frozen=True, slots=True)
+class AllocationRecheck:
+    """Durable positive evidence immediately before dispatch."""
+
+    recheck_id: str
+    job_id: str
+    attempt: int
+    worker_id: str
+    member_no: str
+    status: ProbeStatus
+    probe_reference: str
+    observed_at: str
+
+
+@dataclass(frozen=True, slots=True)
 class WriteIntentRecord:
     job_id: str
     intent_id: str
     member_no: str
     payload_hash: str
     recorded_at: str
+    recheck_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -203,6 +227,27 @@ class DispatchFenceRecord:
     member_no: str
     operation: str
     created_at: str
+    recheck_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ReconciliationCaseRecord:
+    case_id: str
+    job_id: str
+    member_no: str
+    state: ReconciliationCaseState
+    opened_at: str
+    closed_at: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ReconciliationCheckRecord:
+    check_id: str
+    case_id: str
+    lookup_status: str
+    readback_found: bool
+    readback_match: bool
+    checked_at: str
 
 
 @dataclass(frozen=True, slots=True)
