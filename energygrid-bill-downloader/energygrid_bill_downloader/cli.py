@@ -13,7 +13,12 @@ from typing import Any
 from .config import load_config_file, load_runtime_config
 from .errors import ACTION_REQUIRED, AppError, ConfigError, DependencyError, exit_code_for
 from .publication import cleanup_stale_owned_temp
-from .portal import PlaywrightPortal
+from .portal import (
+    LOGIN_DIAGNOSTIC_CLASSIFICATIONS,
+    SUBMIT_NOT_DISPATCHED,
+    PlaywrightPortal,
+    unobserved_login_witnesses,
+)
 from .reconcile import reconcile_inventory
 from .state import StateStore
 
@@ -30,6 +35,20 @@ ALLOWED_LOG_FIELDS = {
 
 RUN_FAILED_PHASE = "run_failed"
 UNCLASSIFIED_SUPPORT_REF = "APP_ERROR_UNCLASSIFIED"
+
+# DL-XB-141-RUNTIME-005-SOURCE-DURABILITY-A1: the bounded diagnostic operation.
+# The launcher reaches it as the fixed `login-diagnostic` command; headed
+# execution is an implicit, non-overridable property of that one operation and
+# never a generic switch.
+LOGIN_DIAGNOSTIC_COMMAND = "login-diagnostic"
+LOGIN_DIAGNOSTIC_SCHEMA = "energygrid.login_diagnostic.v1"
+DIAGNOSTIC_COMPLETE = "DIAGNOSTIC_COMPLETE"
+
+# The bounded reference for a diagnostic that ran to its deadline without
+# establishing an authorised classification. It is a fail-closed outcome, not a
+# failure of a named step, so it carries its own reference rather than
+# borrowing one that names a step that did not fail.
+DIAGNOSTIC_UNCLASSIFIED_SUPPORT_REF = "EG_LOGIN_DIAGNOSTIC_UNCLASSIFIED"
 
 # Every message the pre-auth login path can raise, mapped to a bounded ASCII
 # reference. portal.py owns the wording, so a change there fails the reachability
@@ -159,7 +178,151 @@ def build_parser() -> argparse.ArgumentParser:
         subparser.add_argument("--timeout-seconds", type=int)
         subparser.add_argument("--max-attempts", type=int)
         subparser.add_argument("--headed", action="store_true")
+    # Deliberately NOT built from the loop above. The diagnostic accepts
+    # `--config` and nothing else: no `--headed`, no archive, state, temp or log
+    # override, no timeout or attempt override, and no additional argument. Its
+    # headed mode and its bounds are fixed properties of the operation.
+    diagnostic = subparsers.add_parser(LOGIN_DIAGNOSTIC_COMMAND)
+    diagnostic.add_argument("--config", required=True, type=Path)
     return parser
+
+
+def login_diagnostic_document(
+    *,
+    status: str,
+    classification: str | None,
+    submit_dispatched: bool,
+    submit_outcome: str,
+    pre_submit: dict[str, Any],
+    post_submit: dict[str, Any],
+    support_ref: str | None = None,
+) -> dict[str, Any]:
+    """Build the one closed, public-safe diagnostic document.
+
+    Every value is a fixed identifier, a boolean, a count, or null. No exception
+    text, URL, filesystem path, account identity, host identity, security
+    identifier, credential, credential derivative, page text, or business datum
+    can reach it, because none of them is ever a field.
+    """
+
+    document: dict[str, Any] = {
+        "schema": LOGIN_DIAGNOSTIC_SCHEMA,
+        "status": status,
+        "classification": classification,
+        "submit_dispatched": submit_dispatched,
+        "submit_outcome": submit_outcome,
+        "pre_submit": pre_submit,
+        "post_submit": post_submit,
+    }
+    if support_ref is not None:
+        document["support_ref"] = support_ref
+    return document
+
+
+def emit_login_diagnostic(document: dict[str, Any]) -> None:
+    print(json.dumps(document, sort_keys=True))
+
+
+def run_login_diagnostic(config_path: Path) -> int:
+    """Run the bounded diagnostic and emit exactly one result document.
+
+    The configuration is loaded and validated, and nothing else on the run path
+    is touched: `config.preflight()` is not called, no `SafeLogger` is built, no
+    stale-temp cleanup runs, no `StateStore` is opened, and inventory
+    reconciliation is never reached. Nothing is created, modified, or deleted on
+    disk.
+    """
+
+    unobserved_pre = unobserved_login_witnesses()
+    unobserved_post = unobserved_login_witnesses(include_url=True)
+
+    def action_required(support_ref: str) -> dict[str, Any]:
+        return login_diagnostic_document(
+            status=ACTION_REQUIRED,
+            classification=None,
+            submit_dispatched=False,
+            submit_outcome=SUBMIT_NOT_DISPATCHED,
+            pre_submit=unobserved_pre,
+            post_submit=unobserved_post,
+            support_ref=support_ref,
+        )
+
+    try:
+        config = load_runtime_config(load_config_file(config_path))
+    except (ConfigError, DependencyError) as exc:
+        emit_login_diagnostic(action_required(support_ref_for(exc)))
+        return 64
+
+    try:
+        # Headed unconditionally: it is what the operation is for, and there is
+        # no argument by which a caller could ask for anything else.
+        with PlaywrightPortal(config, headed=True) as portal:
+            result = portal.login_diagnostic()
+    except (ConfigError, DependencyError) as exc:
+        emit_login_diagnostic(action_required(support_ref_for(exc)))
+        return 64
+    except AppError as exc:
+        emit_login_diagnostic(action_required(support_ref_for(exc)))
+        return 20
+    except Exception:
+        # The diagnostic's own fail-closed boundary for an unexpected ordinary
+        # exception that escapes before a truthful submit-dispatched result
+        # exists. The portal keeps its own post-submit envelope, so nothing that
+        # has already dispatched Login can arrive here and be reported as never
+        # dispatched. Exactly one closed document is still emitted, with the
+        # unobserved witness shapes and a bounded reference; the exception
+        # itself is discarded rather than described, so no traceback or
+        # free-form text reaches stdout or stderr. `BaseException` is
+        # deliberately excluded: `KeyboardInterrupt` and `SystemExit` are
+        # process control, not a diagnostic outcome, and must propagate.
+        emit_login_diagnostic(action_required(UNCLASSIFIED_SUPPORT_REF))
+        return 20
+
+    if result.failure is not None:
+        emit_login_diagnostic(
+            login_diagnostic_document(
+                status=ACTION_REQUIRED,
+                classification=None,
+                submit_dispatched=result.submit_dispatched,
+                submit_outcome=result.submit_outcome,
+                pre_submit=result.pre_submit,
+                post_submit=result.post_submit,
+                support_ref=support_ref_for(result.failure),
+            )
+        )
+        return 20
+
+    # An unrecognised classification is treated as none at all, so the emitted
+    # vocabulary stays closed even if the portal layer ever grows a new one
+    # without this document being updated to authorise it.
+    classification = result.classification
+    if classification not in LOGIN_DIAGNOSTIC_CLASSIFICATIONS:
+        classification = None
+    if classification is None:
+        emit_login_diagnostic(
+            login_diagnostic_document(
+                status=ACTION_REQUIRED,
+                classification=None,
+                submit_dispatched=result.submit_dispatched,
+                submit_outcome=result.submit_outcome,
+                pre_submit=result.pre_submit,
+                post_submit=result.post_submit,
+                support_ref=DIAGNOSTIC_UNCLASSIFIED_SUPPORT_REF,
+            )
+        )
+        return 20
+
+    emit_login_diagnostic(
+        login_diagnostic_document(
+            status=DIAGNOSTIC_COMPLETE,
+            classification=classification,
+            submit_dispatched=result.submit_dispatched,
+            submit_outcome=result.submit_outcome,
+            pre_submit=result.pre_submit,
+            post_submit=result.post_submit,
+        )
+    )
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -167,6 +330,11 @@ def main(argv: list[str] | None = None) -> int:
     logger: SafeLogger | None = None
     try:
         args = parser.parse_args(argv)
+        if args.command == LOGIN_DIAGNOSTIC_COMMAND:
+            # The diagnostic owns its whole result contract, including its own
+            # exit codes. It never reaches the run path below, so no state, log,
+            # temp or archive artefact can be created on its behalf.
+            return run_login_diagnostic(args.config)
         raw = load_config_file(args.config)
         config = load_runtime_config(raw)
         config = config.with_overrides(

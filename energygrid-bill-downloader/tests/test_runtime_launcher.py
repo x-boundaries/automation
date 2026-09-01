@@ -6591,6 +6591,68 @@ class LauncherStaticGuards(TierCBase):
             "the launcher root is $PSScriptRoot and is never a parameter",
         )
 
+    # ---- DL-XB-141-RUNTIME-005-SOURCE-DURABILITY-A1 ---- #
+    #
+    # The amendment admits ONE more fixed operation name. It adds no parameter,
+    # no headed switch, and no way for a caller to reach the child with anything
+    # of their own. These guards are what stop that from drifting.
+
+    def test_the_command_allowlist_is_exactly_the_three_admitted_operations(self):
+        """A closed ValidateSet, read from the committed script rather than assumed."""
+        match = re.search(
+            r"\[ValidateSet\(([^)]*)\)\]\[string\]\$Command", self.launcher
+        )
+        self.assertIsNotNone(match, "-Command must carry a ValidateSet")
+        admitted = re.findall(r"'([^']*)'", match.group(1))
+        self.assertEqual(["run", "list", "login-diagnostic"], admitted)
+        self.assertIn("$Command = 'run'", self.launcher, "the default stays `run`")
+
+    def test_the_child_argument_vector_is_fixed_and_never_extended(self):
+        """Five elements, one assignment, and no conditional append anywhere."""
+        assignments = re.findall(r"^\s*\$childArguments\s*=.*$", self.launcher, re.M)
+        self.assertEqual(
+            [
+                "$childArguments = @('-m', 'energygrid_bill_downloader', "
+                "$Command, '--config', $ConfigPath)"
+            ],
+            [line.strip() for line in assignments],
+            "the child argument vector is one fixed five-element assignment",
+        )
+        for forbidden in ("$childArguments +=", "$childArguments +", "$childArguments.Add"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, self.launcher)
+        # Assigned once, read once. A third mention would be a mutation site.
+        self.assertEqual(2, self.launcher.count("$childArguments"))
+
+    def test_the_launcher_forwards_no_caller_supplied_argument_to_the_child(self):
+        """No argument-forwarding surface, and no headed switch on any path."""
+        for forbidden in (
+            "-Headed",
+            "$Headed",
+            "--headed",
+            "ArgumentList",
+            "$args",
+            "ValueFromRemainingArguments",
+            "Invoke-Expression",
+        ):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, self.launcher)
+
+    def test_the_launcher_names_no_portal_credential_or_script_child_argument(self):
+        """The five elements are the whole contract the child ever receives."""
+        vector_start = self.launcher.index("$childArguments = @(")
+        vector = self.launcher[vector_start:self.launcher.index(")", vector_start) + 1]
+        for forbidden in ("http", "Password", "UserName", ".py", ".ps1", "PortalUrl"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, vector)
+
+    def test_the_launcher_states_that_headed_is_not_a_generic_switch(self):
+        """The committed comment must say what the parameter surface does not."""
+        prose = normalised_prose(self.launcher[:self.launcher.index("[CmdletBinding()]")])
+        for phrase in ("no headed switch", "login-diagnostic", "non-overridable"):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase.lower(), prose)
+
     def test_the_authorised_identifier_set_is_mandatory_with_no_default(self):
         """Design section 9.1: no default, no environment route, and no file route."""
         self.assertIn(
@@ -7374,6 +7436,7 @@ def normalised_prose(text):
 SCHEDULER_EXAMPLE = PROJECT_ROOT / "task-scheduler" / "register_task.example.ps1"
 PROJECT_RUNBOOK = PROJECT_ROOT / "docs" / "runbook.md"
 PROJECT_README = PROJECT_ROOT / "README.md"
+DESIGN_DOCUMENT = PROJECT_ROOT / "docs" / "runtime_source_durability_design.md"
 
 RUNTIME_README_REQUIRED_SECTIONS = (
     "What is canonical here and what is not",
@@ -7532,6 +7595,63 @@ class RuntimeDocumentation(TierCBase):
             section = section[:end]
         prose = normalised_prose(section)
         for phrase in ("SHA-256", "before", "Class C", "fails closed", "no copy at all"):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase.lower(), prose)
+
+    def test_the_scheduler_artefacts_name_no_diagnostic_command(self):
+        """Scheduler semantics are unchanged: the scheduled shape still runs `run`."""
+        text = SCHEDULER_EXAMPLE.read_text(encoding="utf-8")
+        self.assertNotIn("login-diagnostic", text)
+        self.assertNotIn("-Headed", text)
+        for command in SCHEDULER_MUTATING_COMMANDS:
+            with self.subTest(command=command):
+                self.assertNotIn(command, text)
+
+    def test_the_runtime_readme_documents_the_bounded_diagnostic_command(self):
+        """The directory-level contract states the third command and its bounds."""
+        text = RUNTIME_README.read_text(encoding="utf-8")
+        self.assertIn("`run` (default), `list`, or `login-diagnostic`", text)
+        prose = normalised_prose(text)
+        for phrase in (
+            "no generic headed switch",
+            "implicit and non-overridable",
+            "exactly five",
+            "nothing is appended conditionally",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase.lower(), prose)
+
+    def test_the_design_document_records_the_accepted_amendment(self):
+        """The narrow amendment is recorded; every unaffected clause stays controlling."""
+        text = DESIGN_DOCUMENT.read_text(encoding="utf-8")
+        self.assertIn("DL-XB-141-RUNTIME-005-SOURCE-DURABILITY-A1", text)
+        self.assertIn("### 5.4 Bounded login diagnostic operation", text)
+        self.assertIn("energygrid.login_diagnostic.v1", text)
+        prose = normalised_prose(text)
+        for phrase in (
+            "every other clause of `dl-xb-141-runtime-005-source-durability` remains "
+            "controlling",
+            "does not add a headed switch",
+            "scheduler semantics are unchanged",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase.lower(), prose)
+
+    def test_the_runbook_documents_the_diagnostic_argument_and_exit_contract(self):
+        """The operator-facing contract matches the committed command surface."""
+        text = PROJECT_RUNBOOK.read_text(encoding="utf-8")
+        self.assertIn(
+            "python -m energygrid_bill_downloader login-diagnostic "
+            "--config <EXTERNAL_CONFIG_JSON>",
+            text,
+        )
+        prose = normalised_prose(text)
+        for phrase in (
+            "accepts `--config` and nothing else",
+            "rejects `--headed`",
+            "energygrid.login_diagnostic.v1",
+            "never exits `10`",
+        ):
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase.lower(), prose)
 
