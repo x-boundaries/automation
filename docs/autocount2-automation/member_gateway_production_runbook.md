@@ -46,8 +46,16 @@ AutoCount writer in one supervised child process. It renews the lease on the
 configured heartbeat cadence and uses `attempt_started_at` plus the configured
 execution deadline as the hard boundary. A heartbeat failure or deadline causes
 the child to be terminated and its exit to be positively observed before lease
-protection can lapse. Failure to confirm exit is fail closed; it never starts a
-second writer or retries `SaveMember`.
+protection can lapse. Failure to confirm exit is fail closed into durable
+quarantine; it never starts a second writer or retries `SaveMember`.
+
+The dispatch-fence transaction creates a `PENDING` writer hold before the child
+starts. The child receives no payload while pending, so it cannot create the
+AutoCount session or reach `SaveMember`. The parent records the exact PID and
+process-start timestamp, registers them with the existing fence/attempt/session/
+host/execution bindings, waits for the `REGISTERED` acknowledgement, and only
+then releases stdin. The registered child is the single writer process and may
+not detach or spawn a SaveMember-capable descendant.
 
 ## Operating sequence after a separately approved activation
 
@@ -72,10 +80,25 @@ window.
 ## Uncertain write handling
 
 After a dispatch fence, do not replay the job, call SaveMember again, or select
-another suffix. Use the same bound MemberNo and the read-only `GetMember`
-reconciliation path. An exact readback can close as verified. Positive absence
-closes as `CONFIRMED_NOT_CREATED` for manual follow-up and does not authorize
-automatic recreation. Any mismatch or ambiguous lookup stays in manual review.
+another suffix. First verify that the writer hold is
+`TERMINATION_CONFIRMED`. A normal child result is posted only after that
+durable confirmation. If confirmation is unavailable, preserve the fence,
+allocation, and write-intent lineage in `WRITER_TERMINATION_UNCONFIRMED` with a
+`QUARANTINED` hold; do not infer safety from elapsed time, a Kill() return,
+watchdog callback, or a restart. A quarantined job cannot be claimed,
+reallocated, written, expired into ordinary uncertainty, or reconciled.
+
+Only a fresh, host-bound recovery authority with exact recorded process
+identity and positive exit evidence may resolve the termination side of a
+quarantined fence. Recovery does not retry SaveMember or allocate a new
+MemberNo. When termination is confirmed but the business outcome is unknown,
+the repository atomically creates exactly one immutable
+`WRITE_OUTCOME_UNCERTAIN` event and current projection, moves the job to that
+existing result state, clears the hold, and releases the stale lease. The
+existing reconciliation path then applies only to that ordinary uncertainty:
+the hold must be cleared, no lease may remain active, and the existing case and
+read-only check evidence must be present. Positive absence does not authorize
+automatic recreation; mismatch or ambiguity remains manual review.
 
 ## Stop and disable
 
@@ -97,9 +120,12 @@ The API readiness check is only defence in depth.
 
 Before a dispatch fence, lease expiry may move a job through bounded retry or
 dead-letter handling while retaining the durable allocation and intent. After a
-fence, lease expiry becomes uncertainty. There is no automatic suffix advance
-or second SaveMember attempt. Manual review is the safe terminal path when
-lookup or readback evidence is not positive and exact.
+fence, expiry while the writer hold lacks positive termination proof preserves
+quarantine and global exclusion. If termination proof was already durable,
+expiry may atomically settle the existing ordinary
+`WRITE_OUTCOME_UNCERTAIN` event/projection and clear the hold. There is no
+automatic suffix advance or second SaveMember attempt. Manual review is the
+safe terminal path when lookup or readback evidence is not positive and exact.
 
 The candidate `FREE` probe is not the final dispatch evidence. Immediately
 before write intent/fence, the worker rechecks the already bound MemberNo using
@@ -113,10 +139,16 @@ reconciled.
 
 The published fence ID remains the `fence-...` representation. PostgreSQL's
 existing UUID storage is internal only and is converted at the repository
-boundary; the existing migration is therefore retained unchanged. The
-repository rate gate is fail closed and derives eligibility only from the
+boundary; the A1 migration adds the writer hold without changing that public
+representation. The repository rate gate is fail closed and derives eligibility only from the
 current sole active lease/attempt evidence; no new owner-facing numeric rate is
 defined here.
+
+The public job/status contract is versioned as
+schemas/member_gateway_job.v2.schema.json. It exposes only the safe
+writer-termination state and proof-required/hold-active indicators; it does
+not expose PID, process-start timestamp, host identity, nonce, or raw evidence.
+The result-status vocabulary remains the existing v1 vocabulary.
 
 ## Not performed by this run
 

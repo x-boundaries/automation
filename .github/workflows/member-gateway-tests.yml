@@ -6,6 +6,7 @@ on:
       - "member_gateway/**"
       - "schemas/member_gateway_source_event.v1.schema.json"
       - "schemas/member_gateway_job.v1.schema.json"
+      - "schemas/member_gateway_job.v2.schema.json"
       - "schemas/member_gateway_result.v1.schema.json"
       - "schemas/member_gateway_error.v1.schema.json"
       - "config/member_gateway.production.example.json"
@@ -23,6 +24,7 @@ on:
       - "docs/autocount2-automation/member_gateway_production_runbook.md"
       - "docs/ci-cd/CURRENT_CICD_STATUS.md"
       - "n8n-workflows/member_forms_gateway_ingest.workflow.json"
+      - "member_gateway/migrations/0003_writer_termination_quarantine.sql"
       - ".github/workflows/member-gateway-tests.yml"
   push:
     branches:
@@ -31,6 +33,7 @@ on:
       - "member_gateway/**"
       - "schemas/member_gateway_source_event.v1.schema.json"
       - "schemas/member_gateway_job.v1.schema.json"
+      - "schemas/member_gateway_job.v2.schema.json"
       - "schemas/member_gateway_result.v1.schema.json"
       - "schemas/member_gateway_error.v1.schema.json"
       - "config/member_gateway.production.example.json"
@@ -48,6 +51,7 @@ on:
       - "docs/autocount2-automation/member_gateway_production_runbook.md"
       - "docs/ci-cd/CURRENT_CICD_STATUS.md"
       - "n8n-workflows/member_forms_gateway_ingest.workflow.json"
+      - "member_gateway/migrations/0003_writer_termination_quarantine.sql"
       - ".github/workflows/member-gateway-tests.yml"
   workflow_dispatch: {}
 

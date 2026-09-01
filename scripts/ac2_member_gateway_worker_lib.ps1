@@ -17,6 +17,13 @@ function New-XbMemberGatewayProbeReference {
     return "probe-$value"
 }
 
+function Get-XbMemberGatewayWorkerHostBinding {
+    param([string]$Value = [Environment]::GetEnvironmentVariable("XB_MEMBER_GATEWAY_WORKER_HOST_BINDING", "Process"))
+    if ([string]::IsNullOrWhiteSpace($Value)) { throw "worker_host_binding_missing" }
+    if ($Value -cnotmatch '^host-[A-Za-z0-9._:-]{1,120}$') { throw "worker_host_binding_invalid" }
+    return $Value
+}
+
 function Get-XbMemberGatewayRuntimeToken {
     param([string]$EnvironmentVariable = "XB_MEMBER_GATEWAY_WORKER_TOKEN")
     $token = [Environment]::GetEnvironmentVariable($EnvironmentVariable, "Process")
@@ -157,7 +164,6 @@ function Get-XbMemberGatewayPowerShellPath {
 function Start-XbMemberGatewayChildWriter {
     param(
         [Parameter(Mandatory)][string]$ScriptPath,
-        [Parameter(Mandatory)]$Payload,
         [string[]]$Arguments = @("-ChildExternalWrite")
     )
     if (-not (Test-Path -LiteralPath $ScriptPath -PathType Leaf)) { throw "writer_script_missing" }
@@ -178,8 +184,6 @@ function Start-XbMemberGatewayChildWriter {
     try {
         if (-not $process.Start()) { throw "writer_start_failed" }
         $started = $true
-        [void]$process.StandardInput.WriteLine((ConvertTo-XbGatewayJson -Body $Payload))
-        $process.StandardInput.Close()
     }
     catch {
         if ($started) {
@@ -188,6 +192,64 @@ function Start-XbMemberGatewayChildWriter {
         throw "writer_start_failed"
     }
     return $process
+}
+
+function Get-XbMemberGatewayProcessIdentity {
+    param([Parameter(Mandatory)][System.Diagnostics.Process]$Process)
+    try {
+        $start = $Process.StartTime.ToUniversalTime().ToString("o").Replace("+00:00", "Z")
+        $processId = [int]$Process.Id
+    }
+    catch { throw "writer_process_identity_unavailable" }
+    if ($processId -le 0 -or [string]::IsNullOrWhiteSpace($start)) { throw "writer_process_identity_unavailable" }
+    return [pscustomobject]@{ pid = $processId; process_start_time = $start }
+}
+
+function Release-XbMemberGatewayChildWriterPayload {
+    param(
+        [Parameter(Mandatory)][System.Diagnostics.Process]$Process,
+        [Parameter(Mandatory)]$Payload
+    )
+    try {
+        if ($Process.HasExited) { throw "writer_process_exited_before_release" }
+        [void]$Process.StandardInput.WriteLine((ConvertTo-XbGatewayJson -Body $Payload))
+        $Process.StandardInput.Close()
+    }
+    catch { throw "writer_payload_release_failed" }
+}
+
+function Confirm-XbMemberGatewayWriterTermination {
+    param(
+        [Parameter(Mandatory)][string]$GatewayBaseUrl,
+        [Parameter(Mandatory)][string]$JobId,
+        [Parameter(Mandatory)][string]$WorkerSession,
+        [Parameter(Mandatory)][string]$WorkerHostBinding,
+        [Parameter(Mandatory)]$JobStatus,
+        [Parameter(Mandatory)]$Fence,
+        [Parameter(Mandatory)][System.Diagnostics.Process]$Process,
+        [Parameter(Mandatory)]$ProcessIdentity,
+        [Parameter(Mandatory)][scriptblock]$GatewayRequest
+    )
+    try {
+        if (-not $Process.HasExited) { throw "writer_exit_not_proven" }
+        $exitCode = [int]$Process.ExitCode
+        $evidenceReference = "evidence-$(([Guid]::NewGuid().ToString('N')).ToLowerInvariant())"
+        $body = @{
+            fence_id = [string]$Fence.dispatch_fence_id
+            attempt = ConvertTo-XbMemberGatewayPositiveInteger $JobStatus.attempt "writer_attempt_invalid"
+            execution_id = [string]$Fence.execution_id
+            host_binding = $WorkerHostBinding
+            pid = [int]$ProcessIdentity.pid
+            process_start_time = [string]$ProcessIdentity.process_start_time
+            evidence_type = "process_exit"
+            evidence_reference = $evidenceReference
+            exit_code = $exitCode
+        }
+        $response = & $GatewayRequest $GatewayBaseUrl ("/v1/jobs/{0}/writer/termination" -f $JobId) "POST" $body $WorkerSession
+        if ($response.termination_confirmed -ne $true -or [string]$response.lifecycle -ne "TERMINATION_CONFIRMED") { throw "writer_termination_confirmation_rejected" }
+        return $true
+    }
+    catch { throw "writer_termination_unconfirmed" }
 }
 
 function Read-XbMemberGatewayWriterOutcome {
@@ -216,8 +278,10 @@ function Invoke-XbMemberGatewayProtectedWrite {
         [Parameter(Mandatory)][string]$GatewayBaseUrl,
         [Parameter(Mandatory)][string]$JobId,
         [Parameter(Mandatory)][string]$WorkerSession,
+        [Parameter(Mandatory)][string]$WorkerHostBinding,
         [Parameter(Mandatory)]$JobStatus,
         [Parameter(Mandatory)]$Lease,
+        [Parameter(Mandatory)]$Fence,
         [Parameter(Mandatory)]$Timing,
         [Parameter(Mandatory)]$Payload,
         [Parameter(Mandatory)][scriptblock]$GatewayRequest,
@@ -237,19 +301,37 @@ function Invoke-XbMemberGatewayProtectedWrite {
     if ($stopAt -le [DateTimeOffset]::UtcNow) { throw "writer_deadline_expired" }
 
     $process = $null
+    $processIdentity = $null
+    $registered = $false
+    $terminationConfirmed = $false
     try {
         $process = & $WriterProcessFactory $Payload $stopAt
         if ($process -isnot [System.Diagnostics.Process]) { throw "writer_process_required" }
+        $processIdentity = Get-XbMemberGatewayProcessIdentity -Process $process
+        $registerBody = @{
+            fence_id = [string]$Fence.dispatch_fence_id
+            attempt = ConvertTo-XbMemberGatewayPositiveInteger $JobStatus.attempt "writer_attempt_invalid"
+            execution_id = [string]$Fence.execution_id
+            host_binding = $WorkerHostBinding
+            pid = [int]$processIdentity.pid
+            process_start_time = [string]$processIdentity.process_start_time
+        }
+        $registration = & $GatewayRequest $GatewayBaseUrl ("/v1/jobs/{0}/writer/register" -f $JobId) "POST" $registerBody $WorkerSession
+        if ($registration.registered -ne $true -or [string]$registration.lifecycle -ne "REGISTERED") { throw "writer_registration_rejected" }
+        $registered = $true
+        Release-XbMemberGatewayChildWriterPayload -Process $process -Payload $Payload
         $nextHeartbeatAt = [DateTimeOffset]::UtcNow.AddSeconds([int]$Timing.heartbeat_seconds)
         while ($true) {
             $now = [DateTimeOffset]::UtcNow
             if ($process.HasExited) {
                 if ($now -ge $stopAt -or $now -ge $deadlineAt) { throw "writer_deadline_expired" }
-                return Read-XbMemberGatewayWriterOutcome -Process $process
+                $terminationConfirmed = Confirm-XbMemberGatewayWriterTermination -GatewayBaseUrl $GatewayBaseUrl -JobId $JobId -WorkerSession $WorkerSession -WorkerHostBinding $WorkerHostBinding -JobStatus $JobStatus -Fence $Fence -Process $process -ProcessIdentity $processIdentity -GatewayRequest $GatewayRequest
+                return [pscustomobject]@{ outcome = (Read-XbMemberGatewayWriterOutcome -Process $process); termination_confirmed = $terminationConfirmed }
             }
             if ($now -ge $stopAt) {
                 Stop-XbMemberGatewayWriterProcess -Process $process
-                throw "writer_deadline_expired"
+                $terminationConfirmed = Confirm-XbMemberGatewayWriterTermination -GatewayBaseUrl $GatewayBaseUrl -JobId $JobId -WorkerSession $WorkerSession -WorkerHostBinding $WorkerHostBinding -JobStatus $JobStatus -Fence $Fence -Process $process -ProcessIdentity $processIdentity -GatewayRequest $GatewayRequest
+                throw "writer_termination_confirmed:writer_deadline_expired"
             }
             if ($now -ge $nextHeartbeatAt) {
                 try {
@@ -268,8 +350,12 @@ function Invoke-XbMemberGatewayProtectedWrite {
                     $nextHeartbeatAt = $heartbeatNow.AddSeconds([int]$Timing.heartbeat_seconds)
                 }
                 catch {
-                    try { Stop-XbMemberGatewayWriterProcess -Process $process } catch { throw "writer_termination_unconfirmed" }
-                    throw "writer_heartbeat_failed"
+                    try {
+                        Stop-XbMemberGatewayWriterProcess -Process $process
+                        $terminationConfirmed = Confirm-XbMemberGatewayWriterTermination -GatewayBaseUrl $GatewayBaseUrl -JobId $JobId -WorkerSession $WorkerSession -WorkerHostBinding $WorkerHostBinding -JobStatus $JobStatus -Fence $Fence -Process $process -ProcessIdentity $processIdentity -GatewayRequest $GatewayRequest
+                    }
+                    catch { throw "writer_termination_unconfirmed" }
+                    throw "writer_termination_confirmed:writer_heartbeat_failed"
                 }
                 continue
             }
@@ -280,7 +366,8 @@ function Invoke-XbMemberGatewayProtectedWrite {
         }
     }
     catch {
-        if ($null -ne $process) {
+        $failureCode = $_.Exception.Message
+        if ($null -ne $process -and -not $terminationConfirmed) {
             try {
                 if (-not $process.HasExited) { Stop-XbMemberGatewayWriterProcess -Process $process }
             }
@@ -288,6 +375,13 @@ function Invoke-XbMemberGatewayProtectedWrite {
                 throw "writer_termination_unconfirmed"
             }
         }
+        if ($registered -and $null -ne $processIdentity -and -not $terminationConfirmed) {
+            try {
+                $terminationConfirmed = Confirm-XbMemberGatewayWriterTermination -GatewayBaseUrl $GatewayBaseUrl -JobId $JobId -WorkerSession $WorkerSession -WorkerHostBinding $WorkerHostBinding -JobStatus $JobStatus -Fence $Fence -Process $process -ProcessIdentity $processIdentity -GatewayRequest $GatewayRequest
+            }
+            catch { throw "writer_termination_unconfirmed" }
+        }
+        if ($terminationConfirmed) { throw ("writer_termination_confirmed:{0}" -f $failureCode) }
         throw
     }
 }
@@ -301,6 +395,7 @@ function Invoke-XbMemberGatewayWorkerCycle {
         [Parameter(Mandatory)][scriptblock]$ProbeMember,
         [Parameter(Mandatory)][scriptblock]$CreateMember,
         [string]$WorkerSession,
+        [string]$WorkerHostBinding,
         [scriptblock]$GatewayRequest,
         [scriptblock]$WriterProcessFactory
     )
@@ -320,6 +415,12 @@ function Invoke-XbMemberGatewayWorkerCycle {
     }
     elseif ($WorkerSession -cnotmatch '^ws-[0-9a-f]{32}$') {
         throw "worker_session_invalid"
+    }
+    if ([string]::IsNullOrWhiteSpace($WorkerHostBinding)) {
+        $WorkerHostBinding = Get-XbMemberGatewayWorkerHostBinding
+    }
+    elseif ($WorkerHostBinding -cnotmatch '^host-[A-Za-z0-9._:-]{1,120}$') {
+        throw "worker_host_binding_invalid"
     }
 
     $ready = & $GatewayRequest $GatewayBaseUrl "/readyz" "GET" $null $WorkerSession
@@ -374,9 +475,11 @@ function Invoke-XbMemberGatewayWorkerCycle {
     $fence = & $GatewayRequest $GatewayBaseUrl ("/v1/jobs/{0}/dispatch-fence" -f $jobId) "POST" @{
         operation = "member.create"
         member_no = [string]$allocation.member_no
+        host_binding = $WorkerHostBinding
     } $WorkerSession
     if ([string]$fence.state -ne "WRITING") { throw "dispatch_fence_not_created" }
 
+    $terminationConfirmed = $false
     try {
         $jobStatus = & $GatewayRequest $GatewayBaseUrl ("/v1/jobs/{0}/status" -f $jobId) "GET" $null $WorkerSession
         if ([string]$jobStatus.state -ne "WRITING") { throw "writer_state_invalid" }
@@ -385,40 +488,66 @@ function Invoke-XbMemberGatewayWorkerCycle {
         $leaseStateVersion = ConvertTo-XbMemberGatewayPositiveInteger $lease.state_version "writer_lease_invalid"
         $leaseExpiresAt = ConvertTo-XbMemberGatewayDateTimeOffset $lease.lease_expires_at "writer_lease_invalid"
         if ($leaseStateVersion -ne ($jobStateVersion + 1) -or $leaseExpiresAt -le [DateTimeOffset]::UtcNow) { throw "writer_lease_invalid" }
-        $writeOutcome = Invoke-XbMemberGatewayProtectedWrite -GatewayBaseUrl $GatewayBaseUrl -JobId $jobId -WorkerSession $WorkerSession -JobStatus $jobStatus -Lease $lease -Timing $timing -Payload ([pscustomobject]@{ job = $job; allocation = $allocation }) -GatewayRequest $GatewayRequest -WriterProcessFactory $WriterProcessFactory
+        $protected = Invoke-XbMemberGatewayProtectedWrite -GatewayBaseUrl $GatewayBaseUrl -JobId $jobId -WorkerSession $WorkerSession -WorkerHostBinding $WorkerHostBinding -JobStatus $jobStatus -Lease $lease -Fence $fence -Timing $timing -Payload ([pscustomobject]@{ job = $job; allocation = $allocation }) -GatewayRequest $GatewayRequest -WriterProcessFactory $WriterProcessFactory
+        $terminationConfirmed = [bool]$protected.termination_confirmed
+        $writeOutcome = $protected.outcome
         $readbackFound = [bool]$writeOutcome.readback_found
         $readbackMatch = [bool]$writeOutcome.readback_match
         $status = if (-not $readbackFound) { "WRITE_OUTCOME_UNCERTAIN" } elseif ($readbackMatch) { "CREATED_VERIFIED" } else { "CREATED_READBACK_MISMATCH" }
         $errorCode = if (-not $readbackFound) { "readback_absent" } elseif (-not $readbackMatch) { "readback_mismatch_manual_review" } else { $null }
-        & $GatewayRequest $GatewayBaseUrl ("/v1/jobs/{0}/result" -f $jobId) "POST" @{
-            schema_version = "xb.member.gateway.result.v1"
-            job_id = $jobId
-            operation = "member.create"
-            dispatch_fence_id = [string]$fence.dispatch_fence_id
-            status = $status
-            member_no = [string]$allocation.member_no
-            save_invocation_count = [int]$writeOutcome.save_invocation_count
-            readback_found = $readbackFound
-            readback_match = $readbackMatch
-            error_code = $errorCode
-        } $WorkerSession | Out-Null
+        try {
+            & $GatewayRequest $GatewayBaseUrl ("/v1/jobs/{0}/result" -f $jobId) "POST" @{
+                schema_version = "xb.member.gateway.result.v1"
+                job_id = $jobId
+                operation = "member.create"
+                dispatch_fence_id = [string]$fence.dispatch_fence_id
+                status = $status
+                member_no = [string]$allocation.member_no
+                save_invocation_count = [int]$writeOutcome.save_invocation_count
+                readback_found = $readbackFound
+                readback_match = $readbackMatch
+                error_code = $errorCode
+            } $WorkerSession | Out-Null
+        }
+        catch { throw "result_acknowledgement_pending" }
         return [pscustomobject]@{ status = $status; writes = 1; dispatch_fence = $true }
     }
     catch {
-        # After the fence, a timeout/exception/crash is uncertain.  A later
-        # reconciliation may only use this same bound MemberNo.
-        & $GatewayRequest $GatewayBaseUrl ("/v1/jobs/{0}/result" -f $jobId) "POST" @{
-            schema_version = "xb.member.gateway.result.v1"
-            job_id = $jobId
-            operation = "member.create"
-            dispatch_fence_id = [string]$fence.dispatch_fence_id
-            status = "WRITE_OUTCOME_UNCERTAIN"
-            member_no = [string]$allocation.member_no
-            save_invocation_count = 1
-            readback_found = $false
-            readback_match = $false
-            error_code = "save_outcome_uncertain"
-        } $WorkerSession | Out-Null
-        return [pscustomobject]@{ status = "WRITE_OUTCOME_UNCERTAIN"; writes = 1; dispatch_fence = $true }
+        $failureCode = $_.Exception.Message
+        if ($terminationConfirmed -and -not $failureCode.StartsWith("writer_termination_confirmed:")) {
+            throw $failureCode
+        }
+        if ($failureCode.StartsWith("writer_termination_confirmed:")) {
+            try {
+                & $GatewayRequest $GatewayBaseUrl ("/v1/jobs/{0}/result" -f $jobId) "POST" @{
+                    schema_version = "xb.member.gateway.result.v1"
+                    job_id = $jobId
+                    operation = "member.create"
+                    dispatch_fence_id = [string]$fence.dispatch_fence_id
+                    status = "WRITE_OUTCOME_UNCERTAIN"
+                    member_no = [string]$allocation.member_no
+                    save_invocation_count = 1
+                    readback_found = $false
+                    readback_match = $false
+                    error_code = "save_outcome_uncertain"
+                } $WorkerSession | Out-Null
+                return [pscustomobject]@{ status = "WRITE_OUTCOME_UNCERTAIN"; writes = 1; dispatch_fence = $true }
+            }
+            catch { throw "result_acknowledgement_pending" }
+        }
+        try {
+            & $GatewayRequest $GatewayBaseUrl ("/v1/jobs/{0}/writer/quarantine" -f $jobId) "POST" @{
+                fence_id = [string]$fence.dispatch_fence_id
+                attempt = ConvertTo-XbMemberGatewayPositiveInteger $job.attempt "writer_attempt_invalid"
+                execution_id = [string]$fence.execution_id
+                host_binding = $WorkerHostBinding
+                pid = $null
+                process_start_time = $null
+                evidence_reference = "quarantine-$(([Guid]::NewGuid().ToString('N')).ToLowerInvariant())"
+                reason = "writer_termination_unconfirmed"
+            } $WorkerSession | Out-Null
+            return [pscustomobject]@{ status = "WRITER_TERMINATION_UNCONFIRMED"; writes = 1; dispatch_fence = $true; failure_code = $failureCode }
+        }
+        catch { throw "writer_termination_unconfirmed" }
     }
 }

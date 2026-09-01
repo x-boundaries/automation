@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/schemas/member_gateway_job.v2.schema.json",
+  "title": "XB member gateway job v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "job_id", "request_id", "source_response_ref", "payload_hash", "operation", "source_system", "form_alias", "mapping_version", "state", "state_version", "attempt", "max_attempts", "writer_termination_state", "writer_termination_hold_active", "writer_termination_proof_required"],
+  "properties": {
+    "schema_version": {"const": "xb.member.gateway.job.v2"},
+    "job_id": {"type": "string", "pattern": "^job-[A-Za-z0-9]{16,64}$"},
+    "request_id": {"type": "string", "pattern": "^[A-Za-z0-9._:-]{1,200}$"},
+    "source_response_ref": {"type": "string", "pattern": "^hmac-v1:[0-9a-f]{64}$"},
+    "payload_hash": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "operation": {"const": "member.create"},
+    "source_system": {"const": "google_forms"},
+    "form_alias": {"type": "string", "pattern": "^[A-Za-z0-9._:-]{1,100}$"},
+    "mapping_version": {"type": "string", "pattern": "^[A-Za-z0-9._:-]{1,100}$"},
+    "state": {"type": "string", "enum": ["RECEIVED", "VALIDATED", "QUEUED", "LEASED", "PRECHECKING", "ALLOCATION_BOUND", "WRITE_INTENT_RECORDED", "WRITING", "READBACK", "CREATED_VERIFIED", "REJECTED_VALIDATION", "RETRY_WAIT", "AMBIGUOUS_LOOKUP", "WRITE_OUTCOME_UNCERTAIN", "WRITER_TERMINATION_UNCONFIRMED", "CONFIRMED_NOT_CREATED", "CREATED_READBACK_MISMATCH", "MANUAL_REVIEW", "DEAD_LETTER"]},
+    "state_version": {"type": "integer", "minimum": 0},
+    "attempt": {"type": "integer", "minimum": 0},
+    "max_attempts": {"type": "integer", "minimum": 1},
+    "attempt_started_at": {"type": ["string", "null"], "format": "date-time"},
+    "next_attempt_at": {"type": ["string", "null"], "format": "date-time"},
+    "lease_expires_at": {"type": ["string", "null"], "format": "date-time"},
+    "has_allocation": {"type": "boolean"},
+    "has_write_intent": {"type": "boolean"},
+    "has_dispatch_fence": {"type": "boolean"},
+    "result_status": {"type": ["string", "null"], "enum": ["CREATED_VERIFIED", "WRITE_OUTCOME_UNCERTAIN", "CONFIRMED_NOT_CREATED", "CREATED_READBACK_MISMATCH", null]},
+    "last_error_code": {"type": ["string", "null"]},
+    "writer_termination_state": {"type": ["string", "null"], "enum": ["PENDING", "REGISTERED", "TERMINATION_CONFIRMED", "QUARANTINED", "CLEARED", null]},
+    "writer_termination_hold_active": {"type": "boolean"},
+    "writer_termination_proof_required": {"type": "boolean"},
+    "member_payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "phone", "email", "birthday_month", "marketing_consent", "pdpa_acknowledged", "create_time"],
+      "properties": {
+        "name": {"type": "string", "minLength": 1, "maxLength": 200},
+        "phone": {"type": "string", "pattern": "^65[89][0-9]{7}$"},
+        "email": {"type": "string", "format": "email"},
+        "birthday_month": {"type": "string", "enum": ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"]},
+        "marketing_consent": {"type": "string", "enum": ["Yes", "No"]},
+        "pdpa_acknowledged": {"type": "boolean"},
+        "create_time": {"type": "string", "format": "date-time"}
+      }
+    },
+    "allocation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["member_no"],
+      "properties": {"member_no": {"type": "string", "pattern": "^65[89][0-9]{7}(?:X[1-9][0-9]*)?$"}}
+    }
+  }
+}

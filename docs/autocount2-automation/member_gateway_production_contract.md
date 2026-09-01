@@ -92,8 +92,47 @@ renews the lease on the configured heartbeat cadence and requires the returned
 state version to advance and the lease to remain beyond the absolute execution
 deadline. A heartbeat failure, deadline, or protection cutoff terminates the child
 and waits until process exit is positively observed before the lease protection can
-lapse. If exit cannot be confirmed, the worker fails closed. An already-dispatched
-ambiguous outcome remains `WRITE_OUTCOME_UNCERTAIN`; there is no SaveMember retry.
+lapse. If exit cannot be confirmed, the worker fails closed into the durable
+writer-termination quarantine described below. An already-dispatched ambiguous
+outcome has no SaveMember retry.
+
+## Writer liveness and quarantine (A1)
+
+The dispatch-fence transaction creates one durable writer-execution hold in
+`PENDING` state and locks the singleton writer-termination gate. The hold is
+bound to the job, fence, attempt, worker session, host binding, opaque execution
+identity, and bound MemberNo. PID and process-start identity are intentionally
+unset until the process exists. While any hold is active, the repository blocks
+another claim, fence, allocation, SaveMember-capable path, ordinary lease
+reclamation, and reconciliation. PostgreSQL serializes these transitions by
+transactionally locking the gate row; the in-memory repository applies the same
+rule under its repository lock.
+
+The parent starts the child with stdin withheld. The child cannot create the
+AutoCount session or reach SaveMember until the parent has obtained the exact PID
+and process-start timestamp, registered both through the worker-only
+`writer/register` CAS operation, and received a durable `REGISTERED`
+acknowledgement. Only then does the parent release the payload. The registered
+child is the sole SaveMember-capable process for this fence; it does not detach
+or spawn a writer descendant.
+
+Normal completion first establishes positive process exit and durably moves the
+hold to `TERMINATION_CONFIRMED`, with exact fence/attempt/session/host/execution
+and PID/start bindings plus bounded process-exit evidence. Only after that
+confirmation does the worker post the business result. Result acknowledgement
+does not release the hold early. If exit or proof cannot be established, the
+hold becomes `QUARANTINED` and the job becomes
+`WRITER_TERMINATION_UNCONFIRMED`; elapsed time, Kill(), a watchdog callback,
+restart, or stale session is never proof.
+
+If termination is positively known but the business result is unknown, the
+repository atomically creates the single immutable
+`WRITE_OUTCOME_UNCERTAIN` event and projection, moves the job to that existing
+result state, clears the hold, and releases the stale lease. A recovery operation
+is narrower than ordinary writer authority, must be fresh host-bound evidence,
+and can only resolve the termination side of a quarantined fence. Legacy
+post-fence uncertainty is materialized as legacy-unproven quarantine; it is not
+automatically cleared or made reconcilable.
 
 ## Kill-switch control
 
@@ -126,12 +165,12 @@ does not log MemberNo. A missing, stale, occupied, ambiguous, unavailable, or
 conflicting recheck fails closed without allocating another suffix.
 
 After the fence exists, there is no automatic retry, no new suffix, and no
-return to the normal create queue. A timeout, exception, or crash is uncertain.
-Reconciliation may begin only for exactly `WRITE_OUTCOME_UNCERTAIN`, with the
-same bound MemberNo and fence, after the original writer lease is no longer
-active through durable expiry/reclaim. An existing reconciliation case and
-read-only check must be recorded before a result projection can be replaced;
-`WRITING` and a live writer lease are rejected. Positive absence does not
+return to the normal create queue. A missing termination proof remains
+`WRITER_TERMINATION_UNCONFIRMED` with an active quarantine and is never
+reconcilable. Reconciliation may begin only for exactly
+`WRITE_OUTCOME_UNCERTAIN`, with positively confirmed writer termination, a
+cleared hold, no active lease, the same bound MemberNo and fence, and the
+existing reconciliation case/check evidence. Positive absence does not
 authorize recreation; mismatch or ambiguous lookup remains manual/reconciliation
 work, and a late writer result cannot overwrite a completed reconciliation.
 
@@ -163,9 +202,17 @@ introduced.
 
 ## Persistence and trust boundary
 
-The migration stores source responses and observations, ingest receipts, jobs,
-attempts, leases, allocation probes and bindings, write intents, dispatch
-fences, append-only result events plus a current result projection,
+The append-only 0003_writer_termination_quarantine.sql migration adds the
+WRITER_TERMINATION_UNCONFIRMED job state, a singleton writer_termination_gate,
+and one versioned writer-execution hold per dispatch fence. It preserves exact
+job/fence/attempt/session/host/execution/member bindings, nullable pending
+process identity, registered/confirmed/quarantined/cleared lifecycle, bounded
+public-safe evidence metadata, and legacy post-fence quarantine materialization.
+The versioned schemas/member_gateway_job.v2.schema.json publishes the safe
+job/status shape; the result-status vocabulary remains unchanged. The migration
+stores these surfaces alongside source responses and observations, ingest
+receipts, jobs, attempts, leases, allocation probes and bindings, write intents,
+dispatch fences, append-only result events plus a current result projection,
 reconciliation cases/checks, rejections, dead letters, control flags, audit
 events, and schema versions. Foreign keys use restrictive delete behaviour.
 The current projection is replaced by a conditional update only after the
@@ -181,7 +228,9 @@ and private server/database identity are not normal log fields.
 The committed n8n export is inactive, credential-free, placeholder-only, and
 has a false activation gate. It is not imported, activated, or executed by this
 run. CI is offline-only and does not contact Google, n8n, AutoCount,
-PostgreSQL, Docker, or a deployment target.
+PostgreSQL, Docker, or a deployment target. Private process identity,
+host-binding, nonce, and raw evidence never appear in ordinary public job
+status or result responses.
 
 ## Unsupported production prerequisites
 

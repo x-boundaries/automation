@@ -176,13 +176,24 @@ class GatewayTests(unittest.TestCase):
         same = self.repository.record_dispatch_fence(job["job_id"], job["member_payload"]["phone"], "member.create", "worker-1", now=NOW)
         self.assertEqual(fence["dispatch_fence_id"], same.fence_id)
         self.assertEqual(self.repository.reclaim_expired(now=NOW + timedelta(seconds=601)), 1)
-        self.assertEqual(self.repository.get_job(job["job_id"]).state, JobState.WRITE_OUTCOME_UNCERTAIN)
+        self.assertEqual(self.repository.get_job(job["job_id"]).state, JobState.WRITER_TERMINATION_UNCONFIRMED)
         self.assertIsNone(self.repository.claim_job("worker-2", now=NOW + timedelta(seconds=602)))
 
     def test_save_exception_is_uncertain_and_reconcile_absence_never_retries(self):
         _, job = self.ingest_claim()
         fence = self.fence(job)
         uncertain = {"schema_version": "xb.member.gateway.result.v1", "job_id": job["job_id"], "operation": "member.create", "dispatch_fence_id": fence["dispatch_fence_id"], "status": "WRITE_OUTCOME_UNCERTAIN", "member_no": job["member_payload"]["phone"], "save_invocation_count": 1, "readback_found": False, "readback_match": False, "error_code": "save_timeout"}
+        self.repository.register_writer_execution(
+            job["job_id"], fence_id=fence["dispatch_fence_id"], attempt=job["attempt"],
+            worker_session="worker-1", host_binding="host-worker-1", execution_id=fence["execution_id"],
+            pid=4321, process_start_time="2026-08-30T01:00:01Z", now=NOW,
+        )
+        self.repository.confirm_writer_termination(
+            job["job_id"], fence_id=fence["dispatch_fence_id"], attempt=job["attempt"],
+            worker_session="worker-1", host_binding="host-worker-1", execution_id=fence["execution_id"],
+            pid=4321, process_start_time="2026-08-30T01:00:01Z", evidence_type="process_exit",
+            evidence_reference="evidence-gateway", exit_code=0, now=NOW,
+        )
         self.service.acknowledge_result(job["job_id"], "worker-1", uncertain)
         result = self.service.reconcile(job["job_id"], {"member_no": job["member_payload"]["phone"], "lookup_status": "absent", "readback_found": False, "readback_match": False, "error_code": "confirmed_absent_manual_followup"})
         self.assertEqual(result["state"], ResultStatus.CONFIRMED_NOT_CREATED.value)

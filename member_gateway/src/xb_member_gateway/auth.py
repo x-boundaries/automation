@@ -51,6 +51,7 @@ _SUBJECT_RE = re.compile(r"^[A-Za-z0-9._:-]{1,100}$")
 _DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 WORKER_SESSION_HEADER = "X-XB-Worker-Session"
 WORKER_SESSION_RE = re.compile(r"^ws-[0-9a-f]{32}$")
+WORKER_HOST_BINDING_RE = re.compile(r"^host-[A-Za-z0-9._:-]{1,120}$")
 
 
 def worker_session(value: str) -> str:
@@ -58,6 +59,14 @@ def worker_session(value: str) -> str:
 
     if not isinstance(value, str) or not WORKER_SESSION_RE.fullmatch(value):
         raise AuthenticationError("worker_session_invalid")
+    return value
+
+
+def worker_host_binding(value: str) -> str:
+    """Validate the opaque host identity bound to a writer execution."""
+
+    if not isinstance(value, str) or not WORKER_HOST_BINDING_RE.fullmatch(value):
+        raise AuthenticationError("worker_host_binding_invalid")
     return value
 
 
@@ -95,6 +104,10 @@ class BearerTokenAuthenticator:
                             "worker.allocation",
                             "worker.write_intent",
                             "worker.dispatch",
+                            "worker.writer_register",
+                            "worker.writer_termination",
+                            "worker.writer_quarantine",
+                            "worker.writer_termination_recovery",
                             "worker.result",
                             "worker.reconcile",
                             "job.read",

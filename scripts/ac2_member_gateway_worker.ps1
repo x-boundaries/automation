@@ -2,6 +2,7 @@
 param(
     [string]$GatewayBaseUrl = [Environment]::GetEnvironmentVariable("XB_MEMBER_GATEWAY_URL", "Process"),
     [string]$WorkerId = "ac2-member-worker",
+    [string]$WorkerHostBinding = [Environment]::GetEnvironmentVariable("XB_MEMBER_GATEWAY_WORKER_HOST_BINDING", "Process"),
     [switch]$EnableProductionWorker,
     [switch]$EnableProductionAdapter,
     [switch]$ChildExternalWrite,
@@ -107,8 +108,8 @@ $create = {
 $writerScriptPath = $PSCommandPath
 $writerProcessFactory = {
     param($Payload, $StopAt)
-    Start-XbMemberGatewayChildWriter -ScriptPath $writerScriptPath -Payload $Payload -Arguments @("-ChildExternalWrite", "-EnableProductionAdapter", "-WriteDeadlineUtc", $StopAt.ToString("o"))
+    Start-XbMemberGatewayChildWriter -ScriptPath $writerScriptPath -Arguments @("-ChildExternalWrite", "-EnableProductionAdapter", "-WriteDeadlineUtc", $StopAt.ToString("o"))
 }.GetNewClosure()
 
-$result = Invoke-XbMemberGatewayWorkerCycle -GatewayBaseUrl $GatewayBaseUrl -WorkerId $WorkerId -EnableProductionWorker:$EnableProductionWorker -EnableProductionAdapter:$EnableProductionAdapter -ProbeMember $probe -CreateMember $create -WriterProcessFactory $writerProcessFactory
+$result = Invoke-XbMemberGatewayWorkerCycle -GatewayBaseUrl $GatewayBaseUrl -WorkerId $WorkerId -WorkerHostBinding $WorkerHostBinding -EnableProductionWorker:$EnableProductionWorker -EnableProductionAdapter:$EnableProductionAdapter -ProbeMember $probe -CreateMember $create -WriterProcessFactory $writerProcessFactory
 $result | ConvertTo-Json -Compress

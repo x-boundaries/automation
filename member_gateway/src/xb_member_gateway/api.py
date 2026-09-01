@@ -18,6 +18,7 @@ from .auth import (
     Principal,
     WORKER_SESSION_HEADER,
     require_scope,
+    worker_host_binding,
     worker_session,
 )
 from .canonical import CanonicalizationError, canonicalize_source_event
@@ -32,6 +33,7 @@ from .repository import (
     RepositoryError,
     ResultConflict,
     SourceConflict,
+    WriterTerminationConflict,
 )
 from .results import ResultValidationError, make_result, result_contract
 from .state_machine import InvalidTransition
@@ -53,6 +55,9 @@ class ApiResponse:
 _SAFE_CODE_RE = re.compile(r"^[a-z0-9_.:-]{1,80}$")
 _WORKER_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,120}$")
 _APPROVAL_RE = re.compile(r"^[A-Za-z0-9._:/#-]{1,160}$")
+_EXECUTION_ID_RE = re.compile(r"^exec-[A-Za-z0-9]{16,80}$")
+_EVIDENCE_REFERENCE_RE = re.compile(r"^[A-Za-z0-9._:-]{1,200}$")
+_PROCESS_START_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,7})?Z$")
 
 
 def _safe_code(value: Any, default: str = "request_rejected") -> str:
@@ -137,7 +142,7 @@ class GatewayService:
             raise ApiError(422, "mapping_version_not_allowlisted")
         outcome = self.repository.ingest_source_event(event, now=self.clock)
         return {
-            "schema_version": "xb.member.gateway.job.v1",
+            "schema_version": "xb.member.gateway.job.v2",
             "job_id": outcome.job.job_id,
             "operation": "member.create",
             "state": outcome.job.state.value,
@@ -154,8 +159,8 @@ class GatewayService:
             raise ApiError(423, "kill_switch_enabled")
         job = self.repository.claim_job(worker_id, lease_seconds=config.lease_seconds, now=self.clock)
         if job is None:
-            return {"schema_version": "xb.member.gateway.job.v1", "claimed": False, "job": None}
-        return {"schema_version": "xb.member.gateway.job.v1", "claimed": True, "job": job.worker_dict()}
+            return {"schema_version": "xb.member.gateway.job.v2", "claimed": False, "job": None}
+        return {"schema_version": "xb.member.gateway.job.v2", "claimed": True, "job": job.worker_dict()}
 
     def precheck(self, job_id: str, worker_id: str) -> dict[str, Any]:
         job = self.repository.begin_prechecking(job_id, worker_id, now=self.clock)
@@ -199,6 +204,7 @@ class GatewayService:
         return candidate
 
     def allocation_candidate(self, job_id: str, worker_id: str | None = None) -> dict[str, Any]:
+        self.repository.assert_no_active_writer_hold()
         job = self.repository.get_job(job_id)
         if worker_id is not None:
             self.repository.assert_lease(job_id, worker_id, now=self.clock)
@@ -328,7 +334,8 @@ class GatewayService:
         return {"job_id": job_id, "state": JobState.WRITE_INTENT_RECORDED.value, "intent_id": intent.intent_id}
 
     def dispatch_fence(self, job_id: str, worker_id: str, body: Mapping[str, Any], *, principal_valid: bool) -> dict[str, Any]:
-        _exact_fields(body, {"operation", "member_no"})
+        if set(body) not in ({"operation", "member_no"}, {"operation", "member_no", "host_binding"}):
+            raise ApiError(400, "request_fields_invalid")
         if body["operation"] != "member.create":
             raise ApiError(400, "operation_invalid")
         job = self.repository.get_job(job_id)
@@ -340,10 +347,106 @@ class GatewayService:
         # Re-read control immediately before the irreversible fence transaction.
         if self._runtime_config().kill_switch_enabled:
             raise ApiError(423, "kill_switch_enabled")
+        resolved_host = body.get("host_binding", f"host-{worker_id}")
+        try:
+            resolved_host = worker_host_binding(resolved_host)
+        except AuthenticationError as exc:
+            raise ApiError(400, exc.code) from exc
         fence = self.repository.record_dispatch_fence(
-            job_id, body["member_no"], body["operation"], worker_id, now=self.clock
+            job_id, body["member_no"], body["operation"], worker_id, host_binding=resolved_host, now=self.clock
         )
-        return {"job_id": job_id, "state": JobState.WRITING.value, "dispatch_fence_id": fence.fence_id, "member_no": fence.member_no}
+        return {"job_id": job_id, "state": JobState.WRITING.value, "dispatch_fence_id": fence.fence_id, "member_no": fence.member_no, "execution_id": fence.execution_id}
+
+    @staticmethod
+    def _writer_request(body: Mapping[str, Any], *, include_pid: bool = True, include_reason: bool = False, include_proof: bool = True) -> tuple[str, int, str, str, str | None, int | None, str | None, str | None]:
+        fields = {"fence_id", "attempt", "execution_id", "host_binding"}
+        if include_pid:
+            fields |= {"pid", "process_start_time"}
+        if include_reason:
+            fields |= {"evidence_reference", "reason"}
+        elif include_proof:
+            fields |= {"evidence_type", "evidence_reference", "exit_code"}
+        _exact_fields(body, fields)
+        fence_id = body.get("fence_id")
+        execution_id = body.get("execution_id")
+        host = body.get("host_binding")
+        if not isinstance(fence_id, str) or not re.fullmatch(r"^fence-[A-Za-z0-9]{16,64}$", fence_id):
+            raise ApiError(400, "dispatch_fence_id_invalid")
+        if not isinstance(execution_id, str) or not _EXECUTION_ID_RE.fullmatch(execution_id):
+            raise ApiError(400, "writer_execution_identity_invalid")
+        try:
+            host = worker_host_binding(host)
+        except AuthenticationError as exc:
+            raise ApiError(400, exc.code) from exc
+        attempt = body.get("attempt")
+        if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt <= 0:
+            raise ApiError(400, "writer_attempt_invalid")
+        pid = body.get("pid") if include_pid else None
+        start = body.get("process_start_time") if include_pid else None
+        if include_pid and pid is not None and (isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0):
+            raise ApiError(400, "writer_process_identity_invalid")
+        if include_pid and pid is not None and (not isinstance(start, str) or not _PROCESS_START_RE.fullmatch(start)):
+            raise ApiError(400, "writer_process_identity_invalid")
+        if include_reason:
+            reference = body.get("evidence_reference")
+            if not isinstance(reference, str) or not _EVIDENCE_REFERENCE_RE.fullmatch(reference):
+                raise ApiError(400, "writer_quarantine_evidence_invalid")
+            return fence_id, attempt, execution_id, host, "", pid, start, reference
+        if not include_proof:
+            return fence_id, attempt, execution_id, host, None, pid, start, None
+        evidence_type = body.get("evidence_type")
+        reference = body.get("evidence_reference")
+        exit_code = body.get("exit_code")
+        if evidence_type != "process_exit" or not isinstance(reference, str) or not _EVIDENCE_REFERENCE_RE.fullmatch(reference):
+            raise ApiError(400, "writer_termination_proof_required")
+        if isinstance(exit_code, bool) or not isinstance(exit_code, int) or not -(2**31) <= exit_code <= (2**31 - 1):
+            raise ApiError(400, "writer_termination_proof_required")
+        return fence_id, attempt, execution_id, host, evidence_type, pid, start, reference
+
+    def register_writer_execution(self, job_id: str, worker_id: str, body: Mapping[str, Any]) -> dict[str, Any]:
+        fence_id, attempt, execution_id, host, _, pid, start, _ = self._writer_request(body, include_proof=False)
+        if pid is None or start is None:
+            raise ApiError(400, "writer_process_identity_invalid")
+        hold = self.repository.register_writer_execution(
+            job_id, fence_id=fence_id, attempt=attempt, worker_session=worker_id,
+            host_binding=host, execution_id=execution_id, pid=pid,
+            process_start_time=start, now=self.clock,
+        )
+        return {"job_id": job_id, "lifecycle": hold.state.value, "registered": True, "execution_id": hold.execution_id}
+
+    def confirm_writer_termination(self, job_id: str, worker_id: str, body: Mapping[str, Any]) -> dict[str, Any]:
+        fence_id, attempt, execution_id, host, evidence_type, pid, start, reference = self._writer_request(body)
+        if pid is None or start is None:
+            raise ApiError(400, "writer_process_identity_invalid")
+        hold = self.repository.confirm_writer_termination(
+            job_id, fence_id=fence_id, attempt=attempt, worker_session=worker_id,
+            host_binding=host, execution_id=execution_id, pid=pid,
+            process_start_time=start, evidence_type=evidence_type,
+            evidence_reference=reference, exit_code=body["exit_code"], now=self.clock,
+        )
+        return {"job_id": job_id, "lifecycle": hold.state.value, "termination_confirmed": True}
+
+    def quarantine_writer_execution(self, job_id: str, worker_id: str, body: Mapping[str, Any]) -> dict[str, Any]:
+        fence_id, attempt, execution_id, host, _, pid, start, reference = self._writer_request(body, include_reason=True)
+        hold = self.repository.quarantine_writer_execution(
+            job_id, fence_id=fence_id, attempt=attempt, worker_session=worker_id,
+            host_binding=host, execution_id=execution_id, pid=pid,
+            process_start_time=start, evidence_reference=reference,
+            reason=str(body["reason"]), now=self.clock,
+        )
+        return {"job_id": job_id, "state": JobState.WRITER_TERMINATION_UNCONFIRMED.value, "lifecycle": hold.state.value, "quarantined": True}
+
+    def recover_writer_termination(self, job_id: str, recovery_session: str, body: Mapping[str, Any]) -> dict[str, Any]:
+        fence_id, attempt, execution_id, host, _, pid, start, reference = self._writer_request(body)
+        if pid is None or start is None:
+            raise ApiError(400, "writer_process_identity_invalid")
+        result, duplicate = self.repository.recover_writer_termination(
+            job_id, fence_id=fence_id, attempt=attempt, recovery_session=recovery_session,
+            host_binding=host, execution_id=execution_id, pid=pid,
+            process_start_time=start, evidence_reference=reference,
+            exit_code=body["exit_code"], now=self.clock,
+        )
+        return {"job_id": job_id, "state": JobState.WRITE_OUTCOME_UNCERTAIN.value, "result_status": result.status.value, "result_hash": result.result_hash, "duplicate": duplicate}
 
     def acknowledge_result(self, job_id: str, worker_id: str, body: Mapping[str, Any]) -> dict[str, Any]:
         result_body = dict(body)
@@ -382,8 +485,12 @@ class GatewayService:
         job = self.repository.get_job(job_id)
         fence = self.repository.get_dispatch_fence(job_id)
         allocation = self.repository.get_allocation(job_id)
-        if fence is None or allocation is None or body["member_no"] != fence.member_no or job.state != JobState.WRITE_OUTCOME_UNCERTAIN:
+        if fence is None or allocation is None or body["member_no"] != fence.member_no:
             raise ApiError(409, "reconciliation_member_binding_invalid")
+        if job.state != JobState.WRITE_OUTCOME_UNCERTAIN:
+            if job.state == JobState.WRITER_TERMINATION_UNCONFIRMED:
+                raise ApiError(423, "writer_termination_quarantine_active")
+            raise ApiError(409, "reconciliation_requires_uncertain_state")
         try:
             status = {
                 "exact_match": ResultStatus.CREATED_VERIFIED,
@@ -479,6 +586,8 @@ class GatewayApp:
             status, code = 409, "source_identity_conflict"
         elif isinstance(error, ResultConflict):
             status, code = 409, "result_conflict"
+        elif isinstance(error, WriterTerminationConflict):
+            status, code = 423 if str(error) == "writer_termination_quarantine_active" else 409, _safe_code(str(error))
         elif isinstance(error, RepositoryError) and str(error) == "kill_switch_enabled":
             status, code = 423, "kill_switch_enabled"
         elif isinstance(error, (LeaseConflict, AllocationConflict, InvalidTransition, RepositoryError)):
@@ -553,6 +662,22 @@ class GatewayApp:
             if method == "POST" and match:
                 self._principal(headers, "worker.dispatch")
                 return ApiResponse(200, self.service.dispatch_fence(unquote(match.group(1)), self._worker_session(headers), value, principal_valid=True))
+            match = re.fullmatch(r"/v1/jobs/([^/]+)/writer/register", route)
+            if method == "POST" and match:
+                self._principal(headers, "worker.writer_register")
+                return ApiResponse(200, self.service.register_writer_execution(unquote(match.group(1)), self._worker_session(headers), value))
+            match = re.fullmatch(r"/v1/jobs/([^/]+)/writer/termination", route)
+            if method == "POST" and match:
+                self._principal(headers, "worker.writer_termination")
+                return ApiResponse(200, self.service.confirm_writer_termination(unquote(match.group(1)), self._worker_session(headers), value))
+            match = re.fullmatch(r"/v1/jobs/([^/]+)/writer/quarantine", route)
+            if method == "POST" and match:
+                self._principal(headers, "worker.writer_quarantine")
+                return ApiResponse(200, self.service.quarantine_writer_execution(unquote(match.group(1)), self._worker_session(headers), value))
+            match = re.fullmatch(r"/v1/jobs/([^/]+)/writer/recover", route)
+            if method == "POST" and match:
+                self._principal(headers, "worker.writer_termination_recovery")
+                return ApiResponse(200, self.service.recover_writer_termination(unquote(match.group(1)), self._worker_session(headers), value))
             match = re.fullmatch(r"/v1/jobs/([^/]+)/result", route)
             if method == "POST" and match:
                 self._principal(headers, "worker.result")

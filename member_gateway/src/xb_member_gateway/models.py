@@ -22,6 +22,7 @@ class JobState(str, Enum):
     RETRY_WAIT = "RETRY_WAIT"
     AMBIGUOUS_LOOKUP = "AMBIGUOUS_LOOKUP"
     WRITE_OUTCOME_UNCERTAIN = "WRITE_OUTCOME_UNCERTAIN"
+    WRITER_TERMINATION_UNCONFIRMED = "WRITER_TERMINATION_UNCONFIRMED"
     CONFIRMED_NOT_CREATED = "CONFIRMED_NOT_CREATED"
     CREATED_READBACK_MISMATCH = "CREATED_READBACK_MISMATCH"
     MANUAL_REVIEW = "MANUAL_REVIEW"
@@ -40,6 +41,14 @@ class ResultStatus(str, Enum):
     WRITE_OUTCOME_UNCERTAIN = "WRITE_OUTCOME_UNCERTAIN"
     CONFIRMED_NOT_CREATED = "CONFIRMED_NOT_CREATED"
     CREATED_READBACK_MISMATCH = "CREATED_READBACK_MISMATCH"
+
+
+class WriterHoldState(str, Enum):
+    PENDING = "PENDING"
+    REGISTERED = "REGISTERED"
+    TERMINATION_CONFIRMED = "TERMINATION_CONFIRMED"
+    QUARANTINED = "QUARANTINED"
+    CLEARED = "CLEARED"
 
 
 class ReconciliationCaseState(str, Enum):
@@ -132,14 +141,20 @@ class JobRecord:
     form_alias: str = "member_registration"
     mapping_version: str = "member-intake.v1"
     attempt_started_at: str | None = None
+    writer_termination_state: str | None = None
 
     @property
     def dispatch_fenced(self) -> bool:
         return self.dispatch_fence_id is not None
 
     def safe_dict(self) -> dict[str, Any]:
+        writer_state = self.writer_termination_state or (
+            WriterHoldState.QUARANTINED.value
+            if self.state == JobState.WRITER_TERMINATION_UNCONFIRMED
+            else None
+        )
         return {
-            "schema_version": "xb.member.gateway.job.v1",
+            "schema_version": "xb.member.gateway.job.v2",
             "job_id": self.job_id,
             "request_id": self.request_id,
             "source_response_ref": self.source_response_ref,
@@ -160,6 +175,13 @@ class JobRecord:
             "has_dispatch_fence": self.dispatch_fenced,
             "result_status": self.result_status.value if self.result_status else None,
             "last_error_code": self.last_error_code,
+            "writer_termination_state": writer_state,
+            "writer_termination_hold_active": writer_state not in (None, WriterHoldState.CLEARED.value),
+            "writer_termination_proof_required": writer_state in {
+                WriterHoldState.PENDING.value,
+                WriterHoldState.REGISTERED.value,
+                WriterHoldState.QUARANTINED.value,
+            },
         }
 
     def worker_dict(self) -> dict[str, Any]:
@@ -228,6 +250,41 @@ class DispatchFenceRecord:
     operation: str
     created_at: str
     recheck_id: str | None = None
+    execution_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class WriterExecutionHold:
+    """Private durable binding for one fenced writer execution."""
+
+    hold_id: str
+    job_id: str
+    fence_id: str
+    attempt: int
+    worker_session: str | None
+    host_binding: str | None
+    execution_id: str
+    member_no: str
+    state: WriterHoldState
+    state_version: int
+    pid: int | None
+    process_start_time: str | None
+    evidence_type: str | None
+    evidence_reference: str | None
+    created_at: str
+    updated_at: str
+    registered_at: str | None = None
+    termination_confirmed_at: str | None = None
+    quarantined_at: str | None = None
+    cleared_at: str | None = None
+
+    @property
+    def active(self) -> bool:
+        return self.state != WriterHoldState.CLEARED
+
+    @property
+    def termination_confirmed(self) -> bool:
+        return self.state == WriterHoldState.TERMINATION_CONFIRMED
 
 
 @dataclass(frozen=True, slots=True)

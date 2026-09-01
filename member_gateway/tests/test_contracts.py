@@ -21,6 +21,7 @@ class ContractSurfaceTests(unittest.TestCase):
         for relative in (
             "schemas/member_gateway_source_event.v1.schema.json",
             "schemas/member_gateway_job.v1.schema.json",
+            "schemas/member_gateway_job.v2.schema.json",
             "schemas/member_gateway_result.v1.schema.json",
             "schemas/member_gateway_error.v1.schema.json",
             "config/member_gateway.production.example.json",
@@ -45,6 +46,7 @@ class ContractSurfaceTests(unittest.TestCase):
         for relative in (
             "schemas/member_gateway_source_event.v1.schema.json",
             "schemas/member_gateway_job.v1.schema.json",
+            "schemas/member_gateway_job.v2.schema.json",
             "schemas/member_gateway_result.v1.schema.json",
             "schemas/member_gateway_error.v1.schema.json",
         ):
@@ -92,6 +94,7 @@ class ContractSurfaceTests(unittest.TestCase):
         second = (
             ROOT / "member_gateway/migrations/0002_result_event_history.sql"
         ).read_text(encoding="utf-8")
+        third = (ROOT / "member_gateway/migrations/0003_writer_termination_quarantine.sql").read_text(encoding="utf-8")
         for table in (
             "source_responses",
             "source_observations",
@@ -120,6 +123,13 @@ class ContractSurfaceTests(unittest.TestCase):
         self.assertIn("member_no text NOT NULL UNIQUE", first)
         self.assertIn("CREATE TABLE IF NOT EXISTS xb_member_gateway.result_events", second)
         self.assertIn("save_invocation_count = 1", second)
+        self.assertIn("WRITER_TERMINATION_UNCONFIRMED", third)
+        self.assertIn("writer_termination_gate", third)
+        self.assertIn("writer_execution_holds", third)
+        self.assertIn("lifecycle IN", third)
+        self.assertIn("legacy_unproven", third)
+        self.assertIn("ADD COLUMN IF NOT EXISTS recheck_id", third)
+        self.assertNotIn("ON DELETE CASCADE", third.upper())
 
     def test_state_machine_contains_all_required_states_and_blocks_requeue(self):
         required = {
@@ -137,6 +147,7 @@ class ContractSurfaceTests(unittest.TestCase):
             "RETRY_WAIT",
             "AMBIGUOUS_LOOKUP",
             "WRITE_OUTCOME_UNCERTAIN",
+            "WRITER_TERMINATION_UNCONFIRMED",
             "CONFIRMED_NOT_CREATED",
             "CREATED_READBACK_MISMATCH",
             "MANUAL_REVIEW",
@@ -145,6 +156,9 @@ class ContractSurfaceTests(unittest.TestCase):
         self.assertTrue(required.issubset({state.value for state in JobState}))
         self.assertNotIn(JobState.QUEUED, ALLOWED_TRANSITIONS[JobState.WRITING])
         self.assertNotIn(JobState.QUEUED, ALLOWED_TRANSITIONS[JobState.WRITE_OUTCOME_UNCERTAIN])
+        self.assertNotIn(JobState.WRITING, ALLOWED_TRANSITIONS[JobState.WRITER_TERMINATION_UNCONFIRMED])
+        self.assertNotIn(JobState.CREATED_VERIFIED, ALLOWED_TRANSITIONS[JobState.WRITER_TERMINATION_UNCONFIRMED])
+        self.assertNotIn(JobState.CONFIRMED_NOT_CREATED, ALLOWED_TRANSITIONS[JobState.WRITER_TERMINATION_UNCONFIRMED])
 
     def test_allocator_rejects_truncation_and_uses_only_deterministic_suffixes(self):
         allocator = MemberNoAllocator(12)

@@ -16,6 +16,7 @@ from xb_member_gateway.repository import (
     PostgresRepository,
     RepositoryError,
     ResultConflict,
+    WriterTerminationConflict,
     internal_fence_id,
     public_fence_id,
 )
@@ -157,9 +158,24 @@ class EnforcementTests(unittest.TestCase):
             principal_valid=True,
         )
 
+    def prove_writer(self, job, fence, worker=SESSION_A):
+        host = f"host-{worker}"
+        self.repository.register_writer_execution(
+            job.job_id, fence_id=fence["dispatch_fence_id"], attempt=job.attempt,
+            worker_session=worker, host_binding=host, execution_id=fence["execution_id"],
+            pid=4321, process_start_time="2026-08-30T01:00:01Z", now=NOW,
+        )
+        self.repository.confirm_writer_termination(
+            job.job_id, fence_id=fence["dispatch_fence_id"], attempt=job.attempt,
+            worker_session=worker, host_binding=host, execution_id=fence["execution_id"],
+            pid=4321, process_start_time="2026-08-30T01:00:01Z", evidence_type="process_exit",
+            evidence_reference="evidence-enforcement", exit_code=0, now=NOW,
+        )
+
     def uncertain(self, response_id="uncertain-001", *, phone="81234567"):
         job = self.prepare(response_id, phone=phone, recheck=True)
         fence = self.write_fence(job)
+        self.prove_writer(job, fence)
         result = self.service.acknowledge_result(
             job.job_id,
             SESSION_A,
@@ -242,6 +258,7 @@ class EnforcementTests(unittest.TestCase):
         with self.assertRaises(LeaseConflict):
             self.repository.record_dispatch_fence(job_id, candidate, "member.create", SESSION_B, now=NOW)
         fence = self.service.dispatch_fence(job_id, SESSION_A, {"operation": "member.create", "member_no": candidate}, principal_valid=True)
+        self.prove_writer(job, fence, SESSION_A)
         result_body = {"schema_version": "xb.member.gateway.result.v1", "job_id": job_id, "operation": "member.create", "dispatch_fence_id": fence["dispatch_fence_id"], "status": "CREATED_VERIFIED", "member_no": candidate, "save_invocation_count": 1, "readback_found": True, "readback_match": True, "error_code": None}
         with self.assertRaises(LeaseConflict):
             self.service.acknowledge_result(job_id, SESSION_B, result_body)
@@ -289,13 +306,7 @@ class EnforcementTests(unittest.TestCase):
     def test_expired_writer_is_reclaimed_before_reconciliation_case_opens(self):
         job = self.prepare("reclaim-reconcile", recheck=True)
         fence = self.write_fence(job)
-        self.repository.mark_state(
-            job.job_id,
-            JobState.WRITE_OUTCOME_UNCERTAIN,
-            worker_id=SESSION_A,
-            require_lease=True,
-            now=NOW,
-        )
+        self.prove_writer(job, fence)
         reclaim_time = NOW + timedelta(seconds=601)
         self.assertEqual(self.repository.reclaim_expired(now=reclaim_time), 1)
         self.assertEqual(self.repository.get_job(job.job_id).state, JobState.WRITE_OUTCOME_UNCERTAIN)
@@ -342,9 +353,9 @@ class EnforcementTests(unittest.TestCase):
         with self.assertRaises(ApiError):
             self.service.reconcile(job.job_id, body)
         self.repository.mark_state(job.job_id, JobState.WRITE_OUTCOME_UNCERTAIN, worker_id=SESSION_A, require_lease=True, now=NOW)
-        with self.assertRaises(LeaseConflict):
+        with self.assertRaises(WriterTerminationConflict):
             self.repository.open_reconciliation_case(job.job_id, job.allocation_member_no, now=NOW)
-        self.assertEqual(self.repository.get_job(job.job_id).state, JobState.WRITE_OUTCOME_UNCERTAIN)
+        self.assertEqual(self.repository.get_job(job.job_id).state, JobState.WRITER_TERMINATION_UNCONFIRMED)
         self.assertEqual(fence["state"], JobState.WRITING.value)
 
     def test_reconciliation_requires_case_check_and_preserves_late_writer_safety(self):

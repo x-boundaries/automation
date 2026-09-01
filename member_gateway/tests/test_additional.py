@@ -66,6 +66,20 @@ def prepare(service, response_id="additional-response", worker="worker-1"):
     return service.repository.get_job(job["job_id"])
 
 
+def prove_writer(repository, job, fence, worker="worker-1"):
+    repository.register_writer_execution(
+        job.job_id, fence_id=fence["dispatch_fence_id"], attempt=job.attempt,
+        worker_session=worker, host_binding=f"host-{worker}", execution_id=fence["execution_id"],
+        pid=4321, process_start_time="2026-08-30T01:00:01Z", now=NOW,
+    )
+    repository.confirm_writer_termination(
+        job.job_id, fence_id=fence["dispatch_fence_id"], attempt=job.attempt,
+        worker_session=worker, host_binding=f"host-{worker}", execution_id=fence["execution_id"],
+        pid=4321, process_start_time="2026-08-30T01:00:01Z", evidence_type="process_exit",
+        evidence_reference="evidence-additional", exit_code=0, now=NOW,
+    )
+
+
 class AdditionalGatewayTests(unittest.TestCase):
     def new_service(self, **config_changes):
         repository = InMemoryRepository()
@@ -116,6 +130,7 @@ class AdditionalGatewayTests(unittest.TestCase):
             {"operation": "member.create", "member_no": member_no},
             principal_valid=True,
         )
+        prove_writer(repository, job, fence)
         uncertain = {
             "schema_version": "xb.member.gateway.result.v1",
             "job_id": job.job_id,
@@ -158,6 +173,7 @@ class AdditionalGatewayTests(unittest.TestCase):
             {"operation": "member.create", "member_no": member_no},
             principal_valid=True,
         )
+        prove_writer(service.repository, job, fence)
         result = service.acknowledge_result(
             job.job_id,
             "worker-1",

@@ -15,6 +15,8 @@ param(
     [Parameter(Mandatory)][ValidateSet("exact", "mismatch", "absent")][string]$Outcome,
     [int]$DelayMilliseconds = 0,
     [switch]$HeartbeatFailure,
+    [switch]$RegistrationFailure,
+    [switch]$ParentDeath,
     [switch]$ChildWriter
 )
 $ErrorActionPreference = "Stop"
@@ -22,7 +24,8 @@ $ErrorActionPreference = "Stop"
 
 if ($ChildWriter) {
     try {
-        $null = [Console]::In.ReadLine()
+        $payloadLine = [Console]::In.ReadLine()
+        if ([string]::IsNullOrWhiteSpace($payloadLine)) { throw "writer_payload_missing" }
         if ($DelayMilliseconds -gt 0) { Start-Sleep -Milliseconds $DelayMilliseconds }
         $childResult = $null
         if ($Outcome -eq "exact") {
@@ -39,7 +42,7 @@ if ($ChildWriter) {
     }
 }
 
-$state = @{ result = $null; paths = @(); sessions = @(); probe_refs = @(); heartbeat_count = 0; state_version = 10; writer_pid = 0 }
+$state = @{ result = $null; paths = @(); sessions = @(); probe_refs = @(); heartbeat_count = 0; state_version = 10; writer_pid = 0; registered = $false; termination_confirmed = $false }
 $state.attempt_started_at = [DateTimeOffset]::UtcNow.ToString("o")
 $gateway = {
     param($Base, $Path, $Method, $Body, $WorkerSession, $Timeout)
@@ -55,7 +58,7 @@ $gateway = {
     if ($Path -eq "/v1/worker/claim") {
         return [pscustomobject]@{
             claimed = $true
-            job = [pscustomobject]@{ job_id = "job-1"; payload_hash = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"; member_payload = [pscustomobject]@{ create_time = "2026-08-30T01:00:00Z" } }
+            job = [pscustomobject]@{ job_id = "job-1"; attempt = 1; payload_hash = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"; member_payload = [pscustomobject]@{ create_time = "2026-08-30T01:00:00Z" } }
         }
     }
     if ($Path -like "*/allocation/candidate") {
@@ -66,10 +69,23 @@ $gateway = {
     }
     if ($Path -like "*/allocation/recheck") { return [pscustomobject]@{ state = "ALLOCATION_BOUND" } }
     if ($Path -like "*/dispatch-fence") {
-        return [pscustomobject]@{ state = "WRITING"; dispatch_fence_id = "fence-1234567890abcdef" }
+        return [pscustomobject]@{ state = "WRITING"; dispatch_fence_id = "fence-1234567890abcdef"; execution_id = "exec-1234567890abcdef" }
     }
     if ($Path -like "*/status") {
-        return [pscustomobject]@{ state = "WRITING"; state_version = $thisState.state_version; attempt_started_at = $thisState.attempt_started_at; lease_expires_at = [DateTimeOffset]::UtcNow.AddSeconds(8).ToString("o") }
+        return [pscustomobject]@{ state = "WRITING"; state_version = $thisState.state_version; attempt = 1; attempt_started_at = $thisState.attempt_started_at; lease_expires_at = [DateTimeOffset]::UtcNow.AddSeconds(8).ToString("o") }
+    }
+    if ($Path -like "*/writer/register") {
+        if ($RegistrationFailure) { throw "synthetic_registration_failure" }
+        $thisState.registered = $true
+        return [pscustomobject]@{ registered = $true; lifecycle = "REGISTERED" }
+    }
+    if ($Path -like "*/writer/termination") {
+        if (-not $thisState.registered) { throw "registration_required" }
+        $thisState.termination_confirmed = $true
+        return [pscustomobject]@{ termination_confirmed = $true; lifecycle = "TERMINATION_CONFIRMED" }
+    }
+    if ($Path -like "*/writer/quarantine") {
+        return [pscustomobject]@{ quarantined = $true; lifecycle = "QUARANTINED" }
     }
     if ($Path -like "*/lease") {
         if ($HeartbeatFailure -and $thisState.heartbeat_count -gt 0) { throw "synthetic_heartbeat_failure" }
@@ -84,6 +100,19 @@ $gateway = {
     return [pscustomobject]@{}
 }.GetNewClosure()
 
+if ($ParentDeath) {
+    $parentDeathProcess = Start-XbMemberGatewayChildWriter -ScriptPath $PSCommandPath -Arguments @("-Lib", $Lib, "-Outcome", $Outcome, "-ChildWriter")
+    $state.writer_pid = $parentDeathProcess.Id
+    $parentDeathProcess.StandardInput.Close()
+    $parentDeathProcess.WaitForExit(2000)
+    $parentDeathOutput = $parentDeathProcess.StandardOutput.ReadToEnd()
+    [pscustomobject]@{
+        parent_death_fail_closed = ($parentDeathProcess.HasExited -and $parentDeathProcess.ExitCode -ne 0 -and [string]::IsNullOrWhiteSpace($parentDeathOutput))
+        writer_exit_confirmed = $parentDeathProcess.HasExited
+    } | ConvertTo-Json -Compress
+    exit 0
+}
+
 $probe = {
     param([string]$Candidate)
     [pscustomobject]@{ status = "FREE" }
@@ -95,25 +124,31 @@ $create = {
 
 $writerProcessFactory = {
     param($Payload)
-    $process = Start-XbMemberGatewayChildWriter -ScriptPath $PSCommandPath -Payload $Payload -Arguments @("-Lib", $Lib, "-Outcome", $Outcome, "-DelayMilliseconds", [string]$DelayMilliseconds, "-ChildWriter")
+    $process = Start-XbMemberGatewayChildWriter -ScriptPath $PSCommandPath -Arguments @("-Lib", $Lib, "-Outcome", $Outcome, "-DelayMilliseconds", [string]$DelayMilliseconds, "-ChildWriter")
     $state.writer_pid = $process.Id
     return $process
 }.GetNewClosure()
 
-$result = Invoke-XbMemberGatewayWorkerCycle -GatewayBaseUrl "https://gateway.example.test" -WorkerId "synthetic-worker" -EnableProductionWorker -EnableProductionAdapter -ProbeMember $probe -CreateMember $create -GatewayRequest $gateway -WriterProcessFactory $writerProcessFactory
+$result = Invoke-XbMemberGatewayWorkerCycle -GatewayBaseUrl "https://gateway.example.test" -WorkerId "synthetic-worker" -WorkerHostBinding "host-test" -EnableProductionWorker -EnableProductionAdapter -ProbeMember $probe -CreateMember $create -GatewayRequest $gateway -WriterProcessFactory $writerProcessFactory
 $writerExitConfirmed = $false
 if ($state.writer_pid -gt 0) {
     try { Get-Process -Id $state.writer_pid -ErrorAction Stop | Out-Null } catch { $writerExitConfirmed = $true }
 }
+$resultBody = $state.result
+$cycleResult = $result
 [pscustomobject]@{
-    cycle_status = $result.status
-    writes = $result.writes
-    result_status = $state.result.status
-    readback_found = $state.result.readback_found
-    readback_match = $state.result.readback_match
-    error_code = $state.result.error_code
+    cycle_status = if ($null -eq $cycleResult) { "NONE" } else { $cycleResult.status }
+    writes = if ($null -eq $cycleResult) { 0 } else { $cycleResult.writes }
+    result_status = if ($null -eq $resultBody) { "NONE" } else { $resultBody.status }
+    readback_found = if ($null -eq $resultBody) { $false } else { $resultBody.readback_found }
+    readback_match = if ($null -eq $resultBody) { $false } else { $resultBody.readback_match }
+    error_code = if ($null -eq $resultBody) { "NONE" } else { $resultBody.error_code }
     heartbeat_count = $state.heartbeat_count
     writer_exit_confirmed = $writerExitConfirmed
+    registration_before_result = ((@($state.paths).IndexOf("/v1/jobs/job-1/writer/register") -ge 0) -and (@($state.paths).IndexOf("/v1/jobs/job-1/writer/register") -lt @($state.paths).IndexOf("/v1/jobs/job-1/result")))
+    paths = [string]::Join(",", [string[]]$state.paths)
+    registered = $state.registered
+    termination_confirmed = $state.termination_confirmed
     session_valid = (@($state.sessions | Where-Object { $_ -notmatch '^ws-[0-9a-f]{32}$' }).Count -eq 0)
     session_count = @($state.sessions | Select-Object -Unique).Count
     probe_refs_distinct = (@($state.probe_refs | Select-Object -Unique).Count -eq 2)
@@ -129,7 +164,7 @@ class MemberGatewayWorkerCyclePowerShellTests(unittest.TestCase):
         cls.probe.write_text(PROBE, encoding="utf-8")
         cls.pwsh = shutil.which("pwsh") or shutil.which("powershell")
 
-    def run_probe(self, outcome, delay_milliseconds=0, heartbeat_failure=False):
+    def run_probe(self, outcome, delay_milliseconds=0, heartbeat_failure=False, registration_failure=False, parent_death=False):
         command = [
                 self.pwsh,
                 "-NoLogo",
@@ -148,6 +183,10 @@ class MemberGatewayWorkerCyclePowerShellTests(unittest.TestCase):
             command.extend(["-DelayMilliseconds", str(delay_milliseconds)])
         if heartbeat_failure:
             command.append("-HeartbeatFailure")
+        if registration_failure:
+            command.append("-RegistrationFailure")
+        if parent_death:
+            command.append("-ParentDeath")
         proc = subprocess.run(
             command,
             capture_output=True,
@@ -164,6 +203,9 @@ class MemberGatewayWorkerCyclePowerShellTests(unittest.TestCase):
         self.assertTrue(exact["readback_found"])
         self.assertTrue(exact["readback_match"])
         self.assertIsNone(exact["error_code"])
+        self.assertTrue(exact["registration_before_result"])
+        self.assertTrue(exact["registered"])
+        self.assertTrue(exact["termination_confirmed"])
 
         mismatch = self.run_probe("mismatch")
         self.assertEqual(mismatch["cycle_status"], "CREATED_READBACK_MISMATCH")
@@ -183,6 +225,22 @@ class MemberGatewayWorkerCyclePowerShellTests(unittest.TestCase):
         self.assertTrue(exact["session_valid"])
         self.assertEqual(exact["session_count"], 1)
         self.assertTrue(exact["probe_refs_distinct"])
+
+    def test_registration_failure_is_quarantined_without_payload_release(self):
+        failed = self.run_probe("exact", registration_failure=True)
+        self.assertEqual(failed["cycle_status"], "WRITER_TERMINATION_UNCONFIRMED")
+        self.assertEqual(failed["result_status"], "NONE")
+        self.assertEqual(failed["writes"], 1)
+        self.assertFalse(failed["registered"])
+        self.assertFalse(failed["termination_confirmed"])
+        self.assertTrue(failed["writer_exit_confirmed"])
+        self.assertNotIn("/v1/jobs/job-1/result", failed["paths"])
+        self.assertIn("/v1/jobs/job-1/writer/quarantine", failed["paths"])
+
+    def test_parent_death_before_payload_is_fail_closed(self):
+        parent_death = self.run_probe("exact", parent_death=True)
+        self.assertTrue(parent_death["parent_death_fail_closed"])
+        self.assertTrue(parent_death["writer_exit_confirmed"])
 
     def test_supervisor_renews_before_deadline_and_terminates_hung_writer(self):
         slow = self.run_probe("exact", delay_milliseconds=1500)

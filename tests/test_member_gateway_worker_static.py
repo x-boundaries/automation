@@ -58,6 +58,23 @@ class MemberGatewayWorkerStaticTests(unittest.TestCase):
         ):
             self.assertNotIn(private_identity, text)
 
+    def test_writer_registration_precedes_payload_release_and_unconfirmed_is_quarantined(self):
+        library = (ROOT / "scripts/ac2_member_gateway_worker_lib.ps1").read_text(
+            encoding="utf-8"
+        )
+        start = library.index("function Start-XbMemberGatewayChildWriter")
+        release = library.index("function Release-XbMemberGatewayChildWriterPayload")
+        protected = library.index("function Invoke-XbMemberGatewayProtectedWrite")
+        start_block = library[start:release]
+        protected_block = library[protected:]
+        self.assertNotIn("StandardInput.WriteLine", start_block)
+        self.assertNotIn("$Payload", start_block)
+        self.assertLess(protected_block.index("writer/register"), protected_block.index("Release-XbMemberGatewayChildWriterPayload"))
+        self.assertIn("writer_termination_unconfirmed", protected_block)
+        self.assertIn("writer_termination_confirmed:", protected_block)
+        self.assertIn("writer/quarantine", library)
+        self.assertIn("writer_payload_missing", (ROOT / "scripts/ac2_member_gateway_worker.ps1").read_text(encoding="utf-8"))
+
     def test_adapter_uses_only_the_reviewed_member_create_surface(self):
         adapter = (ROOT / "scripts/ac2_member_gateway_autocount_adapter.ps1").read_text(
             encoding="utf-8"

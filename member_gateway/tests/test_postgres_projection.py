@@ -45,14 +45,19 @@ class ProjectionStore:
             "error_code": "save_outcome_uncertain",
         }
         self.result_events = [copy.deepcopy(self.result_projection)]
+        self.hold = (
+            str(uuid.uuid4()), self.job_id, self.fence_id, 1, "worker-a", "host-a",
+            "exec-projection-001", self.member_no, "CLEARED", 3, 4321, NOW,
+            "process_exit", "evidence-projection", NOW, NOW, NOW, NOW, None, NOW,
+        )
         self.statements = []
         self.force_stale_cas = False
 
     def snapshot(self):
-        return copy.deepcopy((self.job_row, self.result_projection, self.result_events))
+        return copy.deepcopy((self.job_row, self.result_projection, self.result_events, self.hold))
 
     def restore(self, snapshot):
-        self.job_row, self.result_projection, self.result_events = copy.deepcopy(snapshot)
+        self.job_row, self.result_projection, self.result_events, self.hold = copy.deepcopy(snapshot)
 
 
 class ProjectionConnection:
@@ -91,11 +96,17 @@ class ProjectionCursor:
         self.rows = []
         self.rowcount = -1
 
+        if "SELECT STATE_VERSION FROM XB_MEMBER_GATEWAY.WRITER_TERMINATION_GATE" in normalized:
+            self.rows = [(0,)]
+            return
         if "FROM XB_MEMBER_GATEWAY.JOBS J" in normalized:
             self.rows = [self.store.job_row]
             return
         if "SELECT FENCE_ID,MEMBER_NO FROM XB_MEMBER_GATEWAY.DISPATCH_FENCES" in normalized:
             self.rows = [(self.store.fence_id, self.store.member_no)]
+            return
+        if "SELECT HOLD_ID,JOB_ID,FENCE_ID,ATTEMPT_COUNT,WORKER_SESSION,HOST_BINDING,EXECUTION_ID" in normalized:
+            self.rows = [self.store.hold]
             return
         if "SELECT RESULT_HASH,STATUS FROM XB_MEMBER_GATEWAY.RESULTS" in normalized:
             projection = self.store.result_projection
@@ -157,6 +168,13 @@ class ProjectionCursor:
             row[8] = values[0]
             row[9] = int(row[9]) + 1
             self.store.job_row = tuple(row)
+            self.rowcount = 1
+            return
+        if normalized.startswith("UPDATE XB_MEMBER_GATEWAY.WRITER_EXECUTION_HOLDS SET LIFECYCLE='CLEARED'"):
+            row = list(self.store.hold)
+            row[8] = "CLEARED"
+            row[19] = NOW
+            self.store.hold = tuple(row)
             self.rowcount = 1
             return
         self.rowcount = 1

@@ -10,6 +10,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import re
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -23,8 +24,9 @@ from .models import (
     AllocationProbe, AllocationRecord, AllocationRecheck, DispatchFenceRecord, IngestOutcome,
     JobRecord, JobState, LeaseRecord, ProbeStatus, ResultRecord, ResultStatus,
     ReconciliationCaseRecord, ReconciliationCaseState, ReconciliationCheckRecord,
-    SourceEvent, WriteIntentRecord,
+    SourceEvent, WriteIntentRecord, WriterExecutionHold, WriterHoldState,
 )
+from .results import make_result
 from .state_machine import TERMINAL_STATES, next_state
 
 
@@ -49,6 +51,10 @@ class AllocationConflict(RepositoryError):
 
 
 class ResultConflict(RepositoryError):
+    pass
+
+
+class WriterTerminationConflict(RepositoryError):
     pass
 
 
@@ -113,6 +119,8 @@ class InMemoryRepository:
         self._allocations_by_member: dict[str, str] = {}
         self._write_intents: dict[str, WriteIntentRecord] = {}
         self._fences: dict[str, DispatchFenceRecord] = {}
+        self._writer_holds: dict[str, WriterExecutionHold] = {}
+        self._writer_gate_version = 0
         self._rechecks: dict[str, list[AllocationRecheck]] = {}
         self._reconciliation_cases: dict[str, ReconciliationCaseRecord] = {}
         self._reconciliation_checks: dict[str, list[ReconciliationCheckRecord]] = {}
@@ -142,6 +150,34 @@ class InMemoryRepository:
         """Must be called while _lock is held, at the mutation boundary."""
         if self._control.get("kill_switch_enabled", True):
             raise RepositoryError("kill_switch_enabled")
+
+    def _active_writer_holds(self) -> list[WriterExecutionHold]:
+        return [hold for hold in self._writer_holds.values() if hold.active]
+
+    def _assert_no_active_writer_hold(self, *, allow_job_id: str | None = None) -> None:
+        if any(hold.job_id != allow_job_id for hold in self._active_writer_holds()):
+            raise WriterTerminationConflict("writer_termination_quarantine_active")
+
+    def _hold(self, job_id: str) -> WriterExecutionHold | None:
+        return self._writer_holds.get(job_id)
+
+    def _set_hold(self, hold: WriterExecutionHold, job: JobRecord) -> None:
+        self._writer_holds[job.job_id] = hold
+        job.writer_termination_state = hold.state.value
+
+    @staticmethod
+    def _validate_process_identity(pid: int, process_start_time: str) -> None:
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+            raise WriterTerminationConflict("writer_process_identity_invalid")
+        if not isinstance(process_start_time, str) or not process_start_time or len(process_start_time) > 80:
+            raise WriterTerminationConflict("writer_process_identity_invalid")
+
+    @staticmethod
+    def _validate_evidence(evidence_type: str, evidence_reference: str, exit_code: int | None = None) -> None:
+        if evidence_type != "process_exit" or not isinstance(evidence_reference, str) or not re.fullmatch(r"[A-Za-z0-9._:-]{1,200}", evidence_reference):
+            raise WriterTerminationConflict("writer_termination_proof_required")
+        if exit_code is None or isinstance(exit_code, bool) or not isinstance(exit_code, int) or not -(2**31) <= exit_code <= (2**31 - 1):
+            raise WriterTerminationConflict("writer_termination_proof_required")
 
     def _active_leases(self, now: datetime) -> list[LeaseRecord]:
         return [
@@ -232,21 +268,96 @@ class InMemoryRepository:
         with self._lock:
             return dict(self._control)
 
+    def _quarantine_hold(self, job: JobRecord, current: datetime, *, error_code: str = "writer_termination_unconfirmed") -> WriterExecutionHold:
+        fence = self._fences.get(job.job_id)
+        if fence is None:
+            raise WriterTerminationConflict("dispatch_fence_required")
+        hold = self._writer_holds.get(job.job_id)
+        if hold is None:
+            hold = WriterExecutionHold(
+                hold_id=f"hold-{uuid.uuid4().hex}", job_id=job.job_id, fence_id=fence.fence_id,
+                attempt=max(job.attempt, 1), worker_session=None, host_binding=None,
+                execution_id=fence.execution_id or f"legacy-execution-{uuid.uuid4().hex}",
+                member_no=fence.member_no, state=WriterHoldState.QUARANTINED,
+                state_version=1, pid=None, process_start_time=None,
+                evidence_type="legacy_unproven", evidence_reference=f"legacy-{uuid.uuid4().hex}",
+                created_at=timestamp(current), updated_at=timestamp(current),
+                quarantined_at=timestamp(current),
+            )
+        elif hold.state == WriterHoldState.CLEARED:
+            raise WriterTerminationConflict("writer_termination_clearance_rejected")
+        elif hold.state != WriterHoldState.QUARANTINED:
+            hold = replace(
+                hold, state=WriterHoldState.QUARANTINED, state_version=hold.state_version + 1,
+                evidence_type="quarantine", evidence_reference=f"quarantine-{uuid.uuid4().hex}",
+                updated_at=timestamp(current), quarantined_at=timestamp(current),
+            )
+        self._set_hold(hold, job)
+        if job.state != JobState.WRITER_TERMINATION_UNCONFIRMED:
+            self._move(job, JobState.WRITER_TERMINATION_UNCONFIRMED)
+        job.last_error_code = error_code
+        return hold
+
+    def _settle_confirmed_termination(self, job: JobRecord, current: datetime, *, error_code: str = "result_acknowledgement_lost") -> ResultRecord:
+        hold = self._writer_holds.get(job.job_id)
+        fence = self._fences.get(job.job_id)
+        if hold is None or not hold.termination_confirmed or fence is None:
+            raise WriterTerminationConflict("writer_termination_proof_required")
+        existing = self._results.get(job.job_id)
+        if existing is None:
+            result = make_result(
+                job=job, fence=fence, status=ResultStatus.WRITE_OUTCOME_UNCERTAIN,
+                save_invocation_count=1, readback_found=False, readback_match=False,
+                error_code=error_code, acknowledged_at=current,
+            )
+            self._result_history.setdefault(job.job_id, []).append(self._copy(result))
+            self._results[job.job_id] = self._copy(result)
+        elif existing.status == ResultStatus.WRITE_OUTCOME_UNCERTAIN:
+            result = existing
+        else:
+            raise ResultConflict("result_payload_conflict")
+        if job.state != JobState.WRITE_OUTCOME_UNCERTAIN:
+            self._move(job, JobState.WRITE_OUTCOME_UNCERTAIN)
+        job.result_status = ResultStatus.WRITE_OUTCOME_UNCERTAIN
+        job.save_invocation_count = 1
+        job.last_error_code = result.error_code
+        cleared = replace(
+            hold, state=WriterHoldState.CLEARED, state_version=hold.state_version + 1,
+            updated_at=timestamp(current), cleared_at=timestamp(current),
+        )
+        self._set_hold(cleared, job)
+        self._leases.pop(job.job_id, None)
+        job.lease_owner = None
+        job.lease_expires_at = None
+        self._audit("confirmed_termination_uncertainty_settled", job, error_code=result.error_code)
+        return self._copy(result)
+
     def reclaim_expired(self, *, now: datetime | None = None) -> int:
         current = utc_now(now)
         with self._lock:
             count = 0
+            active_hold_jobs = {hold.job_id for hold in self._active_writer_holds()}
             for job in self._jobs.values():
                 if job.state in TERMINAL_STATES:
                     self._leases.pop(job.job_id, None)
                     continue
+                if active_hold_jobs and job.job_id not in active_hold_jobs:
+                    continue
                 lease = self._leases.get(job.job_id)
                 if lease is None or parse_timestamp(lease.expires_at) > current:
                     continue
-                if job.dispatch_fenced or job.state == JobState.WRITING:
-                    if job.state != JobState.WRITE_OUTCOME_UNCERTAIN:
-                        self._move(job, JobState.WRITE_OUTCOME_UNCERTAIN)
-                    job.last_error_code = "lease_expired_after_dispatch"
+                hold = self._writer_holds.get(job.job_id)
+                if hold is not None and hold.state == WriterHoldState.CLEARED:
+                    self._leases.pop(job.job_id, None)
+                    job.lease_owner = None
+                    job.lease_expires_at = None
+                    count += 1
+                    self._audit("lease_reclaimed", job, count=count)
+                    continue
+                if hold is not None and hold.termination_confirmed:
+                    self._settle_confirmed_termination(job, current, error_code="lease_expired_after_confirmed_termination")
+                elif job.dispatch_fenced or job.state in {JobState.WRITING, JobState.READBACK, JobState.WRITER_TERMINATION_UNCONFIRMED}:
+                    self._quarantine_hold(job, current, error_code="lease_expired_after_dispatch")
                 elif job.state in {JobState.LEASED, JobState.PRECHECKING, JobState.ALLOCATION_BOUND, JobState.WRITE_INTENT_RECORDED}:
                     if job.attempt >= job.max_attempts:
                         self._move(job, JobState.DEAD_LETTER)
@@ -270,6 +381,8 @@ class InMemoryRepository:
         with self._lock:
             self._assert_kill_switch_clear()
             self.reclaim_expired(now=current)
+            if self._active_writer_holds():
+                return None
             if self._active_leases(current):
                 return None
             jobs = [job for job in self._jobs.values() if job.state in {JobState.QUEUED, JobState.RETRY_WAIT} and (not job.next_attempt_at or parse_timestamp(job.next_attempt_at) <= current) and job.attempt < job.max_attempts]
@@ -343,9 +456,10 @@ class InMemoryRepository:
         current = utc_now(now)
         with self._lock:
             job = self._job(job_id)
-            self._lease(job, worker_id, current)
             if job.dispatch_fenced or job.state not in {JobState.PRECHECKING, JobState.ALLOCATION_BOUND}:
                 raise AllocationConflict("probe_state_invalid")
+            self._assert_no_active_writer_hold()
+            self._lease(job, worker_id, current)
             probe = AllocationProbe(job_id, candidate, ProbeStatus(status), probe_reference, timestamp(current))
             self._probes[job_id].append(probe)
             return probe
@@ -359,9 +473,10 @@ class InMemoryRepository:
         current = utc_now(now)
         with self._lock:
             job = self._job(job_id)
-            self._lease(job, worker_id, current)
             if job.dispatch_fenced:
                 raise AllocationConflict("allocation_after_dispatch_fence")
+            self._assert_no_active_writer_hold()
+            self._lease(job, worker_id, current)
             existing = self._allocations.get(job_id)
             if existing is not None:
                 if existing.member_no != member_no or existing.probe_reference != probe_reference:
@@ -387,6 +502,7 @@ class InMemoryRepository:
         current = utc_now(now)
         with self._lock:
             job = self._job(job_id)
+            self._assert_no_active_writer_hold()
             self._lease(job, worker_id, current)
             allocation = self._allocations.get(job_id)
             if allocation is None or job.state != JobState.ALLOCATION_BOUND:
@@ -447,6 +563,9 @@ class InMemoryRepository:
         current = utc_now(now)
         with self._lock:
             job = self._job(job_id)
+            if job.dispatch_fenced:
+                raise RepositoryError("write_intent_state_invalid")
+            self._assert_no_active_writer_hold()
             self._lease(job, worker_id, current)
             if operation != "member.create" or job.operation != operation:
                 raise RepositoryError("operation_invalid")
@@ -480,7 +599,7 @@ class InMemoryRepository:
             self._job(job_id)
             return self._copy(self._write_intents.get(job_id))
 
-    def record_dispatch_fence(self, job_id: str, member_no: str, operation: str, worker_id: str, *, now: datetime | None = None) -> DispatchFenceRecord:
+    def record_dispatch_fence(self, job_id: str, member_no: str, operation: str, worker_id: str, *, host_binding: str | None = None, now: datetime | None = None) -> DispatchFenceRecord:
         current = utc_now(now)
         with self._lock:
             self._assert_kill_switch_clear()
@@ -491,6 +610,7 @@ class InMemoryRepository:
                 if existing.member_no != member_no or existing.operation != operation:
                     raise AllocationConflict("dispatch_fence_binding_invalid")
                 return self._copy(existing)
+            self._assert_no_active_writer_hold()
             intent = self._write_intents.get(job_id)
             fresh = self._fresh_recheck(job, worker_id, current)
             if (
@@ -499,10 +619,20 @@ class InMemoryRepository:
                 or fresh is None or intent.recheck_id != fresh.recheck_id
             ):
                 raise RepositoryError("write_intent_required")
-            fence = DispatchFenceRecord(job_id, new_fence_id(), member_no, operation, timestamp(current), fresh.recheck_id)
+            resolved_host = host_binding or f"host-{worker_id}"
+            if not re.fullmatch(r"host-[A-Za-z0-9._:-]{1,120}", resolved_host):
+                raise WriterTerminationConflict("worker_host_binding_invalid")
+            fence = DispatchFenceRecord(job_id, new_fence_id(), member_no, operation, timestamp(current), fresh.recheck_id, f"exec-{uuid.uuid4().hex}")
             self._fences[job_id] = fence
             job.dispatch_fence_id = fence.fence_id
             self._move(job, JobState.WRITING)
+            self._set_hold(WriterExecutionHold(
+                hold_id=f"hold-{uuid.uuid4().hex}", job_id=job_id, fence_id=fence.fence_id,
+                attempt=job.attempt, worker_session=worker_id, host_binding=resolved_host,
+                execution_id=fence.execution_id or f"exec-{uuid.uuid4().hex}", member_no=member_no,
+                state=WriterHoldState.PENDING, state_version=0, pid=None, process_start_time=None,
+                evidence_type=None, evidence_reference=None, created_at=timestamp(current), updated_at=timestamp(current),
+            ), job)
             self._audit("dispatch_fence_created", job)
             return self._copy(fence)
 
@@ -511,10 +641,210 @@ class InMemoryRepository:
             self._job(job_id)
             return self._copy(self._fences.get(job_id))
 
+    def get_writer_execution_hold(self, job_id: str) -> WriterExecutionHold | None:
+        with self._lock:
+            self._job(job_id)
+            return self._copy(self._writer_holds.get(job_id))
+
+    def assert_no_active_writer_hold(self) -> None:
+        with self._lock:
+            self._assert_no_active_writer_hold()
+
+    def _check_writer_binding(
+        self,
+        job: JobRecord,
+        hold: WriterExecutionHold,
+        *,
+        fence_id: str,
+        attempt: int,
+        worker_session: str,
+        host_binding: str,
+        execution_id: str,
+    ) -> None:
+        if (
+            hold.fence_id != fence_id or hold.attempt != attempt
+            or hold.worker_session != worker_session or hold.host_binding != host_binding
+            or hold.execution_id != execution_id or job.dispatch_fence_id != fence_id
+        ):
+            raise WriterTerminationConflict("writer_termination_binding_invalid")
+
+    def register_writer_execution(
+        self,
+        job_id: str,
+        *,
+        fence_id: str,
+        attempt: int,
+        worker_session: str,
+        host_binding: str,
+        execution_id: str,
+        pid: int,
+        process_start_time: str,
+        now: datetime | None = None,
+    ) -> WriterExecutionHold:
+        current = utc_now(now)
+        with self._lock:
+            job = self._job(job_id)
+            hold = self._writer_holds.get(job_id)
+            if hold is None:
+                raise WriterTerminationConflict("writer_termination_hold_missing")
+            self._check_writer_binding(job, hold, fence_id=fence_id, attempt=attempt, worker_session=worker_session, host_binding=host_binding, execution_id=execution_id)
+            self._validate_process_identity(pid, process_start_time)
+            if hold.state == WriterHoldState.REGISTERED:
+                if hold.pid != pid or hold.process_start_time != process_start_time:
+                    raise WriterTerminationConflict("writer_process_identity_mismatch")
+                return self._copy(hold)
+            if hold.state != WriterHoldState.PENDING:
+                raise WriterTerminationConflict("writer_termination_clearance_rejected")
+            self._lease(job, worker_session, current)
+            updated = replace(
+                hold, state=WriterHoldState.REGISTERED, state_version=hold.state_version + 1,
+                pid=pid, process_start_time=process_start_time, updated_at=timestamp(current),
+                registered_at=timestamp(current),
+            )
+            self._set_hold(updated, job)
+            self._audit("writer_execution_registered", job)
+            return self._copy(updated)
+
+    def confirm_writer_termination(
+        self,
+        job_id: str,
+        *,
+        fence_id: str,
+        attempt: int,
+        worker_session: str,
+        host_binding: str,
+        execution_id: str,
+        pid: int,
+        process_start_time: str,
+        evidence_type: str,
+        evidence_reference: str,
+        exit_code: int,
+        now: datetime | None = None,
+    ) -> WriterExecutionHold:
+        current = utc_now(now)
+        with self._lock:
+            job = self._job(job_id)
+            hold = self._writer_holds.get(job_id)
+            if hold is None:
+                raise WriterTerminationConflict("writer_termination_hold_missing")
+            self._check_writer_binding(job, hold, fence_id=fence_id, attempt=attempt, worker_session=worker_session, host_binding=host_binding, execution_id=execution_id)
+            self._validate_process_identity(pid, process_start_time)
+            self._validate_evidence(evidence_type, evidence_reference, exit_code)
+            if hold.state == WriterHoldState.TERMINATION_CONFIRMED:
+                if hold.pid != pid or hold.process_start_time != process_start_time:
+                    raise WriterTerminationConflict("writer_process_identity_mismatch")
+                return self._copy(hold)
+            if hold.state != WriterHoldState.REGISTERED:
+                raise WriterTerminationConflict("writer_termination_proof_required")
+            if hold.pid != pid or hold.process_start_time != process_start_time:
+                raise WriterTerminationConflict("writer_process_identity_mismatch")
+            self._lease(job, worker_session, current)
+            updated = replace(
+                hold, state=WriterHoldState.TERMINATION_CONFIRMED, state_version=hold.state_version + 1,
+                evidence_type=evidence_type, evidence_reference=evidence_reference,
+                updated_at=timestamp(current), termination_confirmed_at=timestamp(current),
+            )
+            self._set_hold(updated, job)
+            self._audit("writer_termination_confirmed", job)
+            return self._copy(updated)
+
+    def quarantine_writer_execution(
+        self,
+        job_id: str,
+        *,
+        fence_id: str,
+        attempt: int,
+        worker_session: str,
+        host_binding: str,
+        execution_id: str,
+        pid: int | None = None,
+        process_start_time: str | None = None,
+        evidence_reference: str,
+        reason: str = "writer_termination_unconfirmed",
+        now: datetime | None = None,
+    ) -> WriterExecutionHold:
+        current = utc_now(now)
+        with self._lock:
+            job = self._job(job_id)
+            hold = self._writer_holds.get(job_id)
+            if hold is None:
+                raise WriterTerminationConflict("writer_termination_hold_missing")
+            self._check_writer_binding(job, hold, fence_id=fence_id, attempt=attempt, worker_session=worker_session, host_binding=host_binding, execution_id=execution_id)
+            if hold.state == WriterHoldState.CLEARED or hold.state == WriterHoldState.TERMINATION_CONFIRMED:
+                raise WriterTerminationConflict("writer_termination_clearance_rejected")
+            if (pid is None) != (process_start_time is None):
+                raise WriterTerminationConflict("writer_process_identity_invalid")
+            if pid is not None and process_start_time is not None:
+                self._validate_process_identity(pid, process_start_time)
+            if not isinstance(evidence_reference, str) or not re.fullmatch(r"[A-Za-z0-9._:-]{1,200}", evidence_reference):
+                raise WriterTerminationConflict("writer_quarantine_evidence_invalid")
+            if hold.state == WriterHoldState.QUARANTINED:
+                return self._copy(hold)
+            updated = replace(
+                hold, state=WriterHoldState.QUARANTINED, state_version=hold.state_version + 1,
+                pid=pid if pid is not None else hold.pid, process_start_time=process_start_time if process_start_time is not None else hold.process_start_time,
+                evidence_type="quarantine", evidence_reference=evidence_reference,
+                updated_at=timestamp(current), quarantined_at=timestamp(current),
+            )
+            self._set_hold(updated, job)
+            if job.state != JobState.WRITER_TERMINATION_UNCONFIRMED:
+                self._move(job, JobState.WRITER_TERMINATION_UNCONFIRMED)
+            job.last_error_code = reason if re.fullmatch(r"[a-z0-9_.:-]{1,80}", reason) else "writer_termination_unconfirmed"
+            self._audit("writer_termination_quarantined", job, error_code=job.last_error_code)
+            return self._copy(updated)
+
+    def recover_writer_termination(
+        self,
+        job_id: str,
+        *,
+        fence_id: str,
+        attempt: int,
+        recovery_session: str,
+        host_binding: str,
+        execution_id: str,
+        pid: int,
+        process_start_time: str,
+        evidence_reference: str,
+        exit_code: int,
+        now: datetime | None = None,
+    ) -> tuple[ResultRecord, bool]:
+        current = utc_now(now)
+        with self._lock:
+            job = self._job(job_id)
+            existing = self._results.get(job_id)
+            hold = self._writer_holds.get(job_id)
+            if hold is not None and hold.state == WriterHoldState.CLEARED and existing is not None and existing.status == ResultStatus.WRITE_OUTCOME_UNCERTAIN:
+                return self._copy(existing), True
+            if hold is None or hold.state != WriterHoldState.QUARANTINED:
+                raise WriterTerminationConflict("writer_termination_clearance_rejected")
+            if hold.worker_session == recovery_session:
+                raise WriterTerminationConflict("stale_worker_session")
+            self._check_writer_binding(job, hold, fence_id=fence_id, attempt=attempt, worker_session=hold.worker_session or "", host_binding=host_binding, execution_id=execution_id)
+            if hold.host_binding != host_binding or hold.execution_id != execution_id or hold.fence_id != fence_id or hold.attempt != attempt or hold.pid != pid or hold.process_start_time != process_start_time:
+                raise WriterTerminationConflict("writer_termination_binding_invalid")
+            self._validate_process_identity(pid, process_start_time)
+            self._validate_evidence("process_exit", evidence_reference, exit_code)
+            lease = self._leases.get(job_id)
+            if lease is not None and parse_timestamp(lease.expires_at) > current:
+                raise WriterTerminationConflict("writer_termination_clearance_rejected")
+            confirmed = replace(
+                hold, state=WriterHoldState.TERMINATION_CONFIRMED, state_version=hold.state_version + 1,
+                pid=pid, process_start_time=process_start_time, evidence_type="termination_recovery",
+                evidence_reference=evidence_reference, updated_at=timestamp(current),
+                termination_confirmed_at=timestamp(current),
+            )
+            self._set_hold(confirmed, job)
+            return self._copy(self._settle_confirmed_termination(job, current, error_code="termination_recovered_result_unknown")), False
+
     def open_reconciliation_case(self, job_id: str, member_no: str, *, now: datetime | None = None) -> ReconciliationCaseRecord:
         current = utc_now(now)
         with self._lock:
             job = self._job(job_id)
+            hold = self._writer_holds.get(job_id)
+            if any(item.active for item in self._writer_holds.values()):
+                raise WriterTerminationConflict("writer_termination_quarantine_active")
+            if hold is None or hold.state != WriterHoldState.CLEARED or hold.termination_confirmed_at is None:
+                raise WriterTerminationConflict("writer_termination_proof_required")
             if job.state != JobState.WRITE_OUTCOME_UNCERTAIN:
                 raise RepositoryError("reconciliation_requires_uncertain_state")
             allocation = self._allocations.get(job_id)
@@ -562,6 +892,11 @@ class InMemoryRepository:
             if case.state != ReconciliationCaseState.OPEN:
                 raise RepositoryError("reconciliation_case_not_open")
             job = self._job(case.job_id)
+            hold = self._writer_holds.get(case.job_id)
+            if hold is None or hold.state != WriterHoldState.CLEARED or hold.termination_confirmed_at is None:
+                raise WriterTerminationConflict("writer_termination_proof_required")
+            if any(item.active for item in self._writer_holds.values()):
+                raise WriterTerminationConflict("writer_termination_quarantine_active")
             if job.state != JobState.WRITE_OUTCOME_UNCERTAIN:
                 raise RepositoryError("reconciliation_requires_uncertain_state")
             lease = self._leases.get(job.job_id)
@@ -658,6 +993,11 @@ class InMemoryRepository:
                     self._result_conflicts.append({"job_id": result.job_id, "code": "result_payload_conflict"})
                     raise ResultConflict("result_payload_conflict")
                 reconciliation_projection = True
+            hold = self._writer_holds.get(result.job_id)
+            if require_lease and (hold is None or not hold.termination_confirmed):
+                raise WriterTerminationConflict("writer_termination_proof_required")
+            if not require_lease and (hold is None or hold.state != WriterHoldState.CLEARED or hold.termination_confirmed_at is None):
+                raise WriterTerminationConflict("writer_termination_proof_required")
             if require_lease:
                 if not worker_id:
                     raise LeaseConflict("worker_identity_required")
@@ -694,6 +1034,13 @@ class InMemoryRepository:
             self._result_history.setdefault(result.job_id, []).append(self._copy(result))
             self._results[result.job_id] = self._copy(result)
             if require_lease:
+                confirmed = self._writer_holds.get(result.job_id)
+                if confirmed is None or not confirmed.termination_confirmed:
+                    raise WriterTerminationConflict("writer_termination_proof_required")
+                self._set_hold(replace(
+                    confirmed, state=WriterHoldState.CLEARED, state_version=confirmed.state_version + 1,
+                    updated_at=timestamp(current), cleared_at=timestamp(current),
+                ), job)
                 self._leases.pop(result.job_id, None)
                 job.lease_owner = None
                 job.lease_expires_at = None
@@ -713,6 +1060,22 @@ class InMemoryRepository:
                 if worker_id is None:
                     raise LeaseConflict("worker_identity_required")
                 self._lease(job, worker_id, current)
+            if job.dispatch_fenced and JobState(target) == JobState.WRITER_TERMINATION_UNCONFIRMED:
+                self._quarantine_hold(job, current, error_code=error_code or "writer_termination_unconfirmed")
+                return self._copy(job)
+            if job.dispatch_fenced and JobState(target) == JobState.WRITE_OUTCOME_UNCERTAIN:
+                hold = self._writer_holds.get(job_id)
+                if hold is None or not hold.termination_confirmed:
+                    self._quarantine_hold(job, current, error_code=error_code or "writer_termination_unconfirmed")
+                    return self._copy(job)
+                self._settle_confirmed_termination(job, current, error_code=error_code or "writer_termination_unconfirmed")
+                return self._copy(job)
+            if job.dispatch_fenced and JobState(target) in {
+                JobState.CREATED_VERIFIED,
+                JobState.CONFIRMED_NOT_CREATED,
+                JobState.CREATED_READBACK_MISMATCH,
+            }:
+                raise WriterTerminationConflict("writer_termination_proof_required")
             self._move(job, JobState(target))
             if error_code:
                 job.last_error_code = error_code
@@ -740,6 +1103,29 @@ class InMemoryRepository:
         with self._lock:
             return tuple(self._copy(job) for job in self._jobs.values())
 
+    def result_history(self, job_id: str) -> tuple[ResultRecord, ...]:
+        with self._lock:
+            self._job(job_id)
+            return tuple(self._copy(item) for item in self._result_history.get(job_id, []))
+
+    def snapshot_state(self) -> dict[str, Any]:
+        """Return a private restart fixture without exposing it through the API."""
+        with self._lock:
+            return self._copy({
+                key: value for key, value in self.__dict__.items()
+                if key not in {"_lock", "_reference_key"}
+            })
+
+    @classmethod
+    def from_snapshot(cls, snapshot: Mapping[str, Any], *, reference_key: bytes = b"synthetic-member-gateway-key") -> "InMemoryRepository":
+        repository = cls(reference_key=reference_key)
+        with repository._lock:
+            for key, value in snapshot.items():
+                if key == "_lock":
+                    continue
+                setattr(repository, key, repository._copy(value))
+        return repository
+
     @property
     def audit_events(self) -> tuple[dict[str, Any], ...]:
         with self._lock:
@@ -761,13 +1147,18 @@ class PostgresRepository:
                j.lease_owner,j.lease_expires_at,j.allocation_member_no,
                j.allocation_probe_reference,j.write_intent_id,j.dispatch_fence_id,
                j.save_invocation_count,j.result_status,j.last_error_code,
-               'google_forms',COALESCE(obs.form_alias,''),COALESCE(obs.mapping_version,''),j.attempt_started_at
+               'google_forms',COALESCE(obs.form_alias,''),COALESCE(obs.mapping_version,''),j.attempt_started_at,
+               hold.lifecycle
         FROM xb_member_gateway.jobs j
         JOIN xb_member_gateway.source_responses sr ON sr.response_id=j.response_id
         LEFT JOIN LATERAL (
             SELECT request_id,form_alias,mapping_version FROM xb_member_gateway.source_observations
             WHERE response_id=j.response_id ORDER BY observed_at DESC,observation_id DESC LIMIT 1
         ) obs ON TRUE
+        LEFT JOIN LATERAL (
+            SELECT lifecycle FROM xb_member_gateway.writer_execution_holds
+            WHERE job_id=j.job_id ORDER BY hold_id DESC LIMIT 1
+        ) hold ON TRUE
         WHERE j.job_id=%s
     """
 
@@ -814,6 +1205,7 @@ class PostgresRepository:
             result_status=ResultStatus(row[20]) if row[20] else None,last_error_code=row[21],
             source_system=row[22],form_alias=row[23],mapping_version=row[24],
             attempt_started_at=cls._dt(row[25]),
+            writer_termination_state=str(row[26]) if len(row) > 26 and row[26] else None,
         )
 
     def _select_job(self, cursor: Any, job_id: str, *, for_update: bool = False) -> JobRecord:
@@ -840,6 +1232,52 @@ class PostgresRepository:
             raise RepositoryError("kill_switch_state_unavailable")
         if bool(row[0]):
             raise RepositoryError("kill_switch_enabled")
+
+    def _lock_writer_termination_gate(self, cursor: Any) -> None:
+        cursor.execute(
+            "SELECT state_version FROM xb_member_gateway.writer_termination_gate "
+            "WHERE gate_id=1 FOR UPDATE"
+        )
+        if cursor.fetchone() is None:
+            raise WriterTerminationConflict("writer_termination_gate_unavailable")
+
+    def _bump_writer_termination_gate(self, cursor: Any) -> None:
+        cursor.execute(
+            "UPDATE xb_member_gateway.writer_termination_gate "
+            "SET state_version=state_version+1,updated_at=now() WHERE gate_id=1"
+        )
+
+    def _assert_no_active_writer_hold_cursor(self, cursor: Any) -> None:
+        cursor.execute(
+            "SELECT 1 FROM xb_member_gateway.writer_execution_holds "
+            "WHERE lifecycle <> 'CLEARED' LIMIT 1 FOR UPDATE"
+        )
+        if cursor.fetchone() is not None:
+            raise WriterTerminationConflict("writer_termination_quarantine_active")
+
+    @classmethod
+    def _hold_from_row(cls, row: tuple[Any, ...]) -> WriterExecutionHold:
+        return WriterExecutionHold(
+            hold_id=str(row[0]), job_id=str(row[1]), fence_id=public_fence_id(row[2]),
+            attempt=int(row[3]), worker_session=row[4], host_binding=row[5], execution_id=str(row[6]),
+            member_no=row[7], state=WriterHoldState(row[8]), state_version=int(row[9]),
+            pid=int(row[10]) if row[10] is not None else None, process_start_time=cls._dt(row[11]),
+            evidence_type=row[12], evidence_reference=row[13], created_at=cls._dt(row[14]) or "",
+            updated_at=cls._dt(row[15]) or "", registered_at=cls._dt(row[16]),
+            termination_confirmed_at=cls._dt(row[17]), quarantined_at=cls._dt(row[18]),
+            cleared_at=cls._dt(row[19]),
+        )
+
+    def _select_writer_hold(self, cursor: Any, job_id: str, *, for_update: bool = False) -> WriterExecutionHold | None:
+        cursor.execute(
+            "SELECT hold_id,job_id,fence_id,attempt_count,worker_session,host_binding,execution_id,member_no,"
+            "lifecycle,state_version,process_pid,process_start_at,evidence_type,evidence_reference,created_at,"
+            "updated_at,registered_at,termination_confirmed_at,quarantined_at,cleared_at "
+            "FROM xb_member_gateway.writer_execution_holds WHERE job_id=%s" + (" FOR UPDATE" if for_update else ""),
+            (job_id,),
+        )
+        row = cursor.fetchone()
+        return None if row is None else self._hold_from_row(row)
 
     def _fresh_recheck_cursor(self, cursor: Any, job: JobRecord, worker_id: str, now: datetime) -> AllocationRecheck | None:
         latest = self._latest_recheck_cursor(cursor, job)
@@ -991,11 +1429,199 @@ class PostgresRepository:
                     and job.attempt_started_at is not None
                 )
 
+    @staticmethod
+    def _result_from_row(job_id: str, row: tuple[Any, ...]) -> ResultRecord:
+        return ResultRecord(
+            job_id, row[0], ResultStatus(row[1]), row[2], public_fence_id(row[3]), int(row[4]),
+            bool(row[5]), bool(row[6]), bool(row[7]), row[8], PostgresRepository._dt(row[9]) or "",
+        )
+
+    def _quarantine_hold_cursor(self, cursor: Any, job: JobRecord, current: datetime, error_code: str) -> WriterExecutionHold:
+        hold = self._select_writer_hold(cursor, job.job_id, for_update=True)
+        if hold is None:
+            fence = self.get_dispatch_fence_cursor(cursor, job.job_id, job)
+            if fence is None:
+                raise WriterTerminationConflict("dispatch_fence_required")
+            hold_id = str(uuid.uuid4())
+            execution_id = fence.execution_id or f"legacy-execution-{uuid.uuid4().hex}"
+            reference = f"legacy-{uuid.uuid4().hex}"
+            cursor.execute(
+                "INSERT INTO xb_member_gateway.writer_execution_holds(hold_id,job_id,fence_id,attempt_count,execution_id,member_no,lifecycle,state_version,evidence_type,evidence_reference,quarantined_at) "
+                "VALUES(%s,%s,%s,%s,%s,%s,'QUARANTINED',1,'legacy_unproven',%s,%s)",
+                (hold_id, job.job_id, internal_fence_id(fence.fence_id), max(job.attempt, 1), execution_id, fence.member_no, reference, current),
+            )
+        elif hold.state == WriterHoldState.CLEARED:
+            raise WriterTerminationConflict("writer_termination_clearance_rejected")
+        elif hold.state != WriterHoldState.QUARANTINED:
+            cursor.execute(
+                "UPDATE xb_member_gateway.writer_execution_holds SET lifecycle='QUARANTINED',state_version=state_version+1,evidence_type='quarantine',evidence_reference=%s,quarantined_at=%s,updated_at=%s WHERE job_id=%s",
+                (f"quarantine-{uuid.uuid4().hex}", current, current, job.job_id),
+            )
+        if job.state != JobState.WRITER_TERMINATION_UNCONFIRMED:
+            self._advance(cursor, job, JobState.WRITER_TERMINATION_UNCONFIRMED, current, {"last_error_code": error_code})
+        else:
+            cursor.execute("UPDATE xb_member_gateway.jobs SET last_error_code=%s,updated_at=%s WHERE job_id=%s", (error_code, current, job.job_id))
+        job.writer_termination_state = WriterHoldState.QUARANTINED.value
+        job.last_error_code = error_code
+        self._bump_writer_termination_gate(cursor)
+        return self._select_writer_hold(cursor, job.job_id, for_update=True)  # type: ignore[return-value]
+
+    def get_dispatch_fence_cursor(self, cursor: Any, job_id: str, job: JobRecord | None = None) -> DispatchFenceRecord | None:
+        cursor.execute("SELECT fence_id,member_no,operation,created_at FROM xb_member_gateway.dispatch_fences WHERE job_id=%s FOR UPDATE", (job_id,))
+        row = cursor.fetchone()
+        if row is None:
+            return None
+        latest = self._latest_recheck_cursor(cursor, job or self._select_job(cursor, job_id))
+        cursor.execute("SELECT execution_id FROM xb_member_gateway.writer_execution_holds WHERE job_id=%s", (job_id,))
+        execution = cursor.fetchone()
+        return DispatchFenceRecord(job_id, public_fence_id(row[0]), row[1], row[2], self._dt(row[3]) or "", latest.recheck_id if latest else None, execution[0] if execution else None)
+
+    def _settle_confirmed_termination_cursor(self, cursor: Any, job: JobRecord, current: datetime, error_code: str) -> ResultRecord:
+        hold = self._select_writer_hold(cursor, job.job_id, for_update=True)
+        if hold is None or not hold.termination_confirmed:
+            raise WriterTerminationConflict("writer_termination_proof_required")
+        fence = self.get_dispatch_fence_cursor(cursor, job.job_id, job)
+        if fence is None:
+            raise WriterTerminationConflict("dispatch_fence_required")
+        cursor.execute(
+            "SELECT result_hash,status,member_no,dispatch_fence_id,save_invocation_count,readback_found,readback_match,reconciliation_required,error_code,acknowledged_at FROM xb_member_gateway.results WHERE job_id=%s FOR UPDATE",
+            (job.job_id,),
+        )
+        existing = cursor.fetchone()
+        if existing is None:
+            result = make_result(job=job, fence=fence, status=ResultStatus.WRITE_OUTCOME_UNCERTAIN, save_invocation_count=1, readback_found=False, readback_match=False, error_code=error_code, acknowledged_at=current)
+            params = (result.job_id, result.result_hash, result.status.value, result.member_no, internal_fence_id(result.dispatch_fence_id), 1, False, False, True, result.error_code, current)
+            cursor.execute("INSERT INTO xb_member_gateway.result_events(job_id,result_hash,status,member_no,dispatch_fence_id,save_invocation_count,readback_found,readback_match,reconciliation_required,error_code,acknowledged_at) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", params)
+            cursor.execute("INSERT INTO xb_member_gateway.results(job_id,result_hash,status,member_no,dispatch_fence_id,save_invocation_count,readback_found,readback_match,reconciliation_required,error_code,acknowledged_at) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", params)
+        else:
+            result = self._result_from_row(job.job_id, existing)
+            if result.status != ResultStatus.WRITE_OUTCOME_UNCERTAIN:
+                raise ResultConflict("result_payload_conflict")
+        if job.state != JobState.WRITE_OUTCOME_UNCERTAIN:
+            self._advance(cursor, job, JobState.WRITE_OUTCOME_UNCERTAIN, current, {"result_status": ResultStatus.WRITE_OUTCOME_UNCERTAIN.value, "save_invocation_count": 1, "last_error_code": result.error_code})
+        else:
+            cursor.execute("UPDATE xb_member_gateway.jobs SET result_status='WRITE_OUTCOME_UNCERTAIN',save_invocation_count=1,last_error_code=%s,updated_at=%s WHERE job_id=%s", (result.error_code, current, job.job_id))
+        cursor.execute("UPDATE xb_member_gateway.writer_execution_holds SET lifecycle='CLEARED',state_version=state_version+1,cleared_at=%s,updated_at=%s WHERE job_id=%s AND lifecycle='TERMINATION_CONFIRMED'", (current, current, job.job_id))
+        cursor.execute("UPDATE xb_member_gateway.leases SET active=FALSE WHERE job_id=%s AND active=TRUE", (job.job_id,))
+        cursor.execute("UPDATE xb_member_gateway.jobs SET lease_owner=NULL,lease_expires_at=NULL,updated_at=%s WHERE job_id=%s", (current, job.job_id))
+        job.writer_termination_state = WriterHoldState.CLEARED.value
+        job.result_status = ResultStatus.WRITE_OUTCOME_UNCERTAIN
+        job.save_invocation_count = 1
+        job.last_error_code = result.error_code
+        self._bump_writer_termination_gate(cursor)
+        return result
+
+    def get_writer_execution_hold(self, job_id: str) -> WriterExecutionHold | None:
+        with self._transaction() as connection:
+            with connection.cursor() as cursor:
+                self._select_job(cursor, job_id)
+                return self._select_writer_hold(cursor, job_id)
+
+    def assert_no_active_writer_hold(self) -> None:
+        with self._transaction() as connection:
+            with connection.cursor() as cursor:
+                self._lock_writer_termination_gate(cursor)
+                self._assert_no_active_writer_hold_cursor(cursor)
+
+    def register_writer_execution(self, job_id: str, *, fence_id: str, attempt: int, worker_session: str, host_binding: str, execution_id: str, pid: int, process_start_time: str, now: datetime | None = None) -> WriterExecutionHold:
+        current = utc_now(now)
+        with self._transaction() as connection:
+            with connection.cursor() as cursor:
+                self._lock_writer_termination_gate(cursor)
+                job = self._select_job(cursor, job_id, for_update=True)
+                hold = self._select_writer_hold(cursor, job_id, for_update=True)
+                if hold is None or (hold.fence_id != fence_id or hold.attempt != attempt or hold.worker_session != worker_session or hold.host_binding != host_binding or hold.execution_id != execution_id or job.dispatch_fence_id != fence_id):
+                    raise WriterTerminationConflict("writer_termination_binding_invalid")
+                if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0 or not isinstance(process_start_time, str) or not process_start_time:
+                    raise WriterTerminationConflict("writer_process_identity_invalid")
+                if hold.state == WriterHoldState.REGISTERED:
+                    if hold.pid != pid or hold.process_start_time != process_start_time:
+                        raise WriterTerminationConflict("writer_process_identity_mismatch")
+                    return hold
+                if hold.state != WriterHoldState.PENDING:
+                    raise WriterTerminationConflict("writer_termination_clearance_rejected")
+                self._require_lease(cursor, job, worker_session, current)
+                cursor.execute("UPDATE xb_member_gateway.writer_execution_holds SET lifecycle='REGISTERED',process_pid=%s,process_start_at=%s,registered_at=%s,state_version=state_version+1,updated_at=%s WHERE job_id=%s AND lifecycle='PENDING'", (pid, process_start_time, current, current, job_id))
+                self._bump_writer_termination_gate(cursor)
+                return self._select_writer_hold(cursor, job_id, for_update=True)  # type: ignore[return-value]
+
+    def confirm_writer_termination(self, job_id: str, *, fence_id: str, attempt: int, worker_session: str, host_binding: str, execution_id: str, pid: int, process_start_time: str, evidence_type: str, evidence_reference: str, exit_code: int, now: datetime | None = None) -> WriterExecutionHold:
+        current = utc_now(now)
+        if evidence_type != "process_exit" or not isinstance(evidence_reference, str) or not re.fullmatch(r"[A-Za-z0-9._:-]{1,200}", evidence_reference) or isinstance(exit_code, bool) or not isinstance(exit_code, int) or not -(2**31) <= exit_code <= (2**31 - 1):
+            raise WriterTerminationConflict("writer_termination_proof_required")
+        with self._transaction() as connection:
+            with connection.cursor() as cursor:
+                self._lock_writer_termination_gate(cursor)
+                job = self._select_job(cursor, job_id, for_update=True)
+                hold = self._select_writer_hold(cursor, job_id, for_update=True)
+                if hold is None or hold.fence_id != fence_id or hold.attempt != attempt or hold.worker_session != worker_session or hold.host_binding != host_binding or hold.execution_id != execution_id or job.dispatch_fence_id != fence_id:
+                    raise WriterTerminationConflict("writer_termination_binding_invalid")
+                if hold.state == WriterHoldState.TERMINATION_CONFIRMED:
+                    if hold.pid != pid or hold.process_start_time != process_start_time:
+                        raise WriterTerminationConflict("writer_process_identity_mismatch")
+                    return hold
+                if hold.state != WriterHoldState.REGISTERED or hold.pid != pid or hold.process_start_time != process_start_time:
+                    raise WriterTerminationConflict("writer_process_identity_mismatch")
+                self._require_lease(cursor, job, worker_session, current)
+                cursor.execute("UPDATE xb_member_gateway.writer_execution_holds SET lifecycle='TERMINATION_CONFIRMED',evidence_type=%s,evidence_reference=%s,termination_confirmed_at=%s,state_version=state_version+1,updated_at=%s WHERE job_id=%s AND lifecycle='REGISTERED'", (evidence_type, evidence_reference, current, current, job_id))
+                self._bump_writer_termination_gate(cursor)
+                return self._select_writer_hold(cursor, job_id, for_update=True)  # type: ignore[return-value]
+
+    def quarantine_writer_execution(self, job_id: str, *, fence_id: str, attempt: int, worker_session: str, host_binding: str, execution_id: str, pid: int | None = None, process_start_time: str | None = None, evidence_reference: str, reason: str = "writer_termination_unconfirmed", now: datetime | None = None) -> WriterExecutionHold:
+        current = utc_now(now)
+        if (pid is None) != (process_start_time is None) or not isinstance(evidence_reference, str) or not re.fullmatch(r"[A-Za-z0-9._:-]{1,200}", evidence_reference):
+            raise WriterTerminationConflict("writer_quarantine_evidence_invalid")
+        with self._transaction() as connection:
+            with connection.cursor() as cursor:
+                self._lock_writer_termination_gate(cursor)
+                job = self._select_job(cursor, job_id, for_update=True)
+                hold = self._select_writer_hold(cursor, job_id, for_update=True)
+                if hold is None or hold.fence_id != fence_id or hold.attempt != attempt or hold.worker_session != worker_session or hold.host_binding != host_binding or hold.execution_id != execution_id or job.dispatch_fence_id != fence_id:
+                    raise WriterTerminationConflict("writer_termination_binding_invalid")
+                if hold.state in {WriterHoldState.CLEARED, WriterHoldState.TERMINATION_CONFIRMED}:
+                    raise WriterTerminationConflict("writer_termination_clearance_rejected")
+                if hold.state == WriterHoldState.QUARANTINED:
+                    return hold
+                cursor.execute("UPDATE xb_member_gateway.writer_execution_holds SET lifecycle='QUARANTINED',process_pid=COALESCE(%s,process_pid),process_start_at=COALESCE(%s,process_start_at),evidence_type='quarantine',evidence_reference=%s,quarantined_at=%s,state_version=state_version+1,updated_at=%s WHERE job_id=%s", (pid, process_start_time, evidence_reference, current, current, job_id))
+                safe_reason = reason if re.fullmatch(r"[a-z0-9_.:-]{1,80}", reason) else "writer_termination_unconfirmed"
+                if job.state != JobState.WRITER_TERMINATION_UNCONFIRMED:
+                    self._advance(cursor, job, JobState.WRITER_TERMINATION_UNCONFIRMED, current, {"last_error_code": safe_reason})
+                else:
+                    cursor.execute("UPDATE xb_member_gateway.jobs SET last_error_code=%s,updated_at=%s WHERE job_id=%s", (safe_reason, current, job_id))
+                self._bump_writer_termination_gate(cursor)
+                return self._select_writer_hold(cursor, job_id, for_update=True)  # type: ignore[return-value]
+
+    def recover_writer_termination(self, job_id: str, *, fence_id: str, attempt: int, recovery_session: str, host_binding: str, execution_id: str, pid: int, process_start_time: str, evidence_reference: str, exit_code: int, now: datetime | None = None) -> tuple[ResultRecord, bool]:
+        current = utc_now(now)
+        with self._transaction() as connection:
+            with connection.cursor() as cursor:
+                self._lock_writer_termination_gate(cursor)
+                job = self._select_job(cursor, job_id, for_update=True)
+                existing = self._select_writer_hold(cursor, job_id, for_update=True)
+                cursor.execute("SELECT result_hash,status,member_no,dispatch_fence_id,save_invocation_count,readback_found,readback_match,reconciliation_required,error_code,acknowledged_at FROM xb_member_gateway.results WHERE job_id=%s FOR UPDATE", (job_id,))
+                result_row = cursor.fetchone()
+                if existing is not None and existing.state == WriterHoldState.CLEARED and result_row is not None and result_row[1] == ResultStatus.WRITE_OUTCOME_UNCERTAIN.value:
+                    return self._result_from_row(job_id, result_row), True
+                if existing is None or existing.state != WriterHoldState.QUARANTINED or existing.worker_session is None:
+                    raise WriterTerminationConflict("writer_termination_clearance_rejected")
+                if existing.worker_session == recovery_session or existing.fence_id != fence_id or existing.attempt != attempt or existing.host_binding != host_binding or existing.execution_id != execution_id or job.dispatch_fence_id != fence_id or existing.pid != pid or existing.process_start_time != process_start_time:
+                    raise WriterTerminationConflict("writer_termination_binding_invalid")
+                if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0 or not isinstance(process_start_time, str) or not process_start_time or not isinstance(exit_code, int) or isinstance(exit_code, bool) or not -(2**31) <= exit_code <= (2**31 - 1) or not isinstance(evidence_reference, str) or not re.fullmatch(r"[A-Za-z0-9._:-]{1,200}", evidence_reference):
+                    raise WriterTerminationConflict("writer_termination_proof_required")
+                cursor.execute("SELECT expires_at FROM xb_member_gateway.leases WHERE job_id=%s AND active=TRUE FOR UPDATE", (job_id,))
+                lease = cursor.fetchone()
+                if lease is not None and parse_timestamp(lease[0]) > current:
+                    raise WriterTerminationConflict("writer_termination_clearance_rejected")
+                cursor.execute("UPDATE xb_member_gateway.writer_execution_holds SET lifecycle='TERMINATION_CONFIRMED',evidence_type='termination_recovery',evidence_reference=%s,termination_confirmed_at=%s,state_version=state_version+1,updated_at=%s WHERE job_id=%s AND lifecycle='QUARANTINED'", (evidence_reference, current, current, job_id))
+                return self._settle_confirmed_termination_cursor(cursor, job, current, "termination_recovered_result_unknown"), False
+
     def _reclaim_expired_cursor(self, cursor: Any, current: datetime) -> int:
-        cursor.execute("SELECT j.job_id,j.state,j.dispatch_fence_id,j.attempt_count,j.max_attempts FROM xb_member_gateway.jobs j JOIN xb_member_gateway.leases l ON l.job_id=j.job_id WHERE l.active=TRUE AND l.expires_at<=%s FOR UPDATE OF j,l", (current,))
+        cursor.execute("SELECT j.job_id,j.state,j.dispatch_fence_id,j.attempt_count,j.max_attempts,h.lifecycle FROM xb_member_gateway.jobs j JOIN xb_member_gateway.leases l ON l.job_id=j.job_id LEFT JOIN xb_member_gateway.writer_execution_holds h ON h.job_id=j.job_id WHERE l.active=TRUE AND l.expires_at<=%s FOR UPDATE OF j,l", (current,))
         rows = cursor.fetchall()
+        cursor.execute("SELECT job_id FROM xb_member_gateway.writer_execution_holds WHERE lifecycle <> 'CLEARED'")
+        active_hold_jobs = {row[0] for row in cursor.fetchall()}
         changed = 0
-        for job_id,state_value,fence_id,attempts,max_attempts in rows:
+        for job_id,state_value,fence_id,attempts,max_attempts,hold_lifecycle in rows:
             if state_value in {
                 JobState.CREATED_VERIFIED.value, JobState.CONFIRMED_NOT_CREATED.value,
                 JobState.CREATED_READBACK_MISMATCH.value, JobState.MANUAL_REVIEW.value,
@@ -1003,8 +1629,23 @@ class PostgresRepository:
             }:
                 cursor.execute("UPDATE xb_member_gateway.leases SET active=FALSE WHERE job_id=%s AND active=TRUE", (job_id,))
                 continue
-            if fence_id is not None or state_value == JobState.WRITING.value:
-                target,error = JobState.WRITE_OUTCOME_UNCERTAIN,"lease_expired_after_dispatch"
+            if active_hold_jobs and job_id not in active_hold_jobs:
+                continue
+            if hold_lifecycle == WriterHoldState.TERMINATION_CONFIRMED.value:
+                job = self._select_job(cursor, job_id, for_update=True)
+                self._settle_confirmed_termination_cursor(cursor, job, current, "lease_expired_after_confirmed_termination")
+                changed += 1
+                continue
+            if hold_lifecycle == WriterHoldState.CLEARED.value:
+                cursor.execute("UPDATE xb_member_gateway.leases SET active=FALSE WHERE job_id=%s AND active=TRUE", (job_id,))
+                changed += 1
+                continue
+            if fence_id is not None or state_value in {JobState.WRITING.value, JobState.READBACK.value, JobState.WRITER_TERMINATION_UNCONFIRMED.value}:
+                job = self._select_job(cursor, job_id, for_update=True)
+                self._quarantine_hold_cursor(cursor, job, current, "lease_expired_after_dispatch")
+                cursor.execute("UPDATE xb_member_gateway.leases SET active=FALSE WHERE job_id=%s AND active=TRUE", (job_id,))
+                changed += 1
+                continue
             elif attempts >= max_attempts:
                 target,error = JobState.DEAD_LETTER,"lease_expired_attempt_limit"
             else:
@@ -1020,6 +1661,7 @@ class PostgresRepository:
         current = utc_now(now)
         with self._transaction() as connection:
             with connection.cursor() as cursor:
+                self._lock_writer_termination_gate(cursor)
                 return self._reclaim_expired_cursor(cursor, current)
 
     def claim_job(self, worker_id: str, *, lease_seconds: int = 600, now: datetime | None = None) -> JobRecord | None:
@@ -1028,8 +1670,10 @@ class PostgresRepository:
         current = utc_now(now)
         with self._transaction() as connection:
             with connection.cursor() as cursor:
+                self._lock_writer_termination_gate(cursor)
                 self._lock_kill_switch(cursor)
                 self._reclaim_expired_cursor(cursor, current)
+                self._assert_no_active_writer_hold_cursor(cursor)
                 cursor.execute(
                     "SELECT lease_id FROM xb_member_gateway.leases "
                     "WHERE active=TRUE AND expires_at>%s LIMIT 1 FOR UPDATE",
@@ -1054,6 +1698,7 @@ class PostgresRepository:
         expires = current + timedelta(seconds=lease_seconds)
         with self._transaction() as connection:
             with connection.cursor() as cursor:
+                self._lock_writer_termination_gate(cursor)
                 job = self._select_job(cursor,job_id,for_update=True)
                 if job.state_version != expected_state_version:
                     raise LeaseConflict("state_version_mismatch")
@@ -1087,6 +1732,8 @@ class PostgresRepository:
         current = utc_now(now)
         with self._transaction() as connection:
             with connection.cursor() as cursor:
+                self._lock_writer_termination_gate(cursor)
+                self._assert_no_active_writer_hold_cursor(cursor)
                 job = self._select_job(cursor,job_id,for_update=True)
                 self._require_lease(cursor,job,worker_id,current)
                 if job.dispatch_fenced or job.state not in {JobState.PRECHECKING,JobState.ALLOCATION_BOUND}:
@@ -1107,6 +1754,8 @@ class PostgresRepository:
         current = utc_now(now)
         with self._transaction() as connection:
             with connection.cursor() as cursor:
+                self._lock_writer_termination_gate(cursor)
+                self._assert_no_active_writer_hold_cursor(cursor)
                 job = self._select_job(cursor,job_id,for_update=True)
                 self._require_lease(cursor,job,worker_id,current)
                 if job.dispatch_fenced:
@@ -1134,6 +1783,8 @@ class PostgresRepository:
         current = utc_now(now)
         with self._transaction() as connection:
             with connection.cursor() as cursor:
+                self._lock_writer_termination_gate(cursor)
+                self._assert_no_active_writer_hold_cursor(cursor)
                 job = self._select_job(cursor,job_id,for_update=True)
                 self._require_lease(cursor,job,worker_id,current)
                 if job.state != JobState.ALLOCATION_BOUND or not job.allocation_member_no:
@@ -1166,6 +1817,8 @@ class PostgresRepository:
         current = utc_now(now)
         with self._transaction() as connection:
             with connection.cursor() as cursor:
+                self._lock_writer_termination_gate(cursor)
+                self._assert_no_active_writer_hold_cursor(cursor)
                 job = self._select_job(cursor,job_id,for_update=True)
                 self._require_lease(cursor,job,worker_id,current)
                 if operation != "member.create" or job.operation != operation:
@@ -1177,18 +1830,20 @@ class PostgresRepository:
                 fresh = self._fresh_recheck_cursor(cursor, job, worker_id, current)
                 if fresh is None:
                     raise RepositoryError("fresh_bound_member_no_recheck_required")
-                cursor.execute("SELECT intent_id,member_no,payload_hash,recorded_at FROM xb_member_gateway.write_intents WHERE job_id=%s FOR UPDATE", (job_id,))
+                cursor.execute("SELECT intent_id,member_no,payload_hash,recorded_at,recheck_id FROM xb_member_gateway.write_intents WHERE job_id=%s FOR UPDATE", (job_id,))
                 existing = cursor.fetchone()
                 if existing is not None:
                     if existing[1] != member_no or existing[2] != payload_hash_value:
                         raise SourceConflict("write_intent_payload_conflict")
+                    if existing[4] != fresh.recheck_id:
+                        cursor.execute("UPDATE xb_member_gateway.write_intents SET recheck_id=%s WHERE job_id=%s", (fresh.recheck_id, job_id))
                     if job.state == JobState.ALLOCATION_BOUND:
                         self._advance(cursor,job,JobState.WRITE_INTENT_RECORDED,current,{"write_intent_id":str(existing[0])})
                     return WriteIntentRecord(job_id,str(existing[0]),existing[1],existing[2],self._dt(existing[3]) or "",fresh.recheck_id)
                 if job.state != JobState.ALLOCATION_BOUND:
                     raise RepositoryError("write_intent_state_invalid")
                 intent_id = str(uuid.uuid4())
-                cursor.execute("INSERT INTO xb_member_gateway.write_intents(intent_id,job_id,operation,member_no,payload_hash,recorded_at) VALUES(%s,%s,%s,%s,%s,%s)", (intent_id,job_id,operation,member_no,payload_hash_value,current))
+                cursor.execute("INSERT INTO xb_member_gateway.write_intents(intent_id,job_id,operation,member_no,payload_hash,recorded_at,recheck_id) VALUES(%s,%s,%s,%s,%s,%s,%s)", (intent_id,job_id,operation,member_no,payload_hash_value,current,fresh.recheck_id))
                 self._advance(cursor,job,JobState.WRITE_INTENT_RECORDED,current,{"write_intent_id":intent_id})
                 return WriteIntentRecord(job_id,intent_id,member_no,payload_hash_value,timestamp(current),fresh.recheck_id)
 
@@ -1196,17 +1851,17 @@ class PostgresRepository:
         with self._transaction() as connection:
             with connection.cursor() as cursor:
                 self._select_job(cursor,job_id)
-                cursor.execute("SELECT intent_id,member_no,payload_hash,recorded_at FROM xb_member_gateway.write_intents WHERE job_id=%s", (job_id,))
+                cursor.execute("SELECT intent_id,member_no,payload_hash,recorded_at,recheck_id FROM xb_member_gateway.write_intents WHERE job_id=%s", (job_id,))
                 row = cursor.fetchone()
                 if row is None:
                     return None
-                latest = self._latest_recheck_cursor(cursor, self._select_job(cursor, job_id))
-                return WriteIntentRecord(job_id,str(row[0]),row[1],row[2],self._dt(row[3]) or "",latest.recheck_id if latest else None)
+                return WriteIntentRecord(job_id,str(row[0]),row[1],row[2],self._dt(row[3]) or "",row[4])
 
-    def record_dispatch_fence(self, job_id: str, member_no: str, operation: str, worker_id: str, *, now: datetime | None = None) -> DispatchFenceRecord:
+    def record_dispatch_fence(self, job_id: str, member_no: str, operation: str, worker_id: str, *, host_binding: str | None = None, now: datetime | None = None) -> DispatchFenceRecord:
         current = utc_now(now)
         with self._transaction() as connection:
             with connection.cursor() as cursor:
+                self._lock_writer_termination_gate(cursor)
                 self._lock_kill_switch(cursor)
                 job = self._select_job(cursor,job_id,for_update=True)
                 self._require_lease(cursor,job,worker_id,current)
@@ -1215,21 +1870,27 @@ class PostgresRepository:
                 if existing is not None:
                     if existing[1] != member_no or existing[2] != operation:
                         raise AllocationConflict("dispatch_fence_binding_invalid")
-                    latest = self._latest_recheck_cursor(cursor, job)
-                    return DispatchFenceRecord(job_id,public_fence_id(existing[0]),existing[1],existing[2],self._dt(existing[3]) or "",latest.recheck_id if latest else None)
+                    return self.get_dispatch_fence_cursor(cursor, job_id, job)  # type: ignore[return-value]
+                self._assert_no_active_writer_hold_cursor(cursor)
                 fresh = self._fresh_recheck_cursor(cursor, job, worker_id, current)
-                cursor.execute("SELECT member_no FROM xb_member_gateway.write_intents WHERE job_id=%s", (job_id,))
+                cursor.execute("SELECT member_no,recheck_id FROM xb_member_gateway.write_intents WHERE job_id=%s", (job_id,))
                 intent = cursor.fetchone()
                 if (
                     intent is None or intent[0] != member_no or operation != "member.create"
                     or job.state != JobState.WRITE_INTENT_RECORDED or job.save_invocation_count != 0
-                    or fresh is None
+                    or fresh is None or intent[1] != fresh.recheck_id
                 ):
                     raise RepositoryError("write_intent_required")
                 fence_id = new_fence_id()
                 cursor.execute("INSERT INTO xb_member_gateway.dispatch_fences(fence_id,job_id,operation,member_no,created_at,save_invocation_count) VALUES(%s,%s,%s,%s,%s,0)", (internal_fence_id(fence_id),job_id,operation,member_no,current))
                 self._advance(cursor,job,JobState.WRITING,current,{"dispatch_fence_id":fence_id})
-                return DispatchFenceRecord(job_id,fence_id,member_no,operation,timestamp(current),fresh.recheck_id)
+                resolved_host = host_binding or f"host-{worker_id}"
+                if not re.fullmatch(r"host-[A-Za-z0-9._:-]{1,120}", resolved_host):
+                    raise WriterTerminationConflict("worker_host_binding_invalid")
+                execution_id = f"exec-{uuid.uuid4().hex}"
+                cursor.execute("INSERT INTO xb_member_gateway.writer_execution_holds(hold_id,job_id,fence_id,attempt_count,worker_session,host_binding,execution_id,member_no,lifecycle,state_version,created_at,updated_at) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,'PENDING',0,%s,%s)", (str(uuid.uuid4()),job_id,internal_fence_id(fence_id),job.attempt,worker_id,resolved_host,execution_id,member_no,current,current))
+                self._bump_writer_termination_gate(cursor)
+                return DispatchFenceRecord(job_id,fence_id,member_no,operation,timestamp(current),fresh.recheck_id,execution_id)
 
     def get_dispatch_fence(self, job_id: str) -> DispatchFenceRecord | None:
         with self._transaction() as connection:
@@ -1240,13 +1901,22 @@ class PostgresRepository:
                 if row is None:
                     return None
                 latest = self._latest_recheck_cursor(cursor, self._select_job(cursor, job_id))
-                return DispatchFenceRecord(job_id,public_fence_id(row[0]),row[1],row[2],self._dt(row[3]) or "",latest.recheck_id if latest else None)
+                cursor.execute("SELECT execution_id FROM xb_member_gateway.writer_execution_holds WHERE job_id=%s", (job_id,))
+                execution = cursor.fetchone()
+                return DispatchFenceRecord(job_id,public_fence_id(row[0]),row[1],row[2],self._dt(row[3]) or "",latest.recheck_id if latest else None,execution[0] if execution else None)
 
     def open_reconciliation_case(self, job_id: str, member_no: str, *, now: datetime | None = None) -> ReconciliationCaseRecord:
         current = utc_now(now)
         with self._transaction() as connection:
             with connection.cursor() as cursor:
+                self._lock_writer_termination_gate(cursor)
                 job = self._select_job(cursor, job_id, for_update=True)
+                hold = self._select_writer_hold(cursor, job_id, for_update=True)
+                cursor.execute("SELECT 1 FROM xb_member_gateway.writer_execution_holds WHERE lifecycle <> 'CLEARED' LIMIT 1 FOR UPDATE")
+                if cursor.fetchone() is not None:
+                    raise WriterTerminationConflict("writer_termination_quarantine_active")
+                if hold is None or hold.state != WriterHoldState.CLEARED or hold.termination_confirmed_at is None:
+                    raise WriterTerminationConflict("writer_termination_proof_required")
                 if job.state != JobState.WRITE_OUTCOME_UNCERTAIN:
                     raise RepositoryError("reconciliation_requires_uncertain_state")
                 cursor.execute("SELECT member_no FROM xb_member_gateway.member_allocations WHERE job_id=%s FOR UPDATE", (job_id,))
@@ -1276,6 +1946,7 @@ class PostgresRepository:
         current = utc_now(now)
         with self._transaction() as connection:
             with connection.cursor() as cursor:
+                self._lock_writer_termination_gate(cursor)
                 cursor.execute("SELECT job_id,member_no,case_state FROM xb_member_gateway.reconciliation_cases WHERE case_id=%s", (case_id,))
                 case = cursor.fetchone()
                 if case is None:
@@ -1287,6 +1958,12 @@ class PostgresRepository:
                     raise RepositoryError("reconciliation_case_required")
                 if case[2] != ReconciliationCaseState.OPEN.value:
                     raise RepositoryError("reconciliation_case_not_open")
+                hold = self._select_writer_hold(cursor, job.job_id, for_update=True)
+                cursor.execute("SELECT 1 FROM xb_member_gateway.writer_execution_holds WHERE lifecycle <> 'CLEARED' LIMIT 1 FOR UPDATE")
+                if cursor.fetchone() is not None:
+                    raise WriterTerminationConflict("writer_termination_quarantine_active")
+                if hold is None or hold.state != WriterHoldState.CLEARED or hold.termination_confirmed_at is None:
+                    raise WriterTerminationConflict("writer_termination_proof_required")
                 if job.state != JobState.WRITE_OUTCOME_UNCERTAIN:
                     raise RepositoryError("reconciliation_requires_uncertain_state")
                 cursor.execute("SELECT expires_at FROM xb_member_gateway.leases WHERE job_id=%s AND active=TRUE FOR UPDATE", (job.job_id,))
@@ -1339,6 +2016,7 @@ class PostgresRepository:
             raise ResultConflict("save_invocation_count_must_be_one")
         with self._transaction() as connection:
             with connection.cursor() as cursor:
+                self._lock_writer_termination_gate(cursor)
                 job = self._select_job(cursor,result.job_id,for_update=True)
                 cursor.execute("SELECT fence_id,member_no FROM xb_member_gateway.dispatch_fences WHERE job_id=%s FOR UPDATE", (result.job_id,))
                 fence = cursor.fetchone()
@@ -1358,6 +2036,11 @@ class PostgresRepository:
                         cursor.execute("INSERT INTO xb_member_gateway.result_conflicts(job_id,expected_hash,observed_hash) VALUES(%s,%s,%s)", (result.job_id,existing[0],result.result_hash))
                         raise ResultConflict("result_payload_conflict")
                     reconciliation_projection = True
+                hold = self._select_writer_hold(cursor, result.job_id, for_update=True)
+                if require_lease and (hold is None or hold.state != WriterHoldState.TERMINATION_CONFIRMED):
+                    raise WriterTerminationConflict("writer_termination_proof_required")
+                if not require_lease and (hold is None or hold.state != WriterHoldState.CLEARED or hold.termination_confirmed_at is None):
+                    raise WriterTerminationConflict("writer_termination_proof_required")
                 if require_lease:
                     if not worker_id:
                         raise LeaseConflict("worker_identity_required")
@@ -1389,6 +2072,8 @@ class PostgresRepository:
                 if require_lease:
                     cursor.execute("UPDATE xb_member_gateway.leases SET active=FALSE WHERE job_id=%s AND active=TRUE", (result.job_id,))
                     cursor.execute("UPDATE xb_member_gateway.jobs SET lease_owner=NULL,lease_expires_at=NULL,updated_at=%s WHERE job_id=%s", (current,result.job_id))
+                    cursor.execute("UPDATE xb_member_gateway.writer_execution_holds SET lifecycle='CLEARED',state_version=state_version+1,cleared_at=%s,updated_at=%s WHERE job_id=%s AND lifecycle='TERMINATION_CONFIRMED'", (current, current, result.job_id))
+                    self._bump_writer_termination_gate(cursor)
                 return result, False
 
     def get_result(self, job_id: str) -> ResultRecord | None:
@@ -1403,9 +2088,27 @@ class PostgresRepository:
         current = utc_now(now)
         with self._transaction() as connection:
             with connection.cursor() as cursor:
+                self._lock_writer_termination_gate(cursor)
                 job = self._select_job(cursor,job_id,for_update=True)
                 if require_lease:
                     if worker_id is None:
                         raise LeaseConflict("worker_identity_required")
                     self._require_lease(cursor,job,worker_id,current)
-                return self._advance(cursor,job,JobState(target),current,{"last_error_code":error_code} if error_code else None)
+                desired = JobState(target)
+                if job.dispatch_fenced and desired == JobState.WRITER_TERMINATION_UNCONFIRMED:
+                    self._quarantine_hold_cursor(cursor, job, current, error_code or "writer_termination_unconfirmed")
+                    return job
+                if job.dispatch_fenced and desired == JobState.WRITE_OUTCOME_UNCERTAIN:
+                    hold = self._select_writer_hold(cursor, job.job_id, for_update=True)
+                    if hold is None or not hold.termination_confirmed:
+                        self._quarantine_hold_cursor(cursor, job, current, error_code or "writer_termination_unconfirmed")
+                        return job
+                    self._settle_confirmed_termination_cursor(cursor, job, current, error_code or "writer_termination_unconfirmed")
+                    return job
+                if job.dispatch_fenced and desired in {
+                    JobState.CREATED_VERIFIED,
+                    JobState.CONFIRMED_NOT_CREATED,
+                    JobState.CREATED_READBACK_MISMATCH,
+                }:
+                    raise WriterTerminationConflict("writer_termination_proof_required")
+                return self._advance(cursor,job,desired,current,{"last_error_code":error_code} if error_code else None)

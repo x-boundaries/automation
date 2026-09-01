@@ -61,6 +61,10 @@ class ApiBoundaryTests(unittest.TestCase):
             "worker.allocation",
             "worker.write_intent",
             "worker.dispatch",
+            "worker.writer_register",
+            "worker.writer_termination",
+            "worker.writer_quarantine",
+            "worker.writer_termination_recovery",
             "worker.result",
             "worker.reconcile",
             "job.read",
@@ -190,9 +194,40 @@ class ApiBoundaryTests(unittest.TestCase):
         fence = self.call(
             "POST",
             f"/v1/jobs/{job_id}/dispatch-fence",
-            {"operation": "member.create", "member_no": member_no},
+            {"operation": "member.create", "member_no": member_no, "host_binding": "host-api"},
         )
         self.assertEqual(fence.status, 200)
+        registered = self.call(
+            "POST",
+            f"/v1/jobs/{job_id}/writer/register",
+            {
+                "fence_id": fence.body["dispatch_fence_id"],
+                "attempt": job["attempt"],
+                "execution_id": fence.body["execution_id"],
+                "host_binding": "host-api",
+                "pid": 4321,
+                "process_start_time": "2026-08-30T01:00:01Z",
+            },
+        )
+        self.assertEqual(registered.status, 200)
+        self.assertEqual(registered.body["lifecycle"], "REGISTERED")
+        terminated = self.call(
+            "POST",
+            f"/v1/jobs/{job_id}/writer/termination",
+            {
+                "fence_id": fence.body["dispatch_fence_id"],
+                "attempt": job["attempt"],
+                "execution_id": fence.body["execution_id"],
+                "host_binding": "host-api",
+                "pid": 4321,
+                "process_start_time": "2026-08-30T01:00:01Z",
+                "evidence_type": "process_exit",
+                "evidence_reference": "evidence-api",
+                "exit_code": 0,
+            },
+        )
+        self.assertEqual(terminated.status, 200)
+        self.assertTrue(terminated.body["termination_confirmed"])
         result = self.call(
             "POST",
             f"/v1/jobs/{job_id}/result",
@@ -212,6 +247,7 @@ class ApiBoundaryTests(unittest.TestCase):
         self.assertEqual(result.status, 200)
         status = self.call("GET", f"/v1/jobs/{job_id}")
         self.assertEqual(status.status, 200)
+        self.assertEqual(status.body["schema_version"], "xb.member.gateway.job.v2")
         self.assertEqual(status.body["state"], "CREATED_VERIFIED")
         self.assertNotIn("member_payload", status.body)
         self.assertNotIn("response_id", status.body)
