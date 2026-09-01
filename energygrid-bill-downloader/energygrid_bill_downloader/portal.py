@@ -59,6 +59,86 @@ PORTAL_RECOVERY_ATTEMPTS_MS = (
 # never a settle or a retry budget.
 LOGIN_KEY_ENTRY_DELAY_MS = 25
 
+# ---- bounded login diagnostic vocabulary ---- #
+#
+# DL-XB-141-RUNTIME-005-SOURCE-DURABILITY-A1. The diagnostic observes a fixed
+# public-safe witness set and nothing else: no page text, HTML, DOM or
+# accessibility-tree dump, no attribute outside these observations, no
+# screenshot, trace, storage or network capture, and no URL. Every witness is a
+# count, a boolean, or null when it could not be read; null is never evidence.
+
+# The Flutter host and render surfaces. The first two are the semantics
+# surface; the rest are the non-semantics render shell. Both halves together
+# are the allowlisted shell/render witness set.
+DIAGNOSTIC_SEMANTICS_HOST_TAGS = ("flt-semantics-host", "flt-semantics")
+DIAGNOSTIC_RENDER_SHELL_TAGS = (
+    "flt-glass-pane",
+    "flt-text-editing-host",
+    "flt-scene-host",
+    "canvas",
+)
+DIAGNOSTIC_HOST_TAGS = DIAGNOSTIC_SEMANTICS_HOST_TAGS + DIAGNOSTIC_RENDER_SHELL_TAGS
+
+# Every known post-submit application or public control. A shell-only
+# classification requires all of them absent BY COUNT, so one counted control -
+# including the public `Enable accessibility` gate - blocks it.
+DIAGNOSTIC_CONTROL_WITNESSES = (
+    "billing_manager",
+    "username",
+    "password",
+    "login",
+    "enable_accessibility",
+)
+
+BILLING_MANAGER_VISIBLE = "BILLING_MANAGER_VISIBLE"
+VISIBLE_ALERT = "VISIBLE_ALERT"
+LOGIN_ROUTE_PERSISTED_OR_RETURNED = "LOGIN_ROUTE_PERSISTED_OR_RETURNED"
+SEMANTICS_HOST_PRESENT_WITHOUT_APP_CONTROLS = "SEMANTICS_HOST_PRESENT_WITHOUT_APP_CONTROLS"
+FLUTTER_RENDER_SHELL_PRESENT_SEMANTICS_HOST_ABSENT = (
+    "FLUTTER_RENDER_SHELL_PRESENT_SEMANTICS_HOST_ABSENT"
+)
+FLUTTER_SHELL_DISAPPEARED_AFTER_SUBMIT = "FLUTTER_SHELL_DISAPPEARED_AFTER_SUBMIT"
+
+# Priority order. The first satisfied classification wins; anything
+# contradictory, ambiguous or insufficient yields no classification at all.
+LOGIN_DIAGNOSTIC_CLASSIFICATIONS = (
+    BILLING_MANAGER_VISIBLE,
+    VISIBLE_ALERT,
+    LOGIN_ROUTE_PERSISTED_OR_RETURNED,
+    SEMANTICS_HOST_PRESENT_WITHOUT_APP_CONTROLS,
+    FLUTTER_RENDER_SHELL_PRESENT_SEMANTICS_HOST_ABSENT,
+    FLUTTER_SHELL_DISAPPEARED_AFTER_SUBMIT,
+)
+
+# The one-shot submit boundary, reported rather than inferred.
+SUBMIT_DISPATCHED = "DISPATCHED"
+SUBMIT_DISPATCH_UNCERTAIN = "DISPATCH_UNCERTAIN"
+SUBMIT_NOT_DISPATCHED = "NOT_DISPATCHED"
+SUBMIT_OUTCOMES = (SUBMIT_DISPATCHED, SUBMIT_DISPATCH_UNCERTAIN, SUBMIT_NOT_DISPATCHED)
+
+
+def unobserved_login_witnesses(include_url: bool = False) -> dict[str, Any]:
+    """Return the witness shape with nothing observed.
+
+    The document shape never varies with what happened, so a failure before any
+    observation still reports the same closed keys with null values rather than
+    a different, shorter object.
+    """
+
+    observation: dict[str, Any] = {
+        "hosts": {tag: None for tag in DIAGNOSTIC_HOST_TAGS},
+        "semantics_placeholder": {"count": None, "present": None},
+        "billing_manager": {"count": None, "visible": None},
+        "username": {"count": None, "visible": None},
+        "password": {"count": None, "visible": None},
+        "login": {"count": None, "visible": None, "actionable": None},
+        "enable_accessibility": {"count": None, "visible": None, "actionable": None},
+        "visible_alert": None,
+    }
+    if include_url:
+        observation["url_changed"] = None
+    return observation
+
 # What a checkpoint observed. Only READY ends a recovery successfully; the rest
 # are transient inside the window and name the fail-closed message once the
 # deadline passes. UNRESOLVED is the exception: a locator that cannot be
@@ -104,6 +184,41 @@ class _PortalNotSettled(Exception):
 class BillRef:
     filename: str
     page_url: str
+
+
+@dataclass
+class _LoginProgress:
+    """How far one canonical login sequence got.
+
+    `stage_failure` names the step that is about to run, so a generic failure
+    reports which one failed instead of one message for the whole sequence. It
+    is a fixed internal marker: never a selector, URL, credential, account
+    identity, or anything read back from the page.
+
+    `submit_dispatched` is flipped at the explicit one-shot boundary - the real
+    submit invocation - and never by anything that only proved readiness.
+    """
+
+    stage_failure: str = "portal navigation did not complete"
+    submit_dispatched: bool = False
+
+
+@dataclass(frozen=True)
+class LoginDiagnosticResult:
+    """The bounded observation of one login attempt.
+
+    `failure` is the caller's classification key only: the CLI maps it to a
+    bounded support reference and drops it, exactly as it does for a run. It is
+    never part of the emitted document, so no exception text can reach an
+    output surface. It is set only when the submit was never dispatched.
+    """
+
+    classification: str | None
+    submit_dispatched: bool
+    submit_outcome: str
+    pre_submit: dict[str, Any]
+    post_submit: dict[str, Any]
+    failure: Any = None
 
 
 class PlaywrightPortal:
@@ -316,44 +431,66 @@ class PlaywrightPortal:
     # ---- login ---- #
 
     def login(self) -> None:
-        username = os.environ.get("ENERGYGRID_USERNAME")
-        password = os.environ.get("ENERGYGRID_PASSWORD")
-        if not username or not password:
-            raise LoginError("runtime credentials are unavailable")
+        username, password = self._require_runtime_credentials()
         page = self._require_page()
-        # Names the step that is about to run, so the generic arm below reports
-        # which one failed instead of one message for the whole sequence. It is
-        # a fixed internal marker: never a selector, URL, credential, account
-        # identity, or anything read back from the page. The sequence itself is
-        # unchanged -- the Login entry is resolved and clicked in two statements
-        # rather than one so that a generic failure inside the semantics gate
-        # stays distinguishable from a failure to click what it returned.
-        stage_failure = "portal navigation did not complete"
+        progress = _LoginProgress()
         try:
-            page.goto(self.config.portal_url, wait_until="domcontentloaded")
-            stage_failure = "Flutter semantics activation dispatch did not complete"
-            login_entry = self._enter_public_semantics(page)
-            stage_failure = "post-activation Login control click did not complete"
-            login_entry.click()
-            stage_failure = "login username entry did not complete"
-            self._fill_login_field(page, "Username", username)
-            stage_failure = "login password entry did not complete"
-            self._fill_login_field(page, "Password", password)
+            self._enter_login_credentials(page, username, password, progress)
             # Readiness failures are proven before the normal submit call. Keep
             # this fallback pre-dispatch so an unexpected readiness exception
             # cannot be mistaken for an uncertain click outcome.
-            stage_failure = "login submit control could not be resolved"
-            self._submit_login(page)
-            stage_failure = "Billing Manager entry did not appear after login"
+            progress.stage_failure = "login submit control could not be resolved"
+            self._submit_login(page, progress)
+            progress.stage_failure = "Billing Manager entry did not appear after login"
             self._await_billing_manager(page)
         except LayoutChangedError:
             # A proven pre-auth contract failure must not be reclassified as a
             # credential rejection just because the page also renders an alert.
             raise
         except Exception as exc:
-            if self._visible(page, page.get_by_role("alert")):
-                raise LoginError("portal rejected the login") from exc
-            raise LayoutChangedError(stage_failure) from exc
+            raise self._classify_login_stage_failure(page, progress) from exc
+
+    @staticmethod
+    def _require_runtime_credentials() -> tuple[str, str]:
+        """Return the injected credential pair, or fail closed without one."""
+
+        username = os.environ.get("ENERGYGRID_USERNAME")
+        password = os.environ.get("ENERGYGRID_PASSWORD")
+        if not username or not password:
+            raise LoginError("runtime credentials are unavailable")
+        return username, password
+
+    def _enter_login_credentials(
+        self, page: Any, username: str, password: str, progress: _LoginProgress
+    ) -> None:
+        """Run the canonical pre-submit login sequence, up to but not including submit.
+
+        This is the ONE place the pre-submit sequence exists. The bounded login
+        diagnostic reuses it rather than carrying a second set of selectors or
+        credential-entry semantics, so there is no path on which the two could
+        drift apart. The sequence itself is unchanged -- the Login entry is
+        resolved and clicked in two statements rather than one so that a
+        generic failure inside the semantics gate stays distinguishable from a
+        failure to click what it returned.
+        """
+
+        progress.stage_failure = "portal navigation did not complete"
+        page.goto(self.config.portal_url, wait_until="domcontentloaded")
+        progress.stage_failure = "Flutter semantics activation dispatch did not complete"
+        login_entry = self._enter_public_semantics(page)
+        progress.stage_failure = "post-activation Login control click did not complete"
+        login_entry.click()
+        progress.stage_failure = "login username entry did not complete"
+        self._fill_login_field(page, "Username", username)
+        progress.stage_failure = "login password entry did not complete"
+        self._fill_login_field(page, "Password", password)
+
+    def _classify_login_stage_failure(self, page: Any, progress: _LoginProgress) -> Exception:
+        """Name the failed step, unless the page has settled on a rejection."""
+
+        if self._visible(page, page.get_by_role("alert")):
+            return LoginError("portal rejected the login")
+        return LayoutChangedError(progress.stage_failure)
 
     def _fill_login_field(self, page: Any, label: str, value: str) -> None:
         """Type one exact labelled credential field after proving it ready.
@@ -384,7 +521,7 @@ class PlaywrightPortal:
         field.click()
         field.press_sequentially(value, delay=LOGIN_KEY_ENTRY_DELAY_MS)
 
-    def _submit_login(self, page: Any) -> None:
+    def _submit_login(self, page: Any, progress: _LoginProgress) -> None:
         """Click the canonical Login control exactly once, after proving it ready.
 
         The selector never changes, and there is no alternate or fallback
@@ -411,7 +548,10 @@ class PlaywrightPortal:
 
         # This is the explicit dispatch boundary. Once normal click invocation
         # begins, an exception cannot prove whether the browser acted, so the
-        # outcome is uncertain and the call must never be retried.
+        # outcome is uncertain and the call must never be retried. The flag is
+        # raised before invocation starts, so an exception thrown by the call
+        # itself can never be read back as "never dispatched".
+        progress.submit_dispatched = True
         try:
             submit.click()
         except Exception as exc:
@@ -507,6 +647,262 @@ class PlaywrightPortal:
             # deadline is what turns persistence into a fail-closed.
             return False
         return True
+
+    # ---- bounded login diagnostic ---- #
+
+    def login_diagnostic(self) -> LoginDiagnosticResult:
+        """Observe one login attempt and stop, without entering the application.
+
+        This is the whole diagnostic operation. It reuses the canonical
+        pre-submit sequence and the one canonical submit, then performs a
+        bounded read-only observation and returns. It never reaches
+        `_await_billing_manager`, the Billing Manager click, EB Bill, tenant or
+        account selection, Search, inventory, pagination, download, publication,
+        archive, state, temp cleanup or reconciliation: none of them is called
+        from here or from anything this calls.
+        """
+
+        username, password = self._require_runtime_credentials()
+        page = self._require_page()
+        progress = _LoginProgress()
+        pre_submit = unobserved_login_witnesses()
+        entry_url: str | None = None
+        try:
+            self._enter_login_credentials(page, username, password, progress)
+            # Read-only, and placed between credential entry and submit
+            # readiness so a shell witness that was genuinely present before the
+            # submit can be told apart from one that was never established.
+            pre_submit = self._observe_login_witnesses(page, MAX_PORTAL_PROBE_TIMEOUT_MS)
+            entry_url = self._current_url(page)
+            progress.stage_failure = "login submit control could not be resolved"
+            self._submit_login(page, progress)
+        except LayoutChangedError as exc:
+            failure: Exception | None = exc
+        except Exception as exc:
+            failure = self._classify_login_stage_failure(page, progress)
+            failure.__cause__ = exc
+        else:
+            failure = None
+
+        if not progress.submit_dispatched:
+            # Nothing was sent, so there is nothing to observe the effect of.
+            return LoginDiagnosticResult(
+                classification=None,
+                submit_dispatched=False,
+                submit_outcome=SUBMIT_NOT_DISPATCHED,
+                pre_submit=pre_submit,
+                post_submit=unobserved_login_witnesses(include_url=True),
+                failure=failure,
+            )
+
+        # A dispatch whose outcome is uncertain is still observed, because the
+        # page is the only remaining evidence. It is never promoted to a proven
+        # successful dispatch by anything the observation finds.
+        outcome = SUBMIT_DISPATCHED if failure is None else SUBMIT_DISPATCH_UNCERTAIN
+        post_submit, classification = self._observe_after_submit(page, pre_submit, entry_url)
+        return LoginDiagnosticResult(
+            classification=classification,
+            submit_dispatched=True,
+            submit_outcome=outcome,
+            pre_submit=pre_submit,
+            post_submit=post_submit,
+            failure=None,
+        )
+
+    def _observe_after_submit(
+        self, page: Any, pre_submit: dict[str, Any], entry_url: str | None
+    ) -> tuple[dict[str, Any], str | None]:
+        """Watch the post-submit surface on the existing bounded ladder.
+
+        The same monotonic deadline every other portal recovery uses bounds this
+        one: no new polling loop, no larger timeout, and fresh locators at every
+        checkpoint. A settled classification ends the window early; a window
+        that never settles fails closed.
+        """
+
+        state: dict[str, Any] = {
+            "observation": unobserved_login_witnesses(include_url=True),
+            "shell_absent_throughout": True,
+            "controls_absent_throughout": True,
+        }
+
+        def probe(remaining_ms: int) -> tuple[str, Any]:
+            observation = self._observe_login_witnesses(page, remaining_ms, entry_url=entry_url)
+            state["observation"] = observation
+            if not self._shell_witnesses_absent(observation):
+                state["shell_absent_throughout"] = False
+            if not self._app_controls_absent(observation):
+                state["controls_absent_throughout"] = False
+            classification = self._classify_post_submit(observation)
+            if classification is None:
+                return _PORTAL_ABSENT, None
+            return _PORTAL_READY, classification
+
+        try:
+            classification = self._recover(
+                page,
+                probe,
+                "login diagnostic observation",
+                messages=_uniform_messages("login diagnostic observation did not settle"),
+                classified=False,
+            )
+        except _PortalNotSettled:
+            # Disappearance is only ever concluded from a shell that was
+            # positively there beforehand and never came back while the whole
+            # window ran. A shell that was never established cannot disappear.
+            classification = None
+            if (
+                self._any_shell_witness(pre_submit)
+                and state["shell_absent_throughout"]
+                and state["controls_absent_throughout"]
+            ):
+                classification = FLUTTER_SHELL_DISAPPEARED_AFTER_SUBMIT
+        return state["observation"], classification
+
+    def _classify_post_submit(self, observation: dict[str, Any]) -> str | None:
+        """Return the first satisfied classification, or none at all.
+
+        Every arm needs positive evidence. A locator that could not be read is
+        null, and null never satisfies either a positive or an absence test, so
+        an unreadable surface fails closed rather than classifying.
+        """
+
+        billing_manager = observation["billing_manager"]
+        if billing_manager["count"] == 1 and billing_manager["visible"] is True:
+            return BILLING_MANAGER_VISIBLE
+        if observation["visible_alert"] is True:
+            return VISIBLE_ALERT
+        # A counted but hidden login control is ambiguous evidence, not a route
+        # witness: at least one of the three must be positively visible.
+        if any(
+            self._positively_visible(observation[name])
+            for name in ("username", "password", "login")
+        ):
+            return LOGIN_ROUTE_PERSISTED_OR_RETURNED
+        if not self._app_controls_absent(observation):
+            return None
+        hosts = observation["hosts"]
+        if any(hosts[tag] is None for tag in DIAGNOSTIC_HOST_TAGS):
+            return None
+        if any(hosts[tag] > 0 for tag in DIAGNOSTIC_SEMANTICS_HOST_TAGS):
+            return SEMANTICS_HOST_PRESENT_WITHOUT_APP_CONTROLS
+        if any(hosts[tag] > 0 for tag in DIAGNOSTIC_RENDER_SHELL_TAGS):
+            return FLUTTER_RENDER_SHELL_PRESENT_SEMANTICS_HOST_ABSENT
+        return None
+
+    @staticmethod
+    def _positively_visible(witness: dict[str, Any]) -> bool:
+        return bool(witness["count"]) and witness["visible"] is True
+
+    @staticmethod
+    def _app_controls_absent(observation: dict[str, Any]) -> bool:
+        """Report every known post-submit control absent by an exact zero count."""
+
+        return all(observation[name]["count"] == 0 for name in DIAGNOSTIC_CONTROL_WITNESSES)
+
+    @staticmethod
+    def _shell_witnesses_absent(observation: dict[str, Any]) -> bool:
+        return all(observation["hosts"][tag] == 0 for tag in DIAGNOSTIC_HOST_TAGS)
+
+    @staticmethod
+    def _any_shell_witness(observation: dict[str, Any]) -> bool:
+        return any((observation["hosts"][tag] or 0) > 0 for tag in DIAGNOSTIC_HOST_TAGS)
+
+    def _observe_login_witnesses(
+        self, page: Any, remaining_ms: int, entry_url: str | None = None
+    ) -> dict[str, Any]:
+        """Read the fixed public-safe witness set from fresh locators.
+
+        Nothing outside this set is read, and nothing read here is text: the
+        result carries counts, booleans and nulls only.
+        """
+
+        observation: dict[str, Any] = {
+            "hosts": {
+                tag: self._witness_count(page, tag) for tag in DIAGNOSTIC_HOST_TAGS
+            },
+            "semantics_placeholder": self._presence_witness(
+                page, "flt-semantics-placeholder"
+            ),
+            "billing_manager": self._visibility_witness(
+                lambda: page.get_by_role("link", name="Billing Manager", exact=True)
+            ),
+            "username": self._visibility_witness(
+                lambda: page.get_by_label("Username", exact=True)
+            ),
+            "password": self._visibility_witness(
+                lambda: page.get_by_label("Password", exact=True)
+            ),
+            "login": self._actionable_witness(
+                lambda: page.get_by_role("button", name="Login", exact=True), remaining_ms
+            ),
+            "enable_accessibility": self._actionable_witness(
+                lambda: page.get_by_role("button", name="Enable accessibility", exact=True),
+                remaining_ms,
+            ),
+            "visible_alert": self._visible(page, page.get_by_role("alert")),
+        }
+        if entry_url is not None:
+            observation["url_changed"] = self._url_changed(page, entry_url)
+        return observation
+
+    @staticmethod
+    def _witness_count(page: Any, selector: str) -> int | None:
+        try:
+            return int(page.locator(selector).count())
+        except Exception:
+            return None
+
+    def _presence_witness(self, page: Any, selector: str) -> dict[str, Any]:
+        count = self._witness_count(page, selector)
+        return {"count": count, "present": None if count is None else count > 0}
+
+    @staticmethod
+    def _visibility_witness(factory: Callable[[], Any]) -> dict[str, Any]:
+        try:
+            count = int(factory().count())
+        except Exception:
+            return {"count": None, "visible": None}
+        if count == 0:
+            return {"count": 0, "visible": False}
+        try:
+            visible: bool | None = bool(factory().is_visible())
+        except Exception:
+            visible = None
+        return {"count": count, "visible": visible}
+
+    def _actionable_witness(
+        self, factory: Callable[[], Any], remaining_ms: int
+    ) -> dict[str, Any]:
+        witness = self._visibility_witness(factory)
+        actionable: bool | None = None
+        if witness["visible"] is False:
+            actionable = False
+        elif witness["visible"] is True:
+            try:
+                actionable = bool(self._probe_actionable(factory(), remaining_ms))
+            except Exception:
+                actionable = None
+        return {
+            "count": witness["count"],
+            "visible": witness["visible"],
+            "actionable": actionable,
+        }
+
+    @staticmethod
+    def _current_url(page: Any) -> str | None:
+        """Hold the entry address internally so only a boolean is ever reported."""
+
+        try:
+            return str(page.url)
+        except Exception:
+            return None
+
+    def _url_changed(self, page: Any, entry_url: str | None) -> bool | None:
+        current = self._current_url(page)
+        if entry_url is None or current is None:
+            return None
+        return current != entry_url
 
     # ---- inventory ---- #
 

@@ -69,10 +69,25 @@ own directory.
 | `-BrowserCachePath` | yes | Absolute path to the approved private Playwright browser cache |
 | `-ExpectedBranch` | yes | Branch the deployed checkout must be on, or the literal `ANY_BRANCH` |
 | `-AuthorisedLauncherRootWriteSid` | yes | One or more exact security identifier strings naming the exhaustive set of trustees permitted to hold write-capable access on the launcher root |
-| `-Command` | no | `run` (default) or `list` |
+| `-Command` | no | `run` (default), `list`, or `login-diagnostic` |
 | `-LogRoot` | no | Private diagnostics root for the launcher's own terminal event |
 | `-ValidateOnly` | no | Switch; see below |
 | `-RunId` | no | Correlation identifier for the terminal event only |
+
+`-Command` is a closed allowlist of three fixed operation names and is the only thing that
+varies in the invocation. The child is always started as
+`<PythonExe> -m energygrid_bill_downloader <Command> --config <ConfigPath>` -- exactly five
+arguments, in that order, for every admitted command. Nothing is appended conditionally, and
+no caller-supplied script, module, path, portal address, credential value, or arbitrary
+child argument can reach it.
+
+`login-diagnostic` runs the bounded login diagnostic: the canonical login sequence up to and
+including exactly one real Login submit, then a bounded read-only observation of fixed
+public-safe counts and booleans, then stop. It reaches no inventory, download, archive,
+state, or publication behaviour. There is still **no generic headed switch**: headed
+execution is an implicit and non-overridable property of that one fixed operation, it cannot
+be selected, suppressed, or applied to `run` or `list`, and no launcher parameter exposes
+it. `run` and `list` are unchanged.
 
 `-ExpectedBranch` is mandatory with an explicit `ANY_BRANCH` sentinel rather than optional,
 so branch binding is never disabled by omitting an argument.
@@ -152,8 +167,8 @@ approval for a mutating action.
 It creates, modifies, deletes, and renames nothing: no staging file, no backup file, no log
 file, no directory, no scheduler entry, and no environment change that outlives the process.
 It starts no child process other than the read-only interpreter version probe and the
-governed Git reads, and it never invokes `run` or `list`. It launches no browser, installs
-or updates no browser cache, and contacts no portal.
+governed Git reads, and it never invokes `run`, `list`, or `login-diagnostic`. It launches
+no browser, installs or updates no browser cache, and contacts no portal.
 
 It may import the private credential artefact in-process to prove viability, because an
 artefact that cannot be imported is exactly the failure an operator needs to find before
@@ -226,7 +241,9 @@ package.
 - No browser provisioning: it never installs, updates, repairs, or downloads into the
   browser cache. Provisioning is an operator action.
 - No credential creation, rotation, relocation, or inspection beyond the read-only import.
-- No portal contact and no headed run.
+- No portal contact and no headed run of its own. The launcher never opens a browser; a
+  headed browser exists only inside the application child started for the fixed
+  `login-diagnostic` command, and no launcher parameter can request one.
 - No access-control mutation. The runtime observes launcher-root security and fails closed;
   it never grants, revokes, or repairs a permission.
 - No broad fallback, silent compatibility path, synthetic-data fallback, fake success state,

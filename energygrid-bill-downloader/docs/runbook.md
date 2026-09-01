@@ -45,14 +45,31 @@ From the project directory:
 python -m energygrid_bill_downloader run --config <EXTERNAL_CONFIG_JSON>
 python -m energygrid_bill_downloader list --config <EXTERNAL_CONFIG_JSON>
 python -m energygrid_bill_downloader list --config <EXTERNAL_CONFIG_JSON> --headed
+python -m energygrid_bill_downloader login-diagnostic --config <EXTERNAL_CONFIG_JSON>
 ```
 
-The only supported command-specific options are `--headed`, private root
-overrides, `--timeout-seconds`, and `--max-attempts`. A normal `run` performs
-downloads and publication. `list` performs login and complete inventory but does
-not download; an unresolved bill therefore remains `ACTION_REQUIRED` rather
-than being reported as success. `NO_NEW_BILLS` means the full inventory
+For `run` and `list` the only supported command-specific options are `--headed`,
+private root overrides, `--timeout-seconds`, and `--max-attempts`. A normal `run`
+performs downloads and publication. `list` performs login and complete inventory
+but does not download; an unresolved bill therefore remains `ACTION_REQUIRED`
+rather than being reported as success. `NO_NEW_BILLS` means the full inventory
 reconciled with no new publication, including an empty portal inventory.
+
+`login-diagnostic` accepts `--config` and nothing else. It rejects `--headed`,
+every private root override, and every timeout or attempt override, because its
+headed mode and its bounds are fixed properties of the operation rather than
+choices. It runs the canonical login sequence up to and including exactly one
+real Login submit, observes a fixed allowlist of public-safe counts and booleans
+for at most a further 60 seconds, and stops. It reaches no Billing Manager click,
+EB Bill, account selection, Search, inventory, pagination, download, publication,
+archive, or state behaviour, and it creates no state, log, temp, or archive
+artefact. Its result is one JSON document with schema
+`energygrid.login_diagnostic.v1`, carrying `status`, `classification`,
+`submit_dispatched`, `submit_outcome`, the pre- and post-submit observations, and
+a bounded `support_ref` when the result is not complete. It exits `0` only when an
+authorised classification is positively established, `20` on any fail-closed or
+insufficient-evidence result, and `64` on a configuration, dependency, or argument
+contract failure; it never exits `10`.
 
 Exit statuses:
 
@@ -98,7 +115,10 @@ following sequence:
 2. Inject runtime credentials through the approved host mechanism.
 3. Run a headed `list` only, inspect the aggregate result, and confirm the login,
    Billing Manager, EB Bill, invoice-list, filename, download-button, and
-   pagination contracts against the live portal.
+   pagination contracts against the live portal. Where the login step itself is
+   what needs evidence, `login-diagnostic` is the narrower first move: it stops
+   at the submit and reports what the portal rendered, without entering the
+   application at all.
 4. Run a controlled `run` and inspect the resulting archive, state record, and
    aggregate logs. Confirm no existing file was overwritten.
 5. Re-run `run` to verify idempotency and then reconcile any remaining history

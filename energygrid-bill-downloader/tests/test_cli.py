@@ -3,15 +3,19 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
 from pathlib import Path
 import re
 import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 from energygrid_bill_downloader import cli
+from energygrid_bill_downloader import portal as portal_module
 from energygrid_bill_downloader.cli import build_parser, main
+from energygrid_bill_downloader.config import RuntimeConfig
 from energygrid_bill_downloader.errors import (
     ACTION_REQUIRED,
     DOWNLOAD_FAILED,
@@ -19,6 +23,8 @@ from energygrid_bill_downloader.errors import (
     NO_NEW_BILLS,
     PORTAL_LAYOUT_CHANGED,
     AppError,
+    ConfigError,
+    DependencyError,
     DownloadError,
     LayoutChangedError,
     LoginError,
@@ -655,6 +661,446 @@ class SupportReferenceContractTests(unittest.TestCase):
                 self.assertEqual(
                     cli.support_ref_for(LayoutChangedError(near_miss)), cli.UNCLASSIFIED_SUPPORT_REF
                 )
+
+
+# ---- DL-XB-141-RUNTIME-005-SOURCE-DURABILITY-A1: the bounded diagnostic command ---- #
+#
+# The diagnostic is a separate command with its own closed argument surface, its
+# own closed result document, and its own exit codes. These cases hold that it
+# cannot be widened by an argument, cannot create a filesystem artefact, and
+# cannot leak a private value.
+
+# The same bounded-reference shape SupportReferenceContractTests enforces.
+SUPPORT_REFERENCE_PATTERN = re.compile(r"\A[A-Z][A-Z0-9_]{0,63}\Z")
+
+DIAGNOSTIC_SENTINEL_USERNAME = "synthetic-diagnostic-user"
+DIAGNOSTIC_SENTINEL_PASSWORD = "synthetic-diagnostic-hunter2"
+
+
+def diagnostic_witnesses(**overrides):
+    """A pre- or post-submit observation in the shape the portal produces."""
+    observation = portal_module.unobserved_login_witnesses(
+        include_url=overrides.pop("include_url", False)
+    )
+    observation["hosts"] = {tag: 0 for tag in portal_module.DIAGNOSTIC_HOST_TAGS}
+    observation["semantics_placeholder"] = {"count": 0, "present": False}
+    for name in ("billing_manager", "username", "password"):
+        observation[name] = {"count": 0, "visible": False}
+    for name in ("login", "enable_accessibility"):
+        observation[name] = {"count": 0, "visible": False, "actionable": False}
+    observation["visible_alert"] = False
+    if "url_changed" in observation:
+        observation["url_changed"] = False
+    observation.update(overrides)
+    return observation
+
+
+def diagnostic_portal(
+    result=None,
+    error: BaseException | None = None,
+    recorder: list | None = None,
+):
+    """A portal class that records how it was constructed and returns a result.
+
+    No Playwright, no browser, no network and no credential: the diagnostic
+    contract under test is the CLI's, not the portal's.
+    """
+
+    class StubDiagnosticPortal:
+        def __init__(self, config, headed: bool = False) -> None:
+            self.config = config
+            if recorder is not None:
+                recorder.append(headed)
+
+        def __enter__(self) -> "StubDiagnosticPortal":
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        def login_diagnostic(self):
+            if error is not None:
+                raise error
+            return result
+
+        def login(self) -> None:
+            raise AssertionError("the diagnostic must never run the login path")
+
+        def inventory(self, safety_ceiling: int) -> list:
+            raise AssertionError("the diagnostic must never reach inventory")
+
+    return StubDiagnosticPortal
+
+
+def complete_result(classification="SEMANTICS_HOST_PRESENT_WITHOUT_APP_CONTROLS"):
+    return portal_module.LoginDiagnosticResult(
+        classification=classification,
+        submit_dispatched=True,
+        submit_outcome=portal_module.SUBMIT_DISPATCHED,
+        pre_submit=diagnostic_witnesses(),
+        post_submit=diagnostic_witnesses(include_url=True),
+        failure=None,
+    )
+
+
+class LoginDiagnosticCliTests(unittest.TestCase):
+    """The command surface, the closed document, and the exit-code mapping."""
+
+    # ---- argument surface ---- #
+
+    def test_the_diagnostic_accepts_only_a_config_argument(self) -> None:
+        args = build_parser().parse_args(["login-diagnostic", "--config", "C:/private/eg.json"])
+        self.assertEqual(args.command, "login-diagnostic")
+        self.assertEqual(vars(args).keys(), {"command", "config"})
+
+    def test_the_diagnostic_rejects_every_other_argument(self) -> None:
+        for extra in (
+            ["--headed"],
+            ["--archive-root", "C:/private/archive"],
+            ["--state-path", "C:/private/state.sqlite3"],
+            ["--temp-root", "C:/private/temp"],
+            ["--log-root", "C:/private/logs"],
+            ["--timeout-seconds", "9"],
+            ["--max-attempts", "3"],
+            ["--portal-url", "http://example.invalid"],
+            ["extra-positional"],
+        ):
+            with self.subTest(extra=extra):
+                with self.assertRaises(ConfigError):
+                    build_parser().parse_args(
+                        ["login-diagnostic", "--config", "C:/private/eg.json", *extra]
+                    )
+
+    def test_the_diagnostic_requires_its_config_argument(self) -> None:
+        with self.assertRaises(ConfigError):
+            build_parser().parse_args(["login-diagnostic"])
+
+    def test_run_and_list_keep_their_existing_option_surface(self) -> None:
+        """The new command must not have narrowed the two established ones."""
+        for command in ("run", "list"):
+            with self.subTest(command=command):
+                args = build_parser().parse_args(
+                    [command, "--config", "C:/private/eg.json", "--headed"]
+                )
+                self.assertTrue(args.headed)
+
+    def test_the_command_allowlist_is_exactly_the_three_admitted_operations(self) -> None:
+        actions = [
+            action
+            for action in build_parser()._subparsers._group_actions
+            if hasattr(action, "choices")
+        ]
+        self.assertEqual(list(actions[0].choices), ["run", "list", "login-diagnostic"])
+
+    # ---- the run itself ---- #
+
+    def write_diagnostic_config(self, root: Path) -> Path:
+        (root / "archive").mkdir()
+        config_path = root / "config.json"
+        config_path.write_text(
+            json.dumps(
+                {
+                    # Never contacted: every case replaces the portal class.
+                    "portal_url": "http://127.0.0.1:1/synthetic",
+                    "account_identity": "SYNTHETIC-INTENDED-ACCOUNT",
+                    "archive_root": str(root / "archive"),
+                    "state_path": str(root / "state" / "state.sqlite3"),
+                    "temp_root": str(root / "temp"),
+                    "log_root": str(root / "logs"),
+                    "timeout_seconds": 5,
+                    "max_attempts": 2,
+                    "inventory_safety_ceiling": 50,
+                }
+            ),
+            encoding="utf-8",
+        )
+        return config_path
+
+    def run_diagnostic(self, root: Path, portal_cls, config_path: Path | None = None):
+        if config_path is None:
+            config_path = self.write_diagnostic_config(root)
+        original = cli.PlaywrightPortal
+        cli.PlaywrightPortal = portal_cls
+        out = io.StringIO()
+        err = io.StringIO()
+        environment = {
+            "ENERGYGRID_USERNAME": DIAGNOSTIC_SENTINEL_USERNAME,
+            "ENERGYGRID_PASSWORD": DIAGNOSTIC_SENTINEL_PASSWORD,
+        }
+        previous = {name: os.environ.get(name) for name in environment}
+        os.environ.update(environment)
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                exit_code = cli.main(["login-diagnostic", "--config", str(config_path)])
+        finally:
+            cli.PlaywrightPortal = original
+            for name, value in previous.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+        return exit_code, out.getvalue(), err.getvalue()
+
+    def test_the_portal_is_always_constructed_headed(self) -> None:
+        recorder: list = []
+        with tempfile.TemporaryDirectory() as name:
+            exit_code, _out, _err = self.run_diagnostic(
+                Path(name), diagnostic_portal(complete_result(), recorder=recorder)
+            )
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(recorder, [True], "headed is a property, not a choice")
+
+    def test_the_diagnostic_creates_no_filesystem_artefact(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            config_path = self.write_diagnostic_config(root)
+            before = sorted(path.relative_to(root).as_posix() for path in root.rglob("*"))
+            self.run_diagnostic(root, diagnostic_portal(complete_result()), config_path)
+            after = sorted(path.relative_to(root).as_posix() for path in root.rglob("*"))
+        self.assertEqual(before, after, "no state, log, temp or archive artefact")
+        for absent in ("logs", "temp", "state"):
+            self.assertNotIn(absent, after)
+
+    def test_the_run_path_machinery_is_unreachable(self) -> None:
+        """Preflight, the logger, temp cleanup, the state store and reconcile never run."""
+
+        def explode(*_args, **_kwargs):
+            raise AssertionError("the diagnostic reached the run path")
+
+        with tempfile.TemporaryDirectory() as name:
+            with mock.patch.object(cli, "SafeLogger", explode), \
+                    mock.patch.object(cli, "StateStore", explode), \
+                    mock.patch.object(cli, "cleanup_stale_owned_temp", explode), \
+                    mock.patch.object(cli, "reconcile_inventory", explode), \
+                    mock.patch.object(RuntimeConfig, "preflight", explode):
+                exit_code, out, _err = self.run_diagnostic(
+                    Path(name), diagnostic_portal(complete_result())
+                )
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(json.loads(out)["status"], cli.DIAGNOSTIC_COMPLETE)
+
+    # ---- the document ---- #
+
+    def document(self, out: str) -> dict:
+        self.assertEqual(len(out.strip().splitlines()), 1, "exactly one document")
+        return json.loads(out)
+
+    def test_a_classified_run_is_complete_and_exits_zero(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            exit_code, out, _err = self.run_diagnostic(
+                Path(name), diagnostic_portal(complete_result())
+            )
+        document = self.document(out)
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(document["schema"], "energygrid.login_diagnostic.v1")
+        self.assertEqual(document["status"], "DIAGNOSTIC_COMPLETE")
+        self.assertEqual(
+            document["classification"], "SEMANTICS_HOST_PRESENT_WITHOUT_APP_CONTROLS"
+        )
+        self.assertIs(document["submit_dispatched"], True)
+        self.assertEqual(document["submit_outcome"], "DISPATCHED")
+        self.assertNotIn("support_ref", document, "a complete result carries no reference")
+        self.assertEqual(
+            set(document),
+            {
+                "schema",
+                "status",
+                "classification",
+                "submit_dispatched",
+                "submit_outcome",
+                "pre_submit",
+                "post_submit",
+            },
+        )
+
+    def test_every_accepted_classification_is_emitted_verbatim(self) -> None:
+        for classification in portal_module.LOGIN_DIAGNOSTIC_CLASSIFICATIONS:
+            with self.subTest(classification=classification):
+                with tempfile.TemporaryDirectory() as name:
+                    exit_code, out, _err = self.run_diagnostic(
+                        Path(name), diagnostic_portal(complete_result(classification))
+                    )
+                document = self.document(out)
+                self.assertEqual(exit_code, 0)
+                self.assertEqual(document["classification"], classification)
+                self.assertEqual(document["status"], "DIAGNOSTIC_COMPLETE")
+
+    def test_an_unclassified_run_fails_closed_with_its_own_reference(self) -> None:
+        unclassified = portal_module.LoginDiagnosticResult(
+            classification=None,
+            submit_dispatched=True,
+            submit_outcome=portal_module.SUBMIT_DISPATCH_UNCERTAIN,
+            pre_submit=diagnostic_witnesses(),
+            post_submit=diagnostic_witnesses(include_url=True),
+            failure=None,
+        )
+        with tempfile.TemporaryDirectory() as name:
+            exit_code, out, _err = self.run_diagnostic(
+                Path(name), diagnostic_portal(unclassified)
+            )
+        document = self.document(out)
+        self.assertEqual(exit_code, 20)
+        self.assertEqual(document["status"], ACTION_REQUIRED)
+        self.assertIsNone(document["classification"])
+        self.assertEqual(document["submit_outcome"], "DISPATCH_UNCERTAIN")
+        self.assertEqual(document["support_ref"], "EG_LOGIN_DIAGNOSTIC_UNCLASSIFIED")
+
+    def test_an_unauthorised_classification_is_never_emitted(self) -> None:
+        """The emitted vocabulary stays closed even against an unknown value."""
+        rogue = complete_result("SOME_FUTURE_CLASSIFICATION")
+        with tempfile.TemporaryDirectory() as name:
+            exit_code, out, _err = self.run_diagnostic(Path(name), diagnostic_portal(rogue))
+        document = self.document(out)
+        self.assertEqual(exit_code, 20)
+        self.assertIsNone(document["classification"])
+        self.assertNotIn("SOME_FUTURE_CLASSIFICATION", out)
+
+    def test_a_pre_dispatch_failure_reports_its_step_reference(self) -> None:
+        failed = portal_module.LoginDiagnosticResult(
+            classification=None,
+            submit_dispatched=False,
+            submit_outcome=portal_module.SUBMIT_NOT_DISPATCHED,
+            pre_submit=diagnostic_witnesses(),
+            post_submit=diagnostic_witnesses(include_url=True),
+            failure=LayoutChangedError("login submit control did not appear"),
+        )
+        with tempfile.TemporaryDirectory() as name:
+            exit_code, out, _err = self.run_diagnostic(Path(name), diagnostic_portal(failed))
+        document = self.document(out)
+        self.assertEqual(exit_code, 20)
+        self.assertIs(document["submit_dispatched"], False)
+        self.assertEqual(document["submit_outcome"], "NOT_DISPATCHED")
+        self.assertEqual(document["support_ref"], "EG_LOGIN_SUBMIT_NOT_APPEAR")
+
+    def test_a_raised_application_error_still_emits_one_bounded_document(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            exit_code, out, _err = self.run_diagnostic(
+                Path(name),
+                diagnostic_portal(error=LoginError("runtime credentials are unavailable")),
+            )
+        document = self.document(out)
+        self.assertEqual(exit_code, 20)
+        self.assertEqual(document["status"], ACTION_REQUIRED)
+        self.assertEqual(document["support_ref"], "EG_LOGIN_CREDENTIALS_UNAVAILABLE")
+        self.assertEqual(document["submit_outcome"], "NOT_DISPATCHED")
+
+    def test_a_dependency_failure_is_a_contract_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            exit_code, out, _err = self.run_diagnostic(
+                Path(name),
+                diagnostic_portal(error=DependencyError("Playwright Python is not installed")),
+            )
+        document = self.document(out)
+        self.assertEqual(exit_code, 64)
+        self.assertEqual(document["schema"], "energygrid.login_diagnostic.v1")
+        self.assertEqual(document["status"], ACTION_REQUIRED)
+
+    def test_an_unreadable_configuration_is_a_contract_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            missing = root / "absent.json"
+            exit_code, out, _err = self.run_diagnostic(
+                root, diagnostic_portal(complete_result()), missing
+            )
+        document = self.document(out)
+        self.assertEqual(exit_code, 64)
+        self.assertEqual(document["status"], ACTION_REQUIRED)
+        self.assertIsNone(document["classification"])
+
+    def test_the_diagnostic_never_returns_the_retryable_code(self) -> None:
+        """`10` belongs to the download and network band, which is unreachable here."""
+        cases = (
+            diagnostic_portal(complete_result()),
+            diagnostic_portal(error=LoginError("runtime credentials are unavailable")),
+            diagnostic_portal(error=DownloadError("browser download failed")),
+        )
+        for index, portal_cls in enumerate(cases):
+            with self.subTest(case=index):
+                with tempfile.TemporaryDirectory() as name:
+                    exit_code, _out, _err = self.run_diagnostic(Path(name), portal_cls)
+                self.assertIn(exit_code, (0, 20, 64))
+                self.assertNotEqual(exit_code, 10)
+
+    # ---- privacy ---- #
+
+    def test_no_private_or_free_form_value_reaches_the_document(self) -> None:
+        hostile = portal_module.LoginDiagnosticResult(
+            classification=None,
+            submit_dispatched=False,
+            submit_outcome=portal_module.SUBMIT_NOT_DISPATCHED,
+            pre_submit=diagnostic_witnesses(),
+            post_submit=diagnostic_witnesses(include_url=True),
+            failure=LayoutChangedError(
+                "unmapped future failure: password=hunter2 at "
+                "https://portal.example.invalid/session for SYNTHETIC-INTENDED-ACCOUNT"
+            ),
+        )
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            exit_code, out, err = self.run_diagnostic(root, diagnostic_portal(hostile))
+            emitted = out + err
+            self.assertNotIn(str(root), emitted)
+        document = self.document(out)
+        self.assertEqual(exit_code, 20)
+        self.assertEqual(document["support_ref"], cli.UNCLASSIFIED_SUPPORT_REF)
+        for fragment in (
+            "hunter2",
+            "https://",
+            "portal.example.invalid",
+            "SYNTHETIC-INTENDED-ACCOUNT",
+            "unmapped future failure",
+            DIAGNOSTIC_SENTINEL_USERNAME,
+            DIAGNOSTIC_SENTINEL_PASSWORD,
+        ):
+            with self.subTest(fragment=fragment):
+                self.assertNotIn(fragment, emitted)
+
+    def test_the_sentinel_credentials_never_reach_any_output_surface(self) -> None:
+        for portal_cls in (
+            diagnostic_portal(complete_result()),
+            diagnostic_portal(error=LoginError("portal rejected the login")),
+        ):
+            with tempfile.TemporaryDirectory() as name:
+                _exit_code, out, err = self.run_diagnostic(Path(name), portal_cls)
+            for fragment in (DIAGNOSTIC_SENTINEL_USERNAME, DIAGNOSTIC_SENTINEL_PASSWORD):
+                with self.subTest(fragment=fragment):
+                    self.assertNotIn(fragment, out + err)
+
+    def test_every_document_value_is_an_identifier_a_count_or_a_boolean(self) -> None:
+        allowed = set(portal_module.LOGIN_DIAGNOSTIC_CLASSIFICATIONS) | {
+            "energygrid.login_diagnostic.v1",
+            cli.DIAGNOSTIC_COMPLETE,
+            ACTION_REQUIRED,
+            *portal_module.SUBMIT_OUTCOMES,
+        }
+        with tempfile.TemporaryDirectory() as name:
+            _exit_code, out, _err = self.run_diagnostic(
+                Path(name), diagnostic_portal(complete_result())
+            )
+        document = self.document(out)
+
+        def check(value) -> None:
+            if isinstance(value, dict):
+                for item in value.values():
+                    check(item)
+                return
+            if isinstance(value, str):
+                self.assertTrue(
+                    value in allowed or SUPPORT_REFERENCE_PATTERN.match(value),
+                    "%r is neither a closed identifier nor a bounded reference" % value,
+                )
+                return
+            self.assertIsInstance(value, (bool, int, type(None)))
+
+        check(document)
+
+    def test_the_diagnostic_reference_is_a_bounded_ascii_identifier(self) -> None:
+        reference = cli.DIAGNOSTIC_UNCLASSIFIED_SUPPORT_REF
+        self.assertEqual(reference, "EG_LOGIN_DIAGNOSTIC_UNCLASSIFIED")
+        self.assertRegex(reference, SUPPORT_REFERENCE_PATTERN)
+        self.assertTrue(reference.isascii())
+        self.assertNotIn(reference, cli.SUPPORT_REFS_BY_MESSAGE.values())
+        self.assertNotIn(reference, cli.RETIRED_SUPPORT_REFS)
 
 
 if __name__ == "__main__":

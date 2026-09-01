@@ -706,6 +706,9 @@ class FakePage:
         # unbounded call inherits it, so it is what a missing explicit
         # timeout costs.
         self.default_timeout_ms = default_timeout_ms
+        # Only ever compared with itself: the diagnostic reports whether the
+        # address moved and never what either address was.
+        self.url = "http://127.0.0.1:1/synthetic"
         self.waited_ms: list[int] = []
         # Every simulated cost in the order it was incurred, so a case can
         # prove a probe never outlasted the budget remaining at that moment.
@@ -2742,6 +2745,645 @@ class PortalLoginDispatchTests(unittest.TestCase):
         self.assertEqual(cli.support_ref_for(error), "EG_LOGIN_BILLING_MANAGER_WAIT_FAILED")
         self.assertEqual(submit.clicks, 1)
         self.assertEqual(ambiguous.waits, 0, "an ambiguous surface is never asked to wait")
+
+
+# ---- DL-XB-141-RUNTIME-005-SOURCE-DURABILITY-A1: the bounded login diagnostic ---- #
+#
+# The diagnostic reuses the canonical pre-submit sequence and the one canonical
+# submit. These cases hold that reuse, the one-shot submit boundary, the closed
+# observation allowlist, the fail-closed classification matrix, and the fact
+# that no business path is reachable from it.
+
+
+def witnesses(
+    *,
+    hosts=None,
+    placeholder: int = 0,
+    billing_manager=(0, False),
+    username=(0, False),
+    password=(0, False),
+    login=(0, False, False),
+    enable_accessibility=(0, False, False),
+    alert: bool = False,
+) -> dict:
+    """Build one observation in exactly the shape the portal produces."""
+
+    host_counts = {tag: 0 for tag in portal_module.DIAGNOSTIC_HOST_TAGS}
+    host_counts.update(hosts or {})
+    return {
+        "hosts": host_counts,
+        "semantics_placeholder": {
+            "count": placeholder,
+            "present": None if placeholder is None else placeholder > 0,
+        },
+        "billing_manager": {"count": billing_manager[0], "visible": billing_manager[1]},
+        "username": {"count": username[0], "visible": username[1]},
+        "password": {"count": password[0], "visible": password[1]},
+        "login": {"count": login[0], "visible": login[1], "actionable": login[2]},
+        "enable_accessibility": {
+            "count": enable_accessibility[0],
+            "visible": enable_accessibility[1],
+            "actionable": enable_accessibility[2],
+        },
+        "visible_alert": alert,
+    }
+
+
+SHELL_ONLY = witnesses(hosts={"flt-glass-pane": 1})
+SEMANTICS_ONLY = witnesses(hosts={"flt-semantics-host": 1, "flt-glass-pane": 1})
+NOTHING_AT_ALL = witnesses()
+
+
+class WitnessLocator:
+    """A locator that reports one fixed witness and is never really clicked."""
+
+    def __init__(self, count, visible, actionable) -> None:
+        self._count = count
+        self._visible = visible
+        self._actionable = actionable
+
+    def count(self) -> int:
+        if self._count is None:
+            raise RuntimeError("synthetic unreadable locator")
+        return self._count
+
+    def is_visible(self, timeout: int | None = None) -> bool:
+        if self._visible is None:
+            raise RuntimeError("synthetic unreadable locator")
+        return bool(self._visible)
+
+    def click(self, trial: bool = False, timeout: int | None = None) -> None:
+        if not trial:
+            raise AssertionError("observation must never dispatch a real click")
+        if not self._actionable:
+            raise SyntheticTimeoutError("synthetic actionability timeout")
+
+
+class WitnessPage:
+    """A page that serves only the fixed diagnostic witness lookups.
+
+    One state is served for a whole observation pass; the next checkpoint's
+    event-loop yield is what advances to the next state, so a surface can be
+    made to change between checkpoints exactly as a real one would.
+    """
+
+    def __init__(self, states, urls=None) -> None:
+        self._states = list(states)
+        self._urls = list(urls) if urls is not None else None
+        self._index = 0
+        self.entry_url = "http://127.0.0.1:1/synthetic"
+        self.lookups: list[str] = []
+        self.waited_ms: list[int] = []
+
+    @property
+    def state(self) -> dict:
+        return self._states[min(self._index, len(self._states) - 1)]
+
+    @property
+    def url(self) -> str:
+        if self._urls is None:
+            return self.entry_url
+        return self._urls[min(self._index, len(self._urls) - 1)]
+
+    @property
+    def observations(self) -> int:
+        return len([name for name in self.lookups if name == "role:alert:None"])
+
+    def wait_for_timeout(self, milliseconds: int) -> None:
+        self.waited_ms.append(int(milliseconds))
+        self._index += 1
+
+    def simulated_monotonic(self) -> float:
+        return sum(self.waited_ms) / 1000.0
+
+    def locator(self, selector: str):
+        self.lookups.append("locator:" + selector)
+        if selector == "flt-semantics-placeholder":
+            return WitnessLocator(self.state["semantics_placeholder"]["count"], False, False)
+        return WitnessLocator(self.state["hosts"][selector], False, False)
+
+    def get_by_role(self, role: str, name: str | None = None, exact: bool = False):
+        self.lookups.append(f"role:{role}:{name}")
+        if role == "alert":
+            visible = bool(self.state["visible_alert"])
+            return WitnessLocator(1 if visible else 0, visible, False)
+        key = {
+            "Billing Manager": "billing_manager",
+            "Login": "login",
+            "Enable accessibility": "enable_accessibility",
+        }[name]
+        witness = self.state[key]
+        return WitnessLocator(
+            witness["count"], witness["visible"], witness.get("actionable", False)
+        )
+
+    def get_by_label(self, name: str, exact: bool = False):
+        self.lookups.append("label:" + name)
+        witness = self.state[{"Username": "username", "Password": "password"}[name]]
+        return WitnessLocator(witness["count"], witness["visible"], False)
+
+
+# Exactly the lookups one observation pass is permitted to make. Anything else -
+# page text, HTML, a DOM or accessibility-tree dump, an attribute, a screenshot,
+# a trace, storage, or network - would show up here as an extra entry.
+ALLOWED_OBSERVATION_LOOKUPS = [
+    "locator:flt-semantics-host",
+    "locator:flt-semantics",
+    "locator:flt-glass-pane",
+    "locator:flt-text-editing-host",
+    "locator:flt-scene-host",
+    "locator:canvas",
+    "locator:flt-semantics-placeholder",
+    "role:link:Billing Manager",
+    "label:Username",
+    "label:Password",
+    "role:button:Login",
+    "role:button:Enable accessibility",
+    "role:alert:None",
+]
+
+
+@contextlib.contextmanager
+def stubbed_observation(*observations):
+    """Serve fixed observations so a sequence case needs no witness surface."""
+
+    seen: list[int] = []
+
+    def fake(self, page, remaining_ms, entry_url=None):
+        index = min(len(seen), len(observations) - 1)
+        seen.append(index)
+        observation = dict(observations[index])
+        if entry_url is not None:
+            observation["url_changed"] = False
+        return observation
+
+    with mock.patch.object(PlaywrightPortal, "_observe_login_witnesses", fake):
+        yield seen
+
+
+class LoginDiagnosticSequenceTests(unittest.TestCase):
+    """The diagnostic runs the canonical sequence once, and stops at the submit."""
+
+    def run_diagnostic(self, page, observations=(SEMANTICS_ONLY,)):
+        portal = PlaywrightPortal(FakeConfig(), headed=True)
+        portal.page = page
+        old = {
+            name: os.environ.get(name)
+            for name in ("ENERGYGRID_USERNAME", "ENERGYGRID_PASSWORD")
+        }
+        os.environ.update(runtime_credentials())
+        try:
+            with stubbed_observation(*observations):
+                with mock.patch.object(portal_module, "time", create=True) as clock:
+                    clock.monotonic.side_effect = page.simulated_monotonic
+                    return portal.login_diagnostic()
+        finally:
+            for name, value in old.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+
+    def test_the_canonical_pre_submit_sequence_is_reused_verbatim(self) -> None:
+        """The diagnostic dispatches the same steps `login()` does, in the same order."""
+        journal: list[str] = []
+        page = login_page(
+            activation=FakeLocator(journal=journal, label="activation"),
+            placeholder=FakeLocator(journal=journal, label="placeholder"),
+            login_entry=FakeLocator(journal=journal, label="login_entry"),
+            username_field=FakeLocator(journal=journal, label="username"),
+            password_field=FakeLocator(journal=journal, label="password"),
+            submit=FakeLocator(journal=journal, label="submit"),
+            journal=journal,
+        )
+
+        result = self.run_diagnostic(page)
+        self.assertEqual(result.submit_outcome, portal_module.SUBMIT_DISPATCHED)
+        # The committed successful sequence, minus only the post-login settle
+        # the diagnostic deliberately never performs.
+        self.assertEqual(journal, SUCCESSFUL_LOGIN_SEQUENCE[:-1])
+
+    def test_the_semantics_gate_and_login_entry_are_each_dispatched_once(self) -> None:
+        activation = FakeLocator(label="activation")
+        entry = FakeLocator(label="entry")
+        # A distinct submit locator, so the shared Login role cannot let the one
+        # submit be counted as a second entry click.
+        page = login_page(
+            activation=activation, login_entry=entry, submit=FakeLocator(label="submit")
+        )
+
+        self.run_diagnostic(page)
+        self.assertEqual(activation.dispatched, 1, "exactly one semantics activation")
+        self.assertEqual(entry.clicks, 1, "exactly one Login-entry click")
+        self.assertEqual(entry.trial_clicks, 1, "proven actionable before the one click")
+
+    def test_the_credentials_are_typed_once_each_with_the_committed_pacing(self) -> None:
+        username = FakeLocator(label="username")
+        password = FakeLocator(label="password")
+        page = login_page(username_field=username, password_field=password)
+
+        self.run_diagnostic(page)
+        for field in (username, password):
+            self.assertEqual(field.typed, 1)
+            self.assertEqual(field.type_delays, [portal_module.LOGIN_KEY_ENTRY_DELAY_MS])
+
+    def test_the_submit_is_dispatched_exactly_once_and_never_retried(self) -> None:
+        submit = FakeLocator(label="submit")
+        page = login_page(submit=submit)
+
+        result = self.run_diagnostic(page)
+        self.assertEqual(submit.clicks, 1, "one real submit, never retried")
+        self.assertEqual(submit.trial_clicks, 1)
+        self.assertTrue(result.submit_dispatched)
+        self.assertEqual(result.submit_outcome, portal_module.SUBMIT_DISPATCHED)
+
+    def test_a_dispatch_exception_is_uncertain_and_is_never_re_sent(self) -> None:
+        submit = FakeLocator(click_error=step_failure(), label="submit")
+        page = login_page(submit=submit)
+
+        result = self.run_diagnostic(page)
+        self.assertTrue(result.submit_dispatched)
+        self.assertEqual(result.submit_outcome, portal_module.SUBMIT_DISPATCH_UNCERTAIN)
+        self.assertEqual(submit.clicks, 1, "an uncertain dispatch is never re-sent")
+        self.assertIsNone(result.failure, "an uncertain dispatch is reported, not raised")
+
+    def test_a_dispatch_uncertain_run_may_still_classify(self) -> None:
+        """The page is the only remaining evidence, and it is still read."""
+        page = login_page(submit=FakeLocator(click_error=step_failure(), label="submit"))
+
+        result = self.run_diagnostic(page, observations=(SEMANTICS_ONLY,))
+        self.assertEqual(
+            result.classification,
+            portal_module.SEMANTICS_HOST_PRESENT_WITHOUT_APP_CONTROLS,
+        )
+        self.assertEqual(
+            result.submit_outcome,
+            portal_module.SUBMIT_DISPATCH_UNCERTAIN,
+            "observation never promotes an uncertain dispatch to a proven one",
+        )
+
+    def test_a_pre_dispatch_readiness_failure_reports_not_dispatched(self) -> None:
+        submit = FakeLocator(count=0, label="absent_submit")
+        page = login_page(submits=[submit])
+
+        result = self.run_diagnostic(page)
+        self.assertFalse(result.submit_dispatched)
+        self.assertEqual(result.submit_outcome, portal_module.SUBMIT_NOT_DISPATCHED)
+        self.assertIsNone(result.classification)
+        self.assertEqual(submit.clicks, 0)
+        self.assertEqual(
+            cli.support_ref_for(result.failure), "EG_LOGIN_SUBMIT_NOT_APPEAR"
+        )
+
+    def test_an_earlier_step_failure_keeps_its_own_bounded_reference(self) -> None:
+        page = login_page(username_field=FakeLocator(type_error=step_failure()))
+
+        result = self.run_diagnostic(page)
+        self.assertFalse(result.submit_dispatched)
+        self.assertEqual(result.submit_outcome, portal_module.SUBMIT_NOT_DISPATCHED)
+        ref = cli.support_ref_for(result.failure)
+        self.assertEqual(ref, "EG_LOGIN_USERNAME_FILL_FAILED")
+        self.assertNotIn(STEP_FAILURE_TEXT, repr(result.failure.message))
+
+    def test_missing_runtime_credentials_fail_closed_before_any_navigation(self) -> None:
+        page = login_page()
+        portal = PlaywrightPortal(FakeConfig(), headed=True)
+        portal.page = page
+        old = {
+            name: os.environ.get(name)
+            for name in ("ENERGYGRID_USERNAME", "ENERGYGRID_PASSWORD")
+        }
+        for name in old:
+            os.environ.pop(name, None)
+        try:
+            with self.assertRaises(LoginError):
+                portal.login_diagnostic()
+        finally:
+            for name, value in old.items():
+                if value is not None:
+                    os.environ[name] = value
+        self.assertEqual(page.goto_calls, 0)
+
+    def test_no_business_path_is_reachable_from_the_diagnostic(self) -> None:
+        """Every post-login application behaviour is made to explode, and none runs."""
+        forbidden = (
+            "_await_billing_manager",
+            "_entry_is_visible",
+            "inventory",
+            "download",
+            "_open_verified_results",
+            "_await_invoice_list",
+            "_advance_page",
+            "_restore_page",
+            "_resolve_pagination_control",
+        )
+
+        def explode(*_args, **_kwargs):
+            raise AssertionError("the diagnostic reached a business path")
+
+        page = login_page()
+        with contextlib.ExitStack() as stack:
+            for name in forbidden:
+                stack.enter_context(mock.patch.object(PlaywrightPortal, name, explode))
+            result = self.run_diagnostic(page)
+        self.assertEqual(
+            result.classification,
+            portal_module.SEMANTICS_HOST_PRESENT_WITHOUT_APP_CONTROLS,
+        )
+
+    def test_the_normal_login_path_still_settles_on_billing_manager(self) -> None:
+        """The shared refactor must not have moved `login()` off its own contract."""
+        journal: list[str] = []
+        page = login_page(
+            activation=FakeLocator(journal=journal, label="activation"),
+            placeholder=FakeLocator(journal=journal, label="placeholder"),
+            login_entry=FakeLocator(journal=journal, label="login_entry"),
+            username_field=FakeLocator(journal=journal, label="username"),
+            password_field=FakeLocator(journal=journal, label="password"),
+            submit=FakeLocator(journal=journal, label="submit"),
+            billing_manager=FakeLocator(journal=journal, label="billing_manager"),
+            journal=journal,
+        )
+        portal = PlaywrightPortal(FakeConfig(), headed=False)
+        portal.page = page
+        old = {
+            name: os.environ.get(name)
+            for name in ("ENERGYGRID_USERNAME", "ENERGYGRID_PASSWORD")
+        }
+        os.environ.update(runtime_credentials())
+        try:
+            with mock.patch.object(portal_module, "time", create=True) as clock:
+                clock.monotonic.side_effect = page.simulated_monotonic
+                portal.login()
+        finally:
+            for name, value in old.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+        self.assertEqual(journal, SUCCESSFUL_LOGIN_SEQUENCE)
+
+
+class LoginDiagnosticObservationTests(unittest.TestCase):
+    """The observation reads a closed allowlist and stays inside the shared deadline."""
+
+    def observe(self, page):
+        portal = PlaywrightPortal(FakeConfig(), headed=True)
+        portal.page = page
+        return portal._observe_login_witnesses(page, portal_module.MAX_PORTAL_PROBE_TIMEOUT_MS)
+
+    def test_the_observation_reads_exactly_the_allowlisted_witnesses(self) -> None:
+        page = WitnessPage([SEMANTICS_ONLY])
+        self.observe(page)
+        # The visibility and actionability witnesses resolve a fresh locator per
+        # question, so compare the distinct lookups in first-seen order.
+        seen: list[str] = []
+        for name in page.lookups:
+            if name not in seen:
+                seen.append(name)
+        self.assertEqual(seen, ALLOWED_OBSERVATION_LOOKUPS)
+
+    def test_the_observation_reproduces_the_surface_it_was_given(self) -> None:
+        state = witnesses(
+            hosts={"flt-semantics-host": 1, "flt-glass-pane": 2, "canvas": 1},
+            placeholder=1,
+            billing_manager=(1, True),
+            username=(1, False),
+            password=(0, False),
+            login=(1, True, True),
+            enable_accessibility=(0, False, False),
+            alert=False,
+        )
+        self.assertEqual(self.observe(WitnessPage([state])), state)
+
+    def test_every_observed_value_is_a_count_a_boolean_or_null(self) -> None:
+        observed = self.observe(WitnessPage([SEMANTICS_ONLY]))
+
+        def check(value) -> None:
+            if isinstance(value, dict):
+                for key, item in value.items():
+                    self.assertIsInstance(key, str)
+                    check(item)
+                return
+            self.assertIsInstance(
+                value, (bool, int, type(None)), "no free-form value may be observed"
+            )
+            self.assertNotIsInstance(value, str)
+
+        check(observed)
+
+    def test_an_unreadable_witness_is_null_rather_than_a_guess(self) -> None:
+        state = witnesses(hosts={"flt-semantics-host": None}, billing_manager=(None, None))
+        observed = self.observe(WitnessPage([state]))
+        self.assertIsNone(observed["hosts"]["flt-semantics-host"])
+        self.assertIsNone(observed["billing_manager"]["count"])
+        self.assertIsNone(observed["billing_manager"]["visible"])
+
+    def test_only_a_url_changed_boolean_is_ever_reported(self) -> None:
+        portal = PlaywrightPortal(FakeConfig(), headed=True)
+        moved = WitnessPage([SEMANTICS_ONLY], urls=["http://127.0.0.1:1/after"])
+        observed = portal._observe_login_witnesses(
+            moved, portal_module.MAX_PORTAL_PROBE_TIMEOUT_MS, entry_url=moved.entry_url
+        )
+        self.assertIs(observed["url_changed"], True)
+        stayed = WitnessPage([SEMANTICS_ONLY])
+        observed = portal._observe_login_witnesses(
+            stayed, portal_module.MAX_PORTAL_PROBE_TIMEOUT_MS, entry_url=stayed.entry_url
+        )
+        self.assertIs(observed["url_changed"], False)
+        for document in (observed,):
+            self.assertNotIn("url", document)
+            self.assertNotIn("http", repr(document))
+
+    def test_the_unobserved_shape_is_the_same_closed_shape(self) -> None:
+        observed = self.observe(WitnessPage([SEMANTICS_ONLY]))
+        unobserved = portal_module.unobserved_login_witnesses()
+        self.assertEqual(set(observed), set(unobserved))
+        self.assertEqual(set(observed["hosts"]), set(unobserved["hosts"]))
+        with_url = portal_module.unobserved_login_witnesses(include_url=True)
+        self.assertEqual(set(with_url) - set(unobserved), {"url_changed"})
+
+
+class LoginDiagnosticClassificationTests(unittest.TestCase):
+    """The fail-closed classification matrix, arm by arm."""
+
+    def classify(self, observation):
+        return PlaywrightPortal(FakeConfig(), headed=True)._classify_post_submit(observation)
+
+    def settle(self, states, pre_submit=NOTHING_AT_ALL, urls=None):
+        """Run the whole bounded post-submit window against a witness surface."""
+        page = WitnessPage(states, urls=urls)
+        portal = PlaywrightPortal(FakeConfig(), headed=True)
+        portal.page = page
+        with mock.patch.object(portal_module, "time", create=True) as clock:
+            clock.monotonic.side_effect = page.simulated_monotonic
+            observation, classification = portal._observe_after_submit(
+                page, pre_submit, page.entry_url
+            )
+        return page, observation, classification
+
+    # ---- the six accepted classifications ---- #
+
+    def test_billing_manager_visible(self) -> None:
+        state = witnesses(hosts={"flt-semantics-host": 1}, billing_manager=(1, True))
+        self.assertEqual(self.classify(state), portal_module.BILLING_MANAGER_VISIBLE)
+        _page, _observed, classification = self.settle([state])
+        self.assertEqual(classification, portal_module.BILLING_MANAGER_VISIBLE)
+
+    def test_visible_alert_outranks_route_and_shell_inference(self) -> None:
+        state = witnesses(
+            hosts={"flt-semantics-host": 1},
+            username=(1, True),
+            login=(1, True, True),
+            alert=True,
+        )
+        self.assertEqual(self.classify(state), portal_module.VISIBLE_ALERT)
+
+    def test_login_route_persisted_or_returned(self) -> None:
+        state = witnesses(hosts={"flt-semantics-host": 1}, password=(1, True))
+        self.assertEqual(
+            self.classify(state), portal_module.LOGIN_ROUTE_PERSISTED_OR_RETURNED
+        )
+        _page, _observed, classification = self.settle([state])
+        self.assertEqual(classification, portal_module.LOGIN_ROUTE_PERSISTED_OR_RETURNED)
+
+    def test_semantics_host_present_without_app_controls(self) -> None:
+        state = witnesses(hosts={"flt-semantics": 1, "flt-glass-pane": 1})
+        self.assertEqual(
+            self.classify(state),
+            portal_module.SEMANTICS_HOST_PRESENT_WITHOUT_APP_CONTROLS,
+        )
+
+    def test_flutter_render_shell_present_semantics_host_absent(self) -> None:
+        state = witnesses(hosts={"flt-glass-pane": 1, "canvas": 2})
+        self.assertEqual(
+            self.classify(state),
+            portal_module.FLUTTER_RENDER_SHELL_PRESENT_SEMANTICS_HOST_ABSENT,
+        )
+
+    def test_flutter_shell_disappeared_after_submit(self) -> None:
+        page, _observed, classification = self.settle(
+            [NOTHING_AT_ALL], pre_submit=SHELL_ONLY
+        )
+        self.assertEqual(
+            classification, portal_module.FLUTTER_SHELL_DISAPPEARED_AFTER_SUBMIT
+        )
+        self.assertEqual(
+            page.observations,
+            len(portal_module.PORTAL_RECOVERY_ATTEMPTS_MS),
+            "disappearance is only concluded after the whole window ran",
+        )
+
+    def test_every_accepted_classification_has_coverage(self) -> None:
+        """The six are exactly what the portal declares, in priority order."""
+        self.assertEqual(
+            portal_module.LOGIN_DIAGNOSTIC_CLASSIFICATIONS,
+            (
+                "BILLING_MANAGER_VISIBLE",
+                "VISIBLE_ALERT",
+                "LOGIN_ROUTE_PERSISTED_OR_RETURNED",
+                "SEMANTICS_HOST_PRESENT_WITHOUT_APP_CONTROLS",
+                "FLUTTER_RENDER_SHELL_PRESENT_SEMANTICS_HOST_ABSENT",
+                "FLUTTER_SHELL_DISAPPEARED_AFTER_SUBMIT",
+            ),
+        )
+
+    # ---- Web's visibility and absence clarification ---- #
+
+    def test_a_hidden_billing_manager_does_not_classify(self) -> None:
+        self.assertIsNone(self.classify(witnesses(billing_manager=(1, False))))
+
+    def test_multiple_billing_manager_matches_do_not_classify(self) -> None:
+        self.assertIsNone(self.classify(witnesses(billing_manager=(2, True))))
+
+    def test_hidden_login_controls_do_not_prove_the_login_route(self) -> None:
+        """Counted but hidden is ambiguous evidence, and ambiguity fails closed."""
+        state = witnesses(
+            hosts={"flt-semantics-host": 1},
+            username=(1, False),
+            password=(1, False),
+            login=(1, False, False),
+        )
+        self.assertIsNone(self.classify(state))
+
+    def test_a_counted_enable_accessibility_blocks_every_shell_classification(self) -> None:
+        blocked = witnesses(
+            hosts={"flt-semantics-host": 1, "flt-glass-pane": 1},
+            enable_accessibility=(1, False, False),
+        )
+        self.assertIsNone(self.classify(blocked))
+        _page, _observed, classification = self.settle([blocked], pre_submit=SHELL_ONLY)
+        self.assertIsNone(
+            classification, "a counted public gate also blocks disappearance"
+        )
+
+    def test_each_known_control_blocks_a_shell_classification_by_count(self) -> None:
+        for name, override in (
+            ("billing_manager", {"billing_manager": (1, False)}),
+            ("username", {"username": (1, False)}),
+            ("password", {"password": (1, False)}),
+            ("login", {"login": (1, False, False)}),
+            ("enable_accessibility", {"enable_accessibility": (1, False, False)}),
+        ):
+            with self.subTest(control=name):
+                state = witnesses(hosts={"flt-semantics-host": 1}, **override)
+                self.assertIsNone(self.classify(state))
+
+    def test_an_unreadable_host_count_blocks_a_shell_classification(self) -> None:
+        state = witnesses(hosts={"flt-semantics-host": None, "flt-glass-pane": 1})
+        self.assertIsNone(self.classify(state))
+
+    def test_shell_disappearance_requires_a_positive_pre_submit_witness(self) -> None:
+        _page, _observed, classification = self.settle(
+            [NOTHING_AT_ALL], pre_submit=NOTHING_AT_ALL
+        )
+        self.assertIsNone(
+            classification, "a shell that was never established cannot disappear"
+        )
+
+    def test_shell_disappearance_requires_the_shell_to_stay_gone(self) -> None:
+        """A shell that comes back classifies as present, never as disappeared."""
+        page, _observed, classification = self.settle(
+            [NOTHING_AT_ALL, NOTHING_AT_ALL, SHELL_ONLY], pre_submit=SHELL_ONLY
+        )
+        self.assertEqual(
+            classification,
+            portal_module.FLUTTER_RENDER_SHELL_PRESENT_SEMANTICS_HOST_ABSENT,
+        )
+        self.assertEqual(page.observations, 3, "the window ended as soon as it settled")
+
+    def test_a_control_seen_earlier_blocks_a_later_disappearance_verdict(self) -> None:
+        page, _observed, classification = self.settle(
+            [witnesses(login=(1, False, False)), NOTHING_AT_ALL], pre_submit=SHELL_ONLY
+        )
+        self.assertIsNone(classification)
+        self.assertEqual(page.observations, len(portal_module.PORTAL_RECOVERY_ATTEMPTS_MS))
+
+    def test_a_surface_that_never_settles_fails_closed(self) -> None:
+        never = witnesses(billing_manager=(1, False))
+        page, observed, classification = self.settle([never], pre_submit=SHELL_ONLY)
+        self.assertIsNone(classification)
+        self.assertEqual(observed, never | {"url_changed": False})
+
+    def test_the_post_submit_window_stays_inside_the_shared_deadline(self) -> None:
+        page, _observed, classification = self.settle(
+            [witnesses(billing_manager=(1, False))], pre_submit=SHELL_ONLY
+        )
+        self.assertIsNone(classification)
+        self.assertEqual(page.observations, len(portal_module.PORTAL_RECOVERY_ATTEMPTS_MS))
+        self.assertLessEqual(
+            page.simulated_monotonic(),
+            portal_module.PORTAL_RECOVERY_DEADLINE_SECONDS,
+            "the diagnostic reuses the shared 60-second ceiling and never raises it",
+        )
+        self.assertEqual(portal_module.PORTAL_RECOVERY_DEADLINE_SECONDS, 60.0)
+
+    def test_a_settled_surface_ends_the_window_immediately(self) -> None:
+        page, _observed, classification = self.settle(
+            [witnesses(billing_manager=(1, True))]
+        )
+        self.assertEqual(classification, portal_module.BILLING_MANAGER_VISIBLE)
+        self.assertEqual(page.waited_ms, [], "a settled answer is not waited out")
 
 
 if __name__ == "__main__":
