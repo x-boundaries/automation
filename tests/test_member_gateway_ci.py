@@ -34,6 +34,20 @@ class MemberGatewayCiTests(unittest.TestCase):
         self.assertIn("fetch-depth: 0", self.text)
         self.assertIn("persist-credentials: false", self.text)
 
+    def test_windows_full_offline_regression_provisions_tzdata_before_suite(self):
+        job = self.text.split("  full-offline-regression:", 1)[1]
+        setup_index = job.index("      - uses: actions/setup-python@v5")
+        install_index = job.index(
+            "      - name: Install tzdata (Windows Python has no system zoneinfo database)"
+        )
+        suite_index = job.index("run: python tests/_run_ci_full_suite.py")
+        self.assertLess(setup_index, install_index)
+        self.assertLess(install_index, suite_index)
+        self.assertIn(
+            "shell: pwsh\n        run: python -m pip install --quiet tzdata",
+            job,
+        )
+
     def test_ci_contains_no_live_or_mutating_operation(self):
         for forbidden in (
             r"\$\{\{\s*secrets\.",
@@ -43,7 +57,7 @@ class MemberGatewayCiTests(unittest.TestCase):
             r"\bdeployment\b",
             r"\bdeploy(?:ment)?\b",
             r"\bnpm\s+install\b",
-            r"\bpip\s+install\b",
+            r"\bpip\s+install\b(?!\s+--quiet\s+tzdata(?:\s|$))",
         ):
             self.assertIsNone(re.search(forbidden, self.text, re.IGNORECASE), forbidden)
         self.assertIn("offline", self.text.lower())

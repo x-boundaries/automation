@@ -184,6 +184,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Install tzdata (Windows Python has no system zoneinfo database)
+        shell: pwsh
+        run: python -m pip install --quiet tzdata
       - name: Run repository offline suite
         shell: bash
         run: python tests/_run_ci_full_suite.py
