@@ -264,7 +264,17 @@ def run_login_diagnostic(config_path: Path) -> int:
     except AppError as exc:
         emit_login_diagnostic(action_required(support_ref_for(exc)))
         return 20
-    except (OSError, ValueError, TypeError):
+    except Exception:
+        # The diagnostic's own fail-closed boundary for an unexpected ordinary
+        # exception that escapes before a truthful submit-dispatched result
+        # exists. The portal keeps its own post-submit envelope, so nothing that
+        # has already dispatched Login can arrive here and be reported as never
+        # dispatched. Exactly one closed document is still emitted, with the
+        # unobserved witness shapes and a bounded reference; the exception
+        # itself is discarded rather than described, so no traceback or
+        # free-form text reaches stdout or stderr. `BaseException` is
+        # deliberately excluded: `KeyboardInterrupt` and `SystemExit` are
+        # process control, not a diagnostic outcome, and must propagate.
         emit_login_diagnostic(action_required(UNCLASSIFIED_SUPPORT_REF))
         return 20
 

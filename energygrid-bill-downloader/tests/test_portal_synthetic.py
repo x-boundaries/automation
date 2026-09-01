@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import contextlib
 from dataclasses import dataclass
+import io
+import json
 import os
 from pathlib import Path
 import tempfile
@@ -14,6 +16,7 @@ from energygrid_bill_downloader import portal as portal_module
 from energygrid_bill_downloader.config import load_runtime_config
 from energygrid_bill_downloader.cli import main
 from energygrid_bill_downloader.errors import (
+    ACTION_REQUIRED,
     PORTAL_LAYOUT_CHANGED,
     AppError,
     DownloadError,
@@ -847,13 +850,18 @@ def step_failure() -> RuntimeError:
     return RuntimeError(STEP_FAILURE_TEXT)
 
 
-def login_page(**overrides) -> FakePage:
-    """A page whose login path succeeds unless `overrides` break exactly one step."""
+def login_page(*, page_cls: type[FakePage] = FakePage, **overrides) -> FakePage:
+    """A page whose login path succeeds unless `overrides` break exactly one step.
+
+    `page_cls` lets a case supply a `FakePage` subclass -- a page whose
+    event-loop yield fails, for instance -- without restating the healthy
+    login surface every other case relies on.
+    """
     slots = {"activation": FakeLocator(), "placeholder": FakeLocator(), "login_entry": FakeLocator()}
     for name in tuple(slots):
         if name in overrides:
             slots[name] = overrides.pop(name)
-    return FakePage(slots["activation"], slots["placeholder"], slots["login_entry"], **overrides)
+    return page_cls(slots["activation"], slots["placeholder"], slots["login_entry"], **overrides)
 
 
 # Every operation the broad generic arm of `login()` can currently cover, with
@@ -3384,6 +3392,242 @@ class LoginDiagnosticClassificationTests(unittest.TestCase):
         )
         self.assertEqual(classification, portal_module.BILLING_MANAGER_VISIBLE)
         self.assertEqual(page.waited_ms, [], "a settled answer is not waited out")
+
+
+# The private, hostile text an unexpected infrastructure failure is made to
+# carry. Nothing in it may reach stdout, stderr or the emitted document.
+UNEXPECTED_OBSERVATION_TEXT = (
+    "synthetic private hostile value: password=hunter2 at "
+    "https://portal.example.invalid/session for SYNTHETIC-INTENDED-ACCOUNT"
+)
+UNEXPECTED_OBSERVATION_FRAGMENTS = (
+    "synthetic private hostile value",
+    "hunter2",
+    "https://",
+    "portal.example.invalid",
+    "SYNTHETIC-INTENDED-ACCOUNT",
+    "Traceback",
+    "RuntimeError",
+)
+
+
+class UnobservablePage(FakePage):
+    """A page whose event-loop yield fails once the one Login submit is sent.
+
+    This is the reported shape verbatim: the shared recovery yields with
+    `page.wait_for_timeout(...)` outside its probe handling, so an ordinary
+    exception raised there escapes the post-submit observation entirely rather
+    than being absorbed as "not settled yet". The failure is armed by the one
+    real submit click, so nothing before the dispatch boundary is disturbed.
+    """
+
+    @property
+    def submit_clicks(self) -> int:
+        return sum(locator.clicks for locator in self._submit_locators())
+
+    def _submit_locators(self) -> list[FakeLocator]:
+        locators = list(self.submits or ())
+        if self.submit is not None:
+            locators.append(self.submit)
+        return locators
+
+    def wait_for_timeout(self, milliseconds: int) -> None:
+        if self.submit_clicks:
+            raise RuntimeError(UNEXPECTED_OBSERVATION_TEXT)
+        super().wait_for_timeout(milliseconds)
+
+
+def real_diagnostic_portal(page: FakePage):
+    """The real portal, driven against a fake page instead of a browser.
+
+    Only browser acquisition is replaced. `login_diagnostic()` itself, the
+    canonical pre-submit sequence, the one normal submit and the post-submit
+    observation are the production ones, so a case exercises the real CLI
+    boundary end to end without Playwright, a browser or a portal.
+    """
+
+    class RealDiagnosticPortal(PlaywrightPortal):
+        def __init__(self, config, headed: bool = False) -> None:
+            super().__init__(config, headed=headed)
+            self.page = page
+
+        def __enter__(self) -> "RealDiagnosticPortal":
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+    return RealDiagnosticPortal
+
+
+class LoginDiagnosticUnexpectedFailureTests(unittest.TestCase):
+    """An unexpected ordinary exception still yields one truthful document.
+
+    The diagnostic contract is fail-closed on output as well as on outcome:
+    whatever goes wrong, exactly one bounded `energygrid.login_diagnostic.v1`
+    document is emitted, the already-established submit truth is preserved, and
+    no traceback or free-form exception text reaches any output surface.
+    """
+
+    def write_diagnostic_config(self, root: Path) -> Path:
+        (root / "archive").mkdir()
+        config_path = root / "config.json"
+        config_path.write_text(
+            json.dumps(
+                {
+                    # Never contacted: the portal is a fake page throughout.
+                    "portal_url": "http://127.0.0.1:1/synthetic",
+                    "account_identity": "SYNTHETIC-INTENDED-ACCOUNT",
+                    "archive_root": str(root / "archive"),
+                    "state_path": str(root / "state" / "state.sqlite3"),
+                    "temp_root": str(root / "temp"),
+                    "log_root": str(root / "logs"),
+                    "timeout_seconds": 5,
+                    "max_attempts": 2,
+                    "inventory_safety_ceiling": 50,
+                }
+            ),
+            encoding="utf-8",
+        )
+        return config_path
+
+    def run_cli_diagnostic(self, page: FakePage, observations=(NOTHING_AT_ALL,)):
+        """Run the real `login-diagnostic` command against `page`."""
+
+        out = io.StringIO()
+        err = io.StringIO()
+        old = {
+            name: os.environ.get(name)
+            for name in ("ENERGYGRID_USERNAME", "ENERGYGRID_PASSWORD")
+        }
+        credentials = runtime_credentials()
+        os.environ.update(credentials)
+        try:
+            with tempfile.TemporaryDirectory() as name:
+                root = Path(name)
+                config_path = self.write_diagnostic_config(root)
+                with mock.patch.object(cli, "PlaywrightPortal", real_diagnostic_portal(page)), \
+                        stubbed_observation(*observations), \
+                        mock.patch.object(portal_module, "time", create=True) as clock, \
+                        contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                    clock.monotonic.side_effect = page.simulated_monotonic
+                    exit_code = main(["login-diagnostic", "--config", str(config_path)])
+                emitted = out.getvalue() + err.getvalue()
+                self.assertNotIn(str(root), emitted, "no filesystem path is ever emitted")
+        finally:
+            for name, value in old.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+        return exit_code, out.getvalue(), err.getvalue(), credentials
+
+    def one_document(self, out: str) -> dict:
+        lines = out.strip().splitlines()
+        self.assertEqual(len(lines), 1, "exactly one document")
+        return json.loads(lines[0])
+
+    def assert_nothing_private_escaped(self, out: str, err: str, credentials: dict) -> None:
+        emitted = out + err
+        self.assertEqual(err, "", "no stderr surface at all, traceback or otherwise")
+        for fragment in UNEXPECTED_OBSERVATION_FRAGMENTS + tuple(credentials.values()):
+            with self.subTest(fragment=fragment):
+                self.assertNotIn(fragment, emitted)
+        self.assertNotIn(STEP_FAILURE_TEXT, emitted)
+
+    def assert_unclassified_envelope(self, document: dict) -> None:
+        self.assertEqual(document["schema"], cli.LOGIN_DIAGNOSTIC_SCHEMA)
+        self.assertEqual(document["status"], ACTION_REQUIRED)
+        self.assertIsNone(document["classification"])
+        self.assertEqual(
+            document["support_ref"], cli.DIAGNOSTIC_UNCLASSIFIED_SUPPORT_REF
+        )
+        self.assertEqual(
+            document["post_submit"],
+            portal_module.unobserved_login_witnesses(include_url=True),
+            "an observation that could not be completed reports the unobserved shape",
+        )
+
+    # ---- after the one submit has already been dispatched ---- #
+
+    def test_an_unexpected_post_submit_failure_keeps_a_proven_dispatch(self) -> None:
+        """A proven dispatch stays proven: the observation failed, not the submit."""
+        submit = FakeLocator(label="submit")
+        page = login_page(page_cls=UnobservablePage, submit=submit)
+
+        exit_code, out, err, credentials = self.run_cli_diagnostic(page)
+
+        document = self.one_document(out)
+        self.assertEqual(exit_code, 20)
+        self.assert_unclassified_envelope(document)
+        self.assertIs(document["submit_dispatched"], True)
+        self.assertEqual(document["submit_outcome"], portal_module.SUBMIT_DISPATCHED)
+        self.assertEqual(submit.clicks, 1, "one real submit, never retried")
+        self.assert_nothing_private_escaped(out, err, credentials)
+
+    def test_an_unexpected_post_submit_failure_keeps_an_uncertain_dispatch(self) -> None:
+        """An uncertain dispatch stays uncertain: it is never promoted or demoted."""
+        submit = FakeLocator(click_error=step_failure(), label="submit")
+        page = login_page(page_cls=UnobservablePage, submit=submit)
+
+        exit_code, out, err, credentials = self.run_cli_diagnostic(page)
+
+        document = self.one_document(out)
+        self.assertEqual(exit_code, 20)
+        self.assert_unclassified_envelope(document)
+        self.assertIs(document["submit_dispatched"], True)
+        self.assertEqual(
+            document["submit_outcome"], portal_module.SUBMIT_DISPATCH_UNCERTAIN
+        )
+        self.assertEqual(submit.clicks, 1, "an uncertain dispatch is never re-sent")
+        self.assert_nothing_private_escaped(out, err, credentials)
+
+    def test_the_failed_observation_never_reaches_a_business_path(self) -> None:
+        """The envelope is a return, not a new route into the application."""
+
+        def explode(*_args, **_kwargs):
+            raise AssertionError("the diagnostic reached a business path")
+
+        submit = FakeLocator(label="submit")
+        page = login_page(page_cls=UnobservablePage, submit=submit)
+        with contextlib.ExitStack() as stack:
+            for name in ("_await_billing_manager", "inventory", "download"):
+                stack.enter_context(mock.patch.object(PlaywrightPortal, name, explode))
+            exit_code, out, _err, _credentials = self.run_cli_diagnostic(page)
+        self.assertEqual(exit_code, 20)
+        self.assertIs(self.one_document(out)["submit_dispatched"], True)
+
+    # ---- before anything was dispatched ---- #
+
+    def test_an_unexpected_pre_dispatch_failure_reports_not_dispatched(self) -> None:
+        """Nothing was sent, so the closed unobserved document says exactly that."""
+        submit = FakeLocator(label="submit")
+        page = login_page(page_cls=UnobservablePage, submit=submit)
+
+        def unexpected(*_args, **_kwargs):
+            raise RuntimeError(UNEXPECTED_OBSERVATION_TEXT)
+
+        with mock.patch.object(PlaywrightPortal, "_require_page", unexpected):
+            exit_code, out, err, credentials = self.run_cli_diagnostic(page)
+
+        document = self.one_document(out)
+        self.assertEqual(exit_code, 20)
+        self.assertEqual(document["schema"], cli.LOGIN_DIAGNOSTIC_SCHEMA)
+        self.assertEqual(document["status"], ACTION_REQUIRED)
+        self.assertIsNone(document["classification"])
+        self.assertIs(document["submit_dispatched"], False)
+        self.assertEqual(document["submit_outcome"], portal_module.SUBMIT_NOT_DISPATCHED)
+        self.assertEqual(document["support_ref"], cli.UNCLASSIFIED_SUPPORT_REF)
+        self.assertEqual(
+            document["pre_submit"], portal_module.unobserved_login_witnesses()
+        )
+        self.assertEqual(
+            document["post_submit"],
+            portal_module.unobserved_login_witnesses(include_url=True),
+        )
+        self.assertEqual(submit.clicks, 0, "nothing was ever dispatched")
+        self.assertEqual(page.goto_calls, 0)
+        self.assert_nothing_private_escaped(out, err, credentials)
 
 
 if __name__ == "__main__":

@@ -699,7 +699,21 @@ class PlaywrightPortal:
         # page is the only remaining evidence. It is never promoted to a proven
         # successful dispatch by anything the observation finds.
         outcome = SUBMIT_DISPATCHED if failure is None else SUBMIT_DISPATCH_UNCERTAIN
-        post_submit, classification = self._observe_after_submit(page, pre_submit, entry_url)
+        try:
+            post_submit, classification = self._observe_after_submit(page, pre_submit, entry_url)
+        except Exception:
+            # The submit outcome was settled at the dispatch boundary and stays
+            # exactly as it was settled. An observation that could not be
+            # completed is evidence about the observation, never about what was
+            # sent: it can neither promote an uncertain dispatch to a proven one
+            # nor demote a proven one, and the Login control is never touched
+            # again. The unobserved shape is reported rather than a partial one,
+            # and nothing derived from the exception is retained, so no
+            # free-form text can reach an output surface. `BaseException` is
+            # deliberately outside this arm: an interrupt or an interpreter exit
+            # is not a portal condition and must not become a diagnostic result.
+            post_submit = unobserved_login_witnesses(include_url=True)
+            classification = None
         return LoginDiagnosticResult(
             classification=classification,
             submit_dispatched=True,

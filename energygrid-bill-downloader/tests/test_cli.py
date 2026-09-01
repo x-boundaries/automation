@@ -1094,6 +1094,77 @@ class LoginDiagnosticCliTests(unittest.TestCase):
 
         check(document)
 
+    # ---- the unexpected-exception boundary ---- #
+
+    def test_an_unexpected_exception_still_emits_one_bounded_document(self) -> None:
+        """The last resort is a closed document, never a traceback and exit 1."""
+        hostile = RuntimeError(
+            "synthetic private hostile value: password=hunter2 at "
+            "https://portal.example.invalid/session for SYNTHETIC-INTENDED-ACCOUNT"
+        )
+        with tempfile.TemporaryDirectory() as name:
+            exit_code, out, err = self.run_diagnostic(
+                Path(name), diagnostic_portal(error=hostile)
+            )
+        document = self.document(out)
+        self.assertEqual(exit_code, 20)
+        self.assertEqual(document["status"], ACTION_REQUIRED)
+        self.assertIsNone(document["classification"])
+        self.assertIs(document["submit_dispatched"], False)
+        self.assertEqual(
+            document["submit_outcome"], portal_module.SUBMIT_NOT_DISPATCHED
+        )
+        self.assertEqual(document["support_ref"], cli.UNCLASSIFIED_SUPPORT_REF)
+        self.assertEqual(
+            document["pre_submit"], portal_module.unobserved_login_witnesses()
+        )
+        self.assertEqual(
+            document["post_submit"],
+            portal_module.unobserved_login_witnesses(include_url=True),
+        )
+        self.assertEqual(err, "", "no traceback, and no stderr surface at all")
+        for fragment in (
+            "synthetic private hostile value",
+            "hunter2",
+            "https://",
+            "portal.example.invalid",
+            "SYNTHETIC-INTENDED-ACCOUNT",
+            "Traceback",
+            "RuntimeError",
+            DIAGNOSTIC_SENTINEL_USERNAME,
+            DIAGNOSTIC_SENTINEL_PASSWORD,
+        ):
+            with self.subTest(fragment=fragment):
+                self.assertNotIn(fragment, out + err)
+
+    def test_process_control_is_never_converted_into_a_diagnostic_result(self) -> None:
+        """`KeyboardInterrupt` and `SystemExit` are process control, not an outcome."""
+        for raised in (KeyboardInterrupt(), SystemExit(3)):
+            with self.subTest(raised=type(raised).__name__):
+                with tempfile.TemporaryDirectory() as name:
+                    with self.assertRaises(type(raised)):
+                        self.run_diagnostic(
+                            Path(name), diagnostic_portal(error=raised)
+                        )
+
+    def test_the_boundary_leaves_no_document_behind_when_it_propagates(self) -> None:
+        """A propagated interrupt must not also have emitted a result."""
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            config_path = self.write_diagnostic_config(root)
+            out = io.StringIO()
+            err = io.StringIO()
+            original = cli.PlaywrightPortal
+            cli.PlaywrightPortal = diagnostic_portal(error=KeyboardInterrupt())
+            try:
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                    with self.assertRaises(KeyboardInterrupt):
+                        cli.main(["login-diagnostic", "--config", str(config_path)])
+            finally:
+                cli.PlaywrightPortal = original
+        self.assertEqual(out.getvalue(), "", "no document is emitted for an interrupt")
+        self.assertEqual(err.getvalue(), "")
+
     def test_the_diagnostic_reference_is_a_bounded_ascii_identifier(self) -> None:
         reference = cli.DIAGNOSTIC_UNCLASSIFIED_SUPPORT_REF
         self.assertEqual(reference, "EG_LOGIN_DIAGNOSTIC_UNCLASSIFIED")
