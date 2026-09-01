@@ -50,19 +50,35 @@ function Set-EgInstallerCheck {
 function Write-EgInstallerStatus {
     # The installer's bounded real-path stdout shape (DD-06). It carries no path, no
     # environment value, no account identity, and no Git output text.
+    #
+    # phase, exception_type and hresult are ALWAYS present, in this fixed order, on every
+    # real path including success, and are the empty string when no phase failed and no
+    # exception was caught. That mirrors the PublicationResult rule in DD-07: a field that
+    # is sometimes absent forces a consumer to distinguish absent from empty, and the whole
+    # point of this shape is that one parse works on every outcome.
+    #
+    # These three fields are exactly what design section 11.1 permits to be reported, and
+    # nothing else is added: no message text, no path, no file name, no operation
+    # identifier, and no identity.
     param(
         [Parameter(Mandatory)]
         [ValidateSet('INSTALLED', 'ALREADY_CURRENT', 'FAILED_PREFLIGHT',
                      'FAILED_ROLLED_BACK', 'FAILED_ROLLBACK_INCOMPLETE')]
         [string]$Status,
         [AllowEmptyString()][string]$SupportRef = '',
-        [int]$BackupsRemaining = 0
+        [int]$BackupsRemaining = 0,
+        [AllowEmptyString()][string]$Phase = '',
+        [AllowEmptyString()][string]$ExceptionType = '',
+        [AllowEmptyString()][string]$HResult = ''
     )
 
     $payload = [ordered]@{}
     $payload['status'] = $Status
     $payload['support_ref'] = $SupportRef
     $payload['backups_remaining'] = $BackupsRemaining
+    $payload['phase'] = $Phase
+    $payload['exception_type'] = $ExceptionType
+    $payload['hresult'] = $HResult
     Write-Output ($payload | ConvertTo-Json -Depth 8 -Compress)
 }
 
@@ -257,8 +273,23 @@ $transaction = New-EgTransactionState -OperationId $operationId
 # publishing any of them. Staging files are created in the destination directory only,
 # never in a shared temporary directory, and are named exclusively by the reserved Class B
 # contract, which is what makes them recognisable to the launcher later.
+#
+# Every staging substep records WHICH substep failed, and the two substeps that can raise
+# additionally record the exception type name and the HRESULT. Before this, all five
+# collapsed into one support reference with no exception evidence at all, which made a
+# staging write failure an evidence dead end: the operator learned that staging failed but
+# never which class of failure it was. Design section 7.2 rule 5 already required the type
+# and HRESULT to be recorded; section 17.3 already required the failing phase. This is
+# those rules applied to Phase 1 staging.
+#
+# The hash, parse and manifest-hash substeps do NOT raise, so they carry a phase and leave
+# the exception fields empty. That is what keeps a verification failure permanently
+# distinguishable from a write exception rather than inheriting its classification.
 $stagingOk = $true
 $stagingFailureRef = 'EG_LAUNCHER_INSTALL_STAGING_FAILED'
+$stagingPhase = ''
+$stagingExceptionType = ''
+$stagingHResult = ''
 foreach ($member in $deployable) {
     $destination = Join-Path $resolvedLauncherRoot $member.Name
     $stagingPath = Join-Path $resolvedLauncherRoot (New-EgResidueName -Kind 'staging' `
@@ -270,14 +301,24 @@ foreach ($member in $deployable) {
         [System.IO.File]::WriteAllBytes($stagingPath, [System.IO.File]::ReadAllBytes($member.SourcePath))
     }
     catch {
+        # The real exception, unwrapped from the wrapper PowerShell puts around a failed
+        # .NET method call, so the recorded type and HRESULT are the actual ones.
+        $stagingException = Get-EgUnderlyingException -Exception $_.Exception
+        $stagingPhase = 'staging_write_executable'
+        $stagingExceptionType = [string]$stagingException.GetType().FullName
+        $stagingHResult = Get-EgExceptionHResultString -Exception $stagingException
+        $stagingFailureRef = Get-EgStagingWriteSupportRef -Exception $stagingException
+        $stagingException = $null
         $stagingOk = $false
         break
     }
     if ((Get-EgFileSha256 -Path $stagingPath) -cne $sourceHashes[$member.Name]) {
+        $stagingPhase = 'staging_hash_executable'
         $stagingOk = $false
         break
     }
     if (-not (Test-EgPowerShellFileParsesCleanly -Path $stagingPath)) {
+        $stagingPhase = 'staging_parse_executable'
         $stagingOk = $false
         break
     }
@@ -301,6 +342,14 @@ if ($stagingOk) {
         Write-EgUtf8NoBomText -Path $manifestStagingPath -Text $candidateManifestJson
     }
     catch {
+        # The manifest staging write is the second raising substep and is classified
+        # identically to the executable one, so neither is an evidence dead end.
+        $stagingException = Get-EgUnderlyingException -Exception $_.Exception
+        $stagingPhase = 'staging_write_manifest'
+        $stagingExceptionType = [string]$stagingException.GetType().FullName
+        $stagingHResult = Get-EgExceptionHResultString -Exception $stagingException
+        $stagingFailureRef = Get-EgStagingWriteSupportRef -Exception $stagingException
+        $stagingException = $null
         $stagingOk = $false
     }
 }
@@ -308,6 +357,7 @@ $manifestStagingSha = ''
 if ($stagingOk) {
     $manifestStagingSha = Get-EgFileSha256 -Path $manifestStagingPath
     if ([string]::IsNullOrEmpty($manifestStagingSha)) {
+        $stagingPhase = 'staging_hash_manifest'
         $stagingOk = $false
     }
 }
@@ -330,7 +380,8 @@ if (-not $stagingOk) {
     # destination has advanced. Staging residue is retained for inspection and carries a
     # reserved Class B name, so it does not fail the launcher's next preflight.
     Write-EgInstallerStatus -Status 'FAILED_PREFLIGHT' -SupportRef $stagingFailureRef `
-        -BackupsRemaining 0
+        -BackupsRemaining 0 -Phase $stagingPhase -ExceptionType $stagingExceptionType `
+        -HResult $stagingHResult
     exit $script:EgLauncherExitCodes['InstallPreMutationFailed']
 }
 
