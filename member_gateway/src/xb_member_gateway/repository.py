@@ -652,35 +652,32 @@ class InMemoryRepository:
                         raise RepositoryError("reconciliation_case_required")
                     self._require_reconciliation_evidence(result, reconciliation_case_id)
                 return self._copy(existing), True
-            reconciliation_projection = (
-                existing is not None
-                and not require_lease
-                and existing.status == ResultStatus.WRITE_OUTCOME_UNCERTAIN
-            )
-            reconciliation_replacement = (
-                reconciliation_projection
-                and result.status != ResultStatus.WRITE_OUTCOME_UNCERTAIN
-            )
-            if existing is not None and not reconciliation_projection and (
-                existing.status != ResultStatus.WRITE_OUTCOME_UNCERTAIN
-                or result.status == ResultStatus.WRITE_OUTCOME_UNCERTAIN
-            ):
-                self._result_conflicts.append({"job_id": result.job_id, "code": "result_payload_conflict"})
-                raise ResultConflict("result_payload_conflict")
+            reconciliation_projection = False
+            if existing is not None:
+                if require_lease or existing.status != ResultStatus.WRITE_OUTCOME_UNCERTAIN:
+                    self._result_conflicts.append({"job_id": result.job_id, "code": "result_payload_conflict"})
+                    raise ResultConflict("result_payload_conflict")
+                reconciliation_projection = True
             if require_lease:
                 if not worker_id:
                     raise LeaseConflict("worker_identity_required")
                 self._lease(job, worker_id, current)
             else:
+                if not reconciliation_projection:
+                    raise ResultConflict("reconciliation_projection_missing")
                 if reconciliation_case_id is None:
                     raise RepositoryError("reconciliation_case_required")
                 self._require_reconciliation_evidence(result, reconciliation_case_id)
+                current_projection = self._results.get(result.job_id)
+                if (
+                    current_projection is None
+                    or current_projection.result_hash != existing.result_hash
+                    or current_projection.status != ResultStatus.WRITE_OUTCOME_UNCERTAIN
+                ):
+                    self._result_conflicts.append({"job_id": result.job_id, "code": "reconciliation_projection_stale"})
+                    raise ResultConflict("reconciliation_projection_stale")
             if reconciliation_projection and result.status == ResultStatus.WRITE_OUTCOME_UNCERTAIN:
                 return self._copy(existing), True
-            if existing is not None and not reconciliation_replacement:
-                if existing.status != ResultStatus.WRITE_OUTCOME_UNCERTAIN or result.status == ResultStatus.WRITE_OUTCOME_UNCERTAIN:
-                    self._result_conflicts.append({"job_id": result.job_id, "code": "result_payload_conflict"})
-                    raise ResultConflict("result_payload_conflict")
             if result.status == ResultStatus.CREATED_VERIFIED and job.state == JobState.WRITING:
                 self._move(job, JobState.READBACK)
             target = {
@@ -694,8 +691,8 @@ class InMemoryRepository:
             job.result_status = result.status
             job.save_invocation_count = result.save_invocation_count
             job.last_error_code = result.error_code
-            self._results[result.job_id] = self._copy(result)
             self._result_history.setdefault(result.job_id, []).append(self._copy(result))
+            self._results[result.job_id] = self._copy(result)
             if require_lease:
                 self._leases.pop(result.job_id, None)
                 job.lease_owner = None
@@ -1355,39 +1352,33 @@ class PostgresRepository:
                             raise RepositoryError("reconciliation_case_required")
                         self._require_reconciliation_evidence(cursor, result, reconciliation_case_id)
                     return result, True
-                reconciliation_projection = (
-                    existing is not None
-                    and not require_lease
-                    and existing[1] == ResultStatus.WRITE_OUTCOME_UNCERTAIN.value
-                )
-                reconciliation_replacement = (
-                    reconciliation_projection
-                    and result.status != ResultStatus.WRITE_OUTCOME_UNCERTAIN
-                )
-                if existing is not None and not reconciliation_projection and (
-                    existing[1] != ResultStatus.WRITE_OUTCOME_UNCERTAIN.value
-                    or result.status == ResultStatus.WRITE_OUTCOME_UNCERTAIN
-                ):
-                    cursor.execute("INSERT INTO xb_member_gateway.result_conflicts(job_id,expected_hash,observed_hash) VALUES(%s,%s,%s)", (result.job_id,existing[0],result.result_hash))
-                    raise ResultConflict("result_payload_conflict")
+                reconciliation_projection = False
+                if existing is not None:
+                    if require_lease or existing[1] != ResultStatus.WRITE_OUTCOME_UNCERTAIN.value:
+                        cursor.execute("INSERT INTO xb_member_gateway.result_conflicts(job_id,expected_hash,observed_hash) VALUES(%s,%s,%s)", (result.job_id,existing[0],result.result_hash))
+                        raise ResultConflict("result_payload_conflict")
+                    reconciliation_projection = True
                 if require_lease:
                     if not worker_id:
                         raise LeaseConflict("worker_identity_required")
                     self._require_lease(cursor,job,worker_id,current)
                 else:
+                    if not reconciliation_projection:
+                        raise ResultConflict("reconciliation_projection_missing")
                     if reconciliation_case_id is None:
                         raise RepositoryError("reconciliation_case_required")
                     self._require_reconciliation_evidence(cursor, result, reconciliation_case_id)
                 if reconciliation_projection and result.status == ResultStatus.WRITE_OUTCOME_UNCERTAIN:
                     return result, True
-                if existing is not None and not reconciliation_replacement:
-                    if existing[1] != ResultStatus.WRITE_OUTCOME_UNCERTAIN.value or result.status == ResultStatus.WRITE_OUTCOME_UNCERTAIN:
-                        cursor.execute("INSERT INTO xb_member_gateway.result_conflicts(job_id,expected_hash,observed_hash) VALUES(%s,%s,%s)", (result.job_id,existing[0],result.result_hash))
-                        raise ResultConflict("result_payload_conflict")
-                    cursor.execute("DELETE FROM xb_member_gateway.results WHERE job_id=%s", (result.job_id,))
                 internal_fence = internal_fence_id(result.dispatch_fence_id)
-                cursor.execute("INSERT INTO xb_member_gateway.result_events(job_id,result_hash,status,member_no,dispatch_fence_id,save_invocation_count,readback_found,readback_match,reconciliation_required,error_code,acknowledged_at) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", (result.job_id,result.result_hash,result.status.value,result.member_no,internal_fence,result.save_invocation_count,result.readback_found,result.readback_match,result.reconciliation_required,result.error_code,current))
-                cursor.execute("INSERT INTO xb_member_gateway.results(job_id,result_hash,status,member_no,dispatch_fence_id,save_invocation_count,readback_found,readback_match,reconciliation_required,error_code,acknowledged_at) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", (result.job_id,result.result_hash,result.status.value,result.member_no,internal_fence,result.save_invocation_count,result.readback_found,result.readback_match,result.reconciliation_required,result.error_code,current))
+                event_params = (result.job_id,result.result_hash,result.status.value,result.member_no,internal_fence,result.save_invocation_count,result.readback_found,result.readback_match,result.reconciliation_required,result.error_code,current)
+                cursor.execute("INSERT INTO xb_member_gateway.result_events(job_id,result_hash,status,member_no,dispatch_fence_id,save_invocation_count,readback_found,readback_match,reconciliation_required,error_code,acknowledged_at) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", event_params)
+                if reconciliation_projection:
+                    cursor.execute("UPDATE xb_member_gateway.results SET result_hash=%s,status=%s,member_no=%s,dispatch_fence_id=%s,save_invocation_count=%s,readback_found=%s,readback_match=%s,reconciliation_required=%s,error_code=%s,acknowledged_at=%s WHERE job_id=%s AND result_hash=%s AND status=%s RETURNING result_id", (result.result_hash,result.status.value,result.member_no,internal_fence,result.save_invocation_count,result.readback_found,result.readback_match,result.reconciliation_required,result.error_code,current,result.job_id,existing[0],ResultStatus.WRITE_OUTCOME_UNCERTAIN.value))
+                    if cursor.fetchone() is None:
+                        raise ResultConflict("reconciliation_projection_stale")
+                else:
+                    cursor.execute("INSERT INTO xb_member_gateway.results(job_id,result_hash,status,member_no,dispatch_fence_id,save_invocation_count,readback_found,readback_match,reconciliation_required,error_code,acknowledged_at) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", event_params)
                 if result.status == ResultStatus.CREATED_VERIFIED and job.state == JobState.WRITING:
                     self._advance(cursor,job,JobState.READBACK,current)
                 target = {ResultStatus.CREATED_VERIFIED:JobState.CREATED_VERIFIED,ResultStatus.WRITE_OUTCOME_UNCERTAIN:JobState.WRITE_OUTCOME_UNCERTAIN,ResultStatus.CONFIRMED_NOT_CREATED:JobState.CONFIRMED_NOT_CREATED,ResultStatus.CREATED_READBACK_MISMATCH:JobState.CREATED_READBACK_MISMATCH}[result.status]

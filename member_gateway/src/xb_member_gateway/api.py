@@ -123,6 +123,9 @@ class GatewayService:
             "reasons": sorted(set(reasons)),
             "worker_concurrency": config.worker_concurrency,
             "claim_size": config.claim_size,
+            "lease_seconds": config.lease_seconds,
+            "heartbeat_seconds": config.heartbeat_seconds,
+            "execution_deadline_seconds": config.execution_deadline_seconds,
         }
 
     def ingest(self, body: Mapping[str, Any]) -> dict[str, Any]:

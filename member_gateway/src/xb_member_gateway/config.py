@@ -107,7 +107,9 @@ class GatewayConfig:
             raise ConfigError("environment_invalid")
         if self.lease_seconds <= self.heartbeat_seconds:
             raise ConfigError("heartbeat_must_be_shorter_than_lease")
-        if self.execution_deadline_seconds > self.lease_seconds:
+        if self.heartbeat_seconds >= self.execution_deadline_seconds:
+            raise ConfigError("heartbeat_must_be_shorter_than_execution_deadline")
+        if self.execution_deadline_seconds >= self.lease_seconds:
             raise ConfigError("execution_deadline_exceeds_lease")
         if self.worker_concurrency != 1:
             raise ConfigError("worker_concurrency_must_be_one")

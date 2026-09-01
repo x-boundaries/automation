@@ -40,6 +40,15 @@ identity. Do not substitute a username, SID, hostname, or private path.
 Claim transactions hold the existing `kill_switch_enabled` control row lock for
 their full transaction, providing the durable singleton mutex across processes.
 
+Before the irreversible call, refresh the job lease with the current
+`state_version`. The worker keeps one `ws-` session and starts the reviewed
+AutoCount writer in one supervised child process. It renews the lease on the
+configured heartbeat cadence and uses `attempt_started_at` plus the configured
+execution deadline as the hard boundary. A heartbeat failure or deadline causes
+the child to be terminated and its exit to be positively observed before lease
+protection can lapse. Failure to confirm exit is fail closed; it never starts a
+second writer or retries `SaveMember`.
+
 ## Operating sequence after a separately approved activation
 
 The kill switch defaults to ON. To engage it, use the separately scoped

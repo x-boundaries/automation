@@ -85,6 +85,16 @@ same bearer used with another session cannot inherit or operate the first
 session's lease. The session is bound to claim, lease/heartbeat, allocation,
 write-intent, dispatch-fence, and result operations.
 
+The worker refreshes the same lease, with the current `state_version`, immediately
+before starting the irreversible AutoCount call. The call runs in one supervised
+child process while the singleton worker retains the gateway session. The parent
+renews the lease on the configured heartbeat cadence and requires the returned
+state version to advance and the lease to remain beyond the absolute execution
+deadline. A heartbeat failure, deadline, or protection cutoff terminates the child
+and waits until process exit is positively observed before the lease protection can
+lapse. If exit cannot be confirmed, the worker fails closed. An already-dispatched
+ambiguous outcome remains `WRITE_OUTCOME_UNCERTAIN`; there is no SaveMember retry.
+
 ## Kill-switch control
 
 The repository control plane exposes only the scoped member-gateway kill-switch
@@ -158,7 +168,10 @@ attempts, leases, allocation probes and bindings, write intents, dispatch
 fences, append-only result events plus a current result projection,
 reconciliation cases/checks, rejections, dead letters, control flags, audit
 events, and schema versions. Foreign keys use restrictive delete behaviour.
-No database transaction remains open across an AutoCount call.
+The current projection is replaced by a conditional update only after the
+immutable result event is recorded in the same transaction; the unique `job_id`
+projection is never delete/reinserted. No database transaction remains open
+across an AutoCount call.
 
 Normal logs contain only run/request/job/attempt metadata, state, operation,
 safe error codes, timing/counts, and versioned keyed HMAC references. Names,

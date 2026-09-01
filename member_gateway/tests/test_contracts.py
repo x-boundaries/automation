@@ -73,6 +73,18 @@ class ContractSurfaceTests(unittest.TestCase):
         self.assertFalse(loaded.gateway_ready)
         self.assertIn("member_no_max_length_required", loaded.readiness_reasons())
 
+    def test_writer_timing_order_is_strictly_nested(self):
+        base = {
+            "member_no_max_length": 20,
+            "worker_token_sha256": "0" * 64,
+            "production_activation_enabled": True,
+            "kill_switch_enabled": False,
+        }
+        with self.assertRaisesRegex(ConfigError, "heartbeat_must_be_shorter_than_execution_deadline"):
+            GatewayConfig.from_mapping({**base, "heartbeat_seconds": 300, "execution_deadline_seconds": 300})
+        with self.assertRaisesRegex(ConfigError, "execution_deadline_exceeds_lease"):
+            GatewayConfig.from_mapping({**base, "lease_seconds": 300, "execution_deadline_seconds": 300})
+
     def test_migration_has_durable_model_and_restrictive_history(self):
         first = (ROOT / "member_gateway/migrations/0001_member_gateway.sql").read_text(
             encoding="utf-8"
