@@ -3271,14 +3271,41 @@ $denyCreate = New-Object System.Security.AccessControl.FileSystemAccessRule(
     'None',
     'Deny')
 
-$acl = Get-Acl -LiteralPath $Root
+# Only the ACCESS section is read and written. The Set-Acl cmdlet persists the owner and
+# group sections too, which needs a privilege the runner does not hold when the scratch
+# directory is owned by Administrators rather than by the running user, and that made the
+# 5.1 boundary skip silently instead of exercising the contract. GetAccessControl and
+# SetAccessControl write back only the section that was modified.
+$info = New-Object System.IO.DirectoryInfo($Root)
+$sections = [System.Security.AccessControl.AccessControlSections]::Access
+
+$acl = $null
+if ($null -ne $info.PSObject.Methods['GetAccessControl']) {
+    $acl = $info.GetAccessControl($sections)
+}
+elseif ($null -ne ([System.IO.FileSystemAclExtensions] -as [type])) {
+    $acl = [System.IO.FileSystemAclExtensions]::GetAccessControl($info, $sections)
+}
+else {
+    $acl = Get-Acl -LiteralPath $Root
+}
+
 if ($Mode -ceq 'lock') {
     $acl.AddAccessRule($denyCreate)
 }
 else {
     [void]$acl.RemoveAccessRuleSpecific($denyCreate)
 }
-Set-Acl -LiteralPath $Root -AclObject $acl
+
+if ($null -ne $info.PSObject.Methods['SetAccessControl']) {
+    $info.SetAccessControl($acl)
+}
+elseif ($null -ne ([System.IO.FileSystemAclExtensions] -as [type])) {
+    [System.IO.FileSystemAclExtensions]::SetAccessControl($info, $acl)
+}
+else {
+    Set-Acl -LiteralPath $Root -AclObject $acl
+}
 Write-Output 'OK'
 """
 
