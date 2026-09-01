@@ -76,14 +76,25 @@ lock for the complete claim transaction. That row is the durable singleton
 mutex: separate PostgreSQL connections cannot both observe an empty active-lease
 set and claim parallel jobs.
 
-The bearer credential authenticates the worker capability; it is not the lease
-identity. Every worker request carries `X-XB-Worker-Session` with a generated
-`ws-` plus 32 lower-case hexadecimal characters. The value is generated locally
-for one worker process/run, is validated against that closed pattern, and is
-not a secret, hostname, Windows/account identity, SID, or private path. The
-same bearer used with another session cannot inherit or operate the first
-session's lease. The session is bound to claim, lease/heartbeat, allocation,
-write-intent, dispatch-fence, and result operations.
+The bearer credential authenticates the caller; it is not the lease identity.
+Production binds two distinct runtime-only credential sources: the normal worker
+credential receives ordinary worker scopes, while the recovery credential
+receives only `worker.writer_termination_recovery`. The normal worker credential
+does not receive recovery scope, and the recovery credential is not a worker,
+source-ingest, result, reconciliation, or control credential. Readiness and
+environment authentication fail closed if either configured digest is missing,
+the digests match, or the credential sources alias. Credential values and
+digests remain outside Git and ordinary logs.
+
+Every worker request carries `X-XB-Worker-Session` with a generated `ws-` plus
+32 lower-case hexadecimal characters. The value is generated locally for one
+worker process/run, is validated against that closed pattern, and is not a
+secret, hostname, Windows/account identity, SID, or private path. The same
+bearer used with another session cannot inherit or operate the first session's
+lease. The normal worker session is bound to claim, lease/heartbeat, allocation,
+write-intent, dispatch-fence, and result operations. Recovery uses a fresh
+host-bound session and the exact recorded execution bindings, independently of
+the normal worker credential.
 
 The worker refreshes the same lease, with the current `state_version`, immediately
 before starting the irreversible AutoCount call. The call runs in one supervised
@@ -130,9 +141,10 @@ repository atomically creates the single immutable
 `WRITE_OUTCOME_UNCERTAIN` event and projection, moves the job to that existing
 result state, clears the hold, and releases the stale lease. A recovery operation
 is narrower than ordinary writer authority, must be fresh host-bound evidence,
-and can only resolve the termination side of a quarantined fence. Legacy
-post-fence uncertainty is materialized as legacy-unproven quarantine; it is not
-automatically cleared or made reconcilable.
+and can only resolve the termination side of a quarantined fence. The recovery
+principal has no `job.read` scope because the recovery operation does not require
+it. Legacy post-fence uncertainty is materialized as legacy-unproven quarantine;
+it is not automatically cleared or made reconcilable.
 
 ## Kill-switch control
 
@@ -238,7 +250,8 @@ Before any separately controlled activation, an owner must positively verify:
 
 - the effective account-book MemberNo length and accepted field types;
 - the licensed official AutoCount assembly/version and session factory;
-- the private HTTPS gateway/auth deployment and worker credential issuance;
+- the private HTTPS gateway/auth deployment, distinct normal-worker and
+  recovery credential issuance, source binding, and digest configuration;
 - PostgreSQL provisioning, migration application, backup, monitoring, and access policy;
 - Google Forms API authentication, form alias/question mapping, and pagination policy;
 - operator approval, kill-switch ownership, reconciliation handling, and rollback/runbook ownership.

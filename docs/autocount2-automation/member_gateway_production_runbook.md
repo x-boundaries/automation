@@ -13,9 +13,10 @@ fixtures only. Do not set production credentials or enable the workflow while
 reviewing the branch.
 
 The committed example config must remain activation-disabled, kill-switch-on,
-without a MemberNo limit, and without a worker-token digest. Those values make
-readiness fail closed until an owner supplies deployment configuration outside
-Git.
+without a MemberNo limit, and without worker or recovery credential digests.
+Those values make readiness fail closed until an owner supplies deployment
+configuration outside Git. The worker and recovery credential sources must also
+remain distinct; equal digests or aliased sources are refused.
 
 ## Pre-activation review
 
@@ -31,8 +32,11 @@ PDPA acknowledgement. Marketing `No` must remain eligible for membership
 creation.
 
 Confirm private transport, authentication scopes, database backups, operator
-access, alerting, and manual reconciliation ownership. Keep worker concurrency
-and claim size at one for this initial topology. The repository must enforce
+access, alerting, and manual reconciliation ownership. Bind the normal worker
+credential to ordinary worker scopes only, and bind a separate recovery
+credential to only `worker.writer_termination_recovery`; do not grant recovery
+authority to the normal worker or ordinary worker/control authority to recovery.
+Keep worker concurrency and claim size at one for this initial topology. The repository must enforce
 one active non-expired worker lease across concurrent claim requests. A worker
 run must generate one bounded `ws-` session identifier and send it in
 `X-XB-Worker-Session`; it is an execution identity, not a credential or host
@@ -88,10 +92,11 @@ allocation, and write-intent lineage in `WRITER_TERMINATION_UNCONFIRMED` with a
 watchdog callback, or a restart. A quarantined job cannot be claimed,
 reallocated, written, expired into ordinary uncertainty, or reconciled.
 
-Only a fresh, host-bound recovery authority with exact recorded process
-identity and positive exit evidence may resolve the termination side of a
-quarantined fence. Recovery does not retry SaveMember or allocate a new
-MemberNo. When termination is confirmed but the business outcome is unknown,
+Only the distinct runtime recovery principal, with a fresh host-bound session,
+exact recorded process identity, and positive exit evidence, may resolve the
+termination side of a quarantined fence. The normal worker principal is denied
+this route even if it supplies a newly created worker session. Recovery does not
+retry SaveMember or allocate a new MemberNo. When termination is confirmed but the business outcome is unknown,
 the repository atomically creates exactly one immutable
 `WRITE_OUTCOME_UNCERTAIN` event and current projection, moves the job to that
 existing result state, clears the hold, and releases the stale lease. The

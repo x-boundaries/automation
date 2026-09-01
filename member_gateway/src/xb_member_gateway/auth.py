@@ -86,16 +86,27 @@ class BearerTokenAuthenticator:
 
     @classmethod
     def from_environment(cls, config: GatewayConfig) -> "BearerTokenAuthenticator":
-        token = os.environ.get(config.worker_token_env, "")
-        if not token:
+        try:
+            config.validate()
+        except ValueError:
             return cls({})
-        digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
-        configured_digest = config.worker_token_sha256 or digest
-        if not hmac.compare_digest(configured_digest.lower(), digest):
+        if config.worker_token_sha256 is None or config.recovery_token_sha256 is None:
+            return cls({})
+        worker_token = os.environ.get(config.worker_token_env, "")
+        recovery_token = os.environ.get(config.recovery_token_env, "")
+        if not worker_token or not recovery_token:
+            return cls({})
+        worker_digest = hashlib.sha256(worker_token.encode("utf-8")).hexdigest()
+        recovery_digest = hashlib.sha256(recovery_token.encode("utf-8")).hexdigest()
+        if hmac.compare_digest(worker_digest, recovery_digest):
+            return cls({})
+        if not hmac.compare_digest(config.worker_token_sha256.lower(), worker_digest):
+            return cls({})
+        if not hmac.compare_digest(config.recovery_token_sha256.lower(), recovery_digest):
             return cls({})
         return cls(
             {
-                digest: Principal(
+                worker_digest: Principal(
                     subject="configured-worker",
                     scopes=frozenset(
                         {
@@ -107,13 +118,16 @@ class BearerTokenAuthenticator:
                             "worker.writer_register",
                             "worker.writer_termination",
                             "worker.writer_quarantine",
-                            "worker.writer_termination_recovery",
                             "worker.result",
                             "worker.reconcile",
                             "job.read",
                         }
                     ),
-                )
+                ),
+                recovery_digest: Principal(
+                    subject="configured-recovery",
+                    scopes=frozenset({"worker.writer_termination_recovery"}),
+                ),
             }
         )
 

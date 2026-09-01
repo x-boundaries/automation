@@ -46,8 +46,10 @@ class GatewayConfig:
     worker_concurrency: int = 1
     claim_size: int = 1
     worker_token_sha256: str | None = None
+    recovery_token_sha256: str | None = None
     source_hmac_key_env: str = "XB_MEMBER_GATEWAY_HMAC_KEY"
     worker_token_env: str = "XB_MEMBER_GATEWAY_WORKER_TOKEN"
+    recovery_token_env: str = "XB_MEMBER_GATEWAY_RECOVERY_TOKEN"
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "GatewayConfig":
@@ -59,7 +61,7 @@ class GatewayConfig:
             "kill_switch_enabled", "allowed_form_aliases", "allowed_mapping_versions",
             "member_no_max_length", "lease_seconds", "heartbeat_seconds", "execution_deadline_seconds",
             "max_attempts", "worker_concurrency", "claim_size", "worker_token_sha256",
-            "source_hmac_key_env", "worker_token_env",
+            "recovery_token_sha256", "source_hmac_key_env", "worker_token_env", "recovery_token_env",
         }
         if set(value) - allowed:
             raise ConfigError("unknown_config_fields")
@@ -75,12 +77,18 @@ class GatewayConfig:
         token_hash = value.get("worker_token_sha256", defaults.worker_token_sha256)
         if token_hash is not None and (not isinstance(token_hash, str) or not _HASH_RE.fullmatch(token_hash)):
             raise ConfigError("worker_token_sha256_invalid")
+        recovery_hash = value.get("recovery_token_sha256", defaults.recovery_token_sha256)
+        if recovery_hash is not None and (not isinstance(recovery_hash, str) or not _HASH_RE.fullmatch(recovery_hash)):
+            raise ConfigError("recovery_token_sha256_invalid")
         source_env = value.get("source_hmac_key_env", defaults.source_hmac_key_env)
         worker_env = value.get("worker_token_env", defaults.worker_token_env)
+        recovery_env = value.get("recovery_token_env", defaults.recovery_token_env)
         if not isinstance(source_env, str) or not _ENV_RE.fullmatch(source_env):
             raise ConfigError("source_hmac_key_env_invalid")
         if not isinstance(worker_env, str) or not _ENV_RE.fullmatch(worker_env):
             raise ConfigError("worker_token_env_invalid")
+        if not isinstance(recovery_env, str) or not _ENV_RE.fullmatch(recovery_env):
+            raise ConfigError("recovery_token_env_invalid")
         result = cls(
             schema_version=value.get("schema_version", defaults.schema_version),
             environment=value.get("environment", defaults.environment),
@@ -95,7 +103,8 @@ class GatewayConfig:
             max_attempts=_positive(value.get("max_attempts", defaults.max_attempts), "max_attempts"),
             worker_concurrency=_positive(value.get("worker_concurrency", defaults.worker_concurrency), "worker_concurrency"),
             claim_size=_positive(value.get("claim_size", defaults.claim_size), "claim_size"),
-            worker_token_sha256=token_hash, source_hmac_key_env=source_env, worker_token_env=worker_env,
+            worker_token_sha256=token_hash, recovery_token_sha256=recovery_hash,
+            source_hmac_key_env=source_env, worker_token_env=worker_env, recovery_token_env=recovery_env,
         )
         result.validate()
         return result
@@ -117,6 +126,14 @@ class GatewayConfig:
             raise ConfigError("claim_size_must_be_one")
         if self.member_no_max_length is not None and not 10 <= self.member_no_max_length <= 20:
             raise ConfigError("member_no_max_length_incompatible")
+        if self.worker_token_env.casefold() == self.recovery_token_env.casefold():
+            raise ConfigError("worker_recovery_credential_sources_must_differ")
+        if (
+            self.worker_token_sha256 is not None
+            and self.recovery_token_sha256 is not None
+            and self.worker_token_sha256.casefold() == self.recovery_token_sha256.casefold()
+        ):
+            raise ConfigError("worker_recovery_credential_digests_must_differ")
 
     @property
     def environment_matches(self) -> bool:
@@ -142,6 +159,8 @@ class GatewayConfig:
             reasons.append("member_no_max_length_required")
         if self.worker_token_sha256 is None:
             reasons.append("worker_credential_digest_required")
+        if self.recovery_token_sha256 is None:
+            reasons.append("recovery_credential_digest_required")
         return tuple(dict.fromkeys(reasons))
 
     @property

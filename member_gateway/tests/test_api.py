@@ -1,5 +1,5 @@
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from xb_member_gateway.api import GatewayApp, GatewayService
 from xb_member_gateway.auth import Principal, StaticAuthenticator
@@ -15,6 +15,7 @@ def make_config(**changes):
     value = {
         "member_no_max_length": 20,
         "worker_token_sha256": "0" * 64,
+        "recovery_token_sha256": "1" * 64,
         "production_activation_enabled": True,
         "kill_switch_enabled": False,
     }
@@ -64,7 +65,6 @@ class ApiBoundaryTests(unittest.TestCase):
             "worker.writer_register",
             "worker.writer_termination",
             "worker.writer_quarantine",
-            "worker.writer_termination_recovery",
             "worker.result",
             "worker.reconcile",
             "job.read",
@@ -84,13 +84,21 @@ class ApiBoundaryTests(unittest.TestCase):
                 {
                     "synthetic-worker-token": Principal(
                         subject="synthetic-worker", scopes=self.worker_scopes
-                    )
+                    ),
+                    "synthetic-recovery-token": Principal(
+                        subject="synthetic-recovery",
+                        scopes=frozenset({"worker.writer_termination_recovery"}),
+                    ),
                 }
             ),
         )
         self.headers = {
             "Authorization": "Bearer synthetic-worker-token",
             "X-XB-Worker-Session": "ws-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        }
+        self.recovery_headers = {
+            "Authorization": "Bearer synthetic-recovery-token",
+            "X-XB-Worker-Session": "ws-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         }
 
     def call(self, method, path, body=None, headers=None):
@@ -100,6 +108,180 @@ class ApiBoundaryTests(unittest.TestCase):
             headers=self.headers if headers is None else headers,
             body={} if body is None else body,
         )
+
+    def quarantined_writer(self, response_id="api-recovery-001"):
+        ingested = self.call("POST", "/v1/source-events", make_event(response_id))
+        self.assertEqual(ingested.status, 202)
+        job_id = ingested.body["job_id"]
+        claimed = self.call("POST", "/v1/worker/claim", {})
+        self.assertEqual(claimed.status, 200)
+        job = claimed.body["job"]
+        self.assertEqual(job["job_id"], job_id)
+        self.assertEqual(self.call("POST", f"/v1/jobs/{job_id}/precheck", {}).status, 200)
+        candidate = self.call("POST", f"/v1/jobs/{job_id}/allocation/candidate", {})
+        self.assertEqual(candidate.status, 200)
+        member_no = candidate.body["candidate"]
+        self.assertEqual(
+            self.call(
+                "POST",
+                f"/v1/jobs/{job_id}/allocation/probe",
+                {"candidate": member_no, "status": "FREE", "probe_reference": f"{response_id}-free"},
+            ).status,
+            200,
+        )
+        self.assertEqual(
+            self.call(
+                "POST",
+                f"/v1/jobs/{job_id}/allocation/recheck",
+                {"status": "FREE", "probe_reference": f"{response_id}-recheck"},
+            ).status,
+            200,
+        )
+        self.assertEqual(
+            self.call(
+                "POST",
+                f"/v1/jobs/{job_id}/write-intent",
+                {"operation": "member.create", "member_no": member_no, "payload_hash": job["payload_hash"]},
+            ).status,
+            200,
+        )
+        fence = self.call(
+            "POST",
+            f"/v1/jobs/{job_id}/dispatch-fence",
+            {"operation": "member.create", "member_no": member_no, "host_binding": "host-api"},
+        )
+        self.assertEqual(fence.status, 200)
+        writer = {
+            "fence_id": fence.body["dispatch_fence_id"],
+            "attempt": job["attempt"],
+            "execution_id": fence.body["execution_id"],
+            "host_binding": "host-api",
+            "pid": 4321,
+            "process_start_time": "2026-08-30T01:00:01Z",
+        }
+        registered = self.call("POST", f"/v1/jobs/{job_id}/writer/register", writer)
+        self.assertEqual(registered.status, 200)
+        quarantined = dict(writer, evidence_reference=f"{response_id}-quarantine", reason="writer_termination_unconfirmed")
+        quarantined_response = self.call("POST", f"/v1/jobs/{job_id}/writer/quarantine", quarantined)
+        self.assertEqual(quarantined_response.status, 200)
+        return job, fence.body, writer
+
+    @staticmethod
+    def recovery_body(fence, job, writer, **changes):
+        body = dict(
+            writer,
+            evidence_type="process_exit",
+            evidence_reference="api-recovery-proof",
+            exit_code=0,
+        )
+        body.update(
+            {
+                "fence_id": fence["dispatch_fence_id"],
+                "attempt": job["attempt"],
+                "execution_id": fence["execution_id"],
+                **changes,
+            }
+        )
+        return body
+
+    def test_normal_worker_principal_is_denied_writer_termination_recovery(self):
+        response = self.call(
+            "POST",
+            "/v1/jobs/synthetic/writer/recover",
+            {},
+        )
+        self.assertEqual(response.status, 403)
+        self.assertEqual(response.body["error_code"], "scope_denied")
+
+    def test_stale_worker_cannot_recover_with_new_worker_session(self):
+        job, fence, writer = self.quarantined_writer("api-recovery-stale-worker")
+        self.app.service.clock = NOW + timedelta(seconds=700)
+        response = self.call(
+            "POST",
+            f"/v1/jobs/{job['job_id']}/writer/recover",
+            self.recovery_body(fence, job, writer),
+            headers={
+                "Authorization": "Bearer synthetic-worker-token",
+                "X-XB-Worker-Session": "ws-cccccccccccccccccccccccccccccccc",
+            },
+        )
+        self.assertEqual(response.status, 403)
+        self.assertEqual(response.body["error_code"], "scope_denied")
+        self.assertEqual(self.repository.get_job(job["job_id"]).state.value, "WRITER_TERMINATION_UNCONFIRMED")
+
+    def test_recovery_principal_is_denied_ordinary_worker_write_and_control_routes(self):
+        routes = (
+            ("POST", "/v1/source-events", make_event("api-recovery-source-denied")),
+            ("POST", "/v1/worker/claim", {}),
+            ("POST", "/v1/jobs/synthetic/write-intent", {}),
+            ("POST", "/v1/jobs/synthetic/dispatch-fence", {}),
+            ("POST", "/v1/jobs/synthetic/result", {}),
+            ("POST", "/v1/jobs/synthetic/reconcile", {}),
+            ("GET", "/v1/jobs/synthetic", None),
+            ("POST", "/v1/control/kill-switch/enable", {}),
+        )
+        for method, path, body in routes:
+            with self.subTest(method=method, path=path):
+                response = self.call(method, path, body, headers=self.recovery_headers)
+                self.assertEqual(response.status, 403)
+                self.assertEqual(response.body["error_code"], "scope_denied")
+
+    def test_distinct_recovery_principal_can_recover_with_exact_bindings(self):
+        job, fence, writer = self.quarantined_writer("api-recovery-success")
+        self.app.service.clock = NOW + timedelta(seconds=700)
+        response = self.call(
+            "POST",
+            f"/v1/jobs/{job['job_id']}/writer/recover",
+            self.recovery_body(fence, job, writer),
+            headers=self.recovery_headers,
+        )
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.body["state"], "WRITE_OUTCOME_UNCERTAIN")
+        self.assertEqual(self.repository.get_job(job["job_id"]).state.value, "WRITE_OUTCOME_UNCERTAIN")
+        self.assertEqual(len(self.repository.result_history(job["job_id"])), 1)
+
+    def test_recovery_preserves_binding_and_active_lease_guards(self):
+        job, fence, writer = self.quarantined_writer("api-recovery-bindings")
+        self.app.service.clock = NOW + timedelta(seconds=700)
+        mismatches = (
+            {"host_binding": "host-other"},
+            {"fence_id": "fence-bbbbbbbbbbbbbbbb"},
+            {"attempt": job["attempt"] + 1},
+            {"execution_id": "exec-bbbbbbbbbbbbbbbb"},
+            {"pid": 4322},
+            {"process_start_time": "2026-08-30T01:00:02Z"},
+        )
+        for changes in mismatches:
+            with self.subTest(changes=changes):
+                response = self.call(
+                    "POST",
+                    f"/v1/jobs/{job['job_id']}/writer/recover",
+                    self.recovery_body(fence, job, writer, **changes),
+                    headers=self.recovery_headers,
+                )
+                self.assertEqual(response.status, 409)
+                self.assertEqual(response.body["error_code"], "writer_termination_binding_invalid")
+        stale_session = self.call(
+            "POST",
+            f"/v1/jobs/{job['job_id']}/writer/recover",
+            self.recovery_body(fence, job, writer),
+            headers={
+                "Authorization": "Bearer synthetic-recovery-token",
+                "X-XB-Worker-Session": "ws-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            },
+        )
+        self.assertEqual(stale_session.status, 409)
+        self.assertEqual(stale_session.body["error_code"], "stale_worker_session")
+
+        self.app.service.clock = NOW + timedelta(seconds=1)
+        active = self.call(
+            "POST",
+            f"/v1/jobs/{job['job_id']}/writer/recover",
+            self.recovery_body(fence, job, writer),
+            headers=self.recovery_headers,
+        )
+        self.assertEqual(active.status, 409)
+        self.assertEqual(active.body["error_code"], "writer_termination_clearance_rejected")
 
     def test_health_is_liveness_only_and_missing_auth_is_rejected_elsewhere(self):
         health = self.call("GET", "/livez", headers={})

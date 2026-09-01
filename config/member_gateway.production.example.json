@@ -14,6 +14,8 @@
   "worker_concurrency": 1,
   "claim_size": 1,
   "worker_token_sha256": null,
+  "recovery_token_sha256": null,
   "source_hmac_key_env": "XB_MEMBER_GATEWAY_HMAC_KEY",
-  "worker_token_env": "XB_MEMBER_GATEWAY_WORKER_TOKEN"
+  "worker_token_env": "XB_MEMBER_GATEWAY_WORKER_TOKEN",
+  "recovery_token_env": "XB_MEMBER_GATEWAY_RECOVERY_TOKEN"
 }

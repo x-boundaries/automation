@@ -19,6 +19,7 @@ def make_config(**changes):
     value = {
         "member_no_max_length": 20,
         "worker_token_sha256": "0" * 64,
+        "recovery_token_sha256": "1" * 64,
         "production_activation_enabled": True,
         "kill_switch_enabled": False,
     }

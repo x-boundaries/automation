@@ -71,14 +71,17 @@ class ContractSurfaceTests(unittest.TestCase):
         self.assertTrue(config["kill_switch_enabled"])
         self.assertIsNone(config["member_no_max_length"])
         self.assertIsNone(config["worker_token_sha256"])
+        self.assertIsNone(config["recovery_token_sha256"])
         loaded = GatewayConfig.from_mapping(config)
         self.assertFalse(loaded.gateway_ready)
         self.assertIn("member_no_max_length_required", loaded.readiness_reasons())
+        self.assertIn("recovery_credential_digest_required", loaded.readiness_reasons())
 
     def test_writer_timing_order_is_strictly_nested(self):
         base = {
             "member_no_max_length": 20,
             "worker_token_sha256": "0" * 64,
+            "recovery_token_sha256": "1" * 64,
             "production_activation_enabled": True,
             "kill_switch_enabled": False,
         }
