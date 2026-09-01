@@ -1195,6 +1195,85 @@ function Get-EgReplaceSupportRef {
 }
 
 # --------------------------------------------------------------------------------------
+# Installer staging phase vocabulary (design sections 11.1 and 17.3)
+# --------------------------------------------------------------------------------------
+# Section 7.2 rule 5 requires every failure to record the exception type name and the
+# HRESULT mapped to a bounded support reference, and section 17.3 states that the support
+# reference, the FAILING PHASE, the type name, and the HRESULT together distinguish every
+# failure class. Phase 1 staging has five distinguishable substeps that previously all
+# collapsed into one support reference, which is exactly the evidence-dead-end this
+# vocabulary removes.
+#
+# The vocabulary is BOUNDED and CLOSED, like the support references. Every value is a
+# public phase label: it carries no path, no file name, no operation identifier, and no
+# identity. The empty string means no staging phase failed.
+$script:EgInstallerStagingPhases = @(
+    'staging_write_executable',
+    'staging_hash_executable',
+    'staging_parse_executable',
+    'staging_write_manifest',
+    'staging_hash_manifest'
+)
+
+function Get-EgInstallerStagingPhases {
+    # The bounded staging phase vocabulary, enumerated explicitly.
+    [CmdletBinding()]
+    param()
+
+    @($script:EgInstallerStagingPhases)
+}
+
+function Test-EgInstallerStagingPhase {
+    # Exact, case-sensitive membership. An unrecognised phase is never treated as live.
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Phase)
+
+    foreach ($known in $script:EgInstallerStagingPhases) {
+        if ($known -ceq $Phase) {
+            return $true
+        }
+    }
+    return $false
+}
+
+function Get-EgStagingWriteSupportRef {
+    # Map a staging WRITE failure to its bounded support reference by exception TYPE and
+    # HRESULT ONLY. Exception message text is never read, exactly as Get-EgReplaceSupportRef
+    # does for replacement, and no control-flow decision is made by reading it.
+    #
+    # This deliberately adds NO new vocabulary. Every write failure recognised here is a
+    # staging failure and keeps the existing bounded reference; the class that distinguishes
+    # one cause from another is carried by the exception type name and the HRESULT, which is
+    # what section 17.3 already requires. Minting a per-cause reference would fabricate
+    # causal specificity that the type and HRESULT already express exactly.
+    #
+    # An unrecognised class records EG_LAUNCHER_UNCLASSIFIED rather than being absorbed into
+    # the staging reference, so a genuinely unexpected failure stays visible as unexpected
+    # while still surfacing only its type and HRESULT.
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][System.Exception]$Exception)
+
+    if ($Exception -is [System.UnauthorizedAccessException]) {
+        return 'EG_LAUNCHER_INSTALL_STAGING_FAILED'
+    }
+    if ($Exception -is [System.Security.SecurityException]) {
+        return 'EG_LAUNCHER_INSTALL_STAGING_FAILED'
+    }
+    if ($Exception -is [System.NotSupportedException]) {
+        return 'EG_LAUNCHER_INSTALL_STAGING_FAILED'
+    }
+    if ($Exception -is [System.ArgumentException]) {
+        return 'EG_LAUNCHER_INSTALL_STAGING_FAILED'
+    }
+    # PathTooLongException, DirectoryNotFoundException, FileNotFoundException and the
+    # sharing-violation class all derive from IOException, so the one test covers them.
+    if ($Exception -is [System.IO.IOException]) {
+        return 'EG_LAUNCHER_INSTALL_STAGING_FAILED'
+    }
+    return 'EG_LAUNCHER_UNCLASSIFIED'
+}
+
+# --------------------------------------------------------------------------------------
 # Publication result shape (design section 7.1)
 # --------------------------------------------------------------------------------------
 

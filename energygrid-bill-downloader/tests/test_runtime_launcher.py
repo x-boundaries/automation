@@ -1031,6 +1031,37 @@ switch ($Op) {
             emptyIsLive     = (Test-EgLauncherSupportRefLive -SupportRef '')
         } | ConvertTo-Json -Depth 8 -Compress
     }
+    'stagingdiag' {
+        # Staging-write classification, by exception TYPE and HRESULT only. Every entry is
+        # a real exception instance, so the recorded HRESULT is the framework's own value
+        # rather than a value the test asserts into existence.
+        $cases = @(
+            (New-Object System.UnauthorizedAccessException),
+            (New-Object System.IO.IOException),
+            (New-Object System.IO.PathTooLongException),
+            (New-Object System.ArgumentException),
+            (New-Object System.NotSupportedException),
+            (New-Object System.InvalidOperationException)
+        )
+        $classified = @()
+        foreach ($case in $cases) {
+            $classified = $classified + ([ordered]@{
+                typeName   = [string]$case.GetType().FullName
+                supportRef = (Get-EgStagingWriteSupportRef -Exception $case)
+                hresult    = (Get-EgExceptionHResultString -Exception $case)
+            })
+        }
+        $phases = @(Get-EgInstallerStagingPhases)
+        [ordered]@{
+            classified        = @($classified)
+            phases            = @($phases)
+            phaseCount        = @($phases).Count
+            knownPhaseIsLive  = (Test-EgInstallerStagingPhase -Phase 'staging_write_executable')
+            unknownPhaseIsLive = (Test-EgInstallerStagingPhase -Phase 'staging_write_nonsense')
+            uppercasePhaseIsLive = (Test-EgInstallerStagingPhase -Phase 'STAGING_WRITE_EXECUTABLE')
+            emptyPhaseIsLive  = (Test-EgInstallerStagingPhase -Phase '')
+        } | ConvertTo-Json -Depth 8 -Compress
+    }
     default {
         throw ('unknown probe operation: ' + $Op)
     }
@@ -3184,6 +3215,311 @@ class InstallerTransactionTierB(InstallerTransactionMixin, TierBBase):
     def setUpClass(cls):
         TierBBase.setUpClass()
         cls.exe = DESKTOP_PS
+
+
+# --------------------------------------------------------------------------------------
+# Staging-write diagnosability (design sections 7.2 rule 5, 11.1, 17.3)
+# --------------------------------------------------------------------------------------
+# A staging WRITE failure used to report only EG_LAUNCHER_INSTALL_STAGING_FAILED, with no
+# phase and no exception evidence, which made a real production failure an evidence dead
+# end: staging had failed, but which of the five substeps, and from which exception class,
+# was unrecoverable after the fact. These regressions lock the evidence in place.
+
+STAGING_PHASES = (
+    "staging_write_executable",
+    "staging_hash_executable",
+    "staging_parse_executable",
+    "staging_write_manifest",
+    "staging_hash_manifest",
+)
+
+INSTALLER_STATUS_KEYS = {
+    "status",
+    "support_ref",
+    "backups_remaining",
+    "phase",
+    "exception_type",
+    "hresult",
+}
+
+HRESULT_PATTERN = re.compile(r"^0x[0-9A-F]{8}$")
+
+# Applied to a scratch launcher root only. Removing write authority is what makes the
+# staging WriteAllBytes raise deterministically, without predicting the random operation
+# identifier embedded in the reserved staging name and without any test-only hook in
+# production code.
+# One explicit Deny entry for file creation, added and later removed again. The whole
+# discretionary list is deliberately NOT replaced and NOT protected: doing that also
+# withdraws the WRITE_DAC the fixture needs to undo itself, which leaves an undeletable
+# scratch directory and, worse, turns a real run into a skip when the teardown fails.
+# Denying only CreateFiles keeps every other right, including the authority to remove the
+# entry again, while still raising the access-denied class inside WriteAllBytes.
+ROOT_WRITE_AUTHORITY_SCRIPT = r"""
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory)][string]$Root,
+    [Parameter(Mandatory)][ValidateSet('lock', 'unlock')][string]$Mode
+)
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+$self = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+$denyCreate = New-Object System.Security.AccessControl.FileSystemAccessRule(
+    $self,
+    [System.Security.AccessControl.FileSystemRights]::CreateFiles,
+    'ContainerInherit, ObjectInherit',
+    'None',
+    'Deny')
+
+# Only the ACCESS section is read and written. The Set-Acl cmdlet persists the owner and
+# group sections too, which needs a privilege the runner does not hold when the scratch
+# directory is owned by Administrators rather than by the running user, and that made the
+# 5.1 boundary skip silently instead of exercising the contract. GetAccessControl and
+# SetAccessControl write back only the section that was modified.
+$info = New-Object System.IO.DirectoryInfo($Root)
+$sections = [System.Security.AccessControl.AccessControlSections]::Access
+
+$acl = $null
+if ($null -ne $info.PSObject.Methods['GetAccessControl']) {
+    $acl = $info.GetAccessControl($sections)
+}
+elseif ($null -ne ([System.IO.FileSystemAclExtensions] -as [type])) {
+    $acl = [System.IO.FileSystemAclExtensions]::GetAccessControl($info, $sections)
+}
+else {
+    $acl = Get-Acl -LiteralPath $Root
+}
+
+if ($Mode -ceq 'lock') {
+    $acl.AddAccessRule($denyCreate)
+}
+else {
+    [void]$acl.RemoveAccessRuleSpecific($denyCreate)
+}
+
+if ($null -ne $info.PSObject.Methods['SetAccessControl']) {
+    $info.SetAccessControl($acl)
+}
+elseif ($null -ne ([System.IO.FileSystemAclExtensions] -as [type])) {
+    [System.IO.FileSystemAclExtensions]::SetAccessControl($info, $acl)
+}
+else {
+    Set-Acl -LiteralPath $Root -AclObject $acl
+}
+Write-Output 'OK'
+"""
+
+
+def set_root_write_authority(exe, tmp, root, mode):
+    """Remove or restore file-creation authority on a scratch launcher root.
+
+    A host that cannot reshape an access control list skips the fixture, but only when
+    LOCKING. A failed unlock is an error, never a skip: silently downgrading teardown
+    failure to a skip is what would let this whole contract go unexercised while still
+    reporting a green run.
+    """
+    script = Path(tmp) / ("eg_root_authority_%s.ps1" % mode)
+    script.write_text(ROOT_WRITE_AUTHORITY_SCRIPT, encoding="utf-8")
+    completed = run_ps(exe, script, "-Root", str(root), "-Mode", mode)
+    if completed.returncode == 0 and "OK" in completed.stdout:
+        return
+    if mode == "lock":
+        raise unittest.SkipTest(
+            "this host cannot reshape a scratch directory's access control list, so the "
+            "staging write-failure fixture cannot be built deterministically"
+        )
+    raise AssertionError(
+        "the scratch launcher root could not be unlocked\nstdout:\n%s\nstderr:\n%s"
+        % (completed.stdout, completed.stderr)
+    )
+
+
+class StagingWriteFailureIsDiagnosableMixin:
+    """A staging WRITE exception surfaces phase, type and HRESULT, and leaks nothing."""
+
+    exe = None
+
+    def _run_against_unwritable_root(self, tmp):
+        checkout, commit = build_scratch_checkout(tmp)
+        root = tmp / "launcher_root"
+        root.mkdir()
+        set_root_write_authority(self.exe, tmp, root, "lock")
+        try:
+            return root, run_installer(self.exe, checkout, root, commit)
+        finally:
+            set_root_write_authority(self.exe, tmp, root, "unlock")
+
+    def test_a_staging_write_exception_reports_phase_type_and_hresult(self):
+        """The failure class is recoverable from the terminal JSON alone."""
+        with TemporaryScratch() as tmp:
+            root, completed = self._run_against_unwritable_root(tmp)
+            status = installer_status(completed)
+
+        self.assertEqual(
+            71, completed.returncode,
+            "a staging failure is pre-mutation and exits 71\nstdout:\n%s\nstderr:\n%s"
+            % (completed.stdout, completed.stderr),
+        )
+        self.assertEqual("FAILED_PREFLIGHT", status["status"])
+        self.assertEqual("EG_LAUNCHER_INSTALL_STAGING_FAILED", status["support_ref"])
+        self.assertEqual(0, status["backups_remaining"])
+        self.assertEqual(
+            "staging_write_executable", status["phase"],
+            "the library is staged first, so the executable write is the failing substep",
+        )
+        self.assertEqual(
+            "System.UnauthorizedAccessException", status["exception_type"],
+            "removing write authority raises exactly the access-denied class",
+        )
+        self.assertEqual("0x80070005", status["hresult"])
+        self.assertIn(status["phase"], STAGING_PHASES)
+
+    def test_the_terminal_json_carries_no_field_beyond_the_bounded_shape(self):
+        """DD-06 stays a closed shape: three added fields and not one more."""
+        with TemporaryScratch() as tmp:
+            _root, completed = self._run_against_unwritable_root(tmp)
+            status = installer_status(completed)
+        self.assertEqual(INSTALLER_STATUS_KEYS, set(status.keys()))
+        self.assertTrue(HRESULT_PATTERN.match(status["hresult"]))
+
+    def test_no_path_or_exception_message_reaches_any_output_surface(self):
+        """Section 11.2: no path, no file name, no operation id, no message text."""
+        with TemporaryScratch() as tmp:
+            root, completed = self._run_against_unwritable_root(tmp)
+            emitted = completed.stdout + completed.stderr
+            for leaked in (str(root), root.name, str(tmp)):
+                with self.subTest(leaked=leaked):
+                    self.assertNotIn(leaked, emitted)
+            self.assertNotIn(RESIDUE_PREFIX, emitted)
+            for message_word in ("Access to the path", "denied", "Exception calling"):
+                with self.subTest(message_word=message_word):
+                    self.assertNotIn(message_word, emitted)
+
+
+class StagingWriteFailureIsDiagnosableTierA(
+    StagingWriteFailureIsDiagnosableMixin, TierABase
+):
+    """Portable half of the staging write-failure evidence contract."""
+
+    @classmethod
+    def setUpClass(cls):
+        TierABase.setUpClass()
+        cls.exe = ANY_PS
+
+
+class StagingWriteFailureIsDiagnosableTierB(
+    StagingWriteFailureIsDiagnosableMixin, TierBBase
+):
+    """The same contract on the Windows PowerShell 5.1 production boundary."""
+
+    @classmethod
+    def setUpClass(cls):
+        TierBBase.setUpClass()
+        cls.exe = DESKTOP_PS
+
+
+class StagingWriteClassification(TierABase):
+    """The staging-write classifier maps by type and HRESULT, and never by message."""
+
+    def test_recognised_write_exception_classes_keep_the_bounded_staging_reference(self):
+        """No per-cause reference is minted: the type and HRESULT carry the class."""
+        with TemporaryScratch() as tmp:
+            observed = probe_json(ANY_PS, "stagingdiag", tmp)
+        by_type = {entry["typeName"]: entry for entry in observed["classified"]}
+        for recognised in (
+            "System.UnauthorizedAccessException",
+            "System.IO.IOException",
+            "System.IO.PathTooLongException",
+            "System.ArgumentException",
+            "System.NotSupportedException",
+        ):
+            with self.subTest(exception_type=recognised):
+                self.assertEqual(
+                    "EG_LAUNCHER_INSTALL_STAGING_FAILED",
+                    by_type[recognised]["supportRef"],
+                )
+                self.assertTrue(HRESULT_PATTERN.match(by_type[recognised]["hresult"]))
+        self.assertEqual(
+            "0x80070005", by_type["System.UnauthorizedAccessException"]["hresult"]
+        )
+        self.assertEqual("0x80070057", by_type["System.ArgumentException"]["hresult"])
+
+    def test_an_unrecognised_class_falls_back_to_unclassified_but_keeps_its_evidence(self):
+        """Fail safe: unclassified, yet the permitted type and HRESULT still surface."""
+        with TemporaryScratch() as tmp:
+            observed = probe_json(ANY_PS, "stagingdiag", tmp)
+        by_type = {entry["typeName"]: entry for entry in observed["classified"]}
+        unmapped = by_type["System.InvalidOperationException"]
+        self.assertEqual("EG_LAUNCHER_UNCLASSIFIED", unmapped["supportRef"])
+        self.assertIn(unmapped["supportRef"], LIVE_SUPPORT_REFS)
+        self.assertTrue(HRESULT_PATTERN.match(unmapped["hresult"]))
+
+    def test_the_staging_phase_vocabulary_is_bounded_and_closed(self):
+        """Membership is exact and case sensitive, like the support references."""
+        with TemporaryScratch() as tmp:
+            observed = probe_json(ANY_PS, "stagingdiag", tmp)
+        self.assertEqual(list(STAGING_PHASES), observed["phases"])
+        self.assertEqual(len(STAGING_PHASES), observed["phaseCount"])
+        self.assertTrue(observed["knownPhaseIsLive"])
+        self.assertFalse(observed["unknownPhaseIsLive"])
+        self.assertFalse(observed["uppercasePhaseIsLive"])
+        self.assertFalse(observed["emptyPhaseIsLive"])
+
+
+class StagingDiagnosticsStaticGuards(TierCBase):
+    """Structural properties no single dynamic run can guarantee."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.installer = INSTALLER.read_text(encoding="utf-8")
+
+    def test_both_staging_write_catches_classify_the_caught_exception(self):
+        """Neither raising substep may discard its exception again."""
+        self.assertEqual(
+            2,
+            self.installer.count("Get-EgStagingWriteSupportRef -Exception"),
+            "exactly two staging write catches exist and both must classify",
+        )
+        self.assertEqual(
+            2,
+            self.installer.count("Get-EgUnderlyingException -Exception $_.Exception"),
+            "both catches must unwrap the real exception before recording it",
+        )
+
+    def test_every_staging_substep_records_a_distinct_bounded_phase(self):
+        """Five substeps, five distinct phases, so none can inherit another's meaning."""
+        for phase in STAGING_PHASES:
+            with self.subTest(phase=phase):
+                self.assertEqual(
+                    1,
+                    self.installer.count("'%s'" % phase),
+                    "each staging phase is assigned at exactly one substep",
+                )
+
+    def test_verification_substeps_never_record_write_exception_evidence(self):
+        """A hash, parse or manifest-hash failure is never labelled a write exception."""
+        for verification_phase in (
+            "staging_hash_executable",
+            "staging_parse_executable",
+            "staging_hash_manifest",
+        ):
+            index = self.installer.index("'%s'" % verification_phase)
+            window = self.installer[index:index + 400]
+            with self.subTest(phase=verification_phase):
+                self.assertNotIn("Get-EgStagingWriteSupportRef", window)
+                self.assertNotIn("stagingExceptionType =", window)
+                self.assertNotIn("stagingHResult =", window)
+
+    def test_no_staging_diagnostic_reads_exception_message_text(self):
+        """Section 7.2 rule 5: no control flow and no output derives from message text."""
+        for forbidden in (
+            "$_.Exception.Message",
+            ".Exception.Message",
+            "$_.ErrorDetails",
+            "ToString()",
+        ):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, self.installer)
 
 
 class DeployableSourceSetStaticGuard(TierCBase):

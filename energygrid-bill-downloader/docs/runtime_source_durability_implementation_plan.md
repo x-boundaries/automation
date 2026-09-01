@@ -487,7 +487,18 @@ One JSON object, no timestamp, no generated identifier (design section 8).
 ### Installer real-path stdout (`DD-06`)
 
 ```text
-{"status":"INSTALLED|ALREADY_CURRENT|FAILED_PREFLIGHT|FAILED_ROLLED_BACK|FAILED_ROLLBACK_INCOMPLETE","support_ref":"<ref or empty>","backups_remaining":<int>}
+{"status":"INSTALLED|ALREADY_CURRENT|FAILED_PREFLIGHT|FAILED_ROLLED_BACK|FAILED_ROLLBACK_INCOMPLETE","support_ref":"<ref or empty>","backups_remaining":<int>,"phase":"<staging phase or empty>","exception_type":"<type name or empty>","hresult":"<0x%08X or empty>"}
+```
+
+`phase`, `exception_type` and `hresult` are always present, in that order, on every real
+path including success, and are the empty string when no phase failed and no exception was
+caught. They carry exactly what design section 11.1 permits and section 17.3 requires: the
+failing phase, the exception type name, and the HRESULT. The bounded staging phase
+vocabulary is closed:
+
+```text
+staging_write_executable | staging_hash_executable | staging_parse_executable
+staging_write_manifest   | staging_hash_manifest
 ```
 
 ## Ordered preflight check names
