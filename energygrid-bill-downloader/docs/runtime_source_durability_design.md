@@ -5,6 +5,14 @@ implementation, no test, and no CI change. It records the reviewed contract that
 later, separately approved implementation change must satisfy.
 
 Design lock: `DL-XB-141-RUNTIME-005-SOURCE-DURABILITY`.
+Accepted amendment: `DL-XB-141-RUNTIME-005-SOURCE-DURABILITY-A1`, which narrowly amends
+the invocation contract of sections 5.1 and 5.3 to admit one fixed repository-controlled
+`login-diagnostic` operation, and adds its bounded contract as section 5.4. Every other
+clause of `DL-XB-141-RUNTIME-005-SOURCE-DURABILITY` remains controlling and unchanged:
+the eleven-parameter surface, the twenty-one ordered preflight checks, credential import
+last, the three injected process variables, exact environment restoration, the
+installer/manifest/source-integrity architecture, the exit bands, and Scheduler `run`
+semantics are all untouched by the amendment.
 Architecture: Option 2, Git canonical for reusable runtime behaviour.
 Authority at authoring time: repository `x-boundaries/automation`, remote `main` at
 `893f319a3e9ccf5055723a201377fe9261cda42a`.
@@ -184,7 +192,7 @@ approved.
 | `-BrowserCachePath` | yes | Absolute path to the approved private Playwright browser cache, section 9.3 |
 | `-ExpectedBranch` | yes | Branch the deployed checkout must be on, or the literal `ANY_BRANCH`, section 10.3 |
 | `-AuthorisedLauncherRootWriteSid` | yes | One or more SID strings naming the exhaustive set of trustees permitted to hold write-capable access on the launcher root, section 17.2.1 |
-| `-Command` | no | `run` (default) or `list` |
+| `-Command` | no | `run` (default), `list`, or `login-diagnostic` (section 5.4) |
 | `-LogRoot` | no | Private diagnostics root for the launcher's own terminal event |
 | `-ValidateOnly` | no | Switch, contract in section 8 |
 | `-RunId` | no | Correlation identifier for the terminal event only |
@@ -194,8 +202,16 @@ carry a credential value or a committed path. `-ExpectedBranch` is mandatory wit
 explicit `ANY_BRANCH` sentinel rather than optional, so branch binding is never
 disabled by omitting an argument. There is no parameter that accepts a credential
 value, no portal parameter, no browser-install parameter, no commit-pin parameter, and
-no headed switch. `--headed` remains an application concern reached through a
-separately approved manual invocation, not through the launcher.
+no headed switch. `-Command` is a closed allowlist of three fixed operation names and
+is the only thing that varies in the invocation.
+
+Amendment A1 does not add a headed switch and does not make headed execution selectable.
+Headed execution is an implicit and non-overridable property of the fixed
+`login-diagnostic` operation alone: the application constructs a headed browser for that
+one command and for no other, and there is no argument -- launcher or application -- by
+which a caller can request it, suppress it, or apply it to `run` or `list`. The
+application's own `--headed` flag remains reachable only on `run` and `list` through a
+separately approved manual invocation, never through the launcher.
 
 `-AuthorisedLauncherRootWriteSid` is the launcher root's write-authority binding. It is
 mandatory for the same reason `-ExpectedBranch` is: omitting an argument must never
@@ -268,6 +284,12 @@ On success the launcher invokes
 `energygrid-bill-downloader` directory beneath `-CheckoutRoot` as the working
 directory, and propagates the child's exit code verbatim.
 
+The child argument vector is exactly those five elements, in that order, for every
+admitted command including `login-diagnostic`. Nothing is appended conditionally, no
+argument is derived from the operation, and there is no path by which a caller-supplied
+script, module, path, portal address, credential value, or arbitrary child argument
+reaches the child.
+
 The environment is not passed through unchanged. Immediately before the child starts,
 the launcher sets exactly three process-scope variables from the values established in
 preflight: `ENERGYGRID_USERNAME` and `ENERGYGRID_PASSWORD` from the imported credential
@@ -288,6 +310,112 @@ status:
 | `73` | Package rollback failed, could not be verified, or an advanced destination had no recoverable preimage; manual owner action required |
 
 The disjointness of the two bands is asserted by a test, not left to convention.
+
+### 5.4 Bounded login diagnostic operation
+
+`login-diagnostic` exists because the launcher is the only thing that materialises the
+private DPAPI credential, and the mechanism gap it closes is narrow: observing what the
+portal actually renders after one real Login submit previously required either a headed
+switch on the launcher or a second credential route, and both were refused.
+
+The operation runs the same canonical pre-submit login sequence the ordinary `login()`
+path runs -- portal navigation, the existing public semantics activation, exactly one
+Login-entry click, the existing typed Username entry, the existing typed Password entry,
+the existing submit readiness resolution, and exactly one real submit dispatch. That
+sequence exists in one place in `portal.py`; the diagnostic reuses it rather than
+carrying a second set of selectors or credential-entry semantics, so the two cannot
+drift apart. There remains exactly one normal `submit.click()` call site, no submit
+fallback, no alternate selector, and no submit retry.
+
+Where the two paths differ is what happens next. `login()` continues into
+`_await_billing_manager()` exactly as before. The diagnostic stops the normal
+application flow at the submit and performs only a bounded read-only observation.
+
+**Submit uncertainty.** The real submit invocation is the explicit one-shot boundary.
+Once invocation begins the submit is recorded as dispatched: a successful call reports
+`DISPATCHED`, and a call that raises reports `DISPATCH_UNCERTAIN`, because an exception
+cannot prove whether the browser acted. It is never retried. A readiness or resolution
+failure before that boundary reports `NOT_DISPATCHED`. A dispatch-uncertain result may
+still be observed, since the page is the only remaining evidence, but it is never
+converted into a proven successful dispatch.
+
+**Observation allowlist.** Only fixed public-safe counts and booleans are read:
+host and render counts for `flt-glass-pane`, `flt-semantics-host`, `flt-semantics`,
+`flt-text-editing-host`, `flt-scene-host` and `canvas`; the count and presence of
+`flt-semantics-placeholder`; count and visibility for Billing Manager, Username and
+Password; count, visibility and actionability for the exact `Login` and exact
+`Enable accessibility` controls; a visible-alert boolean; and, after the submit, a
+URL-changed boolean. No page text, HTML, DOM dump, accessibility-tree dump, attribute
+outside these observations, screenshot, trace, storage capture, network capture, or URL
+is read or reported. Locators are freshly resolved at every observation checkpoint. The
+observation runs on the existing bounded portal recovery ladder and deadline; it does
+not raise the timeout and adds no unbounded polling loop. Post-submit observation is at
+most 60 seconds.
+
+**Classification.** The first satisfied classification wins, in this order:
+
+1. `BILLING_MANAGER_VISIBLE`
+2. `VISIBLE_ALERT`
+3. `LOGIN_ROUTE_PERSISTED_OR_RETURNED`
+4. `SEMANTICS_HOST_PRESENT_WITHOUT_APP_CONTROLS`
+5. `FLUTTER_RENDER_SHELL_PRESENT_SEMANTICS_HOST_ABSENT`
+6. `FLUTTER_SHELL_DISAPPEARED_AFTER_SUBMIT`
+
+Anything else fails closed with no classification at all. Each arm needs positive
+evidence, never the absence of a contradiction:
+
+- `BILLING_MANAGER_VISIBLE` requires an unambiguous positive visible Billing Manager
+  witness. A stale, hidden, or multiple locator does not classify.
+- `LOGIN_ROUTE_PERSISTED_OR_RETURNED` requires at least one positively **visible**
+  Username, Password, or exact Login witness. A locator with a count above zero whose
+  matches are all hidden is ambiguous evidence and is not sufficient.
+- The three shell-only classifications require every known post-submit application and
+  public control absent **by count**: Billing Manager, Username, Password, exact Login,
+  and exact `Enable accessibility` all zero. One counted control -- including the public
+  accessibility gate -- blocks all three.
+- With controls absent, a present semantics host or surface yields (4); otherwise a
+  present non-semantics render or shell witness yields (5).
+- `FLUTTER_SHELL_DISAPPEARED_AFTER_SUBMIT` additionally requires at least one
+  allowlisted shell or render witness positively present immediately before the submit,
+  and every allowlisted shell or render witness zero throughout the whole post-submit
+  observation. A shell that was never positively established cannot be inferred to have
+  disappeared.
+
+A witness that could not be read is null, and null satisfies neither a positive test nor
+an absence test, so an unreadable surface fails closed rather than classifying.
+
+**Side-effect boundary.** The diagnostic is structurally unable to reach
+`_await_billing_manager`, the Billing Manager click, EB Bill, tenant or account
+selection, Search, inventory, pagination, download, PDF publication, archive mutation,
+state mutation, temp cleanup, idempotency or reconciliation, the Scheduler, n8n, or
+AutoCount. On the application side it loads and validates the configuration without
+mutating the filesystem, and it does not call `config.preflight()`, construct the
+`SafeLogger`, run stale-temp cleanup, or open the `StateStore`. Its only intended real
+effects, when separately authorised live, are one Chromium process from the accepted
+private cache, one portal navigation, one semantics activation, one Login-entry click,
+typed credentials, at most one normal Login submit, the bounded observation, and browser
+teardown.
+
+**Result document.** The operation emits exactly one JSON document with schema
+identifier `energygrid.login_diagnostic.v1`, carrying `schema`, `status`,
+`classification`, `submit_dispatched`, `submit_outcome`, `pre_submit`, `post_submit`,
+and `support_ref` on a non-complete result where applicable. `status` is
+`DIAGNOSTIC_COMPLETE` or `ACTION_REQUIRED`; `classification` is one of the six accepted
+values or null; `submit_outcome` is `DISPATCHED`, `DISPATCH_UNCERTAIN`, or
+`NOT_DISPATCHED`. Every remaining value is a count, a boolean, or null. No free-form
+exception text, URL, filesystem path, account identity, host identity, security
+identifier, credential, credential derivative, page text, or business datum is a field,
+so none can reach the surface.
+
+**Exit codes.** The diagnostic returns `0` only when an authorised classification is
+positively established, `20` for any fail-closed diagnostic, layout, login, or
+insufficient-evidence result, and `64` for a configuration, dependency, or argument
+contract failure. It never emits `10`. The launcher's own `70`-`73` band is unchanged
+and remains disjoint from it.
+
+**What A1 does not change.** `run` and `list` behave exactly as before. Scheduler
+semantics are unchanged: the Scheduled Task invokes `run`, and no scheduler artefact
+names the diagnostic. `-ValidateOnly` is unchanged and still invokes no command at all.
 
 ## 6. Installation And Update Contract
 
