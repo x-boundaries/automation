@@ -1,0 +1,556 @@
+import unittest
+from datetime import datetime, timedelta, timezone
+
+from xb_member_gateway.api import GatewayApp, GatewayService
+from xb_member_gateway.auth import Principal, StaticAuthenticator
+from xb_member_gateway.canonical import build_source_event
+from xb_member_gateway.config import GatewayConfig
+from xb_member_gateway.repository import InMemoryRepository
+
+
+NOW = datetime(2026, 8, 30, 1, 0, tzinfo=timezone.utc)
+
+
+def make_config(**changes):
+    value = {
+        "member_no_max_length": 20,
+        "worker_token_sha256": "0" * 64,
+        "recovery_token_sha256": "1" * 64,
+        "production_activation_enabled": True,
+        "kill_switch_enabled": False,
+    }
+    value.update(changes)
+    return GatewayConfig.from_mapping(value)
+
+
+def make_event(response_id="api-response-001"):
+    payload = {
+        "name": "API Synthetic Member",
+        "phone": "81234567",
+        "email": "api-synthetic@example.test",
+        "birthday_month": "March",
+        "marketing_consent": "No",
+        "pdpa_acknowledged": True,
+    }
+    from xb_member_gateway.canonical import canonical_json
+    from xb_member_gateway.crypto import payload_hash
+
+    canonical_payload = {
+        "name": payload["name"],
+        "phone": "6581234567",
+        "email": payload["email"],
+        "birthday_month": payload["birthday_month"],
+        "marketing_consent": payload["marketing_consent"],
+        "pdpa_acknowledged": payload["pdpa_acknowledged"],
+    }
+    return build_source_event(
+        response_id=response_id,
+        request_id=f"api-request-{response_id}",
+        create_time="2026-08-30T01:00:00Z",
+        form_alias="member_registration",
+        mapping_version="member-intake.v1",
+        payload=payload,
+    )
+
+
+class ApiBoundaryTests(unittest.TestCase):
+    worker_scopes = frozenset(
+        {
+            "source.ingest",
+            "worker.claim",
+            "worker.heartbeat",
+            "worker.allocation",
+            "worker.write_intent",
+            "worker.dispatch",
+            "worker.writer_register",
+            "worker.writer_termination",
+            "worker.writer_quarantine",
+            "worker.result",
+            "worker.reconcile",
+            "job.read",
+            "control.kill_switch",
+            "control.activate",
+        }
+    )
+
+    def setUp(self):
+        self.repository = InMemoryRepository()
+        self.repository.set_control("kill_switch_enabled", False)
+        self.repository.set_control("production_activation_enabled", True)
+        service = GatewayService(make_config(), self.repository, adapter_ready=True, clock=NOW)
+        self.app = GatewayApp(
+            service,
+            StaticAuthenticator(
+                {
+                    "synthetic-worker-token": Principal(
+                        subject="synthetic-worker", scopes=self.worker_scopes
+                    ),
+                    "synthetic-recovery-token": Principal(
+                        subject="synthetic-recovery",
+                        scopes=frozenset({"worker.writer_termination_recovery"}),
+                    ),
+                }
+            ),
+        )
+        self.headers = {
+            "Authorization": "Bearer synthetic-worker-token",
+            "X-XB-Worker-Session": "ws-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        }
+        self.recovery_headers = {
+            "Authorization": "Bearer synthetic-recovery-token",
+            "X-XB-Worker-Session": "ws-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        }
+
+    def call(self, method, path, body=None, headers=None):
+        return self.app.handle(
+            method,
+            path,
+            headers=self.headers if headers is None else headers,
+            body={} if body is None else body,
+        )
+
+    def quarantined_writer(self, response_id="api-recovery-001"):
+        ingested = self.call("POST", "/v1/source-events", make_event(response_id))
+        self.assertEqual(ingested.status, 202)
+        job_id = ingested.body["job_id"]
+        claimed = self.call("POST", "/v1/worker/claim", {})
+        self.assertEqual(claimed.status, 200)
+        job = claimed.body["job"]
+        self.assertEqual(job["job_id"], job_id)
+        self.assertEqual(self.call("POST", f"/v1/jobs/{job_id}/precheck", {}).status, 200)
+        candidate = self.call("POST", f"/v1/jobs/{job_id}/allocation/candidate", {})
+        self.assertEqual(candidate.status, 200)
+        member_no = candidate.body["candidate"]
+        self.assertEqual(
+            self.call(
+                "POST",
+                f"/v1/jobs/{job_id}/allocation/probe",
+                {"candidate": member_no, "status": "FREE", "probe_reference": f"{response_id}-free"},
+            ).status,
+            200,
+        )
+        self.assertEqual(
+            self.call(
+                "POST",
+                f"/v1/jobs/{job_id}/allocation/recheck",
+                {"status": "FREE", "probe_reference": f"{response_id}-recheck"},
+            ).status,
+            200,
+        )
+        self.assertEqual(
+            self.call(
+                "POST",
+                f"/v1/jobs/{job_id}/write-intent",
+                {"operation": "member.create", "member_no": member_no, "payload_hash": job["payload_hash"]},
+            ).status,
+            200,
+        )
+        fence = self.call(
+            "POST",
+            f"/v1/jobs/{job_id}/dispatch-fence",
+            {"operation": "member.create", "member_no": member_no, "host_binding": "host-api"},
+        )
+        self.assertEqual(fence.status, 200)
+        writer = {
+            "fence_id": fence.body["dispatch_fence_id"],
+            "attempt": job["attempt"],
+            "execution_id": fence.body["execution_id"],
+            "host_binding": "host-api",
+            "pid": 4321,
+            "process_start_time": "2026-08-30T01:00:01Z",
+        }
+        registered = self.call("POST", f"/v1/jobs/{job_id}/writer/register", writer)
+        self.assertEqual(registered.status, 200)
+        quarantined = dict(writer, evidence_reference=f"{response_id}-quarantine", reason="writer_termination_unconfirmed")
+        quarantined_response = self.call("POST", f"/v1/jobs/{job_id}/writer/quarantine", quarantined)
+        self.assertEqual(quarantined_response.status, 200)
+        return job, fence.body, writer
+
+    @staticmethod
+    def recovery_body(fence, job, writer, **changes):
+        body = dict(
+            writer,
+            evidence_type="process_exit",
+            evidence_reference="api-recovery-proof",
+            exit_code=0,
+        )
+        body.update(
+            {
+                "fence_id": fence["dispatch_fence_id"],
+                "attempt": job["attempt"],
+                "execution_id": fence["execution_id"],
+                **changes,
+            }
+        )
+        return body
+
+    def test_normal_worker_principal_is_denied_writer_termination_recovery(self):
+        response = self.call(
+            "POST",
+            "/v1/jobs/synthetic/writer/recover",
+            {},
+        )
+        self.assertEqual(response.status, 403)
+        self.assertEqual(response.body["error_code"], "scope_denied")
+
+    def test_stale_worker_cannot_recover_with_new_worker_session(self):
+        job, fence, writer = self.quarantined_writer("api-recovery-stale-worker")
+        self.app.service.clock = NOW + timedelta(seconds=700)
+        response = self.call(
+            "POST",
+            f"/v1/jobs/{job['job_id']}/writer/recover",
+            self.recovery_body(fence, job, writer),
+            headers={
+                "Authorization": "Bearer synthetic-worker-token",
+                "X-XB-Worker-Session": "ws-cccccccccccccccccccccccccccccccc",
+            },
+        )
+        self.assertEqual(response.status, 403)
+        self.assertEqual(response.body["error_code"], "scope_denied")
+        self.assertEqual(self.repository.get_job(job["job_id"]).state.value, "WRITER_TERMINATION_UNCONFIRMED")
+
+    def test_worker_quarantine_preserves_registered_identity_and_rejects_mismatch_on_repeat(self):
+        job, fence, writer = self.quarantined_writer("api-quarantine-identity")
+        omitted = self.call(
+            "POST",
+            f"/v1/jobs/{job['job_id']}/writer/quarantine",
+            dict(writer, pid=None, process_start_time=None, evidence_reference="api-quarantine-omitted", reason="writer_termination_unconfirmed"),
+        )
+        self.assertEqual(omitted.status, 200)
+        hold = self.repository.get_writer_execution_hold(job["job_id"])
+        self.assertEqual((hold.pid, hold.process_start_time), (writer["pid"], writer["process_start_time"]))
+        for changes in (
+            {"pid": writer["pid"] + 1, "evidence_reference": "api-quarantine-wrong-pid"},
+            {"process_start_time": "2026-08-30T01:00:02Z", "evidence_reference": "api-quarantine-wrong-start"},
+        ):
+            with self.subTest(changes=changes):
+                response = self.call(
+                    "POST",
+                    f"/v1/jobs/{job['job_id']}/writer/quarantine",
+                    dict(writer, reason="writer_termination_unconfirmed", **changes),
+                )
+                self.assertEqual(response.status, 409)
+                self.assertEqual(response.body["error_code"], "writer_process_identity_mismatch")
+        current = self.repository.get_writer_execution_hold(job["job_id"])
+        self.assertEqual((current.pid, current.process_start_time), (writer["pid"], writer["process_start_time"]))
+
+    def test_recovery_principal_is_denied_ordinary_worker_write_and_control_routes(self):
+        routes = (
+            ("POST", "/v1/source-events", make_event("api-recovery-source-denied")),
+            ("POST", "/v1/worker/claim", {}),
+            ("POST", "/v1/jobs/synthetic/write-intent", {}),
+            ("POST", "/v1/jobs/synthetic/dispatch-fence", {}),
+            ("POST", "/v1/jobs/synthetic/result", {}),
+            ("POST", "/v1/jobs/synthetic/reconcile", {}),
+            ("GET", "/v1/jobs/synthetic", None),
+            ("POST", "/v1/control/kill-switch/enable", {}),
+        )
+        for method, path, body in routes:
+            with self.subTest(method=method, path=path):
+                response = self.call(method, path, body, headers=self.recovery_headers)
+                self.assertEqual(response.status, 403)
+                self.assertEqual(response.body["error_code"], "scope_denied")
+
+    def test_distinct_recovery_principal_can_recover_with_exact_bindings(self):
+        job, fence, writer = self.quarantined_writer("api-recovery-success")
+        self.app.service.clock = NOW + timedelta(seconds=700)
+        response = self.call(
+            "POST",
+            f"/v1/jobs/{job['job_id']}/writer/recover",
+            self.recovery_body(fence, job, writer),
+            headers=self.recovery_headers,
+        )
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.body["state"], "WRITE_OUTCOME_UNCERTAIN")
+        self.assertEqual(self.repository.get_job(job["job_id"]).state.value, "WRITE_OUTCOME_UNCERTAIN")
+        self.assertEqual(len(self.repository.result_history(job["job_id"])), 1)
+
+    def test_recovery_preserves_binding_and_active_lease_guards(self):
+        job, fence, writer = self.quarantined_writer("api-recovery-bindings")
+        self.app.service.clock = NOW + timedelta(seconds=700)
+        mismatches = (
+            {"host_binding": "host-other"},
+            {"fence_id": "fence-bbbbbbbbbbbbbbbb"},
+            {"attempt": job["attempt"] + 1},
+            {"execution_id": "exec-bbbbbbbbbbbbbbbb"},
+            {"pid": 4322},
+            {"process_start_time": "2026-08-30T01:00:02Z"},
+        )
+        for changes in mismatches:
+            with self.subTest(changes=changes):
+                response = self.call(
+                    "POST",
+                    f"/v1/jobs/{job['job_id']}/writer/recover",
+                    self.recovery_body(fence, job, writer, **changes),
+                    headers=self.recovery_headers,
+                )
+                self.assertEqual(response.status, 409)
+                self.assertEqual(response.body["error_code"], "writer_termination_binding_invalid")
+        stale_session = self.call(
+            "POST",
+            f"/v1/jobs/{job['job_id']}/writer/recover",
+            self.recovery_body(fence, job, writer),
+            headers={
+                "Authorization": "Bearer synthetic-recovery-token",
+                "X-XB-Worker-Session": "ws-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            },
+        )
+        self.assertEqual(stale_session.status, 409)
+        self.assertEqual(stale_session.body["error_code"], "stale_worker_session")
+
+        self.app.service.clock = NOW + timedelta(seconds=1)
+        active = self.call(
+            "POST",
+            f"/v1/jobs/{job['job_id']}/writer/recover",
+            self.recovery_body(fence, job, writer),
+            headers=self.recovery_headers,
+        )
+        self.assertEqual(active.status, 409)
+        self.assertEqual(active.body["error_code"], "writer_termination_clearance_rejected")
+
+    def test_health_is_liveness_only_and_missing_auth_is_rejected_elsewhere(self):
+        health = self.call("GET", "/livez", headers={})
+        self.assertEqual(health.status, 200)
+        denied = self.call("POST", "/v1/source-events", make_event(), headers={})
+        self.assertEqual(denied.status, 401)
+        self.assertEqual(
+            set(denied.body),
+            {"schema_version", "trace_id", "error_code", "message"},
+        )
+        self.assertNotIn("API Synthetic Member", str(denied.body))
+
+    def test_scope_denial_is_distinct_from_authentication(self):
+        read_only = GatewayApp(
+            self.app.service,
+            StaticAuthenticator(
+                {"read-only-token": Principal("read-only", frozenset({"job.read"}))}
+            ),
+        )
+        response = read_only.handle(
+            "POST",
+            "/v1/source-events",
+            headers={"Authorization": "Bearer read-only-token"},
+            body=make_event(),
+        )
+        self.assertEqual(response.status, 403)
+        self.assertEqual(response.body["error_code"], "scope_denied")
+
+    def test_worker_session_header_is_required_and_strictly_bounded(self):
+        missing = self.call(
+            "POST",
+            "/v1/worker/claim",
+            {},
+            headers={"Authorization": "Bearer synthetic-worker-token"},
+        )
+        self.assertEqual(missing.status, 400)
+        self.assertEqual(missing.body["error_code"], "worker_session_invalid")
+        uppercase = self.call(
+            "POST",
+            "/v1/worker/claim",
+            {},
+            headers={
+                "Authorization": "Bearer synthetic-worker-token",
+                "X-XB-Worker-Session": "ws-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            },
+        )
+        self.assertEqual(uppercase.status, 400)
+        self.assertEqual(uppercase.body["error_code"], "worker_session_invalid")
+
+    def test_member_vertical_slice_routes_and_safe_status(self):
+        ingested = self.call("POST", "/v1/source-events", make_event())
+        self.assertEqual(ingested.status, 202)
+        job_id = ingested.body["job_id"]
+        claimed = self.call("POST", "/v1/worker/claim", {})
+        self.assertEqual(claimed.status, 200)
+        job = claimed.body["job"]
+        self.assertEqual(job["job_id"], job_id)
+        self.assertNotIn("response_id", job)
+
+        self.assertEqual(
+            self.call("POST", f"/v1/jobs/{job_id}/precheck", {}).status, 200
+        )
+        candidate = self.call("POST", f"/v1/jobs/{job_id}/allocation/candidate", {})
+        self.assertEqual(candidate.status, 200)
+        member_no = candidate.body["candidate"]
+        probed = self.call(
+            "POST",
+            f"/v1/jobs/{job_id}/allocation/probe",
+            {
+                "candidate": member_no,
+                "status": "FREE",
+                "probe_reference": "api-synthetic-free-001",
+            },
+        )
+        self.assertEqual(probed.status, 200)
+        rechecked = self.call(
+            "POST",
+            f"/v1/jobs/{job_id}/allocation/recheck",
+            {"status": "FREE", "probe_reference": "api-synthetic-recheck-001"},
+        )
+        self.assertEqual(rechecked.status, 200)
+        intent = self.call(
+            "POST",
+            f"/v1/jobs/{job_id}/write-intent",
+            {
+                "operation": "member.create",
+                "member_no": member_no,
+                "payload_hash": job["payload_hash"],
+            },
+        )
+        self.assertEqual(intent.status, 200)
+        fence = self.call(
+            "POST",
+            f"/v1/jobs/{job_id}/dispatch-fence",
+            {"operation": "member.create", "member_no": member_no, "host_binding": "host-api"},
+        )
+        self.assertEqual(fence.status, 200)
+        registered = self.call(
+            "POST",
+            f"/v1/jobs/{job_id}/writer/register",
+            {
+                "fence_id": fence.body["dispatch_fence_id"],
+                "attempt": job["attempt"],
+                "execution_id": fence.body["execution_id"],
+                "host_binding": "host-api",
+                "pid": 4321,
+                "process_start_time": "2026-08-30T01:00:01Z",
+            },
+        )
+        self.assertEqual(registered.status, 200)
+        self.assertEqual(registered.body["lifecycle"], "REGISTERED")
+        terminated = self.call(
+            "POST",
+            f"/v1/jobs/{job_id}/writer/termination",
+            {
+                "fence_id": fence.body["dispatch_fence_id"],
+                "attempt": job["attempt"],
+                "execution_id": fence.body["execution_id"],
+                "host_binding": "host-api",
+                "pid": 4321,
+                "process_start_time": "2026-08-30T01:00:01Z",
+                "evidence_type": "process_exit",
+                "evidence_reference": "evidence-api",
+                "exit_code": 0,
+            },
+        )
+        self.assertEqual(terminated.status, 200)
+        self.assertTrue(terminated.body["termination_confirmed"])
+        result = self.call(
+            "POST",
+            f"/v1/jobs/{job_id}/result",
+            {
+                "schema_version": "xb.member.gateway.result.v1",
+                "job_id": job_id,
+                "operation": "member.create",
+                "dispatch_fence_id": fence.body["dispatch_fence_id"],
+                "status": "CREATED_VERIFIED",
+                "member_no": member_no,
+                "save_invocation_count": 1,
+                "readback_found": True,
+                "readback_match": True,
+                "error_code": None,
+            },
+        )
+        self.assertEqual(result.status, 200)
+        status = self.call("GET", f"/v1/jobs/{job_id}")
+        self.assertEqual(status.status, 200)
+        self.assertEqual(status.body["schema_version"], "xb.member.gateway.job.v2")
+        self.assertEqual(status.body["state"], "CREATED_VERIFIED")
+        self.assertNotIn("member_payload", status.body)
+        self.assertNotIn("response_id", status.body)
+
+    def test_operation_surface_is_exact_member_create(self):
+        response = self.call(
+            "POST",
+            "/v1/jobs/synthetic/write-intent",
+            {
+                "operation": "member.update",
+                "member_no": "6581234567",
+                "payload_hash": "sha256:" + "0" * 64,
+            },
+        )
+        self.assertEqual(response.status, 400)
+        self.assertEqual(response.body["error_code"], "operation_invalid")
+        self.assertEqual(self.call("POST", "/v1/jobs/synthetic/update", {}).status, 404)
+        self.assertEqual(self.call("DELETE", "/v1/jobs/synthetic", {}).status, 404)
+
+    def test_readiness_fails_closed_without_effective_member_constraint(self):
+        repository = InMemoryRepository()
+        service = GatewayService(
+            GatewayConfig.from_mapping({}),
+            repository,
+            adapter_ready=False,
+            clock=NOW,
+        )
+        response = GatewayApp(service).handle("GET", "/readyz", headers={})
+        self.assertEqual(response.status, 503)
+        self.assertFalse(response.body["ready"])
+        self.assertIn("member_no_max_length_required", response.body["reasons"])
+
+    def test_activation_and_kill_switch_are_controlled_operations(self):
+        repository = InMemoryRepository()
+        repository.set_control("kill_switch_enabled", True)
+        service = GatewayService(
+            make_config(production_activation_enabled=False, kill_switch_enabled=True),
+            repository,
+            adapter_ready=True,
+            clock=NOW,
+        )
+        app = GatewayApp(
+            service,
+            StaticAuthenticator(
+                {
+                    "operator-token": Principal(
+                        "synthetic-operator",
+                        frozenset({"control.kill_switch", "control.activate"}),
+                    )
+                }
+            ),
+        )
+        headers = {"Authorization": "Bearer operator-token"}
+        activation = app.handle(
+            "POST",
+            "/v1/control/activation",
+            headers=headers,
+            body={
+                "enabled": True,
+                "environment": "production",
+                "approval_reference": "synthetic-approval-001",
+            },
+        )
+        self.assertEqual(activation.status, 200)
+        self.assertTrue(repository.get_control()["production_activation_enabled"])
+        disabled = app.handle(
+            "POST",
+            "/v1/control/kill-switch/disable",
+            headers=headers,
+            body={},
+        )
+        self.assertEqual(disabled.status, 200)
+        self.assertFalse(repository.get_control()["kill_switch_enabled"])
+
+
+
+    def test_kill_switch_engage_blocks_claim_and_controlled_clear_restores_eligibility(self):
+        engaged = self.call("POST", "/v1/control/kill-switch/enable", {})
+        self.assertEqual(engaged.status, 200)
+        self.assertTrue(engaged.body["kill_switch_enabled"])
+        self.assertTrue(self.repository.get_control()["kill_switch_enabled"])
+
+        ingested = self.call(
+            "POST", "/v1/source-events", make_event("api-kill-switch-response")
+        )
+        self.assertEqual(ingested.status, 202)
+        blocked = self.call("POST", "/v1/worker/claim", {})
+        self.assertEqual(blocked.status, 423)
+        self.assertEqual(blocked.body["error_code"], "kill_switch_enabled")
+
+        cleared = self.call("POST", "/v1/control/kill-switch/disable", {})
+        self.assertEqual(cleared.status, 200)
+        self.assertFalse(cleared.body["kill_switch_enabled"])
+        claimed = self.call("POST", "/v1/worker/claim", {})
+        self.assertEqual(claimed.status, 200)
+        self.assertTrue(claimed.body["claimed"])
+
+if __name__ == "__main__":
+    unittest.main()

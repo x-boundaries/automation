@@ -1,0 +1,21 @@
+{
+  "schema_version": "xb.member.gateway.config.v1",
+  "environment": "production",
+  "expected_environment": "production",
+  "production_activation_enabled": false,
+  "kill_switch_enabled": true,
+  "allowed_form_aliases": ["member_registration"],
+  "allowed_mapping_versions": ["member-intake.v1"],
+  "member_no_max_length": null,
+  "lease_seconds": 600,
+  "heartbeat_seconds": 120,
+  "execution_deadline_seconds": 300,
+  "max_attempts": 3,
+  "worker_concurrency": 1,
+  "claim_size": 1,
+  "worker_token_sha256": null,
+  "recovery_token_sha256": null,
+  "source_hmac_key_env": "XB_MEMBER_GATEWAY_HMAC_KEY",
+  "worker_token_env": "XB_MEMBER_GATEWAY_WORKER_TOKEN",
+  "recovery_token_env": "XB_MEMBER_GATEWAY_RECOVERY_TOKEN"
+}

@@ -6,6 +6,14 @@ Workflow JSON in this directory is source-controlled evidence of workflow design
 
 ## Current Workflow Exports
 
+### member_forms_gateway_ingest.workflow.json
+
+- Purpose: inactive production-boundary design evidence for the synthetic/configurable Google Forms source adapter. It consumes the Google Forms v1 `responses`/`answers[questionId]` shape through the versioned placeholder question-ID allowlist, follows bounded `nextPageToken` pagination, de-duplicates overlapping response IDs, normalizes a source event, computes the canonical payload hash, and sends only the reviewed xb.member.source_event.v1 contract to the protected gateway; it does not create or update AutoCount members.
+- Status: source-controlled, inactive, credential-free, and incapable of live execution merely by repository checkout. It contains no real Form ID, question ID, credential binding, customer data, pinned data, or execution data; its mapping IDs and endpoint values remain placeholders.
+- Runbook: [Member gateway production runbook](../docs/autocount2-automation/member_gateway_production_runbook.md).
+- Import, credential binding, activation, and execution each require separate explicit current-turn approval; this export is offline validation evidence only.
+- Focused offline coverage: [tests/test_member_gateway_n8n.py](../tests/test_member_gateway_n8n.py).
+
 ### member_intake_gate4a_container_queue_write.workflow.json
 
 - Purpose: Gate 4A staged proof only. Reads exactly one approved real non-dummy source row from the Google Form / Google Sheet intake, validates and normalizes only allowed fields, and writes exactly one sanitized `PENDING_LOOKUP` queue row to JSONL inside the n8n container. No AC2 lookup, no bridge call, no result mapping.

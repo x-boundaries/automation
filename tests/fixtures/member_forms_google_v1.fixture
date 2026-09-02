@@ -1,0 +1,814 @@
+{
+  "one_page": {
+    "pages": [
+      {
+        "responses": [
+          {
+            "responseId": "forms-resp-one-001",
+            "createTime": "2026-08-30T01:02:03.000Z",
+            "lastSubmittedTime": "2026-08-30T04:00:00.000Z",
+            "answers": {
+              "QUESTION_ID_NAME_PLACEHOLDER": {
+                "questionId": "QUESTION_ID_NAME_PLACEHOLDER",
+                "textAnswers": {
+                  "answers": [
+                    {
+                      "value": "Synthetic Alpha"
+                    }
+                  ]
+                }
+              },
+              "QUESTION_ID_PHONE_PLACEHOLDER": {
+                "questionId": "QUESTION_ID_PHONE_PLACEHOLDER",
+                "textAnswers": {
+                  "answers": [
+                    {
+                      "value": "8123 4567"
+                    }
+                  ]
+                }
+              },
+              "QUESTION_ID_EMAIL_PLACEHOLDER": {
+                "questionId": "QUESTION_ID_EMAIL_PLACEHOLDER",
+                "textAnswers": {
+                  "answers": [
+                    {
+                      "value": "alpha@example.test"
+                    }
+                  ]
+                }
+              },
+              "QUESTION_ID_BIRTHDAY_MONTH_PLACEHOLDER": {
+                "questionId": "QUESTION_ID_BIRTHDAY_MONTH_PLACEHOLDER",
+                "textAnswers": {
+                  "answers": [
+                    {
+                      "value": "March"
+                    }
+                  ]
+                }
+              },
+              "QUESTION_ID_MARKETING_CONSENT_PLACEHOLDER": {
+                "questionId": "QUESTION_ID_MARKETING_CONSENT_PLACEHOLDER",
+                "textAnswers": {
+                  "answers": [
+                    {
+                      "value": "No"
+                    }
+                  ]
+                }
+              },
+              "QUESTION_ID_PDPA_ACKNOWLEDGED_PLACEHOLDER": {
+                "questionId": "QUESTION_ID_PDPA_ACKNOWLEDGED_PLACEHOLDER",
+                "textAnswers": {
+                  "answers": [
+                    {
+                      "value": "I agree"
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        ]
+      }
+    ]
+  },
+  "multiple_pages": {
+    "pages": [
+      {
+        "responses": [
+          {
+            "responseId": "forms-resp-page-001",
+            "createTime": "2026-08-30T01:10:00Z",
+            "lastSubmittedTime": "2026-08-30T04:00:00.000Z",
+            "answers": {
+              "QUESTION_ID_NAME_PLACEHOLDER": {
+                "questionId": "QUESTION_ID_NAME_PLACEHOLDER",
+                "textAnswers": {
+                  "answers": [
+                    {
+                      "value": "Synthetic Page One"
+                    }
+                  ]
+                }
+              },
+              "QUESTION_ID_PHONE_PLACEHOLDER": {
+                "questionId": "QUESTION_ID_PHONE_PLACEHOLDER",
+                "textAnswers": {
+                  "answers": [
+                    {
+                      "value": "8123 4567"
+                    }
+                  ]
+                }
+              },
+              "QUESTION_ID_EMAIL_PLACEHOLDER": {
+                "questionId": "QUESTION_ID_EMAIL_PLACEHOLDER",
+                "textAnswers": {
+                  "answers": [
+                    {
+                      "value": "alpha@example.test"
+                    }
+                  ]
+                }
+              },
+              "QUESTION_ID_BIRTHDAY_MONTH_PLACEHOLDER": {
+                "questionId": "QUESTION_ID_BIRTHDAY_MONTH_PLACEHOLDER",
+                "textAnswers": {
+                  "answers": [
+                    {
+                      "value": "March"
+                    }
+                  ]
+                }
+              },
+              "QUESTION_ID_MARKETING_CONSENT_PLACEHOLDER": {
+                "questionId": "QUESTION_ID_MARKETING_CONSENT_PLACEHOLDER",
+                "textAnswers": {
+                  "answers": [
+                    {
+                      "value": "No"
+                    }
+                  ]
+                }
+              },
+              "QUESTION_ID_PDPA_ACKNOWLEDGED_PLACEHOLDER": {
+                "questionId": "QUESTION_ID_PDPA_ACKNOWLEDGED_PLACEHOLDER",
+                "textAnswers": {
+                  "answers": [
+                    {
+                      "value": "I agree"
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        ],
+        "nextPageToken": "page-token-002"
+      },
+      {
+        "responses": [
+          {
+            "responseId": "forms-resp-page-002",
+            "createTime": "2026-08-30T01:11:00+00:00",
+            "lastSubmittedTime": "2026-08-30T04:00:00.000Z",
+            "answers": {
+              "QUESTION_ID_NAME_PLACEHOLDER": {
+                "questionId": "QUESTION_ID_NAME_PLACEHOLDER",
+                "textAnswers": {
+                  "answers": [
+                    {
+                      "value": "Synthetic Page Two"
+                    }
+                  ]
+                }
+              },
+              "QUESTION_ID_PHONE_PLACEHOLDER": {
+                "questionId": "QUESTION_ID_PHONE_PLACEHOLDER",
+                "textAnswers": {
+                  "answers": [
+                    {
+                      "value": "8123 4567"
+                    }
+                  ]
+                }
+              },
+              "QUESTION_ID_EMAIL_PLACEHOLDER": {
+                "questionId": "QUESTION_ID_EMAIL_PLACEHOLDER",
+                "textAnswers": {
+                  "answers": [
+                    {
+                      "value": "page-two@example.test"
+                    }
+                  ]
+                }
+              },
+              "QUESTION_ID_BIRTHDAY_MONTH_PLACEHOLDER": {
+                "questionId": "QUESTION_ID_BIRTHDAY_MONTH_PLACEHOLDER",
+                "textAnswers": {
+                  "answers": [
+                    {
+                      "value": "March"
+                    }
+                  ]
+                }
+              },
+              "QUESTION_ID_MARKETING_CONSENT_PLACEHOLDER": {
+                "questionId": "QUESTION_ID_MARKETING_CONSENT_PLACEHOLDER",
+                "textAnswers": {
+                  "answers": [
+                    {
+                      "value": "No"
+                    }
+                  ]
+                }
+              },
+              "QUESTION_ID_PDPA_ACKNOWLEDGED_PLACEHOLDER": {
+                "questionId": "QUESTION_ID_PDPA_ACKNOWLEDGED_PLACEHOLDER",
+                "textAnswers": {
+                  "answers": [
+                    {
+                      "value": "I agree"
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        ]
+      }
+    ]
+  },
+  "overlap": {
+    "pages": [
+      {
+        "responses": [
+          {
+            "responseId": "forms-resp-overlap-001",
+            "createTime": "2026-08-30T02:00:00Z",
+            "lastSubmittedTime": "2026-08-30T04:00:00.000Z",
+            "answers": {
+              "QUESTION_ID_NAME_PLACEHOLDER": {
+                "questionId": "QUESTION_ID_NAME_PLACEHOLDER",
+                "textAnswers": {
+                  "answers": [
+                    {
+                      "value": "Synthetic Overlap"
+                    }
+                  ]
+                }
+              },
+              "QUESTION_ID_PHONE_PLACEHOLDER": {
+                "questionId": "QUESTION_ID_PHONE_PLACEHOLDER",
+                "textAnswers": {
+                  "answers": [
+                    {
+                      "value": "8123 4567"
+                    }
+                  ]
+                }
+              },
+              "QUESTION_ID_EMAIL_PLACEHOLDER": {
+                "questionId": "QUESTION_ID_EMAIL_PLACEHOLDER",
+                "textAnswers": {
+                  "answers": [
+                    {
+                      "value": "alpha@example.test"
+                    }
+                  ]
+                }
+              },
+              "QUESTION_ID_BIRTHDAY_MONTH_PLACEHOLDER": {
+                "questionId": "QUESTION_ID_BIRTHDAY_MONTH_PLACEHOLDER",
+                "textAnswers": {
+                  "answers": [
+                    {
+                      "value": "March"
+                    }
+                  ]
+                }
+              },
+              "QUESTION_ID_MARKETING_CONSENT_PLACEHOLDER": {
+                "questionId": "QUESTION_ID_MARKETING_CONSENT_PLACEHOLDER",
+                "textAnswers": {
+                  "answers": [
+                    {
+                      "value": "No"
+                    }
+                  ]
+                }
+              },
+              "QUESTION_ID_PDPA_ACKNOWLEDGED_PLACEHOLDER": {
+                "questionId": "QUESTION_ID_PDPA_ACKNOWLEDGED_PLACEHOLDER",
+                "textAnswers": {
+                  "answers": [
+                    {
+                      "value": "I agree"
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        ],
+        "nextPageToken": "overlap-token-002"
+      },
+      {
+        "responses": [
+          {
+            "responseId": "forms-resp-overlap-001",
+            "createTime": "2026-08-30T02:00:00Z",
+            "lastSubmittedTime": "2026-08-30T04:00:00.000Z",
+            "answers": {
+              "QUESTION_ID_NAME_PLACEHOLDER": {
+                "questionId": "QUESTION_ID_NAME_PLACEHOLDER",
+                "textAnswers": {
+                  "answers": [
+                    {
+                      "value": "Synthetic Overlap"
+                    }
+                  ]
+                }
+              },
+              "QUESTION_ID_PHONE_PLACEHOLDER": {
+                "questionId": "QUESTION_ID_PHONE_PLACEHOLDER",
+                "textAnswers": {
+                  "answers": [
+                    {
+                      "value": "8123 4567"
+                    }
+                  ]
+                }
+              },
+              "QUESTION_ID_EMAIL_PLACEHOLDER": {
+                "questionId": "QUESTION_ID_EMAIL_PLACEHOLDER",
+                "textAnswers": {
+                  "answers": [
+                    {
+                      "value": "alpha@example.test"
+                    }
+                  ]
+                }
+              },
+              "QUESTION_ID_BIRTHDAY_MONTH_PLACEHOLDER": {
+                "questionId": "QUESTION_ID_BIRTHDAY_MONTH_PLACEHOLDER",
+                "textAnswers": {
+                  "answers": [
+                    {
+                      "value": "March"
+                    }
+                  ]
+                }
+              },
+              "QUESTION_ID_MARKETING_CONSENT_PLACEHOLDER": {
+                "questionId": "QUESTION_ID_MARKETING_CONSENT_PLACEHOLDER",
+                "textAnswers": {
+                  "answers": [
+                    {
+                      "value": "No"
+                    }
+                  ]
+                }
+              },
+              "QUESTION_ID_PDPA_ACKNOWLEDGED_PLACEHOLDER": {
+                "questionId": "QUESTION_ID_PDPA_ACKNOWLEDGED_PLACEHOLDER",
+                "textAnswers": {
+                  "answers": [
+                    {
+                      "value": "I agree"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "responseId": "forms-resp-overlap-002",
+            "createTime": "2026-08-30T02:01:00Z",
+            "lastSubmittedTime": "2026-08-30T04:00:00.000Z",
+            "answers": {
+              "QUESTION_ID_NAME_PLACEHOLDER": {
+                "questionId": "QUESTION_ID_NAME_PLACEHOLDER",
+                "textAnswers": {
+                  "answers": [
+                    {
+                      "value": "Synthetic Second"
+                    }
+                  ]
+                }
+              },
+              "QUESTION_ID_PHONE_PLACEHOLDER": {
+                "questionId": "QUESTION_ID_PHONE_PLACEHOLDER",
+                "textAnswers": {
+                  "answers": [
+                    {
+                      "value": "8123 4567"
+                    }
+                  ]
+                }
+              },
+              "QUESTION_ID_EMAIL_PLACEHOLDER": {
+                "questionId": "QUESTION_ID_EMAIL_PLACEHOLDER",
+                "textAnswers": {
+                  "answers": [
+                    {
+                      "value": "second@example.test"
+                    }
+                  ]
+                }
+              },
+              "QUESTION_ID_BIRTHDAY_MONTH_PLACEHOLDER": {
+                "questionId": "QUESTION_ID_BIRTHDAY_MONTH_PLACEHOLDER",
+                "textAnswers": {
+                  "answers": [
+                    {
+                      "value": "March"
+                    }
+                  ]
+                }
+              },
+              "QUESTION_ID_MARKETING_CONSENT_PLACEHOLDER": {
+                "questionId": "QUESTION_ID_MARKETING_CONSENT_PLACEHOLDER",
+                "textAnswers": {
+                  "answers": [
+                    {
+                      "value": "No"
+                    }
+                  ]
+                }
+              },
+              "QUESTION_ID_PDPA_ACKNOWLEDGED_PLACEHOLDER": {
+                "questionId": "QUESTION_ID_PDPA_ACKNOWLEDGED_PLACEHOLDER",
+                "textAnswers": {
+                  "answers": [
+                    {
+                      "value": "I agree"
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        ]
+      }
+    ]
+  },
+  "repeated_token": {
+    "pages": [
+      {
+        "responses": [
+          {
+            "responseId": "forms-resp-repeat-001",
+            "createTime": "2026-08-30T03:00:00Z",
+            "lastSubmittedTime": "2026-08-30T04:00:00.000Z",
+            "answers": {
+              "QUESTION_ID_NAME_PLACEHOLDER": {
+                "questionId": "QUESTION_ID_NAME_PLACEHOLDER",
+                "textAnswers": {
+                  "answers": [
+                    {
+                      "value": "Synthetic Alpha"
+                    }
+                  ]
+                }
+              },
+              "QUESTION_ID_PHONE_PLACEHOLDER": {
+                "questionId": "QUESTION_ID_PHONE_PLACEHOLDER",
+                "textAnswers": {
+                  "answers": [
+                    {
+                      "value": "8123 4567"
+                    }
+                  ]
+                }
+              },
+              "QUESTION_ID_EMAIL_PLACEHOLDER": {
+                "questionId": "QUESTION_ID_EMAIL_PLACEHOLDER",
+                "textAnswers": {
+                  "answers": [
+                    {
+                      "value": "alpha@example.test"
+                    }
+                  ]
+                }
+              },
+              "QUESTION_ID_BIRTHDAY_MONTH_PLACEHOLDER": {
+                "questionId": "QUESTION_ID_BIRTHDAY_MONTH_PLACEHOLDER",
+                "textAnswers": {
+                  "answers": [
+                    {
+                      "value": "March"
+                    }
+                  ]
+                }
+              },
+              "QUESTION_ID_MARKETING_CONSENT_PLACEHOLDER": {
+                "questionId": "QUESTION_ID_MARKETING_CONSENT_PLACEHOLDER",
+                "textAnswers": {
+                  "answers": [
+                    {
+                      "value": "No"
+                    }
+                  ]
+                }
+              },
+              "QUESTION_ID_PDPA_ACKNOWLEDGED_PLACEHOLDER": {
+                "questionId": "QUESTION_ID_PDPA_ACKNOWLEDGED_PLACEHOLDER",
+                "textAnswers": {
+                  "answers": [
+                    {
+                      "value": "I agree"
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        ],
+        "nextPageToken": "repeat-token"
+      },
+      {
+        "responses": [
+          {
+            "responseId": "forms-resp-repeat-002",
+            "createTime": "2026-08-30T03:01:00Z",
+            "lastSubmittedTime": "2026-08-30T04:00:00.000Z",
+            "answers": {
+              "QUESTION_ID_NAME_PLACEHOLDER": {
+                "questionId": "QUESTION_ID_NAME_PLACEHOLDER",
+                "textAnswers": {
+                  "answers": [
+                    {
+                      "value": "Synthetic Alpha"
+                    }
+                  ]
+                }
+              },
+              "QUESTION_ID_PHONE_PLACEHOLDER": {
+                "questionId": "QUESTION_ID_PHONE_PLACEHOLDER",
+                "textAnswers": {
+                  "answers": [
+                    {
+                      "value": "8123 4567"
+                    }
+                  ]
+                }
+              },
+              "QUESTION_ID_EMAIL_PLACEHOLDER": {
+                "questionId": "QUESTION_ID_EMAIL_PLACEHOLDER",
+                "textAnswers": {
+                  "answers": [
+                    {
+                      "value": "alpha@example.test"
+                    }
+                  ]
+                }
+              },
+              "QUESTION_ID_BIRTHDAY_MONTH_PLACEHOLDER": {
+                "questionId": "QUESTION_ID_BIRTHDAY_MONTH_PLACEHOLDER",
+                "textAnswers": {
+                  "answers": [
+                    {
+                      "value": "March"
+                    }
+                  ]
+                }
+              },
+              "QUESTION_ID_MARKETING_CONSENT_PLACEHOLDER": {
+                "questionId": "QUESTION_ID_MARKETING_CONSENT_PLACEHOLDER",
+                "textAnswers": {
+                  "answers": [
+                    {
+                      "value": "No"
+                    }
+                  ]
+                }
+              },
+              "QUESTION_ID_PDPA_ACKNOWLEDGED_PLACEHOLDER": {
+                "questionId": "QUESTION_ID_PDPA_ACKNOWLEDGED_PLACEHOLDER",
+                "textAnswers": {
+                  "answers": [
+                    {
+                      "value": "I agree"
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        ],
+        "nextPageToken": "repeat-token"
+      }
+    ]
+  },
+  "malformed_token": {
+    "pages": [
+      {
+        "responses": [
+          {
+            "responseId": "forms-resp-malformed-001",
+            "createTime": "2026-08-30T03:10:00Z",
+            "lastSubmittedTime": "2026-08-30T04:00:00.000Z",
+            "answers": {
+              "QUESTION_ID_NAME_PLACEHOLDER": {
+                "questionId": "QUESTION_ID_NAME_PLACEHOLDER",
+                "textAnswers": {
+                  "answers": [
+                    {
+                      "value": "Synthetic Alpha"
+                    }
+                  ]
+                }
+              },
+              "QUESTION_ID_PHONE_PLACEHOLDER": {
+                "questionId": "QUESTION_ID_PHONE_PLACEHOLDER",
+                "textAnswers": {
+                  "answers": [
+                    {
+                      "value": "8123 4567"
+                    }
+                  ]
+                }
+              },
+              "QUESTION_ID_EMAIL_PLACEHOLDER": {
+                "questionId": "QUESTION_ID_EMAIL_PLACEHOLDER",
+                "textAnswers": {
+                  "answers": [
+                    {
+                      "value": "alpha@example.test"
+                    }
+                  ]
+                }
+              },
+              "QUESTION_ID_BIRTHDAY_MONTH_PLACEHOLDER": {
+                "questionId": "QUESTION_ID_BIRTHDAY_MONTH_PLACEHOLDER",
+                "textAnswers": {
+                  "answers": [
+                    {
+                      "value": "March"
+                    }
+                  ]
+                }
+              },
+              "QUESTION_ID_MARKETING_CONSENT_PLACEHOLDER": {
+                "questionId": "QUESTION_ID_MARKETING_CONSENT_PLACEHOLDER",
+                "textAnswers": {
+                  "answers": [
+                    {
+                      "value": "No"
+                    }
+                  ]
+                }
+              },
+              "QUESTION_ID_PDPA_ACKNOWLEDGED_PLACEHOLDER": {
+                "questionId": "QUESTION_ID_PDPA_ACKNOWLEDGED_PLACEHOLDER",
+                "textAnswers": {
+                  "answers": [
+                    {
+                      "value": "I agree"
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        ],
+        "nextPageToken": {
+          "invalid": true
+        }
+      }
+    ]
+  },
+  "missing_mapping": {
+    "pages": [
+      {
+        "responses": [
+          {
+            "responseId": "forms-resp-missing-001",
+            "createTime": "2026-08-30T03:20:00Z",
+            "lastSubmittedTime": "2026-08-30T04:00:00.000Z",
+            "answers": {
+              "QUESTION_ID_NAME_PLACEHOLDER": {
+                "questionId": "QUESTION_ID_NAME_PLACEHOLDER",
+                "textAnswers": {
+                  "answers": [
+                    {
+                      "value": "Synthetic Alpha"
+                    }
+                  ]
+                }
+              },
+              "QUESTION_ID_PHONE_PLACEHOLDER": {
+                "questionId": "QUESTION_ID_PHONE_PLACEHOLDER",
+                "textAnswers": {
+                  "answers": [
+                    {
+                      "value": "8123 4567"
+                    }
+                  ]
+                }
+              },
+              "QUESTION_ID_BIRTHDAY_MONTH_PLACEHOLDER": {
+                "questionId": "QUESTION_ID_BIRTHDAY_MONTH_PLACEHOLDER",
+                "textAnswers": {
+                  "answers": [
+                    {
+                      "value": "March"
+                    }
+                  ]
+                }
+              },
+              "QUESTION_ID_MARKETING_CONSENT_PLACEHOLDER": {
+                "questionId": "QUESTION_ID_MARKETING_CONSENT_PLACEHOLDER",
+                "textAnswers": {
+                  "answers": [
+                    {
+                      "value": "No"
+                    }
+                  ]
+                }
+              },
+              "QUESTION_ID_PDPA_ACKNOWLEDGED_PLACEHOLDER": {
+                "questionId": "QUESTION_ID_PDPA_ACKNOWLEDGED_PLACEHOLDER",
+                "textAnswers": {
+                  "answers": [
+                    {
+                      "value": "I agree"
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        ]
+      }
+    ]
+  },
+  "unknown_mapping": {
+    "pages": [
+      {
+        "responses": [
+          {
+            "responseId": "forms-resp-unknown-001",
+            "createTime": "2026-08-30T03:30:00Z",
+            "lastSubmittedTime": "2026-08-30T04:00:00.000Z",
+            "answers": {
+              "QUESTION_ID_NAME_PLACEHOLDER": {
+                "questionId": "QUESTION_ID_NAME_PLACEHOLDER",
+                "textAnswers": {
+                  "answers": [
+                    {
+                      "value": "Synthetic Alpha"
+                    }
+                  ]
+                }
+              },
+              "QUESTION_ID_PHONE_PLACEHOLDER": {
+                "questionId": "QUESTION_ID_PHONE_PLACEHOLDER",
+                "textAnswers": {
+                  "answers": [
+                    {
+                      "value": "8123 4567"
+                    }
+                  ]
+                }
+              },
+              "QUESTION_ID_EMAIL_PLACEHOLDER": {
+                "questionId": "QUESTION_ID_EMAIL_PLACEHOLDER",
+                "textAnswers": {
+                  "answers": [
+                    {
+                      "value": "alpha@example.test"
+                    }
+                  ]
+                }
+              },
+              "QUESTION_ID_BIRTHDAY_MONTH_PLACEHOLDER": {
+                "questionId": "QUESTION_ID_BIRTHDAY_MONTH_PLACEHOLDER",
+                "textAnswers": {
+                  "answers": [
+                    {
+                      "value": "March"
+                    }
+                  ]
+                }
+              },
+              "QUESTION_ID_MARKETING_CONSENT_PLACEHOLDER": {
+                "questionId": "QUESTION_ID_MARKETING_CONSENT_PLACEHOLDER",
+                "textAnswers": {
+                  "answers": [
+                    {
+                      "value": "No"
+                    }
+                  ]
+                }
+              },
+              "QUESTION_ID_PDPA_ACKNOWLEDGED_PLACEHOLDER": {
+                "questionId": "QUESTION_ID_PDPA_ACKNOWLEDGED_PLACEHOLDER",
+                "textAnswers": {
+                  "answers": [
+                    {
+                      "value": "I agree"
+                    }
+                  ]
+                }
+              },
+              "QUESTION_ID_UNKNOWN_PLACEHOLDER": {
+                "questionId": "QUESTION_ID_UNKNOWN_PLACEHOLDER",
+                "textAnswers": {
+                  "answers": [
+                    {
+                      "value": "ignored"
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        ]
+      }
+    ]
+  }
+}

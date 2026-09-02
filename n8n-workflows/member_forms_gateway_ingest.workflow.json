@@ -1,0 +1,129 @@
+{
+  "id": "xbMemberGatewayTemplate01",
+  "name": "Member Gateway - Google Forms source adapter (inactive)",
+  "active": false,
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "b1111111-1111-4111-8111-111111111111",
+      "name": "Manual source adapter preview",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [-920, 160]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            { "id": "b2222222-2222-4222-8222-222222222222", "name": "activation_enabled", "value": false, "type": "boolean" },
+            { "id": "b2222222-2222-4222-8222-222222222223", "name": "source_system", "value": "google_forms", "type": "string" },
+            { "id": "b2222222-2222-4222-8222-222222222224", "name": "form_alias", "value": "member_registration", "type": "string" },
+            { "id": "b2222222-2222-4222-8222-222222222225", "name": "mapping_version", "value": "member-intake.v1", "type": "string" },
+            { "id": "b2222222-2222-4222-8222-222222222226", "name": "forms_api_url", "value": "https://forms.example.com/v1/forms/GOOGLE_FORM_ID_PLACEHOLDER/responses", "type": "string" },
+            { "id": "b2222222-2222-4222-8222-222222222227", "name": "gateway_api_url", "value": "https://gateway.example.com/v1/source-events", "type": "string" }
+          ]
+        },
+        "options": {}
+      },
+      "id": "b3333333-3333-4333-8333-333333333333",
+      "name": "Repository-safe source configuration",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [-704, 160],
+      "notesInFlow": true,
+      "notes": "Template only. Placeholder URLs, credentials, and a separate activation decision are required outside this export."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 2 },
+          "conditions": [{ "id": "b4444444-4444-4444-8444-444444444444", "leftValue": "={{ $json.activation_enabled }}", "rightValue": true, "operator": { "type": "boolean", "operation": "equals" } }],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "b5555555-5555-4555-8555-555555555555",
+      "name": "Controlled activation gate",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [-480, 160],
+      "notesInFlow": true,
+      "notes": "The checked-in gate is false. A checkout cannot activate or contact a live system."
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $json.forms_api_url }}",
+        "sendQuery": true,
+        "queryParameters": { "parameters": [{ "name": "pageSize", "value": "100" }] },
+        "options": {
+          "response": { "response": { "responseFormat": "json", "fullResponse": true } },
+          "pagination": { "pagination": {
+            "paginationMode": "updateAParameterInEachRequest",
+            "parameters": { "parameters": [{ "name": "pageToken", "value": "={{ $response.body.nextPageToken }}", "type": "qs" }] },
+            "paginationCompleteWhen": "other",
+            "completeExpression": "={{ !$response.body || !$response.body.nextPageToken || typeof $response.body.nextPageToken !== \"string\" || $response.body.nextPageToken.length < 1 || $response.body.nextPageToken.length > 1024 }}",
+            "limitPagesFetched": true,
+            "maxRequests": 50
+          } }
+        }
+      },
+      "id": "b6666666-6666-4666-8666-666666666666",
+      "name": "Google Forms API page (configured outside repo)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [-240, 32],
+      "notesInFlow": true,
+      "notes": "Inactive credential-free design surface. Configure official Forms authentication and pagination only in a separately controlled environment."
+    },
+    {
+      "parameters": {
+        "jsCode": "const crypto = require('crypto');\n\nconst MAPPING_VERSION = 'member-intake.v1';\nconst QUESTION_MAPPING = Object.freeze({\n  name: 'QUESTION_ID_NAME_PLACEHOLDER',\n  phone: 'QUESTION_ID_PHONE_PLACEHOLDER',\n  email: 'QUESTION_ID_EMAIL_PLACEHOLDER',\n  birthday_month: 'QUESTION_ID_BIRTHDAY_MONTH_PLACEHOLDER',\n  marketing_consent: 'QUESTION_ID_MARKETING_CONSENT_PLACEHOLDER',\n  pdpa_acknowledged: 'QUESTION_ID_PDPA_ACKNOWLEDGED_PLACEHOLDER',\n});\nconst REQUIRED_FIELDS = Object.freeze([\n  'name',\n  'phone',\n  'email',\n  'birthday_month',\n  'marketing_consent',\n  'pdpa_acknowledged',\n]);\nconst SAFE_ID = /^[A-Za-z0-9._:-]{1,200}$/;\nconst RFC3339 = /^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?(?:Z|[+-]\\d{2}:\\d{2})$/;\nconst MAX_PAGES = 50;\n\nconst clean = value => {\n  if (typeof value !== 'string') throw new Error('text_value_required');\n  return value.normalize('NFC').replace(/\\r\\n?/g, '\\n').trim();\n};\nconst spaces = value => clean(value).split(/\\s+/).filter(Boolean).join(' ');\nconst answerValue = (answers, field) => {\n  const questionId = QUESTION_MAPPING[field];\n  if (typeof questionId !== 'string' || !questionId) throw new Error('forms_question_mapping_invalid');\n  if (!Object.prototype.hasOwnProperty.call(answers, questionId)) {\n    throw new Error('forms_question_mapping_missing');\n  }\n  const entry = answers[questionId];\n  const values = entry && entry.textAnswers && entry.textAnswers.answers;\n  if (!Array.isArray(values) || values.length !== 1 || !values[0] || typeof values[0].value !== 'string') {\n    throw new Error('forms_answer_value_invalid');\n  }\n  return values[0].value;\n};\nconst mapResponse = response => {\n  if (!response || typeof response !== 'object' || Array.isArray(response)) {\n    throw new Error('forms_response_invalid');\n  }\n  const responseId = response.responseId;\n  const createTime = response.createTime;\n  if (typeof responseId !== 'string' || !SAFE_ID.test(responseId)) throw new Error('forms_response_id_invalid');\n  if (typeof createTime !== 'string' || !RFC3339.test(createTime) || Number.isNaN(Date.parse(createTime))) {\n    throw new Error('forms_create_time_invalid');\n  }\n  const answers = response.answers;\n  if (!answers || typeof answers !== 'object' || Array.isArray(answers)) throw new Error('forms_answers_invalid');\n  const allowedQuestionIds = new Set(Object.values(QUESTION_MAPPING));\n  for (const questionId of Object.keys(answers)) {\n    if (!allowedQuestionIds.has(questionId)) throw new Error('forms_question_mapping_unknown');\n  }\n\n  const raw = {};\n  for (const field of REQUIRED_FIELDS) raw[field] = answerValue(answers, field);\n  const rawPhone = clean(raw.phone);\n  if (!rawPhone) throw new Error('phone_required');\n  if (!/^[0-9\\s()+.\\-]+$/.test(rawPhone)) throw new Error('phone_contains_letters_or_unsupported_characters');\n  const digits = rawPhone.replace(/[^0-9]/g, '');\n  let phone;\n  if (digits.length === 8 && /^[89]/.test(digits)) phone = '65' + digits;\n  else if (digits.length === 10 && digits.startsWith('65') && /^[89]/.test(digits[2])) phone = digits;\n  else throw new Error('phone_shape_invalid');\n\n  const name = spaces(raw.name);\n  if (name.length < 1 || name.length > 200) throw new Error('name_invalid');\n  const email = spaces(raw.email).toLowerCase();\n  if (email.length < 1 || email.length > 254 || !/^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$/.test(email)) {\n    throw new Error('email_invalid');\n  }\n  const monthName = spaces(raw.birthday_month).toLowerCase();\n  const months = {\n    january: 'January', february: 'February', march: 'March', april: 'April',\n    may: 'May', june: 'June', july: 'July', august: 'August',\n    september: 'September', october: 'October', november: 'November', december: 'December',\n  };\n  const month = months[monthName];\n  const consent = spaces(raw.marketing_consent).toLowerCase();\n  if (!month) throw new Error('birthday_month_invalid');\n  if (consent !== 'yes' && consent !== 'no') throw new Error('marketing_consent_must_be_yes_or_no');\n  const pdpa = typeof raw.pdpa_acknowledged === 'boolean'\n    ? raw.pdpa_acknowledged\n    : ['yes', 'i agree'].includes(spaces(raw.pdpa_acknowledged).toLowerCase());\n\n  const payload = {\n    name,\n    phone,\n    email,\n    birthday_month: month,\n    marketing_consent: consent === 'yes' ? 'Yes' : 'No',\n    pdpa_acknowledged: pdpa,\n  };\n  const canonical = JSON.stringify(Object.keys(payload).sort().reduce((sorted, key) => {\n    sorted[key] = payload[key];\n    return sorted;\n  }, {}));\n  return {\n    schema_version: 'xb.member.source_event.v1',\n    source_system: 'google_forms',\n    form_alias: 'member_registration',\n    response_id: responseId,\n    create_time: createTime,\n    mapping_version: MAPPING_VERSION,\n    request_id: 'n8n-' + crypto.randomUUID(),\n    payload,\n    payload_hash: 'sha256:' + crypto.createHash('sha256').update(canonical, 'utf8').digest('hex'),\n    operation: 'member.create',\n  };\n};\nconst pageFromItem = item => {\n  const value = item && item.json;\n  if (value && value.body && typeof value.body === 'object' && !Array.isArray(value.body)) return value.body;\n  return value;\n};\n\nconst items = $input.all();\nif (!Array.isArray(items) || items.length < 1) throw new Error('forms_page_missing');\nif (items.length > MAX_PAGES) throw new Error('forms_pagination_limit_exceeded');\n\nconst seenTokens = new Set();\nconst events = new Map();\nlet terminalPage = false;\nfor (const item of items) {\n  const page = pageFromItem(item);\n  if (!page || typeof page !== 'object' || Array.isArray(page)) throw new Error('forms_page_invalid');\n  if (terminalPage) throw new Error('forms_page_after_terminal');\n  if (!Array.isArray(page.responses)) throw new Error('forms_responses_invalid');\n\n  for (const response of page.responses) {\n    const event = mapResponse(response);\n    const existing = events.get(event.response_id);\n    if (!existing) {\n      events.set(event.response_id, event);\n      continue;\n    }\n    if (existing.create_time !== event.create_time ||\n        existing.payload_hash !== event.payload_hash ||\n        JSON.stringify(existing.payload) !== JSON.stringify(event.payload)) {\n      throw new Error('forms_response_id_conflict');\n    }\n  }\n\n  const next = page.nextPageToken;\n  if (next === undefined || next === null || next === '') {\n    terminalPage = true;\n    continue;\n  }\n  if (typeof next !== 'string' || next.length < 1 || next.length > 1024 || /[\\u0000-\\u001f\\u007f]/.test(next)) {\n    throw new Error('forms_page_token_invalid');\n  }\n  if (seenTokens.has(next)) throw new Error('forms_page_token_repeated');\n  seenTokens.add(next);\n}\nif (!terminalPage) throw new Error('forms_pagination_unterminated');\nreturn Array.from(events.values()).map(json => ({ json }));\n"
+      },
+      "id": "b7777777-7777-4777-8777-777777777777",
+      "name": "Canonicalize source response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [0, 32],
+      "notesInFlow": true,
+      "notes": "The adapter normalizes source values and creates the sorted-key UTF-8 hash; the gateway validates the closed contract again."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Repository-safe source configuration').first().json.gateway_api_url }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $json }}",
+        "options": { "response": { "response": { "responseFormat": "json" } } }
+      },
+      "id": "b8888888-8888-4888-8888-888888888888",
+      "name": "Protected XB Gateway ingest (configured outside repo)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [240, 32],
+      "notesInFlow": true,
+      "notes": "Inactive credential-free design surface. Private HTTPS authentication is configured outside this repository before any controlled activation."
+    },
+    {
+      "parameters": { "jsCode": "return [{ json: { status: 'blocked_by_default_activation_gate', activation_enabled: false, source_system: 'google_forms', operation: 'member.create' } }];" },
+      "id": "b9999999-9999-4999-8999-999999999999",
+      "name": "Blocked until separate activation",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-240, 288],
+      "notesInFlow": true,
+      "notes": "Safe false branch emits synthetic status metadata and performs no network operation."
+    }
+  ],
+  "connections": {
+    "Manual source adapter preview": { "main": [[{ "node": "Repository-safe source configuration", "type": "main", "index": 0 }]] },
+    "Repository-safe source configuration": { "main": [[{ "node": "Controlled activation gate", "type": "main", "index": 0 }]] },
+    "Controlled activation gate": { "main": [[{ "node": "Google Forms API page (configured outside repo)", "type": "main", "index": 0 }], [{ "node": "Blocked until separate activation", "type": "main", "index": 0 }]] },
+    "Google Forms API page (configured outside repo)": { "main": [[{ "node": "Canonicalize source response", "type": "main", "index": 0 }]] },
+    "Canonicalize source response": { "main": [[{ "node": "Protected XB Gateway ingest (configured outside repo)", "type": "main", "index": 0 }]] }
+  },
+  "settings": { "executionOrder": "v1", "saveManualExecutions": false, "saveDataErrorExecution": "none", "saveDataSuccessExecution": "none" },
+  "staticData": null,
+  "pinData": {}
+}
