@@ -209,6 +209,31 @@ class ApiBoundaryTests(unittest.TestCase):
         self.assertEqual(response.body["error_code"], "scope_denied")
         self.assertEqual(self.repository.get_job(job["job_id"]).state.value, "WRITER_TERMINATION_UNCONFIRMED")
 
+    def test_worker_quarantine_preserves_registered_identity_and_rejects_mismatch_on_repeat(self):
+        job, fence, writer = self.quarantined_writer("api-quarantine-identity")
+        omitted = self.call(
+            "POST",
+            f"/v1/jobs/{job['job_id']}/writer/quarantine",
+            dict(writer, pid=None, process_start_time=None, evidence_reference="api-quarantine-omitted", reason="writer_termination_unconfirmed"),
+        )
+        self.assertEqual(omitted.status, 200)
+        hold = self.repository.get_writer_execution_hold(job["job_id"])
+        self.assertEqual((hold.pid, hold.process_start_time), (writer["pid"], writer["process_start_time"]))
+        for changes in (
+            {"pid": writer["pid"] + 1, "evidence_reference": "api-quarantine-wrong-pid"},
+            {"process_start_time": "2026-08-30T01:00:02Z", "evidence_reference": "api-quarantine-wrong-start"},
+        ):
+            with self.subTest(changes=changes):
+                response = self.call(
+                    "POST",
+                    f"/v1/jobs/{job['job_id']}/writer/quarantine",
+                    dict(writer, reason="writer_termination_unconfirmed", **changes),
+                )
+                self.assertEqual(response.status, 409)
+                self.assertEqual(response.body["error_code"], "writer_process_identity_mismatch")
+        current = self.repository.get_writer_execution_hold(job["job_id"])
+        self.assertEqual((current.pid, current.process_start_time), (writer["pid"], writer["process_start_time"]))
+
     def test_recovery_principal_is_denied_ordinary_worker_write_and_control_routes(self):
         routes = (
             ("POST", "/v1/source-events", make_event("api-recovery-source-denied")),

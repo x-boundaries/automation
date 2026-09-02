@@ -93,11 +93,12 @@ class WriterLivenessTests(unittest.TestCase):
             "error_code": None if status == "CREATED_VERIFIED" else "save_outcome_uncertain",
         }
 
-    def quarantine(self, job, fence):
+    def quarantine(self, job, fence, *, pid=None, process_start=None, evidence_reference="quarantine-test"):
         return self.repository.quarantine_writer_execution(
             job["job_id"], fence_id=fence["dispatch_fence_id"], attempt=job["attempt"],
             worker_session=WORKER, host_binding=HOST, execution_id=fence["execution_id"],
-            evidence_reference="quarantine-test", reason="writer_termination_unconfirmed", now=NOW,
+            pid=pid, process_start_time=process_start, evidence_reference=evidence_reference,
+            reason="writer_termination_unconfirmed", now=NOW,
         )
 
     def test_fence_creates_pending_hold_and_registration_is_exact(self):
@@ -117,6 +118,30 @@ class WriterLivenessTests(unittest.TestCase):
         self.assertEqual(self.register(job, fence).state, WriterHoldState.REGISTERED)
         with self.assertRaisesRegex(WriterTerminationConflict, "writer_process_identity_mismatch"):
             self.register(job, fence, process_start="pid-reuse")
+
+    def test_registered_quarantine_rejects_identity_replacement_before_and_after_quarantine(self):
+        job, fence = self.fenced("quarantine-identity")
+        self.register(job, fence)
+        for pid, process_start in ((4322, PROCESS_START), (4321, "2026-09-01T01:00:02Z")):
+            with self.subTest(pid=pid, process_start=process_start):
+                with self.assertRaisesRegex(WriterTerminationConflict, "writer_process_identity_mismatch"):
+                    self.quarantine(job, fence, pid=pid, process_start=process_start, evidence_reference=f"mismatch-{pid}")
+        registered = self.repository.get_writer_execution_hold(job["job_id"])
+        self.assertEqual((registered.pid, registered.process_start_time), (4321, PROCESS_START))
+        quarantined = self.quarantine(job, fence)
+        self.assertEqual(quarantined.state, WriterHoldState.QUARANTINED)
+        self.assertEqual((quarantined.pid, quarantined.process_start_time), (4321, PROCESS_START))
+        with self.assertRaisesRegex(WriterTerminationConflict, "writer_process_identity_mismatch"):
+            self.quarantine(job, fence, pid=4322, process_start=PROCESS_START, evidence_reference="repeat-mismatch")
+        current = self.repository.get_writer_execution_hold(job["job_id"])
+        self.assertEqual((current.pid, current.process_start_time), (4321, PROCESS_START))
+
+    def test_registered_quarantine_accepts_matching_identity_without_replacement(self):
+        job, fence = self.fenced("quarantine-matching")
+        self.register(job, fence)
+        quarantined = self.quarantine(job, fence, pid=4321, process_start=PROCESS_START, evidence_reference="matching-identity")
+        self.assertEqual(quarantined.state, WriterHoldState.QUARANTINED)
+        self.assertEqual((quarantined.pid, quarantined.process_start_time), (4321, PROCESS_START))
 
     def test_result_before_confirmation_and_kill_without_exit_proof_stay_quarantined(self):
         job, fence = self.fenced()
@@ -147,12 +172,17 @@ class WriterLivenessTests(unittest.TestCase):
                 recovery_session=WORKER, host_binding=HOST, execution_id=fence["execution_id"],
                 pid=4321, process_start_time=PROCESS_START, evidence_reference="recovery-1", exit_code=0, now=NOW + timedelta(seconds=700),
             )
-        with self.assertRaisesRegex(WriterTerminationConflict, "writer_termination_binding_invalid"):
-            restarted.recover_writer_termination(
-                job["job_id"], fence_id=fence["dispatch_fence_id"], attempt=job["attempt"],
-                recovery_session="worker-b", host_binding=HOST, execution_id=fence["execution_id"],
-                pid=4321, process_start_time="pid-reused", evidence_reference="recovery-2", exit_code=0, now=NOW + timedelta(seconds=700),
-            )
+        for pid, process_start, evidence_reference in (
+            (4322, PROCESS_START, "recovery-wrong-pid"),
+            (4321, "pid-reused", "recovery-reused-pid"),
+        ):
+            with self.subTest(pid=pid, process_start=process_start):
+                with self.assertRaisesRegex(WriterTerminationConflict, "writer_termination_binding_invalid"):
+                    restarted.recover_writer_termination(
+                        job["job_id"], fence_id=fence["dispatch_fence_id"], attempt=job["attempt"],
+                        recovery_session="worker-b", host_binding=HOST, execution_id=fence["execution_id"],
+                        pid=pid, process_start_time=process_start, evidence_reference=evidence_reference, exit_code=0, now=NOW + timedelta(seconds=700),
+                    )
         result, duplicate = restarted.recover_writer_termination(
             job["job_id"], fence_id=fence["dispatch_fence_id"], attempt=job["attempt"],
             recovery_session="worker-b", host_binding=HOST, execution_id=fence["execution_id"],

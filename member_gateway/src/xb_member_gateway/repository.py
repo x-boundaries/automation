@@ -778,6 +778,10 @@ class InMemoryRepository:
                 self._validate_process_identity(pid, process_start_time)
             if not isinstance(evidence_reference, str) or not re.fullmatch(r"[A-Za-z0-9._:-]{1,200}", evidence_reference):
                 raise WriterTerminationConflict("writer_quarantine_evidence_invalid")
+            if hold.state in {WriterHoldState.REGISTERED, WriterHoldState.QUARANTINED}:
+                if pid is not None and (hold.pid != pid or hold.process_start_time != process_start_time):
+                    raise WriterTerminationConflict("writer_process_identity_mismatch")
+                pid, process_start_time = hold.pid, hold.process_start_time
             if hold.state == WriterHoldState.QUARANTINED:
                 return self._copy(hold)
             updated = replace(
@@ -1580,9 +1584,18 @@ class PostgresRepository:
                     raise WriterTerminationConflict("writer_termination_binding_invalid")
                 if hold.state in {WriterHoldState.CLEARED, WriterHoldState.TERMINATION_CONFIRMED}:
                     raise WriterTerminationConflict("writer_termination_clearance_rejected")
+                if pid is not None and (isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0 or not isinstance(process_start_time, str) or not process_start_time or len(process_start_time) > 80):
+                    raise WriterTerminationConflict("writer_process_identity_invalid")
+                if hold.state in {WriterHoldState.REGISTERED, WriterHoldState.QUARANTINED}:
+                    if pid is not None and (hold.pid != pid or hold.process_start_time != process_start_time):
+                        raise WriterTerminationConflict("writer_process_identity_mismatch")
+                    pid, process_start_time = hold.pid, hold.process_start_time
                 if hold.state == WriterHoldState.QUARANTINED:
                     return hold
-                cursor.execute("UPDATE xb_member_gateway.writer_execution_holds SET lifecycle='QUARANTINED',process_pid=COALESCE(%s,process_pid),process_start_at=COALESCE(%s,process_start_at),evidence_type='quarantine',evidence_reference=%s,quarantined_at=%s,state_version=state_version+1,updated_at=%s WHERE job_id=%s", (pid, process_start_time, evidence_reference, current, current, job_id))
+                if hold.state == WriterHoldState.REGISTERED:
+                    cursor.execute("UPDATE xb_member_gateway.writer_execution_holds SET lifecycle='QUARANTINED',evidence_type='quarantine',evidence_reference=%s,quarantined_at=%s,state_version=state_version+1,updated_at=%s WHERE job_id=%s", (evidence_reference, current, current, job_id))
+                else:
+                    cursor.execute("UPDATE xb_member_gateway.writer_execution_holds SET lifecycle='QUARANTINED',process_pid=COALESCE(%s,process_pid),process_start_at=COALESCE(%s,process_start_at),evidence_type='quarantine',evidence_reference=%s,quarantined_at=%s,state_version=state_version+1,updated_at=%s WHERE job_id=%s", (pid, process_start_time, evidence_reference, current, current, job_id))
                 safe_reason = reason if re.fullmatch(r"[a-z0-9_.:-]{1,80}", reason) else "writer_termination_unconfirmed"
                 if job.state != JobState.WRITER_TERMINATION_UNCONFIRMED:
                     self._advance(cursor, job, JobState.WRITER_TERMINATION_UNCONFIRMED, current, {"last_error_code": safe_reason})
