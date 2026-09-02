@@ -53,7 +53,7 @@ $gateway = {
         $thisState.probe_refs += [string]$Body.probe_reference
     }
     if ($Path -eq "/readyz") {
-        return [pscustomobject]@{ ready = $true; lease_seconds = 8; heartbeat_seconds = 1; execution_deadline_seconds = 5 }
+        return [pscustomobject]@{ ready = $true; lease_seconds = 20; heartbeat_seconds = 1; execution_deadline_seconds = 10 }
     }
     if ($Path -eq "/v1/worker/claim") {
         return [pscustomobject]@{
@@ -72,7 +72,7 @@ $gateway = {
         return [pscustomobject]@{ state = "WRITING"; dispatch_fence_id = "fence-1234567890abcdef"; execution_id = "exec-1234567890abcdef" }
     }
     if ($Path -like "*/status") {
-        return [pscustomobject]@{ state = "WRITING"; state_version = $thisState.state_version; attempt = 1; attempt_started_at = $thisState.attempt_started_at; lease_expires_at = [DateTimeOffset]::UtcNow.AddSeconds(8).ToString("o") }
+        return [pscustomobject]@{ state = "WRITING"; state_version = $thisState.state_version; attempt = 1; attempt_started_at = $thisState.attempt_started_at; lease_expires_at = [DateTimeOffset]::UtcNow.AddSeconds(20).ToString("o") }
     }
     if ($Path -like "*/writer/register") {
         if ($RegistrationFailure) { throw "synthetic_registration_failure" }
@@ -91,7 +91,7 @@ $gateway = {
         if ($HeartbeatFailure -and $thisState.heartbeat_count -gt 0) { throw "synthetic_heartbeat_failure" }
         $thisState.heartbeat_count++
         $thisState.state_version++
-        return [pscustomobject]@{ state_version = $thisState.state_version; lease_expires_at = [DateTimeOffset]::UtcNow.AddSeconds(8).ToString("o") }
+        return [pscustomobject]@{ state_version = $thisState.state_version; lease_expires_at = [DateTimeOffset]::UtcNow.AddSeconds(20).ToString("o") }
     }
     if ($Path -like "*/result") {
         $thisState.result = $Body
