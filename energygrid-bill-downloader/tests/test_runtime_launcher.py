@@ -7002,6 +7002,387 @@ class LauncherStaticGuards(TierCBase):
         )
 
 
+# --------------------------------------------------------------------------------------
+# Python-child stdout/stderr transport, design lock DL-XB-141-STDOUT-TRANSPORT-001
+# --------------------------------------------------------------------------------------
+# Run101 reproduced the defect: the launcher started its native child without redirecting
+# either standard stream, so a redirected caller of the launcher received nothing the child
+# wrote. The repair redirects both streams, drains them concurrently, and relays them
+# verbatim after the child completes.
+#
+# The full launcher preflight cannot be satisfied portably: position 15 requires a launcher
+# root that the run principal cannot write and that no bypass privilege overrides, which is
+# a host-and-token property rather than a fixture property. These tests therefore execute
+# the COMMITTED transport source itself, lifted verbatim out of runtime/launcher.ps1
+# between its two named markers, rather than a copy of it. Nothing here starts the real
+# application, reads a real credential, touches a private runtime path, or leaves the
+# scratch directory.
+
+TRANSPORT_CAPTURE_BEGIN = "# EG-TRANSPORT-CAPTURE-BEGIN"
+TRANSPORT_CAPTURE_END = "# EG-TRANSPORT-CAPTURE-END"
+
+TRANSPORT_PROBE_SCHEMA = "xb.launcher.transport.probe.v1"
+
+# Comfortably past the operating system pipe buffer on both streams, so a launcher that
+# drained one stream to completion before starting the other would block here rather than
+# return. Kept small enough to stay fast.
+TRANSPORT_FILLER_LINES = 4000
+TRANSPORT_PAYLOAD_CHARS = 60000
+
+TRANSPORT_CHILD_SCRIPT = r"""
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory)][string]$Marker,
+    [Parameter(Mandatory)][int]$PayloadChars,
+    [Parameter(Mandatory)][int]$FillerLines,
+    [int]$ExitCode = 0,
+    [switch]$Opaque
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+# The console writers are used deliberately: this stub must emit exactly the bytes the
+# assertions expect, with no object-pipeline wrapping of its own to confuse the result.
+if ($Opaque) {
+    [Console]::Out.WriteLine('not json at all ' + $Marker)
+    [Console]::Out.WriteLine('{ "half": "an object"')
+    [Console]::Error.WriteLine('OPAQUE-ERR ' + $Marker)
+    exit $ExitCode
+}
+
+$payload = 'A' * $PayloadChars
+$document = [ordered]@{
+    schema  = 'xb.launcher.transport.probe.v1'
+    marker  = $Marker
+    payload = $payload
+}
+[Console]::Out.WriteLine(($document | ConvertTo-Json -Depth 4 -Compress))
+for ($i = 0; $i -lt $FillerLines; $i++) {
+    [Console]::Out.WriteLine('OUT-FILLER-' + $i)
+}
+
+[Console]::Error.WriteLine('ERR-MARKER ' + $Marker)
+for ($i = 0; $i -lt $FillerLines; $i++) {
+    [Console]::Error.WriteLine('ERR-FILLER-' + $i)
+}
+
+exit $ExitCode
+"""
+
+# The harness binds exactly the names the committed capture region reads, splices the
+# committed capture and relay regions in unmodified, and then does nothing else.
+TRANSPORT_HARNESS_TEMPLATE = r"""
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory)][string]$Lib,
+    [Parameter(Mandatory)][string]$PythonExe,
+    [Parameter(Mandatory)][string]$WorkDirectory,
+    [Parameter(Mandatory)][string]$ArgumentJson
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+. $Lib
+
+$workingDirectory = $WorkDirectory
+$childArguments = @(
+    [string[]]((Get-Content -LiteralPath $ArgumentJson -Raw) | ConvertFrom-Json))
+
+$outcome = & {
+__CAPTURE__
+}
+
+$childStdOut = [string]$outcome.StdOut
+$childStdErr = [string]$outcome.StdErr
+$childExitCode = [int]$outcome.ExitCode
+
+__RELAY__
+
+exit $childExitCode
+"""
+
+
+def committed_region(text, begin_marker, end_marker):
+    """Lift one marked region out of a committed runtime file, verbatim."""
+    start = text.index(begin_marker) + len(begin_marker)
+    end = text.index(end_marker, start)
+    return text[start:end]
+
+
+def committed_transport_capture():
+    """The committed Python-child capture region of runtime/launcher.ps1."""
+    return committed_region(
+        LAUNCHER.read_text(encoding="utf-8"),
+        TRANSPORT_CAPTURE_BEGIN,
+        TRANSPORT_CAPTURE_END,
+    )
+
+
+def committed_transport_relay():
+    """The committed relay statements of runtime/launcher.ps1.
+
+    The relay is deliberately NOT inside a marked region in the launcher: it sits on the
+    launcher's own terminal path between the credential cleanup and the restore check, and
+    wrapping it in a block would change that ordering. It is located here by its two exact
+    committed statements instead, so a launcher that stopped relaying could not satisfy it.
+    """
+    launcher = LAUNCHER.read_text(encoding="utf-8")
+    start = launcher.index("if (-not [string]::IsNullOrEmpty($childStdOut)) {")
+    end = launcher.index("if ($null -ne $restoreResult) {", start)
+    return launcher[start:end]
+
+
+def transport_harness_source():
+    """The scratch harness with both committed regions spliced in unmodified."""
+    return (
+        TRANSPORT_HARNESS_TEMPLATE
+        .replace("__CAPTURE__", committed_transport_capture())
+        .replace("__RELAY__", committed_transport_relay())
+    )
+
+
+def run_transport_probe(exe, tmp, marker, exit_code=0, opaque=False):
+    """Drive the committed transport over a synthetic child, through a redirected caller."""
+    tmp = Path(tmp)
+    harness = tmp / "eg_transport_harness.ps1"
+    harness.write_text(transport_harness_source(), encoding="utf-8")
+
+    child = tmp / "eg_transport_child.ps1"
+    child.write_text(TRANSPORT_CHILD_SCRIPT, encoding="utf-8")
+
+    work = tmp / "transport_work"
+    if not work.exists():
+        work.mkdir()
+
+    arguments = [
+        "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+        "-File", str(child),
+        "-Marker", marker,
+        "-PayloadChars", str(TRANSPORT_PAYLOAD_CHARS),
+        "-FillerLines", str(TRANSPORT_FILLER_LINES),
+        "-ExitCode", str(exit_code),
+    ]
+    if opaque:
+        arguments.append("-Opaque")
+    argument_json = write_json(tmp, "transport_arguments.json", arguments)
+
+    # capture_output makes this a REDIRECTED caller, which is exactly the topology the
+    # unrepaired launcher could not serve.
+    return run_ps(
+        exe, harness,
+        "-Lib", str(LIB),
+        "-PythonExe", str(exe),
+        "-WorkDirectory", str(work),
+        "-ArgumentJson", str(argument_json),
+    )
+
+
+class ChildStreamTransportMixin:
+    """DL-XB-141-STDOUT-TRANSPORT-001: capture, relay, and exit-code preservation."""
+
+    exe = None
+
+    def _probe(self, marker, exit_code=0, opaque=False):
+        with TemporaryScratch() as tmp:
+            return run_transport_probe(
+                self.exe, tmp, marker, exit_code=exit_code, opaque=opaque
+            )
+
+    def test_a_redirected_caller_receives_the_complete_child_stdout_document(self):
+        """Case A: the whole document survives, unwrapped and unreflowed, on one line."""
+        marker = "eg-transport-stdout"
+        completed = self._probe(marker)
+        self.assertEqual(0, completed.returncode, completed.stderr[:2000])
+
+        lines = completed.stdout.splitlines()
+        self.assertTrue(lines, "the redirected caller received no child stdout at all")
+        document = json.loads(lines[0])
+        self.assertEqual(TRANSPORT_PROBE_SCHEMA, document["schema"])
+        self.assertEqual(marker, document["marker"])
+        self.assertEqual(
+            TRANSPORT_PAYLOAD_CHARS,
+            len(document["payload"]),
+            "a wrapped or reflowed relay would not round-trip the payload length",
+        )
+        self.assertEqual(
+            "OUT-FILLER-%d" % (TRANSPORT_FILLER_LINES - 1),
+            lines[-1],
+            "every stdout line must arrive, not just the ones before the pipe filled",
+        )
+
+    def test_child_stderr_is_relayed_to_launcher_stderr(self):
+        """Case B: stderr arrives on stderr, complete, and never folded into stdout."""
+        marker = "eg-transport-stderr"
+        completed = self._probe(marker)
+        self.assertEqual(0, completed.returncode, completed.stderr[:2000])
+
+        error_lines = completed.stderr.splitlines()
+        self.assertEqual("ERR-MARKER %s" % marker, error_lines[0])
+        self.assertEqual(
+            "ERR-FILLER-%d" % (TRANSPORT_FILLER_LINES - 1),
+            error_lines[-1],
+            "a single-stream drain would deadlock or truncate here",
+        )
+        self.assertNotIn(
+            "ERR-MARKER", completed.stdout,
+            "the two streams stay independent; stderr is never merged into stdout",
+        )
+        self.assertNotIn(
+            "OUT-FILLER-", completed.stderr,
+            "the two streams stay independent; stdout is never merged into stderr",
+        )
+
+    def test_a_zero_child_exit_remains_a_zero_launcher_exit(self):
+        """Case C."""
+        completed = self._probe("eg-transport-exit-zero")
+        self.assertEqual(0, completed.returncode, completed.stderr[:2000])
+
+    def test_a_non_zero_child_exit_is_preserved_exactly_and_still_relays(self):
+        """Case D: application exit codes pass through untouched, output and all."""
+        for exit_code in (20, 64):
+            with self.subTest(child_exit=exit_code):
+                marker = "eg-transport-exit-%d" % exit_code
+                completed = self._probe(marker, exit_code=exit_code)
+                self.assertEqual(
+                    exit_code,
+                    completed.returncode,
+                    "the real child exit code must survive the relay",
+                )
+                document = json.loads(completed.stdout.splitlines()[0])
+                self.assertEqual(marker, document["marker"])
+                self.assertIn("ERR-MARKER %s" % marker, completed.stderr)
+
+    def test_child_output_is_carried_opaquely(self):
+        """Case E: non-JSON and half-JSON output is relayed byte-for-byte regardless."""
+        marker = "eg-transport-opaque"
+        completed = self._probe(marker, exit_code=7, opaque=True)
+        self.assertEqual(7, completed.returncode)
+        self.assertEqual(
+            ["not json at all %s" % marker, '{ "half": "an object"'],
+            completed.stdout.splitlines(),
+            "the transport must not parse, repair, or filter application output",
+        )
+        self.assertEqual(
+            ["OPAQUE-ERR %s" % marker], completed.stderr.splitlines()
+        )
+
+
+class ChildStreamTransportTierA(ChildStreamTransportMixin, TierABase):
+    """Portable half."""
+
+    @classmethod
+    def setUpClass(cls):
+        TierABase.setUpClass()
+        cls.exe = ANY_PS
+
+
+class ChildStreamTransportTierB(ChildStreamTransportMixin, TierBBase):
+    """Windows PowerShell 5.1 half: the production runtime the deadlock claim is about."""
+
+    @classmethod
+    def setUpClass(cls):
+        TierBBase.setUpClass()
+        cls.exe = DESKTOP_PS
+
+
+class ChildStreamTransportStaticGuards(TierCBase):
+    """The structural half of DL-XB-141-STDOUT-TRANSPORT-001."""
+
+    def setUp(self):
+        self.launcher = LAUNCHER.read_text(encoding="utf-8")
+        self.capture = committed_transport_capture()
+        self.relay = committed_transport_relay()
+
+    def test_both_child_streams_are_explicitly_redirected(self):
+        """The defect was the absence of exactly these two assignments."""
+        for statement in ("$startInfo.RedirectStandardOutput = $true",
+                          "$startInfo.RedirectStandardError = $true"):
+            with self.subTest(statement=statement):
+                self.assertIn(statement, self.capture)
+
+    def test_both_readers_start_before_either_is_awaited(self):
+        """Awaiting the first read before starting the second is the deadlock shape."""
+        out_start = self.capture.index(
+            "$stdOutReader = $child.StandardOutput.ReadToEndAsync()")
+        err_start = self.capture.index(
+            "$stdErrReader = $child.StandardError.ReadToEndAsync()")
+        first_await = self.capture.index("$stdOutReader.GetAwaiter().GetResult()")
+        second_await = self.capture.index("$stdErrReader.GetAwaiter().GetResult()")
+        self.assertLess(out_start, err_start)
+        self.assertLess(
+            err_start,
+            first_await,
+            "both asynchronous reads must be in flight before either result is taken",
+        )
+        self.assertLess(first_await, second_await)
+        self.assertLess(
+            second_await,
+            self.capture.index("$child.WaitForExit()"),
+            "the wait happens once both streams have reached end of file",
+        )
+        for serial in ("$child.StandardOutput.ReadToEnd()",
+                       "$child.StandardError.ReadToEnd()"):
+            with self.subTest(serial=serial):
+                self.assertNotIn(
+                    serial, self.launcher,
+                    "a synchronous full read of one stream can deadlock the other",
+                )
+
+    def test_the_relay_writes_each_stream_to_its_own_console_writer(self):
+        """Stdout to stdout, stderr to stderr, through writers that cannot reflow a line."""
+        self.assertIn("[Console]::Out.Write($childStdOut)", self.relay)
+        self.assertIn("[Console]::Error.Write($childStdErr)", self.relay)
+        for pipeline_emitter in ("Write-Host", "Write-Output $childStdOut",
+                                 "Write-Error $childStdErr"):
+            with self.subTest(emitter=pipeline_emitter):
+                self.assertNotIn(pipeline_emitter, self.launcher)
+
+    def test_the_relay_precedes_every_launcher_terminal_path_after_the_child(self):
+        """Application output is never discarded by a launcher-owned failure after it."""
+        relay_at = self.launcher.index("[Console]::Out.Write($childStdOut)")
+        for later in ("if ($null -ne $restoreResult) {",
+                      "if (-not $bindOk) {",
+                      "exit $childExitCode"):
+            with self.subTest(later=later):
+                self.assertGreater(self.launcher.index(later, relay_at), relay_at)
+
+    def test_the_exit_code_is_the_real_child_exit_code(self):
+        """No manufactured success, no swallowed non-zero exit, no remapping."""
+        self.assertIn("ExitCode = $child.ExitCode", self.capture)
+        self.assertIn("$childExitCode = [int]$outcome.BodyResult.ExitCode", self.launcher)
+        self.assertTrue(
+            self.launcher.rstrip().endswith("exit $childExitCode"),
+            "the launcher's last statement stays the child's own exit code",
+        )
+
+    def test_the_transport_introduces_no_application_output_coupling(self):
+        """The launcher stays agnostic: no parsing, no filtering, no per-command branch."""
+        region = self.capture + self.relay
+        for forbidden in ("ConvertFrom-Json", "ConvertTo-Json", "Select-String",
+                          "-match", "-like", "-replace", "Out-String", "$Command",
+                          "login-diagnostic", "schema"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(
+                    forbidden, region,
+                    "the transport must carry application output, never interpret it",
+                )
+
+    def test_the_transport_adds_no_file_log_or_persistent_state(self):
+        """Capture and relay are in-memory only."""
+        for forbidden in ("New-Item", "WriteAllText", "WriteAllBytes", "Out-File",
+                          "Start-Transcript", "GetTempPath", "SetEnvironmentVariable"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, self.capture + self.relay)
+
+    def test_the_committed_markers_are_present_exactly_once(self):
+        """The dynamic tests execute the committed region; the markers are its contract."""
+        for marker in (TRANSPORT_CAPTURE_BEGIN, TRANSPORT_CAPTURE_END):
+            with self.subTest(marker=marker):
+                self.assertEqual(1, self.launcher.count(marker))
+
+
 class ValidateOnlyContract(TierABase):
     """Task 17: design section 8.
 

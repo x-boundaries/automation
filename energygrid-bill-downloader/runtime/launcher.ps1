@@ -22,6 +22,12 @@
 # rather than being optional, and -AuthorisedLauncherRootWriteSid is the only route by
 # which the authorised write-trustee set reaches the launcher.
 #
+# The Python child's standard streams are redirected, captured in full, and relayed
+# verbatim to this launcher's own standard output and standard error after the child
+# completes, so a redirected caller receives the application's own output. The launcher
+# stays application-output agnostic: it never parses, filters, reshapes, or interprets a
+# single byte of that output, and it never varies the relay by -Command.
+#
 # Nothing private is committed here. No credential value, account identity, private absolute
 # path, UNC path, host identity, or principal identity appears in this file.
 
@@ -354,6 +360,8 @@ $childArguments = @('-m', 'energygrid_bill_downloader', $Command, '--config', $C
 $childExitCode = $script:EgLauncherExitCodes['PreflightFailed']
 $restoreResult = $null
 $bindOk = $false
+$childStdOut = ''
+$childStdErr = ''
 try {
     $outcome = Invoke-EgWithInjectedProcessEnvironment -Variables $injected -Body {
         # The browser-cache binding is verified POSITIVELY before the child starts. An
@@ -363,31 +371,55 @@ try {
         $boundCache = [System.Environment]::GetEnvironmentVariable(
             $script:EgBrowserCacheVariableName, 'Process')
         if ($boundCache -cne $BrowserCachePath) {
-            [pscustomobject]@{ BindOk = $false; ExitCode = -1 }
+            [pscustomobject]@{ BindOk = $false; ExitCode = -1; StdOut = ''; StdErr = '' }
         }
         else {
+            # EG-TRANSPORT-CAPTURE-BEGIN
             $startInfo = New-Object System.Diagnostics.ProcessStartInfo
             $startInfo.FileName = $PythonExe
             $startInfo.Arguments = ConvertTo-EgNativeArgumentString -Argument $childArguments
             $startInfo.WorkingDirectory = $workingDirectory
             $startInfo.UseShellExecute = $false
             $startInfo.CreateNoWindow = $true
+            # Redirection is what makes the child's output reachable at all. An unredirected
+            # native grandchild writes to the console handle this launcher inherited, which a
+            # redirected caller of the launcher never observes.
+            $startInfo.RedirectStandardOutput = $true
+            $startInfo.RedirectStandardError = $true
 
             $child = $null
             try {
                 $child = New-Object System.Diagnostics.Process
                 $child.StartInfo = $startInfo
                 [void]$child.Start()
+                # BOTH readers are started before either is awaited. Draining one stream to
+                # completion first lets the other stream's pipe buffer fill and block the
+                # child forever, which is the classic redirection deadlock under Windows
+                # PowerShell 5.1 and production .NET. The awaits therefore observe two
+                # already-running reads rather than serialising them, and WaitForExit runs
+                # only once both streams have reached end of file.
+                $stdOutReader = $child.StandardOutput.ReadToEndAsync()
+                $stdErrReader = $child.StandardError.ReadToEndAsync()
+                $capturedStdOut = $stdOutReader.GetAwaiter().GetResult()
+                $capturedStdErr = $stdErrReader.GetAwaiter().GetResult()
                 $child.WaitForExit()
-                [pscustomobject]@{ BindOk = $true; ExitCode = $child.ExitCode }
+                [pscustomobject]@{
+                    BindOk   = $true
+                    ExitCode = $child.ExitCode
+                    StdOut   = [string]$capturedStdOut
+                    StdErr   = [string]$capturedStdErr
+                }
             }
             finally {
                 if ($null -ne $child) { $child.Dispose() }
             }
+            # EG-TRANSPORT-CAPTURE-END
         }
     }
     $bindOk = [bool]$outcome.BodyResult.BindOk
     $childExitCode = [int]$outcome.BodyResult.ExitCode
+    $childStdOut = [string]$outcome.BodyResult.StdOut
+    $childStdErr = [string]$outcome.BodyResult.StdErr
     $restoreResult = $outcome.Restore
 }
 finally {
@@ -397,6 +429,22 @@ finally {
     $plainUsername = ''
     $credential = $null
     $injected = $null
+}
+
+# The application owns its output contract; this launcher only carries it. Relay happens
+# after the child completes and after the injected environment has been restored, for a
+# zero and a non-zero child exit alike, and before any launcher-owned terminal path can
+# run, so application output is never discarded by a later launcher failure. The console
+# writers are used rather than the object pipeline because the pipeline formatter can wrap
+# and reflow a long line; these writers emit the captured text byte-for-byte with nothing
+# added, removed, parsed, or filtered.
+if (-not [string]::IsNullOrEmpty($childStdOut)) {
+    [Console]::Out.Write($childStdOut)
+    [Console]::Out.Flush()
+}
+if (-not [string]::IsNullOrEmpty($childStdErr)) {
+    [Console]::Error.Write($childStdErr)
+    [Console]::Error.Flush()
 }
 
 if ($null -ne $restoreResult) {
