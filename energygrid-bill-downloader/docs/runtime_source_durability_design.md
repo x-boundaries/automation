@@ -352,6 +352,24 @@ observation runs on the existing bounded portal recovery ladder and deadline; it
 not raise the timeout and adds no unbounded polling loop. Post-submit observation is at
 most 60 seconds.
 
+**Observation settling.** Only two outcomes end the window early. A positive
+`BILLING_MANAGER_VISIBLE` and a decisive `VISIBLE_ALERT` are terminal on sight, because
+neither can be improved on by looking again. `LOGIN_ROUTE_PERSISTED_OR_RETURNED`,
+`SEMANTICS_HOST_PRESENT_WITHOUT_APP_CONTROLS` and
+`FLUTTER_RENDER_SHELL_PRESENT_SEMANTICS_HOST_ABSENT` are provisional while the window
+runs. They are what a post-submit Flutter route legitimately presents on its way
+somewhere else, so an early one is preserved as the current observation rather than
+concluded, and the window keeps looking with freshly resolved locators until the
+deadline; a later Billing Manager or visible alert supersedes it. Once the window is
+spent without either, the persistent classifications are determined from the **final**
+bounded observation, under the same classifier and the same priority order below: a
+persistent login route finally reports (3), a persistent semantics host (4), and a
+persistent render shell (5). This governs when a classification is concluded, not what
+any classification means. The vocabulary, the priority order, the positive evidence each
+arm requires, the checkpoint ladder, the 60-second ceiling, the single submit and the
+no-retry rule are all unchanged, and an unreadable or ambiguous final observation still
+fails closed with no classification at all.
+
 **Classification.** The first satisfied classification wins, in this order:
 
 1. `BILLING_MANAGER_VISIBLE`
@@ -379,7 +397,10 @@ evidence, never the absence of a contradiction:
   allowlisted shell or render witness positively present immediately before the submit,
   and every allowlisted shell or render witness zero throughout the whole post-submit
   observation. A shell that was never positively established cannot be inferred to have
-  disappeared.
+  disappeared. This is unchanged, and it is never an early conclusion: it is decided
+  from the throughout-window record once the window is spent, before the final
+  observation is classified. A shell or a known control seen at any checkpoint breaks
+  that record, so it cannot collide with (3), (4) or (5).
 
 A witness that could not be read is null, and null satisfies neither a positive test nor
 an absence test, so an unreadable surface fails closed rather than classifying.
