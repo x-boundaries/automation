@@ -110,6 +110,27 @@ LOGIN_DIAGNOSTIC_CLASSIFICATIONS = (
     FLUTTER_SHELL_DISAPPEARED_AFTER_SUBMIT,
 )
 
+# How a classification settles the bounded post-submit window
+# (DL-XB-141-ASTRA-SIMPLIFY-001). This splits the vocabulary above by settling
+# behaviour only: nothing is added, removed or reordered.
+#
+# Only a positive Billing Manager and a decisive visible alert are terminal on
+# sight, because neither can be improved on by looking again. The route and
+# shell classifications name what one checkpoint saw while a Flutter route was
+# still settling, so concluding them on sight ended the observation before a
+# later Billing Manager could appear. They stay provisional for the whole
+# window and are concluded only from the final observation.
+#
+# `FLUTTER_SHELL_DISAPPEARED_AFTER_SUBMIT` belongs to neither group: the
+# classifier never produces it, and it is concluded only from the
+# throughout-window absence test.
+DIAGNOSTIC_IMMEDIATE_CLASSIFICATIONS = (BILLING_MANAGER_VISIBLE, VISIBLE_ALERT)
+DIAGNOSTIC_CONTINUABLE_CLASSIFICATIONS = (
+    LOGIN_ROUTE_PERSISTED_OR_RETURNED,
+    SEMANTICS_HOST_PRESENT_WITHOUT_APP_CONTROLS,
+    FLUTTER_RENDER_SHELL_PRESENT_SEMANTICS_HOST_ABSENT,
+)
+
 # The one-shot submit boundary, reported rather than inferred.
 SUBMIT_DISPATCHED = "DISPATCHED"
 SUBMIT_DISPATCH_UNCERTAIN = "DISPATCH_UNCERTAIN"
@@ -730,8 +751,14 @@ class PlaywrightPortal:
 
         The same monotonic deadline every other portal recovery uses bounds this
         one: no new polling loop, no larger timeout, and fresh locators at every
-        checkpoint. A settled classification ends the window early; a window
-        that never settles fails closed.
+        checkpoint. Only a positive Billing Manager or a decisive visible alert
+        ends the window early; a login route or a bare Flutter shell is a
+        provisional reading of a route that may still be settling, so the window
+        keeps looking and a later Billing Manager supersedes it. Once the window
+        is spent the outcome is the throughout-window disappearance verdict when
+        that contract is met, and otherwise the classification of the final
+        observation, which still fails closed on unreadable or ambiguous
+        evidence.
         """
 
         state: dict[str, Any] = {
@@ -748,9 +775,13 @@ class PlaywrightPortal:
             if not self._app_controls_absent(observation):
                 state["controls_absent_throughout"] = False
             classification = self._classify_post_submit(observation)
-            if classification is None:
-                return _PORTAL_ABSENT, None
-            return _PORTAL_READY, classification
+            if classification in DIAGNOSTIC_IMMEDIATE_CLASSIFICATIONS:
+                return _PORTAL_READY, classification
+            # Every other reading is provisional, so it is kept as the current
+            # observation and the window looks again with fresh locators rather
+            # than settling here. Nothing about the surface is asserted by
+            # continuing, and the shared deadline is not extended.
+            return _PORTAL_ABSENT, None
 
         try:
             classification = self._recover(
@@ -764,13 +795,20 @@ class PlaywrightPortal:
             # Disappearance is only ever concluded from a shell that was
             # positively there beforehand and never came back while the whole
             # window ran. A shell that was never established cannot disappear.
-            classification = None
             if (
                 self._any_shell_witness(pre_submit)
                 and state["shell_absent_throughout"]
                 and state["controls_absent_throughout"]
             ):
                 classification = FLUTTER_SHELL_DISAPPEARED_AFTER_SUBMIT
+            else:
+                # No Billing Manager and no decisive alert arrived inside the
+                # window, so the outcome is whatever the final bounded
+                # observation still supports under the unchanged classifier and
+                # its unchanged priority. A persistent login route or shell
+                # state is concluded here rather than on first sight, and an
+                # unreadable or ambiguous final reading classifies as nothing.
+                classification = self._classify_post_submit(state["observation"])
         return state["observation"], classification
 
     def _classify_post_submit(self, observation: dict[str, Any]) -> str | None:

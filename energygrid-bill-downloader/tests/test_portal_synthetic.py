@@ -2800,6 +2800,18 @@ def witnesses(
 SHELL_ONLY = witnesses(hosts={"flt-glass-pane": 1})
 SEMANTICS_ONLY = witnesses(hosts={"flt-semantics-host": 1, "flt-glass-pane": 1})
 NOTHING_AT_ALL = witnesses()
+# The login route a post-submit Flutter route settles away from, and the two
+# outcomes it may reach.
+LOGIN_ROUTE_ONLY = witnesses(hosts={"flt-semantics-host": 1}, password=(1, True))
+BILLING_MANAGER_READY = witnesses(
+    hosts={"flt-semantics-host": 1}, billing_manager=(1, True)
+)
+ALERT_SURFACE = witnesses(
+    hosts={"flt-semantics-host": 1},
+    username=(1, True),
+    login=(1, True, True),
+    alert=True,
+)
 
 
 class WitnessLocator:
@@ -2969,7 +2981,16 @@ class LoginDiagnosticSequenceTests(unittest.TestCase):
         self.assertEqual(result.submit_outcome, portal_module.SUBMIT_DISPATCHED)
         # The committed successful sequence, minus only the post-login settle
         # the diagnostic deliberately never performs.
-        self.assertEqual(journal, SUCCESSFUL_LOGIN_SEQUENCE[:-1])
+        dispatched = len(SUCCESSFUL_LOGIN_SEQUENCE) - 1
+        self.assertEqual(journal[:dispatched], SUCCESSFUL_LOGIN_SEQUENCE[:-1])
+        # Everything the bounded observation adds is a bare event-loop yield.
+        # The provisional surface it is given keeps the window looking, and
+        # looking dispatches nothing at all.
+        self.assertEqual(
+            [step for step in journal[dispatched:] if step != "page:wait_for_timeout"],
+            [],
+            "the observation only yields the event loop; it dispatches nothing",
+        )
 
     def test_the_semantics_gate_and_login_entry_are_each_dispatched_once(self) -> None:
         activation = FakeLocator(label="activation")
@@ -3239,21 +3260,25 @@ class LoginDiagnosticClassificationTests(unittest.TestCase):
         self.assertEqual(classification, portal_module.BILLING_MANAGER_VISIBLE)
 
     def test_visible_alert_outranks_route_and_shell_inference(self) -> None:
-        state = witnesses(
-            hosts={"flt-semantics-host": 1},
-            username=(1, True),
-            login=(1, True, True),
-            alert=True,
+        self.assertEqual(self.classify(ALERT_SURFACE), portal_module.VISIBLE_ALERT)
+        page, _observed, classification = self.settle([ALERT_SURFACE])
+        self.assertEqual(classification, portal_module.VISIBLE_ALERT)
+        self.assertEqual(
+            page.waited_ms, [], "a decisive alert is terminal on sight, not waited out"
         )
-        self.assertEqual(self.classify(state), portal_module.VISIBLE_ALERT)
 
     def test_login_route_persisted_or_returned(self) -> None:
-        state = witnesses(hosts={"flt-semantics-host": 1}, password=(1, True))
         self.assertEqual(
-            self.classify(state), portal_module.LOGIN_ROUTE_PERSISTED_OR_RETURNED
+            self.classify(LOGIN_ROUTE_ONLY),
+            portal_module.LOGIN_ROUTE_PERSISTED_OR_RETURNED,
         )
-        _page, _observed, classification = self.settle([state])
+        page, _observed, classification = self.settle([LOGIN_ROUTE_ONLY])
         self.assertEqual(classification, portal_module.LOGIN_ROUTE_PERSISTED_OR_RETURNED)
+        self.assertEqual(
+            page.observations,
+            len(portal_module.PORTAL_RECOVERY_ATTEMPTS_MS),
+            "a persistent login route is concluded from the final look, not the first",
+        )
 
     def test_semantics_host_present_without_app_controls(self) -> None:
         state = witnesses(hosts={"flt-semantics": 1, "flt-glass-pane": 1})
@@ -3261,12 +3286,31 @@ class LoginDiagnosticClassificationTests(unittest.TestCase):
             self.classify(state),
             portal_module.SEMANTICS_HOST_PRESENT_WITHOUT_APP_CONTROLS,
         )
+        page, _observed, classification = self.settle([state])
+        self.assertEqual(
+            classification, portal_module.SEMANTICS_HOST_PRESENT_WITHOUT_APP_CONTROLS
+        )
+        self.assertEqual(
+            page.observations,
+            len(portal_module.PORTAL_RECOVERY_ATTEMPTS_MS),
+            "a persistent semantics host is concluded from the final look",
+        )
 
     def test_flutter_render_shell_present_semantics_host_absent(self) -> None:
         state = witnesses(hosts={"flt-glass-pane": 1, "canvas": 2})
         self.assertEqual(
             self.classify(state),
             portal_module.FLUTTER_RENDER_SHELL_PRESENT_SEMANTICS_HOST_ABSENT,
+        )
+        page, _observed, classification = self.settle([state])
+        self.assertEqual(
+            classification,
+            portal_module.FLUTTER_RENDER_SHELL_PRESENT_SEMANTICS_HOST_ABSENT,
+        )
+        self.assertEqual(
+            page.observations,
+            len(portal_module.PORTAL_RECOVERY_ATTEMPTS_MS),
+            "a persistent render shell is concluded from the final look",
         )
 
     def test_flutter_shell_disappeared_after_submit(self) -> None:
@@ -3294,6 +3338,92 @@ class LoginDiagnosticClassificationTests(unittest.TestCase):
                 "FLUTTER_RENDER_SHELL_PRESENT_SEMANTICS_HOST_ABSENT",
                 "FLUTTER_SHELL_DISAPPEARED_AFTER_SUBMIT",
             ),
+        )
+
+    # ---- settling: only two outcomes are terminal on sight ---- #
+    #
+    # DL-XB-141-ASTRA-SIMPLIFY-001. A post-submit Flutter route settles through
+    # the login route it came from and through a bare shell, so concluding
+    # either on sight ended the observation before Billing Manager appeared.
+
+    def test_the_settling_split_covers_the_accepted_six_in_order(self) -> None:
+        """The split is over the existing vocabulary; it adds and reorders nothing."""
+        self.assertEqual(
+            portal_module.DIAGNOSTIC_IMMEDIATE_CLASSIFICATIONS,
+            ("BILLING_MANAGER_VISIBLE", "VISIBLE_ALERT"),
+        )
+        self.assertEqual(
+            portal_module.DIAGNOSTIC_CONTINUABLE_CLASSIFICATIONS,
+            (
+                "LOGIN_ROUTE_PERSISTED_OR_RETURNED",
+                "SEMANTICS_HOST_PRESENT_WITHOUT_APP_CONTROLS",
+                "FLUTTER_RENDER_SHELL_PRESENT_SEMANTICS_HOST_ABSENT",
+            ),
+        )
+        self.assertEqual(
+            portal_module.DIAGNOSTIC_IMMEDIATE_CLASSIFICATIONS
+            + portal_module.DIAGNOSTIC_CONTINUABLE_CLASSIFICATIONS
+            + (portal_module.FLUTTER_SHELL_DISAPPEARED_AFTER_SUBMIT,),
+            portal_module.LOGIN_DIAGNOSTIC_CLASSIFICATIONS,
+        )
+
+    def test_a_transient_login_route_does_not_end_the_window(self) -> None:
+        """The reported defect: the login route is seen first, Billing Manager later."""
+        page, observed, classification = self.settle(
+            [LOGIN_ROUTE_ONLY, LOGIN_ROUTE_ONLY, BILLING_MANAGER_READY]
+        )
+        self.assertEqual(classification, portal_module.BILLING_MANAGER_VISIBLE)
+        self.assertEqual(page.observations, 3, "Billing Manager is still terminal")
+        self.assertEqual(
+            observed,
+            BILLING_MANAGER_READY | {"url_changed": False},
+            "the reported observation is the one that settled, not an earlier look",
+        )
+
+    def test_a_transient_semantics_host_does_not_end_the_window(self) -> None:
+        page, _observed, classification = self.settle(
+            [SEMANTICS_ONLY, SEMANTICS_ONLY, BILLING_MANAGER_READY]
+        )
+        self.assertEqual(classification, portal_module.BILLING_MANAGER_VISIBLE)
+        self.assertEqual(page.observations, 3)
+
+    def test_a_transient_render_shell_does_not_end_the_window(self) -> None:
+        page, _observed, classification = self.settle(
+            [SHELL_ONLY, SHELL_ONLY, BILLING_MANAGER_READY]
+        )
+        self.assertEqual(classification, portal_module.BILLING_MANAGER_VISIBLE)
+        self.assertEqual(page.observations, 3)
+
+    def test_a_transient_route_never_outranks_a_later_alert(self) -> None:
+        page, _observed, classification = self.settle([SHELL_ONLY, ALERT_SURFACE])
+        self.assertEqual(classification, portal_module.VISIBLE_ALERT)
+        self.assertEqual(page.observations, 2)
+
+    def test_a_billing_manager_on_the_last_look_still_wins(self) -> None:
+        """A login route for all but the final checkpoint is still superseded."""
+        looks = len(portal_module.PORTAL_RECOVERY_ATTEMPTS_MS)
+        page, _observed, classification = self.settle(
+            [LOGIN_ROUTE_ONLY] * (looks - 1) + [BILLING_MANAGER_READY]
+        )
+        self.assertEqual(classification, portal_module.BILLING_MANAGER_VISIBLE)
+        self.assertEqual(page.observations, looks)
+        self.assertLessEqual(
+            page.simulated_monotonic(),
+            portal_module.PORTAL_RECOVERY_DEADLINE_SECONDS,
+            "waiting a transient route out never raises the shared ceiling",
+        )
+
+    def test_a_provisional_reading_is_never_kept_for_an_unreadable_final_look(
+        self,
+    ) -> None:
+        """A route seen earlier is evidence about then, not about the final surface."""
+        unreadable = witnesses(hosts={"flt-semantics-host": None, "flt-glass-pane": 1})
+        page, _observed, classification = self.settle([LOGIN_ROUTE_ONLY, unreadable])
+        self.assertIsNone(
+            classification, "an unreadable final look classifies as nothing at all"
+        )
+        self.assertEqual(
+            page.observations, len(portal_module.PORTAL_RECOVERY_ATTEMPTS_MS)
         )
 
     # ---- Web's visibility and absence clarification ---- #
@@ -3358,7 +3488,11 @@ class LoginDiagnosticClassificationTests(unittest.TestCase):
             classification,
             portal_module.FLUTTER_RENDER_SHELL_PRESENT_SEMANTICS_HOST_ABSENT,
         )
-        self.assertEqual(page.observations, 3, "the window ended as soon as it settled")
+        self.assertEqual(
+            page.observations,
+            len(portal_module.PORTAL_RECOVERY_ATTEMPTS_MS),
+            "a returning shell is provisional, so the whole window still ran",
+        )
 
     def test_a_control_seen_earlier_blocks_a_later_disappearance_verdict(self) -> None:
         page, _observed, classification = self.settle(
