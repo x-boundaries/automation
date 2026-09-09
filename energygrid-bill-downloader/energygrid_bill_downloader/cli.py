@@ -14,6 +14,8 @@ from .config import load_config_file, load_runtime_config
 from .errors import ACTION_REQUIRED, AppError, ConfigError, DependencyError, exit_code_for
 from .publication import cleanup_stale_owned_temp
 from .portal import (
+    AUTHENTICATION_OUTCOMES,
+    AUTHENTICATION_UNPROVED,
     LOGIN_DIAGNOSTIC_CLASSIFICATIONS,
     SUBMIT_NOT_DISPATCHED,
     PlaywrightPortal,
@@ -41,8 +43,22 @@ UNCLASSIFIED_SUPPORT_REF = "APP_ERROR_UNCLASSIFIED"
 # execution is an implicit, non-overridable property of that one operation and
 # never a generic switch.
 LOGIN_DIAGNOSTIC_COMMAND = "login-diagnostic"
-LOGIN_DIAGNOSTIC_SCHEMA = "energygrid.login_diagnostic.v1"
+
+# DL-XB-141-AUTH-LANDING-NAV-SEPARATION-G2-001. The active schema is v2: the
+# document now carries the authentication verdict and the invariant
+# never-tested navigation status alongside the existing bounded observations.
+LOGIN_DIAGNOSTIC_SCHEMA = "energygrid.login_diagnostic.v2"
+
+# The superseded identifier, kept so a document emitted by an earlier build
+# stays readable as what it was. No build emits it: it is documentation and
+# historical evidence only, never the active schema.
+HISTORICAL_LOGIN_DIAGNOSTIC_SCHEMAS = ("energygrid.login_diagnostic.v1",)
+
 DIAGNOSTIC_COMPLETE = "DIAGNOSTIC_COMPLETE"
+
+# The diagnostic observes authentication and stops. It never tests business
+# navigation, so this is an invariant of the document rather than a result.
+NAVIGATION_NOT_TESTED = "NOT_TESTED"
 
 # The bounded reference for a diagnostic that ran to its deadline without
 # establishing an authorised classification. It is a fail-closed outcome, not a
@@ -79,7 +95,29 @@ SUPPORT_REFS_BY_MESSAGE = {
     "required login control is missing or ambiguous": "EG_LOGIN_REQUIRED_CONTROL_UNRESOLVED",
     "runtime credentials are unavailable": "EG_LOGIN_CREDENTIALS_UNAVAILABLE",
     "portal rejected the login": "EG_LOGIN_PORTAL_REJECTED",
+    "authenticated landing was not proven after login": "EG_LOGIN_AUTHENTICATION_UNPROVED",
+    # Business navigation, not authentication. Billing Manager becoming
+    # unusable after a proven authenticated landing is a navigation failure and
+    # carries a navigation reference, so an operator can tell the two apart.
+    "Billing Manager navigation control is not ready": "EG_NAV_BILLING_MANAGER_NOT_READY",
+    "Billing Manager navigation dispatch outcome uncertain": "EG_NAV_BILLING_MANAGER_DISPATCH_UNCERTAIN",
+    "EB Bill navigation control is not ready": "EG_NAV_EB_BILL_NOT_READY",
+    "EB Bill navigation dispatch outcome uncertain": "EG_NAV_EB_BILL_DISPATCH_UNCERTAIN",
+    "EB Bill results route was not proven": "EG_NAV_RESULTS_ROUTE_UNPROVED",
 }
+
+# The business-navigation half of the vocabulary, declared rather than inferred
+# from a prefix. It is reachable only from `_open_verified_results()`, so the
+# pre-auth login reachability contract is stated over the login half alone.
+NAVIGATION_SUPPORT_REFS = frozenset(
+    {
+        "EG_NAV_BILLING_MANAGER_NOT_READY",
+        "EG_NAV_BILLING_MANAGER_DISPATCH_UNCERTAIN",
+        "EG_NAV_EB_BILL_NOT_READY",
+        "EG_NAV_EB_BILL_DISPATCH_UNCERTAIN",
+        "EG_NAV_RESULTS_ROUTE_UNPROVED",
+    }
+)
 
 # Kept so evidence written by an earlier build stays readable, not because any
 # step can still raise it: every operation that once shared this one coarse
@@ -87,7 +125,18 @@ SUPPORT_REFS_BY_MESSAGE = {
 # the reachability tests can require the live vocabulary to be fully reachable
 # and a retired one to be unreachable.
 RETIRED_SUPPORT_REFS = frozenset(
-    {"EG_LOGIN_REQUIRED_CONTROL_UNRESOLVED", "EG_LOGIN_SUBMIT_FAILED"}
+    {
+        "EG_LOGIN_REQUIRED_CONTROL_UNRESOLVED",
+        "EG_LOGIN_SUBMIT_FAILED",
+        # DL-XB-141-AUTH-LANDING-NAV-SEPARATION-G2-001. Billing Manager is no
+        # longer an authentication oracle, so no login step waits on it and
+        # nothing can raise this again. The mapping stays so evidence written
+        # by an earlier build still reads; a login that cannot prove the
+        # authenticated landing now records
+        # `EG_LOGIN_AUTHENTICATION_UNPROVED`, and a Billing Manager that never
+        # becomes usable records a navigation reference instead.
+        "EG_LOGIN_BILLING_MANAGER_WAIT_FAILED",
+    }
 )
 
 
@@ -195,6 +244,7 @@ def login_diagnostic_document(
     submit_outcome: str,
     pre_submit: dict[str, Any],
     post_submit: dict[str, Any],
+    authentication_outcome: str = AUTHENTICATION_UNPROVED,
     support_ref: str | None = None,
 ) -> dict[str, Any]:
     """Build the one closed, public-safe diagnostic document.
@@ -203,12 +253,22 @@ def login_diagnostic_document(
     text, URL, filesystem path, account identity, host identity, security
     identifier, credential, credential derivative, page text, or business datum
     can reach it, because none of them is ever a field.
+
+    `authentication_outcome` is closed over the three authorised values, and an
+    unauthorised one is reported as unproved rather than emitted, so the
+    vocabulary stays closed even against a future portal value this document
+    does not authorise. `navigation_status` is an invariant: the diagnostic
+    never tests business navigation, so it can only ever be `NOT_TESTED`.
     """
 
+    if authentication_outcome not in AUTHENTICATION_OUTCOMES:
+        authentication_outcome = AUTHENTICATION_UNPROVED
     document: dict[str, Any] = {
         "schema": LOGIN_DIAGNOSTIC_SCHEMA,
         "status": status,
         "classification": classification,
+        "authentication_outcome": authentication_outcome,
+        "navigation_status": NAVIGATION_NOT_TESTED,
         "submit_dispatched": submit_dispatched,
         "submit_outcome": submit_outcome,
         "pre_submit": pre_submit,
@@ -287,6 +347,7 @@ def run_login_diagnostic(config_path: Path) -> int:
                 submit_outcome=result.submit_outcome,
                 pre_submit=result.pre_submit,
                 post_submit=result.post_submit,
+                authentication_outcome=result.authentication_outcome,
                 support_ref=support_ref_for(result.failure),
             )
         )
@@ -307,6 +368,7 @@ def run_login_diagnostic(config_path: Path) -> int:
                 submit_outcome=result.submit_outcome,
                 pre_submit=result.pre_submit,
                 post_submit=result.post_submit,
+                authentication_outcome=result.authentication_outcome,
                 support_ref=DIAGNOSTIC_UNCLASSIFIED_SUPPORT_REF,
             )
         )
@@ -320,6 +382,7 @@ def run_login_diagnostic(config_path: Path) -> int:
             submit_outcome=result.submit_outcome,
             pre_submit=result.pre_submit,
             post_submit=result.post_submit,
+            authentication_outcome=result.authentication_outcome,
         )
     )
     return 0

@@ -64,9 +64,15 @@ for at most a further 60 seconds, and stops. It reaches no Billing Manager click
 EB Bill, account selection, Search, inventory, pagination, download, publication,
 archive, or state behaviour, and it creates no state, log, temp, or archive
 artefact. Its result is one JSON document with schema
-`energygrid.login_diagnostic.v1`, carrying `status`, `classification`,
-`submit_dispatched`, `submit_outcome`, the pre- and post-submit observations, and
-a bounded `support_ref` when the result is not complete. It exits `0` only when an
+`energygrid.login_diagnostic.v2`, carrying `status`, `classification`,
+`authentication_outcome`, `navigation_status`, `submit_dispatched`,
+`submit_outcome`, the pre- and post-submit observations, and
+a bounded `support_ref` when the result is not complete.
+`authentication_outcome` is exactly `AUTHENTICATED`, `REJECTED`, or
+`AUTHENTICATION_UNPROVED`, and `navigation_status` is always `NOT_TESTED`
+because the diagnostic never tests business navigation. The superseded
+`energygrid.login_diagnostic.v1` identifier is historical only: it reads
+evidence written by an earlier build and is never emitted now. It exits `0` only when an
 authorised classification is positively established, `20` on any fail-closed or
 insufficient-evidence result, and `64` on a configuration, dependency, or argument
 contract failure; it never exits `10`.
@@ -98,11 +104,29 @@ never written to the log, the console, or any filename, so quote the
 Each step of the login sequence carries its own code, so a failed login is
 attributable to portal navigation, the semantics activation dispatch, the Login
 entry click, the username entry, the password entry, the login submission, or
-the Billing Manager wait. A visible portal alert still takes precedence over all
-of them and records `EG_LOGIN_PORTAL_REJECTED`. Evidence written before those
-steps were told apart records the retired `EG_LOGIN_REQUIRED_CONTROL_UNRESOLVED`
-instead: no current build emits it, and it narrows a failure only to that login
-sequence as a whole.
+the authenticated landing. A visible portal rejection still takes precedence
+over all of them and records `EG_LOGIN_PORTAL_REJECTED`. Evidence written before
+those steps were told apart records the retired
+`EG_LOGIN_REQUIRED_CONTROL_UNRESOLVED` instead: no current build emits it, and it
+narrows a failure only to that login sequence as a whole.
+
+Authentication and business navigation are separate contracts, and their codes
+say which one failed. A successful login means only that the authenticated
+landing was positively proven, from the exact `EMS` witness together with an
+exact zero count for every retained login control, accessibility gate and
+rejection. Billing Manager is not part of that proof. A login that cannot prove
+the landing records `EG_LOGIN_AUTHENTICATION_UNPROVED`; a Billing Manager or EB
+Bill that never becomes usable afterwards is a navigation failure and records
+`EG_NAV_BILLING_MANAGER_NOT_READY`,
+`EG_NAV_BILLING_MANAGER_DISPATCH_UNCERTAIN`, `EG_NAV_EB_BILL_NOT_READY`,
+`EG_NAV_EB_BILL_DISPATCH_UNCERTAIN`, or `EG_NAV_RESULTS_ROUTE_UNPROVED`
+according to whether the control was never ready, was clicked with an outcome
+that could not be established, or was clicked without the EB Bill route ever
+becoming proven. A dispatch whose outcome is uncertain is terminal and is never
+retried. Evidence written while Billing Manager was still treated as the login
+postcondition records the retired `EG_LOGIN_BILLING_MANAGER_WAIT_FAILED`: no
+current build emits it, and it means only that the pre-separation build never
+saw Billing Manager after the submit.
 
 ## Controlled first validation
 

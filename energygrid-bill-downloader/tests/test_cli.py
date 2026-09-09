@@ -626,6 +626,9 @@ class SupportReferenceContractTests(unittest.TestCase):
         self.assertTrue(cli.RETIRED_SUPPORT_REFS.issubset(committed))
         self.assertIn("EG_LOGIN_REQUIRED_CONTROL_UNRESOLVED", cli.RETIRED_SUPPORT_REFS)
         self.assertIn("EG_LOGIN_SUBMIT_FAILED", cli.RETIRED_SUPPORT_REFS)
+        # DL-XB-141-AUTH-LANDING-NAV-SEPARATION-G2-001. Billing Manager is no
+        # longer an authentication oracle, so no login step waits on it.
+        self.assertIn("EG_LOGIN_BILLING_MANAGER_WAIT_FAILED", cli.RETIRED_SUPPORT_REFS)
         for ref in cli.RETIRED_SUPPORT_REFS:
             with self.subTest(ref=ref):
                 self.assertRegex(ref, self.IDENTIFIER)
@@ -641,10 +644,50 @@ class SupportReferenceContractTests(unittest.TestCase):
             "EG_LOGIN_SUBMIT_NOT_READY",
             "EG_LOGIN_SUBMIT_UNRESOLVED",
             "EG_LOGIN_SUBMIT_DISPATCH_UNCERTAIN",
-            "EG_LOGIN_BILLING_MANAGER_WAIT_FAILED",
+            # What replaced the retired Billing Manager login wait: the login
+            # half now names the authentication contract, and the navigation
+            # half names the business route separately.
+            "EG_LOGIN_AUTHENTICATION_UNPROVED",
+            "EG_NAV_BILLING_MANAGER_NOT_READY",
         }
         self.assertTrue(replacements.issubset(committed))
         self.assertTrue(replacements.isdisjoint(cli.RETIRED_SUPPORT_REFS))
+
+    def test_the_retired_billing_manager_wait_stays_readable_but_unreachable(self) -> None:
+        """Old evidence still reads; no current build can record it again."""
+        error = LayoutChangedError("Billing Manager entry did not appear after login")
+        self.assertEqual(
+            cli.support_ref_for(error), "EG_LOGIN_BILLING_MANAGER_WAIT_FAILED"
+        )
+        self.assertIn("EG_LOGIN_BILLING_MANAGER_WAIT_FAILED", cli.RETIRED_SUPPORT_REFS)
+        self.assertNotIn(
+            "EG_LOGIN_BILLING_MANAGER_WAIT_FAILED", cli.NAVIGATION_SUPPORT_REFS
+        )
+
+    def test_the_navigation_half_is_declared_mapped_and_separate(self) -> None:
+        """Business navigation has its own references, disjoint from login."""
+        committed = set(cli.SUPPORT_REFS_BY_MESSAGE.values())
+        self.assertTrue(cli.NAVIGATION_SUPPORT_REFS.issubset(committed))
+        self.assertTrue(
+            cli.NAVIGATION_SUPPORT_REFS.isdisjoint(cli.RETIRED_SUPPORT_REFS)
+        )
+        self.assertEqual(
+            cli.NAVIGATION_SUPPORT_REFS,
+            {
+                "EG_NAV_BILLING_MANAGER_NOT_READY",
+                "EG_NAV_BILLING_MANAGER_DISPATCH_UNCERTAIN",
+                "EG_NAV_EB_BILL_NOT_READY",
+                "EG_NAV_EB_BILL_DISPATCH_UNCERTAIN",
+                "EG_NAV_RESULTS_ROUTE_UNPROVED",
+            },
+        )
+        for ref in cli.NAVIGATION_SUPPORT_REFS:
+            with self.subTest(ref=ref):
+                self.assertRegex(ref, self.IDENTIFIER)
+                self.assertTrue(
+                    ref.startswith("EG_NAV_"),
+                    "a navigation failure never borrows the login vocabulary",
+                )
 
     def test_historical_submit_message_remains_mapped_but_retired(self) -> None:
         error = LayoutChangedError("login submission did not complete")
@@ -684,7 +727,7 @@ def diagnostic_witnesses(**overrides):
     )
     observation["hosts"] = {tag: 0 for tag in portal_module.DIAGNOSTIC_HOST_TAGS}
     observation["semantics_placeholder"] = {"count": 0, "present": False}
-    for name in ("billing_manager", "username", "password"):
+    for name in ("billing_manager", "username", "password", "ems", "rejection"):
         observation[name] = {"count": 0, "visible": False}
     for name in ("login", "enable_accessibility"):
         observation[name] = {"count": 0, "visible": False, "actionable": False}
@@ -732,7 +775,10 @@ def diagnostic_portal(
     return StubDiagnosticPortal
 
 
-def complete_result(classification="SEMANTICS_HOST_PRESENT_WITHOUT_APP_CONTROLS"):
+def complete_result(
+    classification="SEMANTICS_HOST_PRESENT_WITHOUT_APP_CONTROLS",
+    authentication_outcome=portal_module.AUTHENTICATION_UNPROVED,
+):
     return portal_module.LoginDiagnosticResult(
         classification=classification,
         submit_dispatched=True,
@@ -740,6 +786,7 @@ def complete_result(classification="SEMANTICS_HOST_PRESENT_WITHOUT_APP_CONTROLS"
         pre_submit=diagnostic_witnesses(),
         post_submit=diagnostic_witnesses(include_url=True),
         failure=None,
+        authentication_outcome=authentication_outcome,
     )
 
 
@@ -892,11 +939,15 @@ class LoginDiagnosticCliTests(unittest.TestCase):
             )
         document = self.document(out)
         self.assertEqual(exit_code, 0)
-        self.assertEqual(document["schema"], "energygrid.login_diagnostic.v1")
+        self.assertEqual(document["schema"], "energygrid.login_diagnostic.v2")
         self.assertEqual(document["status"], "DIAGNOSTIC_COMPLETE")
         self.assertEqual(
             document["classification"], "SEMANTICS_HOST_PRESENT_WITHOUT_APP_CONTROLS"
         )
+        # A historical shell classification is diagnostically complete and
+        # still says nothing about authentication.
+        self.assertEqual(document["authentication_outcome"], "AUTHENTICATION_UNPROVED")
+        self.assertEqual(document["navigation_status"], "NOT_TESTED")
         self.assertIs(document["submit_dispatched"], True)
         self.assertEqual(document["submit_outcome"], "DISPATCHED")
         self.assertNotIn("support_ref", document, "a complete result carries no reference")
@@ -906,12 +957,109 @@ class LoginDiagnosticCliTests(unittest.TestCase):
                 "schema",
                 "status",
                 "classification",
+                "authentication_outcome",
+                "navigation_status",
                 "submit_dispatched",
                 "submit_outcome",
                 "pre_submit",
                 "post_submit",
             },
         )
+
+    # ---- DL-XB-141-AUTH-LANDING-NAV-SEPARATION-G2-001: the v2 additions ---- #
+
+    def test_the_active_schema_is_v2_and_v1_is_historical_only(self) -> None:
+        """v1 stays readable as documentation; no build emits it."""
+        self.assertEqual(cli.LOGIN_DIAGNOSTIC_SCHEMA, "energygrid.login_diagnostic.v2")
+        self.assertIn(
+            "energygrid.login_diagnostic.v1", cli.HISTORICAL_LOGIN_DIAGNOSTIC_SCHEMAS
+        )
+        self.assertNotIn(
+            cli.LOGIN_DIAGNOSTIC_SCHEMA, cli.HISTORICAL_LOGIN_DIAGNOSTIC_SCHEMAS
+        )
+        with tempfile.TemporaryDirectory() as name:
+            _exit_code, out, _err = self.run_diagnostic(
+                Path(name), diagnostic_portal(complete_result())
+            )
+        for historical in cli.HISTORICAL_LOGIN_DIAGNOSTIC_SCHEMAS:
+            self.assertNotIn(historical, out)
+
+    def test_a_clean_authenticated_landing_is_reported_as_authenticated(self) -> None:
+        result = complete_result(
+            "AUTHENTICATED_LANDING_PROVEN",
+            authentication_outcome=portal_module.AUTHENTICATED,
+        )
+        with tempfile.TemporaryDirectory() as name:
+            exit_code, out, _err = self.run_diagnostic(
+                Path(name), diagnostic_portal(result)
+            )
+        document = self.document(out)
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(document["classification"], "AUTHENTICATED_LANDING_PROVEN")
+        self.assertEqual(document["authentication_outcome"], "AUTHENTICATED")
+        self.assertEqual(document["navigation_status"], "NOT_TESTED")
+
+    def test_a_clean_rejection_is_reported_as_rejected(self) -> None:
+        result = complete_result(
+            "VISIBLE_ALERT", authentication_outcome=portal_module.REJECTED
+        )
+        with tempfile.TemporaryDirectory() as name:
+            exit_code, out, _err = self.run_diagnostic(
+                Path(name), diagnostic_portal(result)
+            )
+        document = self.document(out)
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(document["classification"], "VISIBLE_ALERT")
+        self.assertEqual(document["authentication_outcome"], "REJECTED")
+
+    def test_the_authentication_outcome_vocabulary_is_closed(self) -> None:
+        """Exactly three values, and an unauthorised one is never emitted."""
+        self.assertEqual(
+            portal_module.AUTHENTICATION_OUTCOMES,
+            ("AUTHENTICATED", "REJECTED", "AUTHENTICATION_UNPROVED"),
+        )
+        for outcome in portal_module.AUTHENTICATION_OUTCOMES:
+            with self.subTest(outcome=outcome):
+                document = cli.login_diagnostic_document(
+                    status=cli.DIAGNOSTIC_COMPLETE,
+                    classification="VISIBLE_ALERT",
+                    submit_dispatched=True,
+                    submit_outcome=portal_module.SUBMIT_DISPATCHED,
+                    pre_submit=diagnostic_witnesses(),
+                    post_submit=diagnostic_witnesses(include_url=True),
+                    authentication_outcome=outcome,
+                )
+                self.assertEqual(document["authentication_outcome"], outcome)
+        rogue = complete_result(authentication_outcome="SOME_FUTURE_OUTCOME")
+        with tempfile.TemporaryDirectory() as name:
+            _exit_code, out, _err = self.run_diagnostic(
+                Path(name), diagnostic_portal(rogue)
+            )
+        document = self.document(out)
+        self.assertEqual(document["authentication_outcome"], "AUTHENTICATION_UNPROVED")
+        self.assertNotIn("SOME_FUTURE_OUTCOME", out)
+
+    def test_navigation_is_never_tested_on_any_emitted_document(self) -> None:
+        """The invariant holds on every result shape the command can emit."""
+        cases = (
+            diagnostic_portal(complete_result()),
+            diagnostic_portal(complete_result(None)),
+            diagnostic_portal(error=LoginError("portal rejected the login")),
+            diagnostic_portal(
+                error=DependencyError("Playwright Python is not installed")
+            ),
+            diagnostic_portal(error=RuntimeError("unmapped future failure")),
+        )
+        for portal_cls in cases:
+            with self.subTest(portal=portal_cls):
+                with tempfile.TemporaryDirectory() as name:
+                    _exit_code, out, _err = self.run_diagnostic(Path(name), portal_cls)
+                document = self.document(out)
+                self.assertEqual(document["navigation_status"], "NOT_TESTED")
+                self.assertIn(
+                    document["authentication_outcome"],
+                    portal_module.AUTHENTICATION_OUTCOMES,
+                )
 
     def test_every_accepted_classification_is_emitted_verbatim(self) -> None:
         for classification in portal_module.LOGIN_DIAGNOSTIC_CLASSIFICATIONS:
@@ -992,8 +1140,10 @@ class LoginDiagnosticCliTests(unittest.TestCase):
             )
         document = self.document(out)
         self.assertEqual(exit_code, 64)
-        self.assertEqual(document["schema"], "energygrid.login_diagnostic.v1")
+        self.assertEqual(document["schema"], "energygrid.login_diagnostic.v2")
         self.assertEqual(document["status"], ACTION_REQUIRED)
+        self.assertEqual(document["authentication_outcome"], "AUTHENTICATION_UNPROVED")
+        self.assertEqual(document["navigation_status"], "NOT_TESTED")
 
     def test_an_unreadable_configuration_is_a_contract_failure(self) -> None:
         with tempfile.TemporaryDirectory() as name:
@@ -1068,10 +1218,12 @@ class LoginDiagnosticCliTests(unittest.TestCase):
 
     def test_every_document_value_is_an_identifier_a_count_or_a_boolean(self) -> None:
         allowed = set(portal_module.LOGIN_DIAGNOSTIC_CLASSIFICATIONS) | {
-            "energygrid.login_diagnostic.v1",
+            cli.LOGIN_DIAGNOSTIC_SCHEMA,
             cli.DIAGNOSTIC_COMPLETE,
+            cli.NAVIGATION_NOT_TESTED,
             ACTION_REQUIRED,
             *portal_module.SUBMIT_OUTCOMES,
+            *portal_module.AUTHENTICATION_OUTCOMES,
         }
         with tempfile.TemporaryDirectory() as name:
             _exit_code, out, _err = self.run_diagnostic(
