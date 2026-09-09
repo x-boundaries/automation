@@ -59,6 +59,46 @@ PORTAL_RECOVERY_ATTEMPTS_MS = (
 # never a settle or a retry budget.
 LOGIN_KEY_ENTRY_DELAY_MS = 25
 
+# The credential focus/text-editing-host settle floor.
+#
+# Run123 was adjudicable, unattended and complete, and the owner observed that
+# password entry appeared to receive one fewer character than expected. The
+# matching gap is that a credential field was proven visible and enabled,
+# clicked, and then typed into immediately: nothing proved that the field --
+# or the editing host the click hands off to -- actually owned focus before
+# the first key event, so the leading key can land nowhere. Visible and
+# enabled is therefore NOT a sufficient precondition for typing. That the lost
+# character is caused by this handoff remains the leading hypothesis and not a
+# proved portal fact; the gate is correct regardless, because typing into an
+# unfocused field is never right.
+#
+# The floor is the FIRST COMMITTED recovery checkpoint, not a new independent
+# sleep and not a budget of its own: the focus proof simply is not consulted at
+# the ladder's immediate look, because a click's focus handoff has not
+# meaningfully happened yet and an immediate answer would be read as settled
+# state. Everything after the floor -- the later checkpoints, the one monotonic
+# deadline, the fresh re-resolution at every look -- is the existing shared
+# contract unchanged.
+LOGIN_FOCUS_SETTLE_FLOOR_MS = PORTAL_RECOVERY_CHECKPOINTS_MS[0]
+
+# Boolean-only focus ownership. The predicate compares node identity against
+# the document's active element, following shadow roots so a host that renders
+# its real editable inside one still reports the containing target as the owner.
+# It reads no value, no attribute and no text, returns nothing but a boolean,
+# and therefore cannot expose or compare a credential character.
+_FOCUS_OWNERSHIP_PREDICATE = """
+(node) => {
+  const owner = node.ownerDocument;
+  if (!owner) { return false; }
+  let active = owner.activeElement;
+  if (!active) { return false; }
+  while (active.shadowRoot && active.shadowRoot.activeElement) {
+    active = active.shadowRoot.activeElement;
+  }
+  return active === node || node.contains(active);
+}
+"""
+
 # ---- bounded login diagnostic vocabulary ---- #
 #
 # DL-XB-141-RUNTIME-005-SOURCE-DURABILITY-A1. The diagnostic observes a fixed
@@ -307,6 +347,7 @@ class PlaywrightPortal:
         *,
         messages: Mapping[str, str] | None = None,
         classified: bool = True,
+        settle_floor_ms: int = 0,
     ) -> Any:
         """Run `probe` at bounded elapsed checkpoints until it reports ready.
 
@@ -314,12 +355,16 @@ class PlaywrightPortal:
         never dispatch an externally meaningful action, because a recovery can
         run it many times. One monotonic deadline covers the whole window, so a
         surface that never settles fails closed rather than holding.
+
+        `settle_floor_ms` declines the earliest looks for a probe whose answer
+        is not yet meaningful that soon. It never adds a checkpoint, extends the
+        window or moves the deadline.
         """
 
         start = time.monotonic()
         deadline = start + PORTAL_RECOVERY_DEADLINE_SECONDS
         verdict = _PORTAL_ABSENT
-        for target_ms in PORTAL_RECOVERY_ATTEMPTS_MS:
+        for target_ms in self._recovery_attempts_ms(settle_floor_ms):
             remaining_ms = int((deadline - time.monotonic()) * 1000)
             if remaining_ms <= 0:
                 break
@@ -338,6 +383,21 @@ class PlaywrightPortal:
             if verdict == _PORTAL_READY:
                 return value
         raise self._recovery_failure(description, messages, verdict, classified)
+
+    @staticmethod
+    def _recovery_attempts_ms(settle_floor_ms: int) -> tuple[int, ...]:
+        """Return the committed ladder without the looks earlier than the floor.
+
+        The default floor of 0 -- every caller but the credential focus gate --
+        returns the committed ladder exactly as it is. A floor is only ever one
+        of the committed checkpoints, so the first consulted look is a real
+        ladder offset rather than a bespoke sleep. If a floor would remove every
+        look, the ladder's final look is kept: a gate must still get one bounded
+        chance to prove its condition before it fails closed.
+        """
+
+        attempts = tuple(ms for ms in PORTAL_RECOVERY_ATTEMPTS_MS if ms >= settle_floor_ms)
+        return attempts or PORTAL_RECOVERY_ATTEMPTS_MS[-1:]
 
     @staticmethod
     def _recovery_failure(
@@ -359,6 +419,8 @@ class PlaywrightPortal:
         *,
         require_enabled: bool = True,
         require_trial_actionable: bool = False,
+        require_focus_owned: bool = False,
+        settle_floor_ms: int = 0,
         messages: Mapping[str, str] | None = None,
         classified: bool = True,
     ) -> Any:
@@ -396,9 +458,18 @@ class PlaywrightPortal:
                 return _PORTAL_NOT_READY, None
             if require_trial_actionable and not self._probe_actionable(locator, remaining_ms):
                 return _PORTAL_NOT_READY, None
+            if require_focus_owned and not self._probe_focus_owned(locator, remaining_ms):
+                return _PORTAL_NOT_READY, None
             return _PORTAL_READY, locator
 
-        return self._recover(page, probe, description, messages=messages, classified=classified)
+        return self._recover(
+            page,
+            probe,
+            description,
+            messages=messages,
+            classified=classified,
+            settle_floor_ms=settle_floor_ms,
+        )
 
     def _probe_enabled(self, locator: Any, remaining_ms: int) -> bool:
         """Report enabled-ness without letting the check outlast the budget.
@@ -427,6 +498,29 @@ class PlaywrightPortal:
                 raise
             return False
         return True
+
+    def _probe_focus_owned(self, locator: Any, remaining_ms: int) -> bool:
+        """Prove the freshly resolved target owns focus, as a boolean only.
+
+        Node identity is compared against the document's active element, so a
+        focused descendant of the target counts and nothing else does. No value,
+        attribute or text is read, returned or retained, so no credential
+        character can reach a comparison, a log or an output surface.
+
+        Only a literal `True` is proof. A predicate that could not answer in
+        time is "not yet", never a pass; and, as everywhere else on this ladder,
+        a non-timeout failure is a real failure and reaches the caller intact.
+        """
+
+        try:
+            owned = locator.evaluate(
+                _FOCUS_OWNERSHIP_PREDICATE, timeout=self._probe_timeout_ms(remaining_ms)
+            )
+        except Exception as exc:
+            if not self._looks_like_timeout(exc):
+                raise
+            return False
+        return owned is True
 
     def _await_condition(
         self,
@@ -514,23 +608,36 @@ class PlaywrightPortal:
         return LayoutChangedError(progress.stage_failure)
 
     def _fill_login_field(self, page: Any, label: str, value: str) -> None:
-        """Type one exact labelled credential field after proving it ready.
+        """Type one exact labelled credential field after proving it ready and focused.
 
-        The field is focused and then typed. The established evidence is the
-        observed A/B contract (see `LOGIN_KEY_ENTRY_DELAY_MS`): assignment-based
-        entry left the canonical Login control stably absent, while user-like
-        typed entry on the same path produced exactly one visible, enabled,
-        actionable canonical Login control. Why assignment fails is inferred
-        rather than measured -- the hypothesis is that the editing host ignores
-        a value it did not observe being edited, leaving a form that renders no
-        submit control, which would surface at the submit step rather than here.
+        The field is focused, the focus is PROVEN, and only then is it typed.
+        The established entry evidence is the observed A/B contract (see
+        `LOGIN_KEY_ENTRY_DELAY_MS`): assignment-based entry left the canonical
+        Login control stably absent, while user-like typed entry on the same
+        path produced exactly one visible, enabled, actionable canonical Login
+        control. Why assignment fails is inferred rather than measured -- the
+        hypothesis is that the editing host ignores a value it did not observe
+        being edited, leaving a form that renders no submit control, which would
+        surface at the submit step rather than here. That mechanism is unchanged
+        here: the same single typed entry, at the same per-key pacing.
 
-        Readiness is recovered; the entry is not. Focus and typing may each
-        have partially committed before raising, so they are dispatched once
-        and the failure goes to the caller's classification. The locator is
-        re-queried by each action, so a host that replaces the input between
-        focus and typing is followed rather than held stale. The value is
-        never logged, echoed, or read back.
+        What is added is the focus gate between the one click and the first key
+        event (see `LOGIN_FOCUS_SETTLE_FLOOR_MS`). Readiness alone -- exactly
+        one match, visible, enabled -- does not establish that the field owns
+        focus, and a key event sent into an unfocused field is simply lost. The
+        gate therefore re-resolves the exact labelled target at each look rather
+        than trusting the handle the click was sent to, and requires boolean
+        focus ownership on top of readiness. It starts at the ladder's first
+        committed checkpoint, so a focus answer read before the handoff could
+        have happened is not mistaken for a settled one.
+
+        Focus that never settles inside the bounded window fails closed: no
+        credential key is sent for this field, and because the caller aborts,
+        no Login submit is dispatched either. Readiness and focus are recovered;
+        the entry is not. Typing may have partially committed before raising, so
+        it is dispatched exactly once and never retried, and the failure goes to
+        the caller's classification. The value is never logged, echoed, read
+        back, measured, or exposed to the focus predicate.
         """
 
         field = self._resolve_ready_control(
@@ -540,7 +647,16 @@ class PlaywrightPortal:
             classified=False,
         )
         field.click()
-        field.press_sequentially(value, delay=LOGIN_KEY_ENTRY_DELAY_MS)
+        focused = self._resolve_ready_control(
+            page,
+            lambda: page.get_by_label(label, exact=True),
+            f"login {label} field focus",
+            require_focus_owned=True,
+            settle_floor_ms=LOGIN_FOCUS_SETTLE_FLOOR_MS,
+            messages=_uniform_messages(f"login {label} field did not take focus"),
+            classified=False,
+        )
+        focused.press_sequentially(value, delay=LOGIN_KEY_ENTRY_DELAY_MS)
 
     def _submit_login(self, page: Any, progress: _LoginProgress) -> None:
         """Click the canonical Login control exactly once, after proving it ready.

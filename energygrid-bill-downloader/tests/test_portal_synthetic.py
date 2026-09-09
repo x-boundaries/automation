@@ -506,6 +506,9 @@ class FakeLocator:
         trial_click_error: Exception | None = None,
         enabled_error: Exception | None = None,
         type_error: Exception | None = None,
+        focused: bool = True,
+        focus_after_looks: int = 0,
+        focus_error: Exception | None = None,
         journal: list[str] | None = None,
         label: str = "locator",
     ) -> None:
@@ -519,6 +522,9 @@ class FakeLocator:
         self._trial_click_error = trial_click_error
         self._enabled_error = enabled_error
         self._type_error = type_error
+        self._focused = focused
+        self._focus_after_looks = focus_after_looks
+        self._focus_error = focus_error
         self._journal = journal
         self._label = label
         self._clock: "FakePage | None" = None
@@ -533,6 +539,11 @@ class FakeLocator:
         self.enabled_timeouts: list[int | None] = []
         self.typed = 0
         self.type_delays: list[int | None] = []
+        self.focus_checks = 0
+        self.evaluate_timeouts: list[int | None] = []
+        # Whether the last focus look proved this locator owns focus. Only ever
+        # a boolean: the fake is handed no credential value either.
+        self._focus_proven = False
         self.waits = 0
         self.wait_timeouts: list[int | None] = []
 
@@ -624,6 +635,29 @@ class FakeLocator:
         if self._click_error is not None:
             raise self._click_error
 
+    def evaluate(self, expression: str, timeout: int | None = None) -> bool:
+        """Model the boolean-only focus predicate the credential gate evaluates.
+
+        The production predicate compares node identity against the document's
+        active element and returns nothing but a boolean, so this returns a
+        boolean and is handed no value to inspect. `focus_after_looks` models an
+        editing host that takes focus a little after the click rather than
+        instantly; `focused=False` models one that never takes it at all.
+
+        A focus probe that stalls is charged its whole explicit budget, exactly
+        like the enabled and trial probes, so an unbounded one cannot be free.
+        """
+        self.focus_checks += 1
+        self.evaluate_timeouts.append(timeout)
+        self._record("evaluate")
+        if self._focus_error is not None:
+            if self._clock is not None:
+                spent = timeout if timeout is not None else self._clock.default_timeout_ms
+                self._clock.charge_probe_ms(spent)
+            raise self._focus_error
+        self._focus_proven = self._focused and self.focus_checks > self._focus_after_looks
+        return self._focus_proven
+
     def press_sequentially(self, value: str, delay: int | None = None) -> None:
         """Model typed credential entry: real key events, not value assignment.
 
@@ -636,6 +670,30 @@ class FakeLocator:
         self._record("press_sequentially")
         if self._type_error is not None:
             raise self._type_error
+
+
+class FocusHostField(FakeLocator):
+    """A credential field whose editing host loses keys sent before it focuses.
+
+    This is the Run123 regression model, expressed in booleans only. The owner
+    observed unattended password entry appearing to receive one fewer character
+    than expected; a host like this one is what that looks like -- an entry that
+    begins before focus is owned loses its leading key event. The value itself
+    is never held, measured or compared; only whether the entry began focused.
+    """
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.complete_entries = 0
+        self.leading_key_dropped = False
+
+    def press_sequentially(self, value: str, delay: int | None = None) -> None:
+        started_focused = self._focus_proven
+        super().press_sequentially(value, delay)
+        if started_focused:
+            self.complete_entries += 1
+        else:
+            self.leading_key_dropped = True
 
 
 class FakePage:
@@ -908,8 +966,14 @@ LOGIN_STEP_CASES = (
 # The committed order of portal interactions for one successful login attempt.
 # Every control that is about to be clicked for real is proven actionable by
 # one trial click first; readiness itself is proven by current-state reads that
-# dispatch nothing. A healthy portal is ready at the immediate checkpoint, so it
-# costs no extra resolution and no event-loop yield.
+# dispatch nothing. A healthy portal is ready at the immediate checkpoint, so
+# every non-credential surface costs no extra resolution and no event-loop
+# yield.
+#
+# Each credential field is the one exception, and deliberately so: one click,
+# then one boolean focus proof at the committed settle floor, then one typed
+# entry. The focus gate declines the ladder's immediate look, so a healthy
+# field still pays exactly one bounded yield -- see `CREDENTIAL_FOCUS_YIELDS`.
 SUCCESSFUL_LOGIN_SEQUENCE = [
     "page:goto",
     "activation:dispatch_event",
@@ -917,13 +981,24 @@ SUCCESSFUL_LOGIN_SEQUENCE = [
     "login_entry:click_trial",
     "login_entry:click",
     "username:click",
+    "page:wait_for_timeout",
+    "username:evaluate",
     "username:press_sequentially",
     "password:click",
+    "page:wait_for_timeout",
+    "password:evaluate",
     "password:press_sequentially",
     "submit:click_trial",
     "submit:click",
     "billing_manager:wait_for",
 ]
+
+# What one healthy login now spends before any other surface can lag: the
+# credential focus gate declines the immediate look, so each of the two fields
+# yields once at the committed floor before its focus is proven. Cases that
+# assert "nothing else was waited out" compare against this rather than an
+# empty list.
+CREDENTIAL_FOCUS_YIELDS = [portal_module.LOGIN_FOCUS_SETTLE_FLOOR_MS] * 2
 
 
 class PreAuthLoginFailureReferenceTests(unittest.TestCase):
@@ -1105,8 +1180,15 @@ class PreAuthLoginFailureReferenceTests(unittest.TestCase):
         self.assertEqual(locators["username"].typed, 1)
         self.assertEqual(locators["password"].typed, 1)
         self.assertEqual(locators["billing_manager"].waits, 1)
-        # A healthy control needs no recovery, so nothing is spent waiting.
-        self.assertEqual(page.waited_ms, [])
+        # Each credential field is focused exactly once and its focus proven
+        # exactly once, and neither proof is read before the settle floor.
+        self.assertEqual(locators["username"].clicks, 1)
+        self.assertEqual(locators["password"].clicks, 1)
+        self.assertEqual(locators["username"].focus_checks, 1)
+        self.assertEqual(locators["password"].focus_checks, 1)
+        # A healthy non-credential control needs no recovery, so the only cost
+        # is the committed post-click focus floor, once per credential field.
+        self.assertEqual(page.waited_ms, CREDENTIAL_FOCUS_YIELDS)
         # A success never consults the alert, so it never takes the rejection arm.
         self.assertEqual(page.alert_lookups, 0)
 
@@ -1312,7 +1394,7 @@ class LoginSubmitRecoveryTests(unittest.TestCase):
             "login submit control could not be resolved",
             "EG_LOGIN_SUBMIT_UNRESOLVED",
         )
-        self.assertEqual(page.waited_ms, [])
+        self.assertEqual(page.waited_ms, CREDENTIAL_FOCUS_YIELDS)
         self.assertEqual(broken.clicks, 0)
         self.assertNotIn("hunter2", error.message)
         self.assertNotIn("portal.example.invalid", error.message)
@@ -1437,7 +1519,11 @@ class LoginSubmitRecoveryTests(unittest.TestCase):
         # The checkpoints are elapsed offsets, not additive sleeps: a probe that
         # already spent the first checkpoint's worth of budget has nothing left
         # to yield before the next look, so the retry is immediate.
-        self.assertEqual(page.waited_ms, [], "a probe that already elapsed past a checkpoint adds no sleep")
+        self.assertEqual(
+            page.waited_ms,
+            CREDENTIAL_FOCUS_YIELDS,
+            "a probe that already elapsed past a checkpoint adds no sleep",
+        )
         self.assertGreaterEqual(page.login_lookups, 3, "the retry resolved a fresh locator")
         self.assertEqual(ready.trial_clicks, 1)
         self.assertEqual(ready.clicks, 1)
@@ -1457,7 +1543,11 @@ class LoginSubmitRecoveryTests(unittest.TestCase):
             "EG_LOGIN_SUBMIT_UNRESOLVED",
         )
         self.assertEqual(broken.enabled_checks, 1, "a real failure is not retried")
-        self.assertEqual(page.waited_ms, [], "no yield follows a terminal readiness failure")
+        self.assertEqual(
+            page.waited_ms,
+            CREDENTIAL_FOCUS_YIELDS,
+            "no yield follows a terminal readiness failure",
+        )
         self.assertEqual(broken.trial_clicks, 0)
         self.assertEqual(broken.clicks, 0)
         self.assertNotIn("hunter2", error.message)
@@ -2665,16 +2755,16 @@ class PortalLoginDispatchTests(unittest.TestCase):
         self.assertEqual(hidden_password.typed, 0)
         self.assertEqual(password.typed, 1)
 
-    def test_each_credential_is_focused_then_typed_never_assigned(self) -> None:
-        """The observed entry contract: focused and typed, never assigned.
+    def test_each_credential_is_focused_proven_then_typed_never_assigned(self) -> None:
+        """The observed entry contract: focused, PROVEN focused, then typed.
 
         Observed live: assignment-based credential entry left the canonical
         Login control stably absent, while user-like typed entry on the same
         path produced exactly one visible, enabled, actionable Login control.
         The internal reason for that difference was not measured, so any
         editing-widget or incomplete-form account of it stays hypothesis. Each
-        field is therefore focused once and typed once, in that order, and
-        nothing is assigned.
+        field is therefore clicked once, its focus proven once, and typed once,
+        in that order, and nothing is assigned.
         """
         journal: list[str] = []
         username = FakeLocator(journal=journal, label="username")
@@ -2695,11 +2785,13 @@ class PortalLoginDispatchTests(unittest.TestCase):
             credential_steps,
             [
                 "username:click",
+                "username:evaluate",
                 "username:press_sequentially",
                 "password:click",
+                "password:evaluate",
                 "password:press_sequentially",
             ],
-            "focus precedes typing for each field, and no value is ever assigned",
+            "proven focus separates the one click from the one typed entry",
         )
 
     def test_a_delayed_billing_manager_postcondition_never_re_submits(self) -> None:
@@ -2739,7 +2831,11 @@ class PortalLoginDispatchTests(unittest.TestCase):
         self.assertIsInstance(error, LoginError)
         self.assertEqual(cli.support_ref_for(error), "EG_LOGIN_PORTAL_REJECTED")
         self.assertEqual(submit.clicks, 1, "a rejection is never re-submitted")
-        self.assertEqual(page.waited_ms, [], "a settled rejection is not waited out")
+        self.assertEqual(
+            page.waited_ms,
+            CREDENTIAL_FOCUS_YIELDS,
+            "a settled rejection is not waited out beyond the credential focus floor",
+        )
         self.assertEqual(never.waits, 0)
 
     def test_an_ambiguous_post_login_surface_never_re_submits(self) -> None:
@@ -2753,6 +2849,343 @@ class PortalLoginDispatchTests(unittest.TestCase):
         self.assertEqual(cli.support_ref_for(error), "EG_LOGIN_BILLING_MANAGER_WAIT_FAILED")
         self.assertEqual(submit.clicks, 1)
         self.assertEqual(ambiguous.waits, 0, "an ambiguous surface is never asked to wait")
+
+
+# ---- DL-XB-141-PASSWORD-FOCUS-SETTLE-001: the credential focus gate ---- #
+#
+# Run123 was adjudicable, unattended and complete, and the owner observed that
+# unattended password entry appeared to receive one fewer character than
+# expected. The matching code gap was that a credential field proven visible
+# and enabled was clicked and then typed into immediately, with nothing proving
+# that the field -- or the editing host the click hands focus to -- had actually
+# taken focus before the first key event.
+#
+# These cases drive the committed `login()` and `login_diagnostic()`, so what
+# they prove is the production path: proven focus separates the one click from
+# the one typed entry, focus that never settles types nothing and submits
+# nothing, and no case anywhere holds, measures or emits a credential value.
+# The handoff race remains the leading hypothesis rather than a proved portal
+# fact; typing into an unfocused field is wrong either way.
+
+
+class CredentialFocusSettleTests(unittest.TestCase):
+    """Credential keys are never sent until the target is proven focused."""
+
+    def run_login(self, page: FakePage) -> tuple[AppError | None, dict[str, str]]:
+        """Run the committed `login()` on a simulated clock.
+
+        The synthetic credential values are returned so a case can prove no
+        output surface carries them; nothing in the portal is ever asked for a
+        value, and no case asserts a length.
+        """
+
+        portal = PlaywrightPortal(FakeConfig(), headed=False)
+        portal.page = page
+        old = {name: os.environ.get(name) for name in ("ENERGYGRID_USERNAME", "ENERGYGRID_PASSWORD")}
+        values = runtime_credentials()
+        os.environ.update(values)
+        try:
+            with mock.patch.object(portal_module, "time", create=True) as clock:
+                clock.monotonic.side_effect = page.simulated_monotonic
+                portal.login()
+        except AppError as exc:
+            return exc, values
+        finally:
+            for name, value in old.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+        return None, values
+
+    def run_diagnostic(self, page: FakePage):
+        """Run the committed bounded diagnostic against `page`."""
+
+        portal = PlaywrightPortal(FakeConfig(), headed=False)
+        portal.page = page
+        old = {name: os.environ.get(name) for name in ("ENERGYGRID_USERNAME", "ENERGYGRID_PASSWORD")}
+        os.environ.update(runtime_credentials())
+        try:
+            with mock.patch.object(portal_module, "time", create=True) as clock:
+                clock.monotonic.side_effect = page.simulated_monotonic
+                return portal.login_diagnostic()
+        finally:
+            for name, value in old.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+
+    def assert_typed_once_at_the_committed_pacing(self, field: FakeLocator, name: str) -> None:
+        """One typed entry, at the established per-key pacing, after one click."""
+
+        self.assertEqual(field.clicks, 1, f"{name} takes exactly one normal focus click")
+        self.assertEqual(field.typed, 1, f"{name} is typed exactly once")
+        self.assertEqual(
+            field.type_delays,
+            [portal_module.LOGIN_KEY_ENTRY_DELAY_MS],
+            f"{name} keeps the established 25 ms per-key pacing",
+        )
+
+    def test_the_settle_floor_is_a_committed_checkpoint_not_a_new_sleep(self) -> None:
+        """The gate reuses the recovery timing contract instead of adding one."""
+
+        self.assertEqual(
+            portal_module.LOGIN_FOCUS_SETTLE_FLOOR_MS,
+            portal_module.PORTAL_RECOVERY_CHECKPOINTS_MS[0],
+            "the floor is the ladder's first committed checkpoint",
+        )
+        self.assertEqual(
+            portal_module.PORTAL_RECOVERY_DEADLINE_SECONDS,
+            60.0,
+            "the gate must not move the shared deadline",
+        )
+        # The floored ladder is the committed one minus its earliest looks: no
+        # checkpoint is added, and the window still ends where it always did.
+        floored = PlaywrightPortal._recovery_attempts_ms(
+            portal_module.LOGIN_FOCUS_SETTLE_FLOOR_MS
+        )
+        self.assertEqual(
+            floored,
+            tuple(
+                ms
+                for ms in portal_module.PORTAL_RECOVERY_ATTEMPTS_MS
+                if ms >= portal_module.LOGIN_FOCUS_SETTLE_FLOOR_MS
+            ),
+        )
+        self.assertNotIn(0, floored, "the immediate look is declined, not repurposed")
+        self.assertEqual(floored[-1], portal_module.PORTAL_RECOVERY_ATTEMPTS_MS[-1])
+        self.assertEqual(
+            PlaywrightPortal._recovery_attempts_ms(0),
+            portal_module.PORTAL_RECOVERY_ATTEMPTS_MS,
+            "every other caller keeps the committed ladder unchanged",
+        )
+
+    def test_a_stably_focused_username_is_typed_exactly_once(self) -> None:
+        """The healthy case: focus is owned, proven once, and typed once."""
+
+        username = FocusHostField(label="username")
+        page = login_page(username_field=username)
+
+        error, _values = self.run_login(page)
+        self.assertIsNone(error)
+        self.assert_typed_once_at_the_committed_pacing(username, "username")
+        self.assertEqual(username.focus_checks, 1, "a settled field needs one focus proof")
+        self.assertEqual(username.complete_entries, 1)
+        self.assertFalse(username.leading_key_dropped)
+
+    def test_a_stably_focused_password_is_typed_exactly_once(self) -> None:
+        """The same contract for the field the observation was made on."""
+
+        password = FocusHostField(label="password")
+        submit = FakeLocator(label="submit")
+        page = login_page(password_field=password, submits=[submit])
+
+        error, _values = self.run_login(page)
+        self.assertIsNone(error)
+        self.assert_typed_once_at_the_committed_pacing(password, "password")
+        self.assertEqual(password.focus_checks, 1)
+        self.assertEqual(password.complete_entries, 1)
+        self.assertFalse(password.leading_key_dropped)
+        # The one-shot submit boundary is untouched by the gate.
+        self.assertEqual(submit.trial_clicks, 1)
+        self.assertEqual(submit.clicks, 1)
+
+    def test_a_password_host_slow_to_focus_receives_no_key_until_it_settles(self) -> None:
+        """The regression case, on the observed Username-to-Password handoff.
+
+        The host reports unfocused for the first two looks and focused after.
+        No key event may be sent while it is unfocused: the modelled host loses
+        the leading key, which is exactly the one-fewer-character the owner
+        observed. The corrected path types only once focus is proven, so the
+        entry is complete and dispatched exactly once.
+        """
+
+        password = FocusHostField(focus_after_looks=2, label="password")
+        page = login_page(password_field=password)
+
+        error, _values = self.run_login(page)
+        self.assertIsNone(error)
+        self.assertEqual(password.focus_checks, 3, "the gate looked again instead of typing")
+        self.assert_typed_once_at_the_committed_pacing(password, "password")
+        self.assertFalse(
+            password.leading_key_dropped,
+            "no key event may be sent into a host that has not taken focus",
+        )
+        self.assertEqual(password.complete_entries, 1, "one complete entry, once focus settled")
+        self.assertTrue(page.waited_ms, "an unsettled focus costs bounded yields, not keys")
+
+    def test_a_locator_replaced_during_the_handoff_is_freshly_re_resolved(self) -> None:
+        """The gate follows a replaced input rather than trusting a stale handle.
+
+        The field the click was sent to is discarded by the host and replaced by
+        the one that actually owns focus. Because every look re-resolves the
+        exact labelled target, the replacement is what is proven and what is
+        typed -- and the stale handle is never typed into.
+        """
+
+        clicked = FocusHostField(focused=False, label="clicked_password")
+        replacement = FocusHostField(label="replacement_password")
+        page = login_page(password_fields=[clicked, clicked, replacement])
+
+        error, _values = self.run_login(page)
+        self.assertIsNone(error)
+        self.assertEqual(clicked.clicks, 1, "the one focus click went to the field that resolved")
+        self.assertEqual(clicked.typed, 0, "a stale handle is never typed into")
+        self.assertFalse(clicked.leading_key_dropped)
+        self.assertEqual(replacement.typed, 1)
+        self.assertEqual(replacement.type_delays, [portal_module.LOGIN_KEY_ENTRY_DELAY_MS])
+        self.assertEqual(replacement.complete_entries, 1)
+        self.assertFalse(replacement.leading_key_dropped)
+        self.assertEqual(
+            replacement.clicks, 0, "exactly one normal focus click per field, never a second"
+        )
+
+    def test_visible_and_enabled_but_unfocused_is_not_sufficient(self) -> None:
+        """Readiness is not focus, and a ready-but-unfocused field is not typed."""
+
+        password = FocusHostField(focused=True, focus_after_looks=1, label="password")
+        page = login_page(password_field=password)
+
+        error, _values = self.run_login(page)
+        self.assertIsNone(error)
+        # The field was visible and enabled from the first look, so readiness
+        # alone would have typed immediately; the gate did not.
+        self.assertTrue(password.enabled_checks, "readiness is still proven as before")
+        self.assertEqual(password.focus_checks, 2, "readiness did not stand in for focus")
+        self.assertEqual(password.typed, 1)
+        self.assertFalse(password.leading_key_dropped)
+
+    def test_focus_that_never_settles_fails_closed_before_typing_or_submit(self) -> None:
+        """Fail-closed: no credential key for that field, and no Login submit."""
+
+        password = FocusHostField(focused=False, label="password")
+        submit = FakeLocator(label="submit")
+        page = login_page(password_field=password, submits=[submit])
+
+        error, values = self.run_login(page)
+        self.assertIsInstance(error, LayoutChangedError)
+        self.assertEqual(error.message, "login password entry did not complete")
+        self.assertEqual(cli.support_ref_for(error), "EG_LOGIN_PASSWORD_FILL_FAILED")
+        self.assertEqual(error.status, PORTAL_LAYOUT_CHANGED)
+        self.assertEqual(password.typed, 0, "an unfocused field is never typed into")
+        self.assertFalse(password.leading_key_dropped)
+        self.assertEqual(password.clicks, 1, "still exactly one normal focus click")
+        self.assertEqual(submit.clicks, 0, "no Login submit follows a failed credential entry")
+        self.assertEqual(submit.trial_clicks, 0)
+        self.assertEqual(
+            password.focus_checks,
+            len(PlaywrightPortal._recovery_attempts_ms(portal_module.LOGIN_FOCUS_SETTLE_FLOOR_MS)),
+            "focus was re-proven at every remaining checkpoint before failing closed",
+        )
+        self.assert_no_credential_value(error.message, values)
+
+    def test_an_unsettled_username_focus_never_reaches_the_password_field(self) -> None:
+        """The first field failing closed stops the sequence where it stands."""
+
+        username = FocusHostField(focused=False, label="username")
+        password = FocusHostField(label="password")
+        submit = FakeLocator(label="submit")
+        page = login_page(username_field=username, password_field=password, submits=[submit])
+
+        error, values = self.run_login(page)
+        self.assertIsInstance(error, LayoutChangedError)
+        self.assertEqual(error.message, "login username entry did not complete")
+        self.assertEqual(cli.support_ref_for(error), "EG_LOGIN_USERNAME_FILL_FAILED")
+        self.assertEqual(username.typed, 0)
+        self.assertEqual(password.clicks, 0, "the password field is never even reached")
+        self.assertEqual(password.typed, 0)
+        self.assertEqual(submit.clicks, 0)
+        self.assert_no_credential_value(error.message, values)
+
+    def test_the_diagnostic_reports_nothing_dispatched_when_focus_never_settles(self) -> None:
+        """The bounded diagnostic fails closed on the same gate, and observes nothing.
+
+        Its vocabulary, submit semantics and post-submit observation timing are
+        unchanged: nothing was sent, so there is nothing to observe, and the
+        unobserved witness shape is what is reported.
+        """
+
+        password = FocusHostField(focused=False, label="password")
+        submit = FakeLocator(label="submit")
+        page = login_page(password_field=password, submits=[submit])
+
+        result = self.run_diagnostic(page)
+        self.assertFalse(result.submit_dispatched)
+        self.assertEqual(result.submit_outcome, portal_module.SUBMIT_NOT_DISPATCHED)
+        self.assertIsNone(result.classification)
+        self.assertEqual(submit.clicks, 0)
+        self.assertEqual(password.typed, 0)
+        self.assertIsInstance(result.failure, LayoutChangedError)
+        self.assertEqual(cli.support_ref_for(result.failure), "EG_LOGIN_PASSWORD_FILL_FAILED")
+        self.assertEqual(
+            result.post_submit, portal_module.unobserved_login_witnesses(include_url=True)
+        )
+
+    def test_the_focus_probe_is_bounded_and_a_real_failure_is_not_transient(self) -> None:
+        """A focus probe carries its own small explicit timeout, like every other."""
+
+        stalling = FocusHostField(focus_error=synthetic_timeout(), label="stalling_password")
+        page = login_page(password_field=stalling, default_timeout_ms=300_000)
+
+        error, _values = self.run_login(page)
+        self.assertIsInstance(error, LayoutChangedError)
+        self.assertTrue(stalling.evaluate_timeouts, "the focus probe must actually run")
+        self.assertTrue(
+            all(value is not None for value in stalling.evaluate_timeouts),
+            "every focus probe must carry an explicit timeout",
+        )
+        self.assertNotIn(0, stalling.evaluate_timeouts, "a zero timeout would wait forever")
+        self.assertLessEqual(
+            max(stalling.evaluate_timeouts),
+            MAX_TRIAL_PROBE_MS,
+            "a focus probe stays far below any configured page default",
+        )
+        self.assertEqual(stalling.typed, 0)
+
+        broken = FocusHostField(focus_error=step_failure(), label="broken_password")
+        error, values = self.run_login(login_page(password_field=broken))
+        self.assertIsInstance(error, LayoutChangedError)
+        self.assertEqual(broken.focus_checks, 1, "only a timeout is transient")
+        self.assertEqual(broken.typed, 0)
+        self.assertNotIn("hunter2", error.message)
+        self.assertNotIn("portal.example.invalid", error.message)
+        self.assert_no_credential_value(error.message, values)
+
+    def test_the_focus_predicate_cannot_read_a_credential(self) -> None:
+        """The predicate is a boolean identity comparison and nothing more."""
+
+        predicate = portal_module._FOCUS_OWNERSHIP_PREDICATE
+        for forbidden in (
+            ".value",
+            "textContent",
+            "innerText",
+            "innerHTML",
+            "outerHTML",
+            "length",
+            "getAttribute",
+            "screenshot",
+        ):
+            self.assertNotIn(
+                forbidden, predicate, f"the focus predicate must never reach for {forbidden}"
+            )
+        self.assertIn("activeElement", predicate, "focus ownership is what it proves")
+        # Only a literal True is proof: a predicate that answers anything else
+        # is "not yet", never a pass.
+        portal = PlaywrightPortal(FakeConfig(), headed=False)
+        for answer in (None, "true", 1, {}):
+            with self.subTest(answer=answer):
+                locator = mock.Mock()
+                locator.evaluate.return_value = answer
+                self.assertFalse(portal._probe_focus_owned(locator, 1_000))
+
+    def assert_no_credential_value(self, text: str, values: dict[str, str]) -> None:
+        """No credential value, and no fragment of one, may reach an output surface."""
+
+        for name, value in values.items():
+            self.assertNotIn(value, text, f"{name} must never appear in an output surface")
+            # The random half of each synthetic value: a partial echo is a leak too.
+            self.assertNotIn(value.split("-", 1)[1], text)
 
 
 # ---- DL-XB-141-RUNTIME-005-SOURCE-DURABILITY-A1: the bounded login diagnostic ---- #
