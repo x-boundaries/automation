@@ -279,18 +279,54 @@ class SyntheticPortalServer:
                     "</form>" + script,
                 )
 
+            def _authenticated_shell(self) -> str:
+                """The authenticated-landing witness, and only it.
+
+                The exact `EMS` control is what proves authentication on the
+                observed surface. It is deliberately independent of Billing
+                Manager, so a landing with no Billing Manager at all still
+                authenticates and fails later, in navigation.
+                """
+
+                if fixture.variant == "missing_ems":
+                    return ""
+                if fixture.variant == "ambiguous_ems":
+                    return (
+                        '<button type="button">EMS</button>'
+                        '<button type="button">EMS</button>'
+                    )
+                if fixture.variant == "hidden_ems":
+                    # Still in the accessibility tree, with an empty box.
+                    return (
+                        '<button type="button" '
+                        'style="width:0;height:0;padding:0;border:0;overflow:hidden">'
+                        "EMS</button>"
+                    )
+                return '<button type="button">EMS</button>'
+
             def _app_page(self) -> bytes:
                 if fixture.variant == "missing_billing_manager":
-                    return self._page("Application", "<main>Unexpected application</main>")
+                    return self._page(
+                        "Application",
+                        self._authenticated_shell() + "<main>Unexpected application</main>",
+                    )
                 return self._page(
                     "Application",
-                    '<a href="/billing" role="link">Billing Manager</a>',
+                    self._authenticated_shell()
+                    + '<a href="/billing" role="link">Billing Manager</a>',
                 )
 
             def _billing_page(self) -> bytes:
                 if fixture.variant == "missing_eb_bill":
-                    return self._page("Billing", "<main>Unexpected billing page</main>")
-                return self._page("Billing", '<a href="/eb-bill" role="link">EB Bill</a>')
+                    return self._page(
+                        "Billing",
+                        self._authenticated_shell() + "<main>Unexpected billing page</main>",
+                    )
+                return self._page(
+                    "Billing",
+                    self._authenticated_shell()
+                    + '<a href="/eb-bill" role="link">EB Bill</a>',
+                )
 
             def _invoice_page(self, page: int) -> bytes:
                 start = (page - 1) * fixture.page_size
@@ -405,6 +441,14 @@ class SyntheticPortalServer:
                 displayed = selected_account if not searched else (fixture.displayed_account or selected_account)
                 if searched and fixture.variant == "account_mismatch" and fixture.displayed_account is None:
                     displayed = "SYNTHETIC-DISPLAYED-MISMATCH"
+                # The results route carries its own EB Bill nav entry, exactly as
+                # the billing route does. Route proof compares the current
+                # address with this control's own target, so an already-valid
+                # saved results address needs no navigation click at all.
+                eb_bill_markup = (
+                    "" if fixture.variant == "missing_eb_bill"
+                    else '<a href="/eb-bill" role="link">EB Bill</a>'
+                )
                 search_button = "" if fixture.variant == "missing_search" else (
                     '<button id="search-button" type="button">Search</button>'
                 )
@@ -484,7 +528,8 @@ class SyntheticPortalServer:
                 </script>
                 """
                 content = (
-                    account_markup
+                    eb_bill_markup
+                    + account_markup
                     + '<div data-testid="selected-account">'
                     + escape(displayed)
                     + "</div>"

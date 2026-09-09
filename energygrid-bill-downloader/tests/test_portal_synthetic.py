@@ -9,6 +9,7 @@ from pathlib import Path
 import tempfile
 import unittest
 from unittest import mock
+from urllib.parse import parse_qs, urlparse
 import uuid
 
 from energygrid_bill_downloader import cli
@@ -704,6 +705,14 @@ class FakePage:
     lookup to `login_entry` and any later one to `submit`. That mirrors the
     committed sequence while still letting a click failure be attributed to the
     step that made it. Every optional slot defaults to a healthy locator.
+
+    The one real submit click also opens the landing stage
+    (DL-XB-141-AUTH-LANDING-NAV-SEPARATION-G2-001). A healthy landing serves
+    exactly one visible `EMS` control and reports every retained login witness
+    absent by an exact zero count, which is what a clean authenticated landing
+    is. `landing=False` models a landing that never renders the authentication
+    witness, and `retained_login=True` models a login route that survives the
+    submit -- the contradiction that must never authenticate.
     """
 
     def __init__(
@@ -720,6 +729,11 @@ class FakePage:
         username_field: FakeLocator | None = None,
         password_field: FakeLocator | None = None,
         billing_manager: FakeLocator | None = None,
+        ems: FakeLocator | None = None,
+        emss: list[FakeLocator] | None = None,
+        rejection: FakeLocator | None = None,
+        landing: bool = True,
+        retained_login: bool = False,
         activations: list[FakeLocator] | None = None,
         placeholders: list[FakeLocator] | None = None,
         entries: list[FakeLocator] | None = None,
@@ -743,6 +757,13 @@ class FakePage:
         self.username_field = username_field
         self.password_field = password_field
         self.billing_manager = billing_manager
+        self.ems = ems
+        self.emss = emss
+        # An explicit strict rejection witness, so a case can model a rejection
+        # reader that FAILS rather than one that reports absence.
+        self.rejection = rejection
+        self.landing = landing
+        self.retained_login = retained_login
         # Successive resolutions of one surface, so a caller that re-resolves at
         # every recovery checkpoint can be handed a different locator each time.
         # The last entry repeats, which models a surface that stays as it is.
@@ -760,8 +781,13 @@ class FakePage:
         # control. The one real entry click is what moves the page on, so a
         # re-resolved entry is never mistaken for the submit control.
         self.entry_phase = True
+        # The landing stage opens at the one real submit dispatch, so nothing
+        # before that boundary can be read as post-submit evidence.
+        self.landing_phase = False
         self.entry_lookups = 0
         self.submit_lookups = 0
+        self.landing_lookups = 0
+        self.ems_lookups = 0
         self._sequence_lookups: dict[str, int] = {}
         # What `page.set_default_timeout()` would have installed. An
         # unbounded call inherits it, so it is what a missing explicit
@@ -776,6 +802,7 @@ class FakePage:
         self.ledger: list[tuple[str, int]] = []
         for sequence in (
             self.submits,
+            self.emss,
             self.activations,
             self.placeholders,
             self.entries,
@@ -803,13 +830,42 @@ class FakePage:
     def _end_entry_stage(self) -> None:
         self.entry_phase = False
 
+    def _end_submit_stage(self) -> None:
+        self.landing_phase = True
+
+    @staticmethod
+    def _absent() -> FakeLocator:
+        """A control the surface positively does not have: an exact zero count."""
+        return FakeLocator(count=0, visible=False)
+
+    def _landing_absent(self) -> bool:
+        """Whether a retained login witness is gone, as the landing stage requires."""
+        return self.landing_phase and not self.retained_login
+
     def get_by_role(self, role: str, name: str | None = None, exact: bool = False):
+        if name == "EMS":
+            # The authentication witness. It exists only on the landing, so a
+            # look before the one submit dispatch is an exact zero count.
+            self.ems_lookups += 1
+            if not self.landing_phase:
+                return self._absent()
+            if self.emss is not None:
+                return self._from_sequence("ems", self.emss)
+            if self.ems is not None:
+                return self.ems
+            return FakeLocator() if self.landing else self._absent()
         if name == "Enable accessibility":
+            if self._landing_absent():
+                return self._absent()
             if self.activations is not None:
                 return self._from_sequence("activation", self.activations)
             return self.activation
         if name == "Login":
             self.login_lookups += 1
+            if self._landing_absent():
+                # The login route is gone, which is what the landing requires.
+                self.landing_lookups += 1
+                return self._absent()
             if self.entry_phase:
                 self.entry_lookups += 1
                 locator = (
@@ -820,14 +876,21 @@ class FakePage:
                 locator._on_click_hook = self._end_entry_stage
                 return locator
             self.submit_lookups += 1
+            locator = self.login_entry
             if self.submits is not None:
-                return self._from_sequence("submit", self.submits)
-            if self.submit is not None:
-                return self.submit
-            return self.login_entry
+                locator = self._from_sequence("submit", self.submits)
+            elif self.submit is not None:
+                locator = self.submit
+            # The one real submit click is what opens the landing stage.
+            locator._on_click_hook = self._end_submit_stage
+            return locator
         if role == "alert":
             self.alert_lookups += 1
-            return FakeLocator(visible=self.alert_visible)
+            if self.rejection is not None:
+                return self.rejection
+            # A surface with no rejection reports an exact zero count, so its
+            # absence is positively readable rather than merely invisible.
+            return FakeLocator(count=1 if self.alert_visible else 0, visible=self.alert_visible)
         if name == "Billing Manager":
             if self.billing_managers is not None:
                 return self._from_sequence("billing_manager", self.billing_managers)
@@ -868,6 +931,9 @@ class FakePage:
     def get_by_label(self, name: str, exact: bool = False):
         if self.label_error is not None:
             raise self.label_error
+        if self._landing_absent():
+            # The credential route is gone on a clean authenticated landing.
+            return self._absent()
         if name == "Username":
             if self.username_fields is not None:
                 return self._from_sequence("username", self.username_fields)
@@ -956,10 +1022,13 @@ LOGIN_STEP_CASES = (
         lambda exc: {"submit": FakeLocator(click_error=exc)},
         "EG_LOGIN_SUBMIT_DISPATCH_UNCERTAIN",
     ),
+    # Billing Manager is no longer an authentication oracle. What ends the
+    # login sequence now is positive authentication proof, so the step that can
+    # fail here is the authenticated landing, and it carries its own reference.
     (
-        "billing_manager_wait",
-        lambda exc: {"billing_manager": FakeLocator(wait_error=exc)},
-        "EG_LOGIN_BILLING_MANAGER_WAIT_FAILED",
+        "authenticated_landing",
+        lambda exc: {"landing": False},
+        "EG_LOGIN_AUTHENTICATION_UNPROVED",
     ),
 )
 
@@ -990,8 +1059,11 @@ SUCCESSFUL_LOGIN_SEQUENCE = [
     "password:press_sequentially",
     "submit:click_trial",
     "submit:click",
-    "billing_manager:wait_for",
 ]
+# Nothing follows the one submit click. The authentication proof that ends
+# `login()` is pure observation: it resolves fresh exact locators and reads
+# counts and visibility, so it dispatches nothing at all and therefore adds no
+# interaction to the committed sequence.
 
 # What one healthy login now spends before any other surface can lag: the
 # credential focus gate declines the immediate look, so each of the two fields
@@ -1146,7 +1218,7 @@ class PreAuthLoginFailureReferenceTests(unittest.TestCase):
         journal: list[str] = []
         locators = {
             name: FakeLocator(journal=journal, label=name)
-            for name in ("activation", "placeholder", "login_entry", "submit", "username", "password", "billing_manager")
+            for name in ("activation", "placeholder", "login_entry", "submit", "username", "password")
         }
         page = FakePage(
             locators["activation"],
@@ -1155,7 +1227,6 @@ class PreAuthLoginFailureReferenceTests(unittest.TestCase):
             submit=locators["submit"],
             username_field=locators["username"],
             password_field=locators["password"],
-            billing_manager=locators["billing_manager"],
             journal=journal,
         )
         old = {name: os.environ.get(name) for name in ("ENERGYGRID_USERNAME", "ENERGYGRID_PASSWORD")}
@@ -1171,7 +1242,8 @@ class PreAuthLoginFailureReferenceTests(unittest.TestCase):
 
         self.assertEqual(journal, SUCCESSFUL_LOGIN_SEQUENCE)
         self.assertEqual(page.goto_calls, 1)
-        self.assertEqual(page.login_lookups, 2, "the entry and the submit control resolve as before")
+        self.assertEqual(page.entry_lookups, 1, "the entry control resolves as before")
+        self.assertEqual(page.submit_lookups, 1, "the submit control resolves as before")
         self.assertEqual(locators["activation"].dispatched, 1)
         self.assertEqual(locators["login_entry"].clicks, 1)
         self.assertEqual(locators["login_entry"].trial_clicks, 1)
@@ -1179,7 +1251,12 @@ class PreAuthLoginFailureReferenceTests(unittest.TestCase):
         self.assertEqual(locators["submit"].trial_clicks, 1)
         self.assertEqual(locators["username"].typed, 1)
         self.assertEqual(locators["password"].typed, 1)
-        self.assertEqual(locators["billing_manager"].waits, 1)
+        # The landing is proven from the authentication witness alone, and the
+        # retained login route is proven gone by an exact zero count.
+        # Two looks: the count question and the visibility question each
+        # resolve a fresh exact locator, as everywhere else on this ladder.
+        self.assertEqual(page.ems_lookups, 2)
+        self.assertGreaterEqual(page.landing_lookups, 1)
         # Each credential field is focused exactly once and its focus proven
         # exactly once, and neither proof is read before the settle floor.
         self.assertEqual(locators["username"].clicks, 1)
@@ -1189,8 +1266,10 @@ class PreAuthLoginFailureReferenceTests(unittest.TestCase):
         # A healthy non-credential control needs no recovery, so the only cost
         # is the committed post-click focus floor, once per credential field.
         self.assertEqual(page.waited_ms, CREDENTIAL_FOCUS_YIELDS)
-        # A success never consults the alert, so it never takes the rejection arm.
-        self.assertEqual(page.alert_lookups, 0)
+        # The strict rejection witness IS part of the authentication proof, so a
+        # success reads it exactly once and proves its absence by an exact zero
+        # count. It never takes the rejection classification arm.
+        self.assertEqual(page.alert_lookups, 1)
 
     def test_credential_absence_is_referenced_without_touching_the_page(self) -> None:
         page = FakePage(FakeLocator(), FakeLocator(), FakeLocator())
@@ -1247,7 +1326,15 @@ class PreAuthLoginFailureReferenceTests(unittest.TestCase):
         record(self.run_login(login_page(goto_error=step_failure(), alert_visible=True)))
         record(self.run_login(login_page(), credentials=False))
 
-        live = set(cli.SUPPORT_REFS_BY_MESSAGE.values()) - cli.RETIRED_SUPPORT_REFS
+        # The login half of the vocabulary. Business navigation is a separate
+        # contract with its own declared references, reachable only from
+        # `_open_verified_results()`, and is proven complete by
+        # `BusinessNavigationReferenceTests` instead.
+        live = (
+            set(cli.SUPPORT_REFS_BY_MESSAGE.values())
+            - cli.RETIRED_SUPPORT_REFS
+            - cli.NAVIGATION_SUPPORT_REFS
+        )
         self.assertEqual(
             reached,
             live,
@@ -1981,6 +2068,8 @@ class _ResultsControl:
         disabled: bool = False,
         actionable: bool = True,
         on_click=None,
+        href: str | None = None,
+        click_error: Exception | None = None,
     ) -> None:
         self._page = page
         self._key = key
@@ -1990,6 +2079,10 @@ class _ResultsControl:
         self._disabled = disabled
         self._actionable = actionable
         self._on_click = on_click
+        # A navigation link's own target, which is what route proof compares
+        # the current address against. `None` models a link with no target.
+        self._href = href
+        self._click_error = click_error
 
     def count(self) -> int:
         return 1 if self._present else 0
@@ -2005,6 +2098,14 @@ class _ResultsControl:
         self._page.probe_timeouts.append(timeout)
         return self._disabled
 
+    def get_attribute(self, name: str, timeout: int | None = None) -> str | None:
+        assert name == "href", name
+        self._page.probe_timeouts.append(timeout)
+        self._page.href_reads.append(self._key)
+        if self._page.href_read_error is not None:
+            raise self._page.href_read_error
+        return self._href
+
     def click(self, trial: bool = False, timeout: int | None = None) -> None:
         if trial:
             self._page.probe_timeouts.append(timeout)
@@ -2015,6 +2116,10 @@ class _ResultsControl:
             return
         self._page.clicks[self._key] = self._page.clicks.get(self._key, 0) + 1
         self._page.events.append(self._key)
+        if self._click_error is not None:
+            # A dispatch whose outcome cannot be established. It may well have
+            # landed, which is exactly why it must never be sent again.
+            raise self._click_error
         if self._on_click is not None:
             self._on_click()
 
@@ -2214,6 +2319,14 @@ class FakeResultsPage:
         download_delay: int = 0,
         state_attribute_stalls: int = 0,
         state_attribute_error: Exception | None = None,
+        start_route: str = "app",
+        eb_bill_href: str = "/eb-bill",
+        eb_bill_actionable: bool = True,
+        eb_bill_click_error: Exception | None = None,
+        eb_bill_click_inert: bool = False,
+        billing_manager_actionable: bool = True,
+        billing_manager_click_error: Exception | None = None,
+        href_read_error: Exception | None = None,
         clock: RecoveryClock | None = None,
     ) -> None:
         self.clock = clock or RecoveryClock()
@@ -2230,7 +2343,17 @@ class FakeResultsPage:
         self.download_delay = download_delay
         self.state_attribute_stalls = state_attribute_stalls
         self.state_attribute_error = state_attribute_error
-        self.route = "app"
+        self.eb_bill_href = eb_bill_href
+        self.eb_bill_actionable = eb_bill_actionable
+        self.eb_bill_click_error = eb_bill_click_error
+        # A click that lands and changes nothing: the postcondition route never
+        # becomes proven, which is a distinct failure from a click that raised.
+        self.eb_bill_click_inert = eb_bill_click_inert
+        self.billing_manager_actionable = billing_manager_actionable
+        self.billing_manager_click_error = billing_manager_click_error
+        self.href_read_error = href_read_error
+        self.href_reads: list[str] = []
+        self.route = start_route
         self.page_index = 0
         self.searched = False
         self.post_search_pending = 0
@@ -2283,18 +2406,37 @@ class FakeResultsPage:
 
     # -- the slice of the page surface the results route touches -- #
 
+    # Each route has its own address, and only the EB Bill results route
+    # carries query parameters -- which is what route proof must ignore.
+    ROUTE_PATHS = {
+        "app": "/app",
+        "billing": "/billing",
+        # A Tenant-Bill-like route that also renders a tenant/account selector.
+        # Its selector is exactly the evidence the retired shortcut mistook for
+        # proof that EB Bill was already active.
+        "tenant_bill": "/tenant-bill",
+        "results": "/eb-bill",
+    }
+
     @property
     def url(self) -> str:
-        return f"http://synthetic.invalid/results?page={self.page_index + 1}"
+        path = self.ROUTE_PATHS[self.route]
+        if self.route != "results":
+            return "http://synthetic.invalid" + path
+        return (
+            "http://synthetic.invalid"
+            + path
+            + f"?page={self.page_index + 1}&account={self.account}&searched=1#invoices"
+        )
 
     def goto(self, url: str, wait_until: str | None = None) -> None:
         self.events.append("goto")
         self.route = "results"
         self.searched = False
         self.post_search_pending = 0
-        for key in ("account", "invoice-list", "search"):
+        for key in ("account", "invoice-list", "search", "eb_bill"):
             self.reset_looks(key)
-        index = int(url.rsplit("=", 1)[1]) - 1
+        index = int(parse_qs(urlparse(url).query).get("page", ["1"])[0]) - 1
         self.page_index = max(0, min(index, len(self.pages) - 1))
 
     def wait_for_timeout(self, milliseconds: int) -> None:
@@ -2303,7 +2445,12 @@ class FakeResultsPage:
     def get_by_label(self, name: str, exact: bool = False):
         assert name == "Tenant/account", name
         looks = self.bump("account")
-        return _AccountControl(self, self.route == "results" and looks > self.account_delay)
+        # The selector renders on more than one route, which is why its presence
+        # was never proof of the EB Bill route.
+        return _AccountControl(
+            self,
+            self.route in ("results", "tenant_bill") and looks > self.account_delay,
+        )
 
     def get_by_role(self, role: str, name: str | None = None, exact: bool = False):
         if name == "Billing Manager":
@@ -2312,6 +2459,9 @@ class FakeResultsPage:
                 self,
                 "billing_manager",
                 present=self.route == "app" and looks > self.billing_manager_delay,
+                actionable=self.billing_manager_actionable,
+                click_error=self.billing_manager_click_error,
+                href="/billing",
                 on_click=self._open_billing,
             )
         if name == "EB Bill":
@@ -2319,8 +2469,17 @@ class FakeResultsPage:
             return _ResultsControl(
                 self,
                 "eb_bill",
-                present=self.route == "billing" and looks > self.eb_bill_delay,
-                on_click=self._open_results,
+                # The EB Bill nav entry lives on every route that has one,
+                # including the results route itself, so route identity can be
+                # proven from the control's own target.
+                present=(
+                    self.route in ("billing", "tenant_bill", "results")
+                    and looks > self.eb_bill_delay
+                ),
+                actionable=self.eb_bill_actionable,
+                click_error=self.eb_bill_click_error,
+                href=self.eb_bill_href,
+                on_click=None if self.eb_bill_click_inert else self._open_results,
             )
         if name == "Search":
             self.bump("search")
@@ -2649,6 +2808,307 @@ class PortalResultsSettlingTests(unittest.TestCase):
 
 
 
+# ---- DL-XB-141-AUTH-LANDING-NAV-SEPARATION-G2-001: business navigation ---- #
+#
+# Contract B. `_open_verified_results()` owns the Billing Manager / EB Bill
+# route, and route identity is PROVEN rather than inferred. The retired
+# shortcut read the presence of the tenant/account selector as proof that EB
+# Bill was already active; that selector renders on more than one route, so it
+# never proved anything of the kind. These cases drive the real route against
+# the settling fake and assert what was dispatched, what was not, and which
+# failure each surface produces.
+
+
+class BusinessNavigationTests(unittest.TestCase):
+    """The route is proven, the clicks are one-shot, and the failures are distinct."""
+
+    def route(self, **kwargs):
+        clock = RecoveryClock()
+        page = FakeResultsPage(clock=clock, **kwargs)
+        portal = PlaywrightPortal(ResultsConfig(), headed=False)
+        portal.page = page
+        return portal, page, clock
+
+    def open_route(self, **kwargs):
+        """Run the real navigation contract and return what it did."""
+        portal, page, clock = self.route(**kwargs)
+        error = None
+        with simulated_clock(clock):
+            try:
+                portal._open_eb_bill_route(page)
+            except AppError as exc:
+                error = exc
+        return page, error
+
+    # ---- N01-N04: how few clicks each starting route needs ---- #
+
+    def test_a_tenant_account_selector_never_skips_eb_bill(self) -> None:
+        """N01. The retired shortcut's exact evidence, on a Tenant-Bill route.
+
+        The selector is present and resolvable, and the route is NOT EB Bill.
+        The old inference stopped here; the proven contract navigates.
+        """
+        page, error = self.open_route(start_route="tenant_bill")
+        self.assertIsNone(error)
+        self.assertEqual(page.get_by_label("Tenant/account").count(), 1)
+        self.assertEqual(page.route, "results")
+        self.assertEqual(page.clicks, {"eb_bill": 1}, "one EB Bill click, and no more")
+        self.assertNotIn("billing_manager", page.clicks)
+
+    def test_an_already_proven_route_dispatches_nothing(self) -> None:
+        """N02. Route proof is the only thing that may skip a navigation click."""
+        page, error = self.open_route(start_route="results")
+        self.assertIsNone(error)
+        self.assertEqual(page.clicks, {})
+        self.assertEqual(page.events, [])
+        self.assertTrue(page.href_reads, "the route was proven, not assumed")
+
+    def test_direct_eb_bill_availability_needs_no_billing_manager_click(self) -> None:
+        """N03. At most one EB Bill click, and never a Billing Manager click."""
+        page, error = self.open_route(start_route="billing")
+        self.assertIsNone(error)
+        self.assertEqual(page.clicks, {"eb_bill": 1})
+        self.assertEqual(page.route, "results")
+
+    def test_the_outer_app_route_dispatches_each_control_once(self) -> None:
+        """N04. Billing Manager then EB Bill, each exactly once."""
+        page, error = self.open_route(start_route="app")
+        self.assertIsNone(error)
+        self.assertEqual(page.events, ["billing_manager", "eb_bill"])
+        self.assertEqual(page.clicks, {"billing_manager": 1, "eb_bill": 1})
+
+    # ---- N05-N09: the three failure classes, per control ---- #
+
+    def test_a_billing_manager_readiness_failure_is_distinct(self) -> None:
+        """N05. It fails before any dispatch, with its own reference."""
+        page, error = self.open_route(billing_manager_actionable=False)
+        self.assertIsInstance(error, LayoutChangedError)
+        self.assertEqual(error.message, "Billing Manager navigation control is not ready")
+        self.assertEqual(
+            cli.support_ref_for(error), "EG_NAV_BILLING_MANAGER_NOT_READY"
+        )
+        self.assertEqual(page.clicks.get("billing_manager", 0), 0)
+
+    def test_a_billing_manager_click_exception_is_uncertain_and_terminal(self) -> None:
+        """N06. It may have landed, so it is never sent again."""
+        page, error = self.open_route(
+            billing_manager_click_error=RuntimeError(STEP_FAILURE_TEXT)
+        )
+        self.assertIsInstance(error, LayoutChangedError)
+        self.assertEqual(
+            error.message, "Billing Manager navigation dispatch outcome uncertain"
+        )
+        self.assertEqual(
+            cli.support_ref_for(error), "EG_NAV_BILLING_MANAGER_DISPATCH_UNCERTAIN"
+        )
+        self.assertEqual(page.clicks["billing_manager"], 1, "never retried")
+        self.assertNotIn("hunter2", error.message)
+
+    def test_an_eb_bill_readiness_failure_is_distinct(self) -> None:
+        """N07. Readiness is proven before the one dispatch."""
+        page, error = self.open_route(start_route="billing", eb_bill_actionable=False)
+        self.assertIsInstance(error, LayoutChangedError)
+        self.assertEqual(error.message, "EB Bill navigation control is not ready")
+        self.assertEqual(cli.support_ref_for(error), "EG_NAV_EB_BILL_NOT_READY")
+        self.assertEqual(page.clicks.get("eb_bill", 0), 0)
+
+    def test_an_eb_bill_click_exception_is_uncertain_and_terminal(self) -> None:
+        """N08. An uncertain EB Bill dispatch is terminal, with no retry."""
+        page, error = self.open_route(
+            start_route="billing", eb_bill_click_error=RuntimeError(STEP_FAILURE_TEXT)
+        )
+        self.assertIsInstance(error, LayoutChangedError)
+        self.assertEqual(error.message, "EB Bill navigation dispatch outcome uncertain")
+        self.assertEqual(
+            cli.support_ref_for(error), "EG_NAV_EB_BILL_DISPATCH_UNCERTAIN"
+        )
+        self.assertEqual(page.clicks["eb_bill"], 1, "never retried")
+        self.assertNotIn("portal.example.invalid", error.message)
+
+    def test_a_dispatched_click_without_route_proof_fails_closed(self) -> None:
+        """N09. The click landed and the route never became proven."""
+        page, error = self.open_route(start_route="billing", eb_bill_click_inert=True)
+        self.assertIsInstance(error, LayoutChangedError)
+        self.assertEqual(error.message, "EB Bill results route was not proven")
+        self.assertEqual(cli.support_ref_for(error), "EG_NAV_RESULTS_ROUTE_UNPROVED")
+        self.assertEqual(page.clicks["eb_bill"], 1, "a missing postcondition never re-clicks")
+
+    def test_the_three_navigation_failure_classes_are_all_distinct(self) -> None:
+        """One control, three outcomes, three references."""
+        references = set()
+        for kwargs in (
+            {"start_route": "billing", "eb_bill_actionable": False},
+            {"start_route": "billing", "eb_bill_click_error": synthetic_timeout()},
+            {"start_route": "billing", "eb_bill_click_inert": True},
+        ):
+            _page, error = self.open_route(**kwargs)
+            references.add(cli.support_ref_for(error))
+        self.assertEqual(len(references), 3)
+
+    # ---- N10-N13: the selector, the proof, and its privacy ---- #
+
+    def test_no_generic_or_narrowed_navigation_selector_exists(self) -> None:
+        """N10. Exact role and name, never `.first`, never generic text."""
+        seen: list[tuple] = []
+
+        class SelectorRecorder(FakeResultsPage):
+            def get_by_role(self, role, name=None, exact=False):
+                seen.append((role, name, exact))
+                return super().get_by_role(role, name=name, exact=exact)
+
+            def get_by_text(self, *args, **kwargs):
+                raise AssertionError("navigation never resolves a control by text")
+
+        clock = RecoveryClock()
+        page = SelectorRecorder(clock=clock)
+        portal = PlaywrightPortal(ResultsConfig(), headed=False)
+        portal.page = page
+        with simulated_clock(clock):
+            portal._open_eb_bill_route(page)
+        for role, name, exact in seen:
+            with self.subTest(control=name):
+                self.assertIn(name, ("Billing Manager", "EB Bill"))
+                self.assertTrue(exact, "an exact name match is never weakened")
+        source = pathlib_read_portal_source()
+        navigation = source[source.index("def _open_eb_bill_route") : source.index("def _await_post_search_state")]
+        self.assertNotIn(".first", navigation)
+        self.assertNotIn("get_by_text", navigation)
+
+    def test_a_saved_results_route_restores_without_a_navigation_click(self) -> None:
+        """N11. The saved verified-results address is recognised as the route."""
+        portal, page, clock = self.route(pages=(("a.pdf", "b.pdf"), ("c.pdf",)))
+        with tempfile.TemporaryDirectory() as directory:
+            with simulated_clock(clock):
+                inventory = portal.inventory(20)
+                before = dict(page.clicks)
+                portal.download(inventory[0], Path(directory) / "download.bin")
+        self.assertEqual(
+            page.clicks.get("billing_manager", 0),
+            before.get("billing_manager", 0),
+            "restoration re-enters no Billing Manager",
+        )
+        self.assertEqual(
+            page.clicks.get("eb_bill", 0),
+            before.get("eb_bill", 0),
+            "restoration re-enters no EB Bill",
+        )
+        self.assertIn("goto", page.events)
+
+    def test_route_proof_ignores_only_query_and_fragment(self) -> None:
+        """N12. Query and fragment are ignored; nothing else is."""
+        portal, page, _clock = self.route(start_route="results")
+        # The results address carries page, account, searched and a fragment.
+        self.assertIn("?", page.url)
+        self.assertIn("#", page.url)
+        self.assertTrue(portal._eb_bill_route_proven(page))
+        for case, href in (
+            ("different_path", "/tenant-bill"),
+            ("deeper_path", "/eb-bill/extra"),
+            ("cross_origin", "http://other.invalid/eb-bill"),
+            ("cross_scheme", "https://synthetic.invalid/eb-bill"),
+            ("empty_target", ""),
+        ):
+            with self.subTest(case=case):
+                page.eb_bill_href = href
+                self.assertFalse(portal._eb_bill_route_proven(page))
+        # A trailing slash is the same route, and an unreadable target is not.
+        page.eb_bill_href = "/eb-bill/"
+        self.assertTrue(portal._eb_bill_route_proven(page))
+        page.href_read_error = RuntimeError(STEP_FAILURE_TEXT)
+        self.assertFalse(portal._eb_bill_route_proven(page))
+
+    def test_route_proof_emits_nothing_but_a_boolean(self) -> None:
+        """N13. Neither address leaves the proof, on success or on failure."""
+        portal, page, _clock = self.route(start_route="results")
+        self.assertIs(portal._eb_bill_route_proven(page), True)
+        page.eb_bill_href = "/tenant-bill"
+        self.assertIs(portal._eb_bill_route_proven(page), False)
+        _failed, error = self.open_route(start_route="billing", eb_bill_click_inert=True)
+        for fragment in ("http", "synthetic.invalid", "/eb-bill", "?", "#"):
+            with self.subTest(fragment=fragment):
+                self.assertNotIn(fragment, error.message)
+        self.assertNotIn("http", cli.support_ref_for(error))
+
+    def test_an_ambiguous_eb_bill_control_never_proves_the_route(self) -> None:
+        """Ambiguity is drift, and drift is never route proof."""
+
+        class AmbiguousResultsPage(FakeResultsPage):
+            def get_by_role(self, role, name=None, exact=False):
+                control = super().get_by_role(role, name=name, exact=exact)
+                if name == "EB Bill":
+                    control.count = lambda: 2
+                return control
+
+        clock = RecoveryClock()
+        page = AmbiguousResultsPage(clock=clock, start_route="results")
+        portal = PlaywrightPortal(ResultsConfig(), headed=False)
+        portal.page = page
+        self.assertFalse(portal._eb_bill_route_proven(page))
+        self.assertFalse(portal._eb_bill_control_available(page))
+
+    # ---- the downstream contracts stay exactly as they were ---- #
+
+    def test_the_downstream_sequence_is_unchanged_after_route_proof(self) -> None:
+        portal, page, clock = self.route()
+        with simulated_clock(clock):
+            inventory = portal.inventory(20)
+        self.assertEqual([bill.filename for bill in inventory], ["2026-01-01_synthetic.pdf"])
+        self.assertEqual(
+            page.events, ["billing_manager", "eb_bill", "select_account", "search"]
+        )
+        self.assertFalse(page.rows_read_before_search)
+
+
+class BusinessNavigationReferenceTests(unittest.TestCase):
+    """Completeness in both directions for the navigation vocabulary."""
+
+    NAVIGATION_BRANCHES = (
+        {"billing_manager_actionable": False},
+        {"billing_manager_click_error": RuntimeError(STEP_FAILURE_TEXT)},
+        {"start_route": "billing", "eb_bill_actionable": False},
+        {"start_route": "billing", "eb_bill_click_error": RuntimeError(STEP_FAILURE_TEXT)},
+        {"start_route": "billing", "eb_bill_click_inert": True},
+    )
+
+    def test_every_navigation_reference_is_reachable_and_none_is_unmapped(self) -> None:
+        reached: set[str] = set()
+        for kwargs in self.NAVIGATION_BRANCHES:
+            clock = RecoveryClock()
+            page = FakeResultsPage(clock=clock, **kwargs)
+            portal = PlaywrightPortal(ResultsConfig(), headed=False)
+            portal.page = page
+            with simulated_clock(clock):
+                with self.assertRaises(LayoutChangedError) as caught:
+                    portal._open_eb_bill_route(page)
+            error = caught.exception
+            self.assertIn(error.message, cli.SUPPORT_REFS_BY_MESSAGE, error.message)
+            reached.add(cli.support_ref_for(error))
+            # Nothing the raised exception carried may survive into a message.
+            self.assertNotIn("hunter2", error.message)
+            self.assertNotIn("portal.example.invalid", error.message)
+        self.assertEqual(
+            reached,
+            set(cli.NAVIGATION_SUPPORT_REFS),
+            "the declared navigation vocabulary and its reachable branches must match",
+        )
+        self.assertTrue(reached.isdisjoint(cli.RETIRED_SUPPORT_REFS))
+
+    def test_a_navigation_failure_never_reports_a_login_reference(self) -> None:
+        """Billing Manager after a proven landing is navigation, not login."""
+        for kwargs in self.NAVIGATION_BRANCHES:
+            clock = RecoveryClock()
+            page = FakeResultsPage(clock=clock, **kwargs)
+            portal = PlaywrightPortal(ResultsConfig(), headed=False)
+            portal.page = page
+            with simulated_clock(clock):
+                with self.assertRaises(LayoutChangedError) as caught:
+                    portal._open_eb_bill_route(page)
+            reference = cli.support_ref_for(caught.exception)
+            with self.subTest(reference=reference):
+                self.assertFalse(reference.startswith("EG_LOGIN_"))
+                self.assertNotEqual(reference, cli.UNCLASSIFIED_SUPPORT_REF)
+
+
 # ---- DL-XB-141-PORTAL-RESILIENCE-002: single dispatch on the login route ---- #
 #
 # The pre-auth route is where a duplicated dispatch is least recoverable: a
@@ -2794,38 +3254,39 @@ class PortalLoginDispatchTests(unittest.TestCase):
             "proven focus separates the one click from the one typed entry",
         )
 
-    def test_a_delayed_billing_manager_postcondition_never_re_submits(self) -> None:
+    def test_a_delayed_authenticated_landing_never_re_submits(self) -> None:
+        """A landing slow to render the witness is waited for, not re-submitted."""
         submit = FakeLocator(label="submit")
-        pending = FakeLocator(wait_error=synthetic_timeout(), label="pending_billing")
-        settled = FakeLocator(label="billing_manager")
-        page = login_page(submits=[submit], billing_managers=[pending, pending, settled])
+        pending = FakeLocator(count=0, visible=False, label="pending_landing")
+        settled = FakeLocator(label="ems")
+        page = login_page(submits=[submit], emss=[pending, pending, settled])
 
         self.assertIsNone(self.attempt(page))
-        self.assertEqual(submit.clicks, 1, "a slow post-login surface never re-submits the login")
-        self.assertEqual(pending.waits, 2)
-        self.assert_waits_bounded(pending, settled)
+        self.assertEqual(submit.clicks, 1, "a slow landing never re-submits the login")
+        self.assertTrue(page.waited_ms, "the lagging landing cost a bounded yield")
 
-    def test_a_billing_manager_that_never_appears_never_re_submits(self) -> None:
+    def test_a_landing_that_never_proves_never_re_submits(self) -> None:
         submit = FakeLocator(label="submit")
-        pending = FakeLocator(wait_error=synthetic_timeout(), label="pending_billing")
-        page = login_page(submits=[submit], billing_managers=[pending])
+        never = FakeLocator(count=0, visible=False, label="never_landing")
+        page = login_page(submits=[submit], emss=[never])
 
         error = self.attempt(page)
         self.assertIsInstance(error, LayoutChangedError)
-        self.assertEqual(error.message, "Billing Manager entry did not appear after login")
-        self.assertEqual(cli.support_ref_for(error), "EG_LOGIN_BILLING_MANAGER_WAIT_FAILED")
-        self.assertEqual(submit.clicks, 1, "a postcondition timeout never duplicates the submit")
-        self.assert_waits_bounded(pending)
+        self.assertEqual(
+            error.message, "authenticated landing was not proven after login"
+        )
+        self.assertEqual(cli.support_ref_for(error), "EG_LOGIN_AUTHENTICATION_UNPROVED")
+        self.assertEqual(submit.clicks, 1, "an unproved landing never duplicates the submit")
 
     def test_a_settled_rejection_stops_the_post_login_window_early(self) -> None:
-        """A visible alert is an answer, so the window does not run its course.
+        """A visible rejection is an answer, so the window does not run its course.
 
-        Waiting the whole minute out could not change the classification and
-        would delay every rejected credential run by that minute.
+        Waiting the whole minute out could not change the outcome and would
+        delay every rejected credential run by that minute. The authentication
+        witness must be positively ABSENT for this to be a rejection at all.
         """
         submit = FakeLocator(label="submit")
-        never = FakeLocator(count=0, label="never_billing")
-        page = login_page(submits=[submit], billing_managers=[never], alert_visible=True)
+        page = login_page(submits=[submit], landing=False, alert_visible=True)
 
         error = self.attempt(page)
         self.assertIsInstance(error, LoginError)
@@ -2836,19 +3297,255 @@ class PortalLoginDispatchTests(unittest.TestCase):
             CREDENTIAL_FOCUS_YIELDS,
             "a settled rejection is not waited out beyond the credential focus floor",
         )
-        self.assertEqual(never.waits, 0)
 
-    def test_an_ambiguous_post_login_surface_never_re_submits(self) -> None:
-        """Two Billing Manager entries are re-checked, never acted on."""
+    def test_an_ambiguous_authentication_witness_never_re_submits(self) -> None:
+        """Two EMS matches are re-checked, never acted on and never authenticated."""
         submit = FakeLocator(label="submit")
-        ambiguous = FakeLocator(count=2, label="ambiguous_billing")
-        page = login_page(submits=[submit], billing_managers=[ambiguous])
+        ambiguous = FakeLocator(count=2, label="ambiguous_ems")
+        page = login_page(submits=[submit], emss=[ambiguous])
 
         error = self.attempt(page)
         self.assertIsInstance(error, LayoutChangedError)
-        self.assertEqual(cli.support_ref_for(error), "EG_LOGIN_BILLING_MANAGER_WAIT_FAILED")
+        self.assertEqual(cli.support_ref_for(error), "EG_LOGIN_AUTHENTICATION_UNPROVED")
         self.assertEqual(submit.clicks, 1)
-        self.assertEqual(ambiguous.waits, 0, "an ambiguous surface is never asked to wait")
+        self.assertEqual(ambiguous.clicks, 0, "an ambiguous witness is never interacted with")
+
+
+# ---- DL-XB-141-AUTH-LANDING-NAV-SEPARATION-G2-001: authentication ---- #
+#
+# Run125 is consumed, adjudicable and PASS, and it bound the authenticated
+# landing to exactly one witness: role `button`, name `EMS`, exact. These cases
+# hold the whole authentication contract against that witness set and nothing
+# else. They need no browser, no server and no credential: what is under test
+# is what the counts and booleans are allowed to mean.
+
+
+class AuthenticationProofTests(unittest.TestCase):
+    """Contract A: only a clean EMS witness set authenticates."""
+
+    def outcome(self, **overrides) -> str:
+        observation = witnesses(**overrides)
+        return PlaywrightPortal(FakeConfig(), headed=False)._authentication_outcome(
+            observation
+        )
+
+    # ---- A01-A03: what authentication is ---- #
+
+    def test_a_clean_unique_visible_witness_authenticates(self) -> None:
+        """A01. One visible EMS and every retained witness at an exact zero."""
+        self.assertEqual(self.outcome(ems=(1, True)), portal_module.AUTHENTICATED)
+
+    def test_authentication_does_not_need_billing_manager(self) -> None:
+        """A02. Billing Manager is absent, and the landing still authenticates."""
+        observation = witnesses(ems=(1, True), billing_manager=(0, False))
+        portal = PlaywrightPortal(FakeConfig(), headed=False)
+        self.assertEqual(
+            portal._authentication_outcome(observation), portal_module.AUTHENTICATED
+        )
+
+    def test_authentication_survives_an_unreadable_billing_manager(self) -> None:
+        """A03. An unreadable Billing Manager is not authentication evidence."""
+        self.assertEqual(
+            self.outcome(ems=(1, True), billing_manager=(None, None)),
+            portal_module.AUTHENTICATED,
+        )
+
+    # ---- A04-A08: what can never authenticate ---- #
+
+    def test_no_prohibited_substitute_can_authenticate(self) -> None:
+        """A04-A08. None of the corroborating observations is ever proof.
+
+        URL movement, a vanished login route, a Flutter semantics host, a
+        render shell, and a visible Billing Manager are each tried alone and
+        then all together. Without EMS none of them authenticates.
+        """
+        substitutes = {
+            "url_movement": {},
+            "login_controls_gone": {},
+            "semantics_host": {"hosts": {"flt-semantics-host": 1}},
+            "render_shell": {"hosts": {"flt-glass-pane": 1, "canvas": 2}},
+            "billing_manager": {"billing_manager": (1, True)},
+        }
+        for case, override in substitutes.items():
+            with self.subTest(case=case):
+                self.assertEqual(
+                    self.outcome(**override), portal_module.AUTHENTICATION_UNPROVED
+                )
+        combined = witnesses(
+            hosts={"flt-semantics-host": 1, "flt-glass-pane": 1},
+            billing_manager=(1, True),
+        )
+        # The URL-changed observation exists on the post-submit shape and is
+        # deliberately not part of the authentication witness set at all.
+        combined["url_changed"] = True
+        portal = PlaywrightPortal(FakeConfig(), headed=False)
+        self.assertEqual(
+            portal._authentication_outcome(combined),
+            portal_module.AUTHENTICATION_UNPROVED,
+            "every corroborating observation together is still not proof",
+        )
+
+    # ---- A09-A13: fail-closed readings ---- #
+
+    def test_every_unusable_witness_reading_fails_closed(self) -> None:
+        """A09-A12. Missing, duplicate, hidden and unreadable all fail closed."""
+        for case, override in (
+            ("missing", {"ems": (0, False)}),
+            ("duplicate", {"ems": (2, True)}),
+            ("hidden", {"ems": (1, False)}),
+            ("unreadable_count", {"ems": (None, None)}),
+            ("unreadable_visibility", {"ems": (1, None)}),
+        ):
+            with self.subTest(case=case):
+                self.assertEqual(
+                    self.outcome(**override), portal_module.AUTHENTICATION_UNPROVED
+                )
+
+    def test_a_rejection_reader_failure_never_becomes_rejection_absent(self) -> None:
+        """A13. The strict witness is null, so neither arm can be satisfied."""
+        self.assertEqual(
+            self.outcome(ems=(1, True), rejection=(None, None)),
+            portal_module.AUTHENTICATION_UNPROVED,
+            "an unreadable rejection is never read as absent",
+        )
+        self.assertEqual(
+            self.outcome(ems=(0, False), rejection=(None, None)),
+            portal_module.AUTHENTICATION_UNPROVED,
+            "an unreadable rejection is never read as a rejection either",
+        )
+        # An ambiguous rejection is unreadable in the same way: strict mode
+        # cannot answer the visibility question for more than one match.
+        self.assertEqual(
+            self.outcome(ems=(1, True), rejection=(2, None)),
+            portal_module.AUTHENTICATION_UNPROVED,
+        )
+
+    # ---- A14-A17: contradictions, and the one true rejection ---- #
+
+    def test_no_contradiction_ever_authenticates(self) -> None:
+        """A14-A16. EMS beside a retained login, gate or rejection is unproved."""
+        for case, override in (
+            ("login", {"login": (1, True, True)}),
+            ("hidden_login", {"login": (1, False, False)}),
+            ("username", {"username": (1, True)}),
+            ("password", {"password": (1, True)}),
+            ("enable_accessibility", {"enable_accessibility": (1, True, True)}),
+            ("rejection", {"alert": True}),
+        ):
+            with self.subTest(case=case):
+                self.assertEqual(
+                    self.outcome(ems=(1, True), **override),
+                    portal_module.AUTHENTICATION_UNPROVED,
+                )
+
+    def test_a_visible_rejection_with_the_witness_absent_rejects(self) -> None:
+        """A17. The one reading that establishes rejection."""
+        self.assertEqual(
+            self.outcome(ems=(0, False), alert=True), portal_module.REJECTED
+        )
+        # And an unreadable witness count is not "positively absent".
+        self.assertEqual(
+            self.outcome(ems=(None, None), alert=True),
+            portal_module.AUTHENTICATION_UNPROVED,
+        )
+
+    def test_the_witness_identity_is_exactly_the_run125_locator(self) -> None:
+        """The bound witness, stated as the exact role and name it must be."""
+        self.assertEqual(portal_module.AUTHENTICATION_WITNESS_ROLE, "button")
+        self.assertEqual(portal_module.AUTHENTICATION_WITNESS_NAME, "EMS")
+        looked_up: list[tuple] = []
+
+        class WitnessRecorder(FakePage):
+            def get_by_role(self, role, name=None, exact=False):
+                looked_up.append((role, name, exact))
+                return super().get_by_role(role, name=name, exact=exact)
+
+        page = login_page(page_cls=WitnessRecorder)
+        portal = PlaywrightPortal(FakeConfig(), headed=False)
+        portal.page = page
+        portal._observe_authentication_witnesses(page, 1000)
+        self.assertIn(("button", "EMS", True), looked_up)
+
+
+class AuthenticatedLandingWindowTests(unittest.TestCase):
+    """Contract A end to end, through the real `login()` and its bounded window."""
+
+    def attempt(self, page: FakePage):
+        portal = PlaywrightPortal(FakeConfig(), headed=False)
+        portal.page = page
+        old = {
+            name: os.environ.get(name)
+            for name in ("ENERGYGRID_USERNAME", "ENERGYGRID_PASSWORD")
+        }
+        os.environ.update(runtime_credentials())
+        try:
+            with mock.patch.object(portal_module, "time", create=True) as clock:
+                clock.monotonic.side_effect = page.simulated_monotonic
+                portal.login()
+        except AppError as exc:
+            return exc
+        finally:
+            for name, value in old.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+        return None
+
+    def test_a_clean_landing_returns_without_touching_billing_manager(self) -> None:
+        """`login() -> None` means the landing was proven, and nothing more."""
+        billing_manager = FakeLocator(count=0, visible=False, label="no_billing")
+        page = login_page(billing_manager=billing_manager)
+        self.assertIsNone(self.attempt(page))
+        self.assertEqual(billing_manager.clicks, 0)
+        self.assertEqual(billing_manager.waits, 0)
+
+    def test_a_retained_login_route_beside_the_witness_fails_closed(self) -> None:
+        page = login_page(retained_login=True)
+        error = self.attempt(page)
+        self.assertIsInstance(error, LayoutChangedError)
+        self.assertEqual(cli.support_ref_for(error), "EG_LOGIN_AUTHENTICATION_UNPROVED")
+
+    def test_a_hidden_witness_fails_closed(self) -> None:
+        page = login_page(ems=FakeLocator(visible=False, label="hidden_ems"))
+        error = self.attempt(page)
+        self.assertIsInstance(error, LayoutChangedError)
+        self.assertEqual(cli.support_ref_for(error), "EG_LOGIN_AUTHENTICATION_UNPROVED")
+
+    def test_an_unreadable_witness_fails_closed(self) -> None:
+        page = login_page(
+            ems=FakeLocator(state_error=RuntimeError("strict mode violation"))
+        )
+        error = self.attempt(page)
+        self.assertIsInstance(error, LayoutChangedError)
+        self.assertEqual(cli.support_ref_for(error), "EG_LOGIN_AUTHENTICATION_UNPROVED")
+
+    def test_an_unreadable_rejection_beside_a_clean_witness_fails_closed(self) -> None:
+        """The strict reader failing is never "rejection absent"."""
+        page = login_page(
+            rejection=FakeLocator(state_error=RuntimeError("strict mode violation"))
+        )
+        error = self.attempt(page)
+        self.assertIsInstance(error, LayoutChangedError)
+        self.assertEqual(cli.support_ref_for(error), "EG_LOGIN_AUTHENTICATION_UNPROVED")
+
+    def test_a_witness_beside_a_visible_rejection_is_not_a_rejection(self) -> None:
+        """The contradiction fails closed rather than reporting a rejection."""
+        page = login_page(alert_visible=True)
+        error = self.attempt(page)
+        self.assertIsInstance(error, LayoutChangedError)
+        self.assertEqual(cli.support_ref_for(error), "EG_LOGIN_AUTHENTICATION_UNPROVED")
+        self.assertNotEqual(cli.support_ref_for(error), "EG_LOGIN_PORTAL_REJECTED")
+
+    def test_the_authentication_window_stays_inside_the_shared_deadline(self) -> None:
+        page = login_page(landing=False)
+        error = self.attempt(page)
+        self.assertIsInstance(error, LayoutChangedError)
+        self.assertLessEqual(
+            page.simulated_elapsed_ms() / 1000.0,
+            portal_module.PORTAL_RECOVERY_DEADLINE_SECONDS,
+            "the authentication window reuses the shared ceiling and never raises it",
+        )
 
 
 # ---- DL-XB-141-PASSWORD-FOCUS-SETTLE-001: the credential focus gate ---- #
@@ -3196,6 +3893,12 @@ class CredentialFocusSettleTests(unittest.TestCase):
 # that no business path is reachable from it.
 
 
+def pathlib_read_portal_source() -> str:
+    """Return the committed portal source, for source-shape assertions."""
+
+    return Path(portal_module.__file__).read_text(encoding="utf-8")
+
+
 def witnesses(
     *,
     hosts=None,
@@ -3205,19 +3908,28 @@ def witnesses(
     password=(0, False),
     login=(0, False, False),
     enable_accessibility=(0, False, False),
+    ems=(0, False),
+    rejection=None,
     alert: bool = False,
 ) -> dict:
-    """Build one observation in exactly the shape the portal produces."""
+    """Build one observation in exactly the shape the portal produces.
+
+    `rejection` defaults to the strict witness a surface with `alert` either
+    has or positively lacks. A case that needs an UNREADABLE rejection reader,
+    or one whose count and visibility disagree, states it explicitly.
+    """
 
     host_counts = {tag: 0 for tag in portal_module.DIAGNOSTIC_HOST_TAGS}
     host_counts.update(hosts or {})
+    if rejection is None:
+        rejection = (1, True) if alert else (0, False)
     return {
         "hosts": host_counts,
         "semantics_placeholder": {
             "count": placeholder,
             "present": None if placeholder is None else placeholder > 0,
         },
-        "billing_manager": {"count": billing_manager[0], "visible": billing_manager[1]},
+        "ems": {"count": ems[0], "visible": ems[1]},
         "username": {"count": username[0], "visible": username[1]},
         "password": {"count": password[0], "visible": password[1]},
         "login": {"count": login[0], "visible": login[1], "actionable": login[2]},
@@ -3226,6 +3938,8 @@ def witnesses(
             "visible": enable_accessibility[1],
             "actionable": enable_accessibility[2],
         },
+        "rejection": {"count": rejection[0], "visible": rejection[1]},
+        "billing_manager": {"count": billing_manager[0], "visible": billing_manager[1]},
         "visible_alert": alert,
     }
 
@@ -3245,6 +3959,11 @@ ALERT_SURFACE = witnesses(
     login=(1, True, True),
     alert=True,
 )
+# The clean authenticated landing Run125 bound: exactly one visible EMS witness
+# with every retained login, accessibility and rejection witness at an exact
+# zero count. It deliberately carries NO Billing Manager, because Billing
+# Manager is not an authentication oracle.
+AUTHENTICATED_LANDING = witnesses(hosts={"flt-semantics-host": 1}, ems=(1, True))
 
 
 class WitnessLocator:
@@ -3300,7 +4019,9 @@ class WitnessPage:
 
     @property
     def observations(self) -> int:
-        return len([name for name in self.lookups if name == "role:alert:None"])
+        return len(
+            [name for name in self.lookups if name == "locator:flt-semantics-host"]
+        )
 
     def wait_for_timeout(self, milliseconds: int) -> None:
         self.waited_ms.append(int(milliseconds))
@@ -3318,12 +4039,15 @@ class WitnessPage:
     def get_by_role(self, role: str, name: str | None = None, exact: bool = False):
         self.lookups.append(f"role:{role}:{name}")
         if role == "alert":
-            visible = bool(self.state["visible_alert"])
-            return WitnessLocator(1 if visible else 0, visible, False)
+            # The strict rejection witness: an exact count, a visibility, or an
+            # unreadable null. A reader failure is never "rejection absent".
+            witness = self.state["rejection"]
+            return WitnessLocator(witness["count"], witness["visible"], False)
         key = {
             "Billing Manager": "billing_manager",
             "Login": "login",
             "Enable accessibility": "enable_accessibility",
+            "EMS": "ems",
         }[name]
         witness = self.state[key]
         return WitnessLocator(
@@ -3347,12 +4071,16 @@ ALLOWED_OBSERVATION_LOOKUPS = [
     "locator:flt-scene-host",
     "locator:canvas",
     "locator:flt-semantics-placeholder",
-    "role:link:Billing Manager",
+    # The shared authentication witness set, read in one place for both the
+    # normal login path and the diagnostic.
+    "role:button:EMS",
     "label:Username",
     "label:Password",
     "role:button:Login",
     "role:button:Enable accessibility",
     "role:alert:None",
+    # The Billing Manager observation, which remains an observation only.
+    "role:link:Billing Manager",
 ]
 
 
@@ -3412,10 +4140,11 @@ class LoginDiagnosticSequenceTests(unittest.TestCase):
 
         result = self.run_diagnostic(page)
         self.assertEqual(result.submit_outcome, portal_module.SUBMIT_DISPATCHED)
-        # The committed successful sequence, minus only the post-login settle
-        # the diagnostic deliberately never performs.
-        dispatched = len(SUCCESSFUL_LOGIN_SEQUENCE) - 1
-        self.assertEqual(journal[:dispatched], SUCCESSFUL_LOGIN_SEQUENCE[:-1])
+        # The committed successful sequence in full: `login()` now ends at the
+        # one submit dispatch too, because the authentication proof that
+        # follows it dispatches nothing.
+        dispatched = len(SUCCESSFUL_LOGIN_SEQUENCE)
+        self.assertEqual(journal[:dispatched], SUCCESSFUL_LOGIN_SEQUENCE)
         # Everything the bounded observation adds is a bare event-loop yield.
         # The provisional surface it is given keeps the window looking, and
         # looking dispatches nothing at all.
@@ -3484,6 +4213,38 @@ class LoginDiagnosticSequenceTests(unittest.TestCase):
             "observation never promotes an uncertain dispatch to a proven one",
         )
 
+    def test_the_result_carries_the_authentication_verdict_it_observed(self) -> None:
+        """The verdict comes from the settled post-submit observation only."""
+        page = login_page()
+        result = self.run_diagnostic(page, observations=(AUTHENTICATED_LANDING,))
+        self.assertEqual(
+            result.classification, portal_module.AUTHENTICATED_LANDING_PROVEN
+        )
+        self.assertEqual(result.authentication_outcome, portal_module.AUTHENTICATED)
+
+        rejected = witnesses(hosts={"flt-semantics-host": 1}, alert=True)
+        result = self.run_diagnostic(login_page(), observations=(rejected,))
+        self.assertEqual(result.classification, portal_module.VISIBLE_ALERT)
+        self.assertEqual(result.authentication_outcome, portal_module.REJECTED)
+
+        result = self.run_diagnostic(login_page(), observations=(SEMANTICS_ONLY,))
+        self.assertEqual(
+            result.classification,
+            portal_module.SEMANTICS_HOST_PRESENT_WITHOUT_APP_CONTROLS,
+        )
+        self.assertEqual(
+            result.authentication_outcome, portal_module.AUTHENTICATION_UNPROVED
+        )
+
+    def test_a_result_with_nothing_dispatched_is_never_authenticated(self) -> None:
+        """Nothing was sent, so no authentication evidence exists."""
+        submit = FakeLocator(count=0, label="absent_submit")
+        result = self.run_diagnostic(login_page(submits=[submit]))
+        self.assertIs(result.submit_dispatched, False)
+        self.assertEqual(
+            result.authentication_outcome, portal_module.AUTHENTICATION_UNPROVED
+        )
+
     def test_a_pre_dispatch_readiness_failure_reports_not_dispatched(self) -> None:
         submit = FakeLocator(count=0, label="absent_submit")
         page = login_page(submits=[submit])
@@ -3529,11 +4290,15 @@ class LoginDiagnosticSequenceTests(unittest.TestCase):
     def test_no_business_path_is_reachable_from_the_diagnostic(self) -> None:
         """Every post-login application behaviour is made to explode, and none runs."""
         forbidden = (
-            "_await_billing_manager",
-            "_entry_is_visible",
+            "_await_authenticated_landing",
             "inventory",
             "download",
             "_open_verified_results",
+            "_open_eb_bill_route",
+            "_eb_bill_route_proven",
+            "_eb_bill_control_available",
+            "_dispatch_billing_manager",
+            "_dispatch_eb_bill",
             "_await_invoice_list",
             "_advance_page",
             "_restore_page",
@@ -3553,7 +4318,7 @@ class LoginDiagnosticSequenceTests(unittest.TestCase):
             portal_module.SEMANTICS_HOST_PRESENT_WITHOUT_APP_CONTROLS,
         )
 
-    def test_the_normal_login_path_still_settles_on_billing_manager(self) -> None:
+    def test_the_normal_login_path_still_ends_at_the_authenticated_landing(self) -> None:
         """The shared refactor must not have moved `login()` off its own contract."""
         journal: list[str] = []
         page = login_page(
@@ -3563,7 +4328,6 @@ class LoginDiagnosticSequenceTests(unittest.TestCase):
             username_field=FakeLocator(journal=journal, label="username"),
             password_field=FakeLocator(journal=journal, label="password"),
             submit=FakeLocator(journal=journal, label="submit"),
-            billing_manager=FakeLocator(journal=journal, label="billing_manager"),
             journal=journal,
         )
         portal = PlaywrightPortal(FakeConfig(), headed=False)
@@ -3656,6 +4420,40 @@ class LoginDiagnosticObservationTests(unittest.TestCase):
         for document in (observed,):
             self.assertNotIn("url", document)
             self.assertNotIn("http", repr(document))
+
+    def test_the_shared_authentication_witnesses_are_read_in_one_place(self) -> None:
+        """The login path and the diagnostic cannot carry two witness sets."""
+        page = WitnessPage([AUTHENTICATED_LANDING])
+        portal = PlaywrightPortal(FakeConfig(), headed=True)
+        portal.page = page
+        shared = portal._observe_authentication_witnesses(
+            page, portal_module.MAX_PORTAL_PROBE_TIMEOUT_MS
+        )
+        observed = self.observe(WitnessPage([AUTHENTICATED_LANDING]))
+        for name in ("ems", "username", "password", "login", "enable_accessibility", "rejection"):
+            with self.subTest(witness=name):
+                self.assertEqual(shared[name], observed[name])
+        self.assertEqual(
+            set(shared),
+            {"ems", "username", "password", "login", "enable_accessibility", "rejection"},
+            "the authentication reader reads the authentication witnesses and no more",
+        )
+
+    def test_the_historical_alert_boolean_is_derived_from_the_strict_witness(self) -> None:
+        """`visible_alert` is preserved, and absence is never proven from it."""
+        for case, override, expected_alert in (
+            ("visible", {"rejection": (1, True)}, True),
+            ("absent", {"rejection": (0, False)}, False),
+            ("hidden", {"rejection": (1, False)}, False),
+            ("unreadable", {"rejection": (None, None)}, False),
+        ):
+            with self.subTest(case=case):
+                count, visible = override["rejection"]
+                observed = self.observe(WitnessPage([witnesses(**override)]))
+                self.assertIs(observed["visible_alert"], expected_alert)
+                self.assertEqual(
+                    observed["rejection"], {"count": count, "visible": visible}
+                )
 
     def test_the_unobserved_shape_is_the_same_closed_shape(self) -> None:
         observed = self.observe(WitnessPage([SEMANTICS_ONLY]))
@@ -3760,17 +4558,39 @@ class LoginDiagnosticClassificationTests(unittest.TestCase):
         )
 
     def test_every_accepted_classification_has_coverage(self) -> None:
-        """The six are exactly what the portal declares, in priority order."""
+        """The declared vocabulary, in priority order.
+
+        The six historical observational classifications are retained exactly,
+        in their original relative order, and the two authentication
+        classifications are added around them: the proven landing leads, and
+        the positively-counted-but-unproved witness is the last observational
+        arm before the throughout-window disappearance verdict.
+        """
         self.assertEqual(
             portal_module.LOGIN_DIAGNOSTIC_CLASSIFICATIONS,
             (
+                "AUTHENTICATED_LANDING_PROVEN",
                 "BILLING_MANAGER_VISIBLE",
                 "VISIBLE_ALERT",
                 "LOGIN_ROUTE_PERSISTED_OR_RETURNED",
                 "SEMANTICS_HOST_PRESENT_WITHOUT_APP_CONTROLS",
                 "FLUTTER_RENDER_SHELL_PRESENT_SEMANTICS_HOST_ABSENT",
+                "AUTHENTICATION_UNPROVED",
                 "FLUTTER_SHELL_DISAPPEARED_AFTER_SUBMIT",
             ),
+        )
+        # The six historical classifications survive, in their original order.
+        historical = (
+            "BILLING_MANAGER_VISIBLE",
+            "VISIBLE_ALERT",
+            "LOGIN_ROUTE_PERSISTED_OR_RETURNED",
+            "SEMANTICS_HOST_PRESENT_WITHOUT_APP_CONTROLS",
+            "FLUTTER_RENDER_SHELL_PRESENT_SEMANTICS_HOST_ABSENT",
+            "FLUTTER_SHELL_DISAPPEARED_AFTER_SUBMIT",
+        )
+        declared = portal_module.LOGIN_DIAGNOSTIC_CLASSIFICATIONS
+        self.assertEqual(
+            tuple(name for name in declared if name in historical), historical
         )
 
     # ---- settling: only two outcomes are terminal on sight ---- #
@@ -3779,11 +4599,17 @@ class LoginDiagnosticClassificationTests(unittest.TestCase):
     # the login route it came from and through a bare shell, so concluding
     # either on sight ended the observation before Billing Manager appeared.
 
-    def test_the_settling_split_covers_the_accepted_six_in_order(self) -> None:
-        """The split is over the existing vocabulary; it adds and reorders nothing."""
+    def test_the_settling_split_covers_the_declared_vocabulary_in_order(self) -> None:
+        """The split is over the declared vocabulary; it reorders nothing.
+
+        A clean authenticated landing joins the terminal group, because a later
+        look cannot improve on positive authentication proof. A contradictory
+        or incomplete authentication reading is provisional like every other
+        unsettled surface.
+        """
         self.assertEqual(
             portal_module.DIAGNOSTIC_IMMEDIATE_CLASSIFICATIONS,
-            ("BILLING_MANAGER_VISIBLE", "VISIBLE_ALERT"),
+            ("AUTHENTICATED_LANDING_PROVEN", "BILLING_MANAGER_VISIBLE", "VISIBLE_ALERT"),
         )
         self.assertEqual(
             portal_module.DIAGNOSTIC_CONTINUABLE_CLASSIFICATIONS,
@@ -3791,6 +4617,7 @@ class LoginDiagnosticClassificationTests(unittest.TestCase):
                 "LOGIN_ROUTE_PERSISTED_OR_RETURNED",
                 "SEMANTICS_HOST_PRESENT_WITHOUT_APP_CONTROLS",
                 "FLUTTER_RENDER_SHELL_PRESENT_SEMANTICS_HOST_ABSENT",
+                "AUTHENTICATION_UNPROVED",
             ),
         )
         self.assertEqual(
@@ -3858,6 +4685,97 @@ class LoginDiagnosticClassificationTests(unittest.TestCase):
         self.assertEqual(
             page.observations, len(portal_module.PORTAL_RECOVERY_ATTEMPTS_MS)
         )
+
+    # ---- DL-XB-141-AUTH-LANDING-NAV-SEPARATION-G2-001 ---- #
+
+    def test_a_clean_authenticated_landing_classifies_and_settles_at_once(self) -> None:
+        """D04. The proven landing leads the priority order and is terminal."""
+        self.assertEqual(
+            self.classify(AUTHENTICATED_LANDING),
+            portal_module.AUTHENTICATED_LANDING_PROVEN,
+        )
+        page, _observed, classification = self.settle([AUTHENTICATED_LANDING])
+        self.assertEqual(classification, portal_module.AUTHENTICATED_LANDING_PROVEN)
+        self.assertEqual(
+            page.waited_ms, [], "positive authentication proof is not waited out"
+        )
+
+    def test_the_landing_classification_needs_no_billing_manager(self) -> None:
+        """A02 at the classifier: Billing Manager is not an authentication oracle."""
+        self.assertEqual(AUTHENTICATED_LANDING["billing_manager"]["count"], 0)
+        self.assertEqual(
+            self.classify(AUTHENTICATED_LANDING),
+            portal_module.AUTHENTICATED_LANDING_PROVEN,
+        )
+        # And a Billing Manager on its own still classifies as it always did,
+        # while saying nothing at all about authentication.
+        self.assertEqual(
+            self.classify(BILLING_MANAGER_READY), portal_module.BILLING_MANAGER_VISIBLE
+        )
+
+    def test_a_clean_rejection_classifies_as_the_historical_alert(self) -> None:
+        """D05. The rejection reading keeps its historical classification."""
+        rejection = witnesses(hosts={"flt-semantics-host": 1}, alert=True)
+        self.assertEqual(self.classify(rejection), portal_module.VISIBLE_ALERT)
+        portal = PlaywrightPortal(FakeConfig(), headed=True)
+        self.assertEqual(
+            portal._authentication_outcome(rejection), portal_module.REJECTED
+        )
+
+    def test_a_counted_witness_that_never_proves_classifies_as_unproved(self) -> None:
+        """The last observational arm, and only from positive evidence."""
+        for case, override in (
+            ("duplicate", {"ems": (2, True)}),
+            ("hidden", {"ems": (1, False)}),
+            ("contradicted_by_a_hidden_login", {"ems": (1, True), "login": (1, False, False)}),
+        ):
+            with self.subTest(case=case):
+                state = witnesses(hosts={"flt-semantics-host": 1}, **override)
+                self.assertEqual(
+                    self.classify(state), portal_module.AUTHENTICATION_UNPROVED
+                )
+        # An unreadable witness is not evidence about authentication, and an
+        # absent one is not either: both still classify as nothing at all.
+        for case, override in (
+            ("unreadable", {"ems": (None, None)}),
+            ("absent", {"ems": (0, False)}),
+        ):
+            with self.subTest(case=case):
+                self.assertIsNone(
+                    self.classify(witnesses(billing_manager=(1, False), **override))
+                )
+
+    def test_a_counted_witness_blocks_a_shell_classification(self) -> None:
+        """EMS is an application control, so it blocks a shell-only reading."""
+        self.assertIn("ems", portal_module.DIAGNOSTIC_CONTROL_WITNESSES)
+        state = witnesses(hosts={"flt-semantics-host": 1}, ems=(1, False))
+        self.assertNotEqual(
+            self.classify(state),
+            portal_module.SEMANTICS_HOST_PRESENT_WITHOUT_APP_CONTROLS,
+        )
+
+    def test_a_transient_unproved_witness_does_not_end_the_window(self) -> None:
+        """A landing that settles late is still reached inside the window."""
+        early = witnesses(hosts={"flt-semantics-host": 1}, ems=(2, True))
+        page, _observed, classification = self.settle(
+            [early, early, AUTHENTICATED_LANDING]
+        )
+        self.assertEqual(classification, portal_module.AUTHENTICATED_LANDING_PROVEN)
+        self.assertEqual(page.observations, 3)
+
+    def test_a_historical_shell_reading_carries_an_unproved_outcome(self) -> None:
+        """D06. Diagnostically complete, and still not authenticated."""
+        portal = PlaywrightPortal(FakeConfig(), headed=True)
+        for state in (SEMANTICS_ONLY, SHELL_ONLY, BILLING_MANAGER_READY, LOGIN_ROUTE_ONLY):
+            with self.subTest(state=self.classify(state)):
+                self.assertIn(state["ems"]["count"], (0,))
+                self.assertEqual(
+                    portal._authentication_outcome(state),
+                    portal_module.AUTHENTICATION_UNPROVED,
+                )
+                self.assertIn(
+                    self.classify(state), portal_module.LOGIN_DIAGNOSTIC_CLASSIFICATIONS
+                )
 
     # ---- Web's visibility and absence clarification ---- #
 
@@ -4158,7 +5076,13 @@ class LoginDiagnosticUnexpectedFailureTests(unittest.TestCase):
         submit = FakeLocator(label="submit")
         page = login_page(page_cls=UnobservablePage, submit=submit)
         with contextlib.ExitStack() as stack:
-            for name in ("_await_billing_manager", "inventory", "download"):
+            for name in (
+                "_await_authenticated_landing",
+                "_open_verified_results",
+                "_open_eb_bill_route",
+                "inventory",
+                "download",
+            ):
                 stack.enter_context(mock.patch.object(PlaywrightPortal, name, explode))
             exit_code, out, _err, _credentials = self.run_cli_diagnostic(page)
         self.assertEqual(exit_code, 20)

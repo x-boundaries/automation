@@ -7817,6 +7817,10 @@ class SupportReferenceStaticGuards(TierCBase):
         )
         for text in self.sources.values():
             self.assertIsNone(re.search(r"\bEG_LOGIN_[A-Z0-9_]+", text))
+            # The application's business-navigation half is application
+            # vocabulary too, and stays out of the runtime just as the login
+            # half does (DL-XB-141-AUTH-LANDING-NAV-SEPARATION-G2-001).
+            self.assertIsNone(re.search(r"\bEG_NAV_[A-Z0-9_]+", text))
             self.assertIsNone(re.search(r"\bAPP_ERROR_[A-Z0-9_]+", text))
 
     def test_the_unclassified_reference_is_the_only_fallback(self):
@@ -8343,7 +8347,12 @@ class RuntimeDocumentation(TierCBase):
         text = DESIGN_DOCUMENT.read_text(encoding="utf-8")
         self.assertIn("DL-XB-141-RUNTIME-005-SOURCE-DURABILITY-A1", text)
         self.assertIn("### 5.4 Bounded login diagnostic operation", text)
+        # DL-XB-141-AUTH-LANDING-NAV-SEPARATION-G2-001: the active schema is
+        # v2, and v1 survives only as documented historical evidence.
+        self.assertIn("energygrid.login_diagnostic.v2", text)
         self.assertIn("energygrid.login_diagnostic.v1", text)
+        prose_text = normalised_prose(text)
+        self.assertIn("historical documentation", prose_text)
         prose = normalised_prose(text)
         for phrase in (
             "every other clause of `dl-xb-141-runtime-005-source-durability` remains "
@@ -8366,7 +8375,10 @@ class RuntimeDocumentation(TierCBase):
         for phrase in (
             "accepts `--config` and nothing else",
             "rejects `--headed`",
-            "energygrid.login_diagnostic.v1",
+            # The active schema, plus the invariants v2 added.
+            "energygrid.login_diagnostic.v2",
+            "`authentication_outcome`",
+            "`navigation_status` is always `not_tested`",
             "never exits `10`",
         ):
             with self.subTest(phrase=phrase):

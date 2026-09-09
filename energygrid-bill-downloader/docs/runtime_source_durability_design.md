@@ -328,8 +328,33 @@ drift apart. There remains exactly one normal `submit.click()` call site, no sub
 fallback, no alternate selector, and no submit retry.
 
 Where the two paths differ is what happens next. `login()` continues into
-`_await_billing_manager()` exactly as before. The diagnostic stops the normal
-application flow at the submit and performs only a bounded read-only observation.
+`_await_authenticated_landing()` and ends there
+(`DL-XB-141-AUTH-LANDING-NAV-SEPARATION-G2-001`, superseding the
+`_await_billing_manager()` wait this section originally described). The
+diagnostic stops the normal application flow at the submit and performs only a
+bounded read-only observation.
+
+**Authentication and navigation are two contracts.** A normal `login()` return
+means one thing: the authenticated landing was positively proven. Billing
+Manager is not an authentication oracle, so a Billing Manager that never
+becomes usable is a navigation failure owned by `_open_verified_results()`
+rather than a login failure. The authentication witness is exactly
+`get_by_role("button", name="EMS", exact=True)`, bound by Run125. A clean
+`AUTHENTICATED` reading requires exactly one visible witness together with an
+exact zero count for Username, Password, the exact `Login` control, the exact
+`Enable accessibility` gate, and the strict rejection witness. A positively
+visible rejection with the authentication witness positively absent is
+`REJECTED` and keeps the existing `EG_LOGIN_PORTAL_REJECTED` contract.
+Everything else -- missing, duplicate, hidden or unreadable witness, a retained
+login route or accessibility gate, unreadable rejection evidence, or any
+contradictory combination -- is bounded `AUTHENTICATION_UNPROVED` and records
+`EG_LOGIN_AUTHENTICATION_UNPROVED`. URL movement, the disappearance of the
+Login control, Flutter shell or semantics counts, Billing Manager visibility,
+EB Bill visibility, tenant/account-selector presence and owner observation may
+corroborate but never establish authentication. The rejection witness is
+strict -- an exact count and a visibility, or null -- so a reader failure is
+never read as "rejection absent". Submit dispatch uncertainty remains terminal
+and is never retried.
 
 **Submit uncertainty.** The real submit invocation is the explicit one-shot boundary.
 Once invocation begins the submit is recorded as dispatched: a successful call reports
@@ -342,10 +367,12 @@ converted into a proven successful dispatch.
 **Observation allowlist.** Only fixed public-safe counts and booleans are read:
 host and render counts for `flt-glass-pane`, `flt-semantics-host`, `flt-semantics`,
 `flt-text-editing-host`, `flt-scene-host` and `canvas`; the count and presence of
-`flt-semantics-placeholder`; count and visibility for Billing Manager, Username and
-Password; count, visibility and actionability for the exact `Login` and exact
-`Enable accessibility` controls; a visible-alert boolean; and, after the submit, a
-URL-changed boolean. No page text, HTML, DOM dump, accessibility-tree dump, attribute
+`flt-semantics-placeholder`; count and visibility for the exact `EMS`
+authentication witness, Billing Manager, Username and Password; count,
+visibility and actionability for the exact `Login` and exact
+`Enable accessibility` controls; the strict rejection witness as an exact count
+and visibility; the preserved historical visible-alert boolean, now derived
+from that strict witness; and, after the submit, a URL-changed boolean. No page text, HTML, DOM dump, accessibility-tree dump, attribute
 outside these observations, screenshot, trace, storage capture, network capture, or URL
 is read or reported. Locators are freshly resolved at every observation checkpoint. The
 observation runs on the existing bounded portal recovery ladder and deadline; it does
@@ -370,17 +397,34 @@ arm requires, the checkpoint ladder, the 60-second ceiling, the single submit an
 no-retry rule are all unchanged, and an unreadable or ambiguous final observation still
 fails closed with no classification at all.
 
-**Classification.** The first satisfied classification wins, in this order:
+**Classification.** The first satisfied classification wins, in this order.
+The six historical observational classifications are retained exactly, in their
+original relative order, and the two authentication classifications are added
+around them:
 
-1. `BILLING_MANAGER_VISIBLE`
-2. `VISIBLE_ALERT`
-3. `LOGIN_ROUTE_PERSISTED_OR_RETURNED`
-4. `SEMANTICS_HOST_PRESENT_WITHOUT_APP_CONTROLS`
-5. `FLUTTER_RENDER_SHELL_PRESENT_SEMANTICS_HOST_ABSENT`
-6. `FLUTTER_SHELL_DISAPPEARED_AFTER_SUBMIT`
+1. `AUTHENTICATED_LANDING_PROVEN`
+2. `BILLING_MANAGER_VISIBLE`
+3. `VISIBLE_ALERT`
+4. `LOGIN_ROUTE_PERSISTED_OR_RETURNED`
+5. `SEMANTICS_HOST_PRESENT_WITHOUT_APP_CONTROLS`
+6. `FLUTTER_RENDER_SHELL_PRESENT_SEMANTICS_HOST_ABSENT`
+7. `AUTHENTICATION_UNPROVED`
+8. `FLUTTER_SHELL_DISAPPEARED_AFTER_SUBMIT`
 
 Anything else fails closed with no classification at all. Each arm needs positive
 evidence, never the absence of a contradiction:
+
+- `AUTHENTICATED_LANDING_PROVEN` requires the clean `AUTHENTICATED` witness set
+  above. It is terminal on sight, because a later look cannot improve on
+  positive authentication proof.
+- `AUTHENTICATION_UNPROVED` requires the authentication witness to have been
+  READ and positively counted while the landing stayed unproven -- a duplicate,
+  a hidden one, or one standing beside a retained control or a rejection. A
+  witness absent by an exact zero count, or one that could not be read at all,
+  is not evidence about authentication and classifies as nothing. A historical
+  `BILLING_MANAGER_VISIBLE` or shell classification never implies
+  authentication: such a reading may still emit `DIAGNOSTIC_COMPLETE` while
+  `authentication_outcome` is `AUTHENTICATION_UNPROVED`.
 
 - `BILLING_MANAGER_VISIBLE` requires an unambiguous positive visible Billing Manager
   witness. A stale, hidden, or multiple locator does not classify.
@@ -388,9 +432,10 @@ evidence, never the absence of a contradiction:
   Username, Password, or exact Login witness. A locator with a count above zero whose
   matches are all hidden is ambiguous evidence and is not sufficient.
 - The three shell-only classifications require every known post-submit application and
-  public control absent **by count**: Billing Manager, Username, Password, exact Login,
-  and exact `Enable accessibility` all zero. One counted control -- including the public
-  accessibility gate -- blocks all three.
+  public control absent **by count**: the exact `EMS` witness, Billing Manager,
+  Username, Password, exact Login, and exact `Enable accessibility` all zero.
+  One counted control -- including the public accessibility gate and the
+  authentication witness -- blocks all three.
 - With controls absent, a present semantics host or surface yields (4); otherwise a
   present non-semantics render or shell witness yields (5).
 - `FLUTTER_SHELL_DISAPPEARED_AFTER_SUBMIT` additionally requires at least one
@@ -406,7 +451,8 @@ A witness that could not be read is null, and null satisfies neither a positive 
 an absence test, so an unreadable surface fails closed rather than classifying.
 
 **Side-effect boundary.** The diagnostic is structurally unable to reach
-`_await_billing_manager`, the Billing Manager click, EB Bill, tenant or account
+`_await_authenticated_landing`, `_open_verified_results`, the EB Bill route
+proof, the Billing Manager click, the EB Bill click, tenant or account
 selection, Search, inventory, pagination, download, PDF publication, archive mutation,
 state mutation, temp cleanup, idempotency or reconciliation, the Scheduler, n8n, or
 AutoCount. On the application side it loads and validates the configuration without
@@ -418,12 +464,19 @@ typed credentials, at most one normal Login submit, the bounded observation, and
 teardown.
 
 **Result document.** The operation emits exactly one JSON document with schema
-identifier `energygrid.login_diagnostic.v1`, carrying `schema`, `status`,
-`classification`, `submit_dispatched`, `submit_outcome`, `pre_submit`, `post_submit`,
+identifier `energygrid.login_diagnostic.v2`, carrying `schema`, `status`,
+`classification`, `authentication_outcome`, `navigation_status`,
+`submit_dispatched`, `submit_outcome`, `pre_submit`, `post_submit`,
 and `support_ref` on a non-complete result where applicable. `status` is
-`DIAGNOSTIC_COMPLETE` or `ACTION_REQUIRED`; `classification` is one of the six accepted
-values or null; `submit_outcome` is `DISPATCHED`, `DISPATCH_UNCERTAIN`, or
-`NOT_DISPATCHED`. Every remaining value is a count, a boolean, or null. No free-form
+`DIAGNOSTIC_COMPLETE` or `ACTION_REQUIRED`; `classification` is one of the eight
+accepted values or null; `authentication_outcome` is exactly `AUTHENTICATED`,
+`REJECTED`, or `AUTHENTICATION_UNPROVED`; `navigation_status` is the invariant
+`NOT_TESTED`, because the diagnostic never tests business navigation at all;
+`submit_outcome` is `DISPATCHED`, `DISPATCH_UNCERTAIN`, or
+`NOT_DISPATCHED`. The superseded identifier
+`energygrid.login_diagnostic.v1` is retained as historical documentation and
+evidence only: it names what an earlier build emitted and is never the active
+schema. Every remaining value is a count, a boolean, or null. No free-form
 exception text, URL, filesystem path, account identity, host identity, security
 identifier, credential, credential derivative, page text, or business datum is a field,
 so none can reach the surface.
@@ -433,6 +486,37 @@ positively established, `20` for any fail-closed diagnostic, layout, login, or
 insufficient-evidence result, and `64` for a configuration, dependency, or argument
 contract failure. It never emits `10`. The launcher's own `70`-`73` band is unchanged
 and remains disjoint from it.
+
+**Business navigation (Contract B).** `_open_verified_results()` owns the route
+from the authenticated landing to the confirmed post-search invoice list. The
+superseded shortcut inferred the route from the presence of the tenant/account
+selector; that selector renders on more than one route, so its presence never
+proved that EB Bill was active, and the inference is removed. Route identity is
+proven positively by internal-only same-origin path equivalence between the
+current address and the exact `get_by_role("link", name="EB Bill", exact=True)`
+control's own target. Query and fragment are ignored -- and only they -- so an
+already-valid saved results address remains recognised. Neither address is
+returned, logged, raised, or placed on any diagnostic or public-safe surface:
+the proof yields one boolean, and anything unreadable or unparseable fails
+closed as an unproven route. Cross-origin targets never match.
+
+The route is then taken in one of three ways: an already-proven route dispatches
+nothing; a directly available exact EB Bill control is proven ready and
+trial-actionable and clicked exactly once, with no Billing Manager click at all;
+otherwise the exact Billing Manager control is proven ready and clicked exactly
+once, EB Bill readiness is waited for on the shared bounded ladder, and EB Bill
+is clicked exactly once. Every click boundary distinguishes a pre-dispatch
+readiness failure (`EG_NAV_BILLING_MANAGER_NOT_READY`,
+`EG_NAV_EB_BILL_NOT_READY`) from an uncertain dispatch
+(`EG_NAV_BILLING_MANAGER_DISPATCH_UNCERTAIN`,
+`EG_NAV_EB_BILL_DISPATCH_UNCERTAIN`) from a postcondition that never became
+proven (`EG_NAV_RESULTS_ROUTE_UNPROVED`). No click is retried, there is no
+alternate opener, no fallback or generic-text selector, no narrowing of an
+ambiguous match, and no re-login. Once the route is proven, the existing
+tenant/account identity selection and read-back, the one Search dispatch, the
+post-search proof, and the invoice inventory, pagination and download contracts
+are unchanged. `EG_LOGIN_BILLING_MANAGER_WAIT_FAILED` is retired from live
+reachability and retained as a readable historical mapping.
 
 **What A1 does not change.** `run` and `list` behave exactly as before. Scheduler
 semantics are unchanged: the Scheduled Task invokes `run`, and no scheduler artefact

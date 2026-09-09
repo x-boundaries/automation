@@ -6,6 +6,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urljoin, urlparse
 
 from .config import RuntimeConfig
 from .errors import DependencyError, DownloadError, LayoutChangedError, LoginError
@@ -121,8 +122,10 @@ DIAGNOSTIC_HOST_TAGS = DIAGNOSTIC_SEMANTICS_HOST_TAGS + DIAGNOSTIC_RENDER_SHELL_
 
 # Every known post-submit application or public control. A shell-only
 # classification requires all of them absent BY COUNT, so one counted control -
-# including the public `Enable accessibility` gate - blocks it.
+# including the public `Enable accessibility` gate and the authenticated-landing
+# EMS control - blocks it.
 DIAGNOSTIC_CONTROL_WITNESSES = (
+    "ems",
     "billing_manager",
     "username",
     "password",
@@ -130,6 +133,40 @@ DIAGNOSTIC_CONTROL_WITNESSES = (
     "enable_accessibility",
 )
 
+# ---- authentication proof (DL-XB-141-AUTH-LANDING-NAV-SEPARATION-G2-001) ---- #
+#
+# Authentication and business navigation are two independent contracts. Billing
+# Manager is NOT an authentication oracle: Run125 bound the authenticated
+# landing to exactly one witness, and nothing else establishes authentication.
+#
+# The witnesses below are the whole authentication evidence set. They are exact
+# counts, booleans and nulls, so no page text, URL or credential derivative can
+# reach a decision or an output surface.
+AUTHENTICATION_WITNESS_ROLE = "button"
+AUTHENTICATION_WITNESS_NAME = "EMS"
+
+# Every witness that must be positively ABSENT BY EXACT ZERO COUNT for a clean
+# authenticated landing. A retained login route, a retained public
+# accessibility gate, or a rendered rejection contradicts authentication.
+AUTHENTICATION_RETAINED_WITNESSES = (
+    "username",
+    "password",
+    "login",
+    "enable_accessibility",
+)
+
+# The three authentication outcomes. Nothing else is ever reported, and the
+# unproved outcome is the fail-closed default rather than an error case.
+AUTHENTICATED = "AUTHENTICATED"
+REJECTED = "REJECTED"
+AUTHENTICATION_UNPROVED = "AUTHENTICATION_UNPROVED"
+AUTHENTICATION_OUTCOMES = (AUTHENTICATED, REJECTED, AUTHENTICATION_UNPROVED)
+
+# The one message a bounded authentication window that never proved the landing
+# reports. It names the contract that failed, never what was observed.
+AUTHENTICATION_UNPROVED_MESSAGE = "authenticated landing was not proven after login"
+
+AUTHENTICATED_LANDING_PROVEN = "AUTHENTICATED_LANDING_PROVEN"
 BILLING_MANAGER_VISIBLE = "BILLING_MANAGER_VISIBLE"
 VISIBLE_ALERT = "VISIBLE_ALERT"
 LOGIN_ROUTE_PERSISTED_OR_RETURNED = "LOGIN_ROUTE_PERSISTED_OR_RETURNED"
@@ -141,12 +178,26 @@ FLUTTER_SHELL_DISAPPEARED_AFTER_SUBMIT = "FLUTTER_SHELL_DISAPPEARED_AFTER_SUBMIT
 
 # Priority order. The first satisfied classification wins; anything
 # contradictory, ambiguous or insufficient yields no classification at all.
+#
+# `AUTHENTICATED_LANDING_PROVEN` leads, because a clean authentication witness
+# set is the strongest positive evidence the surface can carry and cannot be
+# improved on by looking again. `AUTHENTICATION_UNPROVED` is last of the
+# observational arms and needs its own positive evidence: the authentication
+# witness must have been READ and positively counted while the landing stayed
+# unproven. It is therefore never reached by an empty or unreadable surface,
+# which still fails closed with no classification at all.
+#
+# The six historical classifications are retained exactly, in their original
+# relative order. `BILLING_MANAGER_VISIBLE` and the shell classifications
+# remain observations about the surface and never imply authentication.
 LOGIN_DIAGNOSTIC_CLASSIFICATIONS = (
+    AUTHENTICATED_LANDING_PROVEN,
     BILLING_MANAGER_VISIBLE,
     VISIBLE_ALERT,
     LOGIN_ROUTE_PERSISTED_OR_RETURNED,
     SEMANTICS_HOST_PRESENT_WITHOUT_APP_CONTROLS,
     FLUTTER_RENDER_SHELL_PRESENT_SEMANTICS_HOST_ABSENT,
+    AUTHENTICATION_UNPROVED,
     FLUTTER_SHELL_DISAPPEARED_AFTER_SUBMIT,
 )
 
@@ -164,12 +215,36 @@ LOGIN_DIAGNOSTIC_CLASSIFICATIONS = (
 # `FLUTTER_SHELL_DISAPPEARED_AFTER_SUBMIT` belongs to neither group: the
 # classifier never produces it, and it is concluded only from the
 # throughout-window absence test.
-DIAGNOSTIC_IMMEDIATE_CLASSIFICATIONS = (BILLING_MANAGER_VISIBLE, VISIBLE_ALERT)
+# A clean authenticated landing joins the terminal group: it is the positive
+# proof the whole observation exists to find, and a later look cannot improve
+# on it. A contradictory or incomplete authentication reading is provisional
+# like every other unsettled surface and is concluded only from the final look.
+DIAGNOSTIC_IMMEDIATE_CLASSIFICATIONS = (
+    AUTHENTICATED_LANDING_PROVEN,
+    BILLING_MANAGER_VISIBLE,
+    VISIBLE_ALERT,
+)
 DIAGNOSTIC_CONTINUABLE_CLASSIFICATIONS = (
     LOGIN_ROUTE_PERSISTED_OR_RETURNED,
     SEMANTICS_HOST_PRESENT_WITHOUT_APP_CONTROLS,
     FLUTTER_RENDER_SHELL_PRESENT_SEMANTICS_HOST_ABSENT,
+    AUTHENTICATION_UNPROVED,
 )
+
+# ---- business navigation (Contract B) ---- #
+#
+# The exact controls `_open_verified_results()` owns after authentication. They
+# are business navigation, never authentication evidence, and each message
+# below distinguishes a pre-dispatch readiness failure from an uncertain
+# dispatch and from a postcondition that never became proven.
+BILLING_MANAGER_NAV_NAME = "Billing Manager"
+EB_BILL_NAV_NAME = "EB Bill"
+
+NAV_BILLING_MANAGER_NOT_READY_MESSAGE = "Billing Manager navigation control is not ready"
+NAV_BILLING_MANAGER_UNCERTAIN_MESSAGE = "Billing Manager navigation dispatch outcome uncertain"
+NAV_EB_BILL_NOT_READY_MESSAGE = "EB Bill navigation control is not ready"
+NAV_EB_BILL_UNCERTAIN_MESSAGE = "EB Bill navigation dispatch outcome uncertain"
+NAV_RESULTS_ROUTE_UNPROVED_MESSAGE = "EB Bill results route was not proven"
 
 # The one-shot submit boundary, reported rather than inferred.
 SUBMIT_DISPATCHED = "DISPATCHED"
@@ -189,11 +264,15 @@ def unobserved_login_witnesses(include_url: bool = False) -> dict[str, Any]:
     observation: dict[str, Any] = {
         "hosts": {tag: None for tag in DIAGNOSTIC_HOST_TAGS},
         "semantics_placeholder": {"count": None, "present": None},
-        "billing_manager": {"count": None, "visible": None},
+        "ems": {"count": None, "visible": None},
         "username": {"count": None, "visible": None},
         "password": {"count": None, "visible": None},
         "login": {"count": None, "visible": None, "actionable": None},
         "enable_accessibility": {"count": None, "visible": None, "actionable": None},
+        # The strict rejection witness. A reader failure is null, and null is
+        # never read as "rejection absent" anywhere.
+        "rejection": {"count": None, "visible": None},
+        "billing_manager": {"count": None, "visible": None},
         "visible_alert": None,
     }
     if include_url:
@@ -280,6 +359,11 @@ class LoginDiagnosticResult:
     pre_submit: dict[str, Any]
     post_submit: dict[str, Any]
     failure: Any = None
+    # The authentication contract's own verdict, independent of every
+    # observational classification. It defaults to the fail-closed outcome, so
+    # a result built before any authentication evidence exists reports
+    # "unproved" rather than an absent field.
+    authentication_outcome: str = AUTHENTICATION_UNPROVED
 
 
 class PlaywrightPortal:
@@ -546,6 +630,17 @@ class PlaywrightPortal:
     # ---- login ---- #
 
     def login(self) -> None:
+        """End at positively proven authenticated landing, and nothing further.
+
+        A normal return means exactly one thing: the authentication witness set
+        was read and proved a clean authenticated landing. It does not mean the
+        application was entered, that Billing Manager exists, or that any
+        business route is reachable -- `_open_verified_results()` owns all of
+        that (DL-XB-141-AUTH-LANDING-NAV-SEPARATION-G2-001). Billing Manager is
+        no longer consulted here at all, so a Billing Manager that never
+        appears is a navigation failure rather than a login failure.
+        """
+
         username, password = self._require_runtime_credentials()
         page = self._require_page()
         progress = _LoginProgress()
@@ -556,11 +651,13 @@ class PlaywrightPortal:
             # cannot be mistaken for an uncertain click outcome.
             progress.stage_failure = "login submit control could not be resolved"
             self._submit_login(page, progress)
-            progress.stage_failure = "Billing Manager entry did not appear after login"
-            self._await_billing_manager(page)
-        except LayoutChangedError:
+            progress.stage_failure = AUTHENTICATION_UNPROVED_MESSAGE
+            self._await_authenticated_landing(page)
+        except (LayoutChangedError, LoginError):
             # A proven pre-auth contract failure must not be reclassified as a
-            # credential rejection just because the page also renders an alert.
+            # credential rejection just because the page also renders an alert,
+            # and a rejection the authentication window proved positively keeps
+            # its own classification instead of being re-derived from an alert.
             raise
         except Exception as exc:
             raise self._classify_login_stage_failure(page, progress) from exc
@@ -601,11 +698,22 @@ class PlaywrightPortal:
         self._fill_login_field(page, "Password", password)
 
     def _classify_login_stage_failure(self, page: Any, progress: _LoginProgress) -> Exception:
-        """Name the failed step, unless the page has settled on a rejection."""
+        """Name the failed step, unless the page has settled on a rejection.
 
-        if self._visible(page, page.get_by_role("alert")):
+        The rejection witness is the strict one: only an unambiguous positively
+        visible rejection outranks the step marker. A rejection that could not
+        be read is null, so it names the step that failed rather than being
+        read as either a rejection or its absence.
+        """
+
+        if self._positively_visible(self._rejection_witness(page)):
             return LoginError("portal rejected the login")
         return LayoutChangedError(progress.stage_failure)
+
+    def _rejection_witness(self, page: Any) -> dict[str, Any]:
+        """Read the strict rejection witness: exact count, visibility, or null."""
+
+        return self._visibility_witness(lambda: page.get_by_role("alert"))
 
     def _fill_login_field(self, page: Any, label: str, value: str) -> None:
         """Type one exact labelled credential field after proving it ready and focused.
@@ -694,44 +802,110 @@ class PlaywrightPortal:
         except Exception as exc:
             raise LayoutChangedError("login submit dispatch outcome uncertain") from exc
 
-    def _await_billing_manager(self, page: Any) -> None:
-        """Settle on the post-login surface without submitting anything again.
+    def _await_authenticated_landing(self, page: Any) -> None:
+        """Settle on positively proven authentication, or fail closed.
 
-        The failure is left unclassified on purpose: `login()` owns the step
-        marker for this stage and lets a visible alert outrank it, so a slow
-        surface must not pre-empt a credential rejection.
+        This replaces the retired Billing Manager login wait. It submits
+        nothing again, clicks nothing at all, and reads only the authentication
+        witness set on the existing shared bounded ladder with freshly resolved
+        exact locators at every look.
+
+        Only three things can end the window. A clean authenticated landing
+        returns. A positively visible rejection with the authentication witness
+        positively absent raises the existing portal-rejected contract on
+        sight, because a later look could not improve on it. Everything else --
+        a missing, duplicate, hidden or unreadable authentication witness, a
+        retained login route or accessibility gate, unreadable rejection
+        evidence, or any contradictory combination -- stays provisional inside
+        the window and fails closed as unproved once it is spent. URL movement,
+        a vanished Login control, Flutter shell or semantics state, Billing
+        Manager visibility and owner observation are never consulted here, so
+        none of them can stand in for the proof.
         """
 
         def condition(remaining_ms: int) -> bool:
-            if self._entry_is_visible(page, remaining_ms):
+            observation = self._observe_authentication_witnesses(page, remaining_ms)
+            outcome = self._authentication_outcome(observation)
+            if outcome == AUTHENTICATED:
                 return True
-            # A visible alert is a settled answer, not lag. Spending the rest of
-            # the window on it could not change the outcome and would delay a
-            # credential rejection by a minute, so the window stops here and the
-            # caller classifies it exactly as it always has.
-            if self._visible(page, page.get_by_role("alert")):
-                raise _PortalNotSettled("Billing Manager entry did not appear after login")
+            if outcome == REJECTED:
+                # The existing credential-rejection contract, reached from
+                # positive evidence rather than from a generic alert read.
+                raise LoginError("portal rejected the login")
             return False
 
         self._await_condition(
             page,
             condition,
-            "Billing Manager entry",
-            messages=_uniform_messages("Billing Manager control is missing or ambiguous"),
-            classified=False,
+            "authenticated landing",
+            messages=_uniform_messages(AUTHENTICATION_UNPROVED_MESSAGE),
         )
 
-    def _entry_is_visible(self, page: Any, remaining_ms: int) -> bool:
-        """Report whether exactly one Billing Manager entry is visible yet."""
+    def _authentication_outcome(self, observation: Mapping[str, Any]) -> str:
+        """Classify authentication from the exact witness set, fail-closed.
 
-        entry = page.get_by_role("link", name="Billing Manager", exact=True)
-        if entry.count() != 1:
-            return False
-        try:
-            entry.wait_for(state="visible", timeout=self._probe_timeout_ms(remaining_ms))
-        except Exception:
-            return False
-        return True
+        Every arm needs positive evidence. A witness that could not be read is
+        null, and null satisfies neither a positive test nor an absence test,
+        so an unreadable surface is unproved rather than either authenticated
+        or rejected. In particular a strict rejection-reader failure can never
+        become "rejection absent".
+        """
+
+        ems = observation["ems"]
+        rejection = observation["rejection"]
+        if (
+            ems["count"] == 1
+            and ems["visible"] is True
+            and rejection["count"] == 0
+            and all(
+                observation[name]["count"] == 0
+                for name in AUTHENTICATION_RETAINED_WITNESSES
+            )
+        ):
+            return AUTHENTICATED
+        # A rejection may only be concluded while the authentication witness is
+        # positively ABSENT by an exact zero count. Any counted, hidden or
+        # unreadable authentication witness alongside a rejection is a
+        # contradiction, and a contradiction is never a settled answer.
+        if self._positively_visible(rejection) and ems["count"] == 0:
+            return REJECTED
+        return AUTHENTICATION_UNPROVED
+
+    def _observe_authentication_witnesses(
+        self, page: Any, remaining_ms: int
+    ) -> dict[str, Any]:
+        """Read the authentication witness set from fresh exact locators.
+
+        This is the ONE place the authentication witnesses are read. The normal
+        login path and the bounded diagnostic share it, so neither can carry a
+        second witness set or a second notion of what authentication means.
+        Nothing read here is text: the result carries counts, booleans and
+        nulls only, and no URL is read or reported.
+        """
+
+        return {
+            "ems": self._visibility_witness(
+                lambda: page.get_by_role(
+                    AUTHENTICATION_WITNESS_ROLE,
+                    name=AUTHENTICATION_WITNESS_NAME,
+                    exact=True,
+                )
+            ),
+            "username": self._visibility_witness(
+                lambda: page.get_by_label("Username", exact=True)
+            ),
+            "password": self._visibility_witness(
+                lambda: page.get_by_label("Password", exact=True)
+            ),
+            "login": self._actionable_witness(
+                lambda: page.get_by_role("button", name="Login", exact=True), remaining_ms
+            ),
+            "enable_accessibility": self._actionable_witness(
+                lambda: page.get_by_role("button", name="Enable accessibility", exact=True),
+                remaining_ms,
+            ),
+            "rejection": self._rejection_witness(page),
+        }
 
     def _enter_public_semantics(self, page: Any) -> Any:
         """Open the public Flutter semantics gate and return the Login entry.
@@ -793,10 +967,12 @@ class PlaywrightPortal:
         This is the whole diagnostic operation. It reuses the canonical
         pre-submit sequence and the one canonical submit, then performs a
         bounded read-only observation and returns. It never reaches
-        `_await_billing_manager`, the Billing Manager click, EB Bill, tenant or
-        account selection, Search, inventory, pagination, download, publication,
-        archive, state, temp cleanup or reconciliation: none of them is called
-        from here or from anything this calls.
+        `_await_authenticated_landing`, `_open_verified_results`, the EB Bill
+        route proof, the Billing Manager click, the EB Bill click, tenant or
+        account selection, Search, inventory, pagination, download,
+        publication, archive, state, temp cleanup or reconciliation: none of
+        them is called from here or from anything this calls. Business
+        navigation is therefore never tested by the diagnostic at all.
         """
 
         username, password = self._require_runtime_credentials()
@@ -830,6 +1006,7 @@ class PlaywrightPortal:
                 pre_submit=pre_submit,
                 post_submit=unobserved_login_witnesses(include_url=True),
                 failure=failure,
+                authentication_outcome=AUTHENTICATION_UNPROVED,
             )
 
         # A dispatch whose outcome is uncertain is still observed, because the
@@ -858,6 +1035,11 @@ class PlaywrightPortal:
             pre_submit=pre_submit,
             post_submit=post_submit,
             failure=None,
+            # The authentication verdict is read from the settled post-submit
+            # observation and from nothing else. An unobserved shape carries
+            # null witnesses, which is unproved, so a failed observation cannot
+            # report authentication either way.
+            authentication_outcome=self._authentication_outcome(post_submit),
         )
 
     def _observe_after_submit(
@@ -935,6 +1117,8 @@ class PlaywrightPortal:
         an unreadable surface fails closed rather than classifying.
         """
 
+        if self._authentication_outcome(observation) == AUTHENTICATED:
+            return AUTHENTICATED_LANDING_PROVEN
         billing_manager = observation["billing_manager"]
         if billing_manager["count"] == 1 and billing_manager["visible"] is True:
             return BILLING_MANAGER_VISIBLE
@@ -948,7 +1132,7 @@ class PlaywrightPortal:
         ):
             return LOGIN_ROUTE_PERSISTED_OR_RETURNED
         if not self._app_controls_absent(observation):
-            return None
+            return self._unproved_authentication_classification(observation)
         hosts = observation["hosts"]
         if any(hosts[tag] is None for tag in DIAGNOSTIC_HOST_TAGS):
             return None
@@ -956,7 +1140,27 @@ class PlaywrightPortal:
             return SEMANTICS_HOST_PRESENT_WITHOUT_APP_CONTROLS
         if any(hosts[tag] > 0 for tag in DIAGNOSTIC_RENDER_SHELL_TAGS):
             return FLUTTER_RENDER_SHELL_PRESENT_SEMANTICS_HOST_ABSENT
-        return None
+        return self._unproved_authentication_classification(observation)
+
+    @staticmethod
+    def _unproved_authentication_classification(
+        observation: Mapping[str, Any],
+    ) -> str | None:
+        """Classify a positively counted authentication witness that never proved.
+
+        This is the last observational arm and it needs its own positive
+        evidence: the authentication witness must have been READ and counted at
+        least once while the landing stayed unproven -- a duplicate, a hidden
+        one, or one standing beside a retained login control or a rejection.
+        An authentication witness that is absent by an exact zero count, or one
+        that could not be read at all, is not evidence about authentication and
+        still classifies as nothing at all.
+        """
+
+        count = observation["ems"]["count"]
+        if count is None or count == 0:
+            return None
+        return AUTHENTICATION_UNPROVED
 
     @staticmethod
     def _positively_visible(witness: dict[str, Any]) -> bool:
@@ -985,30 +1189,25 @@ class PlaywrightPortal:
         result carries counts, booleans and nulls only.
         """
 
+        # Read in the committed order: the shell surfaces, then the shared
+        # authentication witness set, then the Billing Manager observation.
+        hosts = {tag: self._witness_count(page, tag) for tag in DIAGNOSTIC_HOST_TAGS}
+        placeholder = self._presence_witness(page, "flt-semantics-placeholder")
+        authentication = self._observe_authentication_witnesses(page, remaining_ms)
         observation: dict[str, Any] = {
-            "hosts": {
-                tag: self._witness_count(page, tag) for tag in DIAGNOSTIC_HOST_TAGS
-            },
-            "semantics_placeholder": self._presence_witness(
-                page, "flt-semantics-placeholder"
-            ),
+            "hosts": hosts,
+            "semantics_placeholder": placeholder,
+            **authentication,
             "billing_manager": self._visibility_witness(
                 lambda: page.get_by_role("link", name="Billing Manager", exact=True)
             ),
-            "username": self._visibility_witness(
-                lambda: page.get_by_label("Username", exact=True)
-            ),
-            "password": self._visibility_witness(
-                lambda: page.get_by_label("Password", exact=True)
-            ),
-            "login": self._actionable_witness(
-                lambda: page.get_by_role("button", name="Login", exact=True), remaining_ms
-            ),
-            "enable_accessibility": self._actionable_witness(
-                lambda: page.get_by_role("button", name="Enable accessibility", exact=True),
-                remaining_ms,
-            ),
-            "visible_alert": self._visible(page, page.get_by_role("alert")),
+            # Preserved historical observation, now DERIVED from the strict
+            # rejection witness rather than read again: an unambiguous
+            # positively visible rejection is true, and anything else -- absent,
+            # hidden, ambiguous or unreadable -- is false, exactly as the
+            # original boolean behaved. Absence is never proven from it; that is
+            # what the strict `rejection` witness is for.
+            "visible_alert": self._positively_visible(authentication["rejection"]),
         }
         if entry_url is not None:
             observation["url_changed"] = self._url_changed(page, entry_url)
@@ -1248,6 +1447,15 @@ class PlaywrightPortal:
     # ---- verified results route ---- #
 
     def _open_verified_results(self, entry_url: str | None = None) -> Any:
+        """Own the business route to verified results, after authentication.
+
+        `login()` proves authentication and stops there
+        (DL-XB-141-AUTH-LANDING-NAV-SEPARATION-G2-001). Everything from the
+        Billing Manager entry to the confirmed post-search invoice list belongs
+        here, so a Billing Manager or EB Bill that never becomes usable is a
+        navigation failure and is never reported as a login failure.
+        """
+
         page = self._require_page()
         try:
             if entry_url is not None:
@@ -1256,27 +1464,7 @@ class PlaywrightPortal:
             def account_locator() -> Any:
                 return page.get_by_label("Tenant/account", exact=True)
 
-            if account_locator().count() != 1:
-                # Each click is dispatched once, and the readiness recovery for
-                # the next surface is that click's postcondition: Billing
-                # Manager settles into EB Bill, and EB Bill into the
-                # tenant/account selector.
-                billing_manager = self._resolve_ready_control(
-                    page,
-                    lambda: page.get_by_role("link", name="Billing Manager", exact=True),
-                    "Billing Manager control",
-                    require_trial_actionable=True,
-                    messages=_uniform_messages("Billing Manager control is missing or ambiguous"),
-                )
-                billing_manager.click()
-                eb_bill = self._resolve_ready_control(
-                    page,
-                    lambda: page.get_by_role("link", name="EB Bill", exact=True),
-                    "EB Bill control",
-                    require_trial_actionable=True,
-                    messages=_uniform_messages("EB Bill control is missing or ambiguous"),
-                )
-                eb_bill.click()
+            self._open_eb_bill_route(page)
             account_control = self._resolve_ready_control(
                 page,
                 account_locator,
@@ -1315,6 +1503,147 @@ class PlaywrightPortal:
             raise
         except Exception as exc:
             raise LayoutChangedError("tenant/account search result contract changed") from exc
+
+    def _open_eb_bill_route(self, page: Any) -> None:
+        """Put the page on the exact EB Bill route, dispatching as little as possible.
+
+        The retired shortcut inferred the route from the presence of the
+        tenant/account selector. That inference was invalid: a selector renders
+        on more than one route, so its presence never proved that EB Bill was
+        active. Route identity is now proven positively, and only route proof
+        can skip a navigation click.
+
+        Three cases, in order:
+
+        1. the exact EB Bill route is already proven -- nothing is dispatched;
+        2. the exact EB Bill control is directly available -- exactly one EB
+           Bill click, with no Billing Manager click at all;
+        3. otherwise -- exactly one Billing Manager click, then the bounded
+           wait for EB Bill readiness, then exactly one EB Bill click.
+
+        No click is ever retried, no alternate opener or generic-text selector
+        exists, and an ambiguous match is never narrowed to one of its matches.
+        """
+
+        if self._eb_bill_route_proven(page):
+            return
+        if not self._eb_bill_control_available(page):
+            self._dispatch_billing_manager(page)
+        self._dispatch_eb_bill(page)
+
+    def _eb_bill_control_available(self, page: Any) -> bool:
+        """Report whether exactly one exact EB Bill control resolves right now.
+
+        This only chooses between the direct route and the outer-app route, so
+        it is a single immediate look with no recovery of its own: an
+        unresolvable or ambiguous answer means "not directly available", and
+        the Billing Manager path proves its own readiness afterwards.
+        """
+
+        try:
+            return int(self._eb_bill_locator(page).count()) == 1
+        except Exception:
+            return False
+
+    @staticmethod
+    def _eb_bill_locator(page: Any) -> Any:
+        """Resolve the one exact EB Bill control. Never narrowed, never weakened."""
+
+        return page.get_by_role("link", name=EB_BILL_NAV_NAME, exact=True)
+
+    def _dispatch_billing_manager(self, page: Any) -> None:
+        """Prove the Billing Manager entry ready, then click it exactly once."""
+
+        control = self._resolve_ready_control(
+            page,
+            lambda: page.get_by_role("link", name=BILLING_MANAGER_NAV_NAME, exact=True),
+            "Billing Manager navigation control",
+            require_trial_actionable=True,
+            messages=_uniform_messages(NAV_BILLING_MANAGER_NOT_READY_MESSAGE),
+        )
+        # The explicit dispatch boundary. Once the normal click begins an
+        # exception cannot prove whether the browser acted, so the outcome is
+        # uncertain and terminal, and the click is never sent again.
+        try:
+            control.click()
+        except Exception as exc:
+            raise LayoutChangedError(NAV_BILLING_MANAGER_UNCERTAIN_MESSAGE) from exc
+
+    def _dispatch_eb_bill(self, page: Any) -> None:
+        """Prove EB Bill ready, click it once, then prove the route it opened.
+
+        The three failures stay distinct: a control that never becomes ready
+        fails before any dispatch, a click whose outcome cannot be established
+        is terminal and is never retried, and a dispatched click whose route
+        postcondition never becomes proven fails as an unproven results route
+        rather than being clicked again.
+        """
+
+        control = self._resolve_ready_control(
+            page,
+            lambda: self._eb_bill_locator(page),
+            "EB Bill navigation control",
+            require_trial_actionable=True,
+            messages=_uniform_messages(NAV_EB_BILL_NOT_READY_MESSAGE),
+        )
+        try:
+            control.click()
+        except Exception as exc:
+            raise LayoutChangedError(NAV_EB_BILL_UNCERTAIN_MESSAGE) from exc
+        self._await_condition(
+            page,
+            lambda remaining_ms: self._eb_bill_route_proven(page, remaining_ms),
+            "EB Bill results route",
+            messages=_uniform_messages(NAV_RESULTS_ROUTE_UNPROVED_MESSAGE),
+        )
+
+    def _eb_bill_route_proven(
+        self, page: Any, remaining_ms: int = MAX_PORTAL_PROBE_TIMEOUT_MS
+    ) -> bool:
+        """Report whether the page is on the exact EB Bill route, as a boolean only.
+
+        The proof is internal and privacy-closed. Two addresses are compared
+        inside this method and neither is returned, logged, raised, retained or
+        placed on any diagnostic or public-safe surface: the only thing that
+        leaves is one boolean.
+
+        Equivalence is same-origin plus path. The exact EB Bill control's own
+        target is resolved against the current address, so a relative target is
+        same-origin by construction and a cross-origin target can never match.
+        Query and fragment are ignored -- and only they -- so an already-valid
+        saved results address that carries page, account and search parameters
+        is still recognised as the EB Bill route.
+
+        Anything that cannot be read or parsed is not proof: an absent,
+        ambiguous or unreadable control, a missing target, or an unparseable
+        address all fail closed as an unproven route.
+        """
+
+        try:
+            control = self._eb_bill_locator(page)
+            if int(control.count()) != 1:
+                return False
+            target = control.get_attribute(
+                "href", timeout=self._probe_timeout_ms(remaining_ms)
+            )
+            current = page.url
+            if not target or not current:
+                return False
+            resolved = urlparse(urljoin(str(current), str(target)))
+            here = urlparse(str(current))
+        except Exception:
+            return False
+        if not resolved.scheme or resolved.scheme != here.scheme:
+            return False
+        if not resolved.netloc or resolved.netloc != here.netloc:
+            return False
+        return self._route_path(resolved.path) == self._route_path(here.path)
+
+    @staticmethod
+    def _route_path(path: str) -> str:
+        """Normalise one route path for comparison, without exposing it."""
+
+        return path.rstrip("/") or "/"
 
     def _await_post_search_state(self, page: Any) -> None:
         """Settle on the confirmed post-search result state after one Search."""
