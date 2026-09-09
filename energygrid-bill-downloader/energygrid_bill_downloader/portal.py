@@ -246,6 +246,13 @@ NAV_EB_BILL_NOT_READY_MESSAGE = "EB Bill navigation control is not ready"
 NAV_EB_BILL_UNCERTAIN_MESSAGE = "EB Bill navigation dispatch outcome uncertain"
 NAV_RESULTS_ROUTE_UNPROVED_MESSAGE = "EB Bill results route was not proven"
 
+# What one bounded EB Bill entry observation concluded. Only these three are
+# routing decisions. Ambiguity and an unreadable state are deliberately absent:
+# they are drift, they never become a decision, and they fail closed.
+_EB_BILL_ENTRY_ROUTE_PROVEN = "route proven"
+_EB_BILL_ENTRY_DIRECT_READY = "direct ready"
+_EB_BILL_ENTRY_OUTER = "outer required"
+
 # The one-shot submit boundary, reported rather than inferred.
 SUBMIT_DISPATCHED = "DISPATCHED"
 SUBMIT_DISPATCH_UNCERTAIN = "DISPATCH_UNCERTAIN"
@@ -1513,37 +1520,120 @@ class PlaywrightPortal:
         active. Route identity is now proven positively, and only route proof
         can skip a navigation click.
 
+        Which entry this surface offers is settled first, by one bounded
+        mutation-free observation, and only then is anything dispatched. That
+        ordering is the correction: an immediate single look cannot tell a
+        surface that has no direct EB Bill entry from one that has not finished
+        rendering it yet, so deciding from that look mis-routes a direct or
+        restored EB Bill surface through the outer application -- which is
+        exactly what a saved results address re-entering this method after
+        `goto()` looks like while it settles.
+
         Three cases, in order:
 
-        1. the exact EB Bill route is already proven -- nothing is dispatched;
-        2. the exact EB Bill control is directly available -- exactly one EB
-           Bill click, with no Billing Manager click at all;
-        3. otherwise -- exactly one Billing Manager click, then the bounded
-           wait for EB Bill readiness, then exactly one EB Bill click.
+        1. the exact EB Bill route becomes proven -- nothing is dispatched;
+        2. the exact EB Bill control becomes positively usable -- exactly one
+           EB Bill click, with no Billing Manager click at all;
+        3. the direct control is positively absent or never usable inside the
+           bounded window -- exactly one Billing Manager click, then the
+           bounded wait for EB Bill readiness, then exactly one EB Bill click.
 
-        No click is ever retried, no alternate opener or generic-text selector
-        exists, and an ambiguous match is never narrowed to one of its matches.
+        Ambiguous and unreadable entry states are none of the three and fail
+        closed instead of becoming a routing decision. No click is ever
+        retried, no alternate opener or generic-text selector exists, and an
+        ambiguous match is never narrowed to one of its matches.
         """
 
-        if self._eb_bill_route_proven(page):
+        entry = self._settle_eb_bill_entry(page)
+        if entry == _EB_BILL_ENTRY_ROUTE_PROVEN:
             return
-        if not self._eb_bill_control_available(page):
+        if entry == _EB_BILL_ENTRY_OUTER:
             self._dispatch_billing_manager(page)
         self._dispatch_eb_bill(page)
 
-    def _eb_bill_control_available(self, page: Any) -> bool:
-        """Report whether exactly one exact EB Bill control resolves right now.
+    def _settle_eb_bill_entry(self, page: Any) -> str:
+        """Settle which EB Bill entry this surface offers, dispatching nothing.
 
-        This only chooses between the direct route and the outer-app route, so
-        it is a single immediate look with no recovery of its own: an
-        unresolvable or ambiguous answer means "not directly available", and
-        the Billing Manager path proves its own readiness afterwards.
+        One bounded observation answers both questions the routing decision
+        needs -- whether the exact route is already proven, and whether the
+        exact direct control is genuinely usable -- so a settling surface
+        spends the committed recovery window once rather than once per
+        question.
+
+        The window ends in exactly one of three states. Route proof and a
+        positively usable direct control are each decisive the moment they are
+        observed. A direct control that is merely absent, or present but not
+        yet usable, is an ordinary not-yet state: it keeps being re-observed at
+        the committed checkpoints and only becomes "not directly available"
+        once the window is genuinely exhausted. Ambiguity and an unreadable
+        state are neither -- they are drift, and drift is never narrowed into a
+        direct path nor masked behind the outer one.
         """
 
+        # `_recover` reports only that its window expired, and here two
+        # expiries mean opposite things, so the last verdict it observed is
+        # what separates "no direct entry" from fail-closed drift.
+        observed = [_PORTAL_ABSENT]
+
+        def probe(remaining_ms: int) -> tuple[str, Any]:
+            try:
+                verdict, entry = self._observe_eb_bill_entry(page, remaining_ms)
+            except _ControlUnresolved:
+                observed[0] = _PORTAL_UNRESOLVED
+                raise
+            observed[0] = verdict
+            return verdict, entry
+
         try:
-            return int(self._eb_bill_locator(page).count()) == 1
-        except Exception:
-            return False
+            return self._recover(
+                page,
+                probe,
+                "EB Bill navigation entry",
+                messages=_uniform_messages(NAV_EB_BILL_NOT_READY_MESSAGE),
+                classified=False,
+            )
+        except _PortalNotSettled as exc:
+            if observed[0] in (_PORTAL_ABSENT, _PORTAL_NOT_READY):
+                return _EB_BILL_ENTRY_OUTER
+            raise LayoutChangedError(NAV_EB_BILL_NOT_READY_MESSAGE) from exc
+
+    def _observe_eb_bill_entry(self, page: Any, remaining_ms: int) -> tuple[str, Any]:
+        """Observe the EB Bill entry once. Inspection only, never a dispatch.
+
+        This runs at every checkpoint of the bounded window, so nothing here
+        may be externally meaningful: no navigation, and no real click. Only
+        Playwright's own no-op trial actionability check is used, which is the
+        same predicate `_resolve_ready_control()` proves readiness with.
+
+        Readiness is proven, not inferred from existence. Exactly one exact
+        match is necessary and not sufficient: while a route settles, that one
+        match can still be hidden, disabled or unactionable, and none of those
+        is a usable direct entry. More than one exact match is ambiguity, and a
+        state that cannot be read at all is drift; neither is narrowed here.
+        """
+
+        if self._eb_bill_route_proven(page, remaining_ms):
+            return _PORTAL_READY, _EB_BILL_ENTRY_ROUTE_PROVEN
+        try:
+            control = self._eb_bill_locator(page)
+            count = int(control.count())
+        except Exception as exc:
+            raise _ControlUnresolved(exc) from exc
+        if count == 0:
+            return _PORTAL_ABSENT, None
+        if count > 1:
+            return _PORTAL_AMBIGUOUS, None
+        try:
+            visible = bool(control.is_visible())
+        except Exception as exc:
+            raise _ControlUnresolved(exc) from exc
+        if not visible:
+            return _PORTAL_NOT_READY, None
+        if not self._probe_enabled(control, remaining_ms):
+            return _PORTAL_NOT_READY, None
+        if not self._probe_actionable(control, remaining_ms):
+            return _PORTAL_NOT_READY, None
+        return _PORTAL_READY, _EB_BILL_ENTRY_DIRECT_READY
 
     @staticmethod
     def _eb_bill_locator(page: Any) -> Any:

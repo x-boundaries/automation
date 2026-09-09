@@ -1358,6 +1358,14 @@ def synthetic_timeout() -> SyntheticTimeoutError:
 # Asserted independently of the production constants, so a case fails if the
 # committed ceiling or per-probe cap is widened rather than silently tracking it.
 RECOVERY_CEILING_MS = 60_000
+
+# The committed ladder, as the elapsed yields one exhausted recovery window
+# spends. A navigation that has to reach the outer application pays exactly this
+# once, in `_settle_eb_bill_entry()`: a direct or restored EB Bill entry that is
+# still rendering must be given the committed window before the run may conclude
+# it does not exist. It is one window on the shared ladder, spent at most once
+# per navigation, and no downstream surface pays anything for it.
+ENTRY_SETTLE_YIELDS = [250, 750, 4000, 5000, 20000, 28000]
 MAX_TRIAL_PROBE_MS = 1_000
 
 
@@ -2070,10 +2078,17 @@ class _ResultsControl:
         on_click=None,
         href: str | None = None,
         click_error: Exception | None = None,
+        matches: int = 1,
+        state_error: Exception | None = None,
     ) -> None:
         self._page = page
         self._key = key
         self._present = present
+        # How many exact matches this resolution reports, and a state read that
+        # cannot answer at all. Ambiguity and unreadability are what a routing
+        # decision must never be derived from, so they are first-class knobs.
+        self._matches = matches
+        self._state_error = state_error
         self._visible = visible
         self._enabled = enabled
         self._disabled = disabled
@@ -2085,9 +2100,13 @@ class _ResultsControl:
         self._click_error = click_error
 
     def count(self) -> int:
-        return 1 if self._present else 0
+        if self._state_error is not None:
+            raise self._state_error
+        return self._matches if self._present else 0
 
     def is_visible(self, timeout: int | None = None) -> bool:
+        if self._state_error is not None:
+            raise self._state_error
         return self._visible
 
     def is_enabled(self, timeout: int | None = None) -> bool:
@@ -2322,6 +2341,11 @@ class FakeResultsPage:
         start_route: str = "app",
         eb_bill_href: str = "/eb-bill",
         eb_bill_actionable: bool = True,
+        eb_bill_on_app: bool = False,
+        eb_bill_visible_delay: int = 0,
+        eb_bill_actionable_delay: int = 0,
+        eb_bill_matches: int = 1,
+        eb_bill_state_error: Exception | None = None,
         eb_bill_click_error: Exception | None = None,
         eb_bill_click_inert: bool = False,
         billing_manager_actionable: bool = True,
@@ -2345,6 +2369,18 @@ class FakeResultsPage:
         self.state_attribute_error = state_attribute_error
         self.eb_bill_href = eb_bill_href
         self.eb_bill_actionable = eb_bill_actionable
+        # A surface that offers BOTH entries: the outer Billing Manager and a
+        # direct EB Bill on the same route. That is the shape a settling direct
+        # entry has, and the only shape on which choosing the outer path can be
+        # observed as a mis-route rather than as the only option.
+        self.eb_bill_on_app = eb_bill_on_app
+        # Existence settles before usability. Each of these keeps the count at
+        # exactly one while the control is still hidden, or still refuses a
+        # trial action, for that many fresh looks.
+        self.eb_bill_visible_delay = eb_bill_visible_delay
+        self.eb_bill_actionable_delay = eb_bill_actionable_delay
+        self.eb_bill_matches = eb_bill_matches
+        self.eb_bill_state_error = eb_bill_state_error
         self.eb_bill_click_error = eb_bill_click_error
         # A click that lands and changes nothing: the postcondition route never
         # becomes proven, which is a distinct failure from a click that raised.
@@ -2471,15 +2507,23 @@ class FakeResultsPage:
                 "eb_bill",
                 # The EB Bill nav entry lives on every route that has one,
                 # including the results route itself, so route identity can be
-                # proven from the control's own target.
+                # proven from the control's own target. `eb_bill_on_app` adds it
+                # to the outer application route as well, which is where a
+                # direct entry and the Billing Manager entry coexist.
                 present=(
                     self.route in ("billing", "tenant_bill", "results")
-                    and looks > self.eb_bill_delay
+                    or (self.eb_bill_on_app and self.route == "app")
+                )
+                and looks > self.eb_bill_delay,
+                visible=looks > self.eb_bill_visible_delay,
+                actionable=(
+                    self.eb_bill_actionable and looks > self.eb_bill_actionable_delay
                 ),
-                actionable=self.eb_bill_actionable,
                 click_error=self.eb_bill_click_error,
                 href=self.eb_bill_href,
                 on_click=None if self.eb_bill_click_inert else self._open_results,
+                matches=self.eb_bill_matches,
+                state_error=self.eb_bill_state_error,
             )
         if name == "Search":
             self.bump("search")
@@ -2601,7 +2645,11 @@ class PortalResultsSettlingTests(unittest.TestCase):
             "an empty EB Bill surface before Search is never read as no invoices",
         )
         self.assertEqual(page.clicks, {"billing_manager": 1, "eb_bill": 1, "search": 1})
-        self.assertEqual(clock.yields, [], "a settled route pays nothing for recovery")
+        self.assertEqual(
+            clock.yields,
+            ENTRY_SETTLE_YIELDS,
+            "only the bounded entry settle pays; every settled surface after it is free",
+        )
         self.assert_probes_bounded(page)
 
     def test_a_delayed_billing_manager_is_recovered_and_clicked_once(self) -> None:
@@ -2669,7 +2717,7 @@ class PortalResultsSettlingTests(unittest.TestCase):
         self.assert_probes_bounded(page)
 
     def test_a_post_search_state_that_never_settles_never_re_searches(self) -> None:
-        portal, page, clock = self.route(post_search_delay=10 ** 6)
+        portal, page, clock = self.route(start_route="results", post_search_delay=10 ** 6)
         with simulated_clock(clock):
             with self.assertRaises(LayoutChangedError) as caught:
                 portal.inventory(20)
@@ -2680,7 +2728,9 @@ class PortalResultsSettlingTests(unittest.TestCase):
 
     def test_pagination_that_never_advances_never_re_clicks(self) -> None:
         portal, page, clock = self.route(
-            pages=(("2026-01-01_a.pdf",), ("2026-02-01_b.pdf",)), advance_delay=10 ** 6
+            start_route="results",
+            pages=(("2026-01-01_a.pdf",), ("2026-02-01_b.pdf",)),
+            advance_delay=10 ** 6,
         )
         with simulated_clock(clock):
             with self.assertRaises(LayoutChangedError) as caught:
@@ -2692,7 +2742,7 @@ class PortalResultsSettlingTests(unittest.TestCase):
 
     def test_end_of_inventory_is_still_a_disabled_next_page(self) -> None:
         """A disabled Next page stays the committed end signal, not lag."""
-        portal, page, clock = self.route()
+        portal, page, clock = self.route(start_route="results")
         with simulated_clock(clock):
             inventory = portal.inventory(20)
 
@@ -2735,7 +2785,9 @@ class PortalResultsSettlingTests(unittest.TestCase):
         given, so an unbounded one would be charged the 300 s page default and
         blow the ceiling on its first checkpoint instead of ending inside it.
         """
-        portal, page, clock = self.route(state_attribute_stalls=10 ** 6)
+        portal, page, clock = self.route(
+            start_route="results", state_attribute_stalls=10 ** 6
+        )
         with simulated_clock(clock):
             with self.assertRaises(LayoutChangedError) as caught:
                 portal.inventory(20)
@@ -2753,7 +2805,8 @@ class PortalResultsSettlingTests(unittest.TestCase):
     def test_a_non_timeout_post_search_attribute_failure_is_terminal(self) -> None:
         """A structural read failure is not the lag this recovery waits for."""
         portal, page, clock = self.route(
-            state_attribute_error=RuntimeError("synthetic structural failure")
+            start_route="results",
+            state_attribute_error=RuntimeError("synthetic structural failure"),
         )
         with simulated_clock(clock):
             with self.assertRaises(LayoutChangedError) as caught:
@@ -2905,12 +2958,20 @@ class BusinessNavigationTests(unittest.TestCase):
         self.assertNotIn("hunter2", error.message)
 
     def test_an_eb_bill_readiness_failure_is_distinct(self) -> None:
-        """N07. Readiness is proven before the one dispatch."""
-        page, error = self.open_route(start_route="billing", eb_bill_actionable=False)
+        """N07. Readiness is proven before the one dispatch.
+
+        The outer route, so the EB Bill entry reached after the one Billing
+        Manager click is unambiguously the dispatch target: it never becomes
+        actionable, and it is never clicked. A never-usable DIRECT entry is a
+        different case, and belongs to the entry decision rather than to this
+        dispatch (N16).
+        """
+        page, error = self.open_route(eb_bill_actionable=False)
         self.assertIsInstance(error, LayoutChangedError)
         self.assertEqual(error.message, "EB Bill navigation control is not ready")
         self.assertEqual(cli.support_ref_for(error), "EG_NAV_EB_BILL_NOT_READY")
         self.assertEqual(page.clicks.get("eb_bill", 0), 0)
+        self.assertEqual(page.clicks["billing_manager"], 1)
 
     def test_an_eb_bill_click_exception_is_uncertain_and_terminal(self) -> None:
         """N08. An uncertain EB Bill dispatch is terminal, with no retry."""
@@ -2937,7 +2998,7 @@ class BusinessNavigationTests(unittest.TestCase):
         """One control, three outcomes, three references."""
         references = set()
         for kwargs in (
-            {"start_route": "billing", "eb_bill_actionable": False},
+            {"eb_bill_actionable": False},
             {"start_route": "billing", "eb_bill_click_error": synthetic_timeout()},
             {"start_route": "billing", "eb_bill_click_inert": True},
         ):
@@ -3031,20 +3092,202 @@ class BusinessNavigationTests(unittest.TestCase):
 
     def test_an_ambiguous_eb_bill_control_never_proves_the_route(self) -> None:
         """Ambiguity is drift, and drift is never route proof."""
-
-        class AmbiguousResultsPage(FakeResultsPage):
-            def get_by_role(self, role, name=None, exact=False):
-                control = super().get_by_role(role, name=name, exact=exact)
-                if name == "EB Bill":
-                    control.count = lambda: 2
-                return control
-
-        clock = RecoveryClock()
-        page = AmbiguousResultsPage(clock=clock, start_route="results")
-        portal = PlaywrightPortal(ResultsConfig(), headed=False)
-        portal.page = page
+        portal, page, clock = self.route(start_route="results", eb_bill_matches=2)
         self.assertFalse(portal._eb_bill_route_proven(page))
-        self.assertFalse(portal._eb_bill_control_available(page))
+        with simulated_clock(clock):
+            with self.assertRaises(LayoutChangedError):
+                portal._settle_eb_bill_entry(page)
+        self.assertEqual(page.clicks, {}, "an ambiguous entry dispatches nothing")
+
+    # ---- N14-N21: the entry decision is settled, never guessed ---- #
+    #
+    # The repaired defect: the entry decision used to be taken from one
+    # immediate look -- `count() == 1` chose the direct path and anything else
+    # chose Billing Manager. A surface that is still settling cannot be read
+    # that way, in either direction. These cases put a direct entry on the same
+    # route as the Billing Manager entry, so choosing the outer path is
+    # observable as a mis-route rather than as the only option available, and
+    # then vary WHEN and WHETHER that direct entry becomes genuinely usable.
+
+    def test_a_settling_direct_eb_bill_entry_is_never_mis_routed(self) -> None:
+        """N14. The direct entry appears after the immediate look, and is used.
+
+        Both entries exist on this route. The direct EB Bill entry has simply
+        not rendered yet at the first look, and it becomes available at a later
+        committed checkpoint. Deciding from the immediate look sends the run
+        through Billing Manager even though the direct route was about to prove
+        itself, so a single Billing Manager click here is the defect.
+        """
+        page, error = self.open_route(
+            start_route="app", eb_bill_on_app=True, eb_bill_delay=2
+        )
+        self.assertIsNone(error)
+        self.assertEqual(
+            page.clicks.get("billing_manager", 0),
+            0,
+            "a settling direct entry is never routed through Billing Manager",
+        )
+        self.assertEqual(page.clicks, {"eb_bill": 1}, "one EB Bill click, and no more")
+        self.assertEqual(page.route, "results")
+
+    def test_a_settling_restored_route_needs_no_navigation_click(self) -> None:
+        """N15. The saved address IS the route; its own entry settles after `goto()`.
+
+        Restoration re-enters the navigation contract, and the exact control
+        route proof is read from has not rendered yet at that moment. The route
+        is nonetheless already correct, so giving proof its bounded chance is
+        what keeps restoration free of navigation entirely.
+        """
+        portal, page, clock = self.route(
+            pages=(("a.pdf", "b.pdf"), ("c.pdf",)), eb_bill_delay=2
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            with simulated_clock(clock):
+                inventory = portal.inventory(20)
+                before = dict(page.clicks)
+                portal.download(inventory[0], Path(directory) / "download.bin")
+        self.assertIn("goto", page.events)
+        for control in ("billing_manager", "eb_bill"):
+            with self.subTest(control=control):
+                self.assertEqual(
+                    page.clicks.get(control, 0),
+                    before.get(control, 0),
+                    "a settling restored route re-enters no navigation",
+                )
+
+    def test_a_hidden_direct_entry_is_not_ready_merely_because_it_exists(self) -> None:
+        """N16. Exactly one exact match, hidden: existence is not usability.
+
+        The count is one from the first look, so the retired discriminator
+        called this a direct route immediately. It stays hidden for the whole
+        bounded window, so the direct entry was never usable and the outer
+        route is the contract-conformant path -- which is only reached at all
+        if readiness, not existence, decided.
+        """
+        page, error = self.open_route(
+            start_route="app", eb_bill_on_app=True, eb_bill_visible_delay=10 ** 6
+        )
+        self.assertIsInstance(error, LayoutChangedError)
+        self.assertEqual(error.message, "EB Bill navigation control is not ready")
+        self.assertEqual(cli.support_ref_for(error), "EG_NAV_EB_BILL_NOT_READY")
+        self.assertEqual(
+            page.clicks.get("billing_manager", 0),
+            1,
+            "a never-usable direct entry does not claim the direct path",
+        )
+        self.assertEqual(page.clicks.get("eb_bill", 0), 0)
+
+    def test_a_direct_entry_that_becomes_visible_later_is_used_directly(self) -> None:
+        """N17. The same hidden entry, this time settling inside the window."""
+        page, error = self.open_route(
+            start_route="app", eb_bill_on_app=True, eb_bill_visible_delay=2
+        )
+        self.assertIsNone(error)
+        self.assertEqual(page.clicks, {"eb_bill": 1})
+        self.assertEqual(page.clicks.get("billing_manager", 0), 0)
+        self.assertEqual(page.route, "results")
+
+    def test_a_direct_entry_is_clicked_only_once_it_is_actionable(self) -> None:
+        """N18. Present and visible at once, trial-actionable only later.
+
+        Nothing is dispatched while actionability is still being proven: the
+        trial check runs repeatedly and the real click happens once, after it
+        finally passes.
+        """
+        page, error = self.open_route(
+            start_route="app", eb_bill_on_app=True, eb_bill_actionable_delay=2
+        )
+        self.assertIsNone(error)
+        self.assertEqual(page.clicks, {"eb_bill": 1})
+        self.assertEqual(page.clicks.get("billing_manager", 0), 0)
+        self.assertGreater(
+            page.trial_clicks["eb_bill"],
+            1,
+            "actionability was re-proven, and only the real click was one-shot",
+        )
+
+    def test_an_ambiguous_direct_entry_fails_closed_without_a_fallback(self) -> None:
+        """N19. Two exact matches: neither narrowed, nor masked by Billing Manager.
+
+        Ambiguity is structural uncertainty about which control the route even
+        is. Turning it into "no direct entry" would send the run through the
+        outer application and hide the drift behind a route that happens to
+        work, so it fails closed with nothing dispatched at all.
+        """
+        page, error = self.open_route(
+            start_route="app", eb_bill_on_app=True, eb_bill_matches=2
+        )
+        self.assertIsInstance(error, LayoutChangedError)
+        self.assertEqual(error.message, "EB Bill navigation control is not ready")
+        self.assertEqual(cli.support_ref_for(error), "EG_NAV_EB_BILL_NOT_READY")
+        self.assertEqual(page.clicks, {}, "ambiguity is never routed around")
+
+    def test_an_unreadable_direct_entry_fails_closed_without_dispatching(self) -> None:
+        """N20. A state that cannot be read is drift, not evidence of absence."""
+        page, error = self.open_route(
+            start_route="app",
+            eb_bill_on_app=True,
+            eb_bill_state_error=RuntimeError(STEP_FAILURE_TEXT),
+        )
+        self.assertIsInstance(error, LayoutChangedError)
+        self.assertEqual(error.message, "EB Bill navigation control is not ready")
+        self.assertEqual(page.clicks, {}, "an unreadable entry dispatches nothing")
+        self.assertNotIn("hunter2", error.message)
+        self.assertNotIn("portal.example.invalid", error.message)
+
+    def test_no_entry_observation_ever_dispatches_a_navigation_click(self) -> None:
+        """N21. The mutation boundary: the settled decision is observation only."""
+        for kwargs in (
+            {"start_route": "results", "eb_bill_delay": 2},
+            {"start_route": "app", "eb_bill_on_app": True, "eb_bill_delay": 2},
+            {"start_route": "app", "eb_bill_on_app": True, "eb_bill_matches": 2},
+            {
+                "start_route": "app",
+                "eb_bill_on_app": True,
+                "eb_bill_visible_delay": 10 ** 6,
+            },
+        ):
+            with self.subTest(**kwargs):
+                portal, page, clock = self.route(**kwargs)
+                with simulated_clock(clock):
+                    try:
+                        portal._settle_eb_bill_entry(page)
+                    except LayoutChangedError:
+                        pass
+                self.assertEqual(page.clicks, {}, "the entry decision clicks nothing")
+                self.assertEqual(page.events, [])
+
+    def test_only_the_outer_conclusion_costs_a_bounded_window(self) -> None:
+        """N22. What the settled entry decision is allowed to cost, per surface.
+
+        A decisive surface pays nothing: an already-proven route and a directly
+        usable entry are both answered at the immediate look, so the healthy
+        interaction is still free. Only concluding that no direct entry exists
+        requires the committed window -- that conclusion cannot be reached from
+        one look without mis-routing a settling surface -- and it costs exactly
+        one window, once, with the ready outer controls after it paying nothing.
+        """
+        for case, kwargs, expected_yields, expected_clicks in (
+            ("already_proven", {"start_route": "results"}, [], {}),
+            ("direct_ready", {"start_route": "billing"}, [], {"eb_bill": 1}),
+            (
+                "outer_required",
+                {},
+                ENTRY_SETTLE_YIELDS,
+                {"billing_manager": 1, "eb_bill": 1},
+            ),
+        ):
+            with self.subTest(case=case):
+                portal, page, clock = self.route(**kwargs)
+                with simulated_clock(clock):
+                    portal._open_eb_bill_route(page)
+                self.assertEqual(page.clicks, expected_clicks)
+                self.assertEqual(clock.yields, expected_yields)
+                self.assertLessEqual(
+                    clock.elapsed_ms(),
+                    RECOVERY_CEILING_MS,
+                    "the entry decision is one bounded window, never two",
+                )
 
     # ---- the downstream contracts stay exactly as they were ---- #
 
@@ -3065,7 +3308,7 @@ class BusinessNavigationReferenceTests(unittest.TestCase):
     NAVIGATION_BRANCHES = (
         {"billing_manager_actionable": False},
         {"billing_manager_click_error": RuntimeError(STEP_FAILURE_TEXT)},
-        {"start_route": "billing", "eb_bill_actionable": False},
+        {"eb_bill_actionable": False},
         {"start_route": "billing", "eb_bill_click_error": RuntimeError(STEP_FAILURE_TEXT)},
         {"start_route": "billing", "eb_bill_click_inert": True},
     )
@@ -4296,7 +4539,8 @@ class LoginDiagnosticSequenceTests(unittest.TestCase):
             "_open_verified_results",
             "_open_eb_bill_route",
             "_eb_bill_route_proven",
-            "_eb_bill_control_available",
+            "_settle_eb_bill_entry",
+            "_observe_eb_bill_entry",
             "_dispatch_billing_manager",
             "_dispatch_eb_bill",
             "_await_invoice_list",
