@@ -137,12 +137,14 @@ they tell an operator a different story:
 | --- | --- | --- |
 | `EG_NAV_EMS_ENTRY_NOT_READY` | The exact `EMS` application entry was missing, duplicated, hidden, disabled, unactionable or unreadable for the whole bounded window. | On the landing. Nothing was clicked at all, and the application was never entered. |
 | `EG_NAV_EMS_ENTRY_DISPATCH_UNCERTAIN` | The one real EMS click raised, so whether the browser acted cannot be established. | At the entry click. It is never sent again, and no re-login or fallback is attempted. |
-| `EG_NAV_BILLING_MANAGER_*` / `EG_NAV_EB_BILL_*` / `EG_NAV_RESULTS_ROUTE_UNPROVED` | The application was entered and the failure is later, inside the existing EB Bill route. | Inside the application, after exactly one EMS entry. |
+| `EG_NAV_BILLING_MANAGER_*` / `EG_NAV_EB_BILL_*` / `EG_NAV_RESULTS_ROUTE_UNPROVED` | The one EMS dispatch had already been consumed, and the failure is later, on the existing EB Bill route. | After the entry click. These codes do not establish that the application was actually reached. |
 
 An EMS code therefore points at the landing or at the entry control itself; a
-Billing Manager or EB Bill code confirms the entry already succeeded and points
-further in. An EMS click that lands but opens nothing shows up as
-`EG_NAV_BILLING_MANAGER_NOT_READY`, because the entry was consumed and the
+Billing Manager or EB Bill code says the failure was observed after the EMS
+dispatch had already been consumed, which is not the same as proving the
+application was entered. An EMS click that lands but opens nothing is exactly
+that counterexample: it consumes the one entry attempt without ever reaching the
+application, and then shows up as `EG_NAV_BILLING_MANAGER_NOT_READY` because the
 surface simply never became the application -- the run does not try EMS again.
 A run reaches the application entry exactly once: a download that resumes from a
 saved results address is already inside the application and never re-actuates

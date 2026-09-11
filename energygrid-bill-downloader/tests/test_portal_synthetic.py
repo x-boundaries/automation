@@ -535,6 +535,87 @@ class SyntheticPortalTests(unittest.TestCase):
             finally:
                 self.restore_credentials(old)
 
+    def test_results_surfaces_keep_a_counted_non_navigating_ems_control(self) -> None:
+        """A downstream EMS click is counted, and it opens nothing.
+
+        The exactly-once guarantee is only meaningful if a second actuation
+        would actually show up. Every authenticated surface after the landing
+        keeps the same exact EMS control, so this drives the whole normal
+        production-shaped flow first -- login enters nothing, inventory enters
+        once, a restored download re-enters nothing -- and only then actuates
+        the results-surface control deliberately. That click has to increment
+        the counter and leave the route exactly where it was: if the fixture
+        dropped the control from results, an accidental repeat click in the real
+        portal would be invisible here rather than caught.
+        """
+        bills = [
+            SyntheticBill("2026-11-01_SYNTHETIC-A.pdf"),
+            SyntheticBill("2026-11-02_SYNTHETIC-B.pdf"),
+            SyntheticBill("2026-11-03_SYNTHETIC-C.pdf"),
+        ]
+        with tempfile.TemporaryDirectory() as directory, SyntheticPortalServer(
+            bills, page_size=2
+        ) as server:
+            root = Path(directory)
+            config = self.config_for(server, root)
+            old, _values = self.with_credentials()
+            try:
+                with PlaywrightPortal(config) as portal:
+                    portal.login()
+                    self.assertEqual(
+                        server.ems_actuation_count, 0, "proving a landing enters nothing"
+                    )
+
+                    inventory = portal.inventory(20)
+                    self.assertEqual(
+                        server.ems_actuation_count, 1, "exactly one application entry"
+                    )
+                    page = portal.page
+                    # The paginated results surface inventory finished on is
+                    # still application chrome, so it still carries the control.
+                    self.assertEqual(
+                        page.get_by_role("button", name="EMS", exact=True).count(),
+                        1,
+                        "paginated results keep the exact EMS control",
+                    )
+
+                    target = root / "download.bin"
+                    portal.download(inventory[-1], target)
+                    self.assertEqual(target.read_bytes(), bills[-1].payload)
+                    self.assertEqual(
+                        server.ems_actuation_count,
+                        1,
+                        "a restored results address re-enters nothing",
+                    )
+
+                    # Everything above is the normal flow, at exactly one
+                    # actuation. What follows is the accidental second click.
+                    page = portal.page
+                    restored_route = page.url
+                    control = page.get_by_role("button", name="EMS", exact=True)
+                    self.assertEqual(
+                        control.count(), 1, "restored results keep the exact EMS control"
+                    )
+
+                    control.click()
+                    self.assertEqual(
+                        server.ems_actuation_count,
+                        2,
+                        "a downstream re-actuation is counted, not lost",
+                    )
+                    self.assertEqual(
+                        page.url,
+                        restored_route,
+                        "a downstream EMS click navigates nowhere",
+                    )
+                    self.assertEqual(
+                        page.get_by_test_id("invoice-list").count(),
+                        1,
+                        "the results surface is still the results surface",
+                    )
+            finally:
+                self.restore_credentials(old)
+
     def test_the_login_diagnostic_never_actuates_ems(self) -> None:
         """The diagnostic observes a landing; it never enters the application."""
         with tempfile.TemporaryDirectory() as directory, SyntheticPortalServer() as server:
@@ -2224,6 +2305,8 @@ class _ResultsControl:
         click_error: Exception | None = None,
         matches: int = 1,
         state_error: Exception | None = None,
+        enabled_error: Exception | None = None,
+        trial_error: Exception | None = None,
     ) -> None:
         self._page = page
         self._key = key
@@ -2233,6 +2316,12 @@ class _ResultsControl:
         # decision must never be derived from, so they are first-class knobs.
         self._matches = matches
         self._state_error = state_error
+        # The two readiness probes that fail WITHOUT a timeout, which is the
+        # distinction that matters: the shared ladder treats a non-timeout
+        # failure as drift and lets it out intact rather than retrying it. These
+        # are the real exception paths, not a stand-in for them.
+        self._enabled_error = enabled_error
+        self._trial_error = trial_error
         self._visible = visible
         self._enabled = enabled
         self._disabled = disabled
@@ -2255,6 +2344,8 @@ class _ResultsControl:
 
     def is_enabled(self, timeout: int | None = None) -> bool:
         self._page.probe_timeouts.append(timeout)
+        if self._enabled_error is not None:
+            raise self._enabled_error
         return self._enabled
 
     def is_disabled(self, timeout: int | None = None) -> bool:
@@ -2273,6 +2364,10 @@ class _ResultsControl:
         if trial:
             self._page.probe_timeouts.append(timeout)
             self._page.trial_clicks[self._key] = self._page.trial_clicks.get(self._key, 0) + 1
+            if self._trial_error is not None:
+                # A trial click is still only a probe: it dispatches nothing, so
+                # this failure must never be recorded as an actuation.
+                raise self._trial_error
             if not self._actionable:
                 self._page.clock.charge_probe(timeout)
                 raise synthetic_timeout()
@@ -2490,6 +2585,8 @@ class FakeResultsPage:
         ems_actionable_delay: int = 0,
         ems_matches: int = 1,
         ems_state_error: Exception | None = None,
+        ems_enabled_error: Exception | None = None,
+        ems_trial_error: Exception | None = None,
         ems_click_error: Exception | None = None,
         ems_click_inert: bool = False,
         eb_bill_href: str = "/eb-bill",
@@ -2532,6 +2629,12 @@ class FakeResultsPage:
         self.ems_actionable_delay = ems_actionable_delay
         self.ems_matches = ems_matches
         self.ems_state_error = ems_state_error
+        # An enabled-state read and an actionability trial that fail for a
+        # reason that is not a timeout. The shared ladder deliberately lets
+        # these out intact, so they are the exact paths the EMS pre-dispatch
+        # classification has to own.
+        self.ems_enabled_error = ems_enabled_error
+        self.ems_trial_error = ems_trial_error
         self.ems_click_error = ems_click_error
         # A click that lands and opens nothing. The entry is consumed and the
         # surface stays put, which is a distinct outcome from a click that
@@ -2692,6 +2795,8 @@ class FakeResultsPage:
                 click_error=self.ems_click_error,
                 matches=self.ems_matches,
                 state_error=self.ems_state_error,
+                enabled_error=self.ems_enabled_error,
+                trial_error=self.ems_trial_error,
                 on_click=self._actuate_ems,
             )
         if name == "Billing Manager":
@@ -3600,6 +3705,56 @@ class EmsApplicationEntryTests(unittest.TestCase):
         self.assertEqual(page.clicks, {})
         self.assertNotIn("hunter2", error.message)
         self.assertNotIn("portal.example.invalid", error.message)
+
+    def test_an_unreadable_ems_enabled_state_is_a_pre_dispatch_failure(self) -> None:
+        """E05b. `is_enabled()` raised without timing out: readiness, not drift-as-search.
+
+        This is the path the shared ladder deliberately does not convert. It
+        leaves the probe intact, so without the caller-local classification the
+        bare browser exception reached `_open_verified_results()` and was
+        reported as a tenant/account contract failure -- a downstream identity
+        for something that happened on the landing before any click existed.
+        """
+        page, error = self.enter(ems_enabled_error=RuntimeError(STEP_FAILURE_TEXT))
+        self.assertIsInstance(error, LayoutChangedError)
+        self.assertEqual(error.message, "EMS application entry control is not ready")
+        self.assertEqual(cli.support_ref_for(error), "EG_NAV_EMS_ENTRY_NOT_READY")
+        self.assertEqual(page.clicks, {}, "a readiness failure dispatches nothing")
+        self.assertEqual(page.ems_actuations, 0)
+        self.assertEqual(page.clicks.get("billing_manager", 0), 0)
+        self.assertEqual(page.clicks.get("eb_bill", 0), 0)
+        self.assertNotIn("hunter2", error.message)
+        self.assertNotIn("portal.example.invalid", error.message)
+
+    def test_an_unreadable_ems_actionability_is_a_pre_dispatch_failure(self) -> None:
+        """E05c. The trial click raised: a probe failed, so nothing was ever sent.
+
+        A trial click is not a dispatch. Its failing for a reason that is not a
+        timeout says the control could not be proven usable, which is the same
+        pre-dispatch answer as an absent or disabled entry and must carry the
+        same reference.
+        """
+        page, error = self.enter(ems_trial_error=RuntimeError(STEP_FAILURE_TEXT))
+        self.assertIsInstance(error, LayoutChangedError)
+        self.assertEqual(error.message, "EMS application entry control is not ready")
+        self.assertEqual(cli.support_ref_for(error), "EG_NAV_EMS_ENTRY_NOT_READY")
+        self.assertEqual(page.clicks, {}, "a trial click is a probe, never a dispatch")
+        self.assertEqual(page.ems_actuations, 0)
+        self.assertEqual(page.clicks.get("billing_manager", 0), 0)
+        self.assertEqual(page.clicks.get("eb_bill", 0), 0)
+        self.assertNotIn("hunter2", error.message)
+        self.assertNotIn("portal.example.invalid", error.message)
+
+    def test_a_persistently_absent_ems_entry_is_a_pre_dispatch_failure(self) -> None:
+        """E05d. The entry never appears at all, for the whole bounded window."""
+        page, error = self.enter(ems_present=False)
+        self.assertIsInstance(error, LayoutChangedError)
+        self.assertEqual(error.message, "EMS application entry control is not ready")
+        self.assertEqual(cli.support_ref_for(error), "EG_NAV_EMS_ENTRY_NOT_READY")
+        self.assertEqual(page.clicks, {}, "an absent entry dispatches nothing")
+        self.assertEqual(page.ems_actuations, 0)
+        self.assertEqual(page.clicks.get("billing_manager", 0), 0)
+        self.assertEqual(page.clicks.get("eb_bill", 0), 0)
 
     def test_an_ems_click_exception_is_uncertain_and_terminal(self) -> None:
         """E06. It may have landed, so it is never sent again."""

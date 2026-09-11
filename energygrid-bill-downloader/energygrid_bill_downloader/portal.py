@@ -1549,21 +1549,41 @@ class PlaywrightPortal:
         its matches, and the selector is never weakened to another role, name
         or generic text.
 
-        The normal click is the dispatch boundary. Once it begins, an exception
-        cannot prove whether the browser acted, so the outcome is uncertain and
-        terminal: there is no second EMS click, no re-resolution, no re-login
-        and no fallback opener. A successful click hands the route to
-        `_open_eb_bill_route()` immediately, so no second navigation or
-        recovery system exists here.
+        Proving readiness is classified here, not left to the caller. The shared
+        ladder deliberately lets a non-timeout failure out of its enabled and
+        trial-actionability probes intact, because a state that cannot be read
+        is drift rather than lag and must never become a retry. Intact, however,
+        it is also unclassified: it would leave this method as a bare browser
+        exception and reach `_open_verified_results()`, whose generic arm would
+        report a tenant/account contract failure for something that happened on
+        the landing before any dispatch at all. So every way readiness can end
+        without a proven control -- absent, duplicate, hidden, disabled,
+        unreadable enabled-state, unreadable actionability -- is committed to
+        the one pre-dispatch classification, with zero EMS clicks and therefore
+        zero downstream dispatch. Only the shared ladder decides how long to
+        wait; this adds no window, no look and no retry of its own.
+
+        The normal click is the dispatch boundary, and is deliberately outside
+        that normalisation. Once it begins, an exception cannot prove whether
+        the browser acted, so the outcome is uncertain and terminal: there is no
+        second EMS click, no re-resolution, no re-login and no fallback opener.
+        A successful click hands the route to `_open_eb_bill_route()`
+        immediately, so no second navigation or recovery system exists here.
         """
 
-        control = self._resolve_ready_control(
-            page,
-            lambda: page.get_by_role("button", name=EMS_ENTRY_NAV_NAME, exact=True),
-            "EMS application entry control",
-            require_trial_actionable=True,
-            messages=_uniform_messages(NAV_EMS_ENTRY_NOT_READY_MESSAGE),
-        )
+        try:
+            control = self._resolve_ready_control(
+                page,
+                lambda: page.get_by_role("button", name=EMS_ENTRY_NAV_NAME, exact=True),
+                "EMS application entry control",
+                require_trial_actionable=True,
+                messages=_uniform_messages(NAV_EMS_ENTRY_NOT_READY_MESSAGE),
+            )
+        except Exception as exc:
+            # Nothing has been dispatched at this point, so the committed
+            # pre-dispatch message is the whole truth regardless of which probe
+            # failed or how. The cause is chained, never surfaced.
+            raise LayoutChangedError(NAV_EMS_ENTRY_NOT_READY_MESSAGE) from exc
         try:
             control.click()
         except Exception as exc:

@@ -591,8 +591,16 @@ class SyntheticPortalServer:
                 }});
                 </script>
                 """
+                # The results route is authenticated application chrome, so it
+                # keeps the same exact EMS control every other downstream
+                # surface keeps. Built without `entry=True`, an actuation here
+                # records itself and navigates nowhere, which is precisely what
+                # makes an accidental second EMS click on results, a paginated
+                # results page or a restored results address observable in
+                # `ems_actuation_count` instead of silently vanishing.
                 content = (
-                    eb_bill_markup
+                    self._authenticated_shell()
+                    + eb_bill_markup
                     + account_markup
                     + '<div data-testid="selected-account">'
                     + escape(displayed)
