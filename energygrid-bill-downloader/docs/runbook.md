@@ -115,9 +115,10 @@ say which one failed. A successful login means only that the authenticated
 landing was positively proven, from the exact `EMS` witness together with an
 exact zero count for every retained login control, accessibility gate and
 rejection. Billing Manager is not part of that proof. A login that cannot prove
-the landing records `EG_LOGIN_AUTHENTICATION_UNPROVED`; a Billing Manager or EB
-Bill that never becomes usable afterwards is a navigation failure and records
-`EG_NAV_BILLING_MANAGER_NOT_READY`,
+the landing records `EG_LOGIN_AUTHENTICATION_UNPROVED`; an EMS application
+entry, Billing Manager or EB Bill that never becomes usable afterwards is a
+navigation failure and records `EG_NAV_EMS_ENTRY_NOT_READY`,
+`EG_NAV_EMS_ENTRY_DISPATCH_UNCERTAIN`, `EG_NAV_BILLING_MANAGER_NOT_READY`,
 `EG_NAV_BILLING_MANAGER_DISPATCH_UNCERTAIN`, `EG_NAV_EB_BILL_NOT_READY`,
 `EG_NAV_EB_BILL_DISPATCH_UNCERTAIN`, or `EG_NAV_RESULTS_ROUTE_UNPROVED`
 according to whether the control was never ready, was clicked with an outcome
@@ -127,6 +128,32 @@ retried. Evidence written while Billing Manager was still treated as the login
 postcondition records the retired `EG_LOGIN_BILLING_MANAGER_WAIT_FAILED`: no
 current build emits it, and it means only that the pre-separation build never
 saw Billing Manager after the submit.
+
+The authenticated landing is not yet the application, so the two EMS codes sit
+before the Billing Manager and EB Bill codes rather than alongside them, and
+they tell an operator a different story:
+
+| Code | What it means | Where the run stopped |
+| --- | --- | --- |
+| `EG_NAV_EMS_ENTRY_NOT_READY` | The exact `EMS` application entry was missing, duplicated, hidden, disabled, unactionable or unreadable for the whole bounded window. | On the landing. Nothing was clicked at all, and the application was never entered. |
+| `EG_NAV_EMS_ENTRY_DISPATCH_UNCERTAIN` | The one real EMS click raised, so whether the browser acted cannot be established. | At the entry click. It is never sent again, and no re-login or fallback is attempted. |
+| `EG_NAV_BILLING_MANAGER_*` / `EG_NAV_EB_BILL_*` / `EG_NAV_RESULTS_ROUTE_UNPROVED` | The application was entered and the failure is later, inside the existing EB Bill route. | Inside the application, after exactly one EMS entry. |
+
+An EMS code therefore points at the landing or at the entry control itself; a
+Billing Manager or EB Bill code confirms the entry already succeeded and points
+further in. An EMS click that lands but opens nothing shows up as
+`EG_NAV_BILLING_MANAGER_NOT_READY`, because the entry was consumed and the
+surface simply never became the application -- the run does not try EMS again.
+A run reaches the application entry exactly once: a download that resumes from a
+saved results address is already inside the application and never re-actuates
+EMS.
+
+`login-diagnostic` does not actuate EMS at all. It observes the surface after
+the submit and stops there, so it never enters the application, never clicks
+Billing Manager or EB Bill, and can never record any `EG_NAV_` code. Use it to
+tell a credential or landing problem from an application-entry problem: if the
+diagnostic proves the landing but a `run` reports `EG_NAV_EMS_ENTRY_NOT_READY`,
+the credentials are fine and the entry control itself has drifted.
 
 ## Controlled first validation
 

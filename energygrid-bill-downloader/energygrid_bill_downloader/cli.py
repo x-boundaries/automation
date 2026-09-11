@@ -99,6 +99,10 @@ SUPPORT_REFS_BY_MESSAGE = {
     # Business navigation, not authentication. Billing Manager becoming
     # unusable after a proven authenticated landing is a navigation failure and
     # carries a navigation reference, so an operator can tell the two apart.
+    # The EMS application entry is the first of these: it runs after the landing
+    # is already proven, so it can never mean the login failed.
+    "EMS application entry control is not ready": "EG_NAV_EMS_ENTRY_NOT_READY",
+    "EMS application entry dispatch outcome uncertain": "EG_NAV_EMS_ENTRY_DISPATCH_UNCERTAIN",
     "Billing Manager navigation control is not ready": "EG_NAV_BILLING_MANAGER_NOT_READY",
     "Billing Manager navigation dispatch outcome uncertain": "EG_NAV_BILLING_MANAGER_DISPATCH_UNCERTAIN",
     "EB Bill navigation control is not ready": "EG_NAV_EB_BILL_NOT_READY",
@@ -111,6 +115,8 @@ SUPPORT_REFS_BY_MESSAGE = {
 # pre-auth login reachability contract is stated over the login half alone.
 NAVIGATION_SUPPORT_REFS = frozenset(
     {
+        "EG_NAV_EMS_ENTRY_NOT_READY",
+        "EG_NAV_EMS_ENTRY_DISPATCH_UNCERTAIN",
         "EG_NAV_BILLING_MANAGER_NOT_READY",
         "EG_NAV_BILLING_MANAGER_DISPATCH_UNCERTAIN",
         "EG_NAV_EB_BILL_NOT_READY",

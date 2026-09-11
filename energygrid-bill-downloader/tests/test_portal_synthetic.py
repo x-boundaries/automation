@@ -474,6 +474,150 @@ class SyntheticPortalTests(unittest.TestCase):
                 self.restore_credentials(old)
 
 
+    # ---- DL-XB-141-EMS-ENTRY-MINIMAL-REPAIR-G2-136 ---- #
+
+    def test_login_lands_on_a_surface_with_no_business_navigation(self) -> None:
+        """The corrected topology: EMS only, and no EMS actuation from login."""
+        with tempfile.TemporaryDirectory() as directory, SyntheticPortalServer() as server:
+            root = Path(directory)
+            config = self.config_for(server, root)
+            old, _values = self.with_credentials()
+            try:
+                with PlaywrightPortal(config) as portal:
+                    portal.login()
+                    page = portal.page
+                    self.assertEqual(
+                        page.get_by_role("button", name="EMS", exact=True).count(), 1
+                    )
+                    self.assertEqual(
+                        page.get_by_role("link", name="Billing Manager", exact=True).count(),
+                        0,
+                    )
+                    self.assertEqual(
+                        page.get_by_role("link", name="EB Bill", exact=True).count(), 0
+                    )
+                    self.assertEqual(
+                        server.ems_actuation_count,
+                        0,
+                        "proving a landing never enters the application",
+                    )
+            finally:
+                self.restore_credentials(old)
+
+    def test_inventory_enters_the_application_once_and_download_adds_none(self) -> None:
+        bills = [
+            SyntheticBill("2026-10-01_SYNTHETIC-A.pdf"),
+            SyntheticBill("2026-10-02_SYNTHETIC-B.pdf"),
+            SyntheticBill("2026-10-03_SYNTHETIC-C.pdf"),
+        ]
+        with tempfile.TemporaryDirectory() as directory, SyntheticPortalServer(
+            bills, page_size=2
+        ) as server:
+            root = Path(directory)
+            config = self.config_for(server, root)
+            old, _values = self.with_credentials()
+            try:
+                with PlaywrightPortal(config) as portal:
+                    portal.login()
+                    self.assertEqual(server.ems_actuation_count, 0)
+                    inventory = portal.inventory(20)
+                    self.assertEqual(
+                        server.ems_actuation_count, 1, "exactly one application entry"
+                    )
+                    target = root / "download.bin"
+                    portal.download(inventory[-1], target)
+                    self.assertEqual(
+                        server.ems_actuation_count,
+                        1,
+                        "a restored results address re-enters nothing",
+                    )
+                    self.assertEqual(target.read_bytes(), bills[-1].payload)
+            finally:
+                self.restore_credentials(old)
+
+    def test_the_login_diagnostic_never_actuates_ems(self) -> None:
+        """The diagnostic observes a landing; it never enters the application."""
+        with tempfile.TemporaryDirectory() as directory, SyntheticPortalServer() as server:
+            root = Path(directory)
+            config = self.config_for(server, root)
+            old, _values = self.with_credentials()
+            try:
+                with PlaywrightPortal(config) as portal:
+                    result = portal.login_diagnostic()
+                    self.assertTrue(result.submit_dispatched)
+            finally:
+                self.restore_credentials(old)
+            self.assertEqual(server.ems_actuation_count, 0)
+
+    def test_a_disabled_ems_authenticates_but_never_enters_the_application(self) -> None:
+        """Authentication reads a count and a visibility; the entry needs more."""
+        with tempfile.TemporaryDirectory() as directory, SyntheticPortalServer(
+            [SyntheticBill("2026-10-04_SYNTHETIC-DISABLED.pdf")], variant="disabled_ems"
+        ) as server:
+            root = Path(directory)
+            config = self.config_for(server, root)
+            old, _values = self.with_credentials()
+            try:
+                with PlaywrightPortal(config) as portal, fast_portal_recovery():
+                    portal.login()
+                    with self.assertRaises(LayoutChangedError) as caught:
+                        portal.inventory(20)
+            finally:
+                self.restore_credentials(old)
+            self.assertEqual(
+                caught.exception.message, "EMS application entry control is not ready"
+            )
+            self.assertEqual(
+                cli.support_ref_for(caught.exception), "EG_NAV_EMS_ENTRY_NOT_READY"
+            )
+            self.assertEqual(server.ems_actuation_count, 0)
+
+    def test_an_inert_ems_entry_fails_downstream_after_exactly_one_actuation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, SyntheticPortalServer(
+            [SyntheticBill("2026-10-05_SYNTHETIC-INERT.pdf")], variant="inert_ems"
+        ) as server:
+            root = Path(directory)
+            config = self.config_for(server, root)
+            old, _values = self.with_credentials()
+            try:
+                with PlaywrightPortal(config) as portal, fast_portal_recovery():
+                    portal.login()
+                    with self.assertRaises(LayoutChangedError) as caught:
+                        portal.inventory(20)
+            finally:
+                self.restore_credentials(old)
+            self.assertEqual(
+                caught.exception.message,
+                "Billing Manager navigation control is not ready",
+            )
+            self.assertEqual(
+                server.ems_actuation_count, 1, "a consumed entry is never re-attempted"
+            )
+
+    def test_downstream_navigation_gaps_still_follow_one_ems_actuation(self) -> None:
+        """`missing_billing_manager` and `missing_eb_bill` stay downstream failures."""
+        for variant, message in (
+            ("missing_billing_manager", "Billing Manager navigation control is not ready"),
+            ("missing_eb_bill", "EB Bill navigation control is not ready"),
+        ):
+            with self.subTest(variant=variant):
+                with tempfile.TemporaryDirectory() as directory, SyntheticPortalServer(
+                    [SyntheticBill("2026-10-06_SYNTHETIC-GAP.pdf")], variant=variant
+                ) as server:
+                    root = Path(directory)
+                    config = self.config_for(server, root)
+                    old, _values = self.with_credentials()
+                    try:
+                        with PlaywrightPortal(config) as portal, fast_portal_recovery():
+                            portal.login()
+                            with self.assertRaises(LayoutChangedError) as caught:
+                                portal.inventory(20)
+                    finally:
+                        self.restore_credentials(old)
+                    self.assertEqual(caught.exception.message, message)
+                    self.assertEqual(server.ems_actuation_count, 1)
+
+
 # ---- DL-XB-141-OBS-001: pre-auth failure localisation ---- #
 #
 # portal.py deliberately raises generic messages, so the CLI needs a mapping to
@@ -2338,7 +2482,16 @@ class FakeResultsPage:
         download_delay: int = 0,
         state_attribute_stalls: int = 0,
         state_attribute_error: Exception | None = None,
-        start_route: str = "app",
+        start_route: str = "landing",
+        ems_present: bool = True,
+        ems_delay: int = 0,
+        ems_visible_delay: int = 0,
+        ems_actionable: bool = True,
+        ems_actionable_delay: int = 0,
+        ems_matches: int = 1,
+        ems_state_error: Exception | None = None,
+        ems_click_error: Exception | None = None,
+        ems_click_inert: bool = False,
         eb_bill_href: str = "/eb-bill",
         eb_bill_actionable: bool = True,
         eb_bill_on_app: bool = False,
@@ -2367,6 +2520,23 @@ class FakeResultsPage:
         self.download_delay = download_delay
         self.state_attribute_stalls = state_attribute_stalls
         self.state_attribute_error = state_attribute_error
+        # The authenticated landing is where a run now starts, and it carries no
+        # business navigation at all. These knobs vary the EMS application entry
+        # exactly as the EB Bill knobs vary the entry after it: whether it
+        # exists, when it becomes usable, whether it is ambiguous or unreadable,
+        # and how its one real click ends.
+        self.ems_present = ems_present
+        self.ems_delay = ems_delay
+        self.ems_visible_delay = ems_visible_delay
+        self.ems_actionable = ems_actionable
+        self.ems_actionable_delay = ems_actionable_delay
+        self.ems_matches = ems_matches
+        self.ems_state_error = ems_state_error
+        self.ems_click_error = ems_click_error
+        # A click that lands and opens nothing. The entry is consumed and the
+        # surface stays put, which is a distinct outcome from a click that
+        # raised and from one that was never ready.
+        self.ems_click_inert = ems_click_inert
         self.eb_bill_href = eb_bill_href
         self.eb_bill_actionable = eb_bill_actionable
         # A surface that offers BOTH entries: the outer Billing Manager and a
@@ -2390,6 +2560,10 @@ class FakeResultsPage:
         self.href_read_error = href_read_error
         self.href_reads: list[str] = []
         self.route = start_route
+        # Real EMS actuations, counted wherever they happen. Downstream routes
+        # keep the control, so a second one would be visible here rather than
+        # silently absorbed.
+        self.ems_actuations = 0
         self.page_index = 0
         self.searched = False
         self.post_search_pending = 0
@@ -2421,6 +2595,16 @@ class FakeResultsPage:
         self.download_delay = looks
         self.reset_looks("download")
 
+    def _actuate_ems(self) -> None:
+        """Consume one real EMS actuation, from whichever surface sent it."""
+        self.ems_actuations += 1
+        if self.ems_click_inert:
+            return
+        # Only the landing has anywhere to go. On application chrome the
+        # control is still there and still counts, and still opens nothing.
+        if self.route == "landing":
+            self.route = "app"
+
     def _open_billing(self) -> None:
         self.route = "billing"
 
@@ -2445,6 +2629,9 @@ class FakeResultsPage:
     # Each route has its own address, and only the EB Bill results route
     # carries query parameters -- which is what route proof must ignore.
     ROUTE_PATHS = {
+        # The authenticated landing. It is not the business surface: the EMS
+        # application entry is what reaches the outer application route below.
+        "landing": "/landing",
         "app": "/app",
         "billing": "/billing",
         # A Tenant-Bill-like route that also renders a tenant/account selector.
@@ -2489,6 +2676,24 @@ class FakeResultsPage:
         )
 
     def get_by_role(self, role: str, name: str | None = None, exact: bool = False):
+        if name == "EMS":
+            looks = self.bump("ems")
+            # Present on every authenticated surface, exactly as the observed
+            # application chrome keeps it, so a second actuation from anywhere
+            # would be counted rather than fail as a missing control.
+            return _ResultsControl(
+                self,
+                "ems",
+                present=self.ems_present and looks > self.ems_delay,
+                visible=looks > self.ems_visible_delay,
+                actionable=(
+                    self.ems_actionable and looks > self.ems_actionable_delay
+                ),
+                click_error=self.ems_click_error,
+                matches=self.ems_matches,
+                state_error=self.ems_state_error,
+                on_click=self._actuate_ems,
+            )
         if name == "Billing Manager":
             looks = self.bump("billing_manager")
             return _ResultsControl(
@@ -2639,12 +2844,19 @@ class PortalResultsSettlingTests(unittest.TestCase):
             inventory = portal.inventory(20)
 
         self.assertEqual([bill.filename for bill in inventory], ["2026-01-01_synthetic.pdf"])
-        self.assertEqual(page.events, ["billing_manager", "eb_bill", "select_account", "search"])
+        self.assertEqual(
+            page.events,
+            ["ems", "billing_manager", "eb_bill", "select_account", "search"],
+        )
         self.assertFalse(
             page.rows_read_before_search,
             "an empty EB Bill surface before Search is never read as no invoices",
         )
-        self.assertEqual(page.clicks, {"billing_manager": 1, "eb_bill": 1, "search": 1})
+        self.assertEqual(
+            page.clicks,
+            {"ems": 1, "billing_manager": 1, "eb_bill": 1, "search": 1},
+        )
+        self.assertEqual(page.ems_actuations, 1, "the application is entered once")
         self.assertEqual(
             clock.yields,
             ENTRY_SETTLE_YIELDS,
@@ -2934,7 +3146,7 @@ class BusinessNavigationTests(unittest.TestCase):
 
     def test_a_billing_manager_readiness_failure_is_distinct(self) -> None:
         """N05. It fails before any dispatch, with its own reference."""
-        page, error = self.open_route(billing_manager_actionable=False)
+        page, error = self.open_route(start_route="app", billing_manager_actionable=False)
         self.assertIsInstance(error, LayoutChangedError)
         self.assertEqual(error.message, "Billing Manager navigation control is not ready")
         self.assertEqual(
@@ -2945,7 +3157,8 @@ class BusinessNavigationTests(unittest.TestCase):
     def test_a_billing_manager_click_exception_is_uncertain_and_terminal(self) -> None:
         """N06. It may have landed, so it is never sent again."""
         page, error = self.open_route(
-            billing_manager_click_error=RuntimeError(STEP_FAILURE_TEXT)
+            start_route="app",
+            billing_manager_click_error=RuntimeError(STEP_FAILURE_TEXT),
         )
         self.assertIsInstance(error, LayoutChangedError)
         self.assertEqual(
@@ -2966,7 +3179,7 @@ class BusinessNavigationTests(unittest.TestCase):
         different case, and belongs to the entry decision rather than to this
         dispatch (N16).
         """
-        page, error = self.open_route(eb_bill_actionable=False)
+        page, error = self.open_route(start_route="app", eb_bill_actionable=False)
         self.assertIsInstance(error, LayoutChangedError)
         self.assertEqual(error.message, "EB Bill navigation control is not ready")
         self.assertEqual(cli.support_ref_for(error), "EG_NAV_EB_BILL_NOT_READY")
@@ -2998,7 +3211,7 @@ class BusinessNavigationTests(unittest.TestCase):
         """One control, three outcomes, three references."""
         references = set()
         for kwargs in (
-            {"eb_bill_actionable": False},
+            {"start_route": "app", "eb_bill_actionable": False},
             {"start_route": "billing", "eb_bill_click_error": synthetic_timeout()},
             {"start_route": "billing", "eb_bill_click_inert": True},
         ):
@@ -3021,7 +3234,7 @@ class BusinessNavigationTests(unittest.TestCase):
                 raise AssertionError("navigation never resolves a control by text")
 
         clock = RecoveryClock()
-        page = SelectorRecorder(clock=clock)
+        page = SelectorRecorder(clock=clock, start_route="app")
         portal = PlaywrightPortal(ResultsConfig(), headed=False)
         portal.page = page
         with simulated_clock(clock):
@@ -3272,7 +3485,7 @@ class BusinessNavigationTests(unittest.TestCase):
             ("direct_ready", {"start_route": "billing"}, [], {"eb_bill": 1}),
             (
                 "outer_required",
-                {},
+                {"start_route": "app"},
                 ENTRY_SETTLE_YIELDS,
                 {"billing_manager": 1, "eb_bill": 1},
             ),
@@ -3297,33 +3510,288 @@ class BusinessNavigationTests(unittest.TestCase):
             inventory = portal.inventory(20)
         self.assertEqual([bill.filename for bill in inventory], ["2026-01-01_synthetic.pdf"])
         self.assertEqual(
-            page.events, ["billing_manager", "eb_bill", "select_account", "search"]
+            page.events,
+            ["ems", "billing_manager", "eb_bill", "select_account", "search"],
         )
         self.assertFalse(page.rows_read_before_search)
+
+
+# ---- DL-XB-141-EMS-ENTRY-MINIMAL-REPAIR-G2-136: the application entry ---- #
+#
+# The repaired defect: the authenticated landing was treated as the business
+# surface. It is not. Login proves the landing and stops; the first business
+# entry opens the EMS application with exactly one real click, and everything
+# after it is the existing EB Bill route, unchanged. These cases fix that one
+# click -- how it is resolved, when it is allowed, and every way it can end.
+
+
+class EmsApplicationEntryTests(unittest.TestCase):
+    """One exact EMS click, once per run, and never from a restored address."""
+
+    def route(self, **kwargs):
+        clock = RecoveryClock()
+        page = FakeResultsPage(clock=clock, **kwargs)
+        portal = PlaywrightPortal(ResultsConfig(), headed=False)
+        portal.page = page
+        return portal, page, clock
+
+    def enter(self, **kwargs):
+        """Run the real first-entry contract and return what it did."""
+        portal, page, clock = self.route(**kwargs)
+        error = None
+        with simulated_clock(clock):
+            try:
+                portal._open_verified_results()
+            except AppError as exc:
+                error = exc
+        return page, error
+
+    # ---- E01: the landing is not the business surface ---- #
+
+    def test_the_authenticated_landing_carries_no_business_navigation(self) -> None:
+        """E01. EMS is there; Billing Manager and EB Bill are not."""
+        _portal, page, _clock = self.route()
+        self.assertEqual(page.route, "landing")
+        self.assertEqual(page.get_by_role("button", name="EMS", exact=True).count(), 1)
+        self.assertEqual(
+            page.get_by_role("link", name="Billing Manager", exact=True).count(), 0
+        )
+        self.assertEqual(page.get_by_role("link", name="EB Bill", exact=True).count(), 0)
+
+    def test_the_owner_confirmed_entry_sequence_starts_with_one_ems_click(self) -> None:
+        """E02. EMS, then Billing Manager, EB Bill, account and Search."""
+        portal, page, clock = self.route()
+        with simulated_clock(clock):
+            inventory = portal.inventory(20)
+
+        self.assertEqual([bill.filename for bill in inventory], ["2026-01-01_synthetic.pdf"])
+        self.assertEqual(
+            page.events,
+            ["ems", "billing_manager", "eb_bill", "select_account", "search"],
+        )
+        self.assertEqual(page.ems_actuations, 1)
+        self.assertEqual(page.clicks["ems"], 1)
+
+    # ---- E03-E06: the three failure classes, on the entry itself ---- #
+
+    def test_an_ems_readiness_failure_fails_before_any_dispatch(self) -> None:
+        """E03. Not actionable is proven first, so nothing is ever clicked."""
+        page, error = self.enter(ems_actionable=False)
+        self.assertIsInstance(error, LayoutChangedError)
+        self.assertEqual(error.message, "EMS application entry control is not ready")
+        self.assertEqual(cli.support_ref_for(error), "EG_NAV_EMS_ENTRY_NOT_READY")
+        self.assertEqual(page.clicks, {}, "a readiness failure dispatches nothing")
+        self.assertEqual(page.ems_actuations, 0)
+        self.assertGreater(page.trial_clicks["ems"], 1, "actionability was re-proven")
+
+    def test_a_duplicate_ems_entry_fails_closed_without_narrowing(self) -> None:
+        """E04. Two exact matches: neither is chosen, and the selector holds."""
+        page, error = self.enter(ems_matches=2)
+        self.assertIsInstance(error, LayoutChangedError)
+        self.assertEqual(error.message, "EMS application entry control is not ready")
+        self.assertEqual(page.clicks, {}, "ambiguity is never narrowed to one control")
+        self.assertEqual(page.ems_actuations, 0)
+
+    def test_an_unreadable_ems_entry_fails_closed_without_dispatching(self) -> None:
+        """E05. A state that cannot be read is drift, not evidence of readiness."""
+        page, error = self.enter(ems_state_error=RuntimeError(STEP_FAILURE_TEXT))
+        self.assertIsInstance(error, LayoutChangedError)
+        self.assertEqual(error.message, "EMS application entry control is not ready")
+        self.assertEqual(page.clicks, {})
+        self.assertNotIn("hunter2", error.message)
+        self.assertNotIn("portal.example.invalid", error.message)
+
+    def test_an_ems_click_exception_is_uncertain_and_terminal(self) -> None:
+        """E06. It may have landed, so it is never sent again."""
+        page, error = self.enter(ems_click_error=RuntimeError(STEP_FAILURE_TEXT))
+        self.assertIsInstance(error, LayoutChangedError)
+        self.assertEqual(
+            error.message, "EMS application entry dispatch outcome uncertain"
+        )
+        self.assertEqual(
+            cli.support_ref_for(error), "EG_NAV_EMS_ENTRY_DISPATCH_UNCERTAIN"
+        )
+        self.assertEqual(page.clicks["ems"], 1, "never retried, never re-resolved")
+        self.assertEqual(page.clicks.get("billing_manager", 0), 0)
+        self.assertEqual(page.clicks.get("eb_bill", 0), 0)
+        self.assertNotIn("hunter2", error.message)
+
+    def test_an_inert_ems_click_stops_at_the_existing_downstream_failure(self) -> None:
+        """E07. The click landed and opened nothing: downstream says so.
+
+        The entry was consumed, so the contract does not look for it again. The
+        surface simply never became the application, which the existing Billing
+        Manager readiness failure already names exactly.
+        """
+        page, error = self.enter(ems_click_inert=True)
+        self.assertIsInstance(error, LayoutChangedError)
+        self.assertEqual(error.message, "Billing Manager navigation control is not ready")
+        self.assertEqual(
+            cli.support_ref_for(error), "EG_NAV_BILLING_MANAGER_NOT_READY"
+        )
+        self.assertEqual(page.ems_actuations, 1, "exactly one actuation, and no retry")
+        self.assertEqual(page.clicks["ems"], 1)
+
+    # ---- E08: readiness still recovers, and still clicks once ---- #
+
+    def test_a_delayed_ems_entry_is_recovered_and_clicked_once(self) -> None:
+        """E08. The shared bounded ladder owns the waiting, not a second one."""
+        portal, page, clock = self.route(ems_delay=3, ems_actionable_delay=1)
+        with simulated_clock(clock):
+            inventory = portal.inventory(20)
+
+        self.assertEqual(len(inventory), 1)
+        self.assertEqual(page.clicks["ems"], 1)
+        self.assertEqual(page.ems_actuations, 1)
+        self.assertGreater(page.looks["ems"], 3, "each look resolved a fresh locator")
+        self.assertTrue(clock.yields, "the delay was waited out, not polled tightly")
+
+    def test_an_ems_entry_that_never_settles_costs_exactly_one_window(self) -> None:
+        """E08b. The entry gets one bounded window, and then fails closed."""
+        portal, page, clock = self.route(ems_visible_delay=10 ** 6)
+        with simulated_clock(clock):
+            with self.assertRaises(LayoutChangedError) as caught:
+                portal._enter_ems_application(page)
+
+        self.assertEqual(
+            caught.exception.message, "EMS application entry control is not ready"
+        )
+        self.assertEqual(page.clicks, {}, "an unsettled entry dispatches nothing")
+        self.assertLessEqual(clock.elapsed_ms(), RECOVERY_CEILING_MS)
+
+    # ---- E09: the selector is exact, and stays exact ---- #
+
+    def test_the_ems_entry_selector_is_exact_and_never_weakened(self) -> None:
+        """E09. Role button, name EMS, exact -- and no second mechanism."""
+        seen: list[tuple] = []
+
+        class SelectorRecorder(FakeResultsPage):
+            def get_by_role(self, role, name=None, exact=False):
+                seen.append((role, name, exact))
+                return super().get_by_role(role, name=name, exact=exact)
+
+            def get_by_text(self, *args, **kwargs):
+                raise AssertionError("the entry never resolves a control by text")
+
+        clock = RecoveryClock()
+        page = SelectorRecorder(clock=clock)
+        portal = PlaywrightPortal(ResultsConfig(), headed=False)
+        portal.page = page
+        with simulated_clock(clock):
+            portal._enter_ems_application(page)
+
+        self.assertEqual(
+            [entry for entry in seen if entry[1] == "EMS"],
+            [("button", "EMS", True)],
+            "one exact resolution, by role and name only",
+        )
+        source = pathlib_read_portal_source()
+        entry = source[
+            source.index("def _enter_ems_application") : source.index(
+                "def _open_eb_bill_route"
+            )
+        ]
+        for forbidden in (".first", "get_by_text", "dispatch_event", "press("):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, entry)
+        self.assertEqual(entry.count("control.click()"), 1, "one dispatch, and only one")
+
+    # ---- E10: a restored results address never re-enters the application ---- #
+
+    def test_a_restored_results_address_never_re_actuates_ems(self) -> None:
+        """E10. Inventory then download is one EMS actuation in total."""
+        portal, page, clock = self.route(pages=(("a.pdf", "b.pdf"), ("c.pdf",)))
+        with tempfile.TemporaryDirectory() as directory:
+            with simulated_clock(clock):
+                inventory = portal.inventory(20)
+                self.assertEqual(page.ems_actuations, 1)
+                portal.download(inventory[0], Path(directory) / "download.bin")
+
+        self.assertEqual(
+            page.ems_actuations, 1, "a restored address is already inside the application"
+        )
+        self.assertEqual(page.clicks["ems"], 1)
+        self.assertIn("goto", page.events)
+
+    # ---- E11: the two EMS symbols are separate, and must stay in step ---- #
+
+    def test_the_authentication_witness_and_the_business_entry_stay_in_step(self) -> None:
+        """E11. Same text today, separate symbols, and drift is caught here.
+
+        Authentication reads a witness; business navigation clicks a control.
+        They are declared apart so either can move on its own -- and this case
+        is what makes moving one of them a decision rather than an accident.
+        """
+        self.assertEqual(portal_module.AUTHENTICATION_WITNESS_ROLE, "button")
+        self.assertEqual(portal_module.AUTHENTICATION_WITNESS_NAME, "EMS")
+        self.assertEqual(portal_module.EMS_ENTRY_NAV_NAME, "EMS")
+        self.assertEqual(
+            portal_module.EMS_ENTRY_NAV_NAME,
+            portal_module.AUTHENTICATION_WITNESS_NAME,
+            "the landing witness and the application entry currently name one control",
+        )
+        source = pathlib_read_portal_source()
+        self.assertIn('EMS_ENTRY_NAV_NAME = "EMS"', source)
+        self.assertIn('AUTHENTICATION_WITNESS_NAME = "EMS"', source)
+        entry = source[
+            source.index("def _enter_ems_application") : source.index(
+                "def _open_eb_bill_route"
+            )
+        ]
+        self.assertIn("EMS_ENTRY_NAV_NAME", entry)
+        self.assertNotIn(
+            "AUTHENTICATION_WITNESS_NAME",
+            entry,
+            "business navigation never clicks the authentication witness symbol",
+        )
 
 
 class BusinessNavigationReferenceTests(unittest.TestCase):
     """Completeness in both directions for the navigation vocabulary."""
 
     NAVIGATION_BRANCHES = (
-        {"billing_manager_actionable": False},
-        {"billing_manager_click_error": RuntimeError(STEP_FAILURE_TEXT)},
-        {"eb_bill_actionable": False},
+        {"start_route": "app", "billing_manager_actionable": False},
+        {
+            "start_route": "app",
+            "billing_manager_click_error": RuntimeError(STEP_FAILURE_TEXT),
+        },
+        {"start_route": "app", "eb_bill_actionable": False},
         {"start_route": "billing", "eb_bill_click_error": RuntimeError(STEP_FAILURE_TEXT)},
         {"start_route": "billing", "eb_bill_click_inert": True},
     )
 
+    # The EMS application entry is reached from `_open_verified_results()`
+    # rather than from `_open_eb_bill_route()`, so its two references are driven
+    # through the entry point that owns them.
+    EMS_ENTRY_BRANCHES = (
+        {"ems_actionable": False},
+        {"ems_click_error": RuntimeError(STEP_FAILURE_TEXT)},
+    )
+
+    def drive(self, kwargs, entry: str):
+        """Run one navigation branch through the entry point that owns it."""
+        clock = RecoveryClock()
+        page = FakeResultsPage(clock=clock, **kwargs)
+        portal = PlaywrightPortal(ResultsConfig(), headed=False)
+        portal.page = page
+        with simulated_clock(clock):
+            with self.assertRaises(LayoutChangedError) as caught:
+                if entry == "ems":
+                    portal._open_verified_results()
+                else:
+                    portal._open_eb_bill_route(page)
+        return page, caught.exception
+
+    def branches(self):
+        for kwargs in self.NAVIGATION_BRANCHES:
+            yield kwargs, "eb_bill_route"
+        for kwargs in self.EMS_ENTRY_BRANCHES:
+            yield kwargs, "ems"
+
     def test_every_navigation_reference_is_reachable_and_none_is_unmapped(self) -> None:
         reached: set[str] = set()
-        for kwargs in self.NAVIGATION_BRANCHES:
-            clock = RecoveryClock()
-            page = FakeResultsPage(clock=clock, **kwargs)
-            portal = PlaywrightPortal(ResultsConfig(), headed=False)
-            portal.page = page
-            with simulated_clock(clock):
-                with self.assertRaises(LayoutChangedError) as caught:
-                    portal._open_eb_bill_route(page)
-            error = caught.exception
+        for kwargs, entry in self.branches():
+            _page, error = self.drive(kwargs, entry)
             self.assertIn(error.message, cli.SUPPORT_REFS_BY_MESSAGE, error.message)
             reached.add(cli.support_ref_for(error))
             # Nothing the raised exception carried may survive into a message.
@@ -3337,16 +3805,10 @@ class BusinessNavigationReferenceTests(unittest.TestCase):
         self.assertTrue(reached.isdisjoint(cli.RETIRED_SUPPORT_REFS))
 
     def test_a_navigation_failure_never_reports_a_login_reference(self) -> None:
-        """Billing Manager after a proven landing is navigation, not login."""
-        for kwargs in self.NAVIGATION_BRANCHES:
-            clock = RecoveryClock()
-            page = FakeResultsPage(clock=clock, **kwargs)
-            portal = PlaywrightPortal(ResultsConfig(), headed=False)
-            portal.page = page
-            with simulated_clock(clock):
-                with self.assertRaises(LayoutChangedError) as caught:
-                    portal._open_eb_bill_route(page)
-            reference = cli.support_ref_for(caught.exception)
+        """Business navigation after a proven landing is never a login failure."""
+        for kwargs, entry in self.branches():
+            _page, error = self.drive(kwargs, entry)
+            reference = cli.support_ref_for(error)
             with self.subTest(reference=reference):
                 self.assertFalse(reference.startswith("EG_LOGIN_"))
                 self.assertNotEqual(reference, cli.UNCLASSIFIED_SUPPORT_REF)
