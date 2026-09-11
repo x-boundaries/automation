@@ -674,6 +674,11 @@ class SupportReferenceContractTests(unittest.TestCase):
         self.assertEqual(
             cli.NAVIGATION_SUPPORT_REFS,
             {
+                # DL-XB-141-EMS-ENTRY-MINIMAL-REPAIR-G2-136. The EMS application
+                # entry runs after the landing is already proven, so its two
+                # failures are navigation references like every step after them.
+                "EG_NAV_EMS_ENTRY_NOT_READY",
+                "EG_NAV_EMS_ENTRY_DISPATCH_UNCERTAIN",
                 "EG_NAV_BILLING_MANAGER_NOT_READY",
                 "EG_NAV_BILLING_MANAGER_DISPATCH_UNCERTAIN",
                 "EG_NAV_EB_BILL_NOT_READY",
@@ -688,6 +693,36 @@ class SupportReferenceContractTests(unittest.TestCase):
                     ref.startswith("EG_NAV_"),
                     "a navigation failure never borrows the login vocabulary",
                 )
+
+    def test_the_ems_entry_references_are_mapped_exactly_and_stay_navigation(self) -> None:
+        """The application entry has its own two references, and no others."""
+        for message, ref in (
+            (
+                "EMS application entry control is not ready",
+                "EG_NAV_EMS_ENTRY_NOT_READY",
+            ),
+            (
+                "EMS application entry dispatch outcome uncertain",
+                "EG_NAV_EMS_ENTRY_DISPATCH_UNCERTAIN",
+            ),
+        ):
+            with self.subTest(ref=ref):
+                self.assertEqual(
+                    cli.support_ref_for(LayoutChangedError(message)), ref
+                )
+                self.assertIn(ref, cli.NAVIGATION_SUPPORT_REFS)
+                self.assertNotIn(ref, cli.RETIRED_SUPPORT_REFS)
+                self.assertFalse(ref.startswith("EG_LOGIN_"))
+        # The wording is owned by portal.py, so a reword there fails here
+        # rather than silently degrading to the generic reference.
+        self.assertEqual(
+            portal_module.NAV_EMS_ENTRY_NOT_READY_MESSAGE,
+            "EMS application entry control is not ready",
+        )
+        self.assertEqual(
+            portal_module.NAV_EMS_ENTRY_UNCERTAIN_MESSAGE,
+            "EMS application entry dispatch outcome uncertain",
+        )
 
     def test_historical_submit_message_remains_mapped_but_retired(self) -> None:
         error = LayoutChangedError("login submission did not complete")

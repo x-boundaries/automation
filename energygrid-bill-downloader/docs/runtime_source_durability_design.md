@@ -451,8 +451,9 @@ A witness that could not be read is null, and null satisfies neither a positive 
 an absence test, so an unreadable surface fails closed rather than classifying.
 
 **Side-effect boundary.** The diagnostic is structurally unable to reach
-`_await_authenticated_landing`, `_open_verified_results`, the EB Bill route
-proof, the Billing Manager click, the EB Bill click, tenant or account
+`_await_authenticated_landing`, `_open_verified_results`, the EMS application
+entry click, the EB Bill route proof, the Billing Manager click, the EB Bill
+click, tenant or account
 selection, Search, inventory, pagination, download, PDF publication, archive mutation,
 state mutation, temp cleanup, idempotency or reconciliation, the Scheduler, n8n, or
 AutoCount. On the application side it loads and validates the configuration without
@@ -488,8 +489,43 @@ contract failure. It never emits `10`. The launcher's own `70`-`73` band is unch
 and remains disjoint from it.
 
 **Business navigation (Contract B).** `_open_verified_results()` owns the route
-from the authenticated landing to the confirmed post-search invoice list. The
-superseded shortcut inferred the route from the presence of the tenant/account
+from the authenticated landing to the confirmed post-search invoice list.
+
+**The authenticated landing is not the business surface.** Proving the landing
+proves that the portal accepted the credentials; it does not put the session
+inside the application. The landing exposes the exact `EMS` control and no
+business navigation at all, so Billing Manager and EB Bill are not yet present
+and cannot be waited for. The first business entry therefore actuates the EMS
+application entry exactly once, using a freshly resolved
+`get_by_role("button", name="EMS", exact=True)`. The control is resolved for
+this purpose rather than reusing the authentication witness locator: the witness
+answered whether a landing was authenticated, which is not evidence that a
+business control is usable now. `EMS_ENTRY_NAV_NAME` and
+`AUTHENTICATION_WITNESS_NAME` currently carry the same text and stay separate
+symbols, with a regression that fails if they drift apart.
+
+Readiness uses the same shared bounded navigation discipline as every other
+navigation control: exactly one exact match, visible, enabled and
+trial-actionable. Zero matches, duplicate matches, a hidden, disabled or
+unactionable control, and an unreadable resolution all fail closed before any
+dispatch as `EG_NAV_EMS_ENTRY_NOT_READY`; an ambiguous match is never narrowed
+to one of its matches and the selector is never weakened. The normal click is
+the dispatch and consumption boundary: if it raises, the outcome is terminal
+`EG_NAV_EMS_ENTRY_DISPATCH_UNCERTAIN` and the click is never sent again, the
+control is never re-resolved, and there is no re-login, fallback opener,
+alternate dispatch mechanism or second EMS click. A successful click hands
+control straight to the existing `_open_eb_bill_route()`, which remains
+authoritative for everything after it; no second navigation or recovery system
+exists. A click that lands but opens nothing therefore surfaces as the existing
+downstream `EG_NAV_BILLING_MANAGER_NOT_READY`, not as a repeated entry attempt.
+
+**Restored results addresses never re-actuate EMS.** The entry belongs to the
+first-entry arm of `_open_verified_results()` only. A run restored through a
+saved results address is already inside the application, so that arm actuates
+nothing: `inventory()` followed by any number of `download()` calls performs
+exactly one EMS application entry in total.
+
+The superseded shortcut inferred the route from the presence of the tenant/account
 selector; that selector renders on more than one route, so its presence never
 proved that EB Bill was active, and the inference is removed. Route identity is
 proven positively by internal-only same-origin path equivalence between the
@@ -506,9 +542,10 @@ trial-actionable and clicked exactly once, with no Billing Manager click at all;
 otherwise the exact Billing Manager control is proven ready and clicked exactly
 once, EB Bill readiness is waited for on the shared bounded ladder, and EB Bill
 is clicked exactly once. Every click boundary distinguishes a pre-dispatch
-readiness failure (`EG_NAV_BILLING_MANAGER_NOT_READY`,
-`EG_NAV_EB_BILL_NOT_READY`) from an uncertain dispatch
-(`EG_NAV_BILLING_MANAGER_DISPATCH_UNCERTAIN`,
+readiness failure (`EG_NAV_EMS_ENTRY_NOT_READY`,
+`EG_NAV_BILLING_MANAGER_NOT_READY`, `EG_NAV_EB_BILL_NOT_READY`) from an
+uncertain dispatch (`EG_NAV_EMS_ENTRY_DISPATCH_UNCERTAIN`,
+`EG_NAV_BILLING_MANAGER_DISPATCH_UNCERTAIN`,
 `EG_NAV_EB_BILL_DISPATCH_UNCERTAIN`) from a postcondition that never became
 proven (`EG_NAV_RESULTS_ROUTE_UNPROVED`). No click is retried, there is no
 alternate opener, no fallback or generic-text selector, no narrowing of an

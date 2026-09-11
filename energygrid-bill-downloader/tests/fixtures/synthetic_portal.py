@@ -76,6 +76,10 @@ class SyntheticPortalServer:
         self.download_counts: dict[str, int] = {}
         self.search_count = 0
         self.activation_count = 0
+        # Every real EMS actuation this fixture observed, from any surface.
+        # Downstream chrome keeps its EMS control, so an accidental second
+        # click is counted here rather than silently disappearing.
+        self.ems_actuation_count = 0
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
 
@@ -279,30 +283,90 @@ class SyntheticPortalServer:
                     "</form>" + script,
                 )
 
-            def _authenticated_shell(self) -> str:
-                """The authenticated-landing witness, and only it.
+            def _ems_control(self) -> str:
+                """The exact `EMS` control, as both witness and business entry.
 
-                The exact `EMS` control is what proves authentication on the
-                observed surface. It is deliberately independent of Billing
-                Manager, so a landing with no Billing Manager at all still
-                authenticates and fails later, in navigation.
+                One control carries both meanings on the observed surface: it is
+                the authentication witness the landing is proven by, and it is
+                the application entry business navigation actuates. The drift
+                variants are therefore shared, and `disabled_ems` is the case
+                that separates them -- authentication only ever reads a count
+                and a visibility, so a disabled control still proves the landing
+                while failing the readiness the entry click requires.
                 """
 
                 if fixture.variant == "missing_ems":
                     return ""
                 if fixture.variant == "ambiguous_ems":
                     return (
-                        '<button type="button">EMS</button>'
-                        '<button type="button">EMS</button>'
+                        '<button type="button" data-testid="ems-entry">EMS</button>'
+                        '<button type="button" data-testid="ems-entry">EMS</button>'
                     )
                 if fixture.variant == "hidden_ems":
                     # Still in the accessibility tree, with an empty box.
                     return (
-                        '<button type="button" '
+                        '<button type="button" data-testid="ems-entry" '
                         'style="width:0;height:0;padding:0;border:0;overflow:hidden">'
                         "EMS</button>"
                     )
-                return '<button type="button">EMS</button>'
+                if fixture.variant == "disabled_ems":
+                    return (
+                        '<button type="button" data-testid="ems-entry" disabled>'
+                        "EMS</button>"
+                    )
+                return '<button type="button" data-testid="ems-entry">EMS</button>'
+
+            def _authenticated_shell(self, *, entry: bool = False) -> str:
+                """The authenticated chrome: the exact EMS control and its script.
+
+                `entry` is what tells the landing apart from every surface after
+                it. On the landing an actuation records itself and opens the
+                application; on downstream chrome it records itself and goes
+                nowhere, so an accidental second EMS click stays observable in
+                `ems_actuation_count` instead of vanishing.
+
+                The record is a synchronous request, exactly like the semantics
+                gate above, so the count is committed before any navigation the
+                handler starts.
+                """
+
+                control = self._ems_control()
+                if not control:
+                    return ""
+                target = "null"
+                if entry and fixture.variant != "inert_ems":
+                    target = "'/ems'"
+                script = """
+                <script>
+                (function () {
+                    const target = %(target)s;
+                    function recordEms() {
+                        const request = new XMLHttpRequest();
+                        request.open('GET', '/synthetic-ems', false);
+                        request.send();
+                    }
+                    for (const control of document.querySelectorAll('[data-testid="ems-entry"]')) {
+                        control.addEventListener('click', function () {
+                            recordEms();
+                            if (target) window.location.href = target;
+                        });
+                    }
+                })();
+                </script>
+                """ % {"target": target}
+                return control + script
+
+            def _landing_page(self) -> bytes:
+                """The authenticated landing, which is NOT the business surface.
+
+                It exposes the EMS control and no business navigation at all.
+                Billing Manager and EB Bill become reachable only after exactly
+                one EMS actuation, so a build that skipped the application entry
+                fails here rather than passing against a surface that the
+                observed portal never presents.
+                """
+
+                return self._page("Landing", self._authenticated_shell(entry=True))
 
             def _app_page(self) -> bytes:
                 if fixture.variant == "missing_billing_manager":
@@ -527,8 +591,16 @@ class SyntheticPortalServer:
                 }});
                 </script>
                 """
+                # The results route is authenticated application chrome, so it
+                # keeps the same exact EMS control every other downstream
+                # surface keeps. Built without `entry=True`, an actuation here
+                # records itself and navigates nowhere, which is precisely what
+                # makes an accidental second EMS click on results, a paginated
+                # results page or a restored results address observable in
+                # `ems_actuation_count` instead of silently vanishing.
                 content = (
-                    eb_bill_markup
+                    self._authenticated_shell()
+                    + eb_bill_markup
                     + account_markup
                     + '<div data-testid="selected-account">'
                     + escape(displayed)
@@ -561,6 +633,13 @@ class SyntheticPortalServer:
                     self._send(self._login_page("Session expired"), status=HTTPStatus.UNAUTHORIZED)
                     return
                 if parsed.path == "/app":
+                    self._send(self._landing_page())
+                    return
+                if parsed.path == "/synthetic-ems":
+                    fixture.ems_actuation_count += 1
+                    self._send(b"ok", content_type="text/plain")
+                    return
+                if parsed.path == "/ems":
                     self._send(self._app_page())
                     return
                 if parsed.path == "/billing":

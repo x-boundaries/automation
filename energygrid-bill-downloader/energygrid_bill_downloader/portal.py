@@ -237,9 +237,21 @@ DIAGNOSTIC_CONTINUABLE_CLASSIFICATIONS = (
 # are business navigation, never authentication evidence, and each message
 # below distinguishes a pre-dispatch readiness failure from an uncertain
 # dispatch and from a postcondition that never became proven.
+#
+# The authenticated landing is not itself the business surface
+# (DL-XB-141-EMS-ENTRY-MINIMAL-REPAIR-G2-136): entering the EMS application is
+# the first business navigation step, and it is named here rather than borrowed
+# from the authentication witness. `EMS_ENTRY_NAV_NAME` and
+# `AUTHENTICATION_WITNESS_NAME` currently carry the same text and stay
+# deliberately separate symbols, because they answer different questions -- one
+# is the evidence a landing is authenticated, the other is the control that is
+# clicked -- and either may move without the other.
+EMS_ENTRY_NAV_NAME = "EMS"
 BILLING_MANAGER_NAV_NAME = "Billing Manager"
 EB_BILL_NAV_NAME = "EB Bill"
 
+NAV_EMS_ENTRY_NOT_READY_MESSAGE = "EMS application entry control is not ready"
+NAV_EMS_ENTRY_UNCERTAIN_MESSAGE = "EMS application entry dispatch outcome uncertain"
 NAV_BILLING_MANAGER_NOT_READY_MESSAGE = "Billing Manager navigation control is not ready"
 NAV_BILLING_MANAGER_UNCERTAIN_MESSAGE = "Billing Manager navigation dispatch outcome uncertain"
 NAV_EB_BILL_NOT_READY_MESSAGE = "EB Bill navigation control is not ready"
@@ -1457,16 +1469,26 @@ class PlaywrightPortal:
         """Own the business route to verified results, after authentication.
 
         `login()` proves authentication and stops there
-        (DL-XB-141-AUTH-LANDING-NAV-SEPARATION-G2-001). Everything from the
-        Billing Manager entry to the confirmed post-search invoice list belongs
-        here, so a Billing Manager or EB Bill that never becomes usable is a
-        navigation failure and is never reported as a login failure.
+        (DL-XB-141-AUTH-LANDING-NAV-SEPARATION-G2-001). Everything from the EMS
+        application entry to the confirmed post-search invoice list belongs
+        here, so an EMS entry, Billing Manager or EB Bill that never becomes
+        usable is a navigation failure and is never reported as a login failure.
+
+        The authenticated landing is not the business surface
+        (DL-XB-141-EMS-ENTRY-MINIMAL-REPAIR-G2-136). A first entry therefore
+        opens the EMS application exactly once and then hands the route
+        straight to `_open_eb_bill_route()`, which stays authoritative for
+        everything after it. A restored results address is already inside the
+        application, so that arm never actuates EMS at all: re-entering it would
+        be a second real click that navigates nothing.
         """
 
         page = self._require_page()
         try:
             if entry_url is not None:
                 page.goto(entry_url, wait_until="domcontentloaded")
+            else:
+                self._enter_ems_application(page)
 
             def account_locator() -> Any:
                 return page.get_by_label("Tenant/account", exact=True)
@@ -1510,6 +1532,62 @@ class PlaywrightPortal:
             raise
         except Exception as exc:
             raise LayoutChangedError("tenant/account search result contract changed") from exc
+
+    def _enter_ems_application(self, page: Any) -> None:
+        """Prove the EMS application entry ready, then click it exactly once.
+
+        This is the structural twin of `_dispatch_billing_manager()`, and
+        deliberately nothing more. The control is resolved freshly here rather
+        than reusing the locator the authentication witness was read through:
+        that witness answered whether the landing was authenticated, which is
+        not evidence that a business control is usable now.
+
+        Readiness is proven on the existing shared bounded ladder -- exactly one
+        exact match, visible, enabled and trial-actionable -- so an absent,
+        duplicate, hidden, disabled or unreadable entry fails closed before
+        anything is dispatched. An ambiguous match is never narrowed to one of
+        its matches, and the selector is never weakened to another role, name
+        or generic text.
+
+        Proving readiness is classified here, not left to the caller. The shared
+        ladder deliberately lets a non-timeout failure out of its enabled and
+        trial-actionability probes intact, because a state that cannot be read
+        is drift rather than lag and must never become a retry. Intact, however,
+        it is also unclassified: it would leave this method as a bare browser
+        exception and reach `_open_verified_results()`, whose generic arm would
+        report a tenant/account contract failure for something that happened on
+        the landing before any dispatch at all. So every way readiness can end
+        without a proven control -- absent, duplicate, hidden, disabled,
+        unreadable enabled-state, unreadable actionability -- is committed to
+        the one pre-dispatch classification, with zero EMS clicks and therefore
+        zero downstream dispatch. Only the shared ladder decides how long to
+        wait; this adds no window, no look and no retry of its own.
+
+        The normal click is the dispatch boundary, and is deliberately outside
+        that normalisation. Once it begins, an exception cannot prove whether
+        the browser acted, so the outcome is uncertain and terminal: there is no
+        second EMS click, no re-resolution, no re-login and no fallback opener.
+        A successful click hands the route to `_open_eb_bill_route()`
+        immediately, so no second navigation or recovery system exists here.
+        """
+
+        try:
+            control = self._resolve_ready_control(
+                page,
+                lambda: page.get_by_role("button", name=EMS_ENTRY_NAV_NAME, exact=True),
+                "EMS application entry control",
+                require_trial_actionable=True,
+                messages=_uniform_messages(NAV_EMS_ENTRY_NOT_READY_MESSAGE),
+            )
+        except Exception as exc:
+            # Nothing has been dispatched at this point, so the committed
+            # pre-dispatch message is the whole truth regardless of which probe
+            # failed or how. The cause is chained, never surfaced.
+            raise LayoutChangedError(NAV_EMS_ENTRY_NOT_READY_MESSAGE) from exc
+        try:
+            control.click()
+        except Exception as exc:
+            raise LayoutChangedError(NAV_EMS_ENTRY_UNCERTAIN_MESSAGE) from exc
 
     def _open_eb_bill_route(self, page: Any) -> None:
         """Put the page on the exact EB Bill route, dispatching as little as possible.
