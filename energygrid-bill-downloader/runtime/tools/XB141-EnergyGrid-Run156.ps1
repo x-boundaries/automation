@@ -31,9 +31,6 @@ $script:R156LocatorRelative = 'X-Boundaries\EnergyGrid\runtime_locator.json'
 $script:R156LocatorSchema = 'xb.energygrid.runtime_locator.v1'
 $script:R156ManifestSchema = 'eg_launcher_installation_manifest/v1'
 $script:R156ExpectedBranch = 'main'
-# This public constant is only the required stale installed-manifest admission value.
-# The execution repository parent is never hard-coded; it is $ExpectedParent.
-$script:R156ExpectedParentForPreimage = 'ee3d70fd3700b5e9c20874ec4472ce0f433e3134'
 $script:R156RuntimeRelative = 'energygrid-bill-downloader\runtime'
 $script:R156InstallerRelative = 'energygrid-bill-downloader\runtime\install_or_update_launcher.ps1'
 $script:R156LibraryRelative = 'energygrid-bill-downloader\runtime\launcher_lib.ps1'
@@ -47,6 +44,24 @@ $script:R156LauncherGitBlobLength = [int64]21081
 $script:R156ManifestFileName = 'installation_manifest.json'
 $script:R156PackageNames = @('launcher.ps1', 'launcher_lib.ps1', 'installation_manifest.json')
 $script:R156ManifestNames = @('launcher.ps1', 'launcher_lib.ps1')
+$script:R156GitReadOnlySubcommands = @(
+    'symbolic-ref',
+    'rev-parse',
+    'rev-list',
+    'status',
+    'ls-remote',
+    'hash-object',
+    'cat-file',
+    'config'
+)
+$script:R156CanonicalOrigins = @(
+    'https://github.com/x-boundaries/automation',
+    'https://github.com/x-boundaries/automation.git',
+    'git@github.com:x-boundaries/automation',
+    'git@github.com:x-boundaries/automation.git',
+    'ssh://git@github.com/x-boundaries/automation',
+    'ssh://git@github.com/x-boundaries/automation.git'
+)
 $script:R156ValidationCheckNames = @(
     'checkout_root_absolute',
     'launcher_root_absolute',
@@ -369,10 +384,19 @@ function Invoke-R156Git {
         [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Arguments
     )
 
+    if (@($Arguments).Count -eq 0 -or
+        $script:R156GitReadOnlySubcommands -notcontains ([string]$Arguments[0])) {
+        return [pscustomobject]@{
+            Success = $false
+            ExitCode = -1
+            Lines = [string[]]@()
+        }
+    }
+
     $startInfo = New-Object System.Diagnostics.ProcessStartInfo
     $startInfo.FileName = 'git.exe'
     $quoted = @()
-    foreach ($argument in @($Arguments)) {
+    foreach ($argument in @('--no-optional-locks') + @($Arguments)) {
         $quoted = $quoted + (ConvertTo-R156NativeArgument -Value ([string]$argument))
     }
     $startInfo.Arguments = [string]::Join(' ', $quoted)
@@ -381,7 +405,15 @@ function Invoke-R156Git {
     $startInfo.RedirectStandardOutput = $true
     $startInfo.RedirectStandardError = $true
     $startInfo.CreateNoWindow = $true
+    $inheritedGitNames = @($startInfo.EnvironmentVariables.Keys |
+        Where-Object { ([string]$_) -like 'GIT_*' })
+    foreach ($name in $inheritedGitNames) {
+        [void]$startInfo.EnvironmentVariables.Remove([string]$name)
+    }
     $startInfo.EnvironmentVariables['GIT_TERMINAL_PROMPT'] = '0'
+    $startInfo.EnvironmentVariables['GIT_OPTIONAL_LOCKS'] = '0'
+    $startInfo.EnvironmentVariables['GIT_CONFIG_NOSYSTEM'] = '1'
+    $startInfo.EnvironmentVariables['GIT_CONFIG_GLOBAL'] = 'NUL'
 
     $process = $null
     try {
@@ -430,6 +462,21 @@ function Get-R156RepositoryState {
     $status = Invoke-R156Git -RepositoryRoot $RepositoryRoot -Arguments @(
         'status', '--porcelain=v1', '--untracked-files=all'
     )
+    $topLevel = Invoke-R156Git -RepositoryRoot $RepositoryRoot -Arguments @(
+        'rev-parse', '--show-toplevel'
+    )
+    $insideWorkTree = Invoke-R156Git -RepositoryRoot $RepositoryRoot -Arguments @(
+        'rev-parse', '--is-inside-work-tree'
+    )
+    $gitDirectory = Invoke-R156Git -RepositoryRoot $RepositoryRoot -Arguments @(
+        'rev-parse', '--git-dir'
+    )
+    $commonDirectory = Invoke-R156Git -RepositoryRoot $RepositoryRoot -Arguments @(
+        'rev-parse', '--git-common-dir'
+    )
+    $origin = Invoke-R156Git -RepositoryRoot $RepositoryRoot -Arguments @(
+        'config', '--no-includes', '--local', '--get-all', 'remote.origin.url'
+    )
 
     $branchValue = ''
     if ($branch.Success -and $branch.Lines.Count -eq 1) {
@@ -454,12 +501,41 @@ function Get-R156RepositoryState {
             $parentValue = $parts[1].ToLowerInvariant()
         }
     }
+    $topLevelValue = ''
+    if ($topLevel.Success -and $topLevel.Lines.Count -eq 1) {
+        $topLevelValue = $topLevel.Lines[0].Trim()
+    }
+    $insideWorkTreeValue = ''
+    if ($insideWorkTree.Success -and $insideWorkTree.Lines.Count -eq 1) {
+        $insideWorkTreeValue = $insideWorkTree.Lines[0].Trim().ToLowerInvariant()
+    }
+    $gitDirectoryValue = ''
+    if ($gitDirectory.Success -and $gitDirectory.Lines.Count -eq 1) {
+        $gitDirectoryValue = Resolve-R156RepositoryPath `
+            -RepositoryRoot $RepositoryRoot -Value $gitDirectory.Lines[0].Trim()
+    }
+    $commonDirectoryValue = ''
+    if ($commonDirectory.Success -and $commonDirectory.Lines.Count -eq 1) {
+        $commonDirectoryValue = Resolve-R156RepositoryPath `
+            -RepositoryRoot $RepositoryRoot -Value $commonDirectory.Lines[0].Trim()
+    }
+    $originValues = @()
+    if ($origin.Success) {
+        foreach ($line in @($origin.Lines)) {
+            $originValues = $originValues + ([string]$line).Trim()
+        }
+    }
     return [pscustomobject]@{
         Branch = $branchValue
         Head = $headValue
         Tree = $treeValue
         Parent = $parentValue
         ParentCount = $parentCount
+        TopLevel = $topLevelValue
+        InsideWorkTree = $insideWorkTreeValue
+        GitDirectory = $gitDirectoryValue
+        CommonDirectory = $commonDirectoryValue
+        Origin = [string[]]$originValues
         Clean = (
             $status.Success -and
             $status.Lines.Count -eq 0
@@ -469,14 +545,101 @@ function Get-R156RepositoryState {
             $head.Success -and
             $tree.Success -and
             $parents.Success -and
-            $status.Success
+            $status.Success -and
+            $topLevel.Success -and
+            $insideWorkTree.Success -and
+            $gitDirectory.Success -and
+            $commonDirectory.Success -and
+            $origin.Success
         )
+    }
+}
+
+function Resolve-R156RepositoryPath {
+    param(
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$RepositoryRoot,
+        [AllowEmptyString()][string]$Value
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        return ''
+    }
+    try {
+        $root = Get-R156FullPath -Path $RepositoryRoot
+        if ([System.IO.Path]::IsPathRooted($Value)) {
+            return Get-R156FullPath -Path $Value
+        }
+        return Get-R156FullPath -Path (Join-Path $root $Value)
+    }
+    catch {
+        return ''
+    }
+}
+
+function Test-R156CanonicalOrigin {
+    param([AllowEmptyCollection()][string[]]$Origin)
+
+    $values = @($Origin)
+    if ($values.Count -ne 1) {
+        return $false
+    }
+    foreach ($expected in @($script:R156CanonicalOrigins)) {
+        if ([string]::Equals(
+                ([string]$values[0]),
+                $expected,
+                [StringComparison]::Ordinal)) {
+            return $true
+        }
+    }
+    return $false
+}
+
+function Test-R156RepositoryIdentity {
+    param(
+        [Parameter(Mandatory)]$State,
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$RepositoryRoot
+    )
+
+    if (-not $State.ReadOk -or
+        [string]::IsNullOrWhiteSpace([string]$State.TopLevel) -or
+        [string]::IsNullOrWhiteSpace([string]$State.GitDirectory) -or
+        [string]::IsNullOrWhiteSpace([string]$State.CommonDirectory)) {
+        return $false
+    }
+    try {
+        $expectedRoot = Get-R156FullPath -Path $RepositoryRoot
+        $expectedGitMetadata = Get-R156FullPath -Path (Join-Path $expectedRoot '.git')
+        if (-not (Test-R156SamePath -Left $State.TopLevel -Right $expectedRoot)) {
+            return $false
+        }
+        if ([string]$State.InsideWorkTree -cne 'true') {
+            return $false
+        }
+        if (-not (Test-R156NormalFile -Path $expectedGitMetadata) -and
+            -not (Test-R156NormalDirectory -Path $expectedGitMetadata)) {
+            return $false
+        }
+        if (-not (Test-R156SamePath -Left $State.CommonDirectory -Right $expectedGitMetadata)) {
+            return $false
+        }
+        if (-not (Test-R156NormalDirectory -Path $State.CommonDirectory) -or
+            -not (Test-R156NormalDirectory -Path $State.GitDirectory)) {
+            return $false
+        }
+        if (-not (Test-R156PathWithin -Candidate $State.GitDirectory -Container $State.CommonDirectory)) {
+            return $false
+        }
+        return (Test-R156CanonicalOrigin -Origin $State.Origin)
+    }
+    catch {
+        return $false
     }
 }
 
 function Test-R156RepositoryFence {
     param(
         [Parameter(Mandatory)]$State,
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$RepositoryRoot,
         [Parameter(Mandatory)][string]$ExpectedHeadValue,
         [Parameter(Mandatory)][string]$ExpectedTreeValue,
         [Parameter(Mandatory)][string]$ExpectedParentValue
@@ -484,6 +647,7 @@ function Test-R156RepositoryFence {
 
     return (
         $State.ReadOk -and
+        (Test-R156RepositoryIdentity -State $State -RepositoryRoot $RepositoryRoot) -and
         $State.Branch -ceq $script:R156ExpectedBranch -and
         $State.Head -ceq $ExpectedHeadValue -and
         $State.Tree -ceq $ExpectedTreeValue -and
@@ -790,9 +954,6 @@ namespace EgR156 {
             ref uint accessMask,
             ref GENERIC_MAPPING genericMapping);
 
-        [DllImport("advapi32.dll", SetLastError = true)]
-        private static extern uint GetLengthSid(IntPtr sid);
-
         [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true,
             EntryPoint = "LookupPrivilegeNameW")]
         private static extern bool LookupPrivilegeNameW(
@@ -829,58 +990,191 @@ namespace EgR156 {
             return token;
         }
 
-        private static byte[] ReadTokenInformation(IntPtr token, int informationClass) {
-            int required = 0;
-            bool first = GetTokenInformation(token, informationClass, IntPtr.Zero, 0, out required);
-            if (first) {
-                return new byte[0];
+        private static bool HasBufferRange(
+            int bufferLength,
+            long offset,
+            long length) {
+            if (bufferLength <= 0 || offset < 0 || length < 0) {
+                return false;
             }
-            if (Marshal.GetLastWin32Error() != ERROR_INSUFFICIENT_BUFFER || required <= 0) {
-                return null;
+            if (offset > (long)bufferLength) {
+                return false;
             }
-            IntPtr buffer = IntPtr.Zero;
+            return length <= ((long)bufferLength - offset);
+        }
+
+        private static bool TryGetTokenInformationBuffer(
+            IntPtr token,
+            int informationClass,
+            out IntPtr buffer,
+            out int returnedLength) {
+            buffer = IntPtr.Zero;
+            returnedLength = 0;
+            IntPtr allocated = IntPtr.Zero;
             try {
-                buffer = Marshal.AllocHGlobal(required);
-                int returned = 0;
-                if (!GetTokenInformation(token, informationClass, buffer, required, out returned)) {
-                    return null;
+                if (token == IntPtr.Zero) {
+                    return false;
                 }
-                byte[] bytes = new byte[returned];
-                Marshal.Copy(buffer, bytes, 0, returned);
-                return bytes;
+                int required = 0;
+                bool first = GetTokenInformation(
+                    token,
+                    informationClass,
+                    IntPtr.Zero,
+                    0,
+                    out required);
+                int firstError = Marshal.GetLastWin32Error();
+                if (first ||
+                    firstError != ERROR_INSUFFICIENT_BUFFER ||
+                    required <= 0) {
+                    return false;
+                }
+                allocated = Marshal.AllocHGlobal(required);
+                int returned = 0;
+                if (!GetTokenInformation(
+                        token,
+                        informationClass,
+                        allocated,
+                        required,
+                        out returned) ||
+                    returned <= 0 ||
+                    returned > required) {
+                    return false;
+                }
+                buffer = allocated;
+                returnedLength = returned;
+                allocated = IntPtr.Zero;
+                return true;
+            }
+            catch {
+                buffer = IntPtr.Zero;
+                returnedLength = 0;
+                return false;
             }
             finally {
-                if (buffer != IntPtr.Zero) {
-                    Marshal.FreeHGlobal(buffer);
+                if (allocated != IntPtr.Zero) {
+                    Marshal.FreeHGlobal(allocated);
                 }
             }
         }
 
-        private static byte[] CopySid(IntPtr sid) {
-            if (sid == IntPtr.Zero) {
-                return null;
+        private static bool TryGetBufferOffset(
+            IntPtr buffer,
+            int bufferLength,
+            IntPtr target,
+            int minimumLength,
+            out int offset) {
+            offset = 0;
+            if (buffer == IntPtr.Zero ||
+                target == IntPtr.Zero ||
+                bufferLength <= 0 ||
+                minimumLength < 0 ||
+                minimumLength > bufferLength) {
+                return false;
             }
-            uint length = GetLengthSid(sid);
-            if (length == 0 || length > 4096) {
-                return null;
+            long bufferAddress = buffer.ToInt64();
+            long targetAddress = target.ToInt64();
+            if (bufferAddress <= 0 || targetAddress <= 0) {
+                return false;
             }
-            byte[] result = new byte[(int)length];
-            Marshal.Copy(sid, result, 0, (int)length);
-            return result;
+            long bufferEnd;
+            try {
+                bufferEnd = checked(bufferAddress + (long)bufferLength);
+            }
+            catch {
+                return false;
+            }
+            if (bufferEnd <= bufferAddress ||
+                targetAddress < bufferAddress ||
+                targetAddress > bufferEnd - (long)minimumLength) {
+                return false;
+            }
+            long difference = targetAddress - bufferAddress;
+            if (difference < 0 || difference > Int32.MaxValue) {
+                return false;
+            }
+            offset = (int)difference;
+            return true;
+        }
+
+        private static bool TryCopySidFromBuffer(
+            IntPtr buffer,
+            int bufferLength,
+            IntPtr sid,
+            out byte[] sidBytes) {
+            sidBytes = null;
+            const int SID_HEADER_LENGTH = 8;
+            const int SID_MAX_SUB_AUTHORITIES = 15;
+            int sidOffset = 0;
+            if (!TryGetBufferOffset(
+                    buffer,
+                    bufferLength,
+                    sid,
+                    SID_HEADER_LENGTH,
+                    out sidOffset)) {
+                return false;
+            }
+            try {
+                int revision = Marshal.ReadByte(buffer, sidOffset);
+                int subAuthorityCount = Marshal.ReadByte(buffer, sidOffset + 1);
+                if (revision != 1 ||
+                    subAuthorityCount < 0 ||
+                    subAuthorityCount > SID_MAX_SUB_AUTHORITIES) {
+                    return false;
+                }
+                long sidLength = SID_HEADER_LENGTH +
+                    (4L * (long)subAuthorityCount);
+                if (!HasBufferRange(bufferLength, sidOffset, sidLength)) {
+                    return false;
+                }
+                byte[] copy = new byte[(int)sidLength];
+                Marshal.Copy(
+                    IntPtr.Add(buffer, sidOffset),
+                    copy,
+                    0,
+                    copy.Length);
+                sidBytes = copy;
+                return true;
+            }
+            catch {
+                sidBytes = null;
+                return false;
+            }
         }
 
         public static byte[] ReadTokenUserSid(IntPtr token) {
-            byte[] bytes = ReadTokenInformation(token, TOKEN_USER_CLASS);
-            if (bytes == null) {
+            IntPtr buffer = IntPtr.Zero;
+            int returnedLength = 0;
+            if (!TryGetTokenInformationBuffer(
+                    token,
+                    TOKEN_USER_CLASS,
+                    out buffer,
+                    out returnedLength)) {
                 return null;
             }
-            IntPtr buffer = Marshal.AllocHGlobal(bytes.Length);
             try {
-                Marshal.Copy(bytes, 0, buffer, bytes.Length);
-                IntPtr sid = Marshal.ReadIntPtr(
-                    IntPtr.Add(buffer, (int)Marshal.OffsetOf(
-                        typeof(TOKEN_USER_LAYOUT), "User")));
-                return CopySid(sid);
+                int structureLength = Marshal.SizeOf(typeof(TOKEN_USER_LAYOUT));
+                long sidOffset = Marshal.OffsetOf(
+                    typeof(TOKEN_USER_LAYOUT), "User").ToInt64();
+                if (structureLength <= 0 ||
+                    returnedLength < structureLength ||
+                    sidOffset < 0 ||
+                    sidOffset > Int32.MaxValue ||
+                    !HasBufferRange(returnedLength, sidOffset, IntPtr.Size)) {
+                    return null;
+                }
+                IntPtr sid = Marshal.ReadIntPtr(buffer, (int)sidOffset);
+                byte[] sidBytes = null;
+                if (!TryCopySidFromBuffer(
+                        buffer,
+                        returnedLength,
+                        sid,
+                        out sidBytes)) {
+                    return null;
+                }
+                return sidBytes;
+            }
+            catch {
+                return null;
             }
             finally {
                 Marshal.FreeHGlobal(buffer);
@@ -888,17 +1182,39 @@ namespace EgR156 {
         }
 
         public static byte[] ReadTokenOwnerSid(IntPtr token) {
-            byte[] bytes = ReadTokenInformation(token, TOKEN_OWNER_CLASS);
-            if (bytes == null) {
+            IntPtr buffer = IntPtr.Zero;
+            int returnedLength = 0;
+            if (!TryGetTokenInformationBuffer(
+                    token,
+                    TOKEN_OWNER_CLASS,
+                    out buffer,
+                    out returnedLength)) {
                 return null;
             }
-            IntPtr buffer = Marshal.AllocHGlobal(bytes.Length);
             try {
-                Marshal.Copy(bytes, 0, buffer, bytes.Length);
-                IntPtr sid = Marshal.ReadIntPtr(
-                    IntPtr.Add(buffer, (int)Marshal.OffsetOf(
-                        typeof(TOKEN_OWNER_LAYOUT), "Owner")));
-                return CopySid(sid);
+                int structureLength = Marshal.SizeOf(typeof(TOKEN_OWNER_LAYOUT));
+                long sidOffset = Marshal.OffsetOf(
+                    typeof(TOKEN_OWNER_LAYOUT), "Owner").ToInt64();
+                if (structureLength <= 0 ||
+                    returnedLength < structureLength ||
+                    sidOffset < 0 ||
+                    sidOffset > Int32.MaxValue ||
+                    !HasBufferRange(returnedLength, sidOffset, IntPtr.Size)) {
+                    return null;
+                }
+                IntPtr sid = Marshal.ReadIntPtr(buffer, (int)sidOffset);
+                byte[] sidBytes = null;
+                if (!TryCopySidFromBuffer(
+                        buffer,
+                        returnedLength,
+                        sid,
+                        out sidBytes)) {
+                    return null;
+                }
+                return sidBytes;
+            }
+            catch {
+                return null;
             }
             finally {
                 Marshal.FreeHGlobal(buffer);
@@ -906,32 +1222,60 @@ namespace EgR156 {
         }
 
         public static TokenGroupRecord[] ReadTokenGroups(IntPtr token) {
-            byte[] bytes = ReadTokenInformation(token, TOKEN_GROUPS_CLASS);
-            if (bytes == null || bytes.Length < 4) {
+            IntPtr buffer = IntPtr.Zero;
+            int returnedLength = 0;
+            if (!TryGetTokenInformationBuffer(
+                    token,
+                    TOKEN_GROUPS_CLASS,
+                    out buffer,
+                    out returnedLength)) {
                 return null;
             }
-            IntPtr buffer = Marshal.AllocHGlobal(bytes.Length);
             try {
-                Marshal.Copy(bytes, 0, buffer, bytes.Length);
-                uint count = (uint)Marshal.ReadInt32(buffer);
+                long countOffset = Marshal.OffsetOf(
+                    typeof(TOKEN_GROUPS_LAYOUT), "GroupCount").ToInt64();
+                long firstOffset = Marshal.OffsetOf(
+                    typeof(TOKEN_GROUPS_LAYOUT), "Groups").ToInt64();
+                int entrySize = Marshal.SizeOf(typeof(SID_AND_ATTRIBUTES));
+                if (entrySize <= 0 ||
+                    countOffset < 0 ||
+                    countOffset > Int32.MaxValue ||
+                    firstOffset < 0 ||
+                    firstOffset > Int32.MaxValue ||
+                    !HasBufferRange(returnedLength, countOffset, 4)) {
+                    return null;
+                }
+                int countValue = Marshal.ReadInt32(buffer, (int)countOffset);
+                if (countValue < 0) {
+                    return null;
+                }
+                uint count = (uint)countValue;
                 if (count > 65536) {
                     return null;
                 }
-                int firstOffset = (int)Marshal.OffsetOf(
-                    typeof(TOKEN_GROUPS_LAYOUT), "Groups");
-                int entrySize = Marshal.SizeOf(typeof(SID_AND_ATTRIBUTES));
-                if (firstOffset < 0 ||
-                    firstOffset + (long)entrySize * count > bytes.Length) {
+                long entriesLength = (long)entrySize * (long)count;
+                if (count > 0 &&
+                    !HasBufferRange(returnedLength, firstOffset, entriesLength)) {
                     return null;
                 }
                 TokenGroupRecord[] result = new TokenGroupRecord[(int)count];
                 for (int index = 0; index < (int)count; index++) {
-                    IntPtr entry = IntPtr.Add(buffer, firstOffset + (entrySize * index));
+                    long entryOffset = firstOffset +
+                        ((long)entrySize * (long)index);
+                    if (!HasBufferRange(returnedLength, entryOffset, entrySize)) {
+                        return null;
+                    }
+                    IntPtr entry = IntPtr.Add(buffer, (int)entryOffset);
                     IntPtr sid = Marshal.ReadIntPtr(entry);
                     uint attributes = (uint)Marshal.ReadInt32(
-                        IntPtr.Add(entry, IntPtr.Size));
-                    byte[] sidBytes = CopySid(sid);
-                    if (sidBytes == null) {
+                        entry,
+                        IntPtr.Size);
+                    byte[] sidBytes = null;
+                    if (!TryCopySidFromBuffer(
+                            buffer,
+                            returnedLength,
+                            sid,
+                            out sidBytes)) {
                         return null;
                     }
                     result[index] = new TokenGroupRecord();
@@ -940,36 +1284,68 @@ namespace EgR156 {
                 }
                 return result;
             }
+            catch {
+                return null;
+            }
+            finally {
+                Marshal.FreeHGlobal(buffer);
+            }
+        }
+
+        // Scalar and inline-value token classes are safe to copy. Pointer-bearing token
+        // classes use their dedicated readers above so no embedded target survives a free.
+        private static byte[] ReadTokenInformationBytes(IntPtr token, int informationClass) {
+            IntPtr buffer = IntPtr.Zero;
+            int returnedLength = 0;
+            if (!TryGetTokenInformationBuffer(
+                    token,
+                    informationClass,
+                    out buffer,
+                    out returnedLength)) {
+                return null;
+            }
+            try {
+                byte[] bytes = new byte[returnedLength];
+                Marshal.Copy(buffer, bytes, 0, returnedLength);
+                return bytes;
+            }
+            catch {
+                return null;
+            }
             finally {
                 Marshal.FreeHGlobal(buffer);
             }
         }
 
         public static int GetTokenElevationType(IntPtr token) {
-            byte[] bytes = ReadTokenInformation(token, TOKEN_ELEVATION_TYPE_CLASS);
-            if (bytes == null || bytes.Length < 4) {
+            byte[] bytes = ReadTokenInformationBytes(token, TOKEN_ELEVATION_TYPE_CLASS);
+            if (bytes == null || bytes.Length != 4) {
                 return 0;
             }
             return BitConverter.ToInt32(bytes, 0);
         }
 
         public static IntPtr GetLinkedToken(IntPtr token) {
-            byte[] bytes = ReadTokenInformation(token, TOKEN_LINKED_TOKEN_CLASS);
-            if (bytes == null || bytes.Length < IntPtr.Size) {
+            // TOKEN_LINKED_TOKEN contains a HANDLE value, not a SID pointer into the
+            // returned allocation. Copying the value is safe; the caller owns the returned
+            // handle and closes it exactly once after all filtered-token reads complete.
+            byte[] bytes = ReadTokenInformationBytes(token, TOKEN_LINKED_TOKEN_CLASS);
+            if (bytes == null || bytes.Length != IntPtr.Size) {
                 return IntPtr.Zero;
             }
-            IntPtr buffer = Marshal.AllocHGlobal(bytes.Length);
             try {
-                Marshal.Copy(bytes, 0, buffer, bytes.Length);
-                return Marshal.ReadIntPtr(buffer);
+                if (IntPtr.Size == 8) {
+                    return new IntPtr(BitConverter.ToInt64(bytes, 0));
+                }
+                return new IntPtr(BitConverter.ToInt32(bytes, 0));
             }
-            finally {
-                Marshal.FreeHGlobal(buffer);
+            catch {
+                return IntPtr.Zero;
             }
         }
 
         public static string[] ReadTokenPrivilegeNames(IntPtr token) {
-            byte[] bytes = ReadTokenInformation(token, TOKEN_PRIVILEGES_CLASS);
+            byte[] bytes = ReadTokenInformationBytes(token, TOKEN_PRIVILEGES_CLASS);
             if (bytes == null || bytes.Length < 4) {
                 return null;
             }
@@ -1219,7 +1595,7 @@ function Get-R156TokenContext {
         }
 
         $linked = [EgR156.Native]::GetLinkedToken($full)
-        if ($linked -eq [IntPtr]::Zero) {
+        if ($linked -eq [IntPtr]::Zero -or $linked -eq $full) {
             Stop-R156Gate -SupportRef 'EG_R156_FILTERED_TOKEN_UNAVAILABLE'
         }
         $linkedUserBytes = [EgR156.Native]::ReadTokenUserSid($linked)
@@ -2770,7 +3146,7 @@ function Assert-R156PostProof {
     }
 
     $state = Get-R156RepositoryState -RepositoryRoot $CheckoutRoot
-    if (-not (Test-R156RepositoryFence -State $state -ExpectedHeadValue $ExpectedHeadValue -ExpectedTreeValue $script:R156ExpectedTreeAtExecution -ExpectedParentValue $script:R156ExpectedParentAtExecution)) {
+    if (-not (Test-R156RepositoryFence -State $state -RepositoryRoot $CheckoutRoot -ExpectedHeadValue $ExpectedHeadValue -ExpectedTreeValue $script:R156ExpectedTreeAtExecution -ExpectedParentValue $script:R156ExpectedParentAtExecution)) {
         $script:R156RepositoryContinuity = 'FAIL'
         Stop-R156Gate -SupportRef 'EG_R156_REPOSITORY_CHANGED'
     }
@@ -2803,7 +3179,7 @@ try {
     }
 
     $initialState = Get-R156RepositoryState -RepositoryRoot $checkout
-    if (-not (Test-R156RepositoryFence -State $initialState -ExpectedHeadValue $script:R156ExpectedHeadAtExecution -ExpectedTreeValue $script:R156ExpectedTreeAtExecution -ExpectedParentValue $script:R156ExpectedParentAtExecution)) {
+    if (-not (Test-R156RepositoryFence -State $initialState -RepositoryRoot $checkout -ExpectedHeadValue $script:R156ExpectedHeadAtExecution -ExpectedTreeValue $script:R156ExpectedTreeAtExecution -ExpectedParentValue $script:R156ExpectedParentAtExecution)) {
         Stop-R156Gate -SupportRef 'EG_R156_REPOSITORY_FENCE_FAILED'
     }
     if (-not (Test-R156RemoteHead -RepositoryRoot $checkout -ExpectedHeadValue $script:R156ExpectedHeadAtExecution)) {
@@ -2867,7 +3243,7 @@ try {
     if (-not (Test-R156PrivateBindingsOutsideCheckout -Topology $topology -CheckoutRoot $checkout)) {
         Stop-R156Gate -SupportRef 'EG_R156_PRIVATE_BINDING_INSIDE_CHECKOUT'
     }
-    $manifestState = Read-R156ManifestState -LauncherRoot $topology.Candidate -ExpectedAdmission $script:R156ExpectedParentForPreimage -CanonicalSources $canonicalSources
+    $manifestState = Read-R156ManifestState -LauncherRoot $topology.Candidate -ExpectedAdmission $script:R156ExpectedParentAtExecution -CanonicalSources $canonicalSources
     if ($null -eq $manifestState) {
         Stop-R156Gate -SupportRef 'EG_R156_STALE_PREIMAGE_FAILED'
     }
@@ -2880,7 +3256,7 @@ try {
     }
 
     $preValidateState = Get-R156RepositoryState -RepositoryRoot $checkout
-    if (-not (Test-R156RepositoryFence -State $preValidateState -ExpectedHeadValue $script:R156ExpectedHeadAtExecution -ExpectedTreeValue $script:R156ExpectedTreeAtExecution -ExpectedParentValue $script:R156ExpectedParentAtExecution)) {
+    if (-not (Test-R156RepositoryFence -State $preValidateState -RepositoryRoot $checkout -ExpectedHeadValue $script:R156ExpectedHeadAtExecution -ExpectedTreeValue $script:R156ExpectedTreeAtExecution -ExpectedParentValue $script:R156ExpectedParentAtExecution)) {
         Stop-R156Gate -SupportRef 'EG_R156_REPOSITORY_CHANGED'
     }
     $script:R156Validation = 'FAIL'
@@ -2909,7 +3285,7 @@ try {
         -not (Test-R156TopologyContinuity -Before $topology -After $topologyBeforeReal)) {
         Stop-R156Gate -SupportRef 'EG_R156_PRIVATE_STATE_CHANGED'
     }
-    $manifestBeforeReal = Read-R156ManifestState -LauncherRoot $topologyBeforeReal.Candidate -ExpectedAdmission $script:R156ExpectedParentForPreimage -CanonicalSources $canonicalSources
+    $manifestBeforeReal = Read-R156ManifestState -LauncherRoot $topologyBeforeReal.Candidate -ExpectedAdmission $script:R156ExpectedParentAtExecution -CanonicalSources $canonicalSources
     if ($null -eq $manifestBeforeReal) {
         Stop-R156Gate -SupportRef 'EG_R156_STALE_PREIMAGE_MOVED'
     }
@@ -2920,7 +3296,7 @@ try {
         Stop-R156Gate -SupportRef 'EG_R156_LAUNCHER_SECURITY_FAILED'
     }
     $beforeRealState = Get-R156RepositoryState -RepositoryRoot $checkout
-    if (-not (Test-R156RepositoryFence -State $beforeRealState -ExpectedHeadValue $script:R156ExpectedHeadAtExecution -ExpectedTreeValue $script:R156ExpectedTreeAtExecution -ExpectedParentValue $script:R156ExpectedParentAtExecution)) {
+    if (-not (Test-R156RepositoryFence -State $beforeRealState -RepositoryRoot $checkout -ExpectedHeadValue $script:R156ExpectedHeadAtExecution -ExpectedTreeValue $script:R156ExpectedTreeAtExecution -ExpectedParentValue $script:R156ExpectedParentAtExecution)) {
         Stop-R156Gate -SupportRef 'EG_R156_REPOSITORY_CHANGED'
     }
     $canonicalLibraryBeforeReal = Read-R156TrustedSource -RepositoryRoot $checkout -RelativePath $script:R156LibraryRelative -ExpectedGitBlob $script:R156LibraryGitBlob -ExpectedGitBlobLength $script:R156LibraryGitBlobLength
@@ -2934,7 +3310,7 @@ try {
     $canonicalSources['launcher.ps1'] = $canonicalLauncherBeforeReal
     $canonicalSources['launcher_lib.ps1'] = $canonicalLibraryBeforeReal
     $canonicalInstaller = $canonicalInstallerBeforeReal
-    $manifestBeforeReal = Read-R156ManifestState -LauncherRoot $topologyBeforeReal.Candidate -ExpectedAdmission $script:R156ExpectedParentForPreimage -CanonicalSources $canonicalSources
+    $manifestBeforeReal = Read-R156ManifestState -LauncherRoot $topologyBeforeReal.Candidate -ExpectedAdmission $script:R156ExpectedParentAtExecution -CanonicalSources $canonicalSources
     if ($null -eq $manifestBeforeReal) {
         Stop-R156Gate -SupportRef 'EG_R156_STALE_PREIMAGE_MOVED'
     }
