@@ -84,6 +84,9 @@ class Run156HelperStaticTests(unittest.TestCase):
         self.assertIn("['GIT_OPTIONAL_LOCKS'] = '0'", self.source)
         self.assertIn("['GIT_CONFIG_NOSYSTEM'] = '1'", self.source)
         self.assertIn("['GIT_CONFIG_GLOBAL'] = 'NUL'", self.source)
+        self.assertIn("['GIT_CONFIG_COUNT'] = '1'", self.source)
+        self.assertIn("['GIT_CONFIG_KEY_0'] = 'credential.helper'", self.source)
+        self.assertIn("['GIT_CONFIG_VALUE_0'] = 'manager'", self.source)
         self.assertIn("'config', '--no-includes', '--local', '--get-all', 'remote.origin.url'", self.source)
 
         self.assertLess(

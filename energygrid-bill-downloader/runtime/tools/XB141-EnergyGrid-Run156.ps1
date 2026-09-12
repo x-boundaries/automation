@@ -414,6 +414,11 @@ function Invoke-R156Git {
     $startInfo.EnvironmentVariables['GIT_OPTIONAL_LOCKS'] = '0'
     $startInfo.EnvironmentVariables['GIT_CONFIG_NOSYSTEM'] = '1'
     $startInfo.EnvironmentVariables['GIT_CONFIG_GLOBAL'] = 'NUL'
+    # This private remote requires the machine's existing noninteractive Git Credential
+    # Manager. Make that one helper explicit while keeping all ambient Git config out.
+    $startInfo.EnvironmentVariables['GIT_CONFIG_COUNT'] = '1'
+    $startInfo.EnvironmentVariables['GIT_CONFIG_KEY_0'] = 'credential.helper'
+    $startInfo.EnvironmentVariables['GIT_CONFIG_VALUE_0'] = 'manager'
 
     $process = $null
     try {
