@@ -1,7 +1,7 @@
 """Static regression proof for the bounded Run156 helper repair.
 
 These tests inspect source only. They do not dot-source or execute the helper, installer,
-launcher, browser, portal, Scheduler, n8n, or AutoCount paths.
+launcher, browser, portal, Scheduler, n8n, AutoCount, or Git mutation paths.
 """
 
 from pathlib import Path
@@ -29,6 +29,31 @@ class Run156HelperStaticTests(unittest.TestCase):
         start = self.native.index(signature)
         end = self.native.index(next_signature, start + len(signature))
         return self.native[start:end]
+
+    def source_function(self, signature, next_signature):
+        start = self.source.index(signature)
+        end = self.source.index(next_signature, start + len(signature))
+        return self.source[start:end]
+
+    @staticmethod
+    def hash_object_shape(args):
+        """Mirror the source's exact hash-object shape for a no-write challenge."""
+        if len(args) != 3 or args[0] != "hash-object":
+            return False
+        if not args[1].startswith("--path="):
+            return False
+        path = args[1][len("--path=") :]
+        if not path or path.startswith(("/", "-")) or "\\" in path or "//" in path:
+            return False
+        segments = path.split("/")
+        if any(
+            not segment
+            or segment in {".", ".."}
+            or re.fullmatch(r"[A-Za-z0-9._-]+", segment) is None
+            for segment in segments
+        ):
+            return False
+        return args[2] == path
 
     def test_pointer_readers_extract_sids_before_freeing_native_buffers(self):
         user = self.method_body(
@@ -75,48 +100,133 @@ class Run156HelperStaticTests(unittest.TestCase):
         self.assertIn("!HasBufferRange(returnedLength, firstOffset, entriesLength)", self.native)
         self.assertIn("catch {\n                return null;", self.native)
 
-    def test_git_reads_are_sanitised_and_read_only(self):
-        self.assertIn("$script:R156GitReadOnlySubcommands", self.source)
-        self.assertIn("foreach ($argument in @('--no-optional-locks') + @($Arguments))", self.source)
-        self.assertIn("Where-Object { ([string]$_) -like 'GIT_*' }", self.source)
-        self.assertIn("EnvironmentVariables.Remove", self.source)
-        self.assertIn("['GIT_TERMINAL_PROMPT'] = '0'", self.source)
-        self.assertIn("['GIT_OPTIONAL_LOCKS'] = '0'", self.source)
-        self.assertIn("['GIT_CONFIG_NOSYSTEM'] = '1'", self.source)
-        self.assertIn("['GIT_CONFIG_GLOBAL'] = 'NUL'", self.source)
-        self.assertIn("['GIT_CONFIG_COUNT'] = '1'", self.source)
-        self.assertIn("['GIT_CONFIG_KEY_0'] = 'credential.helper'", self.source)
-        self.assertIn("['GIT_CONFIG_VALUE_0'] = 'manager'", self.source)
-        self.assertIn("'config', '--no-includes', '--local', '--get-all', 'remote.origin.url'", self.source)
-
-        self.assertLess(
-            self.source.index("foreach ($name in $inheritedGitNames)"),
-            self.source.index("$startInfo.EnvironmentVariables['GIT_TERMINAL_PROMPT']"),
+    def test_git_wrapper_enforces_central_exact_read_only_contract(self):
+        contract = self.source_function(
+            "function Test-R156GitReadOnlyArguments",
+            "function Invoke-R156Git",
         )
-        self.assertLess(
-            self.source.index("$startInfo.EnvironmentVariables['GIT_CONFIG_GLOBAL'] = 'NUL'"),
-            self.source.index("[void]$process.Start()"),
+        wrapper = self.source_function(
+            "function Invoke-R156Git",
+            "function Get-R156RepositoryState",
         )
 
-        calls = re.findall(
-            r"Invoke-R156Git\s+-RepositoryRoot\s+[^\r\n]+?-Arguments\s+@\('([^']+)'",
-            self.source,
+        self.assertEqual(self.source.count("$startInfo.FileName = 'git.exe'"), 1)
+        self.assertIn("Test-R156GitReadOnlyArguments -Arguments $Arguments", wrapper)
+        self.assertIn("$script:R156GitReadOnlySubcommands", contract)
+        self.assertIn("Test-R156GitPathToken", contract)
+
+        exact_markers = (
+            "$items.Count -eq 4",
+            "'--short'",
+            "'-q'",
+            "$items.Count -eq 5",
+            "'--parents'",
+            "'--porcelain=v1'",
+            "'--untracked-files=all'",
+            "'--no-includes'",
+            "'--local'",
+            "'--get-all'",
+            "'remote.origin.url'",
+            "'refs/heads/main'",
+            "$items.Count -ne 3",
+            "StartsWith('--path='",
+            "'cat-file'",
+            "'-s'",
+            "'--verify'",
+            "'HEAD^{tree}'",
+            "'--show-toplevel'",
+            "'--is-inside-work-tree'",
+            "'--git-dir'",
+            "'--git-common-dir'",
         )
-        self.assertTrue(calls)
-        self.assertTrue(
-            set(calls).issubset(
-                {
-                    "symbolic-ref",
-                    "rev-parse",
-                    "rev-list",
-                    "status",
-                    "ls-remote",
+        for marker in exact_markers:
+            self.assertIn(marker, contract)
+
+        self.assertIn("'--no-optional-locks'", wrapper)
+        self.assertNotIn("hash-object', '-w'", self.source)
+
+    def test_hash_object_write_flag_challenge_is_rejected_without_running_git(self):
+        valid = [
+            "hash-object",
+            "--path=energygrid-bill-downloader/runtime/launcher.ps1",
+            "energygrid-bill-downloader/runtime/launcher.ps1",
+        ]
+        self.assertTrue(self.hash_object_shape(valid))
+        self.assertFalse(self.hash_object_shape(valid + ["-w"]))
+        self.assertFalse(
+            self.hash_object_shape(
+                [
                     "hash-object",
-                    "cat-file",
-                    "config",
-                }
+                    "-w",
+                    "--path=energygrid-bill-downloader/runtime/launcher.ps1",
+                    "energygrid-bill-downloader/runtime/launcher.ps1",
+                ]
             )
         )
+
+        contract = self.source_function(
+            "function Test-R156GitReadOnlyArguments",
+            "function Invoke-R156Git",
+        )
+        hash_branch = contract[
+            contract.index("if ($command -ceq 'hash-object')") :
+            contract.index("if ($command -ceq 'cat-file')")
+        ]
+        self.assertIn("$items.Count -ne 3", hash_branch)
+        self.assertIn("Test-R156GitPathToken -Value $path", hash_branch)
+        self.assertIn("[string]$items[2] -ceq $path", hash_branch)
+
+    def test_git_environment_remote_and_credential_isolation(self):
+        wrapper = self.source_function(
+            "function Invoke-R156Git",
+            "function Get-R156RepositoryState",
+        )
+        remote = self.source_function(
+            "function Test-R156RemoteHead",
+            "function Get-R156SourceBytes",
+        )
+
+        self.assertIn("Where-Object { ([string]$_) -like 'GIT_*' }", wrapper)
+        self.assertIn("EnvironmentVariables.Remove", wrapper)
+        self.assertIn("['GIT_TERMINAL_PROMPT'] = '0'", wrapper)
+        self.assertIn("['GIT_OPTIONAL_LOCKS'] = '0'", wrapper)
+        self.assertIn("['GIT_CONFIG_NOSYSTEM'] = '1'", wrapper)
+        self.assertIn("['GIT_CONFIG_GLOBAL'] = 'NUL'", wrapper)
+        self.assertNotIn("['GIT_CONFIG_COUNT']", wrapper)
+        self.assertNotIn("['GIT_CONFIG_KEY_0']", wrapper)
+        self.assertNotIn("['GIT_CONFIG_VALUE_0']", wrapper)
+
+        reset = wrapper.index("'-c', 'credential.helper='")
+        manager = wrapper.index("'-c', 'credential.helper=manager'")
+        start = wrapper.index("[void]$process.Start()")
+        self.assertLess(reset, manager)
+        self.assertLess(manager, start)
+
+        self.assertIn("$remoteProbe = ([string]$Arguments[0] -ceq 'ls-remote')", wrapper)
+        self.assertIn("[Environment+SpecialFolder]::Windows", wrapper)
+        self.assertIn("['GIT_CEILING_DIRECTORIES'] = $isolatedWorkingDirectory", wrapper)
+        self.assertIn("Test-R156CanonicalOrigin -Origin @($RemoteOrigin)", remote)
+        self.assertIn("'ls-remote', $RemoteOrigin, 'refs/heads/main'", remote)
+        self.assertNotIn("'ls-remote', 'origin'", remote)
+        self.assertIn("$initialState.Origin[0]", self.source)
+        self.assertIn("$beforeRealState.Origin[0]", self.source)
+        self.assertEqual(self.source.count("Test-R156RemoteHead -RepositoryRoot"), 2)
+
+    def test_transport_strips_all_inherited_git_environment_before_child_start(self):
+        transport = self.source_function(
+            "function Invoke-R156Transport",
+            "function Test-R156PrivateBindingsOutsideCheckout",
+        )
+        self.assertIn("Where-Object { ([string]$_) -like 'GIT_*' }", transport)
+        self.assertIn("EnvironmentVariables.Remove", transport)
+
+        collect = transport.index("$inheritedGitNames = @(")
+        remove = transport.index("foreach ($name in $inheritedGitNames)")
+        child_binding = transport.index("$startInfo.EnvironmentVariables['EG_R156_MODE']")
+        start = transport.index("$started = [bool]$process.Start()")
+        self.assertLess(collect, remove)
+        self.assertLess(remove, child_binding)
+        self.assertLess(child_binding, start)
 
     def test_repository_identity_is_part_of_every_repository_fence(self):
         for marker in (
