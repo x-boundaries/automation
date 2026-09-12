@@ -60,7 +60,7 @@ $script:R156CanonicalOrigins = @(
     'git@github.com:x-boundaries/automation',
     'git@github.com:x-boundaries/automation.git',
     'ssh://git@github.com/x-boundaries/automation',
-    'ssh://git@github.com/x-boundaries/automation.git'
+    'ssh://git@github.com:x-boundaries/automation.git'
 )
 $script:R156ValidationCheckNames = @(
     'checkout_root_absolute',
@@ -378,14 +378,134 @@ function ConvertTo-R156NativeArgument {
     return '"' + $Value.Replace('"', '\"') + '"'
 }
 
+function Test-R156GitPathToken {
+    param([AllowEmptyString()][string]$Value)
+
+    if ([string]::IsNullOrWhiteSpace($Value) -or
+        $Value.StartsWith('/', [StringComparison]::Ordinal) -or
+        $Value.StartsWith('-', [StringComparison]::Ordinal) -or
+        $Value.Contains('\') -or
+        $Value.Contains('//')) {
+        return $false
+    }
+    $segments = @($Value -split '/')
+    if ($segments.Count -eq 0) {
+        return $false
+    }
+    foreach ($segment in $segments) {
+        if ([string]::IsNullOrEmpty($segment) -or
+            $segment -ceq '.' -or
+            $segment -ceq '..' -or
+            $segment -cnotmatch '^[A-Za-z0-9._-]+$') {
+            return $false
+        }
+    }
+    return $true
+}
+
+function Test-R156GitReadOnlyArguments {
+    param([Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Arguments)
+
+    $items = @($Arguments)
+    if ($items.Count -eq 0 -or
+        $script:R156GitReadOnlySubcommands -notcontains ([string]$items[0])) {
+        return $false
+    }
+    $command = [string]$items[0]
+    if ($command -ceq 'symbolic-ref') {
+        return (
+            $items.Count -eq 4 -and
+            [string]$items[1] -ceq '--short' -and
+            [string]$items[2] -ceq '-q' -and
+            [string]$items[3] -ceq 'HEAD'
+        )
+    }
+    if ($command -ceq 'rev-list') {
+        return (
+            $items.Count -eq 5 -and
+            [string]$items[1] -ceq '--parents' -and
+            [string]$items[2] -ceq '-n' -and
+            [string]$items[3] -ceq '1' -and
+            [string]$items[4] -ceq 'HEAD'
+        )
+    }
+    if ($command -ceq 'status') {
+        return (
+            $items.Count -eq 3 -and
+            [string]$items[1] -ceq '--porcelain=v1' -and
+            [string]$items[2] -ceq '--untracked-files=all'
+        )
+    }
+    if ($command -ceq 'config') {
+        return (
+            $items.Count -eq 5 -and
+            [string]$items[1] -ceq '--no-includes' -and
+            [string]$items[2] -ceq '--local' -and
+            [string]$items[3] -ceq '--get-all' -and
+            [string]$items[4] -ceq 'remote.origin.url'
+        )
+    }
+    if ($command -ceq 'ls-remote') {
+        return (
+            $items.Count -eq 3 -and
+            (Test-R156CanonicalOrigin -Origin @([string]$items[1])) -and
+            [string]$items[2] -ceq 'refs/heads/main'
+        )
+    }
+    if ($command -ceq 'hash-object') {
+        if ($items.Count -ne 3 -or
+            -not ([string]$items[1]).StartsWith('--path=', [StringComparison]::Ordinal)) {
+            return $false
+        }
+        $path = ([string]$items[1]).Substring('--path='.Length)
+        return (
+            (Test-R156GitPathToken -Value $path) -and
+            [string]$items[2] -ceq $path
+        )
+    }
+    if ($command -ceq 'cat-file') {
+        if ($items.Count -ne 3 -or [string]$items[1] -cne '-s') {
+            return $false
+        }
+        $value = [string]$items[2]
+        if (-not $value.StartsWith('HEAD:', [StringComparison]::Ordinal)) {
+            return $false
+        }
+        return (Test-R156GitPathToken -Value $value.Substring('HEAD:'.Length))
+    }
+    if ($command -ceq 'rev-parse') {
+        if ($items.Count -eq 3 -and
+            [string]$items[1] -ceq '--verify' -and
+            [string]$items[2] -in @('HEAD', 'HEAD^{tree}')) {
+            return $true
+        }
+        if ($items.Count -eq 2 -and
+            [string]$items[1] -in @(
+                '--show-toplevel',
+                '--is-inside-work-tree',
+                '--git-dir',
+                '--git-common-dir'
+            )) {
+            return $true
+        }
+        if ($items.Count -eq 2) {
+            $value = [string]$items[1]
+            if ($value.StartsWith('HEAD:', [StringComparison]::Ordinal)) {
+                return (Test-R156GitPathToken -Value $value.Substring('HEAD:'.Length))
+            }
+        }
+        return $false
+    }
+    return $false
+}
+
 function Invoke-R156Git {
     param(
         [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$RepositoryRoot,
         [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Arguments
     )
 
-    if (@($Arguments).Count -eq 0 -or
-        $script:R156GitReadOnlySubcommands -notcontains ([string]$Arguments[0])) {
+    if (-not (Test-R156GitReadOnlyArguments -Arguments $Arguments)) {
         return [pscustomobject]@{
             Success = $false
             ExitCode = -1
@@ -393,14 +513,34 @@ function Invoke-R156Git {
         }
     }
 
+    $remoteProbe = ([string]$Arguments[0] -ceq 'ls-remote')
     $startInfo = New-Object System.Diagnostics.ProcessStartInfo
     $startInfo.FileName = 'git.exe'
     $quoted = @()
-    foreach ($argument in @('--no-optional-locks') + @($Arguments)) {
+    foreach ($argument in @(
+            '--no-optional-locks',
+            '-c', 'credential.helper=',
+            '-c', 'credential.helper=manager'
+        ) + @($Arguments)) {
         $quoted = $quoted + (ConvertTo-R156NativeArgument -Value ([string]$argument))
     }
     $startInfo.Arguments = [string]::Join(' ', $quoted)
-    $startInfo.WorkingDirectory = (Get-R156FullPath -Path $RepositoryRoot)
+    if ($remoteProbe) {
+        $isolatedWorkingDirectory = [Environment]::GetFolderPath(
+            [Environment+SpecialFolder]::Windows)
+        if ([string]::IsNullOrWhiteSpace($isolatedWorkingDirectory) -or
+            -not (Test-R156NormalDirectory -Path $isolatedWorkingDirectory)) {
+            return [pscustomobject]@{
+                Success = $false
+                ExitCode = -1
+                Lines = [string[]]@()
+            }
+        }
+        $startInfo.WorkingDirectory = $isolatedWorkingDirectory
+    }
+    else {
+        $startInfo.WorkingDirectory = (Get-R156FullPath -Path $RepositoryRoot)
+    }
     $startInfo.UseShellExecute = $false
     $startInfo.RedirectStandardOutput = $true
     $startInfo.RedirectStandardError = $true
@@ -414,11 +554,9 @@ function Invoke-R156Git {
     $startInfo.EnvironmentVariables['GIT_OPTIONAL_LOCKS'] = '0'
     $startInfo.EnvironmentVariables['GIT_CONFIG_NOSYSTEM'] = '1'
     $startInfo.EnvironmentVariables['GIT_CONFIG_GLOBAL'] = 'NUL'
-    # This private remote requires the machine's existing noninteractive Git Credential
-    # Manager. Make that one helper explicit while keeping all ambient Git config out.
-    $startInfo.EnvironmentVariables['GIT_CONFIG_COUNT'] = '1'
-    $startInfo.EnvironmentVariables['GIT_CONFIG_KEY_0'] = 'credential.helper'
-    $startInfo.EnvironmentVariables['GIT_CONFIG_VALUE_0'] = 'manager'
+    if ($remoteProbe) {
+        $startInfo.EnvironmentVariables['GIT_CEILING_DIRECTORIES'] = $isolatedWorkingDirectory
+    }
 
     $process = $null
     try {
@@ -665,11 +803,15 @@ function Test-R156RepositoryFence {
 function Test-R156RemoteHead {
     param(
         [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$RepositoryRoot,
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$RemoteOrigin,
         [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$ExpectedHeadValue
     )
 
+    if (-not (Test-R156CanonicalOrigin -Origin @($RemoteOrigin))) {
+        return $false
+    }
     $remote = Invoke-R156Git -RepositoryRoot $RepositoryRoot -Arguments @(
-        'ls-remote', 'origin', 'refs/heads/main'
+        'ls-remote', $RemoteOrigin, 'refs/heads/main'
     )
     if (-not $remote.Success -or $remote.Lines.Count -ne 1) {
         return $false
@@ -2996,6 +3138,11 @@ function Invoke-R156Transport {
     $startInfo.RedirectStandardOutput = $true
     $startInfo.RedirectStandardError = $true
     $startInfo.CreateNoWindow = $true
+    $inheritedGitNames = @($startInfo.EnvironmentVariables.Keys |
+        Where-Object { ([string]$_) -like 'GIT_*' })
+    foreach ($name in $inheritedGitNames) {
+        [void]$startInfo.EnvironmentVariables.Remove([string]$name)
+    }
     $startInfo.EnvironmentVariables['EG_R156_MODE'] = $Mode
     $startInfo.EnvironmentVariables['EG_R156_CHECKOUT_ROOT'] = $CheckoutRoot
     $startInfo.EnvironmentVariables['EG_R156_INSTALLER_PATH'] = $InstallerPath
@@ -3187,7 +3334,7 @@ try {
     if (-not (Test-R156RepositoryFence -State $initialState -RepositoryRoot $checkout -ExpectedHeadValue $script:R156ExpectedHeadAtExecution -ExpectedTreeValue $script:R156ExpectedTreeAtExecution -ExpectedParentValue $script:R156ExpectedParentAtExecution)) {
         Stop-R156Gate -SupportRef 'EG_R156_REPOSITORY_FENCE_FAILED'
     }
-    if (-not (Test-R156RemoteHead -RepositoryRoot $checkout -ExpectedHeadValue $script:R156ExpectedHeadAtExecution)) {
+    if (-not (Test-R156RemoteHead -RepositoryRoot $checkout -RemoteOrigin $initialState.Origin[0] -ExpectedHeadValue $script:R156ExpectedHeadAtExecution)) {
         $script:R156GithubAuth = 'FAIL'
         Stop-R156Gate -SupportRef 'EG_R156_GITHUB_HEAD_FAILED'
     }
@@ -3319,7 +3466,7 @@ try {
     if ($null -eq $manifestBeforeReal) {
         Stop-R156Gate -SupportRef 'EG_R156_STALE_PREIMAGE_MOVED'
     }
-    if (-not (Test-R156RemoteHead -RepositoryRoot $checkout -ExpectedHeadValue $script:R156ExpectedHeadAtExecution)) {
+    if (-not (Test-R156RemoteHead -RepositoryRoot $checkout -RemoteOrigin $beforeRealState.Origin[0] -ExpectedHeadValue $script:R156ExpectedHeadAtExecution)) {
         $script:R156GithubAuth = 'FAIL'
         Stop-R156Gate -SupportRef 'EG_R156_GITHUB_HEAD_FAILED'
     }
