@@ -1,10 +1,6 @@
-"""Regression proof for the bounded Run156 helper repair.
+"""Static, in-memory, parser, and synthetic regression proof for Run156 G3."""
 
-These tests inspect source and, on Windows, perform parser-only validation. They do not
-dot-source or execute the helper, installer, launcher, browser, portal, Scheduler, n8n,
-AutoCount, or Git mutation paths.
-"""
-
+import hashlib
 import os
 from pathlib import Path
 import re
@@ -40,24 +36,100 @@ class Run156HelperStaticTests(unittest.TestCase):
         return self.source[start:end]
 
     @staticmethod
-    def hash_object_shape(args):
-        """Mirror the source's exact hash-object shape for a no-write challenge."""
-        if len(args) != 3 or args[0] != "hash-object":
+    def config_accepts(entries):
+        allowed = {
+            "core.repositoryformatversion": "0",
+            "core.filemode": None,
+            "core.bare": "false",
+            "core.logallrefupdates": "true",
+            "core.symlinks": None,
+            "core.ignorecase": None,
+            "remote.origin.url": None,
+            "remote.origin.fetch": "+refs/heads/*:refs/remotes/origin/*",
+            "branch.main.remote": "origin",
+            "branch.main.merge": "refs/heads/main",
+        }
+        canonical = {
+            "https://github.com/x-boundaries/automation",
+            "https://github.com/x-boundaries/automation.git",
+            "git@github.com:x-boundaries/automation",
+            "git@github.com:x-boundaries/automation.git",
+            "ssh://git@github.com:x-boundaries/automation",
+            "ssh://git@github.com:x-boundaries/automation.git",
+        }
+        if len(entries) != len(allowed):
             return False
-        if not args[1].startswith("--path="):
-            return False
-        path = args[1][len("--path=") :]
-        if not path or path.startswith(("/", "-")) or "\\" in path or "//" in path:
-            return False
-        segments = path.split("/")
-        if any(
-            not segment
-            or segment in {".", ".."}
-            or re.fullmatch(r"[A-Za-z0-9._-]+", segment) is None
-            for segment in segments
+        seen = set()
+        for key, value in entries:
+            if key not in allowed or key in seen:
+                return False
+            seen.add(key)
+            if key == "remote.origin.url":
+                if value not in canonical:
+                    return False
+            elif key in {"core.filemode", "core.symlinks", "core.ignorecase"}:
+                if value not in {"true", "false"}:
+                    return False
+            elif value != allowed[key]:
+                return False
+        return seen == set(allowed)
+
+    @staticmethod
+    def normalize_contract(working, committed):
+        if (
+            not committed
+            or committed.startswith(b"\xef\xbb\xbf")
+            or b"\x00" in committed
+            or b"\r" in committed
+            or not committed.endswith(b"\n")
         ):
             return False
-        return args[2] == path
+        try:
+            committed.decode("utf-8", errors="strict")
+            working.decode("utf-8", errors="strict")
+        except UnicodeDecodeError:
+            return False
+        if (
+            working.startswith(b"\xef\xbb\xbf")
+            or b"\x00" in working
+            or not working.endswith(b"\n")
+        ):
+            return False
+        has_crlf = b"\r\n" in working
+        has_bare_lf = any(
+            byte == 0x0A and (index == 0 or working[index - 1] != 0x0D)
+            for index, byte in enumerate(working)
+        )
+        for index, byte in enumerate(working):
+            if byte == 0x0D and (
+                index + 1 >= len(working) or working[index + 1] != 0x0A
+            ):
+                return False
+        if has_crlf and has_bare_lf:
+            return False
+        if has_crlf and not working.endswith(b"\r\n"):
+            return False
+        return working.replace(b"\r\n", b"\n") == committed
+
+    @staticmethod
+    def git_object_sha1(object_type, raw):
+        header = f"{object_type} {len(raw)}\0".encode("ascii")
+        return hashlib.sha1(header + raw).hexdigest()
+
+    @staticmethod
+    def commit_headers(tree, parent):
+        return (
+            f"tree {tree}\n"
+            f"parent {parent}\n"
+            "author WJ <10020253+weijunswj@users.noreply.github.com> 0 +0000\n"
+            "committer WJ <10020253+weijunswj@users.noreply.github.com> 0 +0000\n"
+            "\n"
+            "synthetic\n"
+        ).encode("utf-8")
+
+    @staticmethod
+    def remote_record(head):
+        return f"{head}\trefs/heads/main\n".encode("ascii")
 
     def test_helper_parses_under_windows_powershell_51_when_available(self):
         powershell = shutil.which("powershell.exe")
@@ -130,126 +202,352 @@ class Run156HelperStaticTests(unittest.TestCase):
         self.assertIn("!HasBufferRange(returnedLength, firstOffset, entriesLength)", self.native)
         self.assertIn("catch {\n                return null;", self.native)
 
-    def test_git_wrapper_enforces_central_exact_read_only_contract(self):
-        contract = self.source_function(
-            "function Test-R156GitReadOnlyArguments",
-            "function Invoke-R156Git",
+    def test_local_and_remote_git_wrappers_are_distinct(self):
+        self.assertEqual(self.source.count("function Invoke-R156LocalGitRead {"), 1)
+        self.assertEqual(self.source.count("function Invoke-R156RemoteHeadProof {"), 1)
+        self.assertNotIn("function Invoke-R156Git {", self.source)
+        self.assertIn("Test-R156LocalGitArguments", self.source)
+        self.assertIn("Test-R156RemoteGitArguments", self.source)
+        self.assertIn("R156LocalGitReadOnlySubcommands", self.source)
+        self.assertIn("R156RemoteGitReadOnlySubcommands", self.source)
+
+    def test_absolute_git_and_gcm_trust_anchor_is_frozen(self):
+        self.assertEqual(
+            self.source.count(
+                "$startInfo.FileName = [string]$script:R156FrozenGitPath"
+            ),
+            2,
         )
-        wrapper = self.source_function(
-            "function Invoke-R156Git",
+        self.assertNotIn("$startInfo.FileName = 'git.exe'", self.source)
+        self.assertNotIn("FileName='git.exe'", self.source)
+        self.assertNotIn("credential.helper=manager", self.source)
+        self.assertIn("git-credential-manager.exe", self.source)
+        self.assertIn("Get-R156CredentialHelperConfig", self.source)
+        self.assertIn("'credential.helper='", self.source)
+        self.assertIn("credential.helper=\"", self.source)
+        self.assertIn("ProgramFiles", self.source)
+        self.assertIn("ProgramFilesX86", self.source)
+        self.assertIn("Test-R156ProtectedInstallationRoot", self.source)
+        self.assertIn("FileSystemRights", self.source)
+        self.assertIn("Test-R156NoReparseAncestors", self.source)
+        self.assertNotIn("Get-Command", self.source)
+        self.assertNotIn("$env:PATH", self.source)
+
+    def test_git_process_environment_and_output_are_bounded(self):
+        local = self.source_function(
+            "function Invoke-R156LocalGitRead",
+            "function Get-R156RemoteWorkingDirectory",
+        )
+        remote = self.source_function(
+            "function Invoke-R156RemoteHeadProof",
             "function Get-R156RepositoryState",
         )
+        for wrapper in (local, remote):
+            self.assertIn("Where-Object { ([string]$_) -like 'GIT_*' }", wrapper)
+            self.assertIn("EnvironmentVariables.Remove", wrapper)
+            self.assertIn("RedirectStandardOutput", wrapper)
+            self.assertIn("RedirectStandardError", wrapper)
+            self.assertIn("GIT_TERMINAL_PROMPT", wrapper)
+        self.assertIn("Where-Object { ([string]$_) -like 'GCM_*' }", remote)
+        self.assertIn("GCM_INTERACTIVE", remote)
+        self.assertIn("StderrDiscarded", self.source)
+        self.assertIn("ReadAsync", self.source)
+        self.assertIn("MaximumOutputBytes", self.source)
+        self.assertIn("TimedOut", self.source)
+        self.assertIn("Overflow", self.source)
+        self.assertIn("process.Kill", self.source)
+        self.assertIn("process.ExitCode -eq 0", self.source)
 
-        self.assertEqual(self.source.count("$startInfo.FileName = 'git.exe'"), 1)
-        self.assertIn("Test-R156GitReadOnlyArguments -Arguments $Arguments", wrapper)
-        self.assertIn("$script:R156GitReadOnlySubcommands", contract)
-        self.assertIn("Test-R156GitPathToken", contract)
+    def test_remote_discovery_isolation_is_fixed_and_repository_free(self):
+        remote = self.source_function(
+            "function Get-R156RemoteWorkingDirectory",
+            "function Invoke-R156RemoteHeadProof",
+        )
+        self.assertIn("[Environment+SpecialFolder]::Windows", remote)
+        self.assertIn("StartingDirectory", remote)
+        self.assertIn("CeilingDirectory", remote)
+        self.assertIn("[System.IO.Path]::GetPathRoot", remote)
+        self.assertIn("EnvironmentVariables['GIT_CEILING_DIRECTORIES']", self.source)
+        self.assertIn("File]::Exists($marker)", remote)
+        self.assertIn("Directory]::Exists($marker)", remote)
+        self.assertNotIn("GIT_DIR=NUL", self.source)
+        self.assertNotIn("['GIT_DIR']", self.source)
+        self.assertIn(
+            "'https://github.com/x-boundaries/automation.git'",
+            self.source,
+        )
+        self.assertNotIn("RemoteOrigin", self.source)
 
-        exact_markers = (
-            "$items.Count -eq 4",
+    def test_local_git_command_matrix_is_exact_and_read_only(self):
+        contract = self.source_function(
+            "function Test-R156LocalGitArguments",
+            "function Test-R156RemoteGitArguments",
+        )
+        for marker in (
+            "symbolic-ref",
             "'--short'",
             "'-q'",
-            "$items.Count -eq 5",
-            "'--parents'",
-            "'--porcelain=v1'",
-            "'--untracked-files=all'",
-            "'--no-includes'",
-            "'--local'",
-            "'--get-all'",
-            "'remote.origin.url'",
-            "'refs/heads/main'",
-            "$items.Count -ne 3",
-            "StartsWith('--path='",
-            "'cat-file'",
-            "'-s'",
+            "'HEAD'",
+            "rev-parse",
             "'--verify'",
-            "'HEAD^{tree}'",
             "'--show-toplevel'",
             "'--is-inside-work-tree'",
             "'--git-dir'",
             "'--git-common-dir'",
-        )
-        for marker in exact_markers:
+            "status",
+            "'--porcelain=v1'",
+            "'--untracked-files=all'",
+            "'--ignore-submodules=none'",
+            "config",
+            "'--no-includes'",
+            "'--null'",
+            "'--list'",
+            "cat-file",
+            "'commit'",
+            "'blob'",
+        ):
             self.assertIn(marker, contract)
-
-        self.assertIn("'--no-optional-locks'", wrapper)
-        self.assertNotIn("hash-object', '-w'", self.source)
-
-    def test_hash_object_write_flag_challenge_is_rejected_without_running_git(self):
-        valid = [
-            "hash-object",
-            "--path=energygrid-bill-downloader/runtime/launcher.ps1",
-            "energygrid-bill-downloader/runtime/launcher.ps1",
-        ]
-        self.assertTrue(self.hash_object_shape(valid))
-        self.assertFalse(self.hash_object_shape(valid + ["-w"]))
-        self.assertFalse(
-            self.hash_object_shape(
-                [
-                    "hash-object",
-                    "-w",
-                    "--path=energygrid-bill-downloader/runtime/launcher.ps1",
-                    "energygrid-bill-downloader/runtime/launcher.ps1",
-                ]
-            )
+        self.assertIn(
+            "'--git-dir=C:\\XB\\automation\\.git'",
+            self.source,
         )
-
-        contract = self.source_function(
-            "function Test-R156GitReadOnlyArguments",
-            "function Invoke-R156Git",
+        self.assertIn(
+            "'--work-tree=C:\\XB\\automation'",
+            self.source,
         )
-        hash_branch = contract[
-            contract.index("if ($command -ceq 'hash-object')") :
-            contract.index("if ($command -ceq 'cat-file')")
-        ]
-        self.assertIn("$items.Count -ne 3", hash_branch)
-        self.assertIn("Test-R156GitPathToken -Value $path", hash_branch)
-        self.assertIn("[string]$items[2] -ceq $path", hash_branch)
+        for marker in (
+            "'--no-optional-locks'",
+            "'--no-replace-objects'",
+            "'--no-lazy-fetch'",
+            "'--literal-pathspecs'",
+        ):
+            self.assertIn(marker, self.source)
+        self.assertNotIn("rev-list", self.source)
+        self.assertNotIn("hash-object", self.source)
+        self.assertNotIn("HEAD^{tree}", self.source)
 
-    def test_git_environment_remote_and_credential_isolation(self):
-        wrapper = self.source_function(
-            "function Invoke-R156Git",
+    def test_remote_command_and_helper_scope_are_fixed(self):
+        remote = self.source_function(
+            "function Invoke-R156RemoteHeadProof",
             "function Get-R156RepositoryState",
         )
-        remote = self.source_function(
-            "function Test-R156RemoteHead",
-            "function Get-R156SourceBytes",
+        for marker in (
+            "'ls-remote'",
+            "'--quiet'",
+            "'--refs'",
+            "'--exit-code'",
+            "'refs/heads/main'",
+            "credential.interactive=false",
+            "protocol.allow=never",
+            "protocol.https.allow=always",
+            "credential.helper=",
+            "GIT_ALLOW_PROTOCOL",
+            "'GCM_INTERACTIVE'] = '0'",
+        ):
+            self.assertIn(marker, remote)
+        self.assertIn(
+            "GIT_CONFIG_NOSYSTEM",
+            remote,
+        )
+        self.assertIn("GIT_CONFIG_SYSTEM", remote)
+        self.assertIn("GIT_CONFIG_GLOBAL", remote)
+
+    def test_config_admission_rejects_includes_url_rewrites_and_unknown_keys(self):
+        base = [
+            ("core.repositoryformatversion", "0"),
+            ("core.filemode", "false"),
+            ("core.bare", "false"),
+            ("core.logallrefupdates", "true"),
+            ("core.symlinks", "false"),
+            ("core.ignorecase", "true"),
+            ("remote.origin.url", "https://github.com/x-boundaries/automation.git"),
+            ("remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"),
+            ("branch.main.remote", "origin"),
+            ("branch.main.merge", "refs/heads/main"),
+        ]
+        self.assertTrue(self.config_accepts(base))
+        for replacement in (
+            ("include.path", "C:\\user\\config"),
+            ("includeIf.gitdir", "C:\\user\\config"),
+            ("url.https://evil/.insteadOf", "https://github.com/x-boundaries/automation.git"),
+            ("credential.helper", "manager"),
+            ("core.fsmonitor", "true"),
+            ("remote.origin.promisor", "true"),
+        ):
+            mutated = list(base)
+            mutated[1] = replacement
+            self.assertFalse(self.config_accepts(mutated))
+        self.assertIn("Test-R156ConfigAdmission", self.source)
+        self.assertIn("acceptedKeys", self.source)
+        self.assertIn("'--file=C:\\XB\\automation\\.git\\config'", self.source)
+        self.assertIn("'--no-includes'", self.source)
+
+    def test_status_is_side_effect_free_and_index_is_held(self):
+        status = self.source_function(
+            "function Get-R156RepositoryState",
+            "function Resolve-R156RepositoryPath",
+        )
+        for marker in (
+            "core.fsmonitor=false",
+            "core.untrackedCache=false",
+            "core.hooksPath=NUL",
+            "submodule.recurse=false",
+            "'--ignore-submodules=none'",
+            "R156IndexHandle",
+            "indexMetadataBefore",
+            "indexMetadataAfter",
+            "indexDigestBefore",
+            "indexDigestAfter",
+            "indexSideEffectFree",
+            "FileShare]::Read",
+            "GIT_OPTIONAL_LOCKS",
+        ):
+            self.assertIn(marker, status + self.source)
+        self.assertIn("R156RepositoryConfigHandle", status)
+        self.assertIn("ConfigAdmission", status)
+
+    def test_cat_file_rejects_filters_textconv_mailmap_and_arbitrary_objects(self):
+        contract = self.source_function(
+            "function Test-R156LocalGitArguments",
+            "function Test-R156RemoteGitArguments",
+        )
+        self.assertIn("R156LibraryGitBlob", contract)
+        self.assertIn("R156InstallerGitBlob", contract)
+        self.assertIn("R156LauncherGitBlob", contract)
+        for marker in (
+            "--filters",
+            "--textconv",
+            "--follow-symlinks",
+            "--mailmap",
+            "arbitrary",
+        ):
+            self.assertNotIn(marker, contract)
+        self.assertIn("ExpectedHeadAtExecution", contract)
+        self.assertIn("'cat-file', 'commit'", self.source)
+        self.assertIn("'cat-file', 'blob'", self.source)
+
+    def test_raw_commit_tree_parent_and_blob_hash_proofs_are_present(self):
+        proof = self.source_function(
+            "function Get-R156CommitTreeParentProof",
+            "function Close-R156TrackedHandles",
+        )
+        for marker in (
+            "RawCommitBytes",
+            "Get-R156Sha1ForGitObject",
+            "CommitObjectHash",
+            "headerText",
+            "allowedHeaders",
+            "counts",
+            "'tree'",
+            "'parent'",
+            "ExpectedTreeValue",
+            "ExpectedParentValue",
+            "ParentCount",
+        ):
+            self.assertIn(marker, proof)
+        tree = "a" * 40
+        parent = "b" * 40
+        raw = self.commit_headers(tree, parent)
+        self.assertEqual(self.git_object_sha1("commit", raw), self.git_object_sha1("commit", raw))
+        headers = raw.split(b"\n\n", 1)[0].decode("utf-8").splitlines()
+        self.assertEqual([line.split(" ", 1)[1] for line in headers if line.startswith("tree ")], [tree])
+        self.assertEqual([line.split(" ", 1)[1] for line in headers if line.startswith("parent ")], [parent])
+        duplicate_parent = raw.replace(
+            f"parent {parent}\n".encode(),
+            f"parent {parent}\nparent {parent}\n".encode(),
+        )
+        self.assertEqual(
+            len(re.findall(r"^parent [0-9a-f]{40}$", duplicate_parent.decode(), re.MULTILINE)),
+            2,
         )
 
-        self.assertIn("Where-Object { ([string]$_) -like 'GIT_*' }", wrapper)
-        self.assertIn("EnvironmentVariables.Remove", wrapper)
-        self.assertIn("['GIT_TERMINAL_PROMPT'] = '0'", wrapper)
-        self.assertIn("['GIT_OPTIONAL_LOCKS'] = '0'", wrapper)
-        self.assertIn("['GIT_CONFIG_NOSYSTEM'] = '1'", wrapper)
-        self.assertIn("['GIT_CONFIG_GLOBAL'] = 'NUL'", wrapper)
-        self.assertNotIn("['GIT_CONFIG_COUNT']", wrapper)
-        self.assertNotIn("['GIT_CONFIG_KEY_0']", wrapper)
-        self.assertNotIn("['GIT_CONFIG_VALUE_0']", wrapper)
+        source = self.source_function(
+            "function Read-R156TrustedSource",
+            "function Read-R156Locator",
+        )
+        for marker in (
+            "rev-parse",
+            "ExpectedGitBlob",
+            "cat-file",
+            "committedBytes",
+            "Get-R156Sha1ForGitObject -Type 'blob'",
+            "workingBytes",
+            "NormalizedBytes",
+            "Test-R156ByteArraysEqual",
+            "Test-R156PowerShellParse -Path $workingPath -Bytes $workingBytes",
+            "R156SourceHandles",
+        ):
+            self.assertIn(marker, source)
 
-        reset = wrapper.index("'-c', 'credential.helper='")
-        manager = wrapper.index("'-c', 'credential.helper=manager'")
-        start = wrapper.index("[void]$process.Start()")
-        self.assertLess(reset, manager)
-        self.assertLess(manager, start)
+    def test_normalization_contract_covers_all_endings_and_byte_failures(self):
+        committed = b"alpha\nbeta\n"
+        self.assertTrue(self.normalize_contract(committed, committed))
+        self.assertTrue(self.normalize_contract(b"alpha\r\nbeta\r\n", committed))
+        self.assertFalse(self.normalize_contract(b"\xef\xbb\xbf" + committed, committed))
+        self.assertFalse(self.normalize_contract(b"alpha\n\xff\n", committed))
+        self.assertFalse(self.normalize_contract(b"alpha\x00\n", committed))
+        self.assertFalse(self.normalize_contract(b"alpha\r\nbeta\n", committed))
+        self.assertFalse(self.normalize_contract(b"alpha\rbeta\n", committed))
+        self.assertFalse(self.normalize_contract(b"alpha", b"alpha"))
+        self.assertFalse(self.normalize_contract(b"alpha\n", b"omega\n"))
+        for marker in (
+            "Test-R156CommittedByteContract",
+            "Test-R156WorkingByteContract",
+            "Convert-R156WorkingBytesToLf",
+            "NormalizedBytes",
+            "Ending = if ($hasCrlf)",
+            "UTF8Encoding($false, $true)",
+            "0xEF",
+            "0x0D",
+            "0x0A",
+        ):
+            self.assertIn(marker, self.source)
 
-        self.assertIn("$remoteProbe = ([string]$Arguments[0] -ceq 'ls-remote')", wrapper)
-        self.assertIn("[Environment+SpecialFolder]::Windows", wrapper)
-        self.assertIn("['GIT_CEILING_DIRECTORIES'] = $isolatedWorkingDirectory", wrapper)
-        self.assertIn("Test-R156CanonicalOrigin -Origin @($RemoteOrigin)", remote)
-        self.assertIn("'ls-remote', $RemoteOrigin, 'refs/heads/main'", remote)
-        self.assertNotIn("'ls-remote', 'origin'", remote)
-        self.assertIn("$initialState.Origin[0]", self.source)
-        self.assertIn("$beforeRealState.Origin[0]", self.source)
-        self.assertEqual(self.source.count("Test-R156RemoteHead -RepositoryRoot"), 2)
+    def test_source_and_repository_handles_deny_replacement(self):
+        for marker in (
+            "Open-R156ReadOnlyHandle",
+            "FileMode]::Open",
+            "FileAccess]::Read",
+            "FileShare]::Read",
+            "R156RepositoryConfigHandle",
+            "R156SourceHandles",
+            "R156IndexHandle",
+            "Test-R156NoReparseAncestors",
+        ):
+            self.assertIn(marker, self.source)
+        self.assertNotIn("FileShare]::ReadWrite", self.source)
+        self.assertNotIn("FileShare]::Delete", self.source)
 
-    def test_transport_strips_all_inherited_git_environment_before_child_start(self):
+    def test_malformed_extra_output_overflow_timeout_and_nonzero_fail_closed(self):
+        head = "0" * 40
+        self.assertEqual(self.remote_record(head), f"{head}\trefs/heads/main\n".encode())
+        self.assertNotEqual(
+            self.remote_record(head) + b"extra\n",
+            self.remote_record(head),
+        )
+        for marker in (
+            "Test-R156SingleGitLineBytes",
+            "Test-R156ConfigBytes",
+            "StdoutBytes",
+            "StderrDiscarded",
+            "MaximumOutputBytes",
+            "TimedOut",
+            "Overflow",
+            "ExitCode",
+            "Success",
+            "process.Kill",
+            "RedirectStandardOutput",
+            "RedirectStandardError",
+        ):
+            self.assertIn(marker, self.source)
+
+    def test_frozen_boundaries_and_dispatch_protocol_remain_unchanged(self):
         transport = self.source_function(
             "function Invoke-R156Transport",
             "function Test-R156PrivateBindingsOutsideCheckout",
         )
         self.assertIn("Where-Object { ([string]$_) -like 'GIT_*' }", transport)
         self.assertIn("EnvironmentVariables.Remove", transport)
-
         collect = transport.index("$inheritedGitNames = @(")
         remove = transport.index("foreach ($name in $inheritedGitNames)")
         child_binding = transport.index("$startInfo.EnvironmentVariables['EG_R156_MODE']")
@@ -257,43 +555,23 @@ class Run156HelperStaticTests(unittest.TestCase):
         self.assertLess(collect, remove)
         self.assertLess(remove, child_binding)
         self.assertLess(child_binding, start)
+        self.assertEqual(self.source.count("Invoke-R156Transport -Mode 'REAL'"), 1)
+        self.assertIn("$script:R156RealInstallerInvocations = 1", self.source)
+        self.assertIn("$script:R156AuthorityConsumed = 'YES'", self.source)
+        self.assertIn("'CONTROLLER_REQUIRED_POST_DISPATCH'", self.source)
+        self.assertIn("$fields['retry_allowed'] = 'NO'", self.source)
 
-    def test_repository_identity_is_part_of_every_repository_fence(self):
-        for marker in (
-            "'rev-parse', '--show-toplevel'",
-            "'rev-parse', '--is-inside-work-tree'",
-            "'rev-parse', '--git-dir'",
-            "'rev-parse', '--git-common-dir'",
-            "Test-R156CanonicalOrigin",
-            "Test-R156RepositoryIdentity",
-            "State.CommonDirectory",
-            "State.Origin",
-        ):
-            self.assertIn(marker, self.source)
-
-        fence_calls = re.findall(
-            r"Test-R156RepositoryFence\s+-State\s+[^\r\n]+",
-            self.source,
-        )
-        self.assertEqual(len(fence_calls), 4)
-        for call in fence_calls:
-            self.assertIn("-RepositoryRoot", call)
-
-    def test_stale_preimage_checks_bind_only_to_execution_parent(self):
         self.assertNotIn("R156ExpectedParentForPreimage", self.source)
         stale_calls = re.findall(
             r"Read-R156ManifestState\s+-LauncherRoot\s+[^\r\n]+?-ExpectedAdmission\s+\$script:R156ExpectedParentAtExecution",
             self.source,
         )
         self.assertEqual(len(stale_calls), 3)
-
-    def test_real_dispatch_is_one_shot_and_post_dispatch_is_non_retryable(self):
-        self.assertEqual(self.source.count("Invoke-R156Transport -Mode 'REAL'"), 1)
-        self.assertIn("$script:R156RealInstallerInvocations = 1", self.source)
-        self.assertIn("$script:R156AuthorityConsumed = 'YES'", self.source)
-        self.assertIn("if ($script:R156RealStarted)", self.source)
-        self.assertIn("'CONTROLLER_REQUIRED_POST_DISPATCH'", self.source)
-        self.assertIn("$fields['retry_allowed'] = 'NO'", self.source)
+        fence_calls = re.findall(
+            r"Test-R156RepositoryFence\s+-State\s+[^\r\n]+",
+            self.source,
+        )
+        self.assertEqual(len(fence_calls), 4)
 
 
 if __name__ == "__main__":

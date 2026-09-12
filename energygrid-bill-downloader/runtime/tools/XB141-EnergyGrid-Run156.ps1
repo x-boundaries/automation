@@ -44,16 +44,30 @@ $script:R156LauncherGitBlobLength = [int64]21081
 $script:R156ManifestFileName = 'installation_manifest.json'
 $script:R156PackageNames = @('launcher.ps1', 'launcher_lib.ps1', 'installation_manifest.json')
 $script:R156ManifestNames = @('launcher.ps1', 'launcher_lib.ps1')
-$script:R156GitReadOnlySubcommands = @(
+$script:R156LocalGitReadOnlySubcommands = @(
     'symbolic-ref',
     'rev-parse',
-    'rev-list',
     'status',
-    'ls-remote',
-    'hash-object',
-    'cat-file',
-    'config'
+    'config',
+    'cat-file'
 )
+$script:R156RemoteGitReadOnlySubcommands = @('ls-remote')
+$script:R156RemoteDestination = 'https://github.com/x-boundaries/automation.git'
+$script:R156GitOutputLimitBytes = [int64]65536
+$script:R156GitTimeoutMilliseconds = [int]15000
+$script:R156GitMetadataDirectory = 'C:\XB\automation\.git'
+$script:R156GitConfigPath = 'C:\XB\automation\.git\config'
+$script:R156GitIndexPath = 'C:\XB\automation\.git\index'
+$script:R156FrozenGitPath = ''
+$script:R156FrozenGcmPath = ''
+$script:R156FrozenGitInstallationRoot = ''
+$script:R156FrozenGitProgramFilesRoot = ''
+$script:R156GitTrustAnchor = $null
+$script:R156GitHandle = $null
+$script:R156GcmHandle = $null
+$script:R156RepositoryConfigHandle = $null
+$script:R156IndexHandle = $null
+$script:R156SourceHandles = @()
 $script:R156CanonicalOrigins = @(
     'https://github.com/x-boundaries/automation',
     'https://github.com/x-boundaries/automation.git',
@@ -375,7 +389,34 @@ function ConvertTo-R156NativeArgument {
     if ($Value -notmatch '[\s"]') {
         return $Value
     }
-    return '"' + $Value.Replace('"', '\"') + '"'
+
+    $builder = New-Object System.Text.StringBuilder
+    [void]$builder.Append([char]34)
+    $backslashes = 0
+    foreach ($character in $Value.ToCharArray()) {
+        if ($character -eq [char]92) {
+            $backslashes++
+            continue
+        }
+        if ($character -eq [char]34) {
+            for ($index = 0; $index -lt (($backslashes * 2) + 1); $index++) {
+                [void]$builder.Append([char]92)
+            }
+            [void]$builder.Append([char]34)
+            $backslashes = 0
+            continue
+        }
+        for ($index = 0; $index -lt $backslashes; $index++) {
+            [void]$builder.Append([char]92)
+        }
+        [void]$builder.Append($character)
+        $backslashes = 0
+    }
+    for ($index = 0; $index -lt ($backslashes * 2); $index++) {
+        [void]$builder.Append([char]92)
+    }
+    [void]$builder.Append([char]34)
+    return $builder.ToString()
 }
 
 function Test-R156GitPathToken {
@@ -403,84 +444,725 @@ function Test-R156GitPathToken {
     return $true
 }
 
-function Test-R156GitReadOnlyArguments {
+function Test-R156NoReparseAncestors {
+    param([Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Path)
+
+    try {
+        $current = Get-R156FullPath -Path $Path
+        while ($true) {
+            $item = Get-Item -LiteralPath $current -Force
+            if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                return $false
+            }
+            $root = [System.IO.Path]::GetPathRoot($current)
+            if ([string]::Equals($current, $root, [StringComparison]::OrdinalIgnoreCase)) {
+                break
+            }
+            $next = Get-R156ParentDirectory -Path $current
+            if ($null -eq $next) {
+                return $false
+            }
+            $current = $next
+        }
+        return $true
+    }
+    catch {
+        return $false
+    }
+}
+
+function Test-R156ProtectedInstallationRoot {
+    param(
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$InstallationRoot,
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$ProgramFilesRoot
+    )
+
+    if (-not (Test-R156NormalDirectory -Path $ProgramFilesRoot) -or
+        -not (Test-R156NormalDirectory -Path $InstallationRoot) -or
+        (Test-R156SamePath -Left $InstallationRoot -Right $ProgramFilesRoot) -or
+        -not (Test-R156PathWithin -Candidate $InstallationRoot -Container $ProgramFilesRoot) -or
+        -not (Test-R156NoReparseAncestors -Path $InstallationRoot)) {
+        return $false
+    }
+
+    try {
+        $writeRights = (
+            [System.Security.AccessControl.FileSystemRights]::Write -bor
+            [System.Security.AccessControl.FileSystemRights]::Modify -bor
+            [System.Security.AccessControl.FileSystemRights]::FullControl
+        )
+        foreach ($aclPath in @($ProgramFilesRoot, $InstallationRoot)) {
+            $acl = Get-Acl -LiteralPath $aclPath
+            foreach ($rule in @($acl.Access)) {
+                if ($rule.AccessControlType -ne
+                    [System.Security.AccessControl.AccessControlType]::Allow) {
+                    continue
+                }
+                $identity = [string]$rule.IdentityReference
+                $broadIdentity = ($identity -cmatch
+                    '(^|\\)(Everyone|Users|Authenticated Users|CREATOR OWNER)$')
+                if ($broadIdentity -and
+                    (($rule.FileSystemRights -band $writeRights) -ne 0)) {
+                    return $false
+                }
+            }
+        }
+        return $true
+    }
+    catch {
+        return $false
+    }
+}
+
+function Open-R156ReadOnlyHandle {
+    param([Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Path)
+
+    try {
+        if (-not (Test-R156NormalFile -Path $Path) -or
+            -not (Test-R156NoReparseAncestors -Path $Path)) {
+            return $null
+        }
+        return New-Object System.IO.FileStream(
+            $Path,
+            [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::Read,
+            [System.IO.FileShare]::Read,
+            8192,
+            [System.IO.FileOptions]::SequentialScan
+        )
+    }
+    catch {
+        return $null
+    }
+}
+
+function Read-R156HandleBytes {
+    param(
+        [Parameter(Mandatory)][System.IO.Stream]$Handle,
+        [Parameter(Mandatory)][ValidateRange(1, [int64]::MaxValue)][int64]$MaximumBytes
+    )
+
+    $buffer = New-Object byte[] 8192
+    $output = New-Object System.IO.MemoryStream
+    try {
+        if ($Handle.CanSeek) {
+            $Handle.Position = 0
+        }
+        while ($true) {
+            $read = $Handle.Read($buffer, 0, $buffer.Length)
+            if ($read -eq 0) {
+                break
+            }
+            if (($output.Length + $read) -gt $MaximumBytes) {
+                return $null
+            }
+            $output.Write($buffer, 0, $read)
+        }
+        return ,([byte[]]$output.ToArray())
+    }
+    catch {
+        return $null
+    }
+    finally {
+        $output.Dispose()
+    }
+}
+
+function Get-R156Sha1ForGitObject {
+    param(
+        [Parameter(Mandatory)][ValidateSet('commit', 'tree', 'blob')][string]$Type,
+        [Parameter(Mandatory)][byte[]]$Bytes
+    )
+
+    $header = [System.Text.Encoding]::ASCII.GetBytes(
+        $Type + ' ' + [string]$Bytes.Length + [char]0
+    )
+    $payload = New-Object byte[] ($header.Length + $Bytes.Length)
+    [System.Array]::Copy($header, 0, $payload, 0, $header.Length)
+    [System.Array]::Copy($Bytes, 0, $payload, $header.Length, $Bytes.Length)
+    $algorithm = [System.Security.Cryptography.SHA1]::Create()
+    try {
+        return Convert-R156BytesToHex -Bytes $algorithm.ComputeHash($payload)
+    }
+    finally {
+        $algorithm.Dispose()
+    }
+}
+
+function Convert-R156Utf8Bytes {
+    param([Parameter(Mandatory)][byte[]]$Bytes)
+
+    try {
+        $encoding = New-Object System.Text.UTF8Encoding($false, $true)
+        return $encoding.GetString($Bytes)
+    }
+    catch {
+        return $null
+    }
+}
+
+function Test-R156ByteArraysEqual {
+    param(
+        [Parameter(Mandatory)][byte[]]$Left,
+        [Parameter(Mandatory)][byte[]]$Right
+    )
+
+    if ($Left.Length -ne $Right.Length) {
+        return $false
+    }
+    for ($index = 0; $index -lt $Left.Length; $index++) {
+        if ($Left[$index] -ne $Right[$index]) {
+            return $false
+        }
+    }
+    return $true
+}
+
+function Test-R156CommittedByteContract {
+    param([Parameter(Mandatory)][byte[]]$Bytes)
+
+    if ($Bytes.Length -lt 1 -or
+        ($Bytes.Length -ge 3 -and
+            $Bytes[0] -eq 0xEF -and
+            $Bytes[1] -eq 0xBB -and
+            $Bytes[2] -eq 0xBF) -or
+        ($Bytes -contains [byte]0) -or
+        $Bytes[$Bytes.Length - 1] -ne [byte]0x0A) {
+        return $false
+    }
+    for ($index = 0; $index -lt $Bytes.Length; $index++) {
+        if ($Bytes[$index] -eq [byte]0x0D) {
+            return $false
+        }
+    }
+    $text = Convert-R156Utf8Bytes -Bytes $Bytes
+    if ($null -eq $text -or
+        ($text.Length -gt 0 -and $text[0] -eq [char]0xFEFF)) {
+        return $false
+    }
+    return $true
+}
+
+function Convert-R156WorkingBytesToLf {
+    param([Parameter(Mandatory)][byte[]]$Bytes)
+
+    $output = New-Object System.IO.MemoryStream
+    try {
+        for ($index = 0; $index -lt $Bytes.Length; $index++) {
+            if ($Bytes[$index] -eq [byte]0x0D -and
+                ($index + 1) -lt $Bytes.Length -and
+                $Bytes[$index + 1] -eq [byte]0x0A) {
+                continue
+            }
+            $output.WriteByte($Bytes[$index])
+        }
+        return ,([byte[]]$output.ToArray())
+    }
+    finally {
+        $output.Dispose()
+    }
+}
+
+function Test-R156WorkingByteContract {
+    param([Parameter(Mandatory)][byte[]]$Bytes)
+
+    if ($Bytes.Length -lt 1 -or
+        ($Bytes.Length -ge 3 -and
+            $Bytes[0] -eq 0xEF -and
+            $Bytes[1] -eq 0xBB -and
+            $Bytes[2] -eq 0xBF) -or
+        ($Bytes -contains [byte]0)) {
+        return $null
+    }
+    $text = Convert-R156Utf8Bytes -Bytes $Bytes
+    if ($null -eq $text -or
+        ($text.Length -gt 0 -and $text[0] -eq [char]0xFEFF)) {
+        return $null
+    }
+
+    $hasCrlf = $false
+    $hasBareLf = $false
+    for ($index = 0; $index -lt $Bytes.Length; $index++) {
+        if ($Bytes[$index] -eq [byte]0x0D) {
+            if (($index + 1) -ge $Bytes.Length -or
+                $Bytes[$index + 1] -ne [byte]0x0A) {
+                return $null
+            }
+            $hasCrlf = $true
+        }
+        elseif ($Bytes[$index] -eq [byte]0x0A) {
+            if ($index -eq 0 -or $Bytes[$index - 1] -ne [byte]0x0D) {
+                $hasBareLf = $true
+            }
+        }
+    }
+    if ($Bytes[$Bytes.Length - 1] -ne [byte]0x0A -or
+        ($hasCrlf -and $hasBareLf) -or
+        ($hasCrlf -and
+            ($Bytes.Length -lt 2 -or
+                $Bytes[$Bytes.Length - 2] -ne [byte]0x0D))) {
+        return $null
+    }
+    if (-not $hasCrlf -and ($Bytes -contains [byte]0x0D)) {
+        return $null
+    }
+
+    $normalized = Convert-R156WorkingBytesToLf -Bytes $Bytes
+    return [pscustomobject]@{
+        Valid = $true
+        NormalizedBytes = [byte[]]$normalized
+        Ending = if ($hasCrlf) { 'CRLF' } else { 'LF' }
+    }
+}
+
+function Test-R156LockedSourcePath {
+    param([Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$RelativePath)
+
+    $normalized = $RelativePath.Replace('\', '/')
+    return @(
+        'energygrid-bill-downloader/runtime/launcher_lib.ps1',
+        'energygrid-bill-downloader/runtime/install_or_update_launcher.ps1',
+        'energygrid-bill-downloader/runtime/launcher.ps1'
+    ) -contains $normalized
+}
+
+function Get-R156ProgramFilesRoots {
+    $roots = @()
+    foreach ($specialFolder in @(
+            [Environment+SpecialFolder]::ProgramFiles,
+            [Environment+SpecialFolder]::ProgramFilesX86
+        )) {
+        try {
+            $value = [Environment]::GetFolderPath($specialFolder)
+            if (-not [string]::IsNullOrWhiteSpace($value) -and
+                (Test-R156NormalDirectory -Path $value) -and
+                (Test-R156NoReparseAncestors -Path $value)) {
+                $full = Get-R156FullPath -Path $value
+                if (-not (@($roots | Where-Object {
+                            Test-R156SamePath -Left $_ -Right $full
+                        }).Count -gt 0)) {
+                    $roots = $roots + $full
+                }
+            }
+        }
+        catch {
+        }
+    }
+    return [string[]]$roots
+}
+
+function Get-R156GitTrustAnchor {
+    $accepted = @()
+    $gitCandidates = @(
+        'mingw64\bin\git.exe',
+        'usr\bin\git.exe'
+    )
+    $gcmCandidates = @(
+        'mingw64\bin\git-credential-manager.exe',
+        'usr\bin\git-credential-manager.exe'
+    )
+
+    foreach ($programFilesRoot in @(Get-R156ProgramFilesRoots)) {
+        $installationRoot = Join-Path $programFilesRoot 'Git'
+        if (-not (Test-R156ProtectedInstallationRoot -InstallationRoot $installationRoot -ProgramFilesRoot $programFilesRoot)) {
+            continue
+        }
+
+        $gitPath = $null
+        foreach ($relative in $gitCandidates) {
+            $candidate = Join-Path $installationRoot $relative
+            if (Test-R156NormalFile -Path $candidate -and
+                Test-R156NoReparseAncestors -Path $candidate) {
+                $gitPath = Get-R156FullPath -Path $candidate
+                break
+            }
+        }
+        $gcmPath = $null
+        foreach ($relative in $gcmCandidates) {
+            $candidate = Join-Path $installationRoot $relative
+            if (Test-R156NormalFile -Path $candidate -and
+                Test-R156NoReparseAncestors -Path $candidate) {
+                $gcmPath = Get-R156FullPath -Path $candidate
+                break
+            }
+        }
+        if ([string]::IsNullOrWhiteSpace($gitPath) -or
+            [string]::IsNullOrWhiteSpace($gcmPath) -or
+            [System.IO.Path]::GetFileName($gitPath) -cne 'git.exe' -or
+            [System.IO.Path]::GetFileName($gcmPath) -cne 'git-credential-manager.exe' -or
+            -not (Test-R156PathWithin -Candidate $gitPath -Container $installationRoot) -or
+            -not (Test-R156PathWithin -Candidate $gcmPath -Container $installationRoot)) {
+            continue
+        }
+        $accepted = $accepted + [pscustomobject]@{
+            InstallationRoot = Get-R156FullPath -Path $installationRoot
+            ProgramFilesRoot = Get-R156FullPath -Path $programFilesRoot
+            GitPath = $gitPath
+            GcmPath = $gcmPath
+        }
+    }
+
+    $uniqueRoots = @($accepted | ForEach-Object { [string]$_.InstallationRoot } | Sort-Object -Unique)
+    if ($uniqueRoots.Count -ne 1 -or $accepted.Count -lt 1) {
+        return $null
+    }
+    $anchor = $accepted[0]
+    $gitHandle = Open-R156ReadOnlyHandle -Path $anchor.GitPath
+    $gcmHandle = Open-R156ReadOnlyHandle -Path $anchor.GcmPath
+    if ($null -eq $gitHandle -or $null -eq $gcmHandle) {
+        if ($null -ne $gitHandle) { $gitHandle.Dispose() }
+        if ($null -ne $gcmHandle) { $gcmHandle.Dispose() }
+        return $null
+    }
+    $anchor | Add-Member -NotePropertyName GitHandle -NotePropertyValue $gitHandle
+    $anchor | Add-Member -NotePropertyName GcmHandle -NotePropertyValue $gcmHandle
+    $script:R156FrozenGitPath = [string]$anchor.GitPath
+    $script:R156FrozenGcmPath = [string]$anchor.GcmPath
+    $script:R156FrozenGitInstallationRoot = [string]$anchor.InstallationRoot
+    $script:R156FrozenGitProgramFilesRoot = [string]$anchor.ProgramFilesRoot
+    $script:R156GitTrustAnchor = $anchor
+    $script:R156GitHandle = $gitHandle
+    $script:R156GcmHandle = $gcmHandle
+    return $anchor
+}
+
+function Test-R156FrozenGitTrust {
+    if ($null -eq $script:R156GitTrustAnchor -or
+        [string]::IsNullOrWhiteSpace($script:R156FrozenGitPath) -or
+        [string]::IsNullOrWhiteSpace($script:R156FrozenGcmPath) -or
+        [string]::IsNullOrWhiteSpace($script:R156FrozenGitInstallationRoot) -or
+        [string]::IsNullOrWhiteSpace($script:R156FrozenGitProgramFilesRoot) -or
+        $null -eq $script:R156GitHandle -or
+        $null -eq $script:R156GcmHandle) {
+        return $false
+    }
+    if (-not (Test-R156NormalFile -Path $script:R156FrozenGitPath) -or
+        -not (Test-R156NormalFile -Path $script:R156FrozenGcmPath) -or
+        -not (Test-R156NoReparseAncestors -Path $script:R156FrozenGitPath) -or
+        -not (Test-R156NoReparseAncestors -Path $script:R156FrozenGcmPath) -or
+        -not (Test-R156PathWithin -Candidate $script:R156FrozenGitPath -Container $script:R156FrozenGitInstallationRoot) -or
+        -not (Test-R156PathWithin -Candidate $script:R156FrozenGcmPath -Container $script:R156FrozenGitInstallationRoot) -or
+        -not (Test-R156ProtectedInstallationRoot -InstallationRoot $script:R156FrozenGitInstallationRoot -ProgramFilesRoot $script:R156FrozenGitProgramFilesRoot)) {
+        return $false
+    }
+    return $true
+}
+
+function Get-R156CredentialHelperConfig {
+    param([Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Path)
+
+    if (-not [System.IO.Path]::IsPathRooted($Path) -or
+        -not (Test-R156NormalFile -Path $Path) -or
+        -not (Test-R156NoReparseAncestors -Path $Path) -or
+        -not (Test-R156PathWithin -Candidate $Path -Container $script:R156FrozenGitInstallationRoot)) {
+        return ''
+    }
+    return 'credential.helper="' + $Path + '"'
+}
+
+function New-R156GitProcessResult {
+    param(
+        [Parameter(Mandatory)][bool]$Started,
+        [Parameter(Mandatory)][bool]$Success,
+        [Parameter(Mandatory)][int]$ExitCode,
+        [Parameter(Mandatory)][byte[]]$StdoutBytes,
+        [bool]$TimedOut = $false,
+        [bool]$Overflow = $false
+    )
+
+    return [pscustomobject]@{
+        Started = $Started
+        Success = $Success
+        ExitCode = $ExitCode
+        StdoutBytes = [byte[]]$StdoutBytes
+        TimedOut = $TimedOut
+        Overflow = $Overflow
+        StderrDiscarded = $true
+    }
+}
+
+function Invoke-R156BoundedProcess {
+    param(
+        [Parameter(Mandatory)][System.Diagnostics.ProcessStartInfo]$StartInfo,
+        [Parameter(Mandatory)][ValidateRange(1, [int]::MaxValue)][int]$TimeoutMilliseconds,
+        [Parameter(Mandatory)][ValidateRange(1, [int64]::MaxValue)][int64]$MaximumOutputBytes
+    )
+
+    $process = $null
+    $stdoutStore = New-Object System.IO.MemoryStream
+    try {
+        $process = New-Object System.Diagnostics.Process
+        $process.StartInfo = $StartInfo
+        $started = [bool]$process.Start()
+        if (-not $started) {
+            return New-R156GitProcessResult -Started $false -Success $false -ExitCode -1 -StdoutBytes ([byte[]]@())
+        }
+
+        $stdoutStream = $process.StandardOutput.BaseStream
+        $stderrStream = $process.StandardError.BaseStream
+        $stdoutBuffer = New-Object byte[] 4096
+        $stderrBuffer = New-Object byte[] 4096
+        $stderrTotal = [int64]0
+        $stdoutTask = $stdoutStream.ReadAsync($stdoutBuffer, 0, $stdoutBuffer.Length)
+        $stderrTask = $stderrStream.ReadAsync($stderrBuffer, 0, $stderrBuffer.Length)
+        $stdoutComplete = $false
+        $stderrComplete = $false
+        $startedAt = [DateTime]::UtcNow
+
+        while (-not ($stdoutComplete -and $stderrComplete)) {
+            $progress = $false
+            if ($stdoutTask.IsCompleted) {
+                if ($stdoutTask.IsFaulted -or $stdoutTask.IsCanceled) {
+                    return New-R156GitProcessResult -Started $true -Success $false -ExitCode -1 -StdoutBytes ([byte[]]@())
+                }
+                $count = [int]$stdoutTask.Result
+                $stdoutTask = $null
+                $progress = $true
+                if ($count -eq 0) {
+                    $stdoutComplete = $true
+                }
+                else {
+                    if (($stdoutStore.Length + $count) -gt $MaximumOutputBytes) {
+                        try {
+                            if (-not $process.HasExited) { $process.Kill() }
+                        }
+                        catch {
+                        }
+                        return New-R156GitProcessResult -Started $true -Success $false -ExitCode -1 -StdoutBytes ([byte[]]@()) -Overflow $true
+                    }
+                    $stdoutStore.Write($stdoutBuffer, 0, $count)
+                    $stdoutTask = $stdoutStream.ReadAsync($stdoutBuffer, 0, $stdoutBuffer.Length)
+                }
+            }
+            if ($stderrTask.IsCompleted) {
+                if ($stderrTask.IsFaulted -or $stderrTask.IsCanceled) {
+                    return New-R156GitProcessResult -Started $true -Success $false -ExitCode -1 -StdoutBytes ([byte[]]@())
+                }
+                $errorCount = [int]$stderrTask.Result
+                $stderrTask = $null
+                $progress = $true
+                if ($errorCount -eq 0) {
+                    $stderrComplete = $true
+                }
+                else {
+                    $stderrTotal = $stderrTotal + $errorCount
+                    if ($stderrTotal -gt $MaximumOutputBytes) {
+                        try {
+                            if (-not $process.HasExited) { $process.Kill() }
+                        }
+                        catch {
+                        }
+                        return New-R156GitProcessResult -Started $true -Success $false -ExitCode -1 -StdoutBytes ([byte[]]@()) -Overflow $true
+                    }
+                    $stderrTask = $stderrStream.ReadAsync($stderrBuffer, 0, $stderrBuffer.Length)
+                }
+            }
+            if (([DateTime]::UtcNow - $startedAt).TotalMilliseconds -ge $TimeoutMilliseconds) {
+                try {
+                    if (-not $process.HasExited) { $process.Kill() }
+                }
+                catch {
+                }
+                return New-R156GitProcessResult -Started $true -Success $false -ExitCode -1 -StdoutBytes ([byte[]]@()) -TimedOut $true
+            }
+            if (-not $progress) {
+                Start-Sleep -Milliseconds 5
+            }
+        }
+
+        $process.WaitForExit()
+        $bytes = [byte[]]$stdoutStore.ToArray()
+        return New-R156GitProcessResult -Started $true -Success ($process.ExitCode -eq 0) -ExitCode ([int]$process.ExitCode) -StdoutBytes $bytes
+    }
+    catch {
+        return New-R156GitProcessResult -Started ($null -ne $process) -Success $false -ExitCode -1 -StdoutBytes ([byte[]]@())
+    }
+    finally {
+        if ($null -ne $stdoutStore) {
+            $stdoutStore.Dispose()
+        }
+        if ($null -ne $process) {
+            $process.Dispose()
+        }
+    }
+}
+
+function Convert-R156ConfigBytes {
+    param([Parameter(Mandatory)][byte[]]$Bytes)
+
+    $text = Convert-R156Utf8Bytes -Bytes $Bytes
+    if ($null -eq $text -or
+        $text.Length -eq 0 -or
+        $text.Contains([char]0x0D) -or
+        $text[$text.Length - 1] -ne [char]0) {
+        return $null
+    }
+    $records = @($text.Split([char]0))
+    if ($records.Count -lt 2 -or
+        -not [string]::IsNullOrEmpty($records[$records.Count - 1])) {
+        return $null
+    }
+    $entries = @()
+    for ($index = 0; $index -lt ($records.Count - 1); $index++) {
+        $parts = @($records[$index].Split([char]0x0A))
+        if ($parts.Count -ne 2 -or
+            [string]::IsNullOrEmpty($parts[0]) -or
+            $parts[0] -cnotmatch '^[a-z][a-z0-9.-]*$' -or
+            $parts[1].Contains([char]0x0A)) {
+            return $null
+        }
+        $entries = $entries + [pscustomobject]@{
+            Key = [string]$parts[0]
+            Value = [string]$parts[1]
+        }
+    }
+    return ,$entries
+}
+
+function Test-R156ConfigAdmission {
+    param([Parameter(Mandatory)][object[]]$Entries)
+
+    $acceptedKeys = @(
+        'core.repositoryformatversion',
+        'core.filemode',
+        'core.bare',
+        'core.logallrefupdates',
+        'core.symlinks',
+        'core.ignorecase',
+        'remote.origin.url',
+        'remote.origin.fetch',
+        'branch.main.remote',
+        'branch.main.merge'
+    )
+    if (@($Entries).Count -ne $acceptedKeys.Count) {
+        return $null
+    }
+    $seen = @{}
+    foreach ($entry in @($Entries)) {
+        $key = [string]$entry.Key
+        if ($acceptedKeys -notcontains $key -or $seen.ContainsKey($key)) {
+            return $null
+        }
+        $seen[$key] = $true
+        $value = [string]$entry.Value
+        if ($key -ceq 'core.repositoryformatversion' -and $value -cne '0') { return $null }
+        if ($key -ceq 'core.filemode' -and $value -cnotmatch '^(true|false)$') { return $null }
+        if ($key -ceq 'core.bare' -and $value -cne 'false') { return $null }
+        if ($key -ceq 'core.logallrefupdates' -and $value -cne 'true') { return $null }
+        if ($key -ceq 'core.symlinks' -and $value -cnotmatch '^(true|false)$') { return $null }
+        if ($key -ceq 'core.ignorecase' -and $value -cnotmatch '^(true|false)$') { return $null }
+        if ($key -ceq 'remote.origin.fetch' -and $value -cne '+refs/heads/*:refs/remotes/origin/*') { return $null }
+        if ($key -ceq 'branch.main.remote' -and $value -cne 'origin') { return $null }
+        if ($key -ceq 'branch.main.merge' -and $value -cne 'refs/heads/main') { return $null }
+    }
+    foreach ($key in $acceptedKeys) {
+        if (-not $seen.ContainsKey($key)) {
+            return $null
+        }
+    }
+    $origin = @($Entries | Where-Object { $_.Key -ceq 'remote.origin.url' })
+    if ($origin.Count -ne 1 -or
+        -not (Test-R156CanonicalOrigin -Origin @([string]$origin[0].Value))) {
+        return $null
+    }
+    return [pscustomobject]@{
+        Pass = $true
+        Origin = [string[]]@([string]$origin[0].Value)
+    }
+}
+
+function Test-R156SingleGitLineBytes {
+    param([Parameter(Mandatory)][byte[]]$Bytes)
+
+    $text = Convert-R156Utf8Bytes -Bytes $Bytes
+    if ($null -eq $text -or
+        $text.Length -lt 1 -or
+        $text[$text.Length - 1] -ne [char]0x0A -or
+        $text.Contains([char]0x0D) -or
+        ($text.Length -gt 1 -and
+            $text.Substring(0, $text.Length - 1).Contains([char]0x0A))) {
+        return $false
+    }
+    return $true
+}
+
+function Get-R156LocalGitCommandName {
+    param([Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Arguments)
+
+    if ($Arguments.Count -gt 0 -and $Arguments[0] -ceq 'status') {
+        return 'status'
+    }
+    if ($Arguments.Count -gt 8 -and $Arguments[8] -ceq 'status') {
+        return 'status'
+    }
+    if ($Arguments.Count -gt 0) {
+        return [string]$Arguments[0]
+    }
+    return ''
+}
+
+function Test-R156LocalGitArguments {
     param([Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Arguments)
 
     $items = @($Arguments)
+    $command = Get-R156LocalGitCommandName -Arguments $items
     if ($items.Count -eq 0 -or
-        $script:R156GitReadOnlySubcommands -notcontains ([string]$items[0])) {
+        $script:R156LocalGitReadOnlySubcommands -notcontains $command) {
         return $false
     }
-    $command = [string]$items[0]
     if ($command -ceq 'symbolic-ref') {
         return (
             $items.Count -eq 4 -and
-            [string]$items[1] -ceq '--short' -and
-            [string]$items[2] -ceq '-q' -and
-            [string]$items[3] -ceq 'HEAD'
-        )
-    }
-    if ($command -ceq 'rev-list') {
-        return (
-            $items.Count -eq 5 -and
-            [string]$items[1] -ceq '--parents' -and
-            [string]$items[2] -ceq '-n' -and
-            [string]$items[3] -ceq '1' -and
-            [string]$items[4] -ceq 'HEAD'
+            $items[0] -ceq 'symbolic-ref' -and
+            $items[1] -ceq '--short' -and
+            $items[2] -ceq '-q' -and
+            $items[3] -ceq 'HEAD'
         )
     }
     if ($command -ceq 'status') {
         return (
-            $items.Count -eq 3 -and
-            [string]$items[1] -ceq '--porcelain=v1' -and
-            [string]$items[2] -ceq '--untracked-files=all'
+            $items.Count -eq 12 -and
+            $items[0] -ceq '-c' -and
+            $items[1] -ceq 'core.fsmonitor=false' -and
+            $items[2] -ceq '-c' -and
+            $items[3] -ceq 'core.untrackedCache=false' -and
+            $items[4] -ceq '-c' -and
+            $items[5] -ceq 'core.hooksPath=NUL' -and
+            $items[6] -ceq '-c' -and
+            $items[7] -ceq 'submodule.recurse=false' -and
+            $items[8] -ceq 'status' -and
+            $items[9] -ceq '--porcelain=v1' -and
+            $items[10] -ceq '--untracked-files=all' -and
+            $items[11] -ceq '--ignore-submodules=none'
         )
     }
     if ($command -ceq 'config') {
         return (
             $items.Count -eq 5 -and
-            [string]$items[1] -ceq '--no-includes' -and
-            [string]$items[2] -ceq '--local' -and
-            [string]$items[3] -ceq '--get-all' -and
-            [string]$items[4] -ceq 'remote.origin.url'
+            $items[0] -ceq 'config' -and
+            $items[1] -ceq '--file=C:\XB\automation\.git\config' -and
+            $items[2] -ceq '--no-includes' -and
+            $items[3] -ceq '--null' -and
+            $items[4] -ceq '--list'
         )
-    }
-    if ($command -ceq 'ls-remote') {
-        return (
-            $items.Count -eq 3 -and
-            (Test-R156CanonicalOrigin -Origin @([string]$items[1])) -and
-            [string]$items[2] -ceq 'refs/heads/main'
-        )
-    }
-    if ($command -ceq 'hash-object') {
-        if ($items.Count -ne 3 -or
-            -not ([string]$items[1]).StartsWith('--path=', [StringComparison]::Ordinal)) {
-            return $false
-        }
-        $path = ([string]$items[1]).Substring('--path='.Length)
-        return (
-            (Test-R156GitPathToken -Value $path) -and
-            [string]$items[2] -ceq $path
-        )
-    }
-    if ($command -ceq 'cat-file') {
-        if ($items.Count -ne 3 -or [string]$items[1] -cne '-s') {
-            return $false
-        }
-        $value = [string]$items[2]
-        if (-not $value.StartsWith('HEAD:', [StringComparison]::Ordinal)) {
-            return $false
-        }
-        return (Test-R156GitPathToken -Value $value.Substring('HEAD:'.Length))
     }
     if ($command -ceq 'rev-parse') {
         if ($items.Count -eq 3 -and
-            [string]$items[1] -ceq '--verify' -and
-            [string]$items[2] -in @('HEAD', 'HEAD^{tree}')) {
+            $items[0] -ceq 'rev-parse' -and
+            $items[1] -ceq '--verify' -and
+            $items[2] -ceq 'HEAD') {
             return $true
         }
+        if ($items.Count -eq 3 -and
+            $items[0] -ceq 'rev-parse' -and
+            $items[1] -ceq '--verify' -and
+            $items[2] -cmatch
+                '^[0-9a-f]{40}:energygrid-bill-downloader/runtime/(launcher_lib|install_or_update_launcher|launcher)\.ps1$') {
+            return ([string]$items[2].Substring(0, 40) -ceq [string]$script:R156ExpectedHeadAtExecution)
+        }
         if ($items.Count -eq 2 -and
-            [string]$items[1] -in @(
+            $items[0] -ceq 'rev-parse' -and
+            $items[1] -in @(
                 '--show-toplevel',
                 '--is-inside-work-tree',
                 '--git-dir',
@@ -488,214 +1170,365 @@ function Test-R156GitReadOnlyArguments {
             )) {
             return $true
         }
-        if ($items.Count -eq 2) {
-            $value = [string]$items[1]
-            if ($value.StartsWith('HEAD:', [StringComparison]::Ordinal)) {
-                return (Test-R156GitPathToken -Value $value.Substring('HEAD:'.Length))
-            }
+        return $false
+    }
+    if ($command -ceq 'cat-file') {
+        if ($items.Count -ne 3 -or $items[0] -cne 'cat-file') {
+            return $false
+        }
+        if ($items[1] -ceq 'commit') {
+            return ([string]$items[2] -ceq [string]$script:R156ExpectedHeadAtExecution)
+        }
+        if ($items[1] -ceq 'blob') {
+            return @(
+                [string]$script:R156LibraryGitBlob,
+                [string]$script:R156InstallerGitBlob,
+                [string]$script:R156LauncherGitBlob
+            ) -contains ([string]$items[2])
         }
         return $false
     }
     return $false
 }
 
-function Invoke-R156Git {
+function Test-R156RemoteGitArguments {
+    param([Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Arguments)
+
+    $items = @($Arguments)
+    return (
+        $items.Count -eq 6 -and
+        $items[0] -ceq 'ls-remote' -and
+        $items[1] -ceq '--quiet' -and
+        $items[2] -ceq '--refs' -and
+        $items[3] -ceq '--exit-code' -and
+        $items[4] -ceq 'https://github.com/x-boundaries/automation.git' -and
+        $items[5] -ceq 'refs/heads/main'
+    )
+}
+
+function Test-R156LocalGitOutput {
+    param(
+        [Parameter(Mandatory)][string[]]$Arguments,
+        [Parameter(Mandatory)][byte[]]$Bytes
+    )
+
+    $command = Get-R156LocalGitCommandName -Arguments $Arguments
+    if ($command -ceq 'status') {
+        return ($Bytes.Length -eq 0)
+    }
+    if ($command -ceq 'config') {
+        return ($null -ne (Convert-R156ConfigBytes -Bytes $Bytes))
+    }
+    if ($command -ceq 'cat-file') {
+        return $true
+    }
+    return Test-R156SingleGitLineBytes -Bytes $Bytes
+}
+
+function Invoke-R156LocalGitRead {
     param(
         [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$RepositoryRoot,
         [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Arguments
     )
 
-    if (-not (Test-R156GitReadOnlyArguments -Arguments $Arguments)) {
-        return [pscustomobject]@{
-            Success = $false
-            ExitCode = -1
-            Lines = [string[]]@()
-        }
+    if (-not (Test-R156FrozenGitTrust) -or
+        -not (Test-R156SamePath -Left $RepositoryRoot -Right 'C:\XB\automation') -or
+        -not (Test-R156NormalDirectory -Path 'C:\XB\automation')) {
+        return New-R156GitProcessResult -Started $false -Success $false -ExitCode -1 -StdoutBytes ([byte[]]@())
+    }
+    if (-not (Test-R156LocalGitArguments -Arguments $Arguments)) {
+        return New-R156GitProcessResult -Started $false -Success $false -ExitCode -1 -StdoutBytes ([byte[]]@())
     }
 
-    $remoteProbe = ([string]$Arguments[0] -ceq 'ls-remote')
     $startInfo = New-Object System.Diagnostics.ProcessStartInfo
-    $startInfo.FileName = 'git.exe'
+    $startInfo.FileName = [string]$script:R156FrozenGitPath
+    $fixedLocalArguments = @(
+        '--git-dir=C:\XB\automation\.git',
+        '--work-tree=C:\XB\automation',
+        '--no-optional-locks',
+        '--no-replace-objects',
+        '--no-lazy-fetch',
+        '--literal-pathspecs'
+    )
     $quoted = @()
-    foreach ($argument in @(
-            '--no-optional-locks',
-            '-c', 'credential.helper=',
-            '-c', 'credential.helper=manager'
-        ) + @($Arguments)) {
+    foreach ($argument in @($fixedLocalArguments + @($Arguments))) {
         $quoted = $quoted + (ConvertTo-R156NativeArgument -Value ([string]$argument))
     }
     $startInfo.Arguments = [string]::Join(' ', $quoted)
-    if ($remoteProbe) {
-        $isolatedWorkingDirectory = [Environment]::GetFolderPath(
-            [Environment+SpecialFolder]::Windows)
-        if ([string]::IsNullOrWhiteSpace($isolatedWorkingDirectory) -or
-            -not (Test-R156NormalDirectory -Path $isolatedWorkingDirectory)) {
-            return [pscustomobject]@{
-                Success = $false
-                ExitCode = -1
-                Lines = [string[]]@()
-            }
-        }
-        $startInfo.WorkingDirectory = $isolatedWorkingDirectory
-    }
-    else {
-        $startInfo.WorkingDirectory = (Get-R156FullPath -Path $RepositoryRoot)
-    }
+    $startInfo.WorkingDirectory = 'C:\XB\automation'
     $startInfo.UseShellExecute = $false
     $startInfo.RedirectStandardOutput = $true
     $startInfo.RedirectStandardError = $true
     $startInfo.CreateNoWindow = $true
+
     $inheritedGitNames = @($startInfo.EnvironmentVariables.Keys |
         Where-Object { ([string]$_) -like 'GIT_*' })
     foreach ($name in $inheritedGitNames) {
         [void]$startInfo.EnvironmentVariables.Remove([string]$name)
     }
+    $inheritedGcmNames = @($startInfo.EnvironmentVariables.Keys |
+        Where-Object { ([string]$_) -like 'GCM_*' })
+    foreach ($name in $inheritedGcmNames) {
+        [void]$startInfo.EnvironmentVariables.Remove([string]$name)
+    }
     $startInfo.EnvironmentVariables['GIT_TERMINAL_PROMPT'] = '0'
     $startInfo.EnvironmentVariables['GIT_OPTIONAL_LOCKS'] = '0'
+    $startInfo.EnvironmentVariables['GIT_NO_REPLACE_OBJECTS'] = '1'
+    $startInfo.EnvironmentVariables['GIT_NO_LAZY_FETCH'] = '1'
     $startInfo.EnvironmentVariables['GIT_CONFIG_NOSYSTEM'] = '1'
+    $startInfo.EnvironmentVariables['GIT_CONFIG_SYSTEM'] = 'NUL'
     $startInfo.EnvironmentVariables['GIT_CONFIG_GLOBAL'] = 'NUL'
-    if ($remoteProbe) {
-        $startInfo.EnvironmentVariables['GIT_CEILING_DIRECTORIES'] = $isolatedWorkingDirectory
-    }
 
-    $process = $null
+    $result = Invoke-R156BoundedProcess -StartInfo $startInfo -TimeoutMilliseconds $script:R156GitTimeoutMilliseconds -MaximumOutputBytes $script:R156GitOutputLimitBytes
+    if (-not $result.Success -or
+        -not (Test-R156LocalGitOutput -Arguments $Arguments -Bytes $result.StdoutBytes)) {
+        return New-R156GitProcessResult -Started $result.Started -Success $false -ExitCode $result.ExitCode -StdoutBytes ([byte[]]@()) -TimedOut $result.TimedOut -Overflow $result.Overflow
+    }
+    return $result
+}
+
+function Get-R156RemoteWorkingDirectory {
     try {
-        $process = New-Object System.Diagnostics.Process
-        $process.StartInfo = $startInfo
-        [void]$process.Start()
-        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
-        $stderrTask = $process.StandardError.ReadToEndAsync()
-        $process.WaitForExit()
-        $stdout = [string]$stdoutTask.Result
-        $null = $stderrTask.Result
-        $lines = @()
-        if (-not [string]::IsNullOrEmpty($stdout)) {
-            $lines = @($stdout -split '\r?\n')
-            if ($lines.Count -gt 0 -and [string]::IsNullOrEmpty($lines[$lines.Count - 1])) {
-                $lines = @($lines[0..($lines.Count - 2)])
-            }
+        $windowsDirectory = [Environment]::GetFolderPath([Environment+SpecialFolder]::Windows)
+        if ([string]::IsNullOrWhiteSpace($windowsDirectory) -or
+            -not (Test-R156NormalDirectory -Path $windowsDirectory) -or
+            -not (Test-R156NoReparseAncestors -Path $windowsDirectory)) {
+            return $null
+        }
+        $marker = Join-Path $windowsDirectory '.git'
+        if ([System.IO.File]::Exists($marker) -or
+            [System.IO.Directory]::Exists($marker)) {
+            return $null
+        }
+        $ceiling = [System.IO.Path]::GetPathRoot((Get-R156FullPath -Path $windowsDirectory))
+        if ([string]::IsNullOrWhiteSpace($ceiling) -or
+            -not (Test-R156NormalDirectory -Path $ceiling) -or
+            -not (Test-R156NoReparseAncestors -Path $ceiling)) {
+            return $null
         }
         return [pscustomobject]@{
-            Success = ($process.ExitCode -eq 0)
-            ExitCode = [int]$process.ExitCode
-            Lines = [string[]]$lines
+            StartingDirectory = Get-R156FullPath -Path $windowsDirectory
+            CeilingDirectory = Get-R156FullPath -Path $ceiling
         }
     }
     catch {
-        return [pscustomobject]@{
-            Success = $false
-            ExitCode = -1
-            Lines = [string[]]@()
-        }
+        return $null
     }
-    finally {
-        if ($null -ne $process) {
-            $process.Dispose()
-        }
+}
+
+function Invoke-R156RemoteHeadProof {
+    param([Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{40}$')][string]$ExpectedHeadValue)
+
+    if (-not (Test-R156FrozenGitTrust) -or
+        -not (Test-R156CommitText -Value $ExpectedHeadValue)) {
+        return New-R156GitProcessResult -Started $false -Success $false -ExitCode -1 -StdoutBytes ([byte[]]@())
     }
+    $isolation = Get-R156RemoteWorkingDirectory
+    if ($null -eq $isolation) {
+        return New-R156GitProcessResult -Started $false -Success $false -ExitCode -1 -StdoutBytes ([byte[]]@())
+    }
+    $arguments = @(
+        'ls-remote',
+        '--quiet',
+        '--refs',
+        '--exit-code',
+        [string]$script:R156RemoteDestination,
+        'refs/heads/main'
+    )
+    if (-not (Test-R156RemoteGitArguments -Arguments $arguments)) {
+        return New-R156GitProcessResult -Started $false -Success $false -ExitCode -1 -StdoutBytes ([byte[]]@())
+    }
+
+    $helperConfig = Get-R156CredentialHelperConfig -Path $script:R156FrozenGcmPath
+    if ([string]::IsNullOrWhiteSpace($helperConfig)) {
+        return New-R156GitProcessResult -Started $false -Success $false -ExitCode -1 -StdoutBytes ([byte[]]@())
+    }
+    $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $startInfo.FileName = [string]$script:R156FrozenGitPath
+    $configArguments = @(
+        '-c', 'credential.helper=',
+        '-c', $helperConfig,
+        '-c', 'credential.interactive=false',
+        '-c', 'protocol.allow=never',
+        '-c', 'protocol.https.allow=always'
+    )
+    $quoted = @()
+    foreach ($argument in @($configArguments + $arguments)) {
+        $quoted = $quoted + (ConvertTo-R156NativeArgument -Value ([string]$argument))
+    }
+    $startInfo.Arguments = [string]::Join(' ', $quoted)
+    $startInfo.WorkingDirectory = $isolation.StartingDirectory
+    $startInfo.UseShellExecute = $false
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $startInfo.CreateNoWindow = $true
+
+    $inheritedGitNames = @($startInfo.EnvironmentVariables.Keys |
+        Where-Object { ([string]$_) -like 'GIT_*' })
+    foreach ($name in $inheritedGitNames) {
+        [void]$startInfo.EnvironmentVariables.Remove([string]$name)
+    }
+    $inheritedGcmNames = @($startInfo.EnvironmentVariables.Keys |
+        Where-Object { ([string]$_) -like 'GCM_*' })
+    foreach ($name in $inheritedGcmNames) {
+        [void]$startInfo.EnvironmentVariables.Remove([string]$name)
+    }
+    $startInfo.EnvironmentVariables['GIT_TERMINAL_PROMPT'] = '0'
+    $startInfo.EnvironmentVariables['GIT_CONFIG_NOSYSTEM'] = '1'
+    $startInfo.EnvironmentVariables['GIT_CONFIG_SYSTEM'] = 'NUL'
+    $startInfo.EnvironmentVariables['GIT_CONFIG_GLOBAL'] = 'NUL'
+    $startInfo.EnvironmentVariables['GIT_ALLOW_PROTOCOL'] = 'https'
+    $startInfo.EnvironmentVariables['GIT_CEILING_DIRECTORIES'] = $isolation.CeilingDirectory
+    $startInfo.EnvironmentVariables['GCM_INTERACTIVE'] = '0'
+
+    $result = Invoke-R156BoundedProcess -StartInfo $startInfo -TimeoutMilliseconds $script:R156GitTimeoutMilliseconds -MaximumOutputBytes $script:R156GitOutputLimitBytes
+    if (-not $result.Success) {
+        return New-R156GitProcessResult -Started $result.Started -Success $false -ExitCode $result.ExitCode -StdoutBytes ([byte[]]@()) -TimedOut $result.TimedOut -Overflow $result.Overflow
+    }
+    $text = Convert-R156Utf8Bytes -Bytes $result.StdoutBytes
+    $expectedRecord = $ExpectedHeadValue + [char]9 + 'refs/heads/main' + [char]10
+    if ($null -eq $text -or
+        -not [string]::Equals($text, $expectedRecord, [StringComparison]::Ordinal)) {
+        return New-R156GitProcessResult -Started $result.Started -Success $false -ExitCode $result.ExitCode -StdoutBytes ([byte[]]@())
+    }
+    return $result
 }
 
 function Get-R156RepositoryState {
     param([Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$RepositoryRoot)
 
-    $branch = Invoke-R156Git -RepositoryRoot $RepositoryRoot -Arguments @('symbolic-ref', '--short', '-q', 'HEAD')
-    $head = Invoke-R156Git -RepositoryRoot $RepositoryRoot -Arguments @('rev-parse', '--verify', 'HEAD')
-    $tree = Invoke-R156Git -RepositoryRoot $RepositoryRoot -Arguments @('rev-parse', '--verify', 'HEAD^{tree}')
-    $parents = Invoke-R156Git -RepositoryRoot $RepositoryRoot -Arguments @('rev-list', '--parents', '-n', '1', 'HEAD')
-    $status = Invoke-R156Git -RepositoryRoot $RepositoryRoot -Arguments @(
-        'status', '--porcelain=v1', '--untracked-files=all'
-    )
-    $topLevel = Invoke-R156Git -RepositoryRoot $RepositoryRoot -Arguments @(
-        'rev-parse', '--show-toplevel'
-    )
-    $insideWorkTree = Invoke-R156Git -RepositoryRoot $RepositoryRoot -Arguments @(
-        'rev-parse', '--is-inside-work-tree'
-    )
-    $gitDirectory = Invoke-R156Git -RepositoryRoot $RepositoryRoot -Arguments @(
-        'rev-parse', '--git-dir'
-    )
-    $commonDirectory = Invoke-R156Git -RepositoryRoot $RepositoryRoot -Arguments @(
-        'rev-parse', '--git-common-dir'
-    )
-    $origin = Invoke-R156Git -RepositoryRoot $RepositoryRoot -Arguments @(
-        'config', '--no-includes', '--local', '--get-all', 'remote.origin.url'
-    )
+    $state = [ordered]@{
+        Branch = ''
+        Head = ''
+        Tree = ''
+        Parent = ''
+        ParentCount = -1
+        TopLevel = ''
+        InsideWorkTree = ''
+        GitDirectory = ''
+        CommonDirectory = ''
+        ConfigPath = 'C:\XB\automation\.git\config'
+        IndexPath = 'C:\XB\automation\.git\index'
+        ConfigAdmission = $null
+        Origin = [string[]]@()
+        Clean = $false
+        ReadOk = $false
+    }
+    if (-not (Test-R156SamePath -Left $RepositoryRoot -Right 'C:\XB\automation') -or
+        -not (Test-R156NormalDirectory -Path 'C:\XB\automation') -or
+        -not (Test-R156NoReparseAncestors -Path 'C:\XB\automation') -or
+        -not (Test-R156NormalDirectory -Path 'C:\XB\automation\.git') -or
+        -not (Test-R156NoReparseAncestors -Path 'C:\XB\automation\.git') -or
+        -not (Test-R156NormalFile -Path 'C:\XB\automation\.git\config') -or
+        -not (Test-R156NormalFile -Path 'C:\XB\automation\.git\index')) {
+        return [pscustomobject]$state
+    }
 
-    $branchValue = ''
-    if ($branch.Success -and $branch.Lines.Count -eq 1) {
-        $branchValue = $branch.Lines[0].Trim()
+    if ($null -eq $script:R156RepositoryConfigHandle) {
+        $script:R156RepositoryConfigHandle = Open-R156ReadOnlyHandle -Path 'C:\XB\automation\.git\config'
     }
-    $headValue = ''
-    if ($head.Success -and $head.Lines.Count -eq 1) {
-        $headValue = $head.Lines[0].Trim().ToLowerInvariant()
+    if ($null -eq $script:R156RepositoryConfigHandle) {
+        return [pscustomobject]$state
     }
-    $treeValue = ''
-    if ($tree.Success -and $tree.Lines.Count -eq 1) {
-        $treeValue = $tree.Lines[0].Trim().ToLowerInvariant()
+    $configResult = Invoke-R156LocalGitRead -RepositoryRoot $RepositoryRoot -Arguments @(
+        'config',
+        '--file=C:\XB\automation\.git\config',
+        '--no-includes',
+        '--null',
+        '--list'
+    )
+    if (-not $configResult.Success) {
+        return [pscustomobject]$state
     }
-    $parentValue = ''
-    $parentCount = -1
-    if ($parents.Success -and $parents.Lines.Count -eq 1) {
-        $parts = @($parents.Lines[0].Trim() -split '\s+')
-        if ($parts.Count -ge 1) {
-            $parentCount = $parts.Count - 1
-        }
-        if ($parts.Count -eq 2) {
-            $parentValue = $parts[1].ToLowerInvariant()
-        }
+    $configEntries = Convert-R156ConfigBytes -Bytes $configResult.StdoutBytes
+    if ($null -eq $configEntries) {
+        return [pscustomobject]$state
     }
-    $topLevelValue = ''
-    if ($topLevel.Success -and $topLevel.Lines.Count -eq 1) {
-        $topLevelValue = $topLevel.Lines[0].Trim()
+    $configAdmission = Test-R156ConfigAdmission -Entries ([object[]]$configEntries)
+    if ($null -eq $configAdmission) {
+        return [pscustomobject]$state
     }
-    $insideWorkTreeValue = ''
-    if ($insideWorkTree.Success -and $insideWorkTree.Lines.Count -eq 1) {
-        $insideWorkTreeValue = $insideWorkTree.Lines[0].Trim().ToLowerInvariant()
+    $state.ConfigAdmission = $configAdmission
+    $state.Origin = [string[]]$configAdmission.Origin
+
+    $branchResult = Invoke-R156LocalGitRead -RepositoryRoot $RepositoryRoot -Arguments @('symbolic-ref', '--short', '-q', 'HEAD')
+    $headResult = Invoke-R156LocalGitRead -RepositoryRoot $RepositoryRoot -Arguments @('rev-parse', '--verify', 'HEAD')
+    $topLevelResult = Invoke-R156LocalGitRead -RepositoryRoot $RepositoryRoot -Arguments @('rev-parse', '--show-toplevel')
+    $insideResult = Invoke-R156LocalGitRead -RepositoryRoot $RepositoryRoot -Arguments @('rev-parse', '--is-inside-work-tree')
+    $gitDirectoryResult = Invoke-R156LocalGitRead -RepositoryRoot $RepositoryRoot -Arguments @('rev-parse', '--git-dir')
+    $commonDirectoryResult = Invoke-R156LocalGitRead -RepositoryRoot $RepositoryRoot -Arguments @('rev-parse', '--git-common-dir')
+
+    $state.Branch = Get-R156SingleGitLine -Result $branchResult
+    $state.Head = (Get-R156SingleGitLine -Result $headResult).ToLowerInvariant()
+    $state.TopLevel = Get-R156SingleGitLine -Result $topLevelResult
+    $state.InsideWorkTree = (Get-R156SingleGitLine -Result $insideResult).ToLowerInvariant()
+    $state.GitDirectory = Resolve-R156RepositoryPath -RepositoryRoot $RepositoryRoot -Value (Get-R156SingleGitLine -Result $gitDirectoryResult)
+    $state.CommonDirectory = Resolve-R156RepositoryPath -RepositoryRoot $RepositoryRoot -Value (Get-R156SingleGitLine -Result $commonDirectoryResult)
+
+    if ($state.Head -notmatch '^[0-9a-f]{40}$' -or
+        -not [string]::Equals($state.Head, [string]$script:R156ExpectedHeadAtExecution, [StringComparison]::Ordinal)) {
+        return [pscustomobject]$state
     }
-    $gitDirectoryValue = ''
-    if ($gitDirectory.Success -and $gitDirectory.Lines.Count -eq 1) {
-        $gitDirectoryValue = Resolve-R156RepositoryPath `
-            -RepositoryRoot $RepositoryRoot -Value $gitDirectory.Lines[0].Trim()
+    $proof = Get-R156CommitTreeParentProof -ExpectedHeadValue $script:R156ExpectedHeadAtExecution -ExpectedTreeValue $script:R156ExpectedTreeAtExecution -ExpectedParentValue $script:R156ExpectedParentAtExecution
+    if ($null -eq $proof) {
+        return [pscustomobject]$state
     }
-    $commonDirectoryValue = ''
-    if ($commonDirectory.Success -and $commonDirectory.Lines.Count -eq 1) {
-        $commonDirectoryValue = Resolve-R156RepositoryPath `
-            -RepositoryRoot $RepositoryRoot -Value $commonDirectory.Lines[0].Trim()
+    $state.Tree = [string]$proof.Tree
+    $state.Parent = [string]$proof.Parent
+    $state.ParentCount = [int]$proof.ParentCount
+
+    if ($null -eq $script:R156IndexHandle) {
+        $script:R156IndexHandle = Open-R156ReadOnlyHandle -Path 'C:\XB\automation\.git\index'
     }
-    $originValues = @()
-    if ($origin.Success) {
-        foreach ($line in @($origin.Lines)) {
-            $originValues = $originValues + ([string]$line).Trim()
-        }
+    if ($null -eq $script:R156IndexHandle) {
+        return [pscustomobject]$state
     }
-    return [pscustomobject]@{
-        Branch = $branchValue
-        Head = $headValue
-        Tree = $treeValue
-        Parent = $parentValue
-        ParentCount = $parentCount
-        TopLevel = $topLevelValue
-        InsideWorkTree = $insideWorkTreeValue
-        GitDirectory = $gitDirectoryValue
-        CommonDirectory = $commonDirectoryValue
-        Origin = [string[]]$originValues
-        Clean = (
-            $status.Success -and
-            $status.Lines.Count -eq 0
-        )
-        ReadOk = (
-            $branch.Success -and
-            $head.Success -and
-            $tree.Success -and
-            $parents.Success -and
-            $status.Success -and
-            $topLevel.Success -and
-            $insideWorkTree.Success -and
-            $gitDirectory.Success -and
-            $commonDirectory.Success -and
-            $origin.Success
-        )
+    $indexMetadataBefore = Get-R156Metadata -Path 'C:\XB\automation\.git\index'
+    $indexBytesBefore = Read-R156HandleBytes -Handle $script:R156IndexHandle -MaximumBytes 16777216
+    if ($null -eq $indexBytesBefore) {
+        return [pscustomobject]$state
     }
+    $indexDigestBefore = Get-R156Sha256ForBytes -Bytes $indexBytesBefore
+    $statusResult = Invoke-R156LocalGitRead -RepositoryRoot $RepositoryRoot -Arguments @(
+        '-c', 'core.fsmonitor=false',
+        '-c', 'core.untrackedCache=false',
+        '-c', 'core.hooksPath=NUL',
+        '-c', 'submodule.recurse=false',
+        'status',
+        '--porcelain=v1',
+        '--untracked-files=all',
+        '--ignore-submodules=none'
+    )
+    $indexMetadataAfter = Get-R156Metadata -Path 'C:\XB\automation\.git\index'
+    $indexBytesAfter = Read-R156HandleBytes -Handle $script:R156IndexHandle -MaximumBytes 16777216
+    if ($null -eq $indexBytesAfter) {
+        return [pscustomobject]$state
+    }
+    $indexDigestAfter = Get-R156Sha256ForBytes -Bytes $indexBytesAfter
+    $indexSideEffectFree = (
+        Test-R156MetadataEqual -Before $indexMetadataBefore -After $indexMetadataAfter -and
+        [string]::Equals($indexDigestBefore, $indexDigestAfter, [StringComparison]::Ordinal)
+    )
+    $state.Clean = (
+        $statusResult.Success -and
+        $statusResult.StdoutBytes.Length -eq 0 -and
+        $indexSideEffectFree
+    )
+    $state.ReadOk = (
+        $branchResult.Success -and
+        $headResult.Success -and
+        $topLevelResult.Success -and
+        $insideResult.Success -and
+        $gitDirectoryResult.Success -and
+        $commonDirectoryResult.Success -and
+        $proof.CommitObjectHash -ceq $script:R156ExpectedHeadAtExecution -and
+        $null -ne $state.ConfigAdmission -and
+        $state.ConfigAdmission.Pass -and
+        $state.ParentCount -eq 1 -and
+        $statusResult.Success -and
+        $indexSideEffectFree
+    )
+    return [pscustomobject]$state
 }
 
 function Resolve-R156RepositoryPath {
@@ -727,10 +1560,7 @@ function Test-R156CanonicalOrigin {
         return $false
     }
     foreach ($expected in @($script:R156CanonicalOrigins)) {
-        if ([string]::Equals(
-                ([string]$values[0]),
-                $expected,
-                [StringComparison]::Ordinal)) {
+        if ([string]::Equals(([string]$values[0]), $expected, [StringComparison]::Ordinal)) {
             return $true
         }
     }
@@ -744,6 +1574,8 @@ function Test-R156RepositoryIdentity {
     )
 
     if (-not $State.ReadOk -or
+        $null -eq $State.ConfigAdmission -or
+        -not $State.ConfigAdmission.Pass -or
         [string]::IsNullOrWhiteSpace([string]$State.TopLevel) -or
         [string]::IsNullOrWhiteSpace([string]$State.GitDirectory) -or
         [string]::IsNullOrWhiteSpace([string]$State.CommonDirectory)) {
@@ -751,28 +1583,24 @@ function Test-R156RepositoryIdentity {
     }
     try {
         $expectedRoot = Get-R156FullPath -Path $RepositoryRoot
-        $expectedGitMetadata = Get-R156FullPath -Path (Join-Path $expectedRoot '.git')
-        if (-not (Test-R156SamePath -Left $State.TopLevel -Right $expectedRoot)) {
+        $expectedGitMetadata = 'C:\XB\automation\.git'
+        if (-not (Test-R156SamePath -Left $expectedRoot -Right 'C:\XB\automation') -or
+            -not (Test-R156NormalDirectory -Path $expectedGitMetadata) -or
+            -not (Test-R156NoReparseAncestors -Path $expectedGitMetadata) -or
+            [System.IO.File]::Exists($expectedGitMetadata) -or
+            -not (Test-R156NormalFile -Path 'C:\XB\automation\.git\config') -or
+            -not (Test-R156NormalFile -Path 'C:\XB\automation\.git\index') -or
+            -not (Test-R156SamePath -Left $State.TopLevel -Right $expectedRoot) -or
+            -not (Test-R156SamePath -Left $State.GitDirectory -Right $expectedGitMetadata) -or
+            -not (Test-R156SamePath -Left $State.CommonDirectory -Right $expectedGitMetadata) -or
+            -not (Test-R156PathWithin -Candidate $State.GitDirectory -Container $expectedGitMetadata) -or
+            -not (Test-R156CanonicalOrigin -Origin $State.Origin)) {
             return $false
         }
         if ([string]$State.InsideWorkTree -cne 'true') {
             return $false
         }
-        if (-not (Test-R156NormalFile -Path $expectedGitMetadata) -and
-            -not (Test-R156NormalDirectory -Path $expectedGitMetadata)) {
-            return $false
-        }
-        if (-not (Test-R156SamePath -Left $State.CommonDirectory -Right $expectedGitMetadata)) {
-            return $false
-        }
-        if (-not (Test-R156NormalDirectory -Path $State.CommonDirectory) -or
-            -not (Test-R156NormalDirectory -Path $State.GitDirectory)) {
-            return $false
-        }
-        if (-not (Test-R156PathWithin -Candidate $State.GitDirectory -Container $State.CommonDirectory)) {
-            return $false
-        }
-        return (Test-R156CanonicalOrigin -Origin $State.Origin)
+        return $true
     }
     catch {
         return $false
@@ -800,40 +1628,133 @@ function Test-R156RepositoryFence {
     )
 }
 
-function Test-R156RemoteHead {
-    param(
-        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$RepositoryRoot,
-        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$RemoteOrigin,
-        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$ExpectedHeadValue
-    )
+function Get-R156SingleGitLine {
+    param([Parameter(Mandatory)]$Result)
 
-    if (-not (Test-R156CanonicalOrigin -Origin @($RemoteOrigin))) {
-        return $false
+    if ($null -eq $Result -or -not $Result.Success) {
+        return ''
     }
-    $remote = Invoke-R156Git -RepositoryRoot $RepositoryRoot -Arguments @(
-        'ls-remote', $RemoteOrigin, 'refs/heads/main'
-    )
-    if (-not $remote.Success -or $remote.Lines.Count -ne 1) {
-        return $false
+    $text = Convert-R156Utf8Bytes -Bytes $Result.StdoutBytes
+    if (-not (Test-R156SingleGitLineBytes -Bytes $Result.StdoutBytes)) {
+        return ''
     }
-    $parts = @($remote.Lines[0].Trim() -split '[ \t]+')
-    if ($parts.Count -ne 2) {
-        return $false
-    }
-    return (
-        ($parts[0] -cmatch '^[0-9a-f]{40}$') -and
-        $parts[0].ToLowerInvariant() -ceq $ExpectedHeadValue -and
-        $parts[1] -ceq 'refs/heads/main'
-    )
+    return $text.Substring(0, $text.Length - 1)
 }
 
-function Get-R156SourceBytes {
-    param([Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Path)
+function Get-R156CommitTreeParentProof {
+    param(
+        [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{40}$')][string]$ExpectedHeadValue,
+        [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{40}$')][string]$ExpectedTreeValue,
+        [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{40}$')][string]$ExpectedParentValue
+    )
 
-    if (-not (Test-R156NormalFile -Path $Path)) {
+    $result = Invoke-R156LocalGitRead -RepositoryRoot $script:R156Checkout -Arguments @('cat-file', 'commit', $ExpectedHeadValue)
+    if ($null -eq $result -or -not $result.Success -or $result.StdoutBytes.Length -lt 1) {
         return $null
     }
-    return [System.IO.File]::ReadAllBytes($Path)
+    $rawCommitBytes = [byte[]]$result.StdoutBytes
+    if ((Get-R156Sha1ForGitObject -Type 'commit' -Bytes $rawCommitBytes) -cne $ExpectedHeadValue) {
+        return $null
+    }
+    $text = Convert-R156Utf8Bytes -Bytes $rawCommitBytes
+    if ($null -eq $text -or $text.IndexOf([char]0) -ge 0) {
+        return $null
+    }
+    $separator = ([char]10).ToString() + ([char]10).ToString()
+    $headerEnd = $text.IndexOf($separator, [StringComparison]::Ordinal)
+    if ($headerEnd -lt 1) {
+        return $null
+    }
+    $headerText = $text.Substring(0, $headerEnd)
+    $headerLines = @($headerText -split [char]10)
+    $allowedHeaders = @('tree', 'parent', 'author', 'committer', 'encoding', 'gpgsig', 'mergetag')
+    $counts = @{}
+    $lastHeader = ''
+    $treeValue = ''
+    $parentValue = ''
+    foreach ($line in $headerLines) {
+        if ([string]$line -match '^[ ]') {
+            if ($lastHeader -notin @('gpgsig', 'mergetag') -or $line.Length -lt 2) {
+                return $null
+            }
+            continue
+        }
+        $match = [regex]::Match([string]$line, '^(?<name>[a-z][a-z0-9-]*) (?<value>[^\r\n]+)$')
+        if (-not $match.Success) {
+            return $null
+        }
+        $name = [string]$match.Groups['name'].Value
+        $value = [string]$match.Groups['value'].Value
+        if ($allowedHeaders -notcontains $name -or $counts.ContainsKey($name)) {
+            return $null
+        }
+        $counts[$name] = 1
+        $lastHeader = $name
+        if ($name -ceq 'tree') {
+            if ($value -cnotmatch '^[0-9a-f]{40}$' -or $value -cne $ExpectedTreeValue) {
+                return $null
+            }
+            $treeValue = $value
+        }
+        elseif ($name -ceq 'parent') {
+            if ($value -cnotmatch '^[0-9a-f]{40}$' -or $value -cne $ExpectedParentValue) {
+                return $null
+            }
+            $parentValue = $value
+        }
+    }
+    foreach ($required in @('tree', 'parent', 'author', 'committer')) {
+        if (-not $counts.ContainsKey($required)) {
+            return $null
+        }
+    }
+    return [pscustomobject]@{
+        CommitObjectHash = Get-R156Sha1ForGitObject -Type 'commit' -Bytes $rawCommitBytes
+        RawCommitBytes = $rawCommitBytes
+        Tree = $treeValue
+        Parent = $parentValue
+        ParentCount = [int]$counts['parent']
+    }
+}
+
+function Close-R156TrackedHandles {
+    foreach ($handle in @($script:R156SourceHandles)) {
+        if ($null -ne $handle) {
+            try { $handle.Dispose() } catch { }
+        }
+    }
+    $script:R156SourceHandles = @()
+    foreach ($handle in @(
+            $script:R156IndexHandle,
+            $script:R156RepositoryConfigHandle,
+            $script:R156GitHandle,
+            $script:R156GcmHandle
+        )) {
+        if ($null -ne $handle) {
+            try { $handle.Dispose() } catch { }
+        }
+    }
+    $script:R156IndexHandle = $null
+    $script:R156RepositoryConfigHandle = $null
+    $script:R156GitHandle = $null
+    $script:R156GcmHandle = $null
+}
+
+function Test-R156RemoteHead {
+    param(
+        [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{40}$')][string]$ExpectedHeadValue
+    )
+
+    $remote = Invoke-R156RemoteHeadProof -ExpectedHeadValue $ExpectedHeadValue
+    if ($null -eq $remote -or -not $remote.Success) {
+        return $false
+    }
+    $text = Convert-R156Utf8Bytes -Bytes $remote.StdoutBytes
+    $expectedRecord = $ExpectedHeadValue + [char]9 + 'refs/heads/main' + [char]10
+    return (
+        $null -ne $text -and
+        [string]::Equals($text, $expectedRecord, [StringComparison]::Ordinal)
+    )
 }
 
 function Test-R156PowerShellParse {
@@ -867,86 +1788,84 @@ function Read-R156TrustedSource {
         [Parameter(Mandatory)][ValidateRange(1, [int64]::MaxValue)][int64]$ExpectedGitBlobLength
     )
 
-    $path = Join-Path $RepositoryRoot ($RelativePath.Replace('/', '\'))
-    $bytes = Get-R156SourceBytes -Path $path
-    if ($null -eq $bytes) {
+    if (-not (Test-R156LockedSourcePath -RelativePath $RelativePath) -or
+        [string]$script:R156ExpectedHeadAtExecution -notmatch '^[0-9a-f]{40}$') {
         return $null
     }
-    $blob = Invoke-R156Git -RepositoryRoot $RepositoryRoot -Arguments @(
-        'hash-object', ('--path=' + $RelativePath.Replace('\', '/')),
-        $RelativePath.Replace('\', '/')
+    $normalizedPath = $RelativePath.Replace('\', '/')
+    $workingPath = Join-Path $RepositoryRoot ($RelativePath.Replace('/', '\'))
+    if (-not (Test-R156SamePath -Left $RepositoryRoot -Right 'C:\XB\automation') -or
+        -not (Test-R156NormalFile -Path $workingPath) -or
+        -not (Test-R156NoReparseAncestors -Path $workingPath)) {
+        return $null
+    }
+
+    $resolved = Invoke-R156LocalGitRead -RepositoryRoot $RepositoryRoot -Arguments @(
+        'rev-parse',
+        '--verify',
+        ([string]$script:R156ExpectedHeadAtExecution + ':' + $normalizedPath)
     )
-    $blobValue = ''
-    if ($blob.Success -and $blob.Lines.Count -eq 1) {
-        $blobValue = $blob.Lines[0].Trim().ToLowerInvariant()
-    }
-    if ($blobValue -notmatch '^[0-9a-f]{40}$') {
+    $resolvedValue = Get-R156SingleGitLine -Result $resolved
+    if ($resolvedValue -notmatch '^[0-9a-f]{40}$' -or $resolvedValue -cne $ExpectedGitBlob) {
         return $null
     }
-    if ($blobValue -cne $ExpectedGitBlob) {
+
+    $committedResult = Invoke-R156LocalGitRead -RepositoryRoot $RepositoryRoot -Arguments @('cat-file', 'blob', $ExpectedGitBlob)
+    if ($null -eq $committedResult -or -not $committedResult.Success) {
         return $null
     }
-    $blobSize = Invoke-R156Git -RepositoryRoot $RepositoryRoot -Arguments @(
-        'cat-file', '-s', ('HEAD:' + $RelativePath.Replace('\', '/'))
-    )
-    $blobSizeValue = ''
-    if ($blobSize.Success -and $blobSize.Lines.Count -eq 1) {
-        $blobSizeValue = $blobSize.Lines[0].Trim()
-    }
-    if ($blobSizeValue -notmatch '^[0-9]+$') {
+    $committedBytes = [byte[]]$committedResult.StdoutBytes
+    if ($committedBytes.Length -ne $ExpectedGitBlobLength -or
+        -not (Test-R156CommittedByteContract -Bytes $committedBytes) -or
+        (Get-R156Sha1ForGitObject -Type 'blob' -Bytes $committedBytes) -cne $ExpectedGitBlob) {
         return $null
     }
+
+    $workingHandle = $null
+    $retainHandle = $false
     try {
-        if ([int64]$blobSizeValue -ne $ExpectedGitBlobLength) {
+        $workingHandle = Open-R156ReadOnlyHandle -Path $workingPath
+        if ($null -eq $workingHandle) {
             return $null
+        }
+        $workingMetadataBefore = Get-R156Metadata -Path $workingPath
+        $workingBytes = Read-R156HandleBytes -Handle $workingHandle -MaximumBytes 8388608
+        if ($null -eq $workingBytes) {
+            return $null
+        }
+        $workingMetadataAfter = Get-R156Metadata -Path $workingPath
+        if (-not (Test-R156MetadataEqual -Before $workingMetadataBefore -After $workingMetadataAfter)) {
+            return $null
+        }
+        $workingEnding = Test-R156WorkingByteContract -Bytes $workingBytes
+        if ($null -eq $workingEnding -or
+            -not (Test-R156ByteArraysEqual -Left $workingEnding.NormalizedBytes -Right $committedBytes)) {
+            return $null
+        }
+        if (-not (Test-R156PowerShellParse -Path $workingPath -Bytes $workingBytes)) {
+            return $null
+        }
+        $script:R156SourceHandles = @($script:R156SourceHandles) + $workingHandle
+        $retainHandle = $true
+        return [pscustomobject]@{
+            Path = $workingPath
+            RelativePath = $RelativePath
+            Handle = $workingHandle
+            Bytes = [byte[]]$workingBytes
+            CommittedBytes = [byte[]]$committedBytes
+            Sha256 = Get-R156Sha256ForBytes -Bytes $committedBytes
+            ByteLength = [int64]$committedBytes.Length
+            GitBlob = $ExpectedGitBlob
+            Ending = [string]$workingEnding.Ending
         }
     }
     catch {
         return $null
     }
-    $headBlob = Invoke-R156Git -RepositoryRoot $RepositoryRoot -Arguments @(
-        'rev-parse', ('HEAD:' + $RelativePath.Replace('\', '/'))
-    )
-    if (-not $headBlob.Success -or $headBlob.Lines.Count -ne 1) {
-        return $null
-    }
-    if ($blobValue -cne $headBlob.Lines[0].Trim().ToLowerInvariant()) {
-        return $null
-    }
-    if (-not (Test-R156PowerShellParse -Path $path -Bytes $bytes)) {
-        return $null
-    }
-    return [pscustomobject]@{
-        Path = $path
-        RelativePath = $RelativePath
-        Bytes = $bytes
-        Sha256 = Get-R156Sha256ForBytes -Bytes $bytes
-        ByteLength = [int64]$bytes.Length
-    }
-}
-
-function Read-R156StrictJsonObject {
-    param([Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Path)
-
-    if (-not (Test-R156NormalFile -Path $Path)) {
-        return $null
-    }
-    try {
-        $raw = [System.IO.File]::ReadAllText($Path)
-        if ([string]::IsNullOrWhiteSpace($raw)) {
-            return $null
+    finally {
+        if ($null -ne $workingHandle -and -not $retainHandle) {
+            $workingHandle.Dispose()
         }
-        $parsed = @($raw | ConvertFrom-Json)
-        if ($parsed.Count -ne 1) {
-            return $null
-        }
-        if ($parsed[0] -isnot [System.Management.Automation.PSCustomObject]) {
-            return $null
-        }
-        return $parsed[0]
-    }
-    catch {
-        return $null
     }
 }
 
@@ -3330,11 +4249,16 @@ try {
         Stop-R156Gate -SupportRef 'EG_R156_CHECKOUT_BINDING_INVALID'
     }
 
+    $gitAnchor = Get-R156GitTrustAnchor
+    if ($null -eq $gitAnchor -or -not (Test-R156FrozenGitTrust)) {
+        Stop-R156Gate -SupportRef 'EG_R156_GIT_TRUST_ANCHOR_FAILED'
+    }
+
     $initialState = Get-R156RepositoryState -RepositoryRoot $checkout
     if (-not (Test-R156RepositoryFence -State $initialState -RepositoryRoot $checkout -ExpectedHeadValue $script:R156ExpectedHeadAtExecution -ExpectedTreeValue $script:R156ExpectedTreeAtExecution -ExpectedParentValue $script:R156ExpectedParentAtExecution)) {
         Stop-R156Gate -SupportRef 'EG_R156_REPOSITORY_FENCE_FAILED'
     }
-    if (-not (Test-R156RemoteHead -RepositoryRoot $checkout -RemoteOrigin $initialState.Origin[0] -ExpectedHeadValue $script:R156ExpectedHeadAtExecution)) {
+    if (-not (Test-R156RemoteHead -ExpectedHeadValue $script:R156ExpectedHeadAtExecution)) {
         $script:R156GithubAuth = 'FAIL'
         Stop-R156Gate -SupportRef 'EG_R156_GITHUB_HEAD_FAILED'
     }
@@ -3466,7 +4390,7 @@ try {
     if ($null -eq $manifestBeforeReal) {
         Stop-R156Gate -SupportRef 'EG_R156_STALE_PREIMAGE_MOVED'
     }
-    if (-not (Test-R156RemoteHead -RepositoryRoot $checkout -RemoteOrigin $beforeRealState.Origin[0] -ExpectedHeadValue $script:R156ExpectedHeadAtExecution)) {
+    if (-not (Test-R156RemoteHead -ExpectedHeadValue $script:R156ExpectedHeadAtExecution)) {
         $script:R156GithubAuth = 'FAIL'
         Stop-R156Gate -SupportRef 'EG_R156_GITHUB_HEAD_FAILED'
     }
@@ -3513,6 +4437,7 @@ catch {
     }
 }
 finally {
+    Close-R156TrackedHandles
     if ($null -ne $tokenContext) {
         if ($tokenContext.FilteredToken -ne [IntPtr]::Zero) {
             [EgR156.Native]::CloseToken($tokenContext.FilteredToken)
