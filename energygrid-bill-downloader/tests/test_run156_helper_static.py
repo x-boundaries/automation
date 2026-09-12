@@ -573,6 +573,23 @@ class Run156HelperStaticTests(unittest.TestCase):
         )
         self.assertEqual(len(fence_calls), 4)
 
+    def test_helper_byte_hygiene(self):
+        helper_bytes = HELPER.read_bytes()
+        self.assertTrue(helper_bytes)
+        self.assertFalse(helper_bytes.startswith(b"\xef\xbb\xbf"))
+        self.assertNotIn(b"\r", helper_bytes)
+        self.assertEqual(helper_bytes[-1:], b"\n")
+        self.assertNotEqual(helper_bytes[-2:], b"\n\n")
+        forbidden = {
+            byte
+            for byte in helper_bytes
+            if byte < 0x20 and byte not in (0x09, 0x0A)
+        }
+        self.assertEqual(forbidden, set())
+        self.assertNotIn(b"\x7f", helper_bytes)
+        helper_bytes.decode("utf-8")
+
+
 
 if __name__ == "__main__":
     unittest.main()
