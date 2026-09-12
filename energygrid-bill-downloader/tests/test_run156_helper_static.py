@@ -1,11 +1,15 @@
-"""Static regression proof for the bounded Run156 helper repair.
+"""Regression proof for the bounded Run156 helper repair.
 
-These tests inspect source only. They do not dot-source or execute the helper, installer,
-launcher, browser, portal, Scheduler, n8n, AutoCount, or Git mutation paths.
+These tests inspect source and, on Windows, perform parser-only validation. They do not
+dot-source or execute the helper, installer, launcher, browser, portal, Scheduler, n8n,
+AutoCount, or Git mutation paths.
 """
 
+import os
 from pathlib import Path
 import re
+import shutil
+import subprocess
 import unittest
 
 
@@ -54,6 +58,32 @@ class Run156HelperStaticTests(unittest.TestCase):
         ):
             return False
         return args[2] == path
+
+    def test_helper_parses_under_windows_powershell_51_when_available(self):
+        powershell = shutil.which("powershell.exe")
+        if os.name != "nt" or powershell is None:
+            self.skipTest("Windows PowerShell 5.1 parser is not available on this host")
+
+        command = (
+            "$tokens=$null; $errors=$null; "
+            "if ([string]$PSVersionTable.PSEdition -cne 'Desktop' -or "
+            "[int]$PSVersionTable.PSVersion.Major -ne 5 -or "
+            "[int]$PSVersionTable.PSVersion.Minor -ne 1) { exit 2 }; "
+            "[System.Management.Automation.Language.Parser]::ParseFile("
+            "$env:R156_HELPER_PARSE_PATH,[ref]$tokens,[ref]$errors) | Out-Null; "
+            "if (@($errors).Count -ne 0) { exit 1 }; exit 0"
+        )
+        environment = os.environ.copy()
+        environment["R156_HELPER_PARSE_PATH"] = str(HELPER)
+        result = subprocess.run(
+            [powershell, "-NoProfile", "-NonInteractive", "-Command", command],
+            env=environment,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, "Windows PowerShell 5.1 parse failed")
 
     def test_pointer_readers_extract_sids_before_freeing_native_buffers(self):
         user = self.method_body(
