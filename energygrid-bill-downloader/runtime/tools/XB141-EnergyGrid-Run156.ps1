@@ -522,7 +522,7 @@ function Open-R156ReadOnlyHandle {
             -not (Test-R156NoReparseAncestors -Path $Path)) {
             return $null
         }
-        return New-Object System.IO.FileStream(
+        return New-Object -TypeName System.IO.FileStream -ArgumentList @(
             $Path,
             [System.IO.FileMode]::Open,
             [System.IO.FileAccess]::Read,
@@ -4447,3 +4447,4 @@ finally {
         }
     }
 }
+

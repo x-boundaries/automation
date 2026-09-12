@@ -527,7 +527,7 @@ class Run156HelperStaticTests(unittest.TestCase):
         )
         for marker in (
             "Test-R156SingleGitLineBytes",
-            "Test-R156ConfigBytes",
+            "Convert-R156ConfigBytes",
             "StdoutBytes",
             "StderrDiscarded",
             "MaximumOutputBytes",
