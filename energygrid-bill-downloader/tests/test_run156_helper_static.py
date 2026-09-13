@@ -1,0 +1,1609 @@
+"""Static, in-memory, parser, and synthetic regression proof for Run156 G3."""
+
+import hashlib
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import tempfile
+import time
+import unittest
+
+
+HELPER = (
+    Path(__file__).resolve().parents[1]
+    / "runtime"
+    / "tools"
+    / "XB141-EnergyGrid-Run156.ps1"
+)
+REPO_ROOT = HELPER.parents[3]
+OWNED_RELATIVE_PATHS = (
+    "energygrid-bill-downloader/runtime/tools/XB141-EnergyGrid-Run156.ps1",
+    "energygrid-bill-downloader/tests/test_run156_helper_static.py",
+)
+
+
+class Run156HelperStaticTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.source = HELPER.read_text(encoding="utf-8")
+        native_start = cls.source.index("$script:R156NativeSource = @'")
+        native_end = cls.source.index("'@", native_start + 1)
+        cls.native = cls.source[native_start:native_end]
+
+    def method_body(self, signature, next_signature):
+        start = self.native.index(signature)
+        end = self.native.index(next_signature, start + len(signature))
+        return self.native[start:end]
+
+    def source_function(self, signature, next_signature):
+        start = self.source.index(signature)
+        end = self.source.index(next_signature, start + len(signature))
+        return self.source[start:end]
+
+    def extracted_functions(self, names):
+        """Extract only named production functions for an isolated PowerShell harness."""
+        wanted = set(names)
+        matches = list(
+            re.finditer(
+                r"(?m)^function\s+([A-Za-z0-9-]+)\s*\{",
+                self.source,
+            )
+        )
+        blocks = []
+        for index, match in enumerate(matches):
+            if match.group(1) not in wanted:
+                continue
+            end = matches[index + 1].start() if index + 1 < len(matches) else len(self.source)
+            blocks.append((match.start(), self.source[match.start():end].rstrip()))
+        blocks.sort(key=lambda item: item[0])
+        self.assertEqual(
+            {self.source_function_name(block) for _, block in blocks},
+            wanted,
+            "every isolated harness function must come from the production source",
+        )
+        return "\n\n".join(block for _, block in blocks)
+
+    @staticmethod
+    def source_function_name(block):
+        match = re.match(r"function\s+([A-Za-z0-9-]+)\s*\{", block)
+        if match is None:
+            raise AssertionError("isolated function extraction lost its declaration")
+        return match.group(1)
+
+    def run_isolated_powershell(self, script, environment=None, timeout=120):
+        """Run a scratch harness, never the complete helper or a dot-sourced file."""
+        powershell = shutil.which("powershell.exe")
+        if powershell is None:
+            self.skipTest("Windows PowerShell 5.1 is not available on this host")
+        probe = subprocess.run(
+            [powershell, "-NoProfile", "-NonInteractive", "-Command", "$PSVersionTable.PSEdition"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        if probe.returncode != 0 or probe.stdout.strip() != "Desktop":
+            self.skipTest("Windows PowerShell 5.1 (PSEdition Desktop) is required")
+        env = os.environ.copy()
+        if environment:
+            env.update({str(key): str(value) for key, value in environment.items()})
+        with tempfile.TemporaryDirectory(prefix="r156_isolated_") as directory:
+            harness = Path(directory) / "harness.ps1"
+            harness.write_text(script, encoding="utf-8")
+            result = subprocess.run(
+                [
+                    powershell,
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    str(harness),
+                ],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+        if result.returncode != 0:
+            self.fail(
+                "isolated PowerShell harness failed: "
+                f"stdout={result.stdout[-4096:]!r} stderr={result.stderr[-4096:]!r}"
+            )
+        return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+    @staticmethod
+    def git_contract_constants():
+        return """
+$script:R156LibraryGitBlob = 'de75302dfb7ce3b1b4b37919d6b7e734d0503018'
+$script:R156LibraryGitBlobLength = [int64]141393
+$script:R156InstallerGitBlob = 'a5b670e3b043a026af1d7f2086df03fdb1e7fa13'
+$script:R156InstallerGitBlobLength = [int64]25643
+$script:R156LauncherGitBlob = 'd632068bbd5832cc46971278ca0f4fba3bf7e8f3'
+$script:R156LauncherGitBlobLength = [int64]21081
+$script:R156ExpectedHeadAtExecution = '0000000000000000000000000000000000000000'
+$script:R156GitOutputLimitBytes = [int64]65536
+$script:R156LocalGitReadOnlySubcommands = @('symbolic-ref', 'rev-parse', 'status', 'config', 'cat-file')
+"""
+
+    @staticmethod
+    def parse_fields(lines):
+        self_line = next((line for line in lines if line.startswith("started=")), None)
+        if self_line is None:
+            raise AssertionError(f"isolated process harness emitted no result: {lines!r}")
+        fields = {}
+        for field in self_line.split(";"):
+            key, value = field.split("=", 1)
+            fields[key] = value
+        for key in ("started", "success", "timedout", "overflow", "stderrdiscarded"):
+            if key in fields:
+                fields[key] = fields[key].lower() == "true"
+        for key in ("length", "exit"):
+            if key in fields:
+                fields[key] = int(fields[key])
+        return fields
+
+    @staticmethod
+    def read_witness(path):
+        try:
+            size = path.stat().st_size
+        except FileNotFoundError:
+            return []
+        if size > 4096:
+            raise AssertionError("synthetic child witness exceeded its bounded size")
+        try:
+            text = path.read_bytes().decode("ascii")
+        except UnicodeDecodeError as error:
+            raise AssertionError("synthetic child witness was not ASCII") from error
+        return [line for line in text.splitlines() if line]
+
+    def process_functions(self):
+        return self.extracted_functions(
+            (
+                "ConvertTo-R156NativeArgument",
+                "New-R156GitProcessResult",
+                "Get-R156CompletedReadResult",
+                "Invoke-R156BoundedProcess",
+                "Convert-R156BytesToHex",
+                "Get-R156Sha256ForBytes",
+            )
+        )
+
+    def git_output_functions(self):
+        return self.extracted_functions(
+            (
+                "Convert-R156BytesToHex",
+                "Get-R156Sha1ForGitObject",
+                "Convert-R156Utf8Bytes",
+                "Convert-R156ConfigBytes",
+                "Test-R156SingleGitLineBytes",
+                "Get-R156LocalGitCommandName",
+                "Test-R156LocalGitArguments",
+                "Get-R156LocalGitOutputContract",
+                "Test-R156LocalGitOutput",
+            )
+        )
+
+    def json_functions(self):
+        return self.extracted_functions(
+            (
+                "Get-R156FullPath",
+                "Get-R156ParentDirectory",
+                "Test-R156NormalFile",
+                "Test-R156NoReparseAncestors",
+                "Open-R156ReadOnlyHandle",
+                "Read-R156HandleBytes",
+                "Convert-R156Utf8Bytes",
+                "Skip-R156JsonWhitespace",
+                "Get-R156JsonHexValue",
+                "Get-R156JsonString",
+                "Test-R156JsonNumber",
+                "Test-R156JsonLiteral",
+                "Test-R156JsonValue",
+                "Test-R156JsonObject",
+                "Test-R156JsonArray",
+                "Test-R156StrictJsonBytes",
+                "Read-R156StrictJsonObject",
+            )
+        )
+
+    @staticmethod
+    def stream_child_script():
+        return r"""
+$ProgressPreference = 'SilentlyContinue'
+$mode = [string]$env:R156_CHILD_MODE
+$stdout = [Console]::OpenStandardOutput()
+$stderr = [Console]::OpenStandardError()
+$exitCode = 0
+
+function Write-R156ChildWitness {
+    param([Parameter(Mandatory)][string]$Phase)
+    $witnessPath = [string]$env:R156_WITNESS_PATH
+    if ([string]::IsNullOrWhiteSpace($witnessPath)) {
+        throw 'missing synthetic witness path'
+    }
+    [System.IO.File]::AppendAllText(
+        $witnessPath,
+        $Phase + [Environment]::NewLine,
+        [System.Text.Encoding]::ASCII
+    )
+}
+
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+public static class R156ChildNative
+{
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern IntPtr GetStdHandle(int nStdHandle);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool CloseHandle(IntPtr hObject);
+}
+'@
+
+function Close-R156ChildStandardHandle {
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet('stdout', 'stderr')]
+        [string]$Name
+    )
+    $identifier = if ($Name -ceq 'stdout') { -11 } else { -12 }
+    $handle = [R156ChildNative]::GetStdHandle($identifier)
+    if ($handle -eq [IntPtr]::Zero -or $handle.ToInt64() -eq -1) {
+        $lastError = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        Write-R156ChildWitness -Phase ("native-close-failed:{0}:get:{1}" -f $Name, $lastError)
+        throw ("GetStdHandle failed for {0}; win32_error={1}" -f $Name, $lastError)
+    }
+    $closed = [R156ChildNative]::CloseHandle($handle)
+    if (-not $closed) {
+        $lastError = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        Write-R156ChildWitness -Phase ("native-close-failed:{0}:close:{1}" -f $Name, $lastError)
+        throw ("CloseHandle failed for {0}; win32_error={1}" -f $Name, $lastError)
+    }
+    Write-R156ChildWitness -Phase ($Name + '-os-closed')
+}
+
+function Write-R156ChildText {
+    param([Parameter(Mandatory)][System.IO.Stream]$Stream, [Parameter(Mandatory)][string]$Text)
+    $bytes = [System.Text.Encoding]::ASCII.GetBytes($Text)
+    if ($bytes.Length -gt 0) {
+        $Stream.Write($bytes, 0, $bytes.Length)
+        $Stream.Flush()
+    }
+}
+
+function Write-R156ChildFile {
+    param([Parameter(Mandatory)][System.IO.Stream]$Stream, [Parameter(Mandatory)][string]$Path)
+    $bytes = [System.IO.File]::ReadAllBytes($Path)
+    if ($bytes.Length -gt 0) {
+        $Stream.Write($bytes, 0, $bytes.Length)
+        $Stream.Flush()
+    }
+}
+
+function Write-R156ChildFill {
+    param([Parameter(Mandatory)][System.IO.Stream]$Stream, [Parameter(Mandatory)][int]$Count)
+    $bytes = New-Object byte[] $Count
+    $Stream.Write($bytes, 0, $bytes.Length)
+    $Stream.Flush()
+}
+
+switch ($mode) {
+        'payload' {
+            Write-R156ChildFile -Stream $stdout -Path $env:R156_PAYLOAD_PATH
+            if (([System.IO.FileInfo]$env:R156_ERROR_PAYLOAD_PATH).Length -gt 0) {
+                Write-R156ChildFile -Stream $stderr -Path $env:R156_ERROR_PAYLOAD_PATH
+            }
+        }
+        'empty' {
+        }
+        'stdout-first' {
+            Write-R156ChildText -Stream $stdout -Text 'OUT'
+            Write-R156ChildWitness -Phase 'stdout-payload-written'
+            Close-R156ChildStandardHandle -Name 'stdout'
+            Start-Sleep -Milliseconds 150
+            Write-R156ChildWitness -Phase 'post-stdout-closure-alive'
+            Write-R156ChildText -Stream $stderr -Text 'ERR'
+            Write-R156ChildWitness -Phase 'stderr-write-after-stdout-closure'
+            Close-R156ChildStandardHandle -Name 'stderr'
+            Write-R156ChildWitness -Phase 'both-os-handles-closed'
+        }
+        'stderr-first' {
+            Write-R156ChildText -Stream $stderr -Text 'ERR'
+            Write-R156ChildWitness -Phase 'stderr-payload-written'
+            Close-R156ChildStandardHandle -Name 'stderr'
+            Start-Sleep -Milliseconds 150
+            Write-R156ChildWitness -Phase 'post-stderr-closure-alive'
+            Write-R156ChildText -Stream $stdout -Text 'OUT'
+            Write-R156ChildWitness -Phase 'stdout-write-after-stderr-closure'
+            Close-R156ChildStandardHandle -Name 'stdout'
+            Write-R156ChildWitness -Phase 'both-os-handles-closed'
+        }
+        'simultaneous' {
+            Write-R156ChildText -Stream $stdout -Text 'OUT'
+            Write-R156ChildWitness -Phase 'stdout-payload-written'
+            Write-R156ChildText -Stream $stderr -Text 'ERR'
+            Write-R156ChildWitness -Phase 'stderr-payload-written'
+            Close-R156ChildStandardHandle -Name 'stdout'
+            Close-R156ChildStandardHandle -Name 'stderr'
+            Write-R156ChildWitness -Phase 'both-os-handles-closed'
+        }
+        'stdout-after-stderr' {
+            Write-R156ChildText -Stream $stderr -Text 'ERR'
+            Write-R156ChildWitness -Phase 'stderr-payload-written'
+            Close-R156ChildStandardHandle -Name 'stderr'
+            Start-Sleep -Milliseconds 60
+            Write-R156ChildWitness -Phase 'post-stderr-closure-alive'
+            Write-R156ChildFill -Stream $stdout -Count 32768
+            Write-R156ChildWitness -Phase 'stdout-write1-after-stderr-closure'
+            Start-Sleep -Milliseconds 60
+            Write-R156ChildFill -Stream $stdout -Count 32768
+            Write-R156ChildWitness -Phase 'stdout-write2-after-stderr-closure'
+            Close-R156ChildStandardHandle -Name 'stdout'
+            Write-R156ChildWitness -Phase 'both-os-handles-closed'
+        }
+        'stderr-after-stdout' {
+            Write-R156ChildText -Stream $stdout -Text 'OUT'
+            Write-R156ChildWitness -Phase 'stdout-payload-written'
+            Close-R156ChildStandardHandle -Name 'stdout'
+            Start-Sleep -Milliseconds 60
+            Write-R156ChildWitness -Phase 'post-stdout-closure-alive'
+            Write-R156ChildFill -Stream $stderr -Count 32768
+            Write-R156ChildWitness -Phase 'stderr-write1-after-stdout-closure'
+            Start-Sleep -Milliseconds 60
+            Write-R156ChildFill -Stream $stderr -Count 32768
+            Write-R156ChildWitness -Phase 'stderr-write2-after-stdout-closure'
+            Close-R156ChildStandardHandle -Name 'stderr'
+            Write-R156ChildWitness -Phase 'both-os-handles-closed'
+        }
+        'both-closed-alive' {
+            Write-R156ChildText -Stream $stdout -Text 'OUT'
+            Write-R156ChildWitness -Phase 'stdout-payload-written'
+            Write-R156ChildText -Stream $stderr -Text 'ERR'
+            Write-R156ChildWitness -Phase 'stderr-payload-written'
+            Close-R156ChildStandardHandle -Name 'stdout'
+            Close-R156ChildStandardHandle -Name 'stderr'
+            Write-R156ChildWitness -Phase 'both-os-handles-closed'
+            Write-R156ChildWitness -Phase 'post-both-closure-alive'
+            Start-Sleep -Milliseconds 5000
+        }
+        'timeout' {
+            Start-Sleep -Milliseconds 5000
+        }
+        'stdout-overflow' {
+            Write-R156ChildFill -Stream $stdout -Count 70000
+        }
+        'stderr-overflow' {
+            Write-R156ChildFill -Stream $stderr -Count 70000
+        }
+        'nonzero' {
+            Write-R156ChildText -Stream $stdout -Text 'OUT'
+            Write-R156ChildWitness -Phase 'stdout-payload-written'
+            Close-R156ChildStandardHandle -Name 'stdout'
+            Close-R156ChildStandardHandle -Name 'stderr'
+            Write-R156ChildWitness -Phase 'both-os-handles-closed'
+            $exitCode = 7
+        }
+        default {
+            throw 'unknown synthetic child mode'
+        }
+}
+
+if ($exitCode -ne 0) {
+    exit $exitCode
+}
+"""
+
+    def run_bounded_process(
+        self,
+        mode,
+        stdout_limit=65536,
+        stderr_limit=65536,
+        timeout_milliseconds=2000,
+        payload=b"",
+        error_payload=b"",
+    ):
+        powershell = shutil.which("powershell.exe")
+        if powershell is None:
+            self.skipTest("Windows PowerShell 5.1 is not available on this host")
+        with tempfile.TemporaryDirectory(prefix="r156_process_") as directory:
+            root = Path(directory)
+            payload_path = root / "payload.bin"
+            error_path = root / "error.bin"
+            child_path = root / "child.ps1"
+            witness_path = root / "witness.state"
+            payload_path.write_bytes(payload)
+            error_path.write_bytes(error_payload)
+            child_path.write_text(self.stream_child_script(), encoding="utf-8")
+            script = (
+                "$ErrorActionPreference = 'Stop'\n"
+                + self.process_functions()
+                + r"""
+$startInfo = New-Object System.Diagnostics.ProcessStartInfo
+if ([string]$env:R156_CHILD_MODE -ceq 'not-started') {
+    $startInfo.FileName = 'C:\R156-missing\not-a-process.exe'
+}
+else {
+    $startInfo.FileName = [string]$env:R156_CHILD_POWERSHELL
+}
+$startInfo.Arguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File ' + (ConvertTo-R156NativeArgument -Value $env:R156_CHILD_SCRIPT)
+$startInfo.UseShellExecute = $false
+$startInfo.RedirectStandardOutput = $true
+$startInfo.RedirectStandardError = $true
+$startInfo.CreateNoWindow = $true
+$startInfo.EnvironmentVariables['R156_CHILD_MODE'] = [string]$env:R156_CHILD_MODE
+$startInfo.EnvironmentVariables['R156_PAYLOAD_PATH'] = [string]$env:R156_PAYLOAD_PATH
+$startInfo.EnvironmentVariables['R156_ERROR_PAYLOAD_PATH'] = [string]$env:R156_ERROR_PAYLOAD_PATH
+$startInfo.EnvironmentVariables['R156_WITNESS_PATH'] = [string]$env:R156_WITNESS_PATH
+$result = Invoke-R156BoundedProcess -StartInfo $startInfo -TimeoutMilliseconds ([int]$env:R156_TIMEOUT_MS) -MaximumOutputBytes ([int64]$env:R156_STDOUT_LIMIT) -MaximumErrorBytes ([int64]$env:R156_STDERR_LIMIT)
+$algorithm = [System.Security.Cryptography.SHA256]::Create()
+try {
+    $sha = [BitConverter]::ToString($algorithm.ComputeHash($result.StdoutBytes)).Replace('-', '').ToLowerInvariant()
+}
+finally {
+    $algorithm.Dispose()
+}
+Write-Output ('started=' + [string]$result.Started + ';success=' + [string]$result.Success + ';length=' + [string]$result.StdoutBytes.Length + ';exit=' + [string]$result.ExitCode + ';timedout=' + [string]$result.TimedOut + ';overflow=' + [string]$result.Overflow + ';stderrdiscarded=' + [string]$result.StderrDiscarded + ';sha256=' + $sha)
+"""
+            )
+            lines = self.run_isolated_powershell(
+                script,
+                environment={
+                    "R156_CHILD_MODE": mode,
+                    "R156_CHILD_POWERSHELL": powershell,
+                    "R156_CHILD_SCRIPT": str(child_path),
+                    "R156_PAYLOAD_PATH": str(payload_path),
+                    "R156_ERROR_PAYLOAD_PATH": str(error_path),
+                    "R156_WITNESS_PATH": str(witness_path),
+                    "R156_STDOUT_LIMIT": str(stdout_limit),
+                    "R156_STDERR_LIMIT": str(stderr_limit),
+                    "R156_TIMEOUT_MS": str(timeout_milliseconds),
+                },
+                timeout=30,
+            )
+            witness = self.read_witness(witness_path)
+            native_failures = [line for line in witness if line.startswith("native-close-failed:")]
+            if native_failures:
+                self.fail("synthetic child native handle close failed: " + " | ".join(native_failures))
+        fields = self.parse_fields(lines)
+        sha_line = next(line for line in lines if line.startswith("started="))
+        fields["sha256"] = sha_line.split("sha256=", 1)[1]
+        fields["witness"] = witness
+        return fields
+
+    def run_local_output_check(self, object_argument, payload):
+        with tempfile.TemporaryDirectory(prefix="r156_output_contract_") as directory:
+            payload_path = Path(directory) / "payload.bin"
+            payload_path.write_bytes(payload)
+            script = (
+                "$ErrorActionPreference = 'Stop'\n"
+                + self.git_contract_constants()
+                + self.git_output_functions()
+                + r"""
+$arguments = @('cat-file', 'blob', [string]$env:R156_OBJECT_ARGUMENT)
+$bytes = [System.IO.File]::ReadAllBytes($env:R156_PAYLOAD_PATH)
+$contract = Get-R156LocalGitOutputContract -Arguments $arguments
+$valid = Test-R156LocalGitOutput -Arguments $arguments -Bytes $bytes
+if ($null -eq $contract) {
+    Write-Output ('valid=' + [string]$valid + ';contract=none')
+}
+else {
+    Write-Output ('valid=' + [string]$valid + ';contract_limit=' + [string]$contract.StdoutLimitBytes + ';contract_length=' + [string]$contract.ExpectedBlobLength + ';contract_object=' + [string]$contract.ExpectedBlobObject)
+}
+"""
+            )
+            lines = self.run_isolated_powershell(
+                script,
+                environment={
+                    "R156_OBJECT_ARGUMENT": object_argument,
+                    "R156_PAYLOAD_PATH": str(payload_path),
+                },
+            )
+        fields = {}
+        for field in lines[-1].split(";"):
+            key, value = field.split("=", 1)
+            fields[key] = value
+        fields["valid"] = fields["valid"].lower() == "true"
+        for key in ("contract_limit", "contract_length"):
+            if key in fields:
+                fields[key] = int(fields[key])
+        return fields
+
+    def run_empty_byte_matrix(self):
+        script = (
+            "$ErrorActionPreference = 'Stop'\n"
+            + self.git_contract_constants()
+            + self.git_output_functions()
+            + self.extracted_functions(("New-R156GitProcessResult",))
+            + r"""
+$statusArguments = @('-c', 'core.fsmonitor=false', '-c', 'core.untrackedCache=false', '-c', 'core.hooksPath=NUL', '-c', 'submodule.recurse=false', 'status', '--porcelain=v1', '--untracked-files=all', '--ignore-submodules=none')
+$cleanStatus = Test-R156LocalGitOutput -Arguments $statusArguments -Bytes ([byte[]]@())
+$dirtyStatus = Test-R156LocalGitOutput -Arguments $statusArguments -Bytes ([System.Text.Encoding]::ASCII.GetBytes(" M file`n"))
+$required = @(
+    [pscustomobject]@{ Name = 'symbolic'; Arguments = @('symbolic-ref', '--short', '-q', 'HEAD') },
+    [pscustomobject]@{ Name = 'head'; Arguments = @('rev-parse', '--verify', 'HEAD') },
+    [pscustomobject]@{ Name = 'config'; Arguments = @('config', '--file=C:\XB\automation\.git\config', '--no-includes', '--null', '--list') },
+    [pscustomobject]@{ Name = 'commit'; Arguments = @('cat-file', 'commit', $script:R156ExpectedHeadAtExecution) },
+    [pscustomobject]@{ Name = 'blob'; Arguments = @('cat-file', 'blob', $script:R156LibraryGitBlob) }
+)
+$results = @()
+foreach ($case in $required) {
+    $results = $results + (Test-R156LocalGitOutput -Arguments $case.Arguments -Bytes ([byte[]]@()))
+}
+$notStarted = New-R156GitProcessResult -Started $false -Success $false -ExitCode -1 -StdoutBytes ([byte[]]@())
+$timeout = New-R156GitProcessResult -Started $true -Success $false -ExitCode -1 -StdoutBytes ([byte[]]@()) -TimedOut $true
+$overflow = New-R156GitProcessResult -Started $true -Success $false -ExitCode -1 -StdoutBytes ([byte[]]@()) -Overflow $true
+$nonzero = New-R156GitProcessResult -Started $true -Success $false -ExitCode 7 -StdoutBytes ([byte[]]@())
+$failedEmpty = @($notStarted, $timeout, $overflow, $nonzero) | Where-Object { $_.StdoutBytes.Length -eq 0 }
+Write-Output ('clean_status=' + [string]$cleanStatus + ';dirty_status=' + [string]$dirtyStatus + ';failed_empty=' + [string]($failedEmpty.Count -eq 4))
+foreach ($case in $required) {
+    Write-Output ('data_' + $case.Name + '=' + [string](Test-R156LocalGitOutput -Arguments $case.Arguments -Bytes ([byte[]]@())))
+}
+"""
+        )
+        lines = self.run_isolated_powershell(script)
+        values = {}
+        for line in lines:
+            for field in line.split(";"):
+                key, value = field.split("=", 1)
+                values[key] = value.lower() == "true"
+        return values
+
+    def run_fault_cancel_matrix(self):
+        script = (
+            "$ErrorActionPreference = 'Stop'\n"
+            + self.extracted_functions(("Get-R156CompletedReadResult",))
+            + r"""
+$faultSource = New-Object 'System.Threading.Tasks.TaskCompletionSource[int]'
+[void]$faultSource.SetException((New-Object -TypeName System.InvalidOperationException -ArgumentList 'synthetic'))
+$fault = Get-R156CompletedReadResult -Task $faultSource.Task -Active $true
+$cancelSource = New-Object 'System.Threading.Tasks.TaskCompletionSource[int]'
+[void]$cancelSource.SetCanceled()
+$cancelled = Get-R156CompletedReadResult -Task $cancelSource.Task -Active $true
+$inactiveSource = New-Object 'System.Threading.Tasks.TaskCompletionSource[int]'
+[void]$inactiveSource.SetResult(0)
+$inactive = Get-R156CompletedReadResult -Task $inactiveSource.Task -Active $false
+Write-Output ('fault_success=' + [string]$fault.Success + ';faulted=' + [string]$fault.Faulted + ';cancel_success=' + [string]$cancelled.Success + ';cancelled=' + [string]$cancelled.Canceled + ';inactive_invariant=' + [string]$inactive.InvariantViolation)
+"""
+        )
+        lines = self.run_isolated_powershell(script)
+        values = {}
+        for field in lines[-1].split(";"):
+            key, value = field.split("=", 1)
+            values[key] = value.lower() == "true"
+        return values
+
+    def run_acl_matrix(self):
+        script = (
+            "$ErrorActionPreference = 'Stop'\n"
+            + self.extracted_functions(("Test-R156MutationCapableFileSystemRights",))
+            + r"""
+$cases = [ordered]@{
+    Read = [System.Security.AccessControl.FileSystemRights]::Read
+    ReadAndExecute = [System.Security.AccessControl.FileSystemRights]::ReadAndExecute
+    Synchronize = [System.Security.AccessControl.FileSystemRights]::Synchronize
+    WriteData = [System.Security.AccessControl.FileSystemRights]::WriteData
+    AppendData = [System.Security.AccessControl.FileSystemRights]::AppendData
+    WriteExtendedAttributes = [System.Security.AccessControl.FileSystemRights]::WriteExtendedAttributes
+    DeleteSubdirectoriesAndFiles = [System.Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles
+    WriteAttributes = [System.Security.AccessControl.FileSystemRights]::WriteAttributes
+    Delete = [System.Security.AccessControl.FileSystemRights]::Delete
+    ChangePermissions = [System.Security.AccessControl.FileSystemRights]::ChangePermissions
+    TakeOwnership = [System.Security.AccessControl.FileSystemRights]::TakeOwnership
+    Write = [System.Security.AccessControl.FileSystemRights]::Write
+    Modify = [System.Security.AccessControl.FileSystemRights]::Modify
+    FullControl = [System.Security.AccessControl.FileSystemRights]::FullControl
+}
+foreach ($entry in $cases.GetEnumerator()) {
+    Write-Output ($entry.Key + '=' + [string](Test-R156MutationCapableFileSystemRights -Rights $entry.Value))
+}
+"""
+        )
+        lines = self.run_isolated_powershell(script)
+        values = {}
+        for line in lines:
+            key, value = line.split("=", 1)
+            values[key] = value.lower() == "true"
+        return values
+
+    def run_json_matrix(self, cases):
+        with tempfile.TemporaryDirectory(prefix="r156_json_cases_") as directory:
+            root = Path(directory)
+            for name, data in cases.items():
+                (root / (name + ".json")).write_bytes(data)
+            script = (
+                "$ErrorActionPreference = 'Stop'\n"
+                "$script:R156MetadataJsonLimitBytes = [int64]65536\n"
+                "$script:R156MetadataJsonMaxDepth = [int]32\n"
+                "$script:R156MetadataJsonMaxBytesPerRead = [int]8192\n"
+                + self.json_functions()
+                + r"""
+$files = @(Get-ChildItem -LiteralPath $env:R156_JSON_DIR -File | Sort-Object Name)
+foreach ($file in $files) {
+    $object = Read-R156StrictJsonObject -Path $file.FullName
+    if ($null -eq $object) {
+        Write-Output ($file.BaseName + ';kind=null')
+    }
+    else {
+        Write-Output ($file.BaseName + ';kind=object;count=' + [string](@($object.PSObject.Properties).Count))
+    }
+}
+"""
+            )
+            lines = self.run_isolated_powershell(
+                script,
+                environment={"R156_JSON_DIR": str(root)},
+            )
+        results = {}
+        for line in lines:
+            fields = line.split(";")
+            name = fields[0]
+            result = {key: value for key, value in (field.split("=", 1) for field in fields[1:])}
+            if "count" in result:
+                result["count"] = int(result["count"])
+            results[name] = result
+        return results
+
+    @staticmethod
+    def config_accepts(entries):
+        allowed = {
+            "core.repositoryformatversion": "0",
+            "core.filemode": None,
+            "core.bare": "false",
+            "core.logallrefupdates": "true",
+            "core.symlinks": None,
+            "core.ignorecase": None,
+            "remote.origin.url": None,
+            "remote.origin.fetch": "+refs/heads/*:refs/remotes/origin/*",
+            "branch.main.remote": "origin",
+            "branch.main.merge": "refs/heads/main",
+        }
+        canonical = {
+            "https://github.com/x-boundaries/automation",
+            "https://github.com/x-boundaries/automation.git",
+            "git@github.com:x-boundaries/automation",
+            "git@github.com:x-boundaries/automation.git",
+            "ssh://git@github.com:x-boundaries/automation",
+            "ssh://git@github.com:x-boundaries/automation.git",
+        }
+        if len(entries) != len(allowed):
+            return False
+        seen = set()
+        for key, value in entries:
+            if key not in allowed or key in seen:
+                return False
+            seen.add(key)
+            if key == "remote.origin.url":
+                if value not in canonical:
+                    return False
+            elif key in {"core.filemode", "core.symlinks", "core.ignorecase"}:
+                if value not in {"true", "false"}:
+                    return False
+            elif value != allowed[key]:
+                return False
+        return seen == set(allowed)
+
+    @staticmethod
+    def canonical_byte_contract(committed):
+        if (
+            not committed
+            or b"\xef\xbb\xbf" in committed
+            or b"\r" in committed
+            or not committed.endswith(b"\n")
+            or committed.endswith(b"\n\n")
+        ):
+            return False
+        try:
+            committed.decode("utf-8", errors="strict")
+        except UnicodeDecodeError:
+            return False
+        if any(
+            (byte < 0x20 and byte not in (0x09, 0x0A)) or byte == 0x7F
+            for byte in committed
+        ):
+            return False
+        return True
+
+    @staticmethod
+    def working_byte_contract(working):
+        if not working or b"\xef\xbb\xbf" in working:
+            return None
+        try:
+            working.decode("utf-8", errors="strict")
+        except UnicodeDecodeError:
+            return None
+
+        has_crlf = False
+        has_bare_lf = False
+        for index, byte in enumerate(working):
+            if byte == 0x0D:
+                if index + 1 >= len(working) or working[index + 1] != 0x0A:
+                    return None
+                has_crlf = True
+            elif byte == 0x0A:
+                if index == 0 or working[index - 1] != 0x0D:
+                    has_bare_lf = True
+            elif (byte < 0x20 and byte != 0x09) or byte == 0x7F:
+                return None
+        if has_crlf and has_bare_lf:
+            return None
+        if not working.endswith(b"\n"):
+            return None
+        if has_crlf and not working.endswith(b"\r\n"):
+            return None
+
+        normalized = working.replace(b"\r\n", b"\n")
+        if normalized.endswith(b"\n\n"):
+            return None
+        return normalized
+
+    @classmethod
+    def normalize_contract(cls, working, committed):
+        if not cls.canonical_byte_contract(committed):
+            return False
+        normalized = cls.working_byte_contract(working)
+        return normalized is not None and normalized == committed
+
+    @staticmethod
+    def git_object_sha1(object_type, raw):
+        header = f"{object_type} {len(raw)}\0".encode("ascii")
+        return hashlib.sha1(header + raw).hexdigest()
+
+    @staticmethod
+    def commit_headers(tree, parent):
+        return (
+            f"tree {tree}\n"
+            f"parent {parent}\n"
+            "author WJ <10020253+weijunswj@users.noreply.github.com> 0 +0000\n"
+            "committer WJ <10020253+weijunswj@users.noreply.github.com> 0 +0000\n"
+            "\n"
+            "synthetic\n"
+        ).encode("utf-8")
+
+    @staticmethod
+    def remote_record(head):
+        return f"{head}\trefs/heads/main\n".encode("ascii")
+
+    def read_head_blob(self, relative_path):
+        environment = os.environ.copy()
+        environment["GIT_NO_REPLACE_OBJECTS"] = "1"
+        environment["GIT_NO_LAZY_FETCH"] = "1"
+        resolved = subprocess.run(
+            ["git", "rev-parse", "--verify", f"HEAD:{relative_path}"],
+            cwd=REPO_ROOT,
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(
+            resolved.returncode,
+            0,
+            f"HEAD blob resolution failed for {relative_path}",
+        )
+        resolved_text = resolved.stdout.decode("ascii", errors="strict")
+        match = re.fullmatch(r"([0-9a-f]{40})\r?\n", resolved_text)
+        self.assertIsNotNone(match, f"invalid HEAD blob identity for {relative_path}")
+        object_id = match.group(1)
+
+        blob = subprocess.run(
+            ["git", "cat-file", "blob", object_id],
+            cwd=REPO_ROOT,
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(
+            blob.returncode,
+            0,
+            f"HEAD blob read failed for {relative_path}",
+        )
+        return object_id, blob.stdout
+
+    def test_helper_parses_under_windows_powershell_51_when_available(self):
+        powershell = shutil.which("powershell.exe")
+        if os.name != "nt" or powershell is None:
+            self.skipTest("Windows PowerShell 5.1 parser is not available on this host")
+
+        command = (
+            "$tokens=$null; $errors=$null; "
+            "if ([string]$PSVersionTable.PSEdition -cne 'Desktop' -or "
+            "[int]$PSVersionTable.PSVersion.Major -ne 5 -or "
+            "[int]$PSVersionTable.PSVersion.Minor -ne 1) { exit 2 }; "
+            "[System.Management.Automation.Language.Parser]::ParseFile("
+            "$env:R156_HELPER_PARSE_PATH,[ref]$tokens,[ref]$errors) | Out-Null; "
+            "if (@($errors).Count -ne 0) { "
+            "foreach ($parseError in @($errors) | Select-Object -First 8) { "
+            "Write-Output (('{0}:{1}:{2}' -f "
+            "[int]$parseError.Extent.StartLineNumber, "
+            "[int]$parseError.Extent.StartColumnNumber, "
+            "[string]$parseError.ErrorId)) }; exit 1 }; exit 0"
+        )
+        environment = os.environ.copy()
+        environment["R156_HELPER_PARSE_PATH"] = str(HELPER)
+        result = subprocess.run(
+            [powershell, "-NoProfile", "-NonInteractive", "-Command", command],
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=30,
+            check=False,
+        )
+        if result.returncode != 0:
+            raw_diagnostics = result.stdout[:2048].decode("ascii", errors="ignore")
+            diagnostics = [
+                line
+                for line in raw_diagnostics.splitlines()
+                if re.fullmatch(r"[0-9]+:[0-9]+:[A-Za-z0-9_]+", line)
+            ][:8]
+            bounded = ", ".join(diagnostics) if diagnostics else "none"
+            self.fail(
+                "Windows PowerShell 5.1 parse failed; "
+                f"bounded diagnostics: {bounded}"
+            )
+
+    def test_pointer_readers_extract_sids_before_freeing_native_buffers(self):
+        user = self.method_body(
+            "public static byte[] ReadTokenUserSid",
+            "public static byte[] ReadTokenOwnerSid",
+        )
+        owner = self.method_body(
+            "public static byte[] ReadTokenOwnerSid",
+            "public static TokenGroupRecord[] ReadTokenGroups",
+        )
+        groups = self.method_body(
+            "public static TokenGroupRecord[] ReadTokenGroups",
+            "// Scalar and inline-value token classes",
+        )
+
+        for body in (user, owner, groups):
+            self.assertNotIn("ReadTokenInformationBytes", body)
+            self.assertLess(
+                body.index("TryGetTokenInformationBuffer"),
+                body.index("TryCopySidFromBuffer"),
+            )
+            self.assertLess(
+                body.index("TryCopySidFromBuffer"),
+                body.index("Marshal.FreeHGlobal(buffer)"),
+            )
+        self.assertIn("return sidBytes", user)
+        self.assertIn("return sidBytes", owner)
+        self.assertIn("result[index].Sid = sidBytes", groups)
+
+        self.assertIn("returnedLength < structureLength", user)
+        self.assertIn("returnedLength < structureLength", owner)
+        self.assertIn("countOffset", groups)
+        self.assertIn("entriesLength", groups)
+        self.assertIn("TryCopySidFromBuffer", groups)
+
+    def test_sid_pointer_and_structure_bounds_fail_closed(self):
+        self.assertIn("targetAddress < bufferAddress", self.native)
+        self.assertIn("targetAddress > bufferEnd - (long)minimumLength", self.native)
+        self.assertIn("returned <= 0", self.native)
+        self.assertIn("returned > required", self.native)
+        self.assertIn("subAuthorityCount > SID_MAX_SUB_AUTHORITIES", self.native)
+        self.assertIn("!HasBufferRange(bufferLength, sidOffset, sidLength)", self.native)
+        self.assertIn("count > 65536", self.native)
+        self.assertIn("!HasBufferRange(returnedLength, firstOffset, entriesLength)", self.native)
+        self.assertIn("catch {\n                return null;", self.native)
+
+    def test_local_and_remote_git_wrappers_are_distinct(self):
+        self.assertEqual(self.source.count("function Invoke-R156LocalGitRead {"), 1)
+        self.assertEqual(self.source.count("function Invoke-R156RemoteHeadProof {"), 1)
+        self.assertNotIn("function Invoke-R156Git {", self.source)
+        self.assertIn("Test-R156LocalGitArguments", self.source)
+        self.assertIn("Test-R156RemoteGitArguments", self.source)
+        self.assertIn("R156LocalGitReadOnlySubcommands", self.source)
+        self.assertIn("R156RemoteGitReadOnlySubcommands", self.source)
+
+    def test_absolute_git_and_gcm_trust_anchor_is_frozen(self):
+        self.assertEqual(
+            self.source.count(
+                "$startInfo.FileName = [string]$script:R156FrozenGitPath"
+            ),
+            2,
+        )
+        self.assertNotIn("$startInfo.FileName = 'git.exe'", self.source)
+        self.assertNotIn("FileName='git.exe'", self.source)
+        self.assertNotIn("credential.helper=manager", self.source)
+        self.assertIn("git-credential-manager.exe", self.source)
+        self.assertIn("Get-R156CredentialHelperConfig", self.source)
+        self.assertIn("'credential.helper='", self.source)
+        self.assertIn("credential.helper=\"", self.source)
+        self.assertIn("ProgramFiles", self.source)
+        self.assertIn("ProgramFilesX86", self.source)
+        self.assertIn("Test-R156ProtectedInstallationRoot", self.source)
+        self.assertIn("FileSystemRights", self.source)
+        self.assertIn("Test-R156NoReparseAncestors", self.source)
+        self.assertNotIn("Get-Command", self.source)
+        self.assertNotIn("$env:PATH", self.source)
+
+    def test_git_process_environment_and_output_are_bounded(self):
+        local = self.source_function(
+            "function Invoke-R156LocalGitRead",
+            "function Get-R156RemoteWorkingDirectory",
+        )
+        remote = self.source_function(
+            "function Invoke-R156RemoteHeadProof",
+            "function Get-R156RepositoryState",
+        )
+        for wrapper in (local, remote):
+            self.assertIn("Where-Object { ([string]$_) -like 'GIT_*' }", wrapper)
+            self.assertIn("EnvironmentVariables.Remove", wrapper)
+            self.assertIn("RedirectStandardOutput", wrapper)
+            self.assertIn("RedirectStandardError", wrapper)
+            self.assertIn("GIT_TERMINAL_PROMPT", wrapper)
+        self.assertIn("Where-Object { ([string]$_) -like 'GCM_*' }", remote)
+        self.assertIn("GCM_INTERACTIVE", remote)
+        self.assertIn("StderrDiscarded", self.source)
+        self.assertIn("ReadAsync", self.source)
+        self.assertIn("MaximumOutputBytes", self.source)
+        self.assertIn("TimedOut", self.source)
+        self.assertIn("Overflow", self.source)
+        self.assertIn("process.Kill", self.source)
+        self.assertIn("process.ExitCode -eq 0", self.source)
+
+    def test_remote_discovery_isolation_is_fixed_and_repository_free(self):
+        remote = self.source_function(
+            "function Get-R156RemoteWorkingDirectory",
+            "function Invoke-R156RemoteHeadProof",
+        )
+        self.assertIn("[Environment+SpecialFolder]::Windows", remote)
+        self.assertIn("StartingDirectory", remote)
+        self.assertIn("CeilingDirectory", remote)
+        self.assertIn("[System.IO.Path]::GetPathRoot", remote)
+        self.assertIn("EnvironmentVariables['GIT_CEILING_DIRECTORIES']", self.source)
+        self.assertIn("File]::Exists($marker)", remote)
+        self.assertIn("Directory]::Exists($marker)", remote)
+        self.assertNotIn("GIT_DIR=NUL", self.source)
+        self.assertNotIn("['GIT_DIR']", self.source)
+        self.assertIn(
+            "'https://github.com/x-boundaries/automation.git'",
+            self.source,
+        )
+        self.assertNotIn("RemoteOrigin", self.source)
+
+    def test_local_git_command_matrix_is_exact_and_read_only(self):
+        contract = self.source_function(
+            "function Test-R156LocalGitArguments",
+            "function Test-R156RemoteGitArguments",
+        )
+        for marker in (
+            "symbolic-ref",
+            "'--short'",
+            "'-q'",
+            "'HEAD'",
+            "rev-parse",
+            "'--verify'",
+            "'--show-toplevel'",
+            "'--is-inside-work-tree'",
+            "'--git-dir'",
+            "'--git-common-dir'",
+            "status",
+            "'--porcelain=v1'",
+            "'--untracked-files=all'",
+            "'--ignore-submodules=none'",
+            "config",
+            "'--no-includes'",
+            "'--null'",
+            "'--list'",
+            "cat-file",
+            "'commit'",
+            "'blob'",
+        ):
+            self.assertIn(marker, contract)
+        self.assertIn(
+            "'--git-dir=C:\\XB\\automation\\.git'",
+            self.source,
+        )
+        self.assertIn(
+            "'--work-tree=C:\\XB\\automation'",
+            self.source,
+        )
+        for marker in (
+            "'--no-optional-locks'",
+            "'--no-replace-objects'",
+            "'--no-lazy-fetch'",
+            "'--literal-pathspecs'",
+        ):
+            self.assertIn(marker, self.source)
+        self.assertNotIn("rev-list", self.source)
+        self.assertNotIn("hash-object", self.source)
+        self.assertNotIn("HEAD^{tree}", self.source)
+
+    def test_remote_command_and_helper_scope_are_fixed(self):
+        remote = self.source_function(
+            "function Invoke-R156RemoteHeadProof",
+            "function Get-R156RepositoryState",
+        )
+        for marker in (
+            "'ls-remote'",
+            "'--quiet'",
+            "'--refs'",
+            "'--exit-code'",
+            "'refs/heads/main'",
+            "credential.interactive=false",
+            "protocol.allow=never",
+            "protocol.https.allow=always",
+            "credential.helper=",
+            "GIT_ALLOW_PROTOCOL",
+            "'GCM_INTERACTIVE'] = '0'",
+        ):
+            self.assertIn(marker, remote)
+        self.assertIn(
+            "GIT_CONFIG_NOSYSTEM",
+            remote,
+        )
+        self.assertIn("GIT_CONFIG_SYSTEM", remote)
+        self.assertIn("GIT_CONFIG_GLOBAL", remote)
+
+    def test_config_admission_rejects_includes_url_rewrites_and_unknown_keys(self):
+        base = [
+            ("core.repositoryformatversion", "0"),
+            ("core.filemode", "false"),
+            ("core.bare", "false"),
+            ("core.logallrefupdates", "true"),
+            ("core.symlinks", "false"),
+            ("core.ignorecase", "true"),
+            ("remote.origin.url", "https://github.com/x-boundaries/automation.git"),
+            ("remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"),
+            ("branch.main.remote", "origin"),
+            ("branch.main.merge", "refs/heads/main"),
+        ]
+        self.assertTrue(self.config_accepts(base))
+        for replacement in (
+            ("include.path", "C:\\user\\config"),
+            ("includeIf.gitdir", "C:\\user\\config"),
+            ("url.https://evil/.insteadOf", "https://github.com/x-boundaries/automation.git"),
+            ("credential.helper", "manager"),
+            ("core.fsmonitor", "true"),
+            ("remote.origin.promisor", "true"),
+        ):
+            mutated = list(base)
+            mutated[1] = replacement
+            self.assertFalse(self.config_accepts(mutated))
+        self.assertIn("Test-R156ConfigAdmission", self.source)
+        self.assertIn("acceptedKeys", self.source)
+        self.assertIn("'--file=C:\\XB\\automation\\.git\\config'", self.source)
+        self.assertIn("'--no-includes'", self.source)
+
+    def test_status_is_side_effect_free_and_index_is_held(self):
+        status = self.source_function(
+            "function Get-R156RepositoryState",
+            "function Resolve-R156RepositoryPath",
+        )
+        for marker in (
+            "core.fsmonitor=false",
+            "core.untrackedCache=false",
+            "core.hooksPath=NUL",
+            "submodule.recurse=false",
+            "'--ignore-submodules=none'",
+            "R156IndexHandle",
+            "indexMetadataBefore",
+            "indexMetadataAfter",
+            "indexDigestBefore",
+            "indexDigestAfter",
+            "indexSideEffectFree",
+            "FileShare]::Read",
+            "GIT_OPTIONAL_LOCKS",
+        ):
+            self.assertIn(marker, status + self.source)
+        self.assertIn("R156RepositoryConfigHandle", status)
+        self.assertIn("ConfigAdmission", status)
+
+    def test_cat_file_rejects_filters_textconv_mailmap_and_arbitrary_objects(self):
+        contract = self.source_function(
+            "function Test-R156LocalGitArguments",
+            "function Test-R156RemoteGitArguments",
+        )
+        self.assertIn("R156LibraryGitBlob", contract)
+        self.assertIn("R156InstallerGitBlob", contract)
+        self.assertIn("R156LauncherGitBlob", contract)
+        for marker in (
+            "--filters",
+            "--textconv",
+            "--follow-symlinks",
+            "--mailmap",
+            "arbitrary",
+        ):
+            self.assertNotIn(marker, contract)
+        self.assertIn("ExpectedHeadAtExecution", contract)
+        self.assertIn("'cat-file', 'commit'", self.source)
+        self.assertIn("'cat-file', 'blob'", self.source)
+
+    def test_raw_commit_tree_parent_and_blob_hash_proofs_are_present(self):
+        proof = self.source_function(
+            "function Get-R156CommitTreeParentProof",
+            "function Close-R156TrackedHandles",
+        )
+        for marker in (
+            "RawCommitBytes",
+            "Get-R156Sha1ForGitObject",
+            "CommitObjectHash",
+            "headerText",
+            "allowedHeaders",
+            "counts",
+            "'tree'",
+            "'parent'",
+            "ExpectedTreeValue",
+            "ExpectedParentValue",
+            "ParentCount",
+        ):
+            self.assertIn(marker, proof)
+        tree = "a" * 40
+        parent = "b" * 40
+        raw = self.commit_headers(tree, parent)
+        self.assertEqual(self.git_object_sha1("commit", raw), self.git_object_sha1("commit", raw))
+        headers = raw.split(b"\n\n", 1)[0].decode("utf-8").splitlines()
+        self.assertEqual([line.split(" ", 1)[1] for line in headers if line.startswith("tree ")], [tree])
+        self.assertEqual([line.split(" ", 1)[1] for line in headers if line.startswith("parent ")], [parent])
+        duplicate_parent = raw.replace(
+            f"parent {parent}\n".encode(),
+            f"parent {parent}\nparent {parent}\n".encode(),
+        )
+        self.assertEqual(
+            len(re.findall(r"^parent [0-9a-f]{40}$", duplicate_parent.decode(), re.MULTILINE)),
+            2,
+        )
+
+        source = self.source_function(
+            "function Read-R156TrustedSource",
+            "function Read-R156Locator",
+        )
+        for marker in (
+            "rev-parse",
+            "ExpectedGitBlob",
+            "cat-file",
+            "committedBytes",
+            "Get-R156Sha1ForGitObject -Type 'blob'",
+            "workingBytes",
+            "NormalizedBytes",
+            "Test-R156ByteArraysEqual",
+            "Test-R156PowerShellParse -Path $workingPath -Bytes $workingBytes",
+            "R156SourceHandles",
+        ):
+            self.assertIn(marker, source)
+
+    def test_byte_contract_synthetic_matrix(self):
+        committed = b"alpha\nbeta\n"
+        canonical_cases = (
+            ("valid uniform LF", committed, True),
+            ("CRLF is not canonical", b"alpha\r\nbeta\r\n", False),
+            ("BOM", b"\xef\xbb\xbf" + committed, False),
+            ("invalid UTF-8", b"alpha\n\xff\n", False),
+            ("NUL", b"alpha\x00\n", False),
+            ("EOT", b"alpha\x04\n", False),
+            ("other forbidden C0 control", b"alpha\x01\n", False),
+            ("DEL", b"alpha\x7f\n", False),
+            ("missing terminal LF", b"alpha\nbeta", False),
+            ("surplus terminal LF", b"alpha\nbeta\n\n", False),
+        )
+        for label, candidate, expected in canonical_cases:
+            with self.subTest(contract="canonical", case=label):
+                self.assertEqual(self.canonical_byte_contract(candidate), expected)
+
+        working_cases = (
+            ("valid uniform LF", committed, True),
+            ("valid uniform CRLF", b"alpha\r\nbeta\r\n", True),
+            ("mixed line endings", b"alpha\r\nbeta\n", False),
+            ("lone CR", b"alpha\rbeta\n", False),
+            ("BOM", b"\xef\xbb\xbf" + committed, False),
+            ("invalid UTF-8", b"alpha\n\xff\n", False),
+            ("NUL", b"alpha\x00\n", False),
+            ("EOT", b"alpha\x04\n", False),
+            ("other forbidden C0 control", b"alpha\x01\n", False),
+            ("DEL", b"alpha\x7f\n", False),
+            ("missing terminal LF", b"alpha\nbeta", False),
+            ("surplus terminal LF", b"alpha\nbeta\n\n", False),
+        )
+        for label, candidate, expected in working_cases:
+            with self.subTest(contract="working", case=label):
+                self.assertEqual(self.normalize_contract(candidate, committed), expected)
+
+        self.assertFalse(self.normalize_contract(b"alpha\n", b"omega\n"))
+        for marker in (
+            "Test-R156CommittedByteContract",
+            "Test-R156WorkingByteContract",
+            "Convert-R156WorkingBytesToLf",
+            "NormalizedBytes",
+            "Ending = if ($hasCrlf)",
+            "UTF8Encoding($false, $true)",
+            "0xEF",
+            "0x0D",
+            "0x0A",
+        ):
+            self.assertIn(marker, self.source)
+
+    def test_source_and_repository_handles_deny_replacement(self):
+        for marker in (
+            "Open-R156ReadOnlyHandle",
+            "FileMode]::Open",
+            "FileAccess]::Read",
+            "FileShare]::Read",
+            "R156RepositoryConfigHandle",
+            "R156SourceHandles",
+            "R156IndexHandle",
+            "Test-R156NoReparseAncestors",
+        ):
+            self.assertIn(marker, self.source)
+        self.assertNotIn("FileShare]::ReadWrite", self.source)
+        self.assertNotIn("FileShare]::Delete", self.source)
+
+    def test_malformed_extra_output_overflow_timeout_and_nonzero_fail_closed(self):
+        head = "0" * 40
+        self.assertEqual(self.remote_record(head), f"{head}\trefs/heads/main\n".encode())
+        self.assertNotEqual(
+            self.remote_record(head) + b"extra\n",
+            self.remote_record(head),
+        )
+        for marker in (
+            "Test-R156SingleGitLineBytes",
+            "Convert-R156ConfigBytes",
+            "StdoutBytes",
+            "StderrDiscarded",
+            "MaximumOutputBytes",
+            "TimedOut",
+            "Overflow",
+            "ExitCode",
+            "Success",
+            "process.Kill",
+            "RedirectStandardOutput",
+            "RedirectStandardError",
+        ):
+            self.assertIn(marker, self.source)
+
+    def test_frozen_boundaries_and_dispatch_protocol_remain_unchanged(self):
+        transport = self.source_function(
+            "function Invoke-R156Transport",
+            "function Test-R156PrivateBindingsOutsideCheckout",
+        )
+        self.assertIn("Where-Object { ([string]$_) -like 'GIT_*' }", transport)
+        self.assertIn("EnvironmentVariables.Remove", transport)
+        collect = transport.index("$inheritedGitNames = @(")
+        remove = transport.index("foreach ($name in $inheritedGitNames)")
+        child_binding = transport.index("$startInfo.EnvironmentVariables['EG_R156_MODE']")
+        start = transport.index("$started = [bool]$process.Start()")
+        self.assertLess(collect, remove)
+        self.assertLess(remove, child_binding)
+        self.assertLess(child_binding, start)
+        self.assertEqual(self.source.count("Invoke-R156Transport -Mode 'REAL'"), 1)
+        self.assertIn("$script:R156RealInstallerInvocations = 1", self.source)
+        self.assertIn("$script:R156AuthorityConsumed = 'YES'", self.source)
+        self.assertIn("'CONTROLLER_REQUIRED_POST_DISPATCH'", self.source)
+        self.assertIn("$fields['retry_allowed'] = 'NO'", self.source)
+
+        self.assertNotIn("R156ExpectedParentForPreimage", self.source)
+        stale_calls = re.findall(
+            r"Read-R156ManifestState\s+-LauncherRoot\s+[^\r\n]+?-ExpectedAdmission\s+\$script:R156ExpectedParentAtExecution",
+            self.source,
+        )
+        self.assertEqual(len(stale_calls), 3)
+        fence_calls = re.findall(
+            r"Test-R156RepositoryFence\s+-State\s+[^\r\n]+",
+            self.source,
+        )
+        self.assertEqual(len(fence_calls), 4)
+
+    def test_head_blobs_are_canonical_for_both_owned_files(self):
+        for relative_path in OWNED_RELATIVE_PATHS:
+            with self.subTest(path=relative_path):
+                object_id, committed = self.read_head_blob(relative_path)
+                self.assertTrue(self.canonical_byte_contract(committed))
+                self.assertEqual(self.git_object_sha1("blob", committed), object_id)
+
+    def test_working_tree_bytes_match_verified_head_blobs_after_normalization(self):
+        for relative_path in OWNED_RELATIVE_PATHS:
+            with self.subTest(path=relative_path):
+                _, committed = self.read_head_blob(relative_path)
+                working = (REPO_ROOT / Path(relative_path)).read_bytes()
+                normalized = self.working_byte_contract(working)
+                self.assertIsNotNone(normalized)
+                self.assertEqual(normalized, committed)
+
+    def test_git_output_contract_behavioural_matrix(self):
+        frozen = (
+            ("library", "de75302dfb7ce3b1b4b37919d6b7e734d0503018", 141393),
+            ("installer", "a5b670e3b043a026af1d7f2086df03fdb1e7fa13", 25643),
+            ("launcher", "d632068bbd5832cc46971278ca0f4fba3bf7e8f3", 21081),
+        )
+        blobs = {}
+        for name, object_id, expected_length in frozen:
+            with self.subTest(blob=name):
+                result = subprocess.run(
+                    ["git", "cat-file", "blob", object_id],
+                    cwd=REPO_ROOT,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    timeout=30,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 0)
+                self.assertEqual(len(result.stdout), expected_length)
+                self.assertEqual(self.git_object_sha1("blob", result.stdout), object_id)
+                blobs[name] = result.stdout
+
+                process = self.run_bounded_process(
+                    "payload",
+                    stdout_limit=expected_length,
+                    payload=result.stdout,
+                )
+                self.assertTrue(process["success"], process)
+                self.assertEqual(process["length"], expected_length)
+                self.assertEqual(process["sha256"], hashlib.sha256(result.stdout).hexdigest())
+                self.assertTrue(process["stderrdiscarded"])
+
+                contract = self.run_local_output_check(object_id, result.stdout)
+                self.assertTrue(contract["valid"], contract)
+                self.assertEqual(contract["contract_limit"], expected_length)
+                self.assertEqual(contract["contract_length"], expected_length)
+                self.assertEqual(contract["contract_object"], object_id)
+
+        library_id = frozen[0][1]
+        library = blobs["library"]
+        short = self.run_local_output_check(library_id, library[:-1])
+        self.assertFalse(short["valid"], short)
+        extra = self.run_local_output_check(library_id, library + b"x")
+        self.assertFalse(extra["valid"], extra)
+        wrong_bytes = bytearray(library)
+        wrong_bytes[len(wrong_bytes) // 2] ^= 0x01
+        wrong = self.run_local_output_check(library_id, bytes(wrong_bytes))
+        self.assertFalse(wrong["valid"], wrong)
+        wrong_object = self.run_local_output_check("0" * 40, library)
+        self.assertFalse(wrong_object["valid"], wrong_object)
+        wrong_admitted_id = self.run_local_output_check(frozen[1][1], library)
+        self.assertFalse(wrong_admitted_id["valid"], wrong_admitted_id)
+
+        size_plus_one = self.run_bounded_process(
+            "payload",
+            stdout_limit=len(library),
+            payload=library + b"x",
+        )
+        self.assertFalse(size_plus_one["success"], size_plus_one)
+        self.assertTrue(size_plus_one["overflow"], size_plus_one)
+        self.assertEqual(size_plus_one["length"], 0)
+
+        ordinary = b"o" * 65536
+        ordinary_result = self.run_bounded_process(
+            "payload",
+            stdout_limit=65536,
+            payload=ordinary,
+        )
+        self.assertTrue(ordinary_result["success"], ordinary_result)
+        self.assertEqual(ordinary_result["length"], 65536)
+        ordinary_overflow = self.run_bounded_process(
+            "payload",
+            stdout_limit=65536,
+            payload=ordinary + b"o",
+        )
+        self.assertFalse(ordinary_overflow["success"], ordinary_overflow)
+        self.assertTrue(ordinary_overflow["overflow"], ordinary_overflow)
+        self.assertEqual(ordinary_overflow["length"], 0)
+
+        stderr_at_limit = self.run_bounded_process(
+            "payload",
+            stdout_limit=len(library),
+            stderr_limit=65536,
+            payload=library,
+            error_payload=b"e" * 65536,
+        )
+        self.assertTrue(stderr_at_limit["success"], stderr_at_limit)
+        self.assertEqual(stderr_at_limit["length"], len(library))
+        stderr_overflow = self.run_bounded_process(
+            "payload",
+            stdout_limit=len(library),
+            stderr_limit=65536,
+            payload=library,
+            error_payload=b"e" * 65537,
+        )
+        self.assertFalse(stderr_overflow["success"], stderr_overflow)
+        self.assertTrue(stderr_overflow["overflow"], stderr_overflow)
+        self.assertEqual(stderr_overflow["length"], 0)
+
+    def test_empty_byte_protocol_behavioural_matrix(self):
+        values = self.run_empty_byte_matrix()
+        self.assertTrue(values["clean_status"])
+        self.assertFalse(values["dirty_status"])
+        self.assertTrue(values["failed_empty"])
+        for name in ("symbolic", "head", "config", "commit", "blob"):
+            with self.subTest(command=name):
+                self.assertFalse(values["data_" + name])
+
+    def test_redirected_stream_lifecycle_behavioural_matrix(self):
+        child_script = self.stream_child_script()
+        self.assertIn('GetStdHandle', child_script)
+        self.assertIn('CloseHandle', child_script)
+        self.assertIn('-11', child_script)
+        self.assertIn('-12', child_script)
+        self.assertNotIn('$stdout.Dispose()', child_script)
+        self.assertNotIn('$stderr.Dispose()', child_script)
+
+        stdout_first_witness = (
+            'stdout-payload-written',
+            'stdout-os-closed',
+            'post-stdout-closure-alive',
+            'stderr-write-after-stdout-closure',
+            'stderr-os-closed',
+            'both-os-handles-closed',
+        )
+        stderr_first_witness = (
+            'stderr-payload-written',
+            'stderr-os-closed',
+            'post-stderr-closure-alive',
+            'stdout-write-after-stderr-closure',
+            'stdout-os-closed',
+            'both-os-handles-closed',
+        )
+        successful = {
+            "empty": (b"", ()),
+            "stdout-first": (b"OUT", stdout_first_witness),
+            "stderr-first": (b"OUT", stderr_first_witness),
+            "simultaneous": (
+                b"OUT",
+                (
+                    'stdout-payload-written',
+                    'stderr-payload-written',
+                    'stdout-os-closed',
+                    'stderr-os-closed',
+                    'both-os-handles-closed',
+                ),
+            ),
+            "stdout-after-stderr": (
+                b"\x00" * 65536,
+                (
+                    'stderr-payload-written',
+                    'stderr-os-closed',
+                    'post-stderr-closure-alive',
+                    'stdout-write1-after-stderr-closure',
+                    'stdout-write2-after-stderr-closure',
+                    'stdout-os-closed',
+                    'both-os-handles-closed',
+                ),
+            ),
+            "stderr-after-stdout": (
+                b"OUT",
+                (
+                    'stdout-payload-written',
+                    'stdout-os-closed',
+                    'post-stdout-closure-alive',
+                    'stderr-write1-after-stdout-closure',
+                    'stderr-write2-after-stdout-closure',
+                    'stderr-os-closed',
+                    'both-os-handles-closed',
+                ),
+            ),
+        }
+        for mode, (expected_output, expected_witness) in successful.items():
+            with self.subTest(mode=mode):
+                result = self.run_bounded_process(mode, timeout_milliseconds=3000)
+                self.assertTrue(result["success"], result)
+                self.assertFalse(result["timedout"], result)
+                self.assertFalse(result["overflow"], result)
+                self.assertEqual(result["length"], len(expected_output))
+                self.assertEqual(result["sha256"], hashlib.sha256(expected_output).hexdigest())
+                self.assertEqual(result["witness"], list(expected_witness))
+
+        for mode in ("timeout", "both-closed-alive"):
+            with self.subTest(timeout_mode=mode):
+                started = time.monotonic()
+                timeout_milliseconds = 1500 if mode == "both-closed-alive" else 500
+                result = self.run_bounded_process(mode, timeout_milliseconds=timeout_milliseconds)
+                elapsed = time.monotonic() - started
+                self.assertFalse(result["success"], result)
+                self.assertTrue(result["timedout"], result)
+                self.assertFalse(result["overflow"], result)
+                self.assertEqual(result["length"], 0)
+                self.assertLess(
+                    elapsed,
+                    3.0,
+                    "the bounded pump must not wait for the intentionally live child after stream EOF",
+                )
+                if mode == "both-closed-alive":
+                    self.assertEqual(
+                        result["witness"],
+                        [
+                            'stdout-payload-written',
+                            'stderr-payload-written',
+                            'stdout-os-closed',
+                            'stderr-os-closed',
+                            'both-os-handles-closed',
+                            'post-both-closure-alive',
+                        ],
+                    )
+                else:
+                    self.assertEqual(result["witness"], [])
+
+        for mode in ("stdout-overflow", "stderr-overflow"):
+            with self.subTest(overflow_mode=mode):
+                result = self.run_bounded_process(mode, timeout_milliseconds=2000)
+                self.assertFalse(result["success"], result)
+                self.assertTrue(result["overflow"], result)
+                self.assertEqual(result["length"], 0)
+
+        nonzero = self.run_bounded_process("nonzero", timeout_milliseconds=3000)
+        self.assertFalse(nonzero["success"], nonzero)
+        self.assertEqual(nonzero["exit"], 7)
+        self.assertEqual(nonzero["length"], 0)
+
+        not_started = self.run_bounded_process("not-started", timeout_milliseconds=500)
+        self.assertFalse(not_started["started"], not_started)
+        self.assertFalse(not_started["success"], not_started)
+        self.assertEqual(not_started["length"], 0)
+
+    def test_completed_read_fault_cancel_and_inactive_states_are_fail_closed(self):
+        values = self.run_fault_cancel_matrix()
+        self.assertFalse(values["fault_success"])
+        self.assertTrue(values["faulted"])
+        self.assertFalse(values["cancel_success"])
+        self.assertTrue(values["cancelled"])
+        self.assertTrue(values["inactive_invariant"])
+
+    def test_acl_primitive_mutation_behavioural_matrix(self):
+        values = self.run_acl_matrix()
+        for name in ("Read", "ReadAndExecute", "Synchronize"):
+            with self.subTest(accepted=name):
+                self.assertFalse(values[name])
+        for name in (
+            "WriteData",
+            "AppendData",
+            "WriteExtendedAttributes",
+            "DeleteSubdirectoriesAndFiles",
+            "WriteAttributes",
+            "Delete",
+            "ChangePermissions",
+            "TakeOwnership",
+            "Write",
+            "Modify",
+            "FullControl",
+        ):
+            with self.subTest(rejected=name):
+                self.assertTrue(values[name])
+
+    def test_strict_json_reader_behavioural_matrix(self):
+        depth = 33
+        cases = {
+            "valid": b'{"name":"grid","nested":{"enabled":true},"items":[1,null]}',
+            "empty_object": b"{}",
+            "malformed": b'{"a":}',
+            "empty": b"",
+            "whitespace_only": b" \r\n\t ",
+            "invalid_utf8": b'{"a":"\xff"}',
+            "bom": b"\xef\xbb\xbf{" + b'"a":1}',
+            "top_array": b"[1,2]",
+            "scalar": b"1",
+            "null_root": b"null",
+            "exact_duplicate": b'{"a":1,"a":2}',
+            "case_duplicate": b'{"A":1,"a":2}',
+            "escaped_duplicate": b'{"a":1,"\\u0061":2}',
+            "nested_scope_valid": b'{"outer":{"a":1},"other":{"a":2},"a":3}',
+            "nested_scope_duplicate": b'{"outer":{"a":1,"a":2}}',
+            "trailing_garbage": b'{"a":1}x',
+            "concatenated": b'{"a":1}{"b":2}',
+            "oversize": b'{"x":"' + (b"a" * 65530) + b'"}',
+            "depth_over_32": (b'{"a":' * depth) + b"0" + (b"}" * depth),
+        }
+        results = self.run_json_matrix(cases)
+        self.assertEqual(set(results), set(cases))
+        self.assertEqual(results["valid"]["kind"], "object")
+        self.assertEqual(results["valid"]["count"], 3)
+        self.assertEqual(results["empty_object"]["kind"], "object")
+        self.assertEqual(results["empty_object"]["count"], 0)
+        self.assertEqual(results["nested_scope_valid"]["kind"], "object")
+        self.assertEqual(results["nested_scope_valid"]["count"], 3)
+        for name in cases:
+            if name not in {"valid", "empty_object", "nested_scope_valid"}:
+                with self.subTest(json_case=name):
+                    self.assertEqual(results[name]["kind"], "null")
+
+
+
+if __name__ == "__main__":
+    unittest.main()
