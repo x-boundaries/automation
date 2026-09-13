@@ -15,6 +15,11 @@ HELPER = (
     / "tools"
     / "XB141-EnergyGrid-Run156.ps1"
 )
+REPO_ROOT = HELPER.parents[3]
+OWNED_RELATIVE_PATHS = (
+    "energygrid-bill-downloader/runtime/tools/XB141-EnergyGrid-Run156.ps1",
+    "energygrid-bill-downloader/tests/test_run156_helper_static.py",
+)
 
 
 class Run156HelperStaticTests(unittest.TestCase):
@@ -75,41 +80,65 @@ class Run156HelperStaticTests(unittest.TestCase):
         return seen == set(allowed)
 
     @staticmethod
-    def normalize_contract(working, committed):
+    def canonical_byte_contract(committed):
         if (
             not committed
-            or committed.startswith(b"\xef\xbb\xbf")
-            or b"\x00" in committed
+            or b"\xef\xbb\xbf" in committed
             or b"\r" in committed
             or not committed.endswith(b"\n")
+            or committed.endswith(b"\n\n")
         ):
             return False
         try:
             committed.decode("utf-8", errors="strict")
-            working.decode("utf-8", errors="strict")
         except UnicodeDecodeError:
             return False
-        if (
-            working.startswith(b"\xef\xbb\xbf")
-            or b"\x00" in working
-            or not working.endswith(b"\n")
+        if any(
+            (byte < 0x20 and byte not in (0x09, 0x0A)) or byte == 0x7F
+            for byte in committed
         ):
             return False
-        has_crlf = b"\r\n" in working
-        has_bare_lf = any(
-            byte == 0x0A and (index == 0 or working[index - 1] != 0x0D)
-            for index, byte in enumerate(working)
-        )
+        return True
+
+    @staticmethod
+    def working_byte_contract(working):
+        if not working or b"\xef\xbb\xbf" in working:
+            return None
+        try:
+            working.decode("utf-8", errors="strict")
+        except UnicodeDecodeError:
+            return None
+
+        has_crlf = False
+        has_bare_lf = False
         for index, byte in enumerate(working):
-            if byte == 0x0D and (
-                index + 1 >= len(working) or working[index + 1] != 0x0A
-            ):
-                return False
+            if byte == 0x0D:
+                if index + 1 >= len(working) or working[index + 1] != 0x0A:
+                    return None
+                has_crlf = True
+            elif byte == 0x0A:
+                if index == 0 or working[index - 1] != 0x0D:
+                    has_bare_lf = True
+            elif (byte < 0x20 and byte != 0x09) or byte == 0x7F:
+                return None
         if has_crlf and has_bare_lf:
-            return False
+            return None
+        if not working.endswith(b"\n"):
+            return None
         if has_crlf and not working.endswith(b"\r\n"):
+            return None
+
+        normalized = working.replace(b"\r\n", b"\n")
+        if normalized.endswith(b"\n\n"):
+            return None
+        return normalized
+
+    @classmethod
+    def normalize_contract(cls, working, committed):
+        if not cls.canonical_byte_contract(committed):
             return False
-        return working.replace(b"\r\n", b"\n") == committed
+        normalized = cls.working_byte_contract(working)
+        return normalized is not None and normalized == committed
 
     @staticmethod
     def git_object_sha1(object_type, raw):
@@ -131,6 +160,45 @@ class Run156HelperStaticTests(unittest.TestCase):
     def remote_record(head):
         return f"{head}\trefs/heads/main\n".encode("ascii")
 
+    def read_head_blob(self, relative_path):
+        environment = os.environ.copy()
+        environment["GIT_NO_REPLACE_OBJECTS"] = "1"
+        environment["GIT_NO_LAZY_FETCH"] = "1"
+        resolved = subprocess.run(
+            ["git", "rev-parse", "--verify", f"HEAD:{relative_path}"],
+            cwd=REPO_ROOT,
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(
+            resolved.returncode,
+            0,
+            f"HEAD blob resolution failed for {relative_path}",
+        )
+        resolved_text = resolved.stdout.decode("ascii", errors="strict")
+        match = re.fullmatch(r"([0-9a-f]{40})\r?\n", resolved_text)
+        self.assertIsNotNone(match, f"invalid HEAD blob identity for {relative_path}")
+        object_id = match.group(1)
+
+        blob = subprocess.run(
+            ["git", "cat-file", "blob", object_id],
+            cwd=REPO_ROOT,
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(
+            blob.returncode,
+            0,
+            f"HEAD blob read failed for {relative_path}",
+        )
+        return object_id, blob.stdout
+
     def test_helper_parses_under_windows_powershell_51_when_available(self):
         powershell = shutil.which("powershell.exe")
         if os.name != "nt" or powershell is None:
@@ -143,19 +211,35 @@ class Run156HelperStaticTests(unittest.TestCase):
             "[int]$PSVersionTable.PSVersion.Minor -ne 1) { exit 2 }; "
             "[System.Management.Automation.Language.Parser]::ParseFile("
             "$env:R156_HELPER_PARSE_PATH,[ref]$tokens,[ref]$errors) | Out-Null; "
-            "if (@($errors).Count -ne 0) { exit 1 }; exit 0"
+            "if (@($errors).Count -ne 0) { "
+            "foreach ($parseError in @($errors) | Select-Object -First 8) { "
+            "Write-Output (('{0}:{1}:{2}' -f "
+            "[int]$parseError.Extent.StartLineNumber, "
+            "[int]$parseError.Extent.StartColumnNumber, "
+            "[string]$parseError.ErrorId)) }; exit 1 }; exit 0"
         )
         environment = os.environ.copy()
         environment["R156_HELPER_PARSE_PATH"] = str(HELPER)
         result = subprocess.run(
             [powershell, "-NoProfile", "-NonInteractive", "-Command", command],
             env=environment,
-            stdout=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             timeout=30,
             check=False,
         )
-        self.assertEqual(result.returncode, 0, "Windows PowerShell 5.1 parse failed")
+        if result.returncode != 0:
+            raw_diagnostics = result.stdout[:2048].decode("ascii", errors="ignore")
+            diagnostics = [
+                line
+                for line in raw_diagnostics.splitlines()
+                if re.fullmatch(r"[0-9]+:[0-9]+:[A-Za-z0-9_]+", line)
+            ][:8]
+            bounded = ", ".join(diagnostics) if diagnostics else "none"
+            self.fail(
+                "Windows PowerShell 5.1 parse failed; "
+                f"bounded diagnostics: {bounded}"
+            )
 
     def test_pointer_readers_extract_sids_before_freeing_native_buffers(self):
         user = self.method_body(
@@ -479,16 +563,42 @@ class Run156HelperStaticTests(unittest.TestCase):
         ):
             self.assertIn(marker, source)
 
-    def test_normalization_contract_covers_all_endings_and_byte_failures(self):
+    def test_byte_contract_synthetic_matrix(self):
         committed = b"alpha\nbeta\n"
-        self.assertTrue(self.normalize_contract(committed, committed))
-        self.assertTrue(self.normalize_contract(b"alpha\r\nbeta\r\n", committed))
-        self.assertFalse(self.normalize_contract(b"\xef\xbb\xbf" + committed, committed))
-        self.assertFalse(self.normalize_contract(b"alpha\n\xff\n", committed))
-        self.assertFalse(self.normalize_contract(b"alpha\x00\n", committed))
-        self.assertFalse(self.normalize_contract(b"alpha\r\nbeta\n", committed))
-        self.assertFalse(self.normalize_contract(b"alpha\rbeta\n", committed))
-        self.assertFalse(self.normalize_contract(b"alpha", b"alpha"))
+        canonical_cases = (
+            ("valid uniform LF", committed, True),
+            ("CRLF is not canonical", b"alpha\r\nbeta\r\n", False),
+            ("BOM", b"\xef\xbb\xbf" + committed, False),
+            ("invalid UTF-8", b"alpha\n\xff\n", False),
+            ("NUL", b"alpha\x00\n", False),
+            ("EOT", b"alpha\x04\n", False),
+            ("other forbidden C0 control", b"alpha\x01\n", False),
+            ("DEL", b"alpha\x7f\n", False),
+            ("missing terminal LF", b"alpha\nbeta", False),
+            ("surplus terminal LF", b"alpha\nbeta\n\n", False),
+        )
+        for label, candidate, expected in canonical_cases:
+            with self.subTest(contract="canonical", case=label):
+                self.assertEqual(self.canonical_byte_contract(candidate), expected)
+
+        working_cases = (
+            ("valid uniform LF", committed, True),
+            ("valid uniform CRLF", b"alpha\r\nbeta\r\n", True),
+            ("mixed line endings", b"alpha\r\nbeta\n", False),
+            ("lone CR", b"alpha\rbeta\n", False),
+            ("BOM", b"\xef\xbb\xbf" + committed, False),
+            ("invalid UTF-8", b"alpha\n\xff\n", False),
+            ("NUL", b"alpha\x00\n", False),
+            ("EOT", b"alpha\x04\n", False),
+            ("other forbidden C0 control", b"alpha\x01\n", False),
+            ("DEL", b"alpha\x7f\n", False),
+            ("missing terminal LF", b"alpha\nbeta", False),
+            ("surplus terminal LF", b"alpha\nbeta\n\n", False),
+        )
+        for label, candidate, expected in working_cases:
+            with self.subTest(contract="working", case=label):
+                self.assertEqual(self.normalize_contract(candidate, committed), expected)
+
         self.assertFalse(self.normalize_contract(b"alpha\n", b"omega\n"))
         for marker in (
             "Test-R156CommittedByteContract",
@@ -573,21 +683,21 @@ class Run156HelperStaticTests(unittest.TestCase):
         )
         self.assertEqual(len(fence_calls), 4)
 
-    def test_helper_byte_hygiene(self):
-        helper_bytes = HELPER.read_bytes()
-        self.assertTrue(helper_bytes)
-        self.assertFalse(helper_bytes.startswith(b"\xef\xbb\xbf"))
-        self.assertNotIn(b"\r", helper_bytes)
-        self.assertEqual(helper_bytes[-1:], b"\n")
-        self.assertNotEqual(helper_bytes[-2:], b"\n\n")
-        forbidden = {
-            byte
-            for byte in helper_bytes
-            if byte < 0x20 and byte not in (0x09, 0x0A)
-        }
-        self.assertEqual(forbidden, set())
-        self.assertNotIn(b"\x7f", helper_bytes)
-        helper_bytes.decode("utf-8")
+    def test_head_blobs_are_canonical_for_both_owned_files(self):
+        for relative_path in OWNED_RELATIVE_PATHS:
+            with self.subTest(path=relative_path):
+                object_id, committed = self.read_head_blob(relative_path)
+                self.assertTrue(self.canonical_byte_contract(committed))
+                self.assertEqual(self.git_object_sha1("blob", committed), object_id)
+
+    def test_working_tree_bytes_match_verified_head_blobs_after_normalization(self):
+        for relative_path in OWNED_RELATIVE_PATHS:
+            with self.subTest(path=relative_path):
+                _, committed = self.read_head_blob(relative_path)
+                working = (REPO_ROOT / Path(relative_path)).read_bytes()
+                normalized = self.working_byte_contract(working)
+                self.assertIsNotNone(normalized)
+                self.assertEqual(normalized, committed)
 
 
 

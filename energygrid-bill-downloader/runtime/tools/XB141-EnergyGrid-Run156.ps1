@@ -771,8 +771,8 @@ function Get-R156GitTrustAnchor {
         $gitPath = $null
         foreach ($relative in $gitCandidates) {
             $candidate = Join-Path $installationRoot $relative
-            if (Test-R156NormalFile -Path $candidate -and
-                Test-R156NoReparseAncestors -Path $candidate) {
+            if ((Test-R156NormalFile -Path $candidate) -and
+                (Test-R156NoReparseAncestors -Path $candidate)) {
                 $gitPath = Get-R156FullPath -Path $candidate
                 break
             }
@@ -780,8 +780,8 @@ function Get-R156GitTrustAnchor {
         $gcmPath = $null
         foreach ($relative in $gcmCandidates) {
             $candidate = Join-Path $installationRoot $relative
-            if (Test-R156NormalFile -Path $candidate -and
-                Test-R156NoReparseAncestors -Path $candidate) {
+            if ((Test-R156NormalFile -Path $candidate) -and
+                (Test-R156NoReparseAncestors -Path $candidate)) {
                 $gcmPath = Get-R156FullPath -Path $candidate
                 break
             }
@@ -1506,7 +1506,7 @@ function Get-R156RepositoryState {
     }
     $indexDigestAfter = Get-R156Sha256ForBytes -Bytes $indexBytesAfter
     $indexSideEffectFree = (
-        Test-R156MetadataEqual -Before $indexMetadataBefore -After $indexMetadataAfter -and
+        (Test-R156MetadataEqual -Before $indexMetadataBefore -After $indexMetadataAfter) -and
         [string]::Equals($indexDigestBefore, $indexDigestAfter, [StringComparison]::Ordinal)
     )
     $state.Clean = (
