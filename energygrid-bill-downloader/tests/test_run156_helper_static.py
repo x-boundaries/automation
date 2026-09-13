@@ -1,6 +1,7 @@
 """Static, in-memory, parser, and synthetic regression proof for Run156 G3."""
 
 import hashlib
+import json
 import os
 from pathlib import Path
 import re
@@ -22,6 +23,10 @@ OWNED_RELATIVE_PATHS = (
     "energygrid-bill-downloader/runtime/tools/XB141-EnergyGrid-Run156.ps1",
     "energygrid-bill-downloader/tests/test_run156_helper_static.py",
 )
+CURRENT_HEAD = "54b6a7e873c2b7117016bc9f65d6c7b7894dd16c"
+CURRENT_TREE = "dcad3b64a0475d3df04fe3cd8f46d9e9cf477f17"
+CURRENT_PARENT = "e8b90d6d907a2970e387a6379f4aca48a8fdfd01"
+ACCEPTED_STALE_ADMISSION = "ee3d70fd3700b5e9c20874ec4472ce0f433e3134"
 
 
 class Run156HelperStaticTests(unittest.TestCase):
@@ -770,6 +775,167 @@ foreach ($file in $files) {
     def remote_record(head):
         return f"{head}\trefs/heads/main\n".encode("ascii")
 
+    def run_preimage_boundary_case(
+        self,
+        *,
+        expected_head=CURRENT_HEAD,
+        expected_tree=CURRENT_TREE,
+        expected_parent=CURRENT_PARENT,
+        expected_installed=ACCEPTED_STALE_ADMISSION,
+        actual_head=CURRENT_HEAD,
+        actual_tree=CURRENT_TREE,
+        actual_parent=CURRENT_PARENT,
+        parent_count=1,
+        manifest_sequence=None,
+        post_admission=CURRENT_HEAD,
+    ):
+        """Exercise a synthetic boundary harness, never the complete helper."""
+        manifests = list(manifest_sequence or [expected_installed] * 3)
+        self.assertEqual(len(manifests), 3)
+        script = (
+            self.extracted_functions(("Test-R156CommitText",))
+            + r'''
+$ErrorActionPreference = 'Stop'
+$script:R156ExpectedHeadAtExecution = ''
+$script:R156ExpectedTreeAtExecution = ''
+$script:R156ExpectedParentAtExecution = ''
+$script:R156ExpectedInstalledAdmissionAtExecution = ''
+$script:R156SyntheticManifestAdmissions = @(
+    [string]$env:R156_SYNTH_MANIFEST_1,
+    [string]$env:R156_SYNTH_MANIFEST_2,
+    [string]$env:R156_SYNTH_MANIFEST_3
+)
+$script:R156SyntheticReadIndex = 0
+$script:R156SyntheticReadCount = 0
+$script:R156SyntheticRealInstallerInvocations = 0
+
+function Test-SyntheticRepositoryFence {
+    param(
+        [Parameter(Mandatory)]$ActualHead,
+        [Parameter(Mandatory)]$ActualTree,
+        [Parameter(Mandatory)]$ActualParent,
+        [Parameter(Mandatory)][int]$ActualParentCount
+    )
+
+    return (
+        [string]$ActualHead -ceq $script:R156ExpectedHeadAtExecution -and
+        [string]$ActualTree -ceq $script:R156ExpectedTreeAtExecution -and
+        [string]$ActualParent -ceq $script:R156ExpectedParentAtExecution -and
+        $ActualParentCount -eq 1
+    )
+}
+
+function Read-SyntheticManifestState {
+    $script:R156SyntheticReadCount++
+    $admission = [string]$script:R156SyntheticManifestAdmissions[$script:R156SyntheticReadIndex]
+    $script:R156SyntheticReadIndex++
+    if ([string]::IsNullOrEmpty($admission) -or
+        $admission -cne $script:R156ExpectedInstalledAdmissionAtExecution -or
+        $admission -ceq $script:R156ExpectedHeadAtExecution) {
+        return $null
+    }
+    return [pscustomobject]@{ Admission = $admission }
+}
+
+function Invoke-SyntheticR156Boundary {
+    param(
+        [Parameter(Mandatory)][string]$ExpectedHead,
+        [Parameter(Mandatory)][string]$ExpectedTree,
+        [Parameter(Mandatory)][string]$ExpectedParent,
+        [Parameter(Mandatory)][string]$ExpectedInstalledAdmission,
+        [Parameter(Mandatory)][string]$ActualHead,
+        [Parameter(Mandatory)][string]$ActualTree,
+        [Parameter(Mandatory)][string]$ActualParent,
+        [Parameter(Mandatory)][int]$ActualParentCount,
+        [Parameter(Mandatory)][string]$PostAdmission
+    )
+
+    $result = [ordered]@{
+        admission_valid = $false
+        repository_fence = $false
+        expected_parent_state = ''
+        expected_installed_state = ''
+        stale_reads = 0
+        pre_dispatch_passed = $false
+        real_installer_invocations = 0
+        transport_admission = ''
+        post_proof_current = $false
+        post_proof_stale = $false
+        terminal = 'BLOCKED'
+    }
+    if (-not (Test-R156CommitText -Value $ExpectedHead) -or
+        -not (Test-R156CommitText -Value $ExpectedTree) -or
+        -not (Test-R156CommitText -Value $ExpectedParent) -or
+        -not (Test-R156CommitText -Value $ExpectedInstalledAdmission)) {
+        return [pscustomobject]$result
+    }
+
+    $script:R156ExpectedHeadAtExecution = $ExpectedHead.ToLowerInvariant()
+    $script:R156ExpectedTreeAtExecution = $ExpectedTree.ToLowerInvariant()
+    $script:R156ExpectedParentAtExecution = $ExpectedParent.ToLowerInvariant()
+    $script:R156ExpectedInstalledAdmissionAtExecution = $ExpectedInstalledAdmission.ToLowerInvariant()
+    $result.admission_valid = $true
+    $result.expected_parent_state = $script:R156ExpectedParentAtExecution
+    $result.expected_installed_state = $script:R156ExpectedInstalledAdmissionAtExecution
+
+    if (-not (Test-SyntheticRepositoryFence -ActualHead $ActualHead -ActualTree $ActualTree -ActualParent $ActualParent -ActualParentCount $ActualParentCount)) {
+        return [pscustomobject]$result
+    }
+    $result.repository_fence = $true
+
+    for ($index = 0; $index -lt 3; $index++) {
+        if ($null -eq (Read-SyntheticManifestState)) {
+            $result.stale_reads = [int]$script:R156SyntheticReadCount
+            return [pscustomobject]$result
+        }
+    }
+    $result.stale_reads = [int]$script:R156SyntheticReadCount
+    $result.pre_dispatch_passed = $true
+    $script:R156SyntheticRealInstallerInvocations = 1
+    $result.real_installer_invocations = [int]$script:R156SyntheticRealInstallerInvocations
+    $result.transport_admission = $script:R156ExpectedHeadAtExecution
+    $result.post_proof_current = [string]$PostAdmission -ceq $script:R156ExpectedHeadAtExecution
+    $result.post_proof_stale = [string]$PostAdmission -ceq $script:R156ExpectedInstalledAdmissionAtExecution
+    if ($result.post_proof_current) {
+        $result.terminal = 'PASS'
+    }
+    else {
+        $result.terminal = 'POST_PROOF_FAILED'
+    }
+    return [pscustomobject]$result
+}
+
+$result = Invoke-SyntheticR156Boundary `
+    -ExpectedHead ([string]$env:R156_SYNTH_EXPECTED_HEAD) `
+    -ExpectedTree ([string]$env:R156_SYNTH_EXPECTED_TREE) `
+    -ExpectedParent ([string]$env:R156_SYNTH_EXPECTED_PARENT) `
+    -ExpectedInstalledAdmission ([string]$env:R156_SYNTH_EXPECTED_INSTALLED) `
+    -ActualHead ([string]$env:R156_SYNTH_ACTUAL_HEAD) `
+    -ActualTree ([string]$env:R156_SYNTH_ACTUAL_TREE) `
+    -ActualParent ([string]$env:R156_SYNTH_ACTUAL_PARENT) `
+    -ActualParentCount ([int]$env:R156_SYNTH_PARENT_COUNT) `
+    -PostAdmission ([string]$env:R156_SYNTH_POST_ADMISSION)
+$result | ConvertTo-Json -Compress
+'''
+        )
+        environment = {
+            "R156_SYNTH_EXPECTED_HEAD": expected_head,
+            "R156_SYNTH_EXPECTED_TREE": expected_tree,
+            "R156_SYNTH_EXPECTED_PARENT": expected_parent,
+            "R156_SYNTH_EXPECTED_INSTALLED": expected_installed,
+            "R156_SYNTH_ACTUAL_HEAD": actual_head,
+            "R156_SYNTH_ACTUAL_TREE": actual_tree,
+            "R156_SYNTH_ACTUAL_PARENT": actual_parent,
+            "R156_SYNTH_PARENT_COUNT": str(parent_count),
+            "R156_SYNTH_MANIFEST_1": manifests[0],
+            "R156_SYNTH_MANIFEST_2": manifests[1],
+            "R156_SYNTH_MANIFEST_3": manifests[2],
+            "R156_SYNTH_POST_ADMISSION": post_admission,
+        }
+        lines = self.run_isolated_powershell(script, environment=environment)
+        self.assertEqual(len(lines), 1, lines)
+        return json.loads(lines[0])
+
     def read_head_blob(self, relative_path):
         environment = os.environ.copy()
         environment["GIT_NO_REPLACE_OBJECTS"] = "1"
@@ -1282,16 +1448,185 @@ foreach ($file in $files) {
         self.assertIn("$fields['retry_allowed'] = 'NO'", self.source)
 
         self.assertNotIn("R156ExpectedParentForPreimage", self.source)
+        parameter_start = self.source.index("param(")
+        parameter_end = self.source.index(")\n\nSet-StrictMode", parameter_start) + 1
+        parameter_block = self.source[parameter_start:parameter_end]
+        self.assertRegex(
+            parameter_block,
+            r"\[string\]\$ExpectedInstalledAdmission\s*\)",
+        )
+        self.assertNotRegex(parameter_block, r"\$ExpectedInstalledAdmission\s*=")
+
+        admission_start = self.source.index("$tokenContext = $null")
+        admission_end = self.source.index(
+            "if ([string]$PSVersionTable",
+            admission_start,
+        )
+        admission_block = self.source[admission_start:admission_end]
+        for name in (
+            "ExpectedHead",
+            "ExpectedTree",
+            "ExpectedParent",
+            "ExpectedInstalledAdmission",
+        ):
+            self.assertEqual(
+                admission_block.count(f"Test-R156CommitText -Value ${name}"),
+                1,
+                name,
+            )
+        self.assertIn(
+            "$script:R156ExpectedInstalledAdmissionAtExecution = $ExpectedInstalledAdmission.ToLowerInvariant()",
+            admission_block,
+        )
+        self.assertNotIn(
+            "$script:R156ExpectedInstalledAdmissionAtExecution = $ExpectedParent",
+            admission_block,
+        )
+
         stale_calls = re.findall(
-            r"Read-R156ManifestState\s+-LauncherRoot\s+[^\r\n]+?-ExpectedAdmission\s+\$script:R156ExpectedParentAtExecution",
+            r"Read-R156ManifestState\s+-LauncherRoot\s+[^\r\n]+?-ExpectedAdmission\s+\$script:R156ExpectedInstalledAdmissionAtExecution",
             self.source,
         )
         self.assertEqual(len(stale_calls), 3)
+        stale_parent_calls = re.findall(
+            r"Read-R156ManifestState\s+-LauncherRoot\s+[^\r\n]+?-ExpectedAdmission\s+\$script:R156ExpectedParentAtExecution",
+            self.source,
+        )
+        self.assertEqual(stale_parent_calls, [])
+        self.assertIn(
+            "Get-R156CommitTreeParentProof -ExpectedHeadValue $script:R156ExpectedHeadAtExecution -ExpectedTreeValue $script:R156ExpectedTreeAtExecution -ExpectedParentValue $script:R156ExpectedParentAtExecution",
+            self.source,
+        )
+        self.assertGreaterEqual(
+            self.source.count("-ExpectedParentValue $script:R156ExpectedParentAtExecution"),
+            5,
+        )
+        self.assertEqual(
+            self.source.count("Invoke-R156Transport -Mode 'VALIDATE_ONLY'"),
+            1,
+        )
+        self.assertEqual(
+            self.source.count("Invoke-R156Transport -Mode 'REAL'"),
+            1,
+        )
+        for transport in (
+            "Invoke-R156Transport -Mode 'VALIDATE_ONLY'",
+            "Invoke-R156Transport -Mode 'REAL'",
+        ):
+            transport_start = self.source.index(transport)
+            transport_line = self.source[transport_start:self.source.index("\n", transport_start)]
+            self.assertIn(
+                "-AdmissionCommit $script:R156ExpectedHeadAtExecution",
+                transport_line,
+            )
+        post_proof = self.source_function(
+            "function Assert-R156PostProof",
+            "$tokenContext = $null",
+        )
+        self.assertIn(
+            "Read-R156ManifestState -LauncherRoot $topologyAfter.Candidate -ExpectedAdmission $ExpectedHeadValue",
+            post_proof,
+        )
+        self.assertNotIn(
+            "-AdmissionCommit $script:R156ExpectedInstalledAdmissionAtExecution",
+            self.source,
+        )
+        self.assertNotIn(ACCEPTED_STALE_ADMISSION, self.source)
         fence_calls = re.findall(
             r"Test-R156RepositoryFence\s+-State\s+[^\r\n]+",
             self.source,
         )
         self.assertEqual(len(fence_calls), 4)
+
+    def test_preimage_decoupling_accepts_valid_distinct_identities(self):
+        result = self.run_preimage_boundary_case()
+        self.assertTrue(result["admission_valid"])
+        self.assertTrue(result["repository_fence"])
+        self.assertTrue(result["pre_dispatch_passed"])
+        self.assertEqual(result["stale_reads"], 3)
+        self.assertEqual(result["real_installer_invocations"], 1)
+        self.assertEqual(result["transport_admission"], CURRENT_HEAD)
+
+    def test_preimage_decoupling_wrong_installed_admission_blocks_real_dispatch(self):
+        result = self.run_preimage_boundary_case(
+            expected_installed="c" * 40,
+            manifest_sequence=[ACCEPTED_STALE_ADMISSION] * 3,
+        )
+        self.assertTrue(result["admission_valid"])
+        self.assertTrue(result["repository_fence"])
+        self.assertFalse(result["pre_dispatch_passed"])
+        self.assertEqual(result["real_installer_invocations"], 0)
+
+    def test_preimage_decoupling_wrong_repository_parent_blocks_real_dispatch(self):
+        result = self.run_preimage_boundary_case(
+            expected_parent="b" * 40,
+            manifest_sequence=[ACCEPTED_STALE_ADMISSION] * 3,
+        )
+        self.assertTrue(result["admission_valid"])
+        self.assertFalse(result["repository_fence"])
+        self.assertEqual(result["stale_reads"], 0)
+        self.assertEqual(result["real_installer_invocations"], 0)
+
+    def test_preimage_decoupling_swapped_identities_block_real_dispatch(self):
+        result = self.run_preimage_boundary_case(
+            expected_parent=ACCEPTED_STALE_ADMISSION,
+            expected_installed=CURRENT_PARENT,
+            manifest_sequence=[ACCEPTED_STALE_ADMISSION] * 3,
+        )
+        self.assertTrue(result["admission_valid"])
+        self.assertFalse(result["repository_fence"])
+        self.assertEqual(result["real_installer_invocations"], 0)
+
+    def test_preimage_decoupling_already_current_manifest_is_a_contradiction(self):
+        result = self.run_preimage_boundary_case(
+            manifest_sequence=[CURRENT_HEAD] * 3,
+        )
+        self.assertTrue(result["repository_fence"])
+        self.assertFalse(result["pre_dispatch_passed"])
+        self.assertEqual(result["stale_reads"], 1)
+        self.assertEqual(result["real_installer_invocations"], 0)
+
+    def test_preimage_decoupling_moved_preimage_blocks_late_real_dispatch(self):
+        result = self.run_preimage_boundary_case(
+            manifest_sequence=[
+                ACCEPTED_STALE_ADMISSION,
+                ACCEPTED_STALE_ADMISSION,
+                "d" * 40,
+            ],
+        )
+        self.assertTrue(result["repository_fence"])
+        self.assertFalse(result["pre_dispatch_passed"])
+        self.assertEqual(result["stale_reads"], 3)
+        self.assertEqual(result["real_installer_invocations"], 0)
+
+    def test_preimage_decoupling_post_proof_accepts_only_current_head(self):
+        current = self.run_preimage_boundary_case(post_admission=CURRENT_HEAD)
+        stale = self.run_preimage_boundary_case(
+            post_admission=ACCEPTED_STALE_ADMISSION,
+        )
+        self.assertEqual(current["terminal"], "PASS")
+        self.assertTrue(current["post_proof_current"])
+        self.assertFalse(current["post_proof_stale"])
+        self.assertEqual(stale["terminal"], "POST_PROOF_FAILED")
+        self.assertFalse(stale["post_proof_current"])
+        self.assertTrue(stale["post_proof_stale"])
+
+    def test_preimage_decoupling_parent_cardinality_requires_one(self):
+        for count in (0, 2):
+            with self.subTest(parent_count=count):
+                result = self.run_preimage_boundary_case(parent_count=count)
+                self.assertTrue(result["admission_valid"])
+                self.assertFalse(result["repository_fence"])
+                self.assertEqual(result["real_installer_invocations"], 0)
+
+    def test_preimage_decoupling_installed_admission_provenance_is_explicit(self):
+        result = self.run_preimage_boundary_case()
+        self.assertEqual(result["expected_parent_state"], CURRENT_PARENT)
+        self.assertEqual(result["expected_installed_state"], ACCEPTED_STALE_ADMISSION)
+        self.assertNotEqual(
+            result["expected_parent_state"],
+            result["expected_installed_state"],
+        )
 
     def test_head_blobs_are_canonical_for_both_owned_files(self):
         for relative_path in OWNED_RELATIVE_PATHS:

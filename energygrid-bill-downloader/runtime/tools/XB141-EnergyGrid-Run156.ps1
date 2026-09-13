@@ -5,7 +5,7 @@
 # interactive Windows PowerShell 5.1 Desktop session on the EnergyGrid server.
 #
 # The final repository commit is deliberately not embedded here. The operator supplies
-# the exact server checkout HEAD, tree, and sole parent at execution time.
+# the exact server checkout HEAD, tree, sole parent, and installed-package admission at execution time.
 #
 # Closed surfaces: no self-elevation, no persistent execution-policy change, no repository
 # write, no ACL write, no credential/config write, no launcher/browser/portal/Scheduler/
@@ -17,7 +17,8 @@
 param(
     [string]$ExpectedHead,
     [string]$ExpectedTree,
-    [string]$ExpectedParent
+    [string]$ExpectedParent,
+    [string]$ExpectedInstalledAdmission
 )
 
 Set-StrictMode -Version Latest
@@ -4886,12 +4887,14 @@ $tokenContext = $null
 try {
     if (-not (Test-R156CommitText -Value $ExpectedHead) -or
         -not (Test-R156CommitText -Value $ExpectedTree) -or
-        -not (Test-R156CommitText -Value $ExpectedParent)) {
+        -not (Test-R156CommitText -Value $ExpectedParent) -or
+        -not (Test-R156CommitText -Value $ExpectedInstalledAdmission)) {
         Stop-R156Gate -SupportRef 'EG_R156_EXPECTED_FENCE_INVALID'
     }
     $script:R156ExpectedHeadAtExecution = $ExpectedHead.ToLowerInvariant()
     $script:R156ExpectedTreeAtExecution = $ExpectedTree.ToLowerInvariant()
     $script:R156ExpectedParentAtExecution = $ExpectedParent.ToLowerInvariant()
+    $script:R156ExpectedInstalledAdmissionAtExecution = $ExpectedInstalledAdmission.ToLowerInvariant()
 
     if ([string]$PSVersionTable.PSEdition -cne 'Desktop' -or
         [int]$PSVersionTable.PSVersion.Major -ne 5 -or
@@ -4977,7 +4980,7 @@ try {
     if (-not (Test-R156PrivateBindingsOutsideCheckout -Topology $topology -CheckoutRoot $checkout)) {
         Stop-R156Gate -SupportRef 'EG_R156_PRIVATE_BINDING_INSIDE_CHECKOUT'
     }
-    $manifestState = Read-R156ManifestState -LauncherRoot $topology.Candidate -ExpectedAdmission $script:R156ExpectedParentAtExecution -CanonicalSources $canonicalSources
+    $manifestState = Read-R156ManifestState -LauncherRoot $topology.Candidate -ExpectedAdmission $script:R156ExpectedInstalledAdmissionAtExecution -CanonicalSources $canonicalSources
     if ($null -eq $manifestState) {
         Stop-R156Gate -SupportRef 'EG_R156_STALE_PREIMAGE_FAILED'
     }
@@ -5019,7 +5022,7 @@ try {
         -not (Test-R156TopologyContinuity -Before $topology -After $topologyBeforeReal)) {
         Stop-R156Gate -SupportRef 'EG_R156_PRIVATE_STATE_CHANGED'
     }
-    $manifestBeforeReal = Read-R156ManifestState -LauncherRoot $topologyBeforeReal.Candidate -ExpectedAdmission $script:R156ExpectedParentAtExecution -CanonicalSources $canonicalSources
+    $manifestBeforeReal = Read-R156ManifestState -LauncherRoot $topologyBeforeReal.Candidate -ExpectedAdmission $script:R156ExpectedInstalledAdmissionAtExecution -CanonicalSources $canonicalSources
     if ($null -eq $manifestBeforeReal) {
         Stop-R156Gate -SupportRef 'EG_R156_STALE_PREIMAGE_MOVED'
     }
@@ -5044,7 +5047,7 @@ try {
     $canonicalSources['launcher.ps1'] = $canonicalLauncherBeforeReal
     $canonicalSources['launcher_lib.ps1'] = $canonicalLibraryBeforeReal
     $canonicalInstaller = $canonicalInstallerBeforeReal
-    $manifestBeforeReal = Read-R156ManifestState -LauncherRoot $topologyBeforeReal.Candidate -ExpectedAdmission $script:R156ExpectedParentAtExecution -CanonicalSources $canonicalSources
+    $manifestBeforeReal = Read-R156ManifestState -LauncherRoot $topologyBeforeReal.Candidate -ExpectedAdmission $script:R156ExpectedInstalledAdmissionAtExecution -CanonicalSources $canonicalSources
     if ($null -eq $manifestBeforeReal) {
         Stop-R156Gate -SupportRef 'EG_R156_STALE_PREIMAGE_MOVED'
     }
