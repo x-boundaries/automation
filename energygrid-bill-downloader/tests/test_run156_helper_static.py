@@ -146,6 +146,20 @@ $script:R156LocalGitReadOnlySubcommands = @('symbolic-ref', 'rev-parse', 'status
                 fields[key] = int(fields[key])
         return fields
 
+    @staticmethod
+    def read_witness(path):
+        try:
+            size = path.stat().st_size
+        except FileNotFoundError:
+            return []
+        if size > 4096:
+            raise AssertionError("synthetic child witness exceeded its bounded size")
+        try:
+            text = path.read_bytes().decode("ascii")
+        except UnicodeDecodeError as error:
+            raise AssertionError("synthetic child witness was not ASCII") from error
+        return [line for line in text.splitlines() if line]
+
     def process_functions(self):
         return self.extracted_functions(
             (
@@ -205,6 +219,56 @@ $stdout = [Console]::OpenStandardOutput()
 $stderr = [Console]::OpenStandardError()
 $exitCode = 0
 
+function Write-R156ChildWitness {
+    param([Parameter(Mandatory)][string]$Phase)
+    $witnessPath = [string]$env:R156_WITNESS_PATH
+    if ([string]::IsNullOrWhiteSpace($witnessPath)) {
+        throw 'missing synthetic witness path'
+    }
+    [System.IO.File]::AppendAllText(
+        $witnessPath,
+        $Phase + [Environment]::NewLine,
+        [System.Text.Encoding]::ASCII
+    )
+}
+
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+public static class R156ChildNative
+{
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern IntPtr GetStdHandle(int nStdHandle);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool CloseHandle(IntPtr hObject);
+}
+'@
+
+function Close-R156ChildStandardHandle {
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet('stdout', 'stderr')]
+        [string]$Name
+    )
+    $identifier = if ($Name -ceq 'stdout') { -11 } else { -12 }
+    $handle = [R156ChildNative]::GetStdHandle($identifier)
+    if ($handle -eq [IntPtr]::Zero -or $handle.ToInt64() -eq -1) {
+        $lastError = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        Write-R156ChildWitness -Phase ("native-close-failed:{0}:get:{1}" -f $Name, $lastError)
+        throw ("GetStdHandle failed for {0}; win32_error={1}" -f $Name, $lastError)
+    }
+    $closed = [R156ChildNative]::CloseHandle($handle)
+    if (-not $closed) {
+        $lastError = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        Write-R156ChildWitness -Phase ("native-close-failed:{0}:close:{1}" -f $Name, $lastError)
+        throw ("CloseHandle failed for {0}; win32_error={1}" -f $Name, $lastError)
+    }
+    Write-R156ChildWitness -Phase ($Name + '-os-closed')
+}
+
 function Write-R156ChildText {
     param([Parameter(Mandatory)][System.IO.Stream]$Stream, [Parameter(Mandatory)][string]$Text)
     $bytes = [System.Text.Encoding]::ASCII.GetBytes($Text)
@@ -230,8 +294,7 @@ function Write-R156ChildFill {
     $Stream.Flush()
 }
 
-try {
-    switch ($mode) {
+switch ($mode) {
         'payload' {
             Write-R156ChildFile -Stream $stdout -Path $env:R156_PAYLOAD_PATH
             if (([System.IO.FileInfo]$env:R156_ERROR_PAYLOAD_PATH).Length -gt 0) {
@@ -242,47 +305,72 @@ try {
         }
         'stdout-first' {
             Write-R156ChildText -Stream $stdout -Text 'OUT'
-            $stdout.Dispose()
+            Write-R156ChildWitness -Phase 'stdout-payload-written'
+            Close-R156ChildStandardHandle -Name 'stdout'
             Start-Sleep -Milliseconds 150
+            Write-R156ChildWitness -Phase 'post-stdout-closure-alive'
             Write-R156ChildText -Stream $stderr -Text 'ERR'
-            $stderr.Dispose()
+            Write-R156ChildWitness -Phase 'stderr-write-after-stdout-closure'
+            Close-R156ChildStandardHandle -Name 'stderr'
+            Write-R156ChildWitness -Phase 'both-os-handles-closed'
         }
         'stderr-first' {
             Write-R156ChildText -Stream $stderr -Text 'ERR'
-            $stderr.Dispose()
+            Write-R156ChildWitness -Phase 'stderr-payload-written'
+            Close-R156ChildStandardHandle -Name 'stderr'
             Start-Sleep -Milliseconds 150
+            Write-R156ChildWitness -Phase 'post-stderr-closure-alive'
             Write-R156ChildText -Stream $stdout -Text 'OUT'
-            $stdout.Dispose()
+            Write-R156ChildWitness -Phase 'stdout-write-after-stderr-closure'
+            Close-R156ChildStandardHandle -Name 'stdout'
+            Write-R156ChildWitness -Phase 'both-os-handles-closed'
         }
         'simultaneous' {
             Write-R156ChildText -Stream $stdout -Text 'OUT'
+            Write-R156ChildWitness -Phase 'stdout-payload-written'
             Write-R156ChildText -Stream $stderr -Text 'ERR'
-            $stdout.Dispose()
-            $stderr.Dispose()
+            Write-R156ChildWitness -Phase 'stderr-payload-written'
+            Close-R156ChildStandardHandle -Name 'stdout'
+            Close-R156ChildStandardHandle -Name 'stderr'
+            Write-R156ChildWitness -Phase 'both-os-handles-closed'
         }
         'stdout-after-stderr' {
             Write-R156ChildText -Stream $stderr -Text 'ERR'
-            $stderr.Dispose()
+            Write-R156ChildWitness -Phase 'stderr-payload-written'
+            Close-R156ChildStandardHandle -Name 'stderr'
             Start-Sleep -Milliseconds 60
-            Write-R156ChildText -Stream $stdout -Text 'OUT1'
+            Write-R156ChildWitness -Phase 'post-stderr-closure-alive'
+            Write-R156ChildFill -Stream $stdout -Count 32768
+            Write-R156ChildWitness -Phase 'stdout-write1-after-stderr-closure'
             Start-Sleep -Milliseconds 60
-            Write-R156ChildText -Stream $stdout -Text 'OUT2'
-            $stdout.Dispose()
+            Write-R156ChildFill -Stream $stdout -Count 32768
+            Write-R156ChildWitness -Phase 'stdout-write2-after-stderr-closure'
+            Close-R156ChildStandardHandle -Name 'stdout'
+            Write-R156ChildWitness -Phase 'both-os-handles-closed'
         }
         'stderr-after-stdout' {
             Write-R156ChildText -Stream $stdout -Text 'OUT'
-            $stdout.Dispose()
+            Write-R156ChildWitness -Phase 'stdout-payload-written'
+            Close-R156ChildStandardHandle -Name 'stdout'
             Start-Sleep -Milliseconds 60
-            Write-R156ChildText -Stream $stderr -Text 'ERR1'
+            Write-R156ChildWitness -Phase 'post-stdout-closure-alive'
+            Write-R156ChildFill -Stream $stderr -Count 32768
+            Write-R156ChildWitness -Phase 'stderr-write1-after-stdout-closure'
             Start-Sleep -Milliseconds 60
-            Write-R156ChildText -Stream $stderr -Text 'ERR2'
-            $stderr.Dispose()
+            Write-R156ChildFill -Stream $stderr -Count 32768
+            Write-R156ChildWitness -Phase 'stderr-write2-after-stdout-closure'
+            Close-R156ChildStandardHandle -Name 'stderr'
+            Write-R156ChildWitness -Phase 'both-os-handles-closed'
         }
         'both-closed-alive' {
             Write-R156ChildText -Stream $stdout -Text 'OUT'
+            Write-R156ChildWitness -Phase 'stdout-payload-written'
             Write-R156ChildText -Stream $stderr -Text 'ERR'
-            $stdout.Dispose()
-            $stderr.Dispose()
+            Write-R156ChildWitness -Phase 'stderr-payload-written'
+            Close-R156ChildStandardHandle -Name 'stdout'
+            Close-R156ChildStandardHandle -Name 'stderr'
+            Write-R156ChildWitness -Phase 'both-os-handles-closed'
+            Write-R156ChildWitness -Phase 'post-both-closure-alive'
             Start-Sleep -Milliseconds 5000
         }
         'timeout' {
@@ -290,28 +378,21 @@ try {
         }
         'stdout-overflow' {
             Write-R156ChildFill -Stream $stdout -Count 70000
-            $stdout.Dispose()
-            $stderr.Dispose()
         }
         'stderr-overflow' {
             Write-R156ChildFill -Stream $stderr -Count 70000
-            $stderr.Dispose()
-            $stdout.Dispose()
         }
         'nonzero' {
             Write-R156ChildText -Stream $stdout -Text 'OUT'
-            $stdout.Dispose()
-            $stderr.Dispose()
+            Write-R156ChildWitness -Phase 'stdout-payload-written'
+            Close-R156ChildStandardHandle -Name 'stdout'
+            Close-R156ChildStandardHandle -Name 'stderr'
+            Write-R156ChildWitness -Phase 'both-os-handles-closed'
             $exitCode = 7
         }
         default {
             throw 'unknown synthetic child mode'
         }
-    }
-}
-finally {
-    try { $stdout.Dispose() } catch { }
-    try { $stderr.Dispose() } catch { }
 }
 
 if ($exitCode -ne 0) {
@@ -336,6 +417,7 @@ if ($exitCode -ne 0) {
             payload_path = root / "payload.bin"
             error_path = root / "error.bin"
             child_path = root / "child.ps1"
+            witness_path = root / "witness.state"
             payload_path.write_bytes(payload)
             error_path.write_bytes(error_payload)
             child_path.write_text(self.stream_child_script(), encoding="utf-8")
@@ -358,6 +440,7 @@ $startInfo.CreateNoWindow = $true
 $startInfo.EnvironmentVariables['R156_CHILD_MODE'] = [string]$env:R156_CHILD_MODE
 $startInfo.EnvironmentVariables['R156_PAYLOAD_PATH'] = [string]$env:R156_PAYLOAD_PATH
 $startInfo.EnvironmentVariables['R156_ERROR_PAYLOAD_PATH'] = [string]$env:R156_ERROR_PAYLOAD_PATH
+$startInfo.EnvironmentVariables['R156_WITNESS_PATH'] = [string]$env:R156_WITNESS_PATH
 $result = Invoke-R156BoundedProcess -StartInfo $startInfo -TimeoutMilliseconds ([int]$env:R156_TIMEOUT_MS) -MaximumOutputBytes ([int64]$env:R156_STDOUT_LIMIT) -MaximumErrorBytes ([int64]$env:R156_STDERR_LIMIT)
 $algorithm = [System.Security.Cryptography.SHA256]::Create()
 try {
@@ -377,15 +460,21 @@ Write-Output ('started=' + [string]$result.Started + ';success=' + [string]$resu
                     "R156_CHILD_SCRIPT": str(child_path),
                     "R156_PAYLOAD_PATH": str(payload_path),
                     "R156_ERROR_PAYLOAD_PATH": str(error_path),
+                    "R156_WITNESS_PATH": str(witness_path),
                     "R156_STDOUT_LIMIT": str(stdout_limit),
                     "R156_STDERR_LIMIT": str(stderr_limit),
                     "R156_TIMEOUT_MS": str(timeout_milliseconds),
                 },
                 timeout=30,
             )
+            witness = self.read_witness(witness_path)
+            native_failures = [line for line in witness if line.startswith("native-close-failed:")]
+            if native_failures:
+                self.fail("synthetic child native handle close failed: " + " | ".join(native_failures))
         fields = self.parse_fields(lines)
         sha_line = next(line for line in lines if line.startswith("started="))
         fields["sha256"] = sha_line.split("sha256=", 1)[1]
+        fields["witness"] = witness
         return fields
 
     def run_local_output_check(self, object_argument, payload):
@@ -1329,32 +1418,108 @@ foreach ($file in $files) {
                 self.assertFalse(values["data_" + name])
 
     def test_redirected_stream_lifecycle_behavioural_matrix(self):
+        child_script = self.stream_child_script()
+        self.assertIn('GetStdHandle', child_script)
+        self.assertIn('CloseHandle', child_script)
+        self.assertIn('-11', child_script)
+        self.assertIn('-12', child_script)
+        self.assertNotIn('$stdout.Dispose()', child_script)
+        self.assertNotIn('$stderr.Dispose()', child_script)
+
+        stdout_first_witness = (
+            'stdout-payload-written',
+            'stdout-os-closed',
+            'post-stdout-closure-alive',
+            'stderr-write-after-stdout-closure',
+            'stderr-os-closed',
+            'both-os-handles-closed',
+        )
+        stderr_first_witness = (
+            'stderr-payload-written',
+            'stderr-os-closed',
+            'post-stderr-closure-alive',
+            'stdout-write-after-stderr-closure',
+            'stdout-os-closed',
+            'both-os-handles-closed',
+        )
         successful = {
-            "empty": (0, ""),
-            "stdout-first": (3, "OUT"),
-            "stderr-first": (3, "OUT"),
-            "simultaneous": (3, "OUT"),
-            "stdout-after-stderr": (8, "OUT1OUT2"),
-            "stderr-after-stdout": (3, "OUT"),
+            "empty": (b"", ()),
+            "stdout-first": (b"OUT", stdout_first_witness),
+            "stderr-first": (b"OUT", stderr_first_witness),
+            "simultaneous": (
+                b"OUT",
+                (
+                    'stdout-payload-written',
+                    'stderr-payload-written',
+                    'stdout-os-closed',
+                    'stderr-os-closed',
+                    'both-os-handles-closed',
+                ),
+            ),
+            "stdout-after-stderr": (
+                b"\x00" * 65536,
+                (
+                    'stderr-payload-written',
+                    'stderr-os-closed',
+                    'post-stderr-closure-alive',
+                    'stdout-write1-after-stderr-closure',
+                    'stdout-write2-after-stderr-closure',
+                    'stdout-os-closed',
+                    'both-os-handles-closed',
+                ),
+            ),
+            "stderr-after-stdout": (
+                b"OUT",
+                (
+                    'stdout-payload-written',
+                    'stdout-os-closed',
+                    'post-stdout-closure-alive',
+                    'stderr-write1-after-stdout-closure',
+                    'stderr-write2-after-stdout-closure',
+                    'stderr-os-closed',
+                    'both-os-handles-closed',
+                ),
+            ),
         }
-        for mode, (expected_length, expected_text) in successful.items():
+        for mode, (expected_output, expected_witness) in successful.items():
             with self.subTest(mode=mode):
                 result = self.run_bounded_process(mode, timeout_milliseconds=3000)
                 self.assertTrue(result["success"], result)
                 self.assertFalse(result["timedout"], result)
                 self.assertFalse(result["overflow"], result)
-                self.assertEqual(result["length"], expected_length)
-                self.assertEqual(result["sha256"], hashlib.sha256(expected_text.encode("ascii")).hexdigest())
+                self.assertEqual(result["length"], len(expected_output))
+                self.assertEqual(result["sha256"], hashlib.sha256(expected_output).hexdigest())
+                self.assertEqual(result["witness"], list(expected_witness))
 
         for mode in ("timeout", "both-closed-alive"):
             with self.subTest(timeout_mode=mode):
                 started = time.monotonic()
-                result = self.run_bounded_process(mode, timeout_milliseconds=500)
+                timeout_milliseconds = 1500 if mode == "both-closed-alive" else 500
+                result = self.run_bounded_process(mode, timeout_milliseconds=timeout_milliseconds)
                 elapsed = time.monotonic() - started
                 self.assertFalse(result["success"], result)
                 self.assertTrue(result["timedout"], result)
+                self.assertFalse(result["overflow"], result)
                 self.assertEqual(result["length"], 0)
-                self.assertLess(elapsed, 3.0, "the bounded pump must not wait for a live child after stream EOF")
+                self.assertLess(
+                    elapsed,
+                    3.0,
+                    "the bounded pump must not wait for the intentionally live child after stream EOF",
+                )
+                if mode == "both-closed-alive":
+                    self.assertEqual(
+                        result["witness"],
+                        [
+                            'stdout-payload-written',
+                            'stderr-payload-written',
+                            'stdout-os-closed',
+                            'stderr-os-closed',
+                            'both-os-handles-closed',
+                            'post-both-closure-alive',
+                        ],
+                    )
+                else:
+                    self.assertEqual(result["witness"], [])
 
         for mode in ("stdout-overflow", "stderr-overflow"):
             with self.subTest(overflow_mode=mode):
