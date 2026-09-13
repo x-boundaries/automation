@@ -1670,6 +1670,7 @@ $result | ConvertTo-Json -Compress
                     "payload",
                     stdout_limit=expected_length,
                     payload=result.stdout,
+                    timeout_milliseconds=10000,
                 )
                 self.assertTrue(process["success"], process)
                 self.assertEqual(process["length"], expected_length)
@@ -1729,6 +1730,7 @@ $result | ConvertTo-Json -Compress
             stderr_limit=65536,
             payload=library,
             error_payload=b"e" * 65536,
+            timeout_milliseconds=10000,
         )
         self.assertTrue(stderr_at_limit["success"], stderr_at_limit)
         self.assertEqual(stderr_at_limit["length"], len(library))
