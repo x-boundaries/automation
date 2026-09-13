@@ -6,6 +6,8 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import tempfile
+import time
 import unittest
 
 
@@ -39,6 +41,525 @@ class Run156HelperStaticTests(unittest.TestCase):
         start = self.source.index(signature)
         end = self.source.index(next_signature, start + len(signature))
         return self.source[start:end]
+
+    def extracted_functions(self, names):
+        """Extract only named production functions for an isolated PowerShell harness."""
+        wanted = set(names)
+        matches = list(
+            re.finditer(
+                r"(?m)^function\s+([A-Za-z0-9-]+)\s*\{",
+                self.source,
+            )
+        )
+        blocks = []
+        for index, match in enumerate(matches):
+            if match.group(1) not in wanted:
+                continue
+            end = matches[index + 1].start() if index + 1 < len(matches) else len(self.source)
+            blocks.append((match.start(), self.source[match.start():end].rstrip()))
+        blocks.sort(key=lambda item: item[0])
+        self.assertEqual(
+            {self.source_function_name(block) for _, block in blocks},
+            wanted,
+            "every isolated harness function must come from the production source",
+        )
+        return "\n\n".join(block for _, block in blocks)
+
+    @staticmethod
+    def source_function_name(block):
+        match = re.match(r"function\s+([A-Za-z0-9-]+)\s*\{", block)
+        if match is None:
+            raise AssertionError("isolated function extraction lost its declaration")
+        return match.group(1)
+
+    def run_isolated_powershell(self, script, environment=None, timeout=120):
+        """Run a scratch harness, never the complete helper or a dot-sourced file."""
+        powershell = shutil.which("powershell.exe")
+        if powershell is None:
+            self.skipTest("Windows PowerShell 5.1 is not available on this host")
+        probe = subprocess.run(
+            [powershell, "-NoProfile", "-NonInteractive", "-Command", "$PSVersionTable.PSEdition"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        if probe.returncode != 0 or probe.stdout.strip() != "Desktop":
+            self.skipTest("Windows PowerShell 5.1 (PSEdition Desktop) is required")
+        env = os.environ.copy()
+        if environment:
+            env.update({str(key): str(value) for key, value in environment.items()})
+        with tempfile.TemporaryDirectory(prefix="r156_isolated_") as directory:
+            harness = Path(directory) / "harness.ps1"
+            harness.write_text(script, encoding="utf-8")
+            result = subprocess.run(
+                [
+                    powershell,
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    str(harness),
+                ],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+        if result.returncode != 0:
+            self.fail(
+                "isolated PowerShell harness failed: "
+                f"stdout={result.stdout[-4096:]!r} stderr={result.stderr[-4096:]!r}"
+            )
+        return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+    @staticmethod
+    def git_contract_constants():
+        return """
+$script:R156LibraryGitBlob = 'de75302dfb7ce3b1b4b37919d6b7e734d0503018'
+$script:R156LibraryGitBlobLength = [int64]141393
+$script:R156InstallerGitBlob = 'a5b670e3b043a026af1d7f2086df03fdb1e7fa13'
+$script:R156InstallerGitBlobLength = [int64]25643
+$script:R156LauncherGitBlob = 'd632068bbd5832cc46971278ca0f4fba3bf7e8f3'
+$script:R156LauncherGitBlobLength = [int64]21081
+$script:R156ExpectedHeadAtExecution = '0000000000000000000000000000000000000000'
+$script:R156GitOutputLimitBytes = [int64]65536
+$script:R156LocalGitReadOnlySubcommands = @('symbolic-ref', 'rev-parse', 'status', 'config', 'cat-file')
+"""
+
+    @staticmethod
+    def parse_fields(lines):
+        self_line = next((line for line in lines if line.startswith("started=")), None)
+        if self_line is None:
+            raise AssertionError(f"isolated process harness emitted no result: {lines!r}")
+        fields = {}
+        for field in self_line.split(";"):
+            key, value = field.split("=", 1)
+            fields[key] = value
+        for key in ("started", "success", "timedout", "overflow", "stderrdiscarded"):
+            if key in fields:
+                fields[key] = fields[key].lower() == "true"
+        for key in ("length", "exit"):
+            if key in fields:
+                fields[key] = int(fields[key])
+        return fields
+
+    def process_functions(self):
+        return self.extracted_functions(
+            (
+                "ConvertTo-R156NativeArgument",
+                "New-R156GitProcessResult",
+                "Get-R156CompletedReadResult",
+                "Invoke-R156BoundedProcess",
+                "Convert-R156BytesToHex",
+                "Get-R156Sha256ForBytes",
+            )
+        )
+
+    def git_output_functions(self):
+        return self.extracted_functions(
+            (
+                "Convert-R156BytesToHex",
+                "Get-R156Sha1ForGitObject",
+                "Convert-R156Utf8Bytes",
+                "Convert-R156ConfigBytes",
+                "Test-R156SingleGitLineBytes",
+                "Get-R156LocalGitCommandName",
+                "Test-R156LocalGitArguments",
+                "Get-R156LocalGitOutputContract",
+                "Test-R156LocalGitOutput",
+            )
+        )
+
+    def json_functions(self):
+        return self.extracted_functions(
+            (
+                "Get-R156FullPath",
+                "Get-R156ParentDirectory",
+                "Test-R156NormalFile",
+                "Test-R156NoReparseAncestors",
+                "Open-R156ReadOnlyHandle",
+                "Read-R156HandleBytes",
+                "Convert-R156Utf8Bytes",
+                "Skip-R156JsonWhitespace",
+                "Get-R156JsonHexValue",
+                "Get-R156JsonString",
+                "Test-R156JsonNumber",
+                "Test-R156JsonLiteral",
+                "Test-R156JsonValue",
+                "Test-R156JsonObject",
+                "Test-R156JsonArray",
+                "Test-R156StrictJsonBytes",
+                "Read-R156StrictJsonObject",
+            )
+        )
+
+    @staticmethod
+    def stream_child_script():
+        return r"""
+$ProgressPreference = 'SilentlyContinue'
+$mode = [string]$env:R156_CHILD_MODE
+$stdout = [Console]::OpenStandardOutput()
+$stderr = [Console]::OpenStandardError()
+$exitCode = 0
+
+function Write-R156ChildText {
+    param([Parameter(Mandatory)][System.IO.Stream]$Stream, [Parameter(Mandatory)][string]$Text)
+    $bytes = [System.Text.Encoding]::ASCII.GetBytes($Text)
+    if ($bytes.Length -gt 0) {
+        $Stream.Write($bytes, 0, $bytes.Length)
+        $Stream.Flush()
+    }
+}
+
+function Write-R156ChildFile {
+    param([Parameter(Mandatory)][System.IO.Stream]$Stream, [Parameter(Mandatory)][string]$Path)
+    $bytes = [System.IO.File]::ReadAllBytes($Path)
+    if ($bytes.Length -gt 0) {
+        $Stream.Write($bytes, 0, $bytes.Length)
+        $Stream.Flush()
+    }
+}
+
+function Write-R156ChildFill {
+    param([Parameter(Mandatory)][System.IO.Stream]$Stream, [Parameter(Mandatory)][int]$Count)
+    $bytes = New-Object byte[] $Count
+    $Stream.Write($bytes, 0, $bytes.Length)
+    $Stream.Flush()
+}
+
+try {
+    switch ($mode) {
+        'payload' {
+            Write-R156ChildFile -Stream $stdout -Path $env:R156_PAYLOAD_PATH
+            if (([System.IO.FileInfo]$env:R156_ERROR_PAYLOAD_PATH).Length -gt 0) {
+                Write-R156ChildFile -Stream $stderr -Path $env:R156_ERROR_PAYLOAD_PATH
+            }
+        }
+        'empty' {
+        }
+        'stdout-first' {
+            Write-R156ChildText -Stream $stdout -Text 'OUT'
+            $stdout.Dispose()
+            Start-Sleep -Milliseconds 150
+            Write-R156ChildText -Stream $stderr -Text 'ERR'
+            $stderr.Dispose()
+        }
+        'stderr-first' {
+            Write-R156ChildText -Stream $stderr -Text 'ERR'
+            $stderr.Dispose()
+            Start-Sleep -Milliseconds 150
+            Write-R156ChildText -Stream $stdout -Text 'OUT'
+            $stdout.Dispose()
+        }
+        'simultaneous' {
+            Write-R156ChildText -Stream $stdout -Text 'OUT'
+            Write-R156ChildText -Stream $stderr -Text 'ERR'
+            $stdout.Dispose()
+            $stderr.Dispose()
+        }
+        'stdout-after-stderr' {
+            Write-R156ChildText -Stream $stderr -Text 'ERR'
+            $stderr.Dispose()
+            Start-Sleep -Milliseconds 60
+            Write-R156ChildText -Stream $stdout -Text 'OUT1'
+            Start-Sleep -Milliseconds 60
+            Write-R156ChildText -Stream $stdout -Text 'OUT2'
+            $stdout.Dispose()
+        }
+        'stderr-after-stdout' {
+            Write-R156ChildText -Stream $stdout -Text 'OUT'
+            $stdout.Dispose()
+            Start-Sleep -Milliseconds 60
+            Write-R156ChildText -Stream $stderr -Text 'ERR1'
+            Start-Sleep -Milliseconds 60
+            Write-R156ChildText -Stream $stderr -Text 'ERR2'
+            $stderr.Dispose()
+        }
+        'both-closed-alive' {
+            Write-R156ChildText -Stream $stdout -Text 'OUT'
+            Write-R156ChildText -Stream $stderr -Text 'ERR'
+            $stdout.Dispose()
+            $stderr.Dispose()
+            Start-Sleep -Milliseconds 5000
+        }
+        'timeout' {
+            Start-Sleep -Milliseconds 5000
+        }
+        'stdout-overflow' {
+            Write-R156ChildFill -Stream $stdout -Count 70000
+            $stdout.Dispose()
+            $stderr.Dispose()
+        }
+        'stderr-overflow' {
+            Write-R156ChildFill -Stream $stderr -Count 70000
+            $stderr.Dispose()
+            $stdout.Dispose()
+        }
+        'nonzero' {
+            Write-R156ChildText -Stream $stdout -Text 'OUT'
+            $stdout.Dispose()
+            $stderr.Dispose()
+            $exitCode = 7
+        }
+        default {
+            throw 'unknown synthetic child mode'
+        }
+    }
+}
+finally {
+    try { $stdout.Dispose() } catch { }
+    try { $stderr.Dispose() } catch { }
+}
+
+if ($exitCode -ne 0) {
+    exit $exitCode
+}
+"""
+
+    def run_bounded_process(
+        self,
+        mode,
+        stdout_limit=65536,
+        stderr_limit=65536,
+        timeout_milliseconds=2000,
+        payload=b"",
+        error_payload=b"",
+    ):
+        powershell = shutil.which("powershell.exe")
+        if powershell is None:
+            self.skipTest("Windows PowerShell 5.1 is not available on this host")
+        with tempfile.TemporaryDirectory(prefix="r156_process_") as directory:
+            root = Path(directory)
+            payload_path = root / "payload.bin"
+            error_path = root / "error.bin"
+            child_path = root / "child.ps1"
+            payload_path.write_bytes(payload)
+            error_path.write_bytes(error_payload)
+            child_path.write_text(self.stream_child_script(), encoding="utf-8")
+            script = (
+                "$ErrorActionPreference = 'Stop'\n"
+                + self.process_functions()
+                + r"""
+$startInfo = New-Object System.Diagnostics.ProcessStartInfo
+if ([string]$env:R156_CHILD_MODE -ceq 'not-started') {
+    $startInfo.FileName = 'C:\R156-missing\not-a-process.exe'
+}
+else {
+    $startInfo.FileName = [string]$env:R156_CHILD_POWERSHELL
+}
+$startInfo.Arguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File ' + (ConvertTo-R156NativeArgument -Value $env:R156_CHILD_SCRIPT)
+$startInfo.UseShellExecute = $false
+$startInfo.RedirectStandardOutput = $true
+$startInfo.RedirectStandardError = $true
+$startInfo.CreateNoWindow = $true
+$startInfo.EnvironmentVariables['R156_CHILD_MODE'] = [string]$env:R156_CHILD_MODE
+$startInfo.EnvironmentVariables['R156_PAYLOAD_PATH'] = [string]$env:R156_PAYLOAD_PATH
+$startInfo.EnvironmentVariables['R156_ERROR_PAYLOAD_PATH'] = [string]$env:R156_ERROR_PAYLOAD_PATH
+$result = Invoke-R156BoundedProcess -StartInfo $startInfo -TimeoutMilliseconds ([int]$env:R156_TIMEOUT_MS) -MaximumOutputBytes ([int64]$env:R156_STDOUT_LIMIT) -MaximumErrorBytes ([int64]$env:R156_STDERR_LIMIT)
+$algorithm = [System.Security.Cryptography.SHA256]::Create()
+try {
+    $sha = [BitConverter]::ToString($algorithm.ComputeHash($result.StdoutBytes)).Replace('-', '').ToLowerInvariant()
+}
+finally {
+    $algorithm.Dispose()
+}
+Write-Output ('started=' + [string]$result.Started + ';success=' + [string]$result.Success + ';length=' + [string]$result.StdoutBytes.Length + ';exit=' + [string]$result.ExitCode + ';timedout=' + [string]$result.TimedOut + ';overflow=' + [string]$result.Overflow + ';stderrdiscarded=' + [string]$result.StderrDiscarded + ';sha256=' + $sha)
+"""
+            )
+            lines = self.run_isolated_powershell(
+                script,
+                environment={
+                    "R156_CHILD_MODE": mode,
+                    "R156_CHILD_POWERSHELL": powershell,
+                    "R156_CHILD_SCRIPT": str(child_path),
+                    "R156_PAYLOAD_PATH": str(payload_path),
+                    "R156_ERROR_PAYLOAD_PATH": str(error_path),
+                    "R156_STDOUT_LIMIT": str(stdout_limit),
+                    "R156_STDERR_LIMIT": str(stderr_limit),
+                    "R156_TIMEOUT_MS": str(timeout_milliseconds),
+                },
+                timeout=30,
+            )
+        fields = self.parse_fields(lines)
+        sha_line = next(line for line in lines if line.startswith("started="))
+        fields["sha256"] = sha_line.split("sha256=", 1)[1]
+        return fields
+
+    def run_local_output_check(self, object_argument, payload):
+        with tempfile.TemporaryDirectory(prefix="r156_output_contract_") as directory:
+            payload_path = Path(directory) / "payload.bin"
+            payload_path.write_bytes(payload)
+            script = (
+                "$ErrorActionPreference = 'Stop'\n"
+                + self.git_contract_constants()
+                + self.git_output_functions()
+                + r"""
+$arguments = @('cat-file', 'blob', [string]$env:R156_OBJECT_ARGUMENT)
+$bytes = [System.IO.File]::ReadAllBytes($env:R156_PAYLOAD_PATH)
+$contract = Get-R156LocalGitOutputContract -Arguments $arguments
+$valid = Test-R156LocalGitOutput -Arguments $arguments -Bytes $bytes
+if ($null -eq $contract) {
+    Write-Output ('valid=' + [string]$valid + ';contract=none')
+}
+else {
+    Write-Output ('valid=' + [string]$valid + ';contract_limit=' + [string]$contract.StdoutLimitBytes + ';contract_length=' + [string]$contract.ExpectedBlobLength + ';contract_object=' + [string]$contract.ExpectedBlobObject)
+}
+"""
+            )
+            lines = self.run_isolated_powershell(
+                script,
+                environment={
+                    "R156_OBJECT_ARGUMENT": object_argument,
+                    "R156_PAYLOAD_PATH": str(payload_path),
+                },
+            )
+        fields = {}
+        for field in lines[-1].split(";"):
+            key, value = field.split("=", 1)
+            fields[key] = value
+        fields["valid"] = fields["valid"].lower() == "true"
+        for key in ("contract_limit", "contract_length"):
+            if key in fields:
+                fields[key] = int(fields[key])
+        return fields
+
+    def run_empty_byte_matrix(self):
+        script = (
+            "$ErrorActionPreference = 'Stop'\n"
+            + self.git_contract_constants()
+            + self.git_output_functions()
+            + self.extracted_functions(("New-R156GitProcessResult",))
+            + r"""
+$statusArguments = @('-c', 'core.fsmonitor=false', '-c', 'core.untrackedCache=false', '-c', 'core.hooksPath=NUL', '-c', 'submodule.recurse=false', 'status', '--porcelain=v1', '--untracked-files=all', '--ignore-submodules=none')
+$cleanStatus = Test-R156LocalGitOutput -Arguments $statusArguments -Bytes ([byte[]]@())
+$dirtyStatus = Test-R156LocalGitOutput -Arguments $statusArguments -Bytes ([System.Text.Encoding]::ASCII.GetBytes(" M file`n"))
+$required = @(
+    [pscustomobject]@{ Name = 'symbolic'; Arguments = @('symbolic-ref', '--short', '-q', 'HEAD') },
+    [pscustomobject]@{ Name = 'head'; Arguments = @('rev-parse', '--verify', 'HEAD') },
+    [pscustomobject]@{ Name = 'config'; Arguments = @('config', '--file=C:\XB\automation\.git\config', '--no-includes', '--null', '--list') },
+    [pscustomobject]@{ Name = 'commit'; Arguments = @('cat-file', 'commit', $script:R156ExpectedHeadAtExecution) },
+    [pscustomobject]@{ Name = 'blob'; Arguments = @('cat-file', 'blob', $script:R156LibraryGitBlob) }
+)
+$results = @()
+foreach ($case in $required) {
+    $results = $results + (Test-R156LocalGitOutput -Arguments $case.Arguments -Bytes ([byte[]]@()))
+}
+$notStarted = New-R156GitProcessResult -Started $false -Success $false -ExitCode -1 -StdoutBytes ([byte[]]@())
+$timeout = New-R156GitProcessResult -Started $true -Success $false -ExitCode -1 -StdoutBytes ([byte[]]@()) -TimedOut $true
+$overflow = New-R156GitProcessResult -Started $true -Success $false -ExitCode -1 -StdoutBytes ([byte[]]@()) -Overflow $true
+$nonzero = New-R156GitProcessResult -Started $true -Success $false -ExitCode 7 -StdoutBytes ([byte[]]@())
+$failedEmpty = @($notStarted, $timeout, $overflow, $nonzero) | Where-Object { $_.StdoutBytes.Length -eq 0 }
+Write-Output ('clean_status=' + [string]$cleanStatus + ';dirty_status=' + [string]$dirtyStatus + ';failed_empty=' + [string]($failedEmpty.Count -eq 4))
+foreach ($case in $required) {
+    Write-Output ('data_' + $case.Name + '=' + [string](Test-R156LocalGitOutput -Arguments $case.Arguments -Bytes ([byte[]]@())))
+}
+"""
+        )
+        lines = self.run_isolated_powershell(script)
+        values = {}
+        for line in lines:
+            for field in line.split(";"):
+                key, value = field.split("=", 1)
+                values[key] = value.lower() == "true"
+        return values
+
+    def run_fault_cancel_matrix(self):
+        script = (
+            "$ErrorActionPreference = 'Stop'\n"
+            + self.extracted_functions(("Get-R156CompletedReadResult",))
+            + r"""
+$faultSource = New-Object 'System.Threading.Tasks.TaskCompletionSource[int]'
+[void]$faultSource.SetException((New-Object -TypeName System.InvalidOperationException -ArgumentList 'synthetic'))
+$fault = Get-R156CompletedReadResult -Task $faultSource.Task -Active $true
+$cancelSource = New-Object 'System.Threading.Tasks.TaskCompletionSource[int]'
+[void]$cancelSource.SetCanceled()
+$cancelled = Get-R156CompletedReadResult -Task $cancelSource.Task -Active $true
+$inactiveSource = New-Object 'System.Threading.Tasks.TaskCompletionSource[int]'
+[void]$inactiveSource.SetResult(0)
+$inactive = Get-R156CompletedReadResult -Task $inactiveSource.Task -Active $false
+Write-Output ('fault_success=' + [string]$fault.Success + ';faulted=' + [string]$fault.Faulted + ';cancel_success=' + [string]$cancelled.Success + ';cancelled=' + [string]$cancelled.Canceled + ';inactive_invariant=' + [string]$inactive.InvariantViolation)
+"""
+        )
+        lines = self.run_isolated_powershell(script)
+        values = {}
+        for field in lines[-1].split(";"):
+            key, value = field.split("=", 1)
+            values[key] = value.lower() == "true"
+        return values
+
+    def run_acl_matrix(self):
+        script = (
+            "$ErrorActionPreference = 'Stop'\n"
+            + self.extracted_functions(("Test-R156MutationCapableFileSystemRights",))
+            + r"""
+$cases = [ordered]@{
+    Read = [System.Security.AccessControl.FileSystemRights]::Read
+    ReadAndExecute = [System.Security.AccessControl.FileSystemRights]::ReadAndExecute
+    Synchronize = [System.Security.AccessControl.FileSystemRights]::Synchronize
+    WriteData = [System.Security.AccessControl.FileSystemRights]::WriteData
+    AppendData = [System.Security.AccessControl.FileSystemRights]::AppendData
+    WriteExtendedAttributes = [System.Security.AccessControl.FileSystemRights]::WriteExtendedAttributes
+    DeleteSubdirectoriesAndFiles = [System.Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles
+    WriteAttributes = [System.Security.AccessControl.FileSystemRights]::WriteAttributes
+    Delete = [System.Security.AccessControl.FileSystemRights]::Delete
+    ChangePermissions = [System.Security.AccessControl.FileSystemRights]::ChangePermissions
+    TakeOwnership = [System.Security.AccessControl.FileSystemRights]::TakeOwnership
+    Write = [System.Security.AccessControl.FileSystemRights]::Write
+    Modify = [System.Security.AccessControl.FileSystemRights]::Modify
+    FullControl = [System.Security.AccessControl.FileSystemRights]::FullControl
+}
+foreach ($entry in $cases.GetEnumerator()) {
+    Write-Output ($entry.Key + '=' + [string](Test-R156MutationCapableFileSystemRights -Rights $entry.Value))
+}
+"""
+        )
+        lines = self.run_isolated_powershell(script)
+        values = {}
+        for line in lines:
+            key, value = line.split("=", 1)
+            values[key] = value.lower() == "true"
+        return values
+
+    def run_json_matrix(self, cases):
+        with tempfile.TemporaryDirectory(prefix="r156_json_cases_") as directory:
+            root = Path(directory)
+            for name, data in cases.items():
+                (root / (name + ".json")).write_bytes(data)
+            script = (
+                "$ErrorActionPreference = 'Stop'\n"
+                "$script:R156MetadataJsonLimitBytes = [int64]65536\n"
+                "$script:R156MetadataJsonMaxDepth = [int]32\n"
+                "$script:R156MetadataJsonMaxBytesPerRead = [int]8192\n"
+                + self.json_functions()
+                + r"""
+$files = @(Get-ChildItem -LiteralPath $env:R156_JSON_DIR -File | Sort-Object Name)
+foreach ($file in $files) {
+    $object = Read-R156StrictJsonObject -Path $file.FullName
+    if ($null -eq $object) {
+        Write-Output ($file.BaseName + ';kind=null')
+    }
+    else {
+        Write-Output ($file.BaseName + ';kind=object;count=' + [string](@($object.PSObject.Properties).Count))
+    }
+}
+"""
+            )
+            lines = self.run_isolated_powershell(
+                script,
+                environment={"R156_JSON_DIR": str(root)},
+            )
+        results = {}
+        for line in lines:
+            fields = line.split(";")
+            name = fields[0]
+            result = {key: value for key, value in (field.split("=", 1) for field in fields[1:])}
+            if "count" in result:
+                result["count"] = int(result["count"])
+            results[name] = result
+        return results
 
     @staticmethod
     def config_accepts(entries):
@@ -698,6 +1219,224 @@ class Run156HelperStaticTests(unittest.TestCase):
                 normalized = self.working_byte_contract(working)
                 self.assertIsNotNone(normalized)
                 self.assertEqual(normalized, committed)
+
+    def test_git_output_contract_behavioural_matrix(self):
+        frozen = (
+            ("library", "de75302dfb7ce3b1b4b37919d6b7e734d0503018", 141393),
+            ("installer", "a5b670e3b043a026af1d7f2086df03fdb1e7fa13", 25643),
+            ("launcher", "d632068bbd5832cc46971278ca0f4fba3bf7e8f3", 21081),
+        )
+        blobs = {}
+        for name, object_id, expected_length in frozen:
+            with self.subTest(blob=name):
+                result = subprocess.run(
+                    ["git", "cat-file", "blob", object_id],
+                    cwd=REPO_ROOT,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    timeout=30,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 0)
+                self.assertEqual(len(result.stdout), expected_length)
+                self.assertEqual(self.git_object_sha1("blob", result.stdout), object_id)
+                blobs[name] = result.stdout
+
+                process = self.run_bounded_process(
+                    "payload",
+                    stdout_limit=expected_length,
+                    payload=result.stdout,
+                )
+                self.assertTrue(process["success"], process)
+                self.assertEqual(process["length"], expected_length)
+                self.assertEqual(process["sha256"], hashlib.sha256(result.stdout).hexdigest())
+                self.assertTrue(process["stderrdiscarded"])
+
+                contract = self.run_local_output_check(object_id, result.stdout)
+                self.assertTrue(contract["valid"], contract)
+                self.assertEqual(contract["contract_limit"], expected_length)
+                self.assertEqual(contract["contract_length"], expected_length)
+                self.assertEqual(contract["contract_object"], object_id)
+
+        library_id = frozen[0][1]
+        library = blobs["library"]
+        short = self.run_local_output_check(library_id, library[:-1])
+        self.assertFalse(short["valid"], short)
+        extra = self.run_local_output_check(library_id, library + b"x")
+        self.assertFalse(extra["valid"], extra)
+        wrong_bytes = bytearray(library)
+        wrong_bytes[len(wrong_bytes) // 2] ^= 0x01
+        wrong = self.run_local_output_check(library_id, bytes(wrong_bytes))
+        self.assertFalse(wrong["valid"], wrong)
+        wrong_object = self.run_local_output_check("0" * 40, library)
+        self.assertFalse(wrong_object["valid"], wrong_object)
+        wrong_admitted_id = self.run_local_output_check(frozen[1][1], library)
+        self.assertFalse(wrong_admitted_id["valid"], wrong_admitted_id)
+
+        size_plus_one = self.run_bounded_process(
+            "payload",
+            stdout_limit=len(library),
+            payload=library + b"x",
+        )
+        self.assertFalse(size_plus_one["success"], size_plus_one)
+        self.assertTrue(size_plus_one["overflow"], size_plus_one)
+        self.assertEqual(size_plus_one["length"], 0)
+
+        ordinary = b"o" * 65536
+        ordinary_result = self.run_bounded_process(
+            "payload",
+            stdout_limit=65536,
+            payload=ordinary,
+        )
+        self.assertTrue(ordinary_result["success"], ordinary_result)
+        self.assertEqual(ordinary_result["length"], 65536)
+        ordinary_overflow = self.run_bounded_process(
+            "payload",
+            stdout_limit=65536,
+            payload=ordinary + b"o",
+        )
+        self.assertFalse(ordinary_overflow["success"], ordinary_overflow)
+        self.assertTrue(ordinary_overflow["overflow"], ordinary_overflow)
+        self.assertEqual(ordinary_overflow["length"], 0)
+
+        stderr_at_limit = self.run_bounded_process(
+            "payload",
+            stdout_limit=len(library),
+            stderr_limit=65536,
+            payload=library,
+            error_payload=b"e" * 65536,
+        )
+        self.assertTrue(stderr_at_limit["success"], stderr_at_limit)
+        self.assertEqual(stderr_at_limit["length"], len(library))
+        stderr_overflow = self.run_bounded_process(
+            "payload",
+            stdout_limit=len(library),
+            stderr_limit=65536,
+            payload=library,
+            error_payload=b"e" * 65537,
+        )
+        self.assertFalse(stderr_overflow["success"], stderr_overflow)
+        self.assertTrue(stderr_overflow["overflow"], stderr_overflow)
+        self.assertEqual(stderr_overflow["length"], 0)
+
+    def test_empty_byte_protocol_behavioural_matrix(self):
+        values = self.run_empty_byte_matrix()
+        self.assertTrue(values["clean_status"])
+        self.assertFalse(values["dirty_status"])
+        self.assertTrue(values["failed_empty"])
+        for name in ("symbolic", "head", "config", "commit", "blob"):
+            with self.subTest(command=name):
+                self.assertFalse(values["data_" + name])
+
+    def test_redirected_stream_lifecycle_behavioural_matrix(self):
+        successful = {
+            "empty": (0, ""),
+            "stdout-first": (3, "OUT"),
+            "stderr-first": (3, "OUT"),
+            "simultaneous": (3, "OUT"),
+            "stdout-after-stderr": (8, "OUT1OUT2"),
+            "stderr-after-stdout": (3, "OUT"),
+        }
+        for mode, (expected_length, expected_text) in successful.items():
+            with self.subTest(mode=mode):
+                result = self.run_bounded_process(mode, timeout_milliseconds=3000)
+                self.assertTrue(result["success"], result)
+                self.assertFalse(result["timedout"], result)
+                self.assertFalse(result["overflow"], result)
+                self.assertEqual(result["length"], expected_length)
+                self.assertEqual(result["sha256"], hashlib.sha256(expected_text.encode("ascii")).hexdigest())
+
+        for mode in ("timeout", "both-closed-alive"):
+            with self.subTest(timeout_mode=mode):
+                started = time.monotonic()
+                result = self.run_bounded_process(mode, timeout_milliseconds=500)
+                elapsed = time.monotonic() - started
+                self.assertFalse(result["success"], result)
+                self.assertTrue(result["timedout"], result)
+                self.assertEqual(result["length"], 0)
+                self.assertLess(elapsed, 3.0, "the bounded pump must not wait for a live child after stream EOF")
+
+        for mode in ("stdout-overflow", "stderr-overflow"):
+            with self.subTest(overflow_mode=mode):
+                result = self.run_bounded_process(mode, timeout_milliseconds=2000)
+                self.assertFalse(result["success"], result)
+                self.assertTrue(result["overflow"], result)
+                self.assertEqual(result["length"], 0)
+
+        nonzero = self.run_bounded_process("nonzero", timeout_milliseconds=3000)
+        self.assertFalse(nonzero["success"], nonzero)
+        self.assertEqual(nonzero["exit"], 7)
+        self.assertEqual(nonzero["length"], 0)
+
+        not_started = self.run_bounded_process("not-started", timeout_milliseconds=500)
+        self.assertFalse(not_started["started"], not_started)
+        self.assertFalse(not_started["success"], not_started)
+        self.assertEqual(not_started["length"], 0)
+
+    def test_completed_read_fault_cancel_and_inactive_states_are_fail_closed(self):
+        values = self.run_fault_cancel_matrix()
+        self.assertFalse(values["fault_success"])
+        self.assertTrue(values["faulted"])
+        self.assertFalse(values["cancel_success"])
+        self.assertTrue(values["cancelled"])
+        self.assertTrue(values["inactive_invariant"])
+
+    def test_acl_primitive_mutation_behavioural_matrix(self):
+        values = self.run_acl_matrix()
+        for name in ("Read", "ReadAndExecute", "Synchronize"):
+            with self.subTest(accepted=name):
+                self.assertFalse(values[name])
+        for name in (
+            "WriteData",
+            "AppendData",
+            "WriteExtendedAttributes",
+            "DeleteSubdirectoriesAndFiles",
+            "WriteAttributes",
+            "Delete",
+            "ChangePermissions",
+            "TakeOwnership",
+            "Write",
+            "Modify",
+            "FullControl",
+        ):
+            with self.subTest(rejected=name):
+                self.assertTrue(values[name])
+
+    def test_strict_json_reader_behavioural_matrix(self):
+        depth = 33
+        cases = {
+            "valid": b'{"name":"grid","nested":{"enabled":true},"items":[1,null]}',
+            "empty_object": b"{}",
+            "malformed": b'{"a":}',
+            "empty": b"",
+            "whitespace_only": b" \r\n\t ",
+            "invalid_utf8": b'{"a":"\xff"}',
+            "bom": b"\xef\xbb\xbf{" + b'"a":1}',
+            "top_array": b"[1,2]",
+            "scalar": b"1",
+            "null_root": b"null",
+            "exact_duplicate": b'{"a":1,"a":2}',
+            "case_duplicate": b'{"A":1,"a":2}',
+            "escaped_duplicate": b'{"a":1,"\\u0061":2}',
+            "nested_scope_valid": b'{"outer":{"a":1},"other":{"a":2},"a":3}',
+            "nested_scope_duplicate": b'{"outer":{"a":1,"a":2}}',
+            "trailing_garbage": b'{"a":1}x',
+            "concatenated": b'{"a":1}{"b":2}',
+            "oversize": b'{"x":"' + (b"a" * 65530) + b'"}',
+            "depth_over_32": (b'{"a":' * depth) + b"0" + (b"}" * depth),
+        }
+        results = self.run_json_matrix(cases)
+        self.assertEqual(set(results), set(cases))
+        self.assertEqual(results["valid"]["kind"], "object")
+        self.assertEqual(results["valid"]["count"], 3)
+        self.assertEqual(results["empty_object"]["kind"], "object")
+        self.assertEqual(results["empty_object"]["count"], 0)
+        self.assertEqual(results["nested_scope_valid"]["kind"], "object")
+        self.assertEqual(results["nested_scope_valid"]["count"], 3)
+        for name in cases:
+            if name not in {"valid", "empty_object", "nested_scope_valid"}:
+                with self.subTest(json_case=name):
+                    self.assertEqual(results[name]["kind"], "null")
 
 
 

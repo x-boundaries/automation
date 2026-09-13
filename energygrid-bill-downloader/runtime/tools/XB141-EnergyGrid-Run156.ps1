@@ -55,6 +55,9 @@ $script:R156RemoteGitReadOnlySubcommands = @('ls-remote')
 $script:R156RemoteDestination = 'https://github.com/x-boundaries/automation.git'
 $script:R156GitOutputLimitBytes = [int64]65536
 $script:R156GitTimeoutMilliseconds = [int]15000
+$script:R156MetadataJsonLimitBytes = [int64]65536
+$script:R156MetadataJsonMaxDepth = [int]32
+$script:R156MetadataJsonMaxBytesPerRead = [int]8192
 $script:R156GitMetadataDirectory = 'C:\XB\automation\.git'
 $script:R156GitConfigPath = 'C:\XB\automation\.git\config'
 $script:R156GitIndexPath = 'C:\XB\automation\.git\index'
@@ -486,11 +489,6 @@ function Test-R156ProtectedInstallationRoot {
     }
 
     try {
-        $writeRights = (
-            [System.Security.AccessControl.FileSystemRights]::Write -bor
-            [System.Security.AccessControl.FileSystemRights]::Modify -bor
-            [System.Security.AccessControl.FileSystemRights]::FullControl
-        )
         foreach ($aclPath in @($ProgramFilesRoot, $InstallationRoot)) {
             $acl = Get-Acl -LiteralPath $aclPath
             foreach ($rule in @($acl.Access)) {
@@ -502,7 +500,7 @@ function Test-R156ProtectedInstallationRoot {
                 $broadIdentity = ($identity -cmatch
                     '(^|\\)(Everyone|Users|Authenticated Users|CREATOR OWNER)$')
                 if ($broadIdentity -and
-                    (($rule.FileSystemRights -band $writeRights) -ne 0)) {
+                    (Test-R156MutationCapableFileSystemRights -Rights $rule.FileSystemRights)) {
                     return $false
                 }
             }
@@ -512,6 +510,19 @@ function Test-R156ProtectedInstallationRoot {
     catch {
         return $false
     }
+}
+
+function Test-R156MutationCapableFileSystemRights {
+    param(
+        [Parameter(Mandatory)][System.Security.AccessControl.FileSystemRights]$Rights
+    )
+
+    # WriteData/CreateFiles 0x00000002; AppendData/CreateDirectories 0x00000004;
+    # WriteExtendedAttributes 0x00000010; DeleteSubdirectoriesAndFiles 0x00000040;
+    # WriteAttributes 0x00000100; Delete 0x00010000; ChangePermissions 0x00040000;
+    # TakeOwnership 0x00080000. Combined primitive mutation mask: 0x000D0156.
+    $mutationMask = [uint32]0x000D0156
+    return (([uint32]$Rights -band $mutationMask) -ne 0)
 }
 
 function Open-R156ReadOnlyHandle {
@@ -865,7 +876,7 @@ function New-R156GitProcessResult {
         [Parameter(Mandatory)][bool]$Started,
         [Parameter(Mandatory)][bool]$Success,
         [Parameter(Mandatory)][int]$ExitCode,
-        [Parameter(Mandatory)][byte[]]$StdoutBytes,
+        [Parameter(Mandatory)][AllowEmptyCollection()][byte[]]$StdoutBytes,
         [bool]$TimedOut = $false,
         [bool]$Overflow = $false
     )
@@ -881,15 +892,87 @@ function New-R156GitProcessResult {
     }
 }
 
+function Get-R156CompletedReadResult {
+    param(
+        [Parameter(Mandatory)]$Task,
+        [Parameter(Mandatory)][bool]$Active
+    )
+
+    if (-not $Active -or $null -eq $Task) {
+        return [pscustomobject]@{
+            Ready = $true
+            Success = $false
+            Count = 0
+            Faulted = $false
+            Canceled = $false
+            InvariantViolation = $true
+        }
+    }
+    if (-not $Task.IsCompleted) {
+        return [pscustomobject]@{
+            Ready = $false
+            Success = $true
+            Count = 0
+            Faulted = $false
+            Canceled = $false
+            InvariantViolation = $false
+        }
+    }
+    if ($Task.IsFaulted -or $Task.IsCanceled) {
+        return [pscustomobject]@{
+            Ready = $true
+            Success = $false
+            Count = 0
+            Faulted = [bool]$Task.IsFaulted
+            Canceled = [bool]$Task.IsCanceled
+            InvariantViolation = $false
+        }
+    }
+    try {
+        $count = [int]$Task.Result
+        if ($count -lt 0) {
+            return [pscustomobject]@{
+                Ready = $true
+                Success = $false
+                Count = 0
+                Faulted = $false
+                Canceled = $false
+                InvariantViolation = $true
+            }
+        }
+        return [pscustomobject]@{
+            Ready = $true
+            Success = $true
+            Count = $count
+            Faulted = $false
+            Canceled = $false
+            InvariantViolation = $false
+        }
+    }
+    catch {
+        return [pscustomobject]@{
+            Ready = $true
+            Success = $false
+            Count = 0
+            Faulted = $false
+            Canceled = $false
+            InvariantViolation = $true
+        }
+    }
+}
+
 function Invoke-R156BoundedProcess {
     param(
         [Parameter(Mandatory)][System.Diagnostics.ProcessStartInfo]$StartInfo,
         [Parameter(Mandatory)][ValidateRange(1, [int]::MaxValue)][int]$TimeoutMilliseconds,
-        [Parameter(Mandatory)][ValidateRange(1, [int64]::MaxValue)][int64]$MaximumOutputBytes
+        [Parameter(Mandatory)][ValidateRange(1, [int64]::MaxValue)][int64]$MaximumOutputBytes,
+        [Parameter(Mandatory)][ValidateRange(1, [int64]::MaxValue)][int64]$MaximumErrorBytes
     )
 
     $process = $null
     $stdoutStore = New-Object System.IO.MemoryStream
+    $started = $false
+    $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMilliseconds)
     try {
         $process = New-Object System.Diagnostics.Process
         $process.StartInfo = $StartInfo
@@ -907,82 +990,106 @@ function Invoke-R156BoundedProcess {
         $stderrTask = $stderrStream.ReadAsync($stderrBuffer, 0, $stderrBuffer.Length)
         $stdoutComplete = $false
         $stderrComplete = $false
-        $startedAt = [DateTime]::UtcNow
 
-        while (-not ($stdoutComplete -and $stderrComplete)) {
+        while ($true) {
+            if (($stdoutComplete -and $null -ne $stdoutTask) -or
+                (-not $stdoutComplete -and $null -eq $stdoutTask) -or
+                ($stderrComplete -and $null -ne $stderrTask) -or
+                (-not $stderrComplete -and $null -eq $stderrTask)) {
+                throw 'redirected stream state invariant failed'
+            }
+
             $progress = $false
-            if ($stdoutTask.IsCompleted) {
-                if ($stdoutTask.IsFaulted -or $stdoutTask.IsCanceled) {
+            if (-not $stdoutComplete) {
+                $stdoutRead = Get-R156CompletedReadResult -Task $stdoutTask -Active $true
+                if ($null -eq $stdoutRead -or -not $stdoutRead.Success -or
+                    $stdoutRead.InvariantViolation) {
                     return New-R156GitProcessResult -Started $true -Success $false -ExitCode -1 -StdoutBytes ([byte[]]@())
                 }
-                $count = [int]$stdoutTask.Result
-                $stdoutTask = $null
-                $progress = $true
-                if ($count -eq 0) {
-                    $stdoutComplete = $true
-                }
-                else {
-                    if (($stdoutStore.Length + $count) -gt $MaximumOutputBytes) {
-                        try {
-                            if (-not $process.HasExited) { $process.Kill() }
-                        }
-                        catch {
-                        }
-                        return New-R156GitProcessResult -Started $true -Success $false -ExitCode -1 -StdoutBytes ([byte[]]@()) -Overflow $true
+                if ($stdoutRead.Ready) {
+                    $count = [int]$stdoutRead.Count
+                    $stdoutTask = $null
+                    $progress = $true
+                    if ($count -eq 0) {
+                        $stdoutComplete = $true
                     }
-                    $stdoutStore.Write($stdoutBuffer, 0, $count)
-                    $stdoutTask = $stdoutStream.ReadAsync($stdoutBuffer, 0, $stdoutBuffer.Length)
+                    else {
+                        if (($stdoutStore.Length + $count) -gt $MaximumOutputBytes) {
+                            return New-R156GitProcessResult -Started $true -Success $false -ExitCode -1 -StdoutBytes ([byte[]]@()) -Overflow $true
+                        }
+                        $stdoutStore.Write($stdoutBuffer, 0, $count)
+                        $stdoutTask = $stdoutStream.ReadAsync($stdoutBuffer, 0, $stdoutBuffer.Length)
+                        if ($null -eq $stdoutTask) {
+                            throw 'stdout read task was not re-armed'
+                        }
+                    }
                 }
             }
-            if ($stderrTask.IsCompleted) {
-                if ($stderrTask.IsFaulted -or $stderrTask.IsCanceled) {
+
+            if (-not $stderrComplete) {
+                $stderrRead = Get-R156CompletedReadResult -Task $stderrTask -Active $true
+                if ($null -eq $stderrRead -or -not $stderrRead.Success -or
+                    $stderrRead.InvariantViolation) {
                     return New-R156GitProcessResult -Started $true -Success $false -ExitCode -1 -StdoutBytes ([byte[]]@())
                 }
-                $errorCount = [int]$stderrTask.Result
-                $stderrTask = $null
-                $progress = $true
-                if ($errorCount -eq 0) {
-                    $stderrComplete = $true
-                }
-                else {
-                    $stderrTotal = $stderrTotal + $errorCount
-                    if ($stderrTotal -gt $MaximumOutputBytes) {
-                        try {
-                            if (-not $process.HasExited) { $process.Kill() }
-                        }
-                        catch {
-                        }
-                        return New-R156GitProcessResult -Started $true -Success $false -ExitCode -1 -StdoutBytes ([byte[]]@()) -Overflow $true
+                if ($stderrRead.Ready) {
+                    $errorCount = [int]$stderrRead.Count
+                    $stderrTask = $null
+                    $progress = $true
+                    if ($errorCount -eq 0) {
+                        $stderrComplete = $true
                     }
-                    $stderrTask = $stderrStream.ReadAsync($stderrBuffer, 0, $stderrBuffer.Length)
+                    else {
+                        $stderrTotal = $stderrTotal + $errorCount
+                        if ($stderrTotal -gt $MaximumErrorBytes) {
+                            return New-R156GitProcessResult -Started $true -Success $false -ExitCode -1 -StdoutBytes ([byte[]]@()) -Overflow $true
+                        }
+                        $stderrTask = $stderrStream.ReadAsync($stderrBuffer, 0, $stderrBuffer.Length)
+                        if ($null -eq $stderrTask) {
+                            throw 'stderr read task was not re-armed'
+                        }
+                    }
                 }
             }
-            if (([DateTime]::UtcNow - $startedAt).TotalMilliseconds -ge $TimeoutMilliseconds) {
-                try {
-                    if (-not $process.HasExited) { $process.Kill() }
+
+            if ($stdoutComplete -and $stderrComplete -and $process.HasExited) {
+                $exitCode = [int]$process.ExitCode
+                if ($process.ExitCode -eq 0) {
+                    $bytes = [byte[]]$stdoutStore.ToArray()
+                    return New-R156GitProcessResult -Started $true -Success $true -ExitCode $exitCode -StdoutBytes $bytes
                 }
-                catch {
-                }
+                return New-R156GitProcessResult -Started $true -Success $false -ExitCode $exitCode -StdoutBytes ([byte[]]@())
+            }
+
+            if ([DateTime]::UtcNow -ge $deadline) {
                 return New-R156GitProcessResult -Started $true -Success $false -ExitCode -1 -StdoutBytes ([byte[]]@()) -TimedOut $true
             }
+
             if (-not $progress) {
                 Start-Sleep -Milliseconds 5
             }
         }
-
-        $process.WaitForExit()
-        $bytes = [byte[]]$stdoutStore.ToArray()
-        return New-R156GitProcessResult -Started $true -Success ($process.ExitCode -eq 0) -ExitCode ([int]$process.ExitCode) -StdoutBytes $bytes
     }
     catch {
-        return New-R156GitProcessResult -Started ($null -ne $process) -Success $false -ExitCode -1 -StdoutBytes ([byte[]]@())
+        return New-R156GitProcessResult -Started $started -Success $false -ExitCode -1 -StdoutBytes ([byte[]]@())
     }
     finally {
         if ($null -ne $stdoutStore) {
             $stdoutStore.Dispose()
         }
         if ($null -ne $process) {
-            $process.Dispose()
+            try {
+                if ($started -and -not $process.HasExited) {
+                    $process.Kill()
+                }
+            }
+            catch {
+            }
+            try {
+                $process.Dispose()
+            }
+            catch {
+            }
         }
     }
 }
@@ -1191,6 +1298,50 @@ function Test-R156LocalGitArguments {
     return $false
 }
 
+function Get-R156LocalGitOutputContract {
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Arguments
+    )
+
+    $items = @($Arguments)
+    if (-not (Test-R156LocalGitArguments -Arguments $items)) {
+        return $null
+    }
+
+    $command = Get-R156LocalGitCommandName -Arguments $items
+    $contract = [ordered]@{
+        StdoutLimitBytes = [int64]$script:R156GitOutputLimitBytes
+        RequireNonEmpty = $true
+        ExpectedBlobObject = $null
+        ExpectedBlobLength = $null
+    }
+    if ($command -ceq 'status') {
+        $contract.RequireNonEmpty = $false
+    }
+    elseif ($command -ceq 'cat-file' -and $items[1] -ceq 'blob') {
+        if ($items[2] -ceq [string]$script:R156LibraryGitBlob) {
+            $contract.StdoutLimitBytes = [int64]$script:R156LibraryGitBlobLength
+            $contract.ExpectedBlobObject = [string]$script:R156LibraryGitBlob
+            $contract.ExpectedBlobLength = [int64]$script:R156LibraryGitBlobLength
+        }
+        elseif ($items[2] -ceq [string]$script:R156InstallerGitBlob) {
+            $contract.StdoutLimitBytes = [int64]$script:R156InstallerGitBlobLength
+            $contract.ExpectedBlobObject = [string]$script:R156InstallerGitBlob
+            $contract.ExpectedBlobLength = [int64]$script:R156InstallerGitBlobLength
+        }
+        elseif ($items[2] -ceq [string]$script:R156LauncherGitBlob) {
+            $contract.StdoutLimitBytes = [int64]$script:R156LauncherGitBlobLength
+            $contract.ExpectedBlobObject = [string]$script:R156LauncherGitBlob
+            $contract.ExpectedBlobLength = [int64]$script:R156LauncherGitBlobLength
+        }
+        else {
+            return $null
+        }
+    }
+
+    return [pscustomobject]$contract
+}
+
 function Test-R156RemoteGitArguments {
     param([Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Arguments)
 
@@ -1209,12 +1360,30 @@ function Test-R156RemoteGitArguments {
 function Test-R156LocalGitOutput {
     param(
         [Parameter(Mandatory)][string[]]$Arguments,
-        [Parameter(Mandatory)][byte[]]$Bytes
+        [Parameter(Mandatory)][AllowEmptyCollection()][byte[]]$Bytes
     )
 
     $command = Get-R156LocalGitCommandName -Arguments $Arguments
+    $contract = Get-R156LocalGitOutputContract -Arguments $Arguments
+    if ($null -eq $contract) {
+        return $false
+    }
     if ($command -ceq 'status') {
         return ($Bytes.Length -eq 0)
+    }
+    if ($Bytes.Length -eq 0 -and $contract.RequireNonEmpty) {
+        return $false
+    }
+    if ($command -ceq 'cat-file' -and $Arguments[1] -ceq 'blob') {
+        if ($Bytes.Length -ne [int64]$contract.ExpectedBlobLength) {
+            return $false
+        }
+        try {
+            return ((Get-R156Sha1ForGitObject -Type 'blob' -Bytes $Bytes) -ceq [string]$contract.ExpectedBlobObject)
+        }
+        catch {
+            return $false
+        }
     }
     if ($command -ceq 'config') {
         return ($null -ne (Convert-R156ConfigBytes -Bytes $Bytes))
@@ -1237,6 +1406,10 @@ function Invoke-R156LocalGitRead {
         return New-R156GitProcessResult -Started $false -Success $false -ExitCode -1 -StdoutBytes ([byte[]]@())
     }
     if (-not (Test-R156LocalGitArguments -Arguments $Arguments)) {
+        return New-R156GitProcessResult -Started $false -Success $false -ExitCode -1 -StdoutBytes ([byte[]]@())
+    }
+    $outputContract = Get-R156LocalGitOutputContract -Arguments $Arguments
+    if ($null -eq $outputContract) {
         return New-R156GitProcessResult -Started $false -Success $false -ExitCode -1 -StdoutBytes ([byte[]]@())
     }
 
@@ -1279,7 +1452,7 @@ function Invoke-R156LocalGitRead {
     $startInfo.EnvironmentVariables['GIT_CONFIG_SYSTEM'] = 'NUL'
     $startInfo.EnvironmentVariables['GIT_CONFIG_GLOBAL'] = 'NUL'
 
-    $result = Invoke-R156BoundedProcess -StartInfo $startInfo -TimeoutMilliseconds $script:R156GitTimeoutMilliseconds -MaximumOutputBytes $script:R156GitOutputLimitBytes
+    $result = Invoke-R156BoundedProcess -StartInfo $startInfo -TimeoutMilliseconds $script:R156GitTimeoutMilliseconds -MaximumOutputBytes $outputContract.StdoutLimitBytes -MaximumErrorBytes $script:R156GitOutputLimitBytes
     if (-not $result.Success -or
         -not (Test-R156LocalGitOutput -Arguments $Arguments -Bytes $result.StdoutBytes)) {
         return New-R156GitProcessResult -Started $result.Started -Success $false -ExitCode $result.ExitCode -StdoutBytes ([byte[]]@()) -TimedOut $result.TimedOut -Overflow $result.Overflow
@@ -1381,7 +1554,7 @@ function Invoke-R156RemoteHeadProof {
     $startInfo.EnvironmentVariables['GIT_CEILING_DIRECTORIES'] = $isolation.CeilingDirectory
     $startInfo.EnvironmentVariables['GCM_INTERACTIVE'] = '0'
 
-    $result = Invoke-R156BoundedProcess -StartInfo $startInfo -TimeoutMilliseconds $script:R156GitTimeoutMilliseconds -MaximumOutputBytes $script:R156GitOutputLimitBytes
+    $result = Invoke-R156BoundedProcess -StartInfo $startInfo -TimeoutMilliseconds $script:R156GitTimeoutMilliseconds -MaximumOutputBytes $script:R156GitOutputLimitBytes -MaximumErrorBytes $script:R156GitOutputLimitBytes
     if (-not $result.Success) {
         return New-R156GitProcessResult -Started $result.Started -Success $false -ExitCode $result.ExitCode -StdoutBytes ([byte[]]@()) -TimedOut $result.TimedOut -Overflow $result.Overflow
     }
@@ -1777,6 +1950,491 @@ function Test-R156PowerShellParse {
     }
     catch {
         return $false
+    }
+}
+
+function Skip-R156JsonWhitespace {
+    param(
+        [Parameter(Mandatory)][string]$Text,
+        [Parameter(Mandatory)][ref]$Index
+    )
+
+    $position = [int]$Index.Value
+    while ($position -lt $Text.Length) {
+        $code = [int][char]$Text[$position]
+        if ($code -ne 0x20 -and $code -ne 0x09 -and
+            $code -ne 0x0A -and $code -ne 0x0D) {
+            break
+        }
+        $position++
+    }
+    $Index.Value = $position
+}
+
+function Get-R156JsonHexValue {
+    param([Parameter(Mandatory)][char]$Character)
+
+    $code = [int]$Character
+    if ($code -ge 0x30 -and $code -le 0x39) {
+        return ($code - 0x30)
+    }
+    if ($code -ge 0x41 -and $code -le 0x46) {
+        return ($code - 0x41 + 10)
+    }
+    if ($code -ge 0x61 -and $code -le 0x66) {
+        return ($code - 0x61 + 10)
+    }
+    return -1
+}
+
+function Get-R156JsonString {
+    param(
+        [Parameter(Mandatory)][string]$Text,
+        [Parameter(Mandatory)][ref]$Index,
+        [Parameter(Mandatory)][ref]$Success
+    )
+
+    $Success.Value = $false
+    $position = [int]$Index.Value
+    if ($position -ge $Text.Length -or
+        [int][char]$Text[$position] -ne 0x22) {
+        return ''
+    }
+    $position++
+    $builder = New-Object System.Text.StringBuilder
+    while ($position -lt $Text.Length) {
+        $character = [char]$Text[$position]
+        $position++
+        if ([int]$character -eq 0x22) {
+            $Index.Value = $position
+            $Success.Value = $true
+            return $builder.ToString()
+        }
+        if ([int]$character -eq 0x5C) {
+            if ($position -ge $Text.Length) {
+                return ''
+            }
+            $escapeCode = [int][char]$Text[$position]
+            $position++
+            if ($escapeCode -eq 0x22) {
+                [void]$builder.Append([char]0x22)
+            }
+            elseif ($escapeCode -eq 0x5C) {
+                [void]$builder.Append([char]0x5C)
+            }
+            elseif ($escapeCode -eq 0x2F) {
+                [void]$builder.Append([char]0x2F)
+            }
+            elseif ($escapeCode -eq 0x62) {
+                [void]$builder.Append([char]0x08)
+            }
+            elseif ($escapeCode -eq 0x66) {
+                [void]$builder.Append([char]0x0C)
+            }
+            elseif ($escapeCode -eq 0x6E) {
+                [void]$builder.Append([char]0x0A)
+            }
+            elseif ($escapeCode -eq 0x72) {
+                [void]$builder.Append([char]0x0D)
+            }
+            elseif ($escapeCode -eq 0x74) {
+                [void]$builder.Append([char]0x09)
+            }
+            elseif ($escapeCode -eq 0x75) {
+                if (($position + 4) -gt $Text.Length) {
+                    return ''
+                }
+                $value = 0
+                for ($offset = 0; $offset -lt 4; $offset++) {
+                    $hex = Get-R156JsonHexValue -Character $Text[$position + $offset]
+                    if ($hex -lt 0) {
+                        return ''
+                    }
+                    $value = ($value * 16) + $hex
+                }
+                $position += 4
+                [void]$builder.Append([char]$value)
+            }
+            else {
+                return ''
+            }
+            continue
+        }
+        if ([int]$character -lt 0x20) {
+            return ''
+        }
+        [void]$builder.Append($character)
+    }
+    return ''
+}
+
+function Test-R156JsonNumber {
+    param(
+        [Parameter(Mandatory)][string]$Text,
+        [Parameter(Mandatory)][ref]$Index
+    )
+
+    $position = [int]$Index.Value
+    if ($position -lt $Text.Length -and
+        [int][char]$Text[$position] -eq 0x2D) {
+        $position++
+    }
+    if ($position -ge $Text.Length) {
+        return $false
+    }
+
+    $firstCode = [int][char]$Text[$position]
+    if ($firstCode -eq 0x30) {
+        $position++
+        if ($position -lt $Text.Length) {
+            $nextCode = [int][char]$Text[$position]
+            if ($nextCode -ge 0x30 -and $nextCode -le 0x39) {
+                return $false
+            }
+        }
+    }
+    elseif ($firstCode -ge 0x31 -and $firstCode -le 0x39) {
+        while ($position -lt $Text.Length) {
+            $nextCode = [int][char]$Text[$position]
+            if ($nextCode -lt 0x30 -or $nextCode -gt 0x39) {
+                break
+            }
+            $position++
+        }
+    }
+    else {
+        return $false
+    }
+
+    if ($position -lt $Text.Length -and
+        [int][char]$Text[$position] -eq 0x2E) {
+        $position++
+        if ($position -ge $Text.Length) {
+            return $false
+        }
+        $fractionCode = [int][char]$Text[$position]
+        if ($fractionCode -lt 0x30 -or $fractionCode -gt 0x39) {
+            return $false
+        }
+        while ($position -lt $Text.Length) {
+            $nextCode = [int][char]$Text[$position]
+            if ($nextCode -lt 0x30 -or $nextCode -gt 0x39) {
+                break
+            }
+            $position++
+        }
+    }
+
+    if ($position -lt $Text.Length) {
+        $exponentCode = [int][char]$Text[$position]
+        if ($exponentCode -eq 0x45 -or $exponentCode -eq 0x65) {
+            $position++
+            if ($position -lt $Text.Length) {
+                $signCode = [int][char]$Text[$position]
+                if ($signCode -eq 0x2B -or $signCode -eq 0x2D) {
+                    $position++
+                }
+            }
+            if ($position -ge $Text.Length) {
+                return $false
+            }
+            $exponentDigit = [int][char]$Text[$position]
+            if ($exponentDigit -lt 0x30 -or $exponentDigit -gt 0x39) {
+                return $false
+            }
+            while ($position -lt $Text.Length) {
+                $nextCode = [int][char]$Text[$position]
+                if ($nextCode -lt 0x30 -or $nextCode -gt 0x39) {
+                    break
+                }
+                $position++
+            }
+        }
+    }
+
+    $Index.Value = $position
+    return $true
+}
+
+function Test-R156JsonLiteral {
+    param(
+        [Parameter(Mandatory)][string]$Text,
+        [Parameter(Mandatory)][ref]$Index
+    )
+
+    $position = [int]$Index.Value
+    foreach ($literal in @('true', 'false', 'null')) {
+        if (($position + $literal.Length) -le $Text.Length -and
+            [string]::Equals(
+                $Text.Substring($position, $literal.Length),
+                $literal,
+                [StringComparison]::Ordinal)) {
+            $Index.Value = $position + $literal.Length
+            return $true
+        }
+    }
+    return $false
+}
+
+function Test-R156JsonValue {
+    param(
+        [Parameter(Mandatory)][string]$Text,
+        [Parameter(Mandatory)][ref]$Index,
+        [Parameter(Mandatory)][int]$Depth
+    )
+
+    $position = [int]$Index.Value
+    if ($position -ge $Text.Length) {
+        return $false
+    }
+    $code = [int][char]$Text[$position]
+    if ($code -eq 0x7B) {
+        $valid = Test-R156JsonObject -Text $Text -Index ([ref]$position) -Depth $Depth
+        $Index.Value = $position
+        return $valid
+    }
+    if ($code -eq 0x5B) {
+        $valid = Test-R156JsonArray -Text $Text -Index ([ref]$position) -Depth $Depth
+        $Index.Value = $position
+        return $valid
+    }
+    if ($code -eq 0x22) {
+        $stringSuccess = $false
+        [void](Get-R156JsonString -Text $Text -Index ([ref]$position) -Success ([ref]$stringSuccess))
+        $Index.Value = $position
+        return $stringSuccess
+    }
+    if ($code -eq 0x2D -or ($code -ge 0x30 -and $code -le 0x39)) {
+        $valid = Test-R156JsonNumber -Text $Text -Index ([ref]$position)
+        $Index.Value = $position
+        return $valid
+    }
+    $valid = Test-R156JsonLiteral -Text $Text -Index ([ref]$position)
+    $Index.Value = $position
+    return $valid
+}
+
+function Test-R156JsonObject {
+    param(
+        [Parameter(Mandatory)][string]$Text,
+        [Parameter(Mandatory)][ref]$Index,
+        [Parameter(Mandatory)][int]$Depth
+    )
+
+    if ($Depth -gt $script:R156MetadataJsonMaxDepth) {
+        return $false
+    }
+    $position = [int]$Index.Value
+    if ($position -ge $Text.Length -or
+        [int][char]$Text[$position] -ne 0x7B) {
+        return $false
+    }
+    $position++
+    Skip-R156JsonWhitespace -Text $Text -Index ([ref]$position)
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    if ($position -lt $Text.Length -and
+        [int][char]$Text[$position] -eq 0x7D) {
+        $Index.Value = $position + 1
+        return $true
+    }
+
+    while ($position -lt $Text.Length) {
+        if ([int][char]$Text[$position] -ne 0x22) {
+            return $false
+        }
+        $nameSuccess = $false
+        $name = Get-R156JsonString -Text $Text -Index ([ref]$position) -Success ([ref]$nameSuccess)
+        if (-not $nameSuccess -or -not $seen.Add([string]$name)) {
+            return $false
+        }
+        Skip-R156JsonWhitespace -Text $Text -Index ([ref]$position)
+        if ($position -ge $Text.Length -or
+            [int][char]$Text[$position] -ne 0x3A) {
+            return $false
+        }
+        $position++
+        Skip-R156JsonWhitespace -Text $Text -Index ([ref]$position)
+        if (-not (Test-R156JsonValue -Text $Text -Index ([ref]$position) -Depth ($Depth + 1))) {
+            return $false
+        }
+        Skip-R156JsonWhitespace -Text $Text -Index ([ref]$position)
+        if ($position -ge $Text.Length) {
+            return $false
+        }
+        $separator = [int][char]$Text[$position]
+        if ($separator -eq 0x7D) {
+            $Index.Value = $position + 1
+            return $true
+        }
+        if ($separator -ne 0x2C) {
+            return $false
+        }
+        $position++
+        Skip-R156JsonWhitespace -Text $Text -Index ([ref]$position)
+    }
+    return $false
+}
+
+function Test-R156JsonArray {
+    param(
+        [Parameter(Mandatory)][string]$Text,
+        [Parameter(Mandatory)][ref]$Index,
+        [Parameter(Mandatory)][int]$Depth
+    )
+
+    if ($Depth -gt $script:R156MetadataJsonMaxDepth) {
+        return $false
+    }
+    $position = [int]$Index.Value
+    if ($position -ge $Text.Length -or
+        [int][char]$Text[$position] -ne 0x5B) {
+        return $false
+    }
+    $position++
+    Skip-R156JsonWhitespace -Text $Text -Index ([ref]$position)
+    if ($position -lt $Text.Length -and
+        [int][char]$Text[$position] -eq 0x5D) {
+        $Index.Value = $position + 1
+        return $true
+    }
+
+    $count = 0
+    while ($position -lt $Text.Length) {
+        if ($count -ge 65536 -or
+            -not (Test-R156JsonValue -Text $Text -Index ([ref]$position) -Depth ($Depth + 1))) {
+            return $false
+        }
+        $count++
+        Skip-R156JsonWhitespace -Text $Text -Index ([ref]$position)
+        if ($position -ge $Text.Length) {
+            return $false
+        }
+        $separator = [int][char]$Text[$position]
+        if ($separator -eq 0x5D) {
+            $Index.Value = $position + 1
+            return $true
+        }
+        if ($separator -ne 0x2C) {
+            return $false
+        }
+        $position++
+        Skip-R156JsonWhitespace -Text $Text -Index ([ref]$position)
+    }
+    return $false
+}
+
+function Test-R156StrictJsonBytes {
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][byte[]]$Bytes
+    )
+
+    $reader = $null
+    try {
+        if ($null -eq $Bytes -or
+            $Bytes.Length -eq 0 -or
+            $Bytes.Length -gt $script:R156MetadataJsonLimitBytes) {
+            return $false
+        }
+        if ($Bytes.Length -ge 3 -and
+            $Bytes[0] -eq 0xEF -and
+            $Bytes[1] -eq 0xBB -and
+            $Bytes[2] -eq 0xBF) {
+            return $false
+        }
+        $text = Convert-R156Utf8Bytes -Bytes $Bytes
+        if ($null -eq $text -or $text.Length -eq 0) {
+            return $false
+        }
+
+        $position = 0
+        Skip-R156JsonWhitespace -Text $text -Index ([ref]$position)
+        if ($position -ge $text.Length -or
+            [int][char]$text[$position] -ne 0x7B -or
+            -not (Test-R156JsonObject -Text $text -Index ([ref]$position) -Depth 1)) {
+            return $false
+        }
+        Skip-R156JsonWhitespace -Text $text -Index ([ref]$position)
+        if ($position -ne $text.Length) {
+            return $false
+        }
+
+        [void](Add-Type -AssemblyName System.Runtime.Serialization -ErrorAction Stop)
+        [void](Add-Type -AssemblyName System.Xml -ErrorAction Stop)
+        $quotas = New-Object System.Xml.XmlDictionaryReaderQuotas
+        $quotas.MaxDepth = [int]$script:R156MetadataJsonMaxDepth
+        $quotas.MaxStringContentLength = [int]$script:R156MetadataJsonLimitBytes
+        $quotas.MaxArrayLength = [int]$script:R156MetadataJsonLimitBytes
+        $quotas.MaxBytesPerRead = [int]$script:R156MetadataJsonMaxBytesPerRead
+        $quotas.MaxNameTableCharCount = [int]$script:R156MetadataJsonLimitBytes
+        $reader = [System.Runtime.Serialization.Json.JsonReaderWriterFactory]::CreateJsonReader(
+            $Bytes,
+            0,
+            $Bytes.Length,
+            [System.Text.Encoding]::UTF8,
+            $quotas,
+            $null
+        )
+        $rootStartCount = 0
+        $rootEndCount = 0
+        while ($reader.Read()) {
+            if ($reader.NodeType -eq [System.Xml.XmlNodeType]::Element -and
+                [int]$reader.Depth -eq 0 -and
+                $reader.LocalName -ceq 'root') {
+                $rootStartCount++
+            }
+            elseif ($reader.NodeType -eq [System.Xml.XmlNodeType]::EndElement -and
+                [int]$reader.Depth -eq 0 -and
+                $reader.LocalName -ceq 'root') {
+                $rootEndCount++
+            }
+        }
+        return ($rootStartCount -eq 1 -and $rootEndCount -eq 1)
+    }
+    catch {
+        return $false
+    }
+    finally {
+        if ($null -ne $reader) {
+            try { $reader.Close() } catch { }
+        }
+    }
+}
+
+function Read-R156StrictJsonObject {
+    param([Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Path)
+
+    $handle = $null
+    try {
+        $handle = Open-R156ReadOnlyHandle -Path $Path
+        if ($null -eq $handle) {
+            return $null
+        }
+        $length = [int64]$handle.Length
+        if ($length -le 0 -or $length -gt $script:R156MetadataJsonLimitBytes) {
+            return $null
+        }
+        $bytes = Read-R156HandleBytes -Handle $handle -MaximumBytes $script:R156MetadataJsonLimitBytes
+        if ($null -eq $bytes -or $bytes.Length -ne $length -or
+            -not (Test-R156StrictJsonBytes -Bytes $bytes)) {
+            return $null
+        }
+        $text = Convert-R156Utf8Bytes -Bytes $bytes
+        if ($null -eq $text) {
+            return $null
+        }
+        $object = ConvertFrom-Json -InputObject $text -ErrorAction Stop
+        if ($null -eq $object -or $object -isnot [pscustomobject]) {
+            return $null
+        }
+        return $object
+    }
+    catch {
+        return $null
+    }
+    finally {
+        if ($null -ne $handle) {
+            try { $handle.Dispose() } catch { }
+        }
     }
 }
 
