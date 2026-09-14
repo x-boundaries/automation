@@ -775,6 +775,31 @@ foreach ($file in $files) {
     def remote_record(head):
         return f"{head}\trefs/heads/main\n".encode("ascii")
 
+    def preimage_production_source(self, manifest_source=None):
+        """Extract the production preimage functions without loading the helper."""
+        function_ranges = (
+            ("function Test-R156CommitText", "function Convert-R156BytesToHex"),
+            ("function Convert-R156BytesToHex", "function Get-R156Sha256ForBytes"),
+            ("function Get-R156Sha256ForBytes", "function Get-R156Properties"),
+            ("function Get-R156FullPath", "function Test-R156SamePath"),
+            ("function Test-R156SamePath", "function Test-R156PathWithin"),
+            ("function Test-R156PathWithin", "function Test-R156NormalDirectory"),
+            ("function Test-R156CanonicalOrigin", "function Test-R156ClassAClassification"),
+            ("function Test-R156RepositoryIdentity", "function Test-R156RepositoryFence"),
+            ("function Test-R156RepositoryFence", "function Get-R156SingleGitLine"),
+            ("function Test-R156ClassAClassification", "function Get-R156ClassAPaths"),
+            ("function Read-R156ManifestState", "function Get-R156DirectChildren"),
+            ("function Assert-R156PostProof", "$tokenContext = $null"),
+        )
+        blocks = []
+        for signature, next_signature in function_ranges:
+            if signature == "function Read-R156ManifestState" and manifest_source is not None:
+                block = manifest_source
+            else:
+                block = self.source_function(signature, next_signature)
+            blocks.append(block.rstrip())
+        return "\n\n".join(blocks)
+
     def run_preimage_boundary_case(
         self,
         *,
@@ -788,53 +813,221 @@ foreach ($file in $files) {
         parent_count=1,
         manifest_sequence=None,
         post_admission=CURRENT_HEAD,
+        _manifest_source=None,
     ):
-        """Exercise a synthetic boundary harness, never the complete helper."""
+        """Exercise extracted production gates in a synthetic, side-effect-free fixture."""
         manifests = list(manifest_sequence or [expected_installed] * 3)
         self.assertEqual(len(manifests), 3)
-        script = (
-            self.extracted_functions(("Test-R156CommitText",))
-            + r'''
+        with tempfile.TemporaryDirectory(prefix="r156_preimage_fixture_") as directory:
+            fixture_root = Path(directory)
+            (fixture_root / "launcher.ps1").write_bytes(b"# synthetic launcher\n")
+            (fixture_root / "launcher_lib.ps1").write_bytes(b"# synthetic library\n")
+            script = (
+                self.preimage_production_source(_manifest_source)
+                + r'''
 $ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+
+$script:R156ExpectedBranch = 'main'
+$script:R156CanonicalOrigins = @('https://github.com/x-boundaries/automation')
+$script:R156ManifestFileName = 'installation_manifest.json'
+$script:R156PackageNames = @('launcher.ps1', 'launcher_lib.ps1', 'installation_manifest.json')
+$script:R156ManifestNames = @('launcher.ps1', 'launcher_lib.ps1')
+$script:R156ManifestSchema = 'eg_launcher_installation_manifest/v1'
+$script:R156ProgramData = 'C:\Synthetic\ProgramData'
 $script:R156ExpectedHeadAtExecution = ''
 $script:R156ExpectedTreeAtExecution = ''
 $script:R156ExpectedParentAtExecution = ''
 $script:R156ExpectedInstalledAdmissionAtExecution = ''
-$script:R156SyntheticManifestAdmissions = @(
+$script:R156PostManifest = 'NOT_RUN'
+$script:R156PostPackageManifest = 'NOT_RUN'
+$script:R156CanonicalEquivalence = 'NOT_RUN'
+$script:R156LauncherClassification = 'NOT_RUN'
+$script:R156RepositoryContinuity = 'NOT_RUN'
+$script:R156SyntheticRoot = [string]$env:R156_SYNTH_ROOT
+$script:R156SyntheticCandidate = $script:R156SyntheticRoot
+$script:R156SyntheticManifestAdmissions = [string[]]@(
     [string]$env:R156_SYNTH_MANIFEST_1,
     [string]$env:R156_SYNTH_MANIFEST_2,
     [string]$env:R156_SYNTH_MANIFEST_3
 )
-$script:R156SyntheticReadIndex = 0
-$script:R156SyntheticReadCount = 0
+$script:R156SyntheticPostAdmission = [string]$env:R156_SYNTH_POST_ADMISSION
+$script:R156SyntheticPhase = 'PRE'
+$script:R156SyntheticPreReadIndex = 0
+$script:R156SyntheticPreReadCount = 0
+$script:R156SyntheticPostReadCount = 0
+$script:R156SyntheticLastAdmission = ''
 $script:R156SyntheticRealInstallerInvocations = 0
+$script:R156SyntheticSupportRef = ''
+$script:R156SyntheticNormalFiles = [string[]]@(
+    'C:\XB\automation\.git\config',
+    'C:\XB\automation\.git\index',
+    (Join-Path $script:R156SyntheticCandidate 'launcher.ps1'),
+    (Join-Path $script:R156SyntheticCandidate 'launcher_lib.ps1'),
+    (Join-Path $script:R156SyntheticCandidate 'installation_manifest.json')
+)
 
-function Test-SyntheticRepositoryFence {
-    param(
-        [Parameter(Mandatory)]$ActualHead,
-        [Parameter(Mandatory)]$ActualTree,
-        [Parameter(Mandatory)]$ActualParent,
-        [Parameter(Mandatory)][int]$ActualParentCount
-    )
+# These stubs are environmental seams only. The admission comparison, repository
+# identity/fence, and post-proof bodies above are extracted from production.
+function Test-R156NormalDirectory {
+    param([Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Path)
+    return ([string]$Path -ceq 'C:\XB\automation\.git')
+}
 
-    return (
-        [string]$ActualHead -ceq $script:R156ExpectedHeadAtExecution -and
-        [string]$ActualTree -ceq $script:R156ExpectedTreeAtExecution -and
-        [string]$ActualParent -ceq $script:R156ExpectedParentAtExecution -and
-        $ActualParentCount -eq 1
+function Test-R156NormalFile {
+    param([Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Path)
+    return (@($script:R156SyntheticNormalFiles) -contains [string]$Path)
+}
+
+function Test-R156NoReparseAncestors {
+    param([Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Path)
+    return $true
+}
+
+function Get-EgLauncherRootClassification {
+    param([Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$LauncherRootPath)
+    return [pscustomobject]@{
+        Pass = $true
+        ClassA = @('launcher.ps1', 'launcher_lib.ps1', 'installation_manifest.json')
+        ClassB = @()
+        ClassC = @()
+        MissingMembers = @()
+    }
+}
+
+function Get-R156ClassAPaths {
+    param([Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$LauncherRoot)
+    return [string[]]@(
+        (Join-Path $LauncherRoot 'launcher.ps1'),
+        (Join-Path $LauncherRoot 'launcher_lib.ps1'),
+        (Join-Path $LauncherRoot 'installation_manifest.json')
     )
 }
 
-function Read-SyntheticManifestState {
-    $script:R156SyntheticReadCount++
-    $admission = [string]$script:R156SyntheticManifestAdmissions[$script:R156SyntheticReadIndex]
-    $script:R156SyntheticReadIndex++
-    if ([string]::IsNullOrEmpty($admission) -or
-        $admission -cne $script:R156ExpectedInstalledAdmissionAtExecution -or
-        $admission -ceq $script:R156ExpectedHeadAtExecution) {
+function Read-R156StrictJsonObject {
+    param([Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Path)
+    $expectedPath = Join-Path $script:R156SyntheticCandidate $script:R156ManifestFileName
+    if (-not [string]::Equals($Path, $expectedPath, [StringComparison]::OrdinalIgnoreCase)) {
         return $null
     }
-    return [pscustomobject]@{ Admission = $admission }
+    if ($script:R156SyntheticPhase -ceq 'PRE') {
+        $index = [int]$script:R156SyntheticPreReadIndex
+        if ($index -ge $script:R156SyntheticManifestAdmissions.Count) {
+            return $null
+        }
+        $admission = [string]$script:R156SyntheticManifestAdmissions[$index]
+        $script:R156SyntheticPreReadIndex = $index + 1
+        $script:R156SyntheticPreReadCount++
+    }
+    else {
+        $admission = [string]$script:R156SyntheticPostAdmission
+        $script:R156SyntheticPostReadCount++
+    }
+    $script:R156SyntheticLastAdmission = $admission
+    return [pscustomobject]@{
+        schema_version = $script:R156ManifestSchema
+        admission_commit = $admission
+    }
+}
+
+function Test-EgInstallationManifestShape {
+    param([Parameter(Mandatory)]$ManifestObject)
+    return [pscustomobject]@{ Pass = $true }
+}
+
+function Compare-EgInstalledPackageToManifest {
+    param([Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$LauncherRootPath)
+    return [pscustomobject]@{ Pass = $true }
+}
+
+function Test-R156PowerShellParse {
+    param(
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Path,
+        [Parameter(Mandatory)][byte[]]$Bytes
+    )
+    return $true
+}
+
+function Stop-R156Gate {
+    param([Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$SupportRef)
+    $script:R156SyntheticSupportRef = $SupportRef
+    throw 'synthetic bounded gate stop'
+}
+
+function Read-R156Locator {
+    param([Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$LocatorPath)
+    return [pscustomobject]@{
+        RuntimeRoot = 'C:\Synthetic\Runtime'
+        Metadata = 'stable'
+    }
+}
+
+function Test-R156LocatorContinuity {
+    param([Parameter(Mandatory)]$Before, [Parameter(Mandatory)]$After)
+    return $true
+}
+
+function Resolve-R156Topology {
+    param(
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$RuntimeRoot,
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$CheckoutRoot
+    )
+    return [pscustomobject]@{ Candidate = $script:R156SyntheticCandidate }
+}
+
+function Test-R156TopologyContinuity {
+    param([Parameter(Mandatory)]$Before, [Parameter(Mandatory)]$After)
+    return $true
+}
+
+function Test-R156PrivateBindingsOutsideCheckout {
+    param(
+        [Parameter(Mandatory)]$Topology,
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$CheckoutRoot
+    )
+    return $true
+}
+
+function Test-R156LocatorSecurity {
+    param(
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$ProgramData,
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$LocatorPath,
+        [Parameter(Mandatory)]$TokenContext
+    )
+    return $true
+}
+
+function Test-R156LauncherSecurity {
+    param(
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$LauncherRoot,
+        [Parameter(Mandatory)]$ClassAPath,
+        [Parameter(Mandatory)]$TokenContext
+    )
+    return $true
+}
+
+$script:R156SyntheticRepositoryState = [pscustomobject]@{
+    Branch = 'main'
+    Head = ([string]$env:R156_SYNTH_ACTUAL_HEAD).ToLowerInvariant()
+    Tree = ([string]$env:R156_SYNTH_ACTUAL_TREE).ToLowerInvariant()
+    Parent = ([string]$env:R156_SYNTH_ACTUAL_PARENT).ToLowerInvariant()
+    ParentCount = [int]$env:R156_SYNTH_PARENT_COUNT
+    TopLevel = 'C:\XB\automation'
+    InsideWorkTree = 'true'
+    GitDirectory = 'C:\XB\automation\.git'
+    CommonDirectory = 'C:\XB\automation\.git'
+    ConfigAdmission = [pscustomobject]@{
+        Pass = $true
+        InstalledAdmission = [string]$env:R156_SYNTH_INSTALLED_PROVENANCE
+    }
+    Origin = [string[]]@('https://github.com/x-boundaries/automation')
+    Clean = $true
+    ReadOk = $true
+}
+
+function Get-R156RepositoryState {
+    param([Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$RepositoryRoot)
+    return $script:R156SyntheticRepositoryState
 }
 
 function Invoke-SyntheticR156Boundary {
@@ -843,24 +1036,26 @@ function Invoke-SyntheticR156Boundary {
         [Parameter(Mandatory)][string]$ExpectedTree,
         [Parameter(Mandatory)][string]$ExpectedParent,
         [Parameter(Mandatory)][string]$ExpectedInstalledAdmission,
-        [Parameter(Mandatory)][string]$ActualHead,
-        [Parameter(Mandatory)][string]$ActualTree,
-        [Parameter(Mandatory)][string]$ActualParent,
-        [Parameter(Mandatory)][int]$ActualParentCount,
         [Parameter(Mandatory)][string]$PostAdmission
     )
 
     $result = [ordered]@{
         admission_valid = $false
         repository_fence = $false
+        repository_fence_exercised = $false
         expected_parent_state = ''
         expected_installed_state = ''
         stale_reads = 0
+        production_manifest_reads = 0
+        manifest_guard_rejection_observed = $false
         pre_dispatch_passed = $false
         real_installer_invocations = 0
+        synthetic_dispatch_boundary = $false
         transport_admission = ''
+        post_proof_exercised = $false
         post_proof_current = $false
         post_proof_stale = $false
+        post_proof_terminal = 'NOT_RUN'
         terminal = 'BLOCKED'
     }
     if (-not (Test-R156CommitText -Value $ExpectedHead) -or
@@ -878,24 +1073,72 @@ function Invoke-SyntheticR156Boundary {
     $result.expected_parent_state = $script:R156ExpectedParentAtExecution
     $result.expected_installed_state = $script:R156ExpectedInstalledAdmissionAtExecution
 
-    if (-not (Test-SyntheticRepositoryFence -ActualHead $ActualHead -ActualTree $ActualTree -ActualParent $ActualParent -ActualParentCount $ActualParentCount)) {
+    $result.repository_fence_exercised = $true
+    $repositoryFence = Test-R156RepositoryFence `
+        -State $script:R156SyntheticRepositoryState `
+        -RepositoryRoot 'C:\XB\automation' `
+        -ExpectedHeadValue $script:R156ExpectedHeadAtExecution `
+        -ExpectedTreeValue $script:R156ExpectedTreeAtExecution `
+        -ExpectedParentValue $script:R156ExpectedParentAtExecution
+    $result.repository_fence = [bool]$repositoryFence
+    if (-not $result.repository_fence) {
         return [pscustomobject]$result
     }
-    $result.repository_fence = $true
 
+    $canonicalSources = [ordered]@{}
+    foreach ($name in @('launcher.ps1', 'launcher_lib.ps1')) {
+        $path = Join-Path $script:R156SyntheticCandidate $name
+        $bytes = [System.IO.File]::ReadAllBytes($path)
+        $canonicalSources[$name] = [pscustomobject]@{
+            Sha256 = (Get-R156Sha256ForBytes -Bytes $bytes)
+            ByteLength = [int64]$bytes.Length
+        }
+    }
+
+    $script:R156SyntheticPhase = 'PRE'
     for ($index = 0; $index -lt 3; $index++) {
-        if ($null -eq (Read-SyntheticManifestState)) {
-            $result.stale_reads = [int]$script:R156SyntheticReadCount
+        $manifest = Read-R156ManifestState `
+            -LauncherRoot $script:R156SyntheticCandidate `
+            -ExpectedAdmission $script:R156ExpectedInstalledAdmissionAtExecution `
+            -CanonicalSources $canonicalSources
+        if ($null -eq $manifest) {
+            $result.stale_reads = [int]$script:R156SyntheticPreReadCount
+            $result.production_manifest_reads = [int]$script:R156SyntheticPreReadCount
+            $result.manifest_guard_rejection_observed = (
+                [string]$script:R156SyntheticLastAdmission -cne
+                $script:R156ExpectedInstalledAdmissionAtExecution
+            )
             return [pscustomobject]$result
         }
     }
-    $result.stale_reads = [int]$script:R156SyntheticReadCount
+    $result.stale_reads = [int]$script:R156SyntheticPreReadCount
+    $result.production_manifest_reads = [int]$script:R156SyntheticPreReadCount
     $result.pre_dispatch_passed = $true
     $script:R156SyntheticRealInstallerInvocations = 1
     $result.real_installer_invocations = [int]$script:R156SyntheticRealInstallerInvocations
+    $result.synthetic_dispatch_boundary = $true
     $result.transport_admission = $script:R156ExpectedHeadAtExecution
-    $result.post_proof_current = [string]$PostAdmission -ceq $script:R156ExpectedHeadAtExecution
-    $result.post_proof_stale = [string]$PostAdmission -ceq $script:R156ExpectedInstalledAdmissionAtExecution
+
+    $script:R156SyntheticPhase = 'POST'
+    $result.post_proof_exercised = $true
+    $postOutcome = 'BLOCKED'
+    try {
+        Assert-R156PostProof `
+            -LocatorPath (Join-Path $script:R156SyntheticRoot 'runtime_locator.json') `
+            -LocatorBefore ([pscustomobject]@{ RuntimeRoot = 'C:\Synthetic\Runtime'; Metadata = 'stable' }) `
+            -TopologyBefore ([pscustomobject]@{ RuntimeRoot = 'C:\Synthetic\Runtime' }) `
+            -CheckoutRoot 'C:\XB\automation' `
+            -ExpectedHeadValue $script:R156ExpectedHeadAtExecution `
+            -CanonicalSources $canonicalSources `
+            -TokenContext ([pscustomobject]@{})
+        $postOutcome = 'PASS'
+    }
+    catch {
+        $postOutcome = 'BLOCKED'
+    }
+    $result.post_proof_terminal = $postOutcome
+    $result.post_proof_current = ($postOutcome -ceq 'PASS')
+    $result.post_proof_stale = ([string]$PostAdmission -ceq $script:R156ExpectedInstalledAdmissionAtExecution)
     if ($result.post_proof_current) {
         $result.terminal = 'PASS'
     }
@@ -910,29 +1153,27 @@ $result = Invoke-SyntheticR156Boundary `
     -ExpectedTree ([string]$env:R156_SYNTH_EXPECTED_TREE) `
     -ExpectedParent ([string]$env:R156_SYNTH_EXPECTED_PARENT) `
     -ExpectedInstalledAdmission ([string]$env:R156_SYNTH_EXPECTED_INSTALLED) `
-    -ActualHead ([string]$env:R156_SYNTH_ACTUAL_HEAD) `
-    -ActualTree ([string]$env:R156_SYNTH_ACTUAL_TREE) `
-    -ActualParent ([string]$env:R156_SYNTH_ACTUAL_PARENT) `
-    -ActualParentCount ([int]$env:R156_SYNTH_PARENT_COUNT) `
     -PostAdmission ([string]$env:R156_SYNTH_POST_ADMISSION)
 $result | ConvertTo-Json -Compress
 '''
-        )
-        environment = {
-            "R156_SYNTH_EXPECTED_HEAD": expected_head,
-            "R156_SYNTH_EXPECTED_TREE": expected_tree,
-            "R156_SYNTH_EXPECTED_PARENT": expected_parent,
-            "R156_SYNTH_EXPECTED_INSTALLED": expected_installed,
-            "R156_SYNTH_ACTUAL_HEAD": actual_head,
-            "R156_SYNTH_ACTUAL_TREE": actual_tree,
-            "R156_SYNTH_ACTUAL_PARENT": actual_parent,
-            "R156_SYNTH_PARENT_COUNT": str(parent_count),
-            "R156_SYNTH_MANIFEST_1": manifests[0],
-            "R156_SYNTH_MANIFEST_2": manifests[1],
-            "R156_SYNTH_MANIFEST_3": manifests[2],
-            "R156_SYNTH_POST_ADMISSION": post_admission,
-        }
-        lines = self.run_isolated_powershell(script, environment=environment)
+            )
+            environment = {
+                "R156_SYNTH_ROOT": str(fixture_root),
+                "R156_SYNTH_EXPECTED_HEAD": expected_head,
+                "R156_SYNTH_EXPECTED_TREE": expected_tree,
+                "R156_SYNTH_EXPECTED_PARENT": expected_parent,
+                "R156_SYNTH_EXPECTED_INSTALLED": expected_installed,
+                "R156_SYNTH_INSTALLED_PROVENANCE": expected_installed,
+                "R156_SYNTH_ACTUAL_HEAD": actual_head,
+                "R156_SYNTH_ACTUAL_TREE": actual_tree,
+                "R156_SYNTH_ACTUAL_PARENT": actual_parent,
+                "R156_SYNTH_PARENT_COUNT": str(parent_count),
+                "R156_SYNTH_MANIFEST_1": manifests[0],
+                "R156_SYNTH_MANIFEST_2": manifests[1],
+                "R156_SYNTH_MANIFEST_3": manifests[2],
+                "R156_SYNTH_POST_ADMISSION": post_admission,
+            }
+            lines = self.run_isolated_powershell(script, environment=environment)
         self.assertEqual(len(lines), 1, lines)
         return json.loads(lines[0])
 
@@ -1542,10 +1783,56 @@ $result | ConvertTo-Json -Compress
         result = self.run_preimage_boundary_case()
         self.assertTrue(result["admission_valid"])
         self.assertTrue(result["repository_fence"])
+        self.assertTrue(result["repository_fence_exercised"])
+        self.assertEqual(result["production_manifest_reads"], 3)
         self.assertTrue(result["pre_dispatch_passed"])
         self.assertEqual(result["stale_reads"], 3)
         self.assertEqual(result["real_installer_invocations"], 1)
+        self.assertTrue(result["synthetic_dispatch_boundary"])
         self.assertEqual(result["transport_admission"], CURRENT_HEAD)
+        self.assertTrue(result["post_proof_exercised"])
+
+    def test_preimage_decoupling_manifest_admission_is_mutation_sensitive(self):
+        manifest_source = self.source_function(
+            "function Read-R156ManifestState",
+            "function Get-R156DirectChildren",
+        )
+        admission_guard = (
+            "    if ([string]$manifest.admission_commit -cne $ExpectedAdmission) {\n"
+            "        return $null\n"
+            "    }"
+        )
+        self.assertEqual(manifest_source.count(admission_guard), 1)
+        defective_source = manifest_source.replace(admission_guard, "", 1)
+        self.assertEqual(defective_source.count(admission_guard), 0)
+        self.assertEqual(
+            manifest_source.count(admission_guard) - defective_source.count(admission_guard),
+            1,
+        )
+
+        case = {
+            "expected_installed": "c" * 40,
+            "manifest_sequence": [ACCEPTED_STALE_ADMISSION] * 3,
+            "post_admission": CURRENT_HEAD,
+        }
+        canonical = self.run_preimage_boundary_case(**case)
+        defective = self.run_preimage_boundary_case(
+            **case,
+            _manifest_source=defective_source,
+        )
+
+        self.assertTrue(canonical["repository_fence_exercised"])
+        self.assertEqual(canonical["production_manifest_reads"], 1)
+        self.assertTrue(canonical["manifest_guard_rejection_observed"])
+        self.assertFalse(canonical["pre_dispatch_passed"])
+        self.assertEqual(canonical["real_installer_invocations"], 0)
+
+        self.assertTrue(defective["repository_fence_exercised"])
+        self.assertEqual(defective["production_manifest_reads"], 3)
+        self.assertTrue(defective["pre_dispatch_passed"])
+        self.assertTrue(defective["synthetic_dispatch_boundary"])
+        self.assertEqual(defective["real_installer_invocations"], 1)
+        self.assertEqual(defective["terminal"], "PASS")
 
     def test_preimage_decoupling_wrong_installed_admission_blocks_real_dispatch(self):
         result = self.run_preimage_boundary_case(
@@ -1554,6 +1841,9 @@ $result | ConvertTo-Json -Compress
         )
         self.assertTrue(result["admission_valid"])
         self.assertTrue(result["repository_fence"])
+        self.assertTrue(result["repository_fence_exercised"])
+        self.assertEqual(result["production_manifest_reads"], 1)
+        self.assertTrue(result["manifest_guard_rejection_observed"])
         self.assertFalse(result["pre_dispatch_passed"])
         self.assertEqual(result["real_installer_invocations"], 0)
 
@@ -1563,7 +1853,9 @@ $result | ConvertTo-Json -Compress
             manifest_sequence=[ACCEPTED_STALE_ADMISSION] * 3,
         )
         self.assertTrue(result["admission_valid"])
+        self.assertTrue(result["repository_fence_exercised"])
         self.assertFalse(result["repository_fence"])
+        self.assertEqual(result["production_manifest_reads"], 0)
         self.assertEqual(result["stale_reads"], 0)
         self.assertEqual(result["real_installer_invocations"], 0)
 
@@ -1574,6 +1866,7 @@ $result | ConvertTo-Json -Compress
             manifest_sequence=[ACCEPTED_STALE_ADMISSION] * 3,
         )
         self.assertTrue(result["admission_valid"])
+        self.assertTrue(result["repository_fence_exercised"])
         self.assertFalse(result["repository_fence"])
         self.assertEqual(result["real_installer_invocations"], 0)
 
@@ -1582,6 +1875,9 @@ $result | ConvertTo-Json -Compress
             manifest_sequence=[CURRENT_HEAD] * 3,
         )
         self.assertTrue(result["repository_fence"])
+        self.assertTrue(result["repository_fence_exercised"])
+        self.assertEqual(result["production_manifest_reads"], 1)
+        self.assertTrue(result["manifest_guard_rejection_observed"])
         self.assertFalse(result["pre_dispatch_passed"])
         self.assertEqual(result["stale_reads"], 1)
         self.assertEqual(result["real_installer_invocations"], 0)
@@ -1595,6 +1891,9 @@ $result | ConvertTo-Json -Compress
             ],
         )
         self.assertTrue(result["repository_fence"])
+        self.assertTrue(result["repository_fence_exercised"])
+        self.assertEqual(result["production_manifest_reads"], 3)
+        self.assertTrue(result["manifest_guard_rejection_observed"])
         self.assertFalse(result["pre_dispatch_passed"])
         self.assertEqual(result["stale_reads"], 3)
         self.assertEqual(result["real_installer_invocations"], 0)
@@ -1605,9 +1904,13 @@ $result | ConvertTo-Json -Compress
             post_admission=ACCEPTED_STALE_ADMISSION,
         )
         self.assertEqual(current["terminal"], "PASS")
+        self.assertTrue(current["post_proof_exercised"])
+        self.assertEqual(current["post_proof_terminal"], "PASS")
         self.assertTrue(current["post_proof_current"])
         self.assertFalse(current["post_proof_stale"])
         self.assertEqual(stale["terminal"], "POST_PROOF_FAILED")
+        self.assertTrue(stale["post_proof_exercised"])
+        self.assertEqual(stale["post_proof_terminal"], "BLOCKED")
         self.assertFalse(stale["post_proof_current"])
         self.assertTrue(stale["post_proof_stale"])
 
@@ -1616,11 +1919,14 @@ $result | ConvertTo-Json -Compress
             with self.subTest(parent_count=count):
                 result = self.run_preimage_boundary_case(parent_count=count)
                 self.assertTrue(result["admission_valid"])
+                self.assertTrue(result["repository_fence_exercised"])
                 self.assertFalse(result["repository_fence"])
                 self.assertEqual(result["real_installer_invocations"], 0)
 
     def test_preimage_decoupling_installed_admission_provenance_is_explicit(self):
         result = self.run_preimage_boundary_case()
+        self.assertTrue(result["repository_fence_exercised"])
+        self.assertEqual(result["production_manifest_reads"], 3)
         self.assertEqual(result["expected_parent_state"], CURRENT_PARENT)
         self.assertEqual(result["expected_installed_state"], ACCEPTED_STALE_ADMISSION)
         self.assertNotEqual(
