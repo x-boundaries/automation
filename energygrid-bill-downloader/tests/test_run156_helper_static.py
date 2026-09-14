@@ -589,6 +589,16 @@ Write-Output ('fault_success=' + [string]$fault.Success + ';faulted=' + [string]
             "$ErrorActionPreference = 'Stop'\n"
             + self.extracted_functions(("Test-R156MutationCapableFileSystemRights",))
             + r"""
+function New-R156RawFileSystemRights {
+    param([Parameter(Mandatory)][string]$Hex)
+    $bits = [Convert]::ToUInt32($Hex, 16)
+    $signed = [BitConverter]::ToInt32([BitConverter]::GetBytes($bits), 0)
+    return [System.Enum]::ToObject(
+        [System.Security.AccessControl.FileSystemRights],
+        $signed
+    )
+}
+
 $cases = [ordered]@{
     Read = [System.Security.AccessControl.FileSystemRights]::Read
     ReadAndExecute = [System.Security.AccessControl.FileSystemRights]::ReadAndExecute
@@ -604,6 +614,13 @@ $cases = [ordered]@{
     Write = [System.Security.AccessControl.FileSystemRights]::Write
     Modify = [System.Security.AccessControl.FileSystemRights]::Modify
     FullControl = [System.Security.AccessControl.FileSystemRights]::FullControl
+    GenericRead = New-R156RawFileSystemRights -Hex '80000000'
+    GenericExecute = New-R156RawFileSystemRights -Hex '20000000'
+    GenericReadExecute = New-R156RawFileSystemRights -Hex 'A0000000'
+    GenericWrite = New-R156RawFileSystemRights -Hex '40000000'
+    GenericReadWrite = New-R156RawFileSystemRights -Hex 'C0000000'
+    GenericAll = New-R156RawFileSystemRights -Hex '10000000'
+    HighPrimitive = New-R156RawFileSystemRights -Hex 'A0000002'
 }
 foreach ($entry in $cases.GetEnumerator()) {
     Write-Output ($entry.Key + '=' + [string](Test-R156MutationCapableFileSystemRights -Rights $entry.Value))
@@ -2209,6 +2226,18 @@ $result | ConvertTo-Json -Compress
         ):
             with self.subTest(rejected=name):
                 self.assertTrue(values[name])
+        expected_raw = {
+            "GenericRead": False,
+            "GenericExecute": False,
+            "GenericReadExecute": False,
+            "GenericWrite": True,
+            "GenericReadWrite": True,
+            "GenericAll": True,
+            "HighPrimitive": True,
+        }
+        for name, expected in expected_raw.items():
+            with self.subTest(raw_mask=name):
+                self.assertEqual(values[name], expected)
 
     def test_strict_json_reader_behavioural_matrix(self):
         depth = 33

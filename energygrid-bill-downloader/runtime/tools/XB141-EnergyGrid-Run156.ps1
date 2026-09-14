@@ -522,8 +522,18 @@ function Test-R156MutationCapableFileSystemRights {
     # WriteExtendedAttributes 0x00000010; DeleteSubdirectoriesAndFiles 0x00000040;
     # WriteAttributes 0x00000100; Delete 0x00010000; ChangePermissions 0x00040000;
     # TakeOwnership 0x00080000. Combined primitive mutation mask: 0x000D0156.
+    # FileSystemRights is Int32-backed; reinterpret its exact 32-bit pattern so
+    # high generic-access bits remain safe under Windows PowerShell 5.1.
+    $rightsBits = [BitConverter]::ToUInt32(
+        [BitConverter]::GetBytes([int32]$Rights),
+        0
+    )
     $mutationMask = [uint32]0x000D0156
-    return (([uint32]$Rights -band $mutationMask) -ne 0)
+    $genericWriteMask = [uint32]0x40000000
+    $genericAllMask = [uint32]0x10000000
+    return (($rightsBits -band $mutationMask) -ne 0 -or
+        ($rightsBits -band $genericWriteMask) -ne 0 -or
+        ($rightsBits -band $genericAllMask) -ne 0)
 }
 
 function Open-R156ReadOnlyHandle {
