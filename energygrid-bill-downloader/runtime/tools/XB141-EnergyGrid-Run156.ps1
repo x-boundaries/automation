@@ -498,10 +498,17 @@ function Test-R156ProtectedInstallationRoot {
                     continue
                 }
                 $identity = [string]$rule.IdentityReference
+                $creatorOwner = ($identity -cmatch '(^|\\)CREATOR OWNER$')
                 $broadIdentity = ($identity -cmatch
                     '(^|\\)(Everyone|Users|Authenticated Users|CREATOR OWNER)$')
+                $creatorOwnerInheritOnly = (
+                    $creatorOwner -and
+                    (([int]$rule.PropagationFlags -band
+                        [int][System.Security.AccessControl.PropagationFlags]::InheritOnly) -ne 0)
+                )
                 if ($broadIdentity -and
-                    (Test-R156MutationCapableFileSystemRights -Rights $rule.FileSystemRights)) {
+                    (Test-R156MutationCapableFileSystemRights -Rights $rule.FileSystemRights) -and
+                    -not $creatorOwnerInheritOnly) {
                     return $false
                 }
             }
