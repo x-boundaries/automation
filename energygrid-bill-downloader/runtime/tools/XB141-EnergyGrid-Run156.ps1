@@ -1384,7 +1384,18 @@ function Get-R156LocalGitCommandName {
     if ($Arguments.Count -gt 0 -and $Arguments[0] -ceq 'status') {
         return 'status'
     }
-    if ($Arguments.Count -gt 8 -and $Arguments[8] -ceq 'status') {
+    if ($Arguments.Count -gt 10 -and
+        $Arguments[0] -ceq '-c' -and
+        $Arguments[1] -ceq 'core.fsmonitor=false' -and
+        $Arguments[2] -ceq '-c' -and
+        $Arguments[3] -ceq 'core.untrackedCache=false' -and
+        $Arguments[4] -ceq '-c' -and
+        $Arguments[5] -ceq 'core.hooksPath=NUL' -and
+        $Arguments[6] -ceq '-c' -and
+        $Arguments[7] -ceq 'submodule.recurse=false' -and
+        $Arguments[8] -ceq '-c' -and
+        $Arguments[9] -ceq 'core.autocrlf=true' -and
+        $Arguments[10] -ceq 'status') {
         return 'status'
     }
     if ($Arguments.Count -gt 0) {
@@ -1413,7 +1424,7 @@ function Test-R156LocalGitArguments {
     }
     if ($command -ceq 'status') {
         return (
-            $items.Count -eq 12 -and
+            $items.Count -eq 14 -and
             $items[0] -ceq '-c' -and
             $items[1] -ceq 'core.fsmonitor=false' -and
             $items[2] -ceq '-c' -and
@@ -1422,10 +1433,12 @@ function Test-R156LocalGitArguments {
             $items[5] -ceq 'core.hooksPath=NUL' -and
             $items[6] -ceq '-c' -and
             $items[7] -ceq 'submodule.recurse=false' -and
-            $items[8] -ceq 'status' -and
-            $items[9] -ceq '--porcelain=v1' -and
-            $items[10] -ceq '--untracked-files=all' -and
-            $items[11] -ceq '--ignore-submodules=none'
+            $items[8] -ceq '-c' -and
+            $items[9] -ceq 'core.autocrlf=true' -and
+            $items[10] -ceq 'status' -and
+            $items[11] -ceq '--porcelain=v1' -and
+            $items[12] -ceq '--untracked-files=all' -and
+            $items[13] -ceq '--ignore-submodules=none'
         )
     }
     if ($command -ceq 'config') {
@@ -1857,6 +1870,7 @@ function Get-R156RepositoryState {
         '-c', 'core.untrackedCache=false',
         '-c', 'core.hooksPath=NUL',
         '-c', 'submodule.recurse=false',
+        '-c', 'core.autocrlf=true',
         'status',
         '--porcelain=v1',
         '--untracked-files=all',

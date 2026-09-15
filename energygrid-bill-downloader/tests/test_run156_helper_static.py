@@ -152,6 +152,92 @@ $script:R156LocalGitReadOnlySubcommands = @('symbolic-ref', 'rev-parse', 'status
         return fields
 
     @staticmethod
+    def production_status_vector():
+        return [
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.untrackedCache=false",
+            "-c",
+            "core.hooksPath=NUL",
+            "-c",
+            "submodule.recurse=false",
+            "-c",
+            "core.autocrlf=true",
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+            "--ignore-submodules=none",
+        ]
+
+    @staticmethod
+    def isolated_git_environment():
+        environment = os.environ.copy()
+        for name in tuple(environment):
+            if name.startswith("GIT_") or name.startswith("GCM_"):
+                environment.pop(name)
+        environment.update(
+            {
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_CONFIG_SYSTEM": "NUL",
+                "GIT_CONFIG_GLOBAL": "NUL",
+                "GIT_TERMINAL_PROMPT": "0",
+                "GIT_OPTIONAL_LOCKS": "0",
+                "GIT_NO_REPLACE_OBJECTS": "1",
+                "GIT_NO_LAZY_FETCH": "1",
+            }
+        )
+        return environment
+
+    def run_synthetic_git(self, repository, arguments, check=True):
+        result = subprocess.run(
+            ["git", *arguments],
+            cwd=repository,
+            env=self.isolated_git_environment(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=30,
+            check=False,
+        )
+        if check and result.returncode != 0:
+            self.fail(
+                "synthetic Git command failed: "
+                f"arguments={arguments!r} exit={result.returncode} "
+                f"stderr={result.stderr[-2048:]!r}"
+            )
+        return result
+
+    def create_synthetic_eol_repository(self, directory):
+        repository = Path(directory)
+        self.run_synthetic_git(repository, ["-c", "init.defaultBranch=main", "init", "-q"])
+        self.run_synthetic_git(repository, ["config", "user.name", "Run156 Offline Test"])
+        self.run_synthetic_git(
+            repository,
+            ["config", "user.email", "run156-offline@example.invalid"],
+        )
+        (repository / "alpha.txt").write_bytes(b"alpha\nsecond\n")
+        (repository / "beta.txt").write_bytes(b"beta\nsecond\n")
+        self.run_synthetic_git(repository, ["-c", "core.autocrlf=true", "add", "--", "alpha.txt", "beta.txt"])
+        self.run_synthetic_git(repository, ["-c", "core.autocrlf=true", "commit", "-q", "-m", "fixture"])
+        (repository / "alpha.txt").unlink()
+        (repository / "beta.txt").unlink()
+        self.run_synthetic_git(
+            repository,
+            ["-c", "core.autocrlf=true", "checkout", "--", "alpha.txt", "beta.txt"],
+        )
+        time.sleep(0.02)
+        (repository / "alpha.txt").write_bytes(b"alpha\r\nsecond\r\n")
+        (repository / "beta.txt").write_bytes(b"beta\r\nsecond\r\n")
+        return repository
+
+    def synthetic_status(self, repository, vector=None):
+        return self.run_synthetic_git(
+            repository,
+            self.production_status_vector() if vector is None else vector,
+            check=False,
+        )
+
+    @staticmethod
     def read_witness(path):
         try:
             size = path.stat().st_size
@@ -212,9 +298,10 @@ $script:R156LocalGitReadOnlySubcommands = @('symbolic-ref', 'rev-parse', 'status
             )
         )
 
-    def run_repository_order_case(self, absence_results):
+    def run_repository_order_case(self, absence_results, status_case="clean"):
         functions = self.extracted_functions(
             (
+                "Get-R156LocalGitCommandName",
                 "Test-R156WorktreeConfigFence",
                 "Get-R156RepositoryState",
             )
@@ -229,6 +316,8 @@ $script:R156IndexHandle = $null
 $script:R156ExpectedHeadAtExecution = '0000000000000000000000000000000000000000'
 $script:R156ExpectedTreeAtExecution = '1111111111111111111111111111111111111111'
 $script:R156ExpectedParentAtExecution = '2222222222222222222222222222222222222222'
+$script:R156StatusCase = [string]$env:R156_STATUS_CASE
+$script:R156StatusArguments = [string[]]@()
 
 function Test-R156SamePath { return $true }
 function Test-R156NormalDirectory { return $true }
@@ -250,8 +339,27 @@ function Test-R156WorktreeConfigSurfaceAbsent {
 }
 function Invoke-R156LocalGitRead {
     param([string]$RepositoryRoot, [string[]]$Arguments)
-    $command = if ($Arguments[0] -ceq '-c') { 'status' } else { [string]$Arguments[0] }
+    $command = Get-R156LocalGitCommandName -Arguments $Arguments
     [void]$script:R156Events.Add('git:' + $command)
+    if ($command -ceq 'status') {
+        $script:R156StatusArguments = [string[]]@($Arguments)
+        if ($script:R156StatusCase -ceq 'dirty') {
+            return [pscustomobject]@{ Success = $true; StdoutBytes = [System.Text.Encoding]::ASCII.GetBytes(" M synthetic.txt`n") }
+        }
+        if ($script:R156StatusCase -ceq 'nonzero') {
+            return [pscustomobject]@{ Success = $false; Started = $true; ExitCode = 7; StdoutBytes = [byte[]]@() }
+        }
+        if ($script:R156StatusCase -ceq 'launch') {
+            return [pscustomobject]@{ Success = $false; Started = $false; ExitCode = -1; StdoutBytes = [byte[]]@() }
+        }
+        if ($script:R156StatusCase -ceq 'timeout') {
+            return [pscustomobject]@{ Success = $false; Started = $true; ExitCode = -1; TimedOut = $true; StdoutBytes = [byte[]]@() }
+        }
+        if ($script:R156StatusCase -ceq 'overflow') {
+            return [pscustomobject]@{ Success = $false; Started = $true; ExitCode = -1; Overflow = $true; StdoutBytes = [byte[]]@() }
+        }
+        return [pscustomobject]@{ Success = $true; Started = $true; ExitCode = 0; StdoutBytes = [byte[]]@() }
+    }
     $text = ''
     if ($command -ceq 'symbolic-ref') { $text = 'main' }
     elseif ($command -ceq 'rev-parse' -and $Arguments[-1] -ceq 'HEAD') { $text = $script:R156ExpectedHeadAtExecution }
@@ -281,8 +389,11 @@ function Test-R156MetadataEqual { return $true }
 $state = Get-R156RepositoryState -RepositoryRoot 'C:\XB\automation'
 [pscustomobject]@{
     read_ok = [bool]$state.ReadOk
+    clean = [bool]$state.Clean
+    admitted = [bool]($state.ReadOk -and $state.Clean)
     events = [string[]]@($script:R156Events)
     absence_checks = [int]$script:R156AbsenceIndex
+    status_arguments = [string[]]@($script:R156StatusArguments)
 } | ConvertTo-Json -Compress
 """
         )
@@ -291,7 +402,8 @@ $state = Get-R156RepositoryState -RepositoryRoot 'C:\XB\automation'
             environment={
                 "R156_ABSENCE_RESULTS": ",".join(
                     "true" if value else "false" for value in absence_results
-                )
+                ),
+                "R156_STATUS_CASE": status_case,
             },
         )
         self.assertEqual(len(lines), 1, lines)
@@ -779,7 +891,7 @@ else {
             + self.git_output_functions()
             + self.extracted_functions(("New-R156GitProcessResult",))
             + r"""
-$statusArguments = @('-c', 'core.fsmonitor=false', '-c', 'core.untrackedCache=false', '-c', 'core.hooksPath=NUL', '-c', 'submodule.recurse=false', 'status', '--porcelain=v1', '--untracked-files=all', '--ignore-submodules=none')
+$statusArguments = @('-c', 'core.fsmonitor=false', '-c', 'core.untrackedCache=false', '-c', 'core.hooksPath=NUL', '-c', 'submodule.recurse=false', '-c', 'core.autocrlf=true', 'status', '--porcelain=v1', '--untracked-files=all', '--ignore-submodules=none')
 $cleanStatus = Test-R156LocalGitOutput -Arguments $statusArguments -Bytes ([byte[]]@())
 $dirtyStatus = Test-R156LocalGitOutput -Arguments $statusArguments -Bytes ([System.Text.Encoding]::ASCII.GetBytes(" M file`n"))
 $required = @(
@@ -1868,6 +1980,162 @@ $result | ConvertTo-Json -Compress
         self.assertNotIn("hash-object", self.source)
         self.assertNotIn("HEAD^{tree}", self.source)
 
+    def test_production_status_vector_command_name_and_allowlist_are_exact(self):
+        state = self.run_repository_order_case([True, True])
+        exact = self.production_status_vector()
+        self.assertEqual(state["status_arguments"], exact)
+        self.assertTrue(state["clean"])
+        self.assertTrue(state["admitted"])
+
+        script = (
+            "$ErrorActionPreference = 'Stop'\n"
+            + self.git_contract_constants()
+            + self.extracted_functions(
+                ("Get-R156LocalGitCommandName", "Test-R156LocalGitArguments")
+            )
+            + r'''
+$exact = @('-c', 'core.fsmonitor=false', '-c', 'core.untrackedCache=false', '-c', 'core.hooksPath=NUL', '-c', 'submodule.recurse=false', '-c', 'core.autocrlf=true', 'status', '--porcelain=v1', '--untracked-files=all', '--ignore-submodules=none')
+$missing = @($exact[0..7] + $exact[10..13])
+$falsePolicy = [string[]]$exact.Clone(); $falsePolicy[9] = 'core.autocrlf=false'
+$inputPolicy = [string[]]$exact.Clone(); $inputPolicy[9] = 'core.autocrlf=input'
+$wrongCase = [string[]]$exact.Clone(); $wrongCase[9] = 'core.autoCrlf=true'
+$malformedPrefix = [string[]]$exact.Clone(); $malformedPrefix[1] = 'core.fsmonitor=True'
+$reordered = [string[]]$exact.Clone()
+$reordered[6] = '-c'; $reordered[7] = 'core.autocrlf=true'
+$reordered[8] = '-c'; $reordered[9] = 'submodule.recurse=false'
+$duplicate = @($exact[0..9] + @('-c', 'core.autocrlf=true') + $exact[10..13])
+$extra = @($exact + '--ignored-option')
+$alternateFlag = [string[]]$exact.Clone(); $alternateFlag[11] = '--porcelain=v2'
+$cases = [ordered]@{
+    exact = $exact
+    missing = $missing
+    false_policy = $falsePolicy
+    input_policy = $inputPolicy
+    wrong_case = $wrongCase
+    malformed_prefix = $malformedPrefix
+    reordered = $reordered
+    duplicate = $duplicate
+    extra = $extra
+    alternate_flag = $alternateFlag
+}
+$results = [ordered]@{}
+foreach ($name in $cases.Keys) {
+    $arguments = [string[]]@($cases[$name])
+    $results[$name] = [ordered]@{
+        command = Get-R156LocalGitCommandName -Arguments $arguments
+        allowed = Test-R156LocalGitArguments -Arguments $arguments
+    }
+}
+$results | ConvertTo-Json -Compress -Depth 4
+'''
+        )
+        lines = self.run_isolated_powershell(script)
+        results = json.loads(lines[-1])
+        self.assertEqual(results["exact"]["command"], "status")
+        self.assertTrue(results["exact"]["allowed"])
+        for name in (
+            "missing",
+            "false_policy",
+            "input_policy",
+            "wrong_case",
+            "malformed_prefix",
+            "reordered",
+            "duplicate",
+            "extra",
+            "alternate_flag",
+        ):
+            with self.subTest(case=name):
+                self.assertFalse(results[name]["allowed"])
+        for name in (
+            "missing",
+            "false_policy",
+            "input_policy",
+            "wrong_case",
+            "malformed_prefix",
+            "reordered",
+            "duplicate",
+        ):
+            with self.subTest(parser_case=name):
+                self.assertNotEqual(results[name]["command"], "status")
+
+    def test_offline_eol_policy_reproduces_false_dirty_and_preserves_clean(self):
+        with tempfile.TemporaryDirectory(prefix="r156_eol_policy_") as directory:
+            repository = self.create_synthetic_eol_repository(directory)
+            production = self.synthetic_status(repository)
+            self.assertEqual(production.returncode, 0, production.stderr)
+            self.assertEqual(production.stdout, b"")
+
+            false_vector = self.production_status_vector()
+            false_vector[9] = "core.autocrlf=false"
+            false_policy = self.synthetic_status(repository, false_vector)
+            self.assertEqual(false_policy.returncode, 0, false_policy.stderr)
+            self.assertEqual(
+                false_policy.stdout.splitlines(),
+                [b" M alpha.txt", b" M beta.txt"],
+            )
+
+    def test_production_eol_policy_keeps_every_genuine_dirty_class_dirty(self):
+        cases = {
+            "substantive_content": lambda repository: (
+                repository / "alpha.txt"
+            ).write_bytes(b"changed\r\nsecond\r\n"),
+            "non_eol_whitespace": lambda repository: (
+                repository / "alpha.txt"
+            ).write_bytes(b"alpha \r\nsecond\r\n"),
+            "untracked": lambda repository: (
+                repository / "untracked.txt"
+            ).write_bytes(b"untracked\r\n"),
+            "tracked_deletion": lambda repository: (
+                repository / "alpha.txt"
+            ).unlink(),
+            "tracked_rename": lambda repository: self.run_synthetic_git(
+                repository, ["mv", "alpha.txt", "renamed.txt"]
+            ),
+            "staged_modification": lambda repository: (
+                (repository / "alpha.txt").write_bytes(b"staged\r\nsecond\r\n"),
+                self.run_synthetic_git(
+                    repository,
+                    ["-c", "core.autocrlf=true", "add", "--", "alpha.txt"],
+                ),
+            ),
+        }
+        for name, mutate in cases.items():
+            with self.subTest(case=name):
+                with tempfile.TemporaryDirectory(prefix="r156_genuine_dirty_") as directory:
+                    repository = self.create_synthetic_eol_repository(directory)
+                    mutate(repository)
+                    status = self.synthetic_status(repository)
+                    self.assertEqual(status.returncode, 0, status.stderr)
+                    self.assertNotEqual(status.stdout, b"")
+
+    def test_repository_state_status_failures_and_nonempty_output_fail_closed(self):
+        for status_case in ("nonzero", "launch", "timeout", "overflow", "dirty"):
+            with self.subTest(status_case=status_case):
+                state = self.run_repository_order_case(
+                    [True, True], status_case=status_case
+                )
+                self.assertFalse(state["clean"])
+                self.assertFalse(state["admitted"])
+
+    def test_eol_policy_is_explicit_only_on_status_and_isolation_stays_fixed(self):
+        state = self.source_function(
+            "function Get-R156RepositoryState",
+            "function Resolve-R156RepositoryPath",
+        )
+        self.assertEqual(state.count("core.autocrlf=true"), 1)
+        self.assertNotIn("core.autocrlf=false", self.source)
+        self.assertNotIn("core.autocrlf=input", self.source)
+        local = self.source_function(
+            "function Invoke-R156LocalGitRead",
+            "function Get-R156RemoteWorkingDirectory",
+        )
+        for binding in (
+            "EnvironmentVariables['GIT_CONFIG_NOSYSTEM'] = '1'",
+            "EnvironmentVariables['GIT_CONFIG_SYSTEM'] = 'NUL'",
+            "EnvironmentVariables['GIT_CONFIG_GLOBAL'] = 'NUL'",
+        ):
+            self.assertIn(binding, local)
+
     def test_remote_command_and_helper_scope_are_fixed(self):
         remote = self.source_function(
             "function Invoke-R156RemoteHeadProof",
@@ -2296,6 +2564,7 @@ $result | ConvertTo-Json -Compress
             "core.untrackedCache=false",
             "core.hooksPath=NUL",
             "submodule.recurse=false",
+            "core.autocrlf=true",
             "'--ignore-submodules=none'",
             "R156IndexHandle",
             "indexMetadataBefore",
