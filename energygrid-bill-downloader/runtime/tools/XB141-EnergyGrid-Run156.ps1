@@ -1782,6 +1782,11 @@ function Get-R156RepositoryState {
         return [pscustomobject]$state
     }
 
+    $worktreeConfigAbsentBefore = Test-R156WorktreeConfigSurfaceAbsent -Path 'C:\XB\automation\.git\config.worktree'
+    if (-not $worktreeConfigAbsentBefore) {
+        return [pscustomobject]$state
+    }
+
     if ($null -eq $script:R156RepositoryConfigHandle) {
         $script:R156RepositoryConfigHandle = Open-R156ReadOnlyHandle -Path 'C:\XB\automation\.git\config'
     }
@@ -1808,14 +1813,6 @@ function Get-R156RepositoryState {
     }
     $state.ConfigAdmission = $configAdmission
     $state.Origin = [string[]]$configAdmission.Origin
-
-    $worktreeConfigAbsentBefore = $false
-    if ($configAdmission.WorktreeConfigEnabled) {
-        $worktreeConfigAbsentBefore = Test-R156WorktreeConfigSurfaceAbsent -Path 'C:\XB\automation\.git\config.worktree'
-        if (-not $worktreeConfigAbsentBefore) {
-            return [pscustomobject]$state
-        }
-    }
 
     $branchResult = Invoke-R156LocalGitRead -RepositoryRoot $RepositoryRoot -Arguments @('symbolic-ref', '--short', '-q', 'HEAD')
     $headResult = Invoke-R156LocalGitRead -RepositoryRoot $RepositoryRoot -Arguments @('rev-parse', '--verify', 'HEAD')
@@ -1880,12 +1877,9 @@ function Get-R156RepositoryState {
         $statusResult.StdoutBytes.Length -eq 0 -and
         $indexSideEffectFree
     )
-    $worktreeConfigAbsentAfter = $false
-    if ($configAdmission.WorktreeConfigEnabled) {
-        $worktreeConfigAbsentAfter = Test-R156WorktreeConfigSurfaceAbsent -Path 'C:\XB\automation\.git\config.worktree'
-    }
+    $worktreeConfigAbsentAfter = Test-R156WorktreeConfigSurfaceAbsent -Path 'C:\XB\automation\.git\config.worktree'
     $worktreeConfigFence = Test-R156WorktreeConfigFence `
-        -Enabled ([bool]$configAdmission.WorktreeConfigEnabled) `
+        -Enabled $true `
         -AbsentBefore $worktreeConfigAbsentBefore `
         -AbsentAfter $worktreeConfigAbsentAfter
     $state.ReadOk = (
@@ -2660,18 +2654,26 @@ function Read-R156TrustedSource {
         return $null
     }
 
+    $worktreeConfigAbsentBefore = Test-R156WorktreeConfigSurfaceAbsent -Path 'C:\XB\automation\.git\config.worktree'
+    if (-not $worktreeConfigAbsentBefore) {
+        return $null
+    }
     $resolved = Invoke-R156LocalGitRead -RepositoryRoot $RepositoryRoot -Arguments @(
         'rev-parse',
         '--verify',
         ([string]$script:R156ExpectedHeadAtExecution + ':' + $normalizedPath)
     )
-    $resolvedValue = Get-R156SingleGitLine -Result $resolved
-    if ($resolvedValue -notmatch '^[0-9a-f]{40}$' -or $resolvedValue -cne $ExpectedGitBlob) {
+    $committedResult = Invoke-R156LocalGitRead -RepositoryRoot $RepositoryRoot -Arguments @('cat-file', 'blob', $ExpectedGitBlob)
+    $worktreeConfigAbsentAfter = Test-R156WorktreeConfigSurfaceAbsent -Path 'C:\XB\automation\.git\config.worktree'
+    if (-not $worktreeConfigAbsentAfter) {
         return $null
     }
 
-    $committedResult = Invoke-R156LocalGitRead -RepositoryRoot $RepositoryRoot -Arguments @('cat-file', 'blob', $ExpectedGitBlob)
-    if ($null -eq $committedResult -or -not $committedResult.Success) {
+    $resolvedValue = Get-R156SingleGitLine -Result $resolved
+    if ($resolvedValue -notmatch '^[0-9a-f]{40}$' -or
+        $resolvedValue -cne $ExpectedGitBlob -or
+        $null -eq $committedResult -or
+        -not $committedResult.Success) {
         return $null
     }
     $committedBytes = [byte[]]$committedResult.StdoutBytes
@@ -5257,6 +5259,9 @@ try {
         Stop-R156Gate -SupportRef 'EG_R156_GITHUB_HEAD_FAILED'
     }
     $script:R156GithubAuth = 'PASS'
+    if (-not (Test-R156WorktreeConfigSurfaceAbsent -Path 'C:\XB\automation\.git\config.worktree')) {
+        Stop-R156Gate -SupportRef 'EG_R156_WORKTREE_CONFIG_CHANGED'
+    }
     $realResult = Invoke-R156Transport -Mode 'REAL' -CheckoutRoot $checkout -InstallerPath $canonicalInstaller.Path -LauncherRoot $topologyBeforeReal.Candidate -AdmissionCommit $script:R156ExpectedHeadAtExecution
     if ($null -eq $realResult -or -not $realResult.Started) {
         Stop-R156Gate -SupportRef 'EG_R156_REAL_CHILD_START_FAILED'

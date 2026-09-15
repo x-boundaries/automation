@@ -212,6 +212,238 @@ $script:R156LocalGitReadOnlySubcommands = @('symbolic-ref', 'rev-parse', 'status
             )
         )
 
+    def run_repository_order_case(self, absence_results):
+        functions = self.extracted_functions(
+            (
+                "Test-R156WorktreeConfigFence",
+                "Get-R156RepositoryState",
+            )
+        )
+        script = (
+            r"""
+$script:R156Events = New-Object System.Collections.ArrayList
+$script:R156AbsenceResults = @($env:R156_ABSENCE_RESULTS -split ',' | ForEach-Object { [bool]::Parse($_) })
+$script:R156AbsenceIndex = 0
+$script:R156RepositoryConfigHandle = $null
+$script:R156IndexHandle = $null
+$script:R156ExpectedHeadAtExecution = '0000000000000000000000000000000000000000'
+$script:R156ExpectedTreeAtExecution = '1111111111111111111111111111111111111111'
+$script:R156ExpectedParentAtExecution = '2222222222222222222222222222222222222222'
+
+function Test-R156SamePath { return $true }
+function Test-R156NormalDirectory { return $true }
+function Test-R156NoReparseAncestors { return $true }
+function Test-R156NormalFile { return $true }
+function Open-R156ReadOnlyHandle { return (New-Object System.IO.MemoryStream) }
+function Convert-R156ConfigBytes { return [object[]]@([pscustomobject]@{ Key = 'synthetic'; Value = 'synthetic' }) }
+function Test-R156ConfigAdmission {
+    return [pscustomobject]@{ Pass = $true; Origin = [string[]]@('origin'); WorktreeConfigEnabled = $true }
+}
+function Test-R156WorktreeConfigSurfaceAbsent {
+    $value = $false
+    if ($script:R156AbsenceIndex -lt $script:R156AbsenceResults.Count) {
+        $value = [bool]$script:R156AbsenceResults[$script:R156AbsenceIndex]
+    }
+    $script:R156AbsenceIndex += 1
+    [void]$script:R156Events.Add('absence:' + $value.ToString().ToLowerInvariant())
+    return $value
+}
+function Invoke-R156LocalGitRead {
+    param([string]$RepositoryRoot, [string[]]$Arguments)
+    $command = if ($Arguments[0] -ceq '-c') { 'status' } else { [string]$Arguments[0] }
+    [void]$script:R156Events.Add('git:' + $command)
+    $text = ''
+    if ($command -ceq 'symbolic-ref') { $text = 'main' }
+    elseif ($command -ceq 'rev-parse' -and $Arguments[-1] -ceq 'HEAD') { $text = $script:R156ExpectedHeadAtExecution }
+    elseif ($command -ceq 'rev-parse' -and $Arguments[-1] -ceq '--show-toplevel') { $text = 'C:\XB\automation' }
+    elseif ($command -ceq 'rev-parse' -and $Arguments[-1] -ceq '--is-inside-work-tree') { $text = 'true' }
+    elseif ($command -ceq 'rev-parse' -and $Arguments[-1] -ceq '--git-dir') { $text = '.git' }
+    elseif ($command -ceq 'rev-parse' -and $Arguments[-1] -ceq '--git-common-dir') { $text = '.git' }
+    return [pscustomobject]@{ Success = $true; StdoutBytes = [byte[]]@(); Text = $text }
+}
+function Get-R156SingleGitLine { param($Result) return [string]$Result.Text }
+function Resolve-R156RepositoryPath { return 'C:\XB\automation\.git' }
+function Get-R156CommitTreeParentProof {
+    return [pscustomobject]@{
+        Tree = $script:R156ExpectedTreeAtExecution
+        Parent = $script:R156ExpectedParentAtExecution
+        ParentCount = 1
+        CommitObjectHash = $script:R156ExpectedHeadAtExecution
+    }
+}
+function Get-R156Metadata { return [pscustomobject]@{ Value = 'same' } }
+function Read-R156HandleBytes { return [byte[]](1, 2, 3) }
+function Get-R156Sha256ForBytes { return 'digest' }
+function Test-R156MetadataEqual { return $true }
+"""
+            + functions
+            + r"""
+$state = Get-R156RepositoryState -RepositoryRoot 'C:\XB\automation'
+[pscustomobject]@{
+    read_ok = [bool]$state.ReadOk
+    events = [string[]]@($script:R156Events)
+    absence_checks = [int]$script:R156AbsenceIndex
+} | ConvertTo-Json -Compress
+"""
+        )
+        lines = self.run_isolated_powershell(
+            script,
+            environment={
+                "R156_ABSENCE_RESULTS": ",".join(
+                    "true" if value else "false" for value in absence_results
+                )
+            },
+        )
+        self.assertEqual(len(lines), 1, lines)
+        return json.loads(lines[0])
+
+    def run_trusted_source_order_case(self, absence_results):
+        functions = self.extracted_functions(("Read-R156TrustedSource",))
+        script = (
+            r"""
+$script:R156Events = New-Object System.Collections.ArrayList
+$script:R156AbsenceResults = @($env:R156_ABSENCE_RESULTS -split ',' | ForEach-Object { [bool]::Parse($_) })
+$script:R156AbsenceIndex = 0
+$script:R156GitReads = 0
+$script:R156ExpectedHeadAtExecution = '1111111111111111111111111111111111111111'
+$script:R156SourceHandles = @()
+$script:R156ExpectedSyntheticBlob = '0000000000000000000000000000000000000000'
+$script:R156SyntheticBytes = [byte[]](120, 10)
+
+function Test-R156LockedSourcePath { return $true }
+function Test-R156SamePath { return $true }
+function Test-R156NormalFile { return $true }
+function Test-R156NoReparseAncestors { return $true }
+function Test-R156WorktreeConfigSurfaceAbsent {
+    $value = $false
+    if ($script:R156AbsenceIndex -lt $script:R156AbsenceResults.Count) {
+        $value = [bool]$script:R156AbsenceResults[$script:R156AbsenceIndex]
+    }
+    $script:R156AbsenceIndex += 1
+    [void]$script:R156Events.Add('absence:' + $value.ToString().ToLowerInvariant())
+    return $value
+}
+function Invoke-R156LocalGitRead {
+    param([string]$RepositoryRoot, [string[]]$Arguments)
+    $script:R156GitReads += 1
+    [void]$script:R156Events.Add('git:' + [string]$Arguments[0])
+    return [pscustomobject]@{
+        Success = $true
+        StdoutBytes = [byte[]]$script:R156SyntheticBytes
+        Text = $script:R156ExpectedSyntheticBlob
+    }
+}
+function Get-R156SingleGitLine { param($Result) return [string]$Result.Text }
+function Test-R156CommittedByteContract { return $true }
+function Get-R156Sha1ForGitObject { return [string]$script:R156ExpectedSyntheticBlob }
+function Open-R156ReadOnlyHandle { return (New-Object System.IO.MemoryStream) }
+function Get-R156Metadata { return [pscustomobject]@{ Value = 'same' } }
+function Read-R156HandleBytes { return [byte[]]$script:R156SyntheticBytes }
+function Test-R156MetadataEqual { return $true }
+function Test-R156WorkingByteContract {
+    return [pscustomobject]@{ NormalizedBytes = [byte[]]$script:R156SyntheticBytes; Ending = 'LF' }
+}
+function Test-R156ByteArraysEqual { return $true }
+function Test-R156PowerShellParse { return $true }
+function Get-R156Sha256ForBytes { return 'digest' }
+"""
+            + functions
+            + r"""
+$source = Read-R156TrustedSource `
+    -RepositoryRoot 'C:\XB\automation' `
+    -RelativePath 'energygrid-bill-downloader/runtime/launcher.ps1' `
+    -ExpectedGitBlob $script:R156ExpectedSyntheticBlob `
+    -ExpectedGitBlobLength 2
+[pscustomobject]@{
+    accepted = $null -ne $source
+    events = [string[]]@($script:R156Events)
+    git_reads = [int]$script:R156GitReads
+    absence_checks = [int]$script:R156AbsenceIndex
+} | ConvertTo-Json -Compress
+"""
+        )
+        lines = self.run_isolated_powershell(
+            script,
+            environment={
+                "R156_ABSENCE_RESULTS": ",".join(
+                    "true" if value else "false" for value in absence_results
+                )
+            },
+        )
+        self.assertEqual(len(lines), 1, lines)
+        return json.loads(lines[0])
+
+    def run_final_predispatch_case(self, final_absence):
+        start = self.source.index("    $canonicalLibraryBeforeReal =")
+        dispatch = self.source.index(
+            "    $realResult = Invoke-R156Transport -Mode 'REAL'",
+            start,
+        )
+        end = self.source.index("\n", dispatch) + 1
+        production_sequence = self.source[start:end]
+        script = (
+            r"""
+$script:R156Events = New-Object System.Collections.ArrayList
+$script:R156RealInstallerInvocations = 0
+$script:R156LibraryRelative = 'library'
+$script:R156LibraryGitBlob = '1111111111111111111111111111111111111111'
+$script:R156LibraryGitBlobLength = 1
+$script:R156LauncherRelative = 'launcher'
+$script:R156LauncherGitBlob = '2222222222222222222222222222222222222222'
+$script:R156LauncherGitBlobLength = 1
+$script:R156InstallerRelative = 'installer'
+$script:R156InstallerGitBlob = '3333333333333333333333333333333333333333'
+$script:R156InstallerGitBlobLength = 1
+$script:R156ExpectedInstalledAdmissionAtExecution = '4444444444444444444444444444444444444444'
+$script:R156ExpectedHeadAtExecution = '5555555555555555555555555555555555555555'
+$script:R156GithubAuth = 'FAIL'
+$checkout = 'C:\XB\automation'
+$topologyBeforeReal = [pscustomobject]@{ Candidate = 'C:\Program Files\Synthetic' }
+$canonicalSources = [ordered]@{ 'launcher.ps1' = $null; 'launcher_lib.ps1' = $null }
+
+function Read-R156TrustedSource {
+    [void]$script:R156Events.Add('trusted-source')
+    return [pscustomobject]@{ Path = 'C:\synthetic\installer.ps1' }
+}
+function Read-R156ManifestState {
+    [void]$script:R156Events.Add('manifest')
+    return [pscustomobject]@{ Pass = $true }
+}
+function Test-R156RemoteHead {
+    [void]$script:R156Events.Add('remote-head')
+    return $true
+}
+function Test-R156WorktreeConfigSurfaceAbsent {
+    [void]$script:R156Events.Add('final-absence')
+    return [bool]::Parse([string]$env:R156_FINAL_ABSENCE)
+}
+function Stop-R156Gate { throw 'synthetic-stop' }
+function Invoke-R156Transport {
+    [void]$script:R156Events.Add('real')
+    $script:R156RealInstallerInvocations += 1
+    return [pscustomobject]@{ Started = $true }
+}
+
+function Invoke-R156ProductionPredispatch {
+"""
+            + production_sequence
+            + r"""
+}
+
+try { Invoke-R156ProductionPredispatch } catch { }
+[pscustomobject]@{
+    events = [string[]]@($script:R156Events)
+    real_installer_invocations = [int]$script:R156RealInstallerInvocations
+} | ConvertTo-Json -Compress
+"""
+        )
+        lines = self.run_isolated_powershell(
+            script,
+            environment={"R156_FINAL_ABSENCE": "true" if final_absence else "false"},
+        )
+        self.assertEqual(len(lines), 1, lines)
+        return json.loads(lines[0])
+
     def json_functions(self):
         return self.extracted_functions(
             (
@@ -1951,15 +2183,108 @@ $result | ConvertTo-Json -Compress
             "function Resolve-R156RepositoryPath",
         )
         before = state.index("$worktreeConfigAbsentBefore")
+        config_read = state.index("$configResult = Invoke-R156LocalGitRead")
         first_repository_read = state.index("$branchResult = Invoke-R156LocalGitRead")
         last_repository_read = state.index("$statusResult = Invoke-R156LocalGitRead")
         after = state.index("$worktreeConfigAbsentAfter")
         read_ok = state.index("$state.ReadOk")
+        self.assertLess(before, config_read)
+        self.assertLess(config_read, first_repository_read)
         self.assertLess(before, first_repository_read)
         self.assertLess(last_repository_read, after)
         self.assertLess(after, read_ok)
         self.assertIn("C:\\XB\\automation\\.git\\config.worktree", state)
         self.assertIn("$worktreeConfigFence", state)
+        self.assertIn("-Enabled $true", state)
+
+    def test_initial_repository_read_order_and_appearance_race_use_production_function(self):
+        accepted = self.run_repository_order_case((True, True))
+        self.assertTrue(accepted["read_ok"], accepted)
+        self.assertEqual(accepted["events"][0], "absence:true")
+        self.assertEqual(accepted["events"][1], "git:config")
+        self.assertEqual(accepted["events"][-1], "absence:true")
+        self.assertEqual(accepted["absence_checks"], 2)
+
+        appeared = self.run_repository_order_case((True, False))
+        self.assertFalse(appeared["read_ok"], appeared)
+        self.assertEqual(appeared["events"][0], "absence:true")
+        self.assertEqual(appeared["events"][1], "git:config")
+        self.assertEqual(appeared["events"][-1], "absence:false")
+        self.assertEqual(appeared["absence_checks"], 2)
+
+    def test_trusted_source_git_window_is_fenced_by_production_function(self):
+        source = self.source_function(
+            "function Read-R156TrustedSource",
+            "function Read-R156Locator",
+        )
+        before = source.index("$worktreeConfigAbsentBefore")
+        resolve = source.index("$resolved = Invoke-R156LocalGitRead")
+        cat_file = source.index("$committedResult = Invoke-R156LocalGitRead")
+        after = source.index("$worktreeConfigAbsentAfter")
+        accept = source.index("$resolvedValue = Get-R156SingleGitLine")
+        self.assertLess(before, resolve)
+        self.assertLess(resolve, cat_file)
+        self.assertLess(cat_file, after)
+        self.assertLess(after, accept)
+
+        accepted = self.run_trusted_source_order_case((True, True))
+        self.assertTrue(accepted["accepted"], accepted)
+        self.assertEqual(
+            accepted["events"],
+            ["absence:true", "git:rev-parse", "git:cat-file", "absence:true"],
+        )
+        self.assertEqual(accepted["git_reads"], 2)
+        self.assertEqual(accepted["absence_checks"], 2)
+
+        appeared_after_repository_admission = self.run_trusted_source_order_case((False,))
+        self.assertFalse(
+            appeared_after_repository_admission["accepted"],
+            appeared_after_repository_admission,
+        )
+        self.assertEqual(
+            appeared_after_repository_admission["events"],
+            ["absence:false"],
+        )
+        self.assertEqual(appeared_after_repository_admission["git_reads"], 0)
+
+        appeared_during_read = self.run_trusted_source_order_case((True, False))
+        self.assertFalse(appeared_during_read["accepted"], appeared_during_read)
+        self.assertEqual(
+            appeared_during_read["events"],
+            ["absence:true", "git:rev-parse", "git:cat-file", "absence:false"],
+        )
+        self.assertEqual(appeared_during_read["git_reads"], 2)
+
+    def test_final_predispatch_sequence_rechecks_absence_after_trusted_reads(self):
+        start = self.source.index("    $canonicalLibraryBeforeReal =")
+        real = self.source.index("    $realResult = Invoke-R156Transport -Mode 'REAL'", start)
+        sequence = self.source[start:real]
+        last_trusted = sequence.rindex("Read-R156TrustedSource")
+        manifest = sequence.rindex("Read-R156ManifestState")
+        remote = sequence.rindex("Test-R156RemoteHead")
+        final_absence = sequence.rindex("Test-R156WorktreeConfigSurfaceAbsent")
+        self.assertLess(last_trusted, manifest)
+        self.assertLess(manifest, remote)
+        self.assertLess(remote, final_absence)
+        self.assertNotIn("Invoke-R156LocalGitRead", sequence[final_absence:])
+
+        appeared_before_dispatch = self.run_final_predispatch_case(False)
+        self.assertEqual(
+            appeared_before_dispatch["events"],
+            [
+                "trusted-source",
+                "trusted-source",
+                "trusted-source",
+                "manifest",
+                "remote-head",
+                "final-absence",
+            ],
+        )
+        self.assertEqual(appeared_before_dispatch["real_installer_invocations"], 0)
+
+        absent_before_dispatch = self.run_final_predispatch_case(True)
+        self.assertEqual(absent_before_dispatch["events"][-2:], ["final-absence", "real"])
+        self.assertEqual(absent_before_dispatch["real_installer_invocations"], 1)
 
     def test_status_is_side_effect_free_and_index_is_held(self):
         status = self.source_function(
