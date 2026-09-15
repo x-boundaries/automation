@@ -1132,16 +1132,86 @@ function Convert-R156ConfigBytes {
         $parts = @($records[$index].Split([char]0x0A))
         if ($parts.Count -ne 2 -or
             [string]::IsNullOrEmpty($parts[0]) -or
-            $parts[0] -cnotmatch '^[a-z][a-z0-9.-]*$' -or
             $parts[1].Contains([char]0x0A)) {
             return $null
         }
+        $key = [string]$parts[0]
+        if ($key.StartsWith('branch.', [StringComparison]::Ordinal)) {
+            if ($null -eq (Get-R156BranchConfigKey -Key $key)) {
+                return $null
+            }
+        }
+        elseif ($key -cnotmatch '^[a-z][a-z0-9.-]*$') {
+            return $null
+        }
         $entries = $entries + [pscustomobject]@{
-            Key = [string]$parts[0]
+            Key = $key
             Value = [string]$parts[1]
         }
     }
     return ,$entries
+}
+
+function Test-R156BranchName {
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Name)
+
+    if ($Name.Length -lt 1 -or
+        $Name.Length -gt 255 -or
+        $Name.StartsWith('-', [StringComparison]::Ordinal) -or
+        $Name.StartsWith('/', [StringComparison]::Ordinal) -or
+        $Name.EndsWith('/', [StringComparison]::Ordinal) -or
+        $Name.Contains('//') -or
+        $Name.Contains('..')) {
+        return $false
+    }
+    foreach ($component in @($Name.Split([char]'/'))) {
+        if ([string]::IsNullOrEmpty($component) -or
+            $component -cnotmatch '^[A-Za-z0-9._-]+$' -or
+            [string]::Equals($component, '.', [StringComparison]::Ordinal) -or
+            [string]::Equals($component, '..', [StringComparison]::Ordinal) -or
+            $component.StartsWith('.', [StringComparison]::Ordinal) -or
+            $component.EndsWith('.', [StringComparison]::Ordinal) -or
+            $component.EndsWith('.lock', [StringComparison]::Ordinal)) {
+            return $false
+        }
+    }
+    return $true
+}
+
+function Get-R156BranchConfigKey {
+    param([Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Key)
+
+    $prefix = 'branch.'
+    $remoteSuffix = '.remote'
+    $mergeSuffix = '.merge'
+    if (-not $Key.StartsWith($prefix, [StringComparison]::Ordinal)) {
+        return $null
+    }
+    $field = ''
+    $suffix = ''
+    if ($Key.EndsWith($remoteSuffix, [StringComparison]::Ordinal)) {
+        $field = 'remote'
+        $suffix = $remoteSuffix
+    }
+    elseif ($Key.EndsWith($mergeSuffix, [StringComparison]::Ordinal)) {
+        $field = 'merge'
+        $suffix = $mergeSuffix
+    }
+    else {
+        return $null
+    }
+    $nameLength = $Key.Length - $prefix.Length - $suffix.Length
+    if ($nameLength -lt 1) {
+        return $null
+    }
+    $name = $Key.Substring($prefix.Length, $nameLength)
+    if (-not (Test-R156BranchName -Name $name)) {
+        return $null
+    }
+    return [pscustomobject]@{
+        Name = $name
+        Field = $field
+    }
 }
 
 function Test-R156ConfigAdmission {
@@ -1159,29 +1229,84 @@ function Test-R156ConfigAdmission {
         'branch.main.remote',
         'branch.main.merge'
     )
-    if (@($Entries).Count -ne $acceptedKeys.Count) {
-        return $null
-    }
-    $seen = @{}
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+    $requiredCount = 0
+    $historicalBranches = @()
+    $worktreeConfigEnabled = $false
     foreach ($entry in @($Entries)) {
         $key = [string]$entry.Key
-        if ($acceptedKeys -notcontains $key -or $seen.ContainsKey($key)) {
+        if (-not $seen.Add($key)) {
             return $null
         }
-        $seen[$key] = $true
         $value = [string]$entry.Value
-        if ($key -ceq 'core.repositoryformatversion' -and $value -cne '0') { return $null }
-        if ($key -ceq 'core.filemode' -and $value -cnotmatch '^(true|false)$') { return $null }
-        if ($key -ceq 'core.bare' -and $value -cne 'false') { return $null }
-        if ($key -ceq 'core.logallrefupdates' -and $value -cne 'true') { return $null }
-        if ($key -ceq 'core.symlinks' -and $value -cnotmatch '^(true|false)$') { return $null }
-        if ($key -ceq 'core.ignorecase' -and $value -cnotmatch '^(true|false)$') { return $null }
-        if ($key -ceq 'remote.origin.fetch' -and $value -cne '+refs/heads/*:refs/remotes/origin/*') { return $null }
-        if ($key -ceq 'branch.main.remote' -and $value -cne 'origin') { return $null }
-        if ($key -ceq 'branch.main.merge' -and $value -cne 'refs/heads/main') { return $null }
+        $required = $false
+        foreach ($acceptedKey in $acceptedKeys) {
+            if ([string]::Equals($key, $acceptedKey, [StringComparison]::Ordinal)) {
+                $required = $true
+                break
+            }
+        }
+        if ($required) {
+            $requiredCount++
+            if ($key -ceq 'core.repositoryformatversion' -and $value -cne '0') { return $null }
+            if ($key -ceq 'core.filemode' -and $value -cnotmatch '^(true|false)$') { return $null }
+            if ($key -ceq 'core.bare' -and $value -cne 'false') { return $null }
+            if ($key -ceq 'core.logallrefupdates' -and $value -cne 'true') { return $null }
+            if ($key -ceq 'core.symlinks' -and $value -cnotmatch '^(true|false)$') { return $null }
+            if ($key -ceq 'core.ignorecase' -and $value -cnotmatch '^(true|false)$') { return $null }
+            if ($key -ceq 'remote.origin.fetch' -and $value -cne '+refs/heads/*:refs/remotes/origin/*') { return $null }
+            if ($key -ceq 'branch.main.remote' -and $value -cne 'origin') { return $null }
+            if ($key -ceq 'branch.main.merge' -and $value -cne 'refs/heads/main') { return $null }
+            continue
+        }
+
+        $branchKey = Get-R156BranchConfigKey -Key $key
+        if ($null -ne $branchKey) {
+            $pair = $null
+            foreach ($candidate in @($historicalBranches)) {
+                if ([string]::Equals([string]$candidate.Name, [string]$branchKey.Name, [StringComparison]::Ordinal)) {
+                    $pair = $candidate
+                    break
+                }
+            }
+            if ($null -eq $pair) {
+                $pair = [pscustomobject]@{
+                    Name = [string]$branchKey.Name
+                    RemoteSeen = $false
+                    MergeSeen = $false
+                }
+                $historicalBranches = $historicalBranches + $pair
+            }
+            if ([string]::Equals([string]$branchKey.Field, 'remote', [StringComparison]::Ordinal)) {
+                if ($pair.RemoteSeen -or $value -cne 'origin') { return $null }
+                $pair.RemoteSeen = $true
+            }
+            else {
+                $expectedMerge = 'refs/heads/' + [string]$branchKey.Name
+                if ($pair.MergeSeen -or
+                    -not [string]::Equals($value, $expectedMerge, [StringComparison]::Ordinal)) {
+                    return $null
+                }
+                $pair.MergeSeen = $true
+            }
+            continue
+        }
+
+        if ($key -ceq 'user.name' -or $key -ceq 'user.email') {
+            continue
+        }
+        if ($key -ceq 'extensions.worktreeconfig') {
+            if ($value -cne 'true') { return $null }
+            $worktreeConfigEnabled = $true
+            continue
+        }
+        return $null
     }
-    foreach ($key in $acceptedKeys) {
-        if (-not $seen.ContainsKey($key)) {
+    if ($requiredCount -ne $acceptedKeys.Count) {
+        return $null
+    }
+    foreach ($pair in @($historicalBranches)) {
+        if (-not $pair.RemoteSeen -or -not $pair.MergeSeen) {
             return $null
         }
     }
@@ -1193,7 +1318,49 @@ function Test-R156ConfigAdmission {
     return [pscustomobject]@{
         Pass = $true
         Origin = [string[]]@([string]$origin[0].Value)
+        WorktreeConfigEnabled = $worktreeConfigEnabled
     }
+}
+
+function Test-R156WorktreeConfigSurfaceAbsent {
+    param([Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Path)
+
+    try {
+        $fullPath = [System.IO.Path]::GetFullPath($Path)
+        $parentPath = [System.IO.Path]::GetDirectoryName($fullPath)
+        $leafName = [System.IO.Path]::GetFileName($fullPath)
+        if ([string]::IsNullOrWhiteSpace($parentPath) -or
+            [string]::IsNullOrWhiteSpace($leafName)) {
+            return $false
+        }
+        $parent = New-Object System.IO.DirectoryInfo($parentPath)
+        if (-not $parent.Exists) {
+            return $false
+        }
+        $entries = @($parent.GetFileSystemInfos($leafName))
+        foreach ($entry in $entries) {
+            if ([string]::Equals(
+                    [System.IO.Path]::GetFullPath([string]$entry.FullName),
+                    $fullPath,
+                    [StringComparison]::OrdinalIgnoreCase)) {
+                return $false
+            }
+        }
+        return ($entries.Count -eq 0)
+    }
+    catch {
+        return $false
+    }
+}
+
+function Test-R156WorktreeConfigFence {
+    param(
+        [Parameter(Mandatory)][bool]$Enabled,
+        [Parameter(Mandatory)][bool]$AbsentBefore,
+        [Parameter(Mandatory)][bool]$AbsentAfter
+    )
+
+    return (-not $Enabled -or ($AbsentBefore -and $AbsentAfter))
 }
 
 function Test-R156SingleGitLineBytes {
@@ -1615,6 +1782,11 @@ function Get-R156RepositoryState {
         return [pscustomobject]$state
     }
 
+    $worktreeConfigAbsentBefore = Test-R156WorktreeConfigSurfaceAbsent -Path 'C:\XB\automation\.git\config.worktree'
+    if (-not $worktreeConfigAbsentBefore) {
+        return [pscustomobject]$state
+    }
+
     if ($null -eq $script:R156RepositoryConfigHandle) {
         $script:R156RepositoryConfigHandle = Open-R156ReadOnlyHandle -Path 'C:\XB\automation\.git\config'
     }
@@ -1705,6 +1877,11 @@ function Get-R156RepositoryState {
         $statusResult.StdoutBytes.Length -eq 0 -and
         $indexSideEffectFree
     )
+    $worktreeConfigAbsentAfter = Test-R156WorktreeConfigSurfaceAbsent -Path 'C:\XB\automation\.git\config.worktree'
+    $worktreeConfigFence = Test-R156WorktreeConfigFence `
+        -Enabled $true `
+        -AbsentBefore $worktreeConfigAbsentBefore `
+        -AbsentAfter $worktreeConfigAbsentAfter
     $state.ReadOk = (
         $branchResult.Success -and
         $headResult.Success -and
@@ -1717,7 +1894,8 @@ function Get-R156RepositoryState {
         $state.ConfigAdmission.Pass -and
         $state.ParentCount -eq 1 -and
         $statusResult.Success -and
-        $indexSideEffectFree
+        $indexSideEffectFree -and
+        $worktreeConfigFence
     )
     return [pscustomobject]$state
 }
@@ -2476,18 +2654,26 @@ function Read-R156TrustedSource {
         return $null
     }
 
+    $worktreeConfigAbsentBefore = Test-R156WorktreeConfigSurfaceAbsent -Path 'C:\XB\automation\.git\config.worktree'
+    if (-not $worktreeConfigAbsentBefore) {
+        return $null
+    }
     $resolved = Invoke-R156LocalGitRead -RepositoryRoot $RepositoryRoot -Arguments @(
         'rev-parse',
         '--verify',
         ([string]$script:R156ExpectedHeadAtExecution + ':' + $normalizedPath)
     )
-    $resolvedValue = Get-R156SingleGitLine -Result $resolved
-    if ($resolvedValue -notmatch '^[0-9a-f]{40}$' -or $resolvedValue -cne $ExpectedGitBlob) {
+    $committedResult = Invoke-R156LocalGitRead -RepositoryRoot $RepositoryRoot -Arguments @('cat-file', 'blob', $ExpectedGitBlob)
+    $worktreeConfigAbsentAfter = Test-R156WorktreeConfigSurfaceAbsent -Path 'C:\XB\automation\.git\config.worktree'
+    if (-not $worktreeConfigAbsentAfter) {
         return $null
     }
 
-    $committedResult = Invoke-R156LocalGitRead -RepositoryRoot $RepositoryRoot -Arguments @('cat-file', 'blob', $ExpectedGitBlob)
-    if ($null -eq $committedResult -or -not $committedResult.Success) {
+    $resolvedValue = Get-R156SingleGitLine -Result $resolved
+    if ($resolvedValue -notmatch '^[0-9a-f]{40}$' -or
+        $resolvedValue -cne $ExpectedGitBlob -or
+        $null -eq $committedResult -or
+        -not $committedResult.Success) {
         return $null
     }
     $committedBytes = [byte[]]$committedResult.StdoutBytes
@@ -5073,6 +5259,9 @@ try {
         Stop-R156Gate -SupportRef 'EG_R156_GITHUB_HEAD_FAILED'
     }
     $script:R156GithubAuth = 'PASS'
+    if (-not (Test-R156WorktreeConfigSurfaceAbsent -Path 'C:\XB\automation\.git\config.worktree')) {
+        Stop-R156Gate -SupportRef 'EG_R156_WORKTREE_CONFIG_CHANGED'
+    }
     $realResult = Invoke-R156Transport -Mode 'REAL' -CheckoutRoot $checkout -InstallerPath $canonicalInstaller.Path -LauncherRoot $topologyBeforeReal.Candidate -AdmissionCommit $script:R156ExpectedHeadAtExecution
     if ($null -eq $realResult -or -not $realResult.Started) {
         Stop-R156Gate -SupportRef 'EG_R156_REAL_CHILD_START_FAILED'
