@@ -341,7 +341,7 @@ class EnforcementTests(unittest.TestCase):
             self.assertEqual(self.repository.get_job(job.job_id).allocation_member_no, member_no)
             with self.assertRaises(ApiError):
                 self.service.write_intent(job.job_id, SESSION_A, {"operation": "member.create", "member_no": member_no, "payload_hash": job.payload_hash}, principal_valid=True)
-        job = self.prepare("conflicting-recheck", phone="89888888", recheck=True)
+        job = self.prepare("failed-recheck-4-conflicting", phone="89888888", recheck=True)
         self.service.allocation_recheck(job.job_id, SESSION_A, {"status": "FREE", "probe_reference": "conflicting-recheck-2"})
         self.assertEqual(self.repository.get_job(job.job_id).state, JobState.MANUAL_REVIEW)
         self.assertIsNone(self.repository.get_fresh_recheck(job.job_id, SESSION_A, now=NOW))

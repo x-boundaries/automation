@@ -28,9 +28,22 @@ insignificant whitespace is hashed before ingest.
 a same-ID/different-hash observation is a conflict; a different ID remains a
 different signup even when its customer fields match. The checked-in inactive
 adapter consumes the Google Forms v1 `responses` shape and maps required values
-only through the versioned question-ID allowlist; it follows `nextPageToken`
-with a bounded `pageToken` request, rejects malformed or repeated tokens, and
-de-duplicates overlapping `responseId` observations before ingest.
+only through the versioned question-ID allowlist. Config v2 requires a
+timezone-aware RFC3339 cutover watermark and a closed set of distinct question
+IDs before admission. Queries are inclusive (`createTime >= watermark`), pages
+are sorted by `(create_time, response_id)`, and an observation earlier than the
+watermark is rejected before job creation or cursor movement.
+
+Migration `0004_forms_ingest_cursor.sql` adds the keyed durable cursor and
+append-only page receipts without seeding production state. Source-event
+admission and monotonic response-cursor movement commit atomically. Page-token
+movement is a separate compare-and-set checkpoint and is permitted only when
+every eligible page response has an identical durable response-ID/payload-hash
+receipt. Terminal pagination clears the token and deliberately restarts
+inclusively from the durable response cursor. Same-ID/same-hash overlap is
+idempotent; conflicting hashes, reordered unseen responses behind the cursor,
+malformed/repeated/conflicting tokens, and any cursor regression fail closed.
+The initial deployment window admits at most one newly seen response.
 
 ## Member semantics
 
@@ -50,7 +63,7 @@ than silent reallocation. No truncation, alternate suffix, or wraparound is
 implemented.
 
 The effective production `member_no_max_length` is required configuration and
-must be an integer from 10 through 20. Repository/schema evidence does not
+must be exactly 20. Repository/schema evidence does not
 prove the installed account-book limit. Missing, invalid, or incompatible
 configuration blocks readiness and dispatch.
 
@@ -76,15 +89,36 @@ lock for the complete claim transaction. That row is the durable singleton
 mutex: separate PostgreSQL connections cannot both observe an empty active-lease
 set and claim parallel jobs.
 
-The bearer credential authenticates the caller; it is not the lease identity.
-Production binds two distinct runtime-only credential sources: the normal worker
-credential receives ordinary worker scopes, while the recovery credential
-receives only `worker.writer_termination_recovery`. The normal worker credential
-does not receive recovery scope, and the recovery credential is not a worker,
-source-ingest, result, reconciliation, or control credential. Readiness and
-environment authentication fail closed if either configured digest is missing,
-the digests match, or the credential sources alias. Credential values and
-digests remain outside Git and ordinary logs.
+Bearer credentials authenticate callers; they are not lease identities.
+Production binds exactly five pairwise-distinct principals: source
+(`source.ingest`), operator (`operator.status.read` and
+`operator.reconciliation.read`), control (`control.kill_switch` and
+`control.activate`), the normal worker (the frozen worker scope set), and
+recovery (`worker.writer_termination_recovery` only). Their environment names,
+configured SHA-256 digests, and resolved runtime values must each be pairwise
+distinct. There is no role union. The reference-HMAC key is a separate runtime
+boundary and cannot authenticate HTTP. Missing, malformed, aliased, or
+mismatched bindings fail before listening. Credential values remain outside
+Git, errors, and logs.
+
+## Production bootstrap and operator reads
+
+The only production entry is `python -m xb_member_gateway --config
+<reviewed-external-config>`. It loads closed config v2, enforces safe defaults,
+resolves only named PostgreSQL, bind, reference-HMAC, and five bearer
+boundaries, validates separation, builds the authenticator and repository, and
+performs read-only admission checks for migrations 0001 through 0004, control
+rows, and initialized cursor/watermark consistency. Only then may it construct
+the service/application and listen. Bootstrap never migrates, initializes,
+repairs, discovers identity, generates credentials, clears the kill switch, or
+activates the gateway; failures expose bounded codes only.
+
+The operator status and reconciliation GET endpoints are read-only safe
+projections. They expose readiness/control state, bounded lease/hold/proof and
+uncertainty summaries, and public reconciliation/result lineage. They never
+expose worker/process/host identity, MemberNo, source payloads, raw response
+IDs, credentials, or page tokens. Operators have no mutation route; existing
+control and worker mutation scopes remain separate.
 
 Every worker request carries `X-XB-Worker-Session` with a generated `ws-` plus
 32 lower-case hexadecimal characters. The value is generated locally for one
@@ -227,6 +261,10 @@ receipts, jobs, attempts, leases, allocation probes and bindings, write intents,
 dispatch fences, append-only result events plus a current result projection,
 reconciliation cases/checks, rejections, dead letters, control flags, audit
 events, and schema versions. Foreign keys use restrictive delete behaviour.
+The separate 0004 migration adds only the durable Forms cursor and append-only
+page receipts. It does not modify migrations 0001-0003 and does not seed a real
+watermark or cursor; one-time production initialization is a later authorised
+deployment transaction.
 The current projection is replaced by a conditional update only after the
 immutable result event is recorded in the same transaction; the unique `job_id`
 projection is never delete/reinserted. No database transaction remains open

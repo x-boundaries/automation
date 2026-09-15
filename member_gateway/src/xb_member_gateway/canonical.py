@@ -138,19 +138,33 @@ def _safe_identity(value: Any, field: str) -> str:
     return normalized
 
 
-def parse_rfc3339(value: Any) -> datetime:
+def parse_rfc3339(value: Any, *, field: str = "create_time") -> datetime:
     if not isinstance(value, str) or not value.strip():
-        raise CanonicalizationError("create_time_required")
+        raise CanonicalizationError(f"{field}_required")
     candidate = value.strip()
     if candidate.endswith("Z"):
         candidate = f"{candidate[:-1]}+00:00"
     try:
         parsed = datetime.fromisoformat(candidate)
     except ValueError as exc:
-        raise CanonicalizationError("create_time_invalid") from exc
+        raise CanonicalizationError(f"{field}_invalid") from exc
     if parsed.tzinfo is None or parsed.utcoffset() is None:
-        raise CanonicalizationError("create_time_timezone_required")
+        raise CanonicalizationError(f"{field}_timezone_required")
     return parsed
+
+
+def validate_page_token(value: Any, *, allow_none: bool = True) -> str | None:
+    """Validate an opaque token without ever interpreting or logging it."""
+
+    if value is None and allow_none:
+        return None
+    if not isinstance(value, str) or not re.fullmatch(r"[\x20-\x7e]{1,1024}", value):
+        raise CanonicalizationError("forms_page_token_invalid")
+    return value
+
+
+def source_position(create_time: str, response_id: str) -> tuple[datetime, str]:
+    return parse_rfc3339(create_time), _safe_identity(response_id, "response_id")
 
 
 def format_rfc3339(value: datetime) -> str:
@@ -311,9 +325,7 @@ def iter_forms_pages(
         next_token = snake_token if snake_token is not None else camel_token
         if next_token is None or next_token == "":
             return
-        if not isinstance(next_token, str):
-            raise CanonicalizationError("forms_page_token_invalid")
-        token = next_token
+        token = validate_page_token(next_token, allow_none=False)
     raise CanonicalizationError("forms_pagination_limit_exceeded")
 
 

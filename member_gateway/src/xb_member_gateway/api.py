@@ -8,7 +8,7 @@ import uuid
 from dataclasses import dataclass, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Mapping
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 from .allocation import AllocationError, MemberNoAllocator
 from .auth import (
@@ -98,12 +98,12 @@ class GatewayService:
         config: GatewayConfig,
         repository: Any,
         *,
-        adapter_ready: bool = False,
+        adapter_ready: bool | None = None,
         clock=None,
     ):
         self.config = config
         self.repository = repository
-        self.adapter_ready = adapter_ready
+        self.adapter_ready = config.autocount_adapter_ready if adapter_ready is None else adapter_ready
         self.clock = clock
 
     def _runtime_config(self) -> GatewayConfig:
@@ -140,7 +140,15 @@ class GatewayService:
             raise ApiError(422, "form_alias_not_allowlisted")
         if event.mapping_version not in config.allowed_mapping_versions:
             raise ApiError(422, "mapping_version_not_allowlisted")
-        outcome = self.repository.ingest_source_event(event, now=self.clock)
+        outcome = self.repository.ingest_source_event(
+            event,
+            now=self.clock,
+            initial_window_max=(
+                None
+                if config.production_activation_enabled
+                else config.initial_source_window_max
+            ),
+        )
         return {
             "schema_version": "xb.member.gateway.job.v2",
             "job_id": outcome.job.job_id,
@@ -308,7 +316,7 @@ class GatewayService:
                 lease_owner=job.lease_owner,
                 positive_free_evidence=positive_free,
                 fresh_bound_member_no_recheck=fresh_recheck,
-                gateway_ready=config.gateway_ready,
+                gateway_ready=config.worker_gateway_ready,
                 autocount_adapter_ready=self.adapter_ready,
                 worker_credential_valid=principal_valid,
                 kill_switch_rechecked=not config.kill_switch_enabled,
@@ -532,6 +540,33 @@ class GatewayService:
     def status(self, job_id: str) -> dict[str, Any]:
         return self.repository.get_job(job_id).safe_dict()
 
+    def source_cursor(self, form_alias: str, mapping_version: str) -> dict[str, Any]:
+        if form_alias not in self.config.allowed_form_aliases or mapping_version not in self.config.allowed_mapping_versions:
+            raise ApiError(422, "source_cursor_binding_invalid")
+        return self.repository.get_source_cursor(form_alias, mapping_version).to_dict()
+
+    def checkpoint_source_page(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        _exact_fields(body, {"form_alias", "mapping_version", "expected_state_version", "current_page_token", "next_page_token", "scan_lower_bound", "terminal", "responses"})
+        if body["form_alias"] not in self.config.allowed_form_aliases or body["mapping_version"] not in self.config.allowed_mapping_versions:
+            raise ApiError(422, "source_cursor_binding_invalid")
+        if isinstance(body["expected_state_version"], bool) or not isinstance(body["expected_state_version"], int) or body["expected_state_version"] < 0:
+            raise ApiError(400, "source_cursor_state_version_invalid")
+        if not isinstance(body["terminal"], bool) or not isinstance(body["responses"], list):
+            raise ApiError(400, "source_page_request_invalid")
+        cursor = self.repository.checkpoint_source_page(
+            body["form_alias"], body["mapping_version"],
+            expected_state_version=body["expected_state_version"],
+            current_page_token=body["current_page_token"], next_page_token=body["next_page_token"],
+            scan_lower_bound=body["scan_lower_bound"], terminal=body["terminal"], responses=body["responses"],
+        )
+        return cursor.to_dict()
+
+    def operator_status(self) -> dict[str, Any]:
+        return self.repository.operator_status()
+
+    def operator_reconciliation(self, job_id: str) -> dict[str, Any]:
+        return self.repository.operator_reconciliation(job_id)
+
     def disable_kill_switch(self) -> dict[str, Any]:
         self.repository.set_control("kill_switch_enabled", False)
         return {"status": "disabled", "kill_switch_enabled": False}
@@ -583,7 +618,7 @@ class GatewayApp:
         if isinstance(error, JobNotFound):
             status, code = 404, "job_not_found"
         elif isinstance(error, SourceConflict):
-            status, code = 409, "source_identity_conflict"
+            status, code = 409, _safe_code(str(error), "source_identity_conflict")
         elif isinstance(error, ResultConflict):
             status, code = 409, "result_conflict"
         elif isinstance(error, WriterTerminationConflict):
@@ -615,7 +650,8 @@ class GatewayApp:
         body: bytes | str | Mapping[str, Any] | None = None,
     ) -> ApiResponse:
         headers = headers or {}
-        route = urlsplit(path).path
+        split = urlsplit(path)
+        route = split.path
         try:
             if method == "GET" and route in {"/livez", "/v1/health"}:
                 return ApiResponse(200, self.service.health())
@@ -626,6 +662,22 @@ class GatewayApp:
             if method == "POST" and route == "/v1/source-events":
                 self._principal(headers, "source.ingest")
                 return ApiResponse(202, self.service.ingest(value))
+            if method == "GET" and route == "/v1/source/cursor":
+                self._principal(headers, "source.ingest")
+                query = parse_qs(split.query, keep_blank_values=True, strict_parsing=True)
+                if set(query) != {"form_alias", "mapping_version"} or any(len(item) != 1 for item in query.values()):
+                    raise ApiError(400, "source_cursor_query_invalid")
+                return ApiResponse(200, self.service.source_cursor(query["form_alias"][0], query["mapping_version"][0]))
+            if method == "POST" and route == "/v1/source/cursor/page":
+                self._principal(headers, "source.ingest")
+                return ApiResponse(200, self.service.checkpoint_source_page(value))
+            if method == "GET" and route == "/v1/operator/status":
+                self._principal(headers, "operator.status.read")
+                return ApiResponse(200, self.service.operator_status())
+            match = re.fullmatch(r"/v1/operator/reconciliation/([^/]+)", route)
+            if method == "GET" and match:
+                self._principal(headers, "operator.reconciliation.read")
+                return ApiResponse(200, self.service.operator_reconciliation(unquote(match.group(1))))
             if method == "POST" and route == "/v1/worker/claim":
                 self._principal(headers, "worker.claim")
                 return ApiResponse(200, self.service.claim(self._worker_session(headers)))

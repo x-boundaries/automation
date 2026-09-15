@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/schemas/member_gateway_operator_reconciliation.v1.schema.json",
+  "title": "XB member gateway operator reconciliation v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "job", "result", "reconciliation"],
+  "properties": {
+    "schema_version": {"const": "xb.member.gateway.operator_reconciliation.v1"},
+    "job": {
+      "type": "object", "additionalProperties": false,
+      "required": ["job_id", "operation", "state", "state_version", "attempt", "created_at"],
+      "properties": {
+        "job_id": {"type": "string"}, "operation": {"const": "member.create"},
+        "state": {"type": "string"}, "state_version": {"type": "integer", "minimum": 0},
+        "attempt": {"type": "integer", "minimum": 0}, "created_at": {"type": "string", "format": "date-time"}
+      }
+    },
+    "result": {
+      "oneOf": [
+        {"type": "null"},
+        {"type": "object", "additionalProperties": false, "required": ["status", "result_hash", "public_fence_reference", "acknowledged_at"], "properties": {
+          "status": {"type": "string"}, "result_hash": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+          "public_fence_reference": {"type": "string", "pattern": "^fence-[0-9a-f]{32}$"}, "acknowledged_at": {"type": "string", "format": "date-time"}
+        }}
+      ]
+    },
+    "reconciliation": {
+      "oneOf": [
+        {"type": "null"},
+        {"type": "object", "additionalProperties": false, "required": ["case_state", "opened_at", "closed_at", "check_state", "checked_at"], "properties": {
+          "case_state": {"type": "string"}, "opened_at": {"type": "string", "format": "date-time"},
+          "closed_at": {"type": ["string", "null"], "format": "date-time"},
+          "check_state": {"type": ["string", "null"]}, "checked_at": {"type": ["string", "null"], "format": "date-time"}
+        }}
+      ]
+    }
+  }
+}

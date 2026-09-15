@@ -10,10 +10,16 @@ from xb_member_gateway.auth import (
 from xb_member_gateway.config import ConfigError, GatewayConfig
 
 
-WORKER_TOKEN = "synthetic-worker-secret"
-RECOVERY_TOKEN = "synthetic-recovery-secret"
-WORKER_ENV = "TEST_XB_MEMBER_GATEWAY_WORKER_TOKEN"
-RECOVERY_ENV = "TEST_XB_MEMBER_GATEWAY_RECOVERY_TOKEN"
+TOKENS = {
+    "source": "synthetic-source-secret", "operator": "synthetic-operator-secret",
+    "control": "synthetic-control-secret", "worker": "synthetic-worker-secret",
+    "recovery": "synthetic-recovery-secret",
+}
+ENVS = {name: f"TEST_XB_MEMBER_GATEWAY_{name.upper()}_TOKEN" for name in TOKENS}
+WORKER_TOKEN = TOKENS["worker"]
+RECOVERY_TOKEN = TOKENS["recovery"]
+WORKER_ENV = ENVS["worker"]
+RECOVERY_ENV = ENVS["recovery"]
 
 
 def digest(value):
@@ -23,10 +29,8 @@ def digest(value):
 def valid_config(**changes):
     value = {
         "member_no_max_length": 20,
-        "worker_token_sha256": digest(WORKER_TOKEN),
-        "recovery_token_sha256": digest(RECOVERY_TOKEN),
-        "worker_token_env": WORKER_ENV,
-        "recovery_token_env": RECOVERY_ENV,
+        **{f"{name}_token_sha256": digest(token) for name, token in TOKENS.items()},
+        **{f"{name}_token_env": ENVS[name] for name in TOKENS},
         "production_activation_enabled": True,
         "kill_switch_enabled": False,
     }
@@ -39,12 +43,15 @@ class BearerAuthenticatorTests(unittest.TestCase):
         config = valid_config()
         with patch.dict(
             os.environ,
-            {WORKER_ENV: WORKER_TOKEN, RECOVERY_ENV: RECOVERY_TOKEN},
+            {ENVS[name]: token for name, token in TOKENS.items()},
             clear=False,
         ):
             authenticator = BearerTokenAuthenticator.from_environment(config)
             worker = authenticator.authenticate({"Authorization": f"Bearer {WORKER_TOKEN}"})
             recovery = authenticator.authenticate({"Authorization": f"Bearer {RECOVERY_TOKEN}"})
+            source = authenticator.authenticate({"Authorization": f"Bearer {TOKENS['source']}"})
+            operator = authenticator.authenticate({"Authorization": f"Bearer {TOKENS['operator']}"})
+            control = authenticator.authenticate({"Authorization": f"Bearer {TOKENS['control']}"})
 
         self.assertEqual(worker.subject, "configured-worker")
         self.assertIn("worker.claim", worker.scopes)
@@ -56,10 +63,14 @@ class BearerAuthenticatorTests(unittest.TestCase):
             frozenset({"worker.writer_termination_recovery"}),
         )
         self.assertNotIn("job.read", recovery.scopes)
+        self.assertEqual(source.scopes, frozenset({"source.ingest"}))
+        self.assertEqual(operator.scopes, frozenset({"operator.status.read", "operator.reconciliation.read"}))
+        self.assertEqual(control.scopes, frozenset({"control.kill_switch", "control.activate"}))
 
     def test_missing_recovery_runtime_credential_fails_closed(self):
         config = valid_config()
-        with patch.dict(os.environ, {WORKER_ENV: WORKER_TOKEN}, clear=True):
+        runtime = {ENVS[name]: token for name, token in TOKENS.items() if name != "recovery"}
+        with patch.dict(os.environ, runtime, clear=True):
             authenticator = BearerTokenAuthenticator.from_environment(config)
             with self.assertRaises(AuthenticationError):
                 authenticator.authenticate({"Authorization": f"Bearer {WORKER_TOKEN}"})
@@ -71,13 +82,13 @@ class BearerAuthenticatorTests(unittest.TestCase):
 
     def test_same_worker_and_recovery_digest_is_rejected(self):
         with self.assertRaisesRegex(
-            ConfigError, "worker_recovery_credential_digests_must_differ"
+            ConfigError, "credential_digests_must_differ"
         ):
             valid_config(recovery_token_sha256=digest(WORKER_TOKEN))
 
     def test_aliased_worker_and_recovery_sources_are_rejected(self):
         with self.assertRaisesRegex(
-            ConfigError, "worker_recovery_credential_sources_must_differ"
+            ConfigError, "credential_environment_bindings_must_differ"
         ):
             valid_config(recovery_token_env=WORKER_ENV)
 

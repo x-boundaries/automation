@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/schemas/member_gateway_operator_status.v1.schema.json",
+  "title": "XB member gateway operator status v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "activation_enabled", "kill_switch_enabled", "migrations_ready", "source_cursor_ready", "active_lease_count", "writer_hold_active", "writer_quarantined", "termination_proof_required", "uncertain_job_count"],
+  "properties": {
+    "schema_version": {"const": "xb.member.gateway.operator_status.v1"},
+    "activation_enabled": {"type": "boolean"},
+    "kill_switch_enabled": {"type": "boolean"},
+    "migrations_ready": {"type": "boolean"},
+    "source_cursor_ready": {"type": "boolean"},
+    "active_lease_count": {"type": "integer", "minimum": 0},
+    "writer_hold_active": {"type": "boolean"},
+    "writer_quarantined": {"type": "boolean"},
+    "termination_proof_required": {"type": "boolean"},
+    "uncertain_job_count": {"type": "integer", "minimum": 0}
+  }
+}

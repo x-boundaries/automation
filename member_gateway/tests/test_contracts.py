@@ -24,6 +24,9 @@ class ContractSurfaceTests(unittest.TestCase):
             "schemas/member_gateway_job.v2.schema.json",
             "schemas/member_gateway_result.v1.schema.json",
             "schemas/member_gateway_error.v1.schema.json",
+            "schemas/member_gateway_source_cursor.v1.schema.json",
+            "schemas/member_gateway_operator_status.v1.schema.json",
+            "schemas/member_gateway_operator_reconciliation.v1.schema.json",
             "config/member_gateway.production.example.json",
         ):
             value = self.read_json(relative)
@@ -49,6 +52,9 @@ class ContractSurfaceTests(unittest.TestCase):
             "schemas/member_gateway_job.v2.schema.json",
             "schemas/member_gateway_result.v1.schema.json",
             "schemas/member_gateway_error.v1.schema.json",
+            "schemas/member_gateway_source_cursor.v1.schema.json",
+            "schemas/member_gateway_operator_status.v1.schema.json",
+            "schemas/member_gateway_operator_reconciliation.v1.schema.json",
         ):
             assert_closed(self.read_json(relative))
 
@@ -69,12 +75,16 @@ class ContractSurfaceTests(unittest.TestCase):
         config = self.read_json("config/member_gateway.production.example.json")
         self.assertFalse(config["production_activation_enabled"])
         self.assertTrue(config["kill_switch_enabled"])
-        self.assertIsNone(config["member_no_max_length"])
+        self.assertEqual(config["member_no_max_length"], 20)
+        self.assertEqual(config["schema_version"], "xb.member.gateway.config.v2")
+        self.assertEqual(config["initial_source_window_max"], 1)
+        self.assertFalse(config["autocount_adapter_ready"])
+        self.assertIsNone(config["source_cutover_watermark"])
         self.assertIsNone(config["worker_token_sha256"])
         self.assertIsNone(config["recovery_token_sha256"])
         loaded = GatewayConfig.from_mapping(config)
         self.assertFalse(loaded.gateway_ready)
-        self.assertIn("member_no_max_length_required", loaded.readiness_reasons())
+        self.assertIn("source_cutover_watermark_required", loaded.readiness_reasons())
         self.assertIn("recovery_credential_digest_required", loaded.readiness_reasons())
 
     def test_writer_timing_order_is_strictly_nested(self):
@@ -98,6 +108,7 @@ class ContractSurfaceTests(unittest.TestCase):
             ROOT / "member_gateway/migrations/0002_result_event_history.sql"
         ).read_text(encoding="utf-8")
         third = (ROOT / "member_gateway/migrations/0003_writer_termination_quarantine.sql").read_text(encoding="utf-8")
+        fourth = (ROOT / "member_gateway/migrations/0004_forms_ingest_cursor.sql").read_text(encoding="utf-8")
         for table in (
             "source_responses",
             "source_observations",
@@ -133,6 +144,13 @@ class ContractSurfaceTests(unittest.TestCase):
         self.assertIn("legacy_unproven", third)
         self.assertIn("ADD COLUMN IF NOT EXISTS recheck_id", third)
         self.assertNotIn("ON DELETE CASCADE", third.upper())
+        self.assertIn("source_ingest_cursors", fourth)
+        self.assertIn("source_ingest_page_receipts", fourth)
+        self.assertIn("initial_window_admission_count", fourth)
+        self.assertIn("protect_source_ingest_cursor_identity", fourth)
+        self.assertIn("source_ingest_cursor_identity_immutable", fourth)
+        self.assertIn("reject_source_page_receipt_mutation", fourth)
+        self.assertNotIn("INSERT INTO xb_member_gateway.source_ingest_cursors", fourth)
 
     def test_state_machine_contains_all_required_states_and_blocks_requeue(self):
         required = {
@@ -173,6 +191,23 @@ class ContractSurfaceTests(unittest.TestCase):
         self.assertFalse(allocator.validate_candidate("6581234567", "658123456"))
         self.assertFalse(allocator.validate_candidate("6581234567", "6581234567-1"))
         self.assertFalse(allocator.validate_candidate("6581234567", "6581234567X01"))
+
+        production_allocator = MemberNoAllocator(20)
+        self.assertFalse(
+            production_allocator.validate_candidate("1" * 20, "1" * 21)
+        )
+
+    def test_governed_mapping_surfaces_do_not_bind_unused_udfs(self):
+        governed = (
+            ROOT / "member_gateway/src/xb_member_gateway/canonical.py",
+            ROOT / "member_gateway/src/xb_member_gateway/models.py",
+            ROOT / "member_gateway/src/xb_member_gateway/repository.py",
+            ROOT / "config/member_gateway.production.example.json",
+            ROOT / "n8n-workflows/member_forms_gateway_ingest.workflow.json",
+        )
+        text = "\n".join(path.read_text(encoding="utf-8") for path in governed)
+        self.assertNotIn("UDF_CustId", text)
+        self.assertNotIn("UDF_MemberId", text)
 
 
 if __name__ == "__main__":

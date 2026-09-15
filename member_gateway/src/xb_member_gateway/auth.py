@@ -53,6 +53,18 @@ WORKER_SESSION_HEADER = "X-XB-Worker-Session"
 WORKER_SESSION_RE = re.compile(r"^ws-[0-9a-f]{32}$")
 WORKER_HOST_BINDING_RE = re.compile(r"^host-[A-Za-z0-9._:-]{1,120}$")
 
+SOURCE_SCOPES = frozenset({"source.ingest"})
+OPERATOR_SCOPES = frozenset({"operator.status.read", "operator.reconciliation.read"})
+CONTROL_SCOPES = frozenset({"control.kill_switch", "control.activate"})
+WORKER_SCOPES = frozenset(
+    {
+        "worker.claim", "worker.heartbeat", "worker.allocation", "worker.write_intent",
+        "worker.dispatch", "worker.writer_register", "worker.writer_termination",
+        "worker.writer_quarantine", "worker.result", "worker.reconcile", "job.read",
+    }
+)
+RECOVERY_SCOPES = frozenset({"worker.writer_termination_recovery"})
+
 
 def worker_session(value: str) -> str:
     """Validate the public-safe per-process lease/session identifier."""
@@ -85,51 +97,43 @@ class BearerTokenAuthenticator:
         )
 
     @classmethod
-    def from_environment(cls, config: GatewayConfig) -> "BearerTokenAuthenticator":
+    def from_environment(
+        cls,
+        config: GatewayConfig,
+        environment: Mapping[str, str] | None = None,
+        *,
+        strict: bool = False,
+    ) -> "BearerTokenAuthenticator":
+        def rejected(code: str) -> "BearerTokenAuthenticator":
+            if strict:
+                raise AuthenticationError(code)
+            return cls({})
+
         try:
             config.validate()
         except ValueError:
-            return cls({})
-        if config.worker_token_sha256 is None or config.recovery_token_sha256 is None:
-            return cls({})
-        worker_token = os.environ.get(config.worker_token_env, "")
-        recovery_token = os.environ.get(config.recovery_token_env, "")
-        if not worker_token or not recovery_token:
-            return cls({})
-        worker_digest = hashlib.sha256(worker_token.encode("utf-8")).hexdigest()
-        recovery_digest = hashlib.sha256(recovery_token.encode("utf-8")).hexdigest()
-        if hmac.compare_digest(worker_digest, recovery_digest):
-            return cls({})
-        if not hmac.compare_digest(config.worker_token_sha256.lower(), worker_digest):
-            return cls({})
-        if not hmac.compare_digest(config.recovery_token_sha256.lower(), recovery_digest):
-            return cls({})
-        return cls(
-            {
-                worker_digest: Principal(
-                    subject="configured-worker",
-                    scopes=frozenset(
-                        {
-                            "worker.claim",
-                            "worker.heartbeat",
-                            "worker.allocation",
-                            "worker.write_intent",
-                            "worker.dispatch",
-                            "worker.writer_register",
-                            "worker.writer_termination",
-                            "worker.writer_quarantine",
-                            "worker.result",
-                            "worker.reconcile",
-                            "job.read",
-                        }
-                    ),
-                ),
-                recovery_digest: Principal(
-                    subject="configured-recovery",
-                    scopes=frozenset({"worker.writer_termination_recovery"}),
-                ),
-            }
+            return rejected("authentication_configuration_invalid")
+        if any(digest is None for digest in config.credential_digests):
+            return rejected("authentication_digest_missing")
+        source = environment if environment is not None else os.environ
+        tokens = [source.get(name, "") for name in config.credential_env_names]
+        if any(not token or any(character.isspace() for character in token) for token in tokens):
+            return rejected("authentication_binding_missing")
+        if len(set(tokens)) != 5:
+            return rejected("authentication_binding_aliased")
+        digests = [hashlib.sha256(token.encode("utf-8")).hexdigest() for token in tokens]
+        if len(set(digests)) != 5:
+            return rejected("authentication_binding_aliased")
+        if any(not hmac.compare_digest(expected or "", actual) for expected, actual in zip(config.credential_digests, digests)):
+            return rejected("authentication_binding_mismatch")
+        principals = (
+            Principal("configured-source", SOURCE_SCOPES),
+            Principal("configured-operator", OPERATOR_SCOPES),
+            Principal("configured-control", CONTROL_SCOPES),
+            Principal("configured-worker", WORKER_SCOPES),
+            Principal("configured-recovery", RECOVERY_SCOPES),
         )
+        return cls(dict(zip(digests, principals)))
 
     def authenticate(self, headers: Mapping[str, str]) -> Principal:
         value = _header(headers, "Authorization")

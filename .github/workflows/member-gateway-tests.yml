@@ -9,6 +9,9 @@ on:
       - "schemas/member_gateway_job.v2.schema.json"
       - "schemas/member_gateway_result.v1.schema.json"
       - "schemas/member_gateway_error.v1.schema.json"
+      - "schemas/member_gateway_source_cursor.v1.schema.json"
+      - "schemas/member_gateway_operator_status.v1.schema.json"
+      - "schemas/member_gateway_operator_reconciliation.v1.schema.json"
       - "config/member_gateway.production.example.json"
       - "scripts/ac2_member_gateway_worker.ps1"
       - "scripts/ac2_member_gateway_worker_lib.ps1"
@@ -25,6 +28,7 @@ on:
       - "docs/ci-cd/CURRENT_CICD_STATUS.md"
       - "n8n-workflows/member_forms_gateway_ingest.workflow.json"
       - "member_gateway/migrations/0003_writer_termination_quarantine.sql"
+      - "member_gateway/migrations/0004_forms_ingest_cursor.sql"
       - ".github/workflows/member-gateway-tests.yml"
   push:
     branches:
@@ -36,6 +40,9 @@ on:
       - "schemas/member_gateway_job.v2.schema.json"
       - "schemas/member_gateway_result.v1.schema.json"
       - "schemas/member_gateway_error.v1.schema.json"
+      - "schemas/member_gateway_source_cursor.v1.schema.json"
+      - "schemas/member_gateway_operator_status.v1.schema.json"
+      - "schemas/member_gateway_operator_reconciliation.v1.schema.json"
       - "config/member_gateway.production.example.json"
       - "scripts/ac2_member_gateway_worker.ps1"
       - "scripts/ac2_member_gateway_worker_lib.ps1"
@@ -52,6 +59,7 @@ on:
       - "docs/ci-cd/CURRENT_CICD_STATUS.md"
       - "n8n-workflows/member_forms_gateway_ingest.workflow.json"
       - "member_gateway/migrations/0003_writer_termination_quarantine.sql"
+      - "member_gateway/migrations/0004_forms_ingest_cursor.sql"
       - ".github/workflows/member-gateway-tests.yml"
   workflow_dispatch: {}
 
