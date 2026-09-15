@@ -634,6 +634,61 @@ foreach ($entry in $cases.GetEnumerator()) {
             values[key] = value.lower() == "true"
         return values
 
+    def run_protected_root_acl_matrix(self):
+        script = (
+            "$ErrorActionPreference = 'Stop'\n"
+            + self.extracted_functions(
+                (
+                    "Test-R156ProtectedInstallationRoot",
+                    "Test-R156MutationCapableFileSystemRights",
+                )
+            )
+            + r"""
+function Test-R156NormalDirectory { return $true }
+function Test-R156SamePath { return $false }
+function Test-R156PathWithin { return $true }
+function Test-R156NoReparseAncestors { return $true }
+function Get-Acl { return [pscustomobject]@{ Access = @($script:R156AclRule) } }
+
+function New-R156RawFileSystemRights {
+    param([Parameter(Mandatory)][string]$Hex)
+    $bits = [Convert]::ToUInt32($Hex, 16)
+    $signed = [BitConverter]::ToInt32([BitConverter]::GetBytes($bits), 0)
+    return [System.Enum]::ToObject(
+        [System.Security.AccessControl.FileSystemRights],
+        $signed
+    )
+}
+
+$cases = @(
+    [pscustomobject]@{ Name = 'CreatorOwnerGenericAllInheritOnly'; Identity = 'CREATOR OWNER'; Rights = (New-R156RawFileSystemRights -Hex '10000000'); Propagation = [System.Security.AccessControl.PropagationFlags]::InheritOnly },
+    [pscustomobject]@{ Name = 'CreatorOwnerGenericAllNone'; Identity = 'CREATOR OWNER'; Rights = (New-R156RawFileSystemRights -Hex '10000000'); Propagation = [System.Security.AccessControl.PropagationFlags]::None },
+    [pscustomobject]@{ Name = 'BuiltinUsersGenericAllInheritOnly'; Identity = 'BUILTIN\Users'; Rights = (New-R156RawFileSystemRights -Hex '10000000'); Propagation = [System.Security.AccessControl.PropagationFlags]::InheritOnly },
+    [pscustomobject]@{ Name = 'EveryoneWriteDataNone'; Identity = 'Everyone'; Rights = [System.Security.AccessControl.FileSystemRights]::WriteData; Propagation = [System.Security.AccessControl.PropagationFlags]::None },
+    [pscustomobject]@{ Name = 'EveryoneWriteDataInheritOnly'; Identity = 'Everyone'; Rights = [System.Security.AccessControl.FileSystemRights]::WriteData; Propagation = [System.Security.AccessControl.PropagationFlags]::InheritOnly },
+    [pscustomobject]@{ Name = 'AuthenticatedUsersGenericWriteInheritOnly'; Identity = 'Authenticated Users'; Rights = (New-R156RawFileSystemRights -Hex '40000000'); Propagation = [System.Security.AccessControl.PropagationFlags]::InheritOnly },
+    [pscustomobject]@{ Name = 'CreatorOwnerReadAndExecuteNone'; Identity = 'CREATOR OWNER'; Rights = [System.Security.AccessControl.FileSystemRights]::ReadAndExecute; Propagation = [System.Security.AccessControl.PropagationFlags]::None }
+)
+
+foreach ($case in $cases) {
+    $script:R156AclRule = [pscustomobject]@{
+        AccessControlType = [System.Security.AccessControl.AccessControlType]::Allow
+        IdentityReference = $case.Identity
+        FileSystemRights = $case.Rights
+        PropagationFlags = $case.Propagation
+    }
+    $accepted = Test-R156ProtectedInstallationRoot -InstallationRoot 'C:\Program Files\EnergyGrid' -ProgramFilesRoot 'C:\Program Files'
+    Write-Output ($case.Name + '=' + [string]$accepted)
+}
+"""
+        )
+        lines = self.run_isolated_powershell(script)
+        values = {}
+        for line in lines:
+            key, value = line.split("=", 1)
+            values[key] = value.lower() == "true"
+        return values
+
     def run_json_matrix(self, cases):
         with tempfile.TemporaryDirectory(prefix="r156_json_cases_") as directory:
             root = Path(directory)
@@ -2238,6 +2293,19 @@ $result | ConvertTo-Json -Compress
         for name, expected in expected_raw.items():
             with self.subTest(raw_mask=name):
                 self.assertEqual(values[name], expected)
+
+    def test_protected_root_creator_owner_inheritonly_behavioural_matrix(self):
+        values = self.run_protected_root_acl_matrix()
+        expected = {
+            "CreatorOwnerGenericAllInheritOnly": True,
+            "CreatorOwnerGenericAllNone": False,
+            "BuiltinUsersGenericAllInheritOnly": False,
+            "EveryoneWriteDataNone": False,
+            "EveryoneWriteDataInheritOnly": False,
+            "AuthenticatedUsersGenericWriteInheritOnly": False,
+            "CreatorOwnerReadAndExecuteNone": True,
+        }
+        self.assertEqual(values, expected)
 
     def test_strict_json_reader_behavioural_matrix(self):
         depth = 33
