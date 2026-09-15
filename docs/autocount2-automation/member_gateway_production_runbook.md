@@ -12,11 +12,20 @@ checks, `git diff --check`, and the final secret/PII/scope scan. Use synthetic
 fixtures only. Do not set production credentials or enable the workflow while
 reviewing the branch.
 
-The committed example config must remain activation-disabled, kill-switch-on,
-without a MemberNo limit, and without worker or recovery credential digests.
-Those values make readiness fail closed until an owner supplies deployment
-configuration outside Git. The worker and recovery credential sources must also
-remain distinct; equal digests or aliased sources are refused.
+The committed config v2 example must remain activation-disabled,
+kill-switch-on, adapter-not-ready, fixed to `member_no_max_length=20`, and
+without real form/question IDs, cutover watermark, credential digests, database,
+bind, TLS, host, or gateway bindings. Those values make readiness fail closed
+until an owner supplies reviewed deployment configuration outside Git.
+
+Before any listener starts, run only `python -m xb_member_gateway --config
+<reviewed-external-config>`. Bootstrap must read and validate config, resolve
+the named runtime boundaries, validate all five principal separations, build
+the strict authenticator and repository, and read-only verify migrations
+0001-0004, required control rows, and initialized cursor/watermark consistency.
+Any bounded bootstrap error is a stop condition. Do not let bootstrap apply a
+migration, initialize the cursor, repair state, generate a credential, clear
+the kill switch, or activate the gateway.
 
 ## Pre-activation review
 
@@ -32,10 +41,20 @@ PDPA acknowledgement. Marketing `No` must remain eligible for membership
 creation.
 
 Confirm private transport, authentication scopes, database backups, operator
-access, alerting, and manual reconciliation ownership. Bind the normal worker
-credential to ordinary worker scopes only, and bind a separate recovery
-credential to only `worker.writer_termination_recovery`; do not grant recovery
-authority to the normal worker or ordinary worker/control authority to recovery.
+access, alerting, and manual reconciliation ownership. Bind exactly five
+pairwise-distinct source, operator, control, normal-worker, and recovery bearer
+principals. Keep their environment names, configured digests, and runtime
+values pairwise distinct; do not combine roles. Bind recovery only to
+`worker.writer_termination_recovery`, and never use the reference-HMAC key as a
+bearer.
+
+Apply migration 0004 and initialize its immutable production watermark/cursor
+only in a later separately authorised deployment transaction. The configured
+watermark must exactly match the persisted value. Review the closed question-ID
+map, inclusive Forms query, `(create_time, response_id)` ordering, and one-new-
+response initial window. A page-token checkpoint is valid only after all
+eligible page responses have identical durable receipts. Terminal scans restart
+inclusively; overlaps are expected and conflicting history is a stop condition.
 Keep worker concurrency and claim size at one for this initial topology. The repository must enforce
 one active non-expired worker lease across concurrent claim requests. A worker
 run must generate one bounded `ws-` session identifier and send it in

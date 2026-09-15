@@ -138,13 +138,8 @@ class GatewayTests(unittest.TestCase):
         self.assertEqual(self.repository.get_probes(job["job_id"])[0].candidate, base)
 
     def test_constraint_exhaustion_does_not_truncate(self):
-        service = GatewayService(config(member_no_max_length=10), self.repository, adapter_ready=True, clock=NOW)
-        service.ingest(event())
-        job = service.claim("worker-1")["job"]
-        service.precheck(job["job_id"], "worker-1")
-        base = service.allocation_candidate(job["job_id"])["candidate"]
-        with self.assertRaises(ApiError):
-            service.allocation_probe(job["job_id"], "worker-1", {"candidate": base, "status": "OCCUPIED", "probe_reference": "occupied"})
+        with self.assertRaisesRegex(ValueError, "member_no_max_length_must_be_twenty"):
+            config(member_no_max_length=10)
 
     def test_lease_expiry_reclaims_before_fence(self):
         repo = InMemoryRepository()

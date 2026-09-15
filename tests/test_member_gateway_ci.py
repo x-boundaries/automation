@@ -39,6 +39,13 @@ class MemberGatewayCiTests(unittest.TestCase):
         ):
             self.assertNotIn(broad_path, self.text)
         self.assertIn('"member_gateway/**"', self.text)
+        for required_path in (
+            '"schemas/member_gateway_source_cursor.v1.schema.json"',
+            '"schemas/member_gateway_operator_status.v1.schema.json"',
+            '"schemas/member_gateway_operator_reconciliation.v1.schema.json"',
+            '"member_gateway/migrations/0004_forms_ingest_cursor.sql"',
+        ):
+            self.assertEqual(self.text.count(required_path), 2, required_path)
 
     def test_every_checkout_binds_to_literal_event_head(self):
         head_ref = chr(36) + "{{ github.event.pull_request.head.sha || github.sha }}"

@@ -56,7 +56,6 @@ def make_event(response_id="api-response-001"):
 class ApiBoundaryTests(unittest.TestCase):
     worker_scopes = frozenset(
         {
-            "source.ingest",
             "worker.claim",
             "worker.heartbeat",
             "worker.allocation",
@@ -68,8 +67,6 @@ class ApiBoundaryTests(unittest.TestCase):
             "worker.result",
             "worker.reconcile",
             "job.read",
-            "control.kill_switch",
-            "control.activate",
         }
     )
 
@@ -85,6 +82,9 @@ class ApiBoundaryTests(unittest.TestCase):
                     "synthetic-worker-token": Principal(
                         subject="synthetic-worker", scopes=self.worker_scopes
                     ),
+                    "synthetic-source-token": Principal("synthetic-source", frozenset({"source.ingest"})),
+                    "synthetic-operator-token": Principal("synthetic-operator", frozenset({"operator.status.read", "operator.reconciliation.read"})),
+                    "synthetic-control-token": Principal("synthetic-control", frozenset({"control.kill_switch", "control.activate"})),
                     "synthetic-recovery-token": Principal(
                         subject="synthetic-recovery",
                         scopes=frozenset({"worker.writer_termination_recovery"}),
@@ -100,12 +100,24 @@ class ApiBoundaryTests(unittest.TestCase):
             "Authorization": "Bearer synthetic-recovery-token",
             "X-XB-Worker-Session": "ws-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         }
+        self.source_headers = {"Authorization": "Bearer synthetic-source-token"}
+        self.operator_headers = {"Authorization": "Bearer synthetic-operator-token"}
+        self.control_headers = {"Authorization": "Bearer synthetic-control-token"}
 
     def call(self, method, path, body=None, headers=None):
+        if headers is None:
+            if path.startswith("/v1/source"):
+                headers = self.source_headers
+            elif path.startswith("/v1/control"):
+                headers = self.control_headers
+            elif path.startswith("/v1/operator"):
+                headers = self.operator_headers
+            else:
+                headers = self.headers
         return self.app.handle(
             method,
             path,
-            headers=self.headers if headers is None else headers,
+            headers=headers,
             body={} if body is None else body,
         )
 
@@ -485,7 +497,8 @@ class ApiBoundaryTests(unittest.TestCase):
         response = GatewayApp(service).handle("GET", "/readyz", headers={})
         self.assertEqual(response.status, 503)
         self.assertFalse(response.body["ready"])
-        self.assertIn("member_no_max_length_required", response.body["reasons"])
+        self.assertNotIn("member_no_max_length_required", response.body["reasons"])
+        self.assertIn("source_credential_digest_required", response.body["reasons"])
 
     def test_activation_and_kill_switch_are_controlled_operations(self):
         repository = InMemoryRepository()
@@ -551,6 +564,33 @@ class ApiBoundaryTests(unittest.TestCase):
         claimed = self.call("POST", "/v1/worker/claim", {})
         self.assertEqual(claimed.status, 200)
         self.assertTrue(claimed.body["claimed"])
+
+    def test_five_principal_route_matrix_has_no_role_union(self):
+        source_denied = [
+            ("GET", "/v1/operator/status"), ("POST", "/v1/control/kill-switch/enable"),
+            ("POST", "/v1/worker/claim"), ("POST", "/v1/jobs/missing/writer/recover"),
+        ]
+        for method, path in source_denied:
+            self.assertEqual(self.app.handle(method, path, headers=self.source_headers, body={}).status, 403)
+        for method, path in (("POST", "/v1/source-events"), ("POST", "/v1/control/activation"), ("POST", "/v1/worker/claim"), ("POST", "/v1/jobs/missing/result")):
+            self.assertEqual(self.app.handle(method, path, headers=self.operator_headers, body={}).status, 403)
+        for method, path in (("POST", "/v1/source-events"), ("POST", "/v1/worker/claim"), ("GET", "/v1/operator/status"), ("POST", "/v1/jobs/missing/writer/recover")):
+            self.assertEqual(self.app.handle(method, path, headers=self.control_headers, body={}).status, 403)
+        self.assertEqual(self.app.handle("GET", "/v1/operator/status", headers=self.headers).status, 403)
+        self.assertEqual(self.app.handle("POST", "/v1/control/kill-switch/enable", headers=self.recovery_headers, body={}).status, 403)
+        self.assertEqual(self.app.handle("GET", "/v1/operator/status", headers={}).status, 401)
+
+    def test_operator_status_and_reconciliation_are_safe_read_only_projections(self):
+        admitted = self.call("POST", "/v1/source-events", make_event("operator-safe"))
+        job_id = admitted.body["job_id"]
+        status = self.call("GET", "/v1/operator/status")
+        self.assertEqual(status.status, 200)
+        reconciliation = self.call("GET", f"/v1/operator/reconciliation/{job_id}")
+        self.assertEqual(reconciliation.status, 200)
+        rendered = str({"status": status.body, "reconciliation": reconciliation.body})
+        for forbidden in ("operator-safe", "member_payload", "response_id", "lease_owner", "worker_session", "process_start", "member_no", "resume_page_token"):
+            self.assertNotIn(forbidden, rendered.casefold())
+        self.assertEqual(self.repository.get_job(job_id).state.value, "QUEUED")
 
 if __name__ == "__main__":
     unittest.main()

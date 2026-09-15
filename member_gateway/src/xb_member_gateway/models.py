@@ -347,6 +347,35 @@ class IngestOutcome:
 
 
 @dataclass(frozen=True, slots=True)
+class SourceCursor:
+    source_system: str
+    form_alias: str
+    mapping_version: str
+    watermark: str
+    last_admitted_create_time: str | None
+    last_admitted_response_id: str | None
+    state_version: int
+    scan_lower_bound: str
+    resume_page_token: str | None
+    initial_window_admission_count: int
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": "xb.member.gateway.source_cursor.v1",
+            "source_system": self.source_system,
+            "form_alias": self.form_alias,
+            "mapping_version": self.mapping_version,
+            "watermark": self.watermark,
+            "last_admitted_create_time": self.last_admitted_create_time,
+            "last_admitted_response_id": self.last_admitted_response_id,
+            "state_version": self.state_version,
+            "scan_lower_bound": self.scan_lower_bound,
+            "resume_page_token": self.resume_page_token,
+            "initial_window_admission_count": self.initial_window_admission_count,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class ReadbackCheck:
     match: bool
     mismatches: tuple[str, ...] = field(default_factory=tuple)

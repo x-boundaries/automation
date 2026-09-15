@@ -53,7 +53,7 @@ The isolated Energy@Grid utility surface is documented in [energygrid-bill-downl
 - `config/autocount_stock_extract.ac2_smoke.example.json`
 - `config/autocount_stock_extract.example.json`
 - `config/autocount_stock_extract.from_probe.example.json`
-- `config/member_gateway.production.example.json` (fail-closed production member-gateway example; activation disabled and no effective MemberNo limit or credential digest)
+- `config/member_gateway.production.example.json` (closed `xb.member.gateway.config.v2` example; MemberNo is fixed at 20, activation is disabled, the kill switch is on, the adapter is not ready, and all real source, database, network, watermark, and credential bindings remain external)
 
 Copy example files to local ignored config paths before use. Do not commit credentials, connection strings, production exports, or real operational data.
 

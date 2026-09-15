@@ -18,13 +18,13 @@ from dataclasses import replace
 from threading import RLock
 from typing import Any, Callable, Iterator, Mapping, Protocol
 
-from .canonical import canonical_json
+from .canonical import canonical_json, parse_rfc3339, source_position, validate_page_token
 from .crypto import hmac_reference
 from .models import (
     AllocationProbe, AllocationRecord, AllocationRecheck, DispatchFenceRecord, IngestOutcome,
     JobRecord, JobState, LeaseRecord, ProbeStatus, ResultRecord, ResultStatus,
     ReconciliationCaseRecord, ReconciliationCaseState, ReconciliationCheckRecord,
-    SourceEvent, WriteIntentRecord, WriterExecutionHold, WriterHoldState,
+    SourceCursor, SourceEvent, WriteIntentRecord, WriterExecutionHold, WriterHoldState,
 )
 from .results import make_result
 from .state_machine import TERMINAL_STATES, next_state
@@ -105,7 +105,12 @@ class MemberProbe(Protocol):
 class InMemoryRepository:
     """Thread-safe fake of all durable gateway records."""
 
-    def __init__(self, *, reference_key: bytes = b"synthetic-member-gateway-key"):
+    def __init__(
+        self,
+        *,
+        reference_key: bytes = b"synthetic-member-gateway-key",
+        source_cutover_watermark: str | None = "1970-01-01T00:00:00Z",
+    ):
         self._lock = RLock()
         self._reference_key = reference_key
         self._responses: dict[str, SourceEvent] = {}
@@ -131,6 +136,27 @@ class InMemoryRepository:
         self._probe_status: dict[str, ProbeStatus] = {}
         self._member_records: dict[str, Mapping[str, Any]] = {}
         self._audit_events: list[dict[str, Any]] = []
+        self._source_cursors: dict[tuple[str, str, str], SourceCursor] = {}
+        self._source_page_receipts: list[dict[str, Any]] = []
+        if source_cutover_watermark is not None:
+            self.initialize_source_cursor(
+                "google_forms", "member_registration", "member-intake.v1",
+                source_cutover_watermark,
+            )
+
+    def initialize_source_cursor(
+        self, source_system: str, form_alias: str, mapping_version: str, watermark: str
+    ) -> SourceCursor:
+        """Synthetic-test initialization seam; production bootstrap never calls it."""
+
+        normalized = timestamp(parse_rfc3339(watermark, field="source_cutover_watermark"))
+        key = (source_system, form_alias, mapping_version)
+        with self._lock:
+            if key in self._source_cursors:
+                raise SourceConflict("source_cursor_already_initialized")
+            cursor = SourceCursor(source_system, form_alias, mapping_version, normalized, None, None, 0, normalized, None, 0)
+            self._source_cursors[key] = cursor
+            return self._copy(cursor)
 
     @staticmethod
     def _copy(value: Any) -> Any:
@@ -223,20 +249,40 @@ class InMemoryRepository:
             entry["count"] = count
         self._audit_events.append(entry)
 
-    def ingest_source_event(self, event: SourceEvent, *, now: datetime | None = None) -> IngestOutcome:
+    def ingest_source_event(
+        self,
+        event: SourceEvent,
+        *,
+        now: datetime | None = None,
+        initial_window_max: int = 1,
+        enforce_cursor_order: bool = True,
+    ) -> IngestOutcome:
         with self._lock:
+            cursor_key = (event.source_system, event.form_alias, event.mapping_version)
+            cursor = self._source_cursors.get(cursor_key)
+            if cursor is None:
+                raise SourceConflict("source_cursor_not_initialized")
+            position = source_position(event.create_time, event.response_id)
+            if position[0] < parse_timestamp(cursor.watermark):
+                raise SourceConflict("source_event_before_watermark")
             prior_hash = self._request_hashes.get(event.request_id)
             prior_response = self._request_responses.get(event.request_id)
             if prior_hash is not None and (prior_hash != event.payload_hash or prior_response != event.response_id):
                 raise SourceConflict("request_identity_payload_conflict")
             existing = self._responses.get(event.response_id)
             if existing is not None:
-                if existing.payload_hash != event.payload_hash:
+                if existing.payload_hash != event.payload_hash or existing.create_time != event.create_time:
                     self._audit("source_conflict", error_code="source_identity_conflict")
                     raise SourceConflict("source_identity_payload_conflict")
                 self._request_hashes[event.request_id] = event.payload_hash
                 self._request_responses[event.request_id] = event.response_id
                 return IngestOutcome(self._copy(self._job(self._job_by_response[event.response_id])), replayed=True)
+            if enforce_cursor_order and cursor.last_admitted_create_time is not None:
+                durable = source_position(cursor.last_admitted_create_time, cursor.last_admitted_response_id or "")
+                if position < durable:
+                    raise SourceConflict("source_event_behind_cursor")
+            if cursor.initial_window_admission_count >= initial_window_max:
+                raise SourceConflict("initial_source_window_exhausted")
             self._responses[event.response_id] = self._copy(event)
             self._request_hashes[event.request_id] = event.payload_hash
             self._request_responses[event.request_id] = event.response_id
@@ -256,7 +302,80 @@ class InMemoryRepository:
             self._job_by_response[event.response_id] = job.job_id
             self._probes[job.job_id] = []
             self._audit("source_ingested", job)
+            self._source_cursors[cursor_key] = replace(
+                cursor,
+                last_admitted_create_time=event.create_time,
+                last_admitted_response_id=event.response_id,
+                state_version=cursor.state_version + 1,
+                initial_window_admission_count=cursor.initial_window_admission_count + 1,
+            )
             return IngestOutcome(self._copy(job), replayed=False)
+
+    def get_source_cursor(self, form_alias: str, mapping_version: str) -> SourceCursor:
+        with self._lock:
+            cursor = self._source_cursors.get(("google_forms", form_alias, mapping_version))
+            if cursor is None:
+                raise SourceConflict("source_cursor_not_initialized")
+            return self._copy(cursor)
+
+    def checkpoint_source_page(
+        self,
+        form_alias: str,
+        mapping_version: str,
+        *,
+        expected_state_version: int,
+        current_page_token: str | None,
+        next_page_token: str | None,
+        scan_lower_bound: str,
+        terminal: bool,
+        responses: list[Mapping[str, Any]],
+    ) -> SourceCursor:
+        with self._lock:
+            key = ("google_forms", form_alias, mapping_version)
+            cursor = self._source_cursors.get(key)
+            if cursor is None:
+                raise SourceConflict("source_cursor_not_initialized")
+            if cursor.state_version != expected_state_version:
+                raise SourceConflict("source_cursor_state_version_mismatch")
+            current_page_token = validate_page_token(current_page_token)
+            next_page_token = validate_page_token(next_page_token)
+            if current_page_token != cursor.resume_page_token:
+                raise SourceConflict("source_page_token_unexpected")
+            if terminal != (next_page_token is None):
+                raise SourceConflict("source_page_terminal_invalid")
+            prior_tokens = {
+                token for receipt in self._source_page_receipts
+                for token in (receipt["current_page_token"], receipt["next_page_token"])
+                if token is not None
+            }
+            if next_page_token is not None and (next_page_token == current_page_token or next_page_token in prior_tokens):
+                raise SourceConflict("source_page_token_repeated")
+            lower = timestamp(parse_rfc3339(scan_lower_bound, field="scan_lower_bound"))
+            if parse_timestamp(lower) < parse_timestamp(cursor.watermark):
+                raise SourceConflict("source_scan_lower_bound_regressed")
+            if not isinstance(responses, list) or len(responses) > 100:
+                raise SourceConflict("source_page_responses_invalid")
+            positions: list[tuple[datetime, str]] = []
+            for item in responses:
+                if not isinstance(item, Mapping) or set(item) != {"response_id", "create_time", "payload_hash"}:
+                    raise SourceConflict("source_page_responses_invalid")
+                response_id = str(item["response_id"])
+                create_time = timestamp(parse_rfc3339(item["create_time"]))
+                positions.append(source_position(create_time, response_id))
+                existing = self._responses.get(response_id)
+                if existing is None or existing.payload_hash != item["payload_hash"] or existing.create_time != create_time:
+                    raise SourceConflict("source_page_response_not_admitted")
+            if positions != sorted(positions):
+                raise SourceConflict("source_page_responses_unsorted")
+            new_lower = cursor.last_admitted_create_time or cursor.watermark if terminal else lower
+            updated = replace(cursor, state_version=cursor.state_version + 1, scan_lower_bound=new_lower, resume_page_token=None if terminal else next_page_token)
+            self._source_page_receipts.append({
+                "current_page_token": current_page_token, "next_page_token": next_page_token,
+                "expected_state_version": expected_state_version, "terminal": terminal,
+                "responses": copy.deepcopy(responses),
+            })
+            self._source_cursors[key] = updated
+            return self._copy(updated)
 
     def set_control(self, name: str, enabled: bool) -> None:
         if name not in self._control or not isinstance(enabled, bool):
@@ -267,6 +386,36 @@ class InMemoryRepository:
     def get_control(self) -> dict[str, bool]:
         with self._lock:
             return dict(self._control)
+
+    def operator_status(self) -> dict[str, Any]:
+        with self._lock:
+            holds = list(self._writer_holds.values())
+            active_holds = [hold for hold in holds if hold.active]
+            return {
+                "schema_version": "xb.member.gateway.operator_status.v1",
+                "activation_enabled": self._control["production_activation_enabled"],
+                "kill_switch_enabled": self._control["kill_switch_enabled"],
+                "migrations_ready": True,
+                "source_cursor_ready": bool(self._source_cursors),
+                "active_lease_count": len([lease for lease in self._leases.values() if parse_timestamp(lease.expires_at) > utc_now()]),
+                "writer_hold_active": bool(active_holds),
+                "writer_quarantined": any(hold.state == WriterHoldState.QUARANTINED for hold in active_holds),
+                "termination_proof_required": any(hold.state in {WriterHoldState.PENDING, WriterHoldState.REGISTERED, WriterHoldState.QUARANTINED} for hold in active_holds),
+                "uncertain_job_count": len([job for job in self._jobs.values() if job.state == JobState.WRITE_OUTCOME_UNCERTAIN]),
+            }
+
+    def operator_reconciliation(self, job_id: str) -> dict[str, Any]:
+        with self._lock:
+            job = self._job(job_id)
+            result = self._results.get(job_id)
+            case = next((item for item in self._reconciliation_cases.values() if item.job_id == job_id), None)
+            checks = self._reconciliation_checks.get(case.case_id, []) if case else []
+            return {
+                "schema_version": "xb.member.gateway.operator_reconciliation.v1",
+                "job": {"job_id": job.job_id, "operation": job.operation, "state": job.state.value, "state_version": job.state_version, "attempt": job.attempt, "created_at": job.created_at},
+                "result": None if result is None else {"status": result.status.value, "result_hash": result.result_hash, "public_fence_reference": result.dispatch_fence_id, "acknowledged_at": result.acknowledged_at},
+                "reconciliation": None if case is None else {"case_state": case.state.value, "opened_at": case.opened_at, "closed_at": case.closed_at, "check_state": checks[-1].lookup_status if checks else None, "checked_at": checks[-1].checked_at if checks else None},
+            }
 
     def _quarantine_hold(self, job: JobRecord, current: datetime, *, error_code: str = "writer_termination_unconfirmed") -> WriterExecutionHold:
         fence = self._fences.get(job.job_id)
@@ -1364,8 +1513,162 @@ class PostgresRepository:
                 if cursor.rowcount != 1:
                     raise RepositoryError("control_flag_missing")
 
-    def ingest_source_event(self, event: SourceEvent, *, now: datetime | None = None) -> IngestOutcome:
-        key = self._reference_key or os.environ.get("XB_MEMBER_GATEWAY_HMAC_KEY", "").encode("utf-8")
+    @classmethod
+    def _source_cursor_from_row(cls, row: tuple[Any, ...]) -> SourceCursor:
+        return SourceCursor(
+            str(row[0]), str(row[1]), str(row[2]), cls._dt(row[3]) or "",
+            cls._dt(row[4]), row[5], int(row[6]), cls._dt(row[7]) or "",
+            row[8], int(row[9]),
+        )
+
+    def get_source_cursor(self, form_alias: str, mapping_version: str) -> SourceCursor:
+        with self._transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT source_system,form_alias,mapping_version,watermark,last_admitted_create_time,last_admitted_response_id,state_version,scan_lower_bound,resume_page_token,initial_window_admission_count FROM xb_member_gateway.source_ingest_cursors WHERE source_system='google_forms' AND form_alias=%s AND mapping_version=%s",
+                    (form_alias, mapping_version),
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    raise SourceConflict("source_cursor_not_initialized")
+                return self._source_cursor_from_row(row)
+
+    def verify_bootstrap_readiness(self, config: Any) -> None:
+        with self._transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT version FROM xb_member_gateway.schema_migrations")
+                versions = {str(row[0]) for row in cursor.fetchall()}
+                required = {"0001_member_gateway", "0002_result_event_history", "0003_writer_termination_quarantine", "0004_forms_ingest_cursor"}
+                if not required.issubset(versions):
+                    raise RepositoryError("required_migrations_missing")
+                cursor.execute("SELECT flag_name,enabled FROM xb_member_gateway.control_flags WHERE flag_name IN ('production_activation_enabled','kill_switch_enabled')")
+                controls = {str(row[0]): bool(row[1]) for row in cursor.fetchall()}
+                if set(controls) != {"production_activation_enabled", "kill_switch_enabled"}:
+                    raise RepositoryError("required_control_rows_missing")
+                if controls["production_activation_enabled"] or not controls["kill_switch_enabled"]:
+                    raise RepositoryError("unsafe_control_state")
+                cursor.execute(
+                    "SELECT source_system,form_alias,mapping_version,watermark,last_admitted_create_time,last_admitted_response_id,state_version,scan_lower_bound,resume_page_token,initial_window_admission_count FROM xb_member_gateway.source_ingest_cursors WHERE source_system='google_forms' AND form_alias=%s AND mapping_version=%s",
+                    (config.allowed_form_aliases[0], config.allowed_mapping_versions[0]),
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    raise RepositoryError("source_cursor_not_initialized")
+                source_cursor = self._source_cursor_from_row(row)
+                expected = timestamp(parse_rfc3339(config.source_cutover_watermark, field="source_cutover_watermark"))
+                if source_cursor.watermark != expected or parse_timestamp(source_cursor.scan_lower_bound) < parse_timestamp(expected):
+                    raise RepositoryError("source_cursor_watermark_mismatch")
+                if (source_cursor.last_admitted_create_time is None) != (source_cursor.last_admitted_response_id is None):
+                    raise RepositoryError("source_cursor_inconsistent")
+
+    def checkpoint_source_page(
+        self, form_alias: str, mapping_version: str, *, expected_state_version: int,
+        current_page_token: str | None, next_page_token: str | None,
+        scan_lower_bound: str, terminal: bool, responses: list[Mapping[str, Any]],
+    ) -> SourceCursor:
+        current_page_token = validate_page_token(current_page_token)
+        next_page_token = validate_page_token(next_page_token)
+        lower = timestamp(parse_rfc3339(scan_lower_bound, field="scan_lower_bound"))
+        if not isinstance(responses, list) or len(responses) > 100:
+            raise SourceConflict("source_page_responses_invalid")
+        with self._transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT source_system,form_alias,mapping_version,watermark,last_admitted_create_time,last_admitted_response_id,state_version,scan_lower_bound,resume_page_token,initial_window_admission_count FROM xb_member_gateway.source_ingest_cursors WHERE source_system='google_forms' AND form_alias=%s AND mapping_version=%s FOR UPDATE",
+                    (form_alias, mapping_version),
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    raise SourceConflict("source_cursor_not_initialized")
+                source_cursor = self._source_cursor_from_row(row)
+                if source_cursor.state_version != expected_state_version:
+                    raise SourceConflict("source_cursor_state_version_mismatch")
+                if source_cursor.resume_page_token != current_page_token:
+                    raise SourceConflict("source_page_token_unexpected")
+                if terminal != (next_page_token is None):
+                    raise SourceConflict("source_page_terminal_invalid")
+                cursor.execute("SELECT 1 FROM xb_member_gateway.source_ingest_page_receipts WHERE current_page_token=%s OR next_page_token=%s LIMIT 1", (next_page_token, next_page_token))
+                if next_page_token is not None and (next_page_token == current_page_token or cursor.fetchone() is not None):
+                    raise SourceConflict("source_page_token_repeated")
+                if parse_timestamp(lower) < parse_timestamp(source_cursor.watermark):
+                    raise SourceConflict("source_scan_lower_bound_regressed")
+                positions: list[tuple[datetime, str]] = []
+                normalized: list[dict[str, str]] = []
+                for item in responses:
+                    if not isinstance(item, Mapping) or set(item) != {"response_id", "create_time", "payload_hash"}:
+                        raise SourceConflict("source_page_responses_invalid")
+                    response_id = str(item["response_id"])
+                    create_time = timestamp(parse_rfc3339(item["create_time"]))
+                    positions.append(source_position(create_time, response_id))
+                    cursor.execute("SELECT payload_hash,create_time FROM xb_member_gateway.source_responses WHERE response_id=%s", (response_id,))
+                    persisted = cursor.fetchone()
+                    if persisted is None or persisted[0] != item["payload_hash"] or self._dt(persisted[1]) != create_time:
+                        raise SourceConflict("source_page_response_not_admitted")
+                    normalized.append({"response_id": response_id, "create_time": create_time, "payload_hash": str(item["payload_hash"])})
+                if positions != sorted(positions):
+                    raise SourceConflict("source_page_responses_unsorted")
+                new_lower = source_cursor.last_admitted_create_time or source_cursor.watermark if terminal else lower
+                cursor.execute(
+                    "UPDATE xb_member_gateway.source_ingest_cursors SET state_version=state_version+1,scan_lower_bound=%s,resume_page_token=%s,updated_at=now() WHERE source_system='google_forms' AND form_alias=%s AND mapping_version=%s",
+                    (new_lower, None if terminal else next_page_token, form_alias, mapping_version),
+                )
+                cursor.execute(
+                    "INSERT INTO xb_member_gateway.source_ingest_page_receipts(source_system,form_alias,mapping_version,expected_state_version,committed_state_version,current_page_token,next_page_token,scan_lower_bound,terminal,responses) VALUES('google_forms',%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)",
+                    (form_alias, mapping_version, expected_state_version, expected_state_version + 1, current_page_token, next_page_token, lower, terminal, canonical_json(normalized)),
+                )
+                return replace(source_cursor, state_version=expected_state_version + 1, scan_lower_bound=new_lower, resume_page_token=None if terminal else next_page_token)
+
+    def operator_status(self) -> dict[str, Any]:
+        current = utc_now()
+        with self._transaction() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT flag_name,enabled FROM xb_member_gateway.control_flags WHERE flag_name IN ('production_activation_enabled','kill_switch_enabled')")
+                controls = {str(row[0]): bool(row[1]) for row in cursor.fetchall()}
+                cursor.execute("SELECT count(*) FROM xb_member_gateway.schema_migrations WHERE version IN ('0001_member_gateway','0002_result_event_history','0003_writer_termination_quarantine','0004_forms_ingest_cursor')")
+                migrations_ready = int(cursor.fetchone()[0]) == 4
+                cursor.execute("SELECT count(*) FROM xb_member_gateway.source_ingest_cursors")
+                cursor_ready = int(cursor.fetchone()[0]) > 0
+                cursor.execute("SELECT count(*) FROM xb_member_gateway.leases WHERE active=TRUE AND expires_at>%s", (current,))
+                leases = int(cursor.fetchone()[0])
+                cursor.execute("SELECT lifecycle FROM xb_member_gateway.writer_execution_holds WHERE lifecycle <> 'CLEARED'")
+                holds = [str(row[0]) for row in cursor.fetchall()]
+                cursor.execute("SELECT count(*) FROM xb_member_gateway.jobs WHERE state='WRITE_OUTCOME_UNCERTAIN'")
+                uncertain = int(cursor.fetchone()[0])
+                return {
+                    "schema_version": "xb.member.gateway.operator_status.v1",
+                    "activation_enabled": controls.get("production_activation_enabled", False),
+                    "kill_switch_enabled": controls.get("kill_switch_enabled", True),
+                    "migrations_ready": migrations_ready, "source_cursor_ready": cursor_ready,
+                    "active_lease_count": leases, "writer_hold_active": bool(holds),
+                    "writer_quarantined": "QUARANTINED" in holds,
+                    "termination_proof_required": any(item in {"PENDING", "REGISTERED", "QUARANTINED"} for item in holds),
+                    "uncertain_job_count": uncertain,
+                }
+
+    def operator_reconciliation(self, job_id: str) -> dict[str, Any]:
+        with self._transaction() as connection:
+            with connection.cursor() as cursor:
+                job = self._select_job(cursor, job_id)
+                cursor.execute("SELECT result_hash,status,dispatch_fence_id,acknowledged_at FROM xb_member_gateway.results WHERE job_id=%s", (job_id,))
+                result = cursor.fetchone()
+                cursor.execute("SELECT case_id,case_state,opened_at,closed_at FROM xb_member_gateway.reconciliation_cases WHERE job_id=%s", (job_id,))
+                case = cursor.fetchone()
+                check = None
+                if case is not None:
+                    cursor.execute("SELECT lookup_status,checked_at FROM xb_member_gateway.reconciliation_checks WHERE case_id=%s ORDER BY check_id DESC LIMIT 1", (case[0],))
+                    check = cursor.fetchone()
+                return {
+                    "schema_version": "xb.member.gateway.operator_reconciliation.v1",
+                    "job": {"job_id": job.job_id, "operation": job.operation, "state": job.state.value, "state_version": job.state_version, "attempt": job.attempt, "created_at": job.created_at},
+                    "result": None if result is None else {"status": str(result[1]), "result_hash": str(result[0]), "public_fence_reference": public_fence_id(result[2]), "acknowledged_at": self._dt(result[3])},
+                    "reconciliation": None if case is None else {"case_state": str(case[1]), "opened_at": self._dt(case[2]), "closed_at": self._dt(case[3]), "check_state": None if check is None else str(check[0]), "checked_at": None if check is None else self._dt(check[1])},
+                }
+
+    def ingest_source_event(
+        self, event: SourceEvent, *, now: datetime | None = None, initial_window_max: int = 1,
+        enforce_cursor_order: bool = True,
+    ) -> IngestOutcome:
+        key = self._reference_key or os.environ.get("XB_MEMBER_GATEWAY_REFERENCE_HMAC_KEY", "").encode("utf-8")
         if not key:
             raise RepositoryError("source_reference_key_required")
         source_ref = hmac_reference(event.response_id, key)
@@ -1374,28 +1677,46 @@ class PostgresRepository:
         created_at = utc_now(now)
         with self._transaction() as connection:
             with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT source_system,form_alias,mapping_version,watermark,last_admitted_create_time,last_admitted_response_id,state_version,scan_lower_bound,resume_page_token,initial_window_admission_count FROM xb_member_gateway.source_ingest_cursors WHERE source_system=%s AND form_alias=%s AND mapping_version=%s FOR UPDATE",
+                    (event.source_system, event.form_alias, event.mapping_version),
+                )
+                cursor_row = cursor.fetchone()
+                if cursor_row is None:
+                    raise SourceConflict("source_cursor_not_initialized")
+                source_cursor = self._source_cursor_from_row(cursor_row)
+                position = source_position(event.create_time, event.response_id)
+                if position[0] < parse_timestamp(source_cursor.watermark):
+                    raise SourceConflict("source_event_before_watermark")
                 cursor.execute("SELECT response_id,payload_hash FROM xb_member_gateway.ingest_receipts WHERE request_id=%s FOR UPDATE", (event.request_id,))
                 receipt = cursor.fetchone()
                 if receipt is not None and (receipt[0] != event.response_id or receipt[1] != event.payload_hash):
                     raise SourceConflict("request_identity_payload_conflict")
-                cursor.execute("INSERT INTO xb_member_gateway.source_responses(response_id,source_response_ref,create_time,mapping_version,payload_hash,canonical_payload) VALUES(%s,%s,%s,%s,%s,%s::jsonb) ON CONFLICT(response_id) DO NOTHING", (event.response_id,source_ref,event.create_time,event.mapping_version,event.payload_hash,canonical_json(payload)))
-                cursor.execute("SELECT payload_hash FROM xb_member_gateway.source_responses WHERE response_id=%s FOR UPDATE", (event.response_id,))
+                cursor.execute("SELECT payload_hash,create_time FROM xb_member_gateway.source_responses WHERE response_id=%s FOR UPDATE", (event.response_id,))
                 source = cursor.fetchone()
-                if source is None:
-                    raise RepositoryError("source_response_insert_failed")
-                if source[0] != event.payload_hash:
+                if source is not None and (source[0] != event.payload_hash or self._dt(source[1]) != event.create_time):
                     raise SourceConflict("source_identity_payload_conflict")
-                cursor.execute("INSERT INTO xb_member_gateway.source_observations(response_id,request_id,form_alias,create_time,mapping_version,payload_hash,canonical_payload) VALUES(%s,%s,%s,%s,%s,%s,%s::jsonb)", (event.response_id,event.request_id,event.form_alias,event.create_time,event.mapping_version,event.payload_hash,canonical_json(payload)))
                 cursor.execute("SELECT job_id FROM xb_member_gateway.jobs WHERE response_id=%s", (event.response_id,))
                 job_row = cursor.fetchone()
-                if receipt is not None or job_row is not None:
-                    cursor.execute("INSERT INTO xb_member_gateway.ingest_receipts(request_id,response_id,payload_hash,replayed) VALUES(%s,%s,%s,TRUE) ON CONFLICT(request_id) DO UPDATE SET replayed=TRUE,received_at=now()", (event.request_id,event.response_id,event.payload_hash))
-                    if job_row is None:
+                if source is not None or receipt is not None or job_row is not None:
+                    if source is None or job_row is None:
                         raise RepositoryError("job_missing_for_source_response")
+                    cursor.execute("INSERT INTO xb_member_gateway.source_observations(response_id,request_id,form_alias,create_time,mapping_version,payload_hash,canonical_payload) VALUES(%s,%s,%s,%s,%s,%s,%s::jsonb)", (event.response_id,event.request_id,event.form_alias,event.create_time,event.mapping_version,event.payload_hash,canonical_json(payload)))
+                    cursor.execute("INSERT INTO xb_member_gateway.ingest_receipts(request_id,response_id,payload_hash,replayed) VALUES(%s,%s,%s,TRUE) ON CONFLICT(request_id) DO UPDATE SET replayed=TRUE,received_at=now()", (event.request_id,event.response_id,event.payload_hash))
                     return IngestOutcome(self._select_job(cursor,job_row[0]), replayed=True)
+                if enforce_cursor_order and source_cursor.last_admitted_create_time is not None and position < source_position(source_cursor.last_admitted_create_time, source_cursor.last_admitted_response_id or ""):
+                    raise SourceConflict("source_event_behind_cursor")
+                if source_cursor.initial_window_admission_count >= initial_window_max:
+                    raise SourceConflict("initial_source_window_exhausted")
+                cursor.execute("INSERT INTO xb_member_gateway.source_responses(response_id,source_response_ref,create_time,mapping_version,payload_hash,canonical_payload) VALUES(%s,%s,%s,%s,%s,%s::jsonb)", (event.response_id,source_ref,event.create_time,event.mapping_version,event.payload_hash,canonical_json(payload)))
+                cursor.execute("INSERT INTO xb_member_gateway.source_observations(response_id,request_id,form_alias,create_time,mapping_version,payload_hash,canonical_payload) VALUES(%s,%s,%s,%s,%s,%s,%s::jsonb)", (event.response_id,event.request_id,event.form_alias,event.create_time,event.mapping_version,event.payload_hash,canonical_json(payload)))
                 job_id = f"job-{uuid.uuid4().hex}"
                 cursor.execute("INSERT INTO xb_member_gateway.ingest_receipts(request_id,response_id,payload_hash,replayed) VALUES(%s,%s,%s,FALSE)", (event.request_id,event.response_id,event.payload_hash))
                 cursor.execute("INSERT INTO xb_member_gateway.jobs(job_id,response_id,operation,payload_hash,canonical_payload,state,state_version,attempt_count,max_attempts,created_at) VALUES(%s,%s,'member.create',%s,%s::jsonb,'QUEUED',2,0,3,%s)", (job_id,event.response_id,event.payload_hash,canonical_json(payload),created_at))
+                cursor.execute(
+                    "UPDATE xb_member_gateway.source_ingest_cursors SET last_admitted_create_time=%s,last_admitted_response_id=%s,state_version=state_version+1,initial_window_admission_count=initial_window_admission_count+1,updated_at=now() WHERE source_system=%s AND form_alias=%s AND mapping_version=%s",
+                    (event.create_time, event.response_id, event.source_system, event.form_alias, event.mapping_version),
+                )
                 return IngestOutcome(JobRecord(job_id,event.request_id,source_ref,event.response_id,event.payload_hash,event.operation,payload,timestamp(created_at),state=JobState.QUEUED,state_version=2,source_system=event.source_system,form_alias=event.form_alias,mapping_version=event.mapping_version), replayed=False)
 
     def get_job(self, job_id: str) -> JobRecord:
