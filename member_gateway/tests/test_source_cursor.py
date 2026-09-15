@@ -87,9 +87,21 @@ class SourceCursorTests(unittest.TestCase):
         self.assertEqual(self.repository.get_source_cursor("member_registration", "member-intake.v1"), cursor)
 
     def test_initial_window_is_exactly_one_new_response(self):
-        self.service.ingest(event())
+        first = event()
+        self.service.ingest(first)
+        replay = self.service.ingest({**first, "request_id": "request-replay"})
+        self.assertTrue(replay["replayed"])
         with self.assertRaisesRegex(SourceConflict, "initial_source_window_exhausted"):
             self.service.ingest(event(response_id="forms-second", create_time="2026-09-15T00:00:01Z", request_id="request-2"))
+        self.service.enable_activation(
+            {"enabled": True, "environment": "production", "approval_reference": "synthetic-approval"}
+        )
+        self.service.ingest(event(response_id="forms-second", create_time="2026-09-15T00:00:01Z", request_id="request-2"))
+        self.service.ingest(event(response_id="forms-third", create_time="2026-09-15T00:00:02Z", request_id="request-3"))
+        cursor = self.repository.get_source_cursor("member_registration", "member-intake.v1")
+        self.assertEqual(cursor.initial_window_admission_count, 1)
+        with self.assertRaisesRegex(SourceConflict, "source_event_behind_cursor"):
+            self.service.ingest(event(response_id="forms-behind", create_time="2026-09-15T00:00:01Z", request_id="request-4"))
 
 
 if __name__ == "__main__":

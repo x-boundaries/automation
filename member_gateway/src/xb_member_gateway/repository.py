@@ -254,8 +254,7 @@ class InMemoryRepository:
         event: SourceEvent,
         *,
         now: datetime | None = None,
-        initial_window_max: int = 1,
-        enforce_cursor_order: bool = True,
+        initial_window_max: int | None = 1,
     ) -> IngestOutcome:
         with self._lock:
             cursor_key = (event.source_system, event.form_alias, event.mapping_version)
@@ -277,11 +276,11 @@ class InMemoryRepository:
                 self._request_hashes[event.request_id] = event.payload_hash
                 self._request_responses[event.request_id] = event.response_id
                 return IngestOutcome(self._copy(self._job(self._job_by_response[event.response_id])), replayed=True)
-            if enforce_cursor_order and cursor.last_admitted_create_time is not None:
+            if cursor.last_admitted_create_time is not None:
                 durable = source_position(cursor.last_admitted_create_time, cursor.last_admitted_response_id or "")
                 if position < durable:
                     raise SourceConflict("source_event_behind_cursor")
-            if cursor.initial_window_admission_count >= initial_window_max:
+            if initial_window_max is not None and cursor.initial_window_admission_count >= initial_window_max:
                 raise SourceConflict("initial_source_window_exhausted")
             self._responses[event.response_id] = self._copy(event)
             self._request_hashes[event.request_id] = event.payload_hash
@@ -307,7 +306,10 @@ class InMemoryRepository:
                 last_admitted_create_time=event.create_time,
                 last_admitted_response_id=event.response_id,
                 state_version=cursor.state_version + 1,
-                initial_window_admission_count=cursor.initial_window_admission_count + 1,
+                initial_window_admission_count=(
+                    cursor.initial_window_admission_count
+                    + (1 if initial_window_max is not None else 0)
+                ),
             )
             return IngestOutcome(self._copy(job), replayed=False)
 
@@ -1665,8 +1667,8 @@ class PostgresRepository:
                 }
 
     def ingest_source_event(
-        self, event: SourceEvent, *, now: datetime | None = None, initial_window_max: int = 1,
-        enforce_cursor_order: bool = True,
+        self, event: SourceEvent, *, now: datetime | None = None,
+        initial_window_max: int | None = 1,
     ) -> IngestOutcome:
         key = self._reference_key or os.environ.get("XB_MEMBER_GATEWAY_REFERENCE_HMAC_KEY", "").encode("utf-8")
         if not key:
@@ -1704,9 +1706,9 @@ class PostgresRepository:
                     cursor.execute("INSERT INTO xb_member_gateway.source_observations(response_id,request_id,form_alias,create_time,mapping_version,payload_hash,canonical_payload) VALUES(%s,%s,%s,%s,%s,%s,%s::jsonb)", (event.response_id,event.request_id,event.form_alias,event.create_time,event.mapping_version,event.payload_hash,canonical_json(payload)))
                     cursor.execute("INSERT INTO xb_member_gateway.ingest_receipts(request_id,response_id,payload_hash,replayed) VALUES(%s,%s,%s,TRUE) ON CONFLICT(request_id) DO UPDATE SET replayed=TRUE,received_at=now()", (event.request_id,event.response_id,event.payload_hash))
                     return IngestOutcome(self._select_job(cursor,job_row[0]), replayed=True)
-                if enforce_cursor_order and source_cursor.last_admitted_create_time is not None and position < source_position(source_cursor.last_admitted_create_time, source_cursor.last_admitted_response_id or ""):
+                if source_cursor.last_admitted_create_time is not None and position < source_position(source_cursor.last_admitted_create_time, source_cursor.last_admitted_response_id or ""):
                     raise SourceConflict("source_event_behind_cursor")
-                if source_cursor.initial_window_admission_count >= initial_window_max:
+                if initial_window_max is not None and source_cursor.initial_window_admission_count >= initial_window_max:
                     raise SourceConflict("initial_source_window_exhausted")
                 cursor.execute("INSERT INTO xb_member_gateway.source_responses(response_id,source_response_ref,create_time,mapping_version,payload_hash,canonical_payload) VALUES(%s,%s,%s,%s,%s,%s::jsonb)", (event.response_id,source_ref,event.create_time,event.mapping_version,event.payload_hash,canonical_json(payload)))
                 cursor.execute("INSERT INTO xb_member_gateway.source_observations(response_id,request_id,form_alias,create_time,mapping_version,payload_hash,canonical_payload) VALUES(%s,%s,%s,%s,%s,%s,%s::jsonb)", (event.response_id,event.request_id,event.form_alias,event.create_time,event.mapping_version,event.payload_hash,canonical_json(payload)))
@@ -1714,8 +1716,8 @@ class PostgresRepository:
                 cursor.execute("INSERT INTO xb_member_gateway.ingest_receipts(request_id,response_id,payload_hash,replayed) VALUES(%s,%s,%s,FALSE)", (event.request_id,event.response_id,event.payload_hash))
                 cursor.execute("INSERT INTO xb_member_gateway.jobs(job_id,response_id,operation,payload_hash,canonical_payload,state,state_version,attempt_count,max_attempts,created_at) VALUES(%s,%s,'member.create',%s,%s::jsonb,'QUEUED',2,0,3,%s)", (job_id,event.response_id,event.payload_hash,canonical_json(payload),created_at))
                 cursor.execute(
-                    "UPDATE xb_member_gateway.source_ingest_cursors SET last_admitted_create_time=%s,last_admitted_response_id=%s,state_version=state_version+1,initial_window_admission_count=initial_window_admission_count+1,updated_at=now() WHERE source_system=%s AND form_alias=%s AND mapping_version=%s",
-                    (event.create_time, event.response_id, event.source_system, event.form_alias, event.mapping_version),
+                    "UPDATE xb_member_gateway.source_ingest_cursors SET last_admitted_create_time=%s,last_admitted_response_id=%s,state_version=state_version+1,initial_window_admission_count=initial_window_admission_count+%s,updated_at=now() WHERE source_system=%s AND form_alias=%s AND mapping_version=%s",
+                    (event.create_time, event.response_id, 1 if initial_window_max is not None else 0, event.source_system, event.form_alias, event.mapping_version),
                 )
                 return IngestOutcome(JobRecord(job_id,event.request_id,source_ref,event.response_id,event.payload_hash,event.operation,payload,timestamp(created_at),state=JobState.QUEUED,state_version=2,source_system=event.source_system,form_alias=event.form_alias,mapping_version=event.mapping_version), replayed=False)
 

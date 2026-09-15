@@ -1,6 +1,7 @@
 import unittest
 from datetime import datetime, timezone
 
+from xb_member_gateway.canonical import build_source_event, canonicalize_source_event
 from xb_member_gateway.repository import PostgresRepository, SourceConflict
 
 
@@ -26,14 +27,19 @@ class Cursor:
         if "FROM xb_member_gateway.source_ingest_page_receipts" in self.query:
             return None
         if "FROM xb_member_gateway.source_responses" in self.query:
-            return None if self.connection.missing_response else (HASH, WATERMARK)
+            return None if self.connection.missing_response or self.connection.ingest_mode else (HASH, WATERMARK)
+        if "FROM xb_member_gateway.ingest_receipts" in self.query:
+            return None
+        if "FROM xb_member_gateway.jobs WHERE response_id" in self.query:
+            return None
         return None
     def fetchall(self): return []
 
 
 class Connection:
-    def __init__(self, *, missing_response=False):
+    def __init__(self, *, missing_response=False, ingest_mode=False):
         self.missing_response = missing_response
+        self.ingest_mode = ingest_mode
         self.queries = []
         self.committed = False
         self.rolled_back = False
@@ -44,6 +50,26 @@ class Connection:
 
 
 class PostgresCursorTests(unittest.TestCase):
+    @staticmethod
+    def source_event(response_id="forms-two", create_time="2026-09-15T00:00:01Z"):
+        return canonicalize_source_event(
+            build_source_event(
+                response_id=response_id,
+                create_time=create_time,
+                request_id=f"request-{response_id}",
+                form_alias="member_registration",
+                mapping_version="member-intake.v1",
+                payload={
+                    "name": "Synthetic Member",
+                    "phone": "81234567",
+                    "email": "synthetic@example.test",
+                    "birthday_month": "January",
+                    "marketing_consent": "No",
+                    "pdpa_acknowledged": True,
+                },
+            )
+        )
+
     def test_checkpoint_is_cas_and_appends_receipt_in_one_transaction(self):
         connection = Connection()
         repository = PostgresRepository(connection_factory=lambda: connection, reference_key=b"synthetic")
@@ -70,6 +96,42 @@ class PostgresCursorTests(unittest.TestCase):
             )
         self.assertTrue(connection.rolled_back)
         self.assertFalse(any(query.startswith("UPDATE xb_member_gateway.source_ingest_cursors") for query, _ in connection.queries))
+
+    def test_post_activation_admission_keeps_initial_counter_bounded(self):
+        connection = Connection(ingest_mode=True)
+        repository = PostgresRepository(connection_factory=lambda: connection, reference_key=b"synthetic")
+        outcome = repository.ingest_source_event(self.source_event(), initial_window_max=None)
+        self.assertFalse(outcome.replayed)
+        self.assertTrue(connection.committed)
+        updates = [
+            (query, params)
+            for query, params in connection.queries
+            if query.startswith("UPDATE xb_member_gateway.source_ingest_cursors")
+        ]
+        self.assertEqual(len(updates), 1)
+        self.assertIn("initial_window_admission_count=initial_window_admission_count+%s", updates[0][0])
+        self.assertEqual(updates[0][1][2], 0)
+        self.assertTrue(any(query.startswith("INSERT INTO xb_member_gateway.jobs") for query, _ in connection.queries))
+
+    def test_pre_activation_exhaustion_rolls_back_without_cursor_or_job_write(self):
+        connection = Connection(ingest_mode=True)
+        repository = PostgresRepository(connection_factory=lambda: connection, reference_key=b"synthetic")
+        with self.assertRaisesRegex(SourceConflict, "initial_source_window_exhausted"):
+            repository.ingest_source_event(self.source_event(), initial_window_max=1)
+        self.assertTrue(connection.rolled_back)
+        self.assertFalse(any(query.startswith("INSERT INTO xb_member_gateway.jobs") for query, _ in connection.queries))
+        self.assertFalse(any(query.startswith("UPDATE xb_member_gateway.source_ingest_cursors") for query, _ in connection.queries))
+
+    def test_post_activation_still_rejects_unseen_response_behind_cursor(self):
+        connection = Connection(ingest_mode=True)
+        repository = PostgresRepository(connection_factory=lambda: connection, reference_key=b"synthetic")
+        with self.assertRaisesRegex(SourceConflict, "source_event_behind_cursor"):
+            repository.ingest_source_event(
+                self.source_event(response_id="forms-aaa", create_time="2026-09-15T00:00:00Z"),
+                initial_window_max=None,
+            )
+        self.assertTrue(connection.rolled_back)
+        self.assertFalse(any(query.startswith("INSERT INTO xb_member_gateway.jobs") for query, _ in connection.queries))
 
 
 if __name__ == "__main__":

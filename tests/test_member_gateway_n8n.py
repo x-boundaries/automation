@@ -133,10 +133,11 @@ class MemberGatewayN8nTests(unittest.TestCase):
         self.assertEqual(second_item["page_checkpoint"]["current_page_token"], "page-token-002")
         self.assertTrue(second_item["page_checkpoint"]["terminal"])
 
-    def test_repeated_malformed_and_exhausted_window_fail_closed(self):
+    def test_repeated_and_malformed_tokens_fail_closed_but_initial_count_does_not_deadlock(self):
         self.assert_page_error("repeated_token", "forms_page_token_repeated", 1, cursor=self.cursor(token="repeat-token"))
         self.assert_page_error("malformed_token", "forms_page_token_invalid")
-        self.assert_page_error("one_page", "initial_source_window_exhausted", cursor=self.cursor(count=1))
+        result = self.run_page("one_page", cursor=self.cursor(count=1))
+        self.assertTrue(result["ok"], result)
 
     def test_mapping_is_closed_and_real_shape_only(self):
         self.assert_page_error("missing_mapping", "forms_answer_value_invalid")

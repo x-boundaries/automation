@@ -143,8 +143,11 @@ class GatewayService:
         outcome = self.repository.ingest_source_event(
             event,
             now=self.clock,
-            initial_window_max=(config.initial_source_window_max if not self.config.production_activation_enabled else 2**31 - 1),
-            enforce_cursor_order=not self.config.production_activation_enabled,
+            initial_window_max=(
+                None
+                if config.production_activation_enabled
+                else config.initial_source_window_max
+            ),
         )
         return {
             "schema_version": "xb.member.gateway.job.v2",

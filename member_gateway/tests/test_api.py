@@ -542,6 +542,62 @@ class ApiBoundaryTests(unittest.TestCase):
         self.assertEqual(disabled.status, 200)
         self.assertFalse(repository.get_control()["kill_switch_enabled"])
 
+    def test_runtime_activation_releases_initial_window_without_releasing_ordering(self):
+        repository = InMemoryRepository(source_cutover_watermark="2026-08-30T00:00:00Z")
+        repository.set_control("kill_switch_enabled", True)
+        repository.set_control("production_activation_enabled", False)
+        service = GatewayService(
+            make_config(
+                production_activation_enabled=False,
+                kill_switch_enabled=True,
+                source_cutover_watermark="2026-08-30T00:00:00Z",
+            ),
+            repository,
+            adapter_ready=True,
+            clock=NOW,
+        )
+        app = GatewayApp(
+            service,
+            StaticAuthenticator(
+                {
+                    "source-token": Principal("synthetic-source", frozenset({"source.ingest"})),
+                    "control-token": Principal("synthetic-control", frozenset({"control.activate"})),
+                }
+            ),
+        )
+        source_headers = {"Authorization": "Bearer source-token"}
+        control_headers = {"Authorization": "Bearer control-token"}
+
+        first = make_event("activation-first")
+        self.assertEqual(app.handle("POST", "/v1/source-events", headers=source_headers, body=first).status, 202)
+        replay = app.handle(
+            "POST", "/v1/source-events", headers=source_headers,
+            body={**first, "request_id": "api-request-activation-first-replay"},
+        )
+        self.assertEqual(replay.status, 202)
+        self.assertTrue(replay.body["replayed"])
+        second = {**make_event("activation-second"), "create_time": "2026-08-30T01:00:01Z"}
+        blocked = app.handle("POST", "/v1/source-events", headers=source_headers, body=second)
+        self.assertEqual(blocked.status, 409)
+        self.assertEqual(blocked.body["error_code"], "initial_source_window_exhausted")
+
+        activated = app.handle(
+            "POST", "/v1/control/activation", headers=control_headers,
+            body={"enabled": True, "environment": "production", "approval_reference": "synthetic-approval-002"},
+        )
+        self.assertEqual(activated.status, 200)
+        self.assertTrue(repository.get_control()["production_activation_enabled"])
+        self.assertEqual(app.handle("POST", "/v1/source-events", headers=source_headers, body=second).status, 202)
+        third = {**make_event("activation-third"), "create_time": "2026-08-30T01:00:02Z"}
+        self.assertEqual(app.handle("POST", "/v1/source-events", headers=source_headers, body=third).status, 202)
+        cursor = repository.get_source_cursor("member_registration", "member-intake.v1")
+        self.assertEqual(cursor.initial_window_admission_count, 1)
+
+        behind = {**make_event("activation-behind"), "create_time": "2026-08-30T01:00:01Z"}
+        rejected = app.handle("POST", "/v1/source-events", headers=source_headers, body=behind)
+        self.assertEqual(rejected.status, 409)
+        self.assertEqual(rejected.body["error_code"], "source_event_behind_cursor")
+
 
 
     def test_kill_switch_engage_blocks_claim_and_controlled_clear_restores_eligibility(self):
