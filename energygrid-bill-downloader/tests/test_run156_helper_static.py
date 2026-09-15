@@ -192,6 +192,26 @@ $script:R156LocalGitReadOnlySubcommands = @('symbolic-ref', 'rev-parse', 'status
             )
         )
 
+    def config_functions(self):
+        return self.extracted_functions(
+            (
+                "Convert-R156Utf8Bytes",
+                "Convert-R156ConfigBytes",
+                "Test-R156BranchName",
+                "Get-R156BranchConfigKey",
+                "Test-R156ConfigAdmission",
+                "Test-R156CanonicalOrigin",
+            )
+        )
+
+    def worktree_config_functions(self):
+        return self.extracted_functions(
+            (
+                "Test-R156WorktreeConfigSurfaceAbsent",
+                "Test-R156WorktreeConfigFence",
+            )
+        )
+
     def json_functions(self):
         return self.extracted_functions(
             (
@@ -765,6 +785,123 @@ foreach ($file in $files) {
             elif value != allowed[key]:
                 return False
         return seen == set(allowed)
+
+    @staticmethod
+    def canonical_config_entries():
+        return [
+            ("core.repositoryformatversion", "0"),
+            ("core.filemode", "false"),
+            ("core.bare", "false"),
+            ("core.logallrefupdates", "true"),
+            ("core.symlinks", "false"),
+            ("core.ignorecase", "true"),
+            ("remote.origin.url", "https://github.com/x-boundaries/automation.git"),
+            ("remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"),
+            ("branch.main.remote", "origin"),
+            ("branch.main.merge", "refs/heads/main"),
+        ]
+
+    @staticmethod
+    def config_bytes(entries):
+        return b"".join(
+            key.encode("ascii") + b"\n" + value.encode("utf-8") + b"\0"
+            for key, value in entries
+        )
+
+    def run_production_config_cases(self, cases):
+        with tempfile.TemporaryDirectory(prefix="r156_config_") as directory:
+            root = Path(directory)
+            names = {}
+            for index, (name, payload) in enumerate(cases.items()):
+                fixture_name = f"case_{index:03d}.bin"
+                (root / fixture_name).write_bytes(payload)
+                names[fixture_name] = name
+            script = (
+                "$script:R156CanonicalOrigins = @("
+                "'https://github.com/x-boundaries/automation',"
+                "'https://github.com/x-boundaries/automation.git',"
+                "'git@github.com:x-boundaries/automation',"
+                "'git@github.com:x-boundaries/automation.git',"
+                "'ssh://git@github.com/x-boundaries/automation',"
+                "'ssh://git@github.com:x-boundaries/automation.git')\n"
+                + self.config_functions()
+                + r"""
+$files = @(Get-ChildItem -LiteralPath $env:R156_CONFIG_DIR -File | Sort-Object Name)
+foreach ($file in $files) {
+    $entries = Convert-R156ConfigBytes -Bytes ([System.IO.File]::ReadAllBytes($file.FullName))
+    $parsed = $null -ne $entries
+    $admission = $null
+    if ($parsed) {
+        $admission = Test-R156ConfigAdmission -Entries ([object[]]$entries)
+    }
+    $admitted = $null -ne $admission -and [bool]$admission.Pass
+    $worktree = $admitted -and [bool]$admission.WorktreeConfigEnabled
+    Write-Output ($file.Name + ';parsed=' + $parsed + ';admitted=' + $admitted + ';worktree=' + $worktree)
+}
+"""
+            )
+            lines = self.run_isolated_powershell(
+                script,
+                environment={"R156_CONFIG_DIR": str(root)},
+            )
+        results = {}
+        for line in lines:
+            fixture_name, *fields = line.split(";")
+            results[names[fixture_name]] = {
+                key: value.lower() == "true"
+                for key, value in (field.split("=", 1) for field in fields)
+            }
+        return results, "\n".join(lines)
+
+    def run_worktree_config_matrix(self):
+        with tempfile.TemporaryDirectory(prefix="r156_worktree_config_") as directory:
+            script = (
+                self.worktree_config_functions()
+                + r"""
+$root = [string]$env:R156_WORKTREE_ROOT
+$absentParent = Join-Path $root 'absent'
+$fileParent = Join-Path $root 'file'
+$directoryParent = Join-Path $root 'directory'
+$reparseParent = Join-Path $root 'reparse'
+$target = Join-Path $root 'target'
+foreach ($path in @($absentParent, $fileParent, $directoryParent, $reparseParent, $target)) {
+    [void][System.IO.Directory]::CreateDirectory($path)
+}
+$absentPath = Join-Path $absentParent 'config.worktree'
+$filePath = Join-Path $fileParent 'config.worktree'
+$directoryPath = Join-Path $directoryParent 'config.worktree'
+$reparsePath = Join-Path $reparseParent 'config.worktree'
+$indeterminatePath = Join-Path (Join-Path $root 'missing-parent') 'config.worktree'
+[System.IO.File]::WriteAllText($filePath, 'x')
+[void][System.IO.Directory]::CreateDirectory($directoryPath)
+$junction = New-Item -ItemType Junction -Path $reparsePath -Target $target -ErrorAction Stop
+$values = [ordered]@{
+    absent = Test-R156WorktreeConfigSurfaceAbsent -Path $absentPath
+    file = Test-R156WorktreeConfigSurfaceAbsent -Path $filePath
+    directory = Test-R156WorktreeConfigSurfaceAbsent -Path $directoryPath
+    reparse = Test-R156WorktreeConfigSurfaceAbsent -Path $reparsePath
+    indeterminate = Test-R156WorktreeConfigSurfaceAbsent -Path $indeterminatePath
+    disabled_preserves = Test-R156WorktreeConfigFence -Enabled $false -AbsentBefore $false -AbsentAfter $false
+    enabled_absent = Test-R156WorktreeConfigFence -Enabled $true -AbsentBefore $true -AbsentAfter $true
+    enabled_file = Test-R156WorktreeConfigFence -Enabled $true -AbsentBefore $false -AbsentAfter $false
+    enabled_directory = Test-R156WorktreeConfigFence -Enabled $true -AbsentBefore $false -AbsentAfter $false
+    enabled_reparse = Test-R156WorktreeConfigFence -Enabled $true -AbsentBefore $false -AbsentAfter $false
+    enabled_indeterminate = Test-R156WorktreeConfigFence -Enabled $true -AbsentBefore $false -AbsentAfter $false
+    enabled_appeared_after = Test-R156WorktreeConfigFence -Enabled $true -AbsentBefore $true -AbsentAfter $false
+}
+foreach ($item in $values.GetEnumerator()) {
+    Write-Output ($item.Key + '=' + [string]$item.Value)
+}
+"""
+            )
+            lines = self.run_isolated_powershell(
+                script,
+                environment={"R156_WORKTREE_ROOT": directory},
+            )
+        return {
+            key: value.lower() == "true"
+            for key, value in (line.split("=", 1) for line in lines)
+        }
 
     @staticmethod
     def canonical_byte_contract(committed):
@@ -1526,18 +1663,7 @@ $result | ConvertTo-Json -Compress
         self.assertIn("GIT_CONFIG_GLOBAL", remote)
 
     def test_config_admission_rejects_includes_url_rewrites_and_unknown_keys(self):
-        base = [
-            ("core.repositoryformatversion", "0"),
-            ("core.filemode", "false"),
-            ("core.bare", "false"),
-            ("core.logallrefupdates", "true"),
-            ("core.symlinks", "false"),
-            ("core.ignorecase", "true"),
-            ("remote.origin.url", "https://github.com/x-boundaries/automation.git"),
-            ("remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"),
-            ("branch.main.remote", "origin"),
-            ("branch.main.merge", "refs/heads/main"),
-        ]
+        base = self.canonical_config_entries()
         self.assertTrue(self.config_accepts(base))
         for replacement in (
             ("include.path", "C:\\user\\config"),
@@ -1554,6 +1680,286 @@ $result | ConvertTo-Json -Compress
         self.assertIn("acceptedKeys", self.source)
         self.assertIn("'--file=C:\\XB\\automation\\.git\\config'", self.source)
         self.assertIn("'--no-includes'", self.source)
+
+    def test_production_config_parser_and_admission_behavioural_matrix(self):
+        base = self.canonical_config_entries()
+        historical_names = (
+            "codex/energygrid-run156",
+            "feature/archive-reader",
+            "fix/portal-entry",
+            "release/energygrid-v1",
+            "ops/package-alignment",
+            "audit/repository-fence",
+            "chore/runtime-update",
+            "docs/launcher-runbook",
+            "test/synthetic-fixtures",
+            "security/git-trust-anchor",
+            "maintenance/legacy.branch",
+            "WJ/Owner_branch-1",
+        )
+        observed_37 = list(base)
+        for name in historical_names:
+            observed_37.extend(
+                (
+                    (f"branch.{name}.remote", "origin"),
+                    (f"branch.{name}.merge", f"refs/heads/{name}"),
+                )
+            )
+        identity_name = "R156_PRIVATE_NAME_SENTINEL"
+        identity_email = "r156-private-email-sentinel@example.invalid"
+        observed_37.extend(
+            (
+                ("user.name", identity_name),
+                ("user.email", identity_email),
+                ("extensions.worktreeconfig", "true"),
+            )
+        )
+        self.assertEqual(len(observed_37), 37)
+
+        ordinal_pairs = list(base) + [
+            ("branch.Feature/One.remote", "origin"),
+            ("branch.Feature/One.merge", "refs/heads/Feature/One"),
+            ("branch.feature/One.remote", "origin"),
+            ("branch.feature/One.merge", "refs/heads/feature/One"),
+        ]
+        maximum_length_name = "a" * 255
+        cases = {
+            "original_ten": self.config_bytes(base),
+            "observed_37": self.config_bytes(observed_37),
+            "slash_pair": self.config_bytes(
+                base
+                + [
+                    ("branch.feature/nested-name.remote", "origin"),
+                    (
+                        "branch.feature/nested-name.merge",
+                        "refs/heads/feature/nested-name",
+                    ),
+                ]
+            ),
+            "ordinal_pairs": self.config_bytes(ordinal_pairs),
+            "maximum_length_branch": self.config_bytes(
+                base
+                + [
+                    (f"branch.{maximum_length_name}.remote", "origin"),
+                    (
+                        f"branch.{maximum_length_name}.merge",
+                        f"refs/heads/{maximum_length_name}",
+                    ),
+                ]
+            ),
+            "user_identity": self.config_bytes(
+                base
+                + [("user.name", identity_name), ("user.email", identity_email)]
+            ),
+            "worktree_extension": self.config_bytes(
+                base + [("extensions.worktreeconfig", "true")]
+            ),
+            "branch_remote_wrong": self.config_bytes(
+                base
+                + [
+                    ("branch.feature/one.remote", "upstream"),
+                    ("branch.feature/one.merge", "refs/heads/feature/one"),
+                ]
+            ),
+            "branch_merge_wrong": self.config_bytes(
+                base
+                + [
+                    ("branch.feature/one.remote", "origin"),
+                    ("branch.feature/one.merge", "refs/heads/feature/two"),
+                ]
+            ),
+            "branch_orphan": self.config_bytes(
+                base + [("branch.feature/one.remote", "origin")]
+            ),
+            "duplicate_user": self.config_bytes(
+                base + [("user.name", "one"), ("user.name", "two")]
+            ),
+            "duplicate_historical_branch_key": self.config_bytes(
+                base
+                + [
+                    ("branch.feature/one.remote", "origin"),
+                    ("branch.feature/one.remote", "origin"),
+                    ("branch.feature/one.merge", "refs/heads/feature/one"),
+                ]
+            ),
+            "duplicate_extension": self.config_bytes(
+                base
+                + [
+                    ("extensions.worktreeconfig", "true"),
+                    ("extensions.worktreeconfig", "true"),
+                ]
+            ),
+            "unknown_branch_field": self.config_bytes(
+                base + [("branch.feature/one.rebase", "true")]
+            ),
+            "worktree_extension_false": self.config_bytes(
+                base + [("extensions.worktreeconfig", "false")]
+            ),
+            "invalid_utf8": b"user.name\n\xff\0",
+            "missing_terminal_nul": self.config_bytes(base)[:-1],
+            "carriage_return": b"user.name\r\nvalue\0",
+            "missing_separator": b"user.name\0",
+            "extra_separator": b"user.name\nvalue\nmore\0",
+            "empty_key": b"\nvalue\0",
+        }
+
+        malformed_names = (
+            "-leading",
+            "/leading",
+            "trailing/",
+            "repeated//slash",
+            "dot/./component",
+            "dot/../component",
+            "contains..dots",
+            ".leading-dot/component",
+            "trailing-dot./component",
+            "component.lock",
+            "white space",
+            "back\\slash",
+            "meta~name",
+            "meta^name",
+            "meta:name",
+            "meta?name",
+            "meta*name",
+            "meta[name",
+            "meta@{name",
+        )
+        for index, name in enumerate(malformed_names):
+            cases[f"malformed_{index:02d}"] = self.config_bytes(
+                base
+                + [
+                    (f"branch.{name}.remote", "origin"),
+                    (f"branch.{name}.merge", f"refs/heads/{name}"),
+                ]
+            )
+        overlong = "a" * 256
+        cases["overlong_branch"] = self.config_bytes(
+            base
+            + [
+                (f"branch.{overlong}.remote", "origin"),
+                (f"branch.{overlong}.merge", f"refs/heads/{overlong}"),
+            ]
+        )
+
+        security_extras = (
+            ("unknown.setting", "value"),
+            ("include.path", "C:\\private\\config"),
+            ("includeIf.gitdir", "C:\\private\\config"),
+            ("credential.helper", "manager"),
+            ("url.https://evil/.insteadOf", "https://github.com/x-boundaries/automation.git"),
+            ("alias.deploy", "!danger"),
+            ("core.fsmonitor", "true"),
+            ("core.hooksPath", "C:\\hooks"),
+            ("safe.directory", "*"),
+            ("submodule.recurse", "true"),
+            ("remote.origin.promisor", "true"),
+            ("remote.upstream.url", "https://github.com/x-boundaries/automation.git"),
+            ("extensions.objectformat", "sha256"),
+            ("extensions.arbitrary", "true"),
+            ("user.signingkey", "opaque"),
+        )
+        for index, extra in enumerate(security_extras):
+            cases[f"security_extra_{index:02d}"] = self.config_bytes(base + [extra])
+
+        for index, (key, value) in enumerate(base):
+            removed = base[:index] + base[index + 1 :]
+            cases[f"required_removed_{index:02d}"] = self.config_bytes(removed)
+            changed = list(base)
+            replacement = "unexpected"
+            if key == "remote.origin.url":
+                replacement = "https://github.com/example/other.git"
+            changed[index] = (key, replacement if replacement != value else "changed")
+            cases[f"required_changed_{index:02d}"] = self.config_bytes(changed)
+            duplicate = list(base) + [(key, value)]
+            cases[f"required_duplicate_{index:02d}"] = self.config_bytes(duplicate)
+
+        results, output = self.run_production_config_cases(cases)
+        for name in (
+            "original_ten",
+            "observed_37",
+            "slash_pair",
+            "ordinal_pairs",
+            "maximum_length_branch",
+            "user_identity",
+            "worktree_extension",
+        ):
+            with self.subTest(accepted=name):
+                self.assertTrue(results[name]["parsed"], results[name])
+                self.assertTrue(results[name]["admitted"], results[name])
+        self.assertFalse(results["original_ten"]["worktree"])
+        self.assertTrue(results["worktree_extension"]["worktree"])
+        self.assertTrue(results["observed_37"]["worktree"])
+
+        admission_failures = {
+            "branch_remote_wrong",
+            "branch_merge_wrong",
+            "branch_orphan",
+            "duplicate_user",
+            "duplicate_historical_branch_key",
+            "duplicate_extension",
+            "worktree_extension_false",
+            "unknown_branch_field",
+        }
+        admission_failures.update(
+            name
+            for name in cases
+            if name.startswith(("security_extra_", "required_"))
+        )
+        for name in admission_failures:
+            with self.subTest(admission_failure=name):
+                self.assertFalse(results[name]["admitted"], results[name])
+
+        parser_failures = {
+            "invalid_utf8",
+            "missing_terminal_nul",
+            "carriage_return",
+            "missing_separator",
+            "extra_separator",
+            "empty_key",
+            "overlong_branch",
+        }
+        parser_failures.update(name for name in cases if name.startswith("malformed_"))
+        for name in parser_failures:
+            with self.subTest(parser_failure=name):
+                self.assertFalse(results[name]["parsed"], results[name])
+                self.assertFalse(results[name]["admitted"], results[name])
+
+        self.assertNotIn(identity_name, output)
+        self.assertNotIn(identity_email, output)
+
+    def test_worktree_config_absence_fence_behavioural_matrix(self):
+        values = self.run_worktree_config_matrix()
+        self.assertTrue(values["absent"])
+        for name in ("file", "directory", "reparse", "indeterminate"):
+            with self.subTest(surface=name):
+                self.assertFalse(values[name])
+        self.assertTrue(values["disabled_preserves"])
+        self.assertTrue(values["enabled_absent"])
+        for name in (
+            "enabled_file",
+            "enabled_directory",
+            "enabled_reparse",
+            "enabled_indeterminate",
+            "enabled_appeared_after",
+        ):
+            with self.subTest(fence=name):
+                self.assertFalse(values[name])
+
+    def test_worktree_config_fence_wraps_all_config_consuming_repository_reads(self):
+        state = self.source_function(
+            "function Get-R156RepositoryState",
+            "function Resolve-R156RepositoryPath",
+        )
+        before = state.index("$worktreeConfigAbsentBefore")
+        first_repository_read = state.index("$branchResult = Invoke-R156LocalGitRead")
+        last_repository_read = state.index("$statusResult = Invoke-R156LocalGitRead")
+        after = state.index("$worktreeConfigAbsentAfter")
+        read_ok = state.index("$state.ReadOk")
+        self.assertLess(before, first_repository_read)
+        self.assertLess(last_repository_read, after)
+        self.assertLess(after, read_ok)
+        self.assertIn("C:\\XB\\automation\\.git\\config.worktree", state)
+        self.assertIn("$worktreeConfigFence", state)
 
     def test_status_is_side_effect_free_and_index_is_held(self):
         status = self.source_function(
