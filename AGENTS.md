@@ -211,8 +211,8 @@ Do not run live n8n, Docker, import/export, sync, activation, execution, publish
 
 ### n8n skill routing
 
-- Agents should load the host-qualified installed Toolkit skill equivalent to `n8n-agent-rules` (for example `ai-agent-toolkit:n8n-agent-rules`), plus the smallest relevant official `n8n-skills:*` skill set. Host-specific naming may differ.
-- An agent must not stop merely because the unqualified literal path `skills/n8n-agent-rules` is unavailable when the equivalent complete host-qualified Toolkit skill has been successfully loaded.
+- Agents should load the host-qualified installed Toolkit skill equivalent to `n8n-safety-router` (for example `ai-agent-toolkit:n8n-safety-router`), plus the smallest relevant official `n8n-skills:*` skill set. Host-specific naming may differ.
+- An agent must not stop merely because the unqualified literal path `skills/n8n-safety-router` is unavailable when the equivalent complete host-qualified Toolkit skill has been successfully loaded.
 - The agent must still stop when no equivalent complete Toolkit n8n safety rules are available.
 - This clarification does not weaken any approval, credential, local-only, import/export, execution, activation, or deployment safety gate.
 
