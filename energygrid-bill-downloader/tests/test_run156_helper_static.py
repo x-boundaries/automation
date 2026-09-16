@@ -1949,6 +1949,13 @@ $result | ConvertTo-Json -Compress
             "public static string[] ReadTokenPrivilegeNames",
         )
 
+        self.assertRegex(
+            linked,
+            r"if\s*\(\s*returnedLength\s*!=\s*nativeSize\s*\|\|\s*"
+            r"linkedToken\s*==\s*IntPtr\.Zero\s*\|\|\s*"
+            r"linkedToken\s*==\s*token\s*\)\s*\{\s*"
+            r"return\s+IntPtr\.Zero;\s*\}\s*transferred\s*=\s*true;",
+        )
         self.assertIn("linkedToken == IntPtr.Zero", linked)
         self.assertIn("linkedToken == token", linked)
         self.assertIn("bool transferred = false", linked)
