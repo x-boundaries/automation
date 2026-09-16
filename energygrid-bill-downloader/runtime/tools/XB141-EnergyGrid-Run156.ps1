@@ -2057,7 +2057,7 @@ function Get-R156CommitTreeParentProof {
     $parentValue = ''
     foreach ($line in $headerLines) {
         if ([string]$line -match '^[ ]') {
-            if ($lastHeader -notin @('gpgsig', 'mergetag') -or $line.Length -lt 2) {
+            if ($lastHeader -notin @('gpgsig', 'mergetag')) {
                 return $null
             }
             continue

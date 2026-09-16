@@ -1324,6 +1324,53 @@ foreach ($item in $values.GetEnumerator()) {
             "synthetic\n"
         ).encode("utf-8")
 
+    def test_signed_gpgsig_one_space_continuation_is_accepted(self):
+        tree = "a" * 40
+        parent = "b" * 40
+        raw = (
+            f"tree {tree}\n"
+            f"parent {parent}\n"
+            "author WJ <10020253+weijunswj@users.noreply.github.com> 0 +0000\n"
+            "committer WJ <10020253+weijunswj@users.noreply.github.com> 0 +0000\n"
+            "gpgsig -----BEGIN PGP SIGNATURE-----\n"
+            " \n"
+            " -----END PGP SIGNATURE-----\n"
+            "\n"
+            "synthetic\n"
+        ).encode("utf-8")
+        head = self.git_object_sha1("commit", raw)
+        functions = self.extracted_functions(
+            (
+                "Convert-R156BytesToHex",
+                "Get-R156Sha1ForGitObject",
+                "Convert-R156Utf8Bytes",
+                "Get-R156CommitTreeParentProof",
+            )
+        )
+        script = (
+            "$script:R156Checkout = 'C:\\XB\\automation'\n"
+            "function Invoke-R156LocalGitRead {\n"
+            "    return [pscustomobject]@{\n"
+            "        Success = $true\n"
+            "        StdoutBytes = [Convert]::FromBase64String($env:R156_RAW_COMMIT)\n"
+            "    }\n"
+            "}\n"
+            + functions
+            + "\n$result = Get-R156CommitTreeParentProof "
+            + f"-ExpectedHeadValue '{head}' "
+            + f"-ExpectedTreeValue '{tree}' "
+            + f"-ExpectedParentValue '{parent}'\n"
+            + "[pscustomobject]@{ accepted = ($null -ne $result) } "
+            + "| ConvertTo-Json -Compress\n"
+        )
+        lines = self.run_isolated_powershell(
+            script,
+            environment={
+                "R156_RAW_COMMIT": __import__("base64").b64encode(raw).decode("ascii")
+            },
+        )
+        self.assertEqual(json.loads(lines[-1]), {"accepted": True})
+
     @staticmethod
     def remote_record(head):
         return f"{head}\trefs/heads/main\n".encode("ascii")
