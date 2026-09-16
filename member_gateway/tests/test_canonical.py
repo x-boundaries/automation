@@ -4,6 +4,7 @@ from xb_member_gateway.canonical import (
     CanonicalizationError,
     build_source_event,
     canonical_json,
+    canonical_phone,
     canonicalize_source_event,
     dedupe_poll_responses,
     derive_register_and_expiry,
@@ -72,6 +73,65 @@ class CanonicalContractTests(unittest.TestCase):
         changed["payload_hash"] = self.event()["payload_hash"]
         with self.assertRaises(CanonicalizationError):
             canonicalize_source_event(changed)
+
+
+class OpaqueDigitPhoneTests(unittest.TestCase):
+    """The phone is the member's own digits: no country code is required or added."""
+
+    def test_local_and_country_prefixed_digits_are_preserved_and_distinct(self):
+        self.assertEqual(canonical_phone("91234567"), "91234567")
+        self.assertEqual(canonical_phone("6591234567"), "6591234567")
+        self.assertNotEqual(canonical_phone("91234567"), canonical_phone("6591234567"))
+
+    def test_international_digits_are_accepted_without_country_interpretation(self):
+        self.assertEqual(canonical_phone("+44 7700 900123"), "447700900123")
+        self.assertEqual(canonical_phone("14155552671"), "14155552671")
+
+    def test_presentation_characters_are_stripped_without_meaning(self):
+        for supplied in ("+65 9123 4567", "(65) 9123-4567", "65.9123.4567", "+6591234567"):
+            with self.subTest(supplied=supplied):
+                self.assertEqual(canonical_phone(supplied), "6591234567")
+
+    def test_leading_zero_survives_canonicalization(self):
+        self.assertEqual(canonical_phone("0912345"), "0912345")
+        self.assertEqual(canonical_phone("+0044 7700 900123"), "00447700900123")
+
+    def test_letters_extensions_and_unsupported_punctuation_are_rejected(self):
+        for supplied in (
+            "9123456x",
+            "91234567 x123",
+            "91234567 ext123",
+            "91234567#123",
+            "91234567,123",
+            "91234567/123",
+            "9123\t4567",
+            "9123\n4567",
+            "\uff19\uff11\uff12\uff13\uff14\uff15\uff16\uff17",
+        ):
+            with self.subTest(supplied=supplied):
+                with self.assertRaises(CanonicalizationError):
+                    canonical_phone(supplied)
+
+    def test_plus_is_allowed_once_and_only_in_the_lead_position(self):
+        self.assertEqual(canonical_phone(" +6591234567 "), "6591234567")
+        for supplied in ("++6591234567", "65+91234567", "6591234567+"):
+            with self.subTest(supplied=supplied):
+                with self.assertRaises(CanonicalizationError):
+                    canonical_phone(supplied)
+
+    def test_empty_and_separator_only_input_is_rejected(self):
+        for supplied in ("", "   ", "+", "()", "- - -", "..."):
+            with self.subTest(supplied=supplied):
+                with self.assertRaises(CanonicalizationError):
+                    canonical_phone(supplied)
+
+    def test_accepted_length_range_is_six_to_fifteen_digits(self):
+        self.assertEqual(canonical_phone("1" * 6), "1" * 6)
+        self.assertEqual(canonical_phone("1" * 15), "1" * 15)
+        for supplied in ("1" * 5, "1" * 16, "1" * 20):
+            with self.subTest(length=len(supplied)):
+                with self.assertRaises(CanonicalizationError):
+                    canonical_phone(supplied)
 
 
 if __name__ == "__main__":

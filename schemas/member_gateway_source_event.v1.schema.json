@@ -32,7 +32,7 @@
       "required": ["name", "phone", "email", "birthday_month", "marketing_consent", "pdpa_acknowledged"],
       "properties": {
         "name": {"type": "string", "minLength": 1, "maxLength": 200},
-        "phone": {"type": "string", "pattern": "^65[89][0-9]{7}$"},
+        "phone": {"type": "string", "pattern": "^[0-9]{6,15}$"},
         "email": {"type": "string", "format": "email", "maxLength": 254},
         "birthday_month": {
           "type": "string",

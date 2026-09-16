@@ -75,6 +75,22 @@ class MemberGatewayWorkerStaticTests(unittest.TestCase):
         self.assertIn("writer/quarantine", library)
         self.assertIn("writer_payload_missing", (ROOT / "scripts/ac2_member_gateway_worker.ps1").read_text(encoding="utf-8"))
 
+    def test_worker_keeps_its_probe_horizon_and_infers_nothing_about_the_phone(self):
+        library = (ROOT / "scripts/ac2_member_gateway_worker_lib.ps1").read_text(
+            encoding="utf-8"
+        )
+        # The widened 6-15 digit canonical range must not have changed the
+        # worker: it still walks the gateway's candidates up to the same
+        # 10,000-probe fail-closed horizon.
+        self.assertIn("for ($index = 0; $index -lt 10000; $index++)", library)
+        self.assertIn("member_no_allocation_exhausted", library)
+
+        text = "\n".join(path.read_text(encoding="utf-8") for path in WORKER_FILES)
+        # MemberNo shape is the gateway's contract; the worker treats the
+        # candidate as opaque and must not normalize or country-prefix it.
+        for forbidden in ("'65'", '"65"', "65[89]", "canonical_phone", "MobilePhone -replace"):
+            self.assertNotIn(forbidden, text, forbidden)
+
     def test_adapter_uses_only_the_reviewed_member_create_surface(self):
         adapter = (ROOT / "scripts/ac2_member_gateway_autocount_adapter.ps1").read_text(
             encoding="utf-8"

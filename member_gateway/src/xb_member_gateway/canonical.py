@@ -60,6 +60,16 @@ EVENT_FIELDS = frozenset(
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 SAFE_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,200}$")
 HASH_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+# The phone is an opaque digit string. Only the characters below are accepted as
+# presentation and stripped; anything else (letters, extensions, tabs/newlines,
+# Unicode digits, other punctuation) is rejected rather than silently dropped.
+PHONE_UNSUPPORTED_RE = re.compile(r"[^0-9 ()+.\-]")
+PHONE_PRESENTATION_RE = re.compile(r"^\+?[0-9 ().\-]*$")
+# 15 is the largest base that still leaves the production allocator its full
+# effective horizon: 15 digits plus "X9999" is exactly member_no_max_length 20.
+PHONE_MIN_DIGITS = 6
+PHONE_MAX_DIGITS = 15
+PHONE_DIGITS_RE = re.compile(rf"^[0-9]{{{PHONE_MIN_DIGITS},{PHONE_MAX_DIGITS}}}$")
 
 
 def normalize_text(value: Any) -> str:
@@ -88,19 +98,26 @@ def normalize_email(value: Any) -> str:
 
 
 def canonical_phone(value: Any) -> str:
-    """Return the canonical Singapore phone-shaped identifier."""
+    """Return the supplied phone as an opaque canonical ASCII digit string.
+
+    A country code is optional and is never validated, inferred, or prepended,
+    so a local-looking number and the same number carrying a country prefix stay
+    distinct values. Only the presentation characters are removed; the digits
+    themselves, including any leading zero, are preserved exactly as supplied.
+    """
 
     raw = normalize_text(value)
     if not raw:
         raise CanonicalizationError("phone_required")
-    if re.search(r"[^0-9\s()+.\-]", raw):
+    if PHONE_UNSUPPORTED_RE.search(raw):
         raise CanonicalizationError("phone_contains_letters_or_unsupported_characters")
+    if not PHONE_PRESENTATION_RE.fullmatch(raw):
+        # A "+" is presentation only: at most one, and only in the lead position.
+        raise CanonicalizationError("phone_shape_invalid")
     digits = re.sub(r"[^0-9]", "", raw)
-    if len(digits) == 8 and digits[0] in "89":
-        return f"65{digits}"
-    if len(digits) == 10 and digits.startswith("65") and digits[2] in "89":
-        return digits
-    raise CanonicalizationError("phone_shape_invalid")
+    if not PHONE_DIGITS_RE.fullmatch(digits):
+        raise CanonicalizationError("phone_shape_invalid")
+    return digits
 
 
 def normalize_month(value: Any) -> str:

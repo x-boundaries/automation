@@ -35,8 +35,11 @@ class AllocationDecision:
     reused: bool
 
 
-_PHONE_RE = re.compile(r"^65[89][0-9]{7}$")
-_CANDIDATE_RE = re.compile(r"^65[89][0-9]{7}(?:X[1-9][0-9]*)?$")
+# The base is the canonical opaque phone digits; no country prefix is required
+# or interpreted here. Candidate length stays bounded by max_length below, so
+# the suffix itself deliberately carries no separate digit cap.
+_PHONE_RE = re.compile(r"^[0-9]{6,15}$")
+_CANDIDATE_RE = re.compile(r"^[0-9]{6,15}(?:X[1-9][0-9]*)?$")
 
 
 class MemberNoAllocator:

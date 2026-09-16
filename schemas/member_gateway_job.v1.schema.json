@@ -33,7 +33,7 @@
       "required": ["name", "phone", "email", "birthday_month", "marketing_consent", "pdpa_acknowledged", "create_time"],
       "properties": {
         "name": {"type": "string", "minLength": 1, "maxLength": 200},
-        "phone": {"type": "string", "pattern": "^65[89][0-9]{7}$"},
+        "phone": {"type": "string", "pattern": "^[0-9]{6,15}$"},
         "email": {"type": "string", "format": "email"},
         "birthday_month": {"type": "string", "enum": ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"]},
         "marketing_consent": {"type": "string", "enum": ["Yes", "No"]},
@@ -45,7 +45,7 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["member_no"],
-      "properties": {"member_no": {"type": "string", "pattern": "^65[89][0-9]{7}(?:X[1-9][0-9]*)?$"}}
+      "properties": {"member_no": {"type": "string", "pattern": "^[0-9]{6,15}(?:X[1-9][0-9]*)?$", "maxLength": 20}}
     }
   }
 }

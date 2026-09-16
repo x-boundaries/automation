@@ -11,7 +11,7 @@
     "operation": {"const": "member.create"},
     "result_hash": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
     "status": {"type": "string", "enum": ["CREATED_VERIFIED", "WRITE_OUTCOME_UNCERTAIN", "CONFIRMED_NOT_CREATED", "CREATED_READBACK_MISMATCH"]},
-    "member_no": {"type": "string", "pattern": "^65[89][0-9]{7}(?:X[1-9][0-9]*)?$"},
+    "member_no": {"type": "string", "pattern": "^[0-9]{6,15}(?:X[1-9][0-9]*)?$", "maxLength": 20},
     "dispatch_fence_id": {"type": "string", "pattern": "^fence-[A-Za-z0-9]{16,64}$"},
     "save_invocation_count": {"type": "integer", "const": 1},
     "readback_found": {"type": "boolean"},
