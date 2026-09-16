@@ -1,6 +1,7 @@
 {
   "id": "xbMemberGatewayTemplate02",
   "name": "Member Gateway - Google Forms durable source adapter (inactive)",
+  "description": "Inactive Google Forms source adapter for the XB member gateway. On each manual run it reads the durable source cursor, fetches exactly one Google Forms response page from the cursor lower bound, applies the closed member-intake.v1 question map, and admits at most one new source event before committing a page checkpoint. It exists so member signups reach the downstream member pipeline through one auditable, replay-safe path instead of manual re-entry. Fail-closed by default: the internal activation_enabled gate is false and every outbound endpoint, credential and form identifier in this repository copy is a placeholder configured outside the repository. DO NOT ACTIVATE from this template. Activation requires separate, explicitly granted owner authority and a documented source-contract reconciliation; it is not implied by importing or updating this workflow.",
   "active": false,
   "nodes": [
     {
@@ -61,13 +62,16 @@
           {"name": "form_alias", "value": "={{ $('Repository-safe source configuration').first().json.form_alias }}"},
           {"name": "mapping_version", "value": "={{ $('Repository-safe source configuration').first().json.mapping_version }}"}
         ]},
-        "options": {"response": {"response": {"responseFormat": "json"}}}
+        "options": {"response": {"response": {"responseFormat": "json"}}, "timeout": 30000}
       },
       "id": "b6000000-0000-4600-8600-000000000001",
       "name": "Read durable source cursor",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
       "position": [-480, 32],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1000,
       "notesInFlow": true,
       "notes": "Source-only read. Authentication remains deliberately unbound in this inactive export."
     },
@@ -81,13 +85,16 @@
           {"name": "filter", "value": "={{ 'timestamp >= ' + $json.scan_lower_bound }}"},
           {"name": "pageToken", "value": "={{ $json.resume_page_token || undefined }}"}
         ]},
-        "options": {"response": {"response": {"responseFormat": "json", "fullResponse": true}}}
+        "options": {"response": {"response": {"responseFormat": "json", "fullResponse": true}}, "timeout": 30000}
       },
       "id": "b6666666-6666-4666-8666-666666666666",
       "name": "Google Forms single page (configured outside repo)",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
       "position": [-256, 32],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
       "notesInFlow": true,
       "notes": "One page only, inclusive durable lower bound, page size one. No scheduler, credential, or live Form binding is committed."
     },
@@ -125,13 +132,16 @@
         "sendBody": true,
         "specifyBody": "json",
         "jsonBody": "={{ $('Canonicalize source page').first().json.source_event }}",
-        "options": {"response": {"response": {"responseFormat": "json"}}}
+        "options": {"response": {"response": {"responseFormat": "json"}}, "timeout": 30000}
       },
       "id": "b8888888-8888-4888-8888-888888888888",
       "name": "Protected XB Gateway ingest (configured outside repo)",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
       "position": [416, -48],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 2000,
       "notesInFlow": true,
       "notes": "Sequential source admission. A failed admission prevents the page checkpoint."
     },
@@ -142,7 +152,7 @@
         "sendBody": true,
         "specifyBody": "json",
         "jsonBody": "={{ ({ ...$('Canonicalize source page').first().json.page_checkpoint, expected_state_version: $('Canonicalize source page').first().json.source_event === null ? $('Read durable source cursor').first().json.state_version : ($json.replayed ? $('Read durable source cursor').first().json.state_version : $('Read durable source cursor').first().json.state_version + 1) }) }}",
-        "options": {"response": {"response": {"responseFormat": "json"}}}
+        "options": {"response": {"response": {"responseFormat": "json"}}, "timeout": 30000}
       },
       "id": "b9000000-0000-4900-8900-000000000001",
       "name": "Commit durable page checkpoint",
@@ -173,6 +183,6 @@
     "Eligible source response present": {"main": [[{"node": "Protected XB Gateway ingest (configured outside repo)", "type": "main", "index": 0}], [{"node": "Commit durable page checkpoint", "type": "main", "index": 0}]]},
     "Protected XB Gateway ingest (configured outside repo)": {"main": [[{"node": "Commit durable page checkpoint", "type": "main", "index": 0}]]}
   },
-  "settings": {"executionOrder": "v1", "saveManualExecutions": false, "saveDataErrorExecution": "none", "saveDataSuccessExecution": "none"},
+  "settings": {"executionOrder": "v1", "saveManualExecutions": false, "saveDataErrorExecution": "none", "saveDataSuccessExecution": "none", "availableInMCP": false},
   "staticData": null
 }
