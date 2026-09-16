@@ -1892,6 +1892,127 @@ $result | ConvertTo-Json -Compress
         self.assertIn("entriesLength", groups)
         self.assertIn("TryCopySidFromBuffer", groups)
 
+    def test_generic_token_query_helper_remains_122_only_and_class_18_uses_it(self):
+        helper = self.method_body(
+            "private static bool TryGetTokenInformationBuffer",
+            "private static bool TryGetBufferOffset",
+        )
+        elevation = self.method_body(
+            "public static int GetTokenElevationType",
+            "public static IntPtr GetLinkedToken",
+        )
+
+        self.assertIn("IntPtr.Zero,\n                    0,", helper)
+        self.assertIn("firstError != ERROR_INSUFFICIENT_BUFFER", helper)
+        self.assertNotIn("ERROR_BAD_LENGTH", helper)
+        self.assertNotIn("TOKEN_LINKED_TOKEN_CLASS", helper)
+        self.assertIn(
+            "ReadTokenInformationBytes(token, TOKEN_ELEVATION_TYPE_CLASS)",
+            elevation,
+        )
+
+    def test_linked_token_query_is_direct_exact_and_pointer_width_safe(self):
+        self.assertRegex(
+            self.native,
+            r"\[StructLayout\(LayoutKind\.Sequential\)\]\s+"
+            r"public struct TOKEN_LINKED_TOKEN\s*\{\s*"
+            r"public IntPtr LinkedToken;\s*\}",
+        )
+        linked = self.method_body(
+            "public static IntPtr GetLinkedToken",
+            "public static string[] ReadTokenPrivilegeNames",
+        )
+
+        self.assertNotIn("TryGetTokenInformationBuffer", linked)
+        self.assertNotIn("ReadTokenInformationBytes", linked)
+        self.assertNotIn("IntPtr.Zero,\n                        0,", linked)
+        for marker in (
+            "Marshal.SizeOf(typeof(TOKEN_LINKED_TOKEN))",
+            "nativeSize != IntPtr.Size",
+            "Marshal.AllocHGlobal(nativeSize)",
+            "Marshal.WriteIntPtr(buffer, IntPtr.Zero)",
+            "TOKEN_LINKED_TOKEN_CLASS",
+            "buffer,\n                        nativeSize,",
+            "returnedLength != nativeSize",
+            "linkedToken = Marshal.ReadIntPtr(buffer)",
+        ):
+            self.assertIn(marker, linked)
+        self.assertLess(
+            linked.index("Marshal.ReadIntPtr(buffer)"),
+            linked.index("Marshal.FreeHGlobal(buffer)"),
+        )
+        self.assertNotIn("return buffer", linked)
+
+    def test_linked_token_handle_rejection_cleanup_and_transfer_are_fail_closed(self):
+        linked = self.method_body(
+            "public static IntPtr GetLinkedToken",
+            "public static string[] ReadTokenPrivilegeNames",
+        )
+
+        self.assertRegex(
+            linked,
+            r"if\s*\(\s*returnedLength\s*!=\s*nativeSize\s*\|\|\s*"
+            r"linkedToken\s*==\s*IntPtr\.Zero\s*\|\|\s*"
+            r"linkedToken\s*==\s*token\s*\)\s*\{\s*"
+            r"return\s+IntPtr\.Zero;\s*\}\s*transferred\s*=\s*true;",
+        )
+        self.assertIn("linkedToken == IntPtr.Zero", linked)
+        self.assertIn("linkedToken == token", linked)
+        self.assertIn("bool transferred = false", linked)
+        self.assertIn("!transferred", linked)
+        self.assertIn("linkedToken != IntPtr.Zero", linked)
+        self.assertIn("linkedToken != token", linked)
+        self.assertIn("CloseHandle(linkedToken)", linked)
+        self.assertLess(linked.index("transferred = true"), linked.index("return linkedToken"))
+        self.assertLess(linked.index("return linkedToken"), linked.index("finally"))
+        self.assertEqual(linked.count("CloseHandle(linkedToken)"), 1)
+        self.assertEqual(linked.count("Marshal.FreeHGlobal(buffer)"), 1)
+
+    def test_full_and_linked_token_security_fences_remain_intact(self):
+        context = self.source_function(
+            "function Get-R156TokenContext",
+            "function Get-R156RawSecurityDescriptor",
+        )
+
+        for marker in (
+            "EG_R156_TOKEN_READ_FAILED",
+            "EG_R156_SYSTEM_CONTEXT",
+            "EG_R156_NON_INTERACTIVE_CONTEXT",
+            "$elevationType -ne 2",
+            "$fullAdminMatches -ne 1",
+            "($group.Attributes -band 0x00000004) -eq 0",
+            "($group.Attributes -band 0x00000010) -ne 0",
+            "$linked -eq [IntPtr]::Zero -or $linked -eq $full",
+            "EG_R156_FILTERED_TOKEN_ACCOUNT_MISMATCH",
+            "GetTokenElevationType($linked) -ne 3",
+            "$linkedAdminMatches -ne 1",
+            "($group.Attributes -band 0x00000010) -eq 0",
+            "($group.Attributes -band 0x00000004) -ne 0",
+            "EG_R156_FILTERED_TOKEN_PRIVILEGE_READ_FAILED",
+            "SeTakeOwnershipPrivilege",
+            "SeRestorePrivilege",
+            "EG_R156_FILTERED_TOKEN_BYPASS_PRIVILEGE",
+        ):
+            self.assertIn(marker, context)
+        self.assertIn("$success = $true", context)
+        self.assertIn("if (-not $success)", context)
+        self.assertIn("[EgR156.Native]::CloseToken($linked)", context)
+
+    def test_signed_commit_header_fail_closed_guards_remain_intact(self):
+        proof = self.source_function(
+            "function Get-R156CommitTreeParentProof",
+            "function Close-R156TrackedHandles",
+        )
+
+        for marker in (
+            "$lastHeader -notin @('gpgsig', 'mergetag')",
+            "'^(?<name>[a-z][a-z0-9-]*) (?<value>[^\\r\\n]+)$'",
+            "$allowedHeaders -notcontains $name",
+            "$counts.ContainsKey($name)",
+            "foreach ($required in @('tree', 'parent', 'author', 'committer'))",
+        ):
+            self.assertIn(marker, proof)
+
     def test_sid_pointer_and_structure_bounds_fail_closed(self):
         self.assertIn("targetAddress < bufferAddress", self.native)
         self.assertIn("targetAddress > bufferEnd - (long)minimumLength", self.native)
