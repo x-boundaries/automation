@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping
 
@@ -9,6 +10,13 @@ from .api import GatewayApp, GatewayService, serve
 from .auth import AuthenticationError, BearerTokenAuthenticator
 from .config import ConfigError, GatewayConfig, load_config
 from .repository import PostgresRepository, RepositoryError
+
+
+# Dark bring-up composes a gateway whose AutoCount adapter is deliberately not
+# ready. Only startup composition is exempt: the reason stays in
+# GatewayConfig.readiness_reasons(), so readiness stays false, dispatch stays
+# ineligible, and AutoCount execution stays unavailable.
+_STARTUP_EXEMPT_READINESS_REASONS = frozenset({"autocount_adapter_not_ready"})
 
 
 class BootstrapError(RuntimeError):
@@ -33,6 +41,30 @@ def _required(environment: Mapping[str, str], name: str, code: str) -> str:
     return value
 
 
+def _private_bind_address(value: str) -> str:
+    """Accept only a private IP literal; the supplied value is never echoed.
+
+    Deployment, not the application, places the gateway on its fixed private
+    backend address. No name resolution happens here, so a hostname is a
+    bounded rejection rather than a silent lookup.
+    """
+
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError as exc:
+        raise BootstrapError("bind_address_invalid") from exc
+    mapped = getattr(address, "ipv4_mapped", None)
+    if mapped is not None:
+        address = mapped
+    if address.is_unspecified:
+        # 0.0.0.0 and :: are classified private, so the wildcard needs its own
+        # fence. There is never a fallback to an all-interface bind.
+        raise BootstrapError("bind_address_unspecified")
+    if address.is_multicast or address.is_reserved or not address.is_private:
+        raise BootstrapError("bind_address_not_private")
+    return value
+
+
 def compose_gateway(
     config_path: str,
     *,
@@ -45,7 +77,11 @@ def compose_gateway(
         config = load_config(config_path)
         if config.production_activation_enabled or not config.kill_switch_enabled:
             raise BootstrapError("unsafe_startup_defaults")
-        reasons = config.readiness_reasons()
+        reasons = tuple(
+            reason
+            for reason in config.readiness_reasons()
+            if reason not in _STARTUP_EXEMPT_READINESS_REASONS
+        )
         if reasons:
             raise BootstrapError(reasons[0])
         runtime_names = (
@@ -55,7 +91,9 @@ def compose_gateway(
         if len({name.casefold() for name in runtime_names}) != len(runtime_names):
             raise BootstrapError("runtime_environment_bindings_must_differ")
         dsn = _required(environment, config.postgres_dsn_env, "postgres_dsn_binding_missing")
-        address = _required(environment, config.bind_address_env, "bind_address_binding_missing")
+        address = _private_bind_address(
+            _required(environment, config.bind_address_env, "bind_address_binding_missing")
+        )
         port_text = _required(environment, config.bind_port_env, "bind_port_binding_missing")
         reference_key = _required(environment, config.reference_hmac_key_env, "reference_hmac_binding_missing")
         bearer_values = [_required(environment, name, "bearer_binding_missing") for name in config.credential_env_names]
