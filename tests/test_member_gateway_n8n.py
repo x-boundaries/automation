@@ -1,5 +1,6 @@
 import hashlib
 import json
+import re
 import shutil
 import subprocess
 import unittest
@@ -8,6 +9,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / "n8n-workflows/member_forms_gateway_ingest.workflow.json"
 FIXTURE = ROOT / "tests/fixtures/member_forms_google_v1.fixture"
+PAGE_TOKEN_EXPRESSION = "={{ $json.resume_page_token || undefined }}"
 
 NODE_RUNNER = r"""
 const fs = require('fs');
@@ -19,6 +21,18 @@ try {
   const item = {body: payload.page};
   const result = run({all: () => [{json: item}]}, item, localRequire, selector);
   process.stdout.write(JSON.stringify({ok: true, result}));
+} catch (error) {
+  process.stdout.write(JSON.stringify({ok: false, error: String(error && error.message ? error.message : error)}));
+}
+"""
+
+EXPRESSION_RUNNER = r"""
+const fs = require('fs');
+const payload = JSON.parse(fs.readFileSync(0, 'utf8'));
+try {
+  const evaluate = new Function('$json', 'return (' + payload.expression + ');');
+  const value = evaluate(payload.json);
+  process.stdout.write(JSON.stringify({ok: true, type: typeof value, value: value === undefined ? null : value}));
 } catch (error) {
   process.stdout.write(JSON.stringify({ok: false, error: String(error && error.message ? error.message : error)}));
 }
@@ -147,6 +161,141 @@ class MemberGatewayN8nTests(unittest.TestCase):
             self.assertIn(text, code)
         self.assertNotIn("source.phone", code)
         self.assertNotIn("lastSubmittedTime", code)
+
+    def test_page_token_expression_resolves_first_page_and_continuation(self):
+        page_token = next(item for item in self.forms_http["parameters"]["queryParameters"]["parameters"] if item["name"] == "pageToken")
+        self.assertEqual(page_token["value"], PAGE_TOKEN_EXPRESSION)
+        expression = page_token["value"][len("={{"):-len("}}")]
+        for token, expected_type, expected_value in ((None, "undefined", None), ("", "undefined", None), ("page-token-002", "string", "page-token-002")):
+            with self.subTest(token=token):
+                payload = {"expression": expression, "json": {"resume_page_token": token}}
+                proc = subprocess.run(["node", "-e", EXPRESSION_RUNNER], input=json.dumps(payload), capture_output=True, text=True, check=False)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                result = json.loads(proc.stdout)
+                self.assertTrue(result["ok"], result)
+                self.assertEqual(result["type"], expected_type)
+                self.assertEqual(result["value"], expected_value)
+
+
+class MemberGatewayN8nCanonicalContractTests(unittest.TestCase):
+    """Canonical timeout, retry, MCP-exposure, description, and fail-closed regressions. No node runtime required."""
+
+    HTTP_NODES = (
+        "Read durable source cursor",
+        "Google Forms single page (configured outside repo)",
+        "Protected XB Gateway ingest (configured outside repo)",
+        "Commit durable page checkpoint",
+    )
+    RETRY_POLICY = {
+        "Read durable source cursor": (3, 1000),
+        "Google Forms single page (configured outside repo)": (3, 2000),
+        "Protected XB Gateway ingest (configured outside repo)": (2, 2000),
+    }
+    RETRY_FIELDS = ("retryOnFail", "maxTries", "waitBetweenTries")
+    DOMAIN_PATTERN = re.compile(r"\b[a-z0-9-]+\.(?:com|sg|net|org|io|dev|app|googleapis)\b", re.IGNORECASE)
+    OPAQUE_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{25,}")
+
+    def setUp(self):
+        self.workflow = json.loads(WORKFLOW.read_text(encoding="utf-8"))
+        self.nodes = {node["name"]: node for node in self.workflow["nodes"]}
+
+    def test_every_http_node_declares_an_explicit_thirty_second_timeout(self):
+        http_names = {node["name"] for node in self.workflow["nodes"] if node["type"] == "n8n-nodes-base.httpRequest"}
+        self.assertEqual(http_names, set(self.HTTP_NODES))
+        for name in self.HTTP_NODES:
+            with self.subTest(node=name):
+                options = self.nodes[name]["parameters"]["options"]
+                self.assertEqual(options["timeout"], 30000)
+                self.assertIn("response", options)
+
+    def test_bounded_retry_only_on_reads_and_idempotent_ingest(self):
+        for name, (max_tries, wait) in self.RETRY_POLICY.items():
+            with self.subTest(node=name):
+                node = self.nodes[name]
+                self.assertIs(node["retryOnFail"], True)
+                self.assertEqual(node["maxTries"], max_tries)
+                self.assertEqual(node["waitBetweenTries"], wait)
+
+    def test_cas_page_checkpoint_declares_no_automatic_retry(self):
+        checkpoint = self.nodes["Commit durable page checkpoint"]
+        for field in self.RETRY_FIELDS:
+            self.assertNotIn(field, checkpoint)
+
+    def test_settings_disable_mcp_exposure_and_preserve_execution_policy(self):
+        self.assertEqual(self.workflow["settings"], {
+            "executionOrder": "v1",
+            "saveManualExecutions": False,
+            "saveDataErrorExecution": "none",
+            "saveDataSuccessExecution": "none",
+            "availableInMCP": False,
+        })
+
+    def test_description_states_do_not_activate_without_leaking_live_identifiers(self):
+        description = self.workflow["description"]
+        self.assertTrue(description.strip())
+        self.assertIn("DO NOT ACTIVATE", description)
+        self.assertNotIn("http", description.lower())
+        self.assertNotIn("@", description)
+        self.assertEqual(self.DOMAIN_PATTERN.findall(description), [])
+        self.assertEqual(self.OPAQUE_ID_PATTERN.findall(description), [])
+        for marker in ("bearer", "api_key", "apikey", "password", "private key", "token="):
+            self.assertNotIn(marker, description.lower())
+
+    def test_page_token_parameter_is_declared_exactly_once_and_unchanged(self):
+        forms = self.nodes["Google Forms single page (configured outside repo)"]
+        parameters = forms["parameters"]["queryParameters"]["parameters"]
+        page_tokens = [item for item in parameters if item["name"] == "pageToken"]
+        self.assertEqual(len(page_tokens), 1)
+        self.assertEqual(page_tokens[0]["value"], PAGE_TOKEN_EXPRESSION)
+        self.assertNotIn("jsonQuery", forms["parameters"])
+        self.assertNotIn("pagination", forms["parameters"]["options"])
+
+    def test_inactive_manual_only_posture_carries_no_webhook_or_credential_binding(self):
+        self.assertIs(self.workflow["active"], False)
+        triggers = {node["type"] for node in self.workflow["nodes"] if node["type"].endswith("Trigger")}
+        self.assertEqual(triggers, {"n8n-nodes-base.manualTrigger"})
+        activation = next(item for item in self.nodes["Repository-safe source configuration"]["parameters"]["assignments"]["assignments"] if item["name"] == "activation_enabled")
+        self.assertIs(activation["value"], False)
+
+        def walk(value):
+            if isinstance(value, dict):
+                yield value
+                for child in value.values():
+                    yield from walk(child)
+            elif isinstance(value, list):
+                for child in value:
+                    yield from walk(child)
+
+        for item in walk(self.workflow):
+            self.assertNotIn("webhookId", item)
+            self.assertNotIn("credentials", item)
+            self.assertNotIn("authentication", item)
+        raw = WORKFLOW.read_text(encoding="utf-8")
+        for placeholder in ("GOOGLE_FORM_ID_PLACEHOLDER", "QUESTION_ID_NAME_PLACEHOLDER", "QUESTION_ID_PHONE_PLACEHOLDER"):
+            self.assertIn(placeholder, raw)
+
+    def test_blocked_activation_branch_reaches_no_network_node(self):
+        blocked = self.workflow["connections"]["Controlled activation gate"]["main"][1]
+        self.assertEqual([edge["node"] for edge in blocked], ["Blocked until separate activation"])
+        reachable = set()
+        frontier = [edge["node"] for edge in blocked]
+        while frontier:
+            name = frontier.pop()
+            if name in reachable:
+                continue
+            reachable.add(name)
+            for branch in self.workflow["connections"].get(name, {}).get("main", []):
+                frontier.extend(edge["node"] for edge in branch)
+        for name in reachable:
+            node = self.nodes[name]
+            self.assertNotEqual(node["type"], "n8n-nodes-base.httpRequest")
+            self.assertNotIn("url", node["parameters"])
+
+    def test_ineligible_page_checkpoints_without_gateway_ingest(self):
+        eligible = self.workflow["connections"]["Eligible source response present"]["main"]
+        self.assertEqual([edge["node"] for edge in eligible[0]], ["Protected XB Gateway ingest (configured outside repo)"])
+        self.assertEqual([edge["node"] for edge in eligible[1]], ["Commit durable page checkpoint"])
+        self.assertEqual([edge["node"] for edge in self.workflow["connections"]["Protected XB Gateway ingest (configured outside repo)"]["main"][0]], ["Commit durable page checkpoint"])
 
 
 if __name__ == "__main__":
