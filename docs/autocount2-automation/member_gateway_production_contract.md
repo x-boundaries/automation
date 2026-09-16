@@ -19,9 +19,9 @@ The closed `xb.member.source_event.v1` object requires `source_system` to be
 `google_forms`, an allowlisted form alias and mapping version, an opaque
 `response_id`, RFC3339 `create_time`, request identity, the canonical member
 payload, and its SHA-256 payload hash. Canonicalization uses UTF-8, Unicode NFC,
-normalized line endings, stable whitespace/name handling, canonical Singapore
-phone, lower-case trimmed email, birthday month, explicit `Yes`/`No` marketing
-consent, and explicit PDPA acknowledgement. Sorted-key JSON without
+normalized line endings, stable whitespace/name handling, canonical opaque
+phone digits, lower-case trimmed email, birthday month, explicit `Yes`/`No`
+marketing consent, and explicit PDPA acknowledgement. Sorted-key JSON without
 insignificant whitespace is hashed before ingest.
 
 `response_id` is immutable. A same-ID/same-hash replay returns the original job;
@@ -53,14 +53,27 @@ calendar years minus one day. `MemberType` is `Default`, `OpeningPoints` is
 zero, and the existing repository DOB representation is preserved:
 `Birthday Month -> 2000-MM-01`.
 
-`MobilePhone` is the canonical normalized phone. `MemberNo` is independent,
-but starts with the canonical phone-shaped base and progresses only as
-`base`, `baseX1`, `baseX2`, and so on. A positive-free lookup is required before
-durable binding. An existing binding always wins. Ambiguous or unavailable
-lookups never advance the suffix. A bound candidate is rechecked immediately
-before the dispatch fence; unexpected occupancy becomes manual review rather
-than silent reallocation. No truncation, alternate suffix, or wraparound is
-implemented.
+`MobilePhone` is the canonical normalized phone: the exact ASCII digits the
+member supplied, `^[0-9]{6,15}$`, after presentation characters are removed. A
+single leading `+` is accepted only as the first non-whitespace character and is
+stripped; ASCII spaces, hyphens, parentheses and dots are stripped without
+interpretation. Letters, extension syntax, Unicode digits, internal
+tabs/newlines, extra or mid-string `+`, unsupported punctuation, and empty or
+separator-only input are rejected. A country code is optional and is never
+required, validated, inferred, or prepended, so international and local numbers
+are both valid and a local-looking number is never equivalent to the same
+number carrying a country prefix. Leading zeroes are preserved and the value is
+never treated as an integer. The 15-digit ceiling is what keeps the effective
+production allocation horizon intact: 15 digits plus `X9999` is exactly the
+20-character `member_no_max_length`.
+
+`MemberNo` is independent, but starts with the canonical phone-shaped base and
+progresses only as `base`, `baseX1`, `baseX2`, and so on. A positive-free
+lookup is required before durable binding. An existing binding always wins.
+Ambiguous or unavailable lookups never advance the suffix. A bound candidate is
+rechecked immediately before the dispatch fence; unexpected occupancy becomes
+manual review rather than silent reallocation. No truncation, alternate suffix,
+or wraparound is implemented.
 
 The effective production `member_no_max_length` is required configuration and
 must be exactly 20. Repository/schema evidence does not

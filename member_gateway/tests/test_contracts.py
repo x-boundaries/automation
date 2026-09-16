@@ -2,7 +2,7 @@ import json
 import unittest
 from pathlib import Path
 
-from xb_member_gateway.allocation import MemberNoAllocator
+from xb_member_gateway.allocation import AllocationError, MemberNoAllocator
 from xb_member_gateway.config import ConfigError, GatewayConfig
 from xb_member_gateway.models import JobState
 from xb_member_gateway.state_machine import ALLOWED_TRANSITIONS
@@ -196,6 +196,56 @@ class ContractSurfaceTests(unittest.TestCase):
         self.assertFalse(
             production_allocator.validate_candidate("1" * 20, "1" * 21)
         )
+
+    def test_schemas_bind_the_opaque_digit_phone_and_total_member_no_length(self):
+        phone_pattern = "^[0-9]{6,15}$"
+        member_no_pattern = "^[0-9]{6,15}(?:X[1-9][0-9]*)?$"
+        for relative in (
+            "schemas/member_gateway_source_event.v1.schema.json",
+            "schemas/member_gateway_job.v1.schema.json",
+            "schemas/member_gateway_job.v2.schema.json",
+        ):
+            with self.subTest(schema=relative):
+                schema = self.read_json(relative)
+                payload = schema["properties"].get("payload") or schema["properties"]["member_payload"]
+                self.assertEqual(payload["properties"]["phone"]["pattern"], phone_pattern)
+
+        for relative, pointer in (
+            ("schemas/member_gateway_job.v1.schema.json", ("allocation",)),
+            ("schemas/member_gateway_job.v2.schema.json", ("allocation",)),
+            ("schemas/member_gateway_result.v1.schema.json", ()),
+        ):
+            with self.subTest(schema=relative):
+                node = self.read_json(relative)["properties"]
+                for key in pointer:
+                    node = node[key]["properties"]
+                member_no = node["member_no"]
+                self.assertEqual(member_no["pattern"], member_no_pattern)
+                # The suffix is deliberately uncapped in the pattern; total length
+                # is what the allocator and AutoCount actually constrain.
+                self.assertEqual(member_no["maxLength"], 20)
+
+    def test_fifteen_digit_base_keeps_the_full_production_allocation_horizon(self):
+        allocator = MemberNoAllocator(20)
+        base = "1" * 15
+        candidates = allocator.candidates(base)
+        self.assertEqual(next(candidates), base)
+        self.assertEqual(next(candidates), base + "X1")
+        self.assertTrue(allocator.validate_candidate(base, base + "X9999"))
+        self.assertEqual(len(base + "X9999"), 20)
+        # X10000 would be 21 characters, so the length-derived generator stops
+        # exactly at the worker's existing 10,000-probe horizon.
+        self.assertFalse(allocator.validate_candidate(base, base + "X10000"))
+
+    def test_allocator_accepts_the_opaque_range_and_rejects_outside_it(self):
+        allocator = MemberNoAllocator(20)
+        for base in ("1" * 6, "91234567", "6591234567", "1" * 15):
+            with self.subTest(base=base):
+                self.assertEqual(next(allocator.candidates(base)), base)
+        for base in ("1" * 5, "1" * 16, "65912345a7", "+6591234567"):
+            with self.subTest(base=base):
+                with self.assertRaises(AllocationError):
+                    next(allocator.candidates(base))
 
     def test_governed_mapping_surfaces_do_not_bind_unused_udfs(self):
         governed = (

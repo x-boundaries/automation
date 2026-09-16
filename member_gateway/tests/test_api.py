@@ -32,17 +32,6 @@ def make_event(response_id="api-response-001"):
         "marketing_consent": "No",
         "pdpa_acknowledged": True,
     }
-    from xb_member_gateway.canonical import canonical_json
-    from xb_member_gateway.crypto import payload_hash
-
-    canonical_payload = {
-        "name": payload["name"],
-        "phone": "6581234567",
-        "email": payload["email"],
-        "birthday_month": payload["birthday_month"],
-        "marketing_consent": payload["marketing_consent"],
-        "pdpa_acknowledged": payload["pdpa_acknowledged"],
-    }
     return build_source_event(
         response_id=response_id,
         request_id=f"api-request-{response_id}",

@@ -1,8 +1,10 @@
+import copy
 import hashlib
 import json
 import re
 import shutil
 import subprocess
+import sys
 import unittest
 from pathlib import Path
 
@@ -71,6 +73,58 @@ class MemberGatewayN8nTests(unittest.TestCase):
         result = self.run_page(name, index, cursor=cursor)
         self.assertFalse(result["ok"])
         self.assertIn(code, result["error"])
+
+    def run_page_with_phone(self, supplied):
+        page = copy.deepcopy(self.fixtures["one_page"]["pages"][0])
+        answers = page["responses"][0]["answers"]["QUESTION_ID_PHONE_PLACEHOLDER"]
+        answers["textAnswers"]["answers"][0]["value"] = supplied
+        payload = {"code": self.mapper["parameters"]["jsCode"], "page": page, "cursor": self.cursor()}
+        proc = subprocess.run(["node", "-e", NODE_RUNNER], input=json.dumps(payload), capture_output=True, text=True, check=False)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return json.loads(proc.stdout)
+
+    def canonical_phone_from_adapter(self, supplied):
+        result = self.run_page_with_phone(supplied)
+        self.assertTrue(result["ok"], result)
+        return result["result"][0]["json"]["source_event"]["payload"]["phone"]
+
+    def test_adapter_phone_is_opaque_digits_with_no_country_inference(self):
+        self.assertEqual(self.canonical_phone_from_adapter("91234567"), "91234567")
+        self.assertEqual(self.canonical_phone_from_adapter("6591234567"), "6591234567")
+        self.assertEqual(self.canonical_phone_from_adapter("+44 7700 900123"), "447700900123")
+        self.assertEqual(self.canonical_phone_from_adapter("(65) 9123-4567"), "6591234567")
+        self.assertEqual(self.canonical_phone_from_adapter("65.9123.4567"), "6591234567")
+        self.assertEqual(self.canonical_phone_from_adapter("0912345"), "0912345")
+        self.assertEqual(self.canonical_phone_from_adapter("1" * 6), "1" * 6)
+        self.assertEqual(self.canonical_phone_from_adapter("1" * 15), "1" * 15)
+
+    def test_adapter_phone_rejects_everything_outside_the_locked_contract(self):
+        for supplied in (
+            "91234567 ext123",
+            "91234567x12",
+            "91234567#12",
+            "++6591234567",
+            "65+91234567",
+            "9123\t4567",
+            "\uff19\uff11\uff12\uff13\uff14\uff15\uff16\uff17",
+            "-- --",
+            "1" * 5,
+            "1" * 16,
+        ):
+            with self.subTest(supplied=supplied):
+                result = self.run_page_with_phone(supplied)
+                self.assertFalse(result["ok"], result)
+                self.assertIn("phone_shape_invalid", result["error"])
+
+    def test_adapter_and_gateway_canonicalizers_agree(self):
+        sys.path.insert(0, str(ROOT / "member_gateway/src"))
+        try:
+            from xb_member_gateway.canonical import canonical_phone
+        finally:
+            sys.path.pop(0)
+        for supplied in ("91234567", "6591234567", "+44 7700 900123", "0912345", "1" * 15):
+            with self.subTest(supplied=supplied):
+                self.assertEqual(self.canonical_phone_from_adapter(supplied), canonical_phone(supplied))
 
     def test_export_is_inactive_credential_webhook_pin_and_static_data_free(self):
         raw = WORKFLOW.read_text(encoding="utf-8")
