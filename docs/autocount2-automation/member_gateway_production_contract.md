@@ -126,6 +126,26 @@ the service/application and listen. Bootstrap never migrates, initializes,
 repairs, discovers identity, generates credentials, clears the kill switch, or
 activates the gateway; failures expose bounded codes only.
 
+Startup composition admits exactly one dark-bring-up exemption. A gateway whose
+`autocount_adapter_ready` is false may compose and listen provided every other
+config, readiness, separation, and repository admission check passes.
+`GatewayConfig.readiness_reasons()` is unchanged, so adapter-not-ready still
+returns readiness false, still publishes `autocount_adapter_not_ready` in the
+readiness reasons, still fails the dispatch eligibility predicate, and still
+leaves AutoCount execution unavailable. The activation-false and
+kill-switch-true startup fence is unchanged and is evaluated before the
+exemption. Every unrelated readiness or config failure remains fail closed.
+
+The resolved bind address must be a private IP literal. Bootstrap rejects a
+malformed or non-literal value as `bind_address_invalid`, an IPv4 or IPv6
+unspecified or wildcard value as `bind_address_unspecified`, and a multicast,
+reserved, or public value as `bind_address_not_private`. IPv4-mapped IPv6 forms
+are unwrapped before classification, so a mapped wildcard is rejected as a
+wildcard. The supplied value is never echoed in the bounded code, no name
+resolution is performed, and there is no fallback to `0.0.0.0` or `::`. The
+application does not terminate TLS; deployment places the gateway on its fixed
+private backend address.
+
 The operator status and reconciliation GET endpoints are read-only safe
 projections. They expose readiness/control state, bounded lease/hold/proof and
 uncertainty summaries, and public reconciliation/result lineage. They never
@@ -294,6 +314,52 @@ run. CI is offline-only and does not contact Google, n8n, AutoCount,
 PostgreSQL, Docker, or a deployment target. Private process identity,
 host-binding, nonce, and raw evidence never appear in ordinary public job
 status or result responses.
+
+## Private HTTPS deployment topology
+
+The production member gateway is reached only over private HTTPS. The gateway
+application serves plain HTTP on a fixed private backend address and is never
+the TLS terminator and never host or publicly exposed.
+
+A dedicated pinned nginx reverse-proxy container is the sole TLS terminator and
+the sole holder of the leaf private key. It reaches the gateway only across a
+dedicated internal backend bridge. Two container networks are added: one
+internal backend bridge carrying only the gateway and the ingress, and one
+separate n8n/ingress bridge. n8n reaches the ingress by container DNS over
+private HTTPS and uses no host port. The accepted PostgreSQL deployment is
+unchanged apart from the gateway attaching to its network: it remains
+`internal=true`, publishes no host database port, and keeps its existing
+least-privilege application DSN.
+
+The outbound-only AC2 worker reaches one host HTTPS publication. That
+publication is bound exclusively to a Hyper-V Internal switch host endpoint.
+Before any host binding, elevated read-only metadata must positively prove that
+the target switch type is `Internal`, that the accepted AC2 VM is attached to
+it, and that the host-endpoint subnet is not LAN routable. Any ambiguity or
+mismatch halts the deployment. There is no wildcard, LAN, or public fallback,
+and no public tunnel, NAT, or public DNS is used for the member gateway. The
+unrelated public tunnel stack is not modified or used.
+
+Trust is supplied by a private CA and a leaf certificate whose subject
+alternative names cover both caller classes: the ingress container name used by
+n8n, and the private endpoint address used by the AC2 worker. No public DNS name
+is required, and certificate verification is never disabled on either caller.
+Keys and certificates live outside Git under a restrictive ACL.
+
+For n8n the selected mechanism is a read-only CA certificate mount plus the
+`NODE_EXTRA_CA_CERTS` environment binding. It was selected against the observed
+n8n runtime, which is Node on Alpine, where Node does not consult the operating
+system trust store by default. This is the mechanism this deployment uses; it is
+not asserted to be the only CA mechanism available to a Node 24 runtime. For the
+Windows AC2 worker, the private CA is imported into the machine trusted-root
+store as a separately approved mutation. The AC2 worker already refuses any base
+URL that is not HTTPS.
+
+Gateway and ingress containers are created with a no-restart policy and are
+started manually for dark bring-up, so no unattended activation authority is
+created. Dark bring-up keeps production activation false, the kill switch true,
+the adapter not ready, and the initialized source cursor and watermark
+unchanged.
 
 ## Unsupported production prerequisites
 

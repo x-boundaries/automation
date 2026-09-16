@@ -27,6 +27,80 @@ Any bounded bootstrap error is a stop condition. Do not let bootstrap apply a
 migration, initialize the cursor, repair state, generate a credential, clear
 the kill switch, or activate the gateway.
 
+Dark bring-up is the one composition exemption: `autocount_adapter_ready=false`
+no longer blocks startup composition, provided production activation is false,
+the kill switch is true, and every other admission check passes. Adapter-not-
+ready still reports readiness false, still lists `autocount_adapter_not_ready`,
+and still blocks dispatch, so a composed dark gateway is not an activated one.
+The bind address must be a private IP literal; a wildcard, unspecified,
+malformed, multicast, reserved, or public value is refused with a bounded code
+that does not echo the value, and there is no fallback bind.
+
+## Private HTTPS dark bring-up
+
+This sequence prepares the dark gateway. It does not activate the gateway, start
+a worker, or touch AutoCount or member data.
+
+1. Re-verify the repository head and a clean worktree. Confirm the accepted
+   PostgreSQL network is still `internal=true`, that no host database port is
+   published, and that the application DSN is unchanged.
+2. Capture the current n8n container baseline: image identity, mount set,
+   environment variable count, loopback-only user-interface publication, and
+   restart policy. Capture the unrelated tunnel container identity so it can be
+   proven untouched afterwards.
+3. Prove the Hyper-V topology with elevated read-only metadata: the target
+   switch type is `Internal`, the accepted AC2 VM is attached, and the
+   host-endpoint subnet is not LAN routable. Any ambiguity or mismatch is a stop
+   condition. Do not continue to any host binding on a partial proof, and never
+   substitute a wildcard, LAN, or public bind.
+4. Build the gateway image and pull the pinned nginx ingress image.
+5. Create the reviewed external deployment state, the five pairwise-distinct
+   bearer principals, and the separate reference-HMAC key. Keep every raw value
+   outside Git, chat, and logs.
+6. Create the two container networks: the internal backend bridge and the
+   n8n/ingress bridge.
+7. Generate the private CA and the leaf certificate. Issue the leaf only after
+   step 3, because its subject alternative names must cover the proven private
+   endpoint as well as the ingress container name.
+8. Start the gateway and then the ingress with a no-restart policy and manual
+   start. Do not publish a host port yet.
+9. Add the read-only CA mount and the `NODE_EXTRA_CA_CERTS` binding to n8n and
+   recreate only the n8n service. Preserve its image, volumes, environment
+   bindings, loopback-only publication, and restart posture. The unrelated
+   tunnel container and its configuration must remain untouched.
+10. Import the private CA into the Windows AC2 machine trusted-root store as a
+    separately approved mutation.
+11. Re-verify the step 3 proof immediately before binding, then publish exactly
+    one host HTTPS port bound only to the proven Hyper-V Internal endpoint.
+
+## Dark proof boundaries
+
+Prove, without activating anything: no database host port and the database
+network still internal; no LAN or public path to the gateway or the ingress; the
+gateway listening socket equal to its fixed private backend address and never a
+wildcard; private HTTPS only, with trusted certificates from both the n8n and
+AC2 caller classes and no verification disabled anywhere; least-privilege
+database connectivity working over the unchanged DSN; production activation
+false, kill switch true, adapter not ready with readiness false and dispatch
+ineligible; the five bearer principals and the reference-HMAC key separated by
+environment name, configured digest, and resolved value, with the
+reference-HMAC key unable to authenticate HTTP; cursor, watermark, control rows,
+and business state unchanged, with source, jobs, results, allocations, attempts,
+and write intents all zero; no n8n execution or activation; no worker start; and
+no AutoCount, AC2, or member activity.
+
+## Dark rollback boundaries
+
+Roll back in reverse order: remove the host publication, remove the AC2
+trusted-root entry, remove the n8n CA mount and environment binding and recreate
+only n8n back to the captured baseline, stop and remove the ingress and gateway
+containers, remove the two new networks, then destroy the leaf and CA keys and
+the external deployment state. Verify afterwards that the n8n baseline matches
+what was captured and that the tunnel container was never recreated. The
+accepted database, its DSN, the source cursor and watermark, the control rows,
+and the unrelated tunnel stack are never mutated by this bring-up, so none of
+them requires rollback.
+
 ## Pre-activation review
 
 An owner must independently verify the unsupported prerequisites in the
