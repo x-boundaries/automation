@@ -2812,6 +2812,11 @@ namespace EgR156 {
     }
 
     [StructLayout(LayoutKind.Sequential)]
+    public struct TOKEN_LINKED_TOKEN {
+        public IntPtr LinkedToken;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
     public struct TOKEN_GROUPS_LAYOUT {
         public uint GroupCount;
         public SID_AND_ATTRIBUTES Groups;
@@ -3268,21 +3273,49 @@ namespace EgR156 {
         }
 
         public static IntPtr GetLinkedToken(IntPtr token) {
-            // TOKEN_LINKED_TOKEN contains a HANDLE value, not a SID pointer into the
-            // returned allocation. Copying the value is safe; the caller owns the returned
-            // handle and closes it exactly once after all filtered-token reads complete.
-            byte[] bytes = ReadTokenInformationBytes(token, TOKEN_LINKED_TOKEN_CLASS);
-            if (bytes == null || bytes.Length != IntPtr.Size) {
+            if (token == IntPtr.Zero) {
                 return IntPtr.Zero;
             }
+            int nativeSize = Marshal.SizeOf(typeof(TOKEN_LINKED_TOKEN));
+            if (nativeSize != IntPtr.Size) {
+                return IntPtr.Zero;
+            }
+            IntPtr buffer = IntPtr.Zero;
+            IntPtr linkedToken = IntPtr.Zero;
+            bool transferred = false;
             try {
-                if (IntPtr.Size == 8) {
-                    return new IntPtr(BitConverter.ToInt64(bytes, 0));
+                buffer = Marshal.AllocHGlobal(nativeSize);
+                Marshal.WriteIntPtr(buffer, IntPtr.Zero);
+                int returnedLength = 0;
+                if (!GetTokenInformation(
+                        token,
+                        TOKEN_LINKED_TOKEN_CLASS,
+                        buffer,
+                        nativeSize,
+                        out returnedLength)) {
+                    return IntPtr.Zero;
                 }
-                return new IntPtr(BitConverter.ToInt32(bytes, 0));
+                linkedToken = Marshal.ReadIntPtr(buffer);
+                if (returnedLength != nativeSize ||
+                    linkedToken == IntPtr.Zero ||
+                    linkedToken == token) {
+                    return IntPtr.Zero;
+                }
+                transferred = true;
+                return linkedToken;
             }
             catch {
                 return IntPtr.Zero;
+            }
+            finally {
+                if (!transferred &&
+                    linkedToken != IntPtr.Zero &&
+                    linkedToken != token) {
+                    CloseHandle(linkedToken);
+                }
+                if (buffer != IntPtr.Zero) {
+                    Marshal.FreeHGlobal(buffer);
+                }
             }
         }
 
