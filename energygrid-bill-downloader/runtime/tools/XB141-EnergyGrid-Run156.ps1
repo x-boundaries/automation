@@ -2912,7 +2912,7 @@ namespace EgR156 {
         private const uint TOKEN_DUPLICATE = 0x0002;
         private const uint TOKEN_QUERY = 0x0008;
         private const uint MAXIMUM_ALLOWED = 0x02000000;
-        private const int SECURITY_IDENTIFICATION = 2;
+        private const int SECURITY_IDENTIFICATION = 1;
         private const int TOKEN_IMPERSONATION = 2;
         private const int TOKEN_USER_CLASS = 1;
         private const int TOKEN_GROUPS_CLASS = 2;

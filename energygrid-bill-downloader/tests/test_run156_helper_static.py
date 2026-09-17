@@ -1858,6 +1858,91 @@ $result | ConvertTo-Json -Compress
                 f"bounded diagnostics: {bounded}"
             )
 
+    def test_access_check_token_constants_are_exact_and_distinct(self):
+        identification = re.findall(
+            r"private const int SECURITY_IDENTIFICATION = ([0-9]+);",
+            self.native,
+        )
+        impersonation = re.findall(
+            r"private const int TOKEN_IMPERSONATION = ([0-9]+);",
+            self.native,
+        )
+
+        self.assertEqual(identification, ["1"])
+        self.assertEqual(impersonation, ["2"])
+        self.assertNotEqual(identification, impersonation)
+        self.assertNotIn(
+            "private const int SECURITY_IDENTIFICATION = 2;",
+            self.native,
+        )
+
+    def test_access_check_uses_the_exact_duplicated_token_shape(self):
+        check = self.native[
+            self.native.index("public static AccessCheckOutcome CheckMaximumAllowed") :
+        ]
+
+        self.assertEqual(self.source.count("DuplicateTokenEx("), 2)
+        self.assertEqual(
+            self.native.count("public static AccessCheckOutcome CheckMaximumAllowed("),
+            1,
+        )
+        self.assertRegex(
+            check,
+            r"DuplicateTokenEx\(\s*primaryToken,\s*TOKEN_QUERY,\s*"
+            r"IntPtr\.Zero,\s*SECURITY_IDENTIFICATION,\s*"
+            r"TOKEN_IMPERSONATION,\s*out impersonation\)",
+        )
+        self.assertEqual(check.count("DuplicateTokenEx("), 1)
+        self.assertRegex(
+            check,
+            r"AccessCheck\(\s*descriptor,\s*impersonation,\s*"
+            r"MAXIMUM_ALLOWED,\s*ref mapping,\s*privilegeSet,\s*"
+            r"ref privilegeSetLength,\s*out granted,\s*out status\)",
+        )
+        self.assertEqual(check.count("AccessCheck("), 1)
+        self.assertNotRegex(
+            check,
+            r"AccessCheck\(\s*descriptor,\s*primaryToken\b",
+        )
+
+    def test_access_check_failures_and_duplicated_handle_cleanup_remain_fail_closed(self):
+        check = self.native[
+            self.native.index("public static AccessCheckOutcome CheckMaximumAllowed") :
+        ]
+
+        self.assertIn("public int LastError;", self.native)
+        self.assertRegex(
+            check,
+            r"if \(!DuplicateTokenEx\([\s\S]*?\)\) \{\s*"
+            r"outcome\.LastError = Marshal\.GetLastWin32Error\(\);\s*"
+            r"return outcome;\s*\}",
+        )
+        self.assertRegex(
+            check,
+            r"if \(!AccessCheck\([\s\S]*?\)\) \{\s*"
+            r"outcome\.LastError = Marshal\.GetLastWin32Error\(\);\s*"
+            r"return outcome;\s*\}",
+        )
+        self.assertEqual(
+            check.count("outcome.LastError = Marshal.GetLastWin32Error();"),
+            2,
+        )
+        self.assertLess(
+            check.index("outcome.Evaluated = false;"),
+            check.index("DuplicateTokenEx("),
+        )
+        self.assertGreater(
+            check.index("outcome.Evaluated = true;"),
+            check.index("AccessCheck("),
+        )
+        self.assertRegex(
+            check,
+            r"finally \{[\s\S]*?"
+            r"if \(impersonation != IntPtr\.Zero\) \{\s*"
+            r"CloseHandle\(impersonation\);\s*\}",
+        )
+        self.assertEqual(check.count("CloseHandle(impersonation);"), 1)
+
     def test_pointer_readers_extract_sids_before_freeing_native_buffers(self):
         user = self.method_body(
             "public static byte[] ReadTokenUserSid",
