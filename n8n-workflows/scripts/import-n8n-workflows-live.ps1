@@ -1,5 +1,6 @@
 param(
   [string]$WorkflowDir = "n8n-workflows",
+  [string]$WorkflowFile,
   [string]$BindingsFile = ".n8n-local\n8n-credential-bindings.json",
   [string]$Container,
   [string]$ContainerName,
@@ -95,6 +96,13 @@ function Resolve-RepoRootFromScript {
 $HelperScriptDir = (Resolve-Path $PSScriptRoot).Path
 $RepoRoot = Resolve-RepoRootFromScript
 Set-Location $RepoRoot
+$SingleWorkflowMode = -not [string]::IsNullOrWhiteSpace($WorkflowFile)
+if ($SingleWorkflowMode -and $PSBoundParameters.ContainsKey("WorkflowDir")) {
+  throw "WorkflowFile and WorkflowDir are mutually exclusive. Omit WorkflowDir for the bounded single-workflow mode."
+}
+if ($SingleWorkflowMode -and $RestartContainerAfterImport) {
+  throw "RestartContainerAfterImport is forbidden in bounded single-workflow mode."
+}
 
 function Write-Section($Title) {
   Write-Host ""
@@ -637,6 +645,29 @@ function Get-RootWorkflowFiles($WorkflowDirPath) {
   return $workflowFiles
 }
 
+function Get-SingleCanonicalWorkflowFile($WorkflowDirPath) {
+  $expectedName = "member_forms_gateway_ingest.workflow.json"
+  $candidate = if ([IO.Path]::IsPathRooted($WorkflowFile)) { $WorkflowFile } else { Join-Path $RepoRoot $WorkflowFile }
+  $fullPath = [IO.Path]::GetFullPath($candidate)
+  $canonicalDir = [IO.Path]::GetFullPath($WorkflowDirPath).TrimEnd('\', '/')
+  $parent = [IO.Path]::GetDirectoryName($fullPath).TrimEnd('\', '/')
+  if ($parent -cne $canonicalDir -or [IO.Path]::GetFileName($fullPath) -cne $expectedName) {
+    throw "WorkflowFile must be the immediate canonical child n8n-workflows\member_forms_gateway_ingest.workflow.json."
+  }
+  if (-not (Test-Path -LiteralPath $fullPath -PathType Leaf)) { throw "Canonical single workflow file is missing." }
+  return @(Get-Item -LiteralPath $fullPath)
+}
+
+function Assert-SingleWorkflowRepositoryPosture($WorkflowFileInfo) {
+  $workflow = Get-Content -Raw -LiteralPath $WorkflowFileInfo.FullName | ConvertFrom-Json
+  if ([string]$workflow.id -cne "xbMemberGatewayTemplate02" -or [string]$workflow.name -cne "Member Gateway - Google Forms durable source adapter (inactive)") { throw "Single workflow identity mismatch." }
+  if ($workflow.active -ne $false -or $null -ne $workflow.staticData -or $workflow.PSObject.Properties.Name -contains "pinData") { throw "Single workflow must remain inactive and free of static/pinned data." }
+  $triggers = @($workflow.nodes | Where-Object { ([string]$_.type).EndsWith("Trigger") })
+  if ($triggers.Count -ne 1 -or [string]$triggers[0].type -cne "n8n-nodes-base.manualTrigger") { throw "Single workflow must remain manual-only." }
+  if ($workflow.settings.availableInMCP -ne $false -or $workflow.settings.saveManualExecutions -ne $false -or [string]$workflow.settings.saveDataErrorExecution -cne "none" -or [string]$workflow.settings.saveDataSuccessExecution -cne "none") { throw "Single workflow retention or MCP posture mismatch." }
+  if (Test-WorkflowHasScheduleTrigger $workflow) { throw "Single workflow cannot contain a schedule trigger." }
+}
+
 function Resolve-LiveWorkflowByName($WorkflowName, $WorkflowFileName, $LiveWorkflows) {
   $matches = @($LiveWorkflows | Where-Object { [string]$_.name -eq $WorkflowName })
   if ($matches.Count -eq 0) {
@@ -804,7 +835,31 @@ function Invoke-WorkflowPreflight($WorkflowFiles, [bool]$BindingsFileExists, $Li
       Remove-Item -Path $liveCompareFile -Force
     }
 
-    if ($hasWorkflowId) {
+    if ($SingleWorkflowMode) {
+      $targetMatches = @($LiveWorkflows | Where-Object { [string]$_.id -eq $workflowId -or [string]$_.name -eq $workflowName } | Group-Object { [string]$_.id } | ForEach-Object { $_.Group[0] })
+      if ($targetMatches.Count -gt 1) {
+        $blockedWorkflows += [PSCustomObject]@{ File = $workflowFile.Name; Reason = "Bounded single-workflow target is ambiguous by canonical id/name."; Kind = "SingleTargetAmbiguous" }
+        continue
+      }
+      if ($targetMatches.Count -eq 1) {
+        $target = $targetMatches[0]
+        if ($target.isArchived -eq $true) {
+          $blockedWorkflows += [PSCustomObject]@{ File = $workflowFile.Name; Reason = "Archived target blocks bounded single-workflow replacement."; Kind = "SingleTargetArchived" }
+          continue
+        }
+        if ($target.active -eq $true -or (Test-WorkflowHasScheduleTrigger $target)) {
+          $blockedWorkflows += [PSCustomObject]@{ File = $workflowFile.Name; Reason = "Active or scheduled target blocks bounded single-workflow replacement."; Kind = "SingleTargetActiveOrScheduled" }
+          continue
+        }
+        $workflowStatus = "ExistingById"
+        $liveWorkflowForCredentialCheck = $target
+        $liveWorkflowIdForImport = [string]$target.id
+        $targetLiveId = $liveWorkflowIdForImport
+        $plannedAction = "Update bounded inactive target"
+        Write-WorkflowJson $target $liveCompareFile
+        Write-Step "MATCH" "$($workflowFile.Name) matched one inactive manual target as $liveWorkflowIdForImport; its preimage was captured."
+      }
+    } elseif ($hasWorkflowId) {
       $idMatches = @($LiveWorkflows | Where-Object { [string]$_.id -eq $workflowId })
       if ($idMatches.Count -gt 1) {
         $blockedWorkflows += [PSCustomObject]@{
@@ -1006,6 +1061,19 @@ function Invoke-WorkflowPreflight($WorkflowFiles, [bool]$BindingsFileExists, $Li
   }
 }
 
+function Assert-BoundedImportedWorkflow($PlannedImport) {
+  $result = Invoke-CapturedCommand "docker" @("exec", $Container, "n8n", "export:workflow", "--id=$($PlannedImport.TargetId)", "--pretty")
+  if ($result.ExitCode -ne 0) { throw "Failed to read back bounded imported target." }
+  $text = ($result.StdOut -join "`n").Trim()
+  $items = @($text | ConvertFrom-Json)
+  if ($items.Count -ne 1) { throw "Bounded import readback did not return exactly one target." }
+  $workflow = $items[0]
+  if ([string]$workflow.id -cne [string]$PlannedImport.TargetId) { throw "Bounded import readback id mismatch." }
+  if ($workflow.active -eq $true -or $workflow.isArchived -eq $true -or (Test-WorkflowHasScheduleTrigger $workflow)) { throw "Bounded import readback is not inactive and unscheduled." }
+  $triggers = @($workflow.nodes | Where-Object { ([string]$_.type).EndsWith("Trigger") })
+  if ($triggers.Count -ne 1 -or [string]$triggers[0].type -cne "n8n-nodes-base.manualTrigger") { throw "Bounded import readback is not manual-only." }
+}
+
 function Write-BlockedSummary($PreflightResult) {
   Write-Section "Summary"
   Write-Host ("Ready       : {0}" -f $PreflightResult.PlannedImports.Count)
@@ -1063,6 +1131,7 @@ if ($DryRun) {
 Write-Section "n8n workflow import"
 Write-Host ("Repo root        : {0}" -f $RepoRoot)
 Write-Host ("Workflow dir     : {0}" -f (Get-DisplayPath $WorkflowDirPath))
+Write-Host ("Workflow file    : {0}" -f ($(if ($SingleWorkflowMode) { $WorkflowFile } else { "(broad mode)" })))
 Write-Host ("Prepared dir     : {0}" -f (Get-DisplayPath $PreparedDirPath))
 if ($DryRun) {
   Write-Host ("Dry-run plan dir : {0}" -f (Get-DisplayPath $RunPreparedDirPath))
@@ -1093,18 +1162,31 @@ if (-not $DryRun) {
   }
 }
 
-$workflowFiles = Get-RootWorkflowFiles $WorkflowDirPath
+$workflowFiles = @(if ($SingleWorkflowMode) { Get-SingleCanonicalWorkflowFile $WorkflowDirPath } else { Get-RootWorkflowFiles $WorkflowDirPath })
+if ($SingleWorkflowMode) {
+  if ($workflowFiles.Count -ne 1) { throw "Bounded single-workflow mode requires exactly one input file." }
+  Assert-SingleWorkflowRepositoryPosture $workflowFiles[0]
+}
 
 Write-Section "Workflow JSON Validation"
-$validationResult = Invoke-CapturedCommand "node" @((Join-Path $HelperScriptDir "validate-n8n-workflows.cjs"), $WorkflowDirPath)
-if ($validationResult.ExitCode -ne 0) {
-  throw "Workflow JSON validation failed before live import.`n$($validationResult.Output -join "`n")"
+if ($SingleWorkflowMode) {
+  Write-Step "VALID" "Canonical single workflow identity, inactive/manual posture, retention, MCP, pin, and static-data checks passed."
+} else {
+  $validationResult = Invoke-CapturedCommand "node" @((Join-Path $HelperScriptDir "validate-n8n-workflows.cjs"), $WorkflowDirPath)
+  if ($validationResult.ExitCode -ne 0) {
+    throw "Workflow JSON validation failed before live import.`n$($validationResult.Output -join "`n")"
+  }
+  Write-CommandOutput $validationResult.StdOut "VALID"
 }
-Write-CommandOutput $validationResult.StdOut "VALID"
 
 Invoke-LivePreflight
 $liveWorkflows = Get-LiveWorkflows
 Write-Step "LIVE" "Read $($liveWorkflows.Count) workflow(s) from live n8n."
+if ($SingleWorkflowMode) {
+  $selectedIdentity = Read-RepoWorkflowInfo $workflowFiles[0]
+  $liveWorkflows = @($liveWorkflows | Where-Object { [string]$_.id -eq $selectedIdentity.Id -or [string]$_.name -eq $selectedIdentity.Name })
+  Write-Step "LIVE" "Retained only canonical id/name candidates for bounded single-workflow evaluation."
+}
 
 Initialize-RunDirectory $RunPreparedDirPath
 
@@ -1229,6 +1311,7 @@ foreach ($plannedImport in $preflight.PlannedImports) {
 
   $importedCount += 1
   Write-Step "IMPORT" "$($plannedImport.File) imported into live n8n."
+  if ($SingleWorkflowMode) { Assert-BoundedImportedWorkflow $plannedImport }
   if ($plannedImport.UpdatesArchivedWorkflow) {
     Write-Step "ARCHIVE" "$($plannedImport.File) updated an archived live workflow. Unarchive it in n8n if you want it active/usable."
   }

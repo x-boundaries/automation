@@ -13,10 +13,17 @@ on:
       - "schemas/member_gateway_operator_status.v1.schema.json"
       - "schemas/member_gateway_operator_reconciliation.v1.schema.json"
       - "config/member_gateway.production.example.json"
+      - "config/member_forms_gateway_ingest.binding.template.json"
       - "scripts/ac2_member_gateway_worker.ps1"
       - "scripts/ac2_member_gateway_worker_lib.ps1"
       - "scripts/ac2_member_gateway_autocount_adapter.ps1"
+      - "scripts/install_ac2_member_gateway_worker.ps1"
+      - "scripts/launch_ac2_member_gateway_worker.ps1"
+      - "scripts/test_ac2_member_gateway_autocount_dependencies.ps1"
+      - "scripts/render_member_forms_gateway_binding.ps1"
+      - "n8n-workflows/scripts/import-n8n-workflows-live.ps1"
       - "tests/test_member_gateway_worker_static.py"
+      - "tests/test_member_gateway_deployment_tooling.py"
       - "tests/test_member_gateway_n8n.py"
       - "tests/test_member_gateway_ci.py"
       - "tests/test_member_gateway_privacy.py"
@@ -44,10 +51,17 @@ on:
       - "schemas/member_gateway_operator_status.v1.schema.json"
       - "schemas/member_gateway_operator_reconciliation.v1.schema.json"
       - "config/member_gateway.production.example.json"
+      - "config/member_forms_gateway_ingest.binding.template.json"
       - "scripts/ac2_member_gateway_worker.ps1"
       - "scripts/ac2_member_gateway_worker_lib.ps1"
       - "scripts/ac2_member_gateway_autocount_adapter.ps1"
+      - "scripts/install_ac2_member_gateway_worker.ps1"
+      - "scripts/launch_ac2_member_gateway_worker.ps1"
+      - "scripts/test_ac2_member_gateway_autocount_dependencies.ps1"
+      - "scripts/render_member_forms_gateway_binding.ps1"
+      - "n8n-workflows/scripts/import-n8n-workflows-live.ps1"
       - "tests/test_member_gateway_worker_static.py"
+      - "tests/test_member_gateway_deployment_tooling.py"
       - "tests/test_member_gateway_n8n.py"
       - "tests/test_member_gateway_ci.py"
       - "tests/test_member_gateway_privacy.py"
@@ -96,7 +110,7 @@ jobs:
       - name: Run offline repository/static/privacy checks
         shell: bash
         run: |
-          python -m unittest tests.test_member_gateway_n8n tests.test_member_gateway_ci tests.test_member_gateway_privacy tests.test_member_gateway_worker_static -v
+          python -m unittest tests.test_member_gateway_n8n tests.test_member_gateway_ci tests.test_member_gateway_privacy tests.test_member_gateway_worker_static tests.test_member_gateway_deployment_tooling -v
       - name: Check whitespace
         shell: bash
         run: git diff --check HEAD^ HEAD
@@ -123,6 +137,7 @@ jobs:
         shell: pwsh
         run: >-
           python -m unittest tests.test_member_gateway_worker_static
+          tests.test_member_gateway_deployment_tooling
           tests.test_member_gateway_adapter_ps
           tests.test_member_gateway_worker_cycle_ps -v
 

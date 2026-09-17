@@ -21,6 +21,7 @@ are unaffected. No live n8n, Docker, credential, Sheet, or AutoCount surface
 is touched.
 """
 
+import json
 import os
 import shutil
 import subprocess
@@ -38,7 +39,10 @@ const path = require('path');
 const fs = require('fs');
 
 if (path.basename(process.execPath).toLowerCase() === 'docker.exe') {
-  const args = process.argv.slice(1);
+  const rawArgs = process.argv.slice(1);
+  const args = rawArgs.length && path.isAbsolute(rawArgs[0])
+    ? [path.basename(rawArgs[0]), ...rawArgs.slice(1)]
+    : rawArgs;
   const log = process.env.DOCKER_STUB_LOG;
   if (log) {
     fs.appendFileSync(log, args.join(' ') + '\n');
@@ -62,6 +66,19 @@ if (path.basename(process.execPath).toLowerCase() === 'docker.exe') {
   }
 
   if (args[0] === 'exec' && args.includes('export:workflow')) {
+    const workflowsFile = log ? log + '.workflows.json' : null;
+    if (workflowsFile && fs.existsSync(workflowsFile)) {
+      process.stdout.write(fs.readFileSync(workflowsFile, 'utf8') + '\n');
+      process.exit(0);
+    }
+    if (process.env.DOCKER_STUB_WORKFLOWS_FILE) {
+      process.stdout.write(fs.readFileSync(process.env.DOCKER_STUB_WORKFLOWS_FILE, 'utf8') + '\n');
+      process.exit(0);
+    }
+    if (process.env.DOCKER_STUB_WORKFLOWS) {
+      process.stdout.write(process.env.DOCKER_STUB_WORKFLOWS + '\n');
+      process.exit(0);
+    }
     process.stderr.write('No workflows found with specified filters\n');
     process.exit(1);
   }
@@ -113,7 +130,7 @@ class ImportDryRunIsolationTest(unittest.TestCase):
                 shutil.copy(helper_file, scripts_dir / helper_file.name)
         return repo
 
-    def _run_import(self, extra_args):
+    def _run_import(self, extra_args, extra_env=None):
         env = os.environ.copy()
         env["PATH"] = str(self.stub_dir) + os.pathsep + env["PATH"]
         env["DOCKER_STUB_LOG"] = str(self.docker_log)
@@ -122,6 +139,8 @@ class ImportDryRunIsolationTest(unittest.TestCase):
         env["NODE_OPTIONS"] = f'--require "{self.preload_path.as_posix()}"'
         env.pop("N8N_WORKFLOW_HOOK_SCRIPT", None)
         env.pop("N8N_WORKFLOW_HOOK_AUTOLOAD", None)
+        if extra_env:
+            env.update(extra_env)
         command = [
             "powershell",
             "-NoProfile",
@@ -228,6 +247,70 @@ class ImportDryRunIsolationTest(unittest.TestCase):
             "import mode (non-dry-run) should still stage prepared files in the configured dir",
         )
         self._assert_no_mutating_docker_calls()
+
+    def test_single_workflow_mode_plans_exactly_one_canonical_input(self):
+        result = self._run_import([
+            "-WorkflowFile",
+            "n8n-workflows/member_forms_gateway_ingest.workflow.json",
+            "-DryRun",
+        ])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("Would import      : 1", result.stdout)
+        self.assertIn("member_forms_gateway_ingest.workflow.json", result.stdout)
+        for other in REAL_WORKFLOW_DIR.glob("*.workflow.json"):
+            if other.name != "member_forms_gateway_ingest.workflow.json":
+                self.assertNotIn(other.name, result.stdout)
+        self._assert_no_mutating_docker_calls()
+
+    def test_single_workflow_mode_rejects_noncanonical_file_and_broad_mode_mix(self):
+        wrong = self._run_import([
+            "-WorkflowFile", "n8n-workflows/member_create_uat_result_mapping.workflow.json", "-DryRun"
+        ])
+        self.assertEqual(wrong.returncode, 1)
+        self.assertIn("immediate canonical child", wrong.stdout + wrong.stderr)
+        mixed = self._run_import([
+            "-WorkflowFile", "n8n-workflows/member_forms_gateway_ingest.workflow.json",
+            "-WorkflowDir", "n8n-workflows", "-DryRun",
+        ])
+        self.assertEqual(mixed.returncode, 1)
+        self.assertIn("mutually exclusive", mixed.stdout + mixed.stderr)
+
+    def test_single_workflow_mode_blocks_active_archived_scheduled_and_ambiguous_targets(self):
+        canonical = json.loads((REAL_WORKFLOW_DIR / "member_forms_gateway_ingest.workflow.json").read_text(encoding="utf-8"))
+        minimal = {
+            "id": canonical["id"],
+            "name": canonical["name"],
+            "active": False,
+            "isArchived": False,
+            "nodes": [{"name": "Manual", "type": "n8n-nodes-base.manualTrigger", "parameters": {}}],
+            "connections": {},
+            "settings": canonical["settings"],
+            "staticData": None,
+        }
+        cases = {}
+        active = dict(minimal)
+        active["active"] = True
+        cases["active"] = [active]
+        archived = dict(minimal)
+        archived["isArchived"] = True
+        cases["archived"] = [archived]
+        scheduled = json.loads(json.dumps(minimal))
+        scheduled["nodes"].append({"name": "Forbidden schedule", "type": "n8n-nodes-base.scheduleTrigger", "parameters": {}})
+        cases["scheduled"] = [scheduled]
+        duplicate = json.loads(json.dumps(minimal))
+        duplicate["id"] = "anotherCanonicalNameMatch"
+        cases["ambiguous"] = [minimal, duplicate]
+
+        for label, workflows in cases.items():
+            with self.subTest(label=label):
+                live_fixture = Path(str(self.docker_log) + ".workflows.json")
+                live_fixture.write_text(json.dumps(workflows), encoding="utf-8")
+                result = self._run_import(
+                    ["-WorkflowFile", "n8n-workflows/member_forms_gateway_ingest.workflow.json", "-DryRun"],
+                )
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn("BLOCK", result.stdout + result.stderr)
+                self._assert_no_mutating_docker_calls()
 
 
 if __name__ == "__main__":

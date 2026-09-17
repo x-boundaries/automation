@@ -18,6 +18,52 @@ without real form/question IDs, cutover watermark, credential digests, database,
 bind, TLS, host, or gateway bindings. Those values make readiness fail closed
 until an owner supplies reviewed deployment configuration outside Git.
 
+## Worker and n8n deployment tooling boundary
+
+The repository now carries an offline-reviewed Windows package boundary. Run
+`scripts/install_ac2_member_gateway_worker.ps1 -Operation ValidateOnly` to
+inspect the deterministic five-file package manifest without changing the
+machine. A later separately approved live install uses the fixed executable
+root `C:\Program Files\X-Boundaries\MemberGatewayWorker\` and runtime root
+`C:\ProgramData\X-Boundaries\MemberGatewayWorker\`. It registers only the
+disabled, triggerless `\X-Boundaries\AC2 Member Gateway Worker` Scheduled Task,
+whose sole initial action invokes `DisabledProof`. The task has no retry,
+start-when-available, production enable switch, or service equivalent.
+
+`DisabledProof` reads neither runtime config nor either user-scoped secure-string
+artifact. Future production mode imports the two `Export-Clixml` SecureString
+artifacts only under the dedicated task identity and writes their resolved
+values only into the child process environment. Do not place those values in
+arguments, machine/user environment, config, logs, or public evidence.
+
+The dependency probe loads only the five frozen AutoCount assemblies through
+reflection and checks the reviewed type/method surface under 64-bit Windows
+PowerShell 5. It does not read a password, authenticate, construct a session,
+call an AutoCount server/database API, or inspect member data.
+
+For the n8n slice, render the private binding payload only to ignored
+`.tmp/member-gateway-g3/member_forms_gateway_ingest.binding.json` with
+`scripts/render_member_forms_gateway_binding.ps1`. The renderer binds the
+canonical commit/tree/parent/workflow blob, four HTTPS endpoints, the closed
+question map and its accepted hash, cursor/watermark references, exact
+credential types and node roles, and inactive/manual posture. It rejects
+tracked output, permissive ACLs, secret-bearing content, route or Form-ID drift,
+and canonical mismatch. Do not commit a populated payload.
+
+The bounded live helper syntax for a later separately authorised import is:
+
+```powershell
+.\n8n-workflows\scripts\import-n8n-workflows-live.ps1 `
+  -WorkflowFile n8n-workflows\member_forms_gateway_ingest.workflow.json `
+  -DryRun
+```
+
+That mode accepts only this immediate canonical child, blocks archived,
+ambiguous, active, or scheduled targets, captures the exact target preimage,
+preserves its ID on update, and reads back only the exact inactive/manual
+target. Removing `-DryRun` is a live n8n mutation and still requires fresh
+explicit owner approval; this repository gate does not grant it.
+
 Before any listener starts, run only `python -m xb_member_gateway --config
 <reviewed-external-config>`. Bootstrap must read and validate config, resolve
 the named runtime boundaries, validate all five principal separations, build
