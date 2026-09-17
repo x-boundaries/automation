@@ -4232,10 +4232,9 @@ function Read-R156ManifestState {
             return $null
         }
         $source = $CanonicalSources[$name]
-        if ((Get-R156Sha256ForBytes -Bytes $installedBytes) -cne $source.Sha256) {
-            return $null
-        }
-        if ([int64]$installedBytes.Length -ne [int64]$source.ByteLength) {
+        $installedEnding = Test-R156WorkingByteContract -Bytes $installedBytes
+        if ($null -eq $installedEnding -or
+            -not (Test-R156ByteArraysEqual -Left $installedEnding.NormalizedBytes -Right $source.CommittedBytes)) {
             return $null
         }
     }

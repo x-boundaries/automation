@@ -1381,6 +1381,7 @@ foreach ($item in $values.GetEnumerator()) {
             ("function Test-R156CommitText", "function Convert-R156BytesToHex"),
             ("function Convert-R156BytesToHex", "function Get-R156Sha256ForBytes"),
             ("function Get-R156Sha256ForBytes", "function Get-R156Properties"),
+            ("function Convert-R156Utf8Bytes", "function Test-R156LockedSourcePath"),
             ("function Get-R156FullPath", "function Test-R156SamePath"),
             ("function Test-R156SamePath", "function Test-R156PathWithin"),
             ("function Test-R156PathWithin", "function Test-R156NormalDirectory"),
@@ -1690,6 +1691,7 @@ function Invoke-SyntheticR156Boundary {
         $path = Join-Path $script:R156SyntheticCandidate $name
         $bytes = [System.IO.File]::ReadAllBytes($path)
         $canonicalSources[$name] = [pscustomobject]@{
+            CommittedBytes = [byte[]]$bytes
             Sha256 = (Get-R156Sha256ForBytes -Bytes $bytes)
             ByteLength = [int64]$bytes.Length
         }
@@ -1772,6 +1774,150 @@ $result | ConvertTo-Json -Compress
                 "R156_SYNTH_MANIFEST_2": manifests[1],
                 "R156_SYNTH_MANIFEST_3": manifests[2],
                 "R156_SYNTH_POST_ADMISSION": post_admission,
+            }
+            lines = self.run_isolated_powershell(script, environment=environment)
+        self.assertEqual(len(lines), 1, lines)
+        return json.loads(lines[0])
+
+    def run_manifest_equivalence_case(
+        self,
+        *,
+        launcher_installed=b"# launcher\r\nWrite-Output 'launcher'\r\n",
+        library_installed=b"# library\r\nfunction Invoke-Library { }\r\n",
+        launcher_canonical=b"# launcher\nWrite-Output 'launcher'\n",
+        library_canonical=b"# library\nfunction Invoke-Library { }\n",
+        manifest_schema="eg_launcher_installation_manifest/v1",
+        manifest_admission=ACCEPTED_STALE_ADMISSION,
+        expected_admission=ACCEPTED_STALE_ADMISSION,
+        manifest_shape=True,
+        package_pass=True,
+        non_normal_name="",
+        parse_fail_name="",
+    ):
+        """Exercise the production manifest/canonical boundary without live surfaces."""
+        functions = self.extracted_functions(
+            (
+                "Convert-R156Utf8Bytes",
+                "Test-R156ByteArraysEqual",
+                "Convert-R156WorkingBytesToLf",
+                "Test-R156WorkingByteContract",
+                "Test-R156ClassAClassification",
+                "Get-R156ClassAPaths",
+                "Read-R156ManifestState",
+            )
+        )
+        with tempfile.TemporaryDirectory(prefix="r156_manifest_fixture_") as directory:
+            root = Path(directory)
+            (root / "launcher.ps1").write_bytes(launcher_installed)
+            (root / "launcher_lib.ps1").write_bytes(library_installed)
+            (root / "installation_manifest.json").write_bytes(b"{}\n")
+            script = (
+                functions
+                + r'''
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+$script:R156ManifestFileName = 'installation_manifest.json'
+$script:R156PackageNames = @('launcher.ps1', 'launcher_lib.ps1', 'installation_manifest.json')
+$script:R156ManifestNames = @('launcher.ps1', 'launcher_lib.ps1')
+$script:R156ManifestSchema = 'eg_launcher_installation_manifest/v1'
+$script:R156PackageCalls = 0
+$script:R156RawDigestMatch = $false
+
+function Test-R156NormalFile {
+    param([Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Path)
+    if ([string]::IsNullOrEmpty([string]$env:R156_NON_NORMAL_NAME)) { return $true }
+    return ([System.IO.Path]::GetFileName($Path) -cne [string]$env:R156_NON_NORMAL_NAME)
+}
+
+function Get-EgLauncherRootClassification {
+    param([Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$LauncherRootPath)
+    return [pscustomobject]@{
+        Pass = $true
+        ClassA = @('launcher.ps1', 'launcher_lib.ps1', 'installation_manifest.json')
+        ClassB = @()
+        ClassC = @()
+        MissingMembers = @()
+    }
+}
+
+function Read-R156StrictJsonObject {
+    param([Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Path)
+    return [pscustomobject]@{
+        schema_version = [string]$env:R156_MANIFEST_SCHEMA
+        admission_commit = [string]$env:R156_MANIFEST_ADMISSION
+    }
+}
+
+function Test-EgInstallationManifestShape {
+    param([Parameter(Mandatory)]$ManifestObject)
+    return [pscustomobject]@{ Pass = [bool]::Parse([string]$env:R156_MANIFEST_SHAPE) }
+}
+
+function Get-SyntheticSha256 {
+    param([Parameter(Mandatory)][byte[]]$Bytes)
+    $algorithm = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        return ([BitConverter]::ToString($algorithm.ComputeHash($Bytes))).Replace('-', '').ToLowerInvariant()
+    }
+    finally {
+        $algorithm.Dispose()
+    }
+}
+
+function Compare-EgInstalledPackageToManifest {
+    param([Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$LauncherRootPath)
+    $script:R156PackageCalls++
+    $launcherRaw = [System.IO.File]::ReadAllBytes((Join-Path $LauncherRootPath 'launcher.ps1'))
+    $libraryRaw = [System.IO.File]::ReadAllBytes((Join-Path $LauncherRootPath 'launcher_lib.ps1'))
+    $script:R156RawDigestMatch = (
+        (Get-SyntheticSha256 -Bytes $launcherRaw) -ceq [string]$env:R156_LAUNCHER_RAW_SHA256 -and
+        (Get-SyntheticSha256 -Bytes $libraryRaw) -ceq [string]$env:R156_LIBRARY_RAW_SHA256
+    )
+    return [pscustomobject]@{
+        Pass = ([bool]::Parse([string]$env:R156_PACKAGE_PASS) -and $script:R156RawDigestMatch)
+    }
+}
+
+function Test-R156PowerShellParse {
+    param(
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Path,
+        [Parameter(Mandatory)][byte[]]$Bytes
+    )
+    if ([string]::IsNullOrEmpty([string]$env:R156_PARSE_FAIL_NAME)) { return $true }
+    return ([System.IO.Path]::GetFileName($Path) -cne [string]$env:R156_PARSE_FAIL_NAME)
+}
+
+$launcherCanonical = [Convert]::FromBase64String([string]$env:R156_LAUNCHER_CANONICAL)
+$libraryCanonical = [Convert]::FromBase64String([string]$env:R156_LIBRARY_CANONICAL)
+$canonicalSources = [ordered]@{
+    'launcher.ps1' = [pscustomobject]@{ CommittedBytes = [byte[]]$launcherCanonical }
+    'launcher_lib.ps1' = [pscustomobject]@{ CommittedBytes = [byte[]]$libraryCanonical }
+}
+$state = Read-R156ManifestState `
+    -LauncherRoot ([string]$env:R156_FIXTURE_ROOT) `
+    -ExpectedAdmission ([string]$env:R156_EXPECTED_ADMISSION) `
+    -CanonicalSources $canonicalSources
+[pscustomobject]@{
+    accepted = ($null -ne $state)
+    package_calls = [int]$script:R156PackageCalls
+    raw_digest_match = [bool]$script:R156RawDigestMatch
+} | ConvertTo-Json -Compress
+'''
+            )
+            encode = lambda value: __import__("base64").b64encode(value).decode("ascii")
+            environment = {
+                "R156_FIXTURE_ROOT": str(root),
+                "R156_LAUNCHER_CANONICAL": encode(launcher_canonical),
+                "R156_LIBRARY_CANONICAL": encode(library_canonical),
+                "R156_LAUNCHER_RAW_SHA256": hashlib.sha256(launcher_installed).hexdigest(),
+                "R156_LIBRARY_RAW_SHA256": hashlib.sha256(library_installed).hexdigest(),
+                "R156_MANIFEST_SCHEMA": manifest_schema,
+                "R156_MANIFEST_ADMISSION": manifest_admission,
+                "R156_EXPECTED_ADMISSION": expected_admission,
+                "R156_MANIFEST_SHAPE": str(manifest_shape),
+                "R156_PACKAGE_PASS": str(package_pass),
+                "R156_NON_NORMAL_NAME": non_normal_name,
+                "R156_PARSE_FAIL_NAME": parse_fail_name,
             }
             lines = self.run_isolated_powershell(script, environment=environment)
         self.assertEqual(len(lines), 1, lines)
@@ -3258,6 +3404,74 @@ $results | ConvertTo-Json -Compress -Depth 4
             result["expected_parent_state"],
             result["expected_installed_state"],
         )
+
+    def test_live248_crlf_installed_members_are_canonically_equivalent(self):
+        result = self.run_manifest_equivalence_case()
+        self.assertTrue(result["accepted"], result)
+        self.assertEqual(result["package_calls"], 1, result)
+        self.assertTrue(result["raw_digest_match"], result)
+
+    def test_installed_content_drift_surviving_normalization_is_rejected(self):
+        cases = (
+            {"launcher_installed": b"# launcher\r\nWrite-Output 'drift'\r\n"},
+            {"library_installed": b"# library\r\nfunction Invoke-Drift { }\r\n"},
+        )
+        for case in cases:
+            with self.subTest(member=next(iter(case))):
+                result = self.run_manifest_equivalence_case(**case)
+                self.assertFalse(result["accepted"], result)
+                self.assertEqual(result["package_calls"], 1, result)
+                self.assertTrue(result["raw_digest_match"], result)
+
+    def test_unsupported_installed_line_endings_fail_closed(self):
+        cases = (
+            {"launcher_installed": b"# launcher\r\nWrite-Output 'launcher'\n"},
+            {"library_installed": b"# library\rfunction Invoke-Library { }\n"},
+        )
+        for case in cases:
+            with self.subTest(member=next(iter(case))):
+                result = self.run_manifest_equivalence_case(**case)
+                self.assertFalse(result["accepted"], result)
+                self.assertEqual(result["package_calls"], 1, result)
+                self.assertTrue(result["raw_digest_match"], result)
+
+    def test_manifest_equivalence_preserves_all_precomparison_gates(self):
+        cases = (
+            {"manifest_schema": "eg_launcher_installation_manifest/v2"},
+            {"manifest_admission": "f" * 40},
+            {"manifest_shape": False},
+            {"package_pass": False},
+            {"non_normal_name": "launcher.ps1"},
+            {"parse_fail_name": "launcher.ps1"},
+            {"parse_fail_name": "launcher_lib.ps1"},
+        )
+        for case in cases:
+            with self.subTest(case=case):
+                result = self.run_manifest_equivalence_case(**case)
+                self.assertFalse(result["accepted"], result)
+
+        manifest_reader = self.source_function(
+            "function Read-R156ManifestState",
+            "function Get-R156DirectChildren",
+        )
+        strict_reader = self.source_function(
+            "function Read-R156StrictJsonObject",
+            "function Read-R156TrustedSource",
+        )
+        read_handle = self.source_function(
+            "function Open-R156ReadOnlyHandle",
+            "function Read-R156HandleBytes",
+        )
+        self.assertLess(
+            manifest_reader.index("Compare-EgInstalledPackageToManifest"),
+            manifest_reader.index("Test-R156WorkingByteContract -Bytes $installedBytes"),
+        )
+        self.assertIn("Test-R156NormalFile -Path $installedPath", manifest_reader)
+        self.assertIn("Test-R156PowerShellParse -Path $installedPath -Bytes $installedBytes", manifest_reader)
+        self.assertIn("Open-R156ReadOnlyHandle -Path $Path", strict_reader)
+        self.assertIn("Test-R156StrictJsonBytes -Bytes $bytes", strict_reader)
+        self.assertIn("Test-R156NormalFile -Path $Path", read_handle)
+        self.assertIn("Test-R156NoReparseAncestors -Path $Path", read_handle)
 
     def test_head_blobs_are_canonical_for_both_owned_files(self):
         for relative_path in OWNED_RELATIVE_PATHS:
