@@ -9,6 +9,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -39,10 +40,12 @@ class MemberGatewayBoundedImportSecurityTests(unittest.TestCase):
             raise unittest.SkipTest("PowerShell is required for bounded importer tests")
 
     def setUp(self) -> None:
-        self.case_root = Path(tempfile.mkdtemp(prefix="bounded-import-security-", dir=ROOT))
+        self.case_root = Path(tempfile.mkdtemp(prefix="bounded-import-security-"))
         self.addCleanup(lambda: shutil.rmtree(self.case_root, ignore_errors=True))
         self.operations_root = ".n8n-local/member-gateway-bounded-import/operations"
-        self.manifest_path = self.case_root / "binding.json"
+        self.private_manifest_path = ROOT / ".n8n-local/member-gateway-bounded-import" / f"test-binding-{uuid4().hex}.json"
+        self.manifest_path = self.private_manifest_path
+        self.addCleanup(lambda path=self.private_manifest_path: path.unlink(missing_ok=True))
         self.fixture_path = self.case_root / "fixture.json"
         self.manifest = self._make_manifest()
         _write_json(self.manifest_path, self.manifest)
@@ -119,7 +122,7 @@ class MemberGatewayBoundedImportSecurityTests(unittest.TestCase):
         self.addCleanup(lambda: shutil.rmtree(self._operation_path(operation_id), ignore_errors=True))
         return operation_id
 
-    def _run(self, mode: str, operation_id: str, *, expect_success: bool = True) -> subprocess.CompletedProcess[str]:
+    def _build_command(self, mode: str, operation_id: str, *, extra_args: tuple[str, ...] = ()) -> tuple[list[str], dict[str, str]]:
         command = [
             self.pwsh,
             "-NoLogo",
@@ -143,6 +146,7 @@ class MemberGatewayBoundedImportSecurityTests(unittest.TestCase):
         ]
         if mode == "Apply":
             command.append("-ConfirmBoundedApply")
+        command.extend(extra_args)
         environment = os.environ.copy()
         for name in (
             "N8N_WORKFLOW_HOOK_SCRIPT",
@@ -151,6 +155,20 @@ class MemberGatewayBoundedImportSecurityTests(unittest.TestCase):
             "N8N_WORKFLOW_VALIDATION_RULES_AUTOLOAD",
         ):
             environment.pop(name, None)
+        return command, environment
+
+    def _run(
+        self,
+        mode: str,
+        operation_id: str,
+        *,
+        expect_success: bool = True,
+        extra_args: tuple[str, ...] = (),
+        extra_env: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        command, environment = self._build_command(mode, operation_id, extra_args=extra_args)
+        if extra_env:
+            environment.update(extra_env)
         completed = subprocess.run(
             command,
             cwd=ROOT,
@@ -173,6 +191,20 @@ class MemberGatewayBoundedImportSecurityTests(unittest.TestCase):
                 msg=f"bounded importer unexpectedly succeeded\nstdout={completed.stdout}",
             )
         return completed
+
+    def _start(self, mode: str, operation_id: str, *, extra_args: tuple[str, ...] = (), extra_env: dict[str, str] | None = None) -> subprocess.Popen[str]:
+        command, environment = self._build_command(mode, operation_id, extra_args=extra_args)
+        if extra_env:
+            environment.update(extra_env)
+        return subprocess.Popen(
+            command,
+            cwd=ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            env=environment,
+        )
 
     def _operation_path(self, operation_id: str) -> Path:
         return ROOT / self.operations_root / operation_id
@@ -217,6 +249,7 @@ class MemberGatewayBoundedImportSecurityTests(unittest.TestCase):
                 "plan.json",
                 "prepared.workflow.json",
                 "preimage.workflow.json",
+                "dispatch-ownership.json",
                 "dispatch-receipt.json",
                 "completion-receipt.json",
             },
@@ -250,7 +283,13 @@ class MemberGatewayBoundedImportSecurityTests(unittest.TestCase):
         result = self._apply_successfully(operation_id)
         self.assertEqual(result["status"], "completed_existing_dispatch")
         self.assertEqual(result["mutation_attempted"], 0)
-        self.assertEqual(dispatch_before, (operation_path / "dispatch-receipt.json").read_bytes())
+        reconciled = _read_json(operation_path / "dispatch-receipt.json")
+        self.assertNotEqual(dispatch_before, (operation_path / "dispatch-receipt.json").read_bytes())
+        self.assertEqual(reconciled["dispatch_state"], "dispatched")
+        self.assertEqual(reconciled["outcome"], "completed")
+        retry = self._apply_successfully(operation_id)
+        self.assertEqual(retry["status"], "no_op_success")
+        self.assertEqual(retry["mutation_attempted"], 0)
 
     def test_ambiguous_dispatch_does_not_replay_when_target_is_still_preimage(self) -> None:
         operation_id, fixture = self._capture("ambiguous-no-replay", dispatch_mode="ambiguous")
@@ -281,6 +320,9 @@ class MemberGatewayBoundedImportSecurityTests(unittest.TestCase):
         self.assertEqual(reconciled["dispatch_state"], "dispatched")
         self.assertEqual(reconciled["outcome"], "completed")
         self.assertFalse(reconciled["replay_allowed"])
+        retry = self._apply_successfully(operation_id)
+        self.assertEqual(retry["status"], "no_op_success")
+        self.assertEqual(retry["mutation_attempted"], 0)
 
     def test_pre_dispatch_failure_can_retry_only_after_fresh_evidence(self) -> None:
         operation_id, fixture = self._capture("pre-dispatch-retry", dispatch_mode="pre_dispatch_failure")
@@ -294,6 +336,27 @@ class MemberGatewayBoundedImportSecurityTests(unittest.TestCase):
         _write_json(self.fixture_path, fixture)
         result = self._apply_successfully(operation_id)
         self.assertEqual(result["mutation_attempted"], 1)
+
+    def test_concurrent_admission_has_one_operation_scoped_dispatch_owner(self) -> None:
+        operation_id, fixture = self._capture("concurrent-admission", dispatch_mode="concurrent_success")
+        barrier = self.case_root / "admission-barrier"
+        dispatch_markers = self.case_root / "dispatch-markers"
+        fixture["admission_barrier_directory"] = str(barrier)
+        fixture["dispatch_marker_directory"] = str(dispatch_markers)
+        _write_json(self.fixture_path, fixture)
+
+        processes = [self._start("Apply", operation_id), self._start("Apply", operation_id)]
+        results = [process.communicate(timeout=90) for process in processes]
+        self.assertEqual(len(list(barrier.glob("*.marker"))), 2)
+        dispatch_count = len(list(dispatch_markers.glob("*.marker")))
+        self.assertLessEqual(dispatch_count, 1)
+        self.assertEqual(dispatch_count, 1)
+        payloads = []
+        for stdout, stderr in results:
+            if stdout.strip():
+                payloads.append(json.loads(stdout.strip().splitlines()[-1]))
+        self.assertEqual(sum(payload.get("status") == "applied_and_verified" for payload in payloads), 1)
+        self.assertEqual(sum(process.returncode == 0 for process in processes), 1)
 
     def test_cursor_identity_watermark_and_preimage_mismatch_block_before_dispatch(self) -> None:
         cases = (
@@ -343,6 +406,54 @@ class MemberGatewayBoundedImportSecurityTests(unittest.TestCase):
         completed = self._run("CapturePlan", operation_id, expect_success=False)
         self.assertIn("binding_credential_type_invalid", completed.stderr)
 
+        operation_id = self._operation_id("foreign-checkpoint-origin")
+        self.manifest = self._make_manifest()
+        self.manifest["endpoints"]["page_checkpoint"] = "https://foreign.example.com/v1/source/cursor-security/page"
+        _write_json(self.manifest_path, self.manifest)
+        self._make_fixture()
+        completed = self._run("CapturePlan", operation_id, expect_success=False)
+        self.assertIn("binding_gateway_origin_invalid", completed.stderr)
+
+        operation_id = self._operation_id("foreign-forms-origin")
+        self.manifest = self._make_manifest()
+        self.manifest["endpoints"]["forms_responses"] = "https://foreign.example.com/v1/forms/form-security-001/responses"
+        _write_json(self.manifest_path, self.manifest)
+        self._make_fixture()
+        completed = self._run("CapturePlan", operation_id, expect_success=False)
+        self.assertIn("binding_forms_origin_invalid", completed.stderr)
+
+    def _add_resolved_credential_ids(self, workflow: dict[str, Any]) -> dict[str, Any]:
+        resolved = copy.deepcopy(workflow)
+        for role in self.manifest["credential_roles"].values():
+            for node_name in role["node_names"]:
+                node = next(node for node in resolved["nodes"] if node["name"] == node_name)
+                credential_type = role["credential_type"]
+                credential = node["credentials"][credential_type]
+                node["credentials"][credential_type] = {
+                    "id": f"resolved-{node_name[:12].lower().replace(' ', '-')}",
+                    "name": credential["name"],
+                }
+        return resolved
+
+    def test_resolved_credential_readback_is_canonicalised_without_dropping_binding(self) -> None:
+        operation_id, fixture = self._capture("resolved-credentials")
+        fixture["after_workflow"] = self._add_resolved_credential_ids(fixture["after_workflow"])
+        _write_json(self.fixture_path, fixture)
+        result = self._apply_successfully(operation_id)
+        self.assertEqual(result["status"], "applied_and_verified")
+
+    def test_mismatched_resolved_credential_is_rejected(self) -> None:
+        operation_id, fixture = self._capture("mismatched-resolved-credential")
+        fixture["after_workflow"] = self._add_resolved_credential_ids(fixture["after_workflow"])
+        forms_node = next(
+            node for node in fixture["after_workflow"]["nodes"]
+            if node["name"] == "Google Forms single page (configured outside repo)"
+        )
+        forms_node["credentials"]["googleOAuth2Api"]["name"] = "wrong-credential"
+        _write_json(self.fixture_path, fixture)
+        completed = self._run("Apply", operation_id, expect_success=False)
+        self.assertIn("credential_name_mismatch", completed.stderr)
+
     def test_conflicting_workflow_identity_is_not_treated_as_absent(self) -> None:
         operation_id = self._operation_id("identity-conflict")
         fixture = self._make_fixture()
@@ -376,6 +487,51 @@ class MemberGatewayBoundedImportSecurityTests(unittest.TestCase):
             self.assertIn("repository_workflow_blob_mismatch", completed.stderr)
         finally:
             CANONICAL_WORKFLOW.write_bytes(original)
+
+    def test_manifest_custody_is_established_before_semantic_parsing(self) -> None:
+        outside_manifest = self.case_root / "outside-binding.json"
+        outside_manifest.write_text("{not-json", encoding="utf-8")
+        self.manifest_path = outside_manifest
+        operation_id = self._operation_id("manifest-out-of-custody")
+        self._make_fixture()
+        completed = self._run("CapturePlan", operation_id, expect_success=False)
+        self.assertIn("binding_manifest_path_not_private", completed.stderr)
+        self.assertNotIn("binding_shape_invalid", completed.stderr)
+
+        self.manifest_path = self.private_manifest_path
+        self.private_manifest_path.write_text("{not-json", encoding="utf-8")
+        fixture = self._make_fixture()
+        fixture["custody_mode"] = "manifest_acl_failure"
+        _write_json(self.fixture_path, fixture)
+        operation_id = self._operation_id("manifest-acl-before-parse")
+        completed = self._run("CapturePlan", operation_id, expect_success=False)
+        self.assertIn("private_acl_verification_failed", completed.stderr)
+        self.assertNotIn("json_invalid", completed.stderr)
+
+    def test_manifest_reparse_path_is_rejected_before_semantic_parsing(self) -> None:
+        outside_manifest = self.case_root / "reparse-target.json"
+        outside_manifest.write_text("{not-json", encoding="utf-8")
+        link = ROOT / ".n8n-local/member-gateway-bounded-import" / f"test-manifest-link-{uuid4().hex}.json"
+        try:
+            try:
+                os.symlink(outside_manifest, link)
+            except (OSError, NotImplementedError):
+                junction = subprocess.run(
+                    ["cmd.exe", "/c", "mklink", str(link), str(outside_manifest)],
+                    capture_output=True,
+                    text=True,
+                )
+                if junction.returncode != 0:
+                    self.skipTest(f"manifest reparse point unavailable: {junction.stderr}")
+            self.addCleanup(lambda path=link: path.unlink(missing_ok=True))
+            self.manifest_path = link
+            operation_id = self._operation_id("manifest-reparse-before-parse")
+            self._make_fixture()
+            completed = self._run("CapturePlan", operation_id, expect_success=False)
+            self.assertIn("unsafe_link", completed.stderr)
+            self.assertNotIn("json_invalid", completed.stderr)
+        finally:
+            link.unlink(missing_ok=True)
 
     def test_prepared_transport_bindings_and_process_contract_are_explicit(self) -> None:
         operation_id, _ = self._capture("transport-bindings")
@@ -430,6 +586,93 @@ class MemberGatewayBoundedImportSecurityTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
         self.assertIn("LIST=workflow-security-001|Member Gateway - Google Forms durable source adapter (inactive)", completed.stdout)
         self.assertIn("IMPORT=import-ok:import:workflow --input=C:\\prepared.workflow.json --projectId=project-security-001 --activeState=false", completed.stdout)
+
+    def test_container_import_consumer_reads_exact_prepared_bytes_and_cleans_up(self) -> None:
+        operation_id, fixture = self._capture("container-visible-import", dispatch_mode="container_visible_import")
+        fake_docker_py = self.case_root / "fake-docker.py"
+        fake_docker_cmd = self.case_root / "docker.cmd"
+        container_root = self.case_root / "container-root"
+        consumer_marker = self.case_root / "consumer.marker"
+        cleanup_marker = self.case_root / "cleanup.marker"
+        fake_docker_py.write_text(
+            '''import hashlib
+import os
+import shutil
+import sys
+from pathlib import Path
+
+
+args = sys.argv[1:]
+root = Path(os.environ["FAKE_CONTAINER_ROOT"])
+
+
+def resolve_container_path(path: str) -> Path:
+    return root.joinpath(path.lstrip("/").replace("/", os.sep))
+
+
+if args and args[0] == "cp":
+    destination = args[2]
+    separator = destination.find(":")
+    if separator < 1:
+        raise SystemExit(11)
+    target = resolve_container_path(destination[separator + 1 :])
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(args[1], target)
+    raise SystemExit(0)
+
+if args and args[0] == "exec":
+    offset = 1
+    if args[offset] == "-i":
+        offset += 1
+    if args[offset] != "fake-container":
+        raise SystemExit(12)
+    command = args[offset + 1]
+    if command == "n8n":
+        input_arguments = [argument for argument in args if argument.startswith("--input=")]
+        if len(input_arguments) != 1:
+            raise SystemExit(13)
+        container_file = resolve_container_path(input_arguments[0][8:])
+        if not container_file.is_file():
+            raise SystemExit(14)
+        actual_hash = hashlib.sha256(container_file.read_bytes()).hexdigest()
+        if actual_hash != os.environ["EXPECTED_PREPARED_SHA"]:
+            raise SystemExit(15)
+        Path(os.environ["FAKE_CONSUMER_MARKER"]).write_text("container-read-ok", encoding="utf-8")
+        raise SystemExit(0)
+    if command == "rm":
+        container_file = resolve_container_path(args[-1])
+        if container_file.exists():
+            container_file.unlink()
+        Path(os.environ["FAKE_CLEANUP_MARKER"]).write_text("container-cleaned", encoding="utf-8")
+        raise SystemExit(0)
+
+raise SystemExit(16)
+''',
+            encoding="utf-8",
+        )
+        fake_docker_cmd.write_text(
+            f'@echo off\r\n"{sys.executable}" "%~dp0fake-docker.py" %*\r\nexit /b %ERRORLEVEL%\r\n',
+            encoding="ascii",
+        )
+        prepared_path = self._operation_path(operation_id) / "prepared.workflow.json"
+        extra_env = {
+            "FAKE_CONTAINER_ROOT": str(container_root),
+            "EXPECTED_PREPARED_SHA": hashlib.sha256(prepared_path.read_bytes()).hexdigest(),
+            "FAKE_CONSUMER_MARKER": str(consumer_marker),
+            "FAKE_CLEANUP_MARKER": str(cleanup_marker),
+        }
+        result = self._run(
+            "Apply",
+            operation_id,
+            extra_args=("-N8nContainer", "fake-container", "-DockerExecutable", str(fake_docker_cmd)),
+            extra_env=extra_env,
+        )
+        payload = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertEqual(payload["status"], "applied_and_verified")
+        self.assertEqual(consumer_marker.read_text(encoding="utf-8"), "container-read-ok")
+        self.assertEqual(cleanup_marker.read_text(encoding="utf-8"), "container-cleaned")
+        if container_root.exists():
+            self.assertEqual([path for path in container_root.rglob("*") if path.is_file()], [])
 
     def test_completion_claims_are_typed_and_bound_to_immutable_plan(self) -> None:
         operation_id, _ = self._capture("completion-claims")
@@ -536,6 +779,24 @@ class MemberGatewayBoundedImportSecurityTests(unittest.TestCase):
         self._run("Apply", operation_id, expect_success=False)
         self.assertEqual(dispatch_before, (self._operation_path(operation_id) / "dispatch-receipt.json").read_bytes())
         self.assertFalse((self._operation_path(operation_id) / "completion-receipt.json").exists())
+
+    def test_partial_retry_rederives_changed_preparation_inputs_and_rejects_them(self) -> None:
+        operation_id, fixture = self._capture("partial-fresh-preparation", dispatch_mode="ambiguous")
+        self._run("Apply", operation_id, expect_success=False)
+        dispatch_before = (self._operation_path(operation_id) / "dispatch-receipt.json").read_bytes()
+        self.manifest["question_mapping"]["name"] = "question-name-changed-002"
+        _write_json(self.manifest_path, self.manifest)
+        completed = self._run("Apply", operation_id, expect_success=False)
+        self.assertIn("binding_digest_mismatch", completed.stderr)
+        self.assertEqual(dispatch_before, (self._operation_path(operation_id) / "dispatch-receipt.json").read_bytes())
+
+    def test_completed_noop_retry_rederives_changed_preparation_inputs_and_rejects_them(self) -> None:
+        operation_id, _ = self._capture("completed-fresh-preparation")
+        self._apply_successfully(operation_id)
+        self.manifest["endpoints"]["gateway_ingest"] = "https://gateway.example.com/v1/source-events-changed"
+        _write_json(self.manifest_path, self.manifest)
+        completed = self._run("Apply", operation_id, expect_success=False)
+        self.assertIn("binding_digest_mismatch", completed.stderr)
 
     def test_completed_operation_is_noop_only_for_exact_target(self) -> None:
         operation_id, fixture = self._capture("completed-target")
