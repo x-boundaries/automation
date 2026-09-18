@@ -1,5 +1,7 @@
 param(
   [string]$WorkflowDir = "n8n-workflows",
+  [string]$WorkflowFile,
+  [string]$BindingManifestFile,
   [string]$BindingsFile = ".n8n-local\n8n-credential-bindings.json",
   [string]$Container,
   [string]$ContainerName,
@@ -8,6 +10,7 @@ param(
   [string]$ComposeService,
   [string]$PreparedDir = ".tmp/n8n-live-import",
   [string]$CredentialExportDir = ".tmp/n8n-live-credential-exports",
+  [string]$RecoveryDir = ".n8n-local/member-gateway-recovery",
   [string]$ContainerDir = "/tmp",
   [ValidateSet("CreateNew", "UpdateArchived", "Block")]
   [string]$ArchivedByNameMode = "CreateNew",
@@ -95,6 +98,50 @@ function Resolve-RepoRootFromScript {
 $HelperScriptDir = (Resolve-Path $PSScriptRoot).Path
 $RepoRoot = Resolve-RepoRootFromScript
 Set-Location $RepoRoot
+$SingleWorkflowMode = -not [string]::IsNullOrWhiteSpace($WorkflowFile)
+
+function Get-BoundedGenericHookPaths {
+  return @(
+    (Join-Path $RepoRoot "scripts/n8n-workflow-hooks.cjs"),
+    (Join-Path $RepoRoot "scripts/n8n-workflow-hooks.js"),
+    (Join-Path $RepoRoot "scripts/n8n-workflow-hooks.ps1"),
+    (Join-Path $RepoRoot ".n8n-local/n8n-workflow-hooks.cjs"),
+    (Join-Path $RepoRoot ".n8n-local/n8n-workflow-hooks.js"),
+    (Join-Path $RepoRoot ".n8n-local/n8n-workflow-hooks.ps1"),
+    (Join-Path $RepoRoot ".n8n-workflow-hooks.cjs"),
+    (Join-Path $RepoRoot ".n8n-workflow-hooks.js"),
+    (Join-Path $RepoRoot ".n8n-workflow-hooks.ps1")
+  )
+}
+
+function Assert-BoundedModeHasNoGenericHooks {
+  if (-not $SingleWorkflowMode) {
+    return
+  }
+
+  if (-not [string]::IsNullOrWhiteSpace($env:N8N_WORKFLOW_HOOK_SCRIPT)) {
+    throw "Bounded single-workflow mode forbids N8N_WORKFLOW_HOOK_SCRIPT."
+  }
+  if ($env:N8N_WORKFLOW_HOOK_AUTOLOAD -match '^(?i:true|1|yes|on)$') {
+    throw "Bounded single-workflow mode forbids generic hook autoload."
+  }
+  foreach ($hookPath in @(Get-BoundedGenericHookPaths)) {
+    if (Test-Path -LiteralPath $hookPath -PathType Leaf) {
+      throw "Bounded single-workflow mode forbids discovered generic workflow hooks: $hookPath"
+    }
+  }
+}
+
+Assert-BoundedModeHasNoGenericHooks
+if ($SingleWorkflowMode -and $PSBoundParameters.ContainsKey("WorkflowDir")) {
+  throw "WorkflowFile and WorkflowDir are mutually exclusive. Omit WorkflowDir for the bounded single-workflow mode."
+}
+if ($SingleWorkflowMode -and $RestartContainerAfterImport) {
+  throw "RestartContainerAfterImport is forbidden in bounded single-workflow mode."
+}
+if ($SingleWorkflowMode -and [string]::IsNullOrWhiteSpace($BindingManifestFile)) {
+  throw "BindingManifestFile is required in bounded single-workflow mode."
+}
 
 function Write-Section($Title) {
   Write-Host ""
@@ -624,6 +671,105 @@ function Get-LiveWorkflows {
   return @($workflows)
 }
 
+function Assert-ExactProperties($Value, [string[]]$Expected, [string]$Message) {
+  if (@(Compare-Object @($Value.PSObject.Properties.Name | Sort-Object) @($Expected | Sort-Object)).Count -ne 0) { throw $Message }
+}
+
+function Assert-BoundedReference($Value, [string]$Name) {
+  $reference = [string]$Value
+  if ([string]::IsNullOrWhiteSpace($reference) -or $reference -match '[\r\n]' -or $reference -cnotmatch '^[A-Za-z0-9._:-]{1,200}$') {
+    throw "Bounded $Name reference is missing or invalid."
+  }
+}
+
+function Get-BoundedManifestContext($Manifest) {
+  return [ordered]@{
+    project_reference = [string]$Manifest.target.project_reference
+    workflow_reference = [string]$Manifest.target.workflow_reference
+    preimage_reference = [string]$Manifest.target.preimage_reference
+    cursor_binding_reference = [string]$Manifest.source.cursor_binding_reference
+    watermark_binding_reference = [string]$Manifest.source.watermark_binding_reference
+  }
+}
+
+function Read-BoundedBindingManifest {
+  $path = if ([IO.Path]::IsPathRooted($BindingManifestFile)) { $BindingManifestFile } else { Join-Path $RepoRoot $BindingManifestFile }
+  if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Bounded deployment binding manifest is missing." }
+  $manifest = Get-Content -Raw -LiteralPath $path | ConvertFrom-Json
+  $trackedStatus = @(& git -C $RepoRoot status --porcelain --untracked-files=no)
+  if ($LASTEXITCODE -ne 0 -or $trackedStatus.Count -ne 0) { throw "Bounded deployment checkout is not clean." }
+  Assert-ExactProperties $manifest @("schema_version", "source_provenance", "deployment_admission", "endpoints", "source", "posture", "credentials", "target") "Bounded deployment binding manifest root shape is invalid."
+  Assert-ExactProperties $manifest.source_provenance @("commit", "tree", "parent", "workflow_path", "workflow_blob", "workflow_id", "workflow_name") "Bounded source provenance shape is invalid."
+  Assert-ExactProperties $manifest.deployment_admission @("commit", "tree", "parent") "Bounded deployment admission shape is invalid."
+  Assert-ExactProperties $manifest.endpoints @("forms_api_url", "source_cursor_url", "gateway_ingest_url", "page_checkpoint_url") "Bounded endpoint binding shape is invalid."
+  Assert-ExactProperties $manifest.source @("form_alias", "mapping_version", "form_id_reference", "question_map_sha256", "questions", "cursor_binding_reference", "watermark_binding_reference") "Bounded source binding shape is invalid."
+  Assert-ExactProperties $manifest.source.questions @("name", "phone", "email", "birthday_month", "marketing_consent", "pdpa_acknowledged") "Bounded question binding shape is invalid."
+  Assert-ExactProperties $manifest.posture @("active", "trigger", "available_in_mcp", "save_manual_executions", "save_success_execution", "save_error_execution", "static_data", "pin_data_present") "Bounded posture shape is invalid."
+  Assert-ExactProperties $manifest.credentials @("google_forms_responses_read", "gateway_source_bearer") "Bounded credential binding shape is invalid."
+  foreach ($role in @("google_forms_responses_read", "gateway_source_bearer")) { Assert-ExactProperties $manifest.credentials.$role @("type", "reference", "nodes") "Bounded credential role shape is invalid." }
+  Assert-ExactProperties $manifest.target @("project_reference", "workflow_reference", "preimage_reference") "Bounded target binding shape is invalid."
+  if ([string]$manifest.schema_version -cne "xb.member.gateway.n8n.binding.v1" -or [string]$manifest.source.form_alias -cne "member_registration" -or [string]$manifest.source.mapping_version -cne "member-intake.v1") { throw "Bounded binding fixed values are invalid." }
+  if ($manifest.posture.active -ne $false -or [string]$manifest.posture.trigger -cne "manual_only" -or $manifest.posture.available_in_mcp -ne $false -or $manifest.posture.save_manual_executions -ne $false -or [string]$manifest.posture.save_success_execution -cne "none" -or [string]$manifest.posture.save_error_execution -cne "none" -or $null -ne $manifest.posture.static_data -or $manifest.posture.pin_data_present -ne $false) { throw "Bounded binding posture is invalid." }
+  if ([string]$manifest.credentials.google_forms_responses_read.type -cne "googleOAuth2Api" -or [string]$manifest.credentials.gateway_source_bearer.type -cne "httpBearerAuth") { throw "Bounded credential types are invalid." }
+  Assert-BoundedReference $manifest.source.cursor_binding_reference "cursor binding"
+  Assert-BoundedReference $manifest.source.watermark_binding_reference "watermark binding"
+  Assert-BoundedReference $manifest.target.project_reference "target project"
+  Assert-BoundedReference $manifest.target.workflow_reference "target workflow"
+  Assert-BoundedReference $manifest.target.preimage_reference "target preimage"
+  if ([string]$manifest.source.cursor_binding_reference -ceq [string]$manifest.source.watermark_binding_reference) { throw "Bounded cursor and watermark bindings must be distinct." }
+  if (-not [string]::IsNullOrWhiteSpace($UserId)) { throw "Bounded single-workflow mode forbids UserId; the manifest project reference is authoritative." }
+  if ([string]::IsNullOrWhiteSpace($ProjectId) -or [string]$ProjectId -cne [string]$manifest.target.project_reference) { throw "Bounded ProjectId must exactly equal the manifest target project reference." }
+  $googleNodes = @($manifest.credentials.google_forms_responses_read.nodes)
+  $gatewayNodes = @($manifest.credentials.gateway_source_bearer.nodes)
+  if ($googleNodes.Count -ne 1 -or [string]$googleNodes[0] -cne "Google Forms single page (configured outside repo)" -or @(Compare-Object @($gatewayNodes | Sort-Object) @(@("Read durable source cursor", "Protected XB Gateway ingest (configured outside repo)", "Commit durable page checkpoint") | Sort-Object)).Count -ne 0) { throw "Bounded credential node roles are invalid." }
+  foreach ($reference in @([string]$manifest.credentials.google_forms_responses_read.reference, [string]$manifest.credentials.gateway_source_bearer.reference)) { if ([string]::IsNullOrWhiteSpace($reference) -or $reference -match '[\r\n]') { throw "Bounded credential reference is invalid." } }
+  $commit = (& git -C $RepoRoot rev-parse HEAD).Trim(); $tree = (& git -C $RepoRoot rev-parse 'HEAD^{tree}').Trim(); $parent = (& git -C $RepoRoot rev-parse 'HEAD^').Trim()
+  if ($LASTEXITCODE -ne 0 -or [string]$manifest.deployment_admission.commit -cne $commit -or [string]$manifest.deployment_admission.tree -cne $tree -or [string]$manifest.deployment_admission.parent -cne $parent) { throw "Bounded deployment admission does not match the current checkout." }
+  if ([string]$manifest.source_provenance.commit -cne "52308eebb95d9bc4f5a09fbe036c197a5e95b176" -or [string]$manifest.source_provenance.tree -cne "3ab7e3363b7189d7d1bb79ec8a1988eb23e1c7b3" -or [string]$manifest.source_provenance.parent -cne "1052f40e62a5ff5884c8ba49aac8114cc634b81c" -or [string]$manifest.source_provenance.workflow_path -cne "n8n-workflows/member_forms_gateway_ingest.workflow.json" -or [string]$manifest.source_provenance.workflow_blob -cne "4eeff984fb8a9a2fb569c1648e8dd4350c45b2fe" -or [string]$manifest.source_provenance.workflow_id -cne "xbMemberGatewayTemplate02" -or [string]$manifest.source_provenance.workflow_name -cne "Member Gateway - Google Forms durable source adapter (inactive)") { throw "Bounded immutable source provenance is invalid." }
+  $observedBlob = (& git -C $RepoRoot hash-object (Join-Path $RepoRoot "n8n-workflows/member_forms_gateway_ingest.workflow.json")).Trim()
+  if ($observedBlob -cne [string]$manifest.source_provenance.workflow_blob) { throw "Bounded canonical workflow blob mismatch." }
+  $expectedPaths = [ordered]@{ forms_api_url = "/v1/forms/$([string]$manifest.source.form_id_reference)/responses"; source_cursor_url = "/v1/source/cursor"; gateway_ingest_url = "/v1/source-events"; page_checkpoint_url = "/v1/source/cursor/page" }
+  foreach ($entry in $expectedPaths.GetEnumerator()) {
+    [Uri]$uri = $null; $value = [string]$manifest.endpoints.PSObject.Properties[$entry.Key].Value
+    if (-not [Uri]::TryCreate($value, [UriKind]::Absolute, [ref]$uri) -or $uri.Scheme -cne "https" -or $uri.AbsolutePath -cne $entry.Value -or $uri.UserInfo -or $uri.Query -or $uri.Fragment) { throw "Bounded endpoint binding is invalid." }
+  }
+  $orderedQuestions = [ordered]@{}; foreach ($key in @($manifest.source.questions.PSObject.Properties.Name | Sort-Object)) { $orderedQuestions[$key] = [string]$manifest.source.questions.$key }
+  foreach ($value in $orderedQuestions.Values) { if ($value -cnotmatch '^[A-Za-z0-9._:-]{1,200}$') { throw "Bounded question binding is invalid." } }
+  $questionHash = Get-Sha256Hex ([Text.Encoding]::UTF8.GetBytes(($orderedQuestions | ConvertTo-Json -Compress)))
+  if ([string]$manifest.source.question_map_sha256 -cne $questionHash) { throw "Bounded question map hash mismatch." }
+  $script:BoundedManifestContext = Get-BoundedManifestContext $manifest
+  return $manifest
+}
+
+function Get-BoundedLiveWorkflows($WorkflowInfo) {
+  $result = Invoke-CapturedCommand "docker" @("exec", $Container, "n8n", "list:workflow")
+  if ($result.ExitCode -ne 0) { if (Test-MissingLiveWorkflow $result) { return @() }; throw "Failed to list bounded workflow metadata." }
+  $metadata = @()
+  foreach ($line in @($result.StdOut)) {
+    if ([string]::IsNullOrWhiteSpace($line)) { continue }
+    $parts = $line -split '\|', 2
+    if ($parts.Count -ne 2 -or [string]::IsNullOrWhiteSpace($parts[0])) { throw "Bounded workflow metadata shape is invalid." }
+    $metadata += [pscustomobject]@{ id = $parts[0].Trim(); name = $parts[1].Trim() }
+  }
+  foreach ($group in @($metadata | Group-Object { ([string]$_.id).ToLowerInvariant() })) {
+    if ($group.Count -gt 1) { throw "Bounded workflow metadata contains duplicate or case-distinct ids." }
+  }
+  $exact = @($metadata | Where-Object { [string]$_.id -ceq $WorkflowInfo.Id -or [string]$_.name -ceq $WorkflowInfo.Name })
+  $caseCollisions = @($metadata | Where-Object {
+    (([string]$_.id -ieq $WorkflowInfo.Id) -and ([string]$_.id -cne $WorkflowInfo.Id)) -or
+    (([string]$_.name -ieq $WorkflowInfo.Name) -and ([string]$_.name -cne $WorkflowInfo.Name)) -or
+    ([string]$_.id -ieq $WorkflowInfo.Name) -or ([string]$_.name -ieq $WorkflowInfo.Id)
+  })
+  if ($caseCollisions.Count -gt 0 -or $exact.Count -gt 1) { throw "Bounded workflow metadata is ambiguous by id/name." }
+  if ($exact.Count -eq 0) { return @() }
+  $id = [string]$exact[0].id
+  $export = Invoke-CapturedCommand "docker" @("exec", $Container, "n8n", "export:workflow", "--id=$id", "--pretty")
+  if ($export.ExitCode -ne 0) { throw "Failed to export the exact bounded workflow target." }
+  $items = @(($export.StdOut -join "`n") | ConvertFrom-Json)
+  if ($items.Count -ne 1 -or [string]$items[0].id -cne $id) { throw "Exact bounded workflow export is contradictory." }
+  return $items
+}
+
 function Get-RootWorkflowFiles($WorkflowDirPath) {
   if (-not (Test-Path -Path $WorkflowDirPath -PathType Container)) {
     throw "Workflow directory not found: n8n-workflows. Create n8n-workflows/ or run AllLive export to bootstrap from live n8n."
@@ -635,6 +781,29 @@ function Get-RootWorkflowFiles($WorkflowDirPath) {
   }
 
   return $workflowFiles
+}
+
+function Get-SingleCanonicalWorkflowFile($WorkflowDirPath) {
+  $expectedName = "member_forms_gateway_ingest.workflow.json"
+  $candidate = if ([IO.Path]::IsPathRooted($WorkflowFile)) { $WorkflowFile } else { Join-Path $RepoRoot $WorkflowFile }
+  $fullPath = [IO.Path]::GetFullPath($candidate)
+  $canonicalDir = [IO.Path]::GetFullPath($WorkflowDirPath).TrimEnd('\', '/')
+  $parent = [IO.Path]::GetDirectoryName($fullPath).TrimEnd('\', '/')
+  if ($parent -cne $canonicalDir -or [IO.Path]::GetFileName($fullPath) -cne $expectedName) {
+    throw "WorkflowFile must be the immediate canonical child n8n-workflows\member_forms_gateway_ingest.workflow.json."
+  }
+  if (-not (Test-Path -LiteralPath $fullPath -PathType Leaf)) { throw "Canonical single workflow file is missing." }
+  return @(Get-Item -LiteralPath $fullPath)
+}
+
+function Assert-SingleWorkflowRepositoryPosture($WorkflowFileInfo) {
+  $workflow = Get-Content -Raw -LiteralPath $WorkflowFileInfo.FullName | ConvertFrom-Json
+  if ([string]$workflow.id -cne "xbMemberGatewayTemplate02" -or [string]$workflow.name -cne "Member Gateway - Google Forms durable source adapter (inactive)") { throw "Single workflow identity mismatch." }
+  if ($workflow.active -ne $false -or $null -ne $workflow.staticData -or $workflow.PSObject.Properties.Name -contains "pinData") { throw "Single workflow must remain inactive and free of static/pinned data." }
+  $triggers = @($workflow.nodes | Where-Object { ([string]$_.type).EndsWith("Trigger") })
+  if ($triggers.Count -ne 1 -or [string]$triggers[0].type -cne "n8n-nodes-base.manualTrigger") { throw "Single workflow must remain manual-only." }
+  if ($workflow.settings.availableInMCP -ne $false -or $workflow.settings.saveManualExecutions -ne $false -or [string]$workflow.settings.saveDataErrorExecution -cne "none" -or [string]$workflow.settings.saveDataSuccessExecution -cne "none") { throw "Single workflow retention or MCP posture mismatch." }
+  if (Test-WorkflowHasScheduleTrigger $workflow) { throw "Single workflow cannot contain a schedule trigger." }
 }
 
 function Resolve-LiveWorkflowByName($WorkflowName, $WorkflowFileName, $LiveWorkflows) {
@@ -697,6 +866,86 @@ function Set-PreparedWorkflowId($PreparedFile, $WorkflowId) {
     $preparedWorkflow | Add-Member -MemberType NoteProperty -Name "id" -Value $WorkflowId
   }
   Write-Utf8NoBomText -Path $PreparedFile -Text (($preparedWorkflow | ConvertTo-Json -Depth 100) + "`n")
+}
+
+function Get-BoundedWorkflowProjection($Workflow) {
+  $projection = [ordered]@{
+    id = [string]$Workflow.id
+    name = [string]$Workflow.name
+    active = $Workflow.active
+    nodes = @($Workflow.nodes)
+    connections = $Workflow.connections
+    settings = $Workflow.settings
+    staticData = $Workflow.staticData
+    pinDataPresent = [bool]($Workflow.PSObject.Properties.Name -contains "pinData")
+  }
+  return ($projection | ConvertTo-Json -Depth 100 -Compress)
+}
+
+function New-BoundedPreparedWorkflow($WorkflowFile, $TargetId, $Manifest, $PreparedFile) {
+  $workflow = (Get-Content -Raw -LiteralPath $WorkflowFile.FullName | ConvertFrom-Json | ConvertTo-Json -Depth 100 | ConvertFrom-Json)
+  if ([string]$Manifest.target.workflow_reference -cne [string]$TargetId) { throw "Bounded manifest target workflow reference mismatch." }
+  $configNode = @($workflow.nodes | Where-Object { [string]$_.name -ceq "Repository-safe source configuration" })
+  if ($configNode.Count -ne 1) { throw "Bounded source configuration node contract mismatch." }
+  $assignments = @($configNode[0].parameters.assignments.assignments)
+  $expectedAssignmentNames = @("activation_enabled", "form_alias", "mapping_version", "forms_api_url", "source_cursor_url", "gateway_ingest_url", "page_checkpoint_url", "initial_source_window_max")
+  if (@(Compare-Object @($assignments.name | Sort-Object) @($expectedAssignmentNames | Sort-Object)).Count -ne 0) { throw "Bounded source configuration assignment contract mismatch." }
+  $replacement = @{
+    forms_api_url = [string]$Manifest.endpoints.forms_api_url
+    source_cursor_url = [string]$Manifest.endpoints.source_cursor_url
+    gateway_ingest_url = [string]$Manifest.endpoints.gateway_ingest_url
+    page_checkpoint_url = [string]$Manifest.endpoints.page_checkpoint_url
+  }
+  foreach ($entry in $assignments) {
+    if ($replacement.ContainsKey([string]$entry.name)) { $entry.value = $replacement[[string]$entry.name] }
+  }
+  $activation = @($assignments | Where-Object name -CEQ "activation_enabled")
+  if ($activation.Count -ne 1 -or $activation[0].value -ne $false) { throw "Bounded internal activation gate changed." }
+  $codeNode = @($workflow.nodes | Where-Object { [string]$_.name -ceq "Canonicalize source page" })
+  if ($codeNode.Count -ne 1) { throw "Bounded canonicalization node contract mismatch." }
+  $questionPlaceholders = [ordered]@{
+    QUESTION_ID_NAME_PLACEHOLDER = [string]$Manifest.source.questions.name
+    QUESTION_ID_PHONE_PLACEHOLDER = [string]$Manifest.source.questions.phone
+    QUESTION_ID_EMAIL_PLACEHOLDER = [string]$Manifest.source.questions.email
+    QUESTION_ID_BIRTHDAY_MONTH_PLACEHOLDER = [string]$Manifest.source.questions.birthday_month
+    QUESTION_ID_MARKETING_CONSENT_PLACEHOLDER = [string]$Manifest.source.questions.marketing_consent
+    QUESTION_ID_PDPA_ACKNOWLEDGED_PLACEHOLDER = [string]$Manifest.source.questions.pdpa_acknowledged
+  }
+  $code = [string]$codeNode[0].parameters.jsCode
+  foreach ($entry in $questionPlaceholders.GetEnumerator()) {
+    if ([regex]::Matches($code, [regex]::Escape($entry.Key)).Count -ne 1 -or $entry.Value -cnotmatch '^[A-Za-z0-9._:-]{1,200}$') { throw "Bounded question placeholder contract mismatch." }
+    $code = $code.Replace($entry.Key, $entry.Value)
+  }
+  $codeNode[0].parameters.jsCode = $code
+  $roleMap = [ordered]@{
+    "Google Forms single page (configured outside repo)" = [pscustomobject]@{ Type = "googleOAuth2Api"; Reference = [string]$Manifest.credentials.google_forms_responses_read.reference; Authentication = "predefinedCredentialType" }
+    "Read durable source cursor" = [pscustomobject]@{ Type = "httpBearerAuth"; Reference = [string]$Manifest.credentials.gateway_source_bearer.reference; Authentication = "genericCredentialType" }
+    "Protected XB Gateway ingest (configured outside repo)" = [pscustomobject]@{ Type = "httpBearerAuth"; Reference = [string]$Manifest.credentials.gateway_source_bearer.reference; Authentication = "genericCredentialType" }
+    "Commit durable page checkpoint" = [pscustomobject]@{ Type = "httpBearerAuth"; Reference = [string]$Manifest.credentials.gateway_source_bearer.reference; Authentication = "genericCredentialType" }
+  }
+  foreach ($node in @($workflow.nodes)) {
+    $hasRole = $roleMap.Contains([string]$node.name)
+    if (-not $hasRole -and $node.PSObject.Properties.Name -contains "credentials") { throw "Bounded workflow contains an extra credential." }
+    if (-not $hasRole) { continue }
+    $role = $roleMap[[string]$node.name]
+    $credential = [pscustomobject]@{ id = $role.Reference; name = $role.Reference }
+    $credentials = [pscustomobject]@{}
+    $credentials | Add-Member -MemberType NoteProperty -Name $role.Type -Value $credential
+    $node | Add-Member -MemberType NoteProperty -Name credentials -Value $credentials -Force
+    $node.parameters | Add-Member -MemberType NoteProperty -Name authentication -Value $role.Authentication -Force
+    if ($role.Type -ceq "googleOAuth2Api") { $node.parameters | Add-Member -MemberType NoteProperty -Name nodeCredentialType -Value "googleOAuth2Api" -Force }
+    else { $node.parameters | Add-Member -MemberType NoteProperty -Name genericAuthType -Value "httpBearerAuth" -Force }
+    if ($node.parameters.PSObject.Properties.Name -contains "headerParameters") {
+      if (@($node.parameters.headerParameters.parameters | Where-Object { [string]$_.name -ieq "Authorization" }).Count -gt 0) { throw "Bounded workflow contains a manual Authorization header." }
+    }
+  }
+  $workflow.id = [string]$TargetId
+  Write-Utf8NoBomText -Path $PreparedFile -Text (($workflow | ConvertTo-Json -Depth 100) + "`n")
+  return $workflow
+}
+
+function Assert-BoundedWorkflowContract($Observed, $Expected) {
+  if ((Get-BoundedWorkflowProjection $Observed) -cne (Get-BoundedWorkflowProjection $Expected)) { throw "Bounded workflow complete locked contract mismatch." }
 }
 
 function Test-WorkflowHasScheduleTrigger($Workflow) {
@@ -804,7 +1053,31 @@ function Invoke-WorkflowPreflight($WorkflowFiles, [bool]$BindingsFileExists, $Li
       Remove-Item -Path $liveCompareFile -Force
     }
 
-    if ($hasWorkflowId) {
+    if ($SingleWorkflowMode) {
+      $targetMatches = @($LiveWorkflows | Where-Object { [string]$_.id -ceq $workflowId -or [string]$_.name -ceq $workflowName })
+      if ($targetMatches.Count -gt 1) {
+        $blockedWorkflows += [PSCustomObject]@{ File = $workflowFile.Name; Reason = "Bounded single-workflow target is ambiguous by canonical id/name."; Kind = "SingleTargetAmbiguous" }
+        continue
+      }
+      if ($targetMatches.Count -eq 1) {
+        $target = $targetMatches[0]
+        if ($target.isArchived -eq $true) {
+          $blockedWorkflows += [PSCustomObject]@{ File = $workflowFile.Name; Reason = "Archived target blocks bounded single-workflow replacement."; Kind = "SingleTargetArchived" }
+          continue
+        }
+        if ($target.active -eq $true -or (Test-WorkflowHasScheduleTrigger $target)) {
+          $blockedWorkflows += [PSCustomObject]@{ File = $workflowFile.Name; Reason = "Active or scheduled target blocks bounded single-workflow replacement."; Kind = "SingleTargetActiveOrScheduled" }
+          continue
+        }
+        $workflowStatus = "ExistingById"
+        $liveWorkflowForCredentialCheck = $target
+        $liveWorkflowIdForImport = [string]$target.id
+        $targetLiveId = $liveWorkflowIdForImport
+        $plannedAction = "Update bounded inactive target"
+        Write-WorkflowJson $target $liveCompareFile
+        Write-Step "MATCH" "$($workflowFile.Name) matched one inactive manual target as $liveWorkflowIdForImport; its preimage was captured."
+      }
+    } elseif ($hasWorkflowId) {
       $idMatches = @($LiveWorkflows | Where-Object { [string]$_.id -eq $workflowId })
       if ($idMatches.Count -gt 1) {
         $blockedWorkflows += [PSCustomObject]@{
@@ -887,6 +1160,20 @@ function Invoke-WorkflowPreflight($WorkflowFiles, [bool]$BindingsFileExists, $Li
         Write-Step "WARN" "On non multi-main n8n instances, cron triggers may keep running until n8n is restarted."
         Write-Step "WARN" "Restart the n8n container after import before trusting activation state."
       }
+    }
+
+    if ($SingleWorkflowMode) {
+      $expectedWorkflow = New-BoundedPreparedWorkflow -WorkflowFile $workflowFile -TargetId $targetLiveId -Manifest $script:BoundedBindingManifest -PreparedFile $preparedFile
+      if ($null -ne $liveWorkflowForCredentialCheck) { Write-WorkflowJson $liveWorkflowForCredentialCheck $liveCompareFile }
+      Write-Step "READY" "$($workflowFile.Name) prepared from the exact authorised binding contract."
+      $plannedImports += [PSCustomObject]@{
+        File = $workflowFile.Name; PreparedFile = $preparedFile; ContainerFile = $containerFile
+        IsArchivedInLive = $false; UpdatesArchivedWorkflow = $false; RequiresRestartWarning = $false
+        Action = $plannedAction; TargetId = $targetLiveId; Note = $actionNote
+        ExpectedWorkflow = $expectedWorkflow; PreimageWorkflow = $liveWorkflowForCredentialCheck
+        BoundedContext = $script:BoundedManifestContext; SkipMutation = $false; ReconciledCreation = $false
+      }
+      continue
     }
 
     if ($workflowStatus -eq "ExistingById" -or $workflowStatus -eq "ExistingByName" -or $workflowStatus -eq "ExistingArchivedById") {
@@ -1006,6 +1293,164 @@ function Invoke-WorkflowPreflight($WorkflowFiles, [bool]$BindingsFileExists, $Li
   }
 }
 
+function Assert-BoundedImportedWorkflow($PlannedImport) {
+  $result = Invoke-CapturedCommand "docker" @("exec", $Container, "n8n", "export:workflow", "--id=$($PlannedImport.TargetId)", "--pretty")
+  if ($result.ExitCode -ne 0) { throw "Failed to read back bounded imported target." }
+  $text = ($result.StdOut -join "`n").Trim()
+  $items = @($text | ConvertFrom-Json)
+  if ($items.Count -ne 1) { throw "Bounded import readback did not return exactly one target." }
+  $workflow = $items[0]
+  if ([string]$workflow.id -cne [string]$PlannedImport.TargetId) { throw "Bounded import readback id mismatch." }
+  if ($workflow.active -eq $true -or $workflow.isArchived -eq $true -or (Test-WorkflowHasScheduleTrigger $workflow)) { throw "Bounded import readback is not inactive and unscheduled." }
+  $triggers = @($workflow.nodes | Where-Object { ([string]$_.type).EndsWith("Trigger") })
+  if ($triggers.Count -ne 1 -or [string]$triggers[0].type -cne "n8n-nodes-base.manualTrigger") { throw "Bounded import readback is not manual-only." }
+  Assert-BoundedWorkflowContract -Observed $workflow -Expected $PlannedImport.ExpectedWorkflow
+}
+
+function Get-Sha256Hex([byte[]]$Bytes) {
+  $algorithm = [Security.Cryptography.SHA256]::Create()
+  try { return ([BitConverter]::ToString($algorithm.ComputeHash($Bytes))).Replace("-", "").ToLowerInvariant() }
+  finally { $algorithm.Dispose() }
+}
+
+function Write-CreateNewUtf8($Path, $Text) {
+  $bytes = [Text.UTF8Encoding]::new($false).GetBytes($Text)
+  $stream = [IO.File]::Open($Path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+  try { $stream.Write($bytes, 0, $bytes.Length); $stream.Flush($true) } finally { $stream.Dispose(); [Array]::Clear($bytes, 0, $bytes.Length) }
+}
+
+function Set-BoundedRecoveryAcl($Path) {
+  if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) { return }
+  $acl = [Security.AccessControl.DirectorySecurity]::new(); $acl.SetAccessRuleProtection($true, $false)
+  $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User
+  $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($sid, "FullControl", "ContainerInherit,ObjectInherit", "None", "Allow"))
+  [IO.Directory]::SetAccessControl($Path, $acl)
+  if (-not [IO.Directory]::GetAccessControl($Path).AreAccessRulesProtected) { throw "Bounded recovery ACL is not restrictive." }
+}
+
+function Read-BoundedJsonFile($Path, $ErrorId) {
+  try { return (Get-Content -Raw -LiteralPath $Path | ConvertFrom-Json) } catch { throw $ErrorId }
+}
+
+function Assert-BoundedRecoveryFileSet($RecordRoot, $PreimageState, [bool]$HasCreationReceipt) {
+  $allowed = @("recovery-receipt.json")
+  if ($PreimageState -eq "existing") { $allowed += "preimage.workflow.json" }
+  if ($HasCreationReceipt) { $allowed += "creation-receipt.json" }
+  $actual = @(Get-ChildItem -LiteralPath $RecordRoot -Force | ForEach-Object Name | Sort-Object)
+  if (@(Compare-Object $actual @($allowed | Sort-Object)).Count -ne 0) { throw "Bounded recovery record file set is invalid." }
+}
+
+function Assert-BoundedCreationReceipt($Path, $PlannedImport) {
+  if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw "Bounded creation receipt is missing." }
+  $receipt = Read-BoundedJsonFile $Path "Bounded creation receipt is corrupt."
+  Assert-ExactProperties $receipt @("schema_version", "target_id", "operation_hash", "ownership") "Bounded creation receipt schema is invalid."
+  if ([string]$receipt.schema_version -cne "xb.member.gateway.n8n.creation.v1" -or [string]$receipt.target_id -cne [string]$PlannedImport.TargetId -or [string]$receipt.operation_hash -cne [string]$PlannedImport.OperationHash -or [string]$receipt.ownership -cne "created_by_this_transaction") { throw "Bounded creation receipt is contradictory." }
+  return $receipt
+}
+
+function Assert-BoundedRecoveryReceipt($RecordRoot, $PlannedImport, $PreparedHash, $OperationHash, $Context) {
+  $receiptPath = Join-Path $RecordRoot "recovery-receipt.json"
+  if (-not (Test-Path -LiteralPath $receiptPath -PathType Leaf)) { throw "Bounded recovery receipt is missing." }
+  $receipt = Read-BoundedJsonFile $receiptPath "Bounded recovery receipt is corrupt."
+  Assert-ExactProperties $receipt @("schema_version", "target_id", "operation_hash", "prepared_sha256", "preimage_state", "preimage_sha256", "context") "Bounded recovery receipt schema is invalid."
+  Assert-ExactProperties $receipt.context @("project_reference", "workflow_reference", "preimage_reference", "cursor_binding_reference", "watermark_binding_reference") "Bounded recovery context schema is invalid."
+  if ([string]$receipt.schema_version -cne "xb.member.gateway.n8n.recovery.v2" -or [string]$receipt.target_id -cne [string]$PlannedImport.TargetId -or [string]$receipt.operation_hash -cne $OperationHash -or [string]$receipt.prepared_sha256 -cne $PreparedHash) { throw "Bounded recovery retry record mismatch." }
+  if ([string]$receipt.prepared_sha256 -cnotmatch '^[0-9a-f]{64}$' -or [string]$receipt.operation_hash -cnotmatch '^[0-9a-f]{64}$') { throw "Bounded recovery receipt hash is invalid." }
+  foreach ($key in @("project_reference", "workflow_reference", "preimage_reference", "cursor_binding_reference", "watermark_binding_reference")) {
+    if ([string]$receipt.context.$key -cne [string]$Context[$key]) { throw "Bounded recovery context mismatch." }
+  }
+  $preimagePath = Join-Path $RecordRoot "preimage.workflow.json"
+  $creationPath = Join-Path $RecordRoot "creation-receipt.json"
+  $preimageWorkflow = $null
+  if ([string]$receipt.preimage_state -ceq "absent") {
+    if ($null -ne $receipt.preimage_sha256 -or (Test-Path -LiteralPath $preimagePath)) { throw "Bounded absent preimage evidence is contradictory." }
+  } elseif ([string]$receipt.preimage_state -ceq "existing") {
+    if ([string]$receipt.preimage_sha256 -cnotmatch '^[0-9a-f]{64}$' -or -not (Test-Path -LiteralPath $preimagePath -PathType Leaf)) { throw "Bounded existing preimage evidence is missing." }
+    $preimageBytes = [IO.File]::ReadAllBytes($preimagePath)
+    try { $actualPreimageHash = Get-Sha256Hex $preimageBytes } finally { [Array]::Clear($preimageBytes, 0, $preimageBytes.Length) }
+    if ($actualPreimageHash -cne [string]$receipt.preimage_sha256) { throw "Bounded existing preimage hash mismatch." }
+    $preimageWorkflow = Read-BoundedJsonFile $preimagePath "Bounded existing preimage is corrupt."
+    if ([string]$preimageWorkflow.id -cne [string]$PlannedImport.TargetId) { throw "Bounded existing preimage target mismatch." }
+  } else {
+    throw "Bounded recovery preimage state is invalid."
+  }
+  $hasCreationReceipt = Test-Path -LiteralPath $creationPath
+  if ($hasCreationReceipt) {
+    if ([string]$receipt.preimage_state -cne "absent") { throw "Bounded recovery has contradictory creation ownership." }
+    Assert-BoundedCreationReceipt $creationPath $PlannedImport | Out-Null
+  }
+  Assert-BoundedRecoveryFileSet $RecordRoot ([string]$receipt.preimage_state) $hasCreationReceipt
+  return [pscustomobject]@{ Receipt = $receipt; PreimageWorkflow = $preimageWorkflow; HasCreationReceipt = $hasCreationReceipt }
+}
+
+function Assert-BoundedReconciledCreation($PlannedImport) {
+  $target = $PlannedImport.PreimageWorkflow
+  if ($null -eq $target -or [string]$target.id -cne [string]$PlannedImport.TargetId -or $target.active -eq $true -or $target.isArchived -eq $true -or (Test-WorkflowHasScheduleTrigger $target)) { throw "Bounded partial create target is not an exact inactive target." }
+  try { Assert-BoundedWorkflowContract -Observed $target -Expected $PlannedImport.ExpectedWorkflow } catch { throw "Bounded partial create reconciliation failed." }
+}
+
+function Save-BoundedRecoveryRecord($PlannedImport) {
+  $recoveryRoot = if ([IO.Path]::IsPathRooted($RecoveryDir)) { $RecoveryDir } else { Join-Path $RepoRoot $RecoveryDir }
+  $relativeRecovery = $RecoveryDir.Replace('\', '/')
+  if ([IO.Path]::IsPathRooted($RecoveryDir) -or $relativeRecovery -cne ".n8n-local/member-gateway-recovery") { throw "Bounded recovery directory contract mismatch." }
+  & git -C $RepoRoot check-ignore --quiet -- $relativeRecovery
+  if ($LASTEXITCODE -ne 0) { throw "Bounded recovery directory is not ignored." }
+  if (@(& git -C $RepoRoot ls-files -- $relativeRecovery).Count -ne 0) { throw "Bounded recovery directory is tracked." }
+  if ($null -eq $PlannedImport.BoundedContext) { throw "Bounded recovery context is missing." }
+  $context = [ordered]@{
+    project_reference = [string]$PlannedImport.BoundedContext["project_reference"]
+    workflow_reference = [string]$PlannedImport.BoundedContext["workflow_reference"]
+    preimage_reference = [string]$PlannedImport.BoundedContext["preimage_reference"]
+    cursor_binding_reference = [string]$PlannedImport.BoundedContext["cursor_binding_reference"]
+    watermark_binding_reference = [string]$PlannedImport.BoundedContext["watermark_binding_reference"]
+  }
+  foreach ($key in @("project_reference", "workflow_reference", "preimage_reference", "cursor_binding_reference", "watermark_binding_reference")) { Assert-BoundedReference $context[$key] $key }
+  $contextJson = $context | ConvertTo-Json -Compress
+  $preparedBytes = [IO.File]::ReadAllBytes($PlannedImport.PreparedFile)
+  try { $preparedHash = Get-Sha256Hex $preparedBytes } finally { [Array]::Clear($preparedBytes, 0, $preparedBytes.Length) }
+  $operationHash = Get-Sha256Hex ([Text.Encoding]::UTF8.GetBytes(([string]$PlannedImport.TargetId + [Environment]::NewLine + $preparedHash + [Environment]::NewLine + $contextJson)))
+  if ([string]$PlannedImport.TargetId -cnotmatch '^[A-Za-z0-9._:-]{1,200}$') { throw "Bounded recovery target id is invalid." }
+  $recordRoot = Join-Path (Join-Path $recoveryRoot ([string]$PlannedImport.TargetId)) $operationHash
+  $receiptPath = Join-Path $recordRoot "recovery-receipt.json"
+  if (Test-Path -LiteralPath $receiptPath) {
+    $validated = Assert-BoundedRecoveryReceipt $recordRoot $PlannedImport $preparedHash $operationHash $context
+    $PlannedImport | Add-Member -MemberType NoteProperty -Name RecoveryRecordRoot -Value $recordRoot -Force
+    $PlannedImport | Add-Member -MemberType NoteProperty -Name OperationHash -Value $operationHash -Force
+    if ([string]$validated.Receipt.preimage_state -ceq "existing") {
+      if ($null -eq $PlannedImport.PreimageWorkflow) { throw "Bounded recovery target is missing while original preimage is existing." }
+      $PlannedImport.PreimageWorkflow = $validated.PreimageWorkflow
+    } else {
+      if ($null -eq $PlannedImport.PreimageWorkflow) { throw "Bounded partial create cannot be reconciled safely." }
+      Assert-BoundedReconciledCreation $PlannedImport
+      $PlannedImport | Add-Member -MemberType NoteProperty -Name SkipMutation -Value $true -Force
+      $PlannedImport | Add-Member -MemberType NoteProperty -Name ReconciledCreation -Value $true -Force
+    }
+    return
+  }
+  if ((Test-Path -LiteralPath $recordRoot -PathType Container) -and @(Get-ChildItem -LiteralPath $recordRoot -Force).Count -ne 0) { throw "Bounded recovery record has incomplete material." }
+  New-Item -ItemType Directory -Path $recordRoot -Force | Out-Null
+  Set-BoundedRecoveryAcl $recordRoot
+  $preimageState = if ($null -eq $PlannedImport.PreimageWorkflow) { "absent" } else { "existing" }
+  $preimageHash = $null
+  if ($preimageState -eq "existing") {
+    $preimageText = ($PlannedImport.PreimageWorkflow | ConvertTo-Json -Depth 100) + [Environment]::NewLine
+    $preimageHash = Get-Sha256Hex ([Text.UTF8Encoding]::new($false).GetBytes($preimageText))
+    Write-CreateNewUtf8 (Join-Path $recordRoot "preimage.workflow.json") $preimageText
+  }
+  $receipt = [ordered]@{ schema_version = "xb.member.gateway.n8n.recovery.v2"; target_id = [string]$PlannedImport.TargetId; operation_hash = $operationHash; prepared_sha256 = $preparedHash; preimage_state = $preimageState; preimage_sha256 = $preimageHash; context = $context }
+  Write-CreateNewUtf8 $receiptPath (($receipt | ConvertTo-Json -Depth 10) + [Environment]::NewLine)
+  $PlannedImport | Add-Member -MemberType NoteProperty -Name RecoveryRecordRoot -Value $recordRoot -Force
+  $PlannedImport | Add-Member -MemberType NoteProperty -Name OperationHash -Value $operationHash -Force
+}
+
+function Save-BoundedCreationReceipt($PlannedImport) {
+  if ($null -ne $PlannedImport.PreimageWorkflow -and -not [bool]$PlannedImport.ReconciledCreation) { return }
+  $path = Join-Path $PlannedImport.RecoveryRecordRoot "creation-receipt.json"
+  if (Test-Path -LiteralPath $path) { Assert-BoundedCreationReceipt $path $PlannedImport | Out-Null; return }
+  $receipt = [ordered]@{ schema_version = "xb.member.gateway.n8n.creation.v1"; target_id = [string]$PlannedImport.TargetId; operation_hash = [string]$PlannedImport.OperationHash; ownership = "created_by_this_transaction" }
+  Write-CreateNewUtf8 $path (($receipt | ConvertTo-Json -Depth 10) + [Environment]::NewLine)
+}
+
 function Write-BlockedSummary($PreflightResult) {
   Write-Section "Summary"
   Write-Host ("Ready       : {0}" -f $PreflightResult.PlannedImports.Count)
@@ -1063,6 +1508,7 @@ if ($DryRun) {
 Write-Section "n8n workflow import"
 Write-Host ("Repo root        : {0}" -f $RepoRoot)
 Write-Host ("Workflow dir     : {0}" -f (Get-DisplayPath $WorkflowDirPath))
+Write-Host ("Workflow file    : {0}" -f ($(if ($SingleWorkflowMode) { $WorkflowFile } else { "(broad mode)" })))
 Write-Host ("Prepared dir     : {0}" -f (Get-DisplayPath $PreparedDirPath))
 if ($DryRun) {
   Write-Host ("Dry-run plan dir : {0}" -f (Get-DisplayPath $RunPreparedDirPath))
@@ -1093,18 +1539,33 @@ if (-not $DryRun) {
   }
 }
 
-$workflowFiles = Get-RootWorkflowFiles $WorkflowDirPath
+$workflowFiles = @(if ($SingleWorkflowMode) { Get-SingleCanonicalWorkflowFile $WorkflowDirPath } else { Get-RootWorkflowFiles $WorkflowDirPath })
+if ($SingleWorkflowMode) {
+  if ($workflowFiles.Count -ne 1) { throw "Bounded single-workflow mode requires exactly one input file." }
+  Assert-SingleWorkflowRepositoryPosture $workflowFiles[0]
+  $script:BoundedBindingManifest = Read-BoundedBindingManifest
+}
 
 Write-Section "Workflow JSON Validation"
-$validationResult = Invoke-CapturedCommand "node" @((Join-Path $HelperScriptDir "validate-n8n-workflows.cjs"), $WorkflowDirPath)
-if ($validationResult.ExitCode -ne 0) {
-  throw "Workflow JSON validation failed before live import.`n$($validationResult.Output -join "`n")"
+if ($SingleWorkflowMode) {
+  Write-Step "VALID" "Canonical single workflow identity, inactive/manual posture, retention, MCP, pin, and static-data checks passed."
+} else {
+  $validationResult = Invoke-CapturedCommand "node" @((Join-Path $HelperScriptDir "validate-n8n-workflows.cjs"), $WorkflowDirPath)
+  if ($validationResult.ExitCode -ne 0) {
+    throw "Workflow JSON validation failed before live import.`n$($validationResult.Output -join "`n")"
+  }
+  Write-CommandOutput $validationResult.StdOut "VALID"
 }
-Write-CommandOutput $validationResult.StdOut "VALID"
 
 Invoke-LivePreflight
-$liveWorkflows = Get-LiveWorkflows
-Write-Step "LIVE" "Read $($liveWorkflows.Count) workflow(s) from live n8n."
+if ($SingleWorkflowMode) {
+  $selectedIdentity = Read-RepoWorkflowInfo $workflowFiles[0]
+  $liveWorkflows = @(Get-BoundedLiveWorkflows $selectedIdentity)
+  Write-Step "LIVE" "Read only exact canonical id/name target bodies for bounded single-workflow evaluation."
+} else {
+  $liveWorkflows = Get-LiveWorkflows
+  Write-Step "LIVE" "Read $($liveWorkflows.Count) workflow(s) from live n8n."
+}
 
 Initialize-RunDirectory $RunPreparedDirPath
 
@@ -1114,7 +1575,8 @@ $missingCredentialBlockers = @($preflight.BlockedWorkflows | Where-Object { $_.K
 if (
   $missingCredentialBlockers.Count -gt 0 -and
   -not $SkipCredentialBindingRefresh -and
-  -not $DryRun
+  -not $DryRun -and
+  -not $SingleWorkflowMode
 ) {
   if (Export-CredentialBindingsOnly $workflowFiles $liveWorkflows) {
     $bindingsFileExists = Test-Path -Path $BindingsFilePath -PathType Leaf
@@ -1206,17 +1668,33 @@ if ($preparedValidationResult.ExitCode -ne 0) {
 }
 Write-CommandOutput $preparedValidationResult.StdOut "VALID"
 
+if ($SingleWorkflowMode) {
+  foreach ($plannedImport in $preflight.PlannedImports) {
+    $preparedObserved = Get-Content -Raw -LiteralPath $plannedImport.PreparedFile | ConvertFrom-Json
+    Assert-BoundedWorkflowContract -Observed $preparedObserved -Expected $plannedImport.ExpectedWorkflow
+    Save-BoundedRecoveryRecord $plannedImport
+  }
+}
+
 Write-Section "Import"
 
 $importedCount = 0
 foreach ($plannedImport in $preflight.PlannedImports) {
+  if ($SingleWorkflowMode -and [bool]$plannedImport.SkipMutation) {
+    Write-Step "REUSE" "$($plannedImport.File) matched the exact target created by the original bounded operation; no second mutation was issued."
+    Assert-BoundedImportedWorkflow $plannedImport
+    Save-BoundedCreationReceipt $plannedImport
+    continue
+  }
   $copyResult = Invoke-CapturedCommand "docker" @("cp", $plannedImport.PreparedFile, "${Container}:$($plannedImport.ContainerFile)")
   if ($copyResult.ExitCode -ne 0) {
     throw "Failed to copy $($plannedImport.PreparedFile) into container $Container.`n$($copyResult.Output -join "`n")"
   }
 
   $importArgs = @("exec", $Container, "n8n", "import:workflow", "--input=$($plannedImport.ContainerFile)")
-  if (-not [string]::IsNullOrWhiteSpace($ProjectId)) {
+  if ($SingleWorkflowMode) {
+    $importArgs += "--projectId=$([string]$script:BoundedManifestContext.project_reference)"
+  } elseif (-not [string]::IsNullOrWhiteSpace($ProjectId)) {
     $importArgs += "--projectId=$ProjectId"
   } elseif (-not [string]::IsNullOrWhiteSpace($UserId)) {
     $importArgs += "--userId=$UserId"
@@ -1229,6 +1707,7 @@ foreach ($plannedImport in $preflight.PlannedImports) {
 
   $importedCount += 1
   Write-Step "IMPORT" "$($plannedImport.File) imported into live n8n."
+  if ($SingleWorkflowMode) { Assert-BoundedImportedWorkflow $plannedImport; Save-BoundedCreationReceipt $plannedImport }
   if ($plannedImport.UpdatesArchivedWorkflow) {
     Write-Step "ARCHIVE" "$($plannedImport.File) updated an archived live workflow. Unarchive it in n8n if you want it active/usable."
   }
