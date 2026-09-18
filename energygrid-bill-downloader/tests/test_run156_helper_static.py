@@ -4207,7 +4207,1238 @@ $results | ConvertTo-Json -Compress -Depth 4
                 with self.subTest(json_case=name):
                     self.assertEqual(results[name]["kind"], "null")
 
+    def test_hosted_processstartinfo_topology_separation_g2_281(self):
+        """Run the frozen three-route, three-subject, two-case evidence matrix."""
 
+        expected_helper_blob = "0b445fd26837081272502827291ec73fa19d0782"
+        expected_workflow_blob = "cc19fe12d9c5006740b5ca2c1fae6f4e73cd6d86"
+        workflow = REPO_ROOT / ".github" / "workflows" / "energygrid-bill-downloader-tests.yml"
+
+        def blob_sha(path):
+            payload = path.read_bytes().replace(b"\r\n", b"\n")
+            header = f"blob {len(payload)}\0".encode("ascii")
+            return hashlib.sha1(header + payload).hexdigest()
+
+        self.assertEqual(blob_sha(HELPER), expected_helper_blob)
+        self.assertEqual(blob_sha(workflow), expected_workflow_blob)
+
+        transport_source = self.source_function(
+            "function Invoke-R156Transport",
+            "function Test-R156PrivateBindingsOutsideCheckout",
+        )
+        for required_shape in (
+            "$encoded = ConvertTo-R156EncodedCommand -ScriptText $script:R156BootstrapScript",
+            "$startInfo.FileName = Join-Path $PSHOME 'powershell.exe'",
+            "$startInfo.Arguments = (",
+            "$startInfo.UseShellExecute = $false",
+            "$startInfo.RedirectStandardInput = $true",
+            "$startInfo.RedirectStandardOutput = $true",
+            "$startInfo.RedirectStandardError = $true",
+            "$startInfo.CreateNoWindow = $true",
+            "$process.StandardOutput.ReadToEndAsync()",
+            "$process.StandardError.ReadToEndAsync()",
+            "$process.StandardInput.Write($script:R156ChildScript)",
+            "$process.StandardInput.Flush()",
+            "$process.StandardInput.Close()",
+            "$process.WaitForExit()",
+            "$process.Dispose()",
+        ):
+            self.assertIn(required_shape, transport_source)
+        self.assertEqual(transport_source.count("function Invoke-R156Transport"), 1)
+
+        powershell = shutil.which("powershell.exe")
+        if powershell is None:
+            print(
+                "R156_TOPOLOGY_V1|CLASSIFICATION=EXTERNAL_ENVIRONMENT_CONDITION"
+                "|REASON=POWERSHELL_UNAVAILABLE"
+            )
+            return
+        probe = subprocess.run(
+            [
+                powershell,
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "$PSVersionTable.PSEdition",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        if probe.returncode != 0 or probe.stdout.strip() != "Desktop":
+            print(
+                "R156_TOPOLOGY_V1|CLASSIFICATION=EXTERNAL_ENVIRONMENT_CONDITION"
+                "|REASON=POWERSHELL_DESKTOP_UNAVAILABLE"
+            )
+            return
+
+        calibration_marker = "R156|CALIBRATION|NO_RUNSPACE"
+        calibration_exit = 0x40012345
+        calibration_bootstrap = (
+            "Set-StrictMode -Version Latest\n"
+            "$ErrorActionPreference = 'Stop'\n"
+            "$null = [Console]::In.ReadToEnd()\n"
+            f"[Console]::Out.WriteLine('{calibration_marker}')\n"
+            "[Console]::Out.Flush()\n"
+            f"exit ([int32]0x{calibration_exit:08X})\n"
+        )
+
+        cases = {
+            "VALIDATE_CRLF": {
+                "mode": "VALIDATE_ONLY",
+                "child": "\r\n".join(
+                    [
+                        "$inner = [PowerShell]::Create()",
+                        "try { [void]$inner.AddScript('exit 31'); [void]$inner.Invoke() } finally { $inner.Dispose() }",
+                        "[Console]::Out.WriteLine('R156|BEGIN|VALIDATE_ONLY')",
+                        "[Console]::Out.WriteLine('R156|PACKET|{\"protocol\":\"xb-r156-child/v1\",\"mode\":\"VALIDATE_ONLY\",\"canonical_valid\":true,\"validation_status\":\"PASS\",\"validation_current\":\"FAIL\",\"real_status\":\"\",\"real_backups_remaining\":-1,\"real_success_shape\":false}')",
+                        "[Console]::Out.WriteLine('R156|END|VALIDATE_ONLY')",
+                    ]
+                )
+                + "\r\n",
+            },
+            "REAL_SEMANTIC_FAILURE": {
+                "mode": "REAL",
+                "child": "\r\n".join(
+                    (
+                        "[Console]::Out.WriteLine('R156|BEGIN|REAL')",
+                        "[Console]::Out.WriteLine('R156|DISPATCH|REAL')",
+                        "[Console]::Out.WriteLine('R156|PACKET|{\"protocol\":\"xb-r156-child/v1\",\"mode\":\"REAL\",\"canonical_valid\":true,\"validation_status\":\"\",\"validation_current\":\"\",\"real_status\":\"FAILED_PREFLIGHT\",\"real_backups_remaining\":1,\"real_success_shape\":false}')",
+                        "[Console]::Out.WriteLine('R156|END|REAL')",
+                        "",
+                    )
+                ),
+            },
+        }
+        self.assertEqual(
+            tuple(cases),
+            ("VALIDATE_CRLF", "REAL_SEMANTIC_FAILURE"),
+        )
+
+        functions = self.extracted_functions(
+            (
+                "Get-R156Properties",
+                "Test-R156ExactNameMultiset",
+                "Test-R156ExactPropertySet",
+                "ConvertTo-R156EncodedCommand",
+                "Get-R156ChildProtocol",
+                "Test-R156DispatchMarkerObserved",
+                "Invoke-R156Transport",
+            )
+        )
+
+        def replace_once(source, old, new):
+            self.assertEqual(source.count(old), 1)
+            return source.replace(old, new, 1)
+
+        diagnostic = replace_once(
+            self.bootstrap,
+            "$p=$null;$ok=$false;$d=$true;$a=$false;$x=$false;$v=$true;$n='Running','Stopping'",
+            "$sc=4;$pc=1;"
+            "$ir=0;$ie=0;$cr=0;$rn=1;$as=0;$iv=0;$si=0;"
+            "$rp=0;$he=0;$en=0;$ad=0;$sa=0;$pa=0;$da=0;"
+            "$p=$null;$ok=$false;$d=$true;$a=$false;$x=$false;$v=$true;$n='Running','Stopping'",
+        )
+        diagnostic = replace_once(
+            diagnostic,
+            "$s=[Console]::In.ReadToEnd()",
+            "$s=[Console]::In.ReadToEnd();$ir=1;$ie=[string]::IsNullOrEmpty($s)",
+        )
+        diagnostic = replace_once(
+            diagnostic,
+            "        $p=[PowerShell]::Create([System.Management.Automation.RunspaceMode]::NewRunspace)",
+            "        $p=[PowerShell]::Create([System.Management.Automation.RunspaceMode]::NewRunspace);$cr=1",
+        )
+        diagnostic = replace_once(
+            diagnostic,
+            "        if($null -ne $p -and $null -ne $p.Runspace){\n            $d=$false;",
+            "        if($null -ne $p -and $null -ne $p.Runspace){\n"
+            "            $rn=0\n"
+            "            $d=$false;",
+        )
+        diagnostic = replace_once(
+            diagnostic,
+            "$d=$false;$null=$p.AddScript($s);$a=$true",
+            "$d=$false;$null=$p.AddScript($s);$as=1;$a=$true",
+        )
+        diagnostic = replace_once(
+            diagnostic,
+            "            try{$null=$p.Invoke()}catch{$x=$true}",
+            "            try{$null=$p.Invoke();$iv=1}catch{$x=$true}",
+        )
+        diagnostic = replace_once(
+            diagnostic,
+            "            $i=$p.InvocationStateInfo;$q=[string]$i.State;$r=$i.Reason;$h=[bool]$p.HadErrors;$e=@($p.Streams.Error).Count",
+            "            $i=$p.InvocationStateInfo;$si=1;$q=[string]$i.State;"
+            "$r=$i.Reason;$h=[bool]$p.HadErrors;$e=@($p.Streams.Error).Count;"
+            "$rp=$null -ne $r;$he=$h;$en=$e -ne 0;",
+        )
+        diagnostic = replace_once(
+            diagnostic,
+            "            if($q -in $n){\n                try{$p.Stop();$z=[string]$p.InvocationStateInfo.State;$v=$z -notin $n}catch{$v=$false}\n            }",
+            "            $ad=$q -in $n\n"
+            "            if($q -in $n){\n"
+            "                $sa=1\n"
+            "                try{$p.Stop();$z=[string]$p.InvocationStateInfo.State;"
+            "$pa=$z -in $n;$v=$z -notin $n}"
+            "catch{$v=$false}\n            }",
+        )
+        diagnostic = replace_once(
+            diagnostic,
+            "        }\n    }\n}catch{$ok=$false}",
+            "        }\n"
+            "    }\n}catch{$ok=$false}",
+        )
+        diagnostic = replace_once(
+            diagnostic,
+            "finally{if($null -ne $p){try{$p.Dispose();$d=$true}catch{$d=$false}}}",
+            "finally{if($null -ne $p){$da=1;"
+            "try{$p.Dispose();$d=$true}"
+            "catch{$d=$false}}}",
+        )
+        diagnostic = replace_once(
+            diagnostic,
+            "if($ok -and $d){\n    exit 0\n}\nexit 1",
+            "$w=[int32]0x40000000;$w=$w-bor((([int]$sc)-band 15)-shl 4);"
+            "$w=$w-bor((([int]$pc)-band 15)-shl 8);"
+            "$o=@($ir,$ie,$cr,$rn,$as,$iv,$x,$si,$rp,$he,$en,$ad,$sa,$v,$pa,$da,$d,$ok);"
+            "for($i=0;$i-lt 18;$i++){$w=$w-bor((([int]$o[$i])-band 1)-shl(12+$i))};exit $w",
+        )
+        self.assertIn(
+            "$ok=$a -and -not $x -and $q -eq 'Completed' -and $null -eq $r -and $e -eq 0 -and $q -notin $n -and $v",
+            diagnostic,
+        )
+        self.assertIn("$w=[int32]0x40000000;", diagnostic)
+        self.assertIn("$o=@(", diagnostic)
+        self.assertIn("$o[$i]", diagnostic)
+        self.assertNotIn("exit 0", diagnostic)
+        self.assertNotIn("exit 1", diagnostic)
+
+        command_lines = []
+        for bootstrap in (calibration_bootstrap, self.bootstrap, diagnostic):
+            encoded = base64.b64encode(bootstrap.encode("utf-16-le")).decode("ascii")
+            command = [
+                "powershell.exe",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-EncodedCommand",
+                encoded,
+            ]
+            command_lines.append(subprocess.list2cmdline(command))
+            self.assertLess(len(command_lines[-1]), 4096)
+            self.assertLess(len(command_lines[-1]), 32767)
+
+        failure_stage_labels = (
+            "NONE",
+            "INPUT_READ",
+            "CREATE",
+            "RUNSPACE_ACCESS",
+            "ADDSCRIPT",
+            "INVOKE",
+            "STATEINFO",
+            "STATE",
+            "REASON",
+            "HADERRORS",
+            "ERRORSTREAM",
+            "STOP",
+            "POST_STOP",
+            "DISPOSE",
+            "FINAL_ENCODE",
+            "RESERVED",
+        )
+        state_labels = (
+            "Unavailable",
+            "NotStarted",
+            "Running",
+            "Stopping",
+            "Completed",
+            "Failed",
+            "Stopped",
+            "Disconnected",
+            "Other",
+        )
+        observation_names = (
+            "input_read_ok",
+            "input_empty",
+            "create_ok",
+            "runspace_null",
+            "addscript_ok",
+            "invoke_returned",
+            "invoke_throw",
+            "stateinfo_ok",
+            "reason_present",
+            "had_errors",
+            "error_nonzero",
+            "active_detected",
+            "stop_attempted",
+            "stop_ok",
+            "post_stop_active",
+            "dispose_attempted",
+            "dispose_ok",
+            "predicate_ok",
+        )
+
+        def decode_forensic_exit(exit_code):
+            try:
+                word = int(exit_code)
+            except (TypeError, ValueError):
+                return None
+            if not (0x40000000 <= word < 0x80000000):
+                return None
+            if ((word >> 30) & 1) != 1:
+                return None
+            fail_stage = word & 0xF
+            state = (word >> 4) & 0xF
+            post_stop_state = (word >> 8) & 0xF
+            if (
+                fail_stage >= len(failure_stage_labels)
+                or state >= len(state_labels)
+                or post_stop_state >= len(state_labels)
+            ):
+                return None
+            values = {
+                name: bool((word >> (12 + index)) & 1)
+                for index, name in enumerate(observation_names)
+            }
+            encoded = 0x40000000 | fail_stage | (state << 4) | (post_stop_state << 8)
+            for index, name in enumerate(observation_names):
+                encoded |= int(values[name]) << (12 + index)
+            candidate_expected = (
+                values["addscript_ok"]
+                and values["invoke_returned"]
+                and not values["invoke_throw"]
+                and state_labels[state] == "Completed"
+                and not values["reason_present"]
+                and not values["error_nonzero"]
+                and not values["active_detected"]
+                and values["stop_ok"]
+            )
+            final_ok = values["predicate_ok"] and values["dispose_ok"]
+            values.update(
+                {
+                    "observer_result": "VALID",
+                    "exit_class": "VALID_FORENSIC",
+                    "fail_stage": failure_stage_labels[fail_stage],
+                    "state": state_labels[state],
+                    "post_stop_state": state_labels[post_stop_state],
+                    "error_count": "NONZERO" if values["error_nonzero"] else "ZERO",
+                    "final_ok": final_ok,
+                    "observation_consistent": (
+                        encoded == word
+                        and values["predicate_ok"] == candidate_expected
+                        and final_ok == (values["predicate_ok"] and values["dispose_ok"])
+                    ),
+                }
+            )
+            return values
+
+        observer_decoder_ps = r"""
+function Get-R156ForensicObservation {
+    param([Parameter(Mandatory)][int64]$Word)
+
+    $failureStages = @(
+        'NONE', 'INPUT_READ', 'CREATE', 'RUNSPACE_ACCESS', 'ADDSCRIPT',
+        'INVOKE', 'STATEINFO', 'STATE', 'REASON', 'HADERRORS',
+        'ERRORSTREAM', 'STOP', 'POST_STOP', 'DISPOSE', 'FINAL_ENCODE',
+        'RESERVED'
+    )
+    $states = @(
+        'Unavailable', 'NotStarted', 'Running', 'Stopping', 'Completed',
+        'Failed', 'Stopped', 'Disconnected', 'Other'
+    )
+    $names = @(
+        'input_read_ok', 'input_empty', 'create_ok', 'runspace_null',
+        'addscript_ok', 'invoke_returned', 'invoke_throw', 'stateinfo_ok',
+        'reason_present', 'had_errors', 'error_nonzero', 'active_detected',
+        'stop_attempted', 'stop_ok', 'post_stop_active',
+        'dispose_attempted', 'dispose_ok', 'predicate_ok'
+    )
+    if ($Word -lt [int64]0x40000000 -or $Word -ge [int64]0x80000000) {
+        return $null
+    }
+    if ((($Word -shr 30) -band 1) -ne 1) {
+        return $null
+    }
+    $failStage = [int]($Word -band 15)
+    $state = [int](($Word -shr 4) -band 15)
+    $postStopState = [int](($Word -shr 8) -band 15)
+    if ($failStage -ge $failureStages.Count -or
+        $state -ge $states.Count -or
+        $postStopState -ge $states.Count) {
+        return $null
+    }
+    $values = @{}
+    for ($index = 0; $index -lt $names.Count; $index++) {
+        $values[$names[$index]] = ((($Word -shr (12 + $index)) -band 1) -eq 1)
+    }
+    $encoded = [int64]0x40000000
+    $encoded = $encoded -bor $failStage
+    $encoded = $encoded -bor ($state -shl 4)
+    $encoded = $encoded -bor ($postStopState -shl 8)
+    for ($index = 0; $index -lt $names.Count; $index++) {
+        if ([bool]$values[$names[$index]]) {
+            $encoded = $encoded -bor ([int64]1 -shl (12 + $index))
+        }
+    }
+    $candidateExpected = (
+        [bool]$values['addscript_ok'] -and
+        [bool]$values['invoke_returned'] -and
+        -not [bool]$values['invoke_throw'] -and
+        $states[$state] -ceq 'Completed' -and
+        -not [bool]$values['reason_present'] -and
+        -not [bool]$values['error_nonzero'] -and
+        -not [bool]$values['active_detected'] -and
+        [bool]$values['stop_ok']
+    )
+    $finalOk = [bool]$values['predicate_ok'] -and [bool]$values['dispose_ok']
+    $consistent = (
+        $encoded -eq $Word -and
+        [bool]$values['predicate_ok'] -eq [bool]$candidateExpected -and
+        [bool]$finalOk -eq ([bool]$values['predicate_ok'] -and [bool]$values['dispose_ok'])
+    )
+    return [pscustomobject]@{
+        observer_result = 'VALID'
+        fail_stage = $failureStages[$failStage]
+        state = $states[$state]
+        post_stop_state = $states[$postStopState]
+        input_read_ok = [bool]$values['input_read_ok']
+        input_empty = [bool]$values['input_empty']
+        create_ok = [bool]$values['create_ok']
+        runspace_null = [bool]$values['runspace_null']
+        addscript_ok = [bool]$values['addscript_ok']
+        invoke_returned = [bool]$values['invoke_returned']
+        invoke_throw = [bool]$values['invoke_throw']
+        stateinfo_ok = [bool]$values['stateinfo_ok']
+        reason_present = [bool]$values['reason_present']
+        had_errors = [bool]$values['had_errors']
+        error_nonzero = [bool]$values['error_nonzero']
+        error_count = if ([bool]$values['error_nonzero']) { 'NONZERO' } else { 'ZERO' }
+        active_detected = [bool]$values['active_detected']
+        stop_attempted = [bool]$values['stop_attempted']
+        stop_ok = [bool]$values['stop_ok']
+        post_stop_active = [bool]$values['post_stop_active']
+        dispose_attempted = [bool]$values['dispose_attempted']
+        dispose_ok = [bool]$values['dispose_ok']
+        predicate_ok = [bool]$values['predicate_ok']
+        final_ok = [bool]$finalOk
+        observation_consistent = [bool]$consistent
+    }
+}
+"""
+
+        def shaped_environment(mode, extra=None):
+            environment = os.environ.copy()
+            for key in tuple(environment):
+                if key.upper().startswith("GIT_"):
+                    environment.pop(key, None)
+            environment.update(
+                {
+                    "EG_R156_MODE": mode,
+                    "EG_R156_CHECKOUT_ROOT": r"C:\r156-topology-checkout",
+                    "EG_R156_INSTALLER_PATH": r"C:\r156-topology-installer.ps1",
+                    "EG_R156_LAUNCHER_ROOT": r"C:\r156-topology-launcher",
+                    "EG_R156_ADMISSION_COMMIT": "1111111111111111111111111111111111111111",
+                }
+            )
+            if extra:
+                environment.update(extra)
+            return environment
+
+        creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+        working_directory = str(Path.cwd())
+
+        def parse_closed_json(output):
+            lines = [line.strip() for line in output.splitlines() if line.strip()]
+            if len(lines) != 1:
+                return {
+                    "cell_status": "UNRESOLVED",
+                    "failure_class": "NO_CLOSED_RECORD",
+                }
+            try:
+                record = json.loads(lines[0])
+            except (TypeError, ValueError):
+                return {
+                    "cell_status": "UNRESOLVED",
+                    "failure_class": "INVALID_CLOSED_RECORD",
+                }
+            if not isinstance(record, dict):
+                return {
+                    "cell_status": "UNRESOLVED",
+                    "failure_class": "INVALID_CLOSED_RECORD",
+                }
+            return record
+
+        def direct_record(subject, mode, bootstrap, child):
+            encoded = base64.b64encode(bootstrap.encode("utf-16-le")).decode("ascii")
+            arguments = [
+                powershell,
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-EncodedCommand",
+                encoded,
+            ]
+            environment = shaped_environment(mode)
+            process = None
+            try:
+                process = subprocess.Popen(
+                    arguments,
+                    cwd=working_directory,
+                    env=environment,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding="utf-8",
+                    errors="strict",
+                    creationflags=creation_flags,
+                )
+                stdout, stderr = process.communicate(child, timeout=120)
+            except subprocess.TimeoutExpired:
+                if process is not None:
+                    process.kill()
+                    process.communicate()
+                return {
+                    "cell_status": "UNRESOLVED",
+                    "failure_class": "TIMEOUT",
+                }
+            except (OSError, ValueError):
+                return {
+                    "cell_status": "UNRESOLVED",
+                    "failure_class": "PROCESS_START_FAILURE",
+                }
+            finally:
+                if process is not None:
+                    for stream in (process.stdin, process.stdout, process.stderr):
+                        if stream is not None:
+                            try:
+                                stream.close()
+                            except OSError:
+                                pass
+            record = {
+                "cell_status": "OBSERVED",
+                "started": True,
+                "supervisor_complete": True,
+                "exit_class": "ZERO" if process.returncode == 0 else "NONZERO",
+                "stdout_class": "EMPTY" if stdout == "" else "NONEMPTY",
+                "stderr_class": "EMPTY" if stderr == "" else "NONEMPTY",
+            }
+            if subject == "NO_RUNSPACE_CALIBRATION":
+                record["calibration_result"] = (
+                    "PASS"
+                    if process.returncode == calibration_exit
+                    and stdout.splitlines() == [calibration_marker]
+                    and stderr == ""
+                    else "FAIL"
+                )
+            elif subject == "SYMMETRIC_OBSERVER":
+                observation = decode_forensic_exit(process.returncode)
+                if observation is None:
+                    record["observer_result"] = "INVALID"
+                else:
+                    record.update(observation)
+            else:
+                record["candidate_result"] = (
+                    "ZERO" if process.returncode == 0 else "NONZERO"
+                )
+                record["protocol"] = "NOT_EVALUATED"
+                record["real_accounting"] = "NOT_EVALUATED"
+            return record
+
+        raw_psi_launcher = (
+            r"""
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+"""
+            + observer_decoder_ps
+            + r"""
+
+$mode = [string]$env:R156_TOPOLOGY_MODE
+$subject = [string]$env:R156_TOPOLOGY_SUBJECT
+$started = $false
+$supervisorComplete = $false
+$exitCode = [int64]-1
+$stdout = ''
+$stderr = ''
+$process = $null
+
+try {
+    $bootstrap = [System.Text.Encoding]::UTF8.GetString(
+        [Convert]::FromBase64String([string]$env:R156_TOPOLOGY_BOOTSTRAP_B64)
+    )
+    $child = [System.Text.Encoding]::UTF8.GetString(
+        [Convert]::FromBase64String([string]$env:R156_TOPOLOGY_CHILD_B64)
+    )
+    $unicode = New-Object System.Text.UnicodeEncoding($false, $true)
+    $encoded = [Convert]::ToBase64String($unicode.GetBytes($bootstrap))
+    $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $startInfo.FileName = Join-Path $PSHOME 'powershell.exe'
+    $startInfo.Arguments = (
+        '-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand ' + $encoded
+    )
+    $startInfo.UseShellExecute = $false
+    $startInfo.RedirectStandardInput = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $startInfo.CreateNoWindow = $true
+    $inheritedGitNames = @($startInfo.EnvironmentVariables.Keys |
+        Where-Object { ([string]$_) -like 'GIT_*' })
+    foreach ($name in $inheritedGitNames) {
+        [void]$startInfo.EnvironmentVariables.Remove([string]$name)
+    }
+    $testOnlyNames = @($startInfo.EnvironmentVariables.Keys |
+        Where-Object { ([string]$_) -like 'R156_TOPOLOGY_*' })
+    foreach ($name in $testOnlyNames) {
+        [void]$startInfo.EnvironmentVariables.Remove([string]$name)
+    }
+    $startInfo.EnvironmentVariables['EG_R156_MODE'] = $mode
+    $startInfo.EnvironmentVariables['EG_R156_CHECKOUT_ROOT'] = 'C:\r156-topology-checkout'
+    $startInfo.EnvironmentVariables['EG_R156_INSTALLER_PATH'] = 'C:\r156-topology-installer.ps1'
+    $startInfo.EnvironmentVariables['EG_R156_LAUNCHER_ROOT'] = 'C:\r156-topology-launcher'
+    $startInfo.EnvironmentVariables['EG_R156_ADMISSION_COMMIT'] = '1111111111111111111111111111111111111111'
+
+    $process = New-Object System.Diagnostics.Process
+    $process.StartInfo = $startInfo
+    $started = [bool]$process.Start()
+    if ($started) {
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        $process.StandardInput.Write($child)
+        $process.StandardInput.Flush()
+        $process.StandardInput.Close()
+        $process.WaitForExit()
+        $stdout = [string]$stdoutTask.Result
+        $stderr = [string]$stderrTask.Result
+        $exitCode = [int64]$process.ExitCode
+        $supervisorComplete = $true
+    }
+}
+catch {
+    $supervisorComplete = $false
+}
+finally {
+    if ($null -ne $process) {
+        if ($started) {
+            try {
+                if (-not $process.HasExited) {
+                    $process.Kill()
+                    $process.WaitForExit()
+                }
+            }
+            catch {
+                $supervisorComplete = $false
+            }
+            try { $process.StandardInput.Dispose() } catch {}
+        }
+        $process.Dispose()
+    }
+}
+
+$exitClass = 'UNAVAILABLE'
+if ($started -and $supervisorComplete) {
+    if ($exitCode -eq 0) {
+        $exitClass = 'ZERO'
+    }
+    else {
+        $exitClass = 'NONZERO'
+    }
+}
+$stdoutClass = if ([string]::IsNullOrEmpty($stdout)) { 'EMPTY' } else { 'NONEMPTY' }
+$stderrClass = if ([string]::IsNullOrEmpty($stderr)) { 'EMPTY' } else { 'NONEMPTY' }
+$record = [ordered]@{
+    cell_status = if ($started -and $supervisorComplete) { 'OBSERVED' } else { 'UNRESOLVED' }
+    failure_class = if ($started -and $supervisorComplete) { '' } else { 'RAW_PSI_FAILURE' }
+    started = [bool]$started
+    supervisor_complete = [bool]$supervisorComplete
+    exit_class = $exitClass
+    stdout_class = $stdoutClass
+    stderr_class = $stderrClass
+}
+if ($subject -ceq 'NO_RUNSPACE_CALIBRATION') {
+    $markerLines = @()
+    if (-not [string]::IsNullOrEmpty($stdout)) {
+        $markerLines = @($stdout -split '\r?\n' | Where-Object { $_ -ne '' })
+    }
+    $record['calibration_result'] = if (
+        $started -and $supervisorComplete -and
+        $exitCode -eq [int64]0x40012345 -and
+        $markerLines.Count -eq 1 -and
+        $markerLines[0] -ceq 'R156|CALIBRATION|NO_RUNSPACE' -and
+        [string]::IsNullOrEmpty($stderr)
+    ) { 'PASS' } else { 'FAIL' }
+}
+elseif ($subject -ceq 'SYMMETRIC_OBSERVER') {
+        if (-not ($started -and $supervisorComplete)) {
+            $record['observer_result'] = 'INVALID'
+        }
+        else {
+            $observation = Get-R156ForensicObservation -Word $exitCode
+            if ($null -eq $observation) {
+                $record['observer_result'] = 'INVALID'
+            }
+        else {
+            foreach ($property in $observation.PSObject.Properties) {
+                $record[$property.Name] = $property.Value
+            }
+        }
+    }
+}
+else {
+    $record['candidate_result'] = if ($exitCode -eq 0) { 'ZERO' } else { 'NONZERO' }
+    $record['protocol'] = 'NOT_EVALUATED'
+    $record['real_accounting'] = 'NOT_EVALUATED'
+}
+$record | ConvertTo-Json -Compress
+"""
+        )
+
+        def raw_psi_record(subject, mode, bootstrap, child):
+            encoded_bootstrap = base64.b64encode(bootstrap.encode("utf-8")).decode("ascii")
+            encoded_child = base64.b64encode(child.encode("utf-8")).decode("ascii")
+            with tempfile.TemporaryDirectory(prefix="r156_topology_raw_") as directory:
+                harness = Path(directory) / "raw_psi_launcher.ps1"
+                harness.write_text(raw_psi_launcher, encoding="utf-8")
+                result = subprocess.run(
+                    [
+                        powershell,
+                        "-NoProfile",
+                        "-NonInteractive",
+                        "-ExecutionPolicy",
+                        "Bypass",
+                        "-File",
+                        str(harness),
+                    ],
+                    cwd=working_directory,
+                    env=shaped_environment(
+                        mode,
+                        {
+                            "R156_TOPOLOGY_MODE": mode,
+                            "R156_TOPOLOGY_SUBJECT": subject,
+                            "R156_TOPOLOGY_BOOTSTRAP_B64": encoded_bootstrap,
+                            "R156_TOPOLOGY_CHILD_B64": encoded_child,
+                        },
+                    ),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                    timeout=150,
+                    check=False,
+                    creationflags=creation_flags,
+                )
+            if result.returncode != 0:
+                return {
+                    "cell_status": "UNRESOLVED",
+                    "failure_class": "RAW_PSI_LAUNCHER_FAILURE",
+                }
+            return parse_closed_json(result.stdout)
+
+        def production_transport_record(subject, mode, bootstrap, child):
+            script = (
+                "$ErrorActionPreference = 'Stop'\n"
+                "$script:R156BootstrapScript = @'\n"
+                + bootstrap
+                + "\n'@\n"
+                "$script:R156ChildScript = [Environment]::GetEnvironmentVariable('R156_TOPOLOGY_CHILD')\n"
+                "$script:R156RealStarted = $false\n"
+                "$script:R156RealInstallerInvocations = 0\n"
+                "$script:R156AuthorityConsumed = 'NO'\n"
+                "$script:R156PackageMutation = 'NONE'\n"
+                + observer_decoder_ps
+                + functions
+                + r"""
+$mode = [Environment]::GetEnvironmentVariable('R156_TOPOLOGY_MODE')
+$subject = [Environment]::GetEnvironmentVariable('R156_TOPOLOGY_SUBJECT')
+$record = [ordered]@{}
+try {
+    $result = Invoke-R156Transport -Mode $mode -CheckoutRoot 'C:\r156-topology-checkout' -InstallerPath 'C:\r156-topology-installer.ps1' -LauncherRoot 'C:\r156-topology-launcher' -AdmissionCommit '1111111111111111111111111111111111111111'
+    $exitCode = [int64]$result.ChildExitCode
+    $packetPresent = $null -ne $result.Packet
+    $record['cell_status'] = if ([bool]$result.Started -and [bool]$result.SupervisorComplete) { 'OBSERVED' } else { 'UNRESOLVED' }
+    $record['failure_class'] = if ($record['cell_status'] -ceq 'OBSERVED') { '' } else { 'PRODUCTION_TRANSPORT_FAILURE' }
+    $record['started'] = [bool]$result.Started
+    $record['supervisor_complete'] = [bool]$result.SupervisorComplete
+    $record['exit_class'] = if ($exitCode -eq 0) { 'ZERO' } else { 'NONZERO' }
+    $record['stdout_class'] = 'NOT_RETURNED'
+    $record['stderr_class'] = if ($packetPresent) { 'EMPTY' } else { 'NOT_RETURNED' }
+    $record['packet_class'] = if ($packetPresent) { 'PRESENT' } else { 'ABSENT' }
+    if ($subject -ceq 'NO_RUNSPACE_CALIBRATION') {
+        $record['calibration_result'] = if ($exitCode -eq [int64]0x40012345) { 'PASS' } else { 'FAIL' }
+    }
+    elseif ($subject -ceq 'SYMMETRIC_OBSERVER') {
+        $observation = Get-R156ForensicObservation -Word $exitCode
+        if ($null -eq $observation) {
+            $record['observer_result'] = 'INVALID'
+        }
+        else {
+            foreach ($property in $observation.PSObject.Properties) {
+                $record[$property.Name] = $property.Value
+            }
+        }
+        $record['protocol'] = if ($packetPresent) { 'VALID' } else { 'INVALID_OR_ABSENT' }
+    }
+    else {
+        $record['candidate_result'] = if ($exitCode -eq 0) { 'ZERO' } else { 'NONZERO' }
+        $record['protocol'] = if ($packetPresent) { 'VALID' } else { 'INVALID_OR_ABSENT' }
+    }
+    if ($mode -ceq 'REAL') {
+        $record['real_accounting'] = if (
+            [bool]$script:R156RealStarted -and
+            [int]$script:R156RealInstallerInvocations -eq 1 -and
+            [string]$script:R156AuthorityConsumed -ceq 'YES'
+        ) { 'ACCOUNTED_ONCE' } else { 'ACCOUNTING_INCONSISTENT' }
+        $record['real_package_mutation'] = [string]$script:R156PackageMutation
+    }
+    else {
+        $record['real_accounting'] = 'NOT_APPLICABLE'
+        $record['real_package_mutation'] = 'NOT_APPLICABLE'
+    }
+}
+catch {
+    $record = [ordered]@{
+        cell_status = 'UNRESOLVED'
+        failure_class = 'PRODUCTION_TRANSPORT_FAILURE'
+        started = $false
+        supervisor_complete = $false
+        exit_class = 'UNAVAILABLE'
+        stdout_class = 'NOT_RETURNED'
+        stderr_class = 'NOT_RETURNED'
+        packet_class = 'NOT_RETURNED'
+    }
+}
+$record | ConvertTo-Json -Compress
+"""
+            )
+            with tempfile.TemporaryDirectory(prefix="r156_topology_transport_") as directory:
+                harness = Path(directory) / "production_transport.ps1"
+                harness.write_text(script, encoding="utf-8")
+                result = subprocess.run(
+                    [
+                        powershell,
+                        "-NoProfile",
+                        "-NonInteractive",
+                        "-ExecutionPolicy",
+                        "Bypass",
+                        "-File",
+                        str(harness),
+                    ],
+                    cwd=working_directory,
+                    env=shaped_environment(
+                        mode,
+                        {
+                            "R156_TOPOLOGY_MODE": mode,
+                            "R156_TOPOLOGY_SUBJECT": subject,
+                            "R156_TOPOLOGY_CHILD": child,
+                        },
+                    ),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                    timeout=150,
+                    check=False,
+                    creationflags=creation_flags,
+                )
+            if result.returncode != 0:
+                return {
+                    "cell_status": "UNRESOLVED",
+                    "failure_class": "PRODUCTION_TRANSPORT_HARNESS_FAILURE",
+                }
+            return parse_closed_json(result.stdout)
+
+        def unresolved_record(failure_class):
+            return {
+                "cell_status": "UNRESOLVED",
+                "failure_class": failure_class,
+            }
+
+        def run_cell(route, subject, case):
+            bootstrap = {
+                "NO_RUNSPACE_CALIBRATION": calibration_bootstrap,
+                "SYMMETRIC_OBSERVER": diagnostic,
+                "EXACT_CANDIDATE": self.bootstrap,
+            }[subject]
+            try:
+                if route == "MATCHED_DIRECT":
+                    return direct_record(subject, case["mode"], bootstrap, case["child"])
+                if route == "RAW_PSI":
+                    return raw_psi_record(subject, case["mode"], bootstrap, case["child"])
+                return production_transport_record(
+                    subject,
+                    case["mode"],
+                    bootstrap,
+                    case["child"],
+                )
+            except subprocess.TimeoutExpired:
+                return unresolved_record("TIMEOUT")
+            except (OSError, TypeError, ValueError):
+                return unresolved_record("HARNESS_ERROR")
+
+        round_trip = {}
+        for route in ("MATCHED_DIRECT", "RAW_PSI", "PRODUCTION_TRANSPORT"):
+            try:
+                if route == "MATCHED_DIRECT":
+                    record = direct_record(
+                        "NO_RUNSPACE_CALIBRATION",
+                        "VALIDATE_ONLY",
+                        calibration_bootstrap,
+                        "",
+                    )
+                elif route == "RAW_PSI":
+                    record = raw_psi_record(
+                        "NO_RUNSPACE_CALIBRATION",
+                        "VALIDATE_ONLY",
+                        calibration_bootstrap,
+                        "",
+                    )
+                else:
+                    record = production_transport_record(
+                        "NO_RUNSPACE_CALIBRATION",
+                        "VALIDATE_ONLY",
+                        calibration_bootstrap,
+                        "",
+                    )
+            except (OSError, TypeError, ValueError, subprocess.TimeoutExpired):
+                record = unresolved_record("ROUND_TRIP_ERROR")
+            round_trip[route] = record
+            result = (
+                "PASS"
+                if record.get("cell_status") == "OBSERVED"
+                and record.get("calibration_result") == "PASS"
+                else "FAIL"
+            )
+            print(
+                "R156_TOPOLOGY_V1|ROUND_TRIP|ROUTE="
+                + route
+                + "|RESULT="
+                + result
+            )
+
+        matrix = {}
+        for case_name, case in cases.items():
+            for subject in (
+                "NO_RUNSPACE_CALIBRATION",
+                "SYMMETRIC_OBSERVER",
+                "EXACT_CANDIDATE",
+            ):
+                for route in (
+                    "MATCHED_DIRECT",
+                    "RAW_PSI",
+                    "PRODUCTION_TRANSPORT",
+                ):
+                    matrix[(route, subject, case_name)] = run_cell(
+                        route,
+                        subject,
+                        case,
+                    )
+
+        def public_value(record, key):
+            value = record.get(key, "UNAVAILABLE")
+            if isinstance(value, bool):
+                return "TRUE" if value else "FALSE"
+            if value is None or value == "":
+                return "UNAVAILABLE"
+            value = str(value)
+            if re.fullmatch(r"[A-Za-z0-9_]+", value) is None:
+                return "INVALID_CLOSED_VALUE"
+            return value
+
+        def emit_cell(route, subject, case_name, record):
+            fields = [
+                ("CASE", case_name),
+                ("ROUTE", route),
+                ("SUBJECT", subject),
+                ("CELL", public_value(record, "cell_status")),
+                ("STARTED", public_value(record, "started")),
+                ("SUPERVISOR_COMPLETE", public_value(record, "supervisor_complete")),
+                ("EXIT_CLASS", public_value(record, "exit_class")),
+                ("STDOUT", public_value(record, "stdout_class")),
+                ("STDERR", public_value(record, "stderr_class")),
+            ]
+            if subject == "NO_RUNSPACE_CALIBRATION":
+                fields.append(("CALIBRATION", public_value(record, "calibration_result")))
+            elif subject == "SYMMETRIC_OBSERVER":
+                for key in (
+                    "observer_result",
+                    "fail_stage",
+                    "input_read_ok",
+                    "input_empty",
+                    "create_ok",
+                    "runspace_null",
+                    "addscript_ok",
+                    "invoke_returned",
+                    "invoke_throw",
+                    "state",
+                    "reason_present",
+                    "had_errors",
+                    "error_count",
+                    "active_detected",
+                    "stop_attempted",
+                    "stop_ok",
+                    "post_stop_state",
+                    "post_stop_active",
+                    "dispose_attempted",
+                    "dispose_ok",
+                    "predicate_ok",
+                    "final_ok",
+                    "observation_consistent",
+                ):
+                    fields.append((key.upper(), public_value(record, key)))
+            else:
+                for key in (
+                    "candidate_result",
+                    "protocol",
+                    "real_accounting",
+                    "real_package_mutation",
+                ):
+                    fields.append((key.upper(), public_value(record, key)))
+            failure = public_value(record, "failure_class")
+            if failure != "UNAVAILABLE":
+                fields.append(("FAILURE", failure))
+            print(
+                "R156_TOPOLOGY_V1|"
+                + "|".join(
+                    f"{key}={public_value({'value': value}, 'value')}"
+                    for key, value in fields
+                )
+            )
+
+        for (route, subject, case_name), record in matrix.items():
+            emit_cell(route, subject, case_name, record)
+            for value in record.values():
+                if isinstance(value, str):
+                    self.assertNotIn("R156_PRIVATE", value)
+                    self.assertNotIn("password", value.lower())
+                    self.assertNotIn("token", value.lower())
+
+        def observed(record):
+            return record.get("cell_status") == "OBSERVED"
+
+        def observer_signature(record):
+            if (
+                not observed(record)
+                or record.get("observer_result") != "VALID"
+                or not record.get("observation_consistent", False)
+            ):
+                return None
+            return tuple(
+                record.get(key)
+                for key in (
+                    "fail_stage",
+                    "state",
+                    "post_stop_state",
+                    *observation_names,
+                    "error_count",
+                    "final_ok",
+                    "observation_consistent",
+                )
+            )
+
+        def route_subject(case_name, route, subject):
+            return matrix[(route, subject, case_name)]
+
+        case_effects = {}
+        for case_name in cases:
+            direct_calibration = route_subject(
+                case_name, "MATCHED_DIRECT", "NO_RUNSPACE_CALIBRATION"
+            )
+            raw_calibration = route_subject(
+                case_name, "RAW_PSI", "NO_RUNSPACE_CALIBRATION"
+            )
+            production_calibration = route_subject(
+                case_name, "PRODUCTION_TRANSPORT", "NO_RUNSPACE_CALIBRATION"
+            )
+            calibration_records = (
+                direct_calibration,
+                raw_calibration,
+                production_calibration,
+            )
+            calibration_complete = all(
+                observed(record) and record.get("calibration_result") == "PASS"
+                for record in calibration_records
+            )
+            calibration_agrees = (
+                observed(direct_calibration)
+                and observed(raw_calibration)
+                and direct_calibration.get("calibration_result")
+                == raw_calibration.get("calibration_result")
+            )
+            if not all(observed(record) for record in calibration_records):
+                psi_bootstrap_effect = "UNRESOLVED"
+            elif (
+                direct_calibration.get("calibration_result")
+                != raw_calibration.get("calibration_result")
+            ):
+                psi_bootstrap_effect = "YES"
+            else:
+                psi_bootstrap_effect = "NO"
+
+            observer_records = {
+                route: route_subject(case_name, route, "SYMMETRIC_OBSERVER")
+                for route in (
+                    "MATCHED_DIRECT",
+                    "RAW_PSI",
+                    "PRODUCTION_TRANSPORT",
+                )
+            }
+            signatures = {
+                route: observer_signature(record)
+                for route, record in observer_records.items()
+            }
+            if not calibration_agrees:
+                runspace_effect = "NOT_APPLICABLE"
+            elif any(signature is None for signature in signatures.values()):
+                runspace_effect = "UNRESOLVED"
+            elif signatures["MATCHED_DIRECT"] != signatures["RAW_PSI"]:
+                runspace_effect = "YES"
+            else:
+                runspace_effect = "NO"
+
+            candidate_complete = True
+            candidate_behavior = "NO"
+            for route in (
+                "MATCHED_DIRECT",
+                "RAW_PSI",
+                "PRODUCTION_TRANSPORT",
+            ):
+                observer = observer_records[route]
+                candidate = route_subject(case_name, route, "EXACT_CANDIDATE")
+                if (
+                    observer_signature(observer) is None
+                    or not observed(candidate)
+                    or candidate.get("candidate_result") not in {"ZERO", "NONZERO"}
+                ):
+                    candidate_complete = False
+                    continue
+                expected = "ZERO" if observer.get("final_ok") else "NONZERO"
+                if candidate.get("candidate_result") != expected:
+                    candidate_behavior = "FAIL"
+            if not candidate_complete:
+                candidate_behavior = "UNRESOLVED"
+
+            outer_complete = True
+            outer_effect = "NO"
+            for subject in (
+                "NO_RUNSPACE_CALIBRATION",
+                "SYMMETRIC_OBSERVER",
+                "EXACT_CANDIDATE",
+            ):
+                raw = route_subject(case_name, "RAW_PSI", subject)
+                production = route_subject(
+                    case_name, "PRODUCTION_TRANSPORT", subject
+                )
+                if not observed(raw) or not observed(production):
+                    outer_complete = False
+                    continue
+                if raw.get("exit_class") != production.get("exit_class"):
+                    outer_effect = "YES"
+                raw_stderr = raw.get("stderr_class")
+                production_stderr = production.get("stderr_class")
+                if raw_stderr not in {"EMPTY", "NONEMPTY"} or production_stderr not in {
+                    "EMPTY",
+                    "NONEMPTY",
+                }:
+                    outer_complete = False
+                elif raw_stderr != production_stderr:
+                    outer_effect = "YES"
+            if not outer_complete and outer_effect != "YES":
+                outer_effect = "UNRESOLVED"
+
+            case_effects[case_name] = {
+                "psi_bootstrap_effect": psi_bootstrap_effect,
+                "powershell_runspace_effect": runspace_effect,
+                "candidate_behavior": candidate_behavior,
+                "outer_transport_effect": outer_effect,
+                "calibration_complete": calibration_complete,
+                "matrix_complete": all(
+                    observed(route_subject(case_name, route, subject))
+                    for route in (
+                        "MATCHED_DIRECT",
+                        "RAW_PSI",
+                        "PRODUCTION_TRANSPORT",
+                    )
+                    for subject in (
+                        "NO_RUNSPACE_CALIBRATION",
+                        "SYMMETRIC_OBSERVER",
+                        "EXACT_CANDIDATE",
+                    )
+                ),
+            }
+            print(
+                "R156_TOPOLOGY_V1|ADJUDICATION|CASE="
+                + case_name
+                + "|PSI_BOOTSTRAP_EFFECT="
+                + case_effects[case_name]["psi_bootstrap_effect"]
+                + "|POWERSHELL_RUNSPACE_EFFECT="
+                + case_effects[case_name]["powershell_runspace_effect"]
+                + "|CANDIDATE_BEHAVIOR="
+                + case_effects[case_name]["candidate_behavior"]
+                + "|OUTER_TRANSPORT_EFFECT="
+                + case_effects[case_name]["outer_transport_effect"]
+            )
+
+        positive_layers = {
+            layer
+            for layer in (
+                "psi_bootstrap_effect",
+                "powershell_runspace_effect",
+                "candidate_behavior",
+                "outer_transport_effect",
+            )
+            if any(
+                effects[layer] in {"YES", "FAIL"}
+                for effects in case_effects.values()
+            )
+        }
+        complete = (
+            all(
+                round_trip[route].get("calibration_result") == "PASS"
+                for route in round_trip
+            )
+            and all(
+                effects["matrix_complete"]
+                and effects["calibration_complete"]
+                and all(
+                    effects[key] not in {"UNRESOLVED"}
+                    for key in (
+                        "psi_bootstrap_effect",
+                        "powershell_runspace_effect",
+                        "candidate_behavior",
+                        "outer_transport_effect",
+                    )
+                )
+                for effects in case_effects.values()
+            )
+        )
+        if not complete:
+            classification = "TOPOLOGY_ATTRIBUTION_UNRESOLVED"
+        elif len(positive_layers) > 1:
+            classification = "MULTI_LAYER_EFFECT_CONFIRMED"
+        elif "candidate_behavior" in positive_layers:
+            classification = "CANDIDATE_BEHAVIOR_DEFECT_CONFIRMED"
+        elif "powershell_runspace_effect" in positive_layers:
+            classification = "POWERSHELL_RUNSPACE_TOPOLOGY_EFFECT_CONFIRMED"
+        elif "psi_bootstrap_effect" in positive_layers:
+            classification = "PROCESSSTARTINFO_BOOTSTRAP_EFFECT_CONFIRMED"
+        elif "outer_transport_effect" in positive_layers:
+            classification = "OUTER_PRODUCTION_TRANSPORT_EFFECT_CONFIRMED"
+        else:
+            classification = "TOPOLOGY_ATTRIBUTION_UNRESOLVED"
+        self.assertEqual(len(matrix), 18)
+        self.assertEqual(set(case_effects), set(cases))
+        print(
+            "R156_TOPOLOGY_V1|CLASSIFICATION="
+            + classification
+            + "|MATRIX_CELLS="
+            + str(len(matrix))
+            + "|ROUND_TRIP_ROUTES="
+            + str(len(round_trip))
+            + "|POSITIVE_LAYERS="
+            + ("NONE" if not positive_layers else "_".join(sorted(positive_layers)))
+        )
 
 if __name__ == "__main__":
     unittest.main()
