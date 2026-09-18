@@ -16,9 +16,13 @@ on:
       - "scripts/ac2_member_gateway_worker.ps1"
       - "scripts/ac2_member_gateway_worker_lib.ps1"
       - "scripts/ac2_member_gateway_autocount_adapter.ps1"
+      - "scripts/install_ac2_member_gateway_worker.ps1"
+      - "scripts/launch_ac2_member_gateway_worker.ps1"
+      - "scripts/test_ac2_member_gateway_autocount_dependencies.ps1"
       - "tests/test_member_gateway_worker_static.py"
       - "tests/test_member_gateway_n8n.py"
       - "tests/test_member_gateway_ci.py"
+      - "tests/test_member_gateway_worker_deployment.py"
       - "tests/test_member_gateway_privacy.py"
       - "tests/test_member_gateway_adapter_ps.py"
       - "tests/test_member_gateway_worker_cycle_ps.py"
@@ -47,9 +51,13 @@ on:
       - "scripts/ac2_member_gateway_worker.ps1"
       - "scripts/ac2_member_gateway_worker_lib.ps1"
       - "scripts/ac2_member_gateway_autocount_adapter.ps1"
+      - "scripts/install_ac2_member_gateway_worker.ps1"
+      - "scripts/launch_ac2_member_gateway_worker.ps1"
+      - "scripts/test_ac2_member_gateway_autocount_dependencies.ps1"
       - "tests/test_member_gateway_worker_static.py"
       - "tests/test_member_gateway_n8n.py"
       - "tests/test_member_gateway_ci.py"
+      - "tests/test_member_gateway_worker_deployment.py"
       - "tests/test_member_gateway_privacy.py"
       - "tests/test_member_gateway_adapter_ps.py"
       - "tests/test_member_gateway_worker_cycle_ps.py"
@@ -123,6 +131,7 @@ jobs:
         shell: pwsh
         run: >-
           python -m unittest tests.test_member_gateway_worker_static
+          tests.test_member_gateway_worker_deployment
           tests.test_member_gateway_adapter_ps
           tests.test_member_gateway_worker_cycle_ps -v
 
