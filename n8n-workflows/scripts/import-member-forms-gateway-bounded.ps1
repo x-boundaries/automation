@@ -7,6 +7,7 @@ param(
     [string]$BindingManifestFile = "config/member_forms_gateway_bounded_import.v2.template.json",
     [string]$OperationsRoot = ".n8n-local/member-gateway-bounded-import/operations",
     [string]$N8nExecutable = "n8n",
+    [string]$DockerExecutable = "docker",
     [string]$N8nContainer = "",
     [string]$FixtureFile = "",
     [switch]$ConfirmBoundedApply,
@@ -24,6 +25,7 @@ $script:BoundedOperationsRoot = $null
 $script:BoundedFixture = $null
 $script:BoundedTestOnly = $false
 $script:BoundedExitCode = 0
+$script:BoundedDockerExecutable = $DockerExecutable
 
 function Stop-Bounded {
     param([Parameter(Mandatory)][string]$Code)
@@ -312,6 +314,27 @@ function Get-BoundedHttpsUri {
     return $uri
 }
 
+function Assert-BoundedApprovedOrigin {
+    param(
+        [Parameter(Mandatory)][System.Uri]$Uri,
+        [Parameter(Mandatory)][string]$ApprovedHost,
+        [Parameter(Mandatory)][string]$Code
+    )
+    if ($Uri.Scheme -cne "https" -or -not $Uri.Host.Equals($ApprovedHost, [StringComparison]::OrdinalIgnoreCase) -or $Uri.Port -ne 443) {
+        Stop-Bounded $Code
+    }
+}
+
+function Test-BoundedSameOrigin {
+    param(
+        [Parameter(Mandatory)][System.Uri]$Left,
+        [Parameter(Mandatory)][System.Uri]$Right
+    )
+    return $Left.Scheme.Equals($Right.Scheme, [StringComparison]::OrdinalIgnoreCase) -and
+        $Left.Host.Equals($Right.Host, [StringComparison]::OrdinalIgnoreCase) -and
+        $Left.Port -eq $Right.Port
+}
+
 function Assert-BoundedManifestEndpointRelationships {
     param([Parameter(Mandatory)]$Manifest)
     $source = Get-BoundedHttpsUri ([string]$Manifest.endpoints.source_cursor) "binding_endpoint_relationship_invalid"
@@ -322,7 +345,11 @@ function Assert-BoundedManifestEndpointRelationships {
         if (-not [string]::IsNullOrEmpty($uri.Query)) { Stop-Bounded "binding_endpoint_query_invalid" }
         if ([string]::IsNullOrWhiteSpace($uri.AbsolutePath) -or $uri.AbsolutePath -eq "/") { Stop-Bounded "binding_endpoint_relationship_invalid" }
     }
-    if ($source.Scheme -cne $gateway.Scheme -or -not $source.Host.Equals($gateway.Host, [StringComparison]::OrdinalIgnoreCase) -or $source.Port -ne $gateway.Port) {
+    Assert-BoundedApprovedOrigin $source "gateway.example.com" "binding_gateway_origin_invalid"
+    Assert-BoundedApprovedOrigin $gateway "gateway.example.com" "binding_gateway_origin_invalid"
+    Assert-BoundedApprovedOrigin $checkpoint "gateway.example.com" "binding_gateway_origin_invalid"
+    Assert-BoundedApprovedOrigin $forms "forms.example.com" "binding_forms_origin_invalid"
+    if (-not (Test-BoundedSameOrigin $source $gateway) -or -not (Test-BoundedSameOrigin $source $checkpoint)) {
         Stop-Bounded "binding_endpoint_relationship_invalid"
     }
     $sourcePath = $source.AbsolutePath.TrimEnd([char]'/')
@@ -518,16 +545,69 @@ function Get-BoundedActivationValue {
 }
 
 function Get-BoundedWorkflowProjection {
-    param([Parameter(Mandatory)]$Workflow)
+    param(
+        [Parameter(Mandatory)]$Workflow,
+        [Parameter(Mandatory)]$Manifest
+    )
     $activation = Get-BoundedActivationValue $Workflow
     $staticData = if ($Workflow.PSObject.Properties.Name -contains "staticData") { $Workflow.staticData } else { $null }
     $pinData = if ($Workflow.PSObject.Properties.Name -contains "pinData") { $Workflow.pinData } else { $null }
+    $projected = ConvertFrom-BoundedWorkflowJsonText ($Workflow | ConvertTo-Json -Depth 100 -Compress)
+    $roleByNode = @{}
+    foreach ($roleEntry in @($Manifest.credential_roles.PSObject.Properties)) {
+        $roleName = [string]$roleEntry.Name
+        $role = $roleEntry.Value
+        foreach ($nodeNameValue in @($role.node_names)) {
+            $nodeName = [string]$nodeNameValue
+            if ($roleByNode.ContainsKey($nodeName)) { Stop-Bounded "credential_role_collision" }
+            $roleByNode[$nodeName] = $roleName
+        }
+    }
+    $seenCredentialNodes = New-Object System.Collections.Generic.HashSet[string]
+    foreach ($node in @($projected.nodes)) {
+        $nodeName = [string]$node.name
+        $hasCredentials = $node.PSObject.Properties.Name -contains "credentials"
+        if (-not $roleByNode.ContainsKey($nodeName)) {
+            if ($hasCredentials) { Stop-Bounded "credential_role_unexpected" }
+            continue
+        }
+        if (-not $hasCredentials -or $null -eq $node.credentials) { Stop-Bounded "credential_binding_missing" }
+        $roleName = [string]$roleByNode[$nodeName]
+        $role = $Manifest.credential_roles.$roleName
+        $expectedType = [string]$role.credential_type
+        $credentialProperties = @(Get-BoundedPropertyNames $node.credentials)
+        if ($credentialProperties.Count -ne 1 -or $credentialProperties[0] -cne $expectedType) {
+            Stop-Bounded "credential_role_mismatch"
+        }
+        $resolved = $node.credentials.$expectedType
+        if ($null -eq $resolved) { Stop-Bounded "credential_binding_invalid" }
+        $resolvedProperties = @(Get-BoundedPropertyNames $resolved | Sort-Object)
+        $nameOnly = @("name")
+        $resolvedShape = @("id", "name")
+        $isNameOnly = $resolvedProperties.Count -eq 1 -and $resolvedProperties[0] -ceq "name"
+        $isResolved = $resolvedProperties.Count -eq 2 -and
+            $resolvedProperties[0] -ceq "id" -and $resolvedProperties[1] -ceq "name"
+        if (-not $isNameOnly -and -not $isResolved) { Stop-Bounded "credential_resolution_shape_invalid" }
+        if ([string]::IsNullOrWhiteSpace([string]$resolved.name) -or [string]$resolved.name -cne [string]$role.credential_name) {
+            Stop-Bounded "credential_name_mismatch"
+        }
+        if ($isResolved) {
+            Assert-BoundedSafeIdentity ([string]$resolved.id) "credential_resolution_id_invalid"
+        }
+        $normalisedCredential = [ordered]@{}
+        $normalisedCredential[$expectedType] = [ordered]@{ name = [string]$role.credential_name }
+        Set-BoundedProperty $node "credentials" ([pscustomobject]$normalisedCredential)
+        [void]$seenCredentialNodes.Add($nodeName)
+    }
+    foreach ($nodeName in $roleByNode.Keys) {
+        if (-not $seenCredentialNodes.Contains([string]$nodeName)) { Stop-Bounded "credential_binding_missing" }
+    }
     return [pscustomobject]([ordered]@{
         id = [string]$Workflow.id
         name = [string]$Workflow.name
         active = [bool]$Workflow.active
         activation_enabled = $activation
-        nodes = $Workflow.nodes
+        nodes = $projected.nodes
         connections = $Workflow.connections
         settings = $Workflow.settings
         staticData = $staticData
@@ -821,22 +901,12 @@ function Assert-BoundedAbsenceEvidence {
     if (@($Evidence.case_exact_matches).Count -ne 0 -or @($Evidence.case_distinct_matches).Count -ne 0) { Stop-Bounded "absence_matches_present" }
 }
 
-function Invoke-BoundedExternalCommand {
+function Invoke-BoundedProcess {
     param(
-        [Parameter(Mandatory)][string]$Verb,
+        [Parameter(Mandatory)][string]$Command,
         [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Arguments,
         [string]$InputText = ""
     )
-    if ($Verb -notin @("list:workflow", "export:workflow", "import:workflow")) { Stop-Bounded "n8n_command_not_allowed" }
-    if ($Arguments -match "--all" -or $Arguments -match "export:workflow.*--all") { Stop-Bounded "unbounded_workflow_export" }
-    $command = $N8nExecutable
-    $finalArgs = @()
-    if (-not [string]::IsNullOrWhiteSpace($N8nContainer)) {
-        $command = "docker"
-        $finalArgs += @("exec", "-i", $N8nContainer, "n8n")
-    }
-    $finalArgs += $Verb
-    $finalArgs += $Arguments
     $processInfo = New-Object System.Diagnostics.ProcessStartInfo
     $processInfo.FileName = $command
     $processInfo.UseShellExecute = $false
@@ -844,7 +914,7 @@ function Invoke-BoundedExternalCommand {
     $processInfo.RedirectStandardOutput = $true
     $processInfo.RedirectStandardError = $true
     $processInfo.CreateNoWindow = $true
-    foreach ($argument in $finalArgs) { [void]$processInfo.ArgumentList.Add([string]$argument) }
+    foreach ($argument in $Arguments) { [void]$processInfo.ArgumentList.Add([string]$argument) }
     $process = New-Object System.Diagnostics.Process
     $process.StartInfo = $processInfo
     try {
@@ -865,6 +935,58 @@ function Invoke-BoundedExternalCommand {
         })
     } finally {
         $process.Dispose()
+    }
+}
+
+function Invoke-BoundedDockerCommand {
+    param([Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Arguments)
+    return Invoke-BoundedProcess -Command $script:BoundedDockerExecutable -Arguments $Arguments
+}
+
+function Invoke-BoundedExternalCommand {
+    param(
+        [Parameter(Mandatory)][string]$Verb,
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Arguments,
+        [string]$InputText = "",
+        [string]$ContainerInputKey = ""
+    )
+    if ($Verb -notin @("list:workflow", "export:workflow", "import:workflow")) { Stop-Bounded "n8n_command_not_allowed" }
+    if ($Arguments -match "--all" -or $Arguments -match "export:workflow.*--all") { Stop-Bounded "unbounded_workflow_export" }
+    if ([string]::IsNullOrWhiteSpace($N8nContainer)) {
+        return Invoke-BoundedProcess -Command $N8nExecutable -Arguments (@($Verb) + @($Arguments)) -InputText $InputText
+    }
+    if ($N8nContainer -notmatch '^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$') { Stop-Bounded "n8n_container_invalid" }
+    if ($Verb -ne "import:workflow") {
+        return Invoke-BoundedProcess -Command $script:BoundedDockerExecutable -Arguments (@("exec", "-i", $N8nContainer, "n8n", $Verb) + @($Arguments)) -InputText $InputText
+    }
+
+    $inputArguments = @($Arguments | Where-Object { ([string]$_).StartsWith("--input=", [StringComparison]::Ordinal) })
+    if ($inputArguments.Count -ne 1) { Stop-Bounded "n8n_container_input_invalid" }
+    $hostInputPath = ([string]$inputArguments[0]).Substring(8)
+    if (-not (Test-Path -LiteralPath $hostInputPath -PathType Leaf)) { Stop-Bounded "n8n_container_input_missing" }
+    [void](Get-BoundedSha256File $hostInputPath)
+    $containerKey = if ([string]::IsNullOrWhiteSpace($ContainerInputKey)) { Get-BoundedSha256File $hostInputPath } else { $ContainerInputKey }
+    if ($containerKey -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{2,127}$') { Stop-Bounded "n8n_container_input_key_invalid" }
+    $containerPath = "/tmp/.xb-member-gateway-{0}.workflow.json" -f $containerKey
+    $copyTarget = $N8nContainer + ":" + $containerPath
+    $cleanupRequired = $true
+    try {
+        $copyResult = Invoke-BoundedDockerCommand @("cp", $hostInputPath, $copyTarget)
+        if ([int]$copyResult.exit_code -ne 0) { Stop-Bounded "n8n_container_input_copy_failed" }
+        $containerArguments = @("exec", "-i", $N8nContainer, "n8n", $Verb)
+        foreach ($argument in @($Arguments)) {
+            if (([string]$argument).StartsWith("--input=", [StringComparison]::Ordinal)) {
+                $containerArguments += "--input=$containerPath"
+            } else {
+                $containerArguments += [string]$argument
+            }
+        }
+        return Invoke-BoundedProcess -Command $script:BoundedDockerExecutable -Arguments $containerArguments -InputText $InputText
+    } finally {
+        if ($cleanupRequired) {
+            $cleanupResult = Invoke-BoundedDockerCommand @("exec", "-i", $N8nContainer, "rm", "-f", "--", $containerPath)
+            if ([int]$cleanupResult.exit_code -ne 0) { Stop-Bounded "n8n_container_input_cleanup_failed" }
+        }
     }
 }
 
@@ -1023,7 +1145,7 @@ function Assert-BoundedNoGenericHooks {
 function Set-BoundedProtectedAcl {
     param([Parameter(Mandatory)][string]$Path)
     if ($script:BoundedTestOnly) {
-        if ($script:BoundedFixture -and [string]$script:BoundedFixture.custody_mode -eq "acl_failure") { Stop-Bounded "private_acl_verification_failed" }
+        if ($script:BoundedFixture -and [string]$script:BoundedFixture.custody_mode -in @("acl_failure", "manifest_acl_failure")) { Stop-Bounded "private_acl_verification_failed" }
         return
     }
     if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) { Stop-Bounded "private_acl_unavailable" }
@@ -1062,7 +1184,7 @@ function Assert-BoundedProtectedAcl {
     param([Parameter(Mandatory)][string]$Path)
     if (-not (Test-Path -LiteralPath $Path)) { return }
     if ($script:BoundedTestOnly) {
-        if ($script:BoundedFixture -and [string]$script:BoundedFixture.custody_mode -eq "acl_failure") { Stop-Bounded "private_acl_verification_failed" }
+        if ($script:BoundedFixture -and [string]$script:BoundedFixture.custody_mode -in @("acl_failure", "manifest_acl_failure")) { Stop-Bounded "private_acl_verification_failed" }
         return
     }
     if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) { Stop-Bounded "private_acl_unavailable" }
@@ -1123,6 +1245,29 @@ function Assert-BoundedPrivateDestination {
         $tracked = @(& git -C $Root ls-files -- $relative)
         if ($tracked.Count -gt 0) { Stop-Bounded "private_path_tracked" }
     }
+}
+
+function Assert-BoundedManifestCustody {
+    param(
+        [Parameter(Mandatory)][string]$Root,
+        [Parameter(Mandatory)][string]$ManifestPath
+    )
+    $privateRoot = Resolve-BoundedFullPath (Join-Path $Root ".n8n-local/member-gateway-bounded-import")
+    $resolvedManifest = Resolve-BoundedFullPath $ManifestPath
+    if (-not (Test-BoundedStrictChild $resolvedManifest $privateRoot)) { Stop-Bounded "binding_manifest_path_not_private" }
+    Assert-BoundedNoUnsafePathComponents $resolvedManifest $privateRoot
+    if (-not (Test-Path -LiteralPath $resolvedManifest -PathType Leaf)) { Stop-Bounded "binding_manifest_missing" }
+    $manifestItem = Get-Item -LiteralPath $resolvedManifest -Force -ErrorAction Stop
+    if (Test-BoundedUnsafeLink $manifestItem) { Stop-Bounded "unsafe_link" }
+    if (-not $script:BoundedTestOnly) {
+        $relative = $resolvedManifest.Substring((Resolve-BoundedFullPath $Root).Length).TrimStart([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar)
+        $ignored = & git -C $Root check-ignore --quiet --no-index -- $relative 2>$null
+        if ($LASTEXITCODE -ne 0) { Stop-Bounded "binding_manifest_not_ignored" }
+        $tracked = @(& git -C $Root ls-files -- $relative)
+        if ($tracked.Count -gt 0) { Stop-Bounded "binding_manifest_tracked" }
+    }
+    Assert-BoundedProtectedAcl (Split-Path -Parent $resolvedManifest)
+    Assert-BoundedProtectedAcl $resolvedManifest
 }
 
 function New-BoundedStagingRoot {
@@ -1196,9 +1341,9 @@ function Get-BoundedOperationState {
     foreach ($name in $base) { if ($name -notin $files) { Stop-Bounded "operation_incomplete" } }
     $preimage = @($files | Where-Object { $_ -in @("preimage.workflow.json", "absence-evidence.json") })
     if ($preimage.Count -ne 1) { Stop-Bounded "operation_preimage_shape_invalid" }
-    $optional = @($files | Where-Object { $_ -in @("dispatch-receipt.json", "completion-receipt.json") })
+    $optional = @($files | Where-Object { $_ -in @("dispatch-ownership.json", "dispatch-receipt.json", "completion-receipt.json") })
     foreach ($file in $files) {
-        if ($file -notin ($base + $preimage + @("dispatch-receipt.json", "completion-receipt.json"))) { Stop-Bounded "operation_extra_material" }
+        if ($file -notin ($base + $preimage + @("dispatch-ownership.json", "dispatch-receipt.json", "completion-receipt.json"))) { Stop-Bounded "operation_extra_material" }
     }
     if ("completion-receipt.json" -in $optional -and "dispatch-receipt.json" -notin $optional) { Stop-Bounded "completion_without_dispatch" }
     $plan = Read-BoundedJsonFile (Join-Path $OperationPath "plan.json") -RequireCanonical
@@ -1294,8 +1439,19 @@ function Get-BoundedOperationState {
         if ((Get-BoundedSha256Text $absenceText) -cne [string]$plan.identity_seed.preimage_digest) { Stop-Bounded "absence_digest_mismatch" }
     }
     if ([string]$intent.expected_projection_digest -ne [string]$plan.expected_projection_digest) { Stop-Bounded "mutation_intent_mismatch" }
+    $ownership = $null
     $dispatch = $null
     $completion = $null
+    if ("dispatch-ownership.json" -in $optional) {
+        $ownership = Read-BoundedJsonFile (Join-Path $OperationPath "dispatch-ownership.json") -RequireCanonical
+        Assert-BoundedExactProperties $ownership @("schema_version", "operation_id", "operation_identity", "plan_digest", "mutation_intent_digest", "ownership_id") "dispatch_ownership_shape_invalid"
+        if ([string]$ownership.schema_version -cne "xb.member.gateway.bounded_import.dispatch-ownership.v1" -or [string]$ownership.operation_id -ne [string]$OperationId) { Stop-Bounded "dispatch_ownership_identity_invalid" }
+        if ([string]$ownership.ownership_id -notmatch '^[0-9a-f]{32}$') { Stop-Bounded "dispatch_ownership_identity_invalid" }
+        Assert-BoundedDigest ([string]$ownership.plan_digest) "dispatch_ownership_plan_digest_invalid"
+        Assert-BoundedDigest ([string]$ownership.mutation_intent_digest) "dispatch_ownership_intent_digest_invalid"
+        if ([string]$ownership.plan_digest -ne $planDigest -or [string]$ownership.operation_identity -ne [string]$plan.operation_identity) { Stop-Bounded "dispatch_ownership_chain_mismatch" }
+        if ([string]$ownership.mutation_intent_digest -ne (Get-BoundedSha256File (Join-Path $OperationPath "mutation-intent.json"))) { Stop-Bounded "dispatch_ownership_chain_mismatch" }
+    }
     if ("dispatch-receipt.json" -in $optional) {
         $dispatch = Read-BoundedJsonFile (Join-Path $OperationPath "dispatch-receipt.json") -RequireCanonical
         Assert-BoundedExactProperties $dispatch @("schema_version", "operation_id", "operation_identity", "plan_digest", "mutation_intent_digest", "dispatch_state", "outcome", "replay_allowed") "dispatch_receipt_shape_invalid"
@@ -1311,6 +1467,7 @@ function Get-BoundedOperationState {
         if ([string]$dispatch.mutation_intent_digest -cne (Get-BoundedSha256File (Join-Path $OperationPath "mutation-intent.json"))) { Stop-Bounded "dispatch_chain_mismatch" }
         if ([string]$dispatch.plan_digest -ne $planDigest -or [string]$dispatch.operation_identity -ne [string]$plan.operation_identity) { Stop-Bounded "dispatch_chain_mismatch" }
     }
+    if ($null -ne $ownership -and $null -eq $dispatch) { Stop-Bounded "dispatch_ownership_without_receipt" }
     if ("completion-receipt.json" -in $optional) {
         $completion = Read-BoundedJsonFile (Join-Path $OperationPath "completion-receipt.json") -RequireCanonical
         Assert-BoundedExactProperties $completion @(
@@ -1337,6 +1494,7 @@ function Get-BoundedOperationState {
         cursor_state = $cursorState
         intent = $intent
         preimage_name = $preimage[0]
+        ownership = $ownership
         dispatch = $dispatch
         completion = $completion
     })
@@ -1414,7 +1572,7 @@ function New-BoundedPlanArtifacts {
     }
     $manifestCanonical = Get-BoundedCanonicalJsonFromObject $Manifest
     $manifestDigest = Get-BoundedSha256Text $manifestCanonical
-    $projection = Get-BoundedWorkflowProjection $prepared
+    $projection = Get-BoundedWorkflowProjection $prepared $Manifest
     $projectionDigest = Get-BoundedSha256Text (Get-BoundedCanonicalJsonFromObject $projection -AllowFloatingPoint)
     $selectionDigest = Get-BoundedSha256Text (Get-BoundedCanonicalJsonFromObject $Evidence.selection)
     $identitySeed = New-BoundedIdentitySeed $repo $Manifest $Evidence.cursor $preparedDigest $preimageState $preimageDigest $selectionDigest $manifestDigest
@@ -1574,6 +1732,58 @@ function Write-BoundedOperationReceipt {
     }
 }
 
+function New-BoundedDispatchOwnership {
+    param([Parameter(Mandatory)]$State)
+    return [pscustomobject]([ordered]@{
+        schema_version = "xb.member.gateway.bounded_import.dispatch-ownership.v1"
+        operation_id = [string]$State.plan.operation_id
+        operation_identity = [string]$State.plan.operation_identity
+        plan_digest = [string]$State.plan_digest
+        mutation_intent_digest = Get-BoundedSha256File (Join-Path $State.operation_path "mutation-intent.json")
+        ownership_id = [Guid]::NewGuid().ToString("N")
+    })
+}
+
+function Try-BoundedAcquireDispatchOwnership {
+    param(
+        [Parameter(Mandatory)][string]$OperationPath,
+        [Parameter(Mandatory)]$Ownership
+    )
+    $target = Join-Path $OperationPath "dispatch-ownership.json"
+    $text = (Get-BoundedCanonicalJsonFromObject $Ownership) + $script:BoundedLf
+    $bytes = (Get-BoundedUtf8NoBom).GetBytes($text)
+    try {
+        $stream = [System.IO.File]::Open($target, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        try {
+            $stream.Write($bytes, 0, $bytes.Length)
+            $stream.Flush($true)
+            $script:BoundedPrivateBytesWritten = $true
+        } finally {
+            $stream.Dispose()
+        }
+        Set-BoundedProtectedAcl $target
+        return $true
+    } catch [System.IO.IOException] {
+        if (Test-Path -LiteralPath $target -PathType Leaf) { return $false }
+        Stop-Bounded "dispatch_ownership_acquire_failed"
+    } catch {
+        if ($_.Exception.Message -match "^private_acl_") { throw }
+        Stop-Bounded "dispatch_ownership_acquire_failed"
+    }
+}
+
+function Release-BoundedDispatchOwnership {
+    param(
+        [Parameter(Mandatory)][string]$OperationPath,
+        [Parameter(Mandatory)]$Ownership
+    )
+    $target = Join-Path $OperationPath "dispatch-ownership.json"
+    if (-not (Test-Path -LiteralPath $target -PathType Leaf)) { Stop-Bounded "dispatch_ownership_missing" }
+    $current = Read-BoundedJsonFile $target -RequireCanonical
+    if ([string]$current.ownership_id -cne [string]$Ownership.ownership_id) { Stop-Bounded "dispatch_ownership_mismatch" }
+    Remove-Item -LiteralPath $target -Force -ErrorAction Stop
+}
+
 function Compare-BoundedText {
     param([Parameter(Mandatory)][string]$Left, [Parameter(Mandatory)][string]$Right)
     return $Left.Equals($Right, [StringComparison]::Ordinal)
@@ -1631,7 +1841,7 @@ function Assert-BoundedCurrentOperationIdentity {
     $preparedDigest = Get-BoundedSha256Text $preparedText
     if (-not (Compare-BoundedText $preparedDigest ([string]$State.plan.identity_seed.prepared_workflow_digest))) { Stop-Bounded "prepared_source_digest_mismatch" }
     Assert-BoundedFileDigest (Join-Path $State.operation_path "prepared.workflow.json") ([string]$State.plan.identity_seed.prepared_workflow_digest) "prepared_digest_mismatch"
-    $projection = Get-BoundedWorkflowProjection $prepared
+    $projection = Get-BoundedWorkflowProjection $prepared $Manifest
     $projectionDigest = Get-BoundedSha256Text (Get-BoundedCanonicalJsonFromObject $projection -AllowFloatingPoint)
     if (-not (Compare-BoundedText $projectionDigest ([string]$State.plan.expected_projection_digest))) { Stop-Bounded "prepared_projection_mismatch" }
     $freshSeed = New-BoundedIdentitySeed $currentRepository $Manifest $Evidence.cursor $preparedDigest ([string]$State.plan.identity_seed.preimage_state) ([string]$State.plan.identity_seed.preimage_digest) ([string]$State.plan.identity_seed.preimage_selection_digest) $manifestDigest
@@ -1645,9 +1855,36 @@ function Test-BoundedExpectedTarget {
         [Parameter(Mandatory)]$Evidence
     )
     if ($Evidence.selection.state -ne "existing") { return $false }
-    $actualProjection = Get-BoundedWorkflowProjection $Evidence.workflow
+    $actualProjection = Get-BoundedWorkflowProjection $Evidence.workflow $State.binding.manifest
     $actualDigest = Get-BoundedSha256Text (Get-BoundedCanonicalJsonFromObject $actualProjection -AllowFloatingPoint)
     return Compare-BoundedText $actualDigest ([string]$State.plan.expected_projection_digest)
+}
+
+function Write-BoundedFixtureMarker {
+    param([Parameter(Mandatory)][string]$Directory)
+    if ([string]::IsNullOrWhiteSpace($Directory)) { Stop-Bounded "fixture_marker_path_invalid" }
+    New-Item -ItemType Directory -Path $Directory -Force | Out-Null
+    $path = Join-Path $Directory (([Guid]::NewGuid()).ToString("N") + ".marker")
+    $stream = [System.IO.File]::Open($path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+    try {
+        $stream.Flush($true)
+    } finally {
+        $stream.Dispose()
+    }
+    return $path
+}
+
+function Wait-BoundedFixtureAdmissionBarrier {
+    param([AllowNull()]$Fixture)
+    if ($null -eq $Fixture) { return }
+    if (-not $script:BoundedTestOnly -or [string]$Fixture.dispatch_mode -ne "concurrent_success") { return }
+    $barrier = [string]$Fixture.admission_barrier_directory
+    Write-BoundedFixtureMarker $barrier | Out-Null
+    for ($attempt = 0; $attempt -lt 240; $attempt++) {
+        if (@(Get-ChildItem -LiteralPath $barrier -Filter "*.marker" -File -ErrorAction Stop).Count -ge 2) { return }
+        Start-Sleep -Milliseconds 25
+    }
+    Stop-Bounded "fixture_admission_barrier_timeout"
 }
 
 function Invoke-BoundedOfflineDispatch {
@@ -1662,6 +1899,10 @@ function Invoke-BoundedOfflineDispatch {
     if ($mode -eq "interrupt_after_start") {
         Stop-Bounded "dispatch_interrupted"
     }
+    if ($mode -eq "concurrent_success") {
+        Write-BoundedFixtureMarker ([string]$Fixture.dispatch_marker_directory) | Out-Null
+        return [pscustomobject]([ordered]@{ started = $true; outcome = "completed" })
+    }
     if ($mode -ne "success") { Stop-Bounded "fixture_dispatch_mode_invalid" }
     return [pscustomobject]([ordered]@{ started = $true; outcome = "completed" })
 }
@@ -1675,14 +1916,14 @@ function Invoke-BoundedMutation {
     $preparedPath = Join-Path $OperationPath "prepared.workflow.json"
     $prepared = Read-BoundedWorkflowFile $preparedPath
     Assert-BoundedInactiveWorkflow $prepared
-    if ($script:BoundedTestOnly) {
+    if ($script:BoundedTestOnly -and [string]$script:BoundedFixture.dispatch_mode -ne "container_visible_import") {
         return Invoke-BoundedOfflineDispatch $script:BoundedFixture
     }
     $importResult = Invoke-BoundedExternalCommand "import:workflow" @(
         "--input=$preparedPath",
         "--projectId=$([string]$State.intent.project.id)",
         "--activeState=false"
-    )
+    ) -ContainerInputKey ([string]$State.plan.operation_id)
     if ([int]$importResult.exit_code -ne 0) { Stop-Bounded "n8n_command_failed" }
     return [pscustomobject]([ordered]@{ started = $true; outcome = "completed" })
 }
@@ -1717,7 +1958,8 @@ function New-BoundedCompletionReceipt {
     param(
         [Parameter(Mandatory)]$State,
         [Parameter(Mandatory)][string]$DispatchDigest,
-        [Parameter(Mandatory)]$Evidence
+        [Parameter(Mandatory)]$Evidence,
+        [Parameter(Mandatory)]$Manifest
     )
     return [pscustomobject]([ordered]@{
         schema_version = "xb.member.gateway.bounded_import.completion.v2"
@@ -1726,7 +1968,7 @@ function New-BoundedCompletionReceipt {
         plan_digest = [string]$State.plan_digest
         dispatch_digest = $DispatchDigest
         expected_projection_digest = [string]$State.plan.expected_projection_digest
-        target_projection_digest = Get-BoundedSha256Text (Get-BoundedCanonicalJsonFromObject -Value (Get-BoundedWorkflowProjection $Evidence.workflow) -AllowFloatingPoint)
+        target_projection_digest = Get-BoundedSha256Text (Get-BoundedCanonicalJsonFromObject -Value (Get-BoundedWorkflowProjection $Evidence.workflow $Manifest) -AllowFloatingPoint)
         original_preimage_state = [string]$State.plan.identity_seed.preimage_state
         ownership = if ([string]$State.plan.identity_seed.preimage_state -eq "absent") { "created" } else { "updated_or_noop" }
         complete = $true
@@ -1739,6 +1981,9 @@ function Invoke-BoundedDispatchAttempt {
         [Parameter(Mandatory)][string]$OperationsPath,
         [Parameter(Mandatory)][string]$OperationPath
     )
+    Wait-BoundedFixtureAdmissionBarrier $script:BoundedFixture
+    $ownership = New-BoundedDispatchOwnership $State
+    if (-not (Try-BoundedAcquireDispatchOwnership $OperationPath $ownership)) { Stop-Bounded "dispatch_ownership_unavailable" }
     $pending = New-BoundedDispatchReceipt $State "dispatching" "pending" $false
     $replacePending = Test-Path -LiteralPath (Join-Path $OperationPath "dispatch-receipt.json") -PathType Leaf
     Write-BoundedOperationReceipt $OperationsPath $OperationPath "dispatch-receipt.json" $pending -ReplaceExisting:$replacePending
@@ -1746,6 +1991,7 @@ function Invoke-BoundedDispatchAttempt {
     if (-not $result.started) {
         $notDispatched = New-BoundedDispatchReceipt $State "not_dispatched" "pre_dispatch_failure" $true
         Write-BoundedOperationReceipt $OperationsPath $OperationPath "dispatch-receipt.json" $notDispatched -ReplaceExisting
+        Release-BoundedDispatchOwnership $OperationPath $ownership
         Stop-Bounded "pre_dispatch_failure"
     }
     if ([string]$result.outcome -notin @("completed", "ambiguous")) { Stop-Bounded "dispatch_outcome_invalid" }
@@ -1781,18 +2027,18 @@ function Invoke-BoundedApply {
             $after = Get-BoundedEvidence $Manifest -AfterDispatch
             Assert-BoundedCurrentOperationIdentity $state $after $Manifest
             if (-not (Test-BoundedExpectedTarget $state $after)) { Stop-Bounded "readback_mismatch" }
-            $completion = New-BoundedCompletionReceipt $state (Get-BoundedSha256File (Join-Path $OperationPath "dispatch-receipt.json")) $after
+            $completion = New-BoundedCompletionReceipt $state (Get-BoundedSha256File (Join-Path $OperationPath "dispatch-receipt.json")) $after $Manifest
             Write-BoundedOperationReceipt $OperationsPath $OperationPath "completion-receipt.json" $completion
             return [pscustomobject]([ordered]@{ status = "applied_and_verified"; mutation_attempted = 1; replay = $false; operation_identity = [string]$state.plan.operation_identity })
         }
         $evidence = Get-BoundedEvidence $Manifest -AfterDispatch
         Assert-BoundedCurrentOperationIdentity $state $evidence $Manifest
         if (Test-BoundedExpectedTarget $state $evidence) {
-            if ([string]$state.dispatch.dispatch_state -eq "dispatching") {
+            if ([string]$state.dispatch.dispatch_state -ne "dispatched" -or [string]$state.dispatch.outcome -ne "completed") {
                 $reconciled = New-BoundedDispatchReceipt $state "dispatched" "completed" $false
                 Write-BoundedOperationReceipt $OperationsPath $OperationPath "dispatch-receipt.json" $reconciled -ReplaceExisting
             }
-            $receipt = New-BoundedCompletionReceipt $state (Get-BoundedSha256File (Join-Path $OperationPath "dispatch-receipt.json")) $evidence
+            $receipt = New-BoundedCompletionReceipt $state (Get-BoundedSha256File (Join-Path $OperationPath "dispatch-receipt.json")) $evidence $Manifest
             Write-BoundedOperationReceipt $OperationsPath $OperationPath "completion-receipt.json" $receipt
             return [pscustomobject]([ordered]@{ status = "completed_existing_dispatch"; mutation_attempted = 0; replay = $false; operation_identity = [string]$state.plan.operation_identity })
         }
@@ -1810,7 +2056,7 @@ function Invoke-BoundedApply {
     if (-not (Test-BoundedExpectedTarget $state $after)) {
         Stop-Bounded "readback_mismatch"
     }
-    $completion = New-BoundedCompletionReceipt $state (Get-BoundedSha256File (Join-Path $OperationPath "dispatch-receipt.json")) $after
+    $completion = New-BoundedCompletionReceipt $state (Get-BoundedSha256File (Join-Path $OperationPath "dispatch-receipt.json")) $after $Manifest
     Write-BoundedOperationReceipt $OperationsPath $OperationPath "completion-receipt.json" $completion
     return [pscustomobject]([ordered]@{ status = "applied_and_verified"; mutation_attempted = 1; replay = $false; operation_identity = [string]$state.plan.operation_identity })
 }
@@ -1830,6 +2076,7 @@ function Initialize-BoundedContext {
     if ($TestOnly) {
         $script:BoundedFixture = Read-BoundedJsonFile (Resolve-BoundedFullPath $FixtureFile) -AllowFloatingPoint
     }
+    Assert-BoundedPrivateDestination $root $operations
     Assert-BoundedNoGenericHooks $root
     if ([string]::IsNullOrWhiteSpace($OperationId) -or $OperationId -notmatch '^[a-z0-9][a-z0-9._-]{2,96}$') { Stop-Bounded "operation_id_invalid" }
     return [pscustomobject]@{ root = $root; operations = $operations; operation = Join-Path $operations $OperationId }
@@ -1840,14 +2087,15 @@ function Invoke-BoundedMain {
         $context = Initialize-BoundedContext
         if ($Mode -eq "Apply" -and -not $ConfirmBoundedApply -and -not $TestOnly) { Stop-Bounded "apply_confirmation_required" }
         $manifestPath = if ([System.IO.Path]::IsPathRooted($BindingManifestFile)) { $BindingManifestFile } else { Join-Path $context.root $BindingManifestFile }
-        $manifest = Read-BoundedJsonFile (Resolve-BoundedFullPath $manifestPath)
+        $resolvedManifestPath = Resolve-BoundedFullPath $manifestPath
+        Assert-BoundedManifestCustody $context.root $resolvedManifestPath
+        $manifest = Read-BoundedJsonFile $resolvedManifestPath
         Assert-BoundedManifest $manifest
         Assert-BoundedReviewedBinding $manifest
         if ($Mode -eq "CapturePlan") {
             if (Test-Path -LiteralPath $context.operation) {
                 Stop-Bounded "operation_already_exists"
             }
-            Assert-BoundedPrivateDestination $context.root $context.operations
             $evidence = Get-BoundedEvidence $manifest
             if (($evidence.selection.state -eq "absent") -and ((Test-BoundedPlaceholder ([string]$manifest.workflow.id)) -or (Test-BoundedPlaceholder ([string]$manifest.project.id)))) {
                 Stop-Bounded "binding_placeholder_unresolved"
