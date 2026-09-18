@@ -4813,13 +4813,27 @@ $script:R156BootstrapScript = @'
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$source = [Console]::In.ReadToEnd()
-if ([string]::IsNullOrEmpty($source)) {
-    throw 'missing child script'
+$p=$null;$ok=$false;$d=$true;$a=$false;$x=$false;$v=$true;$n='Running','Stopping'
+try{
+    $s=[Console]::In.ReadToEnd()
+    if(-not [string]::IsNullOrEmpty($s)){
+        $p=[PowerShell]::Create([System.Management.Automation.RunspaceMode]::NewRunspace)
+        if($null -ne $p -and $null -ne $p.Runspace){
+            $d=$false;$null=$p.AddScript($s);$a=$true
+            try{$null=$p.Invoke()}catch{$x=$true}
+            $i=$p.InvocationStateInfo;$q=[string]$i.State;$r=$i.Reason;$h=[bool]$p.HadErrors;$e=@($p.Streams.Error).Count
+            if($q -in $n){
+                try{$p.Stop();$z=[string]$p.InvocationStateInfo.State;$v=$z -notin $n}catch{$v=$false}
+            }
+            $ok=$a -and -not $x -and $q -eq 'Completed' -and $null -eq $r -and $e -eq 0 -and $q -notin $n -and $v
+        }
+    }
+}catch{$ok=$false}
+finally{if($null -ne $p){try{$p.Dispose();$d=$true}catch{$d=$false}}}
+if($ok -and $d){
+    exit 0
 }
-$child = [ScriptBlock]::Create($source)
-& $child
-exit 0
+exit 1
 '@
 
 function Test-R156ChildScriptParse {

@@ -2099,13 +2099,27 @@ $state = Read-R156ManifestState `
         expected = """Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$source = [Console]::In.ReadToEnd()
-if ([string]::IsNullOrEmpty($source)) {
-    throw 'missing child script'
+$p=$null;$ok=$false;$d=$true;$a=$false;$x=$false;$v=$true;$n='Running','Stopping'
+try{
+    $s=[Console]::In.ReadToEnd()
+    if(-not [string]::IsNullOrEmpty($s)){
+        $p=[PowerShell]::Create([System.Management.Automation.RunspaceMode]::NewRunspace)
+        if($null -ne $p -and $null -ne $p.Runspace){
+            $d=$false;$null=$p.AddScript($s);$a=$true
+            try{$null=$p.Invoke()}catch{$x=$true}
+            $i=$p.InvocationStateInfo;$q=[string]$i.State;$r=$i.Reason;$h=[bool]$p.HadErrors;$e=@($p.Streams.Error).Count
+            if($q -in $n){
+                try{$p.Stop();$z=[string]$p.InvocationStateInfo.State;$v=$z -notin $n}catch{$v=$false}
+            }
+            $ok=$a -and -not $x -and $q -eq 'Completed' -and $null -eq $r -and $e -eq 0 -and $q -notin $n -and $v
+        }
+    }
+}catch{$ok=$false}
+finally{if($null -ne $p){try{$p.Dispose();$d=$true}catch{$d=$false}}}
+if($ok -and $d){
+    exit 0
 }
-$child = [ScriptBlock]::Create($source)
-& $child
-exit 0"""
+exit 1"""
         self.assertEqual(self.bootstrap, expected)
         encoded = base64.b64encode(self.bootstrap.encode("utf-16-le")).decode("ascii")
         command_line = subprocess.list2cmdline(
@@ -2183,14 +2197,23 @@ finally {
         self.assertEqual(normal.returncode, 0, normal.stderr)
         self.assertEqual(normal.stdout.strip(), "nested-returned")
 
+        top_level_exit = self.run_bootstrap("exit 23")
+        self.assertEqual(top_level_exit.returncode, 0, top_level_exit.stderr)
+        self.assertEqual(top_level_exit.stdout, "")
+        self.assertEqual(top_level_exit.stderr, "")
+
         for name, source in (
             ("empty", ""),
             ("parse", "if ("),
-            ("throw", "throw 'synthetic uncaught child failure'"),
+            ("throw", "throw 'R156_PRIVATE_UNCAUGHT_SENTINEL'"),
+            ("error-stream", "Write-Error 'synthetic error-stream failure'"),
         ):
             with self.subTest(name=name):
                 failed = self.run_bootstrap(source)
                 self.assertNotEqual(failed.returncode, 0)
+                self.assertNotIn("R156_PRIVATE_UNCAUGHT_SENTINEL", failed.stdout)
+                self.assertNotIn("R156_PRIVATE_UNCAUGHT_SENTINEL", failed.stderr)
+                self.assertEqual(failed.stderr, "")
 
     def test_child_protocol_rejects_missing_malformed_duplicate_and_extra_packets(self):
         functions = self.extracted_functions(
