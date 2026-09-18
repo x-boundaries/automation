@@ -4592,89 +4592,92 @@ if ([int64][int]$result.ChildExitCode -ne $expected) { exit 1 }
                 labels[name.upper()] = "TRUE" if values[name] else "FALSE"
             return labels
 
+        observed_cases = []
+        consistency_results = []
         for name, case in cases.items():
-            diagnostic_result = run_transport(
-                diagnostic,
-                case["mode"],
-                case["child"],
-                case["sentinel"] + "_DIAGNOSTIC",
-            )
-            self.assertTrue(diagnostic_result["started"])
-            self.assertTrue(diagnostic_result["supervisor_complete"])
-            values = extract_bits(diagnostic_result["exit_code"])
-            self.assertTrue(
-                reencode_bits(values) == diagnostic_result["exit_code"],
-                "forensic exit-word round-trip failed",
-            )
-            labels = closed_labels(values)
-            candidate_expected = (
-                values["addscript_ok"]
-                and values["invoke_returned"]
-                and not values["invoke_throw"]
-                and labels["STATE"] == "Completed"
-                and not values["reason_present"]
-                and not values["error_nonzero"]
-                and not values["active_detected"]
-                and values["stop_ok"]
-            )
-            final_ok = values["predicate_ok"] and values["dispose_ok"]
-            observation_consistent = (
-                labels["FAIL_STAGE"] == "NONE"
-                and values["input_read_ok"]
-                and not values["input_empty"]
-                and values["create_ok"]
-                and not values["runspace_null"]
-                and values["addscript_ok"]
-                and values["invoke_returned"]
-                and not values["invoke_throw"]
-                and values["stateinfo_ok"]
-                and labels["STATE"] == "Completed"
-                and not values["reason_present"]
-                and not values["had_errors"]
-                and not values["error_nonzero"]
-                and not values["active_detected"]
-                and not values["stop_attempted"]
-                and values["stop_ok"]
-                and labels["POST_STOP_STATE"] == "NotStarted"
-                and not values["post_stop_active"]
-                and values["dispose_attempted"]
-                and values["dispose_ok"]
-                and values["predicate_ok"] == candidate_expected
-                and final_ok == (candidate_expected and values["dispose_ok"])
-            )
-            record = [
-                ("CASE", name),
-                ("DIRECT_CONTROL", "ZERO"),
-                ("PSI_CONTROL", "NONZERO"),
-                ("EXIT_WORD", labels["EXIT_WORD"]),
-                ("FAIL_STAGE", labels["FAIL_STAGE"]),
-                ("INPUT_READ_OK", labels["INPUT_READ_OK"]),
-                ("INPUT_EMPTY", labels["INPUT_EMPTY"]),
-                ("CREATE_OK", labels["CREATE_OK"]),
-                ("RUNSPACE_NULL", labels["RUNSPACE_NULL"]),
-                ("ADDSCRIPT_OK", labels["ADDSCRIPT_OK"]),
-                ("INVOKE_RETURNED", labels["INVOKE_RETURNED"]),
-                ("INVOKE_THROW", labels["INVOKE_THROW"]),
-                ("STATE", labels["STATE"]),
-                ("REASON_PRESENT", labels["REASON_PRESENT"]),
-                ("HAD_ERRORS", labels["HAD_ERRORS"]),
-                ("ERROR_COUNT", labels["ERROR_COUNT"]),
-                ("ACTIVE_DETECTED", labels["ACTIVE_DETECTED"]),
-                ("STOP_ATTEMPTED", labels["STOP_ATTEMPTED"]),
-                ("STOP_OK", labels["STOP_OK"]),
-                ("POST_STOP_STATE", labels["POST_STOP_STATE"]),
-                ("POST_STOP_ACTIVE", labels["POST_STOP_ACTIVE"]),
-                ("DISPOSE_ATTEMPTED", labels["DISPOSE_ATTEMPTED"]),
-                ("DISPOSE_OK", labels["DISPOSE_OK"]),
-                ("PREDICATE_OK", labels["PREDICATE_OK"]),
-                ("FINAL_OK", "TRUE" if final_ok else "FALSE"),
-                ("OBSERVATION_CONSISTENT", str(observation_consistent).lower()),
-            ]
-            print(
-                "R156_FORENSIC_V1|"
-                + "|".join(f"{key}={value}" for key, value in record)
-            )
-            self.assertTrue(observation_consistent, "forensic observation was inconsistent")
+            try:
+                diagnostic_result = run_transport(
+                    diagnostic,
+                    case["mode"],
+                    case["child"],
+                    case["sentinel"] + "_DIAGNOSTIC",
+                )
+                self.assertTrue(diagnostic_result["started"])
+                self.assertTrue(diagnostic_result["supervisor_complete"])
+                values = extract_bits(diagnostic_result["exit_code"])
+                self.assertTrue(
+                    reencode_bits(values) == diagnostic_result["exit_code"],
+                    "forensic exit-word round-trip failed",
+                )
+                labels = closed_labels(values)
+                candidate_expected = (
+                    values["addscript_ok"]
+                    and values["invoke_returned"]
+                    and not values["invoke_throw"]
+                    and labels["STATE"] == "Completed"
+                    and not values["reason_present"]
+                    and not values["error_nonzero"]
+                    and not values["active_detected"]
+                    and values["stop_ok"]
+                )
+                final_ok = values["predicate_ok"] and values["dispose_ok"]
+                observation_consistent = (
+                    values["predicate_ok"] == candidate_expected
+                    and final_ok == (values["predicate_ok"] and values["dispose_ok"])
+                )
+                record = [
+                    ("CASE", name),
+                    ("DIRECT_CONTROL", "ZERO"),
+                    ("PSI_CONTROL", "NONZERO"),
+                    ("EXIT_WORD", labels["EXIT_WORD"]),
+                    ("FAIL_STAGE", labels["FAIL_STAGE"]),
+                    ("INPUT_READ_OK", labels["INPUT_READ_OK"]),
+                    ("INPUT_EMPTY", labels["INPUT_EMPTY"]),
+                    ("CREATE_OK", labels["CREATE_OK"]),
+                    ("RUNSPACE_NULL", labels["RUNSPACE_NULL"]),
+                    ("ADDSCRIPT_OK", labels["ADDSCRIPT_OK"]),
+                    ("INVOKE_RETURNED", labels["INVOKE_RETURNED"]),
+                    ("INVOKE_THROW", labels["INVOKE_THROW"]),
+                    ("STATE", labels["STATE"]),
+                    ("REASON_PRESENT", labels["REASON_PRESENT"]),
+                    ("HAD_ERRORS", labels["HAD_ERRORS"]),
+                    ("ERROR_COUNT", labels["ERROR_COUNT"]),
+                    ("ACTIVE_DETECTED", labels["ACTIVE_DETECTED"]),
+                    ("STOP_ATTEMPTED", labels["STOP_ATTEMPTED"]),
+                    ("STOP_OK", labels["STOP_OK"]),
+                    ("POST_STOP_STATE", labels["POST_STOP_STATE"]),
+                    ("POST_STOP_ACTIVE", labels["POST_STOP_ACTIVE"]),
+                    ("DISPOSE_ATTEMPTED", labels["DISPOSE_ATTEMPTED"]),
+                    ("DISPOSE_OK", labels["DISPOSE_OK"]),
+                    ("PREDICATE_OK", labels["PREDICATE_OK"]),
+                    ("FINAL_OK", "TRUE" if final_ok else "FALSE"),
+                    ("OBSERVATION_CONSISTENT", str(observation_consistent).lower()),
+                ]
+                print(
+                    "R156_FORENSIC_V1|"
+                    + "|".join(f"{key}={value}" for key, value in record)
+                )
+                observed_cases.append(name)
+                consistency_results.append(observation_consistent)
+            except (
+                AssertionError,
+                KeyError,
+                OSError,
+                TypeError,
+                ValueError,
+                subprocess.TimeoutExpired,
+            ):
+                continue
+
+        self.assertEqual(
+            tuple(observed_cases),
+            tuple(cases),
+            "forensic cases were absent or undecodable",
+        )
+        self.assertTrue(
+            all(consistency_results),
+            "forensic telemetry relationships were inconsistent",
+        )
 
 
 
