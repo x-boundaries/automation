@@ -204,16 +204,16 @@ $global:registered = $false; $global:unregistered = $false; $global:invalid = $f
 $WorkerAccount = 'DOMAIN\worker'
 $secure = [Security.SecureString]::new(); foreach($char in 'test-only'.ToCharArray()){{$secure.AppendChar($char)}}; $secure.MakeReadOnly()
 $TaskCredential = [Management.Automation.PSCredential]::new($WorkerAccount, $secure)
-function New-ScheduledTaskAction {{ param($Execute,$Argument); [pscustomobject]@{{ Arguments=$Argument }} }}
+function New-ScheduledTaskAction {{ param($Execute,$Argument); [pscustomobject]@{{ Execute=$Execute; Arguments=$Argument; WorkingDirectory='' }} }}
 function New-ScheduledTaskSettingsSet {{ param($MultipleInstances,$ExecutionTimeLimit,$RestartCount,$StartWhenAvailable,[switch]$Disable); [pscustomobject]@{{ MultipleInstances=$MultipleInstances; ExecutionTimeLimit=$ExecutionTimeLimit; RestartCount=$RestartCount; StartWhenAvailable=$StartWhenAvailable; InitiallyDisabled=[bool]$Disable }} }}
-function New-ScheduledTaskPrincipal {{ [pscustomobject]@{{}} }}
-function New-ScheduledTask {{ param($Action,$Settings,$Principal); [pscustomobject]@{{ Actions=@($Action); Settings=$Settings; Triggers=@() }} }}
+function New-ScheduledTaskPrincipal {{ param($UserId,$LogonType,$RunLevel); [pscustomobject]@{{ UserId=$UserId; LogonType=$LogonType; RunLevel=$RunLevel }} }}
+function New-ScheduledTask {{ param($Action,$Settings,$Principal); [pscustomobject]@{{ Actions=@($Action); Settings=$Settings; Principal=$Principal; Triggers=@() }} }}
 function Register-ScheduledTask {{ param($TaskPath,$TaskName,$InputObject,$User,$Password,[switch]$Force); $global:registered=$true; $global:registeredTask=$InputObject }}
-function Get-ScheduledTask {{ [pscustomobject]@{{ State='Disabled'; Triggers=@(); Actions=$global:registeredTask.Actions; Settings=$global:registeredTask.Settings }} }}
+function Get-ScheduledTask {{ [pscustomobject]@{{ State='Disabled'; Triggers=@(); Actions=$global:registeredTask.Actions; Settings=$global:registeredTask.Settings; Principal=$global:registeredTask.Principal }} }}
 function Unregister-ScheduledTask {{ $global:unregistered=$true }}
 try {{ Register-XbWorkerScheduledTask -LauncherPath 'C:\Program Files\X-Boundaries\MemberGatewayWorker\launch_ac2_member_gateway_worker.ps1' }} catch {{ $global:first_error=$_.Exception.Message }}
 $accepted = $global:registered -and $global:registeredTask.Settings.InitiallyDisabled -and $global:registeredTask.Settings.ExecutionTimeLimit -eq [TimeSpan]::FromMinutes(10)
-function Get-ScheduledTask {{ [pscustomobject]@{{ State='Disabled'; Triggers=@(); Actions=$global:registeredTask.Actions; Settings=[pscustomobject]@{{MultipleInstances='IgnoreNew';ExecutionTimeLimit='PT11M';RestartCount=0;StartWhenAvailable=$false}} }} }}
+function Get-ScheduledTask {{ [pscustomobject]@{{ State='Disabled'; Triggers=@(); Actions=$global:registeredTask.Actions; Settings=[pscustomobject]@{{MultipleInstances='IgnoreNew';ExecutionTimeLimit='PT11M';RestartCount=0;StartWhenAvailable=$false}}; Principal=$global:registeredTask.Principal }} }}
 try {{ Register-XbWorkerScheduledTask -LauncherPath 'x'; }} catch {{ $global:invalid=$true; if($global:XbTaskCreated){{Unregister-ScheduledTask}} }}
 [pscustomobject]@{{accepted=$accepted;invalid=$global:invalid;rolled_back=$global:unregistered;registered=$global:registered;task_created=$global:XbTaskCreated;initially_disabled=$global:registeredTask.Settings.InitiallyDisabled;limit=[string]$global:registeredTask.Settings.ExecutionTimeLimit;first_error=$global:first_error}} | ConvertTo-Json -Compress
 '''
@@ -223,6 +223,68 @@ try {{ Register-XbWorkerScheduledTask -LauncherPath 'x'; }} catch {{ $global:inv
         self.assertTrue(observed["accepted"], observed)
         self.assertTrue(observed["invalid"], observed)
         self.assertTrue(observed["rolled_back"], observed)
+
+    def test_task_removal_fails_closed_before_filesystem_removal(self):
+        with tempfile.TemporaryDirectory(prefix="xb-task-removal-") as temp:
+            root = Path(temp); install = root / "install"; runtime = root / "runtime"
+            command = rf'''
+. '{INSTALLER}' -LibraryOnly
+$InstallRoot = '{install}'; $RuntimeRoot = '{runtime}'
+$global:taskPresent = $true; $global:mode = ''
+function Get-ScheduledTask {{ if($global:taskPresent) {{ [pscustomobject]@{{ State='Disabled'; Triggers=@(); Actions=@(); Settings=[pscustomobject]@{{}} }} }} }}
+function Unregister-ScheduledTask {{ if($global:mode -eq 'throw') {{ throw 'simulated unregister failure' }}; if($global:mode -eq 'absent') {{ $global:taskPresent = $false }} }}
+$observed = @()
+foreach($case in @('throw','still','absent')) {{
+    New-Item -ItemType Directory -Path $InstallRoot,$RuntimeRoot -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $InstallRoot 'owned.txt') -Value 'owned'
+    $global:taskPresent = $true; $global:mode = $case
+    try {{ Remove-XbWorkerOwnedState -TaskMayExist; $status = 'success' }} catch {{ $status = $_.Exception.Message }}
+    $observed += [pscustomobject]@{{ case=$case; status=$status; install_exists=(Test-Path -LiteralPath $InstallRoot); runtime_exists=(Test-Path -LiteralPath $RuntimeRoot) }}
+}}
+$observed | ConvertTo-Json -Compress
+'''
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-NonInteractive", "-Command", command],
+                cwd=ROOT, capture_output=True, text=True, check=False, timeout=120,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            observed = {item["case"]: item for item in json.loads(result.stdout.strip().splitlines()[-1])}
+            self.assertEqual(observed["throw"]["status"], "task_unregister_failed")
+            self.assertEqual(observed["still"]["status"], "task_still_present")
+            self.assertTrue(observed["throw"]["install_exists"] and observed["throw"]["runtime_exists"])
+            self.assertTrue(observed["still"]["install_exists"] and observed["still"]["runtime_exists"])
+            self.assertEqual(observed["absent"]["status"], "success")
+            self.assertFalse(observed["absent"]["install_exists"] or observed["absent"]["runtime_exists"])
+
+    def test_replacement_task_identity_fails_even_when_disabled_proof_is_preserved(self):
+        command = rf'''
+. '{INSTALLER}' -LibraryOnly
+$launcher = 'C:\Program Files\X-Boundaries\MemberGatewayWorker\launch_ac2_member_gateway_worker.ps1'
+$expected = Get-XbWorkerTaskIdentity -LauncherPath $launcher -WorkerAccount 'DOMAIN\worker'
+$settings = [pscustomobject]@{{ MultipleInstances='IgnoreNew'; ExecutionTimeLimit='PT10M'; RestartCount=0; StartWhenAvailable=$false }}
+$fields = @('executable','launcher_path','arguments','principal','run_level')
+$observed = foreach($field in $fields) {{
+    $action = [pscustomobject]@{{ Execute=$expected.executable; Arguments=$expected.arguments; WorkingDirectory='' }}
+    $principal = [pscustomobject]@{{ UserId=$expected.principal_user_id; LogonType=$expected.principal_logon_type; RunLevel=$expected.principal_run_level }}
+    if($field -eq 'executable') {{ $action.Execute = 'pwsh.exe' }}
+    if($field -eq 'launcher_path') {{ $action.Arguments = $expected.arguments.Replace($expected.launcher_path, 'C:\foreign\launch.ps1') }}
+    if($field -eq 'arguments') {{ $action.Arguments = $expected.arguments + ' -NoExit' }}
+    if($field -eq 'principal') {{ $principal.UserId = 'DOMAIN\foreign' }}
+    if($field -eq 'run_level') {{ $principal.RunLevel = 'Highest' }}
+    $task = [pscustomobject]@{{ State='Disabled'; Triggers=@(); Actions=@($action); Settings=$settings; Principal=$principal }}
+    try {{ Assert-XbWorkerTaskContract -Task $task -ExpectedIdentity $expected; [pscustomobject]@{{field=$field; accepted=$true}} }}
+    catch {{ [pscustomobject]@{{field=$field; accepted=$false; error=$_.Exception.Message}} }}
+}}
+$observed | ConvertTo-Json -Compress
+'''
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-NonInteractive", "-Command", command],
+            cwd=ROOT, capture_output=True, text=True, check=False, timeout=120,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        observed = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertEqual({item["field"] for item in observed}, {"executable", "launcher_path", "arguments", "principal", "run_level"})
+        self.assertTrue(all(not item["accepted"] for item in observed), observed)
 
     def test_launcher_concurrently_drains_and_reaps_failure_cases(self):
         cases = {

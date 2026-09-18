@@ -68,6 +68,10 @@ if (path.basename(process.execPath).toLowerCase() === 'docker.exe') {
   if (args[0] === 'exec' && args.includes('export:workflow')) {
     const workflowsFile = log ? log + '.workflows.json' : null;
     const importedFile = log ? log + '.imported.json' : null;
+    if (process.env.DOCKER_STUB_READBACK_FAIL === '1' && importedFile && fs.existsSync(importedFile)) {
+      process.stderr.write('simulated bounded readback failure\n');
+      process.exit(1);
+    }
     if (importedFile && fs.existsSync(importedFile) && process.env.DOCKER_STUB_READBACK_STALE !== '1') {
       process.stdout.write(JSON.stringify([JSON.parse(fs.readFileSync(importedFile, 'utf8'))]) + '\n');
       process.exit(0);
@@ -95,6 +99,10 @@ if (path.basename(process.execPath).toLowerCase() === 'docker.exe') {
     const workflowsFile = log ? log + '.workflows.json' : null;
     let workflows = [];
     if (workflowsFile && fs.existsSync(workflowsFile)) workflows = JSON.parse(fs.readFileSync(workflowsFile, 'utf8'));
+    if (process.env.DOCKER_STUB_INCLUDE_IMPORTED === '1' && log && fs.existsSync(log + '.imported.json')) {
+      const imported = JSON.parse(fs.readFileSync(log + '.imported.json', 'utf8'));
+      if (!workflows.some(item => String(item.id) === String(imported.id))) workflows.push(imported);
+    }
     for (const workflow of workflows) process.stdout.write(String(workflow.id) + '|' + String(workflow.name) + '\n');
     process.exit(0);
   }
@@ -182,7 +190,7 @@ class ImportDryRunIsolationTest(unittest.TestCase):
         return repo
 
     def _bounded_args(self, *extra):
-        return ["-WorkflowFile", "n8n-workflows/member_forms_gateway_ingest.workflow.json", "-BindingManifestFile", str(self.binding_manifest), *extra]
+        return ["-WorkflowFile", "n8n-workflows/member_forms_gateway_ingest.workflow.json", "-BindingManifestFile", str(self.binding_manifest), "-ProjectId", "project_ref", *extra]
 
     def _run_import(self, extra_args, extra_env=None):
         env = os.environ.copy()
@@ -422,6 +430,12 @@ class ImportDryRunIsolationTest(unittest.TestCase):
         extra = json.loads(json.dumps(original)); extra["extra"] = True; cases.append(("shape", extra))
         active = json.loads(json.dumps(original)); active["posture"]["active"] = True; cases.append(("posture", active))
         stale = json.loads(json.dumps(original)); stale["deployment_admission"]["commit"] = "0" * 40; cases.append(("admission", stale))
+        missing_cursor = json.loads(json.dumps(original)); missing_cursor["source"]["cursor_binding_reference"] = ""; cases.append(("missing-cursor-binding", missing_cursor))
+        missing_watermark = json.loads(json.dumps(original)); missing_watermark["source"]["watermark_binding_reference"] = ""; cases.append(("missing-watermark-binding", missing_watermark))
+        duplicate_state_binding = json.loads(json.dumps(original)); duplicate_state_binding["source"]["watermark_binding_reference"] = duplicate_state_binding["source"]["cursor_binding_reference"]; cases.append(("duplicate-state-binding", duplicate_state_binding))
+        wrong_project = json.loads(json.dumps(original)); wrong_project["target"]["project_reference"] = "other_project"; cases.append(("wrong-project", wrong_project))
+        wrong_workflow = json.loads(json.dumps(original)); wrong_workflow["target"]["workflow_reference"] = "other_workflow"; cases.append(("wrong-workflow", wrong_workflow))
+        missing_preimage = json.loads(json.dumps(original)); missing_preimage["target"]["preimage_reference"] = ""; cases.append(("missing-preimage-binding", missing_preimage))
         for label, manifest in cases:
             with self.subTest(label=label):
                 self.binding_manifest.write_text(json.dumps(manifest), encoding="utf-8")
@@ -429,6 +443,48 @@ class ImportDryRunIsolationTest(unittest.TestCase):
                 self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
                 self._assert_no_mutating_docker_calls()
         self.binding_manifest.write_text(json.dumps(original), encoding="utf-8")
+        for label, extra_args in (
+            ("project-conflict", ("-ProjectId", "other_project")),
+            ("user-context", ("-UserId", "user_ref")),
+            ("missing-project-context", ("-ProjectId", "")),
+        ):
+            with self.subTest(label=label):
+                result = self._run_import(self._bounded_args("-DryRun", *extra_args))
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self._assert_no_mutating_docker_calls()
+
+    def test_bounded_mode_rejects_generic_hooks_before_any_hook_or_mutation(self):
+        explicit_sentinel = self.repo / "explicit-hook-sentinel.txt"
+        explicit_hook = self.repo / "explicit-hook.cjs"
+        explicit_hook.write_text(
+            f"require('fs').writeFileSync({json.dumps(explicit_sentinel.as_posix())}, 'executed');\n",
+            encoding="utf-8",
+        )
+        explicit = self._run_import(
+            self._bounded_args("-DryRun"),
+            {"N8N_WORKFLOW_HOOK_SCRIPT": str(explicit_hook)},
+        )
+        self.assertEqual(explicit.returncode, 1, explicit.stdout + explicit.stderr)
+        self.assertIn("forbids", (explicit.stdout + explicit.stderr).lower())
+        self.assertFalse(explicit_sentinel.exists())
+        self._assert_no_mutating_docker_calls()
+
+        autoload_sentinel = self.repo / "autoload-hook-sentinel.txt"
+        autoload_dir = self.repo / "scripts"
+        autoload_dir.mkdir(parents=True, exist_ok=True)
+        autoload_hook = autoload_dir / "n8n-workflow-hooks.cjs"
+        autoload_hook.write_text(
+            f"require('fs').writeFileSync({json.dumps(autoload_sentinel.as_posix())}, 'executed');\n",
+            encoding="utf-8",
+        )
+        autoload = self._run_import(
+            self._bounded_args("-DryRun"),
+            {"N8N_WORKFLOW_HOOK_AUTOLOAD": "1"},
+        )
+        self.assertEqual(autoload.returncode, 1, autoload.stdout + autoload.stderr)
+        self.assertIn("forbids", (autoload.stdout + autoload.stderr).lower())
+        self.assertFalse(autoload_sentinel.exists())
+        self._assert_no_mutating_docker_calls()
 
     def test_failed_readback_retry_preserves_original_durable_preimage(self):
         canonical = json.loads((REAL_WORKFLOW_DIR / "member_forms_gateway_ingest.workflow.json").read_text(encoding="utf-8"))
@@ -445,6 +501,106 @@ class ImportDryRunIsolationTest(unittest.TestCase):
         self.assertEqual(second.returncode, 1, second.stdout + second.stderr)
         self.assertEqual(receipts[0].read_bytes(), receipt_before)
         self.assertEqual((receipts[0].parent / "preimage.workflow.json").read_bytes(), preimage_before)
+
+    def test_recovery_reuse_rejects_deleted_modified_and_substituted_evidence(self):
+        cases = ("deleted-preimage", "modified-preimage", "corrupt-receipt", "wrong-schema", "wrong-hash", "wrong-state")
+        for label in cases:
+            with self.subTest(label=label):
+                shutil.rmtree(self.repo / ".n8n-local" / "member-gateway-recovery", ignore_errors=True)
+                shutil.rmtree(self.configured_prepared_dir, ignore_errors=True)
+                for path in (
+                    self.docker_log,
+                    Path(str(self.docker_log) + ".workflows.json"),
+                    Path(str(self.docker_log) + ".imported.json"),
+                ):
+                    path.unlink(missing_ok=True)
+                canonical = json.loads((REAL_WORKFLOW_DIR / "member_forms_gateway_ingest.workflow.json").read_text(encoding="utf-8"))
+                preimage = json.loads(json.dumps(canonical))
+                preimage["nodes"] = [{"name": "Manual", "type": "n8n-nodes-base.manualTrigger", "parameters": {}}]
+                Path(str(self.docker_log) + ".workflows.json").write_text(json.dumps([preimage]), encoding="utf-8")
+                first = self._run_import(self._bounded_args("-ConfirmLiveImport"), {"DOCKER_STUB_READBACK_STALE": "1"})
+                self.assertEqual(first.returncode, 1, first.stdout + first.stderr)
+                receipts = list((self.repo / ".n8n-local/member-gateway-recovery").rglob("recovery-receipt.json"))
+                self.assertEqual(len(receipts), 1)
+                receipt_path = receipts[0]
+                preimage_path = receipt_path.parent / "preimage.workflow.json"
+                receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+                if label == "deleted-preimage":
+                    preimage_path.unlink()
+                elif label == "modified-preimage":
+                    preimage_path.write_bytes(b'{"substituted":true}\n')
+                elif label == "corrupt-receipt":
+                    receipt_path.write_text("{", encoding="utf-8")
+                elif label == "wrong-schema":
+                    receipt["schema_version"] = "wrong.schema"
+                    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+                elif label == "wrong-hash":
+                    receipt["prepared_sha256"] = "0" * 64
+                    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+                else:
+                    receipt["preimage_state"] = "absent"
+                    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+                mutating_before = [
+                    line for line in self._docker_log_lines()
+                    if line.startswith("cp ") or "import:workflow" in line or line.startswith("restart ")
+                ]
+                second = self._run_import(self._bounded_args("-ConfirmLiveImport"), {"DOCKER_STUB_READBACK_STALE": "1"})
+                self.assertEqual(second.returncode, 1, second.stdout + second.stderr)
+                mutating_after = [
+                    line for line in self._docker_log_lines()
+                    if line.startswith("cp ") or "import:workflow" in line or line.startswith("restart ")
+                ]
+                self.assertEqual(mutating_after, mutating_before)
+
+    def test_partial_create_retry_repairs_receipt_without_repeating_mutation(self):
+        Path(str(self.docker_log) + ".workflows.json").write_text("[]", encoding="utf-8")
+        imported = Path(str(self.docker_log) + ".imported.json")
+        imported.unlink(missing_ok=True)
+        first = self._run_import(
+            self._bounded_args("-ConfirmLiveImport"),
+            {"DOCKER_STUB_READBACK_FAIL": "1"},
+        )
+        self.assertEqual(first.returncode, 1, first.stdout + first.stderr)
+        calls_before = self._docker_log_lines()
+        second = self._run_import(
+            self._bounded_args("-ConfirmLiveImport"),
+            {"DOCKER_STUB_INCLUDE_IMPORTED": "1"},
+        )
+        self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+        calls_after = self._docker_log_lines()
+        self.assertEqual(
+            [line for line in calls_after if line.startswith("cp ") or "import:workflow" in line],
+            [line for line in calls_before if line.startswith("cp ") or "import:workflow" in line],
+        )
+        receipts = list((self.repo / ".n8n-local/member-gateway-recovery").rglob("recovery-receipt.json"))
+        self.assertEqual(len(receipts), 1)
+        receipt = json.loads(receipts[0].read_text(encoding="utf-8"))
+        self.assertEqual(receipt["preimage_state"], "absent")
+        creation = json.loads((receipts[0].parent / "creation-receipt.json").read_text(encoding="utf-8"))
+        self.assertEqual(creation["ownership"], "created_by_this_transaction")
+
+    def test_partial_create_retry_rejects_nonmatching_existing_target(self):
+        Path(str(self.docker_log) + ".workflows.json").write_text("[]", encoding="utf-8")
+        imported = Path(str(self.docker_log) + ".imported.json")
+        imported.unlink(missing_ok=True)
+        first = self._run_import(
+            self._bounded_args("-ConfirmLiveImport"),
+            {"DOCKER_STUB_READBACK_FAIL": "1"},
+        )
+        self.assertEqual(first.returncode, 1, first.stdout + first.stderr)
+        changed = json.loads(imported.read_text(encoding="utf-8"))
+        changed["nodes"] = []
+        imported.write_text(json.dumps(changed), encoding="utf-8")
+        calls_before = self._docker_log_lines()
+        second = self._run_import(
+            self._bounded_args("-ConfirmLiveImport"),
+            {"DOCKER_STUB_INCLUDE_IMPORTED": "1"},
+        )
+        self.assertEqual(second.returncode, 1, second.stdout + second.stderr)
+        self.assertEqual(
+            [line for line in self._docker_log_lines() if line.startswith("cp ") or "import:workflow" in line],
+            [line for line in calls_before if line.startswith("cp ") or "import:workflow" in line],
+        )
 
     def test_new_target_success_persists_absence_and_creation_receipts(self):
         Path(str(self.docker_log) + ".workflows.json").write_text("[]", encoding="utf-8")
