@@ -85,7 +85,8 @@ class WorkerDeploymentStaticTests(unittest.TestCase):
         for marker in (
             '$taskPath = "\\X-Boundaries\\"',
             '$taskName = "AC2 Member Gateway Worker"',
-            "Disable-ScheduledTask",
+            "New-ScheduledTaskSettingsSet",
+            "-Disable",
             "Triggers).Count -ne 0",
             '"IgnoreNew"',
             '"PT10M"',
@@ -135,7 +136,7 @@ class N8nDeploymentStaticTests(unittest.TestCase):
         self.assertNotIn("Authorization", WORKFLOW.read_text(encoding="utf-8"))
 
     def test_binding_template_and_renderer_are_canonical_and_closed(self):
-        canonical = self.template["canonical"]
+        canonical = self.template["source_provenance"]
         self.assertEqual(canonical["commit"], "52308eebb95d9bc4f5a09fbe036c197a5e95b176")
         self.assertEqual(canonical["tree"], "3ab7e3363b7189d7d1bb79ec8a1988eb23e1c7b3")
         self.assertEqual(canonical["parent"], "1052f40e62a5ff5884c8ba49aac8114cc634b81c")
@@ -147,6 +148,8 @@ class N8nDeploymentStaticTests(unittest.TestCase):
         self.assertIn("binding_question_map_hash_mismatch", self.renderer)
         self.assertIn("binding_output_not_ignored", self.renderer)
         self.assertIn("binding_output_acl_permissive", self.renderer)
+        self.assertIn("binding_output_preimage_exists", self.renderer)
+        self.assertIn("binding_deployment_admission_mismatch", self.renderer)
         self.assertIn("binding_secret_content_detected", self.renderer)
 
     def test_posture_contract_remains_inactive_manual_private_and_retention_free(self):
@@ -193,16 +196,125 @@ class N8nDeploymentStaticTests(unittest.TestCase):
 @unittest.skipUnless(os.name == "nt", "Windows PowerShell behavior is Windows-only")
 @unittest.skipUnless(shutil.which("powershell"), "Windows PowerShell is required")
 class WorkerDeploymentPowerShellTests(unittest.TestCase):
+    def test_task_duration_registration_is_initially_disabled_and_invalid_contract_rolls_back(self):
+        command = rf'''
+. '{INSTALLER}' -LibraryOnly
+$global:registered = $false; $global:unregistered = $false; $global:invalid = $false; $global:first_error = $null
+$WorkerAccount = 'DOMAIN\worker'
+$secure = [Security.SecureString]::new(); foreach($char in 'test-only'.ToCharArray()){{$secure.AppendChar($char)}}; $secure.MakeReadOnly()
+$TaskCredential = [Management.Automation.PSCredential]::new($WorkerAccount, $secure)
+function New-ScheduledTaskAction {{ param($Execute,$Argument); [pscustomobject]@{{ Arguments=$Argument }} }}
+function New-ScheduledTaskSettingsSet {{ param($MultipleInstances,$ExecutionTimeLimit,$RestartCount,$StartWhenAvailable,[switch]$Disable); [pscustomobject]@{{ MultipleInstances=$MultipleInstances; ExecutionTimeLimit=$ExecutionTimeLimit; RestartCount=$RestartCount; StartWhenAvailable=$StartWhenAvailable; InitiallyDisabled=[bool]$Disable }} }}
+function New-ScheduledTaskPrincipal {{ [pscustomobject]@{{}} }}
+function New-ScheduledTask {{ param($Action,$Settings,$Principal); [pscustomobject]@{{ Actions=@($Action); Settings=$Settings; Triggers=@() }} }}
+function Register-ScheduledTask {{ param($TaskPath,$TaskName,$InputObject,$User,$Password,[switch]$Force); $global:registered=$true; $global:registeredTask=$InputObject }}
+function Get-ScheduledTask {{ [pscustomobject]@{{ State='Disabled'; Triggers=@(); Actions=$global:registeredTask.Actions; Settings=$global:registeredTask.Settings }} }}
+function Unregister-ScheduledTask {{ $global:unregistered=$true }}
+try {{ Register-XbWorkerScheduledTask -LauncherPath 'C:\Program Files\X-Boundaries\MemberGatewayWorker\launch_ac2_member_gateway_worker.ps1' }} catch {{ $global:first_error=$_.Exception.Message }}
+$accepted = $global:registered -and $global:registeredTask.Settings.InitiallyDisabled -and $global:registeredTask.Settings.ExecutionTimeLimit -eq [TimeSpan]::FromMinutes(10)
+function Get-ScheduledTask {{ [pscustomobject]@{{ State='Disabled'; Triggers=@(); Actions=$global:registeredTask.Actions; Settings=[pscustomobject]@{{MultipleInstances='IgnoreNew';ExecutionTimeLimit='PT11M';RestartCount=0;StartWhenAvailable=$false}} }} }}
+try {{ Register-XbWorkerScheduledTask -LauncherPath 'x'; }} catch {{ $global:invalid=$true; if($global:XbTaskCreated){{Unregister-ScheduledTask}} }}
+[pscustomobject]@{{accepted=$accepted;invalid=$global:invalid;rolled_back=$global:unregistered;registered=$global:registered;task_created=$global:XbTaskCreated;initially_disabled=$global:registeredTask.Settings.InitiallyDisabled;limit=[string]$global:registeredTask.Settings.ExecutionTimeLimit;first_error=$global:first_error}} | ConvertTo-Json -Compress
+'''
+        result = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-NonInteractive", "-Command", command], cwd=ROOT, capture_output=True, text=True, check=False, timeout=120)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        observed = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertTrue(observed["accepted"], observed)
+        self.assertTrue(observed["invalid"], observed)
+        self.assertTrue(observed["rolled_back"], observed)
+
+    def test_launcher_concurrently_drains_and_reaps_failure_cases(self):
+        cases = {
+            "stderr_saturation": ("[Console]::Error.Write(('PRIVATE-ERR-' + ('x' * 1048576))); [Console]::Out.Write('{\"status\":\"disabled\",\"writes\":0,\"dispatch_fence\":false}')", 0),
+            "malformed": ("[Console]::Out.Write('not-json')", 1),
+            "nonzero": ("[Console]::Out.Write('{\"status\":\"disabled\",\"writes\":0,\"dispatch_fence\":false}'); exit 7", 1),
+        }
+        for label, (body, expected) in cases.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory(prefix="xb-launch-case-") as temp:
+                root = Path(temp); install = root / "install"; runtime = root / "runtime"; install.mkdir()
+                (install / "ac2_member_gateway_worker.ps1").write_text(body, encoding="utf-8")
+                result = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-NonInteractive", "-File", str(LAUNCHER), "-Mode", "DisabledProof", "-InstallRoot", str(install), "-RuntimeRoot", str(runtime), "-ExecutionTimeoutMilliseconds", "5000"], cwd=ROOT, capture_output=True, text=True, check=False, timeout=20)
+                self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+                self.assertNotIn("PRIVATE-ERR", result.stdout + result.stderr)
+                output = json.loads(result.stdout.strip().splitlines()[-1])
+                self.assertEqual(output["terminal_status"], "disabled_proof_pass" if expected == 0 else "launcher_failed")
+
+        with tempfile.TemporaryDirectory(prefix="xb-launch-hang-") as temp:
+            root = Path(temp); install = root / "install"; runtime = root / "runtime"; install.mkdir(); pid_path = root / "pid.txt"
+            (install / "ac2_member_gateway_worker.ps1").write_text(f"$PID | Set-Content -LiteralPath '{pid_path}'; Start-Sleep -Seconds 30", encoding="utf-8")
+            result = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-NonInteractive", "-File", str(LAUNCHER), "-Mode", "DisabledProof", "-InstallRoot", str(install), "-RuntimeRoot", str(runtime), "-ExecutionTimeoutMilliseconds", "500"], cwd=ROOT, capture_output=True, text=True, check=False, timeout=20)
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            pid = int(pid_path.read_text().strip())
+            probe = subprocess.run(["powershell", "-NoProfile", "-Command", f"if(Get-Process -Id {pid} -ErrorAction SilentlyContinue){{exit 1}}"], check=False)
+            self.assertEqual(probe.returncode, 0, "timed-out owned child must be reaped")
+
+    def test_uninstall_ownership_failures_leave_all_state_untouched(self):
+        package_names = ("ac2_member_gateway_worker.ps1", "ac2_member_gateway_worker_lib.ps1", "ac2_member_gateway_autocount_adapter.ps1", "launch_ac2_member_gateway_worker.ps1", "test_ac2_member_gateway_autocount_dependencies.ps1")
+        for label in ("malformed", "partial", "unexpected", "replaced-task"):
+            with self.subTest(label=label), tempfile.TemporaryDirectory(prefix="xb-uninstall-") as temp:
+                root = Path(temp); install = root / "install"; runtime = root / "runtime"; install.mkdir()
+                for child in ("config", "secrets", "logs", "rollback"): (runtime / child).mkdir(parents=True)
+                entries = []
+                for name in package_names:
+                    data = ("owned-" + name).encode(); (install / name).write_bytes(data); entries.append({"name": name, "sha256": hashlib.sha256(data).hexdigest()})
+                manifest = {"schema_version":"xb.member.gateway.worker.installation.v1", "reviewed_source":{"commit":"1"*40,"tree":"2"*40}, "install_root":"C:\\Program Files\\X-Boundaries\\MemberGatewayWorker\\", "runtime_root":"C:\\ProgramData\\X-Boundaries\\MemberGatewayWorker\\", "package_files":entries, "task":{"path":"\\X-Boundaries\\","name":"AC2 Member Gateway Worker","enabled":False,"trigger_count":0,"action_mode":"DisabledProof","production_switches":[],"multiple_instances":"IgnoreNew","execution_time_limit":"PT10M","restart_count":0,"start_when_available":False}, "rollback_owned_roots":["config","secrets","logs","rollback"]}
+                manifest_path = install / "installation-manifest.json"
+                if label == "malformed": manifest_path.write_text("{", encoding="utf-8")
+                else:
+                    if label == "partial": manifest["package_files"] = manifest["package_files"][:-1]
+                    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+                if label == "unexpected": (install / "foreign.txt").write_text("foreign", encoding="utf-8")
+                before = {p.relative_to(root).as_posix(): p.read_bytes() for p in root.rglob("*") if p.is_file()}
+                bad_action = "-Mode Production" if label == "replaced-task" else "-Mode DisabledProof"
+                command = f". '{INSTALLER}' -LibraryOnly; $InstallRoot='{install}'; $RuntimeRoot='{runtime}'; function Get-ScheduledTask {{ [pscustomobject]@{{State='Disabled';Triggers=@();Actions=@([pscustomobject]@{{Arguments='{bad_action}'}});Settings=[pscustomobject]@{{MultipleInstances='IgnoreNew';ExecutionTimeLimit='PT10M';RestartCount=0;StartWhenAvailable=$false}}}} }}; try {{ Assert-XbUninstallOwnership; exit 9 }} catch {{ exit 0 }}"
+                result = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-NonInteractive", "-Command", command], cwd=ROOT, capture_output=True, text=True, check=False, timeout=120)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                after = {p.relative_to(root).as_posix(): p.read_bytes() for p in root.rglob("*") if p.is_file()}
+                self.assertEqual(after, before)
+
     def test_validate_only_manifest_and_disabled_proof(self):
-        validate = subprocess.run(
-            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-NonInteractive", "-File", str(INSTALLER), "-Operation", "ValidateOnly"],
-            cwd=ROOT, capture_output=True, text=True, check=False, timeout=120,
-        )
-        self.assertEqual(validate.returncode, 0, validate.stdout + validate.stderr)
-        manifest = json.loads(validate.stdout)
-        self.assertEqual(manifest["task"]["trigger_count"], 0)
-        self.assertFalse(manifest["task"]["enabled"])
-        self.assertEqual(manifest["task"]["action_mode"], "DisabledProof")
+        with tempfile.TemporaryDirectory(prefix="xb-reviewed-package-") as temp:
+            checkout = Path(temp) / "repo"
+            scripts = checkout / "scripts"
+            scripts.mkdir(parents=True)
+            for name in (
+                "install_ac2_member_gateway_worker.ps1", "ac2_member_gateway_worker.ps1",
+                "ac2_member_gateway_worker_lib.ps1", "ac2_member_gateway_autocount_adapter.ps1",
+                "launch_ac2_member_gateway_worker.ps1", "test_ac2_member_gateway_autocount_dependencies.ps1",
+            ):
+                shutil.copy(SCRIPTS / name, scripts / name)
+            subprocess.run(["git", "init"], cwd=checkout, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "WJ"], cwd=checkout, check=True)
+            subprocess.run(["git", "config", "user.email", "10020253+weijunswj@users.noreply.github.com"], cwd=checkout, check=True)
+            subprocess.run(["git", "add", "scripts"], cwd=checkout, check=True)
+            subprocess.run(["git", "commit", "-m", "reviewed package"], cwd=checkout, check=True, capture_output=True)
+            commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=checkout, text=True).strip()
+            tree = subprocess.check_output(["git", "rev-parse", "HEAD^{tree}"], cwd=checkout, text=True).strip()
+            names = (
+                "ac2_member_gateway_worker.ps1", "ac2_member_gateway_worker_lib.ps1",
+                "ac2_member_gateway_autocount_adapter.ps1", "launch_ac2_member_gateway_worker.ps1",
+                "test_ac2_member_gateway_autocount_dependencies.ps1",
+            )
+            identity = {
+                "schema_version": "xb.member.gateway.worker.reviewed-package.v1",
+                "source": {"commit": commit, "tree": tree},
+                "package_files": [
+                    {"name": name, "sha256": hashlib.sha256((scripts / name).read_bytes()).hexdigest(),
+                     "git_blob": subprocess.check_output(["git", "rev-parse", f"HEAD:scripts/{name}"], cwd=checkout, text=True).strip()}
+                    for name in names
+                ],
+            }
+            identity_path = checkout / "reviewed-package.json"
+            identity_path.write_text(json.dumps(identity), encoding="utf-8")
+            validate = subprocess.run(
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-NonInteractive", "-File", str(scripts / INSTALLER.name), "-Operation", "ValidateOnly", "-ReviewedPackageManifestPath", str(identity_path)],
+                cwd=checkout, capture_output=True, text=True, check=False, timeout=120,
+            )
+            self.assertEqual(validate.returncode, 0, validate.stdout + validate.stderr)
+            manifest = json.loads(validate.stdout)
+            self.assertEqual(manifest["task"]["trigger_count"], 0)
+            self.assertFalse(manifest["task"]["enabled"])
+            self.assertEqual(manifest["task"]["action_mode"], "DisabledProof")
 
         with tempfile.TemporaryDirectory(prefix="xb-worker-proof-") as temp:
             root = Path(temp)
@@ -226,6 +338,33 @@ class WorkerDeploymentPowerShellTests(unittest.TestCase):
             event = json.loads(logs[0].read_text(encoding="utf-8-sig").strip())
             self.assertEqual(set(event), {"utc_timestamp", "run_id", "launcher_mode", "exit_code", "terminal_status", "write_count", "support_reference"})
 
+    def test_reviewed_package_rejects_changed_missing_and_staged_mismatch(self):
+        names = ("ac2_member_gateway_worker.ps1", "ac2_member_gateway_worker_lib.ps1", "ac2_member_gateway_autocount_adapter.ps1", "launch_ac2_member_gateway_worker.ps1", "test_ac2_member_gateway_autocount_dependencies.ps1")
+        with tempfile.TemporaryDirectory(prefix="xb-package-negative-") as temp:
+            checkout = Path(temp) / "repo"; scripts = checkout / "scripts"; scripts.mkdir(parents=True)
+            shutil.copy(INSTALLER, scripts / INSTALLER.name)
+            for name in names: shutil.copy(SCRIPTS / name, scripts / name)
+            subprocess.run(["git", "init"], cwd=checkout, check=True, capture_output=True); subprocess.run(["git", "config", "user.name", "WJ"], cwd=checkout, check=True); subprocess.run(["git", "config", "user.email", "10020253+weijunswj@users.noreply.github.com"], cwd=checkout, check=True)
+            subprocess.run(["git", "add", "scripts"], cwd=checkout, check=True); subprocess.run(["git", "commit", "-m", "reviewed"], cwd=checkout, check=True, capture_output=True)
+            commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=checkout, text=True).strip(); tree = subprocess.check_output(["git", "rev-parse", "HEAD^{tree}"], cwd=checkout, text=True).strip()
+            identity = {"schema_version":"xb.member.gateway.worker.reviewed-package.v1","source":{"commit":commit,"tree":tree},"package_files":[{"name":name,"sha256":hashlib.sha256((scripts/name).read_bytes()).hexdigest(),"git_blob":subprocess.check_output(["git","rev-parse",f"HEAD:scripts/{name}"],cwd=checkout,text=True).strip()} for name in names]}
+            identity_path = checkout / "identity.json"
+            def run(candidate):
+                identity_path.write_text(json.dumps(candidate), encoding="utf-8")
+                return subprocess.run(["powershell","-NoProfile","-ExecutionPolicy","Bypass","-NonInteractive","-File",str(scripts/INSTALLER.name),"-Operation","ValidateOnly","-ReviewedPackageManifestPath",str(identity_path)],cwd=checkout,capture_output=True,text=True,check=False,timeout=120)
+            missing = json.loads(json.dumps(identity)); missing["package_files"] = missing["package_files"][:-1]
+            self.assertEqual(run(missing).returncode, 1)
+            (scripts / names[0]).write_text("changed", encoding="utf-8")
+            self.assertEqual(run(identity).returncode, 1)
+            shutil.copy(SCRIPTS / names[0], scripts / names[0])
+            identity_path.write_text(json.dumps(identity), encoding="utf-8")
+            stage = checkout / "stage"; stage.mkdir()
+            for name in names: shutil.copy(scripts / name, stage / name)
+            (stage / names[-1]).write_text("staged mismatch", encoding="utf-8")
+            command = f". '{scripts / INSTALLER.name}' -LibraryOnly; $i=Get-Content -Raw '{identity_path}'|ConvertFrom-Json; try{{Assert-XbStagedPackageIdentity -StageRoot '{stage}' -ReviewedIdentity $i;exit 9}}catch{{exit 0}}"
+            staged = subprocess.run(["powershell","-NoProfile","-ExecutionPolicy","Bypass","-NonInteractive","-Command",command],cwd=checkout,check=False)
+            self.assertEqual(staged.returncode, 0)
+
     def test_renderer_template_validation_only(self):
         result = subprocess.run(
             ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-NonInteractive", "-File", str(RENDERER), "-ValidateTemplateOnly"],
@@ -234,7 +373,26 @@ class WorkerDeploymentPowerShellTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         output = json.loads(result.stdout)
         self.assertEqual(output["status"], "template_valid")
-        self.assertTrue(output["canonical_workflow_match"])
+        self.assertTrue(output["source_provenance_workflow_match"])
+
+    def test_renderer_rejects_closed_schema_fixed_value_and_placeholder_relocation_drift(self):
+        original = json.loads(TEMPLATE.read_text(encoding="utf-8"))
+        cases = {}
+        extra = json.loads(json.dumps(original)); extra["unexpected"] = True; cases["extra"] = extra
+        active = json.loads(json.dumps(original)); active["posture"]["active"] = True; cases["active"] = active
+        cred = json.loads(json.dumps(original)); cred["credentials"]["gateway_source_bearer"]["type"] = "httpBasicAuth"; cases["credential"] = cred
+        role = json.loads(json.dumps(original)); role["credentials"]["gateway_source_bearer"]["nodes"][0] = "Wrong node"; cases["node-role"] = role
+        relocated = json.loads(json.dumps(original)); relocated["endpoints"]["forms_api_url"], relocated["endpoints"]["source_cursor_url"] = relocated["endpoints"]["source_cursor_url"], relocated["endpoints"]["forms_api_url"]; cases["placeholder-location"] = relocated
+        temp_path = ROOT / ".tmp" / "member-gateway-g3" / "template-under-test.json"
+        temp_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            for label, candidate in cases.items():
+                with self.subTest(label=label):
+                    temp_path.write_text(json.dumps(candidate), encoding="utf-8")
+                    result = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-NonInteractive", "-File", str(RENDERER), "-TemplatePath", temp_path.relative_to(ROOT).as_posix(), "-ValidateTemplateOnly"], cwd=ROOT, capture_output=True, text=True, check=False, timeout=120)
+                    self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        finally:
+            temp_path.unlink(missing_ok=True)
 
     def test_renderer_writes_only_private_ignored_closed_manifest(self):
         questions = {
@@ -261,6 +419,10 @@ class WorkerDeploymentPowerShellTests(unittest.TestCase):
                 "-TargetProjectReference", "project_ref_01", "-TargetWorkflowReference", "workflow_ref_01",
                 "-TargetPreimageReference", "preimage_absent_ref_01",
             ]
+            commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
+            tree = subprocess.check_output(["git", "rev-parse", "HEAD^{tree}"], cwd=ROOT, text=True).strip()
+            parent = subprocess.check_output(["git", "rev-parse", "HEAD^"], cwd=ROOT, text=True).strip()
+            command += ["-AdmittedDeploymentCommit", commit, "-AdmittedDeploymentTree", tree, "-AdmittedDeploymentParent", parent]
             try:
                 result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True, check=False, timeout=120)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -270,6 +432,31 @@ class WorkerDeploymentPowerShellTests(unittest.TestCase):
                 self.assertFalse(manifest["posture"]["active"])
             finally:
                 output_path.unlink(missing_ok=True)
+
+    def test_renderer_preflight_and_acl_failures_never_overwrite_or_leave_private_output(self):
+        output_path = ROOT / ".tmp/member-gateway-g3/member_forms_gateway_ingest.binding.json"
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"sentinel-do-not-overwrite")
+        common = ["-FormsApiUrl", "https://forms.googleapis.com/v1/forms/form_ref_01/responses", "-SourceCursorUrl", "https://gateway.invalid/v1/source/cursor", "-GatewayIngestUrl", "https://gateway.invalid/v1/source-events", "-PageCheckpointUrl", "https://gateway.invalid/v1/source/cursor/page", "-FormIdReference", "form_ref_01"]
+        commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(); tree = subprocess.check_output(["git", "rev-parse", "HEAD^{tree}"], cwd=ROOT, text=True).strip(); parent = subprocess.check_output(["git", "rev-parse", "HEAD^"], cwd=ROOT, text=True).strip()
+        with tempfile.TemporaryDirectory(prefix="xb-render-failure-") as temp:
+            questions = {"name":"q1","phone":"q2","email":"q3","birthday_month":"q4","marketing_consent":"q5","pdpa_acknowledged":"q6"}
+            qpath = Path(temp) / "q.json"; qpath.write_text(json.dumps(questions), encoding="utf-8")
+            qhash = hashlib.sha256(json.dumps(questions, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+            args = common + ["-QuestionMapPath", str(qpath), "-AcceptedQuestionMapSha256", qhash, "-CursorBindingReference", "c", "-WatermarkBindingReference", "w", "-GoogleCredentialReference", "g", "-GatewayCredentialReference", "b", "-TargetProjectReference", "p", "-TargetWorkflowReference", "t", "-TargetPreimageReference", "r", "-AdmittedDeploymentCommit", commit, "-AdmittedDeploymentTree", tree, "-AdmittedDeploymentParent", parent]
+            result = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-File", str(RENDERER), *args], cwd=ROOT, capture_output=True, text=True, check=False, timeout=120)
+            self.assertEqual(result.returncode, 1)
+            self.assertEqual(output_path.read_bytes(), b"sentinel-do-not-overwrite")
+            output_path.unlink()
+            ps_args = " ".join(value if value.startswith("-") else "'" + value.replace("'", "''") + "'" for value in args)
+            command = f". '{RENDERER}' {ps_args}; function Set-XbPrivateAcl {{ throw 'forced_acl_failure' }}; try {{ Invoke-XbBindingRenderer }} catch {{ }}; if(Test-Path -LiteralPath '{output_path}'){{exit 2}}; if(Get-ChildItem -LiteralPath '{output_path.parent}' -Filter '.binding-stage-*' -Force){{exit 3}}"
+            failed_acl = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-NonInteractive", "-Command", command], cwd=ROOT, capture_output=True, text=True, check=False, timeout=120)
+            self.assertEqual(failed_acl.returncode, 0, failed_acl.stdout + failed_acl.stderr)
+            for mode, expected in (("nonignored", "binding_output_not_ignored"), ("tracked", "binding_output_tracked")):
+                mock_git = "function git { if($args -contains 'check-ignore'){ $global:LASTEXITCODE=" + ("1" if mode == "nonignored" else "0") + "; return }; if($args -contains 'ls-files'){ $global:LASTEXITCODE=0; " + ("return" if mode == "nonignored" else "Write-Output '.tmp/member-gateway-g3/member_forms_gateway_ingest.binding.json'; return") + " }; & git.exe @args; $global:LASTEXITCODE=$LASTEXITCODE }"
+                safety_command = f". '{RENDERER}' {ps_args}; {mock_git}; try {{ Invoke-XbBindingRenderer; exit 4 }} catch {{ if($_.Exception.Message -cne '{expected}'){{Write-Error $_; exit 5}} }}; if(Test-Path -LiteralPath '{output_path}'){{exit 6}}"
+                safety = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-NonInteractive", "-Command", safety_command], cwd=ROOT, capture_output=True, text=True, check=False, timeout=120)
+                self.assertEqual(safety.returncode, 0, f"{mode}: {safety.stdout}{safety.stderr}")
 
 
 if __name__ == "__main__":

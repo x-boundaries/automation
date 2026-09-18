@@ -67,8 +67,16 @@ if (path.basename(process.execPath).toLowerCase() === 'docker.exe') {
 
   if (args[0] === 'exec' && args.includes('export:workflow')) {
     const workflowsFile = log ? log + '.workflows.json' : null;
+    const importedFile = log ? log + '.imported.json' : null;
+    if (importedFile && fs.existsSync(importedFile) && process.env.DOCKER_STUB_READBACK_STALE !== '1') {
+      process.stdout.write(JSON.stringify([JSON.parse(fs.readFileSync(importedFile, 'utf8'))]) + '\n');
+      process.exit(0);
+    }
     if (workflowsFile && fs.existsSync(workflowsFile)) {
-      process.stdout.write(fs.readFileSync(workflowsFile, 'utf8') + '\n');
+      let workflows = JSON.parse(fs.readFileSync(workflowsFile, 'utf8'));
+      const idArg = args.find(value => value.startsWith('--id='));
+      if (idArg) workflows = workflows.filter(item => String(item.id) === idArg.slice(5));
+      process.stdout.write(JSON.stringify(workflows) + '\n');
       process.exit(0);
     }
     if (process.env.DOCKER_STUB_WORKFLOWS_FILE) {
@@ -81,6 +89,19 @@ if (path.basename(process.execPath).toLowerCase() === 'docker.exe') {
     }
     process.stderr.write('No workflows found with specified filters\n');
     process.exit(1);
+  }
+
+  if (args[0] === 'exec' && args.includes('list:workflow')) {
+    const workflowsFile = log ? log + '.workflows.json' : null;
+    let workflows = [];
+    if (workflowsFile && fs.existsSync(workflowsFile)) workflows = JSON.parse(fs.readFileSync(workflowsFile, 'utf8'));
+    for (const workflow of workflows) process.stdout.write(String(workflow.id) + '|' + String(workflow.name) + '\n');
+    process.exit(0);
+  }
+
+  if (args[0] === 'cp') {
+    if (log) fs.copyFileSync(args[1], log + '.imported.json');
+    process.exit(0);
   }
 
   process.exit(0);
@@ -117,7 +138,7 @@ class ImportDryRunIsolationTest(unittest.TestCase):
 
     def _build_fixture_repo(self, base):
         repo = base / "repo"
-        (repo / ".git").mkdir(parents=True)
+        repo.mkdir(parents=True)
         workflow_dir = repo / "n8n-workflows"
         scripts_dir = workflow_dir / "scripts"
         scripts_dir.mkdir(parents=True)
@@ -128,7 +149,40 @@ class ImportDryRunIsolationTest(unittest.TestCase):
         for helper_file in sorted(REAL_SCRIPTS_DIR.iterdir()):
             if helper_file.is_file():
                 shutil.copy(helper_file, scripts_dir / helper_file.name)
+        subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "WJ"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.email", "10020253+weijunswj@users.noreply.github.com"], cwd=repo, check=True)
+        (repo / "initial.txt").write_text("parent\n", encoding="utf-8")
+        (repo / ".gitignore").write_text(".tmp/\n.n8n-local/\n", encoding="utf-8")
+        subprocess.run(["git", "add", "initial.txt", ".gitignore"], cwd=repo, check=True)
+        subprocess.run(["git", "commit", "-m", "parent"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(["git", "add", "n8n-workflows"], cwd=repo, check=True)
+        subprocess.run(["git", "commit", "-m", "deployment checkout"], cwd=repo, check=True, capture_output=True)
+        commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+        tree = subprocess.check_output(["git", "rev-parse", "HEAD^{tree}"], cwd=repo, text=True).strip()
+        parent = subprocess.check_output(["git", "rev-parse", "HEAD^"], cwd=repo, text=True).strip()
+        questions = {"name": "q_name", "phone": "q_phone", "email": "q_email", "birthday_month": "q_birth", "marketing_consent": "q_marketing", "pdpa_acknowledged": "q_pdpa"}
+        qhash = __import__("hashlib").sha256(json.dumps(questions, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        manifest = json.loads((REPO_ROOT / "config/member_forms_gateway_ingest.binding.template.json").read_text(encoding="utf-8"))
+        rendered = json.dumps(manifest)
+        values = {
+            "FORMS_API_URL": "https://forms.googleapis.com/v1/forms/form_ref/responses", "SOURCE_CURSOR_URL": "https://gateway.invalid/v1/source/cursor",
+            "GATEWAY_INGEST_URL": "https://gateway.invalid/v1/source-events", "PAGE_CHECKPOINT_URL": "https://gateway.invalid/v1/source/cursor/page",
+            "FORM_ID_REFERENCE": "form_ref", "QUESTION_MAP_SHA256": qhash, "QUESTION_NAME_REFERENCE": questions["name"], "QUESTION_PHONE_REFERENCE": questions["phone"],
+            "QUESTION_EMAIL_REFERENCE": questions["email"], "QUESTION_BIRTHDAY_MONTH_REFERENCE": questions["birthday_month"], "QUESTION_MARKETING_CONSENT_REFERENCE": questions["marketing_consent"],
+            "QUESTION_PDPA_ACKNOWLEDGED_REFERENCE": questions["pdpa_acknowledged"], "CURSOR_BINDING_REFERENCE": "cursor_ref", "WATERMARK_BINDING_REFERENCE": "watermark_ref",
+            "GOOGLE_CREDENTIAL_REFERENCE": "google_cred", "GATEWAY_CREDENTIAL_REFERENCE": "gateway_cred", "TARGET_PROJECT_REFERENCE": "project_ref",
+            "TARGET_WORKFLOW_REFERENCE": "xbMemberGatewayTemplate02", "TARGET_PREIMAGE_REFERENCE": "preimage_ref", "DEPLOYMENT_COMMIT": commit, "DEPLOYMENT_TREE": tree, "DEPLOYMENT_PARENT": parent,
+        }
+        for key, value in values.items(): rendered = rendered.replace("{{" + key + "}}", value)
+        binding_path = repo / ".tmp" / "test-binding.json"
+        binding_path.parent.mkdir(parents=True)
+        binding_path.write_text(json.dumps(json.loads(rendered)), encoding="utf-8")
+        self.binding_manifest = binding_path
         return repo
+
+    def _bounded_args(self, *extra):
+        return ["-WorkflowFile", "n8n-workflows/member_forms_gateway_ingest.workflow.json", "-BindingManifestFile", str(self.binding_manifest), *extra]
 
     def _run_import(self, extra_args, extra_env=None):
         env = os.environ.copy()
@@ -249,11 +303,7 @@ class ImportDryRunIsolationTest(unittest.TestCase):
         self._assert_no_mutating_docker_calls()
 
     def test_single_workflow_mode_plans_exactly_one_canonical_input(self):
-        result = self._run_import([
-            "-WorkflowFile",
-            "n8n-workflows/member_forms_gateway_ingest.workflow.json",
-            "-DryRun",
-        ])
+        result = self._run_import(self._bounded_args("-DryRun"))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("Would import      : 1", result.stdout)
         self.assertIn("member_forms_gateway_ingest.workflow.json", result.stdout)
@@ -264,13 +314,13 @@ class ImportDryRunIsolationTest(unittest.TestCase):
 
     def test_single_workflow_mode_rejects_noncanonical_file_and_broad_mode_mix(self):
         wrong = self._run_import([
-            "-WorkflowFile", "n8n-workflows/member_create_uat_result_mapping.workflow.json", "-DryRun"
+            "-WorkflowFile", "n8n-workflows/member_create_uat_result_mapping.workflow.json", "-BindingManifestFile", str(self.binding_manifest), "-DryRun"
         ])
         self.assertEqual(wrong.returncode, 1)
         self.assertIn("immediate canonical child", wrong.stdout + wrong.stderr)
         mixed = self._run_import([
             "-WorkflowFile", "n8n-workflows/member_forms_gateway_ingest.workflow.json",
-            "-WorkflowDir", "n8n-workflows", "-DryRun",
+            "-BindingManifestFile", str(self.binding_manifest), "-WorkflowDir", "n8n-workflows", "-DryRun",
         ])
         self.assertEqual(mixed.returncode, 1)
         self.assertIn("mutually exclusive", mixed.stdout + mixed.stderr)
@@ -306,11 +356,108 @@ class ImportDryRunIsolationTest(unittest.TestCase):
                 live_fixture = Path(str(self.docker_log) + ".workflows.json")
                 live_fixture.write_text(json.dumps(workflows), encoding="utf-8")
                 result = self._run_import(
-                    ["-WorkflowFile", "n8n-workflows/member_forms_gateway_ingest.workflow.json", "-DryRun"],
+                    self._bounded_args("-DryRun"),
                 )
                 self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-                self.assertIn("BLOCK", result.stdout + result.stderr)
+                if label == "ambiguous":
+                    self.assertIn("ambiguous", (result.stdout + result.stderr).lower())
+                else:
+                    self.assertIn("BLOCK", result.stdout + result.stderr)
                 self._assert_no_mutating_docker_calls()
+
+    def test_bounded_mode_exports_only_exact_target_and_applies_exact_manifest(self):
+        canonical = json.loads((REAL_WORKFLOW_DIR / "member_forms_gateway_ingest.workflow.json").read_text(encoding="utf-8"))
+        target = json.loads(json.dumps(canonical))
+        target["nodes"] = [{"name": "Manual", "type": "n8n-nodes-base.manualTrigger", "parameters": {}}]
+        unrelated = {"id": "unrelated", "name": "Unrelated private workflow", "active": False, "nodes": [], "connections": {}, "settings": {}, "staticData": None}
+        live_fixture = Path(str(self.docker_log) + ".workflows.json")
+        live_fixture.write_text(json.dumps([target, unrelated]), encoding="utf-8")
+        bindings = self.repo / ".n8n-local" / "n8n-credential-bindings.json"
+        bindings.parent.mkdir(parents=True)
+        bindings.write_bytes(b'{"sentinel":"unchanged"}\n')
+
+        result = self._run_import(self._bounded_args())
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("Live import requires explicit confirmation", result.stdout + result.stderr)
+        prepared = json.loads((self.configured_prepared_dir / "member_forms_gateway_ingest.workflow.live-import.json").read_text(encoding="utf-8"))
+        config = next(node for node in prepared["nodes"] if node["name"] == "Repository-safe source configuration")
+        values = {item["name"]: item["value"] for item in config["parameters"]["assignments"]["assignments"]}
+        self.assertFalse(values["activation_enabled"])
+        self.assertEqual(values["gateway_ingest_url"], "https://gateway.invalid/v1/source-events")
+        google = next(node for node in prepared["nodes"] if node["name"].startswith("Google Forms single page"))
+        self.assertEqual(set(google["credentials"]), {"googleOAuth2Api"})
+        self.assertEqual(google["parameters"]["authentication"], "predefinedCredentialType")
+        for name in ("Read durable source cursor", "Protected XB Gateway ingest (configured outside repo)", "Commit durable page checkpoint"):
+            node = next(item for item in prepared["nodes"] if item["name"] == name)
+            self.assertEqual(set(node["credentials"]), {"httpBearerAuth"})
+            self.assertEqual(node["parameters"]["genericAuthType"], "httpBearerAuth")
+            self.assertNotIn("Authorization", json.dumps(node))
+        self.assertNotIn("QUESTION_ID_", next(node for node in prepared["nodes"] if node["name"] == "Canonicalize source page")["parameters"]["jsCode"])
+        self.assertEqual(bindings.read_bytes(), b'{"sentinel":"unchanged"}\n')
+        calls = self._docker_log_lines()
+        self.assertTrue(any("list:workflow" in line for line in calls))
+        self.assertTrue(any("--id=xbMemberGatewayTemplate02" in line for line in calls))
+        self.assertFalse(any("--all" in line for line in calls))
+        self.assertFalse(any("--id=unrelated" in line for line in calls))
+        self._assert_no_mutating_docker_calls()
+
+    def test_bounded_metadata_rejects_case_distinct_duplicates_and_name_id_collisions(self):
+        cases = {
+            "case-distinct": [{"id": "AbC", "name": "one"}, {"id": "abc", "name": "two"}],
+            "contradictory-duplicate": [{"id": "xbMemberGatewayTemplate02", "name": "one"}, {"id": "xbMemberGatewayTemplate02", "name": "two"}],
+            "name-id-collision": [{"id": "Member Gateway - Google Forms durable source adapter (inactive)", "name": "other"}],
+        }
+        for label, workflows in cases.items():
+            with self.subTest(label=label):
+                Path(str(self.docker_log) + ".workflows.json").write_text(json.dumps(workflows), encoding="utf-8")
+                result = self._run_import(self._bounded_args("-DryRun"))
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn("ambiguous", (result.stdout + result.stderr).lower() if label == "name-id-collision" else (result.stdout + result.stderr).lower().replace("duplicate", "ambiguous"))
+                self._assert_no_mutating_docker_calls()
+
+    def test_bounded_manifest_and_workflow_drift_fail_before_import(self):
+        original = json.loads(self.binding_manifest.read_text(encoding="utf-8"))
+        cases = []
+        wrong_type = json.loads(json.dumps(original)); wrong_type["credentials"]["gateway_source_bearer"]["type"] = "httpBasicAuth"; cases.append(("credential", wrong_type))
+        extra = json.loads(json.dumps(original)); extra["extra"] = True; cases.append(("shape", extra))
+        active = json.loads(json.dumps(original)); active["posture"]["active"] = True; cases.append(("posture", active))
+        stale = json.loads(json.dumps(original)); stale["deployment_admission"]["commit"] = "0" * 40; cases.append(("admission", stale))
+        for label, manifest in cases:
+            with self.subTest(label=label):
+                self.binding_manifest.write_text(json.dumps(manifest), encoding="utf-8")
+                result = self._run_import(self._bounded_args("-DryRun"))
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self._assert_no_mutating_docker_calls()
+        self.binding_manifest.write_text(json.dumps(original), encoding="utf-8")
+
+    def test_failed_readback_retry_preserves_original_durable_preimage(self):
+        canonical = json.loads((REAL_WORKFLOW_DIR / "member_forms_gateway_ingest.workflow.json").read_text(encoding="utf-8"))
+        preimage = json.loads(json.dumps(canonical))
+        preimage["nodes"] = [{"name": "Manual", "type": "n8n-nodes-base.manualTrigger", "parameters": {}}]
+        Path(str(self.docker_log) + ".workflows.json").write_text(json.dumps([preimage]), encoding="utf-8")
+        first = self._run_import(self._bounded_args("-ConfirmLiveImport"), {"DOCKER_STUB_READBACK_STALE": "1"})
+        self.assertEqual(first.returncode, 1, first.stdout + first.stderr)
+        receipts = list((self.repo / ".n8n-local/member-gateway-recovery").rglob("recovery-receipt.json"))
+        self.assertEqual(len(receipts), 1)
+        receipt_before = receipts[0].read_bytes()
+        preimage_before = (receipts[0].parent / "preimage.workflow.json").read_bytes()
+        second = self._run_import(self._bounded_args("-ConfirmLiveImport"), {"DOCKER_STUB_READBACK_STALE": "1"})
+        self.assertEqual(second.returncode, 1, second.stdout + second.stderr)
+        self.assertEqual(receipts[0].read_bytes(), receipt_before)
+        self.assertEqual((receipts[0].parent / "preimage.workflow.json").read_bytes(), preimage_before)
+
+    def test_new_target_success_persists_absence_and_creation_receipts(self):
+        Path(str(self.docker_log) + ".workflows.json").write_text("[]", encoding="utf-8")
+        imported = Path(str(self.docker_log) + ".imported.json")
+        imported.unlink(missing_ok=True)
+        result = self._run_import(self._bounded_args("-ConfirmLiveImport"))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        receipts = list((self.repo / ".n8n-local/member-gateway-recovery").rglob("recovery-receipt.json"))
+        self.assertEqual(len(receipts), 1)
+        receipt = json.loads(receipts[0].read_text(encoding="utf-8"))
+        self.assertEqual(receipt["preimage_state"], "absent")
+        creation = json.loads((receipts[0].parent / "creation-receipt.json").read_text(encoding="utf-8"))
+        self.assertEqual(creation["ownership"], "created_by_this_transaction")
 
 
 if __name__ == "__main__":

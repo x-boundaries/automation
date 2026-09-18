@@ -3,7 +3,8 @@ param(
     [ValidateSet("DisabledProof", "Production")]
     [string]$Mode = "DisabledProof",
     [string]$InstallRoot = "C:\Program Files\X-Boundaries\MemberGatewayWorker",
-    [string]$RuntimeRoot = "C:\ProgramData\X-Boundaries\MemberGatewayWorker"
+    [string]$RuntimeRoot = "C:\ProgramData\X-Boundaries\MemberGatewayWorker",
+    [ValidateRange(100, 600000)][int]$ExecutionTimeoutMilliseconds = 600000
 )
 
 Set-StrictMode -Version Latest
@@ -88,6 +89,16 @@ function New-XbWorkerProcessStartInfo {
     return $startInfo
 }
 
+function Stop-XbOwnedWorkerProcess {
+    param([Parameter(Mandatory)][Diagnostics.Process]$Process)
+    try {
+        if (-not $Process.HasExited) { $Process.Kill() }
+    } catch { }
+    try {
+        if (-not $Process.WaitForExit(30000)) { throw "worker_reap_failed" }
+    } catch { throw "worker_reap_failed" }
+}
+
 $runId = "run-$(([Guid]::NewGuid().ToString('N')).ToLowerInvariant())"
 $supportReference = "support-$(([Guid]::NewGuid().ToString('N')).ToLowerInvariant())"
 $exitCode = 1
@@ -100,13 +111,17 @@ try {
     $process = [Diagnostics.Process]::new()
     $process.StartInfo = New-XbWorkerProcessStartInfo -WorkerScript $workerScript -LauncherMode $Mode -RuntimeRootPath $RuntimeRoot
     if (-not $process.Start()) { throw "worker_start_failed" }
-    $stdout = $process.StandardOutput.ReadToEnd()
-    [void]$process.StandardError.ReadToEnd()
-    if (-not $process.WaitForExit(600000)) {
-        try { $process.Kill() } catch { }
+    $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+    $stderrTask = $process.StandardError.ReadToEndAsync()
+    if (-not $process.WaitForExit($ExecutionTimeoutMilliseconds)) {
+        Stop-XbOwnedWorkerProcess -Process $process
         throw "worker_execution_ceiling_exceeded"
     }
+    $process.WaitForExit()
+    [void]$stderrTask.GetAwaiter().GetResult()
+    $stdout = $stdoutTask.GetAwaiter().GetResult()
     $exitCode = [int]$process.ExitCode
+    if ($exitCode -ne 0) { throw "worker_nonzero_exit" }
     $result = $stdout | ConvertFrom-Json -ErrorAction Stop
     if ($Mode -eq "DisabledProof") {
         if ($exitCode -ne 0 -or [string]$result.status -cne "disabled" -or [int]$result.writes -ne 0 -or [bool]$result.dispatch_fence) {
@@ -123,7 +138,10 @@ catch {
     $exitCode = 1
 }
 finally {
-    if ($null -ne $process) { $process.Dispose() }
+    if ($null -ne $process) {
+        if (-not $process.HasExited) { Stop-XbOwnedWorkerProcess -Process $process }
+        $process.Dispose()
+    }
     Write-XbWorkerLauncherEvent -LogRoot (Join-Path $RuntimeRoot "logs") -RunId $runId -LauncherMode $Mode -ExitCode $exitCode -TerminalStatus $terminalStatus -WriteCount $writeCount -SupportReference $supportReference
 }
 

@@ -20,14 +20,20 @@ until an owner supplies reviewed deployment configuration outside Git.
 
 ## Worker and n8n deployment tooling boundary
 
-The repository now carries an offline-reviewed Windows package boundary. Run
-`scripts/install_ac2_member_gateway_worker.ps1 -Operation ValidateOnly` to
-inspect the deterministic five-file package manifest without changing the
-machine. A later separately approved live install uses the fixed executable
+The repository now carries an offline-reviewed Windows package boundary. An
+owner-reviewed `xb.member.gateway.worker.reviewed-package.v1` identity file
+must name the admitted checkout commit/tree and the exact five members with
+both Git blob IDs and SHA-256 hashes. Run
+`scripts/install_ac2_member_gateway_worker.ps1 -Operation ValidateOnly
+-ReviewedPackageManifestPath <reviewed-identity.json>` to verify that identity
+against the checkout without changing the machine. Install stages exactly
+those members and re-hashes the staged bytes before publication. A later
+separately approved live install uses the fixed executable
 root `C:\Program Files\X-Boundaries\MemberGatewayWorker\` and runtime root
 `C:\ProgramData\X-Boundaries\MemberGatewayWorker\`. It registers only the
-disabled, triggerless `\X-Boundaries\AC2 Member Gateway Worker` Scheduled Task,
-whose sole initial action invokes `DisabledProof`. The task has no retry,
+disabled-from-construction, triggerless `\X-Boundaries\AC2 Member Gateway
+Worker` Scheduled Task, whose sole initial action invokes `DisabledProof`. The
+task has a ten-minute execution ceiling and no retry,
 start-when-available, production enable switch, or service equivalent.
 
 `DisabledProof` reads neither runtime config nor either user-scoped secure-string
@@ -44,25 +50,39 @@ call an AutoCount server/database API, or inspect member data.
 For the n8n slice, render the private binding payload only to ignored
 `.tmp/member-gateway-g3/member_forms_gateway_ingest.binding.json` with
 `scripts/render_member_forms_gateway_binding.ps1`. The renderer binds the
-canonical commit/tree/parent/workflow blob, four HTTPS endpoints, the closed
+immutable source-provenance commit/tree/parent/workflow blob, four HTTPS endpoints, the closed
 question map and its accepted hash, cursor/watermark references, exact
 credential types and node roles, and inactive/manual posture. It rejects
 tracked output, permissive ACLs, secret-bearing content, route or Form-ID drift,
-and canonical mismatch. Do not commit a populated payload.
+and source-provenance mismatch. The historical tuple is recorded as immutable
+`source_provenance`; the renderer separately requires and records the current
+admitted deployment checkout commit/tree/parent, so a correctly admitted
+post-merge checkout is valid while a stale checkout is not. Output safety is
+proved before populated bytes are staged under a restrictive ACL and atomically
+published. Do not commit a populated payload.
 
 The bounded live helper syntax for a later separately authorised import is:
 
 ```powershell
 .\n8n-workflows\scripts\import-n8n-workflows-live.ps1 `
   -WorkflowFile n8n-workflows\member_forms_gateway_ingest.workflow.json `
+  -BindingManifestFile .tmp\member-gateway-g3\member_forms_gateway_ingest.binding.json `
   -DryRun
 ```
 
-That mode accepts only this immediate canonical child, blocks archived,
-ambiguous, active, or scheduled targets, captures the exact target preimage,
-preserves its ID on update, and reads back only the exact inactive/manual
-target. Removing `-DryRun` is a live n8n mutation and still requires fresh
-explicit owner approval; this repository gate does not grant it.
+That mode accepts only this immediate canonical child. It uses metadata-only
+discovery and exports only an exact selected target body, blocks case-distinct,
+duplicate, name/ID-colliding, archived, active, or scheduled targets, and never
+refreshes shared credential bindings. The private manifest drives the exact
+four endpoints, six question references, Google OAuth role, and three gateway
+Bearer roles for both create and update. Preparation and readback are compared
+against the complete locked canonical graph/posture contract. Before a live
+mutation it writes an immutable ignored recovery record under
+`.n8n-local/member-gateway-recovery/`: exact preimage for an update or an
+absence/creation ownership receipt for a create. Retrying after a failed
+readback reuses that record and cannot replace the original evidence. Removing
+`-DryRun` is a live n8n mutation and still requires fresh explicit owner
+approval; this repository gate does not grant it.
 
 Before any listener starts, run only `python -m xb_member_gateway --config
 <reviewed-external-config>`. Bootstrap must read and validate config, resolve

@@ -1,6 +1,6 @@
 {
   "schema_version": "xb.member.gateway.n8n.binding.v1",
-  "canonical": {
+  "source_provenance": {
     "commit": "52308eebb95d9bc4f5a09fbe036c197a5e95b176",
     "tree": "3ab7e3363b7189d7d1bb79ec8a1988eb23e1c7b3",
     "parent": "1052f40e62a5ff5884c8ba49aac8114cc634b81c",
@@ -8,6 +8,11 @@
     "workflow_blob": "4eeff984fb8a9a2fb569c1648e8dd4350c45b2fe",
     "workflow_id": "xbMemberGatewayTemplate02",
     "workflow_name": "Member Gateway - Google Forms durable source adapter (inactive)"
+  },
+  "deployment_admission": {
+    "commit": "{{DEPLOYMENT_COMMIT}}",
+    "tree": "{{DEPLOYMENT_TREE}}",
+    "parent": "{{DEPLOYMENT_PARENT}}"
   },
   "endpoints": {
     "forms_api_url": "{{FORMS_API_URL}}",

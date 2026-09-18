@@ -4,6 +4,8 @@ param(
     [string]$Operation = "ValidateOnly",
     [string]$WorkerAccount,
     [Management.Automation.PSCredential]$TaskCredential,
+    [string]$ReviewedPackageManifestPath,
+    [switch]$LibraryOnly,
     [string]$InstallRoot = "C:\Program Files\X-Boundaries\MemberGatewayWorker",
     [string]$RuntimeRoot = "C:\ProgramData\X-Boundaries\MemberGatewayWorker"
 )
@@ -50,14 +52,15 @@ function Get-XbFileSha256 {
 }
 
 function New-XbWorkerInstallationManifest {
-    param([Parameter(Mandatory)][string]$PackageRoot)
+    param([Parameter(Mandatory)][string]$PackageRoot, [Parameter(Mandatory)]$ReviewedIdentity)
     $files = foreach ($name in $packageFiles) {
-        $path = Join-Path $PackageRoot $name
-        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "package_file_missing" }
-        [ordered]@{ name = $name; sha256 = Get-XbFileSha256 -Path $path }
+        $entry = @($ReviewedIdentity.package_files | Where-Object { [string]$_.name -ceq $name })
+        if ($entry.Count -ne 1) { throw "reviewed_package_membership_invalid" }
+        [ordered]@{ name = $name; sha256 = [string]$entry[0].sha256 }
     }
     [ordered]@{
         schema_version = "xb.member.gateway.worker.installation.v1"
+        reviewed_source = $ReviewedIdentity.source
         install_root = "C:\Program Files\X-Boundaries\MemberGatewayWorker\"
         runtime_root = "C:\ProgramData\X-Boundaries\MemberGatewayWorker\"
         package_files = @($files)
@@ -77,6 +80,57 @@ function New-XbWorkerInstallationManifest {
     }
 }
 
+function Get-XbExactPropertyNames {
+    param([Parameter(Mandatory)]$Value)
+    return @($Value.PSObject.Properties.Name | Sort-Object)
+}
+
+function Assert-XbExactProperties {
+    param([Parameter(Mandatory)]$Value, [Parameter(Mandatory)][string[]]$Expected, [Parameter(Mandatory)][string]$ErrorId)
+    if (@(Compare-Object (Get-XbExactPropertyNames $Value) @($Expected | Sort-Object)).Count -ne 0) { throw $ErrorId }
+}
+
+function Read-XbReviewedPackageIdentity {
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$PackageRoot)
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw "reviewed_package_identity_missing" }
+    $identity = Get-Content -Raw -LiteralPath $Path | ConvertFrom-Json
+    Assert-XbExactProperties $identity @("schema_version", "source", "package_files") "reviewed_package_identity_shape_invalid"
+    Assert-XbExactProperties $identity.source @("commit", "tree") "reviewed_package_source_shape_invalid"
+    if ([string]$identity.schema_version -cne "xb.member.gateway.worker.reviewed-package.v1") { throw "reviewed_package_identity_schema_invalid" }
+    foreach ($value in @([string]$identity.source.commit, [string]$identity.source.tree)) {
+        if ($value -cnotmatch '^[0-9a-f]{40}$') { throw "reviewed_package_source_invalid" }
+    }
+    $entries = @($identity.package_files)
+    if ($entries.Count -ne $packageFiles.Count) { throw "reviewed_package_membership_invalid" }
+    $seen = @{}
+    foreach ($entry in $entries) {
+        Assert-XbExactProperties $entry @("name", "sha256", "git_blob") "reviewed_package_entry_shape_invalid"
+        $name = [string]$entry.name
+        if ($name -cnotin $packageFiles -or $seen.ContainsKey($name) -or [string]$entry.sha256 -cnotmatch '^[0-9a-f]{64}$' -or [string]$entry.git_blob -cnotmatch '^[0-9a-f]{40}$') { throw "reviewed_package_membership_invalid" }
+        $seen[$name] = [string]$entry.sha256
+    }
+    foreach ($name in $packageFiles) {
+        $sourcePath = Join-Path $PackageRoot $name
+        $entry = @($entries | Where-Object { [string]$_.name -ceq $name })[0]
+        $currentBlob = (& git -C $PackageRoot hash-object $sourcePath).Trim()
+        $reviewedBlob = (& git -C $PackageRoot rev-parse ("{0}:scripts/{1}" -f [string]$identity.source.commit, $name)).Trim()
+        if (-not (Test-Path -LiteralPath $sourcePath -PathType Leaf) -or (Get-XbFileSha256 $sourcePath) -cne $seen[$name] -or $currentBlob -cne [string]$entry.git_blob -or $reviewedBlob -cne [string]$entry.git_blob) { throw "reviewed_package_source_bytes_mismatch" }
+    }
+    $observedCommit = (& git -C $PackageRoot rev-parse HEAD).Trim()
+    $observedTree = (& git -C $PackageRoot rev-parse 'HEAD^{tree}').Trim()
+    if ($LASTEXITCODE -ne 0 -or $observedCommit -cne [string]$identity.source.commit -or $observedTree -cne [string]$identity.source.tree) { throw "reviewed_package_source_identity_mismatch" }
+    return $identity
+}
+
+function Assert-XbStagedPackageIdentity {
+    param([Parameter(Mandatory)][string]$StageRoot, [Parameter(Mandatory)]$ReviewedIdentity)
+    $actualNames = @(Get-ChildItem -LiteralPath $StageRoot -File | ForEach-Object Name | Sort-Object)
+    if (@(Compare-Object $actualNames @($packageFiles | Sort-Object)).Count -ne 0) { throw "staged_package_membership_mismatch" }
+    foreach ($entry in @($ReviewedIdentity.package_files)) {
+        if ((Get-XbFileSha256 (Join-Path $StageRoot ([string]$entry.name))) -cne [string]$entry.sha256) { throw "staged_package_bytes_mismatch" }
+    }
+}
+
 function Assert-XbWorkerTaskContract {
     param([Parameter(Mandatory)]$Task)
     if ($Task.State -ne "Disabled") { throw "task_not_disabled" }
@@ -86,17 +140,64 @@ function Assert-XbWorkerTaskContract {
     if ($arguments -notmatch '(?:^|\s)-Mode\s+DisabledProof(?:\s|$)') { throw "task_action_mode_invalid" }
     if ($arguments -match 'EnableProduction(?:Worker|Adapter)') { throw "task_production_switch_present" }
     if ([string]$Task.Settings.MultipleInstances -ne "IgnoreNew") { throw "task_multiple_instances_invalid" }
-    if ([Xml.XmlConvert]::ToString($Task.Settings.ExecutionTimeLimit) -ne "PT10M") { throw "task_execution_limit_invalid" }
+    $executionLimit = $Task.Settings.ExecutionTimeLimit
+    if ($executionLimit -is [string]) {
+        try { $executionLimit = [Xml.XmlConvert]::ToTimeSpan($executionLimit) } catch { throw "task_execution_limit_invalid" }
+    }
+    if ([TimeSpan]$executionLimit -ne [TimeSpan]::FromMinutes(10)) { throw "task_execution_limit_invalid" }
     if ([int]$Task.Settings.RestartCount -ne 0 -or [bool]$Task.Settings.StartWhenAvailable) { throw "task_retry_contract_invalid" }
 }
 
+function Assert-XbUninstallOwnership {
+    $manifestPath = Join-Path $InstallRoot "installation-manifest.json"
+    if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) { throw "installation_manifest_missing" }
+    try { $installed = Get-Content -Raw -LiteralPath $manifestPath | ConvertFrom-Json } catch { throw "installation_manifest_invalid" }
+    Assert-XbExactProperties $installed @("schema_version", "reviewed_source", "install_root", "runtime_root", "package_files", "task", "rollback_owned_roots") "installation_manifest_invalid"
+    Assert-XbExactProperties $installed.reviewed_source @("commit", "tree") "installation_manifest_invalid"
+    Assert-XbExactProperties $installed.task @("path", "name", "enabled", "trigger_count", "action_mode", "production_switches", "multiple_instances", "execution_time_limit", "restart_count", "start_when_available") "installation_manifest_invalid"
+    if ([string]$installed.schema_version -cne "xb.member.gateway.worker.installation.v1") { throw "installation_manifest_invalid" }
+    if ([string]$installed.install_root -cne "C:\Program Files\X-Boundaries\MemberGatewayWorker\" -or [string]$installed.runtime_root -cne "C:\ProgramData\X-Boundaries\MemberGatewayWorker\") { throw "installation_manifest_path_invalid" }
+    $entries = @($installed.package_files)
+    if ($entries.Count -ne $packageFiles.Count) { throw "installation_manifest_membership_invalid" }
+    foreach ($name in $packageFiles) {
+        $matches = @($entries | Where-Object { [string]$_.name -ceq $name })
+        foreach ($match in $matches) { Assert-XbExactProperties $match @("name", "sha256") "installation_manifest_membership_invalid" }
+        $path = Join-Path $InstallRoot $name
+        if ($matches.Count -ne 1 -or -not (Test-Path -LiteralPath $path -PathType Leaf) -or (Get-XbFileSha256 $path) -cne [string]$matches[0].sha256) { throw "installation_manifest_membership_invalid" }
+    }
+    $allowedInstall = @($packageFiles + "installation-manifest.json" | Sort-Object)
+    $actualInstall = @(Get-ChildItem -LiteralPath $InstallRoot -Force | ForEach-Object Name | Sort-Object)
+    if (@(Compare-Object $actualInstall $allowedInstall).Count -ne 0) { throw "installation_owned_surface_unknown" }
+    if (@(Compare-Object @($installed.rollback_owned_roots | Sort-Object) @("config", "logs", "rollback", "secrets")).Count -ne 0) { throw "installation_runtime_roots_invalid" }
+    if ([string]$installed.task.path -cne $taskPath -or [string]$installed.task.name -cne $taskName -or $installed.task.enabled -ne $false -or [int]$installed.task.trigger_count -ne 0 -or [string]$installed.task.action_mode -cne "DisabledProof" -or @($installed.task.production_switches).Count -ne 0 -or [string]$installed.task.multiple_instances -cne "IgnoreNew" -or [string]$installed.task.execution_time_limit -cne "PT10M" -or [int]$installed.task.restart_count -ne 0 -or $installed.task.start_when_available -ne $false) { throw "installation_manifest_task_invalid" }
+    $runtimeChildren = @(Get-ChildItem -LiteralPath $RuntimeRoot -Force)
+    if (@(Compare-Object @($runtimeChildren.Name | Sort-Object) @("config", "logs", "rollback", "secrets")).Count -ne 0) { throw "installation_owned_surface_unknown" }
+    foreach ($child in $runtimeChildren) { if (-not $child.PSIsContainer -or @(Get-ChildItem -LiteralPath $child.FullName -Force).Count -ne 0) { throw "installation_owned_surface_unknown" } }
+    $task = Get-ScheduledTask -TaskPath $taskPath -TaskName $taskName -ErrorAction SilentlyContinue
+    if ($null -eq $task) { throw "installation_task_ownership_ambiguous" }
+    Assert-XbWorkerTaskContract $task
+    return $installed
+}
+
+function Register-XbWorkerScheduledTask {
+    param([Parameter(Mandatory)][string]$LauncherPath)
+    $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument ('-NoLogo -NoProfile -NonInteractive -File "{0}" -Mode DisabledProof' -f $LauncherPath)
+    $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::FromMinutes(10)) -RestartCount 0 -StartWhenAvailable:$false -Disable
+    $taskPrincipal = New-ScheduledTaskPrincipal -UserId $WorkerAccount -LogonType Password -RunLevel Limited
+    $task = New-ScheduledTask -Action $action -Settings $settings -Principal $taskPrincipal
+    $plainPassword = $TaskCredential.GetNetworkCredential().Password
+    try { Register-ScheduledTask -TaskPath $taskPath -TaskName $taskName -InputObject $task -User $WorkerAccount -Password $plainPassword -Force | Out-Null; $script:XbTaskCreated = $true }
+    finally { $plainPassword = $null }
+    Assert-XbWorkerTaskContract -Task (Get-ScheduledTask -TaskPath $taskPath -TaskName $taskName)
+}
+
+function Invoke-XbWorkerInstaller {
 Assert-XbWorkerInstallLayout
 $sourceRoot = $PSScriptRoot
-$manifest = New-XbWorkerInstallationManifest -PackageRoot $sourceRoot
-if ($Operation -eq "ValidateOnly") {
-    $manifest | ConvertTo-Json -Depth 12
-    exit 0
-}
+if ([string]::IsNullOrWhiteSpace($ReviewedPackageManifestPath)) { throw "reviewed_package_identity_required" }
+$reviewedIdentity = Read-XbReviewedPackageIdentity -Path $ReviewedPackageManifestPath -PackageRoot $sourceRoot
+$manifest = New-XbWorkerInstallationManifest -PackageRoot $sourceRoot -ReviewedIdentity $reviewedIdentity
+if ($Operation -eq "ValidateOnly") { $manifest | ConvertTo-Json -Depth 12; return }
 
 if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) { throw "windows_required" }
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -111,10 +212,11 @@ if ($Operation -eq "Install") {
     if ($null -ne (Get-ScheduledTask -TaskPath $taskPath -TaskName $taskName -ErrorAction SilentlyContinue)) { throw "task_preimage_exists" }
 
     $stageRoot = Join-Path ([IO.Path]::GetTempPath()) ("xb-member-worker-" + [Guid]::NewGuid().ToString("N"))
-    $taskCreated = $false
+    $script:XbTaskCreated = $false
     try {
         New-Item -ItemType Directory -Path $stageRoot | Out-Null
         foreach ($name in $packageFiles) { Copy-Item -LiteralPath (Join-Path $sourceRoot $name) -Destination (Join-Path $stageRoot $name) }
+        Assert-XbStagedPackageIdentity -StageRoot $stageRoot -ReviewedIdentity $reviewedIdentity
         ($manifest | ConvertTo-Json -Depth 12) + "`n" | Set-Content -LiteralPath (Join-Path $stageRoot "installation-manifest.json") -Encoding UTF8
         New-Item -ItemType Directory -Path (Split-Path -Parent $InstallRoot) -Force | Out-Null
         Move-Item -LiteralPath $stageRoot -Destination $InstallRoot
@@ -126,34 +228,22 @@ if ($Operation -eq "Install") {
         Set-XbWorkerAcl -Path (Join-Path $RuntimeRoot "rollback") -Kind Rollback
 
         $launcher = Join-Path $InstallRoot "launch_ac2_member_gateway_worker.ps1"
-        $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument ('-NoLogo -NoProfile -NonInteractive -File "{0}" -Mode DisabledProof' -f $launcher)
-        $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::FromMinutes(10)) -RestartCount 0 -StartWhenAvailable:$false
-        $taskPrincipal = New-ScheduledTaskPrincipal -UserId $WorkerAccount -LogonType Password -RunLevel Limited
-        $task = New-ScheduledTask -Action $action -Settings $settings -Principal $taskPrincipal
-        $plainPassword = $TaskCredential.GetNetworkCredential().Password
-        try { Register-ScheduledTask -TaskPath $taskPath -TaskName $taskName -InputObject $task -User $WorkerAccount -Password $plainPassword -Force | Out-Null }
-        finally { $plainPassword = $null }
-        $taskCreated = $true
-        Disable-ScheduledTask -TaskPath $taskPath -TaskName $taskName | Out-Null
-        Assert-XbWorkerTaskContract -Task (Get-ScheduledTask -TaskPath $taskPath -TaskName $taskName)
+        Register-XbWorkerScheduledTask -LauncherPath $launcher
     }
     catch {
-        if ($taskCreated) { Unregister-ScheduledTask -TaskPath $taskPath -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue }
+        if ($script:XbTaskCreated) { Unregister-ScheduledTask -TaskPath $taskPath -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue }
         if (Test-Path -LiteralPath $InstallRoot) { Remove-Item -LiteralPath $InstallRoot -Recurse -Force }
         if (Test-Path -LiteralPath $RuntimeRoot) { Remove-Item -LiteralPath $RuntimeRoot -Recurse -Force }
         if (Test-Path -LiteralPath $stageRoot) { Remove-Item -LiteralPath $stageRoot -Recurse -Force }
         throw
     }
-    exit 0
+    return
 }
 
-$installedManifestPath = Join-Path $InstallRoot "installation-manifest.json"
-if (-not (Test-Path -LiteralPath $installedManifestPath -PathType Leaf)) { throw "installation_manifest_missing" }
-$installedManifest = Get-Content -Raw -LiteralPath $installedManifestPath | ConvertFrom-Json
-if ([string]$installedManifest.schema_version -cne "xb.member.gateway.worker.installation.v1") { throw "installation_manifest_invalid" }
-foreach ($entry in @($installedManifest.package_files)) {
-    if ([string]$entry.name -notin $packageFiles) { throw "installation_manifest_scope_invalid" }
-}
+$null = Assert-XbUninstallOwnership
 Unregister-ScheduledTask -TaskPath $taskPath -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
 Remove-Item -LiteralPath $InstallRoot -Recurse -Force
 Remove-Item -LiteralPath $RuntimeRoot -Recurse -Force
+}
+
+if (-not $LibraryOnly) { Invoke-XbWorkerInstaller }
