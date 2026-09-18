@@ -3592,6 +3592,38 @@ $results | ConvertTo-Json -Compress -Depth 4
         )
         self.assertEqual(len(fence_calls), 4)
 
+    def test_delivery_failure_terminates_and_reaps_before_cleanup(self):
+        transport = self.source_function(
+            "function Invoke-R156Transport",
+            "function Test-R156PrivateBindingsOutsideCheckout",
+        )
+        catch_start = transport.index("    catch {")
+        has_exited = transport.index("if (-not $process.HasExited)", catch_start)
+        kill = transport.index("$process.Kill()", has_exited)
+        wait = transport.index("$process.WaitForExit()", kill)
+        terminated = transport.index(
+            "$terminated = [bool]$process.HasExited", wait
+        )
+        failed_result = transport.index(
+            "SupervisorComplete = $false", terminated
+        )
+        terminated_report = transport.index(
+            "ChildTerminatedKnown = $terminated", failed_result
+        )
+        finally_start = transport.index("    finally {", terminated_report)
+        stdin_dispose = transport.index(
+            "$process.StandardInput.Dispose()", finally_start
+        )
+
+        self.assertLess(catch_start, has_exited)
+        self.assertLess(has_exited, kill)
+        self.assertLess(kill, wait)
+        self.assertLess(wait, terminated)
+        self.assertLess(terminated, failed_result)
+        self.assertLess(failed_result, terminated_report)
+        self.assertLess(terminated_report, finally_start)
+        self.assertLess(finally_start, stdin_dispose)
+
     def test_preimage_decoupling_accepts_valid_distinct_identities(self):
         result = self.run_preimage_boundary_case()
         self.assertTrue(result["admission_valid"])

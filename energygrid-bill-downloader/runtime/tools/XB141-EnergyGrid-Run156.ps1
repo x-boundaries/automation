@@ -5047,6 +5047,10 @@ function Invoke-R156Transport {
         $terminated = $false
         if ($started) {
             try {
+                if (-not $process.HasExited) {
+                    $process.Kill()
+                    $process.WaitForExit()
+                }
                 $terminated = [bool]$process.HasExited
             }
             catch {
