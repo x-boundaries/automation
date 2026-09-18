@@ -18,6 +18,29 @@ They are meant to be copied into a consumer repository that intentionally owns n
 
 Live import/export helper entry points are not run from this toolkit repo during CI. Non-live validation, sanitizer, sync, compare, and prepare logic may be exercised by tests.
 
+## Dedicated bounded member-gateway helper
+
+`import-member-forms-gateway-bounded.ps1` is a reviewed local successor helper,
+separate from the generic import/export/sync package above. It is the only
+production path for the inactive member gateway source-adapter workflow. It
+accepts a typed private binding manifest, captures an immutable cursor,
+watermark, target-preimage, repository, and canonical-workflow identity, and
+imports no more than that one exact workflow after explicit confirmation.
+
+It must not call the generic importer, generic export-all path, hook surface,
+workflow execution, activation, MCP exposure, Forms, AutoCount, or member
+endpoints. Operation files belong only under the ignored canonical private
+root `.n8n-local/member-gateway-bounded-import/operations/`; the helper rejects
+tracked, non-ignored, outside-root, linked, corrupt, incomplete, and extra
+material before mutation. It writes canonical UTF-8 no-BOM LF-only JSON and
+retains incomplete state for fail-closed reconciliation.
+
+The direct offline regression command is:
+
+```text
+python -m unittest tests.test_member_gateway_bounded_import_security -v
+```
+
 ## Consumer Repo Layout
 
 - Committed n8n workflow export JSON belongs under the repo root `n8n-workflows/`.
