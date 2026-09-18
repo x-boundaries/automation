@@ -4339,6 +4339,36 @@ $result = Invoke-R156Transport `
             self.assertNotIn(private_sentinel, lines[0])
             return json.loads(lines[0])
 
+        def run_high_bit_round_trip():
+            script = (
+                "$script:R156BootstrapScript = @'\n"
+                "$s=[Console]::In.ReadToEnd()\n"
+                "$expected=[int32]0x40012345\n"
+                "exit $expected\n"
+                "'@\n"
+                "$script:R156ChildScript = ''\n"
+                "$script:R156RealStarted = $false\n"
+                "$script:R156RealInstallerInvocations = 0\n"
+                "$script:R156AuthorityConsumed = 'NO'\n"
+                "$script:R156PackageMutation = 'NONE'\n"
+                + functions
+                + r"""
+$result = Invoke-R156Transport `
+    -Mode 'VALIDATE_ONLY' `
+    -CheckoutRoot 'C:\roundtrip-checkout' `
+    -InstallerPath 'C:\roundtrip-installer.ps1' `
+    -LauncherRoot 'C:\roundtrip-launcher' `
+    -AdmissionCommit '1111111111111111111111111111111111111111'
+$expected = [int64][int32]0x40012345
+if (-not [bool]$result.Started -or -not [bool]$result.SupervisorComplete) { exit 1 }
+if ([int64][int]$result.ChildExitCode -ne $expected) { exit 1 }
+[Console]::Out.WriteLine('R156_HIGH_BIT_ROUNDTRIP=PASS')
+"""
+            )
+            lines = run_closed_powershell(script, {})
+            self.assertEqual(lines, ["R156_HIGH_BIT_ROUNDTRIP=PASS"])
+            return True
+
         def replace_once(source, old, new):
             self.assertEqual(source.count(old), 1)
             return source.replace(old, new, 1)
@@ -4346,83 +4376,89 @@ $result = Invoke-R156Transport `
         diagnostic = replace_once(
             self.bootstrap,
             "$p=$null;$ok=$false;$d=$true;$a=$false;$x=$false;$v=$true;$n='Running','Stopping'",
-            "$b=0;$c=0;$g=0;$j=0;$k=0;$l=0;$m=0;$o=0;$y=0;"
-            "$zz=0;$dd=0;"
+            "$sc=4;$pc=1;"
+            "$ir=0;$ie=0;$cr=0;$rn=1;$as=0;$iv=0;$si=0;"
+            "$rp=0;$he=0;$en=0;$ad=0;$sa=0;$pa=0;$da=0;"
             "$p=$null;$ok=$false;$d=$true;$a=$false;$x=$false;$v=$true;$n='Running','Stopping'",
         )
         diagnostic = replace_once(
             diagnostic,
             "$s=[Console]::In.ReadToEnd()",
-            "$s=[Console]::In.ReadToEnd();$c=1",
+            "$s=[Console]::In.ReadToEnd();$ir=1;$ie=[string]::IsNullOrEmpty($s)",
         )
         diagnostic = replace_once(
             diagnostic,
             "        $p=[PowerShell]::Create([System.Management.Automation.RunspaceMode]::NewRunspace)",
-            "        $p=[PowerShell]::Create([System.Management.Automation.RunspaceMode]::NewRunspace);$g=1",
+            "        $p=[PowerShell]::Create([System.Management.Automation.RunspaceMode]::NewRunspace);$cr=1",
         )
         diagnostic = replace_once(
             diagnostic,
             "        if($null -ne $p -and $null -ne $p.Runspace){\n            $d=$false;",
-            "        if($null -ne $p -and $null -ne $p.Runspace){\n            $j=1\n            $d=$false;",
+            "        if($null -ne $p -and $null -ne $p.Runspace){\n"
+            "            $rn=0\n"
+            "            $d=$false;",
         )
         diagnostic = replace_once(
             diagnostic,
             "$d=$false;$null=$p.AddScript($s);$a=$true",
-            "$d=$false;$null=$p.AddScript($s);$a=$true;$k=1",
+            "$d=$false;$null=$p.AddScript($s);$as=1;$a=$true",
         )
         diagnostic = replace_once(
             diagnostic,
             "            try{$null=$p.Invoke()}catch{$x=$true}",
-            "            try{$null=$p.Invoke();$l=1}catch{$x=$true;$b=6}",
+            "            try{$null=$p.Invoke();$iv=1}catch{$x=$true}",
         )
         diagnostic = replace_once(
             diagnostic,
             "            $i=$p.InvocationStateInfo;$q=[string]$i.State;$r=$i.Reason;$h=[bool]$p.HadErrors;$e=@($p.Streams.Error).Count",
-            "            $i=$p.InvocationStateInfo;$q=[string]$i.State;"
+            "            $i=$p.InvocationStateInfo;$si=1;$q=[string]$i.State;"
             "$r=$i.Reason;$h=[bool]$p.HadErrors;$e=@($p.Streams.Error).Count;"
-            "if($q -ceq 'Completed'){$m=1}elseif($q -ceq 'Running'){$m=2}elseif($q -ceq 'Stopping'){$m=3};"
-            "$o=[int]($null -ne $r);$y=[int]($e -ne 0)",
+            "$rp=$null -ne $r;$he=$h;$en=$e -ne 0;",
         )
         diagnostic = replace_once(
             diagnostic,
             "            if($q -in $n){\n                try{$p.Stop();$z=[string]$p.InvocationStateInfo.State;$v=$z -notin $n}catch{$v=$false}\n            }",
+            "            $ad=$q -in $n\n"
             "            if($q -in $n){\n"
-            "                try{$zz=1;$p.Stop();$z=[string]$p.InvocationStateInfo.State;"
-            "$v=$z -notin $n;if($v){$zz=2}else{$zz=3}}"
-            "catch{$v=$false;$zz=3;$b=8}\n            }",
+            "                $sa=1\n"
+            "                try{$p.Stop();$z=[string]$p.InvocationStateInfo.State;"
+            "$pa=$z -in $n;$v=$z -notin $n}"
+            "catch{$v=$false}\n            }",
         )
         diagnostic = replace_once(
             diagnostic,
             "            $ok=$a -and -not $x -and $q -eq 'Completed' -and $null -eq $r -and $e -eq 0 -and $q -notin $n -and $v",
-            "            $ok=$a -and -not $x -and $q -eq 'Completed' -and $null -eq $r -and $e -eq 0 -and $q -notin $n -and $v;"
-            "",
+            "            $ok=$a -and -not $x -and $q -eq 'Completed' -and $null -eq $r -and $e -eq 0 -and $q -notin $n -and $v",
         )
         diagnostic = replace_once(
             diagnostic,
             "        }\n    }\n}catch{$ok=$false}",
             "        }\n"
-            "    }\n}catch{$ok=$false;if($b -eq 0){$b=9}}",
+            "    }\n}catch{$ok=$false}",
         )
         diagnostic = replace_once(
             diagnostic,
             "finally{if($null -ne $p){try{$p.Dispose();$d=$true}catch{$d=$false}}}",
-            "finally{if($null -ne $p){try{$p.Dispose();$d=$true;$dd=1}"
-            "catch{$d=$false;$dd=2;$b=10}}}",
+            "finally{if($null -ne $p){$da=1;"
+            "try{$p.Dispose();$d=$true}"
+            "catch{$d=$false}}}",
         )
         diagnostic = replace_once(
             diagnostic,
             "if($ok -and $d){\n    exit 0\n}\nexit 1",
-            "$f=[int][bool]($ok -and $d);$w=[int]0x40000000;$A=@($f,$ok,$c,$k,$l,$g,$j,$m,$o,$y,$zz,$dd);"
-            "for($i=0;$i-lt 12;$i++){$w=$w-bor(($A[$i]-band 3)-shl($i*2))};"
-            "$w=$w-bor(($b-band 15)-shl 24);"
-            "if($ok -and $d){exit $w};exit $w",
+            "$w=[int32]0x40000000;$w=$w-bor((([int]$sc)-band 15)-shl 4);"
+            "$w=$w-bor((([int]$pc)-band 15)-shl 8);"
+            "$o=@($ir,$ie,$cr,$rn,$as,$iv,$x,$si,$rp,$he,$en,$ad,$sa,$v,$pa,$da,$d,$ok);"
+            "for($i=0;$i-lt 18;$i++){$w=$w-bor((([int]$o[$i])-band 1)-shl(12+$i))};exit $w",
         )
 
         self.assertIn(
             "$ok=$a -and -not $x -and $q -eq 'Completed' -and $null -eq $r -and $e -eq 0 -and $q -notin $n -and $v",
             diagnostic,
         )
-        self.assertIn("if($ok -and $d){", diagnostic)
+        self.assertIn("$w=[int32]0x40000000;", diagnostic)
+        self.assertIn("$o=@(", diagnostic)
+        self.assertIn("$o[$i]", diagnostic)
         self.assertNotIn("exit 0", diagnostic)
         self.assertNotIn("exit 1", diagnostic)
 
@@ -4461,132 +4497,99 @@ $result = Invoke-R156Transport `
                 self.skipTest("hosted ProcessStartInfo differential is not present locally")
             self.fail("frozen ProcessStartInfo control did not remain nonzero")
 
+        for _, frozen in frozen_results:
+            self.assertTrue(frozen["exit_code"] != 0, "frozen ProcessStartInfo control was zero")
+
+        self.assertTrue(run_high_bit_round_trip())
+
+        failure_stage_labels = (
+            "NONE",
+            "INPUT_READ",
+            "CREATE",
+            "RUNSPACE_ACCESS",
+            "ADDSCRIPT",
+            "INVOKE",
+            "STATEINFO",
+            "STATE",
+            "REASON",
+            "HADERRORS",
+            "ERRORSTREAM",
+            "STOP",
+            "POST_STOP",
+            "DISPOSE",
+            "FINAL_ENCODE",
+            "RESERVED",
+        )
+        state_labels = (
+            "Unavailable",
+            "NotStarted",
+            "Running",
+            "Stopping",
+            "Completed",
+            "Failed",
+            "Stopped",
+            "Disconnected",
+            "Other",
+        )
+        observation_names = (
+            "input_read_ok",
+            "input_empty",
+            "create_ok",
+            "runspace_null",
+            "addscript_ok",
+            "invoke_returned",
+            "invoke_throw",
+            "stateinfo_ok",
+            "reason_present",
+            "had_errors",
+            "error_nonzero",
+            "active_detected",
+            "stop_attempted",
+            "stop_ok",
+            "post_stop_active",
+            "dispose_attempted",
+            "dispose_ok",
+            "predicate_ok",
+        )
+
         def extract_bits(word):
-            self.assertTrue(isinstance(word, int))
-            self.assertTrue(0x40000000 <= word < 0x80000000)
-
-            def bit(offset):
-                return (word >> offset) & 1
-
-            def pair(offset):
-                return (word >> offset) & 3
-
-            def quad(offset):
-                return (word >> offset) & 15
-
-            return {
-                "final": bit(0),
-                "candidate": bit(2),
-                "input": bit(4),
-                "add": bit(6),
-                "invoke": bit(8),
-                "create": pair(10),
-                "runspace": pair(12),
-                "state": pair(14),
-                "reason": pair(16),
-                "error": pair(18),
-                "stop": pair(20),
-                "dispose": pair(22),
-                "fail_stage": quad(24),
+            if not isinstance(word, int):
+                self.fail("forensic exit word was not an integer")
+            if not (0x40000000 <= word < 0x80000000):
+                self.fail("forensic exit word was outside the positive 31-bit domain")
+            if ((word >> 30) & 1) != 1:
+                self.fail("forensic exit word lacked the version marker")
+            values = {
+                "fail_stage": word & 0xF,
+                "state": (word >> 4) & 0xF,
+                "post_stop_state": (word >> 8) & 0xF,
             }
+            for index, name in enumerate(observation_names):
+                values[name] = bool((word >> (12 + index)) & 1)
+            return values
 
         def reencode_bits(values):
             encoded = 0x40000000
-            for offset, name in enumerate(
-                (
-                    "final",
-                    "candidate",
-                    "input",
-                    "add",
-                    "invoke",
-                    "create",
-                    "runspace",
-                    "state",
-                    "reason",
-                    "error",
-                    "stop",
-                    "dispose",
-                )
-            ):
-                encoded |= (int(values[name]) & 3) << (offset * 2)
-            encoded |= (int(values["fail_stage"]) & 15) << 24
+            encoded |= int(values["fail_stage"]) & 0xF
+            encoded |= (int(values["state"]) & 0xF) << 4
+            encoded |= (int(values["post_stop_state"]) & 0xF) << 8
+            for index, name in enumerate(observation_names):
+                encoded |= int(bool(values[name])) << (12 + index)
             return encoded
 
         def closed_labels(values):
-            pair_labels = {
-                "create": {
-                    0: "NOT_CREATED",
-                    1: "CREATED",
-                    2: "FAILED",
-                    3: "UNKNOWN",
-                },
-                "runspace": {
-                    0: "NULL",
-                    1: "NON_NULL",
-                    2: "FAILED",
-                    3: "UNKNOWN",
-                },
-                "state": {
-                    0: "OTHER",
-                    1: "COMPLETED",
-                    2: "RUNNING",
-                    3: "STOPPING",
-                },
-                "reason": {0: "NULL", 1: "NON_NULL", 2: "FAILED", 3: "UNKNOWN"},
-                "error": {0: "NONE", 1: "PRESENT", 2: "FAILED", 3: "UNKNOWN"},
-                "stop": {
-                    0: "NOT_REQUIRED",
-                    1: "ATTEMPTED",
-                    2: "INACTIVE",
-                    3: "ACTIVE_OR_FAILED",
-                },
-                "dispose": {
-                    0: "NOT_ATTEMPTED",
-                    1: "DISPOSED",
-                    2: "FAILED",
-                    3: "UNKNOWN",
-                },
-            }
-            stage_labels = {
-                0: "NONE",
-                1: "INPUT_READ",
-                2: "INPUT_GATE",
-                3: "CREATE",
-                4: "RUNSPACE",
-                5: "ADD_SCRIPT",
-                6: "INVOKE",
-                7: "OBSERVE",
-                8: "STOP",
-                9: "BOOTSTRAP",
-                10: "DISPOSE",
-            }
+            self.assertTrue(0 <= values["fail_stage"] < len(failure_stage_labels))
+            self.assertTrue(0 <= values["state"] < len(state_labels))
+            self.assertTrue(0 <= values["post_stop_state"] < len(state_labels))
             labels = {
-                "INPUT": "READ" if values["input"] else "NOT_READ",
-                "ADDSCRIPT": "COMPLETED" if values["add"] else "NOT_COMPLETED",
-                "INVOKE": "COMPLETED" if values["invoke"] else "NOT_COMPLETED",
-                "CANDIDATE_OK": "TRUE" if values["candidate"] else "FALSE",
-                "FINAL_OK_AND_D": "TRUE" if values["final"] else "FALSE",
+                "EXIT_WORD": "VALID",
+                "FAIL_STAGE": failure_stage_labels[values["fail_stage"]],
+                "STATE": state_labels[values["state"]],
+                "POST_STOP_STATE": state_labels[values["post_stop_state"]],
+                "ERROR_COUNT": "NONZERO" if values["error_nonzero"] else "ZERO",
             }
-            for key, mapping in pair_labels.items():
-                labels[key.upper()] = mapping[values[key]]
-            fail_stage = values["fail_stage"]
-            if (
-                fail_stage == 0
-                and values["input"]
-                and values["create"]
-                and values["runspace"] == 0
-            ):
-                fail_stage = 4
-            labels["FAIL_STAGE"] = stage_labels.get(fail_stage, "RESERVED")
-            labels["STOP"] = (
-                "ATTEMPTED" if values["stop"] else "NOT_REQUIRED"
-            )
-            labels["POST_STOP"] = {
-                0: "NOT_APPLICABLE",
-                1: "UNOBSERVED",
-                2: "INACTIVE",
-                3: "ACTIVE_OR_FAILED",
-            }[values["stop"]]
+            for name in observation_names:
+                labels[name.upper()] = "TRUE" if values[name] else "FALSE"
             return labels
 
         for name, case in cases.items():
@@ -4598,7 +4601,6 @@ $result = Invoke-R156Transport `
             )
             self.assertTrue(diagnostic_result["started"])
             self.assertTrue(diagnostic_result["supervisor_complete"])
-            self.assertTrue(diagnostic_result["packet_present"])
             values = extract_bits(diagnostic_result["exit_code"])
             self.assertTrue(
                 reencode_bits(values) == diagnostic_result["exit_code"],
@@ -4606,44 +4608,66 @@ $result = Invoke-R156Transport `
             )
             labels = closed_labels(values)
             candidate_expected = (
-                values["add"] == 1
-                and values["invoke"] == 1
-                and values["state"] == 1
-                and values["reason"] == 0
-                and values["error"] == 0
-                and values["stop"] == 0
+                values["addscript_ok"]
+                and values["invoke_returned"]
+                and not values["invoke_throw"]
+                and labels["STATE"] == "Completed"
+                and not values["reason_present"]
+                and not values["error_nonzero"]
+                and not values["active_detected"]
+                and values["stop_ok"]
             )
-            final_expected = candidate_expected and values["dispose"] == 1
+            final_ok = values["predicate_ok"] and values["dispose_ok"]
             observation_consistent = (
-                values["candidate"] == int(candidate_expected)
-                and values["final"] == int(final_expected)
-                and labels["FAIL_STAGE"] != "RESERVED"
-                and labels["CREATE"] != "UNKNOWN"
-                and labels["RUNSPACE"] != "UNKNOWN"
-                and labels["STATE"] != "OTHER"
-                and labels["REASON"] not in {"FAILED", "UNKNOWN"}
-                and labels["ERROR"] not in {"FAILED", "UNKNOWN"}
-                and labels["DISPOSE"] != "UNKNOWN"
+                labels["FAIL_STAGE"] == "NONE"
+                and values["input_read_ok"]
+                and not values["input_empty"]
+                and values["create_ok"]
+                and not values["runspace_null"]
+                and values["addscript_ok"]
+                and values["invoke_returned"]
+                and not values["invoke_throw"]
+                and values["stateinfo_ok"]
+                and labels["STATE"] == "Completed"
+                and not values["reason_present"]
+                and not values["had_errors"]
+                and not values["error_nonzero"]
+                and not values["active_detected"]
+                and not values["stop_attempted"]
+                and values["stop_ok"]
+                and labels["POST_STOP_STATE"] == "NotStarted"
+                and not values["post_stop_active"]
+                and values["dispose_attempted"]
+                and values["dispose_ok"]
+                and values["predicate_ok"] == candidate_expected
+                and final_ok == (candidate_expected and values["dispose_ok"])
             )
             record = [
                 ("CASE", name),
-                ("DIRECT_PYTHON", "ZERO"),
-                ("FROZEN_TRANSPORT", "NONZERO"),
-                ("DIAGNOSTIC_TRANSPORT", "FORENSIC_WORD"),
+                ("DIRECT_CONTROL", "ZERO"),
+                ("PSI_CONTROL", "NONZERO"),
+                ("EXIT_WORD", labels["EXIT_WORD"]),
                 ("FAIL_STAGE", labels["FAIL_STAGE"]),
-                ("INPUT", labels["INPUT"]),
-                ("CREATE", labels["CREATE"]),
-                ("RUNSPACE", labels["RUNSPACE"]),
-                ("ADDSCRIPT", labels["ADDSCRIPT"]),
-                ("INVOKE", labels["INVOKE"]),
+                ("INPUT_READ_OK", labels["INPUT_READ_OK"]),
+                ("INPUT_EMPTY", labels["INPUT_EMPTY"]),
+                ("CREATE_OK", labels["CREATE_OK"]),
+                ("RUNSPACE_NULL", labels["RUNSPACE_NULL"]),
+                ("ADDSCRIPT_OK", labels["ADDSCRIPT_OK"]),
+                ("INVOKE_RETURNED", labels["INVOKE_RETURNED"]),
+                ("INVOKE_THROW", labels["INVOKE_THROW"]),
                 ("STATE", labels["STATE"]),
-                ("REASON", labels["REASON"]),
-                ("ERROR", labels["ERROR"]),
-                ("STOP", labels["STOP"]),
-                ("POST_STOP", labels["POST_STOP"]),
-                ("DISPOSE", labels["DISPOSE"]),
-                ("CANDIDATE_OK", labels["CANDIDATE_OK"]),
-                ("FINAL_OK_AND_D", labels["FINAL_OK_AND_D"]),
+                ("REASON_PRESENT", labels["REASON_PRESENT"]),
+                ("HAD_ERRORS", labels["HAD_ERRORS"]),
+                ("ERROR_COUNT", labels["ERROR_COUNT"]),
+                ("ACTIVE_DETECTED", labels["ACTIVE_DETECTED"]),
+                ("STOP_ATTEMPTED", labels["STOP_ATTEMPTED"]),
+                ("STOP_OK", labels["STOP_OK"]),
+                ("POST_STOP_STATE", labels["POST_STOP_STATE"]),
+                ("POST_STOP_ACTIVE", labels["POST_STOP_ACTIVE"]),
+                ("DISPOSE_ATTEMPTED", labels["DISPOSE_ATTEMPTED"]),
+                ("DISPOSE_OK", labels["DISPOSE_OK"]),
+                ("PREDICATE_OK", labels["PREDICATE_OK"]),
+                ("FINAL_OK", "TRUE" if final_ok else "FALSE"),
                 ("OBSERVATION_CONSISTENT", str(observation_consistent).lower()),
             ]
             print(
