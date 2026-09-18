@@ -4733,6 +4733,11 @@ function Get-R156ChildPacket {
         catch {
             return $null
         }
+        if ([bool]$packet.real_success_shape -and
+            ([string]$packet.real_status -cne 'INSTALLED' -or
+             [int64]$packet.real_backups_remaining -ne 0)) {
+            return $null
+        }
     }
     return $packet
 }
@@ -4802,6 +4807,19 @@ finally {
     Write-R156ChildLine -Line ('R156|PACKET|' + ($packet | ConvertTo-Json -Depth 8 -Compress))
     Write-R156ChildLine -Line ('R156|END|' + [string]$mode)
 }
+'@
+
+$script:R156BootstrapScript = @'
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+$source = [Console]::In.ReadToEnd()
+if ([string]::IsNullOrEmpty($source)) {
+    throw 'missing child script'
+}
+$child = [ScriptBlock]::Create($source)
+& $child
+exit 0
 '@
 
 function Test-R156ChildScriptParse {
@@ -4931,6 +4949,11 @@ function Get-R156ChildProtocol {
         catch {
             return $null
         }
+        if ([bool]$packetObject.real_success_shape -and
+            ([string]$packetObject.real_status -cne 'INSTALLED' -or
+             [int64]$packetObject.real_backups_remaining -ne 0)) {
+            return $null
+        }
     }
     return $packetObject
 }
@@ -4955,13 +4978,14 @@ function Invoke-R156Transport {
         [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$AdmissionCommit
     )
 
-    $encoded = ConvertTo-R156EncodedCommand -ScriptText $script:R156ChildScript
+    $encoded = ConvertTo-R156EncodedCommand -ScriptText $script:R156BootstrapScript
     $startInfo = New-Object System.Diagnostics.ProcessStartInfo
     $startInfo.FileName = Join-Path $PSHOME 'powershell.exe'
     $startInfo.Arguments = (
         '-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand ' + $encoded
     )
     $startInfo.UseShellExecute = $false
+    $startInfo.RedirectStandardInput = $true
     $startInfo.RedirectStandardOutput = $true
     $startInfo.RedirectStandardError = $true
     $startInfo.CreateNoWindow = $true
@@ -4990,26 +5014,33 @@ function Invoke-R156Transport {
                 Packet = $null
             }
         }
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        $process.StandardInput.Write($script:R156ChildScript)
+        $process.StandardInput.Flush()
         if ($Mode -ceq 'REAL') {
             $script:R156RealStarted = $true
             $script:R156RealInstallerInvocations = 1
             $script:R156AuthorityConsumed = 'YES'
             $script:R156PackageMutation = 'UNKNOWN'
         }
-        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
-        $stderrTask = $process.StandardError.ReadToEndAsync()
+        $process.StandardInput.Close()
         $process.WaitForExit()
         $stdout = [string]$stdoutTask.Result
-        $null = $stderrTask.Result
+        $stderr = [string]$stderrTask.Result
         $exitCode = [int]$process.ExitCode
         if ($Mode -ceq 'REAL' -and (Test-R156DispatchMarkerObserved -Stdout $stdout)) {
             $script:R156PackageMutation = 'CANONICAL_TRANSACTION_ATTEMPTED'
+        }
+        $packet = $null
+        if ([string]::IsNullOrEmpty($stderr)) {
+            $packet = Get-R156ChildProtocol -Mode $Mode -Stdout $stdout
         }
         return [pscustomobject]@{
             Started = $true
             SupervisorComplete = $true
             ChildExitCode = $exitCode
-            Packet = Get-R156ChildProtocol -Mode $Mode -Stdout $stdout
+            Packet = $packet
         }
     }
     catch {
@@ -5032,6 +5063,9 @@ function Invoke-R156Transport {
     }
     finally {
         if ($null -ne $process) {
+            if ($started) {
+                $process.StandardInput.Dispose()
+            }
             $process.Dispose()
         }
     }

@@ -1,5 +1,6 @@
 """Static, in-memory, parser, and synthetic regression proof for Run156 G3."""
 
+import base64
 import hashlib
 import json
 import os
@@ -36,6 +37,10 @@ class Run156HelperStaticTests(unittest.TestCase):
         native_start = cls.source.index("$script:R156NativeSource = @'")
         native_end = cls.source.index("'@", native_start + 1)
         cls.native = cls.source[native_start:native_end]
+        bootstrap_marker = "$script:R156BootstrapScript = @'\n"
+        bootstrap_start = cls.source.index(bootstrap_marker) + len(bootstrap_marker)
+        bootstrap_end = cls.source.index("\n'@", bootstrap_start)
+        cls.bootstrap = cls.source[bootstrap_start:bootstrap_end]
 
     def method_body(self, signature, next_signature):
         start = self.native.index(signature)
@@ -119,6 +124,92 @@ class Run156HelperStaticTests(unittest.TestCase):
                 f"stdout={result.stdout[-4096:]!r} stderr={result.stderr[-4096:]!r}"
             )
         return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+    def run_bootstrap(self, child_source, timeout=30, environment=None):
+        powershell = shutil.which("powershell.exe")
+        if powershell is None:
+            self.skipTest("Windows PowerShell 5.1 is not available on this host")
+        encoded = base64.b64encode(self.bootstrap.encode("utf-16-le")).decode("ascii")
+        env = os.environ.copy()
+        if environment:
+            env.update({str(key): str(value) for key, value in environment.items()})
+        return subprocess.run(
+            [
+                powershell,
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-EncodedCommand",
+                encoded,
+            ],
+            input=child_source,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+
+    def run_synthetic_transport(self, mode, child_source, private_sentinel):
+        functions = self.extracted_functions(
+            (
+                "Get-R156Properties",
+                "Test-R156ExactNameMultiset",
+                "Test-R156ExactPropertySet",
+                "ConvertTo-R156EncodedCommand",
+                "Get-R156ChildProtocol",
+                "Test-R156DispatchMarkerObserved",
+                "Invoke-R156Transport",
+            )
+        )
+        script = (
+            "$script:R156BootstrapScript = @'\n"
+            + self.bootstrap
+            + "\n'@\n"
+            + r"""
+$script:R156ChildScript = [Environment]::GetEnvironmentVariable('R156_SYNTHETIC_CHILD', 'Process')
+$script:R156RealStarted = $false
+$script:R156RealInstallerInvocations = 0
+$script:R156AuthorityConsumed = 'NO'
+$script:R156PackageMutation = 'NONE'
+"""
+            + functions
+            + r"""
+$private = [Environment]::GetEnvironmentVariable('R156_PRIVATE_SENTINEL', 'Process')
+$result = Invoke-R156Transport `
+    -Mode ([Environment]::GetEnvironmentVariable('R156_SYNTHETIC_MODE', 'Process')) `
+    -CheckoutRoot ('C:\checkout-' + $private) `
+    -InstallerPath ('C:\installer-' + $private + '.ps1') `
+    -LauncherRoot ('C:\launcher-' + $private) `
+    -AdmissionCommit '1111111111111111111111111111111111111111'
+[pscustomobject]@{
+    started = [bool]$result.Started
+    supervisor_complete = [bool]$result.SupervisorComplete
+    exit_code = [int]$result.ChildExitCode
+    packet_present = $null -ne $result.Packet
+    validation_status = if ($null -eq $result.Packet) { '' } else { [string]$result.Packet.validation_status }
+    validation_current = if ($null -eq $result.Packet) { '' } else { [string]$result.Packet.validation_current }
+    real_status = if ($null -eq $result.Packet) { '' } else { [string]$result.Packet.real_status }
+    real_success_shape = if ($null -eq $result.Packet) { $false } else { [bool]$result.Packet.real_success_shape }
+    real_started = [bool]$script:R156RealStarted
+    real_invocations = [int]$script:R156RealInstallerInvocations
+    authority_consumed = [string]$script:R156AuthorityConsumed
+    package_mutation = [string]$script:R156PackageMutation
+} | ConvertTo-Json -Compress
+"""
+        )
+        lines = self.run_isolated_powershell(
+            script,
+            environment={
+                "R156_SYNTHETIC_MODE": mode,
+                "R156_SYNTHETIC_CHILD": child_source,
+                "R156_PRIVATE_SENTINEL": private_sentinel,
+            },
+        )
+        self.assertEqual(len(lines), 1, lines)
+        self.assertNotIn(private_sentinel, "\n".join(lines))
+        return json.loads(lines[0])
 
     @staticmethod
     def git_contract_constants():
@@ -2004,6 +2095,224 @@ $state = Read-R156ManifestState `
                 f"bounded diagnostics: {bounded}"
             )
 
+    def test_stdin_bootstrap_is_frozen_and_safely_below_command_line_limit(self):
+        expected = """Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+$source = [Console]::In.ReadToEnd()
+if ([string]::IsNullOrEmpty($source)) {
+    throw 'missing child script'
+}
+$child = [ScriptBlock]::Create($source)
+& $child
+exit 0"""
+        self.assertEqual(self.bootstrap, expected)
+        encoded = base64.b64encode(self.bootstrap.encode("utf-16-le")).decode("ascii")
+        command_line = subprocess.list2cmdline(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-EncodedCommand",
+                encoded,
+            ]
+        )
+        self.assertLess(len(command_line), 4096)
+        self.assertLess(len(command_line), 32767)
+
+    def test_bootstrap_waits_for_eof_before_child_execution(self):
+        powershell = shutil.which("powershell.exe")
+        if powershell is None:
+            self.skipTest("Windows PowerShell 5.1 is not available on this host")
+        encoded = base64.b64encode(self.bootstrap.encode("utf-16-le")).decode("ascii")
+        with tempfile.TemporaryDirectory(prefix="r156_eof_") as directory:
+            marker = Path(directory) / "started.txt"
+            env = os.environ.copy()
+            env["R156_EOF_MARKER"] = str(marker)
+            child = (
+                "[IO.File]::WriteAllText($env:R156_EOF_MARKER, 'started')\r\n"
+                "[Console]::Out.WriteLine('after-eof')\r\n"
+            )
+            process = subprocess.Popen(
+                [
+                    powershell,
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-EncodedCommand",
+                    encoded,
+                ],
+                env=env,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            try:
+                process.stdin.write(child)
+                process.stdin.flush()
+                time.sleep(0.5)
+                self.assertFalse(marker.exists())
+                process.stdin.close()
+                process.stdin = None
+                stdout, stderr = process.communicate(timeout=30)
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait(timeout=10)
+            self.assertEqual(process.returncode, 0, stderr)
+            self.assertEqual(stdout.strip(), "after-eof")
+            self.assertTrue(marker.is_file())
+
+    def test_bootstrap_normalizes_only_normal_return_and_preserves_failures(self):
+        nested_exit = """
+$inner = [PowerShell]::Create()
+try {
+    [void]$inner.AddScript('exit 23')
+    [void]$inner.Invoke()
+}
+finally {
+    $inner.Dispose()
+}
+[Console]::Out.WriteLine('nested-returned')
+""".replace("\n", "\r\n")
+        normal = self.run_bootstrap(nested_exit)
+        self.assertEqual(normal.returncode, 0, normal.stderr)
+        self.assertEqual(normal.stdout.strip(), "nested-returned")
+
+        for name, source in (
+            ("empty", ""),
+            ("parse", "if ("),
+            ("throw", "throw 'synthetic uncaught child failure'"),
+        ):
+            with self.subTest(name=name):
+                failed = self.run_bootstrap(source)
+                self.assertNotEqual(failed.returncode, 0)
+
+    def test_child_protocol_rejects_missing_malformed_duplicate_and_extra_packets(self):
+        functions = self.extracted_functions(
+            (
+                "Get-R156Properties",
+                "Test-R156ExactNameMultiset",
+                "Test-R156ExactPropertySet",
+                "Get-R156ChildProtocol",
+            )
+        )
+        packet = (
+            'R156|PACKET|{"protocol":"xb-r156-child/v1",'
+            '"mode":"VALIDATE_ONLY","canonical_valid":true,'
+            '"validation_status":"PASS","validation_current":"FAIL",'
+            '"real_status":"","real_backups_remaining":-1,'
+            '"real_success_shape":false}'
+        )
+        script = (
+            functions
+            + "\n$packet = '"
+            + packet
+            + "'\n"
+            + r"""
+$cases = [ordered]@{
+    valid = "R156|BEGIN|VALIDATE_ONLY`r`n$packet`r`nR156|END|VALIDATE_ONLY`r`n"
+    missing = "R156|BEGIN|VALIDATE_ONLY`r`nR156|END|VALIDATE_ONLY`r`n"
+    malformed = "R156|BEGIN|VALIDATE_ONLY`r`nR156|PACKET|{`r`nR156|END|VALIDATE_ONLY`r`n"
+    duplicate = "R156|BEGIN|VALIDATE_ONLY`r`n$packet`r`n$packet`r`nR156|END|VALIDATE_ONLY`r`n"
+    extra = "R156|BEGIN|VALIDATE_ONLY`r`n$packet`r`nR156|END|VALIDATE_ONLY`r`nEXTRA`r`n"
+}
+$result = [ordered]@{}
+foreach ($entry in $cases.GetEnumerator()) {
+    $result[$entry.Key] = $null -ne (Get-R156ChildProtocol -Mode 'VALIDATE_ONLY' -Stdout $entry.Value)
+}
+$result | ConvertTo-Json -Compress
+"""
+        )
+        lines = self.run_isolated_powershell(script)
+        self.assertEqual(len(lines), 1, lines)
+        result = json.loads(lines[0])
+        self.assertTrue(result["valid"])
+        for name in ("missing", "malformed", "duplicate", "extra"):
+            self.assertFalse(result[name], name)
+
+    def test_full_crlf_validate_only_normalizes_exit_and_stderr_rejects_privately(self):
+        packet = (
+            '{"protocol":"xb-r156-child/v1","mode":"VALIDATE_ONLY",'
+            '"canonical_valid":true,"validation_status":"PASS",'
+            '"validation_current":"FAIL","real_status":"",'
+            '"real_backups_remaining":-1,"real_success_shape":false}'
+        )
+        child_lines = [
+            "$inner = [PowerShell]::Create()",
+            "try { [void]$inner.AddScript('exit 31'); [void]$inner.Invoke() } finally { $inner.Dispose() }",
+            "[Console]::Out.WriteLine('R156|BEGIN|VALIDATE_ONLY')",
+            f"[Console]::Out.WriteLine('R156|PACKET|{packet}')",
+            "[Console]::Out.WriteLine('R156|END|VALIDATE_ONLY')",
+        ]
+        child = "\r\n".join(child_lines) + "\r\n"
+        private = "R156_PRIVATE_TRANSPORT_SENTINEL"
+        accepted = self.run_synthetic_transport("VALIDATE_ONLY", child, private)
+        self.assertTrue(accepted["started"])
+        self.assertTrue(accepted["supervisor_complete"])
+        self.assertEqual(accepted["exit_code"], 0)
+        self.assertTrue(accepted["packet_present"])
+        self.assertEqual(accepted["validation_status"], "PASS")
+        self.assertEqual(accepted["validation_current"], "FAIL")
+
+        noisy_child = (
+            f"[Console]::Error.Write('{private}')\r\n"
+            + "\r\n".join(child_lines[2:])
+            + "\r\n"
+        )
+        rejected = self.run_synthetic_transport("VALIDATE_ONLY", noisy_child, private)
+        self.assertEqual(rejected["exit_code"], 0)
+        self.assertFalse(rejected["packet_present"])
+
+    def test_real_semantic_failure_is_protocol_classified_and_accounted_once(self):
+        packet = (
+            '{"protocol":"xb-r156-child/v1","mode":"REAL",'
+            '"canonical_valid":true,"validation_status":"",'
+            '"validation_current":"","real_status":"FAILED_PREFLIGHT",'
+            '"real_backups_remaining":1,"real_success_shape":false}'
+        )
+        child = "\r\n".join(
+            (
+                "[Console]::Out.WriteLine('R156|BEGIN|REAL')",
+                "[Console]::Out.WriteLine('R156|DISPATCH|REAL')",
+                f"[Console]::Out.WriteLine('R156|PACKET|{packet}')",
+                "[Console]::Out.WriteLine('R156|END|REAL')",
+                "",
+            )
+        )
+        result = self.run_synthetic_transport(
+            "REAL", child, "R156_PRIVATE_REAL_SENTINEL"
+        )
+        self.assertEqual(result["exit_code"], 0)
+        self.assertTrue(result["packet_present"])
+        self.assertEqual(result["real_status"], "FAILED_PREFLIGHT")
+        self.assertFalse(result["real_success_shape"])
+        self.assertTrue(result["real_started"])
+        self.assertEqual(result["real_invocations"], 1)
+        self.assertEqual(result["authority_consumed"], "YES")
+        self.assertEqual(result["package_mutation"], "CANONICAL_TRANSACTION_ATTEMPTED")
+
+        forged_child = child.replace(
+            '"real_success_shape":false', '"real_success_shape":true'
+        )
+        forged = self.run_synthetic_transport(
+            "REAL", forged_child, "R156_PRIVATE_FORGED_SENTINEL"
+        )
+        self.assertEqual(forged["exit_code"], 0)
+        self.assertFalse(forged["packet_present"])
+        self.assertEqual(forged["real_status"], "")
+
+        real_policy = self.source[
+            self.source.index("$script:R156InstallerStatus = [string]$realResult.Packet.real_status") :
+            self.source.index("Assert-R156PostProof", self.source.index("$script:R156InstallerStatus = [string]$realResult.Packet.real_status"))
+        ]
+        self.assertIn("$script:R156InstallerStatus -cne 'INSTALLED'", real_policy)
+        self.assertIn("-not [bool]$realResult.Packet.real_success_shape", real_policy)
+
     def test_access_check_token_constants_are_exact_and_distinct(self):
         identification = re.findall(
             r"private const int SECURITY_IDENTIFICATION = ([0-9]+);",
@@ -3153,7 +3462,40 @@ $results | ConvertTo-Json -Compress -Depth 4
         self.assertLess(collect, remove)
         self.assertLess(remove, child_binding)
         self.assertLess(child_binding, start)
+        self.assertIn("$startInfo.RedirectStandardInput = $true", transport)
+        stdout_read = transport.index(
+            "$stdoutTask = $process.StandardOutput.ReadToEndAsync()"
+        )
+        stderr_read = transport.index(
+            "$stderrTask = $process.StandardError.ReadToEndAsync()"
+        )
+        child_write = transport.index(
+            "$process.StandardInput.Write($script:R156ChildScript)"
+        )
+        child_flush = transport.index("$process.StandardInput.Flush()")
+        real_accounting = transport.index("$script:R156RealStarted = $true")
+        stdin_close = transport.index("$process.StandardInput.Close()")
+        self.assertLess(start, stdout_read)
+        self.assertLess(start, stderr_read)
+        self.assertLess(stdout_read, child_write)
+        self.assertLess(stderr_read, child_write)
+        self.assertLess(child_write, child_flush)
+        self.assertLess(child_flush, real_accounting)
+        self.assertLess(real_accounting, stdin_close)
+        arguments = transport[
+            transport.index("$startInfo.Arguments = (") :
+            transport.index("$startInfo.UseShellExecute", transport.index("$startInfo.Arguments = ("))
+        ]
+        self.assertIn("$encoded", arguments)
+        self.assertNotIn("R156ChildScript", arguments)
+        self.assertIn(
+            "ConvertTo-R156EncodedCommand -ScriptText $script:R156BootstrapScript",
+            transport,
+        )
         self.assertEqual(self.source.count("Invoke-R156Transport -Mode 'REAL'"), 1)
+        self.assertEqual(self.source.count("$script:R156RealStarted = $true"), 1)
+        self.assertEqual(self.source.count("$script:R156RealInstallerInvocations = 1"), 1)
+        self.assertEqual(self.source.count("$script:R156AuthorityConsumed = 'YES'"), 1)
         self.assertIn("$script:R156RealInstallerInvocations = 1", self.source)
         self.assertIn("$script:R156AuthorityConsumed = 'YES'", self.source)
         self.assertIn("'CONTROLLER_REQUIRED_POST_DISPATCH'", self.source)
