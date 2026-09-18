@@ -36,7 +36,8 @@ class WorkerDeploymentStaticTests(unittest.TestCase):
         }
         block = self.installer.split("$packageFiles = @(", 1)[1].split(")", 1)[0]
         self.assertEqual(set(re.findall(r'"([^"]+\.ps1)"', block)), expected)
-        self.assertIn("Get-XbFileSha256 -Path $path", self.installer)
+        self.assertIn("sha256 = [string]$entry[0].sha256", self.installer)
+        self.assertIn("Assert-XbStagedPackageIdentity", self.installer)
         self.assertNotIn("Get-Date", self.installer)
         self.assertNotIn("utc_timestamp", self.installer)
 
