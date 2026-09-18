@@ -4207,6 +4207,451 @@ $results | ConvertTo-Json -Compress -Depth 4
                 with self.subTest(json_case=name):
                     self.assertEqual(results[name]["kind"], "null")
 
+    def test_hosted_processstartinfo_bootstrap_predicate_forensics_g2_277(self):
+        """Capture only closed bootstrap observations through the frozen transport."""
+
+        cases = {
+            "VALIDATE_CRLF": {
+                "mode": "VALIDATE_ONLY",
+                "child": "\r\n".join(
+                    [
+                        "$inner = [PowerShell]::Create()",
+                        "try { [void]$inner.AddScript('exit 31'); [void]$inner.Invoke() } finally { $inner.Dispose() }",
+                        "[Console]::Out.WriteLine('R156|BEGIN|VALIDATE_ONLY')",
+                        "[Console]::Out.WriteLine('R156|PACKET|{\"protocol\":\"xb-r156-child/v1\",\"mode\":\"VALIDATE_ONLY\",\"canonical_valid\":true,\"validation_status\":\"PASS\",\"validation_current\":\"FAIL\",\"real_status\":\"\",\"real_backups_remaining\":-1,\"real_success_shape\":false}')",
+                        "[Console]::Out.WriteLine('R156|END|VALIDATE_ONLY')",
+                    ]
+                )
+                + "\r\n",
+                "sentinel": "R156_PRIVATE_FORENSIC_VALIDATE",
+            },
+            "REAL_SEMANTIC_FAILURE": {
+                "mode": "REAL",
+                "child": "\r\n".join(
+                    (
+                        "[Console]::Out.WriteLine('R156|BEGIN|REAL')",
+                        "[Console]::Out.WriteLine('R156|DISPATCH|REAL')",
+                        "[Console]::Out.WriteLine('R156|PACKET|{\"protocol\":\"xb-r156-child/v1\",\"mode\":\"REAL\",\"canonical_valid\":true,\"validation_status\":\"\",\"validation_current\":\"\",\"real_status\":\"FAILED_PREFLIGHT\",\"real_backups_remaining\":1,\"real_success_shape\":false}')",
+                        "[Console]::Out.WriteLine('R156|END|REAL')",
+                        "",
+                    )
+                ),
+                "sentinel": "R156_PRIVATE_FORENSIC_REAL",
+            },
+        }
+
+        functions = self.extracted_functions(
+            (
+                "Get-R156Properties",
+                "Test-R156ExactNameMultiset",
+                "Test-R156ExactPropertySet",
+                "ConvertTo-R156EncodedCommand",
+                "Get-R156ChildProtocol",
+                "Test-R156DispatchMarkerObserved",
+                "Invoke-R156Transport",
+            )
+        )
+
+        def run_closed_powershell(script, environment):
+            powershell = shutil.which("powershell.exe")
+            if powershell is None:
+                self.skipTest("Windows PowerShell 5.1 is not available on this host")
+            probe = subprocess.run(
+                [
+                    powershell,
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "$PSVersionTable.PSEdition",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            if probe.returncode != 0 or probe.stdout.strip() != "Desktop":
+                self.skipTest("Windows PowerShell 5.1 (PSEdition Desktop) is required")
+            env = os.environ.copy()
+            env.update({str(key): str(value) for key, value in environment.items()})
+            with tempfile.TemporaryDirectory(prefix="r156_forensic_") as directory:
+                harness = Path(directory) / "harness.ps1"
+                harness.write_text(script, encoding="utf-8")
+                result = subprocess.run(
+                    [
+                        powershell,
+                        "-NoProfile",
+                        "-NonInteractive",
+                        "-ExecutionPolicy",
+                        "Bypass",
+                        "-File",
+                        str(harness),
+                    ],
+                    env=env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                    timeout=120,
+                    check=False,
+                )
+            if result.returncode != 0:
+                self.fail("closed forensic PowerShell harness failed")
+            return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+        def run_transport(bootstrap, mode, child_source, private_sentinel):
+            script = (
+                "$script:R156BootstrapScript = @'\n"
+                + bootstrap
+                + "\n'@\n"
+                + r"""
+$script:R156ChildScript = [Environment]::GetEnvironmentVariable('R156_FORENSIC_CHILD', 'Process')
+$script:R156RealStarted = $false
+$script:R156RealInstallerInvocations = 0
+$script:R156AuthorityConsumed = 'NO'
+$script:R156PackageMutation = 'NONE'
+"""
+                + functions
+                + r"""
+$private = [Environment]::GetEnvironmentVariable('R156_FORENSIC_PRIVATE', 'Process')
+$result = Invoke-R156Transport `
+    -Mode ([Environment]::GetEnvironmentVariable('R156_FORENSIC_MODE', 'Process')) `
+    -CheckoutRoot ('C:\checkout-' + $private) `
+    -InstallerPath ('C:\installer-' + $private + '.ps1') `
+    -LauncherRoot ('C:\launcher-' + $private) `
+    -AdmissionCommit '1111111111111111111111111111111111111111'
+[pscustomobject]@{
+    started = [bool]$result.Started
+    supervisor_complete = [bool]$result.SupervisorComplete
+    exit_code = [int]$result.ChildExitCode
+    packet_present = $null -ne $result.Packet
+} | ConvertTo-Json -Compress
+"""
+            )
+            lines = run_closed_powershell(
+                script,
+                {
+                    "R156_FORENSIC_MODE": mode,
+                    "R156_FORENSIC_CHILD": child_source,
+                    "R156_FORENSIC_PRIVATE": private_sentinel,
+                },
+            )
+            self.assertEqual(len(lines), 1)
+            self.assertNotIn(private_sentinel, lines[0])
+            return json.loads(lines[0])
+
+        def replace_once(source, old, new):
+            self.assertEqual(source.count(old), 1)
+            return source.replace(old, new, 1)
+
+        diagnostic = replace_once(
+            self.bootstrap,
+            "$p=$null;$ok=$false;$d=$true;$a=$false;$x=$false;$v=$true;$n='Running','Stopping'",
+            "$b=0;$c=0;$g=0;$j=0;$k=0;$l=0;$m=0;$o=0;$y=0;"
+            "$zz=0;$dd=0;"
+            "$p=$null;$ok=$false;$d=$true;$a=$false;$x=$false;$v=$true;$n='Running','Stopping'",
+        )
+        diagnostic = replace_once(
+            diagnostic,
+            "$s=[Console]::In.ReadToEnd()",
+            "$s=[Console]::In.ReadToEnd();$c=1",
+        )
+        diagnostic = replace_once(
+            diagnostic,
+            "        $p=[PowerShell]::Create([System.Management.Automation.RunspaceMode]::NewRunspace)",
+            "        $p=[PowerShell]::Create([System.Management.Automation.RunspaceMode]::NewRunspace);$g=1",
+        )
+        diagnostic = replace_once(
+            diagnostic,
+            "        if($null -ne $p -and $null -ne $p.Runspace){\n            $d=$false;",
+            "        if($null -ne $p -and $null -ne $p.Runspace){\n            $j=1\n            $d=$false;",
+        )
+        diagnostic = replace_once(
+            diagnostic,
+            "$d=$false;$null=$p.AddScript($s);$a=$true",
+            "$d=$false;$null=$p.AddScript($s);$a=$true;$k=1",
+        )
+        diagnostic = replace_once(
+            diagnostic,
+            "            try{$null=$p.Invoke()}catch{$x=$true}",
+            "            try{$null=$p.Invoke();$l=1}catch{$x=$true;$b=6}",
+        )
+        diagnostic = replace_once(
+            diagnostic,
+            "            $i=$p.InvocationStateInfo;$q=[string]$i.State;$r=$i.Reason;$h=[bool]$p.HadErrors;$e=@($p.Streams.Error).Count",
+            "            $i=$p.InvocationStateInfo;$q=[string]$i.State;"
+            "$r=$i.Reason;$h=[bool]$p.HadErrors;$e=@($p.Streams.Error).Count;"
+            "if($q -ceq 'Completed'){$m=1}elseif($q -ceq 'Running'){$m=2}elseif($q -ceq 'Stopping'){$m=3};"
+            "$o=[int]($null -ne $r);$y=[int]($e -ne 0)",
+        )
+        diagnostic = replace_once(
+            diagnostic,
+            "            if($q -in $n){\n                try{$p.Stop();$z=[string]$p.InvocationStateInfo.State;$v=$z -notin $n}catch{$v=$false}\n            }",
+            "            if($q -in $n){\n"
+            "                try{$zz=1;$p.Stop();$z=[string]$p.InvocationStateInfo.State;"
+            "$v=$z -notin $n;if($v){$zz=2}else{$zz=3}}"
+            "catch{$v=$false;$zz=3;$b=8}\n            }",
+        )
+        diagnostic = replace_once(
+            diagnostic,
+            "            $ok=$a -and -not $x -and $q -eq 'Completed' -and $null -eq $r -and $e -eq 0 -and $q -notin $n -and $v",
+            "            $ok=$a -and -not $x -and $q -eq 'Completed' -and $null -eq $r -and $e -eq 0 -and $q -notin $n -and $v;"
+            "",
+        )
+        diagnostic = replace_once(
+            diagnostic,
+            "        }\n    }\n}catch{$ok=$false}",
+            "        }\n"
+            "    }\n}catch{$ok=$false;if($b -eq 0){$b=9}}",
+        )
+        diagnostic = replace_once(
+            diagnostic,
+            "finally{if($null -ne $p){try{$p.Dispose();$d=$true}catch{$d=$false}}}",
+            "finally{if($null -ne $p){try{$p.Dispose();$d=$true;$dd=1}"
+            "catch{$d=$false;$dd=2;$b=10}}}",
+        )
+        diagnostic = replace_once(
+            diagnostic,
+            "if($ok -and $d){\n    exit 0\n}\nexit 1",
+            "$f=[int][bool]($ok -and $d);$w=[int]0x40000000;$A=@($f,$ok,$c,$k,$l,$g,$j,$m,$o,$y,$zz,$dd);"
+            "for($i=0;$i-lt 12;$i++){$w=$w-bor(($A[$i]-band 3)-shl($i*2))};"
+            "$w=$w-bor(($b-band 15)-shl 24);"
+            "if($ok -and $d){exit $w};exit $w",
+        )
+
+        self.assertIn(
+            "$ok=$a -and -not $x -and $q -eq 'Completed' -and $null -eq $r -and $e -eq 0 -and $q -notin $n -and $v",
+            diagnostic,
+        )
+        self.assertIn("if($ok -and $d){", diagnostic)
+        self.assertNotIn("exit 0", diagnostic)
+        self.assertNotIn("exit 1", diagnostic)
+
+        for bootstrap in (self.bootstrap, diagnostic):
+            encoded = base64.b64encode(bootstrap.encode("utf-16-le")).decode("ascii")
+            command_line = subprocess.list2cmdline(
+                [
+                    "powershell.exe",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-EncodedCommand",
+                    encoded,
+                ]
+            )
+            self.assertLess(len(command_line), 4096)
+            self.assertLess(len(command_line), 32767)
+
+        frozen_results = []
+        for name, case in cases.items():
+            direct = self.run_bootstrap(case["child"])
+            self.assertEqual(direct.returncode, 0)
+            frozen = run_transport(
+                self.bootstrap,
+                case["mode"],
+                case["child"],
+                case["sentinel"],
+            )
+            self.assertTrue(frozen["started"])
+            self.assertTrue(frozen["supervisor_complete"])
+            frozen_results.append((name, frozen))
+
+        if any(result["exit_code"] == 0 for _, result in frozen_results):
+            if os.environ.get("GITHUB_ACTIONS", "").lower() != "true":
+                self.skipTest("hosted ProcessStartInfo differential is not present locally")
+            self.fail("frozen ProcessStartInfo control did not remain nonzero")
+
+        def extract_bits(word):
+            self.assertTrue(isinstance(word, int))
+            self.assertTrue(0x40000000 <= word < 0x80000000)
+
+            def bit(offset):
+                return (word >> offset) & 1
+
+            def pair(offset):
+                return (word >> offset) & 3
+
+            def quad(offset):
+                return (word >> offset) & 15
+
+            return {
+                "final": bit(0),
+                "candidate": bit(2),
+                "input": bit(4),
+                "add": bit(6),
+                "invoke": bit(8),
+                "create": pair(10),
+                "runspace": pair(12),
+                "state": pair(14),
+                "reason": pair(16),
+                "error": pair(18),
+                "stop": pair(20),
+                "dispose": pair(22),
+                "fail_stage": quad(24),
+            }
+
+        def reencode_bits(values):
+            encoded = 0x40000000
+            for offset, name in enumerate(
+                (
+                    "final",
+                    "candidate",
+                    "input",
+                    "add",
+                    "invoke",
+                    "create",
+                    "runspace",
+                    "state",
+                    "reason",
+                    "error",
+                    "stop",
+                    "dispose",
+                )
+            ):
+                encoded |= (int(values[name]) & 3) << (offset * 2)
+            encoded |= (int(values["fail_stage"]) & 15) << 24
+            return encoded
+
+        def closed_labels(values):
+            pair_labels = {
+                "create": {
+                    0: "NOT_CREATED",
+                    1: "CREATED",
+                    2: "FAILED",
+                    3: "UNKNOWN",
+                },
+                "runspace": {
+                    0: "NULL",
+                    1: "NON_NULL",
+                    2: "FAILED",
+                    3: "UNKNOWN",
+                },
+                "state": {
+                    0: "OTHER",
+                    1: "COMPLETED",
+                    2: "RUNNING",
+                    3: "STOPPING",
+                },
+                "reason": {0: "NULL", 1: "NON_NULL", 2: "FAILED", 3: "UNKNOWN"},
+                "error": {0: "NONE", 1: "PRESENT", 2: "FAILED", 3: "UNKNOWN"},
+                "stop": {
+                    0: "NOT_REQUIRED",
+                    1: "ATTEMPTED",
+                    2: "INACTIVE",
+                    3: "ACTIVE_OR_FAILED",
+                },
+                "dispose": {
+                    0: "NOT_ATTEMPTED",
+                    1: "DISPOSED",
+                    2: "FAILED",
+                    3: "UNKNOWN",
+                },
+            }
+            stage_labels = {
+                0: "NONE",
+                1: "INPUT_READ",
+                2: "INPUT_GATE",
+                3: "CREATE",
+                4: "RUNSPACE",
+                5: "ADD_SCRIPT",
+                6: "INVOKE",
+                7: "OBSERVE",
+                8: "STOP",
+                9: "BOOTSTRAP",
+                10: "DISPOSE",
+            }
+            labels = {
+                "INPUT": "READ" if values["input"] else "NOT_READ",
+                "ADDSCRIPT": "COMPLETED" if values["add"] else "NOT_COMPLETED",
+                "INVOKE": "COMPLETED" if values["invoke"] else "NOT_COMPLETED",
+                "CANDIDATE_OK": "TRUE" if values["candidate"] else "FALSE",
+                "FINAL_OK_AND_D": "TRUE" if values["final"] else "FALSE",
+            }
+            for key, mapping in pair_labels.items():
+                labels[key.upper()] = mapping[values[key]]
+            fail_stage = values["fail_stage"]
+            if (
+                fail_stage == 0
+                and values["input"]
+                and values["create"]
+                and values["runspace"] == 0
+            ):
+                fail_stage = 4
+            labels["FAIL_STAGE"] = stage_labels.get(fail_stage, "RESERVED")
+            labels["STOP"] = (
+                "ATTEMPTED" if values["stop"] else "NOT_REQUIRED"
+            )
+            labels["POST_STOP"] = {
+                0: "NOT_APPLICABLE",
+                1: "UNOBSERVED",
+                2: "INACTIVE",
+                3: "ACTIVE_OR_FAILED",
+            }[values["stop"]]
+            return labels
+
+        for name, case in cases.items():
+            diagnostic_result = run_transport(
+                diagnostic,
+                case["mode"],
+                case["child"],
+                case["sentinel"] + "_DIAGNOSTIC",
+            )
+            self.assertTrue(diagnostic_result["started"])
+            self.assertTrue(diagnostic_result["supervisor_complete"])
+            self.assertTrue(diagnostic_result["packet_present"])
+            values = extract_bits(diagnostic_result["exit_code"])
+            self.assertTrue(
+                reencode_bits(values) == diagnostic_result["exit_code"],
+                "forensic exit-word round-trip failed",
+            )
+            labels = closed_labels(values)
+            candidate_expected = (
+                values["add"] == 1
+                and values["invoke"] == 1
+                and values["state"] == 1
+                and values["reason"] == 0
+                and values["error"] == 0
+                and values["stop"] == 0
+            )
+            final_expected = candidate_expected and values["dispose"] == 1
+            observation_consistent = (
+                values["candidate"] == int(candidate_expected)
+                and values["final"] == int(final_expected)
+                and labels["FAIL_STAGE"] != "RESERVED"
+                and labels["CREATE"] != "UNKNOWN"
+                and labels["RUNSPACE"] != "UNKNOWN"
+                and labels["STATE"] != "OTHER"
+                and labels["REASON"] not in {"FAILED", "UNKNOWN"}
+                and labels["ERROR"] not in {"FAILED", "UNKNOWN"}
+                and labels["DISPOSE"] != "UNKNOWN"
+            )
+            record = [
+                ("CASE", name),
+                ("DIRECT_PYTHON", "ZERO"),
+                ("FROZEN_TRANSPORT", "NONZERO"),
+                ("DIAGNOSTIC_TRANSPORT", "FORENSIC_WORD"),
+                ("FAIL_STAGE", labels["FAIL_STAGE"]),
+                ("INPUT", labels["INPUT"]),
+                ("CREATE", labels["CREATE"]),
+                ("RUNSPACE", labels["RUNSPACE"]),
+                ("ADDSCRIPT", labels["ADDSCRIPT"]),
+                ("INVOKE", labels["INVOKE"]),
+                ("STATE", labels["STATE"]),
+                ("REASON", labels["REASON"]),
+                ("ERROR", labels["ERROR"]),
+                ("STOP", labels["STOP"]),
+                ("POST_STOP", labels["POST_STOP"]),
+                ("DISPOSE", labels["DISPOSE"]),
+                ("CANDIDATE_OK", labels["CANDIDATE_OK"]),
+                ("FINAL_OK_AND_D", labels["FINAL_OK_AND_D"]),
+                ("OBSERVATION_CONSISTENT", str(observation_consistent).lower()),
+            ]
+            print(
+                "R156_FORENSIC_V1|"
+                + "|".join(f"{key}={value}" for key, value in record)
+            )
+            self.assertTrue(observation_consistent, "forensic observation was inconsistent")
+
 
 
 if __name__ == "__main__":
