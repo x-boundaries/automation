@@ -2258,23 +2258,24 @@ $result | ConvertTo-Json -Compress
         for name in ("missing", "malformed", "duplicate", "extra"):
             self.assertFalse(result[name], name)
 
-    def test_full_crlf_validate_only_normalizes_exit_and_stderr_rejects_privately(self):
+    def test_validate_only_transport_accepts_crlf_packet_at_external_boundary(self):
         packet = (
             '{"protocol":"xb-r156-child/v1","mode":"VALIDATE_ONLY",'
             '"canonical_valid":true,"validation_status":"PASS",'
             '"validation_current":"FAIL","real_status":"",'
             '"real_backups_remaining":-1,"real_success_shape":false}'
         )
-        child_lines = [
-            "$inner = [PowerShell]::Create()",
-            "try { [void]$inner.AddScript('exit 31'); [void]$inner.Invoke() } finally { $inner.Dispose() }",
-            "[Console]::Out.WriteLine('R156|BEGIN|VALIDATE_ONLY')",
-            f"[Console]::Out.WriteLine('R156|PACKET|{packet}')",
-            "[Console]::Out.WriteLine('R156|END|VALIDATE_ONLY')",
-        ]
-        child = "\r\n".join(child_lines) + "\r\n"
-        private = "R156_PRIVATE_TRANSPORT_SENTINEL"
-        accepted = self.run_synthetic_transport("VALIDATE_ONLY", child, private)
+        child = "\r\n".join(
+            (
+                "[Console]::Out.WriteLine('R156|BEGIN|VALIDATE_ONLY')",
+                f"[Console]::Out.WriteLine('R156|PACKET|{packet}')",
+                "[Console]::Out.WriteLine('R156|END|VALIDATE_ONLY')",
+                "",
+            )
+        )
+        accepted = self.run_synthetic_transport(
+            "VALIDATE_ONLY", child, "R156_PRIVATE_VALIDATE_ACCEPT_SENTINEL"
+        )
         self.assertTrue(accepted["started"])
         self.assertTrue(accepted["supervisor_complete"])
         self.assertEqual(accepted["exit_code"], 0)
@@ -2282,16 +2283,32 @@ $result | ConvertTo-Json -Compress
         self.assertEqual(accepted["validation_status"], "PASS")
         self.assertEqual(accepted["validation_current"], "FAIL")
 
-        noisy_child = (
-            f"[Console]::Error.Write('{private}')\r\n"
-            + "\r\n".join(child_lines[2:])
-            + "\r\n"
+    def test_validate_only_private_stderr_rejection_is_classified_without_exposure(self):
+        packet = (
+            '{"protocol":"xb-r156-child/v1","mode":"VALIDATE_ONLY",'
+            '"canonical_valid":true,"validation_status":"PASS",'
+            '"validation_current":"FAIL","real_status":"",'
+            '"real_backups_remaining":-1,"real_success_shape":false}'
+        )
+        private = "R156_PRIVATE_VALIDATE_REJECTION_SENTINEL"
+        noisy_child = "\r\n".join(
+            (
+                f"[Console]::Error.Write('{private}')",
+                "[Console]::Out.WriteLine('R156|BEGIN|VALIDATE_ONLY')",
+                f"[Console]::Out.WriteLine('R156|PACKET|{packet}')",
+                "[Console]::Out.WriteLine('R156|END|VALIDATE_ONLY')",
+                "",
+            )
         )
         rejected = self.run_synthetic_transport("VALIDATE_ONLY", noisy_child, private)
+        self.assertTrue(rejected["started"])
+        self.assertTrue(rejected["supervisor_complete"])
         self.assertEqual(rejected["exit_code"], 0)
         self.assertFalse(rejected["packet_present"])
+        self.assertEqual(rejected["validation_status"], "")
+        self.assertNotIn(private, json.dumps(rejected, sort_keys=True))
 
-    def test_real_semantic_failure_is_protocol_classified_and_accounted_once(self):
+    def test_real_transport_classifies_semantic_failure_and_accounts_once(self):
         packet = (
             '{"protocol":"xb-r156-child/v1","mode":"REAL",'
             '"canonical_valid":true,"validation_status":"",'
@@ -2310,6 +2327,8 @@ $result | ConvertTo-Json -Compress
         result = self.run_synthetic_transport(
             "REAL", child, "R156_PRIVATE_REAL_SENTINEL"
         )
+        self.assertTrue(result["started"])
+        self.assertTrue(result["supervisor_complete"])
         self.assertEqual(result["exit_code"], 0)
         self.assertTrue(result["packet_present"])
         self.assertEqual(result["real_status"], "FAILED_PREFLIGHT")
@@ -2319,15 +2338,31 @@ $result | ConvertTo-Json -Compress
         self.assertEqual(result["authority_consumed"], "YES")
         self.assertEqual(result["package_mutation"], "CANONICAL_TRANSACTION_ATTEMPTED")
 
-        forged_child = child.replace(
-            '"real_success_shape":false', '"real_success_shape":true'
+    def test_real_transport_rejects_forged_success_shape(self):
+        packet = (
+            '{"protocol":"xb-r156-child/v1","mode":"REAL",'
+            '"canonical_valid":true,"validation_status":"",'
+            '"validation_current":"","real_status":"FAILED_PREFLIGHT",'
+            '"real_backups_remaining":1,"real_success_shape":true}'
+        )
+        forged_child = "\r\n".join(
+            (
+                "[Console]::Out.WriteLine('R156|BEGIN|REAL')",
+                "[Console]::Out.WriteLine('R156|DISPATCH|REAL')",
+                f"[Console]::Out.WriteLine('R156|PACKET|{packet}')",
+                "[Console]::Out.WriteLine('R156|END|REAL')",
+                "",
+            )
         )
         forged = self.run_synthetic_transport(
             "REAL", forged_child, "R156_PRIVATE_FORGED_SENTINEL"
         )
+        self.assertTrue(forged["started"])
+        self.assertTrue(forged["supervisor_complete"])
         self.assertEqual(forged["exit_code"], 0)
         self.assertFalse(forged["packet_present"])
         self.assertEqual(forged["real_status"], "")
+        self.assertFalse(forged["real_success_shape"])
 
         real_policy = self.source[
             self.source.index("$script:R156InstallerStatus = [string]$realResult.Packet.real_status") :
