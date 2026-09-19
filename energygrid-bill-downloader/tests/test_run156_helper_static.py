@@ -156,6 +156,31 @@ class Run156HelperStaticTests(unittest.TestCase):
             check=False,
         )
 
+    def run_bootstrap_bytes(self, stdin_bytes, timeout=30, environment=None):
+        powershell = shutil.which("powershell.exe")
+        if powershell is None:
+            self.skipTest("Windows PowerShell 5.1 is not available on this host")
+        encoded = base64.b64encode(self.bootstrap.encode("utf-16-le")).decode("ascii")
+        env = os.environ.copy()
+        if environment:
+            env.update({str(key): str(value) for key, value in environment.items()})
+        return subprocess.run(
+            [
+                powershell,
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-EncodedCommand",
+                encoded,
+            ],
+            input=stdin_bytes,
+            env=env,
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+        )
+
     @staticmethod
     def git_contract_constants():
         return """
@@ -2048,7 +2073,8 @@ $p=$null;$ok=$false;$d=$true;$a=$false;$x=$false;$v=$true;$n='Running','Stopping
 try{
     $w=[Console]::OpenStandardInput();$m=[System.IO.MemoryStream]::new();$w.CopyTo($m);$y=$m.ToArray();$k=0
     if($y.Length -ge 3 -and $y[0] -eq 239 -and $y[1] -eq 187 -and $y[2] -eq 191){$k=3}
-    $s=[System.Text.UTF8Encoding]::new($false).GetString($y,$k,$y.Length-$k)
+    if($y.Length -ge ($k + 3) -and $y[$k] -eq 239 -and $y[$k + 1] -eq 187 -and $y[$k + 2] -eq 191){throw [System.ArgumentException]::new('multiple leading UTF-8 preambles')}
+    $s=[System.Text.UTF8Encoding]::new($false, $true).GetString($y,$k,$y.Length-$k)
     if(-not [string]::IsNullOrEmpty($s)){
         $p=[PowerShell]::Create([System.Management.Automation.RunspaceMode]::NewRunspace)
         if($null -ne $p -and $null -ne $p.Runspace){
@@ -3775,6 +3801,7 @@ $results | ConvertTo-Json -Compress -Depth 4
         ]
         child = (
             "Set-StrictMode -Version Latest\r\n"
+            "# valid UTF-8: é€\r\n"
             "[Console]::Out.WriteLine('child-ran')\r\n"
         ).encode("utf-8")
 
@@ -3809,6 +3836,31 @@ $results | ConvertTo-Json -Compress -Depth 4
                     check=False,
                 )
                 self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, b"")
+
+    def test_bootstrap_rejects_malformed_utf8_before_any_child_packet(self):
+        """Strict decoding fails before executable or comment bytes can run."""
+        packet = (
+            b"Set-StrictMode -Version Latest\r\n"
+            b"[Console]::Out.WriteLine('R156|PACKET|accepted')\r\n"
+        )
+        cases = (
+            (
+                "invalid-byte-in-executable",
+                b"Set-StrictMode -Version Latest\r\n$broken = '\xff'\r\n" + packet,
+            ),
+            (
+                "invalid-sequence-in-comment",
+                b"Set-StrictMode -Version Latest\r\n# malformed \xc3\x28\r\n" + packet,
+            ),
+        )
+        for label, payload in cases:
+            for prefix_label, prefix in (("bomless", b""), ("bom", codecs.BOM_UTF8)):
+                with self.subTest(case=label, prefix=prefix_label):
+                    result = self.run_bootstrap_bytes(prefix + payload)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertEqual(result.stdout, b"")
+                    self.assertNotIn(b"R156|PACKET|", result.stdout)
 
     def test_real_bootstrap_starts_child_at_set_strictmode_under_utf8_parent_console(self):
         """End to end: the child's first token survives a UTF-8 parent console."""

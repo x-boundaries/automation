@@ -4817,7 +4817,8 @@ $p=$null;$ok=$false;$d=$true;$a=$false;$x=$false;$v=$true;$n='Running','Stopping
 try{
     $w=[Console]::OpenStandardInput();$m=[System.IO.MemoryStream]::new();$w.CopyTo($m);$y=$m.ToArray();$k=0
     if($y.Length -ge 3 -and $y[0] -eq 239 -and $y[1] -eq 187 -and $y[2] -eq 191){$k=3}
-    $s=[System.Text.UTF8Encoding]::new($false).GetString($y,$k,$y.Length-$k)
+    if($y.Length -ge ($k + 3) -and $y[$k] -eq 239 -and $y[$k + 1] -eq 187 -and $y[$k + 2] -eq 191){throw [System.ArgumentException]::new('multiple leading UTF-8 preambles')}
+    $s=[System.Text.UTF8Encoding]::new($false, $true).GetString($y,$k,$y.Length-$k)
     if(-not [string]::IsNullOrEmpty($s)){
         $p=[PowerShell]::Create([System.Management.Automation.RunspaceMode]::NewRunspace)
         if($null -ne $p -and $null -ne $p.Runspace){
