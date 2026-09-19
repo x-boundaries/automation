@@ -278,9 +278,14 @@ The reviewed manifest must carry the exact resolved credential object for each
 role: ID, name, type, and node-role membership. The prepared workflow retains
 the ID and name, and exact readback rejects a different credential object even
 when the replacement has the same name and type. The manifest must also carry
-`security.approved_gateway_origin` exactly as
-`https://gateway.example.com:443`; the gateway endpoints must resolve to that
-HTTPS origin. The Forms request must be exactly
+`security.approved_gateway_origin` as the reviewed private production
+authority: HTTPS, explicit port 443, no userinfo, query, fragment, or
+non-root path, and the exact `https://<host>:443` representation. The
+`https://gateway.example.com:443` value in the committed template is an
+illustrative placeholder only; the private reviewed production binding must
+replace it with the actual approved origin. All three gateway endpoints must
+match that approved scheme, host, and port while retaining their reviewed
+path relationships. The Forms request must be exactly
 `https://forms.googleapis.com:443/v1/forms/<form-id>/responses`. Alternate
 hosts, ports, versions, form IDs, queries, encoded/case/trailing-dot host
 variants, and other canonicalisation tricks are fail-closed before any token,
@@ -313,9 +318,11 @@ credential, or Docker access.
    Any mismatch blocks the operation and requires a new reviewed plan.
    Container staging is root-assisted only for mkdir/chown/chmod/stat/hash/
    cleanup; the n8n import runs as the recorded non-root UID/GID. Cleanup is
-   unconditional and exact. A cleanup failure after possible mutation is
+   unconditional and exact. No completion receipt or success status is valid
+   unless persisted custody proves `cleanup_state=cleaned` and
+   `cleanup_verified=true`. A cleanup failure after possible mutation is
    terminal no-replay state; subsequent recovery may read back the target or
-   clean the exact recorded path, but may not re-import.
+   clean the exact recorded path, but may not re-import or silently clean it.
 6. Run `Apply` only with the separately authorised target, source token, and
    explicit `-ConfirmBoundedApply`. Read back the exact inactive/manual target
    projection before writing completion evidence.
