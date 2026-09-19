@@ -13,12 +13,18 @@ on:
       - "schemas/member_gateway_operator_status.v1.schema.json"
       - "schemas/member_gateway_operator_reconciliation.v1.schema.json"
       - "config/member_gateway.production.example.json"
+      - "config/member_forms_gateway_bounded_import.v2.template.json"
       - "scripts/ac2_member_gateway_worker.ps1"
       - "scripts/ac2_member_gateway_worker_lib.ps1"
       - "scripts/ac2_member_gateway_autocount_adapter.ps1"
+      - "scripts/install_ac2_member_gateway_worker.ps1"
+      - "scripts/launch_ac2_member_gateway_worker.ps1"
+      - "scripts/test_ac2_member_gateway_autocount_dependencies.ps1"
       - "tests/test_member_gateway_worker_static.py"
       - "tests/test_member_gateway_n8n.py"
       - "tests/test_member_gateway_ci.py"
+      - "tests/test_member_gateway_worker_deployment.py"
+      - "tests/test_member_gateway_bounded_import_security.py"
       - "tests/test_member_gateway_privacy.py"
       - "tests/test_member_gateway_adapter_ps.py"
       - "tests/test_member_gateway_worker_cycle_ps.py"
@@ -27,6 +33,9 @@ on:
       - "docs/autocount2-automation/member_gateway_production_runbook.md"
       - "docs/ci-cd/CURRENT_CICD_STATUS.md"
       - "n8n-workflows/member_forms_gateway_ingest.workflow.json"
+      - "n8n-workflows/README.md"
+      - "n8n-workflows/scripts/README.md"
+      - "n8n-workflows/scripts/import-member-forms-gateway-bounded.ps1"
       - "member_gateway/migrations/0003_writer_termination_quarantine.sql"
       - "member_gateway/migrations/0004_forms_ingest_cursor.sql"
       - ".github/workflows/member-gateway-tests.yml"
@@ -44,12 +53,18 @@ on:
       - "schemas/member_gateway_operator_status.v1.schema.json"
       - "schemas/member_gateway_operator_reconciliation.v1.schema.json"
       - "config/member_gateway.production.example.json"
+      - "config/member_forms_gateway_bounded_import.v2.template.json"
       - "scripts/ac2_member_gateway_worker.ps1"
       - "scripts/ac2_member_gateway_worker_lib.ps1"
       - "scripts/ac2_member_gateway_autocount_adapter.ps1"
+      - "scripts/install_ac2_member_gateway_worker.ps1"
+      - "scripts/launch_ac2_member_gateway_worker.ps1"
+      - "scripts/test_ac2_member_gateway_autocount_dependencies.ps1"
       - "tests/test_member_gateway_worker_static.py"
       - "tests/test_member_gateway_n8n.py"
       - "tests/test_member_gateway_ci.py"
+      - "tests/test_member_gateway_worker_deployment.py"
+      - "tests/test_member_gateway_bounded_import_security.py"
       - "tests/test_member_gateway_privacy.py"
       - "tests/test_member_gateway_adapter_ps.py"
       - "tests/test_member_gateway_worker_cycle_ps.py"
@@ -58,6 +73,9 @@ on:
       - "docs/autocount2-automation/member_gateway_production_runbook.md"
       - "docs/ci-cd/CURRENT_CICD_STATUS.md"
       - "n8n-workflows/member_forms_gateway_ingest.workflow.json"
+      - "n8n-workflows/README.md"
+      - "n8n-workflows/scripts/README.md"
+      - "n8n-workflows/scripts/import-member-forms-gateway-bounded.ps1"
       - "member_gateway/migrations/0003_writer_termination_quarantine.sql"
       - "member_gateway/migrations/0004_forms_ingest_cursor.sql"
       - ".github/workflows/member-gateway-tests.yml"
@@ -123,8 +141,31 @@ jobs:
         shell: pwsh
         run: >-
           python -m unittest tests.test_member_gateway_worker_static
+          tests.test_member_gateway_worker_deployment
           tests.test_member_gateway_adapter_ps
           tests.test_member_gateway_worker_cycle_ps -v
+
+  bounded-import-security:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Assert literal exact-head checkout
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          ACTUAL_SHA="$(git rev-parse HEAD)"
+          test "${ACTUAL_SHA}" = "${EXPECTED_SHA}"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run bounded import security regressions
+        shell: pwsh
+        run: python -m unittest tests.test_member_gateway_bounded_import_security -v
 
   n8n-offline:
     runs-on: ubuntu-latest
@@ -179,7 +220,7 @@ jobs:
 
   full-offline-regression:
     runs-on: windows-latest
-    needs: [gateway-tests, powershell-static, n8n-offline, existing-member-regression]
+    needs: [gateway-tests, powershell-static, bounded-import-security, n8n-offline, existing-member-regression]
     steps:
       - uses: actions/checkout@v4
         with:

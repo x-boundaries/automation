@@ -58,6 +58,36 @@ class MemberGatewayCiTests(unittest.TestCase):
     def test_windows_full_offline_regression_provisions_tzdata_before_suite(self):
         self._assert_exact_tzdata_allowance(self.text)
 
+    def test_bounded_import_security_job_is_exact_offline_gate(self):
+        self.assertEqual(
+            self.text.count("run: python -m unittest tests.test_member_gateway_bounded_import_security -v"),
+            1,
+        )
+        job = self.text.split("  bounded-import-security:\n", 1)[1].split("\n  n8n-offline:", 1)[0]
+        self.assertIn("runs-on: windows-latest", job)
+        self.assertIn("ref: ${{ github.event.pull_request.head.sha || github.sha }}", job)
+        self.assertIn("persist-credentials: false", job)
+        self.assertIn("shell: pwsh", job)
+        self.assertNotIn("secrets.", job)
+        self.assertNotIn("docker", job.lower())
+        self.assertNotIn("import:workflow", job)
+        self.assertIn(
+            "needs: [gateway-tests, powershell-static, bounded-import-security, n8n-offline, existing-member-regression]",
+            self.text,
+        )
+
+    def test_bounded_import_files_are_narrowly_triggered(self):
+        for required_path in (
+            '"config/member_forms_gateway_bounded_import.v2.template.json"',
+            '"n8n-workflows/scripts/import-member-forms-gateway-bounded.ps1"',
+            '"scripts/install_ac2_member_gateway_worker.ps1"',
+            '"scripts/launch_ac2_member_gateway_worker.ps1"',
+            '"scripts/test_ac2_member_gateway_autocount_dependencies.ps1"',
+            '"tests/test_member_gateway_worker_deployment.py"',
+            '"tests/test_member_gateway_bounded_import_security.py"',
+        ):
+            self.assertEqual(self.text.count(required_path), 2, required_path)
+
     def test_tzdata_allowance_rejects_appended_package(self):
         mutated = self.text.replace(self.TZDATA_COMMAND, self.TZDATA_COMMAND + " requests", 1)
         with self.assertRaises(AssertionError):

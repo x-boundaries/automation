@@ -78,6 +78,57 @@ Workflow JSON in this directory is source-controlled evidence of workflow design
 
 ## Helper Scripts
 
+### Bounded member-gateway import successor
+
+`scripts/import-member-forms-gateway-bounded.ps1` is a dedicated, fresh
+split-successor helper for the inactive member gateway source-adapter
+workflow. It is the sole bounded production path for this workflow. It reads
+the authoritative cursor and exact target metadata, captures an immutable
+operation plan, and can import at most the one reviewed workflow after an
+explicit apply confirmation. It does not call the generic live importer,
+export all workflows, execute or activate a workflow, enable MCP, or contact
+Google Forms, AutoCount, or member endpoints.
+
+The binding shape is
+`../config/member_forms_gateway_bounded_import.v2.template.json`. Real target
+IDs, form/question IDs, resolved credential IDs and names, cursor values, source
+tokens, and operation material stay in ignored private custody under
+`.n8n-local/member-gateway-bounded-import/operations/`. These files are
+rejected if they are tracked, outside the canonical private root, linked, or
+not protected by the required Windows ACL. Persisted JSON is canonical UTF-8
+without BOM with LF line endings.
+
+The private manifest must bind each credential role's exact resolved
+`credential_id`, `credential_name`, `credential_type`, and node role. Prepared
+node references retain both ID and name; readback rejects a different object
+even when its name and type are unchanged. The manifest's
+`security.approved_gateway_origin` is the reviewed private production
+authority and must be a canonical `https://<host>:443` origin with no
+userinfo, query, fragment, or non-root path. The
+`https://gateway.example.com:443` value in the committed template is an
+illustrative placeholder only; the private reviewed production binding must
+replace it with the actual approved origin. All three gateway endpoints must
+match that origin's scheme, host, and port. The Forms endpoint is separately fixed to
+`https://forms.googleapis.com:443` with the exact
+`/v1/forms/<form-id>/responses` path and no alternate host, port, version,
+query, or canonicalisation form.
+
+When the target is containerised, the operation records immutable container
+and image identities, the non-root n8n import UID/GID, a random operation
+nonce, sticky `/tmp` proof, private 0700/0600 staging ownership and modes, and
+the exact prepared-file hash before import. Root-assisted staging,
+verification, and exact recursive cleanup are allowed; the n8n import itself
+is never run as root. A cleanup failure after dispatch leaves the operation in
+terminal no-replay custody. No completion receipt or success/no-op status may
+be emitted unless persisted custody proves `cleanup_state=cleaned` and
+`cleanup_verified=true`; recovery may only perform readback or separately
+authorised exact cleanup.
+
+The helper's CapturePlan and Apply recovery contract is covered by the exact
+offline command `python -m unittest tests.test_member_gateway_bounded_import_security -v`.
+An incomplete or ambiguous operation is retained and reconciled by exact
+identity/readback evidence; it is never silently reinitialised or replayed.
+
 The approved n8n import/export helper-script package from the Toolkit source (`ai-agent-toolkit:n8n-workflow-helper-scripts`, project `n8n.workflow-toolkit`) is installed under `scripts/` in this directory, as required by the n8n workflows playbook (`docs/agent-playbooks/n8n-workflows.md`) and the package's own consumer-repo layout.
 
 - Entry points: `scripts/_import-n8n-workflows-live.cmd` and `scripts/_export-n8n-workflows-live.cmd` (manual, review-required; they never run automatically).

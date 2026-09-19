@@ -1,0 +1,61 @@
+{
+  "schema_version": "xb.member.gateway.bounded_import.binding.v2",
+  "source_system": "google_forms",
+  "form_alias": "member_registration",
+  "mapping_version": "member-intake.v1",
+  "project": {
+    "id": "PROJECT_ID_PLACEHOLDER",
+    "name": "Member Gateway"
+  },
+  "workflow": {
+    "id": "WORKFLOW_ID_PLACEHOLDER",
+    "name": "Member Gateway - Google Forms durable source adapter (inactive)"
+  },
+  "endpoints": {
+    "source_cursor": "https://gateway.example.com:443/v1/source/cursor",
+    "forms_responses": "https://forms.googleapis.com:443/v1/forms/GOOGLE_FORM_ID_PLACEHOLDER/responses",
+    "gateway_ingest": "https://gateway.example.com:443/v1/source-events",
+    "page_checkpoint": "https://gateway.example.com:443/v1/source/cursor/page"
+  },
+  "form": {
+    "id": "GOOGLE_FORM_ID_PLACEHOLDER"
+  },
+  "question_mapping": {
+    "name": "QUESTION_ID_NAME_PLACEHOLDER",
+    "phone": "QUESTION_ID_PHONE_PLACEHOLDER",
+    "email": "QUESTION_ID_EMAIL_PLACEHOLDER",
+    "birthday_month": "QUESTION_ID_BIRTHDAY_MONTH_PLACEHOLDER",
+    "marketing_consent": "QUESTION_ID_MARKETING_CONSENT_PLACEHOLDER",
+    "pdpa_acknowledged": "QUESTION_ID_PDPA_ACKNOWLEDGED_PLACEHOLDER"
+  },
+  "credential_roles": {
+    "google_forms_oauth": {
+      "credential_id": "GOOGLE_FORMS_CREDENTIAL_ID_PLACEHOLDER",
+      "credential_name": "GOOGLE_FORMS_CREDENTIAL_NAME_PLACEHOLDER",
+      "credential_type": "googleOAuth2Api",
+      "node_names": [
+        "Google Forms single page (configured outside repo)"
+      ]
+    },
+    "gateway_bearer": {
+      "credential_id": "GATEWAY_BEARER_CREDENTIAL_ID_PLACEHOLDER",
+      "credential_name": "GATEWAY_BEARER_CREDENTIAL_NAME_PLACEHOLDER",
+      "credential_type": "httpBearerAuth",
+      "node_names": [
+        "Read durable source cursor",
+        "Protected XB Gateway ingest (configured outside repo)",
+        "Commit durable page checkpoint"
+      ]
+    }
+  },
+  "cursor_expectation": {
+    "state_version": 0,
+    "watermark": "WATERMARK_RFC3339_PLACEHOLDER",
+    "watermark_digest": "WATERMARK_SHA256_PLACEHOLDER"
+  },
+  "security": {
+    "approved_gateway_origin": "https://gateway.example.com:443",
+    "source_token_env": "XB_MEMBER_GATEWAY_SOURCE_TOKEN",
+    "n8n_target_mode": "explicit-reviewed-target"
+  }
+}

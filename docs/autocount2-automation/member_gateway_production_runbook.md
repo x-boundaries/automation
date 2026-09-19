@@ -254,3 +254,116 @@ No live Google Forms/Sheets, n8n instance, PostgreSQL server, AutoCount account
 book, Docker/service, VM, network, credential, scheduler, production
 activation, deployment, or existing UAT package execution is part of this
 runbook execution.
+
+## Bounded member-gateway workflow import successor
+
+The bounded importer is a fresh split-successor path for the inactive member
+gateway source-adapter workflow. Its only production mutation is one explicit,
+reviewed n8n workflow import. It does not call the generic repository importer,
+export all workflows, execute a workflow, activate a workflow, expose MCP, or
+contact Forms, AutoCount, or the member API. The canonical source remains
+`n8n-workflows/member_forms_gateway_ingest.workflow.json` and must remain
+inactive, manual-triggered, credential-free, and unchanged.
+
+The bounded entry point is
+`n8n-workflows/scripts/import-member-forms-gateway-bounded.ps1`. Its reviewed
+binding shape is documented by
+`config/member_forms_gateway_bounded_import.v2.template.json`. The committed
+file is a shape template only: real project/workflow IDs, form/question IDs,
+resolved credential IDs and names, cursor watermark, and source token stay in
+a private, ignored operator manifest. Do not put those values in a workflow
+export, ordinary temporary files, or this repository.
+
+The reviewed manifest must carry the exact resolved credential object for each
+role: ID, name, type, and node-role membership. The prepared workflow retains
+the ID and name, and exact readback rejects a different credential object even
+when the replacement has the same name and type. The manifest must also carry
+`security.approved_gateway_origin` as the reviewed private production
+authority: HTTPS, explicit port 443, no userinfo, query, fragment, or
+non-root path, and the exact `https://<host>:443` representation. The
+`https://gateway.example.com:443` value in the committed template is an
+illustrative placeholder only; the private reviewed production binding must
+replace it with the actual approved origin. All three gateway endpoints must
+match that approved scheme, host, and port while retaining their reviewed
+path relationships. The Forms request must be exactly
+`https://forms.googleapis.com:443/v1/forms/<form-id>/responses`. Alternate
+hosts, ports, versions, form IDs, queries, encoded/case/trailing-dot host
+variants, and other canonicalisation tricks are fail-closed before any token,
+credential, or Docker access.
+
+### Required sequence
+
+1. Reconcile the protected canonical main revision, the parent/child issue
+   authority, the frozen predecessor PR, and the exact canonical workflow blob.
+   A changed authority packet requires a new reviewed plan.
+2. Prepare the private manifest and acquire the authoritative source cursor,
+   watermark, exact project/workflow metadata, and either the exact existing
+   workflow export or complete absence evidence. A case-distinct target is a
+   collision, not an absent target.
+3. Run `CapturePlan` read-only. The plan binds the repository H/tree/parent,
+   canonical workflow blob, project/workflow identity, prepared workflow,
+   resolved credential-binding digest, cursor digest and state version,
+   domain-separated watermark digest, and existing/absent preimage digest.
+4. Review the immutable files under
+   `.n8n-local/member-gateway-bounded-import/operations/<operation-id>/`.
+   They must contain only the plan, binding, cursor state, prepared workflow,
+   mutation intent, exactly one preimage/absence receipt, and later receipts.
+   A containerised apply additionally records one private
+   `container-custody.json` receipt before import. It binds the container and
+   image IDs, non-root import UID/GID, random nonce, sticky `/tmp` proof,
+   private staging ownership/modes, exact prepared bytes/hash, and cleanup
+   state.
+5. Immediately before `Apply`, reacquire and compare the cursor, watermark,
+   project/workflow metadata, and preimage. Every retry repeats this check.
+   Any mismatch blocks the operation and requires a new reviewed plan.
+   Container staging is root-assisted only for mkdir/chown/chmod/stat/hash/
+   cleanup; the n8n import runs as the recorded non-root UID/GID. Cleanup is
+   unconditional and exact. No completion receipt or success status is valid
+   unless persisted custody proves `cleanup_state=cleaned` and
+   `cleanup_verified=true`. A cleanup failure after possible mutation is
+   terminal no-replay state; subsequent recovery may read back the target or
+   clean the exact recorded path, but may not re-import or silently clean it.
+6. Run `Apply` only with the separately authorised target, source token, and
+   explicit `-ConfirmBoundedApply`. Read back the exact inactive/manual target
+   projection before writing completion evidence.
+
+Example planning command (read-only; use a private manifest path):
+
+```powershell
+pwsh -NoProfile -File n8n-workflows/scripts/import-member-forms-gateway-bounded.ps1 `
+  -Mode CapturePlan `
+  -OperationId member-gateway-<reviewed-operation-id> `
+  -BindingManifestFile <private-manifest-path>
+```
+
+The live apply command is intentionally not part of automated CI and is not a
+deployment command. It requires current-turn authority naming the target and
+operation, plus `-ConfirmBoundedApply`; this repository change alone is never
+proof of import, activation, execution, or production deployment.
+
+### Recovery and custody rules
+
+The operation directory is immutable once populated. Missing, corrupt, extra,
+or reinitialised material fails closed. A pre-dispatch failure may be retried
+only after fresh evidence. A dispatch with no completion is ambiguous: if the
+exact target already matches, write only completion evidence; if it does not,
+stop without replay. A partial create with a complete target result is also
+completed without a second mutation. A completed operation is a no-op only
+when the target projection and operation identity still match exactly.
+
+Before the first private byte is written, the helper resolves the repository
+and canonical private root, verifies ignored/untracked custody, rejects path
+escape and reparse/link components, creates restrictive Windows ACLs for the
+current operator/SYSTEM/Administrators, then writes flushed UTF-8 LF-only
+files by create-new and same-root staged rename. Incomplete operations remain
+for reconciliation; they are never silently deleted or reinitialised.
+
+Offline validation for this path is the dedicated regression command:
+
+```text
+python -m unittest tests.test_member_gateway_bounded_import_security -v
+```
+
+The hosted `bounded-import-security` job runs that exact command on Windows.
+It uses synthetic fixtures only and has no live credentials, Docker target,
+generic importer hook, or n8n mutation authority.
