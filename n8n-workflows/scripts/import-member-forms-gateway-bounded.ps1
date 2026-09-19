@@ -311,16 +311,39 @@ function Get-BoundedHttpsUri {
     if (-not $uri.IsAbsoluteUri -or $uri.Scheme -cne "https" -or -not [string]::IsNullOrEmpty($uri.UserInfo) -or -not [string]::IsNullOrEmpty($uri.Fragment)) {
         Stop-Bounded $Code
     }
+    if ([string]::IsNullOrWhiteSpace($uri.Host) -or $uri.Host.EndsWith(".", [StringComparison]::Ordinal)) {
+        Stop-Bounded $Code
+    }
     return $uri
 }
 
-function Assert-BoundedApprovedOrigin {
+function Get-BoundedCanonicalOrigin {
     param(
-        [Parameter(Mandatory)][System.Uri]$Uri,
-        [Parameter(Mandatory)][string]$ApprovedHost,
+        [Parameter(Mandatory)][string]$Value,
         [Parameter(Mandatory)][string]$Code
     )
-    if ($Uri.Scheme -cne "https" -or -not $Uri.Host.Equals($ApprovedHost, [StringComparison]::OrdinalIgnoreCase) -or $Uri.Port -ne 443) {
+    $uri = Get-BoundedHttpsUri $Value $Code
+    if ($uri.Port -ne 443 -or
+        -not [string]::IsNullOrEmpty($uri.UserInfo) -or
+        -not [string]::IsNullOrEmpty($uri.Query) -or
+        -not [string]::IsNullOrEmpty($uri.Fragment) -or
+        $uri.AbsolutePath -ne "/") {
+        Stop-Bounded $Code
+    }
+    $originHost = $uri.Host.ToLowerInvariant()
+    $authorityHost = if ($uri.HostNameType -eq [System.UriHostNameType]::IPv6) { "[" + $originHost + "]" } else { $originHost }
+    $canonical = "https://{0}:443" -f $authorityHost
+    if ([string]$Value -cne $canonical) { Stop-Bounded $Code }
+    return $uri
+}
+
+function Assert-BoundedOriginMatches {
+    param(
+        [Parameter(Mandatory)][System.Uri]$Uri,
+        [Parameter(Mandatory)][System.Uri]$ApprovedOrigin,
+        [Parameter(Mandatory)][string]$Code
+    )
+    if (-not (Test-BoundedSameOrigin $Uri $ApprovedOrigin)) {
         Stop-Bounded $Code
     }
 }
@@ -338,26 +361,30 @@ function Test-BoundedSameOrigin {
 function Assert-BoundedManifestEndpointRelationships {
     param([Parameter(Mandatory)]$Manifest)
     $source = Get-BoundedHttpsUri ([string]$Manifest.endpoints.source_cursor) "binding_endpoint_relationship_invalid"
-    $forms = Get-BoundedHttpsUri ([string]$Manifest.endpoints.forms_responses) "binding_endpoint_relationship_invalid"
+    $forms = Get-BoundedHttpsUri ([string]$Manifest.endpoints.forms_responses) "binding_forms_origin_invalid"
     $gateway = Get-BoundedHttpsUri ([string]$Manifest.endpoints.gateway_ingest) "binding_endpoint_relationship_invalid"
     $checkpoint = Get-BoundedHttpsUri ([string]$Manifest.endpoints.page_checkpoint) "binding_endpoint_relationship_invalid"
     foreach ($uri in @($source, $forms, $gateway, $checkpoint)) {
         if (-not [string]::IsNullOrEmpty($uri.Query)) { Stop-Bounded "binding_endpoint_query_invalid" }
         if ([string]::IsNullOrWhiteSpace($uri.AbsolutePath) -or $uri.AbsolutePath -eq "/") { Stop-Bounded "binding_endpoint_relationship_invalid" }
     }
-    Assert-BoundedApprovedOrigin $source "gateway.example.com" "binding_gateway_origin_invalid"
-    Assert-BoundedApprovedOrigin $gateway "gateway.example.com" "binding_gateway_origin_invalid"
-    Assert-BoundedApprovedOrigin $checkpoint "gateway.example.com" "binding_gateway_origin_invalid"
-    Assert-BoundedApprovedOrigin $forms "forms.example.com" "binding_forms_origin_invalid"
+    $approvedGatewayOrigin = Get-BoundedCanonicalOrigin ([string]$Manifest.security.approved_gateway_origin) "binding_gateway_origin_invalid"
+    $approvedFormsOrigin = Get-BoundedCanonicalOrigin "https://forms.googleapis.com:443" "binding_forms_origin_invalid"
+    Assert-BoundedOriginMatches $source $approvedGatewayOrigin "binding_gateway_origin_invalid"
+    Assert-BoundedOriginMatches $gateway $approvedGatewayOrigin "binding_gateway_origin_invalid"
+    Assert-BoundedOriginMatches $checkpoint $approvedGatewayOrigin "binding_gateway_origin_invalid"
+    Assert-BoundedOriginMatches $forms $approvedFormsOrigin "binding_forms_origin_invalid"
     if (-not (Test-BoundedSameOrigin $source $gateway) -or -not (Test-BoundedSameOrigin $source $checkpoint)) {
         Stop-Bounded "binding_endpoint_relationship_invalid"
     }
     $sourcePath = $source.AbsolutePath.TrimEnd([char]'/')
     $checkpointPath = $checkpoint.AbsolutePath.TrimEnd([char]'/')
     if ($checkpointPath -cne ($sourcePath + "/page")) { Stop-Bounded "binding_endpoint_relationship_invalid" }
-    $formsPath = $forms.AbsolutePath.TrimEnd([char]'/')
-    $expectedFormsSuffix = "/forms/" + [string]$Manifest.form.id + "/responses"
-    if (-not $formsPath.EndsWith($expectedFormsSuffix, [StringComparison]::Ordinal)) { Stop-Bounded "binding_form_endpoint_mismatch" }
+    $expectedFormsPath = "/v1/forms/" + [string]$Manifest.form.id + "/responses"
+    if ($forms.AbsolutePath -cne $expectedFormsPath -or
+        ([string]$Manifest.endpoints.forms_responses).Equals("https://forms.googleapis.com:443" + $expectedFormsPath, [StringComparison]::Ordinal) -eq $false) {
+        Stop-Bounded "binding_form_endpoint_mismatch"
+    }
 }
 
 function Assert-BoundedManifest {
@@ -396,7 +423,8 @@ function Assert-BoundedManifest {
     Assert-BoundedExactProperties $Manifest.credential_roles @("google_forms_oauth", "gateway_bearer") "binding_credentials_shape_invalid"
     foreach ($roleName in @("google_forms_oauth", "gateway_bearer")) {
         $role = $Manifest.credential_roles.$roleName
-        Assert-BoundedExactProperties $role @("credential_name", "credential_type", "node_names") "binding_credential_role_shape_invalid"
+        Assert-BoundedExactProperties $role @("credential_id", "credential_name", "credential_type", "node_names") "binding_credential_role_shape_invalid"
+        Assert-BoundedSafeIdentity ([string]$role.credential_id) "binding_credential_invalid" -AllowPlaceholder
         Assert-BoundedSafeIdentity ([string]$role.credential_name) "binding_credential_invalid" -AllowPlaceholder
         Assert-BoundedSafeIdentity ([string]$role.credential_type) "binding_credential_invalid"
         $expectedCredentialType = if ($roleName -eq "google_forms_oauth") { "googleOAuth2Api" } else { "httpBearerAuth" }
@@ -421,7 +449,8 @@ function Assert-BoundedManifest {
     if (-not (Test-BoundedPlaceholder $watermark) -and $watermark -notmatch '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$') { Stop-Bounded "binding_watermark_invalid" }
     if (-not (Test-BoundedPlaceholder $watermarkDigest) -and $watermarkDigest -notmatch '^[0-9a-f]{64}$') { Stop-Bounded "binding_watermark_digest_invalid" }
 
-    Assert-BoundedExactProperties $Manifest.security @("source_token_env", "n8n_target_mode") "binding_security_shape_invalid"
+    Assert-BoundedExactProperties $Manifest.security @("approved_gateway_origin", "source_token_env", "n8n_target_mode") "binding_security_shape_invalid"
+    Get-BoundedCanonicalOrigin ([string]$Manifest.security.approved_gateway_origin) "binding_security_invalid" | Out-Null
     if ([string]$Manifest.security.source_token_env -notmatch '^[A-Z][A-Z0-9_]{2,80}$') { Stop-Bounded "binding_security_invalid" }
     if ([string]$Manifest.security.n8n_target_mode -cne "explicit-reviewed-target") { Stop-Bounded "binding_security_invalid" }
     Assert-BoundedManifestEndpointRelationships $Manifest
@@ -447,6 +476,14 @@ function Assert-BoundedDigest {
 
 function Assert-BoundedReviewedBinding {
     param([Parameter(Mandatory)]$Manifest)
+    foreach ($roleName in @("google_forms_oauth", "gateway_bearer")) {
+        $role = $Manifest.credential_roles.$roleName
+        if ((Test-BoundedPlaceholder ([string]$role.credential_id)) -or (Test-BoundedPlaceholder ([string]$role.credential_name))) {
+            Stop-Bounded "binding_credential_reference_unresolved"
+        }
+        Assert-BoundedSafeIdentity ([string]$role.credential_id) "binding_credential_reference_invalid"
+        Assert-BoundedSafeIdentity ([string]$role.credential_name) "binding_credential_reference_invalid"
+    }
     $watermark = [string]$Manifest.cursor_expectation.watermark
     $watermarkDigest = [string]$Manifest.cursor_expectation.watermark_digest
     if ((Test-BoundedPlaceholder $watermark) -or (Test-BoundedPlaceholder $watermarkDigest)) {
@@ -593,9 +630,14 @@ function Get-BoundedWorkflowProjection {
         }
         if ($isResolved) {
             Assert-BoundedSafeIdentity ([string]$resolved.id) "credential_resolution_id_invalid"
+            if ([string]$resolved.id -cne [string]$role.credential_id) {
+                Stop-Bounded "credential_id_mismatch"
+            }
         }
         $normalisedCredential = [ordered]@{}
-        $normalisedCredential[$expectedType] = [ordered]@{ name = [string]$role.credential_name }
+        $normalisedValue = [ordered]@{ name = [string]$role.credential_name }
+        if ($isResolved) { $normalisedValue = [ordered]@{ id = [string]$resolved.id; name = [string]$role.credential_name } }
+        $normalisedCredential[$expectedType] = $normalisedValue
         Set-BoundedProperty $node "credentials" ([pscustomobject]$normalisedCredential)
         [void]$seenCredentialNodes.Add($nodeName)
     }
@@ -680,6 +722,10 @@ function New-BoundedPreparedWorkflow {
 
     $formsRole = $Manifest.credential_roles.google_forms_oauth
     $gatewayRole = $Manifest.credential_roles.gateway_bearer
+    foreach ($role in @($formsRole, $gatewayRole)) {
+        if (Test-BoundedPlaceholder ([string]$role.credential_id)) { Stop-Bounded "binding_credential_reference_unresolved" }
+        Assert-BoundedSafeIdentity ([string]$role.credential_id) "binding_credential_reference_invalid"
+    }
     $formsCredentialNodeCount = 0
     $gatewayCredentialNodeCount = 0
     foreach ($node in @($prepared.nodes)) {
@@ -687,7 +733,7 @@ function New-BoundedPreparedWorkflow {
         if ($nodeName -in @($formsRole.node_names)) {
             if ($null -eq $node.parameters) { Stop-Bounded "binding_credential_binding_invalid" }
             $credential = [ordered]@{}
-            $credential[[string]$formsRole.credential_type] = [ordered]@{ name = [string]$formsRole.credential_name }
+            $credential[[string]$formsRole.credential_type] = [ordered]@{ id = [string]$formsRole.credential_id; name = [string]$formsRole.credential_name }
             Set-BoundedProperty $node "credentials" $credential
             Set-BoundedProperty $node.parameters "authentication" "predefinedCredentialType"
             Set-BoundedProperty $node.parameters "nodeCredentialType" "googleOAuth2Api"
@@ -695,7 +741,7 @@ function New-BoundedPreparedWorkflow {
         } elseif ($nodeName -in @($gatewayRole.node_names)) {
             if ($null -eq $node.parameters) { Stop-Bounded "binding_credential_binding_invalid" }
             $credential = [ordered]@{}
-            $credential[[string]$gatewayRole.credential_type] = [ordered]@{ name = [string]$gatewayRole.credential_name }
+            $credential[[string]$gatewayRole.credential_type] = [ordered]@{ id = [string]$gatewayRole.credential_id; name = [string]$gatewayRole.credential_name }
             Set-BoundedProperty $node "credentials" $credential
             Set-BoundedProperty $node.parameters "authentication" "genericCredentialType"
             Set-BoundedProperty $node.parameters "genericAuthType" "httpBearerAuth"
@@ -943,12 +989,45 @@ function Invoke-BoundedDockerCommand {
     return Invoke-BoundedProcess -Command $script:BoundedDockerExecutable -Arguments $Arguments
 }
 
+function Invoke-BoundedContainerExec {
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Arguments,
+        [switch]$Root
+    )
+    $dockerArguments = @("exec", "-i")
+    if ($Root) { $dockerArguments += @("-u", "0") }
+    $dockerArguments += @($N8nContainer)
+    $dockerArguments += @($Arguments)
+    return Invoke-BoundedDockerCommand $dockerArguments
+}
+
+function Get-BoundedContainerSingleLine {
+    param(
+        [Parameter(Mandatory)]$Result,
+        [Parameter(Mandatory)][string]$Code
+    )
+    if ([int]$Result.exit_code -ne 0) { Stop-Bounded $Code }
+    $lines = @(([string]$Result.stdout).Trim() -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
+    if ($lines.Count -ne 1) { Stop-Bounded $Code }
+    return ([string]$lines[0]).Trim()
+}
+
+function Write-BoundedContainerCustodyReceipt {
+    param(
+        [Parameter(Mandatory)]$Context,
+        [Parameter(Mandatory)]$Custody,
+        [switch]$ReplaceExisting
+    )
+    Write-BoundedOperationReceipt ([string]$Context.operations_path) ([string]$Context.operation_path) "container-custody.json" $Custody -ReplaceExisting:$ReplaceExisting
+}
+
 function Invoke-BoundedExternalCommand {
     param(
         [Parameter(Mandatory)][string]$Verb,
         [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Arguments,
         [string]$InputText = "",
-        [string]$ContainerInputKey = ""
+        [string]$ContainerInputKey = "",
+        [AllowNull()][object]$ContainerEvidenceContext = $null
     )
     if ($Verb -notin @("list:workflow", "export:workflow", "import:workflow")) { Stop-Bounded "n8n_command_not_allowed" }
     if ($Arguments -match "--all" -or $Arguments -match "export:workflow.*--all") { Stop-Bounded "unbounded_workflow_export" }
@@ -957,23 +1036,100 @@ function Invoke-BoundedExternalCommand {
     }
     if ($N8nContainer -notmatch '^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$') { Stop-Bounded "n8n_container_invalid" }
     if ($Verb -ne "import:workflow") {
-        return Invoke-BoundedProcess -Command $script:BoundedDockerExecutable -Arguments (@("exec", "-i", $N8nContainer, "n8n", $Verb) + @($Arguments)) -InputText $InputText
+        return Invoke-BoundedContainerExec (@("n8n", $Verb) + @($Arguments))
     }
 
     $inputArguments = @($Arguments | Where-Object { ([string]$_).StartsWith("--input=", [StringComparison]::Ordinal) })
     if ($inputArguments.Count -ne 1) { Stop-Bounded "n8n_container_input_invalid" }
     $hostInputPath = ([string]$inputArguments[0]).Substring(8)
     if (-not (Test-Path -LiteralPath $hostInputPath -PathType Leaf)) { Stop-Bounded "n8n_container_input_missing" }
-    [void](Get-BoundedSha256File $hostInputPath)
-    $containerKey = if ([string]::IsNullOrWhiteSpace($ContainerInputKey)) { Get-BoundedSha256File $hostInputPath } else { $ContainerInputKey }
-    if ($containerKey -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{2,127}$') { Stop-Bounded "n8n_container_input_key_invalid" }
-    $containerPath = "/tmp/.xb-member-gateway-{0}.workflow.json" -f $containerKey
-    $copyTarget = $N8nContainer + ":" + $containerPath
-    $cleanupRequired = $true
+    if ($null -eq $ContainerEvidenceContext) { Stop-Bounded "container_custody_context_missing" }
+    $containerKey = [string]$ContainerEvidenceContext.operation_id
+    if ([string]::IsNullOrWhiteSpace($containerKey) -or $containerKey -notmatch '^[a-z0-9][a-z0-9._-]{2,96}$' -or
+        (-not [string]::IsNullOrWhiteSpace($ContainerInputKey) -and $ContainerInputKey -cne $containerKey)) {
+        Stop-Bounded "n8n_container_input_key_invalid"
+    }
+    $inputHash = Get-BoundedSha256File $hostInputPath
+    $inputSize = [int64]([System.IO.File]::ReadAllBytes($hostInputPath).Length)
+    if ($inputSize -le 0) { Stop-Bounded "n8n_container_input_empty" }
+
+    $containerId = Get-BoundedContainerSingleLine (Invoke-BoundedDockerCommand @("inspect", "--format={{.Id}}", $N8nContainer)) "n8n_container_identity_unavailable"
+    $imageId = Get-BoundedContainerSingleLine (Invoke-BoundedDockerCommand @("inspect", "--format={{.Image}}", $N8nContainer)) "n8n_container_identity_unavailable"
+    if ($containerId -notmatch '^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$' -or $imageId -notmatch '^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$') { Stop-Bounded "n8n_container_identity_invalid" }
+
+    $tmpStat = (Get-BoundedContainerSingleLine (Invoke-BoundedContainerExec @("stat", "-c", "%a:%u:%g:%F", "/tmp")) "n8n_container_tmp_unavailable").Split(":")
+    if ($tmpStat.Count -ne 4 -or $tmpStat[0] -cne "1777" -or $tmpStat[1] -cne "0" -or $tmpStat[2] -cne "0" -or $tmpStat[3] -cne "directory") { Stop-Bounded "n8n_container_tmp_invalid" }
+
+    $importUid = Get-BoundedContainerSingleLine (Invoke-BoundedContainerExec @("id", "-u")) "n8n_container_import_identity_unavailable"
+    $importGid = Get-BoundedContainerSingleLine (Invoke-BoundedContainerExec @("id", "-g")) "n8n_container_import_identity_unavailable"
+    if ($importUid -notmatch '^[0-9]{1,10}$' -or $importGid -notmatch '^[0-9]{1,10}$' -or [int64]$importUid -le 0 -or [int64]$importGid -le 0) { Stop-Bounded "container_import_root" }
+
+    $nonce = [Guid]::NewGuid().ToString("N")
+    $containerDirectory = "/tmp/.xb-member-gateway-{0}-{1}" -f $containerKey, $nonce
+    $containerPath = $containerDirectory + "/prepared.workflow.json"
+    $custody = [pscustomobject]([ordered]@{
+        schema_version = "xb.member.gateway.bounded_import.container-custody.v1"
+        operation_id = [string]$ContainerEvidenceContext.operation_id
+        operation_identity = [string]$ContainerEvidenceContext.operation_identity
+        plan_digest = [string]$ContainerEvidenceContext.plan_digest
+        prepared_workflow_digest = [string]$ContainerEvidenceContext.prepared_workflow_digest
+        container_name = [string]$N8nContainer
+        container_id = $containerId
+        image_id = $imageId
+        nonce = $nonce
+        import_uid = $importUid
+        import_gid = $importGid
+        tmp_mode = $tmpStat[0]
+        tmp_uid = $tmpStat[1]
+        tmp_gid = $tmpStat[2]
+        stage_directory = $containerDirectory
+        stage_file = $containerPath
+        stage_directory_mode = "700"
+        stage_directory_uid = $importUid
+        stage_directory_gid = $importGid
+        stage_file_mode = "600"
+        stage_file_uid = $importUid
+        stage_file_gid = $importGid
+        stage_file_size = $inputSize
+        input_sha256 = $inputHash
+        container_sha256 = $inputHash
+        stage_verified = $false
+        import_started = $false
+        mutation_possible = $false
+        cleanup_state = "pending"
+        cleanup_verified = $false
+        import_exit_code = $null
+    })
+    Write-BoundedContainerCustodyReceipt $ContainerEvidenceContext $custody
+    $cleanupError = $false
     try {
-        $copyResult = Invoke-BoundedDockerCommand @("cp", $hostInputPath, $copyTarget)
+        $mkdirResult = Invoke-BoundedContainerExec @("mkdir", "-m", "700", "--", $containerDirectory) -Root
+        if ([int]$mkdirResult.exit_code -ne 0) { Stop-Bounded "n8n_container_stage_failed" }
+        $copyResult = Invoke-BoundedDockerCommand @("cp", $hostInputPath, ($N8nContainer + ":" + $containerPath))
         if ([int]$copyResult.exit_code -ne 0) { Stop-Bounded "n8n_container_input_copy_failed" }
-        $containerArguments = @("exec", "-i", $N8nContainer, "n8n", $Verb)
+        $owner = "{0}:{1}" -f $importUid, $importGid
+        foreach ($path in @($containerDirectory, $containerPath)) {
+            $chownResult = Invoke-BoundedContainerExec @("chown", $owner, $path) -Root
+            if ([int]$chownResult.exit_code -ne 0) { Stop-Bounded "n8n_container_stage_verification_failed" }
+        }
+        $chmodDirectory = Invoke-BoundedContainerExec @("chmod", "700", $containerDirectory) -Root
+        $chmodFile = Invoke-BoundedContainerExec @("chmod", "600", $containerPath) -Root
+        if ([int]$chmodDirectory.exit_code -ne 0 -or [int]$chmodFile.exit_code -ne 0) { Stop-Bounded "n8n_container_stage_verification_failed" }
+        $directoryStat = (Get-BoundedContainerSingleLine (Invoke-BoundedContainerExec @("stat", "-c", "%a:%u:%g:%F", $containerDirectory) -Root) "n8n_container_stage_verification_failed").Split(":")
+        $fileStat = (Get-BoundedContainerSingleLine (Invoke-BoundedContainerExec @("stat", "-c", "%a:%u:%g:%F:%s", $containerPath) -Root) "n8n_container_stage_verification_failed").Split(":")
+        if ($directoryStat.Count -ne 4 -or $directoryStat[0] -cne "700" -or $directoryStat[1] -cne $importUid -or $directoryStat[2] -cne $importGid -or $directoryStat[3] -cne "directory" -or
+            $fileStat.Count -ne 5 -or $fileStat[0] -cne "600" -or $fileStat[1] -cne $importUid -or $fileStat[2] -cne $importGid -or $fileStat[3] -cne "regular file" -or [int64]$fileStat[4] -ne $inputSize) {
+            Stop-Bounded "n8n_container_stage_verification_failed"
+        }
+        $containerHashLine = Get-BoundedContainerSingleLine (Invoke-BoundedContainerExec @("sha256sum", $containerPath) -Root) "n8n_container_stage_verification_failed"
+        $containerHash = (($containerHashLine -split "\s+")[0]).Trim().ToLowerInvariant()
+        if ($containerHash -cne $inputHash) { Stop-Bounded "n8n_container_content_mismatch" }
+        $custody.stage_verified = $true
+        Write-BoundedContainerCustodyReceipt $ContainerEvidenceContext $custody -ReplaceExisting
+        $custody.import_started = $true
+        $custody.mutation_possible = $true
+        Write-BoundedContainerCustodyReceipt $ContainerEvidenceContext $custody -ReplaceExisting
+        $containerArguments = @("n8n", $Verb)
         foreach ($argument in @($Arguments)) {
             if (([string]$argument).StartsWith("--input=", [StringComparison]::Ordinal)) {
                 $containerArguments += "--input=$containerPath"
@@ -981,11 +1137,32 @@ function Invoke-BoundedExternalCommand {
                 $containerArguments += [string]$argument
             }
         }
-        return Invoke-BoundedProcess -Command $script:BoundedDockerExecutable -Arguments $containerArguments -InputText $InputText
+        $result = Invoke-BoundedContainerExec $containerArguments
+        $custody.import_exit_code = [int]$result.exit_code
+        Write-BoundedContainerCustodyReceipt $ContainerEvidenceContext $custody -ReplaceExisting
+        return $result
     } finally {
-        if ($cleanupRequired) {
-            $cleanupResult = Invoke-BoundedDockerCommand @("exec", "-i", $N8nContainer, "rm", "-f", "--", $containerPath)
-            if ([int]$cleanupResult.exit_code -ne 0) { Stop-Bounded "n8n_container_input_cleanup_failed" }
+        $cleanupResult = Invoke-BoundedContainerExec @("rm", "-rf", "--", $containerDirectory) -Root
+        if ([int]$cleanupResult.exit_code -ne 0) {
+            $cleanupError = $true
+        } else {
+            $absenceResult = Invoke-BoundedContainerExec @("test", "!", "-e", $containerDirectory) -Root
+            if ([int]$absenceResult.exit_code -ne 0) { $cleanupError = $true }
+        }
+        if ($cleanupError) {
+            $custody.cleanup_state = "failed"
+            $custody.cleanup_verified = $false
+        } else {
+            $custody.cleanup_state = "cleaned"
+            $custody.cleanup_verified = $true
+        }
+        try {
+            Write-BoundedContainerCustodyReceipt $ContainerEvidenceContext $custody -ReplaceExisting
+        } catch {
+            $cleanupError = $true
+        }
+        if ($cleanupError) {
+            Stop-Bounded "n8n_container_input_cleanup_failed"
         }
     }
 }
@@ -1334,6 +1511,71 @@ function Assert-BoundedFileDigest {
     if ((Get-BoundedSha256File $Path) -cne $Expected) { Stop-Bounded $Code }
 }
 
+function Assert-BoundedContainerCustody {
+    param(
+        [Parameter(Mandatory)]$Custody,
+        [Parameter(Mandatory)]$Plan
+    )
+    Assert-BoundedExactProperties $Custody @(
+        "schema_version", "operation_id", "operation_identity", "plan_digest", "prepared_workflow_digest",
+        "container_name", "container_id", "image_id", "nonce", "import_uid", "import_gid",
+        "tmp_mode", "tmp_uid", "tmp_gid", "stage_directory", "stage_file",
+        "stage_directory_mode", "stage_directory_uid", "stage_directory_gid",
+        "stage_file_mode", "stage_file_uid", "stage_file_gid", "stage_file_size",
+        "input_sha256", "container_sha256", "stage_verified", "import_started", "mutation_possible",
+        "cleanup_state", "cleanup_verified", "import_exit_code"
+    ) "container_custody_shape_invalid"
+    Assert-BoundedBoolean $Custody.stage_verified "container_custody_state_invalid"
+    Assert-BoundedBoolean $Custody.import_started "container_custody_state_invalid"
+    Assert-BoundedBoolean $Custody.mutation_possible "container_custody_state_invalid"
+    Assert-BoundedBoolean $Custody.cleanup_verified "container_custody_state_invalid"
+    if ([string]$Custody.schema_version -cne "xb.member.gateway.bounded_import.container-custody.v1" -or
+        [string]$Custody.operation_id -cne [string]$Plan.operation_id -or
+        [string]$Custody.operation_identity -cne [string]$Plan.operation_identity -or
+        [string]$Custody.prepared_workflow_digest -cne [string]$Plan.identity_seed.prepared_workflow_digest) {
+        Stop-Bounded "container_custody_identity_invalid"
+    }
+    if ([string]$Custody.container_name -notmatch '^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$' -or
+        [string]$Custody.container_id -notmatch '^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$' -or
+        [string]$Custody.image_id -notmatch '^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$' -or
+        [string]$Custody.nonce -notmatch '^[0-9a-f]{32}$') {
+        Stop-Bounded "container_custody_identity_invalid"
+    }
+    foreach ($uid in @([string]$Custody.import_uid, [string]$Custody.import_gid, [string]$Custody.tmp_uid, [string]$Custody.tmp_gid, [string]$Custody.stage_directory_uid, [string]$Custody.stage_directory_gid, [string]$Custody.stage_file_uid, [string]$Custody.stage_file_gid)) {
+        if ($uid -notmatch '^[0-9]{1,10}$') { Stop-Bounded "container_custody_owner_invalid" }
+    }
+    if ([int64]$Custody.import_uid -le 0 -or [int64]$Custody.import_gid -le 0) { Stop-Bounded "container_import_root" }
+    if ([string]$Custody.tmp_mode -cne "1777" -or [string]$Custody.stage_directory_mode -cne "700" -or [string]$Custody.stage_file_mode -cne "600") { Stop-Bounded "container_custody_mode_invalid" }
+    if ([string]$Custody.tmp_uid -cne "0" -or [string]$Custody.tmp_gid -cne "0" -or
+        [string]$Custody.stage_directory_uid -cne [string]$Custody.import_uid -or
+        [string]$Custody.stage_directory_gid -cne [string]$Custody.import_gid -or
+        [string]$Custody.stage_file_uid -cne [string]$Custody.import_uid -or
+        [string]$Custody.stage_file_gid -cne [string]$Custody.import_gid) {
+        Stop-Bounded "container_custody_owner_invalid"
+    }
+    $operationPattern = [regex]::Escape([string]$Plan.operation_id)
+    if ([string]$Custody.stage_directory -notmatch ("^/tmp/\.xb-member-gateway-" + $operationPattern + "-[0-9a-f]{32}$") -or
+        [string]$Custody.stage_file -cne ([string]$Custody.stage_directory + "/prepared.workflow.json")) {
+        Stop-Bounded "container_custody_path_invalid"
+    }
+    Assert-BoundedDigest ([string]$Custody.input_sha256) "container_custody_digest_invalid"
+    Assert-BoundedDigest ([string]$Custody.container_sha256) "container_custody_digest_invalid"
+    if ([string]$Custody.input_sha256 -cne [string]$Custody.container_sha256 -or [int64]$Custody.stage_file_size -le 0) { Stop-Bounded "container_custody_content_invalid" }
+    if ([string]$Custody.cleanup_state -notin @("pending", "cleaned", "failed")) { Stop-Bounded "container_custody_state_invalid" }
+    if ([string]$Custody.cleanup_state -eq "cleaned" -and -not $Custody.cleanup_verified) { Stop-Bounded "container_cleanup_unverified" }
+    if ([string]$Custody.cleanup_state -eq "failed" -and $Custody.cleanup_verified) { Stop-Bounded "container_cleanup_state_invalid" }
+    if ($Custody.import_started -and -not $Custody.mutation_possible) { Stop-Bounded "container_custody_state_invalid" }
+    if ($null -ne $Custody.import_exit_code -and ([int64]$Custody.import_exit_code -lt -1 -or [int64]$Custody.import_exit_code -gt 255)) { Stop-Bounded "container_custody_state_invalid" }
+}
+
+function Assert-BoundedContainerCleanupVerified {
+    param([AllowNull()][object]$Custody)
+    if ($null -eq $Custody) { return }
+    if ([string]$Custody.cleanup_state -cne "cleaned" -or -not $Custody.cleanup_verified) {
+        Stop-Bounded "container_cleanup_not_verified"
+    }
+}
+
 function Get-BoundedOperationState {
     param([Parameter(Mandatory)][string]$OperationPath)
     $files = @(Get-BoundedOperationFiles $OperationPath)
@@ -1341,9 +1583,9 @@ function Get-BoundedOperationState {
     foreach ($name in $base) { if ($name -notin $files) { Stop-Bounded "operation_incomplete" } }
     $preimage = @($files | Where-Object { $_ -in @("preimage.workflow.json", "absence-evidence.json") })
     if ($preimage.Count -ne 1) { Stop-Bounded "operation_preimage_shape_invalid" }
-    $optional = @($files | Where-Object { $_ -in @("dispatch-ownership.json", "dispatch-receipt.json", "completion-receipt.json") })
+    $optional = @($files | Where-Object { $_ -in @("container-custody.json", "dispatch-ownership.json", "dispatch-receipt.json", "completion-receipt.json") })
     foreach ($file in $files) {
-        if ($file -notin ($base + $preimage + @("dispatch-ownership.json", "dispatch-receipt.json", "completion-receipt.json"))) { Stop-Bounded "operation_extra_material" }
+        if ($file -notin ($base + $preimage + @("container-custody.json", "dispatch-ownership.json", "dispatch-receipt.json", "completion-receipt.json"))) { Stop-Bounded "operation_extra_material" }
     }
     if ("completion-receipt.json" -in $optional -and "dispatch-receipt.json" -notin $optional) { Stop-Bounded "completion_without_dispatch" }
     $plan = Read-BoundedJsonFile (Join-Path $OperationPath "plan.json") -RequireCanonical
@@ -1357,7 +1599,7 @@ function Get-BoundedOperationState {
         "schema_version", "repository", "canonical_workflow", "project_identity", "workflow_identity",
         "prepared_workflow_digest", "cursor_digest", "cursor_state_version", "watermark_digest",
         "watermark_value", "preimage_state", "preimage_digest", "preimage_selection_digest",
-        "binding_manifest_digest"
+        "binding_manifest_digest", "credential_binding_digest"
     ) "identity_seed_shape_invalid"
     Assert-BoundedExactProperties $plan.identity_seed.repository @("head", "tree", "parent", "workflow_blob") "repository_identity_shape_invalid"
     Assert-BoundedExactProperties $plan.identity_seed.canonical_workflow @("path", "git_blob") "canonical_workflow_identity_shape_invalid"
@@ -1369,7 +1611,8 @@ function Get-BoundedOperationState {
         [string]$plan.identity_seed.watermark_digest,
         [string]$plan.identity_seed.preimage_digest,
         [string]$plan.identity_seed.preimage_selection_digest,
-        [string]$plan.identity_seed.binding_manifest_digest
+        [string]$plan.identity_seed.binding_manifest_digest,
+        [string]$plan.identity_seed.credential_binding_digest
     )) { Assert-BoundedDigest $digest "identity_seed_digest_invalid" }
     if ([string]$plan.identity_seed.canonical_workflow.path -cne "n8n-workflows/member_forms_gateway_ingest.workflow.json") { Stop-Bounded "canonical_workflow_identity_invalid" }
     foreach ($repositoryValue in @(
@@ -1426,6 +1669,7 @@ function Get-BoundedOperationState {
         if ([string]$value.plan_digest -cne $planDigest -or [string]$value.operation_identity -cne [string]$plan.operation_identity) { Stop-Bounded "evidence_chain_mismatch" }
     }
     if ([string]$binding.manifest_digest -cne [string]$plan.identity_seed.binding_manifest_digest) { Stop-Bounded "binding_digest_mismatch" }
+    if ([string]$plan.identity_seed.credential_binding_digest -cne (Get-BoundedSha256Text (Get-BoundedCanonicalJsonFromObject $binding.manifest.credential_roles))) { Stop-Bounded "credential_binding_digest_mismatch" }
     $cursor = $cursorState.cursor
     Assert-BoundedCursor $cursor $binding.manifest
     if ([string]$cursorState.cursor_digest -cne [string]$plan.identity_seed.cursor_digest -or (Get-BoundedSha256Text (Get-BoundedCanonicalJsonFromObject $cursor)) -cne [string]$cursorState.cursor_digest) { Stop-Bounded "cursor_digest_mismatch" }
@@ -1439,6 +1683,12 @@ function Get-BoundedOperationState {
         if ((Get-BoundedSha256Text $absenceText) -cne [string]$plan.identity_seed.preimage_digest) { Stop-Bounded "absence_digest_mismatch" }
     }
     if ([string]$intent.expected_projection_digest -ne [string]$plan.expected_projection_digest) { Stop-Bounded "mutation_intent_mismatch" }
+    $containerCustody = $null
+    if ("container-custody.json" -in $optional) {
+        $containerCustody = Read-BoundedJsonFile (Join-Path $OperationPath "container-custody.json") -RequireCanonical
+        Assert-BoundedContainerCustody $containerCustody $plan
+        if ([string]$containerCustody.plan_digest -cne [string]$planDigest) { Stop-Bounded "container_custody_identity_invalid" }
+    }
     $ownership = $null
     $dispatch = $null
     $completion = $null
@@ -1495,6 +1745,7 @@ function Get-BoundedOperationState {
         intent = $intent
         preimage_name = $preimage[0]
         ownership = $ownership
+        container_custody = $containerCustody
         dispatch = $dispatch
         completion = $completion
     })
@@ -1542,6 +1793,7 @@ function New-BoundedIdentitySeed {
         preimage_digest = $PreimageDigest
         preimage_selection_digest = $PreimageSelectionDigest
         binding_manifest_digest = $BindingManifestDigest
+        credential_binding_digest = Get-BoundedSha256Text (Get-BoundedCanonicalJsonFromObject $Manifest.credential_roles)
     })
 }
 
@@ -1919,11 +2171,23 @@ function Invoke-BoundedMutation {
     if ($script:BoundedTestOnly -and [string]$script:BoundedFixture.dispatch_mode -ne "container_visible_import") {
         return Invoke-BoundedOfflineDispatch $script:BoundedFixture
     }
+    $containerEvidenceContext = if ([string]::IsNullOrWhiteSpace($N8nContainer)) {
+        $null
+    } else {
+        [pscustomobject]([ordered]@{
+            operations_path = $script:BoundedOperationsRoot
+            operation_path = $OperationPath
+            operation_id = [string]$State.plan.operation_id
+            operation_identity = [string]$State.plan.operation_identity
+            plan_digest = [string]$State.plan_digest
+            prepared_workflow_digest = [string]$State.plan.identity_seed.prepared_workflow_digest
+        })
+    }
     $importResult = Invoke-BoundedExternalCommand "import:workflow" @(
         "--input=$preparedPath",
         "--projectId=$([string]$State.intent.project.id)",
         "--activeState=false"
-    ) -ContainerInputKey ([string]$State.plan.operation_id)
+    ) -ContainerInputKey ([string]$State.plan.operation_id) -ContainerEvidenceContext $containerEvidenceContext
     if ([int]$importResult.exit_code -ne 0) { Stop-Bounded "n8n_command_failed" }
     return [pscustomobject]([ordered]@{ started = $true; outcome = "completed" })
 }
@@ -1961,6 +2225,8 @@ function New-BoundedCompletionReceipt {
         [Parameter(Mandatory)]$Evidence,
         [Parameter(Mandatory)]$Manifest
     )
+    $persistedState = Get-BoundedOperationState ([string]$State.operation_path)
+    Assert-BoundedContainerCleanupVerified $persistedState.container_custody
     return [pscustomobject]([ordered]@{
         schema_version = "xb.member.gateway.bounded_import.completion.v2"
         operation_id = [string]$State.plan.operation_id
@@ -2015,6 +2281,7 @@ function Invoke-BoundedApply {
         $evidence = Get-BoundedEvidence $Manifest -AfterDispatch
         Assert-BoundedCurrentOperationIdentity $state $evidence $Manifest
         if (-not (Test-BoundedExpectedTarget $state $evidence)) { Stop-Bounded "completed_target_changed" }
+        Assert-BoundedContainerCleanupVerified $state.container_custody
         return [pscustomobject]([ordered]@{ status = "no_op_success"; mutation_attempted = 0; replay = $false; operation_identity = [string]$state.plan.operation_identity })
     }
     if ($null -ne $state.dispatch) {
@@ -2022,17 +2289,21 @@ function Invoke-BoundedApply {
             $before = Get-BoundedEvidence $Manifest
             Assert-BoundedCurrentOperationIdentity $state $before $Manifest
             Assert-BoundedPlanEvidence $state $before $Manifest
+            Assert-BoundedContainerCleanupVerified $state.container_custody
             $result = Invoke-BoundedDispatchAttempt $state $OperationsPath $OperationPath
             if ([string]$result.outcome -eq "ambiguous") { Stop-Bounded "dispatch_outcome_ambiguous" }
             $after = Get-BoundedEvidence $Manifest -AfterDispatch
             Assert-BoundedCurrentOperationIdentity $state $after $Manifest
             if (-not (Test-BoundedExpectedTarget $state $after)) { Stop-Bounded "readback_mismatch" }
+            $completionState = Get-BoundedOperationState $OperationPath
+            Assert-BoundedContainerCleanupVerified $completionState.container_custody
             $completion = New-BoundedCompletionReceipt $state (Get-BoundedSha256File (Join-Path $OperationPath "dispatch-receipt.json")) $after $Manifest
             Write-BoundedOperationReceipt $OperationsPath $OperationPath "completion-receipt.json" $completion
             return [pscustomobject]([ordered]@{ status = "applied_and_verified"; mutation_attempted = 1; replay = $false; operation_identity = [string]$state.plan.operation_identity })
         }
         $evidence = Get-BoundedEvidence $Manifest -AfterDispatch
         Assert-BoundedCurrentOperationIdentity $state $evidence $Manifest
+        Assert-BoundedContainerCleanupVerified $state.container_custody
         if (Test-BoundedExpectedTarget $state $evidence) {
             if ([string]$state.dispatch.dispatch_state -ne "dispatched" -or [string]$state.dispatch.outcome -ne "completed") {
                 $reconciled = New-BoundedDispatchReceipt $state "dispatched" "completed" $false
@@ -2056,6 +2327,8 @@ function Invoke-BoundedApply {
     if (-not (Test-BoundedExpectedTarget $state $after)) {
         Stop-Bounded "readback_mismatch"
     }
+    $completionState = Get-BoundedOperationState $OperationPath
+    Assert-BoundedContainerCleanupVerified $completionState.container_custody
     $completion = New-BoundedCompletionReceipt $state (Get-BoundedSha256File (Join-Path $OperationPath "dispatch-receipt.json")) $after $Manifest
     Write-BoundedOperationReceipt $OperationsPath $OperationPath "completion-receipt.json" $completion
     return [pscustomobject]([ordered]@{ status = "applied_and_verified"; mutation_attempted = 1; replay = $false; operation_identity = [string]$state.plan.operation_identity })

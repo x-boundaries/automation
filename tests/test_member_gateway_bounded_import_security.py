@@ -33,6 +33,8 @@ def _read_json(path: Path) -> Any:
 
 
 class MemberGatewayBoundedImportSecurityTests(unittest.TestCase):
+    TEST_GATEWAY_ORIGIN = "https://reviewed.gateway.internal:443"
+
     @classmethod
     def setUpClass(cls) -> None:
         cls.pwsh = shutil.which("pwsh") or shutil.which("powershell")
@@ -55,10 +57,11 @@ class MemberGatewayBoundedImportSecurityTests(unittest.TestCase):
         manifest["project"]["id"] = "project-security-001"
         manifest["workflow"]["id"] = "workflow-security-001"
         manifest["form"]["id"] = "form-security-001"
-        manifest["endpoints"]["forms_responses"] = "https://forms.example.com/v1/forms/form-security-001/responses"
-        manifest["endpoints"]["source_cursor"] = "https://gateway.example.com/v1/source/cursor-security"
-        manifest["endpoints"]["gateway_ingest"] = "https://gateway.example.com/v1/source-events-security"
-        manifest["endpoints"]["page_checkpoint"] = "https://gateway.example.com/v1/source/cursor-security/page"
+        manifest["endpoints"]["forms_responses"] = "https://forms.googleapis.com:443/v1/forms/form-security-001/responses"
+        manifest["security"]["approved_gateway_origin"] = self.TEST_GATEWAY_ORIGIN
+        manifest["endpoints"]["source_cursor"] = f"{self.TEST_GATEWAY_ORIGIN}/v1/source/cursor-security"
+        manifest["endpoints"]["gateway_ingest"] = f"{self.TEST_GATEWAY_ORIGIN}/v1/source-events-security"
+        manifest["endpoints"]["page_checkpoint"] = f"{self.TEST_GATEWAY_ORIGIN}/v1/source/cursor-security/page"
         manifest["question_mapping"] = {
             "name": "question-name-001",
             "phone": "question-phone-001",
@@ -68,7 +71,9 @@ class MemberGatewayBoundedImportSecurityTests(unittest.TestCase):
             "pdpa_acknowledged": "question-pdpa-001",
         }
         manifest["credential_roles"]["google_forms_oauth"]["credential_name"] = "google_forms_test_credential"
+        manifest["credential_roles"]["google_forms_oauth"]["credential_id"] = "google-credential-id-001"
         manifest["credential_roles"]["gateway_bearer"]["credential_name"] = "gateway_test_credential"
+        manifest["credential_roles"]["gateway_bearer"]["credential_id"] = "gateway-credential-id-001"
         watermark = "2026-09-18T00:00:00Z"
         manifest["cursor_expectation"]["watermark"] = watermark
         manifest["cursor_expectation"]["watermark_digest"] = hashlib.sha256(
@@ -393,7 +398,7 @@ class MemberGatewayBoundedImportSecurityTests(unittest.TestCase):
     def test_endpoint_and_credential_relationships_fail_closed(self) -> None:
         operation_id = self._operation_id("endpoint-relationship")
         self._make_fixture()
-        self.manifest["endpoints"]["forms_responses"] = "https://forms.example.com/v1/forms/other-form/responses"
+        self.manifest["endpoints"]["forms_responses"] = "https://forms.googleapis.com:443/v1/forms/other-form/responses"
         _write_json(self.manifest_path, self.manifest)
         completed = self._run("CapturePlan", operation_id, expect_success=False)
         self.assertIn("binding_form_endpoint_mismatch", completed.stderr)
@@ -416,11 +421,76 @@ class MemberGatewayBoundedImportSecurityTests(unittest.TestCase):
 
         operation_id = self._operation_id("foreign-forms-origin")
         self.manifest = self._make_manifest()
-        self.manifest["endpoints"]["forms_responses"] = "https://foreign.example.com/v1/forms/form-security-001/responses"
+        self.manifest["endpoints"]["forms_responses"] = "https://foreign.example.com:443/v1/forms/form-security-001/responses"
         _write_json(self.manifest_path, self.manifest)
         self._make_fixture()
         completed = self._run("CapturePlan", operation_id, expect_success=False)
         self.assertIn("binding_forms_origin_invalid", completed.stderr)
+
+        for label, endpoint, expected in (
+            ("forms-wrong-port", "https://forms.googleapis.com:8443/v1/forms/form-security-001/responses", "binding_forms_origin_invalid"),
+            ("forms-wrong-version", "https://forms.googleapis.com:443/v2/forms/form-security-001/responses", "binding_form_endpoint_mismatch"),
+            ("forms-host-case", "https://FORMS.GOOGLEAPIS.COM:443/v1/forms/form-security-001/responses", "binding_form_endpoint_mismatch"),
+            ("forms-host-dot", "https://forms.googleapis.com.:443/v1/forms/form-security-001/responses", "binding_forms_origin_invalid"),
+        ):
+            with self.subTest(label=label):
+                operation_id = self._operation_id(label)
+                self.manifest = self._make_manifest()
+                self.manifest["endpoints"]["forms_responses"] = endpoint
+                _write_json(self.manifest_path, self.manifest)
+                self._make_fixture()
+                completed = self._run("CapturePlan", operation_id, expect_success=False)
+                self.assertIn(expected, completed.stderr)
+
+    def test_reviewed_gateway_origin_is_canonical_manifest_authority(self) -> None:
+        operation_id = self._operation_id("reviewed-origin-pass")
+        self._make_fixture()
+        completed = self._run("CapturePlan", operation_id)
+        self.assertIn("capture_plan_complete", completed.stdout)
+
+        endpoint_cases = (
+            (
+                "endpoint-foreign-host",
+                lambda manifest: manifest["endpoints"].update(
+                    gateway_ingest="https://other.gateway.internal:443/v1/source-events-security"
+                ),
+                "binding_gateway_origin_invalid",
+            ),
+            (
+                "manifest-origin-mismatch",
+                lambda manifest: manifest["security"].update(
+                    approved_gateway_origin="https://other.gateway.internal:443"
+                ),
+                "binding_gateway_origin_invalid",
+            ),
+        )
+        for label, mutate, expected in endpoint_cases:
+            with self.subTest(label=label):
+                operation_id = self._operation_id(label)
+                self.manifest = self._make_manifest()
+                mutate(self.manifest)
+                _write_json(self.manifest_path, self.manifest)
+                self._make_fixture()
+                completed = self._run("CapturePlan", operation_id, expect_success=False)
+                self.assertIn(expected, completed.stderr)
+
+        origin_cases = (
+            ("origin-http", "http://reviewed.gateway.internal:443", "binding_security_invalid"),
+            ("origin-wrong-port", "https://reviewed.gateway.internal:8443", "binding_security_invalid"),
+            ("origin-userinfo", "https://user:pass@reviewed.gateway.internal:443", "binding_security_invalid"),
+            ("origin-path", "https://reviewed.gateway.internal:443/private", "binding_security_invalid"),
+            ("origin-query", "https://reviewed.gateway.internal:443?private=1", "binding_security_invalid"),
+            ("origin-fragment", "https://reviewed.gateway.internal:443#private", "binding_security_invalid"),
+        )
+        for label, origin, expected in origin_cases:
+            with self.subTest(label=label):
+                operation_id = self._operation_id(label)
+                self.manifest = self._make_manifest()
+                self.manifest["security"]["approved_gateway_origin"] = origin
+                _write_json(self.manifest_path, self.manifest)
+                self._make_fixture()
+                completed = self._run("CapturePlan", operation_id, expect_success=False)
+                self.assertIn(expected, completed.stderr)
 
     def _add_resolved_credential_ids(self, workflow: dict[str, Any]) -> dict[str, Any]:
         resolved = copy.deepcopy(workflow)
@@ -430,7 +500,7 @@ class MemberGatewayBoundedImportSecurityTests(unittest.TestCase):
                 credential_type = role["credential_type"]
                 credential = node["credentials"][credential_type]
                 node["credentials"][credential_type] = {
-                    "id": f"resolved-{node_name[:12].lower().replace(' ', '-')}",
+                    "id": role["credential_id"],
                     "name": credential["name"],
                 }
         return resolved
@@ -453,6 +523,17 @@ class MemberGatewayBoundedImportSecurityTests(unittest.TestCase):
         _write_json(self.fixture_path, fixture)
         completed = self._run("Apply", operation_id, expect_success=False)
         self.assertIn("credential_name_mismatch", completed.stderr)
+
+    def test_different_resolved_credential_id_with_same_name_is_rejected(self) -> None:
+        operation_id, fixture = self._capture("mismatched-resolved-credential-id")
+        forms_node = next(
+            node for node in fixture["after_workflow"]["nodes"]
+            if node["name"] == "Google Forms single page (configured outside repo)"
+        )
+        forms_node["credentials"]["googleOAuth2Api"]["id"] = "different-credential-object-001"
+        _write_json(self.fixture_path, fixture)
+        completed = self._run("Apply", operation_id, expect_success=False)
+        self.assertIn("credential_id_mismatch", completed.stderr)
 
     def test_conflicting_workflow_identity_is_not_treated_as_absent(self) -> None:
         operation_id = self._operation_id("identity-conflict")
@@ -542,6 +623,10 @@ class MemberGatewayBoundedImportSecurityTests(unittest.TestCase):
         self.assertIn(self.manifest["endpoints"]["page_checkpoint"], prepared_text)
         self.assertNotIn("https://gateway.example.com/v1/source/cursor/page", prepared_text)
         nodes = {node["name"]: node for node in prepared["nodes"]}
+        self.assertEqual(
+            nodes["Google Forms single page (configured outside repo)"]["credentials"]["googleOAuth2Api"]["id"],
+            self.manifest["credential_roles"]["google_forms_oauth"]["credential_id"],
+        )
         self.assertEqual(nodes["Google Forms single page (configured outside repo)"]["parameters"]["authentication"], "predefinedCredentialType")
         self.assertEqual(nodes["Google Forms single page (configured outside repo)"]["parameters"]["nodeCredentialType"], "googleOAuth2Api")
         for name in (
@@ -551,6 +636,10 @@ class MemberGatewayBoundedImportSecurityTests(unittest.TestCase):
         ):
             self.assertEqual(nodes[name]["parameters"]["authentication"], "genericCredentialType")
             self.assertEqual(nodes[name]["parameters"]["genericAuthType"], "httpBearerAuth")
+            self.assertEqual(
+                nodes[name]["credentials"]["httpBearerAuth"]["id"],
+                self.manifest["credential_roles"]["gateway_bearer"]["credential_id"],
+            )
         source = SCRIPT.read_text(encoding="utf-8")
         self.assertIn("Get-BoundedCursorRequestUri", source)
         self.assertIn('Invoke-BoundedExternalCommand "list:workflow" @()', source)
@@ -587,16 +676,20 @@ class MemberGatewayBoundedImportSecurityTests(unittest.TestCase):
         self.assertIn("LIST=workflow-security-001|Member Gateway - Google Forms durable source adapter (inactive)", completed.stdout)
         self.assertIn("IMPORT=import-ok:import:workflow --input=C:\\prepared.workflow.json --projectId=project-security-001 --activeState=false", completed.stdout)
 
-    def test_container_import_consumer_reads_exact_prepared_bytes_and_cleans_up(self) -> None:
-        operation_id, fixture = self._capture("container-visible-import", dispatch_mode="container_visible_import")
+    def test_container_permission_model_and_cleanup_finality(self) -> None:
+        happy_operation_id, fixture = self._capture("container-visible-import", dispatch_mode="container_visible_import")
         fake_docker_py = self.case_root / "fake-docker.py"
         fake_docker_cmd = self.case_root / "docker.cmd"
         container_root = self.case_root / "container-root"
+        container_state = self.case_root / "container-state.json"
         consumer_marker = self.case_root / "consumer.marker"
+        consumer_count = self.case_root / "consumer.count"
         cleanup_marker = self.case_root / "cleanup.marker"
         fake_docker_py.write_text(
             '''import hashlib
+import json
 import os
+import posixpath
 import shutil
 import sys
 from pathlib import Path
@@ -604,11 +697,122 @@ from pathlib import Path
 
 args = sys.argv[1:]
 root = Path(os.environ["FAKE_CONTAINER_ROOT"])
+root.mkdir(parents=True, exist_ok=True)
+state_path = Path(os.environ["FAKE_CONTAINER_STATE"])
+
+
+def parse_mode(value: str) -> int:
+    return int(value, 8)
+
+
+def parse_owner(value: str) -> tuple[int, int]:
+    uid, gid = value.split(":", 1)
+    return int(uid), int(gid)
+
+
+def env_int(name: str, default: str) -> int:
+    return int(os.environ.get(name, default))
+
+
+def path_key(path: str) -> str:
+    value = "/" + path.lstrip("/").replace("\\\\", "/")
+    value = posixpath.normpath(value)
+    return value if value != "." else "/"
 
 
 def resolve_container_path(path: str) -> Path:
     return root.joinpath(path.lstrip("/").replace("/", os.sep))
 
+
+def default_state() -> dict[str, object]:
+    return {
+        "entries": {
+            "/tmp": {
+                "mode": parse_mode(os.environ.get("FAKE_TMP_MODE", "1777")),
+                "uid": env_int("FAKE_TMP_UID", "0"),
+                "gid": env_int("FAKE_TMP_GID", "0"),
+                "type": "directory",
+            }
+        }
+    }
+
+
+def load_state() -> dict[str, object]:
+    if state_path.is_file():
+        return json.loads(state_path.read_text(encoding="utf-8"))
+    state = default_state()
+    save_state(state)
+    return state
+
+
+def save_state(state: dict[str, object]) -> None:
+    state_path.write_text(json.dumps(state, sort_keys=True), encoding="utf-8")
+
+
+def entry_for(state: dict[str, object], path: str) -> dict[str, object] | None:
+    return state["entries"].get(path_key(path))  # type: ignore[union-attr]
+
+
+def permission_bits(entry: dict[str, object], uid: int, gid: int) -> int:
+    mode = int(entry["mode"])
+    if uid == int(entry["uid"]):
+        return (mode >> 6) & 0b111
+    if gid == int(entry["gid"]):
+        return (mode >> 3) & 0b111
+    return mode & 0b111
+
+
+def can_read(state: dict[str, object], path: str, uid: int, gid: int) -> bool:
+    key = path_key(path)
+    file_entry = entry_for(state, key)
+    if file_entry is None or file_entry["type"] != "regular file":
+        return False
+    if uid == 0:
+        return True
+    parent = posixpath.dirname(key) or "/"
+    while parent and parent != "/":
+        directory = entry_for(state, parent)
+        if directory is None or directory["type"] != "directory" or not (permission_bits(directory, uid, gid) & 0b001):
+            return False
+        parent = posixpath.dirname(parent)
+    return bool(permission_bits(file_entry, uid, gid) & 0b100)
+
+
+def update_owner(state: dict[str, object], target: str, owner: str) -> None:
+    item = entry_for(state, target)
+    if item is None:
+        raise SystemExit(14)
+    uid, gid = parse_owner(owner)
+    if item["type"] == "directory" and os.environ.get("FAKE_CHOWN_DIRECTORY_OWNER"):
+        uid, gid = parse_owner(os.environ["FAKE_CHOWN_DIRECTORY_OWNER"])
+    if item["type"] == "regular file" and os.environ.get("FAKE_CHOWN_FILE_OWNER"):
+        uid, gid = parse_owner(os.environ["FAKE_CHOWN_FILE_OWNER"])
+    item["uid"] = uid
+    item["gid"] = gid
+
+
+def update_mode(state: dict[str, object], target: str, mode: str) -> None:
+    item = entry_for(state, target)
+    if item is None:
+        raise SystemExit(14)
+    value = mode
+    if item["type"] == "directory" and os.environ.get("FAKE_CHMOD_DIRECTORY_MODE"):
+        value = os.environ["FAKE_CHMOD_DIRECTORY_MODE"]
+    if item["type"] == "regular file" and os.environ.get("FAKE_CHMOD_FILE_MODE"):
+        value = os.environ["FAKE_CHMOD_FILE_MODE"]
+    item["mode"] = parse_mode(value)
+
+
+state = load_state()
+
+if args and args[0] == "inspect":
+    if args[1] == "--format={{.Id}}":
+        print("container-id-001")
+        raise SystemExit(0)
+    if args[1] == "--format={{.Image}}":
+        print("image-id-001")
+        raise SystemExit(0)
+    raise SystemExit(10)
 
 if args and args[0] == "cp":
     destination = args[2]
@@ -618,31 +822,127 @@ if args and args[0] == "cp":
     target = resolve_container_path(destination[separator + 1 :])
     target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(args[1], target)
+    state["entries"][path_key(destination[separator + 1 :])] = {
+        "mode": parse_mode("644"),
+        "uid": 0,
+        "gid": 0,
+        "type": "regular file",
+    }
+    save_state(state)
     raise SystemExit(0)
 
 if args and args[0] == "exec":
     offset = 1
     if args[offset] == "-i":
         offset += 1
+    import_uid = env_int("FAKE_IMPORT_UID", "1000")
+    import_gid = env_int("FAKE_IMPORT_GID", "1000")
+    exec_uid = import_uid
+    if args[offset] == "-u":
+        if args[offset + 1] != "0":
+            raise SystemExit(12)
+        exec_uid = 0
+        offset += 2
     if args[offset] != "fake-container":
         raise SystemExit(12)
     command = args[offset + 1]
+    command_arguments = args[offset + 2 :]
+    if command == "id":
+        if command_arguments == ["-u"]:
+            print(import_uid)
+        elif command_arguments == ["-g"]:
+            print(import_gid)
+        else:
+            raise SystemExit(13)
+        raise SystemExit(0)
+    if command == "stat":
+        target = command_arguments[-1]
+        item = entry_for(state, target)
+        if item is None:
+            raise SystemExit(14)
+        path = resolve_container_path(target)
+        mode = format(int(item["mode"]), "o")
+        owner = f"{item['uid']}:{item['gid']}"
+        if item["type"] == "directory":
+            print(f"{mode}:{owner}:directory")
+        elif item["type"] == "regular file" and path.is_file():
+            print(f"{mode}:{owner}:regular file:{path.stat().st_size}")
+        else:
+            raise SystemExit(14)
+        raise SystemExit(0)
+    if command == "mkdir":
+        if exec_uid != 0:
+            raise SystemExit(12)
+        target = command_arguments[-1]
+        resolve_container_path(target).mkdir(parents=True, exist_ok=False)
+        mode = command_arguments[command_arguments.index("-m") + 1] if "-m" in command_arguments else "777"
+        state["entries"][path_key(target)] = {"mode": parse_mode(mode), "uid": 0, "gid": 0, "type": "directory"}
+        save_state(state)
+        raise SystemExit(0)
+    if command == "chown":
+        if exec_uid != 0:
+            raise SystemExit(12)
+        update_owner(state, command_arguments[-1], command_arguments[0])
+        save_state(state)
+        raise SystemExit(0)
+    if command == "chmod":
+        if exec_uid != 0:
+            raise SystemExit(12)
+        update_mode(state, command_arguments[-1], command_arguments[0])
+        save_state(state)
+        raise SystemExit(0)
+    if command == "sha256sum":
+        if exec_uid != 0:
+            raise SystemExit(12)
+        target = command_arguments[-1]
+        path = resolve_container_path(target)
+        item = entry_for(state, target)
+        if item is None or item["type"] != "regular file" or not path.is_file():
+            raise SystemExit(14)
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        if os.environ.get("FAKE_HASH_MISMATCH") == "1":
+            digest = "0" * 64
+        print(f"{digest}  {target}")
+        if os.environ.get("FAKE_MUTATE_AFTER_HASH") == "unreadable":
+            item["mode"] = parse_mode("000")
+            save_state(state)
+        raise SystemExit(0)
+    if command == "test":
+        if exec_uid != 0 or command_arguments[:2] != ["!", "-e"]:
+            raise SystemExit(13)
+        raise SystemExit(0 if not resolve_container_path(command_arguments[2]).exists() else 1)
     if command == "n8n":
-        input_arguments = [argument for argument in args if argument.startswith("--input=")]
+        input_arguments = [argument for argument in command_arguments if argument.startswith("--input=")]
         if len(input_arguments) != 1:
             raise SystemExit(13)
-        container_file = resolve_container_path(input_arguments[0][8:])
-        if not container_file.is_file():
-            raise SystemExit(14)
+        target = input_arguments[0][8:]
+        container_file = resolve_container_path(target)
+        if not container_file.is_file() or not can_read(state, target, import_uid, import_gid):
+            raise SystemExit(18)
         actual_hash = hashlib.sha256(container_file.read_bytes()).hexdigest()
         if actual_hash != os.environ["EXPECTED_PREPARED_SHA"]:
             raise SystemExit(15)
         Path(os.environ["FAKE_CONSUMER_MARKER"]).write_text("container-read-ok", encoding="utf-8")
+        count_path = Path(os.environ["FAKE_CONSUMER_COUNT"])
+        count = int(count_path.read_text(encoding="utf-8")) if count_path.is_file() else 0
+        count_path.write_text(str(count + 1), encoding="utf-8")
         raise SystemExit(0)
     if command == "rm":
-        container_file = resolve_container_path(args[-1])
-        if container_file.exists():
-            container_file.unlink()
+        if exec_uid != 0:
+            raise SystemExit(12)
+        if os.environ.get("FAKE_CLEANUP_FAIL") == "1":
+            raise SystemExit(17)
+        target = command_arguments[-1]
+        container_directory = resolve_container_path(target)
+        if container_directory.exists():
+            shutil.rmtree(container_directory)
+        directory_key = path_key(target)
+        state["entries"] = {
+            key: value
+            for key, value in state["entries"].items()
+            if key != directory_key and not key.startswith(directory_key + "/")
+        }
+        save_state(state)
         Path(os.environ["FAKE_CLEANUP_MARKER"]).write_text("container-cleaned", encoding="utf-8")
         raise SystemExit(0)
 
@@ -654,25 +954,153 @@ raise SystemExit(16)
             f'@echo off\r\n"{sys.executable}" "%~dp0fake-docker.py" %*\r\nexit /b %ERRORLEVEL%\r\n',
             encoding="ascii",
         )
-        prepared_path = self._operation_path(operation_id) / "prepared.workflow.json"
+        prepared_path = self._operation_path(happy_operation_id) / "prepared.workflow.json"
         extra_env = {
             "FAKE_CONTAINER_ROOT": str(container_root),
+            "FAKE_CONTAINER_STATE": str(container_state),
             "EXPECTED_PREPARED_SHA": hashlib.sha256(prepared_path.read_bytes()).hexdigest(),
             "FAKE_CONSUMER_MARKER": str(consumer_marker),
+            "FAKE_CONSUMER_COUNT": str(consumer_count),
             "FAKE_CLEANUP_MARKER": str(cleanup_marker),
         }
         result = self._run(
             "Apply",
-            operation_id,
+            happy_operation_id,
             extra_args=("-N8nContainer", "fake-container", "-DockerExecutable", str(fake_docker_cmd)),
             extra_env=extra_env,
         )
         payload = json.loads(result.stdout.strip().splitlines()[-1])
         self.assertEqual(payload["status"], "applied_and_verified")
         self.assertEqual(consumer_marker.read_text(encoding="utf-8"), "container-read-ok")
+        self.assertEqual(consumer_count.read_text(encoding="utf-8"), "1")
         self.assertEqual(cleanup_marker.read_text(encoding="utf-8"), "container-cleaned")
         if container_root.exists():
             self.assertEqual([path for path in container_root.rglob("*") if path.is_file()], [])
+        custody = _read_json(self._operation_path(happy_operation_id) / "container-custody.json")
+        self.assertEqual(custody["container_id"], "container-id-001")
+        self.assertEqual(custody["image_id"], "image-id-001")
+        self.assertEqual(custody["tmp_mode"], "1777")
+        self.assertEqual(custody["tmp_uid"], "0")
+        self.assertEqual(custody["tmp_gid"], "0")
+        self.assertEqual(custody["import_uid"], "1000")
+        self.assertEqual(custody["import_gid"], "1000")
+        self.assertEqual(custody["stage_directory_mode"], "700")
+        self.assertEqual(custody["stage_directory_uid"], "1000")
+        self.assertEqual(custody["stage_directory_gid"], "1000")
+        self.assertEqual(custody["stage_file_mode"], "600")
+        self.assertEqual(custody["stage_file_uid"], "1000")
+        self.assertEqual(custody["stage_file_gid"], "1000")
+        self.assertTrue(custody["stage_verified"])
+        self.assertTrue(custody["mutation_possible"])
+        self.assertEqual(custody["cleanup_state"], "cleaned")
+        self.assertTrue(custody["cleanup_verified"])
+
+        def run_failed_case(label: str, faults: dict[str, str], expected: str) -> tuple[str, Path, Path]:
+            operation_id, _ = self._capture(label, dispatch_mode="container_visible_import")
+            case_dir = self.case_root / label
+            case_container_root = case_dir / "container-root"
+            case_state = case_dir / "container-state.json"
+            case_consumer = case_dir / "consumer.marker"
+            case_count = case_dir / "consumer.count"
+            case_cleanup = case_dir / "cleanup.marker"
+            prepared = self._operation_path(operation_id) / "prepared.workflow.json"
+            environment = {
+                "FAKE_CONTAINER_ROOT": str(case_container_root),
+                "FAKE_CONTAINER_STATE": str(case_state),
+                "EXPECTED_PREPARED_SHA": hashlib.sha256(prepared.read_bytes()).hexdigest(),
+                "FAKE_CONSUMER_MARKER": str(case_consumer),
+                "FAKE_CONSUMER_COUNT": str(case_count),
+                "FAKE_CLEANUP_MARKER": str(case_cleanup),
+            }
+            environment.update(faults)
+            completed = self._run(
+                "Apply",
+                operation_id,
+                expect_success=False,
+                extra_args=("-N8nContainer", "fake-container", "-DockerExecutable", str(fake_docker_cmd)),
+                extra_env=environment,
+            )
+            self.assertIn(expected, completed.stderr)
+            self.assertFalse((self._operation_path(operation_id) / "completion-receipt.json").exists())
+            return operation_id, case_container_root, case_count
+
+        for label, faults in (
+            ("tmp-not-sticky", {"FAKE_TMP_MODE": "0777"}),
+            ("tmp-wrong-owner", {"FAKE_TMP_UID": "1000"}),
+        ):
+            with self.subTest(label=label):
+                run_failed_case(label, faults, "n8n_container_tmp_invalid")
+
+        for label, faults in (
+            ("stage-directory-wrong-owner", {"FAKE_CHOWN_DIRECTORY_OWNER": "2000:2000"}),
+            ("stage-directory-wrong-mode", {"FAKE_CHMOD_DIRECTORY_MODE": "750"}),
+            ("stage-file-wrong-owner", {"FAKE_CHOWN_FILE_OWNER": "2000:2000"}),
+            ("stage-file-wrong-mode", {"FAKE_CHMOD_FILE_MODE": "640"}),
+        ):
+            with self.subTest(label=label):
+                run_failed_case(label, faults, "n8n_container_stage_verification_failed")
+
+        with self.subTest(label="root-import-identity"):
+            run_failed_case(
+                "root-import-identity",
+                {"FAKE_IMPORT_UID": "0", "FAKE_IMPORT_GID": "0"},
+                "container_import_root",
+            )
+
+        with self.subTest(label="import-user-unable-to-read"):
+            run_failed_case("import-user-unable-to-read", {"FAKE_MUTATE_AFTER_HASH": "unreadable"}, "n8n_command_failed")
+
+        with self.subTest(label="hash-mismatch"):
+            run_failed_case("hash-mismatch", {"FAKE_HASH_MISMATCH": "1"}, "n8n_container_content_mismatch")
+
+        with self.subTest(label="cleanup-failure-no-replay"):
+            failure_operation_id, case_container_root, case_count = run_failed_case(
+                "cleanup-failure-no-replay",
+                {"FAKE_CLEANUP_FAIL": "1"},
+                "n8n_container_input_cleanup_failed",
+            )
+            operation_path = self._operation_path(failure_operation_id)
+            custody = _read_json(operation_path / "container-custody.json")
+            self.assertEqual(custody["cleanup_state"], "failed")
+            self.assertFalse(custody["cleanup_verified"])
+            self.assertTrue((case_container_root / "tmp").exists())
+            self.assertFalse((operation_path / "completion-receipt.json").exists())
+            retry_env = {
+                "FAKE_CONTAINER_ROOT": str(case_container_root),
+                "FAKE_CONTAINER_STATE": str(self.case_root / "cleanup-failure-no-replay" / "container-state.json"),
+                "EXPECTED_PREPARED_SHA": hashlib.sha256((operation_path / "prepared.workflow.json").read_bytes()).hexdigest(),
+                "FAKE_CONSUMER_MARKER": str(self.case_root / "cleanup-failure-no-replay" / "consumer.marker"),
+                "FAKE_CONSUMER_COUNT": str(case_count),
+                "FAKE_CLEANUP_MARKER": str(self.case_root / "cleanup-failure-no-replay" / "cleanup.marker"),
+                "FAKE_CLEANUP_FAIL": "1",
+            }
+            retry = self._run(
+                "Apply",
+                failure_operation_id,
+                expect_success=False,
+                extra_args=("-N8nContainer", "fake-container", "-DockerExecutable", str(fake_docker_cmd)),
+                extra_env=retry_env,
+            )
+            self.assertIn("container_cleanup_not_verified", retry.stderr)
+            self.assertEqual(case_count.read_text(encoding="utf-8"), "1")
+            self.assertFalse((operation_path / "completion-receipt.json").exists())
+
+        completed_operation_path = self._operation_path(happy_operation_id)
+        custody_path = completed_operation_path / "container-custody.json"
+        original_custody = _read_json(custody_path)
+        for label, cleanup_state, cleanup_verified, expected in (
+            ("existing-completion-pending-custody", "pending", False, "container_cleanup_not_verified"),
+            ("existing-completion-unverified-custody", "cleaned", False, "container_cleanup_unverified"),
+        ):
+            with self.subTest(label=label):
+                mutated_custody = copy.deepcopy(original_custody)
+                mutated_custody["cleanup_state"] = cleanup_state
+                mutated_custody["cleanup_verified"] = cleanup_verified
+                _write_json(custody_path, mutated_custody)
+                completed = self._run("Apply", happy_operation_id, expect_success=False)
+                self.assertIn(expected, completed.stderr)
+                self.assertFalse(completed.stdout.strip().endswith('"status":"no_op_success"'))
+                _write_json(custody_path, original_custody)
 
     def test_completion_claims_are_typed_and_bound_to_immutable_plan(self) -> None:
         operation_id, _ = self._capture("completion-claims")
@@ -708,7 +1136,7 @@ raise SystemExit(16)
         completed = self._run_ps_command(command_text)
         self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
         self.assertIn(
-            "https://gateway.example.com/v1/source/cursor-security?form_alias=member_registration&mapping_version=member-intake.v1",
+            "https://reviewed.gateway.internal/v1/source/cursor-security?form_alias=member_registration&mapping_version=member-intake.v1",
             completed.stdout,
         )
 
@@ -793,7 +1221,7 @@ raise SystemExit(16)
     def test_completed_noop_retry_rederives_changed_preparation_inputs_and_rejects_them(self) -> None:
         operation_id, _ = self._capture("completed-fresh-preparation")
         self._apply_successfully(operation_id)
-        self.manifest["endpoints"]["gateway_ingest"] = "https://gateway.example.com/v1/source-events-changed"
+        self.manifest["endpoints"]["gateway_ingest"] = f"{self.TEST_GATEWAY_ORIGIN}/v1/source-events-changed"
         _write_json(self.manifest_path, self.manifest)
         completed = self._run("Apply", operation_id, expect_success=False)
         self.assertIn("binding_digest_mismatch", completed.stderr)
@@ -823,7 +1251,7 @@ raise SystemExit(16)
         publish_function = source.split("function Publish-BoundedPlanArtifacts", 1)[1].split("function Write-BoundedOperationReceipt", 1)[0]
         self.assertIn("Set-BoundedProtectedAcl $stage", staging_function)
         self.assertLess(publish_function.index("$stage = New-BoundedStagingRoot"), publish_function.index("Write-BoundedCreateNewText"))
-        self.assertNotIn(".tmp", source)
+        self.assertNotIn(".tmp/", source)
 
     def _run_private_guard(self, root: Path, candidate: Path, *, expected: str) -> None:
         command_text = (

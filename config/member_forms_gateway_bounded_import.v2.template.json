@@ -12,10 +12,10 @@
     "name": "Member Gateway - Google Forms durable source adapter (inactive)"
   },
   "endpoints": {
-    "source_cursor": "https://gateway.example.com/v1/source/cursor",
-    "forms_responses": "https://forms.example.com/v1/forms/GOOGLE_FORM_ID_PLACEHOLDER/responses",
-    "gateway_ingest": "https://gateway.example.com/v1/source-events",
-    "page_checkpoint": "https://gateway.example.com/v1/source/cursor/page"
+    "source_cursor": "https://gateway.example.com:443/v1/source/cursor",
+    "forms_responses": "https://forms.googleapis.com:443/v1/forms/GOOGLE_FORM_ID_PLACEHOLDER/responses",
+    "gateway_ingest": "https://gateway.example.com:443/v1/source-events",
+    "page_checkpoint": "https://gateway.example.com:443/v1/source/cursor/page"
   },
   "form": {
     "id": "GOOGLE_FORM_ID_PLACEHOLDER"
@@ -30,6 +30,7 @@
   },
   "credential_roles": {
     "google_forms_oauth": {
+      "credential_id": "GOOGLE_FORMS_CREDENTIAL_ID_PLACEHOLDER",
       "credential_name": "GOOGLE_FORMS_CREDENTIAL_NAME_PLACEHOLDER",
       "credential_type": "googleOAuth2Api",
       "node_names": [
@@ -37,6 +38,7 @@
       ]
     },
     "gateway_bearer": {
+      "credential_id": "GATEWAY_BEARER_CREDENTIAL_ID_PLACEHOLDER",
       "credential_name": "GATEWAY_BEARER_CREDENTIAL_NAME_PLACEHOLDER",
       "credential_type": "httpBearerAuth",
       "node_names": [
@@ -52,6 +54,7 @@
     "watermark_digest": "WATERMARK_SHA256_PLACEHOLDER"
   },
   "security": {
+    "approved_gateway_origin": "https://gateway.example.com:443",
     "source_token_env": "XB_MEMBER_GATEWAY_SOURCE_TOKEN",
     "n8n_target_mode": "explicit-reviewed-target"
   }
