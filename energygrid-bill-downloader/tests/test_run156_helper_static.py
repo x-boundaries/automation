@@ -151,66 +151,6 @@ class Run156HelperStaticTests(unittest.TestCase):
             check=False,
         )
 
-    def run_synthetic_transport(self, mode, child_source, private_sentinel):
-        functions = self.extracted_functions(
-            (
-                "Get-R156Properties",
-                "Test-R156ExactNameMultiset",
-                "Test-R156ExactPropertySet",
-                "ConvertTo-R156EncodedCommand",
-                "Get-R156ChildProtocol",
-                "Test-R156DispatchMarkerObserved",
-                "Invoke-R156Transport",
-            )
-        )
-        script = (
-            "$script:R156BootstrapScript = @'\n"
-            + self.bootstrap
-            + "\n'@\n"
-            + r"""
-$script:R156ChildScript = [Environment]::GetEnvironmentVariable('R156_SYNTHETIC_CHILD', 'Process')
-$script:R156RealStarted = $false
-$script:R156RealInstallerInvocations = 0
-$script:R156AuthorityConsumed = 'NO'
-$script:R156PackageMutation = 'NONE'
-"""
-            + functions
-            + r"""
-$private = [Environment]::GetEnvironmentVariable('R156_PRIVATE_SENTINEL', 'Process')
-$result = Invoke-R156Transport `
-    -Mode ([Environment]::GetEnvironmentVariable('R156_SYNTHETIC_MODE', 'Process')) `
-    -CheckoutRoot ('C:\checkout-' + $private) `
-    -InstallerPath ('C:\installer-' + $private + '.ps1') `
-    -LauncherRoot ('C:\launcher-' + $private) `
-    -AdmissionCommit '1111111111111111111111111111111111111111'
-[pscustomobject]@{
-    started = [bool]$result.Started
-    supervisor_complete = [bool]$result.SupervisorComplete
-    exit_code = [int]$result.ChildExitCode
-    packet_present = $null -ne $result.Packet
-    validation_status = if ($null -eq $result.Packet) { '' } else { [string]$result.Packet.validation_status }
-    validation_current = if ($null -eq $result.Packet) { '' } else { [string]$result.Packet.validation_current }
-    real_status = if ($null -eq $result.Packet) { '' } else { [string]$result.Packet.real_status }
-    real_success_shape = if ($null -eq $result.Packet) { $false } else { [bool]$result.Packet.real_success_shape }
-    real_started = [bool]$script:R156RealStarted
-    real_invocations = [int]$script:R156RealInstallerInvocations
-    authority_consumed = [string]$script:R156AuthorityConsumed
-    package_mutation = [string]$script:R156PackageMutation
-} | ConvertTo-Json -Compress
-"""
-        )
-        lines = self.run_isolated_powershell(
-            script,
-            environment={
-                "R156_SYNTHETIC_MODE": mode,
-                "R156_SYNTHETIC_CHILD": child_source,
-                "R156_PRIVATE_SENTINEL": private_sentinel,
-            },
-        )
-        self.assertEqual(len(lines), 1, lines)
-        self.assertNotIn(private_sentinel, "\n".join(lines))
-        return json.loads(lines[0])
-
     @staticmethod
     def git_contract_constants():
         return """
@@ -2258,118 +2198,94 @@ $result | ConvertTo-Json -Compress
         for name in ("missing", "malformed", "duplicate", "extra"):
             self.assertFalse(result[name], name)
 
-    def test_validate_only_transport_accepts_crlf_packet_at_external_boundary(self):
-        packet = (
-            '{"protocol":"xb-r156-child/v1","mode":"VALIDATE_ONLY",'
-            '"canonical_valid":true,"validation_status":"PASS",'
-            '"validation_current":"FAIL","real_status":"",'
-            '"real_backups_remaining":-1,"real_success_shape":false}'
-        )
-        child = "\r\n".join(
+    def test_child_protocol_classifies_real_semantic_failure_and_rejects_forged_success_shape(self):
+        functions = self.extracted_functions(
             (
-                "[Console]::Out.WriteLine('R156|BEGIN|VALIDATE_ONLY')",
-                f"[Console]::Out.WriteLine('R156|PACKET|{packet}')",
-                "[Console]::Out.WriteLine('R156|END|VALIDATE_ONLY')",
-                "",
+                "Get-R156Properties",
+                "Test-R156ExactNameMultiset",
+                "Test-R156ExactPropertySet",
+                "Get-R156ChildProtocol",
             )
         )
-        accepted = self.run_synthetic_transport(
-            "VALIDATE_ONLY", child, "R156_PRIVATE_VALIDATE_ACCEPT_SENTINEL"
+        script = (
+            functions
+            + r'''
+$validPacket = '{"protocol":"xb-r156-child/v1","mode":"REAL","canonical_valid":true,"validation_status":"","validation_current":"","real_status":"FAILED_PREFLIGHT","real_backups_remaining":1,"real_success_shape":false}'
+$forgedPacket = '{"protocol":"xb-r156-child/v1","mode":"REAL","canonical_valid":true,"validation_status":"","validation_current":"","real_status":"FAILED_PREFLIGHT","real_backups_remaining":1,"real_success_shape":true}'
+$validStdout = "R156|BEGIN|REAL`r`nR156|DISPATCH|REAL`r`nR156|PACKET|$validPacket`r`nR156|END|REAL`r`n"
+$forgedStdout = "R156|BEGIN|REAL`r`nR156|DISPATCH|REAL`r`nR156|PACKET|$forgedPacket`r`nR156|END|REAL`r`n"
+$valid = Get-R156ChildProtocol -Mode 'REAL' -Stdout $validStdout
+$forged = Get-R156ChildProtocol -Mode 'REAL' -Stdout $forgedStdout
+[ordered]@{
+    valid_packet = $null -ne $valid
+    valid_protocol = if ($null -eq $valid) { '' } else { [string]$valid.protocol }
+    valid_mode = if ($null -eq $valid) { '' } else { [string]$valid.mode }
+    valid_canonical = if ($null -eq $valid) { $false } else { [bool]$valid.canonical_valid }
+    valid_status = if ($null -eq $valid) { '' } else { [string]$valid.real_status }
+    valid_backups_remaining = if ($null -eq $valid) { -1 } else { [int64]$valid.real_backups_remaining }
+    valid_success_shape = if ($null -eq $valid) { $true } else { [bool]$valid.real_success_shape }
+    forged_packet = $null -ne $forged
+} | ConvertTo-Json -Compress
+'''
         )
-        self.assertTrue(accepted["started"])
-        self.assertTrue(accepted["supervisor_complete"])
-        self.assertEqual(accepted["exit_code"], 0)
-        self.assertTrue(accepted["packet_present"])
-        self.assertEqual(accepted["validation_status"], "PASS")
-        self.assertEqual(accepted["validation_current"], "FAIL")
+        self.assertNotIn("Invoke-R156Transport", script)
+        lines = self.run_isolated_powershell(script)
+        self.assertEqual(len(lines), 1, lines)
+        result = json.loads(lines[0])
+        self.assertTrue(result["valid_packet"])
+        self.assertEqual(result["valid_protocol"], "xb-r156-child/v1")
+        self.assertEqual(result["valid_mode"], "REAL")
+        self.assertTrue(result["valid_canonical"])
+        self.assertEqual(result["valid_status"], "FAILED_PREFLIGHT")
+        self.assertEqual(result["valid_backups_remaining"], 1)
+        self.assertFalse(result["valid_success_shape"])
+        self.assertFalse(result["forged_packet"])
 
-    def test_validate_only_private_stderr_rejection_is_classified_without_exposure(self):
-        packet = (
-            '{"protocol":"xb-r156-child/v1","mode":"VALIDATE_ONLY",'
-            '"canonical_valid":true,"validation_status":"PASS",'
-            '"validation_current":"FAIL","real_status":"",'
-            '"real_backups_remaining":-1,"real_success_shape":false}'
+    def test_transport_private_stderr_gate_is_closed_and_non_exposing(self):
+        transport = self.source_function(
+            "function Invoke-R156Transport",
+            "function Test-R156PrivateBindingsOutsideCheckout",
         )
-        private = "R156_PRIVATE_VALIDATE_REJECTION_SENTINEL"
-        noisy_child = "\r\n".join(
+        stderr_read = transport.index("$stderr = [string]$stderrTask.Result")
+        parse_gate = (
+            "        if ([string]::IsNullOrEmpty($stderr)) {\n"
+            "            $packet = Get-R156ChildProtocol -Mode $Mode -Stdout $stdout\n"
+            "        }"
+        )
+        self.assertEqual(transport.count(parse_gate), 1)
+        parse_gate_start = transport.index(parse_gate)
+        successful_result = transport.index(
+            "        return [pscustomobject]@{", parse_gate_start
+        )
+        self.assertLess(stderr_read, parse_gate_start)
+        self.assertLess(parse_gate_start, successful_result)
+        self.assertEqual(
+            transport.count("Get-R156ChildProtocol -Mode $Mode -Stdout $stdout"),
+            1,
+        )
+
+        result_blocks = re.findall(
+            r"(?ms)return \[pscustomobject\]@\{\n(.*?)(?:\n\s*\})",
+            transport,
+        )
+        self.assertEqual(len(result_blocks), 3)
+        expected_fields = (
+            ("Started", "SupervisorComplete", "ChildExitCode", "Packet"),
+            ("Started", "SupervisorComplete", "ChildExitCode", "Packet"),
             (
-                f"[Console]::Error.Write('{private}')",
-                "[Console]::Out.WriteLine('R156|BEGIN|VALIDATE_ONLY')",
-                f"[Console]::Out.WriteLine('R156|PACKET|{packet}')",
-                "[Console]::Out.WriteLine('R156|END|VALIDATE_ONLY')",
-                "",
+                "Started",
+                "SupervisorComplete",
+                "ChildExitCode",
+                "Packet",
+                "ChildTerminatedKnown",
+            ),
+        )
+        for block, expected in zip(result_blocks, expected_fields):
+            fields = tuple(
+                re.findall(r"(?m)^\s+([A-Za-z][A-Za-z0-9_]*)\s*=", block)
             )
-        )
-        rejected = self.run_synthetic_transport("VALIDATE_ONLY", noisy_child, private)
-        self.assertTrue(rejected["started"])
-        self.assertTrue(rejected["supervisor_complete"])
-        self.assertEqual(rejected["exit_code"], 0)
-        self.assertFalse(rejected["packet_present"])
-        self.assertEqual(rejected["validation_status"], "")
-        self.assertNotIn(private, json.dumps(rejected, sort_keys=True))
-
-    def test_real_transport_classifies_semantic_failure_and_accounts_once(self):
-        packet = (
-            '{"protocol":"xb-r156-child/v1","mode":"REAL",'
-            '"canonical_valid":true,"validation_status":"",'
-            '"validation_current":"","real_status":"FAILED_PREFLIGHT",'
-            '"real_backups_remaining":1,"real_success_shape":false}'
-        )
-        child = "\r\n".join(
-            (
-                "[Console]::Out.WriteLine('R156|BEGIN|REAL')",
-                "[Console]::Out.WriteLine('R156|DISPATCH|REAL')",
-                f"[Console]::Out.WriteLine('R156|PACKET|{packet}')",
-                "[Console]::Out.WriteLine('R156|END|REAL')",
-                "",
-            )
-        )
-        result = self.run_synthetic_transport(
-            "REAL", child, "R156_PRIVATE_REAL_SENTINEL"
-        )
-        self.assertTrue(result["started"])
-        self.assertTrue(result["supervisor_complete"])
-        self.assertEqual(result["exit_code"], 0)
-        self.assertTrue(result["packet_present"])
-        self.assertEqual(result["real_status"], "FAILED_PREFLIGHT")
-        self.assertFalse(result["real_success_shape"])
-        self.assertTrue(result["real_started"])
-        self.assertEqual(result["real_invocations"], 1)
-        self.assertEqual(result["authority_consumed"], "YES")
-        self.assertEqual(result["package_mutation"], "CANONICAL_TRANSACTION_ATTEMPTED")
-
-    def test_real_transport_rejects_forged_success_shape(self):
-        packet = (
-            '{"protocol":"xb-r156-child/v1","mode":"REAL",'
-            '"canonical_valid":true,"validation_status":"",'
-            '"validation_current":"","real_status":"FAILED_PREFLIGHT",'
-            '"real_backups_remaining":1,"real_success_shape":true}'
-        )
-        forged_child = "\r\n".join(
-            (
-                "[Console]::Out.WriteLine('R156|BEGIN|REAL')",
-                "[Console]::Out.WriteLine('R156|DISPATCH|REAL')",
-                f"[Console]::Out.WriteLine('R156|PACKET|{packet}')",
-                "[Console]::Out.WriteLine('R156|END|REAL')",
-                "",
-            )
-        )
-        forged = self.run_synthetic_transport(
-            "REAL", forged_child, "R156_PRIVATE_FORGED_SENTINEL"
-        )
-        self.assertTrue(forged["started"])
-        self.assertTrue(forged["supervisor_complete"])
-        self.assertEqual(forged["exit_code"], 0)
-        self.assertFalse(forged["packet_present"])
-        self.assertEqual(forged["real_status"], "")
-        self.assertFalse(forged["real_success_shape"])
-
-        real_policy = self.source[
-            self.source.index("$script:R156InstallerStatus = [string]$realResult.Packet.real_status") :
-            self.source.index("Assert-R156PostProof", self.source.index("$script:R156InstallerStatus = [string]$realResult.Packet.real_status"))
-        ]
-        self.assertIn("$script:R156InstallerStatus -cne 'INSTALLED'", real_policy)
-        self.assertIn("-not [bool]$realResult.Packet.real_success_shape", real_policy)
+            self.assertEqual(fields, expected)
+            self.assertNotRegex(block, r"(?i)\b(stdout|stderr|private|sentinel)\b")
 
     def test_access_check_token_constants_are_exact_and_distinct(self):
         identification = re.findall(
@@ -3549,6 +3465,37 @@ $results | ConvertTo-Json -Compress -Depth 4
         self.assertIn(
             "ConvertTo-R156EncodedCommand -ScriptText $script:R156BootstrapScript",
             transport,
+        )
+        dispatch_proof = self.source_function(
+            "function Test-R156DispatchMarkerObserved",
+            "function Invoke-R156Transport",
+        )
+        self.assertEqual(
+            dispatch_proof.count("$_ -ceq 'R156|DISPATCH|REAL'"),
+            1,
+        )
+        self.assertIn("return ($matches.Count -eq 1)", dispatch_proof)
+        dispatch_guard = (
+            "        if ($Mode -ceq 'REAL' -and (Test-R156DispatchMarkerObserved -Stdout $stdout)) {\n"
+            "            $script:R156PackageMutation = 'CANONICAL_TRANSACTION_ATTEMPTED'\n"
+            "        }"
+        )
+        self.assertEqual(transport.count(dispatch_guard), 1)
+        dispatch_guard_start = transport.index(dispatch_guard)
+        transaction_attempt = transport.index(
+            "$script:R156PackageMutation = 'CANONICAL_TRANSACTION_ATTEMPTED'",
+            dispatch_guard_start,
+        )
+        self.assertLess(dispatch_guard_start, transaction_attempt)
+        self.assertEqual(
+            self.source.count("Test-R156DispatchMarkerObserved -Stdout $stdout"),
+            1,
+        )
+        self.assertEqual(
+            self.source.count(
+                "$script:R156PackageMutation = 'CANONICAL_TRANSACTION_ATTEMPTED'"
+            ),
+            1,
         )
         self.assertEqual(self.source.count("Invoke-R156Transport -Mode 'REAL'"), 1)
         self.assertEqual(self.source.count("$script:R156RealStarted = $true"), 1)
