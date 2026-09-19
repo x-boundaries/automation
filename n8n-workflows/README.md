@@ -78,6 +78,31 @@ Workflow JSON in this directory is source-controlled evidence of workflow design
 
 ## Helper Scripts
 
+### Bounded member-gateway import successor
+
+`scripts/import-member-forms-gateway-bounded.ps1` is a dedicated, fresh
+split-successor helper for the inactive member gateway source-adapter
+workflow. It is the sole bounded production path for this workflow. It reads
+the authoritative cursor and exact target metadata, captures an immutable
+operation plan, and can import at most the one reviewed workflow after an
+explicit apply confirmation. It does not call the generic live importer,
+export all workflows, execute or activate a workflow, enable MCP, or contact
+Google Forms, AutoCount, or member endpoints.
+
+The binding shape is
+`../config/member_forms_gateway_bounded_import.v2.template.json`. Real target
+IDs, form/question IDs, credential names, cursor values, source tokens, and
+operation material stay in ignored private custody under
+`.n8n-local/member-gateway-bounded-import/operations/`. These files are
+rejected if they are tracked, outside the canonical private root, linked, or
+not protected by the required Windows ACL. Persisted JSON is canonical UTF-8
+without BOM with LF line endings.
+
+The helper's CapturePlan and Apply recovery contract is covered by the exact
+offline command `python -m unittest tests.test_member_gateway_bounded_import_security -v`.
+An incomplete or ambiguous operation is retained and reconciled by exact
+identity/readback evidence; it is never silently reinitialised or replayed.
+
 The approved n8n import/export helper-script package from the Toolkit source (`ai-agent-toolkit:n8n-workflow-helper-scripts`, project `n8n.workflow-toolkit`) is installed under `scripts/` in this directory, as required by the n8n workflows playbook (`docs/agent-playbooks/n8n-workflows.md`) and the package's own consumer-repo layout.
 
 - Entry points: `scripts/_import-n8n-workflows-live.cmd` and `scripts/_export-n8n-workflows-live.cmd` (manual, review-required; they never run automatically).
