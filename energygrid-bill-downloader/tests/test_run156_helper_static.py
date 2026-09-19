@@ -1,5 +1,6 @@
 """Static, in-memory, parser, and synthetic regression proof for Run156 G3."""
 
+import base64
 import hashlib
 import json
 import os
@@ -36,6 +37,10 @@ class Run156HelperStaticTests(unittest.TestCase):
         native_start = cls.source.index("$script:R156NativeSource = @'")
         native_end = cls.source.index("'@", native_start + 1)
         cls.native = cls.source[native_start:native_end]
+        bootstrap_marker = "$script:R156BootstrapScript = @'\n"
+        bootstrap_start = cls.source.index(bootstrap_marker) + len(bootstrap_marker)
+        bootstrap_end = cls.source.index("\n'@", bootstrap_start)
+        cls.bootstrap = cls.source[bootstrap_start:bootstrap_end]
 
     def method_body(self, signature, next_signature):
         start = self.native.index(signature)
@@ -119,6 +124,32 @@ class Run156HelperStaticTests(unittest.TestCase):
                 f"stdout={result.stdout[-4096:]!r} stderr={result.stderr[-4096:]!r}"
             )
         return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+    def run_bootstrap(self, child_source, timeout=30, environment=None):
+        powershell = shutil.which("powershell.exe")
+        if powershell is None:
+            self.skipTest("Windows PowerShell 5.1 is not available on this host")
+        encoded = base64.b64encode(self.bootstrap.encode("utf-16-le")).decode("ascii")
+        env = os.environ.copy()
+        if environment:
+            env.update({str(key): str(value) for key, value in environment.items()})
+        return subprocess.run(
+            [
+                powershell,
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-EncodedCommand",
+                encoded,
+            ],
+            input=child_source,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
 
     @staticmethod
     def git_contract_constants():
@@ -2004,6 +2035,258 @@ $state = Read-R156ManifestState `
                 f"bounded diagnostics: {bounded}"
             )
 
+    def test_stdin_bootstrap_is_frozen_and_safely_below_command_line_limit(self):
+        expected = """Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+$p=$null;$ok=$false;$d=$true;$a=$false;$x=$false;$v=$true;$n='Running','Stopping'
+try{
+    $s=[Console]::In.ReadToEnd()
+    if(-not [string]::IsNullOrEmpty($s)){
+        $p=[PowerShell]::Create([System.Management.Automation.RunspaceMode]::NewRunspace)
+        if($null -ne $p -and $null -ne $p.Runspace){
+            $d=$false;$null=$p.AddScript($s);$a=$true
+            try{$null=$p.Invoke()}catch{$x=$true}
+            $i=$p.InvocationStateInfo;$q=[string]$i.State;$r=$i.Reason;$h=[bool]$p.HadErrors;$e=@($p.Streams.Error).Count
+            if($q -in $n){
+                try{$p.Stop();$z=[string]$p.InvocationStateInfo.State;$v=$z -notin $n}catch{$v=$false}
+            }
+            $ok=$a -and -not $x -and $q -eq 'Completed' -and $null -eq $r -and $e -eq 0 -and $q -notin $n -and $v
+        }
+    }
+}catch{$ok=$false}
+finally{if($null -ne $p){try{$p.Dispose();$d=$true}catch{$d=$false}}}
+if($ok -and $d){
+    exit 0
+}
+exit 1"""
+        self.assertEqual(self.bootstrap, expected)
+        encoded = base64.b64encode(self.bootstrap.encode("utf-16-le")).decode("ascii")
+        command_line = subprocess.list2cmdline(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-EncodedCommand",
+                encoded,
+            ]
+        )
+        self.assertLess(len(command_line), 4096)
+        self.assertLess(len(command_line), 32767)
+
+    def test_bootstrap_waits_for_eof_before_child_execution(self):
+        powershell = shutil.which("powershell.exe")
+        if powershell is None:
+            self.skipTest("Windows PowerShell 5.1 is not available on this host")
+        encoded = base64.b64encode(self.bootstrap.encode("utf-16-le")).decode("ascii")
+        with tempfile.TemporaryDirectory(prefix="r156_eof_") as directory:
+            marker = Path(directory) / "started.txt"
+            env = os.environ.copy()
+            env["R156_EOF_MARKER"] = str(marker)
+            child = (
+                "[IO.File]::WriteAllText($env:R156_EOF_MARKER, 'started')\r\n"
+                "[Console]::Out.WriteLine('after-eof')\r\n"
+            )
+            process = subprocess.Popen(
+                [
+                    powershell,
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-EncodedCommand",
+                    encoded,
+                ],
+                env=env,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            try:
+                process.stdin.write(child)
+                process.stdin.flush()
+                time.sleep(0.5)
+                self.assertFalse(marker.exists())
+                process.stdin.close()
+                process.stdin = None
+                stdout, stderr = process.communicate(timeout=30)
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait(timeout=10)
+            self.assertEqual(process.returncode, 0, stderr)
+            self.assertEqual(stdout.strip(), "after-eof")
+            self.assertTrue(marker.is_file())
+
+    def test_bootstrap_normalizes_only_normal_return_and_preserves_failures(self):
+        nested_exit = """
+$inner = [PowerShell]::Create()
+try {
+    [void]$inner.AddScript('exit 23')
+    [void]$inner.Invoke()
+}
+finally {
+    $inner.Dispose()
+}
+[Console]::Out.WriteLine('nested-returned')
+""".replace("\n", "\r\n")
+        normal = self.run_bootstrap(nested_exit)
+        self.assertEqual(normal.returncode, 0, normal.stderr)
+        self.assertEqual(normal.stdout.strip(), "nested-returned")
+
+        top_level_exit = self.run_bootstrap("exit 23")
+        self.assertEqual(top_level_exit.returncode, 0, top_level_exit.stderr)
+        self.assertEqual(top_level_exit.stdout, "")
+        self.assertEqual(top_level_exit.stderr, "")
+
+        for name, source in (
+            ("empty", ""),
+            ("parse", "if ("),
+            ("throw", "throw 'R156_PRIVATE_UNCAUGHT_SENTINEL'"),
+            ("error-stream", "Write-Error 'synthetic error-stream failure'"),
+        ):
+            with self.subTest(name=name):
+                failed = self.run_bootstrap(source)
+                self.assertNotEqual(failed.returncode, 0)
+                self.assertNotIn("R156_PRIVATE_UNCAUGHT_SENTINEL", failed.stdout)
+                self.assertNotIn("R156_PRIVATE_UNCAUGHT_SENTINEL", failed.stderr)
+                self.assertEqual(failed.stderr, "")
+
+    def test_child_protocol_rejects_missing_malformed_duplicate_and_extra_packets(self):
+        functions = self.extracted_functions(
+            (
+                "Get-R156Properties",
+                "Test-R156ExactNameMultiset",
+                "Test-R156ExactPropertySet",
+                "Get-R156ChildProtocol",
+            )
+        )
+        packet = (
+            'R156|PACKET|{"protocol":"xb-r156-child/v1",'
+            '"mode":"VALIDATE_ONLY","canonical_valid":true,'
+            '"validation_status":"PASS","validation_current":"FAIL",'
+            '"real_status":"","real_backups_remaining":-1,'
+            '"real_success_shape":false}'
+        )
+        script = (
+            functions
+            + "\n$packet = '"
+            + packet
+            + "'\n"
+            + r"""
+$cases = [ordered]@{
+    valid = "R156|BEGIN|VALIDATE_ONLY`r`n$packet`r`nR156|END|VALIDATE_ONLY`r`n"
+    missing = "R156|BEGIN|VALIDATE_ONLY`r`nR156|END|VALIDATE_ONLY`r`n"
+    malformed = "R156|BEGIN|VALIDATE_ONLY`r`nR156|PACKET|{`r`nR156|END|VALIDATE_ONLY`r`n"
+    duplicate = "R156|BEGIN|VALIDATE_ONLY`r`n$packet`r`n$packet`r`nR156|END|VALIDATE_ONLY`r`n"
+    extra = "R156|BEGIN|VALIDATE_ONLY`r`n$packet`r`nR156|END|VALIDATE_ONLY`r`nEXTRA`r`n"
+}
+$result = [ordered]@{}
+foreach ($entry in $cases.GetEnumerator()) {
+    $result[$entry.Key] = $null -ne (Get-R156ChildProtocol -Mode 'VALIDATE_ONLY' -Stdout $entry.Value)
+}
+$result | ConvertTo-Json -Compress
+"""
+        )
+        lines = self.run_isolated_powershell(script)
+        self.assertEqual(len(lines), 1, lines)
+        result = json.loads(lines[0])
+        self.assertTrue(result["valid"])
+        for name in ("missing", "malformed", "duplicate", "extra"):
+            self.assertFalse(result[name], name)
+
+    def test_child_protocol_classifies_real_semantic_failure_and_rejects_forged_success_shape(self):
+        functions = self.extracted_functions(
+            (
+                "Get-R156Properties",
+                "Test-R156ExactNameMultiset",
+                "Test-R156ExactPropertySet",
+                "Get-R156ChildProtocol",
+            )
+        )
+        script = (
+            functions
+            + r'''
+$validPacket = '{"protocol":"xb-r156-child/v1","mode":"REAL","canonical_valid":true,"validation_status":"","validation_current":"","real_status":"FAILED_PREFLIGHT","real_backups_remaining":1,"real_success_shape":false}'
+$forgedPacket = '{"protocol":"xb-r156-child/v1","mode":"REAL","canonical_valid":true,"validation_status":"","validation_current":"","real_status":"FAILED_PREFLIGHT","real_backups_remaining":1,"real_success_shape":true}'
+$validStdout = "R156|BEGIN|REAL`r`nR156|DISPATCH|REAL`r`nR156|PACKET|$validPacket`r`nR156|END|REAL`r`n"
+$forgedStdout = "R156|BEGIN|REAL`r`nR156|DISPATCH|REAL`r`nR156|PACKET|$forgedPacket`r`nR156|END|REAL`r`n"
+$valid = Get-R156ChildProtocol -Mode 'REAL' -Stdout $validStdout
+$forged = Get-R156ChildProtocol -Mode 'REAL' -Stdout $forgedStdout
+[ordered]@{
+    valid_packet = $null -ne $valid
+    valid_protocol = if ($null -eq $valid) { '' } else { [string]$valid.protocol }
+    valid_mode = if ($null -eq $valid) { '' } else { [string]$valid.mode }
+    valid_canonical = if ($null -eq $valid) { $false } else { [bool]$valid.canonical_valid }
+    valid_status = if ($null -eq $valid) { '' } else { [string]$valid.real_status }
+    valid_backups_remaining = if ($null -eq $valid) { -1 } else { [int64]$valid.real_backups_remaining }
+    valid_success_shape = if ($null -eq $valid) { $true } else { [bool]$valid.real_success_shape }
+    forged_packet = $null -ne $forged
+} | ConvertTo-Json -Compress
+'''
+        )
+        self.assertNotIn("Invoke-R156Transport", script)
+        lines = self.run_isolated_powershell(script)
+        self.assertEqual(len(lines), 1, lines)
+        result = json.loads(lines[0])
+        self.assertTrue(result["valid_packet"])
+        self.assertEqual(result["valid_protocol"], "xb-r156-child/v1")
+        self.assertEqual(result["valid_mode"], "REAL")
+        self.assertTrue(result["valid_canonical"])
+        self.assertEqual(result["valid_status"], "FAILED_PREFLIGHT")
+        self.assertEqual(result["valid_backups_remaining"], 1)
+        self.assertFalse(result["valid_success_shape"])
+        self.assertFalse(result["forged_packet"])
+
+    def test_transport_private_stderr_gate_is_closed_and_non_exposing(self):
+        transport = self.source_function(
+            "function Invoke-R156Transport",
+            "function Test-R156PrivateBindingsOutsideCheckout",
+        )
+        stderr_read = transport.index("$stderr = [string]$stderrTask.Result")
+        parse_gate = (
+            "        if ([string]::IsNullOrEmpty($stderr)) {\n"
+            "            $packet = Get-R156ChildProtocol -Mode $Mode -Stdout $stdout\n"
+            "        }"
+        )
+        self.assertEqual(transport.count(parse_gate), 1)
+        parse_gate_start = transport.index(parse_gate)
+        successful_result = transport.index(
+            "        return [pscustomobject]@{", parse_gate_start
+        )
+        self.assertLess(stderr_read, parse_gate_start)
+        self.assertLess(parse_gate_start, successful_result)
+        self.assertEqual(
+            transport.count("Get-R156ChildProtocol -Mode $Mode -Stdout $stdout"),
+            1,
+        )
+
+        result_blocks = re.findall(
+            r"(?ms)return \[pscustomobject\]@\{\n(.*?)(?:\n\s*\})",
+            transport,
+        )
+        self.assertEqual(len(result_blocks), 3)
+        expected_fields = (
+            ("Started", "SupervisorComplete", "ChildExitCode", "Packet"),
+            ("Started", "SupervisorComplete", "ChildExitCode", "Packet"),
+            (
+                "Started",
+                "SupervisorComplete",
+                "ChildExitCode",
+                "Packet",
+                "ChildTerminatedKnown",
+            ),
+        )
+        for block, expected in zip(result_blocks, expected_fields):
+            fields = tuple(
+                re.findall(r"(?m)^\s+([A-Za-z][A-Za-z0-9_]*)\s*=", block)
+            )
+            self.assertEqual(fields, expected)
+            self.assertNotRegex(block, r"(?i)\b(stdout|stderr|private|sentinel)\b")
+
     def test_access_check_token_constants_are_exact_and_distinct(self):
         identification = re.findall(
             r"private const int SECURITY_IDENTIFICATION = ([0-9]+);",
@@ -3153,7 +3436,71 @@ $results | ConvertTo-Json -Compress -Depth 4
         self.assertLess(collect, remove)
         self.assertLess(remove, child_binding)
         self.assertLess(child_binding, start)
+        self.assertIn("$startInfo.RedirectStandardInput = $true", transport)
+        stdout_read = transport.index(
+            "$stdoutTask = $process.StandardOutput.ReadToEndAsync()"
+        )
+        stderr_read = transport.index(
+            "$stderrTask = $process.StandardError.ReadToEndAsync()"
+        )
+        child_write = transport.index(
+            "$process.StandardInput.Write($script:R156ChildScript)"
+        )
+        child_flush = transport.index("$process.StandardInput.Flush()")
+        real_accounting = transport.index("$script:R156RealStarted = $true")
+        stdin_close = transport.index("$process.StandardInput.Close()")
+        self.assertLess(start, stdout_read)
+        self.assertLess(start, stderr_read)
+        self.assertLess(stdout_read, child_write)
+        self.assertLess(stderr_read, child_write)
+        self.assertLess(child_write, child_flush)
+        self.assertLess(child_flush, real_accounting)
+        self.assertLess(real_accounting, stdin_close)
+        arguments = transport[
+            transport.index("$startInfo.Arguments = (") :
+            transport.index("$startInfo.UseShellExecute", transport.index("$startInfo.Arguments = ("))
+        ]
+        self.assertIn("$encoded", arguments)
+        self.assertNotIn("R156ChildScript", arguments)
+        self.assertIn(
+            "ConvertTo-R156EncodedCommand -ScriptText $script:R156BootstrapScript",
+            transport,
+        )
+        dispatch_proof = self.source_function(
+            "function Test-R156DispatchMarkerObserved",
+            "function Invoke-R156Transport",
+        )
+        self.assertEqual(
+            dispatch_proof.count("$_ -ceq 'R156|DISPATCH|REAL'"),
+            1,
+        )
+        self.assertIn("return ($matches.Count -eq 1)", dispatch_proof)
+        dispatch_guard = (
+            "        if ($Mode -ceq 'REAL' -and (Test-R156DispatchMarkerObserved -Stdout $stdout)) {\n"
+            "            $script:R156PackageMutation = 'CANONICAL_TRANSACTION_ATTEMPTED'\n"
+            "        }"
+        )
+        self.assertEqual(transport.count(dispatch_guard), 1)
+        dispatch_guard_start = transport.index(dispatch_guard)
+        transaction_attempt = transport.index(
+            "$script:R156PackageMutation = 'CANONICAL_TRANSACTION_ATTEMPTED'",
+            dispatch_guard_start,
+        )
+        self.assertLess(dispatch_guard_start, transaction_attempt)
+        self.assertEqual(
+            self.source.count("Test-R156DispatchMarkerObserved -Stdout $stdout"),
+            1,
+        )
+        self.assertEqual(
+            self.source.count(
+                "$script:R156PackageMutation = 'CANONICAL_TRANSACTION_ATTEMPTED'"
+            ),
+            1,
+        )
         self.assertEqual(self.source.count("Invoke-R156Transport -Mode 'REAL'"), 1)
+        self.assertEqual(self.source.count("$script:R156RealStarted = $true"), 1)
+        self.assertEqual(self.source.count("$script:R156RealInstallerInvocations = 1"), 1)
+        self.assertEqual(self.source.count("$script:R156AuthorityConsumed = 'YES'"), 1)
         self.assertIn("$script:R156RealInstallerInvocations = 1", self.source)
         self.assertIn("$script:R156AuthorityConsumed = 'YES'", self.source)
         self.assertIn("'CONTROLLER_REQUIRED_POST_DISPATCH'", self.source)
@@ -3249,6 +3596,38 @@ $results | ConvertTo-Json -Compress -Depth 4
             self.source,
         )
         self.assertEqual(len(fence_calls), 4)
+
+    def test_delivery_failure_terminates_and_reaps_before_cleanup(self):
+        transport = self.source_function(
+            "function Invoke-R156Transport",
+            "function Test-R156PrivateBindingsOutsideCheckout",
+        )
+        catch_start = transport.index("    catch {")
+        has_exited = transport.index("if (-not $process.HasExited)", catch_start)
+        kill = transport.index("$process.Kill()", has_exited)
+        wait = transport.index("$process.WaitForExit()", kill)
+        terminated = transport.index(
+            "$terminated = [bool]$process.HasExited", wait
+        )
+        failed_result = transport.index(
+            "SupervisorComplete = $false", terminated
+        )
+        terminated_report = transport.index(
+            "ChildTerminatedKnown = $terminated", failed_result
+        )
+        finally_start = transport.index("    finally {", terminated_report)
+        stdin_dispose = transport.index(
+            "$process.StandardInput.Dispose()", finally_start
+        )
+
+        self.assertLess(catch_start, has_exited)
+        self.assertLess(has_exited, kill)
+        self.assertLess(kill, wait)
+        self.assertLess(wait, terminated)
+        self.assertLess(terminated, failed_result)
+        self.assertLess(failed_result, terminated_report)
+        self.assertLess(terminated_report, finally_start)
+        self.assertLess(finally_start, stdin_dispose)
 
     def test_preimage_decoupling_accepts_valid_distinct_identities(self):
         result = self.run_preimage_boundary_case()
