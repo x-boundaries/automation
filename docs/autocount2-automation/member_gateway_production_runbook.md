@@ -270,9 +270,21 @@ The bounded entry point is
 binding shape is documented by
 `config/member_forms_gateway_bounded_import.v2.template.json`. The committed
 file is a shape template only: real project/workflow IDs, form/question IDs,
-credential names, cursor watermark, and source token stay in a private,
-ignored operator manifest. Do not put those values in a workflow export,
-ordinary temporary files, or this repository.
+resolved credential IDs and names, cursor watermark, and source token stay in
+a private, ignored operator manifest. Do not put those values in a workflow
+export, ordinary temporary files, or this repository.
+
+The reviewed manifest must carry the exact resolved credential object for each
+role: ID, name, type, and node-role membership. The prepared workflow retains
+the ID and name, and exact readback rejects a different credential object even
+when the replacement has the same name and type. The manifest must also carry
+`security.approved_gateway_origin` exactly as
+`https://gateway.example.com:443`; the gateway endpoints must resolve to that
+HTTPS origin. The Forms request must be exactly
+`https://forms.googleapis.com:443/v1/forms/<form-id>/responses`. Alternate
+hosts, ports, versions, form IDs, queries, encoded/case/trailing-dot host
+variants, and other canonicalisation tricks are fail-closed before any token,
+credential, or Docker access.
 
 ### Required sequence
 
@@ -285,15 +297,25 @@ ordinary temporary files, or this repository.
    collision, not an absent target.
 3. Run `CapturePlan` read-only. The plan binds the repository H/tree/parent,
    canonical workflow blob, project/workflow identity, prepared workflow,
-   cursor digest and state version, domain-separated watermark digest, and
-   existing/absent preimage digest.
+   resolved credential-binding digest, cursor digest and state version,
+   domain-separated watermark digest, and existing/absent preimage digest.
 4. Review the immutable files under
    `.n8n-local/member-gateway-bounded-import/operations/<operation-id>/`.
    They must contain only the plan, binding, cursor state, prepared workflow,
    mutation intent, exactly one preimage/absence receipt, and later receipts.
+   A containerised apply additionally records one private
+   `container-custody.json` receipt before import. It binds the container and
+   image IDs, non-root import UID/GID, random nonce, sticky `/tmp` proof,
+   private staging ownership/modes, exact prepared bytes/hash, and cleanup
+   state.
 5. Immediately before `Apply`, reacquire and compare the cursor, watermark,
    project/workflow metadata, and preimage. Every retry repeats this check.
    Any mismatch blocks the operation and requires a new reviewed plan.
+   Container staging is root-assisted only for mkdir/chown/chmod/stat/hash/
+   cleanup; the n8n import runs as the recorded non-root UID/GID. Cleanup is
+   unconditional and exact. A cleanup failure after possible mutation is
+   terminal no-replay state; subsequent recovery may read back the target or
+   clean the exact recorded path, but may not re-import.
 6. Run `Apply` only with the separately authorised target, source token, and
    explicit `-ConfirmBoundedApply`. Read back the exact inactive/manual target
    projection before writing completion evidence.

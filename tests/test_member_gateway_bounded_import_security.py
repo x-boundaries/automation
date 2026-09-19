@@ -55,7 +55,7 @@ class MemberGatewayBoundedImportSecurityTests(unittest.TestCase):
         manifest["project"]["id"] = "project-security-001"
         manifest["workflow"]["id"] = "workflow-security-001"
         manifest["form"]["id"] = "form-security-001"
-        manifest["endpoints"]["forms_responses"] = "https://forms.example.com/v1/forms/form-security-001/responses"
+        manifest["endpoints"]["forms_responses"] = "https://forms.googleapis.com:443/v1/forms/form-security-001/responses"
         manifest["endpoints"]["source_cursor"] = "https://gateway.example.com/v1/source/cursor-security"
         manifest["endpoints"]["gateway_ingest"] = "https://gateway.example.com/v1/source-events-security"
         manifest["endpoints"]["page_checkpoint"] = "https://gateway.example.com/v1/source/cursor-security/page"
@@ -68,7 +68,9 @@ class MemberGatewayBoundedImportSecurityTests(unittest.TestCase):
             "pdpa_acknowledged": "question-pdpa-001",
         }
         manifest["credential_roles"]["google_forms_oauth"]["credential_name"] = "google_forms_test_credential"
+        manifest["credential_roles"]["google_forms_oauth"]["credential_id"] = "google-credential-id-001"
         manifest["credential_roles"]["gateway_bearer"]["credential_name"] = "gateway_test_credential"
+        manifest["credential_roles"]["gateway_bearer"]["credential_id"] = "gateway-credential-id-001"
         watermark = "2026-09-18T00:00:00Z"
         manifest["cursor_expectation"]["watermark"] = watermark
         manifest["cursor_expectation"]["watermark_digest"] = hashlib.sha256(
@@ -393,7 +395,7 @@ class MemberGatewayBoundedImportSecurityTests(unittest.TestCase):
     def test_endpoint_and_credential_relationships_fail_closed(self) -> None:
         operation_id = self._operation_id("endpoint-relationship")
         self._make_fixture()
-        self.manifest["endpoints"]["forms_responses"] = "https://forms.example.com/v1/forms/other-form/responses"
+        self.manifest["endpoints"]["forms_responses"] = "https://forms.googleapis.com:443/v1/forms/other-form/responses"
         _write_json(self.manifest_path, self.manifest)
         completed = self._run("CapturePlan", operation_id, expect_success=False)
         self.assertIn("binding_form_endpoint_mismatch", completed.stderr)
@@ -416,11 +418,26 @@ class MemberGatewayBoundedImportSecurityTests(unittest.TestCase):
 
         operation_id = self._operation_id("foreign-forms-origin")
         self.manifest = self._make_manifest()
-        self.manifest["endpoints"]["forms_responses"] = "https://foreign.example.com/v1/forms/form-security-001/responses"
+        self.manifest["endpoints"]["forms_responses"] = "https://foreign.example.com:443/v1/forms/form-security-001/responses"
         _write_json(self.manifest_path, self.manifest)
         self._make_fixture()
         completed = self._run("CapturePlan", operation_id, expect_success=False)
         self.assertIn("binding_forms_origin_invalid", completed.stderr)
+
+        for label, endpoint, expected in (
+            ("forms-wrong-port", "https://forms.googleapis.com:8443/v1/forms/form-security-001/responses", "binding_forms_origin_invalid"),
+            ("forms-wrong-version", "https://forms.googleapis.com:443/v2/forms/form-security-001/responses", "binding_form_endpoint_mismatch"),
+            ("forms-host-case", "https://FORMS.GOOGLEAPIS.COM:443/v1/forms/form-security-001/responses", "binding_form_endpoint_mismatch"),
+            ("forms-host-dot", "https://forms.googleapis.com.:443/v1/forms/form-security-001/responses", "binding_forms_origin_invalid"),
+        ):
+            with self.subTest(label=label):
+                operation_id = self._operation_id(label)
+                self.manifest = self._make_manifest()
+                self.manifest["endpoints"]["forms_responses"] = endpoint
+                _write_json(self.manifest_path, self.manifest)
+                self._make_fixture()
+                completed = self._run("CapturePlan", operation_id, expect_success=False)
+                self.assertIn(expected, completed.stderr)
 
     def _add_resolved_credential_ids(self, workflow: dict[str, Any]) -> dict[str, Any]:
         resolved = copy.deepcopy(workflow)
@@ -430,7 +447,7 @@ class MemberGatewayBoundedImportSecurityTests(unittest.TestCase):
                 credential_type = role["credential_type"]
                 credential = node["credentials"][credential_type]
                 node["credentials"][credential_type] = {
-                    "id": f"resolved-{node_name[:12].lower().replace(' ', '-')}",
+                    "id": role["credential_id"],
                     "name": credential["name"],
                 }
         return resolved
@@ -453,6 +470,17 @@ class MemberGatewayBoundedImportSecurityTests(unittest.TestCase):
         _write_json(self.fixture_path, fixture)
         completed = self._run("Apply", operation_id, expect_success=False)
         self.assertIn("credential_name_mismatch", completed.stderr)
+
+    def test_different_resolved_credential_id_with_same_name_is_rejected(self) -> None:
+        operation_id, fixture = self._capture("mismatched-resolved-credential-id")
+        forms_node = next(
+            node for node in fixture["after_workflow"]["nodes"]
+            if node["name"] == "Google Forms single page (configured outside repo)"
+        )
+        forms_node["credentials"]["googleOAuth2Api"]["id"] = "different-credential-object-001"
+        _write_json(self.fixture_path, fixture)
+        completed = self._run("Apply", operation_id, expect_success=False)
+        self.assertIn("credential_id_mismatch", completed.stderr)
 
     def test_conflicting_workflow_identity_is_not_treated_as_absent(self) -> None:
         operation_id = self._operation_id("identity-conflict")
@@ -542,6 +570,10 @@ class MemberGatewayBoundedImportSecurityTests(unittest.TestCase):
         self.assertIn(self.manifest["endpoints"]["page_checkpoint"], prepared_text)
         self.assertNotIn("https://gateway.example.com/v1/source/cursor/page", prepared_text)
         nodes = {node["name"]: node for node in prepared["nodes"]}
+        self.assertEqual(
+            nodes["Google Forms single page (configured outside repo)"]["credentials"]["googleOAuth2Api"]["id"],
+            self.manifest["credential_roles"]["google_forms_oauth"]["credential_id"],
+        )
         self.assertEqual(nodes["Google Forms single page (configured outside repo)"]["parameters"]["authentication"], "predefinedCredentialType")
         self.assertEqual(nodes["Google Forms single page (configured outside repo)"]["parameters"]["nodeCredentialType"], "googleOAuth2Api")
         for name in (
@@ -551,6 +583,10 @@ class MemberGatewayBoundedImportSecurityTests(unittest.TestCase):
         ):
             self.assertEqual(nodes[name]["parameters"]["authentication"], "genericCredentialType")
             self.assertEqual(nodes[name]["parameters"]["genericAuthType"], "httpBearerAuth")
+            self.assertEqual(
+                nodes[name]["credentials"]["httpBearerAuth"]["id"],
+                self.manifest["credential_roles"]["gateway_bearer"]["credential_id"],
+            )
         source = SCRIPT.read_text(encoding="utf-8")
         self.assertIn("Get-BoundedCursorRequestUri", source)
         self.assertIn('Invoke-BoundedExternalCommand "list:workflow" @()', source)
@@ -610,6 +646,15 @@ def resolve_container_path(path: str) -> Path:
     return root.joinpath(path.lstrip("/").replace("/", os.sep))
 
 
+if args and args[0] == "inspect":
+    if args[1] == "--format={{.Id}}":
+        print("container-id-001")
+        raise SystemExit(0)
+    if args[1] == "--format={{.Image}}":
+        print("image-id-001")
+        raise SystemExit(0)
+    raise SystemExit(10)
+
 if args and args[0] == "cp":
     destination = args[2]
     separator = destination.find(":")
@@ -624,11 +669,49 @@ if args and args[0] == "exec":
     offset = 1
     if args[offset] == "-i":
         offset += 1
+    if args[offset] == "-u":
+        if args[offset + 1] != "0":
+            raise SystemExit(12)
+        offset += 2
     if args[offset] != "fake-container":
         raise SystemExit(12)
     command = args[offset + 1]
+    command_arguments = args[offset + 2 :]
+    if command == "id":
+        print("1000")
+        raise SystemExit(0)
+    if command == "stat":
+        target = command_arguments[-1]
+        if target == "/tmp":
+            print("1777:0:0:directory")
+            raise SystemExit(0)
+        path = resolve_container_path(target)
+        if path.is_dir():
+            print("700:1000:1000:directory")
+            raise SystemExit(0)
+        if path.is_file():
+            print(f"600:1000:1000:regular file:{path.stat().st_size}")
+            raise SystemExit(0)
+        raise SystemExit(14)
+    if command == "mkdir":
+        resolve_container_path(command_arguments[-1]).mkdir(parents=True, exist_ok=False)
+        raise SystemExit(0)
+    if command in {"chown", "chmod"}:
+        if not resolve_container_path(command_arguments[-1]).exists():
+            raise SystemExit(14)
+        raise SystemExit(0)
+    if command == "sha256sum":
+        path = resolve_container_path(command_arguments[-1])
+        if not path.is_file():
+            raise SystemExit(14)
+        print(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {command_arguments[-1]}")
+        raise SystemExit(0)
+    if command == "test":
+        if command_arguments[:2] != ["!", "-e"]:
+            raise SystemExit(13)
+        raise SystemExit(0 if not resolve_container_path(command_arguments[2]).exists() else 1)
     if command == "n8n":
-        input_arguments = [argument for argument in args if argument.startswith("--input=")]
+        input_arguments = [argument for argument in command_arguments if argument.startswith("--input=")]
         if len(input_arguments) != 1:
             raise SystemExit(13)
         container_file = resolve_container_path(input_arguments[0][8:])
@@ -640,9 +723,11 @@ if args and args[0] == "exec":
         Path(os.environ["FAKE_CONSUMER_MARKER"]).write_text("container-read-ok", encoding="utf-8")
         raise SystemExit(0)
     if command == "rm":
-        container_file = resolve_container_path(args[-1])
-        if container_file.exists():
-            container_file.unlink()
+        if os.environ.get("FAKE_CLEANUP_FAIL") == "1":
+            raise SystemExit(17)
+        container_directory = resolve_container_path(command_arguments[-1])
+        if container_directory.exists():
+            shutil.rmtree(container_directory)
         Path(os.environ["FAKE_CLEANUP_MARKER"]).write_text("container-cleaned", encoding="utf-8")
         raise SystemExit(0)
 
@@ -673,6 +758,15 @@ raise SystemExit(16)
         self.assertEqual(cleanup_marker.read_text(encoding="utf-8"), "container-cleaned")
         if container_root.exists():
             self.assertEqual([path for path in container_root.rglob("*") if path.is_file()], [])
+        custody = _read_json(self._operation_path(operation_id) / "container-custody.json")
+        self.assertEqual(custody["container_id"], "container-id-001")
+        self.assertEqual(custody["image_id"], "image-id-001")
+        self.assertEqual(custody["tmp_mode"], "1777")
+        self.assertEqual(custody["import_uid"], "1000")
+        self.assertTrue(custody["stage_verified"])
+        self.assertTrue(custody["mutation_possible"])
+        self.assertEqual(custody["cleanup_state"], "cleaned")
+        self.assertTrue(custody["cleanup_verified"])
 
     def test_completion_claims_are_typed_and_bound_to_immutable_plan(self) -> None:
         operation_id, _ = self._capture("completion-claims")
@@ -823,7 +917,7 @@ raise SystemExit(16)
         publish_function = source.split("function Publish-BoundedPlanArtifacts", 1)[1].split("function Write-BoundedOperationReceipt", 1)[0]
         self.assertIn("Set-BoundedProtectedAcl $stage", staging_function)
         self.assertLess(publish_function.index("$stage = New-BoundedStagingRoot"), publish_function.index("Write-BoundedCreateNewText"))
-        self.assertNotIn(".tmp", source)
+        self.assertNotIn(".tmp/", source)
 
     def _run_private_guard(self, root: Path, candidate: Path, *, expected: str) -> None:
         command_text = (
