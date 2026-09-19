@@ -311,19 +311,39 @@ function Get-BoundedHttpsUri {
     if (-not $uri.IsAbsoluteUri -or $uri.Scheme -cne "https" -or -not [string]::IsNullOrEmpty($uri.UserInfo) -or -not [string]::IsNullOrEmpty($uri.Fragment)) {
         Stop-Bounded $Code
     }
-    if ([string]::IsNullOrWhiteSpace($uri.Host) -or $uri.Host.Contains(".", [StringComparison]::Ordinal) -and $uri.Host.EndsWith(".", [StringComparison]::Ordinal)) {
+    if ([string]::IsNullOrWhiteSpace($uri.Host) -or $uri.Host.EndsWith(".", [StringComparison]::Ordinal)) {
         Stop-Bounded $Code
     }
     return $uri
 }
 
-function Assert-BoundedApprovedOrigin {
+function Get-BoundedCanonicalOrigin {
     param(
-        [Parameter(Mandatory)][System.Uri]$Uri,
-        [Parameter(Mandatory)][string]$ApprovedHost,
+        [Parameter(Mandatory)][string]$Value,
         [Parameter(Mandatory)][string]$Code
     )
-    if ($Uri.Scheme -cne "https" -or -not $Uri.Host.Equals($ApprovedHost, [StringComparison]::OrdinalIgnoreCase) -or $Uri.Port -ne 443) {
+    $uri = Get-BoundedHttpsUri $Value $Code
+    if ($uri.Port -ne 443 -or
+        -not [string]::IsNullOrEmpty($uri.UserInfo) -or
+        -not [string]::IsNullOrEmpty($uri.Query) -or
+        -not [string]::IsNullOrEmpty($uri.Fragment) -or
+        $uri.AbsolutePath -ne "/") {
+        Stop-Bounded $Code
+    }
+    $originHost = $uri.Host.ToLowerInvariant()
+    $authorityHost = if ($uri.HostNameType -eq [System.UriHostNameType]::IPv6) { "[" + $originHost + "]" } else { $originHost }
+    $canonical = "https://{0}:443" -f $authorityHost
+    if ([string]$Value -cne $canonical) { Stop-Bounded $Code }
+    return $uri
+}
+
+function Assert-BoundedOriginMatches {
+    param(
+        [Parameter(Mandatory)][System.Uri]$Uri,
+        [Parameter(Mandatory)][System.Uri]$ApprovedOrigin,
+        [Parameter(Mandatory)][string]$Code
+    )
+    if (-not (Test-BoundedSameOrigin $Uri $ApprovedOrigin)) {
         Stop-Bounded $Code
     }
 }
@@ -348,16 +368,12 @@ function Assert-BoundedManifestEndpointRelationships {
         if (-not [string]::IsNullOrEmpty($uri.Query)) { Stop-Bounded "binding_endpoint_query_invalid" }
         if ([string]::IsNullOrWhiteSpace($uri.AbsolutePath) -or $uri.AbsolutePath -eq "/") { Stop-Bounded "binding_endpoint_relationship_invalid" }
     }
-    Assert-BoundedApprovedOrigin $source "gateway.example.com" "binding_gateway_origin_invalid"
-    Assert-BoundedApprovedOrigin $gateway "gateway.example.com" "binding_gateway_origin_invalid"
-    Assert-BoundedApprovedOrigin $checkpoint "gateway.example.com" "binding_gateway_origin_invalid"
-    if ([string]$Manifest.security.approved_gateway_origin -cne "https://gateway.example.com:443") { Stop-Bounded "binding_gateway_origin_invalid" }
-    Assert-BoundedApprovedOrigin $forms "forms.googleapis.com" "binding_forms_origin_invalid"
-    foreach ($uri in @($source, $gateway, $checkpoint)) {
-        if (("https://" + $uri.Host.ToLowerInvariant() + ":" + [string]$uri.Port) -cne [string]$Manifest.security.approved_gateway_origin) {
-            Stop-Bounded "binding_gateway_origin_invalid"
-        }
-    }
+    $approvedGatewayOrigin = Get-BoundedCanonicalOrigin ([string]$Manifest.security.approved_gateway_origin) "binding_gateway_origin_invalid"
+    $approvedFormsOrigin = Get-BoundedCanonicalOrigin "https://forms.googleapis.com:443" "binding_forms_origin_invalid"
+    Assert-BoundedOriginMatches $source $approvedGatewayOrigin "binding_gateway_origin_invalid"
+    Assert-BoundedOriginMatches $gateway $approvedGatewayOrigin "binding_gateway_origin_invalid"
+    Assert-BoundedOriginMatches $checkpoint $approvedGatewayOrigin "binding_gateway_origin_invalid"
+    Assert-BoundedOriginMatches $forms $approvedFormsOrigin "binding_forms_origin_invalid"
     if (-not (Test-BoundedSameOrigin $source $gateway) -or -not (Test-BoundedSameOrigin $source $checkpoint)) {
         Stop-Bounded "binding_endpoint_relationship_invalid"
     }
@@ -434,7 +450,7 @@ function Assert-BoundedManifest {
     if (-not (Test-BoundedPlaceholder $watermarkDigest) -and $watermarkDigest -notmatch '^[0-9a-f]{64}$') { Stop-Bounded "binding_watermark_digest_invalid" }
 
     Assert-BoundedExactProperties $Manifest.security @("approved_gateway_origin", "source_token_env", "n8n_target_mode") "binding_security_shape_invalid"
-    if ([string]$Manifest.security.approved_gateway_origin -cne "https://gateway.example.com:443") { Stop-Bounded "binding_security_invalid" }
+    Get-BoundedCanonicalOrigin ([string]$Manifest.security.approved_gateway_origin) "binding_security_invalid" | Out-Null
     if ([string]$Manifest.security.source_token_env -notmatch '^[A-Z][A-Z0-9_]{2,80}$') { Stop-Bounded "binding_security_invalid" }
     if ([string]$Manifest.security.n8n_target_mode -cne "explicit-reviewed-target") { Stop-Bounded "binding_security_invalid" }
     Assert-BoundedManifestEndpointRelationships $Manifest
@@ -1552,6 +1568,14 @@ function Assert-BoundedContainerCustody {
     if ($null -ne $Custody.import_exit_code -and ([int64]$Custody.import_exit_code -lt -1 -or [int64]$Custody.import_exit_code -gt 255)) { Stop-Bounded "container_custody_state_invalid" }
 }
 
+function Assert-BoundedContainerCleanupVerified {
+    param([AllowNull()][object]$Custody)
+    if ($null -eq $Custody) { return }
+    if ([string]$Custody.cleanup_state -cne "cleaned" -or -not $Custody.cleanup_verified) {
+        Stop-Bounded "container_cleanup_not_verified"
+    }
+}
+
 function Get-BoundedOperationState {
     param([Parameter(Mandatory)][string]$OperationPath)
     $files = @(Get-BoundedOperationFiles $OperationPath)
@@ -2201,6 +2225,8 @@ function New-BoundedCompletionReceipt {
         [Parameter(Mandatory)]$Evidence,
         [Parameter(Mandatory)]$Manifest
     )
+    $persistedState = Get-BoundedOperationState ([string]$State.operation_path)
+    Assert-BoundedContainerCleanupVerified $persistedState.container_custody
     return [pscustomobject]([ordered]@{
         schema_version = "xb.member.gateway.bounded_import.completion.v2"
         operation_id = [string]$State.plan.operation_id
@@ -2255,6 +2281,7 @@ function Invoke-BoundedApply {
         $evidence = Get-BoundedEvidence $Manifest -AfterDispatch
         Assert-BoundedCurrentOperationIdentity $state $evidence $Manifest
         if (-not (Test-BoundedExpectedTarget $state $evidence)) { Stop-Bounded "completed_target_changed" }
+        Assert-BoundedContainerCleanupVerified $state.container_custody
         return [pscustomobject]([ordered]@{ status = "no_op_success"; mutation_attempted = 0; replay = $false; operation_identity = [string]$state.plan.operation_identity })
     }
     if ($null -ne $state.dispatch) {
@@ -2262,17 +2289,21 @@ function Invoke-BoundedApply {
             $before = Get-BoundedEvidence $Manifest
             Assert-BoundedCurrentOperationIdentity $state $before $Manifest
             Assert-BoundedPlanEvidence $state $before $Manifest
+            Assert-BoundedContainerCleanupVerified $state.container_custody
             $result = Invoke-BoundedDispatchAttempt $state $OperationsPath $OperationPath
             if ([string]$result.outcome -eq "ambiguous") { Stop-Bounded "dispatch_outcome_ambiguous" }
             $after = Get-BoundedEvidence $Manifest -AfterDispatch
             Assert-BoundedCurrentOperationIdentity $state $after $Manifest
             if (-not (Test-BoundedExpectedTarget $state $after)) { Stop-Bounded "readback_mismatch" }
+            $completionState = Get-BoundedOperationState $OperationPath
+            Assert-BoundedContainerCleanupVerified $completionState.container_custody
             $completion = New-BoundedCompletionReceipt $state (Get-BoundedSha256File (Join-Path $OperationPath "dispatch-receipt.json")) $after $Manifest
             Write-BoundedOperationReceipt $OperationsPath $OperationPath "completion-receipt.json" $completion
             return [pscustomobject]([ordered]@{ status = "applied_and_verified"; mutation_attempted = 1; replay = $false; operation_identity = [string]$state.plan.operation_identity })
         }
         $evidence = Get-BoundedEvidence $Manifest -AfterDispatch
         Assert-BoundedCurrentOperationIdentity $state $evidence $Manifest
+        Assert-BoundedContainerCleanupVerified $state.container_custody
         if (Test-BoundedExpectedTarget $state $evidence) {
             if ([string]$state.dispatch.dispatch_state -ne "dispatched" -or [string]$state.dispatch.outcome -ne "completed") {
                 $reconciled = New-BoundedDispatchReceipt $state "dispatched" "completed" $false
@@ -2296,6 +2327,8 @@ function Invoke-BoundedApply {
     if (-not (Test-BoundedExpectedTarget $state $after)) {
         Stop-Bounded "readback_mismatch"
     }
+    $completionState = Get-BoundedOperationState $OperationPath
+    Assert-BoundedContainerCleanupVerified $completionState.container_custody
     $completion = New-BoundedCompletionReceipt $state (Get-BoundedSha256File (Join-Path $OperationPath "dispatch-receipt.json")) $after $Manifest
     Write-BoundedOperationReceipt $OperationsPath $OperationPath "completion-receipt.json" $completion
     return [pscustomobject]([ordered]@{ status = "applied_and_verified"; mutation_attempted = 1; replay = $false; operation_identity = [string]$state.plan.operation_identity })
