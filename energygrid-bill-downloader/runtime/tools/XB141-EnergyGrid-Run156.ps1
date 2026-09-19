@@ -4815,7 +4815,9 @@ $ErrorActionPreference = 'Stop'
 
 $p=$null;$ok=$false;$d=$true;$a=$false;$x=$false;$v=$true;$n='Running','Stopping'
 try{
-    $s=[Console]::In.ReadToEnd()
+    $w=[Console]::OpenStandardInput();$m=[System.IO.MemoryStream]::new();$w.CopyTo($m);$y=$m.ToArray();$k=0
+    if($y.Length -ge 3 -and $y[0] -eq 239 -and $y[1] -eq 187 -and $y[2] -eq 191){$k=3}
+    $s=[System.Text.UTF8Encoding]::new($false).GetString($y,$k,$y.Length-$k)
     if(-not [string]::IsNullOrEmpty($s)){
         $p=[PowerShell]::Create([System.Management.Automation.RunspaceMode]::NewRunspace)
         if($null -ne $p -and $null -ne $p.Runspace){
@@ -5030,8 +5032,14 @@ function Invoke-R156Transport {
         }
         $stdoutTask = $process.StandardOutput.ReadToEndAsync()
         $stderrTask = $process.StandardError.ReadToEndAsync()
-        $process.StandardInput.Write($script:R156ChildScript)
-        $process.StandardInput.Flush()
+        # The child payload is delivered as explicit UTF-8 WITHOUT a byte order mark,
+        # written straight through the stdin base stream. The console-derived text writer
+        # is never used for the payload: on Windows PowerShell 5.1 launched from a UTF-8
+        # console its encoding carries a preamble, and the child decodes stdin with its own
+        # code page, so a preamble arrives as junk characters glued to the first token.
+        $childBytes = (New-Object System.Text.UTF8Encoding($false)).GetBytes($script:R156ChildScript)
+        $process.StandardInput.BaseStream.Write($childBytes, 0, $childBytes.Length)
+        $process.StandardInput.BaseStream.Flush()
         if ($Mode -ceq 'REAL') {
             $script:R156RealStarted = $true
             $script:R156RealInstallerInvocations = 1

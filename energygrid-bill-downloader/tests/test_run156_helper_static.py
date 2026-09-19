@@ -1,6 +1,7 @@
 """Static, in-memory, parser, and synthetic regression proof for Run156 G3."""
 
 import base64
+import codecs
 import hashlib
 import json
 import os
@@ -41,6 +42,10 @@ class Run156HelperStaticTests(unittest.TestCase):
         bootstrap_start = cls.source.index(bootstrap_marker) + len(bootstrap_marker)
         bootstrap_end = cls.source.index("\n'@", bootstrap_start)
         cls.bootstrap = cls.source[bootstrap_start:bootstrap_end]
+        child_marker = "$script:R156ChildScript = @'\n"
+        child_start = cls.source.index(child_marker) + len(child_marker)
+        child_end = cls.source.index("\n'@", child_start)
+        cls.child_script = cls.source[child_start:child_end]
 
     def method_body(self, signature, next_signature):
         start = self.native.index(signature)
@@ -2041,7 +2046,9 @@ $ErrorActionPreference = 'Stop'
 
 $p=$null;$ok=$false;$d=$true;$a=$false;$x=$false;$v=$true;$n='Running','Stopping'
 try{
-    $s=[Console]::In.ReadToEnd()
+    $w=[Console]::OpenStandardInput();$m=[System.IO.MemoryStream]::new();$w.CopyTo($m);$y=$m.ToArray();$k=0
+    if($y.Length -ge 3 -and $y[0] -eq 239 -and $y[1] -eq 187 -and $y[2] -eq 191){$k=3}
+    $s=[System.Text.UTF8Encoding]::new($false).GetString($y,$k,$y.Length-$k)
     if(-not [string]::IsNullOrEmpty($s)){
         $p=[PowerShell]::Create([System.Management.Automation.RunspaceMode]::NewRunspace)
         if($null -ne $p -and $null -ne $p.Runspace){
@@ -3444,9 +3451,18 @@ $results | ConvertTo-Json -Compress -Depth 4
             "$stderrTask = $process.StandardError.ReadToEndAsync()"
         )
         child_write = transport.index(
-            "$process.StandardInput.Write($script:R156ChildScript)"
+            "$process.StandardInput.BaseStream.Write($childBytes, 0, $childBytes.Length)"
         )
-        child_flush = transport.index("$process.StandardInput.Flush()")
+        child_flush = transport.index("$process.StandardInput.BaseStream.Flush()")
+        # The payload never travels through the console-derived text writer, whose
+        # encoding carries a preamble when the operator's console is UTF-8.
+        self.assertNotIn("$process.StandardInput.Write(", transport)
+        self.assertNotIn("$process.StandardInput.Flush()", transport)
+        encode = transport.index(
+            "$childBytes = (New-Object System.Text.UTF8Encoding($false))"
+            ".GetBytes($script:R156ChildScript)"
+        )
+        self.assertLess(encode, child_write)
         real_accounting = transport.index("$script:R156RealStarted = $true")
         stdin_close = transport.index("$process.StandardInput.Close()")
         self.assertLess(start, stdout_read)
@@ -3596,6 +3612,265 @@ $results | ConvertTo-Json -Compress -Depth 4
             self.source,
         )
         self.assertEqual(len(fence_calls), 4)
+
+    BOMLESS_TRANSPORT_FUNCTIONS = (
+        "Get-R156Properties",
+        "Test-R156ExactNameMultiset",
+        "Test-R156ExactPropertySet",
+        "ConvertTo-R156EncodedCommand",
+        "Get-R156ChildProtocol",
+        "Test-R156DispatchMarkerObserved",
+        "Invoke-R156Transport",
+    )
+
+    @staticmethod
+    def powershell_base64_literal(text):
+        """Carry an exact script body into a harness with no quoting hazard."""
+        encoded = base64.b64encode(text.encode("utf-8")).decode("ascii")
+        return (
+            "[System.Text.Encoding]::UTF8.GetString("
+            f"[Convert]::FromBase64String('{encoded}'))"
+        )
+
+    def run_bomless_transport_harness(
+        self, child_script, bootstrap_script, capture_name=None, console_code_page=65001
+    ):
+        """Drive the real Invoke-R156Transport from a chosen parent console code page.
+
+        CP65001 reproduces the exact operator condition that broke Run156: a parent whose
+        StandardInput writer encoding carries a 3-byte preamble. CP850 gives the contrasting
+        single-byte console. Only the two script bodies are supplied by the caller; the
+        transport itself is production code.
+        """
+        harness = "\n".join(
+            [
+                "Set-StrictMode -Version Latest",
+                "$ErrorActionPreference = 'Stop'",
+                self.extracted_functions(self.BOMLESS_TRANSPORT_FUNCTIONS),
+                "$script:R156ChildScript = "
+                + self.powershell_base64_literal(child_script),
+                "$script:R156BootstrapScript = "
+                + self.powershell_base64_literal(bootstrap_script),
+                "$preamble = -1",
+                "try {",
+                f"    [Console]::InputEncoding = [System.Text.Encoding]::GetEncoding({console_code_page})",
+                "    $preamble = [Console]::InputEncoding.GetPreamble().Length",
+                "}",
+                "catch { $preamble = -1 }",
+                "$result = Invoke-R156Transport -Mode 'VALIDATE_ONLY'"
+                " -CheckoutRoot $env:R156_TEST_ROOT"
+                " -InstallerPath $env:R156_TEST_INSTALLER"
+                " -LauncherRoot $env:R156_TEST_ROOT"
+                " -AdmissionCommit ('a' * 40)",
+                "[Console]::Out.WriteLine('PREAMBLE=' + $preamble)",
+                "[Console]::Out.WriteLine('CONSOLE=' + [Console]::InputEncoding.WebName)",
+                "[Console]::Out.WriteLine('STARTED=' + $result.Started)",
+                "[Console]::Out.WriteLine('SUPERVISOR=' + $result.SupervisorComplete)",
+                "[Console]::Out.WriteLine('EXITCODE=' + $result.ChildExitCode)",
+                "[Console]::Out.WriteLine('PACKET=' + ($null -ne $result.Packet))",
+                "if ($null -ne $result.Packet) {",
+                "    [Console]::Out.WriteLine('CANONICAL=' + $result.Packet.canonical_valid)",
+                "    [Console]::Out.WriteLine('STATUS=' + $result.Packet.validation_status)",
+                "    [Console]::Out.WriteLine('CURRENT=' + $result.Packet.validation_current)",
+                "}",
+            ]
+        )
+        captured = None
+        with tempfile.TemporaryDirectory(prefix="r156_bomless_") as directory:
+            capture_path = Path(directory) / "child_stdin.bin"
+            environment = {
+                "R156_TEST_ROOT": directory,
+                "R156_TEST_INSTALLER": str(Path(directory) / "never-invoked.ps1"),
+                "R156_TEST_CAPTURE": str(capture_path),
+            }
+            lines = self.run_isolated_powershell(harness, environment=environment)
+            if capture_name is not None and capture_path.is_file():
+                captured = capture_path.read_bytes()
+        report = {}
+        for line in lines:
+            key, separator, value = line.partition("=")
+            if separator:
+                report[key] = value
+        return report, captured
+
+    STDIN_RECORDER_BOOTSTRAP = (
+        "$w=[Console]::OpenStandardInput()\r\n"
+        "$m=[System.IO.MemoryStream]::new()\r\n"
+        "$w.CopyTo($m)\r\n"
+        "[System.IO.File]::WriteAllBytes($env:R156_TEST_CAPTURE, $m.ToArray())\r\n"
+        "exit 0\r\n"
+    )
+
+    def require_parent_console(self, report, preamble, web_name):
+        if report.get("PREAMBLE") != str(preamble) or report.get("CONSOLE") != web_name:
+            self.skipTest(
+                f"a {web_name} parent console (preamble {preamble}) could not be "
+                "established, so the regression condition was not reproduced"
+            )
+
+    def test_transport_payload_encoding_is_utf8_and_console_independent(self):
+        """The payload is always explicit UTF-8, never the parent console's code page.
+
+        The child now decodes stdin as UTF-8, so the parent must encode as UTF-8 whatever
+        the console is. A single-byte console proves this: the old console-derived writer
+        emitted CP850 bytes here, which would silently corrupt any non-ASCII payload.
+        """
+        child = (
+            "Set-StrictMode -Version Latest\r\n"
+            "# encoding probe: é€\r\n"
+        )
+        report, captured = self.run_bomless_transport_harness(
+            child,
+            self.STDIN_RECORDER_BOOTSTRAP,
+            capture_name="child_stdin.bin",
+            console_code_page=850,
+        )
+        self.require_parent_console(report, 0, "ibm850")
+        self.assertIsNotNone(captured, "the recorder never observed the child payload")
+        # A single-byte console contributes no preamble, so the capture is exactly and
+        # only what the transport wrote.
+        self.assertEqual(captured, child.encode("utf-8"))
+        self.assertNotEqual(captured, child.encode("cp850", errors="replace"))
+        self.assertNotIn(codecs.BOM_UTF8, captured)
+        self.assertEqual(captured[:1], b"S")
+
+    def test_transport_payload_carries_no_bom_under_utf8_parent_console(self):
+        """Byte 0 of the payload stays 'S', and no BOM is ever inside the payload."""
+        child = self.child_script.replace("\n", "\r\n")
+        report, captured = self.run_bomless_transport_harness(
+            child, self.STDIN_RECORDER_BOOTSTRAP, capture_name="child_stdin.bin"
+        )
+        self.require_parent_console(report, 3, "utf-8")
+        self.assertIsNotNone(captured, "the recorder never observed the child payload")
+
+        payload = child.encode("utf-8")
+        self.assertTrue(
+            captured.endswith(payload),
+            "the transport must deliver the child script byte-exactly",
+        )
+        # The runtime writes its own StandardInput preamble inside Process.Start, before
+        # the transport writes anything. That preamble is precisely what the bootstrap
+        # discards; the transport never contributes one of its own.
+        self.assertEqual(captured[: len(captured) - len(payload)], codecs.BOM_UTF8)
+        self.assertNotIn(codecs.BOM_UTF8, payload)
+        self.assertEqual(payload[:1], b"S")
+        self.assertTrue(
+            payload.decode("utf-8").startswith("Set-StrictMode -Version Latest")
+        )
+
+    def test_bootstrap_discards_exactly_one_leading_utf8_preamble(self):
+        """The repair half that actually removes the BOM from the executed child."""
+        powershell = shutil.which("powershell.exe")
+        if powershell is None:
+            self.skipTest("Windows PowerShell 5.1 is not available on this host")
+        encoded = base64.b64encode(self.bootstrap.encode("utf-16-le")).decode("ascii")
+        command = [
+            powershell,
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-EncodedCommand",
+            encoded,
+        ]
+        child = (
+            "Set-StrictMode -Version Latest\r\n"
+            "[Console]::Out.WriteLine('child-ran')\r\n"
+        ).encode("utf-8")
+
+        for label, stdin_bytes in (
+            ("preamble-present", codecs.BOM_UTF8 + child),
+            ("preamble-absent", child),
+        ):
+            with self.subTest(label):
+                result = subprocess.run(
+                    command,
+                    input=stdin_bytes,
+                    capture_output=True,
+                    timeout=30,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.decode("utf-8").strip(), "child-ran")
+                self.assertEqual(result.stderr, b"")
+
+        # Only one preamble is ever discarded, and a payload that is nothing but a
+        # preamble stays empty and therefore still fails closed.
+        for label, stdin_bytes in (
+            ("preamble-only", codecs.BOM_UTF8),
+            ("double-preamble", codecs.BOM_UTF8 + codecs.BOM_UTF8 + child),
+        ):
+            with self.subTest(label):
+                result = subprocess.run(
+                    command,
+                    input=stdin_bytes,
+                    capture_output=True,
+                    timeout=30,
+                    check=False,
+                )
+                self.assertNotEqual(result.returncode, 0)
+
+    def test_real_bootstrap_starts_child_at_set_strictmode_under_utf8_parent_console(self):
+        """End to end: the child's first token survives a UTF-8 parent console."""
+        packet = (
+            '{"protocol":"xb-r156-child/v1","mode":"VALIDATE_ONLY",'
+            '"canonical_valid":true,"validation_status":"PASS",'
+            '"validation_current":"FAIL","real_status":"",'
+            '"real_backups_remaining":-1,"real_success_shape":false}'
+        )
+        # Only .NET statics here: a cmdlet would autoload a module, module-load progress
+        # would reach stderr, and the transport's private stderr gate would close.
+        child = (
+            "Set-StrictMode -Version Latest\r\n"
+            "$ErrorActionPreference = 'Stop'\r\n"
+            "[Console]::Out.WriteLine('R156|BEGIN|VALIDATE_ONLY')\r\n"
+            "[Console]::Out.WriteLine('R156|PACKET|" + packet + "')\r\n"
+            "[Console]::Out.WriteLine('R156|END|VALIDATE_ONLY')\r\n"
+        )
+        report, _ = self.run_bomless_transport_harness(
+            child, self.bootstrap.replace("\n", "\r\n")
+        )
+        self.require_parent_console(report, 3, "utf-8")
+        self.assertEqual(report["STARTED"], "True")
+        self.assertEqual(report["SUPERVISOR"], "True")
+        self.assertEqual(report["EXITCODE"], "0")
+        self.assertEqual(report["PACKET"], "True")
+        self.assertEqual(report["CANONICAL"], "True")
+        self.assertEqual(report["STATUS"], "PASS")
+        self.assertEqual(report["CURRENT"], "FAIL")
+
+    def test_unresolvable_child_first_token_still_fails_closed_after_the_repair(self):
+        """The defect's own signature - a broken first token - must still fail closed."""
+        child = (
+            "ZZZ-R156NotACommand\r\n"
+            "Set-StrictMode -Version Latest\r\n"
+            "[Console]::Out.WriteLine('R156|BEGIN|VALIDATE_ONLY')\r\n"
+        )
+        report, _ = self.run_bomless_transport_harness(
+            child, self.bootstrap.replace("\n", "\r\n")
+        )
+        self.require_parent_console(report, 3, "utf-8")
+        self.assertEqual(report["STARTED"], "True")
+        self.assertEqual(report["SUPERVISOR"], "True")
+        self.assertNotEqual(report["EXITCODE"], "0")
+        self.assertEqual(report["PACKET"], "False")
+
+    def test_bomless_transport_repair_needs_no_installer_or_launcher_change(self):
+        for relative_path in (
+            "energygrid-bill-downloader/runtime/install_or_update_launcher.ps1",
+            "energygrid-bill-downloader/runtime/launcher.ps1",
+            "energygrid-bill-downloader/runtime/launcher_lib.ps1",
+        ):
+            with self.subTest(path=relative_path):
+                _, committed = self.read_head_blob(relative_path)
+                working = (REPO_ROOT / Path(relative_path)).read_bytes()
+                self.assertEqual(self.working_byte_contract(working), committed)
+        transport = self.source_function(
+            "function Invoke-R156Transport",
+            "function Test-R156PrivateBindingsOutsideCheckout",
+        )
+        for name in ("install_or_update_launcher", "launcher_lib", "launcher.ps1"):
+            self.assertNotIn(name, transport)
 
     def test_delivery_failure_terminates_and_reaps_before_cleanup(self):
         transport = self.source_function(
