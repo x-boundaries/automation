@@ -91,12 +91,32 @@ Google Forms, AutoCount, or member endpoints.
 
 The binding shape is
 `../config/member_forms_gateway_bounded_import.v2.template.json`. Real target
-IDs, form/question IDs, credential names, cursor values, source tokens, and
-operation material stay in ignored private custody under
+IDs, form/question IDs, resolved credential IDs and names, cursor values, source
+tokens, and operation material stay in ignored private custody under
 `.n8n-local/member-gateway-bounded-import/operations/`. These files are
 rejected if they are tracked, outside the canonical private root, linked, or
 not protected by the required Windows ACL. Persisted JSON is canonical UTF-8
 without BOM with LF line endings.
+
+The private manifest must bind each credential role's exact resolved
+`credential_id`, `credential_name`, `credential_type`, and node role. Prepared
+node references retain both ID and name; readback rejects a different object
+even when its name and type are unchanged. The manifest's
+`security.approved_gateway_origin` is exactly
+`https://gateway.example.com:443`, and the gateway endpoints must resolve to
+that origin. The Forms endpoint is separately fixed to
+`https://forms.googleapis.com:443` with the exact
+`/v1/forms/<form-id>/responses` path and no alternate host, port, version,
+query, or canonicalisation form.
+
+When the target is containerised, the operation records immutable container
+and image identities, the non-root n8n import UID/GID, a random operation
+nonce, sticky `/tmp` proof, private 0700/0600 staging ownership and modes, and
+the exact prepared-file hash before import. Root-assisted staging,
+verification, and exact recursive cleanup are allowed; the n8n import itself
+is never run as root. A cleanup failure after dispatch leaves the operation in
+terminal no-replay custody, and recovery may only perform readback or exact
+cleanup.
 
 The helper's CapturePlan and Apply recovery contract is covered by the exact
 offline command `python -m unittest tests.test_member_gateway_bounded_import_security -v`.
