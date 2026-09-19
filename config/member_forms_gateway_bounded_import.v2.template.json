@@ -12,10 +12,10 @@
     "name": "Member Gateway - Google Forms durable source adapter (inactive)"
   },
   "endpoints": {
-    "source_cursor": "https://gateway.example.com/v1/source/cursor",
+    "source_cursor": "https://gateway.example.com:443/v1/source/cursor",
     "forms_responses": "https://forms.googleapis.com:443/v1/forms/GOOGLE_FORM_ID_PLACEHOLDER/responses",
-    "gateway_ingest": "https://gateway.example.com/v1/source-events",
-    "page_checkpoint": "https://gateway.example.com/v1/source/cursor/page"
+    "gateway_ingest": "https://gateway.example.com:443/v1/source-events",
+    "page_checkpoint": "https://gateway.example.com:443/v1/source/cursor/page"
   },
   "form": {
     "id": "GOOGLE_FORM_ID_PLACEHOLDER"
