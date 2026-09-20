@@ -1559,6 +1559,7 @@ class PreAuthLoginFailureReferenceTests(unittest.TestCase):
             set(cli.SUPPORT_REFS_BY_MESSAGE.values())
             - cli.RETIRED_SUPPORT_REFS
             - cli.NAVIGATION_SUPPORT_REFS
+            - cli.NAVIGATION_DIAGNOSTIC_SUPPORT_REFS
         )
         self.assertEqual(
             reached,
@@ -5980,6 +5981,649 @@ class LoginDiagnosticUnexpectedFailureTests(unittest.TestCase):
         self.assertEqual(submit.clicks, 0, "nothing was ever dispatched")
         self.assertEqual(page.goto_calls, 0)
         self.assert_nothing_private_escaped(out, err, credentials)
+
+
+# ---- DL-XB-204-NAVIGATION-DIAGNOSTIC-G3-003: bounded post-EMS observation ---- #
+
+
+class NavigationDiagnosticState:
+    def __init__(
+        self,
+        *,
+        matches: int = 0,
+        visible: bool = False,
+        enabled: bool = False,
+        actionable: bool = False,
+        href: str | None = None,
+        count_error: Exception | None = None,
+        visible_error: Exception | None = None,
+        enabled_error: Exception | None = None,
+        trial_error: Exception | None = None,
+        click_error: Exception | None = None,
+    ) -> None:
+        self.matches = matches
+        self.visible = visible
+        self.enabled = enabled
+        self.actionable = actionable
+        self.href = href
+        self.count_error = count_error
+        self.visible_error = visible_error
+        self.enabled_error = enabled_error
+        self.trial_error = trial_error
+        self.click_error = click_error
+
+
+def navigation_absent(**kwargs) -> NavigationDiagnosticState:
+    return NavigationDiagnosticState(**kwargs)
+
+
+def navigation_ready(*, href: str | None = None, **kwargs) -> NavigationDiagnosticState:
+    return NavigationDiagnosticState(
+        matches=1,
+        visible=True,
+        enabled=True,
+        actionable=True,
+        href=href,
+        **kwargs,
+    )
+
+
+class NavigationDiagnosticLocator:
+    def __init__(
+        self,
+        page: "NavigationDiagnosticPage",
+        key: str,
+        state: NavigationDiagnosticState,
+    ) -> None:
+        self.page = page
+        self.key = key
+        self.state = state
+
+    def count(self) -> int:
+        if self.state.count_error is not None:
+            raise self.state.count_error
+        matches = self.state.matches
+        if (
+            self.key == "link:EB Bill"
+            and (self.page.route_count_change or self.page.route_count_elapsed_ms)
+            and not self.page._route_count_changed
+        ):
+            self.page._route_count_changed = True
+            if self.page.route_count_elapsed_ms:
+                self.page.clock.charge_yield(self.page.route_count_elapsed_ms)
+            if self.page.route_count_change:
+                self.page.apply_topology_change(self.page.route_count_change)
+        return matches
+
+    def is_visible(self, timeout: int | None = None) -> bool:
+        if self.state.visible_error is not None:
+            raise self.state.visible_error
+        if self.key == "button:EMS" and self.page.ems_readiness_change:
+            self.page.apply_topology_change(self.page.ems_readiness_change)
+        return self.state.visible
+
+    def is_enabled(self, timeout: int | None = None) -> bool:
+        self.page.probe_timeouts.append(timeout)
+        if self.state.enabled_error is not None:
+            raise self.state.enabled_error
+        if self.page.ems_dispatches and self.page.post_probe_change:
+            self.page.apply_topology_change(self.page.post_probe_change)
+        return self.state.enabled
+
+    def click(self, trial: bool = False, timeout: int | None = None) -> None:
+        if trial:
+            self.page.trial_clicks[self.key] = self.page.trial_clicks.get(self.key, 0) + 1
+            self.page.probe_timeouts.append(timeout)
+            if self.state.trial_error is not None:
+                raise self.state.trial_error
+            if not self.state.actionable:
+                self.page.clock.charge_probe(timeout)
+                raise synthetic_timeout()
+            if self.key == "button:EMS" and self.page.ems_boundary_change:
+                self.page.apply_topology_change(self.page.ems_boundary_change)
+            return
+        self.page.normal_clicks[self.key] = self.page.normal_clicks.get(self.key, 0) + 1
+        if self.key == "button:EMS":
+            self.page.ems_dispatches += 1
+            if self.state.click_error is not None:
+                raise self.state.click_error
+            if not self.page.ems_inert:
+                self.page._url = self.page.post_url
+            return
+        raise AssertionError("the navigation diagnostic dispatched a downstream control")
+
+    def get_attribute(self, name: str, timeout: int | None = None) -> str | None:
+        if name != "href":
+            raise AssertionError(name)
+        self.page.probe_timeouts.append(timeout)
+        self.page.attribute_timeouts.append(timeout)
+        href = self.state.href
+        if (
+            self.key == "link:EB Bill"
+            and (
+                self.page.route_attribute_change
+                or self.page.route_attribute_elapsed_ms
+            )
+            and not self.page._route_attribute_changed
+        ):
+            self.page._route_attribute_changed = True
+            if self.page.route_attribute_elapsed_ms:
+                self.page.clock.charge_yield(self.page.route_attribute_elapsed_ms)
+            if self.page.route_attribute_change:
+                self.page.apply_topology_change(self.page.route_attribute_change)
+        self.page.get_attribute_calls += 1
+        return href
+
+
+class NavigationDiagnosticContext:
+    def __init__(self, page: "NavigationDiagnosticPage") -> None:
+        self.page = page
+
+    @property
+    def pages(self) -> list[object]:
+        return self.page.context_pages()
+
+
+class NavigationDiagnosticPage:
+    def __init__(
+        self,
+        *,
+        clock: RecoveryClock,
+        post_controls: dict[str, list[NavigationDiagnosticState] | NavigationDiagnosticState]
+        | None = None,
+        ems_state: NavigationDiagnosticState | None = None,
+        post_url: str = "http://synthetic.invalid/app",
+        pre_context_pages: int = 1,
+        post_context_pages: int = 1,
+        pre_frames: int = 1,
+        post_frames: int = 1,
+        ems_inert: bool = False,
+        ems_readiness_change: str | None = None,
+        ems_boundary_change: str | None = None,
+        post_checkpoint_change: str | None = None,
+        post_probe_change: str | None = None,
+        route_count_change: str | None = None,
+        route_count_elapsed_ms: int = 0,
+        route_attribute_change: str | None = None,
+        route_attribute_elapsed_ms: int = 0,
+    ) -> None:
+        self.clock = clock
+        self.ems_state = ems_state or navigation_ready()
+        self.post_controls = post_controls or {}
+        self.post_url = post_url
+        self.pre_context_pages = pre_context_pages
+        self.post_context_pages = post_context_pages
+        self.pre_frames = pre_frames
+        self.post_frames = post_frames
+        self.ems_inert = ems_inert
+        self.ems_readiness_change = ems_readiness_change
+        self.ems_boundary_change = ems_boundary_change
+        self.post_checkpoint_change = post_checkpoint_change
+        self.post_probe_change = post_probe_change
+        self.route_count_change = route_count_change
+        self.route_count_elapsed_ms = route_count_elapsed_ms
+        self.route_attribute_change = route_attribute_change
+        self.route_attribute_elapsed_ms = route_attribute_elapsed_ms
+        self._topology_change: str | None = None
+        self._post_checkpoint_changed = False
+        self._post_probe_changed = False
+        self._route_count_changed = False
+        self._route_attribute_changed = False
+        self.ems_dispatches = 0
+        self.normal_clicks: dict[str, int] = {}
+        self.trial_clicks: dict[str, int] = {}
+        self.probe_timeouts: list[int | None] = []
+        self.attribute_timeouts: list[int | None] = []
+        self.get_attribute_calls = 0
+        self.waits: list[int] = []
+        self.role_lookups: list[tuple[str, str | None, bool]] = []
+        self.goto_calls = 0
+        self._url = "http://synthetic.invalid/landing"
+        self._look_indices: dict[str, int] = {}
+
+    def context_pages(self) -> list[object]:
+        count = self.post_context_pages if self.ems_dispatches else self.pre_context_pages
+        if self._topology_change == "page":
+            count = 2
+        return [self] + [object() for _ in range(max(0, count - 1))]
+
+    @property
+    def frames(self) -> list[object]:
+        count = self.post_frames if self.ems_dispatches else self.pre_frames
+        if self._topology_change == "frame":
+            count = 2
+        return [object() for _ in range(max(0, count))]
+
+    @property
+    def url(self) -> str:
+        return self._url
+
+    def wait_for_timeout(self, milliseconds: int) -> None:
+        self.waits.append(milliseconds)
+        self.clock.charge_yield(milliseconds)
+        if (
+            self.ems_dispatches
+            and self.post_checkpoint_change
+            and not self._post_checkpoint_changed
+        ):
+            self._post_checkpoint_changed = True
+            self.apply_topology_change(self.post_checkpoint_change)
+
+    def apply_topology_change(self, change: str) -> None:
+        if change in {"page", "frame"}:
+            self._topology_change = change
+            return
+        if change == "origin":
+            self._url = "https://other.invalid/changed"
+            return
+        raise AssertionError(change)
+
+    def goto(self, *_args, **_kwargs) -> None:
+        self.goto_calls += 1
+        raise AssertionError("navigation diagnostic must not reload or navigate")
+
+    def _state_for(self, key: str) -> NavigationDiagnosticState:
+        if key == "button:EMS" and not self.ems_dispatches:
+            return self.ems_state
+        configured = self.post_controls.get(
+            {
+                "button:EMS": "button_ems",
+                "link:EMS": "link_ems",
+                "link:Billing Manager": "link_billing_manager",
+                "button:Billing Manager": "button_billing_manager",
+                "link:EB Bill": "link_eb_bill",
+                "button:EB Bill": "button_eb_bill",
+            }[key]
+        )
+        if configured is None:
+            return NavigationDiagnosticState()
+        if isinstance(configured, list):
+            index = self._look_indices.get(key, 0)
+            self._look_indices[key] = index + 1
+            return configured[min(index, len(configured) - 1)]
+        return configured
+
+    def get_by_role(self, role: str, name: str | None = None, exact: bool = False):
+        self.role_lookups.append((role, name, exact))
+        if (role, name) not in {
+            ("button", "EMS"),
+            ("link", "EMS"),
+            ("link", "Billing Manager"),
+            ("button", "Billing Manager"),
+            ("link", "EB Bill"),
+            ("button", "EB Bill"),
+        }:
+            raise AssertionError(f"unexpected role lookup: {role}/{name}")
+        return NavigationDiagnosticLocator(self, f"{role}:{name}", self._state_for(f"{role}:{name}"))
+
+    def get_by_text(self, *_args, **_kwargs):
+        raise AssertionError("generic text selectors are forbidden")
+
+
+def navigation_portal(**kwargs):
+    clock = RecoveryClock()
+    page = NavigationDiagnosticPage(clock=clock, **kwargs)
+    portal = PlaywrightPortal(ResultsConfig(), headed=True)
+    portal.page = page
+    portal.context = NavigationDiagnosticContext(page)
+    portal.login = mock.Mock()
+    return portal, page, clock
+
+
+class NavigationDiagnosticStateMachineTests(unittest.TestCase):
+    def run_navigation(self, **kwargs):
+        portal, page, clock = navigation_portal(**kwargs)
+        with simulated_clock(clock):
+            result = portal.navigation_diagnostic()
+        return result, portal, page, clock
+
+    def assert_no_downstream_dispatch(self, page: NavigationDiagnosticPage) -> None:
+        self.assertEqual(
+            page.normal_clicks,
+            {"button:EMS": 1},
+            "only the single EMS entry dispatch is permitted",
+        )
+        self.assertEqual(page.goto_calls, 0)
+
+    def test_inert_ems_consumes_one_dispatch_and_exhausts_the_window(self) -> None:
+        result, portal, page, clock = self.run_navigation(ems_inert=True)
+        self.assertEqual(result.result, portal_module.NAVIGATION_DIAGNOSTIC_POST_EMS_WINDOW_EXHAUSTED)
+        self.assertEqual(result.status, "COMPLETE")
+        self.assertEqual(page.ems_dispatches, 1)
+        self.assert_no_downstream_dispatch(page)
+        portal.login.assert_called_once_with()
+        self.assertEqual(clock.elapsed_ms(), 45000)
+        self.assertTrue(page.waits)
+        self.assertLessEqual(max(page.waits), portal_module.MAX_PORTAL_PROBE_TIMEOUT_MS)
+
+    def test_delayed_billing_manager_link_is_observed_without_clicking(self) -> None:
+        delayed = [navigation_absent(), navigation_ready(href="/billing")]
+        result, _portal, page, _clock = self.run_navigation(
+            post_controls={"link_billing_manager": delayed}
+        )
+        self.assertEqual(
+            result.result,
+            portal_module.NAVIGATION_DIAGNOSTIC_POST_EMS_BILLING_MANAGER_LINK_READY,
+        )
+        self.assertEqual(page.normal_clicks, {"button:EMS": 1})
+        self.assertGreaterEqual(page.trial_clicks.get("link:Billing Manager", 0), 1)
+
+    def test_billing_manager_absent_duplicate_hidden_disabled_and_non_actionable_fail_closed(self) -> None:
+        cases = {
+            "absent": navigation_absent(),
+            "duplicate": navigation_absent(matches=2),
+            "hidden": navigation_absent(matches=1),
+            "disabled": navigation_absent(matches=1, visible=True, enabled=False),
+            "non_actionable": navigation_absent(matches=1, visible=True, enabled=True),
+        }
+        for name, state in cases.items():
+            with self.subTest(case=name):
+                result, _portal, page, _clock = self.run_navigation(
+                    post_controls={"link_billing_manager": state}
+                )
+                self.assertEqual(
+                    result.result,
+                    portal_module.NAVIGATION_DIAGNOSTIC_POST_EMS_WINDOW_EXHAUSTED,
+                )
+                self.assertEqual(page.normal_clicks, {"button:EMS": 1})
+
+    def test_billing_manager_button_evidence_is_observational_only(self) -> None:
+        result, _portal, page, _clock = self.run_navigation(
+            post_controls={"button_billing_manager": navigation_ready()}
+        )
+        self.assertEqual(
+            result.result,
+            portal_module.NAVIGATION_DIAGNOSTIC_POST_EMS_BILLING_MANAGER_BUTTON_READY,
+        )
+        self.assertEqual(page.normal_clicks, {"button:EMS": 1})
+
+    def test_eb_bill_button_evidence_is_observational_only(self) -> None:
+        result, _portal, page, _clock = self.run_navigation(
+            post_controls={"button_eb_bill": navigation_ready()}
+        )
+        self.assertEqual(
+            result.result,
+            portal_module.NAVIGATION_DIAGNOSTIC_POST_EMS_EB_BILL_BUTTON_READY,
+        )
+        self.assertEqual(page.normal_clicks, {"button:EMS": 1})
+
+    def test_direct_route_and_direct_link_have_their_distinct_positive_results(self) -> None:
+        route, _portal, route_page, _clock = self.run_navigation(
+            post_url="http://synthetic.invalid/eb-bill",
+            post_controls={"link_eb_bill": navigation_ready(href="/eb-bill")},
+        )
+        self.assertEqual(
+            route.result,
+            portal_module.NAVIGATION_DIAGNOSTIC_POST_EMS_EB_BILL_ROUTE_PROVEN,
+        )
+        self.assertEqual(route_page.normal_clicks, {"button:EMS": 1})
+
+        direct, _portal, direct_page, _clock = self.run_navigation(
+            post_controls={"link_eb_bill": navigation_ready(href="/eb-bill")}
+        )
+        self.assertEqual(
+            direct.result,
+            portal_module.NAVIGATION_DIAGNOSTIC_POST_EMS_EB_BILL_LINK_READY,
+        )
+        self.assertEqual(direct_page.normal_clicks, {"button:EMS": 1})
+
+    def test_multiple_pages_or_frames_terminate_without_surface_switching(self) -> None:
+        pre_pages, _portal, page, _clock = self.run_navigation(pre_context_pages=2)
+        self.assertEqual(pre_pages.result, portal_module.NAVIGATION_DIAGNOSTIC_PRE_EMS_MULTIPLE_PAGES)
+        self.assertEqual(page.ems_dispatches, 0)
+        self.assertEqual(page.normal_clicks, {})
+
+        post_frames, _portal, page, _clock = self.run_navigation(post_frames=2)
+        self.assertEqual(post_frames.result, portal_module.NAVIGATION_DIAGNOSTIC_POST_EMS_MULTIPLE_FRAMES)
+        self.assertEqual(page.normal_clicks, {"button:EMS": 1})
+        self.assertEqual(page.goto_calls, 0)
+
+    def test_cross_origin_terminates_before_controls_are_read(self) -> None:
+        result, _portal, page, _clock = self.run_navigation(
+            post_url="https://other.invalid/landing?token=private"
+        )
+        self.assertEqual(result.result, portal_module.NAVIGATION_DIAGNOSTIC_POST_EMS_CROSS_ORIGIN)
+        self.assertEqual(page.normal_clicks, {"button:EMS": 1})
+        self.assertEqual(
+            [lookup for lookup in page.role_lookups if lookup[0] != "button" or lookup[1] != "EMS"],
+            [],
+        )
+
+    def test_ems_exception_is_uncertain_and_terminal_without_retry_or_relogin(self) -> None:
+        result, portal, page, _clock = self.run_navigation(
+            ems_state=navigation_ready(click_error=RuntimeError("private click failure"))
+        )
+        self.assertEqual(result.result, portal_module.NAVIGATION_DIAGNOSTIC_EMS_DISPATCH_UNCERTAIN)
+        self.assertEqual(result.status, "ACTION_REQUIRED")
+        self.assertEqual(page.ems_dispatches, 1)
+        self.assertEqual(page.normal_clicks, {"button:EMS": 1})
+        portal.login.assert_called_once_with()
+        self.assertEqual(page.waits, [])
+
+    def test_exact_selectors_and_no_alternate_opener_are_used(self) -> None:
+        result, _portal, page, _clock = self.run_navigation()
+        self.assertEqual(result.result, portal_module.NAVIGATION_DIAGNOSTIC_POST_EMS_WINDOW_EXHAUSTED)
+        self.assertTrue(page.role_lookups)
+        self.assertTrue(all(exact for _role, _name, exact in page.role_lookups))
+        self.assertTrue(all(name in {"EMS", "Billing Manager", "EB Bill"} for _role, name, _exact in page.role_lookups))
+        source = pathlib_read_portal_source()
+        body = source[source.index("def navigation_diagnostic") : source.index("# ---- inventory ----")]
+        for forbidden in ("_open_verified_results", "_open_eb_bill_route", "_dispatch_billing_manager", "_dispatch_eb_bill", ".first", "get_by_text", "reload"):
+            self.assertNotIn(forbidden, body)
+
+
+class NavigationDiagnosticRepair1StateMachineTests(unittest.TestCase):
+    def run_navigation(self, **kwargs):
+        portal, page, clock = navigation_portal(**kwargs)
+        with simulated_clock(clock):
+            result = portal.navigation_diagnostic()
+        return result, portal, page, clock
+
+    def test_second_page_during_ems_readiness_prevents_dispatch(self) -> None:
+        result, _portal, page, _clock = self.run_navigation(
+            ems_readiness_change="page"
+        )
+        self.assertEqual(result.result, portal_module.NAVIGATION_DIAGNOSTIC_PRE_EMS_MULTIPLE_PAGES)
+        self.assertEqual(page.ems_dispatches, 0)
+        self.assertEqual(page.normal_clicks, {})
+
+    def test_extra_frame_during_ems_readiness_prevents_dispatch(self) -> None:
+        result, _portal, page, _clock = self.run_navigation(
+            ems_readiness_change="frame"
+        )
+        self.assertEqual(result.result, portal_module.NAVIGATION_DIAGNOSTIC_PRE_EMS_MULTIPLE_FRAMES)
+        self.assertEqual(page.ems_dispatches, 0)
+        self.assertEqual(page.normal_clicks, {})
+
+    def test_topology_change_at_ems_action_boundary_prevents_dispatch(self) -> None:
+        result, _portal, page, _clock = self.run_navigation(
+            ems_boundary_change="page"
+        )
+        self.assertEqual(result.result, portal_module.NAVIGATION_DIAGNOSTIC_PRE_EMS_MULTIPLE_PAGES)
+        self.assertEqual(page.ems_dispatches, 0)
+        self.assertEqual(page.normal_clicks, {})
+
+    def test_origin_change_at_ems_action_boundary_prevents_dispatch(self) -> None:
+        result, _portal, page, _clock = self.run_navigation(
+            ems_boundary_change="origin"
+        )
+        self.assertEqual(result.result, portal_module.NAVIGATION_DIAGNOSTIC_EMS_NOT_READY)
+        self.assertEqual(page.ems_dispatches, 0)
+        self.assertEqual(page.normal_clicks, {})
+
+    def test_change_between_post_checkpoints_stops_later_probes(self) -> None:
+        result, _portal, page, _clock = self.run_navigation(
+            post_checkpoint_change="origin"
+        )
+        self.assertEqual(result.result, portal_module.NAVIGATION_DIAGNOSTIC_POST_EMS_CROSS_ORIGIN)
+        self.assertEqual(page.normal_clicks, {"button:EMS": 1})
+        self.assertEqual(page.waits, [250])
+
+    def test_change_during_waiting_probe_invalidates_positive_evidence(self) -> None:
+        result, _portal, page, _clock = self.run_navigation(
+            post_controls={"link_billing_manager": navigation_ready()},
+            post_probe_change="page",
+        )
+        self.assertEqual(result.result, portal_module.NAVIGATION_DIAGNOSTIC_POST_EMS_MULTIPLE_PAGES)
+        self.assertEqual(page.normal_clicks, {"button:EMS": 1})
+        self.assertEqual(page.trial_clicks.get("link:Billing Manager", 0), 0)
+
+    def test_one_shared_deadline_clips_probes_and_never_starts_after_exhaustion(self) -> None:
+        result, _portal, page, clock = self.run_navigation(
+            post_controls={
+                "link_billing_manager": navigation_absent(
+                    matches=1, visible=True, enabled=True, actionable=False
+                )
+            }
+        )
+        self.assertEqual(result.result, portal_module.NAVIGATION_DIAGNOSTIC_POST_EMS_WINDOW_EXHAUSTED)
+        self.assertEqual(page.normal_clicks, {"button:EMS": 1})
+        self.assertEqual(clock.elapsed_ms(), 46_000)
+        self.assertLess(clock.elapsed_ms(), 60_000)
+        self.assertTrue(page.probe_timeouts)
+        self.assertLessEqual(
+            max(timeout for timeout in page.probe_timeouts if timeout is not None),
+            1000,
+        )
+
+
+class NavigationDiagnosticRepair2RouteProofTests(unittest.TestCase):
+    def run_navigation(self, **kwargs):
+        portal, page, clock = navigation_portal(**kwargs)
+        with simulated_clock(clock):
+            result = portal.navigation_diagnostic()
+        return result, portal, page, clock
+
+    def test_route_count_terminal_failures_never_read_attribute_or_controls(self) -> None:
+        cases = {
+            "page": (
+                portal_module.NAVIGATION_DIAGNOSTIC_POST_EMS_MULTIPLE_PAGES,
+                {"route_count_change": "page"},
+            ),
+            "frame": (
+                portal_module.NAVIGATION_DIAGNOSTIC_POST_EMS_MULTIPLE_FRAMES,
+                {"route_count_change": "frame"},
+            ),
+            "origin": (
+                portal_module.NAVIGATION_DIAGNOSTIC_POST_EMS_CROSS_ORIGIN,
+                {"route_count_change": "origin"},
+            ),
+            "deadline": (
+                portal_module.NAVIGATION_DIAGNOSTIC_POST_EMS_WINDOW_EXHAUSTED,
+                {"route_count_elapsed_ms": 60_000},
+            ),
+        }
+        for name, (expected, options) in cases.items():
+            with self.subTest(case=name):
+                result, _portal, page, _clock = self.run_navigation(
+                    post_url="http://synthetic.invalid/eb-bill",
+                    post_controls={"link_eb_bill": navigation_ready(href="/eb-bill")},
+                    **options,
+                )
+                self.assertEqual(result.result, expected)
+                self.assertEqual(page.get_attribute_calls, 0)
+                self.assertEqual(page.attribute_timeouts, [])
+                self.assertEqual(page.trial_clicks, {"button:EMS": 1})
+                self.assertEqual(page.normal_clicks, {"button:EMS": 1})
+
+    def test_fresh_remaining_budget_clips_route_attribute_timeout(self) -> None:
+        result, _portal, page, _clock = self.run_navigation(
+            post_url="http://synthetic.invalid/eb-bill",
+            post_controls={"link_eb_bill": navigation_ready(href="/eb-bill")},
+            route_count_elapsed_ms=59_500,
+        )
+        self.assertEqual(
+            result.result,
+            portal_module.NAVIGATION_DIAGNOSTIC_POST_EMS_EB_BILL_ROUTE_PROVEN,
+        )
+        self.assertEqual(page.get_attribute_calls, 1)
+        self.assertEqual(page.attribute_timeouts, [500])
+        self.assertEqual(page.trial_clicks, {"button:EMS": 1})
+
+    def test_route_attribute_terminal_failures_invalidate_positive_evidence(self) -> None:
+        cases = {
+            "page": (
+                portal_module.NAVIGATION_DIAGNOSTIC_POST_EMS_MULTIPLE_PAGES,
+                {"route_attribute_change": "page"},
+            ),
+            "frame": (
+                portal_module.NAVIGATION_DIAGNOSTIC_POST_EMS_MULTIPLE_FRAMES,
+                {"route_attribute_change": "frame"},
+            ),
+            "origin": (
+                portal_module.NAVIGATION_DIAGNOSTIC_POST_EMS_CROSS_ORIGIN,
+                {"route_attribute_change": "origin"},
+            ),
+            "deadline": (
+                portal_module.NAVIGATION_DIAGNOSTIC_POST_EMS_WINDOW_EXHAUSTED,
+                {"route_attribute_elapsed_ms": 60_000},
+            ),
+        }
+        for name, (expected, options) in cases.items():
+            with self.subTest(case=name):
+                result, _portal, page, _clock = self.run_navigation(
+                    post_url="http://synthetic.invalid/eb-bill",
+                    post_controls={"link_eb_bill": navigation_ready(href="/eb-bill")},
+                    **options,
+                )
+                self.assertEqual(result.result, expected)
+                self.assertEqual(page.get_attribute_calls, 1)
+                self.assertEqual(page.trial_clicks, {"button:EMS": 1})
+                self.assertEqual(page.normal_clicks, {"button:EMS": 1})
+
+    def test_stable_route_proof_remains_positive_after_final_fresh_guard(self) -> None:
+        result, _portal, page, _clock = self.run_navigation(
+            post_url="http://synthetic.invalid/eb-bill",
+            post_controls={"link_eb_bill": navigation_ready(href="/eb-bill")},
+        )
+        self.assertEqual(
+            result.result,
+            portal_module.NAVIGATION_DIAGNOSTIC_POST_EMS_EB_BILL_ROUTE_PROVEN,
+        )
+        self.assertEqual(page.get_attribute_calls, 1)
+        self.assertEqual(page.attribute_timeouts, [1000])
+        self.assertEqual(page.trial_clicks, {"button:EMS": 1})
+
+
+class NavigationDiagnosticPrivacyTests(unittest.TestCase):
+    HOSTILE = "private-account password=hunter2 token=tok_live_abcd https://evil.invalid/q"
+
+    def test_raw_url_query_href_and_exception_text_never_enter_result_evidence(self) -> None:
+        portal, _page, _clock = navigation_portal(
+            post_url="http://synthetic.invalid/app?customer=" + self.HOSTILE,
+            post_controls={
+                "link_billing_manager": navigation_absent(
+                    count_error=RuntimeError(self.HOSTILE)
+                )
+            },
+        )
+        with simulated_clock(_clock):
+            observed = portal.navigation_diagnostic()
+        document = cli.navigation_diagnostic_document(observed)
+        encoded = json.dumps(document, sort_keys=True)
+        for fragment in ("private-account", "hunter2", "tok_live_abcd", "evil.invalid", "https://"):
+            self.assertNotIn(fragment, encoded)
+        self.assertEqual(observed.result, portal_module.NAVIGATION_DIAGNOSTIC_POST_EMS_OBSERVATION_UNREADABLE)
+
+    def test_unreadable_observation_is_generic_and_fail_closed(self) -> None:
+        portal, _page, _clock = navigation_portal(
+            post_controls={
+                "link_eb_bill": navigation_absent(
+                    count_error=RuntimeError(self.HOSTILE)
+                )
+            }
+        )
+        with simulated_clock(_clock):
+            observed = portal.navigation_diagnostic()
+        self.assertEqual(observed.result, portal_module.NAVIGATION_DIAGNOSTIC_POST_EMS_OBSERVATION_UNREADABLE)
+        self.assertIsInstance(observed.failure, LayoutChangedError)
+        self.assertNotIn("hunter2", observed.failure.message)
+
+    def test_diagnostic_source_never_reads_or_emits_private_page_text(self) -> None:
+        source = pathlib_read_portal_source()
+        body = source[source.index("def navigation_diagnostic") : source.index("# ---- inventory ----")]
+        for forbidden in ("text_content", "inner_text", "inner_html", "content()", "screenshot", "storage_state", "trace"):
+            self.assertNotIn(forbidden, body)
 
 
 if __name__ == "__main__":

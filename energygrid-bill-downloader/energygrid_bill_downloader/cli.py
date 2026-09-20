@@ -17,8 +17,36 @@ from .portal import (
     AUTHENTICATION_OUTCOMES,
     AUTHENTICATION_UNPROVED,
     LOGIN_DIAGNOSTIC_CLASSIFICATIONS,
+    NAVIGATION_DIAGNOSTIC_ACTION_REQUIRED_STATE,
+    NAVIGATION_DIAGNOSTIC_AUTHENTICATION_NOT_PROVEN,
+    NAVIGATION_DIAGNOSTIC_COMPLETE_RESULTS,
+    NAVIGATION_DIAGNOSTIC_COMPLETE_STATE,
+    NAVIGATION_DIAGNOSTIC_CONFIGURATION_FAILED,
+    NAVIGATION_DIAGNOSTIC_CONTROL_SPECS,
+    NAVIGATION_DIAGNOSTIC_CROSS_ORIGIN_MESSAGE,
+    NAVIGATION_DIAGNOSTIC_EMS_DISPATCH_UNCERTAIN,
+    NAVIGATION_DIAGNOSTIC_EMS_NOT_READY,
+    NAVIGATION_DIAGNOSTIC_FRAME_TOPOLOGY_MESSAGE,
+    NAVIGATION_DIAGNOSTIC_OUTPUT_REJECTED,
+    NAVIGATION_DIAGNOSTIC_OUTPUT_REJECTED_MESSAGE,
+    NAVIGATION_DIAGNOSTIC_OBSERVATION_UNREADABLE_MESSAGE,
+    NAVIGATION_DIAGNOSTIC_PAGE_TOPOLOGY_MESSAGE,
+    NAVIGATION_DIAGNOSTIC_POST_EMS_CROSS_ORIGIN,
+    NAVIGATION_DIAGNOSTIC_POST_EMS_EB_BILL_BUTTON_READY,
+    NAVIGATION_DIAGNOSTIC_POST_EMS_EB_BILL_LINK_READY,
+    NAVIGATION_DIAGNOSTIC_POST_EMS_EB_BILL_ROUTE_PROVEN,
+    NAVIGATION_DIAGNOSTIC_POST_EMS_MULTIPLE_FRAMES,
+    NAVIGATION_DIAGNOSTIC_POST_EMS_MULTIPLE_PAGES,
+    NAVIGATION_DIAGNOSTIC_POST_EMS_OBSERVATION_UNREADABLE,
+    NAVIGATION_DIAGNOSTIC_POST_EMS_WINDOW_EXHAUSTED,
+    NAVIGATION_DIAGNOSTIC_PRE_EMS_MULTIPLE_FRAMES,
+    NAVIGATION_DIAGNOSTIC_PRE_EMS_MULTIPLE_PAGES,
+    NAVIGATION_DIAGNOSTIC_RESULT_IDENTIFIERS,
+    NavigationDiagnosticResult,
     SUBMIT_NOT_DISPATCHED,
     PlaywrightPortal,
+    unobserved_navigation_post_ems,
+    unobserved_navigation_pre_ems,
     unobserved_login_witnesses,
 )
 from .reconcile import reconcile_inventory
@@ -55,6 +83,13 @@ LOGIN_DIAGNOSTIC_SCHEMA = "energygrid.login_diagnostic.v2"
 HISTORICAL_LOGIN_DIAGNOSTIC_SCHEMAS = ("energygrid.login_diagnostic.v1",)
 
 DIAGNOSTIC_COMPLETE = "DIAGNOSTIC_COMPLETE"
+
+# Dedicated direct-Python post-login navigation diagnostic. It is intentionally
+# not part of the runtime launcher allowlist; the launcher continues to expose
+# only `run`, `list` and `login-diagnostic`.
+NAVIGATION_DIAGNOSTIC_COMMAND = "navigation-diagnostic"
+NAVIGATION_DIAGNOSTIC_SCHEMA = "energygrid.navigation_diagnostic.v1"
+NAVIGATION_DIAGNOSTIC_COMPLETE = NAVIGATION_DIAGNOSTIC_COMPLETE_STATE
 
 # The diagnostic observes authentication and stops. It never tests business
 # navigation, so this is an invariant of the document rather than a result.
@@ -108,6 +143,11 @@ SUPPORT_REFS_BY_MESSAGE = {
     "EB Bill navigation control is not ready": "EG_NAV_EB_BILL_NOT_READY",
     "EB Bill navigation dispatch outcome uncertain": "EG_NAV_EB_BILL_DISPATCH_UNCERTAIN",
     "EB Bill results route was not proven": "EG_NAV_RESULTS_ROUTE_UNPROVED",
+    NAVIGATION_DIAGNOSTIC_PAGE_TOPOLOGY_MESSAGE: "EG_NAV_DIAGNOSTIC_PAGE_TOPOLOGY",
+    NAVIGATION_DIAGNOSTIC_FRAME_TOPOLOGY_MESSAGE: "EG_NAV_DIAGNOSTIC_FRAME_TOPOLOGY",
+    NAVIGATION_DIAGNOSTIC_CROSS_ORIGIN_MESSAGE: "EG_NAV_DIAGNOSTIC_CROSS_ORIGIN",
+    NAVIGATION_DIAGNOSTIC_OBSERVATION_UNREADABLE_MESSAGE: "EG_NAV_DIAGNOSTIC_OBSERVATION_UNREADABLE",
+    NAVIGATION_DIAGNOSTIC_OUTPUT_REJECTED_MESSAGE: "EG_NAV_DIAGNOSTIC_OUTPUT_REJECTED",
 }
 
 # The business-navigation half of the vocabulary, declared rather than inferred
@@ -122,6 +162,27 @@ NAVIGATION_SUPPORT_REFS = frozenset(
         "EG_NAV_EB_BILL_NOT_READY",
         "EG_NAV_EB_BILL_DISPATCH_UNCERTAIN",
         "EG_NAV_RESULTS_ROUTE_UNPROVED",
+    }
+)
+
+NAVIGATION_DIAGNOSTIC_SUPPORT_REFS = frozenset(
+    {
+        "EG_NAV_DIAGNOSTIC_PAGE_TOPOLOGY",
+        "EG_NAV_DIAGNOSTIC_FRAME_TOPOLOGY",
+        "EG_NAV_DIAGNOSTIC_CROSS_ORIGIN",
+        "EG_NAV_DIAGNOSTIC_OBSERVATION_UNREADABLE",
+        "EG_NAV_DIAGNOSTIC_OUTPUT_REJECTED",
+    }
+)
+
+NAVIGATION_DIAGNOSTIC_ALLOWED_SUPPORT_REFS = frozenset(
+    ref for ref in SUPPORT_REFS_BY_MESSAGE.values() if ref.startswith("EG_LOGIN_")
+) | frozenset(
+    {
+        "EG_NAV_EMS_ENTRY_NOT_READY",
+        "EG_NAV_EMS_ENTRY_DISPATCH_UNCERTAIN",
+        *NAVIGATION_DIAGNOSTIC_SUPPORT_REFS,
+        DIAGNOSTIC_UNCLASSIFIED_SUPPORT_REF,
     }
 )
 
@@ -239,6 +300,8 @@ def build_parser() -> argparse.ArgumentParser:
     # headed mode and its bounds are fixed properties of the operation.
     diagnostic = subparsers.add_parser(LOGIN_DIAGNOSTIC_COMMAND)
     diagnostic.add_argument("--config", required=True, type=Path)
+    navigation_diagnostic = subparsers.add_parser(NAVIGATION_DIAGNOSTIC_COMMAND)
+    navigation_diagnostic.add_argument("--config", required=True, type=Path)
     return parser
 
 
@@ -394,6 +457,318 @@ def run_login_diagnostic(config_path: Path) -> int:
     return 0
 
 
+_NAVIGATION_DOCUMENT_BASE_KEYS = frozenset(
+    {
+        "schema",
+        "status",
+        "result",
+        "authentication_proven",
+        "ems_dispatch_attempted",
+        "ems_dispatch_uncertain",
+        "pre_ems",
+        "post_ems",
+    }
+)
+_NAVIGATION_DOCUMENT_WITH_SUPPORT_KEYS = _NAVIGATION_DOCUMENT_BASE_KEYS | frozenset(
+    {"support_ref"}
+)
+_NAVIGATION_CONTROL_KEYS = frozenset(
+    {"role", "name", "count", "visible", "enabled", "trial_actionable"}
+)
+_NAVIGATION_PRE_EMS_KEYS = frozenset(
+    {"context_pages", "bound_page_frames", "ems"}
+)
+_NAVIGATION_POST_EMS_KEYS = frozenset(
+    {
+        "context_pages",
+        "bound_page_frames",
+        "route_changed",
+        "same_origin",
+        "eb_bill_route_proven",
+        "controls",
+    }
+)
+_NAVIGATION_DOCUMENT_STATUSES = frozenset(
+    {NAVIGATION_DIAGNOSTIC_COMPLETE_STATE, NAVIGATION_DIAGNOSTIC_ACTION_REQUIRED_STATE}
+)
+_NAVIGATION_DOCUMENT_COUNT_VALUES = frozenset({0, 1, ">1"})
+_NAVIGATION_SUPPORT_REFERENCE_PATTERN = re.compile(r"\A[A-Z][A-Z0-9_]{0,63}\Z")
+
+
+def _valid_navigation_count(value: Any, *, allow_none: bool = True) -> bool:
+    if value is None:
+        return allow_none
+    if type(value) is int:
+        return value in (0, 1)
+    return type(value) is str and value == ">1"
+
+
+def _valid_navigation_boolean(value: Any) -> bool:
+    return type(value) is bool
+
+
+def _valid_navigation_mapping(value: Any, expected_keys: frozenset[str]) -> bool:
+    """Require one exact built-in mapping shape before inspecting its values."""
+
+    if type(value) is not dict:
+        return False
+    keys = tuple(value.keys())
+    if len(keys) != len(expected_keys):
+        return False
+    if any(type(key) is not str for key in keys):
+        return False
+    return frozenset(keys) == expected_keys
+
+
+def _valid_navigation_control(value: Any, role: str, name: str) -> bool:
+    if not _valid_navigation_mapping(value, _NAVIGATION_CONTROL_KEYS):
+        return False
+    if type(value["role"]) is not str or value["role"] != role:
+        return False
+    if type(value["name"]) is not str or value["name"] != name:
+        return False
+    count = value["count"]
+    if not _valid_navigation_count(count):
+        return False
+    remaining = (value["visible"], value["enabled"], value["trial_actionable"])
+    if count is None or count == ">1":
+        return all(item is None for item in remaining)
+    if count == 0:
+        return all(_valid_navigation_boolean(item) and item is False for item in remaining)
+    return all(_valid_navigation_boolean(item) for item in remaining)
+
+
+def _valid_navigation_pre_ems(value: Any) -> bool:
+    if not _valid_navigation_mapping(value, _NAVIGATION_PRE_EMS_KEYS):
+        return False
+    return (
+        _valid_navigation_count(value["context_pages"])
+        and _valid_navigation_count(value["bound_page_frames"])
+        and _valid_navigation_control(value["ems"], "button", "EMS")
+    )
+
+
+def _valid_navigation_post_ems(value: Any) -> bool:
+    if not _valid_navigation_mapping(value, _NAVIGATION_POST_EMS_KEYS):
+        return False
+    if not (
+        _valid_navigation_count(value["context_pages"])
+        and _valid_navigation_count(value["bound_page_frames"])
+    ):
+        return False
+    if not all(
+        item is None or _valid_navigation_boolean(item)
+        for item in (
+            value["route_changed"],
+            value["same_origin"],
+            value["eb_bill_route_proven"],
+        )
+    ):
+        return False
+    controls = value["controls"]
+    expected_controls = {
+        key: (role, name) for role, name, key in NAVIGATION_DIAGNOSTIC_CONTROL_SPECS
+    }
+    if not _valid_navigation_mapping(controls, frozenset(expected_controls)):
+        return False
+    return all(
+        _valid_navigation_control(controls[key], role, name)
+        for key, (role, name) in expected_controls.items()
+    )
+
+
+def _valid_navigation_document(document: Any) -> bool:
+    try:
+        if not (
+            _valid_navigation_mapping(document, _NAVIGATION_DOCUMENT_BASE_KEYS)
+            or _valid_navigation_mapping(document, _NAVIGATION_DOCUMENT_WITH_SUPPORT_KEYS)
+        ):
+            return False
+        schema = document.get("schema")
+        if type(schema) is not str or schema != NAVIGATION_DIAGNOSTIC_SCHEMA:
+            return False
+        status = document.get("status")
+        result = document.get("result")
+        if type(status) is not str or status not in _NAVIGATION_DOCUMENT_STATUSES:
+            return False
+        if type(result) is not str or result not in NAVIGATION_DIAGNOSTIC_RESULT_IDENTIFIERS:
+            return False
+        if not all(
+            _valid_navigation_boolean(document.get(key))
+            for key in (
+                "authentication_proven",
+                "ems_dispatch_attempted",
+                "ems_dispatch_uncertain",
+            )
+        ):
+            return False
+        if not _valid_navigation_pre_ems(document.get("pre_ems")):
+            return False
+        if not _valid_navigation_post_ems(document.get("post_ems")):
+            return False
+        if "support_ref" in document:
+            support_ref = document["support_ref"]
+            if type(support_ref) is not str or not _NAVIGATION_SUPPORT_REFERENCE_PATTERN.fullmatch(
+                support_ref
+            ):
+                return False
+            if support_ref not in NAVIGATION_DIAGNOSTIC_ALLOWED_SUPPORT_REFS:
+                return False
+        if status == NAVIGATION_DIAGNOSTIC_COMPLETE_STATE:
+            return (
+                result in NAVIGATION_DIAGNOSTIC_COMPLETE_RESULTS
+                and document["authentication_proven"] is True
+                and document["ems_dispatch_attempted"] is True
+                and document["ems_dispatch_uncertain"] is False
+                and "support_ref" not in document
+            )
+        if result in NAVIGATION_DIAGNOSTIC_COMPLETE_RESULTS:
+            return False
+        return "support_ref" in document
+    except Exception:
+        return False
+
+
+def _unobserved_navigation_document(
+    *, result: str = NAVIGATION_DIAGNOSTIC_OUTPUT_REJECTED,
+    support_ref: str = "EG_NAV_DIAGNOSTIC_OUTPUT_REJECTED",
+) -> dict[str, Any]:
+    return {
+        "schema": NAVIGATION_DIAGNOSTIC_SCHEMA,
+        "status": NAVIGATION_DIAGNOSTIC_ACTION_REQUIRED_STATE,
+        "result": result,
+        "authentication_proven": False,
+        "ems_dispatch_attempted": False,
+        "ems_dispatch_uncertain": False,
+        "pre_ems": unobserved_navigation_pre_ems(),
+        "post_ems": unobserved_navigation_post_ems(),
+        "support_ref": support_ref,
+    }
+
+
+def navigation_diagnostic_document(
+    result: NavigationDiagnosticResult,
+    *,
+    support_ref: str | None = None,
+) -> dict[str, Any]:
+    """Reconstruct and validate the complete public navigation schema.
+
+    Validation happens before JSON serialization. Any unexpected result,
+    nested key, value or evidence shape is discarded wholesale, so an invalid
+    or future portal value can never carry private text into the fallback.
+    """
+
+    try:
+        if type(result) is not NavigationDiagnosticResult:
+            return _unobserved_navigation_document()
+        if type(result.result) is str and result.result == NAVIGATION_DIAGNOSTIC_OUTPUT_REJECTED:
+            return _unobserved_navigation_document()
+        resolved_support_ref = support_ref
+        if resolved_support_ref is None:
+            if isinstance(result.failure, AppError):
+                resolved_support_ref = support_ref_for(result.failure)
+            elif result.status != NAVIGATION_DIAGNOSTIC_COMPLETE_STATE:
+                resolved_support_ref = DIAGNOSTIC_UNCLASSIFIED_SUPPORT_REF
+        document: dict[str, Any] = {
+            "schema": NAVIGATION_DIAGNOSTIC_SCHEMA,
+            "status": result.status,
+            "result": result.result,
+            "authentication_proven": result.authentication_proven,
+            "ems_dispatch_attempted": result.ems_dispatch_attempted,
+            "ems_dispatch_uncertain": result.ems_dispatch_uncertain,
+            "pre_ems": result.pre_ems,
+            "post_ems": result.post_ems,
+        }
+        if resolved_support_ref is not None:
+            document["support_ref"] = resolved_support_ref
+        if _valid_navigation_document(document):
+            return document
+    except Exception:
+        pass
+    return _unobserved_navigation_document()
+
+
+def emit_navigation_diagnostic(document: dict[str, Any]) -> dict[str, Any]:
+    try:
+        safe_document = (
+            document if _valid_navigation_document(document) else _unobserved_navigation_document()
+        )
+        encoded = json.dumps(safe_document, sort_keys=True)
+    except Exception:
+        safe_document = _unobserved_navigation_document()
+        encoded = json.dumps(safe_document, sort_keys=True)
+    print(encoded)
+    return safe_document
+
+
+def _navigation_diagnostic_exit_code(document: dict[str, Any]) -> int:
+    """Derive the process result only from the final emitted public document."""
+
+    if document["result"] == NAVIGATION_DIAGNOSTIC_CONFIGURATION_FAILED:
+        return 64
+    if document["result"] == NAVIGATION_DIAGNOSTIC_OUTPUT_REJECTED:
+        return 20
+    if document["status"] == NAVIGATION_DIAGNOSTIC_COMPLETE_STATE:
+        return 0
+    return 20
+
+
+def _emit_navigation_diagnostic_and_get_exit_code(document: dict[str, Any]) -> int:
+    return _navigation_diagnostic_exit_code(emit_navigation_diagnostic(document))
+
+
+def run_navigation_diagnostic(config_path: Path) -> int:
+    """Run the headed direct-Python navigation diagnostic only."""
+
+    def configuration_failure(support_ref: str) -> dict[str, Any]:
+        return {
+            "schema": NAVIGATION_DIAGNOSTIC_SCHEMA,
+            "status": NAVIGATION_DIAGNOSTIC_ACTION_REQUIRED_STATE,
+            "result": NAVIGATION_DIAGNOSTIC_CONFIGURATION_FAILED,
+            "authentication_proven": False,
+            "ems_dispatch_attempted": False,
+            "ems_dispatch_uncertain": False,
+            "pre_ems": unobserved_navigation_pre_ems(),
+            "post_ems": unobserved_navigation_post_ems(),
+            "support_ref": support_ref,
+        }
+
+    try:
+        config = load_runtime_config(load_config_file(config_path))
+    except (ConfigError, DependencyError):
+        document = configuration_failure(DIAGNOSTIC_UNCLASSIFIED_SUPPORT_REF)
+        return _emit_navigation_diagnostic_and_get_exit_code(document)
+
+    try:
+        # Headed is fixed for this operation. The command never preflights the
+        # production roots and never constructs the run logger/state machine.
+        with PlaywrightPortal(config, headed=True) as portal:
+            result = portal.navigation_diagnostic()
+    except (ConfigError, DependencyError):
+        document = configuration_failure(DIAGNOSTIC_UNCLASSIFIED_SUPPORT_REF)
+        return _emit_navigation_diagnostic_and_get_exit_code(document)
+    except AppError as exc:
+        result = NavigationDiagnosticResult(
+            result=NAVIGATION_DIAGNOSTIC_AUTHENTICATION_NOT_PROVEN,
+            status=NAVIGATION_DIAGNOSTIC_ACTION_REQUIRED_STATE,
+            failure=exc,
+        )
+        document = navigation_diagnostic_document(result)
+        return _emit_navigation_diagnostic_and_get_exit_code(document)
+    except Exception:
+        result = NavigationDiagnosticResult(
+            result=NAVIGATION_DIAGNOSTIC_AUTHENTICATION_NOT_PROVEN,
+            status=NAVIGATION_DIAGNOSTIC_ACTION_REQUIRED_STATE,
+        )
+        document = navigation_diagnostic_document(
+            result, support_ref=DIAGNOSTIC_UNCLASSIFIED_SUPPORT_REF
+        )
+        return _emit_navigation_diagnostic_and_get_exit_code(document)
+
+    document = navigation_diagnostic_document(result)
+    return _emit_navigation_diagnostic_and_get_exit_code(document)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     logger: SafeLogger | None = None
@@ -404,6 +779,11 @@ def main(argv: list[str] | None = None) -> int:
             # exit codes. It never reaches the run path below, so no state, log,
             # temp or archive artefact can be created on its behalf.
             return run_login_diagnostic(args.config)
+        if args.command == NAVIGATION_DIAGNOSTIC_COMMAND:
+            # This direct-Python diagnostic has the same early-return boundary:
+            # it never reaches production preflight, logging, stale-temp
+            # cleanup, StateStore, reconciliation, inventory or downloads.
+            return run_navigation_diagnostic(args.config)
         raw = load_config_file(args.config)
         config = load_runtime_config(raw)
         config = config.with_overrides(
