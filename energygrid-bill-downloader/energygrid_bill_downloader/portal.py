@@ -565,6 +565,29 @@ class _NavigationObservationUnreadable(Exception):
     """An observation could not be classified without exposing its cause."""
 
 
+class _NavigationDeadlineExhausted(Exception):
+    """The one diagnostic deadline is spent before another operation starts."""
+
+
+class _NavigationFreshnessChanged(Exception):
+    """The bound page, frame topology or origin changed during observation."""
+
+    def __init__(
+        self,
+        result: str,
+        page_count: int | str | None = None,
+        frame_count: int | str | None = None,
+    ) -> None:
+        super().__init__("navigation diagnostic freshness changed")
+        self.result = result
+        self.page_count = page_count
+        self.frame_count = frame_count
+
+
+class _NavigationControlNotReady(Exception):
+    """The exact diagnostic control did not become ready in its window."""
+
+
 class PlaywrightPortal:
     """The only module that knows the portal DOM contract."""
 
@@ -1537,6 +1560,74 @@ class PlaywrightPortal:
         return left == right
 
     @staticmethod
+    def _navigation_remaining_ms(deadline: float) -> int:
+        """Return the remaining diagnostic budget from one absolute deadline."""
+
+        return int((deadline - time.monotonic()) * 1000)
+
+    def _navigation_probe_timeout(self, deadline: float) -> int:
+        """Cap one diagnostic operation without starting it after exhaustion."""
+
+        remaining_ms = self._navigation_remaining_ms(deadline)
+        if remaining_ms <= 0:
+            return 0
+        return min(MAX_PORTAL_PROBE_TIMEOUT_MS, remaining_ms)
+
+    def _navigation_freshness(
+        self,
+        page: Any,
+        expected_origin: tuple[str, str, int | None],
+        deadline: float,
+        *,
+        post_ems: bool = False,
+    ) -> int:
+        """Prove the bound surface is still safe and return one probe timeout.
+
+        This is diagnostic-only. It never switches pages or traverses frames,
+        and it returns no address or page object to the evidence document.
+        """
+
+        if self._navigation_remaining_ms(deadline) <= 0:
+            raise _NavigationDeadlineExhausted
+        page_count, frame_count, topology_error = self._navigation_topology(page)
+        if topology_error == "page" or page_count != 1:
+            result = (
+                NAVIGATION_DIAGNOSTIC_POST_EMS_MULTIPLE_PAGES
+                if post_ems
+                else NAVIGATION_DIAGNOSTIC_PRE_EMS_MULTIPLE_PAGES
+            )
+            raise _NavigationFreshnessChanged(result, page_count, frame_count)
+        if topology_error == "frame" or frame_count != 1:
+            result = (
+                NAVIGATION_DIAGNOSTIC_POST_EMS_MULTIPLE_FRAMES
+                if post_ems
+                else NAVIGATION_DIAGNOSTIC_PRE_EMS_MULTIPLE_FRAMES
+            )
+            raise _NavigationFreshnessChanged(result, page_count, frame_count)
+        current_url = self._current_url(page)
+        current_origin = (
+            None if current_url is None else self._navigation_origin(current_url)
+        )
+        if current_origin is None:
+            result = (
+                NAVIGATION_DIAGNOSTIC_POST_EMS_OBSERVATION_UNREADABLE
+                if post_ems
+                else NAVIGATION_DIAGNOSTIC_EMS_NOT_READY
+            )
+            raise _NavigationFreshnessChanged(result, page_count, frame_count)
+        if current_origin != expected_origin:
+            result = (
+                NAVIGATION_DIAGNOSTIC_POST_EMS_CROSS_ORIGIN
+                if post_ems
+                else NAVIGATION_DIAGNOSTIC_EMS_NOT_READY
+            )
+            raise _NavigationFreshnessChanged(result, page_count, frame_count)
+        remaining_ms = self._navigation_remaining_ms(deadline)
+        if remaining_ms <= 0:
+            raise _NavigationDeadlineExhausted
+        return min(MAX_PORTAL_PROBE_TIMEOUT_MS, remaining_ms)
+
+    @staticmethod
     def _navigation_ready_control_observation(
         role: str, name: str
     ) -> dict[str, Any]:
@@ -1558,16 +1649,94 @@ class PlaywrightPortal:
             and observation.get("trial_actionable") is True
         )
 
+    def _navigation_resolve_ready_control(
+        self,
+        page: Any,
+        role: str,
+        name: str,
+        start: float,
+        deadline: float,
+        expected_origin: tuple[str, str, int | None],
+    ) -> tuple[Any, int]:
+        """Resolve one exact control under the shared diagnostic deadline."""
+
+        for target_ms in NAVIGATION_DIAGNOSTIC_CHECKPOINTS_MS:
+            if not self._navigation_wait_to_checkpoint(
+                page, start, deadline, target_ms
+            ):
+                raise _NavigationDeadlineExhausted
+            self._navigation_freshness(page, expected_origin, deadline)
+            try:
+                locator = page.get_by_role(role, name=name, exact=True)
+                count = self._navigation_capped_count(locator.count())
+            except Exception as exc:
+                raise _NavigationObservationUnreadable from exc
+            self._navigation_freshness(page, expected_origin, deadline)
+            if count != 1:
+                continue
+
+            timeout_ms = self._navigation_probe_timeout(deadline)
+            if timeout_ms <= 0:
+                raise _NavigationDeadlineExhausted
+            try:
+                visible = bool(locator.is_visible(timeout=timeout_ms))
+            except Exception as exc:
+                raise _NavigationObservationUnreadable from exc
+            self._navigation_freshness(page, expected_origin, deadline)
+            if not visible:
+                continue
+
+            remaining_ms = self._navigation_remaining_ms(deadline)
+            if remaining_ms <= 0:
+                raise _NavigationDeadlineExhausted
+            try:
+                enabled = bool(self._probe_enabled(locator, remaining_ms))
+            except Exception as exc:
+                raise _NavigationObservationUnreadable from exc
+            self._navigation_freshness(page, expected_origin, deadline)
+            if not enabled:
+                continue
+
+            remaining_ms = self._navigation_remaining_ms(deadline)
+            if remaining_ms <= 0:
+                raise _NavigationDeadlineExhausted
+            try:
+                actionable = bool(self._probe_actionable(locator, remaining_ms))
+            except Exception as exc:
+                raise _NavigationObservationUnreadable from exc
+            self._navigation_freshness(page, expected_origin, deadline)
+            if not actionable:
+                continue
+
+            # This is the action-boundary guard. The returned timeout is the
+            # only value used by the immediately following normal click: no
+            # wait, locator resolution or additional probe may be inserted.
+            return locator, self._navigation_freshness(
+                page, expected_origin, deadline
+            )
+        raise _NavigationControlNotReady
+
     def _observe_navigation_control(
-        self, page: Any, role: str, name: str, remaining_ms: int
+        self,
+        page: Any,
+        role: str,
+        name: str,
+        deadline: float,
+        expected_origin: tuple[str, str, int | None],
     ) -> dict[str, Any]:
         """Read one fixed control; this helper can never issue a normal click."""
 
+        self._navigation_freshness(
+            page, expected_origin, deadline, post_ems=True
+        )
         try:
             locator = page.get_by_role(role, name=name, exact=True)
-            count = self._navigation_capped_count(int(locator.count()))
+            count = self._navigation_capped_count(locator.count())
         except Exception as exc:
             raise _NavigationObservationUnreadable from exc
+        self._navigation_freshness(
+            page, expected_origin, deadline, post_ems=True
+        )
         if count == 0:
             return {
                 "role": role,
@@ -1586,10 +1755,16 @@ class PlaywrightPortal:
                 "enabled": None,
                 "trial_actionable": None,
             }
+        timeout_ms = self._navigation_probe_timeout(deadline)
+        if timeout_ms <= 0:
+            raise _NavigationDeadlineExhausted
         try:
-            visible = bool(locator.is_visible())
+            visible = bool(locator.is_visible(timeout=timeout_ms))
         except Exception as exc:
             raise _NavigationObservationUnreadable from exc
+        self._navigation_freshness(
+            page, expected_origin, deadline, post_ems=True
+        )
         if not visible:
             return {
                 "role": role,
@@ -1599,10 +1774,16 @@ class PlaywrightPortal:
                 "enabled": False,
                 "trial_actionable": False,
             }
+        remaining_ms = self._navigation_remaining_ms(deadline)
+        if remaining_ms <= 0:
+            raise _NavigationDeadlineExhausted
         try:
             enabled = bool(self._probe_enabled(locator, remaining_ms))
         except Exception as exc:
             raise _NavigationObservationUnreadable from exc
+        self._navigation_freshness(
+            page, expected_origin, deadline, post_ems=True
+        )
         if not enabled:
             return {
                 "role": role,
@@ -1612,10 +1793,16 @@ class PlaywrightPortal:
                 "enabled": False,
                 "trial_actionable": False,
             }
+        remaining_ms = self._navigation_remaining_ms(deadline)
+        if remaining_ms <= 0:
+            raise _NavigationDeadlineExhausted
         try:
             actionable = bool(self._probe_actionable(locator, remaining_ms))
         except Exception as exc:
             raise _NavigationObservationUnreadable from exc
+        self._navigation_freshness(
+            page, expected_origin, deadline, post_ems=True
+        )
         return {
             "role": role,
             "name": name,
@@ -1653,7 +1840,6 @@ class PlaywrightPortal:
         # Keep the state names explicit at the operation boundary. The CLI's
         # output builder owns OUTPUT_VALIDATION; no state is inferred from an
         # exception or emitted as free-form text.
-        state = NAVIGATION_DIAGNOSTIC_AUTHENTICATION_STATE
         pre_ems = unobserved_navigation_pre_ems()
         post_ems = unobserved_navigation_post_ems()
         try:
@@ -1675,7 +1861,8 @@ class PlaywrightPortal:
                 failure=LayoutChangedError(AUTHENTICATION_UNPROVED_MESSAGE),
             )
 
-        state = NAVIGATION_DIAGNOSTIC_PRE_EMS_TOPOLOGY_STATE
+        start = time.monotonic()
+        deadline = start + NAVIGATION_DIAGNOSTIC_DEADLINE_SECONDS
         try:
             page = self._require_page()
         except AppError as exc:
@@ -1721,16 +1908,61 @@ class PlaywrightPortal:
                 ),
             )
 
-        state = NAVIGATION_DIAGNOSTIC_EMS_READINESS_STATE
+        expected_origin = self._navigation_origin(pre_url)
+        if expected_origin is None:
+            return NavigationDiagnosticResult(
+                result=NAVIGATION_DIAGNOSTIC_EMS_NOT_READY,
+                status=NAVIGATION_DIAGNOSTIC_ACTION_REQUIRED_STATE,
+                authentication_proven=True,
+                pre_ems=pre_ems,
+                post_ems=post_ems,
+                failure=LayoutChangedError(NAV_EMS_ENTRY_NOT_READY_MESSAGE),
+            )
         try:
-            ems = self._resolve_ready_control(
+            self._navigation_freshness(page, expected_origin, deadline)
+            ems, ems_timeout_ms = self._navigation_resolve_ready_control(
                 page,
-                lambda: page.get_by_role(
-                    "button", name=EMS_ENTRY_NAV_NAME, exact=True
-                ),
-                "EMS application entry control",
-                require_trial_actionable=True,
-                messages=_uniform_messages(NAV_EMS_ENTRY_NOT_READY_MESSAGE),
+                "button",
+                EMS_ENTRY_NAV_NAME,
+                start,
+                deadline,
+                expected_origin,
+            )
+        except _NavigationFreshnessChanged as exc:
+            pre_ems["context_pages"] = exc.page_count
+            pre_ems["bound_page_frames"] = exc.frame_count
+            if exc.result in {
+                NAVIGATION_DIAGNOSTIC_PRE_EMS_MULTIPLE_PAGES,
+                NAVIGATION_DIAGNOSTIC_PRE_EMS_MULTIPLE_FRAMES,
+            }:
+                return NavigationDiagnosticResult(
+                    result=exc.result,
+                    status=NAVIGATION_DIAGNOSTIC_ACTION_REQUIRED_STATE,
+                    authentication_proven=True,
+                    pre_ems=pre_ems,
+                    post_ems=post_ems,
+                    failure=self._navigation_failure(exc.result),
+                )
+            return NavigationDiagnosticResult(
+                result=NAVIGATION_DIAGNOSTIC_EMS_NOT_READY,
+                status=NAVIGATION_DIAGNOSTIC_ACTION_REQUIRED_STATE,
+                authentication_proven=True,
+                pre_ems=pre_ems,
+                post_ems=post_ems,
+                failure=LayoutChangedError(NAV_EMS_ENTRY_NOT_READY_MESSAGE),
+            )
+        except (
+            _NavigationControlNotReady,
+            _NavigationDeadlineExhausted,
+            _NavigationObservationUnreadable,
+        ):
+            return NavigationDiagnosticResult(
+                result=NAVIGATION_DIAGNOSTIC_EMS_NOT_READY,
+                status=NAVIGATION_DIAGNOSTIC_ACTION_REQUIRED_STATE,
+                authentication_proven=True,
+                pre_ems=pre_ems,
+                post_ems=post_ems,
+                failure=LayoutChangedError(NAV_EMS_ENTRY_NOT_READY_MESSAGE),
             )
         except Exception:
             return NavigationDiagnosticResult(
@@ -1745,9 +1977,12 @@ class PlaywrightPortal:
             "button", EMS_ENTRY_NAV_NAME
         )
 
-        state = NAVIGATION_DIAGNOSTIC_EMS_DISPATCH_STATE
+        # `ems_timeout_ms` and `ems` came from the final freshness guard in
+        # `_navigation_resolve_ready_control`. Keep the next operation as the
+        # single normal EMS dispatch: no locator resolution, wait or probe is
+        # allowed between that guard and this click.
         try:
-            ems.click()
+            ems.click(timeout=ems_timeout_ms)
         except Exception:
             return NavigationDiagnosticResult(
                 result=NAVIGATION_DIAGNOSTIC_EMS_DISPATCH_UNCERTAIN,
@@ -1760,9 +1995,14 @@ class PlaywrightPortal:
                 failure=LayoutChangedError(NAV_EMS_ENTRY_UNCERTAIN_MESSAGE),
             )
 
-        state = NAVIGATION_DIAGNOSTIC_POST_EMS_OBSERVATION_STATE
         try:
-            result, post_ems = self._observe_navigation_post_ems(page, pre_url)
+            result, post_ems = self._observe_navigation_post_ems(
+                page,
+                pre_url,
+                expected_origin,
+                start,
+                deadline,
+            )
         except Exception:
             result = NAVIGATION_DIAGNOSTIC_POST_EMS_OBSERVATION_UNREADABLE
             post_ems = unobserved_navigation_post_ems()
@@ -1802,27 +2042,35 @@ class PlaywrightPortal:
                 page.wait_for_timeout(wait_ms)
             except Exception as exc:
                 raise _NavigationObservationUnreadable from exc
+            if self._navigation_remaining_ms(deadline) <= 0:
+                return False
 
     def _observe_navigation_post_ems(
-        self, page: Any, pre_url: str
+        self,
+        page: Any,
+        pre_url: str,
+        expected_origin: tuple[str, str, int | None],
+        start: float,
+        deadline: float,
     ) -> tuple[str, dict[str, Any]]:
         """Observe one fixed surface at the committed post-EMS checkpoints."""
 
-        start = time.monotonic()
-        deadline = start + NAVIGATION_DIAGNOSTIC_DEADLINE_SECONDS
         post = unobserved_navigation_post_ems()
         for checkpoint_ms in NAVIGATION_DIAGNOSTIC_CHECKPOINTS_MS:
             if not self._navigation_wait_to_checkpoint(
                 page, start, deadline, checkpoint_ms
             ):
-                break
-            page_count, frame_count, topology_error = self._navigation_topology(page)
-            post["context_pages"] = page_count
-            post["bound_page_frames"] = frame_count
-            if topology_error == "page" or page_count == _NAVIGATION_DIAGNOSTIC_COUNT_GT_ONE:
-                return NAVIGATION_DIAGNOSTIC_POST_EMS_MULTIPLE_PAGES, post
-            if topology_error == "frame" or frame_count == _NAVIGATION_DIAGNOSTIC_COUNT_GT_ONE:
-                return NAVIGATION_DIAGNOSTIC_POST_EMS_MULTIPLE_FRAMES, post
+                return NAVIGATION_DIAGNOSTIC_POST_EMS_WINDOW_EXHAUSTED, post
+            try:
+                self._navigation_freshness(
+                    page, expected_origin, deadline, post_ems=True
+                )
+            except _NavigationDeadlineExhausted:
+                return NAVIGATION_DIAGNOSTIC_POST_EMS_WINDOW_EXHAUSTED, post
+            except _NavigationFreshnessChanged as exc:
+                post["context_pages"] = exc.page_count
+                post["bound_page_frames"] = exc.frame_count
+                return exc.result, post
             current_url = self._current_url(page)
             if current_url is None:
                 return NAVIGATION_DIAGNOSTIC_POST_EMS_OBSERVATION_UNREADABLE, unobserved_navigation_post_ems()
@@ -1834,36 +2082,67 @@ class PlaywrightPortal:
                 return NAVIGATION_DIAGNOSTIC_POST_EMS_OBSERVATION_UNREADABLE, unobserved_navigation_post_ems()
             if same_origin is False:
                 return NAVIGATION_DIAGNOSTIC_POST_EMS_CROSS_ORIGIN, post
+            remaining_ms = self._navigation_remaining_ms(deadline)
+            if remaining_ms <= 0:
+                return NAVIGATION_DIAGNOSTIC_POST_EMS_WINDOW_EXHAUSTED, post
             try:
                 route_proven = bool(
                     self._eb_bill_route_proven(
                         page,
-                        max(1, int((deadline - time.monotonic()) * 1000)),
+                        remaining_ms,
                     )
                 )
             except Exception as exc:
-                raise _NavigationObservationUnreadable from exc
+                return NAVIGATION_DIAGNOSTIC_POST_EMS_OBSERVATION_UNREADABLE, unobserved_navigation_post_ems()
             post["eb_bill_route_proven"] = route_proven
             try:
-                controls = {
-                    key: self._observe_navigation_control(
-                        page, role, name, MAX_PORTAL_PROBE_TIMEOUT_MS
+                self._navigation_freshness(
+                    page, expected_origin, deadline, post_ems=True
+                )
+            except _NavigationDeadlineExhausted:
+                return NAVIGATION_DIAGNOSTIC_POST_EMS_WINDOW_EXHAUSTED, post
+            except _NavigationFreshnessChanged as exc:
+                post["context_pages"] = exc.page_count
+                post["bound_page_frames"] = exc.frame_count
+                return exc.result, post
+            if route_proven:
+                try:
+                    self._navigation_freshness(
+                        page, expected_origin, deadline, post_ems=True
                     )
-                    for role, name, key in NAVIGATION_DIAGNOSTIC_CONTROL_SPECS
-                }
+                except _NavigationDeadlineExhausted:
+                    return NAVIGATION_DIAGNOSTIC_POST_EMS_WINDOW_EXHAUSTED, post
+                except _NavigationFreshnessChanged as exc:
+                    post["context_pages"] = exc.page_count
+                    post["bound_page_frames"] = exc.frame_count
+                    return exc.result, post
+                return NAVIGATION_DIAGNOSTIC_POST_EMS_EB_BILL_ROUTE_PROVEN, post
+            controls = post["controls"]
+            try:
+                for role, name, key in NAVIGATION_DIAGNOSTIC_CONTROL_SPECS:
+                    observation = self._observe_navigation_control(
+                        page, role, name, deadline, expected_origin
+                    )
+                    controls[key] = observation
+                    if self._navigation_control_ready(observation):
+                        self._navigation_freshness(
+                            page, expected_origin, deadline, post_ems=True
+                        )
+                        result_by_key = {
+                            "link_billing_manager": NAVIGATION_DIAGNOSTIC_POST_EMS_BILLING_MANAGER_LINK_READY,
+                            "button_billing_manager": NAVIGATION_DIAGNOSTIC_POST_EMS_BILLING_MANAGER_BUTTON_READY,
+                            "link_eb_bill": NAVIGATION_DIAGNOSTIC_POST_EMS_EB_BILL_LINK_READY,
+                            "button_eb_bill": NAVIGATION_DIAGNOSTIC_POST_EMS_EB_BILL_BUTTON_READY,
+                        }
+                        return result_by_key[key], post
+            except _NavigationDeadlineExhausted:
+                return NAVIGATION_DIAGNOSTIC_POST_EMS_WINDOW_EXHAUSTED, post
+            except _NavigationFreshnessChanged as exc:
+                post["context_pages"] = exc.page_count
+                post["bound_page_frames"] = exc.frame_count
+                return exc.result, post
             except _NavigationObservationUnreadable:
                 return NAVIGATION_DIAGNOSTIC_POST_EMS_OBSERVATION_UNREADABLE, unobserved_navigation_post_ems()
-            post["controls"] = controls
-            if route_proven:
-                return NAVIGATION_DIAGNOSTIC_POST_EMS_EB_BILL_ROUTE_PROVEN, post
-            if self._navigation_control_ready(controls["link_billing_manager"]):
-                return NAVIGATION_DIAGNOSTIC_POST_EMS_BILLING_MANAGER_LINK_READY, post
-            if self._navigation_control_ready(controls["button_billing_manager"]):
-                return NAVIGATION_DIAGNOSTIC_POST_EMS_BILLING_MANAGER_BUTTON_READY, post
-            if self._navigation_control_ready(controls["link_eb_bill"]):
-                return NAVIGATION_DIAGNOSTIC_POST_EMS_EB_BILL_LINK_READY, post
-            if self._navigation_control_ready(controls["button_eb_bill"]):
-                return NAVIGATION_DIAGNOSTIC_POST_EMS_EB_BILL_BUTTON_READY, post
         return NAVIGATION_DIAGNOSTIC_POST_EMS_WINDOW_EXHAUSTED, post
 
     # ---- inventory ---- #

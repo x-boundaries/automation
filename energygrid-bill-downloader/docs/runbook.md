@@ -186,6 +186,22 @@ login-diagnostic` allowlist. It is an offline/controlled evidence tool only;
 this implementation does not authorize a live portal session, production run,
 retry, selector correction, deployment, or Scheduler action.
 
+### Future live-session diagnostic authority boundary
+
+Any future live diagnostic requires a separate Web authority binding all of the
+following before the process starts: the exact reviewed Repair-1 H/T/base (or
+the exact merged authority), the exact reviewed diagnostic command, and exactly
+one OS process/session. That authority is consumed at process start regardless
+of success/failure/crash/interruption/configuration failure. One authority
+permits at most one EMS dispatch, zero Billing Manager dispatches, zero EB Bill
+dispatches, zero production `run` actions, and zero Scheduler action.
+
+Evidence is limited to the fixed diagnostic schema. Do not collect or publish
+screenshots, traces, HAR files, storage-state exports, raw URLs, portal text,
+customer/private evidence, or any automatic retry under the same authority.
+This documentation boundary grants no live authority; a later live session
+must bind a new reviewed authority explicitly.
+
 ## Controlled first validation
 
 Before unattended scheduling, the owner must separately approve and perform the

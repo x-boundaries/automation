@@ -479,20 +479,24 @@ _NAVIGATION_SUPPORT_REFERENCE_PATTERN = re.compile(r"\A[A-Z][A-Z0-9_]{0,63}\Z")
 def _valid_navigation_count(value: Any, *, allow_none: bool = True) -> bool:
     if value is None:
         return allow_none
-    if isinstance(value, bool):
-        return False
-    return value in _NAVIGATION_DOCUMENT_COUNT_VALUES
+    if type(value) is int:
+        return value in (0, 1)
+    return type(value) is str and value == ">1"
 
 
 def _valid_navigation_boolean(value: Any) -> bool:
-    return isinstance(value, bool)
+    return type(value) is bool
 
 
 def _valid_navigation_control(value: Any, role: str, name: str) -> bool:
-    if not isinstance(value, dict):
+    if type(value) is not dict:
         return False
     expected = {"role", "name", "count", "visible", "enabled", "trial_actionable"}
-    if set(value) != expected or value["role"] != role or value["name"] != name:
+    if set(value) != expected:
+        return False
+    if type(value["role"]) is not str or value["role"] != role:
+        return False
+    if type(value["name"]) is not str or value["name"] != name:
         return False
     count = value["count"]
     if not _valid_navigation_count(count):
@@ -501,12 +505,12 @@ def _valid_navigation_control(value: Any, role: str, name: str) -> bool:
     if count is None or count == ">1":
         return all(item is None for item in remaining)
     if count == 0:
-        return remaining == (False, False, False)
+        return all(_valid_navigation_boolean(item) and item is False for item in remaining)
     return all(_valid_navigation_boolean(item) for item in remaining)
 
 
 def _valid_navigation_pre_ems(value: Any) -> bool:
-    if not isinstance(value, dict) or set(value) != {
+    if type(value) is not dict or set(value) != {
         "context_pages",
         "bound_page_frames",
         "ems",
@@ -520,7 +524,7 @@ def _valid_navigation_pre_ems(value: Any) -> bool:
 
 
 def _valid_navigation_post_ems(value: Any) -> bool:
-    if not isinstance(value, dict) or set(value) != {
+    if type(value) is not dict or set(value) != {
         "context_pages",
         "bound_page_frames",
         "route_changed",
@@ -544,7 +548,7 @@ def _valid_navigation_post_ems(value: Any) -> bool:
     ):
         return False
     controls = value["controls"]
-    if not isinstance(controls, dict):
+    if type(controls) is not dict:
         return False
     expected_controls = {
         key: (role, name) for role, name, key in NAVIGATION_DIAGNOSTIC_CONTROL_SPECS
@@ -558,53 +562,57 @@ def _valid_navigation_post_ems(value: Any) -> bool:
 
 
 def _valid_navigation_document(document: Any) -> bool:
-    if not isinstance(document, dict):
-        return False
-    keys = set(document)
-    if keys != set(_NAVIGATION_DOCUMENT_BASE_KEYS) and keys != (
-        set(_NAVIGATION_DOCUMENT_BASE_KEYS) | {"support_ref"}
-    ):
-        return False
-    if document.get("schema") != NAVIGATION_DIAGNOSTIC_SCHEMA:
-        return False
-    status = document.get("status")
-    result = document.get("result")
-    if status not in _NAVIGATION_DOCUMENT_STATUSES:
-        return False
-    if not isinstance(result, str) or result not in NAVIGATION_DIAGNOSTIC_RESULT_IDENTIFIERS:
-        return False
-    if not all(
-        _valid_navigation_boolean(document.get(key))
-        for key in (
-            "authentication_proven",
-            "ems_dispatch_attempted",
-            "ems_dispatch_uncertain",
-        )
-    ):
-        return False
-    if not _valid_navigation_pre_ems(document.get("pre_ems")):
-        return False
-    if not _valid_navigation_post_ems(document.get("post_ems")):
-        return False
-    if "support_ref" in document:
-        support_ref = document["support_ref"]
-        if not isinstance(support_ref, str) or not _NAVIGATION_SUPPORT_REFERENCE_PATTERN.fullmatch(
-            support_ref
+    try:
+        if type(document) is not dict:
+            return False
+        keys = set(document)
+        if keys != set(_NAVIGATION_DOCUMENT_BASE_KEYS) and keys != (
+            set(_NAVIGATION_DOCUMENT_BASE_KEYS) | {"support_ref"}
         ):
             return False
-        if support_ref not in NAVIGATION_DIAGNOSTIC_ALLOWED_SUPPORT_REFS:
+        schema = document.get("schema")
+        if type(schema) is not str or schema != NAVIGATION_DIAGNOSTIC_SCHEMA:
             return False
-    if status == NAVIGATION_DIAGNOSTIC_COMPLETE_STATE:
-        return (
-            result in NAVIGATION_DIAGNOSTIC_COMPLETE_RESULTS
-            and document["authentication_proven"] is True
-            and document["ems_dispatch_attempted"] is True
-            and document["ems_dispatch_uncertain"] is False
-            and "support_ref" not in document
-        )
-    if result in NAVIGATION_DIAGNOSTIC_COMPLETE_RESULTS:
+        status = document.get("status")
+        result = document.get("result")
+        if type(status) is not str or status not in _NAVIGATION_DOCUMENT_STATUSES:
+            return False
+        if type(result) is not str or result not in NAVIGATION_DIAGNOSTIC_RESULT_IDENTIFIERS:
+            return False
+        if not all(
+            _valid_navigation_boolean(document.get(key))
+            for key in (
+                "authentication_proven",
+                "ems_dispatch_attempted",
+                "ems_dispatch_uncertain",
+            )
+        ):
+            return False
+        if not _valid_navigation_pre_ems(document.get("pre_ems")):
+            return False
+        if not _valid_navigation_post_ems(document.get("post_ems")):
+            return False
+        if "support_ref" in document:
+            support_ref = document["support_ref"]
+            if type(support_ref) is not str or not _NAVIGATION_SUPPORT_REFERENCE_PATTERN.fullmatch(
+                support_ref
+            ):
+                return False
+            if support_ref not in NAVIGATION_DIAGNOSTIC_ALLOWED_SUPPORT_REFS:
+                return False
+        if status == NAVIGATION_DIAGNOSTIC_COMPLETE_STATE:
+            return (
+                result in NAVIGATION_DIAGNOSTIC_COMPLETE_RESULTS
+                and document["authentication_proven"] is True
+                and document["ems_dispatch_attempted"] is True
+                and document["ems_dispatch_uncertain"] is False
+                and "support_ref" not in document
+            )
+        if result in NAVIGATION_DIAGNOSTIC_COMPLETE_RESULTS:
+            return False
+        return "support_ref" in document
+    except Exception:
         return False
-    return "support_ref" in document
 
 
 def _unobserved_navigation_document(
@@ -636,34 +644,45 @@ def navigation_diagnostic_document(
     or future portal value can never carry private text into the fallback.
     """
 
-    if not isinstance(result, NavigationDiagnosticResult):
-        return _unobserved_navigation_document()
-    if result.result == NAVIGATION_DIAGNOSTIC_OUTPUT_REJECTED:
-        return _unobserved_navigation_document()
-    if support_ref is None:
-        if isinstance(result.failure, AppError):
-            support_ref = support_ref_for(result.failure)
-        elif result.status != NAVIGATION_DIAGNOSTIC_COMPLETE_STATE:
-            support_ref = DIAGNOSTIC_UNCLASSIFIED_SUPPORT_REF
-    document: dict[str, Any] = {
-        "schema": NAVIGATION_DIAGNOSTIC_SCHEMA,
-        "status": result.status,
-        "result": result.result,
-        "authentication_proven": result.authentication_proven,
-        "ems_dispatch_attempted": result.ems_dispatch_attempted,
-        "ems_dispatch_uncertain": result.ems_dispatch_uncertain,
-        "pre_ems": result.pre_ems,
-        "post_ems": result.post_ems,
-    }
-    if support_ref is not None:
-        document["support_ref"] = support_ref
-    if _valid_navigation_document(document):
-        return document
+    try:
+        if type(result) is not NavigationDiagnosticResult:
+            return _unobserved_navigation_document()
+        if type(result.result) is str and result.result == NAVIGATION_DIAGNOSTIC_OUTPUT_REJECTED:
+            return _unobserved_navigation_document()
+        resolved_support_ref = support_ref
+        if resolved_support_ref is None:
+            if isinstance(result.failure, AppError):
+                resolved_support_ref = support_ref_for(result.failure)
+            elif result.status != NAVIGATION_DIAGNOSTIC_COMPLETE_STATE:
+                resolved_support_ref = DIAGNOSTIC_UNCLASSIFIED_SUPPORT_REF
+        document: dict[str, Any] = {
+            "schema": NAVIGATION_DIAGNOSTIC_SCHEMA,
+            "status": result.status,
+            "result": result.result,
+            "authentication_proven": result.authentication_proven,
+            "ems_dispatch_attempted": result.ems_dispatch_attempted,
+            "ems_dispatch_uncertain": result.ems_dispatch_uncertain,
+            "pre_ems": result.pre_ems,
+            "post_ems": result.post_ems,
+        }
+        if resolved_support_ref is not None:
+            document["support_ref"] = resolved_support_ref
+        if _valid_navigation_document(document):
+            return document
+    except Exception:
+        pass
     return _unobserved_navigation_document()
 
 
 def emit_navigation_diagnostic(document: dict[str, Any]) -> None:
-    print(json.dumps(document, sort_keys=True))
+    try:
+        safe_document = (
+            document if _valid_navigation_document(document) else _unobserved_navigation_document()
+        )
+        encoded = json.dumps(safe_document, sort_keys=True)
+    except Exception:
+        encoded = json.dumps(_unobserved_navigation_document(), sort_keys=True)
+    print(encoded)
 
 
 def run_navigation_diagnostic(config_path: Path) -> int:

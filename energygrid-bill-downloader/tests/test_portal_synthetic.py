@@ -6047,12 +6047,16 @@ class NavigationDiagnosticLocator:
     def is_visible(self, timeout: int | None = None) -> bool:
         if self.state.visible_error is not None:
             raise self.state.visible_error
+        if self.key == "button:EMS" and self.page.ems_readiness_change:
+            self.page.apply_topology_change(self.page.ems_readiness_change)
         return self.state.visible
 
     def is_enabled(self, timeout: int | None = None) -> bool:
         self.page.probe_timeouts.append(timeout)
         if self.state.enabled_error is not None:
             raise self.state.enabled_error
+        if self.page.ems_dispatches and self.page.post_probe_change:
+            self.page.apply_topology_change(self.page.post_probe_change)
         return self.state.enabled
 
     def click(self, trial: bool = False, timeout: int | None = None) -> None:
@@ -6064,6 +6068,8 @@ class NavigationDiagnosticLocator:
             if not self.state.actionable:
                 self.page.clock.charge_probe(timeout)
                 raise synthetic_timeout()
+            if self.key == "button:EMS" and self.page.ems_boundary_change:
+                self.page.apply_topology_change(self.page.ems_boundary_change)
             return
         self.page.normal_clicks[self.key] = self.page.normal_clicks.get(self.key, 0) + 1
         if self.key == "button:EMS":
@@ -6105,6 +6111,10 @@ class NavigationDiagnosticPage:
         pre_frames: int = 1,
         post_frames: int = 1,
         ems_inert: bool = False,
+        ems_readiness_change: str | None = None,
+        ems_boundary_change: str | None = None,
+        post_checkpoint_change: str | None = None,
+        post_probe_change: str | None = None,
     ) -> None:
         self.clock = clock
         self.ems_state = ems_state or navigation_ready()
@@ -6115,6 +6125,13 @@ class NavigationDiagnosticPage:
         self.pre_frames = pre_frames
         self.post_frames = post_frames
         self.ems_inert = ems_inert
+        self.ems_readiness_change = ems_readiness_change
+        self.ems_boundary_change = ems_boundary_change
+        self.post_checkpoint_change = post_checkpoint_change
+        self.post_probe_change = post_probe_change
+        self._topology_change: str | None = None
+        self._post_checkpoint_changed = False
+        self._post_probe_changed = False
         self.ems_dispatches = 0
         self.normal_clicks: dict[str, int] = {}
         self.trial_clicks: dict[str, int] = {}
@@ -6127,11 +6144,15 @@ class NavigationDiagnosticPage:
 
     def context_pages(self) -> list[object]:
         count = self.post_context_pages if self.ems_dispatches else self.pre_context_pages
+        if self._topology_change == "page":
+            count = 2
         return [self] + [object() for _ in range(max(0, count - 1))]
 
     @property
     def frames(self) -> list[object]:
         count = self.post_frames if self.ems_dispatches else self.pre_frames
+        if self._topology_change == "frame":
+            count = 2
         return [object() for _ in range(max(0, count))]
 
     @property
@@ -6141,6 +6162,22 @@ class NavigationDiagnosticPage:
     def wait_for_timeout(self, milliseconds: int) -> None:
         self.waits.append(milliseconds)
         self.clock.charge_yield(milliseconds)
+        if (
+            self.ems_dispatches
+            and self.post_checkpoint_change
+            and not self._post_checkpoint_changed
+        ):
+            self._post_checkpoint_changed = True
+            self.apply_topology_change(self.post_checkpoint_change)
+
+    def apply_topology_change(self, change: str) -> None:
+        if change in {"page", "frame"}:
+            self._topology_change = change
+            return
+        if change == "origin":
+            self._url = "https://other.invalid/changed"
+            return
+        raise AssertionError(change)
 
     def goto(self, *_args, **_kwargs) -> None:
         self.goto_calls += 1
@@ -6334,6 +6371,81 @@ class NavigationDiagnosticStateMachineTests(unittest.TestCase):
         body = source[source.index("def navigation_diagnostic") : source.index("# ---- inventory ----")]
         for forbidden in ("_open_verified_results", "_open_eb_bill_route", "_dispatch_billing_manager", "_dispatch_eb_bill", ".first", "get_by_text", "reload"):
             self.assertNotIn(forbidden, body)
+
+
+class NavigationDiagnosticRepair1StateMachineTests(unittest.TestCase):
+    def run_navigation(self, **kwargs):
+        portal, page, clock = navigation_portal(**kwargs)
+        with simulated_clock(clock):
+            result = portal.navigation_diagnostic()
+        return result, portal, page, clock
+
+    def test_second_page_during_ems_readiness_prevents_dispatch(self) -> None:
+        result, _portal, page, _clock = self.run_navigation(
+            ems_readiness_change="page"
+        )
+        self.assertEqual(result.result, portal_module.NAVIGATION_DIAGNOSTIC_PRE_EMS_MULTIPLE_PAGES)
+        self.assertEqual(page.ems_dispatches, 0)
+        self.assertEqual(page.normal_clicks, {})
+
+    def test_extra_frame_during_ems_readiness_prevents_dispatch(self) -> None:
+        result, _portal, page, _clock = self.run_navigation(
+            ems_readiness_change="frame"
+        )
+        self.assertEqual(result.result, portal_module.NAVIGATION_DIAGNOSTIC_PRE_EMS_MULTIPLE_FRAMES)
+        self.assertEqual(page.ems_dispatches, 0)
+        self.assertEqual(page.normal_clicks, {})
+
+    def test_topology_change_at_ems_action_boundary_prevents_dispatch(self) -> None:
+        result, _portal, page, _clock = self.run_navigation(
+            ems_boundary_change="page"
+        )
+        self.assertEqual(result.result, portal_module.NAVIGATION_DIAGNOSTIC_PRE_EMS_MULTIPLE_PAGES)
+        self.assertEqual(page.ems_dispatches, 0)
+        self.assertEqual(page.normal_clicks, {})
+
+    def test_origin_change_at_ems_action_boundary_prevents_dispatch(self) -> None:
+        result, _portal, page, _clock = self.run_navigation(
+            ems_boundary_change="origin"
+        )
+        self.assertEqual(result.result, portal_module.NAVIGATION_DIAGNOSTIC_EMS_NOT_READY)
+        self.assertEqual(page.ems_dispatches, 0)
+        self.assertEqual(page.normal_clicks, {})
+
+    def test_change_between_post_checkpoints_stops_later_probes(self) -> None:
+        result, _portal, page, _clock = self.run_navigation(
+            post_checkpoint_change="origin"
+        )
+        self.assertEqual(result.result, portal_module.NAVIGATION_DIAGNOSTIC_POST_EMS_CROSS_ORIGIN)
+        self.assertEqual(page.normal_clicks, {"button:EMS": 1})
+        self.assertEqual(page.waits, [250])
+
+    def test_change_during_waiting_probe_invalidates_positive_evidence(self) -> None:
+        result, _portal, page, _clock = self.run_navigation(
+            post_controls={"link_billing_manager": navigation_ready()},
+            post_probe_change="page",
+        )
+        self.assertEqual(result.result, portal_module.NAVIGATION_DIAGNOSTIC_POST_EMS_MULTIPLE_PAGES)
+        self.assertEqual(page.normal_clicks, {"button:EMS": 1})
+        self.assertEqual(page.trial_clicks.get("link:Billing Manager", 0), 0)
+
+    def test_one_shared_deadline_clips_probes_and_never_starts_after_exhaustion(self) -> None:
+        result, _portal, page, clock = self.run_navigation(
+            post_controls={
+                "link_billing_manager": navigation_absent(
+                    matches=1, visible=True, enabled=True, actionable=False
+                )
+            }
+        )
+        self.assertEqual(result.result, portal_module.NAVIGATION_DIAGNOSTIC_POST_EMS_WINDOW_EXHAUSTED)
+        self.assertEqual(page.normal_clicks, {"button:EMS": 1})
+        self.assertEqual(clock.elapsed_ms(), 46_000)
+        self.assertLess(clock.elapsed_ms(), 60_000)
+        self.assertTrue(page.probe_timeouts)
+        self.assertLessEqual(
+            max(timeout for timeout in page.probe_timeouts if timeout is not None),
+            1000,
+        )
 
 
 class NavigationDiagnosticPrivacyTests(unittest.TestCase):

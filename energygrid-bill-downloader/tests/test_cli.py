@@ -1669,5 +1669,145 @@ class NavigationDiagnosticCliTests(unittest.TestCase):
         self.assertNotEqual(exit_code, 10)
 
 
+class NavigationDiagnosticRepair1OutputValidationTests(NavigationDiagnosticCliTests):
+    @staticmethod
+    def valid_document() -> dict:
+        return cli.navigation_diagnostic_document(navigation_complete_result())
+
+    @staticmethod
+    def malformed_result(**overrides) -> portal_module.NavigationDiagnosticResult:
+        valid = navigation_complete_result()
+        values = {
+            "result": valid.result,
+            "status": valid.status,
+            "authentication_proven": valid.authentication_proven,
+            "ems_dispatch_attempted": valid.ems_dispatch_attempted,
+            "ems_dispatch_uncertain": valid.ems_dispatch_uncertain,
+            "pre_ems": valid.pre_ems,
+            "post_ems": valid.post_ems,
+            "failure": valid.failure,
+        }
+        values.update(overrides)
+        return portal_module.NavigationDiagnosticResult(**values)
+
+    def assert_rejected_output(self, result: portal_module.NavigationDiagnosticResult) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            exit_code, out, err = self.run_navigation(
+                Path(name), navigation_diagnostic_portal(result)
+            )
+        document = self.document(out)
+        self.assertEqual(exit_code, 20)
+        self.assertEqual(err, "")
+        self.assertEqual(document["schema"], cli.NAVIGATION_DIAGNOSTIC_SCHEMA)
+        self.assertEqual(document["status"], "ACTION_REQUIRED")
+        self.assertEqual(document["result"], portal_module.NAVIGATION_DIAGNOSTIC_OUTPUT_REJECTED)
+        self.assertEqual(document["support_ref"], "EG_NAV_DIAGNOSTIC_OUTPUT_REJECTED")
+        self.assertEqual(document["authentication_proven"], False)
+        self.assertEqual(document["ems_dispatch_attempted"], False)
+        self.assertEqual(document["ems_dispatch_uncertain"], False)
+        self.assertEqual(document["pre_ems"], portal_module.unobserved_navigation_pre_ems())
+        self.assertEqual(document["post_ems"], portal_module.unobserved_navigation_post_ems())
+
+    def test_count_contract_rejects_list_dict_float_and_string_impostors(self) -> None:
+        for value in ([], {}, 1.0, "1"):
+            with self.subTest(value=repr(value)):
+                document = self.valid_document()
+                document["pre_ems"]["context_pages"] = value
+                self.assertFalse(cli._valid_navigation_document(document))
+                self.assert_rejected_output(
+                    self.malformed_result(
+                        pre_ems=document["pre_ems"], post_ems=document["post_ems"]
+                    )
+                )
+
+    def test_boolean_contract_rejects_numeric_float_string_list_dict_and_custom_values(self) -> None:
+        class Truthy:
+            def __bool__(self):
+                return True
+
+        for value in (0, 1, 0.0, 1.0, "true", [], {}, Truthy()):
+            with self.subTest(value=repr(value)):
+                self.assertFalse(cli._valid_navigation_boolean(value))
+                self.assert_rejected_output(
+                    self.malformed_result(authentication_proven=value)
+                )
+
+    def test_exact_booleans_and_valid_nested_document_remain_accepted(self) -> None:
+        document = self.valid_document()
+        self.assertTrue(cli._valid_navigation_document(document))
+        self.assertTrue(cli._valid_navigation_boolean(True))
+        self.assertTrue(cli._valid_navigation_boolean(False))
+        self.assertEqual(cli.navigation_diagnostic_document(navigation_complete_result()), document)
+
+    def test_wrong_containers_missing_keys_unexpected_keys_and_bad_support_refs_reject(self) -> None:
+        wrong_outer = self.valid_document()
+        wrong_outer["post_ems"] = []
+        self.assertFalse(cli._valid_navigation_document(wrong_outer))
+
+        missing = self.valid_document()
+        del missing["pre_ems"]["ems"]
+        self.assertFalse(cli._valid_navigation_document(missing))
+
+        unexpected = self.valid_document()
+        unexpected["post_ems"]["unexpected"] = False
+        self.assertFalse(cli._valid_navigation_document(unexpected))
+
+        for support_ref in ("bad-ref", "EG_NAV_DIAGNOSTIC_NOT_ALLOWED", 1, [], {}):
+            with self.subTest(support_ref=repr(support_ref)):
+                action_required = self.valid_document()
+                action_required["status"] = "ACTION_REQUIRED"
+                action_required["result"] = portal_module.NAVIGATION_DIAGNOSTIC_EMS_NOT_READY
+                action_required["support_ref"] = support_ref
+                self.assertFalse(cli._valid_navigation_document(action_required))
+
+        class RogueDict(dict):
+            pass
+
+        self.assertFalse(cli._valid_navigation_document(RogueDict(self.valid_document())))
+
+    def test_validator_is_total_for_malformed_result_fields(self) -> None:
+        class Hostile:
+            def __eq__(self, _other):
+                raise RuntimeError("private malformed value")
+
+        result = self.malformed_result(result=Hostile(), pre_ems=Hostile())
+        document = cli.navigation_diagnostic_document(result)
+        self.assertEqual(document["result"], portal_module.NAVIGATION_DIAGNOSTIC_OUTPUT_REJECTED)
+        self.assertTrue(cli._valid_navigation_document(document))
+
+
+class NavigationDiagnosticRunbookTests(unittest.TestCase):
+    def test_future_live_authority_boundary_covers_every_invariant(self) -> None:
+        runbook = (Path(__file__).parents[1] / "docs" / "runbook.md").read_text(
+            encoding="utf-8"
+        )
+        runbook = " ".join(runbook.split())
+        required = (
+            "exact reviewed Repair-1 H/T/base",
+            "exact merged authority",
+            "exact reviewed diagnostic command",
+            "exactly one OS process/session",
+            "success/failure/crash/interruption/configuration failure",
+            "at most one EMS dispatch",
+            "zero Billing Manager",
+            "zero EB Bill",
+            "zero production `run`",
+            "zero Scheduler action",
+            "fixed diagnostic schema",
+            "screenshots",
+            "traces",
+            "HAR files",
+            "storage-state exports",
+            "raw URLs",
+            "portal text",
+            "customer/private evidence",
+            "automatic retry under the same authority",
+            "grants no live authority",
+        )
+        for phrase in required:
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, runbook)
+
+
 if __name__ == "__main__":
     unittest.main()
