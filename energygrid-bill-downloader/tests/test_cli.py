@@ -866,13 +866,16 @@ class LoginDiagnosticCliTests(unittest.TestCase):
                 )
                 self.assertTrue(args.headed)
 
-    def test_the_command_allowlist_is_exactly_the_three_admitted_operations(self) -> None:
+    def test_the_command_allowlist_keeps_existing_operations_and_adds_the_direct_diagnostic(self) -> None:
         actions = [
             action
             for action in build_parser()._subparsers._group_actions
             if hasattr(action, "choices")
         ]
-        self.assertEqual(list(actions[0].choices), ["run", "list", "login-diagnostic"])
+        self.assertEqual(
+            list(actions[0].choices),
+            ["run", "list", "login-diagnostic", "navigation-diagnostic"],
+        )
 
     # ---- the run itself ---- #
 
@@ -1359,6 +1362,311 @@ class LoginDiagnosticCliTests(unittest.TestCase):
         self.assertTrue(reference.isascii())
         self.assertNotIn(reference, cli.SUPPORT_REFS_BY_MESSAGE.values())
         self.assertNotIn(reference, cli.RETIRED_SUPPORT_REFS)
+
+
+def navigation_document_control(
+    role: str,
+    name: str,
+    *,
+    count: int | str | None = 0,
+    visible: bool | None = False,
+    enabled: bool | None = False,
+    trial_actionable: bool | None = False,
+) -> dict:
+    return {
+        "role": role,
+        "name": name,
+        "count": count,
+        "visible": visible,
+        "enabled": enabled,
+        "trial_actionable": trial_actionable,
+    }
+
+
+def navigation_document_pre_ems() -> dict:
+    return {
+        "context_pages": 1,
+        "bound_page_frames": 1,
+        "ems": navigation_document_control(
+            "button", "EMS", count=1, visible=True, enabled=True, trial_actionable=True
+        ),
+    }
+
+
+def navigation_document_post_ems() -> dict:
+    controls = {
+        key: navigation_document_control(role, name)
+        for role, name, key in portal_module.NAVIGATION_DIAGNOSTIC_CONTROL_SPECS
+    }
+    controls["link_billing_manager"] = navigation_document_control(
+        "link", "Billing Manager", count=1, visible=True, enabled=True, trial_actionable=True
+    )
+    return {
+        "context_pages": 1,
+        "bound_page_frames": 1,
+        "route_changed": True,
+        "same_origin": True,
+        "eb_bill_route_proven": False,
+        "controls": controls,
+    }
+
+
+def navigation_complete_result(
+    result: str = portal_module.NAVIGATION_DIAGNOSTIC_POST_EMS_BILLING_MANAGER_LINK_READY,
+) -> portal_module.NavigationDiagnosticResult:
+    return portal_module.NavigationDiagnosticResult(
+        result=result,
+        status=portal_module.NAVIGATION_DIAGNOSTIC_COMPLETE_STATE,
+        authentication_proven=True,
+        ems_dispatch_attempted=True,
+        ems_dispatch_uncertain=False,
+        pre_ems=navigation_document_pre_ems(),
+        post_ems=navigation_document_post_ems(),
+    )
+
+
+def navigation_diagnostic_portal(
+    result: portal_module.NavigationDiagnosticResult | None = None,
+    error: BaseException | None = None,
+    recorder: list[bool] | None = None,
+):
+    class StubNavigationDiagnosticPortal:
+        def __init__(self, config, headed: bool = False) -> None:
+            self.config = config
+            if recorder is not None:
+                recorder.append(headed)
+
+        def __enter__(self) -> "StubNavigationDiagnosticPortal":
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        def navigation_diagnostic(self):
+            if error is not None:
+                raise error
+            return result
+
+        def login(self) -> None:
+            raise AssertionError("CLI must call the diagnostic handler, not login directly")
+
+        def inventory(self, *_args, **_kwargs):
+            raise AssertionError("navigation diagnostic reached inventory")
+
+        def download(self, *_args, **_kwargs):
+            raise AssertionError("navigation diagnostic reached download")
+
+    return StubNavigationDiagnosticPortal
+
+
+class NavigationDiagnosticCliTests(unittest.TestCase):
+    def write_config(self, root: Path) -> Path:
+        (root / "archive").mkdir()
+        config_path = root / "config.json"
+        config_path.write_text(
+            json.dumps(
+                {
+                    "portal_url": "http://127.0.0.1:1/synthetic",
+                    "account_identity": "SYNTHETIC-INTENDED-ACCOUNT",
+                    "archive_root": str(root / "archive"),
+                    "state_path": str(root / "state" / "state.sqlite3"),
+                    "temp_root": str(root / "temp"),
+                    "log_root": str(root / "logs"),
+                    "timeout_seconds": 5,
+                    "max_attempts": 2,
+                    "inventory_safety_ceiling": 50,
+                }
+            ),
+            encoding="utf-8",
+        )
+        return config_path
+
+    def run_navigation(self, root: Path, portal_cls, config_path: Path | None = None):
+        config_path = config_path or self.write_config(root)
+        original = cli.PlaywrightPortal
+        cli.PlaywrightPortal = portal_cls
+        out = io.StringIO()
+        err = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                exit_code = main(["navigation-diagnostic", "--config", str(config_path)])
+        finally:
+            cli.PlaywrightPortal = original
+        return exit_code, out.getvalue(), err.getvalue()
+
+    @staticmethod
+    def document(output: str) -> dict:
+        lines = output.strip().splitlines()
+        if len(lines) != 1:
+            raise AssertionError(f"expected one JSON document, got {len(lines)}")
+        return json.loads(lines[0])
+
+    def test_the_new_command_accepts_only_config_and_is_fixed_headed(self) -> None:
+        args = build_parser().parse_args(
+            ["navigation-diagnostic", "--config", "C:/private/eg.json"]
+        )
+        self.assertEqual(vars(args).keys(), {"command", "config"})
+        for extra in (
+            ["--headed"],
+            ["--archive-root", "C:/private/archive"],
+            ["--timeout-seconds", "9"],
+            ["extra-positional"],
+        ):
+            with self.subTest(extra=extra):
+                with self.assertRaises(ConfigError):
+                    build_parser().parse_args(
+                        ["navigation-diagnostic", "--config", "C:/private/eg.json", *extra]
+                    )
+        recorder: list[bool] = []
+        with tempfile.TemporaryDirectory() as name:
+            exit_code, _out, _err = self.run_navigation(
+                Path(name), navigation_diagnostic_portal(navigation_complete_result(), recorder=recorder)
+            )
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(recorder, [True])
+
+    def test_the_early_branch_never_runs_production_preflight_or_state_machinery(self) -> None:
+        def explode(*_args, **_kwargs):
+            raise AssertionError("navigation diagnostic reached production run machinery")
+
+        with tempfile.TemporaryDirectory() as name:
+            with mock.patch.object(cli, "SafeLogger", explode), \
+                    mock.patch.object(cli, "StateStore", explode), \
+                    mock.patch.object(cli, "cleanup_stale_owned_temp", explode), \
+                    mock.patch.object(cli, "reconcile_inventory", explode), \
+                    mock.patch.object(RuntimeConfig, "preflight", explode):
+                exit_code, out, err = self.run_navigation(
+                    Path(name), navigation_diagnostic_portal(navigation_complete_result())
+                )
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(err, "")
+        self.assertEqual(self.document(out)["status"], "COMPLETE")
+
+    def test_a_complete_document_has_the_fixed_schema_and_exits_zero(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            exit_code, out, err = self.run_navigation(
+                Path(name), navigation_diagnostic_portal(navigation_complete_result())
+            )
+        document = self.document(out)
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(err, "")
+        self.assertEqual(document["schema"], cli.NAVIGATION_DIAGNOSTIC_SCHEMA)
+        self.assertEqual(document["status"], "COMPLETE")
+        self.assertEqual(
+            set(document),
+            {
+                "schema",
+                "status",
+                "result",
+                "authentication_proven",
+                "ems_dispatch_attempted",
+                "ems_dispatch_uncertain",
+                "pre_ems",
+                "post_ems",
+            },
+        )
+        self.assertEqual(
+            document["result"],
+            portal_module.NAVIGATION_DIAGNOSTIC_POST_EMS_BILLING_MANAGER_LINK_READY,
+        )
+
+    def test_uncertain_dispatch_uses_the_existing_bounded_navigation_reference(self) -> None:
+        failed = portal_module.NavigationDiagnosticResult(
+            result=portal_module.NAVIGATION_DIAGNOSTIC_EMS_DISPATCH_UNCERTAIN,
+            status=portal_module.NAVIGATION_DIAGNOSTIC_ACTION_REQUIRED_STATE,
+            authentication_proven=True,
+            ems_dispatch_attempted=True,
+            ems_dispatch_uncertain=True,
+            pre_ems=navigation_document_pre_ems(),
+            post_ems=portal_module.unobserved_navigation_post_ems(),
+            failure=LayoutChangedError(portal_module.NAV_EMS_ENTRY_UNCERTAIN_MESSAGE),
+        )
+        with tempfile.TemporaryDirectory() as name:
+            exit_code, out, _err = self.run_navigation(
+                Path(name), navigation_diagnostic_portal(failed)
+            )
+        document = self.document(out)
+        self.assertEqual(exit_code, 20)
+        self.assertEqual(document["support_ref"], "EG_NAV_EMS_ENTRY_DISPATCH_UNCERTAIN")
+
+    def test_invalid_evidence_is_replaced_by_fully_unobserved_output_rejected(self) -> None:
+        rogue = navigation_complete_result()
+        rogue = portal_module.NavigationDiagnosticResult(
+            result=rogue.result,
+            status=rogue.status,
+            authentication_proven=True,
+            ems_dispatch_attempted=True,
+            ems_dispatch_uncertain=False,
+            pre_ems={"hostile": "password=hunter2 https://evil.invalid"},
+            post_ems=rogue.post_ems,
+        )
+        with tempfile.TemporaryDirectory() as name:
+            exit_code, out, err = self.run_navigation(
+                Path(name), navigation_diagnostic_portal(rogue)
+            )
+        document = self.document(out)
+        self.assertEqual(exit_code, 20)
+        self.assertEqual(err, "")
+        self.assertEqual(document["result"], portal_module.NAVIGATION_DIAGNOSTIC_OUTPUT_REJECTED)
+        self.assertEqual(document["support_ref"], "EG_NAV_DIAGNOSTIC_OUTPUT_REJECTED")
+        self.assertEqual(document["pre_ems"], portal_module.unobserved_navigation_pre_ems())
+        encoded = json.dumps(document, sort_keys=True)
+        self.assertNotIn("hunter2", encoded)
+        self.assertNotIn("evil.invalid", encoded)
+
+    def test_configuration_failure_exits_64_and_emits_one_document(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            missing = root / "missing.json"
+            exit_code, out, err = self.run_navigation(
+                root, navigation_diagnostic_portal(navigation_complete_result()), missing
+            )
+        document = self.document(out)
+        self.assertEqual(exit_code, 64)
+        self.assertEqual(err, "")
+        self.assertEqual(document["result"], portal_module.NAVIGATION_DIAGNOSTIC_CONFIGURATION_FAILED)
+        self.assertEqual(document["status"], "ACTION_REQUIRED")
+        self.assertEqual(document["support_ref"], cli.DIAGNOSTIC_UNCLASSIFIED_SUPPORT_REF)
+
+    def test_recursive_strings_stay_inside_the_closed_public_vocabulary(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            _exit_code, out, _err = self.run_navigation(
+                Path(name), navigation_diagnostic_portal(navigation_complete_result())
+            )
+        document = self.document(out)
+        allowed = {
+            cli.NAVIGATION_DIAGNOSTIC_SCHEMA,
+            "COMPLETE",
+            "ACTION_REQUIRED",
+            ">1",
+            "button",
+            "link",
+            "EMS",
+            "Billing Manager",
+            "EB Bill",
+            *portal_module.NAVIGATION_DIAGNOSTIC_RESULT_IDENTIFIERS,
+            *cli.SUPPORT_REFS_BY_MESSAGE.values(),
+        }
+
+        def check(value) -> None:
+            if isinstance(value, dict):
+                for nested in value.values():
+                    check(nested)
+                return
+            if isinstance(value, str):
+                self.assertIn(value, allowed)
+                return
+            self.assertIsInstance(value, (bool, int, type(None)))
+
+        check(document)
+
+    def test_the_new_command_never_returns_retryable_exit_10(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            exit_code, _out, _err = self.run_navigation(
+                Path(name), navigation_diagnostic_portal(error=DownloadError("private download failure"))
+            )
+        self.assertIn(exit_code, (20, 64))
+        self.assertNotEqual(exit_code, 10)
 
 
 if __name__ == "__main__":

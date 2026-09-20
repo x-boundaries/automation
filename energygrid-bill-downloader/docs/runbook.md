@@ -46,6 +46,7 @@ python -m energygrid_bill_downloader run --config <EXTERNAL_CONFIG_JSON>
 python -m energygrid_bill_downloader list --config <EXTERNAL_CONFIG_JSON>
 python -m energygrid_bill_downloader list --config <EXTERNAL_CONFIG_JSON> --headed
 python -m energygrid_bill_downloader login-diagnostic --config <EXTERNAL_CONFIG_JSON>
+python -m energygrid_bill_downloader navigation-diagnostic --config <EXTERNAL_CONFIG_JSON>
 ```
 
 For `run` and `list` the only supported command-specific options are `--headed`,
@@ -156,6 +157,34 @@ Billing Manager or EB Bill, and can never record any `EG_NAV_` code. Use it to
 tell a credential or landing problem from an application-entry problem: if the
 diagnostic proves the landing but a `run` reports `EG_NAV_EMS_ENTRY_NOT_READY`,
 the credentials are fine and the entry control itself has drifted.
+
+`navigation-diagnostic` is a separate direct-Python, headed-only operation. It
+loads and validates the external config but does not run production preflight,
+create a logger, clean temporary files, open StateStore, reconcile inventory,
+download, publish, or invoke the normal `run` path. It calls the canonical
+`login()` exactly once, requires one context page and one frame, allows one
+exact actionable `button / EMS` click, and then observes only the fixed EMS,
+Billing Manager, and EB Bill role/name pairs. Billing Manager and EB Bill are
+never normally clicked. The operation uses one 60-second monotonic deadline
+with checkpoints at 0, 250, 1000, 5000, 10000, 30000, and 45000 milliseconds;
+each waiting yield is capped at 1000 milliseconds.
+
+Every invocation that reaches the handler emits one
+`energygrid.navigation_diagnostic.v1` JSON document. Its fixed public-safe
+keys are `schema`, `status`, `result`, `authentication_proven`,
+`ems_dispatch_attempted`, `ems_dispatch_uncertain`, `pre_ems`, and `post_ems`;
+an action-required document also carries a bounded `support_ref`. The nested
+evidence contains only capped page/frame and control counts, fixed roles and
+names, visibility/enabled/trial-actionability booleans, route-changed,
+same-origin, and existing EB Bill route-proof booleans. URLs, query strings,
+portal text, customer/account values, exception text, cookies, tokens,
+screenshots, traces, HAR, and storage state are never emitted. Invalid output
+evidence is replaced by a fully unobserved `OUTPUT_REJECTED` document.
+
+The direct diagnostic is not in the runtime launcher's `run | list |
+login-diagnostic` allowlist. It is an offline/controlled evidence tool only;
+this implementation does not authorize a live portal session, production run,
+retry, selector correction, deployment, or Scheduler action.
 
 ## Controlled first validation
 
