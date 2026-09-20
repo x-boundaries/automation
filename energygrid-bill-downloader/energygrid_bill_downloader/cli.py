@@ -469,6 +469,25 @@ _NAVIGATION_DOCUMENT_BASE_KEYS = frozenset(
         "post_ems",
     }
 )
+_NAVIGATION_DOCUMENT_WITH_SUPPORT_KEYS = _NAVIGATION_DOCUMENT_BASE_KEYS | frozenset(
+    {"support_ref"}
+)
+_NAVIGATION_CONTROL_KEYS = frozenset(
+    {"role", "name", "count", "visible", "enabled", "trial_actionable"}
+)
+_NAVIGATION_PRE_EMS_KEYS = frozenset(
+    {"context_pages", "bound_page_frames", "ems"}
+)
+_NAVIGATION_POST_EMS_KEYS = frozenset(
+    {
+        "context_pages",
+        "bound_page_frames",
+        "route_changed",
+        "same_origin",
+        "eb_bill_route_proven",
+        "controls",
+    }
+)
 _NAVIGATION_DOCUMENT_STATUSES = frozenset(
     {NAVIGATION_DIAGNOSTIC_COMPLETE_STATE, NAVIGATION_DIAGNOSTIC_ACTION_REQUIRED_STATE}
 )
@@ -488,11 +507,21 @@ def _valid_navigation_boolean(value: Any) -> bool:
     return type(value) is bool
 
 
-def _valid_navigation_control(value: Any, role: str, name: str) -> bool:
+def _valid_navigation_mapping(value: Any, expected_keys: frozenset[str]) -> bool:
+    """Require one exact built-in mapping shape before inspecting its values."""
+
     if type(value) is not dict:
         return False
-    expected = {"role", "name", "count", "visible", "enabled", "trial_actionable"}
-    if set(value) != expected:
+    keys = tuple(value.keys())
+    if len(keys) != len(expected_keys):
+        return False
+    if any(type(key) is not str for key in keys):
+        return False
+    return frozenset(keys) == expected_keys
+
+
+def _valid_navigation_control(value: Any, role: str, name: str) -> bool:
+    if not _valid_navigation_mapping(value, _NAVIGATION_CONTROL_KEYS):
         return False
     if type(value["role"]) is not str or value["role"] != role:
         return False
@@ -510,11 +539,7 @@ def _valid_navigation_control(value: Any, role: str, name: str) -> bool:
 
 
 def _valid_navigation_pre_ems(value: Any) -> bool:
-    if type(value) is not dict or set(value) != {
-        "context_pages",
-        "bound_page_frames",
-        "ems",
-    }:
+    if not _valid_navigation_mapping(value, _NAVIGATION_PRE_EMS_KEYS):
         return False
     return (
         _valid_navigation_count(value["context_pages"])
@@ -524,14 +549,7 @@ def _valid_navigation_pre_ems(value: Any) -> bool:
 
 
 def _valid_navigation_post_ems(value: Any) -> bool:
-    if type(value) is not dict or set(value) != {
-        "context_pages",
-        "bound_page_frames",
-        "route_changed",
-        "same_origin",
-        "eb_bill_route_proven",
-        "controls",
-    }:
+    if not _valid_navigation_mapping(value, _NAVIGATION_POST_EMS_KEYS):
         return False
     if not (
         _valid_navigation_count(value["context_pages"])
@@ -548,12 +566,10 @@ def _valid_navigation_post_ems(value: Any) -> bool:
     ):
         return False
     controls = value["controls"]
-    if type(controls) is not dict:
-        return False
     expected_controls = {
         key: (role, name) for role, name, key in NAVIGATION_DIAGNOSTIC_CONTROL_SPECS
     }
-    if set(controls) != set(expected_controls):
+    if not _valid_navigation_mapping(controls, frozenset(expected_controls)):
         return False
     return all(
         _valid_navigation_control(controls[key], role, name)
@@ -563,11 +579,9 @@ def _valid_navigation_post_ems(value: Any) -> bool:
 
 def _valid_navigation_document(document: Any) -> bool:
     try:
-        if type(document) is not dict:
-            return False
-        keys = set(document)
-        if keys != set(_NAVIGATION_DOCUMENT_BASE_KEYS) and keys != (
-            set(_NAVIGATION_DOCUMENT_BASE_KEYS) | {"support_ref"}
+        if not (
+            _valid_navigation_mapping(document, _NAVIGATION_DOCUMENT_BASE_KEYS)
+            or _valid_navigation_mapping(document, _NAVIGATION_DOCUMENT_WITH_SUPPORT_KEYS)
         ):
             return False
         schema = document.get("schema")
@@ -674,15 +688,33 @@ def navigation_diagnostic_document(
     return _unobserved_navigation_document()
 
 
-def emit_navigation_diagnostic(document: dict[str, Any]) -> None:
+def emit_navigation_diagnostic(document: dict[str, Any]) -> dict[str, Any]:
     try:
         safe_document = (
             document if _valid_navigation_document(document) else _unobserved_navigation_document()
         )
         encoded = json.dumps(safe_document, sort_keys=True)
     except Exception:
-        encoded = json.dumps(_unobserved_navigation_document(), sort_keys=True)
+        safe_document = _unobserved_navigation_document()
+        encoded = json.dumps(safe_document, sort_keys=True)
     print(encoded)
+    return safe_document
+
+
+def _navigation_diagnostic_exit_code(document: dict[str, Any]) -> int:
+    """Derive the process result only from the final emitted public document."""
+
+    if document["result"] == NAVIGATION_DIAGNOSTIC_CONFIGURATION_FAILED:
+        return 64
+    if document["result"] == NAVIGATION_DIAGNOSTIC_OUTPUT_REJECTED:
+        return 20
+    if document["status"] == NAVIGATION_DIAGNOSTIC_COMPLETE_STATE:
+        return 0
+    return 20
+
+
+def _emit_navigation_diagnostic_and_get_exit_code(document: dict[str, Any]) -> int:
+    return _navigation_diagnostic_exit_code(emit_navigation_diagnostic(document))
 
 
 def run_navigation_diagnostic(config_path: Path) -> int:
@@ -705,8 +737,7 @@ def run_navigation_diagnostic(config_path: Path) -> int:
         config = load_runtime_config(load_config_file(config_path))
     except (ConfigError, DependencyError):
         document = configuration_failure(DIAGNOSTIC_UNCLASSIFIED_SUPPORT_REF)
-        emit_navigation_diagnostic(document)
-        return 64
+        return _emit_navigation_diagnostic_and_get_exit_code(document)
 
     try:
         # Headed is fixed for this operation. The command never preflights the
@@ -715,8 +746,7 @@ def run_navigation_diagnostic(config_path: Path) -> int:
             result = portal.navigation_diagnostic()
     except (ConfigError, DependencyError):
         document = configuration_failure(DIAGNOSTIC_UNCLASSIFIED_SUPPORT_REF)
-        emit_navigation_diagnostic(document)
-        return 64
+        return _emit_navigation_diagnostic_and_get_exit_code(document)
     except AppError as exc:
         result = NavigationDiagnosticResult(
             result=NAVIGATION_DIAGNOSTIC_AUTHENTICATION_NOT_PROVEN,
@@ -724,8 +754,7 @@ def run_navigation_diagnostic(config_path: Path) -> int:
             failure=exc,
         )
         document = navigation_diagnostic_document(result)
-        emit_navigation_diagnostic(document)
-        return 20
+        return _emit_navigation_diagnostic_and_get_exit_code(document)
     except Exception:
         result = NavigationDiagnosticResult(
             result=NAVIGATION_DIAGNOSTIC_AUTHENTICATION_NOT_PROVEN,
@@ -734,16 +763,10 @@ def run_navigation_diagnostic(config_path: Path) -> int:
         document = navigation_diagnostic_document(
             result, support_ref=DIAGNOSTIC_UNCLASSIFIED_SUPPORT_REF
         )
-        emit_navigation_diagnostic(document)
-        return 20
+        return _emit_navigation_diagnostic_and_get_exit_code(document)
 
     document = navigation_diagnostic_document(result)
-    emit_navigation_diagnostic(document)
-    if document["result"] == NAVIGATION_DIAGNOSTIC_OUTPUT_REJECTED:
-        return 20
-    if document["status"] == NAVIGATION_DIAGNOSTIC_COMPLETE_STATE:
-        return 0
-    return 20
+    return _emit_navigation_diagnostic_and_get_exit_code(document)
 
 
 def main(argv: list[str] | None = None) -> int:

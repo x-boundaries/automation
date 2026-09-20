@@ -2045,6 +2045,75 @@ class PlaywrightPortal:
             if self._navigation_remaining_ms(deadline) <= 0:
                 return False
 
+    def _navigation_diagnostic_eb_bill_route_proven(
+        self,
+        page: Any,
+        expected_origin: tuple[str, str, int | None],
+        deadline: float,
+    ) -> bool:
+        """Prove the EB Bill route with diagnostic-only freshness guards."""
+
+        self._navigation_freshness(
+            page, expected_origin, deadline, post_ems=True
+        )
+        try:
+            control = self._eb_bill_locator(page)
+        except Exception as exc:
+            raise _NavigationObservationUnreadable from exc
+
+        if self._navigation_remaining_ms(deadline) <= 0:
+            raise _NavigationDeadlineExhausted
+        try:
+            count = self._navigation_capped_count(control.count())
+        except (_NavigationDeadlineExhausted, _NavigationObservationUnreadable):
+            raise
+        except Exception as exc:
+            if self._navigation_remaining_ms(deadline) <= 0:
+                raise _NavigationDeadlineExhausted from exc
+            raise _NavigationObservationUnreadable from exc
+
+        # The count is only useful if the same bound surface remains fresh
+        # immediately after that one observation. A terminal result here must
+        # prevent both attribute access and all later control probes.
+        self._navigation_freshness(
+            page, expected_origin, deadline, post_ems=True
+        )
+        if count != 1:
+            return False
+
+        try:
+            control = self._eb_bill_locator(page)
+        except Exception as exc:
+            raise _NavigationObservationUnreadable from exc
+        timeout_ms = self._navigation_freshness(
+            page, expected_origin, deadline, post_ems=True
+        )
+        try:
+            target = control.get_attribute("href", timeout=timeout_ms)
+        except Exception as exc:
+            if self._navigation_remaining_ms(deadline) <= 0:
+                raise _NavigationDeadlineExhausted from exc
+            raise _NavigationObservationUnreadable from exc
+
+        # This is the final page/frame/origin guard for route evidence. The
+        # address values remain local and never enter the public document.
+        self._navigation_freshness(
+            page, expected_origin, deadline, post_ems=True
+        )
+        current = self._current_url(page)
+        if not target or not current:
+            return False
+        try:
+            resolved = urlparse(urljoin(str(current), str(target)))
+            here = urlparse(str(current))
+        except Exception:
+            return False
+        if not resolved.scheme or resolved.scheme != here.scheme:
+            return False
+        if not resolved.netloc or resolved.netloc != here.netloc:
+            return False
+        return self._route_path(resolved.path) == self._route_path(here.path)
+
     def _observe_navigation_post_ems(
         self,
         page: Any,
@@ -2086,18 +2155,8 @@ class PlaywrightPortal:
             if remaining_ms <= 0:
                 return NAVIGATION_DIAGNOSTIC_POST_EMS_WINDOW_EXHAUSTED, post
             try:
-                route_proven = bool(
-                    self._eb_bill_route_proven(
-                        page,
-                        remaining_ms,
-                    )
-                )
-            except Exception as exc:
-                return NAVIGATION_DIAGNOSTIC_POST_EMS_OBSERVATION_UNREADABLE, unobserved_navigation_post_ems()
-            post["eb_bill_route_proven"] = route_proven
-            try:
-                self._navigation_freshness(
-                    page, expected_origin, deadline, post_ems=True
+                route_proven = self._navigation_diagnostic_eb_bill_route_proven(
+                    page, expected_origin, deadline
                 )
             except _NavigationDeadlineExhausted:
                 return NAVIGATION_DIAGNOSTIC_POST_EMS_WINDOW_EXHAUSTED, post
@@ -2105,17 +2164,12 @@ class PlaywrightPortal:
                 post["context_pages"] = exc.page_count
                 post["bound_page_frames"] = exc.frame_count
                 return exc.result, post
+            except _NavigationObservationUnreadable:
+                return NAVIGATION_DIAGNOSTIC_POST_EMS_OBSERVATION_UNREADABLE, unobserved_navigation_post_ems()
+            except Exception:
+                return NAVIGATION_DIAGNOSTIC_POST_EMS_OBSERVATION_UNREADABLE, unobserved_navigation_post_ems()
+            post["eb_bill_route_proven"] = route_proven
             if route_proven:
-                try:
-                    self._navigation_freshness(
-                        page, expected_origin, deadline, post_ems=True
-                    )
-                except _NavigationDeadlineExhausted:
-                    return NAVIGATION_DIAGNOSTIC_POST_EMS_WINDOW_EXHAUSTED, post
-                except _NavigationFreshnessChanged as exc:
-                    post["context_pages"] = exc.page_count
-                    post["bound_page_frames"] = exc.frame_count
-                    return exc.result, post
                 return NAVIGATION_DIAGNOSTIC_POST_EMS_EB_BILL_ROUTE_PROVEN, post
             controls = post["controls"]
             try:

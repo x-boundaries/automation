@@ -1776,6 +1776,100 @@ class NavigationDiagnosticRepair1OutputValidationTests(NavigationDiagnosticCliTe
         self.assertTrue(cli._valid_navigation_document(document))
 
 
+class NavigationDiagnosticRepair2OutputValidationTests(NavigationDiagnosticCliTests):
+    @staticmethod
+    def valid_document() -> dict:
+        return cli.navigation_diagnostic_document(navigation_complete_result())
+
+    @staticmethod
+    def replace_key(mapping: dict, key: str, replacement) -> None:
+        mapping[replacement] = mapping.pop(key)
+
+    def assert_rejected_emission(self, document: dict) -> None:
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            emitted = cli.emit_navigation_diagnostic(document)
+        parsed = self.document(out.getvalue())
+        expected = portal_module.unobserved_navigation_post_ems()
+        self.assertEqual(emitted, parsed)
+        self.assertEqual(emitted, cli._unobserved_navigation_document())
+        self.assertEqual(parsed["result"], portal_module.NAVIGATION_DIAGNOSTIC_OUTPUT_REJECTED)
+        self.assertEqual(parsed["post_ems"], expected)
+
+    def test_every_public_mapping_boundary_rejects_subclass_and_non_string_keys(self) -> None:
+        class StringSubclass(str):
+            pass
+
+        cases = []
+        document = self.valid_document()
+        self.replace_key(document, "schema", StringSubclass("schema"))
+        cases.append(document)
+
+        document = self.valid_document()
+        self.replace_key(document["pre_ems"], "context_pages", StringSubclass("context_pages"))
+        cases.append(document)
+
+        document = self.valid_document()
+        self.replace_key(document["post_ems"], "route_changed", StringSubclass("route_changed"))
+        cases.append(document)
+
+        document = self.valid_document()
+        self.replace_key(document["post_ems"]["controls"], "link_eb_bill", StringSubclass("link_eb_bill"))
+        cases.append(document)
+
+        document = self.valid_document()
+        self.replace_key(
+            document["post_ems"]["controls"]["link_eb_bill"],
+            "role",
+            StringSubclass("role"),
+        )
+        cases.append(document)
+
+        document = self.valid_document()
+        self.replace_key(document, "schema", object())
+        cases.append(document)
+
+        for malformed in cases:
+            with self.subTest(keys=tuple(malformed)):
+                self.assertFalse(cli._valid_navigation_document(malformed))
+                self.assert_rejected_emission(malformed)
+
+    def test_exact_builtin_mapping_keys_and_values_remain_accepted(self) -> None:
+        document = self.valid_document()
+        self.assertTrue(cli._valid_navigation_document(document))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            emitted = cli.emit_navigation_diagnostic(document)
+        self.assertEqual(emitted, document)
+        self.assertEqual(self.document(out.getvalue()), document)
+
+    def test_serialization_failure_returns_the_final_rejected_document_exit_code(self) -> None:
+        real_dumps = json.dumps
+        with tempfile.TemporaryDirectory() as name:
+            config_path = self.write_config(Path(name))
+            json_proxy = mock.Mock(wraps=cli.json)
+            serialization_calls = 0
+
+            def dumps_side_effect(*args, **kwargs):
+                nonlocal serialization_calls
+                if serialization_calls == 0:
+                    serialization_calls += 1
+                    raise TypeError("malformed serialization")
+                return real_dumps(*args, **kwargs)
+
+            json_proxy.dumps.side_effect = dumps_side_effect
+            with mock.patch.object(cli, "json", json_proxy):
+                exit_code, out, err = self.run_navigation(
+                    Path(name),
+                    navigation_diagnostic_portal(navigation_complete_result()),
+                    config_path,
+                )
+        document = self.document(out)
+        self.assertEqual(exit_code, 20)
+        self.assertEqual(err, "")
+        self.assertEqual(document, cli._unobserved_navigation_document())
+
+
 class NavigationDiagnosticRunbookTests(unittest.TestCase):
     def test_future_live_authority_boundary_covers_every_invariant(self) -> None:
         runbook = (Path(__file__).parents[1] / "docs" / "runbook.md").read_text(
