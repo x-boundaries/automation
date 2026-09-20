@@ -50,6 +50,7 @@ class MemberGatewayBoundedImportSecurityTests(unittest.TestCase):
         self.addCleanup(lambda path=self.private_manifest_path: path.unlink(missing_ok=True))
         self.fixture_path = self.case_root / "fixture.json"
         self.manifest = self._make_manifest()
+        self.repository_identity = self._repository_identity()
         _write_json(self.manifest_path, self.manifest)
 
     def _make_manifest(self) -> dict[str, Any]:
@@ -96,6 +97,31 @@ class MemberGatewayBoundedImportSecurityTests(unittest.TestCase):
             "initial_window_admission_count": 0,
         }
 
+    @staticmethod
+    def _repository_identity() -> dict[str, str | None]:
+        def rev_parse(argument: str) -> str | None:
+            completed = subprocess.run(
+                ["git", "-C", str(ROOT), "rev-parse", "--verify", argument],
+                check=False,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+            )
+            if completed.returncode != 0:
+                return None
+            return completed.stdout.strip()
+
+        raw_workflow = CANONICAL_WORKFLOW.read_bytes()
+        workflow_blob = hashlib.sha1(
+            b"blob " + str(len(raw_workflow)).encode("ascii") + b"\0" + raw_workflow
+        ).hexdigest()
+        return {
+            "head": rev_parse("HEAD"),
+            "tree": rev_parse("HEAD^{tree}"),
+            "parent": rev_parse("HEAD^"),
+            "workflow_blob": workflow_blob,
+        }
+
     def _metadata(self) -> list[dict[str, Any]]:
         return [
             {
@@ -111,6 +137,7 @@ class MemberGatewayBoundedImportSecurityTests(unittest.TestCase):
         canonical = _read_json(CANONICAL_WORKFLOW)
         fixture: dict[str, Any] = {
             "schema_version": "xb.member.gateway.bounded_import.fixture.v1",
+            "repository": copy.deepcopy(self.repository_identity),
             "cursor": self._make_cursor(),
             "metadata": self._metadata() if preimage == "existing" else [],
             "workflow": canonical if preimage == "existing" else None,
@@ -127,7 +154,14 @@ class MemberGatewayBoundedImportSecurityTests(unittest.TestCase):
         self.addCleanup(lambda: shutil.rmtree(self._operation_path(operation_id), ignore_errors=True))
         return operation_id
 
-    def _build_command(self, mode: str, operation_id: str, *, extra_args: tuple[str, ...] = ()) -> tuple[list[str], dict[str, str]]:
+    def _build_command(
+        self,
+        mode: str,
+        operation_id: str,
+        *,
+        extra_args: tuple[str, ...] = (),
+        confirm: bool = True,
+    ) -> tuple[list[str], dict[str, str]]:
         command = [
             self.pwsh,
             "-NoLogo",
@@ -149,7 +183,7 @@ class MemberGatewayBoundedImportSecurityTests(unittest.TestCase):
             str(self.fixture_path),
             "-TestOnly",
         ]
-        if mode == "Apply":
+        if mode == "Apply" and confirm:
             command.append("-ConfirmBoundedApply")
         command.extend(extra_args)
         environment = os.environ.copy()
@@ -170,8 +204,9 @@ class MemberGatewayBoundedImportSecurityTests(unittest.TestCase):
         expect_success: bool = True,
         extra_args: tuple[str, ...] = (),
         extra_env: dict[str, str] | None = None,
+        confirm: bool = True,
     ) -> subprocess.CompletedProcess[str]:
-        command, environment = self._build_command(mode, operation_id, extra_args=extra_args)
+        command, environment = self._build_command(mode, operation_id, extra_args=extra_args, confirm=confirm)
         if extra_env:
             environment.update(extra_env)
         completed = subprocess.run(
@@ -197,8 +232,16 @@ class MemberGatewayBoundedImportSecurityTests(unittest.TestCase):
             )
         return completed
 
-    def _start(self, mode: str, operation_id: str, *, extra_args: tuple[str, ...] = (), extra_env: dict[str, str] | None = None) -> subprocess.Popen[str]:
-        command, environment = self._build_command(mode, operation_id, extra_args=extra_args)
+    def _start(
+        self,
+        mode: str,
+        operation_id: str,
+        *,
+        extra_args: tuple[str, ...] = (),
+        extra_env: dict[str, str] | None = None,
+        confirm: bool = True,
+    ) -> subprocess.Popen[str]:
+        command, environment = self._build_command(mode, operation_id, extra_args=extra_args, confirm=confirm)
         if extra_env:
             environment.update(extra_env)
         return subprocess.Popen(
@@ -213,6 +256,17 @@ class MemberGatewayBoundedImportSecurityTests(unittest.TestCase):
 
     def _operation_path(self, operation_id: str) -> Path:
         return ROOT / self.operations_root / operation_id
+
+    def _poisoned_command(self, label: str) -> tuple[Path, Path]:
+        marker = self.case_root / f"{label}.invoked"
+        command = self.case_root / f"{label}.cmd"
+        command.write_text(
+            "@echo off\r\n"
+            f'> "{marker}" echo invoked\r\n'
+            "exit /b 0\r\n",
+            encoding="ascii",
+        )
+        return command, marker
 
     def _capture(self, label: str, *, preimage: str = "existing", dispatch_mode: str = "success") -> tuple[str, dict[str, Any]]:
         operation_id = self._operation_id(label)
@@ -362,6 +416,93 @@ class MemberGatewayBoundedImportSecurityTests(unittest.TestCase):
                 payloads.append(json.loads(stdout.strip().splitlines()[-1]))
         self.assertEqual(sum(payload.get("status") == "applied_and_verified" for payload in payloads), 1)
         self.assertEqual(sum(process.returncode == 0 for process in processes), 1)
+
+    def test_testonly_dispatch_is_synthetic_and_fixture_modes_fail_closed(self) -> None:
+        operation_id, _ = self._capture("testonly-native-poison", dispatch_mode="success")
+        poisoned_n8n, n8n_marker = self._poisoned_command("testonly-native-poison")
+        result = self._run(
+            "Apply",
+            operation_id,
+            confirm=False,
+            extra_args=("-N8nExecutable", str(poisoned_n8n)),
+        )
+        payload = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertEqual(payload["status"], "applied_and_verified")
+        self.assertFalse(n8n_marker.exists())
+        retry = self._run(
+            "Apply",
+            operation_id,
+            confirm=False,
+            extra_args=("-N8nExecutable", str(poisoned_n8n)),
+        )
+        retry_payload = json.loads(retry.stdout.strip().splitlines()[-1])
+        self.assertEqual(retry_payload["status"], "no_op_success")
+        self.assertFalse(n8n_marker.exists())
+
+        cases = (
+            ("testonly-supplied-container-visible", "container_visible_import", False),
+            ("testonly-named-container-visible", "container_visible_import", True),
+            ("testonly-future-mode", "future_dispatch_mode", False),
+        )
+        for label, dispatch_mode, named_container in cases:
+            with self.subTest(label=label):
+                invalid_operation_id, fixture = self._capture(label, dispatch_mode="success")
+                fixture["dispatch_mode"] = dispatch_mode
+                _write_json(self.fixture_path, fixture)
+                poisoned_n8n, n8n_marker = self._poisoned_command(f"{label}-n8n")
+                extra_args = ["-N8nExecutable", str(poisoned_n8n)]
+                docker_marker: Path | None = None
+                if named_container:
+                    poisoned_docker, docker_marker = self._poisoned_command(f"{label}-docker")
+                    extra_args.extend(("-N8nContainer", "fake-container", "-DockerExecutable", str(poisoned_docker)))
+                completed = self._run(
+                    "Apply",
+                    invalid_operation_id,
+                    expect_success=False,
+                    confirm=False,
+                    extra_args=tuple(extra_args),
+                )
+                self.assertIn("fixture_dispatch_mode_invalid", completed.stderr)
+                self.assertFalse(n8n_marker.exists())
+                if docker_marker is not None:
+                    self.assertFalse(docker_marker.exists())
+                self.assertFalse((self._operation_path(invalid_operation_id) / "completion-receipt.json").exists())
+
+    def test_testonly_process_boundaries_reject_direct_calls(self) -> None:
+        command_text = (
+            f'. "{SCRIPT}"; $script:BoundedTestOnly = $true; '
+            'try { Invoke-BoundedProcess -Command "poison" -Arguments @(); } '
+            'catch { Write-Output ("PROCESS=" + $_.Exception.Message) }; '
+            'try { Invoke-BoundedExternalCommand "list:workflow" @(); } '
+            'catch { Write-Output ("EXTERNAL=" + $_.Exception.Message) }'
+        )
+        completed = self._run_ps_command(command_text)
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        self.assertIn("PROCESS=test_only_process_forbidden", completed.stdout)
+        self.assertIn("EXTERNAL=test_only_external_command_forbidden", completed.stdout)
+
+    def test_testonly_identity_paths_do_not_spawn_git(self) -> None:
+        operation_id = self._operation_id("testonly-no-git")
+        fixture = self._make_fixture()
+        git_marker = self.case_root / "git.invoked"
+        fake_git = self.case_root / "git.cmd"
+        fake_git.write_text(
+            "@echo off\r\n"
+            f'> "{git_marker}" echo invoked\r\n'
+            "exit /b 99\r\n",
+            encoding="ascii",
+        )
+        poisoned_path = str(self.case_root)
+        if os.name == "nt":
+            path_separator = ";"
+        else:
+            path_separator = os.pathsep
+        environment = {"PATH": poisoned_path + path_separator + os.environ.get("PATH", "")}
+        self._run("CapturePlan", operation_id, extra_env=environment)
+        fixture["after_workflow"] = _read_json(self._operation_path(operation_id) / "prepared.workflow.json")
+        _write_json(self.fixture_path, fixture)
+        self._run("Apply", operation_id, confirm=False, extra_env=environment)
+        self.assertFalse(git_marker.exists())
 
     def test_cursor_identity_watermark_and_preimage_mismatch_block_before_dispatch(self) -> None:
         cases = (
@@ -676,431 +817,366 @@ class MemberGatewayBoundedImportSecurityTests(unittest.TestCase):
         self.assertIn("LIST=workflow-security-001|Member Gateway - Google Forms durable source adapter (inactive)", completed.stdout)
         self.assertIn("IMPORT=import-ok:import:workflow --input=C:\\prepared.workflow.json --projectId=project-security-001 --activeState=false", completed.stdout)
 
-    def test_container_permission_model_and_cleanup_finality(self) -> None:
-        happy_operation_id, fixture = self._capture("container-visible-import", dispatch_mode="container_visible_import")
-        fake_docker_py = self.case_root / "fake-docker.py"
-        fake_docker_cmd = self.case_root / "docker.cmd"
-        container_root = self.case_root / "container-root"
-        container_state = self.case_root / "container-state.json"
-        consumer_marker = self.case_root / "consumer.marker"
-        consumer_count = self.case_root / "consumer.count"
-        cleanup_marker = self.case_root / "cleanup.marker"
-        fake_docker_py.write_text(
-            '''import hashlib
-import json
-import os
-import posixpath
-import shutil
-import sys
-from pathlib import Path
+    def _run_container_transport(
+        self,
+        operation_id: str,
+        *,
+        extra_env: dict[str, str],
+        expect_success: bool = True,
+    ) -> subprocess.CompletedProcess[str]:
+        environment = {
+            "FAKE_OPERATION_ID": operation_id,
+            "FAKE_REPO_ROOT": str(ROOT),
+            "FAKE_OPERATIONS_ROOT": self.operations_root,
+            "FAKE_CUSTODY_OPERATIONS_ROOT": str(self.case_root / ("custody-" + operation_id)),
+        }
+        environment.update(extra_env)
+        command_text = """
+. '__SCRIPT__'
+$OperationId = $env:FAKE_OPERATION_ID
+$script:BoundedRepoRoot = $env:FAKE_REPO_ROOT
+$sourceOperationsRoot = Join-Path $script:BoundedRepoRoot $env:FAKE_OPERATIONS_ROOT
+$script:BoundedOperationsRoot = $env:FAKE_CUSTODY_OPERATIONS_ROOT
+[void][System.IO.Directory]::CreateDirectory($script:BoundedOperationsRoot)
+$sourceOperationPath = Join-Path $sourceOperationsRoot $OperationId
+$targetOperationPath = Join-Path $script:BoundedOperationsRoot $OperationId
+[void][System.IO.Directory]::CreateDirectory($targetOperationPath)
+foreach ($sourceFile in @(Get-ChildItem -LiteralPath $sourceOperationPath -File)) {
+    Copy-Item -LiteralPath $sourceFile.FullName -Destination (Join-Path $targetOperationPath $sourceFile.Name) -Force
+}
+$script:BoundedTestOnly = $false
+$N8nContainer = "fake-container"
+$script:BoundedDockerExecutable = "docker"
+$script:FakeRoot = [System.IO.Path]::GetFullPath($env:FAKE_CONTAINER_ROOT)
+[void][System.IO.Directory]::CreateDirectory((Join-Path $script:FakeRoot "tmp"))
+$script:FakeEntries = @{}
 
+function Get-FakeKey {
+    param([Parameter(Mandatory)][string]$Path)
+    $value = "/" + $Path.TrimStart([char]47).Replace([string][char]92, "/")
+    while ($value.Contains("//")) { $value = $value.Replace("//", "/") }
+    return $value
+}
 
-args = sys.argv[1:]
-root = Path(os.environ["FAKE_CONTAINER_ROOT"])
-root.mkdir(parents=True, exist_ok=True)
-state_path = Path(os.environ["FAKE_CONTAINER_STATE"])
+function Get-FakePath {
+    param([Parameter(Mandatory)][string]$Path)
+    $relative = (Get-FakeKey $Path).TrimStart([char]47).Replace("/", [string][System.IO.Path]::DirectorySeparatorChar)
+    return Join-Path $script:FakeRoot $relative
+}
 
+function Get-FakeEntry {
+    param([Parameter(Mandatory)][string]$Path)
+    $key = Get-FakeKey $Path
+    if (-not $script:FakeEntries.ContainsKey($key)) { return $null }
+    return $script:FakeEntries[$key]
+}
 
-def parse_mode(value: str) -> int:
-    return int(value, 8)
+function Set-FakeEntry {
+    param([string]$Path, [string]$Mode, [string]$Uid, [string]$Gid, [string]$Type)
+    $script:FakeEntries[(Get-FakeKey $Path)] = [ordered]@{ mode = $Mode; uid = $Uid; gid = $Gid; type = $Type }
+}
 
+function Get-FakeResult {
+    param([int]$ExitCode, [string]$Stdout = "")
+    return [pscustomobject]([ordered]@{ exit_code = $ExitCode; stdout = $Stdout; stderr = "" })
+}
 
-def parse_owner(value: str) -> tuple[int, int]:
-    uid, gid = value.split(":", 1)
-    return int(uid), int(gid)
+function Test-FakeReadable {
+    param([string]$Path, [string]$Uid, [string]$Gid)
+    $entry = Get-FakeEntry $Path
+    if ($null -eq $entry -or [string]$entry.type -cne "regular file") { return $false }
+    $mode = [Convert]::ToInt32([string]$entry.mode, 8)
+    if ([string]$entry.uid -ceq $Uid) { $bits = ($mode -shr 6) -band 7 }
+    elseif ([string]$entry.gid -ceq $Gid) { $bits = ($mode -shr 3) -band 7 }
+    else { $bits = $mode -band 7 }
+    return (($bits -band 4) -ne 0)
+}
 
+$tmpMode = if ($env:FAKE_TMP_MODE) { $env:FAKE_TMP_MODE } else { "1777" }
+$tmpUid = if ($env:FAKE_TMP_UID) { $env:FAKE_TMP_UID } else { "0" }
+$tmpGid = if ($env:FAKE_TMP_GID) { $env:FAKE_TMP_GID } else { "0" }
+Set-FakeEntry "/tmp" $tmpMode $tmpUid $tmpGid "directory"
 
-def env_int(name: str, default: str) -> int:
-    return int(os.environ.get(name, default))
+function Invoke-BoundedProcess {
+    param(
+        [Parameter(Mandatory)][string]$Command,
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Arguments,
+        [string]$InputText = ""
+    )
+    if ($env:FAKE_PROCESS_CALLS) { Add-Content -LiteralPath $env:FAKE_PROCESS_CALLS -Value (($Arguments -join " ")) }
+    $script:BoundedTestOnly = $true
+    $arguments = @($Arguments)
+    if ($arguments.Count -eq 0) { return Get-FakeResult 13 }
 
+    if ($arguments[0] -ceq "inspect") {
+        if ($arguments[1] -ceq "--format={{.Id}}") { return Get-FakeResult 0 ("container-id-001" + [string][char]10) }
+        if ($arguments[1] -ceq "--format={{.Image}}") { return Get-FakeResult 0 ("image-id-001" + [string][char]10) }
+        return Get-FakeResult 10
+    }
 
-def path_key(path: str) -> str:
-    value = "/" + path.lstrip("/").replace("\\\\", "/")
-    value = posixpath.normpath(value)
-    return value if value != "." else "/"
+    if ($arguments[0] -ceq "cp") {
+        $destination = [string]$arguments[2]
+        $target = $destination.Substring($destination.IndexOf(":") + 1)
+        $targetPath = Get-FakePath $target
+        [void][System.IO.Directory]::CreateDirectory([System.IO.Path]::GetDirectoryName($targetPath))
+        Copy-Item -LiteralPath $arguments[1] -Destination $targetPath -Force
+        Set-FakeEntry $target "644" "0" "0" "regular file"
+        return Get-FakeResult 0
+    }
 
+    if ($arguments[0] -ceq "exec") {
+        $index = 1
+        if ($arguments[$index] -ceq "-i") { $index++ }
+        $importUid = if ($env:FAKE_IMPORT_UID) { $env:FAKE_IMPORT_UID } else { "1000" }
+        $importGid = if ($env:FAKE_IMPORT_GID) { $env:FAKE_IMPORT_GID } else { "1000" }
+        $execUid = $importUid
+        if ($arguments[$index] -ceq "-u") { $execUid = "0"; $index += 2 }
+        $commandName = [string]$arguments[$index + 1]
+        $commandArguments = @()
+        if ($index + 2 -lt $arguments.Count) { $commandArguments = @($arguments[($index + 2)..($arguments.Count - 1)]) }
 
-def resolve_container_path(path: str) -> Path:
-    return root.joinpath(path.lstrip("/").replace("/", os.sep))
-
-
-def default_state() -> dict[str, object]:
-    return {
-        "entries": {
-            "/tmp": {
-                "mode": parse_mode(os.environ.get("FAKE_TMP_MODE", "1777")),
-                "uid": env_int("FAKE_TMP_UID", "0"),
-                "gid": env_int("FAKE_TMP_GID", "0"),
-                "type": "directory",
+        if ($commandName -ceq "id") {
+            if ($commandArguments[0] -ceq "-u") { return Get-FakeResult 0 ($importUid + [string][char]10) }
+            if ($commandArguments[0] -ceq "-g") { return Get-FakeResult 0 ($importGid + [string][char]10) }
+            return Get-FakeResult 13
+        }
+        if ($commandName -ceq "stat") {
+            $target = [string]$commandArguments[-1]
+            $entry = Get-FakeEntry $target
+            if ($null -eq $entry) { return Get-FakeResult 14 }
+            if ([string]$entry.type -ceq "directory") {
+                return Get-FakeResult 0 (("{0}:{1}:{2}:directory" -f $entry.mode, $entry.uid, $entry.gid) + [string][char]10)
             }
+            $path = Get-FakePath $target
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return Get-FakeResult 14 }
+            $size = [System.IO.File]::ReadAllBytes($path).Length
+            return Get-FakeResult 0 (("{0}:{1}:{2}:regular file:{3}" -f $entry.mode, $entry.uid, $entry.gid, $size) + [string][char]10)
         }
-    }
-
-
-def load_state() -> dict[str, object]:
-    if state_path.is_file():
-        return json.loads(state_path.read_text(encoding="utf-8"))
-    state = default_state()
-    save_state(state)
-    return state
-
-
-def save_state(state: dict[str, object]) -> None:
-    state_path.write_text(json.dumps(state, sort_keys=True), encoding="utf-8")
-
-
-def entry_for(state: dict[str, object], path: str) -> dict[str, object] | None:
-    return state["entries"].get(path_key(path))  # type: ignore[union-attr]
-
-
-def permission_bits(entry: dict[str, object], uid: int, gid: int) -> int:
-    mode = int(entry["mode"])
-    if uid == int(entry["uid"]):
-        return (mode >> 6) & 0b111
-    if gid == int(entry["gid"]):
-        return (mode >> 3) & 0b111
-    return mode & 0b111
-
-
-def can_read(state: dict[str, object], path: str, uid: int, gid: int) -> bool:
-    key = path_key(path)
-    file_entry = entry_for(state, key)
-    if file_entry is None or file_entry["type"] != "regular file":
-        return False
-    if uid == 0:
-        return True
-    parent = posixpath.dirname(key) or "/"
-    while parent and parent != "/":
-        directory = entry_for(state, parent)
-        if directory is None or directory["type"] != "directory" or not (permission_bits(directory, uid, gid) & 0b001):
-            return False
-        parent = posixpath.dirname(parent)
-    return bool(permission_bits(file_entry, uid, gid) & 0b100)
-
-
-def update_owner(state: dict[str, object], target: str, owner: str) -> None:
-    item = entry_for(state, target)
-    if item is None:
-        raise SystemExit(14)
-    uid, gid = parse_owner(owner)
-    if item["type"] == "directory" and os.environ.get("FAKE_CHOWN_DIRECTORY_OWNER"):
-        uid, gid = parse_owner(os.environ["FAKE_CHOWN_DIRECTORY_OWNER"])
-    if item["type"] == "regular file" and os.environ.get("FAKE_CHOWN_FILE_OWNER"):
-        uid, gid = parse_owner(os.environ["FAKE_CHOWN_FILE_OWNER"])
-    item["uid"] = uid
-    item["gid"] = gid
-
-
-def update_mode(state: dict[str, object], target: str, mode: str) -> None:
-    item = entry_for(state, target)
-    if item is None:
-        raise SystemExit(14)
-    value = mode
-    if item["type"] == "directory" and os.environ.get("FAKE_CHMOD_DIRECTORY_MODE"):
-        value = os.environ["FAKE_CHMOD_DIRECTORY_MODE"]
-    if item["type"] == "regular file" and os.environ.get("FAKE_CHMOD_FILE_MODE"):
-        value = os.environ["FAKE_CHMOD_FILE_MODE"]
-    item["mode"] = parse_mode(value)
-
-
-state = load_state()
-
-if args and args[0] == "inspect":
-    if args[1] == "--format={{.Id}}":
-        print("container-id-001")
-        raise SystemExit(0)
-    if args[1] == "--format={{.Image}}":
-        print("image-id-001")
-        raise SystemExit(0)
-    raise SystemExit(10)
-
-if args and args[0] == "cp":
-    destination = args[2]
-    separator = destination.find(":")
-    if separator < 1:
-        raise SystemExit(11)
-    target = resolve_container_path(destination[separator + 1 :])
-    target.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(args[1], target)
-    state["entries"][path_key(destination[separator + 1 :])] = {
-        "mode": parse_mode("644"),
-        "uid": 0,
-        "gid": 0,
-        "type": "regular file",
-    }
-    save_state(state)
-    raise SystemExit(0)
-
-if args and args[0] == "exec":
-    offset = 1
-    if args[offset] == "-i":
-        offset += 1
-    import_uid = env_int("FAKE_IMPORT_UID", "1000")
-    import_gid = env_int("FAKE_IMPORT_GID", "1000")
-    exec_uid = import_uid
-    if args[offset] == "-u":
-        if args[offset + 1] != "0":
-            raise SystemExit(12)
-        exec_uid = 0
-        offset += 2
-    if args[offset] != "fake-container":
-        raise SystemExit(12)
-    command = args[offset + 1]
-    command_arguments = args[offset + 2 :]
-    if command == "id":
-        if command_arguments == ["-u"]:
-            print(import_uid)
-        elif command_arguments == ["-g"]:
-            print(import_gid)
-        else:
-            raise SystemExit(13)
-        raise SystemExit(0)
-    if command == "stat":
-        target = command_arguments[-1]
-        item = entry_for(state, target)
-        if item is None:
-            raise SystemExit(14)
-        path = resolve_container_path(target)
-        mode = format(int(item["mode"]), "o")
-        owner = f"{item['uid']}:{item['gid']}"
-        if item["type"] == "directory":
-            print(f"{mode}:{owner}:directory")
-        elif item["type"] == "regular file" and path.is_file():
-            print(f"{mode}:{owner}:regular file:{path.stat().st_size}")
-        else:
-            raise SystemExit(14)
-        raise SystemExit(0)
-    if command == "mkdir":
-        if exec_uid != 0:
-            raise SystemExit(12)
-        target = command_arguments[-1]
-        resolve_container_path(target).mkdir(parents=True, exist_ok=False)
-        mode = command_arguments[command_arguments.index("-m") + 1] if "-m" in command_arguments else "777"
-        state["entries"][path_key(target)] = {"mode": parse_mode(mode), "uid": 0, "gid": 0, "type": "directory"}
-        save_state(state)
-        raise SystemExit(0)
-    if command == "chown":
-        if exec_uid != 0:
-            raise SystemExit(12)
-        update_owner(state, command_arguments[-1], command_arguments[0])
-        save_state(state)
-        raise SystemExit(0)
-    if command == "chmod":
-        if exec_uid != 0:
-            raise SystemExit(12)
-        update_mode(state, command_arguments[-1], command_arguments[0])
-        save_state(state)
-        raise SystemExit(0)
-    if command == "sha256sum":
-        if exec_uid != 0:
-            raise SystemExit(12)
-        target = command_arguments[-1]
-        path = resolve_container_path(target)
-        item = entry_for(state, target)
-        if item is None or item["type"] != "regular file" or not path.is_file():
-            raise SystemExit(14)
-        digest = hashlib.sha256(path.read_bytes()).hexdigest()
-        if os.environ.get("FAKE_HASH_MISMATCH") == "1":
-            digest = "0" * 64
-        print(f"{digest}  {target}")
-        if os.environ.get("FAKE_MUTATE_AFTER_HASH") == "unreadable":
-            item["mode"] = parse_mode("000")
-            save_state(state)
-        raise SystemExit(0)
-    if command == "test":
-        if exec_uid != 0 or command_arguments[:2] != ["!", "-e"]:
-            raise SystemExit(13)
-        raise SystemExit(0 if not resolve_container_path(command_arguments[2]).exists() else 1)
-    if command == "n8n":
-        input_arguments = [argument for argument in command_arguments if argument.startswith("--input=")]
-        if len(input_arguments) != 1:
-            raise SystemExit(13)
-        target = input_arguments[0][8:]
-        container_file = resolve_container_path(target)
-        if not container_file.is_file() or not can_read(state, target, import_uid, import_gid):
-            raise SystemExit(18)
-        actual_hash = hashlib.sha256(container_file.read_bytes()).hexdigest()
-        if actual_hash != os.environ["EXPECTED_PREPARED_SHA"]:
-            raise SystemExit(15)
-        Path(os.environ["FAKE_CONSUMER_MARKER"]).write_text("container-read-ok", encoding="utf-8")
-        count_path = Path(os.environ["FAKE_CONSUMER_COUNT"])
-        count = int(count_path.read_text(encoding="utf-8")) if count_path.is_file() else 0
-        count_path.write_text(str(count + 1), encoding="utf-8")
-        raise SystemExit(0)
-    if command == "rm":
-        if exec_uid != 0:
-            raise SystemExit(12)
-        if os.environ.get("FAKE_CLEANUP_FAIL") == "1":
-            raise SystemExit(17)
-        target = command_arguments[-1]
-        container_directory = resolve_container_path(target)
-        if container_directory.exists():
-            shutil.rmtree(container_directory)
-        directory_key = path_key(target)
-        state["entries"] = {
-            key: value
-            for key, value in state["entries"].items()
-            if key != directory_key and not key.startswith(directory_key + "/")
+        if ($commandName -ceq "mkdir") {
+            $target = [string]$commandArguments[-1]
+            [void][System.IO.Directory]::CreateDirectory((Get-FakePath $target))
+            Set-FakeEntry $target ([string]$commandArguments[1]) "0" "0" "directory"
+            return Get-FakeResult 0
         }
-        save_state(state)
-        Path(os.environ["FAKE_CLEANUP_MARKER"]).write_text("container-cleaned", encoding="utf-8")
-        raise SystemExit(0)
+        if ($commandName -ceq "chown") {
+            $target = [string]$commandArguments[1]
+            $entry = Get-FakeEntry $target
+            if ($null -eq $entry) { return Get-FakeResult 14 }
+            $owner = [string]$commandArguments[0]
+            if ([string]$entry.type -ceq "directory" -and $env:FAKE_CHOWN_DIRECTORY_OWNER) { $owner = $env:FAKE_CHOWN_DIRECTORY_OWNER }
+            if ([string]$entry.type -ceq "regular file" -and $env:FAKE_CHOWN_FILE_OWNER) { $owner = $env:FAKE_CHOWN_FILE_OWNER }
+            $parts = $owner -split ":", 2
+            $entry.uid = $parts[0]; $entry.gid = $parts[1]
+            return Get-FakeResult 0
+        }
+        if ($commandName -ceq "chmod") {
+            $target = [string]$commandArguments[1]
+            $entry = Get-FakeEntry $target
+            if ($null -eq $entry) { return Get-FakeResult 14 }
+            $mode = [string]$commandArguments[0]
+            if ([string]$entry.type -ceq "directory" -and $env:FAKE_CHMOD_DIRECTORY_MODE) { $mode = $env:FAKE_CHMOD_DIRECTORY_MODE }
+            if ([string]$entry.type -ceq "regular file" -and $env:FAKE_CHMOD_FILE_MODE) { $mode = $env:FAKE_CHMOD_FILE_MODE }
+            $entry.mode = $mode
+            return Get-FakeResult 0
+        }
+        if ($commandName -ceq "sha256sum") {
+            $target = [string]$commandArguments[0]
+            $path = Get-FakePath $target
+            $entry = Get-FakeEntry $target
+            if ($null -eq $entry -or -not (Test-Path -LiteralPath $path -PathType Leaf)) { return Get-FakeResult 14 }
+            $digest = Get-BoundedSha256File $path
+            if ($env:FAKE_HASH_MISMATCH -eq "1") { $digest = "0" * 64 }
+            if ($env:FAKE_MUTATE_AFTER_HASH -eq "unreadable") { $entry.mode = "000" }
+            return Get-FakeResult 0 (("{0}  {1}" -f $digest, $target) + [string][char]10)
+        }
+        if ($commandName -ceq "test") {
+            $testCode = if (Test-Path -LiteralPath (Get-FakePath $commandArguments[2])) { 1 } else { 0 }
+            return Get-FakeResult $testCode
+        }
+        if ($commandName -ceq "n8n") {
+            $inputArgument = @($commandArguments | Where-Object { $_.StartsWith("--input=") })[0]
+            $target = $inputArgument.Substring(8)
+            $path = Get-FakePath $target
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf) -or -not (Test-FakeReadable $target $importUid $importGid)) { return Get-FakeResult 18 }
+            if ((Get-BoundedSha256File $path) -cne $env:EXPECTED_PREPARED_SHA) { return Get-FakeResult 15 }
+            [System.IO.File]::WriteAllText($env:FAKE_CONSUMER_MARKER, "container-read-ok")
+            $count = if (Test-Path -LiteralPath $env:FAKE_CONSUMER_COUNT) { [int][System.IO.File]::ReadAllText($env:FAKE_CONSUMER_COUNT) } else { 0 }
+            [System.IO.File]::WriteAllText($env:FAKE_CONSUMER_COUNT, [string]($count + 1))
+            return Get-FakeResult 0
+        }
+        if ($commandName -ceq "rm") {
+            if ($env:FAKE_CLEANUP_FAIL -eq "1") { return Get-FakeResult 17 }
+            $target = [string]$commandArguments[-1]
+            Remove-Item -LiteralPath (Get-FakePath $target) -Recurse -Force -ErrorAction SilentlyContinue
+            $directoryKey = Get-FakeKey $target
+            foreach ($key in @($script:FakeEntries.Keys)) {
+                if ($key -ceq $directoryKey -or $key.StartsWith($directoryKey + "/", [StringComparison]::Ordinal)) { [void]$script:FakeEntries.Remove($key) }
+            }
+            [System.IO.File]::WriteAllText($env:FAKE_CLEANUP_MARKER, "container-cleaned")
+            return Get-FakeResult 0
+        }
+        return Get-FakeResult 16
+    }
+    return Get-FakeResult 16
+}
 
-raise SystemExit(16)
-''',
-            encoding="utf-8",
-        )
-        fake_docker_cmd.write_text(
-            f'@echo off\r\n"{sys.executable}" "%~dp0fake-docker.py" %*\r\nexit /b %ERRORLEVEL%\r\n',
-            encoding="ascii",
-        )
+try {
+    $operationPath = Join-Path $script:BoundedOperationsRoot $OperationId
+    $script:BoundedTestOnly = $true
+    $state = Get-BoundedOperationState $operationPath
+    $script:BoundedTestOnly = $false
+    $context = [pscustomobject]([ordered]@{
+        operations_path = $script:BoundedOperationsRoot
+        operation_path = $operationPath
+        operation_id = [string]$state.plan.operation_id
+        operation_identity = [string]$state.plan.operation_identity
+        plan_digest = [string](Get-BoundedPlanDigest $operationPath)
+        prepared_workflow_digest = [string]$state.plan.identity_seed.prepared_workflow_digest
+    })
+    $preparedPath = Join-Path $operationPath "prepared.workflow.json"
+    $result = Invoke-BoundedExternalCommand "import:workflow" @(
+        "--input=$preparedPath",
+        "--projectId=$([string]$state.intent.project.id)",
+        "--activeState=false"
+    ) -ContainerInputKey $OperationId -ContainerEvidenceContext $context
+    if ([int]$result.exit_code -ne 0) { Stop-Bounded "n8n_command_failed" }
+    Write-Output ("RESULT=" + ($result | ConvertTo-Json -Compress))
+    exit 0
+} catch {
+    Write-Error ("bounded_test:" + [string]$_.Exception.Message)
+    exit 1
+}
+""".replace("__SCRIPT__", str(SCRIPT).replace("'", "''"))
+        completed = self._run_ps_command(command_text, extra_env=environment)
+        if expect_success:
+            self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        else:
+            self.assertNotEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        return completed
+
+    def test_container_permission_model_and_cleanup_finality(self) -> None:
+        happy_operation_id, _ = self._capture("container-visible-import", dispatch_mode="success")
         prepared_path = self._operation_path(happy_operation_id) / "prepared.workflow.json"
-        extra_env = {
-            "FAKE_CONTAINER_ROOT": str(container_root),
-            "FAKE_CONTAINER_STATE": str(container_state),
+        case_dir = self.case_root / "container-visible-import"
+        environment = {
+            "FAKE_CONTAINER_ROOT": str(case_dir / "container-root"),
             "EXPECTED_PREPARED_SHA": hashlib.sha256(prepared_path.read_bytes()).hexdigest(),
-            "FAKE_CONSUMER_MARKER": str(consumer_marker),
-            "FAKE_CONSUMER_COUNT": str(consumer_count),
-            "FAKE_CLEANUP_MARKER": str(cleanup_marker),
+            "FAKE_CONSUMER_MARKER": str(case_dir / "consumer.marker"),
+            "FAKE_CONSUMER_COUNT": str(case_dir / "consumer.count"),
+            "FAKE_CLEANUP_MARKER": str(case_dir / "cleanup.marker"),
+            "FAKE_PROCESS_CALLS": str(case_dir / "process.calls"),
         }
-        result = self._run(
-            "Apply",
-            happy_operation_id,
-            extra_args=("-N8nContainer", "fake-container", "-DockerExecutable", str(fake_docker_cmd)),
-            extra_env=extra_env,
-        )
-        payload = json.loads(result.stdout.strip().splitlines()[-1])
-        self.assertEqual(payload["status"], "applied_and_verified")
-        self.assertEqual(consumer_marker.read_text(encoding="utf-8"), "container-read-ok")
-        self.assertEqual(consumer_count.read_text(encoding="utf-8"), "1")
-        self.assertEqual(cleanup_marker.read_text(encoding="utf-8"), "container-cleaned")
-        if container_root.exists():
-            self.assertEqual([path for path in container_root.rglob("*") if path.is_file()], [])
-        custody = _read_json(self._operation_path(happy_operation_id) / "container-custody.json")
-        self.assertEqual(custody["container_id"], "container-id-001")
-        self.assertEqual(custody["image_id"], "image-id-001")
-        self.assertEqual(custody["tmp_mode"], "1777")
-        self.assertEqual(custody["tmp_uid"], "0")
-        self.assertEqual(custody["tmp_gid"], "0")
-        self.assertEqual(custody["import_uid"], "1000")
-        self.assertEqual(custody["import_gid"], "1000")
-        self.assertEqual(custody["stage_directory_mode"], "700")
-        self.assertEqual(custody["stage_directory_uid"], "1000")
-        self.assertEqual(custody["stage_directory_gid"], "1000")
-        self.assertEqual(custody["stage_file_mode"], "600")
-        self.assertEqual(custody["stage_file_uid"], "1000")
-        self.assertEqual(custody["stage_file_gid"], "1000")
-        self.assertTrue(custody["stage_verified"])
-        self.assertTrue(custody["mutation_possible"])
+        result = self._run_container_transport(happy_operation_id, extra_env=environment)
+        self.assertIn("RESULT=", result.stdout)
+        self.assertEqual((case_dir / "consumer.marker").read_text(encoding="utf-8"), "container-read-ok")
+        self.assertEqual((case_dir / "consumer.count").read_text(encoding="utf-8"), "1")
+        self.assertEqual((case_dir / "cleanup.marker").read_text(encoding="utf-8"), "container-cleaned")
+        self.assertGreater(len((case_dir / "process.calls").read_text(encoding="utf-8").splitlines()), 0)
+        self.assertEqual([path for path in (case_dir / "container-root").rglob("*") if path.is_file()], [])
+        custody_operation_path = self.case_root / ("custody-" + happy_operation_id) / happy_operation_id
+        custody = _read_json(custody_operation_path / "container-custody.json")
+        for key, expected in {
+            "container_id": "container-id-001",
+            "image_id": "image-id-001",
+            "tmp_mode": "1777",
+            "tmp_uid": "0",
+            "tmp_gid": "0",
+            "import_uid": "1000",
+            "import_gid": "1000",
+            "stage_directory_mode": "700",
+            "stage_directory_uid": "1000",
+            "stage_directory_gid": "1000",
+            "stage_file_mode": "600",
+            "stage_file_uid": "1000",
+            "stage_file_gid": "1000",
+        }.items():
+            self.assertEqual(custody[key], expected)
+        for key in ("stage_verified", "mutation_possible", "cleanup_verified"):
+            self.assertTrue(custody[key])
         self.assertEqual(custody["cleanup_state"], "cleaned")
-        self.assertTrue(custody["cleanup_verified"])
 
-        def run_failed_case(label: str, faults: dict[str, str], expected: str) -> tuple[str, Path, Path]:
-            operation_id, _ = self._capture(label, dispatch_mode="container_visible_import")
+        def run_failed_case(label: str, faults: dict[str, str], expected: str) -> tuple[Path, Path, str]:
+            operation_id, _ = self._capture(label, dispatch_mode="success")
             case_dir = self.case_root / label
-            case_container_root = case_dir / "container-root"
-            case_state = case_dir / "container-state.json"
-            case_consumer = case_dir / "consumer.marker"
-            case_count = case_dir / "consumer.count"
-            case_cleanup = case_dir / "cleanup.marker"
             prepared = self._operation_path(operation_id) / "prepared.workflow.json"
             environment = {
-                "FAKE_CONTAINER_ROOT": str(case_container_root),
-                "FAKE_CONTAINER_STATE": str(case_state),
+                "FAKE_CONTAINER_ROOT": str(case_dir / "container-root"),
                 "EXPECTED_PREPARED_SHA": hashlib.sha256(prepared.read_bytes()).hexdigest(),
-                "FAKE_CONSUMER_MARKER": str(case_consumer),
-                "FAKE_CONSUMER_COUNT": str(case_count),
-                "FAKE_CLEANUP_MARKER": str(case_cleanup),
+                "FAKE_CONSUMER_MARKER": str(case_dir / "consumer.marker"),
+                "FAKE_CONSUMER_COUNT": str(case_dir / "consumer.count"),
+                "FAKE_CLEANUP_MARKER": str(case_dir / "cleanup.marker"),
+                "FAKE_PROCESS_CALLS": str(case_dir / "process.calls"),
             }
             environment.update(faults)
-            completed = self._run(
-                "Apply",
-                operation_id,
-                expect_success=False,
-                extra_args=("-N8nContainer", "fake-container", "-DockerExecutable", str(fake_docker_cmd)),
-                extra_env=environment,
-            )
+            completed = self._run_container_transport(operation_id, extra_env=environment, expect_success=False)
             self.assertIn(expected, completed.stderr)
-            self.assertFalse((self._operation_path(operation_id) / "completion-receipt.json").exists())
-            return operation_id, case_container_root, case_count
-
-        for label, faults in (
-            ("tmp-not-sticky", {"FAKE_TMP_MODE": "0777"}),
-            ("tmp-wrong-owner", {"FAKE_TMP_UID": "1000"}),
-        ):
-            with self.subTest(label=label):
-                run_failed_case(label, faults, "n8n_container_tmp_invalid")
-
-        for label, faults in (
-            ("stage-directory-wrong-owner", {"FAKE_CHOWN_DIRECTORY_OWNER": "2000:2000"}),
-            ("stage-directory-wrong-mode", {"FAKE_CHMOD_DIRECTORY_MODE": "750"}),
-            ("stage-file-wrong-owner", {"FAKE_CHOWN_FILE_OWNER": "2000:2000"}),
-            ("stage-file-wrong-mode", {"FAKE_CHMOD_FILE_MODE": "640"}),
-        ):
-            with self.subTest(label=label):
-                run_failed_case(label, faults, "n8n_container_stage_verification_failed")
-
-        with self.subTest(label="root-import-identity"):
-            run_failed_case(
-                "root-import-identity",
-                {"FAKE_IMPORT_UID": "0", "FAKE_IMPORT_GID": "0"},
-                "container_import_root",
+            return (
+                self.case_root / ("custody-" + operation_id) / operation_id,
+                Path(environment["FAKE_CONTAINER_ROOT"]),
+                Path(environment["FAKE_CONSUMER_COUNT"]),
             )
 
-        with self.subTest(label="import-user-unable-to-read"):
-            run_failed_case("import-user-unable-to-read", {"FAKE_MUTATE_AFTER_HASH": "unreadable"}, "n8n_command_failed")
-
-        with self.subTest(label="hash-mismatch"):
-            run_failed_case("hash-mismatch", {"FAKE_HASH_MISMATCH": "1"}, "n8n_container_content_mismatch")
+        for label, faults, expected in (
+            ("tmp-not-sticky", {"FAKE_TMP_MODE": "0777"}, "n8n_container_tmp_invalid"),
+            ("tmp-wrong-owner", {"FAKE_TMP_UID": "1000"}, "n8n_container_tmp_invalid"),
+            ("stage-directory-wrong-owner", {"FAKE_CHOWN_DIRECTORY_OWNER": "2000:2000"}, "n8n_container_stage_verification_failed"),
+            ("stage-directory-wrong-mode", {"FAKE_CHMOD_DIRECTORY_MODE": "750"}, "n8n_container_stage_verification_failed"),
+            ("stage-file-wrong-owner", {"FAKE_CHOWN_FILE_OWNER": "2000:2000"}, "n8n_container_stage_verification_failed"),
+            ("stage-file-wrong-mode", {"FAKE_CHMOD_FILE_MODE": "640"}, "n8n_container_stage_verification_failed"),
+            ("root-import-identity", {"FAKE_IMPORT_UID": "0", "FAKE_IMPORT_GID": "0"}, "container_import_root"),
+            ("import-user-unable-to-read", {"FAKE_MUTATE_AFTER_HASH": "unreadable"}, "n8n_command_failed"),
+            ("hash-mismatch", {"FAKE_HASH_MISMATCH": "1"}, "n8n_container_content_mismatch"),
+        ):
+            with self.subTest(label=label):
+                run_failed_case(label, faults, expected)
 
         with self.subTest(label="cleanup-failure-no-replay"):
-            failure_operation_id, case_container_root, case_count = run_failed_case(
+            operation_path, container_root, count_path = run_failed_case(
                 "cleanup-failure-no-replay",
                 {"FAKE_CLEANUP_FAIL": "1"},
                 "n8n_container_input_cleanup_failed",
             )
-            operation_path = self._operation_path(failure_operation_id)
-            custody = _read_json(operation_path / "container-custody.json")
+            custody_path = operation_path / "container-custody.json"
+            custody = _read_json(custody_path)
             self.assertEqual(custody["cleanup_state"], "failed")
             self.assertFalse(custody["cleanup_verified"])
-            self.assertTrue((case_container_root / "tmp").exists())
-            self.assertFalse((operation_path / "completion-receipt.json").exists())
-            retry_env = {
-                "FAKE_CONTAINER_ROOT": str(case_container_root),
-                "FAKE_CONTAINER_STATE": str(self.case_root / "cleanup-failure-no-replay" / "container-state.json"),
-                "EXPECTED_PREPARED_SHA": hashlib.sha256((operation_path / "prepared.workflow.json").read_bytes()).hexdigest(),
-                "FAKE_CONSUMER_MARKER": str(self.case_root / "cleanup-failure-no-replay" / "consumer.marker"),
-                "FAKE_CONSUMER_COUNT": str(case_count),
-                "FAKE_CLEANUP_MARKER": str(self.case_root / "cleanup-failure-no-replay" / "cleanup.marker"),
-                "FAKE_CLEANUP_FAIL": "1",
-            }
-            retry = self._run(
-                "Apply",
-                failure_operation_id,
-                expect_success=False,
-                extra_args=("-N8nContainer", "fake-container", "-DockerExecutable", str(fake_docker_cmd)),
-                extra_env=retry_env,
+            self.assertTrue((container_root / "tmp").exists())
+            self.assertEqual(count_path.read_text(encoding="utf-8"), "1")
+            check = (
+                f". '{SCRIPT}'; "
+                f"$custody = Read-BoundedJsonFile '{custody_path}'; "
+                f"$plan = Read-BoundedJsonFile '{operation_path / 'plan.json'}'; "
+                "try { Assert-BoundedContainerCustody $custody $plan; Assert-BoundedContainerCleanupVerified $custody; exit 0 } "
+                "catch { Write-Output $_.Exception.Message; exit 1 }"
             )
-            self.assertIn("container_cleanup_not_verified", retry.stderr)
-            self.assertEqual(case_count.read_text(encoding="utf-8"), "1")
-            self.assertFalse((operation_path / "completion-receipt.json").exists())
+            retry = self._run_ps_command(check)
+            self.assertNotEqual(retry.returncode, 0)
+            self.assertIn("container_cleanup_not_verified", retry.stdout + retry.stderr)
+            self.assertEqual(count_path.read_text(encoding="utf-8"), "1")
 
-        completed_operation_path = self._operation_path(happy_operation_id)
-        custody_path = completed_operation_path / "container-custody.json"
+        custody_path = custody_operation_path / "container-custody.json"
         original_custody = _read_json(custody_path)
         for label, cleanup_state, cleanup_verified, expected in (
             ("existing-completion-pending-custody", "pending", False, "container_cleanup_not_verified"),
             ("existing-completion-unverified-custody", "cleaned", False, "container_cleanup_unverified"),
         ):
             with self.subTest(label=label):
-                mutated_custody = copy.deepcopy(original_custody)
-                mutated_custody["cleanup_state"] = cleanup_state
-                mutated_custody["cleanup_verified"] = cleanup_verified
-                _write_json(custody_path, mutated_custody)
-                completed = self._run("Apply", happy_operation_id, expect_success=False)
-                self.assertIn(expected, completed.stderr)
-                self.assertFalse(completed.stdout.strip().endswith('"status":"no_op_success"'))
+                mutated = copy.deepcopy(original_custody)
+                mutated["cleanup_state"] = cleanup_state
+                mutated["cleanup_verified"] = cleanup_verified
+                _write_json(custody_path, mutated)
+                check = (
+                    f". '{SCRIPT}'; "
+                    f"$custody = Read-BoundedJsonFile '{custody_path}'; "
+                    f"$plan = Read-BoundedJsonFile '{custody_path.parent / 'plan.json'}'; "
+                    "try { Assert-BoundedContainerCustody $custody $plan; Assert-BoundedContainerCleanupVerified $custody; exit 0 } "
+                    "catch { Write-Output $_.Exception.Message; exit 1 }"
+                )
+                completed = self._run_ps_command(check)
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertIn(expected, completed.stdout + completed.stderr)
                 _write_json(custody_path, original_custody)
+
 
     def test_completion_claims_are_typed_and_bound_to_immutable_plan(self) -> None:
         operation_id, _ = self._capture("completion-claims")
@@ -1271,14 +1347,30 @@ raise SystemExit(16)
         self.assertNotEqual(completed.returncode, 0, completed.stdout + completed.stderr)
         self.assertIn(expected, completed.stdout + completed.stderr)
 
-    def _run_ps_command(self, command_text: str) -> subprocess.CompletedProcess[str]:
+    def _run_ps_command(
+        self,
+        command_text: str,
+        *,
+        extra_env: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
         encoded = base64.b64encode(command_text.encode("utf-16le")).decode("ascii")
+        environment = os.environ.copy()
+        for name in (
+            "N8N_WORKFLOW_HOOK_SCRIPT",
+            "N8N_WORKFLOW_HOOK_AUTOLOAD",
+            "N8N_WORKFLOW_VALIDATION_RULES",
+            "N8N_WORKFLOW_VALIDATION_RULES_AUTOLOAD",
+        ):
+            environment.pop(name, None)
+        if extra_env:
+            environment.update(extra_env)
         return subprocess.run(
             [self.pwsh, "-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
             cwd=ROOT,
             capture_output=True,
             text=True,
             encoding="utf-8",
+            env=environment,
             timeout=30,
         )
 

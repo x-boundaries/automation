@@ -117,6 +117,25 @@ function Get-BoundedSha256File {
     return Get-BoundedSha256Bytes ([System.IO.File]::ReadAllBytes($Path))
 }
 
+function Get-BoundedGitBlobSha1 {
+    param([Parameter(Mandatory)][string]$Path)
+    try {
+        $content = [System.IO.File]::ReadAllBytes($Path)
+        $header = [System.Text.Encoding]::ASCII.GetBytes(("blob {0}" -f $content.Length) + [char]0)
+        $payload = [byte[]]::new($header.Length + $content.Length)
+        [System.Buffer]::BlockCopy($header, 0, $payload, 0, $header.Length)
+        [System.Buffer]::BlockCopy($content, 0, $payload, $header.Length, $content.Length)
+        $sha1 = [System.Security.Cryptography.SHA1]::Create()
+        try {
+            return (($sha1.ComputeHash($payload) | ForEach-Object { $_.ToString("x2") }) -join "")
+        } finally {
+            $sha1.Dispose()
+        }
+    } catch {
+        Stop-Bounded "repository_workflow_blob_unavailable"
+    }
+}
+
 function ConvertTo-BoundedCanonicalJsonElement {
     param(
         [Parameter(Mandatory)][System.Text.Json.JsonElement]$Element,
@@ -536,6 +555,32 @@ function Assert-BoundedCursor {
 
 function Get-BoundedRepositoryIdentity {
     param([Parameter(Mandatory)][string]$Root)
+    if ($script:BoundedTestOnly) {
+        $repositoryProperty = if ($null -eq $script:BoundedFixture) { $null } else { $script:BoundedFixture.PSObject.Properties["repository"] }
+        if ($null -eq $repositoryProperty -or $null -eq $repositoryProperty.Value) {
+            Stop-Bounded "fixture_repository_identity_missing"
+        }
+        $repository = $repositoryProperty.Value
+        Assert-BoundedExactProperties $repository @("head", "tree", "parent", "workflow_blob") "fixture_repository_identity_shape_invalid"
+        $fixtureValues = @{
+            head = [string]$repository.head
+            tree = [string]$repository.tree
+            parent = if ($null -eq $repository.parent) { $null } else { [string]$repository.parent }
+            workflow_blob = [string]$repository.workflow_blob
+        }
+        foreach ($name in @("head", "tree", "workflow_blob")) {
+            if ($fixtureValues[$name] -cnotmatch '^[0-9a-f]{40}$') { Stop-Bounded "fixture_repository_identity_invalid" }
+        }
+        if ($null -ne $fixtureValues.parent -and $fixtureValues.parent -cnotmatch '^[0-9a-f]{40}$') {
+            Stop-Bounded "fixture_repository_identity_invalid"
+        }
+        return [pscustomobject]([ordered]@{
+            head = $fixtureValues.head
+            tree = $fixtureValues.tree
+            parent = $fixtureValues.parent
+            workflow_blob = $fixtureValues.workflow_blob
+        })
+    }
     $values = @{}
     foreach ($name in @("head", "tree", "parent", "workflow_blob")) {
         $argument = switch ($name) {
@@ -953,6 +998,7 @@ function Invoke-BoundedProcess {
         [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Arguments,
         [string]$InputText = ""
     )
+    if ($script:BoundedTestOnly) { Stop-Bounded "test_only_process_forbidden" }
     $processInfo = New-Object System.Diagnostics.ProcessStartInfo
     $processInfo.FileName = $command
     $processInfo.UseShellExecute = $false
@@ -1029,6 +1075,7 @@ function Invoke-BoundedExternalCommand {
         [string]$ContainerInputKey = "",
         [AllowNull()][object]$ContainerEvidenceContext = $null
     )
+    if ($script:BoundedTestOnly) { Stop-Bounded "test_only_external_command_forbidden" }
     if ($Verb -notin @("list:workflow", "export:workflow", "import:workflow")) { Stop-Bounded "n8n_command_not_allowed" }
     if ($Arguments -match "--all" -or $Arguments -match "export:workflow.*--all") { Stop-Bounded "unbounded_workflow_export" }
     if ([string]::IsNullOrWhiteSpace($N8nContainer)) {
@@ -1757,9 +1804,13 @@ function Assert-BoundedReviewedWorkflowBytes {
         [Parameter(Mandatory)]$Repository
     )
     $path = Get-BoundedWorkflowFile $Root
-    $actual = & git -C $Root hash-object -- n8n-workflows/member_forms_gateway_ingest.workflow.json 2>$null
-    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace([string]$actual)) { Stop-Bounded "repository_workflow_blob_unavailable" }
-    $actualHash = ([string]$actual).Trim()
+    if ($script:BoundedTestOnly) {
+        $actualHash = Get-BoundedGitBlobSha1 $path
+    } else {
+        $actual = & git -C $Root hash-object -- n8n-workflows/member_forms_gateway_ingest.workflow.json 2>$null
+        if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace([string]$actual)) { Stop-Bounded "repository_workflow_blob_unavailable" }
+        $actualHash = ([string]$actual).Trim()
+    }
     if ($actualHash -notmatch '^[0-9a-f]{40}$' -or $actualHash -cne [string]$Repository.workflow_blob) { Stop-Bounded "repository_workflow_blob_mismatch" }
     return $path
 }
@@ -2126,10 +2177,26 @@ function Write-BoundedFixtureMarker {
     return $path
 }
 
+function Assert-BoundedFixtureDispatchMode {
+    param([Parameter(Mandatory)]$Fixture)
+    $modeProperty = $Fixture.PSObject.Properties["dispatch_mode"]
+    if ($null -eq $modeProperty -or $null -eq $modeProperty.Value) { Stop-Bounded "fixture_dispatch_mode_invalid" }
+    $mode = [string]$modeProperty.Value
+    $allowed = @("success", "pre_dispatch_failure", "ambiguous", "interrupt_after_start", "concurrent_success")
+    $valid = $false
+    foreach ($candidate in $allowed) {
+        if ($candidate -ceq $mode) {
+            $valid = $true
+            break
+        }
+    }
+    if (-not $valid) { Stop-Bounded "fixture_dispatch_mode_invalid" }
+}
+
 function Wait-BoundedFixtureAdmissionBarrier {
     param([AllowNull()]$Fixture)
     if ($null -eq $Fixture) { return }
-    if (-not $script:BoundedTestOnly -or [string]$Fixture.dispatch_mode -ne "concurrent_success") { return }
+    if (-not $script:BoundedTestOnly -or [string]$Fixture.dispatch_mode -cne "concurrent_success") { return }
     $barrier = [string]$Fixture.admission_barrier_directory
     Write-BoundedFixtureMarker $barrier | Out-Null
     for ($attempt = 0; $attempt -lt 240; $attempt++) {
@@ -2141,21 +2208,21 @@ function Wait-BoundedFixtureAdmissionBarrier {
 
 function Invoke-BoundedOfflineDispatch {
     param([Parameter(Mandatory)]$Fixture)
+    Assert-BoundedFixtureDispatchMode $Fixture
     $mode = [string]$Fixture.dispatch_mode
-    if ($mode -eq "pre_dispatch_failure") {
+    if ($mode -ceq "pre_dispatch_failure") {
         return [pscustomobject]([ordered]@{ started = $false; outcome = "pre_dispatch_failure" })
     }
-    if ($mode -eq "ambiguous") {
+    if ($mode -ceq "ambiguous") {
         return [pscustomobject]([ordered]@{ started = $true; outcome = "ambiguous" })
     }
-    if ($mode -eq "interrupt_after_start") {
+    if ($mode -ceq "interrupt_after_start") {
         Stop-Bounded "dispatch_interrupted"
     }
-    if ($mode -eq "concurrent_success") {
+    if ($mode -ceq "concurrent_success") {
         Write-BoundedFixtureMarker ([string]$Fixture.dispatch_marker_directory) | Out-Null
         return [pscustomobject]([ordered]@{ started = $true; outcome = "completed" })
     }
-    if ($mode -ne "success") { Stop-Bounded "fixture_dispatch_mode_invalid" }
     return [pscustomobject]([ordered]@{ started = $true; outcome = "completed" })
 }
 
@@ -2168,7 +2235,7 @@ function Invoke-BoundedMutation {
     $preparedPath = Join-Path $OperationPath "prepared.workflow.json"
     $prepared = Read-BoundedWorkflowFile $preparedPath
     Assert-BoundedInactiveWorkflow $prepared
-    if ($script:BoundedTestOnly -and [string]$script:BoundedFixture.dispatch_mode -ne "container_visible_import") {
+    if ($script:BoundedTestOnly) {
         return Invoke-BoundedOfflineDispatch $script:BoundedFixture
     }
     $containerEvidenceContext = if ([string]::IsNullOrWhiteSpace($N8nContainer)) {
@@ -2348,6 +2415,7 @@ function Initialize-BoundedContext {
     if ($TestOnly -and [string]::IsNullOrWhiteSpace($FixtureFile)) { Stop-Bounded "fixture_required" }
     if ($TestOnly) {
         $script:BoundedFixture = Read-BoundedJsonFile (Resolve-BoundedFullPath $FixtureFile) -AllowFloatingPoint
+        Assert-BoundedFixtureDispatchMode $script:BoundedFixture
     }
     Assert-BoundedPrivateDestination $root $operations
     Assert-BoundedNoGenericHooks $root
