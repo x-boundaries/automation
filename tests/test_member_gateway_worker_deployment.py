@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -44,6 +45,93 @@ ALLOWED_FILES = {
 }
 
 
+def _assert_autocount_probe_contract(probe: str) -> None:
+    def require(condition: bool, message: str) -> None:
+        if not condition:
+            raise AssertionError(message)
+
+    require(
+        'if ($PSVersionTable.PSEdition -ne "Desktop" -or $PSVersionTable.PSVersion.Major -ne 5) {' in probe,
+        "PowerShell Desktop/version gate is missing",
+    )
+    require(
+        'if (-not [Environment]::Is64BitProcess) { throw "autocount_64bit_powershell_required" }' in probe,
+        "64-bit gate is missing",
+    )
+
+    required_assembly_match = re.search(
+        r"\$requiredAssemblies\s*=\s*@\(\n(?P<body>.*?)^\)",
+        probe,
+        re.MULTILINE | re.DOTALL,
+    )
+    require(required_assembly_match is not None, "required assembly set is missing")
+    required_assemblies = re.findall(r'"([^"\r\n]+\.dll)"', required_assembly_match.group("body"))
+    require(
+        required_assemblies
+        == [
+            "AutoCount.dll",
+            "AutoCount.Accounting.dll",
+            "AutoCount.Invoicing.dll",
+            "AutoCount.ImportExport.dll",
+            "AutoCount.Tools.dll",
+        ],
+        "required assembly set/order is not the accepted five-assembly contract",
+    )
+
+    require(
+        probe.count("[Reflection.Assembly]::ReflectionOnlyLoadFrom($path)") == 1,
+        "ReflectionOnlyLoadFrom loading contract is missing or duplicated",
+    )
+    require(
+        '$loaded[$name] = [Reflection.Assembly]::ReflectionOnlyLoadFrom($path)' in probe,
+        "required assemblies are not loaded into the named map",
+    )
+    require(
+        probe.count('$invoicing = $loaded["AutoCount.Invoicing.dll"]') == 1,
+        "invoicing binding is not exact",
+    )
+
+    member_command_lines = [
+        line.strip() for line in probe.splitlines() if "AutoCount.BonusPoint.Member.MemberCommand" in line
+    ]
+    require(
+        member_command_lines
+        == [
+            '@($invoicing, "AutoCount.BonusPoint.Member.MemberCommand")',
+            '$memberCommand = $invoicing.GetType("AutoCount.BonusPoint.Member.MemberCommand", $true, $false)',
+        ],
+        "MemberCommand has an alternate binding, scan, or fallback",
+    )
+
+    required_methods_match = re.search(
+        r"foreach \(\$name in @\((?P<body>[^)]*)\)\)\s*\{\s*"
+        r"if \(\$methodNames -notcontains \$name\)",
+        probe,
+        re.DOTALL,
+    )
+    require(required_methods_match is not None, "required MemberCommand method check is missing")
+    required_methods = re.findall(r'"([^"\r\n]+)"', required_methods_match.group("body"))
+    require(
+        required_methods == ["Create", "GetMember", "NewMember", "SaveMember"],
+        "required MemberCommand method set is incomplete or changed",
+    )
+    require(
+        "$memberCommand.GetMethods() | ForEach-Object Name" in probe,
+        "MemberCommand method enumeration is missing",
+    )
+
+    for forbidden in (
+        "AssemblyResolve",
+        "GetFiles(",
+        "EnumerateFiles(",
+        "GetFileSystemEntries(",
+        "Get-ChildItem",
+        "[IO.Directory]::",
+        "[IO.DirectoryInfo]::",
+    ):
+        require(forbidden not in probe, f"forbidden broad/fallback resolver token: {forbidden}")
+
+
 class MemberGatewayWorkerDeploymentTests(unittest.TestCase):
     @staticmethod
     def _blob(path: str) -> str:
@@ -58,6 +146,19 @@ class MemberGatewayWorkerDeploymentTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.pwsh = shutil.which("powershell") or shutil.which("pwsh")
+
+    @staticmethod
+    def _desktop_powershell_environment() -> dict[str, str]:
+        env = os.environ.copy()
+        module_path_key = next((key for key in env if key.casefold() == "psmodulepath"), None)
+        module_path = env.get(module_path_key) if module_path_key else None
+        if module_path and module_path_key:
+            env[module_path_key] = os.pathsep.join(
+                path
+                for path in module_path.split(os.pathsep)
+                if "native\\powershell\\modules" not in path.casefold()
+            )
+        return env
 
     def _run_powershell_harness(self, script: str, *arguments: str, env: dict[str, str] | None = None):
         if not self.pwsh:
@@ -109,25 +210,34 @@ class MemberGatewayWorkerDeploymentTests(unittest.TestCase):
 
     def test_autocount_probe_binds_member_command_to_invoicing(self) -> None:
         probe = (ROOT / "scripts/test_ac2_member_gateway_autocount_dependencies.ps1").read_text(encoding="utf-8")
-        assembly_order = [
-            "AutoCount.dll",
-            "AutoCount.Accounting.dll",
-            "AutoCount.Invoicing.dll",
-            "AutoCount.ImportExport.dll",
-            "AutoCount.Tools.dll",
-        ]
-        assembly_positions = [probe.index(f'"{name}"') for name in assembly_order]
-        self.assertEqual(assembly_positions, sorted(assembly_positions))
-        self.assertEqual(probe.count("ReflectionOnlyLoadFrom($path)"), 1)
-        self.assertIn('$invoicing = $loaded["AutoCount.Invoicing.dll"]', probe)
-        self.assertIn('@($invoicing, "AutoCount.BonusPoint.Member.MemberCommand")', probe)
-        self.assertIn('$memberCommand = $invoicing.GetType("AutoCount.BonusPoint.Member.MemberCommand", $true, $false)', probe)
-        for method_name in ("Create", "GetMember", "NewMember", "SaveMember"):
-            self.assertIn(f'"{method_name}"', probe)
-        self.assertNotIn('@($accounting, "AutoCount.BonusPoint.Member.MemberCommand")', probe)
-        self.assertNotIn('$accounting.GetType("AutoCount.BonusPoint.Member.MemberCommand"', probe)
-        self.assertNotIn("AssemblyResolve", probe)
-        self.assertNotIn("GetFiles(", probe)
+        _assert_autocount_probe_contract(probe)
+
+        rebind = probe.replace(
+            '$invoicing = $loaded["AutoCount.Invoicing.dll"]',
+            '$invoicing = $loaded["AutoCount.Tools.dll"]',
+            1,
+        )
+        alternate_scan = probe.replace(
+            '$memberCommand = $invoicing.GetType("AutoCount.BonusPoint.Member.MemberCommand", $true, $false)',
+            '$memberCommand = $invoicing.GetType("AutoCount.BonusPoint.Member.MemberCommand", $true, $false)\n'
+            '$alternateMemberCommand = @($loaded.Values | ForEach-Object { $_.GetType("AutoCount.BonusPoint.Member.MemberCommand", $false, $false) } | Where-Object { $null -ne $_ } | Select-Object -First 1)\n'
+            'if ($null -eq $memberCommand) { $memberCommand = $alternateMemberCommand }',
+            1,
+        )
+        sixth_assembly = probe.replace(
+            '    "AutoCount.Tools.dll"\n)',
+            '    "AutoCount.Tools.dll",\n    "AutoCount.Extended.dll"\n)',
+            1,
+        )
+
+        for name, counterexample in (
+            ("wrong invoicing binding", rebind),
+            ("alternate assembly MemberCommand scan", alternate_scan),
+            ("sixth required assembly", sixth_assembly),
+        ):
+            with self.subTest(counterexample=name):
+                with self.assertRaises(AssertionError):
+                    _assert_autocount_probe_contract(counterexample)
 
     def test_production_launcher_accepts_exact_strings_and_preserves_dpapi_mapping(self) -> None:
         if not self.pwsh:
@@ -207,24 +317,93 @@ $info = New-XbWorkerProcessStartInfo -WorkerScript $args[1] -LauncherMode Produc
             install = root / "install"
             runtime = root / "runtime"
             (runtime / "config").mkdir(parents=True)
+            (runtime / "secrets").mkdir()
             install.mkdir()
             marker = root / "child-started.txt"
             (install / "ac2_member_gateway_worker.ps1").write_text(
+                "param([switch]$EnableProductionWorker, [switch]$EnableProductionAdapter)\n"
                 "$marker = [Environment]::GetEnvironmentVariable('XB_TEST_CHILD_MARKER', 'Process')\n"
-                "[IO.File]::WriteAllText($marker, 'started')\n",
+                "if ([string]::IsNullOrWhiteSpace($marker)) { throw 'synthetic_marker_missing' }\n"
+                "[IO.File]::WriteAllText($marker, 'started')\n"
+                "[pscustomobject]@{ status = 'completed'; writes = 0 } | ConvertTo-Json -Compress\n",
                 encoding="utf-8",
             )
             base_config = {
                 "gateway_base_url": "https://gateway.example.test",
                 "worker_host_binding": "host-ac2-worker",
                 "autocount_assembly_path": r"C:\\AutoCount",
-                "autocount_server_name": "server",
-                "autocount_database_name": "database",
-                "autocount_user_id": "user",
+                "autocount_server_name": "synthetic-server",
+                "autocount_database_name": "synthetic-database",
+                "autocount_user_id": "synthetic-user",
             }
-            env = os.environ.copy()
+            (runtime / "config" / "worker.config.json").write_text(
+                json.dumps(base_config), encoding="utf-8"
+            )
+            secret_environment = self._desktop_powershell_environment()
+            secret_environment["XB_TEST_WORKER_TOKEN_PATH"] = str(
+                runtime / "secrets" / "worker-token.clixml"
+            )
+            secret_environment["XB_TEST_PASSWORD_PATH"] = str(
+                runtime / "secrets" / "autocount-password.clixml"
+            )
+            secrets = subprocess.run(
+                [
+                    self.pwsh,
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "$ErrorActionPreference = 'Stop'; "
+                    "ConvertTo-SecureString -String 'synthetic-worker-token' -AsPlainText -Force | "
+                    "Export-Clixml -LiteralPath $env:XB_TEST_WORKER_TOKEN_PATH; "
+                    "ConvertTo-SecureString -String 'synthetic-autocount-password' -AsPlainText -Force | "
+                    "Export-Clixml -LiteralPath $env:XB_TEST_PASSWORD_PATH",
+                ],
+                cwd=ROOT,
+                env=secret_environment,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(secrets.returncode, 0, secrets.stdout + secrets.stderr)
+            self.assertTrue((runtime / "secrets" / "worker-token.clixml").is_file())
+            self.assertTrue((runtime / "secrets" / "autocount-password.clixml").is_file())
+            env = self._desktop_powershell_environment()
             env["XB_TEST_CHILD_MARKER"] = str(marker)
             launcher = ROOT / "scripts/launch_ac2_member_gateway_worker.ps1"
+
+            control = subprocess.run(
+                [
+                    self.pwsh,
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-File",
+                    str(launcher),
+                    "-Mode",
+                    "Production",
+                    "-InstallRoot",
+                    str(install),
+                    "-RuntimeRoot",
+                    str(runtime),
+                    "-ExecutionTimeoutMilliseconds",
+                    "5000",
+                ],
+                cwd=ROOT,
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(control.returncode, 0, control.stdout + control.stderr)
+            control_result = json.loads(control.stdout)
+            self.assertEqual(control_result["exit_code"], 0)
+            self.assertEqual(control_result["terminal_status"], "worker_completed")
+            self.assertTrue(marker.exists(), control.stdout + control.stderr)
+            self.assertEqual(marker.read_text(encoding="utf-8"), "started")
+
             for field in ("autocount_server_name", "autocount_database_name", "autocount_user_id"):
                 for value in invalid_values:
                     with self.subTest(field=field, value=value):
@@ -263,6 +442,9 @@ $info = New-XbWorkerProcessStartInfo -WorkerScript $args[1] -LauncherMode Produc
                             text=True,
                         )
                         self.assertEqual(completed.returncode, 1, completed.stdout + completed.stderr)
+                        result = json.loads(completed.stdout)
+                        self.assertEqual(result["exit_code"], 1)
+                        self.assertEqual(result["terminal_status"], "launcher_failed")
                         self.assertFalse(marker.exists(), completed.stdout + completed.stderr)
 
     def test_disabled_proof_does_not_read_production_config_or_secrets(self) -> None:
