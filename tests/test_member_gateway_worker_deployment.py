@@ -145,7 +145,14 @@ class MemberGatewayWorkerDeploymentTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
-        cls.pwsh = shutil.which("powershell") or shutil.which("pwsh")
+        cls.pwsh = shutil.which("powershell")
+        if not cls.pwsh:
+            windows_root = os.environ.get("WINDIR") or os.environ.get("SystemRoot")
+            if windows_root:
+                desktop_powershell = Path(windows_root) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+                if desktop_powershell.is_file():
+                    cls.pwsh = str(desktop_powershell)
+        cls.pwsh = cls.pwsh or shutil.which("pwsh")
 
     @staticmethod
     def _desktop_powershell_environment() -> dict[str, str]:
