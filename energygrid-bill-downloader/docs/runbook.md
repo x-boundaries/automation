@@ -332,6 +332,65 @@ The ordering matters more than the mechanism.
 Retaining a verified copy preserves the option to recover. It performs no restoration and
 asserts no automatic recovery.
 
+## One-shot supervisor boundary
+
+The repository-only one-shot supervisor is a separate Windows PowerShell 5.1 control
+boundary. It has no live authority by itself and fixes the operation to `run`. Its mandatory
+parameters are `LauncherPath`, `ExpectedLauncherSha256`,
+`ExpectedLauncherLibrarySha256`, `ConfigPath`, `PythonExe`, `CheckoutRoot`,
+`CredentialPath`, `BrowserCachePath`, `ExpectedBranch`,
+`AuthorisedLauncherRootWriteSid[]`, `LogRoot`, `EvidenceRoot`, `RunId`, and
+`TimeoutSeconds` (`1..3600`). Filesystem inputs are local absolute paths; UNC, device,
+control-character, embedded-double-quote, invalid-hash, invalid-RunId and oversized
+serialised inputs are rejected before launcher creation. The launcher must be the fixed
+`launcher.ps1` identity beside `launcher_lib.ps1`, and both expected SHA-256 values are
+verified before any process is created. The supervisor never opens the credential, parses
+the private configuration, or executes the launcher during input validation.
+
+Containment is creation-time containment: an unnamed Job Object is configured with
+kill-on-job-close and no active-process, CPU, memory, breakaway or job-time ceiling. The
+launcher is created suspended through `STARTUPINFOEX` and the Job Object attribute list,
+before its initial thread can run. Standard input, output and error use three anonymous
+pipes; only the three launcher-side stream handles are inherited. Supervisor drain workers
+count bytes through fixed 64-KiB buffers and retain zero raw `stdout`/`stderr` bytes. A
+resume is attempted exactly once, only after the create-new INTENT has been flushed with
+`Flush(true)` and the control-state gate remains healthy. A failed or late durability
+operation closes that gate and never reopens it.
+
+`TimeoutSeconds` covers the contained launcher and descendant lifetime. Timeout,
+interruption, resume anomaly, membership/configuration failure, or another post-create
+infrastructure failure closes the gate, calls `TerminateJobObject` once with the fixed
+termination code, and performs bounded accounting/reap. Polling is bounded to 100 ms;
+there is no infinite wait. Reap is confirmed only by a successful final Job Object query
+showing `ActiveProcesses == 0`; closing a handle or observing a launcher exit is not proof.
+If terminal accounting cannot be established, the result remains `AMBIGUOUS`. No retry is
+permitted.
+
+The durable evidence pair is `<RunId>.intent.json` and `<RunId>.outcome.json`. Both are
+UTF-8 without BOM, one JSON object plus LF, create-new, exclusive while written, and
+flushed durably. OUTCOME carries the SHA-256 of the exact committed INTENT bytes, or null
+when INTENT was not committed. Evidence contains only bounded control/accounting fields,
+the positive application-child Boolean and observation elapsed milliseconds, byte counts,
+reap state, launcher exit code, and the fixed start verdict. Raw stdout/stderr, credentials,
+credential lengths, cookies, private command lines, private environment, private paths,
+customer content and exception bodies are never published. Evidence retention is 30 days
+pending separate operator disposition; the supervisor performs no cleanup.
+
+Start verdicts are conservative. `NOT_STARTED_PROVEN` requires a durable pre-creation
+rejection or the accepted launcher-only accounting predicate (`TotalProcesses == 1`,
+baseline and terminal accounting valid, `ActiveProcesses == 0`, no positive application
+observation, and no containment/evidence contradiction). `STARTED_PROVEN` requires a
+positive local `Win32_Process` observation matching the live launcher parent, normalized
+Python image and exact canonical application command line, consistent accounting with at
+least one descendant, valid durable INTENT/OUTCOME and confirmed reap. Everything else is
+`AMBIGUOUS`; a missed observer is not negative proof. Launcher exit 70, a launcher-failure
+log, missing application log, or stream content alone never proves `NOT_STARTED_PROVEN`.
+
+This section does not grant later authority. Repository implementation is separate from
+deployment, Credential import, `ValidateOnly`, a REAL run, and Scheduler registration.
+Each of those actions requires its own explicit current-turn authority and exact target;
+the supervisor implementation supplies no retry or escalation path.
+
 ## Recovery guidance
 
 `ARCHIVE_CONFLICT`, `STATE_INCONSISTENT`, `PORTAL_LAYOUT_CHANGED`, and
