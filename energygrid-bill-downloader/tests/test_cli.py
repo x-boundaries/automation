@@ -92,6 +92,7 @@ class CliTests(unittest.TestCase):
             [
                 "    paths:",
                 '      - "energygrid-bill-downloader/**"',
+                '      - "scripts/energygrid_one_shot_supervisor.ps1"',
                 '      - ".github/workflows/energygrid-bill-downloader-tests.yml"',
                 "      # EnergyGrid n8n error handler (#141): the source-controlled export, its focused",
                 "      # offline test, and the directory README that documents it. Exact entries, not a",
@@ -111,6 +112,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(
             [line.strip() for line in scope_guard if "$file -ne " in line],
             [
+                "$file -ne 'scripts/energygrid_one_shot_supervisor.ps1' -and",
                 "$file -ne '.github/workflows/energygrid-bill-downloader-tests.yml' -and",
                 "$file -ne 'n8n-workflows/energygrid_download_error_handler.workflow.json' -and",
                 "$file -ne 'tests/test_energygrid_n8n_error_handler.py' -and",
@@ -128,18 +130,20 @@ class CliTests(unittest.TestCase):
         # EnergyGrid change, which is the contradiction this repair removes.
         ownership = block_for(lines, "$owned = @($files | Where-Object {", 10)
         ownership_text = " ".join(ownership)
-        self.assertIn("$_ -match '^energygrid-bill-downloader/'", ownership_text)
-        self.assertIn(
-            "$_ -eq '.github/workflows/energygrid-bill-downloader-tests.yml'", ownership_text
+        self.assertEqual(
+            [line.strip() for line in ownership],
+            [
+                "$owned = @($files | Where-Object {",
+                "$_ -match '^energygrid-bill-downloader/' -or",
+                "$_ -eq 'scripts/energygrid_one_shot_supervisor.ps1' -or",
+                "$_ -eq '.github/workflows/energygrid-bill-downloader-tests.yml' -or",
+                "$_ -eq 'n8n-workflows/energygrid_download_error_handler.workflow.json' -or",
+                "$_ -eq 'tests/test_energygrid_n8n_error_handler.py'",
+            ],
         )
         # The n8n error handler export and its focused test are EnergyGrid-owned, so either
         # one alone arms the guard. `n8n-workflows/README.md` is a shared companion: it
         # triggers the workflow and is permitted, but it never confers ownership.
-        self.assertIn(
-            "$_ -eq 'n8n-workflows/energygrid_download_error_handler.workflow.json'",
-            ownership_text,
-        )
-        self.assertIn("$_ -eq 'tests/test_energygrid_n8n_error_handler.py'", ownership_text)
         self.assertNotIn("README.md", ownership_text)
         self.assertNotIn(".gitignore", ownership_text)
         self.assertIn("if ($owned.Count -eq 0) {", workflow)
