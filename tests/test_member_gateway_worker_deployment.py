@@ -363,9 +363,13 @@ $info = New-XbWorkerProcessStartInfo -WorkerScript $args[1] -LauncherMode Produc
                     "-NonInteractive",
                     "-Command",
                     "$ErrorActionPreference = 'Stop'; "
-                    "ConvertTo-SecureString -String 'synthetic-worker-token' -AsPlainText -Force | "
+                    "$workerToken = [Security.SecureString]::new(); "
+                    "'synthetic-worker-token'.ToCharArray() | ForEach-Object { $workerToken.AppendChar($_) }; "
+                    "$workerToken.MakeReadOnly(); $workerToken | "
                     "Export-Clixml -LiteralPath $env:XB_TEST_WORKER_TOKEN_PATH; "
-                    "ConvertTo-SecureString -String 'synthetic-autocount-password' -AsPlainText -Force | "
+                    "$autocountPassword = [Security.SecureString]::new(); "
+                    "'synthetic-autocount-password'.ToCharArray() | ForEach-Object { $autocountPassword.AppendChar($_) }; "
+                    "$autocountPassword.MakeReadOnly(); $autocountPassword | "
                     "Export-Clixml -LiteralPath $env:XB_TEST_PASSWORD_PATH",
                 ],
                 cwd=ROOT,
