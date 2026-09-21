@@ -2188,7 +2188,8 @@ class PlaywrightPortal:
                             "link_eb_bill": NAVIGATION_DIAGNOSTIC_POST_EMS_EB_BILL_LINK_READY,
                             "button_eb_bill": NAVIGATION_DIAGNOSTIC_POST_EMS_EB_BILL_BUTTON_READY,
                         }
-                        return result_by_key[key], post
+                        if key in result_by_key:
+                            return result_by_key[key], post
             except _NavigationDeadlineExhausted:
                 return NAVIGATION_DIAGNOSTIC_POST_EMS_WINDOW_EXHAUSTED, post
             except _NavigationFreshnessChanged as exc:

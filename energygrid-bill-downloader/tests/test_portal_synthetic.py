@@ -6278,12 +6278,55 @@ class NavigationDiagnosticStateMachineTests(unittest.TestCase):
         return result, portal, page, clock
 
     def assert_no_downstream_dispatch(self, page: NavigationDiagnosticPage) -> None:
+        self.assertEqual(page.ems_dispatches, 1)
         self.assertEqual(
             page.normal_clicks,
             {"button:EMS": 1},
             "only the single EMS entry dispatch is permitted",
         )
         self.assertEqual(page.goto_calls, 0)
+
+    def assert_complete_navigation_document(
+        self, result, expected_result: str
+    ) -> None:
+        self.assertEqual(result.result, expected_result)
+        self.assertEqual(result.status, portal_module.NAVIGATION_DIAGNOSTIC_COMPLETE_STATE)
+        document = cli.navigation_diagnostic_document(result)
+        self.assertEqual(document["schema"], cli.NAVIGATION_DIAGNOSTIC_SCHEMA)
+        self.assertNotIn("support_ref", document)
+
+    def assert_ready_ems_witness(self, result, key: str, role: str) -> None:
+        self.assertEqual(
+            result.post_ems["controls"][key],
+            {
+                "role": role,
+                "name": "EMS",
+                "count": 1,
+                "visible": True,
+                "enabled": True,
+                "trial_actionable": True,
+            },
+        )
+
+    def test_ready_button_ems_is_retained_and_does_not_terminate(self) -> None:
+        result, _portal, page, _clock = self.run_navigation(
+            post_controls={"button_ems": navigation_ready()}
+        )
+        self.assert_complete_navigation_document(
+            result, portal_module.NAVIGATION_DIAGNOSTIC_POST_EMS_WINDOW_EXHAUSTED
+        )
+        self.assert_no_downstream_dispatch(page)
+        self.assert_ready_ems_witness(result, "button_ems", "button")
+
+    def test_ready_link_ems_is_retained_and_does_not_terminate(self) -> None:
+        result, _portal, page, _clock = self.run_navigation(
+            post_controls={"link_ems": navigation_ready()}
+        )
+        self.assert_complete_navigation_document(
+            result, portal_module.NAVIGATION_DIAGNOSTIC_POST_EMS_WINDOW_EXHAUSTED
+        )
+        self.assert_no_downstream_dispatch(page)
+        self.assert_ready_ems_witness(result, "link_ems", "link")
 
     def test_inert_ems_consumes_one_dispatch_and_exhausts_the_window(self) -> None:
         result, portal, page, clock = self.run_navigation(ems_inert=True)
@@ -6296,16 +6339,20 @@ class NavigationDiagnosticStateMachineTests(unittest.TestCase):
         self.assertTrue(page.waits)
         self.assertLessEqual(max(page.waits), portal_module.MAX_PORTAL_PROBE_TIMEOUT_MS)
 
-    def test_delayed_billing_manager_link_is_observed_without_clicking(self) -> None:
+    def test_ems_witness_and_delayed_billing_manager_link_are_observed_without_clicking(self) -> None:
         delayed = [navigation_absent(), navigation_ready(href="/billing")]
         result, _portal, page, _clock = self.run_navigation(
-            post_controls={"link_billing_manager": delayed}
+            post_controls={
+                "button_ems": navigation_ready(),
+                "link_billing_manager": delayed,
+            }
         )
-        self.assertEqual(
-            result.result,
+        self.assert_complete_navigation_document(
+            result,
             portal_module.NAVIGATION_DIAGNOSTIC_POST_EMS_BILLING_MANAGER_LINK_READY,
         )
-        self.assertEqual(page.normal_clicks, {"button:EMS": 1})
+        self.assert_no_downstream_dispatch(page)
+        self.assert_ready_ems_witness(result, "button_ems", "button")
         self.assertGreaterEqual(page.trial_clicks.get("link:Billing Manager", 0), 1)
 
     def test_billing_manager_absent_duplicate_hidden_disabled_and_non_actionable_fail_closed(self) -> None:
@@ -6327,45 +6374,110 @@ class NavigationDiagnosticStateMachineTests(unittest.TestCase):
                 )
                 self.assertEqual(page.normal_clicks, {"button:EMS": 1})
 
-    def test_billing_manager_button_evidence_is_observational_only(self) -> None:
+    def test_ems_witness_and_billing_manager_button_evidence_are_observational_only(self) -> None:
         result, _portal, page, _clock = self.run_navigation(
-            post_controls={"button_billing_manager": navigation_ready()}
+            post_controls={
+                "button_ems": navigation_ready(),
+                "button_billing_manager": [navigation_absent(), navigation_ready()],
+            }
         )
-        self.assertEqual(
-            result.result,
+        self.assert_complete_navigation_document(
+            result,
             portal_module.NAVIGATION_DIAGNOSTIC_POST_EMS_BILLING_MANAGER_BUTTON_READY,
         )
-        self.assertEqual(page.normal_clicks, {"button:EMS": 1})
+        self.assert_no_downstream_dispatch(page)
+        self.assert_ready_ems_witness(result, "button_ems", "button")
 
-    def test_eb_bill_button_evidence_is_observational_only(self) -> None:
+    def test_ems_witness_and_delayed_eb_bill_button_evidence_are_observational_only(self) -> None:
         result, _portal, page, _clock = self.run_navigation(
-            post_controls={"button_eb_bill": navigation_ready()}
+            post_controls={
+                "button_ems": navigation_ready(),
+                "button_eb_bill": [navigation_absent(), navigation_ready()],
+            }
         )
-        self.assertEqual(
-            result.result,
+        self.assert_complete_navigation_document(
+            result,
             portal_module.NAVIGATION_DIAGNOSTIC_POST_EMS_EB_BILL_BUTTON_READY,
         )
-        self.assertEqual(page.normal_clicks, {"button:EMS": 1})
+        self.assert_no_downstream_dispatch(page)
+        self.assert_ready_ems_witness(result, "button_ems", "button")
 
     def test_direct_route_and_direct_link_have_their_distinct_positive_results(self) -> None:
         route, _portal, route_page, _clock = self.run_navigation(
             post_url="http://synthetic.invalid/eb-bill",
-            post_controls={"link_eb_bill": navigation_ready(href="/eb-bill")},
+            post_controls={
+                "button_ems": navigation_ready(),
+                "link_eb_bill": navigation_ready(href="/eb-bill"),
+            },
         )
-        self.assertEqual(
-            route.result,
+        self.assert_complete_navigation_document(
+            route,
             portal_module.NAVIGATION_DIAGNOSTIC_POST_EMS_EB_BILL_ROUTE_PROVEN,
         )
-        self.assertEqual(route_page.normal_clicks, {"button:EMS": 1})
+        self.assert_no_downstream_dispatch(route_page)
 
         direct, _portal, direct_page, _clock = self.run_navigation(
-            post_controls={"link_eb_bill": navigation_ready(href="/eb-bill")}
+            post_controls={
+                "button_ems": navigation_ready(),
+                # Route proof consumes one lookup before the control
+                # observation. The second lookup is the delayed ready witness.
+                "link_eb_bill": [
+                    navigation_absent(),
+                    navigation_absent(),
+                    navigation_absent(),
+                    navigation_ready(href="/eb-bill"),
+                ],
+            }
         )
-        self.assertEqual(
-            direct.result,
+        self.assert_complete_navigation_document(
+            direct,
             portal_module.NAVIGATION_DIAGNOSTIC_POST_EMS_EB_BILL_LINK_READY,
         )
-        self.assertEqual(direct_page.normal_clicks, {"button:EMS": 1})
+        self.assert_no_downstream_dispatch(direct_page)
+        self.assert_ready_ems_witness(direct, "button_ems", "button")
+
+    def test_ems_witness_and_later_eb_bill_route_proof_are_observed(self) -> None:
+        result, _portal, page, _clock = self.run_navigation(
+            post_url="http://synthetic.invalid/eb-bill",
+            post_controls={
+                "button_ems": navigation_ready(),
+                # Each checkpoint consumes one route-count lookup. A proven
+                # route then consumes one additional locator lookup for href.
+                "link_eb_bill": [
+                    navigation_absent(),
+                    navigation_absent(),
+                    navigation_absent(),
+                    navigation_absent(),
+                    navigation_ready(href="/eb-bill"),
+                    navigation_ready(href="/eb-bill"),
+                ],
+            }
+        )
+        self.assert_complete_navigation_document(
+            result, portal_module.NAVIGATION_DIAGNOSTIC_POST_EMS_EB_BILL_ROUTE_PROVEN
+        )
+        self.assert_no_downstream_dispatch(page)
+        self.assert_ready_ems_witness(result, "button_ems", "button")
+
+    def test_ems_witness_and_downstream_reader_failure_remain_unreadable(self) -> None:
+        result, _portal, page, _clock = self.run_navigation(
+            post_controls={
+                "button_ems": navigation_ready(),
+                "link_billing_manager": navigation_absent(
+                    count_error=RuntimeError("private-reader-failure token=tok_live_abcd")
+                ),
+            }
+        )
+        self.assertEqual(
+            result.result,
+            portal_module.NAVIGATION_DIAGNOSTIC_POST_EMS_OBSERVATION_UNREADABLE,
+        )
+        self.assertEqual(result.status, portal_module.NAVIGATION_DIAGNOSTIC_ACTION_REQUIRED_STATE)
+        self.assert_no_downstream_dispatch(page)
+        self.assertEqual(result.post_ems, portal_module.unobserved_navigation_post_ems())
+        document = cli.navigation_diagnostic_document(result)
+        self.assertEqual(document["schema"], cli.NAVIGATION_DIAGNOSTIC_SCHEMA)
+        self.assertEqual(document["support_ref"], "EG_NAV_DIAGNOSTIC_OBSERVATION_UNREADABLE")
 
     def test_multiple_pages_or_frames_terminate_without_surface_switching(self) -> None:
         pre_pages, _portal, page, _clock = self.run_navigation(pre_context_pages=2)
