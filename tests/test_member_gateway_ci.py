@@ -88,6 +88,10 @@ class MemberGatewayCiTests(unittest.TestCase):
         ):
             self.assertEqual(self.text.count(required_path), 2, required_path)
 
+    def test_worker_production_example_is_narrowly_triggered(self):
+        required_path = '"config/ac2_member_gateway_worker.production.example.json"'
+        self.assertEqual(self.text.count(required_path), 2, required_path)
+
     def test_tzdata_allowance_rejects_appended_package(self):
         mutated = self.text.replace(self.TZDATA_COMMAND, self.TZDATA_COMMAND + " requests", 1)
         with self.assertRaises(AssertionError):

@@ -1,0 +1,8 @@
+{
+  "gateway_base_url": "https://gateway.example.test",
+  "worker_host_binding": "host-ac2-worker",
+  "autocount_assembly_path": "C:\\Program Files\\AutoCount\\Bin",
+  "autocount_server_name": null,
+  "autocount_database_name": null,
+  "autocount_user_id": null
+}

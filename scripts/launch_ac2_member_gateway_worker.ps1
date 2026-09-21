@@ -57,6 +57,20 @@ function Read-XbCurrentUserSecretArtifact {
     return $holder.GetNetworkCredential().Password
 }
 
+function Get-XbRequiredProductionConfigString {
+    param(
+        $Config,
+        [Parameter(Mandatory)][string]$PropertyName,
+        [Parameter(Mandatory)][string]$ErrorId
+    )
+    if ($null -eq $Config) { throw $ErrorId }
+    $property = $Config.PSObject.Properties[$PropertyName]
+    if ($null -eq $property) { throw $ErrorId }
+    $value = $property.Value
+    if ($null -eq $value -or $value -isnot [string] -or [string]::IsNullOrWhiteSpace($value)) { throw $ErrorId }
+    return $value
+}
+
 function New-XbWorkerProcessStartInfo {
     param([string]$WorkerScript, [string]$LauncherMode, [string]$RuntimeRootPath)
     $startInfo = [Diagnostics.ProcessStartInfo]::new()
@@ -71,6 +85,9 @@ function New-XbWorkerProcessStartInfo {
     # user-scoped secure-string artifacts and supplies no production switch.
     if ($LauncherMode -eq "Production") {
         $config = Get-Content -Raw -LiteralPath (Join-Path $RuntimeRootPath "config\worker.config.json") | ConvertFrom-Json
+        $autocountServerName = Get-XbRequiredProductionConfigString -Config $config -PropertyName "autocount_server_name" -ErrorId "launcher_autocount_server_name_invalid"
+        $autocountDatabaseName = Get-XbRequiredProductionConfigString -Config $config -PropertyName "autocount_database_name" -ErrorId "launcher_autocount_database_name_invalid"
+        $autocountUserId = Get-XbRequiredProductionConfigString -Config $config -PropertyName "autocount_user_id" -ErrorId "launcher_autocount_user_id_invalid"
         $workerToken = Read-XbCurrentUserSecretArtifact -Path (Join-Path $RuntimeRootPath "secrets\worker-token.clixml")
         $ac2Password = Read-XbCurrentUserSecretArtifact -Path (Join-Path $RuntimeRootPath "secrets\autocount-password.clixml")
         if ([string]::IsNullOrWhiteSpace($workerToken) -or [string]::IsNullOrWhiteSpace($ac2Password)) { throw "launcher_secret_invalid" }
@@ -80,7 +97,14 @@ function New-XbWorkerProcessStartInfo {
         $startInfo.EnvironmentVariables["XB_MEMBER_GATEWAY_URL"] = [string]$config.gateway_base_url
         $startInfo.EnvironmentVariables["XB_MEMBER_GATEWAY_WORKER_HOST_BINDING"] = [string]$config.worker_host_binding
         $startInfo.EnvironmentVariables["XB_AC2_ASSEMBLY_PATH"] = [string]$config.autocount_assembly_path
-        $startInfo.EnvironmentVariables.Remove("XB_AC2_SESSION_FACTORY")
+        $startInfo.EnvironmentVariables["XB_AC2_SERVER_NAME"] = $autocountServerName
+        $startInfo.EnvironmentVariables["XB_AC2_DATABASE_NAME"] = $autocountDatabaseName
+        $startInfo.EnvironmentVariables["XB_AC2_USER_ID"] = $autocountUserId
+        [void]$startInfo.EnvironmentVariables.Remove("AC2_PROBE_SERVER_NAME")
+        [void]$startInfo.EnvironmentVariables.Remove("AC2_PROBE_DATABASE_NAME")
+        [void]$startInfo.EnvironmentVariables.Remove("AC2_PROBE_USER_ID")
+        [void]$startInfo.EnvironmentVariables.Remove("AC2_PROBE_PASSWORD")
+        [void]$startInfo.EnvironmentVariables.Remove("XB_AC2_SESSION_FACTORY")
         $arguments += @("-EnableProductionWorker", "-EnableProductionAdapter")
         $workerToken = $null
         $ac2Password = $null
@@ -108,8 +132,9 @@ $process = $null
 try {
     $workerScript = Join-Path $InstallRoot "ac2_member_gateway_worker.ps1"
     if (-not (Test-Path -LiteralPath $workerScript -PathType Leaf)) { throw "worker_script_missing" }
+    $startInfo = New-XbWorkerProcessStartInfo -WorkerScript $workerScript -LauncherMode $Mode -RuntimeRootPath $RuntimeRoot
     $process = [Diagnostics.Process]::new()
-    $process.StartInfo = New-XbWorkerProcessStartInfo -WorkerScript $workerScript -LauncherMode $Mode -RuntimeRootPath $RuntimeRoot
+    $process.StartInfo = $startInfo
     if (-not $process.Start()) { throw "worker_start_failed" }
     $stdoutTask = $process.StandardOutput.ReadToEndAsync()
     $stderrTask = $process.StandardError.ReadToEndAsync()
