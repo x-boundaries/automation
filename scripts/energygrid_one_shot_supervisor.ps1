@@ -536,6 +536,12 @@ public static class EnergyGridOneShotSupervisorNative
         public int ErrorCode;
     }
 
+    private sealed class DurabilityWorkerState
+    {
+        public int Succeeded;
+        public int ErrorCode;
+    }
+
     public sealed class WaitResult
     {
         public uint Value;
@@ -982,7 +988,7 @@ public static class EnergyGridOneShotSupervisorNative
     public static DurabilityResult WriteFlushBounded(
         FileStream stream, byte[] bytes, int timeoutMilliseconds)
     {
-        DurabilityResult result = new DurabilityResult();
+        DurabilityWorkerState workerState = new DurabilityWorkerState();
         Thread writer = new Thread(delegate()
         {
             try
@@ -991,20 +997,30 @@ public static class EnergyGridOneShotSupervisorNative
                 stream.SetLength(0);
                 stream.Write(bytes, 0, bytes.Length);
                 stream.Flush(true);
-                result.Succeeded = true;
+                Volatile.Write(ref workerState.Succeeded, 1);
             }
             catch
             {
-                result.ErrorCode = 0;
+                Volatile.Write(ref workerState.ErrorCode, 0);
             }
         });
         writer.IsBackground = true;
         writer.Start();
         if (!writer.Join(timeoutMilliseconds))
         {
-            result.TimedOut = true;
+            return new DurabilityResult
+            {
+                Succeeded = false,
+                TimedOut = true,
+                ErrorCode = 0
+            };
         }
-        return result;
+        return new DurabilityResult
+        {
+            Succeeded = Volatile.Read(ref workerState.Succeeded) != 0,
+            TimedOut = false,
+            ErrorCode = Volatile.Read(ref workerState.ErrorCode)
+        };
     }
 
     public static NativeBooleanResult TerminateJob(IntPtr job, uint exitCode)
@@ -1424,7 +1440,7 @@ function Write-EgReservedIntent {
         }
         $durability = [EnergyGridOneShotSupervisorNative]::WriteFlushBounded(
             $Stream, $Bytes, $TimeoutMilliseconds)
-        if (-not $durability.Succeeded) {
+        if ($durability.TimedOut -or -not $durability.Succeeded) {
             Stop-EgSupervisor -SupportRef 'EG_SUPERVISOR_INTENT_FLUSH_FAILED' `
                 -ErrorCode $durability.ErrorCode -EvidenceFailure
         }
@@ -1511,7 +1527,7 @@ function Write-EgOutcome {
             }
             $durability = [EnergyGridOneShotSupervisorNative]::WriteFlushBounded(
                 $stream, $bytes, 5000)
-            if (-not $durability.Succeeded) {
+            if ($durability.TimedOut -or -not $durability.Succeeded) {
                 Stop-EgSupervisor -SupportRef 'EG_SUPERVISOR_OUTCOME_FLUSH_FAILED' `
                     -ErrorCode $durability.ErrorCode -EvidenceFailure
             }
@@ -1744,6 +1760,44 @@ function Wait-EgDrains {
     if ($StdoutDrain.Failed -or $StderrDrain.Failed -or
         -not $script:EgState.stdout_complete -or -not $script:EgState.stderr_complete) {
         $script:EgState.drain_failure = $true
+    }
+}
+
+function Wait-EgDescendantGrace {
+    param(
+        [Parameter(Mandatory = $true)][IntPtr]$JobHandle,
+        [Parameter(Mandatory = $true)][IntPtr]$LauncherHandle,
+        [Parameter(Mandatory = $true)][uint32]$LauncherPid,
+        [Parameter(Mandatory = $true)][long]$StartTicks,
+        [Parameter(Mandatory = $true)][long]$DeadlineTicks
+    )
+
+    $graceDeadline = [int64]([System.Diagnostics.Stopwatch]::GetTimestamp() +
+        ([int64]5 * [int64][System.Diagnostics.Stopwatch]::Frequency))
+    while ($script:EgState.active_processes -gt 0) {
+        if ([EnergyGridOneShotSupervisorNative]::IsTerminationRequested) { break }
+        if (Test-EgDeadlineReached -DeadlineTicks $DeadlineTicks) { break }
+        if ([System.Diagnostics.Stopwatch]::GetTimestamp() -ge $graceDeadline) { break }
+        if (-not $script:EgState.application_child_observed) {
+            if (Test-EgApplicationChild -JobHandle $JobHandle -LauncherHandle $LauncherHandle `
+                -LauncherPid $LauncherPid -StartTicks $StartTicks) {
+                $script:EgState.application_child_observed = $true
+            }
+        }
+        $null = Get-EgAccounting -JobHandle $JobHandle
+        Start-Sleep -Milliseconds 100
+    }
+    if ($script:EgState.active_processes -gt 0) {
+        if ([EnergyGridOneShotSupervisorNative]::IsTerminationRequested) {
+            Invoke-EgTerminateJob -JobHandle $JobHandle -Reason 'INTERRUPTION'
+        }
+        elseif (Test-EgDeadlineReached -DeadlineTicks $DeadlineTicks) {
+            Invoke-EgTerminateJob -JobHandle $JobHandle -Reason 'TIMEOUT'
+        }
+        else {
+            $script:EgState.descendant_grace_expired = $true
+            Invoke-EgTerminateJob -JobHandle $JobHandle -Reason 'DESCENDANT_GRACE_EXPIRED'
+        }
     }
 }
 
@@ -1998,24 +2052,9 @@ try {
     }
 
     if ($launcherSignaled -and -not $script:EgState.termination_started) {
-        $graceDeadline = [int64]([System.Diagnostics.Stopwatch]::GetTimestamp() +
-            ([int64]5 * [int64][System.Diagnostics.Stopwatch]::Frequency))
-        while ($script:EgState.active_processes -gt 0 -and
-            [System.Diagnostics.Stopwatch]::GetTimestamp() -lt $graceDeadline -and
-            -not (Test-EgDeadlineReached -DeadlineTicks $deadlineTicks)) {
-            if (-not $script:EgState.application_child_observed) {
-                if (Test-EgApplicationChild -JobHandle $jobHandle -LauncherHandle $processHandle `
-                    -LauncherPid $creation.ProcessInfo.dwProcessId -StartTicks $creationStartTicks) {
-                    $script:EgState.application_child_observed = $true
-                }
-            }
-            $null = Get-EgAccounting -JobHandle $jobHandle
-            Start-Sleep -Milliseconds 100
-        }
-        if ($script:EgState.active_processes -gt 0) {
-            $script:EgState.descendant_grace_expired = $true
-            Invoke-EgTerminateJob -JobHandle $jobHandle -Reason 'DESCENDANT_GRACE_EXPIRED'
-        }
+        Wait-EgDescendantGrace -JobHandle $jobHandle -LauncherHandle $processHandle `
+            -LauncherPid $creation.ProcessInfo.dwProcessId -StartTicks $creationStartTicks `
+            -DeadlineTicks $deadlineTicks
     }
     if ($script:EgState.termination_started) {
         Wait-EgReap -JobHandle $jobHandle -DeadlineTicks $deadlineTicks -WindowSeconds 30
