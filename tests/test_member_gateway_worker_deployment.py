@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import base64
 from concurrent.futures import ThreadPoolExecutor
 import unittest
 from pathlib import Path, PureWindowsPath
@@ -531,6 +532,287 @@ try {
 '''
 
 
+_NATIVE_IDENTITY_MATRIX_WITNESS = r'''[CmdletBinding()]
+param(
+    [Parameter(Mandatory)][string]$ManifestPath
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+
+function Fail-Witness {
+    param([Parameter(Mandatory)][string]$Message)
+    throw "identity matrix witness failed: $Message"
+}
+
+function Decode-Field {
+    param([Parameter(Mandatory)][string]$Value)
+    try {
+        return [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($Value))
+    } catch {
+        Fail-Witness -Message "invalid metadata encoding"
+    }
+}
+
+function Get-Ancestors {
+    param([Parameter(Mandatory)][object]$Node)
+    $current = $Node
+    while ($null -ne $current) {
+        Write-Output $current
+        $current = $current.Parent
+    }
+}
+
+function Test-Region {
+    param(
+        [Parameter(Mandatory)][System.Management.Automation.Language.Ast]$Node,
+        [Parameter(Mandatory)][int]$StartLine,
+        [Parameter(Mandatory)][int]$EndLine
+    )
+    return $Node.Extent.StartLineNumber -ge $StartLine -and
+        $Node.Extent.StartLineNumber -le $EndLine
+}
+
+function Test-VariablePathIdentity {
+    param(
+        [Parameter(Mandatory)][System.Management.Automation.VariablePath]$Actual,
+        [Parameter(Mandatory)][System.Management.Automation.VariablePath]$Expected
+    )
+    if ([string]$Actual.UserPath -ine [string]$Expected.UserPath) { return $false }
+    foreach ($propertyName in @(
+        "IsUnqualified", "IsDriveQualified", "IsGlobal", "IsLocal", "IsPrivate",
+        "IsScript", "IsVariable", "IsUnscopedVariable", "DriveName"
+    )) {
+        if ([string]$Actual.$propertyName -cne [string]$Expected.$propertyName) {
+            return $false
+        }
+    }
+    return $true
+}
+
+function Test-WitnessContext {
+    param(
+        [Parameter(Mandatory)][System.Management.Automation.Language.Ast]$Node,
+        [Parameter(Mandatory)][string]$Context
+    )
+    $ancestors = @(Get-Ancestors -Node $Node)
+    $names = @($ancestors | ForEach-Object { $_.GetType().Name })
+    $subExpressions = @(
+        $ancestors | Where-Object {
+            $_ -is [System.Management.Automation.Language.SubExpressionAst]
+        }
+    )
+    $expandables = @(
+        $ancestors | Where-Object {
+            $_ -is [System.Management.Automation.Language.ExpandableStringExpressionAst]
+        }
+    )
+    $commands = @(
+        $ancestors | Where-Object {
+            $_ -is [System.Management.Automation.Language.CommandAst]
+        }
+    )
+    $parens = @(
+        $ancestors | Where-Object {
+            $_ -is [System.Management.Automation.Language.ParenExpressionAst]
+        }
+    )
+    $scriptBlocks = @(
+        $ancestors | Where-Object {
+            $_ -is [System.Management.Automation.Language.ScriptBlockAst]
+        }
+    )
+    $hereStrings = @(
+        $expandables | Where-Object {
+            [string]$_.StringConstantType -match "HereString$"
+        }
+    )
+
+    switch ($Context) {
+        'top-level statement' {
+            return $subExpressions.Count -eq 0 -and
+                $expandables.Count -eq 0 -and
+                $commands.Count -eq 0 -and
+                $parens.Count -eq 0 -and
+                $scriptBlocks.Count -eq 1
+        }
+        'expandable-string $()' {
+            return $subExpressions.Count -eq 1 -and
+                $expandables.Count -eq 1 -and
+                $hereStrings.Count -eq 0
+        }
+        'expandable here-string $()' {
+            return $subExpressions.Count -eq 1 -and
+                $expandables.Count -eq 1 -and
+                $hereStrings.Count -eq 1
+        }
+        'nested $($())' {
+            return $subExpressions.Count -ge 2 -and
+                $expandables.Count -ge 1 -and
+                $hereStrings.Count -eq 0
+        }
+        'invoked scriptblock' {
+            return $commands.Count -ge 1 -and $scriptBlocks.Count -ge 2 -and
+                $subExpressions.Count -eq 0
+        }
+        'Write-Output (mutation)' {
+            return $commands.Count -ge 1 -and $parens.Count -ge 1 -and
+                $subExpressions.Count -eq 0
+        }
+        default {
+            Fail-Witness -Message "unknown context '$Context'"
+        }
+    }
+}
+
+function Get-ExpectedAssignmentOperator {
+    param([Parameter(Mandatory)][string]$Operator)
+    $map = @{
+        "=" = "Equals"
+        "+=" = "PlusEquals"
+        "-=" = "MinusEquals"
+        "*=" = "MultiplyEquals"
+        "/=" = "DivideEquals"
+        "%=" = "RemainderEquals"
+    }
+    if (-not $map.ContainsKey($Operator)) {
+        Fail-Witness -Message "unknown assignment operator '$Operator'"
+    }
+    return $map[$Operator]
+}
+
+function Get-ExpectedUnaryOperator {
+    param([Parameter(Mandatory)][string]$Operator)
+    $map = @{
+        "prefix++" = "PlusPlus"
+        "prefix--" = "MinusMinus"
+        "postfix++" = "PostfixPlusPlus"
+        "postfix--" = "PostfixMinusMinus"
+    }
+    if (-not $map.ContainsKey($Operator)) {
+        Fail-Witness -Message "unknown unary operator '$Operator'"
+    }
+    return $map[$Operator]
+}
+
+function Test-OperationTarget {
+    param(
+        [Parameter(Mandatory)][System.Management.Automation.Language.Ast]$Operation,
+        [Parameter(Mandatory)][string]$ExpectedIdentity,
+        [Parameter(Mandatory)][string]$ExpectedTargetSpelling
+    )
+    $target = $null
+    if ($Operation -is [System.Management.Automation.Language.AssignmentStatementAst]) {
+        $target = $Operation.Left
+    } elseif ($Operation -is [System.Management.Automation.Language.UnaryExpressionAst]) {
+        $target = $Operation.Child
+    }
+    if ($target -isnot [System.Management.Automation.Language.VariableExpressionAst]) {
+        return $false
+    }
+    if ($target.Splatted) { return $false }
+    if ([string]$target.Extent.Text -cne $ExpectedTargetSpelling) { return $false }
+
+    $expectedTokens = $null
+    $expectedErrors = $null
+    $expectedAst = [System.Management.Automation.Language.Parser]::ParseInput(
+        $ExpectedIdentity + ' = $null', [ref]$expectedTokens, [ref]$expectedErrors
+    )
+    if (@($expectedErrors).Count -ne 0) { return $false }
+    $expectedVariables = @(
+        $expectedAst.FindAll({ param($Candidate)
+            $Candidate -is [System.Management.Automation.Language.VariableExpressionAst]
+        }, $true)
+    )
+    if ($expectedVariables.Count -ne 2) {
+        return $false
+    }
+    $expectedVariable = $expectedVariables[0]
+    return Test-VariablePathIdentity -Actual $target.VariablePath -Expected $expectedVariable.VariablePath
+}
+
+function Test-Case {
+    param([Parameter(Mandatory)][string]$Line)
+    $fields = $Line -split "\|"
+    if ($fields.Count -ne 7) {
+        Fail-Witness -Message "invalid metadata field count"
+    }
+    $sourcePath = Decode-Field -Value $fields[0]
+    $identity = Decode-Field -Value $fields[1]
+    $operator = Decode-Field -Value $fields[2]
+    $context = Decode-Field -Value $fields[3]
+    $targetSpelling = Decode-Field -Value $fields[4]
+    [int]$startLine = 0
+    [int]$endLine = 0
+    if (-not [int]::TryParse($fields[5], [ref]$startLine) -or
+        -not [int]::TryParse($fields[6], [ref]$endLine) -or
+        $startLine -lt 1 -or $endLine -lt $startLine) {
+        Fail-Witness -Message "invalid metadata line range"
+    }
+    if (-not [IO.Path]::IsPathRooted($sourcePath) -or
+        -not [IO.File]::Exists($sourcePath)) {
+        Fail-Witness -Message "candidate source path is invalid"
+    }
+
+    $tokens = $null
+    $parseErrors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+        $sourcePath, [ref]$tokens, [ref]$parseErrors
+    )
+    if (@($parseErrors).Count -ne 0) {
+        Fail-Witness -Message "candidate parser errors for '$operator' '$context'"
+    }
+
+    $operations = @(
+        $ast.FindAll({ param($Candidate)
+            $Candidate -is [System.Management.Automation.Language.AssignmentStatementAst] -or
+                $Candidate -is [System.Management.Automation.Language.UnaryExpressionAst]
+        }, $true)
+    )
+    $matches = @()
+    foreach ($operationNode in $operations) {
+        if (-not (Test-Region -Node $operationNode -StartLine $startLine -EndLine $endLine)) {
+            continue
+        }
+        $operatorMatches = $false
+        if ($operator -in @("=", "+=", "-=", "*=", "/=", "%=")) {
+            $operatorMatches = $operationNode -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+                [string]$operationNode.Operator -ceq (Get-ExpectedAssignmentOperator -Operator $operator)
+        } elseif ($operator -in @("prefix++", "prefix--", "postfix++", "postfix--")) {
+            $operatorMatches = $operationNode -is [System.Management.Automation.Language.UnaryExpressionAst] -and
+                [string]$operationNode.TokenKind -ceq (Get-ExpectedUnaryOperator -Operator $operator)
+        } else {
+            Fail-Witness -Message "unknown operator '$operator'"
+        }
+        if (-not $operatorMatches) { continue }
+        if (-not (Test-OperationTarget -Operation $operationNode -ExpectedIdentity $identity -ExpectedTargetSpelling $targetSpelling)) {
+            continue
+        }
+        if (Test-WitnessContext -Node $operationNode -Context $context) {
+            $matches += $operationNode
+        }
+    }
+    if ($matches.Count -ne 1) {
+        Fail-Witness -Message "expected one native witness for '$operator' '$context', found $($matches.Count)"
+    }
+}
+
+if (-not [IO.Path]::IsPathRooted($ManifestPath) -or -not [IO.File]::Exists($ManifestPath)) {
+    Fail-Witness -Message "manifest path is invalid"
+}
+$lines = @([IO.File]::ReadAllLines($ManifestPath))
+if ($lines.Count -eq 0) { Fail-Witness -Message "manifest is empty" }
+$caseCount = 0
+foreach ($line in $lines) {
+    if ([string]::IsNullOrWhiteSpace($line)) { Fail-Witness -Message "manifest contains a blank line" }
+    Test-Case -Line $line
+    $caseCount++
+}
+[Console]::Out.Write("XB_IDENTITY_MATRIX_WITNESS_OK:$caseCount")
+'''
+
+
 def _resolve_native_powershell() -> str | None:
     if os.name != "nt":
         return None
@@ -708,25 +990,294 @@ def _validate_native_result(result: dict[str, object]) -> dict[str, object]:
         "OK",
     }:
         raise AssertionError("native AST inspector reason is invalid")
-    if result["reason"] == "PARSE_ERROR":
-        if result["parse_ok"] or result["parse_errors"] <= 0:
-            raise AssertionError("native AST inspector parse error result is inconsistent")
-    elif result["parse_errors"] != 0:
-        raise AssertionError("native AST inspector reported parse errors for a non-parse result")
-    expected_accepted = (
-        result["reason"] == "OK"
-        and result["native51_x64"]
-        and result["parse_ok"]
-        and result["parse_errors"] == 0
-        and result["global_shape_ok"]
-        and result["assemblies_ok"]
-        and result["invoicing_ok"]
-        and result["member_command_ok"]
-        and result["required_methods_ok"]
-    )
-    if result["accepted"] is not expected_accepted:
+    if result["parse_errors"] > 2_147_483_647 or result["node_count"] > 2_147_483_647:
+        raise AssertionError("native AST inspector integer exceeds the native Int32 contract")
+
+    reason = result["reason"]
+    native = result["native51_x64"]
+    parse_ok = result["parse_ok"]
+    parse_errors = result["parse_errors"]
+    node_count = result["node_count"]
+    global_shape_ok = result["global_shape_ok"]
+    assemblies_ok = result["assemblies_ok"]
+    invoicing_ok = result["invoicing_ok"]
+    member_command_ok = result["member_command_ok"]
+    required_methods_ok = result["required_methods_ok"]
+    accepted = result["accepted"]
+
+    if global_shape_ok and (node_count != 286 or not required_methods_ok):
+        raise AssertionError("native AST inspector global-shape result is inconsistent")
+
+    if reason == "NATIVE_REQUIRED":
+        valid_state = (
+            not native
+            and not parse_ok
+            and parse_errors == 0
+            and node_count == 0
+            and not global_shape_ok
+            and not assemblies_ok
+            and not invoicing_ok
+            and not member_command_ok
+            and not required_methods_ok
+            and not accepted
+        )
+    elif reason == "INPUT_LIMIT":
+        valid_state = (
+            native
+            and not parse_ok
+            and parse_errors == 0
+            and node_count == 0
+            and not global_shape_ok
+            and not assemblies_ok
+            and not invoicing_ok
+            and not member_command_ok
+            and not required_methods_ok
+            and not accepted
+        )
+    elif reason == "PARSE_ERROR":
+        valid_state = (
+            native
+            and not parse_ok
+            and parse_errors > 0
+            and node_count == 0
+            and not global_shape_ok
+            and not assemblies_ok
+            and not invoicing_ok
+            and not member_command_ok
+            and not required_methods_ok
+            and not accepted
+        )
+    elif reason == "NODE_LIMIT":
+        valid_state = (
+            native
+            and parse_ok
+            and parse_errors == 0
+            and node_count >= 130
+            and not global_shape_ok
+            and not assemblies_ok
+            and not invoicing_ok
+            and not member_command_ok
+            and not required_methods_ok
+            and not accepted
+        )
+    elif reason == "ASSEMBLIES":
+        valid_state = (
+            native
+            and parse_ok
+            and parse_errors == 0
+            and 1 <= node_count <= 4096
+            and not assemblies_ok
+            and not accepted
+        )
+    elif reason == "INVOICING":
+        valid_state = (
+            native
+            and parse_ok
+            and parse_errors == 0
+            and 1 <= node_count <= 4096
+            and assemblies_ok
+            and not invoicing_ok
+            and not accepted
+        )
+    elif reason == "MEMBER_COMMAND":
+        valid_state = (
+            native
+            and parse_ok
+            and parse_errors == 0
+            and 1 <= node_count <= 4096
+            and assemblies_ok
+            and invoicing_ok
+            and not member_command_ok
+            and not accepted
+        )
+    elif reason == "REQUIRED_METHODS":
+        valid_state = (
+            native
+            and parse_ok
+            and parse_errors == 0
+            and 1 <= node_count <= 4096
+            and not global_shape_ok
+            and assemblies_ok
+            and invoicing_ok
+            and member_command_ok
+            and not required_methods_ok
+            and not accepted
+        )
+    elif reason == "AST_SHAPE":
+        ordinary_rejection = (
+            native
+            and parse_ok
+            and parse_errors == 0
+            and 1 <= node_count <= 4096
+            and not global_shape_ok
+            and assemblies_ok
+            and invoicing_ok
+            and member_command_ok
+            and required_methods_ok
+            and not accepted
+        )
+        canonical_reference_parse_failure = (
+            native
+            and parse_ok
+            and parse_errors == 0
+            and 1 <= node_count <= 4096
+            and not global_shape_ok
+            and not assemblies_ok
+            and not invoicing_ok
+            and not member_command_ok
+            and not required_methods_ok
+            and not accepted
+        )
+        catch_branch = (
+            native
+            and not parse_ok
+            and parse_errors == 0
+            and node_count == 0
+            and not global_shape_ok
+            and not assemblies_ok
+            and not invoicing_ok
+            and not member_command_ok
+            and not required_methods_ok
+            and not accepted
+        )
+        valid_state = (
+            ordinary_rejection
+            or canonical_reference_parse_failure
+            or catch_branch
+        )
+    else:
+        valid_state = (
+            native
+            and parse_ok
+            and parse_errors == 0
+            and node_count == 286
+            and global_shape_ok
+            and assemblies_ok
+            and invoicing_ok
+            and member_command_ok
+            and required_methods_ok
+            and accepted
+        )
+
+    if not valid_state:
+        raise AssertionError("native AST inspector reason/state combination is impossible")
+
+    expected_accepted = reason == "OK"
+    if accepted is not expected_accepted:
         raise AssertionError("native AST inspector accepted field is inconsistent")
     return result
+
+
+def _encode_matrix_witness_field(value: str) -> str:
+    return base64.b64encode(value.encode("utf-8")).decode("ascii")
+
+
+def _identity_matrix_witness_case(
+    source: str,
+    name: str,
+    identity: str,
+    operator: str,
+    context: str,
+    *,
+    fixture: str | None = None,
+    fixture_context: str | None = None,
+) -> tuple[str, str, str, str, str, int, int]:
+    if fixture is None:
+        fixture = _identity_matrix_fixture(source, name, identity, operator, context)
+    region_context = fixture_context or context
+    if region_context == "top-level statement":
+        _, assignment_index = _canonical_assignment_lines(source, name)
+        start_line = assignment_index + 1
+        end_line = start_line
+    else:
+        generated_prefix = source.rstrip() + "\n"
+        start_line = generated_prefix.count("\n") + 1
+        end_line = fixture.rstrip("\r\n").count("\n") + 1
+    return (
+        fixture,
+        identity,
+        operator,
+        context,
+        identity,
+        start_line,
+        end_line,
+    )
+
+
+def _run_identity_matrix_witness(
+    cases: list[tuple[str, str, str, str, str, int, int]],
+) -> int:
+    native_powershell = _resolve_native_powershell()
+    if native_powershell is None:
+        raise unittest.SkipTest("native Windows PowerShell Desktop 5.1 x64 is required")
+    if not cases:
+        raise AssertionError("identity matrix witness requires at least one case")
+
+    temporary_root = Path(tempfile.mkdtemp(prefix="xb-member-worker-matrix-"))
+    try:
+        _assert_temp_outside_checkout(ROOT, temporary_root)
+        manifest_lines: list[str] = []
+        for index, (fixture, identity, operator, context, target, start_line, end_line) in enumerate(cases):
+            candidate_path = temporary_root / f"candidate-{index:04d}.ps1"
+            _write_deterministic_powershell_file(candidate_path, fixture)
+            manifest_lines.append(
+                "|".join(
+                    (
+                        _encode_matrix_witness_field(str(candidate_path.resolve())),
+                        _encode_matrix_witness_field(identity),
+                        _encode_matrix_witness_field(operator),
+                        _encode_matrix_witness_field(context),
+                        _encode_matrix_witness_field(target),
+                        str(start_line),
+                        str(end_line),
+                    )
+                )
+            )
+        witness_path = temporary_root / "witness.ps1"
+        _write_deterministic_powershell_file(witness_path, _NATIVE_IDENTITY_MATRIX_WITNESS)
+        witnessed = 0
+        for chunk_index in range(0, len(manifest_lines), 120):
+            chunk = manifest_lines[chunk_index : chunk_index + 120]
+            manifest_path = temporary_root / f"manifest-{chunk_index:04d}.txt"
+            manifest_path.write_bytes(("\n".join(chunk) + "\n").encode("ascii"))
+            command = [
+                native_powershell,
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(witness_path.resolve()),
+                "-ManifestPath",
+                str(manifest_path.resolve()),
+            ]
+            return_code, stdout, stderr, timed_out, overflow = _bounded_native_process(command)
+            if timed_out:
+                raise AssertionError("native identity matrix witness timed out")
+            if overflow:
+                raise AssertionError("native identity matrix witness exceeded bounded output")
+            if stderr:
+                raise AssertionError(
+                    "native identity matrix witness wrote to stderr: "
+                    + stderr.decode("utf-8", errors="replace")[:4096]
+                )
+            if return_code != 0:
+                raise AssertionError(
+                    f"native identity matrix witness exited with status {return_code}"
+                )
+            if len(stdout) > 4096:
+                raise AssertionError("native identity matrix witness stdout exceeded 4096 bytes")
+            expected_marker = f"XB_IDENTITY_MATRIX_WITNESS_OK:{len(chunk)}".encode("ascii")
+            if stdout.rstrip(b"\r\n") != expected_marker:
+                raise AssertionError("native identity matrix witness emitted an invalid marker")
+            witnessed += len(chunk)
+        return witnessed
+    finally:
+        try:
+            shutil.rmtree(temporary_root)
+        except OSError as error:
+            raise AssertionError("native identity matrix witness temporary cleanup failed") from error
 
 
 def _inspect_autocount_probe(probe: str) -> dict[str, object]:
@@ -887,7 +1438,7 @@ def _identity_matrix_fixture(
     if context == "top-level statement":
         return _assignment_fixture(source, name, identity, operator)
     if operator in {"prefix++", "prefix--"}:
-        mutation = f"{operator[:-2]}{identity}"
+        mutation = f"{operator[-2:]}{identity}"
     elif operator in {"postfix++", "postfix--"}:
         mutation = f"{identity}{operator[-2:]}"
     else:
@@ -1326,7 +1877,7 @@ class NativeAstTempPathTests(unittest.TestCase):
                 "native51_x64": True,
                 "parse_ok": True,
                 "parse_errors": 0,
-                "node_count": 1,
+                "node_count": 286,
                 "global_shape_ok": True,
                 "assemblies_ok": True,
                 "invoicing_ok": True,
@@ -1530,6 +2081,342 @@ class NativeAstTempPathTests(unittest.TestCase):
                 temporary_root.rmdir()
 
 
+class NativeAstResultConsistencyTests(unittest.TestCase):
+    _BOOLEAN_FIELDS = (
+        "native51_x64",
+        "parse_ok",
+        "global_shape_ok",
+        "assemblies_ok",
+        "invoicing_ok",
+        "member_command_ok",
+        "required_methods_ok",
+        "accepted",
+    )
+
+    @staticmethod
+    def _result(reason: str, **overrides: object) -> dict[str, object]:
+        result: dict[str, object] = {
+            "schema_version": 1,
+            "native51_x64": True,
+            "parse_ok": True,
+            "parse_errors": 0,
+            "node_count": 286,
+            "global_shape_ok": True,
+            "assemblies_ok": True,
+            "invoicing_ok": True,
+            "member_command_ok": True,
+            "required_methods_ok": True,
+            "accepted": True,
+            "reason": reason,
+        }
+        result.update(
+            {
+                "NATIVE_REQUIRED": {
+                    "native51_x64": False,
+                    "parse_ok": False,
+                    "node_count": 0,
+                    "global_shape_ok": False,
+                    "assemblies_ok": False,
+                    "invoicing_ok": False,
+                    "member_command_ok": False,
+                    "required_methods_ok": False,
+                    "accepted": False,
+                },
+                "INPUT_LIMIT": {
+                    "parse_ok": False,
+                    "node_count": 0,
+                    "global_shape_ok": False,
+                    "assemblies_ok": False,
+                    "invoicing_ok": False,
+                    "member_command_ok": False,
+                    "required_methods_ok": False,
+                    "accepted": False,
+                },
+                "PARSE_ERROR": {
+                    "parse_ok": False,
+                    "parse_errors": 1,
+                    "node_count": 0,
+                    "global_shape_ok": False,
+                    "assemblies_ok": False,
+                    "invoicing_ok": False,
+                    "member_command_ok": False,
+                    "required_methods_ok": False,
+                    "accepted": False,
+                },
+                "NODE_LIMIT": {
+                    "parse_ok": True,
+                    "node_count": 4786,
+                    "global_shape_ok": False,
+                    "assemblies_ok": False,
+                    "invoicing_ok": False,
+                    "member_command_ok": False,
+                    "required_methods_ok": False,
+                    "accepted": False,
+                },
+                "ASSEMBLIES": {
+                    "node_count": 290,
+                    "global_shape_ok": False,
+                    "assemblies_ok": False,
+                    "accepted": False,
+                },
+                "INVOICING": {
+                    "node_count": 290,
+                    "global_shape_ok": False,
+                    "invoicing_ok": False,
+                    "accepted": False,
+                },
+                "MEMBER_COMMAND": {
+                    "node_count": 290,
+                    "global_shape_ok": False,
+                    "member_command_ok": False,
+                    "accepted": False,
+                },
+                "REQUIRED_METHODS": {
+                    "node_count": 290,
+                    "global_shape_ok": False,
+                    "required_methods_ok": False,
+                    "accepted": False,
+                },
+                "AST_SHAPE": {
+                    "node_count": 290,
+                    "global_shape_ok": False,
+                    "accepted": False,
+                },
+                "OK": {},
+            }[reason]
+        )
+        result.update(overrides)
+        return result
+
+    @staticmethod
+    def _payload(result: dict[str, object]) -> bytes:
+        return json.dumps(result, separators=(",", ":")).encode("utf-8")
+
+    def _decode_result(self, payload: bytes) -> dict[str, object]:
+        with (
+            mock.patch(f"{__name__}._resolve_native_powershell", return_value="powershell.exe"),
+            mock.patch(
+                f"{__name__}._bounded_native_process",
+                return_value=(0, payload, b"", False, False),
+            ),
+        ):
+            return _inspect_autocount_probe("synthetic candidate")
+
+    def _assert_decode_rejects(self, result: dict[str, object]) -> None:
+        with self.assertRaises(AssertionError):
+            _validate_native_result(result)
+        with self.assertRaises(AssertionError):
+            self._decode_result(self._payload(result))
+
+    def _assert_decode_accepts(self, result: dict[str, object]) -> None:
+        self.assertIs(_validate_native_result(result), result)
+        self.assertEqual(self._decode_result(self._payload(result)), result)
+
+    def test_legitimate_reason_state_controls(self) -> None:
+        controls = (
+            (
+                "trusted non-native branch",
+                self._result("NATIVE_REQUIRED"),
+            ),
+            (
+                "trusted oversized-input branch",
+                self._result("INPUT_LIMIT"),
+            ),
+            (
+                "trusted candidate parse-error branch",
+                self._result("PARSE_ERROR"),
+            ),
+            (
+                "trusted node-count limit branch",
+                self._result("NODE_LIMIT", node_count=4786),
+            ),
+            (
+                "trusted traversal-depth limit branch",
+                self._result("NODE_LIMIT", node_count=200),
+            ),
+            (
+                "trusted assemblies rejection",
+                self._result("ASSEMBLIES", node_count=290),
+            ),
+            (
+                "trusted global-shape-success assemblies rejection",
+                self._result(
+                    "ASSEMBLIES",
+                    node_count=286,
+                    global_shape_ok=True,
+                    assemblies_ok=False,
+                ),
+            ),
+            (
+                "trusted invoicing rejection",
+                self._result("INVOICING", node_count=290),
+            ),
+            (
+                "trusted member-command rejection",
+                self._result("MEMBER_COMMAND", node_count=290),
+            ),
+            (
+                "trusted required-method rejection",
+                self._result("REQUIRED_METHODS", node_count=290),
+            ),
+            (
+                "trusted ordinary AST-shape rejection",
+                self._result("AST_SHAPE", node_count=290),
+            ),
+            (
+                "trusted canonical-reference parse-failure AST-shape branch",
+                self._result(
+                    "AST_SHAPE",
+                    node_count=290,
+                    global_shape_ok=False,
+                    assemblies_ok=False,
+                    invoicing_ok=False,
+                    member_command_ok=False,
+                    required_methods_ok=False,
+                ),
+            ),
+            (
+                "trusted catch AST-shape branch",
+                self._result(
+                    "AST_SHAPE",
+                    parse_ok=False,
+                    node_count=0,
+                    global_shape_ok=False,
+                    assemblies_ok=False,
+                    invoicing_ok=False,
+                    member_command_ok=False,
+                    required_methods_ok=False,
+                ),
+            ),
+            (
+                "trusted canonical success",
+                self._result("OK"),
+            ),
+        )
+        for label, result in controls:
+            with self.subTest(control=label):
+                self._assert_decode_accepts(result)
+
+    def test_impossible_reason_state_matrix_is_rejected_directly_and_on_decode(self) -> None:
+        invalid_cases: list[tuple[str, dict[str, object]]] = []
+
+        def add(label: str, reason: str, **changes: object) -> None:
+            invalid_cases.append((label, self._result(reason, **changes)))
+
+        add("OK node count zero", "OK", node_count=0)
+        add("OK node count above limit", "OK", node_count=4097)
+        add("OK node count not canonical", "OK", node_count=285)
+        for field in ("global_shape_ok", "assemblies_ok", "invoicing_ok", "member_command_ok", "required_methods_ok"):
+            add(f"OK required flag false: {field}", "OK", **{field: False})
+        add("OK accepted false", "OK", accepted=False)
+        add("OK native false", "OK", native51_x64=False)
+        add("OK parse false", "OK", parse_ok=False)
+
+        add("NODE_LIMIT accepted true", "NODE_LIMIT", accepted=True)
+        for field in (
+            "global_shape_ok",
+            "assemblies_ok",
+            "invoicing_ok",
+            "member_command_ok",
+            "required_methods_ok",
+        ):
+            add(f"NODE_LIMIT success flag true: {field}", "NODE_LIMIT", **{field: True})
+        add("NODE_LIMIT node count zero", "NODE_LIMIT", node_count=0)
+        add("NODE_LIMIT node count below depth minimum", "NODE_LIMIT", node_count=129)
+
+        add("PARSE_ERROR parse_ok true", "PARSE_ERROR", parse_ok=True)
+        add("PARSE_ERROR parse_errors zero", "PARSE_ERROR", parse_errors=0)
+        add("PARSE_ERROR node count nonzero", "PARSE_ERROR", node_count=1)
+        add("PARSE_ERROR accepted true", "PARSE_ERROR", accepted=True)
+        for field in (
+            "global_shape_ok",
+            "assemblies_ok",
+            "invoicing_ok",
+            "member_command_ok",
+            "required_methods_ok",
+        ):
+            add(f"PARSE_ERROR success flag true: {field}", "PARSE_ERROR", **{field: True})
+
+        for reason in (
+            "NATIVE_REQUIRED",
+            "INPUT_LIMIT",
+            "NODE_LIMIT",
+            "ASSEMBLIES",
+            "INVOICING",
+            "MEMBER_COMMAND",
+            "REQUIRED_METHODS",
+            "AST_SHAPE",
+            "OK",
+        ):
+            add(f"non-parse reason with parse errors: {reason}", reason, parse_errors=1)
+
+        add("ASSEMBLIES own flag true", "ASSEMBLIES", assemblies_ok=True)
+        add("INVOICING earlier flag false", "INVOICING", assemblies_ok=False)
+        add("INVOICING own flag true", "INVOICING", invoicing_ok=True)
+        add("MEMBER_COMMAND earlier assemblies false", "MEMBER_COMMAND", assemblies_ok=False)
+        add("MEMBER_COMMAND earlier invoicing false", "MEMBER_COMMAND", invoicing_ok=False)
+        add("MEMBER_COMMAND own flag true", "MEMBER_COMMAND", member_command_ok=True)
+        add("REQUIRED_METHODS global shape true", "REQUIRED_METHODS", global_shape_ok=True)
+        add("REQUIRED_METHODS earlier assemblies false", "REQUIRED_METHODS", assemblies_ok=False)
+        add("REQUIRED_METHODS earlier invoicing false", "REQUIRED_METHODS", invoicing_ok=False)
+        add("REQUIRED_METHODS earlier member command false", "REQUIRED_METHODS", member_command_ok=False)
+        add("REQUIRED_METHODS own flag true", "REQUIRED_METHODS", required_methods_ok=True)
+
+        add("AST_SHAPE global success", "AST_SHAPE", global_shape_ok=True)
+        add("AST_SHAPE ordinary branch missing required methods", "AST_SHAPE", required_methods_ok=False)
+        add("AST_SHAPE catch branch with parse success", "AST_SHAPE", parse_ok=True, node_count=0)
+        add("AST_SHAPE catch branch with nodes", "AST_SHAPE", parse_ok=False, node_count=1)
+        add("AST_SHAPE canonical branch with global success", "AST_SHAPE", global_shape_ok=True)
+        add("NATIVE_REQUIRED native true", "NATIVE_REQUIRED", native51_x64=True)
+        add("NATIVE_REQUIRED parse true", "NATIVE_REQUIRED", parse_ok=True)
+        add("NATIVE_REQUIRED node count nonzero", "NATIVE_REQUIRED", node_count=1)
+        add("INPUT_LIMIT parse true", "INPUT_LIMIT", parse_ok=True)
+        add("INPUT_LIMIT node count nonzero", "INPUT_LIMIT", node_count=1)
+
+        add("global success wrong count", "OK", node_count=287)
+        add("global success required methods false", "OK", required_methods_ok=False)
+
+        unknown_field = self._result("OK")
+        unknown_field["unknown"] = False
+        invalid_cases.append(("unknown field", unknown_field))
+        missing_field = self._result("OK")
+        del missing_field["reason"]
+        invalid_cases.append(("missing field", missing_field))
+        unknown_reason = self._result("OK")
+        unknown_reason["reason"] = "NOT_A_REASON"
+        invalid_cases.append(("unknown reason", unknown_reason))
+        invalid_cases.append(("wrong schema version", self._result("OK", schema_version=2)))
+        invalid_cases.append(("boolean integer confusion", self._result("OK", accepted=1)))
+        invalid_cases.append(("negative integer", self._result("OK", node_count=-1)))
+        invalid_cases.append(("integer above native range", self._result("OK", node_count=2_147_483_648)))
+
+        for label, result in invalid_cases:
+            with self.subTest(state=label):
+                self._assert_decode_rejects(result)
+
+    def test_invalid_json_transport_is_rejected_on_decode(self) -> None:
+        invalid_payloads = (
+            ("duplicate JSON key", b'{"schema_version":1,"schema_version":1}'),
+            ("malformed UTF-8", b"\xff\xfe\xfd"),
+            ("nonfinite number", b'{"schema_version":1,"value":NaN}'),
+            ("non-object JSON", b"[]"),
+            ("multiple JSON documents", b"{}\n{}"),
+            ("extra stdout", b'{} trailing'),
+        )
+        for label, payload in invalid_payloads:
+            with self.subTest(payload=label):
+                with self.assertRaises(AssertionError):
+                    _strict_json_object(payload)
+                with mock.patch(
+                    f"{__name__}._resolve_native_powershell", return_value="powershell.exe"
+                ), mock.patch(
+                    f"{__name__}._bounded_native_process",
+                    return_value=(0, payload, b"", False, False),
+                ):
+                    with self.assertRaises(AssertionError):
+                        _inspect_autocount_probe("synthetic candidate")
+
+
 class MemberGatewayWorkerDeploymentTests(unittest.TestCase):
     @staticmethod
     def _blob(path: str) -> str:
@@ -1717,6 +2604,70 @@ class MemberGatewayWorkerDeploymentTests(unittest.TestCase):
                 self.assertTrue(result["parse_ok"], result)
                 self.assertFalse(result["accepted"], result)
 
+    def test_g2_identity_matrix_witness_rejects_generator_integrity_controls(self) -> None:
+        if not self.pwsh:
+            self.skipTest("native Windows PowerShell Desktop 5.1 x64 is required")
+        probe = (ROOT / "scripts/test_ac2_member_gateway_autocount_dependencies.ps1").read_text(encoding="utf-8")
+        context = "expandable-string $()"
+        valid_prefix = _identity_matrix_witness_case(
+            probe, "invoicing", "$invoicing", "prefix++", context
+        )
+        malformed_prefix = _identity_matrix_witness_case(
+            probe,
+            "invoicing",
+            "$invoicing",
+            "prefix++",
+            context,
+            fixture=_context_fixture(probe, "prefix$invoicing", context),
+            fixture_context=context,
+        )
+        swapped_increment = _identity_matrix_witness_case(
+            probe,
+            "invoicing",
+            "$invoicing",
+            "prefix--",
+            context,
+            fixture=valid_prefix[0],
+            fixture_context=context,
+        )
+        prefix_postfix_mismatch = _identity_matrix_witness_case(
+            probe,
+            "invoicing",
+            "$invoicing",
+            "postfix++",
+            context,
+            fixture=valid_prefix[0],
+            fixture_context=context,
+        )
+        wrong_identity = _identity_matrix_witness_case(
+            probe,
+            "invoicing",
+            "$requiredAssemblies",
+            "prefix++",
+            context,
+            fixture=valid_prefix[0],
+            fixture_context=context,
+        )
+        wrong_context = _identity_matrix_witness_case(
+            probe,
+            "invoicing",
+            "$invoicing",
+            "prefix++",
+            "Write-Output (mutation)",
+            fixture=valid_prefix[0],
+            fixture_context=context,
+        )
+        for label, case in (
+            ("original malformed prefix output", malformed_prefix),
+            ("swapped increment/decrement", swapped_increment),
+            ("prefix/postfix mismatch", prefix_postfix_mismatch),
+            ("wrong variable identity", wrong_identity),
+            ("wrong context", wrong_context),
+        ):
+            with self.subTest(control=label):
+                with self.assertRaises(AssertionError):
+                    _run_identity_matrix_witness([case])
+
     def test_g2_identity_operator_context_matrix(self) -> None:
         if not self.pwsh:
             self.skipTest("native Windows PowerShell Desktop 5.1 x64 is required")
@@ -1732,14 +2683,45 @@ class MemberGatewayWorkerDeploymentTests(unittest.TestCase):
         )
         cases: list[tuple[str, str, str, int, int, bool, str]] = []
         fixtures: list[str] = []
+        witness_cases: list[tuple[str, str, str, str, str, int, int]] = []
         for name in ("invoicing", "requiredAssemblies"):
             for identity_index, (identity, is_bare) in enumerate(_identity_forms(name)):
                 for operator_index, operator in enumerate(operators):
                     context = contexts[(identity_index + operator_index) % len(contexts)]
-                    fixtures.append(_identity_matrix_fixture(probe, name, identity, operator, context))
+                    fixture = _identity_matrix_fixture(probe, name, identity, operator, context)
+                    fixtures.append(fixture)
+                    witness_cases.append(
+                        _identity_matrix_witness_case(
+                            probe, name, identity, operator, context, fixture=fixture
+                        )
+                    )
                     cases.append((name, identity, operator, identity_index, operator_index, is_bare, context))
+        self.assertEqual(len(cases), 720)
         self.assertEqual(len(fixtures), 720)
+        self.assertEqual(len(witness_cases), 720)
+        prefix_cases = [
+            case for case in cases if case[2] in {"prefix++", "prefix--"}
+        ]
+        prefix_witness_cases = [
+            case for case in witness_cases if case[2] in {"prefix++", "prefix--"}
+        ]
+        non_top_level_prefix_cases = [
+            case for case in cases
+            if case[2] in {"prefix++", "prefix--"} and case[6] != "top-level statement"
+        ]
+        self.assertEqual(len(prefix_cases), 144)
+        self.assertEqual(len(prefix_witness_cases), 144)
+        self.assertEqual(len(non_top_level_prefix_cases), 120)
+        self.assertEqual(_run_identity_matrix_witness(witness_cases), 720)
         results = _inspect_many(fixtures)
+        self.assertEqual(len(results), 720)
+        corrected_prefix_results = [
+            result for case, result in zip(cases, results)
+            if case[2] in {"prefix++", "prefix--"} and case[6] != "top-level statement"
+        ]
+        self.assertEqual(len(corrected_prefix_results), 120)
+        self.assertEqual(sum(bool(result["parse_ok"]) for result in corrected_prefix_results), 120)
+        self.assertEqual(sum(not bool(result["accepted"]) for result in corrected_prefix_results), 120)
         for case, result in zip(cases, results):
             name, identity, operator, identity_index, operator_index, is_bare, context = case
             with self.subTest(
@@ -1832,6 +2814,84 @@ class MemberGatewayWorkerDeploymentTests(unittest.TestCase):
         node_limited = _inspect_autocount_probe(ast_heavy)
         self.assertEqual(node_limited["reason"], "NODE_LIMIT", node_limited)
         self.assertFalse(node_limited["accepted"], node_limited)
+
+        depth_limited = _inspect_autocount_probe("(" * 65 + "1" + ")" * 65)
+        self.assertEqual(depth_limited["reason"], "NODE_LIMIT", depth_limited)
+        self.assertTrue(depth_limited["native51_x64"], depth_limited)
+        self.assertTrue(depth_limited["parse_ok"], depth_limited)
+        self.assertEqual(depth_limited["parse_errors"], 0, depth_limited)
+        self.assertGreaterEqual(depth_limited["node_count"], 130, depth_limited)
+        self.assertLessEqual(depth_limited["node_count"], 4096, depth_limited)
+        for field in (
+            "global_shape_ok",
+            "assemblies_ok",
+            "invoicing_ok",
+            "member_command_ok",
+            "required_methods_ok",
+            "accepted",
+        ):
+            self.assertFalse(depth_limited[field], depth_limited)
+
+    def test_g2_native_reason_state_positive_controls(self) -> None:
+        if not self.pwsh:
+            self.skipTest("native Windows PowerShell Desktop 5.1 x64 is required")
+        probe = (ROOT / "scripts/test_ac2_member_gateway_autocount_dependencies.ps1").read_text(encoding="utf-8")
+        semantic_controls = (
+            (
+                "ASSEMBLIES",
+                probe.replace('"AutoCount.dll"', '"AutoCount.Missing.dll"', 1),
+            ),
+            (
+                "INVOICING",
+                probe.replace(
+                    '$invoicing = $loaded["AutoCount.Invoicing.dll"]',
+                    '$invoicing = $loaded["AutoCount.Tools.dll"]',
+                    1,
+                ),
+            ),
+            (
+                "MEMBER_COMMAND",
+                probe.replace(
+                    '$memberCommand = $invoicing.GetType("AutoCount.BonusPoint.Member.MemberCommand", $true, $false)',
+                    '$memberCommand = $core.GetType("AutoCount.BonusPoint.Member.MemberCommand", $true, $false)',
+                    1,
+                ),
+            ),
+            (
+                "REQUIRED_METHODS",
+                probe.replace('"SaveMember"', '"MissingSaveMember"', 1),
+            ),
+            (
+                "AST_SHAPE",
+                probe + "\n$matrixExtraAssignment = 1\n",
+            ),
+            (
+                "INVOICING global-shape-success semantic rejection",
+                probe.replace(
+                    '$invoicing = $loaded["AutoCount.Invoicing.dll"]',
+                    '${invoicing} = $loaded["AutoCount.Invoicing.dll"]',
+                    1,
+                ),
+            ),
+        )
+        for expected_reason, candidate in semantic_controls:
+            with self.subTest(control=expected_reason):
+                result = _inspect_autocount_probe(candidate)
+                self.assertTrue(result["native51_x64"], result)
+                self.assertTrue(result["parse_ok"], result)
+                self.assertEqual(result["parse_errors"], 0, result)
+                self.assertEqual(result["reason"], expected_reason.split()[0], result)
+                self.assertFalse(result["accepted"], result)
+        global_shape_success = _inspect_autocount_probe(
+            probe.replace(
+                '$invoicing = $loaded["AutoCount.Invoicing.dll"]',
+                '${invoicing} = $loaded["AutoCount.Invoicing.dll"]',
+                1,
+            )
+        )
+        self.assertTrue(global_shape_success["global_shape_ok"], global_shape_success)
+        self.assertEqual(global_shape_success["node_count"], 286, global_shape_success)
+        self.assertFalse(global_shape_success["invoicing_ok"], global_shape_success)
 
     def test_native_inspector_transport_and_schema_contract(self) -> None:
         if not self.pwsh:
