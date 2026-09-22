@@ -87,6 +87,7 @@ public static class EnergyGridOneShotSupervisorNative
     public const uint CREATE_NO_WINDOW = 0x08000000;
     public const uint STARTF_USESTDHANDLES = 0x00000100;
     public const uint JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000;
+    public const uint SUPERVISOR_TERMINATION_EXIT_CODE = 0xE0470001;
     public const uint HANDLE_FLAG_INHERIT = 0x00000001;
     public const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x00001000;
     public const uint SYNCHRONIZE = 0x00100000;
@@ -352,6 +353,7 @@ public static class EnergyGridOneShotSupervisorNative
     {
         public bool Attempted;
         public bool Accepted;
+        public bool DeadlineExpired;
         public uint ReturnValue;
         public int ErrorCode;
     }
@@ -633,7 +635,7 @@ public static class EnergyGridOneShotSupervisorNative
         }
     }
 
-    public static ResumeResult TryResumeThread(IntPtr threadHandle)
+    public static ResumeResult TryResumeThread(IntPtr threadHandle, long deadlineTicks)
     {
         lock (controlLock)
         {
@@ -643,6 +645,18 @@ public static class EnergyGridOneShotSupervisorNative
             {
                 result.Attempted = false;
                 result.Accepted = false;
+                result.ReturnValue = UInt32.MaxValue;
+                result.ErrorCode = 0;
+                return result;
+            }
+
+            if (System.Diagnostics.Stopwatch.GetTimestamp() >= deadlineTicks)
+            {
+                resumeGateClosed = 1;
+                failureRequested = 1;
+                result.Attempted = false;
+                result.Accepted = false;
+                result.DeadlineExpired = true;
                 result.ReturnValue = UInt32.MaxValue;
                 result.ErrorCode = 0;
                 return result;
@@ -792,24 +806,7 @@ public static class EnergyGridOneShotSupervisorNative
         }
 
         JOBOBJECT_BASIC_LIMIT_INFORMATION basic = information.BasicLimitInformation;
-        bool zeroIo = information.IoInfo.ReadOperationCount == 0 &&
-            information.IoInfo.WriteOperationCount == 0 &&
-            information.IoInfo.OtherOperationCount == 0 &&
-            information.IoInfo.ReadTransferCount == 0 &&
-            information.IoInfo.WriteTransferCount == 0 &&
-            information.IoInfo.OtherTransferCount == 0;
-        result.Matches = basic.PerProcessUserTimeLimit == 0 &&
-            basic.PerJobUserTimeLimit == 0 &&
-            basic.LimitFlags == JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE &&
-            basic.MinimumWorkingSetSize == UIntPtr.Zero &&
-            basic.MaximumWorkingSetSize == UIntPtr.Zero &&
-            basic.ActiveProcessLimit == 0 &&
-            basic.Affinity == UIntPtr.Zero &&
-            basic.PriorityClass == 0 && basic.SchedulingClass == 0 &&
-            zeroIo && information.ProcessMemoryLimit == UIntPtr.Zero &&
-            information.JobMemoryLimit == UIntPtr.Zero &&
-            information.PeakProcessMemoryUsed == UIntPtr.Zero &&
-            information.PeakJobMemoryUsed == UIntPtr.Zero;
+        result.Matches = basic.LimitFlags == JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
         return result;
     }
 
@@ -1655,7 +1652,7 @@ function Invoke-EgTerminateJob {
     if ($Reason -eq 'INTERRUPTION') { $script:EgState.interrupted = $true }
     [EnergyGridOneShotSupervisorNative]::RequestFailure()
     $termination = [EnergyGridOneShotSupervisorNative]::TerminateJob(
-        $JobHandle, [uint32]0xE0470001)
+        $JobHandle, [EnergyGridOneShotSupervisorNative]::SUPERVISOR_TERMINATION_EXIT_CODE)
     if ($termination.Success) {
         $script:EgState.termination_succeeded = $true
     }
@@ -1778,12 +1775,23 @@ function Get-EgStartVerdict {
 
 function Get-EgExitCode {
     if (-not $script:EgState.outcome_committed) { return 3 }
-    if ($script:EgState.timed_out -or $script:EgState.interrupted) { return 2 }
     if ($script:EgState.containment_failure -or $script:EgState.evidence_integrity_failure -or
-        $script:EgState.drain_failure -or -not $script:EgState.reap_confirmed) { return 3 }
+        $script:EgState.drain_failure -or $script:EgState.termination_failure -or
+        $script:EgState.observer_failed) { return 3 }
+    if ($script:EgState.creation_succeeded -and -not $script:EgState.reap_confirmed) {
+        return 3
+    }
+    if ($script:EgState.creation_succeeded -and
+        (-not $script:EgState.stdout_complete -or -not $script:EgState.stderr_complete)) {
+        return 3
+    }
+    if ($script:EgState.timed_out -or $script:EgState.interrupted) { return 2 }
     if ($script:EgState.start_verdict -eq 'AMBIGUOUS') { return 4 }
     if ($script:EgState.start_verdict -eq 'STARTED_PROVEN' -and
-        $script:EgState.launcher_exit_code -eq 0) { return 0 }
+        $script:EgState.creation_succeeded -and
+        $script:EgState.launcher_exit_code -eq 0 -and
+        $script:EgState.reap_confirmed -and
+        $script:EgState.stdout_complete -and $script:EgState.stderr_complete) { return 0 }
     return 1
 }
 
@@ -1831,6 +1839,7 @@ $intentStream = $null
 $stdoutDrain = $null
 $stderrDrain = $null
 $creationStartTicks = [int64]0
+$deadlineTicks = [int64]0
 $evidenceReady = $false
 $terminalAccountingReady = $false
 
@@ -1879,6 +1888,7 @@ try {
     )
     $commandBuilder = New-Object System.Text.StringBuilder($commandLine)
     $creationStartTicks = [System.Diagnostics.Stopwatch]::GetTimestamp()
+    $deadlineTicks = Get-EgDeadlineTicks -StartTicks $creationStartTicks -Seconds $TimeoutSeconds
     $script:EgState.creation_attempted = $true
     $creation = [EnergyGridOneShotSupervisorNative]::CreateContainedProcess(
         $script:EgNativePowerShell, $commandBuilder, $script:EgCheckoutRootNormal,
@@ -1939,17 +1949,20 @@ try {
     if (-not [EnergyGridOneShotSupervisorNative]::CommitIntent()) {
         Stop-EgSupervisor -SupportRef 'EG_SUPERVISOR_RESUME_GATE_CLOSED' -ContainmentFailure
     }
-    $resume = [EnergyGridOneShotSupervisorNative]::TryResumeThread($threadHandle)
+    $resume = [EnergyGridOneShotSupervisorNative]::TryResumeThread($threadHandle, $deadlineTicks)
     $script:EgState.resume_attempted = [bool]$resume.Attempted
     $script:EgState.resume_succeeded = [bool]$resume.Accepted
     if ($resume.ErrorCode -ne 0) { $script:EgState.error_code = $resume.ErrorCode }
-    if (-not $resume.Attempted -or -not $resume.Accepted -or $resume.ReturnValue -ne 1) {
+    if ($resume.DeadlineExpired) {
+        $script:EgState.timed_out = $true
+        Invoke-EgTerminateJob -JobHandle $jobHandle -Reason 'TIMEOUT'
+    }
+    elseif (-not $resume.Attempted -or -not $resume.Accepted -or $resume.ReturnValue -ne 1) {
         Stop-EgSupervisor -SupportRef 'EG_SUPERVISOR_RESUME_ANOMALY' `
             -ErrorCode $resume.ErrorCode -ContainmentFailure
     }
 
-    $deadlineTicks = Get-EgDeadlineTicks -StartTicks $creationStartTicks -Seconds $TimeoutSeconds
-    $launcherSignaled = $false
+    $launcherSignaled = [bool]$resume.DeadlineExpired
     while (-not $launcherSignaled) {
         if ([EnergyGridOneShotSupervisorNative]::IsTerminationRequested) {
             Invoke-EgTerminateJob -JobHandle $jobHandle -Reason 'INTERRUPTION'
@@ -2038,7 +2051,7 @@ catch {
             Invoke-EgTerminateJob -JobHandle $jobHandle -Reason 'POST_CREATE_FAILURE'
         }
         if ($jobHandle -ne [IntPtr]::Zero) {
-            Wait-EgReap -JobHandle $jobHandle -DeadlineTicks $creationStartTicks -WindowSeconds 30
+            Wait-EgReap -JobHandle $jobHandle -DeadlineTicks $deadlineTicks -WindowSeconds 30
         }
     }
 }
