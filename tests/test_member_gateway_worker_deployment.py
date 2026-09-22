@@ -11,7 +11,8 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 import unittest
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -550,6 +551,30 @@ def _write_deterministic_powershell_file(path: Path, source: str) -> None:
     path.write_bytes(b"\xef\xbb\xbf" + normalised.encode("utf-8"))
 
 
+def _assert_temp_outside_checkout(
+    checkout: Path, temporary_root: Path
+) -> None:
+    if not checkout.is_absolute() or not temporary_root.is_absolute():
+        raise AssertionError("native AST inspector paths must be absolute")
+
+    resolved_root = checkout.resolve(strict=True)
+    resolved_temp = temporary_root.resolve(strict=True)
+
+    if not resolved_root.is_absolute() or not resolved_temp.is_absolute():
+        raise AssertionError(
+            "native AST inspector resolved paths must be absolute"
+        )
+
+    try:
+        resolved_temp.relative_to(resolved_root)
+    except ValueError:
+        return
+
+    raise AssertionError(
+        "native AST inspector temp directory is inside the checkout"
+    )
+
+
 def _bounded_native_process(command: list[str]) -> tuple[int, bytes, bytes, bool, bool]:
     process = subprocess.Popen(
         command,
@@ -710,11 +735,7 @@ def _inspect_autocount_probe(probe: str) -> dict[str, object]:
         raise unittest.SkipTest("native Windows PowerShell Desktop 5.1 x64 is required")
     temporary_root = Path(tempfile.mkdtemp(prefix="xb-member-worker-ast-"))
     try:
-        try:
-            if os.path.commonpath((str(ROOT.resolve()), str(temporary_root.resolve()))) == str(ROOT.resolve()):
-                raise AssertionError("native AST inspector temp directory is inside the checkout")
-        except ValueError as error:
-            raise AssertionError("native AST inspector temp directory could not be validated") from error
+        _assert_temp_outside_checkout(ROOT, temporary_root)
         inspector_path = temporary_root / "inspector.ps1"
         candidate_path = temporary_root / "candidate.ps1"
         inspector_source = _NATIVE_AST_INSPECTOR.replace(
@@ -1287,6 +1308,226 @@ def _parser_invalid_variants(source: str) -> list[tuple[str, str]]:
         ("malformed assignment", source + "\n$invalid = (\n"),
         ("Windows PowerShell 5.1 invalid ??=", source + "\n$invoicing ??= $null\n"),
     ]
+
+
+class NativeAstTempPathTests(unittest.TestCase):
+    @staticmethod
+    def _mock_path(resolved: str, *, absolute: bool = True):
+        path = mock.Mock(spec=Path)
+        path.is_absolute.return_value = absolute
+        path.resolve.return_value = PureWindowsPath(resolved)
+        return path
+
+    @staticmethod
+    def _native_success_payload() -> bytes:
+        return json.dumps(
+            {
+                "schema_version": 1,
+                "native51_x64": True,
+                "parse_ok": True,
+                "parse_errors": 0,
+                "node_count": 1,
+                "global_shape_ok": True,
+                "assemblies_ok": True,
+                "invoicing_ok": True,
+                "member_command_ok": True,
+                "required_methods_ok": True,
+                "accepted": True,
+                "reason": "OK",
+            },
+            separators=(",", ":"),
+        ).encode("utf-8")
+
+    def test_equal_checkout_and_temp_are_rejected(self) -> None:
+        checkout = self._mock_path(r"C:\Checkout")
+        temporary_root = self._mock_path(r"C:\Checkout")
+
+        with self.assertRaisesRegex(AssertionError, "inside the checkout"):
+            _assert_temp_outside_checkout(checkout, temporary_root)
+
+    def test_descendant_temp_is_rejected_case_insensitively(self) -> None:
+        checkout = self._mock_path(r"C:\Checkout")
+        temporary_root = self._mock_path(r"c:\checkout\temp")
+
+        with self.assertRaisesRegex(AssertionError, "inside the checkout"):
+            _assert_temp_outside_checkout(checkout, temporary_root)
+
+    def test_same_drive_sibling_is_accepted(self) -> None:
+        checkout = self._mock_path(r"C:\Checkout")
+        temporary_root = self._mock_path(r"C:\Sibling")
+
+        self.assertIsNone(_assert_temp_outside_checkout(checkout, temporary_root))
+
+    def test_same_drive_unrelated_absolute_path_is_accepted(self) -> None:
+        checkout = self._mock_path(r"C:\Checkout")
+        temporary_root = self._mock_path(r"C:\Other\Temp")
+
+        self.assertIsNone(_assert_temp_outside_checkout(checkout, temporary_root))
+
+    def test_different_windows_drive_is_accepted(self) -> None:
+        checkout = self._mock_path(r"D:\a\automation\automation")
+        temporary_root = self._mock_path(r"C:\xb-member-worker-ast-temp")
+
+        self.assertIsNone(_assert_temp_outside_checkout(checkout, temporary_root))
+
+    def test_checkout_resolution_failure_propagates(self) -> None:
+        checkout = self._mock_path(r"C:\Checkout")
+        temporary_root = self._mock_path(r"C:\Temp")
+        checkout.resolve.side_effect = OSError("checkout resolution failed")
+
+        with self.assertRaisesRegex(OSError, "checkout resolution failed"):
+            _assert_temp_outside_checkout(checkout, temporary_root)
+
+    def test_temp_resolution_failure_propagates(self) -> None:
+        checkout = self._mock_path(r"C:\Checkout")
+        temporary_root = self._mock_path(r"C:\Temp")
+        temporary_root.resolve.side_effect = OSError("temp resolution failed")
+
+        with self.assertRaisesRegex(OSError, "temp resolution failed"):
+            _assert_temp_outside_checkout(checkout, temporary_root)
+
+    def test_nonabsolute_checkout_is_rejected_before_resolution(self) -> None:
+        checkout = self._mock_path("checkout", absolute=False)
+        temporary_root = self._mock_path(r"C:\Temp")
+
+        with self.assertRaisesRegex(AssertionError, "paths must be absolute"):
+            _assert_temp_outside_checkout(checkout, temporary_root)
+        checkout.resolve.assert_not_called()
+        temporary_root.resolve.assert_not_called()
+
+    def test_nonabsolute_temp_is_rejected_before_resolution(self) -> None:
+        checkout = self._mock_path(r"C:\Checkout")
+        temporary_root = self._mock_path("temp", absolute=False)
+
+        with self.assertRaisesRegex(AssertionError, "paths must be absolute"):
+            _assert_temp_outside_checkout(checkout, temporary_root)
+        checkout.resolve.assert_not_called()
+        temporary_root.resolve.assert_not_called()
+
+    def test_resolved_paths_must_be_absolute(self) -> None:
+        checkout = self._mock_path("resolved-checkout")
+        temporary_root = self._mock_path(r"C:\Temp")
+
+        with self.assertRaisesRegex(AssertionError, "resolved paths must be absolute"):
+            _assert_temp_outside_checkout(checkout, temporary_root)
+
+    def test_real_tempfile_directory_outside_checkout_is_accepted(self) -> None:
+        temporary_root = Path(tempfile.mkdtemp(prefix="xb-member-worker-ast-test-"))
+        try:
+            self.assertIsNone(_assert_temp_outside_checkout(ROOT, temporary_root))
+        finally:
+            shutil.rmtree(temporary_root)
+
+    def test_containment_rejection_precedes_file_writes_and_native_invocation(self) -> None:
+        temporary_root = Path(tempfile.mkdtemp(prefix="xb-member-worker-ast-test-"))
+        try:
+            with (
+                mock.patch.object(tempfile, "mkdtemp", return_value=str(temporary_root)),
+                mock.patch(f"{__name__}._resolve_native_powershell", return_value="powershell.exe"),
+                mock.patch(
+                    f"{__name__}._assert_temp_outside_checkout",
+                    side_effect=AssertionError("temp directory is inside the checkout"),
+                ) as containment,
+                mock.patch(f"{__name__}._write_deterministic_powershell_file") as write_file,
+                mock.patch(f"{__name__}._bounded_native_process") as native_process,
+            ):
+                with self.assertRaisesRegex(AssertionError, "inside the checkout"):
+                    _inspect_autocount_probe("candidate")
+
+                containment.assert_called_once_with(ROOT, temporary_root)
+                write_file.assert_not_called()
+                native_process.assert_not_called()
+        finally:
+            if temporary_root.exists():
+                shutil.rmtree(temporary_root)
+
+    def test_containment_rejection_precedes_native_powershell_invocation(self) -> None:
+        temporary_root = Path(tempfile.mkdtemp(prefix="xb-member-worker-ast-test-"))
+        try:
+            with (
+                mock.patch.object(tempfile, "mkdtemp", return_value=str(temporary_root)),
+                mock.patch(f"{__name__}._resolve_native_powershell", return_value="powershell.exe"),
+                mock.patch(
+                    f"{__name__}._assert_temp_outside_checkout",
+                    side_effect=AssertionError("temp directory is inside the checkout"),
+                ),
+                mock.patch(f"{__name__}._bounded_native_process") as native_process,
+            ):
+                with self.assertRaisesRegex(AssertionError, "inside the checkout"):
+                    _inspect_autocount_probe("candidate")
+
+                native_process.assert_not_called()
+        finally:
+            if temporary_root.exists():
+                shutil.rmtree(temporary_root)
+
+    def test_cleanup_runs_after_success(self) -> None:
+        temporary_root = Path(tempfile.mkdtemp(prefix="xb-member-worker-ast-test-"))
+        try:
+            with (
+                mock.patch.object(tempfile, "mkdtemp", return_value=str(temporary_root)),
+                mock.patch(f"{__name__}._resolve_native_powershell", return_value="powershell.exe"),
+                mock.patch(f"{__name__}._assert_temp_outside_checkout"),
+                mock.patch(
+                    f"{__name__}._bounded_native_process",
+                    return_value=(0, self._native_success_payload(), b"", False, False),
+                ),
+                mock.patch.object(shutil, "rmtree", wraps=shutil.rmtree) as remove_tree,
+            ):
+                result = _inspect_autocount_probe("candidate")
+
+            self.assertTrue(result["accepted"])
+            remove_tree.assert_called_once_with(temporary_root)
+            self.assertFalse(temporary_root.exists())
+        finally:
+            if temporary_root.exists():
+                shutil.rmtree(temporary_root)
+
+    def test_cleanup_runs_after_inspection_failure(self) -> None:
+        temporary_root = Path(tempfile.mkdtemp(prefix="xb-member-worker-ast-test-"))
+        try:
+            with (
+                mock.patch.object(tempfile, "mkdtemp", return_value=str(temporary_root)),
+                mock.patch(f"{__name__}._resolve_native_powershell", return_value="powershell.exe"),
+                mock.patch(f"{__name__}._assert_temp_outside_checkout"),
+                mock.patch(
+                    f"{__name__}._bounded_native_process",
+                    side_effect=RuntimeError("native inspection failed"),
+                ),
+                mock.patch.object(shutil, "rmtree", wraps=shutil.rmtree) as remove_tree,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "native inspection failed"):
+                    _inspect_autocount_probe("candidate")
+
+            remove_tree.assert_called_once_with(temporary_root)
+            self.assertFalse(temporary_root.exists())
+        finally:
+            if temporary_root.exists():
+                shutil.rmtree(temporary_root)
+
+    def test_cleanup_failure_remains_an_error(self) -> None:
+        temporary_root = Path(tempfile.mkdtemp(prefix="xb-member-worker-ast-test-"))
+        try:
+            with (
+                mock.patch.object(tempfile, "mkdtemp", return_value=str(temporary_root)),
+                mock.patch(f"{__name__}._resolve_native_powershell", return_value="powershell.exe"),
+                mock.patch(f"{__name__}._assert_temp_outside_checkout"),
+                mock.patch(f"{__name__}._write_deterministic_powershell_file"),
+                mock.patch(
+                    f"{__name__}._bounded_native_process",
+                    return_value=(0, self._native_success_payload(), b"", False, False),
+                ),
+                mock.patch.object(
+                    shutil,
+                    "rmtree",
+                    side_effect=OSError("cleanup failed"),
+                ),
+            ):
+                with self.assertRaisesRegex(AssertionError, "temporary cleanup failed"):
+                    _inspect_autocount_probe("candidate")
+        finally:
+            if temporary_root.exists():
+                temporary_root.rmdir()
 
 
 class MemberGatewayWorkerDeploymentTests(unittest.TestCase):
