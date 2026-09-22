@@ -1186,7 +1186,303 @@ Add-Type -TypeDefinition @'
 using System;
 using System.IO;
 using System.Reflection;
+using System.Runtime.InteropServices;
+using System.Text;
 using System.Threading;
+using Microsoft.Win32.SafeHandles;
+
+public enum FILE_INFO_BY_HANDLE_CLASS : int
+{
+    FileIdInfo = 18
+}
+
+[StructLayout(LayoutKind.Sequential)]
+public struct FILE_ID_128
+{
+    public ulong Part0;
+    public ulong Part1;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+public struct FILE_ID_INFO
+{
+    public ulong VolumeSerialNumber;
+    public FILE_ID_128 FileId;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+public struct BY_HANDLE_FILE_INFORMATION
+{
+    public uint FileAttributes;
+    public System.Runtime.InteropServices.ComTypes.FILETIME CreationTime;
+    public System.Runtime.InteropServices.ComTypes.FILETIME LastAccessTime;
+    public System.Runtime.InteropServices.ComTypes.FILETIME LastWriteTime;
+    public uint VolumeSerialNumber;
+    public uint FileSizeHigh;
+    public uint FileSizeLow;
+    public uint NumberOfLinks;
+    public uint FileIndexHigh;
+    public uint FileIndexLow;
+}
+
+public sealed class EgIdentityOpenResult
+{
+    public bool Succeeded;
+    public int ErrorCode;
+    public SafeFileHandle Handle;
+}
+
+public sealed class EgIdentityInfoResult
+{
+    public bool Succeeded;
+    public int ErrorCode;
+    public ulong VolumeSerialNumber;
+    public ulong FileIdPart0;
+    public ulong FileIdPart1;
+    public uint FileAttributes;
+    public uint NumberOfLinks;
+}
+
+public sealed class EgIdentityReadResult
+{
+    public bool Succeeded;
+    public int ErrorCode;
+    public long InitialLength;
+    public long FinalLength;
+    public bool Eof;
+    public byte[] Bytes;
+}
+
+public sealed class EgIdentityBooleanResult
+{
+    public bool Succeeded;
+    public int ErrorCode;
+}
+
+public sealed class EgShortPathResult
+{
+    public bool Succeeded;
+    public int ErrorCode;
+    public string Path;
+}
+
+public static class EgOutcomeIdentity
+{
+    public const uint DirectoryAccess = 0x00100081;
+    public const uint DirectoryShare = 0x00000003;
+    public const uint DirectoryCreation = 0x00000003;
+    public const uint DirectoryFlags = 0x02200000;
+    public const uint FileAccess = 0x80100080;
+    public const uint FileShare = 0x00000001;
+    public const uint FileCreation = 0x00000003;
+    public const uint FileFlags = 0x00200000;
+    public const uint FileAttributeDirectory = 0x00000010;
+    public const uint FileAttributeReparsePoint = 0x00000400;
+    public const int FileIdInfoValue = 18;
+
+    [DllImport("kernel32.dll", EntryPoint = "CreateFileW", CharSet = CharSet.Unicode,
+        SetLastError = true)]
+    private static extern SafeFileHandle CreateFileW(
+        string fileName,
+        uint desiredAccess,
+        uint shareMode,
+        IntPtr securityAttributes,
+        uint creationDisposition,
+        uint flagsAndAttributes,
+        IntPtr templateFile);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetFileInformationByHandleEx(
+        SafeFileHandle hFile,
+        FILE_INFO_BY_HANDLE_CLASS fileInformationClass,
+        out FILE_ID_INFO fileInformation,
+        uint bufferSize);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetFileInformationByHandle(
+        SafeFileHandle hFile,
+        out BY_HANDLE_FILE_INFORMATION fileInformation);
+
+    [DllImport("kernel32.dll", EntryPoint = "GetShortPathNameW", CharSet = CharSet.Unicode,
+        SetLastError = true)]
+    private static extern uint GetShortPathNameW(
+        string longPath,
+        StringBuilder shortPath,
+        int shortPathCapacity);
+
+    [DllImport("kernel32.dll", EntryPoint = "CreateHardLinkW", CharSet = CharSet.Unicode,
+        SetLastError = true)]
+    private static extern bool CreateHardLinkW(
+        string fileName,
+        string existingFileName,
+        IntPtr securityAttributes);
+
+    public static bool VerifyLayout()
+    {
+        return Marshal.SizeOf(typeof(FILE_ID_128)) == 16 &&
+            Marshal.SizeOf(typeof(FILE_ID_INFO)) == 24 &&
+            Marshal.SizeOf(typeof(BY_HANDLE_FILE_INFORMATION)) == 52 &&
+            (int)FILE_INFO_BY_HANDLE_CLASS.FileIdInfo == FileIdInfoValue;
+    }
+
+    private static EgIdentityOpenResult Open(
+        string path, uint access, uint share, uint creation, uint flags)
+    {
+        EgIdentityOpenResult result = new EgIdentityOpenResult();
+        result.Handle = CreateFileW(path, access, share, IntPtr.Zero, creation, flags, IntPtr.Zero);
+        if (result.Handle == null || result.Handle.IsInvalid)
+        {
+            result.ErrorCode = Marshal.GetLastWin32Error();
+            return result;
+        }
+        result.Succeeded = true;
+        return result;
+    }
+
+    public static EgIdentityOpenResult OpenDirectory(string path)
+    {
+        return Open(path, DirectoryAccess, DirectoryShare, DirectoryCreation, DirectoryFlags);
+    }
+
+    public static EgIdentityOpenResult OpenFile(string path)
+    {
+        return Open(path, FileAccess, FileShare, FileCreation, FileFlags);
+    }
+
+    public static EgIdentityInfoResult QueryInfo(SafeFileHandle handle)
+    {
+        EgIdentityInfoResult result = new EgIdentityInfoResult();
+        if (handle == null || handle.IsInvalid)
+        {
+            result.ErrorCode = 6;
+            return result;
+        }
+
+        FILE_ID_INFO identity;
+        if (!GetFileInformationByHandleEx(
+            handle,
+            FILE_INFO_BY_HANDLE_CLASS.FileIdInfo,
+            out identity,
+            (uint)Marshal.SizeOf(typeof(FILE_ID_INFO))))
+        {
+            result.ErrorCode = Marshal.GetLastWin32Error();
+            return result;
+        }
+
+        BY_HANDLE_FILE_INFORMATION legacy;
+        if (!GetFileInformationByHandle(handle, out legacy))
+        {
+            result.ErrorCode = Marshal.GetLastWin32Error();
+            return result;
+        }
+
+        result.Succeeded = true;
+        result.VolumeSerialNumber = identity.VolumeSerialNumber;
+        result.FileIdPart0 = identity.FileId.Part0;
+        result.FileIdPart1 = identity.FileId.Part1;
+        result.FileAttributes = legacy.FileAttributes;
+        result.NumberOfLinks = legacy.NumberOfLinks;
+        return result;
+    }
+
+    public static EgIdentityReadResult ReadRetained(SafeFileHandle original)
+    {
+        EgIdentityReadResult result = new EgIdentityReadResult();
+        bool addedReference = false;
+        try
+        {
+            if (original == null || original.IsInvalid)
+            {
+                result.ErrorCode = 6;
+                return result;
+            }
+
+            original.DangerousAddRef(ref addedReference);
+            using (SafeFileHandle borrowed = new SafeFileHandle(
+                original.DangerousGetHandle(), false))
+            using (FileStream stream = new FileStream(
+                borrowed, System.IO.FileAccess.Read, 65536, false))
+            {
+                result.InitialLength = stream.Length;
+                if (result.InitialLength < 1 || result.InitialLength > 65536)
+                {
+                    return result;
+                }
+
+                byte[] bytes = new byte[(int)result.InitialLength];
+                int offset = 0;
+                while (offset < bytes.Length)
+                {
+                    int read = stream.Read(bytes, offset, bytes.Length - offset);
+                    if (read <= 0)
+                    {
+                        return result;
+                    }
+                    offset += read;
+                }
+
+                result.Eof = stream.ReadByte() == -1;
+                result.FinalLength = stream.Length;
+                result.Bytes = bytes;
+                result.Succeeded = result.Eof && result.FinalLength == result.InitialLength;
+                if (!result.Succeeded)
+                {
+                    Array.Clear(bytes, 0, bytes.Length);
+                    result.Bytes = null;
+                }
+            }
+        }
+        catch
+        {
+            result.Succeeded = false;
+            result.Bytes = null;
+        }
+        finally
+        {
+            if (addedReference)
+            {
+                original.DangerousRelease();
+            }
+        }
+        return result;
+    }
+
+    public static EgIdentityBooleanResult CreateHardLink(string linkPath, string existingPath)
+    {
+        EgIdentityBooleanResult result = new EgIdentityBooleanResult();
+        result.Succeeded = CreateHardLinkW(linkPath, existingPath, IntPtr.Zero);
+        if (!result.Succeeded)
+        {
+            result.ErrorCode = Marshal.GetLastWin32Error();
+        }
+        return result;
+    }
+
+    public static EgShortPathResult GetShortPath(string path)
+    {
+        EgShortPathResult result = new EgShortPathResult();
+        int capacity = 260;
+        while (capacity <= 32768)
+        {
+            StringBuilder buffer = new StringBuilder(capacity);
+            uint length = GetShortPathNameW(path, buffer, buffer.Capacity);
+            if (length == 0)
+            {
+                result.ErrorCode = Marshal.GetLastWin32Error();
+                return result;
+            }
+            if (length < (uint)buffer.Capacity)
+            {
+                result.Succeeded = true;
+                result.Path = buffer.ToString();
+                return result;
+            }
+            capacity = checked((int)length + 1);
+        }
+        result.ErrorCode = 122;
+        return result;
+    }
+}
 
 public sealed class EnergyGridDelayedFlushStreamForFunctionTest : FileStream
 {
@@ -1297,6 +1593,26 @@ public static class EnergyGridGraceInterruptSchedulerForFunctionTest
     }
 }
 '@
+
+Assert-Native ([EgOutcomeIdentity]::VerifyLayout()) 'file_id_info_layout_invalid'
+Assert-Native ([EgOutcomeIdentity]::DirectoryAccess -eq [uint32]0x00100081) `
+    'directory_access_contract_invalid'
+Assert-Native ([EgOutcomeIdentity]::DirectoryShare -eq [uint32]0x00000003) `
+    'directory_share_contract_invalid'
+Assert-Native ([EgOutcomeIdentity]::DirectoryCreation -eq [uint32]0x00000003) `
+    'directory_creation_contract_invalid'
+Assert-Native ([EgOutcomeIdentity]::DirectoryFlags -eq [uint32]0x02200000) `
+    'directory_flags_contract_invalid'
+Assert-Native ([EgOutcomeIdentity]::FileAccess -eq [uint32]2148532352) `
+    'file_access_contract_invalid'
+Assert-Native ([EgOutcomeIdentity]::FileShare -eq [uint32]0x00000001) `
+    'file_share_contract_invalid'
+Assert-Native ([EgOutcomeIdentity]::FileCreation -eq [uint32]0x00000003) `
+    'file_creation_contract_invalid'
+Assert-Native ([EgOutcomeIdentity]::FileFlags -eq [uint32]0x00200000) `
+    'file_flags_contract_invalid'
+Assert-Native ([EgOutcomeIdentity]::FileIdInfoValue -eq 18) 'file_id_info_class_invalid'
+Write-Output 'file_id_info_layout=PASS'
 
 function Get-ExactFunction {
     param([string]$Name, [string]$NextName)
@@ -1419,8 +1735,9 @@ function Cleanup-Job {
 }
 
 function New-State {
+    param([bool]$OutcomeCommitted = $false)
     return [pscustomobject]@{
-        outcome_committed = $true
+        outcome_committed = $OutcomeCommitted
         outcome_write_attempted = $false
         containment_failure = $false
         evidence_integrity_failure = $false
@@ -1588,6 +1905,151 @@ $outcomeFunction = Get-ExactFunction -Name 'Write-EgOutcome' -NextName 'Get-EgCa
 Assert-Native ($intentFunction.Contains('$durability.TimedOut -or -not $durability.Succeeded')) 'intent_timeout_check_missing'
 Assert-Native ($outcomeFunction.Contains('$durability.TimedOut -or -not $durability.Succeeded')) 'outcome_timeout_check_missing'
 
+function Test-EgDirectoryObjectAttributes {
+    param([uint32]$Attributes)
+    return (($Attributes -band [uint32]0x00000010) -ne 0 -and
+        ($Attributes -band [uint32]0x00000400) -eq 0)
+}
+
+function Test-EgFileObjectAttributes {
+    param([uint32]$Attributes)
+    return (($Attributes -band [uint32]0x00000010) -eq 0 -and
+        ($Attributes -band [uint32]0x00000400) -eq 0)
+}
+
+function Test-EgObjectIdentityEqual {
+    param($Left, $Right)
+    if ($null -eq $Left -or $null -eq $Right -or
+        -not $Left.Succeeded -or -not $Right.Succeeded) { return $false }
+    return [bool]($Left.VolumeSerialNumber -eq $Right.VolumeSerialNumber -and
+        $Left.FileIdPart0 -eq $Right.FileIdPart0 -and
+        $Left.FileIdPart1 -eq $Right.FileIdPart1)
+}
+
+function Assert-EgDistinctDirectoryIdentity {
+    param([string]$PathA, [string]$PathB, [string]$FailureMarker)
+
+    $handleA = $null
+    $handleB = $null
+    try {
+        $openedA = [EgOutcomeIdentity]::OpenDirectory($PathA)
+        $handleA = $openedA.Handle
+        Assert-Native ($openedA.Succeeded -and $null -ne $handleA) 'identity_control_directory_open_a'
+        $openedB = [EgOutcomeIdentity]::OpenDirectory($PathB)
+        $handleB = $openedB.Handle
+        Assert-Native ($openedB.Succeeded -and $null -ne $handleB) 'identity_control_directory_open_b'
+        $infoA = [EgOutcomeIdentity]::QueryInfo($handleA)
+        $infoB = [EgOutcomeIdentity]::QueryInfo($handleB)
+        Assert-Native ($infoA.Succeeded -and $infoB.Succeeded) 'identity_control_directory_query'
+        Assert-Native (-not (Test-EgObjectIdentityEqual -Left $infoA -Right $infoB)) $FailureMarker
+    }
+    finally {
+        if ($null -ne $handleB) { $handleB.Dispose() }
+        if ($null -ne $handleA) { $handleA.Dispose() }
+    }
+}
+
+function Assert-EgDistinctFileIdentity {
+    param([string]$PathA, [string]$PathB, [string]$FailureMarker)
+
+    $handleA = $null
+    $handleB = $null
+    try {
+        $openedA = [EgOutcomeIdentity]::OpenFile($PathA)
+        $handleA = $openedA.Handle
+        Assert-Native ($openedA.Succeeded -and $null -ne $handleA) 'identity_control_file_open_a'
+        $openedB = [EgOutcomeIdentity]::OpenFile($PathB)
+        $handleB = $openedB.Handle
+        Assert-Native ($openedB.Succeeded -and $null -ne $handleB) 'identity_control_file_open_b'
+        $infoA = [EgOutcomeIdentity]::QueryInfo($handleA)
+        $infoB = [EgOutcomeIdentity]::QueryInfo($handleB)
+        Assert-Native ($infoA.Succeeded -and $infoB.Succeeded) 'identity_control_file_query'
+        Assert-Native (-not (Test-EgObjectIdentityEqual -Left $infoA -Right $infoB)) $FailureMarker
+    }
+    finally {
+        if ($null -ne $handleB) { $handleB.Dispose() }
+        if ($null -ne $handleA) { $handleA.Dispose() }
+    }
+}
+
+function Assert-EgHardLinkIdentity {
+    param([string]$OriginalPath, [string]$AliasPath)
+
+    $originalHandle = $null
+    $aliasHandle = $null
+    try {
+        $originalOpen = [EgOutcomeIdentity]::OpenFile($OriginalPath)
+        $originalHandle = $originalOpen.Handle
+        Assert-Native ($originalOpen.Succeeded -and $null -ne $originalHandle) `
+            'hard_link_original_open_failed'
+        $aliasOpen = [EgOutcomeIdentity]::OpenFile($AliasPath)
+        $aliasHandle = $aliasOpen.Handle
+        Assert-Native ($aliasOpen.Succeeded -and $null -ne $aliasHandle) 'hard_link_alias_open_failed'
+        $originalInfo = [EgOutcomeIdentity]::QueryInfo($originalHandle)
+        $aliasInfo = [EgOutcomeIdentity]::QueryInfo($aliasHandle)
+        Assert-Native ($originalInfo.Succeeded -and $aliasInfo.Succeeded) 'hard_link_query_failed'
+        Assert-Native (Test-EgObjectIdentityEqual -Left $originalInfo -Right $aliasInfo) `
+            'hard_link_identity_not_equal'
+        Assert-Native ($originalInfo.NumberOfLinks -gt 1 -and $aliasInfo.NumberOfLinks -gt 1) `
+            'hard_link_count_not_observed'
+    }
+    finally {
+        if ($null -ne $aliasHandle) { $aliasHandle.Dispose() }
+        if ($null -ne $originalHandle) { $originalHandle.Dispose() }
+    }
+}
+
+function Assert-EgCrossRootHardLinkIdentity {
+    param(
+        [string]$ExpectedRootPath,
+        [string]$DiscoveredRootPath,
+        [string]$ExpectedFilePath,
+        [string]$DiscoveredFilePath
+    )
+
+    $expectedRootHandle = $null
+    $discoveredRootHandle = $null
+    $expectedFileHandle = $null
+    $discoveredFileHandle = $null
+    try {
+        $expectedRootOpen = [EgOutcomeIdentity]::OpenDirectory($ExpectedRootPath)
+        $expectedRootHandle = $expectedRootOpen.Handle
+        Assert-Native ($expectedRootOpen.Succeeded -and $null -ne $expectedRootHandle) `
+            'cross_root_expected_root_open_failed'
+        $discoveredRootOpen = [EgOutcomeIdentity]::OpenDirectory($DiscoveredRootPath)
+        $discoveredRootHandle = $discoveredRootOpen.Handle
+        Assert-Native ($discoveredRootOpen.Succeeded -and $null -ne $discoveredRootHandle) `
+            'cross_root_discovered_root_open_failed'
+        $expectedFileOpen = [EgOutcomeIdentity]::OpenFile($ExpectedFilePath)
+        $expectedFileHandle = $expectedFileOpen.Handle
+        Assert-Native ($expectedFileOpen.Succeeded -and $null -ne $expectedFileHandle) `
+            'cross_root_expected_file_open_failed'
+        $discoveredFileOpen = [EgOutcomeIdentity]::OpenFile($DiscoveredFilePath)
+        $discoveredFileHandle = $discoveredFileOpen.Handle
+        Assert-Native ($discoveredFileOpen.Succeeded -and $null -ne $discoveredFileHandle) `
+            'cross_root_discovered_file_open_failed'
+        $expectedRootInfo = [EgOutcomeIdentity]::QueryInfo($expectedRootHandle)
+        $discoveredRootInfo = [EgOutcomeIdentity]::QueryInfo($discoveredRootHandle)
+        $expectedFileInfo = [EgOutcomeIdentity]::QueryInfo($expectedFileHandle)
+        $discoveredFileInfo = [EgOutcomeIdentity]::QueryInfo($discoveredFileHandle)
+        Assert-Native ($expectedRootInfo.Succeeded -and $discoveredRootInfo.Succeeded -and
+            $expectedFileInfo.Succeeded -and $discoveredFileInfo.Succeeded) `
+            'cross_root_query_failed'
+        Assert-Native (-not (Test-EgObjectIdentityEqual -Left $expectedRootInfo -Right $discoveredRootInfo)) `
+            'cross_root_directory_identity_accepted'
+        Assert-Native (Test-EgObjectIdentityEqual -Left $expectedFileInfo -Right $discoveredFileInfo) `
+            'cross_root_file_identity_not_equal'
+        Assert-Native ($expectedFileInfo.NumberOfLinks -gt 1 -and
+            $discoveredFileInfo.NumberOfLinks -gt 1) 'cross_root_link_count_not_observed'
+    }
+    finally {
+        if ($null -ne $discoveredFileHandle) { $discoveredFileHandle.Dispose() }
+        if ($null -ne $expectedFileHandle) { $expectedFileHandle.Dispose() }
+        if ($null -ne $discoveredRootHandle) { $discoveredRootHandle.Dispose() }
+        if ($null -ne $expectedRootHandle) { $expectedRootHandle.Dispose() }
+    }
+}
+
 function Assert-OutcomeFile {
     param(
         [string]$EvidenceRoot,
@@ -1596,39 +2058,136 @@ function Assert-OutcomeFile {
         [string]$ExpectedIntentHash
     )
 
-    $outcomeFiles = @(Get-ChildItem -LiteralPath $EvidenceRoot -Filter '*.outcome.json' -File)
-    Assert-Native ($outcomeFiles.Count -eq 1) 'ordinary_outcome_file_count'
-    Assert-Native ([StringComparer]::OrdinalIgnoreCase.Equals(
-        $outcomeFiles[0].FullName, $ExpectedPath)) 'ordinary_outcome_path_mismatch'
-    $bytes = [IO.File]::ReadAllBytes($ExpectedPath)
-    Assert-Native ($bytes.Length -ge 1 -and $bytes.Length -le 65536) 'ordinary_outcome_size_invalid'
-    $strictUtf8 = New-Object System.Text.UTF8Encoding($false, $true)
-    $jsonText = $strictUtf8.GetString($bytes)
-    $document = $jsonText | ConvertFrom-Json
-    $expectedFields = @(
-        'schema', 'run_id', 'operation', 'intent_sha256', 'start_verdict',
-        'launcher_exit_code', 'creation_attempted', 'resume_attempted',
-        'application_child_observed', 'application_child_observation_elapsed_ms',
-        'total_processes', 'active_processes', 'total_terminated_processes',
-        'reap_confirmed', 'stdout_bytes', 'stderr_bytes', 'stdout_complete',
-        'stderr_complete', 'raw_stream_retained_bytes', 'containment', 'completed_utc'
-    )
-    $actualFields = @($document.PSObject.Properties.Name)
-    Assert-Native ($actualFields.Count -eq $expectedFields.Count) 'ordinary_outcome_field_count'
-    foreach ($field in $expectedFields) {
-        Assert-Native ($actualFields -contains $field) ('ordinary_outcome_field_missing:' + $field)
+    $rootHandle = $null
+    $expectedParentHandle = $null
+    $discoveredParentHandle = $null
+    $expectedFileHandle = $null
+    $discoveredFileHandle = $null
+    try {
+        $ExpectedLeaf = $ExpectedRunId + '.outcome.json'
+        $ConstructedExpectedPath = Join-Path $EvidenceRoot $ExpectedLeaf
+
+        $outcomeFiles = @(Get-ChildItem -LiteralPath $EvidenceRoot -Filter '*.outcome.json' -File)
+        Assert-Native ($outcomeFiles.Count -eq 1) 'ordinary_outcome_file_count'
+        Assert-Native ([StringComparer]::OrdinalIgnoreCase.Equals(
+            [string]$outcomeFiles[0].Name, $ExpectedLeaf)) 'ordinary_outcome_leaf_mismatch'
+
+        $expectedParentPath = [IO.Path]::GetDirectoryName($ConstructedExpectedPath)
+        $discoveredFilePath = [string]$outcomeFiles[0].FullName
+        $discoveredParentPath = [IO.Path]::GetDirectoryName($discoveredFilePath)
+        Assert-Native (-not [string]::IsNullOrEmpty($expectedParentPath) -and
+            -not [string]::IsNullOrEmpty($discoveredParentPath)) 'ordinary_outcome_parent_missing'
+
+        $rootOpen = [EgOutcomeIdentity]::OpenDirectory($EvidenceRoot)
+        $rootHandle = $rootOpen.Handle
+        Assert-Native ($rootOpen.Succeeded -and $null -ne $rootHandle) 'ordinary_outcome_root_open'
+        $expectedParentOpen = [EgOutcomeIdentity]::OpenDirectory($expectedParentPath)
+        $expectedParentHandle = $expectedParentOpen.Handle
+        Assert-Native ($expectedParentOpen.Succeeded -and $null -ne $expectedParentHandle) `
+            'ordinary_outcome_expected_parent_open'
+        $discoveredParentOpen = [EgOutcomeIdentity]::OpenDirectory($discoveredParentPath)
+        $discoveredParentHandle = $discoveredParentOpen.Handle
+        Assert-Native ($discoveredParentOpen.Succeeded -and $null -ne $discoveredParentHandle) `
+            'ordinary_outcome_discovered_parent_open'
+        $expectedFileOpen = [EgOutcomeIdentity]::OpenFile($ConstructedExpectedPath)
+        $expectedFileHandle = $expectedFileOpen.Handle
+        Assert-Native ($expectedFileOpen.Succeeded -and $null -ne $expectedFileHandle) `
+            'ordinary_outcome_expected_file_open'
+        $discoveredFileOpen = [EgOutcomeIdentity]::OpenFile($discoveredFilePath)
+        $discoveredFileHandle = $discoveredFileOpen.Handle
+        Assert-Native ($discoveredFileOpen.Succeeded -and $null -ne $discoveredFileHandle) `
+            'ordinary_outcome_discovered_file_open'
+
+        $rootInfo = [EgOutcomeIdentity]::QueryInfo($rootHandle)
+        $expectedParentInfo = [EgOutcomeIdentity]::QueryInfo($expectedParentHandle)
+        $discoveredParentInfo = [EgOutcomeIdentity]::QueryInfo($discoveredParentHandle)
+        $expectedFileInfo = [EgOutcomeIdentity]::QueryInfo($expectedFileHandle)
+        $discoveredFileInfo = [EgOutcomeIdentity]::QueryInfo($discoveredFileHandle)
+        Assert-Native ($rootInfo.Succeeded -and $expectedParentInfo.Succeeded -and
+            $discoveredParentInfo.Succeeded -and $expectedFileInfo.Succeeded -and
+            $discoveredFileInfo.Succeeded) 'ordinary_outcome_identity_query'
+        Assert-Native (Test-EgDirectoryObjectAttributes -Attributes $rootInfo.FileAttributes) `
+            'ordinary_outcome_root_attributes'
+        Assert-Native (Test-EgDirectoryObjectAttributes -Attributes $expectedParentInfo.FileAttributes) `
+            'ordinary_outcome_expected_parent_attributes'
+        Assert-Native (Test-EgDirectoryObjectAttributes -Attributes $discoveredParentInfo.FileAttributes) `
+            'ordinary_outcome_discovered_parent_attributes'
+        Assert-Native (Test-EgFileObjectAttributes -Attributes $expectedFileInfo.FileAttributes) `
+            'ordinary_outcome_expected_file_attributes'
+        Assert-Native (Test-EgFileObjectAttributes -Attributes $discoveredFileInfo.FileAttributes) `
+            'ordinary_outcome_discovered_file_attributes'
+        Assert-Native (Test-EgObjectIdentityEqual -Left $rootInfo -Right $expectedParentInfo) `
+            'ordinary_outcome_root_expected_parent_identity'
+        Assert-Native (Test-EgObjectIdentityEqual -Left $rootInfo -Right $discoveredParentInfo) `
+            'ordinary_outcome_root_discovered_parent_identity'
+        Assert-Native (Test-EgObjectIdentityEqual -Left $expectedFileInfo -Right $discoveredFileInfo) `
+            'ordinary_outcome_file_identity'
+        Assert-Native ($expectedFileInfo.NumberOfLinks -eq 1 -and
+            $discoveredFileInfo.NumberOfLinks -eq 1) 'ordinary_outcome_link_count_before'
+
+        $retainedRead = [EgOutcomeIdentity]::ReadRetained($expectedFileHandle)
+        Assert-Native $retainedRead.Succeeded 'ordinary_outcome_retained_read'
+        $bytes = $retainedRead.Bytes
+        $script:LastOutcomeBytes = [byte[]]$bytes.Clone()
+        $expectedFileAfterRead = [EgOutcomeIdentity]::QueryInfo($expectedFileHandle)
+        $discoveredFileAfterRead = [EgOutcomeIdentity]::QueryInfo($discoveredFileHandle)
+        Assert-Native ($expectedFileAfterRead.Succeeded -and $discoveredFileAfterRead.Succeeded) `
+            'ordinary_outcome_identity_after_read_query'
+        Assert-Native (Test-EgObjectIdentityEqual -Left $expectedFileInfo -Right $expectedFileAfterRead) `
+            'ordinary_outcome_expected_identity_changed_after_read'
+        Assert-Native (Test-EgObjectIdentityEqual -Left $expectedFileAfterRead -Right $discoveredFileAfterRead) `
+            'ordinary_outcome_file_identity_changed_after_read'
+        Assert-Native (Test-EgFileObjectAttributes -Attributes $expectedFileAfterRead.FileAttributes) `
+            'ordinary_outcome_expected_file_attributes_after_read'
+        Assert-Native (Test-EgFileObjectAttributes -Attributes $discoveredFileAfterRead.FileAttributes) `
+            'ordinary_outcome_discovered_file_attributes_after_read'
+        Assert-Native ($expectedFileAfterRead.NumberOfLinks -eq 1 -and
+            $discoveredFileAfterRead.NumberOfLinks -eq 1) 'ordinary_outcome_link_count_after'
+
+        Assert-Native ($bytes.Length -ge 1 -and $bytes.Length -le 65536) 'ordinary_outcome_size_invalid'
+        $strictUtf8 = New-Object System.Text.UTF8Encoding($false, $true)
+        $jsonText = $strictUtf8.GetString($bytes)
+        $document = $jsonText | ConvertFrom-Json
+        $expectedFields = @(
+            'schema', 'run_id', 'operation', 'intent_sha256', 'start_verdict',
+            'launcher_exit_code', 'creation_attempted', 'resume_attempted',
+            'application_child_observed', 'application_child_observation_elapsed_ms',
+            'total_processes', 'active_processes', 'total_terminated_processes',
+            'reap_confirmed', 'stdout_bytes', 'stderr_bytes', 'stdout_complete',
+            'stderr_complete', 'raw_stream_retained_bytes', 'containment', 'completed_utc'
+        )
+        $actualFields = @($document.PSObject.Properties.Name)
+        Assert-Native ($actualFields.Count -eq $expectedFields.Count) 'ordinary_outcome_field_count'
+        foreach ($field in $expectedFields) {
+            Assert-Native ($actualFields -contains $field) ('ordinary_outcome_field_missing:' + $field)
+        }
+        Assert-Native ($document.schema -eq 'energygrid.one_shot_supervisor.outcome.v1') `
+            'ordinary_outcome_schema_invalid'
+        Assert-Native ($document.run_id -eq $ExpectedRunId) 'ordinary_outcome_run_id_invalid'
+        Assert-Native ($document.operation -eq 'run') 'ordinary_outcome_operation_invalid'
+        Assert-Native ($document.intent_sha256 -eq $ExpectedIntentHash) `
+            'ordinary_outcome_intent_hash_invalid'
+        Assert-Native ($document.raw_stream_retained_bytes -eq 0) 'ordinary_outcome_raw_bytes_retained'
+        Assert-Native ($document.creation_attempted -and $document.resume_attempted) `
+            'ordinary_outcome_representative_flags_invalid'
+        Assert-Native ($document.reap_confirmed -and $document.stdout_complete -and $document.stderr_complete) `
+            'ordinary_outcome_representative_completion_invalid'
+        return $document
     }
-    Assert-Native ($document.schema -eq 'energygrid.one_shot_supervisor.outcome.v1') `
-        'ordinary_outcome_schema_invalid'
-    Assert-Native ($document.run_id -eq $ExpectedRunId) 'ordinary_outcome_run_id_invalid'
-    Assert-Native ($document.operation -eq 'run') 'ordinary_outcome_operation_invalid'
-    Assert-Native ($document.intent_sha256 -eq $ExpectedIntentHash) 'ordinary_outcome_intent_hash_invalid'
-    Assert-Native ($document.raw_stream_retained_bytes -eq 0) 'ordinary_outcome_raw_bytes_retained'
-    Assert-Native ($document.creation_attempted -and $document.resume_attempted) `
-        'ordinary_outcome_representative_flags_invalid'
-    Assert-Native ($document.reap_confirmed -and $document.stdout_complete -and $document.stderr_complete) `
-        'ordinary_outcome_representative_completion_invalid'
-    return $document
+    finally {
+        if ($null -ne $discoveredFileHandle) { $discoveredFileHandle.Dispose() }
+        if ($null -ne $expectedFileHandle) { $expectedFileHandle.Dispose() }
+        if ($null -ne $discoveredParentHandle) { $discoveredParentHandle.Dispose() }
+        if ($null -ne $expectedParentHandle) { $expectedParentHandle.Dispose() }
+        if ($null -ne $rootHandle) { $rootHandle.Dispose() }
+    }
+}
+
+function Assert-EgRejected {
+    param([scriptblock]$Action, [string]$FailureMarker)
+    $rejected = $false
+    try { & $Action | Out-Null } catch { $rejected = $true }
+    Assert-Native $rejected $FailureMarker
 }
 
 Write-Output 'function_case=timed_out_outcome_actual_delayed'
@@ -1643,7 +2202,7 @@ $script:OutcomeConstructionCount = 0
 $script:OutcomeConstructorArgumentsValid = $false
 [EnergyGridOutcomeDelayedFlushStreamForFunctionTest]::ResetState()
 $script:EgState = New-State
-$script:EgState.outcome_committed = $false
+Assert-Native (-not $script:EgState.outcome_committed) 'delayed_outcome_precommitted'
 Write-EgOutcome -StartVerdict 'STARTED_PROVEN'
 Assert-Native $script:EgState.outcome_write_attempted 'delayed_outcome_write_not_attempted'
 Assert-Native (-not $script:EgState.outcome_committed) 'delayed_outcome_committed'
@@ -1706,6 +2265,7 @@ try {
     $expectedIntentHash = ([BitConverter]::ToString($hash.ComputeHash($script:EgState.intent_bytes))).Replace('-', '').ToLowerInvariant()
 }
 finally { $hash.Dispose() }
+Assert-Native (-not $script:EgState.outcome_committed) 'ordinary_outcome_precommitted'
 Write-EgOutcome -StartVerdict 'STARTED_PROVEN'
 Assert-Native $script:EgState.outcome_write_attempted 'ordinary_outcome_write_not_attempted'
 Assert-Native $script:EgState.outcome_committed 'ordinary_outcome_not_committed'
@@ -1715,6 +2275,185 @@ Assert-Native $script:OutcomeConstructorArgumentsValid 'ordinary_outcome_constru
 $null = Assert-OutcomeFile -EvidenceRoot $ordinaryOutcomeRoot `
     -ExpectedPath $script:EgExpectedOutcomePath -ExpectedRunId $RunId `
     -ExpectedIntentHash $expectedIntentHash
+
+Write-Output 'file_id_info_query=PASS'
+Write-Output 'root_identity=PASS'
+Write-Output 'file_identity=PASS'
+Write-Output 'link_count=PASS'
+Write-Output 'retained_handle_read=PASS'
+Write-Output 'outcome_commit_transition=PASS'
+
+$identityControlsRoot = Join-Path $RootPath 'identity-controls'
+$alternateOutcomeRoot = Join-Path $identityControlsRoot 'alternate-root'
+$crossRoot = Join-Path $identityControlsRoot 'cross-root'
+$representationRoot = Join-Path $identityControlsRoot 'representation-long-parent-0123456789'
+$junctionTarget = Join-Path $identityControlsRoot 'junction-target'
+$junctionPath = Join-Path $identityControlsRoot 'junction-root'
+$identityLeaf = $RunId + '.outcome.json'
+try {
+    [IO.Directory]::CreateDirectory($identityControlsRoot) | Out-Null
+    [IO.Directory]::CreateDirectory($alternateOutcomeRoot) | Out-Null
+    [IO.Directory]::CreateDirectory($crossRoot) | Out-Null
+    [IO.Directory]::CreateDirectory($representationRoot) | Out-Null
+    [IO.File]::WriteAllBytes(
+        (Join-Path $alternateOutcomeRoot $identityLeaf), $script:LastOutcomeBytes)
+    [IO.File]::WriteAllBytes(
+        (Join-Path $representationRoot $identityLeaf), $script:LastOutcomeBytes)
+
+    $caseRoot = $ordinaryOutcomeRoot.ToUpperInvariant()
+    $null = Assert-OutcomeFile -EvidenceRoot $caseRoot `
+        -ExpectedPath (Join-Path $caseRoot $identityLeaf) -ExpectedRunId $RunId `
+        -ExpectedIntentHash $expectedIntentHash
+    $slashRoot = $ordinaryOutcomeRoot.Replace('\', '/')
+    $null = Assert-OutcomeFile -EvidenceRoot $slashRoot `
+        -ExpectedPath ($slashRoot + '/' + $identityLeaf) -ExpectedRunId $RunId `
+        -ExpectedIntentHash $expectedIntentHash
+    $dotRoot = $ordinaryOutcomeRoot + '\.\'
+    $null = Assert-OutcomeFile -EvidenceRoot $dotRoot `
+        -ExpectedPath (Join-Path $dotRoot $identityLeaf) -ExpectedRunId $RunId `
+        -ExpectedIntentHash $expectedIntentHash
+
+    $shortParent = [EgOutcomeIdentity]::GetShortPath($representationRoot)
+    if ($shortParent.Succeeded -and
+        -not [StringComparer]::OrdinalIgnoreCase.Equals($shortParent.Path, $representationRoot)) {
+        $shortExpectedPath = Join-Path $shortParent.Path $identityLeaf
+        $null = Assert-OutcomeFile -EvidenceRoot $shortParent.Path `
+            -ExpectedPath $shortExpectedPath -ExpectedRunId $RunId `
+            -ExpectedIntentHash $expectedIntentHash
+        Write-Output 'SHORT_NAME_ALIAS=PASS'
+    }
+    else {
+        Write-Output 'SHORT_NAME_ALIAS=UNAVAILABLE'
+    }
+    Write-Output 'representation_positives=PASS'
+
+    Assert-EgDistinctDirectoryIdentity -PathA $ordinaryOutcomeRoot -PathB $alternateOutcomeRoot `
+        -FailureMarker 'identity_negative_alternate_root'
+    Assert-EgDistinctFileIdentity `
+        -PathA (Join-Path $ordinaryOutcomeRoot $identityLeaf) `
+        -PathB (Join-Path $alternateOutcomeRoot $identityLeaf) `
+        -FailureMarker 'identity_negative_identical_bytes_different_object'
+
+    Assert-EgRejected -Action {
+        $null = Assert-OutcomeFile -EvidenceRoot $ordinaryOutcomeRoot `
+            -ExpectedPath (Join-Path $ordinaryOutcomeRoot 'EG-OUTCOME-SIBLING-0001.outcome.json') `
+            -ExpectedRunId 'EG-OUTCOME-SIBLING-0001' -ExpectedIntentHash $expectedIntentHash
+    } -FailureMarker 'identity_negative_sibling_filename'
+    Assert-EgRejected -Action {
+        $null = Assert-OutcomeFile -EvidenceRoot $ordinaryOutcomeRoot `
+            -ExpectedPath (Join-Path $ordinaryOutcomeRoot 'EG-DIFFERENT-RUN-0001.outcome.json') `
+            -ExpectedRunId 'EG-DIFFERENT-RUN-0001' -ExpectedIntentHash $expectedIntentHash
+    } -FailureMarker 'identity_negative_different_run_id'
+
+    $missingExpectedPath = Join-Path $ordinaryOutcomeRoot 'EG-MISSING-OUTCOME-0001.outcome.json'
+    $missingOpen = [EgOutcomeIdentity]::OpenFile($missingExpectedPath)
+    $missingHandle = $missingOpen.Handle
+    Assert-Native (-not $missingOpen.Succeeded) 'identity_negative_expected_path_opened'
+    if ($null -ne $missingHandle) { $missingHandle.Dispose() }
+    Assert-EgRejected -Action {
+        $null = Assert-OutcomeFile -EvidenceRoot $ordinaryOutcomeRoot `
+            -ExpectedPath $missingExpectedPath -ExpectedRunId 'EG-MISSING-OUTCOME-0001' `
+            -ExpectedIntentHash $expectedIntentHash
+    } -FailureMarker 'identity_negative_expected_path_missing'
+
+    $secondOutcomePath = Join-Path $ordinaryOutcomeRoot 'EG-SECOND-OUTCOME-0001.outcome.json'
+    [IO.File]::WriteAllBytes($secondOutcomePath, $script:LastOutcomeBytes)
+    try {
+        Assert-EgRejected -Action {
+            $null = Assert-OutcomeFile -EvidenceRoot $ordinaryOutcomeRoot `
+                -ExpectedPath $script:EgExpectedOutcomePath -ExpectedRunId $RunId `
+                -ExpectedIntentHash $expectedIntentHash
+        } -FailureMarker 'identity_negative_second_outcome_entry'
+    }
+    finally {
+        if (Test-Path -LiteralPath $secondOutcomePath) {
+            Remove-Item -LiteralPath $secondOutcomePath -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    $sameRootAliasPath = Join-Path $ordinaryOutcomeRoot 'hard-link-alias.bin'
+    $sameRootLink = [EgOutcomeIdentity]::CreateHardLink(
+        $sameRootAliasPath, $script:EgExpectedOutcomePath)
+    Assert-Native $sameRootLink.Succeeded 'identity_negative_same_root_hard_link_create'
+    try {
+        Assert-EgHardLinkIdentity -OriginalPath $script:EgExpectedOutcomePath `
+            -AliasPath $sameRootAliasPath
+        Assert-EgRejected -Action {
+            $null = Assert-OutcomeFile -EvidenceRoot $ordinaryOutcomeRoot `
+                -ExpectedPath $script:EgExpectedOutcomePath -ExpectedRunId $RunId `
+                -ExpectedIntentHash $expectedIntentHash
+        } -FailureMarker 'identity_negative_same_root_hard_link'
+    }
+    finally {
+        if (Test-Path -LiteralPath $sameRootAliasPath) {
+            Remove-Item -LiteralPath $sameRootAliasPath -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    $crossRootLinkPath = Join-Path $crossRoot $identityLeaf
+    $crossRootLink = [EgOutcomeIdentity]::CreateHardLink(
+        $crossRootLinkPath, $script:EgExpectedOutcomePath)
+    Assert-Native $crossRootLink.Succeeded 'identity_negative_cross_root_hard_link_create'
+    try {
+        Assert-EgCrossRootHardLinkIdentity `
+            -ExpectedRootPath $ordinaryOutcomeRoot -DiscoveredRootPath $crossRoot `
+            -ExpectedFilePath $script:EgExpectedOutcomePath -DiscoveredFilePath $crossRootLinkPath
+        Assert-EgRejected -Action {
+            $null = Assert-OutcomeFile -EvidenceRoot $crossRoot `
+                -ExpectedPath $crossRootLinkPath -ExpectedRunId $RunId `
+                -ExpectedIntentHash $expectedIntentHash
+        } -FailureMarker 'identity_negative_cross_root_hard_link'
+    }
+    finally {
+        if (Test-Path -LiteralPath $crossRootLinkPath) {
+            Remove-Item -LiteralPath $crossRootLinkPath -Force -ErrorAction SilentlyContinue
+        }
+    }
+    Write-Output 'identity_negatives=PASS'
+
+    [IO.Directory]::CreateDirectory($junctionTarget) | Out-Null
+    try {
+        New-Item -ItemType Junction -Path $junctionPath -Target $junctionTarget `
+            -ErrorAction Stop | Out-Null
+    }
+    catch { throw 'reparse_junction_creation_failed' }
+    $junctionHandle = $null
+    try {
+        $junctionOpen = [EgOutcomeIdentity]::OpenDirectory($junctionPath)
+        $junctionHandle = $junctionOpen.Handle
+        Assert-Native ($junctionOpen.Succeeded -and $null -ne $junctionHandle) `
+            'reparse_junction_open_failed'
+        $junctionInfo = [EgOutcomeIdentity]::QueryInfo($junctionHandle)
+        Assert-Native $junctionInfo.Succeeded 'reparse_junction_query_failed'
+        Assert-Native (($junctionInfo.FileAttributes -band [uint32]0x00000400) -ne 0) `
+            'reparse_junction_attribute_missing'
+        Assert-Native (-not (Test-EgDirectoryObjectAttributes -Attributes $junctionInfo.FileAttributes)) `
+            'reparse_junction_accepted'
+    }
+    finally {
+        if ($null -ne $junctionHandle) { $junctionHandle.Dispose() }
+    }
+    Assert-Native (-not (Test-EgFileObjectAttributes -Attributes ([uint32]0x00000400))) `
+        'reparse_file_predicate_accepted'
+    Write-Output 'reparse_rejection=PASS'
+}
+finally {
+    if (Test-Path -LiteralPath $junctionPath) {
+        Remove-Item -LiteralPath $junctionPath -Force -ErrorAction SilentlyContinue
+    }
+    if (Test-Path -LiteralPath $junctionTarget) {
+        Remove-Item -LiteralPath $junctionTarget -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    foreach ($cleanupPath in @($crossRoot, $alternateOutcomeRoot, $representationRoot)) {
+        if (Test-Path -LiteralPath $cleanupPath) {
+            Remove-Item -LiteralPath $cleanupPath -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+    if (Test-Path -LiteralPath $identityControlsRoot) {
+        Remove-Item -LiteralPath $identityControlsRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 $script:OutcomeSeamEnabled = $false
 Remove-Item -LiteralPath $ordinaryOutcomeRoot -Recurse -Force
 Assert-Native (-not (Test-Path -LiteralPath $ordinaryOutcomeRoot)) 'ordinary_outcome_cleanup_failed'
@@ -1856,7 +2595,7 @@ Start-Sleep -Milliseconds 150
         Microsoft.PowerShell.Utility\Start-Sleep -Milliseconds 50
     }
     Assert-Native ($null -ne $accounting -and $accounting.ActiveProcesses -gt 0) 'grace_descendant_missing'
-    $script:EgState = New-State
+    $script:EgState = New-State -OutcomeCommitted $true
     $script:EgState.active_processes = [uint64]0
     Wait-EgDescendantGrace -JobHandle $graceDeadlineJob `
         -LauncherHandle $graceDeadlineProcess.ProcessHandle -LauncherPid 0 -StartTicks 0 `
@@ -1893,7 +2632,7 @@ try {
     $graceInterruptAccounting = [EnergyGridOneShotSupervisorNative]::GetAccounting($graceInterruptJob)
     Assert-Native ($graceInterruptAccounting.Succeeded -and $graceInterruptAccounting.ActiveProcesses -gt 0) `
         'grace_interrupt_descendant_missing'
-    $script:EgState = New-State
+    $script:EgState = New-State -OutcomeCommitted $true
     $script:EgState.active_processes = [uint64]1
     $graceInterruptThread = [EnergyGridGraceInterruptSchedulerForFunctionTest]::Schedule(250)
     Wait-EgDescendantGrace -JobHandle $graceInterruptJob `
@@ -2030,7 +2769,7 @@ finally {
 
 Write-Output 'function_case=descendant_grace_accounting_failure'
 [EnergyGridOneShotSupervisorNative]::ResetControlState()
-$accountingFailureState = New-State
+$accountingFailureState = New-State -OutcomeCommitted $true
 $script:EgState = $accountingFailureState
 $accountingFailureThrown = $false
 try {
@@ -2156,7 +2895,7 @@ try {
     $reapJob = [EnergyGridOneShotSupervisorNative]::CreateJob()
     [EnergyGridOneShotSupervisorNative]::ConfigureJob($reapJob)
     $reapProcess = New-TestChild -JobHandle $reapJob
-    $script:EgState = New-State
+    $script:EgState = New-State -OutcomeCommitted $true
     $script:EgState.reap_confirmed = $false
     Wait-EgReap -JobHandle $reapJob -DeadlineTicks 0 -WindowSeconds 0
     Assert-Native (-not $script:EgState.reap_confirmed) 'reap_timeout_was_confirmed'
@@ -2181,38 +2920,38 @@ function Assert-ExitCase {
     Write-Output ('exit_case=' + $Name + '=' + $actual)
 }
 
-$script:EgState = New-State
+$script:EgState = New-State -OutcomeCommitted $true
 $script:EgState.creation_succeeded = $false
 $script:EgState.reap_confirmed = $false
 $script:EgState.start_verdict = 'NOT_STARTED_PROVEN'
 Assert-ExitCase -Name 'durable_precreation_rejection' -Expected 1
 
-$script:EgState = New-State
+$script:EgState = New-State -OutcomeCommitted $true
 $script:EgState.timed_out = $true
 $script:EgState.start_verdict = 'STARTED_PROVEN'
 $script:EgState.launcher_exit_code = 0
 Assert-ExitCase -Name 'durable_timeout_successful_reap' -Expected 2
 
-$script:EgState = New-State
+$script:EgState = New-State -OutcomeCommitted $true
 $script:EgState.timed_out = $true
 $script:EgState.containment_failure = $true
 Assert-ExitCase -Name 'timeout_containment_failure' -Expected 3
 
-$script:EgState = New-State
+$script:EgState = New-State -OutcomeCommitted $true
 $script:EgState.timed_out = $true
 $script:EgState.reap_confirmed = $false
 Assert-ExitCase -Name 'timeout_reap_unconfirmed' -Expected 3
 
-$script:EgState = New-State
+$script:EgState = New-State -OutcomeCommitted $true
 $script:EgState.start_verdict = 'AMBIGUOUS'
 Assert-ExitCase -Name 'durable_ambiguous' -Expected 4
 
-$script:EgState = New-State
+$script:EgState = New-State -OutcomeCommitted $true
 $script:EgState.start_verdict = 'STARTED_PROVEN'
 $script:EgState.launcher_exit_code = 0
 Assert-ExitCase -Name 'started_proven_launcher_zero_complete' -Expected 0
 
-$script:EgState = New-State
+$script:EgState = New-State -OutcomeCommitted $true
 $script:EgState.start_verdict = 'STARTED_PROVEN'
 $script:EgState.launcher_exit_code = 17
 Assert-ExitCase -Name 'nonzero_launcher_nonambiguous' -Expected 1
@@ -2288,6 +3027,20 @@ class SupervisorCommittedFunctionTests(unittest.TestCase):
                 "accounting_failure_and_reap_timeout",
             ):
                 self.assertIn("function_case=" + case, result.stdout)
+            for marker in (
+                "file_id_info_layout=PASS",
+                "file_id_info_query=PASS",
+                "root_identity=PASS",
+                "file_identity=PASS",
+                "link_count=PASS",
+                "reparse_rejection=PASS",
+                "identity_negatives=PASS",
+                "representation_positives=PASS",
+                "outcome_commit_transition=PASS",
+                "retained_handle_read=PASS",
+            ):
+                self.assertIn(marker, result.stdout)
+            self.assertRegex(result.stdout, r"SHORT_NAME_ALIAS=(PASS|UNAVAILABLE)")
             self.assertIn("function_assurance_cases=26", result.stdout)
             self.assertIn("function_assurance=PASS", result.stdout)
 
