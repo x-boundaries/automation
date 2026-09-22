@@ -4,6 +4,7 @@ on:
   pull_request:
     paths:
       - "energygrid-bill-downloader/**"
+      - "scripts/energygrid_one_shot_supervisor.ps1"
       - ".github/workflows/energygrid-bill-downloader-tests.yml"
       # EnergyGrid n8n error handler (#141): the source-controlled export, its focused
       # offline test, and the directory README that documents it. Exact entries, not a
@@ -34,6 +35,39 @@ jobs:
         run: |
           ACTUAL_SHA="$(git rev-parse HEAD)"
           test "${ACTUAL_SHA}" = "${EXPECTED_SHA}"
+      - name: Assert native Windows PowerShell 5.1 supervisor boundary
+        shell: powershell
+        run: |
+          if ($PSVersionTable.PSEdition -cne 'Desktop' -or
+              $PSVersionTable.PSVersion.Major -ne 5 -or
+              $PSVersionTable.PSVersion.Minor -ne 1 -or
+              [IntPtr]::Size -ne 8) {
+            throw "The supervisor gate requires native 64-bit Windows PowerShell 5.1."
+          }
+          $supervisor = (Resolve-Path "scripts/energygrid_one_shot_supervisor.ps1").Path
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            $supervisor, [ref]$null, [ref]$errors
+          ) | Out-Null
+          if (@($errors).Count -gt 0) { throw "Supervisor parse failed." }
+          $source = Get-Content -LiteralPath $supervisor -Raw
+          $marker = "`$script:EgNativeSource = @"
+          $start = $source.IndexOf($marker)
+          if ($start -lt 0) { throw "Supervisor native source marker missing." }
+          $start += $marker.Length
+          if ($source[$start] -eq [char]39) { $start++ }
+          if ($source[$start] -eq "`r") { $start++ }
+          if ($source[$start] -eq "`n") { $start++ }
+          $end = $source.IndexOf(([char]39).ToString() + "@", $start)
+          if ($end -lt 0) { throw "Supervisor native source terminator missing." }
+          $native = $source.Substring($start, $end - $start)
+          Add-Type -TypeDefinition $native -ReferencedAssemblies @("System.Management.dll") -ErrorAction Stop
+          if (-not [EnergyGridOneShotSupervisorNative]::VerifyX64StructureSizes()) {
+            throw "Supervisor x64 native structure assertion failed."
+          }
+          Write-Host ("candidate head=" + (git rev-parse HEAD).Trim())
+          Write-Host ("windows_version=" + [Environment]::OSVersion.Version)
+          Write-Host ("powershell_version=" + $PSVersionTable.PSVersion)
       - uses: actions/setup-python@v5
         with:
           python-version: "3.14"
@@ -63,6 +97,9 @@ jobs:
         shell: pwsh
         working-directory: energygrid-bill-downloader
         run: python -m unittest discover -s tests -v
+      - name: EnergyGrid one-shot supervisor focused test suite
+        shell: powershell
+        run: python -m unittest discover -s energygrid-bill-downloader/tests -p "test_one_shot_supervisor.py" -v
       - name: EnergyGrid n8n error handler focused test
         # The project suite above discovers only energygrid-bill-downloader/tests, so the
         # root-level focused test needs its own step. Standard library plus the runner's
@@ -77,6 +114,7 @@ jobs:
           $files = @(git diff --name-only $base HEAD)
           $owned = @($files | Where-Object {
             $_ -match '^energygrid-bill-downloader/' -or
+            $_ -eq 'scripts/energygrid_one_shot_supervisor.ps1' -or
             $_ -eq '.github/workflows/energygrid-bill-downloader-tests.yml' -or
             $_ -eq 'n8n-workflows/energygrid_download_error_handler.workflow.json' -or
             $_ -eq 'tests/test_energygrid_n8n_error_handler.py'
@@ -86,6 +124,7 @@ jobs:
           } else {
             foreach ($file in $files) {
               if ($file -notmatch '^energygrid-bill-downloader/' -and
+                  $file -ne 'scripts/energygrid_one_shot_supervisor.ps1' -and
                   $file -ne '.github/workflows/energygrid-bill-downloader-tests.yml' -and
                   $file -ne 'n8n-workflows/energygrid_download_error_handler.workflow.json' -and
                   $file -ne 'tests/test_energygrid_n8n_error_handler.py' -and
@@ -96,3 +135,25 @@ jobs:
               }
             }
           }
+      - name: Write bounded supervisor synthetic summary
+        if: always()
+        shell: powershell
+        run: |
+          $summary = Join-Path $env:RUNNER_TEMP 'energygrid-supervisor-summary.txt'
+          @(
+            ("candidate_head=" + (git rev-parse HEAD).Trim()),
+            ("windows_version=" + [Environment]::OSVersion.Version),
+            ("powershell_version=" + $PSVersionTable.PSVersion),
+            "supervisor_summary=synthetic_only"
+          ) | Set-Content -LiteralPath $summary -Encoding ascii
+          if ((Get-Item -LiteralPath $summary).Length -gt 4096) {
+            throw "Supervisor summary exceeded its bound."
+          }
+      - name: Upload supervisor synthetic summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: energygrid-supervisor-synthetic-summary
+          path: ${{ runner.temp }}/energygrid-supervisor-summary.txt
+          if-no-files-found: error
+          retention-days: 7
