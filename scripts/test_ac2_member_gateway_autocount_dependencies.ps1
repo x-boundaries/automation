@@ -28,17 +28,17 @@ foreach ($name in $requiredAssemblies) {
 }
 
 $core = $loaded["AutoCount.dll"]
-$accounting = $loaded["AutoCount.Accounting.dll"]
+$invoicing = $loaded["AutoCount.Invoicing.dll"]
 $requiredTypes = @(
     @($core, "AutoCount.Data.DBSetting"),
     @($core, "AutoCount.Authentication.UserSession"),
-    @($accounting, "AutoCount.BonusPoint.Member.MemberCommand")
+    @($invoicing, "AutoCount.BonusPoint.Member.MemberCommand")
 )
 foreach ($requirement in $requiredTypes) {
     if ($null -eq $requirement[0].GetType($requirement[1], $false, $false)) { throw "autocount_required_type_missing" }
 }
 
-$memberCommand = $accounting.GetType("AutoCount.BonusPoint.Member.MemberCommand", $true, $false)
+$memberCommand = $invoicing.GetType("AutoCount.BonusPoint.Member.MemberCommand", $true, $false)
 $methodNames = @($memberCommand.GetMethods() | ForEach-Object Name)
 foreach ($name in @("Create", "GetMember", "NewMember", "SaveMember")) {
     if ($methodNames -notcontains $name) { throw "autocount_required_method_missing" }

@@ -4,6 +4,45 @@ This is a preparation and review runbook for the bounded #155 G3 repository
 implementation. It does not authorize deployment, activation, live imports, or
 customer-data handling.
 
+## AC2 worker package and production launcher
+
+The committed worker example at
+`config/ac2_member_gateway_worker.production.example.json` is a shape-only
+template. Its `autocount_server_name`, `autocount_database_name`, and
+`autocount_user_id` fields are intentionally `null`; an operator must provide
+the reviewed values in the external runtime config at
+`config\worker.config.json`.
+
+In `Production` mode, the launcher requires each of those three properties to
+exist, be a JSON string, be non-null, and be non-empty and non-whitespace. It
+preserves each accepted value exactly as supplied: there is no trimming,
+coercion, or inference. Invalid values fail closed with the corresponding
+internal code: `launcher_autocount_server_name_invalid`,
+`launcher_autocount_database_name_invalid`, or
+`launcher_autocount_user_id_invalid`, before the worker child starts.
+
+The launcher binds the values unchanged to `XB_AC2_SERVER_NAME`,
+`XB_AC2_DATABASE_NAME`, and `XB_AC2_USER_ID`. The child environment removes
+`AC2_PROBE_SERVER_NAME`, `AC2_PROBE_DATABASE_NAME`, `AC2_PROBE_USER_ID`,
+`AC2_PROBE_PASSWORD`, and `XB_AC2_SESSION_FACTORY`. The existing DPAPI-backed
+password artifact remains mapped to `XB_AC2_PASSWORD` with
+`XB_AC2_PASSWORD_ENV_VAR=XB_AC2_PASSWORD`. `DisabledProof` remains the
+default, does not read production config or secret artifacts, and does not
+start the production worker.
+
+The dependency probe remains Windows PowerShell 5.1 Desktop and 64-bit. It
+loads exactly these five assemblies in order using
+`ReflectionOnlyLoadFrom`: `AutoCount.dll`, `AutoCount.Accounting.dll`,
+`AutoCount.Invoicing.dll`, `AutoCount.ImportExport.dll`, and
+`AutoCount.Tools.dll`. `AutoCount.BonusPoint.Member.MemberCommand` is resolved
+only from `AutoCount.Invoicing.dll`, with `Create`, `GetMember`, `NewMember`,
+and `SaveMember` required. No assembly-directory search, resolver, or broad
+fallback is permitted.
+
+Do not run licensed AutoCount or a production worker on the development
+laptop. Use synthetic/offline validation only; deployment and activation
+remain separately authorised operations.
+
 ## Safe repository checks
 
 Run the focused package tests, worker/static tests, schema and migration checks,
