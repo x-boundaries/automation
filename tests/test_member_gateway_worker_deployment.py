@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import shutil
 import subprocess
 import tempfile
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 import unittest
-from dataclasses import dataclass
 from pathlib import Path
 
 
@@ -22,12 +23,15 @@ PROTECTED_WORKER_BLOBS = {
     "scripts/ac2_member_gateway_worker.ps1": "27f0a3f8c78ba9b391b1a09ad33fe5805f723cc1",
     "scripts/ac2_member_gateway_worker_lib.ps1": "332af5a25f2be996694fdb6cef085139192ebf19",
     "scripts/ac2_member_gateway_autocount_adapter.ps1": "37ea54fea46c57671b02cbc15a138791a2977244",
+    "scripts/launch_ac2_member_gateway_worker.ps1": "a913dffc6191a8f8945b6427652bab963ab34d70",
+    "scripts/test_ac2_member_gateway_autocount_dependencies.ps1": "2143f59739a413b80e4745bc23053fefade09486",
 }
 
-WORKER_SCRIPTS = tuple(PROTECTED_WORKER_BLOBS) + (
-    "scripts/launch_ac2_member_gateway_worker.ps1",
-    "scripts/test_ac2_member_gateway_autocount_dependencies.ps1",
-)
+PROTECTED_WORKER_TREES = {
+    "member_gateway": "1114248f3c2663cb88bb06c48e810ef786de5cc1",
+}
+
+WORKER_SCRIPTS = tuple(PROTECTED_WORKER_BLOBS)
 
 ALLOWED_FILES = {
     ".github/workflows/member-gateway-tests.yml",
@@ -46,454 +50,1243 @@ ALLOWED_FILES = {
 }
 
 
-@dataclass(frozen=True)
-class _PowerShellToken:
-    kind: str
-    value: str
-    literal: bool = True
-
-
-_POWERSHELL_ASSIGNMENT_OPERATORS = frozenset(
-    {"=", "+=", "-=", "*=", "/=", "%=", "??="}
+_CANONICAL_AUTCOUNT_PROBE = r'''[CmdletBinding()]
+param(
+    [Parameter(Mandatory)][string]$AssemblyRoot
 )
-_POWERSHELL_OPEN_TO_CLOSE = {"(": ")", "[": "]", "{": "}"}
-_POWERSHELL_CLOSE_TO_OPEN = {value: key for key, value in _POWERSHELL_OPEN_TO_CLOSE.items()}
-_POWERSHELL_MUTATION_COMMANDS = frozenset(
-    {
-        "ci",
-        "clv",
-        "clear-content",
-        "clear-variable",
-        "copy-item",
-        "get-variable",
-        "gv",
-        "iex",
-        "invoke-expression",
-        "mi",
-        "move-item",
-        "new-variable",
-        "nv",
-        "new-item",
-        "ni",
-        "remove-variable",
-        "remove-item",
-        "ri",
-        "rv",
-        "rename-variable",
-        "rename-item",
-        "rni",
-        "set-content",
-        "set",
-        "set-item",
-        "set-variable",
-        "sc",
-        "si",
-        "sv",
-        "tee",
-        "tee-object",
-        "out-variable",
-        "ov",
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+
+if ($PSVersionTable.PSEdition -ne "Desktop" -or $PSVersionTable.PSVersion.Major -ne 5) {
+    throw "autocount_windows_powershell_5_required"
+}
+if (-not [Environment]::Is64BitProcess) { throw "autocount_64bit_powershell_required" }
+
+$root = [IO.Path]::GetFullPath($AssemblyRoot)
+if (-not (Test-Path -LiteralPath $root -PathType Container)) { throw "autocount_assembly_path_invalid" }
+$requiredAssemblies = @(
+    "AutoCount.dll",
+    "AutoCount.Accounting.dll",
+    "AutoCount.Invoicing.dll",
+    "AutoCount.ImportExport.dll",
+    "AutoCount.Tools.dll"
+)
+$loaded = @{}
+foreach ($name in $requiredAssemblies) {
+    $path = Join-Path $root $name
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "autocount_assembly_missing" }
+    $loaded[$name] = [Reflection.Assembly]::ReflectionOnlyLoadFrom($path)
+}
+
+$core = $loaded["AutoCount.dll"]
+$invoicing = $loaded["AutoCount.Invoicing.dll"]
+$requiredTypes = @(
+    @($core, "AutoCount.Data.DBSetting"),
+    @($core, "AutoCount.Authentication.UserSession"),
+    @($invoicing, "AutoCount.BonusPoint.Member.MemberCommand")
+)
+foreach ($requirement in $requiredTypes) {
+    if ($null -eq $requirement[0].GetType($requirement[1], $false, $false)) { throw "autocount_required_type_missing" }
+}
+
+$memberCommand = $invoicing.GetType("AutoCount.BonusPoint.Member.MemberCommand", $true, $false)
+$methodNames = @($memberCommand.GetMethods() | ForEach-Object Name)
+foreach ($name in @("Create", "GetMember", "NewMember", "SaveMember")) {
+    if ($methodNames -notcontains $name) { throw "autocount_required_method_missing" }
+}
+
+[pscustomobject]@{
+    status = "dependency_probe_pass"
+    powershell_major = $PSVersionTable.PSVersion.Major
+    process_bitness = 64
+    assembly_count = $requiredAssemblies.Count
+    required_type_count = $requiredTypes.Count
+    required_method_count = 4
+} | ConvertTo-Json -Compress
+'''
+
+
+_NATIVE_AST_INSPECTOR = r'''[CmdletBinding()]
+param(
+    [Parameter(Mandatory)][string]$SourcePath
+)
+
+$ErrorActionPreference = "Stop"
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+
+$ExpectedNodeCounts = [ordered]@{
+    ArrayExpressionAst = 7
+    ArrayLiteralAst = 6
+    AssignmentStatementAst = 11
+    AttributeAst = 2
+    BinaryExpressionAst = 5
+    CommandAst = 6
+    CommandExpressionAst = 39
+    CommandParameterAst = 6
+    ConstantExpressionAst = 6
+    ConvertExpressionAst = 1
+    ForEachStatementAst = 3
+    HashtableAst = 2
+    IfStatementAst = 6
+    IndexExpressionAst = 5
+    InvokeMemberExpressionAst = 5
+    MemberExpressionAst = 8
+    NamedAttributeArgumentAst = 1
+    NamedBlockAst = 1
+    ParamBlockAst = 1
+    ParameterAst = 1
+    ParenExpressionAst = 2
+    PipelineAst = 33
+    ScriptBlockAst = 1
+    StatementBlockAst = 16
+    StringConstantExpressionAst = 53
+    ThrowStatementAst = 6
+    TypeConstraintAst = 2
+    TypeExpressionAst = 3
+    UnaryExpressionAst = 3
+    VariableExpressionAst = 45
+}
+$ExpectedReasons = @(
+    "NATIVE_REQUIRED", "INPUT_LIMIT", "PARSE_ERROR", "NODE_LIMIT", "ASSEMBLIES",
+    "INVOICING", "MEMBER_COMMAND", "REQUIRED_METHODS", "AST_SHAPE", "OK"
+)
+$SkipFingerprintProperties = @(
+    "Extent", "Parent", "StaticType", "ErrorPosition", "StringConstantType"
+)
+$CanonicalSource = @'
+__CANONICAL_SOURCE__
+'@
+
+function Convert-ToFingerprintString {
+    param([AllowNull()]$Value)
+
+    if ($null -eq $Value) { return "<null>" }
+    if ($Value -is [System.Management.Automation.Language.Ast]) {
+        return (Get-AstFingerprint -Ast $Value)
     }
-)
+    if ($Value -is [System.Management.Automation.VariablePath]) {
+        $userPath = ([string]$Value.UserPath).ToLowerInvariant()
+        $fields = @(
+            "VariablePath",
+            $userPath,
+            "U=$([int]$Value.IsUnqualified)",
+            "D=$([int]$Value.IsDriveQualified)",
+            "G=$([int]$Value.IsGlobal)",
+            "L=$([int]$Value.IsLocal)",
+            "P=$([int]$Value.IsPrivate)",
+            "S=$([int]$Value.IsScript)",
+            "V=$([int]$Value.IsVariable)",
+            "Q=$([int]$Value.IsUnscopedVariable)",
+            "Drive=$([string]$Value.DriveName)"
+        )
+        return ($fields -join ":")
+    }
+    $type = $Value.GetType()
+    if ($type.FullName -eq "System.Management.Automation.Language.TypeName") {
+        return "TypeName:" + ([string]$Value.FullName)
+    }
+    if ($type.FullName.StartsWith("System.Tuple") -and $null -ne $type.GetProperty("Item1") -and
+        $null -ne $type.GetProperty("Item2")) {
+        return "Tuple2(" + (Convert-ToFingerprintString $Value.Item1) + "," +
+            (Convert-ToFingerprintString $Value.Item2) + ")"
+    }
+    if ($Value -is [System.Collections.IEnumerable] -and -not ($Value -is [string])) {
+        $items = @(
+            foreach ($item in $Value) { Convert-ToFingerprintString $item }
+        )
+        return "[" + [string]::Join(",", [string[]]$items) + "]"
+    }
+    if ($Value -is [System.Enum]) {
+        return "Enum:" + $type.FullName + ":" + ([string]$Value)
+    }
+    if ($Value -is [string]) {
+        return "String:" + [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($Value))
+    }
+    if ($Value -is [bool]) {
+        return "Bool:" + ($(if ($Value) { "1" } else { "0" }))
+    }
+    if ($Value -is [System.ValueType]) {
+        return "Value:" + $type.FullName + ":" + ([string]$Value)
+    }
+    return "Object:" + $type.FullName + ":" + ([string]$Value)
+}
 
+function Get-AstFingerprint {
+    param([System.Management.Automation.Language.Ast]$Ast)
 
-def _tokenize_powershell(source: str) -> list[_PowerShellToken]:
-    """Tokenize the PowerShell constructs needed for the static source contract.
+    $parts = New-Object System.Collections.Generic.List[string]
+    [void]$parts.Add($Ast.GetType().Name)
+    foreach ($propertyName in @($Ast.PSObject.Properties.Name | Sort-Object)) {
+        if ($SkipFingerprintProperties -contains $propertyName) { continue }
+        $property = $Ast.PSObject.Properties[$propertyName]
+        [void]$parts.Add($propertyName + "=" + (Convert-ToFingerprintString $property.Value))
+    }
+    return ($parts -join "|")
+}
 
-    This intentionally accepts only enough syntax to inspect complete assignments,
-    arrays, and member calls. Unsupported dynamic syntax is kept visible as extra
-    tokens so the contract fails closed instead of guessing at its meaning.
-    """
+function Get-AstNodes {
+    param([System.Management.Automation.Language.Ast]$Root)
+    return @($Root.FindAll({ param($Candidate) $true }, $true))
+}
 
-    tokens: list[_PowerShellToken] = []
-    index = 0
-    while index < len(source):
-        character = source[index]
-        if character in " \t\r":
-            index += 1
-            continue
-        if character == "\n":
-            tokens.append(_PowerShellToken("newline", "\n"))
-            index += 1
-            continue
-        if source.startswith("<#", index):
-            end = source.find("#>", index + 2)
-            if end < 0:
-                raise ValueError("unterminated PowerShell block comment")
-            tokens.extend(_PowerShellToken("newline", "\n") for value in source[index:end] if value == "\n")
-            index = end + 2
-            continue
-        if character == "#":
-            newline = source.find("\n", index)
-            index = len(source) if newline < 0 else newline
-            continue
-        if character in ("'", '"'):
-            quote = character
-            index += 1
-            value: list[str] = []
-            is_literal = True
-            closed = False
-            while index < len(source):
-                character = source[index]
-                if quote == "'" and character == "'":
-                    if index + 1 < len(source) and source[index + 1] == "'":
-                        value.append("'")
-                        index += 2
-                    else:
-                        index += 1
-                        closed = True
-                        break
-                elif quote == '"' and character == "`":
-                    is_literal = False
-                    if index + 1 < len(source):
-                        value.append(source[index + 1])
-                        index += 2
-                    else:
-                        index += 1
-                elif quote == '"' and character == "$":
-                    is_literal = False
-                    value.append(character)
-                    index += 1
-                elif character == quote:
-                    index += 1
-                    closed = True
-                    break
-                else:
-                    value.append(character)
-                    index += 1
-            if not closed:
-                raise ValueError("unterminated PowerShell string")
-            tokens.append(_PowerShellToken("string", "".join(value), is_literal))
-            continue
-        if character == "$":
-            if index + 1 < len(source) and source[index + 1] == "{":
-                end = source.find("}", index + 2)
-                if end < 0:
-                    raise ValueError("unterminated PowerShell braced variable")
-                value = source[index + 2 : end]
-                is_literal = re.fullmatch(r"[A-Za-z_?][A-Za-z0-9_?:]*", value) is not None
-                tokens.append(_PowerShellToken("variable", value, is_literal))
-                index = end + 1
-                continue
-            if index + 1 < len(source) and (source[index + 1].isalpha() or source[index + 1] in "_?"):
-                end = index + 2
-                while end < len(source) and (source[end].isalnum() or source[end] in "_?:"):
-                    end += 1
-                tokens.append(_PowerShellToken("variable", source[index + 1 : end]))
-                index = end
-                continue
-            tokens.append(_PowerShellToken("symbol", "$"))
-            index += 1
-            continue
+function Get-AstNodeCounts {
+    param([object[]]$Nodes)
+    $counts = @{}
+    foreach ($node in $Nodes) {
+        $name = $node.GetType().Name
+        if (-not $counts.ContainsKey($name)) { $counts[$name] = 0 }
+        $counts[$name]++
+    }
+    return $counts
+}
 
-        matched_operator = False
-        for operator in ("??=", "+=", "-=", "*=", "/=", "%=", "++", "--"):
-            if source.startswith(operator, index):
-                tokens.append(_PowerShellToken("symbol", operator))
-                index += len(operator)
-                matched_operator = True
-                break
-        if matched_operator:
-            continue
-
-        if character in "=+*/%(),[]{}.;|&<>@?:":
-            tokens.append(_PowerShellToken("symbol", character))
-            index += 1
-            continue
-
-        start = index
-        while index < len(source) and source[index] not in " \t\r\n#'\"$=+*/%(),[]{}.;|&<>@?:.":
-            index += 1
-        if start == index:
-            tokens.append(_PowerShellToken("symbol", source[index]))
-            index += 1
-        else:
-            tokens.append(_PowerShellToken("word", source[start:index]))
-    return tokens
-
-
-def _powershell_variable_name(token: _PowerShellToken) -> str | None:
-    if token.kind != "variable" or not token.literal:
-        return None
-    return token.value.rsplit(":", 1)[-1].casefold()
-
-
-def _powershell_is_bare_variable(token: _PowerShellToken, expected: str) -> bool:
-    return (
-        token.kind == "variable"
-        and token.literal
-        and ":" not in token.value
-        and _powershell_variable_name(token) == expected.casefold()
+function Test-BareTarget {
+    param(
+        [object]$Node,
+        [string]$Name,
+        [bool]$RequireBareExtent = $true
     )
+    if ($Node -isnot [System.Management.Automation.Language.VariableExpressionAst]) { return $false }
+    if ($Node.Splatted) { return $false }
+    if (-not $Node.VariablePath.IsUnqualified) { return $false }
+    if ($Node.VariablePath.UserPath -ine $Name) { return $false }
+    if ($RequireBareExtent -and $Node.Extent.Text -notmatch '^\$[A-Za-z_][A-Za-z0-9_]*$') { return $false }
+    return $true
+}
 
-
-def _powershell_matching_delimiter(tokens: list[_PowerShellToken], opening_index: int) -> int:
-    stack: list[str] = []
-    for index in range(opening_index, len(tokens)):
-        value = tokens[index].value
-        if value in _POWERSHELL_OPEN_TO_CLOSE:
-            stack.append(value)
-        elif value in _POWERSHELL_CLOSE_TO_OPEN:
-            if not stack or _POWERSHELL_CLOSE_TO_OPEN[value] != stack[-1]:
-                raise ValueError("unbalanced PowerShell delimiters")
-            stack.pop()
-            if not stack:
-                return index
-    raise ValueError("unterminated PowerShell construct")
-
-
-def _powershell_split_top_level(
-    tokens: list[_PowerShellToken], start: int, end: int
-) -> list[list[_PowerShellToken]]:
-    parts: list[list[_PowerShellToken]] = []
-    part_start = start
-    stack: list[str] = []
-    for index in range(start, end):
-        value = tokens[index].value
-        if value in _POWERSHELL_OPEN_TO_CLOSE:
-            stack.append(value)
-        elif value in _POWERSHELL_CLOSE_TO_OPEN:
-            if not stack or _POWERSHELL_CLOSE_TO_OPEN[value] != stack[-1]:
-                raise ValueError("unbalanced PowerShell array element")
-            stack.pop()
-        elif value == "," and not stack:
-            parts.append(tokens[part_start:index])
-            part_start = index + 1
-    if stack:
-        raise ValueError("unterminated PowerShell array element")
-    parts.append(tokens[part_start:end])
-    return parts
-
-
-def _powershell_statement_start(tokens: list[_PowerShellToken], before_index: int) -> int:
-    stack: list[str] = []
-    for index in range(before_index - 1, -1, -1):
-        token = tokens[index]
-        value = token.value
-        if value in _POWERSHELL_CLOSE_TO_OPEN:
-            stack.append(value)
-            continue
-        if value in _POWERSHELL_OPEN_TO_CLOSE:
-            if stack:
-                stack.pop()
-                continue
-            return index + 1
-        if not stack and (token.kind == "newline" or value in {";", "{", "}"}):
-            return index + 1
-    return 0
-
-
-def _powershell_statement_end(tokens: list[_PowerShellToken], start_index: int) -> int:
-    stack: list[str] = []
-    for index in range(start_index, len(tokens)):
-        token = tokens[index]
-        value = token.value
-        if not stack and (token.kind == "newline" or value == ";"):
-            return index
-        if value in _POWERSHELL_OPEN_TO_CLOSE:
-            stack.append(value)
-        elif value in _POWERSHELL_CLOSE_TO_OPEN:
-            if stack:
-                stack.pop()
-            else:
-                return index
-    return len(tokens)
-
-
-def _powershell_assignment_mutations(
-    tokens: list[_PowerShellToken], expected: str
-) -> list[tuple[str, int, str, list[_PowerShellToken]]]:
-    mutations: list[tuple[str, int, str, list[_PowerShellToken]]] = []
-    expected = expected.casefold()
-    for index, token in enumerate(tokens):
-        if token.kind != "symbol" or token.value not in _POWERSHELL_ASSIGNMENT_OPERATORS:
-            continue
-        start = _powershell_statement_start(tokens, index)
-        left = [value for value in tokens[start:index] if value.kind != "newline"]
-        if any(_powershell_variable_name(value) == expected for value in left):
-            mutations.append(("assignment", index, token.value, left))
-    for index, token in enumerate(tokens):
-        if _powershell_variable_name(token) != expected:
-            continue
-        if index > 0 and tokens[index - 1].value in {"++", "--"}:
-            mutations.append(("increment", index, tokens[index - 1].value, [token]))
-        if index + 1 < len(tokens) and tokens[index + 1].value in {"++", "--"}:
-            mutations.append(("increment", index, tokens[index + 1].value, [token]))
-    return mutations
-
-
-def _assert_autocount_probe_contract(probe: str) -> None:
-    def require(condition: bool, message: str) -> None:
-        if not condition:
-            raise AssertionError(message)
-
-    require(
-        'if ($PSVersionTable.PSEdition -ne "Desktop" -or $PSVersionTable.PSVersion.Major -ne 5) {' in probe,
-        "PowerShell Desktop/version gate is missing",
+function Get-TargetAssignments {
+    param(
+        [object[]]$Nodes,
+        [string]$Name
     )
-    require(
-        'if (-not [Environment]::Is64BitProcess) { throw "autocount_64bit_powershell_required" }' in probe,
-        "64-bit gate is missing",
-    )
+    foreach ($node in $Nodes) {
+        if ($node -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+            (Test-BareTarget -Node $node.Left -Name $Name)) {
+            $node
+        }
+    }
+}
 
-    try:
-        tokens = _tokenize_powershell(probe)
-    except ValueError as error:
-        raise AssertionError(f"PowerShell source cannot be structurally inspected: {error}") from error
-
-    for index, token in enumerate(tokens):
-        command_name = token.value.casefold().rsplit("\\", 1)[-1]
-        if token.kind == "word" and command_name in _POWERSHELL_MUTATION_COMMANDS:
-            require(False, f"unsupported dynamic variable mutation command: {token.value}")
-        if token.kind == "word" and token.value.casefold() in {
-            "-outvariable",
-            "-pipelinevariable",
-            "-variable",
-        }:
-            require(False, f"unsupported variable mutation parameter: {token.value}")
-        if token.kind == "word" and token.value.casefold() in {"psvariable", "setvalue", "setvalueexact", "ref"}:
-            require(False, f"unsupported indirect variable mutation token: {token.value}")
-        if token.kind == "word" and token.value.casefold() == "variable" and index + 1 < len(tokens) and tokens[index + 1].value == ":":
-            require(False, "unsupported variable-provider mutation surface")
-    for index, token in enumerate(tokens):
-        if token.kind == "symbol" and token.value == "&":
-            require(False, "unsupported dynamic command invocation")
-        if token.kind == "symbol" and token.value == "." and (
-            index == 0 or tokens[index - 1].kind == "newline" or tokens[index - 1].value in {";", "{", "}"}
-        ):
-            require(False, "unsupported dot-sourced command invocation")
-        if token.kind == "word" and token.value.casefold() == "set" and index > 0 and tokens[index - 1].value == ".":
-            require(False, "unsupported indirect variable mutation method: Set")
-
-    required_assemblies = [
+function Test-RequiredAssemblies {
+    param([object[]]$Nodes)
+    $expected = @(
         "AutoCount.dll",
         "AutoCount.Accounting.dll",
         "AutoCount.Invoicing.dll",
         "AutoCount.ImportExport.dll",
-        "AutoCount.Tools.dll",
-    ]
-    required_mutations = _powershell_assignment_mutations(tokens, "requiredAssemblies")
-    require(len(required_mutations) == 1, "required assembly collection must have exactly one assignment")
-    mutation_kind, assignment_index, assignment_operator, left = required_mutations[0]
-    require(
-        mutation_kind == "assignment"
-        and assignment_operator == "="
-        and len(left) == 1
-        and _powershell_is_bare_variable(left[0], "requiredAssemblies"),
-        "required assembly collection assignment is not a simple semantic assignment",
+        "AutoCount.Tools.dll"
     )
-    array_start = assignment_index + 1
-    while array_start < len(tokens) and tokens[array_start].kind == "newline":
-        array_start += 1
-    require(
-        array_start + 1 < len(tokens)
-        and tokens[array_start].value == "@"
-        and tokens[array_start + 1].value == "(",
-        "required assembly collection is not an array subexpression",
+    $assignments = @(Get-TargetAssignments -Nodes $Nodes -Name "requiredAssemblies")
+    if ($assignments.Count -ne 1) { return $false }
+    $assignment = $assignments[0]
+    if ([string]$assignment.Operator -ne "Equals") { return $false }
+    if ($assignment.Right -isnot [System.Management.Automation.Language.CommandExpressionAst]) { return $false }
+    $arrayExpression = $assignment.Right.Expression
+    if ($arrayExpression -isnot [System.Management.Automation.Language.ArrayExpressionAst]) { return $false }
+    $block = $arrayExpression.SubExpression
+    if ($block -isnot [System.Management.Automation.Language.StatementBlockAst]) { return $false }
+    $statements = @($block.Statements)
+    if ($statements.Count -ne 1 -or $statements[0] -isnot [System.Management.Automation.Language.PipelineAst]) { return $false }
+    $pipeline = $statements[0]
+    $elements = @($pipeline.PipelineElements)
+    if ($elements.Count -ne 1 -or $elements[0] -isnot [System.Management.Automation.Language.CommandExpressionAst]) { return $false }
+    $literal = $elements[0].Expression
+    if ($literal -isnot [System.Management.Automation.Language.ArrayLiteralAst]) { return $false }
+    $literalElements = @($literal.Elements)
+    if ($literalElements.Count -ne $expected.Count) { return $false }
+    for ($index = 0; $index -lt $expected.Count; $index++) {
+        if ($literalElements[$index] -isnot [System.Management.Automation.Language.StringConstantExpressionAst]) { return $false }
+        if ([string]$literalElements[$index].Value -cne $expected[$index]) { return $false }
+    }
+    return $true
+}
+
+function Test-Invoicing {
+    param([object[]]$Nodes)
+    $assignments = @(Get-TargetAssignments -Nodes $Nodes -Name "invoicing")
+    if ($assignments.Count -ne 1) { return $false }
+    $assignment = $assignments[0]
+    if ([string]$assignment.Operator -ne "Equals") { return $false }
+    if ($assignment.Right -isnot [System.Management.Automation.Language.CommandExpressionAst]) { return $false }
+    $index = $assignment.Right.Expression
+    if ($index -isnot [System.Management.Automation.Language.IndexExpressionAst]) { return $false }
+    if ($index.Target -isnot [System.Management.Automation.Language.VariableExpressionAst]) { return $false }
+    if ($index.Target.Splatted -or -not $index.Target.VariablePath.IsUnqualified -or
+        $index.Target.VariablePath.UserPath -ine "loaded") { return $false }
+    if ($index.Index -isnot [System.Management.Automation.Language.StringConstantExpressionAst]) { return $false }
+    return [string]$index.Index.Value -ceq "AutoCount.Invoicing.dll"
+}
+
+function Test-BooleanVariable {
+    param([object]$Node, [bool]$Expected)
+    if ($Node -isnot [System.Management.Automation.Language.VariableExpressionAst]) { return $false }
+    if ($Node.Splatted -or -not $Node.VariablePath.IsUnqualified) { return $false }
+    $expectedName = $(if ($Expected) { "true" } else { "false" })
+    return $Node.VariablePath.UserPath -ceq $expectedName
+}
+
+function Test-MemberCommand {
+    param([object[]]$Nodes)
+    $assignments = @(Get-TargetAssignments -Nodes $Nodes -Name "memberCommand")
+    if ($assignments.Count -ne 1) { return $false }
+    $assignment = $assignments[0]
+    if ([string]$assignment.Operator -ne "Equals") { return $false }
+    if ($assignment.Right -isnot [System.Management.Automation.Language.CommandExpressionAst]) { return $false }
+    $invoke = $assignment.Right.Expression
+    if ($invoke -isnot [System.Management.Automation.Language.InvokeMemberExpressionAst]) { return $false }
+    if ($invoke.Static) { return $false }
+    if ($invoke.Expression -isnot [System.Management.Automation.Language.VariableExpressionAst]) { return $false }
+    if ($invoke.Expression.Splatted -or -not $invoke.Expression.VariablePath.IsUnqualified -or
+        $invoke.Expression.VariablePath.UserPath -ine "invoicing") { return $false }
+    if ($invoke.Member -isnot [System.Management.Automation.Language.StringConstantExpressionAst] -or
+        [string]$invoke.Member.Value -cne "GetType") { return $false }
+    $arguments = @($invoke.Arguments)
+    if ($arguments.Count -ne 3) { return $false }
+    if ($arguments[0] -isnot [System.Management.Automation.Language.StringConstantExpressionAst] -or
+        [string]$arguments[0].Value -cne "AutoCount.BonusPoint.Member.MemberCommand") { return $false }
+    return (Test-BooleanVariable -Node $arguments[1] -Expected $true) -and
+        (Test-BooleanVariable -Node $arguments[2] -Expected $false)
+}
+
+function Test-RequiredMethods {
+    param([object[]]$Nodes)
+    $expected = @("Create", "GetMember", "NewMember", "SaveMember")
+    $matches = @()
+    foreach ($loop in $Nodes) {
+        if ($loop -isnot [System.Management.Automation.Language.ForEachStatementAst]) { continue }
+        if (-not (Test-BareTarget -Node $loop.Variable -Name "name" -RequireBareExtent $false)) { continue }
+        if ($loop.Condition -isnot [System.Management.Automation.Language.PipelineAst]) { continue }
+        $pipelineElements = @($loop.Condition.PipelineElements)
+        if ($pipelineElements.Count -ne 1 -or
+            $pipelineElements[0] -isnot [System.Management.Automation.Language.CommandExpressionAst]) { continue }
+        $arrayExpression = $pipelineElements[0].Expression
+        if ($arrayExpression -isnot [System.Management.Automation.Language.ArrayExpressionAst]) { continue }
+        $block = $arrayExpression.SubExpression
+        if ($block -isnot [System.Management.Automation.Language.StatementBlockAst]) { continue }
+        $statements = @($block.Statements)
+        if ($statements.Count -ne 1 -or $statements[0] -isnot [System.Management.Automation.Language.PipelineAst]) { continue }
+        $innerElements = @($statements[0].PipelineElements)
+        if ($innerElements.Count -ne 1 -or
+            $innerElements[0] -isnot [System.Management.Automation.Language.CommandExpressionAst]) { continue }
+        $literal = $innerElements[0].Expression
+        if ($literal -isnot [System.Management.Automation.Language.ArrayLiteralAst]) { continue }
+        $values = @($literal.Elements)
+        if ($values.Count -ne $expected.Count) { continue }
+        $same = $true
+        for ($index = 0; $index -lt $expected.Count; $index++) {
+            if ($values[$index] -isnot [System.Management.Automation.Language.StringConstantExpressionAst] -or
+                [string]$values[$index].Value -cne $expected[$index]) {
+                $same = $false
+                break
+            }
+        }
+        if ($same) { $matches += $loop }
+    }
+    return $matches.Count -eq 1
+}
+
+function Emit-Result {
+    param(
+        [bool]$Native51X64,
+        [bool]$ParseOk,
+        [int]$ParseErrors,
+        [int]$NodeCount,
+        [bool]$GlobalShapeOk,
+        [bool]$AssembliesOk,
+        [bool]$InvoicingOk,
+        [bool]$MemberCommandOk,
+        [bool]$RequiredMethodsOk,
+        [string]$Reason
     )
-    array_open = array_start + 1
+    $accepted = $ParseOk -and $ParseErrors -eq 0 -and $GlobalShapeOk -and
+        $AssembliesOk -and $InvoicingOk -and $MemberCommandOk -and
+        $RequiredMethodsOk -and $Reason -eq "OK"
+    $result = [ordered]@{
+        schema_version = 1
+        native51_x64 = $Native51X64
+        parse_ok = $ParseOk
+        parse_errors = $ParseErrors
+        node_count = $NodeCount
+        global_shape_ok = $GlobalShapeOk
+        assemblies_ok = $AssembliesOk
+        invoicing_ok = $InvoicingOk
+        member_command_ok = $MemberCommandOk
+        required_methods_ok = $RequiredMethodsOk
+        accepted = $accepted
+        reason = $Reason
+    }
+    [Console]::Out.Write(($result | ConvertTo-Json -Compress))
+}
+
+try {
+    $nativeOk = $PSVersionTable.PSEdition -eq "Desktop" -and
+        $PSVersionTable.PSVersion.Major -eq 5 -and [Environment]::Is64BitProcess
+    if (-not $nativeOk) {
+        Emit-Result -Native51X64 $false -ParseOk $false -ParseErrors 0 -NodeCount 0 `
+            -GlobalShapeOk $false -AssembliesOk $false -InvoicingOk $false `
+            -MemberCommandOk $false -RequiredMethodsOk $false -Reason "NATIVE_REQUIRED"
+        exit 0
+    }
+    if (-not [IO.File]::Exists($SourcePath)) {
+        Emit-Result -Native51X64 $true -ParseOk $false -ParseErrors 0 -NodeCount 0 `
+            -GlobalShapeOk $false -AssembliesOk $false -InvoicingOk $false `
+            -MemberCommandOk $false -RequiredMethodsOk $false -Reason "INPUT_LIMIT"
+        exit 0
+    }
+    $inputBytes = [IO.File]::ReadAllBytes($SourcePath)
+    if ($inputBytes.Length -gt 65536) {
+        Emit-Result -Native51X64 $true -ParseOk $false -ParseErrors 0 -NodeCount 0 `
+            -GlobalShapeOk $false -AssembliesOk $false -InvoicingOk $false `
+            -MemberCommandOk $false -RequiredMethodsOk $false -Reason "INPUT_LIMIT"
+        exit 0
+    }
+
+    $tokens = $null
+    $parseErrors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+        $SourcePath, [ref]$tokens, [ref]$parseErrors
+    )
+    $parseErrorCount = @($parseErrors).Count
+    if ($parseErrorCount -gt 0) {
+        Emit-Result -Native51X64 $true -ParseOk $false -ParseErrors $parseErrorCount -NodeCount 0 `
+            -GlobalShapeOk $false -AssembliesOk $false -InvoicingOk $false `
+            -MemberCommandOk $false -RequiredMethodsOk $false -Reason "PARSE_ERROR"
+        exit 0
+    }
+
+    $nodes = @(Get-AstNodes -Root $ast)
+    if ($nodes.Count -gt 4096) {
+        Emit-Result -Native51X64 $true -ParseOk $true -ParseErrors 0 -NodeCount $nodes.Count `
+            -GlobalShapeOk $false -AssembliesOk $false -InvoicingOk $false `
+            -MemberCommandOk $false -RequiredMethodsOk $false -Reason "NODE_LIMIT"
+        exit 0
+    }
+    foreach ($node in $nodes) {
+        $depth = 0
+        $parent = $node.Parent
+        while ($null -ne $parent) {
+            $depth++
+            if ($depth -gt 128) {
+                Emit-Result -Native51X64 $true -ParseOk $true -ParseErrors 0 -NodeCount $nodes.Count `
+                    -GlobalShapeOk $false -AssembliesOk $false -InvoicingOk $false `
+                    -MemberCommandOk $false -RequiredMethodsOk $false -Reason "NODE_LIMIT"
+                exit 0
+            }
+            $parent = $parent.Parent
+        }
+    }
+
+    $canonicalTokens = $null
+    $canonicalErrors = $null
+    $canonicalAst = [System.Management.Automation.Language.Parser]::ParseInput(
+        $CanonicalSource, [ref]$canonicalTokens, [ref]$canonicalErrors
+    )
+    if (@($canonicalErrors).Count -ne 0) {
+        Emit-Result -Native51X64 $true -ParseOk $true -ParseErrors 0 -NodeCount $nodes.Count `
+            -GlobalShapeOk $false -AssembliesOk $false -InvoicingOk $false `
+            -MemberCommandOk $false -RequiredMethodsOk $false -Reason "AST_SHAPE"
+        exit 0
+    }
+    $canonicalNodes = @(Get-AstNodes -Root $canonicalAst)
+    $counts = Get-AstNodeCounts -Nodes $nodes
+    $globalShapeOk = $nodes.Count -eq 286 -and $canonicalNodes.Count -eq 286
+    if ($globalShapeOk -and $counts.Count -eq $ExpectedNodeCounts.Count) {
+        foreach ($name in $ExpectedNodeCounts.Keys) {
+            if (-not $counts.ContainsKey($name) -or $counts[$name] -ne $ExpectedNodeCounts[$name]) {
+                $globalShapeOk = $false
+                break
+            }
+        }
+    } else {
+        $globalShapeOk = $false
+    }
+    if ($globalShapeOk) {
+        $candidateFingerprint = Get-AstFingerprint -Ast $ast
+        $canonicalFingerprint = Get-AstFingerprint -Ast $canonicalAst
+        $globalShapeOk = $candidateFingerprint -ceq $canonicalFingerprint
+    }
+
+    $assembliesOk = Test-RequiredAssemblies -Nodes $nodes
+    $invoicingOk = Test-Invoicing -Nodes $nodes
+    $memberCommandOk = Test-MemberCommand -Nodes $nodes
+    $requiredMethodsOk = Test-RequiredMethods -Nodes $nodes
+
+    if (-not $assembliesOk) { $reason = "ASSEMBLIES" }
+    elseif (-not $invoicingOk) { $reason = "INVOICING" }
+    elseif (-not $memberCommandOk) { $reason = "MEMBER_COMMAND" }
+    elseif (-not $requiredMethodsOk) { $reason = "REQUIRED_METHODS" }
+    elseif (-not $globalShapeOk) { $reason = "AST_SHAPE" }
+    else { $reason = "OK" }
+    Emit-Result -Native51X64 $true -ParseOk $true -ParseErrors 0 -NodeCount $nodes.Count `
+        -GlobalShapeOk $globalShapeOk -AssembliesOk $assembliesOk -InvoicingOk $invoicingOk `
+        -MemberCommandOk $memberCommandOk -RequiredMethodsOk $requiredMethodsOk -Reason $reason
+} catch {
+    Emit-Result -Native51X64 $true -ParseOk $false -ParseErrors 0 -NodeCount 0 `
+        -GlobalShapeOk $false -AssembliesOk $false -InvoicingOk $false `
+        -MemberCommandOk $false -RequiredMethodsOk $false -Reason "AST_SHAPE"
+    exit 0
+}
+'''
+
+
+def _resolve_native_powershell() -> str | None:
+    if os.name != "nt":
+        return None
+    system_root = Path(os.environ.get("WINDIR") or os.environ.get("SystemRoot") or r"C:\Windows")
+    system_path = "Sysnative" if __import__("struct").calcsize("P") == 4 else "System32"
+    candidates = (
+        system_root / system_path / "WindowsPowerShell" / "v1.0" / "powershell.exe",
+        system_root / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe",
+    )
+    for candidate in candidates:
+        if candidate.is_file():
+            return str(candidate.resolve())
+    return None
+
+
+def _write_deterministic_powershell_file(path: Path, source: str) -> None:
+    normalised = source.replace("\r\n", "\n").replace("\r", "\n")
+    path.write_bytes(b"\xef\xbb\xbf" + normalised.encode("utf-8"))
+
+
+def _bounded_native_process(command: list[str]) -> tuple[int, bytes, bytes, bool, bool]:
+    process = subprocess.Popen(
+        command,
+        cwd=ROOT,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        shell=False,
+    )
+    stdout = bytearray()
+    stderr = bytearray()
+    overflow = threading.Event()
+
+    def drain(stream, buffer: bytearray) -> None:
+        while True:
+            chunk = stream.read(1024)
+            if not chunk:
+                return
+            if len(buffer) < 4097:
+                buffer.extend(chunk[: 4097 - len(buffer)])
+            if len(buffer) > 4096:
+                overflow.set()
+
+    stdout_thread = threading.Thread(target=drain, args=(process.stdout, stdout), daemon=True)
+    stderr_thread = threading.Thread(target=drain, args=(process.stderr, stderr), daemon=True)
+    stdout_thread.start()
+    stderr_thread.start()
+    timed_out = False
+    deadline = time.monotonic() + 15.0
+    while process.poll() is None:
+        if overflow.is_set():
+            process.kill()
+            break
+        if time.monotonic() >= deadline:
+            timed_out = True
+            process.kill()
+            break
+        time.sleep(0.01)
     try:
-        array_close = _powershell_matching_delimiter(tokens, array_open)
-        array_elements = _powershell_split_top_level(tokens, array_open + 1, array_close)
-    except ValueError as error:
-        raise AssertionError(f"required assembly collection cannot be structurally inspected: {error}") from error
-    require(
-        not [token for token in tokens[array_close + 1 : _powershell_statement_end(tokens, array_close + 1)] if token.kind != "newline"],
-        "required assembly collection has a trailing mutation or expression",
-    )
-    require(
-        len(array_elements) == len(required_assemblies),
-        "required assembly collection does not contain exactly five elements",
-    )
-    for expected, element in zip(required_assemblies, array_elements):
-        literal_element = [token for token in element if token.kind != "newline"]
-        require(
-            len(literal_element) == 1
-            and literal_element[0].kind == "string"
-            and literal_element[0].literal
-            and literal_element[0].value == expected,
-            "required assembly collection contains a non-literal, unexpected, or misordered element",
+        return_code = process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        return_code = process.wait(timeout=5)
+    stdout_thread.join(timeout=5)
+    stderr_thread.join(timeout=5)
+    if process.stdout is not None:
+        process.stdout.close()
+    if process.stderr is not None:
+        process.stderr.close()
+    return return_code, bytes(stdout), bytes(stderr), timed_out, overflow.is_set()
+
+
+def _strict_json_object(payload: bytes) -> dict[str, object]:
+    if payload.endswith(b"\r\n"):
+        payload = payload[:-2]
+    elif payload.endswith(b"\n"):
+        payload = payload[:-1]
+    if not payload or b"\r" in payload or b"\n" in payload:
+        raise AssertionError("native AST inspector emitted non-compact stdout")
+
+    def reject_duplicate_keys(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise AssertionError(f"native AST inspector emitted duplicate JSON key: {key}")
+            result[key] = value
+        return result
+
+    def reject_nonfinite_numbers(value):
+        raise AssertionError(f"native AST inspector emitted nonfinite number: {value}")
+
+    try:
+        decoded = payload.decode("utf-8", errors="strict")
+        value = json.loads(
+            decoded,
+            object_pairs_hook=reject_duplicate_keys,
+            parse_constant=reject_nonfinite_numbers,
         )
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise AssertionError("native AST inspector emitted invalid JSON") from error
+    if not isinstance(value, dict):
+        raise AssertionError("native AST inspector did not emit one JSON object")
+    return value
 
-    invoicing_mutations = _powershell_assignment_mutations(tokens, "invoicing")
-    require(
-        len(invoicing_mutations) == 1,
-        "semantic $invoicing must have exactly one assignment or mutation",
-    )
-    mutation_kind, assignment_index, assignment_operator, left = invoicing_mutations[0]
-    require(
-        mutation_kind == "assignment"
-        and assignment_operator == "="
-        and len(left) == 1
-        and _powershell_is_bare_variable(left[0], "invoicing"),
-        "semantic $invoicing binding is not the sole simple assignment",
-    )
-    rhs_start = assignment_index + 1
-    rhs_end = _powershell_statement_end(tokens, rhs_start)
-    rhs = [token for token in tokens[rhs_start:rhs_end] if token.kind != "newline"]
-    require(
-        len(rhs) == 4
-        and _powershell_variable_name(rhs[0]) == "loaded"
-        and rhs[1].value == "["
-        and rhs[2].kind == "string"
-        and rhs[2].literal
-        and rhs[2].value == "AutoCount.Invoicing.dll"
-        and rhs[3].value == "]",
-        "semantic $invoicing binding does not select AutoCount.Invoicing.dll from $loaded",
-    )
 
-    require(
-        probe.count("[Reflection.Assembly]::ReflectionOnlyLoadFrom($path)") == 1,
-        "ReflectionOnlyLoadFrom loading contract is missing or duplicated",
+def _validate_native_result(result: dict[str, object]) -> dict[str, object]:
+    expected_fields = {
+        "schema_version",
+        "native51_x64",
+        "parse_ok",
+        "parse_errors",
+        "node_count",
+        "global_shape_ok",
+        "assemblies_ok",
+        "invoicing_ok",
+        "member_command_ok",
+        "required_methods_ok",
+        "accepted",
+        "reason",
+    }
+    if set(result) != expected_fields:
+        raise AssertionError("native AST inspector JSON fields do not match the contract")
+    if type(result["schema_version"]) is not int or result["schema_version"] != 1:
+        raise AssertionError("native AST inspector schema version is invalid")
+    boolean_fields = (
+        "native51_x64",
+        "parse_ok",
+        "global_shape_ok",
+        "assemblies_ok",
+        "invoicing_ok",
+        "member_command_ok",
+        "required_methods_ok",
+        "accepted",
     )
-    require(
-        '$loaded[$name] = [Reflection.Assembly]::ReflectionOnlyLoadFrom($path)' in probe,
-        "required assemblies are not loaded into the named map",
+    for field in boolean_fields:
+        if type(result[field]) is not bool:
+            raise AssertionError(f"native AST inspector field is not Boolean: {field}")
+    for field in ("parse_errors", "node_count"):
+        if type(result[field]) is not int or result[field] < 0:
+            raise AssertionError(f"native AST inspector field is not a nonnegative integer: {field}")
+    if not isinstance(result["reason"], str) or result["reason"] not in {
+        "NATIVE_REQUIRED",
+        "INPUT_LIMIT",
+        "PARSE_ERROR",
+        "NODE_LIMIT",
+        "ASSEMBLIES",
+        "INVOICING",
+        "MEMBER_COMMAND",
+        "REQUIRED_METHODS",
+        "AST_SHAPE",
+        "OK",
+    }:
+        raise AssertionError("native AST inspector reason is invalid")
+    if result["reason"] == "PARSE_ERROR":
+        if result["parse_ok"] or result["parse_errors"] <= 0:
+            raise AssertionError("native AST inspector parse error result is inconsistent")
+    elif result["parse_errors"] != 0:
+        raise AssertionError("native AST inspector reported parse errors for a non-parse result")
+    expected_accepted = (
+        result["reason"] == "OK"
+        and result["native51_x64"]
+        and result["parse_ok"]
+        and result["parse_errors"] == 0
+        and result["global_shape_ok"]
+        and result["assemblies_ok"]
+        and result["invoicing_ok"]
+        and result["member_command_ok"]
+        and result["required_methods_ok"]
     )
-    require(
-        probe.count('$invoicing = $loaded["AutoCount.Invoicing.dll"]') == 1,
-        "invoicing binding is not exact",
-    )
+    if result["accepted"] is not expected_accepted:
+        raise AssertionError("native AST inspector accepted field is inconsistent")
+    return result
 
-    member_command_lines = [
-        line.strip() for line in probe.splitlines() if "AutoCount.BonusPoint.Member.MemberCommand" in line
+
+def _inspect_autocount_probe(probe: str) -> dict[str, object]:
+    native_powershell = _resolve_native_powershell()
+    if native_powershell is None:
+        raise unittest.SkipTest("native Windows PowerShell Desktop 5.1 x64 is required")
+    temporary_root = Path(tempfile.mkdtemp(prefix="xb-member-worker-ast-"))
+    try:
+        try:
+            if os.path.commonpath((str(ROOT.resolve()), str(temporary_root.resolve()))) == str(ROOT.resolve()):
+                raise AssertionError("native AST inspector temp directory is inside the checkout")
+        except ValueError as error:
+            raise AssertionError("native AST inspector temp directory could not be validated") from error
+        inspector_path = temporary_root / "inspector.ps1"
+        candidate_path = temporary_root / "candidate.ps1"
+        inspector_source = _NATIVE_AST_INSPECTOR.replace(
+            "__CANONICAL_SOURCE__", _CANONICAL_AUTCOUNT_PROBE
+        )
+        _write_deterministic_powershell_file(inspector_path, inspector_source)
+        _write_deterministic_powershell_file(candidate_path, probe)
+        command = [
+            native_powershell,
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(inspector_path.resolve()),
+            "-SourcePath",
+            str(candidate_path.resolve()),
+        ]
+        return_code, stdout, stderr, timed_out, overflow = _bounded_native_process(command)
+        if timed_out:
+            raise AssertionError("native AST inspector timed out")
+        if overflow:
+            raise AssertionError("native AST inspector exceeded bounded output")
+        if stderr:
+            raise AssertionError("native AST inspector wrote to stderr")
+        if return_code != 0:
+            raise AssertionError(f"native AST inspector exited with status {return_code}")
+        if len(stdout) > 4096:
+            raise AssertionError("native AST inspector stdout exceeded 4096 bytes")
+        return _validate_native_result(_strict_json_object(stdout))
+    finally:
+        try:
+            shutil.rmtree(temporary_root)
+        except OSError as error:
+            raise AssertionError("native AST inspector temporary cleanup failed") from error
+
+
+def _assert_autocount_probe_contract(probe: str) -> None:
+    result = _inspect_autocount_probe(probe)
+    if not result["accepted"]:
+        raise AssertionError(f"native AST contract rejected candidate: {result['reason']}")
+
+
+def _inspect_many(probes: list[str]) -> list[dict[str, object]]:
+    worker_count = min(8, max(1, os.cpu_count() or 1))
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        return list(executor.map(_inspect_autocount_probe, probes))
+
+
+def _identity_forms(name: str) -> list[tuple[str, bool]]:
+    case_forms = [
+        name,
+        name.upper(),
+        name.lower(),
+        name.title(),
+        "".join(character.upper() if index % 2 else character.lower() for index, character in enumerate(name)),
+        name.swapcase(),
     ]
-    require(
-        member_command_lines
-        == [
-            '@($invoicing, "AutoCount.BonusPoint.Member.MemberCommand")',
-            '$memberCommand = $invoicing.GetType("AutoCount.BonusPoint.Member.MemberCommand", $true, $false)',
-        ],
-        "MemberCommand has an alternate binding, scan, or fallback",
+    forms: list[tuple[str, bool]] = [("$" + value, True) for value in case_forms]
+    forms.extend(
+        [
+            ("${" + name + "}", False),
+            ("${" + name.upper() + "}", False),
+            ("${" + name.title() + "}", False),
+        ]
+    )
+    for scope in ("local", "script", "private", "global", "variable"):
+        forms.extend(
+            [
+                (f"${scope}:{name}", False),
+                (f"${scope.upper()}:{name.upper()}", False),
+                (f"${{{scope}:{name}}}", False),
+                (f"${{{scope}:{name.upper()}}}", False),
+            ]
+        )
+    escaped_positions = range(len(name))
+    forms.extend(
+        [
+            ("${" + name[:position] + "`" + name[position:] + "}", False)
+            for position in escaped_positions
+        ]
+    )
+    unique: list[tuple[str, bool]] = []
+    seen: set[str] = set()
+    for form, is_bare in forms:
+        if form not in seen:
+            unique.append((form, is_bare))
+            seen.add(form)
+    if len(unique) > 36:
+        unique = unique[:36]
+    if len(unique) != 36:
+        raise AssertionError(f"identity fixture generator produced {len(unique)} forms for {name}")
+    return unique
+
+
+def _canonical_assignment_lines(source: str, name: str) -> tuple[list[str], int]:
+    lines = source.splitlines()
+    prefix = f"${name} ="
+    for index, line in enumerate(lines):
+        if line.startswith(prefix):
+            return lines, index
+    raise AssertionError(f"canonical assignment not found: {name}")
+
+
+def _assignment_fixture(source: str, name: str, target: str, operator: str) -> str:
+    lines, assignment_index = _canonical_assignment_lines(source, name)
+    if operator == "=":
+        lines[assignment_index] = lines[assignment_index].replace(f"${name} =", f"{target} =", 1)
+    else:
+        end_index = assignment_index
+        if name == "requiredAssemblies":
+            while not lines[end_index].strip() == ")":
+                end_index += 1
+        replacement = f"{target} {operator} $null"
+        if operator in {"prefix++", "prefix--"}:
+            replacement = f"{operator[-2:]}{target}"
+        elif operator in {"postfix++", "postfix--"}:
+            replacement = f"{target}{operator[-2:]}"
+        lines[assignment_index : end_index + 1] = [replacement]
+    return "\n".join(lines) + "\n"
+
+
+def _context_fixture(source: str, mutation: str, context: str) -> str:
+    if context == "top-level statement":
+        suffix = mutation
+    elif context == "expandable-string $()":
+        suffix = '"$({})"'.format(mutation)
+    elif context == "expandable here-string $()":
+        suffix = '@"\nmatrix\n$({})\n"@'.format(mutation)
+    elif context == "nested $($())":
+        suffix = '"$($({}))"'.format(mutation)
+    elif context == "invoked scriptblock":
+        suffix = "& { " + mutation + " }"
+    elif context == "Write-Output (mutation)":
+        suffix = "Write-Output (" + mutation + ")"
+    else:
+        raise AssertionError(f"unknown mutation context: {context}")
+    return source.rstrip() + "\n" + suffix + "\n"
+
+
+def _identity_matrix_fixture(
+    source: str,
+    name: str,
+    identity: str,
+    operator: str,
+    context: str,
+) -> str:
+    if context == "top-level statement":
+        return _assignment_fixture(source, name, identity, operator)
+    if operator in {"prefix++", "prefix--"}:
+        mutation = f"{operator[:-2]}{identity}"
+    elif operator in {"postfix++", "postfix--"}:
+        mutation = f"{identity}{operator[-2:]}"
+    else:
+        mutation = f"{identity} {operator} $null"
+    return _context_fixture(source, mutation, context)
+
+
+def _indirect_mutations() -> list[str]:
+    value = "$loaded['AutoCount.Tools.dll']"
+    return [
+        f"Set-Variable -Name 'invoicing' -Value {value}",
+        f"sv -Name 'invoicing' -Value {value}",
+        f"set -Name 'invoicing' -Value {value}",
+        f"Microsoft.PowerShell.Utility\\Set-Variable -Name 'invoicing' -Value {value}",
+        f"& ('Set-Variable') -Name 'invoicing' -Value {value}",
+        f"Set-Item variable:invoicing -Value {value}",
+        f"si variable:invoicing -Value {value}",
+        f"(Get-Variable -Name 'invoicing').Value = {value}",
+        f"$ExecutionContext.SessionState.PSVariable.Set('invoicing', {value})",
+        f"([ref]$invoicing).Value = {value}",
+        "Write-Output 1 -OutVariable invoicing",
+        "Write-Output 1 -ov invoicing",
+        "Write-Output 1 -PipelineVariable invoicing | ForEach-Object { $_ }",
+        "Write-Output 1 -pv invoicing | ForEach-Object { $_ }",
+        "Invoke-Expression '$invoicing = $loaded[\"AutoCount.Tools.dll\"]'",
+        "iex '$invoicing = $loaded[\"AutoCount.Tools.dll\"]'",
+        f"function Set-XbInvoicing {{ Set-Variable -Name 'invoicing' -Value {value} }}; Set-XbInvoicing",
+        f"Set-Alias xbSet Set-Variable; xbSet -Name 'invoicing' -Value {value}",
+        f". {{ $invoicing = {value} }}",
+        f"& {{ $invoicing = {value} }}",
+        "Clear-Variable -Name invoicing",
+        "Remove-Variable -Name invoicing",
+        f"New-Variable -Name invoicing -Value {value} -Force",
+        f"Set-Content variable:invoicing -Value {value}",
+        f"Write-Output 1 | Tee-Object -Variable invoicing",
+    ]
+
+
+_ASSEMBLY_VALUES = (
+    "AutoCount.dll",
+    "AutoCount.Accounting.dll",
+    "AutoCount.Invoicing.dll",
+    "AutoCount.ImportExport.dll",
+    "AutoCount.Tools.dll",
+)
+_METHOD_VALUES = ("Create", "GetMember", "NewMember", "SaveMember")
+
+
+def _array_assignment_block(name: str, elements: list[str]) -> str:
+    rendered = [f"    {element}" + ("," if index < len(elements) - 1 else "") for index, element in enumerate(elements)]
+    return f"${name} = @(\n" + "\n".join(rendered) + "\n)"
+
+
+def _replace_assembly_block(source: str, elements: list[str]) -> str:
+    start = source.index("$requiredAssemblies = @(")
+    close = source.index("\n)", start)
+    return source[:start] + _array_assignment_block("requiredAssemblies", elements) + source[close + 2 :]
+
+
+def _replace_assembly_expression(source: str, expression: str) -> str:
+    start = source.index("$requiredAssemblies = @(")
+    close = source.index("\n)", start)
+    return source[:start] + f"$requiredAssemblies = {expression}" + source[close + 2 :]
+
+
+def _replace_method_condition(source: str, condition: str) -> str:
+    start = source.index("foreach ($name in @(")
+    brace = source.index("{", start)
+    return source[:start] + f"foreach ($name in {condition}) " + source[brace:]
+
+
+def _collection_variants(source: str) -> list[tuple[str, str]]:
+    assembly_literals = [f'"{value}"' for value in _ASSEMBLY_VALUES]
+    variants: list[tuple[str, str]] = []
+    for index in range(len(assembly_literals)):
+        variants.append((f"assembly omission {index}", _replace_assembly_block(source, assembly_literals[:index] + assembly_literals[index + 1 :])))
+        replacement = assembly_literals.copy()
+        replacement[index] = '"AutoCount.Extended.dll"'
+        variants.append((f"assembly replacement {index}", _replace_assembly_block(source, replacement)))
+        variable = assembly_literals.copy()
+        variable[index] = "$assemblyName"
+        variants.append((f"assembly variable {index}", _replace_assembly_block(source, variable)))
+        binary = assembly_literals.copy()
+        binary[index] = '"AutoCount" + ".dll"'
+        variants.append((f"assembly binary {index}", _replace_assembly_block(source, binary)))
+        subexpression = assembly_literals.copy()
+        subexpression[index] = '$("AutoCount.dll")'
+        variants.append((f"assembly subexpression {index}", _replace_assembly_block(source, subexpression)))
+        expandable = assembly_literals.copy()
+        expandable[index] = '"AutoCount.$($assemblySuffix)"'
+        variants.append((f"assembly expandable string {index}", _replace_assembly_block(source, expandable)))
+        nested = assembly_literals.copy()
+        nested[index] = '@("AutoCount.dll")'
+        variants.append((f"assembly nested array {index}", _replace_assembly_block(source, nested)))
+    for index in range(len(assembly_literals) - 1):
+        transposed = assembly_literals.copy()
+        transposed[index], transposed[index + 1] = transposed[index + 1], transposed[index]
+        variants.append((f"assembly adjacent transposition {index}", _replace_assembly_block(source, transposed)))
+    for index, literal in enumerate(assembly_literals):
+        duplicate = assembly_literals[:index] + [literal, literal] + assembly_literals[index + 1 :]
+        variants.append((f"assembly duplicate {index}", _replace_assembly_block(source, duplicate)))
+    variants.extend(
+        [
+            (
+                "assembly sixth element",
+                _replace_assembly_block(source, assembly_literals + ['"AutoCount.Extended.dll"']),
+            ),
+            (
+                "assembly flattened comma output",
+                _replace_assembly_expression(source, ", ".join(assembly_literals)),
+            ),
+            (
+                "assembly concatenated arrays",
+                _replace_assembly_expression(source, " + ".join(f"@({literal})" for literal in assembly_literals)),
+            ),
+            (
+                "assembly variable-backed collection",
+                _replace_assembly_expression(source, "$assemblyValues")
+                .replace(
+                    "$requiredAssemblies = $assemblyValues",
+                    _array_assignment_block("assemblyValues", assembly_literals) + "\n$requiredAssemblies = $assemblyValues",
+                    1,
+                ),
+            ),
+            (
+                "assembly command-built collection",
+                _replace_assembly_expression(source, "Get-ChildItem -LiteralPath $root -Name"),
+            ),
+            (
+                "assembly duplicate assignment",
+                source.rstrip() + "\n$requiredAssemblies = @()\n",
+            ),
+            (
+                "assembly semicolon flattened output",
+                _replace_assembly_expression(source, "; ".join(assembly_literals)),
+            ),
+        ]
     )
 
-    required_methods_match = re.search(
-        r"foreach \(\$name in @\((?P<body>[^)]*)\)\)\s*\{\s*"
-        r"if \(\$methodNames -notcontains \$name\)",
-        probe,
-        re.DOTALL,
+    method_literals = [f'"{value}"' for value in _METHOD_VALUES]
+    for index in range(len(method_literals)):
+        omitted = method_literals[:index] + method_literals[index + 1 :]
+        variants.append((f"method omission {index}", _replace_method_condition(source, "@(" + ", ".join(omitted) + ")")))
+        replacement = method_literals.copy()
+        replacement[index] = '"ReplaceMember"'
+        variants.append((f"method replacement {index}", _replace_method_condition(source, "@(" + ", ".join(replacement) + ")")))
+        variable = method_literals.copy()
+        variable[index] = "$methodName"
+        variants.append((f"method variable {index}", _replace_method_condition(source, "@(" + ", ".join(variable) + ")")))
+        binary = method_literals.copy()
+        binary[index] = '"Save" + "Member"'
+        variants.append((f"method binary {index}", _replace_method_condition(source, "@(" + ", ".join(binary) + ")")))
+        subexpression = method_literals.copy()
+        subexpression[index] = '$("Create")'
+        variants.append((f"method subexpression {index}", _replace_method_condition(source, "@(" + ", ".join(subexpression) + ")")))
+        expandable = method_literals.copy()
+        expandable[index] = '"$($methodName)"'
+        variants.append((f"method expandable string {index}", _replace_method_condition(source, "@(" + ", ".join(expandable) + ")")))
+        nested = method_literals.copy()
+        nested[index] = '@("Create")'
+        variants.append((f"method nested array {index}", _replace_method_condition(source, "@(" + ", ".join(nested) + ")")))
+    for index in range(len(method_literals) - 1):
+        transposed = method_literals.copy()
+        transposed[index], transposed[index + 1] = transposed[index + 1], transposed[index]
+        variants.append((f"method adjacent transposition {index}", _replace_method_condition(source, "@(" + ", ".join(transposed) + ")")))
+    for index, literal in enumerate(method_literals):
+        duplicate = method_literals[:index] + [literal, literal] + method_literals[index + 1 :]
+        variants.append((f"method duplicate {index}", _replace_method_condition(source, "@(" + ", ".join(duplicate) + ")")))
+    variants.extend(
+        [
+            (
+                "method fifth element",
+                _replace_method_condition(source, "@(\"Create\", \"GetMember\", \"NewMember\", \"SaveMember\", \"ExtraMember\")"),
+            ),
+            (
+                "method flattened comma output",
+                _replace_method_condition(source, ", ".join(method_literals)),
+            ),
+            (
+                "method variable-backed collection",
+                _replace_method_condition(source, "$requiredMethodNames").replace(
+                    "foreach ($name in $requiredMethodNames)",
+                    _array_assignment_block("requiredMethodNames", method_literals)
+                    + "\nforeach ($name in $requiredMethodNames)",
+                    1,
+                ),
+            ),
+            (
+                "method command-built collection",
+                _replace_method_condition(source, "(Get-Content -LiteralPath $path)"),
+            ),
+            (
+                "method duplicate loop",
+                source.rstrip()
+                + "\nforeach ($name in @(\"Create\", \"GetMember\", \"NewMember\", \"SaveMember\")) {\n}\n",
+            ),
+            (
+                "method replacement collection",
+                _replace_method_condition(source, "$methodNames"),
+            ),
+        ]
     )
-    require(required_methods_match is not None, "required MemberCommand method check is missing")
-    required_methods = re.findall(r'"([^"\r\n]+)"', required_methods_match.group("body"))
-    require(
-        required_methods == ["Create", "GetMember", "NewMember", "SaveMember"],
-        "required MemberCommand method set is incomplete or changed",
-    )
-    require(
-        "$memberCommand.GetMethods() | ForEach-Object Name" in probe,
-        "MemberCommand method enumeration is missing",
-    )
+    return variants
 
-    for forbidden in (
-        "AssemblyResolve",
-        "GetFiles(",
-        "EnumerateFiles(",
-        "GetFileSystemEntries(",
-        "Get-ChildItem",
-        "[IO.Directory]::",
-        "[IO.DirectoryInfo]::",
-    ):
-        require(forbidden not in probe, f"forbidden broad/fallback resolver token: {forbidden}")
+
+def _insert_after(source: str, needle: str, addition: str) -> str:
+    if source.count(needle) != 1:
+        raise AssertionError(f"fixture anchor is not unique: {needle}")
+    return source.replace(needle, needle + "\n" + addition, 1)
+
+
+def _member_resolver_variants(source: str) -> list[tuple[str, str]]:
+    member_line = '$memberCommand = $invoicing.GetType("AutoCount.BonusPoint.Member.MemberCommand", $true, $false)'
+    variants = [
+        (
+            "core receiver",
+            source.replace(
+                "$memberCommand = $invoicing.GetType(",
+                "$memberCommand = $core.GetType(",
+                1,
+            ),
+        ),
+        (
+            "tools receiver",
+            source.replace(
+                member_line,
+                '$memberCommand = $loaded["AutoCount.Tools.dll"].GetType("AutoCount.BonusPoint.Member.MemberCommand", $true, $false)',
+                1,
+            ),
+        ),
+        (
+            "loaded values scan",
+            _insert_after(
+                source,
+                member_line,
+                '$alternateMemberCommand = @($loaded.Values | ForEach-Object { $_.GetType("AutoCount.BonusPoint.Member.MemberCommand", $false, $false) } | Where-Object { $null -ne $_ } | Select-Object -First 1)',
+            ),
+        ),
+        (
+            "AppDomain loaded assembly enumeration",
+            _insert_after(
+                source,
+                member_line,
+                '$alternateMemberCommand = [AppDomain]::CurrentDomain.GetAssemblies() | ForEach-Object { $_.GetType("AutoCount.BonusPoint.Member.MemberCommand", $false, $false) }',
+            ),
+        ),
+        (
+            "reflection-only enumeration",
+            _insert_after(
+                source,
+                member_line,
+                '$alternateMemberCommand = [Reflection.Assembly]::ReflectionOnlyLoadFrom($path).GetTypes() | Where-Object FullName -eq "AutoCount.BonusPoint.Member.MemberCommand"',
+            ),
+        ),
+        (
+            "fallback branch",
+            _insert_after(
+                source,
+                member_line,
+                'if ($null -eq $memberCommand) { $memberCommand = $core.GetType("AutoCount.BonusPoint.Member.MemberCommand", $true, $false) }',
+            ),
+        ),
+        (
+            "Type.GetType",
+            source.replace(
+                member_line,
+                '$memberCommand = [Type]::GetType("AutoCount.BonusPoint.Member.MemberCommand", $true, $false)',
+                1,
+            ),
+        ),
+        (
+            "reflected invocation",
+            source.replace(
+                member_line,
+                '$memberCommand = $invoicing.GetType("AutoCount.BonusPoint.Member.MemberCommand", $true, $false).Invoke($null, $null)',
+                1,
+            ),
+        ),
+        (
+            "dynamic member invocation",
+            source.replace(
+                member_line,
+                '$memberName = "GetType"; $memberCommand = $invoicing.$memberName("AutoCount.BonusPoint.Member.MemberCommand", $true, $false)',
+                1,
+            ),
+        ),
+        (
+            "function resolution",
+            _insert_after(
+                source,
+                member_line,
+                'function Resolve-XbMemberCommand { $invoicing.GetType("AutoCount.BonusPoint.Member.MemberCommand", $true, $false) }; $memberCommand = Resolve-XbMemberCommand',
+            ),
+        ),
+        (
+            "alias resolution",
+            _insert_after(
+                source,
+                member_line,
+                'Set-Alias xbResolve Get-Member; $memberCommand = xbResolve',
+            ),
+        ),
+        (
+            "scriptblock resolution",
+            _insert_after(
+                source,
+                member_line,
+                '$resolver = { $invoicing.GetType("AutoCount.BonusPoint.Member.MemberCommand", $true, $false) }; $memberCommand = & $resolver',
+            ),
+        ),
+        (
+            "additional memberCommand assignment",
+            _insert_after(
+                source,
+                member_line,
+                '$memberCommand = $core.GetType("AutoCount.BonusPoint.Member.MemberCommand", $true, $false)',
+            ),
+        ),
+        (
+            "altered requiredTypes receiver",
+            source.replace(
+                '@($invoicing, "AutoCount.BonusPoint.Member.MemberCommand")',
+                '@($core, "AutoCount.BonusPoint.Member.MemberCommand")',
+                1,
+            ),
+        ),
+        (
+            "AssemblyResolve",
+            _insert_after(
+                source,
+                member_line,
+                '[AppDomain]::CurrentDomain.add_AssemblyResolve({ param($sender, $args) $null })',
+            ),
+        ),
+        (
+            "Get-ChildItem",
+            _insert_after(source, member_line, 'Get-ChildItem -LiteralPath $root -File'),
+        ),
+        (
+            "IO.Directory.GetFiles",
+            _insert_after(source, member_line, '[IO.Directory]::GetFiles($root)'),
+        ),
+        (
+            "EnumerateFiles",
+            _insert_after(source, member_line, '[IO.Directory]::EnumerateFiles($root)'),
+        ),
+        (
+            "GetFileSystemEntries",
+            _insert_after(source, member_line, '[IO.Directory]::GetFileSystemEntries($root)'),
+        ),
+        (
+            "dot-sourced alternate resolution",
+            _insert_after(
+                source,
+                member_line,
+                '. { $memberCommand = $core.GetType("AutoCount.BonusPoint.Member.MemberCommand", $true, $false) }',
+            ),
+        ),
+    ]
+    return variants
+
+
+def _positive_variants(source: str) -> list[tuple[str, str]]:
+    variants = [("canonical", source)]
+    variants.append(
+        (
+            "harmless whitespace and comments",
+            "# leading comment\n\n"
+            + source.replace(
+                "$requiredAssemblies = @(",
+                "# collection comment\n$requiredAssemblies = @(\n",
+                1,
+            ),
+        )
+    )
+    for value in _ASSEMBLY_VALUES:
+        variants.append(
+            (
+                f"single-quoted assembly {value}",
+                source.replace(f'"{value}"', f"'{value}'", 1),
+            )
+        )
+    for value in _METHOD_VALUES:
+        variants.append(
+            (
+                f"single-quoted method {value}",
+                source.replace(f'"{value}"', f"'{value}'", 1),
+            )
+        )
+    variants.append(("all literals single-quoted", source.replace('"', "'")))
+    escaped = source
+    for value in _ASSEMBLY_VALUES + _METHOD_VALUES:
+        escaped = escaped.replace(f'"{value}"', '"`' + value[0] + value[1:] + '"', 1)
+    variants.append(("native-decoded safe literal escapes", escaped))
+    variants.append(
+        (
+            "case-only invoicing identifier",
+            source.replace(
+                '$invoicing = $loaded["AutoCount.Invoicing.dll"]',
+                '$INVOICING = $loaded["AutoCount.Invoicing.dll"]',
+                1,
+            ),
+        )
+    )
+    variants.append(
+        (
+            "case-only required assembly identifier",
+            source.replace("$requiredAssemblies = @(", "$REQUIREDASSEMBLIES = @(", 1),
+        )
+    )
+    return variants
+
+
+def _parser_invalid_variants(source: str) -> list[tuple[str, str]]:
+    return [
+        ("malformed string", source + '\n$invalid = "unterminated\n'),
+        ("malformed delimiter", source + "\nif ($true { throw 'x' }\n"),
+        ("malformed assignment", source + "\n$invalid = (\n"),
+        ("Windows PowerShell 5.1 invalid ??=", source + "\n$invoicing ??= $null\n"),
+    ]
 
 
 class MemberGatewayWorkerDeploymentTests(unittest.TestCase):
@@ -507,16 +1300,19 @@ class MemberGatewayWorkerDeploymentTests(unittest.TestCase):
             text=True,
         ).stdout.strip()
 
+    @staticmethod
+    def _tree(path: str) -> str:
+        return subprocess.run(
+            ["git", "rev-parse", f"HEAD:{path}"],
+            cwd=ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
     @classmethod
     def setUpClass(cls) -> None:
-        cls.pwsh = shutil.which("powershell")
-        if not cls.pwsh:
-            windows_root = os.environ.get("WINDIR") or os.environ.get("SystemRoot")
-            if windows_root:
-                desktop_powershell = Path(windows_root) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
-                if desktop_powershell.is_file():
-                    cls.pwsh = str(desktop_powershell)
-        cls.pwsh = cls.pwsh or shutil.which("pwsh")
+        cls.pwsh = _resolve_native_powershell()
 
     @staticmethod
     def _desktop_powershell_environment() -> dict[str, str]:
@@ -559,6 +1355,9 @@ class MemberGatewayWorkerDeploymentTests(unittest.TestCase):
         for path, expected in PROTECTED_WORKER_BLOBS.items():
             with self.subTest(path=path):
                 self.assertEqual(self._blob(path), expected)
+        for path, expected in PROTECTED_WORKER_TREES.items():
+            with self.subTest(path=path):
+                self.assertEqual(self._tree(path), expected)
 
     def test_approved_worker_scripts_parse_without_execution(self) -> None:
         if not self.pwsh:
@@ -640,6 +1439,22 @@ class MemberGatewayWorkerDeploymentTests(unittest.TestCase):
             '    "AutoCount.Tools.dll",\n    ("AutoCount.Extended" + ".dll")\n)',
             1,
         )
+        expandable_rebind = probe.replace(
+            '$invoicing = $loaded["AutoCount.Invoicing.dll"]',
+            '$invoicing = $loaded["AutoCount.Invoicing.dll"]\n'
+            '"$($invoicing = $loaded[\'AutoCount.Tools.dll\'])"',
+            1,
+        )
+        escaped_braced_rebind = probe.replace(
+            '$invoicing = $loaded["AutoCount.Invoicing.dll"]',
+            '${invoi`cing} = $loaded["AutoCount.Tools.dll"]',
+            1,
+        )
+        fifth_single_method = probe.replace(
+            'foreach ($name in @("Create", "GetMember", "NewMember", "SaveMember"))',
+            'foreach ($name in @("Create", "GetMember", "NewMember", "SaveMember", \'FifthSingleQuoted\'))',
+            1,
+        )
 
         for name, counterexample in (
             ("wrong invoicing binding", rebind),
@@ -652,10 +1467,174 @@ class MemberGatewayWorkerDeploymentTests(unittest.TestCase):
             ("sixth double-quoted required assembly", sixth_assembly),
             ("sixth single-quoted required assembly", sixth_single_assembly),
             ("sixth non-literal required assembly", sixth_non_literal_assembly),
+            ("expandable-string invoicing rebinding", expandable_rebind),
+            ("escaped-braced invoicing rebinding", escaped_braced_rebind),
+            ("fifth single-quoted required method", fifth_single_method),
         ):
             with self.subTest(counterexample=name):
+                result = _inspect_autocount_probe(counterexample)
+                self.assertTrue(result["parse_ok"], result)
+                self.assertFalse(result["accepted"], result)
+
+    def test_g2_identity_operator_context_matrix(self) -> None:
+        if not self.pwsh:
+            self.skipTest("native Windows PowerShell Desktop 5.1 x64 is required")
+        probe = (ROOT / "scripts/test_ac2_member_gateway_autocount_dependencies.ps1").read_text(encoding="utf-8")
+        operators = ("=", "+=", "-=", "*=", "/=", "%=", "prefix++", "postfix++", "prefix--", "postfix--")
+        contexts = (
+            "top-level statement",
+            "expandable-string $()",
+            "expandable here-string $()",
+            "nested $($())",
+            "invoked scriptblock",
+            "Write-Output (mutation)",
+        )
+        cases: list[tuple[str, str, str, int, int, bool, str]] = []
+        fixtures: list[str] = []
+        for name in ("invoicing", "requiredAssemblies"):
+            for identity_index, (identity, is_bare) in enumerate(_identity_forms(name)):
+                for operator_index, operator in enumerate(operators):
+                    context = contexts[(identity_index + operator_index) % len(contexts)]
+                    fixtures.append(_identity_matrix_fixture(probe, name, identity, operator, context))
+                    cases.append((name, identity, operator, identity_index, operator_index, is_bare, context))
+        self.assertEqual(len(fixtures), 720)
+        results = _inspect_many(fixtures)
+        for case, result in zip(cases, results):
+            name, identity, operator, identity_index, operator_index, is_bare, context = case
+            with self.subTest(
+                name=name,
+                identity=identity,
+                operator=operator,
+                context=context,
+            ):
+                self.assertTrue(result["parse_ok"], result)
+                expected_acceptance = is_bare and operator == "=" and context == "top-level statement"
+                self.assertEqual(result["accepted"], expected_acceptance, result)
+        self.assertEqual(sum(bool(result["accepted"]) for result in results), 2)
+
+    def test_g2_indirect_mutation_matrix(self) -> None:
+        if not self.pwsh:
+            self.skipTest("native Windows PowerShell Desktop 5.1 x64 is required")
+        probe = (ROOT / "scripts/test_ac2_member_gateway_autocount_dependencies.ps1").read_text(encoding="utf-8")
+        mutations = _indirect_mutations()
+        self.assertEqual(len(mutations), 25)
+        contexts = ("top-level statement", "expandable-string $()")
+        fixtures = [
+            _context_fixture(probe, mutation, context)
+            for mutation in mutations
+            for context in contexts
+        ]
+        self.assertEqual(len(fixtures), 50)
+        results = _inspect_many(fixtures)
+        for index, (mutation, context, result) in enumerate(zip(
+            (mutation for mutation in mutations for _ in contexts),
+            (context for _ in mutations for context in contexts),
+            results,
+        )):
+            with self.subTest(index=index, mutation=mutation, context=context):
+                self.assertTrue(result["parse_ok"], result)
+                self.assertFalse(result["accepted"], result)
+
+    def test_g2_collection_and_method_matrix(self) -> None:
+        if not self.pwsh:
+            self.skipTest("native Windows PowerShell Desktop 5.1 x64 is required")
+        probe = (ROOT / "scripts/test_ac2_member_gateway_autocount_dependencies.ps1").read_text(encoding="utf-8")
+        variants = _collection_variants(probe)
+        self.assertEqual(len(variants), 92)
+        results = _inspect_many([source for _, source in variants])
+        for (label, _), result in zip(variants, results):
+            with self.subTest(variant=label):
+                self.assertTrue(result["parse_ok"], result)
+                self.assertFalse(result["accepted"], result)
+
+    def test_g2_member_command_and_resolver_matrix(self) -> None:
+        if not self.pwsh:
+            self.skipTest("native Windows PowerShell Desktop 5.1 x64 is required")
+        probe = (ROOT / "scripts/test_ac2_member_gateway_autocount_dependencies.ps1").read_text(encoding="utf-8")
+        variants = _member_resolver_variants(probe)
+        self.assertEqual(len(variants), 20)
+        results = _inspect_many([source for _, source in variants])
+        for (label, _), result in zip(variants, results):
+            with self.subTest(variant=label):
+                self.assertTrue(result["parse_ok"], result)
+                self.assertFalse(result["accepted"], result)
+
+    def test_g2_positive_controls(self) -> None:
+        if not self.pwsh:
+            self.skipTest("native Windows PowerShell Desktop 5.1 x64 is required")
+        probe = (ROOT / "scripts/test_ac2_member_gateway_autocount_dependencies.ps1").read_text(encoding="utf-8")
+        variants = _positive_variants(probe)
+        self.assertEqual(len(variants), 15)
+        results = _inspect_many([source for _, source in variants])
+        for (label, _), result in zip(variants, results):
+            with self.subTest(variant=label):
+                self.assertTrue(result["parse_ok"], result)
+                self.assertTrue(result["accepted"], result)
+
+    def test_g2_parser_integrity_and_resource_limits(self) -> None:
+        if not self.pwsh:
+            self.skipTest("native Windows PowerShell Desktop 5.1 x64 is required")
+        probe = (ROOT / "scripts/test_ac2_member_gateway_autocount_dependencies.ps1").read_text(encoding="utf-8")
+        parser_invalid = _parser_invalid_variants(probe)
+        parser_results = _inspect_many([source for _, source in parser_invalid])
+        for (label, _), result in zip(parser_invalid, parser_results):
+            with self.subTest(fixture=label):
+                self.assertFalse(result["parse_ok"], result)
+                self.assertEqual(result["reason"], "PARSE_ERROR", result)
+                self.assertFalse(result["accepted"], result)
+
+        oversized = _inspect_autocount_probe("x" * 65537)
+        self.assertEqual(oversized["reason"], "INPUT_LIMIT", oversized)
+        self.assertFalse(oversized["accepted"], oversized)
+
+        ast_heavy = probe + ("\n" + "if ($true) { }" * 900)
+        node_limited = _inspect_autocount_probe(ast_heavy)
+        self.assertEqual(node_limited["reason"], "NODE_LIMIT", node_limited)
+        self.assertFalse(node_limited["accepted"], node_limited)
+
+    def test_native_inspector_transport_and_schema_contract(self) -> None:
+        if not self.pwsh:
+            self.skipTest("native Windows PowerShell Desktop 5.1 x64 is required")
+        probe = (ROOT / "scripts/test_ac2_member_gateway_autocount_dependencies.ps1").read_text(encoding="utf-8")
+        result = _inspect_autocount_probe(probe)
+        self.assertEqual(
+            set(result),
+            {
+                "schema_version",
+                "native51_x64",
+                "parse_ok",
+                "parse_errors",
+                "node_count",
+                "global_shape_ok",
+                "assemblies_ok",
+                "invoicing_ok",
+                "member_command_ok",
+                "required_methods_ok",
+                "accepted",
+                "reason",
+            },
+        )
+        for payload in (
+            b'{"schema_version":1,"schema_version":2}',
+            b'{"value":NaN}',
+            b"\xff\xfe\xfd",
+        ):
+            with self.subTest(payload=payload):
                 with self.assertRaises(AssertionError):
-                    _assert_autocount_probe_contract(counterexample)
+                    _strict_json_object(payload)
+
+        unknown_field = dict(result)
+        unknown_field["unexpected"] = False
+        with self.assertRaises(AssertionError):
+            _validate_native_result(unknown_field)
+        wrong_boolean = dict(result)
+        wrong_boolean["accepted"] = 1
+        with self.assertRaises(AssertionError):
+            _validate_native_result(wrong_boolean)
+        inconsistent = dict(result)
+        inconsistent["accepted"] = False
+        with self.assertRaises(AssertionError):
+            _validate_native_result(inconsistent)
 
     def test_production_launcher_accepts_exact_strings_and_preserves_dpapi_mapping(self) -> None:
         if not self.pwsh:
