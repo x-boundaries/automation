@@ -1774,30 +1774,27 @@ function Wait-EgDescendantGrace {
 
     $graceDeadline = [int64]([System.Diagnostics.Stopwatch]::GetTimestamp() +
         ([int64]5 * [int64][System.Diagnostics.Stopwatch]::Frequency))
-    while ($script:EgState.active_processes -gt 0) {
-        if ([EnergyGridOneShotSupervisorNative]::IsTerminationRequested) { break }
-        if (Test-EgDeadlineReached -DeadlineTicks $DeadlineTicks) { break }
-        if ([System.Diagnostics.Stopwatch]::GetTimestamp() -ge $graceDeadline) { break }
-        if (-not $script:EgState.application_child_observed) {
-            if (Test-EgApplicationChild -JobHandle $JobHandle -LauncherHandle $LauncherHandle `
-                -LauncherPid $LauncherPid -StartTicks $StartTicks) {
-                $script:EgState.application_child_observed = $true
-            }
-        }
-        $null = Get-EgAccounting -JobHandle $JobHandle
-        Start-Sleep -Milliseconds 100
-    }
-    if ($script:EgState.active_processes -gt 0) {
+    while ($true) {
+        $accounting = Get-EgAccounting -JobHandle $JobHandle
+        if ($accounting.ActiveProcesses -eq 0) { return }
+
         if ([EnergyGridOneShotSupervisorNative]::IsTerminationRequested) {
             Invoke-EgTerminateJob -JobHandle $JobHandle -Reason 'INTERRUPTION'
+            return
         }
-        elseif (Test-EgDeadlineReached -DeadlineTicks $DeadlineTicks) {
+
+        if (Test-EgDeadlineReached -DeadlineTicks $DeadlineTicks) {
             Invoke-EgTerminateJob -JobHandle $JobHandle -Reason 'TIMEOUT'
+            return
         }
-        else {
+
+        if ([System.Diagnostics.Stopwatch]::GetTimestamp() -ge $graceDeadline) {
             $script:EgState.descendant_grace_expired = $true
             Invoke-EgTerminateJob -JobHandle $JobHandle -Reason 'DESCENDANT_GRACE_EXPIRED'
+            return
         }
+
+        Start-Sleep -Milliseconds 100
     }
 }
 

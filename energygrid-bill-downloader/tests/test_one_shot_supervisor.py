@@ -336,10 +336,14 @@ class SupervisorStaticContractTests(unittest.TestCase):
             self.source.index("function Wait-EgDescendantGrace"):
             self.source.index("function Get-EgStartVerdict")
         ]
+        self.assertNotIn("Test-EgApplicationChild", grace)
+        self.assertIn("$accounting = Get-EgAccounting -JobHandle $JobHandle", grace)
+        self.assertIn("if ($accounting.ActiveProcesses -eq 0) { return }", grace)
         self.assertIn("IsTerminationRequested", grace)
         self.assertIn("-Reason 'INTERRUPTION'", grace)
         self.assertIn("-Reason 'TIMEOUT'", grace)
         self.assertIn("-Reason 'DESCENDANT_GRACE_EXPIRED'", grace)
+        self.assertLess(grace.index("Get-EgAccounting"), grace.index("IsTerminationRequested"))
         self.assertLess(grace.index("IsTerminationRequested"), grace.index("Test-EgDeadlineReached"))
         self.assertLess(grace.index("-Reason 'TIMEOUT'"), grace.index("-Reason 'DESCENDANT_GRACE_EXPIRED'"))
         self.assertIn("Wait-EgDescendantGrace -JobHandle", self.source)
@@ -1179,7 +1183,9 @@ Add-Type -TypeDefinition $source.Substring($start, $end - $start) -ReferencedAss
 Assert-Native ([EnergyGridOneShotSupervisorNative]::VerifyX64StructureSizes()) 'native_x64_layout_failed'
 
 Add-Type -TypeDefinition @'
+using System;
 using System.IO;
+using System.Reflection;
 using System.Threading;
 
 public sealed class EnergyGridDelayedFlushStreamForFunctionTest : FileStream
@@ -1199,10 +1205,104 @@ public sealed class EnergyGridDelayedFlushStreamForFunctionTest : FileStream
         base.Flush(flushToDisk);
     }
 }
+
+public sealed class EnergyGridOutcomeDelayedFlushStreamForFunctionTest : FileStream
+{
+    private const int DelayMilliseconds = 6500;
+    private static readonly object workerLock = new object();
+
+    public static readonly ManualResetEvent FlushEntered = new ManualResetEvent(false);
+    public static readonly ManualResetEvent ReleaseFlush = new ManualResetEvent(false);
+    public static Thread WorkerThread;
+
+    public EnergyGridOutcomeDelayedFlushStreamForFunctionTest(
+        string path, FileMode mode, FileAccess access, FileShare share,
+        int bufferSize, FileOptions options)
+        : base(path, mode, access, share, bufferSize, options)
+    {
+    }
+
+    public static void ResetState()
+    {
+        FlushEntered.Reset();
+        ReleaseFlush.Reset();
+        lock (workerLock) { WorkerThread = null; }
+    }
+
+    public static bool IsReleaseClosed()
+    {
+        return !ReleaseFlush.WaitOne(0);
+    }
+
+    public static void Release()
+    {
+        ReleaseFlush.Set();
+    }
+
+    public static bool JoinWorker(int timeoutMilliseconds)
+    {
+        Thread worker;
+        lock (workerLock) { worker = WorkerThread; }
+        return worker != null && worker.Join(timeoutMilliseconds);
+    }
+
+    public override void Flush(bool flushToDisk)
+    {
+        Thread currentThread = Thread.CurrentThread;
+        if (!currentThread.IsBackground)
+        {
+            base.Flush(flushToDisk);
+            return;
+        }
+        lock (workerLock)
+        {
+            if (WorkerThread != null && WorkerThread != currentThread)
+            {
+                base.Flush(flushToDisk);
+                return;
+            }
+            WorkerThread = currentThread;
+        }
+        FlushEntered.Set();
+        Thread.Sleep(DelayMilliseconds);
+        if (!ReleaseFlush.WaitOne(120000))
+        {
+            throw new TimeoutException("test release event timed out");
+        }
+        base.Flush(flushToDisk);
+    }
+}
+
+public static class EnergyGridGraceInterruptSchedulerForFunctionTest
+{
+    public static Thread Schedule(int delayMilliseconds)
+    {
+        Thread thread = new Thread(delegate()
+        {
+            Thread.Sleep(delayMilliseconds);
+            Type nativeType = null;
+            foreach (Assembly assembly in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                nativeType = assembly.GetType("EnergyGridOneShotSupervisorNative");
+                if (nativeType != null) { break; }
+            }
+            if (nativeType == null) { throw new InvalidOperationException("native type missing"); }
+            MethodInfo signalMethod = nativeType.GetMethod(
+                "HandleConsoleSignal", BindingFlags.NonPublic | BindingFlags.Static);
+            signalMethod.Invoke(null, new object[] { (uint)2 });
+        });
+        thread.IsBackground = true;
+        thread.Start();
+        return thread;
+    }
+}
 '@
 
 function Get-ExactFunction {
     param([string]$Name, [string]$NextName)
+    $definitionCount = [regex]::Matches(
+        $source, '(?m)^function ' + [regex]::Escape($Name) + '\s*\{').Count
+    Assert-Native ($definitionCount -eq 1) ('function_definition_count:' + $Name)
     $start = $source.IndexOf('function ' + $Name)
     $end = $source.IndexOf('function ' + $NextName, $start)
     Assert-Native ($start -ge 0 -and $end -gt $start) ('function_missing:' + $Name)
@@ -1218,6 +1318,8 @@ Invoke-Expression (Get-ExactFunction -Name 'Wait-EgDescendantGrace' -NextName 'G
 Invoke-Expression (Get-ExactFunction -Name 'Get-EgExitCode' -NextName 'Write-EgPublicProjection')
 Invoke-Expression (Get-ExactFunction -Name 'ConvertTo-EgUtf8JsonBytes' -NextName 'Initialize-EgNative')
 Invoke-Expression (Get-ExactFunction -Name 'Write-EgReservedIntent' -NextName 'Get-EgIntentObject')
+Invoke-Expression (Get-ExactFunction -Name 'Get-EgOutcomeObject' -NextName 'Write-EgOutcome')
+Invoke-Expression (Get-ExactFunction -Name 'Write-EgOutcome' -NextName 'Get-EgCanonicalApplicationCommandLine')
 
 function Test-EgApplicationChild {
     param(
@@ -1230,6 +1332,11 @@ function Test-EgApplicationChild {
 }
 
 $script:PowerShellPath = Join-Path ([Environment]::SystemDirectory) 'WindowsPowerShell\v1.0\powershell.exe'
+
+function Quote-PowerShellLiteral {
+    param([string]$Value)
+    return "'" + $Value.Replace("'", "''") + "'"
+}
 
 function Future-Deadline {
     param([int]$Milliseconds = 30000)
@@ -1298,9 +1405,23 @@ function Close-TestChild {
     Close-Native -Handle $Process.ProcessHandle
 }
 
+function Cleanup-Job {
+    param([IntPtr]$JobHandle, $Process)
+    try {
+        if ($JobHandle -ne [IntPtr]::Zero) {
+            [void][EnergyGridOneShotSupervisorNative]::TerminateJob(
+                $JobHandle, [EnergyGridOneShotSupervisorNative]::SUPERVISOR_TERMINATION_EXIT_CODE)
+        }
+    }
+    catch { }
+    try { Close-TestChild -Process $Process } catch { }
+    Close-Native -Handle $JobHandle
+}
+
 function New-State {
     return [pscustomobject]@{
         outcome_committed = $true
+        outcome_write_attempted = $false
         containment_failure = $false
         evidence_integrity_failure = $false
         drain_failure = $false
@@ -1308,6 +1429,7 @@ function New-State {
         observer_failed = $false
         creation_succeeded = $true
         creation_attempted = $true
+        resume_attempted = $false
         reap_confirmed = $true
         stdout_complete = $true
         stderr_complete = $true
@@ -1320,13 +1442,104 @@ function New-State {
         support_ref = 'EG_TEST'
         error_code = $null
         precreate_rejection = $false
-        total_processes = $null
-        active_processes = $null
-        total_terminated_processes = $null
+        total_processes = [uint64]0
+        active_processes = [uint64]0
+        total_terminated_processes = [uint64]0
         intent_committed = $false
+        intent_bytes = [byte[]]@()
         application_child_observed = $false
+        application_child_observation_elapsed_ms = [int64]0
+        stdout_bytes = [uint64]0
+        stderr_bytes = [uint64]0
         descendant_grace_expired = $false
     }
+}
+
+$script:GraceSleepMode = 'off'
+$script:GraceSleepCalls = 0
+$script:GraceSleepJobHandle = [IntPtr]::Zero
+$script:GraceSleepReleasePath = $null
+
+function Start-Sleep {
+    param([int]$Milliseconds)
+
+    if ($script:GraceSleepMode -ne 'off' -and $script:GraceSleepCalls -eq 0) {
+        $script:GraceSleepCalls = $script:GraceSleepCalls + 1
+        if ($null -ne $script:GraceSleepReleasePath) {
+            [IO.File]::WriteAllText($script:GraceSleepReleasePath, 'release')
+        }
+        if ($script:GraceSleepMode -eq 'global-completion' -or
+            $script:GraceSleepMode -eq 'local-completion') {
+            $zeroDeadline = [System.Diagnostics.Stopwatch]::GetTimestamp() +
+                ([int64]10 * [int64][System.Diagnostics.Stopwatch]::Frequency)
+            $zeroAccounting = $null
+            while ([System.Diagnostics.Stopwatch]::GetTimestamp() -lt $zeroDeadline) {
+                $zeroAccounting = [EnergyGridOneShotSupervisorNative]::GetAccounting(
+                    $script:GraceSleepJobHandle)
+                Assert-Native $zeroAccounting.Succeeded ('grace_completion_accounting_failed:' +
+                    $zeroAccounting.ErrorCode)
+                if ($zeroAccounting.ActiveProcesses -eq 0) { break }
+                Microsoft.PowerShell.Utility\Start-Sleep -Milliseconds 50
+            }
+            Assert-Native ($null -ne $zeroAccounting -and $zeroAccounting.ActiveProcesses -eq 0) `
+                'grace_completion_zero_not_observed'
+            if ($script:GraceSleepMode -eq 'global-completion') {
+                [Threading.Thread]::Sleep(250)
+            }
+            else {
+                [Threading.Thread]::Sleep(5200)
+            }
+        }
+        elseif ($script:GraceSleepMode -eq 'timeout-local-precedence') {
+            [Threading.Thread]::Sleep(5200)
+        }
+        return
+    }
+    Microsoft.PowerShell.Utility\Start-Sleep -Milliseconds $Milliseconds
+}
+
+$script:OutcomeSeamEnabled = $false
+$script:OutcomeMode = 'ordinary'
+$script:OutcomeConstructionCount = 0
+$script:OutcomeConstructorArgumentsValid = $false
+$script:EgExpectedOutcomePath = $null
+
+function New-Object {
+    param(
+        [Parameter(Mandatory = $true, Position = 0)][string]$TypeName,
+        [Parameter(Position = 1, ValueFromRemainingArguments = $true)][object[]]$ArgumentList
+    )
+
+    $arguments = @()
+    if ($PSBoundParameters.ContainsKey('ArgumentList')) {
+        $arguments = @($ArgumentList)
+        if ($arguments.Count -eq 1 -and $arguments[0] -is [array]) {
+            $arguments = @($arguments[0])
+        }
+    }
+    $isTarget = $script:OutcomeSeamEnabled -and
+        $TypeName -eq 'System.IO.FileStream' -and
+        $arguments.Count -eq 6 -and
+        [string]$arguments[0] -eq $script:EgExpectedOutcomePath
+    if ($isTarget) {
+        Assert-Native ($arguments[1] -eq [IO.FileMode]::CreateNew) 'outcome_file_mode_mismatch'
+        Assert-Native ($arguments[2] -eq [IO.FileAccess]::Write) 'outcome_file_access_mismatch'
+        Assert-Native ($arguments[3] -eq [IO.FileShare]::None) 'outcome_file_share_mismatch'
+        Assert-Native ($arguments[4] -eq 4096) 'outcome_file_buffer_mismatch'
+        Assert-Native ($arguments[5] -eq [IO.FileOptions]::WriteThrough) 'outcome_file_options_mismatch'
+        $script:OutcomeConstructionCount = $script:OutcomeConstructionCount + 1
+        $script:OutcomeConstructorArgumentsValid = $true
+        if ($script:OutcomeMode -eq 'delayed') {
+            return Microsoft.PowerShell.Utility\New-Object `
+                -TypeName 'EnergyGridOutcomeDelayedFlushStreamForFunctionTest' `
+                -ArgumentList $arguments
+        }
+    }
+
+    if ($PSBoundParameters.ContainsKey('ArgumentList')) {
+        return Microsoft.PowerShell.Utility\New-Object -TypeName $TypeName -ArgumentList $arguments
+    }
+    return Microsoft.PowerShell.Utility\New-Object -TypeName $TypeName
 }
 
 Write-Output 'function_case=timed_out_intent_rejection'
@@ -1369,16 +1582,248 @@ finally {
     Close-Native -Handle $intentGateJob
 }
 
-Write-Output 'function_case=timed_out_outcome_rejection'
-$syntheticTimedOutDurability = [pscustomobject]@{ Succeeded = $true; TimedOut = $true }
+Write-Output 'function_case=timed_out_outcome_contract'
 $intentFunction = Get-ExactFunction -Name 'Write-EgReservedIntent' -NextName 'Get-EgIntentObject'
 $outcomeFunction = Get-ExactFunction -Name 'Write-EgOutcome' -NextName 'Get-EgCanonicalApplicationCommandLine'
 Assert-Native ($intentFunction.Contains('$durability.TimedOut -or -not $durability.Succeeded')) 'intent_timeout_check_missing'
 Assert-Native ($outcomeFunction.Contains('$durability.TimedOut -or -not $durability.Succeeded')) 'outcome_timeout_check_missing'
-Assert-Native (-not ($syntheticTimedOutDurability.Succeeded -and -not $syntheticTimedOutDurability.TimedOut)) 'synthetic_timeout_accepted'
+
+function Assert-OutcomeFile {
+    param(
+        [string]$EvidenceRoot,
+        [string]$ExpectedPath,
+        [string]$ExpectedRunId,
+        [string]$ExpectedIntentHash
+    )
+
+    $outcomeFiles = @(Get-ChildItem -LiteralPath $EvidenceRoot -Filter '*.outcome.json' -File)
+    Assert-Native ($outcomeFiles.Count -eq 1) 'ordinary_outcome_file_count'
+    Assert-Native ([StringComparer]::OrdinalIgnoreCase.Equals(
+        $outcomeFiles[0].FullName, $ExpectedPath)) 'ordinary_outcome_path_mismatch'
+    $bytes = [IO.File]::ReadAllBytes($ExpectedPath)
+    Assert-Native ($bytes.Length -ge 1 -and $bytes.Length -le 65536) 'ordinary_outcome_size_invalid'
+    $strictUtf8 = New-Object System.Text.UTF8Encoding($false, $true)
+    $jsonText = $strictUtf8.GetString($bytes)
+    $document = $jsonText | ConvertFrom-Json
+    $expectedFields = @(
+        'schema', 'run_id', 'operation', 'intent_sha256', 'start_verdict',
+        'launcher_exit_code', 'creation_attempted', 'resume_attempted',
+        'application_child_observed', 'application_child_observation_elapsed_ms',
+        'total_processes', 'active_processes', 'total_terminated_processes',
+        'reap_confirmed', 'stdout_bytes', 'stderr_bytes', 'stdout_complete',
+        'stderr_complete', 'raw_stream_retained_bytes', 'containment', 'completed_utc'
+    )
+    $actualFields = @($document.PSObject.Properties.Name)
+    Assert-Native ($actualFields.Count -eq $expectedFields.Count) 'ordinary_outcome_field_count'
+    foreach ($field in $expectedFields) {
+        Assert-Native ($actualFields -contains $field) ('ordinary_outcome_field_missing:' + $field)
+    }
+    Assert-Native ($document.schema -eq 'energygrid.one_shot_supervisor.outcome.v1') `
+        'ordinary_outcome_schema_invalid'
+    Assert-Native ($document.run_id -eq $ExpectedRunId) 'ordinary_outcome_run_id_invalid'
+    Assert-Native ($document.operation -eq 'run') 'ordinary_outcome_operation_invalid'
+    Assert-Native ($document.intent_sha256 -eq $ExpectedIntentHash) 'ordinary_outcome_intent_hash_invalid'
+    Assert-Native ($document.raw_stream_retained_bytes -eq 0) 'ordinary_outcome_raw_bytes_retained'
+    Assert-Native ($document.creation_attempted -and $document.resume_attempted) `
+        'ordinary_outcome_representative_flags_invalid'
+    Assert-Native ($document.reap_confirmed -and $document.stdout_complete -and $document.stderr_complete) `
+        'ordinary_outcome_representative_completion_invalid'
+    return $document
+}
+
+Write-Output 'function_case=timed_out_outcome_actual_delayed'
+$delayedOutcomeRoot = Join-Path $RootPath 'delayed-outcome'
+[IO.Directory]::CreateDirectory($delayedOutcomeRoot) | Out-Null
+$RunId = 'EG-OUTCOME-DELAYED-0001'
+$script:EgEvidenceRootNormal = $delayedOutcomeRoot
+$script:EgExpectedOutcomePath = Join-Path $delayedOutcomeRoot ($RunId + '.outcome.json')
+$script:OutcomeSeamEnabled = $true
+$script:OutcomeMode = 'delayed'
+$script:OutcomeConstructionCount = 0
+$script:OutcomeConstructorArgumentsValid = $false
+[EnergyGridOutcomeDelayedFlushStreamForFunctionTest]::ResetState()
 $script:EgState = New-State
 $script:EgState.outcome_committed = $false
-Assert-Native (-not $script:EgState.outcome_committed) 'timed_out_outcome_committed'
+Write-EgOutcome -StartVerdict 'STARTED_PROVEN'
+Assert-Native $script:EgState.outcome_write_attempted 'delayed_outcome_write_not_attempted'
+Assert-Native (-not $script:EgState.outcome_committed) 'delayed_outcome_committed'
+Assert-Native $script:EgState.evidence_integrity_failure 'delayed_outcome_evidence_not_failed'
+Assert-Native ($script:EgState.support_ref -eq 'EG_SUPERVISOR_OUTCOME_FLUSH_FAILED') `
+    'delayed_outcome_support_ref_invalid'
+Assert-Native ($script:OutcomeConstructionCount -eq 1) 'delayed_outcome_construction_count_invalid'
+Assert-Native $script:OutcomeConstructorArgumentsValid 'delayed_outcome_constructor_arguments_invalid'
+Assert-Native ([EnergyGridOutcomeDelayedFlushStreamForFunctionTest]::FlushEntered.WaitOne(0)) `
+    'delayed_outcome_flush_not_entered'
+Assert-Native ($null -ne [EnergyGridOutcomeDelayedFlushStreamForFunctionTest]::WorkerThread) `
+    'delayed_outcome_worker_not_captured'
+Assert-Native ([EnergyGridOutcomeDelayedFlushStreamForFunctionTest]::IsReleaseClosed()) `
+    'delayed_outcome_release_open_too_early'
+Assert-Native ([EnergyGridOutcomeDelayedFlushStreamForFunctionTest]::WorkerThread.IsAlive) `
+    'delayed_outcome_worker_not_blocked'
+$delayedOutcomeFiles = @(Get-ChildItem -LiteralPath $delayedOutcomeRoot -Filter '*.outcome.json' -File)
+Assert-Native ($delayedOutcomeFiles.Count -eq 1) 'delayed_outcome_file_count_invalid'
+
+[EnergyGridOutcomeDelayedFlushStreamForFunctionTest]::Release()
+Assert-Native ([EnergyGridOutcomeDelayedFlushStreamForFunctionTest]::JoinWorker(15000)) `
+    'delayed_outcome_worker_join_failed'
+Assert-Native (-not $script:EgState.outcome_committed) 'delayed_outcome_committed_after_worker'
+Assert-Native $script:EgState.evidence_integrity_failure 'delayed_outcome_evidence_changed_after_worker'
+Assert-Native ($script:EgState.support_ref -eq 'EG_SUPERVISOR_OUTCOME_FLUSH_FAILED') `
+    'delayed_outcome_support_ref_changed_after_worker'
+Assert-Native ($script:OutcomeConstructionCount -eq 1) 'delayed_outcome_retried'
+Assert-Native ((Get-EgExitCode) -eq 3) 'delayed_outcome_exit_not_three'
+Assert-Native ((@(Get-ChildItem -LiteralPath $delayedOutcomeRoot -Filter '*.outcome.json' -File)).Count -eq 1) `
+    'delayed_outcome_alternate_file_created'
+$script:OutcomeSeamEnabled = $false
+Remove-Item -LiteralPath $delayedOutcomeRoot -Recurse -Force
+Assert-Native (-not (Test-Path -LiteralPath $delayedOutcomeRoot)) 'delayed_outcome_cleanup_failed'
+
+Write-Output 'function_case=timed_out_outcome_actual_ordinary'
+$ordinaryOutcomeRoot = Join-Path $RootPath 'ordinary-outcome'
+[IO.Directory]::CreateDirectory($ordinaryOutcomeRoot) | Out-Null
+$RunId = 'EG-OUTCOME-ORDINARY-0001'
+$script:EgEvidenceRootNormal = $ordinaryOutcomeRoot
+$script:EgExpectedOutcomePath = Join-Path $ordinaryOutcomeRoot ($RunId + '.outcome.json')
+$script:OutcomeSeamEnabled = $true
+$script:OutcomeMode = 'ordinary'
+$script:OutcomeConstructionCount = 0
+$script:OutcomeConstructorArgumentsValid = $false
+$script:EgState = New-State
+$script:EgState.intent_committed = $true
+$script:EgState.intent_bytes = [byte[]](0, 1, 2, 255)
+$script:EgState.creation_attempted = $true
+$script:EgState.resume_attempted = $true
+$script:EgState.application_child_observed = $true
+$script:EgState.application_child_observation_elapsed_ms = [int64]17
+$script:EgState.total_processes = [uint64]2
+$script:EgState.active_processes = [uint64]0
+$script:EgState.total_terminated_processes = [uint64]1
+$script:EgState.stdout_bytes = [uint64]12
+$script:EgState.stderr_bytes = [uint64]34
+$script:EgState.reap_confirmed = $true
+$hash = New-Object System.Security.Cryptography.SHA256Managed
+try {
+    $expectedIntentHash = ([BitConverter]::ToString($hash.ComputeHash($script:EgState.intent_bytes))).Replace('-', '').ToLowerInvariant()
+}
+finally { $hash.Dispose() }
+Write-EgOutcome -StartVerdict 'STARTED_PROVEN'
+Assert-Native $script:EgState.outcome_write_attempted 'ordinary_outcome_write_not_attempted'
+Assert-Native $script:EgState.outcome_committed 'ordinary_outcome_not_committed'
+Assert-Native (-not $script:EgState.evidence_integrity_failure) 'ordinary_outcome_evidence_failed'
+Assert-Native ($script:OutcomeConstructionCount -eq 1) 'ordinary_outcome_construction_count_invalid'
+Assert-Native $script:OutcomeConstructorArgumentsValid 'ordinary_outcome_constructor_arguments_invalid'
+$null = Assert-OutcomeFile -EvidenceRoot $ordinaryOutcomeRoot `
+    -ExpectedPath $script:EgExpectedOutcomePath -ExpectedRunId $RunId `
+    -ExpectedIntentHash $expectedIntentHash
+$script:OutcomeSeamEnabled = $false
+Remove-Item -LiteralPath $ordinaryOutcomeRoot -Recurse -Force
+Assert-Native (-not (Test-Path -LiteralPath $ordinaryOutcomeRoot)) 'ordinary_outcome_cleanup_failed'
+
+Write-Output 'function_case=timed_out_outcome_defensive_exact_caller'
+$syntheticTimedOutDurability = [pscustomobject]@{ Succeeded = $true; TimedOut = $true; ErrorCode = 0 }
+$branchStart = $outcomeFunction.IndexOf('if ($durability.TimedOut -or -not $durability.Succeeded) {')
+Assert-Native ($branchStart -ge 0) 'outcome_timeout_branch_missing'
+$branchDepth = 0
+$branchEnd = -1
+for ($branchIndex = $branchStart; $branchIndex -lt $outcomeFunction.Length; $branchIndex++) {
+    if ($outcomeFunction[$branchIndex] -eq '{') { $branchDepth++ }
+    elseif ($outcomeFunction[$branchIndex] -eq '}') {
+        $branchDepth--
+        if ($branchDepth -eq 0) { $branchEnd = $branchIndex + 1; break }
+    }
+}
+Assert-Native ($branchEnd -gt $branchStart) 'outcome_timeout_branch_unbalanced'
+$exactOutcomeTimeoutBranch = $outcomeFunction.Substring($branchStart, $branchEnd - $branchStart)
+$script:DefensiveRejected = $false
+$script:DefensiveSupportRef = $null
+$defensiveScript = [scriptblock]::Create(
+    'param($durability)' + "`n" +
+    'function Stop-EgSupervisor { param([string]$SupportRef, [int]$ErrorCode, [switch]$EvidenceFailure); ' +
+        '$script:DefensiveRejected = $true; $script:DefensiveSupportRef = $SupportRef }' + "`n" +
+    $exactOutcomeTimeoutBranch)
+& $defensiveScript $syntheticTimedOutDurability
+Assert-Native $script:DefensiveRejected 'defensive_timeout_caller_accepted'
+Assert-Native ($script:DefensiveSupportRef -eq 'EG_SUPERVISOR_OUTCOME_FLUSH_FAILED') `
+    'defensive_timeout_support_ref_invalid'
+
+Write-Output 'function_case=descendant_grace_stale_zero_global_deadline'
+$staleZeroDeadlineJob = [IntPtr]::Zero
+$staleZeroDeadlineProcess = $null
+try {
+    $staleZeroDeadlineJob = [EnergyGridOneShotSupervisorNative]::CreateJob()
+    [EnergyGridOneShotSupervisorNative]::ConfigureJob($staleZeroDeadlineJob)
+    $staleZeroDeadlineProcess = New-TestChild -JobHandle $staleZeroDeadlineJob `
+        -Code 'Start-Sleep -Milliseconds 150'
+    [EnergyGridOneShotSupervisorNative]::ResetControlState()
+    Assert-Native ([EnergyGridOneShotSupervisorNative]::CommitIntent()) 'stale_zero_deadline_intent_failed'
+    $staleZeroResume = [EnergyGridOneShotSupervisorNative]::TryResumeThread(
+        $staleZeroDeadlineProcess.ThreadHandle, (Future-Deadline))
+    Assert-Native ($staleZeroResume.Attempted -and $staleZeroResume.Accepted) 'stale_zero_deadline_resume_failed'
+    $staleZeroDeadline = Future-Deadline -Milliseconds 1000
+    $staleZeroWait = [EnergyGridOneShotSupervisorNative]::WaitProcess(
+        $staleZeroDeadlineProcess.ProcessHandle, 10000)
+    Assert-Native ($staleZeroWait.Value -eq [EnergyGridOneShotSupervisorNative]::WAIT_OBJECT_0) `
+        'stale_zero_deadline_launcher_wait_failed'
+    $staleZeroAccounting = Wait-JobZero -JobHandle $staleZeroDeadlineJob
+    Assert-Native ($staleZeroAccounting.ActiveProcesses -eq 0) 'stale_zero_deadline_not_zero'
+    Assert-Native ([System.Diagnostics.Stopwatch]::GetTimestamp() -lt $staleZeroDeadline) `
+        'stale_zero_deadline_zero_after_deadline'
+    while ([System.Diagnostics.Stopwatch]::GetTimestamp() -lt $staleZeroDeadline) {
+        Microsoft.PowerShell.Utility\Start-Sleep -Milliseconds 50
+    }
+    $script:EgState = New-State
+    $script:EgState.active_processes = [uint64]1
+    Wait-EgDescendantGrace -JobHandle $staleZeroDeadlineJob `
+        -LauncherHandle $staleZeroDeadlineProcess.ProcessHandle -LauncherPid 0 -StartTicks 0 `
+        -DeadlineTicks $staleZeroDeadline
+    Assert-Native (-not $script:EgState.termination_started) 'stale_zero_deadline_terminated'
+    Assert-Native ($script:EgState.active_processes -eq 0) 'stale_zero_deadline_active_processes_nonzero'
+    Assert-Native (-not $script:EgState.timed_out -and -not $script:EgState.interrupted -and
+        -not $script:EgState.descendant_grace_expired) 'stale_zero_deadline_flags_set'
+}
+finally {
+    Cleanup-Job -JobHandle $staleZeroDeadlineJob -Process $staleZeroDeadlineProcess
+}
+
+Write-Output 'function_case=descendant_grace_stale_zero_interruption'
+$staleZeroInterruptJob = [IntPtr]::Zero
+$staleZeroInterruptProcess = $null
+try {
+    $staleZeroInterruptJob = [EnergyGridOneShotSupervisorNative]::CreateJob()
+    [EnergyGridOneShotSupervisorNative]::ConfigureJob($staleZeroInterruptJob)
+    $staleZeroInterruptProcess = New-TestChild -JobHandle $staleZeroInterruptJob `
+        -Code 'Start-Sleep -Milliseconds 150'
+    [EnergyGridOneShotSupervisorNative]::ResetControlState()
+    Assert-Native ([EnergyGridOneShotSupervisorNative]::CommitIntent()) 'stale_zero_interrupt_intent_failed'
+    $staleZeroInterruptResume = [EnergyGridOneShotSupervisorNative]::TryResumeThread(
+        $staleZeroInterruptProcess.ThreadHandle, (Future-Deadline))
+    Assert-Native ($staleZeroInterruptResume.Attempted -and $staleZeroInterruptResume.Accepted) `
+        'stale_zero_interrupt_resume_failed'
+    $staleZeroInterruptWait = [EnergyGridOneShotSupervisorNative]::WaitProcess(
+        $staleZeroInterruptProcess.ProcessHandle, 10000)
+    Assert-Native ($staleZeroInterruptWait.Value -eq [EnergyGridOneShotSupervisorNative]::WAIT_OBJECT_0) `
+        'stale_zero_interrupt_launcher_wait_failed'
+    $staleZeroInterruptAccounting = Wait-JobZero -JobHandle $staleZeroInterruptJob
+    Assert-Native ($staleZeroInterruptAccounting.ActiveProcesses -eq 0) 'stale_zero_interrupt_not_zero'
+    $staleZeroSignalMethod = [EnergyGridOneShotSupervisorNative].GetMethod(
+        'HandleConsoleSignal', [Reflection.BindingFlags]::NonPublic -bor [Reflection.BindingFlags]::Static)
+    Assert-Native ($null -ne $staleZeroSignalMethod) 'stale_zero_interrupt_signal_method_missing'
+    [void]$staleZeroSignalMethod.Invoke($null, [object[]]@([uint32]2))
+    Assert-Native ([EnergyGridOneShotSupervisorNative]::IsTerminationRequested) `
+        'stale_zero_interrupt_signal_not_pending'
+    $script:EgState = New-State
+    $script:EgState.active_processes = [uint64]1
+    Wait-EgDescendantGrace -JobHandle $staleZeroInterruptJob `
+        -LauncherHandle $staleZeroInterruptProcess.ProcessHandle -LauncherPid 0 -StartTicks 0 `
+        -DeadlineTicks (Future-Deadline)
+    Assert-Native (-not $script:EgState.termination_started) 'stale_zero_interrupt_terminated'
+    Assert-Native ($script:EgState.active_processes -eq 0) 'stale_zero_interrupt_active_processes_nonzero'
+    Assert-Native (-not $script:EgState.timed_out -and -not $script:EgState.interrupted -and
+        -not $script:EgState.descendant_grace_expired) 'stale_zero_interrupt_flags_set'
+}
+finally {
+    Cleanup-Job -JobHandle $staleZeroInterruptJob -Process $staleZeroInterruptProcess
+}
 
 Write-Output 'function_case=descendant_grace_overall_deadline'
 $graceDeadlineJob = [IntPtr]::Zero
@@ -1399,72 +1844,73 @@ Start-Sleep -Milliseconds 150
     Assert-Native ($graceResume.Attempted -and $graceResume.Accepted) 'grace_deadline_resume_failed'
     $launcherWait = [EnergyGridOneShotSupervisorNative]::WaitProcess(
         $graceDeadlineProcess.ProcessHandle, 10000)
-    Assert-Native ($launcherWait.Value -eq [EnergyGridOneShotSupervisorNative]::WAIT_OBJECT_0) 'grace_launcher_did_not_signal'
+    Assert-Native ($launcherWait.Value -eq [EnergyGridOneShotSupervisorNative]::WAIT_OBJECT_0) `
+        'grace_launcher_did_not_signal'
+    $accounting = $null
     $accountingDeadline = [System.Diagnostics.Stopwatch]::GetTimestamp() +
         ([int64]5 * [int64][System.Diagnostics.Stopwatch]::Frequency)
-    $accounting = $null
     while ([System.Diagnostics.Stopwatch]::GetTimestamp() -lt $accountingDeadline) {
         $accounting = [EnergyGridOneShotSupervisorNative]::GetAccounting($graceDeadlineJob)
         Assert-Native $accounting.Succeeded 'grace_deadline_accounting_failed'
         if ($accounting.ActiveProcesses -gt 0) { break }
-        Start-Sleep -Milliseconds 50
+        Microsoft.PowerShell.Utility\Start-Sleep -Milliseconds 50
     }
     Assert-Native ($null -ne $accounting -and $accounting.ActiveProcesses -gt 0) 'grace_descendant_missing'
     $script:EgState = New-State
-    $script:EgState.active_processes = [uint64]$accounting.ActiveProcesses
+    $script:EgState.active_processes = [uint64]0
     Wait-EgDescendantGrace -JobHandle $graceDeadlineJob `
         -LauncherHandle $graceDeadlineProcess.ProcessHandle -LauncherPid 0 -StartTicks 0 `
         -DeadlineTicks (Future-Deadline -Milliseconds 200)
     Assert-Native $script:EgState.timed_out 'grace_deadline_not_timeout'
-    Assert-Native (-not $script:EgState.interrupted) 'grace_deadline_marked_interruption'
+    Assert-Native (-not $script:EgState.interrupted -and -not $script:EgState.descendant_grace_expired) `
+        'grace_deadline_reason_flags_invalid'
+    Assert-Native $script:EgState.termination_succeeded 'grace_deadline_termination_failed'
     Wait-EgReap -JobHandle $graceDeadlineJob -DeadlineTicks 0 -WindowSeconds 10
     Assert-Native ((Get-EgExitCode) -eq 2) 'grace_deadline_exit_not_two'
 }
 finally {
-    try {
-        if ($graceDeadlineJob -ne [IntPtr]::Zero) {
-            [void][EnergyGridOneShotSupervisorNative]::TerminateJob(
-                $graceDeadlineJob, [EnergyGridOneShotSupervisorNative]::SUPERVISOR_TERMINATION_EXIT_CODE)
-        }
-    }
-    catch { }
-    try { Close-TestChild -Process $graceDeadlineProcess } catch { }
-    Close-Native -Handle $graceDeadlineJob
+    Cleanup-Job -JobHandle $graceDeadlineJob -Process $graceDeadlineProcess
 }
 
-Write-Output 'function_case=descendant_grace_interruption'
+Write-Output 'function_case=descendant_grace_interruption_during_polling'
 $graceInterruptJob = [IntPtr]::Zero
 $graceInterruptProcess = $null
+$graceInterruptThread = $null
 try {
     $graceInterruptJob = [EnergyGridOneShotSupervisorNative]::CreateJob()
     [EnergyGridOneShotSupervisorNative]::ConfigureJob($graceInterruptJob)
-    $graceInterruptProcess = New-TestChild -JobHandle $graceInterruptJob
+    $graceInterruptProcess = New-TestChild -JobHandle $graceInterruptJob -Code $descendantCode
     [EnergyGridOneShotSupervisorNative]::ResetControlState()
+    Assert-Native ([EnergyGridOneShotSupervisorNative]::CommitIntent()) 'grace_interrupt_intent_failed'
+    $graceInterruptResume = [EnergyGridOneShotSupervisorNative]::TryResumeThread(
+        $graceInterruptProcess.ThreadHandle, (Future-Deadline))
+    Assert-Native ($graceInterruptResume.Attempted -and $graceInterruptResume.Accepted) `
+        'grace_interrupt_resume_failed'
+    $graceInterruptWait = [EnergyGridOneShotSupervisorNative]::WaitProcess(
+        $graceInterruptProcess.ProcessHandle, 10000)
+    Assert-Native ($graceInterruptWait.Value -eq [EnergyGridOneShotSupervisorNative]::WAIT_OBJECT_0) `
+        'grace_interrupt_launcher_wait_failed'
+    $graceInterruptAccounting = [EnergyGridOneShotSupervisorNative]::GetAccounting($graceInterruptJob)
+    Assert-Native ($graceInterruptAccounting.Succeeded -and $graceInterruptAccounting.ActiveProcesses -gt 0) `
+        'grace_interrupt_descendant_missing'
     $script:EgState = New-State
     $script:EgState.active_processes = [uint64]1
-    $signalMethod = [EnergyGridOneShotSupervisorNative].GetMethod(
-        'HandleConsoleSignal', [Reflection.BindingFlags]::NonPublic -bor [Reflection.BindingFlags]::Static)
-    Assert-Native ($null -ne $signalMethod) 'console_signal_method_missing'
-    [void]$signalMethod.Invoke($null, [object[]]@([uint32]2))
-    Assert-Native ([EnergyGridOneShotSupervisorNative]::IsTerminationRequested) 'interruption_not_requested'
+    $graceInterruptThread = [EnergyGridGraceInterruptSchedulerForFunctionTest]::Schedule(250)
     Wait-EgDescendantGrace -JobHandle $graceInterruptJob `
         -LauncherHandle $graceInterruptProcess.ProcessHandle -LauncherPid 0 -StartTicks 0 `
-        -DeadlineTicks (Future-Deadline)
+        -DeadlineTicks (Future-Deadline -Milliseconds 30000)
+    Assert-Native ($graceInterruptThread.Join(5000)) 'grace_interrupt_scheduler_join_failed'
+    Assert-Native (-not $graceInterruptThread.IsAlive) 'grace_interrupt_scheduler_still_running'
     Assert-Native $script:EgState.interrupted 'grace_interruption_not_recorded'
-    Assert-Native (-not $script:EgState.timed_out) 'grace_interruption_marked_timeout'
+    Assert-Native (-not $script:EgState.timed_out -and -not $script:EgState.descendant_grace_expired) `
+        'grace_interruption_reason_flags_invalid'
+    Assert-Native $script:EgState.termination_succeeded 'grace_interruption_termination_failed'
     Wait-EgReap -JobHandle $graceInterruptJob -DeadlineTicks 0 -WindowSeconds 10
     Assert-Native ((Get-EgExitCode) -eq 2) 'grace_interruption_exit_not_two'
 }
 finally {
-    try {
-        if ($graceInterruptJob -ne [IntPtr]::Zero) {
-            [void][EnergyGridOneShotSupervisorNative]::TerminateJob(
-                $graceInterruptJob, [EnergyGridOneShotSupervisorNative]::SUPERVISOR_TERMINATION_EXIT_CODE)
-        }
-    }
-    catch { }
-    try { Close-TestChild -Process $graceInterruptProcess } catch { }
-    Close-Native -Handle $graceInterruptJob
+    Cleanup-Job -JobHandle $graceInterruptJob -Process $graceInterruptProcess
+    if ($null -ne $graceInterruptThread -and $graceInterruptThread.IsAlive) { [void]$graceInterruptThread.Join(5000) }
 }
 
 Write-Output 'function_case=descendant_grace_local_control'
@@ -1473,64 +1919,191 @@ $localGraceProcess = $null
 try {
     $localGraceJob = [EnergyGridOneShotSupervisorNative]::CreateJob()
     [EnergyGridOneShotSupervisorNative]::ConfigureJob($localGraceJob)
-    $localGraceProcess = New-TestChild -JobHandle $localGraceJob
+    $localGraceProcess = New-TestChild -JobHandle $localGraceJob -Code $descendantCode
     [EnergyGridOneShotSupervisorNative]::ResetControlState()
+    Assert-Native ([EnergyGridOneShotSupervisorNative]::CommitIntent()) 'local_grace_intent_failed'
+    $localGraceResume = [EnergyGridOneShotSupervisorNative]::TryResumeThread(
+        $localGraceProcess.ThreadHandle, (Future-Deadline))
+    Assert-Native ($localGraceResume.Attempted -and $localGraceResume.Accepted) 'local_grace_resume_failed'
+    $localGraceWait = [EnergyGridOneShotSupervisorNative]::WaitProcess(
+        $localGraceProcess.ProcessHandle, 10000)
+    Assert-Native ($localGraceWait.Value -eq [EnergyGridOneShotSupervisorNative]::WAIT_OBJECT_0) `
+        'local_grace_launcher_wait_failed'
     $script:EgState = New-State
     $script:EgState.active_processes = [uint64]1
     Wait-EgDescendantGrace -JobHandle $localGraceJob `
         -LauncherHandle $localGraceProcess.ProcessHandle -LauncherPid 0 -StartTicks 0 `
         -DeadlineTicks (Future-Deadline -Milliseconds 30000)
     Assert-Native $script:EgState.descendant_grace_expired 'local_grace_not_recorded'
-    Assert-Native (-not $script:EgState.timed_out) 'local_grace_marked_timeout'
-    Assert-Native (-not $script:EgState.interrupted) 'local_grace_marked_interruption'
+    Assert-Native (-not $script:EgState.timed_out -and -not $script:EgState.interrupted) `
+        'local_grace_reason_flags_invalid'
+    Assert-Native $script:EgState.termination_succeeded 'local_grace_termination_failed'
     Wait-EgReap -JobHandle $localGraceJob -DeadlineTicks 0 -WindowSeconds 10
 }
 finally {
-    try {
-        if ($localGraceJob -ne [IntPtr]::Zero) {
-            [void][EnergyGridOneShotSupervisorNative]::TerminateJob(
-                $localGraceJob, [EnergyGridOneShotSupervisorNative]::SUPERVISOR_TERMINATION_EXIT_CODE)
-        }
-    }
-    catch { }
-    try { Close-TestChild -Process $localGraceProcess } catch { }
-    Close-Native -Handle $localGraceJob
+    Cleanup-Job -JobHandle $localGraceJob -Process $localGraceProcess
 }
 
-Write-Output 'function_case=descendant_grace_completion'
-$graceCompletionJob = [IntPtr]::Zero
-$graceCompletionProcess = $null
+Write-Output 'function_case=descendant_grace_completion_global_deadline'
+$globalCompletionJob = [IntPtr]::Zero
+$globalCompletionProcess = $null
+$globalCompletionReleasePath = Join-Path $RootPath 'completion-global.release'
 try {
-    $graceCompletionJob = [EnergyGridOneShotSupervisorNative]::CreateJob()
-    [EnergyGridOneShotSupervisorNative]::ConfigureJob($graceCompletionJob)
-    $graceCompletionProcess = New-TestChild -JobHandle $graceCompletionJob `
-        -Code 'Start-Sleep -Milliseconds 150'
+    $globalCompletionJob = [EnergyGridOneShotSupervisorNative]::CreateJob()
+    [EnergyGridOneShotSupervisorNative]::ConfigureJob($globalCompletionJob)
+    $globalCompletionCode = 'while (-not (Test-Path -LiteralPath ' +
+        (Quote-PowerShellLiteral -Value $globalCompletionReleasePath) +
+        ')) { Start-Sleep -Milliseconds 50 }'
+    $globalCompletionProcess = New-TestChild -JobHandle $globalCompletionJob -Code $globalCompletionCode
     [EnergyGridOneShotSupervisorNative]::ResetControlState()
-    Assert-Native ([EnergyGridOneShotSupervisorNative]::CommitIntent()) 'grace_completion_intent_failed'
-    $completionResume = [EnergyGridOneShotSupervisorNative]::TryResumeThread(
-        $graceCompletionProcess.ThreadHandle, (Future-Deadline))
-    Assert-Native ($completionResume.Attempted -and $completionResume.Accepted) 'grace_completion_resume_failed'
-    $completionWait = [EnergyGridOneShotSupervisorNative]::WaitProcess(
-        $graceCompletionProcess.ProcessHandle, 10000)
-    Assert-Native ($completionWait.Value -eq [EnergyGridOneShotSupervisorNative]::WAIT_OBJECT_0) 'grace_completion_launcher_wait_failed'
+    Assert-Native ([EnergyGridOneShotSupervisorNative]::CommitIntent()) 'global_completion_intent_failed'
+    $globalCompletionResume = [EnergyGridOneShotSupervisorNative]::TryResumeThread(
+        $globalCompletionProcess.ThreadHandle, (Future-Deadline))
+    Assert-Native ($globalCompletionResume.Attempted -and $globalCompletionResume.Accepted) `
+        'global_completion_resume_failed'
+    $globalCompletionInitial = [EnergyGridOneShotSupervisorNative]::GetAccounting($globalCompletionJob)
+    Assert-Native ($globalCompletionInitial.Succeeded -and $globalCompletionInitial.ActiveProcesses -gt 0) `
+        'global_completion_initial_positive_missing'
+    $script:GraceSleepMode = 'global-completion'
+    $script:GraceSleepCalls = 0
+    $script:GraceSleepJobHandle = $globalCompletionJob
+    $script:GraceSleepReleasePath = $globalCompletionReleasePath
     $script:EgState = New-State
     $script:EgState.active_processes = [uint64]1
-    Wait-EgDescendantGrace -JobHandle $graceCompletionJob `
-        -LauncherHandle $graceCompletionProcess.ProcessHandle -LauncherPid 0 -StartTicks 0 `
-        -DeadlineTicks (Future-Deadline)
-    Assert-Native (-not $script:EgState.termination_started) 'grace_completion_terminated'
-    Assert-Native ($script:EgState.active_processes -eq 0) 'grace_completion_active_processes_nonzero'
+    Wait-EgDescendantGrace -JobHandle $globalCompletionJob `
+        -LauncherHandle $globalCompletionProcess.ProcessHandle -LauncherPid 0 -StartTicks 0 `
+        -DeadlineTicks (Future-Deadline -Milliseconds 200)
+    $script:GraceSleepMode = 'off'
+    Assert-Native ($script:GraceSleepCalls -eq 1) 'global_completion_sleep_seam_not_used'
+    Assert-Native (-not $script:EgState.termination_started) 'global_completion_terminated'
+    Assert-Native ($script:EgState.active_processes -eq 0) 'global_completion_active_processes_nonzero'
+    Assert-Native (-not $script:EgState.timed_out -and -not $script:EgState.interrupted -and
+        -not $script:EgState.descendant_grace_expired) 'global_completion_flags_set'
 }
 finally {
-    try {
-        if ($graceCompletionJob -ne [IntPtr]::Zero) {
-            [void][EnergyGridOneShotSupervisorNative]::TerminateJob(
-                $graceCompletionJob, [EnergyGridOneShotSupervisorNative]::SUPERVISOR_TERMINATION_EXIT_CODE)
-        }
-    }
-    catch { }
-    try { Close-TestChild -Process $graceCompletionProcess } catch { }
-    Close-Native -Handle $graceCompletionJob
+    $script:GraceSleepMode = 'off'
+    Cleanup-Job -JobHandle $globalCompletionJob -Process $globalCompletionProcess
+    if (Test-Path -LiteralPath $globalCompletionReleasePath) { Remove-Item -LiteralPath $globalCompletionReleasePath -Force }
+}
+
+Write-Output 'function_case=descendant_grace_completion_local_grace'
+$localCompletionJob = [IntPtr]::Zero
+$localCompletionProcess = $null
+$localCompletionReleasePath = Join-Path $RootPath 'completion-local.release'
+try {
+    $localCompletionJob = [EnergyGridOneShotSupervisorNative]::CreateJob()
+    [EnergyGridOneShotSupervisorNative]::ConfigureJob($localCompletionJob)
+    $localCompletionCode = 'while (-not (Test-Path -LiteralPath ' +
+        (Quote-PowerShellLiteral -Value $localCompletionReleasePath) +
+        ')) { Start-Sleep -Milliseconds 50 }'
+    $localCompletionProcess = New-TestChild -JobHandle $localCompletionJob -Code $localCompletionCode
+    [EnergyGridOneShotSupervisorNative]::ResetControlState()
+    Assert-Native ([EnergyGridOneShotSupervisorNative]::CommitIntent()) 'local_completion_intent_failed'
+    $localCompletionResume = [EnergyGridOneShotSupervisorNative]::TryResumeThread(
+        $localCompletionProcess.ThreadHandle, (Future-Deadline))
+    Assert-Native ($localCompletionResume.Attempted -and $localCompletionResume.Accepted) `
+        'local_completion_resume_failed'
+    $localCompletionInitial = [EnergyGridOneShotSupervisorNative]::GetAccounting($localCompletionJob)
+    Assert-Native ($localCompletionInitial.Succeeded -and $localCompletionInitial.ActiveProcesses -gt 0) `
+        'local_completion_initial_positive_missing'
+    $script:GraceSleepMode = 'local-completion'
+    $script:GraceSleepCalls = 0
+    $script:GraceSleepJobHandle = $localCompletionJob
+    $script:GraceSleepReleasePath = $localCompletionReleasePath
+    $script:EgState = New-State
+    $script:EgState.active_processes = [uint64]1
+    Wait-EgDescendantGrace -JobHandle $localCompletionJob `
+        -LauncherHandle $localCompletionProcess.ProcessHandle -LauncherPid 0 -StartTicks 0 `
+        -DeadlineTicks (Future-Deadline -Milliseconds 30000)
+    $script:GraceSleepMode = 'off'
+    Assert-Native ($script:GraceSleepCalls -eq 1) 'local_completion_sleep_seam_not_used'
+    Assert-Native (-not $script:EgState.termination_started) 'local_completion_terminated'
+    Assert-Native ($script:EgState.active_processes -eq 0) 'local_completion_active_processes_nonzero'
+    Assert-Native (-not $script:EgState.timed_out -and -not $script:EgState.interrupted -and
+        -not $script:EgState.descendant_grace_expired) 'local_completion_flags_set'
+}
+finally {
+    $script:GraceSleepMode = 'off'
+    Cleanup-Job -JobHandle $localCompletionJob -Process $localCompletionProcess
+    if (Test-Path -LiteralPath $localCompletionReleasePath) { Remove-Item -LiteralPath $localCompletionReleasePath -Force }
+}
+
+Write-Output 'function_case=descendant_grace_accounting_failure'
+[EnergyGridOneShotSupervisorNative]::ResetControlState()
+$accountingFailureState = New-State
+$script:EgState = $accountingFailureState
+$accountingFailureThrown = $false
+try {
+    Wait-EgDescendantGrace -JobHandle ([IntPtr]([int64]1)) `
+        -LauncherHandle ([IntPtr]::Zero) -LauncherPid 0 -StartTicks 0 `
+        -DeadlineTicks (Future-Deadline)
+}
+catch {
+    $accountingFailureThrown = $true
+    Assert-Native ($_.Exception.Message -eq 'EG_SUPERVISOR_ACCOUNTING_FAILED') `
+        'accounting_failure_support_ref_invalid'
+}
+Assert-Native $accountingFailureThrown 'accounting_failure_not_thrown'
+Assert-Native $script:EgState.containment_failure 'accounting_failure_not_containment_failure'
+Assert-Native ($script:EgState.support_ref -eq 'EG_SUPERVISOR_ACCOUNTING_FAILED') `
+    'accounting_failure_state_support_ref_invalid'
+Assert-Native (-not $script:EgState.timed_out -and -not $script:EgState.interrupted -and
+    -not $script:EgState.descendant_grace_expired) 'accounting_failure_timing_flags_set'
+Assert-Native ((Get-EgExitCode) -eq 3) 'accounting_failure_exit_not_three'
+
+Write-Output 'function_case=descendant_grace_precedence_interruption_over_timeout'
+$precedenceInterruptJob = [IntPtr]::Zero
+$precedenceInterruptProcess = $null
+try {
+    $precedenceInterruptJob = [EnergyGridOneShotSupervisorNative]::CreateJob()
+    [EnergyGridOneShotSupervisorNative]::ConfigureJob($precedenceInterruptJob)
+    $precedenceInterruptProcess = New-TestChild -JobHandle $precedenceInterruptJob
+    [EnergyGridOneShotSupervisorNative]::ResetControlState()
+    $precedenceSignalMethod = [EnergyGridOneShotSupervisorNative].GetMethod(
+        'HandleConsoleSignal', [Reflection.BindingFlags]::NonPublic -bor [Reflection.BindingFlags]::Static)
+    Assert-Native ($null -ne $precedenceSignalMethod) 'precedence_interrupt_signal_method_missing'
+    [void]$precedenceSignalMethod.Invoke($null, [object[]]@([uint32]2))
+    $script:EgState = New-State
+    $script:EgState.active_processes = [uint64]0
+    Wait-EgDescendantGrace -JobHandle $precedenceInterruptJob `
+        -LauncherHandle $precedenceInterruptProcess.ProcessHandle -LauncherPid 0 -StartTicks 0 `
+        -DeadlineTicks ([System.Diagnostics.Stopwatch]::GetTimestamp() - 1)
+    Assert-Native $script:EgState.interrupted 'precedence_interrupt_not_selected'
+    Assert-Native (-not $script:EgState.timed_out -and -not $script:EgState.descendant_grace_expired) `
+        'precedence_interrupt_lost'
+    Wait-EgReap -JobHandle $precedenceInterruptJob -DeadlineTicks 0 -WindowSeconds 10
+}
+finally {
+    Cleanup-Job -JobHandle $precedenceInterruptJob -Process $precedenceInterruptProcess
+}
+
+Write-Output 'function_case=descendant_grace_precedence_timeout_over_local'
+$precedenceTimeoutJob = [IntPtr]::Zero
+$precedenceTimeoutProcess = $null
+try {
+    $precedenceTimeoutJob = [EnergyGridOneShotSupervisorNative]::CreateJob()
+    [EnergyGridOneShotSupervisorNative]::ConfigureJob($precedenceTimeoutJob)
+    $precedenceTimeoutProcess = New-TestChild -JobHandle $precedenceTimeoutJob
+    [EnergyGridOneShotSupervisorNative]::ResetControlState()
+    $script:GraceSleepMode = 'timeout-local-precedence'
+    $script:GraceSleepCalls = 0
+    $script:GraceSleepJobHandle = $precedenceTimeoutJob
+    $script:GraceSleepReleasePath = $null
+    $script:EgState = New-State
+    $script:EgState.active_processes = [uint64]1
+    Wait-EgDescendantGrace -JobHandle $precedenceTimeoutJob `
+        -LauncherHandle $precedenceTimeoutProcess.ProcessHandle -LauncherPid 0 -StartTicks 0 `
+        -DeadlineTicks (Future-Deadline -Milliseconds 5100)
+    $script:GraceSleepMode = 'off'
+    Assert-Native ($script:GraceSleepCalls -eq 1) 'precedence_timeout_sleep_seam_not_used'
+    Assert-Native $script:EgState.timed_out 'precedence_timeout_not_selected'
+    Assert-Native (-not $script:EgState.interrupted -and -not $script:EgState.descendant_grace_expired) `
+        'precedence_timeout_lost_to_local_grace'
+    Wait-EgReap -JobHandle $precedenceTimeoutJob -DeadlineTicks 0 -WindowSeconds 10
+}
+finally {
+    $script:GraceSleepMode = 'off'
+    Cleanup-Job -JobHandle $precedenceTimeoutJob -Process $precedenceTimeoutProcess
 }
 
 Write-Output 'function_case=exact_termination_function'
@@ -1648,7 +2221,7 @@ $script:EgState = New-State
 $script:EgState.outcome_committed = $false
 Assert-ExitCase -Name 'outcome_missing' -Expected 3
 
-Write-Output 'function_assurance_cases=17'
+Write-Output 'function_assurance_cases=26'
 Write-Output 'function_assurance=PASS'
 '''
 
@@ -1696,14 +2269,26 @@ class SupervisorCommittedFunctionTests(unittest.TestCase):
                 self.assertIn("exit_case=" + case, result.stdout)
             for case in (
                 "timed_out_intent_rejection",
-                "timed_out_outcome_rejection",
+                "timed_out_outcome_contract",
+                "timed_out_outcome_actual_delayed",
+                "timed_out_outcome_actual_ordinary",
+                "timed_out_outcome_defensive_exact_caller",
+                "descendant_grace_stale_zero_global_deadline",
+                "descendant_grace_stale_zero_interruption",
                 "descendant_grace_overall_deadline",
-                "descendant_grace_interruption",
+                "descendant_grace_interruption_during_polling",
                 "descendant_grace_local_control",
-                "descendant_grace_completion",
+                "descendant_grace_completion_global_deadline",
+                "descendant_grace_completion_local_grace",
+                "descendant_grace_accounting_failure",
+                "descendant_grace_precedence_interruption_over_timeout",
+                "descendant_grace_precedence_timeout_over_local",
+                "exact_termination_function",
+                "termination_failure_infrastructure",
+                "accounting_failure_and_reap_timeout",
             ):
                 self.assertIn("function_case=" + case, result.stdout)
-            self.assertIn("function_assurance_cases=17", result.stdout)
+            self.assertIn("function_assurance_cases=26", result.stdout)
             self.assertIn("function_assurance=PASS", result.stdout)
 
 
