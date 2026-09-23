@@ -69,6 +69,12 @@ $script:EgState = [pscustomobject]@{
     precreate_rejection = $false
 }
 
+# Application-child observer bounds. The provider budget is the longest single blocking
+# observation query; a query starts only when the whole budget fits before the deadline.
+$script:EgObserverMetadataTimeoutMilliseconds = 1000
+# OpenProcess ERROR_INVALID_PARAMETER: the listed process no longer exists.
+$script:EgObserverProcessGoneErrorCode = 87
+
 $script:EgNativeSource = @'
 using System;
 using System.IO;
@@ -1568,6 +1574,7 @@ function Test-EgApplicationChild {
 
     $observerDeadline = [int64]([System.Diagnostics.Stopwatch]::GetTimestamp() +
         [int64]([System.Diagnostics.Stopwatch]::Frequency / 20))
+    $supervisorDeadline = Get-EgDeadlineTicks -StartTicks $StartTicks -Seconds $TimeoutSeconds
     $pidResult = [EnergyGridOneShotSupervisorNative]::GetProcessIds($JobHandle)
     if (-not $pidResult.Succeeded) {
         $script:EgState.observer_failed = $true
@@ -1580,7 +1587,11 @@ function Test-EgApplicationChild {
         if ([uint32]$candidatePid -eq $LauncherPid) { continue }
         $candidate = [EnergyGridOneShotSupervisorNative]::OpenQueryProcess([uint32]$candidatePid)
         if (-not $candidate.Succeeded) {
-            $script:EgState.observer_failed = $true
+            # A listed descendant that has already exited and been released is absent, not
+            # unprovable. Every other open failure remains an observer failure.
+            if ($candidate.ErrorCode -ne $script:EgObserverProcessGoneErrorCode) {
+                $script:EgState.observer_failed = $true
+            }
             continue
         }
         try {
@@ -1605,15 +1616,34 @@ function Test-EgApplicationChild {
             if (-not $launcherLive.Live) { continue }
             $image = [EnergyGridOneShotSupervisorNative]::GetImage($candidate.Handle)
             if (-not $image.Succeeded) {
-                $script:EgState.observer_failed = $true
+                # Only a candidate proven exited through the held handle is absent.
+                $exited = [EnergyGridOneShotSupervisorNative]::GetProcessLive($candidate.Handle)
+                if (-not ($exited.Succeeded -and -not $exited.Live)) {
+                    $script:EgState.observer_failed = $true
+                }
                 continue
             }
             if ([System.StringComparer]::OrdinalIgnoreCase.Equals(
                 [System.IO.Path]::GetFullPath($image.ImagePath), $expectedImage) -eq $false) { continue }
+            # A provider query is started only when its whole bounded budget fits before the
+            # supervisor deadline, so observation can never outlive the one-shot deadline.
+            $remainingMilliseconds = [Math]::Floor((($supervisorDeadline -
+                [System.Diagnostics.Stopwatch]::GetTimestamp()) * 1000.0) /
+                [System.Diagnostics.Stopwatch]::Frequency)
+            if ($remainingMilliseconds -lt $script:EgObserverMetadataTimeoutMilliseconds) { break }
             $metadata = [EnergyGridOneShotSupervisorNative]::QueryProcessMetadata(
-                [uint32]$candidatePid, 10)
-            if (-not $metadata.Succeeded) {
+                [uint32]$candidatePid, $script:EgObserverMetadataTimeoutMilliseconds)
+            if ($metadata.TimedOut -or $metadata.ProviderFailed) {
+                # Genuine provider uncertainty: a late or busy provider is never evidence.
                 $script:EgState.observer_failed = $true
+                continue
+            }
+            if (-not $metadata.Succeeded) {
+                # No provider row: absent only when the held handle proves the candidate exited.
+                $exited = [EnergyGridOneShotSupervisorNative]::GetProcessLive($candidate.Handle)
+                if (-not ($exited.Succeeded -and -not $exited.Live)) {
+                    $script:EgState.observer_failed = $true
+                }
                 continue
             }
             if ([uint32]$metadata.ParentProcessId -ne $LauncherPid) { continue }
