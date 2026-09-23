@@ -4210,6 +4210,13 @@ class SupervisorRealObserverTests(unittest.TestCase):
             root = Path(os.path.realpath(directory))
             harness = root / "harness.ps1"
             harness.write_text(script, encoding="ascii")
+            # A PowerShell 7 parent (for example a pwsh CI step) exports its own module
+            # path; native Windows PowerShell 5.1 must rebuild its default module path so
+            # script-module commands such as Get-FileHash resolve as they do in production.
+            environment = {
+                name: value for name, value in os.environ.items()
+                if name.upper() != "PSMODULEPATH"
+            }
             result = subprocess.run(
                 [
                     powershell,
@@ -4229,6 +4236,7 @@ class SupervisorRealObserverTests(unittest.TestCase):
                 text=True,
                 timeout=timeout,
                 check=False,
+                env=environment,
             )
             print(result.stdout, flush=True)
             self.assertEqual(0, result.returncode, result.stdout + "\n" + result.stderr)
