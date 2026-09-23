@@ -1,0 +1,463 @@
+{
+  "id": "xbMemberWelcomeEmailTemplate01",
+  "name": "Member Gateway - welcome email outbox mailer (inactive)",
+  "description": "DO NOT ACTIVATE. Inactive, manual-only mailer for the durable welcome_v1 outbox. Each run claims at most one due row, verifies the gateway-built message against its durable hash, records send intent, sends it once with Send Email retry disabled, and records either SMTP acceptance or an uncertain outcome that is never resent. The gateway and SMTP credentials are bound only in a separately reviewed deployment copy.",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "d0000001-0000-4000-8000-000000000001",
+      "name": "Manual welcome email preview",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -1400,
+        160
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "d0000501-0000-4000-8000-000000000501",
+              "name": "activation_enabled",
+              "value": false,
+              "type": "boolean"
+            },
+            {
+              "id": "d0000502-0000-4000-8000-000000000502",
+              "name": "gateway_origin",
+              "value": "https://gateway.example.com",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "d0000002-0000-4000-8000-000000000002",
+      "name": "Repository-safe mailer configuration",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -1200,
+        160
+      ],
+      "notesInFlow": true,
+      "notes": "Inactive placeholders only. The gateway origin, mailer bearer and SMTP credential are bound in a separately reviewed deployment copy."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "d0000903-0000-4000-8000-000000000903",
+              "leftValue": "={{ $json.activation_enabled }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "d0000003-0000-4000-8000-000000000003",
+      "name": "Controlled mailer activation gate",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -1000,
+        160
+      ],
+      "notesInFlow": true,
+      "notes": "False in source control. No schedule or continuous trigger."
+    },
+    {
+      "parameters": {
+        "jsCode": "return [{json: {status: 'blocked_by_default_activation_gate', activation_enabled: false, operation: 'welcome_email.send'}}];"
+      },
+      "id": "d0000004-0000-4000-8000-000000000004",
+      "name": "Blocked until separate mailer activation",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -800,
+        360
+      ],
+      "notesInFlow": true,
+      "notes": "Safe false branch performs no network operation."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Repository-safe mailer configuration').first().json.gateway_origin + '/v1/welcome-emails/claim' }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ ({}) }}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          },
+          "timeout": 30000
+        }
+      },
+      "id": "d0000005-0000-4000-8000-000000000005",
+      "name": "Claim one welcome email",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -800,
+        80
+      ],
+      "notesInFlow": true,
+      "notes": "Claims at most one due welcome_v1 row under a 120 second lease. The gateway builds sender, subject and body.",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "jsCode": "const crypto = require('crypto');\nconst claim = $json;\nif (!claim || claim.schema_version !== 'xb.member.welcome_email.job.v1' || typeof claim.claimed !== 'boolean') throw new Error('welcome_claim_invalid');\nif (!claim.claimed) return [{json: {has_job: false}}];\nconst job = claim.job;\nif (!job || job.schema_version !== 'xb.member.welcome_email.job.v1' || job.operation !== 'welcome_email.send' || job.template_id !== 'welcome_v1' || job.state !== 'LEASED') throw new Error('welcome_job_invalid');\nif (!/^welcome-[0-9a-f]{32}$/.test(job.outbox_id) || !/^lease-[0-9a-f]{32}$/.test(job.lease_id) || !Number.isInteger(job.state_version)) throw new Error('welcome_job_identity_invalid');\nconst message = job.message;\nconst fields = ['content_type', 'from_address', 'from_name', 'reply_to', 'subject', 'template_id', 'text', 'to'];\nif (!message || JSON.stringify(Object.keys(message).sort()) !== JSON.stringify(fields)) throw new Error('welcome_message_shape_invalid');\nif (message.template_id !== 'welcome_v1' || message.reply_to !== null || message.content_type !== 'text/plain; charset=UTF-8') throw new Error('welcome_message_binding_invalid');\nfor (const field of ['from_address', 'from_name', 'subject', 'text', 'to']) {\n  if (typeof message[field] !== 'string' || !message[field] || /[\\r\\n]/.test(field === 'text' ? '' : message[field])) throw new Error('welcome_message_field_invalid');\n}\nif (!/^[^@\\s<>]+@[^@\\s<>]+\\.[^@\\s<>]+$/.test(message.to) || !/^[^@\\s<>]+@[^@\\s<>]+\\.[^@\\s<>]+$/.test(message.from_address)) throw new Error('welcome_message_address_invalid');\n// The gateway-built message must be sent verbatim: prove it matches the durable hash.\nconst canonical = JSON.stringify(Object.keys(message).sort().reduce((out, key) => (out[key] = message[key], out), {}));\nconst digest = 'sha256:' + crypto.createHash('sha256').update(canonical, 'utf8').digest('hex');\nif (digest !== job.message_hash) throw new Error('welcome_message_hash_mismatch');\nreturn [{json: {has_job: true, outbox_id: job.outbox_id, lease_id: job.lease_id, state_version: job.state_version, message}}];"
+      },
+      "id": "d0000006-0000-4000-8000-000000000006",
+      "name": "Validate claimed welcome message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -600,
+        80
+      ],
+      "notesInFlow": true,
+      "notes": "Verifies the gateway-built message against its durable hash. Any failure halts before send intent, so a later claim is a safe retry."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "d0000907-0000-4000-8000-000000000907",
+              "leftValue": "={{ $json.has_job === true }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "d0000007-0000-4000-8000-000000000007",
+      "name": "Welcome email claimed",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -400,
+        80
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "return [{json: {status: 'no_welcome_email_due', operation: 'welcome_email.send'}}];"
+      },
+      "id": "d0000008-0000-4000-8000-000000000008",
+      "name": "No welcome email due",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -200,
+        280
+      ],
+      "notesInFlow": true,
+      "notes": "No network operation."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Repository-safe mailer configuration').first().json.gateway_origin + '/v1/welcome-emails/' + $json.outbox_id + '/send-intent' }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ ({ lease_id: $json.lease_id, state_version: $json.state_version }) }}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          },
+          "timeout": 30000
+        }
+      },
+      "id": "d0000009-0000-4000-8000-000000000009",
+      "name": "Record welcome send intent",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -200,
+        0
+      ],
+      "notesInFlow": true,
+      "notes": "Durable intent before SMTP. Idempotent replay, so bounded retry is safe.",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "fromEmail": "={{ $('Validate claimed welcome message').first().json.message.from_name + ' <' + $('Validate claimed welcome message').first().json.message.from_address + '>' }}",
+        "toEmail": "={{ $('Validate claimed welcome message').first().json.message.to }}",
+        "subject": "={{ $('Validate claimed welcome message').first().json.message.subject }}",
+        "emailFormat": "text",
+        "text": "={{ $('Validate claimed welcome message').first().json.message.text }}",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "id": "d0000010-0000-4000-8000-000000000010",
+      "name": "Send welcome email (SMTP configured outside repo)",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        0,
+        0
+      ],
+      "retryOnFail": false,
+      "onError": "continueErrorOutput",
+      "notesInFlow": true,
+      "notes": "Automatic retry disabled. Success means SMTP accepted the message, not inbox delivery. No Reply-To and no n8n attribution."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Repository-safe mailer configuration').first().json.gateway_origin + '/v1/welcome-emails/' + $('Validate claimed welcome message').first().json.outbox_id + '/result' }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ ({ schema_version: 'xb.member.welcome_email.result.v1', lease_id: $('Validate claimed welcome message').first().json.lease_id, state_version: $('Record welcome send intent').first().json.state_version, outcome: 'smtp_accepted', error_code: null }) }}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          },
+          "timeout": 30000
+        }
+      },
+      "id": "d0000011-0000-4000-8000-000000000011",
+      "name": "Record SMTP acceptance",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        200,
+        -80
+      ],
+      "notesInFlow": true,
+      "notes": "Idempotent result acknowledgement.",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Repository-safe mailer configuration').first().json.gateway_origin + '/v1/welcome-emails/' + $('Validate claimed welcome message').first().json.outbox_id + '/result' }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ ({ schema_version: 'xb.member.welcome_email.result.v1', lease_id: $('Validate claimed welcome message').first().json.lease_id, state_version: $('Record welcome send intent').first().json.state_version, outcome: 'delivery_outcome_uncertain', error_code: 'smtp_node_error_after_send_intent' }) }}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          },
+          "timeout": 30000
+        }
+      },
+      "id": "d0000012-0000-4000-8000-000000000012",
+      "name": "Record uncertain delivery outcome",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        200,
+        120
+      ],
+      "notesInFlow": true,
+      "notes": "Any Send Email failure after intent is uncertain and is never resent automatically.",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "jsCode": "return [{json: {status: 'welcome_email_run_finished', outbox_id: $('Validate claimed welcome message').first().json.outbox_id, state: $json.state, duplicate: $json.duplicate === true}}];"
+      },
+      "id": "d0000013-0000-4000-8000-000000000013",
+      "name": "Welcome email run finished",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        400,
+        0
+      ],
+      "notesInFlow": true,
+      "notes": "No network operation."
+    }
+  ],
+  "connections": {
+    "Manual welcome email preview": {
+      "main": [
+        [
+          {
+            "node": "Repository-safe mailer configuration",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Repository-safe mailer configuration": {
+      "main": [
+        [
+          {
+            "node": "Controlled mailer activation gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Controlled mailer activation gate": {
+      "main": [
+        [
+          {
+            "node": "Claim one welcome email",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Blocked until separate mailer activation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claim one welcome email": {
+      "main": [
+        [
+          {
+            "node": "Validate claimed welcome message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate claimed welcome message": {
+      "main": [
+        [
+          {
+            "node": "Welcome email claimed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Welcome email claimed": {
+      "main": [
+        [
+          {
+            "node": "Record welcome send intent",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "No welcome email due",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record welcome send intent": {
+      "main": [
+        [
+          {
+            "node": "Send welcome email (SMTP configured outside repo)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send welcome email (SMTP configured outside repo)": {
+      "main": [
+        [
+          {
+            "node": "Record SMTP acceptance",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Record uncertain delivery outcome",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record SMTP acceptance": {
+      "main": [
+        [
+          {
+            "node": "Welcome email run finished",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record uncertain delivery outcome": {
+      "main": [
+        [
+          {
+            "node": "Welcome email run finished",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": false,
+    "saveDataErrorExecution": "none",
+    "saveDataSuccessExecution": "none",
+    "availableInMCP": false
+  },
+  "staticData": null
+}

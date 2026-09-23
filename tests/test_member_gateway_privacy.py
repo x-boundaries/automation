@@ -14,7 +14,11 @@ IMPLEMENTATION_FILES = (
     ROOT / "scripts/ac2_member_gateway_worker_lib.ps1",
     ROOT / "scripts/ac2_member_gateway_autocount_adapter.ps1",
     ROOT / "n8n-workflows/member_forms_gateway_ingest.workflow.json",
+    ROOT / "n8n-workflows/member_welcome_email_outbox.workflow.json",
     ROOT / "config/member_gateway.production.example.json",
+    ROOT / "config/member_forms_gateway_bounded_import.v2.template.json",
+    ROOT / "config/member_welcome_email_bounded_import.v1.template.json",
+    ROOT / "member_gateway/migrations/0005_member_vertical_slice.sql",
 )
 
 
@@ -63,6 +67,36 @@ class MemberGatewayPrivacyTests(unittest.TestCase):
             self.assertNotIn("privacy-response-001", json.dumps(audit))
             self.assertNotIn("81234567", json.dumps(audit))
             self.assertNotIn("privacy-synthetic@example.test", json.dumps(audit))
+
+    def test_rejection_and_page_protocol_responses_are_pii_and_token_free(self):
+        from xb_member_gateway.api import GatewayService
+        from xb_member_gateway.canonical import canonical_json
+        from xb_member_gateway.config import GatewayConfig
+        from xb_member_gateway.crypto import payload_hash
+        from xb_member_gateway.repository import InMemoryRepository
+
+        repository = InMemoryRepository(source_cutover_watermark="2026-08-30T00:00:00Z")
+        service = GatewayService(GatewayConfig(source_cutover_watermark="2026-08-30T00:00:00Z", source_production_cutover_exact="2026-08-30T00:00:00Z", source_admission_mode="first_member"), repository, adapter_ready=True)
+        raw = {"name": "Privacy Reject Member", "phone": "privacy-bad-phone", "email": "privacy-reject@example.test", "birthday_month": "May", "marketing_consent": "No", "pdpa_acknowledged": "I agree"}
+        rejection = {
+            "schema_version": "xb.member.source_rejection.v1", "source_system": "google_forms", "form_alias": "member_registration",
+            "response_id": "privacy-reject-response-001", "create_time": "2026-08-30T01:00:00.123Z", "mapping_version": "member-intake.v1",
+            "request_id": "privacy-reject-request-001", "payload_hash": payload_hash(canonical_json(raw)), "error_code": "phone_contains_letters_or_unsupported_characters", "operation": "member.create",
+        }
+        epoch = service.begin_source_epoch({"form_alias": "member_registration", "mapping_version": "member-intake.v1"})["active_epoch"]
+        opened = service.open_source_page(epoch["epoch_id"], {"expected_epoch_state_version": 0, "request_page_token": None, "next_page_token": "privacy-next-token", "terminal": False, "items": [{"response_id": rejection["response_id"], "create_time": rejection["create_time"], "payload_hash": rejection["payload_hash"]}]})
+        rejected = service.reject_source(rejection)
+        committed = service.commit_source_page(opened["page_id"], {"expected_epoch_state_version": opened["epoch_state_version"]})
+        public = json.dumps([opened, rejected, repository.audit_events])
+        for private in ("privacy-reject-response-001", "Privacy Reject Member", "privacy-reject@example.test", "privacy-bad-phone", "privacy-next-token"):
+            self.assertNotIn(private, public)
+        self.assertTrue(rejected["source_response_ref"].startswith("hmac-v1:"))
+        stored = json.dumps(repository.snapshot_state()["_rejections"], default=str)
+        for private in ("Privacy Reject Member", "privacy-reject@example.test", "privacy-bad-phone"):
+            self.assertNotIn(private, stored)
+        # The commit response returns the next opaque token only to the source
+        # principal; it carries no response identity or customer value.
+        self.assertEqual(set(committed) - {"current_page_token"}, {"schema_version", "page_id", "epoch_id", "page_state", "page_ordinal", "item_count", "terminal", "epoch_state_version", "epoch_status", "replayed"})
 
     def test_new_implementation_has_no_obvious_secret_or_private_value_literals(self):
         patterns = (

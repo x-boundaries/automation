@@ -59,9 +59,12 @@ until an owner supplies reviewed deployment configuration outside Git.
 
 Before any listener starts, run only `python -m xb_member_gateway --config
 <reviewed-external-config>`. Bootstrap must read and validate config, resolve
-the named runtime boundaries, validate all five principal separations, build
+the named runtime boundaries, validate all six principal separations, build
 the strict authenticator and repository, and read-only verify migrations
-0001-0004, required control rows, and initialized cursor/watermark consistency.
+0001-0005, required control rows, initialized watermark, exact production
+cutover and form binding, that every source response has an exact
+`createTime` and a handling receipt, and that no `CREATED_VERIFIED` result lacks
+a welcome outbox row.
 Any bounded bootstrap error is a stop condition. Do not let bootstrap apply a
 migration, initialize the cursor, repair state, generate a credential, clear
 the kill switch, or activate the gateway.
@@ -93,7 +96,7 @@ a worker, or touch AutoCount or member data.
    condition. Do not continue to any host binding on a partial proof, and never
    substitute a wildcard, LAN, or public bind.
 4. Build the gateway image and pull the pinned nginx ingress image.
-5. Create the reviewed external deployment state, the five pairwise-distinct
+5. Create the reviewed external deployment state, the six pairwise-distinct
    bearer principals, and the separate reference-HMAC key. Keep every raw value
    outside Git, chat, and logs.
 6. Create the two container networks: the internal backend bridge and the
@@ -121,7 +124,7 @@ wildcard; private HTTPS only, with trusted certificates from both the n8n and
 AC2 caller classes and no verification disabled anywhere; least-privilege
 database connectivity working over the unchanged DSN; production activation
 false, kill switch true, adapter not ready with readiness false and dispatch
-ineligible; the five bearer principals and the reference-HMAC key separated by
+ineligible; the six bearer principals and the reference-HMAC key separated by
 environment name, configured digest, and resolved value, with the
 reference-HMAC key unable to authenticate HTTP; cursor, watermark, control rows,
 and business state unchanged, with source, jobs, results, allocations, attempts,
@@ -154,20 +157,37 @@ PDPA acknowledgement. Marketing `No` must remain eligible for membership
 creation.
 
 Confirm private transport, authentication scopes, database backups, operator
-access, alerting, and manual reconciliation ownership. Bind exactly five
-pairwise-distinct source, operator, control, normal-worker, and recovery bearer
-principals. Keep their environment names, configured digests, and runtime
+access, alerting, and manual reconciliation ownership. Bind exactly six
+pairwise-distinct source, operator, control, normal-worker, recovery, and
+mailer bearer principals. The mailer holds only `welcome_email.claim`,
+`welcome_email.send_intent`, and `welcome_email.result`. Keep their environment names, configured digests, and runtime
 values pairwise distinct; do not combine roles. Bind recovery only to
 `worker.writer_termination_recovery`, and never use the reference-HMAC key as a
 bearer.
 
-Apply migration 0004 and initialize its immutable production watermark/cursor
-only in a later separately authorised deployment transaction. The configured
-watermark must exactly match the persisted value. Review the closed question-ID
-map, inclusive Forms query, `(create_time, response_id)` ordering, and one-new-
-response initial window. A page-token checkpoint is valid only after all
-eligible page responses have identical durable receipts. Terminal scans restart
-inclusively; overlaps are expected and conflicting history is a stop condition.
+Apply migrations 0004 and 0005 and initialize the cursor row (watermark,
+immutable `production_cutover_exact`, and private form ID) only in a later
+separately authorised deployment transaction. The configured watermark,
+`source_production_cutover_exact` (the verbatim Google `createTime` form), and
+`source_form_id` must exactly match the persisted values; the cutover never
+advances. Keep `source_admission_mode` at `first_member` until first-member
+evidence is accepted. Every scan epoch repeats the inclusive fixed-cutover
+filter; overlaps replay their receipts, and any immutable-source conflict,
+unreceipted page item, mapping drift, or token repetition within an epoch is a
+stop condition. Restart an epoch only for `token_invalidated` or
+`ambiguous_crashed_attempt`. If readiness reports
+`source_exact_time_backfill_missing` or `created_verified_without_welcome_outbox`,
+stop: exact values are never guessed and historical success is never made
+email-eligible without separate reviewed private no-send work.
+
+Welcome email: bind exactly one authorised SMTP credential for the sending
+identity `noreply@x-boundaries.com` (provider SPF/DKIM as required) and the
+mailer bearer before first-member activation. Keep the mailer workflow inactive
+and manual. Send Email retry stays disabled. A `DELIVERY_OUTCOME_UNCERTAIN` row
+is never resent automatically; resend needs private positive proof that SMTP
+did not accept. Rollback after any attempt re-engages the kill switch and
+disables schedules; it never deletes or rewinds outbox evidence, resends
+uncertain email, or down-migrates PostgreSQL.
 Keep worker concurrency and claim size at one for this initial topology. The repository must enforce
 one active non-expired worker lease across concurrent claim requests. A worker
 run must generate one bounded `ws-` session identifier and send it in
@@ -309,7 +329,7 @@ The bounded entry point is
 binding shape is documented by
 `config/member_forms_gateway_bounded_import.v2.template.json`. The committed
 file is a shape template only: real project/workflow IDs, form/question IDs,
-resolved credential IDs and names, cursor watermark, and source token stay in
+resolved credential IDs and names, production cutover, and source token stay in
 a private, ignored operator manifest. Do not put those values in a workflow
 export, ordinary temporary files, or this repository.
 
@@ -322,9 +342,11 @@ authority: HTTPS, explicit port 443, no userinfo, query, fragment, or
 non-root path, and the exact `https://<host>:443` representation. The
 `https://gateway.example.com:443` value in the committed template is an
 illustrative placeholder only; the private reviewed production binding must
-replace it with the actual approved origin. All three gateway endpoints must
-match that approved scheme, host, and port while retaining their reviewed
-path relationships. The Forms request must be exactly
+replace it with the actual approved origin. `endpoints.gateway_origin` must be
+exactly that approved origin and `endpoints.source_cursor` exactly
+`<gateway_origin>/v1/source/cursor`; every gateway call in the export is that
+origin plus a fixed route. The gateway-bearer role binds exactly the seven
+gateway nodes (begin/resume, both restarts, open, ingest, rejection, commit). The Forms request must be exactly
 `https://forms.googleapis.com:443/v1/forms/<form-id>/responses`. Alternate
 hosts, ports, versions, form IDs, queries, encoded/case/trailing-dot host
 variants, and other canonicalisation tricks are fail-closed before any token,
@@ -335,24 +357,28 @@ credential, or Docker access.
 1. Reconcile the protected canonical main revision, the parent/child issue
    authority, the frozen predecessor PR, and the exact canonical workflow blob.
    A changed authority packet requires a new reviewed plan.
-2. Prepare the private manifest and acquire the authoritative source cursor,
-   watermark, exact project/workflow metadata, and either the exact existing
+2. Prepare the private manifest (`cursor_expectation` = exact
+   `production_cutover_exact`, its domain-separated digest, and
+   `admission_mode`) and acquire the authoritative cursor v2, exact
+   project/workflow metadata, and either the exact existing
    workflow export or complete absence evidence. A case-distinct target is a
    collision, not an absent target.
 3. Run `CapturePlan` read-only. The plan binds the repository H/tree/parent,
    canonical workflow blob, project/workflow identity, prepared workflow,
-   resolved credential-binding digest, cursor digest and state version,
-   domain-separated watermark digest, and existing/absent preimage digest.
+   resolved credential-binding digest, public cursor-projection digest and
+   state version, domain-separated production cutover digest, and
+   existing/absent preimage digest. Page tokens and raw response IDs from the
+   cursor's active epoch are validated but never persisted.
 4. Review the immutable files under
    `.n8n-local/member-gateway-bounded-import/operations/<operation-id>/`.
-   They must contain only the plan, binding, cursor state, prepared workflow,
+   They must contain only the plan, binding, cursor-projection state, prepared workflow,
    mutation intent, exactly one preimage/absence receipt, and later receipts.
    A containerised apply additionally records one private
    `container-custody.json` receipt before import. It binds the container and
    image IDs, non-root import UID/GID, random nonce, sticky `/tmp` proof,
    private staging ownership/modes, exact prepared bytes/hash, and cleanup
    state.
-5. Immediately before `Apply`, reacquire and compare the cursor, watermark,
+5. Immediately before `Apply`, reacquire and compare the cursor projection, production cutover,
    project/workflow metadata, and preimage. Every retry repeats this check.
    Any mismatch blocks the operation and requires a new reviewed plan.
    Container staging is root-assisted only for mkdir/chown/chmod/stat/hash/
@@ -406,3 +432,25 @@ python -m unittest tests.test_member_gateway_bounded_import_security -v
 The hosted `bounded-import-security` job runs that exact command on Windows.
 It uses synthetic fixtures only and has no live credentials, Docker target,
 generic importer hook, or n8n mutation authority.
+
+## Bounded welcome-email mailer import
+
+`n8n-workflows/scripts/import-member-welcome-email-bounded.ps1` imports the
+inactive `n8n-workflows/member_welcome_email_outbox.workflow.json` with the
+same custody, ACL, canonical JSON, CapturePlan/Apply/Inspect identity chain,
+dispatch ownership and receipts as the forms importer. Its reviewed binding
+shape is `config/member_welcome_email_bounded_import.v1.template.json`: one
+gateway origin, the `gateway_mailer_bearer` role on exactly the four mailer
+gateway nodes, and the `smtp` role on exactly the Send Email node. It never
+calls the gateway (a claim would consume a lease) and never sends mail. It
+refuses an active or MCP-exposed workflow, any non-manual trigger or webhook,
+runtime state, Send Email retry, n8n attribution, any Reply-To, and any literal
+address in the Send Email fields; the gateway supplies sender, subject and body
+at claim time. Private operations live under
+`.n8n-local/member-welcome-email-bounded-import/operations/<operation-id>/`.
+
+```text
+python -m unittest tests.test_member_welcome_email_bounded_import_security -v
+```
+
+The hosted `bounded-import-security` job runs that command as a separate step.

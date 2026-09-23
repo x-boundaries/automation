@@ -14,8 +14,7 @@
   "endpoints": {
     "source_cursor": "https://gateway.example.com:443/v1/source/cursor",
     "forms_responses": "https://forms.googleapis.com:443/v1/forms/GOOGLE_FORM_ID_PLACEHOLDER/responses",
-    "gateway_ingest": "https://gateway.example.com:443/v1/source-events",
-    "page_checkpoint": "https://gateway.example.com:443/v1/source/cursor/page"
+    "gateway_origin": "https://gateway.example.com:443"
   },
   "form": {
     "id": "GOOGLE_FORM_ID_PLACEHOLDER"
@@ -42,16 +41,20 @@
       "credential_name": "GATEWAY_BEARER_CREDENTIAL_NAME_PLACEHOLDER",
       "credential_type": "httpBearerAuth",
       "node_names": [
-        "Read durable source cursor",
+        "Begin or resume scan epoch",
+        "Restart crashed scan epoch",
+        "Restart invalidated scan epoch",
+        "Open page durably",
         "Protected XB Gateway ingest (configured outside repo)",
+        "Record PII-free source rejection",
         "Commit durable page checkpoint"
       ]
     }
   },
   "cursor_expectation": {
-    "state_version": 0,
-    "watermark": "WATERMARK_RFC3339_PLACEHOLDER",
-    "watermark_digest": "WATERMARK_SHA256_PLACEHOLDER"
+    "production_cutover_exact": "PRODUCTION_CUTOVER_EXACT_PLACEHOLDER",
+    "production_cutover_digest": "PRODUCTION_CUTOVER_SHA256_PLACEHOLDER",
+    "admission_mode": "first_member"
   },
   "security": {
     "approved_gateway_origin": "https://gateway.example.com:443",

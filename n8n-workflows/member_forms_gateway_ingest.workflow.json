@@ -1,188 +1,946 @@
 {
   "id": "xbMemberGatewayTemplate02",
   "name": "Member Gateway - Google Forms durable source adapter (inactive)",
-  "description": "Inactive Google Forms source adapter for the XB member gateway. On each manual run it reads the durable source cursor, fetches exactly one Google Forms response page from the cursor lower bound, applies the closed member-intake.v1 question map, and admits at most one new source event before committing a page checkpoint. It exists so member signups reach the downstream member pipeline through one auditable, replay-safe path instead of manual re-entry. Fail-closed by default: the internal activation_enabled gate is false and every outbound endpoint, credential and form identifier in this repository copy is a placeholder configured outside the repository. DO NOT ACTIVATE from this template. Activation requires separate, explicitly granted owner authority and a documented source-contract reconciliation; it is not implied by importing or updating this workflow.",
-  "active": false,
+  "description": "DO NOT ACTIVATE. Inactive, manual-only Google Forms source adapter for the XB member gateway. Each run begins or resumes one gateway scan epoch bound to the fixed production cutover, then runs a bounded manual page loop: fetch one response page, open the page durably, obtain one accepted or PII-free rejected handling receipt per item, and commit the page. createTime is forwarded verbatim. Progress lives only in the gateway; nothing is stored in n8n staticData. Credentials, the Form, the gateway origin and question IDs are bound only in a separately reviewed deployment copy.",
   "nodes": [
     {
       "parameters": {},
-      "id": "b1111111-1111-4111-8111-111111111111",
+      "id": "c0000001-0000-4000-8000-000000000001",
       "name": "Manual source adapter preview",
       "type": "n8n-nodes-base.manualTrigger",
       "typeVersion": 1,
-      "position": [-1120, 160]
+      "position": [
+        -1600,
+        160
+      ]
     },
     {
       "parameters": {
         "assignments": {
           "assignments": [
-            {"id": "b2222222-2222-4222-8222-222222222222", "name": "activation_enabled", "value": false, "type": "boolean"},
-            {"id": "b2222222-2222-4222-8222-222222222223", "name": "form_alias", "value": "member_registration", "type": "string"},
-            {"id": "b2222222-2222-4222-8222-222222222224", "name": "mapping_version", "value": "member-intake.v1", "type": "string"},
-            {"id": "b2222222-2222-4222-8222-222222222225", "name": "forms_api_url", "value": "https://forms.example.com/v1/forms/GOOGLE_FORM_ID_PLACEHOLDER/responses", "type": "string"},
-            {"id": "b2222222-2222-4222-8222-222222222226", "name": "source_cursor_url", "value": "https://gateway.example.com/v1/source/cursor", "type": "string"},
-            {"id": "b2222222-2222-4222-8222-222222222227", "name": "gateway_ingest_url", "value": "https://gateway.example.com/v1/source-events", "type": "string"},
-            {"id": "b2222222-2222-4222-8222-222222222228", "name": "page_checkpoint_url", "value": "https://gateway.example.com/v1/source/cursor/page", "type": "string"},
-            {"id": "b2222222-2222-4222-8222-222222222229", "name": "initial_source_window_max", "value": 1, "type": "number"}
+            {
+              "id": "c0000501-0000-4000-8000-000000000501",
+              "name": "activation_enabled",
+              "value": false,
+              "type": "boolean"
+            },
+            {
+              "id": "c0000502-0000-4000-8000-000000000502",
+              "name": "form_alias",
+              "value": "member_registration",
+              "type": "string"
+            },
+            {
+              "id": "c0000503-0000-4000-8000-000000000503",
+              "name": "mapping_version",
+              "value": "member-intake.v1",
+              "type": "string"
+            },
+            {
+              "id": "c0000504-0000-4000-8000-000000000504",
+              "name": "forms_api_url",
+              "value": "https://forms.example.com/v1/forms/GOOGLE_FORM_ID_PLACEHOLDER/responses",
+              "type": "string"
+            },
+            {
+              "id": "c0000505-0000-4000-8000-000000000505",
+              "name": "gateway_origin",
+              "value": "https://gateway.example.com",
+              "type": "string"
+            },
+            {
+              "id": "c0000506-0000-4000-8000-000000000506",
+              "name": "max_pages_per_run",
+              "value": 20,
+              "type": "number"
+            }
           ]
         },
         "options": {}
       },
-      "id": "b3333333-3333-4333-8333-333333333333",
+      "id": "c0000002-0000-4000-8000-000000000002",
       "name": "Repository-safe source configuration",
       "type": "n8n-nodes-base.set",
       "typeVersion": 3.4,
-      "position": [-912, 160],
+      "position": [
+        -1400,
+        160
+      ],
       "notesInFlow": true,
-      "notes": "Inactive placeholders only. Form, gateway, source bearer, and question IDs are bound in a separately reviewed deployment copy."
+      "notes": "Inactive placeholders only. Form, gateway origin, source bearer, and question IDs are bound in a separately reviewed deployment copy."
     },
     {
       "parameters": {
         "conditions": {
-          "options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 2},
-          "conditions": [{"id": "b4444444-4444-4444-8444-444444444444", "leftValue": "={{ $json.activation_enabled }}", "rightValue": true, "operator": {"type": "boolean", "operation": "equals"}}],
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c0000903-0000-4000-8000-000000000903",
+              "leftValue": "={{ $json.activation_enabled }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
           "combinator": "and"
         },
         "options": {}
       },
-      "id": "b5555555-5555-4555-8555-555555555555",
+      "id": "c0000003-0000-4000-8000-000000000003",
       "name": "Controlled activation gate",
       "type": "n8n-nodes-base.if",
       "typeVersion": 2.2,
-      "position": [-704, 160],
+      "position": [
+        -1200,
+        160
+      ],
       "notesInFlow": true,
       "notes": "False in source control. Repository checkout has no continuous trigger or scheduling authority."
     },
     {
       "parameters": {
-        "method": "GET",
-        "url": "={{ $('Repository-safe source configuration').first().json.source_cursor_url }}",
-        "sendQuery": true,
-        "queryParameters": {"parameters": [
-          {"name": "form_alias", "value": "={{ $('Repository-safe source configuration').first().json.form_alias }}"},
-          {"name": "mapping_version", "value": "={{ $('Repository-safe source configuration').first().json.mapping_version }}"}
-        ]},
-        "options": {"response": {"response": {"responseFormat": "json"}}, "timeout": 30000}
+        "jsCode": "return [{json:{status:'blocked_by_default_activation_gate',activation_enabled:false,source_system:'google_forms',operation:'member.create'}}];"
       },
-      "id": "b6000000-0000-4600-8600-000000000001",
-      "name": "Read durable source cursor",
+      "id": "c0000004-0000-4000-8000-000000000004",
+      "name": "Blocked until separate activation",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1000,
+        360
+      ],
+      "notesInFlow": true,
+      "notes": "Safe false branch emits synthetic metadata and performs no network operation."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Repository-safe source configuration').first().json.gateway_origin + '/v1/source/epochs/begin' }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ ({ form_alias: $('Repository-safe source configuration').first().json.form_alias, mapping_version: $('Repository-safe source configuration').first().json.mapping_version }) }}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          },
+          "timeout": 30000
+        }
+      },
+      "id": "c0000005-0000-4000-8000-000000000005",
+      "name": "Begin or resume scan epoch",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
-      "position": [-480, 32],
+      "position": [
+        -1000,
+        80
+      ],
       "retryOnFail": true,
       "maxTries": 3,
       "waitBetweenTries": 1000,
       "notesInFlow": true,
-      "notes": "Source-only read. Authentication remains deliberately unbound in this inactive export."
+      "notes": "Resumes the one ACTIVE epoch or begins one from the fixed production cutover. Idempotent, so bounded retry is safe."
+    },
+    {
+      "parameters": {
+        "jsCode": "const config = $('Repository-safe source configuration').first().json;\nconst cursor = $json;\nconst EXACT = /^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d{3}|\\.\\d{6}|\\.\\d{9})?Z$/;\nif ($runIndex > 2) throw new Error('source_epoch_restart_loop_bounded');\nif (!cursor || cursor.schema_version !== 'xb.member.gateway.source_cursor.v2' || cursor.form_alias !== config.form_alias || cursor.mapping_version !== config.mapping_version) throw new Error('source_cursor_invalid');\nif (typeof cursor.production_cutover_exact !== 'string' || !EXACT.test(cursor.production_cutover_exact) || cursor.filter_exact !== 'timestamp >= ' + cursor.production_cutover_exact) throw new Error('source_cutover_invalid');\nif (cursor.page_size !== 1) throw new Error('source_page_size_invalid');\nif (!['first_member', 'continuous'].includes(cursor.admission_mode)) throw new Error('source_admission_mode_invalid');\nconst epoch = cursor.active_epoch;\nif (!epoch || epoch.status !== 'ACTIVE' || !/^epoch-[0-9a-f]{32}$/.test(epoch.epoch_id) || !Number.isInteger(epoch.epoch_state_version)) throw new Error('source_epoch_invalid');\nconst maxPages = Number(config.max_pages_per_run);\nif (!Number.isInteger(maxPages) || maxPages < 1 || maxPages > 50) throw new Error('source_page_budget_invalid');\nconst base = {epoch_id: epoch.epoch_id, expected_epoch_state_version: epoch.epoch_state_version, request_page_token: epoch.current_page_token, filter_exact: cursor.filter_exact, admission_mode: cursor.admission_mode, pages_fetched: 0, max_pages: maxPages};\nif (epoch.open_page) return [{json: {...base, action: 'restart', restart_reason: 'ambiguous_crashed_attempt'}}];\nif (cursor.admission_mode === 'first_member' && cursor.accepted_member_allowance_remaining !== 1) return [{json: {...base, action: 'stop', stop_reason: 'first_member_allowance_consumed'}}];\nreturn [{json: {...base, action: 'fetch'}}];"
+      },
+      "id": "c0000006-0000-4000-8000-000000000006",
+      "name": "Plan epoch attempt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -800,
+        80
+      ],
+      "notesInFlow": true,
+      "notes": "Validates cursor v2. An open page from a crashed attempt restarts the epoch; a consumed first_member allowance stops without fetching."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c0000907-0000-4000-8000-000000000907",
+              "leftValue": "={{ $json.action === 'restart' }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "c0000007-0000-4000-8000-000000000007",
+      "name": "Crashed page requires epoch restart",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -600,
+        80
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Repository-safe source configuration').first().json.gateway_origin + '/v1/source/epochs/' + $json.epoch_id + '/restart' }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ ({ expected_epoch_state_version: $json.expected_epoch_state_version, restart_reason: 'ambiguous_crashed_attempt' }) }}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          },
+          "timeout": 30000
+        }
+      },
+      "id": "c0000008-0000-4000-8000-000000000008",
+      "name": "Restart crashed scan epoch",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -400,
+        -120
+      ],
+      "notesInFlow": true,
+      "notes": "CAS restart from the same fixed cutover. No automatic retry."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c0000909-0000-4000-8000-000000000909",
+              "leftValue": "={{ $json.action === 'fetch' }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "c0000009-0000-4000-8000-000000000009",
+      "name": "Epoch may fetch a page",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -400,
+        160
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "return [{json: {status: 'source_run_stopped', stop_reason: $json.stop_reason || null, source_system: 'google_forms', operation: 'member.create'}}];"
+      },
+      "id": "c0000010-0000-4000-8000-000000000010",
+      "name": "Stopped without source progress",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -200,
+        360
+      ],
+      "notesInFlow": true,
+      "notes": "No network operation."
+    },
+    {
+      "parameters": {
+        "jsCode": "const state = $json;\nif (!Number.isInteger(state.pages_fetched) || state.pages_fetched >= state.max_pages) throw new Error('source_page_budget_exhausted');\nif (state.request_page_token !== null && (typeof state.request_page_token !== 'string' || !/^[ -~]{1,1024}$/.test(state.request_page_token))) throw new Error('source_page_token_invalid');\nreturn [{json: {...state}}];"
+      },
+      "id": "c0000011-0000-4000-8000-000000000011",
+      "name": "Prepare page request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -200,
+        80
+      ],
+      "notesInFlow": true,
+      "notes": "Bounded manual page loop entry. Progress is durable in the gateway epoch, never in n8n staticData."
     },
     {
       "parameters": {
         "method": "GET",
         "url": "={{ $('Repository-safe source configuration').first().json.forms_api_url }}",
         "sendQuery": true,
-        "queryParameters": {"parameters": [
-          {"name": "pageSize", "value": "1"},
-          {"name": "filter", "value": "={{ 'timestamp >= ' + $json.scan_lower_bound }}"},
-          {"name": "pageToken", "value": "={{ $json.resume_page_token || undefined }}"}
-        ]},
-        "options": {"response": {"response": {"responseFormat": "json", "fullResponse": true}}, "timeout": 30000}
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "pageSize",
+              "value": "1"
+            },
+            {
+              "name": "filter",
+              "value": "={{ $json.filter_exact }}"
+            },
+            {
+              "name": "pageToken",
+              "value": "={{ $json.request_page_token || undefined }}"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json",
+              "fullResponse": true,
+              "neverError": true
+            }
+          },
+          "timeout": 30000
+        }
       },
-      "id": "b6666666-6666-4666-8666-666666666666",
+      "id": "c0000012-0000-4000-8000-000000000012",
       "name": "Google Forms single page (configured outside repo)",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
-      "position": [-256, 32],
+      "position": [
+        0,
+        80
+      ],
       "retryOnFail": true,
       "maxTries": 3,
       "waitBetweenTries": 2000,
       "notesInFlow": true,
-      "notes": "One page only, inclusive durable lower bound, page size one. No scheduler, credential, or live Form binding is committed."
+      "notes": "One response per page, verbatim fixed-cutover filter, epoch-scoped opaque token. Built-in pagination is not used because it cannot interleave the durable open/receipt/commit steps."
     },
     {
       "parameters": {
-        "jsCode": "const crypto = require('crypto');\nconst cursor = $('Read durable source cursor').first().json;\nconst MAPPING_VERSION = 'member-intake.v1';\nconst MAX_PAGE = 1;\nconst QUESTION_MAPPING = Object.freeze({name:'QUESTION_ID_NAME_PLACEHOLDER',phone:'QUESTION_ID_PHONE_PLACEHOLDER',email:'QUESTION_ID_EMAIL_PLACEHOLDER',birthday_month:'QUESTION_ID_BIRTHDAY_MONTH_PLACEHOLDER',marketing_consent:'QUESTION_ID_MARKETING_CONSENT_PLACEHOLDER',pdpa_acknowledged:'QUESTION_ID_PDPA_ACKNOWLEDGED_PLACEHOLDER'});\nconst REQUIRED = Object.freeze(Object.keys(QUESTION_MAPPING));\nconst SAFE_ID=/^[A-Za-z0-9._:-]{1,200}$/; const TOKEN=/^[ -~]{1,1024}$/;\nconst clean=v=>{if(typeof v!=='string')throw new Error('text_value_required');return v.normalize('NFC').replace(/\\r\\n?/g,'\\n').trim();};\nconst spaces=v=>clean(v).split(/\\s+/).filter(Boolean).join(' ');\nconst answer=(answers,field)=>{const id=QUESTION_MAPPING[field];if(!SAFE_ID.test(id))throw new Error('forms_question_mapping_invalid');const entry=answers[id];const values=entry&&entry.textAnswers&&entry.textAnswers.answers;if(!Array.isArray(values)||values.length!==1||!values[0]||typeof values[0].value!=='string')throw new Error('forms_answer_value_invalid');return values[0].value;};\nconst mapResponse=response=>{if(!response||typeof response!=='object'||Array.isArray(response))throw new Error('forms_response_invalid');if(!SAFE_ID.test(response.responseId||''))throw new Error('forms_response_id_invalid');const created=Date.parse(response.createTime);if(!Number.isFinite(created))throw new Error('forms_create_time_invalid');const watermark=Date.parse(cursor.watermark);if(!Number.isFinite(watermark)||created<watermark)throw new Error('forms_response_before_watermark');const answers=response.answers;if(!answers||typeof answers!=='object'||Array.isArray(answers))throw new Error('forms_answers_invalid');const allowed=new Set(Object.values(QUESTION_MAPPING));if(Object.keys(answers).some(id=>!allowed.has(id)))throw new Error('forms_question_mapping_unknown');const raw={};for(const field of REQUIRED)raw[field]=answer(answers,field);const rawPhone=clean(raw.phone);if(/[^0-9 ()+.\\-]/.test(rawPhone)||!/^\\+?[0-9 ().\\-]*$/.test(rawPhone))throw new Error('phone_shape_invalid');const phone=rawPhone.replace(/[^0-9]/g,'');if(!/^[0-9]{6,15}$/.test(phone))throw new Error('phone_shape_invalid');const name=spaces(raw.name);const email=spaces(raw.email).toLowerCase();const monthName=spaces(raw.birthday_month).toLowerCase();const months={january:'January',february:'February',march:'March',april:'April',may:'May',june:'June',july:'July',august:'August',september:'September',october:'October',november:'November',december:'December'};const consent=spaces(raw.marketing_consent).toLowerCase();if(!name||name.length>200)throw new Error('name_invalid');if(!/^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$/.test(email)||email.length>254)throw new Error('email_invalid');if(!months[monthName])throw new Error('birthday_month_invalid');if(!['yes','no'].includes(consent))throw new Error('marketing_consent_must_be_yes_or_no');const payload={name,phone,email,birthday_month:months[monthName],marketing_consent:consent==='yes'?'Yes':'No',pdpa_acknowledged:['yes','i agree'].includes(spaces(raw.pdpa_acknowledged).toLowerCase())};const canonical=JSON.stringify(Object.keys(payload).sort().reduce((out,key)=>(out[key]=payload[key],out),{}));return {schema_version:'xb.member.source_event.v1',source_system:'google_forms',form_alias:'member_registration',response_id:response.responseId,create_time:new Date(created).toISOString(),mapping_version:MAPPING_VERSION,request_id:'n8n-'+crypto.randomUUID(),payload,payload_hash:'sha256:'+crypto.createHash('sha256').update(canonical,'utf8').digest('hex'),operation:'member.create'};};\nif(!cursor||cursor.schema_version!=='xb.member.gateway.source_cursor.v1'||cursor.form_alias!=='member_registration'||cursor.mapping_version!==MAPPING_VERSION)throw new Error('source_cursor_invalid');const page=$json&&$json.body?$json.body:$json;if(!page||!Array.isArray(page.responses)||page.responses.length>MAX_PAGE)throw new Error('forms_page_invalid');const sorted=[...page.responses].sort((a,b)=>Date.parse(a.createTime)-Date.parse(b.createTime)||String(a.responseId).localeCompare(String(b.responseId)));if(JSON.stringify(sorted.map(x=>x.responseId))!==JSON.stringify(page.responses.map(x=>x.responseId)))throw new Error('forms_page_unsorted');const next=page.nextPageToken??null;if(next!==null&&(typeof next!=='string'||!TOKEN.test(next)))throw new Error('forms_page_token_invalid');if(next!==null&&next===cursor.resume_page_token)throw new Error('forms_page_token_repeated');const events=sorted.map(mapResponse);const receipts=events.map(e=>({response_id:e.response_id,create_time:e.create_time,payload_hash:e.payload_hash}));const checkpoint={form_alias:'member_registration',mapping_version:MAPPING_VERSION,expected_state_version:cursor.state_version+events.length,current_page_token:cursor.resume_page_token,next_page_token:next,scan_lower_bound:cursor.scan_lower_bound,terminal:next===null,responses:receipts};return [{json:{source_event:events[0]||null,page_checkpoint:checkpoint}}];"
+        "jsCode": "const crypto = require('crypto');\nconst state = $('Prepare page request').last().json;\nconst config = $('Repository-safe source configuration').first().json;\nconst MAPPING_VERSION = 'member-intake.v1';\nconst QUESTION_MAPPING = Object.freeze({name:'QUESTION_ID_NAME_PLACEHOLDER',phone:'QUESTION_ID_PHONE_PLACEHOLDER',email:'QUESTION_ID_EMAIL_PLACEHOLDER',birthday_month:'QUESTION_ID_BIRTHDAY_MONTH_PLACEHOLDER',marketing_consent:'QUESTION_ID_MARKETING_CONSENT_PLACEHOLDER',pdpa_acknowledged:'QUESTION_ID_PDPA_ACKNOWLEDGED_PLACEHOLDER'});\nconst REQUIRED = Object.freeze(Object.keys(QUESTION_MAPPING));\nconst SAFE_ID = /^[A-Za-z0-9._:-]{1,200}$/;\nconst TOKEN = /^[ -~]{1,1024}$/;\n// Google createTime is forwarded verbatim: only 0/3/6/9 fractional digits in UTC 'Z' form.\nconst EXACT = /^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d{3}|\\.\\d{6}|\\.\\d{9})?Z$/;\nclass CustomerInvalid extends Error { constructor(code) { super(code); this.code = code; } }\nconst clean = v => { if (typeof v !== 'string') throw new Error('text_value_required'); return v.normalize('NFC').replace(/\\r\\n?/g, '\\n').trim(); };\nconst spaces = v => clean(v).split(/\\s+/).filter(Boolean).join(' ');\nconst canonicalJson = value => JSON.stringify(Object.keys(value).sort().reduce((out, key) => (out[key] = value[key], out), {}));\nconst sha = text => 'sha256:' + crypto.createHash('sha256').update(text, 'utf8').digest('hex');\nconst answer = (answers, field) => { const id = QUESTION_MAPPING[field]; if (!SAFE_ID.test(id)) throw new Error('forms_question_mapping_invalid'); const entry = answers[id]; const values = entry && entry.textAnswers && entry.textAnswers.answers; if (!Array.isArray(values) || values.length !== 1 || !values[0] || typeof values[0].value !== 'string') throw new Error('forms_answer_value_invalid'); return values[0].value; };\nconst months = {january:'January',february:'February',march:'March',april:'April',may:'May',june:'June',july:'July',august:'August',september:'September',october:'October',november:'November',december:'December'};\n// Same field order and codes as the gateway canonicalizer.\nconst canonicalize = raw => {\n  const consent = spaces(raw.marketing_consent).toLowerCase();\n  if (!['yes', 'no'].includes(consent)) throw new CustomerInvalid('marketing_consent_must_be_yes_or_no');\n  const name = spaces(raw.name);\n  if (!name || name.length > 200) throw new CustomerInvalid('name_invalid');\n  const rawPhone = clean(raw.phone);\n  if (!rawPhone) throw new CustomerInvalid('phone_required');\n  if (/[^0-9 ()+.\\-]/.test(rawPhone)) throw new CustomerInvalid('phone_contains_letters_or_unsupported_characters');\n  if (!/^\\+?[0-9 ().\\-]*$/.test(rawPhone)) throw new CustomerInvalid('phone_shape_invalid');\n  const phone = rawPhone.replace(/[^0-9]/g, '');\n  if (!/^[0-9]{6,15}$/.test(phone)) throw new CustomerInvalid('phone_shape_invalid');\n  const email = spaces(raw.email).toLowerCase();\n  if (!email || email.length > 254 || !/^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$/.test(email)) throw new CustomerInvalid('email_invalid');\n  const monthName = spaces(raw.birthday_month).toLowerCase();\n  if (!months[monthName]) throw new CustomerInvalid('birthday_month_invalid');\n  return {name, phone, email, birthday_month: months[monthName], marketing_consent: consent === 'yes' ? 'Yes' : 'No', pdpa_acknowledged: ['yes', 'i agree'].includes(spaces(raw.pdpa_acknowledged).toLowerCase())};\n};\nconst http = $json;\nif (!http || typeof http !== 'object') throw new Error('forms_api_response_invalid');\nif (http.statusCode !== 200) {\n  const error = http.body && http.body.error;\n  const message = error && typeof error.message === 'string' ? error.message : '';\n  // Only a positively classified unusable page token may restart the epoch.\n  if (http.statusCode === 400 && state.request_page_token !== null && error && error.status === 'INVALID_ARGUMENT' && /page ?token/i.test(message)) return [{json: {kind: 'token_invalidated', state}}];\n  throw new Error('forms_api_request_failed');\n}\nconst page = http.body;\nif (!page || typeof page !== 'object' || Array.isArray(page)) throw new Error('forms_page_invalid');\nconst responses = page.responses === undefined ? [] : page.responses;\nif (!Array.isArray(responses) || responses.length > 1) throw new Error('forms_page_invalid');\nconst next = page.nextPageToken === undefined || page.nextPageToken === '' ? null : page.nextPageToken;\nif (next !== null && (typeof next !== 'string' || !TOKEN.test(next))) throw new Error('forms_page_token_invalid');\nif (next !== null && next === state.request_page_token) throw new Error('forms_page_token_repeated');\nconst items = [];\nlet action = null;\nfor (const response of responses) {\n  if (!response || typeof response !== 'object' || Array.isArray(response)) throw new Error('forms_response_invalid');\n  if (typeof response.responseId !== 'string' || !SAFE_ID.test(response.responseId)) throw new Error('forms_response_id_invalid');\n  if (typeof response.createTime !== 'string' || !EXACT.test(response.createTime)) throw new Error('forms_create_time_invalid');\n  const answers = response.answers;\n  if (!answers || typeof answers !== 'object' || Array.isArray(answers)) throw new Error('forms_answers_invalid');\n  const allowed = new Set(Object.values(QUESTION_MAPPING));\n  if (Object.keys(answers).some(id => !allowed.has(id))) throw new Error('forms_question_mapping_unknown');\n  const raw = {};\n  for (const field of REQUIRED) raw[field] = answer(answers, field);\n  const common = {source_system: 'google_forms', form_alias: config.form_alias, response_id: response.responseId, create_time: response.createTime, mapping_version: MAPPING_VERSION, request_id: 'n8n-' + crypto.randomUUID(), operation: 'member.create'};\n  try {\n    const payload = canonicalize(raw);\n    const event = {schema_version: 'xb.member.source_event.v1', ...common, payload, payload_hash: sha(canonicalJson(payload))};\n    action = {kind: 'member', body: event};\n    items.push({response_id: event.response_id, create_time: event.create_time, payload_hash: event.payload_hash});\n  } catch (error) {\n    if (!(error instanceof CustomerInvalid)) throw error;\n    // PII-free: only the fingerprint of the mapped raw answers and the code.\n    const rejection = {schema_version: 'xb.member.source_rejection.v1', ...common, payload_hash: sha(canonicalJson(raw)), error_code: error.code};\n    action = {kind: 'rejection', body: rejection};\n    items.push({response_id: rejection.response_id, create_time: rejection.create_time, payload_hash: rejection.payload_hash});\n  }\n}\nreturn [{json: {kind: 'page', state, open: {expected_epoch_state_version: state.expected_epoch_state_version, request_page_token: state.request_page_token, next_page_token: next, terminal: next === null, items}, action}}];"
       },
-      "id": "b7777777-7777-4777-8777-777777777777",
+      "id": "c0000013-0000-4000-8000-000000000013",
       "name": "Canonicalize source page",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [-32, 32],
+      "position": [
+        200,
+        80
+      ],
       "notesInFlow": true,
-      "notes": "Closed question mapping, sorted (create_time,response_id), inclusive watermark, and exactly one newly admitted response."
+      "notes": "Closed question mapping. createTime is forwarded verbatim; there is no sorting, ordering assertion or Date re-serialisation."
     },
     {
       "parameters": {
         "conditions": {
-          "options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 2},
-          "conditions": [{"id": "b7000000-0000-4700-8700-000000000001", "leftValue": "={{ $json.source_event !== null }}", "rightValue": true, "operator": {"type": "boolean", "operation": "equals"}}],
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c0000914-0000-4000-8000-000000000914",
+              "leftValue": "={{ $json.kind === 'token_invalidated' }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
           "combinator": "and"
         },
         "options": {}
       },
-      "id": "b7000000-0000-4700-8700-000000000002",
-      "name": "Eligible source response present",
+      "id": "c0000014-0000-4000-8000-000000000014",
+      "name": "Page token invalidated",
       "type": "n8n-nodes-base.if",
       "typeVersion": 2.2,
-      "position": [192, 32]
+      "position": [
+        400,
+        80
+      ]
     },
     {
       "parameters": {
         "method": "POST",
-        "url": "={{ $('Repository-safe source configuration').first().json.gateway_ingest_url }}",
+        "url": "={{ $('Repository-safe source configuration').first().json.gateway_origin + '/v1/source/epochs/' + $json.state.epoch_id + '/restart' }}",
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ $('Canonicalize source page').first().json.source_event }}",
-        "options": {"response": {"response": {"responseFormat": "json"}}, "timeout": 30000}
+        "jsonBody": "={{ ({ expected_epoch_state_version: $json.state.expected_epoch_state_version, restart_reason: 'token_invalidated' }) }}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          },
+          "timeout": 30000
+        }
       },
-      "id": "b8888888-8888-4888-8888-888888888888",
+      "id": "c0000015-0000-4000-8000-000000000015",
+      "name": "Restart invalidated scan epoch",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        600,
+        -120
+      ],
+      "notesInFlow": true,
+      "notes": "Only a positively classified unusable page token restarts. No automatic retry."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Repository-safe source configuration').first().json.gateway_origin + '/v1/source/epochs/' + $json.state.epoch_id + '/pages/open' }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $json.open }}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          },
+          "timeout": 30000
+        }
+      },
+      "id": "c0000016-0000-4000-8000-000000000016",
+      "name": "Open page durably",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        600,
+        160
+      ],
+      "notesInFlow": true,
+      "notes": "OPEN persists the request/next token and item identities before the epoch token can move. No automatic retry."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c0000917-0000-4000-8000-000000000917",
+              "leftValue": "={{ $('Canonicalize source page').last().json.action !== null && $('Canonicalize source page').last().json.action.kind === 'member' }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "c0000017-0000-4000-8000-000000000017",
+      "name": "Page item is a valid member",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        800,
+        160
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Repository-safe source configuration').first().json.gateway_origin + '/v1/source-events' }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $('Canonicalize source page').last().json.action.body }}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          },
+          "timeout": 30000
+        }
+      },
+      "id": "c0000018-0000-4000-8000-000000000018",
       "name": "Protected XB Gateway ingest (configured outside repo)",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
-      "position": [416, -48],
+      "position": [
+        1000,
+        0
+      ],
       "retryOnFail": true,
       "maxTries": 2,
       "waitBetweenTries": 2000,
       "notesInFlow": true,
-      "notes": "Sequential source admission. A failed admission prevents the page checkpoint."
+      "notes": "Receipt-driven admission. A matching prior receipt replays; any conflict stops before commit."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c0000919-0000-4000-8000-000000000919",
+              "leftValue": "={{ $('Canonicalize source page').last().json.action !== null && $('Canonicalize source page').last().json.action.kind === 'rejection' }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "c0000019-0000-4000-8000-000000000019",
+      "name": "Page item is a customer rejection",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1000,
+        280
+      ]
     },
     {
       "parameters": {
         "method": "POST",
-        "url": "={{ $('Repository-safe source configuration').first().json.page_checkpoint_url }}",
+        "url": "={{ $('Repository-safe source configuration').first().json.gateway_origin + '/v1/source-rejections' }}",
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ ({ ...$('Canonicalize source page').first().json.page_checkpoint, expected_state_version: $('Canonicalize source page').first().json.source_event === null ? $('Read durable source cursor').first().json.state_version : ($json.replayed ? $('Read durable source cursor').first().json.state_version : $('Read durable source cursor').first().json.state_version + 1) }) }}",
-        "options": {"response": {"response": {"responseFormat": "json"}}, "timeout": 30000}
+        "jsonBody": "={{ $('Canonicalize source page').last().json.action.body }}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          },
+          "timeout": 30000
+        }
       },
-      "id": "b9000000-0000-4900-8900-000000000001",
+      "id": "c0000020-0000-4000-8000-000000000020",
+      "name": "Record PII-free source rejection",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1200,
+        200
+      ],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 2000,
+      "notesInFlow": true,
+      "notes": "Carries only the fingerprint and a customer-validation code. Does not consume the first_member allowance."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Repository-safe source configuration').first().json.gateway_origin + '/v1/source/pages/' + $('Open page durably').last().json.page_id + '/commit' }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ ({ expected_epoch_state_version: $('Open page durably').last().json.epoch_state_version }) }}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          },
+          "timeout": 30000
+        }
+      },
+      "id": "c0000021-0000-4000-8000-000000000021",
       "name": "Commit durable page checkpoint",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
-      "position": [656, 32],
+      "position": [
+        1400,
+        160
+      ],
       "notesInFlow": true,
-      "notes": "CAS checkpoint runs only after every eligible response on this one-response page is durably admitted with the identical hash."
+      "notes": "CAS commit succeeds only when every page item has a matching durable receipt. No automatic retry."
     },
     {
-      "parameters": {"jsCode": "return [{json:{status:'blocked_by_default_activation_gate',activation_enabled:false,source_system:'google_forms',operation:'member.create'}}];"},
-      "id": "b9999999-9999-4999-8999-999999999999",
-      "name": "Blocked until separate activation",
+      "parameters": {
+        "jsCode": "const canonical = $('Canonicalize source page').last().json;\nconst state = canonical.state;\nconst commit = $json;\nif (!commit || commit.page_state !== 'COMMITTED' || commit.epoch_id !== state.epoch_id || !Number.isInteger(commit.epoch_state_version)) throw new Error('source_page_commit_invalid');\nconst fetched = state.pages_fetched + 1;\nconst base = {...state, pages_fetched: fetched, expected_epoch_state_version: commit.epoch_state_version, request_page_token: commit.current_page_token};\nif (commit.epoch_status === 'COMPLETED') return [{json: {...base, continue_paging: false, stop_reason: 'epoch_completed'}}];\nif (state.admission_mode === 'first_member' && canonical.action && canonical.action.kind === 'member') return [{json: {...base, continue_paging: false, stop_reason: 'first_member_page_committed'}}];\nif (fetched >= state.max_pages) return [{json: {...base, continue_paging: false, stop_reason: 'page_budget_reached'}}];\nreturn [{json: {...base, continue_paging: true}}];"
+      },
+      "id": "c0000022-0000-4000-8000-000000000022",
+      "name": "Plan next page",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [-480, 288],
+      "position": [
+        1600,
+        160
+      ],
       "notesInFlow": true,
-      "notes": "Safe false branch emits synthetic metadata and performs no network operation."
+      "notes": "Stops on a completed epoch, a committed first_member member page, or the per-run page budget."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c0000923-0000-4000-8000-000000000923",
+              "leftValue": "={{ $json.continue_paging === true }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "c0000023-0000-4000-8000-000000000023",
+      "name": "Continue bounded paging",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1800,
+        160
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const state = $json;\nreturn [{json: {status: 'source_run_finished', stop_reason: state.stop_reason || null, pages_fetched: state.pages_fetched || 0, source_system: 'google_forms', operation: 'member.create'}}];"
+      },
+      "id": "c0000024-0000-4000-8000-000000000024",
+      "name": "Source run finished",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2000,
+        280
+      ],
+      "notesInFlow": true,
+      "notes": "No network operation."
     }
   ],
   "connections": {
-    "Manual source adapter preview": {"main": [[{"node": "Repository-safe source configuration", "type": "main", "index": 0}]]},
-    "Repository-safe source configuration": {"main": [[{"node": "Controlled activation gate", "type": "main", "index": 0}]]},
-    "Controlled activation gate": {"main": [[{"node": "Read durable source cursor", "type": "main", "index": 0}], [{"node": "Blocked until separate activation", "type": "main", "index": 0}]]},
-    "Read durable source cursor": {"main": [[{"node": "Google Forms single page (configured outside repo)", "type": "main", "index": 0}]]},
-    "Google Forms single page (configured outside repo)": {"main": [[{"node": "Canonicalize source page", "type": "main", "index": 0}]]},
-    "Canonicalize source page": {"main": [[{"node": "Eligible source response present", "type": "main", "index": 0}]]},
-    "Eligible source response present": {"main": [[{"node": "Protected XB Gateway ingest (configured outside repo)", "type": "main", "index": 0}], [{"node": "Commit durable page checkpoint", "type": "main", "index": 0}]]},
-    "Protected XB Gateway ingest (configured outside repo)": {"main": [[{"node": "Commit durable page checkpoint", "type": "main", "index": 0}]]}
+    "Manual source adapter preview": {
+      "main": [
+        [
+          {
+            "node": "Repository-safe source configuration",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Repository-safe source configuration": {
+      "main": [
+        [
+          {
+            "node": "Controlled activation gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Controlled activation gate": {
+      "main": [
+        [
+          {
+            "node": "Begin or resume scan epoch",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Blocked until separate activation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Begin or resume scan epoch": {
+      "main": [
+        [
+          {
+            "node": "Plan epoch attempt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Plan epoch attempt": {
+      "main": [
+        [
+          {
+            "node": "Crashed page requires epoch restart",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Crashed page requires epoch restart": {
+      "main": [
+        [
+          {
+            "node": "Restart crashed scan epoch",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Epoch may fetch a page",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Restart crashed scan epoch": {
+      "main": [
+        [
+          {
+            "node": "Plan epoch attempt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Epoch may fetch a page": {
+      "main": [
+        [
+          {
+            "node": "Prepare page request",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Stopped without source progress",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare page request": {
+      "main": [
+        [
+          {
+            "node": "Google Forms single page (configured outside repo)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google Forms single page (configured outside repo)": {
+      "main": [
+        [
+          {
+            "node": "Canonicalize source page",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Canonicalize source page": {
+      "main": [
+        [
+          {
+            "node": "Page token invalidated",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Page token invalidated": {
+      "main": [
+        [
+          {
+            "node": "Restart invalidated scan epoch",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Open page durably",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Restart invalidated scan epoch": {
+      "main": [
+        [
+          {
+            "node": "Plan epoch attempt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Open page durably": {
+      "main": [
+        [
+          {
+            "node": "Page item is a valid member",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Page item is a valid member": {
+      "main": [
+        [
+          {
+            "node": "Protected XB Gateway ingest (configured outside repo)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Page item is a customer rejection",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Protected XB Gateway ingest (configured outside repo)": {
+      "main": [
+        [
+          {
+            "node": "Commit durable page checkpoint",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Page item is a customer rejection": {
+      "main": [
+        [
+          {
+            "node": "Record PII-free source rejection",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Commit durable page checkpoint",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record PII-free source rejection": {
+      "main": [
+        [
+          {
+            "node": "Commit durable page checkpoint",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Commit durable page checkpoint": {
+      "main": [
+        [
+          {
+            "node": "Plan next page",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Plan next page": {
+      "main": [
+        [
+          {
+            "node": "Continue bounded paging",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Continue bounded paging": {
+      "main": [
+        [
+          {
+            "node": "Prepare page request",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Source run finished",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
   },
-  "settings": {"executionOrder": "v1", "saveManualExecutions": false, "saveDataErrorExecution": "none", "saveDataSuccessExecution": "none", "availableInMCP": false},
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": false,
+    "saveDataErrorExecution": "none",
+    "saveDataSuccessExecution": "none",
+    "availableInMCP": false
+  },
   "staticData": null
 }

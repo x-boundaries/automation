@@ -1,0 +1,66 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/schemas/member_gateway_source_rejection.v1.schema.json",
+  "title": "XB member source rejection v1",
+  "description": "PII-free customer-validation rejection posted by the Forms source. It carries no customer field; payload_hash fingerprints the mapped raw answers. Mapping, identity, timestamp, token, schema and OAuth failures are never rejections.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "source_system",
+    "form_alias",
+    "response_id",
+    "create_time",
+    "mapping_version",
+    "request_id",
+    "payload_hash",
+    "error_code",
+    "operation"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "xb.member.source_rejection.v1"
+    },
+    "source_system": {
+      "const": "google_forms"
+    },
+    "form_alias": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._:-]{1,100}$"
+    },
+    "response_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._:-]{1,200}$"
+    },
+    "create_time": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{3}|\\.[0-9]{6}|\\.[0-9]{9})?Z$"
+    },
+    "mapping_version": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._:-]{1,100}$"
+    },
+    "request_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._:-]{1,200}$"
+    },
+    "payload_hash": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "error_code": {
+      "enum": [
+        "name_invalid",
+        "email_invalid",
+        "phone_required",
+        "phone_contains_letters_or_unsupported_characters",
+        "phone_shape_invalid",
+        "birthday_month_invalid",
+        "marketing_consent_must_be_yes_or_no"
+      ]
+    },
+    "operation": {
+      "const": "member.create"
+    }
+  }
+}

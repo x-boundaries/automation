@@ -1,0 +1,116 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/schemas/member_gateway_welcome_email_job.v1.schema.json",
+  "title": "XB member welcome email job v1",
+  "description": "Private mailer claim envelope. The gateway constructs the immutable welcome_v1 message; the mailer sends it verbatim with Send Email retry disabled. message.to is private and never public evidence.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "outbox_id",
+    "job_id",
+    "source_response_ref",
+    "operation",
+    "template_id",
+    "message_hash",
+    "state",
+    "state_version",
+    "attempt",
+    "max_attempts",
+    "lease_id",
+    "lease_expires_at",
+    "message"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "xb.member.welcome_email.job.v1"
+    },
+    "outbox_id": {
+      "type": "string",
+      "pattern": "^welcome-[0-9a-f]{32}$"
+    },
+    "job_id": {
+      "type": "string",
+      "pattern": "^job-[0-9a-f]{32}$"
+    },
+    "source_response_ref": {
+      "type": "string",
+      "pattern": "^hmac-v1:[0-9a-f]{64}$"
+    },
+    "operation": {
+      "const": "welcome_email.send"
+    },
+    "template_id": {
+      "const": "welcome_v1"
+    },
+    "message_hash": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "state": {
+      "const": "LEASED"
+    },
+    "state_version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "attempt": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 3
+    },
+    "max_attempts": {
+      "const": 3
+    },
+    "lease_id": {
+      "type": "string",
+      "pattern": "^lease-[0-9a-f]{32}$"
+    },
+    "lease_expires_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "message": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "template_id",
+        "from_name",
+        "from_address",
+        "reply_to",
+        "subject",
+        "text",
+        "content_type",
+        "to"
+      ],
+      "properties": {
+        "template_id": {
+          "const": "welcome_v1"
+        },
+        "from_name": {
+          "const": "X-Boundaries"
+        },
+        "from_address": {
+          "const": "noreply@x-boundaries.com"
+        },
+        "reply_to": {
+          "type": "null"
+        },
+        "subject": {
+          "const": "Welcome to X-Boundaries!"
+        },
+        "text": {
+          "const": "Welcome to X-Boundaries!"
+        },
+        "content_type": {
+          "const": "text/plain; charset=UTF-8"
+        },
+        "to": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 254
+        }
+      }
+    }
+  }
+}

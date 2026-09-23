@@ -13,7 +13,7 @@ from xb_member_gateway.config import ConfigError, GatewayConfig
 TOKENS = {
     "source": "synthetic-source-secret", "operator": "synthetic-operator-secret",
     "control": "synthetic-control-secret", "worker": "synthetic-worker-secret",
-    "recovery": "synthetic-recovery-secret",
+    "recovery": "synthetic-recovery-secret", "mailer": "synthetic-mailer-secret",
 }
 ENVS = {name: f"TEST_XB_MEMBER_GATEWAY_{name.upper()}_TOKEN" for name in TOKENS}
 WORKER_TOKEN = TOKENS["worker"]
@@ -52,6 +52,7 @@ class BearerAuthenticatorTests(unittest.TestCase):
             source = authenticator.authenticate({"Authorization": f"Bearer {TOKENS['source']}"})
             operator = authenticator.authenticate({"Authorization": f"Bearer {TOKENS['operator']}"})
             control = authenticator.authenticate({"Authorization": f"Bearer {TOKENS['control']}"})
+            mailer = authenticator.authenticate({"Authorization": f"Bearer {TOKENS['mailer']}"})
 
         self.assertEqual(worker.subject, "configured-worker")
         self.assertIn("worker.claim", worker.scopes)
@@ -66,6 +67,35 @@ class BearerAuthenticatorTests(unittest.TestCase):
         self.assertEqual(source.scopes, frozenset({"source.ingest"}))
         self.assertEqual(operator.scopes, frozenset({"operator.status.read", "operator.reconciliation.read"}))
         self.assertEqual(control.scopes, frozenset({"control.kill_switch", "control.activate"}))
+        self.assertEqual(mailer.subject, "configured-mailer")
+        self.assertEqual(
+            mailer.scopes,
+            frozenset({"welcome_email.claim", "welcome_email.send_intent", "welcome_email.result"}),
+        )
+        welcome = {"welcome_email.claim", "welcome_email.send_intent", "welcome_email.result"}
+        for other in (worker, recovery, source, operator, control):
+            self.assertTrue(welcome.isdisjoint(other.scopes), other.subject)
+        for forbidden in (
+            "worker.claim", "worker.allocation", "worker.write_intent", "worker.dispatch",
+            "worker.result", "worker.reconcile", "job.read", "source.ingest",
+            "control.kill_switch", "control.activate", "operator.status.read",
+            "operator.reconciliation.read", "worker.writer_termination_recovery",
+        ):
+            self.assertFalse(mailer.allows(forbidden), forbidden)
+
+    def test_sixth_mailer_principal_is_required_and_distinct(self):
+        config = valid_config()
+        runtime = {ENVS[name]: token for name, token in TOKENS.items() if name != "mailer"}
+        with patch.dict(os.environ, runtime, clear=True):
+            with self.assertRaisesRegex(AuthenticationError, "authentication_binding_missing"):
+                BearerTokenAuthenticator.from_environment(config, strict=True)
+        aliased = {ENVS[name]: token for name, token in TOKENS.items()}
+        aliased[ENVS["mailer"]] = TOKENS["source"]
+        with self.assertRaisesRegex(AuthenticationError, "authentication_binding_aliased"):
+            BearerTokenAuthenticator.from_environment(config, aliased, strict=True)
+        self.assertIn("mailer_credential_digest_required", valid_config(mailer_token_sha256=None).readiness_reasons())
+        with self.assertRaisesRegex(ConfigError, "credential_environment_bindings_must_differ"):
+            valid_config(mailer_token_env=ENVS["source"])
 
     def test_missing_recovery_runtime_credential_fails_closed(self):
         config = valid_config()

@@ -17,6 +17,8 @@
     "pdpa_acknowledged": null
   },
   "source_cutover_watermark": null,
+  "source_production_cutover_exact": null,
+  "source_admission_mode": "first_member",
   "initial_source_window_max": 1,
   "member_no_max_length": 20,
   "lease_seconds": 600,
@@ -30,6 +32,7 @@
   "control_token_sha256": null,
   "worker_token_sha256": null,
   "recovery_token_sha256": null,
+  "mailer_token_sha256": null,
   "postgres_dsn_env": "XB_MEMBER_GATEWAY_DATABASE_URL",
   "bind_address_env": "XB_MEMBER_GATEWAY_BIND_ADDRESS",
   "bind_port_env": "XB_MEMBER_GATEWAY_BIND_PORT",
@@ -38,5 +41,6 @@
   "operator_token_env": "XB_MEMBER_GATEWAY_OPERATOR_TOKEN",
   "control_token_env": "XB_MEMBER_GATEWAY_CONTROL_TOKEN",
   "worker_token_env": "XB_MEMBER_GATEWAY_WORKER_TOKEN",
-  "recovery_token_env": "XB_MEMBER_GATEWAY_RECOVERY_TOKEN"
+  "recovery_token_env": "XB_MEMBER_GATEWAY_RECOVERY_TOKEN",
+  "mailer_token_env": "XB_MEMBER_GATEWAY_MAILER_TOKEN"
 }

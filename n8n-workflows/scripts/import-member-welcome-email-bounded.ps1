@@ -1,11 +1,16 @@
+# Bounded, fail-closed importer for the inactive welcome_v1 mailer export.
+# Derived from import-member-forms-gateway-bounded.ps1: identical custody, ACL,
+# canonical JSON, plan/apply identity, dispatch-ownership and receipt
+# machinery; the binding contract is one mailer bearer role and one SMTP role.
+# It never calls the gateway (a claim would consume a lease) and never sends mail.
 [CmdletBinding()]
 param(
     [ValidateSet("CapturePlan", "Apply", "Inspect")]
     [string]$Mode = "CapturePlan",
     [string]$RepoRoot = "",
     [string]$OperationId = "",
-    [string]$BindingManifestFile = "config/member_forms_gateway_bounded_import.v2.template.json",
-    [string]$OperationsRoot = ".n8n-local/member-gateway-bounded-import/operations",
+    [string]$BindingManifestFile = "config/member_welcome_email_bounded_import.v1.template.json",
+    [string]$OperationsRoot = ".n8n-local/member-welcome-email-bounded-import/operations",
     [string]$N8nExecutable = "n8n",
     [string]$DockerExecutable = "docker",
     [string]$N8nContainer = "",
@@ -379,117 +384,60 @@ function Test-BoundedSameOrigin {
 
 function Assert-BoundedManifestEndpointRelationships {
     param([Parameter(Mandatory)]$Manifest)
-    $source = Get-BoundedHttpsUri ([string]$Manifest.endpoints.source_cursor) "binding_endpoint_relationship_invalid"
-    $forms = Get-BoundedHttpsUri ([string]$Manifest.endpoints.forms_responses) "binding_forms_origin_invalid"
-    foreach ($uri in @($source, $forms)) {
-        if (-not [string]::IsNullOrEmpty($uri.Query)) { Stop-Bounded "binding_endpoint_query_invalid" }
-        if ([string]::IsNullOrWhiteSpace($uri.AbsolutePath) -or $uri.AbsolutePath -eq "/") { Stop-Bounded "binding_endpoint_relationship_invalid" }
-    }
     $approvedGatewayOrigin = Get-BoundedCanonicalOrigin ([string]$Manifest.security.approved_gateway_origin) "binding_gateway_origin_invalid"
     $gatewayOrigin = Get-BoundedCanonicalOrigin ([string]$Manifest.endpoints.gateway_origin) "binding_gateway_origin_invalid"
-    $approvedFormsOrigin = Get-BoundedCanonicalOrigin "https://forms.googleapis.com:443" "binding_forms_origin_invalid"
-    # Every gateway call in the export is the reviewed origin plus a fixed
-    # route, so the origin itself must be exactly the approved origin.
+    # Every mailer call in the export is the reviewed origin plus a fixed
+    # /v1/welcome-emails route, so the origin must be exactly the approved one.
     if ([string]$Manifest.endpoints.gateway_origin -cne [string]$Manifest.security.approved_gateway_origin) { Stop-Bounded "binding_gateway_origin_invalid" }
     Assert-BoundedOriginMatches $gatewayOrigin $approvedGatewayOrigin "binding_gateway_origin_invalid"
-    Assert-BoundedOriginMatches $source $approvedGatewayOrigin "binding_gateway_origin_invalid"
-    Assert-BoundedOriginMatches $forms $approvedFormsOrigin "binding_forms_origin_invalid"
-    if ([string]$Manifest.endpoints.source_cursor -cne ([string]$Manifest.endpoints.gateway_origin + "/v1/source/cursor")) {
-        Stop-Bounded "binding_endpoint_relationship_invalid"
-    }
-    $expectedFormsPath = "/v1/forms/" + [string]$Manifest.form.id + "/responses"
-    if ($forms.AbsolutePath -cne $expectedFormsPath -or
-        ([string]$Manifest.endpoints.forms_responses).Equals("https://forms.googleapis.com:443" + $expectedFormsPath, [StringComparison]::Ordinal) -eq $false) {
-        Stop-Bounded "binding_form_endpoint_mismatch"
-    }
 }
 
 function Assert-BoundedManifest {
     param([Parameter(Mandatory)]$Manifest)
     Assert-BoundedExactProperties $Manifest @(
-        "schema_version", "source_system", "form_alias", "mapping_version",
-        "project", "workflow", "endpoints", "form", "question_mapping",
-        "credential_roles", "cursor_expectation", "security"
+        "schema_version", "project", "workflow", "endpoints", "credential_roles", "security"
     ) "binding_shape_invalid"
-    if ([string]$Manifest.schema_version -cne "xb.member.gateway.bounded_import.binding.v2") { Stop-Bounded "binding_schema_invalid" }
-    if ([string]$Manifest.source_system -cne "google_forms" -or [string]$Manifest.form_alias -cne "member_registration" -or [string]$Manifest.mapping_version -cne "member-intake.v1") {
-        Stop-Bounded "binding_identity_invalid"
-    }
+    if ([string]$Manifest.schema_version -cne "xb.member.welcome_email.bounded_import.binding.v1") { Stop-Bounded "binding_schema_invalid" }
 
     Assert-BoundedExactProperties $Manifest.project @("id", "name") "binding_project_shape_invalid"
     Assert-BoundedExactProperties $Manifest.workflow @("id", "name") "binding_workflow_shape_invalid"
     foreach ($value in @([string]$Manifest.project.id, [string]$Manifest.workflow.id)) {
         Assert-BoundedSafeIdentity $value "binding_identity_invalid" -AllowPlaceholder
     }
-    if ([string]$Manifest.workflow.name -cne "Member Gateway - Google Forms durable source adapter (inactive)") { Stop-Bounded "binding_workflow_name_invalid" }
+    if ([string]$Manifest.workflow.name -cne "Member Gateway - welcome email outbox mailer (inactive)") { Stop-Bounded "binding_workflow_name_invalid" }
 
-    Assert-BoundedExactProperties $Manifest.endpoints @("source_cursor", "forms_responses", "gateway_origin") "binding_endpoint_shape_invalid"
-    foreach ($property in @("source_cursor", "forms_responses", "gateway_origin")) {
-        $url = [string]$Manifest.endpoints.$property
-        if ($url -notmatch '^https://[A-Za-z0-9._:/{}?=&%+\-]+$') { Stop-Bounded "binding_endpoint_invalid" }
-    }
+    Assert-BoundedExactProperties $Manifest.endpoints @("gateway_origin") "binding_endpoint_shape_invalid"
+    if ([string]$Manifest.endpoints.gateway_origin -notmatch '^https://[A-Za-z0-9._:\-]+$') { Stop-Bounded "binding_endpoint_invalid" }
 
-    Assert-BoundedExactProperties $Manifest.form @("id") "binding_form_shape_invalid"
-    Assert-BoundedSafeIdentity ([string]$Manifest.form.id) "binding_form_invalid" -AllowPlaceholder
-    $questionNames = @("name", "phone", "email", "birthday_month", "marketing_consent", "pdpa_acknowledged")
-    Assert-BoundedExactProperties $Manifest.question_mapping $questionNames "binding_question_shape_invalid"
-    foreach ($property in $questionNames) {
-        Assert-BoundedSafeIdentity ([string]$Manifest.question_mapping.$property) "binding_question_invalid" -AllowPlaceholder
-    }
-
-    Assert-BoundedExactProperties $Manifest.credential_roles @("google_forms_oauth", "gateway_bearer") "binding_credentials_shape_invalid"
-    foreach ($roleName in @("google_forms_oauth", "gateway_bearer")) {
+    Assert-BoundedExactProperties $Manifest.credential_roles @("gateway_mailer_bearer", "smtp") "binding_credentials_shape_invalid"
+    foreach ($roleName in @("gateway_mailer_bearer", "smtp")) {
         $role = $Manifest.credential_roles.$roleName
         Assert-BoundedExactProperties $role @("credential_id", "credential_name", "credential_type", "node_names") "binding_credential_role_shape_invalid"
         Assert-BoundedSafeIdentity ([string]$role.credential_id) "binding_credential_invalid" -AllowPlaceholder
         Assert-BoundedSafeIdentity ([string]$role.credential_name) "binding_credential_invalid" -AllowPlaceholder
         Assert-BoundedSafeIdentity ([string]$role.credential_type) "binding_credential_invalid"
-        $expectedCredentialType = if ($roleName -eq "google_forms_oauth") { "googleOAuth2Api" } else { "httpBearerAuth" }
+        $expectedCredentialType = if ($roleName -eq "smtp") { "smtp" } else { "httpBearerAuth" }
         if ([string]$role.credential_type -cne $expectedCredentialType) { Stop-Bounded "binding_credential_type_invalid" }
         if (@($role.node_names).Count -lt 1) { Stop-Bounded "binding_credential_nodes_invalid" }
         foreach ($nodeName in @($role.node_names)) {
             if ([string]::IsNullOrWhiteSpace([string]$nodeName)) { Stop-Bounded "binding_credential_nodes_invalid" }
         }
     }
-    if (@($Manifest.credential_roles.google_forms_oauth.node_names).Count -ne 1 -or [string]$Manifest.credential_roles.google_forms_oauth.node_names[0] -cne "Google Forms single page (configured outside repo)") {
+    if (@($Manifest.credential_roles.smtp.node_names).Count -ne 1 -or [string]$Manifest.credential_roles.smtp.node_names[0] -cne "Send welcome email (SMTP configured outside repo)") {
         Stop-Bounded "binding_credential_nodes_invalid"
     }
-    $gatewayNodes = @($Manifest.credential_roles.gateway_bearer.node_names)
-    $expectedGatewayNodes = @("Begin or resume scan epoch", "Restart crashed scan epoch", "Restart invalidated scan epoch", "Open page durably", "Protected XB Gateway ingest (configured outside repo)", "Record PII-free source rejection", "Commit durable page checkpoint")
-    if ($gatewayNodes.Count -ne $expectedGatewayNodes.Count) { Stop-Bounded "binding_credential_nodes_invalid" }
-    for ($index = 0; $index -lt $expectedGatewayNodes.Count; $index++) {
-        if ([string]$gatewayNodes[$index] -cne [string]$expectedGatewayNodes[$index]) { Stop-Bounded "binding_credential_nodes_invalid" }
+    $mailerNodes = @($Manifest.credential_roles.gateway_mailer_bearer.node_names)
+    $expectedMailerNodes = @("Claim one welcome email", "Record welcome send intent", "Record SMTP acceptance", "Record uncertain delivery outcome")
+    if ($mailerNodes.Count -ne $expectedMailerNodes.Count) { Stop-Bounded "binding_credential_nodes_invalid" }
+    for ($index = 0; $index -lt $expectedMailerNodes.Count; $index++) {
+        if ([string]$mailerNodes[$index] -cne [string]$expectedMailerNodes[$index]) { Stop-Bounded "binding_credential_nodes_invalid" }
     }
 
-    Assert-BoundedExactProperties $Manifest.cursor_expectation @("production_cutover_exact", "production_cutover_digest", "admission_mode") "binding_cursor_shape_invalid"
-    $cutover = [string]$Manifest.cursor_expectation.production_cutover_exact
-    $cutoverDigest = [string]$Manifest.cursor_expectation.production_cutover_digest
-    if (-not (Test-BoundedPlaceholder $cutover) -and -not (Test-BoundedExactCreateTime $cutover)) { Stop-Bounded "binding_production_cutover_invalid" }
-    if (-not (Test-BoundedPlaceholder $cutoverDigest) -and $cutoverDigest -notmatch '^[0-9a-f]{64}$') { Stop-Bounded "binding_production_cutover_digest_invalid" }
-    if ([string]$Manifest.cursor_expectation.admission_mode -cnotin @("first_member", "continuous")) { Stop-Bounded "binding_admission_mode_invalid" }
-
-    Assert-BoundedExactProperties $Manifest.security @("approved_gateway_origin", "source_token_env", "n8n_target_mode") "binding_security_shape_invalid"
+    Assert-BoundedExactProperties $Manifest.security @("approved_gateway_origin", "mailer_token_env", "n8n_target_mode") "binding_security_shape_invalid"
     Get-BoundedCanonicalOrigin ([string]$Manifest.security.approved_gateway_origin) "binding_security_invalid" | Out-Null
-    if ([string]$Manifest.security.source_token_env -notmatch '^[A-Z][A-Z0-9_]{2,80}$') { Stop-Bounded "binding_security_invalid" }
+    if ([string]$Manifest.security.mailer_token_env -cne "XB_MEMBER_GATEWAY_MAILER_TOKEN") { Stop-Bounded "binding_security_invalid" }
     if ([string]$Manifest.security.n8n_target_mode -cne "explicit-reviewed-target") { Stop-Bounded "binding_security_invalid" }
     Assert-BoundedManifestEndpointRelationships $Manifest
-}
-
-function Test-BoundedExactCreateTime {
-    # Verbatim Google createTime form: UTC 'Z' with 0, 3, 6 or 9 fractional
-    # digits. Validated as text only; never reparsed or reformatted.
-    param([AllowEmptyString()][string]$Value)
-    return $Value -cmatch '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]{3}|\.[0-9]{6}|\.[0-9]{9})?Z$'
-}
-
-function Get-BoundedProductionCutoverDigest {
-    param(
-        [Parameter(Mandatory)][string]$SourceSystem,
-        [Parameter(Mandatory)][string]$FormAlias,
-        [Parameter(Mandatory)][string]$MappingVersion,
-        [Parameter(Mandatory)][string]$Cutover
-    )
-    return Get-BoundedSha256Text ("xb.member.gateway.production_cutover.v1|{0}|{1}|{2}|{3}" -f $SourceSystem, $FormAlias, $MappingVersion, $Cutover)
 }
 
 function Assert-BoundedDigest {
@@ -502,7 +450,7 @@ function Assert-BoundedDigest {
 
 function Assert-BoundedReviewedBinding {
     param([Parameter(Mandatory)]$Manifest)
-    foreach ($roleName in @("google_forms_oauth", "gateway_bearer")) {
+    foreach ($roleName in @("gateway_mailer_bearer", "smtp")) {
         $role = $Manifest.credential_roles.$roleName
         if ((Test-BoundedPlaceholder ([string]$role.credential_id)) -or (Test-BoundedPlaceholder ([string]$role.credential_name))) {
             Stop-Bounded "binding_credential_reference_unresolved"
@@ -510,113 +458,31 @@ function Assert-BoundedReviewedBinding {
         Assert-BoundedSafeIdentity ([string]$role.credential_id) "binding_credential_reference_invalid"
         Assert-BoundedSafeIdentity ([string]$role.credential_name) "binding_credential_reference_invalid"
     }
-    $cutover = [string]$Manifest.cursor_expectation.production_cutover_exact
-    $cutoverDigest = [string]$Manifest.cursor_expectation.production_cutover_digest
-    if ((Test-BoundedPlaceholder $cutover) -or (Test-BoundedPlaceholder $cutoverDigest)) {
-        Stop-Bounded "binding_cursor_reference_unresolved"
-    }
-    if (-not (Test-BoundedExactCreateTime $cutover)) {
-        Stop-Bounded "binding_production_cutover_invalid"
-    }
-    $expectedDigest = Get-BoundedProductionCutoverDigest ([string]$Manifest.source_system) ([string]$Manifest.form_alias) ([string]$Manifest.mapping_version) $cutover
-    if ($cutoverDigest -cne $expectedDigest) { Stop-Bounded "binding_production_cutover_reference_mismatch" }
-}
-
-function Assert-BoundedNoLineBreaks {
-    param($Value)
-    if ($null -eq $Value) { return }
-    if ($Value -is [string]) {
-        if ($Value -match '[\r\n]') { Stop-Bounded "cursor_value_invalid" }
-        return
-    }
-    if ($Value -is [System.Collections.IEnumerable] -and -not ($Value -is [string])) {
-        foreach ($item in $Value) { Assert-BoundedNoLineBreaks $item }
-        return
-    }
-    if ($Value -is [System.Management.Automation.PSCustomObject]) {
-        foreach ($property in $Value.PSObject.Properties) { Assert-BoundedNoLineBreaks $property.Value }
+    if ((Test-BoundedPlaceholder ([string]$Manifest.project.id)) -or (Test-BoundedPlaceholder ([string]$Manifest.workflow.id))) {
+        Stop-Bounded "binding_target_reference_unresolved"
     }
 }
 
-function Assert-BoundedCursor {
-    # Full cursor-v2 response from the read-only GET. Tokens and raw response
-    # ids inside active_epoch are validated here and never persisted.
-    param(
-        [Parameter(Mandatory)]$Cursor,
-        [Parameter(Mandatory)]$Manifest
-    )
-    Assert-BoundedExactProperties $Cursor @(
-        "schema_version", "source_system", "form_alias", "mapping_version",
-        "production_cutover_exact", "filter_exact", "admission_mode", "page_size",
-        "cursor_state_version", "accepted_member_count", "accepted_member_allowance_remaining",
-        "active_epoch"
-    ) "cursor_shape_invalid"
-    if ([string]$Cursor.schema_version -cne "xb.member.gateway.source_cursor.v2" -or [string]$Cursor.source_system -cne [string]$Manifest.source_system -or [string]$Cursor.form_alias -cne [string]$Manifest.form_alias -or [string]$Cursor.mapping_version -cne [string]$Manifest.mapping_version) {
-        Stop-Bounded "cursor_identity_invalid"
-    }
-    Assert-BoundedCursorCommon $Cursor $Manifest
-    if ($null -ne $Cursor.accepted_member_allowance_remaining -and [int64]$Cursor.accepted_member_allowance_remaining -notin @(0, 1)) { Stop-Bounded "cursor_count_invalid" }
-    if ($null -ne $Cursor.active_epoch) {
-        $epoch = $Cursor.active_epoch
-        if (-not ($epoch -is [System.Management.Automation.PSCustomObject])) { Stop-Bounded "cursor_epoch_invalid" }
-        if ([string]$epoch.epoch_id -notmatch '^epoch-[0-9a-f]{32}$' -or [string]$epoch.status -cne "ACTIVE") { Stop-Bounded "cursor_epoch_invalid" }
-        Assert-BoundedNoLineBreaks $epoch
-    }
-}
-
-function Assert-BoundedCursorCommon {
-    param(
-        [Parameter(Mandatory)]$Cursor,
-        [Parameter(Mandatory)]$Manifest
-    )
-    $cutover = [string]$Cursor.production_cutover_exact
-    if (-not (Test-BoundedExactCreateTime $cutover)) { Stop-Bounded "production_cutover_value_invalid" }
-    if ([string]$Cursor.filter_exact -cne ("timestamp >= " + $cutover)) { Stop-Bounded "production_cutover_filter_invalid" }
-    if ([string]$Manifest.cursor_expectation.production_cutover_exact -cnotmatch 'PLACEHOLDER' -and [string]$Manifest.cursor_expectation.production_cutover_exact -cne $cutover) {
-        Stop-Bounded "production_cutover_value_mismatch"
-    }
-    $expectedDigest = Get-BoundedProductionCutoverDigest ([string]$Manifest.source_system) ([string]$Manifest.form_alias) ([string]$Manifest.mapping_version) $cutover
-    if ([string]$Manifest.cursor_expectation.production_cutover_digest -cnotmatch 'PLACEHOLDER' -and [string]$Manifest.cursor_expectation.production_cutover_digest -cne $expectedDigest) {
-        Stop-Bounded "production_cutover_digest_invalid"
-    }
-    if ([string]$Cursor.admission_mode -cne [string]$Manifest.cursor_expectation.admission_mode) { Stop-Bounded "admission_mode_mismatch" }
-    if ([int64]$Cursor.page_size -ne 1) { Stop-Bounded "cursor_page_size_invalid" }
-    if ([int64]$Cursor.cursor_state_version -lt 0) { Stop-Bounded "cursor_state_version_invalid" }
-    if ([int64]$Cursor.accepted_member_count -notin @(0, 1)) { Stop-Bounded "cursor_count_invalid" }
-}
-
-function ConvertTo-BoundedCursorProjection {
-    # Public-safe cursor identity kept in operation evidence. It deliberately
-    # omits active_epoch, so no page token or raw response id is ever written.
-    param([Parameter(Mandatory)]$Cursor)
+function New-BoundedGatewayBinding {
+    # Public-safe binding identity recorded in operation evidence. The mailer
+    # import never calls the gateway: claiming would consume a lease.
+    param([Parameter(Mandatory)]$Manifest)
     return [pscustomobject]([ordered]@{
-        schema_version = "xb.member.gateway.bounded_import.cursor-projection.v1"
-        source_system = [string]$Cursor.source_system
-        form_alias = [string]$Cursor.form_alias
-        mapping_version = [string]$Cursor.mapping_version
-        production_cutover_exact = [string]$Cursor.production_cutover_exact
-        filter_exact = [string]$Cursor.filter_exact
-        admission_mode = [string]$Cursor.admission_mode
-        page_size = [int64]$Cursor.page_size
-        cursor_state_version = [int64]$Cursor.cursor_state_version
-        accepted_member_count = [int64]$Cursor.accepted_member_count
+        schema_version = "xb.member.welcome_email.bounded_import.gateway-binding.v1"
+        gateway_origin = [string]$Manifest.endpoints.gateway_origin
+        mailer_token_env = [string]$Manifest.security.mailer_token_env
+        template_id = "welcome_v1"
     })
 }
 
-function Assert-BoundedCursorProjection {
+function Assert-BoundedGatewayBinding {
     param(
-        [Parameter(Mandatory)]$Cursor,
+        [Parameter(Mandatory)]$Binding,
         [Parameter(Mandatory)]$Manifest
     )
-    Assert-BoundedExactProperties $Cursor @(
-        "schema_version", "source_system", "form_alias", "mapping_version",
-        "production_cutover_exact", "filter_exact", "admission_mode", "page_size",
-        "cursor_state_version", "accepted_member_count"
-    ) "cursor_shape_invalid"
-    if ([string]$Cursor.schema_version -cne "xb.member.gateway.bounded_import.cursor-projection.v1" -or [string]$Cursor.source_system -cne [string]$Manifest.source_system -or [string]$Cursor.form_alias -cne [string]$Manifest.form_alias -or [string]$Cursor.mapping_version -cne [string]$Manifest.mapping_version) {
-        Stop-Bounded "cursor_identity_invalid"
-    }
-    Assert-BoundedCursorCommon $Cursor $Manifest
+    Assert-BoundedExactProperties $Binding @("schema_version", "gateway_origin", "mailer_token_env", "template_id") "gateway_binding_shape_invalid"
+    $expected = Get-BoundedCanonicalJsonFromObject (New-BoundedGatewayBinding $Manifest)
+    if ((Get-BoundedCanonicalJsonFromObject $Binding) -cne $expected) { Stop-Bounded "gateway_binding_mismatch" }
 }
 
 function Get-BoundedRepositoryIdentity {
@@ -653,7 +519,7 @@ function Get-BoundedRepositoryIdentity {
             "head" { "HEAD" }
             "tree" { "HEAD^{tree}" }
             "parent" { "HEAD^" }
-            "workflow_blob" { "HEAD:n8n-workflows/member_forms_gateway_ingest.workflow.json" }
+            "workflow_blob" { "HEAD:n8n-workflows/member_welcome_email_outbox.workflow.json" }
         }
         $result = & git -C $Root rev-parse --verify $argument 2>$null
         if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace([string]$result)) {
@@ -674,7 +540,7 @@ function Get-BoundedRepositoryIdentity {
 
 function Get-BoundedWorkflowFile {
     param([Parameter(Mandatory)][string]$Root)
-    $path = Join-Path $Root "n8n-workflows/member_forms_gateway_ingest.workflow.json"
+    $path = Join-Path $Root "n8n-workflows/member_welcome_email_outbox.workflow.json"
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { Stop-Bounded "canonical_workflow_missing" }
     return $path
 }
@@ -683,7 +549,7 @@ function Get-BoundedActivationValue {
     param([Parameter(Mandatory)]$Workflow)
     $matches = @()
     foreach ($node in @($Workflow.nodes)) {
-        if ($node.name -ne "Repository-safe source configuration") { continue }
+        if ($node.name -ne "Repository-safe mailer configuration") { continue }
         foreach ($assignment in @($node.parameters.assignments.assignments)) {
             if ([string]$assignment.name -ceq "activation_enabled") { $matches += $assignment }
         }
@@ -778,6 +644,26 @@ function Assert-BoundedInactiveWorkflow {
     $staticData = if ($Workflow.PSObject.Properties.Name -contains "staticData") { $Workflow.staticData } else { $null }
     $pinData = if ($Workflow.PSObject.Properties.Name -contains "pinData") { $Workflow.pinData } else { $null }
     if ($null -ne $staticData -or $null -ne $pinData) { Stop-Bounded "workflow_runtime_state_present" }
+    foreach ($node in @($Workflow.nodes)) {
+        if ($node.PSObject.Properties.Name -contains "webhookId") { Stop-Bounded "workflow_trigger_posture_invalid" }
+        if ([string]$node.type -like "*webhook*" -or [string]$node.type -like "*Webhook*") { Stop-Bounded "workflow_trigger_posture_invalid" }
+    }
+    $send = @($Workflow.nodes | Where-Object { [string]$_.type -eq "n8n-nodes-base.emailSend" })
+    if ($send.Count -ne 1 -or [string]$send[0].name -cne "Send welcome email (SMTP configured outside repo)") { Stop-Bounded "send_email_posture_invalid" }
+    $sendNode = $send[0]
+    # Send Email must never retry automatically: after send intent an unknown
+    # SMTP outcome is uncertain and must not be repeated.
+    if (-not ($sendNode.PSObject.Properties.Name -contains "retryOnFail") -or $sendNode.retryOnFail -ne $false -or ($sendNode.PSObject.Properties.Name -contains "maxTries")) { Stop-Bounded "send_email_retry_enabled" }
+    if (-not ($sendNode.PSObject.Properties.Name -contains "onError") -or [string]$sendNode.onError -cne "continueErrorOutput") { Stop-Bounded "send_email_error_route_invalid" }
+    $options = $sendNode.parameters.options
+    $optionNames = @(if ($null -ne $options) { Get-BoundedPropertyNames $options })
+    if ($optionNames.Count -ne 1 -or $optionNames[0] -cne "appendAttribution" -or $options.appendAttribution -ne $false) { Stop-Bounded "send_email_attribution_enabled" }
+    foreach ($field in @("fromEmail", "toEmail", "subject", "text")) {
+        $value = [string]$sendNode.parameters.$field
+        if (-not $value.StartsWith("={{", [StringComparison]::Ordinal)) { Stop-Bounded "send_email_literal_message_field" }
+        if ($value -match '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}') { Stop-Bounded "send_email_literal_address" }
+    }
+    if (($sendNode.parameters | ConvertTo-Json -Depth 20 -Compress) -match '(?i)replyTo') { Stop-Bounded "send_email_reply_to_present" }
 }
 
 function Set-BoundedProperty {
@@ -801,70 +687,46 @@ function New-BoundedPreparedWorkflow {
     $canonicalPath = Get-BoundedWorkflowFile $Root
     $raw = (Get-BoundedUtf8NoBom).GetString([System.IO.File]::ReadAllBytes($canonicalPath))
     $canonical = Get-BoundedCanonicalJsonFromText $raw -AllowFloatingPoint
-    # The reviewed export carries exactly one gateway origin placeholder and one
-    # Forms URL placeholder; anything else is not the reviewed export.
+    # The reviewed export carries exactly one gateway origin placeholder.
     if (([regex]::Matches($canonical, [regex]::Escape('"https://gateway.example.com"'))).Count -ne 1 -or
-        ([regex]::Matches($canonical, [regex]::Escape("https://gateway.example.com"))).Count -ne 1 -or
-        ([regex]::Matches($canonical, [regex]::Escape('"https://forms.example.com/v1/forms/GOOGLE_FORM_ID_PLACEHOLDER/responses"'))).Count -ne 1) {
+        ([regex]::Matches($canonical, [regex]::Escape("https://gateway.example.com"))).Count -ne 1) {
         Stop-Bounded "canonical_workflow_endpoint_placeholders_invalid"
     }
-    $preparedText = $canonical
-    $replacements = [ordered]@{
-        "https://forms.example.com/v1/forms/GOOGLE_FORM_ID_PLACEHOLDER/responses" = [string]$Manifest.endpoints.forms_responses
-        "https://gateway.example.com" = [string]$Manifest.endpoints.gateway_origin
-        "GOOGLE_FORM_ID_PLACEHOLDER" = [string]$Manifest.form.id
-        "QUESTION_ID_NAME_PLACEHOLDER" = [string]$Manifest.question_mapping.name
-        "QUESTION_ID_PHONE_PLACEHOLDER" = [string]$Manifest.question_mapping.phone
-        "QUESTION_ID_EMAIL_PLACEHOLDER" = [string]$Manifest.question_mapping.email
-        "QUESTION_ID_BIRTHDAY_MONTH_PLACEHOLDER" = [string]$Manifest.question_mapping.birthday_month
-        "QUESTION_ID_MARKETING_CONSENT_PLACEHOLDER" = [string]$Manifest.question_mapping.marketing_consent
-        "QUESTION_ID_PDPA_ACKNOWLEDGED_PLACEHOLDER" = [string]$Manifest.question_mapping.pdpa_acknowledged
-    }
-    $replacementTokens = [ordered]@{}
-    $replacementIndex = 0
-    foreach ($key in ($replacements.Keys | Sort-Object { $_.Length } -Descending)) {
-        $token = "__XB_BOUNDARY_REPLACEMENT_{0}__" -f $replacementIndex
-        $replacementIndex++
-        $replacementTokens[$token] = [string]$replacements[$key]
-        $preparedText = $preparedText.Replace([string]$key, $token)
-    }
-    foreach ($token in $replacementTokens.Keys) {
-        $preparedText = $preparedText.Replace([string]$token, [string]$replacementTokens[$token])
-    }
+    $preparedText = $canonical.Replace('"https://gateway.example.com"', (ConvertTo-Json -InputObject ([string]$Manifest.endpoints.gateway_origin) -Compress))
     if ($preparedText -match '[A-Z0-9_]+_PLACEHOLDER') { Stop-Bounded "binding_placeholder_unresolved" }
     $prepared = ConvertFrom-BoundedWorkflowJsonText $preparedText
     Set-BoundedProperty $prepared "id" ([string]$Manifest.workflow.id)
     Set-BoundedProperty $prepared "name" ([string]$Manifest.workflow.name)
 
-    $formsRole = $Manifest.credential_roles.google_forms_oauth
-    $gatewayRole = $Manifest.credential_roles.gateway_bearer
-    foreach ($role in @($formsRole, $gatewayRole)) {
+    $mailerRole = $Manifest.credential_roles.gateway_mailer_bearer
+    $smtpRole = $Manifest.credential_roles.smtp
+    foreach ($role in @($mailerRole, $smtpRole)) {
         if (Test-BoundedPlaceholder ([string]$role.credential_id)) { Stop-Bounded "binding_credential_reference_unresolved" }
         Assert-BoundedSafeIdentity ([string]$role.credential_id) "binding_credential_reference_invalid"
     }
-    $formsCredentialNodeCount = 0
-    $gatewayCredentialNodeCount = 0
+    $mailerCredentialNodeCount = 0
+    $smtpCredentialNodeCount = 0
     foreach ($node in @($prepared.nodes)) {
         $nodeName = [string]$node.name
-        if ($nodeName -in @($formsRole.node_names)) {
-            if ($null -eq $node.parameters) { Stop-Bounded "binding_credential_binding_invalid" }
+        if ($nodeName -in @($smtpRole.node_names)) {
+            if ($null -eq $node.parameters -or [string]$node.type -cne "n8n-nodes-base.emailSend") { Stop-Bounded "binding_credential_binding_invalid" }
             $credential = [ordered]@{}
-            $credential[[string]$formsRole.credential_type] = [ordered]@{ id = [string]$formsRole.credential_id; name = [string]$formsRole.credential_name }
+            $credential[[string]$smtpRole.credential_type] = [ordered]@{ id = [string]$smtpRole.credential_id; name = [string]$smtpRole.credential_name }
             Set-BoundedProperty $node "credentials" $credential
-            Set-BoundedProperty $node.parameters "authentication" "predefinedCredentialType"
-            Set-BoundedProperty $node.parameters "nodeCredentialType" "googleOAuth2Api"
-            $formsCredentialNodeCount++
-        } elseif ($nodeName -in @($gatewayRole.node_names)) {
-            if ($null -eq $node.parameters) { Stop-Bounded "binding_credential_binding_invalid" }
+            $smtpCredentialNodeCount++
+        } elseif ($nodeName -in @($mailerRole.node_names)) {
+            if ($null -eq $node.parameters -or [string]$node.type -cne "n8n-nodes-base.httpRequest") { Stop-Bounded "binding_credential_binding_invalid" }
             $credential = [ordered]@{}
-            $credential[[string]$gatewayRole.credential_type] = [ordered]@{ id = [string]$gatewayRole.credential_id; name = [string]$gatewayRole.credential_name }
+            $credential[[string]$mailerRole.credential_type] = [ordered]@{ id = [string]$mailerRole.credential_id; name = [string]$mailerRole.credential_name }
             Set-BoundedProperty $node "credentials" $credential
             Set-BoundedProperty $node.parameters "authentication" "genericCredentialType"
             Set-BoundedProperty $node.parameters "genericAuthType" "httpBearerAuth"
-            $gatewayCredentialNodeCount++
+            $mailerCredentialNodeCount++
+        } elseif ([string]$node.type -in @("n8n-nodes-base.httpRequest", "n8n-nodes-base.emailSend")) {
+            Stop-Bounded "binding_credential_binding_invalid"
         }
     }
-    if ($formsCredentialNodeCount -ne @($formsRole.node_names).Count -or $gatewayCredentialNodeCount -ne @($gatewayRole.node_names).Count) {
+    if ($smtpCredentialNodeCount -ne @($smtpRole.node_names).Count -or $mailerCredentialNodeCount -ne @($mailerRole.node_names).Count) {
         Stop-Bounded "binding_credential_binding_invalid"
     }
     Assert-BoundedInactiveWorkflow $prepared
@@ -1040,7 +902,7 @@ function New-BoundedAbsenceEvidence {
         [Parameter(Mandatory)]$Manifest
     )
     return [pscustomobject]([ordered]@{
-        schema_version = "xb.member.gateway.bounded_import.absence.v2"
+        schema_version = "xb.member.welcome_email.bounded_import.absence.v2"
         selection = "absent"
         project = [pscustomobject]([ordered]@{ id = [string]$Manifest.project.id; name = [string]$Manifest.project.name })
         workflow = [pscustomobject]([ordered]@{ id = [string]$Manifest.workflow.id; name = [string]$Manifest.workflow.name })
@@ -1056,7 +918,7 @@ function Assert-BoundedAbsenceEvidence {
         [Parameter(Mandatory)]$Manifest
     )
     Assert-BoundedExactProperties $Evidence @("schema_version", "selection", "project", "workflow", "metadata", "case_exact_matches", "case_distinct_matches") "absence_shape_invalid"
-    if ([string]$Evidence.schema_version -cne "xb.member.gateway.bounded_import.absence.v2" -or [string]$Evidence.selection -cne "absent") { Stop-Bounded "absence_state_invalid" }
+    if ([string]$Evidence.schema_version -cne "xb.member.welcome_email.bounded_import.absence.v2" -or [string]$Evidence.selection -cne "absent") { Stop-Bounded "absence_state_invalid" }
     if ([string]$Evidence.project.id -cne [string]$Manifest.project.id -or [string]$Evidence.project.name -cne [string]$Manifest.project.name -or [string]$Evidence.workflow.id -cne [string]$Manifest.workflow.id -or [string]$Evidence.workflow.name -cne [string]$Manifest.workflow.name) {
         Stop-Bounded "absence_identity_invalid"
     }
@@ -1183,10 +1045,10 @@ function Invoke-BoundedExternalCommand {
     if ($importUid -notmatch '^[0-9]{1,10}$' -or $importGid -notmatch '^[0-9]{1,10}$' -or [int64]$importUid -le 0 -or [int64]$importGid -le 0) { Stop-Bounded "container_import_root" }
 
     $nonce = [Guid]::NewGuid().ToString("N")
-    $containerDirectory = "/tmp/.xb-member-gateway-{0}-{1}" -f $containerKey, $nonce
+    $containerDirectory = "/tmp/.xb-member-welcome-email-{0}-{1}" -f $containerKey, $nonce
     $containerPath = $containerDirectory + "/prepared.workflow.json"
     $custody = [pscustomobject]([ordered]@{
-        schema_version = "xb.member.gateway.bounded_import.container-custody.v1"
+        schema_version = "xb.member.welcome_email.bounded_import.container-custody.v1"
         operation_id = [string]$ContainerEvidenceContext.operation_id
         operation_identity = [string]$ContainerEvidenceContext.operation_identity
         plan_digest = [string]$ContainerEvidenceContext.plan_digest
@@ -1306,10 +1168,7 @@ function Get-BoundedFixtureEvidence {
         [Parameter(Mandatory)]$Fixture,
         [switch]$AfterDispatch
     )
-    $fullCursor = ConvertFrom-BoundedJsonText ($Fixture.cursor | ConvertTo-Json -Depth 100 -Compress)
-    Assert-BoundedCursor $fullCursor $Manifest
-    $cursor = ConvertTo-BoundedCursorProjection $fullCursor
-    $fullCursor = $null
+    $gatewayBinding = New-BoundedGatewayBinding $Manifest
     $metadataValue = if ($AfterDispatch) { $Fixture.after_metadata } else { $Fixture.metadata }
     $metadata = if ($null -eq $metadataValue) { @() } else { @($metadataValue) }
     $selection = Select-BoundedWorkflowTarget $metadata $Manifest
@@ -1320,28 +1179,7 @@ function Get-BoundedFixtureEvidence {
         $workflow = ConvertFrom-BoundedWorkflowJsonText ($workflowValue | ConvertTo-Json -Depth 100 -Compress)
         Assert-BoundedInactiveWorkflow $workflow
     }
-    return [pscustomobject]([ordered]@{ cursor = $cursor; selection = $selection; workflow = $workflow })
-}
-
-function Get-BoundedCursorRequestUri {
-    param([Parameter(Mandatory)]$Manifest)
-    $uri = Get-BoundedHttpsUri ([string]$Manifest.endpoints.source_cursor) "cursor_endpoint_invalid"
-    $existingQuery = $uri.Query.TrimStart("?")
-    foreach ($part in ($existingQuery -split "&")) {
-        if ([string]::IsNullOrWhiteSpace($part)) { continue }
-        $key = ($part -split "=", 2)[0].Replace("+", " ")
-        try { $decodedKey = [System.Uri]::UnescapeDataString($key) } catch { Stop-Bounded "cursor_endpoint_invalid" }
-        if ($decodedKey -in @("form_alias", "mapping_version")) { Stop-Bounded "cursor_query_collision" }
-    }
-    $parameters = New-Object System.Collections.Generic.List[string]
-    $parameters.Add("form_alias=" + [System.Uri]::EscapeDataString([string]$Manifest.form_alias))
-    $parameters.Add("mapping_version=" + [System.Uri]::EscapeDataString([string]$Manifest.mapping_version))
-    $builder = [System.UriBuilder]::new($uri)
-    $queryParts = New-Object System.Collections.Generic.List[string]
-    if (-not [string]::IsNullOrWhiteSpace($existingQuery)) { $queryParts.Add($existingQuery) }
-    $queryParts.Add(($parameters -join "&"))
-    $builder.Query = ($queryParts -join "&")
-    return $builder.Uri.AbsoluteUri
+    return [pscustomobject]([ordered]@{ gateway_binding = $gatewayBinding; selection = $selection; workflow = $workflow })
 }
 
 function Get-BoundedLiveWorkflowMetadata {
@@ -1382,17 +1220,8 @@ function Get-BoundedLiveEvidence {
         [Parameter(Mandatory)]$Manifest,
         [switch]$AfterDispatch
     )
-    $tokenName = [string]$Manifest.security.source_token_env
-    $token = [Environment]::GetEnvironmentVariable($tokenName, "Process")
-    if ([string]::IsNullOrWhiteSpace($token)) { Stop-Bounded "source_token_missing" }
-    $headers = @{ Authorization = "Bearer " + $token }
     try {
-        $response = Invoke-WebRequest -UseBasicParsing -Uri (Get-BoundedCursorRequestUri $Manifest) -Headers $headers -Method Get
-        $fullCursor = ConvertFrom-BoundedJsonText ([string]$response.Content)
-        Assert-BoundedCursor $fullCursor $Manifest
-        $cursor = ConvertTo-BoundedCursorProjection $fullCursor
-        $fullCursor = $null
-        $response = $null
+        $gatewayBinding = New-BoundedGatewayBinding $Manifest
         $metadata = Get-BoundedLiveWorkflowMetadata $Manifest
         $selection = Select-BoundedWorkflowTarget $metadata $Manifest
         $workflow = $null
@@ -1405,13 +1234,10 @@ function Get-BoundedLiveEvidence {
             }
             Assert-BoundedInactiveWorkflow $workflow
         }
-        return [pscustomobject]([ordered]@{ cursor = $cursor; selection = $selection; workflow = $workflow })
+        return [pscustomobject]([ordered]@{ gateway_binding = $gatewayBinding; selection = $selection; workflow = $workflow })
     } catch {
-        if ($_.Exception.Message -match "^source_token_missing$|^cursor_|^production_cutover_|^admission_mode_|^metadata_|^target_|^workflow_|^n8n_") { throw }
+        if ($_.Exception.Message -match "^gateway_binding_|^metadata_|^target_|^workflow_|^n8n_") { throw }
         Stop-Bounded "authoritative_read_failed"
-    } finally {
-        $token = $null
-        $headers = $null
     }
 }
 
@@ -1535,7 +1361,7 @@ function Assert-BoundedPrivateDestination {
     )
     if (-not (Test-BoundedStrictChild $OperationsPath $Root)) { Stop-Bounded "private_path_escape" }
     $resolvedOperations = Resolve-BoundedFullPath $OperationsPath
-    $canonicalOperations = Resolve-BoundedFullPath (Join-Path $Root ".n8n-local/member-gateway-bounded-import/operations")
+    $canonicalOperations = Resolve-BoundedFullPath (Join-Path $Root ".n8n-local/member-welcome-email-bounded-import/operations")
     if (-not $resolvedOperations.Equals($canonicalOperations, (Get-BoundedComparison))) { Stop-Bounded "private_path_not_canonical" }
     Assert-BoundedNoUnsafePathComponents $resolvedOperations $Root
     if (-not $script:BoundedTestOnly) {
@@ -1552,7 +1378,7 @@ function Assert-BoundedManifestCustody {
         [Parameter(Mandatory)][string]$Root,
         [Parameter(Mandatory)][string]$ManifestPath
     )
-    $privateRoot = Resolve-BoundedFullPath (Join-Path $Root ".n8n-local/member-gateway-bounded-import")
+    $privateRoot = Resolve-BoundedFullPath (Join-Path $Root ".n8n-local/member-welcome-email-bounded-import")
     $resolvedManifest = Resolve-BoundedFullPath $ManifestPath
     if (-not (Test-BoundedStrictChild $resolvedManifest $privateRoot)) { Stop-Bounded "binding_manifest_path_not_private" }
     Assert-BoundedNoUnsafePathComponents $resolvedManifest $privateRoot
@@ -1652,7 +1478,7 @@ function Assert-BoundedContainerCustody {
     Assert-BoundedBoolean $Custody.import_started "container_custody_state_invalid"
     Assert-BoundedBoolean $Custody.mutation_possible "container_custody_state_invalid"
     Assert-BoundedBoolean $Custody.cleanup_verified "container_custody_state_invalid"
-    if ([string]$Custody.schema_version -cne "xb.member.gateway.bounded_import.container-custody.v1" -or
+    if ([string]$Custody.schema_version -cne "xb.member.welcome_email.bounded_import.container-custody.v1" -or
         [string]$Custody.operation_id -cne [string]$Plan.operation_id -or
         [string]$Custody.operation_identity -cne [string]$Plan.operation_identity -or
         [string]$Custody.prepared_workflow_digest -cne [string]$Plan.identity_seed.prepared_workflow_digest) {
@@ -1677,7 +1503,7 @@ function Assert-BoundedContainerCustody {
         Stop-Bounded "container_custody_owner_invalid"
     }
     $operationPattern = [regex]::Escape([string]$Plan.operation_id)
-    if ([string]$Custody.stage_directory -notmatch ("^/tmp/\.xb-member-gateway-" + $operationPattern + "-[0-9a-f]{32}$") -or
+    if ([string]$Custody.stage_directory -notmatch ("^/tmp/\.xb-member-welcome-email-" + $operationPattern + "-[0-9a-f]{32}$") -or
         [string]$Custody.stage_file -cne ([string]$Custody.stage_directory + "/prepared.workflow.json")) {
         Stop-Bounded "container_custody_path_invalid"
     }
@@ -1702,7 +1528,7 @@ function Assert-BoundedContainerCleanupVerified {
 function Get-BoundedOperationState {
     param([Parameter(Mandatory)][string]$OperationPath)
     $files = @(Get-BoundedOperationFiles $OperationPath)
-    $base = @("binding.json", "cursor-state.json", "mutation-intent.json", "plan.json", "prepared.workflow.json")
+    $base = @("binding.json", "gateway-binding-state.json", "mutation-intent.json", "plan.json", "prepared.workflow.json")
     foreach ($name in $base) { if ($name -notin $files) { Stop-Bounded "operation_incomplete" } }
     $preimage = @($files | Where-Object { $_ -in @("preimage.workflow.json", "absence-evidence.json") })
     if ($preimage.Count -ne 1) { Stop-Bounded "operation_preimage_shape_invalid" }
@@ -1715,13 +1541,12 @@ function Get-BoundedOperationState {
     $planDigest = Get-BoundedPlanDigest $OperationPath
     Assert-BoundedExactProperties $plan @("schema_version", "operation_id", "immutable", "operation_identity", "identity_seed", "expected_projection_digest", "expected_files") "plan_shape_invalid"
     Assert-BoundedBoolean $plan.immutable "plan_identity_invalid"
-    if ([string]$plan.schema_version -cne "xb.member.gateway.bounded_import.plan.v2" -or [string]$plan.operation_id -ne [string]$OperationId -or -not $plan.immutable) { Stop-Bounded "plan_identity_invalid" }
+    if ([string]$plan.schema_version -cne "xb.member.welcome_email.bounded_import.plan.v2" -or [string]$plan.operation_id -ne [string]$OperationId -or -not $plan.immutable) { Stop-Bounded "plan_identity_invalid" }
     Assert-BoundedDigest ([string]$plan.operation_identity) "operation_identity_invalid"
     Assert-BoundedDigest ([string]$plan.expected_projection_digest) "plan_projection_digest_invalid"
     Assert-BoundedExactProperties $plan.identity_seed @(
         "schema_version", "repository", "canonical_workflow", "project_identity", "workflow_identity",
-        "prepared_workflow_digest", "cursor_digest", "cursor_state_version", "production_cutover_digest",
-        "production_cutover_exact", "preimage_state", "preimage_digest", "preimage_selection_digest",
+        "prepared_workflow_digest", "gateway_binding_digest", "preimage_state", "preimage_digest", "preimage_selection_digest",
         "binding_manifest_digest", "credential_binding_digest"
     ) "identity_seed_shape_invalid"
     Assert-BoundedExactProperties $plan.identity_seed.repository @("head", "tree", "parent", "workflow_blob") "repository_identity_shape_invalid"
@@ -1730,14 +1555,13 @@ function Get-BoundedOperationState {
     Assert-BoundedExactProperties $plan.identity_seed.workflow_identity @("id", "name") "workflow_identity_shape_invalid"
     foreach ($digest in @(
         [string]$plan.identity_seed.prepared_workflow_digest,
-        [string]$plan.identity_seed.cursor_digest,
-        [string]$plan.identity_seed.production_cutover_digest,
+        [string]$plan.identity_seed.gateway_binding_digest,
         [string]$plan.identity_seed.preimage_digest,
         [string]$plan.identity_seed.preimage_selection_digest,
         [string]$plan.identity_seed.binding_manifest_digest,
         [string]$plan.identity_seed.credential_binding_digest
     )) { Assert-BoundedDigest $digest "identity_seed_digest_invalid" }
-    if ([string]$plan.identity_seed.canonical_workflow.path -cne "n8n-workflows/member_forms_gateway_ingest.workflow.json") { Stop-Bounded "canonical_workflow_identity_invalid" }
+    if ([string]$plan.identity_seed.canonical_workflow.path -cne "n8n-workflows/member_welcome_email_outbox.workflow.json") { Stop-Bounded "canonical_workflow_identity_invalid" }
     foreach ($repositoryValue in @(
         [string]$plan.identity_seed.repository.head,
         [string]$plan.identity_seed.repository.tree,
@@ -1746,9 +1570,8 @@ function Get-BoundedOperationState {
     )) { if ($repositoryValue -notmatch '^[0-9a-f]{40}$') { Stop-Bounded "repository_identity_invalid" } }
     if ($null -ne $plan.identity_seed.repository.parent -and [string]$plan.identity_seed.repository.parent -notmatch '^[0-9a-f]{40}$') { Stop-Bounded "repository_identity_invalid" }
     if ([string]$plan.identity_seed.preimage_state -notin @("existing", "absent")) { Stop-Bounded "preimage_state_invalid" }
-    if ([int64]$plan.identity_seed.cursor_state_version -lt 0 -or -not (Test-BoundedExactCreateTime ([string]$plan.identity_seed.production_cutover_exact))) { Stop-Bounded "identity_reference_invalid" }
     $expectedFiles = @(
-        "plan.json", "binding.json", "cursor-state.json", "prepared.workflow.json",
+        "plan.json", "binding.json", "gateway-binding-state.json", "prepared.workflow.json",
         $(if ([string]$plan.identity_seed.preimage_state -eq "existing") { "preimage.workflow.json" } else { "absence-evidence.json" }),
         "mutation-intent.json"
     )
@@ -1756,10 +1579,10 @@ function Get-BoundedOperationState {
     $seedDigest = Get-BoundedSha256Text (Get-BoundedCanonicalJsonFromObject $plan.identity_seed)
     if ($seedDigest -cne [string]$plan.operation_identity) { Stop-Bounded "operation_identity_mismatch" }
     $binding = Read-BoundedJsonFile (Join-Path $OperationPath "binding.json") -RequireCanonical
-    $cursorState = Read-BoundedJsonFile (Join-Path $OperationPath "cursor-state.json") -RequireCanonical
+    $gatewayBindingState = Read-BoundedJsonFile (Join-Path $OperationPath "gateway-binding-state.json") -RequireCanonical
     $intent = Read-BoundedJsonFile (Join-Path $OperationPath "mutation-intent.json") -RequireCanonical
     Assert-BoundedExactProperties $binding @("schema_version", "operation_id", "operation_identity", "plan_digest", "manifest_digest", "manifest") "binding_state_shape_invalid"
-    Assert-BoundedExactProperties $cursorState @("schema_version", "operation_id", "operation_identity", "plan_digest", "cursor_digest", "cursor") "cursor_state_shape_invalid"
+    Assert-BoundedExactProperties $gatewayBindingState @("schema_version", "operation_id", "operation_identity", "plan_digest", "gateway_binding_digest", "gateway_binding") "gateway_binding_state_shape_invalid"
     Assert-BoundedExactProperties $intent @(
         "schema_version", "operation_id", "operation_identity", "plan_digest", "operation", "target", "project",
         "prepared_workflow_digest", "expected_projection_digest", "original_preimage_state", "generic_hooks_allowed", "source_execution_allowed"
@@ -1776,26 +1599,26 @@ function Get-BoundedOperationState {
     }
     Assert-BoundedDigest ([string]$binding.manifest_digest) "binding_manifest_digest_invalid"
     Assert-BoundedDigest ([string]$binding.plan_digest) "plan_digest_invalid"
-    Assert-BoundedDigest ([string]$cursorState.cursor_digest) "cursor_digest_invalid"
+    Assert-BoundedDigest ([string]$gatewayBindingState.gateway_binding_digest) "gateway_binding_digest_invalid"
     Assert-BoundedDigest ([string]$intent.prepared_workflow_digest) "prepared_digest_invalid"
     Assert-BoundedDigest ([string]$intent.expected_projection_digest) "intent_projection_digest_invalid"
     Assert-BoundedBoolean $intent.generic_hooks_allowed "mutation_intent_scope_invalid"
     Assert-BoundedBoolean $intent.source_execution_allowed "mutation_intent_scope_invalid"
     if ($intent.generic_hooks_allowed -or $intent.source_execution_allowed) { Stop-Bounded "mutation_intent_scope_invalid" }
-    if ([string]$binding.schema_version -cne "xb.member.gateway.bounded_import.binding-state.v2" -or [string]$binding.operation_id -ne [string]$OperationId) { Stop-Bounded "binding_state_identity_invalid" }
-    if ([string]$cursorState.schema_version -cne "xb.member.gateway.bounded_import.cursor-state.v3" -or [string]$cursorState.operation_id -ne [string]$OperationId) { Stop-Bounded "cursor_state_identity_invalid" }
-    if ([string]$intent.schema_version -cne "xb.member.gateway.bounded_import.mutation-intent.v2" -or [string]$intent.operation_id -ne [string]$OperationId -or [string]$intent.operation -cne "import_one_workflow") { Stop-Bounded "mutation_intent_identity_invalid" }
+    if ([string]$binding.schema_version -cne "xb.member.welcome_email.bounded_import.binding-state.v2" -or [string]$binding.operation_id -ne [string]$OperationId) { Stop-Bounded "binding_state_identity_invalid" }
+    if ([string]$gatewayBindingState.schema_version -cne "xb.member.welcome_email.bounded_import.gateway-binding-state.v1" -or [string]$gatewayBindingState.operation_id -ne [string]$OperationId) { Stop-Bounded "gateway_binding_state_identity_invalid" }
+    if ([string]$intent.schema_version -cne "xb.member.welcome_email.bounded_import.mutation-intent.v2" -or [string]$intent.operation_id -ne [string]$OperationId -or [string]$intent.operation -cne "import_one_workflow") { Stop-Bounded "mutation_intent_identity_invalid" }
     if ((Get-BoundedSha256Text (Get-BoundedCanonicalJsonFromObject $binding.manifest)) -cne [string]$binding.manifest_digest) { Stop-Bounded "binding_digest_mismatch" }
     if ([string]$intent.target.id -cne [string]$binding.manifest.workflow.id -or [string]$intent.target.name -cne [string]$binding.manifest.workflow.name -or [string]$intent.project.id -cne [string]$binding.manifest.project.id -or [string]$intent.project.name -cne [string]$binding.manifest.project.name) { Stop-Bounded "mutation_intent_target_invalid" }
     if ([string]$intent.prepared_workflow_digest -cne [string]$plan.identity_seed.prepared_workflow_digest -or [string]$intent.original_preimage_state -cne [string]$plan.identity_seed.preimage_state) { Stop-Bounded "mutation_intent_chain_mismatch" }
-    foreach ($value in @($binding, $cursorState, $intent)) {
+    foreach ($value in @($binding, $gatewayBindingState, $intent)) {
         if ([string]$value.plan_digest -cne $planDigest -or [string]$value.operation_identity -cne [string]$plan.operation_identity) { Stop-Bounded "evidence_chain_mismatch" }
     }
     if ([string]$binding.manifest_digest -cne [string]$plan.identity_seed.binding_manifest_digest) { Stop-Bounded "binding_digest_mismatch" }
     if ([string]$plan.identity_seed.credential_binding_digest -cne (Get-BoundedSha256Text (Get-BoundedCanonicalJsonFromObject $binding.manifest.credential_roles))) { Stop-Bounded "credential_binding_digest_mismatch" }
-    $cursor = $cursorState.cursor
-    Assert-BoundedCursorProjection $cursor $binding.manifest
-    if ([string]$cursorState.cursor_digest -cne [string]$plan.identity_seed.cursor_digest -or (Get-BoundedSha256Text (Get-BoundedCanonicalJsonFromObject $cursor)) -cne [string]$cursorState.cursor_digest) { Stop-Bounded "cursor_digest_mismatch" }
+    $gatewayBinding = $gatewayBindingState.gateway_binding
+    Assert-BoundedGatewayBinding $gatewayBinding $binding.manifest
+    if ([string]$gatewayBindingState.gateway_binding_digest -cne [string]$plan.identity_seed.gateway_binding_digest -or (Get-BoundedSha256Text (Get-BoundedCanonicalJsonFromObject $gatewayBinding)) -cne [string]$gatewayBindingState.gateway_binding_digest) { Stop-Bounded "gateway_binding_digest_mismatch" }
     Assert-BoundedFileDigest (Join-Path $OperationPath "prepared.workflow.json") ([string]$plan.identity_seed.prepared_workflow_digest) "prepared_digest_mismatch"
     if ($preimage[0] -eq "preimage.workflow.json") {
         Assert-BoundedFileDigest (Join-Path $OperationPath $preimage[0]) ([string]$plan.identity_seed.preimage_digest) "preimage_digest_mismatch"
@@ -1818,7 +1641,7 @@ function Get-BoundedOperationState {
     if ("dispatch-ownership.json" -in $optional) {
         $ownership = Read-BoundedJsonFile (Join-Path $OperationPath "dispatch-ownership.json") -RequireCanonical
         Assert-BoundedExactProperties $ownership @("schema_version", "operation_id", "operation_identity", "plan_digest", "mutation_intent_digest", "ownership_id") "dispatch_ownership_shape_invalid"
-        if ([string]$ownership.schema_version -cne "xb.member.gateway.bounded_import.dispatch-ownership.v1" -or [string]$ownership.operation_id -ne [string]$OperationId) { Stop-Bounded "dispatch_ownership_identity_invalid" }
+        if ([string]$ownership.schema_version -cne "xb.member.welcome_email.bounded_import.dispatch-ownership.v1" -or [string]$ownership.operation_id -ne [string]$OperationId) { Stop-Bounded "dispatch_ownership_identity_invalid" }
         if ([string]$ownership.ownership_id -notmatch '^[0-9a-f]{32}$') { Stop-Bounded "dispatch_ownership_identity_invalid" }
         Assert-BoundedDigest ([string]$ownership.plan_digest) "dispatch_ownership_plan_digest_invalid"
         Assert-BoundedDigest ([string]$ownership.mutation_intent_digest) "dispatch_ownership_intent_digest_invalid"
@@ -1836,7 +1659,7 @@ function Get-BoundedOperationState {
         )
         if (-not $dispatchStateValid) { Stop-Bounded "dispatch_receipt_state_invalid" }
         Assert-BoundedDigest ([string]$dispatch.mutation_intent_digest) "dispatch_intent_digest_invalid"
-        if ([string]$dispatch.schema_version -cne "xb.member.gateway.bounded_import.dispatch.v2" -or [string]$dispatch.operation_id -ne [string]$OperationId) { Stop-Bounded "dispatch_receipt_identity_invalid" }
+        if ([string]$dispatch.schema_version -cne "xb.member.welcome_email.bounded_import.dispatch.v2" -or [string]$dispatch.operation_id -ne [string]$OperationId) { Stop-Bounded "dispatch_receipt_identity_invalid" }
         if ([string]$dispatch.mutation_intent_digest -cne (Get-BoundedSha256File (Join-Path $OperationPath "mutation-intent.json"))) { Stop-Bounded "dispatch_chain_mismatch" }
         if ([string]$dispatch.plan_digest -ne $planDigest -or [string]$dispatch.operation_identity -ne [string]$plan.operation_identity) { Stop-Bounded "dispatch_chain_mismatch" }
     }
@@ -1855,7 +1678,7 @@ function Get-BoundedOperationState {
         if ([string]$completion.expected_projection_digest -ne [string]$plan.expected_projection_digest) { Stop-Bounded "completion_identity_mismatch" }
         if ([string]$completion.plan_digest -ne $planDigest -or [string]$completion.operation_identity -ne [string]$plan.operation_identity) { Stop-Bounded "completion_chain_mismatch" }
         if ($null -eq $dispatch -or [string]$dispatch.dispatch_state -cne "dispatched" -or [string]$dispatch.outcome -cne "completed") { Stop-Bounded "completion_without_completed_dispatch" }
-        if ([string]$completion.schema_version -cne "xb.member.gateway.bounded_import.completion.v2" -or [string]$completion.operation_id -ne [string]$OperationId -or [string]$completion.target_projection_digest -cne [string]$plan.expected_projection_digest) { Stop-Bounded "completion_receipt_identity_invalid" }
+        if ([string]$completion.schema_version -cne "xb.member.welcome_email.bounded_import.completion.v2" -or [string]$completion.operation_id -ne [string]$OperationId -or [string]$completion.target_projection_digest -cne [string]$plan.expected_projection_digest) { Stop-Bounded "completion_receipt_identity_invalid" }
         if ([string]$completion.original_preimage_state -cne [string]$plan.identity_seed.preimage_state) { Stop-Bounded "completion_preimage_state_mismatch" }
         if (([string]$completion.original_preimage_state -eq "absent" -and [string]$completion.ownership -cne "created") -or ([string]$completion.original_preimage_state -eq "existing" -and [string]$completion.ownership -cne "updated_or_noop")) { Stop-Bounded "completion_receipt_state_invalid" }
     }
@@ -1864,7 +1687,7 @@ function Get-BoundedOperationState {
         plan = $plan
         plan_digest = $planDigest
         binding = $binding
-        cursor_state = $cursorState
+        gateway_binding_state = $gatewayBindingState
         intent = $intent
         preimage_name = $preimage[0]
         ownership = $ownership
@@ -1883,7 +1706,7 @@ function Assert-BoundedReviewedWorkflowBytes {
     if ($script:BoundedTestOnly) {
         $actualHash = Get-BoundedGitBlobSha1 $path
     } else {
-        $actual = & git -C $Root hash-object -- n8n-workflows/member_forms_gateway_ingest.workflow.json 2>$null
+        $actual = & git -C $Root hash-object -- n8n-workflows/member_welcome_email_outbox.workflow.json 2>$null
         if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace([string]$actual)) { Stop-Bounded "repository_workflow_blob_unavailable" }
         $actualHash = ([string]$actual).Trim()
     }
@@ -1895,7 +1718,7 @@ function New-BoundedIdentitySeed {
     param(
         [Parameter(Mandatory)]$Repository,
         [Parameter(Mandatory)]$Manifest,
-        [Parameter(Mandatory)]$Cursor,
+        [Parameter(Mandatory)]$GatewayBinding,
         [Parameter(Mandatory)][string]$PreparedWorkflowDigest,
         [Parameter(Mandatory)][string]$PreimageState,
         [Parameter(Mandatory)][string]$PreimageDigest,
@@ -1903,19 +1726,16 @@ function New-BoundedIdentitySeed {
         [Parameter(Mandatory)][string]$BindingManifestDigest
     )
     return [pscustomobject]([ordered]@{
-        schema_version = "xb.member.gateway.bounded_import.identity.v3"
+        schema_version = "xb.member.welcome_email.bounded_import.identity.v3"
         repository = $Repository
         canonical_workflow = [pscustomobject]([ordered]@{
-            path = "n8n-workflows/member_forms_gateway_ingest.workflow.json"
+            path = "n8n-workflows/member_welcome_email_outbox.workflow.json"
             git_blob = [string]$Repository.workflow_blob
         })
         project_identity = $Manifest.project
         workflow_identity = $Manifest.workflow
         prepared_workflow_digest = $PreparedWorkflowDigest
-        cursor_digest = Get-BoundedSha256Text (Get-BoundedCanonicalJsonFromObject $Cursor)
-        cursor_state_version = [int64]$Cursor.cursor_state_version
-        production_cutover_digest = Get-BoundedProductionCutoverDigest ([string]$Manifest.source_system) ([string]$Manifest.form_alias) ([string]$Manifest.mapping_version) ([string]$Cursor.production_cutover_exact)
-        production_cutover_exact = [string]$Cursor.production_cutover_exact
+        gateway_binding_digest = Get-BoundedSha256Text (Get-BoundedCanonicalJsonFromObject $GatewayBinding)
         preimage_state = $PreimageState
         preimage_digest = $PreimageDigest
         preimage_selection_digest = $PreimageSelectionDigest
@@ -1936,8 +1756,8 @@ function New-BoundedPlanArtifacts {
     $prepared = New-BoundedPreparedWorkflow $Manifest $Root
     $preparedText = Get-BoundedWorkflowJsonText $prepared
     $preparedDigest = Get-BoundedSha256Text $preparedText
-    $cursorCanonical = Get-BoundedCanonicalJsonFromObject $Evidence.cursor
-    $cursorDigest = Get-BoundedSha256Text $cursorCanonical
+    $gatewayBindingCanonical = Get-BoundedCanonicalJsonFromObject $Evidence.gateway_binding
+    $gatewayBindingDigest = Get-BoundedSha256Text $gatewayBindingCanonical
     $preimageState = [string]$Evidence.selection.state
     $preimageObject = $null
     $preimageText = $null
@@ -1954,17 +1774,17 @@ function New-BoundedPlanArtifacts {
     $projection = Get-BoundedWorkflowProjection $prepared $Manifest
     $projectionDigest = Get-BoundedSha256Text (Get-BoundedCanonicalJsonFromObject $projection -AllowFloatingPoint)
     $selectionDigest = Get-BoundedSha256Text (Get-BoundedCanonicalJsonFromObject $Evidence.selection)
-    $identitySeed = New-BoundedIdentitySeed $repo $Manifest $Evidence.cursor $preparedDigest $preimageState $preimageDigest $selectionDigest $manifestDigest
+    $identitySeed = New-BoundedIdentitySeed $repo $Manifest $Evidence.gateway_binding $preparedDigest $preimageState $preimageDigest $selectionDigest $manifestDigest
     $operationIdentity = Get-BoundedSha256Text (Get-BoundedCanonicalJsonFromObject $identitySeed)
     $plan = [pscustomobject]([ordered]@{
-        schema_version = "xb.member.gateway.bounded_import.plan.v2"
+        schema_version = "xb.member.welcome_email.bounded_import.plan.v2"
         operation_id = $OperationId
         immutable = $true
         operation_identity = $operationIdentity
         identity_seed = $identitySeed
         expected_projection_digest = $projectionDigest
         expected_files = @(
-            "plan.json", "binding.json", "cursor-state.json", "prepared.workflow.json",
+            "plan.json", "binding.json", "gateway-binding-state.json", "prepared.workflow.json",
             $(if ($preimageState -eq "existing") { "preimage.workflow.json" } else { "absence-evidence.json" }),
             "mutation-intent.json"
         )
@@ -1972,23 +1792,23 @@ function New-BoundedPlanArtifacts {
     $planText = (Get-BoundedCanonicalJsonFromObject $plan) + $script:BoundedLf
     $planDigest = Get-BoundedSha256Text $planText
     $binding = [pscustomobject]([ordered]@{
-        schema_version = "xb.member.gateway.bounded_import.binding-state.v2"
+        schema_version = "xb.member.welcome_email.bounded_import.binding-state.v2"
         operation_id = $OperationId
         operation_identity = $operationIdentity
         plan_digest = $planDigest
         manifest_digest = $manifestDigest
         manifest = $Manifest
     })
-    $cursorState = [pscustomobject]([ordered]@{
-        schema_version = "xb.member.gateway.bounded_import.cursor-state.v3"
+    $gatewayBindingState = [pscustomobject]([ordered]@{
+        schema_version = "xb.member.welcome_email.bounded_import.gateway-binding-state.v1"
         operation_id = $OperationId
         operation_identity = $operationIdentity
         plan_digest = $planDigest
-        cursor_digest = $cursorDigest
-        cursor = $Evidence.cursor
+        gateway_binding_digest = $gatewayBindingDigest
+        gateway_binding = $Evidence.gateway_binding
     })
     $intent = [pscustomobject]([ordered]@{
-        schema_version = "xb.member.gateway.bounded_import.mutation-intent.v2"
+        schema_version = "xb.member.welcome_email.bounded_import.mutation-intent.v2"
         operation_id = $OperationId
         operation_identity = $operationIdentity
         plan_digest = $planDigest
@@ -2004,7 +1824,7 @@ function New-BoundedPlanArtifacts {
     $artifacts = [ordered]@{
         "plan.json" = $planText
         "binding.json" = (Get-BoundedCanonicalJsonFromObject $binding) + $script:BoundedLf
-        "cursor-state.json" = (Get-BoundedCanonicalJsonFromObject $cursorState) + $script:BoundedLf
+        "gateway-binding-state.json" = (Get-BoundedCanonicalJsonFromObject $gatewayBindingState) + $script:BoundedLf
         "prepared.workflow.json" = $preparedText
         "mutation-intent.json" = (Get-BoundedCanonicalJsonFromObject $intent) + $script:BoundedLf
     }
@@ -2114,7 +1934,7 @@ function Write-BoundedOperationReceipt {
 function New-BoundedDispatchOwnership {
     param([Parameter(Mandatory)]$State)
     return [pscustomobject]([ordered]@{
-        schema_version = "xb.member.gateway.bounded_import.dispatch-ownership.v1"
+        schema_version = "xb.member.welcome_email.bounded_import.dispatch-ownership.v1"
         operation_id = [string]$State.plan.operation_id
         operation_identity = [string]$State.plan.operation_identity
         plan_digest = [string]$State.plan_digest
@@ -2174,12 +1994,9 @@ function Assert-BoundedPlanEvidence {
         [Parameter(Mandatory)]$Evidence,
         [Parameter(Mandatory)]$Manifest
     )
-    Assert-BoundedCursorProjection $Evidence.cursor $Manifest
-    $cursorDigest = Get-BoundedSha256Text (Get-BoundedCanonicalJsonFromObject $Evidence.cursor)
-    if (-not (Compare-BoundedText $cursorDigest ([string]$State.plan.identity_seed.cursor_digest))) { Stop-Bounded "cursor_digest_mismatch" }
-    if (-not (Compare-BoundedText ([string]$Evidence.cursor.production_cutover_exact) ([string]$State.plan.identity_seed.production_cutover_exact))) { Stop-Bounded "production_cutover_value_mismatch" }
-    $cutoverDigest = Get-BoundedProductionCutoverDigest ([string]$Manifest.source_system) ([string]$Manifest.form_alias) ([string]$Manifest.mapping_version) ([string]$Evidence.cursor.production_cutover_exact)
-    if (-not (Compare-BoundedText $cutoverDigest ([string]$State.plan.identity_seed.production_cutover_digest))) { Stop-Bounded "production_cutover_digest_mismatch" }
+    Assert-BoundedGatewayBinding $Evidence.gateway_binding $Manifest
+    $gatewayBindingDigest = Get-BoundedSha256Text (Get-BoundedCanonicalJsonFromObject $Evidence.gateway_binding)
+    if (-not (Compare-BoundedText $gatewayBindingDigest ([string]$State.plan.identity_seed.gateway_binding_digest))) { Stop-Bounded "gateway_binding_digest_mismatch" }
     $selectionDigest = Get-BoundedSha256Text (Get-BoundedCanonicalJsonFromObject $Evidence.selection)
     if (-not (Compare-BoundedText $selectionDigest ([string]$State.plan.identity_seed.preimage_selection_digest))) { Stop-Bounded "preimage_selection_digest_mismatch" }
     if (-not (Compare-BoundedText ([string]$Evidence.selection.state) ([string]$State.plan.identity_seed.preimage_state))) { Stop-Bounded "preimage_state_mismatch" }
@@ -2208,13 +2025,9 @@ function Assert-BoundedCurrentOperationIdentity {
     if ([string]$currentRepository.workflow_blob -cne [string]$State.plan.identity_seed.canonical_workflow.git_blob) { Stop-Bounded "repository_workflow_blob_mismatch" }
     $manifestDigest = Get-BoundedSha256Text (Get-BoundedCanonicalJsonFromObject $Manifest)
     if (-not (Compare-BoundedText $manifestDigest ([string]$State.plan.identity_seed.binding_manifest_digest))) { Stop-Bounded "binding_digest_mismatch" }
-    Assert-BoundedCursorProjection $Evidence.cursor $Manifest
-    $cursorDigest = Get-BoundedSha256Text (Get-BoundedCanonicalJsonFromObject $Evidence.cursor)
-    if (-not (Compare-BoundedText $cursorDigest ([string]$State.plan.identity_seed.cursor_digest))) { Stop-Bounded "cursor_digest_mismatch" }
-    if (-not (Compare-BoundedText ([string]$Evidence.cursor.cursor_state_version) ([string]$State.plan.identity_seed.cursor_state_version))) { Stop-Bounded "cursor_state_version_mismatch" }
-    if (-not (Compare-BoundedText ([string]$Evidence.cursor.production_cutover_exact) ([string]$State.plan.identity_seed.production_cutover_exact))) { Stop-Bounded "production_cutover_value_mismatch" }
-    $cutoverDigest = Get-BoundedProductionCutoverDigest ([string]$Manifest.source_system) ([string]$Manifest.form_alias) ([string]$Manifest.mapping_version) ([string]$Evidence.cursor.production_cutover_exact)
-    if (-not (Compare-BoundedText $cutoverDigest ([string]$State.plan.identity_seed.production_cutover_digest))) { Stop-Bounded "production_cutover_digest_mismatch" }
+    Assert-BoundedGatewayBinding $Evidence.gateway_binding $Manifest
+    $gatewayBindingDigest = Get-BoundedSha256Text (Get-BoundedCanonicalJsonFromObject $Evidence.gateway_binding)
+    if (-not (Compare-BoundedText $gatewayBindingDigest ([string]$State.plan.identity_seed.gateway_binding_digest))) { Stop-Bounded "gateway_binding_digest_mismatch" }
     $prepared = New-BoundedPreparedWorkflow $Manifest $script:BoundedRepoRoot
     $preparedText = Get-BoundedWorkflowJsonText $prepared
     $preparedDigest = Get-BoundedSha256Text $preparedText
@@ -2223,7 +2036,7 @@ function Assert-BoundedCurrentOperationIdentity {
     $projection = Get-BoundedWorkflowProjection $prepared $Manifest
     $projectionDigest = Get-BoundedSha256Text (Get-BoundedCanonicalJsonFromObject $projection -AllowFloatingPoint)
     if (-not (Compare-BoundedText $projectionDigest ([string]$State.plan.expected_projection_digest))) { Stop-Bounded "prepared_projection_mismatch" }
-    $freshSeed = New-BoundedIdentitySeed $currentRepository $Manifest $Evidence.cursor $preparedDigest ([string]$State.plan.identity_seed.preimage_state) ([string]$State.plan.identity_seed.preimage_digest) ([string]$State.plan.identity_seed.preimage_selection_digest) $manifestDigest
+    $freshSeed = New-BoundedIdentitySeed $currentRepository $Manifest $Evidence.gateway_binding $preparedDigest ([string]$State.plan.identity_seed.preimage_state) ([string]$State.plan.identity_seed.preimage_digest) ([string]$State.plan.identity_seed.preimage_selection_digest) $manifestDigest
     $freshIdentity = Get-BoundedSha256Text (Get-BoundedCanonicalJsonFromObject $freshSeed)
     if (-not (Compare-BoundedText $freshIdentity ([string]$State.plan.operation_identity))) { Stop-Bounded "operation_identity_mismatch" }
 }
@@ -2350,7 +2163,7 @@ function New-BoundedDispatchReceipt {
         [Parameter(Mandatory)][bool]$ReplayAllowed
     )
     return [pscustomobject]([ordered]@{
-        schema_version = "xb.member.gateway.bounded_import.dispatch.v2"
+        schema_version = "xb.member.welcome_email.bounded_import.dispatch.v2"
         operation_id = [string]$State.plan.operation_id
         operation_identity = [string]$State.plan.operation_identity
         plan_digest = [string]$State.plan_digest
@@ -2371,7 +2184,7 @@ function New-BoundedCompletionReceipt {
     $persistedState = Get-BoundedOperationState ([string]$State.operation_path)
     Assert-BoundedContainerCleanupVerified $persistedState.container_custody
     return [pscustomobject]([ordered]@{
-        schema_version = "xb.member.gateway.bounded_import.completion.v2"
+        schema_version = "xb.member.welcome_email.bounded_import.completion.v2"
         operation_id = [string]$State.plan.operation_id
         operation_identity = [string]$State.plan.operation_identity
         plan_digest = [string]$State.plan_digest
