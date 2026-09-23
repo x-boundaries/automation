@@ -10,6 +10,7 @@ import base64
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import tempfile
@@ -3535,6 +3536,745 @@ class SupervisorSyntheticContainmentTests(unittest.TestCase):
         self.assertTrue(supervisor.containment_failure)
         supervisor.reap(accounting=False)
         self.assertFalse(supervisor.reap_confirmed)
+
+
+class SupervisorObserverRepairStaticTests(unittest.TestCase):
+    """Static contract for the bounded application-child observer repair (#199)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.source = SUPERVISOR.read_text(encoding="utf-8")
+        cls.test_source = Path(__file__).read_text(encoding="utf-8")
+        start = cls.source.index("function Test-EgApplicationChild {")
+        cls.observer = cls.source[start:cls.source.index("function Get-EgAccounting", start)]
+
+    def test_observer_constants_are_defined_exactly_once(self):
+        self.assertEqual(
+            1, self.source.count("$script:EgObserverMetadataTimeoutMilliseconds = "))
+        self.assertEqual(1, self.source.count("$script:EgObserverProcessGoneErrorCode = "))
+        self.assertIn("$script:EgObserverMetadataTimeoutMilliseconds = 1000\n",
+                      self.source.replace("\r\n", "\n"))
+        self.assertIn("$script:EgObserverProcessGoneErrorCode = 87\n",
+                      self.source.replace("\r\n", "\n"))
+
+    def test_metadata_query_uses_the_bound_budget_not_a_literal(self):
+        self.assertIsNone(re.search(
+            r"QueryProcessMetadata\(\s*\[uint32\]\$candidatePid,\s*\d", self.observer))
+        self.assertIsNotNone(re.search(
+            r"QueryProcessMetadata\(\s*\[uint32\]\$candidatePid,\s*"
+            r"\$script:EgObserverMetadataTimeoutMilliseconds\)", self.observer))
+
+    def test_deadline_guard_precedes_the_provider_query(self):
+        self.assertIn(
+            "$supervisorDeadline = Get-EgDeadlineTicks -StartTicks $StartTicks -Seconds $TimeoutSeconds",
+            self.observer,
+        )
+        guard = self.observer.index(
+            "if ($remainingMilliseconds -lt $script:EgObserverMetadataTimeoutMilliseconds) { break }")
+        query = self.observer.index("QueryProcessMetadata(")
+        self.assertLess(self.observer.index("$supervisorDeadline -"), guard)
+        self.assertLess(guard, query)
+
+    def test_provider_uncertainty_is_checked_before_success(self):
+        uncertain = self.observer.index("if ($metadata.TimedOut -or $metadata.ProviderFailed) {")
+        success = self.observer.index("if (-not $metadata.Succeeded) {")
+        self.assertLess(self.observer.index("QueryProcessMetadata("), uncertain)
+        self.assertLess(uncertain, success)
+        branch = self.observer[uncertain:success]
+        self.assertIn("$script:EgState.observer_failed = $true", branch)
+        self.assertIn("continue", branch)
+
+    def test_only_error_87_and_proven_exit_are_treated_as_absent(self):
+        self.assertIn(
+            "if ($candidate.ErrorCode -ne $script:EgObserverProcessGoneErrorCode) {", self.observer)
+        exit_check = re.compile(
+            r"\$exited = \[EnergyGridOneShotSupervisorNative\]::GetProcessLive\(\$candidate\.Handle\)"
+            r"\s*if \(-not \(\$exited\.Succeeded -and -not \$exited\.Live\)\) \{"
+            r"\s*\$script:EgState\.observer_failed = \$true\s*\}\s*continue"
+        )
+        self.assertEqual(2, len(exit_check.findall(self.observer)))
+
+    def test_new_harnesses_never_define_their_own_observer(self):
+        for harness in (_REAL_OBSERVER_HARNESS, _END_TO_END_SUPERVISOR_HARNESS):
+            self.assertIsNone(re.search(
+                r"(?m)^\s*function\s+(?:script:)?Test-EgApplicationChild\b", harness))
+        self.assertEqual(
+            1,
+            _REAL_OBSERVER_HARNESS.count(
+                "'function script:Test-EgApplicationChild {' + $text.Substring($observerHeader.Length)"),
+        )
+        self.assertIn("Get-CommittedFunction 'Test-EgApplicationChild'", _REAL_OBSERVER_HARNESS)
+        self.assertNotIn("Test-EgApplicationChild", _END_TO_END_SUPERVISOR_HARNESS)
+        self.assertIn("def test_observer_failure_forces_ambiguous_verdict", self.test_source)
+
+
+_REAL_OBSERVER_HARNESS = r'''
+param(
+    [Parameter(Mandatory = $true)][string]$SupervisorPath,
+    [Parameter(Mandatory = $true)][string]$RootPath
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+function Assert-Observer {
+    param([bool]$Condition, [string]$Message)
+    if (-not $Condition) { throw ('real_observer_assertion_failed: ' + $Message) }
+}
+
+# Everything below that decides an observation comes from the committed supervisor on
+# disk: the embedded native class, the state object, the observer constants and the
+# observer itself.  This harness never defines its own application observer.  Named
+# fault-injection cases substitute exactly one call site in a copy of the committed
+# observer text after proving that the site is unique, and restore the original after.
+$source = [System.IO.File]::ReadAllText($SupervisorPath)
+$parseErrors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseInput($source, [ref]$null, [ref]$parseErrors)
+Assert-Observer (@($parseErrors).Count -eq 0) 'supervisor_parse'
+function Get-CommittedAssignment {
+    param([string]$Left)
+    $found = @($ast.FindAll({
+        param($node)
+        $node -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+            $node.Left.Extent.Text -eq $Left
+    }, $false))
+    Assert-Observer ($found.Count -eq 1) ('committed_assignment_count:' + $Left)
+    return $found[0]
+}
+function Get-CommittedFunction {
+    param([string]$Name)
+    $found = @($ast.FindAll({
+        param($node)
+        $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $Name
+    }, $false))
+    Assert-Observer ($found.Count -eq 1) ('committed_function_count:' + $Name)
+    return $found[0].Extent.Text
+}
+
+Add-Type -TypeDefinition (Get-CommittedAssignment '$script:EgNativeSource').Right.Expression.Value `
+    -ReferencedAssemblies @('System.Management.dll') -ErrorAction Stop
+Assert-Observer ([EnergyGridOneShotSupervisorNative]::VerifyX64StructureSizes()) 'native_x64_layout'
+$stateText = (Get-CommittedAssignment '$script:EgState').Extent.Text
+Invoke-Expression (Get-CommittedAssignment '$script:EgObserverMetadataTimeoutMilliseconds').Extent.Text
+Invoke-Expression (Get-CommittedAssignment '$script:EgObserverProcessGoneErrorCode').Extent.Text
+$committedBudget = $script:EgObserverMetadataTimeoutMilliseconds
+Assert-Observer ($committedBudget -eq 1000) 'committed_budget'
+Assert-Observer ($script:EgObserverProcessGoneErrorCode -eq 87) 'committed_gone_error'
+foreach ($name in @(
+    'Stop-EgSupervisor', 'Test-EgUnsafeText', 'ConvertTo-EgNativeCommandLine', 'Close-EgHandle',
+    'Get-EgCanonicalApplicationCommandLine', 'Get-EgAccounting', 'Invoke-EgTerminateJob',
+    'Get-EgDeadlineTicks', 'Test-EgDeadlineReached', 'Wait-EgReap', 'Get-EgStartVerdict'
+)) {
+    Invoke-Expression (Get-CommittedFunction $name)
+}
+$observerHeader = 'function Test-EgApplicationChild {'
+$committedObserver = Get-CommittedFunction 'Test-EgApplicationChild'
+Assert-Observer ($committedObserver.StartsWith($observerHeader)) 'committed_observer_header'
+function Use-CommittedObserver {
+    param([hashtable]$Replace = @{})
+    $text = $committedObserver
+    foreach ($pattern in $Replace.Keys) {
+        $count = ([regex]::Matches($text, $pattern)).Count
+        Assert-Observer ($count -eq 1) ('fault_injection_site_not_unique:' + $pattern)
+        $replacement = [string]$Replace[$pattern]
+        $text = [regex]::Replace($text, $pattern, { param($match) $replacement })
+    }
+    Invoke-Expression ('function script:Test-EgApplicationChild {' + $text.Substring($observerHeader.Length))
+}
+$busyField = [EnergyGridOneShotSupervisorNative].GetField(
+    'observerBusy', [System.Reflection.BindingFlags]'NonPublic, Static')
+Assert-Observer ($null -ne $busyField) 'observer_busy_field'
+function Wait-ProviderIdle {
+    for ($i = 0; $i -lt 400 -and [int]$busyField.GetValue($null) -ne 0; $i++) { Start-Sleep -Milliseconds 25 }
+    Assert-Observer ([int]$busyField.GetValue($null) -eq 0) 'provider_idle'
+}
+
+# The application image is a renamed copy of cmd.exe: with redirected standard input it
+# stays alive until that input closes, so it needs no interpreter, network or portal.
+$python = Join-Path $RootPath 'python.exe'
+Copy-Item -LiteralPath (Join-Path ([Environment]::SystemDirectory) 'cmd.exe') -Destination $python
+$TimeoutSeconds = 60
+$script:EgPythonExeNormal = [System.IO.Path]::GetFullPath($python)
+$script:EgConfigPathNormal = Join-Path $RootPath 'config.json'
+$canonicalArguments = '"-m" "energygrid_bill_downloader" "run" "--config" "' + $script:EgConfigPathNormal + '"'
+$canonicalLine = Get-EgCanonicalApplicationCommandLine
+$realCmd = Join-Path ([Environment]::SystemDirectory) 'cmd.exe'
+$hostnameExe = Join-Path ([Environment]::SystemDirectory) 'HOSTNAME.EXE'
+$powershell = Join-Path ([Environment]::SystemDirectory) 'WindowsPowerShell\v1.0\powershell.exe'
+$frequency = [System.Diagnostics.Stopwatch]::Frequency
+
+function Get-SpawnScript {
+    param([string]$File, [string]$Arguments, [string]$Tail = 'Start-Sleep -Seconds 30', [switch]$Inherit)
+    $redirect = ''
+    if (-not $Inherit) {
+        $redirect = "`$s.RedirectStandardInput = `$true; `$s.RedirectStandardOutput = `$true; `$s.RedirectStandardError = `$true; "
+    }
+    return "`$s = New-Object System.Diagnostics.ProcessStartInfo; `$s.FileName = '$File'; `$s.Arguments = '$Arguments'; " +
+        "`$s.UseShellExecute = `$false; `$s.CreateNoWindow = `$true; " + $redirect +
+        "`$c = New-Object System.Diagnostics.Process; `$c.StartInfo = `$s; [void]`$c.Start(); " +
+        "[IO.File]::WriteAllText('READY', [string]`$c.Id); $Tail"
+}
+$spoofScript = @'
+Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; using System.Text; public static class Spoof { [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)] public struct SI { public int cb; public string r; public string d; public string t; public int x, y, xs, ys, xc, yc, f, fl; public short w, c2; public IntPtr r2, i, o, e; } [StructLayout(LayoutKind.Sequential)] public struct PI { public IntPtr p, t; public int pid, tid; } [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern bool CreateProcessW(string a, StringBuilder c, IntPtr pa, IntPtr ta, bool ih, uint f, IntPtr env, string cwd, ref SI si, out PI pi); public static int Start(string app, string line) { SI si = new SI(); si.cb = Marshal.SizeOf(typeof(SI)); PI pi; if (!CreateProcessW(app, new StringBuilder(line), IntPtr.Zero, IntPtr.Zero, false, 0x08000000, IntPtr.Zero, null, ref si, out pi)) { return -Marshal.GetLastWin32Error(); } return pi.pid; } }'
+$childPid = [Spoof]::Start('APP', 'LINE'); [IO.File]::WriteAllText('READY', [string]$childPid); Start-Sleep -Seconds 30
+'@
+# Launcher preflight noise: a same-image probe with its own grandchild, then twelve
+# short-lived other-image helpers, then the long-lived canonical application child.
+$noiseScript = @"
+function P([string]`$f, [string]`$a) { `$s = New-Object System.Diagnostics.ProcessStartInfo; `$s.FileName = `$f; `$s.Arguments = `$a; `$s.UseShellExecute = `$false; `$s.CreateNoWindow = `$true; `$s.RedirectStandardOutput = `$true; `$s.RedirectStandardError = `$true; `$p = New-Object System.Diagnostics.Process; `$p.StartInfo = `$s; [void]`$p.Start(); `$o = `$p.StandardOutput.ReadToEndAsync(); `$e = `$p.StandardError.ReadToEndAsync(); `$p.WaitForExit(); [void]`$o.Result; [void]`$e.Result; `$p.Dispose() }
+P '$python' '/c cmd /c ver'
+for (`$i = 0; `$i -lt 12; `$i++) { P '$hostnameExe' '' }
+"@ + "`n" + (Get-SpawnScript $python $canonicalArguments)
+
+function Start-CaseJob {
+    param([string]$Name, [string]$StandIn)
+    Invoke-Expression $stateText
+    [EnergyGridOneShotSupervisorNative]::ResetControlState()
+    $ready = Join-Path $RootPath ('ready-' + $Name)
+    $job = [EnergyGridOneShotSupervisorNative]::CreateJob()
+    [EnergyGridOneShotSupervisorNative]::ConfigureJob($job)
+    $pipes = [EnergyGridOneShotSupervisorNative]::CreatePipes()
+    $attributes = New-Object EnergyGridOneShotSupervisorNative+AttributeResources(
+        $job, $pipes.LauncherStdinRead, $pipes.LauncherStdoutWrite, $pipes.LauncherStderrWrite)
+    $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($StandIn.Replace('READY', $ready)))
+    $builder = New-Object System.Text.StringBuilder((ConvertTo-EgNativeCommandLine -Argument @(
+        'powershell.exe', '-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', $encoded)))
+    $startTicks = [System.Diagnostics.Stopwatch]::GetTimestamp()
+    $creation = [EnergyGridOneShotSupervisorNative]::CreateContainedProcess(
+        $powershell, $builder, $RootPath, $attributes.AttributeList,
+        $pipes.LauncherStdinRead, $pipes.LauncherStdoutWrite, $pipes.LauncherStderrWrite)
+    $attributes.Dispose()
+    foreach ($handle in @($pipes.LauncherStdinRead, $pipes.LauncherStdoutWrite, $pipes.LauncherStderrWrite)) {
+        [void][EnergyGridOneShotSupervisorNative]::CloseHandleChecked($handle)
+    }
+    Assert-Observer $creation.Succeeded ('contained_creation:' + $Name)
+    $drains = @(
+        [EnergyGridOneShotSupervisorNative]::StartDrain($pipes.SupervisorStdoutRead),
+        [EnergyGridOneShotSupervisorNative]::StartDrain($pipes.SupervisorStderrRead)
+    )
+    $script:EgState.creation_attempted = $true
+    $script:EgState.creation_succeeded = $true
+    $baseline = Get-EgAccounting -JobHandle $job
+    $script:EgState.baseline_total_processes = [uint64]$baseline.TotalProcesses
+    $script:EgState.baseline_active_processes = [uint64]$baseline.ActiveProcesses
+    Assert-Observer ([EnergyGridOneShotSupervisorNative]::CommitIntent()) ('intent_gate:' + $Name)
+    $script:EgState.intent_committed = $true
+    $resume = [EnergyGridOneShotSupervisorNative]::TryResumeThread(
+        $creation.ProcessInfo.hThread, [int64]($startTicks + 60 * $frequency))
+    Assert-Observer ($resume.Accepted -and $resume.ReturnValue -eq 1) ('resume:' + $Name)
+    $script:EgState.resume_attempted = $true
+    $script:EgState.resume_succeeded = $true
+    return [pscustomobject]@{
+        Name = $Name; Job = $job; Creation = $creation; Pipes = $pipes; Drains = $drains
+        StartTicks = $startTicks; Ready = $ready
+    }
+}
+
+function Wait-CaseReady {
+    param($Case)
+    for ($i = 0; $i -lt 800 -and -not (Test-Path -LiteralPath $Case.Ready); $i++) { Start-Sleep -Milliseconds 25 }
+    Assert-Observer (Test-Path -LiteralPath $Case.Ready) ('stand_in_not_ready:' + $Case.Name)
+    Start-Sleep -Milliseconds 50
+    return [int]([IO.File]::ReadAllText($Case.Ready).Trim())
+}
+
+function Invoke-ObserverPass {
+    param($Case, [long]$StartTicks)
+    return [bool](Test-EgApplicationChild -JobHandle $Case.Job -LauncherHandle $Case.Creation.ProcessInfo.hProcess `
+        -LauncherPid $Case.Creation.ProcessInfo.dwProcessId -StartTicks $StartTicks)
+}
+
+function Stop-CaseJob {
+    param($Case, [switch]$Verdict)
+    $verdictText = ''
+    if ($Verdict) {
+        [void](Invoke-EgTerminateJob -JobHandle $Case.Job -Reason 'POST_CREATE_FAILURE')
+        [void](Wait-EgReap -JobHandle $Case.Job -DeadlineTicks ([int64]($Case.StartTicks + 60 * $frequency)) -WindowSeconds 30)
+        $verdictText = [string](Get-EgStartVerdict)
+    }
+    else {
+        [void][EnergyGridOneShotSupervisorNative]::TerminateJob($Case.Job, 1)
+    }
+    $reaped = $false
+    for ($i = 0; $i -lt 200; $i++) {
+        if (([EnergyGridOneShotSupervisorNative]::GetAccounting($Case.Job)).ActiveProcesses -eq 0) { $reaped = $true; break }
+        Start-Sleep -Milliseconds 50
+    }
+    foreach ($handle in @($Case.Creation.ProcessInfo.hThread, $Case.Creation.ProcessInfo.hProcess,
+            $Case.Pipes.SupervisorStdinWrite, $Case.Job)) {
+        [void][EnergyGridOneShotSupervisorNative]::CloseHandleChecked($handle)
+    }
+    foreach ($drain in $Case.Drains) { [void]$drain.Join(5000) }
+    Assert-Observer $reaped ('case_not_reaped:' + $Case.Name)
+    return $verdictText
+}
+
+$script:Results = New-Object 'System.Collections.Generic.List[string]'
+function Complete-Case {
+    param([string]$Name, [bool]$Observed, [bool]$ExpectObserved, [bool]$ExpectFailed,
+        [string]$Verdict = '', [string]$ExpectVerdict = '', [string]$Extra = '')
+    $failed = [bool]$script:EgState.observer_failed
+    $line = 'observer_case={0} observed={1} observer_failed={2} verdict={3}{4}' -f $Name, $Observed, $failed, $Verdict, $Extra
+    Write-Output $line
+    Assert-Observer ($Observed -eq $ExpectObserved) ($line + ' expected_observed=' + $ExpectObserved)
+    Assert-Observer ($failed -eq $ExpectFailed) ($line + ' expected_observer_failed=' + $ExpectFailed)
+    Assert-Observer ($Verdict -ceq $ExpectVerdict) ($line + ' expected_verdict=' + $ExpectVerdict)
+    $script:Results.Add($Name)
+}
+
+# One bounded observation case: wait for the stand-in to publish its child, then run
+# observer passes as the supervisor main loop does until observed or a sticky failure.
+function Invoke-MatrixCase {
+    param([string]$Name, [string]$StandIn, [bool]$ExpectObserved, [bool]$ExpectFailed,
+        [string]$ExpectVerdict = '', [int]$Passes = 20, [scriptblock]$Before, [scriptblock]$Ticks,
+        [switch]$WaitLauncherExit, [switch]$WaitChildExit, [switch]$Verdict)
+    $case = Start-CaseJob $Name $StandIn
+    $observed = $false
+    $verdictText = ''
+    try {
+        $script:CaseChildPid = Wait-CaseReady $case
+        if ($WaitLauncherExit) {
+            [void][EnergyGridOneShotSupervisorNative]::WaitProcess($case.Creation.ProcessInfo.hProcess, 10000)
+        }
+        if ($WaitChildExit) {
+            for ($i = 0; $i -lt 400 -and (Get-Process -Id $script:CaseChildPid -ErrorAction SilentlyContinue); $i++) {
+                Start-Sleep -Milliseconds 25
+            }
+        }
+        if ($null -ne $Before) { & $Before }
+        for ($pass = 0; $pass -lt $Passes -and -not $observed; $pass++) {
+            $startTicks = $case.StartTicks
+            if ($null -ne $Ticks) { $startTicks = & $Ticks }
+            if (Invoke-ObserverPass $case $startTicks) { $observed = $true }
+            if ($script:EgState.observer_failed) { break }
+            Start-Sleep -Milliseconds 50
+        }
+        $script:EgState.application_child_observed = $observed
+    }
+    finally {
+        $verdictText = Stop-CaseJob $case -Verdict:$Verdict
+    }
+    Complete-Case $Name $observed $ExpectObserved $ExpectFailed $verdictText $ExpectVerdict
+}
+
+$script:InjectPrepend = @()
+$script:InjectAppend = @()
+function Invoke-InjectedProcessIds {
+    param([IntPtr]$Handle)
+    $result = [EnergyGridOneShotSupervisorNative]::GetProcessIds($Handle)
+    if ($result.Succeeded) {
+        $result.ProcessIds = [uint32[]](@($script:InjectPrepend) + @($result.ProcessIds) + @($script:InjectAppend))
+    }
+    return $result
+}
+# Fault-injection sites are whitespace-tolerant patterns that must each match exactly once.
+$idsSite = [regex]::Escape('[EnergyGridOneShotSupervisorNative]::GetProcessIds($JobHandle)')
+$openSite = [regex]::Escape('[EnergyGridOneShotSupervisorNative]::OpenQueryProcess([uint32]$candidatePid)')
+$metadataSite = '\[EnergyGridOneShotSupervisorNative\]::QueryProcessMetadata\(\s*\[uint32\]\$candidatePid,\s*\$script:EgObserverMetadataTimeoutMilliseconds\)'
+
+$positive = Get-SpawnScript $python $canonicalArguments
+$quietLauncher = "Start-Sleep -Milliseconds 200; [IO.File]::WriteAllText('READY', '0'); Start-Sleep -Seconds 30"
+
+Use-CommittedObserver
+# P1: correct contained launcher and application child through the real WMI provider.
+Invoke-MatrixCase 'P1_positive' $positive $true $false 'STARTED_PROVEN' -Verdict
+
+# P2: launcher preflight noise; observation runs from resume, exactly like the main loop.
+$noiseObserved = 0
+$noiseFailed = 0
+for ($trial = 1; $trial -le 10; $trial++) {
+    $case = Start-CaseJob ('P2_noise_' + $trial) $noiseScript
+    $observed = $false
+    try {
+        $clock = [System.Diagnostics.Stopwatch]::StartNew()
+        while (-not $observed -and -not $script:EgState.observer_failed -and $clock.Elapsed.TotalSeconds -lt 25) {
+            if (Invoke-ObserverPass $case $case.StartTicks) { $observed = $true; break }
+            [void](Get-EgAccounting -JobHandle $case.Job)
+            $wait = [EnergyGridOneShotSupervisorNative]::WaitProcess($case.Creation.ProcessInfo.hProcess, 50)
+            if ($wait.Value -eq 0) { break }
+        }
+        $script:EgState.application_child_observed = $observed
+    }
+    finally {
+        [void](Stop-CaseJob $case)
+    }
+    if ($observed) { $noiseObserved++ }
+    if ($script:EgState.observer_failed) { $noiseFailed++ }
+}
+Write-Output ('observer_case=P2_preflight_noise trials=10 observed={0} observer_failed={1}' -f $noiseObserved, $noiseFailed)
+Assert-Observer ($noiseObserved -eq 10 -and $noiseFailed -eq 0) 'P2_preflight_noise'
+$script:Results.Add('P2_preflight_noise')
+
+$wrongParent = "`$i = '" + $positive.Replace("'", "''") + "'; `$e = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes(`$i)); " +
+    "Start-Process -FilePath '$powershell' -ArgumentList '-NoProfile','-EncodedCommand',`$e -WindowStyle Hidden; Start-Sleep -Seconds 30"
+Invoke-MatrixCase 'N1_wrong_parent' $wrongParent $false $false
+Invoke-MatrixCase 'N2_wrong_command_line' (Get-SpawnScript $python (
+    '"-m" "energygrid_bill_downloader" "list" "--config" "' + $script:EgConfigPathNormal + '"')) $false $false
+Invoke-MatrixCase 'N3_wrong_image_exact_command_line' (
+    $spoofScript.Replace("'APP'", "'" + $realCmd + "'").Replace("'LINE'", "'" + $canonicalLine.Replace("'", "''") + "'")) $false $false
+
+$script:OutsideChild = $null
+try {
+    Invoke-MatrixCase 'N4a_outside_job_exact_identity' $quietLauncher $false $false -Before {
+        $s = New-Object System.Diagnostics.ProcessStartInfo
+        $s.FileName = $python; $s.Arguments = $canonicalArguments; $s.UseShellExecute = $false; $s.CreateNoWindow = $true
+        $s.RedirectStandardInput = $true; $s.RedirectStandardOutput = $true
+        $script:OutsideChild = New-Object System.Diagnostics.Process
+        $script:OutsideChild.StartInfo = $s
+        [void]$script:OutsideChild.Start()
+        Start-Sleep -Milliseconds 300
+    }
+    Use-CommittedObserver @{ $idsSite = '(Invoke-InjectedProcessIds $JobHandle)' }
+    $script:InjectAppend = @([uint32]$script:OutsideChild.Id)
+    Invoke-MatrixCase 'N4b_injected_non_member_pid' $quietLauncher $false $false
+    $script:InjectAppend = @()
+}
+finally {
+    if ($null -ne $script:OutsideChild) {
+        if (-not $script:OutsideChild.HasExited) { $script:OutsideChild.Kill() }
+        $script:OutsideChild.WaitForExit()
+        $script:OutsideChild.Dispose()
+    }
+}
+# A listed PID that no longer exists makes OpenProcess return error 87; it must be skipped
+# as absent while the real application child is still proven.
+$gonePid = [uint32]4294967292
+$goneProbe = [EnergyGridOneShotSupervisorNative]::OpenQueryProcess($gonePid)
+Assert-Observer ((-not $goneProbe.Succeeded) -and $goneProbe.ErrorCode -eq 87) 'N5_precondition_open_error_87'
+$script:InjectPrepend = @($gonePid)
+Invoke-MatrixCase 'N5_gone_pid_87_then_positive' $positive $true $false 'STARTED_PROVEN' -Verdict
+$script:InjectPrepend = @()
+Use-CommittedObserver
+
+Wait-ProviderIdle
+$busyField.SetValue($null, 1)
+try {
+    Invoke-MatrixCase 'N6_provider_busy' $positive $false $true 'AMBIGUOUS' -Passes 1 -Verdict
+}
+finally {
+    $busyField.SetValue($null, 0)
+}
+# Deterministic provider timeout: the committed budget is lowered to 1 ms, far below any
+# measured WMI response, and the committed observer must fail closed.
+$script:EgObserverMetadataTimeoutMilliseconds = 1
+try {
+    Invoke-MatrixCase 'N7_provider_timeout' $positive $false $true 'AMBIGUOUS' -Passes 1 -Verdict
+}
+finally {
+    $script:EgObserverMetadataTimeoutMilliseconds = $committedBudget
+}
+Wait-ProviderIdle
+
+Invoke-MatrixCase 'N8_launcher_dead' (Get-SpawnScript $python $canonicalArguments 'exit 0' -Inherit) $false $false `
+    -WaitLauncherExit -Before {
+        Assert-Observer ([bool](Get-Process -Id $script:CaseChildPid -ErrorAction SilentlyContinue)) 'N8_child_alive'
+    }
+Invoke-MatrixCase 'N9_child_dead' (Get-SpawnScript $python $canonicalArguments (
+    '$c.StandardInput.Close(); $c.WaitForExit(); Start-Sleep -Seconds 30')) $false $false -WaitChildExit
+
+function Invoke-InjectedOpen {
+    param([uint32]$ProcessId)
+    $result = New-Object EnergyGridOneShotSupervisorNative+ProcessHandleResult
+    $result.Succeeded = $false
+    $result.ErrorCode = 5
+    return $result
+}
+Use-CommittedObserver @{ $openSite = '(Invoke-InjectedOpen ([uint32]$candidatePid))' }
+Invoke-MatrixCase 'N10_open_error_non_87' $positive $false $true -Passes 1
+
+Use-CommittedObserver @{ $metadataSite = '(Invoke-InjectedMetadata ([uint32]$candidatePid) $script:EgObserverMetadataTimeoutMilliseconds)' }
+function Invoke-InjectedMetadata {
+    param([uint32]$ProcessId, [int]$TimeoutMilliseconds)
+    return (New-Object EnergyGridOneShotSupervisorNative+ProcessMetadataResult)
+}
+Invoke-MatrixCase 'N11_no_row_candidate_live' $positive $false $true -Passes 1
+function Invoke-InjectedMetadata {
+    param([uint32]$ProcessId, [int]$TimeoutMilliseconds)
+    $result = New-Object EnergyGridOneShotSupervisorNative+ProcessMetadataResult
+    $result.Succeeded = $true
+    $result.TimedOut = $true
+    $result.ParentProcessId = 0
+    return $result
+}
+Invoke-MatrixCase 'N12_late_success_after_timeout' $positive $false $true -Passes 1
+function Invoke-InjectedMetadata {
+    param([uint32]$ProcessId, [int]$TimeoutMilliseconds)
+    Stop-Process -Id ([int]$ProcessId) -Force
+    for ($i = 0; $i -lt 200 -and (Get-Process -Id ([int]$ProcessId) -ErrorAction SilentlyContinue); $i++) {
+        Start-Sleep -Milliseconds 20
+    }
+    $result = [EnergyGridOneShotSupervisorNative]::QueryProcessMetadata($ProcessId, $TimeoutMilliseconds)
+    $script:NoRowResults.Add(('succeeded={0} timed_out={1} provider_failed={2}' -f
+        $result.Succeeded, $result.TimedOut, $result.ProviderFailed))
+    return $result
+}
+$script:NoRowResults = New-Object 'System.Collections.Generic.List[string]'
+Invoke-MatrixCase 'N13_real_no_row_after_exit' $positive $false $false -Passes 1
+Write-Output ('observer_no_row_results=' + ($script:NoRowResults -join ','))
+Assert-Observer ($script:NoRowResults.Count -eq 1 -and
+    $script:NoRowResults[0] -ceq 'succeeded=False timed_out=False provider_failed=False') 'N13_real_no_row_path'
+
+$script:MetadataCalls = 0
+function Invoke-InjectedMetadata {
+    param([uint32]$ProcessId, [int]$TimeoutMilliseconds)
+    $script:MetadataCalls++
+    return [EnergyGridOneShotSupervisorNative]::QueryProcessMetadata($ProcessId, $TimeoutMilliseconds)
+}
+# Deadline guard: only half a second of a one-second supervisor deadline remains, so the
+# whole provider budget cannot fit and no provider query may start.
+$TimeoutSeconds = 1
+try {
+    Invoke-MatrixCase 'N14_deadline_guard' $positive $false $false -Passes 1 -Ticks {
+        [int64]([System.Diagnostics.Stopwatch]::GetTimestamp() - $frequency / 2)
+    }
+}
+finally {
+    $TimeoutSeconds = 60
+}
+Write-Output ('observer_deadline_guard_metadata_calls=' + $script:MetadataCalls)
+Assert-Observer ($script:MetadataCalls -eq 0) 'N14_deadline_guard_started_a_query'
+Use-CommittedObserver
+
+$leftover = @(Get-Process -ErrorAction SilentlyContinue | Where-Object {
+    try { $_.Path -and [System.StringComparer]::OrdinalIgnoreCase.Equals($_.Path, $script:EgPythonExeNormal) } catch { $false }
+})
+Write-Output ('observer_leftover_processes=' + $leftover.Count)
+Assert-Observer ($leftover.Count -eq 0) 'leftover_application_processes'
+Assert-Observer ($script:Results.Count -eq 17) ('case_count=' + $script:Results.Count)
+Write-Output ('real_observer_matrix=PASS cases={0} budget_ms={1}' -f $script:Results.Count, $committedBudget)
+'''
+
+
+_END_TO_END_SUPERVISOR_HARNESS = r'''
+param(
+    [Parameter(Mandatory = $true)][string]$SupervisorPath,
+    [Parameter(Mandatory = $true)][string]$RootPath
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+function Assert-EndToEnd {
+    param([bool]$Condition, [string]$Message)
+    if (-not $Condition) { throw ('e2e_supervisor_assertion_failed: ' + $Message) }
+}
+
+# The whole committed supervisor runs as its own native Windows PowerShell 5.1 process
+# with a stand-in launcher.  The stand-in has no credential, configuration, portal,
+# Scheduler or network surface; its application child is a renamed copy of cmd.exe.
+$standInLauncher = @'
+[CmdletBinding()]
+param([string]$ConfigPath, [string]$PythonExe, [string]$CheckoutRoot, [string]$CredentialPath,
+    [string]$BrowserCachePath, [string]$ExpectedBranch, [string[]]$AuthorisedLauncherRootWriteSid,
+    [string]$Command, [string]$LogRoot, [string]$RunId)
+$ErrorActionPreference = 'Stop'
+$mode = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'mode.txt')).Trim()
+if ($mode -eq 'early') { exit 70 }
+function Quote([string[]]$Items) { ($Items | ForEach-Object { '"' + $_ + '"' }) -join ' ' }
+function Probe([string]$File, [string]$Arguments) {
+    $s = New-Object System.Diagnostics.ProcessStartInfo; $s.FileName = $File; $s.Arguments = $Arguments
+    $s.UseShellExecute = $false; $s.CreateNoWindow = $true; $s.RedirectStandardOutput = $true; $s.RedirectStandardError = $true
+    $p = New-Object System.Diagnostics.Process; $p.StartInfo = $s; [void]$p.Start()
+    $o = $p.StandardOutput.ReadToEndAsync(); $e = $p.StandardError.ReadToEndAsync(); $p.WaitForExit(); [void]$o.Result; [void]$e.Result; $p.Dispose()
+}
+if ($mode -eq 'noise') {
+    Probe $PythonExe '/c cmd /c ver'
+    for ($i = 0; $i -lt 12; $i++) { Probe (Join-Path ([Environment]::SystemDirectory) 'HOSTNAME.EXE') '' }
+}
+$operation = $Command
+if ($mode -eq 'wrongcmd') { $operation = 'list' }
+$s = New-Object System.Diagnostics.ProcessStartInfo; $s.FileName = $PythonExe
+$s.Arguments = Quote @('-m', 'energygrid_bill_downloader', $operation, '--config', $ConfigPath)
+$s.UseShellExecute = $false; $s.CreateNoWindow = $true; $s.RedirectStandardInput = $true; $s.RedirectStandardOutput = $true; $s.RedirectStandardError = $true
+$c = New-Object System.Diagnostics.Process; $c.StartInfo = $s; [void]$c.Start()
+$o = $c.StandardOutput.ReadToEndAsync(); $e = $c.StandardError.ReadToEndAsync()
+Start-Sleep -Seconds 3
+$c.StandardInput.Close(); $c.WaitForExit(); [void]$o.Result; [void]$e.Result
+exit 0
+'@
+
+$powershell = Join-Path ([Environment]::SystemDirectory) 'WindowsPowerShell\v1.0\powershell.exe'
+$systemSid = (New-Object System.Security.Principal.SecurityIdentifier(
+    [System.Security.Principal.WellKnownSidType]::LocalSystemSid, $null)).Value
+$administratorsSid = (New-Object System.Security.Principal.SecurityIdentifier(
+    [System.Security.Principal.WellKnownSidType]::BuiltinAdministratorsSid, $null)).Value
+$currentSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+function ConvertTo-Literal { param([string]$Value) return "'" + $Value.Replace("'", "''") + "'" }
+
+function Invoke-EndToEndCase {
+    param([string]$Name, [string]$Mode)
+    $root = Join-Path $RootPath $Name
+    foreach ($sub in 'bin', 'venv', 'checkout', 'evidence', 'logs') {
+        [void][System.IO.Directory]::CreateDirectory((Join-Path $root $sub))
+    }
+    $launcher = Join-Path $root 'bin\launcher.ps1'
+    $library = Join-Path $root 'bin\launcher_lib.ps1'
+    [System.IO.File]::WriteAllText($launcher, $standInLauncher, [System.Text.Encoding]::ASCII)
+    [System.IO.File]::WriteAllText($library, "# stand-in launcher library`n", [System.Text.Encoding]::ASCII)
+    [System.IO.File]::WriteAllText((Join-Path $root 'bin\mode.txt'), $Mode, [System.Text.Encoding]::ASCII)
+    $python = Join-Path $root 'venv\python.exe'
+    Copy-Item -LiteralPath (Join-Path ([Environment]::SystemDirectory) 'cmd.exe') -Destination $python
+    $evidence = Join-Path $root 'evidence'
+    $security = New-Object System.Security.AccessControl.DirectorySecurity
+    $security.SetAccessRuleProtection($true, $false)
+    $inherit = [System.Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
+    foreach ($sid in @($currentSid, $systemSid, $administratorsSid)) {
+        $security.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+            (New-Object System.Security.Principal.SecurityIdentifier($sid)), 'FullControl', $inherit, 'None', 'Allow')))
+    }
+    [System.IO.Directory]::SetAccessControl($evidence, $security)
+    $runId = [guid]::NewGuid().ToString()
+    $wrapper = '$p = [ordered]@{ LauncherPath = ' + (ConvertTo-Literal $launcher) +
+        '; ExpectedLauncherSha256 = ' + (ConvertTo-Literal (Get-FileHash -LiteralPath $launcher).Hash) +
+        '; ExpectedLauncherLibrarySha256 = ' + (ConvertTo-Literal (Get-FileHash -LiteralPath $library).Hash) +
+        '; ConfigPath = ' + (ConvertTo-Literal (Join-Path $root 'config.json')) +
+        '; PythonExe = ' + (ConvertTo-Literal $python) +
+        '; CheckoutRoot = ' + (ConvertTo-Literal (Join-Path $root 'checkout')) +
+        '; CredentialPath = ' + (ConvertTo-Literal (Join-Path $root 'credential.xml')) +
+        '; BrowserCachePath = ' + (ConvertTo-Literal (Join-Path $root 'cache')) +
+        "; ExpectedBranch = 'main'; AuthorisedLauncherRootWriteSid = [string[]]@(" +
+        (ConvertTo-Literal $systemSid) + ', ' + (ConvertTo-Literal $administratorsSid) + ')' +
+        '; LogRoot = ' + (ConvertTo-Literal (Join-Path $root 'logs')) +
+        '; EvidenceRoot = ' + (ConvertTo-Literal $evidence) + '; RunId = ' + (ConvertTo-Literal $runId) +
+        '; TimeoutSeconds = 60 }; & ' + (ConvertTo-Literal $SupervisorPath) + ' @p; exit $LASTEXITCODE'
+    $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($wrapper))
+    $output = @(& $powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand $encoded 2>$null)
+    $exitCode = $LASTEXITCODE
+    $projectionLines = @($output | Where-Object { $_ -is [string] -and $_.StartsWith('{') })
+    Assert-EndToEnd ($projectionLines.Count -eq 1) ($Name + '_projection_count=' + $projectionLines.Count)
+    $projection = $projectionLines[0] | ConvertFrom-Json
+    $intentPath = Join-Path $evidence ($runId + '.intent.json')
+    $outcomePath = Join-Path $evidence ($runId + '.outcome.json')
+    Assert-EndToEnd (Test-Path -LiteralPath $intentPath -PathType Leaf) ($Name + '_intent_missing')
+    Assert-EndToEnd (Test-Path -LiteralPath $outcomePath -PathType Leaf) ($Name + '_outcome_missing')
+    $intent = [System.IO.File]::ReadAllText($intentPath) | ConvertFrom-Json
+    $outcome = [System.IO.File]::ReadAllText($outcomePath) | ConvertFrom-Json
+    $intentHash = (Get-FileHash -LiteralPath $intentPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    $integrity = ($intent.run_id -ceq $runId) -and ($outcome.run_id -ceq $runId) -and
+        ($outcome.intent_sha256 -ceq $intentHash) -and
+        ($outcome.start_verdict -ceq $projection.start_verdict) -and
+        ([bool]$outcome.application_child_observed -eq [bool]$projection.application_child_observed) -and
+        ([bool]$outcome.reap_confirmed -eq [bool]$projection.reap_confirmed)
+    $leftover = @(Get-Process -ErrorAction SilentlyContinue | Where-Object {
+        try { $_.Path -and [System.StringComparer]::OrdinalIgnoreCase.Equals($_.Path, $python) } catch { $false }
+    })
+    $line = ('e2e_case={0} exit={1} verdict={2} observed={3} launcher_exit={4} reap={5} total_processes={6} ' +
+        'integrity={7} leftover={8}') -f $Name, $exitCode, $outcome.start_verdict,
+        $projection.application_child_observed, $projection.launcher_exit_code, $projection.reap_confirmed,
+        $projection.total_processes, $integrity, $leftover.Count
+    Assert-EndToEnd $integrity ($line + ' intent_outcome_integrity')
+    Assert-EndToEnd ([bool]$projection.reap_confirmed) ($line + ' reap')
+    Assert-EndToEnd ($leftover.Count -eq 0) ($line + ' leftover')
+    return [pscustomobject]@{
+        Line = $line; Exit = $exitCode; Verdict = [string]$outcome.start_verdict
+        Observed = [bool]$projection.application_child_observed; LauncherExit = $projection.launcher_exit_code
+        Total = $projection.total_processes
+    }
+}
+
+$cases = 0
+foreach ($mode in @('positive', 'noise')) {
+    $result = Invoke-EndToEndCase ('E' + ($cases + 1) + '_' + $mode) $mode
+    Write-Output $result.Line
+    Assert-EndToEnd ($result.Exit -eq 0 -and $result.Verdict -ceq 'STARTED_PROVEN' -and $result.Observed -and
+        $result.LauncherExit -eq 0) ($result.Line + ' expected exit=0 STARTED_PROVEN observed')
+    $cases++
+}
+$result = Invoke-EndToEndCase 'E3_wrong_command_line' 'wrongcmd'
+Write-Output $result.Line
+Assert-EndToEnd ($result.Exit -eq 4 -and $result.Verdict -ceq 'AMBIGUOUS' -and -not $result.Observed) (
+    $result.Line + ' expected exit=4 AMBIGUOUS not observed')
+$cases++
+# A contained PowerShell launcher adds conhost to the Job, so a launcher that fails before
+# any application child is conservatively AMBIGUOUS, never NOT_STARTED or STARTED proof.
+$result = Invoke-EndToEndCase 'E4_launcher_exit_70_no_child' 'early'
+Write-Output $result.Line
+Assert-EndToEnd ($result.Exit -eq 4 -and $result.Verdict -ceq 'AMBIGUOUS' -and -not $result.Observed -and
+    $result.LauncherExit -eq 70 -and [uint64]$result.Total -eq 2) (
+    $result.Line + ' expected exit=4 AMBIGUOUS launcher_exit=70 total_processes=2')
+$cases++
+Write-Output ('e2e_supervisor=PASS cases=' + $cases)
+'''
+
+
+class SupervisorRealObserverTests(unittest.TestCase):
+    """Real Job, launcher, application child, committed observer and WMI provider."""
+
+    def _run_harness(self, script, prefix, timeout):
+        if os.name != "nt":
+            self.skipTest("the real observer boundary exists only on Windows")
+        powershell = native_powershell()
+        self.assertIsNotNone(powershell, "Windows PowerShell 5.1 is required, not optional")
+        with tempfile.TemporaryDirectory(prefix=prefix) as directory:
+            # The committed observer compares the long image path, so resolve any 8.3 alias.
+            root = Path(os.path.realpath(directory))
+            harness = root / "harness.ps1"
+            harness.write_text(script, encoding="ascii")
+            result = subprocess.run(
+                [
+                    powershell,
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    str(harness),
+                    "-SupervisorPath",
+                    str(SUPERVISOR),
+                    "-RootPath",
+                    str(root),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+            print(result.stdout, flush=True)
+            self.assertEqual(0, result.returncode, result.stdout + "\n" + result.stderr)
+            return result.stdout
+
+    def test_real_observer_matrix_through_committed_observer_and_wmi(self):
+        output = self._run_harness(_REAL_OBSERVER_HARNESS, "eg_real_observer_", 900)
+        for case in (
+            "P1_positive observed=True observer_failed=False verdict=STARTED_PROVEN",
+            "N1_wrong_parent observed=False observer_failed=False",
+            "N2_wrong_command_line observed=False observer_failed=False",
+            "N3_wrong_image_exact_command_line observed=False observer_failed=False",
+            "N4a_outside_job_exact_identity observed=False observer_failed=False",
+            "N4b_injected_non_member_pid observed=False observer_failed=False",
+            "N5_gone_pid_87_then_positive observed=True observer_failed=False verdict=STARTED_PROVEN",
+            "N6_provider_busy observed=False observer_failed=True verdict=AMBIGUOUS",
+            "N7_provider_timeout observed=False observer_failed=True verdict=AMBIGUOUS",
+            "N8_launcher_dead observed=False observer_failed=False",
+            "N9_child_dead observed=False observer_failed=False",
+            "N10_open_error_non_87 observed=False observer_failed=True",
+            "N11_no_row_candidate_live observed=False observer_failed=True",
+            "N12_late_success_after_timeout observed=False observer_failed=True",
+            "N13_real_no_row_after_exit observed=False observer_failed=False",
+            "N14_deadline_guard observed=False observer_failed=False",
+        ):
+            self.assertIn("observer_case=" + case, output)
+        self.assertIn(
+            "observer_case=P2_preflight_noise trials=10 observed=10 observer_failed=0", output)
+        self.assertIn(
+            "observer_no_row_results=succeeded=False timed_out=False provider_failed=False", output)
+        self.assertIn("observer_deadline_guard_metadata_calls=0", output)
+        self.assertIn("observer_leftover_processes=0", output)
+        self.assertIn("real_observer_matrix=PASS cases=17 budget_ms=1000", output)
+
+    def test_whole_supervisor_end_to_end_with_real_launcher_and_child(self):
+        output = self._run_harness(_END_TO_END_SUPERVISOR_HARNESS, "eg_e2e_supervisor_", 600)
+        for case in (
+            "E1_positive exit=0 verdict=STARTED_PROVEN observed=True launcher_exit=0 reap=True",
+            "E2_noise exit=0 verdict=STARTED_PROVEN observed=True launcher_exit=0 reap=True",
+            "E3_wrong_command_line exit=4 verdict=AMBIGUOUS observed=False launcher_exit=0 reap=True",
+            "E4_launcher_exit_70_no_child exit=4 verdict=AMBIGUOUS observed=False launcher_exit=70 "
+            "reap=True total_processes=2",
+        ):
+            self.assertIn("e2e_case=" + case, output)
+        self.assertEqual(4, output.count("integrity=True leftover=0"))
+        self.assertIn("e2e_supervisor=PASS cases=4", output)
 
 
 if __name__ == "__main__":
