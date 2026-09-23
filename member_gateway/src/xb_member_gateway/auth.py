@@ -64,6 +64,10 @@ WORKER_SCOPES = frozenset(
     }
 )
 RECOVERY_SCOPES = frozenset({"worker.writer_termination_recovery"})
+# The n8n mailer may only claim, record send intent, and post a result for a
+# welcome-email outbox row. It can never reach member, source or control paths.
+MAILER_SCOPES = frozenset({"welcome_email.claim", "welcome_email.send_intent", "welcome_email.result"})
+PRINCIPAL_COUNT = 6
 
 
 def worker_session(value: str) -> str:
@@ -119,10 +123,10 @@ class BearerTokenAuthenticator:
         tokens = [source.get(name, "") for name in config.credential_env_names]
         if any(not token or any(character.isspace() for character in token) for token in tokens):
             return rejected("authentication_binding_missing")
-        if len(set(tokens)) != 5:
+        if len(set(tokens)) != PRINCIPAL_COUNT:
             return rejected("authentication_binding_aliased")
         digests = [hashlib.sha256(token.encode("utf-8")).hexdigest() for token in tokens]
-        if len(set(digests)) != 5:
+        if len(set(digests)) != PRINCIPAL_COUNT:
             return rejected("authentication_binding_aliased")
         if any(not hmac.compare_digest(expected or "", actual) for expected, actual in zip(config.credential_digests, digests)):
             return rejected("authentication_binding_mismatch")
@@ -132,6 +136,7 @@ class BearerTokenAuthenticator:
             Principal("configured-control", CONTROL_SCOPES),
             Principal("configured-worker", WORKER_SCOPES),
             Principal("configured-recovery", RECOVERY_SCOPES),
+            Principal("configured-mailer", MAILER_SCOPES),
         )
         return cls(dict(zip(digests, principals)))
 

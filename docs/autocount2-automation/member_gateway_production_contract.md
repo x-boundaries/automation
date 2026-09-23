@@ -28,22 +28,99 @@ insignificant whitespace is hashed before ingest.
 a same-ID/different-hash observation is a conflict; a different ID remains a
 different signup even when its customer fields match. The checked-in inactive
 adapter consumes the Google Forms v1 `responses` shape and maps required values
-only through the versioned question-ID allowlist. Config v2 requires a
-timezone-aware RFC3339 cutover watermark and a closed set of distinct question
-IDs before admission. Queries are inclusive (`createTime >= watermark`), pages
-are sorted by `(create_time, response_id)`, and an observation earlier than the
-watermark is rejected before job creation or cursor movement.
+only through the versioned question-ID allowlist. Config v2 requires a closed
+set of distinct question IDs, the fixed `source_production_cutover_exact`, and
+the closed `source_admission_mode` (`first_member` or `continuous`) before
+admission.
 
-Migration `0004_forms_ingest_cursor.sql` adds the keyed durable cursor and
-append-only page receipts without seeding production state. Source-event
-admission and monotonic response-cursor movement commit atomically. Page-token
-movement is a separate compare-and-set checkpoint and is permitted only when
-every eligible page response has an identical durable response-ID/payload-hash
-receipt. Terminal pagination clears the token and deliberately restarts
-inclusively from the durable response cursor. Same-ID/same-hash overlap is
-idempotent; conflicting hashes, reordered unseen responses behind the cursor,
-malformed/repeated/conflicting tokens, and any cursor regression fail closed.
-The initial deployment window admits at most one newly seen response.
+### Exact source identity and the fixed cutover
+
+Google's `createTime` is preserved byte-for-byte as `create_time_exact`. Only
+the Google-issued UTC `Z` forms with 0, 3, 6 or 9 fractional digits are
+accepted; any other width, any offset and any naive value is rejected at the
+ingest API and again at durable admission. Ordering against the cutover uses
+the lossless `(epoch_second, nanoseconds)` key; nothing on the identity path is
+round-tripped through Python `datetime`, PostgreSQL `timestamptz`, or a
+JavaScript `Date`. The same `responseId` with a byte-different exact
+`createTime` is an immutable-source conflict even when both strings name the
+same instant. `create_time_utc` (truncated, never rounded, to microseconds) is
+a business derivative only: it feeds `RegisterDate` in `Asia/Singapore` and the
+worker envelope, so a 9-digit fraction can never move `RegisterDate` forward.
+
+`source_production_cutover_exact` is the only source exclusion lower bound.
+Every scan epoch uses the verbatim inclusive filter
+`timestamp >= <production_cutover_exact>`. It never auto-advances: no admitted
+response, terminal page, highest observed timestamp, page token or completed
+epoch moves it. The deprecated watermark, admitted tuple
+(`last_admitted_create_time`, `last_admitted_response_id`), resume token and
+0004 page receipts remain physically present as audit-only history; no code
+path reads them as admission, filtering, checkpoint or skip authority.
+
+### Receipt-driven admission
+
+Admission is driven by one durable handling receipt per `responseId`:
+
+- matching prior receipt (exact `createTime`, form binding, mapping version and
+  payload fingerprint) replays the original job or rejection;
+- any conflicting exact source identity or fingerprint fails closed;
+- an unseen customer-valid response atomically records the source response,
+  the member job and an `ACCEPTED` receipt;
+- an unseen customer-invalid response with a valid source identity atomically
+  records a PII-free rejection (`xb.member.source_rejection.v1`: fingerprint and
+  a customer-validation code only) and a `REJECTED` receipt.
+
+An unseen response is never compared with another response's position.
+Mapping, identity, timestamp, token, schema and OAuth failures are never
+rejections; they receive no receipt and block the page.
+
+### Scan epochs and the two-phase page protocol
+
+One `ACTIVE` epoch exists per source binding. Page tokens are private,
+epoch-scoped hints; repetition is rejected only within the same epoch, and the
+same opaque token in a successor epoch is not a conflict. Each page is
+`OPEN` (request token, next token, terminal flag and item identities persisted
+before the epoch token can move), then one `ACCEPTED`/`REJECTED` receipt per
+item, then `COMMIT`, which verifies a matching receipt for every item (a
+foreign key to the receipt makes this structural), appends page-item relations
+and advances the epoch token under compare-and-set. An empty terminal page may
+commit; only a committed terminal page completes an epoch. OPEN and COMMIT are
+idempotent for an identical replay. Restart from the same fixed cutover is
+allowed only for `token_invalidated` or `ambiguous_crashed_attempt`; any other
+reason is `422 source_restart_reason_invalid`.
+
+### Admission modes
+
+`first_member` uses page size 1 and an atomic 0 -> 1 accepted-member guard.
+A valid customer rejection may checkpoint without consuming the allowance. A
+losing concurrent member admission gets no receipt, cannot checkpoint, and is
+neither rejected nor skipped. `continuous` (only after separate Owner/Web
+acceptance) begins a new mode-bound epoch from the same cutover, abandoning the
+`first_member` epoch with `admission_mode_changed`; every response, rejection,
+job and page record is retained and replays. Production activation no longer
+changes source admission semantics.
+
+### Cursor-v2 endpoints
+
+All carry scope `source.ingest`:
+
+```text
+GET  /v1/source/cursor?form_alias=&mapping_version=   cursor v2 + active epoch
+POST /v1/source/epochs/begin                          begin or resume the ACTIVE epoch
+POST /v1/source/epochs/{epoch_id}/restart             allowlisted restart reason
+POST /v1/source/epochs/{epoch_id}/pages/open          CAS OPEN
+POST /v1/source/pages/{page_id}/commit                CAS COMMIT (verifies receipts)
+POST /v1/source-rejections                            PII-free REJECTED receipt
+```
+
+Closed error codes include `source_epoch_state_version_mismatch`,
+`source_page_token_unexpected`, `source_page_token_repeated_in_epoch`,
+`source_page_item_unreceipted`, `source_page_item_receipt_mismatch`,
+`source_page_already_open`, `source_event_before_cutover`,
+`source_identity_payload_conflict`, `initial_source_window_exhausted` (409) and
+`source_restart_reason_invalid` (422). Cursor v2
+(`schemas/member_gateway_source_cursor.v2.schema.json`) omits the deprecated
+admitted tuple and resume token. `schemas/member_gateway_source_cursor.v1.schema.json`
+is retained unchanged for compatibility; the v1 page-checkpoint route is removed.
 
 ## Member semantics
 
@@ -118,10 +195,13 @@ Git, errors, and logs.
 
 The only production entry is `python -m xb_member_gateway --config
 <reviewed-external-config>`. It loads closed config v2, enforces safe defaults,
-resolves only named PostgreSQL, bind, reference-HMAC, and five bearer
-boundaries, validates separation, builds the authenticator and repository, and
-performs read-only admission checks for migrations 0001 through 0004, control
-rows, and initialized cursor/watermark consistency. Only then may it construct
+resolves only named PostgreSQL, bind, reference-HMAC, and six bearer
+boundaries (source, operator, control, worker, recovery, mailer), validates
+separation, builds the authenticator and repository, and performs read-only
+admission checks for migrations 0001 through 0005, control rows, the
+initialized watermark, exact production cutover and form binding, the absence
+of any source response without an exact `createTime` or handling receipt, and
+the absence of any `CREATED_VERIFIED` result without a welcome outbox row. Only then may it construct
 the service/application and listen. Bootstrap never migrates, initializes,
 repairs, discovers identity, generates credentials, clears the kill switch, or
 activates the gateway; failures expose bounded codes only.
@@ -298,6 +378,22 @@ The separate 0004 migration adds only the durable Forms cursor and append-only
 page receipts. It does not modify migrations 0001-0003 and does not seed a real
 watermark or cursor; one-time production initialization is a later authorised
 deployment transaction.
+The additive 0005 migration (`0005_member_vertical_slice.sql`) adds exact source
+time columns, unified handling receipts, PII-free rejections, scan epochs,
+pages and page items (token uniqueness scoped to the epoch), append-only and
+immutability triggers, the `welcome_v1` outbox and its append-only events. It
+modifies no earlier migration, deletes nothing and seeds no production cutover
+or form binding. Rows admitted before 0005 cannot prove their exact Google
+string, so the column stays nullable and bootstrap readiness fails closed with
+`source_exact_time_backfill_missing` until a reviewed backfill; exact values are
+never guessed.
+
+The first `results` insert on both the leased worker path and the confirmed
+termination path previously named 11 columns but supplied 12 placeholders for
+11 parameters, so psycopg rejected it and no positive result could be recorded
+against a real database. Both statements now share one 11/11 statement, and the
+offline PostgreSQL test cursor runs every statement through psycopg's real query
+adaptation so a placeholder/parameter mismatch cannot pass silently again.
 The current projection is replaced by a conditional update only after the
 immutable result event is recorded in the same transaction; the unique `job_id`
 projection is never delete/reinserted. No database transaction remains open
@@ -360,6 +456,59 @@ started manually for dark bring-up, so no unattended activation authority is
 created. Dark bring-up keeps production activation false, the kill switch true,
 the adapter not ready, and the initialized source cursor and watermark
 unchanged.
+
+## Welcome email outbox
+
+Owner-approved `welcome_v1`: From `X-Boundaries <noreply@x-boundaries.com>`, no
+Reply-To, subject and plain-text body `Welcome to X-Boundaries!`. The gateway,
+never form input or the n8n export, constructs the message and records its
+hash; the mailer sends it verbatim after verifying that hash.
+
+A unique outbox row (`UNIQUE (response_id, template_id)`, `UNIQUE (job_id)`) is
+inserted inside the same `acknowledge_result` transaction that first records
+`CREATED_VERIFIED`, on both the leased worker path and the exact-match
+reconciliation projection. A database trigger refuses any outbox insert without
+a `CREATED_VERIFIED` result. A duplicate positive acknowledgement verifies the
+existing outbox identity and fails closed if it is missing; historical success
+is never backfilled. Uncertain, absent, mismatch, rejected, manual-review and
+dead-letter outcomes create no outbox row.
+
+State machine:
+
+```text
+PENDING -> LEASED -> RETRY_WAIT              (failure before any send intent)
+                  -> DEAD_LETTER             (third definitively safe failure)
+                  -> SEND_INTENT_RECORDED -> SENT
+                                          -> DELIVERY_OUTCOME_UNCERTAIN
+RETRY_WAIT -> LEASED | DEAD_LETTER
+```
+
+A row becomes claimable one minute after `CREATED_VERIFIED`, then +5 and +30
+minutes after the first and second safe failures; the third safe failure
+dead-letters. The claim lease is 120 seconds and only one row may be leased at
+a time. Send Email automatic retry is disabled. Positive Send Email completion
+records `SENT`, meaning SMTP accepted the message, not inbox delivery. After a
+send intent, any timeout, crash, lost acknowledgement or unclassified outcome
+(including lease expiry) is `DELIVERY_OUTCOME_UNCERTAIN`, which is never
+claimable, so no blind resend can happen; a future resend needs private positive
+proof that SMTP did not accept. Email failure never touches the member job,
+allocation or AutoCount.
+
+The sixth `configured-mailer` principal holds only `welcome_email.claim`,
+`welcome_email.send_intent` and `welcome_email.result`; it is denied every
+member, source, control and operator route, and no other principal can reach
+the welcome-email routes:
+
+```text
+POST /v1/welcome-emails/claim
+POST /v1/welcome-emails/{outbox_id}/send-intent
+POST /v1/welcome-emails/{outbox_id}/result
+```
+
+The mailer claim envelope is `xb.member.welcome_email.job.v1`; recipients,
+response IDs and message payloads stay private. Public-safe evidence is limited
+to outbox/job IDs, the HMAC source reference, hashes, state, version, attempt,
+template and bounded error codes.
 
 ## Unsupported production prerequisites
 

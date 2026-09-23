@@ -1,0 +1,40 @@
+{
+  "schema_version": "xb.member.welcome_email.bounded_import.binding.v1",
+  "project": {
+    "id": "PROJECT_ID_PLACEHOLDER",
+    "name": "Member Gateway"
+  },
+  "workflow": {
+    "id": "WORKFLOW_ID_PLACEHOLDER",
+    "name": "Member Gateway - welcome email outbox mailer (inactive)"
+  },
+  "endpoints": {
+    "gateway_origin": "https://gateway.example.com:443"
+  },
+  "credential_roles": {
+    "gateway_mailer_bearer": {
+      "credential_id": "GATEWAY_MAILER_BEARER_CREDENTIAL_ID_PLACEHOLDER",
+      "credential_name": "GATEWAY_MAILER_BEARER_CREDENTIAL_NAME_PLACEHOLDER",
+      "credential_type": "httpBearerAuth",
+      "node_names": [
+        "Claim one welcome email",
+        "Record welcome send intent",
+        "Record SMTP acceptance",
+        "Record uncertain delivery outcome"
+      ]
+    },
+    "smtp": {
+      "credential_id": "SMTP_CREDENTIAL_ID_PLACEHOLDER",
+      "credential_name": "SMTP_CREDENTIAL_NAME_PLACEHOLDER",
+      "credential_type": "smtp",
+      "node_names": [
+        "Send welcome email (SMTP configured outside repo)"
+      ]
+    }
+  },
+  "security": {
+    "approved_gateway_origin": "https://gateway.example.com:443",
+    "mailer_token_env": "XB_MEMBER_GATEWAY_MAILER_TOKEN",
+    "n8n_target_mode": "explicit-reviewed-target"
+  }
+}

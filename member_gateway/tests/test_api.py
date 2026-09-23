@@ -531,29 +531,27 @@ class ApiBoundaryTests(unittest.TestCase):
         self.assertEqual(disabled.status, 200)
         self.assertFalse(repository.get_control()["kill_switch_enabled"])
 
-    def test_runtime_activation_releases_initial_window_without_releasing_ordering(self):
+    def test_admission_cap_is_bound_to_mode_not_runtime_activation(self):
         repository = InMemoryRepository(source_cutover_watermark="2026-08-30T00:00:00Z")
         repository.set_control("kill_switch_enabled", True)
         repository.set_control("production_activation_enabled", False)
-        service = GatewayService(
+        first_member = GatewayService(
             make_config(
                 production_activation_enabled=False,
                 kill_switch_enabled=True,
                 source_cutover_watermark="2026-08-30T00:00:00Z",
+                source_production_cutover_exact="2026-08-30T00:00:00Z",
+                source_admission_mode="first_member",
             ),
             repository,
             adapter_ready=True,
             clock=NOW,
         )
-        app = GatewayApp(
-            service,
-            StaticAuthenticator(
-                {
-                    "source-token": Principal("synthetic-source", frozenset({"source.ingest"})),
-                    "control-token": Principal("synthetic-control", frozenset({"control.activate"})),
-                }
-            ),
-        )
+        principals = {
+            "source-token": Principal("synthetic-source", frozenset({"source.ingest"})),
+            "control-token": Principal("synthetic-control", frozenset({"control.activate"})),
+        }
+        app = GatewayApp(first_member, StaticAuthenticator(principals))
         source_headers = {"Authorization": "Bearer source-token"}
         control_headers = {"Authorization": "Bearer control-token"}
 
@@ -570,24 +568,57 @@ class ApiBoundaryTests(unittest.TestCase):
         self.assertEqual(blocked.status, 409)
         self.assertEqual(blocked.body["error_code"], "initial_source_window_exhausted")
 
+        # Runtime activation no longer changes source admission semantics.
         activated = app.handle(
             "POST", "/v1/control/activation", headers=control_headers,
             body={"enabled": True, "environment": "production", "approval_reference": "synthetic-approval-002"},
         )
         self.assertEqual(activated.status, 200)
-        self.assertTrue(repository.get_control()["production_activation_enabled"])
+        still_blocked = app.handle("POST", "/v1/source-events", headers=source_headers, body=second)
+        self.assertEqual(still_blocked.body["error_code"], "initial_source_window_exhausted")
+
+        # Only the separately authorised continuous mode removes the cap, and
+        # an unseen response earlier than an admitted one is still admitted.
+        continuous = GatewayService(
+            make_config(
+                source_cutover_watermark="2026-08-30T00:00:00Z",
+                source_production_cutover_exact="2026-08-30T00:00:00Z",
+                source_admission_mode="continuous",
+            ),
+            repository, adapter_ready=True, clock=NOW,
+        )
+        app = GatewayApp(continuous, StaticAuthenticator(principals))
         self.assertEqual(app.handle("POST", "/v1/source-events", headers=source_headers, body=second).status, 202)
-        third = {**make_event("activation-third"), "create_time": "2026-08-30T01:00:02Z"}
-        self.assertEqual(app.handle("POST", "/v1/source-events", headers=source_headers, body=third).status, 202)
-        cursor = repository.get_source_cursor("member_registration", "member-intake.v1")
+        earlier = {**make_event("activation-earlier"), "create_time": "2026-08-30T00:00:00.500Z"}
+        admitted = app.handle("POST", "/v1/source-events", headers=source_headers, body=earlier)
+        self.assertEqual((admitted.status, admitted.body["replayed"]), (202, False))
+        cursor, _, _ = repository.get_source_cursor("member_registration", "member-intake.v1")
         self.assertEqual(cursor.initial_window_admission_count, 1)
+        before = {**make_event("activation-before"), "create_time": "2026-08-29T23:59:59.999Z"}
+        rejected = app.handle("POST", "/v1/source-events", headers=source_headers, body=before)
+        self.assertEqual((rejected.status, rejected.body["error_code"]), (409, "source_event_before_cutover"))
 
-        behind = {**make_event("activation-behind"), "create_time": "2026-08-30T01:00:01Z"}
-        rejected = app.handle("POST", "/v1/source-events", headers=source_headers, body=behind)
-        self.assertEqual(rejected.status, 409)
-        self.assertEqual(rejected.body["error_code"], "source_event_behind_cursor")
-
-
+    def test_cursor_v2_routes_and_v1_checkpoint_removal(self):
+        repository = InMemoryRepository(source_cutover_watermark="2026-08-30T00:00:00Z")
+        service = GatewayService(
+            make_config(source_cutover_watermark="2026-08-30T00:00:00Z", source_production_cutover_exact="2026-08-30T00:00:00Z", source_admission_mode="first_member"),
+            repository, adapter_ready=True, clock=NOW,
+        )
+        app = GatewayApp(service, StaticAuthenticator({"source-token": Principal("synthetic-source", frozenset({"source.ingest"}))}))
+        headers = {"Authorization": "Bearer source-token"}
+        cursor = app.handle("GET", "/v1/source/cursor?form_alias=member_registration&mapping_version=member-intake.v1", headers=headers)
+        self.assertEqual((cursor.status, cursor.body["schema_version"], cursor.body["active_epoch"]), (200, "xb.member.gateway.source_cursor.v2", None))
+        begun = app.handle("POST", "/v1/source/epochs/begin", headers=headers, body={"form_alias": "member_registration", "mapping_version": "member-intake.v1"})
+        self.assertEqual(begun.status, 200)
+        epoch = begun.body["active_epoch"]
+        opened = app.handle("POST", f"/v1/source/epochs/{epoch['epoch_id']}/pages/open", headers=headers, body={"expected_epoch_state_version": 0, "request_page_token": None, "next_page_token": None, "terminal": True, "items": []})
+        self.assertEqual((opened.status, opened.body["page_state"]), (200, "OPEN"))
+        committed = app.handle("POST", f"/v1/source/pages/{opened.body['page_id']}/commit", headers=headers, body={"expected_epoch_state_version": opened.body["epoch_state_version"]})
+        self.assertEqual((committed.status, committed.body["epoch_status"]), (200, "COMPLETED"))
+        legacy = app.handle("POST", "/v1/source/cursor/page", headers=headers, body={})
+        self.assertEqual((legacy.status, legacy.body["error_code"]), (404, "route_not_found"))
+        invalid = app.handle("POST", "/v1/source/epochs/begin", headers=headers, body={"form_alias": "member_registration"})
+        self.assertEqual((invalid.status, invalid.body["error_code"]), (400, "request_fields_invalid"))
 
     def test_kill_switch_engage_blocks_claim_and_controlled_clear_restores_eligibility(self):
         engaged = self.call("POST", "/v1/control/kill-switch/enable", {})

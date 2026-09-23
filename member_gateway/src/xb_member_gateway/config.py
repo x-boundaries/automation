@@ -62,6 +62,14 @@ class GatewayConfig:
         (field, f"synthetic-{field}") for field in _QUESTION_FIELDS
     )
     source_cutover_watermark: str | None = "1970-01-01T00:00:00Z"
+    # Sole immutable source exclusion lower bound: the verbatim Google
+    # createTime form. It never auto-advances. The watermark above is a
+    # deprecated audit-only derivative.
+    source_production_cutover_exact: str | None = "1970-01-01T00:00:00Z"
+    # Synthetic partial-mapping default only. Production load_config requires
+    # every field, and the committed example and first-member deployment bind
+    # "first_member" explicitly.
+    source_admission_mode: str = "continuous"
     initial_source_window_max: int = 1
     member_no_max_length: int | None = 20
     lease_seconds: int = 600
@@ -75,6 +83,7 @@ class GatewayConfig:
     control_token_sha256: str | None = None
     worker_token_sha256: str | None = None
     recovery_token_sha256: str | None = None
+    mailer_token_sha256: str | None = None
     postgres_dsn_env: str = "XB_MEMBER_GATEWAY_DATABASE_URL"
     bind_address_env: str = "XB_MEMBER_GATEWAY_BIND_ADDRESS"
     bind_port_env: str = "XB_MEMBER_GATEWAY_BIND_PORT"
@@ -84,6 +93,7 @@ class GatewayConfig:
     control_token_env: str = "XB_MEMBER_GATEWAY_CONTROL_TOKEN"
     worker_token_env: str = "XB_MEMBER_GATEWAY_WORKER_TOKEN"
     recovery_token_env: str = "XB_MEMBER_GATEWAY_RECOVERY_TOKEN"
+    mailer_token_env: str = "XB_MEMBER_GATEWAY_MAILER_TOKEN"
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any], *, require_complete: bool = False) -> "GatewayConfig":
@@ -125,6 +135,8 @@ class GatewayConfig:
             allowed_form_aliases=tuple(aliases), allowed_mapping_versions=tuple(mappings),
             source_form_id=source_form_id, source_question_ids=tuple(pairs),
             source_cutover_watermark=value.get("source_cutover_watermark", defaults.source_cutover_watermark),
+            source_production_cutover_exact=value.get("source_production_cutover_exact", defaults.source_production_cutover_exact),
+            source_admission_mode=value.get("source_admission_mode", defaults.source_admission_mode),
             initial_source_window_max=_positive(value.get("initial_source_window_max", defaults.initial_source_window_max), "initial_source_window_max"),
             member_no_max_length=max_length,
             lease_seconds=_positive(value.get("lease_seconds", defaults.lease_seconds), "lease_seconds"),
@@ -138,6 +150,7 @@ class GatewayConfig:
             control_token_sha256=_digest(value.get("control_token_sha256", defaults.control_token_sha256), "control_token_sha256"),
             worker_token_sha256=_digest(value.get("worker_token_sha256", defaults.worker_token_sha256), "worker_token_sha256"),
             recovery_token_sha256=_digest(value.get("recovery_token_sha256", defaults.recovery_token_sha256), "recovery_token_sha256"),
+            mailer_token_sha256=_digest(value.get("mailer_token_sha256", defaults.mailer_token_sha256), "mailer_token_sha256"),
             postgres_dsn_env=_env(value.get("postgres_dsn_env", defaults.postgres_dsn_env), "postgres_dsn_env"),
             bind_address_env=_env(value.get("bind_address_env", defaults.bind_address_env), "bind_address_env"),
             bind_port_env=_env(value.get("bind_port_env", defaults.bind_port_env), "bind_port_env"),
@@ -147,17 +160,28 @@ class GatewayConfig:
             control_token_env=_env(value.get("control_token_env", defaults.control_token_env), "control_token_env"),
             worker_token_env=_env(value.get("worker_token_env", defaults.worker_token_env), "worker_token_env"),
             recovery_token_env=_env(value.get("recovery_token_env", defaults.recovery_token_env), "recovery_token_env"),
+            mailer_token_env=_env(value.get("mailer_token_env", defaults.mailer_token_env), "mailer_token_env"),
         )
         result.validate()
         return result
 
     @property
     def credential_digests(self) -> tuple[str | None, ...]:
-        return (self.source_token_sha256, self.operator_token_sha256, self.control_token_sha256, self.worker_token_sha256, self.recovery_token_sha256)
+        return (self.source_token_sha256, self.operator_token_sha256, self.control_token_sha256, self.worker_token_sha256, self.recovery_token_sha256, self.mailer_token_sha256)
 
     @property
     def credential_env_names(self) -> tuple[str, ...]:
-        return (self.source_token_env, self.operator_token_env, self.control_token_env, self.worker_token_env, self.recovery_token_env)
+        return (self.source_token_env, self.operator_token_env, self.control_token_env, self.worker_token_env, self.recovery_token_env, self.mailer_token_env)
+
+    @property
+    def admission_mode(self) -> "SourceAdmissionMode":
+        from .models import SourceAdmissionMode
+        return SourceAdmissionMode(self.source_admission_mode)
+
+    @property
+    def initial_window_max(self) -> int | None:
+        """The accepted-member cap is derived from the mode, never from activation."""
+        return self.initial_source_window_max if self.source_admission_mode == "first_member" else None
 
     @property
     def question_id_mapping(self) -> dict[str, str | None]:
@@ -180,17 +204,28 @@ class GatewayConfig:
             raise ConfigError("initial_source_window_max_must_be_one")
         if self.member_no_max_length is not None and self.member_no_max_length != 20:
             raise ConfigError("member_no_max_length_must_be_twenty")
-        if len({name.casefold() for name in self.credential_env_names}) != 5:
+        if len({name.casefold() for name in self.credential_env_names}) != 6:
             raise ConfigError("credential_environment_bindings_must_differ")
         present = [digest.casefold() for digest in self.credential_digests if digest is not None]
         if len(set(present)) != len(present):
             raise ConfigError("credential_digests_must_differ")
-        from .canonical import parse_rfc3339
+        from .canonical import create_time_utc_from_exact, parse_google_create_time_exact, parse_rfc3339
+        if self.source_admission_mode not in {"first_member", "continuous"}:
+            raise ConfigError("source_admission_mode_invalid")
+        watermark = None
         if self.source_cutover_watermark is not None:
             try:
-                parse_rfc3339(self.source_cutover_watermark, field="source_cutover_watermark")
+                watermark = parse_rfc3339(self.source_cutover_watermark, field="source_cutover_watermark")
             except ValueError as exc:
                 raise ConfigError(str(exc)) from exc
+        if self.source_production_cutover_exact is not None:
+            try:
+                parse_google_create_time_exact(self.source_production_cutover_exact, field="source_production_cutover_exact")
+            except ValueError as exc:
+                raise ConfigError(str(exc)) from exc
+            # The deprecated watermark may never exclude anything the cutover admits.
+            if watermark is not None and watermark > create_time_utc_from_exact(self.source_production_cutover_exact):
+                raise ConfigError("source_cutover_watermark_after_production_cutover")
         question_ids = [item for _, item in self.source_question_ids if item is not None]
         if len(set(question_ids)) != len(question_ids):
             raise ConfigError("source_question_ids_must_differ")
@@ -232,7 +267,9 @@ class GatewayConfig:
             reasons.append("source_question_ids_required")
         if self.source_cutover_watermark is None:
             reasons.append("source_cutover_watermark_required")
-        for name, digest in zip(("source", "operator", "control", "worker", "recovery"), self.credential_digests):
+        if self.source_production_cutover_exact is None:
+            reasons.append("source_production_cutover_exact_required")
+        for name, digest in zip(("source", "operator", "control", "worker", "recovery", "mailer"), self.credential_digests):
             if digest is None:
                 reasons.append(f"{name}_credential_digest_required")
         return tuple(dict.fromkeys(reasons))

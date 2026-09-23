@@ -347,31 +347,244 @@ class IngestOutcome:
 
 
 @dataclass(frozen=True, slots=True)
+class SourceRejection:
+    """PII-free customer-validation rejection; it carries no customer field."""
+
+    schema_version: str
+    source_system: str
+    form_alias: str
+    response_id: str
+    create_time: str
+    mapping_version: str
+    request_id: str
+    payload_hash: str
+    error_code: str
+    operation: str = "member.create"
+
+
+@dataclass(frozen=True, slots=True)
+class RejectionOutcome:
+    rejection_id: str
+    source_response_ref: str
+    error_code: str
+    replayed: bool
+
+
+class SourceAdmissionMode(str, Enum):
+    FIRST_MEMBER = "first_member"
+    CONTINUOUS = "continuous"
+
+
+class HandlingOutcome(str, Enum):
+    ACCEPTED = "ACCEPTED"
+    REJECTED = "REJECTED"
+
+
+class ScanEpochStatus(str, Enum):
+    ACTIVE = "ACTIVE"
+    COMPLETED = "COMPLETED"
+    ABANDONED = "ABANDONED"
+
+
+class ScanPageState(str, Enum):
+    OPEN = "OPEN"
+    COMMITTED = "COMMITTED"
+    ABANDONED = "ABANDONED"
+
+
+# The only reasons a scan epoch may be abandoned and restarted from the same
+# fixed cutover. General OAuth/API/schema/mapping errors halt instead.
+RESTART_REASONS = frozenset({"token_invalidated", "ambiguous_crashed_attempt"})
+ABANDON_REASONS = RESTART_REASONS | {"admission_mode_changed"}
+SOURCE_PAGE_SIZE = 1
+SOURCE_PAGE_ITEM_FIELDS = frozenset({"response_id", "create_time", "payload_hash"})
+
+
+@dataclass(frozen=True, slots=True)
 class SourceCursor:
+    """Durable cursor/config row. ``watermark`` is deprecated audit-only."""
+
     source_system: str
     form_alias: str
     mapping_version: str
     watermark: str
-    last_admitted_create_time: str | None
-    last_admitted_response_id: str | None
+    production_cutover_exact: str | None
+    form_id: str | None
     state_version: int
-    scan_lower_bound: str
-    resume_page_token: str | None
     initial_window_admission_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class HandlingReceipt:
+    response_id: str
+    source_response_ref: str
+    form_alias: str
+    form_id: str
+    mapping_version: str
+    create_time_exact: str
+    payload_fingerprint: str
+    outcome: HandlingOutcome
+    job_id: str | None
+    rejection_id: str | None
+    receipt_version: int
+    recorded_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class ScanPage:
+    page_id: str
+    epoch_id: str
+    page_ordinal: int
+    page_state: ScanPageState
+    request_page_token: str | None
+    next_page_token: str | None
+    terminal: bool
+    items: tuple[tuple[str, str, str], ...]
+    opened_state_version: int
+    committed_state_version: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "schema_version": "xb.member.gateway.source_cursor.v1",
-            "source_system": self.source_system,
-            "form_alias": self.form_alias,
-            "mapping_version": self.mapping_version,
-            "watermark": self.watermark,
-            "last_admitted_create_time": self.last_admitted_create_time,
-            "last_admitted_response_id": self.last_admitted_response_id,
+            "page_id": self.page_id,
+            "page_ordinal": self.page_ordinal,
+            "page_state": self.page_state.value,
+            "request_page_token": self.request_page_token,
+            "next_page_token": self.next_page_token,
+            "terminal": self.terminal,
+            "item_count": len(self.items),
+            "items": [
+                {"response_id": rid, "create_time": created, "payload_hash": digest}
+                for rid, created, digest in self.items
+            ],
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ScanEpoch:
+    epoch_id: str
+    source_system: str
+    form_alias: str
+    form_id: str
+    mapping_version: str
+    admission_mode: SourceAdmissionMode
+    filter_exact: str
+    production_cutover_exact: str
+    page_size: int
+    status: ScanEpochStatus
+    epoch_state_version: int
+    current_page_token: str | None
+    page_ordinal: int
+    predecessor_epoch_id: str | None
+    restart_reason: str | None
+    abandon_reason: str | None
+    created_at: str
+    completed_at: str | None = None
+
+    @property
+    def binding(self) -> tuple[Any, ...]:
+        return (
+            self.source_system, self.form_alias, self.form_id, self.mapping_version,
+            self.admission_mode, self.filter_exact, self.production_cutover_exact, self.page_size,
+        )
+
+    def to_dict(self, open_page: ScanPage | None = None) -> dict[str, Any]:
+        return {
+            "epoch_id": self.epoch_id,
+            "status": self.status.value,
+            "admission_mode": self.admission_mode.value,
+            "epoch_state_version": self.epoch_state_version,
+            "current_page_token": self.current_page_token,
+            "page_ordinal": self.page_ordinal,
+            "predecessor_epoch_id": self.predecessor_epoch_id,
+            "restart_reason": self.restart_reason,
+            "open_page": None if open_page is None else open_page.to_dict(),
+        }
+
+
+def source_cursor_v2(
+    cursor: SourceCursor,
+    *,
+    admission_mode: SourceAdmissionMode,
+    epoch: ScanEpoch | None,
+    open_page: ScanPage | None,
+) -> dict[str, Any]:
+    """Cursor-v2 projection. The deprecated admitted tuple and resume token
+    are intentionally absent: they carry no admission or skip authority."""
+
+    if cursor.production_cutover_exact is None:
+        raise ValueError("source_production_cutover_uninitialized")
+    remaining = (
+        max(0, 1 - cursor.initial_window_admission_count)
+        if admission_mode == SourceAdmissionMode.FIRST_MEMBER
+        else None
+    )
+    return {
+        "schema_version": "xb.member.gateway.source_cursor.v2",
+        "source_system": cursor.source_system,
+        "form_alias": cursor.form_alias,
+        "mapping_version": cursor.mapping_version,
+        "production_cutover_exact": cursor.production_cutover_exact,
+        "filter_exact": f"timestamp >= {cursor.production_cutover_exact}",
+        "admission_mode": admission_mode.value,
+        "page_size": SOURCE_PAGE_SIZE,
+        "cursor_state_version": cursor.state_version,
+        "accepted_member_count": cursor.initial_window_admission_count,
+        "accepted_member_allowance_remaining": remaining,
+        "active_epoch": None if epoch is None else epoch.to_dict(open_page),
+    }
+
+
+class WelcomeEmailState(str, Enum):
+    PENDING = "PENDING"
+    LEASED = "LEASED"
+    RETRY_WAIT = "RETRY_WAIT"
+    SEND_INTENT_RECORDED = "SEND_INTENT_RECORDED"
+    SENT = "SENT"
+    DELIVERY_OUTCOME_UNCERTAIN = "DELIVERY_OUTCOME_UNCERTAIN"
+    DEAD_LETTER = "DEAD_LETTER"
+
+
+WELCOME_TERMINAL_STATES = frozenset(
+    {WelcomeEmailState.SENT, WelcomeEmailState.DELIVERY_OUTCOME_UNCERTAIN, WelcomeEmailState.DEAD_LETTER}
+)
+
+
+@dataclass(frozen=True, slots=True)
+class WelcomeEmailOutbox:
+    """Private outbox row. ``recipient`` and ``response_id`` never leave the
+    private mailer claim envelope."""
+
+    outbox_id: str
+    job_id: str
+    response_id: str
+    source_response_ref: str
+    template_id: str
+    recipient: str
+    message_hash: str
+    state: WelcomeEmailState
+    state_version: int
+    attempt: int
+    max_attempts: int
+    lease_id: str | None
+    lease_expires_at: str | None
+    next_attempt_at: str | None
+    send_intent_at: str | None
+    last_error_code: str | None
+    created_at: str
+    updated_at: str
+
+    def safe_dict(self) -> dict[str, Any]:
+        return {
+            "outbox_id": self.outbox_id,
+            "job_id": self.job_id,
+            "source_response_ref": self.source_response_ref,
+            "template_id": self.template_id,
+            "message_hash": self.message_hash,
+            "state": self.state.value,
             "state_version": self.state_version,
-            "scan_lower_bound": self.scan_lower_bound,
-            "resume_page_token": self.resume_page_token,
-            "initial_window_admission_count": self.initial_window_admission_count,
+            "attempt": self.attempt,
+            "max_attempts": self.max_attempts,
+            "last_error_code": self.last_error_code,
         }
 
 

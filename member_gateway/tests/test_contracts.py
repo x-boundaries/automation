@@ -80,12 +80,19 @@ class ContractSurfaceTests(unittest.TestCase):
         self.assertEqual(config["initial_source_window_max"], 1)
         self.assertFalse(config["autocount_adapter_ready"])
         self.assertIsNone(config["source_cutover_watermark"])
+        self.assertIsNone(config["source_production_cutover_exact"])
+        self.assertEqual(config["source_admission_mode"], "first_member")
         self.assertIsNone(config["worker_token_sha256"])
         self.assertIsNone(config["recovery_token_sha256"])
-        loaded = GatewayConfig.from_mapping(config)
+        self.assertIsNone(config["mailer_token_sha256"])
+        self.assertEqual(config["mailer_token_env"], "XB_MEMBER_GATEWAY_MAILER_TOKEN")
+        loaded = GatewayConfig.from_mapping(config, require_complete=True)
         self.assertFalse(loaded.gateway_ready)
+        self.assertEqual(loaded.initial_window_max, 1)
         self.assertIn("source_cutover_watermark_required", loaded.readiness_reasons())
+        self.assertIn("source_production_cutover_exact_required", loaded.readiness_reasons())
         self.assertIn("recovery_credential_digest_required", loaded.readiness_reasons())
+        self.assertIn("mailer_credential_digest_required", loaded.readiness_reasons())
 
     def test_writer_timing_order_is_strictly_nested(self):
         base = {
@@ -109,6 +116,7 @@ class ContractSurfaceTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         third = (ROOT / "member_gateway/migrations/0003_writer_termination_quarantine.sql").read_text(encoding="utf-8")
         fourth = (ROOT / "member_gateway/migrations/0004_forms_ingest_cursor.sql").read_text(encoding="utf-8")
+        fifth = (ROOT / "member_gateway/migrations/0005_member_vertical_slice.sql").read_text(encoding="utf-8")
         for table in (
             "source_responses",
             "source_observations",
@@ -151,6 +159,60 @@ class ContractSurfaceTests(unittest.TestCase):
         self.assertIn("source_ingest_cursor_identity_immutable", fourth)
         self.assertIn("reject_source_page_receipt_mutation", fourth)
         self.assertNotIn("INSERT INTO xb_member_gateway.source_ingest_cursors", fourth)
+        for table in (
+            "source_rejections", "source_handling_receipts", "source_scan_epochs",
+            "source_scan_pages", "source_scan_page_items", "welcome_email_outbox", "welcome_email_events",
+        ):
+            self.assertIn(f"CREATE TABLE IF NOT EXISTS xb_member_gateway.{table}", fifth)
+        for required in (
+            "ADD COLUMN IF NOT EXISTS create_time_exact", "ADD COLUMN IF NOT EXISTS production_cutover_exact",
+            "source_scan_epochs_one_active_idx", "WHERE status = 'ACTIVE'",
+            "source_scan_pages_next_token_per_epoch_idx", "ON xb_member_gateway.source_scan_pages(epoch_id, next_page_token)",
+            "REFERENCES xb_member_gateway.source_handling_receipts(response_id)",
+            "restart_reason IN ('token_invalidated', 'ambiguous_crashed_attempt')",
+            "UNIQUE (response_id, template_id)", "job_id text NOT NULL UNIQUE",
+            "welcome_email_requires_created_verified", "welcome_email_transition_forbidden",
+            "source_production_cutover_immutable", "('0005_member_vertical_slice')",
+            "(\\.\\d{3}|\\.\\d{6}|\\.\\d{9})?Z$",
+        ):
+            self.assertIn(required, fifth, required)
+        # Additive only: no destructive statement and no seeded production value.
+        for forbidden in ("DROP TABLE", "DROP COLUMN", "DELETE FROM", "TRUNCATE", "ON DELETE CASCADE", "INSERT INTO xb_member_gateway.source_ingest_cursors"):
+            self.assertNotIn(forbidden, fifth.upper() if forbidden.isupper() else fifth)
+        for earlier in (first, second, third, fourth):
+            self.assertNotIn("0005_member_vertical_slice", earlier)
+
+    def test_cursor_v1_is_retained_and_v2_new_schemas_bind_the_contract(self):
+        v1 = self.read_json("schemas/member_gateway_source_cursor.v1.schema.json")
+        self.assertEqual(v1["properties"]["schema_version"]["const"], "xb.member.gateway.source_cursor.v1")
+        v2 = self.read_json("schemas/member_gateway_source_cursor.v2.schema.json")
+        self.assertEqual(v2["properties"]["schema_version"]["const"], "xb.member.gateway.source_cursor.v2")
+        self.assertFalse(v2["additionalProperties"])
+        for deprecated in ("last_admitted_create_time", "last_admitted_response_id", "resume_page_token", "watermark", "scan_lower_bound"):
+            self.assertNotIn(deprecated, v2["properties"])
+        self.assertEqual(v2["properties"]["page_size"]["const"], 1)
+        self.assertEqual(v2["properties"]["active_epoch"]["properties"]["restart_reason"]["enum"], [None, "token_invalidated", "ambiguous_crashed_attempt"])
+        rejection = self.read_json("schemas/member_gateway_source_rejection.v1.schema.json")
+        self.assertTrue({"name", "phone", "email", "payload"}.isdisjoint(rejection["properties"]))
+        from xb_member_gateway.canonical import CUSTOMER_REJECTION_CODES
+        self.assertEqual(set(rejection["properties"]["error_code"]["enum"]), CUSTOMER_REJECTION_CODES)
+        job = self.read_json("schemas/member_gateway_welcome_email_job.v1.schema.json")
+        message = job["properties"]["message"]["properties"]
+        from xb_member_gateway.notifications import WELCOME_V1
+        for field, value in WELCOME_V1.items():
+            if value is None:
+                self.assertEqual(message[field], {"type": "null"})
+            else:
+                self.assertEqual(message[field]["const"], value)
+        self.assertNotIn("response_id", job["properties"])
+        result = self.read_json("schemas/member_gateway_welcome_email_result.v1.schema.json")
+        self.assertEqual(result["properties"]["outcome"]["enum"], ["smtp_accepted", "delivery_outcome_uncertain", "failed_before_send_intent"])
+        import re
+        exact = re.compile(v2["properties"]["production_cutover_exact"]["pattern"])
+        for accepted in ("2026-09-15T00:00:00Z", "2026-09-15T00:00:00.123Z", "2026-09-15T00:00:00.123456Z", "2026-09-15T00:00:00.123456789Z"):
+            self.assertRegex(accepted, exact)
+        for rejected in ("2026-09-15T00:00:00.1Z", "2026-09-15T00:00:00+00:00", "2026-09-15T00:00:00.1234567Z"):
+            self.assertNotRegex(rejected, exact)
 
     def test_state_machine_contains_all_required_states_and_blocks_requeue(self):
         required = {

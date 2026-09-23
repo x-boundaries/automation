@@ -8,14 +8,22 @@ Workflow JSON in this directory is source-controlled evidence of workflow design
 
 ### member_forms_gateway_ingest.workflow.json
 
-- Purpose: inactive production-boundary design evidence for the synthetic/configurable Google Forms source adapter. Each manual run reads the gateway's durable source cursor, requests one Google Forms page inclusively from its scan lower bound with `pageSize=1`, applies the closed question-ID mapping, sorts by `(createTime, responseId)`, admits at most one new source event, and checkpoints the opaque page token only after durable admission proof. Terminal scans deliberately restart inclusively from the durable response cursor. It does not create or update AutoCount members and has no continuous scheduling authority.
+- Purpose: inactive production-boundary design evidence for the configurable Google Forms source adapter (gateway source cursor v2). Each manual run begins or resumes one gateway scan epoch bound to the fixed `production_cutover_exact`, then runs a bounded manual page loop (at most `max_pages_per_run` pages): fetch one page with `pageSize=1` and the verbatim filter `timestamp >= <cutover>`, open the page durably, obtain one accepted (`/v1/source-events`) or PII-free rejected (`/v1/source-rejections`) handling receipt per item, and commit the page. `response.createTime` is forwarded verbatim; there is no sorting, ordering assertion or `Date` re-serialisation, and no progress is stored in `staticData`. A crashed open page restarts the epoch with `ambiguous_crashed_attempt`; only a positively classified invalid page token restarts with `token_invalidated`; every other failure halts. In `first_member` mode the run stops after the first committed member page. It does not create or update AutoCount members and has no continuous scheduling authority.
 - Status: source-controlled, inactive, credential-free, and incapable of live execution merely by repository checkout. It contains no real Form ID, question ID, credential binding, customer data, pinned data, or execution data; its mapping IDs and endpoint values remain placeholders.
-- Timeout policy: all four HTTP nodes declare an explicit `options.timeout` of 30000 ms. A stalled source, cursor, or gateway call must fail visibly inside a bounded window instead of inheriting an unbounded or instance-default wait.
-- Retry policy: bounded node-level retry is granted only where a repeat request is safe. The durable cursor read retries 3 times with 1000 ms between tries, the Google Forms page read 3 times with 2000 ms, and the gateway ingest POST 2 times with 2000 ms. n8n node retry has no per-status-code filter and retries on any error, so it is limited here to the two reads and to the ingest call, which is idempotent on `request_id` and `payload_hash`.
-- `Commit durable page checkpoint` deliberately declares no `retryOnFail`, `maxTries`, or `waitBetweenTries`. It is a compare-and-set write carrying `expected_state_version`, so an automatic blind retry would either fail against a state version its own first attempt already moved, or re-drive a checkpoint whose outcome is ambiguous. Checkpoint failures must surface for deliberate operator reconciliation rather than self-heal.
+- Timeout policy: all eight HTTP nodes declare an explicit `options.timeout` of 30000 ms.
+- Retry policy: bounded node-level retry only where a repeat is safe: epoch begin/resume 3 x 1000 ms, the Google Forms page read 3 x 2000 ms, and the receipt-idempotent ingest and rejection POSTs 2 x 2000 ms. The two restarts, page open and page commit are compare-and-set writes and declare no `retryOnFail`, `maxTries`, or `waitBetweenTries`; their failures surface for deliberate reconciliation rather than self-heal.
 - MCP exposure is disabled in source control through `settings.availableInMCP: false`. MCP exposure and workflow activation are independent controls in n8n, and this export grants neither.
 - Runbook: [Member gateway production runbook](../docs/autocount2-automation/member_gateway_production_runbook.md).
 - The export stays `active: false` with its internal `activation_enabled` gate false and a manual trigger only. Import, credential binding, activation, execution, and any live re-alignment to this canonical definition each require separate explicit current-turn approval; this export is offline validation evidence only.
+- Focused offline coverage: [tests/test_member_gateway_n8n.py](../tests/test_member_gateway_n8n.py).
+
+### member_welcome_email_outbox.workflow.json
+
+- Purpose: inactive, manual-only mailer for the durable gateway `welcome_v1` outbox. Each run claims at most one due row, verifies the gateway-built message against its durable hash, records send intent, sends it once with Send Email, and records either SMTP acceptance (`SENT`, not inbox-delivery proof) or, on the Send Email error output, `DELIVERY_OUTCOME_UNCERTAIN`, which is never resent automatically.
+- Status: source-controlled, inactive, credential-free. Sender, subject and body come only from the gateway claim payload; the export contains no literal email address. Send Email automatic retry is disabled, n8n attribution is disabled and no Reply-To is set.
+- Retry policy: the four idempotent gateway calls (claim, send intent, both results) retry 3 x 5000 ms; Send Email never retries.
+- MCP exposure disabled (`settings.availableInMCP: false`); manual trigger only; `staticData: null`.
+- Runbook: [Member gateway production runbook](../docs/autocount2-automation/member_gateway_production_runbook.md).
 - Focused offline coverage: [tests/test_member_gateway_n8n.py](../tests/test_member_gateway_n8n.py).
 
 ### member_intake_gate4a_container_queue_write.workflow.json
@@ -83,7 +91,8 @@ Workflow JSON in this directory is source-controlled evidence of workflow design
 `scripts/import-member-forms-gateway-bounded.ps1` is a dedicated, fresh
 split-successor helper for the inactive member gateway source-adapter
 workflow. It is the sole bounded production path for this workflow. It reads
-the authoritative cursor and exact target metadata, captures an immutable
+the authoritative cursor v2 (keeping only a public-safe projection: no page
+token or response ID is persisted) and exact target metadata, captures an immutable
 operation plan, and can import at most the one reviewed workflow after an
 explicit apply confirmation. It does not call the generic live importer,
 export all workflows, execute or activate a workflow, enable MCP, or contact
@@ -91,12 +100,20 @@ Google Forms, AutoCount, or member endpoints.
 
 The binding shape is
 `../config/member_forms_gateway_bounded_import.v2.template.json`. Real target
-IDs, form/question IDs, resolved credential IDs and names, cursor values, source
+IDs, form/question IDs, resolved credential IDs and names, the production cutover, source
 tokens, and operation material stay in ignored private custody under
 `.n8n-local/member-gateway-bounded-import/operations/`. These files are
 rejected if they are tracked, outside the canonical private root, linked, or
 not protected by the required Windows ACL. Persisted JSON is canonical UTF-8
 without BOM with LF line endings.
+
+`scripts/import-member-welcome-email-bounded.ps1` is the equivalent bounded
+path for `member_welcome_email_outbox.workflow.json`, with binding shape
+`../config/member_welcome_email_bounded_import.v1.template.json` and private
+custody under `.n8n-local/member-welcome-email-bounded-import/operations/`. It
+binds the mailer bearer to exactly the four gateway nodes and one SMTP
+credential to the Send Email node, never calls the gateway, and refuses Send
+Email retry, attribution, Reply-To, or literal addresses.
 
 The private manifest must bind each credential role's exact resolved
 `credential_id`, `credential_name`, `credential_type`, and node role. Prepared

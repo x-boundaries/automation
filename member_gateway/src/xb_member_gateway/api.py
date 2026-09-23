@@ -21,10 +21,23 @@ from .auth import (
     worker_host_binding,
     worker_session,
 )
-from .canonical import CanonicalizationError, canonicalize_source_event
+from .canonical import (
+    CanonicalizationError,
+    canonicalize_source_event,
+    canonicalize_source_rejection,
+    validate_google_create_time_exact,
+)
 from .config import GatewayConfig
 from .eligibility import EligibilityContext, evaluate_eligibility
-from .models import JobState, ProbeStatus, ResultStatus
+from .models import JobState, ProbeStatus, ResultStatus, source_cursor_v2
+from .notifications import (
+    WELCOME_JOB_SCHEMA_VERSION,
+    WelcomeEmailError,
+    claim_envelope,
+    validate_lease_request,
+    validate_outbox_id,
+    validate_result_request,
+)
 from .repository import (
     AllocationConflict,
     InMemoryRepository,
@@ -33,6 +46,7 @@ from .repository import (
     RepositoryError,
     ResultConflict,
     SourceConflict,
+    SourceRestartReasonInvalid,
     WriterTerminationConflict,
 )
 from .results import ResultValidationError, make_result, result_contract
@@ -90,6 +104,12 @@ def _strict_bool(value: Any, code: str) -> bool:
     return value
 
 
+def _state_version(value: Any, code: str = "source_epoch_state_version_invalid") -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ApiError(400, code)
+    return value
+
+
 class GatewayService:
     """Application service shared by the standard-library HTTP adapter and tests."""
 
@@ -135,19 +155,18 @@ class GatewayService:
 
     def ingest(self, body: Mapping[str, Any]) -> dict[str, Any]:
         event = canonicalize_source_event(body)
+        validate_google_create_time_exact(event.create_time, field="create_time")
         config = self._runtime_config()
         if event.form_alias not in config.allowed_form_aliases:
             raise ApiError(422, "form_alias_not_allowlisted")
         if event.mapping_version not in config.allowed_mapping_versions:
             raise ApiError(422, "mapping_version_not_allowlisted")
+        # The accepted-member cap comes only from the closed admission mode;
+        # production activation no longer changes source admission semantics.
         outcome = self.repository.ingest_source_event(
             event,
             now=self.clock,
-            initial_window_max=(
-                None
-                if config.production_activation_enabled
-                else config.initial_source_window_max
-            ),
+            initial_window_max=config.initial_window_max,
         )
         return {
             "schema_version": "xb.member.gateway.job.v2",
@@ -540,26 +559,114 @@ class GatewayService:
     def status(self, job_id: str) -> dict[str, Any]:
         return self.repository.get_job(job_id).safe_dict()
 
-    def source_cursor(self, form_alias: str, mapping_version: str) -> dict[str, Any]:
+    def reject_source(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        rejection = canonicalize_source_rejection(body)
+        if rejection.form_alias not in self.config.allowed_form_aliases:
+            raise ApiError(422, "form_alias_not_allowlisted")
+        if rejection.mapping_version not in self.config.allowed_mapping_versions:
+            raise ApiError(422, "mapping_version_not_allowlisted")
+        outcome = self.repository.reject_source_response(rejection, now=self.clock)
+        return {
+            "schema_version": "xb.member.gateway.source_rejection_receipt.v1",
+            "rejection_id": outcome.rejection_id,
+            "outcome": "REJECTED",
+            "error_code": outcome.error_code,
+            "replayed": outcome.replayed,
+            "source_response_ref": outcome.source_response_ref,
+        }
+
+    def _cursor_binding(self, form_alias: Any, mapping_version: Any) -> None:
         if form_alias not in self.config.allowed_form_aliases or mapping_version not in self.config.allowed_mapping_versions:
             raise ApiError(422, "source_cursor_binding_invalid")
-        return self.repository.get_source_cursor(form_alias, mapping_version).to_dict()
 
-    def checkpoint_source_page(self, body: Mapping[str, Any]) -> dict[str, Any]:
-        _exact_fields(body, {"form_alias", "mapping_version", "expected_state_version", "current_page_token", "next_page_token", "scan_lower_bound", "terminal", "responses"})
-        if body["form_alias"] not in self.config.allowed_form_aliases or body["mapping_version"] not in self.config.allowed_mapping_versions:
-            raise ApiError(422, "source_cursor_binding_invalid")
-        if isinstance(body["expected_state_version"], bool) or not isinstance(body["expected_state_version"], int) or body["expected_state_version"] < 0:
-            raise ApiError(400, "source_cursor_state_version_invalid")
-        if not isinstance(body["terminal"], bool) or not isinstance(body["responses"], list):
-            raise ApiError(400, "source_page_request_invalid")
-        cursor = self.repository.checkpoint_source_page(
-            body["form_alias"], body["mapping_version"],
-            expected_state_version=body["expected_state_version"],
-            current_page_token=body["current_page_token"], next_page_token=body["next_page_token"],
-            scan_lower_bound=body["scan_lower_bound"], terminal=body["terminal"], responses=body["responses"],
+    def _cursor_v2(self, form_alias: str, mapping_version: str) -> dict[str, Any]:
+        cursor, epoch, page = self.repository.get_source_cursor(form_alias, mapping_version)
+        if cursor.production_cutover_exact is None:
+            raise SourceConflict("source_production_cutover_uninitialized")
+        return source_cursor_v2(cursor, admission_mode=self.config.admission_mode, epoch=epoch, open_page=page)
+
+    def source_cursor(self, form_alias: str, mapping_version: str) -> dict[str, Any]:
+        self._cursor_binding(form_alias, mapping_version)
+        return self._cursor_v2(form_alias, mapping_version)
+
+    def begin_source_epoch(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        _exact_fields(body, {"form_alias", "mapping_version"})
+        self._cursor_binding(body["form_alias"], body["mapping_version"])
+        _, resumed = self.repository.begin_source_epoch(
+            body["form_alias"], body["mapping_version"], admission_mode=self.config.admission_mode,
+            form_id=self.config.source_form_id, now=self.clock,
         )
-        return cursor.to_dict()
+        value = self._cursor_v2(body["form_alias"], body["mapping_version"])
+        value["resumed"] = resumed
+        return value
+
+    def restart_source_epoch(self, epoch_id: str, body: Mapping[str, Any]) -> dict[str, Any]:
+        _exact_fields(body, {"expected_epoch_state_version", "restart_reason"})
+        if not isinstance(body["restart_reason"], str):
+            raise ApiError(422, "source_restart_reason_invalid")
+        successor = self.repository.restart_source_epoch(
+            epoch_id, expected_epoch_state_version=_state_version(body["expected_epoch_state_version"]),
+            restart_reason=body["restart_reason"], now=self.clock,
+        )
+        value = self._cursor_v2(successor.form_alias, successor.mapping_version)
+        value["resumed"] = False
+        return value
+
+    def open_source_page(self, epoch_id: str, body: Mapping[str, Any]) -> dict[str, Any]:
+        _exact_fields(body, {"expected_epoch_state_version", "request_page_token", "next_page_token", "terminal", "items"})
+        if not isinstance(body["terminal"], bool) or not isinstance(body["items"], list):
+            raise ApiError(400, "source_page_request_invalid")
+        page, epoch, replayed = self.repository.open_source_page(
+            epoch_id, expected_epoch_state_version=_state_version(body["expected_epoch_state_version"]),
+            request_page_token=body["request_page_token"], next_page_token=body["next_page_token"],
+            terminal=body["terminal"], items=body["items"], now=self.clock,
+        )
+        return {
+            "schema_version": "xb.member.gateway.source_page.v1", "page_id": page.page_id,
+            "epoch_id": epoch.epoch_id, "page_state": page.page_state.value, "page_ordinal": page.page_ordinal,
+            "item_count": len(page.items), "terminal": page.terminal,
+            "epoch_state_version": page.opened_state_version, "replayed": replayed,
+        }
+
+    def commit_source_page(self, page_id: str, body: Mapping[str, Any]) -> dict[str, Any]:
+        _exact_fields(body, {"expected_epoch_state_version"})
+        page, epoch, replayed = self.repository.commit_source_page(
+            page_id, expected_epoch_state_version=_state_version(body["expected_epoch_state_version"]), now=self.clock,
+        )
+        return {
+            "schema_version": "xb.member.gateway.source_page.v1", "page_id": page.page_id,
+            "epoch_id": epoch.epoch_id, "page_state": page.page_state.value, "page_ordinal": page.page_ordinal,
+            "item_count": len(page.items), "terminal": page.terminal,
+            "epoch_state_version": page.committed_state_version, "epoch_status": epoch.status.value,
+            "current_page_token": epoch.current_page_token,
+            "replayed": replayed,
+        }
+
+    def claim_welcome_email(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        if body:
+            _exact_fields(body, set())
+        if self._runtime_config().kill_switch_enabled:
+            raise ApiError(423, "kill_switch_enabled")
+        claimed = self.repository.claim_welcome_email(now=self.clock)
+        if claimed is None:
+            return {"schema_version": WELCOME_JOB_SCHEMA_VERSION, "claimed": False, "job": None}
+        outbox, message = claimed
+        return {"schema_version": WELCOME_JOB_SCHEMA_VERSION, "claimed": True, "job": claim_envelope(outbox, message)}
+
+    def welcome_send_intent(self, outbox_id: str, body: Mapping[str, Any]) -> dict[str, Any]:
+        lease_id, version = validate_lease_request(body)
+        outbox, replayed = self.repository.record_welcome_send_intent(
+            validate_outbox_id(outbox_id), lease_id=lease_id, expected_state_version=version, now=self.clock,
+        )
+        return {"outbox_id": outbox.outbox_id, "state": outbox.state.value, "state_version": outbox.state_version, "replayed": replayed}
+
+    def welcome_result(self, outbox_id: str, body: Mapping[str, Any]) -> dict[str, Any]:
+        lease_id, version, outcome, error_code = validate_result_request(body)
+        outbox, duplicate = self.repository.record_welcome_result(
+            validate_outbox_id(outbox_id), lease_id=lease_id, expected_state_version=version,
+            outcome=outcome, error_code=error_code, now=self.clock,
+        )
+        return {"outbox_id": outbox.outbox_id, "state": outbox.state.value, "state_version": outbox.state_version, "duplicate": duplicate}
 
     def operator_status(self) -> dict[str, Any]:
         return self.repository.operator_status()
@@ -617,8 +724,13 @@ class GatewayApp:
         status = getattr(error, "status", 500)
         if isinstance(error, JobNotFound):
             status, code = 404, "job_not_found"
+        elif isinstance(error, SourceRestartReasonInvalid):
+            status, code = 422, "source_restart_reason_invalid"
         elif isinstance(error, SourceConflict):
             status, code = 409, _safe_code(str(error), "source_identity_conflict")
+        elif isinstance(error, WelcomeEmailError):
+            status = 404 if error.code == "welcome_email_not_found" else 400 if error.code.endswith("_invalid") else 409
+            code = _safe_code(error.code)
         elif isinstance(error, ResultConflict):
             status, code = 409, "result_conflict"
         elif isinstance(error, WriterTerminationConflict):
@@ -668,9 +780,35 @@ class GatewayApp:
                 if set(query) != {"form_alias", "mapping_version"} or any(len(item) != 1 for item in query.values()):
                     raise ApiError(400, "source_cursor_query_invalid")
                 return ApiResponse(200, self.service.source_cursor(query["form_alias"][0], query["mapping_version"][0]))
-            if method == "POST" and route == "/v1/source/cursor/page":
+            if method == "POST" and route == "/v1/source-rejections":
                 self._principal(headers, "source.ingest")
-                return ApiResponse(200, self.service.checkpoint_source_page(value))
+                return ApiResponse(202, self.service.reject_source(value))
+            if method == "POST" and route == "/v1/source/epochs/begin":
+                self._principal(headers, "source.ingest")
+                return ApiResponse(200, self.service.begin_source_epoch(value))
+            match = re.fullmatch(r"/v1/source/epochs/(epoch-[0-9a-f]{32})/restart", route)
+            if method == "POST" and match:
+                self._principal(headers, "source.ingest")
+                return ApiResponse(200, self.service.restart_source_epoch(match.group(1), value))
+            match = re.fullmatch(r"/v1/source/epochs/(epoch-[0-9a-f]{32})/pages/open", route)
+            if method == "POST" and match:
+                self._principal(headers, "source.ingest")
+                return ApiResponse(200, self.service.open_source_page(match.group(1), value))
+            match = re.fullmatch(r"/v1/source/pages/(page-[0-9a-f]{32})/commit", route)
+            if method == "POST" and match:
+                self._principal(headers, "source.ingest")
+                return ApiResponse(200, self.service.commit_source_page(match.group(1), value))
+            if method == "POST" and route == "/v1/welcome-emails/claim":
+                self._principal(headers, "welcome_email.claim")
+                return ApiResponse(200, self.service.claim_welcome_email(value))
+            match = re.fullmatch(r"/v1/welcome-emails/([^/]+)/send-intent", route)
+            if method == "POST" and match:
+                self._principal(headers, "welcome_email.send_intent")
+                return ApiResponse(200, self.service.welcome_send_intent(unquote(match.group(1)), value))
+            match = re.fullmatch(r"/v1/welcome-emails/([^/]+)/result", route)
+            if method == "POST" and match:
+                self._principal(headers, "welcome_email.result")
+                return ApiResponse(200, self.service.welcome_result(unquote(match.group(1)), value))
             if method == "GET" and route == "/v1/operator/status":
                 self._principal(headers, "operator.status.read")
                 return ApiResponse(200, self.service.operator_status())

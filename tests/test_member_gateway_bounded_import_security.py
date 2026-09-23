@@ -33,7 +33,24 @@ def _read_json(path: Path) -> Any:
 
 
 class MemberGatewayBoundedImportSecurityTests(unittest.TestCase):
+    SCRIPT_PATH = SCRIPT
+    WORKFLOW_PATH = CANONICAL_WORKFLOW
+    TEMPLATE_PATH = MANIFEST_TEMPLATE
+    PRIVATE_ROOT = ".n8n-local/member-gateway-bounded-import"
+    FIXTURE_SCHEMA = "xb.member.gateway.bounded_import.fixture.v1"
+    WORKFLOW_NAME = "Member Gateway - Google Forms durable source adapter (inactive)"
+    # One credentialed node and its credential type, used by the resolved-
+    # credential readback regressions.
+    CREDENTIAL_PROBE = ("Google Forms single page (configured outside repo)", "googleOAuth2Api")
+    EVIDENCE_STATE_FILE = "cursor-state.json"
+    IDENTITY_TAMPER = ("production_cutover_exact", "2026-09-18T00:00:00.123Z")
+
+    def _change_preparation_input(self, manifest: dict[str, Any], label: str) -> None:
+        manifest["question_mapping"][label] = f"question-{label}-changed-002"
     TEST_GATEWAY_ORIGIN = "https://reviewed.gateway.internal:443"
+    TEST_CUTOVER = "2026-09-18T00:00:00.123456789Z"
+    PRIVATE_PAGE_TOKEN = "private-page-token-marker-7f3a"
+    PRIVATE_RESPONSE_ID = "private-response-id-marker-9c1e"
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -44,8 +61,8 @@ class MemberGatewayBoundedImportSecurityTests(unittest.TestCase):
     def setUp(self) -> None:
         self.case_root = Path(tempfile.mkdtemp(prefix="bounded-import-security-"))
         self.addCleanup(lambda: shutil.rmtree(self.case_root, ignore_errors=True))
-        self.operations_root = ".n8n-local/member-gateway-bounded-import/operations"
-        self.private_manifest_path = ROOT / ".n8n-local/member-gateway-bounded-import" / f"test-binding-{uuid4().hex}.json"
+        self.operations_root = self.PRIVATE_ROOT + "/operations"
+        self.private_manifest_path = ROOT / self.PRIVATE_ROOT / f"test-binding-{uuid4().hex}.json"
         self.manifest_path = self.private_manifest_path
         self.addCleanup(lambda path=self.private_manifest_path: path.unlink(missing_ok=True))
         self.fixture_path = self.case_root / "fixture.json"
@@ -54,15 +71,14 @@ class MemberGatewayBoundedImportSecurityTests(unittest.TestCase):
         _write_json(self.manifest_path, self.manifest)
 
     def _make_manifest(self) -> dict[str, Any]:
-        manifest = copy.deepcopy(_read_json(MANIFEST_TEMPLATE))
+        manifest = copy.deepcopy(_read_json(self.TEMPLATE_PATH))
         manifest["project"]["id"] = "project-security-001"
         manifest["workflow"]["id"] = "workflow-security-001"
         manifest["form"]["id"] = "form-security-001"
         manifest["endpoints"]["forms_responses"] = "https://forms.googleapis.com:443/v1/forms/form-security-001/responses"
         manifest["security"]["approved_gateway_origin"] = self.TEST_GATEWAY_ORIGIN
-        manifest["endpoints"]["source_cursor"] = f"{self.TEST_GATEWAY_ORIGIN}/v1/source/cursor-security"
-        manifest["endpoints"]["gateway_ingest"] = f"{self.TEST_GATEWAY_ORIGIN}/v1/source-events-security"
-        manifest["endpoints"]["page_checkpoint"] = f"{self.TEST_GATEWAY_ORIGIN}/v1/source/cursor-security/page"
+        manifest["endpoints"]["source_cursor"] = f"{self.TEST_GATEWAY_ORIGIN}/v1/source/cursor"
+        manifest["endpoints"]["gateway_origin"] = self.TEST_GATEWAY_ORIGIN
         manifest["question_mapping"] = {
             "name": "question-name-001",
             "phone": "question-phone-001",
@@ -75,30 +91,52 @@ class MemberGatewayBoundedImportSecurityTests(unittest.TestCase):
         manifest["credential_roles"]["google_forms_oauth"]["credential_id"] = "google-credential-id-001"
         manifest["credential_roles"]["gateway_bearer"]["credential_name"] = "gateway_test_credential"
         manifest["credential_roles"]["gateway_bearer"]["credential_id"] = "gateway-credential-id-001"
-        watermark = "2026-09-18T00:00:00Z"
-        manifest["cursor_expectation"]["watermark"] = watermark
-        manifest["cursor_expectation"]["watermark_digest"] = hashlib.sha256(
-            f"xb.member.gateway.watermark.v1|google_forms|member_registration|member-intake.v1|{watermark}".encode("utf-8")
+        cutover = self.TEST_CUTOVER
+        manifest["cursor_expectation"]["production_cutover_exact"] = cutover
+        manifest["cursor_expectation"]["admission_mode"] = "first_member"
+        manifest["cursor_expectation"]["production_cutover_digest"] = hashlib.sha256(
+            f"xb.member.gateway.production_cutover.v1|google_forms|member_registration|member-intake.v1|{cutover}".encode("utf-8")
         ).hexdigest()
         return manifest
 
     def _make_cursor(self) -> dict[str, Any]:
+        # Cursor v2 exactly as GET /v1/source/cursor returns it, including a
+        # private open page whose token and response id must never persist.
         return {
-            "schema_version": "xb.member.gateway.source_cursor.v1",
+            "schema_version": "xb.member.gateway.source_cursor.v2",
             "source_system": "google_forms",
             "form_alias": "member_registration",
             "mapping_version": "member-intake.v1",
-            "watermark": "2026-09-18T00:00:00Z",
-            "last_admitted_create_time": None,
-            "last_admitted_response_id": None,
-            "state_version": 0,
-            "scan_lower_bound": "2026-09-18T00:00:00Z",
-            "resume_page_token": None,
-            "initial_window_admission_count": 0,
+            "production_cutover_exact": self.TEST_CUTOVER,
+            "filter_exact": f"timestamp >= {self.TEST_CUTOVER}",
+            "admission_mode": "first_member",
+            "page_size": 1,
+            "cursor_state_version": 0,
+            "accepted_member_count": 0,
+            "accepted_member_allowance_remaining": 1,
+            "active_epoch": {
+                "epoch_id": "epoch-" + "a" * 32,
+                "status": "ACTIVE",
+                "admission_mode": "first_member",
+                "epoch_state_version": 3,
+                "current_page_token": self.PRIVATE_PAGE_TOKEN,
+                "page_ordinal": 1,
+                "predecessor_epoch_id": None,
+                "restart_reason": None,
+                "open_page": {
+                    "page_id": "page-" + "b" * 32,
+                    "page_ordinal": 1,
+                    "page_state": "OPEN",
+                    "request_page_token": self.PRIVATE_PAGE_TOKEN,
+                    "next_page_token": None,
+                    "terminal": True,
+                    "item_count": 1,
+                    "items": [{"response_id": self.PRIVATE_RESPONSE_ID, "create_time": self.TEST_CUTOVER, "payload_hash": "sha256:" + "c" * 64}],
+                },
+            },
         }
 
-    @staticmethod
-    def _repository_identity() -> dict[str, str | None]:
+    def _repository_identity(self) -> dict[str, str | None]:
         def rev_parse(argument: str) -> str | None:
             completed = subprocess.run(
                 ["git", "-C", str(ROOT), "rev-parse", "--verify", argument],
@@ -111,7 +149,7 @@ class MemberGatewayBoundedImportSecurityTests(unittest.TestCase):
                 return None
             return completed.stdout.strip()
 
-        raw_workflow = CANONICAL_WORKFLOW.read_bytes()
+        raw_workflow = self.WORKFLOW_PATH.read_bytes()
         workflow_blob = hashlib.sha1(
             b"blob " + str(len(raw_workflow)).encode("ascii") + b"\0" + raw_workflow
         ).hexdigest()
@@ -134,9 +172,9 @@ class MemberGatewayBoundedImportSecurityTests(unittest.TestCase):
         ]
 
     def _make_fixture(self, *, preimage: str = "existing", dispatch_mode: str = "success") -> dict[str, Any]:
-        canonical = _read_json(CANONICAL_WORKFLOW)
+        canonical = _read_json(self.WORKFLOW_PATH)
         fixture: dict[str, Any] = {
-            "schema_version": "xb.member.gateway.bounded_import.fixture.v1",
+            "schema_version": self.FIXTURE_SCHEMA,
             "repository": copy.deepcopy(self.repository_identity),
             "cursor": self._make_cursor(),
             "metadata": self._metadata() if preimage == "existing" else [],
@@ -168,7 +206,7 @@ class MemberGatewayBoundedImportSecurityTests(unittest.TestCase):
             "-NoProfile",
             "-NonInteractive",
             "-File",
-            str(SCRIPT),
+            str(self.SCRIPT_PATH),
             "-Mode",
             mode,
             "-RepoRoot",
@@ -303,7 +341,7 @@ class MemberGatewayBoundedImportSecurityTests(unittest.TestCase):
             {path.name for path in operation_path.iterdir()},
             {
                 "binding.json",
-                "cursor-state.json",
+                self.EVIDENCE_STATE_FILE,
                 "mutation-intent.json",
                 "plan.json",
                 "prepared.workflow.json",
@@ -352,7 +390,7 @@ class MemberGatewayBoundedImportSecurityTests(unittest.TestCase):
 
     def test_ambiguous_dispatch_does_not_replay_when_target_is_still_preimage(self) -> None:
         operation_id, fixture = self._capture("ambiguous-no-replay", dispatch_mode="ambiguous")
-        original = _read_json(CANONICAL_WORKFLOW)
+        original = _read_json(self.WORKFLOW_PATH)
         fixture["after_workflow"] = original
         _write_json(self.fixture_path, fixture)
         self._run("Apply", operation_id, expect_success=False)
@@ -470,7 +508,7 @@ class MemberGatewayBoundedImportSecurityTests(unittest.TestCase):
 
     def test_testonly_process_boundaries_reject_direct_calls(self) -> None:
         command_text = (
-            f'. "{SCRIPT}"; $script:BoundedTestOnly = $true; '
+            f'. "{self.SCRIPT_PATH}"; $script:BoundedTestOnly = $true; '
             'try { Invoke-BoundedProcess -Command "poison" -Arguments @(); } '
             'catch { Write-Output ("PROCESS=" + $_.Exception.Message) }; '
             'try { Invoke-BoundedExternalCommand "list:workflow" @(); } '
@@ -504,10 +542,12 @@ class MemberGatewayBoundedImportSecurityTests(unittest.TestCase):
         self._run("Apply", operation_id, confirm=False, extra_env=environment)
         self.assertFalse(git_marker.exists())
 
-    def test_cursor_identity_watermark_and_preimage_mismatch_block_before_dispatch(self) -> None:
+    def test_cursor_identity_cutover_and_preimage_mismatch_block_before_dispatch(self) -> None:
         cases = (
             ("cursor-identity", lambda fixture: fixture["cursor"].update({"source_system": "wrong_source"})),
-            ("watermark", lambda fixture: fixture["cursor"].update({"watermark": "2026-09-18T00:00:01Z"})),
+            # A different exact Google string is a mismatch even at similar precision.
+            ("cutover-exact", lambda fixture: fixture["cursor"].update({"production_cutover_exact": "2026-09-18T00:00:00.123Z", "filter_exact": "timestamp >= 2026-09-18T00:00:00.123Z"})),
+            ("admission-mode", lambda fixture: fixture["cursor"].update({"admission_mode": "continuous"})),
             (
                 "preimage",
                 lambda fixture: fixture["workflow"].update({"description": "tampered preimage"}),
@@ -531,7 +571,7 @@ class MemberGatewayBoundedImportSecurityTests(unittest.TestCase):
         self.assertFalse((self._operation_path(operation_id) / "dispatch-receipt.json").exists())
 
         operation_id, fixture = self._capture("cursor-state-version")
-        fixture["cursor"]["state_version"] = 1
+        fixture["cursor"]["cursor_state_version"] = 1
         _write_json(self.fixture_path, fixture)
         self._run("Apply", operation_id, expect_success=False)
         self.assertFalse((self._operation_path(operation_id) / "dispatch-receipt.json").exists())
@@ -552,13 +592,26 @@ class MemberGatewayBoundedImportSecurityTests(unittest.TestCase):
         completed = self._run("CapturePlan", operation_id, expect_success=False)
         self.assertIn("binding_credential_type_invalid", completed.stderr)
 
-        operation_id = self._operation_id("foreign-checkpoint-origin")
+        operation_id = self._operation_id("foreign-cursor-origin")
         self.manifest = self._make_manifest()
-        self.manifest["endpoints"]["page_checkpoint"] = "https://foreign.example.com/v1/source/cursor-security/page"
+        self.manifest["endpoints"]["source_cursor"] = "https://foreign.example.com:443/v1/source/cursor"
         _write_json(self.manifest_path, self.manifest)
         self._make_fixture()
         completed = self._run("CapturePlan", operation_id, expect_success=False)
         self.assertIn("binding_gateway_origin_invalid", completed.stderr)
+
+        for label, cursor_endpoint in (
+            ("cursor-path-drift", f"{self.TEST_GATEWAY_ORIGIN}/v1/source/cursor-other"),
+            ("cursor-trailing-slash", f"{self.TEST_GATEWAY_ORIGIN}/v1/source/cursor/"),
+        ):
+            with self.subTest(label=label):
+                operation_id = self._operation_id(label)
+                self.manifest = self._make_manifest()
+                self.manifest["endpoints"]["source_cursor"] = cursor_endpoint
+                _write_json(self.manifest_path, self.manifest)
+                self._make_fixture()
+                completed = self._run("CapturePlan", operation_id, expect_success=False)
+                self.assertIn("binding_endpoint_relationship_invalid", completed.stderr)
 
         operation_id = self._operation_id("foreign-forms-origin")
         self.manifest = self._make_manifest()
@@ -593,7 +646,7 @@ class MemberGatewayBoundedImportSecurityTests(unittest.TestCase):
             (
                 "endpoint-foreign-host",
                 lambda manifest: manifest["endpoints"].update(
-                    gateway_ingest="https://other.gateway.internal:443/v1/source-events-security"
+                    gateway_origin="https://other.gateway.internal:443"
                 ),
                 "binding_gateway_origin_invalid",
             ),
@@ -656,22 +709,18 @@ class MemberGatewayBoundedImportSecurityTests(unittest.TestCase):
     def test_mismatched_resolved_credential_is_rejected(self) -> None:
         operation_id, fixture = self._capture("mismatched-resolved-credential")
         fixture["after_workflow"] = self._add_resolved_credential_ids(fixture["after_workflow"])
-        forms_node = next(
-            node for node in fixture["after_workflow"]["nodes"]
-            if node["name"] == "Google Forms single page (configured outside repo)"
-        )
-        forms_node["credentials"]["googleOAuth2Api"]["name"] = "wrong-credential"
+        probe_name, probe_type = self.CREDENTIAL_PROBE
+        forms_node = next(node for node in fixture["after_workflow"]["nodes"] if node["name"] == probe_name)
+        forms_node["credentials"][probe_type]["name"] = "wrong-credential"
         _write_json(self.fixture_path, fixture)
         completed = self._run("Apply", operation_id, expect_success=False)
         self.assertIn("credential_name_mismatch", completed.stderr)
 
     def test_different_resolved_credential_id_with_same_name_is_rejected(self) -> None:
         operation_id, fixture = self._capture("mismatched-resolved-credential-id")
-        forms_node = next(
-            node for node in fixture["after_workflow"]["nodes"]
-            if node["name"] == "Google Forms single page (configured outside repo)"
-        )
-        forms_node["credentials"]["googleOAuth2Api"]["id"] = "different-credential-object-001"
+        probe_name, probe_type = self.CREDENTIAL_PROBE
+        forms_node = next(node for node in fixture["after_workflow"]["nodes"] if node["name"] == probe_name)
+        forms_node["credentials"][probe_type]["id"] = "different-credential-object-001"
         _write_json(self.fixture_path, fixture)
         completed = self._run("Apply", operation_id, expect_success=False)
         self.assertIn("credential_id_mismatch", completed.stderr)
@@ -702,13 +751,13 @@ class MemberGatewayBoundedImportSecurityTests(unittest.TestCase):
 
     def test_reviewed_workflow_blob_is_rechecked_on_apply(self) -> None:
         operation_id, _ = self._capture("reviewed-workflow-blob")
-        original = CANONICAL_WORKFLOW.read_bytes()
+        original = self.WORKFLOW_PATH.read_bytes()
         try:
-            CANONICAL_WORKFLOW.write_bytes(original + b"\n")
+            self.WORKFLOW_PATH.write_bytes(original + b"\n")
             completed = self._run("Apply", operation_id, expect_success=False)
             self.assertIn("repository_workflow_blob_mismatch", completed.stderr)
         finally:
-            CANONICAL_WORKFLOW.write_bytes(original)
+            self.WORKFLOW_PATH.write_bytes(original)
 
     def test_manifest_custody_is_established_before_semantic_parsing(self) -> None:
         outside_manifest = self.case_root / "outside-binding.json"
@@ -733,7 +782,7 @@ class MemberGatewayBoundedImportSecurityTests(unittest.TestCase):
     def test_manifest_reparse_path_is_rejected_before_semantic_parsing(self) -> None:
         outside_manifest = self.case_root / "reparse-target.json"
         outside_manifest.write_text("{not-json", encoding="utf-8")
-        link = ROOT / ".n8n-local/member-gateway-bounded-import" / f"test-manifest-link-{uuid4().hex}.json"
+        link = ROOT / self.PRIVATE_ROOT / f"test-manifest-link-{uuid4().hex}.json"
         try:
             try:
                 os.symlink(outside_manifest, link)
@@ -760,9 +809,14 @@ class MemberGatewayBoundedImportSecurityTests(unittest.TestCase):
         prepared_path = self._operation_path(operation_id) / "prepared.workflow.json"
         prepared = _read_json(prepared_path)
         prepared_text = prepared_path.read_text(encoding="utf-8")
-        self.assertIn(self.manifest["endpoints"]["source_cursor"], prepared_text)
-        self.assertIn(self.manifest["endpoints"]["page_checkpoint"], prepared_text)
-        self.assertNotIn("https://gateway.example.com/v1/source/cursor/page", prepared_text)
+        self.assertIn(self.manifest["endpoints"]["gateway_origin"], prepared_text)
+        self.assertNotIn("gateway.example.com", prepared_text)
+        self.assertNotIn("forms.example.com", prepared_text)
+        config_node = next(node for node in prepared["nodes"] if node["name"] == "Repository-safe source configuration")
+        assignments = {item["name"]: item["value"] for item in config_node["parameters"]["assignments"]["assignments"]}
+        self.assertEqual(assignments["gateway_origin"], self.manifest["endpoints"]["gateway_origin"])
+        self.assertEqual(assignments["forms_api_url"], self.manifest["endpoints"]["forms_responses"])
+        self.assertIs(assignments["activation_enabled"], False)
         nodes = {node["name"]: node for node in prepared["nodes"]}
         self.assertEqual(
             nodes["Google Forms single page (configured outside repo)"]["credentials"]["googleOAuth2Api"]["id"],
@@ -770,18 +824,16 @@ class MemberGatewayBoundedImportSecurityTests(unittest.TestCase):
         )
         self.assertEqual(nodes["Google Forms single page (configured outside repo)"]["parameters"]["authentication"], "predefinedCredentialType")
         self.assertEqual(nodes["Google Forms single page (configured outside repo)"]["parameters"]["nodeCredentialType"], "googleOAuth2Api")
-        for name in (
-            "Read durable source cursor",
-            "Protected XB Gateway ingest (configured outside repo)",
-            "Commit durable page checkpoint",
-        ):
+        http_names = {node["name"] for node in prepared["nodes"] if node["type"] == "n8n-nodes-base.httpRequest"}
+        self.assertEqual(http_names, set(('Begin or resume scan epoch', 'Restart crashed scan epoch', 'Restart invalidated scan epoch', 'Open page durably', 'Protected XB Gateway ingest (configured outside repo)', 'Record PII-free source rejection', 'Commit durable page checkpoint')) | {"Google Forms single page (configured outside repo)"})
+        for name in ('Begin or resume scan epoch', 'Restart crashed scan epoch', 'Restart invalidated scan epoch', 'Open page durably', 'Protected XB Gateway ingest (configured outside repo)', 'Record PII-free source rejection', 'Commit durable page checkpoint'):
             self.assertEqual(nodes[name]["parameters"]["authentication"], "genericCredentialType")
             self.assertEqual(nodes[name]["parameters"]["genericAuthType"], "httpBearerAuth")
             self.assertEqual(
                 nodes[name]["credentials"]["httpBearerAuth"]["id"],
                 self.manifest["credential_roles"]["gateway_bearer"]["credential_id"],
             )
-        source = SCRIPT.read_text(encoding="utf-8")
+        source = self.SCRIPT_PATH.read_text(encoding="utf-8")
         self.assertIn("Get-BoundedCursorRequestUri", source)
         self.assertIn('Invoke-BoundedExternalCommand "list:workflow" @()', source)
         self.assertNotIn('list:workflow" @("--output=json")', source)
@@ -797,7 +849,7 @@ class MemberGatewayBoundedImportSecurityTests(unittest.TestCase):
             "if \"%~1\"==\"import:workflow\" goto import\r\n"
             "exit /b 9\r\n"
             ":list\r\n"
-            "echo workflow-security-001^|Member Gateway - Google Forms durable source adapter ^(inactive^)\r\n"
+            "echo workflow-security-001^|" + self.WORKFLOW_NAME.replace("(", "^(").replace(")", "^)") + "\r\n"
             "exit /b 0\r\n"
             ":import\r\n"
             "echo import-ok:%*\r\n"
@@ -805,7 +857,7 @@ class MemberGatewayBoundedImportSecurityTests(unittest.TestCase):
             encoding="ascii",
         )
         command_text = (
-            f'. "{SCRIPT}"; $script:N8nExecutable = "{fake}"; '
+            f'. "{self.SCRIPT_PATH}"; $script:N8nExecutable = "{fake}"; '
             '$list = Invoke-BoundedExternalCommand "list:workflow" @(); '
             '$rows = ConvertFrom-BoundedWorkflowListText $list.stdout; '
             'Write-Output ("LIST=" + $rows[0].id + "|" + $rows[0].name); '
@@ -814,7 +866,7 @@ class MemberGatewayBoundedImportSecurityTests(unittest.TestCase):
         )
         completed = self._run_ps_command(command_text)
         self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
-        self.assertIn("LIST=workflow-security-001|Member Gateway - Google Forms durable source adapter (inactive)", completed.stdout)
+        self.assertIn("LIST=workflow-security-001|" + self.WORKFLOW_NAME, completed.stdout)
         self.assertIn("IMPORT=import-ok:import:workflow --input=C:\\prepared.workflow.json --projectId=project-security-001 --activeState=false", completed.stdout)
 
     def _run_container_transport(
@@ -1046,7 +1098,7 @@ try {
     Write-Error ("bounded_test:" + [string]$_.Exception.Message)
     exit 1
 }
-""".replace("__SCRIPT__", str(SCRIPT).replace("'", "''"))
+""".replace("__SCRIPT__", str(self.SCRIPT_PATH).replace("'", "''"))
         completed = self._run_ps_command(command_text, extra_env=environment)
         if expect_success:
             self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
@@ -1143,7 +1195,7 @@ try {
             self.assertTrue((container_root / "tmp").exists())
             self.assertEqual(count_path.read_text(encoding="utf-8"), "1")
             check = (
-                f". '{SCRIPT}'; "
+                f". '{self.SCRIPT_PATH}'; "
                 f"$custody = Read-BoundedJsonFile '{custody_path}'; "
                 f"$plan = Read-BoundedJsonFile '{operation_path / 'plan.json'}'; "
                 "try { Assert-BoundedContainerCustody $custody $plan; Assert-BoundedContainerCleanupVerified $custody; exit 0 } "
@@ -1166,7 +1218,7 @@ try {
                 mutated["cleanup_verified"] = cleanup_verified
                 _write_json(custody_path, mutated)
                 check = (
-                    f". '{SCRIPT}'; "
+                    f". '{self.SCRIPT_PATH}'; "
                     f"$custody = Read-BoundedJsonFile '{custody_path}'; "
                     f"$plan = Read-BoundedJsonFile '{custody_path.parent / 'plan.json'}'; "
                     "try { Assert-BoundedContainerCustody $custody $plan; Assert-BoundedContainerCleanupVerified $custody; exit 0 } "
@@ -1199,12 +1251,12 @@ try {
         fake_root = Path(tempfile.mkdtemp(prefix="bounded-guard-exact-"))
         self.addCleanup(lambda: shutil.rmtree(fake_root, ignore_errors=True))
         subprocess.run(["git", "init", "-q", str(fake_root)], check=True, capture_output=True, text=True)
-        nested = fake_root / "nested" / ".n8n-local/member-gateway-bounded-import/operations"
+        nested = fake_root / "nested" / (self.PRIVATE_ROOT + "/operations")
         self._run_private_guard(fake_root, nested, expected="private_path_not_canonical")
 
     def test_cursor_request_binds_required_parameters_without_overlap(self) -> None:
         command_text = (
-            f'. "{SCRIPT}"; '
+            f'. "{self.SCRIPT_PATH}"; '
             f'$manifest = Read-BoundedJsonFile "{self.manifest_path}"; '
             'Assert-BoundedManifest $manifest; '
             'Get-BoundedCursorRequestUri $manifest'
@@ -1212,14 +1264,14 @@ try {
         completed = self._run_ps_command(command_text)
         self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
         self.assertIn(
-            "https://reviewed.gateway.internal/v1/source/cursor-security?form_alias=member_registration&mapping_version=member-intake.v1",
+            "https://reviewed.gateway.internal/v1/source/cursor?form_alias=member_registration&mapping_version=member-intake.v1",
             completed.stdout,
         )
 
         self.manifest["endpoints"]["source_cursor"] += "?form_alias=already-present"
         _write_json(self.manifest_path, self.manifest)
         collision_command = (
-            f'. "{SCRIPT}"; '
+            f'. "{self.SCRIPT_PATH}"; '
             f'$manifest = Read-BoundedJsonFile "{self.manifest_path}"; '
             'try { Get-BoundedCursorRequestUri $manifest; exit 0 } '
             'catch { Write-Output $_.Exception.Message; exit 1 }'
@@ -1232,7 +1284,8 @@ try {
         operation_id, _ = self._capture("identity-mismatch")
         plan_path = self._operation_path(operation_id) / "plan.json"
         plan = _read_json(plan_path)
-        plan["identity_seed"]["watermark_value"] = "2026-09-18T00:00:01Z"
+        field, value = self.IDENTITY_TAMPER
+        plan["identity_seed"][field] = value
         _write_json(plan_path, plan)
         self._run("Apply", operation_id, expect_success=False)
         self.assertFalse((self._operation_path(operation_id) / "dispatch-receipt.json").exists())
@@ -1288,7 +1341,7 @@ try {
         operation_id, fixture = self._capture("partial-fresh-preparation", dispatch_mode="ambiguous")
         self._run("Apply", operation_id, expect_success=False)
         dispatch_before = (self._operation_path(operation_id) / "dispatch-receipt.json").read_bytes()
-        self.manifest["question_mapping"]["name"] = "question-name-changed-002"
+        self._change_preparation_input(self.manifest, "name")
         _write_json(self.manifest_path, self.manifest)
         completed = self._run("Apply", operation_id, expect_success=False)
         self.assertIn("binding_digest_mismatch", completed.stderr)
@@ -1297,10 +1350,88 @@ try {
     def test_completed_noop_retry_rederives_changed_preparation_inputs_and_rejects_them(self) -> None:
         operation_id, _ = self._capture("completed-fresh-preparation")
         self._apply_successfully(operation_id)
-        self.manifest["endpoints"]["gateway_ingest"] = f"{self.TEST_GATEWAY_ORIGIN}/v1/source-events-changed"
+        self._change_preparation_input(self.manifest, "email")
         _write_json(self.manifest_path, self.manifest)
         completed = self._run("Apply", operation_id, expect_success=False)
         self.assertIn("binding_digest_mismatch", completed.stderr)
+
+    def test_cursor_v2_shape_and_cutover_binding_fail_closed(self) -> None:
+        v1_cursor = {
+            "schema_version": "xb.member.gateway.source_cursor.v1", "source_system": "google_forms",
+            "form_alias": "member_registration", "mapping_version": "member-intake.v1",
+            "watermark": "2026-09-18T00:00:00Z", "last_admitted_create_time": None,
+            "last_admitted_response_id": None, "state_version": 0, "scan_lower_bound": "2026-09-18T00:00:00Z",
+            "resume_page_token": None, "initial_window_admission_count": 0,
+        }
+        cases = (
+            ("v1-cursor", lambda cursor: (cursor.clear(), cursor.update(v1_cursor)), "cursor_shape_invalid"),
+            ("filter-drift", lambda cursor: cursor.update({"filter_exact": "timestamp >= 2026-09-18T00:00:00Z"}), "production_cutover_filter_invalid"),
+            ("cutover-rounded", lambda cursor: cursor.update({"production_cutover_exact": "2026-09-18T00:00:00.1Z", "filter_exact": "timestamp >= 2026-09-18T00:00:00.1Z"}), "production_cutover_value_invalid"),
+            ("page-size", lambda cursor: cursor.update({"page_size": 50}), "cursor_page_size_invalid"),
+            ("mode", lambda cursor: cursor.update({"admission_mode": "continuous"}), "admission_mode_mismatch"),
+            ("extra-field", lambda cursor: cursor.update({"resume_page_token": None}), "cursor_shape_invalid"),
+            ("epoch-shape", lambda cursor: cursor["active_epoch"].update({"epoch_id": "not-an-epoch"}), "cursor_epoch_invalid"),
+            ("epoch-line-break", lambda cursor: cursor["active_epoch"].update({"current_page_token": "token\nsmuggled"}), "cursor_value_invalid"),
+        )
+        for label, mutate, expected in cases:
+            with self.subTest(label=label):
+                operation_id = self._operation_id(label)
+                fixture = self._make_fixture()
+                mutate(fixture["cursor"])
+                _write_json(self.fixture_path, fixture)
+                completed = self._run("CapturePlan", operation_id, expect_success=False)
+                self.assertIn(expected, completed.stderr)
+
+        manifest_cases = (
+            ("cutover-digest", lambda manifest: manifest["cursor_expectation"].update({"production_cutover_digest": "0" * 64}), "binding_production_cutover_reference_mismatch"),
+            ("cutover-placeholder", lambda manifest: manifest["cursor_expectation"].update({"production_cutover_exact": "PRODUCTION_CUTOVER_EXACT_PLACEHOLDER"}), "binding_cursor_reference_unresolved"),
+            ("cutover-offset", lambda manifest: manifest["cursor_expectation"].update({"production_cutover_exact": "2026-09-18T00:00:00+00:00"}), "binding_production_cutover_invalid"),
+            ("mode-invalid", lambda manifest: manifest["cursor_expectation"].update({"admission_mode": "unbounded"}), "binding_admission_mode_invalid"),
+            ("legacy-watermark", lambda manifest: manifest["cursor_expectation"].update({"watermark": "2026-09-18T00:00:00Z"}), "binding_cursor_shape_invalid"),
+            ("legacy-endpoints", lambda manifest: manifest["endpoints"].update({"page_checkpoint": f"{self.TEST_GATEWAY_ORIGIN}/v1/source/cursor/page"}), "binding_endpoint_shape_invalid"),
+        )
+        for label, mutate, expected in manifest_cases:
+            with self.subTest(label=label):
+                operation_id = self._operation_id(label)
+                self.manifest = self._make_manifest()
+                mutate(self.manifest)
+                _write_json(self.manifest_path, self.manifest)
+                self._make_fixture()
+                completed = self._run("CapturePlan", operation_id, expect_success=False)
+                self.assertIn(expected, completed.stderr)
+
+    def test_gateway_bearer_binds_exactly_the_seven_gateway_nodes(self) -> None:
+        cases = (
+            ("missing-node", lambda nodes: nodes.pop()),
+            ("legacy-node", lambda nodes: nodes.__setitem__(0, "Read durable source cursor")),
+            ("reordered", lambda nodes: nodes.reverse()),
+            ("extra-node", lambda nodes: nodes.append("Plan next page")),
+        )
+        for label, mutate in cases:
+            with self.subTest(label=label):
+                operation_id = self._operation_id(label)
+                self.manifest = self._make_manifest()
+                mutate(self.manifest["credential_roles"]["gateway_bearer"]["node_names"])
+                _write_json(self.manifest_path, self.manifest)
+                self._make_fixture()
+                completed = self._run("CapturePlan", operation_id, expect_success=False)
+                self.assertIn("binding_credential_nodes_invalid", completed.stderr)
+
+    def test_private_tokens_and_response_ids_never_reach_evidence_or_output(self) -> None:
+        operation_id, _ = self._capture("non-disclosure")
+        completed = self._run("Apply", operation_id)
+        self.assertEqual(json.loads(completed.stdout.strip().splitlines()[-1])["status"], "applied_and_verified")
+        streams = (completed.stdout or "") + (completed.stderr or "")
+        for marker in (self.PRIVATE_PAGE_TOKEN, self.PRIVATE_RESPONSE_ID):
+            self.assertNotIn(marker, streams)
+            for path in self._operation_path(operation_id).rglob("*"):
+                if path.is_file():
+                    self.assertNotIn(marker.encode("utf-8"), path.read_bytes(), path.name)
+        cursor_state = _read_json(self._operation_path(operation_id) / "cursor-state.json")
+        self.assertEqual(cursor_state["schema_version"], "xb.member.gateway.bounded_import.cursor-state.v3")
+        self.assertEqual(cursor_state["cursor"]["schema_version"], "xb.member.gateway.bounded_import.cursor-projection.v1")
+        self.assertNotIn("active_epoch", cursor_state["cursor"])
+        self.assertEqual(cursor_state["cursor"]["production_cutover_exact"], self.TEST_CUTOVER)
 
     def test_completed_operation_is_noop_only_for_exact_target(self) -> None:
         operation_id, fixture = self._capture("completed-target")
@@ -1322,7 +1453,7 @@ try {
             self.assertEqual([path for path in private_root.rglob("*") if path.is_file()], [])
 
     def test_acl_proof_precedes_first_populated_write(self) -> None:
-        source = SCRIPT.read_text(encoding="utf-8")
+        source = self.SCRIPT_PATH.read_text(encoding="utf-8")
         staging_function = source.split("function New-BoundedStagingRoot", 1)[1].split("function Write-BoundedCreateNewBytes", 1)[0]
         publish_function = source.split("function Publish-BoundedPlanArtifacts", 1)[1].split("function Write-BoundedOperationReceipt", 1)[0]
         self.assertIn("Set-BoundedProtectedAcl $stage", staging_function)
@@ -1331,7 +1462,7 @@ try {
 
     def _run_private_guard(self, root: Path, candidate: Path, *, expected: str) -> None:
         command_text = (
-            f". '{SCRIPT}'; $script:BoundedTestOnly = $false; "
+            f". '{self.SCRIPT_PATH}'; $script:BoundedTestOnly = $false; "
             f"try {{ Assert-BoundedPrivateDestination '{root}' '{candidate}'; exit 0 }} "
             f"catch {{ Write-Output $_.Exception.Message; exit 1 }}"
         )
@@ -1378,7 +1509,7 @@ try {
         fake_root = Path(tempfile.mkdtemp(prefix="bounded-guard-"))
         self.addCleanup(lambda: shutil.rmtree(fake_root, ignore_errors=True))
         subprocess.run(["git", "init", "-q", str(fake_root)], check=True, capture_output=True, text=True)
-        canonical = fake_root / ".n8n-local/member-gateway-bounded-import/operations"
+        canonical = fake_root / (self.PRIVATE_ROOT + "/operations")
 
         self._run_private_guard(fake_root, fake_root / "outside" / "operations", expected="private_path_not_canonical")
 
@@ -1405,7 +1536,7 @@ try {
                 text=True,
             )
             if junction.returncode != 0:
-                self.assertIn("ReparsePoint", SCRIPT.read_text(encoding="utf-8"))
+                self.assertIn("ReparsePoint", self.SCRIPT_PATH.read_text(encoding="utf-8"))
                 self.skipTest(f"directory reparse point unavailable for direct test: {error}; {junction.stderr}")
         self._run_private_guard(fake_root, canonical, expected="unsafe_link")
 

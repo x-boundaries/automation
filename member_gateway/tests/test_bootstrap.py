@@ -11,7 +11,7 @@ from xb_member_gateway.models import JobRecord
 from xb_member_gateway.repository import RepositoryError
 
 
-TOKENS = {name: f"synthetic-{name}-bearer" for name in ("source", "operator", "control", "worker", "recovery")}
+TOKENS = {name: f"synthetic-{name}-bearer" for name in ("source", "operator", "control", "worker", "recovery", "mailer")}
 
 
 def config_value():
@@ -25,6 +25,8 @@ def config_value():
         "source_form_id": "synthetic-form",
         "source_question_ids": {name: f"synthetic-{name}" for name in ("name", "phone", "email", "birthday_month", "marketing_consent", "pdpa_acknowledged")},
         "source_cutover_watermark": "2026-09-15T00:00:00Z",
+        "source_production_cutover_exact": "2026-09-15T00:00:00.000Z",
+        "source_admission_mode": "first_member",
         "initial_source_window_max": 1, "member_no_max_length": 20,
         "lease_seconds": 600, "heartbeat_seconds": 120, "execution_deadline_seconds": 300,
         "max_attempts": 3, "worker_concurrency": 1, "claim_size": 1,
@@ -103,8 +105,26 @@ class BootstrapTests(unittest.TestCase):
         with self.assertRaisesRegex(BootstrapError, "authentication_binding_aliased"):
             compose_gateway(self.write_config(), environment=values, repository_factory=FakeRepository)
 
+    def test_missing_cutover_mode_or_sixth_principal_fails_closed(self):
+        value = config_value()
+        value["source_production_cutover_exact"] = None
+        with self.assertRaisesRegex(BootstrapError, "source_production_cutover_exact_required"):
+            compose_gateway(self.write_config(value), environment=runtime(), repository_factory=FakeRepository)
+        value = config_value()
+        value["mailer_token_sha256"] = None
+        with self.assertRaisesRegex(BootstrapError, "mailer_credential_digest_required"):
+            compose_gateway(self.write_config(value), environment=runtime(), repository_factory=FakeRepository)
+        value = config_value()
+        value["source_admission_mode"] = "unbounded"
+        with self.assertRaisesRegex(BootstrapError, "source_admission_mode_invalid"):
+            compose_gateway(self.write_config(value), environment=runtime(), repository_factory=FakeRepository)
+        values = runtime()
+        values["TEST_MAILER_TOKEN"] = values["TEST_WORKER_TOKEN"]
+        with self.assertRaisesRegex(BootstrapError, "authentication_binding_aliased"):
+            compose_gateway(self.write_config(), environment=values, repository_factory=FakeRepository)
+
     def test_missing_required_config_field_fails_closed(self):
-        for field in ("postgres_dsn_env", "source_token_env", "source_token_sha256", "source_cutover_watermark", "source_question_ids", "initial_source_window_max"):
+        for field in ("postgres_dsn_env", "source_token_env", "source_token_sha256", "source_cutover_watermark", "source_production_cutover_exact", "source_admission_mode", "mailer_token_sha256", "mailer_token_env", "source_question_ids", "initial_source_window_max"):
             with self.subTest(field=field):
                 value = config_value()
                 value.pop(field)
@@ -269,6 +289,8 @@ class DarkStartCompositionTests(unittest.TestCase):
             ("source_cutover_watermark", None, "source_cutover_watermark_required"),
             ("source_form_id", None, "source_form_id_required"),
             ("recovery_token_sha256", None, "recovery_credential_digest_required"),
+            ("mailer_token_sha256", None, "mailer_credential_digest_required"),
+            ("source_production_cutover_exact", None, "source_production_cutover_exact_required"),
             ("environment", "staging", "environment_mismatch"),
             ("member_no_max_length", 21, "member_no_max_length_must_be_twenty"),
         )

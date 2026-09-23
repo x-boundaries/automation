@@ -4,7 +4,13 @@ import uuid
 from datetime import datetime, timezone
 
 from xb_member_gateway.models import JobState, ResultRecord, ResultStatus
+from xb_member_gateway.notifications import build_welcome_message, welcome_message_hash
 from xb_member_gateway.repository import PostgresRepository, ResultConflict, public_fence_id
+
+try:
+    from .test_postgres_cursor import assert_driver_accepts
+except ImportError:  # discovered as a top-level module
+    from test_postgres_cursor import assert_driver_accepts
 
 
 NOW = datetime(2026, 9, 1, 1, 0, tzinfo=timezone.utc)
@@ -25,9 +31,10 @@ class ProjectionStore:
         self.old_hash = "sha256:" + "a" * 64
         self.new_hash = "sha256:" + "b" * 64
         self.case_id = str(uuid.uuid4())
+        self.recipient = "projection@example.test"
         self.job_row = (
-            self.job_id, "request-001", "source-ref-001", "response-001",
-            self.old_hash, "member.create", {}, NOW, JobState.WRITE_OUTCOME_UNCERTAIN.value,
+            self.job_id, "request-001", "hmac-v1:" + "0" * 64, "response-001",
+            self.old_hash, "member.create", {"email": self.recipient}, NOW, JobState.WRITE_OUTCOME_UNCERTAIN.value,
             12, 1, 3, None, None, None, self.member_no, "allocation-ref-001",
             "intent-001", self.fence_id, 1, ResultStatus.WRITE_OUTCOME_UNCERTAIN.value,
             "save_outcome_uncertain", "google_forms", "member_registration",
@@ -52,12 +59,20 @@ class ProjectionStore:
         )
         self.statements = []
         self.force_stale_cas = False
+        self.case_state = "ABSENT"
+        self.check = ("absent", False, False)
+        self.outbox = []
+        self.outbox_events = []
 
     def snapshot(self):
-        return copy.deepcopy((self.job_row, self.result_projection, self.result_events, self.hold))
+        return copy.deepcopy((self.job_row, self.result_projection, self.result_events, self.hold, self.outbox, self.outbox_events))
 
     def restore(self, snapshot):
-        self.job_row, self.result_projection, self.result_events, self.hold = copy.deepcopy(snapshot)
+        self.job_row, self.result_projection, self.result_events, self.hold, self.outbox, self.outbox_events = copy.deepcopy(snapshot)
+
+    def outbox_row(self):
+        values = self.outbox[0]
+        return (values[0], values[1], values[2], values[3], values[4], values[5], values[6], "PENDING", 0, 0, values[7], None, None, values[8], None, None, values[9], values[10])
 
 
 class ProjectionConnection:
@@ -91,6 +106,9 @@ class ProjectionCursor:
         return False
 
     def execute(self, statement, params=None):
+        # Every statement passes the same arity/adaptation boundary psycopg
+        # applies, so a placeholder mismatch can no longer disappear here.
+        assert_driver_accepts(statement, tuple(params or ()))
         normalized = " ".join(statement.split()).upper()
         self.store.statements.append(statement)
         self.rows = []
@@ -113,10 +131,25 @@ class ProjectionCursor:
             self.rows = [(projection["result_hash"], projection["status"])] if projection else []
             return
         if "SELECT JOB_ID,MEMBER_NO,CASE_STATE FROM XB_MEMBER_GATEWAY.RECONCILIATION_CASES" in normalized:
-            self.rows = [(self.store.job_id, self.store.member_no, "ABSENT")]
+            self.rows = [(self.store.job_id, self.store.member_no, self.store.case_state)]
             return
         if "SELECT LOOKUP_STATUS,READBACK_FOUND,READBACK_MATCH FROM XB_MEMBER_GATEWAY.RECONCILIATION_CHECKS" in normalized:
-            self.rows = [("absent", False, False)]
+            self.rows = [self.store.check]
+            return
+        if normalized.startswith("INSERT INTO XB_MEMBER_GATEWAY.WELCOME_EMAIL_OUTBOX"):
+            if self.store.result_projection is None or self.store.result_projection["status"] != ResultStatus.CREATED_VERIFIED.value:
+                raise RuntimeError("welcome_email_requires_created_verified")
+            if self.store.outbox:
+                raise UniqueProjectionViolation("welcome_email_outbox_job_id_unique")
+            self.store.outbox.append(tuple(params))
+            self.rowcount = 1
+            return
+        if normalized.startswith("INSERT INTO XB_MEMBER_GATEWAY.WELCOME_EMAIL_EVENTS"):
+            self.store.outbox_events.append(tuple(params))
+            self.rowcount = 1
+            return
+        if "FROM XB_MEMBER_GATEWAY.WELCOME_EMAIL_OUTBOX WHERE JOB_ID" in normalized:
+            self.rows = [self.store.outbox_row()] if self.store.outbox else []
             return
         if normalized.startswith("INSERT INTO XB_MEMBER_GATEWAY.RESULT_EVENTS"):
             values = tuple(params)
@@ -187,20 +220,26 @@ class ProjectionCursor:
         return rows
 
 
-def final_result(store):
+def final_result(store, status=ResultStatus.CONFIRMED_NOT_CREATED):
+    positive = status == ResultStatus.CREATED_VERIFIED
     return ResultRecord(
         job_id=store.job_id,
         result_hash=store.new_hash,
-        status=ResultStatus.CONFIRMED_NOT_CREATED,
+        status=status,
         member_no=store.member_no,
         dispatch_fence_id=store.public_fence,
         save_invocation_count=1,
-        readback_found=False,
-        readback_match=False,
-        reconciliation_required=True,
-        error_code="confirmed_absent_manual_followup",
+        readback_found=positive,
+        readback_match=positive,
+        reconciliation_required=not positive,
+        error_code=None if positive else "confirmed_absent_manual_followup",
         acknowledged_at="2026-09-01T01:00:00Z",
     )
+
+
+def exact_match(store):
+    store.case_state = "EXACT_MATCH"
+    store.check = ("exact_match", True, True)
 
 
 class PostgresProjectionTests(unittest.TestCase):
@@ -242,6 +281,60 @@ class PostgresProjectionTests(unittest.TestCase):
         self.assertEqual(len(store.result_events), 1)
         self.assertEqual(store.result_projection["result_hash"], store.old_hash)
         self.assertEqual(store.result_projection["status"], ResultStatus.WRITE_OUTCOME_UNCERTAIN.value)
+        self.assertEqual(store.outbox, [])
+
+    def test_non_positive_reconciliation_creates_no_welcome_outbox(self):
+        store = ProjectionStore()
+        repository = PostgresRepository(connection_factory=lambda: ProjectionConnection(store))
+        repository.acknowledge_result(final_result(store), require_lease=False, reconciliation_case_id=store.case_id, now=NOW)
+        self.assertEqual(store.outbox, [])
+        self.assertFalse(any("WELCOME_EMAIL" in statement.upper() for statement in store.statements))
+
+    def test_exact_match_reconciliation_inserts_welcome_outbox_in_the_same_transaction(self):
+        store = ProjectionStore()
+        exact_match(store)
+        repository = PostgresRepository(connection_factory=lambda: ProjectionConnection(store))
+        stored, duplicate = repository.acknowledge_result(
+            final_result(store, ResultStatus.CREATED_VERIFIED), require_lease=False,
+            reconciliation_case_id=store.case_id, now=NOW,
+        )
+        self.assertEqual((stored.status, duplicate), (ResultStatus.CREATED_VERIFIED, False))
+        self.assertEqual(len(store.outbox), 1)
+        outbox = store.outbox[0]
+        message = build_welcome_message(store.recipient)
+        self.assertEqual((outbox[1], outbox[2], outbox[4], outbox[5], outbox[6]), (store.job_id, "response-001", "welcome_v1", store.recipient, welcome_message_hash(message)))
+        self.assertEqual(len(store.outbox_events), 1)
+        statements = [statement.upper() for statement in store.statements]
+        projection = next(index for index, statement in enumerate(statements) if "RESULTS SET" in statement)
+        insert = next(index for index, statement in enumerate(statements) if "INSERT INTO XB_MEMBER_GATEWAY.WELCOME_EMAIL_OUTBOX" in statement)
+        self.assertLess(projection, insert)
+
+        # Duplicate acknowledgement verifies the existing identity only.
+        again, duplicate = repository.acknowledge_result(
+            final_result(store, ResultStatus.CREATED_VERIFIED), require_lease=False,
+            reconciliation_case_id=store.case_id, now=NOW,
+        )
+        self.assertTrue(duplicate)
+        self.assertEqual(len(store.outbox), 1)
+
+    def test_duplicate_positive_ack_without_outbox_fails_closed_and_never_backfills(self):
+        store = ProjectionStore()
+        exact_match(store)
+        store.result_projection = dict(store.result_projection, result_hash=store.new_hash, status=ResultStatus.CREATED_VERIFIED.value)
+        repository = PostgresRepository(connection_factory=lambda: ProjectionConnection(store))
+        with self.assertRaisesRegex(ResultConflict, "welcome_outbox_identity_missing"):
+            repository.acknowledge_result(final_result(store, ResultStatus.CREATED_VERIFIED), require_lease=False, reconciliation_case_id=store.case_id, now=NOW)
+        self.assertEqual(store.outbox, [])
+
+    def test_outbox_insert_failure_rolls_back_the_positive_projection(self):
+        store = ProjectionStore()
+        exact_match(store)
+        store.outbox.append(("welcome-" + "f" * 32, "job-other", "response-other", "ref", "welcome_v1", "x@example.test", "sha256:" + "0" * 64, 3, NOW, NOW, NOW))
+        repository = PostgresRepository(connection_factory=lambda: ProjectionConnection(store))
+        with self.assertRaises(UniqueProjectionViolation):
+            repository.acknowledge_result(final_result(store, ResultStatus.CREATED_VERIFIED), require_lease=False, reconciliation_case_id=store.case_id, now=NOW)
+        self.assertEqual(store.result_projection["status"], ResultStatus.WRITE_OUTCOME_UNCERTAIN.value)
+        self.assertEqual(len(store.result_events), 1)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,67 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/schemas/member_gateway_welcome_email_result.v1.schema.json",
+  "title": "XB member welcome email result v1",
+  "description": "Mailer result acknowledgement. smtp_accepted means the SMTP server accepted the message, not inbox delivery. Any post-intent timeout, crash, lost acknowledgement or unclassified outcome is delivery_outcome_uncertain and is never resent. failed_before_send_intent is valid only while no send intent exists.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "lease_id",
+    "state_version",
+    "outcome",
+    "error_code"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "xb.member.welcome_email.result.v1"
+    },
+    "lease_id": {
+      "type": "string",
+      "pattern": "^lease-[0-9a-f]{32}$"
+    },
+    "state_version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "outcome": {
+      "enum": [
+        "smtp_accepted",
+        "delivery_outcome_uncertain",
+        "failed_before_send_intent"
+      ]
+    },
+    "error_code": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[a-z0-9_.:-]{1,80}$"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "outcome": {
+            "const": "smtp_accepted"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "error_code": {
+            "type": "null"
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "error_code": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  ]
+}
