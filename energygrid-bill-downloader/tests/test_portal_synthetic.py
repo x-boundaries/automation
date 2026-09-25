@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 from dataclasses import dataclass
 import io
 import json
@@ -27,7 +28,7 @@ from energygrid_bill_downloader.errors import (
 )
 from energygrid_bill_downloader.portal import PlaywrightPortal
 from energygrid_bill_downloader.publication import validate_pdf
-from tests.fixtures.synthetic_portal import SyntheticBill, SyntheticPortalServer, write_config
+from tests.fixtures.synthetic_portal import SyntheticBill, SyntheticPortalServer, synthetic_pdf, write_config
 
 try:
     from playwright.sync_api import sync_playwright  # type: ignore[import-not-found]
@@ -62,7 +63,7 @@ def fast_portal_recovery(attempts_ms=(0, 50, 150), deadline_seconds: float = 2.0
 
 @unittest.skipUnless(sync_playwright is not None, "Playwright Python package is not installed")
 class SyntheticPortalTests(unittest.TestCase):
-    def config_for(self, server: SyntheticPortalServer, root: Path):
+    def config_for(self, server: SyntheticPortalServer, root: Path, **overrides):
         raw = {
             "portal_url": server.base_url,
             "archive_root": str(root / "archive"),
@@ -73,6 +74,7 @@ class SyntheticPortalTests(unittest.TestCase):
             "timeout_seconds": 5,
             "inventory_safety_ceiling": 20,
         }
+        raw.update(overrides)
         config = load_runtime_config(raw, checkout_root=Path.cwd())
         config.archive_root.mkdir()
         config.preflight()
@@ -91,40 +93,6 @@ class SyntheticPortalTests(unittest.TestCase):
                 os.environ.pop(name, None)
             else:
                 os.environ[name] = value
-
-    def test_login_inventory_pagination_and_download_are_synthetic(self) -> None:
-        bills = [
-            SyntheticBill("2026-05-01_account_a.pdf"),
-            SyntheticBill("2026-06-01_account_b.pdf"),
-            SyntheticBill("2026-07-01_account_c.pdf"),
-        ]
-        with tempfile.TemporaryDirectory() as directory, SyntheticPortalServer(bills, page_size=2) as server:
-            root = Path(directory)
-            config = self.config_for(server, root)
-            old, _values = self.with_credentials()
-            try:
-                with PlaywrightPortal(config) as portal:
-                    portal.login()
-                    inventory = portal.inventory(20)
-                    self.assertEqual([item.filename for item in inventory], [item.filename for item in bills])
-                    target = root / "download.bin"
-                    suggested = portal.download(inventory[0], target)
-                    self.assertEqual(suggested, bills[0].filename)
-                    self.assertEqual(target.read_bytes(), bills[0].payload)
-            finally:
-                self.restore_credentials(old)
-
-    def test_empty_inventory_is_supported(self) -> None:
-        with tempfile.TemporaryDirectory() as directory, SyntheticPortalServer([]) as server:
-            root = Path(directory)
-            config = self.config_for(server, root)
-            old, _values = self.with_credentials()
-            try:
-                with PlaywrightPortal(config) as portal:
-                    portal.login()
-                    self.assertEqual(portal.inventory(20), [])
-            finally:
-                self.restore_credentials(old)
 
     def test_login_failure_is_distinct_from_selector_drift(self) -> None:
         with tempfile.TemporaryDirectory() as directory, SyntheticPortalServer(login_success=False) as server:
@@ -223,398 +191,387 @@ class SyntheticPortalTests(unittest.TestCase):
                     # Activation is attempted at most once per login attempt.
                     self.assertEqual(server.activation_count, 1)
 
-    def test_ui_drift_and_ambiguous_controls_fail_closed(self) -> None:
-        with tempfile.TemporaryDirectory() as directory, SyntheticPortalServer(variant="missing_invoice_list") as server:
-            root = Path(directory)
-            config = self.config_for(server, root)
-            old, _values = self.with_credentials()
-            try:
-                with PlaywrightPortal(config) as portal, fast_portal_recovery():
-                    portal.login()
-                    with self.assertRaises(LayoutChangedError):
-                        portal.inventory(20)
-            finally:
-                self.restore_credentials(old)
+    # ---- DL-XB-199: the live single-surface, download-first production path ---- #
 
-        with tempfile.TemporaryDirectory() as directory, SyntheticPortalServer(
-            [SyntheticBill("2026-05-01_account_a.pdf")], variant="ambiguous_download"
-        ) as server:
-            root = Path(directory)
-            config = self.config_for(server, root)
-            old, _values = self.with_credentials()
-            try:
-                with PlaywrightPortal(config) as portal:
-                    portal.login()
-                    with self.assertRaises(LayoutChangedError):
-                        portal.inventory(20)
-            finally:
-                self.restore_credentials(old)
+    def portal_run(self, server: SyntheticPortalServer, root: Path, body, **config_overrides):
+        """Log in against `server` and hand `body` the portal; restore credentials."""
 
+        config = self.config_for(server, root, **config_overrides)
+        old, _values = self.with_credentials()
+        try:
+            with PlaywrightPortal(config) as portal:
+                portal.login()
+                return body(portal)
+        finally:
+            self.restore_credentials(old)
 
-    def test_download_payload_validation_and_page_ceiling(self) -> None:
-        for mode in ("error", "html", "zero", "truncated"):
-            bill = SyntheticBill("2026-05-07_account_ref.pdf", mode=mode)
-            with tempfile.TemporaryDirectory() as directory, SyntheticPortalServer([bill]) as server:
-                root = Path(directory)
-                config = self.config_for(server, root)
-                old, _values = self.with_credentials()
-                try:
-                    with PlaywrightPortal(config) as portal:
-                        portal.login()
-                        reference = portal.inventory(20)[0]
-                        target = root / "download.bin"
-                        if mode == "error":
-                            with self.assertRaises(DownloadError):
-                                portal.download(reference, target)
-                        else:
-                            portal.download(reference, target)
-                            with self.assertRaises(InvalidPdfError):
-                                validate_pdf(target)
-                finally:
-                    self.restore_credentials(old)
+    def expect_inventory_failure(self, server: SyntheticPortalServer, root: Path, message: str) -> None:
+        def body(portal):
+            with fast_portal_recovery(), self.assertRaises(LayoutChangedError) as caught:
+                portal.inventory(20)
+            return caught.exception
 
-        with tempfile.TemporaryDirectory() as directory, SyntheticPortalServer(
-            [SyntheticBill("2026-05-08_account_ref.pdf")], next_loop=True
-        ) as server:
-            root = Path(directory)
-            config = self.config_for(server, root)
-            old, _values = self.with_credentials()
-            try:
-                with PlaywrightPortal(config) as portal:
-                    portal.login()
-                    with self.assertRaises(LayoutChangedError):
-                        portal.inventory(2)
-            finally:
-                self.restore_credentials(old)
+        error = self.portal_run(server, root, body)
+        self.assertEqual(error.message, message)
+        self.assertIn(error.message, cli.SUPPORT_REFS_BY_MESSAGE)
 
-    def test_browser_suggested_filename_mismatch_fails_closed(self) -> None:
-        bill = SyntheticBill(
-            "2026-05-18_account_identity.pdf",
-            suggested_filename="2026-05-18_other_identity.pdf",
-        )
-        with tempfile.TemporaryDirectory() as directory, SyntheticPortalServer([bill]) as server:
-            root = Path(directory)
-            (root / "archive").mkdir()
-            config_path = root / "config.json"
-            write_config(config_path, server, root)
-            old, _values = self.with_credentials()
-            try:
-                result = main(["run", "--config", str(config_path)])
-                self.assertEqual(result, 20)
-                self.assertFalse((root / "archive" / bill.filename).exists())
-                self.assertEqual(server.download_counts[bill.filename], 1)
-            finally:
-                self.restore_credentials(old)
+    def assert_no_business_detour(self, server: SyntheticPortalServer) -> None:
+        self.assertEqual(server.ems_actuation_count, 0, "zero EMS dispatch")
+        self.assertEqual(server.billing_manager_actuation_count, 0, "zero Billing Manager dispatch")
+        self.assertEqual(server.pagination_clicks, 0, "sentinels are never clicked")
 
-    def test_cli_run_logs_in_and_reconciles_synthetic_bill(self) -> None:
-        bill = SyntheticBill("2026-05-09_account_ref.pdf")
-        with tempfile.TemporaryDirectory() as directory, SyntheticPortalServer([bill]) as server:
-            root = Path(directory)
-            (root / "archive").mkdir()
-            config_path = root / "config.json"
-            write_config(config_path, server, root)
-            old, _values = self.with_credentials()
-            try:
-                first = main(["run", "--config", str(config_path)])
-                self.assertEqual(first, 0)
-                second = main(["run", "--config", str(config_path)])
-                self.assertEqual(second, 0)
-                self.assertTrue((root / "archive" / bill.filename).exists())
-            finally:
-                self.restore_credentials(old)
-
-    def test_stable_url_client_side_pagination_restores_later_page_download(self) -> None:
-        bills = [
-            SyntheticBill("2026-05-01_SYNTHETIC-A.pdf"),
-            SyntheticBill("2026-06-01_SYNTHETIC-B.pdf"),
-            SyntheticBill("2026-07-01_SYNTHETIC-C.pdf"),
-        ]
-        with tempfile.TemporaryDirectory() as directory, SyntheticPortalServer(
-            bills, page_size=2, client_side_pagination=True
-        ) as server:
-            root = Path(directory)
-            config = self.config_for(server, root)
-            old, _values = self.with_credentials()
-            try:
-                with PlaywrightPortal(config) as portal:
-                    portal.login()
-                    inventory = portal.inventory(20)
-                    self.assertEqual([bill.filename for bill in inventory], [bill.filename for bill in bills])
-                    self.assertEqual(len({bill.page_url for bill in inventory}), 1)
-                    target = root / "later-page.bin"
-                    suggested = portal.download(inventory[-1], target)
-                    self.assertEqual(suggested, bills[-1].filename)
-                    self.assertEqual(target.read_bytes(), bills[-1].payload)
-            finally:
-                self.restore_credentials(old)
-
-    def test_url_addressable_later_page_download_remains_supported(self) -> None:
-        bills = [
-            SyntheticBill("2026-08-01_SYNTHETIC-A.pdf"),
-            SyntheticBill("2026-08-02_SYNTHETIC-B.pdf"),
-            SyntheticBill("2026-08-03_SYNTHETIC-C.pdf"),
-        ]
-        with tempfile.TemporaryDirectory() as directory, SyntheticPortalServer(bills, page_size=2) as server:
-            root = Path(directory)
-            config = self.config_for(server, root)
-            old, _values = self.with_credentials()
-            try:
-                with PlaywrightPortal(config) as portal:
-                    portal.login()
-                    inventory = portal.inventory(20)
-                    self.assertIn("page=2", inventory[-1].page_url)
-                    target = root / "url-page.bin"
-                    self.assertEqual(portal.download(inventory[-1], target), bills[-1].filename)
-            finally:
-                self.restore_credentials(old)
-
-    def test_wrong_default_account_is_not_authoritative(self) -> None:
-        default = "SYNTHETIC-DEFAULT-ACCOUNT"
-        intended = "SYNTHETIC-INTENDED-ACCOUNT"
-        wrong = SyntheticBill("2026-09-01_SYNTHETIC-WRONG.pdf")
-        right = SyntheticBill("2026-09-02_SYNTHETIC-RIGHT.pdf")
-        with tempfile.TemporaryDirectory() as directory, SyntheticPortalServer(
-            [wrong],
-            account_options=[default, intended],
-            default_account=default,
-            account_bills={default: [wrong], intended: [right]},
-        ) as server:
-            root = Path(directory)
-            config = self.config_for(server, root)
-            old, _values = self.with_credentials()
-            try:
-                with PlaywrightPortal(config) as portal:
-                    portal.login()
-                    inventory = portal.inventory(20)
-                    self.assertEqual([bill.filename for bill in inventory], [right.filename])
-                    target = root / "intended.bin"
-                    portal.download(inventory[0], target)
-                    self.assertEqual(server.download_counts.get(wrong.filename, 0), 0)
-                    self.assertEqual(target.read_bytes(), right.payload)
-            finally:
-                self.restore_credentials(old)
-
-    def test_intended_account_absent_fails_closed(self) -> None:
-        default = "SYNTHETIC-DEFAULT-ACCOUNT"
-        with tempfile.TemporaryDirectory() as directory, SyntheticPortalServer(
-            [SyntheticBill("2026-09-03_SYNTHETIC-WRONG.pdf")],
-            account_options=[default],
-            default_account=default,
-        ) as server:
-            root = Path(directory)
-            config = self.config_for(server, root)
-            old, _values = self.with_credentials()
-            try:
-                with PlaywrightPortal(config) as portal:
-                    portal.login()
-                    with self.assertRaises(LayoutChangedError):
-                        portal.inventory(20)
-            finally:
-                self.restore_credentials(old)
-
-    def test_ambiguous_intended_account_fails_closed(self) -> None:
-        intended = "SYNTHETIC-INTENDED-ACCOUNT"
-        with tempfile.TemporaryDirectory() as directory, SyntheticPortalServer(
-            [SyntheticBill("2026-09-04_SYNTHETIC-AMBIGUOUS.pdf")],
-            account_options=[intended, intended],
-            default_account=intended,
-        ) as server:
-            root = Path(directory)
-            config = self.config_for(server, root)
-            old, _values = self.with_credentials()
-            try:
-                with PlaywrightPortal(config) as portal:
-                    portal.login()
-                    with self.assertRaises(LayoutChangedError):
-                        portal.inventory(20)
-            finally:
-                self.restore_credentials(old)
-
-    def test_selected_displayed_account_mismatch_fails_closed(self) -> None:
-        bill = SyntheticBill("2026-09-05_SYNTHETIC-MISMATCH.pdf")
-        with tempfile.TemporaryDirectory() as directory, SyntheticPortalServer(
-            [bill], variant="account_mismatch"
-        ) as server:
-            root = Path(directory)
-            config = self.config_for(server, root)
-            old, _values = self.with_credentials()
-            try:
-                with PlaywrightPortal(config) as portal:
-                    portal.login()
-                    with self.assertRaises(LayoutChangedError):
-                        portal.inventory(20)
-            finally:
-                self.restore_credentials(old)
-
-    def test_pre_search_blank_state_requires_explicit_search(self) -> None:
-        bill = SyntheticBill("2026-09-06_SYNTHETIC-PRESEARCH.pdf")
-        with tempfile.TemporaryDirectory() as directory, SyntheticPortalServer([bill]) as server:
-            root = Path(directory)
-            config = self.config_for(server, root)
-            old, _values = self.with_credentials()
-            try:
-                with PlaywrightPortal(config) as portal:
-                    portal.login()
-                    inventory = portal.inventory(20)
-                    self.assertEqual([item.filename for item in inventory], [bill.filename])
-            finally:
-                self.restore_credentials(old)
-
-    def test_verified_post_search_empty_state_is_authoritative(self) -> None:
-        with tempfile.TemporaryDirectory() as directory, SyntheticPortalServer([]) as server:
-            root = Path(directory)
-            config = self.config_for(server, root)
-            old, _values = self.with_credentials()
-            try:
-                with PlaywrightPortal(config) as portal:
-                    portal.login()
-                    self.assertEqual(portal.inventory(20), [])
-                    self.assertEqual(server.search_count, 1)
-            finally:
-                self.restore_credentials(old)
-
-
-    # ---- DL-XB-141-EMS-ENTRY-MINIMAL-REPAIR-G2-136 ---- #
-
-    def test_login_lands_on_a_surface_with_no_business_navigation(self) -> None:
-        """The corrected topology: EMS only, and no EMS actuation from login."""
+    def test_login_lands_on_the_single_surface_without_any_business_dispatch(self) -> None:
         with tempfile.TemporaryDirectory() as directory, SyntheticPortalServer() as server:
             root = Path(directory)
-            config = self.config_for(server, root)
-            old, _values = self.with_credentials()
-            try:
-                with PlaywrightPortal(config) as portal:
-                    portal.login()
-                    page = portal.page
-                    self.assertEqual(
-                        page.get_by_role("button", name="EMS", exact=True).count(), 1
-                    )
-                    self.assertEqual(
-                        page.get_by_role("link", name="Billing Manager", exact=True).count(),
-                        0,
-                    )
-                    self.assertEqual(
-                        page.get_by_role("link", name="EB Bill", exact=True).count(), 0
-                    )
-                    self.assertEqual(
-                        server.ems_actuation_count,
-                        0,
-                        "proving a landing never enters the application",
-                    )
-            finally:
-                self.restore_credentials(old)
 
-    def test_inventory_enters_the_application_once_and_download_adds_none(self) -> None:
+            def body(portal):
+                page = portal.page
+                self.assertEqual(page.get_by_role("tab", name="EB Bill", exact=True).count(), 1)
+                self.assertEqual(page.get_by_role("tab", name="Tenant Bill", exact=True).count(), 1)
+                self.assertEqual(page.get_by_role("button", name="EMS", exact=True).count(), 1)
+
+            self.portal_run(server, root, body)
+            self.assert_no_business_detour(server)
+            self.assertEqual(server.eb_bill_tab_clicks, 0, "proving a landing clicks nothing")
+            self.assertEqual(server.search_count, 0)
+
+    def test_the_production_path_clicks_the_tab_once_searches_once_and_downloads_every_row(self) -> None:
         bills = [
-            SyntheticBill("2026-10-01_SYNTHETIC-A.pdf"),
-            SyntheticBill("2026-10-02_SYNTHETIC-B.pdf"),
-            SyntheticBill("2026-10-03_SYNTHETIC-C.pdf"),
+            SyntheticBill("2026-05-01_account_a.pdf", payload=synthetic_pdf(b"bill-a")),
+            SyntheticBill("2026-06-01_account_b.pdf", payload=synthetic_pdf(b"bill-b")),
+            SyntheticBill("2026-07-01_account_c.pdf", payload=synthetic_pdf(b"bill-c")),
         ]
-        with tempfile.TemporaryDirectory() as directory, SyntheticPortalServer(
-            bills, page_size=2
-        ) as server:
+        with tempfile.TemporaryDirectory() as directory, SyntheticPortalServer(bills) as server:
             root = Path(directory)
-            config = self.config_for(server, root)
-            old, _values = self.with_credentials()
-            try:
-                with PlaywrightPortal(config) as portal:
-                    portal.login()
-                    self.assertEqual(server.ems_actuation_count, 0)
-                    inventory = portal.inventory(20)
-                    self.assertEqual(
-                        server.ems_actuation_count, 1, "exactly one application entry"
-                    )
-                    target = root / "download.bin"
-                    portal.download(inventory[-1], target)
-                    self.assertEqual(
-                        server.ems_actuation_count,
-                        1,
-                        "a restored results address re-enters nothing",
-                    )
-                    self.assertEqual(target.read_bytes(), bills[-1].payload)
-            finally:
-                self.restore_credentials(old)
 
-    def test_results_surfaces_keep_a_counted_non_navigating_ems_control(self) -> None:
-        """A downstream EMS click is counted, and it opens nothing.
+            def body(portal):
+                inventory = portal.inventory(20)
+                self.assertEqual([row.ordinal for row in inventory], [0, 1, 2])
+                self.assertEqual(server.eb_bill_tab_clicks, 1)
+                self.assertEqual(server.search_count, 1)
+                self.assertEqual(server.download_clicks, 0, "inventory downloads nothing")
+                names = []
+                for row in inventory:
+                    target = root / f"row-{row.ordinal}.bin"
+                    names.append(portal.download(row, target))
+                    self.assertEqual(target.read_bytes(), bills[row.ordinal].payload)
+                return names
 
-        The exactly-once guarantee is only meaningful if a second actuation
-        would actually show up. Every authenticated surface after the landing
-        keeps the same exact EMS control, so this drives the whole normal
-        production-shaped flow first -- login enters nothing, inventory enters
-        once, a restored download re-enters nothing -- and only then actuates
-        the results-surface control deliberately. That click has to increment
-        the counter and leave the route exactly where it was: if the fixture
-        dropped the control from results, an accidental repeat click in the real
-        portal would be invisible here rather than caught.
-        """
+            names = self.portal_run(server, root, body)
+            self.assertEqual(names, [bill.filename for bill in bills])
+            self.assertEqual(server.download_order, [0, 1, 2], "exactly one Download per row, in order")
+            self.assertEqual(server.search_count, 1)
+            self.assert_no_business_detour(server)
+
+    def test_an_already_selected_eb_bill_tab_is_never_clicked(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, SyntheticPortalServer(
+            [SyntheticBill("2026-05-02_preselected.pdf")], variant="eb_bill_preselected"
+        ) as server:
+            inventory = self.portal_run(server, Path(directory), lambda portal: portal.inventory(20))
+            self.assertEqual(len(inventory), 1)
+            self.assertEqual(server.eb_bill_tab_clicks, 0)
+            self.assertEqual(server.search_count, 1)
+
+    def test_a_link_only_eb_bill_fails_closed_without_any_click(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, SyntheticPortalServer(
+            [SyntheticBill("2026-05-03_link.pdf")], variant="eb_bill_link_only"
+        ) as server:
+            self.expect_inventory_failure(server, Path(directory), portal_module.EB_BILL_TAB_NOT_READY_MESSAGE)
+            self.assertEqual(server.eb_bill_tab_clicks, 0, "no link fallback")
+            self.assertEqual(server.search_count, 0)
+            self.assert_no_business_detour(server)
+
+    def test_an_eb_bill_click_that_selects_nothing_is_unproved_after_one_click(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, SyntheticPortalServer(
+            [SyntheticBill("2026-05-04_inert.pdf")], variant="tab_inert"
+        ) as server:
+            self.expect_inventory_failure(server, Path(directory), portal_module.EB_BILL_TAB_UNPROVED_MESSAGE)
+            self.assertEqual(server.eb_bill_tab_clicks, 1, "the click is never re-sent")
+            self.assertEqual(server.search_count, 0)
+
+    def test_account_witness_absent_duplicate_or_mismatched_fails_before_search(self) -> None:
+        for kwargs, message in (
+            ({"variant": "account_absent"}, portal_module.ACCOUNT_WITNESS_UNPROVED_MESSAGE),
+            ({"variant": "account_duplicate"}, portal_module.ACCOUNT_WITNESS_AMBIGUOUS_MESSAGE),
+            ({"account_text": "SYNTHETIC-OTHER-ACCOUNT"}, portal_module.ACCOUNT_WITNESS_UNPROVED_MESSAGE),
+            # Occurrences inside the results rows never satisfy the witness.
+            ({"variant": "account_absent,account_in_rows"}, portal_module.ACCOUNT_WITNESS_UNPROVED_MESSAGE),
+        ):
+            with self.subTest(**kwargs):
+                with tempfile.TemporaryDirectory() as directory, SyntheticPortalServer(
+                    [SyntheticBill("2026-05-05_account.pdf")], **kwargs
+                ) as server:
+                    self.expect_inventory_failure(server, Path(directory), message)
+                    self.assertEqual(server.search_count, 0)
+
+    def test_account_text_inside_rows_does_not_disturb_the_one_outside_witness(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, SyntheticPortalServer(
+            [SyntheticBill("2026-05-06_rows.pdf"), SyntheticBill("2026-05-07_rows.pdf")],
+            variant="account_in_rows",
+        ) as server:
+            inventory = self.portal_run(server, Path(directory), lambda portal: portal.inventory(20))
+            self.assertEqual(len(inventory), 2)
+
+    def test_a_delayed_search_and_delayed_results_settle_with_one_search(self) -> None:
+        for kwargs in ({"search_delay_ms": 400}, {"results_delay_ms": 400}):
+            with self.subTest(**kwargs):
+                with tempfile.TemporaryDirectory() as directory, SyntheticPortalServer(
+                    [SyntheticBill("2026-05-08_delayed.pdf")], **kwargs
+                ) as server:
+                    inventory = self.portal_run(server, Path(directory), lambda portal: portal.inventory(20))
+                    self.assertEqual(len(inventory), 1)
+                    self.assertEqual(server.search_count, 1)
+
+    def test_a_second_inventory_fails_without_redispatching_search(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, SyntheticPortalServer(
+            [SyntheticBill("2026-05-09_once.pdf")]
+        ) as server:
+
+            def body(portal):
+                portal.inventory(20)
+                with self.assertRaises(LayoutChangedError) as caught:
+                    portal.inventory(20)
+                return caught.exception
+
+            error = self.portal_run(server, Path(directory), body)
+            self.assertEqual(error.message, portal_module.RESULTS_INVENTORY_CONSUMED_MESSAGE)
+            self.assertEqual(server.search_count, 1)
+            self.assertEqual(server.eb_bill_tab_clicks, 1)
+
+    def test_a_header_only_table_is_a_layout_change_not_no_new_bills(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, SyntheticPortalServer([]) as server:
+            self.expect_inventory_failure(server, Path(directory), portal_module.RESULTS_HEADER_ONLY_MESSAGE)
+            self.assertEqual(server.search_count, 1)
+
+    def test_results_shape_drift_fails_before_any_download(self) -> None:
+        for variant in ("two_tables", "header_missing", "ambiguous_download", "missing_download"):
+            with self.subTest(variant=variant):
+                with tempfile.TemporaryDirectory() as directory, SyntheticPortalServer(
+                    [SyntheticBill("2026-05-10_shape.pdf"), SyntheticBill("2026-05-11_shape.pdf")],
+                    variant=variant,
+                ) as server:
+                    self.expect_inventory_failure(
+                        server, Path(directory), portal_module.RESULTS_UNSETTLED_MESSAGE
+                    )
+                    self.assertEqual(server.download_clicks, 0)
+
+    def test_duplicate_row_identity_fails_before_any_download(self) -> None:
         bills = [
-            SyntheticBill("2026-11-01_SYNTHETIC-A.pdf"),
-            SyntheticBill("2026-11-02_SYNTHETIC-B.pdf"),
-            SyntheticBill("2026-11-03_SYNTHETIC-C.pdf"),
+            SyntheticBill("2026-05-12_dup.pdf", row_text="Same private row"),
+            SyntheticBill("2026-05-13_dup.pdf", row_text="Same private row"),
         ]
-        with tempfile.TemporaryDirectory() as directory, SyntheticPortalServer(
-            bills, page_size=2
-        ) as server:
+        with tempfile.TemporaryDirectory() as directory, SyntheticPortalServer(bills) as server:
+            self.expect_inventory_failure(server, Path(directory), portal_module.RESULTS_ROW_IDENTITY_MESSAGE)
+            self.assertEqual(server.download_clicks, 0)
+
+    def test_every_pagination_sentinel_fails_without_any_click(self) -> None:
+        for role in ("button", "link"):
+            for name in ("Next page", "Next", "Previous page", "Load more"):
+                with self.subTest(role=role, name=name):
+                    with tempfile.TemporaryDirectory() as directory, SyntheticPortalServer(
+                        [SyntheticBill("2026-05-14_page.pdf")], pagination_sentinel=(role, name)
+                    ) as server:
+                        self.expect_inventory_failure(
+                            server, Path(directory), portal_module.RESULTS_PAGINATION_MESSAGE
+                        )
+                        self.assertEqual(server.pagination_clicks, 0)
+                        self.assertEqual(server.download_clicks, 0)
+
+    def test_aria_rowcount_must_agree_with_the_rendered_rows(self) -> None:
+        bills = [SyntheticBill("2026-05-15_count.pdf"), SyntheticBill("2026-05-16_count.pdf")]
+        with tempfile.TemporaryDirectory() as directory, SyntheticPortalServer(bills, aria_rowcount="3") as server:
+            inventory = self.portal_run(server, Path(directory), lambda portal: portal.inventory(20))
+            self.assertEqual(len(inventory), 2, "header plus two rows agrees with aria-rowcount 3")
+        for declared in ("7", "-1", "many"):
+            with self.subTest(declared=declared):
+                with tempfile.TemporaryDirectory() as directory, SyntheticPortalServer(
+                    bills, aria_rowcount=declared
+                ) as server:
+                    self.expect_inventory_failure(server, Path(directory), portal_module.RESULTS_ROWCOUNT_MESSAGE)
+
+    def test_the_inventory_safety_ceiling_is_enforced(self) -> None:
+        bills = [SyntheticBill(f"2026-05-2{index}_ceiling.pdf") for index in range(3)]
+        with tempfile.TemporaryDirectory() as directory, SyntheticPortalServer(bills) as server:
+
+            def body(portal):
+                with self.assertRaises(LayoutChangedError) as caught:
+                    portal.inventory(2)
+                return caught.exception
+
+            error = self.portal_run(server, Path(directory), body)
+            self.assertEqual(error.message, portal_module.RESULTS_CEILING_MESSAGE)
+            self.assertEqual(server.download_clicks, 0)
+
+    def test_row_drift_after_a_download_latches_every_later_row(self) -> None:
+        for variant in ("reorder_after_first_download", "text_drift_after_first_download"):
+            with self.subTest(variant=variant):
+                bills = [SyntheticBill(f"2026-06-0{index}_drift.pdf") for index in range(1, 4)]
+                with tempfile.TemporaryDirectory() as directory, SyntheticPortalServer(
+                    bills, variant=variant
+                ) as server:
+                    root = Path(directory)
+
+                    def body(portal):
+                        inventory = portal.inventory(20)
+                        self.assertEqual(portal.download(inventory[0], root / "first.bin"), bills[0].filename)
+                        with self.assertRaises(LayoutChangedError) as drifted:
+                            portal.download(inventory[1], root / "second.bin")
+                        with self.assertRaises(LayoutChangedError) as latched:
+                            portal.download(inventory[2], root / "third.bin")
+                        return drifted.exception, latched.exception
+
+                    drifted, latched = self.portal_run(server, root, body)
+                    self.assertEqual(drifted.message, portal_module.RESULTS_SURFACE_CHANGED_MESSAGE)
+                    self.assertEqual(latched.message, portal_module.RESULTS_LATCHED_MESSAGE)
+                    self.assertEqual(server.download_clicks, 1, "zero later Download dispatch")
+
+    def test_an_uncertain_download_dispatches_once_and_latches(self) -> None:
+        cases = (
+            ({"variant": "tab_lost_on_download"}, "success"),
+            ({"variant": "popup_on_download"}, "success"),
+            ({}, "inert"),
+        )
+        for kwargs, mode in cases:
+            with self.subTest(mode=mode, **kwargs):
+                bills = [
+                    SyntheticBill("2026-06-11_uncertain.pdf", mode=mode),
+                    SyntheticBill("2026-06-12_uncertain.pdf"),
+                ]
+                with tempfile.TemporaryDirectory() as directory, SyntheticPortalServer(bills, **kwargs) as server:
+                    root = Path(directory)
+
+                    def body(portal):
+                        inventory = portal.inventory(20)
+                        with self.assertRaises(AppError) as uncertain:
+                            portal.download(inventory[0], root / "first.bin")
+                        with self.assertRaises(LayoutChangedError) as latched:
+                            portal.download(inventory[1], root / "second.bin")
+                        return uncertain.exception, latched.exception
+
+                    uncertain, latched = self.portal_run(server, root, body, timeout_seconds=2)
+                    self.assertEqual(uncertain.status, "DOWNLOAD_FAILED")
+                    self.assertFalse(uncertain.retryable)
+                    self.assertEqual(uncertain.message, portal_module.DOWNLOAD_UNCERTAIN_MESSAGE)
+                    self.assertEqual(latched.message, portal_module.RESULTS_LATCHED_MESSAGE)
+                    self.assertEqual(server.download_clicks, 1)
+
+    def test_rows_carry_no_filename_and_the_name_is_learned_only_at_download(self) -> None:
+        bill = SyntheticBill("row-never-shows-this.pdf", suggested_filename="2026-06-21_authoritative.pdf")
+        with tempfile.TemporaryDirectory() as directory, SyntheticPortalServer([bill]) as server:
             root = Path(directory)
-            config = self.config_for(server, root)
-            old, _values = self.with_credentials()
-            try:
-                with PlaywrightPortal(config) as portal:
-                    portal.login()
-                    self.assertEqual(
-                        server.ems_actuation_count, 0, "proving a landing enters nothing"
-                    )
 
-                    inventory = portal.inventory(20)
-                    self.assertEqual(
-                        server.ems_actuation_count, 1, "exactly one application entry"
-                    )
-                    page = portal.page
-                    # The paginated results surface inventory finished on is
-                    # still application chrome, so it still carries the control.
-                    self.assertEqual(
-                        page.get_by_role("button", name="EMS", exact=True).count(),
-                        1,
-                        "paginated results keep the exact EMS control",
-                    )
+            def body(portal):
+                inventory = portal.inventory(20)
+                self.assertNotIn("filename", {name for name in vars(inventory[0])})
+                self.assertNotIn("binding", repr(inventory[0]))
+                page = portal.page
+                self.assertEqual(page.locator("[role='table'] [data-testid]").count(), 0)
+                self.assertEqual(page.locator("[role='table'] [data-filename]").count(), 0)
+                self.assertEqual(page.locator("[role='table'] [href]").count(), 0)
+                self.assertEqual(page.locator("select").count(), 0, "no tenant selector exists")
+                return portal.download(inventory[0], root / "row.bin")
 
+            self.assertEqual(self.portal_run(server, root, body), "2026-06-21_authoritative.pdf")
+
+    def test_download_payload_validation(self) -> None:
+        for mode in ("html", "zero", "truncated"):
+            with self.subTest(mode=mode):
+                bill = SyntheticBill("2026-05-07_account_ref.pdf", mode=mode)
+                with tempfile.TemporaryDirectory() as directory, SyntheticPortalServer([bill]) as server:
+                    root = Path(directory)
                     target = root / "download.bin"
-                    portal.download(inventory[-1], target)
-                    self.assertEqual(target.read_bytes(), bills[-1].payload)
-                    self.assertEqual(
-                        server.ems_actuation_count,
-                        1,
-                        "a restored results address re-enters nothing",
-                    )
 
-                    # Everything above is the normal flow, at exactly one
-                    # actuation. What follows is the accidental second click.
-                    page = portal.page
-                    restored_route = page.url
-                    control = page.get_by_role("button", name="EMS", exact=True)
-                    self.assertEqual(
-                        control.count(), 1, "restored results keep the exact EMS control"
-                    )
+                    def body(portal):
+                        return portal.download(portal.inventory(20)[0], target)
 
-                    control.click()
-                    self.assertEqual(
-                        server.ems_actuation_count,
-                        2,
-                        "a downstream re-actuation is counted, not lost",
-                    )
-                    self.assertEqual(
-                        page.url,
-                        restored_route,
-                        "a downstream EMS click navigates nowhere",
-                    )
-                    self.assertEqual(
-                        page.get_by_test_id("invoice-list").count(),
-                        1,
-                        "the results surface is still the results surface",
-                    )
-            finally:
-                self.restore_credentials(old)
+                    self.assertEqual(self.portal_run(server, root, body), bill.filename)
+                    with self.assertRaises(InvalidPdfError):
+                        validate_pdf(target)
+
+    def cli_run(self, server: SyntheticPortalServer, root: Path, command: str = "run") -> tuple[int, dict]:
+        config_path = root / "config.json"
+        if not config_path.exists():
+            (root / "archive").mkdir()
+            write_config(config_path, server, root)
+        old, _values = self.with_credentials()
+        stdout = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(stdout):
+                result = main([command, "--config", str(config_path)])
+        finally:
+            self.restore_credentials(old)
+        return result, json.loads(stdout.getvalue().strip().splitlines()[-1])
+
+    def state_records(self, root: Path) -> dict:
+        from energygrid_bill_downloader.state import StateStore
+
+        with StateStore(root / "state" / "state.sqlite3") as state:
+            return {record.filename_key: record for record in state.records()}
+
+    def test_cli_run_downloads_every_row_and_a_rerun_publishes_nothing(self) -> None:
+        bills = [
+            SyntheticBill("2026-05-09_account_ref.pdf", payload=synthetic_pdf(b"run-a")),
+            SyntheticBill("2026-05-10_account_ref.pdf", payload=synthetic_pdf(b"run-b")),
+        ]
+        with tempfile.TemporaryDirectory() as directory, SyntheticPortalServer(bills) as server:
+            root = Path(directory)
+            first, first_summary = self.cli_run(server, root)
+            self.assertEqual(first, 0)
+            self.assertEqual(first_summary["status"], "DOWNLOADED")
+            self.assertEqual(first_summary["downloaded_count"], 2)
+            before = self.state_records(root)
+            stats = {bill.filename: (root / "archive" / bill.filename).stat().st_mtime_ns for bill in bills}
+
+            second, second_summary = self.cli_run(server, root)
+            self.assertEqual(second, 0)
+            self.assertEqual(second_summary["status"], "ALREADY_PRESENT")
+            self.assertEqual(second_summary["present_count"], 2)
+            self.assertEqual(second_summary["downloaded_count"], 0)
+            self.assertEqual(server.download_counts, {bill.filename: 2 for bill in bills})
+            after = self.state_records(root)
+            self.assertEqual(set(after), set(before))
+            for key, record in after.items():
+                for name in ("status", "sha256", "byte_size", "archived_at_utc", "completion_source"):
+                    self.assertEqual(getattr(record, name), getattr(before[key], name))
+            for bill in bills:
+                self.assertEqual((root / "archive" / bill.filename).stat().st_mtime_ns, stats[bill.filename])
+            self.assertEqual(list((root / "temp").glob("run-*")), [])
+            self.assert_no_business_detour(server)
+
+    def test_cli_list_downloads_nothing_and_writes_no_state(self) -> None:
+        bills = [SyntheticBill("2026-05-11_list.pdf"), SyntheticBill("2026-05-12_list.pdf")]
+        with tempfile.TemporaryDirectory() as directory, SyntheticPortalServer(bills) as server:
+            root = Path(directory)
+            result, summary = self.cli_run(server, root, command="list")
+            self.assertEqual(result, 20)
+            self.assertEqual(summary["status"], ACTION_REQUIRED)
+            self.assertEqual(summary["inventory_count"], 2)
+            self.assertEqual(summary["present_count"], 0)
+            self.assertEqual(server.download_clicks, 0)
+            self.assertEqual(server.search_count, 1)
+            self.assertEqual(self.state_records(root), {})
+
+    def test_cli_duplicate_normalized_filenames_publish_nothing(self) -> None:
+        bills = [SyntheticBill("Invoice.pdf"), SyntheticBill("invoice.PDF")]
+        with tempfile.TemporaryDirectory() as directory, SyntheticPortalServer(bills) as server:
+            root = Path(directory)
+            result, summary = self.cli_run(server, root)
+            self.assertEqual(result, 20)
+            self.assertEqual(summary["status"], PORTAL_LAYOUT_CHANGED)
+            self.assertEqual(list((root / "archive").iterdir()), [])
+            self.assertEqual(self.state_records(root), {})
+            self.assertEqual(list((root / "temp").glob("run-*")), [])
+
+    def test_cli_header_only_surface_fails_closed_with_its_reference(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, SyntheticPortalServer([]) as server:
+            root = Path(directory)
+            with fast_portal_recovery():
+                result, summary = self.cli_run(server, root)
+            self.assertEqual(result, 20)
+            self.assertEqual(summary["status"], PORTAL_LAYOUT_CHANGED)
+            log_text = "".join(path.read_text(encoding="utf-8") for path in (root / "logs").glob("*.jsonl"))
+            self.assertIn("EG_NAV_RESULTS_HEADER_ONLY", log_text)
+            self.assertNotIn("SYNTHETIC-INTENDED-ACCOUNT", log_text)
 
     def test_the_login_diagnostic_never_actuates_ems(self) -> None:
         """The diagnostic observes a landing; it never enters the application."""
@@ -629,74 +586,6 @@ class SyntheticPortalTests(unittest.TestCase):
             finally:
                 self.restore_credentials(old)
             self.assertEqual(server.ems_actuation_count, 0)
-
-    def test_a_disabled_ems_authenticates_but_never_enters_the_application(self) -> None:
-        """Authentication reads a count and a visibility; the entry needs more."""
-        with tempfile.TemporaryDirectory() as directory, SyntheticPortalServer(
-            [SyntheticBill("2026-10-04_SYNTHETIC-DISABLED.pdf")], variant="disabled_ems"
-        ) as server:
-            root = Path(directory)
-            config = self.config_for(server, root)
-            old, _values = self.with_credentials()
-            try:
-                with PlaywrightPortal(config) as portal, fast_portal_recovery():
-                    portal.login()
-                    with self.assertRaises(LayoutChangedError) as caught:
-                        portal.inventory(20)
-            finally:
-                self.restore_credentials(old)
-            self.assertEqual(
-                caught.exception.message, "EMS application entry control is not ready"
-            )
-            self.assertEqual(
-                cli.support_ref_for(caught.exception), "EG_NAV_EMS_ENTRY_NOT_READY"
-            )
-            self.assertEqual(server.ems_actuation_count, 0)
-
-    def test_an_inert_ems_entry_fails_downstream_after_exactly_one_actuation(self) -> None:
-        with tempfile.TemporaryDirectory() as directory, SyntheticPortalServer(
-            [SyntheticBill("2026-10-05_SYNTHETIC-INERT.pdf")], variant="inert_ems"
-        ) as server:
-            root = Path(directory)
-            config = self.config_for(server, root)
-            old, _values = self.with_credentials()
-            try:
-                with PlaywrightPortal(config) as portal, fast_portal_recovery():
-                    portal.login()
-                    with self.assertRaises(LayoutChangedError) as caught:
-                        portal.inventory(20)
-            finally:
-                self.restore_credentials(old)
-            self.assertEqual(
-                caught.exception.message,
-                "Billing Manager navigation control is not ready",
-            )
-            self.assertEqual(
-                server.ems_actuation_count, 1, "a consumed entry is never re-attempted"
-            )
-
-    def test_downstream_navigation_gaps_still_follow_one_ems_actuation(self) -> None:
-        """`missing_billing_manager` and `missing_eb_bill` stay downstream failures."""
-        for variant, message in (
-            ("missing_billing_manager", "Billing Manager navigation control is not ready"),
-            ("missing_eb_bill", "EB Bill navigation control is not ready"),
-        ):
-            with self.subTest(variant=variant):
-                with tempfile.TemporaryDirectory() as directory, SyntheticPortalServer(
-                    [SyntheticBill("2026-10-06_SYNTHETIC-GAP.pdf")], variant=variant
-                ) as server:
-                    root = Path(directory)
-                    config = self.config_for(server, root)
-                    old, _values = self.with_credentials()
-                    try:
-                        with PlaywrightPortal(config) as portal, fast_portal_recovery():
-                            portal.login()
-                            with self.assertRaises(LayoutChangedError) as caught:
-                                portal.inventory(20)
-                    finally:
-                        self.restore_credentials(old)
-                    self.assertEqual(caught.exception.message, message)
-                    self.assertEqual(server.ems_actuation_count, 1)
 
 
 # ---- DL-XB-141-OBS-001: pre-auth failure localisation ---- #
@@ -1552,14 +1441,15 @@ class PreAuthLoginFailureReferenceTests(unittest.TestCase):
         record(self.run_login(login_page(), credentials=False))
 
         # The login half of the vocabulary. Business navigation is a separate
-        # contract with its own declared references, reachable only from
-        # `_open_verified_results()`, and is proven complete by
-        # `BusinessNavigationReferenceTests` instead.
+        # contract with its own declared references, reachable only from the
+        # production `inventory()`, and is proven complete by
+        # `SingleSurfaceSourceIsolationTests` instead.
         live = (
             set(cli.SUPPORT_REFS_BY_MESSAGE.values())
             - cli.RETIRED_SUPPORT_REFS
             - cli.NAVIGATION_SUPPORT_REFS
             - cli.NAVIGATION_DIAGNOSTIC_SUPPORT_REFS
+            - cli.DIAGNOSTIC_EMS_ENTRY_SUPPORT_REFS
         )
         self.assertEqual(
             reached,
@@ -1585,13 +1475,6 @@ def synthetic_timeout() -> SyntheticTimeoutError:
 # committed ceiling or per-probe cap is widened rather than silently tracking it.
 RECOVERY_CEILING_MS = 60_000
 
-# The committed ladder, as the elapsed yields one exhausted recovery window
-# spends. A navigation that has to reach the outer application pays exactly this
-# once, in `_settle_eb_bill_entry()`: a direct or restored EB Bill entry that is
-# still rendering must be given the committed window before the run may conclude
-# it does not exist. It is one window on the shared ladder, spent at most once
-# per navigation, and no downstream surface pays anything for it.
-ENTRY_SETTLE_YIELDS = [250, 750, 4000, 5000, 20000, 28000]
 MAX_TRIAL_PROBE_MS = 1_000
 
 
@@ -2270,14 +2153,13 @@ class PortalReadinessRecoveryTests(unittest.TestCase):
 
 
 
-# ---- DL-XB-141-PORTAL-RESILIENCE-002: post-action settling downstream ---- #
+# ---- DL-XB-199: the single-surface production path, deterministically ---- #
 #
-# The results route is where a duplicated dispatch is most expensive: a second
-# Search discards the first result, a second Next page skips a page of
-# inventory, and a second Download re-bills the portal. These cases drive the
-# committed `inventory()` and `download()` with a page whose surfaces settle
-# only after a known number of fresh looks, and assert both that the flow
-# recovers and that every real dispatch happened exactly once.
+# These cases drive the committed `inventory()` and `download()` against a
+# scripted surface: the exact EB Bill / Tenant Bill tabs, the account witness,
+# the Search button, the one role table and its Download controls. The clock is
+# simulated, so the shared 60-second recovery contract is exercised without any
+# real waiting, and every real dispatch is counted.
 
 
 class ResultsConfig:
@@ -2288,1686 +2170,801 @@ class ResultsConfig:
     account_identity = "SYNTHETIC-INTENDED-ACCOUNT"
 
 
-class _ResultsControl:
-    """One resolution of a results-route control."""
+PRIVATE_ROW_TEXT = "PRIVATE-ROW 2026-09 SGD 123.45 ACCT-778899"
 
-    def __init__(
-        self,
-        page: "FakeResultsPage",
-        key: str,
-        *,
-        present: bool = True,
-        visible: bool = True,
-        enabled: bool = True,
-        disabled: bool = False,
-        actionable: bool = True,
-        on_click=None,
-        href: str | None = None,
-        click_error: Exception | None = None,
-        matches: int = 1,
-        state_error: Exception | None = None,
-        enabled_error: Exception | None = None,
-        trial_error: Exception | None = None,
-    ) -> None:
-        self._page = page
-        self._key = key
-        self._present = present
-        # How many exact matches this resolution reports, and a state read that
-        # cannot answer at all. Ambiguity and unreadability are what a routing
-        # decision must never be derived from, so they are first-class knobs.
-        self._matches = matches
-        self._state_error = state_error
-        # The two readiness probes that fail WITHOUT a timeout, which is the
-        # distinction that matters: the shared ladder treats a non-timeout
-        # failure as drift and lets it out intact rather than retrying it. These
-        # are the real exception paths, not a stand-in for them.
-        self._enabled_error = enabled_error
-        self._trial_error = trial_error
-        self._visible = visible
-        self._enabled = enabled
-        self._disabled = disabled
-        self._actionable = actionable
-        self._on_click = on_click
-        # A navigation link's own target, which is what route proof compares
-        # the current address against. `None` models a link with no target.
-        self._href = href
-        self._click_error = click_error
+
+class SurfaceState:
+    """The scripted single surface. Everything a test may vary lives here."""
+
+    def __init__(self, rows=None, **overrides) -> None:
+        self.eb_tab_role = "tab"
+        self.eb_tab_count = 1
+        self.eb_selected = False
+        self.tenant_count = 1
+        self.tenant_selected = True
+        self.tab_click_selects = True
+        self.tab_click_error: Exception | None = None
+        self.tab_actionable = True
+        # Witness flags: True means outside the results semantics.
+        self.witnesses = [True]
+        self.search_absent_looks = 0
+        self.search_click_error: Exception | None = None
+        self.results_absent_looks = 0
+        self.tables = 1
+        self.header_text = "Invoice Action"
+        self.header_columnheaders = 2
+        self.rows = list(rows if rows is not None else ["Synthetic invoice 1", "Synthetic invoice 2"])
+        self.download_buttons: dict[int, int] = {}
+        self.stray_download_buttons = 0
+        self.pagination: set[tuple[str, str]] = set()
+        self.aria_rowcount: str | None = None
+        self.snapshot_error: Exception | None = None
+        self.extra_pages = 0
+        for key, value in overrides.items():
+            if not hasattr(self, key):
+                raise AttributeError(key)
+            setattr(self, key, value)
+
+
+class SurfaceLocator:
+    """One fresh resolution of a scripted element set."""
+
+    def __init__(self, page: "FakeSurfacePage", kind: str, index: int | None = None) -> None:
+        self.page = page
+        self.kind = kind
+        self.index = index
+
+    # -- resolution -- #
 
     def count(self) -> int:
-        if self._state_error is not None:
-            raise self._state_error
-        return self._matches if self._present else 0
+        page, state = self.page, self.page.state
+        if self.kind == "tab:eb":
+            return state.eb_tab_count if state.eb_tab_role == "tab" else 0
+        if self.kind == "tab:tenant":
+            return state.tenant_count
+        if self.kind == "search":
+            return 0 if page.search_looks < state.search_absent_looks else 1
+        if self.kind == "table":
+            return 0 if page.results_looks < state.results_absent_looks else state.tables
+        if self.kind == "rows":
+            return 1 + len(state.rows)
+        if self.kind == "columnheader":
+            return state.header_columnheaders if self.index == 0 else 0
+        if self.kind == "row-download":
+            if self.index == 0:
+                return 0
+            return state.download_buttons.get(self.index - 1, 1)
+        if self.kind == "all-downloads":
+            return sum(state.download_buttons.get(i, 1) for i in range(len(state.rows))) + state.stray_download_buttons
+        if self.kind == "witness":
+            return len(state.witnesses)
+        if self.kind.startswith("sentinel:"):
+            return 1 if tuple(self.kind.split(":", 2)[1:]) in state.pagination else 0
+        return 0
+
+    def nth(self, index: int) -> "SurfaceLocator":
+        kind = {"rows": "row", "witness": "witness-item"}.get(self.kind, self.kind)
+        return SurfaceLocator(self.page, kind, index)
+
+    def get_by_role(self, role: str, name: str | None = None, exact: bool = False) -> "SurfaceLocator":
+        self.page.role_lookups.append((role, name, exact))
+        if self.kind == "table" and role == "row":
+            return SurfaceLocator(self.page, "rows")
+        if self.kind == "row" and role == "columnheader":
+            return SurfaceLocator(self.page, "columnheader", self.index)
+        if self.kind == "row" and role == "button" and name == "Download" and exact:
+            return SurfaceLocator(self.page, "row-download", self.index)
+        return SurfaceLocator(self.page, "nothing")
+
+    # -- inspection -- #
 
     def is_visible(self, timeout: int | None = None) -> bool:
-        if self._state_error is not None:
-            raise self._state_error
-        return self._visible
+        return True
 
     def is_enabled(self, timeout: int | None = None) -> bool:
-        self._page.probe_timeouts.append(timeout)
-        if self._enabled_error is not None:
-            raise self._enabled_error
-        return self._enabled
+        self.page.probe_timeouts.append(timeout)
+        return True
 
-    def is_disabled(self, timeout: int | None = None) -> bool:
-        self._page.probe_timeouts.append(timeout)
-        return self._disabled
+    def get_attribute(self, name: str, timeout: int | None = None):
+        self.page.probe_timeouts.append(timeout)
+        state = self.page.state
+        if self.kind == "tab:eb" and name == "aria-selected":
+            return "true" if state.eb_selected else "false"
+        if self.kind == "tab:tenant" and name == "aria-selected":
+            return "true" if state.tenant_selected else "false"
+        if self.kind == "table" and name == "aria-rowcount":
+            return state.aria_rowcount
+        raise AssertionError(f"unexpected attribute read {self.kind}:{name}")
 
-    def get_attribute(self, name: str, timeout: int | None = None) -> str | None:
-        assert name == "href", name
-        self._page.probe_timeouts.append(timeout)
-        self._page.href_reads.append(self._key)
-        if self._page.href_read_error is not None:
-            raise self._page.href_read_error
-        return self._href
+    def aria_snapshot(self, timeout: int | None = None) -> str:
+        self.page.probe_timeouts.append(timeout)
+        state = self.page.state
+        if state.snapshot_error is not None:
+            raise state.snapshot_error
+        if self.index == 0:
+            return f'- row "{state.header_text}"'
+        return f'- row "{state.rows[self.index - 1]}":\n  - button "Download"'
+
+    def evaluate_all(self, expression: str, arg=None):
+        self.page.evaluations.append(expression)
+        return list(self.page.state.witnesses)
+
+    # -- actions -- #
 
     def click(self, trial: bool = False, timeout: int | None = None) -> None:
+        page, state = self.page, self.page.state
         if trial:
-            self._page.probe_timeouts.append(timeout)
-            self._page.trial_clicks[self._key] = self._page.trial_clicks.get(self._key, 0) + 1
-            if self._trial_error is not None:
-                # A trial click is still only a probe: it dispatches nothing, so
-                # this failure must never be recorded as an actuation.
-                raise self._trial_error
-            if not self._actionable:
-                self._page.clock.charge_probe(timeout)
+            page.trial_clicks.append(self.kind)
+            if self.kind == "tab:eb" and not state.tab_actionable:
                 raise synthetic_timeout()
             return
-        self._page.clicks[self._key] = self._page.clicks.get(self._key, 0) + 1
-        self._page.events.append(self._key)
-        if self._click_error is not None:
-            # A dispatch whose outcome cannot be established. It may well have
-            # landed, which is exactly why it must never be sent again.
-            raise self._click_error
-        if self._on_click is not None:
-            self._on_click()
+        page.clicks.append(self.kind)
+        if self.kind == "tab:eb":
+            if state.tab_click_error is not None:
+                raise state.tab_click_error
+            if state.tab_click_selects:
+                state.eb_selected = True
+                state.tenant_selected = False
+            return
+        if self.kind == "search":
+            if state.search_click_error is not None:
+                raise state.search_click_error
+            page.searched = True
+            return
+        if self.kind == "row-download":
+            page.download_dispatches.append(self.index - 1)
+            page.fire_download(self.index - 1)
+            return
+        raise AssertionError(f"unexpected click on {self.kind}")
 
 
-class _TextMarker:
-    """A read-only identity marker the account binding compares against."""
-
-    def __init__(self, text: str, present: bool = True) -> None:
-        self._text = text
-        self._present = present
-
-    def count(self) -> int:
-        return 1 if self._present else 0
-
-    @property
-    def first(self) -> "_TextMarker":
-        return self
-
-    def text_content(self) -> str:
-        return self._text
-
-
-class _Option:
-    def __init__(self, value: str) -> None:
-        self._value = value
-
-    def get_attribute(self, name: str) -> str | None:
-        return self._value if name == "value" else None
-
-
-class _Options:
-    def __init__(self, texts: list[str]) -> None:
-        self._texts = texts
-
-    def all_text_contents(self) -> list[str]:
-        return list(self._texts)
-
-    def nth(self, index: int) -> _Option:
-        return _Option(f"synthetic-account-{index}")
-
-
-class _AccountControl:
-    """The tenant/account selector, whose identity contract stays terminal."""
-
-    def __init__(self, page: "FakeResultsPage", present: bool) -> None:
-        self._page = page
-        self._present = present
-
-    def count(self) -> int:
-        return 1 if self._present else 0
-
-    def is_visible(self, timeout: int | None = None) -> bool:
-        return True
-
-    def is_enabled(self, timeout: int | None = None) -> bool:
-        self._page.probe_timeouts.append(timeout)
-        return True
-
-    def locator(self, selector: str):
-        if selector == "option":
-            return _Options(list(self._page.account_options))
-        if selector == "option:checked":
-            return _TextMarker(self._page.selected_account)
-        raise AssertionError(f"unexpected selector: {selector}")
-
-    def select_option(self, value: str | None = None) -> None:
-        self._page.selected_account = self._page.account
-        self._page.events.append("select_account")
-
-
-class _StateMarker:
-    """The result-state marker, which reports pre-search until it settles.
-
-    `get_attribute` auto-waits in Playwright, so the fake takes the timeout the
-    production probe must pass and records it separately from every other
-    probe. A stalled read is charged the timeout it was actually given, which is
-    what makes an omitted argument cost the whole page default instead of
-    nothing.
-    """
-
-    def __init__(self, page: "FakeResultsPage") -> None:
-        self._page = page
-
-    def count(self) -> int:
-        return 1
-
-    def get_attribute(self, name: str, timeout: int | None = None) -> str | None:
-        assert name == "data-state", name
-        self._page.state_attribute_timeouts.append(timeout)
-        self._page.probe_timeouts.append(timeout)
-        if self._page.state_attribute_error is not None:
-            raise self._page.state_attribute_error
-        if self._page.state_attribute_stalls > 0:
-            self._page.state_attribute_stalls -= 1
-            self._page.clock.charge_probe(timeout)
-            raise synthetic_timeout()
-        if self._page.post_search_pending > 0:
-            self._page.post_search_pending -= 1
-            return "pre-search"
-        return "post-search" if self._page.searched else "pre-search"
-
-
-class _ListContainer:
-    def __init__(self, page: "FakeResultsPage", present: bool) -> None:
-        self._page = page
-        self._present = present
-
-    def count(self) -> int:
-        return 1 if self._present else 0
-
-    def is_visible(self, timeout: int | None = None) -> bool:
-        return True
-
-    def get_attribute(self, name: str) -> str | None:
-        assert name == "data-page", name
-        return f"page-{self._page.page_index + 1}"
-
-
-class _Row:
-    def __init__(self, page: "FakeResultsPage", filename: str) -> None:
-        self._page = page
-        self._filename = filename
-
-    def get_attribute(self, name: str) -> str | None:
-        return self._filename if name == "data-filename" else None
-
-    def get_by_role(self, role: str, name: str | None = None, exact: bool = False):
-        assert name == "Download", name
-        looks = self._page.bump("download")
-        filename = self._filename
-        return _ResultsControl(
-            self._page,
-            "download",
-            present=looks > self._page.download_delay,
-            on_click=lambda: setattr(self._page, "last_download", filename),
-        )
-
-
-class _Rows:
-    def __init__(self, page: "FakeResultsPage", filenames: list[str]) -> None:
-        self._page = page
-        self._filenames = filenames
-
-    def count(self) -> int:
-        return len(self._filenames)
-
-    def all(self) -> list[_Row]:
-        return [_Row(self._page, name) for name in self._filenames]
-
-
-class _Download:
-    def __init__(self, filename: str | None) -> None:
-        self._filename = filename
+class FakeDownload:
+    def __init__(self, page: "FakeSurfacePage", outcome: dict) -> None:
+        self.page = page
+        self.outcome = outcome
+        self.suggested_filename = outcome.get("name")
 
     def failure(self):
-        return None
-
-    @property
-    def suggested_filename(self) -> str | None:
-        return self._filename
+        return "net::ERR_SYNTHETIC" if self.outcome.get("kind") == "failure" else None
 
     def save_as(self, destination) -> None:
-        target = Path(destination)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(b"%PDF-1.7\nsynthetic\n%%EOF\n")
+        if self.outcome.get("kind") == "save_error":
+            raise RuntimeError("synthetic save failure at https://portal.example.invalid/private")
+        Path(destination).write_bytes(self.outcome.get("payload", synthetic_pdf()))
+        after = self.outcome.get("after")
+        if after is not None:
+            after(self.page.state)
 
 
-class _DownloadInfo:
-    def __init__(self, page: "FakeResultsPage") -> None:
-        self._page = page
+class FakeDownloadInfo:
+    def __init__(self, page: "FakeSurfacePage") -> None:
+        self.page = page
 
     @property
-    def value(self) -> _Download:
-        return _Download(self._page.last_download)
+    def value(self) -> FakeDownload:
+        if self.page.pending_download is None:
+            raise synthetic_timeout()
+        return self.page.pending_download
 
 
-class FakeResultsPage:
-    """The results route as the portal drives it, with settling knobs.
+class FakeContext:
+    def __init__(self, page: "FakeSurfacePage") -> None:
+        self.page = page
 
-    Every knob counts fresh looks rather than milliseconds, so a delayed
-    transition is deterministic and costs no real time. `clicks` and `events`
-    are what the single-dispatch and owner-sequence cases assert; no browser,
-    no server and no credentials are involved.
-    """
+    @property
+    def pages(self):
+        return [self.page] + [object() for _ in range(self.page.state.extra_pages)]
 
-    def __init__(
-        self,
-        *,
-        pages=(("2026-01-01_synthetic.pdf",),),
-        account: str = "SYNTHETIC-INTENDED-ACCOUNT",
-        billing_manager_delay: int = 0,
-        eb_bill_delay: int = 0,
-        account_delay: int = 0,
-        post_search_delay: int = 0,
-        list_delay: int = 0,
-        advance_delay: int = 0,
-        download_delay: int = 0,
-        state_attribute_stalls: int = 0,
-        state_attribute_error: Exception | None = None,
-        start_route: str = "landing",
-        ems_present: bool = True,
-        ems_delay: int = 0,
-        ems_visible_delay: int = 0,
-        ems_actionable: bool = True,
-        ems_actionable_delay: int = 0,
-        ems_matches: int = 1,
-        ems_state_error: Exception | None = None,
-        ems_enabled_error: Exception | None = None,
-        ems_trial_error: Exception | None = None,
-        ems_click_error: Exception | None = None,
-        ems_click_inert: bool = False,
-        eb_bill_href: str = "/eb-bill",
-        eb_bill_actionable: bool = True,
-        eb_bill_on_app: bool = False,
-        eb_bill_visible_delay: int = 0,
-        eb_bill_actionable_delay: int = 0,
-        eb_bill_matches: int = 1,
-        eb_bill_state_error: Exception | None = None,
-        eb_bill_click_error: Exception | None = None,
-        eb_bill_click_inert: bool = False,
-        billing_manager_actionable: bool = True,
-        billing_manager_click_error: Exception | None = None,
-        href_read_error: Exception | None = None,
-        clock: RecoveryClock | None = None,
-    ) -> None:
-        self.clock = clock or RecoveryClock()
-        self.pages = [list(names) for names in pages]
-        self.account = account
-        self.account_options = [account]
-        self.selected_account = account
-        self.billing_manager_delay = billing_manager_delay
-        self.eb_bill_delay = eb_bill_delay
-        self.account_delay = account_delay
-        self.post_search_delay = post_search_delay
-        self.list_delay = list_delay
-        self.advance_delay = advance_delay
-        self.download_delay = download_delay
-        self.state_attribute_stalls = state_attribute_stalls
-        self.state_attribute_error = state_attribute_error
-        # The authenticated landing is where a run now starts, and it carries no
-        # business navigation at all. These knobs vary the EMS application entry
-        # exactly as the EB Bill knobs vary the entry after it: whether it
-        # exists, when it becomes usable, whether it is ambiguous or unreadable,
-        # and how its one real click ends.
-        self.ems_present = ems_present
-        self.ems_delay = ems_delay
-        self.ems_visible_delay = ems_visible_delay
-        self.ems_actionable = ems_actionable
-        self.ems_actionable_delay = ems_actionable_delay
-        self.ems_matches = ems_matches
-        self.ems_state_error = ems_state_error
-        # An enabled-state read and an actionability trial that fail for a
-        # reason that is not a timeout. The shared ladder deliberately lets
-        # these out intact, so they are the exact paths the EMS pre-dispatch
-        # classification has to own.
-        self.ems_enabled_error = ems_enabled_error
-        self.ems_trial_error = ems_trial_error
-        self.ems_click_error = ems_click_error
-        # A click that lands and opens nothing. The entry is consumed and the
-        # surface stays put, which is a distinct outcome from a click that
-        # raised and from one that was never ready.
-        self.ems_click_inert = ems_click_inert
-        self.eb_bill_href = eb_bill_href
-        self.eb_bill_actionable = eb_bill_actionable
-        # A surface that offers BOTH entries: the outer Billing Manager and a
-        # direct EB Bill on the same route. That is the shape a settling direct
-        # entry has, and the only shape on which choosing the outer path can be
-        # observed as a mis-route rather than as the only option.
-        self.eb_bill_on_app = eb_bill_on_app
-        # Existence settles before usability. Each of these keeps the count at
-        # exactly one while the control is still hidden, or still refuses a
-        # trial action, for that many fresh looks.
-        self.eb_bill_visible_delay = eb_bill_visible_delay
-        self.eb_bill_actionable_delay = eb_bill_actionable_delay
-        self.eb_bill_matches = eb_bill_matches
-        self.eb_bill_state_error = eb_bill_state_error
-        self.eb_bill_click_error = eb_bill_click_error
-        # A click that lands and changes nothing: the postcondition route never
-        # becomes proven, which is a distinct failure from a click that raised.
-        self.eb_bill_click_inert = eb_bill_click_inert
-        self.billing_manager_actionable = billing_manager_actionable
-        self.billing_manager_click_error = billing_manager_click_error
-        self.href_read_error = href_read_error
-        self.href_reads: list[str] = []
-        self.route = start_route
-        # Real EMS actuations, counted wherever they happen. Downstream routes
-        # keep the control, so a second one would be visible here rather than
-        # silently absorbed.
-        self.ems_actuations = 0
-        self.page_index = 0
-        self.searched = False
-        self.post_search_pending = 0
-        self.last_download: str | None = None
-        self.looks: dict[str, int] = {}
-        self.clicks: dict[str, int] = {}
-        self.trial_clicks: dict[str, int] = {}
+
+class FakeSurfacePage:
+    """A page whose surfaces settle after scripted looks; dispatches are counted."""
+
+    def __init__(self, state: SurfaceState, clock: RecoveryClock, downloads=None) -> None:
+        self.state = state
+        self.clock = clock
+        # Per-row per-attempt download outcomes; the last entry repeats.
+        self.downloads: dict[int, list[dict]] = downloads or {}
+        self.role_lookups: list[tuple[str, str | None, bool]] = []
+        self.text_lookups: list[tuple[str, bool]] = []
+        self.clicks: list[str] = []
+        self.trial_clicks: list[str] = []
+        self.download_dispatches: list[int] = []
         self.probe_timeouts: list[int | None] = []
-        # Kept apart from `probe_timeouts` so a case can require the state
-        # marker's own attribute read to be bounded, rather than passing
-        # because some unrelated probe happened to be.
-        self.state_attribute_timeouts: list[int | None] = []
-        self.events: list[str] = []
-        self.rows_read_before_search = False
-        self._advance_after = 0
-        self._advance_target: int | None = None
-
-    # -- fixture helpers -- #
-
-    def bump(self, key: str) -> int:
-        self.looks[key] = self.looks.get(key, 0) + 1
-        return self.looks[key]
-
-    def reset_looks(self, key: str) -> None:
-        self.looks[key] = 0
-
-    def delay_download(self, looks: int) -> None:
-        """Delay the download control from the next look onward."""
-        self.download_delay = looks
-        self.reset_looks("download")
-
-    def _actuate_ems(self) -> None:
-        """Consume one real EMS actuation, from whichever surface sent it."""
-        self.ems_actuations += 1
-        if self.ems_click_inert:
-            return
-        # Only the landing has anywhere to go. On application chrome the
-        # control is still there and still counts, and still opens nothing.
-        if self.route == "landing":
-            self.route = "app"
-
-    def _open_billing(self) -> None:
-        self.route = "billing"
-
-    def _open_results(self) -> None:
-        self.route = "results"
-
-    def _run_search(self) -> None:
-        self.searched = True
-        self.post_search_pending = self.post_search_delay
-        self.page_index = 0
-        self.reset_looks("invoice-list")
-
-    def _has_next(self) -> bool:
-        return self.page_index + 1 < len(self.pages)
-
-    def _click_next(self) -> None:
-        self._advance_after = self.advance_delay
-        self._advance_target = self.page_index + 1
-
-    # -- the slice of the page surface the results route touches -- #
-
-    # Each route has its own address, and only the EB Bill results route
-    # carries query parameters -- which is what route proof must ignore.
-    ROUTE_PATHS = {
-        # The authenticated landing. It is not the business surface: the EMS
-        # application entry is what reaches the outer application route below.
-        "landing": "/landing",
-        "app": "/app",
-        "billing": "/billing",
-        # A Tenant-Bill-like route that also renders a tenant/account selector.
-        # Its selector is exactly the evidence the retired shortcut mistook for
-        # proof that EB Bill was already active.
-        "tenant_bill": "/tenant-bill",
-        "results": "/eb-bill",
-    }
-
-    @property
-    def url(self) -> str:
-        path = self.ROUTE_PATHS[self.route]
-        if self.route != "results":
-            return "http://synthetic.invalid" + path
-        return (
-            "http://synthetic.invalid"
-            + path
-            + f"?page={self.page_index + 1}&account={self.account}&searched=1#invoices"
-        )
-
-    def goto(self, url: str, wait_until: str | None = None) -> None:
-        self.events.append("goto")
-        self.route = "results"
+        self.evaluations: list[str] = []
+        self.expect_download_timeouts: list[int | None] = []
+        self.pending_download: FakeDownload | None = None
+        self.search_looks = 0
+        self.results_looks = 0
         self.searched = False
-        self.post_search_pending = 0
-        for key in ("account", "invoice-list", "search", "eb_bill"):
-            self.reset_looks(key)
-        index = int(parse_qs(urlparse(url).query).get("page", ["1"])[0]) - 1
-        self.page_index = max(0, min(index, len(self.pages) - 1))
 
     def wait_for_timeout(self, milliseconds: int) -> None:
         self.clock.charge_yield(milliseconds)
 
-    def get_by_label(self, name: str, exact: bool = False):
-        assert name == "Tenant/account", name
-        looks = self.bump("account")
-        # The selector renders on more than one route, which is why its presence
-        # was never proof of the EB Bill route.
-        return _AccountControl(
-            self,
-            self.route in ("results", "tenant_bill") and looks > self.account_delay,
-        )
+    def get_by_role(self, role: str, name: str | None = None, exact: bool = False) -> SurfaceLocator:
+        self.role_lookups.append((role, name, exact))
+        if role == "tab" and name == "EB Bill" and exact:
+            return SurfaceLocator(self, "tab:eb")
+        if role == "tab" and name == "Tenant Bill" and exact:
+            return SurfaceLocator(self, "tab:tenant")
+        if role == "button" and name == "Search" and exact:
+            locator = SurfaceLocator(self, "search")
+            self.search_looks += 1
+            return locator
+        if role == "table" and name is None:
+            if self.searched:
+                self.results_looks += 1
+                return SurfaceLocator(self, "table")
+            return SurfaceLocator(self, "nothing")
+        if role == "button" and name == "Download" and exact:
+            return SurfaceLocator(self, "all-downloads")
+        if role in ("button", "link") and exact and name in portal_module.RESULTS_PAGINATION_SENTINEL_NAMES:
+            return SurfaceLocator(self, f"sentinel:{role}:{name}")
+        return SurfaceLocator(self, "nothing")
 
-    def get_by_role(self, role: str, name: str | None = None, exact: bool = False):
-        if name == "EMS":
-            looks = self.bump("ems")
-            # Present on every authenticated surface, exactly as the observed
-            # application chrome keeps it, so a second actuation from anywhere
-            # would be counted rather than fail as a missing control.
-            return _ResultsControl(
-                self,
-                "ems",
-                present=self.ems_present and looks > self.ems_delay,
-                visible=looks > self.ems_visible_delay,
-                actionable=(
-                    self.ems_actionable and looks > self.ems_actionable_delay
-                ),
-                click_error=self.ems_click_error,
-                matches=self.ems_matches,
-                state_error=self.ems_state_error,
-                enabled_error=self.ems_enabled_error,
-                trial_error=self.ems_trial_error,
-                on_click=self._actuate_ems,
-            )
-        if name == "Billing Manager":
-            looks = self.bump("billing_manager")
-            return _ResultsControl(
-                self,
-                "billing_manager",
-                present=self.route == "app" and looks > self.billing_manager_delay,
-                actionable=self.billing_manager_actionable,
-                click_error=self.billing_manager_click_error,
-                href="/billing",
-                on_click=self._open_billing,
-            )
-        if name == "EB Bill":
-            looks = self.bump("eb_bill")
-            return _ResultsControl(
-                self,
-                "eb_bill",
-                # The EB Bill nav entry lives on every route that has one,
-                # including the results route itself, so route identity can be
-                # proven from the control's own target. `eb_bill_on_app` adds it
-                # to the outer application route as well, which is where a
-                # direct entry and the Billing Manager entry coexist.
-                present=(
-                    self.route in ("billing", "tenant_bill", "results")
-                    or (self.eb_bill_on_app and self.route == "app")
-                )
-                and looks > self.eb_bill_delay,
-                visible=looks > self.eb_bill_visible_delay,
-                actionable=(
-                    self.eb_bill_actionable and looks > self.eb_bill_actionable_delay
-                ),
-                click_error=self.eb_bill_click_error,
-                href=self.eb_bill_href,
-                on_click=None if self.eb_bill_click_inert else self._open_results,
-                matches=self.eb_bill_matches,
-                state_error=self.eb_bill_state_error,
-            )
-        if name == "Search":
-            self.bump("search")
-            return _ResultsControl(
-                self, "search", present=self.route == "results", on_click=self._run_search
-            )
-        if name == "Next page":
-            self.bump("next_page")
-            return _ResultsControl(
-                self,
-                "next_page",
-                present=True,
-                disabled=not self._has_next(),
-                on_click=self._click_next,
-            )
-        raise AssertionError(f"unexpected role lookup: {role}/{name}")
+    def get_by_text(self, text: str, exact: bool = False) -> SurfaceLocator:
+        self.text_lookups.append((text, exact))
+        if text == ResultsConfig.account_identity and exact:
+            return SurfaceLocator(self, "witness")
+        return SurfaceLocator(self, "nothing")
 
-    def get_by_test_id(self, test_id: str):
-        if test_id == "invoice-list":
-            looks = self.bump("invoice-list")
-            return _ListContainer(self, looks > self.list_delay)
-        if test_id == "invoice-row":
-            if not self.searched:
-                self.rows_read_before_search = True
-            return _Rows(self, list(self.pages[self.page_index]) if self.searched else [])
-        if test_id == "invoice-list-empty":
-            empty = not (self.searched and self.pages[self.page_index])
-            return _ResultsControl(self, "invoice-list-empty", present=empty, visible=empty)
-        if test_id == "invoice-results-state":
-            self.bump("results_state")
-            return _StateMarker(self)
-        if test_id == "selected-account":
-            return _TextMarker(self.selected_account)
-        raise AssertionError(f"unexpected test id: {test_id}")
+    def fire_download(self, row: int) -> None:
+        script = self.downloads.get(row, [{"kind": "ok"}])
+        attempt = self.download_dispatches.count(row) - 1
+        outcome = dict(script[min(attempt, len(script) - 1)])
+        kind = outcome.get("kind", "ok")
+        outcome.setdefault("name", f"2026-09-0{row + 1}_synthetic.pdf")
+        if kind == "click_error":
+            raise RuntimeError("synthetic click failure password=hunter2")
+        if kind == "no_event":
+            return
+        if kind == "popup":
+            self.state.extra_pages += 1
+        if kind == "tab_lost":
+            self.state.eb_selected = False
+            self.state.tenant_selected = True
+        self.pending_download = FakeDownload(self, outcome)
 
-    def wait_for_function(self, script: str, arg=None, timeout: int | None = None) -> None:
-        self.probe_timeouts.append(timeout)
-        if self._advance_after > 0:
-            self._advance_after -= 1
-            self.clock.charge_probe(timeout)
+    @contextlib.contextmanager
+    def expect_download(self, timeout: int | None = None):
+        self.expect_download_timeouts.append(timeout)
+        self.pending_download = None
+        yield FakeDownloadInfo(self)
+        if self.pending_download is None:
             raise synthetic_timeout()
-        if self._advance_target is not None:
-            self.page_index = self._advance_target
-            self._advance_target = None
-            self.reset_looks("invoice-list")
-
-    def expect_download(self):
-        page = self
-
-        @contextlib.contextmanager
-        def manager():
-            yield _DownloadInfo(page)
-
-        return manager()
 
 
-class PortalResultsSettlingTests(unittest.TestCase):
-    """One dispatch, then settle: the results route under eventual consistency."""
+def surface_portal(state: SurfaceState | None = None, downloads=None):
+    clock = RecoveryClock()
+    page = FakeSurfacePage(state or SurfaceState(), clock, downloads)
+    portal = PlaywrightPortal(ResultsConfig(), headed=False)
+    portal.page = page
+    portal.context = FakeContext(page)
+    return portal, page, clock
 
-    def route(self, **kwargs):
-        clock = RecoveryClock()
-        page = FakeResultsPage(clock=clock, **kwargs)
-        portal = PlaywrightPortal(ResultsConfig(), headed=False)
-        portal.page = page
-        return portal, page, clock
 
-    def assert_probes_bounded(self, page: FakeResultsPage) -> None:
-        """Every waiting call on this route carried an explicit small timeout."""
+class SingleSurfaceNavigationTests(unittest.TestCase):
+    """The exact EB Bill tab, the account witness and one Search."""
 
-        self.assertTrue(page.probe_timeouts, "the route must actually probe")
-        for value in page.probe_timeouts:
-            self.assertIsNotNone(value, "no probe may inherit the page default")
-            self.assertNotEqual(value, 0, "a zero timeout would mean waiting forever")
-            self.assertLessEqual(value, MAX_TRIAL_PROBE_MS)
-
-    def assert_state_attribute_bounded(self, page: FakeResultsPage) -> None:
-        """The state marker's own attribute read is explicitly bounded.
-
-        Asserted against the state-marker evidence specifically, so dropping
-        the timeout from that one call fails here even though other probes on
-        the route are still bounded.
-        """
-
-        self.assertTrue(
-            page.state_attribute_timeouts, "the state marker must actually be read"
-        )
-        for value in page.state_attribute_timeouts:
-            self.assertIsNotNone(
-                value, "the attribute read may not inherit the page default"
-            )
-            self.assertNotEqual(value, 0, "a zero timeout would mean waiting forever")
-            self.assertLessEqual(value, MAX_TRIAL_PROBE_MS)
-
-    def assert_charged_probes_fit_the_ceiling(self, clock: RecoveryClock) -> None:
-        """No charged probe outlasted the budget remaining when it started."""
-
-        elapsed = 0
-        for kind, cost in clock.ledger:
-            if kind == "probe":
-                self.assertLessEqual(cost, MAX_TRIAL_PROBE_MS)
-                self.assertLessEqual(
-                    cost,
-                    RECOVERY_CEILING_MS - elapsed,
-                    "a probe may not outlast the remaining recovery budget",
-                )
-            elapsed += cost
-        self.assertLessEqual(elapsed, RECOVERY_CEILING_MS)
-
-    def test_the_owner_confirmed_downstream_sequence_is_preserved(self) -> None:
-        """Billing Manager, EB Bill, account, Search, and only then invoices."""
-        portal, page, clock = self.route()
+    def inventory(self, state: SurfaceState | None = None, **kwargs):
+        portal, page, clock = surface_portal(state, **kwargs)
+        error = None
+        rows = None
         with simulated_clock(clock):
-            inventory = portal.inventory(20)
+            try:
+                rows = portal.inventory(20)
+            except AppError as exc:
+                error = exc
+        return portal, page, clock, rows, error
 
-        self.assertEqual([bill.filename for bill in inventory], ["2026-01-01_synthetic.pdf"])
-        self.assertEqual(
-            page.events,
-            ["ems", "billing_manager", "eb_bill", "select_account", "search"],
-        )
-        self.assertFalse(
-            page.rows_read_before_search,
-            "an empty EB Bill surface before Search is never read as no invoices",
-        )
-        self.assertEqual(
-            page.clicks,
-            {"ems": 1, "billing_manager": 1, "eb_bill": 1, "search": 1},
-        )
-        self.assertEqual(page.ems_actuations, 1, "the application is entered once")
-        self.assertEqual(
-            clock.yields,
-            ENTRY_SETTLE_YIELDS,
-            "only the bounded entry settle pays; every settled surface after it is free",
-        )
-        self.assert_probes_bounded(page)
+    def test_an_unselected_tab_is_clicked_once_and_its_selection_proven(self) -> None:
+        _portal, page, _clock, rows, error = self.inventory()
+        self.assertIsNone(error)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(page.clicks, ["tab:eb", "search"])
+        self.assertTrue(page.state.eb_selected)
+        self.assertFalse(page.state.tenant_selected)
 
-    def test_a_delayed_billing_manager_is_recovered_and_clicked_once(self) -> None:
-        portal, page, clock = self.route(billing_manager_delay=3)
-        with simulated_clock(clock):
-            inventory = portal.inventory(20)
+    def test_an_already_selected_tab_costs_zero_clicks(self) -> None:
+        state = SurfaceState(eb_selected=True, tenant_selected=False)
+        _portal, page, _clock, rows, error = self.inventory(state)
+        self.assertIsNone(error)
+        self.assertEqual(page.clicks, ["search"])
+        self.assertNotIn("tab:eb", page.trial_clicks)
 
-        self.assertEqual(len(inventory), 1)
-        self.assertEqual(page.clicks["billing_manager"], 1)
-        self.assertGreater(page.looks["billing_manager"], 3, "each look resolved a fresh locator")
-        self.assertTrue(clock.yields)
-        self.assert_probes_bounded(page)
-
-    def test_a_delayed_eb_bill_surface_is_recovered_and_clicked_once(self) -> None:
-        portal, page, clock = self.route(eb_bill_delay=3)
-        with simulated_clock(clock):
-            inventory = portal.inventory(20)
-
-        self.assertEqual(len(inventory), 1)
-        self.assertEqual(page.clicks["billing_manager"], 1, "a slow EB Bill never re-opens Billing")
-        self.assertEqual(page.clicks["eb_bill"], 1)
-        self.assert_probes_bounded(page)
-
-    def test_a_delayed_account_surface_settles_before_selection(self) -> None:
-        portal, page, clock = self.route(account_delay=3)
-        with simulated_clock(clock):
-            inventory = portal.inventory(20)
-
-        self.assertEqual(len(inventory), 1)
-        self.assertEqual(page.clicks["eb_bill"], 1, "a slow account surface never re-clicks EB Bill")
-        self.assertEqual(page.events.count("select_account"), 1)
-        self.assert_probes_bounded(page)
-
-    def test_a_delayed_post_search_state_is_settled_not_re_searched(self) -> None:
-        portal, page, clock = self.route(post_search_delay=4)
-        with simulated_clock(clock):
-            inventory = portal.inventory(20)
-
-        self.assertEqual(len(inventory), 1)
-        self.assertEqual(page.clicks["search"], 1, "a slow result is never re-requested")
-        self.assertTrue(clock.yields)
-        self.assert_probes_bounded(page)
-
-    def test_a_delayed_invoice_list_becomes_visible_without_re_searching(self) -> None:
-        portal, page, clock = self.route(list_delay=3)
-        with simulated_clock(clock):
-            inventory = portal.inventory(20)
-
-        self.assertEqual(len(inventory), 1)
-        self.assertEqual(page.clicks["search"], 1)
-        self.assert_probes_bounded(page)
-
-    def test_a_delayed_pagination_advance_is_waited_for_not_re_clicked(self) -> None:
-        portal, page, clock = self.route(
-            pages=(("2026-01-01_a.pdf",), ("2026-02-01_b.pdf",)), advance_delay=4
-        )
-        with simulated_clock(clock):
-            inventory = portal.inventory(20)
-
-        self.assertEqual([bill.filename for bill in inventory], ["2026-01-01_a.pdf", "2026-02-01_b.pdf"])
-        self.assertEqual(
-            page.clicks["next_page"], 1, "one real click per intended page transition"
-        )
-        self.assertTrue(clock.yields)
-        self.assert_probes_bounded(page)
-
-    def test_a_post_search_state_that_never_settles_never_re_searches(self) -> None:
-        portal, page, clock = self.route(start_route="results", post_search_delay=10 ** 6)
-        with simulated_clock(clock):
-            with self.assertRaises(LayoutChangedError) as caught:
-                portal.inventory(20)
-
-        self.assertEqual(caught.exception.message, "invoice results are not confirmed post-search")
-        self.assertEqual(page.clicks["search"], 1, "a postcondition timeout never duplicates the action")
+    def test_a_link_only_eb_bill_is_never_used(self) -> None:
+        state = SurfaceState(eb_tab_role="link")
+        _portal, page, clock, _rows, error = self.inventory(state)
+        self.assertEqual(error.message, portal_module.EB_BILL_TAB_NOT_READY_MESSAGE)
+        self.assertEqual(page.clicks, [])
+        self.assertNotIn("link", {role for role, _name, _exact in page.role_lookups})
         self.assertLessEqual(clock.elapsed_ms(), RECOVERY_CEILING_MS)
 
-    def test_pagination_that_never_advances_never_re_clicks(self) -> None:
-        portal, page, clock = self.route(
-            start_route="results",
-            pages=(("2026-01-01_a.pdf",), ("2026-02-01_b.pdf",)),
-            advance_delay=10 ** 6,
+    def test_ambiguous_or_unactionable_tabs_fail_closed_before_dispatch(self) -> None:
+        for overrides in ({"eb_tab_count": 2}, {"tab_actionable": False}, {"tenant_count": 2}):
+            with self.subTest(**overrides):
+                _portal, page, _clock, _rows, error = self.inventory(SurfaceState(**overrides))
+                self.assertEqual(error.message, portal_module.EB_BILL_TAB_NOT_READY_MESSAGE)
+                self.assertEqual(page.clicks, [])
+
+    def test_a_tab_click_exception_is_uncertain_and_never_resent(self) -> None:
+        state = SurfaceState(tab_click_error=RuntimeError("synthetic password=hunter2"))
+        _portal, page, _clock, _rows, error = self.inventory(state)
+        self.assertEqual(error.message, portal_module.EB_BILL_TAB_UNCERTAIN_MESSAGE)
+        self.assertEqual(page.clicks, ["tab:eb"])
+        self.assertNotIn("hunter2", error.message)
+
+    def test_a_tab_click_that_selects_nothing_fails_as_unproved(self) -> None:
+        _portal, page, _clock, _rows, error = self.inventory(SurfaceState(tab_click_selects=False))
+        self.assertEqual(error.message, portal_module.EB_BILL_TAB_UNPROVED_MESSAGE)
+        self.assertEqual(page.clicks, ["tab:eb"])
+
+    def test_both_tabs_selected_is_a_contradiction_never_a_selection(self) -> None:
+        state = SurfaceState(eb_selected=True, tenant_selected=True)
+        _portal, page, _clock, _rows, error = self.inventory(state)
+        self.assertEqual(error.message, portal_module.EB_BILL_TAB_NOT_READY_MESSAGE)
+        self.assertEqual(page.clicks, [])
+
+    def test_the_account_witness_must_be_exactly_one_outside_the_results(self) -> None:
+        cases = (
+            ([], portal_module.ACCOUNT_WITNESS_UNPROVED_MESSAGE),
+            ([True, True], portal_module.ACCOUNT_WITNESS_AMBIGUOUS_MESSAGE),
+            ([False, False], portal_module.ACCOUNT_WITNESS_UNPROVED_MESSAGE),
         )
-        with simulated_clock(clock):
-            with self.assertRaises(LayoutChangedError) as caught:
-                portal.inventory(20)
+        for witnesses, message in cases:
+            with self.subTest(witnesses=witnesses):
+                _portal, page, _clock, _rows, error = self.inventory(SurfaceState(witnesses=witnesses))
+                self.assertEqual(error.message, message)
+                self.assertNotIn("search", page.clicks)
+        _portal, page, _clock, rows, error = self.inventory(SurfaceState(witnesses=[False, True, False]))
+        self.assertIsNone(error, "row occurrences are ignored, one outside witness passes")
+        self.assertEqual(page.text_lookups[0], (ResultsConfig.account_identity, True))
 
-        self.assertEqual(caught.exception.message, "invoice pagination did not advance")
-        self.assertEqual(page.clicks["next_page"], 1, "a slow transition is never re-requested")
-        self.assertLessEqual(clock.elapsed_ms(), RECOVERY_CEILING_MS)
+    def test_a_delayed_search_is_recovered_and_dispatched_once(self) -> None:
+        _portal, page, _clock, rows, error = self.inventory(SurfaceState(search_absent_looks=3))
+        self.assertIsNone(error)
+        self.assertEqual(page.clicks.count("search"), 1)
 
-    def test_end_of_inventory_is_still_a_disabled_next_page(self) -> None:
-        """A disabled Next page stays the committed end signal, not lag."""
-        portal, page, clock = self.route(start_route="results")
-        with simulated_clock(clock):
-            inventory = portal.inventory(20)
+    def test_a_search_that_never_appears_fails_before_dispatch(self) -> None:
+        _portal, page, clock, _rows, error = self.inventory(SurfaceState(search_absent_looks=10_000))
+        self.assertEqual(error.message, portal_module.SEARCH_NOT_READY_MESSAGE)
+        self.assertNotIn("search", page.clicks)
+        self.assertLessEqual(clock.elapsed_ms(), 2 * RECOVERY_CEILING_MS)
 
-        self.assertEqual(len(inventory), 1)
-        self.assertEqual(page.clicks.get("next_page", 0), 0)
-        self.assertEqual(clock.yields, [], "the end of inventory is read once and trusted")
+    def test_a_search_click_exception_is_uncertain_and_never_resent(self) -> None:
+        state = SurfaceState(search_click_error=RuntimeError("synthetic"))
+        _portal, page, _clock, _rows, error = self.inventory(state)
+        self.assertEqual(error.message, portal_module.SEARCH_UNCERTAIN_MESSAGE)
+        self.assertEqual(page.clicks.count("search"), 1)
 
-    def test_a_confirmed_post_search_empty_surface_is_authoritative(self) -> None:
-        portal, page, clock = self.route(pages=([],))
-        with simulated_clock(clock):
-            self.assertEqual(portal.inventory(20), [])
-        self.assertEqual(page.clicks["search"], 1)
-        self.assertFalse(page.rows_read_before_search)
+    def test_delayed_results_settle_without_a_second_search(self) -> None:
+        _portal, page, _clock, rows, error = self.inventory(SurfaceState(results_absent_looks=4))
+        self.assertIsNone(error)
+        self.assertEqual(page.clicks.count("search"), 1)
 
-    def test_a_stalled_post_search_attribute_read_is_recovered(self) -> None:
-        """A marker that detaches mid-read is lag, and is re-read afresh.
-
-        `count()` can see exactly one marker and the surface can still rerender
-        before the attribute is read, which is when a Playwright attribute read
-        starts waiting. That wait is bounded, so the checkpoint ends and the
-        next one resolves the marker again.
-        """
-        portal, page, clock = self.route(state_attribute_stalls=2)
-        with simulated_clock(clock):
-            inventory = portal.inventory(20)
-
-        self.assertEqual([bill.filename for bill in inventory], ["2026-01-01_synthetic.pdf"])
-        self.assertEqual(page.clicks["search"], 1, "a stalled read never re-searches")
-        self.assertGreaterEqual(
-            page.looks["results_state"], 3, "each read resolved a fresh marker"
-        )
-        self.assertEqual(len(page.state_attribute_timeouts), 3)
-        self.assert_state_attribute_bounded(page)
-        self.assert_charged_probes_fit_the_ceiling(clock)
-
-    def test_a_post_search_attribute_read_cannot_extend_the_shared_window(self) -> None:
-        """No attribute read may inherit `page.set_default_timeout()`.
-
-        The simulated clock charges a stalled read exactly the timeout it was
-        given, so an unbounded one would be charged the 300 s page default and
-        blow the ceiling on its first checkpoint instead of ending inside it.
-        """
-        portal, page, clock = self.route(
-            start_route="results", state_attribute_stalls=10 ** 6
-        )
-        with simulated_clock(clock):
-            with self.assertRaises(LayoutChangedError) as caught:
-                portal.inventory(20)
-
-        self.assertEqual(caught.exception.message, "invoice results are not confirmed post-search")
-        self.assertEqual(page.clicks["search"], 1, "a deadline is never a second Search")
-        self.assertEqual(
-            len(page.state_attribute_timeouts),
-            len(portal_module.PORTAL_RECOVERY_ATTEMPTS_MS),
-            "the marker was re-read at every checkpoint",
-        )
-        self.assert_state_attribute_bounded(page)
-        self.assert_charged_probes_fit_the_ceiling(clock)
-
-    def test_a_non_timeout_post_search_attribute_failure_is_terminal(self) -> None:
-        """A structural read failure is not the lag this recovery waits for."""
-        portal, page, clock = self.route(
-            start_route="results",
-            state_attribute_error=RuntimeError("synthetic structural failure"),
-        )
-        with simulated_clock(clock):
-            with self.assertRaises(LayoutChangedError) as caught:
-                portal.inventory(20)
-
-        self.assertEqual(
-            caught.exception.message, "tenant/account search result contract changed"
-        )
-        self.assertEqual(
-            len(page.state_attribute_timeouts), 1, "a real failure is not re-probed"
-        )
-        self.assertEqual(page.clicks["search"], 1, "a real failure never re-searches")
-        self.assertEqual(clock.yields, [], "a real failure is not waited out")
-
-    def test_the_post_search_attribute_read_carries_its_own_timeout(self) -> None:
-        """The bound is asserted on this read, not on the route in general."""
-        portal, page, clock = self.route()
+    def test_a_second_inventory_fails_without_any_dispatch(self) -> None:
+        portal, page, clock = surface_portal()
         with simulated_clock(clock):
             portal.inventory(20)
+            clicks = list(page.clicks)
+            lookups = len(page.role_lookups)
+            with self.assertRaises(LayoutChangedError) as caught:
+                portal.inventory(20)
+        self.assertEqual(caught.exception.message, portal_module.RESULTS_INVENTORY_CONSUMED_MESSAGE)
+        self.assertEqual(page.clicks, clicks)
+        self.assertEqual(len(page.role_lookups), lookups, "nothing is even inspected")
 
-        self.assert_state_attribute_bounded(page)
-        self.assertEqual(len(page.state_attribute_timeouts), 1, "a settled marker is read once")
-
-    def test_a_delayed_download_control_is_dispatched_exactly_once(self) -> None:
-        portal, page, clock = self.route()
-        with tempfile.TemporaryDirectory() as directory:
-            with simulated_clock(clock):
-                inventory = portal.inventory(20)
-                page.delay_download(3)
-                target = Path(directory) / "download.bin"
-                suggested = portal.download(inventory[0], target)
-
-            self.assertEqual(suggested, "2026-01-01_synthetic.pdf")
-            self.assertTrue(target.exists())
-        self.assertEqual(page.clicks["download"], 1)
-        self.assertGreater(page.looks["download"], 3, "readiness was re-resolved, not the click")
-        self.assert_probes_bounded(page)
-
-    def test_a_download_control_that_never_settles_is_never_clicked(self) -> None:
-        portal, page, clock = self.route()
-        with tempfile.TemporaryDirectory() as directory:
-            with simulated_clock(clock):
-                inventory = portal.inventory(20)
-                page.delay_download(10 ** 6)
-                with self.assertRaises(LayoutChangedError) as caught:
-                    portal.download(inventory[0], Path(directory) / "download.bin")
-
-        self.assertEqual(
-            caught.exception.message, "invoice row download control is missing or ambiguous"
-        )
-        self.assertEqual(page.clicks.get("download", 0), 0)
-
-
-
-# ---- DL-XB-141-AUTH-LANDING-NAV-SEPARATION-G2-001: business navigation ---- #
-#
-# Contract B. `_open_verified_results()` owns the Billing Manager / EB Bill
-# route, and route identity is PROVEN rather than inferred. The retired
-# shortcut read the presence of the tenant/account selector as proof that EB
-# Bill was already active; that selector renders on more than one route, so it
-# never proved anything of the kind. These cases drive the real route against
-# the settling fake and assert what was dispatched, what was not, and which
-# failure each surface produces.
-
-
-class BusinessNavigationTests(unittest.TestCase):
-    """The route is proven, the clicks are one-shot, and the failures are distinct."""
-
-    def route(self, **kwargs):
-        clock = RecoveryClock()
-        page = FakeResultsPage(clock=clock, **kwargs)
-        portal = PlaywrightPortal(ResultsConfig(), headed=False)
-        portal.page = page
-        return portal, page, clock
-
-    def open_route(self, **kwargs):
-        """Run the real navigation contract and return what it did."""
-        portal, page, clock = self.route(**kwargs)
-        error = None
-        with simulated_clock(clock):
-            try:
-                portal._open_eb_bill_route(page)
-            except AppError as exc:
-                error = exc
-        return page, error
-
-    # ---- N01-N04: how few clicks each starting route needs ---- #
-
-    def test_a_tenant_account_selector_never_skips_eb_bill(self) -> None:
-        """N01. The retired shortcut's exact evidence, on a Tenant-Bill route.
-
-        The selector is present and resolvable, and the route is NOT EB Bill.
-        The old inference stopped here; the proven contract navigates.
-        """
-        page, error = self.open_route(start_route="tenant_bill")
-        self.assertIsNone(error)
-        self.assertEqual(page.get_by_label("Tenant/account").count(), 1)
-        self.assertEqual(page.route, "results")
-        self.assertEqual(page.clicks, {"eb_bill": 1}, "one EB Bill click, and no more")
-        self.assertNotIn("billing_manager", page.clicks)
-
-    def test_an_already_proven_route_dispatches_nothing(self) -> None:
-        """N02. Route proof is the only thing that may skip a navigation click."""
-        page, error = self.open_route(start_route="results")
-        self.assertIsNone(error)
-        self.assertEqual(page.clicks, {})
-        self.assertEqual(page.events, [])
-        self.assertTrue(page.href_reads, "the route was proven, not assumed")
-
-    def test_direct_eb_bill_availability_needs_no_billing_manager_click(self) -> None:
-        """N03. At most one EB Bill click, and never a Billing Manager click."""
-        page, error = self.open_route(start_route="billing")
-        self.assertIsNone(error)
-        self.assertEqual(page.clicks, {"eb_bill": 1})
-        self.assertEqual(page.route, "results")
-
-    def test_the_outer_app_route_dispatches_each_control_once(self) -> None:
-        """N04. Billing Manager then EB Bill, each exactly once."""
-        page, error = self.open_route(start_route="app")
-        self.assertIsNone(error)
-        self.assertEqual(page.events, ["billing_manager", "eb_bill"])
-        self.assertEqual(page.clicks, {"billing_manager": 1, "eb_bill": 1})
-
-    # ---- N05-N09: the three failure classes, per control ---- #
-
-    def test_a_billing_manager_readiness_failure_is_distinct(self) -> None:
-        """N05. It fails before any dispatch, with its own reference."""
-        page, error = self.open_route(start_route="app", billing_manager_actionable=False)
-        self.assertIsInstance(error, LayoutChangedError)
-        self.assertEqual(error.message, "Billing Manager navigation control is not ready")
-        self.assertEqual(
-            cli.support_ref_for(error), "EG_NAV_BILLING_MANAGER_NOT_READY"
-        )
-        self.assertEqual(page.clicks.get("billing_manager", 0), 0)
-
-    def test_a_billing_manager_click_exception_is_uncertain_and_terminal(self) -> None:
-        """N06. It may have landed, so it is never sent again."""
-        page, error = self.open_route(
-            start_route="app",
-            billing_manager_click_error=RuntimeError(STEP_FAILURE_TEXT),
-        )
-        self.assertIsInstance(error, LayoutChangedError)
-        self.assertEqual(
-            error.message, "Billing Manager navigation dispatch outcome uncertain"
-        )
-        self.assertEqual(
-            cli.support_ref_for(error), "EG_NAV_BILLING_MANAGER_DISPATCH_UNCERTAIN"
-        )
-        self.assertEqual(page.clicks["billing_manager"], 1, "never retried")
-        self.assertNotIn("hunter2", error.message)
-
-    def test_an_eb_bill_readiness_failure_is_distinct(self) -> None:
-        """N07. Readiness is proven before the one dispatch.
-
-        The outer route, so the EB Bill entry reached after the one Billing
-        Manager click is unambiguously the dispatch target: it never becomes
-        actionable, and it is never clicked. A never-usable DIRECT entry is a
-        different case, and belongs to the entry decision rather than to this
-        dispatch (N16).
-        """
-        page, error = self.open_route(start_route="app", eb_bill_actionable=False)
-        self.assertIsInstance(error, LayoutChangedError)
-        self.assertEqual(error.message, "EB Bill navigation control is not ready")
-        self.assertEqual(cli.support_ref_for(error), "EG_NAV_EB_BILL_NOT_READY")
-        self.assertEqual(page.clicks.get("eb_bill", 0), 0)
-        self.assertEqual(page.clicks["billing_manager"], 1)
-
-    def test_an_eb_bill_click_exception_is_uncertain_and_terminal(self) -> None:
-        """N08. An uncertain EB Bill dispatch is terminal, with no retry."""
-        page, error = self.open_route(
-            start_route="billing", eb_bill_click_error=RuntimeError(STEP_FAILURE_TEXT)
-        )
-        self.assertIsInstance(error, LayoutChangedError)
-        self.assertEqual(error.message, "EB Bill navigation dispatch outcome uncertain")
-        self.assertEqual(
-            cli.support_ref_for(error), "EG_NAV_EB_BILL_DISPATCH_UNCERTAIN"
-        )
-        self.assertEqual(page.clicks["eb_bill"], 1, "never retried")
-        self.assertNotIn("portal.example.invalid", error.message)
-
-    def test_a_dispatched_click_without_route_proof_fails_closed(self) -> None:
-        """N09. The click landed and the route never became proven."""
-        page, error = self.open_route(start_route="billing", eb_bill_click_inert=True)
-        self.assertIsInstance(error, LayoutChangedError)
-        self.assertEqual(error.message, "EB Bill results route was not proven")
-        self.assertEqual(cli.support_ref_for(error), "EG_NAV_RESULTS_ROUTE_UNPROVED")
-        self.assertEqual(page.clicks["eb_bill"], 1, "a missing postcondition never re-clicks")
-
-    def test_the_three_navigation_failure_classes_are_all_distinct(self) -> None:
-        """One control, three outcomes, three references."""
-        references = set()
-        for kwargs in (
-            {"start_route": "app", "eb_bill_actionable": False},
-            {"start_route": "billing", "eb_bill_click_error": synthetic_timeout()},
-            {"start_route": "billing", "eb_bill_click_inert": True},
-        ):
-            _page, error = self.open_route(**kwargs)
-            references.add(cli.support_ref_for(error))
-        self.assertEqual(len(references), 3)
-
-    # ---- N10-N13: the selector, the proof, and its privacy ---- #
-
-    def test_no_generic_or_narrowed_navigation_selector_exists(self) -> None:
-        """N10. Exact role and name, never `.first`, never generic text."""
-        seen: list[tuple] = []
-
-        class SelectorRecorder(FakeResultsPage):
-            def get_by_role(self, role, name=None, exact=False):
-                seen.append((role, name, exact))
-                return super().get_by_role(role, name=name, exact=exact)
-
-            def get_by_text(self, *args, **kwargs):
-                raise AssertionError("navigation never resolves a control by text")
-
-        clock = RecoveryClock()
-        page = SelectorRecorder(clock=clock, start_route="app")
-        portal = PlaywrightPortal(ResultsConfig(), headed=False)
-        portal.page = page
-        with simulated_clock(clock):
-            portal._open_eb_bill_route(page)
-        for role, name, exact in seen:
-            with self.subTest(control=name):
-                self.assertIn(name, ("Billing Manager", "EB Bill"))
-                self.assertTrue(exact, "an exact name match is never weakened")
-        source = pathlib_read_portal_source()
-        navigation = source[source.index("def _open_eb_bill_route") : source.index("def _await_post_search_state")]
-        self.assertNotIn(".first", navigation)
-        self.assertNotIn("get_by_text", navigation)
-
-    def test_a_saved_results_route_restores_without_a_navigation_click(self) -> None:
-        """N11. The saved verified-results address is recognised as the route."""
-        portal, page, clock = self.route(pages=(("a.pdf", "b.pdf"), ("c.pdf",)))
-        with tempfile.TemporaryDirectory() as directory:
-            with simulated_clock(clock):
-                inventory = portal.inventory(20)
-                before = dict(page.clicks)
-                portal.download(inventory[0], Path(directory) / "download.bin")
-        self.assertEqual(
-            page.clicks.get("billing_manager", 0),
-            before.get("billing_manager", 0),
-            "restoration re-enters no Billing Manager",
-        )
-        self.assertEqual(
-            page.clicks.get("eb_bill", 0),
-            before.get("eb_bill", 0),
-            "restoration re-enters no EB Bill",
-        )
-        self.assertIn("goto", page.events)
-
-    def test_route_proof_ignores_only_query_and_fragment(self) -> None:
-        """N12. Query and fragment are ignored; nothing else is."""
-        portal, page, _clock = self.route(start_route="results")
-        # The results address carries page, account, searched and a fragment.
-        self.assertIn("?", page.url)
-        self.assertIn("#", page.url)
-        self.assertTrue(portal._eb_bill_route_proven(page))
-        for case, href in (
-            ("different_path", "/tenant-bill"),
-            ("deeper_path", "/eb-bill/extra"),
-            ("cross_origin", "http://other.invalid/eb-bill"),
-            ("cross_scheme", "https://synthetic.invalid/eb-bill"),
-            ("empty_target", ""),
-        ):
-            with self.subTest(case=case):
-                page.eb_bill_href = href
-                self.assertFalse(portal._eb_bill_route_proven(page))
-        # A trailing slash is the same route, and an unreadable target is not.
-        page.eb_bill_href = "/eb-bill/"
-        self.assertTrue(portal._eb_bill_route_proven(page))
-        page.href_read_error = RuntimeError(STEP_FAILURE_TEXT)
-        self.assertFalse(portal._eb_bill_route_proven(page))
-
-    def test_route_proof_emits_nothing_but_a_boolean(self) -> None:
-        """N13. Neither address leaves the proof, on success or on failure."""
-        portal, page, _clock = self.route(start_route="results")
-        self.assertIs(portal._eb_bill_route_proven(page), True)
-        page.eb_bill_href = "/tenant-bill"
-        self.assertIs(portal._eb_bill_route_proven(page), False)
-        _failed, error = self.open_route(start_route="billing", eb_bill_click_inert=True)
-        for fragment in ("http", "synthetic.invalid", "/eb-bill", "?", "#"):
-            with self.subTest(fragment=fragment):
-                self.assertNotIn(fragment, error.message)
-        self.assertNotIn("http", cli.support_ref_for(error))
-
-    def test_an_ambiguous_eb_bill_control_never_proves_the_route(self) -> None:
-        """Ambiguity is drift, and drift is never route proof."""
-        portal, page, clock = self.route(start_route="results", eb_bill_matches=2)
-        self.assertFalse(portal._eb_bill_route_proven(page))
+    def test_a_failed_inventory_is_also_consumed(self) -> None:
+        portal, page, clock = surface_portal(SurfaceState(witnesses=[]))
         with simulated_clock(clock):
             with self.assertRaises(LayoutChangedError):
-                portal._settle_eb_bill_entry(page)
-        self.assertEqual(page.clicks, {}, "an ambiguous entry dispatches nothing")
+                portal.inventory(20)
+            with self.assertRaises(LayoutChangedError) as caught:
+                portal.inventory(20)
+        self.assertEqual(caught.exception.message, portal_module.RESULTS_INVENTORY_CONSUMED_MESSAGE)
 
-    # ---- N14-N21: the entry decision is settled, never guessed ---- #
-    #
-    # The repaired defect: the entry decision used to be taken from one
-    # immediate look -- `count() == 1` chose the direct path and anything else
-    # chose Billing Manager. A surface that is still settling cannot be read
-    # that way, in either direction. These cases put a direct entry on the same
-    # route as the Billing Manager entry, so choosing the outer path is
-    # observable as a mis-route rather than as the only option available, and
-    # then vary WHEN and WHETHER that direct entry becomes genuinely usable.
-
-    def test_a_settling_direct_eb_bill_entry_is_never_mis_routed(self) -> None:
-        """N14. The direct entry appears after the immediate look, and is used.
-
-        Both entries exist on this route. The direct EB Bill entry has simply
-        not rendered yet at the first look, and it becomes available at a later
-        committed checkpoint. Deciding from the immediate look sends the run
-        through Billing Manager even though the direct route was about to prove
-        itself, so a single Billing Manager click here is the defect.
-        """
-        page, error = self.open_route(
-            start_route="app", eb_bill_on_app=True, eb_bill_delay=2
+    def test_an_unreadable_final_re_proof_fails_closed_without_private_text(self) -> None:
+        cases = (
+            ("_eb_bill_tab_state", portal_module.EB_BILL_TAB_UNPROVED_MESSAGE),
+            ("_account_witness_count", portal_module.ACCOUNT_WITNESS_UNPROVED_MESSAGE),
         )
+        for target, message in cases:
+            with self.subTest(target=target):
+                portal, page, clock = surface_portal()
+                original = getattr(PlaywrightPortal, target)
+
+                def flaky(self, *args, _original=original, _page=page):
+                    # Only the inspection-only re-proof after the results settled.
+                    if _page.searched and _page.results_looks >= 2:
+                        raise RuntimeError("unreadable ACCT-778899")
+                    return _original(self, *args)
+
+                with mock.patch.object(PlaywrightPortal, target, flaky), simulated_clock(clock):
+                    with self.assertRaises(LayoutChangedError) as caught:
+                        portal.inventory(20)
+                self.assertEqual(caught.exception.message, message)
+                self.assertNotIn("ACCT", caught.exception.message)
+                self.assertEqual(page.clicks.count("search"), 1)
+
+    def test_a_second_page_fails_the_topology_before_anything_is_clicked(self) -> None:
+        _portal, page, _clock, _rows, error = self.inventory(SurfaceState(extra_pages=1))
+        self.assertEqual(error.message, portal_module.RESULTS_TOPOLOGY_MESSAGE)
+        self.assertEqual(page.clicks, [])
+
+    def test_no_ems_billing_manager_link_or_selector_is_ever_resolved(self) -> None:
+        _portal, page, _clock, _rows, error = self.inventory()
         self.assertIsNone(error)
-        self.assertEqual(
-            page.clicks.get("billing_manager", 0),
-            0,
-            "a settling direct entry is never routed through Billing Manager",
-        )
-        self.assertEqual(page.clicks, {"eb_bill": 1}, "one EB Bill click, and no more")
-        self.assertEqual(page.route, "results")
-
-    def test_a_settling_restored_route_needs_no_navigation_click(self) -> None:
-        """N15. The saved address IS the route; its own entry settles after `goto()`.
-
-        Restoration re-enters the navigation contract, and the exact control
-        route proof is read from has not rendered yet at that moment. The route
-        is nonetheless already correct, so giving proof its bounded chance is
-        what keeps restoration free of navigation entirely.
-        """
-        portal, page, clock = self.route(
-            pages=(("a.pdf", "b.pdf"), ("c.pdf",)), eb_bill_delay=2
-        )
-        with tempfile.TemporaryDirectory() as directory:
-            with simulated_clock(clock):
-                inventory = portal.inventory(20)
-                before = dict(page.clicks)
-                portal.download(inventory[0], Path(directory) / "download.bin")
-        self.assertIn("goto", page.events)
-        for control in ("billing_manager", "eb_bill"):
-            with self.subTest(control=control):
-                self.assertEqual(
-                    page.clicks.get(control, 0),
-                    before.get(control, 0),
-                    "a settling restored route re-enters no navigation",
-                )
-
-    def test_a_hidden_direct_entry_is_not_ready_merely_because_it_exists(self) -> None:
-        """N16. Exactly one exact match, hidden: existence is not usability.
-
-        The count is one from the first look, so the retired discriminator
-        called this a direct route immediately. It stays hidden for the whole
-        bounded window, so the direct entry was never usable and the outer
-        route is the contract-conformant path -- which is only reached at all
-        if readiness, not existence, decided.
-        """
-        page, error = self.open_route(
-            start_route="app", eb_bill_on_app=True, eb_bill_visible_delay=10 ** 6
-        )
-        self.assertIsInstance(error, LayoutChangedError)
-        self.assertEqual(error.message, "EB Bill navigation control is not ready")
-        self.assertEqual(cli.support_ref_for(error), "EG_NAV_EB_BILL_NOT_READY")
-        self.assertEqual(
-            page.clicks.get("billing_manager", 0),
-            1,
-            "a never-usable direct entry does not claim the direct path",
-        )
-        self.assertEqual(page.clicks.get("eb_bill", 0), 0)
-
-    def test_a_direct_entry_that_becomes_visible_later_is_used_directly(self) -> None:
-        """N17. The same hidden entry, this time settling inside the window."""
-        page, error = self.open_route(
-            start_route="app", eb_bill_on_app=True, eb_bill_visible_delay=2
-        )
-        self.assertIsNone(error)
-        self.assertEqual(page.clicks, {"eb_bill": 1})
-        self.assertEqual(page.clicks.get("billing_manager", 0), 0)
-        self.assertEqual(page.route, "results")
-
-    def test_a_direct_entry_is_clicked_only_once_it_is_actionable(self) -> None:
-        """N18. Present and visible at once, trial-actionable only later.
-
-        Nothing is dispatched while actionability is still being proven: the
-        trial check runs repeatedly and the real click happens once, after it
-        finally passes.
-        """
-        page, error = self.open_route(
-            start_route="app", eb_bill_on_app=True, eb_bill_actionable_delay=2
-        )
-        self.assertIsNone(error)
-        self.assertEqual(page.clicks, {"eb_bill": 1})
-        self.assertEqual(page.clicks.get("billing_manager", 0), 0)
-        self.assertGreater(
-            page.trial_clicks["eb_bill"],
-            1,
-            "actionability was re-proven, and only the real click was one-shot",
-        )
-
-    def test_an_ambiguous_direct_entry_fails_closed_without_a_fallback(self) -> None:
-        """N19. Two exact matches: neither narrowed, nor masked by Billing Manager.
-
-        Ambiguity is structural uncertainty about which control the route even
-        is. Turning it into "no direct entry" would send the run through the
-        outer application and hide the drift behind a route that happens to
-        work, so it fails closed with nothing dispatched at all.
-        """
-        page, error = self.open_route(
-            start_route="app", eb_bill_on_app=True, eb_bill_matches=2
-        )
-        self.assertIsInstance(error, LayoutChangedError)
-        self.assertEqual(error.message, "EB Bill navigation control is not ready")
-        self.assertEqual(cli.support_ref_for(error), "EG_NAV_EB_BILL_NOT_READY")
-        self.assertEqual(page.clicks, {}, "ambiguity is never routed around")
-
-    def test_an_unreadable_direct_entry_fails_closed_without_dispatching(self) -> None:
-        """N20. A state that cannot be read is drift, not evidence of absence."""
-        page, error = self.open_route(
-            start_route="app",
-            eb_bill_on_app=True,
-            eb_bill_state_error=RuntimeError(STEP_FAILURE_TEXT),
-        )
-        self.assertIsInstance(error, LayoutChangedError)
-        self.assertEqual(error.message, "EB Bill navigation control is not ready")
-        self.assertEqual(page.clicks, {}, "an unreadable entry dispatches nothing")
-        self.assertNotIn("hunter2", error.message)
-        self.assertNotIn("portal.example.invalid", error.message)
-
-    def test_no_entry_observation_ever_dispatches_a_navigation_click(self) -> None:
-        """N21. The mutation boundary: the settled decision is observation only."""
-        for kwargs in (
-            {"start_route": "results", "eb_bill_delay": 2},
-            {"start_route": "app", "eb_bill_on_app": True, "eb_bill_delay": 2},
-            {"start_route": "app", "eb_bill_on_app": True, "eb_bill_matches": 2},
-            {
-                "start_route": "app",
-                "eb_bill_on_app": True,
-                "eb_bill_visible_delay": 10 ** 6,
-            },
-        ):
-            with self.subTest(**kwargs):
-                portal, page, clock = self.route(**kwargs)
-                with simulated_clock(clock):
-                    try:
-                        portal._settle_eb_bill_entry(page)
-                    except LayoutChangedError:
-                        pass
-                self.assertEqual(page.clicks, {}, "the entry decision clicks nothing")
-                self.assertEqual(page.events, [])
-
-    def test_only_the_outer_conclusion_costs_a_bounded_window(self) -> None:
-        """N22. What the settled entry decision is allowed to cost, per surface.
-
-        A decisive surface pays nothing: an already-proven route and a directly
-        usable entry are both answered at the immediate look, so the healthy
-        interaction is still free. Only concluding that no direct entry exists
-        requires the committed window -- that conclusion cannot be reached from
-        one look without mis-routing a settling surface -- and it costs exactly
-        one window, once, with the ready outer controls after it paying nothing.
-        """
-        for case, kwargs, expected_yields, expected_clicks in (
-            ("already_proven", {"start_route": "results"}, [], {}),
-            ("direct_ready", {"start_route": "billing"}, [], {"eb_bill": 1}),
-            (
-                "outer_required",
-                {"start_route": "app"},
-                ENTRY_SETTLE_YIELDS,
-                {"billing_manager": 1, "eb_bill": 1},
-            ),
-        ):
-            with self.subTest(case=case):
-                portal, page, clock = self.route(**kwargs)
-                with simulated_clock(clock):
-                    portal._open_eb_bill_route(page)
-                self.assertEqual(page.clicks, expected_clicks)
-                self.assertEqual(clock.yields, expected_yields)
-                self.assertLessEqual(
-                    clock.elapsed_ms(),
-                    RECOVERY_CEILING_MS,
-                    "the entry decision is one bounded window, never two",
-                )
-
-    # ---- the downstream contracts stay exactly as they were ---- #
-
-    def test_the_downstream_sequence_is_unchanged_after_route_proof(self) -> None:
-        portal, page, clock = self.route()
-        with simulated_clock(clock):
-            inventory = portal.inventory(20)
-        self.assertEqual([bill.filename for bill in inventory], ["2026-01-01_synthetic.pdf"])
-        self.assertEqual(
-            page.events,
-            ["ems", "billing_manager", "eb_bill", "select_account", "search"],
-        )
-        self.assertFalse(page.rows_read_before_search)
+        names = {name for _role, name, _exact in page.role_lookups}
+        self.assertTrue(names.isdisjoint({"EMS", "Billing Manager"}))
+        self.assertNotIn("link", {role for role, name, _exact in page.role_lookups if name not in portal_module.RESULTS_PAGINATION_SENTINEL_NAMES})
+        self.assertTrue(all(exact for _role, name, exact in page.role_lookups if name is not None))
 
 
-# ---- DL-XB-141-EMS-ENTRY-MINIMAL-REPAIR-G2-136: the application entry ---- #
-#
-# The repaired defect: the authenticated landing was treated as the business
-# surface. It is not. Login proves the landing and stops; the first business
-# entry opens the EMS application with exactly one real click, and everything
-# after it is the existing EB Bill route, unchanged. These cases fix that one
-# click -- how it is resolved, when it is allowed, and every way it can end.
+class SingleSurfaceResultsTests(unittest.TestCase):
+    """The one role table: shape, private identity, sentinels and ceiling."""
 
-
-class EmsApplicationEntryTests(unittest.TestCase):
-    """One exact EMS click, once per run, and never from a restored address."""
-
-    def route(self, **kwargs):
-        clock = RecoveryClock()
-        page = FakeResultsPage(clock=clock, **kwargs)
-        portal = PlaywrightPortal(ResultsConfig(), headed=False)
-        portal.page = page
-        return portal, page, clock
-
-    def enter(self, **kwargs):
-        """Run the real first-entry contract and return what it did."""
-        portal, page, clock = self.route(**kwargs)
-        error = None
+    def inventory(self, state: SurfaceState, ceiling: int = 20):
+        portal, page, clock = surface_portal(state)
         with simulated_clock(clock):
             try:
-                portal._open_verified_results()
+                return portal, page, portal.inventory(ceiling), None
             except AppError as exc:
-                error = exc
-        return page, error
+                return portal, page, None, exc
 
-    # ---- E01: the landing is not the business surface ---- #
+    def test_the_header_is_excluded_and_handles_are_opaque(self) -> None:
+        portal, _page, rows, error = self.inventory(SurfaceState(rows=[PRIVATE_ROW_TEXT, "Synthetic invoice 2"]))
+        self.assertIsNone(error)
+        self.assertEqual([row.ordinal for row in rows], [0, 1])
+        self.assertEqual({field.name for field in dataclasses.fields(rows[0])}, {"ordinal", "binding"})
+        for row in rows:
+            self.assertEqual(repr(row), f"InvoiceRow(ordinal={row.ordinal})")
+            self.assertIs(row.binding, portal._inventory_binding)
+        self.assertEqual(len(portal._frozen_rows), 3, "header plus two invoice rows")
 
-    def test_the_authenticated_landing_carries_no_business_navigation(self) -> None:
-        """E01. EMS is there; Billing Manager and EB Bill are not."""
-        _portal, page, _clock = self.route()
-        self.assertEqual(page.route, "landing")
-        self.assertEqual(page.get_by_role("button", name="EMS", exact=True).count(), 1)
-        self.assertEqual(
-            page.get_by_role("link", name="Billing Manager", exact=True).count(), 0
+    def test_structural_drift_fails_before_any_download(self) -> None:
+        cases = (
+            {"tables": 2},
+            {"header_columnheaders": 0},
+            {"download_buttons": {0: 2}},
+            {"download_buttons": {1: 0}},
+            {"stray_download_buttons": 1},
         )
-        self.assertEqual(page.get_by_role("link", name="EB Bill", exact=True).count(), 0)
+        for overrides in cases:
+            with self.subTest(**{key: str(value) for key, value in overrides.items()}):
+                _portal, page, _rows, error = self.inventory(SurfaceState(**overrides))
+                self.assertEqual(error.message, portal_module.RESULTS_UNSETTLED_MESSAGE)
+                self.assertEqual(page.download_dispatches, [])
 
-    def test_the_owner_confirmed_entry_sequence_starts_with_one_ems_click(self) -> None:
-        """E02. EMS, then Billing Manager, EB Bill, account and Search."""
-        portal, page, clock = self.route()
+    def test_a_header_only_table_fails_closed(self) -> None:
+        _portal, page, _rows, error = self.inventory(SurfaceState(rows=[]))
+        self.assertEqual(error.message, portal_module.RESULTS_HEADER_ONLY_MESSAGE)
+
+    def test_duplicate_empty_oversized_or_unreadable_row_identity_fails(self) -> None:
+        cases = (
+            ({"rows": ["Same", "Same"]}, portal_module.RESULTS_ROW_IDENTITY_MESSAGE),
+            ({"rows": ["Same  row\ntext", "Same row text"]}, portal_module.RESULTS_ROW_IDENTITY_MESSAGE),
+            ({"header_text": "Synthetic invoice 1", "rows": ["x"]}, None),
+            ({"rows": ["x" * 5000]}, portal_module.RESULTS_ROW_IDENTITY_MESSAGE),
+            ({"snapshot_error": RuntimeError("unreadable ACCT-778899")}, portal_module.RESULTS_ROW_IDENTITY_MESSAGE),
+            ({"snapshot_error": synthetic_timeout()}, portal_module.RESULTS_ROW_IDENTITY_MESSAGE),
+        )
+        for overrides, message in cases:
+            with self.subTest(case=repr(overrides)[:40]):
+                _portal, page, rows, error = self.inventory(SurfaceState(**overrides))
+                if message is None:
+                    self.assertIsNone(error)
+                    continue
+                self.assertEqual(error.message, message)
+                self.assertNotIn("ACCT", error.message)
+                self.assertEqual(page.download_dispatches, [])
+
+    def test_an_empty_row_identity_is_never_usable(self) -> None:
+        portal, _page, _clock = surface_portal()
+
+        class BlankRow:
+            def aria_snapshot(self, timeout=None):
+                return "   \n\t "
+
+        self.assertIsNone(portal._row_identity(BlankRow(), 1000))
+        portal, _page, clock = surface_portal()
+        with mock.patch.object(SurfaceLocator, "aria_snapshot", lambda self, timeout=None: " \n "):
+            with simulated_clock(clock), self.assertRaises(LayoutChangedError) as caught:
+                portal.inventory(20)
+        self.assertEqual(caught.exception.message, portal_module.RESULTS_ROW_IDENTITY_MESSAGE)
+
+    def test_normalisation_is_nfc_whitespace_and_case_preserving(self) -> None:
+        normalise = portal_module._normalise_surface_text
+        self.assertEqual(normalise("  Café\n\tBill  "), "Café Bill")
+        self.assertNotEqual(normalise("Bill"), normalise("bill"))
+
+    def test_every_pagination_sentinel_fails_closed_and_is_never_clicked(self) -> None:
+        for role in ("button", "link"):
+            for name in ("Next page", "Next", "Previous page", "Load more"):
+                with self.subTest(role=role, name=name):
+                    _portal, page, _rows, error = self.inventory(SurfaceState(pagination={(role, name)}))
+                    self.assertEqual(error.message, portal_module.RESULTS_PAGINATION_MESSAGE)
+                    self.assertFalse(any(kind.startswith("sentinel") for kind in page.clicks + page.trial_clicks))
+
+    def test_the_no_pagination_current_surface_passes(self) -> None:
+        _portal, _page, rows, error = self.inventory(SurfaceState())
+        self.assertIsNone(error)
+        self.assertEqual(len(rows), 2)
+
+    def test_aria_rowcount_is_checked_when_present(self) -> None:
+        _portal, _page, rows, error = self.inventory(SurfaceState(aria_rowcount="3"))
+        self.assertIsNone(error)
+        for declared in ("4", "2", "-1", "lots"):
+            with self.subTest(declared=declared):
+                _portal, _page, _rows, error = self.inventory(SurfaceState(aria_rowcount=declared))
+                self.assertEqual(error.message, portal_module.RESULTS_ROWCOUNT_MESSAGE)
+
+    def test_the_safety_ceiling_fails_before_any_download(self) -> None:
+        _portal, page, _rows, error = self.inventory(SurfaceState(rows=["a", "b", "c"]), ceiling=2)
+        self.assertEqual(error.message, portal_module.RESULTS_CEILING_MESSAGE)
+
+    def test_the_identity_is_a_keyed_session_digest_never_raw_text(self) -> None:
+        first, _page, _rows, _error = self.inventory(SurfaceState(rows=[PRIVATE_ROW_TEXT]))
+        second, _page, _rows, _error = self.inventory(SurfaceState(rows=[PRIVATE_ROW_TEXT]))
+        self.assertNotEqual(first._frozen_rows, second._frozen_rows, "a fresh key per portal instance")
+        for digest in first._frozen_rows:
+            self.assertEqual(len(digest), 32)
+            self.assertNotIn(PRIVATE_ROW_TEXT.encode("utf-8"), digest)
+        self.assertNotIn(PRIVATE_ROW_TEXT, repr(vars(first)))
+
+    def test_close_drops_the_session_binding(self) -> None:
+        portal, _page, rows, _error = self.inventory(SurfaceState())
+        key = portal._row_identity_key
+        portal.page = None
+        portal.close()
+        self.assertIsNone(portal._frozen_rows)
+        self.assertIsNone(portal._inventory_binding)
+        self.assertNotEqual(portal._row_identity_key, key)
+        with self.assertRaises(AppError):
+            portal.download(rows[0], Path("unused.bin"))
+
+
+class SingleSurfaceDownloadTests(unittest.TestCase):
+    """Retry versus uncertainty, drift latches and filename authority."""
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp_dir.name)
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def prepared(self, state: SurfaceState | None = None, downloads=None):
+        portal, page, clock = surface_portal(state or SurfaceState(rows=["r1", "r2", "r3"]), downloads)
         with simulated_clock(clock):
-            inventory = portal.inventory(20)
+            rows = portal.inventory(20)
+        return portal, page, clock, rows
 
-        self.assertEqual([bill.filename for bill in inventory], ["2026-01-01_synthetic.pdf"])
-        self.assertEqual(
-            page.events,
-            ["ems", "billing_manager", "eb_bill", "select_account", "search"],
-        )
-        self.assertEqual(page.ems_actuations, 1)
-        self.assertEqual(page.clicks["ems"], 1)
-
-    # ---- E03-E06: the three failure classes, on the entry itself ---- #
-
-    def test_an_ems_readiness_failure_fails_before_any_dispatch(self) -> None:
-        """E03. Not actionable is proven first, so nothing is ever clicked."""
-        page, error = self.enter(ems_actionable=False)
-        self.assertIsInstance(error, LayoutChangedError)
-        self.assertEqual(error.message, "EMS application entry control is not ready")
-        self.assertEqual(cli.support_ref_for(error), "EG_NAV_EMS_ENTRY_NOT_READY")
-        self.assertEqual(page.clicks, {}, "a readiness failure dispatches nothing")
-        self.assertEqual(page.ems_actuations, 0)
-        self.assertGreater(page.trial_clicks["ems"], 1, "actionability was re-proven")
-
-    def test_a_duplicate_ems_entry_fails_closed_without_narrowing(self) -> None:
-        """E04. Two exact matches: neither is chosen, and the selector holds."""
-        page, error = self.enter(ems_matches=2)
-        self.assertIsInstance(error, LayoutChangedError)
-        self.assertEqual(error.message, "EMS application entry control is not ready")
-        self.assertEqual(page.clicks, {}, "ambiguity is never narrowed to one control")
-        self.assertEqual(page.ems_actuations, 0)
-
-    def test_an_unreadable_ems_entry_fails_closed_without_dispatching(self) -> None:
-        """E05. A state that cannot be read is drift, not evidence of readiness."""
-        page, error = self.enter(ems_state_error=RuntimeError(STEP_FAILURE_TEXT))
-        self.assertIsInstance(error, LayoutChangedError)
-        self.assertEqual(error.message, "EMS application entry control is not ready")
-        self.assertEqual(page.clicks, {})
-        self.assertNotIn("hunter2", error.message)
-        self.assertNotIn("portal.example.invalid", error.message)
-
-    def test_an_unreadable_ems_enabled_state_is_a_pre_dispatch_failure(self) -> None:
-        """E05b. `is_enabled()` raised without timing out: readiness, not drift-as-search.
-
-        This is the path the shared ladder deliberately does not convert. It
-        leaves the probe intact, so without the caller-local classification the
-        bare browser exception reached `_open_verified_results()` and was
-        reported as a tenant/account contract failure -- a downstream identity
-        for something that happened on the landing before any click existed.
-        """
-        page, error = self.enter(ems_enabled_error=RuntimeError(STEP_FAILURE_TEXT))
-        self.assertIsInstance(error, LayoutChangedError)
-        self.assertEqual(error.message, "EMS application entry control is not ready")
-        self.assertEqual(cli.support_ref_for(error), "EG_NAV_EMS_ENTRY_NOT_READY")
-        self.assertEqual(page.clicks, {}, "a readiness failure dispatches nothing")
-        self.assertEqual(page.ems_actuations, 0)
-        self.assertEqual(page.clicks.get("billing_manager", 0), 0)
-        self.assertEqual(page.clicks.get("eb_bill", 0), 0)
-        self.assertNotIn("hunter2", error.message)
-        self.assertNotIn("portal.example.invalid", error.message)
-
-    def test_an_unreadable_ems_actionability_is_a_pre_dispatch_failure(self) -> None:
-        """E05c. The trial click raised: a probe failed, so nothing was ever sent.
-
-        A trial click is not a dispatch. Its failing for a reason that is not a
-        timeout says the control could not be proven usable, which is the same
-        pre-dispatch answer as an absent or disabled entry and must carry the
-        same reference.
-        """
-        page, error = self.enter(ems_trial_error=RuntimeError(STEP_FAILURE_TEXT))
-        self.assertIsInstance(error, LayoutChangedError)
-        self.assertEqual(error.message, "EMS application entry control is not ready")
-        self.assertEqual(cli.support_ref_for(error), "EG_NAV_EMS_ENTRY_NOT_READY")
-        self.assertEqual(page.clicks, {}, "a trial click is a probe, never a dispatch")
-        self.assertEqual(page.ems_actuations, 0)
-        self.assertEqual(page.clicks.get("billing_manager", 0), 0)
-        self.assertEqual(page.clicks.get("eb_bill", 0), 0)
-        self.assertNotIn("hunter2", error.message)
-        self.assertNotIn("portal.example.invalid", error.message)
-
-    def test_a_persistently_absent_ems_entry_is_a_pre_dispatch_failure(self) -> None:
-        """E05d. The entry never appears at all, for the whole bounded window."""
-        page, error = self.enter(ems_present=False)
-        self.assertIsInstance(error, LayoutChangedError)
-        self.assertEqual(error.message, "EMS application entry control is not ready")
-        self.assertEqual(cli.support_ref_for(error), "EG_NAV_EMS_ENTRY_NOT_READY")
-        self.assertEqual(page.clicks, {}, "an absent entry dispatches nothing")
-        self.assertEqual(page.ems_actuations, 0)
-        self.assertEqual(page.clicks.get("billing_manager", 0), 0)
-        self.assertEqual(page.clicks.get("eb_bill", 0), 0)
-
-    def test_an_ems_click_exception_is_uncertain_and_terminal(self) -> None:
-        """E06. It may have landed, so it is never sent again."""
-        page, error = self.enter(ems_click_error=RuntimeError(STEP_FAILURE_TEXT))
-        self.assertIsInstance(error, LayoutChangedError)
-        self.assertEqual(
-            error.message, "EMS application entry dispatch outcome uncertain"
-        )
-        self.assertEqual(
-            cli.support_ref_for(error), "EG_NAV_EMS_ENTRY_DISPATCH_UNCERTAIN"
-        )
-        self.assertEqual(page.clicks["ems"], 1, "never retried, never re-resolved")
-        self.assertEqual(page.clicks.get("billing_manager", 0), 0)
-        self.assertEqual(page.clicks.get("eb_bill", 0), 0)
-        self.assertNotIn("hunter2", error.message)
-
-    def test_an_inert_ems_click_stops_at_the_existing_downstream_failure(self) -> None:
-        """E07. The click landed and opened nothing: downstream says so.
-
-        The entry was consumed, so the contract does not look for it again. The
-        surface simply never became the application, which the existing Billing
-        Manager readiness failure already names exactly.
-        """
-        page, error = self.enter(ems_click_inert=True)
-        self.assertIsInstance(error, LayoutChangedError)
-        self.assertEqual(error.message, "Billing Manager navigation control is not ready")
-        self.assertEqual(
-            cli.support_ref_for(error), "EG_NAV_BILLING_MANAGER_NOT_READY"
-        )
-        self.assertEqual(page.ems_actuations, 1, "exactly one actuation, and no retry")
-        self.assertEqual(page.clicks["ems"], 1)
-
-    # ---- E08: readiness still recovers, and still clicks once ---- #
-
-    def test_a_delayed_ems_entry_is_recovered_and_clicked_once(self) -> None:
-        """E08. The shared bounded ladder owns the waiting, not a second one."""
-        portal, page, clock = self.route(ems_delay=3, ems_actionable_delay=1)
+    def download(self, portal, clock, row, name="download.bin"):
         with simulated_clock(clock):
-            inventory = portal.inventory(20)
+            return portal.download(row, self.root / name)
 
-        self.assertEqual(len(inventory), 1)
-        self.assertEqual(page.clicks["ems"], 1)
-        self.assertEqual(page.ems_actuations, 1)
-        self.assertGreater(page.looks["ems"], 3, "each look resolved a fresh locator")
-        self.assertTrue(clock.yields, "the delay was waited out, not polled tightly")
-
-    def test_an_ems_entry_that_never_settles_costs_exactly_one_window(self) -> None:
-        """E08b. The entry gets one bounded window, and then fails closed."""
-        portal, page, clock = self.route(ems_visible_delay=10 ** 6)
-        with simulated_clock(clock):
-            with self.assertRaises(LayoutChangedError) as caught:
-                portal._enter_ems_application(page)
-
-        self.assertEqual(
-            caught.exception.message, "EMS application entry control is not ready"
+    def test_the_suggested_filename_is_returned_only_after_a_saved_download(self) -> None:
+        portal, page, clock, rows = self.prepared(
+            downloads={0: [{"kind": "ok", "name": "2026-09-30_authoritative.pdf", "payload": synthetic_pdf(b"x")}]}
         )
-        self.assertEqual(page.clicks, {}, "an unsettled entry dispatches nothing")
-        self.assertLessEqual(clock.elapsed_ms(), RECOVERY_CEILING_MS)
+        self.assertEqual(self.download(portal, clock, rows[0]), "2026-09-30_authoritative.pdf")
+        self.assertEqual((self.root / "download.bin").read_bytes(), synthetic_pdf(b"x"))
+        self.assertEqual(page.download_dispatches, [0])
+        self.assertEqual(page.expect_download_timeouts, [ResultsConfig.timeout_seconds * 1000])
 
-    # ---- E09: the selector is exact, and stays exact ---- #
+    def test_every_row_downloads_once_in_order(self) -> None:
+        portal, page, clock, rows = self.prepared()
+        names = [self.download(portal, clock, row, f"row{row.ordinal}.bin") for row in rows]
+        self.assertEqual(page.download_dispatches, [0, 1, 2])
+        self.assertEqual(len(set(names)), 3)
 
-    def test_the_ems_entry_selector_is_exact_and_never_weakened(self) -> None:
-        """E09. Role button, name EMS, exact -- and no second mechanism."""
-        seen: list[tuple] = []
+    def test_a_positively_observed_failure_is_retryable_and_re_proves_the_surface(self) -> None:
+        for kind in ("failure", "save_error"):
+            with self.subTest(kind=kind):
+                portal, page, clock, rows = self.prepared(downloads={0: [{"kind": kind}, {"kind": "ok"}]})
+                with self.assertRaises(DownloadError) as caught:
+                    self.download(portal, clock, rows[0])
+                self.assertTrue(caught.exception.retryable)
+                self.assertNotIn("portal.example.invalid", caught.exception.message)
+                lookups_before = len(page.role_lookups)
+                self.assertTrue(self.download(portal, clock, rows[0]))
+                self.assertEqual(page.download_dispatches, [0, 0])
+                retry_lookups = page.role_lookups[lookups_before:]
+                self.assertIn(("tab", "EB Bill", True), retry_lookups, "the retry re-proves the tab")
+                self.assertIn(("table", None, False), retry_lookups, "the retry re-reads the table")
 
-        class SelectorRecorder(FakeResultsPage):
-            def get_by_role(self, role, name=None, exact=False):
-                seen.append((role, name, exact))
-                return super().get_by_role(role, name=name, exact=exact)
+    def test_uncertain_dispatches_latch_and_block_every_later_row(self) -> None:
+        for kind in ("click_error", "no_event", "popup", "tab_lost"):
+            with self.subTest(kind=kind):
+                portal, page, clock, rows = self.prepared(downloads={0: [{"kind": kind}]})
+                with self.assertRaises(AppError) as caught:
+                    self.download(portal, clock, rows[0])
+                self.assertEqual(caught.exception.status, "DOWNLOAD_FAILED")
+                self.assertFalse(caught.exception.retryable)
+                self.assertEqual(caught.exception.message, portal_module.DOWNLOAD_UNCERTAIN_MESSAGE)
+                self.assertNotIn("hunter2", caught.exception.message)
+                for row in (rows[0], rows[1]):
+                    with self.assertRaises(LayoutChangedError) as latched:
+                        self.download(portal, clock, row)
+                    self.assertEqual(latched.exception.message, portal_module.RESULTS_LATCHED_MESSAGE)
+                self.assertEqual(page.download_dispatches, [0], "exactly one uncertain dispatch")
 
-            def get_by_text(self, *args, **kwargs):
-                raise AssertionError("the entry never resolves a control by text")
+    def test_a_missing_suggested_filename_latches(self) -> None:
+        portal, page, clock, rows = self.prepared(downloads={0: [{"kind": "ok", "name": ""}]})
+        with self.assertRaises(DownloadError) as caught:
+            self.download(portal, clock, rows[0])
+        self.assertFalse(caught.exception.retryable)
+        with self.assertRaises(LayoutChangedError):
+            self.download(portal, clock, rows[1])
+        self.assertEqual(page.download_dispatches, [0])
 
-        clock = RecoveryClock()
-        page = SelectorRecorder(clock=clock)
-        portal = PlaywrightPortal(ResultsConfig(), headed=False)
-        portal.page = page
-        with simulated_clock(clock):
-            portal._enter_ems_application(page)
-
-        self.assertEqual(
-            [entry for entry in seen if entry[1] == "EMS"],
-            [("button", "EMS", True)],
-            "one exact resolution, by role and name only",
+    def test_a_different_suggested_filename_on_retry_latches(self) -> None:
+        portal, page, clock, rows = self.prepared(
+            downloads={0: [{"kind": "save_error", "name": "2026-01-01_a.pdf"}, {"kind": "ok", "name": "2026-01-01_b.pdf"}]}
         )
+        with self.assertRaises(DownloadError):
+            self.download(portal, clock, rows[0])
+        with self.assertRaises(LayoutChangedError) as caught:
+            self.download(portal, clock, rows[0])
+        self.assertEqual(caught.exception.message, portal_module.RESULTS_FILENAME_CHANGED_MESSAGE)
+        with self.assertRaises(LayoutChangedError):
+            self.download(portal, clock, rows[1])
+        self.assertEqual(page.download_dispatches, [0, 0])
+
+    def test_row_reorder_or_text_drift_latches_before_the_next_dispatch(self) -> None:
+        mutations = {
+            "reorder": lambda state: state.rows.reverse(),
+            "text": lambda state: state.rows.__setitem__(1, "r2 (viewed)"),
+            "header": lambda state: setattr(state, "header_text", "Invoice Action Status"),
+            "row_added": lambda state: state.rows.append("r4"),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(drift=label):
+                portal, page, clock, rows = self.prepared(downloads={0: [{"kind": "ok", "after": mutate}]})
+                self.download(portal, clock, rows[0])
+                with self.assertRaises(LayoutChangedError) as caught:
+                    self.download(portal, clock, rows[1], "second.bin")
+                self.assertEqual(caught.exception.message, portal_module.RESULTS_SURFACE_CHANGED_MESSAGE)
+                with self.assertRaises(LayoutChangedError) as latched:
+                    self.download(portal, clock, rows[2], "third.bin")
+                self.assertEqual(latched.exception.message, portal_module.RESULTS_LATCHED_MESSAGE)
+                self.assertEqual(page.download_dispatches, [0])
+
+    def test_a_lost_tab_or_account_witness_before_dispatch_latches(self) -> None:
+        mutations = {
+            "tab": lambda state: (setattr(state, "eb_selected", False), setattr(state, "tenant_selected", True)),
+            "witness": lambda state: setattr(state, "witnesses", [True, True]),
+            "pagination": lambda state: setattr(state, "pagination", {("button", "Load more")}),
+            "topology": lambda state: setattr(state, "extra_pages", 1),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(drift=label):
+                portal, page, clock, rows = self.prepared()
+                mutate(page.state)
+                with self.assertRaises(LayoutChangedError) as caught:
+                    self.download(portal, clock, rows[0])
+                self.assertEqual(caught.exception.message, portal_module.RESULTS_SURFACE_CHANGED_MESSAGE)
+                self.assertEqual(page.download_dispatches, [])
+                self.assertTrue(portal._latched)
+
+    def test_foreign_expired_or_forged_handles_fail_before_any_dispatch(self) -> None:
+        portal, page, clock, rows = self.prepared()
+        other, _other_page, other_clock, other_rows = self.prepared()
+        forged = (
+            other_rows[0],
+            portal_module.InvoiceRow(ordinal=0, binding=object()),
+            portal_module.InvoiceRow(ordinal=3, binding=rows[0].binding),
+            portal_module.InvoiceRow(ordinal=-1, binding=rows[0].binding),
+            portal_module.InvoiceRow(ordinal=True, binding=rows[0].binding),
+            "row-0",
+        )
+        for handle in forged:
+            with self.subTest(handle=repr(handle)):
+                with self.assertRaises(LayoutChangedError) as caught:
+                    self.download(portal, clock, handle)
+                self.assertEqual(caught.exception.message, portal_module.RESULTS_ROW_HANDLE_MESSAGE)
+        self.assertEqual(page.download_dispatches, [])
+        fresh = PlaywrightPortal(ResultsConfig(), headed=False)
+        fresh.page = page
+        with self.assertRaises(LayoutChangedError):
+            fresh.download(rows[0], self.root / "x.bin")
+        self.assertEqual(page.download_dispatches, [])
+
+    def test_download_errors_never_carry_private_values(self) -> None:
+        state = SurfaceState(rows=[PRIVATE_ROW_TEXT, "r2"])
+        portal, page, clock, rows = self.prepared(
+            state, downloads={0: [{"kind": "save_error", "name": "2026-PRIVATE-ACCT-778899.pdf"}]}
+        )
+        with self.assertRaises(DownloadError) as caught:
+            self.download(portal, clock, rows[0])
+        text = caught.exception.message + repr(caught.exception.args)
+        for private in ("ACCT-778899", PRIVATE_ROW_TEXT, ResultsConfig.account_identity, "portal.example.invalid"):
+            self.assertNotIn(private, text)
+
+
+class SingleSurfaceSourceIsolationTests(unittest.TestCase):
+    """The production section depends on none of the retired contracts."""
+
+    def production_source(self) -> str:
         source = pathlib_read_portal_source()
-        entry = source[
-            source.index("def _enter_ems_application") : source.index(
-                "def _open_eb_bill_route"
-            )
-        ]
-        for forbidden in (".first", "get_by_text", "dispatch_event", "press("):
+        start = source.index("    # ---- inventory ---- #")
+        end = source.index("    # ---- diagnostic-owned route helpers ---- #")
+        return source[start:end]
+
+    def test_no_testid_filename_attribute_href_or_selector_dependency(self) -> None:
+        body = self.production_source()
+        for forbidden in (
+            "get_by_test_id",
+            "data-filename",
+            '"href"',
+            "select_option",
+            "option",
+            "get_by_label",
+            "page.url",
+            ".first",
+            "goto",
+            "reload",
+            "EMS_ENTRY_NAV_NAME",
+            "BILLING_MANAGER_NAV_NAME",
+            "EB_BILL_NAV_NAME",
+            "_eb_bill_locator",
+            "_route_path",
+            "_navigation_",
+            "text_content",
+            "inner_text",
+            "inner_html",
+        ):
             with self.subTest(forbidden=forbidden):
-                self.assertNotIn(forbidden, entry)
-        self.assertEqual(entry.count("control.click()"), 1, "one dispatch, and only one")
+                self.assertNotIn(forbidden, body)
 
-    # ---- E10: a restored results address never re-enters the application ---- #
+    def test_the_production_path_never_calls_the_diagnostic(self) -> None:
+        body = self.production_source()
+        self.assertNotIn("navigation_diagnostic", body)
+        self.assertNotIn("login_diagnostic", body)
+        self.assertNotIn("self.login(", body)
 
-    def test_a_restored_results_address_never_re_actuates_ems(self) -> None:
-        """E10. Inventory then download is one EMS actuation in total."""
-        portal, page, clock = self.route(pages=(("a.pdf", "b.pdf"), ("c.pdf",)))
-        with tempfile.TemporaryDirectory() as directory:
-            with simulated_clock(clock):
-                inventory = portal.inventory(20)
-                self.assertEqual(page.ems_actuations, 1)
-                portal.download(inventory[0], Path(directory) / "download.bin")
-
-        self.assertEqual(
-            page.ems_actuations, 1, "a restored address is already inside the application"
-        )
-        self.assertEqual(page.clicks["ems"], 1)
-        self.assertIn("goto", page.events)
-
-    # ---- E11: the two EMS symbols are separate, and must stay in step ---- #
-
-    def test_the_authentication_witness_and_the_business_entry_stay_in_step(self) -> None:
-        """E11. Same text today, separate symbols, and drift is caught here.
-
-        Authentication reads a witness; business navigation clicks a control.
-        They are declared apart so either can move on its own -- and this case
-        is what makes moving one of them a decision rather than an accident.
-        """
-        self.assertEqual(portal_module.AUTHENTICATION_WITNESS_ROLE, "button")
-        self.assertEqual(portal_module.AUTHENTICATION_WITNESS_NAME, "EMS")
-        self.assertEqual(portal_module.EMS_ENTRY_NAV_NAME, "EMS")
-        self.assertEqual(
-            portal_module.EMS_ENTRY_NAV_NAME,
-            portal_module.AUTHENTICATION_WITNESS_NAME,
-            "the landing witness and the application entry currently name one control",
-        )
+    def test_the_diagnostic_still_owns_its_route_helpers(self) -> None:
         source = pathlib_read_portal_source()
-        self.assertIn('EMS_ENTRY_NAV_NAME = "EMS"', source)
-        self.assertIn('AUTHENTICATION_WITNESS_NAME = "EMS"', source)
-        entry = source[
-            source.index("def _enter_ems_application") : source.index(
-                "def _open_eb_bill_route"
-            )
-        ]
-        self.assertIn("EMS_ENTRY_NAV_NAME", entry)
-        self.assertNotIn(
-            "AUTHENTICATION_WITNESS_NAME",
-            entry,
-            "business navigation never clicks the authentication witness symbol",
-        )
+        helpers = source[source.index("    # ---- diagnostic-owned route helpers ---- #"):]
+        self.assertIn('return page.get_by_role("link", name=EB_BILL_NAV_NAME, exact=True)', helpers)
+        self.assertIn('return path.rstrip("/") or "/"', helpers)
+        diagnostic = source[source.index("def navigation_diagnostic") : source.index("    # ---- inventory ---- #")]
+        self.assertIn("self._eb_bill_locator(page)", diagnostic)
 
-
-class BusinessNavigationReferenceTests(unittest.TestCase):
-    """Completeness in both directions for the navigation vocabulary."""
-
-    NAVIGATION_BRANCHES = (
-        {"start_route": "app", "billing_manager_actionable": False},
-        {
-            "start_route": "app",
-            "billing_manager_click_error": RuntimeError(STEP_FAILURE_TEXT),
-        },
-        {"start_route": "app", "eb_bill_actionable": False},
-        {"start_route": "billing", "eb_bill_click_error": RuntimeError(STEP_FAILURE_TEXT)},
-        {"start_route": "billing", "eb_bill_click_inert": True},
-    )
-
-    # The EMS application entry is reached from `_open_verified_results()`
-    # rather than from `_open_eb_bill_route()`, so its two references are driven
-    # through the entry point that owns them.
-    EMS_ENTRY_BRANCHES = (
-        {"ems_actionable": False},
-        {"ems_click_error": RuntimeError(STEP_FAILURE_TEXT)},
-    )
-
-    def drive(self, kwargs, entry: str):
-        """Run one navigation branch through the entry point that owns it."""
-        clock = RecoveryClock()
-        page = FakeResultsPage(clock=clock, **kwargs)
-        portal = PlaywrightPortal(ResultsConfig(), headed=False)
-        portal.page = page
-        with simulated_clock(clock):
-            with self.assertRaises(LayoutChangedError) as caught:
-                if entry == "ems":
-                    portal._open_verified_results()
-                else:
-                    portal._open_eb_bill_route(page)
-        return page, caught.exception
-
-    def branches(self):
-        for kwargs in self.NAVIGATION_BRANCHES:
-            yield kwargs, "eb_bill_route"
-        for kwargs in self.EMS_ENTRY_BRANCHES:
-            yield kwargs, "ems"
-
-    def test_every_navigation_reference_is_reachable_and_none_is_unmapped(self) -> None:
+    def test_every_production_reference_is_reachable_and_mapped(self) -> None:
+        """The declared production navigation vocabulary equals what inventory raises."""
         reached: set[str] = set()
-        for kwargs, entry in self.branches():
-            _page, error = self.drive(kwargs, entry)
-            self.assertIn(error.message, cli.SUPPORT_REFS_BY_MESSAGE, error.message)
-            reached.add(cli.support_ref_for(error))
-            # Nothing the raised exception carried may survive into a message.
-            self.assertNotIn("hunter2", error.message)
-            self.assertNotIn("portal.example.invalid", error.message)
-        self.assertEqual(
-            reached,
-            set(cli.NAVIGATION_SUPPORT_REFS),
-            "the declared navigation vocabulary and its reachable branches must match",
+        scenarios = (
+            SurfaceState(eb_tab_role="link"),
+            SurfaceState(tab_click_error=RuntimeError("x")),
+            SurfaceState(tab_click_selects=False),
+            SurfaceState(witnesses=[]),
+            SurfaceState(witnesses=[True, True]),
+            SurfaceState(search_absent_looks=10_000),
+            SurfaceState(search_click_error=RuntimeError("x")),
+            SurfaceState(extra_pages=1),
+            SurfaceState(tables=0),
+            SurfaceState(rows=[]),
+            SurfaceState(pagination={("button", "Next")}),
+            SurfaceState(aria_rowcount="9"),
+            SurfaceState(rows=["dup", "dup"]),
+            SurfaceState(rows=["a", "b", "c", "d"]),
         )
+        for state in scenarios:
+            portal, _page, clock = surface_portal(state)
+            with simulated_clock(clock), self.assertRaises(LayoutChangedError) as caught:
+                portal.inventory(3)
+            self.assertIn(caught.exception.message, cli.SUPPORT_REFS_BY_MESSAGE)
+            reached.add(cli.support_ref_for(caught.exception))
+        portal, _page, clock = surface_portal()
+        with simulated_clock(clock):
+            portal.inventory(20)
+            with self.assertRaises(LayoutChangedError) as caught:
+                portal.inventory(20)
+        reached.add(cli.support_ref_for(caught.exception))
+        self.assertEqual(reached, set(cli.NAVIGATION_SUPPORT_REFS))
         self.assertTrue(reached.isdisjoint(cli.RETIRED_SUPPORT_REFS))
-
-    def test_a_navigation_failure_never_reports_a_login_reference(self) -> None:
-        """Business navigation after a proven landing is never a login failure."""
-        for kwargs, entry in self.branches():
-            _page, error = self.drive(kwargs, entry)
-            reference = cli.support_ref_for(error)
-            with self.subTest(reference=reference):
-                self.assertFalse(reference.startswith("EG_LOGIN_"))
-                self.assertNotEqual(reference, cli.UNCLASSIFIED_SUPPORT_REF)
+        self.assertTrue(all(not ref.startswith("EG_LOGIN_") for ref in reached))
+        self.assertTrue(reached.isdisjoint(cli.NAVIGATION_DIAGNOSTIC_ALLOWED_SUPPORT_REFS))
 
 
 # ---- DL-XB-141-PORTAL-RESILIENCE-002: single dispatch on the login route ---- #
@@ -5154,17 +4151,15 @@ class LoginDiagnosticSequenceTests(unittest.TestCase):
             "_await_authenticated_landing",
             "inventory",
             "download",
-            "_open_verified_results",
-            "_open_eb_bill_route",
-            "_eb_bill_route_proven",
-            "_settle_eb_bill_entry",
-            "_observe_eb_bill_entry",
-            "_dispatch_billing_manager",
-            "_dispatch_eb_bill",
-            "_await_invoice_list",
-            "_advance_page",
-            "_restore_page",
-            "_resolve_pagination_control",
+            "_select_eb_bill_tab",
+            "_eb_bill_tab_state",
+            "_await_account_witness",
+            "_account_witness_count",
+            "_dispatch_search",
+            "_await_settled_results",
+            "_read_results_surface",
+            "_reprove_frozen_surface",
+            "_row_identity",
         )
 
         def explode(*_args, **_kwargs):
@@ -5940,8 +4935,8 @@ class LoginDiagnosticUnexpectedFailureTests(unittest.TestCase):
         with contextlib.ExitStack() as stack:
             for name in (
                 "_await_authenticated_landing",
-                "_open_verified_results",
-                "_open_eb_bill_route",
+                "_select_eb_bill_tab",
+                "_dispatch_search",
                 "inventory",
                 "download",
             ):
@@ -6520,7 +5515,7 @@ class NavigationDiagnosticStateMachineTests(unittest.TestCase):
         self.assertTrue(all(name in {"EMS", "Billing Manager", "EB Bill"} for _role, name, _exact in page.role_lookups))
         source = pathlib_read_portal_source()
         body = source[source.index("def navigation_diagnostic") : source.index("# ---- inventory ----")]
-        for forbidden in ("_open_verified_results", "_open_eb_bill_route", "_dispatch_billing_manager", "_dispatch_eb_bill", ".first", "get_by_text", "reload"):
+        for forbidden in ("_open_verified_results", "_open_eb_bill_route", "_dispatch_billing_manager", "_dispatch_eb_bill", "_select_eb_bill_tab", "_dispatch_search", "_await_settled_results", "_reprove_frozen_surface", "inventory(", "download(", ".first", "get_by_text", "reload"):
             self.assertNotIn(forbidden, body)
 
 

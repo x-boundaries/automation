@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
 import os
+import re
+import secrets
 import time
+import unicodedata
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -9,7 +14,14 @@ from typing import Any
 from urllib.parse import urljoin, urlparse
 
 from .config import RuntimeConfig
-from .errors import AppError, DependencyError, DownloadError, LayoutChangedError, LoginError
+from .errors import (
+    DOWNLOAD_FAILED,
+    AppError,
+    DependencyError,
+    DownloadError,
+    LayoutChangedError,
+    LoginError,
+)
 
 
 # One shared bounded readiness and post-action settling contract for every
@@ -231,32 +243,99 @@ DIAGNOSTIC_CONTINUABLE_CLASSIFICATIONS = (
     AUTHENTICATION_UNPROVED,
 )
 
-# ---- business navigation (Contract B) ---- #
+# ---- historical business navigation names (navigation diagnostic only) ---- #
 #
-# The exact controls `_open_verified_results()` owns after authentication. They
-# are business navigation, never authentication evidence, and each message
-# below distinguishes a pre-dispatch readiness failure from an uncertain
-# dispatch and from a postcondition that never became proven.
-#
-# The authenticated landing is not itself the business surface
-# (DL-XB-141-EMS-ENTRY-MINIMAL-REPAIR-G2-136): entering the EMS application is
-# the first business navigation step, and it is named here rather than borrowed
-# from the authentication witness. `EMS_ENTRY_NAV_NAME` and
+# The historical EMS / Billing Manager / EB Bill link route. Since DL-XB-199
+# the production path no longer uses any of these: they remain because the
+# separate navigation diagnostic still observes them, and that diagnostic is
+# deliberately not rewritten in this lineage. `EMS_ENTRY_NAV_NAME` and
 # `AUTHENTICATION_WITNESS_NAME` currently carry the same text and stay
 # deliberately separate symbols, because they answer different questions -- one
-# is the evidence a landing is authenticated, the other is the control that is
-# clicked -- and either may move without the other.
+# is the evidence a landing is authenticated, the other is the control the
+# diagnostic clicks -- and either may move without the other.
 EMS_ENTRY_NAV_NAME = "EMS"
 BILLING_MANAGER_NAV_NAME = "Billing Manager"
 EB_BILL_NAV_NAME = "EB Bill"
 
 NAV_EMS_ENTRY_NOT_READY_MESSAGE = "EMS application entry control is not ready"
 NAV_EMS_ENTRY_UNCERTAIN_MESSAGE = "EMS application entry dispatch outcome uncertain"
-NAV_BILLING_MANAGER_NOT_READY_MESSAGE = "Billing Manager navigation control is not ready"
-NAV_BILLING_MANAGER_UNCERTAIN_MESSAGE = "Billing Manager navigation dispatch outcome uncertain"
-NAV_EB_BILL_NOT_READY_MESSAGE = "EB Bill navigation control is not ready"
-NAV_EB_BILL_UNCERTAIN_MESSAGE = "EB Bill navigation dispatch outcome uncertain"
-NAV_RESULTS_ROUTE_UNPROVED_MESSAGE = "EB Bill results route was not proven"
+
+# ---- production single-surface contract (DL-XB-199, G2-076) ---- #
+#
+# The exact accessible names the production path resolves. `EB_BILL_TAB_NAME`
+# is the live `tab` and stays a separate symbol from the diagnostic's
+# historical `EB_BILL_NAV_NAME` link, although both carry the same text.
+EB_BILL_TAB_NAME = "EB Bill"
+TENANT_BILL_TAB_NAME = "Tenant Bill"
+SEARCH_BUTTON_NAME = "Search"
+DOWNLOAD_BUTTON_NAME = "Download"
+
+# Inspection-only pagination/completeness sentinels. Any exact button or link
+# with one of these names fails the results closed; none is ever clicked, and
+# their absence is NOT a proof that all invoice history is rendered
+# (PRE_SCHEDULER_RESULT_COMPLETENESS_EVIDENCE_REQUIRED=YES).
+RESULTS_PAGINATION_SENTINEL_NAMES = ("Next page", "Next", "Previous page", "Load more")
+
+# A normalised row accessible text longer than this is unreadable, not usable.
+RESULTS_ROW_TEXT_MAX_CHARS = 4096
+
+# Fixed public-safe messages. Each names the contract that failed and never
+# what was observed: no row text, digest, filename, account text or address.
+EB_BILL_TAB_NOT_READY_MESSAGE = "EB Bill tab is not ready"
+EB_BILL_TAB_UNCERTAIN_MESSAGE = "EB Bill tab dispatch outcome uncertain"
+EB_BILL_TAB_UNPROVED_MESSAGE = "EB Bill tab selection was not proven"
+ACCOUNT_WITNESS_UNPROVED_MESSAGE = "configured account witness was not proven"
+ACCOUNT_WITNESS_AMBIGUOUS_MESSAGE = "configured account witness is ambiguous"
+SEARCH_NOT_READY_MESSAGE = "Search control is not ready"
+SEARCH_UNCERTAIN_MESSAGE = "Search dispatch outcome uncertain"
+RESULTS_TOPOLOGY_MESSAGE = "portal page topology is not unique"
+RESULTS_UNSETTLED_MESSAGE = "invoice results table did not settle"
+RESULTS_HEADER_ONLY_MESSAGE = "invoice results table has no invoice rows"
+RESULTS_PAGINATION_MESSAGE = "invoice results expose a pagination sentinel"
+RESULTS_ROWCOUNT_MESSAGE = "invoice results row count is contradictory"
+RESULTS_ROW_IDENTITY_MESSAGE = "invoice results row identity is invalid"
+RESULTS_CEILING_MESSAGE = "invoice results safety ceiling exceeded"
+RESULTS_INVENTORY_CONSUMED_MESSAGE = "invoice results inventory was already taken"
+
+# Download-time messages. These end one row's acquisition inside reconcile and
+# are reported by status only; they are never a terminal run reference.
+RESULTS_SURFACE_CHANGED_MESSAGE = "invoice results surface changed"
+RESULTS_LATCHED_MESSAGE = "invoice downloads are latched after an earlier failure"
+RESULTS_ROW_HANDLE_MESSAGE = "invoice row handle is not valid for this inventory"
+RESULTS_FILENAME_CHANGED_MESSAGE = "invoice download filename changed across attempts"
+DOWNLOAD_UNCERTAIN_MESSAGE = "invoice download dispatch outcome uncertain"
+
+# Returns one boolean per matched node: true when it sits outside every table,
+# grid, row and cell semantic. It reads no text and returns nothing else.
+_OUTSIDE_RESULTS_PREDICATE = """
+(nodes) => nodes.map((node) => !node.closest(
+  'table, thead, tbody, tfoot, tr, td, th, [role="table"], [role="grid"], '
+  + '[role="treegrid"], [role="rowgroup"], [role="row"], [role="cell"], '
+  + '[role="gridcell"], [role="columnheader"], [role="rowheader"]'
+))
+"""
+
+_TAB_SELECTED = "selected"
+_TAB_UNSELECTED = "unselected"
+_TAB_ABSENT = "absent"
+_TAB_AMBIGUOUS = "ambiguous"
+_TAB_CONTRADICTORY = "contradictory"
+
+# A bounded attribute read that timed out. Distinct from `None`, which is a
+# positively read absent attribute.
+_UNREAD = object()
+
+
+def _normalise_surface_text(text: str) -> str:
+    """NFC, collapse whitespace, strip. Deliberately no casefold."""
+
+    return re.sub(r"\s+", " ", unicodedata.normalize("NFC", text)).strip()
+
+
+def _uncertain_download() -> AppError:
+    """The one non-retryable uncertain-dispatch download failure."""
+
+    return AppError(DOWNLOAD_UNCERTAIN_MESSAGE, status=DOWNLOAD_FAILED, retryable=False)
 
 # ---- bounded navigation diagnostic ---- #
 #
@@ -376,13 +455,6 @@ NAVIGATION_DIAGNOSTIC_OUTPUT_REJECTED_MESSAGE = (
 
 _NAVIGATION_DIAGNOSTIC_COUNT_GT_ONE = ">1"
 
-# What one bounded EB Bill entry observation concluded. Only these three are
-# routing decisions. Ambiguity and an unreadable state are deliberately absent:
-# they are drift, they never become a decision, and they fail closed.
-_EB_BILL_ENTRY_ROUTE_PROVEN = "route proven"
-_EB_BILL_ENTRY_DIRECT_READY = "direct ready"
-_EB_BILL_ENTRY_OUTER = "outer required"
-
 # The one-shot submit boundary, reported rather than inferred.
 SUBMIT_DISPATCHED = "DISPATCHED"
 SUBMIT_DISPATCH_UNCERTAIN = "DISPATCH_UNCERTAIN"
@@ -458,9 +530,16 @@ class _PortalNotSettled(Exception):
 
 
 @dataclass(frozen=True)
-class BillRef:
-    filename: str
-    page_url: str
+class InvoiceRow:
+    """Opaque pre-download handle: no filename, row text or digest.
+
+    `binding` is valid only for the exact inventory episode of the portal
+    instance that issued it, and it is excluded from `repr` so no debug surface
+    can display it. The authoritative invoice name exists only after Download.
+    """
+
+    ordinal: int
+    binding: object = field(repr=False)
 
 
 @dataclass
@@ -598,8 +677,15 @@ class PlaywrightPortal:
         self.browser: Any = None
         self.context: Any = None
         self.page: Any = None
-        self._page_bindings: dict[str, tuple[int, str]] = {}
-        self._results_entry_url: str | None = None
+        # Private one-session results binding (DL-XB-199). The key, the frozen
+        # row digests and the learned filenames never leave this instance.
+        self._row_identity_key = secrets.token_bytes(32)
+        self._inventory_taken = False
+        self._inventory_binding: object | None = None
+        self._frozen_rows: tuple[bytes, ...] | None = None
+        self._safety_ceiling = 0
+        self._row_filenames: dict[int, str] = {}
+        self._latched = False
 
     def __enter__(self) -> "PlaywrightPortal":
         try:
@@ -635,6 +721,11 @@ class PlaywrightPortal:
         self.context = None
         self.browser = None
         self.playwright = None
+        # Drop the session binding; a closed instance can never download.
+        self._row_identity_key = secrets.token_bytes(32)
+        self._inventory_binding = None
+        self._frozen_rows = None
+        self._row_filenames = {}
 
     # ---- shared bounded recovery ---- #
 
@@ -2201,427 +2292,522 @@ class PlaywrightPortal:
         return NAVIGATION_DIAGNOSTIC_POST_EMS_WINDOW_EXHAUSTED, post
 
     # ---- inventory ---- #
+    #
+    # DL-XB-199 download-first production path (G2-076 as adjudicated by Web).
+    # The live portal serves one surface: the authenticated landing carries an
+    # exact `tab "EB Bill"`, a visible account witness, an exact `button
+    # "Search"` and, after one Search, one role table whose invoice rows each
+    # carry exactly one Download button. Nothing on this path touches EMS,
+    # Billing Manager, a link, a tenant selector, a test id, a filename
+    # attribute or an address. The separate navigation diagnostic above keeps
+    # its own historical helpers and is never called from here.
 
-    def inventory(self, safety_ceiling: int) -> list[BillRef]:
+    def inventory(self, safety_ceiling: int) -> list[InvoiceRow]:
+        """Bind the settled results table once and return opaque row handles.
+
+        One portal instance owns exactly one inventory episode. The episode is
+        consumed before anything is inspected, so a failed inventory cannot be
+        retried on the same instance and a second call never re-dispatches
+        Search. The handles carry an ordinal and an opaque binding only: no
+        filename, no row text and no digest ever leaves this class.
+        """
+
+        if self._inventory_taken:
+            raise LayoutChangedError(RESULTS_INVENTORY_CONSUMED_MESSAGE)
+        self._inventory_taken = True
         page = self._require_page()
-        self._page_bindings = {}
-        self._results_entry_url = None
-        self._open_verified_results()
-        self._results_entry_url = page.url
-        bills: list[BillRef] = []
-        seen_pages: set[str] = set()
-        page_ordinal = 1
-        while True:
-            list_container = self._await_invoice_list(page)
-            page_marker = self._page_marker(page, list_container)
-            if page_marker in seen_pages:
-                raise LayoutChangedError("invoice pagination repeated a page")
-            seen_pages.add(page_marker)
+        self._require_unique_page(page, RESULTS_TOPOLOGY_MESSAGE)
+        self._select_eb_bill_tab(page)
+        self._await_account_witness(page)
+        self._dispatch_search(page)
+        frozen = self._await_settled_results(page, safety_ceiling)
+        # Inspection-only re-proof on the settled surface: nothing is clicked,
+        # and an unreadable answer fails closed like a wrong one.
+        self._require_unique_page(page, RESULTS_TOPOLOGY_MESSAGE)
+        try:
+            selected = self._eb_bill_tab_state(page, MAX_PORTAL_PROBE_TIMEOUT_MS) == _TAB_SELECTED
+        except Exception as exc:
+            raise LayoutChangedError(EB_BILL_TAB_UNPROVED_MESSAGE) from exc
+        if not selected:
+            raise LayoutChangedError(EB_BILL_TAB_UNPROVED_MESSAGE)
+        try:
+            witnessed = self._account_witness_count(page) == 1
+        except Exception as exc:
+            raise LayoutChangedError(ACCOUNT_WITNESS_UNPROVED_MESSAGE) from exc
+        if not witnessed:
+            raise LayoutChangedError(ACCOUNT_WITNESS_UNPROVED_MESSAGE)
+        binding = object()
+        self._inventory_binding = binding
+        self._frozen_rows = frozen
+        self._safety_ceiling = safety_ceiling
+        return [InvoiceRow(ordinal=index, binding=binding) for index in range(len(frozen) - 1)]
 
-            if len(seen_pages) > safety_ceiling:
-                raise LayoutChangedError("invoice pagination safety ceiling exceeded")
-            rows = page.get_by_test_id("invoice-row")
-            row_count = rows.count()
-            if row_count == 0:
-                if not self._visible(page, page.get_by_test_id("invoice-list-empty")):
-                    raise LayoutChangedError("invoice list has neither rows nor an empty marker")
-            for row in rows.all():
-                filename = row.get_attribute("data-filename")
-                if not filename:
-                    raise LayoutChangedError("invoice row has no filename identity")
-                if row.get_by_role("button", name="Download", exact=True).count() != 1:
-                    raise LayoutChangedError("invoice row has an ambiguous download control")
-                if filename in self._page_bindings:
-                    raise LayoutChangedError("invoice filename is duplicated across the inventory")
-                bill = BillRef(filename=filename, page_url=page.url)
-                self._page_bindings[filename] = (page_ordinal, page_marker)
-                bills.append(bill)
-                if len(bills) > safety_ceiling:
-                    raise LayoutChangedError("inventory safety ceiling exceeded")
+    def _require_unique_page(self, page: Any, message: str) -> None:
+        """Require the browser context to hold exactly the one bound page."""
 
-            _control, disabled = self._resolve_pagination_control(
-                page, "invoice pagination control is missing or ambiguous"
-            )
-            if disabled:
-                # A disabled Next page is the committed end-of-inventory
-                # signal, not lag: the results are already confirmed
-                # post-search and this page's list is visible, so it is read
-                # once and trusted rather than waited out.
-                return bills
-            self._advance_page(page, page_marker, page.url, "invoice pagination did not advance")
-            page_ordinal += 1
+        try:
+            pages = list(self.context.pages)
+            unique = len(pages) == 1 and pages[0] is page
+        except Exception as exc:
+            raise LayoutChangedError(message) from exc
+        if not unique:
+            raise LayoutChangedError(message)
 
-    def _await_invoice_list(self, page: Any) -> Any:
-        """Settle on the one visible invoice list container for this page."""
+    # ---- EB Bill tab ---- #
 
-        return self._resolve_ready_control(
-            page,
-            lambda: page.get_by_test_id("invoice-list"),
-            "invoice list container",
-            require_enabled=False,
-            messages={
-                _PORTAL_ABSENT: "invoice list container is missing",
-                _PORTAL_AMBIGUOUS: "invoice list container is missing or ambiguous",
-                _PORTAL_NOT_READY: "invoice list container is missing",
-                _PORTAL_UNRESOLVED: "invoice list container is missing",
-            },
-        )
+    def _eb_bill_tab_state(self, page: Any, remaining_ms: int) -> str:
+        """Read the exact EB Bill / Tenant Bill tab state. Inspection only.
 
-    def _resolve_pagination_control(self, page: Any, missing_message: str) -> tuple[Any, bool]:
-        """Return the unique settled Next-page control and whether it is disabled.
-
-        Enabled-ness is deliberately not part of readiness here, because a
-        disabled control is a legitimate answer rather than a lagging one.
+        Selection is proven from `aria-selected` on the exact accessible tabs.
+        EB Bill must read exactly `"true"` and Tenant Bill, when present, must
+        not. Anything unreadable or contradictory is reported as such and is
+        never promoted to either answer.
         """
 
-        control = self._resolve_ready_control(
-            page,
-            lambda: page.get_by_role("button", name="Next page", exact=True),
-            "invoice pagination control",
-            require_enabled=False,
-            messages=_uniform_messages(missing_message),
+        tab = page.get_by_role("tab", name=EB_BILL_TAB_NAME, exact=True)
+        count = int(tab.count())
+        if count == 0:
+            return _TAB_ABSENT
+        if count > 1:
+            return _TAB_AMBIGUOUS
+        eb_selected = self._read_attribute(tab, "aria-selected", remaining_ms)
+        tenant = page.get_by_role("tab", name=TENANT_BILL_TAB_NAME, exact=True)
+        tenant_count = int(tenant.count())
+        if tenant_count > 1:
+            return _TAB_CONTRADICTORY
+        tenant_selected = (
+            self._read_attribute(tenant, "aria-selected", remaining_ms)
+            if tenant_count == 1
+            else "false"
         )
+        if eb_selected is _UNREAD or tenant_selected is _UNREAD:
+            return _TAB_CONTRADICTORY
+        if eb_selected == "true":
+            return _TAB_SELECTED if tenant_selected != "true" else _TAB_CONTRADICTORY
+        return _TAB_UNSELECTED
+
+    def _read_attribute(self, locator: Any, name: str, remaining_ms: int) -> Any:
+        """Read one attribute within the probe cap; a timeout is `_UNREAD`."""
+
         try:
-            disabled = bool(control.is_disabled(timeout=MAX_PORTAL_PROBE_TIMEOUT_MS))
+            return locator.get_attribute(name, timeout=self._probe_timeout_ms(remaining_ms))
         except Exception as exc:
-            raise LayoutChangedError("invoice pagination control state could not be read") from exc
-        return control, disabled
+            if not self._looks_like_timeout(exc):
+                raise
+            return _UNREAD
 
-    def _advance_page(self, page: Any, old_marker: str, old_url: str, failure: str) -> None:
-        """Click Next page exactly once and settle on the advanced page.
+    def _select_eb_bill_tab(self, page: Any) -> None:
+        """Select the exact EB Bill tab with at most one click.
 
-        The click is proven actionable on a freshly resolved control first, and
-        it is never sent again: advancement that looks slow is waited for, not
-        re-requested, because a second click would skip a page of inventory.
+        One bounded, mutation-free observation settles what the tab offers. An
+        already selected tab costs zero clicks. An unselected tab is clicked
+        exactly once after it is proven visible, enabled and trial-actionable,
+        and the selection is then proven rather than clicked again. There is no
+        link, EMS, Billing Manager or generic-text fallback, and an ambiguous
+        match is never narrowed.
         """
 
-        control = self._resolve_ready_control(
-            page,
-            lambda: page.get_by_role("button", name="Next page", exact=True),
-            "invoice pagination control",
-            require_trial_actionable=True,
-            messages=_uniform_messages(failure),
-        )
-        control.click()
-        self._await_condition(
-            page,
-            lambda remaining_ms: self._page_advanced(page, old_marker, old_url, remaining_ms),
-            "invoice pagination",
-            messages=_uniform_messages(failure),
-        )
-
-    def _page_advanced(self, page: Any, old_marker: str, old_url: str, remaining_ms: int) -> bool:
-        """Report whether the marker or the URL has moved on, within one probe."""
-
-        try:
-            page.wait_for_function(
-                """([selector, old_marker, old_url]) => {
-                    const list = document.querySelector(selector);
-                    const marker = list?.getAttribute('data-page') || window.location.href;
-                    return marker !== old_marker || window.location.href !== old_url;
-                }""",
-                arg=["[data-testid='invoice-list']", old_marker, old_url],
-                timeout=self._probe_timeout_ms(remaining_ms),
-            )
-        except Exception:
-            return False
-        return True
-
-    # ---- download ---- #
-
-    def download(self, bill: BillRef, destination: Path) -> str:
-        page = self._require_page()
-        try:
-            binding = self._page_bindings.get(bill.filename)
-            if binding is None or self._results_entry_url is None:
-                raise LayoutChangedError("invoice page binding is missing or expired")
-            self._open_verified_results(entry_url=self._results_entry_url)
-            self._restore_page(binding)
-            rows = page.get_by_test_id("invoice-row")
-            matching_rows = []
-            for row in rows.all():
-                if row.get_attribute("data-filename") == bill.filename:
-                    matching_rows.append(row)
-            if len(matching_rows) != 1:
-                raise LayoutChangedError("invoice row identity is missing or ambiguous")
-            # Only the control is re-resolved, not the row: the row's identity
-            # has already been proven, and recovering it too could settle on a
-            # different row than the one that was proven.
-            download_control = self._resolve_ready_control(
-                page,
-                lambda: matching_rows[0].get_by_role("button", name="Download", exact=True),
-                "invoice row download control",
-                require_trial_actionable=True,
-                messages=_uniform_messages("invoice row download control is missing or ambiguous"),
-            )
-            with page.expect_download() as download_info:
-                # Exactly one real download dispatch per attempt. An ambiguous
-                # or timed-out outcome is classified below, never re-clicked.
-                download_control.click()
-            download = download_info.value
-            if download.failure():
-                raise DownloadError("browser download failed")
-            suggested_filename = download.suggested_filename
-            if not suggested_filename:
-                raise DownloadError("browser did not provide a suggested filename", retryable=False)
-            download.save_as(destination)
-            return suggested_filename
-        except (LayoutChangedError, DownloadError):
-            raise
-        except Exception as exc:
-            if self._looks_like_timeout(exc):
-                raise DownloadError("browser download timed out") from exc
-            raise DownloadError("browser download could not be completed") from exc
-
-    # ---- verified results route ---- #
-
-    def _open_verified_results(self, entry_url: str | None = None) -> Any:
-        """Own the business route to verified results, after authentication.
-
-        `login()` proves authentication and stops there
-        (DL-XB-141-AUTH-LANDING-NAV-SEPARATION-G2-001). Everything from the EMS
-        application entry to the confirmed post-search invoice list belongs
-        here, so an EMS entry, Billing Manager or EB Bill that never becomes
-        usable is a navigation failure and is never reported as a login failure.
-
-        The authenticated landing is not the business surface
-        (DL-XB-141-EMS-ENTRY-MINIMAL-REPAIR-G2-136). A first entry therefore
-        opens the EMS application exactly once and then hands the route
-        straight to `_open_eb_bill_route()`, which stays authoritative for
-        everything after it. A restored results address is already inside the
-        application, so that arm never actuates EMS at all: re-entering it would
-        be a second real click that navigates nothing.
-        """
-
-        page = self._require_page()
-        try:
-            if entry_url is not None:
-                page.goto(entry_url, wait_until="domcontentloaded")
-            else:
-                self._enter_ems_application(page)
-
-            def account_locator() -> Any:
-                return page.get_by_label("Tenant/account", exact=True)
-
-            self._open_eb_bill_route(page)
-            account_control = self._resolve_ready_control(
-                page,
-                account_locator,
-                "tenant/account selector",
-                messages=_uniform_messages("tenant/account selector is missing or ambiguous"),
-            )
-            # Account identity is a configuration contract, not a timing
-            # question: exactly one configured option, a stable option value and
-            # a matching read-back all stay terminal on failure.
-            options = account_control.locator("option")
-            option_texts = options.all_text_contents()
-            matches = [index for index, text in enumerate(option_texts) if text.strip() == self.config.account_identity]
-            if len(matches) != 1:
-                raise LayoutChangedError("intended tenant/account identity is missing or ambiguous")
-            option_value = options.nth(matches[0]).get_attribute("value")
-            if not option_value:
-                raise LayoutChangedError("intended tenant/account option has no stable value")
-            account_control.select_option(value=option_value)
-            self._verify_account_binding(page, account_control)
-
-            search = self._resolve_ready_control(
-                page,
-                lambda: page.get_by_role("button", name="Search", exact=True),
-                "Search control",
-                require_trial_actionable=True,
-                messages=_uniform_messages("Search control is missing or ambiguous"),
-            )
-            # Exactly one Search dispatch. A slow result is settled for below,
-            # never re-requested: an empty surface before the confirmed
-            # post-search state is not an answer about invoices at all.
-            search.click()
-            self._await_post_search_state(page)
-            self._verify_account_binding(page, account_control)
-            return self._await_invoice_list(page)
-        except LayoutChangedError:
-            raise
-        except Exception as exc:
-            raise LayoutChangedError("tenant/account search result contract changed") from exc
-
-    def _enter_ems_application(self, page: Any) -> None:
-        """Prove the EMS application entry ready, then click it exactly once.
-
-        This is the structural twin of `_dispatch_billing_manager()`, and
-        deliberately nothing more. The control is resolved freshly here rather
-        than reusing the locator the authentication witness was read through:
-        that witness answered whether the landing was authenticated, which is
-        not evidence that a business control is usable now.
-
-        Readiness is proven on the existing shared bounded ladder -- exactly one
-        exact match, visible, enabled and trial-actionable -- so an absent,
-        duplicate, hidden, disabled or unreadable entry fails closed before
-        anything is dispatched. An ambiguous match is never narrowed to one of
-        its matches, and the selector is never weakened to another role, name
-        or generic text.
-
-        Proving readiness is classified here, not left to the caller. The shared
-        ladder deliberately lets a non-timeout failure out of its enabled and
-        trial-actionability probes intact, because a state that cannot be read
-        is drift rather than lag and must never become a retry. Intact, however,
-        it is also unclassified: it would leave this method as a bare browser
-        exception and reach `_open_verified_results()`, whose generic arm would
-        report a tenant/account contract failure for something that happened on
-        the landing before any dispatch at all. So every way readiness can end
-        without a proven control -- absent, duplicate, hidden, disabled,
-        unreadable enabled-state, unreadable actionability -- is committed to
-        the one pre-dispatch classification, with zero EMS clicks and therefore
-        zero downstream dispatch. Only the shared ladder decides how long to
-        wait; this adds no window, no look and no retry of its own.
-
-        The normal click is the dispatch boundary, and is deliberately outside
-        that normalisation. Once it begins, an exception cannot prove whether
-        the browser acted, so the outcome is uncertain and terminal: there is no
-        second EMS click, no re-resolution, no re-login and no fallback opener.
-        A successful click hands the route to `_open_eb_bill_route()`
-        immediately, so no second navigation or recovery system exists here.
-        """
+        def probe(remaining_ms: int) -> tuple[str, Any]:
+            state = self._eb_bill_tab_state(page, remaining_ms)
+            if state == _TAB_SELECTED:
+                return _PORTAL_READY, None
+            if state == _TAB_ABSENT:
+                return _PORTAL_ABSENT, None
+            if state == _TAB_AMBIGUOUS:
+                return _PORTAL_AMBIGUOUS, None
+            if state != _TAB_UNSELECTED:
+                return _PORTAL_NOT_READY, None
+            control = page.get_by_role("tab", name=EB_BILL_TAB_NAME, exact=True)
+            if not bool(control.is_visible()):
+                return _PORTAL_NOT_READY, None
+            if not self._probe_enabled(control, remaining_ms):
+                return _PORTAL_NOT_READY, None
+            if not self._probe_actionable(control, remaining_ms):
+                return _PORTAL_NOT_READY, None
+            return _PORTAL_READY, control
 
         try:
-            control = self._resolve_ready_control(
+            control = self._recover(
                 page,
-                lambda: page.get_by_role("button", name=EMS_ENTRY_NAV_NAME, exact=True),
-                "EMS application entry control",
-                require_trial_actionable=True,
-                messages=_uniform_messages(NAV_EMS_ENTRY_NOT_READY_MESSAGE),
+                probe,
+                "EB Bill tab",
+                messages=_uniform_messages(EB_BILL_TAB_NOT_READY_MESSAGE),
             )
         except Exception as exc:
-            # Nothing has been dispatched at this point, so the committed
-            # pre-dispatch message is the whole truth regardless of which probe
-            # failed or how. The cause is chained, never surfaced.
-            raise LayoutChangedError(NAV_EMS_ENTRY_NOT_READY_MESSAGE) from exc
+            # Nothing has been dispatched, so the pre-dispatch message is the
+            # whole truth whichever probe failed. The cause is chained only.
+            raise LayoutChangedError(EB_BILL_TAB_NOT_READY_MESSAGE) from exc
+        if control is None:
+            return
+        # The dispatch boundary: once the click begins its outcome is uncertain
+        # and it is never sent again.
         try:
             control.click()
         except Exception as exc:
-            raise LayoutChangedError(NAV_EMS_ENTRY_UNCERTAIN_MESSAGE) from exc
+            raise LayoutChangedError(EB_BILL_TAB_UNCERTAIN_MESSAGE) from exc
 
-    def _open_eb_bill_route(self, page: Any) -> None:
-        """Put the page on the exact EB Bill route, dispatching as little as possible.
+        def selected(remaining_ms: int) -> bool:
+            return self._eb_bill_tab_state(page, remaining_ms) == _TAB_SELECTED
 
-        The retired shortcut inferred the route from the presence of the
-        tenant/account selector. That inference was invalid: a selector renders
-        on more than one route, so its presence never proved that EB Bill was
-        active. Route identity is now proven positively, and only route proof
-        can skip a navigation click.
+        try:
+            self._await_condition(
+                page,
+                selected,
+                "EB Bill tab selection",
+                messages=_uniform_messages(EB_BILL_TAB_UNPROVED_MESSAGE),
+            )
+        except Exception as exc:
+            raise LayoutChangedError(EB_BILL_TAB_UNPROVED_MESSAGE) from exc
 
-        Which entry this surface offers is settled first, by one bounded
-        mutation-free observation, and only then is anything dispatched. That
-        ordering is the correction: an immediate single look cannot tell a
-        surface that has no direct EB Bill entry from one that has not finished
-        rendering it yet, so deciding from that look mis-routes a direct or
-        restored EB Bill surface through the outer application -- which is
-        exactly what a saved results address re-entering this method after
-        `goto()` looks like while it settles.
+    # ---- account witness ---- #
 
-        Three cases, in order:
+    def _account_witness_count(self, page: Any) -> int:
+        """Count visible exact configured-account text outside the results.
 
-        1. the exact EB Bill route becomes proven -- nothing is dispatched;
-        2. the exact EB Bill control becomes positively usable -- exactly one
-           EB Bill click, with no Billing Manager click at all;
-        3. the direct control is positively absent or never usable inside the
-           bounded window -- exactly one Billing Manager click, then the
-           bounded wait for EB Bill readiness, then exactly one EB Bill click.
-
-        Ambiguous and unreadable entry states are none of the three and fail
-        closed instead of becoming a routing decision. No click is ever
-        retried, no alternate opener or generic-text selector exists, and an
-        ambiguous match is never narrowed to one of its matches.
+        The configured identity is used only as the lookup key. The page
+        returns one boolean per match -- whether it sits outside table, grid,
+        row and cell semantics -- so no text is read back, and an occurrence
+        inside the results never counts as the account witness.
         """
 
-        entry = self._settle_eb_bill_entry(page)
-        if entry == _EB_BILL_ENTRY_ROUTE_PROVEN:
-            return
-        if entry == _EB_BILL_ENTRY_OUTER:
-            self._dispatch_billing_manager(page)
-        self._dispatch_eb_bill(page)
+        witnesses = page.get_by_text(self.config.account_identity, exact=True)
+        count = int(witnesses.count())
+        outside = witnesses.evaluate_all(_OUTSIDE_RESULTS_PREDICATE)
+        if not isinstance(outside, list) or len(outside) != count:
+            raise LayoutChangedError(ACCOUNT_WITNESS_UNPROVED_MESSAGE)
+        visible = 0
+        for index, flag in enumerate(outside):
+            if flag is True and bool(witnesses.nth(index).is_visible()):
+                visible += 1
+        return visible
 
-    def _settle_eb_bill_entry(self, page: Any) -> str:
-        """Settle which EB Bill entry this surface offers, dispatching nothing.
+    def _await_account_witness(self, page: Any) -> None:
+        """Settle on exactly one visible configured account witness."""
 
-        One bounded observation answers both questions the routing decision
-        needs -- whether the exact route is already proven, and whether the
-        exact direct control is genuinely usable -- so a settling surface
-        spends the committed recovery window once rather than once per
-        question.
+        def probe(_remaining_ms: int) -> tuple[str, Any]:
+            try:
+                count = self._account_witness_count(page)
+            except LayoutChangedError:
+                return _PORTAL_NOT_READY, None
+            except Exception as exc:
+                raise _ControlUnresolved(exc) from exc
+            if count == 1:
+                return _PORTAL_READY, None
+            return (_PORTAL_AMBIGUOUS if count > 1 else _PORTAL_ABSENT), None
 
-        The window ends in exactly one of three states. Route proof and a
-        positively usable direct control are each decisive the moment they are
-        observed. A direct control that is merely absent, or present but not
-        yet usable, is an ordinary not-yet state: it keeps being re-observed at
-        the committed checkpoints and only becomes "not directly available"
-        once the window is genuinely exhausted. Ambiguity and an unreadable
-        state are neither -- they are drift, and drift is never narrowed into a
-        direct path nor masked behind the outer one.
+        self._recover(
+            page,
+            probe,
+            "account witness",
+            messages={
+                _PORTAL_ABSENT: ACCOUNT_WITNESS_UNPROVED_MESSAGE,
+                _PORTAL_AMBIGUOUS: ACCOUNT_WITNESS_AMBIGUOUS_MESSAGE,
+                _PORTAL_NOT_READY: ACCOUNT_WITNESS_UNPROVED_MESSAGE,
+                _PORTAL_UNRESOLVED: ACCOUNT_WITNESS_UNPROVED_MESSAGE,
+            },
+        )
+
+    # ---- Search ---- #
+
+    def _dispatch_search(self, page: Any) -> None:
+        """Resolve the exact Search button on the bounded ladder; click once.
+
+        Search may appear after the first readable EB Bill surface, so early
+        absence is transient. The one real click is the dispatch boundary and
+        is never retried: a slow result is settled for, not re-requested.
         """
 
-        # `_recover` reports only that its window expired, and here two
-        # expiries mean opposite things, so the last verdict it observed is
-        # what separates "no direct entry" from fail-closed drift.
-        observed = [_PORTAL_ABSENT]
+        try:
+            search = self._resolve_ready_control(
+                page,
+                lambda: page.get_by_role("button", name=SEARCH_BUTTON_NAME, exact=True),
+                "Search control",
+                require_trial_actionable=True,
+                messages=_uniform_messages(SEARCH_NOT_READY_MESSAGE),
+            )
+        except Exception as exc:
+            raise LayoutChangedError(SEARCH_NOT_READY_MESSAGE) from exc
+        try:
+            search.click()
+        except Exception as exc:
+            raise LayoutChangedError(SEARCH_UNCERTAIN_MESSAGE) from exc
+
+    # ---- results table ---- #
+
+    def _row_identity(self, row: Any, remaining_ms: int) -> bytes | None:
+        """Return the private per-session digest of one row, or None if lagging.
+
+        The accessible snapshot is normalised (NFC, whitespace collapsed,
+        stripped, no casefold) and digested with this portal's own random key
+        immediately, so the raw text never outlives this call.
+        """
+
+        try:
+            raw = row.aria_snapshot(timeout=self._probe_timeout_ms(remaining_ms))
+        except Exception as exc:
+            if self._looks_like_timeout(exc):
+                return None
+            raise LayoutChangedError(RESULTS_ROW_IDENTITY_MESSAGE) from exc
+        if not isinstance(raw, str):
+            raise LayoutChangedError(RESULTS_ROW_IDENTITY_MESSAGE)
+        normalised = _normalise_surface_text(raw)
+        if len(normalised) > RESULTS_ROW_TEXT_MAX_CHARS:
+            raise LayoutChangedError(RESULTS_ROW_IDENTITY_MESSAGE)
+        if not normalised:
+            return None
+        return hmac.new(self._row_identity_key, normalised.encode("utf-8"), hashlib.sha256).digest()
+
+    def _pagination_sentinel_present(self, page: Any) -> bool:
+        """Report any exact pagination/completeness control. Never clicked."""
+
+        for role in ("button", "link"):
+            for name in RESULTS_PAGINATION_SENTINEL_NAMES:
+                if int(page.get_by_role(role, name=name, exact=True).count()) != 0:
+                    return True
+        return False
+
+    def _read_results_surface(
+        self, page: Any, remaining_ms: int, safety_ceiling: int
+    ) -> tuple[str, Any]:
+        """Read the whole results surface once. Inspection only.
+
+        Returns `(_PORTAL_READY, digests)` for a structurally valid surface --
+        the header digest first, then one digest per invoice row in table
+        order -- or `(verdict, message)` for a surface that is not (yet)
+        valid. Contradictions that waiting cannot repair raise at once.
+        """
+
+        if self._pagination_sentinel_present(page):
+            raise LayoutChangedError(RESULTS_PAGINATION_MESSAGE)
+        tables = page.get_by_role("table")
+        table_count = int(tables.count())
+        if table_count != 1:
+            verdict = _PORTAL_ABSENT if table_count == 0 else _PORTAL_AMBIGUOUS
+            return verdict, RESULTS_UNSETTLED_MESSAGE
+        rows = tables.get_by_role("row")
+        row_count = int(rows.count())
+        if row_count == 0:
+            return _PORTAL_ABSENT, RESULTS_UNSETTLED_MESSAGE
+        header = rows.nth(0)
+        if int(header.get_by_role("columnheader").count()) < 1 or int(
+            header.get_by_role("button", name=DOWNLOAD_BUTTON_NAME, exact=True).count()
+        ) != 0:
+            return _PORTAL_NOT_READY, RESULTS_UNSETTLED_MESSAGE
+        invoice_count = row_count - 1
+        if invoice_count == 0:
+            return _PORTAL_NOT_READY, RESULTS_HEADER_ONLY_MESSAGE
+        if invoice_count > safety_ceiling:
+            raise LayoutChangedError(RESULTS_CEILING_MESSAGE)
+        for index in range(1, row_count):
+            row = rows.nth(index)
+            if int(row.get_by_role("columnheader").count()) != 0 or int(
+                row.get_by_role("button", name=DOWNLOAD_BUTTON_NAME, exact=True).count()
+            ) != 1:
+                return _PORTAL_NOT_READY, RESULTS_UNSETTLED_MESSAGE
+        if int(
+            page.get_by_role("button", name=DOWNLOAD_BUTTON_NAME, exact=True).count()
+        ) != invoice_count:
+            return _PORTAL_NOT_READY, RESULTS_UNSETTLED_MESSAGE
+        declared = self._read_attribute(tables, "aria-rowcount", remaining_ms)
+        if declared is _UNREAD:
+            return _PORTAL_NOT_READY, RESULTS_UNSETTLED_MESSAGE
+        if declared is not None:
+            try:
+                declared_count = int(str(declared).strip())
+            except ValueError as exc:
+                raise LayoutChangedError(RESULTS_ROWCOUNT_MESSAGE) from exc
+            if declared_count != row_count:
+                return _PORTAL_NOT_READY, RESULTS_ROWCOUNT_MESSAGE
+        digests: list[bytes] = []
+        for index in range(row_count):
+            digest = self._row_identity(rows.nth(index), remaining_ms)
+            if digest is None:
+                return _PORTAL_NOT_READY, RESULTS_ROW_IDENTITY_MESSAGE
+            digests.append(digest)
+        if len(set(digests)) != len(digests):
+            return _PORTAL_NOT_READY, RESULTS_ROW_IDENTITY_MESSAGE
+        return _PORTAL_READY, tuple(digests)
+
+    def _await_settled_results(self, page: Any, safety_ceiling: int) -> tuple[bytes, ...]:
+        """Settle on two consecutive identical valid readings of the results.
+
+        A header-only table is never an empty answer: it stays transient and,
+        if it persists, fails closed as a layout change until a real empty
+        state is separately evidenced. Pagination sentinels are inspection
+        only, and their absence is not a proof of result completeness.
+        """
+
+        last: dict[str, Any] = {"message": RESULTS_UNSETTLED_MESSAGE, "digests": None}
 
         def probe(remaining_ms: int) -> tuple[str, Any]:
             try:
-                verdict, entry = self._observe_eb_bill_entry(page, remaining_ms)
-            except _ControlUnresolved:
-                observed[0] = _PORTAL_UNRESOLVED
+                verdict, value = self._read_results_surface(page, remaining_ms, safety_ceiling)
+            except LayoutChangedError:
                 raise
-            observed[0] = verdict
-            return verdict, entry
+            except Exception as exc:
+                raise _ControlUnresolved(exc) from exc
+            if verdict != _PORTAL_READY:
+                last["message"] = value
+                last["digests"] = None
+                return verdict, None
+            if last["digests"] == value:
+                return _PORTAL_READY, value
+            last["digests"] = value
+            last["message"] = RESULTS_UNSETTLED_MESSAGE
+            return _PORTAL_NOT_READY, None
 
         try:
-            return self._recover(
-                page,
-                probe,
-                "EB Bill navigation entry",
-                messages=_uniform_messages(NAV_EB_BILL_NOT_READY_MESSAGE),
-                classified=False,
-            )
+            return self._recover(page, probe, "invoice results", classified=False)
         except _PortalNotSettled as exc:
-            if observed[0] in (_PORTAL_ABSENT, _PORTAL_NOT_READY):
-                return _EB_BILL_ENTRY_OUTER
-            raise LayoutChangedError(NAV_EB_BILL_NOT_READY_MESSAGE) from exc
+            raise LayoutChangedError(last["message"]) from exc
+        except LayoutChangedError:
+            raise
+        except Exception as exc:
+            raise LayoutChangedError(RESULTS_UNSETTLED_MESSAGE) from exc
 
-    def _observe_eb_bill_entry(self, page: Any, remaining_ms: int) -> tuple[str, Any]:
-        """Observe the EB Bill entry once. Inspection only, never a dispatch.
+    # ---- download ---- #
 
-        This runs at every checkpoint of the bounded window, so nothing here
-        may be externally meaningful: no navigation, and no real click. Only
-        Playwright's own no-op trial actionability check is used, which is the
-        same predicate `_resolve_ready_control()` proves readiness with.
+    def download(self, row: InvoiceRow, destination: Path) -> str:
+        """Download one frozen row on the same settled surface; return its name.
 
-        Readiness is proven, not inferred from existence. Exactly one exact
-        match is necessary and not sufficient: while a route settles, that one
-        match can still be hidden, disabled or unactionable, and none of those
-        is a usable direct entry. More than one exact match is ambiguity, and a
-        state that cannot be read at all is drift; neither is narrowed here.
+        Before the one dispatch the whole frozen surface is re-proven: page
+        topology, the selected EB Bill tab, the account witness, pagination
+        absence and the exact ordered row snapshot. Any drift latches the
+        portal so no later Download is ever dispatched. The browser's
+        suggested filename is returned only after a successful save and is the
+        only authoritative invoice name.
+
+        A positively observed browser failure or save failure is retryable by
+        the caller within its existing bound. An uncertain dispatch -- a click
+        that raised, no download event in time, a new page, or a lost tab
+        selection -- latches and is never retried.
         """
 
-        if self._eb_bill_route_proven(page, remaining_ms):
-            return _PORTAL_READY, _EB_BILL_ENTRY_ROUTE_PROVEN
+        page = self._require_page()
+        if self._latched:
+            raise LayoutChangedError(RESULTS_LATCHED_MESSAGE)
+        frozen = self._frozen_rows
+        if (
+            not isinstance(row, InvoiceRow)
+            or frozen is None
+            or self._inventory_binding is None
+            or row.binding is not self._inventory_binding
+            or isinstance(row.ordinal, bool)
+            or not isinstance(row.ordinal, int)
+            or not 0 <= row.ordinal < len(frozen) - 1
+        ):
+            raise LayoutChangedError(RESULTS_ROW_HANDLE_MESSAGE)
         try:
-            control = self._eb_bill_locator(page)
-            count = int(control.count())
+            control = self._reprove_frozen_surface(page, frozen, row.ordinal)
+            rows = page.get_by_role("table").get_by_role("row")
+            if self._row_identity(rows.nth(row.ordinal + 1), MAX_PORTAL_PROBE_TIMEOUT_MS) != frozen[
+                row.ordinal + 1
+            ]:
+                raise LayoutChangedError(RESULTS_SURFACE_CHANGED_MESSAGE)
         except Exception as exc:
-            raise _ControlUnresolved(exc) from exc
-        if count == 0:
-            return _PORTAL_ABSENT, None
-        if count > 1:
-            return _PORTAL_AMBIGUOUS, None
+            self._latched = True
+            raise LayoutChangedError(RESULTS_SURFACE_CHANGED_MESSAGE) from exc
+
+        # The dispatch boundary. From here an exception cannot prove whether
+        # the browser acted, so it is uncertain, latched and never retried.
         try:
-            visible = bool(control.is_visible())
+            with page.expect_download(timeout=self.config.timeout_seconds * 1000) as download_info:
+                control.click(timeout=MAX_PORTAL_PROBE_TIMEOUT_MS)
+            download = download_info.value
         except Exception as exc:
-            raise _ControlUnresolved(exc) from exc
-        if not visible:
-            return _PORTAL_NOT_READY, None
-        if not self._probe_enabled(control, remaining_ms):
-            return _PORTAL_NOT_READY, None
-        if not self._probe_actionable(control, remaining_ms):
-            return _PORTAL_NOT_READY, None
-        return _PORTAL_READY, _EB_BILL_ENTRY_DIRECT_READY
+            self._latched = True
+            raise _uncertain_download() from exc
+
+        try:
+            failure = download.failure()
+        except Exception as exc:
+            self._latched = True
+            raise _uncertain_download() from exc
+        if failure:
+            self._require_post_download_surface(page)
+            raise DownloadError("browser download failed")
+        suggested_filename = getattr(download, "suggested_filename", None)
+        if not isinstance(suggested_filename, str) or not suggested_filename:
+            self._latched = True
+            raise DownloadError("browser did not provide a suggested filename", retryable=False)
+        previous = self._row_filenames.get(row.ordinal)
+        if previous is not None and previous != suggested_filename:
+            self._latched = True
+            raise LayoutChangedError(RESULTS_FILENAME_CHANGED_MESSAGE)
+        self._row_filenames[row.ordinal] = suggested_filename
+        try:
+            download.save_as(destination)
+        except Exception as exc:
+            self._require_post_download_surface(page)
+            raise DownloadError("browser download could not be saved") from exc
+        self._require_post_download_surface(page)
+        return suggested_filename
+
+    def _require_post_download_surface(self, page: Any) -> None:
+        """After a download event, the page and the EB Bill selection must hold."""
+
+        try:
+            self._require_unique_page(page, RESULTS_TOPOLOGY_MESSAGE)
+            selected = self._eb_bill_tab_state(page, MAX_PORTAL_PROBE_TIMEOUT_MS) == _TAB_SELECTED
+        except Exception as exc:
+            self._latched = True
+            raise _uncertain_download() from exc
+        if not selected:
+            self._latched = True
+            raise _uncertain_download()
+
+    def _reprove_frozen_surface(self, page: Any, frozen: tuple[bytes, ...], ordinal: int) -> Any:
+        """Re-prove the frozen surface and return the row's ready Download control.
+
+        Rendering lag -- a table or control momentarily absent or not yet
+        actionable -- gets the shared bounded window. A readable surface that
+        differs from the frozen one in any way is drift and fails at once.
+        """
+
+        ceiling = max(self._safety_ceiling, len(frozen) - 1)
+
+        def probe(remaining_ms: int) -> tuple[str, Any]:
+            self._require_unique_page(page, RESULTS_SURFACE_CHANGED_MESSAGE)
+            state = self._eb_bill_tab_state(page, remaining_ms)
+            if state == _TAB_UNSELECTED or state == _TAB_AMBIGUOUS:
+                raise LayoutChangedError(RESULTS_SURFACE_CHANGED_MESSAGE)
+            if state != _TAB_SELECTED:
+                return _PORTAL_NOT_READY, None
+            witnesses = self._account_witness_count(page)
+            if witnesses > 1:
+                raise LayoutChangedError(RESULTS_SURFACE_CHANGED_MESSAGE)
+            if witnesses != 1:
+                return _PORTAL_NOT_READY, None
+            verdict, value = self._read_results_surface(page, remaining_ms, ceiling)
+            if verdict != _PORTAL_READY:
+                return _PORTAL_NOT_READY, None
+            if value != frozen:
+                raise LayoutChangedError(RESULTS_SURFACE_CHANGED_MESSAGE)
+            control = (
+                page.get_by_role("table")
+                .get_by_role("row")
+                .nth(ordinal + 1)
+                .get_by_role("button", name=DOWNLOAD_BUTTON_NAME, exact=True)
+            )
+            if int(control.count()) != 1 or not bool(control.is_visible()):
+                return _PORTAL_NOT_READY, None
+            if not self._probe_enabled(control, remaining_ms):
+                return _PORTAL_NOT_READY, None
+            if not self._probe_actionable(control, remaining_ms):
+                return _PORTAL_NOT_READY, None
+            return _PORTAL_READY, control
+
+        return self._recover(
+            page,
+            probe,
+            "frozen invoice results",
+            messages=_uniform_messages(RESULTS_SURFACE_CHANGED_MESSAGE),
+        )
+
+    # ---- diagnostic-owned route helpers ---- #
+    #
+    # Used only by the separate navigation diagnostic above. The production
+    # path never calls them.
 
     @staticmethod
     def _eb_bill_locator(page: Any) -> Any:
@@ -2629,199 +2815,16 @@ class PlaywrightPortal:
 
         return page.get_by_role("link", name=EB_BILL_NAV_NAME, exact=True)
 
-    def _dispatch_billing_manager(self, page: Any) -> None:
-        """Prove the Billing Manager entry ready, then click it exactly once."""
-
-        control = self._resolve_ready_control(
-            page,
-            lambda: page.get_by_role("link", name=BILLING_MANAGER_NAV_NAME, exact=True),
-            "Billing Manager navigation control",
-            require_trial_actionable=True,
-            messages=_uniform_messages(NAV_BILLING_MANAGER_NOT_READY_MESSAGE),
-        )
-        # The explicit dispatch boundary. Once the normal click begins an
-        # exception cannot prove whether the browser acted, so the outcome is
-        # uncertain and terminal, and the click is never sent again.
-        try:
-            control.click()
-        except Exception as exc:
-            raise LayoutChangedError(NAV_BILLING_MANAGER_UNCERTAIN_MESSAGE) from exc
-
-    def _dispatch_eb_bill(self, page: Any) -> None:
-        """Prove EB Bill ready, click it once, then prove the route it opened.
-
-        The three failures stay distinct: a control that never becomes ready
-        fails before any dispatch, a click whose outcome cannot be established
-        is terminal and is never retried, and a dispatched click whose route
-        postcondition never becomes proven fails as an unproven results route
-        rather than being clicked again.
-        """
-
-        control = self._resolve_ready_control(
-            page,
-            lambda: self._eb_bill_locator(page),
-            "EB Bill navigation control",
-            require_trial_actionable=True,
-            messages=_uniform_messages(NAV_EB_BILL_NOT_READY_MESSAGE),
-        )
-        try:
-            control.click()
-        except Exception as exc:
-            raise LayoutChangedError(NAV_EB_BILL_UNCERTAIN_MESSAGE) from exc
-        self._await_condition(
-            page,
-            lambda remaining_ms: self._eb_bill_route_proven(page, remaining_ms),
-            "EB Bill results route",
-            messages=_uniform_messages(NAV_RESULTS_ROUTE_UNPROVED_MESSAGE),
-        )
-
-    def _eb_bill_route_proven(
-        self, page: Any, remaining_ms: int = MAX_PORTAL_PROBE_TIMEOUT_MS
-    ) -> bool:
-        """Report whether the page is on the exact EB Bill route, as a boolean only.
-
-        The proof is internal and privacy-closed. Two addresses are compared
-        inside this method and neither is returned, logged, raised, retained or
-        placed on any diagnostic or public-safe surface: the only thing that
-        leaves is one boolean.
-
-        Equivalence is same-origin plus path. The exact EB Bill control's own
-        target is resolved against the current address, so a relative target is
-        same-origin by construction and a cross-origin target can never match.
-        Query and fragment are ignored -- and only they -- so an already-valid
-        saved results address that carries page, account and search parameters
-        is still recognised as the EB Bill route.
-
-        Anything that cannot be read or parsed is not proof: an absent,
-        ambiguous or unreadable control, a missing target, or an unparseable
-        address all fail closed as an unproven route.
-        """
-
-        try:
-            control = self._eb_bill_locator(page)
-            if int(control.count()) != 1:
-                return False
-            target = control.get_attribute(
-                "href", timeout=self._probe_timeout_ms(remaining_ms)
-            )
-            current = page.url
-            if not target or not current:
-                return False
-            resolved = urlparse(urljoin(str(current), str(target)))
-            here = urlparse(str(current))
-        except Exception:
-            return False
-        if not resolved.scheme or resolved.scheme != here.scheme:
-            return False
-        if not resolved.netloc or resolved.netloc != here.netloc:
-            return False
-        return self._route_path(resolved.path) == self._route_path(here.path)
-
     @staticmethod
     def _route_path(path: str) -> str:
         """Normalise one route path for comparison, without exposing it."""
 
         return path.rstrip("/") or "/"
 
-    def _await_post_search_state(self, page: Any) -> None:
-        """Settle on the confirmed post-search result state after one Search."""
-
-        def probe(remaining_ms: int) -> tuple[str, Any]:
-            state = page.get_by_test_id("invoice-results-state")
-            if state.count() != 1:
-                return _PORTAL_AMBIGUOUS, None
-            if self._probe_result_state(state, remaining_ms) != "post-search":
-                return _PORTAL_NOT_READY, None
-            return _PORTAL_READY, None
-
-        self._recover(
-            page,
-            probe,
-            "invoice result state marker",
-            messages={
-                _PORTAL_ABSENT: "invoice result state marker is missing or ambiguous",
-                _PORTAL_AMBIGUOUS: "invoice result state marker is missing or ambiguous",
-                _PORTAL_NOT_READY: "invoice results are not confirmed post-search",
-                _PORTAL_UNRESOLVED: "invoice result state marker is missing or ambiguous",
-            },
-        )
-
-    def _probe_result_state(self, state: Any, remaining_ms: int) -> str | None:
-        """Read the result-state marker without outlasting the shared budget.
-
-        `locator.get_attribute()` auto-waits, so left implicit it inherits
-        `page.set_default_timeout()` -- and the marker can detach between the
-        count above and this read while the surface rerenders, which is exactly
-        when that wait would start. A blocking call the monotonic deadline
-        cannot interrupt is what would make the ceiling nominal rather than
-        hard, so this read is bounded like every other probe.
-        """
-
-        try:
-            return state.get_attribute(
-                "data-state", timeout=self._probe_timeout_ms(remaining_ms)
-            )
-        except Exception as exc:
-            # Only a timeout is the rerender lag this recovery exists for.
-            # Anything else is a real failure and must reach the caller
-            # unaltered rather than becoming another checkpoint.
-            if not self._looks_like_timeout(exc):
-                raise
-            return None
-
-    def _verify_account_binding(self, page: Any, account_control: Any) -> None:
-        checked = account_control.locator("option:checked")
-        if checked.count() != 1:
-            raise LayoutChangedError("selected tenant/account identity is missing or ambiguous")
-        selected_text = checked.first.text_content()
-        if selected_text is None or selected_text.strip() != self.config.account_identity:
-            raise LayoutChangedError("selected tenant/account identity does not match configuration")
-        displayed = page.get_by_test_id("selected-account")
-        if displayed.count() != 1:
-            raise LayoutChangedError("displayed tenant/account identity is missing or ambiguous")
-        displayed_text = displayed.first.text_content()
-        if displayed_text is None or displayed_text.strip() != self.config.account_identity:
-            raise LayoutChangedError("displayed tenant/account identity does not match configuration")
-
-    @staticmethod
-    def _page_marker(page: Any, list_container: Any) -> str:
-        return list_container.get_attribute("data-page") or page.url
-
-    def _restore_page(self, binding: tuple[int, str]) -> None:
-        page = self._require_page()
-        page_ordinal, expected_marker = binding
-        if page_ordinal < 1:
-            raise LayoutChangedError("invoice page binding has an invalid ordinal")
-        list_container = self._await_invoice_list(page)
-        current_marker = self._page_marker(page, list_container)
-        seen_markers = {current_marker}
-        for _ in range(1, page_ordinal):
-            _control, disabled = self._resolve_pagination_control(
-                page, "invoice page binding cannot be replayed"
-            )
-            if disabled:
-                raise LayoutChangedError("invoice page binding cannot be replayed")
-            old_marker = current_marker
-            self._advance_page(page, old_marker, page.url, "invoice page replay did not advance")
-            list_container = self._await_invoice_list(page)
-            current_marker = self._page_marker(page, list_container)
-            if current_marker == old_marker or current_marker in seen_markers:
-                raise LayoutChangedError("invoice page replay repeated or lost its marker")
-            seen_markers.add(current_marker)
-        if current_marker != expected_marker:
-            raise LayoutChangedError("invoice page replay reached an unexpected marker")
-
     def _require_page(self) -> Any:
         if self.page is None:
             raise DependencyError("browser page is not open")
         return self.page
-
-    @staticmethod
-    def _visible(page: Any, locator: Any) -> bool:
-        try:
-            return locator.is_visible(timeout=250)
-        except Exception:
-            return False
 
     @staticmethod
     def _looks_like_timeout(error: Exception) -> bool:

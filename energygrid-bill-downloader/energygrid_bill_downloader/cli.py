@@ -14,8 +14,13 @@ from .config import load_config_file, load_runtime_config
 from .errors import ACTION_REQUIRED, AppError, ConfigError, DependencyError, exit_code_for
 from .publication import cleanup_stale_owned_temp
 from .portal import (
+    ACCOUNT_WITNESS_AMBIGUOUS_MESSAGE,
+    ACCOUNT_WITNESS_UNPROVED_MESSAGE,
     AUTHENTICATION_OUTCOMES,
     AUTHENTICATION_UNPROVED,
+    EB_BILL_TAB_NOT_READY_MESSAGE,
+    EB_BILL_TAB_UNCERTAIN_MESSAGE,
+    EB_BILL_TAB_UNPROVED_MESSAGE,
     LOGIN_DIAGNOSTIC_CLASSIFICATIONS,
     NAVIGATION_DIAGNOSTIC_ACTION_REQUIRED_STATE,
     NAVIGATION_DIAGNOSTIC_AUTHENTICATION_NOT_PROVEN,
@@ -43,6 +48,16 @@ from .portal import (
     NAVIGATION_DIAGNOSTIC_PRE_EMS_MULTIPLE_PAGES,
     NAVIGATION_DIAGNOSTIC_RESULT_IDENTIFIERS,
     NavigationDiagnosticResult,
+    RESULTS_CEILING_MESSAGE,
+    RESULTS_HEADER_ONLY_MESSAGE,
+    RESULTS_INVENTORY_CONSUMED_MESSAGE,
+    RESULTS_PAGINATION_MESSAGE,
+    RESULTS_ROW_IDENTITY_MESSAGE,
+    RESULTS_ROWCOUNT_MESSAGE,
+    RESULTS_TOPOLOGY_MESSAGE,
+    RESULTS_UNSETTLED_MESSAGE,
+    SEARCH_NOT_READY_MESSAGE,
+    SEARCH_UNCERTAIN_MESSAGE,
     SUBMIT_NOT_DISPATCHED,
     PlaywrightPortal,
     unobserved_navigation_post_ems,
@@ -131,18 +146,38 @@ SUPPORT_REFS_BY_MESSAGE = {
     "runtime credentials are unavailable": "EG_LOGIN_CREDENTIALS_UNAVAILABLE",
     "portal rejected the login": "EG_LOGIN_PORTAL_REJECTED",
     "authenticated landing was not proven after login": "EG_LOGIN_AUTHENTICATION_UNPROVED",
-    # Business navigation, not authentication. Billing Manager becoming
-    # unusable after a proven authenticated landing is a navigation failure and
-    # carries a navigation reference, so an operator can tell the two apart.
-    # The EMS application entry is the first of these: it runs after the landing
-    # is already proven, so it can never mean the login failed.
+    # Business navigation, not authentication. A failure after a proven
+    # authenticated landing is a navigation failure and carries a navigation
+    # reference, so an operator can tell the two apart.
+    #
+    # The historical EMS application entry: since DL-XB-199 only the separate
+    # navigation diagnostic can still raise these two.
     "EMS application entry control is not ready": "EG_NAV_EMS_ENTRY_NOT_READY",
     "EMS application entry dispatch outcome uncertain": "EG_NAV_EMS_ENTRY_DISPATCH_UNCERTAIN",
+    # Retired with the historical Billing Manager / EB Bill link route
+    # (DL-XB-199). Kept so older evidence still reads; see RETIRED_SUPPORT_REFS.
     "Billing Manager navigation control is not ready": "EG_NAV_BILLING_MANAGER_NOT_READY",
     "Billing Manager navigation dispatch outcome uncertain": "EG_NAV_BILLING_MANAGER_DISPATCH_UNCERTAIN",
     "EB Bill navigation control is not ready": "EG_NAV_EB_BILL_NOT_READY",
     "EB Bill navigation dispatch outcome uncertain": "EG_NAV_EB_BILL_DISPATCH_UNCERTAIN",
     "EB Bill results route was not proven": "EG_NAV_RESULTS_ROUTE_UNPROVED",
+    # The live single-surface production path (DL-XB-199, G2-076): the exact
+    # EB Bill tab, the account witness, one Search and the one results table.
+    EB_BILL_TAB_NOT_READY_MESSAGE: "EG_NAV_EB_BILL_TAB_NOT_READY",
+    EB_BILL_TAB_UNCERTAIN_MESSAGE: "EG_NAV_EB_BILL_TAB_DISPATCH_UNCERTAIN",
+    EB_BILL_TAB_UNPROVED_MESSAGE: "EG_NAV_EB_BILL_TAB_UNPROVED",
+    ACCOUNT_WITNESS_UNPROVED_MESSAGE: "EG_NAV_ACCOUNT_WITNESS_UNPROVED",
+    ACCOUNT_WITNESS_AMBIGUOUS_MESSAGE: "EG_NAV_ACCOUNT_WITNESS_AMBIGUOUS",
+    SEARCH_NOT_READY_MESSAGE: "EG_NAV_SEARCH_NOT_READY",
+    SEARCH_UNCERTAIN_MESSAGE: "EG_NAV_SEARCH_DISPATCH_UNCERTAIN",
+    RESULTS_TOPOLOGY_MESSAGE: "EG_NAV_PAGE_TOPOLOGY",
+    RESULTS_UNSETTLED_MESSAGE: "EG_NAV_RESULTS_UNSETTLED",
+    RESULTS_HEADER_ONLY_MESSAGE: "EG_NAV_RESULTS_HEADER_ONLY",
+    RESULTS_PAGINATION_MESSAGE: "EG_NAV_RESULTS_PAGINATION_PRESENT",
+    RESULTS_ROWCOUNT_MESSAGE: "EG_NAV_RESULTS_ROWCOUNT_CONTRADICTORY",
+    RESULTS_ROW_IDENTITY_MESSAGE: "EG_NAV_RESULTS_ROW_IDENTITY_INVALID",
+    RESULTS_CEILING_MESSAGE: "EG_NAV_RESULTS_SAFETY_CEILING",
+    RESULTS_INVENTORY_CONSUMED_MESSAGE: "EG_NAV_RESULTS_INVENTORY_CONSUMED",
     NAVIGATION_DIAGNOSTIC_PAGE_TOPOLOGY_MESSAGE: "EG_NAV_DIAGNOSTIC_PAGE_TOPOLOGY",
     NAVIGATION_DIAGNOSTIC_FRAME_TOPOLOGY_MESSAGE: "EG_NAV_DIAGNOSTIC_FRAME_TOPOLOGY",
     NAVIGATION_DIAGNOSTIC_CROSS_ORIGIN_MESSAGE: "EG_NAV_DIAGNOSTIC_CROSS_ORIGIN",
@@ -150,18 +185,29 @@ SUPPORT_REFS_BY_MESSAGE = {
     NAVIGATION_DIAGNOSTIC_OUTPUT_REJECTED_MESSAGE: "EG_NAV_DIAGNOSTIC_OUTPUT_REJECTED",
 }
 
-# The business-navigation half of the vocabulary, declared rather than inferred
-# from a prefix. It is reachable only from `_open_verified_results()`, so the
-# pre-auth login reachability contract is stated over the login half alone.
+# The production business-navigation half of the vocabulary, declared rather
+# than inferred from a prefix. It is reachable only from the production
+# `inventory()` path, so the pre-auth login reachability contract is stated
+# over the login half alone. The two historical EMS entry references are no
+# longer production navigation: only the separate navigation diagnostic can
+# raise them, and its own allowlist below names them exactly.
 NAVIGATION_SUPPORT_REFS = frozenset(
     {
-        "EG_NAV_EMS_ENTRY_NOT_READY",
-        "EG_NAV_EMS_ENTRY_DISPATCH_UNCERTAIN",
-        "EG_NAV_BILLING_MANAGER_NOT_READY",
-        "EG_NAV_BILLING_MANAGER_DISPATCH_UNCERTAIN",
-        "EG_NAV_EB_BILL_NOT_READY",
-        "EG_NAV_EB_BILL_DISPATCH_UNCERTAIN",
-        "EG_NAV_RESULTS_ROUTE_UNPROVED",
+        "EG_NAV_EB_BILL_TAB_NOT_READY",
+        "EG_NAV_EB_BILL_TAB_DISPATCH_UNCERTAIN",
+        "EG_NAV_EB_BILL_TAB_UNPROVED",
+        "EG_NAV_ACCOUNT_WITNESS_UNPROVED",
+        "EG_NAV_ACCOUNT_WITNESS_AMBIGUOUS",
+        "EG_NAV_SEARCH_NOT_READY",
+        "EG_NAV_SEARCH_DISPATCH_UNCERTAIN",
+        "EG_NAV_PAGE_TOPOLOGY",
+        "EG_NAV_RESULTS_UNSETTLED",
+        "EG_NAV_RESULTS_HEADER_ONLY",
+        "EG_NAV_RESULTS_PAGINATION_PRESENT",
+        "EG_NAV_RESULTS_ROWCOUNT_CONTRADICTORY",
+        "EG_NAV_RESULTS_ROW_IDENTITY_INVALID",
+        "EG_NAV_RESULTS_SAFETY_CEILING",
+        "EG_NAV_RESULTS_INVENTORY_CONSUMED",
     }
 )
 
@@ -175,12 +221,21 @@ NAVIGATION_DIAGNOSTIC_SUPPORT_REFS = frozenset(
     }
 )
 
+# The historical EMS application entry references. Since DL-XB-199 only the
+# separate navigation diagnostic's one EMS dispatch can raise them; production
+# never actuates EMS.
+DIAGNOSTIC_EMS_ENTRY_SUPPORT_REFS = frozenset(
+    {
+        "EG_NAV_EMS_ENTRY_NOT_READY",
+        "EG_NAV_EMS_ENTRY_DISPATCH_UNCERTAIN",
+    }
+)
+
 NAVIGATION_DIAGNOSTIC_ALLOWED_SUPPORT_REFS = frozenset(
     ref for ref in SUPPORT_REFS_BY_MESSAGE.values() if ref.startswith("EG_LOGIN_")
 ) | frozenset(
     {
-        "EG_NAV_EMS_ENTRY_NOT_READY",
-        "EG_NAV_EMS_ENTRY_DISPATCH_UNCERTAIN",
+        *DIAGNOSTIC_EMS_ENTRY_SUPPORT_REFS,
         *NAVIGATION_DIAGNOSTIC_SUPPORT_REFS,
         DIAGNOSTIC_UNCLASSIFIED_SUPPORT_REF,
     }
@@ -203,6 +258,15 @@ RETIRED_SUPPORT_REFS = frozenset(
         # `EG_LOGIN_AUTHENTICATION_UNPROVED`, and a Billing Manager that never
         # becomes usable records a navigation reference instead.
         "EG_LOGIN_BILLING_MANAGER_WAIT_FAILED",
+        # DL-XB-199. The production path no longer navigates EMS, Billing
+        # Manager or the EB Bill link route; it selects the live EB Bill tab
+        # on the single surface. Nothing can raise these five again, and the
+        # navigation diagnostic never could.
+        "EG_NAV_BILLING_MANAGER_NOT_READY",
+        "EG_NAV_BILLING_MANAGER_DISPATCH_UNCERTAIN",
+        "EG_NAV_EB_BILL_NOT_READY",
+        "EG_NAV_EB_BILL_DISPATCH_UNCERTAIN",
+        "EG_NAV_RESULTS_ROUTE_UNPROVED",
     }
 )
 
