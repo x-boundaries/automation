@@ -4451,7 +4451,7 @@ function Get-XbAccountObservation {
         lsa_rights = @(if ($null -ne $rights) { $rights | Sort-Object })
         profile_list_present = (Test-Path -LiteralPath $profileKey)
         user_profile_count = @(Get-CimInstance -ClassName Win32_UserProfile -Filter ("SID='{0}'" -f $state.user_sid)).Count
-        worker_process_count = @(Get-Process -IncludeUserName -ErrorAction SilentlyContinue | Where-Object { [string]$_.UserName -ieq $account }).Count
+        worker_process_count = @(Get-Process -IncludeUserName -ErrorAction SilentlyContinue | Where-Object { [string]$_.UserName -ieq $qualifiedAccount }).Count
     }
 }
 
@@ -4584,11 +4584,15 @@ try {
     New-LocalUser -Name $userName -Password $securePassword -PasswordNeverExpires -AccountNeverExpires -UserMayNotChangePassword -Description "XB disposable task boundary test" | Out-Null
     $state.user_sid = (Get-LocalUser -Name $userName).SID.Value
     try { Add-LocalGroupMember -SID "S-1-5-32-545" -Member $userName -ErrorAction Stop } catch [Microsoft.PowerShell.Commands.MemberExistsException] { }
-    $account = "{0}\{1}" -f $env:COMPUTERNAME, $userName
-    $credential = New-Object Management.Automation.PSCredential($account, $securePassword)
-    $wrongCredential = New-Object Management.Automation.PSCredential($account, $secureWrong)
-    $script:WorkerAccount = $account
-    $report.environment.worker_account = $account
+    # Production-faithful WorkerAccount is the bare local account name, matching accepted xb-ac2-worker input;
+    # it drives the credential, principal and registration. The machine-qualified form is used only for OS
+    # observations that report COMPUTER\user, such as process-owner comparison.
+    $workerAccount = $userName
+    $qualifiedAccount = "{0}\{1}" -f $env:COMPUTERNAME, $userName
+    $credential = New-Object Management.Automation.PSCredential($workerAccount, $securePassword)
+    $wrongCredential = New-Object Management.Automation.PSCredential($workerAccount, $secureWrong)
+    $script:WorkerAccount = $workerAccount
+    $report.environment.worker_account = $workerAccount
     try {
         $report.environment.administrators_member = (@(Get-LocalGroupMember -SID "S-1-5-32-544" -ErrorAction Stop | Where-Object { $_.SID.Value -eq $state.user_sid }).Count -ne 0)
     } catch {
@@ -4607,7 +4611,7 @@ try {
     Invoke-XbBoundaryCase "in_memory_null_trigger_pin" {
         $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument ('-NoLogo -NoProfile -NonInteractive -File "{0}" -Mode DisabledProof' -f $fakeLauncher)
         $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::FromMinutes(10)) -RestartCount 0 -StartWhenAvailable:$false -Disable
-        $taskPrincipal = New-ScheduledTaskPrincipal -UserId $account -LogonType Password -RunLevel Limited
+        $taskPrincipal = New-ScheduledTaskPrincipal -UserId $workerAccount -LogonType Password -RunLevel Limited
         $memory = New-ScheduledTask -Action $action -Settings $settings -Principal $taskPrincipal
         return [ordered]@{
             triggers_null = ($null -eq $memory.Triggers)
@@ -4622,7 +4626,7 @@ try {
         $script:TaskCredential = $credential
         $registration = Get-XbBoundaryOutcome { Register-XbWorkerScheduledTask -LauncherPath $fakeLauncher }
         $cim = Get-ScheduledTask -TaskPath $taskPath -TaskName $taskName -ErrorAction Stop
-        $expected = Get-XbWorkerTaskIdentity -LauncherPath $fakeLauncher -WorkerAccount $account
+        $expected = Get-XbWorkerTaskIdentity -LauncherPath $fakeLauncher -WorkerAccount $workerAccount
         $contract = Get-XbBoundaryOutcome { Assert-XbWorkerTaskContract -Task $cim -ExpectedIdentity $expected }
         $view = Get-XbRegisteredWorkerTaskView
         $oracle = try { [string](Get-XbTaskTriggerOracleCount -ComTriggerCount ([int]$view.Definition.Triggers.Count) -TaskXml ([string]$view.Xml) -CimTriggers $cim.Triggers) } catch { [string]$_.Exception.Message }
@@ -4640,14 +4644,14 @@ try {
         $script:taskName = $controlName
         $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument ('-NoLogo -NoProfile -NonInteractive -File "{0}" -Mode DisabledProof' -f $fakeLauncher)
         $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::FromMinutes(10)) -RestartCount 0 -StartWhenAvailable:$false -Disable
-        $taskPrincipal = New-ScheduledTaskPrincipal -UserId $account -LogonType Password -RunLevel Limited
+        $taskPrincipal = New-ScheduledTaskPrincipal -UserId $workerAccount -LogonType Password -RunLevel Limited
         $trigger = New-ScheduledTaskTrigger -Once -At ([datetime]::new(2099, 1, 1, 0, 0, 0))
         $controlDefinition = New-ScheduledTask -Action $action -Settings $settings -Principal $taskPrincipal -Trigger $trigger
         $plain = $credential.GetNetworkCredential().Password
-        try { Register-ScheduledTask -TaskPath $taskPath -TaskName $taskName -InputObject $controlDefinition -User $account -Password $plain -Force | Out-Null }
+        try { Register-ScheduledTask -TaskPath $taskPath -TaskName $taskName -InputObject $controlDefinition -User $workerAccount -Password $plain -Force | Out-Null }
         finally { $plain = $null }
         $cim = Get-ScheduledTask -TaskPath $taskPath -TaskName $taskName -ErrorAction Stop
-        $expected = Get-XbWorkerTaskIdentity -LauncherPath $fakeLauncher -WorkerAccount $account
+        $expected = Get-XbWorkerTaskIdentity -LauncherPath $fakeLauncher -WorkerAccount $workerAccount
         $contract = Get-XbBoundaryOutcome { Assert-XbWorkerTaskContract -Task $cim -ExpectedIdentity $expected }
         return [ordered]@{
             in_memory_filtered_trigger_count = (Get-XbNonNullCount $controlDefinition.Triggers)
@@ -5234,6 +5238,8 @@ class MemberWorkerHostedTaskBoundaryTests(unittest.TestCase):
             {"program_files_parent": False, "program_data_parent": False, "scheduler_folder": False},
         )
         self.assertFalse(environment["administrators_member"])
+        # Installer/task identity must bind to the bare local account, as production does.
+        self.assertRegex(str(environment["worker_account"]), r"^xbt[0-9a-f]{12}$")
 
     def test_no_secret_exposure(self) -> None:
         self.assertEqual(self.report["secret_exposure"], "none")
