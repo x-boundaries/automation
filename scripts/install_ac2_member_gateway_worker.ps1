@@ -157,12 +157,82 @@ function Assert-XbStagedPackageIdentity {
     }
 }
 
+# A triggerless CIM task exposes Triggers as $null and @($null).Count is 1, so collection counts must drop nulls.
+function Get-XbNonNullCount {
+    param($Value)
+    return @(@($Value) | Where-Object { $null -ne $_ }).Count
+}
+
+# COM interop maps HRESULTs to typed exceptions (0x80070002 surfaces as FileNotFoundException), so read the innermost one.
+function Get-XbComHResult {
+    param([Parameter(Mandatory)]$ErrorRecord)
+    $exception = if ($ErrorRecord -is [Management.Automation.ErrorRecord]) { $ErrorRecord.Exception } else { $ErrorRecord }
+    if ($null -eq $exception) { return $null }
+    while ($null -ne $exception.InnerException) { $exception = $exception.InnerException }
+    return [int]$exception.HResult
+}
+
+function Connect-XbTaskService {
+    try {
+        $service = New-Object -ComObject Schedule.Service
+        $service.Connect()
+    } catch { throw "task_service_unavailable" }
+    return $service
+}
+
+function ConvertTo-XbComFolderPath {
+    param([Parameter(Mandatory)][string]$Path)
+    $trimmed = $Path.TrimEnd('\')
+    if ($trimmed -eq "") { return "\" }
+    return $trimmed
+}
+
+function Test-XbTaskFolderPresent {
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$ErrorId)
+    $service = Connect-XbTaskService
+    try { $null = $service.GetFolder((ConvertTo-XbComFolderPath $Path)) }
+    catch {
+        # 0x80070002 is the only Schedule.Service answer accepted as proven folder absence.
+        if ((Get-XbComHResult $_) -eq -2147024894) { return $false }
+        throw $ErrorId
+    }
+    return $true
+}
+
+function Get-XbRegisteredWorkerTaskView {
+    $service = Connect-XbTaskService
+    try { $registered = $service.GetFolder((ConvertTo-XbComFolderPath $taskPath)).GetTask($taskName) }
+    catch { throw "task_presence_unproven" }
+    if ([string]$registered.Path -cne ($taskPath + $taskName)) { throw "task_identity_invalid" }
+    return $registered
+}
+
+# Authoritative trigger oracle: Schedule.Service definition count plus namespaced XML /Task/Triggers/* must agree.
+# The null-filtered CIM count is a consistency check only.
+function Get-XbTaskTriggerOracleCount {
+    param([Parameter(Mandatory)][int]$ComTriggerCount, [Parameter(Mandatory)][AllowEmptyString()][string]$TaskXml, $CimTriggers)
+    $document = New-Object Xml.XmlDocument
+    try { $document.LoadXml($TaskXml) } catch { throw "task_trigger_oracle_disagreement" }
+    $namespaces = New-Object Xml.XmlNamespaceManager($document.NameTable)
+    $namespaces.AddNamespace("t", "http://schemas.microsoft.com/windows/2004/02/mit/task")
+    if ($document.SelectNodes("/t:Task", $namespaces).Count -ne 1) { throw "task_trigger_oracle_disagreement" }
+    $xmlTriggerCount = $document.SelectNodes("/t:Task/t:Triggers/*", $namespaces).Count
+    if ($ComTriggerCount -ne $xmlTriggerCount) { throw "task_trigger_oracle_disagreement" }
+    if ((Get-XbNonNullCount $CimTriggers) -ne $ComTriggerCount) { throw "task_trigger_oracle_disagreement" }
+    return $ComTriggerCount
+}
+
 function Assert-XbWorkerTaskContract {
     param([Parameter(Mandatory)]$Task, $ExpectedIdentity)
-    if ($Task.State -ne "Disabled") { throw "task_not_disabled" }
-    if (@($Task.Triggers).Count -ne 0) { throw "task_triggers_present" }
-    if (@($Task.Actions).Count -ne 1) { throw "task_action_count_invalid" }
-    $arguments = [string]$Task.Actions[0].Arguments
+    if ([string]$Task.TaskPath -cne $taskPath -or [string]$Task.TaskName -cne $taskName) { throw "task_identity_invalid" }
+    $registered = Get-XbRegisteredWorkerTaskView
+    $definition = $registered.Definition
+    if ($Task.State -ne "Disabled" -or [bool]$registered.Enabled -or [bool]$definition.Settings.Enabled) { throw "task_not_disabled" }
+    $triggerCount = Get-XbTaskTriggerOracleCount -ComTriggerCount ([int]$definition.Triggers.Count) -TaskXml ([string]$registered.Xml) -CimTriggers $Task.Triggers
+    if ($triggerCount -ne 0) { throw "task_triggers_present" }
+    $actions = @(@($Task.Actions) | Where-Object { $null -ne $_ })
+    if ($actions.Count -ne 1 -or [int]$definition.Actions.Count -ne 1) { throw "task_action_count_invalid" }
+    $arguments = [string]$actions[0].Arguments
     if ($arguments -notmatch '(?:^|\s)-Mode\s+DisabledProof(?:\s|$)') { throw "task_action_mode_invalid" }
     if ($arguments -match 'EnableProduction(?:Worker|Adapter)') { throw "task_production_switch_present" }
     if ([string]$Task.Settings.MultipleInstances -ne "IgnoreNew") { throw "task_multiple_instances_invalid" }
@@ -175,7 +245,9 @@ function Assert-XbWorkerTaskContract {
     if ($null -eq $ExpectedIdentity) {
         $ExpectedIdentity = Get-XbWorkerTaskIdentity -LauncherPath (Join-Path $InstallRoot "launch_ac2_member_gateway_worker.ps1") -WorkerAccount $WorkerAccount
     }
-    $action = $Task.Actions[0]
+    $action = $actions[0]
+    $comAction = $definition.Actions.Item(1)
+    if ([int]$comAction.Type -ne 0 -or [string]$comAction.Path -cne [string]$ExpectedIdentity.executable -or [string]$comAction.Arguments -cne [string]$ExpectedIdentity.arguments) { throw "task_identity_invalid" }
     $workingDirectory = if ($action.PSObject.Properties.Name -contains "WorkingDirectory") { [string]$action.WorkingDirectory } else { "" }
     $principal = $Task.Principal
     if ([string]$action.Execute -cne [string]$ExpectedIdentity.executable -or
@@ -216,6 +288,81 @@ function Remove-XbWorkerOwnedState {
     if ($TaskMayExist) { Remove-XbWorkerScheduledTask }
     if (Test-Path -LiteralPath $InstallRoot) { Remove-Item -LiteralPath $InstallRoot -Recurse -Force -ErrorAction Stop }
     if (Test-Path -LiteralPath $RuntimeRoot) { Remove-Item -LiteralPath $RuntimeRoot -Recurse -Force -ErrorAction Stop }
+}
+
+function Test-XbContainerPresent {
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$ErrorId)
+    try { $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop }
+    catch [Management.Automation.ItemNotFoundException] { return $false }
+    catch { throw $ErrorId }
+    if (-not $item.PSIsContainer) { throw $ErrorId }
+    return $true
+}
+
+function Get-XbInstallPreimage {
+    return [ordered]@{
+        program_files_parent = Test-XbContainerPresent -Path (Split-Path -Parent $InstallRoot) -ErrorId "container_preimage_unproven"
+        program_data_parent = Test-XbContainerPresent -Path (Split-Path -Parent $RuntimeRoot) -ErrorId "container_preimage_unproven"
+        scheduler_folder = Test-XbTaskFolderPresent -Path $taskPath -ErrorId "task_folder_preimage_unproven"
+    }
+}
+
+# Rollback may remove an attempt-created parent only while it is an ordinary, empty, non-reparse directory.
+function Remove-XbAttemptCreatedContainer {
+    param([Parameter(Mandatory)][string]$Path)
+    if (-not (Test-XbContainerPresent -Path $Path -ErrorId "container_not_owned_empty")) { return }
+    try {
+        $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+        $childCount = @(Get-ChildItem -LiteralPath $Path -Force -ErrorAction Stop).Count
+    } catch { throw "container_not_owned_empty" }
+    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or $childCount -ne 0) { throw "container_not_owned_empty" }
+    Remove-Item -LiteralPath $Path -Force -ErrorAction Stop
+    if (Test-XbContainerPresent -Path $Path -ErrorId "container_presence_unproven") { throw "container_still_present" }
+}
+
+function Remove-XbAttemptCreatedTaskFolder {
+    $service = Connect-XbTaskService
+    $folderPath = ConvertTo-XbComFolderPath $taskPath
+    try { $folder = $service.GetFolder($folderPath) }
+    catch {
+        if ((Get-XbComHResult $_) -eq -2147024894) { return }
+        throw "container_not_owned_empty"
+    }
+    try {
+        $taskCount = [int]$folder.GetTasks(1).Count
+        $folderCount = [int]$folder.GetFolders(0).Count
+    } catch { throw "container_not_owned_empty" }
+    if ($folderPath -eq "\" -or $taskCount -ne 0 -or $folderCount -ne 0) { throw "container_not_owned_empty" }
+    $separator = $folderPath.LastIndexOf('\')
+    $parentPath = if ($separator -eq 0) { "\" } else { $folderPath.Substring(0, $separator) }
+    try { $service.GetFolder($parentPath).DeleteFolder($folderPath.Substring($separator + 1), 0) }
+    catch { throw "task_folder_delete_failed" }
+    if (Test-XbTaskFolderPresent -Path $taskPath -ErrorId "task_folder_presence_unproven") { throw "task_folder_still_present" }
+}
+
+# Task preimage is proven absent before Install, so an absent task after an attempted registration is restored state.
+function Remove-XbAttemptRegisteredTask {
+    param([Parameter(Mandatory)][string]$LauncherPath)
+    $task = Get-XbWorkerTaskIfPresent
+    if ($null -eq $task) { return }
+    $expected = Get-XbWorkerTaskIdentity -LauncherPath $LauncherPath -WorkerAccount $WorkerAccount
+    $actions = @(@($task.Actions) | Where-Object { $null -ne $_ })
+    if ($actions.Count -ne 1 -or
+        [string]$actions[0].Execute -cne [string]$expected.executable -or
+        [string]$actions[0].Arguments -cne [string]$expected.arguments -or
+        $null -eq $task.Principal -or
+        [string]$task.Principal.UserId -cne [string]$expected.principal_user_id) { throw "task_identity_unexpected" }
+    Remove-XbWorkerScheduledTask
+}
+
+function Invoke-XbWorkerInstallRollback {
+    param([Parameter(Mandatory)]$Preimage, [Parameter(Mandatory)][string]$StageRoot, [Parameter(Mandatory)][bool]$RegistrationAttempted)
+    if ($RegistrationAttempted) { Remove-XbAttemptRegisteredTask -LauncherPath (Join-Path $InstallRoot "launch_ac2_member_gateway_worker.ps1") }
+    Remove-XbWorkerOwnedState
+    if (Test-Path -LiteralPath $StageRoot) { Remove-Item -LiteralPath $StageRoot -Recurse -Force -ErrorAction Stop }
+    if (-not $Preimage.scheduler_folder) { Remove-XbAttemptCreatedTaskFolder }
+    if (-not $Preimage.program_files_parent) { Remove-XbAttemptCreatedContainer -Path (Split-Path -Parent $InstallRoot) }
+    if (-not $Preimage.program_data_parent) { Remove-XbAttemptCreatedContainer -Path (Split-Path -Parent $RuntimeRoot) }
 }
 
 function Assert-XbUninstallOwnership {
@@ -267,7 +414,7 @@ function Register-XbWorkerScheduledTask {
     $taskPrincipal = New-ScheduledTaskPrincipal -UserId $WorkerAccount -LogonType Password -RunLevel Limited
     $task = New-ScheduledTask -Action $action -Settings $settings -Principal $taskPrincipal
     $plainPassword = $TaskCredential.GetNetworkCredential().Password
-    $script:XbTaskMayExist = $true
+    $script:XbTaskRegistrationAttempted = $true
     try { Register-ScheduledTask -TaskPath $taskPath -TaskName $taskName -InputObject $task -User $WorkerAccount -Password $plainPassword -Force | Out-Null; $script:XbTaskCreated = $true }
     finally { $plainPassword = $null }
     Assert-XbWorkerTaskContract -Task (Get-ScheduledTask -TaskPath $taskPath -TaskName $taskName -ErrorAction Stop) -ExpectedIdentity (Get-XbWorkerTaskIdentity -LauncherPath $LauncherPath -WorkerAccount $WorkerAccount)
@@ -293,9 +440,10 @@ if ($Operation -eq "Install") {
     if (Test-Path -LiteralPath $RuntimeRoot) { throw "runtime_preimage_exists" }
     if ($null -ne (Get-XbWorkerTaskIfPresent)) { throw "task_preimage_exists" }
 
+    $preimage = Get-XbInstallPreimage
     $stageRoot = Join-Path ([IO.Path]::GetTempPath()) ("xb-member-worker-" + [Guid]::NewGuid().ToString("N"))
     $script:XbTaskCreated = $false
-    $script:XbTaskMayExist = $false
+    $script:XbTaskRegistrationAttempted = $false
     try {
         New-Item -ItemType Directory -Path $stageRoot | Out-Null
         foreach ($name in $packageFiles) { Copy-Item -LiteralPath (Join-Path $sourceRoot $name) -Destination (Join-Path $stageRoot $name) }
@@ -315,9 +463,8 @@ if ($Operation -eq "Install") {
     }
     catch {
         $originalError = $_
-        try { Remove-XbWorkerOwnedState -TaskMayExist:([bool]$script:XbTaskMayExist) }
+        try { Invoke-XbWorkerInstallRollback -Preimage $preimage -StageRoot $stageRoot -RegistrationAttempted ([bool]$script:XbTaskRegistrationAttempted) }
         catch { if (Test-Path -LiteralPath $stageRoot) { Remove-Item -LiteralPath $stageRoot -Recurse -Force -ErrorAction Stop }; throw "install_rollback_failed: $($_.Exception.Message)" }
-        if (Test-Path -LiteralPath $stageRoot) { Remove-Item -LiteralPath $stageRoot -Recurse -Force -ErrorAction Stop }
         throw $originalError
     }
     return
