@@ -6933,15 +6933,70 @@ class LauncherStaticGuards(TierCBase):
     # no headed switch, and no way for a caller to reach the child with anything
     # of their own. These guards are what stop that from drifting.
 
-    def test_the_command_allowlist_is_exactly_the_three_admitted_operations(self):
-        """A closed ValidateSet, read from the committed script rather than assumed."""
+    def test_the_command_allowlist_is_exactly_the_four_admitted_operations(self):
+        """A closed ValidateSet, read from the committed script rather than assumed.
+
+        DL-XB-199 G2-083 / G3-084 admits `download-preflight-diagnostic` as the
+        fourth fixed name; nothing else changes and the default stays `run`.
+        """
         match = re.search(
             r"\[ValidateSet\(([^)]*)\)\]\[string\]\$Command", self.launcher
         )
         self.assertIsNotNone(match, "-Command must carry a ValidateSet")
         admitted = re.findall(r"'([^']*)'", match.group(1))
-        self.assertEqual(["run", "list", "login-diagnostic"], admitted)
+        self.assertEqual(
+            ["run", "list", "login-diagnostic", "download-preflight-diagnostic"], admitted
+        )
         self.assertIn("$Command = 'run'", self.launcher, "the default stays `run`")
+
+    def test_the_preflight_command_adds_no_parameter_branch_or_child_argument(self):
+        """The new name is only an allowlist entry: no per-command code path."""
+        occurrences = [
+            line.strip()
+            for line in self.launcher.splitlines()
+            if "download-preflight-diagnostic" in line
+        ]
+        self.assertEqual(2, len(occurrences), occurrences)
+        self.assertTrue(occurrences[0].startswith("#"), "one mention is header prose")
+        self.assertTrue(occurrences[1].startswith("[ValidateSet("), "the other is the allowlist")
+        for forbidden in (
+            "-eq 'download-preflight-diagnostic'",
+            "-ceq 'download-preflight-diagnostic'",
+            "switch ($Command)",
+            "if ($Command",
+        ):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, self.launcher)
+        param_block = self.launcher[
+            self.launcher.index("[CmdletBinding()]"):self.launcher.index("Set-StrictMode")
+        ]
+        self.assertEqual(
+            [
+                "ConfigPath", "PythonExe", "CheckoutRoot", "CredentialPath",
+                "BrowserCachePath", "ExpectedBranch", "AuthorisedLauncherRootWriteSid",
+                "Command", "LogRoot", "ValidateOnly", "RunId",
+            ],
+            re.findall(r"\$([A-Za-z]+)(?: = 'run')?,?\s*$", param_block, re.M),
+            "the parameter surface is unchanged",
+        )
+
+    def test_the_launcher_states_the_preflight_command_is_headless_and_no_download(self):
+        prose = normalised_prose(self.launcher[:self.launcher.index("[CmdletBinding()]")])
+        for phrase in (
+            "download-preflight-diagnostic",
+            "always headless",
+            "never dispatches a download",
+            "closed allowlist of four fixed operation names",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase.lower(), prose)
+
+    def test_the_library_and_installer_do_not_name_any_command(self):
+        """G3-084 changes launcher.ps1 only; the library and installer stay command-agnostic."""
+        for name in ("launcher_lib.ps1", "install_or_update_launcher.ps1"):
+            text = (RUNTIME_DIR / name).read_text(encoding="utf-8")
+            with self.subTest(file=name):
+                self.assertNotIn("download-preflight-diagnostic", text)
 
     def test_the_child_argument_vector_is_fixed_and_never_extended(self):
         """Five elements, one assignment, and no conditional append anywhere."""
@@ -7362,7 +7417,7 @@ class ChildStreamTransportStaticGuards(TierCBase):
         region = self.capture + self.relay
         for forbidden in ("ConvertFrom-Json", "ConvertTo-Json", "Select-String",
                           "-match", "-like", "-replace", "Out-String", "$Command",
-                          "login-diagnostic", "schema"):
+                          "login-diagnostic", "download-preflight-diagnostic", "schema"):
             with self.subTest(forbidden=forbidden):
                 self.assertNotIn(
                     forbidden, region,
@@ -8323,21 +8378,83 @@ class RuntimeDocumentation(TierCBase):
         """Scheduler semantics are unchanged: the scheduled shape still runs `run`."""
         text = SCHEDULER_EXAMPLE.read_text(encoding="utf-8")
         self.assertNotIn("login-diagnostic", text)
+        self.assertNotIn("download-preflight-diagnostic", text)
         self.assertNotIn("-Headed", text)
         for command in SCHEDULER_MUTATING_COMMANDS:
             with self.subTest(command=command):
                 self.assertNotIn(command, text)
 
     def test_the_runtime_readme_documents_the_bounded_diagnostic_command(self):
-        """The directory-level contract states the third command and its bounds."""
+        """The directory-level contract states the admitted commands and their bounds."""
         text = RUNTIME_README.read_text(encoding="utf-8")
-        self.assertIn("`run` (default), `list`, or `login-diagnostic`", text)
+        self.assertIn(
+            "`run` (default), `list`, `login-diagnostic`, or `download-preflight-diagnostic`", text
+        )
         prose = normalised_prose(text)
         for phrase in (
             "no generic headed switch",
             "implicit and non-overridable",
             "exactly five",
             "nothing is appended conditionally",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase.lower(), prose)
+
+    def test_the_runtime_readme_documents_the_preflight_command_and_stale_install(self):
+        prose = normalised_prose(RUNTIME_README.read_text(encoding="utf-8"))
+        for phrase in (
+            "closed allowlist of four fixed operation names",
+            "fixed headless no-download pre-dispatch diagnostic",
+            "never clicks download",
+            "energygrid.download_preflight_diagnostic.v1",
+            "adds no parameter",
+            "same fixed five elements",
+            "keeps its previously admitted allowlist",
+            "changing this source file deploys nothing",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase.lower(), prose)
+
+    def test_the_design_document_records_the_preflight_amendment(self):
+        text = DESIGN_DOCUMENT.read_text(encoding="utf-8")
+        self.assertIn("### 5.5 Bounded download-preflight diagnostic operation", text)
+        self.assertIn("`download-preflight-diagnostic` (section 5.5)", text)
+        prose = normalised_prose(text)
+        for phrase in (
+            "closed allowlist of four fixed operation names",
+            "adds no launcher parameter, no headed switch and no child argument",
+            "`launcher_lib.ps1`, the installer and the manifest schema are unchanged",
+            "never clicks download",
+            "energygrid.download_preflight_diagnostic.v1",
+            "scheduler semantics are unchanged",
+            "one-shot supervisor remains run-only",
+            "installed launcher stays stale",
+            "refreshes any admission baseline",
+            "deploys nothing and grants no live diagnostic authority",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase.lower(), prose)
+
+    def test_the_runbook_documents_the_preflight_command_contract(self):
+        text = PROJECT_RUNBOOK.read_text(encoding="utf-8")
+        self.assertIn(
+            "python -m energygrid_bill_downloader download-preflight-diagnostic "
+            "--config <EXTERNAL_CONFIG_JSON>",
+            text,
+        )
+        prose = normalised_prose(text)
+        for phrase in (
+            "`run | list | login-diagnostic | download-preflight-diagnostic` allowlist",
+            "accepts `--config` and nothing else",
+            "never clicks download",
+            "energygrid.download_preflight_diagnostic.v1",
+            "`download_dispatched` (always `false`)",
+            "`output_rejected`",
+            "it never exits `10`",
+            "grants no live diagnostic, credential use, deployment, retry or scheduler authority",
+            "`row_ordinal`",
+            "`preflight_reason` and `preflight_checkpoint`",
+            "strict external run-log collector",
         ):
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase.lower(), prose)

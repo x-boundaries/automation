@@ -954,7 +954,13 @@ class LoginDiagnosticCliTests(unittest.TestCase):
         ]
         self.assertEqual(
             list(actions[0].choices),
-            ["run", "list", "login-diagnostic", "navigation-diagnostic"],
+            [
+                "run",
+                "list",
+                "login-diagnostic",
+                "navigation-diagnostic",
+                "download-preflight-diagnostic",
+            ],
         )
 
     # ---- the run itself ---- #
@@ -1981,6 +1987,507 @@ class NavigationDiagnosticRunbookTests(unittest.TestCase):
         for phrase in required:
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, runbook)
+
+
+# ---- DL-XB-199 G2-083 / G3-084: the no-Download pre-dispatch diagnostic ---- #
+#
+# The CLI half of the contract: a closed `--config`-only surface, a fixed
+# headless portal, one exact closed document, the exit mapping, the early
+# return that never reaches the run machinery, and fail-closed output.
+
+
+def preflight_evidence(**overrides) -> portal_module.DownloadPreflightEvidence:
+    values = {
+        "row_ordinal": 1,
+        "reason_code": "CONTROL_NOT_ENABLED",
+        "last_checkpoint": "CONTROL_ENABLED",
+        "window_expired": True,
+        "not_ready_looks": 7,
+        "elapsed_bucket": "LT_60S",
+        "control": portal_module.DownloadPreflightControl(
+            count_bucket=1, visible=True, enabled=False
+        ),
+        "snapshot": None,
+    }
+    values.update(overrides)
+    return portal_module.DownloadPreflightEvidence(**values)
+
+
+def preflight_portal(
+    *,
+    rows: int = 3,
+    result=None,
+    login_error: BaseException | None = None,
+    inventory_error: BaseException | None = None,
+    preflight_error: BaseException | None = None,
+    enter_error: BaseException | None = None,
+    recorder: dict | None = None,
+):
+    """A portal class that satisfies the diagnostic CLI contract without a browser."""
+
+    record = recorder if recorder is not None else {}
+    record.setdefault("headed", [])
+    record.setdefault("calls", [])
+
+    class StubPreflightPortal:
+        def __init__(self, config, headed: bool = False) -> None:
+            record["headed"].append(headed)
+
+        def __enter__(self) -> "StubPreflightPortal":
+            if enter_error is not None:
+                raise enter_error
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            record["calls"].append("close")
+            return None
+
+        def login(self) -> None:
+            record["calls"].append("login")
+            if login_error is not None:
+                raise login_error
+
+        def inventory(self, safety_ceiling: int) -> list:
+            record["calls"].append("inventory")
+            if inventory_error is not None:
+                raise inventory_error
+            return [portal_module.InvoiceRow(ordinal=index, binding=object()) for index in range(rows)]
+
+        def download_preflight(self, handles) -> object:
+            record["calls"].append(("download_preflight", len(handles)))
+            if preflight_error is not None:
+                raise preflight_error
+            if result is not None:
+                return result
+            return portal_module.DownloadPreflightDiagnosticResult(rows_passed=len(handles))
+
+        def download(self, row, destination) -> str:
+            raise AssertionError("the diagnostic must never dispatch a Download")
+
+        def login_diagnostic(self):
+            raise AssertionError("wrong diagnostic")
+
+        def navigation_diagnostic(self):
+            raise AssertionError("wrong diagnostic")
+
+    return StubPreflightPortal
+
+
+class DownloadPreflightDiagnosticCliTests(unittest.TestCase):
+    COMMAND = "download-preflight-diagnostic"
+
+    def write_config(self, root: Path) -> Path:
+        (root / "archive").mkdir()
+        config_path = root / "config.json"
+        config_path.write_text(
+            json.dumps(
+                {
+                    "portal_url": "http://127.0.0.1:1/synthetic",
+                    "account_identity": "SYNTHETIC-INTENDED-ACCOUNT",
+                    "archive_root": str(root / "archive"),
+                    "state_path": str(root / "state" / "state.sqlite3"),
+                    "temp_root": str(root / "temp"),
+                    "log_root": str(root / "logs"),
+                    "timeout_seconds": 5,
+                    "max_attempts": 2,
+                    "inventory_safety_ceiling": 50,
+                }
+            ),
+            encoding="utf-8",
+        )
+        return config_path
+
+    def run_preflight(self, root: Path, portal_cls, config_path: Path | None = None):
+        config_path = config_path or self.write_config(root)
+        original = cli.PlaywrightPortal
+        cli.PlaywrightPortal = portal_cls
+        out, err = io.StringIO(), io.StringIO()
+        environment = {
+            "ENERGYGRID_USERNAME": DIAGNOSTIC_SENTINEL_USERNAME,
+            "ENERGYGRID_PASSWORD": DIAGNOSTIC_SENTINEL_PASSWORD,
+        }
+        previous = {name: os.environ.get(name) for name in environment}
+        os.environ.update(environment)
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                exit_code = main([self.COMMAND, "--config", str(config_path)])
+        finally:
+            cli.PlaywrightPortal = original
+            for name, value in previous.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+        return exit_code, out.getvalue(), err.getvalue()
+
+    def document(self, out: str) -> dict:
+        lines = out.strip().splitlines()
+        self.assertEqual(len(lines), 1, "exactly one document")
+        document = json.loads(lines[0])
+        self.assertEqual(set(document), set(cli._PREFLIGHT_DOCUMENT_KEYS))
+        self.assertEqual(document["schema"], "energygrid.download_preflight_diagnostic.v1")
+        self.assertIs(document["download_dispatched"], False)
+        return document
+
+    def outcome(self, portal_cls):
+        with tempfile.TemporaryDirectory() as name:
+            exit_code, out, err = self.run_preflight(Path(name), portal_cls)
+        self.assertEqual(err, "", "stderr stays empty")
+        return exit_code, self.document(out)
+
+    # ---- argument surface ---- #
+
+    def test_the_command_accepts_only_a_config_argument(self) -> None:
+        args = build_parser().parse_args([self.COMMAND, "--config", "C:/private/eg.json"])
+        self.assertEqual(args.command, self.COMMAND)
+        self.assertEqual(vars(args).keys(), {"command", "config"})
+        for extra in (
+            ["--headed"],
+            ["--archive-root", "C:/private/archive"],
+            ["--state-path", "C:/private/state.sqlite3"],
+            ["--temp-root", "C:/private/temp"],
+            ["--log-root", "C:/private/logs"],
+            ["--timeout-seconds", "9"],
+            ["--max-attempts", "3"],
+            ["--attempt", "1"],
+            ["--portal-url", "http://example.invalid"],
+            ["extra-positional"],
+        ):
+            with self.subTest(extra=extra):
+                with self.assertRaises(ConfigError):
+                    build_parser().parse_args([self.COMMAND, "--config", "C:/private/eg.json", *extra])
+        with self.assertRaises(ConfigError):
+            build_parser().parse_args([self.COMMAND])
+
+    def test_the_portal_is_always_headless(self) -> None:
+        recorder: dict = {}
+        exit_code, _document = self.outcome(preflight_portal(recorder=recorder))
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(recorder["headed"], [False], "headless is a property, not a choice")
+        self.assertEqual(
+            recorder["calls"], ["login", "inventory", ("download_preflight", 3), "close"]
+        )
+
+    # ---- result and exit paths ---- #
+
+    def test_all_rows_passed_is_complete_and_exits_zero(self) -> None:
+        exit_code, document = self.outcome(preflight_portal(rows=3))
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            document,
+            {
+                "schema": cli.DOWNLOAD_PREFLIGHT_DIAGNOSTIC_SCHEMA,
+                "status": cli.DIAGNOSTIC_COMPLETE,
+                "result": "PREFLIGHT_ALL_ROWS_PASSED",
+                "support_ref": None,
+                "download_dispatched": False,
+                "inventory_count": 3,
+                "rows_passed": 3,
+                "failure": None,
+            },
+        )
+
+    def test_a_typed_row_failure_is_complete_and_names_its_closed_reason(self) -> None:
+        result = portal_module.DownloadPreflightDiagnosticResult(rows_passed=1, failure=preflight_evidence())
+        exit_code, document = self.outcome(preflight_portal(rows=3, result=result))
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(document["status"], cli.DIAGNOSTIC_COMPLETE)
+        self.assertEqual(document["result"], "PREFLIGHT_ROW_FAILED")
+        self.assertIsNone(document["support_ref"])
+        self.assertEqual((document["inventory_count"], document["rows_passed"]), (3, 1))
+        self.assertEqual(
+            document["failure"],
+            {
+                "row_ordinal": 1,
+                "reason_code": "CONTROL_NOT_ENABLED",
+                "last_checkpoint": "CONTROL_ENABLED",
+                "window_expired": True,
+                "not_ready_looks": 7,
+                "elapsed_bucket": "LT_60S",
+                "control": {
+                    "count_bucket": 1,
+                    "visible": True,
+                    "enabled": False,
+                    "trial_actionability": "NOT_REACHED",
+                },
+                "snapshot": None,
+            },
+        )
+
+    def test_a_snapshot_mismatch_carries_only_the_bounded_comparison(self) -> None:
+        evidence = preflight_evidence(
+            row_ordinal=0,
+            reason_code="SNAPSHOT_MISMATCH",
+            last_checkpoint="SNAPSHOT_COMPARE",
+            window_expired=False,
+            not_ready_looks=0,
+            elapsed_bucket="LT_250MS",
+            control=portal_module.DownloadPreflightControl(),
+            snapshot=portal_module.DownloadPreflightSnapshot(
+                row_count_equal=True, header_equal=True, rows_equal_as_set=True, changed_row_count=2
+            ),
+        )
+        result = portal_module.DownloadPreflightDiagnosticResult(rows_passed=0, failure=evidence)
+        exit_code, document = self.outcome(preflight_portal(rows=3, result=result))
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            document["failure"]["snapshot"],
+            {"row_count_equal": True, "header_equal": True, "rows_equal_as_set": True, "changed_row_count": 2},
+        )
+
+    def test_every_failure_to_observe_is_action_required_with_its_exit_code(self) -> None:
+        cases = (
+            (preflight_portal(enter_error=DependencyError("Playwright Chromium could not be started")),
+             "CONFIGURATION_FAILED", 64, "APP_ERROR_UNCLASSIFIED"),
+            (preflight_portal(login_error=LoginError("portal rejected the login")),
+             "LOGIN_FAILED", 20, "EG_LOGIN_PORTAL_REJECTED"),
+            (preflight_portal(login_error=LayoutChangedError("login submit control did not appear")),
+             "LOGIN_FAILED", 20, "EG_LOGIN_SUBMIT_NOT_APPEAR"),
+            (preflight_portal(inventory_error=LayoutChangedError(portal_module.RESULTS_HEADER_ONLY_MESSAGE)),
+             "INVENTORY_FAILED", 20, "EG_NAV_RESULTS_HEADER_ONLY"),
+            (preflight_portal(login_error=RuntimeError("private https://portal.example.invalid hunter2")),
+             "UNEXPECTED_FAILURE", 20, "APP_ERROR_UNCLASSIFIED"),
+            (preflight_portal(preflight_error=AppError("private ACCT-778899")),
+             "UNEXPECTED_FAILURE", 20, "APP_ERROR_UNCLASSIFIED"),
+            (preflight_portal(preflight_error=RuntimeError("private ACCT-778899")),
+             "UNEXPECTED_FAILURE", 20, "APP_ERROR_UNCLASSIFIED"),
+        )
+        for portal_cls, result, exit_expected, support_ref in cases:
+            with self.subTest(result=result, support_ref=support_ref):
+                exit_code, document = self.outcome(portal_cls)
+                self.assertEqual(exit_code, exit_expected)
+                self.assertEqual(document["status"], ACTION_REQUIRED)
+                self.assertEqual(document["result"], result)
+                self.assertEqual(document["support_ref"], support_ref)
+                self.assertIsNone(document["inventory_count"])
+                self.assertIsNone(document["rows_passed"])
+                self.assertIsNone(document["failure"])
+
+    def test_an_empty_inventory_is_action_required_and_never_inspected(self) -> None:
+        recorder: dict = {}
+        exit_code, document = self.outcome(preflight_portal(rows=0, recorder=recorder))
+        self.assertEqual(exit_code, 20)
+        self.assertEqual(document["result"], "INVENTORY_EMPTY")
+        self.assertEqual((document["inventory_count"], document["rows_passed"]), (0, 0))
+        self.assertIsNone(document["support_ref"])
+        self.assertNotIn(("download_preflight", 0), recorder["calls"])
+
+    def test_an_unreadable_configuration_exits_64_with_one_document(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            config_path = root / "missing.json"
+            exit_code, out, err = self.run_preflight(root, preflight_portal(), config_path)
+        document = self.document(out)
+        self.assertEqual(exit_code, 64)
+        self.assertEqual(err, "")
+        self.assertEqual(document["result"], "CONFIGURATION_FAILED")
+        self.assertIn(document["support_ref"], cli.DOWNLOAD_PREFLIGHT_ALLOWED_SUPPORT_REFS)
+
+    def test_a_malformed_portal_result_is_rejected_wholesale(self) -> None:
+        malformed = (
+            {"rows_passed": 3},
+            portal_module.DownloadPreflightDiagnosticResult(rows_passed=2),
+            portal_module.DownloadPreflightDiagnosticResult(rows_passed=3, download_dispatched=True),
+            portal_module.DownloadPreflightDiagnosticResult(rows_passed=True),
+            portal_module.DownloadPreflightDiagnosticResult(
+                rows_passed=0, failure=preflight_evidence(row_ordinal=0, reason_code="PRIVATE ACCT-778899")
+            ),
+            portal_module.DownloadPreflightDiagnosticResult(rows_passed=1, failure=preflight_evidence(row_ordinal=2)),
+            portal_module.DownloadPreflightDiagnosticResult(
+                rows_passed=1, failure=preflight_evidence(last_checkpoint="CONTROL_ACTIONABLE")
+            ),
+            portal_module.DownloadPreflightDiagnosticResult(
+                rows_passed=1, failure=preflight_evidence(window_expired=False)
+            ),
+            portal_module.DownloadPreflightDiagnosticResult(
+                rows_passed=1,
+                failure=preflight_evidence(
+                    snapshot=portal_module.DownloadPreflightSnapshot(True, True, True, 0)
+                ),
+            ),
+            portal_module.DownloadPreflightDiagnosticResult(
+                rows_passed=1, failure=preflight_evidence(elapsed_bucket="12345ms")
+            ),
+            portal_module.DownloadPreflightDiagnosticResult(
+                rows_passed=1, failure=preflight_evidence(not_ready_looks=10_000)
+            ),
+            portal_module.DownloadPreflightDiagnosticResult(
+                rows_passed=1,
+                failure=preflight_evidence(
+                    control=portal_module.DownloadPreflightControl(count_bucket=0, visible=True)
+                ),
+            ),
+        )
+        for result in malformed:
+            with self.subTest(result=repr(result)[:80]):
+                exit_code, document = self.outcome(preflight_portal(rows=3, result=result))
+                self.assertEqual(exit_code, 20)
+                self.assertEqual(
+                    document,
+                    {
+                        "schema": cli.DOWNLOAD_PREFLIGHT_DIAGNOSTIC_SCHEMA,
+                        "status": ACTION_REQUIRED,
+                        "result": "OUTPUT_REJECTED",
+                        "support_ref": None,
+                        "download_dispatched": False,
+                        "inventory_count": None,
+                        "rows_passed": None,
+                        "failure": None,
+                    },
+                )
+                self.assertNotIn("ACCT", json.dumps(document))
+
+    def test_the_validator_is_exact_closed_and_total(self) -> None:
+        valid = cli.download_preflight_document(
+            3, portal_module.DownloadPreflightDiagnosticResult(rows_passed=1, failure=preflight_evidence())
+        )
+        self.assertTrue(cli._valid_preflight_document(valid))
+
+        class SubDict(dict):
+            pass
+
+        def mutated(change):
+            document = json.loads(json.dumps(valid))
+            change(document)
+            return document
+
+        rejected = (
+            mutated(lambda d: d.update(extra=1)),
+            mutated(lambda d: d.pop("support_ref")),
+            mutated(lambda d: d.update(schema="energygrid.download_preflight_diagnostic.v2")),
+            mutated(lambda d: d.update(status="ACTION_REQUIRED")),
+            mutated(lambda d: d.update(download_dispatched=0)),
+            mutated(lambda d: d.update(support_ref="EG_NAV_RESULTS_HEADER_ONLY")),
+            mutated(lambda d: d.update(inventory_count=3.0)),
+            mutated(lambda d: d.update(rows_passed=True)),
+            mutated(lambda d: d["failure"].update(row_ordinal=1.0)),
+            mutated(lambda d: d["failure"].update(extra="x")),
+            mutated(lambda d: d["failure"]["control"].update(visible="yes")),
+            mutated(lambda d: d["failure"]["control"].update(count_bucket=2)),
+            mutated(lambda d: d["failure"]["control"].update(trial_actionability="MAYBE")),
+            mutated(lambda d: d["failure"].update(control=SubDict(d["failure"]["control"]))),
+            SubDict(valid),
+            None,
+            [],
+            "document",
+        )
+        for document in rejected:
+            with self.subTest(document=repr(document)[:80]):
+                self.assertFalse(cli._valid_preflight_document(document))
+        # A failure object is admitted by exactly one result.
+        for result in cli.DOWNLOAD_PREFLIGHT_DIAGNOSTIC_RESULTS:
+            if result == "PREFLIGHT_ROW_FAILED":
+                continue
+            with self.subTest(result=result):
+                self.assertFalse(
+                    cli._valid_preflight_document(mutated(lambda d, r=result: d.update(result=r)))
+                )
+
+    def test_a_serialisation_failure_emits_the_fixed_rejected_document(self) -> None:
+        valid = cli.download_preflight_document(3, portal_module.DownloadPreflightDiagnosticResult(rows_passed=3))
+        out = io.StringIO()
+        with mock.patch.object(cli.json, "dumps", side_effect=[TypeError("private"), json.dumps(cli._preflight_rejected_document(), sort_keys=True)]):
+            with contextlib.redirect_stdout(out):
+                emitted = cli.emit_download_preflight_diagnostic(valid)
+        self.assertEqual(emitted["result"], "OUTPUT_REJECTED")
+        self.assertEqual(json.loads(out.getvalue())["result"], "OUTPUT_REJECTED")
+        self.assertEqual(cli._download_preflight_exit_code(emitted), 20)
+
+    # ---- isolation from the run path ---- #
+
+    def test_the_run_path_machinery_is_unreachable(self) -> None:
+        def explode(*_args, **_kwargs):
+            raise AssertionError("the diagnostic reached the run path")
+
+        with tempfile.TemporaryDirectory() as name:
+            with mock.patch.object(cli, "SafeLogger", explode), \
+                    mock.patch.object(cli, "StateStore", explode), \
+                    mock.patch.object(cli, "cleanup_stale_owned_temp", explode), \
+                    mock.patch.object(cli, "reconcile_inventory", explode), \
+                    mock.patch.object(RuntimeConfig, "preflight", explode):
+                exit_code, out, err = self.run_preflight(Path(name), preflight_portal())
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(err, "")
+        self.assertEqual(self.document(out)["result"], "PREFLIGHT_ALL_ROWS_PASSED")
+
+    def test_the_diagnostic_creates_no_filesystem_artefact(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            config_path = self.write_config(root)
+            before = sorted(path.relative_to(root).as_posix() for path in root.rglob("*"))
+            for portal_cls in (
+                preflight_portal(),
+                preflight_portal(result=portal_module.DownloadPreflightDiagnosticResult(rows_passed=1, failure=preflight_evidence())),
+                preflight_portal(login_error=LoginError("portal rejected the login")),
+            ):
+                self.run_preflight(root, portal_cls, config_path)
+            after = sorted(path.relative_to(root).as_posix() for path in root.rglob("*"))
+        self.assertEqual(before, after, "no state, log, temp or archive artefact")
+
+    def test_the_diagnostic_never_returns_the_retryable_code(self) -> None:
+        for portal_cls in (
+            preflight_portal(login_error=DownloadError("synthetic network failure")),
+            preflight_portal(inventory_error=DownloadError("synthetic network failure")),
+            preflight_portal(preflight_error=DownloadError("synthetic network failure")),
+        ):
+            exit_code, document = self.outcome(portal_cls)
+            self.assertNotEqual(exit_code, 10)
+            self.assertIn(exit_code, (0, 20, 64))
+
+    def test_process_control_is_never_converted_into_a_result(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            with self.assertRaises(KeyboardInterrupt):
+                self.run_preflight(Path(name), preflight_portal(login_error=KeyboardInterrupt()))
+
+    # ---- privacy ---- #
+
+    def test_no_private_or_free_form_value_reaches_any_output(self) -> None:
+        hostile = "private ACCT-778899 https://portal.example.invalid 2026-05-01_account_a.pdf"
+        closed = (
+            set(cli.DOWNLOAD_PREFLIGHT_DIAGNOSTIC_RESULTS)
+            | set(portal_module.DOWNLOAD_PREFLIGHT_REASONS)
+            | set(portal_module.DOWNLOAD_PREFLIGHT_CHECKPOINTS)
+            | set(portal_module.DOWNLOAD_PREFLIGHT_ELAPSED_BUCKETS)
+            | set(portal_module.DOWNLOAD_PREFLIGHT_TRIAL_OUTCOMES)
+            | set(cli.DOWNLOAD_PREFLIGHT_ALLOWED_SUPPORT_REFS)
+            | {cli.DOWNLOAD_PREFLIGHT_DIAGNOSTIC_SCHEMA, cli.DIAGNOSTIC_COMPLETE, ACTION_REQUIRED, ">1"}
+        )
+
+        def strings(value):
+            if isinstance(value, dict):
+                for item in value.values():
+                    yield from strings(item)
+            elif isinstance(value, str):
+                yield value
+
+        for portal_cls in (
+            preflight_portal(),
+            preflight_portal(result=portal_module.DownloadPreflightDiagnosticResult(rows_passed=1, failure=preflight_evidence())),
+            preflight_portal(login_error=AppError(hostile)),
+            preflight_portal(inventory_error=LayoutChangedError(hostile)),
+            preflight_portal(preflight_error=RuntimeError(hostile)),
+        ):
+            with tempfile.TemporaryDirectory() as name:
+                exit_code, out, err = self.run_preflight(Path(name), portal_cls)
+            self.assertEqual(err, "")
+            for fragment in ("ACCT-778899", "portal.example.invalid", "account_a", "SYNTHETIC-INTENDED-ACCOUNT",
+                             DIAGNOSTIC_SENTINEL_USERNAME, DIAGNOSTIC_SENTINEL_PASSWORD, "Traceback", name):
+                self.assertNotIn(fragment, out)
+            self.assertTrue(set(strings(self.document(out))) <= closed)
+
+    def test_the_existing_support_reference_vocabulary_is_unchanged(self) -> None:
+        self.assertTrue(cli.DOWNLOAD_PREFLIGHT_ALLOWED_SUPPORT_REFS.isdisjoint(cli.RETIRED_SUPPORT_REFS))
+        self.assertTrue(
+            cli.DOWNLOAD_PREFLIGHT_ALLOWED_SUPPORT_REFS
+            <= set(cli.SUPPORT_REFS_BY_MESSAGE.values()) | {cli.UNCLASSIFIED_SUPPORT_REF}
+        )
+        for message in (
+            portal_module.RESULTS_SURFACE_CHANGED_MESSAGE,
+            portal_module.RESULTS_LATCHED_MESSAGE,
+            portal_module.RESULTS_ROW_HANDLE_MESSAGE,
+        ):
+            with self.subTest(message=message):
+                self.assertNotIn(message, cli.SUPPORT_REFS_BY_MESSAGE, "download-time messages stay status-only")
 
 
 if __name__ == "__main__":

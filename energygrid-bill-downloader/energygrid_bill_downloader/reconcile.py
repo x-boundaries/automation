@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any, Protocol
 import uuid
 
-from .config import RuntimeConfig
+from .config import MAX_INVENTORY_CEILING, RuntimeConfig
 from .errors import (
     ACTION_REQUIRED,
     ALREADY_PRESENT,
@@ -33,7 +33,12 @@ from .publication import (
     validate_filename,
     validate_pdf,
 )
-from .portal import InvoiceRow
+from .portal import (
+    DOWNLOAD_PREFLIGHT_CHECKPOINTS,
+    DOWNLOAD_PREFLIGHT_REASONS,
+    DownloadPreflightError,
+    InvoiceRow,
+)
 from .state import BillRecord, StateStore
 
 
@@ -135,7 +140,7 @@ def reconcile_inventory(
             except AppError as exc:
                 # One terminal row stops all later dispatch and skips Phase B.
                 # Only the row that actually failed is counted.
-                _count_failure(summary, unresolved, logger, exc)
+                _count_failure(summary, unresolved, logger, exc, row.ordinal)
                 break
             # Whole-run filename contract errors keep their existing raise
             # semantics: nothing has been written or published yet.
@@ -155,7 +160,7 @@ def reconcile_inventory(
                         summary.present_count += 1
                 except AppError as exc:
                     _record_failure(state, acquisition.key, acquisition.filename, exc)
-                    _count_failure(summary, unresolved, logger, exc)
+                    _count_failure(summary, unresolved, logger, exc, acquisition.ordinal)
     finally:
         preserved = {acquisition.run_dir for acquisition in acquisitions if acquisition.preserve}
         for run_dir in run_dirs:
@@ -278,12 +283,40 @@ def _reconcile_acquisition(
 
 
 def _count_failure(
-    summary: RunSummary, unresolved: list[str], logger: LoggerProtocol, error: AppError
+    summary: RunSummary,
+    unresolved: list[str],
+    logger: LoggerProtocol,
+    error: AppError,
+    row_ordinal: Any = None,
 ) -> None:
     unresolved.append(error.status)
     summary.failure_count += 1
     summary.failures.append(error.status)
-    logger.event("invoice_failure", status=error.status)
+    logger.event("invoice_failure", status=error.status, **_failure_enrichment(error, row_ordinal))
+
+
+def _failure_enrichment(error: AppError, row_ordinal: Any) -> dict[str, Any]:
+    """The additive, closed invoice_failure fields (DL-XB-199 G2-083).
+
+    `row_ordinal` accompanies every failure whose row is known; the preflight
+    reason and checkpoint accompany only a `DownloadPreflightError`. Each
+    value is validated here, before anything is logged: an invalid value is
+    omitted, never coerced and never logged raw, so no free-form text can
+    reach the log through these fields.
+    """
+
+    fields: dict[str, Any] = {}
+    if type(row_ordinal) is int and 0 <= row_ordinal < MAX_INVENTORY_CEILING:
+        fields["row_ordinal"] = row_ordinal
+    if isinstance(error, DownloadPreflightError):
+        evidence = getattr(error, "evidence", None)
+        reason = getattr(evidence, "reason_code", None)
+        checkpoint = getattr(evidence, "last_checkpoint", None)
+        if type(reason) is str and reason in DOWNLOAD_PREFLIGHT_REASONS:
+            fields["preflight_reason"] = reason
+        if type(checkpoint) is str and checkpoint in DOWNLOAD_PREFLIGHT_CHECKPOINTS:
+            fields["preflight_checkpoint"] = checkpoint
+    return fields
 
 
 def _inspect_existing(final_path: Path, record: BillRecord | None) -> str:
