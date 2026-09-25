@@ -8,11 +8,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from html import escape
+import json
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import threading
-from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.parse import parse_qs, urlparse
 
 
 def synthetic_pdf(marker: bytes = b"synthetic-bill") -> bytes:
@@ -35,53 +36,69 @@ class SyntheticBill:
     payload: bytes = field(default_factory=synthetic_pdf)
     mode: str = "success"
     suggested_filename: str | None = None
+    # The private accessible row text; defaults to a distinct synthetic label.
+    row_text: str | None = None
 
 
 class SyntheticPortalServer:
-    """Threaded local server implementing the narrow portal test contract."""
+    """Threaded local server implementing the narrow portal test contract.
+
+    After login the fixture serves the live single surface observed by the
+    G3-074 census (DL-XB-199): an authenticated landing carrying the exact
+    `EMS` witness, a `Billing Manager` button, a `tab "EB Bill"` beside a
+    selected `tab "Tenant Bill"`, a visible account witness, an exact
+    `button "Search"` and, after one Search, one role table whose invoice rows
+    each carry exactly one Download button. The table deliberately carries no
+    test id, no filename attribute and no href: the only invoice name is the
+    download's own suggested filename.
+
+    `variant` is a comma-separated set of behaviour switches; every switch is
+    documented where it is read.
+    """
 
     def __init__(
         self,
         bills: list[SyntheticBill] | None = None,
         *,
-        page_size: int = 2,
         login_success: bool = True,
         variant: str = "normal",
-        next_loop: bool = False,
-        account_options: list[str] | None = None,
-        default_account: str | None = None,
-        account_bills: dict[str, list[SyntheticBill]] | None = None,
-        displayed_account: str | None = None,
-        client_side_pagination: bool = False,
+        account_text: str = "SYNTHETIC-INTENDED-ACCOUNT",
+        search_delay_ms: int = 0,
+        results_delay_ms: int = 0,
+        pagination_sentinel: tuple[str, str] | None = None,
+        aria_rowcount: str | None = None,
     ) -> None:
-        if page_size < 1:
-            raise ValueError("page_size must be positive")
         self.bills = list(bills or [])
-        self.page_size = page_size
         self.login_success = login_success
         self.variant = variant
-        self.next_loop = next_loop
-        self.account_options = list(account_options or ["SYNTHETIC-INTENDED-ACCOUNT"])
-        self.default_account = default_account or self.account_options[0]
-        self.account_bills = {
-            name: list(values)
-            for name, values in (account_bills or {self.default_account: self.bills}).items()
-        }
-        self.displayed_account = displayed_account
-        self.client_side_pagination = client_side_pagination
-        for mapped_bills in self.account_bills.values():
-            for bill in mapped_bills:
-                if bill not in self.bills:
-                    self.bills.append(bill)
+        self.variants = frozenset(item.strip() for item in variant.split(",") if item.strip())
+        self.account_text = account_text
+        self.search_delay_ms = search_delay_ms
+        self.results_delay_ms = results_delay_ms
+        self.pagination_sentinel = pagination_sentinel
+        self.aria_rowcount = aria_rowcount
         self.download_counts: dict[str, int] = {}
+        # Every served download request, in order, by row index.
+        self.download_order: list[int] = []
+        # Every Download button click, including inert ones that request nothing.
+        self.download_clicks = 0
         self.search_count = 0
         self.activation_count = 0
-        # Every real EMS actuation this fixture observed, from any surface.
-        # Downstream chrome keeps its EMS control, so an accidental second
-        # click is counted here rather than silently disappearing.
+        # Every real EMS / Billing Manager actuation this fixture observed. The
+        # production path must never produce either.
         self.ems_actuation_count = 0
+        self.billing_manager_actuation_count = 0
+        self.eb_bill_tab_clicks = 0
+        # Inspection-only pagination sentinels must never be clicked.
+        self.pagination_clicks = 0
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
+
+    def row_text(self, index: int) -> str:
+        """The private accessible row text of one bill: never its filename."""
+
+        bill = self.bills[index]
+        return bill.row_text if bill.row_text is not None else f"Synthetic invoice {index + 1}"
 
     @property
     def base_url(self) -> str:
@@ -284,339 +301,246 @@ class SyntheticPortalServer:
                 )
 
             def _ems_control(self) -> str:
-                """The exact `EMS` control, as both witness and business entry.
+                """The exact `EMS` control: the authentication witness.
 
-                One control carries both meanings on the observed surface: it is
-                the authentication witness the landing is proven by, and it is
-                the application entry business navigation actuates. The drift
-                variants are therefore shared, and `disabled_ems` is the case
-                that separates them -- authentication only ever reads a count
-                and a visibility, so a disabled control still proves the landing
-                while failing the readiness the entry click requires.
+                Authentication only ever reads its count and visibility. The
+                production path never clicks it; an actuation is recorded by
+                the shell script below so an accidental click is observable.
                 """
 
-                if fixture.variant == "missing_ems":
-                    return ""
-                if fixture.variant == "ambiguous_ems":
-                    return (
-                        '<button type="button" data-testid="ems-entry">EMS</button>'
-                        '<button type="button" data-testid="ems-entry">EMS</button>'
-                    )
-                if fixture.variant == "hidden_ems":
-                    # Still in the accessibility tree, with an empty box.
-                    return (
-                        '<button type="button" data-testid="ems-entry" '
-                        'style="width:0;height:0;padding:0;border:0;overflow:hidden">'
-                        "EMS</button>"
-                    )
-                if fixture.variant == "disabled_ems":
-                    return (
-                        '<button type="button" data-testid="ems-entry" disabled>'
-                        "EMS</button>"
-                    )
                 return '<button type="button" data-testid="ems-entry">EMS</button>'
 
-            def _authenticated_shell(self, *, entry: bool = False) -> str:
-                """The authenticated chrome: the exact EMS control and its script.
+            def _authenticated_shell(self) -> str:
+                """The authenticated chrome: the exact EMS and Billing Manager buttons.
 
-                `entry` is what tells the landing apart from every surface after
-                it. On the landing an actuation records itself and opens the
-                application; on downstream chrome it records itself and goes
-                nowhere, so an accidental second EMS click stays observable in
-                `ems_actuation_count` instead of vanishing.
-
-                The record is a synchronous request, exactly like the semantics
-                gate above, so the count is committed before any navigation the
-                handler starts.
+                Both record every actuation with a synchronous request and then
+                go nowhere, so an accidental production click on either is
+                counted instead of silently vanishing. The EMS button is also
+                the authentication witness the landing is proven by.
                 """
 
                 control = self._ems_control()
-                if not control:
-                    return ""
-                target = "null"
-                if entry and fixture.variant != "inert_ems":
-                    target = "'/ems'"
                 script = """
                 <script>
                 (function () {
-                    const target = %(target)s;
-                    function recordEms() {
+                    function record(path) {
                         const request = new XMLHttpRequest();
-                        request.open('GET', '/synthetic-ems', false);
+                        request.open('GET', path, false);
                         request.send();
                     }
                     for (const control of document.querySelectorAll('[data-testid="ems-entry"]')) {
-                        control.addEventListener('click', function () {
-                            recordEms();
-                            if (target) window.location.href = target;
-                        });
+                        control.addEventListener('click', () => record('/synthetic-ems'));
                     }
+                    const manager = document.getElementById('billing-manager');
+                    if (manager) manager.addEventListener('click', () => record('/synthetic-billing-manager'));
                 })();
                 </script>
-                """ % {"target": target}
-                return control + script
-
-            def _landing_page(self) -> bytes:
-                """The authenticated landing, which is NOT the business surface.
-
-                It exposes the EMS control and no business navigation at all.
-                Billing Manager and EB Bill become reachable only after exactly
-                one EMS actuation, so a build that skipped the application entry
-                fails here rather than passing against a surface that the
-                observed portal never presents.
                 """
-
-                return self._page("Landing", self._authenticated_shell(entry=True))
-
-            def _app_page(self) -> bytes:
-                if fixture.variant == "missing_billing_manager":
-                    return self._page(
-                        "Application",
-                        self._authenticated_shell() + "<main>Unexpected application</main>",
-                    )
-                return self._page(
-                    "Application",
-                    self._authenticated_shell()
-                    + '<a href="/billing" role="link">Billing Manager</a>',
-                )
-
-            def _billing_page(self) -> bytes:
-                if fixture.variant == "missing_eb_bill":
-                    return self._page(
-                        "Billing",
-                        self._authenticated_shell() + "<main>Unexpected billing page</main>",
-                    )
-                return self._page(
-                    "Billing",
-                    self._authenticated_shell()
-                    + '<a href="/eb-bill" role="link">EB Bill</a>',
-                )
-
-            def _invoice_page(self, page: int) -> bytes:
-                start = (page - 1) * fixture.page_size
-                selected = fixture.bills[start : start + fixture.page_size]
-                rows: list[str] = []
-                for index, bill in enumerate(selected, start=start):
-                    button_count = 2 if fixture.variant == "ambiguous_download" else 1
-                    buttons = "".join(
-                        '<button type="button" title="Download" onclick="location.href=\'/download/'
-                        + str(index)
-                        + '\'">Download</button>'
-                        for _ in range(button_count)
-                    )
-                    rows.append(
-                        '<div data-testid="invoice-row" data-filename="'
-                        + escape(bill.filename, quote=True)
-                        + '" data-download="/download/'
-                        + str(index)
-                        + '">' + escape(bill.filename) + buttons + "</div>"
-                    )
-                if fixture.variant == "missing_invoice_list":
-                    listing = "<main>No list marker</main>"
-                elif rows:
-                    listing = '<div data-testid="invoice-list" data-page="' + str(page) + '">' + "".join(rows) + "</div>"
-                else:
-                    listing = '<div data-testid="invoice-list" data-page="' + str(page) + '"><div data-testid="invoice-list-empty">No invoices</div></div>'
-                has_next = start + fixture.page_size < len(fixture.bills)
-                if fixture.next_loop:
-                    has_next = True
-                next_button = (
-                    '<button type="button" title="Next page" data-next="'
-                    + str(page + 1 if has_next else page)
-                    + '" onclick="location.href=\'/eb-bill?page='
-                    + str(page + 1 if has_next else page)
-                    + '\'"'
-                    + ("" if has_next else " disabled")
-                    + ">Next page</button>"
-                )
-                return self._page("EB Bill", listing + next_button)
-
-            def _account_invoice_page(self, page: int, searched_account: str | None = None) -> bytes:
-                import json
-
-                searched = searched_account is not None
-                selected_account = searched_account or fixture.default_account
-                selected_bills = fixture.account_bills.get(selected_account, [])
-                selected_written = False
-                options: list[str] = []
-                for index, account in enumerate(fixture.account_options):
-                    selected = ""
-                    if account == selected_account and not selected_written:
-                        selected = " selected"
-                        selected_written = True
-                    options.append(
-                        f'<option value="synthetic-account-{index}"{selected}>{escape(account)}</option>'
-                    )
-
-                def rows_markup(values: list[SyntheticBill], start: int) -> str:
-                    rows: list[str] = []
-                    for offset, bill in enumerate(values, start=start):
-                        index = fixture.bills.index(bill)
-                        button_count = 2 if fixture.variant == "ambiguous_download" else 1
-                        buttons = "".join(
-                            f'<button type="button" title="Download" onclick="location.href=\'/download/{index}\'">Download</button>'
-                            for _ in range(button_count)
-                        )
-                        rows.append(
-                            '<div data-testid="invoice-row" data-filename="'
-                            + escape(bill.filename, quote=True)
-                            + '" data-download="/download/'
-                            + str(index)
-                            + '">' + escape(bill.filename) + buttons + "</div>"
-                        )
-                    return "".join(rows)
-
-                start = 0
-                if searched:
-                    start = (page - 1) * fixture.page_size
-                    selected_page = selected_bills[start : start + fixture.page_size]
-                    rows = rows_markup(selected_page, start)
-                else:
-                    selected_page = []
-                    rows = ""
-                if fixture.variant == "missing_invoice_list":
-                    listing = "<main>No list marker</main>"
-                elif rows:
-                    listing = '<div data-testid="invoice-list" data-page="' + str(page) + '">' + rows + "</div>"
-                else:
-                    listing = '<div data-testid="invoice-list" data-page="' + str(page) + '"><div data-testid="invoice-list-empty">'
-                    listing += "Search required" if not searched else "No invoices"
-                    listing += "</div></div>"
-                has_next = searched and (start + fixture.page_size < len(selected_bills))
-                if fixture.next_loop:
-                    has_next = True
-                next_page = page + 1 if has_next else page
-                query = urlencode({"page": next_page, "account": selected_account, "searched": "1"})
-                next_button = (
-                    '<button type="button" title="Next page" data-next="'
-                    + str(next_page)
-                    + '" onclick="location.href=\'/eb-bill?'
-                    + query
-                    + '\'"'
-                    + ("" if has_next else " disabled")
-                    + ">Next page</button>"
-                )
-                account_markup = "" if fixture.variant == "missing_account_selector" else (
-                    '<label for="account-identity">Tenant/account</label>'
-                    '<select id="account-identity" aria-label="Tenant/account">'
-                    + "".join(options)
-                    + "</select>"
-                )
-                displayed = selected_account if not searched else (fixture.displayed_account or selected_account)
-                if searched and fixture.variant == "account_mismatch" and fixture.displayed_account is None:
-                    displayed = "SYNTHETIC-DISPLAYED-MISMATCH"
-                # The results route carries its own EB Bill nav entry, exactly as
-                # the billing route does. Route proof compares the current
-                # address with this control's own target, so an already-valid
-                # saved results address needs no navigation click at all.
-                eb_bill_markup = (
-                    "" if fixture.variant == "missing_eb_bill"
-                    else '<a href="/eb-bill" role="link">EB Bill</a>'
-                )
-                search_button = "" if fixture.variant == "missing_search" else (
-                    '<button id="search-button" type="button">Search</button>'
-                )
-                page_payload = {
-                    account: [
-                        {"filename": bill.filename, "path": "/download/" + str(fixture.bills.index(bill))}
-                        for bill in fixture.account_bills.get(account, [])
-                    ]
-                    for account in fixture.account_options
-                }
-                payload = json.dumps(page_payload, ensure_ascii=True).replace("<", "\\u003c")
-                mismatch = fixture.variant == "account_mismatch" or fixture.displayed_account is not None
-                script = f"""
-                <script>
-                const accountBills = {payload};
-                const account = document.getElementById('account-identity');
-                const selectedMarker = document.querySelector('[data-testid="selected-account"]');
-                const state = document.querySelector('[data-testid="invoice-results-state"]');
-                const list = document.querySelector('[data-testid="invoice-list"]');
-                const next = document.querySelector('[title="Next page"]');
-                const search = document.getElementById('search-button');
-                const pageSize = {fixture.page_size};
-                const clientSide = {'true' if fixture.client_side_pagination else 'false'};
-                const nextLoop = {'true' if fixture.next_loop else 'false'};
-                const ambiguousDownload = {'true' if fixture.variant == 'ambiguous_download' else 'false'};
-                const mismatch = {'true' if mismatch else 'false'};
-                function selectedText() {{
-                    return account ? account.options[account.selectedIndex].textContent : '';
-                }}
-                function render(page, values) {{
-                    if (!list || !next) return;
-                    list.dataset.page = String(page);
-                    list.replaceChildren();
-                    const start = (page - 1) * pageSize;
-                    const current = values.slice(start, start + pageSize);
-                    for (const item of current) {{
-                        const row = document.createElement('div');
-                        row.dataset.testid = 'invoice-row';
-                        row.dataset.filename = item.filename;
-                        row.textContent = item.filename;
-                        const buttonCount = ambiguousDownload ? 2 : 1;
-                        for (let buttonIndex = 0; buttonIndex < buttonCount; buttonIndex++) {{
-                            const button = document.createElement('button');
-                            button.type = 'button';
-                            button.title = 'Download';
-                            button.textContent = 'Download';
-                            button.addEventListener('click', () => window.location.href = item.path);
-                            row.appendChild(button);
-                        }}
-                        list.appendChild(row);
-                    }}
-                    if (!current.length) {{
-                        const empty = document.createElement('div');
-                        empty.dataset.testid = 'invoice-list-empty';
-                        empty.textContent = 'No invoices';
-                        list.appendChild(empty);
-                    }}
-                    const hasNext = nextLoop || page * pageSize < values.length;
-                    next.disabled = !hasNext;
-                    next.dataset.next = String(page + 1);
-                    next.onclick = () => {{
-                        if (next.disabled) return;
-                        if (clientSide) render(page + 1, values);
-                        else window.location.href = '/eb-bill?' + new URLSearchParams({{page: page + 1, account: selectedText(), searched: '1'}}).toString();
-                    }};
-                }}
-                if (account) account.addEventListener('change', () => selectedMarker.textContent = selectedText());
-                if (search) search.addEventListener('click', () => {{
-                    const selected = selectedText();
-                    fetch('/synthetic-search?account=' + encodeURIComponent(selected)).then(() => {{
-                        selectedMarker.textContent = mismatch ? 'SYNTHETIC-DISPLAYED-MISMATCH' : selected;
-                        state.dataset.state = 'post-search';
-                        state.textContent = 'Search complete';
-                        render(1, accountBills[selected] || []);
-                    }});
-                }});
-                </script>
-                """
-                # The results route is authenticated application chrome, so it
-                # keeps the same exact EMS control every other downstream
-                # surface keeps. Built without `entry=True`, an actuation here
-                # records itself and navigates nowhere, which is precisely what
-                # makes an accidental second EMS click on results, a paginated
-                # results page or a restored results address observable in
-                # `ems_actuation_count` instead of silently vanishing.
-                content = (
-                    self._authenticated_shell()
-                    + eb_bill_markup
-                    + account_markup
-                    + '<div data-testid="selected-account">'
-                    + escape(displayed)
-                    + "</div>"
-                    + search_button
-                    + '<div data-testid="invoice-results-state" data-state="'
-                    + ("post-search" if searched else "pre-search")
-                    + '">'
-                    + ("Search complete" if searched else "Search required")
-                    + "</div>"
-                    + listing
-                    + next_button
+                return (
+                    control
+                    + '<button type="button" id="billing-manager">Billing Manager</button>'
                     + script
                 )
-                return self._page("EB Bill", content)
 
+            def _landing_page(self) -> bytes:
+                """The live single surface: tabs, account witness, Search, results.
+
+                Switches read here:
+
+                - ``eb_bill_preselected``: EB Bill is already the selected tab.
+                - ``eb_bill_link_only``: EB Bill is a link, not a tab.
+                - ``tab_inert``: clicking EB Bill selects nothing.
+                - ``account_absent`` / ``account_duplicate``: zero or two
+                  account witnesses outside the results.
+                - ``account_in_rows``: every invoice row also carries a cell
+                  with the exact account text.
+                - ``two_tables``, ``header_missing``, ``ambiguous_download``,
+                  ``missing_download``: results-shape drift.
+                - ``reorder_after_first_download`` /
+                  ``text_drift_after_first_download``: the rows change after
+                  the first Download click.
+                - ``tab_lost_on_download``: a Download click deselects EB Bill.
+                - ``popup_on_download``: a Download click also opens a page.
+                """
+
+                variants = fixture.variants
+                preselected = "eb_bill_preselected" in variants
+                if "eb_bill_link_only" in variants:
+                    eb_bill = '<a href="#eb-bill" id="tab-eb">EB Bill</a>'
+                else:
+                    eb_bill = (
+                        '<div role="tab" id="tab-eb" tabindex="0" aria-selected="'
+                        + ("true" if preselected else "false")
+                        + '">EB Bill</div>'
+                    )
+                tenant = (
+                    '<div role="tab" id="tab-tenant" tabindex="0" aria-selected="'
+                    + ("false" if preselected else "true")
+                    + '">Tenant Bill</div>'
+                )
+                witness = '<div class="account-witness"><span>' + escape(fixture.account_text) + "</span></div>"
+                if "account_absent" in variants:
+                    account = ""
+                elif "account_duplicate" in variants:
+                    account = witness * 2
+                else:
+                    account = witness
+                rows = [
+                    {
+                        "text": fixture.row_text(index),
+                        "index": index,
+                        "inert": bill.mode == "inert",
+                    }
+                    for index, bill in enumerate(fixture.bills)
+                ]
+                config = {
+                    "rows": rows,
+                    "account": fixture.account_text,
+                    "variants": sorted(variants),
+                    "searchDelay": fixture.search_delay_ms,
+                    "resultsDelay": fixture.results_delay_ms,
+                    "pagination": list(fixture.pagination_sentinel) if fixture.pagination_sentinel else None,
+                    "ariaRowcount": fixture.aria_rowcount,
+                }
+                payload = json.dumps(config, ensure_ascii=True).replace("<", "\\u003c")
+                script = """
+                <script>
+                (function () {
+                    const config = %(payload)s;
+                    const has = (name) => config.variants.includes(name);
+                    const ebTab = document.getElementById('tab-eb');
+                    const tenantTab = document.getElementById('tab-tenant');
+                    const ebPanel = document.getElementById('eb-panel');
+                    const tenantPanel = document.getElementById('tenant-panel');
+                    const searchSlot = document.getElementById('search-slot');
+                    const results = document.getElementById('results');
+                    let downloadClicks = 0;
+                    function record(path) {
+                        const request = new XMLHttpRequest();
+                        request.open('GET', path, false);
+                        request.send();
+                    }
+                    function renderSearch() {
+                        if (searchSlot.childElementCount) return;
+                        const search = document.createElement('button');
+                        search.type = 'button';
+                        search.textContent = 'Search';
+                        search.addEventListener('click', () => {
+                            record('/synthetic-search');
+                            setTimeout(renderResults, config.resultsDelay);
+                        });
+                        searchSlot.appendChild(search);
+                    }
+                    function select(which) {
+                        const eb = which === 'eb';
+                        if (ebTab.getAttribute('role') === 'tab') ebTab.setAttribute('aria-selected', eb ? 'true' : 'false');
+                        tenantTab.setAttribute('aria-selected', eb ? 'false' : 'true');
+                        ebPanel.hidden = !eb;
+                        tenantPanel.hidden = eb;
+                        if (eb) setTimeout(renderSearch, config.searchDelay);
+                    }
+                    function cell(content) {
+                        const node = document.createElement('span');
+                        node.setAttribute('role', 'cell');
+                        if (typeof content === 'string') node.textContent = content;
+                        else if (content) node.appendChild(content);
+                        return node;
+                    }
+                    function downloadButton(item) {
+                        const button = document.createElement('button');
+                        button.type = 'button';
+                        button.textContent = 'Download';
+                        button.addEventListener('click', () => {
+                            downloadClicks += 1;
+                            record('/synthetic-download-click');
+                            if (has('popup_on_download')) window.open('/synthetic-popup');
+                            if (has('tab_lost_on_download')) select('tenant');
+                            if (!item.inert) window.location.href = '/download/' + item.index;
+                            if (downloadClicks === 1 && has('reorder_after_first_download')) {
+                                setTimeout(() => {
+                                    const table = results.querySelector('[role="table"]');
+                                    const rows = table.querySelectorAll('[role="row"]');
+                                    if (rows.length > 2) table.appendChild(rows[1]);
+                                }, 0);
+                            }
+                            if (downloadClicks === 1 && has('text_drift_after_first_download')) {
+                                setTimeout(() => {
+                                    const first = results.querySelector('[role="row"]:nth-child(2) [role="cell"]');
+                                    if (first) first.textContent = first.textContent + ' (viewed)';
+                                }, 0);
+                            }
+                        });
+                        return button;
+                    }
+                    function table() {
+                        const node = document.createElement('div');
+                        node.setAttribute('role', 'table');
+                        node.setAttribute('aria-label', 'Invoices');
+                        if (config.ariaRowcount !== null) node.setAttribute('aria-rowcount', config.ariaRowcount);
+                        if (!has('header_missing')) {
+                            const header = document.createElement('div');
+                            header.setAttribute('role', 'row');
+                            for (const label of ['Invoice', 'Action']) {
+                                const heading = document.createElement('span');
+                                heading.setAttribute('role', 'columnheader');
+                                heading.textContent = label;
+                                header.appendChild(heading);
+                            }
+                            node.appendChild(header);
+                        }
+                        config.rows.forEach((item, position) => {
+                            const row = document.createElement('div');
+                            row.setAttribute('role', 'row');
+                            row.appendChild(cell(item.text));
+                            if (has('account_in_rows')) row.appendChild(cell(config.account));
+                            const actions = document.createElement('span');
+                            actions.setAttribute('role', 'cell');
+                            const buttons = has('missing_download') && position === 0 ? 0
+                                : has('ambiguous_download') && position === 0 ? 2 : 1;
+                            for (let count = 0; count < buttons; count++) actions.appendChild(downloadButton(item));
+                            row.appendChild(actions);
+                            node.appendChild(row);
+                        });
+                        return node;
+                    }
+                    function renderResults() {
+                        results.replaceChildren(table());
+                        if (has('two_tables')) results.appendChild(table());
+                        if (config.pagination) {
+                            const [role, name] = config.pagination;
+                            const control = document.createElement(role === 'link' ? 'a' : 'button');
+                            if (role === 'link') control.href = '#more';
+                            else control.type = 'button';
+                            control.textContent = name;
+                            control.addEventListener('click', () => record('/synthetic-pagination'));
+                            results.appendChild(control);
+                        }
+                    }
+                    ebTab.addEventListener('click', () => {
+                        record('/synthetic-eb-tab');
+                        if (!has('tab_inert')) select('eb');
+                    });
+                    tenantTab.addEventListener('click', () => select('tenant'));
+                    if (has('eb_bill_preselected')) select('eb');
+                })();
+                </script>
+                """ % {"payload": payload}
+                content = (
+                    self._authenticated_shell()
+                    + '<div role="tablist" aria-label="Bills">'
+                    + eb_bill
+                    + tenant
+                    + "</div>"
+                    + '<section id="tenant-panel"' + (" hidden" if preselected else "") + ">"
+                    + "<p>Tenant bills</p></section>"
+                    + '<section id="eb-panel"' + ("" if preselected else " hidden") + ">"
+                    + account
+                    + '<div id="search-slot"></div>'
+                    + '<div id="results"></div>'
+                    + "</section>"
+                    + script
+                )
+                return self._page("Energy@Grid", content)
             def do_GET(self) -> None:  # noqa: N802 - stdlib handler API
                 parsed = urlparse(self.path)
                 if parsed.path == "/":
@@ -635,30 +559,21 @@ class SyntheticPortalServer:
                 if parsed.path == "/app":
                     self._send(self._landing_page())
                     return
-                if parsed.path == "/synthetic-ems":
-                    fixture.ems_actuation_count += 1
+                counters = {
+                    "/synthetic-ems": "ems_actuation_count",
+                    "/synthetic-billing-manager": "billing_manager_actuation_count",
+                    "/synthetic-eb-tab": "eb_bill_tab_clicks",
+                    "/synthetic-search": "search_count",
+                    "/synthetic-download-click": "download_clicks",
+                    "/synthetic-pagination": "pagination_clicks",
+                }
+                if parsed.path in counters:
+                    name = counters[parsed.path]
+                    setattr(fixture, name, getattr(fixture, name) + 1)
                     self._send(b"ok", content_type="text/plain")
                     return
-                if parsed.path == "/ems":
-                    self._send(self._app_page())
-                    return
-                if parsed.path == "/billing":
-                    self._send(self._billing_page())
-                    return
-                if parsed.path == "/synthetic-search":
-                    fixture.search_count += 1
-                    self._send(b"ok", content_type="text/plain")
-                    return
-
-                if parsed.path == "/eb-bill":
-                    raw_page = parse_qs(parsed.query).get("page", ["1"])[0]
-                    try:
-                        page = max(1, int(raw_page))
-                    except ValueError:
-                        page = 1
-                    query = parse_qs(parsed.query)
-                    searched_account = query.get("account", [None])[0] if query.get("searched") == ["1"] else None
-                    self._send(self._account_invoice_page(page, searched_account=searched_account))
+                if parsed.path == "/synthetic-popup":
+                    self._send(self._page("Popup", "<p>popup</p>"))
                     return
                 if parsed.path.startswith("/download/"):
                     try:
@@ -668,35 +583,19 @@ class SyntheticPortalServer:
                         self._send(b"not found", status=HTTPStatus.NOT_FOUND, content_type="text/plain")
                         return
                     fixture.download_counts[bill.filename] = fixture.download_counts.get(bill.filename, 0) + 1
+                    fixture.download_order.append(index)
                     download_name = bill.suggested_filename or bill.filename
-                    if bill.mode == "error":
-                        self._send(b"temporary download failure", status=HTTPStatus.INTERNAL_SERVER_ERROR, content_type="text/plain")
-                    elif bill.mode == "html":
-                        self._send(
-                            b"<html>not a bill</html>",
-                            headers={"Content-Disposition": f'attachment; filename="{download_name}"'},
-                        )
+                    disposition = {"Content-Disposition": f'attachment; filename="{download_name}"'}
+                    if bill.mode == "html":
+                        self._send(b"<html>not a bill</html>", headers=disposition)
                     elif bill.mode == "zero":
-                        self._send(
-                            b"",
-                            content_type="application/pdf",
-                            headers={"Content-Disposition": f'attachment; filename="{download_name}"'},
-                        )
+                        self._send(b"", content_type="application/pdf", headers=disposition)
                     elif bill.mode == "truncated":
-                        self._send(
-                            b"%PDF-1.7\ntruncated",
-                            content_type="application/pdf",
-                            headers={"Content-Disposition": f'attachment; filename="{download_name}"'},
-                        )
+                        self._send(b"%PDF-1.7\ntruncated", content_type="application/pdf", headers=disposition)
                     else:
-                        self._send(
-                            bill.payload,
-                            content_type="application/pdf",
-                            headers={"Content-Disposition": f'attachment; filename="{download_name}"'},
-                        )
+                        self._send(bill.payload, content_type="application/pdf", headers=disposition)
                     return
                 self._send(b"not found", status=HTTPStatus.NOT_FOUND, content_type="text/plain")
-
             def do_POST(self) -> None:  # noqa: N802 - stdlib handler API
                 if urlparse(self.path).path != "/login":
                     self._send(b"not found", status=HTTPStatus.NOT_FOUND, content_type="text/plain")

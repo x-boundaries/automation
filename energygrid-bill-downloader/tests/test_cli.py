@@ -650,9 +650,10 @@ class SupportReferenceContractTests(unittest.TestCase):
             "EG_LOGIN_SUBMIT_DISPATCH_UNCERTAIN",
             # What replaced the retired Billing Manager login wait: the login
             # half now names the authentication contract, and the navigation
-            # half names the business route separately.
+            # half names the business route separately -- since DL-XB-199 the
+            # live EB Bill tab rather than the retired Billing Manager link.
             "EG_LOGIN_AUTHENTICATION_UNPROVED",
-            "EG_NAV_BILLING_MANAGER_NOT_READY",
+            "EG_NAV_EB_BILL_TAB_NOT_READY",
         }
         self.assertTrue(replacements.issubset(committed))
         self.assertTrue(replacements.isdisjoint(cli.RETIRED_SUPPORT_REFS))
@@ -678,17 +679,30 @@ class SupportReferenceContractTests(unittest.TestCase):
         self.assertEqual(
             cli.NAVIGATION_SUPPORT_REFS,
             {
-                # DL-XB-141-EMS-ENTRY-MINIMAL-REPAIR-G2-136. The EMS application
-                # entry runs after the landing is already proven, so its two
-                # failures are navigation references like every step after them.
-                "EG_NAV_EMS_ENTRY_NOT_READY",
-                "EG_NAV_EMS_ENTRY_DISPATCH_UNCERTAIN",
-                "EG_NAV_BILLING_MANAGER_NOT_READY",
-                "EG_NAV_BILLING_MANAGER_DISPATCH_UNCERTAIN",
-                "EG_NAV_EB_BILL_NOT_READY",
-                "EG_NAV_EB_BILL_DISPATCH_UNCERTAIN",
-                "EG_NAV_RESULTS_ROUTE_UNPROVED",
+                # DL-XB-199 (G2-076). The live single surface: the exact EB
+                # Bill tab, the account witness, one Search and the one results
+                # table. Each is reachable only from the production inventory.
+                "EG_NAV_EB_BILL_TAB_NOT_READY",
+                "EG_NAV_EB_BILL_TAB_DISPATCH_UNCERTAIN",
+                "EG_NAV_EB_BILL_TAB_UNPROVED",
+                "EG_NAV_ACCOUNT_WITNESS_UNPROVED",
+                "EG_NAV_ACCOUNT_WITNESS_AMBIGUOUS",
+                "EG_NAV_SEARCH_NOT_READY",
+                "EG_NAV_SEARCH_DISPATCH_UNCERTAIN",
+                "EG_NAV_PAGE_TOPOLOGY",
+                "EG_NAV_RESULTS_UNSETTLED",
+                "EG_NAV_RESULTS_HEADER_ONLY",
+                "EG_NAV_RESULTS_PAGINATION_PRESENT",
+                "EG_NAV_RESULTS_ROWCOUNT_CONTRADICTORY",
+                "EG_NAV_RESULTS_ROW_IDENTITY_INVALID",
+                "EG_NAV_RESULTS_SAFETY_CEILING",
+                "EG_NAV_RESULTS_INVENTORY_CONSUMED",
             },
+        )
+        self.assertTrue(cli.NAVIGATION_SUPPORT_REFS.isdisjoint(cli.DIAGNOSTIC_EMS_ENTRY_SUPPORT_REFS))
+        self.assertTrue(
+            cli.NAVIGATION_SUPPORT_REFS.isdisjoint(cli.NAVIGATION_DIAGNOSTIC_ALLOWED_SUPPORT_REFS),
+            "no production reference can appear in a navigation diagnostic document",
         )
         for ref in cli.NAVIGATION_SUPPORT_REFS:
             with self.subTest(ref=ref):
@@ -699,7 +713,11 @@ class SupportReferenceContractTests(unittest.TestCase):
                 )
 
     def test_the_ems_entry_references_are_mapped_exactly_and_stay_navigation(self) -> None:
-        """The application entry has its own two references, and no others."""
+        """The application entry has its own two references, and no others.
+
+        Since DL-XB-199 production never actuates EMS, so only the separate
+        navigation diagnostic's one EMS dispatch can raise them.
+        """
         for message, ref in (
             (
                 "EMS application entry control is not ready",
@@ -714,7 +732,9 @@ class SupportReferenceContractTests(unittest.TestCase):
                 self.assertEqual(
                     cli.support_ref_for(LayoutChangedError(message)), ref
                 )
-                self.assertIn(ref, cli.NAVIGATION_SUPPORT_REFS)
+                self.assertIn(ref, cli.DIAGNOSTIC_EMS_ENTRY_SUPPORT_REFS)
+                self.assertIn(ref, cli.NAVIGATION_DIAGNOSTIC_ALLOWED_SUPPORT_REFS)
+                self.assertNotIn(ref, cli.NAVIGATION_SUPPORT_REFS)
                 self.assertNotIn(ref, cli.RETIRED_SUPPORT_REFS)
                 self.assertFalse(ref.startswith("EG_LOGIN_"))
         # The wording is owned by portal.py, so a reword there fails here
@@ -726,6 +746,62 @@ class SupportReferenceContractTests(unittest.TestCase):
         self.assertEqual(
             portal_module.NAV_EMS_ENTRY_UNCERTAIN_MESSAGE,
             "EMS application entry dispatch outcome uncertain",
+        )
+
+    def test_the_retired_link_route_references_stay_readable_but_unreachable(self) -> None:
+        """DL-XB-199 retired the Billing Manager / EB Bill link route."""
+        retired = {
+            "Billing Manager navigation control is not ready": "EG_NAV_BILLING_MANAGER_NOT_READY",
+            "Billing Manager navigation dispatch outcome uncertain": "EG_NAV_BILLING_MANAGER_DISPATCH_UNCERTAIN",
+            "EB Bill navigation control is not ready": "EG_NAV_EB_BILL_NOT_READY",
+            "EB Bill navigation dispatch outcome uncertain": "EG_NAV_EB_BILL_DISPATCH_UNCERTAIN",
+            "EB Bill results route was not proven": "EG_NAV_RESULTS_ROUTE_UNPROVED",
+        }
+        for message, ref in retired.items():
+            with self.subTest(ref=ref):
+                self.assertEqual(cli.support_ref_for(LayoutChangedError(message)), ref)
+                self.assertIn(ref, cli.RETIRED_SUPPORT_REFS)
+                self.assertNotIn(ref, cli.NAVIGATION_SUPPORT_REFS)
+                self.assertNotIn(ref, cli.NAVIGATION_DIAGNOSTIC_ALLOWED_SUPPORT_REFS)
+        # The producing constants are gone, so nothing in portal.py can raise them.
+        for name in (
+            "NAV_BILLING_MANAGER_NOT_READY_MESSAGE",
+            "NAV_BILLING_MANAGER_UNCERTAIN_MESSAGE",
+            "NAV_EB_BILL_NOT_READY_MESSAGE",
+            "NAV_EB_BILL_UNCERTAIN_MESSAGE",
+            "NAV_RESULTS_ROUTE_UNPROVED_MESSAGE",
+        ):
+            self.assertFalse(hasattr(portal_module, name), name)
+        source = Path(portal_module.__file__).read_text(encoding="utf-8")
+        for message in retired:
+            self.assertNotIn(message, source)
+
+    def test_the_navigation_diagnostic_allowlist_is_unchanged(self) -> None:
+        """The diagnostic's own allowlist stays exactly what it was."""
+        login = {ref for ref in cli.SUPPORT_REFS_BY_MESSAGE.values() if ref.startswith("EG_LOGIN_")}
+        self.assertEqual(
+            cli.NAVIGATION_DIAGNOSTIC_ALLOWED_SUPPORT_REFS,
+            login
+            | {
+                "EG_NAV_EMS_ENTRY_NOT_READY",
+                "EG_NAV_EMS_ENTRY_DISPATCH_UNCERTAIN",
+                "EG_NAV_DIAGNOSTIC_PAGE_TOPOLOGY",
+                "EG_NAV_DIAGNOSTIC_FRAME_TOPOLOGY",
+                "EG_NAV_DIAGNOSTIC_CROSS_ORIGIN",
+                "EG_NAV_DIAGNOSTIC_OBSERVATION_UNREADABLE",
+                "EG_NAV_DIAGNOSTIC_OUTPUT_REJECTED",
+                "EG_LOGIN_DIAGNOSTIC_UNCLASSIFIED",
+            },
+        )
+        self.assertEqual(
+            cli.NAVIGATION_DIAGNOSTIC_SUPPORT_REFS,
+            {
+                "EG_NAV_DIAGNOSTIC_PAGE_TOPOLOGY",
+                "EG_NAV_DIAGNOSTIC_FRAME_TOPOLOGY",
+                "EG_NAV_DIAGNOSTIC_CROSS_ORIGIN",
+                "EG_NAV_DIAGNOSTIC_OBSERVATION_UNREADABLE",
+                "EG_NAV_DIAGNOSTIC_OUTPUT_REJECTED",
+            },
         )
 
     def test_historical_submit_message_remains_mapped_but_retired(self) -> None:
