@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -43,7 +44,7 @@ BOOLEAN_ORDER = (
 
 
 PROTECTED_WORKER_BLOBS = {
-    "scripts/install_ac2_member_gateway_worker.ps1": "fee4fac43185eaf893966e176d23216ac9544b7f",
+    "scripts/install_ac2_member_gateway_worker.ps1": "724fc4439fcd3de1966e82eae5adf6fee112b142",
     "scripts/ac2_member_gateway_worker.ps1": "27f0a3f8c78ba9b391b1a09ad33fe5805f723cc1",
     "scripts/ac2_member_gateway_worker_lib.ps1": "332af5a25f2be996694fdb6cef085139192ebf19",
     "scripts/ac2_member_gateway_autocount_adapter.ps1": "37ea54fea46c57671b02cbc15a138791a2977244",
@@ -3925,6 +3926,1466 @@ $info = New-XbWorkerProcessStartInfo -WorkerScript $args[1] -LauncherMode Produc
             if " -> " in path:
                 path = path.split(" -> ", 1)[1]
             self.assertIn(path.replace("\\", "/"), ALLOWED_FILES, line)
+
+
+HOSTED_BOUNDARY_SKIP_REASON = "hosted-runner-only production boundary"
+TASK_BOUNDARY_MARKER = "XB_TASK_BOUNDARY_INTEGRATION_RAN"
+TASK_BOUNDARY_RESULT_PREFIX = "XB_BOUNDARY_RESULT:"
+SCHED_S_TASK_HAS_NOT_RUN = 267011
+INSTALLER_PATH = "scripts/install_ac2_member_gateway_worker.ps1"
+INSTALLER_PACKAGE_FILES = (
+    "ac2_member_gateway_worker.ps1",
+    "ac2_member_gateway_worker_lib.ps1",
+    "ac2_member_gateway_autocount_adapter.ps1",
+    "launch_ac2_member_gateway_worker.ps1",
+    "test_ac2_member_gateway_autocount_dependencies.ps1",
+)
+
+
+def _hosted_windows_boundary_required(env: dict[str, str] | None = None) -> bool:
+    """The real Task Scheduler boundary runs only on disposable GitHub-hosted Windows runners."""
+    env = os.environ if env is None else env
+    return (
+        env.get("GITHUB_ACTIONS") == "true"
+        and env.get("RUNNER_ENVIRONMENT") == "github-hosted"
+        and env.get("RUNNER_OS") == "Windows"
+    )
+
+
+def _windows_powershell_module_environment() -> dict[str, str]:
+    """Pin Windows PowerShell 5.1 module resolution so a pwsh parent cannot shadow ScheduledTasks."""
+    env = {key: value for key, value in os.environ.items() if key.casefold() != "psmodulepath"}
+    system_root = env.get("SystemRoot") or env.get("WINDIR") or r"C:\Windows"
+    program_files = env.get("ProgramFiles") or r"C:\Program Files"
+    env["PSModulePath"] = os.pathsep.join(
+        (
+            str(PureWindowsPath(system_root, "System32", "WindowsPowerShell", "v1.0", "Modules")),
+            str(PureWindowsPath(program_files, "WindowsPowerShell", "Modules")),
+        )
+    )
+    return env
+
+
+def _git_output(*arguments: str) -> str:
+    return subprocess.run(
+        ["git", *arguments], cwd=ROOT, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+
+def _reviewed_package_identity() -> dict[str, object]:
+    """Reviewed-package identity bound to the exact checked-out candidate commit and tree."""
+    commit = _git_output("rev-parse", "HEAD")
+    return {
+        "schema_version": "xb.member.gateway.worker.reviewed-package.v1",
+        "source": {"commit": commit, "tree": _git_output("rev-parse", "HEAD^{tree}")},
+        "package_files": [
+            {
+                "name": name,
+                "sha256": hashlib.sha256((ROOT / "scripts" / name).read_bytes()).hexdigest(),
+                "git_blob": _git_output("rev-parse", f"{commit}:scripts/{name}"),
+            }
+            for name in INSTALLER_PACKAGE_FILES
+        ],
+    }
+
+
+def _boundary_report(stdout: str) -> dict[str, object] | None:
+    lines = [line for line in stdout.splitlines() if line.startswith(TASK_BOUNDARY_RESULT_PREFIX)]
+    if len(lines) != 1:
+        return None
+    return json.loads(lines[0][len(TASK_BOUNDARY_RESULT_PREFIX):])
+
+
+def _installer_function(source: str, name: str) -> str:
+    start = source.index(f"function {name} {{")
+    end = source.find("\nfunction ", start + 1)
+    return source[start:] if end < 0 else source[start:end]
+
+
+_LOCAL_TASK_CONTRACT_HARNESS = r'''[CmdletBinding()]
+param(
+    [Parameter(Mandatory)][string]$InstallerPath,
+    [Parameter(Mandatory)][string]$WorkRoot
+)
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+. $InstallerPath -LibraryOnly
+$out = [ordered]@{}
+
+function Get-XbOutcome {
+    param([Parameter(Mandatory)][scriptblock]$Body)
+    try { $null = & $Body; return "pass" } catch { return [string]$_.Exception.Message }
+}
+
+# In-memory triggerless task built exactly like the installer: CIM exposes Triggers as $null.
+$memoryAction = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoLogo"
+$memorySettings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::FromMinutes(10)) -RestartCount 0 -StartWhenAvailable:$false -Disable
+$memoryTask = New-ScheduledTask -Action $memoryAction -Settings $memorySettings
+$out.in_memory = [ordered]@{
+    triggers_null = ($null -eq $memoryTask.Triggers)
+    historical_expression_count = @($memoryTask.Triggers).Count
+    filtered_trigger_count = (Get-XbNonNullCount $memoryTask.Triggers)
+    filtered_action_count = (Get-XbNonNullCount $memoryTask.Actions)
+}
+
+$ns = "http://schemas.microsoft.com/windows/2004/02/mit/task"
+$zeroXml = '<?xml version="1.0" encoding="UTF-16"?><Task version="1.2" xmlns="' + $ns + '"><Settings><Enabled>false</Enabled></Settings></Task>'
+$emptyTriggersXml = '<Task version="1.2" xmlns="' + $ns + '"><Triggers /></Task>'
+$oneXml = '<Task version="1.2" xmlns="' + $ns + '"><Triggers><TimeTrigger><StartBoundary>2099-01-01T00:00:00</StartBoundary></TimeTrigger></Triggers></Task>'
+$twoXml = '<Task version="1.2" xmlns="' + $ns + '"><Triggers><TimeTrigger /><BootTrigger /></Triggers></Task>'
+$bareXml = '<Task><Triggers><TimeTrigger /></Triggers></Task>'
+$fakeTrigger = [pscustomobject]@{ Enabled = $true }
+
+function Get-XbOracleOutcome {
+    param([int]$Com, [AllowEmptyString()][string]$Xml, $Cim)
+    try { return [string](Get-XbTaskTriggerOracleCount -ComTriggerCount $Com -TaskXml $Xml -CimTriggers $Cim) }
+    catch { return [string]$_.Exception.Message }
+}
+
+$out.oracle = [ordered]@{
+    zero = (Get-XbOracleOutcome 0 $zeroXml $null)
+    empty_triggers_element = (Get-XbOracleOutcome 0 $emptyTriggersXml $null)
+    one = (Get-XbOracleOutcome 1 $oneXml @($fakeTrigger))
+    two = (Get-XbOracleOutcome 2 $twoXml @($fakeTrigger, $fakeTrigger))
+    com_zero_xml_one = (Get-XbOracleOutcome 0 $oneXml $null)
+    com_one_xml_zero = (Get-XbOracleOutcome 1 $zeroXml @($fakeTrigger))
+    cim_null_with_one = (Get-XbOracleOutcome 1 $oneXml $null)
+    cim_one_with_zero = (Get-XbOracleOutcome 0 $zeroXml @($fakeTrigger))
+    un_namespaced = (Get-XbOracleOutcome 1 $bareXml @($fakeTrigger))
+    malformed = (Get-XbOracleOutcome 0 '<Task' $null)
+    empty = (Get-XbOracleOutcome 0 '' $null)
+}
+
+$WorkerAccount = "XBHOST\xbworker"
+$launcher = Join-Path $InstallRoot "launch_ac2_member_gateway_worker.ps1"
+$identity = Get-XbWorkerTaskIdentity -LauncherPath $launcher -WorkerAccount $WorkerAccount
+
+function New-XbFakeTask {
+    param([hashtable]$Override = @{})
+    $values = @{
+        TaskPath = $taskPath; TaskName = $taskName; State = "Disabled"; Triggers = $null
+        Actions = @([pscustomobject]@{ Execute = $identity.executable; Arguments = $identity.arguments; WorkingDirectory = "" })
+        MultipleInstances = "IgnoreNew"; ExecutionTimeLimit = "PT10M"; RestartCount = 0; StartWhenAvailable = $false
+        UserId = $identity.principal_user_id; LogonType = "Password"; RunLevel = "Limited"
+    }
+    foreach ($key in @($Override.Keys)) { $values[$key] = $Override[$key] }
+    return [pscustomobject]@{
+        TaskPath = $values.TaskPath; TaskName = $values.TaskName; State = $values.State
+        Triggers = $values.Triggers; Actions = $values.Actions
+        Settings = [pscustomobject]@{ MultipleInstances = $values.MultipleInstances; ExecutionTimeLimit = $values.ExecutionTimeLimit; RestartCount = $values.RestartCount; StartWhenAvailable = $values.StartWhenAvailable }
+        Principal = [pscustomobject]@{ UserId = $values.UserId; LogonType = $values.LogonType; RunLevel = $values.RunLevel }
+    }
+}
+
+function New-XbFakeView {
+    param([hashtable]$Override = @{})
+    $values = @{
+        Path = $taskPath + $taskName; Enabled = $false; SettingsEnabled = $false; TriggerCount = 0; Xml = $zeroXml
+        ActionCount = 1; ActionType = 0; ActionPath = $identity.executable; ActionArguments = $identity.arguments
+    }
+    foreach ($key in @($Override.Keys)) { $values[$key] = $Override[$key] }
+    $actions = [pscustomobject]@{ Count = $values.ActionCount; Entry = [pscustomobject]@{ Type = $values.ActionType; Path = $values.ActionPath; Arguments = $values.ActionArguments } }
+    Add-Member -InputObject $actions -MemberType ScriptMethod -Name Item -Value { param($Index) return $this.Entry }
+    return [pscustomobject]@{
+        Path = $values.Path; Enabled = $values.Enabled; Xml = $values.Xml
+        Definition = [pscustomobject]@{ Settings = [pscustomobject]@{ Enabled = $values.SettingsEnabled }; Triggers = [pscustomobject]@{ Count = $values.TriggerCount }; Actions = $actions }
+    }
+}
+
+$originalView = ${function:Get-XbRegisteredWorkerTaskView}
+$script:fakeView = $null
+Set-Item function:script:Get-XbRegisteredWorkerTaskView { return $script:fakeView }
+function Get-XbContractOutcome {
+    param([hashtable]$TaskOverride = @{}, [hashtable]$ViewOverride = @{})
+    $script:fakeView = New-XbFakeView $ViewOverride
+    $candidate = New-XbFakeTask $TaskOverride
+    return Get-XbOutcome { Assert-XbWorkerTaskContract -Task $candidate -ExpectedIdentity $identity }
+}
+$out.contract = [ordered]@{
+    valid_null_triggers = (Get-XbContractOutcome)
+    historical_expression_on_valid = @((New-XbFakeTask).Triggers).Count
+    com_enabled = (Get-XbContractOutcome -ViewOverride @{ Enabled = $true })
+    settings_enabled = (Get-XbContractOutcome -ViewOverride @{ SettingsEnabled = $true })
+    cim_ready = (Get-XbContractOutcome -TaskOverride @{ State = "Ready" })
+    one_trigger = (Get-XbContractOutcome -TaskOverride @{ Triggers = @($fakeTrigger) } -ViewOverride @{ TriggerCount = 1; Xml = $oneXml })
+    oracle_disagreement = (Get-XbContractOutcome -ViewOverride @{ TriggerCount = 1 })
+    cim_actions_null = (Get-XbContractOutcome -TaskOverride @{ Actions = $null })
+    com_two_actions = (Get-XbContractOutcome -ViewOverride @{ ActionCount = 2 })
+    com_action_path = (Get-XbContractOutcome -ViewOverride @{ ActionPath = "cmd.exe" })
+    com_action_type = (Get-XbContractOutcome -ViewOverride @{ ActionType = 5 })
+    task_path_mismatch = (Get-XbContractOutcome -TaskOverride @{ TaskPath = "\Other\" })
+    restart_count = (Get-XbContractOutcome -TaskOverride @{ RestartCount = 1 })
+    logon_type = (Get-XbContractOutcome -TaskOverride @{ LogonType = "S4U" })
+}
+Set-Item function:script:Get-XbRegisteredWorkerTaskView $originalView
+
+$out.hresult = [ordered]@{
+    file_not_found = (Get-XbComHResult ([IO.FileNotFoundException]::new("absent")))
+    wrapped_file_not_found = (Get-XbComHResult ([Management.Automation.MethodInvocationException]::new("wrapped", [IO.FileNotFoundException]::new("absent"))))
+    access_denied = (Get-XbComHResult ([UnauthorizedAccessException]::new("denied")))
+}
+
+$originalConnect = ${function:Connect-XbTaskService}
+$script:fakeFolderError = $null
+Set-Item function:script:Connect-XbTaskService {
+    $service = [pscustomobject]@{}
+    Add-Member -InputObject $service -MemberType ScriptMethod -Name GetFolder -Value { param($Path) if ($null -ne $script:fakeFolderError) { throw $script:fakeFolderError }; return [pscustomobject]@{ Path = $Path } }
+    return $service
+}
+function Get-XbFolderOutcome {
+    param($ErrorValue)
+    $script:fakeFolderError = $ErrorValue
+    try { return [string](Test-XbTaskFolderPresent -Path "\X-Boundaries\" -ErrorId "task_folder_preimage_unproven") }
+    catch { return [string]$_.Exception.Message }
+}
+$out.folder_preimage = [ordered]@{
+    present = (Get-XbFolderOutcome $null)
+    file_not_found = (Get-XbFolderOutcome ([IO.FileNotFoundException]::new("absent")))
+    access_denied = (Get-XbFolderOutcome ([UnauthorizedAccessException]::new("denied")))
+    path_not_found = (Get-XbFolderOutcome ([Runtime.InteropServices.COMException]::new("path", -2147024893)))
+}
+Set-Item function:script:Connect-XbTaskService $originalConnect
+
+# Read-only Schedule.Service probes: no folder or task is created or deleted here.
+$absentFolder = "\XB-Absent-" + [Guid]::NewGuid().ToString("N") + "\"
+$productionTaskPath = $taskPath
+$out.real_folder = [ordered]@{
+    root_present = (Test-XbTaskFolderPresent -Path "\" -ErrorId "unproven")
+    random_absent = (Test-XbTaskFolderPresent -Path $absentFolder -ErrorId "unproven")
+}
+$script:taskPath = "\"
+$out.real_folder.root_cleanup = (Get-XbOutcome { Remove-XbAttemptCreatedTaskFolder })
+$script:taskPath = $absentFolder
+$out.real_folder.absent_cleanup = (Get-XbOutcome { Remove-XbAttemptCreatedTaskFolder })
+$script:taskPath = $productionTaskPath
+
+$containers = Join-Path $WorkRoot "containers"
+New-Item -ItemType Directory -Path $containers | Out-Null
+function New-XbDirectory { param([string]$Path) New-Item -ItemType Directory -Path $Path -Force | Out-Null; return $Path }
+$emptyPath = New-XbDirectory (Join-Path $containers "empty")
+$childPath = New-XbDirectory (Join-Path $containers "child")
+Set-Content -LiteralPath (Join-Path $childPath "unrelated.txt") -Value "keep"
+$hiddenPath = New-XbDirectory (Join-Path $containers "hidden")
+Set-Content -LiteralPath (Join-Path $hiddenPath "hidden.txt") -Value "keep"
+(Get-Item -LiteralPath (Join-Path $hiddenPath "hidden.txt") -Force).Attributes = "Hidden"
+$nestedPath = New-XbDirectory (Join-Path $containers "nested")
+New-XbDirectory (Join-Path $nestedPath "inner") | Out-Null
+$junctionTarget = New-XbDirectory (Join-Path $containers "junction-target")
+$junctionPath = Join-Path $containers "junction"
+& cmd.exe /c mklink /J "$junctionPath" "$junctionTarget" | Out-Null
+$filePath = Join-Path $containers "file"
+Set-Content -LiteralPath $filePath -Value "keep"
+$out.container = [ordered]@{
+    absent = (Get-XbOutcome { Remove-XbAttemptCreatedContainer -Path (Join-Path $containers "absent") })
+    empty = (Get-XbOutcome { Remove-XbAttemptCreatedContainer -Path $emptyPath })
+    empty_removed = (-not (Test-Path -LiteralPath $emptyPath))
+    child = (Get-XbOutcome { Remove-XbAttemptCreatedContainer -Path $childPath })
+    child_preserved = (Test-Path -LiteralPath (Join-Path $childPath "unrelated.txt"))
+    hidden_child = (Get-XbOutcome { Remove-XbAttemptCreatedContainer -Path $hiddenPath })
+    hidden_child_preserved = (Test-Path -LiteralPath (Join-Path $hiddenPath "hidden.txt"))
+    nested = (Get-XbOutcome { Remove-XbAttemptCreatedContainer -Path $nestedPath })
+    nested_preserved = (Test-Path -LiteralPath (Join-Path $nestedPath "inner"))
+    junction = (Get-XbOutcome { Remove-XbAttemptCreatedContainer -Path $junctionPath })
+    junction_preserved = (Test-Path -LiteralPath $junctionPath)
+    junction_target_preserved = (Test-Path -LiteralPath $junctionTarget)
+    file = (Get-XbOutcome { Remove-XbAttemptCreatedContainer -Path $filePath })
+    file_preserved = (Test-Path -LiteralPath $filePath)
+}
+& cmd.exe /c rmdir "$junctionPath" | Out-Null
+
+$originalTaskRead = ${function:Get-XbWorkerTaskIfPresent}
+$originalUnregister = ${function:Remove-XbWorkerScheduledTask}
+$script:unregisterCalls = 0
+Set-Item function:script:Remove-XbWorkerScheduledTask { $script:unregisterCalls++ }
+function Get-XbTaskStepOutcome {
+    param([Parameter(Mandatory)][scriptblock]$Presence)
+    Set-Item function:script:Get-XbWorkerTaskIfPresent $Presence
+    $script:unregisterCalls = 0
+    $outcome = Get-XbOutcome { Remove-XbAttemptRegisteredTask -LauncherPath $launcher }
+    return [ordered]@{ outcome = $outcome; unregister_calls = $script:unregisterCalls }
+}
+$out.task_step = [ordered]@{
+    absent = (Get-XbTaskStepOutcome { return $null })
+    owned = (Get-XbTaskStepOutcome { return (New-XbFakeTask) })
+    foreign_action = (Get-XbTaskStepOutcome { return (New-XbFakeTask @{ Actions = @([pscustomobject]@{ Execute = "cmd.exe"; Arguments = "/c"; WorkingDirectory = "" }) }) })
+    foreign_principal = (Get-XbTaskStepOutcome { return (New-XbFakeTask @{ UserId = "XBHOST\other" }) })
+    ambiguous = (Get-XbTaskStepOutcome { throw "task_presence_unproven" })
+}
+
+$script:folderCleanupCalls = 0
+Set-Item function:script:Remove-XbAttemptCreatedTaskFolder { $script:folderCleanupCalls++ }
+Set-Item function:script:Get-XbWorkerTaskIfPresent { return $null }
+function Initialize-XbAttempt {
+    param([Parameter(Mandatory)][string]$Base, [switch]$PreexistingParents)
+    $script:InstallRoot = Join-Path $Base "pf\X-Boundaries\MemberGatewayWorker"
+    $script:RuntimeRoot = Join-Path $Base "pd\X-Boundaries\MemberGatewayWorker"
+    New-Item -ItemType Directory -Path (Join-Path $Base "pf") -Force | Out-Null
+    New-Item -ItemType Directory -Path (Join-Path $Base "pd") -Force | Out-Null
+    if ($PreexistingParents) {
+        foreach ($parent in @((Split-Path -Parent $InstallRoot), (Split-Path -Parent $RuntimeRoot))) {
+            New-Item -ItemType Directory -Path $parent -Force | Out-Null
+            Set-Content -LiteralPath (Join-Path $parent "sentinel.txt") -Value "keep"
+        }
+    }
+    New-Item -ItemType Directory -Path $InstallRoot -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $InstallRoot "installation-manifest.json") -Value "{}"
+    foreach ($child in @("config", "secrets", "logs", "rollback")) { New-Item -ItemType Directory -Path (Join-Path $RuntimeRoot $child) -Force | Out-Null }
+    $stage = Join-Path $Base "stage"
+    New-Item -ItemType Directory -Path $stage -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $stage "staged.txt") -Value "x"
+    return $stage
+}
+function Get-XbAttemptState {
+    param([Parameter(Mandatory)][string]$Base, [Parameter(Mandatory)][string]$Stage)
+    return [ordered]@{
+        install_root = (Test-Path -LiteralPath $InstallRoot)
+        runtime_root = (Test-Path -LiteralPath $RuntimeRoot)
+        program_files_parent = (Test-Path -LiteralPath (Split-Path -Parent $InstallRoot))
+        program_data_parent = (Test-Path -LiteralPath (Split-Path -Parent $RuntimeRoot))
+        program_files_grandparent = (Test-Path -LiteralPath (Join-Path $Base "pf"))
+        program_data_grandparent = (Test-Path -LiteralPath (Join-Path $Base "pd"))
+        stage = (Test-Path -LiteralPath $Stage)
+        folder_cleanup_calls = $script:folderCleanupCalls
+    }
+}
+$absentPreimage = [ordered]@{ program_files_parent = $false; program_data_parent = $false; scheduler_folder = $false }
+$presentPreimage = [ordered]@{ program_files_parent = $true; program_data_parent = $true; scheduler_folder = $true }
+$out.rollback = [ordered]@{}
+
+$base = Join-Path $WorkRoot "parents-absent"
+$stage = Initialize-XbAttempt -Base $base
+$script:folderCleanupCalls = 0
+$outcome = Get-XbOutcome { Invoke-XbWorkerInstallRollback -Preimage $absentPreimage -StageRoot $stage -RegistrationAttempted $true }
+$out.rollback.parents_absent = [ordered]@{ outcome = $outcome; state = (Get-XbAttemptState -Base $base -Stage $stage) }
+
+$base = Join-Path $WorkRoot "parents-preexisting"
+$stage = Initialize-XbAttempt -Base $base -PreexistingParents
+$script:folderCleanupCalls = 0
+$outcome = Get-XbOutcome { Invoke-XbWorkerInstallRollback -Preimage $presentPreimage -StageRoot $stage -RegistrationAttempted $true }
+$out.rollback.parents_preexisting = [ordered]@{
+    outcome = $outcome
+    state = (Get-XbAttemptState -Base $base -Stage $stage)
+    program_files_sentinel = (Test-Path -LiteralPath (Join-Path (Split-Path -Parent $InstallRoot) "sentinel.txt"))
+    program_data_sentinel = (Test-Path -LiteralPath (Join-Path (Split-Path -Parent $RuntimeRoot) "sentinel.txt"))
+}
+
+$base = Join-Path $WorkRoot "not-attempted"
+$stage = Initialize-XbAttempt -Base $base
+Set-Item function:script:Get-XbWorkerTaskIfPresent { throw "unexpected_task_read" }
+$script:folderCleanupCalls = 0
+$outcome = Get-XbOutcome { Invoke-XbWorkerInstallRollback -Preimage $absentPreimage -StageRoot $stage -RegistrationAttempted $false }
+$out.rollback.not_attempted = [ordered]@{ outcome = $outcome; state = (Get-XbAttemptState -Base $base -Stage $stage) }
+Set-Item function:script:Get-XbWorkerTaskIfPresent { return $null }
+
+$base = Join-Path $WorkRoot "unexpected-content"
+$stage = Initialize-XbAttempt -Base $base
+$unexpected = Join-Path (Split-Path -Parent $RuntimeRoot) "unexpected.txt"
+Set-Content -LiteralPath $unexpected -Value "keep"
+$script:folderCleanupCalls = 0
+$outcome = Get-XbOutcome { Invoke-XbWorkerInstallRollback -Preimage $absentPreimage -StageRoot $stage -RegistrationAttempted $true }
+$out.rollback.unexpected_content = [ordered]@{ outcome = $outcome; state = (Get-XbAttemptState -Base $base -Stage $stage); unexpected_preserved = (Test-Path -LiteralPath $unexpected) }
+
+Set-Item function:script:Get-XbWorkerTaskIfPresent $originalTaskRead
+Set-Item function:script:Remove-XbWorkerScheduledTask $originalUnregister
+[Console]::Out.Write(($out | ConvertTo-Json -Depth 8 -Compress))
+'''
+
+
+_HOSTED_TASK_BOUNDARY_HARNESS = r'''[CmdletBinding()]
+param(
+    [Parameter(Mandatory)][string]$InstallerPath,
+    [Parameter(Mandatory)][string]$ReviewedManifestPath
+)
+# Disposable GitHub-hosted Windows runner only. Never starts a task; every created object is removed and read back.
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+$ProgressPreference = "SilentlyContinue"
+
+$report = [ordered]@{
+    harness = "xb.member.worker.task-boundary.v1"
+    environment = [ordered]@{}
+    account = [ordered]@{}
+    cases = [ordered]@{}
+    cleanup = [ordered]@{}
+    fatal = $null
+    secret_exposure = "unchecked"
+}
+$secretValues = New-Object 'System.Collections.Generic.List[string]'
+$trace = New-Object 'System.Collections.Generic.List[string]'
+$state = @{ pristine_proven = $false; user_sid = $null; temp_redirect = $null; stage_before = @(); boundary_folder = $null; boundary_tasks = @(); lsa_loaded = $false }
+
+$lsaSource = @"
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+using System.Security.Principal;
+
+public static class XbBoundaryLsa
+{
+    [StructLayout(LayoutKind.Sequential)]
+    private struct LsaUnicodeString { public ushort Length; public ushort MaximumLength; public IntPtr Buffer; }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct LsaObjectAttributes { public int Length; public IntPtr RootDirectory; public IntPtr ObjectName; public uint Attributes; public IntPtr SecurityDescriptor; public IntPtr SecurityQualityOfService; }
+
+    [DllImport("advapi32.dll")] private static extern uint LsaOpenPolicy(IntPtr systemName, ref LsaObjectAttributes objectAttributes, uint desiredAccess, out IntPtr policyHandle);
+    [DllImport("advapi32.dll")] private static extern uint LsaEnumerateAccountRights(IntPtr policyHandle, byte[] accountSid, out IntPtr userRights, out uint countOfRights);
+    [DllImport("advapi32.dll")] private static extern uint LsaRemoveAccountRights(IntPtr policyHandle, byte[] accountSid, [MarshalAs(UnmanagedType.U1)] bool allRights, IntPtr userRights, uint countOfRights);
+    [DllImport("advapi32.dll")] private static extern uint LsaFreeMemory(IntPtr buffer);
+    [DllImport("advapi32.dll")] private static extern uint LsaClose(IntPtr policyHandle);
+    [DllImport("advapi32.dll")] private static extern int LsaNtStatusToWinError(uint status);
+
+    private const uint PolicyAllAccess = 0x000F0FFF;
+    private const uint StatusObjectNameNotFound = 0xC0000034;
+
+    private static IntPtr Open()
+    {
+        LsaObjectAttributes attributes = new LsaObjectAttributes();
+        attributes.Length = Marshal.SizeOf(typeof(LsaObjectAttributes));
+        IntPtr handle;
+        uint status = LsaOpenPolicy(IntPtr.Zero, ref attributes, PolicyAllAccess, out handle);
+        if (status != 0) { throw new InvalidOperationException("lsa_open_failed:" + LsaNtStatusToWinError(status)); }
+        return handle;
+    }
+
+    private static byte[] SidBytes(string sid)
+    {
+        SecurityIdentifier identifier = new SecurityIdentifier(sid);
+        byte[] bytes = new byte[identifier.BinaryLength];
+        identifier.GetBinaryForm(bytes, 0);
+        return bytes;
+    }
+
+    // Returns null when the SID has no LSA account object.
+    public static string[] GetRights(string sid)
+    {
+        IntPtr handle = Open();
+        try
+        {
+            IntPtr rights;
+            uint count;
+            uint status = LsaEnumerateAccountRights(handle, SidBytes(sid), out rights, out count);
+            if (status == StatusObjectNameNotFound) { return null; }
+            if (status != 0) { throw new InvalidOperationException("lsa_enumerate_failed:" + LsaNtStatusToWinError(status)); }
+            try
+            {
+                List<string> names = new List<string>();
+                int size = Marshal.SizeOf(typeof(LsaUnicodeString));
+                for (int index = 0; index < count; index++)
+                {
+                    LsaUnicodeString entry = (LsaUnicodeString)Marshal.PtrToStructure(new IntPtr(rights.ToInt64() + (long)index * size), typeof(LsaUnicodeString));
+                    names.Add(Marshal.PtrToStringUni(entry.Buffer, entry.Length / 2));
+                }
+                return names.ToArray();
+            }
+            finally { LsaFreeMemory(rights); }
+        }
+        finally { LsaClose(handle); }
+    }
+
+    public static void RemoveAllRights(string sid)
+    {
+        IntPtr handle = Open();
+        try
+        {
+            uint status = LsaRemoveAccountRights(handle, SidBytes(sid), true, IntPtr.Zero, 0);
+            if (status != 0 && status != StatusObjectNameNotFound) { throw new InvalidOperationException("lsa_remove_failed:" + LsaNtStatusToWinError(status)); }
+        }
+        finally { LsaClose(handle); }
+    }
+}
+"@
+
+function New-XbBoundaryHex {
+    param([Parameter(Mandatory)][int]$Bytes)
+    $buffer = New-Object byte[] $Bytes
+    $generator = [Security.Cryptography.RandomNumberGenerator]::Create()
+    try { $generator.GetBytes($buffer) } finally { $generator.Dispose() }
+    return (($buffer | ForEach-Object { $_.ToString("x2") }) -join "")
+}
+
+function New-XbBoundaryPassword {
+    $buffer = New-Object byte[] 24
+    $generator = [Security.Cryptography.RandomNumberGenerator]::Create()
+    try { $generator.GetBytes($buffer) } finally { $generator.Dispose() }
+    return [Convert]::ToBase64String($buffer) + "aZ9!"
+}
+
+function Get-XbBoundaryHResult {
+    param([Parameter(Mandatory)]$ErrorRecord)
+    $exception = $ErrorRecord.Exception
+    while ($null -ne $exception.InnerException) { $exception = $exception.InnerException }
+    return [int]$exception.HResult
+}
+
+function Get-XbBoundaryOutcome {
+    param([Parameter(Mandatory)][scriptblock]$Body)
+    try { $null = & $Body; return "pass" } catch { return [string]$_.Exception.Message }
+}
+
+function Invoke-XbBoundaryCase {
+    param([Parameter(Mandatory)][string]$Name, [Parameter(Mandatory)][scriptblock]$Body)
+    $record = [ordered]@{ status = "error" }
+    try {
+        $data = @(& $Body)
+        if ($data.Count -gt 0 -and $data[-1] -is [Collections.IDictionary]) { foreach ($key in @($data[-1].Keys)) { $record[$key] = $data[-1][$key] } }
+        $record.status = "completed"
+    } catch {
+        $record.error = [string]$_.Exception.Message
+        $record.error_stack = [string]$_.ScriptStackTrace
+    }
+    $report.cases[$Name] = $record
+}
+
+function Get-XbStageNames {
+    return @(Get-ChildItem -LiteralPath ([IO.Path]::GetTempPath()) -Directory -Force -Filter "xb-member-worker-*" | ForEach-Object Name)
+}
+
+function Get-XbAccountObservation {
+    $user = Get-LocalUser -SID $state.user_sid
+    $rights = [XbBoundaryLsa]::GetRights($state.user_sid)
+    $profileKey = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\" + $state.user_sid
+    return [ordered]@{
+        last_logon = $(if ($null -eq $user.LastLogon) { "never" } else { ([datetime]$user.LastLogon).ToUniversalTime().ToString("o") })
+        lsa_account_object = ($null -ne $rights)
+        lsa_rights = @(if ($null -ne $rights) { $rights | Sort-Object })
+        profile_list_present = (Test-Path -LiteralPath $profileKey)
+        user_profile_count = @(Get-CimInstance -ClassName Win32_UserProfile -Filter ("SID='{0}'" -f $state.user_sid)).Count
+        worker_process_count = @(Get-Process -IncludeUserName -ErrorAction SilentlyContinue | Where-Object { [string]$_.UserName -ieq $account }).Count
+    }
+}
+
+function Get-XbTaskEvidence {
+    $cim = Get-ScheduledTask -TaskPath $taskPath -TaskName $taskName -ErrorAction Stop
+    $view = Get-XbRegisteredWorkerTaskView
+    $definition = $view.Definition
+    $document = New-Object Xml.XmlDocument
+    $document.LoadXml([string]$view.Xml)
+    $namespaces = New-Object Xml.XmlNamespaceManager($document.NameTable)
+    $namespaces.AddNamespace("t", "http://schemas.microsoft.com/windows/2004/02/mit/task")
+    $info = Get-ScheduledTaskInfo -TaskPath $taskPath -TaskName $taskName -ErrorAction Stop
+    $cimActions = @(@($cim.Actions) | Where-Object { $null -ne $_ })
+    $comAction = $definition.Actions.Item(1)
+    return [ordered]@{
+        cim_triggers_null = ($null -eq $cim.Triggers)
+        historical_expression_count = @($cim.Triggers).Count
+        cim_filtered_trigger_count = (Get-XbNonNullCount $cim.Triggers)
+        com_trigger_count = [int]$definition.Triggers.Count
+        xml_trigger_count = $document.SelectNodes("/t:Task/t:Triggers/*", $namespaces).Count
+        cim_state = [string]$cim.State
+        com_state = [int]$view.State
+        com_enabled = [bool]$view.Enabled
+        com_settings_enabled = [bool]$definition.Settings.Enabled
+        cim_action_count = $cimActions.Count
+        com_action_count = [int]$definition.Actions.Count
+        com_action_type = [int]$comAction.Type
+        action_execute = $(if ($cimActions.Count -gt 0) { [string]$cimActions[0].Execute } else { $null })
+        action_arguments = $(if ($cimActions.Count -gt 0) { [string]$cimActions[0].Arguments } else { $null })
+        com_action_path = [string]$comAction.Path
+        com_action_arguments = [string]$comAction.Arguments
+        principal_user_id = [string]$cim.Principal.UserId
+        principal_logon_type = [string]$cim.Principal.LogonType
+        principal_run_level = [string]$cim.Principal.RunLevel
+        multiple_instances = [string]$cim.Settings.MultipleInstances
+        execution_time_limit = [string]$cim.Settings.ExecutionTimeLimit
+        restart_count = [int]$cim.Settings.RestartCount
+        start_when_available = [bool]$cim.Settings.StartWhenAvailable
+        last_task_result = [int64]$info.LastTaskResult
+        last_run_time = $(if ($null -eq $info.LastRunTime) { $null } else { ([datetime]$info.LastRunTime).ToString("yyyy-MM-ddTHH:mm:ss") })
+        missed_runs = [int]$info.NumberOfMissedRuns
+        com_last_task_result = [int64]$view.LastTaskResult
+        com_last_run_time = ([datetime]$view.LastRunTime).ToString("yyyy-MM-ddTHH:mm:ss")
+        com_missed_runs = [int]$view.NumberOfMissedRuns
+    }
+}
+
+function Get-XbProductionReadback {
+    $stageNow = @(Get-XbStageNames)
+    return [ordered]@{
+        task_present = ($null -ne (Get-XbWorkerTaskIfPresent))
+        scheduler_folder_present = (Test-XbTaskFolderPresent -Path $productionTaskPath -ErrorId "readback_folder_unproven")
+        install_root_present = (Test-Path -LiteralPath $InstallRoot)
+        runtime_root_present = (Test-Path -LiteralPath $RuntimeRoot)
+        program_files_parent_present = (Test-Path -LiteralPath $programFilesParent)
+        program_data_parent_present = (Test-Path -LiteralPath $programDataParent)
+        new_stage_count = @($stageNow | Where-Object { $state.stage_before -notcontains $_ }).Count
+    }
+}
+
+function Set-XbProductionTaskIdentity {
+    $script:taskPath = $productionTaskPath
+    $script:taskName = $productionTaskName
+    $script:Operation = "Install"
+    $script:ReviewedPackageManifestPath = $ReviewedManifestPath
+}
+
+# Disposable-runner cleanup of containers that were proven absent when the harness started.
+function Clear-XbRetainedProductionContainers {
+    Set-XbProductionTaskIdentity
+    Remove-XbAttemptCreatedTaskFolder
+    foreach ($parent in @($programFilesParent, $programDataParent)) {
+        if (Test-Path -LiteralPath $parent) {
+            Get-ChildItem -LiteralPath $parent -Force -File | Remove-Item -Force
+            Remove-XbAttemptCreatedContainer -Path $parent
+        }
+    }
+}
+
+try {
+    $report.environment.ps_version = $PSVersionTable.PSVersion.ToString()
+    $report.environment.ps_edition = [string]$PSVersionTable.PSEdition
+    if ($PSVersionTable.PSVersion.Major -ne 5 -or $PSVersionTable.PSVersion.Minor -ne 1) { throw "boundary_requires_windows_powershell_51" }
+    $currentPrincipal = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+    $report.environment.elevated = $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    if (-not $report.environment.elevated) { throw "boundary_requires_elevation" }
+    Import-Module ScheduledTasks -ErrorAction Stop
+    $report.environment.scheduled_tasks_module = $true
+    Import-Module Microsoft.PowerShell.LocalAccounts -ErrorAction Stop
+    $probeService = New-Object -ComObject Schedule.Service
+    $probeService.Connect()
+    $report.environment.schedule_service = [bool]$probeService.Connected
+    if (-not $report.environment.schedule_service) { throw "boundary_requires_schedule_service" }
+    Add-Type -TypeDefinition $lsaSource -Language CSharp
+    $state.lsa_loaded = $true
+
+    . $InstallerPath -LibraryOnly
+    $productionTaskPath = $taskPath
+    $productionTaskName = $taskName
+    $programFilesParent = Split-Path -Parent $InstallRoot
+    $programDataParent = Split-Path -Parent $RuntimeRoot
+    $report.environment.pristine_before = [ordered]@{
+        program_files_parent = (Test-Path -LiteralPath $programFilesParent)
+        program_data_parent = (Test-Path -LiteralPath $programDataParent)
+        scheduler_folder = (Test-XbTaskFolderPresent -Path $productionTaskPath -ErrorId "pristine_folder_unproven")
+    }
+    if (@($report.environment.pristine_before.Values | Where-Object { $_ }).Count -ne 0) { throw "hosted_runner_not_pristine" }
+    $state.pristine_proven = $true
+
+    $report.environment.temp_drive = [IO.Path]::GetPathRoot([IO.Path]::GetTempPath())
+    if ($report.environment.temp_drive -ne [IO.Path]::GetPathRoot($InstallRoot)) {
+        $state.temp_redirect = "C:\xb-boundary-tmp-" + (New-XbBoundaryHex 6)
+        New-Item -ItemType Directory -Path $state.temp_redirect | Out-Null
+        $env:TMP = $state.temp_redirect
+        $env:TEMP = $state.temp_redirect
+    }
+    $report.environment.temp_redirected = ($null -ne $state.temp_redirect)
+    $state.stage_before = @(Get-XbStageNames)
+
+    # Ephemeral Users-only account; the CSPRNG passwords exist only in this process and are never emitted.
+    $userName = "xbt" + (New-XbBoundaryHex 6)
+    $plainPassword = New-XbBoundaryPassword
+    $plainWrong = New-XbBoundaryPassword
+    $secretValues.Add($plainPassword)
+    $secretValues.Add($plainWrong)
+    $securePassword = ConvertTo-SecureString -String $plainPassword -AsPlainText -Force
+    $secureWrong = ConvertTo-SecureString -String $plainWrong -AsPlainText -Force
+    $plainPassword = $null
+    $plainWrong = $null
+    New-LocalUser -Name $userName -Password $securePassword -PasswordNeverExpires -AccountNeverExpires -UserMayNotChangePassword -Description "XB disposable task boundary test" | Out-Null
+    $state.user_sid = (Get-LocalUser -Name $userName).SID.Value
+    try { Add-LocalGroupMember -SID "S-1-5-32-545" -Member $userName -ErrorAction Stop } catch [Microsoft.PowerShell.Commands.MemberExistsException] { }
+    $account = "{0}\{1}" -f $env:COMPUTERNAME, $userName
+    $credential = New-Object Management.Automation.PSCredential($account, $securePassword)
+    $wrongCredential = New-Object Management.Automation.PSCredential($account, $secureWrong)
+    $script:WorkerAccount = $account
+    $report.environment.worker_account = $account
+    try {
+        $report.environment.administrators_member = (@(Get-LocalGroupMember -SID "S-1-5-32-544" -ErrorAction Stop | Where-Object { $_.SID.Value -eq $state.user_sid }).Count -ne 0)
+    } catch {
+        $adminNames = @(([ADSI]"WinNT://./Administrators,group").psbase.Invoke("Members") | ForEach-Object { $_.GetType().InvokeMember("Name", "GetProperty", $null, $_, $null) })
+        $report.environment.administrators_member = ($adminNames -contains $userName)
+    }
+    $report.account.before_registration = Get-XbAccountObservation
+
+    $boundaryHex = New-XbBoundaryHex 6
+    $state.boundary_folder = "\XB-Boundary-$boundaryHex\"
+    $candidateName = "XB Candidate $boundaryHex"
+    $controlName = "XB Control $boundaryHex"
+    $state.boundary_tasks = @($candidateName, $controlName)
+    $fakeLauncher = "C:\xb-boundary-launcher-$boundaryHex\launch_ac2_member_gateway_worker.ps1"
+
+    Invoke-XbBoundaryCase "in_memory_null_trigger_pin" {
+        $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument ('-NoLogo -NoProfile -NonInteractive -File "{0}" -Mode DisabledProof' -f $fakeLauncher)
+        $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::FromMinutes(10)) -RestartCount 0 -StartWhenAvailable:$false -Disable
+        $taskPrincipal = New-ScheduledTaskPrincipal -UserId $account -LogonType Password -RunLevel Limited
+        $memory = New-ScheduledTask -Action $action -Settings $settings -Principal $taskPrincipal
+        return [ordered]@{
+            triggers_null = ($null -eq $memory.Triggers)
+            historical_expression_count = @($memory.Triggers).Count
+            filtered_trigger_count = (Get-XbNonNullCount $memory.Triggers)
+        }
+    }
+
+    Invoke-XbBoundaryCase "zero_trigger_candidate" {
+        $script:taskPath = $state.boundary_folder
+        $script:taskName = $candidateName
+        $script:TaskCredential = $credential
+        $registration = Get-XbBoundaryOutcome { Register-XbWorkerScheduledTask -LauncherPath $fakeLauncher }
+        $cim = Get-ScheduledTask -TaskPath $taskPath -TaskName $taskName -ErrorAction Stop
+        $expected = Get-XbWorkerTaskIdentity -LauncherPath $fakeLauncher -WorkerAccount $account
+        $contract = Get-XbBoundaryOutcome { Assert-XbWorkerTaskContract -Task $cim -ExpectedIdentity $expected }
+        $view = Get-XbRegisteredWorkerTaskView
+        $oracle = try { [string](Get-XbTaskTriggerOracleCount -ComTriggerCount ([int]$view.Definition.Triggers.Count) -TaskXml ([string]$view.Xml) -CimTriggers $cim.Triggers) } catch { [string]$_.Exception.Message }
+        return [ordered]@{
+            registration = $registration
+            contract = $contract
+            oracle_count = $oracle
+            evidence = (Get-XbTaskEvidence)
+            account_after_registration = (Get-XbAccountObservation)
+        }
+    }
+
+    Invoke-XbBoundaryCase "one_trigger_control" {
+        $script:taskPath = $state.boundary_folder
+        $script:taskName = $controlName
+        $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument ('-NoLogo -NoProfile -NonInteractive -File "{0}" -Mode DisabledProof' -f $fakeLauncher)
+        $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::FromMinutes(10)) -RestartCount 0 -StartWhenAvailable:$false -Disable
+        $taskPrincipal = New-ScheduledTaskPrincipal -UserId $account -LogonType Password -RunLevel Limited
+        $trigger = New-ScheduledTaskTrigger -Once -At ([datetime]::new(2099, 1, 1, 0, 0, 0))
+        $controlDefinition = New-ScheduledTask -Action $action -Settings $settings -Principal $taskPrincipal -Trigger $trigger
+        $plain = $credential.GetNetworkCredential().Password
+        try { Register-ScheduledTask -TaskPath $taskPath -TaskName $taskName -InputObject $controlDefinition -User $account -Password $plain -Force | Out-Null }
+        finally { $plain = $null }
+        $cim = Get-ScheduledTask -TaskPath $taskPath -TaskName $taskName -ErrorAction Stop
+        $expected = Get-XbWorkerTaskIdentity -LauncherPath $fakeLauncher -WorkerAccount $account
+        $contract = Get-XbBoundaryOutcome { Assert-XbWorkerTaskContract -Task $cim -ExpectedIdentity $expected }
+        return [ordered]@{
+            in_memory_filtered_trigger_count = (Get-XbNonNullCount $controlDefinition.Triggers)
+            contract = $contract
+            evidence = (Get-XbTaskEvidence)
+        }
+    }
+
+    Invoke-XbBoundaryCase "boundary_unregister" {
+        $final = [ordered]@{}
+        foreach ($name in @($candidateName, $controlName)) {
+            $script:taskPath = $state.boundary_folder
+            $script:taskName = $name
+            $final[$name] = [int64](Get-ScheduledTaskInfo -TaskPath $taskPath -TaskName $taskName -ErrorAction Stop).LastTaskResult
+            Remove-XbWorkerScheduledTask
+        }
+        Remove-XbAttemptCreatedTaskFolder
+        return [ordered]@{
+            final_last_task_results = @($final.Values)
+            folder_present_after = (Test-XbTaskFolderPresent -Path $state.boundary_folder -ErrorId "boundary_folder_unproven")
+            account_after_unregister = (Get-XbAccountObservation)
+        }
+    }
+
+    # Observe rollback internals without changing them: record task/folder presence, then call the real step.
+    $originalTaskStep = ${function:Remove-XbAttemptRegisteredTask}
+    $originalFolderStep = ${function:Remove-XbAttemptCreatedTaskFolder}
+    Set-Item function:script:Remove-XbAttemptRegisteredTask {
+        param([Parameter(Mandatory)][string]$LauncherPath)
+        $trace.Add("task_step:" + $(if ($null -ne (Get-XbWorkerTaskIfPresent)) { "present" } else { "absent" }))
+        & $originalTaskStep -LauncherPath $LauncherPath
+    }
+    Set-Item function:script:Remove-XbAttemptCreatedTaskFolder {
+        $trace.Add("folder_step:" + $(if (Test-XbTaskFolderPresent -Path $taskPath -ErrorId "trace_folder_unproven") { "present" } else { "absent" }))
+        & $originalFolderStep
+    }
+    $originalAssert = ${function:Assert-XbWorkerTaskContract}
+    $originalRegister = ${function:Register-XbWorkerScheduledTask}
+
+    Invoke-XbBoundaryCase "registration_failure_parent_absent" {
+        Set-XbProductionTaskIdentity
+        $script:TaskCredential = $wrongCredential
+        $trace.Clear()
+        $outcome = Get-XbBoundaryOutcome { Invoke-XbWorkerInstaller }
+        return [ordered]@{
+            install_outcome = $outcome
+            rollback_trace = @($trace)
+            readback = (Get-XbProductionReadback)
+            historical_unconditional_unregister = (Get-XbBoundaryOutcome { Remove-XbWorkerScheduledTask })
+        }
+    }
+
+    Invoke-XbBoundaryCase "forced_post_registration_parent_absent" {
+        Set-XbProductionTaskIdentity
+        $script:TaskCredential = $credential
+        $trace.Clear()
+        Set-Item function:script:Assert-XbWorkerTaskContract { param($Task, $ExpectedIdentity) throw "forced_post_registration_failure" }
+        try { $outcome = Get-XbBoundaryOutcome { Invoke-XbWorkerInstaller } }
+        finally { Set-Item function:script:Assert-XbWorkerTaskContract $originalAssert }
+        return [ordered]@{ install_outcome = $outcome; rollback_trace = @($trace); readback = (Get-XbProductionReadback) }
+    }
+
+    Invoke-XbBoundaryCase "preexisting_parents_sentinel" {
+        Set-XbProductionTaskIdentity
+        $script:TaskCredential = $credential
+        $sentinelValue = New-XbBoundaryHex 16
+        foreach ($parent in @($programFilesParent, $programDataParent)) {
+            New-Item -ItemType Directory -Path $parent | Out-Null
+            Set-Content -LiteralPath (Join-Path $parent "xb-boundary-sentinel.txt") -Value $sentinelValue -NoNewline
+        }
+        $service = New-Object -ComObject Schedule.Service
+        $service.Connect()
+        $null = $service.GetFolder("\").CreateFolder($productionTaskPath.Trim('\'))
+        $trace.Clear()
+        Set-Item function:script:Assert-XbWorkerTaskContract { param($Task, $ExpectedIdentity) throw "forced_post_registration_failure" }
+        try { $outcome = Get-XbBoundaryOutcome { Invoke-XbWorkerInstaller } }
+        finally { Set-Item function:script:Assert-XbWorkerTaskContract $originalAssert }
+        $rollbackTrace = @($trace)
+        $readback = Get-XbProductionReadback
+        $sentinels = [ordered]@{}
+        foreach ($parent in @($programFilesParent, $programDataParent)) {
+            $sentinelPath = Join-Path $parent "xb-boundary-sentinel.txt"
+            $sentinels[$parent] = [ordered]@{
+                children = @(Get-ChildItem -LiteralPath $parent -Force | ForEach-Object Name | Sort-Object)
+                sentinel_intact = ((Test-Path -LiteralPath $sentinelPath) -and ((Get-Content -Raw -LiteralPath $sentinelPath) -ceq $sentinelValue))
+            }
+        }
+        $folder = $service.GetFolder($productionTaskPath.TrimEnd('\'))
+        $folderContent = [ordered]@{ tasks = [int]$folder.GetTasks(1).Count; folders = [int]$folder.GetFolders(0).Count }
+        Clear-XbRetainedProductionContainers
+        return [ordered]@{
+            install_outcome = $outcome
+            rollback_trace = $rollbackTrace
+            readback = $readback
+            parents = @($sentinels.Values)
+            scheduler_folder_content = $folderContent
+            post_cleanup = (Get-XbProductionReadback)
+        }
+    }
+
+    Invoke-XbBoundaryCase "unexpected_container_content_hold" {
+        Set-XbProductionTaskIdentity
+        $script:TaskCredential = $credential
+        $trace.Clear()
+        $unexpectedPath = Join-Path $programDataParent "xb-boundary-unexpected.txt"
+        Set-Item function:script:Register-XbWorkerScheduledTask {
+            param([Parameter(Mandatory)][string]$LauncherPath)
+            Set-Content -LiteralPath (Join-Path (Split-Path -Parent $RuntimeRoot) "xb-boundary-unexpected.txt") -Value "unexpected"
+            throw "forced_pre_registration_failure"
+        }
+        try { $outcome = Get-XbBoundaryOutcome { Invoke-XbWorkerInstaller } }
+        finally { Set-Item function:script:Register-XbWorkerScheduledTask $originalRegister }
+        $rollbackTrace = @($trace)
+        $readback = Get-XbProductionReadback
+        $unexpectedPreserved = Test-Path -LiteralPath $unexpectedPath
+        Clear-XbRetainedProductionContainers
+        return [ordered]@{
+            install_outcome = $outcome
+            rollback_trace = $rollbackTrace
+            readback = $readback
+            unexpected_preserved = $unexpectedPreserved
+            post_cleanup = (Get-XbProductionReadback)
+        }
+    }
+
+    Invoke-XbBoundaryCase "install_then_uninstall" {
+        Set-XbProductionTaskIdentity
+        $script:TaskCredential = $credential
+        $trace.Clear()
+        $installOutcome = Get-XbBoundaryOutcome { Invoke-XbWorkerInstaller }
+        $installed = Get-XbProductionReadback
+        $contract = Get-XbBoundaryOutcome { Assert-XbWorkerTaskContract -Task (Get-ScheduledTask -TaskPath $taskPath -TaskName $taskName -ErrorAction Stop) }
+        $ownership = Get-XbBoundaryOutcome { Assert-XbUninstallOwnership }
+        $evidence = Get-XbTaskEvidence
+        $manifest = Get-Content -Raw -LiteralPath (Join-Path $InstallRoot "installation-manifest.json") | ConvertFrom-Json
+        $accountInstalled = Get-XbAccountObservation
+        $script:Operation = "Uninstall"
+        $uninstallOutcome = Get-XbBoundaryOutcome { Invoke-XbWorkerInstaller }
+        $uninstalled = Get-XbProductionReadback
+        $accountUninstalled = Get-XbAccountObservation
+        $rollbackTrace = @($trace)
+        Clear-XbRetainedProductionContainers
+        return [ordered]@{
+            install_outcome = $installOutcome
+            installed = $installed
+            contract = $contract
+            ownership = $ownership
+            evidence = $evidence
+            manifest_trigger_count = [int]$manifest.task.trigger_count
+            account_installed = $accountInstalled
+            uninstall_outcome = $uninstallOutcome
+            uninstalled = $uninstalled
+            account_uninstalled = $accountUninstalled
+            rollback_trace = $rollbackTrace
+            post_cleanup = (Get-XbProductionReadback)
+        }
+    }
+} catch {
+    $report.fatal = [string]$_.Exception.Message
+    $report.fatal_stack = [string]$_.ScriptStackTrace
+} finally {
+    $cleanup = [ordered]@{}
+    try {
+        $service = New-Object -ComObject Schedule.Service
+        $service.Connect()
+        $folderSpecs = @()
+        if ($null -ne $state.boundary_folder) { $folderSpecs += ,@("boundary_folder_absent", $state.boundary_folder, $state.boundary_tasks) }
+        if ($state.pristine_proven) { $folderSpecs += ,@("production_folder_absent", "\X-Boundaries\", @("AC2 Member Gateway Worker")) }
+        foreach ($spec in $folderSpecs) {
+            $comPath = ([string]$spec[1]).TrimEnd('\')
+            $folder = $null
+            try { $folder = $service.GetFolder($comPath) } catch { $folder = $null }
+            if ($null -ne $folder) {
+                foreach ($name in @($spec[2])) { try { $folder.DeleteTask($name, 0) } catch { } }
+                if ([int]$folder.GetTasks(1).Count -eq 0 -and [int]$folder.GetFolders(0).Count -eq 0) { $service.GetFolder("\").DeleteFolder($comPath.TrimStart('\'), 0) }
+            }
+            $absent = $false
+            try { $null = $service.GetFolder($comPath) } catch { $absent = ((Get-XbBoundaryHResult $_) -eq -2147024894) }
+            $cleanup[$spec[0]] = $absent
+        }
+    } catch { $cleanup.scheduler_error = [string]$_.Exception.Message }
+    if ($state.pristine_proven) {
+        foreach ($entry in @(@("program_files_parent_absent", "C:\Program Files\X-Boundaries"), @("program_data_parent_absent", "C:\ProgramData\X-Boundaries"))) {
+            try { if (Test-Path -LiteralPath $entry[1]) { Remove-Item -LiteralPath $entry[1] -Recurse -Force } } catch { $cleanup[$entry[0] + "_error"] = [string]$_.Exception.Message }
+            $cleanup[$entry[0]] = (-not (Test-Path -LiteralPath $entry[1]))
+        }
+    }
+    try {
+        foreach ($name in @(Get-XbStageNames | Where-Object { $state.stage_before -notcontains $_ })) { Remove-Item -LiteralPath (Join-Path ([IO.Path]::GetTempPath()) $name) -Recurse -Force }
+        $cleanup.stage_residue_absent = (@(Get-XbStageNames | Where-Object { $state.stage_before -notcontains $_ }).Count -eq 0)
+    } catch { $cleanup.stage_error = [string]$_.Exception.Message }
+    if ($null -ne $state.user_sid) {
+        if ($state.lsa_loaded) {
+            try {
+                [XbBoundaryLsa]::RemoveAllRights($state.user_sid)
+                $cleanup.lsa_account_object_absent = ($null -eq [XbBoundaryLsa]::GetRights($state.user_sid))
+            } catch { $cleanup.lsa_error = [string]$_.Exception.Message }
+        }
+        try {
+            foreach ($profile in @(Get-CimInstance -ClassName Win32_UserProfile -Filter ("SID='{0}'" -f $state.user_sid))) { Remove-CimInstance -InputObject $profile }
+            $cleanup.profile_absent = ((@(Get-CimInstance -ClassName Win32_UserProfile -Filter ("SID='{0}'" -f $state.user_sid)).Count -eq 0) -and -not (Test-Path -LiteralPath ("HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\" + $state.user_sid)))
+        } catch { $cleanup.profile_error = [string]$_.Exception.Message }
+        try {
+            Remove-LocalUser -SID $state.user_sid
+            $cleanup.user_absent = (@(Get-LocalUser -SID $state.user_sid -ErrorAction SilentlyContinue).Count -eq 0)
+        } catch { $cleanup.user_error = [string]$_.Exception.Message }
+    }
+    if ($null -ne $state.temp_redirect) {
+        try { Remove-Item -LiteralPath $state.temp_redirect -Recurse -Force; $cleanup.temp_redirect_absent = (-not (Test-Path -LiteralPath $state.temp_redirect)) }
+        catch { $cleanup.temp_redirect_error = [string]$_.Exception.Message }
+    }
+    $report.cleanup = $cleanup
+}
+
+$report.secret_exposure = "none"
+$json = $report | ConvertTo-Json -Depth 12 -Compress
+foreach ($secret in $secretValues) {
+    if (-not [string]::IsNullOrEmpty($secret) -and $json.Contains($secret)) { $json = '{"secret_exposure":"detected"}'; break }
+}
+[Console]::Out.WriteLine("XB_BOUNDARY_RESULT:" + $json)
+if ($null -ne $report.fatal) { exit 1 }
+exit 0
+'''
+
+
+class MemberWorkerTaskContractSourceTests(unittest.TestCase):
+    """Deterministic source pins for the G3-133 Scheduler oracle and rollback correction."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.source = (ROOT / INSTALLER_PATH).read_text(encoding="utf-8").replace("\r\n", "\n")
+
+    def test_faulty_collection_counts_are_removed(self) -> None:
+        self.assertNotIn("@($Task.Triggers).Count", self.source)
+        self.assertNotIn("@($Task.Actions).Count", self.source)
+        self.assertNotIn("$Task.Actions[0]", self.source)
+        self.assertNotIn("XbTaskMayExist", self.source)
+
+    def test_registration_mechanism_is_unchanged(self) -> None:
+        register = _installer_function(self.source, "Register-XbWorkerScheduledTask")
+        self.assertNotIn("Trigger", register)
+        self.assertIn(
+            "New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::FromMinutes(10)) "
+            "-RestartCount 0 -StartWhenAvailable:$false -Disable",
+            register,
+        )
+        self.assertIn("New-ScheduledTaskPrincipal -UserId $WorkerAccount -LogonType Password -RunLevel Limited", register)
+        self.assertIn("New-ScheduledTask -Action $action -Settings $settings -Principal $taskPrincipal\n", register)
+        self.assertIn("-Mode DisabledProof", register)
+        self.assertLess(
+            register.index("$script:XbTaskRegistrationAttempted = $true"),
+            register.index("Register-ScheduledTask -TaskPath"),
+        )
+        self.assertIn("trigger_count = 0\n", self.source)
+
+    def test_service_backed_trigger_oracle_is_authoritative(self) -> None:
+        oracle = _installer_function(self.source, "Get-XbTaskTriggerOracleCount")
+        self.assertIn('"http://schemas.microsoft.com/windows/2004/02/mit/task"', oracle)
+        self.assertIn('"/t:Task/t:Triggers/*"', oracle)
+        self.assertIn("task_trigger_oracle_disagreement", oracle)
+        contract = _installer_function(self.source, "Assert-XbWorkerTaskContract")
+        self.assertIn("Get-XbRegisteredWorkerTaskView", contract)
+        self.assertIn("-ComTriggerCount ([int]$definition.Triggers.Count) -TaskXml ([string]$registered.Xml)", contract)
+        self.assertIn('if ($triggerCount -ne 0) { throw "task_triggers_present" }', contract)
+        self.assertIn("[int]$definition.Actions.Count -ne 1", contract)
+        self.assertIn("New-Object -ComObject Schedule.Service", _installer_function(self.source, "Connect-XbTaskService"))
+
+    def test_preimage_is_captured_before_first_install_mutation(self) -> None:
+        installer = _installer_function(self.source, "Invoke-XbWorkerInstaller")
+        self.assertLess(installer.index("$preimage = Get-XbInstallPreimage"), installer.index("New-Item -ItemType Directory -Path $stageRoot"))
+        self.assertLess(installer.index('throw "task_preimage_exists"'), installer.index("$preimage = Get-XbInstallPreimage"))
+        self.assertIn("Invoke-XbWorkerInstallRollback -Preimage $preimage -StageRoot $stageRoot", installer)
+
+    def test_rollback_container_removal_is_non_recursive(self) -> None:
+        container = _installer_function(self.source, "Remove-XbAttemptCreatedContainer")
+        self.assertNotIn("-Recurse", container)
+        self.assertIn("Remove-Item -LiteralPath $Path -Force -ErrorAction Stop", container)
+        self.assertIn("[IO.FileAttributes]::ReparsePoint", container)
+        folder = _installer_function(self.source, "Remove-XbAttemptCreatedTaskFolder")
+        self.assertIn("GetTasks(1)", folder)
+        self.assertIn("GetFolders(0)", folder)
+
+    def test_uninstall_ownership_path_is_unchanged(self) -> None:
+        self.assertIn("$null = Assert-XbUninstallOwnership\nRemove-XbWorkerOwnedState -TaskMayExist\n}", self.source)
+        owned = _installer_function(self.source, "Remove-XbWorkerOwnedState")
+        self.assertIn("if ($TaskMayExist) { Remove-XbWorkerScheduledTask }", owned)
+
+    def test_hosted_guard_requires_exact_github_hosted_windows(self) -> None:
+        hosted = {"GITHUB_ACTIONS": "true", "RUNNER_ENVIRONMENT": "github-hosted", "RUNNER_OS": "Windows"}
+        self.assertTrue(_hosted_windows_boundary_required(hosted))
+        for key, value in (
+            ("GITHUB_ACTIONS", "false"),
+            ("RUNNER_ENVIRONMENT", "self-hosted"),
+            ("RUNNER_OS", "Linux"),
+            ("RUNNER_OS", "windows"),
+        ):
+            with self.subTest(key=key, value=value):
+                self.assertFalse(_hosted_windows_boundary_required({**hosted, key: value}))
+        self.assertFalse(_hosted_windows_boundary_required({}))
+
+    def test_hosted_harness_never_starts_a_task(self) -> None:
+        for forbidden in ("Start-ScheduledTask", ".Run(", ".RunEx(", "Enable-ScheduledTask"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, _HOSTED_TASK_BOUNDARY_HARNESS)
+                self.assertNotIn(forbidden, self.source)
+
+
+class MemberWorkerTaskContractBehaviorTests(unittest.TestCase):
+    """Local deterministic behavior of the oracle, contract and rollback helpers (no task registration)."""
+
+    report: dict[str, object]
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        pwsh = _resolve_native_powershell()
+        if not pwsh:
+            if _hosted_windows_boundary_required():
+                raise AssertionError("native Windows PowerShell is required on the hosted runner")
+            raise unittest.SkipTest("Windows PowerShell is required for installer behavior validation")
+        with tempfile.TemporaryDirectory(prefix="xb-task-contract-") as temp_dir:
+            harness = Path(temp_dir) / "task_contract_harness.ps1"
+            harness.write_text(_LOCAL_TASK_CONTRACT_HARNESS, encoding="utf-8", newline="\n")
+            work_root = Path(temp_dir) / "work"
+            work_root.mkdir()
+            completed = subprocess.run(
+                [
+                    pwsh, "-ExecutionPolicy", "Bypass", "-NoLogo", "-NoProfile", "-NonInteractive",
+                    "-File", str(harness),
+                    "-InstallerPath", str(ROOT / INSTALLER_PATH),
+                    "-WorkRoot", str(work_root),
+                ],
+                cwd=ROOT,
+                env=_windows_powershell_module_environment(),
+                capture_output=True,
+                text=True,
+                timeout=600,
+            )
+        if completed.returncode != 0:
+            raise AssertionError(completed.stdout + completed.stderr)
+        cls.report = json.loads(completed.stdout)
+
+    def test_in_memory_triggerless_task_pins_null_collision(self) -> None:
+        self.assertEqual(
+            self.report["in_memory"],
+            {"triggers_null": True, "historical_expression_count": 1, "filtered_trigger_count": 0, "filtered_action_count": 1},
+        )
+
+    def test_trigger_oracle_agreement_matrix(self) -> None:
+        disagreement = "task_trigger_oracle_disagreement"
+        self.assertEqual(
+            self.report["oracle"],
+            {
+                "zero": "0",
+                "empty_triggers_element": "0",
+                "one": "1",
+                "two": "2",
+                "com_zero_xml_one": disagreement,
+                "com_one_xml_zero": disagreement,
+                "cim_null_with_one": disagreement,
+                "cim_one_with_zero": disagreement,
+                "un_namespaced": disagreement,
+                "malformed": disagreement,
+                "empty": disagreement,
+            },
+        )
+
+    def test_task_contract_matrix(self) -> None:
+        self.assertEqual(
+            self.report["contract"],
+            {
+                "valid_null_triggers": "pass",
+                "historical_expression_on_valid": 1,
+                "com_enabled": "task_not_disabled",
+                "settings_enabled": "task_not_disabled",
+                "cim_ready": "task_not_disabled",
+                "one_trigger": "task_triggers_present",
+                "oracle_disagreement": "task_trigger_oracle_disagreement",
+                "cim_actions_null": "task_action_count_invalid",
+                "com_two_actions": "task_action_count_invalid",
+                "com_action_path": "task_identity_invalid",
+                "com_action_type": "task_identity_invalid",
+                "task_path_mismatch": "task_identity_invalid",
+                "restart_count": "task_retry_contract_invalid",
+                "logon_type": "task_identity_invalid",
+            },
+        )
+
+    def test_scheduler_folder_absence_requires_exact_hresult(self) -> None:
+        self.assertEqual(
+            self.report["hresult"],
+            {"file_not_found": -2147024894, "wrapped_file_not_found": -2147024894, "access_denied": -2147024891},
+        )
+        self.assertEqual(
+            self.report["folder_preimage"],
+            {
+                "present": "True",
+                "file_not_found": "False",
+                "access_denied": "task_folder_preimage_unproven",
+                "path_not_found": "task_folder_preimage_unproven",
+            },
+        )
+        self.assertEqual(
+            self.report["real_folder"],
+            {"root_present": True, "random_absent": False, "root_cleanup": "container_not_owned_empty", "absent_cleanup": "pass"},
+        )
+
+    def test_attempt_created_container_cleanup_is_owned_empty_only(self) -> None:
+        hold = "container_not_owned_empty"
+        self.assertEqual(
+            self.report["container"],
+            {
+                "absent": "pass",
+                "empty": "pass",
+                "empty_removed": True,
+                "child": hold,
+                "child_preserved": True,
+                "hidden_child": hold,
+                "hidden_child_preserved": True,
+                "nested": hold,
+                "nested_preserved": True,
+                "junction": hold,
+                "junction_preserved": True,
+                "junction_target_preserved": True,
+                "file": hold,
+                "file_preserved": True,
+            },
+        )
+
+    def test_attempted_registration_task_step(self) -> None:
+        self.assertEqual(
+            self.report["task_step"],
+            {
+                "absent": {"outcome": "pass", "unregister_calls": 0},
+                "owned": {"outcome": "pass", "unregister_calls": 1},
+                "foreign_action": {"outcome": "task_identity_unexpected", "unregister_calls": 0},
+                "foreign_principal": {"outcome": "task_identity_unexpected", "unregister_calls": 0},
+                "ambiguous": {"outcome": "task_presence_unproven", "unregister_calls": 0},
+            },
+        )
+
+    def test_rollback_restores_parent_preimage(self) -> None:
+        rollback = self.report["rollback"]
+        restored = {
+            "install_root": False,
+            "runtime_root": False,
+            "program_files_parent": False,
+            "program_data_parent": False,
+            "program_files_grandparent": True,
+            "program_data_grandparent": True,
+            "stage": False,
+            "folder_cleanup_calls": 1,
+        }
+        self.assertEqual(rollback["parents_absent"], {"outcome": "pass", "state": restored})
+        self.assertEqual(rollback["not_attempted"], {"outcome": "pass", "state": restored})
+        self.assertEqual(
+            rollback["parents_preexisting"],
+            {
+                "outcome": "pass",
+                "state": {**restored, "program_files_parent": True, "program_data_parent": True, "folder_cleanup_calls": 0},
+                "program_files_sentinel": True,
+                "program_data_sentinel": True,
+            },
+        )
+        self.assertEqual(
+            rollback["unexpected_content"],
+            {
+                "outcome": "container_not_owned_empty",
+                "state": {**restored, "program_data_parent": True},
+                "unexpected_preserved": True,
+            },
+        )
+
+
+class MemberWorkerHostedTaskBoundaryTests(unittest.TestCase):
+    """Real Schedule.Service/ScheduledTasks boundary on disposable GitHub-hosted Windows only."""
+
+    report: dict[str, object]
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        if not _hosted_windows_boundary_required():
+            raise unittest.SkipTest(HOSTED_BOUNDARY_SKIP_REASON)
+        pwsh = _resolve_native_powershell()
+        if not pwsh:
+            raise AssertionError("hosted boundary requires native Windows PowerShell 5.1")
+        with tempfile.TemporaryDirectory(prefix="xb-task-boundary-") as temp_dir:
+            root = Path(temp_dir)
+            manifest = root / "reviewed-package.json"
+            manifest.write_text(json.dumps(_reviewed_package_identity(), indent=2) + "\n", encoding="utf-8")
+            harness = root / "task_boundary_harness.ps1"
+            harness.write_text(_HOSTED_TASK_BOUNDARY_HARNESS, encoding="utf-8", newline="\n")
+            completed = subprocess.run(
+                [
+                    pwsh, "-ExecutionPolicy", "Bypass", "-NoLogo", "-NoProfile", "-NonInteractive",
+                    "-File", str(harness),
+                    "-InstallerPath", str(ROOT / INSTALLER_PATH),
+                    "-ReviewedManifestPath", str(manifest),
+                ],
+                cwd=ROOT,
+                env=_windows_powershell_module_environment(),
+                capture_output=True,
+                text=True,
+                timeout=1500,
+            )
+        report = _boundary_report(completed.stdout)
+        if report is None:
+            raise AssertionError(
+                "hosted boundary harness produced no report\n" + completed.stdout[-4000:] + completed.stderr[-4000:]
+            )
+        print(TASK_BOUNDARY_MARKER, flush=True)
+        print(json.dumps(report, sort_keys=True), flush=True)
+        cls.report = report
+
+    def _case(self, name: str) -> dict[str, object]:
+        case = self.report["cases"][name]
+        self.assertEqual(case["status"], "completed", case)
+        return case
+
+    def _assert_pristine(self, readback: dict[str, object]) -> None:
+        self.assertEqual(
+            readback,
+            {
+                "task_present": False,
+                "scheduler_folder_present": False,
+                "install_root_present": False,
+                "runtime_root_present": False,
+                "program_files_parent_present": False,
+                "program_data_parent_present": False,
+                "new_stage_count": 0,
+            },
+        )
+
+    def _assert_never_run(self, evidence: dict[str, object]) -> None:
+        self.assertEqual(evidence["last_task_result"], SCHED_S_TASK_HAS_NOT_RUN)
+        self.assertEqual(evidence["com_last_task_result"], SCHED_S_TASK_HAS_NOT_RUN)
+        self.assertEqual(evidence["missed_runs"], 0)
+        self.assertEqual(evidence["com_missed_runs"], 0)
+        self.assertTrue(evidence["last_run_time"] is None or str(evidence["last_run_time"]).startswith("1999-11-30"), evidence)
+        self.assertLess(str(evidence["com_last_run_time"]), "2000", evidence)
+
+    def _assert_exact_disabled_proof(self, evidence: dict[str, object], worker_account: str) -> None:
+        self.assertEqual(evidence["cim_state"], "Disabled")
+        self.assertEqual(evidence["com_state"], 1)
+        self.assertFalse(evidence["com_enabled"])
+        self.assertFalse(evidence["com_settings_enabled"])
+        self.assertEqual(evidence["cim_action_count"], 1)
+        self.assertEqual(evidence["com_action_count"], 1)
+        self.assertEqual(evidence["com_action_type"], 0)
+        self.assertEqual(evidence["action_execute"], "powershell.exe")
+        self.assertEqual(evidence["com_action_path"], "powershell.exe")
+        self.assertEqual(evidence["com_action_arguments"], evidence["action_arguments"])
+        self.assertRegex(str(evidence["action_arguments"]), r"-Mode DisabledProof$")
+        self.assertNotRegex(str(evidence["action_arguments"]), r"EnableProduction")
+        self.assertEqual(evidence["principal_user_id"], worker_account)
+        self.assertEqual(evidence["principal_logon_type"], "Password")
+        self.assertEqual(evidence["principal_run_level"], "Limited")
+        self.assertEqual(evidence["multiple_instances"], "IgnoreNew")
+        self.assertEqual(evidence["execution_time_limit"], "PT10M")
+        self.assertEqual(evidence["restart_count"], 0)
+        self.assertFalse(evidence["start_when_available"])
+
+    def _assert_zero_triggers(self, evidence: dict[str, object]) -> None:
+        self.assertTrue(evidence["cim_triggers_null"])
+        self.assertEqual(evidence["historical_expression_count"], 1)
+        self.assertEqual(evidence["cim_filtered_trigger_count"], 0)
+        self.assertEqual(evidence["com_trigger_count"], 0)
+        self.assertEqual(evidence["xml_trigger_count"], 0)
+
+    def _assert_no_worker_session(self, observation: dict[str, object]) -> None:
+        self.assertFalse(observation["profile_list_present"], observation)
+        self.assertEqual(observation["user_profile_count"], 0, observation)
+        self.assertEqual(observation["worker_process_count"], 0, observation)
+
+    def test_native_boundary_environment(self) -> None:
+        self.assertIsNone(self.report["fatal"], self.report)
+        environment = self.report["environment"]
+        self.assertTrue(str(environment["ps_version"]).startswith("5.1."))
+        self.assertEqual(environment["ps_edition"], "Desktop")
+        self.assertTrue(environment["elevated"])
+        self.assertTrue(environment["scheduled_tasks_module"])
+        self.assertTrue(environment["schedule_service"])
+        self.assertEqual(
+            environment["pristine_before"],
+            {"program_files_parent": False, "program_data_parent": False, "scheduler_folder": False},
+        )
+        self.assertFalse(environment["administrators_member"])
+
+    def test_no_secret_exposure(self) -> None:
+        self.assertEqual(self.report["secret_exposure"], "none")
+
+    def test_in_memory_null_trigger_representation(self) -> None:
+        case = self._case("in_memory_null_trigger_pin")
+        self.assertTrue(case["triggers_null"])
+        self.assertEqual(case["historical_expression_count"], 1)
+        self.assertEqual(case["filtered_trigger_count"], 0)
+
+    def test_zero_trigger_candidate_passes_service_oracle(self) -> None:
+        case = self._case("zero_trigger_candidate")
+        self.assertEqual(case["registration"], "pass")
+        self.assertEqual(case["contract"], "pass")
+        self.assertEqual(case["oracle_count"], "0")
+        self._assert_zero_triggers(case["evidence"])
+        self._assert_exact_disabled_proof(case["evidence"], self.report["environment"]["worker_account"])
+        self._assert_never_run(case["evidence"])
+        self._assert_no_worker_session(case["account_after_registration"])
+
+    def test_one_trigger_control_fails_through_same_oracle(self) -> None:
+        candidate = self._case("zero_trigger_candidate")["evidence"]
+        case = self._case("one_trigger_control")
+        evidence = case["evidence"]
+        self.assertEqual(case["in_memory_filtered_trigger_count"], 1)
+        self.assertEqual(case["contract"], "task_triggers_present")
+        self.assertFalse(evidence["cim_triggers_null"])
+        self.assertEqual(evidence["cim_filtered_trigger_count"], 1)
+        self.assertEqual(evidence["com_trigger_count"], 1)
+        self.assertEqual(evidence["xml_trigger_count"], 1)
+        # The historical expression cannot tell the zero-trigger candidate from the one-trigger control.
+        self.assertEqual(evidence["historical_expression_count"], 1)
+        self.assertEqual(candidate["historical_expression_count"], evidence["historical_expression_count"])
+        self._assert_exact_disabled_proof(evidence, self.report["environment"]["worker_account"])
+        self._assert_never_run(evidence)
+
+    def test_boundary_tasks_unregistered_never_run(self) -> None:
+        case = self._case("boundary_unregister")
+        self.assertEqual(case["final_last_task_results"], [SCHED_S_TASK_HAS_NOT_RUN, SCHED_S_TASK_HAS_NOT_RUN])
+        self.assertFalse(case["folder_present_after"])
+        self._assert_no_worker_session(case["account_after_unregister"])
+
+    def test_registration_failure_rollback_treats_absent_task_as_restored(self) -> None:
+        case = self._case("registration_failure_parent_absent")
+        self.assertNotEqual(case["install_outcome"], "pass")
+        self.assertFalse(str(case["install_outcome"]).startswith("install_rollback_failed"), case)
+        self.assertIn("task_step:absent", case["rollback_trace"])
+        self._assert_pristine(case["readback"])
+        self.assertEqual(case["historical_unconditional_unregister"], "task_unregister_failed")
+
+    def test_post_registration_rollback_removes_task_and_parents(self) -> None:
+        case = self._case("forced_post_registration_parent_absent")
+        self.assertEqual(case["install_outcome"], "forced_post_registration_failure")
+        self.assertEqual(case["rollback_trace"], ["task_step:present", "folder_step:present"])
+        self._assert_pristine(case["readback"])
+
+    def test_preexisting_parents_and_sentinels_are_preserved(self) -> None:
+        case = self._case("preexisting_parents_sentinel")
+        self.assertEqual(case["install_outcome"], "forced_post_registration_failure")
+        self.assertEqual(case["rollback_trace"], ["task_step:present"])
+        self.assertEqual(
+            case["readback"],
+            {
+                "task_present": False,
+                "scheduler_folder_present": True,
+                "install_root_present": False,
+                "runtime_root_present": False,
+                "program_files_parent_present": True,
+                "program_data_parent_present": True,
+                "new_stage_count": 0,
+            },
+        )
+        self.assertEqual(
+            case["parents"],
+            [{"children": ["xb-boundary-sentinel.txt"], "sentinel_intact": True}] * 2,
+        )
+        self.assertEqual(case["scheduler_folder_content"], {"tasks": 0, "folders": 0})
+        self._assert_pristine(case["post_cleanup"])
+
+    def test_unexpected_attempt_container_content_holds(self) -> None:
+        case = self._case("unexpected_container_content_hold")
+        self.assertEqual(case["install_outcome"], "install_rollback_failed: container_not_owned_empty")
+        self.assertEqual(case["rollback_trace"], ["folder_step:absent"])
+        self.assertTrue(case["unexpected_preserved"])
+        self.assertEqual(
+            case["readback"],
+            {
+                "task_present": False,
+                "scheduler_folder_present": False,
+                "install_root_present": False,
+                "runtime_root_present": False,
+                "program_files_parent_present": False,
+                "program_data_parent_present": True,
+                "new_stage_count": 0,
+            },
+        )
+        self._assert_pristine(case["post_cleanup"])
+
+    def test_install_then_uninstall(self) -> None:
+        case = self._case("install_then_uninstall")
+        self.assertEqual(case["install_outcome"], "pass")
+        self.assertEqual(
+            case["installed"],
+            {
+                "task_present": True,
+                "scheduler_folder_present": True,
+                "install_root_present": True,
+                "runtime_root_present": True,
+                "program_files_parent_present": True,
+                "program_data_parent_present": True,
+                "new_stage_count": 0,
+            },
+        )
+        self.assertEqual(case["contract"], "pass")
+        self.assertEqual(case["ownership"], "pass")
+        self.assertEqual(case["manifest_trigger_count"], 0)
+        self._assert_zero_triggers(case["evidence"])
+        self._assert_exact_disabled_proof(case["evidence"], self.report["environment"]["worker_account"])
+        self._assert_never_run(case["evidence"])
+        self._assert_no_worker_session(case["account_installed"])
+        self.assertEqual(case["uninstall_outcome"], "pass")
+        self.assertEqual(
+            case["uninstalled"],
+            {
+                "task_present": False,
+                "scheduler_folder_present": True,
+                "install_root_present": False,
+                "runtime_root_present": False,
+                "program_files_parent_present": True,
+                "program_data_parent_present": True,
+                "new_stage_count": 0,
+            },
+        )
+        self._assert_no_worker_session(case["account_uninstalled"])
+        self.assertEqual(case["rollback_trace"], [])
+        self._assert_pristine(case["post_cleanup"])
+
+    def test_disposable_state_cleanup_readback(self) -> None:
+        cleanup = self.report["cleanup"]
+        expected = {
+            "boundary_folder_absent": True,
+            "production_folder_absent": True,
+            "program_files_parent_absent": True,
+            "program_data_parent_absent": True,
+            "stage_residue_absent": True,
+            "lsa_account_object_absent": True,
+            "profile_absent": True,
+            "user_absent": True,
+        }
+        if self.report["environment"].get("temp_redirected"):
+            expected["temp_redirect_absent"] = True
+        self.assertEqual(cleanup, expected)
 
 
 if __name__ == "__main__":
