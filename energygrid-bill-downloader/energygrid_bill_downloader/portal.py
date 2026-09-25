@@ -8,12 +8,12 @@ import secrets
 import time
 import unicodedata
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin, urlparse
 
-from .config import RuntimeConfig
+from .config import MAX_INVENTORY_CEILING, RuntimeConfig
 from .errors import (
     DOWNLOAD_FAILED,
     AppError,
@@ -336,6 +336,322 @@ def _uncertain_download() -> AppError:
     """The one non-retryable uncertain-dispatch download failure."""
 
     return AppError(DOWNLOAD_UNCERTAIN_MESSAGE, status=DOWNLOAD_FAILED, retryable=False)
+
+
+# ---- closed pre-dispatch taxonomy (DL-XB-199 G2-083, G3-084) ---- #
+#
+# Every way the one shared pre-dispatch proof can stop a Download, named by a
+# fixed checkpoint and a fixed reason code. Nothing observed on the page is ever
+# a value here: the vocabulary is closed, so evidence built from it can carry
+# no row text, filename, account text, URL, digest or exception text.
+#
+# IMMEDIATE reasons are hard contradictions raised on sight. WINDOW reasons are
+# the last not-ready observation of a bounded recovery window that expired.
+# `PROBE_ERROR` is the one bounded class for anything else; it is immediate.
+PREFLIGHT_CHECKPOINT_HANDLE = "HANDLE"
+PREFLIGHT_CHECKPOINT_TOPOLOGY = "TOPOLOGY"
+PREFLIGHT_CHECKPOINT_TAB_STATE = "TAB_STATE"
+PREFLIGHT_CHECKPOINT_ACCOUNT_WITNESS = "ACCOUNT_WITNESS"
+PREFLIGHT_CHECKPOINT_RESULTS_SURFACE = "RESULTS_SURFACE"
+PREFLIGHT_CHECKPOINT_SNAPSHOT_COMPARE = "SNAPSHOT_COMPARE"
+PREFLIGHT_CHECKPOINT_CONTROL_RESOLVE = "CONTROL_RESOLVE"
+PREFLIGHT_CHECKPOINT_CONTROL_VISIBLE = "CONTROL_VISIBLE"
+PREFLIGHT_CHECKPOINT_CONTROL_ENABLED = "CONTROL_ENABLED"
+PREFLIGHT_CHECKPOINT_CONTROL_ACTIONABLE = "CONTROL_ACTIONABLE"
+PREFLIGHT_CHECKPOINT_ROW_IDENTITY_RECHECK = "ROW_IDENTITY_RECHECK"
+
+# The 11 checkpoints, in the order the proof reaches them.
+DOWNLOAD_PREFLIGHT_CHECKPOINTS = (
+    PREFLIGHT_CHECKPOINT_HANDLE,
+    PREFLIGHT_CHECKPOINT_TOPOLOGY,
+    PREFLIGHT_CHECKPOINT_TAB_STATE,
+    PREFLIGHT_CHECKPOINT_ACCOUNT_WITNESS,
+    PREFLIGHT_CHECKPOINT_RESULTS_SURFACE,
+    PREFLIGHT_CHECKPOINT_SNAPSHOT_COMPARE,
+    PREFLIGHT_CHECKPOINT_CONTROL_RESOLVE,
+    PREFLIGHT_CHECKPOINT_CONTROL_VISIBLE,
+    PREFLIGHT_CHECKPOINT_CONTROL_ENABLED,
+    PREFLIGHT_CHECKPOINT_CONTROL_ACTIONABLE,
+    PREFLIGHT_CHECKPOINT_ROW_IDENTITY_RECHECK,
+)
+
+PREFLIGHT_IMMEDIATE = "IMMEDIATE"
+PREFLIGHT_WINDOW = "WINDOW"
+
+# reason code -> (owning checkpoint, IMMEDIATE | WINDOW). `PROBE_ERROR` has no
+# owning checkpoint: it reports whichever checkpoint the proof had reached.
+_PREFLIGHT_REASON_TABLE = (
+    ("PORTAL_LATCHED", PREFLIGHT_CHECKPOINT_HANDLE, PREFLIGHT_IMMEDIATE),
+    ("ROW_HANDLE_INVALID", PREFLIGHT_CHECKPOINT_HANDLE, PREFLIGHT_IMMEDIATE),
+    ("TOPOLOGY_NOT_UNIQUE", PREFLIGHT_CHECKPOINT_TOPOLOGY, PREFLIGHT_IMMEDIATE),
+    ("TAB_UNSELECTED", PREFLIGHT_CHECKPOINT_TAB_STATE, PREFLIGHT_IMMEDIATE),
+    ("TAB_AMBIGUOUS", PREFLIGHT_CHECKPOINT_TAB_STATE, PREFLIGHT_IMMEDIATE),
+    ("TAB_ABSENT", PREFLIGHT_CHECKPOINT_TAB_STATE, PREFLIGHT_WINDOW),
+    ("TAB_CONTRADICTORY", PREFLIGHT_CHECKPOINT_TAB_STATE, PREFLIGHT_WINDOW),
+    ("WITNESS_MULTIPLE", PREFLIGHT_CHECKPOINT_ACCOUNT_WITNESS, PREFLIGHT_IMMEDIATE),
+    ("WITNESS_READ_RACE", PREFLIGHT_CHECKPOINT_ACCOUNT_WITNESS, PREFLIGHT_IMMEDIATE),
+    ("WITNESS_ABSENT", PREFLIGHT_CHECKPOINT_ACCOUNT_WITNESS, PREFLIGHT_WINDOW),
+    ("RESULTS_PAGINATION_PRESENT", PREFLIGHT_CHECKPOINT_RESULTS_SURFACE, PREFLIGHT_IMMEDIATE),
+    ("RESULTS_CEILING_EXCEEDED", PREFLIGHT_CHECKPOINT_RESULTS_SURFACE, PREFLIGHT_IMMEDIATE),
+    ("RESULTS_ROWCOUNT_INVALID", PREFLIGHT_CHECKPOINT_RESULTS_SURFACE, PREFLIGHT_IMMEDIATE),
+    ("RESULTS_ROW_SNAPSHOT_INVALID", PREFLIGHT_CHECKPOINT_RESULTS_SURFACE, PREFLIGHT_IMMEDIATE),
+    ("RESULTS_TABLE_ABSENT", PREFLIGHT_CHECKPOINT_RESULTS_SURFACE, PREFLIGHT_WINDOW),
+    ("RESULTS_TABLE_AMBIGUOUS", PREFLIGHT_CHECKPOINT_RESULTS_SURFACE, PREFLIGHT_WINDOW),
+    ("RESULTS_ROWS_ABSENT", PREFLIGHT_CHECKPOINT_RESULTS_SURFACE, PREFLIGHT_WINDOW),
+    ("RESULTS_HEADER_NO_COLUMNHEADER", PREFLIGHT_CHECKPOINT_RESULTS_SURFACE, PREFLIGHT_WINDOW),
+    ("RESULTS_HEADER_HAS_DOWNLOAD", PREFLIGHT_CHECKPOINT_RESULTS_SURFACE, PREFLIGHT_WINDOW),
+    ("RESULTS_HEADER_ONLY", PREFLIGHT_CHECKPOINT_RESULTS_SURFACE, PREFLIGHT_WINDOW),
+    ("RESULTS_ROW_HEADER_CELL", PREFLIGHT_CHECKPOINT_RESULTS_SURFACE, PREFLIGHT_WINDOW),
+    ("RESULTS_ROW_DOWNLOAD_COUNT", PREFLIGHT_CHECKPOINT_RESULTS_SURFACE, PREFLIGHT_WINDOW),
+    ("RESULTS_DOWNLOAD_COUNT_MISMATCH", PREFLIGHT_CHECKPOINT_RESULTS_SURFACE, PREFLIGHT_WINDOW),
+    ("RESULTS_ROWCOUNT_UNREAD", PREFLIGHT_CHECKPOINT_RESULTS_SURFACE, PREFLIGHT_WINDOW),
+    ("RESULTS_ROWCOUNT_MISMATCH", PREFLIGHT_CHECKPOINT_RESULTS_SURFACE, PREFLIGHT_WINDOW),
+    ("RESULTS_ROW_SNAPSHOT_NOT_READY", PREFLIGHT_CHECKPOINT_RESULTS_SURFACE, PREFLIGHT_WINDOW),
+    ("RESULTS_ROW_SNAPSHOT_DUPLICATE", PREFLIGHT_CHECKPOINT_RESULTS_SURFACE, PREFLIGHT_WINDOW),
+    ("SNAPSHOT_MISMATCH", PREFLIGHT_CHECKPOINT_SNAPSHOT_COMPARE, PREFLIGHT_IMMEDIATE),
+    ("CONTROL_COUNT_MISMATCH", PREFLIGHT_CHECKPOINT_CONTROL_RESOLVE, PREFLIGHT_WINDOW),
+    ("CONTROL_NOT_VISIBLE", PREFLIGHT_CHECKPOINT_CONTROL_VISIBLE, PREFLIGHT_WINDOW),
+    ("CONTROL_NOT_ENABLED", PREFLIGHT_CHECKPOINT_CONTROL_ENABLED, PREFLIGHT_WINDOW),
+    ("CONTROL_NOT_ACTIONABLE", PREFLIGHT_CHECKPOINT_CONTROL_ACTIONABLE, PREFLIGHT_WINDOW),
+    ("ROW_RECHECK_NOT_READY", PREFLIGHT_CHECKPOINT_ROW_IDENTITY_RECHECK, PREFLIGHT_IMMEDIATE),
+    ("ROW_RECHECK_MISMATCH", PREFLIGHT_CHECKPOINT_ROW_IDENTITY_RECHECK, PREFLIGHT_IMMEDIATE),
+    ("ROW_RECHECK_INVALID", PREFLIGHT_CHECKPOINT_ROW_IDENTITY_RECHECK, PREFLIGHT_IMMEDIATE),
+)
+PREFLIGHT_PROBE_ERROR = "PROBE_ERROR"
+
+# The 36 reason codes: the 35 owned reasons in table order, then PROBE_ERROR.
+DOWNLOAD_PREFLIGHT_REASONS = tuple(code for code, _cp, _kind in _PREFLIGHT_REASON_TABLE) + (
+    PREFLIGHT_PROBE_ERROR,
+)
+DOWNLOAD_PREFLIGHT_REASON_CHECKPOINTS = {code: cp for code, cp, _kind in _PREFLIGHT_REASON_TABLE}
+DOWNLOAD_PREFLIGHT_REASON_KINDS = {code: kind for code, _cp, kind in _PREFLIGHT_REASON_TABLE}
+DOWNLOAD_PREFLIGHT_REASON_KINDS[PREFLIGHT_PROBE_ERROR] = PREFLIGHT_IMMEDIATE
+
+# Elapsed time is reported only as one of these closed buckets.
+PREFLIGHT_ELAPSED_BUCKETS = (
+    (250, "LT_250MS"),
+    (1000, "LT_1S"),
+    (5000, "LT_5S"),
+    (10000, "LT_10S"),
+    (30000, "LT_30S"),
+    (60000, "LT_60S"),
+)
+PREFLIGHT_ELAPSED_BUCKET_LAST = "GE_60S"
+DOWNLOAD_PREFLIGHT_ELAPSED_BUCKETS = tuple(name for _ms, name in PREFLIGHT_ELAPSED_BUCKETS) + (
+    PREFLIGHT_ELAPSED_BUCKET_LAST,
+)
+
+PREFLIGHT_TRIAL_NOT_REACHED = "NOT_REACHED"
+PREFLIGHT_TRIAL_PASSED = "PASSED"
+PREFLIGHT_TRIAL_TIMEOUT = "TIMEOUT"
+PREFLIGHT_TRIAL_ERROR = "ERROR"
+DOWNLOAD_PREFLIGHT_TRIAL_OUTCOMES = (
+    PREFLIGHT_TRIAL_NOT_REACHED,
+    PREFLIGHT_TRIAL_PASSED,
+    PREFLIGHT_TRIAL_TIMEOUT,
+    PREFLIGHT_TRIAL_ERROR,
+)
+PREFLIGHT_COUNT_GT_ONE = ">1"
+
+# The bounded number of not-ready looks a failure can report. The committed
+# ladder has far fewer looks; this only closes the value.
+PREFLIGHT_MAX_NOT_READY_LOOKS = 64
+
+
+def _preflight_elapsed_bucket(elapsed_ms: float) -> str:
+    for ceiling_ms, name in PREFLIGHT_ELAPSED_BUCKETS:
+        if elapsed_ms < ceiling_ms:
+            return name
+    return PREFLIGHT_ELAPSED_BUCKET_LAST
+
+
+@dataclass(frozen=True)
+class DownloadPreflightControl:
+    """Bounded Download-control evidence from the last look that reached it."""
+
+    count_bucket: int | str | None = None
+    visible: bool | None = None
+    enabled: bool | None = None
+    trial_actionability: str = PREFLIGHT_TRIAL_NOT_REACHED
+
+    def as_public_dict(self) -> dict[str, Any]:
+        return {
+            "count_bucket": self.count_bucket,
+            "visible": self.visible,
+            "enabled": self.enabled,
+            "trial_actionability": self.trial_actionability,
+        }
+
+
+@dataclass(frozen=True)
+class DownloadPreflightSnapshot:
+    """How a readable surface differed from the frozen one; never a digest."""
+
+    row_count_equal: bool
+    header_equal: bool
+    rows_equal_as_set: bool
+    changed_row_count: int
+
+    def as_public_dict(self) -> dict[str, Any]:
+        return {
+            "row_count_equal": self.row_count_equal,
+            "header_equal": self.header_equal,
+            "rows_equal_as_set": self.rows_equal_as_set,
+            "changed_row_count": self.changed_row_count,
+        }
+
+    @classmethod
+    def compare(cls, observed: tuple[bytes, ...], frozen: tuple[bytes, ...]) -> "DownloadPreflightSnapshot":
+        observed_rows, frozen_rows = observed[1:], frozen[1:]
+        width = max(len(observed_rows), len(frozen_rows))
+        changed = sum(
+            1
+            for index in range(width)
+            if index >= len(observed_rows)
+            or index >= len(frozen_rows)
+            or observed_rows[index] != frozen_rows[index]
+        )
+        return cls(
+            row_count_equal=len(observed) == len(frozen),
+            header_equal=bool(observed) and bool(frozen) and observed[0] == frozen[0],
+            rows_equal_as_set=set(observed_rows) == set(frozen_rows),
+            changed_row_count=changed,
+        )
+
+
+@dataclass(frozen=True)
+class DownloadPreflightEvidence:
+    """The frozen public-safe record of one pre-dispatch failure.
+
+    Every member is a closed identifier, a bounded integer, a boolean or null.
+    `row_ordinal` is null only when the handle itself carried no valid ordinal.
+    """
+
+    row_ordinal: int | None
+    reason_code: str
+    last_checkpoint: str
+    window_expired: bool
+    not_ready_looks: int
+    elapsed_bucket: str
+    control: DownloadPreflightControl = field(default_factory=DownloadPreflightControl)
+    snapshot: DownloadPreflightSnapshot | None = None
+
+    def as_public_dict(self) -> dict[str, Any]:
+        return {
+            "row_ordinal": self.row_ordinal,
+            "reason_code": self.reason_code,
+            "last_checkpoint": self.last_checkpoint,
+            "window_expired": self.window_expired,
+            "not_ready_looks": self.not_ready_looks,
+            "elapsed_bucket": self.elapsed_bucket,
+            "control": self.control.as_public_dict(),
+            "snapshot": None if self.snapshot is None else self.snapshot.as_public_dict(),
+        }
+
+
+class DownloadPreflightError(LayoutChangedError):
+    """A pre-dispatch failure carrying bounded public-safe evidence.
+
+    Externally it is exactly the `LayoutChangedError` it replaces: the same
+    fixed message, PORTAL_LAYOUT_CHANGED, exit 20 and not retryable. The
+    evidence is additive and never part of the message.
+    """
+
+    def __init__(self, message: str, evidence: DownloadPreflightEvidence) -> None:
+        super().__init__(message)
+        self.evidence = evidence
+
+
+class _PreDispatchTrace:
+    """Private recorder for one pre-dispatch proof. Never leaves the portal.
+
+    It holds only closed identifiers, counts and booleans. The reprove ladder
+    marks each checkpoint it reaches, each not-ready look, and the one
+    immediate reason a hard contradiction raised with. It never decides
+    anything: every predicate, order and timeout stays in the production code.
+    """
+
+    def __init__(self) -> None:
+        self.started = time.monotonic()
+        self.checkpoint = PREFLIGHT_CHECKPOINT_HANDLE
+        self.hard_reason: str | None = None
+        self.lag_reason: str | None = None
+        self.not_ready_looks = 0
+        self.window_expired = False
+        self.control = DownloadPreflightControl()
+        self.snapshot: DownloadPreflightSnapshot | None = None
+
+    def reach(self, checkpoint: str) -> None:
+        self.checkpoint = checkpoint
+
+    def new_look(self) -> None:
+        self.control = DownloadPreflightControl()
+
+    def lag(self, reason: str) -> None:
+        self.lag_reason = reason
+        self.checkpoint = DOWNLOAD_PREFLIGHT_REASON_CHECKPOINTS[reason]
+        self.not_ready_looks += 1
+
+    def hard(self, reason: str) -> None:
+        # The first hard reason wins: an outer handler re-raising the same
+        # failure can never overwrite the precise one recorded at its source.
+        if self.hard_reason is None:
+            self.hard_reason = reason
+            if reason != PREFLIGHT_PROBE_ERROR:
+                self.checkpoint = DOWNLOAD_PREFLIGHT_REASON_CHECKPOINTS[reason]
+
+    def observe_control(self, **changes: Any) -> None:
+        self.control = replace(self.control, **changes)
+
+    def evidence(self, row: Any) -> DownloadPreflightEvidence:
+        if self.hard_reason is not None:
+            reason, expired = self.hard_reason, False
+        elif self.window_expired and self.lag_reason is not None:
+            reason, expired = self.lag_reason, True
+        else:
+            reason, expired = PREFLIGHT_PROBE_ERROR, False
+        checkpoint = (
+            self.checkpoint
+            if reason == PREFLIGHT_PROBE_ERROR
+            else DOWNLOAD_PREFLIGHT_REASON_CHECKPOINTS[reason]
+        )
+        return DownloadPreflightEvidence(
+            row_ordinal=_bounded_row_ordinal(row),
+            reason_code=reason,
+            last_checkpoint=checkpoint,
+            window_expired=expired,
+            not_ready_looks=min(self.not_ready_looks, PREFLIGHT_MAX_NOT_READY_LOOKS),
+            elapsed_bucket=_preflight_elapsed_bucket((time.monotonic() - self.started) * 1000),
+            control=self.control,
+            snapshot=self.snapshot if reason == "SNAPSHOT_MISMATCH" else None,
+        )
+
+
+def _bounded_row_ordinal(row: Any) -> int | None:
+    """The handle's ordinal when it is a plain bounded integer, else null."""
+
+    ordinal = getattr(row, "ordinal", None) if isinstance(row, InvoiceRow) else None
+    if isinstance(ordinal, bool) or not isinstance(ordinal, int):
+        return None
+    return ordinal if 0 <= ordinal < MAX_INVENTORY_CEILING else None
+
+
+def _preflight_count_bucket(count: int) -> int | str:
+    return PREFLIGHT_COUNT_GT_ONE if count > 1 else count
+
+
+@dataclass(frozen=True)
+class DownloadPreflightDiagnosticResult:
+    """What the no-Download diagnostic proved: passes, or the first failure.
+
+    `failure` is the evidence of the first failing row, or None when every
+    authorised row passed. `download_dispatched` is an invariant of the
+    operation, not an observation, and can only ever be False.
+    """
+
+    rows_passed: int
+    failure: DownloadPreflightEvidence | None = None
+    download_dispatched: bool = False
 
 # ---- bounded navigation diagnostic ---- #
 #
@@ -2567,7 +2883,12 @@ class PlaywrightPortal:
         return False
 
     def _read_results_surface(
-        self, page: Any, remaining_ms: int, safety_ceiling: int
+        self,
+        page: Any,
+        remaining_ms: int,
+        safety_ceiling: int,
+        *,
+        trace: _PreDispatchTrace | None = None,
     ) -> tuple[str, Any]:
         """Read the whole results surface once. Inspection only.
 
@@ -2575,56 +2896,88 @@ class PlaywrightPortal:
         the header digest first, then one digest per invoice row in table
         order -- or `(verdict, message)` for a surface that is not (yet)
         valid. Contradictions that waiting cannot repair raise at once.
+
+        `trace` only records which closed reason each existing branch took.
+        The combined shape checks are split into consecutive tests in their
+        original evaluation order, so a trace changes no read and no outcome.
+        Inventory passes no trace.
         """
 
+        def lag(reason: str) -> None:
+            if trace is not None:
+                trace.lag(reason)
+
+        def hard(reason: str) -> None:
+            if trace is not None:
+                trace.hard(reason)
+
         if self._pagination_sentinel_present(page):
+            hard("RESULTS_PAGINATION_PRESENT")
             raise LayoutChangedError(RESULTS_PAGINATION_MESSAGE)
         tables = page.get_by_role("table")
         table_count = int(tables.count())
         if table_count != 1:
             verdict = _PORTAL_ABSENT if table_count == 0 else _PORTAL_AMBIGUOUS
+            lag("RESULTS_TABLE_ABSENT" if table_count == 0 else "RESULTS_TABLE_AMBIGUOUS")
             return verdict, RESULTS_UNSETTLED_MESSAGE
         rows = tables.get_by_role("row")
         row_count = int(rows.count())
         if row_count == 0:
+            lag("RESULTS_ROWS_ABSENT")
             return _PORTAL_ABSENT, RESULTS_UNSETTLED_MESSAGE
         header = rows.nth(0)
-        if int(header.get_by_role("columnheader").count()) < 1 or int(
-            header.get_by_role("button", name=DOWNLOAD_BUTTON_NAME, exact=True).count()
-        ) != 0:
+        if int(header.get_by_role("columnheader").count()) < 1:
+            lag("RESULTS_HEADER_NO_COLUMNHEADER")
+            return _PORTAL_NOT_READY, RESULTS_UNSETTLED_MESSAGE
+        if int(header.get_by_role("button", name=DOWNLOAD_BUTTON_NAME, exact=True).count()) != 0:
+            lag("RESULTS_HEADER_HAS_DOWNLOAD")
             return _PORTAL_NOT_READY, RESULTS_UNSETTLED_MESSAGE
         invoice_count = row_count - 1
         if invoice_count == 0:
+            lag("RESULTS_HEADER_ONLY")
             return _PORTAL_NOT_READY, RESULTS_HEADER_ONLY_MESSAGE
         if invoice_count > safety_ceiling:
+            hard("RESULTS_CEILING_EXCEEDED")
             raise LayoutChangedError(RESULTS_CEILING_MESSAGE)
         for index in range(1, row_count):
             row = rows.nth(index)
-            if int(row.get_by_role("columnheader").count()) != 0 or int(
-                row.get_by_role("button", name=DOWNLOAD_BUTTON_NAME, exact=True).count()
-            ) != 1:
+            if int(row.get_by_role("columnheader").count()) != 0:
+                lag("RESULTS_ROW_HEADER_CELL")
+                return _PORTAL_NOT_READY, RESULTS_UNSETTLED_MESSAGE
+            if int(row.get_by_role("button", name=DOWNLOAD_BUTTON_NAME, exact=True).count()) != 1:
+                lag("RESULTS_ROW_DOWNLOAD_COUNT")
                 return _PORTAL_NOT_READY, RESULTS_UNSETTLED_MESSAGE
         if int(
             page.get_by_role("button", name=DOWNLOAD_BUTTON_NAME, exact=True).count()
         ) != invoice_count:
+            lag("RESULTS_DOWNLOAD_COUNT_MISMATCH")
             return _PORTAL_NOT_READY, RESULTS_UNSETTLED_MESSAGE
         declared = self._read_attribute(tables, "aria-rowcount", remaining_ms)
         if declared is _UNREAD:
+            lag("RESULTS_ROWCOUNT_UNREAD")
             return _PORTAL_NOT_READY, RESULTS_UNSETTLED_MESSAGE
         if declared is not None:
             try:
                 declared_count = int(str(declared).strip())
             except ValueError as exc:
+                hard("RESULTS_ROWCOUNT_INVALID")
                 raise LayoutChangedError(RESULTS_ROWCOUNT_MESSAGE) from exc
             if declared_count != row_count:
+                lag("RESULTS_ROWCOUNT_MISMATCH")
                 return _PORTAL_NOT_READY, RESULTS_ROWCOUNT_MESSAGE
         digests: list[bytes] = []
         for index in range(row_count):
-            digest = self._row_identity(rows.nth(index), remaining_ms)
+            try:
+                digest = self._row_identity(rows.nth(index), remaining_ms)
+            except LayoutChangedError:
+                hard("RESULTS_ROW_SNAPSHOT_INVALID")
+                raise
             if digest is None:
+                lag("RESULTS_ROW_SNAPSHOT_NOT_READY")
                 return _PORTAL_NOT_READY, RESULTS_ROW_IDENTITY_MESSAGE
             digests.append(digest)
         if len(set(digests)) != len(digests):
+            lag("RESULTS_ROW_SNAPSHOT_DUPLICATE")
             return _PORTAL_NOT_READY, RESULTS_ROW_IDENTITY_MESSAGE
         return _PORTAL_READY, tuple(digests)
 
@@ -2683,30 +3036,7 @@ class PlaywrightPortal:
         selection -- latches and is never retried.
         """
 
-        page = self._require_page()
-        if self._latched:
-            raise LayoutChangedError(RESULTS_LATCHED_MESSAGE)
-        frozen = self._frozen_rows
-        if (
-            not isinstance(row, InvoiceRow)
-            or frozen is None
-            or self._inventory_binding is None
-            or row.binding is not self._inventory_binding
-            or isinstance(row.ordinal, bool)
-            or not isinstance(row.ordinal, int)
-            or not 0 <= row.ordinal < len(frozen) - 1
-        ):
-            raise LayoutChangedError(RESULTS_ROW_HANDLE_MESSAGE)
-        try:
-            control = self._reprove_frozen_surface(page, frozen, row.ordinal)
-            rows = page.get_by_role("table").get_by_role("row")
-            if self._row_identity(rows.nth(row.ordinal + 1), MAX_PORTAL_PROBE_TIMEOUT_MS) != frozen[
-                row.ordinal + 1
-            ]:
-                raise LayoutChangedError(RESULTS_SURFACE_CHANGED_MESSAGE)
-        except Exception as exc:
-            self._latched = True
-            raise LayoutChangedError(RESULTS_SURFACE_CHANGED_MESSAGE) from exc
+        page, control = self._pre_dispatch(row, _PreDispatchTrace())
 
         # The dispatch boundary. From here an exception cannot prove whether
         # the browser acted, so it is uncertain, latched and never retried.
@@ -2756,53 +3086,199 @@ class PlaywrightPortal:
             self._latched = True
             raise _uncertain_download()
 
-    def _reprove_frozen_surface(self, page: Any, frozen: tuple[bytes, ...], ordinal: int) -> Any:
+    def _pre_dispatch(self, row: InvoiceRow, trace: _PreDispatchTrace) -> tuple[Any, Any]:
+        """The ONE pre-dispatch proof, shared by `download()` and the diagnostic.
+
+        Returns the page and the row's proven-ready Download control, and
+        dispatches nothing. The checks, their order and their timeouts are the
+        production contract exactly: the latch, the handle, the re-proof of
+        the whole frozen surface on the shared bounded ladder, then a single
+        final one-shot row-identity recheck.
+
+        Latch semantics are preserved exactly. A latched portal raises without
+        writing the latch again, and an invalid handle raises without latching.
+        Every failure of the surface re-proof or the final recheck latches, so
+        no later Download is ever dispatched from this instance.
+        """
+
+        page = self._require_page()
+        if self._latched:
+            trace.hard("PORTAL_LATCHED")
+            raise DownloadPreflightError(RESULTS_LATCHED_MESSAGE, trace.evidence(row))
+        frozen = self._frozen_rows
+        if (
+            not isinstance(row, InvoiceRow)
+            or frozen is None
+            or self._inventory_binding is None
+            or row.binding is not self._inventory_binding
+            or isinstance(row.ordinal, bool)
+            or not isinstance(row.ordinal, int)
+            or not 0 <= row.ordinal < len(frozen) - 1
+        ):
+            trace.hard("ROW_HANDLE_INVALID")
+            raise DownloadPreflightError(RESULTS_ROW_HANDLE_MESSAGE, trace.evidence(row))
+        try:
+            control = self._reprove_frozen_surface(page, frozen, row.ordinal, trace=trace)
+            trace.reach(PREFLIGHT_CHECKPOINT_ROW_IDENTITY_RECHECK)
+            rows = page.get_by_role("table").get_by_role("row")
+            try:
+                digest = self._row_identity(rows.nth(row.ordinal + 1), MAX_PORTAL_PROBE_TIMEOUT_MS)
+            except LayoutChangedError:
+                trace.hard("ROW_RECHECK_INVALID")
+                raise
+            if digest != frozen[row.ordinal + 1]:
+                # Characterised asymmetry: a lagging snapshot here is final,
+                # unlike inside the ladder above. It is recorded, not repaired.
+                trace.hard("ROW_RECHECK_NOT_READY" if digest is None else "ROW_RECHECK_MISMATCH")
+                raise LayoutChangedError(RESULTS_SURFACE_CHANGED_MESSAGE)
+        except Exception as exc:
+            self._latched = True
+            raise DownloadPreflightError(RESULTS_SURFACE_CHANGED_MESSAGE, trace.evidence(row)) from exc
+        return page, control
+
+    def download_preflight(self, rows: list[InvoiceRow]) -> DownloadPreflightDiagnosticResult:
+        """Prove every authorised row dispatchable, in order, dispatching nothing.
+
+        Each row is proven by the one shared `_pre_dispatch`; the ready
+        control it returns is discarded unused. The first failing row stops
+        the inspection and keeps the production latch effect of the predicate
+        that failed. When every row passes, the portal is latched once the
+        whole inspection has finished, so this instance can never later
+        dispatch a Download.
+        """
+
+        passed = 0
+        for row in rows:
+            try:
+                self._pre_dispatch(row, _PreDispatchTrace())
+            except DownloadPreflightError as exc:
+                return DownloadPreflightDiagnosticResult(rows_passed=passed, failure=exc.evidence)
+            passed += 1
+        self._latched = True
+        return DownloadPreflightDiagnosticResult(rows_passed=passed)
+
+    def _reprove_frozen_surface(
+        self,
+        page: Any,
+        frozen: tuple[bytes, ...],
+        ordinal: int,
+        *,
+        trace: _PreDispatchTrace | None = None,
+    ) -> Any:
         """Re-prove the frozen surface and return the row's ready Download control.
 
         Rendering lag -- a table or control momentarily absent or not yet
         actionable -- gets the shared bounded window. A readable surface that
         differs from the frozen one in any way is drift and fails at once.
+
+        `trace` records the closed checkpoint/reason of each branch taken and
+        nothing else; the combined control check is split into consecutive
+        tests in its original evaluation order.
         """
 
         ceiling = max(self._safety_ceiling, len(frozen) - 1)
+        record = trace if trace is not None else _PreDispatchTrace()
 
-        def probe(remaining_ms: int) -> tuple[str, Any]:
-            self._require_unique_page(page, RESULTS_SURFACE_CHANGED_MESSAGE)
+        def inspect(remaining_ms: int) -> tuple[str, Any]:
+            record.new_look()
+            record.reach(PREFLIGHT_CHECKPOINT_TOPOLOGY)
+            try:
+                self._require_unique_page(page, RESULTS_SURFACE_CHANGED_MESSAGE)
+            except LayoutChangedError as exc:
+                if exc.__cause__ is None:
+                    record.hard("TOPOLOGY_NOT_UNIQUE")
+                raise
+            record.reach(PREFLIGHT_CHECKPOINT_TAB_STATE)
             state = self._eb_bill_tab_state(page, remaining_ms)
             if state == _TAB_UNSELECTED or state == _TAB_AMBIGUOUS:
+                record.hard("TAB_UNSELECTED" if state == _TAB_UNSELECTED else "TAB_AMBIGUOUS")
                 raise LayoutChangedError(RESULTS_SURFACE_CHANGED_MESSAGE)
             if state != _TAB_SELECTED:
+                record.lag("TAB_ABSENT" if state == _TAB_ABSENT else "TAB_CONTRADICTORY")
                 return _PORTAL_NOT_READY, None
-            witnesses = self._account_witness_count(page)
+            record.reach(PREFLIGHT_CHECKPOINT_ACCOUNT_WITNESS)
+            try:
+                witnesses = self._account_witness_count(page)
+            except LayoutChangedError:
+                # Characterised asymmetry: this read race is immediate here,
+                # while inventory treats it as a not-ready look.
+                record.hard("WITNESS_READ_RACE")
+                raise
             if witnesses > 1:
+                record.hard("WITNESS_MULTIPLE")
                 raise LayoutChangedError(RESULTS_SURFACE_CHANGED_MESSAGE)
             if witnesses != 1:
+                record.lag("WITNESS_ABSENT")
                 return _PORTAL_NOT_READY, None
-            verdict, value = self._read_results_surface(page, remaining_ms, ceiling)
+            record.reach(PREFLIGHT_CHECKPOINT_RESULTS_SURFACE)
+            verdict, value = self._read_results_surface(page, remaining_ms, ceiling, trace=record)
             if verdict != _PORTAL_READY:
                 return _PORTAL_NOT_READY, None
+            record.reach(PREFLIGHT_CHECKPOINT_SNAPSHOT_COMPARE)
             if value != frozen:
+                record.snapshot = DownloadPreflightSnapshot.compare(value, frozen)
+                record.hard("SNAPSHOT_MISMATCH")
                 raise LayoutChangedError(RESULTS_SURFACE_CHANGED_MESSAGE)
+            record.reach(PREFLIGHT_CHECKPOINT_CONTROL_RESOLVE)
             control = (
                 page.get_by_role("table")
                 .get_by_role("row")
                 .nth(ordinal + 1)
                 .get_by_role("button", name=DOWNLOAD_BUTTON_NAME, exact=True)
             )
-            if int(control.count()) != 1 or not bool(control.is_visible()):
+            count = int(control.count())
+            record.observe_control(count_bucket=_preflight_count_bucket(count))
+            if count != 1:
+                record.lag("CONTROL_COUNT_MISMATCH")
                 return _PORTAL_NOT_READY, None
-            if not self._probe_enabled(control, remaining_ms):
+            record.reach(PREFLIGHT_CHECKPOINT_CONTROL_VISIBLE)
+            visible = bool(control.is_visible())
+            record.observe_control(visible=visible)
+            if not visible:
+                record.lag("CONTROL_NOT_VISIBLE")
                 return _PORTAL_NOT_READY, None
-            if not self._probe_actionable(control, remaining_ms):
+            record.reach(PREFLIGHT_CHECKPOINT_CONTROL_ENABLED)
+            enabled = self._probe_enabled(control, remaining_ms)
+            record.observe_control(enabled=enabled)
+            if not enabled:
+                record.lag("CONTROL_NOT_ENABLED")
+                return _PORTAL_NOT_READY, None
+            record.reach(PREFLIGHT_CHECKPOINT_CONTROL_ACTIONABLE)
+            try:
+                actionable = self._probe_actionable(control, remaining_ms)
+            except Exception:
+                record.observe_control(trial_actionability=PREFLIGHT_TRIAL_ERROR)
+                raise
+            record.observe_control(
+                trial_actionability=PREFLIGHT_TRIAL_PASSED if actionable else PREFLIGHT_TRIAL_TIMEOUT
+            )
+            if not actionable:
+                record.lag("CONTROL_NOT_ACTIONABLE")
                 return _PORTAL_NOT_READY, None
             return _PORTAL_READY, control
 
-        return self._recover(
-            page,
-            probe,
-            "frozen invoice results",
-            messages=_uniform_messages(RESULTS_SURFACE_CHANGED_MESSAGE),
-        )
+        def probe(remaining_ms: int) -> tuple[str, Any]:
+            try:
+                return inspect(remaining_ms)
+            except Exception:
+                # Anything the branches above did not name is the one bounded
+                # unexpected class, at the checkpoint the look had reached.
+                record.hard(PREFLIGHT_PROBE_ERROR)
+                raise
+
+        try:
+            return self._recover(
+                page,
+                probe,
+                "frozen invoice results",
+                messages=_uniform_messages(RESULTS_SURFACE_CHANGED_MESSAGE),
+            )
+        except LayoutChangedError as exc:
+            # The recovery's own deadline failure carries no cause and follows
+            # no hard reason: that, and only that, is an expired window.
+            if record.hard_reason is None and exc.__cause__ is None:
+                record.window_expired = True
+            raise
 
     # ---- diagnostic-owned route helpers ---- #
     #

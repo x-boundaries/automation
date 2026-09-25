@@ -48,6 +48,7 @@ python -m energygrid_bill_downloader list --config <EXTERNAL_CONFIG_JSON>
 python -m energygrid_bill_downloader list --config <EXTERNAL_CONFIG_JSON> --headed
 python -m energygrid_bill_downloader login-diagnostic --config <EXTERNAL_CONFIG_JSON>
 python -m energygrid_bill_downloader navigation-diagnostic --config <EXTERNAL_CONFIG_JSON>
+python -m energygrid_bill_downloader download-preflight-diagnostic --config <EXTERNAL_CONFIG_JSON>
 ```
 
 For `run` and `list` the only supported command-specific options are `--headed`,
@@ -197,9 +198,56 @@ screenshots, traces, HAR, and storage state are never emitted. Invalid output
 evidence is replaced by a fully unobserved `OUTPUT_REJECTED` document.
 
 The direct diagnostic is not in the runtime launcher's `run | list |
-login-diagnostic` allowlist. It is an offline/controlled evidence tool only;
+login-diagnostic | download-preflight-diagnostic` allowlist. It is an
+offline/controlled evidence tool only;
 this implementation does not authorize a live portal session, production run,
 retry, selector correction, deployment, or Scheduler action.
+
+`download-preflight-diagnostic` (DL-XB-199 G2-083 / G3-084) is the fixed
+headless no-Download pre-dispatch diagnostic. It accepts `--config` and nothing
+else, and it is reachable through the runtime launcher as a fixed `-Command` so
+the existing credential boundary is reused. It loads and validates the config,
+performs the canonical login and the production inventory (one EB Bill tab
+selection and one Search), and then runs the one shared production pre-dispatch
+proof over every row in order, stopping at the first failing row. That proof is
+the same code a production Download runs before its dispatch: the latch, the row
+handle, the whole frozen surface re-proof on the bounded ladder, and the final
+one-shot row-identity recheck. The diagnostic never clicks Download, never
+enters a download wait, never clicks pagination, Tenant Bill, EMS, Billing
+Manager or a link, takes no screenshot, trace, HAR or storage state, and never
+retries. It does not run production preflight, create a logger, clean temporary
+files, open StateStore, create a run directory or reconcile, so it creates no
+state, log, temp or archive artefact. When every row passes, the portal latches
+so it can never dispatch a Download afterwards.
+
+It prints exactly one `energygrid.download_preflight_diagnostic.v1` JSON
+document and nothing on stderr. The keys are always `schema`, `status`,
+`result`, `support_ref`, `download_dispatched` (always `false`),
+`inventory_count`, `rows_passed` and `failure`. `result` is one of
+`PREFLIGHT_ALL_ROWS_PASSED`, `PREFLIGHT_ROW_FAILED`, `CONFIGURATION_FAILED`,
+`LOGIN_FAILED`, `INVENTORY_FAILED`, `INVENTORY_EMPTY`, `UNEXPECTED_FAILURE` or
+`OUTPUT_REJECTED`. The two `PREFLIGHT_` results are a complete observation
+(`status` `DIAGNOSTIC_COMPLETE`, exit `0`); everything else is `ACTION_REQUIRED`
+with exit `20`, except `CONFIGURATION_FAILED` which exits `64`. It never exits
+`10`. `support_ref` carries an existing bounded reference only for
+`CONFIGURATION_FAILED`, `LOGIN_FAILED`, `INVENTORY_FAILED` and
+`UNEXPECTED_FAILURE`, and is `null` otherwise. A failed row is described by
+`failure`: `row_ordinal`, one of 36 closed `reason_code` values, its owning
+`last_checkpoint` (one of `HANDLE`, `TOPOLOGY`, `TAB_STATE`, `ACCOUNT_WITNESS`,
+`RESULTS_SURFACE`, `SNAPSHOT_COMPARE`, `CONTROL_RESOLVE`, `CONTROL_VISIBLE`,
+`CONTROL_ENABLED`, `CONTROL_ACTIONABLE`, `ROW_IDENTITY_RECHECK`),
+`window_expired` (true only when a bounded recovery window ran out),
+`not_ready_looks`, a coarse `elapsed_bucket`, the Download `control` evidence
+(`count_bucket`, `visible`, `enabled`, `trial_actionability`) and, only for
+`SNAPSHOT_MISMATCH`, a `snapshot` comparison of booleans and one changed-row
+count. Row text, filenames, account text, URLs, digests and exception text are
+never emitted. Invalid output is replaced by one fixed `OUTPUT_REJECTED`
+document.
+
+The launcher source admits the command, but an installed launcher keeps its
+earlier allowlist until a separately authorised republish, re-admission and
+`ValidateOnly` accept the new launcher bytes. Committing it grants no live
+diagnostic, credential use, deployment, retry or Scheduler authority.
 
 ### Future live-session diagnostic authority boundary
 
@@ -272,6 +320,17 @@ existing stale-temp cleanup.
 Logs, summaries and errors carry fixed messages, statuses and counts only: never
 row text, digests, keys, row handles, suggested filenames, account text, page
 addresses, or invoice/customer/account values.
+
+Each `invoice_failure` event additionally carries `row_ordinal` (the failing
+row's bounded table ordinal) and, when the failure is a pre-dispatch proof
+failure, `preflight_reason` and `preflight_checkpoint` from the same closed
+36-reason / 11-checkpoint vocabulary as `download-preflight-diagnostic`
+(DL-XB-199 G2-083). The fields are never required, so logs written by an earlier
+build stay valid; every value is validated before it is logged and an invalid
+value is omitted rather than coerced. Status, exit code, summary, `run_complete`
+and `run_failed` are unchanged. Any strict external run-log collector that
+rejects unknown keys must be updated to admit these fields before it is used on
+a later run.
 
 **Result completeness is a pre-Scheduler gate.** The pagination sentinels and
 the `aria-rowcount` check are inspection-only safety guards for the currently

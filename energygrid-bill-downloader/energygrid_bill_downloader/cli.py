@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .config import load_config_file, load_runtime_config
+from .config import MAX_INVENTORY_CEILING, load_config_file, load_runtime_config
 from .errors import ACTION_REQUIRED, AppError, ConfigError, DependencyError, exit_code_for
 from .publication import cleanup_stale_owned_temp
 from .portal import (
@@ -18,6 +18,18 @@ from .portal import (
     ACCOUNT_WITNESS_UNPROVED_MESSAGE,
     AUTHENTICATION_OUTCOMES,
     AUTHENTICATION_UNPROVED,
+    DOWNLOAD_PREFLIGHT_CHECKPOINTS,
+    DOWNLOAD_PREFLIGHT_ELAPSED_BUCKETS,
+    DOWNLOAD_PREFLIGHT_REASON_CHECKPOINTS,
+    DOWNLOAD_PREFLIGHT_REASON_KINDS,
+    DOWNLOAD_PREFLIGHT_REASONS,
+    DOWNLOAD_PREFLIGHT_TRIAL_OUTCOMES,
+    PREFLIGHT_COUNT_GT_ONE,
+    PREFLIGHT_MAX_NOT_READY_LOOKS,
+    PREFLIGHT_PROBE_ERROR,
+    PREFLIGHT_TRIAL_NOT_REACHED,
+    PREFLIGHT_WINDOW,
+    DownloadPreflightDiagnosticResult,
     EB_BILL_TAB_NOT_READY_MESSAGE,
     EB_BILL_TAB_UNCERTAIN_MESSAGE,
     EB_BILL_TAB_UNPROVED_MESSAGE,
@@ -68,6 +80,9 @@ from .reconcile import reconcile_inventory
 from .state import StateStore
 
 
+# The last three are the additive invoice_failure enrichment accepted by
+# DL-XB-199 G2-083. They are never required, so a log written by an earlier
+# build stays valid, and reconcile validates each value before it is logged.
 ALLOWED_LOG_FIELDS = {
     "inventory_count",
     "downloaded_count",
@@ -76,6 +91,9 @@ ALLOWED_LOG_FIELDS = {
     "attempt",
     "duration_ms",
     "support_ref",
+    "row_ordinal",
+    "preflight_reason",
+    "preflight_checkpoint",
 }
 
 RUN_FAILED_PHASE = "run_failed"
@@ -100,11 +118,52 @@ HISTORICAL_LOGIN_DIAGNOSTIC_SCHEMAS = ("energygrid.login_diagnostic.v1",)
 DIAGNOSTIC_COMPLETE = "DIAGNOSTIC_COMPLETE"
 
 # Dedicated direct-Python post-login navigation diagnostic. It is intentionally
-# not part of the runtime launcher allowlist; the launcher continues to expose
-# only `run`, `list` and `login-diagnostic`.
+# not part of the runtime launcher allowlist; the launcher exposes only `run`,
+# `list`, `login-diagnostic` and `download-preflight-diagnostic`.
 NAVIGATION_DIAGNOSTIC_COMMAND = "navigation-diagnostic"
 NAVIGATION_DIAGNOSTIC_SCHEMA = "energygrid.navigation_diagnostic.v1"
 NAVIGATION_DIAGNOSTIC_COMPLETE = NAVIGATION_DIAGNOSTIC_COMPLETE_STATE
+
+# DL-XB-199 G2-083 / G3-084: the fixed headless no-Download pre-dispatch
+# diagnostic. It logs in, takes the production inventory and runs the one
+# shared production pre-dispatch proof over every row, and it never dispatches
+# a Download. The launcher reaches it as a fixed command so the existing
+# credential boundary is reused; it takes `--config` and nothing else.
+DOWNLOAD_PREFLIGHT_DIAGNOSTIC_COMMAND = "download-preflight-diagnostic"
+DOWNLOAD_PREFLIGHT_DIAGNOSTIC_SCHEMA = "energygrid.download_preflight_diagnostic.v1"
+
+PREFLIGHT_ALL_ROWS_PASSED = "PREFLIGHT_ALL_ROWS_PASSED"
+PREFLIGHT_ROW_FAILED = "PREFLIGHT_ROW_FAILED"
+PREFLIGHT_CONFIGURATION_FAILED = "CONFIGURATION_FAILED"
+PREFLIGHT_LOGIN_FAILED = "LOGIN_FAILED"
+PREFLIGHT_INVENTORY_FAILED = "INVENTORY_FAILED"
+PREFLIGHT_INVENTORY_EMPTY = "INVENTORY_EMPTY"
+PREFLIGHT_UNEXPECTED_FAILURE = "UNEXPECTED_FAILURE"
+PREFLIGHT_OUTPUT_REJECTED = "OUTPUT_REJECTED"
+DOWNLOAD_PREFLIGHT_DIAGNOSTIC_RESULTS = (
+    PREFLIGHT_ALL_ROWS_PASSED,
+    PREFLIGHT_ROW_FAILED,
+    PREFLIGHT_CONFIGURATION_FAILED,
+    PREFLIGHT_LOGIN_FAILED,
+    PREFLIGHT_INVENTORY_FAILED,
+    PREFLIGHT_INVENTORY_EMPTY,
+    PREFLIGHT_UNEXPECTED_FAILURE,
+    PREFLIGHT_OUTPUT_REJECTED,
+)
+# A complete observation of the pre-dispatch surface: every row passed, or the
+# first failing row is named by its closed reason. Everything else is a
+# failure to observe and is ACTION_REQUIRED.
+DOWNLOAD_PREFLIGHT_COMPLETE_RESULTS = frozenset({PREFLIGHT_ALL_ROWS_PASSED, PREFLIGHT_ROW_FAILED})
+# The results that carry a bounded support reference; every other result
+# carries null there.
+DOWNLOAD_PREFLIGHT_REFERENCED_RESULTS = frozenset(
+    {
+        PREFLIGHT_CONFIGURATION_FAILED,
+        PREFLIGHT_LOGIN_FAILED,
+        PREFLIGHT_INVENTORY_FAILED,
+        PREFLIGHT_UNEXPECTED_FAILURE,
+    }
+)
 
 # The diagnostic observes authentication and stops. It never tests business
 # navigation, so this is an invariant of the document rather than a result.
@@ -366,6 +425,10 @@ def build_parser() -> argparse.ArgumentParser:
     diagnostic.add_argument("--config", required=True, type=Path)
     navigation_diagnostic = subparsers.add_parser(NAVIGATION_DIAGNOSTIC_COMMAND)
     navigation_diagnostic.add_argument("--config", required=True, type=Path)
+    # Same closed surface: `--config` only. Headless and every bound are fixed
+    # properties of the operation, never arguments.
+    preflight_diagnostic = subparsers.add_parser(DOWNLOAD_PREFLIGHT_DIAGNOSTIC_COMMAND)
+    preflight_diagnostic.add_argument("--config", required=True, type=Path)
     return parser
 
 
@@ -833,6 +896,273 @@ def run_navigation_diagnostic(config_path: Path) -> int:
     return _emit_navigation_diagnostic_and_get_exit_code(document)
 
 
+# ---- download-preflight diagnostic (DL-XB-199 G2-083 / G3-084) ---- #
+
+_PREFLIGHT_DOCUMENT_KEYS = frozenset(
+    {
+        "schema",
+        "status",
+        "result",
+        "support_ref",
+        "download_dispatched",
+        "inventory_count",
+        "rows_passed",
+        "failure",
+    }
+)
+_PREFLIGHT_FAILURE_KEYS = frozenset(
+    {
+        "row_ordinal",
+        "reason_code",
+        "last_checkpoint",
+        "window_expired",
+        "not_ready_looks",
+        "elapsed_bucket",
+        "control",
+        "snapshot",
+    }
+)
+_PREFLIGHT_CONTROL_KEYS = frozenset({"count_bucket", "visible", "enabled", "trial_actionability"})
+_PREFLIGHT_SNAPSHOT_KEYS = frozenset(
+    {"row_count_equal", "header_equal", "rows_equal_as_set", "changed_row_count"}
+)
+DOWNLOAD_PREFLIGHT_ALLOWED_SUPPORT_REFS = (
+    frozenset(SUPPORT_REFS_BY_MESSAGE.values()) - RETIRED_SUPPORT_REFS
+) | frozenset({UNCLASSIFIED_SUPPORT_REF})
+
+
+def _preflight_int(value: Any, minimum: int, maximum: int) -> bool:
+    return type(value) is int and minimum <= value <= maximum
+
+
+def _preflight_optional_bool(value: Any) -> bool:
+    return value is None or type(value) is bool
+
+
+def _valid_preflight_control(value: Any) -> bool:
+    if not _valid_navigation_mapping(value, _PREFLIGHT_CONTROL_KEYS):
+        return False
+    count = value["count_bucket"]
+    if not (count is None or (type(count) is int and count in (0, 1)) or (type(count) is str and count == PREFLIGHT_COUNT_GT_ONE)):
+        return False
+    trial = value["trial_actionability"]
+    if type(trial) is not str or trial not in DOWNLOAD_PREFLIGHT_TRIAL_OUTCOMES:
+        return False
+    if not (_preflight_optional_bool(value["visible"]) and _preflight_optional_bool(value["enabled"])):
+        return False
+    # Evidence is only ever gathered in ladder order, so a later field can
+    # never be known while an earlier one is not.
+    if count != 1:
+        return value["visible"] is None and value["enabled"] is None and trial == PREFLIGHT_TRIAL_NOT_REACHED
+    if value["visible"] is not True:
+        return value["enabled"] is None and trial == PREFLIGHT_TRIAL_NOT_REACHED
+    if value["enabled"] is not True:
+        return trial == PREFLIGHT_TRIAL_NOT_REACHED
+    return True
+
+
+def _valid_preflight_snapshot(value: Any, reason: str) -> bool:
+    if reason != "SNAPSHOT_MISMATCH":
+        return value is None
+    if not _valid_navigation_mapping(value, _PREFLIGHT_SNAPSHOT_KEYS):
+        return False
+    return all(
+        type(value[key]) is bool for key in ("row_count_equal", "header_equal", "rows_equal_as_set")
+    ) and _preflight_int(value["changed_row_count"], 0, MAX_INVENTORY_CEILING)
+
+
+def _valid_preflight_failure(value: Any, rows_passed: int, inventory_count: int) -> bool:
+    if not _valid_navigation_mapping(value, _PREFLIGHT_FAILURE_KEYS):
+        return False
+    reason = value["reason_code"]
+    checkpoint = value["last_checkpoint"]
+    if type(reason) is not str or reason not in DOWNLOAD_PREFLIGHT_REASONS:
+        return False
+    if type(checkpoint) is not str or checkpoint not in DOWNLOAD_PREFLIGHT_CHECKPOINTS:
+        return False
+    if reason != PREFLIGHT_PROBE_ERROR and checkpoint != DOWNLOAD_PREFLIGHT_REASON_CHECKPOINTS[reason]:
+        return False
+    if type(value["window_expired"]) is not bool:
+        return False
+    if value["window_expired"] is not (DOWNLOAD_PREFLIGHT_REASON_KINDS[reason] == PREFLIGHT_WINDOW):
+        return False
+    # The inspection stops at the first failing row, so it is the next row.
+    if not _preflight_int(value["row_ordinal"], 0, inventory_count - 1) or value["row_ordinal"] != rows_passed:
+        return False
+    if not _preflight_int(value["not_ready_looks"], 0, PREFLIGHT_MAX_NOT_READY_LOOKS):
+        return False
+    bucket = value["elapsed_bucket"]
+    if type(bucket) is not str or bucket not in DOWNLOAD_PREFLIGHT_ELAPSED_BUCKETS:
+        return False
+    return _valid_preflight_control(value["control"]) and _valid_preflight_snapshot(value["snapshot"], reason)
+
+
+def _valid_preflight_document(document: Any) -> bool:
+    """Total, exact, closed validation of one diagnostic document."""
+
+    try:
+        if not _valid_navigation_mapping(document, _PREFLIGHT_DOCUMENT_KEYS):
+            return False
+        if type(document["schema"]) is not str or document["schema"] != DOWNLOAD_PREFLIGHT_DIAGNOSTIC_SCHEMA:
+            return False
+        result = document["result"]
+        status = document["status"]
+        if type(result) is not str or result not in DOWNLOAD_PREFLIGHT_DIAGNOSTIC_RESULTS:
+            return False
+        expected_status = (
+            DIAGNOSTIC_COMPLETE if result in DOWNLOAD_PREFLIGHT_COMPLETE_RESULTS else ACTION_REQUIRED
+        )
+        if type(status) is not str or status != expected_status:
+            return False
+        if document["download_dispatched"] is not False:
+            return False
+        support_ref = document["support_ref"]
+        if result in DOWNLOAD_PREFLIGHT_REFERENCED_RESULTS:
+            if type(support_ref) is not str or not _NAVIGATION_SUPPORT_REFERENCE_PATTERN.fullmatch(support_ref):
+                return False
+            if support_ref not in DOWNLOAD_PREFLIGHT_ALLOWED_SUPPORT_REFS:
+                return False
+        elif support_ref is not None:
+            return False
+        inventory_count = document["inventory_count"]
+        rows_passed = document["rows_passed"]
+        failure = document["failure"]
+        if result == PREFLIGHT_ALL_ROWS_PASSED:
+            return (
+                _preflight_int(inventory_count, 1, MAX_INVENTORY_CEILING)
+                and rows_passed == inventory_count
+                and type(rows_passed) is int
+                and failure is None
+            )
+        if result == PREFLIGHT_ROW_FAILED:
+            return (
+                _preflight_int(inventory_count, 1, MAX_INVENTORY_CEILING)
+                and _preflight_int(rows_passed, 0, inventory_count - 1)
+                and _valid_preflight_failure(failure, rows_passed, inventory_count)
+            )
+        if failure is not None:
+            return False
+        if result == PREFLIGHT_INVENTORY_EMPTY:
+            return type(inventory_count) is int and inventory_count == 0 and type(rows_passed) is int and rows_passed == 0
+        return inventory_count is None and rows_passed is None
+    except Exception:
+        return False
+
+
+def _preflight_document(
+    result: str,
+    *,
+    support_ref: str | None = None,
+    inventory_count: int | None = None,
+    rows_passed: int | None = None,
+    failure: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return {
+        "schema": DOWNLOAD_PREFLIGHT_DIAGNOSTIC_SCHEMA,
+        "status": DIAGNOSTIC_COMPLETE if result in DOWNLOAD_PREFLIGHT_COMPLETE_RESULTS else ACTION_REQUIRED,
+        "result": result,
+        "support_ref": support_ref,
+        "download_dispatched": False,
+        "inventory_count": inventory_count,
+        "rows_passed": rows_passed,
+        "failure": failure,
+    }
+
+
+def _preflight_rejected_document() -> dict[str, Any]:
+    """The one fixed document emitted when output validation fails."""
+
+    return _preflight_document(PREFLIGHT_OUTPUT_REJECTED)
+
+
+def download_preflight_document(inventory_count: int, result: Any) -> dict[str, Any]:
+    """Rebuild the public document from a portal result, or reject it wholesale."""
+
+    try:
+        if type(result) is not DownloadPreflightDiagnosticResult or result.download_dispatched is not False:
+            return _preflight_rejected_document()
+        if result.failure is None:
+            document = _preflight_document(
+                PREFLIGHT_ALL_ROWS_PASSED, inventory_count=inventory_count, rows_passed=result.rows_passed
+            )
+        else:
+            document = _preflight_document(
+                PREFLIGHT_ROW_FAILED,
+                inventory_count=inventory_count,
+                rows_passed=result.rows_passed,
+                failure=result.failure.as_public_dict(),
+            )
+        if _valid_preflight_document(document):
+            return document
+    except Exception:
+        pass
+    return _preflight_rejected_document()
+
+
+def emit_download_preflight_diagnostic(document: dict[str, Any]) -> dict[str, Any]:
+    """Emit exactly one validated JSON line; anything invalid becomes OUTPUT_REJECTED."""
+
+    try:
+        safe_document = document if _valid_preflight_document(document) else _preflight_rejected_document()
+        encoded = json.dumps(safe_document, sort_keys=True, ensure_ascii=True)
+    except Exception:
+        safe_document = _preflight_rejected_document()
+        encoded = json.dumps(safe_document, sort_keys=True, ensure_ascii=True)
+    print(encoded)
+    return safe_document
+
+
+def _download_preflight_exit_code(document: dict[str, Any]) -> int:
+    """Derive the process result only from the final emitted document."""
+
+    if document["result"] == PREFLIGHT_CONFIGURATION_FAILED:
+        return 64
+    if document["status"] == DIAGNOSTIC_COMPLETE:
+        return 0
+    return 20
+
+
+def run_download_preflight_diagnostic(config_path: Path) -> int:
+    """Prove every inventory row dispatchable, headless, without any Download.
+
+    Only the configuration is loaded and validated. `config.preflight()` is not
+    called, no `SafeLogger`, `StateStore`, stale-temp cleanup, run directory or
+    reconciliation is reached, and nothing is created on disk. The portal is
+    always headless; the inspection is the one shared production pre-dispatch
+    proof and the portal latches itself afterwards, so nothing can be
+    downloaded on this instance.
+    """
+
+    def finish(document: dict[str, Any]) -> int:
+        return _download_preflight_exit_code(emit_download_preflight_diagnostic(document))
+
+    try:
+        config = load_runtime_config(load_config_file(config_path))
+    except (ConfigError, DependencyError) as exc:
+        return finish(_preflight_document(PREFLIGHT_CONFIGURATION_FAILED, support_ref=support_ref_for(exc)))
+
+    stage = PREFLIGHT_LOGIN_FAILED
+    try:
+        with PlaywrightPortal(config, headed=False) as portal:
+            portal.login()
+            stage = PREFLIGHT_INVENTORY_FAILED
+            rows = portal.inventory(config.inventory_safety_ceiling)
+            if not rows:
+                document = _preflight_document(PREFLIGHT_INVENTORY_EMPTY, inventory_count=0, rows_passed=0)
+            else:
+                stage = PREFLIGHT_UNEXPECTED_FAILURE
+                document = download_preflight_document(len(rows), portal.download_preflight(rows))
+    except (ConfigError, DependencyError) as exc:
+        document = _preflight_document(PREFLIGHT_CONFIGURATION_FAILED, support_ref=support_ref_for(exc))
+    except AppError as exc:
+        document = _preflight_document(stage, support_ref=support_ref_for(exc))
+    except Exception:
+        # Discarded, never described: no traceback or free-form text reaches
+        # stdout or stderr. Process control (BaseException) still propagates.
+        document = _preflight_document(PREFLIGHT_UNEXPECTED_FAILURE, support_ref=UNCLASSIFIED_SUPPORT_REF)
+    return finish(document)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     logger: SafeLogger | None = None
@@ -848,6 +1178,10 @@ def main(argv: list[str] | None = None) -> int:
             # it never reaches production preflight, logging, stale-temp
             # cleanup, StateStore, reconciliation, inventory or downloads.
             return run_navigation_diagnostic(args.config)
+        if args.command == DOWNLOAD_PREFLIGHT_DIAGNOSTIC_COMMAND:
+            # Same early-return boundary: no preflight, logger, stale-temp
+            # cleanup, StateStore, reconciliation or Download is reachable.
+            return run_download_preflight_diagnostic(args.config)
         raw = load_config_file(args.config)
         config = load_runtime_config(raw)
         config = config.with_overrides(

@@ -15,8 +15,10 @@
 # browser-install parameter, no commit-pin parameter, and STILL no headed switch. Headed
 # execution is an implicit and non-overridable property of the fixed 'login-diagnostic'
 # operation only; it is not a mode any caller can select, and 'run' and 'list' are
-# unaffected. -Command is a closed allowlist of three fixed operation names, and the child
-# argument vector stays a fixed five elements with nothing appended conditionally. Two
+# unaffected. The fixed 'download-preflight-diagnostic' operation is always headless and
+# never dispatches a Download (DL-XB-199 G2-083).
+# -Command is a closed allowlist of four fixed operation names, and the child argument
+# vector stays a fixed five elements with nothing appended conditionally. Two
 # parameters are mandatory specifically so that omitting an argument can never silently
 # disable a security expectation: -ExpectedBranch takes the literal ANY_BRANCH sentinel
 # rather than being optional, and -AuthorisedLauncherRootWriteSid is the only route by
@@ -40,7 +42,7 @@ param(
     [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$BrowserCachePath,
     [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$ExpectedBranch,
     [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string[]]$AuthorisedLauncherRootWriteSid,
-    [ValidateSet('run', 'list', 'login-diagnostic')][string]$Command = 'run',
+    [ValidateSet('run', 'list', 'login-diagnostic', 'download-preflight-diagnostic')][string]$Command = 'run',
     [string]$LogRoot,
     [switch]$ValidateOnly,
     [string]$RunId
