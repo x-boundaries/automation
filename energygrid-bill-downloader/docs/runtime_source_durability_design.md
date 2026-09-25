@@ -192,7 +192,7 @@ approved.
 | `-BrowserCachePath` | yes | Absolute path to the approved private Playwright browser cache, section 9.3 |
 | `-ExpectedBranch` | yes | Branch the deployed checkout must be on, or the literal `ANY_BRANCH`, section 10.3 |
 | `-AuthorisedLauncherRootWriteSid` | yes | One or more SID strings naming the exhaustive set of trustees permitted to hold write-capable access on the launcher root, section 17.2.1 |
-| `-Command` | no | `run` (default), `list`, or `login-diagnostic` (section 5.4) |
+| `-Command` | no | `run` (default), `list`, `login-diagnostic` (section 5.4), or `download-preflight-diagnostic` (section 5.5) |
 | `-LogRoot` | no | Private diagnostics root for the launcher's own terminal event |
 | `-ValidateOnly` | no | Switch, contract in section 8 |
 | `-RunId` | no | Correlation identifier for the terminal event only |
@@ -202,7 +202,7 @@ carry a credential value or a committed path. `-ExpectedBranch` is mandatory wit
 explicit `ANY_BRANCH` sentinel rather than optional, so branch binding is never
 disabled by omitting an argument. There is no parameter that accepts a credential
 value, no portal parameter, no browser-install parameter, no commit-pin parameter, and
-no headed switch. `-Command` is a closed allowlist of three fixed operation names and
+no headed switch. `-Command` is a closed allowlist of four fixed operation names and
 is the only thing that varies in the invocation.
 
 Amendment A1 does not add a headed switch and does not make headed execution selectable.
@@ -558,6 +558,38 @@ reachability and retained as a readable historical mapping.
 **What A1 does not change.** `run` and `list` behave exactly as before. Scheduler
 semantics are unchanged: the Scheduled Task invokes `run`, and no scheduler artefact
 names the diagnostic. `-ValidateOnly` is unchanged and still invokes no command at all.
+
+### 5.5 Bounded download-preflight diagnostic operation
+
+DL-XB-199 G2-083, accepted by Web with amendments and implemented by G3-084. This is a
+narrow addition to the fixed `-Command` allowlist; every other clause of this design,
+including every clause of section 5.4, remains controlling.
+
+- `download-preflight-diagnostic` is a fixed operation name. It adds no launcher
+  parameter, no headed switch and no child argument: the child vector stays the fixed
+  five elements, and the existing credential import, injection and cleanup are reused
+  unchanged. `launcher_lib.ps1`, the installer and the manifest schema are unchanged.
+- The application runs it headless unconditionally, accepts `--config` and nothing else,
+  and never reaches `config.preflight()`, `SafeLogger`, stale-temp cleanup, `StateStore`,
+  a run directory or reconciliation.
+- It performs canonical login, the production inventory, and then the one shared
+  production pre-dispatch proof (`_pre_dispatch`) over every row in ordinal order,
+  stopping at the first failure. It never clicks Download and never enters
+  `expect_download`; when every row passes it latches the portal so that instance can
+  never dispatch a Download afterwards.
+- It emits exactly one `energygrid.download_preflight_diagnostic.v1` document on stdout
+  and nothing on stderr: closed reason codes, checkpoints, booleans and bounded counts
+  only, never row text, filenames, account text, URLs, digests or exception text. Invalid
+  output is replaced by one fixed `OUTPUT_REJECTED` document. It exits `0` for a complete
+  observation, `64` for a configuration or dependency failure and `20` otherwise; never
+  `10`.
+- Scheduler semantics are unchanged: the scheduled shape still runs `run`, and the
+  one-shot supervisor remains run-only.
+- The installed launcher stays stale until a later, separately authorised gate reviews
+  the new launcher package identity, republishes and re-admits it through the existing
+  runtime package mechanism, runs `ValidateOnly`, and refreshes any admission baseline
+  that pins the launcher hash. This design change deploys nothing and grants no live
+  diagnostic authority.
 
 ## 6. Installation And Update Contract
 

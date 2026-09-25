@@ -69,12 +69,12 @@ own directory.
 | `-BrowserCachePath` | yes | Absolute path to the approved private Playwright browser cache |
 | `-ExpectedBranch` | yes | Branch the deployed checkout must be on, or the literal `ANY_BRANCH` |
 | `-AuthorisedLauncherRootWriteSid` | yes | One or more exact security identifier strings naming the exhaustive set of trustees permitted to hold write-capable access on the launcher root |
-| `-Command` | no | `run` (default), `list`, or `login-diagnostic` |
+| `-Command` | no | `run` (default), `list`, `login-diagnostic`, or `download-preflight-diagnostic` |
 | `-LogRoot` | no | Private diagnostics root for the launcher's own terminal event |
 | `-ValidateOnly` | no | Switch; see below |
 | `-RunId` | no | Correlation identifier for the terminal event only |
 
-`-Command` is a closed allowlist of three fixed operation names and is the only thing that
+`-Command` is a closed allowlist of four fixed operation names and is the only thing that
 varies in the invocation. The child is always started as
 `<PythonExe> -m energygrid_bill_downloader <Command> --config <ConfigPath>` -- exactly five
 arguments, in that order, for every admitted command. Nothing is appended conditionally, and
@@ -88,6 +88,16 @@ state, or publication behaviour. There is still **no generic headed switch**: he
 execution is an implicit and non-overridable property of that one fixed operation, it cannot
 be selected, suppressed, or applied to `run` or `list`, and no launcher parameter exposes
 it. `run` and `list` are unchanged.
+
+`download-preflight-diagnostic` (DL-XB-199 G2-083 / G3-084) runs the fixed headless
+no-Download pre-dispatch diagnostic: canonical login, the production inventory, then the
+one shared production pre-dispatch proof over every row in order. It never clicks
+Download, creates no state, log, temp or archive artefact, and emits one
+`energygrid.download_preflight_diagnostic.v1` document. It reuses the existing credential
+import and injection unchanged and adds no parameter: the child vector is the same fixed
+five elements. The installed launcher on a host keeps its previously admitted allowlist
+until a separately authorised republish, re-admission and `ValidateOnly` accept the new
+launcher bytes; changing this source file deploys nothing.
 
 `-ExpectedBranch` is mandatory with an explicit `ANY_BRANCH` sentinel rather than optional,
 so branch binding is never disabled by omitting an argument.

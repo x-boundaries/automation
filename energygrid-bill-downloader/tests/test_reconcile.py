@@ -6,10 +6,12 @@ import unittest
 from unittest import mock
 import uuid
 
+from energygrid_bill_downloader import portal as portal_module
 from energygrid_bill_downloader import reconcile as reconcile_module
 from energygrid_bill_downloader import state as state_module
 from energygrid_bill_downloader.config import RuntimeConfig
 from energygrid_bill_downloader.errors import (
+    ARCHIVE_CONFLICT,
     DOWNLOAD_FAILED,
     AppError,
     DownloadError,
@@ -540,7 +542,10 @@ class ReconcileTests(unittest.TestCase):
         self.assertNotIn("PRIVATE-ACCOUNT-9911", emitted)
         self.assertNotIn("2026-09-09", emitted)
         for _phase, _status, fields in logger.events:
-            self.assertTrue(set(fields) <= {"inventory_count", "attempt"})
+            # `row_ordinal` is the accepted G2-083 enrichment: a bounded int.
+            self.assertTrue(set(fields) <= {"inventory_count", "attempt", "row_ordinal"})
+            if "row_ordinal" in fields:
+                self.assertIs(type(fields["row_ordinal"]), int)
         acquisition = reconcile_module._Acquisition(
             ordinal=0,
             run_dir=self.root,
@@ -552,6 +557,100 @@ class ReconcileTests(unittest.TestCase):
         )
         self.assertNotIn("PRIVATE", repr(acquisition))
         self.assertNotIn("binding", repr(InvoiceRow(ordinal=3, binding=object())))
+
+
+def preflight_error(reason="CONTROL_NOT_ENABLED", checkpoint="CONTROL_ENABLED", **overrides):
+    evidence = portal_module.DownloadPreflightEvidence(
+        row_ordinal=overrides.pop("row_ordinal", 1),
+        reason_code=reason,
+        last_checkpoint=checkpoint,
+        window_expired=overrides.pop("window_expired", True),
+        not_ready_looks=7,
+        elapsed_bucket="LT_60S",
+    )
+    return portal_module.DownloadPreflightError(portal_module.RESULTS_SURFACE_CHANGED_MESSAGE, evidence)
+
+
+class InvoiceFailureEnrichmentTests(unittest.TestCase):
+    """DL-XB-199 G2-083: additive, closed, validated invoice_failure fields."""
+
+    setUp = ReconcileTests.setUp
+    tearDown = ReconcileTests.tearDown
+    run_once = ReconcileTests.run_once
+    records = ReconcileTests.records
+    archive_files = ReconcileTests.archive_files
+    owned_temps = ReconcileTests.owned_temps
+    seed_archived = ReconcileTests.seed_archived
+
+    @staticmethod
+    def failures(logger) -> list[tuple[str | None, dict]]:
+        return [(status, fields) for phase, status, fields in logger.events if phase == "invoice_failure"]
+
+    def test_a_phase_a_preflight_failure_carries_its_row_reason_and_checkpoint(self) -> None:
+        bills = [SyntheticBill(f"2026-10-0{index}_row.pdf") for index in range(1, 4)]
+        portal = FakePortal(bills, scripts={1: [preflight_error()]})
+        summary, logger = self.run_once(portal)
+        self.assertEqual(
+            self.failures(logger),
+            [
+                (
+                    "PORTAL_LAYOUT_CHANGED",
+                    {
+                        "row_ordinal": 1,
+                        "preflight_reason": "CONTROL_NOT_ENABLED",
+                        "preflight_checkpoint": "CONTROL_ENABLED",
+                    },
+                )
+            ],
+        )
+        # Existing status/exit/summary semantics are unchanged.
+        self.assertEqual(portal.download_log, [0, 1])
+        self.assertEqual((summary.status, summary.exit_code, summary.failure_count), ("PORTAL_LAYOUT_CHANGED", 20, 1))
+        self.assertEqual(summary.as_dict()["failure_classes"], ["PORTAL_LAYOUT_CHANGED"])
+        self.assertEqual(self.records(), {})
+        self.assertEqual(self.archive_files(), [])
+
+    def test_a_post_dispatch_or_plain_failure_carries_only_its_row(self) -> None:
+        bills = [SyntheticBill(f"2026-10-1{index}_row.pdf") for index in range(1, 3)]
+        for error in (uncertain(), LayoutChangedError("synthetic drift"), DownloadError("synthetic", retryable=False)):
+            with self.subTest(error=type(error).__name__):
+                summary, logger = self.run_once(FakePortal(bills, scripts={0: [error]}))
+                self.assertEqual(self.failures(logger), [(error.status, {"row_ordinal": 0})])
+
+    def test_a_phase_b_failure_carries_its_acquisition_row(self) -> None:
+        bill = SyntheticBill("2026-10-21_conflict.pdf")
+        (self.archive / bill.filename).write_bytes(b"not a pdf at all")
+        other = SyntheticBill("2026-10-22_fine.pdf")
+        summary, logger = self.run_once(FakePortal([other, bill]))
+        self.assertEqual(self.failures(logger), [(ARCHIVE_CONFLICT, {"row_ordinal": 1})])
+        self.assertEqual(summary.status, ARCHIVE_CONFLICT)
+
+    def test_invalid_values_are_omitted_never_coerced_or_logged_raw(self) -> None:
+        hostile = preflight_error(reason="PRIVATE ACCT-778899", checkpoint="https://portal.example.invalid")
+        self.assertEqual(reconcile_module._failure_enrichment(hostile, 2), {"row_ordinal": 2})
+        half = preflight_error(checkpoint="NOT_A_CHECKPOINT")
+        self.assertEqual(
+            reconcile_module._failure_enrichment(half, 2),
+            {"row_ordinal": 2, "preflight_reason": "CONTROL_NOT_ENABLED"},
+        )
+        for ordinal in (True, -1, 100_000, 1.0, "1", None):
+            with self.subTest(ordinal=repr(ordinal)):
+                self.assertEqual(reconcile_module._failure_enrichment(uncertain(), ordinal), {})
+        # A LayoutChangedError that is not a preflight error never gains reason fields.
+        self.assertEqual(reconcile_module._failure_enrichment(LayoutChangedError("x"), 0), {"row_ordinal": 0})
+        bills = [SyntheticBill("2026-10-31_row.pdf")]
+        _summary, logger = self.run_once(FakePortal(bills, scripts={0: [hostile]}))
+        self.assertNotIn("ACCT", repr(logger.events))
+        self.assertNotIn("portal.example", repr(logger.events))
+
+    def test_every_real_reason_and_checkpoint_is_accepted(self) -> None:
+        for reason in portal_module.DOWNLOAD_PREFLIGHT_REASONS:
+            checkpoint = portal_module.DOWNLOAD_PREFLIGHT_REASON_CHECKPOINTS.get(reason, "CONTROL_ACTIONABLE")
+            with self.subTest(reason=reason):
+                self.assertEqual(
+                    reconcile_module._failure_enrichment(preflight_error(reason, checkpoint), 0),
+                    {"row_ordinal": 0, "preflight_reason": reason, "preflight_checkpoint": checkpoint},
+                )
 
 
 if __name__ == "__main__":

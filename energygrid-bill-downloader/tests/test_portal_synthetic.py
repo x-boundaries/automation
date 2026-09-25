@@ -263,6 +263,142 @@ class SyntheticPortalTests(unittest.TestCase):
             self.assertEqual(server.search_count, 1)
             self.assert_no_business_detour(server)
 
+    # ---- DL-XB-199 G3-084: the real PlaywrightPortal pre-dispatch boundary ---- #
+    #
+    # Web Amendment 3: fake pages alone are not production-boundary evidence.
+    # These drive the real browser through the real PlaywrightPortal against
+    # the synthetic server and prove, by the server's own counters, that no
+    # Download is ever dispatched by the diagnostic or by a failed proof.
+
+    @staticmethod
+    def spy_pre_dispatch(calls: list[int]):
+        original = PlaywrightPortal._pre_dispatch
+
+        def spy(self, row, trace):
+            calls.append(row.ordinal)
+            return original(self, row, trace)
+
+        return mock.patch.object(PlaywrightPortal, "_pre_dispatch", spy)
+
+    def test_real_download_preflight_diagnostic_passes_every_row_with_zero_download(self) -> None:
+        bills = [SyntheticBill(f"2026-09-0{index}_preflight.pdf") for index in range(1, 4)]
+        with tempfile.TemporaryDirectory() as directory, SyntheticPortalServer(bills) as server:
+            root = Path(directory)
+            config_path = root / "config.json"
+            write_config(config_path, server, root)
+            before = sorted(path.relative_to(root).as_posix() for path in root.rglob("*"))
+            calls: list[int] = []
+            old, _values = self.with_credentials()
+            out, err = io.StringIO(), io.StringIO()
+            try:
+                with self.spy_pre_dispatch(calls), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                    exit_code = main([cli.DOWNLOAD_PREFLIGHT_DIAGNOSTIC_COMMAND, "--config", str(config_path)])
+            finally:
+                self.restore_credentials(old)
+            after = sorted(path.relative_to(root).as_posix() for path in root.rglob("*"))
+            lines = out.getvalue().strip().splitlines()
+            self.assertEqual(len(lines), 1, "exactly one document")
+            document = json.loads(lines[0])
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(err.getvalue(), "")
+            self.assertEqual(document["schema"], cli.DOWNLOAD_PREFLIGHT_DIAGNOSTIC_SCHEMA)
+            self.assertEqual(document["result"], cli.PREFLIGHT_ALL_ROWS_PASSED)
+            self.assertEqual((document["inventory_count"], document["rows_passed"]), (3, 3))
+            self.assertIs(document["download_dispatched"], False)
+            self.assertIsNone(document["failure"])
+            self.assertEqual(calls, [0, 1, 2], "the shared production proof, once per row")
+            self.assertEqual(server.download_clicks, 0, "zero Download dispatch")
+            self.assertEqual(server.download_order, [], "zero download served")
+            self.assertEqual(server.search_count, 1)
+            self.assertEqual(before, after, "no state, log, temp or archive artefact")
+            self.assert_no_business_detour(server)
+
+    def test_real_typed_pre_dispatch_failure_dispatches_no_download_on_either_path(self) -> None:
+        inject_sentinel = """() => {
+            const control = document.createElement('button');
+            control.type = 'button';
+            control.textContent = 'Load more';
+            document.getElementById('results').appendChild(control);
+        }"""
+        for path in ("diagnostic", "production"):
+            with self.subTest(path=path):
+                bills = [SyntheticBill(f"2026-09-1{index}_typed.pdf") for index in range(1, 3)]
+                with tempfile.TemporaryDirectory() as directory, SyntheticPortalServer(bills) as server:
+                    root = Path(directory)
+                    calls: list[int] = []
+
+                    def body(portal):
+                        rows = portal.inventory(20)
+                        portal.page.evaluate(inject_sentinel)
+                        if path == "diagnostic":
+                            result = portal.download_preflight(rows)
+                            self.assertEqual(result.rows_passed, 0)
+                            self.assertFalse(result.download_dispatched)
+                            return result.failure, portal._latched
+                        with self.assertRaises(portal_module.DownloadPreflightError) as caught:
+                            portal.download(rows[0], root / "x.bin")
+                        self.assertEqual(caught.exception.message, portal_module.RESULTS_SURFACE_CHANGED_MESSAGE)
+                        self.assertEqual(caught.exception.status, PORTAL_LAYOUT_CHANGED)
+                        return caught.exception.evidence, portal._latched
+
+                    with self.spy_pre_dispatch(calls):
+                        evidence, latched = self.portal_run(server, root, body)
+                    self.assertEqual(calls, [0])
+                    self.assertEqual(evidence.reason_code, "RESULTS_PAGINATION_PRESENT")
+                    self.assertEqual(evidence.last_checkpoint, "RESULTS_SURFACE")
+                    self.assertIs(evidence.window_expired, False)
+                    self.assertEqual(evidence.row_ordinal, 0)
+                    self.assertTrue(latched)
+                    self.assertEqual(server.download_clicks, 0, "zero Download dispatch")
+                    self.assertEqual(server.download_order, [])
+
+    def test_real_expired_window_failure_dispatches_no_download(self) -> None:
+        hide_witness = """() => {
+            for (const node of document.querySelectorAll('.account-witness')) node.style.display = 'none';
+        }"""
+        bills = [SyntheticBill("2026-09-21_window.pdf"), SyntheticBill("2026-09-22_window.pdf")]
+        with tempfile.TemporaryDirectory() as directory, SyntheticPortalServer(bills) as server:
+            root = Path(directory)
+
+            def body(portal):
+                rows = portal.inventory(20)
+                portal.page.evaluate(hide_witness)
+                with fast_portal_recovery():
+                    return portal.download_preflight(rows)
+
+            result = self.portal_run(server, root, body)
+            self.assertEqual(result.rows_passed, 0)
+            self.assertEqual(result.failure.reason_code, "WITNESS_ABSENT")
+            self.assertEqual(result.failure.last_checkpoint, "ACCOUNT_WITNESS")
+            self.assertIs(result.failure.window_expired, True)
+            self.assertGreaterEqual(result.failure.not_ready_looks, 1)
+            self.assertEqual(server.download_clicks, 0)
+            self.assertEqual(server.download_order, [])
+
+    def test_real_production_download_still_dispatches_through_the_shared_proof(self) -> None:
+        bills = [
+            SyntheticBill("2026-09-31_shared_a.pdf", payload=synthetic_pdf(b"shared-a")),
+            SyntheticBill("2026-09-32_shared_b.pdf", payload=synthetic_pdf(b"shared-b")),
+        ]
+        with tempfile.TemporaryDirectory() as directory, SyntheticPortalServer(bills) as server:
+            root = Path(directory)
+            calls: list[int] = []
+
+            def body(portal):
+                inventory = portal.inventory(20)
+                names = [portal.download(row, root / f"row-{row.ordinal}.bin") for row in inventory]
+                for row in inventory:
+                    self.assertEqual((root / f"row-{row.ordinal}.bin").read_bytes(), bills[row.ordinal].payload)
+                return names, portal._latched
+
+            with self.spy_pre_dispatch(calls):
+                names, latched = self.portal_run(server, root, body)
+            self.assertEqual(names, [bill.filename for bill in bills])
+            self.assertEqual(calls, [0, 1], "every production Download passes the shared proof first")
+            self.assertEqual(server.download_clicks, 2)
+            self.assertEqual(server.download_order, [0, 1])
+            self.assertFalse(latched)
+
     def test_an_already_selected_eb_bill_tab_is_never_clicked(self) -> None:
         with tempfile.TemporaryDirectory() as directory, SyntheticPortalServer(
             [SyntheticBill("2026-05-02_preselected.pdf")], variant="eb_bill_preselected"
@@ -2200,6 +2336,24 @@ class SurfaceState:
         self.aria_rowcount: str | None = None
         self.snapshot_error: Exception | None = None
         self.extra_pages = 0
+        # G3-084 pre-dispatch reachability switches. None/defaults leave the
+        # surface exactly as before.
+        self.witness_flag_override: list | None = None
+        self.rows_absent = False
+        self.header_download_buttons = 0
+        self.row_columnheaders: dict[int, int] = {}
+        self.rowcount_timeout = False
+        # Applied only to the freshly resolved Download control and the final
+        # one-shot recheck, never to the results read; `control_ordinals`
+        # narrows them to some rows (None means every row).
+        self.control_ordinals: set[int] | None = None
+        self.control_count: int | None = None
+        self.control_visible = True
+        self.control_enabled = True
+        self.control_enabled_error: Exception | None = None
+        self.control_actionable = True
+        self.control_trial_error: Exception | None = None
+        self.recheck: str | None = None
         for key, value in overrides.items():
             if not hasattr(self, key):
                 raise AttributeError(key)
@@ -2209,10 +2363,21 @@ class SurfaceState:
 class SurfaceLocator:
     """One fresh resolution of a scripted element set."""
 
-    def __init__(self, page: "FakeSurfacePage", kind: str, index: int | None = None) -> None:
+    def __init__(
+        self, page: "FakeSurfacePage", kind: str, index: int | None = None, purpose: str = "read"
+    ) -> None:
         self.page = page
         self.kind = kind
         self.index = index
+        # "read": reached through the results read; "control": reached through
+        # the separate fresh resolution of the Download control / recheck.
+        self.purpose = purpose
+
+    def _controlled(self) -> bool:
+        state = self.page.state
+        return self.purpose == "control" and (
+            state.control_ordinals is None or (self.index or 0) - 1 in state.control_ordinals
+        )
 
     # -- resolution -- #
 
@@ -2227,12 +2392,16 @@ class SurfaceLocator:
         if self.kind == "table":
             return 0 if page.results_looks < state.results_absent_looks else state.tables
         if self.kind == "rows":
-            return 1 + len(state.rows)
+            return 0 if state.rows_absent else 1 + len(state.rows)
         if self.kind == "columnheader":
-            return state.header_columnheaders if self.index == 0 else 0
+            if self.index == 0:
+                return state.header_columnheaders
+            return state.row_columnheaders.get(self.index - 1, 0)
         if self.kind == "row-download":
             if self.index == 0:
-                return 0
+                return state.header_download_buttons
+            if self._controlled() and state.control_count is not None:
+                return state.control_count
             return state.download_buttons.get(self.index - 1, 1)
         if self.kind == "all-downloads":
             return sum(state.download_buttons.get(i, 1) for i in range(len(state.rows))) + state.stray_download_buttons
@@ -2244,25 +2413,31 @@ class SurfaceLocator:
 
     def nth(self, index: int) -> "SurfaceLocator":
         kind = {"rows": "row", "witness": "witness-item"}.get(self.kind, self.kind)
-        return SurfaceLocator(self.page, kind, index)
+        return SurfaceLocator(self.page, kind, index, self.purpose)
 
     def get_by_role(self, role: str, name: str | None = None, exact: bool = False) -> "SurfaceLocator":
         self.page.role_lookups.append((role, name, exact))
         if self.kind == "table" and role == "row":
-            return SurfaceLocator(self.page, "rows")
+            return SurfaceLocator(self.page, "rows", purpose=self.purpose)
         if self.kind == "row" and role == "columnheader":
-            return SurfaceLocator(self.page, "columnheader", self.index)
+            return SurfaceLocator(self.page, "columnheader", self.index, self.purpose)
         if self.kind == "row" and role == "button" and name == "Download" and exact:
-            return SurfaceLocator(self.page, "row-download", self.index)
+            return SurfaceLocator(self.page, "row-download", self.index, self.purpose)
         return SurfaceLocator(self.page, "nothing")
 
     # -- inspection -- #
 
     def is_visible(self, timeout: int | None = None) -> bool:
+        if self.kind == "row-download" and self._controlled():
+            return self.page.state.control_visible
         return True
 
     def is_enabled(self, timeout: int | None = None) -> bool:
         self.page.probe_timeouts.append(timeout)
+        if self.kind == "row-download" and self._controlled():
+            if self.page.state.control_enabled_error is not None:
+                raise self.page.state.control_enabled_error
+            return self.page.state.control_enabled
         return True
 
     def get_attribute(self, name: str, timeout: int | None = None):
@@ -2273,12 +2448,20 @@ class SurfaceLocator:
         if self.kind == "tab:tenant" and name == "aria-selected":
             return "true" if state.tenant_selected else "false"
         if self.kind == "table" and name == "aria-rowcount":
+            if state.rowcount_timeout:
+                raise synthetic_timeout()
             return state.aria_rowcount
         raise AssertionError(f"unexpected attribute read {self.kind}:{name}")
 
     def aria_snapshot(self, timeout: int | None = None) -> str:
         self.page.probe_timeouts.append(timeout)
         state = self.page.state
+        if self._controlled() and state.recheck is not None:
+            if state.recheck == "timeout":
+                raise synthetic_timeout()
+            if state.recheck == "invalid":
+                raise RuntimeError("unreadable ACCT-778899")
+            return '- row "a different private row":\n  - button "Download"'
         if state.snapshot_error is not None:
             raise state.snapshot_error
         if self.index == 0:
@@ -2287,6 +2470,8 @@ class SurfaceLocator:
 
     def evaluate_all(self, expression: str, arg=None):
         self.page.evaluations.append(expression)
+        if self.page.state.witness_flag_override is not None:
+            return list(self.page.state.witness_flag_override)
         return list(self.page.state.witnesses)
 
     # -- actions -- #
@@ -2297,6 +2482,11 @@ class SurfaceLocator:
             page.trial_clicks.append(self.kind)
             if self.kind == "tab:eb" and not state.tab_actionable:
                 raise synthetic_timeout()
+            if self.kind == "row-download" and self._controlled():
+                if state.control_trial_error is not None:
+                    raise state.control_trial_error
+                if not state.control_actionable:
+                    raise synthetic_timeout()
             return
         page.clicks.append(self.kind)
         if self.kind == "tab:eb":
@@ -2376,6 +2566,10 @@ class FakeSurfacePage:
         self.search_looks = 0
         self.results_looks = 0
         self.searched = False
+        # A results read always inspects the pagination sentinels first, so a
+        # table lookup right after them is a read; any other is the separate
+        # Download-control / recheck resolution.
+        self.after_sentinels = False
 
     def wait_for_timeout(self, milliseconds: int) -> None:
         self.clock.charge_yield(milliseconds)
@@ -2391,13 +2585,16 @@ class FakeSurfacePage:
             self.search_looks += 1
             return locator
         if role == "table" and name is None:
+            purpose = "read" if self.after_sentinels else "control"
+            self.after_sentinels = False
             if self.searched:
                 self.results_looks += 1
-                return SurfaceLocator(self, "table")
+                return SurfaceLocator(self, "table", purpose=purpose)
             return SurfaceLocator(self, "nothing")
         if role == "button" and name == "Download" and exact:
             return SurfaceLocator(self, "all-downloads")
         if role in ("button", "link") and exact and name in portal_module.RESULTS_PAGINATION_SENTINEL_NAMES:
+            self.after_sentinels = True
             return SurfaceLocator(self, f"sentinel:{role}:{name}")
         return SurfaceLocator(self, "nothing")
 
@@ -2879,6 +3076,562 @@ class SingleSurfaceDownloadTests(unittest.TestCase):
         text = caught.exception.message + repr(caught.exception.args)
         for private in ("ACCT-778899", PRIVATE_ROW_TEXT, ResultsConfig.account_identity, "portal.example.invalid"):
             self.assertNotIn(private, text)
+
+
+class DownloadPreDispatchCharacterisationTests(unittest.TestCase):
+    """DL-XB-199-DOWNLOAD-PREFLIGHT G3-084 Phase 1: current behaviour, pinned.
+
+    Written and passed against BASE-equivalent source BEFORE the shared
+    pre-dispatch refactor. These pins describe what the production path does
+    today -- including two deliberate asymmetries that are characterised here
+    and must NOT be silently repaired -- so the refactor is proven to be
+    behaviour-preserving rather than assumed to be.
+    """
+
+    RECORDERS = (
+        "role_lookups",
+        "text_lookups",
+        "clicks",
+        "trial_clicks",
+        "probe_timeouts",
+        "evaluations",
+        "expect_download_timeouts",
+        "download_dispatches",
+    )
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp_dir.name)
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def prepared(self, rows=("r1", "r2", "r3")):
+        portal, page, clock = surface_portal(SurfaceState(rows=list(rows)))
+        with simulated_clock(clock):
+            handles = portal.inventory(20)
+        for name in self.RECORDERS:
+            getattr(page, name).clear()
+        clock.ledger.clear()
+        return portal, page, clock, handles
+
+    def download(self, portal, clock, row, name="download.bin"):
+        with simulated_clock(clock):
+            return portal.download(row, self.root / name)
+
+    def test_the_production_dispatch_golden_is_unchanged(self) -> None:
+        """The exact inspection/dispatch sequence of one successful download."""
+        portal, page, clock, rows = self.prepared()
+        self.assertEqual(self.download(portal, clock, rows[1]), "2026-09-02_synthetic.pdf")
+        sentinels = [
+            (role, name, True)
+            for role in ("button", "link")
+            for name in ("Next page", "Next", "Previous page", "Load more")
+        ]
+        self.assertEqual(
+            page.role_lookups,
+            [("tab", "EB Bill", True), ("tab", "Tenant Bill", True)]
+            + sentinels
+            + [("table", None, False), ("row", None, False)]
+            + [("columnheader", None, False), ("button", "Download", True)] * 4
+            + [("button", "Download", True)]
+            + [("table", None, False), ("row", None, False), ("button", "Download", True)]
+            + [("table", None, False), ("row", None, False)]
+            + [("tab", "EB Bill", True), ("tab", "Tenant Bill", True)],
+        )
+        self.assertEqual(page.text_lookups, [(ResultsConfig.account_identity, True)])
+        self.assertEqual(len(page.evaluations), 1)
+        self.assertEqual(page.trial_clicks, ["row-download"])
+        self.assertEqual(page.clicks, ["row-download"])
+        self.assertEqual(page.probe_timeouts, [portal_module.MAX_PORTAL_PROBE_TIMEOUT_MS] * 11)
+        self.assertEqual(page.expect_download_timeouts, [ResultsConfig.timeout_seconds * 1000])
+        self.assertEqual(page.download_dispatches, [1])
+        self.assertEqual(clock.ledger, [], "a healthy surface pays no recovery wait")
+        self.assertFalse(portal._latched)
+
+    def test_a_witness_read_race_is_transient_in_inventory_but_immediate_before_dispatch(self) -> None:
+        """Characterised asymmetry: the same read race recovers in one path only."""
+        original = SurfaceLocator.evaluate_all
+
+        def racing(looks_to_race):
+            calls = {"n": 0}
+
+            def evaluate_all(self, expression, arg=None):
+                calls["n"] += 1
+                if calls["n"] <= looks_to_race:
+                    self.page.evaluations.append(expression)
+                    return []
+                return original(self, expression, arg)
+
+            return evaluate_all
+
+        # Inventory: the race is a not-ready look and the witness later settles.
+        portal, page, clock = surface_portal(SurfaceState(rows=["r1", "r2"]))
+        with mock.patch.object(SurfaceLocator, "evaluate_all", racing(1)), simulated_clock(clock):
+            rows = portal.inventory(20)
+        self.assertEqual(len(rows), 2)
+        self.assertGreater(len(clock.yields), 0, "inventory waited and looked again")
+
+        # Pre-dispatch: the same race on the first look fails at once and latches.
+        portal, page, clock, rows = self.prepared(rows=("r1", "r2"))
+        with mock.patch.object(SurfaceLocator, "evaluate_all", racing(1)):
+            with self.assertRaises(LayoutChangedError) as caught:
+                self.download(portal, clock, rows[0])
+        self.assertEqual(caught.exception.message, portal_module.RESULTS_SURFACE_CHANGED_MESSAGE)
+        self.assertEqual(clock.yields, [], "no recovery wait before the immediate failure")
+        self.assertTrue(portal._latched)
+        self.assertEqual(page.download_dispatches, [])
+
+    def test_the_final_row_recheck_is_one_shot_while_the_ladder_recovers_lag(self) -> None:
+        """Characterised asymmetry: a lagging row snapshot is lag in the ladder only."""
+        original = SurfaceLocator.aria_snapshot
+
+        def lagging(failing_calls):
+            calls = {"n": 0}
+
+            def aria_snapshot(self, timeout=None):
+                calls["n"] += 1
+                if calls["n"] in failing_calls:
+                    self.page.probe_timeouts.append(timeout)
+                    raise synthetic_timeout()
+                return original(self, timeout)
+
+            return aria_snapshot
+
+        # Header + 3 rows = 4 snapshots per ladder look; the 5th is the final
+        # one-shot recheck. A lag inside the first look is recovered.
+        portal, page, clock, rows = self.prepared()
+        with mock.patch.object(SurfaceLocator, "aria_snapshot", lagging({1})):
+            self.download(portal, clock, rows[0])
+        self.assertEqual(page.download_dispatches, [0])
+        self.assertGreater(len(clock.yields), 0)
+        self.assertFalse(portal._latched)
+
+        # The same lag at the one-shot recheck is final: latched, zero dispatch.
+        portal, page, clock, rows = self.prepared()
+        with mock.patch.object(SurfaceLocator, "aria_snapshot", lagging({5})):
+            with self.assertRaises(LayoutChangedError) as caught:
+                self.download(portal, clock, rows[0])
+        self.assertEqual(caught.exception.message, portal_module.RESULTS_SURFACE_CHANGED_MESSAGE)
+        self.assertEqual(clock.yields, [], "the recheck never re-looks")
+        self.assertTrue(portal._latched)
+        self.assertEqual(page.download_dispatches, [])
+
+    def test_handle_failures_do_not_latch_and_a_latched_portal_is_not_relatched(self) -> None:
+        """HANDLE semantics: the latch check precedes the handle check; neither writes."""
+        portal, page, clock, rows = self.prepared()
+        forged = portal_module.InvoiceRow(ordinal=7, binding=rows[0].binding)
+        with self.assertRaises(LayoutChangedError) as caught:
+            self.download(portal, clock, forged)
+        self.assertEqual(caught.exception.message, portal_module.RESULTS_ROW_HANDLE_MESSAGE)
+        self.assertFalse(portal._latched, "an invalid handle never latches")
+        self.assertEqual(page.role_lookups, [], "nothing is inspected for a bad handle")
+        self.assertTrue(self.download(portal, clock, rows[0]), "a later valid row still dispatches")
+        self.assertEqual(page.download_dispatches, [0])
+
+        portal, page, clock, rows = self.prepared()
+        portal._latched = True
+        writes: list[bool] = []
+        original_setattr = PlaywrightPortal.__setattr__
+
+        def recording_setattr(self, name, value):
+            if name == "_latched":
+                writes.append(value)
+            original_setattr(self, name, value)
+
+        with mock.patch.object(PlaywrightPortal, "__setattr__", recording_setattr):
+            for handle in (rows[0], forged, "row-0"):
+                with self.subTest(handle=repr(handle)):
+                    with self.assertRaises(LayoutChangedError) as caught:
+                        self.download(portal, clock, handle)
+                    self.assertEqual(caught.exception.message, portal_module.RESULTS_LATCHED_MESSAGE)
+        self.assertEqual(writes, [], "the latched state is preserved, never re-written")
+        self.assertEqual(page.role_lookups, [])
+        self.assertEqual(page.download_dispatches, [])
+
+    def test_every_pre_dispatch_surface_failure_latches(self) -> None:
+        """Only the surface/recheck family latches; it latches on every member."""
+        mutations = {
+            "topology": lambda state: setattr(state, "extra_pages", 1),
+            "tab": lambda state: (setattr(state, "eb_selected", False), setattr(state, "tenant_selected", True)),
+            "witness": lambda state: setattr(state, "witnesses", [True, True]),
+            "pagination": lambda state: setattr(state, "pagination", {("link", "Next")}),
+            "snapshot": lambda state: state.rows.reverse(),
+            "invalid": lambda state: setattr(state, "snapshot_error", RuntimeError("private ACCT-778899")),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(drift=label):
+                portal, page, clock, rows = self.prepared()
+                mutate(page.state)
+                with self.assertRaises(LayoutChangedError) as caught:
+                    self.download(portal, clock, rows[0])
+                self.assertEqual(caught.exception.message, portal_module.RESULTS_SURFACE_CHANGED_MESSAGE)
+                self.assertEqual(caught.exception.status, PORTAL_LAYOUT_CHANGED)
+                self.assertEqual(caught.exception.exit_code, 20)
+                self.assertFalse(caught.exception.retryable)
+                self.assertTrue(portal._latched)
+                self.assertEqual(page.download_dispatches, [])
+
+
+def _surface_mutation(**changes):
+    def mutate(state: SurfaceState) -> None:
+        for key, value in changes.items():
+            if not hasattr(state, key):
+                raise AttributeError(key)
+            setattr(state, key, value)
+
+    return mutate
+
+
+# reason -> the post-inventory surface mutation that reaches it. HANDLE reasons
+# are driven by the handle / latch itself, not by the surface.
+PREFLIGHT_REASON_SCENARIOS = {
+    "TOPOLOGY_NOT_UNIQUE": _surface_mutation(extra_pages=1),
+    "TAB_UNSELECTED": _surface_mutation(eb_selected=False, tenant_selected=True),
+    "TAB_AMBIGUOUS": _surface_mutation(eb_tab_count=2),
+    "TAB_ABSENT": _surface_mutation(eb_tab_count=0),
+    "TAB_CONTRADICTORY": _surface_mutation(tenant_selected=True),
+    "WITNESS_MULTIPLE": _surface_mutation(witnesses=[True, True]),
+    "WITNESS_READ_RACE": _surface_mutation(witness_flag_override=[]),
+    "WITNESS_ABSENT": _surface_mutation(witnesses=[False]),
+    "RESULTS_PAGINATION_PRESENT": _surface_mutation(pagination={("button", "Load more")}),
+    "RESULTS_CEILING_EXCEEDED": lambda state: state.rows.extend(f"extra {i}" for i in range(25)),
+    "RESULTS_ROWCOUNT_INVALID": _surface_mutation(aria_rowcount="many"),
+    "RESULTS_ROW_SNAPSHOT_INVALID": _surface_mutation(snapshot_error=RuntimeError("private ACCT-778899")),
+    "RESULTS_TABLE_ABSENT": _surface_mutation(tables=0),
+    "RESULTS_TABLE_AMBIGUOUS": _surface_mutation(tables=2),
+    "RESULTS_ROWS_ABSENT": _surface_mutation(rows_absent=True),
+    "RESULTS_HEADER_NO_COLUMNHEADER": _surface_mutation(header_columnheaders=0),
+    "RESULTS_HEADER_HAS_DOWNLOAD": _surface_mutation(header_download_buttons=1),
+    "RESULTS_HEADER_ONLY": _surface_mutation(rows=[]),
+    "RESULTS_ROW_HEADER_CELL": _surface_mutation(row_columnheaders={1: 1}),
+    "RESULTS_ROW_DOWNLOAD_COUNT": _surface_mutation(download_buttons={1: 2}),
+    "RESULTS_DOWNLOAD_COUNT_MISMATCH": _surface_mutation(stray_download_buttons=1),
+    "RESULTS_ROWCOUNT_UNREAD": _surface_mutation(rowcount_timeout=True),
+    "RESULTS_ROWCOUNT_MISMATCH": _surface_mutation(aria_rowcount="9"),
+    "RESULTS_ROW_SNAPSHOT_NOT_READY": _surface_mutation(snapshot_error=synthetic_timeout()),
+    "RESULTS_ROW_SNAPSHOT_DUPLICATE": _surface_mutation(rows=["same", "same", "same"]),
+    "SNAPSHOT_MISMATCH": lambda state: state.rows.reverse(),
+    "CONTROL_COUNT_MISMATCH": _surface_mutation(control_count=0),
+    "CONTROL_NOT_VISIBLE": _surface_mutation(control_visible=False),
+    "CONTROL_NOT_ENABLED": _surface_mutation(control_enabled=False),
+    "CONTROL_NOT_ACTIONABLE": _surface_mutation(control_actionable=False),
+    "ROW_RECHECK_NOT_READY": _surface_mutation(recheck="timeout"),
+    "ROW_RECHECK_MISMATCH": _surface_mutation(recheck="mismatch"),
+    "ROW_RECHECK_INVALID": _surface_mutation(recheck="invalid"),
+    "PROBE_ERROR": _surface_mutation(control_trial_error=RuntimeError("private https://portal.example.invalid")),
+}
+
+
+class DownloadPreflightReachabilityTests(unittest.TestCase):
+    """Every one of the 36 closed reasons, through production and the diagnostic."""
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp_dir.name)
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def prepared(self):
+        portal, page, clock = surface_portal(SurfaceState(rows=["r1", "r2", "r3"]))
+        with simulated_clock(clock):
+            rows = portal.inventory(20)
+        page.clicks.clear()
+        page.trial_clicks.clear()
+        return portal, page, clock, rows
+
+    def assert_zero_dispatch(self, page) -> None:
+        self.assertEqual(page.download_dispatches, [])
+        self.assertNotIn("row-download", page.clicks)
+        self.assertEqual(page.expect_download_timeouts, [])
+
+    def assert_evidence(self, evidence, reason: str) -> None:
+        kind = portal_module.DOWNLOAD_PREFLIGHT_REASON_KINDS[reason]
+        self.assertEqual(evidence.reason_code, reason)
+        if reason != portal_module.PREFLIGHT_PROBE_ERROR:
+            self.assertEqual(evidence.last_checkpoint, portal_module.DOWNLOAD_PREFLIGHT_REASON_CHECKPOINTS[reason])
+        self.assertIn(evidence.last_checkpoint, portal_module.DOWNLOAD_PREFLIGHT_CHECKPOINTS)
+        self.assertIs(evidence.window_expired, kind == portal_module.PREFLIGHT_WINDOW)
+        if kind == portal_module.PREFLIGHT_WINDOW:
+            self.assertEqual(evidence.not_ready_looks, len(portal_module.PORTAL_RECOVERY_ATTEMPTS_MS))
+        else:
+            self.assertEqual(evidence.not_ready_looks, 0)
+            self.assertEqual(evidence.elapsed_bucket, "LT_250MS")
+        self.assertIn(evidence.elapsed_bucket, portal_module.DOWNLOAD_PREFLIGHT_ELAPSED_BUCKETS)
+        self.assertEqual(evidence.snapshot is not None, reason == "SNAPSHOT_MISMATCH")
+
+    def test_the_taxonomy_is_exactly_11_checkpoints_and_36_reasons(self) -> None:
+        self.assertEqual(
+            portal_module.DOWNLOAD_PREFLIGHT_CHECKPOINTS,
+            (
+                "HANDLE", "TOPOLOGY", "TAB_STATE", "ACCOUNT_WITNESS", "RESULTS_SURFACE",
+                "SNAPSHOT_COMPARE", "CONTROL_RESOLVE", "CONTROL_VISIBLE", "CONTROL_ENABLED",
+                "CONTROL_ACTIONABLE", "ROW_IDENTITY_RECHECK",
+            ),
+        )
+        self.assertEqual(len(portal_module.DOWNLOAD_PREFLIGHT_REASONS), 36)
+        self.assertEqual(len(set(portal_module.DOWNLOAD_PREFLIGHT_REASONS)), 36)
+        self.assertEqual(portal_module.DOWNLOAD_PREFLIGHT_REASONS[-1], "PROBE_ERROR")
+        self.assertEqual(
+            set(portal_module.DOWNLOAD_PREFLIGHT_REASONS),
+            set(PREFLIGHT_REASON_SCENARIOS) | {"PORTAL_LATCHED", "ROW_HANDLE_INVALID"},
+        )
+        immediate = {
+            "PORTAL_LATCHED", "ROW_HANDLE_INVALID", "TOPOLOGY_NOT_UNIQUE", "TAB_UNSELECTED",
+            "TAB_AMBIGUOUS", "WITNESS_MULTIPLE", "WITNESS_READ_RACE", "RESULTS_PAGINATION_PRESENT",
+            "RESULTS_CEILING_EXCEEDED", "RESULTS_ROWCOUNT_INVALID", "RESULTS_ROW_SNAPSHOT_INVALID",
+            "SNAPSHOT_MISMATCH", "ROW_RECHECK_NOT_READY", "ROW_RECHECK_MISMATCH",
+            "ROW_RECHECK_INVALID", "PROBE_ERROR",
+        }
+        for reason, kind in portal_module.DOWNLOAD_PREFLIGHT_REASON_KINDS.items():
+            with self.subTest(reason=reason):
+                expected = portal_module.PREFLIGHT_IMMEDIATE if reason in immediate else portal_module.PREFLIGHT_WINDOW
+                self.assertEqual(kind, expected)
+
+    def test_every_surface_reason_is_reachable_through_production_download(self) -> None:
+        for reason, mutate in PREFLIGHT_REASON_SCENARIOS.items():
+            with self.subTest(reason=reason):
+                portal, page, clock, rows = self.prepared()
+                mutate(page.state)
+                with simulated_clock(clock), self.assertRaises(portal_module.DownloadPreflightError) as caught:
+                    portal.download(rows[0], self.root / "x.bin")
+                error = caught.exception
+                self.assertIsInstance(error, LayoutChangedError)
+                self.assertEqual(error.message, portal_module.RESULTS_SURFACE_CHANGED_MESSAGE)
+                self.assertEqual((error.status, error.exit_code, error.retryable), (PORTAL_LAYOUT_CHANGED, 20, False))
+                self.assert_evidence(error.evidence, reason)
+                self.assertEqual(error.evidence.row_ordinal, 0)
+                self.assertTrue(portal._latched, "the surface/recheck family latches")
+                self.assert_zero_dispatch(page)
+
+    def test_every_surface_reason_is_reachable_through_the_diagnostic(self) -> None:
+        for reason, mutate in PREFLIGHT_REASON_SCENARIOS.items():
+            with self.subTest(reason=reason):
+                portal, page, clock, rows = self.prepared()
+                mutate(page.state)
+                with simulated_clock(clock):
+                    result = portal.download_preflight(rows)
+                self.assertIsInstance(result, portal_module.DownloadPreflightDiagnosticResult)
+                self.assertEqual(result.rows_passed, 0, "stops at the first failing row")
+                self.assertFalse(result.download_dispatched)
+                self.assert_evidence(result.failure, reason)
+                self.assertEqual(result.failure.row_ordinal, 0)
+                self.assertTrue(portal._latched, "the same production latch effect")
+                self.assert_zero_dispatch(page)
+
+    def test_the_handle_reasons_keep_their_exact_latch_semantics(self) -> None:
+        portal, page, clock, rows = self.prepared()
+        forged = portal_module.InvoiceRow(ordinal=9, binding=rows[0].binding)
+        for label, call in (
+            ("production", lambda: portal.download(forged, self.root / "x.bin")),
+            ("diagnostic", lambda: portal.download_preflight([forged])),
+        ):
+            with self.subTest(path=label):
+                with simulated_clock(clock):
+                    if label == "production":
+                        with self.assertRaises(portal_module.DownloadPreflightError) as caught:
+                            call()
+                        evidence = caught.exception.evidence
+                        self.assertEqual(caught.exception.message, portal_module.RESULTS_ROW_HANDLE_MESSAGE)
+                    else:
+                        evidence = call().failure
+                self.assert_evidence(evidence, "ROW_HANDLE_INVALID")
+                self.assertEqual(evidence.row_ordinal, 9)
+                self.assertFalse(portal._latched, "ROW_HANDLE_INVALID never latches")
+        for handle in ("row-0", portal_module.InvoiceRow(ordinal=True, binding=rows[0].binding)):
+            with simulated_clock(clock), self.assertRaises(portal_module.DownloadPreflightError) as caught:
+                portal.download(handle, self.root / "x.bin")
+            self.assertIsNone(caught.exception.evidence.row_ordinal, "no ordinal is invented")
+
+        portal._latched = True
+        writes: list[bool] = []
+        original_setattr = PlaywrightPortal.__setattr__
+
+        def recording_setattr(self, name, value):
+            if name == "_latched":
+                writes.append(value)
+            original_setattr(self, name, value)
+
+        with mock.patch.object(PlaywrightPortal, "__setattr__", recording_setattr), simulated_clock(clock):
+            with self.assertRaises(portal_module.DownloadPreflightError) as caught:
+                portal.download(rows[0], self.root / "x.bin")
+            diagnostic = portal.download_preflight(rows)
+        self.assertEqual(caught.exception.message, portal_module.RESULTS_LATCHED_MESSAGE)
+        self.assert_evidence(caught.exception.evidence, "PORTAL_LATCHED")
+        self.assert_evidence(diagnostic.failure, "PORTAL_LATCHED")
+        self.assertEqual(diagnostic.rows_passed, 0)
+        self.assertEqual(writes, [], "PORTAL_LATCHED performs no latch write")
+        self.assert_zero_dispatch(page)
+
+    def test_control_evidence_reports_how_far_the_last_look_got(self) -> None:
+        cases = {
+            "CONTROL_COUNT_MISMATCH": {"count_bucket": 0, "visible": None, "enabled": None, "trial_actionability": "NOT_REACHED"},
+            "CONTROL_NOT_VISIBLE": {"count_bucket": 1, "visible": False, "enabled": None, "trial_actionability": "NOT_REACHED"},
+            "CONTROL_NOT_ENABLED": {"count_bucket": 1, "visible": True, "enabled": False, "trial_actionability": "NOT_REACHED"},
+            "CONTROL_NOT_ACTIONABLE": {"count_bucket": 1, "visible": True, "enabled": True, "trial_actionability": "TIMEOUT"},
+            "PROBE_ERROR": {"count_bucket": 1, "visible": True, "enabled": True, "trial_actionability": "ERROR"},
+            "TAB_ABSENT": {"count_bucket": None, "visible": None, "enabled": None, "trial_actionability": "NOT_REACHED"},
+        }
+        for reason, expected in cases.items():
+            with self.subTest(reason=reason):
+                portal, page, clock, rows = self.prepared()
+                PREFLIGHT_REASON_SCENARIOS[reason](page.state)
+                with simulated_clock(clock):
+                    evidence = portal.download_preflight(rows).failure
+                self.assertEqual(evidence.control.as_public_dict(), expected)
+                if reason == "PROBE_ERROR":
+                    self.assertEqual(evidence.last_checkpoint, "CONTROL_ACTIONABLE")
+        portal, page, clock, rows = self.prepared()
+        page.state.control_count = 2
+        with simulated_clock(clock):
+            evidence = portal.download_preflight(rows).failure
+        self.assertEqual(evidence.control.count_bucket, ">1")
+        portal, page, clock, rows = self.prepared()
+        page.state.control_enabled_error = RuntimeError("private")
+        with simulated_clock(clock):
+            evidence = portal.download_preflight(rows).failure
+        self.assertEqual((evidence.reason_code, evidence.last_checkpoint), ("PROBE_ERROR", "CONTROL_ENABLED"))
+        self.assertIsNone(evidence.control.enabled)
+
+    def test_snapshot_evidence_compares_without_any_digest(self) -> None:
+        portal, page, clock, rows = self.prepared()
+        page.state.rows.reverse()
+        with simulated_clock(clock):
+            evidence = portal.download_preflight(rows).failure
+        self.assertEqual(
+            evidence.snapshot.as_public_dict(),
+            {"row_count_equal": True, "header_equal": True, "rows_equal_as_set": True, "changed_row_count": 2},
+        )
+        portal, page, clock, rows = self.prepared()
+        page.state.header_text = "Invoice Action Status"
+        page.state.rows.append("r4")
+        with simulated_clock(clock):
+            evidence = portal.download_preflight(rows).failure
+        self.assertEqual(
+            evidence.snapshot.as_public_dict(),
+            {"row_count_equal": False, "header_equal": False, "rows_equal_as_set": False, "changed_row_count": 1},
+        )
+
+    def test_the_diagnostic_passes_every_row_and_then_latches(self) -> None:
+        portal, page, clock, rows = self.prepared()
+        spy_calls: list[int] = []
+        original = PlaywrightPortal._pre_dispatch
+
+        def spy(self, row, trace):
+            spy_calls.append(row.ordinal)
+            return original(self, row, trace)
+
+        latched_during: list[bool] = []
+        original_reprove = PlaywrightPortal._reprove_frozen_surface
+
+        def reprove(self, *args, **kwargs):
+            latched_during.append(self._latched)
+            return original_reprove(self, *args, **kwargs)
+
+        with mock.patch.object(PlaywrightPortal, "_pre_dispatch", spy), \
+                mock.patch.object(PlaywrightPortal, "_reprove_frozen_surface", reprove), simulated_clock(clock):
+            result = portal.download_preflight(rows)
+        self.assertEqual(result, portal_module.DownloadPreflightDiagnosticResult(rows_passed=3))
+        self.assertEqual(spy_calls, [0, 1, 2], "the one shared proof, once per row, in order")
+        self.assertEqual(latched_during, [False, False, False], "latched only after the whole inspection")
+        self.assertTrue(portal._latched)
+        self.assertEqual(page.trial_clicks, ["row-download"] * 3, "trial actionability only")
+        self.assert_zero_dispatch(page)
+        with simulated_clock(clock), self.assertRaises(portal_module.DownloadPreflightError) as caught:
+            portal.download(rows[0], self.root / "x.bin")
+        self.assertEqual(caught.exception.evidence.reason_code, "PORTAL_LATCHED")
+        self.assert_zero_dispatch(page)
+
+    def test_the_diagnostic_stops_at_the_first_failing_row(self) -> None:
+        portal, page, clock, rows = self.prepared()
+        page.state.control_ordinals = {1}
+        page.state.control_visible = False
+        calls: list[int] = []
+        original = PlaywrightPortal._pre_dispatch
+
+        def spy(self, row, trace):
+            calls.append(row.ordinal)
+            return original(self, row, trace)
+
+        with mock.patch.object(PlaywrightPortal, "_pre_dispatch", spy), simulated_clock(clock):
+            result = portal.download_preflight(rows)
+        self.assertEqual(calls, [0, 1], "row 2 is never inspected")
+        self.assertEqual(result.rows_passed, 1)
+        self.assertEqual((result.failure.row_ordinal, result.failure.reason_code), (1, "CONTROL_NOT_VISIBLE"))
+        self.assert_zero_dispatch(page)
+
+    def test_a_production_success_still_dispatches_through_the_shared_proof(self) -> None:
+        portal, page, clock, rows = self.prepared()
+        calls: list[int] = []
+        original = PlaywrightPortal._pre_dispatch
+
+        def spy(self, row, trace):
+            calls.append(row.ordinal)
+            return original(self, row, trace)
+
+        with mock.patch.object(PlaywrightPortal, "_pre_dispatch", spy), simulated_clock(clock):
+            names = [portal.download(row, self.root / f"{row.ordinal}.bin") for row in rows]
+        self.assertEqual(calls, [0, 1, 2])
+        self.assertEqual(page.download_dispatches, [0, 1, 2])
+        self.assertEqual(len(set(names)), 3)
+        self.assertFalse(portal._latched)
+
+    def test_no_private_value_reaches_the_error_or_its_evidence(self) -> None:
+        private = (PRIVATE_ROW_TEXT, "ACCT-778899", ResultsConfig.account_identity, "portal.example.invalid", "SyntheticTimeoutError", "RuntimeError")
+        closed = (
+            set(portal_module.DOWNLOAD_PREFLIGHT_REASONS)
+            | set(portal_module.DOWNLOAD_PREFLIGHT_CHECKPOINTS)
+            | set(portal_module.DOWNLOAD_PREFLIGHT_ELAPSED_BUCKETS)
+            | set(portal_module.DOWNLOAD_PREFLIGHT_TRIAL_OUTCOMES)
+            | {">1"}
+        )
+
+        def strings(value):
+            if isinstance(value, dict):
+                for item in value.values():
+                    yield from strings(item)
+            elif isinstance(value, str):
+                yield value
+
+        for reason, mutate in PREFLIGHT_REASON_SCENARIOS.items():
+            with self.subTest(reason=reason):
+                portal, page, clock = surface_portal(SurfaceState(rows=[PRIVATE_ROW_TEXT, "r2", "r3"]))
+                with simulated_clock(clock):
+                    rows = portal.inventory(20)
+                mutate(page.state)
+                with simulated_clock(clock), self.assertRaises(portal_module.DownloadPreflightError) as caught:
+                    portal.download(rows[0], self.root / "x.bin")
+                public = caught.exception.evidence.as_public_dict()
+                text = json.dumps(public) + repr(caught.exception) + repr(caught.exception.evidence) + caught.exception.message
+                for fragment in private:
+                    self.assertNotIn(fragment, text)
+                self.assertTrue(set(strings(public)) <= closed)
+                for digest in portal._frozen_rows:
+                    self.assertNotIn(digest.hex(), text)
+
+    def test_the_diagnostic_shares_the_production_proof_and_never_dispatches(self) -> None:
+        """Static sharing checks: one proof, no second ladder, no Download."""
+        source = pathlib_read_portal_source()
+        self.assertEqual(source.count("def _pre_dispatch("), 1)
+        self.assertEqual(source.count("def _reprove_frozen_surface("), 1)
+        download = source[source.index("    def download(self"):source.index("    def _require_post_download_surface")]
+        self.assertEqual(download.count("self._pre_dispatch("), 1)
+        self.assertEqual(download.count("_reprove_frozen_surface"), 0, "download no longer owns the ladder")
+        diagnostic = source[source.index("    def download_preflight("):source.index("    def _reprove_frozen_surface(")]
+        self.assertEqual(diagnostic.count("self._pre_dispatch("), 1)
+        for forbidden in (
+            ".click(", "expect_download", "save_as", "_reprove_frozen_surface(", "_row_identity(",
+            "get_by_role", "_read_results_surface", "_account_witness_count", "_eb_bill_tab_state",
+            "wait_for_timeout", "_recover(",
+        ):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, diagnostic)
+        self.assertEqual(diagnostic.count("self._latched = True"), 1)
+        pre = source[source.index("    def _pre_dispatch("):source.index("    def download_preflight(")]
+        self.assertNotIn(".click(", pre)
+        self.assertNotIn("expect_download", pre)
+        self.assertEqual(pre.count("self._latched = True"), 1, "one latch write, on the surface family only")
 
 
 class SingleSurfaceSourceIsolationTests(unittest.TestCase):
