@@ -2881,6 +2881,201 @@ class SingleSurfaceDownloadTests(unittest.TestCase):
             self.assertNotIn(private, text)
 
 
+class DownloadPreDispatchCharacterisationTests(unittest.TestCase):
+    """DL-XB-199-DOWNLOAD-PREFLIGHT G3-084 Phase 1: current behaviour, pinned.
+
+    Written and passed against BASE-equivalent source BEFORE the shared
+    pre-dispatch refactor. These pins describe what the production path does
+    today -- including two deliberate asymmetries that are characterised here
+    and must NOT be silently repaired -- so the refactor is proven to be
+    behaviour-preserving rather than assumed to be.
+    """
+
+    RECORDERS = (
+        "role_lookups",
+        "text_lookups",
+        "clicks",
+        "trial_clicks",
+        "probe_timeouts",
+        "evaluations",
+        "expect_download_timeouts",
+        "download_dispatches",
+    )
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp_dir.name)
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def prepared(self, rows=("r1", "r2", "r3")):
+        portal, page, clock = surface_portal(SurfaceState(rows=list(rows)))
+        with simulated_clock(clock):
+            handles = portal.inventory(20)
+        for name in self.RECORDERS:
+            getattr(page, name).clear()
+        clock.ledger.clear()
+        return portal, page, clock, handles
+
+    def download(self, portal, clock, row, name="download.bin"):
+        with simulated_clock(clock):
+            return portal.download(row, self.root / name)
+
+    def test_the_production_dispatch_golden_is_unchanged(self) -> None:
+        """The exact inspection/dispatch sequence of one successful download."""
+        portal, page, clock, rows = self.prepared()
+        self.assertEqual(self.download(portal, clock, rows[1]), "2026-09-02_synthetic.pdf")
+        sentinels = [
+            (role, name, True)
+            for role in ("button", "link")
+            for name in ("Next page", "Next", "Previous page", "Load more")
+        ]
+        self.assertEqual(
+            page.role_lookups,
+            [("tab", "EB Bill", True), ("tab", "Tenant Bill", True)]
+            + sentinels
+            + [("table", None, False), ("row", None, False)]
+            + [("columnheader", None, False), ("button", "Download", True)] * 4
+            + [("button", "Download", True)]
+            + [("table", None, False), ("row", None, False), ("button", "Download", True)]
+            + [("table", None, False), ("row", None, False)]
+            + [("tab", "EB Bill", True), ("tab", "Tenant Bill", True)],
+        )
+        self.assertEqual(page.text_lookups, [(ResultsConfig.account_identity, True)])
+        self.assertEqual(len(page.evaluations), 1)
+        self.assertEqual(page.trial_clicks, ["row-download"])
+        self.assertEqual(page.clicks, ["row-download"])
+        self.assertEqual(page.probe_timeouts, [portal_module.MAX_PORTAL_PROBE_TIMEOUT_MS] * 11)
+        self.assertEqual(page.expect_download_timeouts, [ResultsConfig.timeout_seconds * 1000])
+        self.assertEqual(page.download_dispatches, [1])
+        self.assertEqual(clock.ledger, [], "a healthy surface pays no recovery wait")
+        self.assertFalse(portal._latched)
+
+    def test_a_witness_read_race_is_transient_in_inventory_but_immediate_before_dispatch(self) -> None:
+        """Characterised asymmetry: the same read race recovers in one path only."""
+        original = SurfaceLocator.evaluate_all
+
+        def racing(looks_to_race):
+            calls = {"n": 0}
+
+            def evaluate_all(self, expression, arg=None):
+                calls["n"] += 1
+                if calls["n"] <= looks_to_race:
+                    self.page.evaluations.append(expression)
+                    return []
+                return original(self, expression, arg)
+
+            return evaluate_all
+
+        # Inventory: the race is a not-ready look and the witness later settles.
+        portal, page, clock = surface_portal(SurfaceState(rows=["r1", "r2"]))
+        with mock.patch.object(SurfaceLocator, "evaluate_all", racing(1)), simulated_clock(clock):
+            rows = portal.inventory(20)
+        self.assertEqual(len(rows), 2)
+        self.assertGreater(len(clock.yields), 0, "inventory waited and looked again")
+
+        # Pre-dispatch: the same race on the first look fails at once and latches.
+        portal, page, clock, rows = self.prepared(rows=("r1", "r2"))
+        with mock.patch.object(SurfaceLocator, "evaluate_all", racing(1)):
+            with self.assertRaises(LayoutChangedError) as caught:
+                self.download(portal, clock, rows[0])
+        self.assertEqual(caught.exception.message, portal_module.RESULTS_SURFACE_CHANGED_MESSAGE)
+        self.assertEqual(clock.yields, [], "no recovery wait before the immediate failure")
+        self.assertTrue(portal._latched)
+        self.assertEqual(page.download_dispatches, [])
+
+    def test_the_final_row_recheck_is_one_shot_while_the_ladder_recovers_lag(self) -> None:
+        """Characterised asymmetry: a lagging row snapshot is lag in the ladder only."""
+        original = SurfaceLocator.aria_snapshot
+
+        def lagging(failing_calls):
+            calls = {"n": 0}
+
+            def aria_snapshot(self, timeout=None):
+                calls["n"] += 1
+                if calls["n"] in failing_calls:
+                    self.page.probe_timeouts.append(timeout)
+                    raise synthetic_timeout()
+                return original(self, timeout)
+
+            return aria_snapshot
+
+        # Header + 3 rows = 4 snapshots per ladder look; the 5th is the final
+        # one-shot recheck. A lag inside the first look is recovered.
+        portal, page, clock, rows = self.prepared()
+        with mock.patch.object(SurfaceLocator, "aria_snapshot", lagging({1})):
+            self.download(portal, clock, rows[0])
+        self.assertEqual(page.download_dispatches, [0])
+        self.assertGreater(len(clock.yields), 0)
+        self.assertFalse(portal._latched)
+
+        # The same lag at the one-shot recheck is final: latched, zero dispatch.
+        portal, page, clock, rows = self.prepared()
+        with mock.patch.object(SurfaceLocator, "aria_snapshot", lagging({5})):
+            with self.assertRaises(LayoutChangedError) as caught:
+                self.download(portal, clock, rows[0])
+        self.assertEqual(caught.exception.message, portal_module.RESULTS_SURFACE_CHANGED_MESSAGE)
+        self.assertEqual(clock.yields, [], "the recheck never re-looks")
+        self.assertTrue(portal._latched)
+        self.assertEqual(page.download_dispatches, [])
+
+    def test_handle_failures_do_not_latch_and_a_latched_portal_is_not_relatched(self) -> None:
+        """HANDLE semantics: the latch check precedes the handle check; neither writes."""
+        portal, page, clock, rows = self.prepared()
+        forged = portal_module.InvoiceRow(ordinal=7, binding=rows[0].binding)
+        with self.assertRaises(LayoutChangedError) as caught:
+            self.download(portal, clock, forged)
+        self.assertEqual(caught.exception.message, portal_module.RESULTS_ROW_HANDLE_MESSAGE)
+        self.assertFalse(portal._latched, "an invalid handle never latches")
+        self.assertEqual(page.role_lookups, [], "nothing is inspected for a bad handle")
+        self.assertTrue(self.download(portal, clock, rows[0]), "a later valid row still dispatches")
+        self.assertEqual(page.download_dispatches, [0])
+
+        portal, page, clock, rows = self.prepared()
+        portal._latched = True
+        writes: list[bool] = []
+        original_setattr = PlaywrightPortal.__setattr__
+
+        def recording_setattr(self, name, value):
+            if name == "_latched":
+                writes.append(value)
+            original_setattr(self, name, value)
+
+        with mock.patch.object(PlaywrightPortal, "__setattr__", recording_setattr):
+            for handle in (rows[0], forged, "row-0"):
+                with self.subTest(handle=repr(handle)):
+                    with self.assertRaises(LayoutChangedError) as caught:
+                        self.download(portal, clock, handle)
+                    self.assertEqual(caught.exception.message, portal_module.RESULTS_LATCHED_MESSAGE)
+        self.assertEqual(writes, [], "the latched state is preserved, never re-written")
+        self.assertEqual(page.role_lookups, [])
+        self.assertEqual(page.download_dispatches, [])
+
+    def test_every_pre_dispatch_surface_failure_latches(self) -> None:
+        """Only the surface/recheck family latches; it latches on every member."""
+        mutations = {
+            "topology": lambda state: setattr(state, "extra_pages", 1),
+            "tab": lambda state: (setattr(state, "eb_selected", False), setattr(state, "tenant_selected", True)),
+            "witness": lambda state: setattr(state, "witnesses", [True, True]),
+            "pagination": lambda state: setattr(state, "pagination", {("link", "Next")}),
+            "snapshot": lambda state: state.rows.reverse(),
+            "invalid": lambda state: setattr(state, "snapshot_error", RuntimeError("private ACCT-778899")),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(drift=label):
+                portal, page, clock, rows = self.prepared()
+                mutate(page.state)
+                with self.assertRaises(LayoutChangedError) as caught:
+                    self.download(portal, clock, rows[0])
+                self.assertEqual(caught.exception.message, portal_module.RESULTS_SURFACE_CHANGED_MESSAGE)
+                self.assertEqual(caught.exception.status, PORTAL_LAYOUT_CHANGED)
+                self.assertEqual(caught.exception.exit_code, 20)
+                self.assertFalse(caught.exception.retryable)
+                self.assertTrue(portal._latched)
+                self.assertEqual(page.download_dispatches, [])
+
+
 class SingleSurfaceSourceIsolationTests(unittest.TestCase):
     """The production section depends on none of the retired contracts."""
 
