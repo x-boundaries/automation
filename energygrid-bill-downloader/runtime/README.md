@@ -93,11 +93,16 @@ it. `run` and `list` are unchanged.
 no-Download pre-dispatch diagnostic: canonical login, the production inventory, then the
 one shared production pre-dispatch proof over every row in order. It never clicks
 Download, creates no state, log, temp or archive artefact, and emits one
-`energygrid.download_preflight_diagnostic.v1` document. It reuses the existing credential
+`energygrid.download_preflight_diagnostic.v2` document (DL-XB-199 G3-092; it supersedes
+`energygrid.download_preflight_diagnostic.v1` with the same top-level keys and one
+diagnostic-only `failure.surface_scan` object, non-null only for
+`RESULTS_ROW_DOWNLOAD_COUNT`, that never enters `invoice_failure` logs). It reuses the existing credential
 import and injection unchanged and adds no parameter: the child vector is the same fixed
 five elements. The installed launcher on a host keeps its previously admitted allowlist
 until a separately authorised republish, re-admission and `ValidateOnly` accept the new
-launcher bytes; changing this source file deploys nothing.
+launcher bytes; changing this source file deploys nothing. An installed launcher,
+checkout or live-diagnostic bundle built for `v1` must be newly reviewed, rebuilt,
+republished and re-admitted before any future live diagnostic.
 
 `-ExpectedBranch` is mandatory with an explicit `ANY_BRANCH` sentinel rather than optional,
 so branch binding is never disabled by omitting an argument.

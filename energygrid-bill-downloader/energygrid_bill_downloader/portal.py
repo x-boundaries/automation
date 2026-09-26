@@ -520,6 +520,36 @@ class DownloadPreflightSnapshot:
 
 
 @dataclass(frozen=True)
+class DownloadPreflightSurfaceScan:
+    """Which surface role-row failed the per-row Download census; never its text.
+
+    Diagnostic-only (schema v2), present only for `RESULTS_ROW_DOWNLOAD_COUNT`.
+    `offending_surface_row_ordinal` is the zero-based position among the
+    non-header role rows the whole-table scan saw at the final such look; it
+    is deliberately distinct from the evidence's handle `row_ordinal`.
+    `offending_witness_looks` counts the consecutive tail looks that saw the
+    identical `(ordinal, bucket)` witness, and
+    `offending_row_changed_between_looks` is true iff any two looks that
+    recorded this reason saw differing witnesses.
+    """
+
+    offending_surface_row_ordinal: int
+    offending_download_count_bucket: int | str
+    surface_row_count_equal_frozen: bool
+    offending_witness_looks: int
+    offending_row_changed_between_looks: bool
+
+    def as_public_dict(self) -> dict[str, Any]:
+        return {
+            "offending_surface_row_ordinal": self.offending_surface_row_ordinal,
+            "offending_download_count_bucket": self.offending_download_count_bucket,
+            "surface_row_count_equal_frozen": self.surface_row_count_equal_frozen,
+            "offending_witness_looks": self.offending_witness_looks,
+            "offending_row_changed_between_looks": self.offending_row_changed_between_looks,
+        }
+
+
+@dataclass(frozen=True)
 class DownloadPreflightEvidence:
     """The frozen public-safe record of one pre-dispatch failure.
 
@@ -535,6 +565,7 @@ class DownloadPreflightEvidence:
     elapsed_bucket: str
     control: DownloadPreflightControl = field(default_factory=DownloadPreflightControl)
     snapshot: DownloadPreflightSnapshot | None = None
+    surface_scan: DownloadPreflightSurfaceScan | None = None
 
     def as_public_dict(self) -> dict[str, Any]:
         return {
@@ -546,6 +577,7 @@ class DownloadPreflightEvidence:
             "elapsed_bucket": self.elapsed_bucket,
             "control": self.control.as_public_dict(),
             "snapshot": None if self.snapshot is None else self.snapshot.as_public_dict(),
+            "surface_scan": None if self.surface_scan is None else self.surface_scan.as_public_dict(),
         }
 
 
@@ -569,6 +601,11 @@ class _PreDispatchTrace:
     marks each checkpoint it reaches, each not-ready look, and the one
     immediate reason a hard contradiction raised with. It never decides
     anything: every predicate, order and timeout stays in the production code.
+
+    For `RESULTS_ROW_DOWNLOAD_COUNT` it also keeps a bounded running summary
+    of the per-look surface-scan witness -- only a bounded ordinal, a fixed
+    count bucket and booleans, never row text, a locator or a digest -- from
+    which `surface_scan` is derived.
     """
 
     def __init__(self) -> None:
@@ -580,6 +617,15 @@ class _PreDispatchTrace:
         self.window_expired = False
         self.control = DownloadPreflightControl()
         self.snapshot: DownloadPreflightSnapshot | None = None
+        # Row-Download-count witness: the pending one of the current look, the
+        # tail run of identical witnesses, the first one seen and whether any
+        # later one differed. Witnesses are `(ordinal, bucket)` pairs only.
+        self._row_count_pending: tuple[int, int | str, bool] | None = None
+        self._row_count_tail: tuple[int, int | str] | None = None
+        self._row_count_tail_looks = 0
+        self._row_count_first: tuple[int, int | str] | None = None
+        self._row_count_changed = False
+        self._row_count_equal_frozen = False
 
     def reach(self, checkpoint: str) -> None:
         self.checkpoint = checkpoint
@@ -587,10 +633,31 @@ class _PreDispatchTrace:
     def new_look(self) -> None:
         self.control = DownloadPreflightControl()
 
+    def row_download_count(self, surface_ordinal: int, count: int, row_count_equal_frozen: bool) -> None:
+        """Note the whole-table scan's offending row for the look's next `lag`."""
+
+        self._row_count_pending = (surface_ordinal, _preflight_count_bucket(count), row_count_equal_frozen)
+
     def lag(self, reason: str) -> None:
         self.lag_reason = reason
         self.checkpoint = DOWNLOAD_PREFLIGHT_REASON_CHECKPOINTS[reason]
         self.not_ready_looks += 1
+        pending, self._row_count_pending = self._row_count_pending, None
+        if reason != "RESULTS_ROW_DOWNLOAD_COUNT" or pending is None:
+            # Any other not-ready look ends the tail run of identical witnesses.
+            self._row_count_tail, self._row_count_tail_looks = None, 0
+            return
+        ordinal, bucket, equal = pending
+        witness = (ordinal, bucket)
+        if witness == self._row_count_tail:
+            self._row_count_tail_looks += 1
+        else:
+            self._row_count_tail, self._row_count_tail_looks = witness, 1
+        if self._row_count_first is None:
+            self._row_count_first = witness
+        elif witness != self._row_count_first:
+            self._row_count_changed = True
+        self._row_count_equal_frozen = equal
 
     def hard(self, reason: str) -> None:
         # The first hard reason wins: an outer handler re-raising the same
@@ -624,6 +691,19 @@ class _PreDispatchTrace:
             elapsed_bucket=_preflight_elapsed_bucket((time.monotonic() - self.started) * 1000),
             control=self.control,
             snapshot=self.snapshot if reason == "SNAPSHOT_MISMATCH" else None,
+            surface_scan=self._surface_scan() if reason == "RESULTS_ROW_DOWNLOAD_COUNT" else None,
+        )
+
+    def _surface_scan(self) -> DownloadPreflightSurfaceScan | None:
+        if self._row_count_tail is None:
+            return None
+        ordinal, bucket = self._row_count_tail
+        return DownloadPreflightSurfaceScan(
+            offending_surface_row_ordinal=ordinal,
+            offending_download_count_bucket=bucket,
+            surface_row_count_equal_frozen=self._row_count_equal_frozen,
+            offending_witness_looks=min(self._row_count_tail_looks, PREFLIGHT_MAX_NOT_READY_LOOKS),
+            offending_row_changed_between_looks=self._row_count_changed,
         )
 
 
@@ -2889,6 +2969,7 @@ class PlaywrightPortal:
         safety_ceiling: int,
         *,
         trace: _PreDispatchTrace | None = None,
+        frozen_length: int | None = None,
     ) -> tuple[str, Any]:
         """Read the whole results surface once. Inspection only.
 
@@ -2900,7 +2981,8 @@ class PlaywrightPortal:
         `trace` only records which closed reason each existing branch took.
         The combined shape checks are split into consecutive tests in their
         original evaluation order, so a trace changes no read and no outcome.
-        Inventory passes no trace.
+        Inventory passes no trace. `frozen_length` (header included) is only
+        compared, for the trace, with the role-row count already read.
         """
 
         def lag(reason: str) -> None:
@@ -2944,7 +3026,12 @@ class PlaywrightPortal:
             if int(row.get_by_role("columnheader").count()) != 0:
                 lag("RESULTS_ROW_HEADER_CELL")
                 return _PORTAL_NOT_READY, RESULTS_UNSETTLED_MESSAGE
-            if int(row.get_by_role("button", name=DOWNLOAD_BUTTON_NAME, exact=True).count()) != 1:
+            # The one Download-control count read of this row: the unchanged
+            # predicate and the bounded trace evidence share the same value.
+            download_count = int(row.get_by_role("button", name=DOWNLOAD_BUTTON_NAME, exact=True).count())
+            if download_count != 1:
+                if trace is not None:
+                    trace.row_download_count(index - 1, download_count, row_count == frozen_length)
                 lag("RESULTS_ROW_DOWNLOAD_COUNT")
                 return _PORTAL_NOT_READY, RESULTS_UNSETTLED_MESSAGE
         if int(
@@ -3211,7 +3298,9 @@ class PlaywrightPortal:
                 record.lag("WITNESS_ABSENT")
                 return _PORTAL_NOT_READY, None
             record.reach(PREFLIGHT_CHECKPOINT_RESULTS_SURFACE)
-            verdict, value = self._read_results_surface(page, remaining_ms, ceiling, trace=record)
+            verdict, value = self._read_results_surface(
+                page, remaining_ms, ceiling, trace=record, frozen_length=len(frozen)
+            )
             if verdict != _PORTAL_READY:
                 return _PORTAL_NOT_READY, None
             record.reach(PREFLIGHT_CHECKPOINT_SNAPSHOT_COMPARE)
