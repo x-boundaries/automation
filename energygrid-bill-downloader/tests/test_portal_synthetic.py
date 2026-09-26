@@ -3634,6 +3634,462 @@ class DownloadPreflightReachabilityTests(unittest.TestCase):
         self.assertEqual(pre.count("self._latched = True"), 1, "one latch write, on the surface family only")
 
 
+class LookScript:
+    """Scripted surface changes between the recovery looks of one proof.
+
+    `looks[0]` is applied at once; `looks[k]` is applied by the wait that
+    precedes look k. The portal is never touched: only the fake page's state
+    changes, and only inside `wait_for_timeout`, which is exactly where the
+    real surface would re-render between looks.
+    """
+
+    def __init__(self, page: FakeSurfacePage, looks: dict) -> None:
+        self.page = page
+        self.looks = looks
+        self.index = 0
+        self.original = page.wait_for_timeout
+        page.wait_for_timeout = self.wait_for_timeout
+        self.apply()
+
+    def apply(self) -> None:
+        mutate = self.looks.get(self.index)
+        if mutate is not None:
+            mutate(self.page.state)
+
+    def wait_for_timeout(self, milliseconds: int) -> None:
+        self.original(milliseconds)
+        self.index += 1
+        self.apply()
+
+
+LADDER_LOOKS = len(portal_module.PORTAL_RECOVERY_ATTEMPTS_MS)
+
+
+class DownloadPreflightSurfaceScanTests(unittest.TestCase):
+    """DL-XB-199 G3-092: evidence-only `surface_scan` for RESULTS_ROW_DOWNLOAD_COUNT."""
+
+    RECORDERS = DownloadPreDispatchCharacterisationTests.RECORDERS
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp_dir.name)
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def prepared(self, rows=("r1", "r2", "r3", "r4")):
+        portal, page, clock = surface_portal(SurfaceState(rows=list(rows)))
+        with simulated_clock(clock):
+            handles = portal.inventory(20)
+        for name in self.RECORDERS:
+            getattr(page, name).clear()
+        clock.ledger.clear()
+        return portal, page, clock, handles
+
+    def run_diagnostic(self, looks=None, *, before_row=None, rows=("r1", "r2", "r3", "r4")):
+        portal, page, clock, handles = self.prepared(rows)
+        original = PlaywrightPortal._pre_dispatch
+        scripts: list[LookScript] = []
+
+        def pre_dispatch(self, row, trace):
+            if before_row is not None and row.ordinal == before_row[0]:
+                scripts.append(LookScript(page, before_row[1]))
+            return original(self, row, trace)
+
+        if looks is not None:
+            scripts.append(LookScript(page, looks))
+        with mock.patch.object(PlaywrightPortal, "_pre_dispatch", pre_dispatch), simulated_clock(clock):
+            result = portal.download_preflight(handles)
+        return portal, page, clock, result
+
+    def scan(self, result) -> dict:
+        self.assertIsNotNone(result.failure)
+        self.assertIsNotNone(result.failure.surface_scan)
+        return result.failure.surface_scan.as_public_dict()
+
+    def assert_zero_dispatch(self, portal, page) -> None:
+        self.assertEqual(page.download_dispatches, [])
+        self.assertNotIn("row-download", page.clicks)
+        self.assertEqual(page.expect_download_timeouts, [])
+        self.assertTrue(portal._latched, "the production latch effect is unchanged")
+
+    def assert_row_download_count(self, result, *, row_ordinal=0, looks=LADDER_LOOKS) -> None:
+        failure = result.failure
+        self.assertEqual(failure.reason_code, "RESULTS_ROW_DOWNLOAD_COUNT")
+        self.assertEqual(failure.last_checkpoint, "RESULTS_SURFACE")
+        self.assertIs(failure.window_expired, True)
+        self.assertEqual(failure.not_ready_looks, looks)
+        self.assertEqual(failure.row_ordinal, row_ordinal)
+        self.assertEqual(result.rows_passed, row_ordinal)
+        self.assertIsNone(failure.snapshot)
+        self.assertEqual(failure.control, portal_module.DownloadPreflightControl())
+        document = cli.download_preflight_document(4, result)
+        self.assertEqual(document["result"], "PREFLIGHT_ROW_FAILED", "the v2 validator admits it")
+        self.assertEqual(document["failure"]["surface_scan"], failure.surface_scan.as_public_dict())
+
+    # ---- the required matrix ---- #
+
+    def test_01_every_row_with_exactly_one_download_passes_with_no_surface_scan(self) -> None:
+        portal, page, _clock, result = self.run_diagnostic()
+        self.assertEqual(result, portal_module.DownloadPreflightDiagnosticResult(rows_passed=4))
+        self.assertIsNone(result.failure)
+        document = cli.download_preflight_document(4, result)
+        self.assertEqual((document["result"], document["failure"]), ("PREFLIGHT_ALL_ROWS_PASSED", None))
+        self.assertEqual(page.trial_clicks, ["row-download"] * 4)
+        self.assert_zero_dispatch(portal, page)
+
+    def test_02_a_row_permanently_without_a_download_is_named_with_bucket_zero(self) -> None:
+        for n in range(4):
+            with self.subTest(n=n):
+                portal, page, _clock, result = self.run_diagnostic({0: _surface_mutation(download_buttons={n: 0})})
+                self.assert_row_download_count(result)
+                self.assertEqual(
+                    self.scan(result),
+                    {
+                        "offending_surface_row_ordinal": n,
+                        "offending_download_count_bucket": 0,
+                        "surface_row_count_equal_frozen": True,
+                        "offending_witness_looks": LADDER_LOOKS,
+                        "offending_row_changed_between_looks": False,
+                    },
+                )
+                self.assert_zero_dispatch(portal, page)
+
+    def test_03_a_row_permanently_with_several_downloads_has_bucket_gt_one(self) -> None:
+        for count in (2, 3, 9):
+            with self.subTest(count=count):
+                portal, page, _clock, result = self.run_diagnostic({0: _surface_mutation(download_buttons={1: count})})
+                self.assert_row_download_count(result)
+                scan = self.scan(result)
+                self.assertEqual(scan["offending_surface_row_ordinal"], 1)
+                self.assertEqual(scan["offending_download_count_bucket"], ">1")
+                self.assertEqual(scan["offending_witness_looks"], LADDER_LOOKS)
+                self.assertIs(scan["offending_row_changed_between_looks"], False)
+                self.assert_zero_dispatch(portal, page)
+
+    def test_04_a_moving_offending_row_is_changed_and_counts_only_the_stable_tail(self) -> None:
+        cases = {
+            # (3,0) x2 then (2,>1) x5
+            "row and bucket move": ({0: _surface_mutation(download_buttons={3: 0}),
+                                     2: _surface_mutation(download_buttons={2: 2})}, (2, ">1"), 5),
+            # (1,0) x6 then (1,>1) x1: same row, bucket moves
+            "bucket moves on the last look": ({0: _surface_mutation(download_buttons={1: 0}),
+                                               6: _surface_mutation(download_buttons={1: 2})}, (1, ">1"), 1),
+            # (0,0), (3,0), (0,0) x5: an earlier witness recurring still counts as changed
+            "witness returns": ({0: _surface_mutation(download_buttons={0: 0}),
+                                 1: _surface_mutation(download_buttons={3: 0}),
+                                 2: _surface_mutation(download_buttons={0: 0})}, (0, 0), 5),
+        }
+        for label, (looks, (ordinal, bucket), tail) in cases.items():
+            with self.subTest(case=label):
+                portal, page, _clock, result = self.run_diagnostic(looks)
+                self.assert_row_download_count(result)
+                scan = self.scan(result)
+                self.assertEqual(
+                    (scan["offending_surface_row_ordinal"], scan["offending_download_count_bucket"]), (ordinal, bucket)
+                )
+                self.assertEqual(scan["offending_witness_looks"], tail)
+                self.assertIs(scan["offending_row_changed_between_looks"], True)
+                self.assert_zero_dispatch(portal, page)
+
+    def test_05_a_bad_count_that_clears_before_the_deadline_passes(self) -> None:
+        portal, page, clock, result = self.run_diagnostic(
+            {0: _surface_mutation(download_buttons={3: 0}), 3: _surface_mutation(download_buttons={})}
+        )
+        self.assertEqual(result, portal_module.DownloadPreflightDiagnosticResult(rows_passed=4))
+        self.assertIsNone(result.failure, "no failure object, so no surface_scan")
+        self.assertEqual(len(clock.yields), 3, "recovered on the fourth look")
+        self.assert_zero_dispatch(portal, page)
+
+    def test_06_a_bad_count_that_persists_expires_the_window_after_seven_looks(self) -> None:
+        self.assertEqual(LADDER_LOOKS, 7)
+        portal, page, clock, result = self.run_diagnostic({0: _surface_mutation(download_buttons={2: 0})})
+        self.assert_row_download_count(result, looks=7)
+        self.assertEqual(result.failure.elapsed_bucket, "LT_60S")
+        self.assertEqual(self.scan(result)["offending_witness_looks"], 7)
+        self.assertEqual(len(clock.yields), 6)
+        self.assert_zero_dispatch(portal, page)
+
+    def test_07_a_stray_global_download_is_a_count_mismatch_without_surface_scan(self) -> None:
+        portal, page, _clock, result = self.run_diagnostic({0: _surface_mutation(stray_download_buttons=1)})
+        self.assertEqual(result.failure.reason_code, "RESULTS_DOWNLOAD_COUNT_MISMATCH")
+        self.assertIsNone(result.failure.surface_scan)
+        self.assertIsNone(cli.download_preflight_document(4, result)["failure"]["surface_scan"])
+        self.assert_zero_dispatch(portal, page)
+        # An earlier row-count look does not leak into the final, different reason.
+        portal, page, _clock, result = self.run_diagnostic(
+            {0: _surface_mutation(download_buttons={1: 0}), 2: _surface_mutation(download_buttons={}, stray_download_buttons=1)}
+        )
+        self.assertEqual(result.failure.reason_code, "RESULTS_DOWNLOAD_COUNT_MISMATCH")
+        self.assertIsNone(result.failure.surface_scan)
+
+    def test_08_a_reordered_readable_surface_is_a_snapshot_mismatch_without_surface_scan(self) -> None:
+        for label, looks in {
+            "immediately": {0: lambda state: state.rows.reverse()},
+            "after row-count looks": {0: _surface_mutation(download_buttons={3: 0}),
+                                      2: lambda state: (state.rows.reverse(), setattr(state, "download_buttons", {}))},
+        }.items():
+            with self.subTest(case=label):
+                portal, page, _clock, result = self.run_diagnostic(looks)
+                failure = result.failure
+                self.assertEqual(failure.reason_code, "SNAPSHOT_MISMATCH")
+                self.assertIs(failure.window_expired, False)
+                self.assertEqual(
+                    failure.snapshot.as_public_dict(),
+                    {"row_count_equal": True, "header_equal": True, "rows_equal_as_set": True, "changed_row_count": 4},
+                )
+                self.assertIsNone(failure.surface_scan)
+                document = cli.download_preflight_document(4, result)
+                self.assertIsNotNone(document["failure"]["snapshot"])
+                self.assertIsNone(document["failure"]["surface_scan"])
+                self.assert_zero_dispatch(portal, page)
+
+    def test_09_the_handle_ordinal_and_the_offending_surface_ordinal_stay_distinct(self) -> None:
+        portal, page, _clock, result = self.run_diagnostic(before_row=(1, {0: _surface_mutation(download_buttons={3: 0})}))
+        self.assert_row_download_count(result, row_ordinal=1)
+        self.assertEqual(result.failure.row_ordinal, 1, "the handle being proven")
+        self.assertEqual(self.scan(result)["offending_surface_row_ordinal"], 3, "the surface row that failed")
+        document = cli.download_preflight_document(4, result)
+        self.assertEqual(
+            (document["failure"]["row_ordinal"], document["failure"]["surface_scan"]["offending_surface_row_ordinal"]),
+            (1, 3),
+        )
+        self.assertEqual(page.trial_clicks, ["row-download"], "handle 0 passed its complete proof first")
+        self.assert_zero_dispatch(portal, page)
+
+    def test_10_an_extra_role_row_without_a_download_differs_from_the_frozen_count(self) -> None:
+        def insert(state: SurfaceState) -> None:
+            state.rows.append("r5")
+            state.download_buttons = {4: 0}
+
+        portal, page, _clock, result = self.run_diagnostic({0: insert})
+        self.assert_row_download_count(result)
+        self.assertEqual(
+            self.scan(result),
+            {
+                "offending_surface_row_ordinal": 4,
+                "offending_download_count_bucket": 0,
+                "surface_row_count_equal_frozen": False,
+                "offending_witness_looks": LADDER_LOOKS,
+                "offending_row_changed_between_looks": False,
+            },
+        )
+        self.assert_zero_dispatch(portal, page)
+
+    def test_11_a_mixed_ladder_counts_only_the_stable_row_count_tail(self) -> None:
+        cases = {
+            "table absent, then row count": {0: _surface_mutation(tables=0),
+                                             2: _surface_mutation(tables=1, download_buttons={2: 0})},
+            "tab absent, then row count": {0: _surface_mutation(eb_tab_count=0),
+                                           3: _surface_mutation(eb_tab_count=1, download_buttons={2: 0})},
+            "row count, other reason, same row count": {0: _surface_mutation(download_buttons={2: 0}),
+                                                        1: _surface_mutation(tables=0),
+                                                        2: _surface_mutation(tables=1)},
+        }
+        expected_tail = {"table absent, then row count": 5, "tab absent, then row count": 4,
+                         "row count, other reason, same row count": 5}
+        for label, looks in cases.items():
+            with self.subTest(case=label):
+                portal, page, _clock, result = self.run_diagnostic(looks)
+                self.assert_row_download_count(result)
+                scan = self.scan(result)
+                self.assertEqual(scan["offending_witness_looks"], expected_tail[label])
+                self.assertLess(scan["offending_witness_looks"], result.failure.not_ready_looks)
+                self.assertEqual((scan["offending_surface_row_ordinal"], scan["offending_download_count_bucket"]), (2, 0))
+                self.assertIs(scan["offending_row_changed_between_looks"], False)
+                self.assert_zero_dispatch(portal, page)
+
+    # ---- evidence only: identical operations ---- #
+
+    def operation_log(self, looks, *, traced: bool, before_row=None, production: bool = False) -> dict:
+        """Every Playwright-facing call the fake page saw, plus the outcome."""
+        portal, page, clock, handles = self.prepared()
+        original_read = PlaywrightPortal._read_results_surface
+        original_pre = PlaywrightPortal._pre_dispatch
+        row_count_reads: list[int | None] = []
+        original_count = SurfaceLocator.count
+
+        def count(locator):
+            if locator.kind == "row-download" and locator.purpose == "read":
+                row_count_reads.append(locator.index)
+            return original_count(locator)
+
+        def read(self, page_, remaining_ms, safety_ceiling, *, trace=None, frozen_length=None):
+            # The un-enriched baseline: the same read with no trace at all.
+            if not traced:
+                trace, frozen_length = None, None
+            return original_read(self, page_, remaining_ms, safety_ceiling, trace=trace, frozen_length=frozen_length)
+
+        def pre_dispatch(self, row, trace):
+            if before_row is not None and row.ordinal == before_row[0]:
+                LookScript(page, before_row[1])
+            return original_pre(self, row, trace)
+
+        LookScript(page, looks)
+        with mock.patch.object(PlaywrightPortal, "_read_results_surface", read), \
+                mock.patch.object(PlaywrightPortal, "_pre_dispatch", pre_dispatch), \
+                mock.patch.object(SurfaceLocator, "count", count), simulated_clock(clock):
+            if production:
+                try:
+                    outcome = ("dispatched", portal.download(handles[0], self.root / f"{uuid.uuid4().hex}.bin"))
+                except LayoutChangedError as exc:
+                    outcome = ("raised", type(exc).__name__, exc.message, exc.status, exc.exit_code, exc.retryable)
+            else:
+                result = portal.download_preflight(handles)
+                outcome = ("diagnostic", result.rows_passed, None if result.failure is None else result.failure.row_ordinal)
+        log = {name: list(getattr(page, name)) for name in self.RECORDERS}
+        log["ledger"] = list(clock.ledger)
+        log["row_download_count_reads"] = row_count_reads
+        log["latched"] = portal._latched
+        log["outcome"] = outcome
+        return log
+
+    EQUIVALENCE_SCENARIOS = {
+        "all pass": {},
+        "row zero persistent": {0: _surface_mutation(download_buttons={2: 0})},
+        "row >1 persistent": {0: _surface_mutation(download_buttons={1: 2})},
+        "moving witness": {0: _surface_mutation(download_buttons={3: 0}), 2: _surface_mutation(download_buttons={2: 2})},
+        "clears before deadline": {0: _surface_mutation(download_buttons={3: 0}), 3: _surface_mutation(download_buttons={})},
+        "stray global": {0: _surface_mutation(stray_download_buttons=1)},
+        "snapshot": {0: lambda state: state.rows.reverse()},
+        "extra row": {0: lambda state: (state.rows.append("r5"), setattr(state, "download_buttons", {4: 0}))},
+        "mixed ladder": {0: _surface_mutation(tables=0), 2: _surface_mutation(tables=1, download_buttons={2: 0})},
+    }
+
+    def test_the_enrichment_changes_no_playwright_operation(self) -> None:
+        for production in (False, True):
+            for label, looks in self.EQUIVALENCE_SCENARIOS.items():
+                with self.subTest(path="download" if production else "diagnostic", case=label):
+                    baseline = self.operation_log(looks, traced=False, production=production)
+                    enriched = self.operation_log(looks, traced=True, production=production)
+                    self.assertEqual(enriched, baseline)
+                    self.assertEqual(enriched["clicks"], ["row-download"] if enriched["outcome"][0] == "dispatched" else [])
+                    if not production:
+                        self.assertEqual(enriched["download_dispatches"], [])
+                        self.assertEqual(enriched["expect_download_timeouts"], [])
+                        self.assertTrue(set(enriched["trial_clicks"]) <= {"row-download"})
+        handle_case = self.operation_log({}, traced=True, before_row=(1, {0: _surface_mutation(download_buttons={3: 0})}))
+        self.assertEqual(
+            handle_case,
+            self.operation_log({}, traced=False, before_row=(1, {0: _surface_mutation(download_buttons={3: 0})})),
+        )
+
+    def test_each_row_download_count_is_read_exactly_once_per_look(self) -> None:
+        log = self.operation_log({0: _surface_mutation(download_buttons={3: 0})}, traced=True)
+        # Each look reads the header's count (index 0) and then rows 1..4 once
+        # each, stopping at the offending row 4, for all seven looks.
+        self.assertEqual(log["row_download_count_reads"], [0, 1, 2, 3, 4] * LADDER_LOOKS)
+        log = self.operation_log({}, traced=True)
+        self.assertEqual(log["row_download_count_reads"], [0, 1, 2, 3, 4] * 4, "one healthy look per handle")
+
+    def test_the_source_keeps_one_download_count_read_per_row_and_the_check_order(self) -> None:
+        source = pathlib_read_portal_source()
+        read = source[source.index("    def _read_results_surface("):source.index("    def _await_settled_results(")]
+        self.assertEqual(read.count(".count()"), 7, "pagination sits outside; table, rows, 2 header, 2 per row, 1 global")
+        self.assertEqual(read.count('get_by_role("button", name=DOWNLOAD_BUTTON_NAME, exact=True).count()'), 3)
+        order = [
+            "self._pagination_sentinel_present(page)",
+            'lag("RESULTS_TABLE_ABSENT"',
+            'lag("RESULTS_ROWS_ABSENT")',
+            'lag("RESULTS_HEADER_NO_COLUMNHEADER")',
+            'lag("RESULTS_HEADER_HAS_DOWNLOAD")',
+            'lag("RESULTS_HEADER_ONLY")',
+            'hard("RESULTS_CEILING_EXCEEDED")',
+            'lag("RESULTS_ROW_HEADER_CELL")',
+            "download_count = int(",
+            "trace.row_download_count(",
+            'lag("RESULTS_ROW_DOWNLOAD_COUNT")',
+            'lag("RESULTS_DOWNLOAD_COUNT_MISMATCH")',
+            'lag("RESULTS_ROWCOUNT_UNREAD")',
+            'lag("RESULTS_ROWCOUNT_MISMATCH")',
+            'lag("RESULTS_ROW_SNAPSHOT_NOT_READY")',
+            'lag("RESULTS_ROW_SNAPSHOT_DUPLICATE")',
+        ]
+        positions = [read.index(marker) for marker in order]
+        self.assertEqual(positions, sorted(positions))
+        reprove = source[source.index("    def _reprove_frozen_surface("):source.index("    # ---- diagnostic-owned route helpers")]
+        self.assertLess(reprove.index("self._read_results_surface("), reprove.index('record.hard("SNAPSHOT_MISMATCH")'))
+        self.assertLess(reprove.index('record.hard("SNAPSHOT_MISMATCH")'), reprove.index('record.lag("CONTROL_COUNT_MISMATCH")'))
+
+    def test_the_36_reasons_and_their_order_are_unchanged(self) -> None:
+        self.assertEqual(
+            portal_module.DOWNLOAD_PREFLIGHT_REASONS,
+            (
+                "PORTAL_LATCHED", "ROW_HANDLE_INVALID", "TOPOLOGY_NOT_UNIQUE", "TAB_UNSELECTED", "TAB_AMBIGUOUS",
+                "TAB_ABSENT", "TAB_CONTRADICTORY", "WITNESS_MULTIPLE", "WITNESS_READ_RACE", "WITNESS_ABSENT",
+                "RESULTS_PAGINATION_PRESENT", "RESULTS_CEILING_EXCEEDED", "RESULTS_ROWCOUNT_INVALID",
+                "RESULTS_ROW_SNAPSHOT_INVALID", "RESULTS_TABLE_ABSENT", "RESULTS_TABLE_AMBIGUOUS",
+                "RESULTS_ROWS_ABSENT", "RESULTS_HEADER_NO_COLUMNHEADER", "RESULTS_HEADER_HAS_DOWNLOAD",
+                "RESULTS_HEADER_ONLY", "RESULTS_ROW_HEADER_CELL", "RESULTS_ROW_DOWNLOAD_COUNT",
+                "RESULTS_DOWNLOAD_COUNT_MISMATCH", "RESULTS_ROWCOUNT_UNREAD", "RESULTS_ROWCOUNT_MISMATCH",
+                "RESULTS_ROW_SNAPSHOT_NOT_READY", "RESULTS_ROW_SNAPSHOT_DUPLICATE", "SNAPSHOT_MISMATCH",
+                "CONTROL_COUNT_MISMATCH", "CONTROL_NOT_VISIBLE", "CONTROL_NOT_ENABLED", "CONTROL_NOT_ACTIONABLE",
+                "ROW_RECHECK_NOT_READY", "ROW_RECHECK_MISMATCH", "ROW_RECHECK_INVALID", "PROBE_ERROR",
+            ),
+        )
+
+    def test_only_row_download_count_ever_carries_a_surface_scan(self) -> None:
+        for reason, mutate in PREFLIGHT_REASON_SCENARIOS.items():
+            with self.subTest(reason=reason):
+                portal, page, clock, handles = self.prepared(rows=("r1", "r2", "r3"))
+                mutate(page.state)
+                with simulated_clock(clock):
+                    failure = portal.download_preflight(handles).failure
+                self.assertEqual(failure.reason_code, reason)
+                self.assertEqual(failure.surface_scan is not None, reason == "RESULTS_ROW_DOWNLOAD_COUNT")
+                self.assertTrue(cli._valid_preflight_document(cli.download_preflight_document(3, portal_module.DownloadPreflightDiagnosticResult(rows_passed=0, failure=failure))))
+
+    # ---- privacy and the frozen invoice_failure boundary ---- #
+
+    def test_the_trace_retains_only_closed_integers_booleans_and_buckets(self) -> None:
+        portal, page, clock = surface_portal(SurfaceState(rows=[PRIVATE_ROW_TEXT, "r2", "r3", "r4"]))
+        with simulated_clock(clock):
+            handles = portal.inventory(20)
+        traces: list = []
+        original = PlaywrightPortal._pre_dispatch
+
+        def pre_dispatch(self, row, trace):
+            traces.append(trace)
+            return original(self, row, trace)
+
+        page.state.download_buttons = {0: 0}
+        with mock.patch.object(PlaywrightPortal, "_pre_dispatch", pre_dispatch), simulated_clock(clock):
+            result = portal.download_preflight(handles)
+        trace = traces[0]
+        for name in ("_row_count_pending", "_row_count_tail", "_row_count_tail_looks", "_row_count_first",
+                     "_row_count_changed", "_row_count_equal_frozen"):
+            value = getattr(trace, name)
+            flat = value if isinstance(value, tuple) else (value,)
+            for item in flat:
+                with self.subTest(field=name, item=repr(item)):
+                    self.assertTrue(item is None or type(item) in (int, bool) or item == ">1")
+        public = json.dumps(result.failure.as_public_dict())
+        for fragment in (PRIVATE_ROW_TEXT, "ACCT-778899", ResultsConfig.account_identity):
+            self.assertNotIn(fragment, public + repr(result.failure) + repr(vars(trace)))
+        for digest in portal._frozen_rows:
+            self.assertNotIn(digest.hex(), public)
+            self.assertNotIn(repr(digest), repr(vars(trace)))
+
+    def test_invoice_failure_enrichment_is_unchanged_by_surface_scan(self) -> None:
+        from energygrid_bill_downloader import reconcile
+
+        portal, page, clock, handles = self.prepared()
+        page.state.download_buttons = {3: 0}
+        with simulated_clock(clock), self.assertRaises(portal_module.DownloadPreflightError) as caught:
+            portal.download(handles[0], self.root / "never.bin")
+        error = caught.exception
+        self.assertEqual(error.message, portal_module.RESULTS_SURFACE_CHANGED_MESSAGE)
+        self.assertEqual((error.status, error.exit_code, error.retryable), (PORTAL_LAYOUT_CHANGED, 20, False))
+        self.assertIsNotNone(error.evidence.surface_scan, "production carries it privately on the evidence")
+        self.assertEqual(
+            reconcile._failure_enrichment(error, 0),
+            {"row_ordinal": 0, "preflight_reason": "RESULTS_ROW_DOWNLOAD_COUNT", "preflight_checkpoint": "RESULTS_SURFACE"},
+        )
+        self.assertNotIn("surface_scan", reconcile.__dict__.get("_failure_enrichment").__code__.co_names)
+        self.assertEqual(page.download_dispatches, [])
+        self.assertTrue(portal._latched)
+
+
 class SingleSurfaceSourceIsolationTests(unittest.TestCase):
     """The production section depends on none of the retired contracts."""
 

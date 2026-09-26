@@ -2013,6 +2013,25 @@ def preflight_evidence(**overrides) -> portal_module.DownloadPreflightEvidence:
     return portal_module.DownloadPreflightEvidence(**values)
 
 
+def row_download_count_evidence(**scan_overrides) -> portal_module.DownloadPreflightEvidence:
+    """The G3-090-shaped RESULTS_ROW_DOWNLOAD_COUNT failure with its v2 surface_scan."""
+
+    scan = {
+        "offending_surface_row_ordinal": 3,
+        "offending_download_count_bucket": 0,
+        "surface_row_count_equal_frozen": True,
+        "offending_witness_looks": 7,
+        "offending_row_changed_between_looks": False,
+    }
+    scan.update(scan_overrides)
+    return preflight_evidence(
+        reason_code="RESULTS_ROW_DOWNLOAD_COUNT",
+        last_checkpoint="RESULTS_SURFACE",
+        control=portal_module.DownloadPreflightControl(),
+        surface_scan=portal_module.DownloadPreflightSurfaceScan(**scan),
+    )
+
+
 def preflight_portal(
     *,
     rows: int = 3,
@@ -2125,7 +2144,7 @@ class DownloadPreflightDiagnosticCliTests(unittest.TestCase):
         self.assertEqual(len(lines), 1, "exactly one document")
         document = json.loads(lines[0])
         self.assertEqual(set(document), set(cli._PREFLIGHT_DOCUMENT_KEYS))
-        self.assertEqual(document["schema"], "energygrid.download_preflight_diagnostic.v1")
+        self.assertEqual(document["schema"], "energygrid.download_preflight_diagnostic.v2")
         self.assertIs(document["download_dispatched"], False)
         return document
 
@@ -2211,6 +2230,7 @@ class DownloadPreflightDiagnosticCliTests(unittest.TestCase):
                     "trial_actionability": "NOT_REACHED",
                 },
                 "snapshot": None,
+                "surface_scan": None,
             },
         )
 
@@ -2354,7 +2374,9 @@ class DownloadPreflightDiagnosticCliTests(unittest.TestCase):
         rejected = (
             mutated(lambda d: d.update(extra=1)),
             mutated(lambda d: d.pop("support_ref")),
-            mutated(lambda d: d.update(schema="energygrid.download_preflight_diagnostic.v2")),
+            mutated(lambda d: d.update(schema="energygrid.download_preflight_diagnostic.v1")),
+            mutated(lambda d: d.update(schema="energygrid.download_preflight_diagnostic.v3")),
+            mutated(lambda d: d["failure"].pop("surface_scan")),
             mutated(lambda d: d.update(status="ACTION_REQUIRED")),
             mutated(lambda d: d.update(download_dispatched=0)),
             mutated(lambda d: d.update(support_ref="EG_NAV_RESULTS_HEADER_ONLY")),
@@ -2382,6 +2404,187 @@ class DownloadPreflightDiagnosticCliTests(unittest.TestCase):
                 self.assertFalse(
                     cli._valid_preflight_document(mutated(lambda d, r=result: d.update(result=r)))
                 )
+
+    # ---- DL-XB-199 G3-092: schema v2 failure.surface_scan ---- #
+
+    def test_the_v2_failure_object_gains_exactly_surface_scan(self) -> None:
+        self.assertEqual(cli.DOWNLOAD_PREFLIGHT_DIAGNOSTIC_SCHEMA, "energygrid.download_preflight_diagnostic.v2")
+        self.assertEqual(
+            cli._PREFLIGHT_DOCUMENT_KEYS,
+            {"schema", "status", "result", "support_ref", "download_dispatched", "inventory_count", "rows_passed", "failure"},
+            "the top-level document keys are unchanged",
+        )
+        self.assertEqual(
+            cli._PREFLIGHT_FAILURE_KEYS,
+            {"row_ordinal", "reason_code", "last_checkpoint", "window_expired", "not_ready_looks",
+             "elapsed_bucket", "control", "snapshot", "surface_scan"},
+        )
+        self.assertEqual(
+            cli._PREFLIGHT_SURFACE_SCAN_KEYS,
+            {"offending_surface_row_ordinal", "offending_download_count_bucket", "surface_row_count_equal_frozen",
+             "offending_witness_looks", "offending_row_changed_between_looks"},
+        )
+
+    def test_a_row_download_count_failure_carries_its_surface_scan(self) -> None:
+        result = portal_module.DownloadPreflightDiagnosticResult(rows_passed=1, failure=row_download_count_evidence())
+        exit_code, document = self.outcome(preflight_portal(rows=4, result=result))
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(document["result"], "PREFLIGHT_ROW_FAILED")
+        failure = document["failure"]
+        self.assertEqual(failure["row_ordinal"], 1, "the handle ordinal keeps its meaning")
+        self.assertEqual(
+            failure["surface_scan"],
+            {
+                "offending_surface_row_ordinal": 3,
+                "offending_download_count_bucket": 0,
+                "surface_row_count_equal_frozen": True,
+                "offending_witness_looks": 7,
+                "offending_row_changed_between_looks": False,
+            },
+        )
+        for bucket in (0, ">1"):
+            with self.subTest(bucket=bucket):
+                evidence = row_download_count_evidence(offending_download_count_bucket=bucket, offending_witness_looks=1)
+                document = cli.download_preflight_document(
+                    4, portal_module.DownloadPreflightDiagnosticResult(rows_passed=1, failure=evidence)
+                )
+                self.assertEqual(document["failure"]["surface_scan"]["offending_download_count_bucket"], bucket)
+
+    def test_the_surface_scan_validator_is_exact_closed_and_fails_closed(self) -> None:
+        valid = cli.download_preflight_document(
+            4, portal_module.DownloadPreflightDiagnosticResult(rows_passed=1, failure=row_download_count_evidence())
+        )
+        self.assertTrue(cli._valid_preflight_document(valid))
+
+        class SubDict(dict):
+            pass
+
+        def mutated(change):
+            document = json.loads(json.dumps(valid))
+            change(document)
+            return document
+
+        def scan(**changes):
+            return mutated(lambda d: d["failure"]["surface_scan"].update(changes))
+
+        def drop(key):
+            return mutated(lambda d: d["failure"]["surface_scan"].pop(key))
+
+        ceiling = cli.MAX_INVENTORY_CEILING
+        rejected = {
+            "surface_scan null for its own reason": mutated(lambda d: d["failure"].update(surface_scan=None)),
+            "surface_scan missing": mutated(lambda d: d["failure"].pop("surface_scan")),
+            "surface_scan not a mapping": mutated(lambda d: d["failure"].update(surface_scan=[3, 0])),
+            "surface_scan subclass": mutated(lambda d: d["failure"].update(surface_scan=SubDict(d["failure"]["surface_scan"]))),
+            "extra key": scan(extra=1),
+            "row text key": scan(row_text="PRIVATE-ROW ACCT-778899"),
+            **{f"missing {key}": drop(key) for key in cli._PREFLIGHT_SURFACE_SCAN_KEYS},
+            "ordinal bool": scan(offending_surface_row_ordinal=True),
+            "ordinal float": scan(offending_surface_row_ordinal=3.0),
+            "ordinal string": scan(offending_surface_row_ordinal="3"),
+            "ordinal negative": scan(offending_surface_row_ordinal=-1),
+            "ordinal at ceiling": scan(offending_surface_row_ordinal=ceiling),
+            "ordinal null": scan(offending_surface_row_ordinal=None),
+            "bucket one": scan(offending_download_count_bucket=1),
+            "bucket two": scan(offending_download_count_bucket=2),
+            "bucket string zero": scan(offending_download_count_bucket="0"),
+            "bucket false": scan(offending_download_count_bucket=False),
+            "bucket float": scan(offending_download_count_bucket=0.0),
+            "bucket >=1": scan(offending_download_count_bucket=">=1"),
+            "bucket null": scan(offending_download_count_bucket=None),
+            "row_count_equal int": scan(surface_row_count_equal_frozen=1),
+            "row_count_equal null": scan(surface_row_count_equal_frozen=None),
+            "changed string": scan(offending_row_changed_between_looks="false"),
+            "changed null": scan(offending_row_changed_between_looks=None),
+            "witness zero": scan(offending_witness_looks=0),
+            "witness above not_ready_looks": scan(offending_witness_looks=8),
+            "witness bool": scan(offending_witness_looks=True),
+            "witness float": scan(offending_witness_looks=7.0),
+            "witness null": scan(offending_witness_looks=None),
+            "surface_scan on another reason": mutated(
+                lambda d: d["failure"].update(reason_code="RESULTS_DOWNLOAD_COUNT_MISMATCH")
+            ),
+        }
+        for label, document in rejected.items():
+            with self.subTest(case=label):
+                self.assertFalse(cli._valid_preflight_document(document))
+        # Every legitimate domain edge is admitted.
+        for label, document in {
+            "ordinal zero": scan(offending_surface_row_ordinal=0),
+            "ordinal ceiling-1": scan(offending_surface_row_ordinal=ceiling - 1),
+            "bucket >1": scan(offending_download_count_bucket=">1"),
+            "witness one": scan(offending_witness_looks=1),
+            "row count differs, changed": scan(surface_row_count_equal_frozen=False, offending_row_changed_between_looks=True),
+        }.items():
+            with self.subTest(admitted=label):
+                self.assertTrue(cli._valid_preflight_document(document))
+        # Every other reason requires surface_scan null, and a mapping there fails closed.
+        a_scan = valid["failure"]["surface_scan"]
+        other = cli.download_preflight_document(
+            3, portal_module.DownloadPreflightDiagnosticResult(rows_passed=1, failure=preflight_evidence())
+        )
+        self.assertIsNone(other["failure"]["surface_scan"])
+        polluted = json.loads(json.dumps(other))
+        polluted["failure"]["surface_scan"] = dict(a_scan)
+        self.assertFalse(cli._valid_preflight_document(polluted))
+
+    def test_a_malformed_surface_scan_from_the_portal_is_rejected_wholesale(self) -> None:
+        malformed = (
+            row_download_count_evidence(offending_download_count_bucket=1),
+            row_download_count_evidence(offending_witness_looks=0),
+            row_download_count_evidence(offending_witness_looks=8),
+            row_download_count_evidence(offending_surface_row_ordinal=True),
+            row_download_count_evidence(offending_surface_row_ordinal=cli.MAX_INVENTORY_CEILING),
+            preflight_evidence(reason_code="RESULTS_ROW_DOWNLOAD_COUNT", last_checkpoint="RESULTS_SURFACE",
+                               control=portal_module.DownloadPreflightControl()),
+            preflight_evidence(surface_scan=row_download_count_evidence().surface_scan),
+        )
+        for evidence in malformed:
+            with self.subTest(evidence=repr(evidence.surface_scan)[:80]):
+                result = portal_module.DownloadPreflightDiagnosticResult(rows_passed=1, failure=evidence)
+                exit_code, document = self.outcome(preflight_portal(rows=4, result=result))
+                self.assertEqual(exit_code, 20)
+                self.assertEqual(document["result"], "OUTPUT_REJECTED")
+                self.assertIsNone(document["failure"])
+
+    def test_a_v1_validator_rejects_every_v2_document(self) -> None:
+        """Compatibility negative control: v2 never passes the v1 validation rules.
+
+        The published M1 validator delegates to the checkout's
+        `_valid_preflight_document`; restoring the two v1 constants reproduces
+        the v1 rules. Each v1 gate rejects a v2 document on its own, so an old
+        bundle can never admit a new document and must be rebuilt.
+        """
+        v1_schema = "energygrid.download_preflight_diagnostic.v1"
+        v1_failure_keys = cli._PREFLIGHT_FAILURE_KEYS - {"surface_scan"}
+        documents = (
+            cli.download_preflight_document(3, portal_module.DownloadPreflightDiagnosticResult(rows_passed=3)),
+            cli.download_preflight_document(
+                3, portal_module.DownloadPreflightDiagnosticResult(rows_passed=1, failure=preflight_evidence())
+            ),
+            cli.download_preflight_document(
+                4, portal_module.DownloadPreflightDiagnosticResult(rows_passed=1, failure=row_download_count_evidence())
+            ),
+        )
+        for document in documents:
+            self.assertTrue(cli._valid_preflight_document(document))
+            with self.subTest(result=document["result"], gate="v1 schema and keys"):
+                with mock.patch.object(cli, "DOWNLOAD_PREFLIGHT_DIAGNOSTIC_SCHEMA", v1_schema), \
+                        mock.patch.object(cli, "_PREFLIGHT_FAILURE_KEYS", v1_failure_keys):
+                    self.assertFalse(cli._valid_preflight_document(document))
+            with self.subTest(result=document["result"], gate="v1 schema only"):
+                with mock.patch.object(cli, "DOWNLOAD_PREFLIGHT_DIAGNOSTIC_SCHEMA", v1_schema):
+                    self.assertFalse(cli._valid_preflight_document(document))
+            if document["failure"] is not None:
+                with self.subTest(result=document["result"], gate="v1 failure keys only"):
+                    relabelled = dict(document, schema=cli.DOWNLOAD_PREFLIGHT_DIAGNOSTIC_SCHEMA)
+                    with mock.patch.object(cli, "_PREFLIGHT_FAILURE_KEYS", v1_failure_keys):
+                        self.assertFalse(cli._valid_preflight_document(relabelled))
+        # And the v2 validator does not admit a v1-shaped document either.
+        v1_document = json.loads(json.dumps(documents[1]))
+        v1_document["schema"] = v1_schema
+        v1_document["failure"].pop("surface_scan")
+        self.assertFalse(cli._valid_preflight_document(v1_document))
 
     def test_a_serialisation_failure_emits_the_fixed_rejected_document(self) -> None:
         valid = cli.download_preflight_document(3, portal_module.DownloadPreflightDiagnosticResult(rows_passed=3))
@@ -2463,6 +2666,7 @@ class DownloadPreflightDiagnosticCliTests(unittest.TestCase):
         for portal_cls in (
             preflight_portal(),
             preflight_portal(result=portal_module.DownloadPreflightDiagnosticResult(rows_passed=1, failure=preflight_evidence())),
+            preflight_portal(result=portal_module.DownloadPreflightDiagnosticResult(rows_passed=1, failure=row_download_count_evidence(offending_download_count_bucket=">1"))),
             preflight_portal(login_error=AppError(hostile)),
             preflight_portal(inventory_error=LayoutChangedError(hostile)),
             preflight_portal(preflight_error=RuntimeError(hostile)),

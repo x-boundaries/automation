@@ -577,19 +577,32 @@ including every clause of section 5.4, remains controlling.
   stopping at the first failure. It never clicks Download and never enters
   `expect_download`; when every row passes it latches the portal so that instance can
   never dispatch a Download afterwards.
-- It emits exactly one `energygrid.download_preflight_diagnostic.v1` document on stdout
-  and nothing on stderr: closed reason codes, checkpoints, booleans and bounded counts
+- It emits exactly one `energygrid.download_preflight_diagnostic.v2` document on stdout
+  (DL-XB-199 G3-092; it supersedes `energygrid.download_preflight_diagnostic.v1`) and
+  nothing on stderr: closed reason codes, checkpoints, booleans and bounded counts
   only, never row text, filenames, account text, URLs, digests or exception text. Invalid
   output is replaced by one fixed `OUTPUT_REJECTED` document. It exits `0` for a complete
   observation, `64` for a configuration or dependency failure and `20` otherwise; never
   `10`.
+- Schema v2 keeps every top-level document key and adds only the diagnostic-only
+  `failure.surface_scan`: `null` for every reason except `RESULTS_ROW_DOWNLOAD_COUNT`,
+  and for that reason an exact closed object of `offending_surface_row_ordinal`
+  (zero-based non-header role-row position seen by the whole-table scan, distinct from
+  the handle `row_ordinal`), `offending_download_count_bucket` (`0` or `>1`),
+  `surface_row_count_equal_frozen`, `offending_witness_looks` (`1..not_ready_looks`) and
+  `offending_row_changed_between_looks`. It is evidence only: it reuses the existing
+  per-row Download count read, adds no Playwright read or action, and retains no row
+  text, locator, digest or exception text. It never enters `invoice_failure` logs, whose
+  enrichment stays `row_ordinal`, `preflight_reason` and `preflight_checkpoint`.
 - Scheduler semantics are unchanged: the scheduled shape still runs `run`, and the
   one-shot supervisor remains run-only.
 - The installed launcher stays stale until a later, separately authorised gate reviews
   the new launcher package identity, republishes and re-admits it through the existing
   runtime package mechanism, runs `ValidateOnly`, and refreshes any admission baseline
-  that pins the launcher hash. This design change deploys nothing and grants no live
-  diagnostic authority.
+  that pins the launcher hash. A launcher, checkout or live-diagnostic bundle built for
+  `v1` must be newly reviewed, rebuilt, republished and re-admitted before any future
+  live diagnostic; its v1 validator rejects a v2 document. This design change deploys
+  nothing and grants no live diagnostic authority.
 
 ## 6. Installation And Update Contract
 

@@ -220,8 +220,10 @@ files, open StateStore, create a run directory or reconcile, so it creates no
 state, log, temp or archive artefact. When every row passes, the portal latches
 so it can never dispatch a Download afterwards.
 
-It prints exactly one `energygrid.download_preflight_diagnostic.v1` JSON
-document and nothing on stderr. The keys are always `schema`, `status`,
+It prints exactly one `energygrid.download_preflight_diagnostic.v2` JSON
+document and nothing on stderr (the superseded
+`energygrid.download_preflight_diagnostic.v1` is no longer emitted or
+accepted). The keys are always `schema`, `status`,
 `result`, `support_ref`, `download_dispatched` (always `false`),
 `inventory_count`, `rows_passed` and `failure`. `result` is one of
 `PREFLIGHT_ALL_ROWS_PASSED`, `PREFLIGHT_ROW_FAILED`, `CONFIGURATION_FAILED`,
@@ -240,14 +242,51 @@ with exit `20`, except `CONFIGURATION_FAILED` which exits `64`. It never exits
 `not_ready_looks`, a coarse `elapsed_bucket`, the Download `control` evidence
 (`count_bucket`, `visible`, `enabled`, `trial_actionability`) and, only for
 `SNAPSHOT_MISMATCH`, a `snapshot` comparison of booleans and one changed-row
-count. Row text, filenames, account text, URLs, digests and exception text are
-never emitted. Invalid output is replaced by one fixed `OUTPUT_REJECTED`
-document.
+count, and, only for `RESULTS_ROW_DOWNLOAD_COUNT`, a diagnostic-only
+`surface_scan` (below). Row text, filenames, account text, URLs, digests and
+exception text are never emitted. Invalid output is replaced by one fixed
+`OUTPUT_REJECTED` document.
+
+Schema `energygrid.download_preflight_diagnostic.v2` (DL-XB-199 G3-092)
+supersedes `energygrid.download_preflight_diagnostic.v1`. The top-level
+document keys are unchanged; the only change is the one additional `failure`
+key `surface_scan`, which is `null` for every reason except
+`RESULTS_ROW_DOWNLOAD_COUNT`. For that reason it is an exact closed object of
+five keys:
+
+- `offending_surface_row_ordinal`: the zero-based position, among the
+  non-header role rows the whole-table surface scan saw at the final such look,
+  of the row whose Download-control count was not exactly one; a plain integer
+  `0 <= n < MAX_INVENTORY_CEILING`.
+- `offending_download_count_bucket`: exactly integer `0` or string `>1`, never
+  `1`.
+- `surface_row_count_equal_frozen`: whether that look's role-row count equalled
+  the frozen surface length.
+- `offending_witness_looks`: how many consecutive tail looks saw the identical
+  `(ordinal, bucket)` witness; a plain integer `1..not_ready_looks`.
+- `offending_row_changed_between_looks`: true iff two looks that recorded this
+  reason saw differing `(ordinal, bucket)` witnesses.
+
+`row_ordinal` keeps its meaning: the zero-based inventory handle being proven.
+`offending_surface_row_ordinal` is a different value on purpose, so
+`row_ordinal` `1` with `offending_surface_row_ordinal` `3` is valid. The
+enrichment is evidence only: it reuses the existing single Download-control
+count read of each row and adds no Playwright read, click, wait or reorder, so
+every predicate, check order, recovery window, latch and dispatch boundary is
+unchanged. It carries only a bounded integer, a fixed bucket and booleans. The
+validator is exact and closed: a missing, extra, mistyped (including a boolean
+for an integer), out-of-range or wrongly placed value rejects the whole
+document as `OUTPUT_REJECTED`, and a `v1` document or validator never admits a
+`v2` document.
 
 The launcher source admits the command, but an installed launcher keeps its
 earlier allowlist until a separately authorised republish, re-admission and
-`ValidateOnly` accept the new launcher bytes. Committing it grants no live
-diagnostic, credential use, deployment, retry or Scheduler authority.
+`ValidateOnly` accept the new launcher bytes. Because the document is now `v2`,
+any installed launcher, checkout or live-diagnostic bundle built for `v1`
+(including its frozen result validator and classifier, which reject a `v2`
+document) must be newly reviewed, rebuilt, republished and re-admitted before a
+future live diagnostic. Committing it grants no live diagnostic, credential
+use, deployment, retry or Scheduler authority.
 
 ### Future live-session diagnostic authority boundary
 
@@ -328,7 +367,8 @@ failure, `preflight_reason` and `preflight_checkpoint` from the same closed
 (DL-XB-199 G2-083). The fields are never required, so logs written by an earlier
 build stay valid; every value is validated before it is logged and an invalid
 value is omitted rather than coerced. Status, exit code, summary, `run_complete`
-and `run_failed` are unchanged. Any strict external run-log collector that
+and `run_failed` are unchanged. The diagnostic-only `surface_scan` and its
+fields never enter `invoice_failure` or any normal run log. Any strict external run-log collector that
 rejects unknown keys must be updated to admit these fields before it is used on
 a later run.
 

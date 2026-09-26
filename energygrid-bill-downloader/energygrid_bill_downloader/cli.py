@@ -129,8 +129,10 @@ NAVIGATION_DIAGNOSTIC_COMPLETE = NAVIGATION_DIAGNOSTIC_COMPLETE_STATE
 # shared production pre-dispatch proof over every row, and it never dispatches
 # a Download. The launcher reaches it as a fixed command so the existing
 # credential boundary is reused; it takes `--config` and nothing else.
+# DL-XB-199 G3-092: v2 adds only the diagnostic-only `failure.surface_scan`;
+# the top-level document keys are unchanged and a v1 document is rejected.
 DOWNLOAD_PREFLIGHT_DIAGNOSTIC_COMMAND = "download-preflight-diagnostic"
-DOWNLOAD_PREFLIGHT_DIAGNOSTIC_SCHEMA = "energygrid.download_preflight_diagnostic.v1"
+DOWNLOAD_PREFLIGHT_DIAGNOSTIC_SCHEMA = "energygrid.download_preflight_diagnostic.v2"
 
 PREFLIGHT_ALL_ROWS_PASSED = "PREFLIGHT_ALL_ROWS_PASSED"
 PREFLIGHT_ROW_FAILED = "PREFLIGHT_ROW_FAILED"
@@ -920,11 +922,21 @@ _PREFLIGHT_FAILURE_KEYS = frozenset(
         "elapsed_bucket",
         "control",
         "snapshot",
+        "surface_scan",
     }
 )
 _PREFLIGHT_CONTROL_KEYS = frozenset({"count_bucket", "visible", "enabled", "trial_actionability"})
 _PREFLIGHT_SNAPSHOT_KEYS = frozenset(
     {"row_count_equal", "header_equal", "rows_equal_as_set", "changed_row_count"}
+)
+_PREFLIGHT_SURFACE_SCAN_KEYS = frozenset(
+    {
+        "offending_surface_row_ordinal",
+        "offending_download_count_bucket",
+        "surface_row_count_equal_frozen",
+        "offending_witness_looks",
+        "offending_row_changed_between_looks",
+    }
 )
 DOWNLOAD_PREFLIGHT_ALLOWED_SUPPORT_REFS = (
     frozenset(SUPPORT_REFS_BY_MESSAGE.values()) - RETIRED_SUPPORT_REFS
@@ -971,6 +983,25 @@ def _valid_preflight_snapshot(value: Any, reason: str) -> bool:
     ) and _preflight_int(value["changed_row_count"], 0, MAX_INVENTORY_CEILING)
 
 
+def _valid_preflight_surface_scan(value: Any, reason: str, not_ready_looks: int) -> bool:
+    """Exactly the closed v2 object for RESULTS_ROW_DOWNLOAD_COUNT; else null."""
+
+    if reason != "RESULTS_ROW_DOWNLOAD_COUNT":
+        return value is None
+    if not _valid_navigation_mapping(value, _PREFLIGHT_SURFACE_SCAN_KEYS):
+        return False
+    # Never 1: the offending row is the one whose count was not exactly one.
+    bucket = value["offending_download_count_bucket"]
+    if not ((type(bucket) is int and bucket == 0) or (type(bucket) is str and bucket == PREFLIGHT_COUNT_GT_ONE)):
+        return False
+    return (
+        _preflight_int(value["offending_surface_row_ordinal"], 0, MAX_INVENTORY_CEILING - 1)
+        and _preflight_int(value["offending_witness_looks"], 1, not_ready_looks)
+        and type(value["surface_row_count_equal_frozen"]) is bool
+        and type(value["offending_row_changed_between_looks"]) is bool
+    )
+
+
 def _valid_preflight_failure(value: Any, rows_passed: int, inventory_count: int) -> bool:
     if not _valid_navigation_mapping(value, _PREFLIGHT_FAILURE_KEYS):
         return False
@@ -994,7 +1025,11 @@ def _valid_preflight_failure(value: Any, rows_passed: int, inventory_count: int)
     bucket = value["elapsed_bucket"]
     if type(bucket) is not str or bucket not in DOWNLOAD_PREFLIGHT_ELAPSED_BUCKETS:
         return False
-    return _valid_preflight_control(value["control"]) and _valid_preflight_snapshot(value["snapshot"], reason)
+    return (
+        _valid_preflight_control(value["control"])
+        and _valid_preflight_snapshot(value["snapshot"], reason)
+        and _valid_preflight_surface_scan(value["surface_scan"], reason, value["not_ready_looks"])
+    )
 
 
 def _valid_preflight_document(document: Any) -> bool:
