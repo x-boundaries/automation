@@ -22,6 +22,7 @@ from __future__ import annotations
 import http.client
 import json
 import socket
+import ssl
 import time
 import urllib.error
 import urllib.request
@@ -54,6 +55,7 @@ STAGE_FETCH = "fetch"
 # The closed support-reference vocabulary this module can raise.
 REF_TRANSPORT_EXHAUSTED = "EG_HTTP_TRANSPORT_EXHAUSTED"
 REF_REDIRECT_REFUSED = "EG_HTTP_REDIRECT_REFUSED"
+REF_TLS_REFUSED = "EG_HTTP_TLS_REFUSED"
 REF_STATUS_UNEXPECTED = "EG_HTTP_STATUS_UNEXPECTED"
 REF_FRAMING_INCOMPLETE = "EG_HTTP_FRAMING_INCOMPLETE"
 REF_LIST_CONTENT_TYPE = "EG_HTTP_LIST_CONTENT_TYPE"
@@ -73,6 +75,7 @@ HTTP_SOURCE_SUPPORT_REFS = frozenset(
     {
         REF_TRANSPORT_EXHAUSTED,
         REF_REDIRECT_REFUSED,
+        REF_TLS_REFUSED,
         REF_STATUS_UNEXPECTED,
         REF_FRAMING_INCOMPLETE,
         REF_LIST_CONTENT_TYPE,
@@ -273,8 +276,15 @@ class DirectHttpSource:
             if 300 <= code < 400:
                 raise SourceContractError(REF_REDIRECT_REFUSED, stage=stage) from None
             raise SourceContractError(REF_STATUS_UNEXPECTED, stage=stage) from None
-        except (urllib.error.URLError, OSError, http.client.RemoteDisconnected):
+        except ssl.SSLError:
+            # A certificate or TLS failure is host/identity drift, never transient.
+            raise SourceContractError(REF_TLS_REFUSED, stage=stage) from None
+        except urllib.error.URLError as exc:
+            if isinstance(exc.reason, (ssl.SSLError, ssl.CertificateError)):
+                raise SourceContractError(REF_TLS_REFUSED, stage=stage) from None
             # Connection refused/reset, DNS failure and timeout before headers.
+            raise _Transient() from None
+        except (OSError, http.client.RemoteDisconnected):
             raise _Transient() from None
         except http.client.HTTPException:
             raise SourceContractError(REF_FRAMING_INCOMPLETE, stage=stage) from None

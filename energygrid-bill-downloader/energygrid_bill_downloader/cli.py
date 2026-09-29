@@ -455,7 +455,11 @@ def run_direct_http(config: RuntimeConfig, logger: SafeLogger, run_id: str, list
                 summary=None,
             )
         return exit_code
-    except (OSError, ValueError, TypeError):
+    except Exception:
+        # Fail closed on anything unforeseen: a fixed document, exit 20 and the alert.
+        # No exception text or traceback reaches stdout, stderr, the log or the alert,
+        # because a message could carry a listed filename. Process control
+        # (BaseException) still propagates.
         print(json.dumps({"status": ACTION_REQUIRED, "error_class": "RUNTIME_FAILURE"}, sort_keys=True))
         if not list_only:
             notify_failure(

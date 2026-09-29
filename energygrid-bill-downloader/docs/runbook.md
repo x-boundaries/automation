@@ -361,10 +361,12 @@ Redirects are never followed and ambient proxies are ignored.
 | `EG_HTTP_LIST_CONTENT_TYPE` / `EG_HTTP_LIST_MALFORMED_JSON` / `EG_HTTP_LIST_OVERSIZE` | LIST body contract broken | 20 |
 | `EG_INVENTORY_FILENAME_UNSAFE` / `EG_INVENTORY_DUPLICATE_FILENAME` | listed name refused | 20 |
 | `EG_INVENTORY_KNOWN_BILL_MISSING` | an archived bill disappeared from the inventory | 20 |
+| `EG_HTTP_TLS_REFUSED` | certificate or TLS failure (identity drift; never retried) | 20 |
 | `EG_HTTP_REDIRECT_REFUSED` / `EG_HTTP_STATUS_UNEXPECTED` | any 3xx; any 4xx except 429; 501/505; any non-200 2xx | 20 |
 | `EG_HTTP_FRAMING_INCOMPLETE` / `EG_HTTP_FETCH_EMPTY` / `EG_HTTP_FETCH_OVERSIZE` | FETCH body contract broken | 20 |
 | `EG_HTTP_TRANSPORT_EXHAUSTED` | connection error, timeout, 429 or 500/502/503/504 on every attempt | 10 |
 | `EG_RUN_ALREADY_ACTIVE` | another run holds the single-run lock (`RUN_IN_PROGRESS`) | 10 |
+| `EG_RUNTIME_FAILURE` | any unforeseen runtime failure (`RUNTIME_FAILURE`); nothing about it is printed | 20 |
 
 Only the transport row is retried, at most `max_attempts` times per operation,
 inside the source. Nothing is retried after a contract violation, a tenant

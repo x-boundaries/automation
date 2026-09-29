@@ -563,6 +563,18 @@ class SourceTransport(DirectHttpCase):
         self.assertEqual(3, source.list_calls)
         self.assertEqual(2, len(attempts))
 
+    def test_tls_failure_is_terminal_and_never_retried(self) -> None:
+        settings = DirectHttpSettings(
+            list_url=self.service.list_url.replace("http://", "https://"),
+            fetch_url=self.service.fetch_url.replace("http://", "https://"),
+            tenant_id=CANARY_TENANT,
+        )
+        source = DirectHttpSource(settings, 5, 3, sleep=lambda _s: None)
+        with self.assertRaises(SourceContractError) as caught:
+            source.inventory(1000)
+        self.assertEqual("EG_HTTP_TLS_REFUSED", caught.exception.support_ref)
+        self.assertEqual(1, source.list_calls)
+
     def test_rows_and_source_do_not_disclose_private_values_in_repr(self) -> None:
         source = self.source()
         rows = source.inventory(1000)
@@ -618,6 +630,19 @@ class Alerting(DirectHttpCase):
         self.assertEqual("fetch", payload["stage"])
         self.assertEqual("INVALID_PDF", payload["status"])
         self.assertEqual({"inventory": 4, "downloaded": 0, "present": 0, "failure": 1}, payload["counts"])
+
+    def test_unforeseen_exception_fails_closed_silently_with_an_alert(self) -> None:
+        with AlertSink() as sink, mock.patch.object(
+            cli, "reconcile_listed_inventory", side_effect=KeyError(CANARY_FILENAME_MARK + CANARY_TENANT)
+        ):
+            deployment = self.deployment(alert={"url": sink.url})
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                code, document = deployment.run()
+        self.assertEqual(20, code)
+        self.assertEqual({"status": "ACTION_REQUIRED", "error_class": "RUNTIME_FAILURE"}, document)
+        self.assertEqual("EG_RUNTIME_FAILURE", sink.payloads[0]["support_ref"])
+        self.assert_no_canary(deployment.last_stdout, stderr.getvalue(), deployment.log_text(), json.dumps(sink.payloads))
 
     def test_success_sends_no_alert(self) -> None:
         with AlertSink() as sink:
