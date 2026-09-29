@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
+import re
 import uuid
 
 from .config import MAX_INVENTORY_CEILING, RuntimeConfig
@@ -21,6 +22,8 @@ from .errors import (
     ArchiveConflictError,
     ConfigError,
     InvalidPdfError,
+    SUPPORT_REF_PATTERN,
+    SourceContractError,
     StateError,
     exit_code_for,
 )
@@ -62,8 +65,21 @@ class RunSummary:
     present_count: int = 0
     failure_count: int = 0
     failures: list[str] = field(default_factory=list)
+    # DL-XB-199 G3-101 (direct HTTP only). `pending_count` is reported by
+    # `list`; the stage, reference and fetch count feed the alert and the log,
+    # never stdout.
+    pending_count: int | None = None
+    failure_stage: str | None = None
+    failure_support_ref: str | None = None
+    fetch_count: int = 0
 
     def as_dict(self) -> dict[str, Any]:
+        document = self._base_dict()
+        if self.pending_count is not None:
+            document["pending_count"] = self.pending_count
+        return document
+
+    def _base_dict(self) -> dict[str, Any]:
         return {
             "run_id": self.run_id,
             "status": self.status,
@@ -308,6 +324,9 @@ def _failure_enrichment(error: AppError, row_ordinal: Any) -> dict[str, Any]:
     fields: dict[str, Any] = {}
     if type(row_ordinal) is int and 0 <= row_ordinal < MAX_INVENTORY_CEILING:
         fields["row_ordinal"] = row_ordinal
+    support_ref = getattr(error, "support_ref", None)
+    if type(support_ref) is str and re.fullmatch(SUPPORT_REF_PATTERN, support_ref):
+        fields["support_ref"] = support_ref
     if isinstance(error, DownloadPreflightError):
         evidence = getattr(error, "evidence", None)
         reason = getattr(evidence, "reason_code", None)
@@ -355,3 +374,214 @@ def _worst_status(statuses: list[str]) -> str:
         RETRYABLE_NETWORK_FAILURE: 30,
     }
     return max(statuses, key=lambda item: priority.get(item, 50))
+
+
+# ---------------------------------------------------------------------------
+# DL-XB-199 G3-101: listed-inventory reconciliation for the direct-HTTP source
+# ---------------------------------------------------------------------------
+# The LIST response names every bill, so presence is decided BEFORE any FETCH:
+# an already-archived valid bill is never fetched again. Everything else keeps
+# the download-first path's guarantees and reuses its primitives unchanged:
+#
+#   Phase 0  bind every listed name (existing filename rules), refuse duplicate
+#            normalised keys, refuse a known archived bill that disappeared
+#            from the inventory, and decide which rows need a FETCH. Read-only.
+#   Phase A  FETCH every needed row into its own owned temp directory and
+#            validate it as a PDF. No state write, no publication. The first
+#            failure stops dispatch and skips Phase B entirely.
+#   Phase B  in inventory order, reconcile present rows and publish fetched
+#            rows with the existing no-replace publication and state rules.
+
+INVENTORY_REF_FILENAME_UNSAFE = "EG_INVENTORY_FILENAME_UNSAFE"
+INVENTORY_REF_DUPLICATE_FILENAME = "EG_INVENTORY_DUPLICATE_FILENAME"
+INVENTORY_REF_KNOWN_BILL_MISSING = "EG_INVENTORY_KNOWN_BILL_MISSING"
+INVENTORY_SUPPORT_REFS = frozenset(
+    {INVENTORY_REF_FILENAME_UNSAFE, INVENTORY_REF_DUPLICATE_FILENAME, INVENTORY_REF_KNOWN_BILL_MISSING}
+)
+ARCHIVED_STATUSES = frozenset({"ARCHIVED", "PRESENT_RECONCILED"})
+
+
+class ListedSourceProtocol(Protocol):
+    def inventory(self, safety_ceiling: int) -> list[Any]: ...
+
+    def download(self, row: Any, destination: Path) -> str: ...
+
+
+@dataclass
+class _PlannedRow:
+    ordinal: int
+    row: Any = field(repr=False)
+    filename: str = field(repr=False)
+    key: str = field(repr=False)
+    final_path: Path = field(repr=False)
+    needs_fetch: bool = False
+
+
+def reconcile_listed_inventory(
+    config: RuntimeConfig,
+    source: ListedSourceProtocol,
+    state: StateStore,
+    logger: LoggerProtocol,
+    run_id: str,
+    list_only: bool = False,
+) -> RunSummary:
+    summary = RunSummary(run_id=run_id, status=NO_NEW_BILLS, exit_code=0)
+    logger.event("inventory_start")
+    rows = source.inventory(config.inventory_safety_ceiling)
+    summary.inventory_count = len(rows)
+    logger.event("inventory_complete", inventory_count=len(rows))
+    if not rows:
+        # The source already refuses an empty inventory; this keeps the
+        # guarantee independent of any one source implementation.
+        raise SourceContractError("EG_HTTP_LIST_EMPTY")
+
+    planned = _plan_listed_rows(config, state, rows)
+    pending = [item for item in planned if item.needs_fetch]
+    if list_only:
+        summary.pending_count = len(pending)
+        if pending:
+            summary.status = ACTION_REQUIRED
+            summary.exit_code = exit_code_for(ACTION_REQUIRED)
+        return summary
+
+    unresolved: list[str] = []
+    acquisitions: dict[int, _Acquisition] = {}
+    run_dirs: list[Path] = []
+    try:
+        # ---- Phase A: fetch every needed row before any durable write ---- #
+        for item in pending:
+            try:
+                acquisitions[item.ordinal] = _fetch_listed_row(config, source, item, run_dirs)
+                summary.fetch_count += 1
+            except AppError as exc:
+                summary.failure_stage = "fetch"
+                summary.failure_support_ref = _support_ref_of(exc)
+                _count_failure(summary, unresolved, logger, exc, item.ordinal)
+                break
+        logger.event("fetch_complete", downloaded_count=len(acquisitions), failure_count=len(unresolved))
+
+        # ---- Phase B: filename-keyed reconciliation and publication ---- #
+        if not unresolved:
+            for item in planned:
+                try:
+                    acquisition = acquisitions.get(item.ordinal)
+                    if acquisition is not None:
+                        outcome = _reconcile_acquisition(config, state, logger, acquisition)
+                    else:
+                        outcome = _reconcile_listed_present(state, item)
+                    if outcome == "downloaded":
+                        summary.downloaded_count += 1
+                    else:
+                        summary.present_count += 1
+                except AppError as exc:
+                    if summary.failure_stage is None:
+                        summary.failure_stage = "publish"
+                        summary.failure_support_ref = _support_ref_of(exc)
+                    _record_failure(state, item.key, item.filename, exc)
+                    _count_failure(summary, unresolved, logger, exc, item.ordinal)
+    finally:
+        preserved = {acquisition.run_dir for acquisition in acquisitions.values() if acquisition.preserve}
+        for run_dir in run_dirs:
+            if run_dir in preserved:
+                continue
+            try:
+                cleanup_run_directory(run_dir, config.temp_root)
+            except (OSError, ConfigError):
+                pass
+
+    if unresolved:
+        summary.status = _worst_status(unresolved)
+        summary.exit_code = 20 if any(exit_code_for(item) == 20 for item in unresolved) else 10
+    elif summary.downloaded_count:
+        summary.status = DOWNLOADED
+        summary.exit_code = 0
+    else:
+        summary.status = ALREADY_PRESENT
+        summary.exit_code = 0
+    return summary
+
+
+def _support_ref_of(error: AppError) -> str | None:
+    ref = getattr(error, "support_ref", None)
+    return ref if type(ref) is str and re.fullmatch(SUPPORT_REF_PATTERN, ref) else None
+
+
+def _plan_listed_rows(config: RuntimeConfig, state: StateStore, rows: list[Any]) -> list[_PlannedRow]:
+    """Phase 0. Read-only: no fetch, no state write, no archive write."""
+
+    planned: list[_PlannedRow] = []
+    seen: set[str] = set()
+    for row in rows:
+        filename = row.filename
+        try:
+            final_path = validate_filename(filename, config.archive_root)
+        except ConfigError:
+            raise SourceContractError(INVENTORY_REF_FILENAME_UNSAFE) from None
+        key = filename_key(filename)
+        if key in seen:
+            raise SourceContractError(INVENTORY_REF_DUPLICATE_FILENAME)
+        seen.add(key)
+        planned.append(_PlannedRow(ordinal=row.ordinal, row=row, filename=filename, key=key, final_path=final_path))
+
+    # Completeness: a bill this program already archived must still be listed.
+    # Its disappearance means the inventory is no longer the complete one.
+    for record in state.records():
+        if record.status in ARCHIVED_STATUSES and record.filename_key not in seen:
+            raise SourceContractError(INVENTORY_REF_KNOWN_BILL_MISSING)
+
+    for item in planned:
+        # An existing archive entry is never fetched: Phase B proves it present
+        # (or a conflict) with the existing rules. Only an absent one is fetched,
+        # and a same-key repair still compares against the recorded hash.
+        item.needs_fetch = not (item.final_path.exists() or item.final_path.is_symlink())
+    return planned
+
+
+def _fetch_listed_row(
+    config: RuntimeConfig,
+    source: ListedSourceProtocol,
+    item: _PlannedRow,
+    run_dirs: list[Path],
+) -> _Acquisition:
+    """FETCH one listed row into its own owned temp directory and validate it.
+
+    Transport retries live inside the source and are bounded by max_attempts;
+    this function never retries, so attempts are never multiplied.
+    """
+
+    run_dir = create_run_directory(config.temp_root, str(uuid.uuid4()))
+    run_dirs.append(run_dir)
+    temp_path = run_dir / "download.bin"
+    try:
+        source.download(item.row, temp_path)
+        info = validate_pdf(temp_path)
+    except OSError as exc:
+        raise StateError("owned temporary file could not be managed") from exc
+    return _Acquisition(
+        ordinal=item.ordinal,
+        run_dir=run_dir,
+        temp_path=temp_path,
+        filename=item.filename,
+        info=info,
+        key=item.key,
+        final_path=item.final_path,
+    )
+
+
+def _reconcile_listed_present(state: StateStore, item: _PlannedRow) -> str:
+    """Reconcile a row whose archive entry already existed at planning time."""
+
+    record = state.get(item.key)
+    state.mark_seen(item.key, item.filename)
+    try:
+        decision = _inspect_existing(item.final_path, record)
+        if decision == "present":
+            if record is None or record.status != "ARCHIVED":
+                info = validate_pdf(item.final_path)
+                state.record_archived(item.key, item.filename, info, completion_source="preexisting")
+            return "present"
+        if decision == "conflict":
+            raise ArchiveConflictError("existing archive hash conflicts with state")
+        raise StateError("archive entry disappeared during reconciliation")
+    except OSError as exc:
+        raise StateError("archive entry could not be inspected") from exc

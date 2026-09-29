@@ -10,8 +10,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .config import MAX_INVENTORY_CEILING, load_config_file, load_runtime_config
-from .errors import ACTION_REQUIRED, AppError, ConfigError, DependencyError, exit_code_for
+from .config import MAX_INVENTORY_CEILING, SOURCE_DIRECT_HTTP, RuntimeConfig, load_config_file, load_runtime_config
+from .errors import ACTION_REQUIRED, SUPPORT_REF_PATTERN, AppError, ConfigError, DependencyError, exit_code_for
+from .http_source import DirectHttpSource
+from .notify import build_alert_payload, send_alert
+from .run_lock import RunLock
 from .publication import cleanup_stale_owned_temp
 from .portal import (
     ACCOUNT_WITNESS_AMBIGUOUS_MESSAGE,
@@ -76,7 +79,7 @@ from .portal import (
     unobserved_navigation_pre_ems,
     unobserved_login_witnesses,
 )
-from .reconcile import reconcile_inventory
+from .reconcile import RunSummary, reconcile_inventory, reconcile_listed_inventory
 from .state import StateStore
 
 
@@ -340,6 +343,11 @@ def support_ref_for(error: AppError) -> str:
     lookup key, so nothing it carries can reach an output surface.
     """
 
+    # DL-XB-199 G3-101: a direct-HTTP, inventory or run-lock failure carries
+    # its own closed reference, chosen by the code that raised it.
+    own = getattr(error, "support_ref", None)
+    if type(own) is str and re.fullmatch(SUPPORT_REF_PATTERN, own):
+        return own
     return SUPPORT_REFS_BY_MESSAGE.get(error.message, UNCLASSIFIED_SUPPORT_REF)
 
 
@@ -403,6 +411,121 @@ def log_terminal_failure(logger: SafeLogger | None, error: AppError) -> None:
     except Exception:
         # Losing the evidence line is strictly less harmful than converting a
         # known failure into a different result or surfacing raw exception text.
+        pass
+
+
+RUNTIME_FAILURE_SUPPORT_REF = "EG_RUNTIME_FAILURE"
+
+
+def run_direct_http(config: RuntimeConfig, logger: SafeLogger, run_id: str, list_only: bool) -> int:
+    """The direct-HTTP MVP path (DL-XB-199 G3-101). No browser is reachable.
+
+    The single-run lock is taken before anything else touches the source,
+    state, archive or temp root. A terminal failure of `run` sends one
+    privacy-minimal alert; the alert never changes the returned exit code.
+    """
+
+    try:
+        with RunLock(config.state_path.parent):
+            cleanup_stale_owned_temp(config.temp_root)
+            with StateStore(config.state_path) as state:
+                if config.direct_http is None:
+                    raise ConfigError("direct_http settings are missing")
+                source = DirectHttpSource(config.direct_http, config.timeout_seconds, config.max_attempts)
+                summary = reconcile_listed_inventory(
+                    config=config,
+                    source=source,
+                    state=state,
+                    logger=logger,
+                    run_id=run_id,
+                    list_only=list_only,
+                )
+    except AppError as exc:
+        log_terminal_failure(logger, exc)
+        support_ref = support_ref_for(exc)
+        exit_code = exc.exit_code or exit_code_for(exc.status)
+        print(json.dumps({"status": exc.status, "error_class": exc.status, "support_ref": support_ref}, sort_keys=True))
+        if not list_only:
+            notify_failure(
+                config, logger, run_id,
+                stage=getattr(exc, "stage", "run"),
+                status=exc.status,
+                support_ref=support_ref,
+                exit_code=exit_code,
+                summary=None,
+            )
+        return exit_code
+    except (OSError, ValueError, TypeError):
+        print(json.dumps({"status": ACTION_REQUIRED, "error_class": "RUNTIME_FAILURE"}, sort_keys=True))
+        if not list_only:
+            notify_failure(
+                config, logger, run_id,
+                stage="run",
+                status=ACTION_REQUIRED,
+                support_ref=RUNTIME_FAILURE_SUPPORT_REF,
+                exit_code=20,
+                summary=None,
+            )
+        return 20
+    logger.event(
+        "run_complete",
+        status=summary.status,
+        inventory_count=summary.inventory_count,
+        downloaded_count=summary.downloaded_count,
+        present_count=summary.present_count,
+        failure_count=summary.failure_count,
+    )
+    print(json.dumps(summary.as_dict(), sort_keys=True))
+    if summary.exit_code != 0 and not list_only:
+        notify_failure(
+            config, logger, run_id,
+            stage=summary.failure_stage or "run",
+            status=summary.status,
+            support_ref=summary.failure_support_ref or f"EG_RESULT_{summary.status}",
+            exit_code=summary.exit_code,
+            summary=summary,
+        )
+    return summary.exit_code
+
+
+def notify_failure(
+    config: RuntimeConfig,
+    logger: SafeLogger,
+    run_id: str,
+    *,
+    stage: str,
+    status: str,
+    support_ref: str,
+    exit_code: int,
+    summary: RunSummary | None,
+) -> None:
+    """Best-effort alert. Every failure here is absorbed and only logged."""
+
+    if config.alert is None:
+        return
+    try:
+        counts = {}
+        if summary is not None:
+            counts = {
+                "inventory": summary.inventory_count,
+                "downloaded": summary.downloaded_count,
+                "present": summary.present_count,
+                "failure": summary.failure_count,
+            }
+        payload = build_alert_payload(
+            run_id=run_id,
+            stage=stage,
+            status=status,
+            support_ref=support_ref,
+            exit_code=exit_code,
+            counts=counts,
+        )
+        delivered = send_alert(config.alert, payload)
+    except Exception:
+        delivered = False
+    try:
+        logger.event("alert_delivered" if delivered else "alert_failed")
+    except Exception:
         pass
 
 
@@ -1232,6 +1355,10 @@ def main(argv: list[str] | None = None) -> int:
         config.preflight(require_archive=True)
         run_id = str(uuid.uuid4())
         logger = SafeLogger(config.log_root, run_id)
+        if config.source == SOURCE_DIRECT_HTTP:
+            if args.headed:
+                raise ConfigError("--headed is not valid for the direct_http source")
+            return run_direct_http(config, logger, run_id, list_only=args.command == "list")
         cleanup_stale_owned_temp(config.temp_root)
         with StateStore(config.state_path) as state:
             with PlaywrightPortal(config, headed=args.headed) as portal:

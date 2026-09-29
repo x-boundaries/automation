@@ -304,7 +304,124 @@ customer/private evidence, or any automatic retry under the same authority.
 This documentation boundary grants no live authority; a later live session
 must bind a new reviewed authority explicitly.
 
+## Direct-HTTP MVP daily path (DL-XB-199 G3-101)
+
+The Owner-fixed MVP daily path is deterministic direct HTTP. It uses no browser,
+no Playwright, no AI and no fallback of any kind:
+
+```text
+Task Scheduler -> installed launcher.ps1 (-File) -> python -m energygrid_bill_downloader run
+  -> LIST (configured tenant only) -> FETCH (listed, not-yet-archived bills only)
+  -> PDF validation -> no-replace publication -> state -> privacy-minimal alert on failure
+```
+
+The legacy browser source (`source: browser`, the default when `source` is
+absent) is unchanged and is not reachable from a `direct_http` run.
+
+### Private configuration
+
+`config/energygrid.direct_http.example.json` shows the shape with placeholders only.
+The private copy sets `"source": "direct_http"` and a `direct_http` object with
+exactly `list_url`, `fetch_url` and `tenant_id`. These are the private interface
+identity: they live only in the host's private configuration and are never
+logged, printed, alerted or committed. `tenant_id` is the Owner-supplied
+X-Boundaries identifier from X-Boundaries' own account records. The runtime never
+enumerates, searches or inspects any other tenant. `portal_url` and
+`account_identity` are not used by this source.
+
+The request bodies are fixed: LIST sends `{"tenant_id": <configured>}`; FETCH sends
+`{"filename": <listed>, "tenant_id": <configured>}`. These field names are the
+protocol vocabulary and must be confirmed against the private G2 evidence before
+the first live `list` (see "Later live steps"). A wrong field name fails closed
+(`EG_HTTP_LIST_REJECTED` or `EG_HTTP_STATUS_UNEXPECTED`); it never widens scope.
+
+### Frozen contract and fail-closed references
+
+A LIST response must be status 200, `Content-Type: application/json`, complete
+framing (`Content-Length` or chunked), at most 4 MiB, valid JSON with no repeated
+key, top-level exactly `{success, files}`, `success` exactly `true`, and a
+non-empty `files` array no longer than `inventory_safety_ceiling`. Every row is
+exactly `{date, filename, tenant_id}`, all strings, with `tenant_id` exactly equal
+to the configured value. Filenames pass the existing Windows filename rules and
+must end in `.pdf`; duplicate normalised names fail. A bill already recorded as
+archived that is missing from the inventory fails the whole run before any FETCH.
+
+A FETCH response must be status 200, correctly framed, non-empty, at most 32 MiB,
+and pass the existing PDF validation before it leaves its owned temp directory.
+Redirects are never followed and ambient proxies are ignored.
+
+| Support reference | Meaning | Exit |
+| --- | --- | --- |
+| `EG_HTTP_LIST_REJECTED` | LIST answered with a bare message (the invalid-tenant shape) | 20 |
+| `EG_HTTP_LIST_NOT_SUCCESS` | `success` was `false` | 20 |
+| `EG_HTTP_LIST_SCHEMA_DRIFT` | top-level shape changed (including paging/cursor/total keys) | 20 |
+| `EG_HTTP_LIST_ROW_SCHEMA_DRIFT` | a row's keys or value types changed | 20 |
+| `EG_HTTP_LIST_TENANT_MISMATCH` | a row carried any other tenant identifier | 20 |
+| `EG_HTTP_LIST_EMPTY` / `EG_HTTP_LIST_CEILING` | empty inventory / above the safety ceiling | 20 |
+| `EG_HTTP_LIST_CONTENT_TYPE` / `EG_HTTP_LIST_MALFORMED_JSON` / `EG_HTTP_LIST_OVERSIZE` | LIST body contract broken | 20 |
+| `EG_INVENTORY_FILENAME_UNSAFE` / `EG_INVENTORY_DUPLICATE_FILENAME` | listed name refused | 20 |
+| `EG_INVENTORY_KNOWN_BILL_MISSING` | an archived bill disappeared from the inventory | 20 |
+| `EG_HTTP_REDIRECT_REFUSED` / `EG_HTTP_STATUS_UNEXPECTED` | any 3xx; any 4xx except 429; 501/505; any non-200 2xx | 20 |
+| `EG_HTTP_FRAMING_INCOMPLETE` / `EG_HTTP_FETCH_EMPTY` / `EG_HTTP_FETCH_OVERSIZE` | FETCH body contract broken | 20 |
+| `EG_HTTP_TRANSPORT_EXHAUSTED` | connection error, timeout, 429 or 500/502/503/504 on every attempt | 10 |
+| `EG_RUN_ALREADY_ACTIVE` | another run holds the single-run lock (`RUN_IN_PROGRESS`) | 10 |
+
+Only the transport row is retried, at most `max_attempts` times per operation,
+inside the source. Nothing is retried after a contract violation, a tenant
+mismatch, an invalid filename, an invalid PDF or a ceiling breach. Retries rewrite
+only an owned temp file, so they can never duplicate a publication.
+
+### Acquisition, publication and rerun semantics
+
+Phase 0 validates the whole inventory and decides which bills need a FETCH, and
+writes nothing. Phase A fetches and validates every needed bill into its own owned
+temp directory; the first failure stops dispatch and nothing is published or
+recorded. Only after every needed bill is acquired does Phase B publish with the
+existing no-replace move and record state. An existing archive file is never
+fetched again: it is proven present (or a conflict) by the existing rules. An
+immediate rerun therefore performs one LIST, zero FETCH and zero publication; it
+may update `last_seen_at_utc`, exactly as the existing state contract does.
+
+`list` performs Phase 0 only and reports `pending_count` (exit 0 when nothing is
+pending, 20 when a `run` would fetch). It never fetches and never writes.
+
+### Single-run exclusion
+
+`run` and `list` take a non-blocking OS lock on `energygrid.run.lock` in the
+private state directory before touching the source, state, archive or temp root.
+The kernel releases it when the process exits or dies, so there is no stale-lock
+state to clean up; the file itself is inert. A second run exits 10 with
+`RUN_IN_PROGRESS` and touches nothing. Task Scheduler's `IgnoreNew` covers
+scheduled re-entry; the lock covers a manual run overlapping a scheduled one.
+
+### Failure alert
+
+When the private config carries an `alert` object, a failing `run` sends one POST
+to a loopback-only URL (127.0.0.1, localhost or ::1), consumed by the inactive
+`n8n-workflows/energygrid_alert_ingress.workflow.json`, which forwards it to the
+existing Telegram capability. The `energygrid.alert.v1` payload carries only
+`schema, event, timestamp, run_id, stage, status, support_ref, exit_code, counts,
+attention_required`. An optional header credential is read from the environment
+variable named by `alert.auth_token_env`; the value is never logged. Delivery is
+one bounded attempt; the outcome is logged as `alert_delivered` or `alert_failed`
+and never changes the run's status or exit code. `list` never alerts.
+
+Not covered by this alert: a launcher preflight failure (exit 70) and a private
+configuration that cannot be parsed (exit 64) happen before the application can
+read its alert settings. Task Scheduler's last-run result records both; the Owner
+must check it after any change to the host.
+
+### Breakage response
+
+A fail-closed reference in the contract table means the interface changed. Do not
+retry beyond the next scheduled run, do not edit the contract locally and do not
+switch to the browser. Preserve the private archive, state and logs, and reopen the
+EnergyGrid case for scoped DELTA discovery.
+
 ## Download-first production path
+
+This section describes the legacy browser source (`source: browser`). The direct-HTTP
+MVP path above does not use it.
 
 DL-XB-199 (G2-076, as adjudicated by Web). A normal `run` works in two phases.
 
@@ -595,6 +712,17 @@ hashed and recorded as `PRESENT_RECONCILED`; an invalid file is not silently
 replaced.
 
 ## Later Task Scheduler handoff
+
+`task-scheduler/energygrid_daily.task.example.xml` is the inert, reviewed task shape
+for the direct-HTTP MVP (DL-XB-199 G3-101): absolute Windows PowerShell 5.1 path,
+the installed `launcher.ps1` through `-File` (which preserves the launcher's exit
+code; a `-Command` wrapper reports 0 when the script cannot load), a non-elevated
+`LeastPrivilege` run principal with a stored password so the DPAPI credential
+import works, `MultipleInstancesPolicy` `IgnoreNew`, a hard `ExecutionTimeLimit`
+of 30 minutes, `StartWhenAvailable`, and `Enabled=false`. `-AuthorisedLauncherRootWriteSid`
+is passed as ONE comma-separated argument: `-File` binds it as a single string and
+the launcher splits it. Before G3-101 that single string was refused, so every
+multi-trustee set failed position 16 under the scheduled invocation.
 
 `task-scheduler/register_task.example.ps1` is intentionally non-operational. A
 separate current-turn approval is required before any scheduler registration,

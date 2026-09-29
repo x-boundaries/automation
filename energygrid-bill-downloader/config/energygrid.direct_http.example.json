@@ -1,0 +1,20 @@
+{
+  "source": "direct_http",
+  "direct_http": {
+    "list_url": "https://list.placeholder.invalid/REPLACE_WITH_PRIVATE_LIST_PATH",
+    "fetch_url": "https://fetch.placeholder.invalid/REPLACE_WITH_PRIVATE_FETCH_PATH",
+    "tenant_id": "REPLACE_WITH_PRIVATE_TENANT_ID"
+  },
+  "alert": {
+    "url": "http://127.0.0.1:5678/webhook/REPLACE_WITH_ALERT_WEBHOOK_PATH",
+    "auth_header_name": "X-EnergyGrid-Alert",
+    "auth_token_env": "ENERGYGRID_ALERT_TOKEN"
+  },
+  "archive_root": "C:\\XB\\_MandarinGallery\\Utilities\\EnergyGrid",
+  "state_path": "C:\\XB_Runtime\\energygrid-bill-downloader\\state\\state.sqlite3",
+  "temp_root": "C:\\XB_Runtime\\energygrid-bill-downloader\\temp",
+  "log_root": "C:\\XB_Runtime\\energygrid-bill-downloader\\logs",
+  "timeout_seconds": 30,
+  "max_attempts": 2,
+  "inventory_safety_ceiling": 1000
+}
