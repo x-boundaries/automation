@@ -4383,6 +4383,7 @@ public static class XbBoundaryLsa
 
     [DllImport("advapi32.dll")] private static extern uint LsaOpenPolicy(IntPtr systemName, ref LsaObjectAttributes objectAttributes, uint desiredAccess, out IntPtr policyHandle);
     [DllImport("advapi32.dll")] private static extern uint LsaEnumerateAccountRights(IntPtr policyHandle, byte[] accountSid, out IntPtr userRights, out uint countOfRights);
+    [DllImport("advapi32.dll")] private static extern uint LsaAddAccountRights(IntPtr policyHandle, byte[] accountSid, ref LsaUnicodeString userRights, uint countOfRights);
     [DllImport("advapi32.dll")] private static extern uint LsaRemoveAccountRights(IntPtr policyHandle, byte[] accountSid, [MarshalAs(UnmanagedType.U1)] bool allRights, IntPtr userRights, uint countOfRights);
     [DllImport("advapi32.dll")] private static extern uint LsaFreeMemory(IntPtr buffer);
     [DllImport("advapi32.dll")] private static extern uint LsaClose(IntPtr policyHandle);
@@ -4434,6 +4435,28 @@ public static class XbBoundaryLsa
             finally { LsaFreeMemory(rights); }
         }
         finally { LsaClose(handle); }
+    }
+
+    public static void AddAccountRight(string sid, string name)
+    {
+        if (String.IsNullOrWhiteSpace(name)) { throw new InvalidOperationException("lsa_right_name_invalid"); }
+        IntPtr handle = Open();
+        IntPtr buffer = IntPtr.Zero;
+        try
+        {
+            buffer = Marshal.StringToHGlobalUni(name);
+            LsaUnicodeString right = new LsaUnicodeString();
+            right.Length = checked((ushort)(name.Length * 2));
+            right.MaximumLength = checked((ushort)(right.Length + 2));
+            right.Buffer = buffer;
+            uint status = LsaAddAccountRights(handle, SidBytes(sid), ref right, 1);
+            if (status != 0) { throw new InvalidOperationException("lsa_add_right_failed:" + LsaNtStatusToWinError(status)); }
+        }
+        finally
+        {
+            if (buffer != IntPtr.Zero) { Marshal.FreeHGlobal(buffer); }
+            LsaClose(handle);
+        }
     }
 
     public static void RemoveAllRights(string sid)
@@ -4645,6 +4668,11 @@ try {
     $credential = New-Object Management.Automation.PSCredential($workerAccount, $securePassword)
     $wrongCredential = New-Object Management.Automation.PSCredential($workerAccount, $secureWrong)
     $script:WorkerAccount = $workerAccount
+    if ($null -ne [XbBoundaryLsa]::GetRights($state.user_sid)) { throw "boundary_user_right_preimage_not_clean" }
+    [XbBoundaryLsa]::AddAccountRight($state.user_sid, "SeBatchLogonRight")
+    $workerRights = @([XbBoundaryLsa]::GetRights($state.user_sid))
+    if ($workerRights.Count -ne 1 -or $workerRights[0] -cne "SeBatchLogonRight") { throw "boundary_batch_logon_right_not_assigned" }
+    $report.account.batch_logon_right_assigned = $true
     $report.environment.worker_account = $workerAccount
     $report.environment.worker_sid = $state.user_sid
     try {
@@ -5526,6 +5554,7 @@ class MemberWorkerHostedTaskBoundaryTests(unittest.TestCase):
         self._assert_pristine(case["post_cleanup"])
 
     def test_install_then_uninstall(self) -> None:
+        self.assertTrue(self.report["account"]["batch_logon_right_assigned"])
         case = self._case("install_then_uninstall")
         self.assertEqual(case["install_outcome"], "pass")
         self.assertEqual(
