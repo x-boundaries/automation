@@ -6248,6 +6248,19 @@ class ScheduledTaskSidBinding(TierBBase):
 class WriteAuthorityBranchDiagnostic(TierABase):
     """Branch-level observability for positions 15 and 16, closed and non-identifying."""
 
+    def assert_run_principal_branch(self, diagnostic, bypass_present):
+        """Host-dependent by design: an elevated or CI token holding a bypass privilege
+        fails position 15 before any object is examined; otherwise the writable scratch
+        root is the first examined object and is reported as granted."""
+        if bypass_present:
+            self.assertEqual("BYPASS_PRIVILEGE_PRESENT", diagnostic["branch"])
+            self.assertIsNone(diagnostic["object"])
+        else:
+            self.assertEqual("WRITE_ACCESS_GRANTED", diagnostic["branch"])
+            self.assertEqual("launcher_root", diagnostic["object"])
+        self.assertIsNone(diagnostic["ace_scope"])
+        self.assertIsNone(diagnostic["trustee_class"])
+
     def assert_closed_validation(self, observed):
         document = json.loads(observed["validationJson"])
         self.assertEqual("FAIL", document["status"])
@@ -6319,9 +6332,7 @@ class WriteAuthorityBranchDiagnostic(TierABase):
         self.assertEqual(RUN_PRINCIPAL_REF, observed["securitySupportRef"])
         diagnostic = self.assert_closed_validation(observed)
         self.assertEqual("launcher_root_not_writable_by_run_principal", diagnostic["check"])
-        self.assertEqual("WRITE_ACCESS_GRANTED", diagnostic["branch"])
-        self.assertEqual("launcher_root", diagnostic["object"])
-        self.assertIsNone(diagnostic["trustee_class"])
+        self.assert_run_principal_branch(diagnostic, observed["bypassPresent"])
 
     def test_a_refused_set_reports_its_branch_through_the_aggregate(self):
         with TemporaryScratch() as tmp:
@@ -6341,8 +6352,10 @@ class WriteAuthorityBranchDiagnostic(TierABase):
         diagnostic = observed["write_authority_diagnostic"]
         self.assertEqual(DIAGNOSTIC_KEYS, list(diagnostic))
         self.assertEqual("launcher_root_not_writable_by_run_principal", diagnostic["check"])
-        self.assertEqual("WRITE_ACCESS_GRANTED", diagnostic["branch"])
-        self.assertEqual("launcher_root", diagnostic["object"])
+        with TemporaryScratch() as tmp:
+            root, _built = build_scratch_launcher_root(ANY_PS, tmp, "authorised_self")
+            bypass_present = check_write_authority(ANY_PS, tmp, root)["bypassPresent"]
+        self.assert_run_principal_branch(diagnostic, bypass_present)
         self.assertIsNone(re.search(r"S-1-(?:\d+-)+\d+", emitted))
         self.assertNotIn(str(environment.launcher_root), emitted)
 
