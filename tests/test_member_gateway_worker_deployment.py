@@ -4892,6 +4892,7 @@ try {
             $runtimeRootAcl = Get-Acl -LiteralPath $RuntimeRoot
             $logsRootAcl = Get-Acl -LiteralPath $logsPath
             $workerSid = Get-XbAccountSid -Account $WorkerAccount
+            $workerSidIdentity = [Security.Principal.SecurityIdentifier]::new($workerSid)
             $ci7.root_owner_sid = $logsRootAcl.GetOwner([Security.Principal.SecurityIdentifier]).Value
             $ci7.root_owner_accepted = ($ci7.root_owner_sid -in @("S-1-5-18", "S-1-5-32-544"))
             $ci7.root_dacl_protected = [bool]$logsRootAcl.AreAccessRulesProtected
@@ -4956,7 +4957,7 @@ try {
             finally { Set-Item function:script:Invoke-XbNativeAccessCheck $originalAccessCheck }
 
             $configPath = Join-Path $RuntimeRoot "config"
-            $denyRead = [Security.AccessControl.FileSystemAccessRule]::new($workerSid, [Security.AccessControl.FileSystemRights]::ReadData, [Security.AccessControl.AccessControlType]::Deny)
+            $denyRead = [Security.AccessControl.FileSystemAccessRule]::new($workerSidIdentity, [Security.AccessControl.FileSystemRights]::ReadData, [Security.AccessControl.AccessControlType]::Deny)
             $originalConfigAcl = Get-Acl -LiteralPath $configPath
             try {
                 $deniedConfigAcl = Get-Acl -LiteralPath $configPath
@@ -4965,13 +4966,13 @@ try {
                 $ci7.required_operation_denied = Get-XbBoundaryOutcome { Assert-XbWorkerEffectiveRights -TaskCredential $credential }
             } finally { Set-Acl -LiteralPath $configPath -AclObject $originalConfigAcl -ErrorAction Stop }
 
-            $ci7.prohibited_write_dac_allow = Invoke-XbCi7AclProbe -Path $configPath -Rule ([Security.AccessControl.FileSystemAccessRule]::new($workerSid, [Security.AccessControl.FileSystemRights]::ChangePermissions, [Security.AccessControl.AccessControlType]::Allow)) -Token $nativeToken -DesiredAccess ([uint32]0x00040000) -Credential $credential
-            $ci7.prohibited_write_owner_allow = Invoke-XbCi7AclProbe -Path $configPath -Rule ([Security.AccessControl.FileSystemAccessRule]::new($workerSid, [Security.AccessControl.FileSystemRights]::TakeOwnership, [Security.AccessControl.AccessControlType]::Allow)) -Token $nativeToken -DesiredAccess ([uint32]0x00080000) -Credential $credential
-            $ci7.prohibited_delete_allow = Invoke-XbCi7AclProbe -Path $configPath -Rule ([Security.AccessControl.FileSystemAccessRule]::new($workerSid, [Security.AccessControl.FileSystemRights]::Delete, [Security.AccessControl.AccessControlType]::Allow)) -Token $nativeToken -DesiredAccess ([uint32]0x00010000) -Credential $credential
-            $ci7.prohibited_delete_child_allow = Invoke-XbCi7AclProbe -Path $configPath -Rule ([Security.AccessControl.FileSystemAccessRule]::new($workerSid, [Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles, [Security.AccessControl.AccessControlType]::Allow)) -Token $nativeToken -DesiredAccess ([uint32]0x00000040) -Credential $credential
-            $ci7.child_write_dac_allow = Invoke-XbCi7AclProbe -Path $logPath -Rule ([Security.AccessControl.FileSystemAccessRule]::new($workerSid, [Security.AccessControl.FileSystemRights]::ChangePermissions, [Security.AccessControl.AccessControlType]::Allow)) -Token $nativeToken -DesiredAccess ([uint32]0x00040000) -Credential $credential
-            $ci7.child_write_owner_allow = Invoke-XbCi7AclProbe -Path $logPath -Rule ([Security.AccessControl.FileSystemAccessRule]::new($workerSid, [Security.AccessControl.FileSystemRights]::TakeOwnership, [Security.AccessControl.AccessControlType]::Allow)) -Token $nativeToken -DesiredAccess ([uint32]0x00080000) -Credential $credential
-            $ci7.parent_delete_child_allow = Invoke-XbCi7AclProbe -Path $RuntimeRoot -Rule ([Security.AccessControl.FileSystemAccessRule]::new($workerSid, [Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles, [Security.AccessControl.AccessControlType]::Allow)) -Token $nativeToken -DesiredAccess ([uint32]0x00000040) -Credential $credential
+            $ci7.prohibited_write_dac_allow = Invoke-XbCi7AclProbe -Path $configPath -Rule ([Security.AccessControl.FileSystemAccessRule]::new($workerSidIdentity, [Security.AccessControl.FileSystemRights]::ChangePermissions, [Security.AccessControl.AccessControlType]::Allow)) -Token $nativeToken -DesiredAccess ([uint32]0x00040000) -Credential $credential
+            $ci7.prohibited_write_owner_allow = Invoke-XbCi7AclProbe -Path $configPath -Rule ([Security.AccessControl.FileSystemAccessRule]::new($workerSidIdentity, [Security.AccessControl.FileSystemRights]::TakeOwnership, [Security.AccessControl.AccessControlType]::Allow)) -Token $nativeToken -DesiredAccess ([uint32]0x00080000) -Credential $credential
+            $ci7.prohibited_delete_allow = Invoke-XbCi7AclProbe -Path $configPath -Rule ([Security.AccessControl.FileSystemAccessRule]::new($workerSidIdentity, [Security.AccessControl.FileSystemRights]::Delete, [Security.AccessControl.AccessControlType]::Allow)) -Token $nativeToken -DesiredAccess ([uint32]0x00010000) -Credential $credential
+            $ci7.prohibited_delete_child_allow = Invoke-XbCi7AclProbe -Path $configPath -Rule ([Security.AccessControl.FileSystemAccessRule]::new($workerSidIdentity, [Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles, [Security.AccessControl.AccessControlType]::Allow)) -Token $nativeToken -DesiredAccess ([uint32]0x00000040) -Credential $credential
+            $ci7.child_write_dac_allow = Invoke-XbCi7AclProbe -Path $logPath -Rule ([Security.AccessControl.FileSystemAccessRule]::new($workerSidIdentity, [Security.AccessControl.FileSystemRights]::ChangePermissions, [Security.AccessControl.AccessControlType]::Allow)) -Token $nativeToken -DesiredAccess ([uint32]0x00040000) -Credential $credential
+            $ci7.child_write_owner_allow = Invoke-XbCi7AclProbe -Path $logPath -Rule ([Security.AccessControl.FileSystemAccessRule]::new($workerSidIdentity, [Security.AccessControl.FileSystemRights]::TakeOwnership, [Security.AccessControl.AccessControlType]::Allow)) -Token $nativeToken -DesiredAccess ([uint32]0x00080000) -Credential $credential
+            $ci7.parent_delete_child_allow = Invoke-XbCi7AclProbe -Path $RuntimeRoot -Rule ([Security.AccessControl.FileSystemAccessRule]::new($workerSidIdentity, [Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles, [Security.AccessControl.AccessControlType]::Allow)) -Token $nativeToken -DesiredAccess ([uint32]0x00000040) -Credential $credential
 
             $junctionPath = Join-Path ([IO.Path]::GetTempPath()) ("xb-ci7-junction-{0}" -f (New-XbBoundaryHex 8))
             & cmd.exe /c mklink /J "$junctionPath" "$logsPath" | Out-Null
