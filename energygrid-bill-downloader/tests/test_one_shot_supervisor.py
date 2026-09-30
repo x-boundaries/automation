@@ -3954,14 +3954,24 @@ try {
 finally {
     $busyField.SetValue($null, 0)
 }
-# Deterministic provider timeout: the committed budget is lowered to 1 ms, far below any
-# measured WMI response, and the committed observer must fail closed.
-$script:EgObserverMetadataTimeoutMilliseconds = 1
+# Deterministic provider timeout response at the metadata call site. The committed
+# observer and its timeout budget remain unchanged; the real-WMI positive control above
+# continues to exercise the committed provider.
+function Invoke-InjectedProviderTimeout {
+    param([uint32]$ProcessId, [int]$TimeoutMilliseconds)
+    Assert-Observer ($TimeoutMilliseconds -eq $committedBudget) 'N7_committed_timeout_budget'
+    $result = New-Object EnergyGridOneShotSupervisorNative+ProcessMetadataResult
+    $result.TimedOut = $true
+    Assert-Observer ($result.TimedOut -and -not $result.Succeeded -and -not $result.ProviderFailed) `
+        'N7_timeout_result'
+    return $result
+}
+Use-CommittedObserver @{ $metadataSite = '(Invoke-InjectedProviderTimeout ([uint32]$candidatePid) $script:EgObserverMetadataTimeoutMilliseconds)' }
 try {
     Invoke-MatrixCase 'N7_provider_timeout' $positive $false $true 'AMBIGUOUS' -Passes 1 -Verdict
 }
 finally {
-    $script:EgObserverMetadataTimeoutMilliseconds = $committedBudget
+    Use-CommittedObserver
 }
 Wait-ProviderIdle
 
