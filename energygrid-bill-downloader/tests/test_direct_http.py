@@ -732,6 +732,65 @@ class HttpFramingAdmission(DirectHttpCase):
             payload,
         )
 
+    def _non_ows_content_length_cases(self, payload: bytes, content_type: str) -> list[tuple[str, object]]:
+        content = [("Content-Type", content_type)]
+        length = str(len(payload))
+        cases = []
+        # These are non-OWS whitespace/control characters that Python's generic
+        # str.strip() removes and that can be represented on the Latin-1 wire.
+        for char in ("\v", "\f", "\x1c", "\x1d", "\x1e", "\x1f", "\x85", "\xa0"):
+            codepoint = f"U+{ord(char):04X}"
+            for position, value in (("leading", char + length), ("trailing", length + char)):
+                cases.append((
+                    f"{position} {codepoint}",
+                    raw_response(content + [("Content-Length", value)], payload),
+                ))
+        return cases
+
+    def test_list_rejects_non_ows_content_length_whitespace_without_retry(self) -> None:
+        self._assert_cases(
+            "list",
+            self._non_ows_content_length_cases(self._list_payload(), "application/json"),
+        )
+
+    def test_fetch_rejects_non_ows_content_length_whitespace_without_retry(self) -> None:
+        self._assert_cases(
+            "fetch",
+            self._non_ows_content_length_cases(synthetic_pdf(b"framing-test"), "application/pdf"),
+        )
+
+    def test_parser_decoded_content_length_accepts_ascii_ows(self) -> None:
+        lengths_and_payloads = (
+            ("list", self._list_payload(), "application/json"),
+            ("fetch", synthetic_pdf(bill_name(0).encode("ascii")), "application/pdf"),
+        )
+        for stage, payload, content_type in lengths_and_payloads:
+            expected = str(len(payload))
+            for value in (expected, f" {expected} ", f"\t{expected}\t"):
+                with self.subTest(stage=stage, content_length=repr(value)):
+                    list_before = len(self.service_state.list_requests)
+                    fetch_before = len(self.service_state.fetch_requests)
+                    behaviour = raw_response(
+                        [("Content-Type", content_type), ("Content-Length", value)],
+                        payload,
+                    )
+                    if stage == "list":
+                        self.service_state.list_queue = [behaviour]
+                        self.service_state.fetch_queue = {}
+                    else:
+                        self.service_state.list_queue = []
+                        self.service_state.fetch_queue = {bill_name(0): [behaviour]}
+
+                    with tempfile.TemporaryDirectory() as case_root:
+                        deployment = Deployment(Path(case_root), self.service)
+                        code, document = deployment.run()
+                        self.assertEqual(0, code, document)
+                        self.assertEqual(4, len(deployment.archived()))
+                        self.assertEqual(4, len(deployment.state_rows()))
+                        self.assertEqual([], deployment.temp_entries())
+                    self.assertEqual(list_before + 1, len(self.service_state.list_requests))
+                    self.assertEqual(fetch_before + 4, len(self.service_state.fetch_requests))
+
     def test_list_rejects_malformed_chunk_wire_delimiters_and_trailers(self) -> None:
         self._assert_cases(
             "list",

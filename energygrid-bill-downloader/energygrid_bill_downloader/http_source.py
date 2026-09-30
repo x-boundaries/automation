@@ -451,7 +451,10 @@ class DirectHttpSource:
             else:
                 if chunked or len(content_lengths) != 1:
                     raise SourceContractError(REF_FRAMING_INCOMPLETE, stage=stage)
-                length_value = content_lengths[0].strip()
+                # HTTP optional whitespace is limited to ASCII SP and HTAB.
+                # Generic str.strip() also removes Unicode whitespace and
+                # other controls, which could normalize an invalid field.
+                length_value = content_lengths[0].strip(" \t")
                 if not length_value.isascii() or not length_value.isdecimal():
                     raise SourceContractError(REF_FRAMING_INCOMPLETE, stage=stage) from None
                 try:
