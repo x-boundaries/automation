@@ -4,7 +4,7 @@ computes the immutable XB-MN-1 identity once (W-G2-149 sections 2.1-2.3, 3)."""
 import unittest
 
 from xb_member_gateway.canonical import build_source_event, canonical_json, canonicalize_source_event
-from xb_member_gateway.models import JobState
+from xb_member_gateway.models import JobState, SourceAdmissionMode, source_cursor_v2
 from xb_member_gateway.repository import InMemoryRepository, RepositoryError, SourceConflict
 
 try:
@@ -46,6 +46,51 @@ class IngestByteIdentityTests(unittest.TestCase):
                 self.assertEqual(canonical_json(stored), entry["canonical_json"])
                 receipt = repository.handling_receipt(entry["id"])
                 self.assertEqual((receipt.payload_fingerprint, receipt.create_time_exact), (entry["payload_hash"], "2026-09-30T01:00:00.123456789Z"))
+
+    def test_first_member_allowance_counts_accepted_members_only(self):
+        """The 0 -> 1 first_member guard counts accepted members; a
+        REJECTED_VALIDATION job is receipted but never consumes it."""
+
+        repository = make_repository()
+
+        def cursor_state():
+            cursor, _, _ = repository.get_source_cursor("member_registration", "member-intake.v1")
+            view = source_cursor_v2(cursor, admission_mode=SourceAdmissionMode.FIRST_MEMBER, epoch=None, open_page=None)
+            return cursor.initial_window_admission_count, view["accepted_member_allowance_remaining"]
+
+        long_name = "N" * 101
+        # 1-3. A validation rejection is handled/receipted, does not count,
+        # and leaves the allowance available.
+        rejected = repository.ingest_source_event(source_event("fm-rejected", pdpa_acknowledged=False, phone="81230001"), policy=policy(), now=NOW, initial_window_max=1)
+        self.assertEqual((rejected.job.state, rejected.job.outcome_reason), (JobState.REJECTED_VALIDATION, "pdpa_not_acknowledged"))
+        self.assertIsNotNone(repository.handling_receipt("fm-rejected"))
+        self.assertEqual(cursor_state(), (0, 1))
+        # 4. A later valid member consumes the 0 -> 1 allowance.
+        accepted = repository.ingest_source_event(source_event("fm-accepted", phone="81230002"), policy=policy(), now=NOW, initial_window_max=1)
+        self.assertEqual(accepted.job.state, JobState.QUEUED)
+        self.assertEqual(cursor_state(), (1, 0))
+        # 5. A second valid member loses atomically: no receipt, no job.
+        with self.assertRaisesRegex(SourceConflict, "initial_source_window_exhausted"):
+            repository.ingest_source_event(source_event("fm-loser", phone="81230003"), policy=policy(), now=NOW, initial_window_max=1)
+        self.assertIsNone(repository.handling_receipt("fm-loser"))
+        self.assertEqual(len(repository._jobs), 2)
+        # 6. A validation rejection is still recordable after consumption.
+        late = repository.ingest_source_event(source_event("fm-late-rejected", name=long_name, phone="81230004"), policy=policy(), now=NOW, initial_window_max=1)
+        self.assertEqual((late.job.state, late.job.outcome_reason), (JobState.REJECTED_VALIDATION, "name_exceeds_autocount_limit"))
+        self.assertIsNotNone(repository.handling_receipt("fm-late-rejected"))
+        self.assertEqual(cursor_state(), (1, 0))
+        # 7. Replay of accepted and rejected responses is idempotent.
+        for response_id, changes, job in (
+            ("fm-accepted", {"phone": "81230002"}, accepted.job),
+            ("fm-rejected", {"pdpa_acknowledged": False, "phone": "81230001"}, rejected.job),
+            ("fm-late-rejected", {"name": long_name, "phone": "81230004"}, late.job),
+        ):
+            replay = repository.ingest_source_event(source_event(response_id, **changes), policy=policy(), now=NOW, initial_window_max=1)
+            self.assertEqual((replay.replayed, replay.job.job_id), (True, job.job_id), response_id)
+        self.assertEqual(cursor_state(), (1, 0))
+        # 8. Source identity / fingerprint conflicts stay fail-closed.
+        with self.assertRaisesRegex(SourceConflict, "^(request|source)_identity_payload_conflict$"):
+            repository.ingest_source_event(source_event("fm-rejected", pdpa_acknowledged=False, phone="81239999"), policy=policy(), now=NOW, initial_window_max=1)
 
     def test_first_member_guard_and_cursor_are_unchanged(self):
         repository = make_repository()

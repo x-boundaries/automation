@@ -163,5 +163,16 @@ class PrimitiveChildEnvironmentTests(unittest.TestCase):
         self.assertIn('[void]$startInfo.EnvironmentVariables.Remove("XB_MEMBER_GATEWAY_WORKER_TOKEN")', library)
         self.assertIn('[void]$startInfo.EnvironmentVariables.Remove("XB_WORKER_FAULT")', library)
 
+    def test_child_stdin_is_explicit_bom_less_bytes(self):
+        library = (ROOT / "scripts/ac2_member_gateway_worker_lib.ps1").read_text(encoding="utf-8")
+        self.assertIn("$script:XbUtf8NoBom = New-Object System.Text.UTF8Encoding($false)", library)
+        self.assertIn("[Console]::InputEncoding = $script:XbUtf8NoBom", library)
+        self.assertIn('if ([Console]::InputEncoding.GetPreamble().Length -ne 0) { throw "stdin_preamble_not_suppressed" }', library)
+        self.assertIn("$stdin = $process.StandardInput.BaseStream", library)
+        self.assertIn('$requestBytes = $script:XbUtf8NoBom.GetBytes($RequestLine + "`n")', library)
+        # The framework text writer never writes the request.
+        self.assertNotIn("StandardInput.WriteLine", library)
+        self.assertNotIn("StandardInput.Write(", library)
+
 if __name__ == "__main__":
     unittest.main()

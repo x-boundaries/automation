@@ -14,6 +14,7 @@ Set-StrictMode -Version Latest
 
 # Absolute interpreter for the primitive child (never resolved from PATH).
 $script:XbWindowsPowerShellPath = "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+$script:XbUtf8NoBom = New-Object System.Text.UTF8Encoding($false)
 $script:XbWorkerClockSkewSeconds = 120
 $script:XbWorkerMaxResultPosts = 3
 $script:XbWorkerAllowedFaults = @("skip_result_post")
@@ -337,12 +338,34 @@ function Invoke-XbAc2PrimitiveChild {
         if ($null -eq $ChildEnvironment[$key]) { [void]$startInfo.EnvironmentVariables.Remove([string]$key) }
         else { $startInfo.EnvironmentVariables[[string]$key] = [string]$ChildEnvironment[$key] }
     }
+    # The child reads exactly one ASCII JSON line; byte 0 must be "{". The
+    # request text is already ASCII (non-ASCII is escaped as \uXXXX); refuse
+    # anything else before a child exists.
+    if ($RequestLine -cnotmatch '^[\x20-\x7E]+$' -or -not $RequestLine.StartsWith("{")) {
+        return (New-XbWorkerSynthesisedOutput -Outcome "FAILED_BEFORE_WRITE" -ReasonCode "primitive_launch_failed" -SaveMayHaveHappened $false -ReleaseSha256 $ReleaseSha256)
+    }
+    $requestBytes = $script:XbUtf8NoBom.GetBytes($RequestLine + "`n")
     $process = New-Object System.Diagnostics.Process
     $process.StartInfo = $startInfo
+    # .NET Framework has no ProcessStartInfo.StandardInputEncoding: Start()
+    # builds the stdin writer from [Console]::InputEncoding and, with
+    # AutoFlush, writes that encoding's preamble into the pipe immediately.
+    # Pin a BOM-less UTF-8 input encoding for exactly the Start() call, prove
+    # it has no preamble, and restore the caller's encoding afterwards.
+    $savedInputEncoding = $null
+    $started = $false
     try {
+        $savedInputEncoding = [Console]::InputEncoding
+        [Console]::InputEncoding = $script:XbUtf8NoBom
+        if ([Console]::InputEncoding.GetPreamble().Length -ne 0) { throw "stdin_preamble_not_suppressed" }
         if (-not $process.Start()) { throw "primitive_start_failed" }
+        $started = $true
     }
-    catch {
+    catch { $started = $false }
+    finally {
+        if ($null -ne $savedInputEncoding) { try { [Console]::InputEncoding = $savedInputEncoding } catch { } }
+    }
+    if (-not $started) {
         $process.Dispose()
         return (New-XbWorkerSynthesisedOutput -Outcome "FAILED_BEFORE_WRITE" -ReasonCode "primitive_launch_failed" -SaveMayHaveHappened $false -ReleaseSha256 $ReleaseSha256)
     }
@@ -350,8 +373,12 @@ function Invoke-XbAc2PrimitiveChild {
     $stderrTask = $process.StandardError.ReadToEndAsync()
     $requestDelivered = $false
     try {
-        $process.StandardInput.WriteLine($RequestLine)
-        $process.StandardInput.Close()
+        # Explicit BOM-less bytes, one line, deterministic LF terminator,
+        # written to the pipe itself; closing the pipe delivers EOF.
+        $stdin = $process.StandardInput.BaseStream
+        $stdin.Write($requestBytes, 0, $requestBytes.Length)
+        $stdin.Flush()
+        $stdin.Close()
         $requestDelivered = $true
     }
     catch { $requestDelivered = $false }

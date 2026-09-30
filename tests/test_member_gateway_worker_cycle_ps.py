@@ -142,6 +142,11 @@ param(
 $ErrorActionPreference = "Stop"
 . $Lib
 . $Adapter
+# Hostile transport condition: a console input encoding WITH a UTF-8 BOM
+# preamble, as on the hosted runner. The worker must still hand the child a
+# preamble-free stdin whose byte 0 is "{", and restore this encoding.
+[Console]::InputEncoding = New-Object System.Text.UTF8Encoding($true)
+if ([Console]::InputEncoding.GetPreamble().Length -ne 3) { throw "hostile_console_encoding_not_set" }
 $release = Get-XbAc2ReleaseIdentity -PackageRoot (Split-Path -Parent $Lib)
 $interpreter = "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
 $now = [DateTimeOffset]::Parse("2026-09-30T02:00:30Z", [Globalization.CultureInfo]::InvariantCulture)
@@ -221,6 +226,7 @@ foreach ($case in $cases) {
         $cycle = Invoke-XbMemberGatewayWorkerCycle -GatewayBaseUrl "https://gateway.example.test" -EnableProductionWorker:(-not [bool](Get-XbCaseValue $case "disabled" $false)) -EnableProductionAdapter -Book ([string](Get-XbCaseValue $case "book" "production")) -ReleaseSha256 $release -PrimitiveScriptPath $primitivePath -ChildEnvironment $childEnvironment -FaultGuardConfig $faultGuard -WorkerFault ([string](Get-XbCaseValue $case "worker_fault" "")) -WorkerSession $session -GatewayRequest $gateway -MutexName $mutexName -DeadlineSeconds ([int](Get-XbCaseValue $case "deadline_seconds" 60)) -KillWaitMilliseconds ([int](Get-XbCaseValue $case "kill_wait_ms" 30000)) -KillAction $killAction -UtcNow { $now }.GetNewClosure()
     }
     catch { $cycleError = [string]$_.Exception.Message }
+    $consolePreambleAfter = [Console]::InputEncoding.GetPreamble().Length
     [Environment]::SetEnvironmentVariable("XB_WORKER_FAULT", $null, "Process")
     if ($null -ne $holder) { if (-not $holder.HasExited) { $holder.Kill() }; [void]$holder.WaitForExit(20000) }
     if ($null -ne $ctx.held) { $ctx.held.ReleaseMutex(); $ctx.held.Dispose() }
@@ -239,6 +245,7 @@ foreach ($case in $cases) {
         session = $session
         trace = $trace
         child_alive_after_cycle = $childAlive
+        console_preamble_after_cycle = $consolePreambleAfter
     }
 }
 $payload = [ordered]@{ release = $release; cases = $results } | ConvertTo-Json -Depth 12
@@ -311,7 +318,12 @@ class MemberGatewayWorkerCyclePowerShellTests(unittest.TestCase):
         self.assertFalse(trace["password_on_command_line"])
         self.assertFalse(trace["worker_fault_present"])
         self.assertTrue(trace["request_line_ascii"])
+        # Byte 0 / first character is the JSON object, never a preamble.
+        self.assertEqual(trace["request_line"][:1], "{")
+        self.assertNotIn("\ufeff", trace["request_line"])
         self.assertEqual(trace["decoded_name"], "Fixture Person \u9648")
+        # The caller's (hostile, BOM-carrying) console encoding is restored.
+        self.assertEqual(entry["console_preamble_after_cycle"], 3)
         request = json.loads(trace["request_line"])
         self.assertEqual(set(request), set(claim_body()["request"]) | {"job_id", "attempt_no", "first_claimed_at", "server_time_utc"})
         self.assertEqual(request["job_id"], JOB_ID)
@@ -351,6 +363,18 @@ class MemberGatewayWorkerCyclePowerShellTests(unittest.TestCase):
         )
         self.assertEqual(body["primitive"], {"release_sha256": self.report["release"], "rule_version": "XB-MN-1"})
         return entry
+
+    def test_every_launched_child_received_a_preamble_free_request_line(self):
+        launched = 0
+        for name, entry in self.report["cases"].items():
+            trace = entry["trace"]
+            if not isinstance(trace, dict) or "request_line" not in trace:
+                continue
+            launched += 1
+            self.assertTrue(trace["request_line_ascii"], name)
+            self.assertEqual(trace["request_line"][:1], "{", name)
+            self.assertEqual(entry["console_preamble_after_cycle"], 3, name)
+        self.assertGreater(launched, 0)
 
     def test_deadline_kill_and_unconfirmed_exit_are_uncertain(self):
         entry = self.assert_synthesised("kcy_deadline_kill", "OUTCOME_UNCERTAIN", "child_deadline_exceeded", save_invoked=True)

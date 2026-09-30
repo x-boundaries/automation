@@ -145,12 +145,12 @@ class ScriptedConnection:
             yield self.receipt
 
 
-def source_event(response_id="forms-two", create_time="2026-09-15T00:00:01.123456789Z"):
+def source_event(response_id="forms-two", create_time="2026-09-15T00:00:01.123456789Z", pdpa_acknowledged=True):
     return canonicalize_source_event(
         build_source_event(
             response_id=response_id, create_time=create_time, request_id=f"request-{response_id}",
             form_alias="member_registration", mapping_version="member-intake.v1",
-            payload={"name": "Synthetic Member", "phone": "81234567", "email": "synthetic@example.test", "birthday_month": "January", "marketing_consent": "No", "pdpa_acknowledged": True},
+            payload={"name": "Synthetic Member", "phone": "81234567", "email": "synthetic@example.test", "birthday_month": "January", "marketing_consent": "No", "pdpa_acknowledged": pdpa_acknowledged},
         )
     )
 
@@ -209,6 +209,18 @@ class PostgresCursorTests(unittest.TestCase):
         self.assertTrue(connection.rolled_back)
         for table in ("jobs", "source_handling_receipts", "source_responses"):
             self.assertFalse(any(query.startswith(f"INSERT INTO xb_member_gateway.{table}") for query, _ in connection.queries), table)
+
+    def test_validation_rejection_never_touches_the_accepted_member_guard(self):
+        for window_open, count in ((True, 0), (False, 1)):
+            with self.subTest(allowance_consumed=not window_open):
+                connection = ScriptedConnection(count=count, window_open=window_open)
+                outcome = self.repository(connection).ingest_source_event(source_event("forms-rejected", pdpa_acknowledged=False), initial_window_max=1, policy=POLICY)
+                self.assertEqual((outcome.job.state.value, outcome.job.outcome_reason), ("REJECTED_VALIDATION", "pdpa_not_acknowledged"))
+                self.assertTrue(connection.committed)
+                self.assertFalse(connection.rolled_back)
+                self.assertFalse(any(query.startswith("UPDATE xb_member_gateway.source_ingest_cursors") for query, _ in connection.queries))
+                for table in ("jobs", "source_handling_receipts", "source_responses"):
+                    self.assertTrue(any(query.startswith(f"INSERT INTO xb_member_gateway.{table}") for query, _ in connection.queries), table)
 
     def test_continuous_admission_does_not_touch_the_guard(self):
         connection = ScriptedConnection(count=1)
@@ -319,6 +331,33 @@ class RealPostgresSourceTests(RealPostgresTestCase):
         self.assertEqual(self.sql("SELECT initial_window_admission_count FROM xb_member_gateway.source_ingest_cursors"), [(1,)])
         with self.assertRaisesRegex(psycopg.errors.RaiseException, "source_handling_receipts_append_only"):
             self.sql("DELETE FROM xb_member_gateway.source_handling_receipts")
+
+    def test_real_first_member_allowance_counts_accepted_members_only(self):
+        self.seed_cursor()
+
+        def count():
+            return self.sql("SELECT initial_window_admission_count FROM xb_member_gateway.source_ingest_cursors")[0][0]
+
+        rejected = self.repository.ingest_source_event(source_event("fm-real-rejected", "2026-09-15T00:00:01Z", pdpa_acknowledged=False), initial_window_max=1, policy=POLICY)
+        self.assertEqual(rejected.job.state.value, "REJECTED_VALIDATION")
+        self.assertEqual(count(), 0)
+        accepted = self.repository.ingest_source_event(source_event("fm-real-accepted", "2026-09-15T00:00:02Z"), initial_window_max=1, policy=POLICY)
+        self.assertEqual((accepted.job.state.value, count()), ("QUEUED", 1))
+        with self.assertRaisesRegex(SourceConflict, "initial_source_window_exhausted"):
+            self.repository.ingest_source_event(source_event("fm-real-loser", "2026-09-15T00:00:03Z"), initial_window_max=1, policy=POLICY)
+        self.assertEqual(self.sql("SELECT count(*) FROM xb_member_gateway.source_handling_receipts WHERE response_id='fm-real-loser'"), [(0,)])
+        late = self.repository.ingest_source_event(source_event("fm-real-late", "2026-09-15T00:00:04Z", pdpa_acknowledged=False), initial_window_max=1, policy=POLICY)
+        self.assertEqual((late.job.state.value, count()), ("REJECTED_VALIDATION", 1))
+        self.assertEqual(self.sql("SELECT count(*) FROM xb_member_gateway.source_handling_receipts"), [(3,)])
+        for response_id, create_time, pdpa, job in (
+            ("fm-real-accepted", "2026-09-15T00:00:02Z", True, accepted.job),
+            ("fm-real-rejected", "2026-09-15T00:00:01Z", False, rejected.job),
+        ):
+            replay = self.repository.ingest_source_event(source_event(response_id, create_time, pdpa_acknowledged=pdpa), initial_window_max=1, policy=POLICY)
+            self.assertEqual((replay.replayed, replay.job.job_id), (True, job.job_id))
+        self.assertEqual(count(), 1)
+        with self.assertRaisesRegex(SourceConflict, "source_identity_payload_conflict"):
+            self.repository.ingest_source_event(source_event("fm-real-rejected", "2026-09-15T00:00:09Z", pdpa_acknowledged=False), initial_window_max=1, policy=POLICY)
 
     def test_real_epoch_open_receipt_commit_restart_and_mode_switch(self):
         self.seed_cursor()

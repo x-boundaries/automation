@@ -417,13 +417,6 @@ class InMemoryRepository:
                 return IngestOutcome(self._copy(self._job(self._job_by_response[event.response_id])), replayed=True)
             if event.response_id in self._responses:
                 raise RepositoryError("source_handling_receipt_missing")
-            if initial_window_max is not None and cursor.initial_window_admission_count >= initial_window_max:
-                # The losing admission gets no receipt and cannot checkpoint; it
-                # stays discoverable for a later continuous epoch.
-                raise SourceConflict("initial_source_window_exhausted")
-            self._responses[event.response_id] = self._copy(event)
-            self._request_hashes[event.request_id] = event.payload_hash
-            self._request_responses[event.request_id] = event.response_id
             payload = self._copy(event.payload)
             payload["create_time"] = render_create_time_utc(create_time_utc_from_exact(event.create_time))
             source_ref = hmac_reference(event.response_id, self._reference_key)
@@ -435,7 +428,18 @@ class InMemoryRepository:
                 source_system=event.source_system, form_alias=event.form_alias,
                 mapping_version=event.mapping_version, max_attempts=DEFAULT_WRITE_BUDGET,
             )
+            # The VALIDATED gate is pure; its outcome decides whether this
+            # response is an accepted member for the first_member guard.
             self._admit(job, policy)
+            counts_as_accepted = job.state != JobState.REJECTED_VALIDATION
+            if initial_window_max is not None and counts_as_accepted and cursor.initial_window_admission_count >= initial_window_max:
+                # The losing accepted member gets no receipt and cannot
+                # checkpoint; it stays discoverable for a later continuous
+                # epoch. A validation rejection never consumes the allowance.
+                raise SourceConflict("initial_source_window_exhausted")
+            self._responses[event.response_id] = self._copy(event)
+            self._request_hashes[event.request_id] = event.payload_hash
+            self._request_responses[event.request_id] = event.response_id
             self._jobs[job.job_id] = job
             self._job_by_response[event.response_id] = job.job_id
             self._attempts[job.job_id] = []
@@ -444,7 +448,7 @@ class InMemoryRepository:
                 event.create_time, event.payload_hash, HandlingOutcome.ACCEPTED, job.job_id, None, 1, timestamp(now),
             )
             self._audit("source_ingested", job, error_code=job.outcome_reason)
-            if initial_window_max is not None:
+            if initial_window_max is not None and counts_as_accepted:
                 self._source_cursors[cursor_key] = replace(
                     cursor,
                     state_version=cursor.state_version + 1,
@@ -1975,9 +1979,10 @@ class PostgresRepository:
                 cursor.execute("SELECT 1 FROM xb_member_gateway.source_responses WHERE response_id=%s", (event.response_id,))
                 if cursor.fetchone() is not None:
                     raise RepositoryError("source_handling_receipt_missing")
-                if initial_window_max is not None:
+                if initial_window_max is not None and job.state != JobState.REJECTED_VALIDATION:
                     # Atomic 0->1 accepted-member guard. A losing concurrent
-                    # admission receives no receipt and cannot checkpoint.
+                    # admission receives no receipt and cannot checkpoint. A
+                    # validation rejection is receipted without consuming it.
                     cursor.execute(
                         "UPDATE xb_member_gateway.source_ingest_cursors SET initial_window_admission_count=initial_window_admission_count+1,"
                         "state_version=state_version+1,updated_at=now() WHERE source_system=%s AND form_alias=%s AND mapping_version=%s "
