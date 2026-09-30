@@ -6,20 +6,18 @@ from pathlib import Path
 
 from xb_member_gateway.bootstrap import BootstrapError, compose_gateway, run
 from xb_member_gateway.config import GatewayConfig
-from xb_member_gateway.eligibility import EligibilityContext, evaluate_eligibility
-from xb_member_gateway.models import JobRecord
 from xb_member_gateway.repository import RepositoryError
 
 
-TOKENS = {name: f"synthetic-{name}-bearer" for name in ("source", "operator", "control", "worker", "recovery", "mailer")}
+TOKENS = {name: f"synthetic-{name}-bearer" for name in ("source", "operator", "control", "worker", "mailer")}
 
 
 def config_value():
     return {
-        "schema_version": "xb.member.gateway.config.v2",
+        "schema_version": "xb.member.gateway.config.v3",
         "environment": "production", "expected_environment": "production",
         "production_activation_enabled": False, "kill_switch_enabled": True,
-        "autocount_adapter_ready": True,
+        "autocount_adapter_ready": True, "member_book_mode": "production",
         "allowed_form_aliases": ["member_registration"],
         "allowed_mapping_versions": ["member-intake.v1"],
         "source_form_id": "synthetic-form",
@@ -27,8 +25,8 @@ def config_value():
         "source_cutover_watermark": "2026-09-15T00:00:00Z",
         "source_production_cutover_exact": "2026-09-15T00:00:00.000Z",
         "source_admission_mode": "first_member",
-        "initial_source_window_max": 1, "member_no_max_length": 20,
-        "lease_seconds": 600, "heartbeat_seconds": 120, "execution_deadline_seconds": 300,
+        "initial_source_window_max": 1,
+        "lease_seconds": 600, "execution_deadline_seconds": 300,
         "max_attempts": 3, "worker_concurrency": 1, "claim_size": 1,
         **{f"{name}_token_sha256": hashlib.sha256(token.encode()).hexdigest() for name, token in TOKENS.items()},
         "postgres_dsn_env": "TEST_DATABASE_URL", "bind_address_env": "TEST_BIND_ADDRESS",
@@ -105,7 +103,7 @@ class BootstrapTests(unittest.TestCase):
         with self.assertRaisesRegex(BootstrapError, "authentication_binding_aliased"):
             compose_gateway(self.write_config(), environment=values, repository_factory=FakeRepository)
 
-    def test_missing_cutover_mode_or_sixth_principal_fails_closed(self):
+    def test_missing_cutover_mode_or_fifth_principal_fails_closed(self):
         value = config_value()
         value["source_production_cutover_exact"] = None
         with self.assertRaisesRegex(BootstrapError, "source_production_cutover_exact_required"):
@@ -124,7 +122,7 @@ class BootstrapTests(unittest.TestCase):
             compose_gateway(self.write_config(), environment=values, repository_factory=FakeRepository)
 
     def test_missing_required_config_field_fails_closed(self):
-        for field in ("postgres_dsn_env", "source_token_env", "source_token_sha256", "source_cutover_watermark", "source_production_cutover_exact", "source_admission_mode", "mailer_token_sha256", "mailer_token_env", "source_question_ids", "initial_source_window_max"):
+        for field in ("postgres_dsn_env", "source_token_env", "source_token_sha256", "source_cutover_watermark", "source_production_cutover_exact", "source_admission_mode", "mailer_token_sha256", "mailer_token_env", "source_question_ids", "initial_source_window_max", "member_book_mode"):
             with self.subTest(field=field):
                 value = config_value()
                 value.pop(field)
@@ -187,26 +185,6 @@ def dark_runtime(bind_address=PRIVATE_BACKEND_ADDRESS):
     return values
 
 
-def dark_job_record():
-    return JobRecord(
-        job_id="job-dark-0001",
-        request_id="req-dark-0001",
-        source_response_ref="source-ref-dark-0001",
-        response_id="response-dark-0001",
-        payload_hash="0" * 64,
-        operation="member.create",
-        member_payload={
-            "name": "Synthetic Dark Fixture",
-            "phone": "600000000",
-            "email": "synthetic-dark@example.invalid",
-            "birthday_month": "January",
-            "marketing_consent": "No",
-            "pdpa_acknowledged": True,
-        },
-        created_at="2026-09-17T00:00:00Z",
-    )
-
-
 class DarkStartCompositionTests(unittest.TestCase):
     """Adapter-not-ready may compose; it must never look ready or dispatchable."""
 
@@ -262,7 +240,7 @@ class DarkStartCompositionTests(unittest.TestCase):
         self.assertFalse(service.adapter_ready)
         readiness = service.readiness()
         self.assertFalse(readiness["ready"])
-        self.assertEqual(readiness["status"], "not_ready")
+        self.assertFalse(readiness["dispatch_enabled"])
         self.assertIn("autocount_adapter_not_ready", readiness["reasons"])
 
     def test_readiness_reasons_still_report_adapter_not_ready(self):
@@ -270,29 +248,25 @@ class DarkStartCompositionTests(unittest.TestCase):
         self.assertIn("autocount_adapter_not_ready", config.readiness_reasons())
         self.assertFalse(config.gateway_ready)
 
-    def test_dispatch_remains_ineligible_while_adapter_is_not_ready(self):
-        config = GatewayConfig.from_mapping(dark_config_value(), require_complete=True)
-        job = dark_job_record()
-        blocked = evaluate_eligibility(
-            EligibilityContext(config=config, job=job, autocount_adapter_ready=False)
+    def test_claim_is_dispatch_disabled_while_adapter_is_not_ready(self):
+        composition = compose_gateway(
+            self.write_config(), environment=dark_runtime(), repository_factory=FakeRepository
         )
-        self.assertFalse(blocked.eligible)
-        self.assertIn("autocount_adapter_ready", blocked.reasons)
-        self.assertFalse(blocked.predicates["autocount_adapter_ready"])
-        ready_adapter = evaluate_eligibility(
-            EligibilityContext(config=config, job=job, autocount_adapter_ready=True)
-        )
-        self.assertNotIn("autocount_adapter_ready", ready_adapter.reasons)
+        claim = composition.app.service.claim("ws-" + "a" * 32)
+        self.assertEqual((claim["claimed"], claim["reason"]), (False, "dispatch_disabled"))
 
     def test_adapter_exemption_does_not_suppress_other_readiness_failures(self):
         cases = (
             ("source_cutover_watermark", None, "source_cutover_watermark_required"),
             ("source_form_id", None, "source_form_id_required"),
-            ("recovery_token_sha256", None, "recovery_credential_digest_required"),
+            ("worker_token_sha256", None, "worker_credential_digest_required"),
+            ("recovery_token_sha256", "0" * 64, "recovery_principal_removed"),
+            ("member_book_mode", None, "member_book_mode_invalid"),
+            ("member_book_mode", "either", "member_book_mode_invalid"),
             ("mailer_token_sha256", None, "mailer_credential_digest_required"),
             ("source_production_cutover_exact", None, "source_production_cutover_exact_required"),
             ("environment", "staging", "environment_mismatch"),
-            ("member_no_max_length", 21, "member_no_max_length_must_be_twenty"),
+            ("heartbeat_seconds", 120, "removed_config_field_present"),
         )
         for field, replacement, expected in cases:
             with self.subTest(field=field):

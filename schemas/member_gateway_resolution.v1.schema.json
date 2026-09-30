@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/schemas/member_gateway_resolution.v1.schema.json",
+  "title": "XB member gateway operator resolution v1 (W-G2-149 sections 2.8 and 3)",
+  "description": "Request and response of POST /v2/control/jobs/{job_id}/resolve (control.resolve). Allowed only from MANUAL_REVIEW. CLOSE -> RESOLVED; REQUEUE -> QUEUED with the write budget raised by 3, capped at 12. The optional member_no and member_guid are stored privately in the append-only job_resolutions table and are never echoed, logged or shown.",
+  "$defs": {
+    "request": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["action", "resolution_code"],
+      "properties": {
+        "action": {"type": "string", "enum": ["CLOSE", "REQUEUE"]},
+        "resolution_code": {"type": "string", "pattern": "^[a-z0-9_.:-]{1,80}$"},
+        "member_no": {"type": ["string", "null"], "minLength": 1, "maxLength": 20},
+        "member_guid": {"type": ["string", "null"], "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"}
+      }
+    }
+  },
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "resolution_id", "job_id", "action", "resolution_code", "state", "state_version", "write_budget", "resolved_at"],
+  "properties": {
+    "schema_version": {"const": "xb.member.gateway.resolution.v1"},
+    "resolution_id": {"type": "string", "pattern": "^resolution-[0-9a-f]{32}$"},
+    "job_id": {"type": "string", "pattern": "^job-[A-Za-z0-9]{16,64}$"},
+    "action": {"type": "string", "enum": ["CLOSE", "REQUEUE"]},
+    "resolution_code": {"type": "string", "pattern": "^[a-z0-9_.:-]{1,80}$"},
+    "state": {"type": "string", "enum": ["RESOLVED", "QUEUED"]},
+    "state_version": {"type": "integer", "minimum": 1},
+    "write_budget": {"type": "integer", "minimum": 1, "maximum": 12},
+    "resolved_at": {"type": "string", "format": "date-time"}
+  }
+}

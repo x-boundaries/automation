@@ -1,0 +1,88 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/schemas/member_gateway_result.v2.schema.json",
+  "title": "XB member gateway result v2 (W-G2-149 section 4.3)",
+  "description": "Body of POST /v2/jobs/{job_id}/result. Closed object. Per-outcome consistency (section 4.4) is enforced by the gateway, not by this schema. member_no and member_guid are stored but never logged or shown in operator views. Worker-synthesised OUTCOME_UNCERTAIN (child deadline, unconfirmed exit, unreadable primitive output) reports save_invoked=true and save_invocation_count=1 as the conservative upper bound.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "job_id", "attempt_no", "lease_id", "state_version", "outcome", "rule", "branch", "member_no", "member_guid", "save_invoked", "save_invocation_count", "readback", "reason_code", "dq_flags", "primitive", "error_code"],
+  "properties": {
+    "schema_version": {"const": "xb.member.gateway.result.v2"},
+    "job_id": {"type": "string", "pattern": "^job-[A-Za-z0-9]{16,64}$"},
+    "attempt_no": {"type": "integer", "minimum": 1},
+    "lease_id": {"type": "string", "pattern": "^lease-[0-9a-f]{32}$"},
+    "state_version": {"type": "integer", "minimum": 0},
+    "outcome": {"type": "string", "enum": ["CREATED_VERIFIED", "CREATED_VERIFIED_PRIOR_ATTEMPT", "LINKED_EXISTING", "MANUAL_REVIEW", "REJECTED_VALIDATION", "FAILED_BEFORE_WRITE", "NOT_CREATED", "NOT_CREATED_CONFLICT", "OUTCOME_UNCERTAIN", "CREATED_READBACK_MISMATCH", "MUTEX_BUSY"]},
+    "rule": {"type": "string", "enum": ["R0", "R1", "R2a", "R2b", "R2c", "R3", "R3b", "R4", "NONE"]},
+    "branch": {"type": "string", "enum": ["BASE", "NAME_APPENDED", "EXISTING", "NONE"]},
+    "member_no": {"type": ["string", "null"], "minLength": 1, "maxLength": 20},
+    "member_guid": {"type": ["string", "null"], "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"},
+    "save_invoked": {"type": "boolean"},
+    "save_invocation_count": {"type": "integer", "enum": [0, 1]},
+    "readback": {
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["found", "match", "created_by_integration_user"],
+          "properties": {
+            "found": {"type": "boolean"},
+            "match": {"type": "boolean"},
+            "created_by_integration_user": {"type": "boolean"}
+          }
+        }
+      ]
+    },
+    "reason_code": {
+      "type": ["string", "null"],
+      "enum": [
+        null,
+        "prior_attempt_ambiguous",
+        "multiple_same_person",
+        "inactive_match",
+        "format_variant_other_person",
+        "holder_identity_unknown",
+        "name_component_empty",
+        "name_candidate_collision",
+        "request_contract_violation",
+        "readback_foreign_row",
+        "name_exceeds_autocount_limit",
+        "email_exceeds_autocount_limit",
+        "synthetic_in_production",
+        "clock_skew",
+        "mutex_unavailable",
+        "session_unavailable",
+        "book_binding_mismatch",
+        "integration_user_mismatch",
+        "probe_unavailable",
+        "fault_injection_refused",
+        "test_book_requires_synthetic",
+        "primitive_config_invalid",
+        "primitive_launch_failed",
+        "readback_absent_after_save",
+        "readback_unavailable",
+        "unexpected_error",
+        "child_deadline_exceeded",
+        "child_termination_unconfirmed",
+        "primitive_output_invalid"
+      ]
+    },
+    "dq_flags": {
+      "type": "array",
+      "uniqueItems": true,
+      "maxItems": 3,
+      "items": {"type": "string", "enum": ["email_seen_on_other_member", "post_save_same_person_other_row", "malformed_member_no_excluded"]}
+    },
+    "primitive": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["release_sha256", "rule_version"],
+      "properties": {
+        "release_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "rule_version": {"const": "XB-MN-1"}
+      }
+    },
+    "error_code": {"type": ["string", "null"], "pattern": "^[a-z0-9_.:-]{1,80}$"}
+  }
+}

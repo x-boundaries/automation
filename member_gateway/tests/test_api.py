@@ -1,672 +1,278 @@
+"""U-RT / U-RZ / U-PV: v2 route surface, removed routes and scopes, readyz,
+resolve and privacy of every response (W-G2-149 sections 2.8, 3, 4.3)."""
+
+import json
 import unittest
-from datetime import datetime, timedelta, timezone
 
-from xb_member_gateway.api import GatewayApp, GatewayService
-from xb_member_gateway.auth import Principal, StaticAuthenticator
-from xb_member_gateway.canonical import build_source_event
-from xb_member_gateway.config import GatewayConfig
-from xb_member_gateway.repository import InMemoryRepository
+from xb_member_gateway.auth import CONTROL_SCOPES, MAILER_SCOPES, OPERATOR_SCOPES, SOURCE_SCOPES, WORKER_SCOPES
+from xb_member_gateway.config import ConfigError, GatewayConfig
 
-
-NOW = datetime(2026, 8, 30, 1, 0, tzinfo=timezone.utc)
-
-
-def make_config(**changes):
-    value = {
-        "member_no_max_length": 20,
-        "worker_token_sha256": "0" * 64,
-        "recovery_token_sha256": "1" * 64,
-        "production_activation_enabled": True,
-        "kill_switch_enabled": False,
-    }
-    value.update(changes)
-    return GatewayConfig.from_mapping(value)
-
-
-def make_event(response_id="api-response-001"):
-    payload = {
-        "name": "API Synthetic Member",
-        "phone": "81234567",
-        "email": "api-synthetic@example.test",
-        "birthday_month": "March",
-        "marketing_consent": "No",
-        "pdpa_acknowledged": True,
-    }
-    return build_source_event(
-        response_id=response_id,
-        request_id=f"api-request-{response_id}",
-        create_time="2026-08-30T01:00:00Z",
-        form_alias="member_registration",
-        mapping_version="member-intake.v1",
-        payload=payload,
+try:
+    from .v2_support import (
+        NOW, REMOVED_SCOPES, SESSION, guid, headers, later, make_app, make_event, make_repository, make_service, outcome_body,
+    )
+except ImportError:  # discovered as a top-level module
+    from v2_support import (
+        NOW, REMOVED_SCOPES, SESSION, guid, headers, later, make_app, make_event, make_repository, make_service, outcome_body,
     )
 
 
-class ApiBoundaryTests(unittest.TestCase):
-    worker_scopes = frozenset(
-        {
-            "worker.claim",
-            "worker.heartbeat",
-            "worker.allocation",
-            "worker.write_intent",
-            "worker.dispatch",
-            "worker.writer_register",
-            "worker.writer_termination",
-            "worker.writer_quarantine",
-            "worker.result",
-            "worker.reconcile",
-            "job.read",
-        }
-    )
+JOB = "job-" + "1" * 32
+# Every v1 worker route removed from code (section 2.8), with its old method.
+REMOVED_ROUTES = (
+    ("POST", "/v1/worker/claim"),
+    ("POST", f"/v1/jobs/{JOB}/precheck"),
+    ("POST", f"/v1/jobs/{JOB}/lease"),
+    ("POST", f"/v1/jobs/{JOB}/allocation/candidate"),
+    ("POST", f"/v1/jobs/{JOB}/allocation/probe"),
+    ("POST", f"/v1/jobs/{JOB}/allocation/recheck"),
+    ("POST", f"/v1/jobs/{JOB}/allocation"),
+    ("POST", f"/v1/jobs/{JOB}/write-intent"),
+    ("POST", f"/v1/jobs/{JOB}/dispatch-fence"),
+    ("POST", f"/v1/jobs/{JOB}/writer/register"),
+    ("POST", f"/v1/jobs/{JOB}/writer/termination"),
+    ("POST", f"/v1/jobs/{JOB}/writer/quarantine"),
+    ("POST", f"/v1/jobs/{JOB}/writer/recover"),
+    ("POST", f"/v1/jobs/{JOB}/result"),
+    ("POST", f"/v1/jobs/{JOB}/reconcile"),
+)
 
+
+class ApiSurfaceTests(unittest.TestCase):
     def setUp(self):
-        self.repository = InMemoryRepository()
-        self.repository.set_control("kill_switch_enabled", False)
-        self.repository.set_control("production_activation_enabled", True)
-        service = GatewayService(make_config(), self.repository, adapter_ready=True, clock=NOW)
-        self.app = GatewayApp(
-            service,
-            StaticAuthenticator(
-                {
-                    "synthetic-worker-token": Principal(
-                        subject="synthetic-worker", scopes=self.worker_scopes
-                    ),
-                    "synthetic-source-token": Principal("synthetic-source", frozenset({"source.ingest"})),
-                    "synthetic-operator-token": Principal("synthetic-operator", frozenset({"operator.status.read", "operator.reconciliation.read"})),
-                    "synthetic-control-token": Principal("synthetic-control", frozenset({"control.kill_switch", "control.activate"})),
-                    "synthetic-recovery-token": Principal(
-                        subject="synthetic-recovery",
-                        scopes=frozenset({"worker.writer_termination_recovery"}),
-                    ),
-                }
-            ),
-        )
-        self.headers = {
-            "Authorization": "Bearer synthetic-worker-token",
-            "X-XB-Worker-Session": "ws-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        }
-        self.recovery_headers = {
-            "Authorization": "Bearer synthetic-recovery-token",
-            "X-XB-Worker-Session": "ws-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-        }
-        self.source_headers = {"Authorization": "Bearer synthetic-source-token"}
-        self.operator_headers = {"Authorization": "Bearer synthetic-operator-token"}
-        self.control_headers = {"Authorization": "Bearer synthetic-control-token"}
+        self.repository = make_repository()
+        self.service = make_service(self.repository)
+        self.app = make_app(self.service)
 
-    def call(self, method, path, body=None, headers=None):
-        if headers is None:
-            if path.startswith("/v1/source"):
-                headers = self.source_headers
-            elif path.startswith("/v1/control"):
-                headers = self.control_headers
-            elif path.startswith("/v1/operator"):
-                headers = self.operator_headers
-            else:
-                headers = self.headers
-        return self.app.handle(
-            method,
-            path,
-            headers=headers,
-            body={} if body is None else body,
-        )
+    def call(self, method, path, token, body=None, session=SESSION):
+        return self.app.handle(method, path, headers=headers(token, session), body={} if body is None else body)
 
-    def quarantined_writer(self, response_id="api-recovery-001"):
-        ingested = self.call("POST", "/v1/source-events", make_event(response_id))
-        self.assertEqual(ingested.status, 202)
-        job_id = ingested.body["job_id"]
-        claimed = self.call("POST", "/v1/worker/claim", {})
-        self.assertEqual(claimed.status, 200)
-        job = claimed.body["job"]
-        self.assertEqual(job["job_id"], job_id)
-        self.assertEqual(self.call("POST", f"/v1/jobs/{job_id}/precheck", {}).status, 200)
-        candidate = self.call("POST", f"/v1/jobs/{job_id}/allocation/candidate", {})
-        self.assertEqual(candidate.status, 200)
-        member_no = candidate.body["candidate"]
-        self.assertEqual(
-            self.call(
-                "POST",
-                f"/v1/jobs/{job_id}/allocation/probe",
-                {"candidate": member_no, "status": "FREE", "probe_reference": f"{response_id}-free"},
-            ).status,
-            200,
-        )
-        self.assertEqual(
-            self.call(
-                "POST",
-                f"/v1/jobs/{job_id}/allocation/recheck",
-                {"status": "FREE", "probe_reference": f"{response_id}-recheck"},
-            ).status,
-            200,
-        )
-        self.assertEqual(
-            self.call(
-                "POST",
-                f"/v1/jobs/{job_id}/write-intent",
-                {"operation": "member.create", "member_no": member_no, "payload_hash": job["payload_hash"]},
-            ).status,
-            200,
-        )
-        fence = self.call(
-            "POST",
-            f"/v1/jobs/{job_id}/dispatch-fence",
-            {"operation": "member.create", "member_no": member_no, "host_binding": "host-api"},
-        )
-        self.assertEqual(fence.status, 200)
-        writer = {
-            "fence_id": fence.body["dispatch_fence_id"],
-            "attempt": job["attempt"],
-            "execution_id": fence.body["execution_id"],
-            "host_binding": "host-api",
-            "pid": 4321,
-            "process_start_time": "2026-08-30T01:00:01Z",
-        }
-        registered = self.call("POST", f"/v1/jobs/{job_id}/writer/register", writer)
-        self.assertEqual(registered.status, 200)
-        quarantined = dict(writer, evidence_reference=f"{response_id}-quarantine", reason="writer_termination_unconfirmed")
-        quarantined_response = self.call("POST", f"/v1/jobs/{job_id}/writer/quarantine", quarantined)
-        self.assertEqual(quarantined_response.status, 200)
-        return job, fence.body, writer
+    def ingest(self, response_id="api-a", **changes):
+        response = self.call("POST", "/v1/source-events", "source", make_event(response_id, **changes))
+        self.assertEqual(response.status, 202)
+        return response.body["job_id"]
 
-    @staticmethod
-    def recovery_body(fence, job, writer, **changes):
-        body = dict(
-            writer,
-            evidence_type="process_exit",
-            evidence_reference="api-recovery-proof",
-            exit_code=0,
-        )
-        body.update(
-            {
-                "fence_id": fence["dispatch_fence_id"],
-                "attempt": job["attempt"],
-                "execution_id": fence["execution_id"],
-                **changes,
-            }
-        )
-        return body
-
-    def test_normal_worker_principal_is_denied_writer_termination_recovery(self):
-        response = self.call(
-            "POST",
-            "/v1/jobs/synthetic/writer/recover",
-            {},
-        )
-        self.assertEqual(response.status, 403)
-        self.assertEqual(response.body["error_code"], "scope_denied")
-
-    def test_stale_worker_cannot_recover_with_new_worker_session(self):
-        job, fence, writer = self.quarantined_writer("api-recovery-stale-worker")
-        self.app.service.clock = NOW + timedelta(seconds=700)
-        response = self.call(
-            "POST",
-            f"/v1/jobs/{job['job_id']}/writer/recover",
-            self.recovery_body(fence, job, writer),
-            headers={
-                "Authorization": "Bearer synthetic-worker-token",
-                "X-XB-Worker-Session": "ws-cccccccccccccccccccccccccccccccc",
-            },
-        )
-        self.assertEqual(response.status, 403)
-        self.assertEqual(response.body["error_code"], "scope_denied")
-        self.assertEqual(self.repository.get_job(job["job_id"]).state.value, "WRITER_TERMINATION_UNCONFIRMED")
-
-    def test_worker_quarantine_preserves_registered_identity_and_rejects_mismatch_on_repeat(self):
-        job, fence, writer = self.quarantined_writer("api-quarantine-identity")
-        omitted = self.call(
-            "POST",
-            f"/v1/jobs/{job['job_id']}/writer/quarantine",
-            dict(writer, pid=None, process_start_time=None, evidence_reference="api-quarantine-omitted", reason="writer_termination_unconfirmed"),
-        )
-        self.assertEqual(omitted.status, 200)
-        hold = self.repository.get_writer_execution_hold(job["job_id"])
-        self.assertEqual((hold.pid, hold.process_start_time), (writer["pid"], writer["process_start_time"]))
-        for changes in (
-            {"pid": writer["pid"] + 1, "evidence_reference": "api-quarantine-wrong-pid"},
-            {"process_start_time": "2026-08-30T01:00:02Z", "evidence_reference": "api-quarantine-wrong-start"},
-        ):
-            with self.subTest(changes=changes):
-                response = self.call(
-                    "POST",
-                    f"/v1/jobs/{job['job_id']}/writer/quarantine",
-                    dict(writer, reason="writer_termination_unconfirmed", **changes),
-                )
-                self.assertEqual(response.status, 409)
-                self.assertEqual(response.body["error_code"], "writer_process_identity_mismatch")
-        current = self.repository.get_writer_execution_hold(job["job_id"])
-        self.assertEqual((current.pid, current.process_start_time), (writer["pid"], writer["process_start_time"]))
-
-    def test_recovery_principal_is_denied_ordinary_worker_write_and_control_routes(self):
-        routes = (
-            ("POST", "/v1/source-events", make_event("api-recovery-source-denied")),
-            ("POST", "/v1/worker/claim", {}),
-            ("POST", "/v1/jobs/synthetic/write-intent", {}),
-            ("POST", "/v1/jobs/synthetic/dispatch-fence", {}),
-            ("POST", "/v1/jobs/synthetic/result", {}),
-            ("POST", "/v1/jobs/synthetic/reconcile", {}),
-            ("GET", "/v1/jobs/synthetic", None),
-            ("POST", "/v1/control/kill-switch/enable", {}),
-        )
-        for method, path, body in routes:
-            with self.subTest(method=method, path=path):
-                response = self.call(method, path, body, headers=self.recovery_headers)
-                self.assertEqual(response.status, 403)
-                self.assertEqual(response.body["error_code"], "scope_denied")
-
-    def test_distinct_recovery_principal_can_recover_with_exact_bindings(self):
-        job, fence, writer = self.quarantined_writer("api-recovery-success")
-        self.app.service.clock = NOW + timedelta(seconds=700)
-        response = self.call(
-            "POST",
-            f"/v1/jobs/{job['job_id']}/writer/recover",
-            self.recovery_body(fence, job, writer),
-            headers=self.recovery_headers,
-        )
+    def claim(self):
+        response = self.call("POST", "/v2/worker/claim", "worker")
         self.assertEqual(response.status, 200)
-        self.assertEqual(response.body["state"], "WRITE_OUTCOME_UNCERTAIN")
-        self.assertEqual(self.repository.get_job(job["job_id"]).state.value, "WRITE_OUTCOME_UNCERTAIN")
-        self.assertEqual(len(self.repository.result_history(job["job_id"])), 1)
+        return response.body
 
-    def test_recovery_preserves_binding_and_active_lease_guards(self):
-        job, fence, writer = self.quarantined_writer("api-recovery-bindings")
-        self.app.service.clock = NOW + timedelta(seconds=700)
-        mismatches = (
-            {"host_binding": "host-other"},
-            {"fence_id": "fence-bbbbbbbbbbbbbbbb"},
-            {"attempt": job["attempt"] + 1},
-            {"execution_id": "exec-bbbbbbbbbbbbbbbb"},
-            {"pid": 4322},
-            {"process_start_time": "2026-08-30T01:00:02Z"},
-        )
-        for changes in mismatches:
-            with self.subTest(changes=changes):
-                response = self.call(
-                    "POST",
-                    f"/v1/jobs/{job['job_id']}/writer/recover",
-                    self.recovery_body(fence, job, writer, **changes),
-                    headers=self.recovery_headers,
-                )
-                self.assertEqual(response.status, 409)
-                self.assertEqual(response.body["error_code"], "writer_termination_binding_invalid")
-        stale_session = self.call(
-            "POST",
-            f"/v1/jobs/{job['job_id']}/writer/recover",
-            self.recovery_body(fence, job, writer),
-            headers={
-                "Authorization": "Bearer synthetic-recovery-token",
-                "X-XB-Worker-Session": "ws-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            },
-        )
-        self.assertEqual(stale_session.status, 409)
-        self.assertEqual(stale_session.body["error_code"], "stale_worker_session")
+    def to_review(self, response_id="api-review"):
+        job_id = self.ingest(response_id)
+        claim = self.claim()
+        self.assertEqual(claim["job_id"], job_id)
+        body = outcome_body(claim, "MANUAL_REVIEW")
+        self.assertEqual(self.call("POST", f"/v2/jobs/{job_id}/result", "worker", body).body["state"], "MANUAL_REVIEW")
+        return job_id
 
-        self.app.service.clock = NOW + timedelta(seconds=1)
-        active = self.call(
-            "POST",
-            f"/v1/jobs/{job['job_id']}/writer/recover",
-            self.recovery_body(fence, job, writer),
-            headers=self.recovery_headers,
-        )
-        self.assertEqual(active.status, 409)
-        self.assertEqual(active.body["error_code"], "writer_termination_clearance_rejected")
+    # --- U-RT: removed routes and scopes ----------------------------------
 
-    def test_health_is_liveness_only_and_missing_auth_is_rejected_elsewhere(self):
-        health = self.call("GET", "/livez", headers={})
-        self.assertEqual(health.status, 200)
-        denied = self.call("POST", "/v1/source-events", make_event(), headers={})
-        self.assertEqual(denied.status, 401)
-        self.assertEqual(
-            set(denied.body),
-            {"schema_version", "trace_id", "error_code", "message"},
-        )
-        self.assertNotIn("API Synthetic Member", str(denied.body))
+    def test_removed_routes_return_404_route_not_found_for_every_principal(self):
+        for token in ("worker", "legacy", "control", "operator", "source", "mailer", "nobody"):
+            for method, path in REMOVED_ROUTES:
+                with self.subTest(token=token, path=path):
+                    response = self.call(method, path, token)
+                    self.assertEqual((response.status, response.body["error_code"]), (404, "route_not_found"))
 
-    def test_scope_denial_is_distinct_from_authentication(self):
-        read_only = GatewayApp(
-            self.app.service,
-            StaticAuthenticator(
-                {"read-only-token": Principal("read-only", frozenset({"job.read"}))}
-            ),
-        )
-        response = read_only.handle(
-            "POST",
-            "/v1/source-events",
-            headers={"Authorization": "Bearer read-only-token"},
-            body=make_event(),
-        )
-        self.assertEqual(response.status, 403)
-        self.assertEqual(response.body["error_code"], "scope_denied")
+    def test_removed_scopes_are_refused_on_every_v2_route(self):
+        self.ingest()
+        for method, path in (("POST", "/v2/worker/claim"), ("POST", f"/v2/jobs/{JOB}/result"), ("POST", f"/v2/control/jobs/{JOB}/resolve"), ("GET", f"/v1/jobs/{JOB}")):
+            with self.subTest(path=path):
+                response = self.call(method, path, "legacy")
+                self.assertEqual((response.status, response.body["error_code"]), (403, "scope_denied"))
 
-    def test_worker_session_header_is_required_and_strictly_bounded(self):
-        missing = self.call(
-            "POST",
-            "/v1/worker/claim",
-            {},
-            headers={"Authorization": "Bearer synthetic-worker-token"},
-        )
-        self.assertEqual(missing.status, 400)
-        self.assertEqual(missing.body["error_code"], "worker_session_invalid")
-        uppercase = self.call(
-            "POST",
-            "/v1/worker/claim",
-            {},
-            headers={
-                "Authorization": "Bearer synthetic-worker-token",
-                "X-XB-Worker-Session": "ws-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-            },
-        )
-        self.assertEqual(uppercase.status, 400)
-        self.assertEqual(uppercase.body["error_code"], "worker_session_invalid")
+    def test_v2_principals_carry_no_removed_scope(self):
+        for scopes in (SOURCE_SCOPES, OPERATOR_SCOPES, CONTROL_SCOPES, WORKER_SCOPES, MAILER_SCOPES):
+            self.assertTrue(REMOVED_SCOPES.isdisjoint(scopes))
+        self.assertEqual(WORKER_SCOPES, {"worker.claim", "worker.result"})
+        self.assertIn("control.resolve", CONTROL_SCOPES)
 
-    def test_member_vertical_slice_routes_and_safe_status(self):
-        ingested = self.call("POST", "/v1/source-events", make_event())
-        self.assertEqual(ingested.status, 202)
-        job_id = ingested.body["job_id"]
-        claimed = self.call("POST", "/v1/worker/claim", {})
-        self.assertEqual(claimed.status, 200)
-        job = claimed.body["job"]
-        self.assertEqual(job["job_id"], job_id)
-        self.assertNotIn("response_id", job)
+    def test_route_matrix_has_no_role_union(self):
+        job_id = self.ingest()
+        cases = (
+            ("POST", "/v2/worker/claim", "worker"),
+            ("POST", f"/v2/jobs/{job_id}/result", "worker"),
+            ("POST", f"/v2/control/jobs/{job_id}/resolve", "control"),
+            ("GET", f"/v1/jobs/{job_id}", "operator"),
+            ("GET", "/v1/operator/status", "operator"),
+            ("POST", "/v1/control/kill-switch/enable", "control"),
+        )
+        for method, path, allowed in cases:
+            for token in ("source", "operator", "control", "worker", "mailer"):
+                if token == allowed:
+                    continue
+                with self.subTest(path=path, token=token):
+                    response = self.call(method, path, token)
+                    self.assertEqual((response.status, response.body["error_code"]), (403, "scope_denied"))
 
-        self.assertEqual(
-            self.call("POST", f"/v1/jobs/{job_id}/precheck", {}).status, 200
-        )
-        candidate = self.call("POST", f"/v1/jobs/{job_id}/allocation/candidate", {})
-        self.assertEqual(candidate.status, 200)
-        member_no = candidate.body["candidate"]
-        probed = self.call(
-            "POST",
-            f"/v1/jobs/{job_id}/allocation/probe",
-            {
-                "candidate": member_no,
-                "status": "FREE",
-                "probe_reference": "api-synthetic-free-001",
-            },
-        )
-        self.assertEqual(probed.status, 200)
-        rechecked = self.call(
-            "POST",
-            f"/v1/jobs/{job_id}/allocation/recheck",
-            {"status": "FREE", "probe_reference": "api-synthetic-recheck-001"},
-        )
-        self.assertEqual(rechecked.status, 200)
-        intent = self.call(
-            "POST",
-            f"/v1/jobs/{job_id}/write-intent",
-            {
-                "operation": "member.create",
-                "member_no": member_no,
-                "payload_hash": job["payload_hash"],
-            },
-        )
-        self.assertEqual(intent.status, 200)
-        fence = self.call(
-            "POST",
-            f"/v1/jobs/{job_id}/dispatch-fence",
-            {"operation": "member.create", "member_no": member_no, "host_binding": "host-api"},
-        )
-        self.assertEqual(fence.status, 200)
-        registered = self.call(
-            "POST",
-            f"/v1/jobs/{job_id}/writer/register",
-            {
-                "fence_id": fence.body["dispatch_fence_id"],
-                "attempt": job["attempt"],
-                "execution_id": fence.body["execution_id"],
-                "host_binding": "host-api",
-                "pid": 4321,
-                "process_start_time": "2026-08-30T01:00:01Z",
-            },
-        )
-        self.assertEqual(registered.status, 200)
-        self.assertEqual(registered.body["lifecycle"], "REGISTERED")
-        terminated = self.call(
-            "POST",
-            f"/v1/jobs/{job_id}/writer/termination",
-            {
-                "fence_id": fence.body["dispatch_fence_id"],
-                "attempt": job["attempt"],
-                "execution_id": fence.body["execution_id"],
-                "host_binding": "host-api",
-                "pid": 4321,
-                "process_start_time": "2026-08-30T01:00:01Z",
-                "evidence_type": "process_exit",
-                "evidence_reference": "evidence-api",
-                "exit_code": 0,
-            },
-        )
-        self.assertEqual(terminated.status, 200)
-        self.assertTrue(terminated.body["termination_confirmed"])
-        result = self.call(
-            "POST",
-            f"/v1/jobs/{job_id}/result",
-            {
-                "schema_version": "xb.member.gateway.result.v1",
-                "job_id": job_id,
-                "operation": "member.create",
-                "dispatch_fence_id": fence.body["dispatch_fence_id"],
-                "status": "CREATED_VERIFIED",
-                "member_no": member_no,
-                "save_invocation_count": 1,
-                "readback_found": True,
-                "readback_match": True,
-                "error_code": None,
-            },
-        )
-        self.assertEqual(result.status, 200)
-        status = self.call("GET", f"/v1/jobs/{job_id}")
-        self.assertEqual(status.status, 200)
-        self.assertEqual(status.body["schema_version"], "xb.member.gateway.job.v2")
-        self.assertEqual(status.body["state"], "CREATED_VERIFIED")
-        self.assertNotIn("member_payload", status.body)
-        self.assertNotIn("response_id", status.body)
+    def test_worker_session_header_is_required_on_worker_routes(self):
+        for method, path in (("POST", "/v2/worker/claim"), ("POST", f"/v2/jobs/{JOB}/result")):
+            response = self.app.handle(method, path, headers={"Authorization": "Bearer worker"}, body={})
+            self.assertEqual((response.status, response.body["error_code"]), (400, "worker_session_invalid"))
+            response = self.call(method, path, "worker", session="ws-short")
+            self.assertEqual(response.status, 400)
 
-    def test_operation_surface_is_exact_member_create(self):
-        response = self.call(
-            "POST",
-            "/v1/jobs/synthetic/write-intent",
-            {
-                "operation": "member.update",
-                "member_no": "6581234567",
-                "payload_hash": "sha256:" + "0" * 64,
-            },
-        )
-        self.assertEqual(response.status, 400)
-        self.assertEqual(response.body["error_code"], "operation_invalid")
-        self.assertEqual(self.call("POST", "/v1/jobs/synthetic/update", {}).status, 404)
-        self.assertEqual(self.call("DELETE", "/v1/jobs/synthetic", {}).status, 404)
+    def test_missing_auth_is_401_and_liveness_is_open(self):
+        self.assertEqual(self.app.handle("GET", "/livez").status, 200)
+        self.assertEqual(self.app.handle("POST", "/v2/worker/claim", headers={}, body={}).status, 401)
 
-    def test_readiness_fails_closed_without_effective_member_constraint(self):
-        repository = InMemoryRepository()
-        service = GatewayService(
-            GatewayConfig.from_mapping({}),
-            repository,
-            adapter_ready=False,
-            clock=NOW,
-        )
-        response = GatewayApp(service).handle("GET", "/readyz", headers={})
-        self.assertEqual(response.status, 503)
-        self.assertFalse(response.body["ready"])
-        self.assertNotIn("member_no_max_length_required", response.body["reasons"])
-        self.assertIn("source_credential_digest_required", response.body["reasons"])
+    # --- U-RZ: readyz and resolve -----------------------------------------
 
-    def test_activation_and_kill_switch_are_controlled_operations(self):
-        repository = InMemoryRepository()
-        repository.set_control("kill_switch_enabled", True)
-        service = GatewayService(
-            make_config(production_activation_enabled=False, kill_switch_enabled=True),
-            repository,
-            adapter_ready=True,
-            clock=NOW,
-        )
-        app = GatewayApp(
-            service,
-            StaticAuthenticator(
-                {
-                    "operator-token": Principal(
-                        "synthetic-operator",
-                        frozenset({"control.kill_switch", "control.activate"}),
-                    )
-                }
-            ),
-        )
-        headers = {"Authorization": "Bearer operator-token"}
-        activation = app.handle(
-            "POST",
-            "/v1/control/activation",
-            headers=headers,
-            body={
-                "enabled": True,
-                "environment": "production",
-                "approval_reference": "synthetic-approval-001",
-            },
-        )
-        self.assertEqual(activation.status, 200)
-        self.assertTrue(repository.get_control()["production_activation_enabled"])
-        disabled = app.handle(
-            "POST",
-            "/v1/control/kill-switch/disable",
-            headers=headers,
-            body={},
-        )
-        self.assertEqual(disabled.status, 200)
-        self.assertFalse(repository.get_control()["kill_switch_enabled"])
+    def test_readyz_has_exactly_the_contract_fields(self):
+        response = self.app.handle("GET", "/readyz")
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.body, {"ready": True, "reasons": [], "dispatch_enabled": True, "server_time_utc": "2026-09-20T01:00:00Z"})
+        self.repository.set_control("kill_switch_enabled", True)
+        self.assertFalse(self.app.handle("GET", "/readyz").body["dispatch_enabled"])
+        self.repository.set_control("kill_switch_enabled", False)
+        self.repository.set_control("production_activation_enabled", False)
+        self.assertFalse(self.app.handle("GET", "/readyz").body["dispatch_enabled"])
+        dark = make_app(make_service(self.repository, worker_token_sha256=None))
+        response = dark.handle("GET", "/readyz")
+        self.assertEqual((response.status, response.body["ready"], response.body["reasons"]), (503, False, ["worker_credential_digest_required"]))
 
-    def test_admission_cap_is_bound_to_mode_not_runtime_activation(self):
-        repository = InMemoryRepository(source_cutover_watermark="2026-08-30T00:00:00Z")
-        repository.set_control("kill_switch_enabled", True)
-        repository.set_control("production_activation_enabled", False)
-        first_member = GatewayService(
-            make_config(
-                production_activation_enabled=False,
-                kill_switch_enabled=True,
-                source_cutover_watermark="2026-08-30T00:00:00Z",
-                source_production_cutover_exact="2026-08-30T00:00:00Z",
-                source_admission_mode="first_member",
-            ),
-            repository,
-            adapter_ready=True,
-            clock=NOW,
-        )
-        principals = {
-            "source-token": Principal("synthetic-source", frozenset({"source.ingest"})),
-            "control-token": Principal("synthetic-control", frozenset({"control.activate"})),
-        }
-        app = GatewayApp(first_member, StaticAuthenticator(principals))
-        source_headers = {"Authorization": "Bearer source-token"}
-        control_headers = {"Authorization": "Bearer control-token"}
+    def test_resolve_close_and_requeue_with_budget_cap(self):
+        job_id = self.to_review()
+        closed = self.call("POST", f"/v2/control/jobs/{job_id}/resolve", "control", {"action": "CLOSE", "resolution_code": "staff_linked_manually", "member_no": "LEGACY001", "member_guid": guid(9)})
+        self.assertEqual(closed.status, 200)
+        self.assertEqual(set(closed.body), {"schema_version", "resolution_id", "job_id", "action", "resolution_code", "state", "state_version", "write_budget", "resolved_at"})
+        self.assertEqual((closed.body["schema_version"], closed.body["state"]), ("xb.member.gateway.resolution.v1", "RESOLVED"))
+        self.assertNotIn("LEGACY001", json.dumps(closed.body))
+        self.assertNotIn(guid(9), json.dumps(closed.body))
+        again = self.call("POST", f"/v2/control/jobs/{job_id}/resolve", "control", {"action": "CLOSE", "resolution_code": "again"})
+        self.assertEqual((again.status, again.body["error_code"]), (409, "resolution_state_invalid"))
+        stored = self.repository.job_resolutions(job_id)
+        self.assertEqual([(item.action, item.member_no, item.member_guid) for item in stored], [("CLOSE", "LEGACY001", guid(9))])
 
-        first = make_event("activation-first")
-        self.assertEqual(app.handle("POST", "/v1/source-events", headers=source_headers, body=first).status, 202)
-        replay = app.handle(
-            "POST", "/v1/source-events", headers=source_headers,
-            body={**first, "request_id": "api-request-activation-first-replay"},
-        )
-        self.assertEqual(replay.status, 202)
-        self.assertTrue(replay.body["replayed"])
-        second = {**make_event("activation-second"), "create_time": "2026-08-30T01:00:01Z"}
-        blocked = app.handle("POST", "/v1/source-events", headers=source_headers, body=second)
-        self.assertEqual(blocked.status, 409)
-        self.assertEqual(blocked.body["error_code"], "initial_source_window_exhausted")
+    def test_requeue_raises_the_write_budget_by_three_up_to_twelve(self):
+        job_id = self.to_review()
+        budgets = []
+        for step in range(4):
+            response = self.call("POST", f"/v2/control/jobs/{job_id}/resolve", "control", {"action": "REQUEUE", "resolution_code": f"retry_{step}"})
+            self.assertEqual((response.status, response.body["state"]), (200, "QUEUED"))
+            budgets.append(response.body["write_budget"])
+            self.service.clock = later(step + 1)
+            claim = self.claim()
+            self.assertEqual(self.call("POST", f"/v2/jobs/{job_id}/result", "worker", outcome_body(claim, "MANUAL_REVIEW")).status, 200)
+        self.assertEqual(budgets, [6, 9, 12, 12])
+        self.assertEqual(self.repository.get_job(job_id).max_attempts, 12)
 
-        # Runtime activation no longer changes source admission semantics.
-        activated = app.handle(
-            "POST", "/v1/control/activation", headers=control_headers,
-            body={"enabled": True, "environment": "production", "approval_reference": "synthetic-approval-002"},
-        )
-        self.assertEqual(activated.status, 200)
-        still_blocked = app.handle("POST", "/v1/source-events", headers=source_headers, body=second)
-        self.assertEqual(still_blocked.body["error_code"], "initial_source_window_exhausted")
+    def test_requeue_refused_when_the_capped_budget_is_spent(self):
+        job_id = self.to_review()
+        record = self.repository._jobs[job_id]
+        record.max_attempts, record.write_attempts = 12, 12
+        response = self.call("POST", f"/v2/control/jobs/{job_id}/resolve", "control", {"action": "REQUEUE", "resolution_code": "retry"})
+        self.assertEqual((response.status, response.body["error_code"]), (409, "write_budget_cap_reached"))
+        self.assertEqual(self.repository.get_job(job_id).state.value, "MANUAL_REVIEW")
 
-        # Only the separately authorised continuous mode removes the cap, and
-        # an unseen response earlier than an admitted one is still admitted.
-        continuous = GatewayService(
-            make_config(
-                source_cutover_watermark="2026-08-30T00:00:00Z",
-                source_production_cutover_exact="2026-08-30T00:00:00Z",
-                source_admission_mode="continuous",
-            ),
-            repository, adapter_ready=True, clock=NOW,
-        )
-        app = GatewayApp(continuous, StaticAuthenticator(principals))
-        self.assertEqual(app.handle("POST", "/v1/source-events", headers=source_headers, body=second).status, 202)
-        earlier = {**make_event("activation-earlier"), "create_time": "2026-08-30T00:00:00.500Z"}
-        admitted = app.handle("POST", "/v1/source-events", headers=source_headers, body=earlier)
-        self.assertEqual((admitted.status, admitted.body["replayed"]), (202, False))
-        cursor, _, _ = repository.get_source_cursor("member_registration", "member-intake.v1")
-        self.assertEqual(cursor.initial_window_admission_count, 1)
-        before = {**make_event("activation-before"), "create_time": "2026-08-29T23:59:59.999Z"}
-        rejected = app.handle("POST", "/v1/source-events", headers=source_headers, body=before)
-        self.assertEqual((rejected.status, rejected.body["error_code"]), (409, "source_event_before_cutover"))
+    def test_resolve_validation_and_state(self):
+        review = self.to_review("api-review-2")
+        job_id = self.ingest()
+        wrong_state = self.call("POST", f"/v2/control/jobs/{job_id}/resolve", "control", {"action": "CLOSE", "resolution_code": "x"})
+        self.assertEqual((wrong_state.status, wrong_state.body["error_code"]), (409, "resolution_state_invalid"))
+        for body, code in (
+            ({"action": "DELETE", "resolution_code": "x"}, "resolution_action_invalid"),
+            ({"action": "CLOSE", "resolution_code": "Bad Code"}, "resolution_code_invalid"),
+            ({"action": "CLOSE", "resolution_code": "x", "member_guid": "not-a-guid"}, "resolution_member_guid_invalid"),
+            ({"action": "CLOSE", "resolution_code": "x", "member_no": "1" * 21}, "resolution_member_no_invalid"),
+            ({"action": "CLOSE"}, "request_fields_invalid"),
+            ({"action": "CLOSE", "resolution_code": "x", "note": "free text"}, "request_fields_invalid"),
+        ):
+            with self.subTest(code=code):
+                response = self.call("POST", f"/v2/control/jobs/{review}/resolve", "control", body)
+                self.assertEqual((response.status, response.body["error_code"]), (400, code))
 
-    def test_cursor_v2_routes_and_v1_checkpoint_removal(self):
-        repository = InMemoryRepository(source_cutover_watermark="2026-08-30T00:00:00Z")
-        service = GatewayService(
-            make_config(source_cutover_watermark="2026-08-30T00:00:00Z", source_production_cutover_exact="2026-08-30T00:00:00Z", source_admission_mode="first_member"),
-            repository, adapter_ready=True, clock=NOW,
-        )
-        app = GatewayApp(service, StaticAuthenticator({"source-token": Principal("synthetic-source", frozenset({"source.ingest"}))}))
-        headers = {"Authorization": "Bearer source-token"}
-        cursor = app.handle("GET", "/v1/source/cursor?form_alias=member_registration&mapping_version=member-intake.v1", headers=headers)
-        self.assertEqual((cursor.status, cursor.body["schema_version"], cursor.body["active_epoch"]), (200, "xb.member.gateway.source_cursor.v2", None))
-        begun = app.handle("POST", "/v1/source/epochs/begin", headers=headers, body={"form_alias": "member_registration", "mapping_version": "member-intake.v1"})
-        self.assertEqual(begun.status, 200)
-        epoch = begun.body["active_epoch"]
-        opened = app.handle("POST", f"/v1/source/epochs/{epoch['epoch_id']}/pages/open", headers=headers, body={"expected_epoch_state_version": 0, "request_page_token": None, "next_page_token": None, "terminal": True, "items": []})
-        self.assertEqual((opened.status, opened.body["page_state"]), (200, "OPEN"))
-        committed = app.handle("POST", f"/v1/source/pages/{opened.body['page_id']}/commit", headers=headers, body={"expected_epoch_state_version": opened.body["epoch_state_version"]})
-        self.assertEqual((committed.status, committed.body["epoch_status"]), (200, "COMPLETED"))
-        legacy = app.handle("POST", "/v1/source/cursor/page", headers=headers, body={})
-        self.assertEqual((legacy.status, legacy.body["error_code"]), (404, "route_not_found"))
-        invalid = app.handle("POST", "/v1/source/epochs/begin", headers=headers, body={"form_alias": "member_registration"})
-        self.assertEqual((invalid.status, invalid.body["error_code"]), (400, "request_fields_invalid"))
+    # --- job.v3 view and operator status ------------------------------------
 
-    def test_kill_switch_engage_blocks_claim_and_controlled_clear_restores_eligibility(self):
-        engaged = self.call("POST", "/v1/control/kill-switch/enable", {})
-        self.assertEqual(engaged.status, 200)
-        self.assertTrue(engaged.body["kill_switch_enabled"])
-        self.assertTrue(self.repository.get_control()["kill_switch_enabled"])
+    def test_job_v3_view_is_operator_scoped_and_metadata_only(self):
+        job_id = self.ingest(name="Private Person", phone="+65 9123 4567")
+        claim = self.claim()
+        self.call("POST", f"/v2/jobs/{job_id}/result", "worker", outcome_body(claim, "CREATED_VERIFIED", member_guid=guid(3)))
+        for path in (f"/v1/jobs/{job_id}", f"/v1/jobs/{job_id}/status"):
+            response = self.call("GET", path, "operator")
+            self.assertEqual((response.status, response.body["schema_version"]), (200, "xb.member.gateway.job.v3"))
+            text = json.dumps(response.body)
+            for private in ("Private Person", "6591234567", "PRIVATEPERSON", guid(3), "synthetic-member@example.test", "api-a", claim["lease_id"]):
+                self.assertNotIn(private, text)
+        self.assertEqual(self.call("GET", f"/v1/jobs/{job_id}", "worker").status, 403)
 
-        ingested = self.call(
-            "POST", "/v1/source-events", make_event("api-kill-switch-response")
-        )
-        self.assertEqual(ingested.status, 202)
-        blocked = self.call("POST", "/v1/worker/claim", {})
-        self.assertEqual(blocked.status, 423)
-        self.assertEqual(blocked.body["error_code"], "kill_switch_enabled")
+    def test_operator_status_v2_counts_without_private_values(self):
+        self.to_review()
+        status = self.call("GET", "/v1/operator/status", "operator").body
+        self.assertEqual(status["schema_version"], "xb.member.gateway.operator_status.v2")
+        self.assertEqual((status["job_state_counts"]["MANUAL_REVIEW"], status["manual_review_reason_counts"]), (1, {"format_variant_other_person": 1}))
+        self.assertTrue(status["dispatch_enabled"])
 
-        cleared = self.call("POST", "/v1/control/kill-switch/disable", {})
-        self.assertEqual(cleared.status, 200)
-        self.assertFalse(cleared.body["kill_switch_enabled"])
-        claimed = self.call("POST", "/v1/worker/claim", {})
-        self.assertEqual(claimed.status, 200)
-        self.assertTrue(claimed.body["claimed"])
+    # --- U-PV: privacy ------------------------------------------------------
 
-    def test_five_principal_route_matrix_has_no_role_union(self):
-        source_denied = [
-            ("GET", "/v1/operator/status"), ("POST", "/v1/control/kill-switch/enable"),
-            ("POST", "/v1/worker/claim"), ("POST", "/v1/jobs/missing/writer/recover"),
+    def test_no_member_no_guid_or_customer_data_in_logs_audit_or_non_worker_views(self):
+        job_id = self.ingest(name="Hidden Name", phone="+65 9876 5432", email="hidden-person@example.test")
+        claim = self.claim()
+        member_no = claim["request"]["base_member_no"] + claim["request"]["name_component"]
+        body = outcome_body(claim, "CREATED_VERIFIED_NAME", member_guid=guid(5))
+        accepted = self.call("POST", f"/v2/jobs/{job_id}/result", "worker", body)
+        replay = self.call("POST", f"/v2/jobs/{job_id}/result", "worker", body)
+        conflict = self.call("POST", f"/v2/jobs/{job_id}/result", "worker", dict(body, error_code="x"))
+        views = [
+            accepted.body, replay.body, conflict.body,
+            self.call("GET", f"/v1/jobs/{job_id}", "operator").body,
+            self.call("GET", "/v1/operator/status", "operator").body,
+            self.call("GET", f"/v1/operator/reconciliation/{job_id}", "operator").body,
+            list(self.repository.audit_events), list(self.repository.result_conflicts),
         ]
-        for method, path in source_denied:
-            self.assertEqual(self.app.handle(method, path, headers=self.source_headers, body={}).status, 403)
-        for method, path in (("POST", "/v1/source-events"), ("POST", "/v1/control/activation"), ("POST", "/v1/worker/claim"), ("POST", "/v1/jobs/missing/result")):
-            self.assertEqual(self.app.handle(method, path, headers=self.operator_headers, body={}).status, 403)
-        for method, path in (("POST", "/v1/source-events"), ("POST", "/v1/worker/claim"), ("GET", "/v1/operator/status"), ("POST", "/v1/jobs/missing/writer/recover")):
-            self.assertEqual(self.app.handle(method, path, headers=self.control_headers, body={}).status, 403)
-        self.assertEqual(self.app.handle("GET", "/v1/operator/status", headers=self.headers).status, 403)
-        self.assertEqual(self.app.handle("POST", "/v1/control/kill-switch/enable", headers=self.recovery_headers, body={}).status, 403)
-        self.assertEqual(self.app.handle("GET", "/v1/operator/status", headers={}).status, 401)
+        text = json.dumps(views)
+        for private in (member_no, claim["request"]["base_member_no"], guid(5), "Hidden Name", "hidden-person@example.test", "api-a", claim["lease_id"]):
+            self.assertNotIn(private, text)
+        for event in self.repository.audit_events:
+            self.assertTrue(set(event) <= {"event_type", "recorded_at", "job_id", "state", "operation", "error_code", "count"})
+        # MemberNo and Guid are stored privately for the job.
+        stored = self.repository.member_outcome(job_id)
+        self.assertEqual((stored.member_no, stored.member_guid), (member_no, guid(5)))
 
-    def test_operator_status_and_reconciliation_are_safe_read_only_projections(self):
-        admitted = self.call("POST", "/v1/source-events", make_event("operator-safe"))
-        job_id = admitted.body["job_id"]
-        status = self.call("GET", "/v1/operator/status")
-        self.assertEqual(status.status, 200)
-        reconciliation = self.call("GET", f"/v1/operator/reconciliation/{job_id}")
-        self.assertEqual(reconciliation.status, 200)
-        rendered = str({"status": status.body, "reconciliation": reconciliation.body})
-        for forbidden in ("operator-safe", "member_payload", "response_id", "lease_owner", "worker_session", "process_start", "member_no", "resume_page_token"):
-            self.assertNotIn(forbidden, rendered.casefold())
-        self.assertEqual(self.repository.get_job(job_id).state.value, "QUEUED")
+    def test_error_envelopes_are_generic_with_a_trace_reference(self):
+        response = self.call("POST", "/v1/worker/claim", "worker")
+        self.assertEqual(set(response.body), {"schema_version", "trace_id", "error_code", "message"})
+        self.assertEqual(response.body["message"], "Request rejected; use trace_id for support.")
+
+
+class ConfigV3Tests(unittest.TestCase):
+    """Config v3: five principals; removed keys are configuration errors."""
+
+    def test_five_principals_and_book_mode(self):
+        config = GatewayConfig.from_mapping({"member_book_mode": "production"})
+        self.assertEqual(len(config.credential_env_names), 5)
+        self.assertEqual(config.schema_version, "xb.member.gateway.config.v3")
+        self.assertIn("member_book_mode_invalid", GatewayConfig().readiness_reasons())
+        with self.assertRaisesRegex(ConfigError, "member_book_mode_invalid"):
+            GatewayConfig.from_mapping({"member_book_mode": "either"})
+
+    def test_removed_keys_fail_closed(self):
+        for key in ("recovery_token_sha256", "recovery_token_env"):
+            with self.subTest(key=key):
+                with self.assertRaisesRegex(ConfigError, "recovery_principal_removed"):
+                    GatewayConfig.from_mapping({"member_book_mode": "production", key: None})
+        for key, value in (("heartbeat_seconds", 120), ("member_no_max_length", 20)):
+            with self.subTest(key=key):
+                with self.assertRaisesRegex(ConfigError, "removed_config_field_present"):
+                    GatewayConfig.from_mapping({"member_book_mode": "production", key: value})
+        with self.assertRaisesRegex(ConfigError, "config_schema_version_invalid"):
+            GatewayConfig.from_mapping({"member_book_mode": "production", "schema_version": "xb.member.gateway.config.v2"})
+
+    def test_fixed_timing_and_budget(self):
+        for key, value, code in (("lease_seconds", 300, "lease_seconds_must_be_600"), ("execution_deadline_seconds", 120, "execution_deadline_seconds_must_be_300"), ("max_attempts", 5, "max_attempts_must_be_three")):
+            with self.subTest(key=key):
+                with self.assertRaisesRegex(ConfigError, code):
+                    GatewayConfig.from_mapping({"member_book_mode": "production", key: value})
+
+    def test_activation_requires_a_valid_book_mode(self):
+        repository = make_repository()
+        service = make_service(repository)
+        response = make_app(service).handle("POST", "/v1/control/activation", headers=headers("control"), body={"enabled": True, "environment": "production", "approval_reference": "approval-1"})
+        self.assertEqual(response.status, 200)
+        service.config = GatewayConfig()
+        response = make_app(service).handle("POST", "/v1/control/activation", headers=headers("control"), body={"enabled": True, "environment": "production", "approval_reference": "approval-1"})
+        self.assertEqual((response.status, response.body["error_code"]), (422, "member_book_mode_invalid"))
+
 
 if __name__ == "__main__":
     unittest.main()

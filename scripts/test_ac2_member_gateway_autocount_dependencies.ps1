@@ -40,7 +40,7 @@ foreach ($requirement in $requiredTypes) {
 
 $memberCommand = $invoicing.GetType("AutoCount.BonusPoint.Member.MemberCommand", $true, $false)
 $methodNames = @($memberCommand.GetMethods() | ForEach-Object Name)
-foreach ($name in @("Create", "GetMember", "NewMember", "SaveMember")) {
+foreach ($name in @("Create", "GetMember", "NewMember", "SaveMember", "LoadBrowseTable")) {
     if ($methodNames -notcontains $name) { throw "autocount_required_method_missing" }
 }
 
@@ -50,5 +50,5 @@ foreach ($name in @("Create", "GetMember", "NewMember", "SaveMember")) {
     process_bitness = 64
     assembly_count = $requiredAssemblies.Count
     required_type_count = $requiredTypes.Count
-    required_method_count = 4
+    required_method_count = 5
 } | ConvertTo-Json -Compress

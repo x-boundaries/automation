@@ -75,6 +75,25 @@ class CanonicalContractTests(unittest.TestCase):
             canonicalize_source_event(changed)
 
 
+    def test_google_page_token_and_response_id_camel_case_are_supported(self):
+        # Moved unchanged from the deleted v1 test_additional module.
+        pages = {
+            None: {
+                "responses": [{"responseId": "google-001"}],
+                "nextPageToken": "page-2",
+            },
+            "page-2": {
+                "responses": [
+                    {"responseId": "google-001"},
+                    {"response_id": "google-002"},
+                ]
+            },
+        }
+        rows = list(iter_forms_pages(lambda token: pages[token]))
+        unique = dedupe_poll_responses(rows)
+        self.assertEqual([row.get("responseId", row.get("response_id")) for row in unique], ["google-001", "google-002"])
+
+
 class OpaqueDigitPhoneTests(unittest.TestCase):
     """The phone is the member's own digits: no country code is required or added."""
 

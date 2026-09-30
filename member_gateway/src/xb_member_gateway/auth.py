@@ -51,23 +51,20 @@ _SUBJECT_RE = re.compile(r"^[A-Za-z0-9._:-]{1,100}$")
 _DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 WORKER_SESSION_HEADER = "X-XB-Worker-Session"
 WORKER_SESSION_RE = re.compile(r"^ws-[0-9a-f]{32}$")
-WORKER_HOST_BINDING_RE = re.compile(r"^host-[A-Za-z0-9._:-]{1,120}$")
 
 SOURCE_SCOPES = frozenset({"source.ingest"})
+# The operator reads metadata-only views (operator status, reconciliation and
+# the job.v3 view). It never reads MemberNo, member Guid or customer data.
 OPERATOR_SCOPES = frozenset({"operator.status.read", "operator.reconciliation.read"})
-CONTROL_SCOPES = frozenset({"control.kill_switch", "control.activate"})
-WORKER_SCOPES = frozenset(
-    {
-        "worker.claim", "worker.heartbeat", "worker.allocation", "worker.write_intent",
-        "worker.dispatch", "worker.writer_register", "worker.writer_termination",
-        "worker.writer_quarantine", "worker.result", "worker.reconcile", "job.read",
-    }
-)
-RECOVERY_SCOPES = frozenset({"worker.writer_termination_recovery"})
+CONTROL_SCOPES = frozenset({"control.kill_switch", "control.activate", "control.resolve"})
+# v2 worker: claim one job and post its one result. Every v1 worker scope
+# (heartbeat, allocation, write-intent, dispatch, writer lifecycle, reconcile,
+# job.read) and the recovery principal were removed from code (W-G2-149 2.8).
+WORKER_SCOPES = frozenset({"worker.claim", "worker.result"})
 # The n8n mailer may only claim, record send intent, and post a result for a
 # welcome-email outbox row. It can never reach member, source or control paths.
 MAILER_SCOPES = frozenset({"welcome_email.claim", "welcome_email.send_intent", "welcome_email.result"})
-PRINCIPAL_COUNT = 6
+PRINCIPAL_COUNT = 5
 
 
 def worker_session(value: str) -> str:
@@ -75,14 +72,6 @@ def worker_session(value: str) -> str:
 
     if not isinstance(value, str) or not WORKER_SESSION_RE.fullmatch(value):
         raise AuthenticationError("worker_session_invalid")
-    return value
-
-
-def worker_host_binding(value: str) -> str:
-    """Validate the opaque host identity bound to a writer execution."""
-
-    if not isinstance(value, str) or not WORKER_HOST_BINDING_RE.fullmatch(value):
-        raise AuthenticationError("worker_host_binding_invalid")
     return value
 
 
@@ -135,7 +124,6 @@ class BearerTokenAuthenticator:
             Principal("configured-operator", OPERATOR_SCOPES),
             Principal("configured-control", CONTROL_SCOPES),
             Principal("configured-worker", WORKER_SCOPES),
-            Principal("configured-recovery", RECOVERY_SCOPES),
             Principal("configured-mailer", MAILER_SCOPES),
         )
         return cls(dict(zip(digests, principals)))

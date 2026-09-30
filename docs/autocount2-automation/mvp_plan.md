@@ -1,5 +1,18 @@
 # AutoCount 2.0 Automation MVP Plan
 
+> **SUPERSEDED / HISTORICAL - not the current plan.**
+> The phased plan below (a .NET Framework extractor, a separate reporting SQL
+> database with raw/staging/mart schemas, and a write-back queue in that
+> database) is superseded as the target architecture. The accepted reporting
+> architecture is AutoCount -> governed SQL views -> deterministic full daily
+> snapshot -> blocking validation -> manifest-last local seal -> Owner-user
+> Task Scheduler publisher -> Drive Desktop synced folder -> dashboards
+> (REPORTING_ARCHITECTURE_STATUS=ACCEPTED,
+> REPORTING_IMPLEMENTATION_STATUS=QUEUED_NOT_YET_IMPLEMENTED). Member creation
+> has its own lane. See [architecture.md](architecture.md) and the
+> [inventory intelligence scope](inventory_intelligence_scope.md). This file is
+> kept as history only.
+
 This plan phases the work from API discovery to dashboards and AI summaries. It keeps all production AutoCount automation read-only until the reporting foundation is stable.
 
 The current scope focus is the

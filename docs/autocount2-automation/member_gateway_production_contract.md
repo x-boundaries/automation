@@ -1,17 +1,22 @@
 # Member gateway production contract
 
-Status: bounded repository implementation for #155 G3. This document describes
-the repository boundary only. Production activation remains disabled.
+Status: repository implementation of the member-write v2 contract (#155
+W-G3-152, contract W-G2-149 with Web amendment #155:5890550314). Production
+activation remains disabled; the first production member is the separate W-ACT
+gate. Canonical architecture: [architecture.md](architecture.md) and the
+[member intake automation blueprint](member_intake_automation_blueprint.md).
 
 ## Boundary
 
 The member-first path is:
 
-`Google Forms API -> n8n source adapter -> protected XB Gateway API -> private PostgreSQL -> one outbound-only AC2 worker -> official local AutoCount API`
+`Google Form -> n8n (SERVER_PC) -> protected member gateway API -> private PostgreSQL (SERVER_PC) <- one outbound-only AC2 worker (AC2_VM) -> narrow local AutoCount member primitive`
 
 The gateway accepts one operation, `member.create`. It is not a generic
-AutoCount proxy. The worker has no inbound HTTP, PowerShell remoting, SQL,
-RDP, scheduler, or batch-write surface.
+AutoCount proxy; a generic AutoCount API facade is deferred and not current.
+The worker has no inbound HTTP, PowerShell remoting, SQL, RDP or batch-write
+surface. AutoCount is changed only by the primitive, which calls `SaveMember`
+at most once per invocation and reads the result back.
 
 ## Source event
 
@@ -28,7 +33,7 @@ insignificant whitespace is hashed before ingest.
 a same-ID/different-hash observation is a conflict; a different ID remains a
 different signup even when its customer fields match. The checked-in inactive
 adapter consumes the Google Forms v1 `responses` shape and maps required values
-only through the versioned question-ID allowlist. Config v2 requires a closed
+only through the versioned question-ID allowlist. Config v3 requires a closed
 set of distinct question IDs, the fixed `source_production_cutover_exact`, and
 the closed `source_admission_mode` (`first_member` or `continuous`) before
 admission.
@@ -122,294 +127,259 @@ Closed error codes include `source_epoch_state_version_mismatch`,
 admitted tuple and resume token. `schemas/member_gateway_source_cursor.v1.schema.json`
 is retained unchanged for compatibility; the v1 page-checkpoint route is removed.
 
-## Member semantics
+## Member semantics (XB-MN-1)
 
 The source `create_time` is converted to `Asia/Singapore`. Its Singapore
 calendar date becomes `RegisterDate`; `ExpiryDate` is that date plus two
 calendar years minus one day. `MemberType` is `Default`, `OpeningPoints` is
-zero, and the existing repository DOB representation is preserved:
-`Birthday Month -> 2000-MM-01`.
+zero, `IsActive` and `Individual` are true, and the existing repository DOB
+representation is preserved: `Birthday Month -> 2000-MM-01`.
 
-`MobilePhone` is the canonical normalized phone: the exact ASCII digits the
-member supplied, `^[0-9]{6,15}$`, after presentation characters are removed. A
-single leading `+` is accepted only as the first non-whitespace character and is
-stripped; ASCII spaces, hyphens, parentheses and dots are stripped without
-interpretation. Letters, extension syntax, Unicode digits, internal
-tabs/newlines, extra or mid-string `+`, unsupported punctuation, and empty or
-separator-only input are rejected. A country code is optional and is never
-required, validated, inferred, or prepended, so international and local numbers
-are both valid and a local-looking number is never equivalent to the same
-number carrying a country prefix. Leading zeroes are preserved and the value is
-never treated as an integer. The 15-digit ceiling is what keeps the effective
-production allocation horizon intact: 15 digits plus `X9999` is exactly the
-20-character `member_no_max_length`.
+Ingest canonicalisation is unchanged (payload and `payload_hash` are
+byte-identical to the v1 gateway). The canonical phone is the exact ASCII
+digits the member supplied, `^[0-9]{6,15}$`, after presentation characters are
+removed. A single leading `+` is accepted only as the first non-whitespace
+character and is stripped; ASCII spaces, hyphens, parentheses and dots are
+stripped without interpretation. Letters, extension syntax, Unicode digits
+(including full-width digits), internal tabs/newlines, extra or mid-string `+`,
+unsupported punctuation, and empty or separator-only input are rejected at
+ingest. A country code is never required, validated, inferred, or prepended.
+Leading zeroes are preserved and the value is never treated as an integer.
 
-`MemberNo` is independent, but starts with the canonical phone-shaped base and
-progresses only as `base`, `baseX1`, `baseX2`, and so on. A positive-free
-lookup is required before durable binding. An existing binding always wins.
-Ambiguous or unavailable lookups never advance the suffix. A bound candidate is
-rechecked immediately before the dispatch fence; unexpected occupancy becomes
-manual review rather than silent reallocation. No truncation, alternate suffix,
-or wraparound is implemented.
+At `VALIDATED` the gateway computes, once and immutably:
 
-The effective production `member_no_max_length` is required configuration and
-must be exactly 20. Repository/schema evidence does not
-prove the installed account-book limit. Missing, invalid, or incompatible
-configuration blocks readiness and dispatch.
+- `base_member_no` = ASCII digits of NFKC(canonical phone), 6 to 15 digits,
+  otherwise `REJECTED_VALIDATION(phone_digits_out_of_range)`. A base that starts
+  `000` is an ordinary base.
+- `name_component` = NFKD(name) with combining marks dropped, ASCII `a-z`
+  upper-cased, `A-Z` kept, everything else dropped, truncated to
+  `20 - len(base)` letters (so 5 to 14 letters of room; it may be empty).
+- `member_no_rule = XB-MN-1`.
 
-## Consent and eligibility
+Field limits are checked, never truncated: `Name` at most 100 and `EmailAddress`
+at most 200 UTF-16 code units (`name_exceeds_autocount_limit`,
+`email_exceeds_autocount_limit`). Synthetic markers are a name starting
+`ZZTEST ` or an email ending `@example.invalid`. In `member_book_mode=production`
+any marker is `REJECTED_VALIDATION(synthetic_in_production)`; in
+`member_book_mode=test` both markers are required
+(`test_book_requires_synthetic`). There is no numeric-prefix synthetic rule.
+
+The AutoCount MemberNo is chosen by the primitive and can only be `base` or
+`base + name_component`; the gateway accepts no other value. Every create writes
+`MobilePhone = base`. There is no X1/X2/X3 suffix allocation, no truncation of
+input, and no update of an existing AutoCount member.
+
+## Consent and admission predicates
 
 PDPA acknowledgement must be true under the accepted acknowledgement contract.
-Marketing consent must be recognized `Yes` or `No`; missing or unrecognized
-values are invalid. `No` sets `marketing_allowed=false` conceptually and does
-not block membership creation. No unattended dispatch occurs unless every
-eligibility predicate is true, including activation, clear kill switch,
-environment/source/mapping identity, valid hash and fields, exact operation,
-lease ownership, positive-free evidence, bound allocation, production length
-constraint, no prior fence/result/uncertain state, attempt/deadline limits,
-gateway/adapter readiness, valid worker credential, immediate kill-switch
-recheck, a repository-owned singleton rate/claim decision, and zero prior
-SaveMember invocations. The rate predicate is deliberately not an owner-facing
-throughput number: it is true only when the current durable lease is valid and
-is the sole active non-expired worker lease. Missing or unavailable evidence
-is ineligible.
-
-Claim transactions also hold the existing `kill_switch_enabled` control row
-lock for the complete claim transaction. That row is the durable singleton
-mutex: separate PostgreSQL connections cannot both observe an empty active-lease
-set and claim parallel jobs.
+Marketing consent must be recognised `Yes` or `No`; `No` does not block
+membership. These source predicates (PDPA, consent, source system, allowlisted
+form alias and mapping version, response and hash identity, exact payload field
+set, `member.create`) are enforced when a job is validated
+(`REJECTED_VALIDATION` with a bounded reason such as `pdpa_not_acknowledged`)
+and again when it is claimed (a stored job that fails them is skipped and never
+dispatched). The claim also re-derives the XB-MN-1 identity under the current
+book mode and requires it to equal the stored identity.
 
 Bearer credentials authenticate callers; they are not lease identities.
 Production binds exactly five pairwise-distinct principals: source
-(`source.ingest`), operator (`operator.status.read` and
-`operator.reconciliation.read`), control (`control.kill_switch` and
-`control.activate`), the normal worker (the frozen worker scope set), and
-recovery (`worker.writer_termination_recovery` only). Their environment names,
-configured SHA-256 digests, and resolved runtime values must each be pairwise
-distinct. There is no role union. The reference-HMAC key is a separate runtime
-boundary and cannot authenticate HTTP. Missing, malformed, aliased, or
-mismatched bindings fail before listening. Credential values remain outside
-Git, errors, and logs.
+(`source.ingest`), operator (`operator.status.read`,
+`operator.reconciliation.read`), control (`control.kill_switch`,
+`control.activate`, `control.resolve`), worker (`worker.claim`,
+`worker.result`) and mailer (`welcome_email.claim`,
+`welcome_email.send_intent`, `welcome_email.result`). The former recovery
+principal and every v1 worker scope are removed from code; a recovery key in
+configuration is a configuration error. Environment names, configured SHA-256
+digests and resolved runtime values must each be pairwise distinct. There is no
+role union. The reference-HMAC key is a separate runtime boundary and cannot
+authenticate HTTP. Credential values remain outside Git, errors and logs.
 
 ## Production bootstrap and operator reads
 
 The only production entry is `python -m xb_member_gateway --config
-<reviewed-external-config>`. It loads closed config v2, enforces safe defaults,
-resolves only named PostgreSQL, bind, reference-HMAC, and six bearer
-boundaries (source, operator, control, worker, recovery, mailer), validates
-separation, builds the authenticator and repository, and performs read-only
-admission checks for migrations 0001 through 0005, control rows, the
-initialized watermark, exact production cutover and form binding, the absence
-of any source response without an exact `createTime` or handling receipt, and
-the absence of any `CREATED_VERIFIED` result without a welcome outbox row. Only then may it construct
-the service/application and listen. Bootstrap never migrates, initializes,
-repairs, discovers identity, generates credentials, clears the kill switch, or
-activates the gateway; failures expose bounded codes only.
+<reviewed-external-config>`. It loads closed config v3
+(`xb.member.gateway.config.v3`, required `member_book_mode`), enforces safe
+defaults, resolves only the named PostgreSQL, bind, reference-HMAC and five
+bearer boundaries, validates separation, builds the authenticator and
+repository, and performs read-only admission checks for migrations 0001 through
+0006, control rows, the initialized watermark, exact production cutover and form
+binding, the absence of any source response without an exact `createTime` or
+handling receipt, and the absence of any `CREATED_VERIFIED` outcome (in either
+the legacy `results` table or `member_outcomes`) without a welcome outbox row.
+Only then may it listen. Bootstrap never migrates, initializes, repairs,
+discovers identity, generates credentials, clears the kill switch, or activates
+the gateway; failures expose bounded codes only.
 
-Startup composition admits exactly one dark-bring-up exemption. A gateway whose
-`autocount_adapter_ready` is false may compose and listen provided every other
-config, readiness, separation, and repository admission check passes.
-`GatewayConfig.readiness_reasons()` is unchanged, so adapter-not-ready still
-returns readiness false, still publishes `autocount_adapter_not_ready` in the
-readiness reasons, still fails the dispatch eligibility predicate, and still
-leaves AutoCount execution unavailable. The activation-false and
-kill-switch-true startup fence is unchanged and is evaluated before the
-exemption. Every unrelated readiness or config failure remains fail closed.
+Startup admits exactly one dark-bring-up exemption: a gateway whose
+`autocount_adapter_ready` is false may compose and listen if every other check
+passes; readiness stays false with `autocount_adapter_not_ready`, so nothing is
+dispatched.
 
-The resolved bind address must be a private IP literal. Bootstrap rejects a
-malformed or non-literal value as `bind_address_invalid`, an IPv4 or IPv6
-unspecified or wildcard value as `bind_address_unspecified`, and a multicast,
-reserved, or public value as `bind_address_not_private`. IPv4-mapped IPv6 forms
-are unwrapped before classification, so a mapped wildcard is rejected as a
-wildcard. The supplied value is never echoed in the bounded code, no name
-resolution is performed, and there is no fallback to `0.0.0.0` or `::`. The
-application does not terminate TLS; deployment places the gateway on its fixed
-private backend address.
+The resolved bind address must be a private IP literal (`bind_address_invalid`,
+`bind_address_unspecified`, `bind_address_not_private`); no name resolution and
+no wildcard fallback. The application does not terminate TLS.
 
-The operator status and reconciliation GET endpoints are read-only safe
-projections. They expose readiness/control state, bounded lease/hold/proof and
-uncertainty summaries, and public reconciliation/result lineage. They never
-expose worker/process/host identity, MemberNo, source payloads, raw response
-IDs, credentials, or page tokens. Operators have no mutation route; existing
-control and worker mutation scopes remain separate.
+Operator status, reconciliation and job (`xb.member.gateway.job.v3`) reads are
+metadata-only projections: state, bounded reasons, attempt and budget counters,
+timestamps and lineage. They never expose MemberNo, member Guid, worker/process
+identity, source payloads, raw response IDs, credentials or page tokens.
+Operator status (`xb.member.gateway.operator_status.v2`) also counts the
+primitive's closed data-quality flags (`email_seen_on_other_member`,
+`post_save_same_person_other_row`, `malformed_member_no_excluded`), recorded
+once per accepted result (per attempt, not per job) as codes only.
 
-Every worker request carries `X-XB-Worker-Session` with a generated `ws-` plus
-32 lower-case hexadecimal characters. The value is generated locally for one
-worker process/run, is validated against that closed pattern, and is not a
-secret, hostname, Windows/account identity, SID, or private path. The same
-bearer used with another session cannot inherit or operate the first session's
-lease. The normal worker session is bound to claim, lease/heartbeat, allocation,
-write-intent, dispatch-fence, and result operations. Recovery uses a fresh
-host-bound session and the exact recorded execution bindings, independently of
-the normal worker credential.
+## Worker v2 wire contract
 
-The worker refreshes the same lease, with the current `state_version`, immediately
-before starting the irreversible AutoCount call. The call runs in one supervised
-child process while the singleton worker retains the gateway session. The parent
-renews the lease on the configured heartbeat cadence and requires the returned
-state version to advance and the lease to remain beyond the absolute execution
-deadline. A heartbeat failure, deadline, or protection cutoff terminates the child
-and waits until process exit is positively observed before the lease protection can
-lapse. If exit cannot be confirmed, the worker fails closed into the durable
-writer-termination quarantine described below. An already-dispatched ambiguous
-outcome has no SaveMember retry.
+```text
+GET  /readyz                            {ready, reasons[], dispatch_enabled, server_time_utc}
+POST /v2/worker/claim                   scope worker.claim; schemas/member_gateway_worker_claim.v2.schema.json
+POST /v2/jobs/{job_id}/result           scope worker.result; schemas/member_gateway_result.v2.schema.json
+POST /v2/control/jobs/{job_id}/resolve  scope control.resolve; schemas/member_gateway_resolution.v1.schema.json
+```
 
-## Writer liveness and quarantine (A1)
+`dispatch_enabled` is `production_activation_enabled AND NOT kill_switch`.
+Every worker request carries `X-XB-Worker-Session` (`ws-` plus 32 lower-case
+hex characters, generated per worker run, not a secret or host identity).
 
-The dispatch-fence transaction creates one durable writer-execution hold in
-`PENDING` state and locks the singleton writer-termination gate. The hold is
-bound to the job, fence, attempt, worker session, host binding, opaque execution
-identity, and bound MemberNo. PID and process-start identity are intentionally
-unset until the process exists. While any hold is active, the repository blocks
-another claim, fence, allocation, SaveMember-capable path, ordinary lease
-reclamation, and reconciliation. PostgreSQL serializes these transitions by
-transactionally locking the gate row; the in-memory repository applies the same
-rule under its repository lock.
+The v1 worker surface is removed from code, not disabled by configuration:
+`/v1/worker/claim`, `/v1/jobs/{id}/precheck`, `/lease` (heartbeat),
+`/allocation*`, `/write-intent`, `/dispatch-fence`, `/writer/{register,
+termination,quarantine,recover}`, the v1 `/result` and `/reconcile` routes, the
+recovery principal and `allocation.py`/`reconciliation.py`. Removed routes
+return `404 route_not_found`. `/v1/source*`, `/v1/welcome-emails/*`,
+`/v1/operator/*`, `/v1/control/*`, `/livez` and `/readyz` remain.
 
-The parent starts the child with stdin withheld. The child cannot create the
-AutoCount session or reach SaveMember until the parent has obtained the exact PID
-and process-start timestamp, registered both through the worker-only
-`writer/register` CAS operation, and received a durable `REGISTERED`
-acknowledgement. Only then does the parent release the payload. The registered
-child is the sole SaveMember-capable process for this fence; it does not detach
-or spawn a writer descendant.
+A claim returns either `{claimed:false, reason: dispatch_disabled |
+no_eligible_job | singleton_busy}` or one job with `attempt_no`, an opaque
+`lease_id` (`lease-` plus 32 hex), `state_version`, `lease_expires_at`,
+`first_claimed_at`, `server_time_utc` and the `request` object (XB-MN-1 rule,
+base, name component, phone, name, email and the member record fields).
 
-Normal completion first establishes positive process exit and durably moves the
-hold to `TERMINATION_CONFIRMED`, with exact fence/attempt/session/host/execution
-and PID/start bindings plus bounded process-exit evidence. Only after that
-confirmation does the worker post the business result. Result acknowledgement
-does not release the hold early. If exit or proof cannot be established, the
-hold becomes `QUARANTINED` and the job becomes
-`WRITER_TERMINATION_UNCONFIRMED`; elapsed time, Kill(), a watchdog callback,
-restart, or stale session is never proof.
+The worker cycle is exactly: readiness, claim, run the primitive as a child
+process with a hard 300-second deadline, post one result (the identical body, at most three
+posts in total, retried only on transport failure or HTTP 5xx, within the lease). There is no
+heartbeat: the 600-second lease is at least twice the child deadline.
 
-If termination is positively known but the business result is unknown, the
-repository atomically creates the single immutable
-`WRITE_OUTCOME_UNCERTAIN` event and projection, moves the job to that existing
-result state, clears the hold, and releases the stale lease. A recovery operation
-is narrower than ordinary writer authority, must be fresh host-bound evidence,
-and can only resolve the termination side of a quarantined fence. The recovery
-principal has no `job.read` scope because the recovery operation does not require
-it. Legacy post-fence uncertainty is materialized as legacy-unproven quarantine;
-it is not automatically cleared or made reconcilable.
+## AutoCount primitive contract
 
-## Kill-switch control
+The primitive (`scripts/ac2_member_create_primitive.ps1`) runs on `AC2_VM`, one
+process per job attempt, as the dedicated integration user:
 
-The repository control plane exposes only the scoped member-gateway kill-switch
-operations: `POST /v1/control/kill-switch/enable` engages
-`kill_switch_enabled=true` and `POST /v1/control/kill-switch/disable` clears it.
-The default is ON. Engaging the switch fails closed for new claims and for the
-dispatch fence; clearing it is a separately authorised operation and does not
-bypass any other eligibility predicate. These endpoints are not generic database
-or administrator controls. The repository owns the final safety boundary:
-the in-memory implementation checks the flag and mutates under one
-repository lock; PostgreSQL locks the `control_flags` row with `FOR UPDATE`
-in the same transaction that creates a lease or dispatch fence. A missing
-control row also fails closed.
+1. Validate the request: shape, digits(phone) = base, name component shape and
+   total length at most 20, field limits, explicit `-Book production|test`,
+   synthetic rules; clock skew against the gateway at most 120 seconds.
+2. Acquire the machine-wide mutex `Global\XB-AC2-MemberCreate` (30 s wait;
+   an abandoned mutex counts as acquired; timeout is `MUTEX_BUSY`) and hold it
+   through readback.
+3. Open the reviewed AutoCount session; the connected book must be the
+   configured book for the mode and the session user must be the integration
+   user.
+4. Probe every Member row (active and inactive): exact holders of the base (H)
+   and suffix/prefix format variants of 8+ digits (V). Same person = same email,
+   or same name tokens ignoring order. Decide, first match wins:
 
-## State and irreversible boundary
+| Rule | Condition | Outcome |
+| --- | --- | --- |
+| R0 | attempt 2+ and a row in H or V created by the integration user since the first claim (minus 10 min) | exactly one exact match of all 11 fields -> `CREATED_VERIFIED_PRIOR_ATTEMPT`; else `MANUAL_REVIEW(prior_attempt_ambiguous)` |
+| R1 | H and V empty | create `base` |
+| R2a | two or more same-person rows | `MANUAL_REVIEW(multiple_same_person)` |
+| R2b | one same-person row, inactive | `MANUAL_REVIEW(inactive_match)` |
+| R2c | one same-person row, active | `LINKED_EXISTING` |
+| R3 | no same person, V not empty | `MANUAL_REVIEW(format_variant_other_person)` |
+| R3b | no same person, an H row with no name and no email | `MANUAL_REVIEW(holder_identity_unknown)` |
+| R4 | every H row clearly another person | empty component -> `MANUAL_REVIEW(name_component_empty)`; `base+component` already used -> `MANUAL_REVIEW(name_candidate_collision)`; else create `base+component` |
 
-The validated state machine includes `RECEIVED`, `VALIDATED`, `QUEUED`,
-`LEASED`, `PRECHECKING`, `ALLOCATION_BOUND`, `WRITE_INTENT_RECORDED`,
-`WRITING`, `READBACK`, and `CREATED_VERIFIED`, plus explicit validation,
-ambiguity, retry, uncertain, mismatch, manual-review, and dead-letter states.
+5. On create only: `NewMember(false)`, assign the 11 fields, call
+   `SaveMember` exactly once from the single call site, then `GetMember` with
+   Guid, creator and creation time, and classify (verified, mismatch, foreign
+   row, not created, not created on conflict, or uncertain).
+6. Release the mutex and emit one bounded result (no personal data except the
+   MemberNo).
 
-The durable dispatch fence is the irreversible boundary. It is unique per job,
-requires the bound allocation, write intent, and a successful fresh recheck of
-that same bound MemberNo, and records zero SaveMember invocations before the
-worker call. Allocation probing and the fresh pre-dispatch recheck are distinct
-durable observations. The recheck marker records only public-safe lineage for
-the job, attempt, worker session, operation reference, and `FREE` status; it
-does not log MemberNo. A missing, stale, occupied, ambiguous, unavailable, or
-conflicting recheck fails closed without allocating another suffix.
+## State machine and retries
 
-After the fence exists, there is no automatic retry, no new suffix, and no
-return to the normal create queue. A missing termination proof remains
-`WRITER_TERMINATION_UNCONFIRMED` with an active quarantine and is never
-reconcilable. Reconciliation may begin only for exactly
-`WRITE_OUTCOME_UNCERTAIN`, with positively confirmed writer termination, a
-cleared hold, no active lease, the same bound MemberNo and fence, and the
-existing reconciliation case/check evidence. Positive absence does not
-authorize recreation; mismatch or ambiguous lookup remains manual/reconciliation
-work, and a late writer result cannot overwrite a completed reconciliation.
+```text
+RECEIVED  -> VALIDATED | REJECTED_VALIDATION
+VALIDATED -> QUEUED | REJECTED_VALIDATION
+QUEUED | RETRY_WAIT(due) -> LEASED                      (claim)
+LEASED    -> CREATED_VERIFIED | LINKED_EXISTING | REJECTED_VALIDATION | MANUAL_REVIEW | RETRY_WAIT
+MANUAL_REVIEW -> RESOLVED (CLOSE) | QUEUED (REQUEUE: write budget +3, total cap 12)
+```
 
-The public dispatch-fence identifier is always `fence-` followed by the
-published safe identifier shape. Both repositories and result construction
-expose that representation. PostgreSQL retains its existing internal UUID
-columns and converts them at the repository boundary, so a plain UUID is never
-emitted as a versioned result fence ID. No additional migration is needed for
-this boundary-only representation.
+REQUEUE resets the busy-attempt counter; a REQUEUE with no budget left is
+refused (`409 write_budget_cap_reached`). Resolutions are append-only in
+`job_resolutions` and never queue a welcome email.
 
-## AutoCount adapter contract
+Legacy v1 states remain readable for historical rows and are never entered.
 
-The adapter is shaped around an authenticated local official session,
-`MemberCommand.Create(...)`, `GetMember(MemberNo)`, `NewMember(false)`, and
-exactly one `SaveMember(MemberEntity)`. It assigns and verifies:
+A claim locks the `control_flags` row, requires `dispatch_enabled`, readiness
+and no active lease on any job (one active lease across all jobs), reaps an
+expired lease (the job goes to `RETRY_WAIT` as an uncertain attempt, eligible
+5 minutes after expiry, or `MANUAL_REVIEW(uncertain_exhausted)`), picks the
+oldest eligible job, records the attempt, sets `first_claimed_at` once, and
+creates a 600-second lease with a fresh token. The kill switch blocks new
+claims only; results for work in flight are always accepted.
 
-`MemberNo`, `MemberType`, `Name`, `MobilePhone`, `EmailAddress`, `DOB`,
-`RegisterDate`, `ExpiryDate`, `OpeningPoints`, `IsActive`, and `Individual`.
+A result is accepted only if the job is `LEASED`, the lease token is the active
+one, and `attempt_no` and `state_version` match (compare-and-set). The same body
+again returns the stored response; a different body for the same lease is `409`
+and recorded; a stale or replaced lease is `409` with nothing changed. A
+lease-matching body that breaks the per-outcome consistency rules (for example
+a `CREATED_VERIFIED` whose MemberNo is not exactly `base` under R1 or
+`base+component` under R4, or any save count above one) goes to
+`MANUAL_REVIEW(result_contract_violation)`.
 
-`IsActive` and `Individual` are adapter-managed defaults. Update, delete, direct
-SQL, batch writes, and fallback creation are outside this contract. The adapter
-has an executable reviewed session boundary: it loads the established AutoCount
-assemblies, creates `DBSetting`, runs the established `UserSession`
-authentication/login sequence, and accepts a private deployment-bound session
-factory when supplied. Server, database, user, password-environment name, and
-assembly path are process-scoped deployment values; secrets remain outside Git
-and are never printed. No repository credential or new credential topology is
-introduced.
+| Primitive outcome | Gateway state | Welcome email |
+| --- | --- | --- |
+| `CREATED_VERIFIED` | `CREATED_VERIFIED` + `member_outcomes` row | queued in the same transaction |
+| `CREATED_VERIFIED_PRIOR_ATTEMPT` | `CREATED_VERIFIED`; if that Guid is already credited to another job, `LINKED_EXISTING(guid_already_verified)` | only when credited |
+| `LINKED_EXISTING` | `LINKED_EXISTING` | no |
+| `MANUAL_REVIEW`, `CREATED_READBACK_MISMATCH` | `MANUAL_REVIEW` | no |
+| `REJECTED_VALIDATION` | `REJECTED_VALIDATION` | no |
+| `FAILED_BEFORE_WRITE`, `NOT_CREATED`, `NOT_CREATED_CONFLICT`, `OUTCOME_UNCERTAIN`, lease expiry | `RETRY_WAIT` (+5 min, then +30 min); third write attempt -> `MANUAL_REVIEW(attempts_exhausted` or `uncertain_exhausted)` | no |
+| `MUTEX_BUSY` | `RETRY_WAIT` +5 min; twelfth -> `MANUAL_REVIEW(mutex_busy_exhausted)` | no |
+
+A fresh create whose Guid is already credited can only be a defect and goes to
+`MANUAL_REVIEW(guid_conflict_on_fresh_create)`. Uncertainty is never guessed:
+the next attempt's probe under the mutex finds the real state (R0 finds our own
+row).
 
 ## Persistence and trust boundary
 
-The append-only 0003_writer_termination_quarantine.sql migration adds the
-WRITER_TERMINATION_UNCONFIRMED job state, a singleton writer_termination_gate,
-and one versioned writer-execution hold per dispatch fence. It preserves exact
-job/fence/attempt/session/host/execution/member bindings, nullable pending
-process identity, registered/confirmed/quarantined/cleared lifecycle, bounded
-public-safe evidence metadata, and legacy post-fence quarantine materialization.
-The versioned schemas/member_gateway_job.v2.schema.json publishes the safe
-job/status shape; the result-status vocabulary remains unchanged. The migration
-stores these surfaces alongside source responses and observations, ingest
-receipts, jobs, attempts, leases, allocation probes and bindings, write intents,
-dispatch fences, append-only result events plus a current result projection,
-reconciliation cases/checks, rejections, dead letters, control flags, audit
-events, and schema versions. Foreign keys use restrictive delete behaviour.
-The separate 0004 migration adds only the durable Forms cursor and append-only
-page receipts. It does not modify migrations 0001-0003 and does not seed a real
-watermark or cursor; one-time production initialization is a later authorised
-deployment transaction.
-The additive 0005 migration (`0005_member_vertical_slice.sql`) adds exact source
-time columns, unified handling receipts, PII-free rejections, scan epochs,
-pages and page items (token uniqueness scoped to the epoch), append-only and
-immutability triggers, the `welcome_v1` outbox and its append-only events. It
-modifies no earlier migration, deletes nothing and seeds no production cutover
-or form binding. Rows admitted before 0005 cannot prove their exact Google
-string, so the column stays nullable and bootstrap readiness fails closed with
-`source_exact_time_backfill_missing` until a reviewed backfill; exact values are
-never guessed.
+Migrations 0001-0005 are unchanged. The additive
+`0006_member_write_v2.sql`:
 
-The first `results` insert on both the leased worker path and the confirmed
-termination path previously named 11 columns but supplied 12 placeholders for
-11 parameters, so psycopg rejected it and no positive result could be recorded
-against a real database. Both statements now share one 11/11 statement, and the
-offline PostgreSQL test cursor runs every statement through psycopg's real query
-adaptation so a placeholder/parameter mismatch cannot pass silently again.
-The current projection is replaced by a conditional update only after the
-immutable result event is recorded in the same transaction; the unique `job_id`
-projection is never delete/reinserted. No database transaction remains open
+1. refuses to run if any job is non-terminal outside `CREATED_VERIFIED`,
+   `REJECTED_VALIDATION`, `CONFIRMED_NOT_CREATED`, `CREATED_READBACK_MISMATCH`,
+   `MANUAL_REVIEW`, `DEAD_LETTER`, or if any `writer_execution_holds` row is not
+   cleared;
+2. widens the job state check with `LINKED_EXISTING` and `RESOLVED` and adds
+   `member_no_rule`, `base_member_no`, `name_component`, `first_claimed_at`,
+   `write_attempts`, `busy_attempts`, `outcome_reason`;
+3. adds `lease_token`, `outcome`, `rule`, `save_invoked`, `result_hash` to
+   attempts and a unique `lease_token` to leases;
+4. adds the append-only `member_outcomes` table (one row per job) with
+   `UNIQUE (member_guid) WHERE outcome = 'CREATED_VERIFIED'`, so an AutoCount
+   member is credited as created by at most one job;
+5. adds the append-only `job_resolutions` table for operator CLOSE/REQUEUE;
+6. replaces the welcome-outbox trigger so an outbox row requires a
+   `CREATED_VERIFIED` outcome in either the legacy `results` table or
+   `member_outcomes`.
+
+No table is dropped. The allocation, write-intent, dispatch-fence,
+writer-hold and v1 result tables become unused and read-only; retiring them
+needs a separately approved migration. No database transaction remains open
 across an AutoCount call.
 
-Normal logs contain only run/request/job/attempt metadata, state, operation,
-safe error codes, timing/counts, and versioned keyed HMAC references. Names,
-phones, email, DOB, MemberNo, raw response IDs, payloads, credentials, SQL,
-and private server/database identity are not normal log fields.
+Normal logs contain only run/request/job/attempt metadata, state, safe reason
+and error codes, timing/counts and keyed HMAC references. Names, phones, email,
+DOB, MemberNo, member Guid, raw response IDs, payloads, credentials, SQL and
+private server/database identity are not log fields.
 
-The committed n8n export is inactive, credential-free, placeholder-only, and
-has a false activation gate. It is not imported, activated, or executed by this
-run. CI is offline-only and does not contact Google, n8n, AutoCount,
-PostgreSQL, Docker, or a deployment target. Private process identity,
-host-binding, nonce, and raw evidence never appear in ordinary public job
-status or result responses.
+The committed n8n exports are inactive, credential-free and placeholder-only;
+they call only the source and welcome-email routes and are unchanged by v2. CI
+is offline-only and does not contact Google, n8n, AutoCount, PostgreSQL,
+Docker or a deployment target.
 
 ## Private HTTPS deployment topology
 
@@ -465,12 +435,12 @@ never form input or the n8n export, constructs the message and records its
 hash; the mailer sends it verbatim after verifying that hash.
 
 A unique outbox row (`UNIQUE (response_id, template_id)`, `UNIQUE (job_id)`) is
-inserted inside the same `acknowledge_result` transaction that first records
-`CREATED_VERIFIED`, on both the leased worker path and the exact-match
-reconciliation projection. A database trigger refuses any outbox insert without
-a `CREATED_VERIFIED` result. A duplicate positive acknowledgement verifies the
+inserted inside the same result transaction that first records a
+`CREATED_VERIFIED` outcome for the job. A database trigger refuses any outbox
+insert without a `CREATED_VERIFIED` outcome (legacy `results` or
+`member_outcomes`). A duplicate positive acknowledgement verifies the
 existing outbox identity and fails closed if it is missing; historical success
-is never backfilled. Uncertain, absent, mismatch, rejected, manual-review and
+is never backfilled. Linked, demoted, uncertain, mismatch, rejected, manual-review, resolved and
 dead-letter outcomes create no outbox row.
 
 State machine:
@@ -491,10 +461,9 @@ records `SENT`, meaning SMTP accepted the message, not inbox delivery. After a
 send intent, any timeout, crash, lost acknowledgement or unclassified outcome
 (including lease expiry) is `DELIVERY_OUTCOME_UNCERTAIN`, which is never
 claimable, so no blind resend can happen; a future resend needs private positive
-proof that SMTP did not accept. Email failure never touches the member job,
-allocation or AutoCount.
+proof that SMTP did not accept. Email failure never touches the member job or AutoCount.
 
-The sixth `configured-mailer` principal holds only `welcome_email.claim`,
+The `configured-mailer` principal holds only `welcome_email.claim`,
 `welcome_email.send_intent` and `welcome_email.result`; it is denied every
 member, source, control and operator route, and no other principal can reach
 the welcome-email routes:
@@ -512,14 +481,15 @@ template and bounded error codes.
 
 ## Unsupported production prerequisites
 
-Before any separately controlled activation, an owner must positively verify:
+Before any separately controlled activation, an owner must positively verify
+(live steps L1-L13 and the test-book matrix T-1..T-17 in the
+[member write v2 live runbook](member_write_v2_live_runbook.md)):
 
-- the effective account-book MemberNo length and accepted field types;
-- the licensed official AutoCount assembly/version and session factory;
-- the private HTTPS gateway/auth deployment, distinct normal-worker and
-  recovery credential issuance, source binding, and digest configuration;
-- PostgreSQL provisioning, migration application, backup, monitoring, and access policy;
-- Google Forms API authentication, form alias/question mapping, and pagination policy;
-- operator approval, kill-switch ownership, reconciliation handling, and rollback/runbook ownership.
-
-None of those prerequisites is claimed as proven by this repository change.
+- a 20-character alphanumeric MemberNo is accepted and is POS-searchable (T-1, T-6);
+- member Guid, creator and creation time are readable and the creator is the integration user (T-2, T-14);
+- the dedicated integration user exists per book with create/view rights only (T-16);
+- zero malformed legacy MemberNos before W-ACT;
+- the private HTTPS gateway/auth deployment, the five credential bindings and digests;
+- PostgreSQL provisioning, migration 0006 application after a pre-migration dump, backup and restore rehearsal;
+- Google Forms API authentication, form alias/question mapping and pagination policy;
+- kill-switch ownership, manual-review handling and rollback/runbook ownership.

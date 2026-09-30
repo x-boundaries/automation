@@ -23,7 +23,7 @@ _MISSING = object()
 
 NODE_COUNTS = (
     -1, 0, 1, 128, 129, 130, 131, 200,
-    285, 286, 287, 4095, 4096, 4097,
+    286, 287, 288, 4095, 4096, 4097,
     2_147_483_647, 2_147_483_648,
 )
 
@@ -44,35 +44,106 @@ BOOLEAN_ORDER = (
 
 
 PROTECTED_WORKER_BLOBS = {
-    "scripts/install_ac2_member_gateway_worker.ps1": "724fc4439fcd3de1966e82eae5adf6fee112b142",
-    "scripts/ac2_member_gateway_worker.ps1": "27f0a3f8c78ba9b391b1a09ad33fe5805f723cc1",
-    "scripts/ac2_member_gateway_worker_lib.ps1": "332af5a25f2be996694fdb6cef085139192ebf19",
-    "scripts/ac2_member_gateway_autocount_adapter.ps1": "37ea54fea46c57671b02cbc15a138791a2977244",
-    "scripts/launch_ac2_member_gateway_worker.ps1": "a913dffc6191a8f8945b6427652bab963ab34d70",
-    "scripts/test_ac2_member_gateway_autocount_dependencies.ps1": "2143f59739a413b80e4745bc23053fefade09486",
+    "scripts/install_ac2_member_gateway_worker.ps1": "297369007223de4507a5b96007268abb4e7aa561",
+    "scripts/ac2_member_gateway_worker.ps1": "ba8aeb169e86ae42dfe007f43c1d3786e63c13c0",
+    "scripts/ac2_member_gateway_worker_lib.ps1": "80bf035c8726637c2efff05b099f63fa0ba1cbcf",
+    "scripts/ac2_member_gateway_autocount_adapter.ps1": "82120047e7d07bbe3e484c3207892b4c9859b3df",
+    "scripts/launch_ac2_member_gateway_worker.ps1": "64174f398cac61cc2a19f35eaf64070a7b10be0d",
+    "scripts/test_ac2_member_gateway_autocount_dependencies.ps1": "4ac24e79c23a70d20ef78cdff921a230c80cff05",
+    "scripts/ac2_member_create_primitive.ps1": "5d6397dba91caaa3819ee78219fb06cf02e672c8",
 }
 
 PROTECTED_WORKER_TREES = {
-    "member_gateway": "bf4c9693bdd187a5585660b0cc61223511906637",
+    "member_gateway": "606c5153a77c5fb97615ad4f50e5d90372cf185d",
 }
 
 WORKER_SCRIPTS = tuple(PROTECTED_WORKER_BLOBS)
 
 ALLOWED_FILES = {
     ".github/workflows/member-gateway-tests.yml",
+    "README.md",
     "config/ac2_member_gateway_worker.production.example.json",
-    "config/member_forms_gateway_bounded_import.v2.template.json",
+    "config/ac2_member_gateway_worker.test_book.example.json",
+    "config/member_gateway.production.example.json",
+    "docs/autocount2-automation/architecture.md",
+    "docs/autocount2-automation/inventory_intelligence_scope.md",
+    "docs/autocount2-automation/member_form_intake_contract.md",
+    "docs/autocount2-automation/member_gateway_production_contract.md",
     "docs/autocount2-automation/member_gateway_production_runbook.md",
-    "n8n-workflows/README.md",
-    "n8n-workflows/scripts/README.md",
-    "n8n-workflows/scripts/import-member-forms-gateway-bounded.ps1",
+    "docs/autocount2-automation/member_intake_automation_blueprint.md",
+    "docs/autocount2-automation/member_intake_local_bridge_design.md",
+    "docs/autocount2-automation/member_write_v2_live_runbook.md",
+    "docs/autocount2-automation/mvp_plan.md",
+    "member_gateway/deploy/BACKUP_RESTORE.md",
+    "member_gateway/deploy/compose.example.yaml",
+    "member_gateway/deploy/gateway.env.example",
+    "member_gateway/migrations/0006_member_write_v2.sql",
+    "member_gateway/src/xb_member_gateway/__init__.py",
+    "member_gateway/src/xb_member_gateway/admission.py",
+    "member_gateway/src/xb_member_gateway/allocation.py",
+    "member_gateway/src/xb_member_gateway/api.py",
+    "member_gateway/src/xb_member_gateway/auth.py",
+    "member_gateway/src/xb_member_gateway/config.py",
+    "member_gateway/src/xb_member_gateway/eligibility.py",
+    "member_gateway/src/xb_member_gateway/identity.py",
+    "member_gateway/src/xb_member_gateway/models.py",
+    "member_gateway/src/xb_member_gateway/notifications.py",
+    "member_gateway/src/xb_member_gateway/reconciliation.py",
+    "member_gateway/src/xb_member_gateway/repository.py",
+    "member_gateway/src/xb_member_gateway/results.py",
+    "member_gateway/src/xb_member_gateway/state_machine.py",
+    "member_gateway/tests/test_additional.py",
+    "member_gateway/tests/test_adversarial_regressions.py",
+    "member_gateway/tests/test_api.py",
+    "member_gateway/tests/test_auth.py",
+    "member_gateway/tests/test_bootstrap.py",
+    "member_gateway/tests/test_canonical.py",
+    "member_gateway/tests/test_claim_v2.py",
+    "member_gateway/tests/test_contracts.py",
+    "member_gateway/tests/test_deadline.py",
+    "member_gateway/tests/test_enforcement.py",
+    "member_gateway/tests/test_gateway.py",
+    "member_gateway/tests/test_identity.py",
+    "member_gateway/tests/test_ingest_v2.py",
+    "member_gateway/tests/test_liveness.py",
+    "member_gateway/tests/test_postgres_cursor.py",
+    "member_gateway/tests/test_postgres_liveness.py",
+    "member_gateway/tests/test_postgres_projection.py",
+    "member_gateway/tests/test_postgres_v2.py",
+    "member_gateway/tests/test_result_v2.py",
+    "member_gateway/tests/test_source_cursor.py",
+    "member_gateway/tests/test_state_machine_v2.py",
+    "member_gateway/tests/test_welcome_email_outbox.py",
+    "member_gateway/tests/v2_support.py",
+    "schemas/member_gateway_job.v3.schema.json",
+    "schemas/member_gateway_operator_status.v2.schema.json",
+    "schemas/member_gateway_resolution.v1.schema.json",
+    "schemas/member_gateway_result.v2.schema.json",
+    "schemas/member_gateway_worker_claim.v2.schema.json",
+    "scripts/ac2_member_create_primitive.ps1",
+    "scripts/ac2_member_gateway_autocount_adapter.ps1",
+    "scripts/ac2_member_gateway_worker.ps1",
+    "scripts/ac2_member_gateway_worker_lib.ps1",
+    "scripts/ac2_member_test_cleanup.ps1",
     "scripts/install_ac2_member_gateway_worker.ps1",
     "scripts/launch_ac2_member_gateway_worker.ps1",
     "scripts/test_ac2_member_gateway_autocount_dependencies.ps1",
-    "tests/test_member_gateway_worker_deployment.py",
-    "tests/test_member_gateway_bounded_import_security.py",
+    "tests/fixtures/ac2_member_primitive/cross_contract_cases.v1.fixture",
+    "tests/fixtures/ac2_member_primitive/fake_autocount.ps1",
+    "tests/fixtures/ac2_member_primitive/fake_primitive_child.ps1",
+    "tests/fixtures/ac2_member_primitive/primitive_child_wrapper.ps1",
+    "tests/fixtures/xb_mn_1_vectors.v1.fixture",
+    "tests/test_ac2_member_primitive.py",
+    "tests/test_ac2_member_primitive_cleanup.py",
+    "tests/test_member_gateway_adapter_ps.py",
     "tests/test_member_gateway_ci.py",
+    "tests/test_member_gateway_privacy.py",
+    "tests/test_member_gateway_worker_cycle_ps.py",
+    "tests/test_member_gateway_worker_deployment.py",
+    "tests/test_member_gateway_worker_static.py",
+    "tests/test_member_write_v2_cross_contract.py",
 }
+
 
 
 _CANONICAL_AUTCOUNT_PROBE = r'''[CmdletBinding()]
@@ -117,7 +188,7 @@ foreach ($requirement in $requiredTypes) {
 
 $memberCommand = $invoicing.GetType("AutoCount.BonusPoint.Member.MemberCommand", $true, $false)
 $methodNames = @($memberCommand.GetMethods() | ForEach-Object Name)
-foreach ($name in @("Create", "GetMember", "NewMember", "SaveMember")) {
+foreach ($name in @("Create", "GetMember", "NewMember", "SaveMember", "LoadBrowseTable")) {
     if ($methodNames -notcontains $name) { throw "autocount_required_method_missing" }
 }
 
@@ -127,7 +198,7 @@ foreach ($name in @("Create", "GetMember", "NewMember", "SaveMember")) {
     process_bitness = 64
     assembly_count = $requiredAssemblies.Count
     required_type_count = $requiredTypes.Count
-    required_method_count = 4
+    required_method_count = 5
 } | ConvertTo-Json -Compress
 '''
 
@@ -165,7 +236,7 @@ $ExpectedNodeCounts = [ordered]@{
     PipelineAst = 33
     ScriptBlockAst = 1
     StatementBlockAst = 16
-    StringConstantExpressionAst = 53
+    StringConstantExpressionAst = 54
     ThrowStatementAst = 6
     TypeConstraintAst = 2
     TypeExpressionAst = 3
@@ -376,7 +447,7 @@ function Test-MemberCommand {
 
 function Test-RequiredMethods {
     param([object[]]$Nodes)
-    $expected = @("Create", "GetMember", "NewMember", "SaveMember")
+    $expected = @("Create", "GetMember", "NewMember", "SaveMember", "LoadBrowseTable")
     $matches = @()
     foreach ($loop in $Nodes) {
         if ($loop -isnot [System.Management.Automation.Language.ForEachStatementAst]) { continue }
@@ -515,7 +586,7 @@ try {
     }
     $canonicalNodes = @(Get-AstNodes -Root $canonicalAst)
     $counts = Get-AstNodeCounts -Nodes $nodes
-    $globalShapeOk = $nodes.Count -eq 286 -and $canonicalNodes.Count -eq 286
+    $globalShapeOk = $nodes.Count -eq 287 -and $canonicalNodes.Count -eq 287
     if ($globalShapeOk -and $counts.Count -eq $ExpectedNodeCounts.Count) {
         foreach ($name in $ExpectedNodeCounts.Keys) {
             if (-not $counts.ContainsKey($name) -or $counts[$name] -ne $ExpectedNodeCounts[$name]) {
@@ -1185,7 +1256,7 @@ def _validate_native_result(result: dict[str, object]) -> dict[str, object]:
     required_methods_ok = result["required_methods_ok"]
     accepted = result["accepted"]
 
-    if global_shape_ok and (node_count != 286 or not required_methods_ok):
+    if global_shape_ok and (node_count != 287 or not required_methods_ok):
         raise AssertionError("native AST inspector global-shape result is inconsistent")
 
     if reason == "NATIVE_REQUIRED":
@@ -1330,7 +1401,7 @@ def _validate_native_result(result: dict[str, object]) -> dict[str, object]:
             native
             and parse_ok
             and parse_errors == 0
-            and node_count == 286
+            and node_count == 287
             and global_shape_ok
             and assemblies_ok
             and invoicing_ok
@@ -1382,7 +1453,7 @@ def _expected_native_emission_valid(
     native, parse_ok, global_shape, assemblies, invoicing, member_command, required_methods, accepted = (
         boolean_values
     )
-    if global_shape and (node_count != 286 or not required_methods):
+    if global_shape and (node_count != 287 or not required_methods):
         return False
 
     if reason == "NATIVE_REQUIRED":
@@ -1523,7 +1594,7 @@ def _expected_native_emission_valid(
             native
             and parse_ok
             and parse_errors == 0
-            and node_count == 286
+            and node_count == 287
             and global_shape
             and assemblies
             and invoicing
@@ -1872,7 +1943,7 @@ _ASSEMBLY_VALUES = (
     "AutoCount.ImportExport.dll",
     "AutoCount.Tools.dll",
 )
-_METHOD_VALUES = ("Create", "GetMember", "NewMember", "SaveMember")
+_METHOD_VALUES = ("Create", "GetMember", "NewMember", "SaveMember", "LoadBrowseTable")
 
 
 def _array_assignment_block(name: str, elements: list[str]) -> str:
@@ -1999,7 +2070,7 @@ def _collection_variants(source: str) -> list[tuple[str, str]]:
         [
             (
                 "method fifth element",
-                _replace_method_condition(source, "@(\"Create\", \"GetMember\", \"NewMember\", \"SaveMember\", \"ExtraMember\")"),
+                _replace_method_condition(source, "@(\"Create\", \"GetMember\", \"NewMember\", \"SaveMember\", \"LoadBrowseTable\", \"ExtraMember\")"),
             ),
             (
                 "method flattened comma output",
@@ -2021,7 +2092,7 @@ def _collection_variants(source: str) -> list[tuple[str, str]]:
             (
                 "method duplicate loop",
                 source.rstrip()
-                + "\nforeach ($name in @(\"Create\", \"GetMember\", \"NewMember\", \"SaveMember\")) {\n}\n",
+                + "\nforeach ($name in @(\"Create\", \"GetMember\", \"NewMember\", \"SaveMember\", \"LoadBrowseTable\")) {\n}\n",
             ),
             (
                 "method replacement collection",
@@ -2265,7 +2336,7 @@ class NativeAstTempPathTests(unittest.TestCase):
                 "native51_x64": True,
                 "parse_ok": True,
                 "parse_errors": 0,
-                "node_count": 286,
+                "node_count": 287,
                 "global_shape_ok": True,
                 "assemblies_ok": True,
                 "invoicing_ok": True,
@@ -2488,7 +2559,7 @@ class NativeAstResultConsistencyTests(unittest.TestCase):
             "native51_x64": True,
             "parse_ok": True,
             "parse_errors": 0,
-            "node_count": 286,
+            "node_count": 287,
             "global_shape_ok": True,
             "assemblies_ok": True,
             "invoicing_ok": True,
@@ -2630,7 +2701,7 @@ class NativeAstResultConsistencyTests(unittest.TestCase):
                 "trusted global-shape-success assemblies rejection",
                 self._result(
                     "ASSEMBLIES",
-                    node_count=286,
+                    node_count=287,
                     global_shape_ok=True,
                     assemblies_ok=False,
                 ),
@@ -2841,7 +2912,7 @@ class NativeAstResultConsistencyTests(unittest.TestCase):
 
         add("OK node count zero", "OK", node_count=0)
         add("OK node count above limit", "OK", node_count=4097)
-        add("OK node count not canonical", "OK", node_count=285)
+        add("OK node count not canonical", "OK", node_count=286)
         for field in ("global_shape_ok", "assemblies_ok", "invoicing_ok", "member_command_ok", "required_methods_ok"):
             add(f"OK required flag false: {field}", "OK", **{field: False})
         add("OK accepted false", "OK", accepted=False)
@@ -2909,7 +2980,7 @@ class NativeAstResultConsistencyTests(unittest.TestCase):
         add("INPUT_LIMIT parse true", "INPUT_LIMIT", parse_ok=True)
         add("INPUT_LIMIT node count nonzero", "INPUT_LIMIT", node_count=1)
 
-        add("global success wrong count", "OK", node_count=287)
+        add("global success wrong count", "OK", node_count=288)
         add("global success required methods false", "OK", required_methods_ok=False)
 
         unknown_field = self._result("OK")
@@ -3019,6 +3090,8 @@ class MemberGatewayWorkerDeploymentTests(unittest.TestCase):
         for path, expected in PROTECTED_WORKER_BLOBS.items():
             with self.subTest(path=path):
                 self.assertEqual(self._blob(path), expected)
+        # The gateway tree pin binds the reviewed candidate; it is checked
+        # against the committed HEAD tree.
         for path, expected in PROTECTED_WORKER_TREES.items():
             with self.subTest(path=path):
                 self.assertEqual(self._tree(path), expected)
@@ -3115,8 +3188,8 @@ class MemberGatewayWorkerDeploymentTests(unittest.TestCase):
             1,
         )
         fifth_single_method = probe.replace(
-            'foreach ($name in @("Create", "GetMember", "NewMember", "SaveMember"))',
-            'foreach ($name in @("Create", "GetMember", "NewMember", "SaveMember", \'FifthSingleQuoted\'))',
+            'foreach ($name in @("Create", "GetMember", "NewMember", "SaveMember", "LoadBrowseTable"))',
+            'foreach ($name in @("Create", "GetMember", "NewMember", "SaveMember", "LoadBrowseTable", \'SixthSingleQuoted\'))',
             1,
         )
 
@@ -3133,7 +3206,7 @@ class MemberGatewayWorkerDeploymentTests(unittest.TestCase):
             ("sixth non-literal required assembly", sixth_non_literal_assembly),
             ("expandable-string invoicing rebinding", expandable_rebind),
             ("escaped-braced invoicing rebinding", escaped_braced_rebind),
-            ("fifth single-quoted required method", fifth_single_method),
+            ("sixth single-quoted required method", fifth_single_method),
         ):
             with self.subTest(counterexample=name):
                 result = _inspect_autocount_probe(counterexample)
@@ -3436,7 +3509,7 @@ class MemberGatewayWorkerDeploymentTests(unittest.TestCase):
             self.skipTest("native Windows PowerShell Desktop 5.1 x64 is required")
         probe = (ROOT / "scripts/test_ac2_member_gateway_autocount_dependencies.ps1").read_text(encoding="utf-8")
         variants = _collection_variants(probe)
-        self.assertEqual(len(variants), 92)
+        self.assertEqual(len(variants), 101)  # 92 + 9 derived from the fifth required method literal
         results = _inspect_many([source for _, source in variants])
         for (label, _), result in zip(variants, results):
             with self.subTest(variant=label):
@@ -3460,7 +3533,7 @@ class MemberGatewayWorkerDeploymentTests(unittest.TestCase):
             self.skipTest("native Windows PowerShell Desktop 5.1 x64 is required")
         probe = (ROOT / "scripts/test_ac2_member_gateway_autocount_dependencies.ps1").read_text(encoding="utf-8")
         variants = _positive_variants(probe)
-        self.assertEqual(len(variants), 15)
+        self.assertEqual(len(variants), 16)  # 15 + 1 single-quoted variant of the fifth method literal
         results = _inspect_many([source for _, source in variants])
         for (label, _), result in zip(variants, results):
             with self.subTest(variant=label):
@@ -3563,7 +3636,7 @@ class MemberGatewayWorkerDeploymentTests(unittest.TestCase):
             )
         )
         self.assertTrue(global_shape_success["global_shape_ok"], global_shape_success)
-        self.assertEqual(global_shape_success["node_count"], 286, global_shape_success)
+        self.assertEqual(global_shape_success["node_count"], 287, global_shape_success)
         self.assertFalse(global_shape_success["invoicing_ok"], global_shape_success)
 
     def test_native_inspector_transport_and_schema_contract(self) -> None:
@@ -3619,11 +3692,14 @@ class MemberGatewayWorkerDeploymentTests(unittest.TestCase):
             (runtime / "secrets").mkdir()
             config = {
                 "gateway_base_url": "https://gateway.example.test",
-                "worker_host_binding": "host-ac2-worker",
                 "autocount_assembly_path": r"C:\\AutoCount",
                 "autocount_server_name": "  server exact  ",
                 "autocount_database_name": "database exact",
                 "autocount_user_id": "user exact",
+                "autocount_integration_user_id": "user exact",
+                "autocount_book_mode": "production",
+                "autocount_production_book": "database exact",
+                "autocount_test_book_allowlist": [],
             }
             (runtime / "config" / "worker.config.json").write_text(json.dumps(config), encoding="utf-8")
             launcher_text = (ROOT / "scripts/launch_ac2_member_gateway_worker.ps1").read_text(encoding="utf-8")
@@ -3643,6 +3719,12 @@ $info = New-XbWorkerProcessStartInfo -WorkerScript $args[1] -LauncherMode Produc
     server = $info.EnvironmentVariables['XB_AC2_SERVER_NAME']
     database = $info.EnvironmentVariables['XB_AC2_DATABASE_NAME']
     user = $info.EnvironmentVariables['XB_AC2_USER_ID']
+    integration_user = $info.EnvironmentVariables['XB_AC2_INTEGRATION_USER_ID']
+    production_book = $info.EnvironmentVariables['XB_AC2_PRODUCTION_BOOK']
+    test_allowlist = $info.EnvironmentVariables['XB_AC2_TEST_BOOK_ALLOWLIST']
+    host_binding = $info.EnvironmentVariables.ContainsKey('XB_MEMBER_GATEWAY_WORKER_HOST_BINDING')
+    arguments = $info.Arguments
+    interpreter = $info.FileName
     probe_server = $info.EnvironmentVariables.ContainsKey('AC2_PROBE_SERVER_NAME')
     probe_database = $info.EnvironmentVariables.ContainsKey('AC2_PROBE_DATABASE_NAME')
     probe_user = $info.EnvironmentVariables.ContainsKey('AC2_PROBE_USER_ID')
@@ -3660,6 +3742,7 @@ $info = New-XbWorkerProcessStartInfo -WorkerScript $args[1] -LauncherMode Produc
                     "AC2_PROBE_USER_ID": "legacy-user",
                     "AC2_PROBE_PASSWORD": "legacy-password",
                     "XB_AC2_SESSION_FACTORY": "legacy-factory",
+                    "XB_MEMBER_GATEWAY_WORKER_HOST_BINDING": "host-legacy",
                 }
             )
             completed = self._run_powershell_harness(
@@ -3674,6 +3757,12 @@ $info = New-XbWorkerProcessStartInfo -WorkerScript $args[1] -LauncherMode Produc
             self.assertEqual(observed["server"], "  server exact  ")
             self.assertEqual(observed["database"], "database exact")
             self.assertEqual(observed["user"], "user exact")
+            self.assertEqual(observed["integration_user"], "user exact")
+            self.assertEqual(observed["production_book"], "database exact")
+            self.assertEqual(observed["test_allowlist"], "")
+            self.assertFalse(observed["host_binding"])
+            self.assertEqual(observed["interpreter"], r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe")
+            self.assertIn('"-Book" "production" "-EnableProductionWorker" "-EnableProductionAdapter"', observed["arguments"])
             for name in ("probe_server", "probe_database", "probe_user", "probe_password", "session_factory"):
                 self.assertFalse(observed[name], name)
             self.assertEqual(observed["password"], "password")
@@ -3692,7 +3781,8 @@ $info = New-XbWorkerProcessStartInfo -WorkerScript $args[1] -LauncherMode Produc
             install.mkdir()
             marker = root / "child-started.txt"
             (install / "ac2_member_gateway_worker.ps1").write_text(
-                "param([switch]$EnableProductionWorker, [switch]$EnableProductionAdapter)\n"
+                "param([string]$Book, [switch]$EnableProductionWorker, [switch]$EnableProductionAdapter)\n"
+                "if ($Book -cne 'production') { throw 'synthetic_book_missing' }\n"
                 "$marker = [Environment]::GetEnvironmentVariable('XB_TEST_CHILD_MARKER', 'Process')\n"
                 "if ([string]::IsNullOrWhiteSpace($marker)) { throw 'synthetic_marker_missing' }\n"
                 "[IO.File]::WriteAllText($marker, 'started')\n"
@@ -3701,11 +3791,14 @@ $info = New-XbWorkerProcessStartInfo -WorkerScript $args[1] -LauncherMode Produc
             )
             base_config = {
                 "gateway_base_url": "https://gateway.example.test",
-                "worker_host_binding": "host-ac2-worker",
                 "autocount_assembly_path": r"C:\\AutoCount",
                 "autocount_server_name": "synthetic-server",
                 "autocount_database_name": "synthetic-database",
                 "autocount_user_id": "synthetic-user",
+                "autocount_integration_user_id": "synthetic-user",
+                "autocount_book_mode": "production",
+                "autocount_production_book": "synthetic-database",
+                "autocount_test_book_allowlist": [],
             }
             (runtime / "config" / "worker.config.json").write_text(
                 json.dumps(base_config), encoding="utf-8"
@@ -3779,8 +3872,15 @@ $info = New-XbWorkerProcessStartInfo -WorkerScript $args[1] -LauncherMode Produc
             self.assertTrue(marker.exists(), control.stdout + control.stderr)
             self.assertEqual(marker.read_text(encoding="utf-8"), "started")
 
-            for field in ("autocount_server_name", "autocount_database_name", "autocount_user_id"):
-                for value in invalid_values:
+            invalid_cases = [
+                (field, value)
+                for field in ("autocount_server_name", "autocount_database_name", "autocount_user_id", "autocount_integration_user_id", "autocount_production_book", "autocount_book_mode")
+                for value in invalid_values
+            ]
+            invalid_cases += [("autocount_book_mode", "Production"), ("autocount_book_mode", "staging")]
+            invalid_cases += [("autocount_test_book_allowlist", value) for value in (_MISSING, None, "book", [7], [""], ["a;b"])]
+            for field, value in invalid_cases:
+                if True:
                     with self.subTest(field=field, value=value):
                         config = dict(base_config)
                         if value is _MISSING:
@@ -3867,6 +3967,9 @@ $info = New-XbWorkerProcessStartInfo -WorkerScript $args[1] -LauncherMode Produc
             "autocount_server_name": "launcher_autocount_server_name_invalid",
             "autocount_database_name": "launcher_autocount_database_name_invalid",
             "autocount_user_id": "launcher_autocount_user_id_invalid",
+            "autocount_integration_user_id": "launcher_autocount_integration_user_id_invalid",
+            "autocount_production_book": "launcher_autocount_production_book_invalid",
+            "autocount_book_mode": "launcher_autocount_book_mode_invalid",
         }
         for field, error_id in fields.items():
             with self.subTest(field=field):
@@ -3876,6 +3979,9 @@ $info = New-XbWorkerProcessStartInfo -WorkerScript $args[1] -LauncherMode Produc
             "XB_AC2_SERVER_NAME",
             "XB_AC2_DATABASE_NAME",
             "XB_AC2_USER_ID",
+            "XB_AC2_INTEGRATION_USER_ID",
+            "XB_AC2_PRODUCTION_BOOK",
+            "XB_AC2_TEST_BOOK_ALLOWLIST",
         ):
             self.assertIn(f'EnvironmentVariables["{environment_name}"]', launcher)
         for environment_name in (
@@ -3884,8 +3990,11 @@ $info = New-XbWorkerProcessStartInfo -WorkerScript $args[1] -LauncherMode Produc
             "AC2_PROBE_USER_ID",
             "AC2_PROBE_PASSWORD",
             "XB_AC2_SESSION_FACTORY",
+            "XB_MEMBER_GATEWAY_WORKER_HOST_BINDING",
         ):
             self.assertIn(f'EnvironmentVariables.Remove("{environment_name}")', launcher)
+        self.assertNotIn("worker_host_binding", launcher)
+        self.assertNotIn("$PSHOME", launcher.replace("never resolved from PATH or $PSHOME", ""))
         self.assertIn('$value -isnot [string]', launcher)
         self.assertIn('[string]::IsNullOrWhiteSpace($value)', launcher)
         self.assertNotIn('[string]$config.autocount_server_name', launcher)
@@ -3900,17 +4009,29 @@ $info = New-XbWorkerProcessStartInfo -WorkerScript $args[1] -LauncherMode Produc
         example = json.loads(
             (ROOT / "config/ac2_member_gateway_worker.production.example.json").read_text(encoding="utf-8")
         )
-        for field in (
+        test_example = json.loads(
+            (ROOT / "config/ac2_member_gateway_worker.test_book.example.json").read_text(encoding="utf-8")
+        )
+        fields = {
             "gateway_base_url",
-            "worker_host_binding",
             "autocount_assembly_path",
             "autocount_server_name",
             "autocount_database_name",
             "autocount_user_id",
-        ):
-            self.assertIn(field, example)
-        for field in ("autocount_server_name", "autocount_database_name", "autocount_user_id"):
-            self.assertIsNone(example[field])
+            "autocount_integration_user_id",
+            "autocount_book_mode",
+            "autocount_production_book",
+            "autocount_test_book_allowlist",
+        }
+        for document, mode in ((example, "production"), (test_example, "test")):
+            self.assertEqual(set(document), fields)
+            self.assertNotIn("worker_host_binding", document)
+            self.assertEqual(document["autocount_book_mode"], mode)
+            for field in ("autocount_server_name", "autocount_database_name", "autocount_user_id", "autocount_integration_user_id", "autocount_production_book"):
+                self.assertIsNone(document[field])
+        self.assertEqual(example["autocount_test_book_allowlist"], [])
+        self.assertEqual(test_example["autocount_test_book_allowlist"], ["REPLACE_WITH_TEST_BOOK_DATABASE_NAME"])
+
 
     def test_worktree_change_allowlist_is_narrow(self) -> None:
         status = subprocess.run(
@@ -3939,7 +4060,9 @@ INSTALLER_PACKAGE_FILES = (
     "ac2_member_gateway_autocount_adapter.ps1",
     "launch_ac2_member_gateway_worker.ps1",
     "test_ac2_member_gateway_autocount_dependencies.ps1",
+    "ac2_member_create_primitive.ps1",
 )
+WINDOWS_POWERSHELL = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
 
 
 def _hosted_windows_boundary_required(env: dict[str, str] | None = None) -> bool:
@@ -4609,7 +4732,7 @@ try {
     $fakeLauncher = "C:\xb-boundary-launcher-$boundaryHex\launch_ac2_member_gateway_worker.ps1"
 
     Invoke-XbBoundaryCase "in_memory_null_trigger_pin" {
-        $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument ('-NoLogo -NoProfile -NonInteractive -File "{0}" -Mode DisabledProof' -f $fakeLauncher)
+        $action = New-ScheduledTaskAction -Execute $script:XbWindowsPowerShellPath -Argument ('-NoLogo -NoProfile -NonInteractive -File "{0}" -Mode DisabledProof' -f $fakeLauncher)
         $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::FromMinutes(10)) -RestartCount 0 -StartWhenAvailable:$false -Disable
         $taskPrincipal = New-ScheduledTaskPrincipal -UserId $workerAccount -LogonType Password -RunLevel Limited
         $memory = New-ScheduledTask -Action $action -Settings $settings -Principal $taskPrincipal
@@ -4642,7 +4765,7 @@ try {
     Invoke-XbBoundaryCase "one_trigger_control" {
         $script:taskPath = $state.boundary_folder
         $script:taskName = $controlName
-        $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument ('-NoLogo -NoProfile -NonInteractive -File "{0}" -Mode DisabledProof' -f $fakeLauncher)
+        $action = New-ScheduledTaskAction -Execute $script:XbWindowsPowerShellPath -Argument ('-NoLogo -NoProfile -NonInteractive -File "{0}" -Mode DisabledProof' -f $fakeLauncher)
         $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::FromMinutes(10)) -RestartCount 0 -StartWhenAvailable:$false -Disable
         $taskPrincipal = New-ScheduledTaskPrincipal -UserId $workerAccount -LogonType Password -RunLevel Limited
         $trigger = New-ScheduledTaskTrigger -Once -At ([datetime]::new(2099, 1, 1, 0, 0, 0))
@@ -5200,8 +5323,8 @@ class MemberWorkerHostedTaskBoundaryTests(unittest.TestCase):
         self.assertEqual(evidence["cim_action_count"], 1)
         self.assertEqual(evidence["com_action_count"], 1)
         self.assertEqual(evidence["com_action_type"], 0)
-        self.assertEqual(evidence["action_execute"], "powershell.exe")
-        self.assertEqual(evidence["com_action_path"], "powershell.exe")
+        self.assertEqual(evidence["action_execute"], WINDOWS_POWERSHELL)
+        self.assertEqual(evidence["com_action_path"], WINDOWS_POWERSHELL)
         self.assertEqual(evidence["com_action_arguments"], evidence["action_arguments"])
         self.assertRegex(str(evidence["action_arguments"]), r"-Mode DisabledProof$")
         self.assertNotRegex(str(evidence["action_arguments"]), r"EnableProduction")
@@ -5392,6 +5515,183 @@ class MemberWorkerHostedTaskBoundaryTests(unittest.TestCase):
         if self.report["environment"].get("temp_redirected"):
             expected["temp_redirect_absent"] = True
         self.assertEqual(cleanup, expected)
+
+
+
+_RELEASE_INTEGRITY_HARNESS = r'''[CmdletBinding()]
+param(
+    [Parameter(Mandatory)][string]$InstallerPath,
+    [Parameter(Mandatory)][string]$AdapterPath,
+    [Parameter(Mandatory)][string]$ScriptsRoot,
+    [Parameter(Mandatory)][string]$WorkRoot
+)
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+. $InstallerPath -LibraryOnly
+$installerPackage = @($packageFiles)
+. $AdapterPath
+$out = [ordered]@{}
+function Get-XbOutcome {
+    param([Parameter(Mandatory)][scriptblock]$Body)
+    try { $null = & $Body; return "pass" } catch { return [string]$_.Exception.Message }
+}
+$out.installer_package = @($installerPackage | Sort-Object)
+$out.adapter_package = @($script:XbAc2ReleasePackageFiles | Sort-Object)
+$out.installer_release = Get-XbReleaseIdentityFromRoot -Root $ScriptsRoot
+$out.adapter_release = Get-XbAc2ReleaseIdentity -PackageRoot $ScriptsRoot
+
+function New-XbPackageCopy {
+    param([string]$Name)
+    $root = Join-Path $WorkRoot $Name
+    New-Item -ItemType Directory -Path $root | Out-Null
+    foreach ($file in $installerPackage) { Copy-Item -LiteralPath (Join-Path $ScriptsRoot $file) -Destination (Join-Path $root $file) }
+    return $root
+}
+$clean = New-XbPackageCopy "clean"
+$out.ci4_clean = Get-XbOutcome { Assert-XbReleaseContent -Root $clean }
+$second = New-XbPackageCopy "second-save"
+Add-Content -LiteralPath (Join-Path $second "ac2_member_gateway_worker_lib.ps1") -Value '# $x.SaveMember($y)'
+$out.ci4_second_save_site = Get-XbOutcome { Assert-XbReleaseContent -Root $second }
+$twoInAdapter = New-XbPackageCopy "two-in-adapter"
+Add-Content -LiteralPath (Join-Path $twoInAdapter "ac2_member_gateway_autocount_adapter.ps1") -Value '# $command.SaveMember($entity)'
+$out.ci4_two_sites_in_adapter = Get-XbOutcome { Assert-XbReleaseContent -Root $twoInAdapter }
+$delete = New-XbPackageCopy "delete"
+Add-Content -LiteralPath (Join-Path $delete "ac2_member_create_primitive.ps1") -Value '# DeleteMember'
+$out.ci4_delete_present = Get-XbOutcome { Assert-XbReleaseContent -Root $delete }
+$cleanupFile = New-XbPackageCopy "cleanup-file"
+Copy-Item -LiteralPath (Join-Path $ScriptsRoot "ac2_member_test_cleanup.ps1") -Destination (Join-Path $cleanupFile "ac2_member_test_cleanup.ps1")
+$out.ci4_cleanup_script_present = Get-XbOutcome { Assert-XbReleaseContent -Root $cleanupFile }
+$uat = New-XbPackageCopy "uat-file"
+Set-Content -LiteralPath (Join-Path $uat "ac2_member_create_uat_runner.ps1") -Value "#"
+$out.ci4_uat_script_present = Get-XbOutcome { Assert-XbReleaseContent -Root $uat }
+$missing = New-XbPackageCopy "missing"
+Remove-Item -LiteralPath (Join-Path $missing "ac2_member_create_primitive.ps1")
+$out.ci4_missing_file = Get-XbOutcome { Assert-XbReleaseContent -Root $missing }
+
+$identity = [pscustomobject]@{
+    source = [pscustomobject]@{ commit = ("a" * 40); tree = ("b" * 40) }
+    package_files = @($installerPackage | ForEach-Object { [pscustomobject]@{ name = $_; sha256 = (Get-XbFileSha256 (Join-Path $ScriptsRoot $_)); git_blob = ("c" * 40) } })
+}
+$manifest = New-XbWorkerInstallationManifest -PackageRoot $ScriptsRoot -ReviewedIdentity $identity -WorkerAccount "XBHOST\xbworker"
+$out.manifest_schema = $manifest.schema_version
+$out.manifest_release = $manifest.release_sha256
+$out.manifest_keys = @($manifest.Keys)
+$out.manifest_executable = $manifest.task.executable
+$out.manifest_arguments = $manifest.task.arguments
+
+$secure = [Security.SecureString]::new()
+"synthetic".ToCharArray() | ForEach-Object { $secure.AppendChar($_) }
+$securePath = Join-Path $WorkRoot "secure.clixml"
+$secure | Export-Clixml -LiteralPath $securePath
+$plainPath = Join-Path $WorkRoot "plain.clixml"
+"synthetic" | Export-Clixml -LiteralPath $plainPath
+$garbagePath = Join-Path $WorkRoot "garbage.clixml"
+Set-Content -LiteralPath $garbagePath -Value "<not xml"
+$out.ci6_secure_artifact = (Test-XbSecureStringArtifact -Path $securePath)
+$out.ci6_plain_artifact = (Test-XbSecureStringArtifact -Path $plainPath)
+$out.ci6_garbage_artifact = (Test-XbSecureStringArtifact -Path $garbagePath)
+
+$script:RuntimeRoot = Join-Path $WorkRoot "runtime"
+foreach ($child in @("config", "secrets", "logs", "rollback")) { New-Item -ItemType Directory -Path (Join-Path $RuntimeRoot $child) -Force | Out-Null }
+$out.ci6_inherited_acl = Get-XbOutcome { Assert-XbRuntimeCustody }
+
+$readExecute = [int]([Security.AccessControl.FileSystemRights]::ReadAndExecute -bor [Security.AccessControl.FileSystemRights]::Synchronize)
+$out.ci7_rights_within = (Test-XbRightsWithin -Granted ([int][Security.AccessControl.FileSystemRights]::ReadAndExecute) -Allowed $readExecute)
+$out.ci7_rights_write_exceeds = (Test-XbRightsWithin -Granted ([int][Security.AccessControl.FileSystemRights]::Modify) -Allowed $readExecute)
+$out.ci7_rights_full_exceeds = (Test-XbRightsWithin -Granted ([int][Security.AccessControl.FileSystemRights]::FullControl) -Allowed $readExecute)
+[Console]::Out.Write(($out | ConvertTo-Json -Depth 8 -Compress))
+'''
+
+
+class MemberWorkerReleaseIntegrityTests(unittest.TestCase):
+    """CI1-CI7 release integrity (installer binding of the W-G2-149 checks) without admin or task registration."""
+
+    report: dict[str, object]
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        pwsh = _resolve_native_powershell()
+        if not pwsh:
+            raise unittest.SkipTest("Windows PowerShell is required for installer behavior validation")
+        with tempfile.TemporaryDirectory(prefix="xb-release-integrity-") as temp_dir:
+            harness = Path(temp_dir) / "release_integrity_harness.ps1"
+            harness.write_text(_RELEASE_INTEGRITY_HARNESS, encoding="utf-8", newline="\n")
+            work_root = Path(temp_dir) / "work"
+            work_root.mkdir()
+            completed = subprocess.run(
+                [
+                    pwsh, "-ExecutionPolicy", "Bypass", "-NoLogo", "-NoProfile", "-NonInteractive",
+                    "-File", str(harness),
+                    "-InstallerPath", str(ROOT / INSTALLER_PATH),
+                    "-AdapterPath", str(ROOT / "scripts/ac2_member_gateway_autocount_adapter.ps1"),
+                    "-ScriptsRoot", str(ROOT / "scripts"),
+                    "-WorkRoot", str(work_root),
+                ],
+                cwd=ROOT,
+                env=_windows_powershell_module_environment(),
+                capture_output=True,
+                text=True,
+                timeout=600,
+            )
+        if completed.returncode != 0:
+            raise AssertionError(completed.stdout + completed.stderr)
+        cls.report = json.loads(completed.stdout)
+
+    def test_package_membership_and_release_identity_agree(self) -> None:
+        self.assertEqual(self.report["installer_package"], sorted(INSTALLER_PACKAGE_FILES))
+        self.assertEqual(self.report["adapter_package"], sorted(INSTALLER_PACKAGE_FILES))
+        lines = "".join(
+            f"{name}:{hashlib.sha256((ROOT / 'scripts' / name).read_bytes()).hexdigest()}\n"
+            for name in sorted(INSTALLER_PACKAGE_FILES)
+        )
+        expected = hashlib.sha256(lines.encode("ascii")).hexdigest()
+        self.assertEqual(self.report["installer_release"], expected)
+        self.assertEqual(self.report["adapter_release"], expected)
+        self.assertEqual(self.report["manifest_release"], expected)
+
+    def test_ci4_release_content(self) -> None:
+        self.assertEqual(self.report["ci4_clean"], "pass")
+        self.assertEqual(self.report["ci4_second_save_site"], "release_content_save_call_sites_invalid")
+        self.assertEqual(self.report["ci4_two_sites_in_adapter"], "release_content_save_call_sites_invalid")
+        self.assertEqual(self.report["ci4_delete_present"], "release_content_delete_present")
+        self.assertEqual(self.report["ci4_cleanup_script_present"], "release_content_forbidden_file")
+        self.assertEqual(self.report["ci4_uat_script_present"], "release_content_forbidden_file")
+        self.assertEqual(self.report["ci4_missing_file"], "release_content_file_missing")
+
+    def test_installation_manifest_v2_records_release_and_absolute_interpreter(self) -> None:
+        self.assertEqual(self.report["manifest_schema"], "xb.member.gateway.worker.installation.v2")
+        self.assertEqual(
+            self.report["manifest_keys"],
+            ["schema_version", "reviewed_source", "release_sha256", "install_root", "runtime_root", "package_files", "task", "rollback_owned_roots"],
+        )
+        self.assertEqual(self.report["manifest_executable"], WINDOWS_POWERSHELL)
+        self.assertRegex(self.report["manifest_arguments"], r"-Mode DisabledProof$")
+        self.assertNotRegex(self.report["manifest_arguments"], r"EnableProduction")
+
+    def test_ci6_custody_and_ci7_rights(self) -> None:
+        self.assertTrue(self.report["ci6_secure_artifact"])
+        self.assertFalse(self.report["ci6_plain_artifact"])
+        self.assertFalse(self.report["ci6_garbage_artifact"])
+        self.assertEqual(self.report["ci6_inherited_acl"], "runtime_custody_acl_invalid")
+        self.assertTrue(self.report["ci7_rights_within"])
+        self.assertFalse(self.report["ci7_rights_write_exceeds"])
+        self.assertFalse(self.report["ci7_rights_full_exceeds"])
+
+    def test_installer_binds_ci1_to_ci7_and_upgrade_contract(self) -> None:
+        source = (ROOT / INSTALLER_PATH).read_text(encoding="utf-8")
+        for label in ("[CI1]", "[CI2]", "[CI3]", "[CI4]", "[CI5]", "[CI6]", "[CI7]"):
+            self.assertIn(label, source)
+        self.assertIn('[ValidateSet("Install", "Upgrade", "Verify", "Uninstall", "ValidateOnly")]', source)
+        upgrade = _installer_function(source, "Invoke-XbWorkerUpgrade")
+        self.assertLess(upgrade.index("Assert-XbStagedPackageIdentity"), upgrade.index("Remove-Item -LiteralPath (Join-Path $InstallRoot $name)"))
+        self.assertLess(upgrade.index("Assert-XbReleaseContent -Root $stageRoot"), upgrade.index("Remove-Item -LiteralPath (Join-Path $InstallRoot $name)"))
+        self.assertIn("Register-XbWorkerScheduledTask", upgrade)
+        for protected in ('"config"', '"secrets"', '"logs"'):
+            self.assertNotIn(f"Remove-Item -LiteralPath (Join-Path $RuntimeRoot {protected})", upgrade)
+        verifier = _installer_function(source, "Invoke-XbInstallVerifier")
+        for step in ("Assert-XbWorkerInstallLayout", "Get-XbReleaseIdentityFromRoot", "Assert-XbReleaseContent", "Assert-XbWorkerTaskContract", "Assert-XbRuntimeCustody", "Assert-XbWorkerEffectiveRights"):
+            self.assertIn(step, verifier)
+        self.assertNotIn("ac2_member_test_cleanup.ps1", source)
 
 
 if __name__ == "__main__":

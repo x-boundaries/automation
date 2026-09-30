@@ -1,5 +1,18 @@
 # Member Form Intake Contract (Dry-Run Validator)
 
+> **Scope note.** This contract governs the Google Form export shape, the
+> consent values, and the historical dry-run validator
+> (`scripts/member_intake_validate.py`). Its statements that the form value is
+> used as-is as the AutoCount `MemberNo` and that AutoCount `MobilePhone` is
+> "intentionally blank and unused" apply only to that historical dry-run
+> validator context. Production member creation is governed by XB-MN-1 and the
+> current member-write architecture: the MemberNo base is the submitted phone
+> digits (no country inference), a shared number may get a bounded name
+> component, and every created member records `MobilePhone` = the base
+> MemberNo. See the canonical
+> [member intake automation blueprint](member_intake_automation_blueprint.md)
+> and the [member gateway production contract](member_gateway_production_contract.md).
+
 Status: implemented dry-run contract for `scripts/member_intake_validate.py`. This contract supersedes the earlier planned `FullName`/`MobileCountryCode`/`MobileNumber` JSON row contract in [member_intake_field_mapping.md](member_intake_field_mapping.md).
 
 ## Purpose And Boundary

@@ -9,7 +9,7 @@ Two layers:
   psycopg's real query converter (the same code path ``cursor.execute`` uses).
 * ``RealPostgresTestCase`` runs the real ``PostgresRepository`` through
   psycopg against a disposable local PostgreSQL named only by
-  ``XB_MEMBER_GATEWAY_TEST_DATABASE_URL``. It applies migrations 0001-0005 to
+  ``XB_MEMBER_GATEWAY_TEST_DATABASE_URL``. It applies migrations 0001-0006 to
   a freshly dropped schema, so it refuses any non-loopback host. Without that
   variable the real-database tests skip and report themselves as skipped.
 """
@@ -22,6 +22,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from xb_member_gateway.admission import AdmissionPolicy
 from xb_member_gateway.canonical import build_source_event, canonicalize_source_event
 from xb_member_gateway.models import SourceAdmissionMode
 from xb_member_gateway.repository import PostgresRepository, RepositoryError, SourceConflict
@@ -35,7 +36,8 @@ except ImportError:  # pragma: no cover
 
 
 ROOT = Path(__file__).resolve().parents[2]
-MIGRATIONS = sorted((ROOT / "member_gateway/migrations").glob("000[1-5]_*.sql"))
+MIGRATIONS = sorted((ROOT / "member_gateway/migrations").glob("000[1-6]_*.sql"))
+POLICY = AdmissionPolicy("production", ("member_registration",), ("member-intake.v1",))
 TEST_DSN_ENV = "XB_MEMBER_GATEWAY_TEST_DATABASE_URL"
 HASH = "sha256:" + "a" * 64
 CUTOVER = "2026-09-15T00:00:00Z"
@@ -47,6 +49,13 @@ F1_DEFECTIVE_RESULTS_INSERT = (
     "INSERT INTO xb_member_gateway.results(job_id,result_hash,status,member_no,dispatch_fence_id,"
     "save_invocation_count,readback_found,readback_match,reconciliation_required,error_code,acknowledged_at) "
     "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"
+)
+# Its repaired form (the v1 results table is now legacy and read-only; the
+# statement stays here only as the driver-boundary positive control).
+F1_REPAIRED_RESULTS_INSERT = (
+    "INSERT INTO xb_member_gateway.results(job_id,result_hash,status,member_no,dispatch_fence_id,"
+    "save_invocation_count,readback_found,readback_match,reconciliation_required,error_code,acknowledged_at) "
+    "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"
 )
 
 
@@ -153,8 +162,9 @@ class DriverBoundaryTests(unittest.TestCase):
         params = result_params()
         with self.assertRaises(PlaceholderArityError):
             assert_driver_accepts(F1_DEFECTIVE_RESULTS_INSERT, params)
-        assert_driver_accepts(PostgresRepository._RESULTS_INSERT, params)
-        self.assertEqual(PostgresRepository._RESULTS_INSERT.count("%s"), 11)
+        assert_driver_accepts(F1_REPAIRED_RESULTS_INSERT, params)
+        self.assertEqual(F1_REPAIRED_RESULTS_INSERT.count("%s"), 11)
+        self.assertNotIn("INSERT INTO xb_member_gateway.results(", (ROOT / "member_gateway/src/xb_member_gateway/repository.py").read_text(encoding="utf-8"))
 
     @unittest.skipIf(psycopg is None, "psycopg driver unavailable")
     def test_real_psycopg_adaptation_rejects_defective_and_accepts_repaired(self):
@@ -162,7 +172,7 @@ class DriverBoundaryTests(unittest.TestCase):
         with self.assertRaisesRegex(psycopg.ProgrammingError, "12 placeholders but 11 parameters"):
             PostgresQuery(Transformer()).convert(F1_DEFECTIVE_RESULTS_INSERT, params)
         converted = PostgresQuery(Transformer())
-        converted.convert(PostgresRepository._RESULTS_INSERT, params)
+        converted.convert(F1_REPAIRED_RESULTS_INSERT, params)
         self.assertEqual(len(converted.params), 11)
 
     def test_repository_source_contains_no_defective_results_insert(self):
@@ -181,7 +191,7 @@ class PostgresCursorTests(unittest.TestCase):
 
     def test_unseen_admission_writes_exact_time_receipt_and_atomic_guard(self):
         connection = ScriptedConnection()
-        outcome = self.repository(connection).ingest_source_event(source_event(), initial_window_max=1)
+        outcome = self.repository(connection).ingest_source_event(source_event(), initial_window_max=1, policy=POLICY)
         self.assertFalse(outcome.replayed)
         self.assertTrue(connection.committed)
         guard = [params for query, params in connection.queries if query.startswith("UPDATE xb_member_gateway.source_ingest_cursors")]
@@ -195,14 +205,14 @@ class PostgresCursorTests(unittest.TestCase):
     def test_losing_first_member_admission_rolls_back_without_receipt(self):
         connection = ScriptedConnection(count=1, window_open=False)
         with self.assertRaisesRegex(SourceConflict, "initial_source_window_exhausted"):
-            self.repository(connection).ingest_source_event(source_event(), initial_window_max=1)
+            self.repository(connection).ingest_source_event(source_event(), initial_window_max=1, policy=POLICY)
         self.assertTrue(connection.rolled_back)
         for table in ("jobs", "source_handling_receipts", "source_responses"):
             self.assertFalse(any(query.startswith(f"INSERT INTO xb_member_gateway.{table}") for query, _ in connection.queries), table)
 
     def test_continuous_admission_does_not_touch_the_guard(self):
         connection = ScriptedConnection(count=1)
-        self.repository(connection).ingest_source_event(source_event(), initial_window_max=None)
+        self.repository(connection).ingest_source_event(source_event(), initial_window_max=None, policy=POLICY)
         self.assertFalse(any(query.startswith("UPDATE xb_member_gateway.source_ingest_cursors") for query, _ in connection.queries))
 
     def test_no_correctness_path_reads_the_deprecated_admitted_tuple(self):
@@ -213,17 +223,17 @@ class PostgresCursorTests(unittest.TestCase):
     def test_pre_cutover_and_uninitialized_cutover_fail_before_any_write(self):
         connection = ScriptedConnection()
         with self.assertRaisesRegex(SourceConflict, "source_event_before_cutover"):
-            self.repository(connection).ingest_source_event(source_event(create_time="2026-09-14T23:59:59.999Z"))
+            self.repository(connection).ingest_source_event(source_event(create_time="2026-09-14T23:59:59.999Z"), policy=POLICY)
         self.assertFalse(any(query.startswith("INSERT") for query, _ in connection.queries))
         connection = ScriptedConnection(cutover=None)
         with self.assertRaisesRegex(SourceConflict, "source_production_cutover_uninitialized"):
-            self.repository(connection).ingest_source_event(source_event())
+            self.repository(connection).ingest_source_event(source_event(), policy=POLICY)
 
     def test_same_instant_different_exact_string_conflicts(self):
         receipt = ("forms-two", "hmac-v1:" + "0" * 64, "member_registration", FORM, "member-intake.v1", "2026-09-15T00:00:01Z", source_event(create_time="2026-09-15T00:00:01Z").payload_hash, "ACCEPTED", "job-x", None, 1, CUTOVER_DT)
         connection = ScriptedConnection(receipt=receipt)
         with self.assertRaisesRegex(SourceConflict, "source_identity_payload_conflict"):
-            self.repository(connection).ingest_source_event(source_event(create_time="2026-09-15T00:00:01.000Z"))
+            self.repository(connection).ingest_source_event(source_event(create_time="2026-09-15T00:00:01.000Z"), policy=POLICY)
         self.assertTrue(connection.rolled_back)
 
 
@@ -248,7 +258,12 @@ class RealPostgresTestCase(unittest.TestCase):
             connection.execute("DROP SCHEMA IF EXISTS xb_member_gateway CASCADE")
             for path in MIGRATIONS:
                 connection.execute(path.read_text(encoding="utf-8"))
+        self.addCleanup(self._drop_schema)
         self.repository = PostgresRepository(self.dsn, reference_key=self.reference_key)
+
+    def _drop_schema(self):
+        with psycopg.connect(self.dsn, autocommit=True) as connection:
+            connection.execute("DROP SCHEMA IF EXISTS xb_member_gateway CASCADE")
 
     def sql(self, statement, params=()):
         with psycopg.connect(self.dsn, autocommit=True) as connection:
@@ -277,12 +292,12 @@ class RealPostgresSourceTests(RealPostgresTestCase):
                 # The repaired statement is accepted by the driver and reaches
                 # the server, which then enforces the real foreign keys.
                 with self.assertRaises(psycopg.errors.ForeignKeyViolation):
-                    cursor.execute(PostgresRepository._RESULTS_INSERT, params)
+                    cursor.execute(F1_REPAIRED_RESULTS_INSERT, params)
             connection.rollback()
 
-    def test_migrations_register_five_and_constraints_hold(self):
+    def test_migrations_register_six_and_constraints_hold(self):
         versions = {row[0] for row in self.sql("SELECT version FROM xb_member_gateway.schema_migrations")}
-        self.assertEqual(versions, {"0001_member_gateway", "0002_result_event_history", "0003_writer_termination_quarantine", "0004_forms_ingest_cursor", "0005_member_vertical_slice"})
+        self.assertEqual(versions, {"0001_member_gateway", "0002_result_event_history", "0003_writer_termination_quarantine", "0004_forms_ingest_cursor", "0005_member_vertical_slice", "0006_member_write_v2"})
         self.seed_cursor()
         with self.assertRaisesRegex(psycopg.errors.RaiseException, "source_production_cutover_immutable"):
             self.sql("UPDATE xb_member_gateway.source_ingest_cursors SET production_cutover_exact='2026-09-16T00:00:00Z'")
@@ -291,15 +306,15 @@ class RealPostgresSourceTests(RealPostgresTestCase):
 
     def test_real_admission_receipt_replay_conflict_and_first_member_guard(self):
         self.seed_cursor()
-        first = self.repository.ingest_source_event(source_event("forms-real-a"), initial_window_max=1)
-        replay = self.repository.ingest_source_event(source_event("forms-real-a"), initial_window_max=1)
+        first = self.repository.ingest_source_event(source_event("forms-real-a"), initial_window_max=1, policy=POLICY)
+        replay = self.repository.ingest_source_event(source_event("forms-real-a"), initial_window_max=1, policy=POLICY)
         self.assertEqual((first.replayed, replay.replayed, replay.job.job_id), (False, True, first.job.job_id))
         exact = self.sql("SELECT create_time_exact FROM xb_member_gateway.source_responses WHERE response_id='forms-real-a'")
         self.assertEqual(exact, [("2026-09-15T00:00:01.123456789Z",)])
         with self.assertRaisesRegex(SourceConflict, "source_identity_payload_conflict"):
-            self.repository.ingest_source_event(source_event("forms-real-a", "2026-09-15T00:00:01.123Z"))
+            self.repository.ingest_source_event(source_event("forms-real-a", "2026-09-15T00:00:01.123Z"), policy=POLICY)
         with self.assertRaisesRegex(SourceConflict, "initial_source_window_exhausted"):
-            self.repository.ingest_source_event(source_event("forms-real-b", "2026-09-15T00:00:02Z"), initial_window_max=1)
+            self.repository.ingest_source_event(source_event("forms-real-b", "2026-09-15T00:00:02Z"), initial_window_max=1, policy=POLICY)
         self.assertEqual(self.sql("SELECT count(*) FROM xb_member_gateway.source_handling_receipts"), [(1,)])
         self.assertEqual(self.sql("SELECT initial_window_admission_count FROM xb_member_gateway.source_ingest_cursors"), [(1,)])
         with self.assertRaisesRegex(psycopg.errors.RaiseException, "source_handling_receipts_append_only"):
@@ -315,7 +330,7 @@ class RealPostgresSourceTests(RealPostgresTestCase):
         with self.assertRaisesRegex(SourceConflict, "source_page_item_unreceipted"):
             self.repository.commit_source_page(page.page_id, expected_epoch_state_version=epoch.epoch_state_version)
         self.assertEqual(self.sql("SELECT count(*) FROM xb_member_gateway.source_scan_page_items"), [(0,)])
-        self.repository.ingest_source_event(event, initial_window_max=1)
+        self.repository.ingest_source_event(event, initial_window_max=1, policy=POLICY)
         committed, epoch, replayed = self.repository.commit_source_page(page.page_id, expected_epoch_state_version=epoch.epoch_state_version)
         self.assertFalse(replayed)
         again = self.repository.commit_source_page(page.page_id, expected_epoch_state_version=page.opened_state_version)
