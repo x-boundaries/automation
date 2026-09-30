@@ -1877,6 +1877,17 @@ $script:EgRequiredConfigKeys = @(
     'portal_url', 'account_identity', 'archive_root', 'state_path', 'temp_root', 'log_root'
 )
 
+# DL-XB-199 G3-101. The application selects its source with an explicit `source` key. When
+# it is `direct_http`, the browser-only `portal_url` and `account_identity` are not used and
+# the `direct_http` object with exactly these non-blank members is required instead. An
+# absent `source` keeps the historical browser key set unchanged; any other value fails.
+$script:EgDirectHttpSource = 'direct_http'
+$script:EgBrowserSource = 'browser'
+$script:EgDirectHttpRequiredConfigKeys = @(
+    'direct_http', 'archive_root', 'state_path', 'temp_root', 'log_root'
+)
+$script:EgDirectHttpRequiredMembers = @('list_url', 'fetch_url', 'tenant_id')
+
 $script:EgPythonVersionPattern = '^Python 3\.14\.'
 $script:EgTerminalEventFileName = 'launcher_failed.jsonl'
 
@@ -1989,7 +2000,42 @@ function Test-EgLauncherConfigContract {
     foreach ($property in @($parsed.PSObject.Properties)) {
         $propertyNames = $propertyNames + $property.Name
     }
-    foreach ($required in $script:EgRequiredConfigKeys) {
+    $requiredKeys = $script:EgRequiredConfigKeys
+    $directHttp = $false
+    if ($propertyNames -ccontains 'source') {
+        $source = $parsed.source
+        if (($source -is [string]) -and ($source -ceq $script:EgDirectHttpSource)) {
+            $directHttp = $true
+            $requiredKeys = $script:EgDirectHttpRequiredConfigKeys
+        }
+        elseif (-not (($source -is [string]) -and ($source -ceq $script:EgBrowserSource))) {
+            return (New-EgCheckResult -Pass $false -SupportRef 'EG_LAUNCHER_CONFIG_KEY_MISSING' -Checks $checks)
+        }
+    }
+    if ($directHttp) {
+        # Presence first: under StrictMode reading an absent property throws.
+        if ($propertyNames -cnotcontains 'direct_http') {
+            return (New-EgCheckResult -Pass $false -SupportRef 'EG_LAUNCHER_CONFIG_KEY_MISSING' -Checks $checks)
+        }
+        $block = $parsed.direct_http
+        if (($null -eq $block) -or ($block -isnot [System.Management.Automation.PSCustomObject])) {
+            return (New-EgCheckResult -Pass $false -SupportRef 'EG_LAUNCHER_CONFIG_KEY_MISSING' -Checks $checks)
+        }
+        $memberNames = @()
+        foreach ($member in @($block.PSObject.Properties)) {
+            $memberNames = $memberNames + $member.Name
+        }
+        foreach ($member in $script:EgDirectHttpRequiredMembers) {
+            if ($memberNames -cnotcontains $member) {
+                return (New-EgCheckResult -Pass $false -SupportRef 'EG_LAUNCHER_CONFIG_KEY_MISSING' -Checks $checks)
+            }
+            $memberValue = $block.$member
+            if (($memberValue -isnot [string]) -or [string]::IsNullOrWhiteSpace($memberValue)) {
+                return (New-EgCheckResult -Pass $false -SupportRef 'EG_LAUNCHER_CONFIG_KEY_MISSING' -Checks $checks)
+            }
+        }
+    }
+    foreach ($required in $requiredKeys) {
         $present = $false
         foreach ($name in $propertyNames) {
             if ($name -ceq $required) { $present = $true }

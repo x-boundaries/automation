@@ -7004,6 +7004,46 @@ class LauncherPreflightContract(TierABase):
                     "EG_LAUNCHER_CONFIG_KEY_MISSING", observed["support_ref"]
                 )
 
+    def test_a_direct_http_config_satisfies_position_ten_without_browser_keys(self):
+        """DL-XB-199 G3-101: the source-aware key set, in the real installed launcher."""
+        direct = {
+            "source": "direct_http",
+            "direct_http": {
+                "list_url": "https://list.placeholder.invalid/x",
+                "fetch_url": "https://fetch.placeholder.invalid/y",
+                "tenant_id": "REPLACE_WITH_PRIVATE_TENANT_ID",
+            },
+        }
+        with TemporaryScratch() as tmp:
+            environment = LauncherEnvironment(tmp, ANY_PS).build(
+                config_overrides=direct, omit_config_keys=("portal_url", "account_identity")
+            )
+            observed = launcher_validation(environment.run())
+        for position in ("config_parses_json", "config_required_keys_present"):
+            self.assertEqual("PASS", observed["checks"][position])
+
+        broken = [
+            ({"source": "direct_http"}, ("portal_url", "account_identity")),
+            ({**direct, "direct_http": {"list_url": "https://a.invalid/x", "fetch_url": "https://a.invalid/y"}},
+             ("portal_url", "account_identity")),
+            ({**direct, "direct_http": {**direct["direct_http"], "tenant_id": "  "}},
+             ("portal_url", "account_identity")),
+            ({**direct, "direct_http": "not-an-object"}, ("portal_url", "account_identity")),
+            ({**direct, "source": "auto"}, ()),
+            ({**direct, "source": "DIRECT_HTTP"}, ()),
+            ({**direct, "archive_root": ""}, ("portal_url", "account_identity")),
+            ({"source": "browser"}, ("account_identity",)),
+        ]
+        for overrides, omitted in broken:
+            with self.subTest(overrides=str(overrides)[:70], omitted=omitted):
+                with TemporaryScratch() as tmp:
+                    environment = LauncherEnvironment(tmp, ANY_PS).build(
+                        config_overrides=overrides, omit_config_keys=omitted
+                    )
+                    observed = launcher_validation(environment.run())
+                self.assertEqual("FAIL", observed["checks"]["config_required_keys_present"])
+                self.assertEqual("EG_LAUNCHER_CONFIG_KEY_MISSING", observed["support_ref"])
+
     def test_an_unsupported_interpreter_version_fails_closed(self):
         """Position 11 requires a 3.14.x interpreter."""
         with TemporaryScratch() as tmp:

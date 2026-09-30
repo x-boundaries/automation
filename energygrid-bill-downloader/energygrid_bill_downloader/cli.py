@@ -471,14 +471,19 @@ def run_direct_http(config: RuntimeConfig, logger: SafeLogger, run_id: str, list
                 summary=None,
             )
         return 20
-    logger.event(
-        "run_complete",
-        status=summary.status,
-        inventory_count=summary.inventory_count,
-        downloaded_count=summary.downloaded_count,
-        present_count=summary.present_count,
-        failure_count=summary.failure_count,
-    )
+    try:
+        logger.event(
+            "run_complete",
+            status=summary.status,
+            inventory_count=summary.inventory_count,
+            downloaded_count=summary.downloaded_count,
+            present_count=summary.present_count,
+            failure_count=summary.failure_count,
+        )
+    except Exception:
+        # Evidence, not a result: losing this line must not turn a completed run
+        # (possibly with published bills) into a reported failure.
+        pass
     print(json.dumps(summary.as_dict(), sort_keys=True))
     if summary.exit_code != 0 and not list_only:
         notify_failure(

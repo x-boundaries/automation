@@ -413,6 +413,32 @@ configuration that cannot be parsed (exit 64) happen before the application can
 read its alert settings. Task Scheduler's last-run result records both; the Owner
 must check it after any change to the host.
 
+### Launcher preconditions that still apply
+
+The launcher's position 10 is source-aware: with `"source": "direct_http"` it requires
+`direct_http` (with non-blank `list_url`, `fetch_url`, `tenant_id`) plus the four path
+keys, and not `portal_url` or `account_identity`. An absent `source` keeps the historical
+browser key set; any other value fails. The launcher still requires the private browser
+cache (position 13) and the DPAPI credential (positions 19-21) and injects that credential
+into the child, although the direct-HTTP source uses neither. Removing those gates changes
+the launcher security design and is left for an explicit Owner/Web decision.
+
+### Known MVP limitations (accepted or pending decision)
+
+- `list_url` / `fetch_url` accept `http://` as well as `https://`, because the observed
+  interface's scheme is private evidence; an `http://` endpoint carries the tenant
+  identifier and bill bytes in clear text and skips TLS identity checking.
+- Launcher preflight failures (exit 70) and configuration failures (exit 64) are not
+  alerted; check Task Scheduler's last-run result.
+- Whether Task Scheduler's `ExecutionTimeLimit` also terminates the Python child is
+  unverified. An orphaned child would keep the run lock, and later starts would report
+  `RUN_IN_PROGRESS` (alerted, without attention required) until it exits.
+- The n8n ingress answers after Telegram (`responseMode: lastNode`); a Telegram send
+  slower than the runtime's 5-second alert timeout is logged as `alert_failed` although it
+  was delivered. The product result is unaffected either way.
+- If the provider ever ages bills out of LIST, `EG_INVENTORY_KNOWN_BILL_MISSING` fails
+  every run by design until the case is reopened.
+
 ### Breakage response
 
 A fail-closed reference in the contract table means the interface changed. Do not

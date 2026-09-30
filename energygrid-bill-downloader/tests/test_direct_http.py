@@ -439,6 +439,36 @@ class ListContractNegatives(DirectHttpCase):
 # --------------------------------------------------------------------------
 
 
+class CompletenessAfterConflict(DirectHttpCase):
+    def test_an_archived_bill_later_marked_conflict_still_may_not_disappear(self) -> None:
+        deployment = self.deployment()
+        self.assertEqual(0, deployment.run()[0])
+        (deployment.archive / bill_name(1)).write_bytes(synthetic_pdf(b"tampered-bytes"))
+        self.assertEqual(20, deployment.run()[0])
+        statuses = {row.portal_filename: row.status for row in deployment.state_rows()}
+        self.assertEqual("CONFLICT", statuses[bill_name(1)])
+        del self.service_state.files[1]
+        code, document = deployment.run()
+        self.assertEqual(20, code)
+        self.assertEqual("EG_INVENTORY_KNOWN_BILL_MISSING", document["support_ref"])
+
+
+class ResultIsolation(DirectHttpCase):
+    def test_a_failing_run_complete_log_write_does_not_change_a_success(self) -> None:
+        deployment = self.deployment()
+        original = cli.SafeLogger.event
+
+        def failing(self, phase, status=None, **fields):
+            if phase == "run_complete":
+                raise OSError("disk full")
+            return original(self, phase, status, **fields)
+
+        with mock.patch.object(cli.SafeLogger, "event", failing):
+            code, document = deployment.run()
+        self.assertEqual(0, code, document)
+        self.assertEqual("DOWNLOADED", document["status"])
+
+
 class FetchNegatives(DirectHttpCase):
     def run_fetch_case(self, behaviours: list, status_value: str, exit_code: int, support_ref: str | None, row: int = 2) -> Deployment:
         self.service_state.fetch_queue = {bill_name(row): list(behaviours)}

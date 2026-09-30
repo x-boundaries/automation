@@ -525,8 +525,15 @@ def _plan_listed_rows(config: RuntimeConfig, state: StateStore, rows: list[Any])
 
     # Completeness: a bill this program already archived must still be listed.
     # Its disappearance means the inventory is no longer the complete one.
+    # "Archived" is judged by durable archival evidence, not only the current status: a
+    # later failure or conflict overwrites the status but keeps the archive time and hash.
     for record in state.records():
-        if record.status in ARCHIVED_STATUSES and record.filename_key not in seen:
+        was_archived = (
+            record.status in ARCHIVED_STATUSES
+            or record.archived_at_utc is not None
+            or record.sha256 is not None
+        )
+        if was_archived and record.filename_key not in seen:
             raise SourceContractError(INVENTORY_REF_KNOWN_BILL_MISSING)
 
     for item in planned:
