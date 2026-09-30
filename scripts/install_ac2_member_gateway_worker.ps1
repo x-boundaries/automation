@@ -40,13 +40,38 @@ function Invoke-XbIcacls {
     if ($LASTEXITCODE -ne 0) { throw "acl_application_failed" }
 }
 
+function Set-XbWorkerLogsAcl {
+    param([Parameter(Mandatory)][string]$Path)
+    $systemSid = New-Object Security.Principal.SecurityIdentifier("S-1-5-18")
+    $administratorsSid = New-Object Security.Principal.SecurityIdentifier("S-1-5-32-544")
+    $ownerRightsSid = New-Object Security.Principal.SecurityIdentifier("S-1-3-4")
+    $workerSid = [Security.Principal.NTAccount]::new($WorkerAccount).Translate([Security.Principal.SecurityIdentifier])
+    $objectInherit = [Security.AccessControl.InheritanceFlags]::ObjectInherit
+    $containerAndObjectInherit = [Security.AccessControl.InheritanceFlags]::ContainerInherit -bor $objectInherit
+    $inheritOnly = [Security.AccessControl.PropagationFlags]::InheritOnly
+    $allow = [Security.AccessControl.AccessControlType]::Allow
+    $fullControl = [Security.AccessControl.FileSystemRights]::FullControl
+    $modify = [Security.AccessControl.FileSystemRights]::Modify -bor [Security.AccessControl.FileSystemRights]::Synchronize
+    if ([int]$modify -ne 0x001301BF) { throw "acl_application_failed" }
+
+    $acl = New-Object Security.AccessControl.DirectorySecurity
+    $acl.SetAccessRuleProtection($true, $false)
+    $acl.SetOwner($administratorsSid)
+    $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($systemSid, $fullControl, $containerAndObjectInherit, [Security.AccessControl.PropagationFlags]::None, $allow))
+    $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($administratorsSid, $fullControl, $containerAndObjectInherit, [Security.AccessControl.PropagationFlags]::None, $allow))
+    $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($workerSid, [Security.AccessControl.FileSystemRights]0x001200AB, [Security.AccessControl.InheritanceFlags]::None, [Security.AccessControl.PropagationFlags]::None, $allow))
+    $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($workerSid, $modify, $objectInherit, $inheritOnly, $allow))
+    $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($ownerRightsSid, $modify, $objectInherit, $inheritOnly, $allow))
+    Set-Acl -LiteralPath $Path -AclObject $acl -ErrorAction Stop
+}
+
 function Set-XbWorkerAcl {
     param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][ValidateSet("Install", "Config", "Secrets", "Logs", "Rollback")][string]$Kind)
+    if ($Kind -eq "Logs") { Set-XbWorkerLogsAcl -Path $Path; return }
     Invoke-XbIcacls -Path $Path -Arguments @("/inheritance:r", "/grant:r", "*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F")
     if ($Kind -eq "Install") { Invoke-XbIcacls -Path $Path -Arguments @("/grant:r", "${WorkerAccount}:(OI)(CI)RX") }
     if ($Kind -eq "Config") { Invoke-XbIcacls -Path $Path -Arguments @("/grant:r", "${WorkerAccount}:(OI)(CI)R") }
     if ($Kind -eq "Secrets") { Invoke-XbIcacls -Path $Path -Arguments @("/grant:r", "${WorkerAccount}:(OI)(CI)R") }
-    if ($Kind -eq "Logs") { Invoke-XbIcacls -Path $Path -Arguments @("/grant:r", "${WorkerAccount}:(OI)(CI)M") }
 }
 
 function Get-XbFileSha256 {
@@ -527,11 +552,6 @@ function Get-XbGrantedRights {
     return $mask
 }
 
-function Test-XbRightsWithin {
-    param([Parameter(Mandatory)][int]$Granted, [Parameter(Mandatory)][int]$Allowed)
-    return (($Granted -band (-bnot $Allowed)) -eq 0)
-}
-
 # [CI6] Runtime custody: protected (non-inherited) ACLs on every runtime root,
 # no broad principal grants, and DPAPI secret artifacts when required.
 function Assert-XbRuntimeCustody {
@@ -552,26 +572,577 @@ function Assert-XbRuntimeCustody {
     }
 }
 
-# [CI7] Effective-rights check for the worker account (explicit and broad
-# group allow rules): read+execute on the install root, read on config and
-# secrets, modify on logs, nothing on rollback.
-function Assert-XbWorkerEffectiveRights {
-    $workerSid = Get-XbAccountSid -Account $WorkerAccount
-    $sids = @($workerSid) + $script:XbBroadPrincipalSids
-    $readExecute = [int]([Security.AccessControl.FileSystemRights]::ReadAndExecute -bor [Security.AccessControl.FileSystemRights]::Synchronize)
-    $read = [int]([Security.AccessControl.FileSystemRights]::Read -bor [Security.AccessControl.FileSystemRights]::Synchronize)
-    $modify = [int]([Security.AccessControl.FileSystemRights]::Modify -bor [Security.AccessControl.FileSystemRights]::Synchronize)
-    $limits = @(
-        @($InstallRoot, $readExecute, [int][Security.AccessControl.FileSystemRights]::ReadAndExecute),
-        @((Join-Path $RuntimeRoot "config"), $read, [int][Security.AccessControl.FileSystemRights]::Read),
-        @((Join-Path $RuntimeRoot "secrets"), $read, [int][Security.AccessControl.FileSystemRights]::Read),
-        @((Join-Path $RuntimeRoot "logs"), $modify, [int][Security.AccessControl.FileSystemRights]::Modify),
-        @((Join-Path $RuntimeRoot "rollback"), 0, 0)
+function Initialize-XbWorkerNativeAccess {
+    $tokenType = "XbWorkerBatchToken" -as [type]
+    $resultType = "XbWorkerAccessResult" -as [type]
+    $state = Get-Variable -Name XbWorkerNativeAccessState -Scope Script -ErrorAction SilentlyContinue
+    if ($null -ne $state) {
+        if ([string]$state.Value -ceq "xb-worker-native-access-v1" -and $null -ne $tokenType -and $null -ne $resultType) { return }
+        throw "effective_rights_unproven"
+    }
+    if ($null -ne $tokenType -or $null -ne $resultType) { throw "effective_rights_unproven" }
+
+    $nativeSource = @"
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Security;
+using System.Security.Principal;
+
+public sealed class XbWorkerAccessResult
+{
+    public bool Allowed { get; private set; }
+    public uint GrantedAccess { get; private set; }
+
+    public XbWorkerAccessResult(bool allowed, uint granted)
+    {
+        Allowed = allowed;
+        GrantedAccess = granted;
+    }
+}
+
+public sealed class XbWorkerBatchToken : IDisposable
+{
+    private const int ErrorInsufficientBuffer = 122;
+    private const int LOGON32_LOGON_BATCH = 4;
+    private const int Logon32ProviderDefault = 0;
+    private const int SecurityImpersonation = 2;
+    private const int TokenImpersonation = 2;
+    private const int TokenQuery = 0x0008;
+    private const int TokenDuplicate = 0x0002;
+    private const int TokenImpersonate = 0x0004;
+    private const int TokenTypeInformationClass = 8;
+    private const int TokenImpersonationLevelInformationClass = 9;
+    private const int TokenIsAppContainerInformationClass = 29;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct GenericMapping
+    {
+        public uint GenericRead;
+        public uint GenericWrite;
+        public uint GenericExecute;
+        public uint GenericAll;
+    }
+
+    private IntPtr token;
+
+    public string UserSid { get; private set; }
+    public int TokenType { get; private set; }
+    public int ImpersonationLevel { get; private set; }
+
+    [DllImport("advapi32.dll", EntryPoint = "LogonUserW", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool LogonUser(
+        string user, string domain, IntPtr password, int logonType, int provider, out IntPtr token);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool DuplicateTokenEx(
+        IntPtr source, uint desiredAccess, IntPtr attributes, int impersonationLevel, int tokenType, out IntPtr token);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetTokenInformation(
+        IntPtr token, int informationClass, IntPtr information, uint informationLength, out uint returnedLength);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool AccessCheck(
+        IntPtr securityDescriptor,
+        IntPtr clientToken,
+        uint desiredAccess,
+        ref GenericMapping genericMapping,
+        IntPtr privilegeSet,
+        ref uint privilegeSetLength,
+        out uint grantedAccess,
+        [MarshalAs(UnmanagedType.Bool)] out bool accessAllowed);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool ImpersonateLoggedOnUser(IntPtr token);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool RevertToSelf();
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool CloseHandle(IntPtr handle);
+
+    private XbWorkerBatchToken(IntPtr handle, string sid, int type, int level)
+    {
+        token = handle;
+        UserSid = sid;
+        TokenType = type;
+        ImpersonationLevel = level;
+    }
+
+    private static void Zero(IntPtr buffer, int length)
+    {
+        if (buffer == IntPtr.Zero) return;
+        for (int index = 0; index < length; index++) Marshal.WriteByte(buffer, index, 0);
+    }
+
+    private static int ReadTokenInteger(IntPtr handle, int informationClass)
+    {
+        uint length = 0;
+        bool querySucceeded = GetTokenInformation(handle, informationClass, IntPtr.Zero, 0, out length);
+        int error = Marshal.GetLastWin32Error();
+        if (querySucceeded || error != ErrorInsufficientBuffer || length == 0 || length > 65536)
+            throw new InvalidOperationException("token_information_unproven");
+
+        IntPtr buffer = Marshal.AllocHGlobal((int)length);
+        try
+        {
+            uint returned;
+            if (!GetTokenInformation(handle, informationClass, buffer, length, out returned) || returned < sizeof(int))
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            return Marshal.ReadInt32(buffer);
+        }
+        finally
+        {
+            Zero(buffer, (int)length);
+            Marshal.FreeHGlobal(buffer);
+        }
+    }
+
+    public static XbWorkerBatchToken OpenBatch(string user, string domain, SecureString password, string expectedSid)
+    {
+        if (String.IsNullOrWhiteSpace(user) || password == null || password.Length == 0 || String.IsNullOrWhiteSpace(expectedSid))
+            throw new InvalidOperationException("token_input_unproven");
+
+        IntPtr secret = IntPtr.Zero;
+        IntPtr primaryToken = IntPtr.Zero;
+        IntPtr impersonationToken = IntPtr.Zero;
+        try
+        {
+            secret = Marshal.SecureStringToGlobalAllocUnicode(password);
+            if (!LogonUser(user, domain, secret, LOGON32_LOGON_BATCH, Logon32ProviderDefault, out primaryToken))
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+
+            uint desiredAccess = TokenQuery | TokenDuplicate | TokenImpersonate;
+            if (!DuplicateTokenEx(
+                    primaryToken, desiredAccess, IntPtr.Zero, SecurityImpersonation, TokenImpersonation, out impersonationToken))
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+
+            int tokenType = ReadTokenInteger(impersonationToken, TokenTypeInformationClass);
+            int impersonationLevel = ReadTokenInteger(impersonationToken, TokenImpersonationLevelInformationClass);
+            int isAppContainer = ReadTokenInteger(impersonationToken, TokenIsAppContainerInformationClass);
+            if (tokenType != TokenImpersonation || impersonationLevel != SecurityImpersonation || isAppContainer != 0)
+                throw new InvalidOperationException("token_profile_unproven");
+
+            string userSid;
+            using (WindowsIdentity identity = new WindowsIdentity(impersonationToken))
+            {
+                if (identity.User == null) throw new InvalidOperationException("token_user_unproven");
+                userSid = identity.User.Value;
+            }
+            if (!String.Equals(userSid, expectedSid, StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException("token_user_mismatch");
+
+            XbWorkerBatchToken result = new XbWorkerBatchToken(impersonationToken, userSid, tokenType, impersonationLevel);
+            impersonationToken = IntPtr.Zero;
+            return result;
+        }
+        finally
+        {
+            if (secret != IntPtr.Zero) Marshal.ZeroFreeGlobalAllocUnicode(secret);
+            if (impersonationToken != IntPtr.Zero) CloseHandle(impersonationToken);
+            if (primaryToken != IntPtr.Zero) CloseHandle(primaryToken);
+        }
+    }
+
+    public XbWorkerAccessResult Check(byte[] securityDescriptorBytes, uint desiredAccess)
+    {
+        if (token == IntPtr.Zero || securityDescriptorBytes == null ||
+            securityDescriptorBytes.Length < 20 || securityDescriptorBytes.Length > 1048576)
+            throw new InvalidOperationException("access_check_input_unproven");
+
+        IntPtr securityDescriptor = IntPtr.Zero;
+        IntPtr privilegeSet = IntPtr.Zero;
+        uint privilegeSetLength = 256;
+        try
+        {
+            securityDescriptor = Marshal.AllocHGlobal(securityDescriptorBytes.Length);
+            Marshal.Copy(securityDescriptorBytes, 0, securityDescriptor, securityDescriptorBytes.Length);
+
+            GenericMapping genericMapping = new GenericMapping();
+            genericMapping.GenericRead = 0x00120089;
+            genericMapping.GenericWrite = 0x00120116;
+            genericMapping.GenericExecute = 0x001200A0;
+            genericMapping.GenericAll = 0x001F01FF;
+
+            for (int attempt = 0; attempt < 3; attempt++)
+            {
+                if (privilegeSetLength == 0 || privilegeSetLength > 65536)
+                    throw new InvalidOperationException("access_check_buffer_unproven");
+
+                privilegeSet = Marshal.AllocHGlobal((int)privilegeSetLength);
+                uint grantedAccess;
+                uint returnedLength = privilegeSetLength;
+                bool accessAllowed;
+                if (AccessCheck(
+                        securityDescriptor, token, desiredAccess, ref genericMapping, privilegeSet,
+                        ref returnedLength, out grantedAccess, out accessAllowed))
+                    return new XbWorkerAccessResult(accessAllowed, grantedAccess);
+
+                int error = Marshal.GetLastWin32Error();
+                if (error != ErrorInsufficientBuffer || returnedLength <= privilegeSetLength || attempt == 2)
+                    throw new Win32Exception(error);
+
+                Zero(privilegeSet, (int)privilegeSetLength);
+                Marshal.FreeHGlobal(privilegeSet);
+                privilegeSet = IntPtr.Zero;
+                privilegeSetLength = returnedLength;
+            }
+            throw new InvalidOperationException("access_check_unproven");
+        }
+        finally
+        {
+            if (privilegeSet != IntPtr.Zero)
+            {
+                Zero(privilegeSet, (int)privilegeSetLength);
+                Marshal.FreeHGlobal(privilegeSet);
+            }
+            if (securityDescriptor != IntPtr.Zero)
+            {
+                Zero(securityDescriptor, securityDescriptorBytes.Length);
+                Marshal.FreeHGlobal(securityDescriptor);
+            }
+        }
+    }
+
+    public void Impersonate()
+    {
+        if (token == IntPtr.Zero || !ImpersonateLoggedOnUser(token))
+            throw new Win32Exception(Marshal.GetLastWin32Error());
+    }
+
+    public static void Revert()
+    {
+        if (!RevertToSelf()) throw new Win32Exception(Marshal.GetLastWin32Error());
+    }
+
+    public void Dispose()
+    {
+        if (token == IntPtr.Zero) return;
+        CloseHandle(token);
+        token = IntPtr.Zero;
+    }
+}
+"@
+    try {
+        Add-Type -TypeDefinition $nativeSource -Language CSharp -ErrorAction Stop
+        if ($null -eq ("XbWorkerBatchToken" -as [type]) -or $null -eq ("XbWorkerAccessResult" -as [type])) {
+            throw "native_type_missing"
+        }
+        $script:XbWorkerNativeAccessState = "xb-worker-native-access-v1"
+    } catch {
+        throw "effective_rights_unproven"
+    }
+}
+
+function New-XbWorkerBatchToken {
+    param([Management.Automation.PSCredential]$Credential)
+    if ($null -eq $Credential -or [string]$Credential.UserName -cne [string]$WorkerAccount) {
+        throw "effective_rights_unproven"
+    }
+
+    try {
+        $separator = ([string]$WorkerAccount).LastIndexOf('\')
+        if ($separator -ge 0) {
+            $domain = ([string]$WorkerAccount).Substring(0, $separator)
+            $userName = ([string]$WorkerAccount).Substring($separator + 1)
+            if ($domain -ceq ".") { $domain = [Environment]::MachineName }
+        }
+        else {
+            if ([string]$WorkerAccount -match '@') { throw "effective_rights_unproven" }
+            $domain = [Environment]::MachineName
+            $userName = [string]$WorkerAccount
+        }
+        if ([string]::IsNullOrWhiteSpace($userName) -or [string]::IsNullOrWhiteSpace($domain)) {
+            throw "effective_rights_unproven"
+        }
+
+        $sid = Get-XbAccountSid -Account $WorkerAccount
+        Initialize-XbWorkerNativeAccess
+        return [XbWorkerBatchToken]::OpenBatch($userName, $domain, $Credential.Password, $sid)
+    }
+    catch {
+        throw "effective_rights_unproven"
+    }
+}
+
+function Get-XbNativePathChain {
+    param([Parameter(Mandatory)][string]$Path)
+
+    try {
+        $fullPath = [IO.Path]::GetFullPath($Path)
+        if ($fullPath -notmatch '^[A-Za-z]:\\' -or $fullPath.StartsWith('\\\\') -or $fullPath.Substring(2).Contains(':')) {
+            throw "effective_rights_unproven"
+        }
+
+        $root = [IO.Path]::GetPathRoot($fullPath)
+        $drive = [IO.DriveInfo]::new($root)
+        if ($drive.DriveType -ne [IO.DriveType]::Fixed -or -not $drive.IsReady) {
+            throw "effective_rights_unproven"
+        }
+
+        $chain = @($root)
+        $currentPath = $root
+        foreach ($part in @($fullPath.Substring($root.Length).Split('\') | Where-Object { $_ })) {
+            $currentPath = Join-Path $currentPath $part
+            if (-not (Test-Path -LiteralPath $currentPath -ErrorAction Stop)) {
+                throw "effective_rights_unproven"
+            }
+            $item = Get-Item -LiteralPath $currentPath -Force -ErrorAction Stop
+            if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "effective_rights_unproven"
+            }
+            $chain += $currentPath
+        }
+        return ,$chain
+    }
+    catch {
+        throw "effective_rights_unproven"
+    }
+}
+
+function Invoke-XbNativeAccessCheck {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)]$Token,
+        [Parameter(Mandatory)][uint32]$DesiredAccess
     )
-    foreach ($limit in $limits) {
-        $granted = Get-XbGrantedRights -Path $limit[0] -Sids $sids
-        if (-not (Test-XbRightsWithin -Granted $granted -Allowed $limit[1])) { throw "effective_rights_exceeded" }
-        if (($granted -band $limit[2]) -ne $limit[2]) { throw "effective_rights_missing" }
+
+    try {
+        $securityDescriptor = (Get-Acl -LiteralPath $Path -ErrorAction Stop).GetSecurityDescriptorBinaryForm()
+        return $Token.Check($securityDescriptor, $DesiredAccess)
+    }
+    catch {
+        throw "effective_rights_unproven"
+    }
+}
+
+function Test-XbNativeAccessAllowed {
+    param([string]$Path, $Token, [uint32]$DesiredAccess)
+    return [bool](Invoke-XbNativeAccessCheck -Path $Path -Token $Token -DesiredAccess $DesiredAccess).Allowed
+}
+
+function Assert-XbLogsRootAclShape {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$WorkerSid
+    )
+
+    try {
+        $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+        if (-not $acl.AreAccessRulesProtected) { throw "effective_rights_unproven" }
+        $ownerSid = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
+        if ($ownerSid -cnotin @("S-1-5-18", "S-1-5-32-544")) { throw "effective_rights_unproven" }
+
+        $fullControl = [int][Security.AccessControl.FileSystemRights]::FullControl
+        $modifyAndSynchronize = [int]([Security.AccessControl.FileSystemRights]::Modify -bor [Security.AccessControl.FileSystemRights]::Synchronize)
+        if ($modifyAndSynchronize -ne 0x001301BF) { throw "effective_rights_unproven" }
+
+        $actual = @($acl.GetAccessRules($true, $false, [Security.Principal.SecurityIdentifier]) | ForEach-Object {
+            "{0}|{1}|{2}|{3}|{4}|{5}" -f $_.IdentityReference.Value, [int]$_.FileSystemRights,
+                [int]$_.AccessControlType, [int]$_.InheritanceFlags, [int]$_.PropagationFlags, [bool]$_.IsInherited
+        } | Sort-Object)
+        $expected = @(
+            ("{0}|{1}|0|3|0|False" -f "S-1-5-18", $fullControl)
+            ("{0}|{1}|0|3|0|False" -f "S-1-5-32-544", $fullControl)
+            ("{0}|{1}|0|0|0|False" -f $WorkerSid, 0x001200AB)
+            ("{0}|{1}|0|2|2|False" -f $WorkerSid, $modifyAndSynchronize)
+            ("{0}|{1}|0|2|2|False" -f "S-1-3-4", $modifyAndSynchronize)
+        ) | Sort-Object
+        if (@(Compare-Object $actual $expected).Count -ne 0) { throw "effective_rights_unproven" }
+    }
+    catch {
+        if ([string]$_.Exception.Message -eq "effective_rights_unproven") { throw }
+        throw "effective_rights_unproven"
+    }
+}
+
+function Assert-XbOwnerRightsLogFile {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$WorkerSid
+    )
+
+    try {
+        $null = Get-XbNativePathChain -Path $Path
+        $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+        if ($item.PSIsContainer -or $item.Name -notlike "launcher-*.jsonl" -or
+            ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "effective_rights_unproven"
+        }
+
+        $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+        if ($acl.AreAccessRulesProtected -or
+            $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -cne $WorkerSid) {
+            throw "effective_rights_unproven"
+        }
+
+        $ownerRightsSid = "S-1-3-4"
+        $ownerRules = @($acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]) |
+            Where-Object { $_.IdentityReference.Value -ceq $ownerRightsSid })
+        if ($ownerRules.Count -ne 1 -or
+            -not $ownerRules[0].IsInherited -or
+            $ownerRules[0].AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow -or
+            $ownerRules[0].InheritanceFlags -ne [Security.AccessControl.InheritanceFlags]::None -or
+            $ownerRules[0].PropagationFlags -ne [Security.AccessControl.PropagationFlags]::None -or
+            [int]$ownerRules[0].FileSystemRights -ne 0x001301BF) {
+            throw "effective_rights_unproven"
+        }
+    }
+    catch {
+        if ([string]$_.Exception.Message -eq "effective_rights_unproven") { throw }
+        throw "effective_rights_unproven"
+    }
+}
+
+function Assert-XbPathNotDeleteable {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)]$Token
+    )
+
+    $chain = @(Get-XbNativePathChain -Path $Path)
+    for ($index = $chain.Count - 1; $index -ge 0; $index--) {
+        if (Test-XbNativeAccessAllowed -Path $chain[$index] -Token $Token -DesiredAccess ([uint32]0x00010000)) {
+            throw "effective_rights_exceeded"
+        }
+        if ($index -gt 0 -and
+            (Test-XbNativeAccessAllowed -Path $chain[$index - 1] -Token $Token -DesiredAccess ([uint32]0x00000040))) {
+            throw "effective_rights_exceeded"
+        }
+    }
+}
+
+# [CI7] Native token-based effective access over the full security descriptor.
+function Assert-XbWorkerEffectiveRights {
+    param([Management.Automation.PSCredential]$TaskCredential)
+    if ($null -eq $TaskCredential -or
+        [string]::IsNullOrWhiteSpace($WorkerAccount) -or
+        [string]$TaskCredential.UserName -cne [string]$WorkerAccount) {
+        throw "effective_rights_unproven"
+    }
+
+    $token = $null
+    try {
+        try {
+            $token = New-XbWorkerBatchToken -Credential $TaskCredential
+        }
+        catch {
+            throw "effective_rights_unproven"
+        }
+
+        $workerSid = Get-XbAccountSid -Account $WorkerAccount
+        if ($null -eq $token -or
+            [string]$token.UserSid -cne $workerSid -or
+            [int]$token.TokenType -ne 2 -or
+            [int]$token.ImpersonationLevel -ne 2) {
+            throw "effective_rights_unproven"
+        }
+
+        $readExecute = [uint32]0x001200A9
+        $read = [uint32]0x00120089
+        $logsRoot = [uint32]0x001200AB
+        $requiredInstall = @([uint32]0x00000001, [uint32]0x00000008, [uint32]0x00000020,
+            [uint32]0x00000080, [uint32]0x00020000, [uint32]0x00100000)
+        $requiredRead = @([uint32]0x00000001, [uint32]0x00000008, [uint32]0x00000080,
+            [uint32]0x00020000, [uint32]0x00100000)
+        $requiredLogsRoot = @([uint32]0x00000001, [uint32]0x00000002, [uint32]0x00000008,
+            [uint32]0x00000080, [uint32]0x00020000, [uint32]0x00100000)
+        $profiles = @(
+            @{ Path = $InstallRoot; Allowed = $readExecute; Required = $requiredInstall }
+            @{ Path = (Join-Path $RuntimeRoot "config"); Allowed = $read; Required = $requiredRead }
+            @{ Path = (Join-Path $RuntimeRoot "secrets"); Allowed = $read; Required = $requiredRead }
+            @{ Path = (Join-Path $RuntimeRoot "logs"); Allowed = $logsRoot; Required = $requiredLogsRoot }
+            @{ Path = (Join-Path $RuntimeRoot "rollback"); Allowed = [uint32]0; Required = @() }
+        )
+
+        $maximumAllowed = [uint32]0x02000000
+        $delete = [uint32]0x00010000
+        $deleteChild = [uint32]0x00000040
+        $writeDac = [uint32]0x00040000
+        $writeOwner = [uint32]0x00080000
+        $prohibitedRights = @($delete, $deleteChild, $writeDac, $writeOwner)
+        $protectedPaths = New-Object System.Collections.Generic.List[string]
+
+        foreach ($profile in $profiles) {
+            $path = [string]$profile.Path
+            $null = Get-XbNativePathChain -Path $path
+            if (-not (Test-Path -LiteralPath $path -PathType Container -ErrorAction Stop)) {
+                throw "effective_rights_unproven"
+            }
+
+            foreach ($required in $profile.Required) {
+                if (-not (Test-XbNativeAccessAllowed -Path $path -Token $token -DesiredAccess ([uint32]$required))) {
+                    throw "effective_rights_missing"
+                }
+            }
+            foreach ($right in $prohibitedRights) {
+                if (Test-XbNativeAccessAllowed -Path $path -Token $token -DesiredAccess $right) {
+                    throw "effective_rights_exceeded"
+                }
+            }
+
+            $maximum = Invoke-XbNativeAccessCheck -Path $path -Token $token -DesiredAccess $maximumAllowed
+            $allowed = [uint32]$profile.Allowed
+            if (([uint32]$maximum.GrantedAccess -band ([uint32]::MaxValue -bxor $allowed)) -ne 0) {
+                throw "effective_rights_exceeded"
+            }
+            $protectedPaths.Add($path)
+        }
+
+        $logsPath = Join-Path $RuntimeRoot "logs"
+        Assert-XbLogsRootAclShape -Path $logsPath -WorkerSid $workerSid
+        foreach ($path in $protectedPaths) {
+            Assert-XbPathNotDeleteable -Path $path -Token $token
+        }
+
+        foreach ($item in @(Get-ChildItem -LiteralPath $logsPath -Force -ErrorAction Stop)) {
+            if ($item.PSIsContainer -or $item.Name -notlike "launcher-*.jsonl") {
+                throw "effective_rights_unproven"
+            }
+            Assert-XbOwnerRightsLogFile -Path $item.FullName -WorkerSid $workerSid
+
+            $fileRights = [uint32]0x001301BF
+            if (-not (Test-XbNativeAccessAllowed -Path $item.FullName -Token $token -DesiredAccess $fileRights)) {
+                throw "effective_rights_missing"
+            }
+            if (-not (Test-XbNativeAccessAllowed -Path $item.FullName -Token $token -DesiredAccess $delete)) {
+                throw "effective_rights_missing"
+            }
+            foreach ($right in @($writeDac, $writeOwner)) {
+                if (Test-XbNativeAccessAllowed -Path $item.FullName -Token $token -DesiredAccess $right) {
+                    throw "effective_rights_exceeded"
+                }
+            }
+            if (Test-XbNativeAccessAllowed -Path $logsPath -Token $token -DesiredAccess $deleteChild) {
+                throw "effective_rights_exceeded"
+            }
+
+            $maximum = Invoke-XbNativeAccessCheck -Path $item.FullName -Token $token -DesiredAccess $maximumAllowed
+            if (([uint32]$maximum.GrantedAccess -band ([uint32]::MaxValue -bxor $fileRights)) -ne 0) {
+                throw "effective_rights_exceeded"
+            }
+        }
+    }
+    catch {
+        $reason = [string]$_.Exception.Message
+        if ($reason -in @("effective_rights_missing", "effective_rights_exceeded", "effective_rights_unproven")) {
+            throw $reason
+        }
+        throw "effective_rights_unproven"
+    }
+    finally {
+        if ($null -ne $token) {
+            try { $token.Dispose() }
+            catch { throw "effective_rights_unproven" }
+        }
     }
 }
 
@@ -599,7 +1170,7 @@ function Read-XbInstalledManifest {
 
 # [CI7] Install verifier: read-only; re-proves the installed release.
 function Invoke-XbInstallVerifier {
-    param([switch]$RequireSecrets)
+    param([Management.Automation.PSCredential]$TaskCredential, [switch]$RequireSecrets)
     $checks = [ordered]@{}
     Assert-XbWorkerInstallLayout
     $checks.CI1_install_layout = "pass"
@@ -624,7 +1195,7 @@ function Invoke-XbInstallVerifier {
     $checks.CI5_task_contract = "pass"
     Assert-XbRuntimeCustody -RequireSecrets:$RequireSecrets
     $checks.CI6_runtime_custody = "pass"
-    Assert-XbWorkerEffectiveRights
+    Assert-XbWorkerEffectiveRights -TaskCredential $TaskCredential
     $checks.CI7_effective_rights = "pass"
     return [ordered]@{ status = "install_verified"; release_sha256 = [string]$installed.release_sha256; checks = $checks }
 }
@@ -684,7 +1255,7 @@ $sourceRoot = $PSScriptRoot
 if ($Operation -eq "Verify") {
     # [CI7] runs on the installed host without a source checkout.
     if ([string]::IsNullOrWhiteSpace($WorkerAccount)) { throw "worker_account_required" }
-    (Invoke-XbInstallVerifier -RequireSecrets:$RequireSecrets) | ConvertTo-Json -Depth 6 -Compress
+    (Invoke-XbInstallVerifier -TaskCredential $TaskCredential -RequireSecrets:$RequireSecrets) | ConvertTo-Json -Depth 6 -Compress
     return
 }
 if ([string]::IsNullOrWhiteSpace($ReviewedPackageManifestPath)) { throw "reviewed_package_identity_required" }

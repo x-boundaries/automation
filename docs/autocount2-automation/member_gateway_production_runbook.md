@@ -220,9 +220,9 @@ stop condition. Restart an epoch only for `token_invalidated` or
 `source_exact_time_backfill_missing` or `created_verified_without_welcome_outbox`,
 stop: exact values are never guessed and historical success is never made
 email-eligible without separate reviewed private no-send work. In
-`first_member` mode a job rejected at `VALIDATED` still consumes the single
-accepted-member admission (the admission guard is unchanged); treat that as a
-stop condition for the first-member window.
+`first_member` mode only a member accepted by the gateway consumes the single
+member admission. A `REJECTED_VALIDATION` response is recorded and receipted
+without consuming that allowance.
 
 Welcome email: bind exactly one authorised SMTP credential for the sending
 identity `noreply@x-boundaries.com` (provider SPF/DKIM as required) and the

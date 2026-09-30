@@ -44,7 +44,7 @@ BOOLEAN_ORDER = (
 
 
 PROTECTED_WORKER_BLOBS = {
-    "scripts/install_ac2_member_gateway_worker.ps1": "297369007223de4507a5b96007268abb4e7aa561",
+    "scripts/install_ac2_member_gateway_worker.ps1": "2037231e434cb1c6a55c961a9bbb87bb0ff35ecd",
     "scripts/ac2_member_gateway_worker.ps1": "ba8aeb169e86ae42dfe007f43c1d3786e63c13c0",
     "scripts/ac2_member_gateway_worker_lib.ps1": "8293559ec6308a8d9afdf73fd4c8b0af322ae382",
     "scripts/ac2_member_gateway_autocount_adapter.ps1": "82120047e7d07bbe3e484c3207892b4c9859b3df",
@@ -60,11 +60,13 @@ PROTECTED_WORKER_TREES = {
 WORKER_SCRIPTS = tuple(PROTECTED_WORKER_BLOBS)
 
 ALLOWED_FILES = {
+    "docs/autocount2-automation/member_gateway_production_runbook.md",
     "member_gateway/migrations/0006_member_write_v2.sql",
     "member_gateway/src/xb_member_gateway/repository.py",
     "member_gateway/tests/test_ingest_v2.py",
     "member_gateway/tests/test_postgres_cursor.py",
     "scripts/ac2_member_gateway_worker_lib.ps1",
+    "scripts/install_ac2_member_gateway_worker.ps1",
     "tests/test_member_gateway_worker_cycle_ps.py",
     "tests/test_member_gateway_worker_deployment.py",
     "tests/test_member_gateway_worker_static.py",
@@ -4362,6 +4364,8 @@ $report = [ordered]@{
 $secretValues = New-Object 'System.Collections.Generic.List[string]'
 $trace = New-Object 'System.Collections.Generic.List[string]'
 $state = @{ pristine_proven = $false; user_sid = $null; temp_redirect = $null; stage_before = @(); boundary_folder = $null; boundary_tasks = @(); lsa_loaded = $false }
+$securePassword = $null
+$secureWrong = $null
 
 $lsaSource = @"
 using System;
@@ -4642,6 +4646,7 @@ try {
     $wrongCredential = New-Object Management.Automation.PSCredential($workerAccount, $secureWrong)
     $script:WorkerAccount = $workerAccount
     $report.environment.worker_account = $workerAccount
+    $report.environment.worker_sid = $state.user_sid
     try {
         $report.environment.administrators_member = (@(Get-LocalGroupMember -SID "S-1-5-32-544" -ErrorAction Stop | Where-Object { $_.SID.Value -eq $state.user_sid }).Count -ne 0)
     } catch {
@@ -4826,6 +4831,19 @@ try {
         }
     }
 
+    function Invoke-XbCi7AclProbe {
+        param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][Security.AccessControl.FileSystemAccessRule]$Rule, [Parameter(Mandatory)]$Token, [Parameter(Mandatory)][uint32]$DesiredAccess, [Parameter(Mandatory)][Management.Automation.PSCredential]$Credential)
+        $original = Get-Acl -LiteralPath $Path -ErrorAction Stop
+        try {
+            $changed = Get-Acl -LiteralPath $Path -ErrorAction Stop
+            $changed.AddAccessRule($Rule)
+            Set-Acl -LiteralPath $Path -AclObject $changed -ErrorAction Stop
+            $granted = Test-XbNativeAccessAllowed -Path $Path -Token $Token -DesiredAccess $DesiredAccess
+            $outcome = Get-XbBoundaryOutcome { Assert-XbWorkerEffectiveRights -TaskCredential $Credential }
+            return [ordered]@{ requested_operation_granted = [bool]$granted; effective_rights = $outcome }
+        } finally { Set-Acl -LiteralPath $Path -AclObject $original -ErrorAction Stop }
+    }
+
     Invoke-XbBoundaryCase "install_then_uninstall" {
         Set-XbProductionTaskIdentity
         $script:TaskCredential = $credential
@@ -4837,6 +4855,123 @@ try {
         $evidence = Get-XbTaskEvidence
         $manifest = Get-Content -Raw -LiteralPath (Join-Path $InstallRoot "installation-manifest.json") | ConvertFrom-Json
         $accountInstalled = Get-XbAccountObservation
+        $ci7 = [ordered]@{ fatal = $null }
+        $nativeToken = $null
+        $logPath = $null
+        $junctionPath = $null
+        try {
+            $logsPath = Join-Path $RuntimeRoot "logs"
+            $runtimeRootAcl = Get-Acl -LiteralPath $RuntimeRoot
+            $logsRootAcl = Get-Acl -LiteralPath $logsPath
+            $workerSid = Get-XbAccountSid -Account $WorkerAccount
+            $ci7.root_owner_sid = $logsRootAcl.GetOwner([Security.Principal.SecurityIdentifier]).Value
+            $ci7.root_owner_accepted = ($ci7.root_owner_sid -in @("S-1-5-18", "S-1-5-32-544"))
+            $ci7.root_dacl_protected = [bool]$logsRootAcl.AreAccessRulesProtected
+            $ci7.root_acl_shape = Get-XbBoundaryOutcome { Assert-XbLogsRootAclShape -Path $logsPath -WorkerSid $workerSid }
+            $nativeToken = New-XbWorkerBatchToken -Credential $credential
+            $ci7.token_user_sid = [string]$nativeToken.UserSid
+            $ci7.token_type = [int]$nativeToken.TokenType
+            $ci7.token_impersonation_level = [int]$nativeToken.ImpersonationLevel
+            $rootMaximum = Invoke-XbNativeAccessCheck -Path $logsPath -Token $nativeToken -DesiredAccess ([uint32]0x02000000)
+            $ci7.logs_root_granted_mask = "0x{0:X8}" -f [uint32]$rootMaximum.GrantedAccess
+            $ci7.root_write_dac = Test-XbNativeAccessAllowed -Path $logsPath -Token $nativeToken -DesiredAccess ([uint32]0x00040000)
+            $ci7.root_write_owner = Test-XbNativeAccessAllowed -Path $logsPath -Token $nativeToken -DesiredAccess ([uint32]0x00080000)
+            $ci7.root_delete = Test-XbNativeAccessAllowed -Path $logsPath -Token $nativeToken -DesiredAccess ([uint32]0x00010000)
+            $ci7.runtime_root_delete_child = Test-XbNativeAccessAllowed -Path $RuntimeRoot -Token $nativeToken -DesiredAccess ([uint32]0x00000040)
+            $ci7.parent_delete_composition = Get-XbBoundaryOutcome { Assert-XbPathNotDeleteable -Path $logsPath -Token $nativeToken }
+
+            $logPath = Join-Path $logsPath ("launcher-ci7-{0}.jsonl" -f (New-XbBoundaryHex 8))
+            $nativeToken.Impersonate()
+            try {
+                Set-Content -LiteralPath $logPath -Value "ci7-create" -NoNewline
+                Add-Content -LiteralPath $logPath -Value "|ci7-append" -NoNewline
+                $ci7.ps51_enumerated = (@(Get-ChildItem -LiteralPath $logsPath -File -Force | ForEach-Object FullName) -contains $logPath)
+                $ci7.ps51_content = [IO.File]::ReadAllText($logPath)
+            } finally { [XbWorkerBatchToken]::Revert() }
+            $childAcl = Get-Acl -LiteralPath $logPath
+            $ci7.child_owner_sid = $childAcl.GetOwner([Security.Principal.SecurityIdentifier]).Value
+            $ci7.child_owner_is_worker = ($ci7.child_owner_sid -ceq $workerSid)
+            $ci7.child_owner_rights_shape = Get-XbBoundaryOutcome { Assert-XbOwnerRightsLogFile -Path $logPath -WorkerSid $workerSid }
+            $ownerRules = @($childAcl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]) | Where-Object { $_.IdentityReference.Value -ceq "S-1-3-4" })
+            $ci7.child_owner_rights_ace_count = $ownerRules.Count
+            $ci7.child_owner_rights_ace_mask = if ($ownerRules.Count -eq 1) { "0x{0:X8}" -f [int]$ownerRules[0].FileSystemRights } else { $null }
+            $childMaximum = Invoke-XbNativeAccessCheck -Path $logPath -Token $nativeToken -DesiredAccess ([uint32]0x02000000)
+            $ci7.child_granted_mask = "0x{0:X8}" -f [uint32]$childMaximum.GrantedAccess
+            $ci7.child_write_dac = Test-XbNativeAccessAllowed -Path $logPath -Token $nativeToken -DesiredAccess ([uint32]0x00040000)
+            $ci7.child_write_owner = Test-XbNativeAccessAllowed -Path $logPath -Token $nativeToken -DesiredAccess ([uint32]0x00080000)
+            $ci7.child_delete = Test-XbNativeAccessAllowed -Path $logPath -Token $nativeToken -DesiredAccess ([uint32]0x00010000)
+
+            $verification = $null
+            try {
+                $verification = Invoke-XbInstallVerifier -TaskCredential $credential
+                $ci7.verify_outcome = "pass"
+                $ci7.verify_status = [string]$verification.status
+                $ci7.verify_release_sha256 = [string]$verification.release_sha256
+                $ci7.verify_checks = $verification.checks
+            } catch { $ci7.verify_outcome = [string]$_.Exception.Message }
+
+            $ci7.missing_credential = Get-XbBoundaryOutcome { Assert-XbWorkerEffectiveRights }
+            $mismatchedCredential = New-Object Management.Automation.PSCredential("xb-ci7-other", $securePassword)
+            $ci7.mismatched_credential = Get-XbBoundaryOutcome { Assert-XbWorkerEffectiveRights -TaskCredential $mismatchedCredential }
+            $ci7.invalid_password = Get-XbBoundaryOutcome { Assert-XbWorkerEffectiveRights -TaskCredential $wrongCredential }
+            $unsupportedAccount = $WorkerAccount + "@invalid.example"
+            $unsupportedCredential = New-Object Management.Automation.PSCredential($unsupportedAccount, $securePassword)
+            $originalWorkerAccount = $script:WorkerAccount
+            try {
+                $script:WorkerAccount = $unsupportedAccount
+                $ci7.unsupported_account_profile = Get-XbBoundaryOutcome { Assert-XbWorkerEffectiveRights -TaskCredential $unsupportedCredential }
+            } finally { $script:WorkerAccount = $originalWorkerAccount }
+
+            $originalAccessCheck = ${function:Invoke-XbNativeAccessCheck}
+            Set-Item function:script:Invoke-XbNativeAccessCheck { param([string]$Path, $Token, [uint32]$DesiredAccess) throw "forced_native_access_failure" }
+            try { $ci7.native_access_failure = Get-XbBoundaryOutcome { Assert-XbWorkerEffectiveRights -TaskCredential $credential } }
+            finally { Set-Item function:script:Invoke-XbNativeAccessCheck $originalAccessCheck }
+
+            $configPath = Join-Path $RuntimeRoot "config"
+            $denyRead = [Security.AccessControl.FileSystemAccessRule]::new($workerSid, [Security.AccessControl.FileSystemRights]::ReadData, [Security.AccessControl.AccessControlType]::Deny)
+            $originalConfigAcl = Get-Acl -LiteralPath $configPath
+            try {
+                $deniedConfigAcl = Get-Acl -LiteralPath $configPath
+                $deniedConfigAcl.AddAccessRule($denyRead)
+                Set-Acl -LiteralPath $configPath -AclObject $deniedConfigAcl -ErrorAction Stop
+                $ci7.required_operation_denied = Get-XbBoundaryOutcome { Assert-XbWorkerEffectiveRights -TaskCredential $credential }
+            } finally { Set-Acl -LiteralPath $configPath -AclObject $originalConfigAcl -ErrorAction Stop }
+
+            $ci7.prohibited_write_dac_allow = Invoke-XbCi7AclProbe -Path $configPath -Rule ([Security.AccessControl.FileSystemAccessRule]::new($workerSid, [Security.AccessControl.FileSystemRights]::ChangePermissions, [Security.AccessControl.AccessControlType]::Allow)) -Token $nativeToken -DesiredAccess ([uint32]0x00040000) -Credential $credential
+            $ci7.prohibited_write_owner_allow = Invoke-XbCi7AclProbe -Path $configPath -Rule ([Security.AccessControl.FileSystemAccessRule]::new($workerSid, [Security.AccessControl.FileSystemRights]::TakeOwnership, [Security.AccessControl.AccessControlType]::Allow)) -Token $nativeToken -DesiredAccess ([uint32]0x00080000) -Credential $credential
+            $ci7.prohibited_delete_allow = Invoke-XbCi7AclProbe -Path $configPath -Rule ([Security.AccessControl.FileSystemAccessRule]::new($workerSid, [Security.AccessControl.FileSystemRights]::Delete, [Security.AccessControl.AccessControlType]::Allow)) -Token $nativeToken -DesiredAccess ([uint32]0x00010000) -Credential $credential
+            $ci7.prohibited_delete_child_allow = Invoke-XbCi7AclProbe -Path $configPath -Rule ([Security.AccessControl.FileSystemAccessRule]::new($workerSid, [Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles, [Security.AccessControl.AccessControlType]::Allow)) -Token $nativeToken -DesiredAccess ([uint32]0x00000040) -Credential $credential
+            $ci7.child_write_dac_allow = Invoke-XbCi7AclProbe -Path $logPath -Rule ([Security.AccessControl.FileSystemAccessRule]::new($workerSid, [Security.AccessControl.FileSystemRights]::ChangePermissions, [Security.AccessControl.AccessControlType]::Allow)) -Token $nativeToken -DesiredAccess ([uint32]0x00040000) -Credential $credential
+            $ci7.child_write_owner_allow = Invoke-XbCi7AclProbe -Path $logPath -Rule ([Security.AccessControl.FileSystemAccessRule]::new($workerSid, [Security.AccessControl.FileSystemRights]::TakeOwnership, [Security.AccessControl.AccessControlType]::Allow)) -Token $nativeToken -DesiredAccess ([uint32]0x00080000) -Credential $credential
+            $ci7.parent_delete_child_allow = Invoke-XbCi7AclProbe -Path $RuntimeRoot -Rule ([Security.AccessControl.FileSystemAccessRule]::new($workerSid, [Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles, [Security.AccessControl.AccessControlType]::Allow)) -Token $nativeToken -DesiredAccess ([uint32]0x00000040) -Credential $credential
+
+            $junctionPath = Join-Path ([IO.Path]::GetTempPath()) ("xb-ci7-junction-{0}" -f (New-XbBoundaryHex 8))
+            & cmd.exe /c mklink /J "$junctionPath" "$logsPath" | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "ci7_reparse_fixture_create_failed" }
+            $ci7.reparse_fail_closed = Get-XbBoundaryOutcome { Assert-XbOwnerRightsLogFile -Path (Join-Path $junctionPath (Split-Path -Leaf $logPath)) -WorkerSid $workerSid }
+            & cmd.exe /c rmdir "$junctionPath" | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "ci7_reparse_fixture_cleanup_failed" }
+            $ci7.reparse_fixture_absent = (-not (Test-Path -LiteralPath $junctionPath))
+            $ci7.unsupported_unc_fail_closed = Get-XbBoundaryOutcome { Get-XbNativePathChain -Path "\\invalid-host\share" }
+
+            $nativeToken.Impersonate()
+            try { Remove-Item -LiteralPath $logPath -Force -ErrorAction Stop }
+            finally { [XbWorkerBatchToken]::Revert() }
+            $ci7.retention_delete = (-not (Test-Path -LiteralPath $logPath))
+        } catch {
+            $ci7.fatal = [string]$_.Exception.Message
+            $ci7.fatal_stack = [string]$_.ScriptStackTrace
+        } finally {
+            if ($null -ne $nativeToken) {
+                try { $nativeToken.Dispose() } catch { }
+            }
+            if ($null -ne $junctionPath -and (Test-Path -LiteralPath $junctionPath)) {
+                try { & cmd.exe /c rmdir "$junctionPath" | Out-Null } catch { }
+            }
+            if ($null -ne $logPath -and (Test-Path -LiteralPath $logPath)) {
+                try { Remove-Item -LiteralPath $logPath -Force -ErrorAction Stop } catch { $ci7.cleanup_error = [string]$_.Exception.Message }
+            }
+        }
         $script:Operation = "Uninstall"
         $uninstallOutcome = Get-XbBoundaryOutcome { Invoke-XbWorkerInstaller }
         $uninstalled = Get-XbProductionReadback
@@ -4851,6 +4986,7 @@ try {
             evidence = $evidence
             manifest_trigger_count = [int]$manifest.task.trigger_count
             account_installed = $accountInstalled
+            ci7 = $ci7
             uninstall_outcome = $uninstallOutcome
             uninstalled = $uninstalled
             account_uninstalled = $accountUninstalled
@@ -4912,6 +5048,8 @@ try {
         try { Remove-Item -LiteralPath $state.temp_redirect -Recurse -Force; $cleanup.temp_redirect_absent = (-not (Test-Path -LiteralPath $state.temp_redirect)) }
         catch { $cleanup.temp_redirect_error = [string]$_.Exception.Message }
     }
+    if ($null -ne $securePassword) { try { $securePassword.Dispose() } catch { $cleanup.secure_password_disposed = $false } }
+    if ($null -ne $secureWrong) { try { $secureWrong.Dispose() } catch { $cleanup.secure_wrong_disposed = $false } }
     $report.cleanup = $cleanup
 }
 
@@ -5409,6 +5547,47 @@ class MemberWorkerHostedTaskBoundaryTests(unittest.TestCase):
         self._assert_exact_disabled_proof(case["evidence"], self.report["environment"]["worker_account"])
         self._assert_never_run(case["evidence"])
         self._assert_no_worker_session(case["account_installed"])
+        ci7 = case["ci7"]
+        self.assertIsNone(ci7["fatal"], ci7)
+        self.assertTrue(ci7["root_owner_accepted"], ci7)
+        self.assertIn(ci7["root_owner_sid"], {"S-1-5-18", "S-1-5-32-544"})
+        self.assertTrue(ci7["root_dacl_protected"])
+        self.assertEqual(ci7["root_acl_shape"], "pass")
+        self.assertEqual(ci7["token_user_sid"], self.report["environment"]["worker_sid"])
+        self.assertEqual(ci7["token_type"], 2)
+        self.assertEqual(ci7["token_impersonation_level"], 2)
+        self.assertEqual(ci7["logs_root_granted_mask"], "0x001200AB")
+        self.assertFalse(ci7["root_write_dac"])
+        self.assertFalse(ci7["root_write_owner"])
+        self.assertFalse(ci7["root_delete"])
+        self.assertFalse(ci7["runtime_root_delete_child"])
+        self.assertEqual(ci7["parent_delete_composition"], "pass")
+        self.assertTrue(ci7["ps51_enumerated"])
+        self.assertEqual(ci7["ps51_content"], "ci7-create|ci7-append")
+        self.assertTrue(ci7["child_owner_is_worker"])
+        self.assertEqual(ci7["child_owner_rights_shape"], "pass")
+        self.assertEqual(ci7["child_owner_rights_ace_count"], 1)
+        self.assertEqual(ci7["child_owner_rights_ace_mask"], "0x001301BF")
+        self.assertEqual(ci7["child_granted_mask"], "0x001301BF")
+        self.assertFalse(ci7["child_write_dac"])
+        self.assertFalse(ci7["child_write_owner"])
+        self.assertTrue(ci7["child_delete"])
+        self.assertEqual(ci7["verify_outcome"], "pass")
+        self.assertEqual(ci7["verify_status"], "install_verified")
+        self.assertRegex(ci7["verify_release_sha256"], r"^[0-9a-f]{64}$")
+        self.assertTrue(ci7["verify_checks"])
+        self.assertTrue(all(value == "pass" for value in ci7["verify_checks"].values()))
+        for key in ("missing_credential", "mismatched_credential", "invalid_password", "unsupported_account_profile", "native_access_failure", "reparse_fail_closed", "unsupported_unc_fail_closed"):
+            with self.subTest(ci7=key):
+                self.assertEqual(ci7[key], "effective_rights_unproven")
+        self.assertEqual(ci7["required_operation_denied"], "effective_rights_missing")
+        for key in ("prohibited_write_dac_allow", "prohibited_write_owner_allow", "prohibited_delete_allow", "prohibited_delete_child_allow", "child_write_dac_allow", "child_write_owner_allow", "parent_delete_child_allow"):
+            with self.subTest(ci7=key):
+                self.assertTrue(ci7[key]["requested_operation_granted"], ci7[key])
+                self.assertEqual(ci7[key]["effective_rights"], "effective_rights_exceeded")
+        self.assertTrue(ci7["reparse_fixture_absent"])
+        self.assertTrue(ci7["retention_delete"])
+        self.assertNotIn("cleanup_error", ci7)
         self.assertEqual(case["uninstall_outcome"], "pass")
         self.assertEqual(
             case["uninstalled"],
@@ -5521,10 +5700,20 @@ $script:RuntimeRoot = Join-Path $WorkRoot "runtime"
 foreach ($child in @("config", "secrets", "logs", "rollback")) { New-Item -ItemType Directory -Path (Join-Path $RuntimeRoot $child) -Force | Out-Null }
 $out.ci6_inherited_acl = Get-XbOutcome { Assert-XbRuntimeCustody }
 
-$readExecute = [int]([Security.AccessControl.FileSystemRights]::ReadAndExecute -bor [Security.AccessControl.FileSystemRights]::Synchronize)
-$out.ci7_rights_within = (Test-XbRightsWithin -Granted ([int][Security.AccessControl.FileSystemRights]::ReadAndExecute) -Allowed $readExecute)
-$out.ci7_rights_write_exceeds = (Test-XbRightsWithin -Granted ([int][Security.AccessControl.FileSystemRights]::Modify) -Allowed $readExecute)
-$out.ci7_rights_full_exceeds = (Test-XbRightsWithin -Granted ([int][Security.AccessControl.FileSystemRights]::FullControl) -Allowed $readExecute)
+$script:WorkerAccount = "XBHOST\bworker"
+$ci7Password = [Security.SecureString]::new()
+$ci7Password.AppendChar('x')
+$ci7Credential = New-Object Management.Automation.PSCredential($script:WorkerAccount, $ci7Password)
+$ci7WrongName = New-Object Management.Automation.PSCredential("XBHOST\other", $ci7Password)
+$out.ci7_missing_credential = Get-XbOutcome { Assert-XbWorkerEffectiveRights }
+$out.ci7_mismatched_credential = Get-XbOutcome { Assert-XbWorkerEffectiveRights -TaskCredential $ci7WrongName }
+$originalTokenFactory = ${function:New-XbWorkerBatchToken}
+Set-Item function:script:New-XbWorkerBatchToken { param([Management.Automation.PSCredential]$Credential) throw "forced_native_token_failure" }
+try { $out.ci7_native_token_failure = Get-XbOutcome { Assert-XbWorkerEffectiveRights -TaskCredential $ci7Credential } }
+finally { Set-Item function:script:New-XbWorkerBatchToken $originalTokenFactory }
+Add-Type -TypeDefinition 'public sealed class XbWorkerBatchToken { public static void Touch() { } }'
+$out.ci7_preloaded_native_type = Get-XbOutcome { Initialize-XbWorkerNativeAccess }
+$ci7Password.Dispose()
 [Console]::Out.Write(($out | ConvertTo-Json -Depth 8 -Compress))
 '''
 
@@ -5594,14 +5783,34 @@ class MemberWorkerReleaseIntegrityTests(unittest.TestCase):
         self.assertRegex(self.report["manifest_arguments"], r"-Mode DisabledProof$")
         self.assertNotRegex(self.report["manifest_arguments"], r"EnableProduction")
 
-    def test_ci6_custody_and_ci7_rights(self) -> None:
+    def test_ci6_custody_and_ci7_fail_closed_wrappers(self) -> None:
         self.assertTrue(self.report["ci6_secure_artifact"])
         self.assertFalse(self.report["ci6_plain_artifact"])
         self.assertFalse(self.report["ci6_garbage_artifact"])
         self.assertEqual(self.report["ci6_inherited_acl"], "runtime_custody_acl_invalid")
-        self.assertTrue(self.report["ci7_rights_within"])
-        self.assertFalse(self.report["ci7_rights_write_exceeds"])
-        self.assertFalse(self.report["ci7_rights_full_exceeds"])
+        self.assertEqual(self.report["ci7_missing_credential"], "effective_rights_unproven")
+        self.assertEqual(self.report["ci7_mismatched_credential"], "effective_rights_unproven")
+        self.assertEqual(self.report["ci7_native_token_failure"], "effective_rights_unproven")
+        self.assertEqual(self.report["ci7_preloaded_native_type"], "effective_rights_unproven")
+
+    def test_ci7_uses_native_token_accesscheck_and_preserves_ci6_oracle(self) -> None:
+        source = (ROOT / INSTALLER_PATH).read_text(encoding="utf-8")
+        self.assertNotIn("Test-XbRightsWithin", source)
+        ci6 = _installer_function(source, "Assert-XbRuntimeCustody")
+        self.assertIn("Get-XbGrantedRights", ci6)
+        token = _installer_function(source, "Initialize-XbWorkerNativeAccess")
+        for required in ("LogonUserW", "LOGON32_LOGON_BATCH", "DuplicateTokenEx", "SecurityImpersonation", "TokenImpersonation", "AccessCheck", "SecureStringToGlobalAllocUnicode", "ZeroFreeGlobalAllocUnicode"):
+            with self.subTest(required=required):
+                self.assertIn(required, token)
+        access = _installer_function(source, "Invoke-XbNativeAccessCheck")
+        self.assertIn("GetSecurityDescriptorBinaryForm", access)
+        self.assertIn("$Token.Check", access)
+        effective = _installer_function(source, "Assert-XbWorkerEffectiveRights")
+        for marker in ("effective_rights_missing", "effective_rights_exceeded", "effective_rights_unproven", "Assert-XbLogsRootAclShape", "Assert-XbOwnerRightsLogFile", "Assert-XbPathNotDeleteable"):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, effective)
+        self.assertIn("0x001301BF", source)
+        self.assertIn("0x001200AB", source)
 
     def test_installer_binds_ci1_to_ci7_and_upgrade_contract(self) -> None:
         source = (ROOT / INSTALLER_PATH).read_text(encoding="utf-8")
