@@ -738,7 +738,7 @@ class HttpFramingAdmission(DirectHttpCase):
         cases = []
         # These are non-OWS whitespace/control characters that Python's generic
         # str.strip() removes and that can be represented on the Latin-1 wire.
-        for char in ("\v", "\f", "\x1c", "\x1d", "\x1e", "\x1f", "\x85", "\xa0"):
+        for char in ("\v", "\f", "\x1c", "\x1d", "\x1e", "\x1f", "\x85", "\xa0", "\r", "\n"):
             codepoint = f"U+{ord(char):04X}"
             for position, value in (("leading", char + length), ("trailing", length + char)):
                 cases.append((

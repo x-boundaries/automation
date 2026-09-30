@@ -133,11 +133,59 @@ _CHUNK_SIZE_LINE = re.compile(
 )
 
 
+class _StrictContentLengthHeaderReader:
+    """Validate Content-Length bytes before email parsing normalizes headers."""
+
+    def __init__(self, fp) -> None:
+        self._fp = fp
+        self._expect_status_line = True
+        self._status_code: bytes | None = None
+        self._last_was_content_length = False
+
+    def readline(self, size: int = -1) -> bytes:
+        line = self._fp.readline(size)
+        if self._expect_status_line:
+            self._expect_status_line = False
+            status_parts = line.split(b" ", 2)
+            self._status_code = status_parts[1] if len(status_parts) > 1 else None
+            return line
+
+        if line in (b"\r\n", b"\n", b""):
+            self._expect_status_line = True
+            self._last_was_content_length = False
+            return line
+
+        if line[:1] in (b" ", b"\t"):
+            if self._last_was_content_length and self._status_code != b"100":
+                raise http.client.HTTPException("folded Content-Length field")
+            return line
+
+        name, separator, _value = line.partition(b":")
+        self._last_was_content_length = separator == b":" and name.lower() == b"content-length"
+        if self._last_was_content_length and self._status_code != b"100":
+            if not line.endswith(b"\r\n"):
+                raise http.client.HTTPException("malformed Content-Length field")
+            raw_value = line[:-2].partition(b":")[2].strip(b" \t")
+            if not raw_value or any(byte < ord("0") or byte > ord("9") for byte in raw_value):
+                raise http.client.HTTPException("malformed Content-Length field")
+        return line
+
+    def close(self) -> None:
+        self._fp.close()
+
+
 class _StrictHTTPResponse(http.client.HTTPResponse):
     """HTTPResponse that refuses permissive chunk terminators from CPython."""
 
     def begin(self) -> None:
-        super().begin()
+        original_fp = self.fp
+        checked_fp = _StrictContentLengthHeaderReader(original_fp)
+        self.fp = checked_fp
+        try:
+            super().begin()
+        finally:
+            if self.fp is checked_fp:
+                self.fp = original_fp
         transfer_encodings = self.headers.get_all("Transfer-Encoding", [])
         admitted_chunked = False
         if len(transfer_encodings) == 1:
