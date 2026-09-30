@@ -136,6 +136,22 @@ _CHUNK_SIZE_LINE = re.compile(
 class _StrictHTTPResponse(http.client.HTTPResponse):
     """HTTPResponse that refuses permissive chunk terminators from CPython."""
 
+    def begin(self) -> None:
+        super().begin()
+        transfer_encodings = self.headers.get_all("Transfer-Encoding", [])
+        admitted_chunked = False
+        if len(transfer_encodings) == 1:
+            value = transfer_encodings[0].strip(" \t")
+            admitted_chunked = value.isascii() and value.lower() == "chunked"
+
+        self.chunked = admitted_chunked
+        self.chunk_left = None
+        if admitted_chunked:
+            self.length = None
+        self.will_close = self._check_close()
+        if not self.will_close and not self.chunked and self.length is None:
+            self.will_close = True
+
     def _read_next_chunk_size(self) -> int:
         line = self.fp.readline(_HTTP_LINE_LIMIT + 1)
         if len(line) > _HTTP_LINE_LIMIT:

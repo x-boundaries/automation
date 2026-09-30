@@ -649,6 +649,15 @@ class HttpFramingAdmission(DirectHttpCase):
         length = str(len(payload))
         return {
             "notchunked": raw_response(content + [("Transfer-Encoding", "notchunked")], payload),
+            "trailing vertical tab": raw_response(
+                content + [("Transfer-Encoding", "chunked" + chr(11))], chunked
+            ),
+            "trailing form feed": raw_response(
+                content + [("Transfer-Encoding", "chunked" + chr(12))], chunked
+            ),
+            "embedded whitespace": raw_response(
+                content + [("Transfer-Encoding", "chun ked")], chunked
+            ),
             "unsupported coding": raw_response(content + [("Transfer-Encoding", "gzip")], payload),
             "gzip then chunked": raw_response(content + [("Transfer-Encoding", "gzip, chunked")], chunked),
             "repeated transfer encoding": raw_response(
@@ -797,6 +806,9 @@ class HttpFramingAdmission(DirectHttpCase):
         cases = self._framing_cases(self._list_payload(), "application/json")
         self._assert_cases("list", [(name, cases[name]) for name in (
             "notchunked",
+            "trailing vertical tab",
+            "trailing form feed",
+            "embedded whitespace",
             "unsupported coding",
             "gzip then chunked",
             "repeated transfer encoding",
@@ -806,6 +818,9 @@ class HttpFramingAdmission(DirectHttpCase):
         cases = self._framing_cases(synthetic_pdf(b"framing-test"), "application/pdf")
         self._assert_cases("fetch", [(name, cases[name]) for name in (
             "notchunked",
+            "trailing vertical tab",
+            "trailing form feed",
+            "embedded whitespace",
             "unsupported coding",
             "gzip then chunked",
             "repeated transfer encoding",
@@ -859,6 +874,52 @@ class HttpFramingAdmission(DirectHttpCase):
             self.assertEqual(4, len(deployment.archived()))
             self.assertEqual(1, len(self.service_state.list_requests))
             self.assertEqual(4, len(self.service_state.fetch_requests))
+
+    def test_parser_decoded_chunked_list_accepts_ascii_ows(self) -> None:
+        body = self._list_payload()
+        header_values = ("chunked", "chunked ", "chunked" + chr(9), chr(9) + "ChUnKeD " + chr(9))
+        for header_value in header_values:
+            with self.subTest(transfer_encoding=repr(header_value)):
+                list_before = len(self.service_state.list_requests)
+                fetch_before = len(self.service_state.fetch_requests)
+                self.service_state.list_queue = [
+                    raw_response(
+                        [("Content-Type", "application/json"), ("Transfer-Encoding", header_value)],
+                        chunked_body(body),
+                    )
+                ]
+                with tempfile.TemporaryDirectory() as case_root:
+                    deployment = Deployment(Path(case_root), self.service)
+                    code, document = deployment.run()
+                    self.assertEqual(0, code, document)
+                    self.assertEqual(4, len(deployment.archived()))
+                    self.assertEqual(4, len(deployment.state_rows()))
+                    self.assertEqual([], deployment.temp_entries())
+                self.assertEqual(list_before + 1, len(self.service_state.list_requests))
+                self.assertEqual(fetch_before + 4, len(self.service_state.fetch_requests))
+
+    def test_parser_decoded_chunked_fetch_accepts_ascii_ows(self) -> None:
+        payload = synthetic_pdf(bill_name(0).encode("ascii"))
+        header_values = ("chunked", "chunked ", "chunked" + chr(9), chr(9) + "ChUnKeD " + chr(9))
+        for header_value in header_values:
+            with self.subTest(transfer_encoding=repr(header_value)):
+                fetch_before = len(self.service_state.fetch_requests)
+                self.service_state.fetch_queue = {
+                    bill_name(0): [
+                        raw_response(
+                            [("Content-Type", "application/pdf"), ("Transfer-Encoding", header_value)],
+                            chunked_body(payload),
+                        )
+                    ]
+                }
+                with tempfile.TemporaryDirectory() as case_root:
+                    deployment = Deployment(Path(case_root), self.service)
+                    code, document = deployment.run()
+                    self.assertEqual(0, code, document)
+                    self.assertEqual(4, len(deployment.archived()))
+                    self.assertEqual(4, len(deployment.state_rows()))
+                    self.assertEqual([], deployment.temp_entries())
+                self.assertEqual(fetch_before + 4, len(self.service_state.fetch_requests))
 
     def test_parser_decoded_chunked_fetch_is_accepted(self) -> None:
         payload = synthetic_pdf(bill_name(0).encode("ascii"))
