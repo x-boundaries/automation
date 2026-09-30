@@ -46,6 +46,7 @@ from tests.fixtures.synthetic_http_source import (
     json_document,
     pdf_bytes,
     raw_body,
+    raw_response,
     short_body,
     slow,
     status,
@@ -61,6 +62,10 @@ def setUpModule() -> None:
     patcher = mock.patch.object(http_source, "RETRY_DELAY_SECONDS", 0.0)
     patcher.start()
     unittest.addModuleCleanup(patcher.stop)
+
+
+def chunked_body(payload: bytes) -> bytes:
+    return f"{len(payload):X}\r\n".encode("ascii") + payload + b"\r\n0\r\n\r\n"
 
 
 class Deployment:
@@ -356,13 +361,60 @@ class ListContractNegatives(DirectHttpCase):
         self.run_list_case(json_document({"success": True, "files": files}), "EG_INVENTORY_DUPLICATE_FILENAME")
 
     def test_unsafe_filename(self) -> None:
-        for name in ("..\\escape.pdf", "../escape.pdf", "CON.pdf", "bill.exe", "bill.pdf.", "a:b.pdf", "", "bill\x01.pdf"):
+        for name in (
+            "..\\escape.pdf",
+            "../escape.pdf",
+            "CON.pdf",
+            "CON.extra.pdf",
+            "NUL.extra.pdf",
+            "COM1.extra.pdf",
+            "COM¹.pdf",
+            "LPT².pdf",
+            "con.Extra.PDF",
+            "nUl.extra.pdf",
+            "com1.EXTRA.PDF",
+            "lPt².PdF",
+            "CONIN$.extra.pdf",
+            "conout$.PDF",
+            "CON .extra.pdf",
+            "bill.exe",
+            "bill.pdf.",
+            "a:b.pdf",
+            "",
+            "bill\x01.pdf",
+        ):
             with self.subTest(name=repr(name)):
                 self.tearDown()
                 self.setUp()
                 files = default_files(2)
                 files[1]["filename"] = name
                 self.run_list_case(json_document({"success": True, "files": files}), "EG_INVENTORY_FILENAME_UNSAFE")
+
+    def test_reserved_name_in_mixed_inventory_fails_in_phase_zero_without_state_writes(self) -> None:
+        files = default_files(3)
+        files[1]["filename"] = "CON.extra.pdf"
+        self.service_state.files = files
+        state_writes: list[str] = []
+
+        def write_spy(name: str):
+            original = getattr(StateStore, name)
+
+            def record_write(state, *args, **kwargs):
+                state_writes.append(name)
+                return original(state, *args, **kwargs)
+
+            return record_write
+
+        deployment = self.deployment()
+        with contextlib.ExitStack() as stack:
+            for method_name in ("mark_seen", "record_archived", "record_failure"):
+                stack.enter_context(mock.patch.object(StateStore, method_name, new=write_spy(method_name)))
+            code, document = deployment.run()
+
+        self.assert_fail_closed(deployment, code, document, "EG_INVENTORY_FILENAME_UNSAFE")
+        self.assertEqual(1, len(self.service_state.list_requests))
+        self.assertEqual(0, len(self.service_state.fetch_requests))
+        self.assertEqual([], state_writes)
 
     def test_empty_inventory(self) -> None:
         self.run_list_case(json_document({"success": True, "files": []}), "EG_HTTP_LIST_EMPTY")
@@ -523,6 +575,162 @@ class FetchNegatives(DirectHttpCase):
         self.service_state.pdfs[bill_name(2)] = big
         with mock.patch.object(http_source, "MAX_PDF_BYTES", normal + 8):
             self.run_fetch_case([], "PORTAL_LAYOUT_CHANGED", 20, "EG_HTTP_FETCH_OVERSIZE")
+
+
+class HttpFramingAdmission(DirectHttpCase):
+    def _assert_framing_incomplete(self, stage: str, behaviour) -> None:
+        list_before = len(self.service_state.list_requests)
+        fetch_before = len(self.service_state.fetch_requests)
+        with tempfile.TemporaryDirectory() as case_root:
+            deployment = Deployment(Path(case_root), self.service)
+            if stage == "list":
+                self.service_state.list_queue = [behaviour]
+                self.service_state.fetch_queue = {}
+            else:
+                self.service_state.list_queue = []
+                self.service_state.fetch_queue = {bill_name(0): [behaviour]}
+            code, document = deployment.run()
+
+            self.assertEqual(20, code, document)
+            self.assertEqual([], deployment.archived(), "framing failure must not publish")
+            self.assertEqual([], deployment.state_rows(), "framing failure must not archive state")
+            self.assertEqual([], deployment.temp_entries(), "framing failure must leave no temp residue")
+            self.assert_no_canary(deployment.last_stdout, deployment.log_text())
+            if stage == "list":
+                self.assertEqual("EG_HTTP_FRAMING_INCOMPLETE", document.get("support_ref"), document)
+                self.assertEqual(0, len(self.service_state.fetch_requests) - fetch_before)
+            else:
+                self.assertEqual("PORTAL_LAYOUT_CHANGED", document["status"])
+                failures = [event for event in deployment.log_events() if event["phase"] == "invoice_failure"]
+                self.assertEqual(1, len(failures))
+                self.assertEqual("EG_HTTP_FRAMING_INCOMPLETE", failures[0].get("support_ref"))
+                self.assertEqual(1, len(self.service_state.fetch_requests) - fetch_before)
+            self.assertEqual(1, len(self.service_state.list_requests) - list_before)
+
+    def _assert_cases(self, stage: str, cases: list[tuple[str, object]]) -> None:
+        for name, behaviour in cases:
+            with self.subTest(stage=stage, case=name):
+                self._assert_framing_incomplete(stage, behaviour)
+
+    @staticmethod
+    def _list_payload() -> bytes:
+        return json.dumps({"success": True, "files": default_files()}).encode("utf-8")
+
+    def _framing_cases(self, payload: bytes, content_type: str) -> dict[str, object]:
+        content = [("Content-Type", content_type)]
+        chunked = chunked_body(payload)
+        length = str(len(payload))
+        return {
+            "notchunked": raw_response(content + [("Transfer-Encoding", "notchunked")], payload),
+            "unsupported coding": raw_response(content + [("Transfer-Encoding", "gzip")], payload),
+            "gzip then chunked": raw_response(content + [("Transfer-Encoding", "gzip, chunked")], chunked),
+            "repeated transfer encoding": raw_response(
+                content + [("Transfer-Encoding", "chunked"), ("Transfer-Encoding", "chunked")], chunked
+            ),
+            "conflicting duplicate content length": raw_response(
+                content + [("Content-Length", length), ("Content-Length", str(len(payload) + 1))], payload
+            ),
+            "repeated content length": raw_response(
+                content + [("Content-Length", length), ("Content-Length", length)], payload
+            ),
+            "comma combined content length": raw_response(
+                content + [("Content-Length", f"{length}, {length}")], payload
+            ),
+            "mixed transfer encoding and content length": raw_response(
+                content + [("Transfer-Encoding", "chunked"), ("Content-Length", length)], chunked
+            ),
+            "close delimited": close_delimited(payload, content_type),
+            "truncated content length": short_body(payload[: max(1, len(payload) // 2)], len(payload), content_type),
+            "malformed chunk size": raw_response(
+                content + [("Transfer-Encoding", "chunked")], b"not-a-chunk-size\r\n"
+            ),
+            "incomplete chunk body": raw_response(
+                content + [("Transfer-Encoding", "chunked")],
+                f"{len(payload):X}\r\n".encode("ascii") + payload[:3],
+            ),
+        }
+
+    def test_list_rejects_unsupported_or_ambiguous_transfer_encoding(self) -> None:
+        cases = self._framing_cases(self._list_payload(), "application/json")
+        self._assert_cases("list", [(name, cases[name]) for name in (
+            "notchunked",
+            "unsupported coding",
+            "gzip then chunked",
+            "repeated transfer encoding",
+        )])
+
+    def test_fetch_rejects_unsupported_or_ambiguous_transfer_encoding(self) -> None:
+        cases = self._framing_cases(synthetic_pdf(b"framing-test"), "application/pdf")
+        self._assert_cases("fetch", [(name, cases[name]) for name in (
+            "notchunked",
+            "unsupported coding",
+            "gzip then chunked",
+            "repeated transfer encoding",
+        )])
+
+    def test_list_rejects_ambiguous_or_mixed_content_length(self) -> None:
+        cases = self._framing_cases(self._list_payload(), "application/json")
+        self._assert_cases("list", [(name, cases[name]) for name in (
+            "conflicting duplicate content length",
+            "repeated content length",
+            "comma combined content length",
+            "mixed transfer encoding and content length",
+        )])
+
+    def test_fetch_rejects_ambiguous_or_mixed_content_length(self) -> None:
+        cases = self._framing_cases(synthetic_pdf(b"framing-test"), "application/pdf")
+        self._assert_cases("fetch", [(name, cases[name]) for name in (
+            "conflicting duplicate content length",
+            "repeated content length",
+            "comma combined content length",
+            "mixed transfer encoding and content length",
+        )])
+
+    def test_list_rejects_close_delimited_and_incomplete_bodies(self) -> None:
+        cases = self._framing_cases(self._list_payload(), "application/json")
+        self._assert_cases("list", [(name, cases[name]) for name in (
+            "close delimited",
+            "truncated content length",
+            "malformed chunk size",
+            "incomplete chunk body",
+        )])
+
+    def test_fetch_rejects_close_delimited_and_incomplete_bodies(self) -> None:
+        cases = self._framing_cases(synthetic_pdf(b"framing-test"), "application/pdf")
+        self._assert_cases("fetch", [(name, cases[name]) for name in (
+            "close delimited",
+            "truncated content length",
+            "malformed chunk size",
+            "incomplete chunk body",
+        )])
+
+    def test_parser_decoded_chunked_list_is_accepted(self) -> None:
+        body = self._list_payload()
+        self.service_state.list_queue = [
+            raw_response([("Content-Type", "application/json"), ("Transfer-Encoding", "chunked")], chunked_body(body))
+        ]
+        with tempfile.TemporaryDirectory() as case_root:
+            deployment = Deployment(Path(case_root), self.service)
+            code, document = deployment.run()
+            self.assertEqual(0, code, document)
+            self.assertEqual(4, len(deployment.archived()))
+            self.assertEqual(1, len(self.service_state.list_requests))
+            self.assertEqual(4, len(self.service_state.fetch_requests))
+
+    def test_parser_decoded_chunked_fetch_is_accepted(self) -> None:
+        payload = synthetic_pdf(bill_name(0).encode("ascii"))
+        self.service_state.fetch_queue = {
+            bill_name(0): [
+                raw_response([("Content-Type", "application/pdf"), ("Transfer-Encoding", "chunked")], chunked_body(payload))
+            ]
+        }
+        with tempfile.TemporaryDirectory() as case_root:
+            deployment = Deployment(Path(case_root), self.service)
+            code, document = deployment.run()
+            self.assertEqual(0, code, document)
+            self.assertEqual(4, len(deployment.archived()))
+            self.assertEqual(4, len(deployment.state_rows()))
+            self.assertEqual([], deployment.temp_entries())
 
 
 class ArchiveConflicts(DirectHttpCase):

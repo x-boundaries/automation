@@ -292,21 +292,30 @@ class DirectHttpSource:
             if response.status != 200:
                 raise SourceContractError(REF_STATUS_UNEXPECTED, stage=stage)
             content_type = response.headers.get("Content-Type", "")
-            length_header = response.headers.get("Content-Length")
-            chunked = "chunked" in response.headers.get("Transfer-Encoding", "").lower()
+            transfer_encodings = response.headers.get_all("Transfer-Encoding", [])
+            content_lengths = response.headers.get_all("Content-Length", [])
+            chunked = response.chunked
             expected: int | None = None
-            if length_header is not None:
-                try:
-                    expected = int(length_header.strip())
-                except ValueError:
+            if transfer_encodings:
+                if (
+                    content_lengths
+                    or len(transfer_encodings) != 1
+                    or transfer_encodings[0].strip().lower() != "chunked"
+                    or not chunked
+                    or response.length is not None
+                ):
                     raise SourceContractError(REF_FRAMING_INCOMPLETE, stage=stage) from None
-                if expected < 0:
+            else:
+                if chunked or len(content_lengths) != 1:
                     raise SourceContractError(REF_FRAMING_INCOMPLETE, stage=stage)
+                length_value = content_lengths[0].strip()
+                if not length_value.isascii() or not length_value.isdecimal():
+                    raise SourceContractError(REF_FRAMING_INCOMPLETE, stage=stage) from None
+                expected = int(length_value)
                 if expected > max_bytes:
                     raise SourceContractError(oversize_ref, stage=stage)
-            elif not chunked:
-                # A close-delimited body cannot prove it arrived complete.
-                raise SourceContractError(REF_FRAMING_INCOMPLETE, stage=stage)
+                if response.length != expected:
+                    raise SourceContractError(REF_FRAMING_INCOMPLETE, stage=stage)
             try:
                 body = response.read(max_bytes + 1)
             except http.client.IncompleteRead:

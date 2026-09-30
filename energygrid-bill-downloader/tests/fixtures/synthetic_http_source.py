@@ -140,6 +140,20 @@ def status(code: int, location: str | None = None) -> Behaviour:
     return act
 
 
+def raw_response(headers: list[tuple[str, str]], body: bytes, code: int = 200, reason: str = "OK") -> Behaviour:
+    """Emit exact response headers/body, including repeated framing fields."""
+
+    def act(handler: _Handler) -> None:
+        lines = [f"HTTP/1.1 {code} {reason}\r\n"]
+        lines.extend(f"{name}: {value}\r\n" for name, value in headers)
+        lines.append("\r\n")
+        handler.wfile.write("".join(lines).encode("latin-1") + body)
+        handler.wfile.flush()
+        handler.close_connection = True
+
+    return act
+
+
 def json_document(document: Any, content_type: str = "application/json") -> Behaviour:
     def act(handler: _Handler) -> None:
         handler.send_json(document, content_type=content_type)

@@ -22,6 +22,44 @@ from energygrid_bill_downloader.publication import (
 from tests.fixtures.synthetic_portal import synthetic_pdf
 
 
+class FilenameValidationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.archive = Path(self.temp_dir.name) / "archive"
+        self.archive.mkdir()
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def test_windows_reserved_device_names_are_rejected_cross_platform(self) -> None:
+        for name in (
+            "CON.extra.pdf",
+            "NUL.extra.pdf",
+            "COM1.extra.pdf",
+            "COM¹.pdf",
+            "LPT².pdf",
+            "con.Extra.PDF",
+            "nUl.extra.pdf",
+            "cOm1.EXTRA.PDF",
+            "com².PdF",
+            "lPt².PdF",
+            "PRN.extra.pdf",
+            "AUX.extra.pdf",
+            "COM9.extra.pdf",
+            "LPT9.extra.pdf",
+            "CONIN$.extra.pdf",
+            "conout$.PDF",
+            "CON .extra.pdf",
+        ):
+            with self.subTest(name=name):
+                with self.assertRaises(ConfigError):
+                    validate_filename(name, self.archive)
+
+    def test_safe_multi_dot_pdf_is_accepted(self) -> None:
+        name = "2026.invoice.final.pdf"
+        self.assertEqual(self.archive.resolve() / name, validate_filename(name, self.archive))
+
+
 @unittest.skipUnless(os.name == "nt", "the locked publication primitive is Windows-only")
 class PublicationTests(unittest.TestCase):
     def setUp(self) -> None:

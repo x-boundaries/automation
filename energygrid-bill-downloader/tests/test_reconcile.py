@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 from pathlib import Path
 import tempfile
 import unittest
@@ -379,13 +380,48 @@ class ReconcileTests(unittest.TestCase):
         self.assertEqual(self.owned_temps(), [])
 
     def test_an_unsafe_suggested_filename_fails_before_any_state_or_publication(self) -> None:
-        bills = [SyntheticBill("2026-09-03_safe.pdf"), SyntheticBill("..\\escape.pdf")]
-        with self.assertRaises(AppError) as caught:
-            self.run_once(FakePortal(bills))
-        self.assertEqual(caught.exception.status, "ACTION_REQUIRED")
-        self.assertEqual(self.records(), {})
-        self.assertEqual(self.archive_files(), [])
-        self.assertEqual(self.owned_temps(), [])
+        reserved_names = (
+            "..\\escape.pdf",
+            "CON.extra.pdf",
+            "NUL.extra.pdf",
+            "COM1.extra.pdf",
+            "COM¹.pdf",
+            "LPT².pdf",
+            "con.Extra.PDF",
+            "lPt².PdF",
+            "CONIN$.extra.pdf",
+            "conout$.PDF",
+            "CON .extra.pdf",
+        )
+        state_writes: list[str] = []
+
+        def write_spy(name: str):
+            original = getattr(StateStore, name)
+
+            def record_write(state, *args, **kwargs):
+                state_writes.append(name)
+                return original(state, *args, **kwargs)
+
+            return record_write
+
+        with contextlib.ExitStack() as stack:
+            for method_name in ("mark_seen", "record_archived", "record_failure"):
+                stack.enter_context(mock.patch.object(StateStore, method_name, new=write_spy(method_name)))
+            for unsafe_name in reserved_names:
+                with self.subTest(name=unsafe_name):
+                    bills = [
+                        SyntheticBill("2026-09-03_safe.pdf"),
+                        SyntheticBill("2026-09-04_other.pdf", suggested_filename=unsafe_name),
+                    ]
+                    portal = FakePortal(bills)
+                    with self.assertRaises(AppError) as caught:
+                        self.run_once(portal)
+                    self.assertEqual(caught.exception.status, "ACTION_REQUIRED")
+                    self.assertEqual(2, portal.download_calls)
+                    self.assertEqual(self.records(), {})
+                    self.assertEqual(self.archive_files(), [])
+                    self.assertEqual(self.owned_temps(), [])
+        self.assertEqual([], state_writes)
 
     def test_an_interruption_during_phase_a_leaves_no_state_publication_or_temp(self) -> None:
         bills = [SyntheticBill("2026-09-04_a.pdf"), SyntheticBill("2026-09-04_b.pdf")]
