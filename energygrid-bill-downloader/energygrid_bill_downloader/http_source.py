@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import re
 import socket
 import ssl
 import time
@@ -114,10 +115,136 @@ class _RefuseRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+_HTTP_LINE_LIMIT = 65_536
+_HTTP_TRAILER_LIMIT = 100
+_HTTP_TOKEN_CHARS = frozenset(
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!#$%&'*+-.^_\x60|~"
+)
+_CHUNK_EXTENSION_TOKEN = rb"[!#$%&'*+\-.^_\x60|~0-9A-Za-z]+"
+_CHUNK_EXTENSION_QUOTED = rb'"(?:[\t \x21\x23-\x5b\x5d-\x7e\x80-\xff]|\\[\t \x21-\x7e\x80-\xff])*"'
+_CHUNK_SIZE_LINE = re.compile(
+    rb"([0-9A-Fa-f]+)(?:[ \t]*;[ \t]*"
+    + _CHUNK_EXTENSION_TOKEN
+    + rb"(?:[ \t]*=[ \t]*(?:"
+    + _CHUNK_EXTENSION_TOKEN
+    + rb"|"
+    + _CHUNK_EXTENSION_QUOTED
+    + rb"))?)*"
+)
+
+
+class _StrictHTTPResponse(http.client.HTTPResponse):
+    """HTTPResponse that refuses permissive chunk terminators from CPython."""
+
+    def _read_next_chunk_size(self) -> int:
+        line = self.fp.readline(_HTTP_LINE_LIMIT + 1)
+        if len(line) > _HTTP_LINE_LIMIT:
+            self._close_conn()
+            raise http.client.LineTooLong("chunk size")
+        if not line.endswith(b"\r\n"):
+            self._close_conn()
+            raise ValueError
+        match = _CHUNK_SIZE_LINE.fullmatch(line[:-2])
+        if match is None:
+            self._close_conn()
+            raise ValueError
+        try:
+            return int(match.group(1), 16)
+        except ValueError:
+            self._close_conn()
+            raise
+
+    def _get_chunk_left(self):
+        chunk_left = self.chunk_left
+        if not chunk_left:
+            if chunk_left is not None:
+                delimiter = self._safe_read(2)
+                if delimiter != b"\r\n":
+                    self._close_conn()
+                    raise http.client.IncompleteRead(b"")
+            try:
+                chunk_left = self._read_next_chunk_size()
+            except ValueError:
+                raise http.client.IncompleteRead(b"") from None
+            if chunk_left == 0:
+                self._read_and_discard_trailer()
+                self._close_conn()
+                chunk_left = None
+            self.chunk_left = chunk_left
+        return chunk_left
+
+    def _read_chunked(self, amt=None):
+        # Keep the decoded buffer bounded even for responses split into tiny
+        # chunks; the caller requests only max_bytes + 1 to detect oversize.
+        if amt is not None and amt < 0:
+            amt = None
+        value = bytearray()
+        try:
+            while (chunk_left := self._get_chunk_left()) is not None:
+                if amt is not None and amt <= chunk_left:
+                    value.extend(self._safe_read(amt))
+                    self.chunk_left = chunk_left - amt
+                    break
+                value.extend(self._safe_read(chunk_left))
+                if amt is not None:
+                    amt -= chunk_left
+                self.chunk_left = 0
+            return bytes(value)
+        except http.client.IncompleteRead:
+            raise http.client.IncompleteRead(bytes(value)) from None
+
+    def _read_and_discard_trailer(self) -> None:
+        trailers_read = 0
+        while True:
+            line = self.fp.readline(_HTTP_LINE_LIMIT + 1)
+            if len(line) > _HTTP_LINE_LIMIT:
+                raise http.client.LineTooLong("trailer line")
+            if not line.endswith(b"\r\n"):
+                raise http.client.IncompleteRead(b"")
+            if line == b"\r\n":
+                return
+
+            field_name, separator, field_value = line[:-2].partition(b":")
+            if (
+                not separator
+                or not field_name
+                or any(char not in _HTTP_TOKEN_CHARS for char in field_name)
+                or any((char < 32 and char != 9) or char == 127 for char in field_value)
+                or field_name.lower() in {b"content-length", b"transfer-encoding"}
+            ):
+                raise http.client.IncompleteRead(b"")
+            trailers_read += 1
+            if trailers_read > _HTTP_TRAILER_LIMIT:
+                raise http.client.HTTPException("too many trailers")
+
+
+class _StrictHTTPConnection(http.client.HTTPConnection):
+    response_class = _StrictHTTPResponse
+
+
+class _StrictHTTPSConnection(http.client.HTTPSConnection):
+    response_class = _StrictHTTPResponse
+
+
+class _StrictHTTPHandler(urllib.request.HTTPHandler):
+    def http_open(self, req):
+        return self.do_open(_StrictHTTPConnection, req)
+
+
+class _StrictHTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self, req):
+        return self.do_open(_StrictHTTPSConnection, req, context=self._context)
+
+
 def _build_opener() -> urllib.request.OpenerDirector:
     # An empty ProxyHandler disables ambient proxy variables, so the request
     # goes exactly where the private configuration says.
-    return urllib.request.build_opener(urllib.request.ProxyHandler({}), _RefuseRedirect())
+    return urllib.request.build_opener(
+        urllib.request.ProxyHandler({}),
+        _StrictHTTPHandler(),
+        _StrictHTTPSHandler(),
+        _RefuseRedirect(),
+    )
 
 
 class DirectHttpSource:
@@ -311,7 +438,10 @@ class DirectHttpSource:
                 length_value = content_lengths[0].strip()
                 if not length_value.isascii() or not length_value.isdecimal():
                     raise SourceContractError(REF_FRAMING_INCOMPLETE, stage=stage) from None
-                expected = int(length_value)
+                try:
+                    expected = int(length_value)
+                except ValueError:
+                    raise SourceContractError(REF_FRAMING_INCOMPLETE, stage=stage) from None
                 if expected > max_bytes:
                     raise SourceContractError(oversize_ref, stage=stage)
                 if response.length != expected:

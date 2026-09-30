@@ -68,6 +68,33 @@ def chunked_body(payload: bytes) -> bytes:
     return f"{len(payload):X}\r\n".encode("ascii") + payload + b"\r\n0\r\n\r\n"
 
 
+def chunked_wire(
+    payload: bytes,
+    *,
+    first_delimiter: bytes = b"\r\n",
+    trailer_fields: bytes = b"",
+    trailer_terminator: bytes = b"\r\n",
+    first_extension: bytes = b"",
+) -> bytes:
+    split = max(1, len(payload) // 2)
+    if split == len(payload):
+        split -= 1
+    first = payload[:split]
+    second = payload[split:]
+    return (
+        f"{len(first):X}".encode("ascii")
+        + first_extension
+        + b"\r\n"
+        + first
+        + first_delimiter
+        + f"{len(second):X}\r\n".encode("ascii")
+        + second
+        + b"\r\n0\r\n"
+        + trailer_fields
+        + trailer_terminator
+    )
+
+
 class Deployment:
     """One private deployment: archive, state, temp, log roots and a config."""
 
@@ -649,6 +676,122 @@ class HttpFramingAdmission(DirectHttpCase):
                 f"{len(payload):X}\r\n".encode("ascii") + payload[:3],
             ),
         }
+
+    def _strict_chunk_cases(self, payload: bytes, content_type: str) -> dict[str, object]:
+        headers = [
+            ("Content-Type", content_type),
+            ("Transfer-Encoding", "chunked"),
+        ]
+        return {
+            "wrong two-byte chunk delimiter": raw_response(
+                headers,
+                chunked_wire(payload, first_delimiter=b"XY"),
+            ),
+            "lone-LF chunk delimiter": raw_response(
+                headers,
+                chunked_wire(payload, first_delimiter=b"\n "),
+            ),
+            "zero chunk missing trailer terminator": raw_response(
+                headers,
+                chunked_wire(payload, trailer_terminator=b""),
+            ),
+            "trailer content missing terminator": raw_response(
+                headers,
+                chunked_wire(
+                    payload,
+                    trailer_fields=b"X-Synthetic: partial\r\n",
+                    trailer_terminator=b"",
+                ),
+            ),
+            "lone-LF trailer terminator": raw_response(
+                headers,
+                chunked_wire(
+                    payload,
+                    trailer_fields=b"X-Synthetic: value\n",
+                    trailer_terminator=b"\n",
+                ),
+            ),
+        }
+
+    def _excessive_content_length(self, payload: bytes, content_type: str) -> object:
+        get_digit_limit = getattr(sys, "get_int_max_str_digits", None)
+        if get_digit_limit is None or get_digit_limit() == 0:
+            self.skipTest("this Python runtime has no integer string conversion digit limit")
+        length = "9" * (get_digit_limit() + 1)
+        return raw_response(
+            [("Content-Type", content_type), ("Content-Length", length)],
+            payload,
+        )
+
+    def test_list_rejects_malformed_chunk_wire_delimiters_and_trailers(self) -> None:
+        self._assert_cases(
+            "list",
+            list(self._strict_chunk_cases(self._list_payload(), "application/json").items()),
+        )
+
+    def test_fetch_rejects_malformed_chunk_wire_delimiters_and_trailers(self) -> None:
+        self._assert_cases(
+            "fetch",
+            list(self._strict_chunk_cases(synthetic_pdf(b"framing-test"), "application/pdf").items()),
+        )
+
+    def test_list_rejects_excessive_content_length_without_retry(self) -> None:
+        self._assert_framing_incomplete(
+            "list",
+            self._excessive_content_length(self._list_payload(), "application/json"),
+        )
+
+    def test_fetch_rejects_excessive_content_length_without_retry(self) -> None:
+        self._assert_framing_incomplete(
+            "fetch",
+            self._excessive_content_length(synthetic_pdf(b"framing-test"), "application/pdf"),
+        )
+
+    def test_parser_decoded_chunked_response_accepts_valid_extensions_and_trailer(self) -> None:
+        body = self._list_payload()
+        self.service_state.list_queue = [
+            raw_response(
+                [("Content-Type", "application/json"), ("Transfer-Encoding", "chunked")],
+                chunked_wire(
+                    body,
+                    first_extension=b';name=token;quoted="a b"',
+                    trailer_fields=b"X-Synthetic: accepted\r\n",
+                ),
+            )
+        ]
+        with tempfile.TemporaryDirectory() as case_root:
+            deployment = Deployment(Path(case_root), self.service)
+            code, document = deployment.run()
+            self.assertEqual(0, code, document)
+            self.assertEqual(4, len(deployment.archived()))
+            self.assertEqual(1, len(self.service_state.list_requests))
+            self.assertEqual(4, len(self.service_state.fetch_requests))
+
+    def test_chunked_fetch_oversize_is_rejected_without_publication_or_state(self) -> None:
+        payload = b"X" * 512
+        wire = b"".join(b"1\r\nX\r\n" for _ in payload) + b"0\r\n\r\n"
+        self.service_state.fetch_queue = {
+            bill_name(0): [
+                raw_response(
+                    [("Content-Type", "application/pdf"), ("Transfer-Encoding", "chunked")],
+                    wire,
+                )
+            ]
+        }
+        with tempfile.TemporaryDirectory() as case_root:
+            deployment = Deployment(Path(case_root), self.service)
+            with mock.patch.object(http_source, "MAX_PDF_BYTES", 64):
+                code, document = deployment.run()
+
+            self.assertEqual(20, code, document)
+            failures = [event for event in deployment.log_events() if event["phase"] == "invoice_failure"]
+            self.assertEqual(1, len(failures))
+            self.assertEqual("EG_HTTP_FETCH_OVERSIZE", failures[0].get("support_ref"))
+            self.assertEqual(1, len(self.service_state.list_requests))
+            self.assertEqual(1, len(self.service_state.fetch_requests))
+            self.assertEqual([], deployment.archived())
+            self.assertEqual([], deployment.state_rows())
+            self.assertEqual([], deployment.temp_entries())
 
     def test_list_rejects_unsupported_or_ambiguous_transfer_encoding(self) -> None:
         cases = self._framing_cases(self._list_payload(), "application/json")
