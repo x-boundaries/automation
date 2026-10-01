@@ -6053,16 +6053,19 @@ class MemberWorkerPathChainCompositionTests(unittest.TestCase):
 
     report: dict[str, object]
     leaf: PureWindowsPath
+    _scratch_dir = None
 
     @classmethod
     def setUpClass(cls) -> None:
         pwsh = _resolve_native_powershell()
         if not pwsh:
             raise unittest.SkipTest("Windows PowerShell is required for path-chain composition validation")
-        with tempfile.TemporaryDirectory(prefix="xb-path-chain-") as temp_dir:
-            harness = Path(temp_dir) / "path_chain_harness.ps1"
+        cls._scratch_dir = tempfile.TemporaryDirectory(prefix="xb-path-chain-")
+        try:
+            temp_dir = Path(cls._scratch_dir.name)
+            harness = temp_dir / "path_chain_harness.ps1"
             harness.write_text(_PATH_CHAIN_HARNESS, encoding="utf-8", newline="\n")
-            leaf = Path(temp_dir) / "chain" / "parent" / "leaf"
+            leaf = temp_dir / "chain" / "parent" / "leaf"
             leaf.mkdir(parents=True)
             cls.leaf = PureWindowsPath(str(leaf))
             completed = subprocess.run(
@@ -6078,9 +6081,19 @@ class MemberWorkerPathChainCompositionTests(unittest.TestCase):
                 text=True,
                 timeout=300,
             )
-        if completed.returncode != 0:
-            raise AssertionError(completed.stdout + completed.stderr)
-        cls.report = json.loads(completed.stdout)
+            if completed.returncode != 0:
+                raise AssertionError(completed.stdout + completed.stderr)
+            cls.report = json.loads(completed.stdout)
+        except BaseException:
+            cls._scratch_dir.cleanup()
+            cls._scratch_dir = None
+            raise
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        if cls._scratch_dir is not None:
+            cls._scratch_dir.cleanup()
+            cls._scratch_dir = None
 
     def _expected_chain(self) -> list[str]:
         chain = [self.leaf.anchor]
@@ -6088,18 +6101,41 @@ class MemberWorkerPathChainCompositionTests(unittest.TestCase):
             chain.append(str(PureWindowsPath(chain[-1], part)))
         return chain
 
-    def _expected_checks(self) -> list[str]:
+    def _expected_checks(self) -> list[tuple[str, str]]:
         chain = self._expected_chain()
-        checks: list[str] = []
+        checks: list[tuple[str, str]] = []
         for index in range(len(chain) - 1, -1, -1):
-            checks.append(f"{chain[index]}|0x00010000")
+            checks.append((chain[index], "0x00010000"))
             if index > 0:
-                checks.append(f"{chain[index - 1]}|0x00000040")
+                checks.append((chain[index - 1], "0x00000040"))
         return checks
+
+    def _assert_same_path_objects(self, actual: object, expected: list[str]) -> None:
+        self.assertIsInstance(actual, list)
+        self.assertEqual(len(actual), len(expected))
+        for index, (actual_path, expected_path) in enumerate(zip(actual, expected)):
+            self.assertIs(type(actual_path), str, f"path at chain position {index} is not an individual string")
+            try:
+                same_object = os.path.samefile(actual_path, expected_path)
+            except OSError as exc:
+                self.fail(f"could not resolve filesystem identity at chain position {index}: {type(exc).__name__}")
+            self.assertTrue(same_object, f"path at chain position {index} resolves to a different filesystem object")
+
+    def _assert_checks_match(self, actual: object, expected: list[tuple[str, str]]) -> None:
+        self.assertIsInstance(actual, list)
+        self.assertEqual(len(actual), len(expected))
+        for index, (actual_check, (expected_path, expected_mask)) in enumerate(zip(actual, expected)):
+            self.assertIs(type(actual_check), str, f"probe at position {index} is not an individual string")
+            path_and_mask = actual_check.rsplit("|", 1)
+            if len(path_and_mask) != 2:
+                self.fail(f"probe at position {index} does not contain a path and access mask")
+            actual_path, actual_mask = path_and_mask
+            self.assertEqual(actual_mask, expected_mask, f"access mask differs at probe position {index}")
+            self._assert_same_path_objects([actual_path], [expected_path])
 
     def test_direct_assignment_yields_ordered_individual_string_paths(self) -> None:
         expected = self._expected_chain()
-        self.assertEqual(self.report["direct_chain"], expected)
+        self._assert_same_path_objects(self.report["direct_chain"], expected)
         self.assertEqual(self.report["direct_count"], len(expected))
         self.assertEqual(self.report["direct_element_types"], ["System.String"])
 
@@ -6117,7 +6153,9 @@ class MemberWorkerPathChainCompositionTests(unittest.TestCase):
 
     def test_safe_chain_passes_after_every_per_element_native_check(self) -> None:
         self.assertTrue(self.report["token_restricted"])
-        self.assertEqual(self.report["pass_case"], {"outcome": "pass", "checks": self._expected_checks()})
+        self.assertEqual(set(self.report["pass_case"]), {"outcome", "checks"})
+        self.assertEqual(self.report["pass_case"]["outcome"], "pass")
+        self._assert_checks_match(self.report["pass_case"]["checks"], self._expected_checks())
         self.assertEqual(self.report["restored_pass"], "pass")
 
     def test_granted_delete_or_delete_child_is_exceeded(self) -> None:
@@ -6132,13 +6170,13 @@ class MemberWorkerPathChainCompositionTests(unittest.TestCase):
                 case = self.report[key]
                 self.assertTrue(case["requested_operation_granted"], case)
                 self.assertEqual(case["outcome"], "effective_rights_exceeded")
-                self.assertEqual(case["checks"], reached)
+                self._assert_checks_match(case["checks"], reached)
 
     def test_native_and_shape_failures_stay_unproven(self) -> None:
         for key in ("forced_native_failure", "disposed_token"):
             with self.subTest(case=key):
                 self.assertEqual(self.report[key]["outcome"], "effective_rights_unproven")
-                self.assertEqual(self.report[key]["checks"], self._expected_checks()[:1])
+                self._assert_checks_match(self.report[key]["checks"], self._expected_checks()[:1])
         for key in ("missing_path", "nested_chain_guard", "empty_element_guard"):
             with self.subTest(case=key):
                 self.assertEqual(self.report[key], {"outcome": "effective_rights_unproven", "checks": []})
