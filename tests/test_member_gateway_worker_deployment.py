@@ -44,7 +44,7 @@ BOOLEAN_ORDER = (
 
 
 PROTECTED_WORKER_BLOBS = {
-    "scripts/install_ac2_member_gateway_worker.ps1": "2037231e434cb1c6a55c961a9bbb87bb0ff35ecd",
+    "scripts/install_ac2_member_gateway_worker.ps1": "6c6c2f9ef88e8fd6fbdd194b2ea5fe52baf61bad",
     "scripts/ac2_member_gateway_worker.ps1": "ba8aeb169e86ae42dfe007f43c1d3786e63c13c0",
     "scripts/ac2_member_gateway_worker_lib.ps1": "8293559ec6308a8d9afdf73fd4c8b0af322ae382",
     "scripts/ac2_member_gateway_autocount_adapter.ps1": "82120047e7d07bbe3e484c3207892b4c9859b3df",
@@ -5857,6 +5857,291 @@ class MemberWorkerReleaseIntegrityTests(unittest.TestCase):
         for step in ("Assert-XbWorkerInstallLayout", "Get-XbReleaseIdentityFromRoot", "Assert-XbReleaseContent", "Assert-XbWorkerTaskContract", "Assert-XbRuntimeCustody", "Assert-XbWorkerEffectiveRights"):
             self.assertIn(step, verifier)
         self.assertNotIn("ac2_member_test_cleanup.ps1", source)
+
+
+# CI7 parent/ancestor delete composition over a real scratch path chain. The
+# caller's token restricted to Everyone (S-1-1-0) is used as a disposable native
+# AccessCheck subject: it needs no privilege or password, and on a standard temp
+# chain it holds neither DELETE nor DELETE_CHILD until the harness grants one.
+_PATH_CHAIN_HARNESS = r'''[CmdletBinding()]
+param(
+    [Parameter(Mandatory)][string]$InstallerPath,
+    [Parameter(Mandatory)][string]$LeafPath
+)
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+. $InstallerPath -LibraryOnly
+$out = [ordered]@{}
+function Get-XbOutcome {
+    param([Parameter(Mandatory)][scriptblock]$Body)
+    try { $null = & $Body; return "pass" } catch { return [string]$_.Exception.Message }
+}
+
+Add-Type -Language CSharp -TypeDefinition @"
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+
+public sealed class XbTestAccessResult
+{
+    public bool Allowed { get; private set; }
+    public uint GrantedAccess { get; private set; }
+    public XbTestAccessResult(bool allowed, uint granted) { Allowed = allowed; GrantedAccess = granted; }
+}
+
+public sealed class XbTestRestrictedToken : IDisposable
+{
+    [StructLayout(LayoutKind.Sequential)]
+    private struct GenericMapping { public uint GenericRead, GenericWrite, GenericExecute, GenericAll; }
+    [StructLayout(LayoutKind.Sequential)]
+    private struct SidAndAttributes { public IntPtr Sid; public uint Attributes; }
+
+    [DllImport("kernel32.dll")] private static extern IntPtr GetCurrentProcess();
+    [DllImport("kernel32.dll", SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool CloseHandle(IntPtr handle);
+    [DllImport("kernel32.dll")] private static extern IntPtr LocalFree(IntPtr memory);
+    [DllImport("advapi32.dll", SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool OpenProcessToken(IntPtr process, uint access, out IntPtr token);
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool ConvertStringSidToSid(string stringSid, out IntPtr sid);
+    [DllImport("advapi32.dll", SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool CreateRestrictedToken(IntPtr existing, uint flags, uint disableCount, IntPtr sidsToDisable,
+        uint deleteCount, IntPtr privilegesToDelete, uint restrictCount, [In] SidAndAttributes[] sidsToRestrict, out IntPtr token);
+    [DllImport("advapi32.dll", SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool DuplicateTokenEx(IntPtr source, uint access, IntPtr attributes, int level, int type, out IntPtr token);
+    [DllImport("advapi32.dll", SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool IsTokenRestricted(IntPtr token);
+    [DllImport("advapi32.dll", SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool AccessCheck(IntPtr securityDescriptor, IntPtr clientToken, uint desiredAccess,
+        ref GenericMapping genericMapping, IntPtr privilegeSet, ref uint privilegeSetLength,
+        out uint grantedAccess, [MarshalAs(UnmanagedType.Bool)] out bool accessAllowed);
+
+    private IntPtr token;
+    public bool Restricted { get; private set; }
+
+    // Current process token restricted to Everyone: effective access is the intersection
+    // of the normal check and an Everyone-only check, at the caller's integrity level.
+    public XbTestRestrictedToken()
+    {
+        IntPtr process = IntPtr.Zero, everyone = IntPtr.Zero, restricted = IntPtr.Zero;
+        try
+        {
+            if (!OpenProcessToken(GetCurrentProcess(), 0x000A, out process)) throw new Win32Exception(Marshal.GetLastWin32Error());
+            if (!ConvertStringSidToSid("S-1-1-0", out everyone)) throw new Win32Exception(Marshal.GetLastWin32Error());
+            SidAndAttributes[] restrict = new SidAndAttributes[1];
+            restrict[0].Sid = everyone;
+            if (!CreateRestrictedToken(process, 0, 0, IntPtr.Zero, 0, IntPtr.Zero, 1, restrict, out restricted))
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            if (!DuplicateTokenEx(restricted, 0x0008, IntPtr.Zero, 2, 2, out token)) throw new Win32Exception(Marshal.GetLastWin32Error());
+            Restricted = IsTokenRestricted(token);
+        }
+        finally
+        {
+            if (restricted != IntPtr.Zero) CloseHandle(restricted);
+            if (everyone != IntPtr.Zero) LocalFree(everyone);
+            if (process != IntPtr.Zero) CloseHandle(process);
+        }
+    }
+
+    // Same AccessCheck call shape as the installer's XbWorkerBatchToken.Check.
+    public XbTestAccessResult Check(byte[] securityDescriptorBytes, uint desiredAccess)
+    {
+        if (token == IntPtr.Zero || securityDescriptorBytes == null || securityDescriptorBytes.Length < 20)
+            throw new InvalidOperationException("access_check_input_unproven");
+        IntPtr securityDescriptor = Marshal.AllocHGlobal(securityDescriptorBytes.Length);
+        IntPtr privilegeSet = Marshal.AllocHGlobal(256);
+        try
+        {
+            Marshal.Copy(securityDescriptorBytes, 0, securityDescriptor, securityDescriptorBytes.Length);
+            GenericMapping mapping = new GenericMapping();
+            mapping.GenericRead = 0x00120089;
+            mapping.GenericWrite = 0x00120116;
+            mapping.GenericExecute = 0x001200A0;
+            mapping.GenericAll = 0x001F01FF;
+            uint privilegeSetLength = 256;
+            uint granted;
+            bool allowed;
+            if (!AccessCheck(securityDescriptor, token, desiredAccess, ref mapping, privilegeSet, ref privilegeSetLength, out granted, out allowed))
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            return new XbTestAccessResult(allowed, granted);
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(privilegeSet);
+            Marshal.FreeHGlobal(securityDescriptor);
+        }
+    }
+
+    public void Dispose()
+    {
+        if (token == IntPtr.Zero) return;
+        CloseHandle(token);
+        token = IntPtr.Zero;
+    }
+}
+"@
+
+# Record every native check Assert-XbPathNotDeleteable reaches, then delegate to the real one.
+$script:nativeChecks = New-Object System.Collections.Generic.List[string]
+$originalAccessCheck = ${function:Invoke-XbNativeAccessCheck}
+Set-Item function:script:Invoke-XbNativeAccessCheck {
+    param([string]$Path, $Token, [uint32]$DesiredAccess)
+    $script:nativeChecks.Add(("{0}|0x{1:X8}" -f $Path, $DesiredAccess))
+    & $originalAccessCheck -Path $Path -Token $Token -DesiredAccess $DesiredAccess
+}
+function Get-XbRecordedOutcome {
+    param([Parameter(Mandatory)][scriptblock]$Body)
+    $script:nativeChecks.Clear()
+    $outcome = Get-XbOutcome $Body
+    return [ordered]@{ outcome = $outcome; checks = @($script:nativeChecks) }
+}
+
+$parentPath = Split-Path -Parent $LeafPath
+$ancestorPath = Split-Path -Parent $parentPath
+$everyoneSid = [Security.Principal.SecurityIdentifier]::new("S-1-1-0")
+function Invoke-XbGrantProbe {
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][Security.AccessControl.FileSystemRights]$Rights, [Parameter(Mandatory)][uint32]$DesiredAccess)
+    $original = Get-Acl -LiteralPath $Path
+    try {
+        $changed = Get-Acl -LiteralPath $Path
+        $changed.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($everyoneSid, $Rights, [Security.AccessControl.AccessControlType]::Allow))
+        Set-Acl -LiteralPath $Path -AclObject $changed
+        $granted = Test-XbNativeAccessAllowed -Path $Path -Token $token -DesiredAccess $DesiredAccess
+        $result = Get-XbRecordedOutcome { Assert-XbPathNotDeleteable -Path $LeafPath -Token $token }
+        $result.requested_operation_granted = [bool]$granted
+        return $result
+    } finally { Set-Acl -LiteralPath $Path -AclObject $original }
+}
+
+$direct = Get-XbNativePathChain -Path $LeafPath
+$out.direct_chain = @($direct | ForEach-Object { [string]$_ })
+$out.direct_count = $direct.Count
+$out.direct_element_types = @($direct | ForEach-Object { $_.GetType().FullName } | Sort-Object -Unique)
+$wrapped = @(Get-XbNativePathChain -Path $LeafPath)
+$out.wrapped_count = $wrapped.Count
+$out.wrapped_first_type = $wrapped[0].GetType().FullName
+
+$token = [XbTestRestrictedToken]::new()
+try {
+    $out.token_restricted = $token.Restricted
+    $out.pass_case = Get-XbRecordedOutcome { Assert-XbPathNotDeleteable -Path $LeafPath -Token $token }
+    $out.leaf_delete = Invoke-XbGrantProbe -Path $LeafPath -Rights ([Security.AccessControl.FileSystemRights]::Delete) -DesiredAccess ([uint32]0x00010000)
+    $out.parent_delete_child = Invoke-XbGrantProbe -Path $parentPath -Rights ([Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles) -DesiredAccess ([uint32]0x00000040)
+    $out.ancestor_delete = Invoke-XbGrantProbe -Path $ancestorPath -Rights ([Security.AccessControl.FileSystemRights]::Delete) -DesiredAccess ([uint32]0x00010000)
+    $out.restored_pass = (Get-XbRecordedOutcome { Assert-XbPathNotDeleteable -Path $LeafPath -Token $token }).outcome
+
+    $throwingToken = [pscustomobject]@{}
+    $throwingToken | Add-Member -MemberType ScriptMethod -Name Check -Value { param($Descriptor, $Access) throw "forced_native_check_failure" }
+    $out.forced_native_failure = Get-XbRecordedOutcome { Assert-XbPathNotDeleteable -Path $LeafPath -Token $throwingToken }
+    $out.missing_path = Get-XbRecordedOutcome { Assert-XbPathNotDeleteable -Path (Join-Path $LeafPath "absent") -Token $token }
+
+    $originalChain = ${function:Get-XbNativePathChain}
+    try {
+        Set-Item function:script:Get-XbNativePathChain { param([string]$Path) return ,@(,@("C:\", "C:\Windows")) }
+        $out.nested_chain_guard = Get-XbRecordedOutcome { Assert-XbPathNotDeleteable -Path $LeafPath -Token $token }
+        Set-Item function:script:Get-XbNativePathChain { param([string]$Path) return ,@("C:\", "") }
+        $out.empty_element_guard = Get-XbRecordedOutcome { Assert-XbPathNotDeleteable -Path $LeafPath -Token $token }
+    } finally { Set-Item function:script:Get-XbNativePathChain $originalChain }
+} finally { $token.Dispose() }
+$out.disposed_token = Get-XbRecordedOutcome { Assert-XbPathNotDeleteable -Path $LeafPath -Token $token }
+[Console]::Out.Write(($out | ConvertTo-Json -Depth 8 -Compress))
+'''
+
+
+class MemberWorkerPathChainCompositionTests(unittest.TestCase):
+    """CI7 parent/ancestor delete composition consumes individual chain paths and reaches native AccessCheck."""
+
+    report: dict[str, object]
+    leaf: PureWindowsPath
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        pwsh = _resolve_native_powershell()
+        if not pwsh:
+            raise unittest.SkipTest("Windows PowerShell is required for path-chain composition validation")
+        with tempfile.TemporaryDirectory(prefix="xb-path-chain-") as temp_dir:
+            harness = Path(temp_dir) / "path_chain_harness.ps1"
+            harness.write_text(_PATH_CHAIN_HARNESS, encoding="utf-8", newline="\n")
+            leaf = Path(temp_dir) / "chain" / "parent" / "leaf"
+            leaf.mkdir(parents=True)
+            cls.leaf = PureWindowsPath(str(leaf))
+            completed = subprocess.run(
+                [
+                    pwsh, "-ExecutionPolicy", "Bypass", "-NoLogo", "-NoProfile", "-NonInteractive",
+                    "-File", str(harness),
+                    "-InstallerPath", str(ROOT / INSTALLER_PATH),
+                    "-LeafPath", str(leaf),
+                ],
+                cwd=ROOT,
+                env=_windows_powershell_module_environment(),
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+        if completed.returncode != 0:
+            raise AssertionError(completed.stdout + completed.stderr)
+        cls.report = json.loads(completed.stdout)
+
+    def _expected_chain(self) -> list[str]:
+        chain = [self.leaf.anchor]
+        for part in self.leaf.parts[1:]:
+            chain.append(str(PureWindowsPath(chain[-1], part)))
+        return chain
+
+    def _expected_checks(self) -> list[str]:
+        chain = self._expected_chain()
+        checks: list[str] = []
+        for index in range(len(chain) - 1, -1, -1):
+            checks.append(f"{chain[index]}|0x00010000")
+            if index > 0:
+                checks.append(f"{chain[index - 1]}|0x00000040")
+        return checks
+
+    def test_direct_assignment_yields_ordered_individual_string_paths(self) -> None:
+        expected = self._expected_chain()
+        self.assertEqual(self.report["direct_chain"], expected)
+        self.assertEqual(self.report["direct_count"], len(expected))
+        self.assertEqual(self.report["direct_element_types"], ["System.String"])
+
+    def test_outer_array_wrapper_would_nest_the_chain(self) -> None:
+        # Pins the Windows PowerShell 5.1 semantics behind the corrected defect.
+        self.assertEqual(self.report["wrapped_count"], 1)
+        self.assertEqual(self.report["wrapped_first_type"], "System.Object[]")
+
+    def test_consumer_uses_direct_assignment_and_producer_shape_is_preserved(self) -> None:
+        source = (ROOT / INSTALLER_PATH).read_text(encoding="utf-8")
+        consumer = _installer_function(source, "Assert-XbPathNotDeleteable")
+        self.assertNotIn("@(Get-XbNativePathChain", consumer)
+        self.assertIn("$chain = Get-XbNativePathChain -Path $Path", consumer)
+        self.assertIn("return ,$chain", _installer_function(source, "Get-XbNativePathChain"))
+
+    def test_safe_chain_passes_after_every_per_element_native_check(self) -> None:
+        self.assertTrue(self.report["token_restricted"])
+        self.assertEqual(self.report["pass_case"], {"outcome": "pass", "checks": self._expected_checks()})
+        self.assertEqual(self.report["restored_pass"], "pass")
+
+    def test_granted_delete_or_delete_child_is_exceeded(self) -> None:
+        checks = self._expected_checks()
+        cases = {
+            "leaf_delete": checks[:1],
+            "parent_delete_child": checks[:2],
+            "ancestor_delete": checks[:5],
+        }
+        for key, reached in cases.items():
+            with self.subTest(case=key):
+                case = self.report[key]
+                self.assertTrue(case["requested_operation_granted"], case)
+                self.assertEqual(case["outcome"], "effective_rights_exceeded")
+                self.assertEqual(case["checks"], reached)
+
+    def test_native_and_shape_failures_stay_unproven(self) -> None:
+        for key in ("forced_native_failure", "disposed_token"):
+            with self.subTest(case=key):
+                self.assertEqual(self.report[key]["outcome"], "effective_rights_unproven")
+                self.assertEqual(self.report[key]["checks"], self._expected_checks()[:1])
+        for key in ("missing_path", "nested_chain_guard", "empty_element_guard"):
+            with self.subTest(case=key):
+                self.assertEqual(self.report[key], {"outcome": "effective_rights_unproven", "checks": []})
 
 
 if __name__ == "__main__":

@@ -1008,7 +1008,13 @@ function Assert-XbPathNotDeleteable {
         [Parameter(Mandatory)]$Token
     )
 
-    $chain = @(Get-XbNativePathChain -Path $Path)
+    # Direct assignment: Get-XbNativePathChain returns ,$chain, so wrapping it in
+    # @(...) would nest the whole chain as one element under Windows PowerShell 5.1.
+    $chain = Get-XbNativePathChain -Path $Path
+    if ($null -eq $chain -or $chain.Count -lt 1) { throw "effective_rights_unproven" }
+    foreach ($element in $chain) {
+        if ($element -isnot [string] -or [string]::IsNullOrWhiteSpace($element)) { throw "effective_rights_unproven" }
+    }
     for ($index = $chain.Count - 1; $index -ge 0; $index--) {
         if (Test-XbNativeAccessAllowed -Path $chain[$index] -Token $Token -DesiredAccess ([uint32]0x00010000)) {
             throw "effective_rights_exceeded"
