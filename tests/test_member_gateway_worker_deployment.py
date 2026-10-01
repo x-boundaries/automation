@@ -50,7 +50,7 @@ PROTECTED_WORKER_BLOBS = {
     "scripts/ac2_member_gateway_autocount_adapter.ps1": "82120047e7d07bbe3e484c3207892b4c9859b3df",
     "scripts/launch_ac2_member_gateway_worker.ps1": "64174f398cac61cc2a19f35eaf64070a7b10be0d",
     "scripts/test_ac2_member_gateway_autocount_dependencies.ps1": "4ac24e79c23a70d20ef78cdff921a230c80cff05",
-    "scripts/ac2_member_create_primitive.ps1": "5d6397dba91caaa3819ee78219fb06cf02e672c8",
+    "scripts/ac2_member_create_primitive.ps1": "37d81d90c2ed7c9fabbc41022ee5bf898a5f6a33",
 }
 
 PROTECTED_WORKER_TREES = {

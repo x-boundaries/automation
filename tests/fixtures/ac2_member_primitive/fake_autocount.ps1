@@ -61,7 +61,10 @@ function New-XbFakeAutoCountBook {
         session_opened = 0
         save_mode = [string](Get-XbFakeValue $Case "save_mode" "normal")
         readback_mode = [string](Get-XbFakeValue $Case "readback_mode" "normal")
+        readback_created_time_mode = [string](Get-XbFakeValue $Case "readback_created_time_mode" "normal")
+        readback_created_user_mode = [string](Get-XbFakeValue $Case "readback_created_user_mode" "normal")
         probe_mode = [string](Get-XbFakeValue $Case "probe_mode" "normal")
+        prior_attempt_window_start_local = $firstClaimed.AddMinutes(-10).ToLocalTime().DateTime
         new_member_mode = [string](Get-XbFakeValue $Case "new_member_mode" "normal")
         iu = $IntegrationUserId
         created_guid = [string](Get-XbFakeValue $Case "created_guid" "0f1e2d3c-4b5a-4968-8778-a1b2c3d4e5f6")
@@ -92,8 +95,18 @@ function New-XbFakeAutoCountBook {
         if (-not $values.ContainsKey("CreatedUserID")) { $values.CreatedUserID = "STAFF_PLACEHOLDER" }
         $guid = Get-XbFakeValue $spec "Guid" $null
         $values.Guid = $(if ($null -eq $guid) { "00000000-0000-4000-8000-{0:d12}" -f $index } elseif ([string]$guid -eq "") { $null } else { [string]$guid })
-        $minutes = Get-XbFakeValue $spec "created_minutes" -100000
-        $values.CreatedTime = $firstClaimed.AddMinutes([double]$minutes).ToLocalTime().DateTime
+        $timeMode = [string](Get-XbFakeValue $spec "created_time_mode" "recent")
+        switch ($timeMode) {
+            "null" { $values.CreatedTime = $null }
+            "dbnull" { $values.CreatedTime = [DBNull]::Value }
+            "malformed" { $values.CreatedTime = "not-a-date" }
+            "non_datetime" { $values.CreatedTime = [long]123 }
+            default {
+                if ($timeMode -cne "recent") { throw "fake_created_time_mode_invalid" }
+                $minutes = Get-XbFakeValue $spec "created_minutes" -100000
+                $values.CreatedTime = $firstClaimed.AddMinutes([double]$minutes).ToLocalTime().DateTime
+            }
+        }
         [void](Add-XbFakeRow -Table $state.table -Values $values)
     }
 
@@ -104,6 +117,11 @@ function New-XbFakeAutoCountBook {
         if ($this.State.probe_mode -ceq "missing_column") {
             $copy = $this.State.table.Copy()
             $copy.Columns.Remove("CreatedUserID")
+            return ,$copy
+        }
+        if ($this.State.probe_mode -ceq "missing_created_time") {
+            $copy = $this.State.table.Copy()
+            $copy.Columns.Remove("CreatedTime")
             return ,$copy
         }
         return ,($this.State.table.Copy())
@@ -154,7 +172,24 @@ function New-XbFakeAutoCountBook {
         $this.State.getmember = [int]$this.State.getmember + 1
         if ($this.State.readback_mode -ceq "fail" -and [int]$this.State.saves -gt 0) { throw "fake_readback_failure" }
         foreach ($row in $this.State.table.Rows) {
-            if ([string]$row["MemberNo"] -eq $MemberNo) { return [pscustomobject]@{ Row = $row } }
+            if ([string]$row["MemberNo"] -eq $MemberNo) {
+                if ($this.State.saves -eq 0 -and $this.State.readback_created_user_mode -cne "normal") {
+                    switch ($this.State.readback_created_user_mode) {
+                        "wrong" { $row["CreatedUserID"] = "OTHER_USER_PLACEHOLDER" }
+                        default { throw "fake_readback_created_user_mode_invalid" }
+                    }
+                }
+                if ($this.State.saves -eq 0 -and $this.State.readback_created_time_mode -cne "normal") {
+                    switch ($this.State.readback_created_time_mode) {
+                        "null" { $row["CreatedTime"] = [DBNull]::Value }
+                        "malformed" { $row["CreatedTime"] = "not-a-date" }
+                        "old" { $row["CreatedTime"] = $this.State.prior_attempt_window_start_local.AddMinutes(-1) }
+                        "missing" { [void]$row.Table.Columns.Remove("CreatedTime") }
+                        default { throw "fake_readback_created_time_mode_invalid" }
+                    }
+                }
+                return [pscustomobject]@{ Row = $row }
+            }
         }
         return $null
     })

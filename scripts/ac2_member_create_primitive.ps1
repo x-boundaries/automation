@@ -371,8 +371,10 @@ function Get-XbAc2Decision {
     # R0: attempt >= 2 and our own recent rows exist in H union V.
     if ([long]$Request.attempt_no -ge 2) {
         $q = @($hv | Where-Object {
+            $createdTime = $_.Row.CreatedTime
             (Test-XbAc2SameText ([string]$_.Row.CreatedUserID) $IntegrationUserId) -and
-            ($null -eq $_.Row.CreatedTime -or $_.Row.CreatedTime -isnot [datetime] -or [datetime]$_.Row.CreatedTime -ge $WindowStartLocal)
+                ($createdTime -is [datetime]) -and
+                ($createdTime -ge $WindowStartLocal)
         })
         if ($q.Count -gt 0) {
             if ($q.Count -eq 1) {
@@ -609,7 +611,10 @@ function Invoke-XbAc2MemberCreatePrimitive {
             $expected = Get-XbAutoCountExpectedMemberRecord -Member (Get-XbAc2MemberFields -Request $request -MemberNo $decision.MemberNo)
             $check = Compare-XbAutoCountMemberReadBack -Expected $expected -Actual $existing
             $audit = Get-XbAutoCountMemberAudit -Entity $existing
-            if ($check.Found -and $check.Match -and $null -ne $audit -and $audit.Guid -ne "" -and (Test-XbAc2SameText $audit.CreatedUserID $iu)) {
+            if ($check.Found -and $check.Match -and $null -ne $audit -and $audit.Guid -ne "" -and
+                (Test-XbAc2SameText $audit.CreatedUserID $iu) -and
+                ($audit.CreatedTime -is [datetime]) -and
+                ($audit.CreatedTime -ge $windowStartLocal)) {
                 return (New-XbAc2PrimitiveResult -Outcome "CREATED_VERIFIED_PRIOR_ATTEMPT" -Rule "R0" -Branch (Get-XbAc2BranchFor -Request $request -MemberNo $decision.MemberNo) -MemberNo $decision.MemberNo -MemberGuid $audit.Guid -DqFlags $state.flags -ReleaseSha256 $release)
             }
             return (New-XbAc2PrimitiveResult -Outcome "MANUAL_REVIEW" -Rule "R0" -ReasonCode "prior_attempt_ambiguous" -DqFlags $state.flags -ReleaseSha256 $release)

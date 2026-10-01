@@ -109,11 +109,24 @@ CASES = [
     case("malformed_member_no_flag", rows=[{"MemberNo": "9.1234567E+07", "MobilePhone": "", "Name": "Sci Notation", "EmailAddress": "s@example.test"}]),
     # R0 (D5).
     case("r0_prior_attempt_verified", req=request(attempt_no=2), rows=[{"MemberNo": "91234567", "from_request": True, "CreatedUserID": IU, "created_minutes": 1}]),
+    case("r0_exact_threshold", req=request(attempt_no=2), rows=[{"MemberNo": "91234567", "from_request": True, "CreatedUserID": IU, "created_minutes": -10}]),
     case("r0_prior_attempt_name_appended", req=request(attempt_no=2), rows=[OTHER | {"MemberNo": "81234567", "MobilePhone": "91234567"}, {"MemberNo": "91234567TANAHKOW", "from_request": True, "CreatedUserID": IU, "created_minutes": 2}]),
     case("r0_staff_edited_prior_row", req=request(attempt_no=2), rows=[{"MemberNo": "91234567", "from_request": True, "Name": "Edited By Staff", "EmailAddress": "edited@example.test", "CreatedUserID": IU, "created_minutes": 1}]),
     case("r0_two_candidates", req=request(attempt_no=2), rows=[{"MemberNo": "91234567", "from_request": True, "CreatedUserID": IU, "created_minutes": 1}, {"MemberNo": "91234567TANAHKOW", "from_request": True, "CreatedUserID": IU, "created_minutes": 2}]),
     case("r0_member_no_not_candidate", req=request(attempt_no=2), rows=[{"MemberNo": "X91234567", "from_request": True, "CreatedUserID": IU, "created_minutes": 1}]),
     case("r0_window_excludes_old_rows", req=request(attempt_no=2), rows=[{"MemberNo": "91234567", "from_request": True, "CreatedUserID": IU, "created_minutes": -11}]),
+    case("r0_wrong_creator", req=request(attempt_no=2), rows=[{"MemberNo": "91234567", "from_request": True, "CreatedUserID": "OTHER_USER_PLACEHOLDER", "created_minutes": 1}]),
+    case("r0_null_created_time", req=request(attempt_no=2), rows=[{"MemberNo": "91234567", "from_request": True, "CreatedUserID": IU, "created_time_mode": "null"}]),
+    case("r0_dbnull_created_time", req=request(attempt_no=2), rows=[{"MemberNo": "91234567", "from_request": True, "CreatedUserID": IU, "created_time_mode": "dbnull"}]),
+    case("r0_malformed_created_time", req=request(attempt_no=2), rows=[{"MemberNo": "91234567", "from_request": True, "CreatedUserID": IU, "created_time_mode": "malformed"}]),
+    case("r0_non_datetime_created_time", req=request(attempt_no=2), rows=[{"MemberNo": "91234567", "from_request": True, "CreatedUserID": IU, "created_time_mode": "non_datetime"}]),
+    case("r0_missing_created_time_column", req=request(attempt_no=2), probe_mode="missing_created_time", rows=[{"MemberNo": "91234567", "from_request": True, "CreatedUserID": IU, "created_minutes": 1}]),
+    case("r0_readback_null_created_time", req=request(attempt_no=2), readback_created_time_mode="null", rows=[{"MemberNo": "91234567", "from_request": True, "CreatedUserID": IU, "created_minutes": 1}]),
+    case("r0_readback_malformed_created_time", req=request(attempt_no=2), readback_created_time_mode="malformed", rows=[{"MemberNo": "91234567", "from_request": True, "CreatedUserID": IU, "created_minutes": 1}]),
+    case("r0_readback_old_created_time", req=request(attempt_no=2), readback_created_time_mode="old", rows=[{"MemberNo": "91234567", "from_request": True, "CreatedUserID": IU, "created_minutes": 1}]),
+    case("r0_readback_missing_created_time", req=request(attempt_no=2), readback_created_time_mode="missing", rows=[{"MemberNo": "91234567", "from_request": True, "CreatedUserID": IU, "created_minutes": 1}]),
+    case("r0_readback_wrong_creator", req=request(attempt_no=2), readback_created_user_mode="wrong", rows=[{"MemberNo": "91234567", "from_request": True, "CreatedUserID": IU, "created_minutes": 1}]),
+    case("r0_readback_missing_guid", req=request(attempt_no=2), rows=[{"MemberNo": "91234567", "from_request": True, "CreatedUserID": IU, "Guid": "", "created_minutes": 1}]),
     case("r0_not_on_first_attempt", rows=[{"MemberNo": "91234567", "from_request": True, "CreatedUserID": IU, "created_minutes": 1}]),
     # P-SV 4.2 classification.
     case("sv_threw_after_commit_equal", save_mode="throw_after_commit"),
@@ -411,14 +424,59 @@ class Ac2MemberPrimitiveTests(unittest.TestCase):
         entry = self.assert_outcome("r0_prior_attempt_verified", "CREATED_VERIFIED_PRIOR_ATTEMPT", rule="R0", branch="BASE", saves=0)
         self.assertEqual(entry["result"]["member_no"], "91234567")
         self.assertIsNotNone(entry["result"]["member_guid"])
+        threshold = self.assert_outcome("r0_exact_threshold", "CREATED_VERIFIED_PRIOR_ATTEMPT", rule="R0", branch="BASE", saves=0)
+        self.assertEqual(threshold["result"]["member_no"], "91234567")
         entry = self.assert_outcome("r0_prior_attempt_name_appended", "CREATED_VERIFIED_PRIOR_ATTEMPT", rule="R0", branch="NAME_APPENDED", saves=0)
         self.assertEqual(entry["result"]["member_no"], "91234567TANAHKOW")
-        for name in ("r0_staff_edited_prior_row", "r0_two_candidates", "r0_member_no_not_candidate"):
+
+        for name in (
+            "r0_staff_edited_prior_row",
+            "r0_two_candidates",
+            "r0_member_no_not_candidate",
+            "r0_readback_null_created_time",
+            "r0_readback_malformed_created_time",
+            "r0_readback_old_created_time",
+            "r0_readback_missing_created_time",
+            "r0_readback_wrong_creator",
+            "r0_readback_missing_guid",
+        ):
             with self.subTest(name=name):
                 self.assert_outcome(name, "MANUAL_REVIEW", rule="R0", reason="prior_attempt_ambiguous", saves=0)
-        # Outside the W0 window, or on attempt 1, R0 does not apply and R2c links.
-        self.assert_outcome("r0_window_excludes_old_rows", "LINKED_EXISTING", rule="R2c", branch="EXISTING", saves=0)
-        self.assert_outcome("r0_not_on_first_attempt", "LINKED_EXISTING", rule="R2c", branch="EXISTING", saves=0)
+
+        # Rows that fail R0 eligibility keep the existing first-match route.
+        for name in (
+            "r0_window_excludes_old_rows",
+            "r0_wrong_creator",
+            "r0_null_created_time",
+            "r0_dbnull_created_time",
+            "r0_malformed_created_time",
+            "r0_non_datetime_created_time",
+            "r0_not_on_first_attempt",
+        ):
+            with self.subTest(name=name):
+                self.assert_outcome(name, "LINKED_EXISTING", rule="R2c", branch="EXISTING", saves=0)
+
+        self.assert_outcome("r0_missing_created_time_column", "FAILED_BEFORE_WRITE", reason="probe_unavailable", saves=0)
+        for name, entry in self.report["cases"].items():
+            if name.startswith("r0_"):
+                self.assertEqual(entry["saves"], 0, name)
+
+        for name in (
+            "r0_window_excludes_old_rows",
+            "r0_wrong_creator",
+            "r0_null_created_time",
+            "r0_dbnull_created_time",
+            "r0_malformed_created_time",
+            "r0_non_datetime_created_time",
+            "r0_readback_null_created_time",
+            "r0_readback_malformed_created_time",
+            "r0_readback_old_created_time",
+            "r0_readback_missing_created_time",
+            "r0_readback_wrong_creator",
+            "r0_readback_missing_guid",
+            "r0_missing_created_time_column",
+        ):
+            self.assertNotEqual(self.report["cases"][name]["result"]["outcome"], "CREATED_VERIFIED_PRIOR_ATTEMPT", name)
 
     # ---- P-SV ----------------------------------------------------------
     def test_post_save_classification_table(self):
