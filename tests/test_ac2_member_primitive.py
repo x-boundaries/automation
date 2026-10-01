@@ -181,6 +181,75 @@ CASES = [
     case("fi_guarded_readback_error", book="test", config={**TEST_CONFIG, "Fault": "readback_error"}, req=synthetic_request()),
 ]
 
+R0_ASSIGNED_FIELDS = (
+    "MemberNo", "MemberType", "Name", "MobilePhone", "EmailAddress", "DOB",
+    "RegisterDate", "ExpiryDate", "OpeningPoints", "IsActive", "Individual",
+)
+_R0_FINAL_ROW = [{"MemberNo": "91234567", "from_request": True, "CreatedUserID": IU, "created_minutes": 1}]
+SELECTED_R0_FINAL_CASES = [
+    "r0_final_getmember_exception",
+    "r0_final_row_absent",
+    "r0_final_guid_missing",
+    "r0_final_guid_dbnull",
+    "r0_final_guid_malformed",
+    "r0_final_guid_empty",
+    "r0_final_guid_changed",
+    "r0_final_creator_missing",
+    "r0_final_creator_dbnull",
+    "r0_final_creator_wrong",
+    "r0_final_time_null",
+    "r0_final_time_dbnull",
+    "r0_final_time_missing",
+    "r0_final_time_malformed",
+    "r0_final_time_non_datetime",
+    "r0_final_time_parseable_string",
+    "r0_final_time_one_tick_before_threshold",
+    "r0_final_compare_exception",
+    "r0_final_audit_exception",
+]
+CASES.extend([
+    case("r0_final_getmember_exception", req=request(attempt_no=2), rows=_R0_FINAL_ROW, final_readback_mode="throw"),
+    case("r0_final_row_absent", req=request(attempt_no=2), rows=_R0_FINAL_ROW, final_readback_mode="absent"),
+    *[
+        case(
+            f"r0_final_field_{field.casefold()}_mismatch",
+            req=request(attempt_no=2),
+            rows=_R0_FINAL_ROW,
+            final_readback_mutations={field: value},
+        )
+        for field, value in (
+            ("MemberNo", "91234567X"),
+            ("MemberType", "Gold"),
+            ("Name", "Changed Name"),
+            ("MobilePhone", "90000000"),
+            ("EmailAddress", "changed@example.test"),
+            ("DOB", "2001-01-01"),
+            ("RegisterDate", "2026-09-29"),
+            ("ExpiryDate", "2028-09-28"),
+            ("OpeningPoints", 1),
+            ("IsActive", "F"),
+            ("Individual", "F"),
+        )
+    ],
+    case("r0_final_guid_missing", req=request(attempt_no=2), rows=_R0_FINAL_ROW, final_readback_remove_columns=["Guid"]),
+    case("r0_final_guid_dbnull", req=request(attempt_no=2), rows=_R0_FINAL_ROW, final_readback_mutations={"Guid": "__DBNULL__"}),
+    case("r0_final_guid_malformed", req=request(attempt_no=2), rows=_R0_FINAL_ROW, final_readback_mutations={"Guid": "not-a-guid"}),
+    case("r0_final_guid_empty", req=request(attempt_no=2), rows=_R0_FINAL_ROW, final_readback_mutations={"Guid": ""}),
+    case("r0_final_guid_changed", req=request(attempt_no=2), rows=_R0_FINAL_ROW, final_readback_mutations={"Guid": "11111111-2222-4333-8444-555555555555"}),
+    case("r0_final_creator_missing", req=request(attempt_no=2), rows=_R0_FINAL_ROW, final_readback_remove_columns=["CreatedUserID"]),
+    case("r0_final_creator_dbnull", req=request(attempt_no=2), rows=_R0_FINAL_ROW, final_readback_mutations={"CreatedUserID": "__DBNULL__"}),
+    case("r0_final_creator_wrong", req=request(attempt_no=2), rows=_R0_FINAL_ROW, final_readback_mutations={"CreatedUserID": "OTHER_USER_PLACEHOLDER"}),
+    case("r0_final_time_null", req=request(attempt_no=2), rows=_R0_FINAL_ROW, final_readback_mutations={"CreatedTime": None}),
+    case("r0_final_time_dbnull", req=request(attempt_no=2), rows=_R0_FINAL_ROW, final_readback_mutations={"CreatedTime": "__DBNULL__"}),
+    case("r0_final_time_missing", req=request(attempt_no=2), rows=_R0_FINAL_ROW, final_readback_remove_columns=["CreatedTime"]),
+    case("r0_final_time_malformed", req=request(attempt_no=2), rows=_R0_FINAL_ROW, final_readback_mutations={"CreatedTime": "not-a-date"}),
+    case("r0_final_time_non_datetime", req=request(attempt_no=2), rows=_R0_FINAL_ROW, final_readback_mutations={"CreatedTime": 123}),
+    case("r0_final_time_parseable_string", req=request(attempt_no=2), rows=_R0_FINAL_ROW, final_readback_mutations={"CreatedTime": "2026-09-30T01:50:00Z"}),
+    case("r0_final_time_one_tick_before_threshold", req=request(attempt_no=2), rows=_R0_FINAL_ROW, final_readback_mutations={"CreatedTime": "__TICK_BEFORE_THRESHOLD__"}),
+    case("r0_final_compare_exception", req=request(attempt_no=2), rows=_R0_FINAL_ROW, final_readback_exception="compare"),
+    case("r0_final_audit_exception", req=request(attempt_no=2), rows=_R0_FINAL_ROW, final_readback_exception="audit"),
+])
+
 HARNESS = r"""
 [CmdletBinding()]
 param(
@@ -258,7 +327,21 @@ foreach ($case in $cases) {
     }
     if ($mode -eq "unavailable") { $handle = New-Object System.Threading.EventWaitHandle($false, [System.Threading.EventResetMode]::ManualReset, $mutexName) }
     if ($mode -eq "free_checked") { $handle = New-Object System.Threading.Mutex($false, $mutexName) }
-    $result = Invoke-XbAc2MemberCreatePrimitive -RequestLine $line -Book ([string]$case.book) -Config $config -EnableProductionAdapter -SessionFactory $fakeBook.SessionFactory -MemberCommandFactory $fakeBook.MemberCommandFactory -MutexName $mutexName -MutexWaitMilliseconds $wait -UtcNow $now
+    $originalCompare = ${function:Compare-XbAutoCountMemberReadBack}
+    $originalAudit = ${function:Get-XbAutoCountMemberAudit}
+    try {
+        if ([string](Get-XbFakeValue $case "final_readback_exception" "") -ceq "compare") {
+            Set-Item function:script:Compare-XbAutoCountMemberReadBack { param($Expected, $Actual) throw "fake_final_compare_exception" }
+        }
+        elseif ([string](Get-XbFakeValue $case "final_readback_exception" "") -ceq "audit") {
+            Set-Item function:script:Get-XbAutoCountMemberAudit { param($Entity) throw "fake_final_audit_exception" }
+        }
+        $result = Invoke-XbAc2MemberCreatePrimitive -RequestLine $line -Book ([string]$case.book) -Config $config -EnableProductionAdapter -SessionFactory $fakeBook.SessionFactory -MemberCommandFactory $fakeBook.MemberCommandFactory -MutexName $mutexName -MutexWaitMilliseconds $wait -UtcNow $now
+    }
+    finally {
+        Set-Item function:script:Compare-XbAutoCountMemberReadBack $originalCompare
+        Set-Item function:script:Get-XbAutoCountMemberAudit $originalAudit
+    }
     $freeAfter = $null
     if ($mode -eq "free_checked") { $freeAfter = Test-XbMutexFreeFromOtherProcess -Name $mutexName }
     if ($null -ne $holder) { if (-not $holder.HasExited) { $holder.Kill() }; [void]$holder.WaitForExit(20000) }
@@ -477,6 +560,22 @@ class Ac2MemberPrimitiveTests(unittest.TestCase):
             "r0_missing_created_time_column",
         ):
             self.assertNotEqual(self.report["cases"][name]["result"]["outcome"], "CREATED_VERIFIED_PRIOR_ATTEMPT", name)
+
+    def test_selected_r0_final_proof_fails_closed(self):
+        for name in SELECTED_R0_FINAL_CASES + [
+            f"r0_final_field_{field.casefold()}_mismatch" for field in R0_ASSIGNED_FIELDS
+        ]:
+            with self.subTest(name=name):
+                entry = self.assert_outcome(name, "MANUAL_REVIEW", rule="R0", branch="NONE", reason="prior_attempt_ambiguous", saves=0)
+                result = entry["result"]
+                self.assertIsNone(result["member_no"])
+                self.assertIsNone(result["member_guid"])
+                self.assertFalse(result["save_invoked"])
+                self.assertEqual(result["save_invocation_count"], 0)
+                self.assertIsNone(result["readback"])
+                self.assertEqual(entry["new_member"], 0)
+                self.assertEqual(entry["getmember"], 1)
+                self.assertNotIn("fake_final_", entry["output_json"])
 
     # ---- P-SV ----------------------------------------------------------
     def test_post_save_classification_table(self):

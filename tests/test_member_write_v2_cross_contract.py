@@ -36,6 +36,8 @@ EXPECTED = {
     "R4_create_name_appended": ("CREATED_VERIFIED", 1),
     "R2c_link_existing": ("LINKED_EXISTING", 0),
     "R0_prior_attempt": ("CREATED_VERIFIED", 1),
+    "R0_final_proof_rejected": ("MANUAL_REVIEW", 0),
+    "R0_final_field_mismatch": ("MANUAL_REVIEW", 0),
     "MUTEX_BUSY": ("RETRY_WAIT", 0),
 }
 
@@ -226,9 +228,32 @@ class GatewayRoundTripTests(unittest.TestCase):
                 stored = self.repository.get_job(job.job_id)
                 self.assertEqual(stored.state, JobState(state))
                 self.assertEqual(len(self.repository.welcome_outboxes()), outbox_rows)
+                if case["name"].startswith("R0_final_"):
+                    self.assertEqual(case["result"]["outcome"], "MANUAL_REVIEW")
+                    self.assertEqual(case["result"]["reason_code"], "prior_attempt_ambiguous")
+                    self.assertFalse(case["result"]["save_invoked"])
+                    self.assertEqual(case["result"]["save_invocation_count"], 0)
+                    self.assertIsNone(case["result"]["member_no"])
+                    self.assertIsNone(case["result"]["member_guid"])
+                    self.assertIsNone(case["result"]["readback"])
+                    self.assertIsNone(stored.next_attempt_at)
+                    self.assertIsNone(self.repository.member_outcome(job.job_id))
+                    self.assertFalse(self.service.claim(self.SESSION)["claimed"])
+                elif case["name"] == "R0_prior_attempt":
+                    credited = self.repository.member_outcome(job.job_id)
+                    self.assertIsNotNone(credited)
+                    self.assertEqual(credited.outcome, "CREATED_VERIFIED")
+                    self.assertEqual(credited.member_guid, case["result"]["member_guid"])
+                    self.assertIsNotNone(self.repository.welcome_outbox_for_job(job.job_id))
+                state_version = stored.state_version
                 replay = self._post(claim, copy.deepcopy(body), at)
                 self.assertEqual((replay.status, replay.body["replayed"]), (200, True))
                 self.assertEqual(len(self.repository.welcome_outboxes()), outbox_rows)
+                if case["name"].startswith("R0_final_"):
+                    replayed_job = self.repository.get_job(job.job_id)
+                    self.assertEqual(replayed_job.state, JobState.MANUAL_REVIEW)
+                    self.assertEqual(replayed_job.state_version, state_version)
+                    self.assertIsNone(replayed_job.next_attempt_at)
 
     def test_fixture_result_rebound_to_a_stale_lease_changes_nothing(self):
         case = FIXTURE["cases"][0]

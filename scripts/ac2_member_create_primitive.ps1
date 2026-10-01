@@ -602,19 +602,29 @@ function Invoke-XbAc2MemberCreatePrimitive {
             return (New-XbAc2PrimitiveResult -Outcome "LINKED_EXISTING" -Rule "R2c" -Branch "EXISTING" -MemberNo $decision.MemberNo -MemberGuid $guid -DqFlags $state.flags -ReleaseSha256 $release)
         }
         if ($decision.Action -ceq "PRIOR_CHECK") {
-            # R0: exactly one own recent row with an exact MemberNo; all 11 fields must equal.
-            $existing = $null
-            try { $existing = Get-XbAutoCountMember -Session $session -MemberNo $decision.MemberNo -MemberCommandFactory $MemberCommandFactory }
-            catch {
-                return (New-XbAc2PrimitiveResult -Outcome "FAILED_BEFORE_WRITE" -Rule "R0" -ReasonCode "probe_unavailable" -ErrorCode "prior_attempt_read_failed" -DqFlags $state.flags -ReleaseSha256 $release)
+            # Selection is the R0 boundary. Any failure in final proof is
+            # terminal manual review; it must never continue into CREATE.
+            $verified = $false
+            $audit = $null
+            try {
+                $existing = Get-XbAutoCountMember -Session $session -MemberNo $decision.MemberNo -MemberCommandFactory $MemberCommandFactory
+                $selectedAudit = Get-XbAutoCountMemberAudit -Entity $decision.Target
+                $expected = Get-XbAutoCountExpectedMemberRecord -Member (Get-XbAc2MemberFields -Request $request -MemberNo $decision.MemberNo)
+                $check = Compare-XbAutoCountMemberReadBack -Expected $expected -Actual $existing
+                $audit = Get-XbAutoCountMemberAudit -Entity $existing
+                $actualMemberNo = Get-XbAutoCountEntityValue -Entity $existing -Field "MemberNo"
+                $verified = ($check.Found -and $check.Match -and
+                    [string]::Equals(([string]$actualMemberNo).Trim(), [string]$decision.MemberNo, [StringComparison]::Ordinal) -and
+                    $null -ne $selectedAudit -and $selectedAudit.Guid -ne "" -and
+                    $null -ne $audit -and $audit.Guid -ne "" -and $audit.Guid -ceq $selectedAudit.Guid -and
+                    (Test-XbAc2SameText $audit.CreatedUserID $iu) -and
+                    ($audit.CreatedTime -is [datetime]) -and
+                    ($audit.CreatedTime -ge $windowStartLocal))
             }
-            $expected = Get-XbAutoCountExpectedMemberRecord -Member (Get-XbAc2MemberFields -Request $request -MemberNo $decision.MemberNo)
-            $check = Compare-XbAutoCountMemberReadBack -Expected $expected -Actual $existing
-            $audit = Get-XbAutoCountMemberAudit -Entity $existing
-            if ($check.Found -and $check.Match -and $null -ne $audit -and $audit.Guid -ne "" -and
-                (Test-XbAc2SameText $audit.CreatedUserID $iu) -and
-                ($audit.CreatedTime -is [datetime]) -and
-                ($audit.CreatedTime -ge $windowStartLocal)) {
+            catch {
+                $verified = $false
+            }
+            if ($verified) {
                 return (New-XbAc2PrimitiveResult -Outcome "CREATED_VERIFIED_PRIOR_ATTEMPT" -Rule "R0" -Branch (Get-XbAc2BranchFor -Request $request -MemberNo $decision.MemberNo) -MemberNo $decision.MemberNo -MemberGuid $audit.Guid -DqFlags $state.flags -ReleaseSha256 $release)
             }
             return (New-XbAc2PrimitiveResult -Outcome "MANUAL_REVIEW" -Rule "R0" -ReasonCode "prior_attempt_ambiguous" -DqFlags $state.flags -ReleaseSha256 $release)

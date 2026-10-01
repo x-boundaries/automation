@@ -122,6 +122,12 @@ CROSS_CASES = [
     {"name": "R4_create_name_appended", "fake_case": {"config": PROD_CONFIG, "rows": [OTHER_ROW]}},
     {"name": "R2c_link_existing", "fake_case": {"config": PROD_CONFIG, "rows": [{"MemberNo": "91234567", "Name": "person fixture", "EmailAddress": "old.fixture@example.test", "Guid": "3a3a3a3a-4b4b-4c4c-8d8d-5e5e5e5e5e5e"}]}},
     {"name": "R0_prior_attempt", "claim": claim_body(attempt_no=2), "fake_case": {"config": PROD_CONFIG, "rows": [{"MemberNo": "91234567", "from_request": True, "CreatedUserID": IU, "created_minutes": 1, "Guid": "6b6b6b6b-7c7c-4d7d-8e8e-9f9f9f9f9f9f"}]}},
+    {"name": "R0_final_proof_rejected", "claim": claim_body(attempt_no=2),
+     "fake_case": {"config": PROD_CONFIG, "rows": [{"MemberNo": "91234567", "from_request": True, "CreatedUserID": IU, "created_minutes": 1}], "final_readback_mode": "throw"},
+     "result_responses": ["gateway_http_503", "ok"]},
+    {"name": "R0_final_field_mismatch", "claim": claim_body(attempt_no=2),
+     "fake_case": {"config": PROD_CONFIG, "rows": [{"MemberNo": "91234567", "from_request": True, "CreatedUserID": IU, "created_minutes": 1}], "final_readback_mutations": {"Name": "Changed final name"}},
+     "result_responses": ["gateway_http_503", "ok"]},
     {"name": "MUTEX_BUSY", "fake_case": {"config": PROD_CONFIG}, "hold_mutex_on_claim": True},
 ]
 for entry in CROSS_CASES:
@@ -173,6 +179,7 @@ foreach ($case in $cases) {
     $name = [string]$case.name
     $mutexName = "Global\XB-AC2-MemberCreate-test-" + [Guid]::NewGuid().ToString("N")
     $tracePath = Join-Path $WorkRoot ($name + ".trace.json")
+    $primitiveTracePath = Join-Path $WorkRoot ($name + ".primitive-invocations.txt")
     $calls = New-Object System.Collections.Generic.List[object]
     $ctx = @{
         ready = (Get-XbCaseValue $case "ready" ([pscustomobject]@{ ready = $true; reasons = @(); dispatch_enabled = $true; server_time_utc = "2026-09-30T02:00:30Z" }))
@@ -204,6 +211,7 @@ foreach ($case in $cases) {
         XB_TEST_CHILD_PASSWORD = "synthetic-child-password"
         XB_TEST_CHILD_MODE = [string](Get-XbCaseValue $case "child_mode" "emit")
         XB_TEST_CHILD_TRACE = $tracePath
+        XB_TEST_PRIMITIVE_TRACE = $primitiveTracePath
         XB_TEST_UTC_NOW = "2026-09-30T02:00:30Z"
         XB_TEST_MUTEX_NAME = $mutexName
         XB_TEST_MUTEX_WAIT_MS = "300"
@@ -222,15 +230,18 @@ foreach ($case in $cases) {
     $session = New-XbMemberGatewayWorkerSession
     $cycle = $null
     $cycleError = $null
+    $cycleErrorStack = $null
     try {
         $cycle = Invoke-XbMemberGatewayWorkerCycle -GatewayBaseUrl "https://gateway.example.test" -EnableProductionWorker:(-not [bool](Get-XbCaseValue $case "disabled" $false)) -EnableProductionAdapter -Book ([string](Get-XbCaseValue $case "book" "production")) -ReleaseSha256 $release -PrimitiveScriptPath $primitivePath -ChildEnvironment $childEnvironment -FaultGuardConfig $faultGuard -WorkerFault ([string](Get-XbCaseValue $case "worker_fault" "")) -WorkerSession $session -GatewayRequest $gateway -MutexName $mutexName -DeadlineSeconds ([int](Get-XbCaseValue $case "deadline_seconds" 60)) -KillWaitMilliseconds ([int](Get-XbCaseValue $case "kill_wait_ms" 30000)) -KillAction $killAction -UtcNow { $now }.GetNewClosure()
     }
-    catch { $cycleError = [string]$_.Exception.Message }
+    catch { $cycleError = [string]$_.Exception.Message; $cycleErrorStack = ([string]$_.Exception.ToString() + "`n" + [string]$_.InvocationInfo.PositionMessage + "`n" + [string]$_.ScriptStackTrace) }
     $consolePreambleAfter = [Console]::InputEncoding.GetPreamble().Length
     [Environment]::SetEnvironmentVariable("XB_WORKER_FAULT", $null, "Process")
     if ($null -ne $holder) { if (-not $holder.HasExited) { $holder.Kill() }; [void]$holder.WaitForExit(20000) }
     if ($null -ne $ctx.held) { $ctx.held.ReleaseMutex(); $ctx.held.Dispose() }
     $trace = $null
+    $primitiveInvocations = 0
+    if (Test-Path -LiteralPath $primitiveTracePath) { $primitiveInvocations = @(Get-Content -LiteralPath $primitiveTracePath).Count }
     $childAlive = $null
     if (Test-Path -LiteralPath $tracePath) {
         $trace = [IO.File]::ReadAllText($tracePath, [Text.Encoding]::UTF8) | ConvertFrom-Json
@@ -241,9 +252,11 @@ foreach ($case in $cases) {
     $results[$name] = [ordered]@{
         cycle = $cycle
         error = $cycleError
+        error_stack = $cycleErrorStack
         calls = $calls.ToArray()
         session = $session
         trace = $trace
+        primitive_invocations = $primitiveInvocations
         child_alive_after_cycle = $childAlive
         console_preamble_after_cycle = $consolePreambleAfter
     }
@@ -276,7 +289,7 @@ class MemberGatewayWorkerCyclePowerShellTests(unittest.TestCase):
                 [POWERSHELL, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(harness),
                  "-Lib", str(LIB), "-Adapter", str(ADAPTER), "-FakeChild", str(FAKE_CHILD), "-WrapperChild", str(WRAPPER_CHILD),
                  "-CasesPath", str(cases), "-WorkRoot", str(root), "-OutPath", str(out)],
-                capture_output=True, text=True, timeout=900,
+                capture_output=True, text=True, timeout=900, env=os.environ.copy(),
             )
             if completed.returncode != 0 or not out.exists():
                 raise AssertionError(completed.stdout[-4000:] + completed.stderr[-4000:])
@@ -284,7 +297,7 @@ class MemberGatewayWorkerCyclePowerShellTests(unittest.TestCase):
 
     def case(self, name):
         entry = self.report["cases"][name]
-        self.assertIsNone(entry["error"], (name, entry["error"]))
+        self.assertIsNone(entry["error"], (name, entry["error"], entry["error_stack"]))
         calls = entry["calls"] or []
         for call in calls:
             for fragment in FORBIDDEN_PATH_FRAGMENTS:
@@ -421,7 +434,10 @@ class MemberGatewayWorkerCyclePowerShellTests(unittest.TestCase):
             entry = self.case(spec["name"])
             self.assertEqual(self.paths(entry)[:2], [("GET", "/readyz"), ("POST", "/v2/worker/claim")])
             posted = [call["body"] for call in entry["calls"] if call["path"].endswith("/result")]
-            self.assertEqual(len(posted), 1, spec["name"])
+            expected_posts = 2 if spec["name"] in ("R0_final_proof_rejected", "R0_final_field_mismatch") else 1
+            self.assertEqual(len(posted), expected_posts, spec["name"])
+            self.assertEqual(len(set(posted)), 1, spec["name"])
+            self.assertEqual(entry["primitive_invocations"], 1, spec["name"])
             self.assertEqual(json.loads(posted[0])["primitive"]["release_sha256"], self.report["release"])
             cases.append({"name": spec["name"], "claim": spec["claim"], "result": _normalised_result(posted[0])})
         outcomes = {case["name"]: (case["result"]["outcome"], case["result"]["rule"]) for case in cases}
@@ -430,6 +446,8 @@ class MemberGatewayWorkerCyclePowerShellTests(unittest.TestCase):
             "R4_create_name_appended": ("CREATED_VERIFIED", "R4"),
             "R2c_link_existing": ("LINKED_EXISTING", "R2c"),
             "R0_prior_attempt": ("CREATED_VERIFIED_PRIOR_ATTEMPT", "R0"),
+            "R0_final_proof_rejected": ("MANUAL_REVIEW", "R0"),
+            "R0_final_field_mismatch": ("MANUAL_REVIEW", "R0"),
             "MUTEX_BUSY": ("MUTEX_BUSY", "NONE"),
         })
         document = {

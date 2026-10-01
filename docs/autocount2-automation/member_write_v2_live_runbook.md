@@ -67,7 +67,26 @@ The contract names CI1-CI7 without defining them; G3 binds them as follows.
 | CI4 | release content: exactly one `SaveMember(` (in the adapter), no `DeleteMember`, no UAT/probe/cleanup file | `Assert-XbReleaseContent` |
 | CI5 | task contract: disabled, no triggers, IgnoreNew, 10 min limit, no retries, absolute interpreter, `-Mode DisabledProof` only | `Assert-XbWorkerTaskContract` |
 | CI6 | runtime custody: protected ACLs, no broad-group grants, secrets are DPAPI SecureString CLIXML | `Assert-XbRuntimeCustody` |
-| CI7 | install verifier: CI1, installed bytes vs manifest, release identity, CI4-CI6, worker effective rights | `Invoke-XbInstallVerifier` (`-Operation Verify`) |
+| CI7 | read-only verifier: fixed six-file package plus manifest, release/content identity, every config leaf including hidden files, trusted owners and native batch-token effective rights | `Invoke-XbInstallVerifier` (`-Operation Verify`) |
+
+CI7 checks package files and `installation-manifest.json` from handles opened
+without write or delete sharing. Package and manifest leaves may be owned only
+by SYSTEM or Administrators. Package leaves require Read+Execute and are capped
+at `0x001200A9`; manifest leaves require Read and use the same ceiling; config
+leaves require Read and are capped at `0x00120089`. A disabled fresh install with an empty config directory
+is valid; when operational config is provisioned, `worker.config.json` and all
+other ordinary config leaves must pass the same custody checks. It rejects worker write-data,
+append, write-EA, write-attributes, delete, write-DACL, and write-owner rights.
+It also checks create/replace and delete-child rights on the package/config
+directory chains, plus delete and parent delete-child composition. Directory
+inventory, object identities, ACL descriptors, and file hashes are rechecked
+after CI5 and CI6 while the handles remain open. Install and Upgrade establish
+SYSTEM ownership for the six package files and manifest. Each config leaf must
+already be owned by SYSTEM or Administrators; Verify reports an owner or rights
+failure without repairing it. Hidden config files are included in the check.
+
+The logs root and `launcher-*.jsonl` lifecycle retain their existing append and
+retention rights contract.
 
 Operations: `Install` (fresh), `Upgrade` (in place: snapshot to `rollback\upgrade-<utc>`,
 replace package files, re-register the task disabled, keep `config`, `secrets`, `logs`),
@@ -85,6 +104,9 @@ replace package files, re-register the task disabled, keep `config`, `secrets`, 
   never placed on a command line.
 - Config: `config\worker.config.json` from `config/ac2_member_gateway_worker.production.example.json`
   (or `.test_book.example.json`); `autocount_user_id` must equal `autocount_integration_user_id`.
+  Before Verify, ensure every regular file in the config directory is owned by
+  SYSTEM or Administrators and remains read-only to the worker. Verify includes
+  hidden files and does not change their owners or ACLs.
 
 ## 6. Fault hooks and cleanup
 

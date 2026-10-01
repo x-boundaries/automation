@@ -280,7 +280,7 @@ process per job attempt, as the dedicated integration user:
 
 | Rule | Condition | Outcome |
 | --- | --- | --- |
-| R0 | attempt 2+ and a row in H or V created by the integration user since the first claim (minus 10 min) | exactly one exact match of all 11 fields -> `CREATED_VERIFIED_PRIOR_ATTEMPT`; else `MANUAL_REVIEW(prior_attempt_ambiguous)` |
+| R0 | attempt 2+ and a row in H or V created by the integration user since the first claim (minus 10 min) | exactly one exact match of all 11 fields plus final proof below -> `CREATED_VERIFIED_PRIOR_ATTEMPT`; any selected-target proof failure -> `MANUAL_REVIEW(prior_attempt_ambiguous)` |
 | R1 | H and V empty | create `base` |
 | R2a | two or more same-person rows | `MANUAL_REVIEW(multiple_same_person)` |
 | R2b | one same-person row, inactive | `MANUAL_REVIEW(inactive_match)` |
@@ -288,6 +288,16 @@ process per job attempt, as the dedicated integration user:
 | R3 | no same person, V not empty | `MANUAL_REVIEW(format_variant_other_person)` |
 | R3b | no same person, an H row with no name and no email | `MANUAL_REVIEW(holder_identity_unknown)` |
 | R4 | every H row clearly another person | empty component -> `MANUAL_REVIEW(name_component_empty)`; `base+component` already used -> `MANUAL_REVIEW(name_candidate_collision)`; else create `base+component` |
+
+After `PRIOR_CHECK` selects a target, R0 performs exactly one final `GetMember` for
+that selected MemberNo. The final row must still have that exact MemberNo, match
+all 11 assigned fields through the normal adapter comparison, and have a valid
+nonzero Guid equal to the selected target's Guid, `CreatedUserID` equal to the
+integration user, and a real `[DateTime]` `CreatedTime` at or after
+`first_claimed_at - 10 minutes`. A false predicate or exception in this final
+proof ends inside R0 with `MANUAL_REVIEW`, `branch=NONE`, null MemberNo/Guid/readback,
+and no save invocation. It never allocates another number, calls `NewMember` or
+`SaveMember`, or schedules an automatic R0 retry.
 
 5. On create only: `NewMember(false)`, assign the 11 fields, call
    `SaveMember` exactly once from the single call site, then `GetMember` with

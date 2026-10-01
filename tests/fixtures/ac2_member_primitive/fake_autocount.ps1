@@ -51,6 +51,10 @@ function New-XbFakeAutoCountBook {
         [Parameter(Mandatory)][string]$IntegrationUserId,
         [Parameter(Mandatory)][string]$DatabaseName
     )
+    $invocationTrace = [Environment]::GetEnvironmentVariable("XB_TEST_PRIMITIVE_TRACE", "Process")
+    if (-not [string]::IsNullOrWhiteSpace($invocationTrace)) {
+        [IO.File]::AppendAllText($invocationTrace, "primitive_invoked`n", [Text.Encoding]::ASCII)
+    }
     $firstClaimed = [DateTimeOffset]::Parse([string]$Request.first_claimed_at, [Globalization.CultureInfo]::InvariantCulture)
     $state = @{
         table = (New-XbFakeTable)
@@ -61,6 +65,9 @@ function New-XbFakeAutoCountBook {
         session_opened = 0
         save_mode = [string](Get-XbFakeValue $Case "save_mode" "normal")
         readback_mode = [string](Get-XbFakeValue $Case "readback_mode" "normal")
+        final_readback_mode = [string](Get-XbFakeValue $Case "final_readback_mode" "normal")
+        final_readback_mutations = (Get-XbFakeValue $Case "final_readback_mutations" $null)
+        final_readback_remove_columns = @((Get-XbFakeValue $Case "final_readback_remove_columns" @()))
         readback_created_time_mode = [string](Get-XbFakeValue $Case "readback_created_time_mode" "normal")
         readback_created_user_mode = [string](Get-XbFakeValue $Case "readback_created_user_mode" "normal")
         probe_mode = [string](Get-XbFakeValue $Case "probe_mode" "normal")
@@ -171,8 +178,33 @@ function New-XbFakeAutoCountBook {
         param([string]$MemberNo)
         $this.State.getmember = [int]$this.State.getmember + 1
         if ($this.State.readback_mode -ceq "fail" -and [int]$this.State.saves -gt 0) { throw "fake_readback_failure" }
+        if ($this.State.saves -eq 0 -and $this.State.final_readback_mode -ceq "throw") { throw "fake_final_readback_failure" }
+        if ($this.State.saves -eq 0 -and $this.State.final_readback_mode -ceq "absent") { return $null }
+        if ($this.State.saves -eq 0 -and $this.State.final_readback_mode -ceq "compare_exception") {
+            Set-Item function:script:Compare-XbAutoCountMemberReadBack { param($Expected, $Actual) throw "fake_final_compare_exception" }
+        }
+        if ($this.State.saves -eq 0 -and $this.State.final_readback_mode -ceq "audit_exception") {
+            Set-Item function:script:Get-XbAutoCountMemberAudit { param($Entity) throw "fake_final_audit_exception" }
+        }
         foreach ($row in $this.State.table.Rows) {
             if ([string]$row["MemberNo"] -eq $MemberNo) {
+                if ($this.State.saves -eq 0) {
+                    foreach ($column in $this.State.final_readback_remove_columns) {
+                        if ($row.Table.Columns.Contains([string]$column)) { [void]$row.Table.Columns.Remove([string]$column) }
+                    }
+                    $mutations = $this.State.final_readback_mutations
+                    if ($null -ne $mutations) {
+                        $properties = if ($mutations -is [System.Collections.IDictionary]) { @($mutations.Keys) } else { @($mutations.PSObject.Properties.Name) }
+                        foreach ($field in $properties) {
+                            if (-not $row.Table.Columns.Contains([string]$field)) { continue }
+                            $value = Get-XbFakeValue $mutations ([string]$field) $null
+                            if ($value -is [string] -and $value -ceq "__DBNULL__") { $value = [DBNull]::Value }
+                            elseif ($value -is [string] -and $value -ceq "__TICK_BEFORE_THRESHOLD__") { $value = $this.State.prior_attempt_window_start_local.AddTicks(-1) }
+                            if ($null -eq $value) { $value = [DBNull]::Value }
+                            $row[[string]$field] = $value
+                        }
+                    }
+                }
                 if ($this.State.saves -eq 0 -and $this.State.readback_created_user_mode -cne "normal") {
                     switch ($this.State.readback_created_user_mode) {
                         "wrong" { $row["CreatedUserID"] = "OTHER_USER_PLACEHOLDER" }
