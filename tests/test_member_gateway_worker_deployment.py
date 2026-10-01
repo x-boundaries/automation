@@ -4500,17 +4500,51 @@ function Get-XbBoundaryOutcome {
 }
 
 function Invoke-XbBoundaryCase {
-    param([Parameter(Mandatory)][string]$Name, [Parameter(Mandatory)][scriptblock]$Body)
-    $record = [ordered]@{ status = "error" }
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][scriptblock]$Body,
+        [switch]$PreserveIncrementally
+    )
+    $record = [ordered]@{ status = "running" }
+    $report.cases[$Name] = $record
     try {
-        $data = @(& $Body)
-        if ($data.Count -gt 0 -and $data[-1] -is [Collections.IDictionary]) { foreach ($key in @($data[-1].Keys)) { $record[$key] = $data[-1][$key] } }
+        if ($PreserveIncrementally) {
+            $null = & $Body $record
+        } else {
+            $data = @(& $Body)
+            if ($data.Count -gt 0 -and $data[-1] -is [Collections.IDictionary]) { foreach ($key in @($data[-1].Keys)) { $record[$key] = $data[-1][$key] } }
+        }
         $record.status = "completed"
     } catch {
+        $record.status = "error"
         $record.error = [string]$_.Exception.Message
         $record.error_stack = [string]$_.ScriptStackTrace
     }
-    $report.cases[$Name] = $record
+}
+
+function Invoke-XbBoundaryCleanup {
+    param(
+        [Parameter(Mandatory)]$CaseRecord,
+        [Parameter(Mandatory)][scriptblock]$Preflight,
+        [Parameter(Mandatory)][scriptblock]$Body
+    )
+    $CaseRecord.cleanup = [ordered]@{
+        attempted = $false
+        pass = $null
+        error = $null
+        stack = $null
+    }
+    try {
+        $null = & $Preflight $CaseRecord
+        $CaseRecord.cleanup.attempted = $true
+        $null = & $Body
+        $CaseRecord.cleanup.pass = $true
+    } catch {
+        if ($CaseRecord.cleanup.attempted) { $CaseRecord.cleanup.pass = $false }
+        $CaseRecord.cleanup.error = [string]$_.Exception.Message
+        $CaseRecord.cleanup.stack = [string]$_.ScriptStackTrace
+        throw
+    }
 }
 
 function Get-XbStageNames {
@@ -4585,6 +4619,170 @@ function Get-XbProductionReadback {
         program_files_parent_present = (Test-Path -LiteralPath $programFilesParent)
         program_data_parent_present = (Test-Path -LiteralPath $programDataParent)
         new_stage_count = @($stageNow | Where-Object { $state.stage_before -notcontains $_ }).Count
+    }
+}
+
+function Get-XbBoundaryComTaskFolderReadback {
+    $requestedFolderPath = ConvertTo-XbComFolderPath -Path $taskPath
+    $service = Connect-XbTaskService
+    $observation = [ordered]@{ requested_folder_path = $requestedFolderPath }
+    try { $folder = $service.GetFolder($requestedFolderPath) }
+    catch {
+        if ((Get-XbBoundaryHResult $_) -eq -2147024894) {
+            $observation.folder_present = $false
+            $observation.task_present = $false
+            return $observation
+        }
+        throw "task_folder_presence_unproven"
+    }
+    $observation.folder_present = $true
+    $observation.returned_folder_path = [string]$folder.Path
+    if ($observation.returned_folder_path -cne $requestedFolderPath) { throw "task_folder_identity_invalid" }
+    $registered = $null
+    try { $registered = $folder.GetTask($taskName) }
+    catch {
+        if ((Get-XbBoundaryHResult $_) -eq -2147024894) {
+            $observation.task_present = $false
+        } else {
+            throw "task_presence_unproven"
+        }
+    }
+    if ($null -ne $registered) {
+        $observation.task_present = $true
+        $observation.task_path = [string]$registered.Path
+        if ($observation.task_path -cne ($taskPath + $taskName)) { throw "task_identity_invalid" }
+    }
+    $observation.task_count = [int]$folder.GetTasks(1).Count
+    $observation.child_folder_count = [int]$folder.GetFolders(0).Count
+    return $observation
+}
+
+function Set-XbBoundaryTaskPresenceReadback {
+    param(
+        [Parameter(Mandatory)]$CaseRecord,
+        [Parameter(Mandatory)][string]$Name
+    )
+    $observation = [ordered]@{
+        effective_task_path = [string]$taskPath
+        effective_task_name = [string]$taskName
+    }
+    $CaseRecord[$Name] = $observation
+    $observation.cim_task_present = ($null -ne (Get-XbWorkerTaskIfPresent))
+    $observation.com = Get-XbBoundaryComTaskFolderReadback
+}
+
+function Get-XbSyntheticConfigSnapshot {
+    param([Parameter(Mandatory)][string]$Path)
+    $protected = [XbWorkerProtectedObject]::Open($Path, $false, $true)
+    try {
+        $snapshot = $protected.ReadSnapshot()
+        return [ordered]@{
+            file_identity = [string]$protected.FileIdentity
+            text = [string]$snapshot.Text
+        }
+    } finally { $protected.Dispose() }
+}
+
+function Get-XbRuntimeDirectoryEvidence {
+    $expectedDirectories = @("config", "logs", "rollback", "secrets")
+    $rootItem = Get-Item -LiteralPath $RuntimeRoot -Force -ErrorAction Stop
+    $rootIsDirectory = [bool]$rootItem.PSIsContainer
+    $rootReparsePoint = (($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)
+    $evidence = [ordered]@{
+        runtime_root_path = [IO.Path]::GetFullPath($RuntimeRoot)
+        root_is_directory = $rootIsDirectory
+        root_reparse_point = [bool]$rootReparsePoint
+    }
+    if (-not $rootIsDirectory -or $rootReparsePoint) {
+        $evidence.prerequisite_satisfied = $false
+        return $evidence
+    }
+
+    $rootEntries = @(Get-ChildItem -LiteralPath $RuntimeRoot -Force -ErrorAction Stop)
+    $directories = @($rootEntries | Where-Object { $_.PSIsContainer })
+    $files = @($rootEntries | Where-Object { -not $_.PSIsContainer })
+    $directoryNames = @($directories | ForEach-Object Name | Sort-Object)
+    $fileNames = @($files | ForEach-Object Name | Sort-Object)
+    $directoryContents = [ordered]@{}
+    $emptyExpectedDirectories = $true
+    foreach ($name in $expectedDirectories) {
+        $matches = @($directories | Where-Object { [string]$_.Name -ceq $name })
+        if ($matches.Count -ne 1) {
+            $directoryContents[$name] = [ordered]@{
+                present = ($matches.Count -gt 0)
+                match_count = $matches.Count
+            }
+            $emptyExpectedDirectories = $false
+            continue
+        }
+        $directory = $matches[0]
+        $reparsePoint = (($directory.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)
+        if ($reparsePoint) {
+            $directoryContents[$name] = [ordered]@{
+                present = $true
+                reparse_point = $true
+            }
+            $emptyExpectedDirectories = $false
+            continue
+        }
+        $entries = @(Get-ChildItem -LiteralPath $directory.FullName -Force -ErrorAction Stop)
+        $entryNames = @($entries | ForEach-Object Name | Sort-Object)
+        $directoryContents[$name] = [ordered]@{
+            present = $true
+            reparse_point = $false
+            entry_count = $entries.Count
+            entry_names = $entryNames
+        }
+        if ($entries.Count -ne 0) { $emptyExpectedDirectories = $false }
+    }
+    $directorySetMatches = (@(Compare-Object -ReferenceObject $directoryNames -DifferenceObject $expectedDirectories -CaseSensitive).Count -eq 0)
+    $evidence.root_directory_count = $directories.Count
+    $evidence.root_file_count = $files.Count
+    $evidence.root_directory_names = $directoryNames
+    $evidence.root_file_names = $fileNames
+    $evidence.directory_contents = $directoryContents
+    $evidence.prerequisite_satisfied = [bool]($directorySetMatches -and $files.Count -eq 0 -and $emptyExpectedDirectories)
+    return $evidence
+}
+
+function Get-XbRetainedParentEvidence {
+    $parents = [ordered]@{}
+    $safeToRemove = $true
+    foreach ($spec in @(
+        @("program_files_parent", $programFilesParent),
+        @("program_data_parent", $programDataParent)
+    )) {
+        $name = [string]$spec[0]
+        $path = [string]$spec[1]
+        $item = $null
+        try { $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop }
+        catch [System.Management.Automation.ItemNotFoundException] {
+            $parents[$name] = [ordered]@{ present = $false }
+            continue
+        } catch {
+            throw "container_not_owned_empty"
+        }
+        $isDirectory = [bool]$item.PSIsContainer
+        $reparsePoint = (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)
+        $parentEvidence = [ordered]@{
+            present = $true
+            is_directory = $isDirectory
+            reparse_point = [bool]$reparsePoint
+        }
+        if (-not $isDirectory -or $reparsePoint) {
+            $parents[$name] = $parentEvidence
+            $safeToRemove = $false
+            continue
+        }
+        $children = @(Get-ChildItem -LiteralPath $path -Force -ErrorAction Stop)
+        $parentEvidence.child_count = $children.Count
+        $parentEvidence.child_names = @($children | ForEach-Object Name | Sort-Object)
+        $parents[$name] = $parentEvidence
+        if ($children.Count -ne 0) { $safeToRemove = $false }
+    }
+    return [ordered]@{
+        safe_to_remove = [bool]$safeToRemove
+        parents = $parents
     }
 }
 
@@ -4896,21 +5094,31 @@ try {
         } finally { Set-Acl -LiteralPath $Path -AclObject $original -ErrorAction Stop }
     }
 
-    Invoke-XbBoundaryCase "install_then_uninstall" {
+    Invoke-XbBoundaryCase -Name "install_then_uninstall" -PreserveIncrementally -Body {
+        param($case)
         Set-XbProductionTaskIdentity
         $script:TaskCredential = $credential
         $trace.Clear()
-        $installOutcome = Get-XbBoundaryOutcome { Invoke-XbWorkerInstaller }
-        $installed = Get-XbProductionReadback
-        $contract = Get-XbBoundaryOutcome { Assert-XbWorkerTaskContract -Task (Get-ScheduledTask -TaskPath $taskPath -TaskName $taskName -ErrorAction Stop) }
-        $ownership = Get-XbBoundaryOutcome { Assert-XbUninstallOwnership }
-        $evidence = Get-XbTaskEvidence
+        $case.install_outcome = Get-XbBoundaryOutcome { Invoke-XbWorkerInstaller }
+        $case.installed = Get-XbProductionReadback
+        Set-XbBoundaryTaskPresenceReadback -CaseRecord $case -Name "install_task_presence"
+        $case.contract = Get-XbBoundaryOutcome { Assert-XbWorkerTaskContract -Task (Get-ScheduledTask -TaskPath $taskPath -TaskName $taskName -ErrorAction Stop) }
+        $case.ownership = Get-XbBoundaryOutcome { Assert-XbUninstallOwnership }
+        $case.evidence = Get-XbTaskEvidence
         $manifest = Get-Content -Raw -LiteralPath (Join-Path $InstallRoot "installation-manifest.json") | ConvertFrom-Json
+        $case.manifest_trigger_count = [int]$manifest.task.trigger_count
         $configFile = Join-Path (Join-Path $RuntimeRoot "config") "worker.config.json"
         Set-Content -LiteralPath $configFile -Value "{}" -Encoding UTF8
         Set-XbWorkerTrustedOwner -Path $configFile -OwnerSid "S-1-5-18"
-        $accountInstalled = Get-XbAccountObservation
-        $ci7 = [ordered]@{ fatal = $null }
+        $syntheticConfigSnapshot = Get-XbSyntheticConfigSnapshot -Path $configFile
+        if ($syntheticConfigSnapshot.text -cne "{}") { throw "synthetic_config_fixture_content_unexpected" }
+        $syntheticConfigIdentity = [string]$syntheticConfigSnapshot.file_identity
+        $case.account_installed = Get-XbAccountObservation
+        $ci7 = [ordered]@{
+            fatal = $null
+            required_probe_completion = [ordered]@{ status = "in_progress" }
+        }
+        $case.ci7 = $ci7
         $nativeToken = $null
         $logPath = $null
         $junctionPath = $null
@@ -4982,6 +5190,9 @@ try {
             $ci7.empty_config_verify = Get-XbBoundaryOutcome { Invoke-XbInstallVerifier -TaskCredential $credential }
             [IO.File]::WriteAllText($configFile, $configContent, [Text.UTF8Encoding]::new($false))
             Set-XbWorkerTrustedOwner -Path $configFile -OwnerSid "S-1-5-18"
+            $syntheticConfigSnapshot = Get-XbSyntheticConfigSnapshot -Path $configFile
+            if ($syntheticConfigSnapshot.text -cne "{}") { throw "synthetic_config_fixture_content_unexpected" }
+            $syntheticConfigIdentity = [string]$syntheticConfigSnapshot.file_identity
             $ci7.package_owner_sids = @($packageFiles + "installation-manifest.json" | ForEach-Object { (Get-Acl -LiteralPath (Join-Path $InstallRoot $_)).GetOwner([Security.Principal.SecurityIdentifier]).Value })
             $ci7.config_owner_sid = (Get-Acl -LiteralPath $configFile).GetOwner([Security.Principal.SecurityIdentifier]).Value
 
@@ -5257,7 +5468,10 @@ try {
             try { Remove-Item -LiteralPath $logPath -Force -ErrorAction Stop }
             finally { [XbWorkerBatchToken]::Revert() }
             $ci7.retention_delete = (-not (Test-Path -LiteralPath $logPath))
+            $ci7.required_probe_completion.status = "complete"
+            $ci7.required_probe_completion.completed_through = "retention_delete"
         } catch {
+            $ci7.required_probe_completion.status = "incomplete"
             $ci7.fatal = [string]$_.Exception.Message
             $ci7.fatal_stack = [string]$_.ScriptStackTrace
         } finally {
@@ -5271,27 +5485,74 @@ try {
                 try { Remove-Item -LiteralPath $logPath -Force -ErrorAction Stop } catch { $ci7.cleanup_error = [string]$_.Exception.Message }
             }
         }
-        $script:Operation = "Uninstall"
-        $uninstallOutcome = Get-XbBoundaryOutcome { Invoke-XbWorkerInstaller }
-        $uninstalled = Get-XbProductionReadback
-        $accountUninstalled = Get-XbAccountObservation
-        $rollbackTrace = @($trace)
-        Clear-XbRetainedProductionContainers
-        return [ordered]@{
-            install_outcome = $installOutcome
-            installed = $installed
-            contract = $contract
-            ownership = $ownership
-            evidence = $evidence
-            manifest_trigger_count = [int]$manifest.task.trigger_count
-            account_installed = $accountInstalled
-            ci7 = $ci7
-            uninstall_outcome = $uninstallOutcome
-            uninstalled = $uninstalled
-            account_uninstalled = $accountUninstalled
-            rollback_trace = $rollbackTrace
-            post_cleanup = (Get-XbProductionReadback)
+        $case.synthetic_config_teardown = [ordered]@{}
+        $configTeardown = $case.synthetic_config_teardown
+        $expectedConfigFile = [IO.Path]::GetFullPath((Join-Path (Join-Path $RuntimeRoot "config") "worker.config.json"))
+        $configTeardown.path = [IO.Path]::GetFullPath($configFile)
+        $configTeardown.path_matches_expected = ($configTeardown.path -ceq $expectedConfigFile)
+        $configItem = $null
+        try { $configItem = Get-Item -LiteralPath $configFile -Force -ErrorAction Stop }
+        catch [System.Management.Automation.ItemNotFoundException] { $configItem = $null }
+        catch { throw "synthetic_config_presence_unproven" }
+        $configTeardown.present_before = ($null -ne $configItem)
+        $configTeardown.runtime_before = Get-XbRuntimeDirectoryEvidence
+        if ($null -eq $configItem) { throw "synthetic_config_fixture_missing" }
+
+        $configIsLeaf = -not [bool]$configItem.PSIsContainer
+        $configReparsePoint = (($configItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)
+        $runtimeRootItem = Get-Item -LiteralPath $RuntimeRoot -Force -ErrorAction Stop
+        $configDirectory = Get-Item -LiteralPath (Join-Path $RuntimeRoot "config") -Force -ErrorAction Stop
+        $runtimeRootReparsePoint = (($runtimeRootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)
+        $configDirectoryReparsePoint = (($configDirectory.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)
+        $configTeardown.file_is_leaf = [bool]$configIsLeaf
+        $configTeardown.file_reparse_point = [bool]$configReparsePoint
+        $configTeardown.runtime_root_reparse_point = [bool]$runtimeRootReparsePoint
+        $configTeardown.config_directory_reparse_point = [bool]$configDirectoryReparsePoint
+        $configTeardown.ordinary_non_reparse = [bool]($configIsLeaf -and -not $configReparsePoint -and -not $runtimeRootReparsePoint -and -not $configDirectoryReparsePoint)
+        if (-not $configTeardown.path_matches_expected -or -not $configTeardown.ordinary_non_reparse) {
+            throw "synthetic_config_identity_unproven"
         }
+
+        $currentConfigSnapshot = Get-XbSyntheticConfigSnapshot -Path $configFile
+        $configTeardown.expected_file_identity = [string]$syntheticConfigIdentity
+        $configTeardown.observed_file_identity = [string]$currentConfigSnapshot.file_identity
+        $configTeardown.identity_matches_created_file = ($currentConfigSnapshot.file_identity -ceq $syntheticConfigIdentity)
+        $configTeardown.content_matches_expected = ($currentConfigSnapshot.text -ceq "{}")
+        if (-not $configTeardown.identity_matches_created_file -or -not $configTeardown.content_matches_expected) {
+            throw "synthetic_config_identity_or_content_unproven"
+        }
+
+        $configTeardown.removal_attempted = $true
+        Remove-Item -LiteralPath $configFile -Force -ErrorAction Stop
+        $configTeardown.present_after = Test-Path -LiteralPath $configFile
+        $configTeardown.removal_pass = (-not $configTeardown.present_after)
+        if (-not $configTeardown.removal_pass) { throw "synthetic_config_fixture_teardown_failed" }
+        $configTeardown.runtime_after = Get-XbRuntimeDirectoryEvidence
+        if (-not $configTeardown.runtime_after.prerequisite_satisfied) {
+            throw "runtime_uninstall_prerequisite_unproven"
+        }
+        if ($null -ne $ci7.fatal) { throw "ci7_fatal" }
+        if ($ci7.required_probe_completion.status -cne "complete") { throw "ci7_required_probes_incomplete" }
+        if ($ci7.Contains("cleanup_error")) { throw "ci7_fixture_cleanup_failed" }
+
+        $script:Operation = "Uninstall"
+        $case.uninstall_outcome = Get-XbBoundaryOutcome { Invoke-XbWorkerInstaller }
+        $case.uninstalled = Get-XbProductionReadback
+        Set-XbBoundaryTaskPresenceReadback -CaseRecord $case -Name "uninstall_task_presence"
+        $case.account_uninstalled = Get-XbAccountObservation
+        $case.rollback_trace = @($trace)
+        Invoke-XbBoundaryCleanup -CaseRecord $case -Preflight {
+            param($case)
+            $case.production_folder_before_retained_cleanup = Get-XbBoundaryComTaskFolderReadback
+            $case.retained_parent_state_before_cleanup = Get-XbRetainedParentEvidence
+            if (-not $case.retained_parent_state_before_cleanup.safe_to_remove) {
+                throw "container_not_owned_empty"
+            }
+        } -Body {
+            Clear-XbRetainedProductionContainers
+        }
+        $case.post_cleanup = Get-XbProductionReadback
+        Set-XbBoundaryTaskPresenceReadback -CaseRecord $case -Name "post_cleanup_task_presence"
     }
 } catch {
     $report.fatal = [string]$_.Exception.Message
@@ -5443,6 +5704,48 @@ class MemberWorkerTaskContractSourceTests(unittest.TestCase):
             with self.subTest(forbidden=forbidden):
                 self.assertNotIn(forbidden, _HOSTED_TASK_BOUNDARY_HARNESS)
                 self.assertNotIn(forbidden, self.source)
+
+
+    def test_hosted_case_record_and_cleanup_errors_are_preserved(self) -> None:
+        case_helper = _installer_function(_HOSTED_TASK_BOUNDARY_HARNESS, "Invoke-XbBoundaryCase")
+        self.assertLess(
+            case_helper.index("$report.cases[$Name] = $record"),
+            case_helper.index("$null = & $Body $record"),
+        )
+        self.assertIn("if ($PreserveIncrementally)", case_helper)
+        self.assertIn('$record.status = "error"', case_helper)
+        cleanup_helper = _installer_function(_HOSTED_TASK_BOUNDARY_HARNESS, "Invoke-XbBoundaryCleanup")
+        for field in ("attempted", "pass", "error", "stack"):
+            with self.subTest(cleanup_field=field):
+                self.assertIn(f"cleanup.{field}", cleanup_helper)
+        self.assertIn("throw", cleanup_helper)
+
+    def test_synthetic_config_teardown_is_identity_gated_before_uninstall(self) -> None:
+        start = _HOSTED_TASK_BOUNDARY_HARNESS.index(
+            'Invoke-XbBoundaryCase -Name "install_then_uninstall"'
+        )
+        end = _HOSTED_TASK_BOUNDARY_HARNESS.index(
+            '\n} catch {\n    $report.fatal',
+            start,
+        )
+        case_source = _HOSTED_TASK_BOUNDARY_HARNESS[start:end]
+        for marker in (
+            "identity_matches_created_file",
+            "content_matches_expected",
+            "[IO.FileAttributes]::ReparsePoint",
+            "runtime_after.prerequisite_satisfied",
+            "required_probe_completion.status",
+        ):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, case_source)
+        self.assertLess(
+            case_source.index("$configTeardown.removal_attempted = $true"),
+            case_source.index('$script:Operation = "Uninstall"'),
+        )
+        self.assertEqual(
+            case_source.count("Get-XbBoundaryOutcome { Invoke-XbWorkerInstaller }"),
+            2,
+        )
 
 
 class MemberWorkerTaskContractBehaviorTests(unittest.TestCase):
@@ -5609,6 +5912,97 @@ class MemberWorkerTaskContractBehaviorTests(unittest.TestCase):
                 "unexpected_preserved": True,
             },
         )
+
+
+class MemberWorkerBoundaryCaseRecordRegressionTests(unittest.TestCase):
+    """Bounded PowerShell regression for evidence retention when retained cleanup throws."""
+
+    def test_cleanup_exception_preserves_evidence_and_fails_the_case(self) -> None:
+        pwsh = _resolve_native_powershell()
+        if not pwsh:
+            raise unittest.SkipTest("Windows PowerShell is required for case-record regression")
+
+        case_helper = _installer_function(_HOSTED_TASK_BOUNDARY_HARNESS, "Invoke-XbBoundaryCase")
+        cleanup_helper = _installer_function(_HOSTED_TASK_BOUNDARY_HARNESS, "Invoke-XbBoundaryCleanup")
+        harness_source = "\n".join(
+            (
+                "$ErrorActionPreference = \"Stop\"",
+                "$report = [ordered]@{ cases = [ordered]@{} }",
+                case_helper,
+                cleanup_helper,
+                r"""
+$body = {
+    param($case)
+    $case.install_outcome = "pass"
+    $case.installed = [ordered]@{ task_present = $true }
+    $case.ci7 = [ordered]@{
+        fatal = $null
+        required_probe_completion = [ordered]@{ status = "complete" }
+    }
+    Invoke-XbBoundaryCleanup -CaseRecord $case -Preflight {
+        param($case)
+        $case.production_folder_before_retained_cleanup = [ordered]@{
+            task_count = 0
+            child_folder_count = 0
+        }
+    } -Body {
+        throw "forced_cleanup_exception"
+    }
+}
+Invoke-XbBoundaryCase -Name "cleanup_exception" -PreserveIncrementally -Body $body
+$case = $report.cases["cleanup_exception"]
+if ($case.status -cne "error" -or $case.error -cne "forced_cleanup_exception" -or
+    $case.install_outcome -cne "pass" -or $case.installed.task_present -ne $true -or
+    $null -ne $case.ci7.fatal -or
+    $case.ci7.required_probe_completion.status -cne "complete" -or
+    $case.production_folder_before_retained_cleanup.task_count -ne 0 -or
+    $case.cleanup.attempted -ne $true -or $case.cleanup.pass -ne $false -or
+    $case.cleanup.error -cne "forced_cleanup_exception" -or
+    [string]::IsNullOrWhiteSpace([string]$case.cleanup.stack) -or
+    [string]::IsNullOrWhiteSpace([string]$case.error_stack)) {
+    throw "boundary_case_cleanup_regression_failed"
+}
+[Console]::Out.WriteLine(($case | ConvertTo-Json -Depth 8 -Compress))
+""",
+            )
+        )
+        with tempfile.TemporaryDirectory(prefix="xb-boundary-case-record-") as temp_dir:
+            harness = Path(temp_dir) / "case_record_regression.ps1"
+            harness.write_text(harness_source, encoding="utf-8", newline="\n")
+            completed = subprocess.run(
+                [
+                    pwsh, "-ExecutionPolicy", "Bypass", "-NoLogo", "-NoProfile", "-NonInteractive",
+                    "-File", str(harness),
+                ],
+                cwd=ROOT,
+                env=_windows_powershell_module_environment(),
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+        if completed.returncode != 0:
+            raise AssertionError(completed.stdout + completed.stderr)
+        case = json.loads(completed.stdout)
+        self.assertEqual(case["status"], "error")
+        self.assertEqual(case["error"], "forced_cleanup_exception")
+        self.assertTrue(case["error_stack"])
+        self.assertEqual(case["install_outcome"], "pass")
+        self.assertEqual(case["installed"], {"task_present": True})
+        self.assertEqual(case["ci7"]["fatal"], None)
+        self.assertEqual(case["ci7"]["required_probe_completion"]["status"], "complete")
+        self.assertEqual(
+            case["production_folder_before_retained_cleanup"],
+            {"task_count": 0, "child_folder_count": 0},
+        )
+        self.assertEqual(
+            {key: value for key, value in case["cleanup"].items() if key != "stack"},
+            {
+                "attempted": True,
+                "pass": False,
+                "error": "forced_cleanup_exception",
+            },
+        )
+        self.assertTrue(case["cleanup"]["stack"])
 
 
 class MemberWorkerHostedTaskBoundaryTests(unittest.TestCase):
@@ -5827,6 +6221,14 @@ class MemberWorkerHostedTaskBoundaryTests(unittest.TestCase):
     def test_install_then_uninstall(self) -> None:
         self.assertTrue(self.report["account"]["batch_logon_right_assigned"])
         case = self._case("install_then_uninstall")
+        install_presence = case["install_task_presence"]
+        self.assertEqual(install_presence["effective_task_path"], "\\X-Boundaries\\")
+        self.assertEqual(install_presence["effective_task_name"], "AC2 Member Gateway Worker")
+        self.assertTrue(install_presence["cim_task_present"])
+        self.assertTrue(install_presence["com"]["folder_present"])
+        self.assertTrue(install_presence["com"]["task_present"])
+        self.assertEqual(install_presence["com"]["task_count"], 1)
+        self.assertEqual(install_presence["com"]["child_folder_count"], 0)
         self.assertEqual(case["install_outcome"], "pass")
         self.assertEqual(
             case["installed"],
@@ -5849,6 +6251,10 @@ class MemberWorkerHostedTaskBoundaryTests(unittest.TestCase):
         self._assert_no_worker_session(case["account_installed"])
         ci7 = case["ci7"]
         self.assertIsNone(ci7["fatal"], ci7)
+        self.assertEqual(
+            ci7["required_probe_completion"],
+            {"status": "complete", "completed_through": "retention_delete"},
+        )
         self.assertTrue(ci7["root_owner_accepted"], ci7)
         self.assertIn(ci7["root_owner_sid"], {"S-1-5-18", "S-1-5-32-544"})
         self.assertTrue(ci7["root_dacl_protected"])
@@ -5945,6 +6351,46 @@ class MemberWorkerHostedTaskBoundaryTests(unittest.TestCase):
         self.assertTrue(ci7["reparse_fixture_absent"])
         self.assertTrue(ci7["retention_delete"])
         self.assertNotIn("cleanup_error", ci7)
+        teardown = case["synthetic_config_teardown"]
+        self.assertTrue(teardown["present_before"])
+        self.assertTrue(teardown["path_matches_expected"])
+        self.assertTrue(teardown["file_is_leaf"])
+        self.assertFalse(teardown["file_reparse_point"])
+        self.assertFalse(teardown["runtime_root_reparse_point"])
+        self.assertFalse(teardown["config_directory_reparse_point"])
+        self.assertTrue(teardown["ordinary_non_reparse"])
+        self.assertTrue(teardown["identity_matches_created_file"])
+        self.assertEqual(teardown["expected_file_identity"], teardown["observed_file_identity"])
+        self.assertTrue(teardown["content_matches_expected"])
+        self.assertTrue(teardown["removal_attempted"])
+        self.assertTrue(teardown["removal_pass"])
+        self.assertFalse(teardown["present_after"])
+        self.assertEqual(teardown["runtime_before"]["root_directory_count"], 4)
+        self.assertEqual(teardown["runtime_before"]["root_file_count"], 0)
+        self.assertEqual(teardown["runtime_before"]["root_directory_names"], ["config", "logs", "rollback", "secrets"])
+        self.assertEqual(
+            teardown["runtime_before"]["directory_contents"]["config"]["entry_names"],
+            ["worker.config.json"],
+        )
+        self.assertFalse(teardown["runtime_before"]["prerequisite_satisfied"])
+        self.assertTrue(teardown["runtime_after"]["prerequisite_satisfied"])
+        self.assertTrue(all(
+            directory["entry_count"] == 0
+            for directory in teardown["runtime_after"]["directory_contents"].values()
+        ))
+
+        uninstall_presence = case["uninstall_task_presence"]
+        self.assertEqual(uninstall_presence["effective_task_path"], "\\X-Boundaries\\")
+        self.assertEqual(uninstall_presence["effective_task_name"], "AC2 Member Gateway Worker")
+        self.assertFalse(uninstall_presence["cim_task_present"])
+        self.assertTrue(uninstall_presence["com"]["folder_present"])
+        self.assertFalse(uninstall_presence["com"]["task_present"])
+        self.assertEqual(
+            uninstall_presence["com"]["returned_folder_path"],
+            uninstall_presence["com"]["requested_folder_path"],
+        )
+        self.assertEqual(uninstall_presence["com"]["task_count"], 0)
+        self.assertEqual(uninstall_presence["com"]["child_folder_count"], 0)
         self.assertEqual(case["uninstall_outcome"], "pass")
         self.assertEqual(
             case["uninstalled"],
@@ -5960,6 +6406,14 @@ class MemberWorkerHostedTaskBoundaryTests(unittest.TestCase):
         )
         self._assert_no_worker_session(case["account_uninstalled"])
         self.assertEqual(case["rollback_trace"], [])
+        self.assertEqual(case["production_folder_before_retained_cleanup"]["task_count"], 0)
+        self.assertEqual(case["production_folder_before_retained_cleanup"]["child_folder_count"], 0)
+        self.assertTrue(case["retained_parent_state_before_cleanup"]["safe_to_remove"])
+        self.assertEqual(case["cleanup"], {"attempted": True, "pass": True, "error": None, "stack": None})
+        post_cleanup_presence = case["post_cleanup_task_presence"]
+        self.assertFalse(post_cleanup_presence["cim_task_present"])
+        self.assertFalse(post_cleanup_presence["com"]["folder_present"])
+        self.assertFalse(post_cleanup_presence["com"]["task_present"])
         self._assert_pristine(case["post_cleanup"])
 
     def test_disposable_state_cleanup_readback(self) -> None:
