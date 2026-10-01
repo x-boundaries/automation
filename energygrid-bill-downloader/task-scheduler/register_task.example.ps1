@@ -24,4 +24,11 @@
 # Credential values must be injected by a later approved host mechanism. They are
 # never placed in this example or passed as command-line arguments.
 
+# DL-XB-199 G3-101: the reviewed direct-HTTP MVP task shape is the inert XML template
+# task-scheduler/energygrid_daily.task.example.xml (Enabled=false, placeholders only):
+# absolute powershell.exe path, the installed launcher.ps1 through -File so its exit code
+# is preserved, a non-elevated LeastPrivilege run principal, MultipleInstances IgnoreNew,
+# a hard ExecutionTimeLimit and StartWhenAvailable. The "Intended daily action shape"
+# above predates the launcher and is superseded: Python is never scheduled directly.
+
 # Template only; no scheduler action is defined or performed here.

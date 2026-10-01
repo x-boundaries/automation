@@ -3813,6 +3813,15 @@ $script:Results = New-Object 'System.Collections.Generic.List[string]'
 function Complete-Case {
     param([string]$Name, [bool]$Observed, [bool]$ExpectObserved, [bool]$ExpectFailed,
         [string]$Verdict = '', [string]$ExpectVerdict = '', [string]$Extra = '')
+    if ($Name -ceq 'N7_provider_timeout') {
+        Assert-Observer ($script:N7InvocationCount -eq 1) 'N7_injected_metadata_invocation_count'
+        Assert-Observer ($script:N7ObservedProcessId -eq [uint32]$script:CaseChildPid) `
+            'N7_injected_metadata_target_pid'
+        Assert-Observer ($script:N7ObservedTimeout -eq $committedBudget -and $committedBudget -eq 1000) `
+            'N7_injected_metadata_timeout_budget'
+        Write-Output ('observer_n7_injection=PASS calls={0} target_pid={1} timeout_ms={2}' -f `
+            $script:N7InvocationCount, $script:N7ObservedProcessId, $script:N7ObservedTimeout)
+    }
     $failed = [bool]$script:EgState.observer_failed
     $line = 'observer_case={0} observed={1} observer_failed={2} verdict={3}{4}' -f $Name, $Observed, $failed, $Verdict, $Extra
     Write-Output $line
@@ -3954,14 +3963,181 @@ try {
 finally {
     $busyField.SetValue($null, 0)
 }
-# Deterministic provider timeout: the committed budget is lowered to 1 ms, far below any
-# measured WMI response, and the committed observer must fail closed.
-$script:EgObserverMetadataTimeoutMilliseconds = 1
+# Execute the committed native timeout-result producer with only its WMI query operation
+# replaced by a deterministic blocked provider. P1 above still uses the original type and
+# real WMI; this clone preserves the production worker, bounded Join and TimedOut branch.
+$nativeSource = (Get-CommittedAssignment '$script:EgNativeSource').Right.Expression.Value
+$nativeTypeDeclaration = 'public static class EnergyGridOneShotSupervisorNative'
+Assert-Observer (([regex]::Matches($nativeSource, [regex]::Escape($nativeTypeDeclaration))).Count -eq 1) `
+    'N7_timeout_probe_type_declaration'
+$timeoutProbeSource = $nativeSource.Replace(
+    $nativeTypeDeclaration, 'public static class EnergyGridOneShotSupervisorTimeoutProbe')
+$producerBranchPattern = 'if\s*\(!queryThread\.Join\(timeoutMilliseconds\)\)\s*\{\s*result\.TimedOut\s*=\s*true;\s*\}'
+Assert-Observer (([regex]::Matches($nativeSource, $producerBranchPattern)).Count -eq 1) `
+    'N7_native_join_timeout_branch_source'
+Assert-Observer (([regex]::Matches($nativeSource, 'queryThread\.Start\(\);')).Count -eq 1) `
+    'N7_native_query_worker_start_source'
+$providerOperationPattern = '(?s)using \(ManagementObjectSearcher searcher = new ManagementObjectSearcher\(\s*"root\\\\cimv2", query\)\)\s*using \(ManagementObjectCollection collection = searcher.Get\(\)\)\s*\{\s*foreach \(ManagementObject item in collection\)\s*\{.*?\s*break;\s*\}\s*\}'
+Assert-Observer (([regex]::Matches($timeoutProbeSource, $providerOperationPattern)).Count -eq 1) `
+    'N7_provider_operation_substitution_site'
+$timeoutProbeSource = [regex]::Replace(
+    $timeoutProbeSource, $providerOperationPattern, 'EgDeterministicProviderSimulator.Hold();', 1)
+Assert-Observer (([regex]::Matches($timeoutProbeSource, 'EgDeterministicProviderSimulator\.Hold\(\);')).Count -eq 1) `
+    'N7_provider_operation_substitution_count'
+Assert-Observer (([regex]::Matches($timeoutProbeSource, $producerBranchPattern)).Count -eq 1) `
+    'N7_timeout_probe_join_branch_preserved'
+$timeoutProbeSource += @'
+
+public static class EgDeterministicProviderSimulator
+{
+    private static readonly System.Threading.ManualResetEvent ProviderEntered =
+        new System.Threading.ManualResetEvent(false);
+    private static readonly System.Threading.ManualResetEvent ProviderRelease =
+        new System.Threading.ManualResetEvent(false);
+    private static readonly System.Threading.ManualResetEvent ProviderCompleted =
+        new System.Threading.ManualResetEvent(false);
+    private static readonly System.Threading.ManualResetEvent QueryReturned =
+        new System.Threading.ManualResetEvent(false);
+    private static int callCount;
+    public static EnergyGridOneShotSupervisorTimeoutProbe.ProcessMetadataResult Result;
+
+    public static void Reset()
+    {
+        ProviderEntered.Reset();
+        ProviderRelease.Reset();
+        ProviderCompleted.Reset();
+        QueryReturned.Reset();
+        Result = null;
+        System.Threading.Interlocked.Exchange(ref callCount, 0);
+    }
+
+    public static void Hold()
+    {
+        System.Threading.Interlocked.Increment(ref callCount);
+        ProviderEntered.Set();
+        ProviderRelease.WaitOne();
+        ProviderCompleted.Set();
+    }
+
+    public static bool WaitUntilEntered(int milliseconds)
+    {
+        return ProviderEntered.WaitOne(milliseconds);
+    }
+
+    public static bool IsCompleted()
+    {
+        return ProviderCompleted.WaitOne(0);
+    }
+
+    public static void Release()
+    {
+        ProviderRelease.Set();
+    }
+
+    public static bool WaitUntilCompleted(int milliseconds)
+    {
+        return ProviderCompleted.WaitOne(milliseconds);
+    }
+
+    public static int GetCallCount()
+    {
+        return System.Threading.Interlocked.CompareExchange(ref callCount, 0, 0);
+    }
+
+    public static void StartQuery(int timeoutMilliseconds)
+    {
+        Thread queryCaller = new Thread(delegate()
+        {
+            Result = EnergyGridOneShotSupervisorTimeoutProbe.QueryProcessMetadata(0u, timeoutMilliseconds);
+            QueryReturned.Set();
+        });
+        queryCaller.IsBackground = true;
+        queryCaller.Start();
+    }
+
+    public static bool WaitForQueryReturn(int milliseconds)
+    {
+        return QueryReturned.WaitOne(milliseconds);
+    }
+}
+'@
+Add-Type -TypeDefinition $timeoutProbeSource -ReferencedAssemblies @('System.Management.dll') -ErrorAction Stop
+$timeoutProbeBusyField = [EnergyGridOneShotSupervisorTimeoutProbe].GetField(
+    'observerBusy', [System.Reflection.BindingFlags]'NonPublic, Static')
+Assert-Observer ($null -ne $timeoutProbeBusyField) 'N7_timeout_probe_busy_field'
+[EgDeterministicProviderSimulator]::Reset()
 try {
-    Invoke-MatrixCase 'N7_provider_timeout' $positive $false $true 'AMBIGUOUS' -Passes 1 -Verdict
+    [EgDeterministicProviderSimulator]::StartQuery([int]$committedBudget)
+    $timeoutProducerWorkerStarted = [EgDeterministicProviderSimulator]::WaitUntilEntered(5000)
+    $timeoutProducerReturned = [EgDeterministicProviderSimulator]::WaitForQueryReturn(5000)
+    Assert-Observer ($timeoutProducerWorkerStarted) 'N7_timeout_probe_worker_started'
+    Assert-Observer ($timeoutProducerReturned) 'N7_timeout_probe_query_returned_after_bound'
+    $timeoutProducerResult = [EgDeterministicProviderSimulator]::Result
+    $timeoutProducerWorkerIncomplete = -not [EgDeterministicProviderSimulator]::IsCompleted()
+    $timeoutProducerCalls = [EgDeterministicProviderSimulator]::GetCallCount()
+    $timeoutProducerBusy = [int]$timeoutProbeBusyField.GetValue($null)
+    Assert-Observer ($timeoutProducerCalls -eq 1) 'N7_timeout_probe_provider_invocation_count'
+    Assert-Observer ($timeoutProducerWorkerIncomplete -and $timeoutProducerBusy -eq 1) `
+        'N7_timeout_probe_worker_incomplete_after_bound'
+    Assert-Observer ($timeoutProducerResult.TimedOut -and -not $timeoutProducerResult.Succeeded -and `
+        -not $timeoutProducerResult.ProviderFailed) 'N7_timeout_probe_result'
 }
 finally {
-    $script:EgObserverMetadataTimeoutMilliseconds = $committedBudget
+    [EgDeterministicProviderSimulator]::Release()
+    Assert-Observer ([EgDeterministicProviderSimulator]::WaitUntilCompleted(5000)) `
+        'N7_timeout_probe_provider_released'
+    Assert-Observer ([EgDeterministicProviderSimulator]::WaitForQueryReturn(5000)) `
+        'N7_timeout_probe_caller_released'
+    for ($i = 0; $i -lt 200 -and [int]$timeoutProbeBusyField.GetValue($null) -ne 0; $i++) {
+        Start-Sleep -Milliseconds 25
+    }
+    Assert-Observer ([int]$timeoutProbeBusyField.GetValue($null) -eq 0) 'N7_timeout_probe_worker_idle'
+}
+Assert-Observer ($timeoutProducerResult.TimedOut -and $timeoutProducerCalls -eq 1 -and `
+    $timeoutProducerWorkerStarted -and $timeoutProducerReturned -and $timeoutProducerWorkerIncomplete) `
+    'N7_timeout_producer_complete'
+Write-Output ('native_timeout_producer=PASS substitutions=1 provider_calls={0} timeout_ms={1} worker_started=True worker_incomplete=True timed_out=True' -f `
+    $timeoutProducerCalls, $committedBudget)
+[EgDeterministicProviderSimulator]::Reset()
+Assert-Observer ([EgDeterministicProviderSimulator]::GetCallCount() -eq 0 -and `
+    -not [EgDeterministicProviderSimulator]::IsCompleted() -and `
+    -not [EgDeterministicProviderSimulator]::WaitForQueryReturn(0)) 'N7_timeout_probe_state_reset'
+
+# Deterministic observer-consumer timeout response. Prove the metadata seam is reached
+# for this case's application child before accepting its AMBIGUOUS verdict.
+$script:N7InvocationCount = 0
+$script:N7ObservedProcessId = [uint32]0
+$script:N7ObservedTimeout = 0
+function Invoke-InjectedProviderTimeout {
+    param([uint32]$ProcessId, [int]$TimeoutMilliseconds)
+    $script:N7InvocationCount++
+    $script:N7ObservedProcessId = [uint32]$ProcessId
+    $script:N7ObservedTimeout = [int]$TimeoutMilliseconds
+    Assert-Observer ($ProcessId -eq [uint32]$script:CaseChildPid) 'N7_intended_application_child'
+    Assert-Observer ($TimeoutMilliseconds -eq $committedBudget -and $committedBudget -eq 1000) `
+        'N7_committed_timeout_budget'
+    $result = New-Object EnergyGridOneShotSupervisorNative+ProcessMetadataResult
+    $result.TimedOut = $true
+    Assert-Observer ($result.TimedOut -and -not $result.Succeeded -and -not $result.ProviderFailed) `
+        'N7_timeout_result'
+    return $result
+}
+Use-CommittedObserver @{ $metadataSite = '(Invoke-InjectedProviderTimeout ([uint32]$candidatePid) $script:EgObserverMetadataTimeoutMilliseconds)' }
+try {
+    Invoke-MatrixCase 'N7_provider_timeout' $positive $false $true 'AMBIGUOUS' -Passes 20 -Verdict
+}
+finally {
+    Use-CommittedObserver
+    Assert-Observer ((Get-Command Test-EgApplicationChild -CommandType Function).ScriptBlock.ToString() -notmatch `
+        'Invoke-InjectedProviderTimeout') 'N7_committed_observer_restored'
+    Remove-Item Function:\Invoke-InjectedProviderTimeout -ErrorAction Stop
+    Assert-Observer ($null -eq (Get-Command Invoke-InjectedProviderTimeout -ErrorAction SilentlyContinue)) `
+        'N7_injected_function_removed'
+    $script:N7InvocationCount = 0
+    $script:N7ObservedProcessId = [uint32]0
+    $script:N7ObservedTimeout = 0
+    Assert-Observer ($script:N7InvocationCount -eq 0 -and $script:N7ObservedProcessId -eq 0 -and `
+        $script:N7ObservedTimeout -eq 0) 'N7_state_reset'
 }
 Wait-ProviderIdle
 
@@ -4267,6 +4443,12 @@ class SupervisorRealObserverTests(unittest.TestCase):
             "observer_case=P2_preflight_noise trials=10 observed=10 observer_failed=0", output)
         self.assertIn(
             "observer_no_row_results=succeeded=False timed_out=False provider_failed=False", output)
+        self.assertRegex(
+            output,
+            r"native_timeout_producer=PASS substitutions=1 provider_calls=1 timeout_ms=1000 "
+            r"worker_started=True worker_incomplete=True timed_out=True")
+        self.assertRegex(
+            output, r"observer_n7_injection=PASS calls=1 target_pid=\d+ timeout_ms=1000")
         self.assertIn("observer_deadline_guard_metadata_calls=0", output)
         self.assertIn("observer_leftover_processes=0", output)
         self.assertIn("real_observer_matrix=PASS cases=17 budget_ms=1000", output)

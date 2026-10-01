@@ -17,8 +17,12 @@ WINDOWS_RESERVED_NAMES = {
     "PRN",
     "AUX",
     "NUL",
+    "CONIN$",
+    "CONOUT$",
     *(f"COM{index}" for index in range(1, 10)),
     *(f"LPT{index}" for index in range(1, 10)),
+    *(f"COM{superscript}" for superscript in ("¹", "²", "³")),
+    *(f"LPT{superscript}" for superscript in ("¹", "²", "³")),
 }
 WINDOWS_INVALID_FILENAME_CHARS = '<>:"/|?*'
 RUN_DIRECTORY_RE = re.compile(
@@ -53,8 +57,8 @@ def validate_filename(filename: str, archive_root: Path) -> Path:
         raise ConfigError("filename has a trailing dot or space")
     if not filename.lower().endswith(".pdf"):
         raise ConfigError("filename must have a PDF extension")
-    stem = filename.rsplit(".", 1)[0].rstrip(" .").upper()
-    if stem in WINDOWS_RESERVED_NAMES:
+    device_base = filename.split(".", 1)[0].rstrip(" .").upper()
+    if device_base in WINDOWS_RESERVED_NAMES:
         raise ConfigError("filename uses a reserved Windows device name")
     final_path = resolved(archive_root / filename)
     if not is_within(final_path, archive_root):

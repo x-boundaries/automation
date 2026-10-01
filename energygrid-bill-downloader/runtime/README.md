@@ -104,6 +104,13 @@ launcher bytes; changing this source file deploys nothing. An installed launcher
 checkout or live-diagnostic bundle built for `v1` must be newly reviewed, rebuilt,
 republished and re-admitted before any future live diagnostic.
 
+`-AuthorisedLauncherRootWriteSid` accepts several identifiers either as a PowerShell array
+(an in-process `&` call) or as ONE comma-separated argument. The second form is the one a
+Scheduled Task uses: `powershell.exe -File` binds `A,B` as the single string `"A,B"`, never
+as an array. The admission splits on the comma (a comma is never part of an identifier) and
+admits every fragment by the same exact rules; an empty fragment is refused, never skipped
+(DL-XB-199 G3-101).
+
 `-ExpectedBranch` is mandatory with an explicit `ANY_BRANCH` sentinel rather than optional,
 so branch binding is never disabled by omitting an argument.
 
@@ -192,11 +199,26 @@ three booleans are recorded. No credential value, length, prefix, suffix, or has
 emitted, logged, measured, or otherwise turned into a reportable quantity.
 
 Output is exactly one JSON object carrying a `checks` map of check name to outcome, an
-overall `status`, and a `support_ref` when the status is not a pass. It contains no path, no
+overall `status`, and, when the status is not a pass, a `support_ref` and a
+`write_authority_diagnostic`. It contains no path, no
 environment value, no credential value, no account identity, no security identifier, no
 trustee or owner name, and no Git output text. It carries no timestamp and no generated
 identifier, so two consecutive runs against unchanged host state produce byte-identical
 output.
+
+`write_authority_diagnostic` (DL-XB-199 G3-101) is `null` unless position 15 or 16
+failed. It then names, from closed vocabularies only, the failing `check`, the internal
+`branch` (for example `PRIVILEGE_READ_FAILED`, `BYPASS_PRIVILEGE_PRESENT`,
+`WRITE_ACCESS_GRANTED`, `SID_ELEMENT_NOT_A_SID`, `OWNER_UNAUTHORISED`,
+`CREATOR_OWNER_WRITE_ENTRY`, `WRITE_ENTRY_UNAUTHORISED`, `DACL_ABSENT`), the examined
+`object` class (`launcher_root` or a Class A member name), the entry's `ace_scope`
+(`EFFECTIVE` or `INHERIT_ONLY`) and `ace_inherited`, and a `trustee_class` taken from the
+.NET well-known identity test (`EVERYONE`, `AUTHENTICATED_USERS`, `BUILTIN_ADMINISTRATORS`,
+`LOCAL_SYSTEM`, ... or the coarse `ACCOUNT_OR_GROUP` / `OTHER`). It never carries an
+identifier, a principal or owner name, or a path, and it changes no verdict, reference or
+exit code. It exists so a false negative can be told apart from a genuinely bad owner or
+trustee without disclosing identity; a genuine finding is corrected in the installation,
+never by weakening the check.
 
 The launcher's real path stops at the first failed check. A validation run evaluates the
 whole non-secret block so the operator sees every outcome at once, then reports the first

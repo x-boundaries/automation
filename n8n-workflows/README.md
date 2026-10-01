@@ -69,9 +69,19 @@ Workflow JSON in this directory is source-controlled evidence of workflow design
 - Only bounded operational metadata is retained: `source`, `event_type`, `failure_stage`, `support_ref`, `run_id`, `exit_code`, alongside the existing n8n error fields. The raw Error Trigger payload is deliberately not retained, and no replacement whole-payload field may be added.
 - The Telegram node carries no `onError`, `continueOnFail`, or `alwaysOutputData`: a failed alert delivery must fail the handler execution and stay visible in n8n rather than being reported as a success. For the same reason this export deliberately does not adopt the sibling exports' `saveDataErrorExecution: none` setting, which would hide that failed execution.
 - This workflow must never be configured as its own error workflow.
-- The future Windows ingress workflow and the missing-heartbeat watchdog workflow are separate workflows and are not included here.
+- The Windows alert ingress is the separate `energygrid_alert_ingress.workflow.json` below; the missing-heartbeat watchdog workflow is not included here.
 - Committing this file performs no live n8n action. Import, credential binding, activation, and execution each require separate explicit current-turn approval.
 - Focused offline coverage: [tests/test_energygrid_n8n_error_handler.py](../tests/test_energygrid_n8n_error_handler.py).
+
+### energygrid_alert_ingress.workflow.json
+
+- Purpose: loopback-only ingress for the Energy@Grid direct-HTTP runtime's terminal-failure alert (DL-XB-199 G3-101). The runtime POSTs one `energygrid.alert.v1` payload; the workflow validates it against a strict allowlist and forwards a plain-text message to the existing Telegram capability for the Owner.
+- Architecture: `EnergyGrid Alert Webhook` (POST, Header Auth, `responseMode: lastNode`) -> `Validate Alert Payload` (Code: exact keys, closed vocabularies, bounded values; anything else fails the execution) -> `Send EnergyGrid Alert` (Telegram, plain text).
+- Privacy: the payload never carries a tenant/account identifier, endpoint, filename, bill content, header or credential value, and the Code node rejects any extra key. Delivery failure surfaces to the runtime as a non-2xx answer, which the runtime only logs: an alert never changes the bill run's result.
+- Status: source-controlled, inactive, credential-free, MCP exposure disabled (`settings.availableInMCP: false`), `staticData: null`, no `webhookId`. The webhook path ships as `REPLACE_WITH_ALERT_WEBHOOK_PATH` and the chat as `REPLACE_WITH_TELEGRAM_CHAT_ID`; the operator binds the Header Auth and Telegram credentials and real values only in a separately authorised local import copy. n8n must listen on loopback for this ingress.
+- Runbook: [Energy@Grid runbook](../energygrid-bill-downloader/docs/runbook.md) (Direct-HTTP MVP daily path, Failure alert).
+- Committing this file performs no live n8n action. Import, credential binding, activation and execution each require separate explicit current-turn approval.
+- Focused offline coverage: [energygrid-bill-downloader/tests/test_alert_ingress_workflow.py](../energygrid-bill-downloader/tests/test_alert_ingress_workflow.py).
 
 ## Directory Rules
 

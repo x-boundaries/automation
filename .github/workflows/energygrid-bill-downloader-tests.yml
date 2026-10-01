@@ -11,6 +11,7 @@ on:
       # broad n8n-workflows/** or tests/** glob, which would widen the reviewed trigger
       # surface beyond what this workflow owns.
       - "n8n-workflows/energygrid_download_error_handler.workflow.json"
+      - "n8n-workflows/energygrid_alert_ingress.workflow.json"
       - "tests/test_energygrid_n8n_error_handler.py"
       - "n8n-workflows/README.md"
       - "README.md"
@@ -117,6 +118,7 @@ jobs:
             $_ -eq 'scripts/energygrid_one_shot_supervisor.ps1' -or
             $_ -eq '.github/workflows/energygrid-bill-downloader-tests.yml' -or
             $_ -eq 'n8n-workflows/energygrid_download_error_handler.workflow.json' -or
+            $_ -eq 'n8n-workflows/energygrid_alert_ingress.workflow.json' -or
             $_ -eq 'tests/test_energygrid_n8n_error_handler.py'
           })
           if ($owned.Count -eq 0) {
@@ -127,6 +129,7 @@ jobs:
                   $file -ne 'scripts/energygrid_one_shot_supervisor.ps1' -and
                   $file -ne '.github/workflows/energygrid-bill-downloader-tests.yml' -and
                   $file -ne 'n8n-workflows/energygrid_download_error_handler.workflow.json' -and
+                  $file -ne 'n8n-workflows/energygrid_alert_ingress.workflow.json' -and
                   $file -ne 'tests/test_energygrid_n8n_error_handler.py' -and
                   $file -ne 'n8n-workflows/README.md' -and
                   $file -ne 'README.md' -and

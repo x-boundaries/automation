@@ -10,6 +10,23 @@ add n8n, email parsing, recurring LLM use, AutoCount integration, or a live API
 client. The browser is used only through the selectors in
 `energygrid_bill_downloader/portal.py`; all tests use the local synthetic portal.
 
+## Direct-HTTP MVP daily path (DL-XB-199 G3-101)
+
+The Owner-fixed MVP daily path is deterministic direct HTTP: one LIST for the
+privately configured X-Boundaries tenant identifier, then a FETCH of each listed
+bill that is not already archived, the existing PDF validation, no-replace
+publication and state reconciliation, and a privacy-minimal loopback alert on a
+terminal failure. It uses no browser, no Playwright, no AI and no fallback, and
+never enumerates tenants. Select it with `"source": "direct_http"` in the private
+configuration (shape: `config/energygrid.direct_http.example.json`, placeholders
+only); the endpoint identity and tenant identifier stay in that private file and
+never reach a log, stdout or alert. A broken HTTP contract fails closed with a
+bounded `EG_HTTP_*` / `EG_INVENTORY_*` reference and an alert, and the case is
+reopened for scoped discovery. Details, the fail-closed reference table, the
+single-run lock and the alert contract are in `docs/runbook.md`.
+
+The browser source below remains the legacy default when `source` is absent.
+
 ## Install and configure
 
 Use a dedicated Python 3.14.x environment. Install the pinned package and
@@ -91,7 +108,9 @@ never committed.
 ## Tests
 
 The suite is standard-library `unittest` plus browser-backed tests against a
-local `ThreadingHTTPServer` fixture. It requires no Energy@Grid credentials or
+local `ThreadingHTTPServer` fixture. The direct-HTTP path is covered by
+`tests/test_direct_http.py` against a loopback synthetic bill service that plants
+canary values and asserts none reaches a log, stdout or alert. It requires no Energy@Grid credentials or
 authenticated network call:
 
 ```powershell

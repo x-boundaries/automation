@@ -99,6 +99,9 @@ foreach ($name in $script:EgOrderedCheckNames) {
 
 $script:EgFirstFailure = ''
 $script:EgFirstFailureRef = ''
+# DL-XB-199 G3-101: the closed branch diagnostic of positions 15 and 16, or null. It is
+# evidence for a failing -ValidateOnly run only and never changes a verdict.
+$script:EgWriteAuthorityDiagnostic = $null
 
 function Set-EgCheckOutcome {
     param(
@@ -161,7 +164,7 @@ function Exit-EgLauncher {
             $supportRef = $script:EgFirstFailureRef
         }
         Write-Output (ConvertTo-EgValidationJson -Checks $script:EgChecks -Status $status `
-            -SupportRef $supportRef)
+            -SupportRef $supportRef -WriteAuthorityDiagnostic $script:EgWriteAuthorityDiagnostic)
     }
     exit $ExitCode
 }
@@ -281,6 +284,7 @@ if (Test-EgPreflightShouldContinue) {
     $securityResult = Test-EgLauncherRootSecurity -LauncherRootPath $launcherRoot `
         -CheckoutRootPath $CheckoutRoot `
         -AuthorisedLauncherRootWriteSid $AuthorisedLauncherRootWriteSid
+    $script:EgWriteAuthorityDiagnostic = $securityResult.Diagnostic
     Merge-EgCheckResult -Result $securityResult -Positions @(
         'launcher_root_outside_checkout',
         'launcher_root_not_writable_by_run_principal',

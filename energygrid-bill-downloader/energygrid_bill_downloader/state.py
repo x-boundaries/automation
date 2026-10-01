@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import stat
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -49,12 +50,16 @@ class BillRecord:
 
 
 class StateStore:
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, read_only: bool = False) -> None:
         self.path = path
+        self.read_only = read_only
         self.connection: sqlite3.Connection | None = None
 
     def __enter__(self) -> "StateStore":
         try:
+            if self.read_only:
+                self._open_read_only()
+                return self
             self.path.parent.mkdir(parents=True, exist_ok=True)
             self.connection = sqlite3.connect(self.path, timeout=30, isolation_level=None)
             self.connection.execute("PRAGMA foreign_keys=ON")
@@ -63,6 +68,51 @@ class StateStore:
         except (OSError, sqlite3.Error, StateError) as exc:
             self.close()
             raise StateError("state database could not be opened") from exc
+
+    def _open_read_only(self) -> None:
+        if not stat.S_ISREG(self.path.lstat().st_mode):
+            raise StateError("state database must be an existing regular file")
+        # lstat distinguishes absence from an inspection error and also sees
+        # dangling sidecar links. Neither WAL nor journal recovery is allowed.
+        for suffix in ("-wal", "-shm", "-journal"):
+            try:
+                self.path.with_name(self.path.name + suffix).lstat()
+            except FileNotFoundError:
+                continue
+            raise StateError("state database has an operational sidecar")
+        with self.path.open("rb") as stream:
+            header = stream.read(100)
+        if (
+            len(header) != 100 or header[:16] != b"SQLite format 3\x00"
+            or header[18:20] != b"\x01\x01"
+        ):
+            raise StateError("state database format is incompatible")
+        # as_uri percent-encodes reserved characters in the *path*, before the
+        # mode query is appended. immutable=1 would bypass SQLite's locking.
+        uri = self.path.resolve().as_uri() + "?mode=ro"
+        self.connection = sqlite3.connect(uri, uri=True, timeout=30, isolation_level=None)
+        connection = self.connection
+        connection.execute("PRAGMA query_only=ON")
+        connection.execute("PRAGMA temp_store=MEMORY")
+        if connection.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:
+            raise StateError("state database schema is incompatible")
+        tables = [row for row in connection.execute("PRAGMA table_list") if row[0:2] == ("main", "bills")]
+        if len(tables) != 1 or tables[0][2] != "table":
+            raise StateError("state database schema is incompatible")
+        columns = {row[1]: row for row in connection.execute("PRAGMA main.table_xinfo(bills)")}
+        if not REQUIRED_COLUMNS.issubset(columns):
+            raise StateError("state database schema is incompatible")
+        for name in REQUIRED_COLUMNS:
+            column = columns[name]
+            expected_type = "INTEGER" if name in {"byte_size", "attempt_count"} else "TEXT"
+            if column[2].upper() != expected_type or column[6] != 0:
+                raise StateError("state database schema is incompatible")
+        if columns["filename_key"][5] != 1:
+            raise StateError("state database schema is incompatible")
+
+    def _require_writable(self) -> None:
+        if self.read_only:
+            raise StateError("state database is read-only")
 
     def __exit__(self, exc_type, exc, tb) -> None:
         self.close()
@@ -153,6 +203,7 @@ class StateStore:
             yield _record_from_row(row)
 
     def _initialize(self) -> None:
+        self._require_writable()
         connection = self._require_connection()
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
         if version > SCHEMA_VERSION:
@@ -186,6 +237,7 @@ class StateStore:
             raise
 
     def _transaction(self, statement: str, parameters: tuple = ()) -> None:
+        self._require_writable()
         connection = self._require_connection()
         try:
             connection.execute("BEGIN IMMEDIATE")

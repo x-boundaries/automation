@@ -5020,15 +5020,23 @@ $emitted = switch ($Op) {
         # An empty or null set is refused by the mandatory parameter contract before the
         # function body runs, which is itself the refusal DD-12 requires. The fixture
         # reports that as the same bounded refusal rather than letting it escape.
+        # DL-XB-199 G3-101: `joined` delivers the set exactly as `powershell.exe -File`
+        # delivers it from a Scheduled Task: ONE comma-separated string.
+        $supplied = [string[]]@($resolved)
+        $joined = ($null -ne $spec.PSObject.Properties['joined']) -and [bool]$spec.joined
+        if ($joined) {
+            $supplied = [string[]]@(($resolved -join ','))
+        }
         $admission = $null
         try {
-            $admission = Test-EgAuthorisedWriteSidSet -AuthorisedSid ([string[]]@($resolved))
+            $admission = Test-EgAuthorisedWriteSidSet -AuthorisedSid $supplied
         }
         catch {
             $admission = [pscustomobject]@{
                 Pass       = $false
                 SupportRef = 'EG_LAUNCHER_ROOT_AUTHORISED_SID_SET_INVALID'
                 Sids       = @()
+                Branch     = ''
             }
         }
 
@@ -5049,17 +5057,38 @@ $emitted = switch ($Op) {
                 anyWriteGranted = $tokenCheck.AnyWriteGranted
                 evaluated       = $tokenCheck.Evaluated
                 supportRef      = $tokenCheck.SupportRef
+                branch          = $tokenCheck.Branch
             })
             if ($admission.Pass) {
                 $trusteeCheck = Test-EgPathWriteTrusteesAuthorised -Path $object.Path `
                     -AuthorisedSid $admission.Sids
                 $trusteeResults = $trusteeResults + ([ordered]@{
-                    name       = $object.Name
-                    authorised = $trusteeCheck.Authorised
-                    evaluated  = $trusteeCheck.Evaluated
-                    supportRef = $trusteeCheck.SupportRef
+                    name         = $object.Name
+                    authorised   = $trusteeCheck.Authorised
+                    evaluated    = $trusteeCheck.Evaluated
+                    supportRef   = $trusteeCheck.SupportRef
+                    branch       = $trusteeCheck.Branch
+                    aceScope     = $trusteeCheck.AceScope
+                    aceInherited = $trusteeCheck.AceInherited
+                    trusteeClass = $trusteeCheck.TrusteeClass
                 })
             }
+        }
+
+        # The aggregate, exactly as the launcher calls it, and the validation document the
+        # launcher would emit from it. The checkout path is a sibling that never contains
+        # the root, so position 14 passes and positions 15 and 16 are what is observed.
+        # An empty set never reaches the aggregate: its mandatory parameter refuses it.
+        $security = [pscustomobject]@{ Pass = $false; SupportRef = ''; Diagnostic = $null }
+        $validationJson = ''
+        if (@($supplied).Count -gt 0) {
+            $security = Test-EgLauncherRootSecurity -LauncherRootPath $Root `
+                -CheckoutRootPath (Join-Path (Split-Path -Parent $Root) 'eg_no_checkout') `
+                -AuthorisedLauncherRootWriteSid $supplied
+            $securityStatus = 'FAIL'
+            if ($security.Pass) { $securityStatus = 'PASS' }
+            $validationJson = ConvertTo-EgValidationJson -Checks $security.Checks -Status $securityStatus `
+                -SupportRef $security.SupportRef -WriteAuthorityDiagnostic $security.Diagnostic
         }
 
         $privileges = Get-EgTokenPrivilegeNames
@@ -5067,6 +5096,11 @@ $emitted = switch ($Op) {
             privilegeNames      = @($privileges.PrivilegeNames)
             admissionPass       = $admission.Pass
             admissionSupportRef = $admission.SupportRef
+            admissionBranch     = [string]$admission.Branch
+            securityPass        = $security.Pass
+            securitySupportRef  = $security.SupportRef
+            securityDiagnostic  = $security.Diagnostic
+            validationJson      = $validationJson
             admittedCount       = @($admission.Sids).Count
             mappedMask          = (Get-EgMappedWriteCapableMask)
             declaredMask        = $script:EgWriteCapableAccessMask
@@ -5362,7 +5396,7 @@ def build_scratch_launcher_root(exe, tmp, shape, right=""):
     return root, built
 
 
-def check_write_authority(exe, tmp, root, authorised=("OWNER",)):
+def check_write_authority(exe, tmp, root, authorised=("OWNER",), joined=False):
     """Evaluate both launcher-root write checks over a prepared scratch root.
 
     The default authorised set is the OBSERVED owner of the scratch root, not the running
@@ -5371,7 +5405,9 @@ def check_write_authority(exe, tmp, root, authorised=("OWNER",)):
     supplied set, so assuming the running user would make the fixture pass only on
     non-elevated hosts.
     """
-    spec = write_json(tmp, "authorised_spec.json", {"authorised": list(authorised)})
+    spec = write_json(
+        tmp, "authorised_spec.json", {"authorised": list(authorised), "joined": bool(joined)}
+    )
     return acl_probe(exe, "check", tmp, root, json=spec)
 
 
@@ -6127,6 +6163,203 @@ REQUIRED_INTEROP_IMPORTS = (
 )
 
 
+# --------------------------------------------------------------------------------------
+# DL-XB-199 G3-101: Scheduled Task binding and the write-authority branch diagnostic
+# --------------------------------------------------------------------------------------
+
+DIAGNOSTIC_KEYS = ["check", "branch", "object", "ace_scope", "ace_inherited", "trustee_class"]
+DIAGNOSTIC_TRUSTEE_CLASSES = {
+    "EVERYONE", "CREATOR_OWNER", "CREATOR_GROUP", "INTERACTIVE", "AUTHENTICATED_USERS",
+    "LOCAL_SYSTEM", "LOCAL_SERVICE", "NETWORK_SERVICE", "BUILTIN_ADMINISTRATORS",
+    "BUILTIN_USERS", "ACCOUNT_OR_GROUP", "OTHER",
+}
+
+FILE_BINDING_PROBE = r"""
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory)][string]$Lib,
+    [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string[]]$AuthorisedLauncherRootWriteSid
+)
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+. $Lib
+$admission = Test-EgAuthorisedWriteSidSet -AuthorisedSid $AuthorisedLauncherRootWriteSid
+[ordered]@{
+    boundElementCount = @($AuthorisedLauncherRootWriteSid).Count
+    admissionPass     = $admission.Pass
+    admittedCount     = @($admission.Sids).Count
+    branch            = [string]$admission.Branch
+} | ConvertTo-Json -Compress
+"""
+
+
+class ScheduledTaskSidBinding(TierBBase):
+    """The -File binding a Scheduled Task uses, on the Windows PowerShell 5.1 boundary.
+
+    `powershell.exe -File launcher.ps1 -AuthorisedLauncherRootWriteSid A,B` binds ONE string
+    "A,B". Before G3-101 the admission refused it, so every multi-trustee set failed the
+    real scheduled invocation while an in-process `&` call passed: a deterministic false
+    negative of position 16 on a compliant host.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        TierBBase.setUpClass()
+        cls.exe = DESKTOP_PS
+
+    def run_probe(self, value):
+        with TemporaryScratch() as tmp:
+            script = Path(tmp) / "eg_file_binding_probe.ps1"
+            script.write_text(FILE_BINDING_PROBE, encoding="utf-8")
+            completed = run_ps(self.exe, script, "-Lib", str(LIB),
+                               "-AuthorisedLauncherRootWriteSid", value)
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        return json.loads(completed.stdout)
+
+    def test_file_binding_delivers_one_string_and_the_admission_splits_it(self):
+        observed = self.run_probe("S-1-5-4,S-1-2-1,S-1-1-0")
+        self.assertEqual(1, observed["boundElementCount"], "the -File binding reality")
+        self.assertTrue(observed["admissionPass"], observed["branch"])
+        self.assertEqual(3, observed["admittedCount"])
+
+    def test_single_identifier_is_unchanged(self):
+        observed = self.run_probe("S-1-5-4")
+        self.assertTrue(observed["admissionPass"])
+        self.assertEqual(1, observed["admittedCount"])
+
+    def test_every_malformed_fragment_is_still_refused(self):
+        cases = {
+            "S-1-5-4,": "SID_ELEMENT_BLANK",
+            "S-1-5-4,,S-1-1-0": "SID_ELEMENT_BLANK",
+            ",S-1-5-4": "SID_ELEMENT_BLANK",
+            "S-1-5-4,not-a-sid": "SID_ELEMENT_NOT_A_SID",
+            "S-1-5-4,S-1-3-0": "SID_CREATOR_OWNER_SUPPLIED",
+            "S-1-5-4,s-1-1-0": "SID_ELEMENT_NOT_CANONICAL",
+            "S-1-5-4;S-1-1-0": "SID_ELEMENT_NOT_A_SID",
+        }
+        for value, branch in cases.items():
+            with self.subTest(value=value):
+                observed = self.run_probe(value)
+                self.assertFalse(observed["admissionPass"])
+                self.assertEqual(0, observed["admittedCount"])
+                self.assertEqual(branch, observed["branch"])
+
+
+class WriteAuthorityBranchDiagnostic(TierABase):
+    """Branch-level observability for positions 15 and 16, closed and non-identifying."""
+
+    def assert_run_principal_branch(self, diagnostic, bypass_present):
+        """Host-dependent by design: an elevated or CI token holding a bypass privilege
+        fails position 15 before any object is examined; otherwise the writable scratch
+        root is the first examined object and is reported as granted."""
+        if bypass_present:
+            self.assertEqual("BYPASS_PRIVILEGE_PRESENT", diagnostic["branch"])
+            self.assertIsNone(diagnostic["object"])
+        else:
+            self.assertEqual("WRITE_ACCESS_GRANTED", diagnostic["branch"])
+            self.assertEqual("launcher_root", diagnostic["object"])
+        self.assertIsNone(diagnostic["ace_scope"])
+        self.assertIsNone(diagnostic["trustee_class"])
+
+    def assert_closed_validation(self, observed):
+        document = json.loads(observed["validationJson"])
+        self.assertEqual("FAIL", document["status"])
+        diagnostic = document["write_authority_diagnostic"]
+        self.assertIsNotNone(diagnostic)
+        self.assertEqual(DIAGNOSTIC_KEYS, list(diagnostic))
+        text = observed["validationJson"]
+        self.assertIsNone(re.search(r"S-1-(?:\d+-)+\d+", text), "no identifier on the surface")
+        self.assertIsNone(re.search(r"[A-Za-z]:\\\\", text), "no path on the surface")
+        return diagnostic
+
+    def test_all_authorised_multi_trustee_positive_control(self):
+        """The joined set (the Scheduled Task shape) passes position 16 on every object."""
+        with TemporaryScratch() as tmp:
+            root, _built = build_scratch_launcher_root(ANY_PS, tmp, "authorised_self")
+            observed = check_write_authority(
+                ANY_PS, tmp, root, authorised=("OWNER", "SERVICE", "WORLD"), joined=True
+            )
+        self.assertTrue(observed["admissionPass"], observed["admissionBranch"])
+        self.assertEqual(3, observed["admittedCount"])
+        self.assertEqual(4, len(observed["trusteeChecks"]))
+        for entry in observed["trusteeChecks"]:
+            with self.subTest(examined=entry["name"]):
+                self.assertTrue(entry["authorised"], entry["branch"])
+                self.assertEqual("", entry["branch"])
+
+    def test_genuinely_bad_trustee_negative_controls_name_their_branch(self):
+        cases = [
+            ("world_write_root", ("OWNER",), "(root)", "WRITE_ENTRY_UNAUTHORISED",
+             "EFFECTIVE", False, "EVERYONE"),
+            ("world_write_member", ("OWNER",), "launcher_lib.ps1", "WRITE_ENTRY_UNAUTHORISED",
+             "EFFECTIVE", False, "EVERYONE"),
+            ("inherited_world_write", ("OWNER",), "launcher_lib.ps1", "WRITE_ENTRY_UNAUTHORISED",
+             "EFFECTIVE", True, "EVERYONE"),
+            ("service_write_root", ("OWNER",), "(root)", "WRITE_ENTRY_UNAUTHORISED",
+             "EFFECTIVE", False, "OTHER"),
+            # Windows stores an inheritable CREATOR OWNER entry as inherit-only on the root.
+            ("creator_owner_inheritable", ("OWNER",), "(root)", "CREATOR_OWNER_WRITE_ENTRY",
+             "INHERIT_ONLY", False, "CREATOR_OWNER"),
+            ("null_dacl_member", ("OWNER",), "launcher_lib.ps1", "DACL_ABSENT", "", None, ""),
+        ]
+        for shape, authorised, examined, branch, scope, inherited, trustee in cases:
+            with self.subTest(shape=shape):
+                with TemporaryScratch() as tmp:
+                    root, _built = build_scratch_launcher_root(ANY_PS, tmp, shape)
+                    observed = check_write_authority(ANY_PS, tmp, root, authorised=authorised)
+                entry = outcome_for(observed["trusteeChecks"], examined)
+                self.assertFalse(entry["authorised"])
+                self.assertEqual(TRUSTEE_REF, entry["supportRef"], "the reference is unchanged")
+                self.assertEqual(branch, entry["branch"])
+                self.assertEqual(scope, entry["aceScope"])
+                self.assertEqual(inherited, entry["aceInherited"])
+                self.assertEqual(trustee, entry["trusteeClass"])
+
+    def test_owner_outside_the_set_is_its_own_branch(self):
+        with TemporaryScratch() as tmp:
+            root, _built = build_scratch_launcher_root(ANY_PS, tmp, "authorised_self")
+            observed = check_write_authority(ANY_PS, tmp, root, authorised=("WORLD",))
+        entry = outcome_for(observed["trusteeChecks"], "(root)")
+        self.assertEqual("OWNER_UNAUTHORISED", entry["branch"])
+        self.assertIn(entry["trusteeClass"], {"ACCOUNT_OR_GROUP", "BUILTIN_ADMINISTRATORS"})
+        self.assertEqual("", entry["aceScope"])
+
+    def test_a_writable_root_reports_the_run_principal_branch_through_the_aggregate(self):
+        with TemporaryScratch() as tmp:
+            root, _built = build_scratch_launcher_root(ANY_PS, tmp, "authorised_self")
+            observed = check_write_authority(ANY_PS, tmp, root)
+        self.assertFalse(observed["securityPass"])
+        self.assertEqual(RUN_PRINCIPAL_REF, observed["securitySupportRef"])
+        diagnostic = self.assert_closed_validation(observed)
+        self.assertEqual("launcher_root_not_writable_by_run_principal", diagnostic["check"])
+        self.assert_run_principal_branch(diagnostic, observed["bypassPresent"])
+
+    def test_a_refused_set_reports_its_branch_through_the_aggregate(self):
+        with TemporaryScratch() as tmp:
+            root, _built = build_scratch_launcher_root(ANY_PS, tmp, "member_no_write")
+            observed = check_write_authority(ANY_PS, tmp, root, authorised=("OWNER", "bad"), joined=True)
+        self.assertFalse(observed["admissionPass"])
+        self.assertEqual("SID_ELEMENT_NOT_A_SID", observed["admissionBranch"])
+
+    def test_the_full_launcher_emits_the_closed_diagnostic_on_validate_only(self):
+        """Full launcher context: the real installed launcher.ps1 under -File."""
+        with TemporaryScratch() as tmp:
+            environment = LauncherEnvironment(tmp, ANY_PS).build()
+            completed = environment.run(authorised=["S-1-1-0", "S-1-5-4"])
+            emitted = completed.stdout.strip()
+        self.assertEqual(EXIT_PREFLIGHT_FAILED, completed.returncode)
+        observed = launcher_validation(completed)
+        diagnostic = observed["write_authority_diagnostic"]
+        self.assertEqual(DIAGNOSTIC_KEYS, list(diagnostic))
+        self.assertEqual("launcher_root_not_writable_by_run_principal", diagnostic["check"])
+        with TemporaryScratch() as tmp:
+            root, _built = build_scratch_launcher_root(ANY_PS, tmp, "authorised_self")
+            bypass_present = check_write_authority(ANY_PS, tmp, root)["bypassPresent"]
+        self.assert_run_principal_branch(diagnostic, bypass_present)
+        self.assertIsNone(re.search(r"S-1-(?:\d+-)+\d+", emitted))
+        self.assertNotIn(str(environment.launcher_root), emitted)
+
+
 class WriteAuthorityStaticGuards(TierCBase):
     """Task 16, Tier C: EGRT-T61, EGRT-T63, EGRT-T70, and EGRT-T71 static halves.
 
@@ -6562,7 +6795,9 @@ class LauncherPreflightContract(TierABase):
             list(observed["checks"].keys()),
             "the checks map key order is part of the contract",
         )
-        self.assertEqual({"checks", "status", "support_ref"}, set(observed.keys()))
+        self.assertEqual(
+            {"checks", "status", "support_ref", "write_authority_diagnostic"}, set(observed.keys())
+        )
 
     def test_the_non_secret_preflight_reaches_the_launcher_root_security_group(self):
         """Positions 1 to 13 pass against a correctly prepared scratch deployment."""
@@ -6781,6 +7016,46 @@ class LauncherPreflightContract(TierABase):
                 self.assertEqual(
                     "EG_LAUNCHER_CONFIG_KEY_MISSING", observed["support_ref"]
                 )
+
+    def test_a_direct_http_config_satisfies_position_ten_without_browser_keys(self):
+        """DL-XB-199 G3-101: the source-aware key set, in the real installed launcher."""
+        direct = {
+            "source": "direct_http",
+            "direct_http": {
+                "list_url": "https://list.placeholder.invalid/x",
+                "fetch_url": "https://fetch.placeholder.invalid/y",
+                "tenant_id": "REPLACE_WITH_PRIVATE_TENANT_ID",
+            },
+        }
+        with TemporaryScratch() as tmp:
+            environment = LauncherEnvironment(tmp, ANY_PS).build(
+                config_overrides=direct, omit_config_keys=("portal_url", "account_identity")
+            )
+            observed = launcher_validation(environment.run())
+        for position in ("config_parses_json", "config_required_keys_present"):
+            self.assertEqual("PASS", observed["checks"][position])
+
+        broken = [
+            ({"source": "direct_http"}, ("portal_url", "account_identity")),
+            ({**direct, "direct_http": {"list_url": "https://a.invalid/x", "fetch_url": "https://a.invalid/y"}},
+             ("portal_url", "account_identity")),
+            ({**direct, "direct_http": {**direct["direct_http"], "tenant_id": "  "}},
+             ("portal_url", "account_identity")),
+            ({**direct, "direct_http": "not-an-object"}, ("portal_url", "account_identity")),
+            ({**direct, "source": "auto"}, ()),
+            ({**direct, "source": "DIRECT_HTTP"}, ()),
+            ({**direct, "archive_root": ""}, ("portal_url", "account_identity")),
+            ({"source": "browser"}, ("account_identity",)),
+        ]
+        for overrides, omitted in broken:
+            with self.subTest(overrides=str(overrides)[:70], omitted=omitted):
+                with TemporaryScratch() as tmp:
+                    environment = LauncherEnvironment(tmp, ANY_PS).build(
+                        config_overrides=overrides, omit_config_keys=omitted
+                    )
+                    observed = launcher_validation(environment.run())
+                self.assertEqual("FAIL", observed["checks"]["config_required_keys_present"])
+                self.assertEqual("EG_LAUNCHER_CONFIG_KEY_MISSING", observed["support_ref"])
 
     def test_an_unsupported_interpreter_version_fails_closed(self):
         """Position 11 requires a 3.14.x interpreter."""
@@ -7525,7 +7800,9 @@ class ValidateOnlyContract(TierABase):
             emitted = completed.stdout.strip()
             observed = launcher_validation(completed)
 
-            self.assertEqual({"checks", "status", "support_ref"}, set(observed.keys()))
+            self.assertEqual(
+            {"checks", "status", "support_ref", "write_authority_diagnostic"}, set(observed.keys())
+        )
             self.assertIsNone(
                 re.search(r"[A-Za-z]:\\\\", emitted),
                 "no Windows absolute path may reach the validation surface",

@@ -779,6 +779,149 @@ function Test-EgPathIsWithin {
     return $candidate.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)
 }
 
+# --------------------------------------------------------------------------------------
+# Write-authority branch diagnostic (DL-XB-199 G3-101)
+# --------------------------------------------------------------------------------------
+# Positions 15 and 16 each collapse several internal failure branches into one public
+# support reference. That is right for the reference, but it left an operator unable to
+# tell a bad owner from an inherit-only entry from an unreadable descriptor. The
+# diagnostic names the branch with a CLOSED vocabulary and nothing else: the examined
+# object's fixed class label, the entry's scope and origin, and a well-known trustee
+# CLASS. It never carries a security identifier, a principal or owner name, a path, or a
+# count derived from them. It is evidence only: it changes no verdict, no check, no
+# reference and no exit code, and it is emitted only on a failing -ValidateOnly run.
+
+$script:EgWriteAuthorityDiagnosticChecks = @(
+    'launcher_root_not_writable_by_run_principal',
+    'launcher_root_write_trustees_authorised'
+)
+$script:EgWriteAuthorityDiagnosticBranches = @(
+    # launcher_root_not_writable_by_run_principal
+    'PRIVILEGE_READ_FAILED',
+    'BYPASS_PRIVILEGE_PRESENT',
+    'ACCESS_CHECK_NOT_EVALUATED',
+    'WRITE_ACCESS_GRANTED',
+    # launcher_root_write_trustees_authorised: the supplied set
+    'SID_SET_EMPTY',
+    'SID_ELEMENT_BLANK',
+    'SID_CREATOR_OWNER_SUPPLIED',
+    'SID_ELEMENT_NOT_A_SID',
+    'SID_ELEMENT_NOT_CANONICAL',
+    # launcher_root_write_trustees_authorised: one examined object
+    'DESCRIPTOR_UNREADABLE',
+    'DESCRIPTOR_UNPARSABLE',
+    'DACL_ABSENT',
+    'MASK_UNAVAILABLE',
+    'OWNER_UNREADABLE',
+    'OWNER_UNAUTHORISED',
+    'CREATOR_OWNER_WRITE_ENTRY',
+    'WRITE_ENTRY_UNAUTHORISED'
+)
+$script:EgWriteAuthorityDiagnosticObjects = @(
+    'launcher_root', 'launcher.ps1', 'launcher_lib.ps1', 'installation_manifest.json'
+)
+$script:EgWriteAuthorityDiagnosticAceScopes = @('EFFECTIVE', 'INHERIT_ONLY')
+
+# Well-known identities are identical on every Windows host, so naming their CLASS
+# discloses nothing about this deployment. They are recognised through the .NET
+# well-known-type test, never through an identifier literal or a prefix comparison;
+# anything else is only ever the coarse ACCOUNT_OR_GROUP or OTHER class.
+$script:EgWellKnownTrusteeClassTypes = @(
+    @('WorldSid', 'EVERYONE'),
+    @('CreatorOwnerSid', 'CREATOR_OWNER'),
+    @('CreatorGroupSid', 'CREATOR_GROUP'),
+    @('InteractiveSid', 'INTERACTIVE'),
+    @('AuthenticatedUserSid', 'AUTHENTICATED_USERS'),
+    @('LocalSystemSid', 'LOCAL_SYSTEM'),
+    @('LocalServiceSid', 'LOCAL_SERVICE'),
+    @('NetworkServiceSid', 'NETWORK_SERVICE'),
+    @('BuiltinAdministratorsSid', 'BUILTIN_ADMINISTRATORS'),
+    @('BuiltinUsersSid', 'BUILTIN_USERS')
+)
+$script:EgTrusteeClasses = @(
+    @($script:EgWellKnownTrusteeClassTypes | ForEach-Object { $_[1] }) + @('ACCOUNT_OR_GROUP', 'OTHER')
+)
+
+function Get-EgTrusteeClass {
+    # Map one identity to its closed class. Pure; never returns or emits the identifier.
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][ValidateNotNull()][System.Security.Principal.SecurityIdentifier]$Sid)
+
+    foreach ($pair in $script:EgWellKnownTrusteeClassTypes) {
+        $type = [System.Security.Principal.WellKnownSidType]$pair[0]
+        if ($Sid.IsWellKnown($type)) {
+            return [string]$pair[1]
+        }
+    }
+    if ($null -ne $Sid.AccountDomainSid) {
+        return 'ACCOUNT_OR_GROUP'
+    }
+    return 'OTHER'
+}
+
+function New-EgWriteAuthorityDiagnostic {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Check,
+        [AllowEmptyString()][string]$Branch = '',
+        [AllowEmptyString()][string]$Object = '',
+        [AllowEmptyString()][string]$AceScope = '',
+        $AceInherited = $null,
+        [AllowEmptyString()][string]$TrusteeClass = ''
+    )
+
+    $diagnostic = [ordered]@{}
+    $diagnostic['check'] = $Check
+    $diagnostic['branch'] = $Branch
+    $diagnostic['object'] = $null
+    if (-not [string]::IsNullOrEmpty($Object)) { $diagnostic['object'] = $Object }
+    $diagnostic['ace_scope'] = $null
+    if (-not [string]::IsNullOrEmpty($AceScope)) { $diagnostic['ace_scope'] = $AceScope }
+    $diagnostic['ace_inherited'] = $null
+    if ($AceInherited -is [bool]) { $diagnostic['ace_inherited'] = $AceInherited }
+    $diagnostic['trustee_class'] = $null
+    if (-not [string]::IsNullOrEmpty($TrusteeClass)) { $diagnostic['trustee_class'] = $TrusteeClass }
+    return $diagnostic
+}
+
+function Test-EgWriteAuthorityDiagnosticClosed {
+    # A diagnostic reaches the validation surface only when every value is a member of its
+    # closed vocabulary. Anything else is dropped whole, never partially emitted.
+    [CmdletBinding()]
+    param($Diagnostic)
+
+    if ($null -eq $Diagnostic) { return $false }
+    if ($Diagnostic -isnot [System.Collections.Specialized.OrderedDictionary]) { return $false }
+    $expectedKeys = @('check', 'branch', 'object', 'ace_scope', 'ace_inherited', 'trustee_class')
+    if (@($Diagnostic.Keys).Count -ne $expectedKeys.Count) { return $false }
+    foreach ($key in $expectedKeys) {
+        if (-not $Diagnostic.Contains($key)) { return $false }
+    }
+    if ($script:EgWriteAuthorityDiagnosticChecks -cnotcontains $Diagnostic['check']) { return $false }
+    if ($script:EgWriteAuthorityDiagnosticBranches -cnotcontains $Diagnostic['branch']) { return $false }
+    if (($null -ne $Diagnostic['object']) -and
+        ($script:EgWriteAuthorityDiagnosticObjects -cnotcontains $Diagnostic['object'])) { return $false }
+    if (($null -ne $Diagnostic['ace_scope']) -and
+        ($script:EgWriteAuthorityDiagnosticAceScopes -cnotcontains $Diagnostic['ace_scope'])) { return $false }
+    if (($null -ne $Diagnostic['ace_inherited']) -and ($Diagnostic['ace_inherited'] -isnot [bool])) { return $false }
+    if (($null -ne $Diagnostic['trustee_class']) -and
+        ($script:EgTrusteeClasses -cnotcontains $Diagnostic['trustee_class'])) { return $false }
+    return $true
+}
+
+function New-EgSidSetRefusal {
+    # One refusal of the supplied authorised set, carrying only its closed branch name.
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Branch)
+
+    [pscustomobject]@{
+        Pass       = $false
+        SupportRef = 'EG_LAUNCHER_ROOT_AUTHORISED_SID_SET_INVALID'
+        Sids       = @()
+        Branch     = $Branch
+    }
+}
+
 function ConvertTo-EgValidationJson {
     # The single deterministic validation output shape (design section 8). It carries no
     # timestamp and no generated identifier, so two consecutive runs against unchanged
@@ -791,7 +934,10 @@ function ConvertTo-EgValidationJson {
     param(
         [Parameter(Mandatory)]$Checks,
         [Parameter(Mandatory)][ValidateSet('PASS', 'FAIL')][string]$Status,
-        [Parameter(Mandatory)][AllowEmptyString()][string]$SupportRef
+        [Parameter(Mandatory)][AllowEmptyString()][string]$SupportRef,
+        # DL-XB-199 G3-101: the closed write-authority branch diagnostic. Emitted only on a
+        # failing validation run, and only after it re-proves closed against the vocabulary.
+        $WriteAuthorityDiagnostic = $null
     )
 
     $payload = [ordered]@{}
@@ -799,6 +945,10 @@ function ConvertTo-EgValidationJson {
     $payload['status'] = $Status
     if ($Status -cne 'PASS') {
         $payload['support_ref'] = $SupportRef
+        $payload['write_authority_diagnostic'] = $null
+        if (Test-EgWriteAuthorityDiagnosticClosed -Diagnostic $WriteAuthorityDiagnostic) {
+            $payload['write_authority_diagnostic'] = $WriteAuthorityDiagnostic
+        }
     }
     return ($payload | ConvertTo-Json -Depth 8 -Compress)
 }
@@ -908,13 +1058,16 @@ function New-EgCheckResult {
     param(
         [bool]$Pass,
         [AllowEmptyString()][string]$SupportRef = '',
-        [Parameter(Mandatory)]$Checks
+        [Parameter(Mandatory)]$Checks,
+        # Optional closed write-authority diagnostic (DL-XB-199 G3-101); null otherwise.
+        $Diagnostic = $null
     )
 
     [pscustomobject]@{
         Pass       = $Pass
         SupportRef = $SupportRef
         Checks     = $Checks
+        Diagnostic = $Diagnostic
     }
 }
 
@@ -1724,6 +1877,17 @@ $script:EgRequiredConfigKeys = @(
     'portal_url', 'account_identity', 'archive_root', 'state_path', 'temp_root', 'log_root'
 )
 
+# DL-XB-199 G3-101. The application selects its source with an explicit `source` key. When
+# it is `direct_http`, the browser-only `portal_url` and `account_identity` are not used and
+# the `direct_http` object with exactly these non-blank members is required instead. An
+# absent `source` keeps the historical browser key set unchanged; any other value fails.
+$script:EgDirectHttpSource = 'direct_http'
+$script:EgBrowserSource = 'browser'
+$script:EgDirectHttpRequiredConfigKeys = @(
+    'direct_http', 'archive_root', 'state_path', 'temp_root', 'log_root'
+)
+$script:EgDirectHttpRequiredMembers = @('list_url', 'fetch_url', 'tenant_id')
+
 $script:EgPythonVersionPattern = '^Python 3\.14\.'
 $script:EgTerminalEventFileName = 'launcher_failed.jsonl'
 
@@ -1836,7 +2000,42 @@ function Test-EgLauncherConfigContract {
     foreach ($property in @($parsed.PSObject.Properties)) {
         $propertyNames = $propertyNames + $property.Name
     }
-    foreach ($required in $script:EgRequiredConfigKeys) {
+    $requiredKeys = $script:EgRequiredConfigKeys
+    $directHttp = $false
+    if ($propertyNames -ccontains 'source') {
+        $source = $parsed.source
+        if (($source -is [string]) -and ($source -ceq $script:EgDirectHttpSource)) {
+            $directHttp = $true
+            $requiredKeys = $script:EgDirectHttpRequiredConfigKeys
+        }
+        elseif (-not (($source -is [string]) -and ($source -ceq $script:EgBrowserSource))) {
+            return (New-EgCheckResult -Pass $false -SupportRef 'EG_LAUNCHER_CONFIG_KEY_MISSING' -Checks $checks)
+        }
+    }
+    if ($directHttp) {
+        # Presence first: under StrictMode reading an absent property throws.
+        if ($propertyNames -cnotcontains 'direct_http') {
+            return (New-EgCheckResult -Pass $false -SupportRef 'EG_LAUNCHER_CONFIG_KEY_MISSING' -Checks $checks)
+        }
+        $block = $parsed.direct_http
+        if (($null -eq $block) -or ($block -isnot [System.Management.Automation.PSCustomObject])) {
+            return (New-EgCheckResult -Pass $false -SupportRef 'EG_LAUNCHER_CONFIG_KEY_MISSING' -Checks $checks)
+        }
+        $memberNames = @()
+        foreach ($member in @($block.PSObject.Properties)) {
+            $memberNames = $memberNames + $member.Name
+        }
+        foreach ($member in $script:EgDirectHttpRequiredMembers) {
+            if ($memberNames -cnotcontains $member) {
+                return (New-EgCheckResult -Pass $false -SupportRef 'EG_LAUNCHER_CONFIG_KEY_MISSING' -Checks $checks)
+            }
+            $memberValue = $block.$member
+            if (($memberValue -isnot [string]) -or [string]::IsNullOrWhiteSpace($memberValue)) {
+                return (New-EgCheckResult -Pass $false -SupportRef 'EG_LAUNCHER_CONFIG_KEY_MISSING' -Checks $checks)
+            }
+        }
+    }
+    foreach ($required in $requiredKeys) {
         $present = $false
         foreach ($name in $propertyNames) {
             if ($name -ceq $required) { $present = $true }
@@ -1886,57 +2085,62 @@ function Test-EgLauncherRootSecurity {
     }
     $checks['launcher_root_outside_checkout'] = 'PASS'
 
+    # Parallel lists: the examined path and its fixed public label. The label is the
+    # object's class name only ('launcher_root' or a Class A member name), never a path.
     $examined = @($LauncherRootPath)
+    $labels = @('launcher_root')
     foreach ($memberName in (Get-EgDeployedPackageMemberNames)) {
         $examined = $examined + (Join-Path $LauncherRootPath $memberName)
+        $labels = $labels + $memberName
     }
 
     # Position 15. The privilege read happens ONCE. A failed read is terminal under this
     # same check and reference: the run does not continue to the privilege predicate or to
     # any remaining access check, and the empty name list is never read as absence of a
     # bypass privilege.
+    $runCheck = 'launcher_root_not_writable_by_run_principal'
+    $runRef = 'EG_LAUNCHER_ROOT_ACL_RUN_PRINCIPAL_WRITABLE'
     $privileges = Get-EgTokenPrivilegeNames
     if (-not $privileges.ReadOk) {
-        return (New-EgCheckResult -Pass $false `
-            -SupportRef 'EG_LAUNCHER_ROOT_ACL_RUN_PRINCIPAL_WRITABLE' -Checks $checks)
+        return (New-EgCheckResult -Pass $false -SupportRef $runRef -Checks $checks `
+            -Diagnostic (New-EgWriteAuthorityDiagnostic -Check $runCheck -Branch 'PRIVILEGE_READ_FAILED'))
     }
     if (Test-EgBypassPrivilegePresent -PrivilegeName $privileges.PrivilegeNames) {
-        return (New-EgCheckResult -Pass $false `
-            -SupportRef 'EG_LAUNCHER_ROOT_ACL_RUN_PRINCIPAL_WRITABLE' -Checks $checks)
+        return (New-EgCheckResult -Pass $false -SupportRef $runRef -Checks $checks `
+            -Diagnostic (New-EgWriteAuthorityDiagnostic -Check $runCheck -Branch 'BYPASS_PRIVILEGE_PRESENT'))
     }
-    foreach ($objectPath in $examined) {
-        $tokenCheck = Test-EgTokenWriteAccessToPath -Path $objectPath
-        if (-not $tokenCheck.Evaluated) {
-            return (New-EgCheckResult -Pass $false `
-                -SupportRef 'EG_LAUNCHER_ROOT_ACL_RUN_PRINCIPAL_WRITABLE' -Checks $checks)
-        }
-        if ($tokenCheck.AnyWriteGranted) {
-            return (New-EgCheckResult -Pass $false `
-                -SupportRef 'EG_LAUNCHER_ROOT_ACL_RUN_PRINCIPAL_WRITABLE' -Checks $checks)
+    for ($index = 0; $index -lt $examined.Count; $index++) {
+        $tokenCheck = Test-EgTokenWriteAccessToPath -Path $examined[$index]
+        if ((-not $tokenCheck.Evaluated) -or $tokenCheck.AnyWriteGranted) {
+            return (New-EgCheckResult -Pass $false -SupportRef $runRef -Checks $checks `
+                -Diagnostic (New-EgWriteAuthorityDiagnostic -Check $runCheck `
+                    -Branch $tokenCheck.Branch -Object $labels[$index]))
         }
     }
-    $checks['launcher_root_not_writable_by_run_principal'] = 'PASS'
+    $checks[$runCheck] = 'PASS'
 
     # Position 16. The supplied set is admitted once, and a refused set is reported as a
     # failure of this same check under its own bounded reference (DD-12).
+    $trusteeCheckName = 'launcher_root_write_trustees_authorised'
     $admission = Test-EgAuthorisedWriteSidSet -AuthorisedSid $AuthorisedLauncherRootWriteSid
     if (-not $admission.Pass) {
         return (New-EgCheckResult -Pass $false `
-            -SupportRef 'EG_LAUNCHER_ROOT_AUTHORISED_SID_SET_INVALID' -Checks $checks)
+            -SupportRef 'EG_LAUNCHER_ROOT_AUTHORISED_SID_SET_INVALID' -Checks $checks `
+            -Diagnostic (New-EgWriteAuthorityDiagnostic -Check $trusteeCheckName -Branch $admission.Branch))
     }
-    foreach ($objectPath in $examined) {
-        $trusteeCheck = Test-EgPathWriteTrusteesAuthorised -Path $objectPath `
+    for ($index = 0; $index -lt $examined.Count; $index++) {
+        $trusteeCheck = Test-EgPathWriteTrusteesAuthorised -Path $examined[$index] `
             -AuthorisedSid $admission.Sids
-        if (-not $trusteeCheck.Evaluated) {
+        if ((-not $trusteeCheck.Evaluated) -or (-not $trusteeCheck.Authorised)) {
             return (New-EgCheckResult -Pass $false `
-                -SupportRef 'EG_LAUNCHER_ROOT_ACL_WRITE_TRUSTEE_UNAUTHORISED' -Checks $checks)
-        }
-        if (-not $trusteeCheck.Authorised) {
-            return (New-EgCheckResult -Pass $false `
-                -SupportRef 'EG_LAUNCHER_ROOT_ACL_WRITE_TRUSTEE_UNAUTHORISED' -Checks $checks)
+                -SupportRef 'EG_LAUNCHER_ROOT_ACL_WRITE_TRUSTEE_UNAUTHORISED' -Checks $checks `
+                -Diagnostic (New-EgWriteAuthorityDiagnostic -Check $trusteeCheckName `
+                    -Branch $trusteeCheck.Branch -Object $labels[$index] `
+                    -AceScope $trusteeCheck.AceScope -AceInherited $trusteeCheck.AceInherited `
+                    -TrusteeClass $trusteeCheck.TrusteeClass))
         }
     }
-    $checks['launcher_root_write_trustees_authorised'] = 'PASS'
+    $checks[$trusteeCheckName] = 'PASS'
 
     # Position 17. Neither installed file, nor the destination directory, is a symlink,
     # junction, or other reparse point.
@@ -2368,39 +2572,43 @@ function Test-EgAuthorisedWriteSidSet {
     [CmdletBinding()]
     param([Parameter(Mandatory)][ValidateNotNullOrEmpty()][string[]]$AuthorisedSid)
 
-    $refused = [pscustomobject]@{
-        Pass       = $false
-        SupportRef = 'EG_LAUNCHER_ROOT_AUTHORISED_SID_SET_INVALID'
-        Sids       = @()
+    # DL-XB-199 G3-101. A Scheduled Task starts the launcher with `powershell.exe -File`,
+    # and -File binds `-AuthorisedLauncherRootWriteSid A,B` as ONE string "A,B", never as
+    # an array; only an in-process `&` call produces two elements. Without this split every
+    # multi-trustee set was refused under -File, a deterministic false negative. A comma is
+    # never part of a security identifier, so splitting on it is unambiguous, and every
+    # fragment is then admitted by exactly the same rules as before: an empty fragment
+    # (a doubled or trailing comma) is refused, never skipped.
+    $supplied = @()
+    foreach ($element in @($AuthorisedSid)) {
+        $supplied = $supplied + @(([string]$element).Split([char]','))
     }
-
-    $supplied = @($AuthorisedSid)
     if ($supplied.Count -eq 0) {
-        return $refused
+        return (New-EgSidSetRefusal 'SID_SET_EMPTY')
     }
 
     $admitted = @()
     foreach ($candidate in $supplied) {
         if ([string]::IsNullOrWhiteSpace($candidate)) {
-            return $refused
+            return (New-EgSidSetRefusal 'SID_ELEMENT_BLANK')
         }
-        if ($candidate -ceq $script:EgRefusedAuthorisedSid) {
-            return $refused
+        if ($candidate.Trim() -ceq $script:EgRefusedAuthorisedSid) {
+            return (New-EgSidSetRefusal 'SID_CREATOR_OWNER_SUPPLIED')
         }
         $parsed = $null
         try {
-            $parsed = New-Object System.Security.Principal.SecurityIdentifier($candidate)
+            $parsed = New-Object System.Security.Principal.SecurityIdentifier($candidate.Trim())
         }
         catch {
-            return $refused
+            return (New-EgSidSetRefusal 'SID_ELEMENT_NOT_A_SID')
         }
         if ($null -eq $parsed) {
-            return $refused
+            return (New-EgSidSetRefusal 'SID_ELEMENT_NOT_A_SID')
         }
         # The textual form must round-trip, so a value that merely happens to construct is
         # not admitted as a security identifier.
         if ($parsed.Value -cne $candidate.Trim()) {
-            return $refused
+            return (New-EgSidSetRefusal 'SID_ELEMENT_NOT_CANONICAL')
         }
         $admitted = $admitted + $parsed
     }
@@ -2409,6 +2617,7 @@ function Test-EgAuthorisedWriteSidSet {
         Pass       = $true
         SupportRef = ''
         Sids       = @($admitted)
+        Branch     = ''
     }
 }
 
@@ -2521,11 +2730,17 @@ function Test-EgTokenWriteAccessToPath {
         AnyWriteGranted = $false
         Evaluated       = $false
         SupportRef      = 'EG_LAUNCHER_ROOT_ACL_RUN_PRINCIPAL_WRITABLE'
+        Branch          = 'ACCESS_CHECK_NOT_EVALUATED'
     }
 
     $descriptor = Get-EgSecurityDescriptorForPath -Path $Path
     if ($null -eq $descriptor) {
-        return $terminal
+        return [pscustomobject]@{
+            AnyWriteGranted = $false
+            Evaluated       = $false
+            SupportRef      = 'EG_LAUNCHER_ROOT_ACL_RUN_PRINCIPAL_WRITABLE'
+            Branch          = 'DESCRIPTOR_UNREADABLE'
+        }
     }
 
     $binaryForm = $null
@@ -2567,14 +2782,17 @@ function Test-EgTokenWriteAccessToPath {
     $anyWriteGranted = ((([int]$outcome.GrantedAccess) -band $mappedMask) -ne 0)
 
     $supportRef = ''
+    $branch = ''
     if ($anyWriteGranted) {
         $supportRef = 'EG_LAUNCHER_ROOT_ACL_RUN_PRINCIPAL_WRITABLE'
+        $branch = 'WRITE_ACCESS_GRANTED'
     }
 
     [pscustomobject]@{
         AnyWriteGranted = $anyWriteGranted
         Evaluated       = $true
         SupportRef      = $supportRef
+        Branch          = $branch
     }
 }
 
@@ -2588,21 +2806,41 @@ function Test-EgPathWriteTrusteesAuthorised {
     # a badly ordered list conceal a real grant. An inherited allow entry is treated exactly
     # as an explicit one, because inheritance describes where an entry came from, not how
     # much access it grants.
+    #
+    # DL-XB-199 G3-101: every return also names its closed Branch, and an entry-level
+    # failure names the entry's scope (EFFECTIVE or INHERIT_ONLY), whether it was
+    # inherited, and the trustee's closed class. The verdict itself is unchanged.
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Path,
         [Parameter(Mandatory)][ValidateNotNull()][System.Security.Principal.SecurityIdentifier[]]$AuthorisedSid
     )
 
-    $terminal = [pscustomobject]@{
-        Authorised = $false
-        Evaluated  = $false
-        SupportRef = 'EG_LAUNCHER_ROOT_ACL_WRITE_TRUSTEE_UNAUTHORISED'
+    function New-EgTrusteeOutcome {
+        param(
+            [bool]$Authorised,
+            [bool]$Evaluated,
+            [string]$Branch,
+            [string]$AceScope = '',
+            $AceInherited = $null,
+            [string]$TrusteeClass = ''
+        )
+        $supportRef = ''
+        if (-not $Authorised) { $supportRef = 'EG_LAUNCHER_ROOT_ACL_WRITE_TRUSTEE_UNAUTHORISED' }
+        [pscustomobject]@{
+            Authorised   = $Authorised
+            Evaluated    = $Evaluated
+            SupportRef   = $supportRef
+            Branch       = $Branch
+            AceScope     = $AceScope
+            AceInherited = $AceInherited
+            TrusteeClass = $TrusteeClass
+        }
     }
 
     $descriptor = Get-EgSecurityDescriptorForPath -Path $Path
     if ($null -eq $descriptor) {
-        return $terminal
+        return (New-EgTrusteeOutcome -Authorised $false -Evaluated $false -Branch 'DESCRIPTOR_UNREADABLE')
     }
 
     $binaryForm = $null
@@ -2612,29 +2850,18 @@ function Test-EgPathWriteTrusteesAuthorised {
         $raw = New-Object System.Security.AccessControl.RawSecurityDescriptor($binaryForm, 0)
     }
     catch {
-        return $terminal
+        return (New-EgTrusteeOutcome -Authorised $false -Evaluated $false -Branch 'DESCRIPTOR_UNPARSABLE')
     }
     if ($null -eq $raw) {
-        return $terminal
+        return (New-EgTrusteeOutcome -Authorised $false -Evaluated $false -Branch 'DESCRIPTOR_UNPARSABLE')
     }
 
     # An object with NO discretionary access list fails, because Windows grants all access
     # in that case.
     $listPresent = (($raw.ControlFlags -band
         [System.Security.AccessControl.ControlFlags]::DiscretionaryAclPresent) -ne 0)
-    if (-not $listPresent) {
-        return [pscustomobject]@{
-            Authorised = $false
-            Evaluated  = $true
-            SupportRef = 'EG_LAUNCHER_ROOT_ACL_WRITE_TRUSTEE_UNAUTHORISED'
-        }
-    }
-    if ($null -eq $raw.DiscretionaryAcl) {
-        return [pscustomobject]@{
-            Authorised = $false
-            Evaluated  = $true
-            SupportRef = 'EG_LAUNCHER_ROOT_ACL_WRITE_TRUSTEE_UNAUTHORISED'
-        }
+    if ((-not $listPresent) -or ($null -eq $raw.DiscretionaryAcl)) {
+        return (New-EgTrusteeOutcome -Authorised $false -Evaluated $true -Branch 'DACL_ABSENT')
     }
 
     $mappedMask = 0
@@ -2642,13 +2869,7 @@ function Test-EgPathWriteTrusteesAuthorised {
         $mappedMask = Get-EgMappedWriteCapableMask
     }
     catch {
-        return $terminal
-    }
-
-    $unauthorised = [pscustomobject]@{
-        Authorised = $false
-        Evaluated  = $true
-        SupportRef = 'EG_LAUNCHER_ROOT_ACL_WRITE_TRUSTEE_UNAUTHORISED'
+        return (New-EgTrusteeOutcome -Authorised $false -Evaluated $false -Branch 'MASK_UNAVAILABLE')
     }
 
     # Every examined object's OWNER must also be in the supplied set, because an owner
@@ -2659,13 +2880,14 @@ function Test-EgPathWriteTrusteesAuthorised {
         $owner = $raw.Owner
     }
     catch {
-        return $terminal
+        return (New-EgTrusteeOutcome -Authorised $false -Evaluated $false -Branch 'OWNER_UNREADABLE')
     }
     if ($null -eq $owner) {
-        return $terminal
+        return (New-EgTrusteeOutcome -Authorised $false -Evaluated $false -Branch 'OWNER_UNREADABLE')
     }
     if (-not (Test-EgSidInSet -Candidate $owner -AuthorisedSid $AuthorisedSid)) {
-        return $unauthorised
+        return (New-EgTrusteeOutcome -Authorised $false -Evaluated $true -Branch 'OWNER_UNAUTHORISED' `
+            -TrusteeClass (Get-EgTrusteeClass -Sid $owner))
     }
 
     foreach ($ace in @($raw.DiscretionaryAcl)) {
@@ -2680,21 +2902,25 @@ function Test-EgPathWriteTrusteesAuthorised {
         if ((([int]$ace.AccessMask) -band $mappedMask) -eq 0) {
             continue
         }
+        $scope = 'EFFECTIVE'
+        if ((([int]$ace.AceFlags) -band ([int][System.Security.AccessControl.AceFlags]::InheritOnly)) -ne 0) {
+            $scope = 'INHERIT_ONLY'
+        }
+        $inherited = ((([int]$ace.AceFlags) -band ([int][System.Security.AccessControl.AceFlags]::Inherited)) -ne 0)
         # A write-capable CREATOR OWNER entry describes an unbounded future write set
         # rather than a principal, so it is terminal.
         if ($ace.SecurityIdentifier.Value -ceq $script:EgRefusedAuthorisedSid) {
-            return $unauthorised
+            return (New-EgTrusteeOutcome -Authorised $false -Evaluated $true -Branch 'CREATOR_OWNER_WRITE_ENTRY' `
+                -AceScope $scope -AceInherited $inherited -TrusteeClass 'CREATOR_OWNER')
         }
         if (-not (Test-EgSidInSet -Candidate $ace.SecurityIdentifier -AuthorisedSid $AuthorisedSid)) {
-            return $unauthorised
+            return (New-EgTrusteeOutcome -Authorised $false -Evaluated $true -Branch 'WRITE_ENTRY_UNAUTHORISED' `
+                -AceScope $scope -AceInherited $inherited `
+                -TrusteeClass (Get-EgTrusteeClass -Sid $ace.SecurityIdentifier))
         }
     }
 
-    [pscustomobject]@{
-        Authorised = $true
-        Evaluated  = $true
-        SupportRef = ''
-    }
+    return (New-EgTrusteeOutcome -Authorised $true -Evaluated $true -Branch '')
 }
 
 function Test-EgSidInSet {

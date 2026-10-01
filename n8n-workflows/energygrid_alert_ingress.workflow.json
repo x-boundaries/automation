@@ -1,0 +1,106 @@
+{
+  "id": "energygridAlertIngress01",
+  "name": "EnergyGrid - Alert Ingress",
+  "active": false,
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "REPLACE_WITH_ALERT_WEBHOOK_PATH",
+        "authentication": "headerAuth",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "id": "5b0a2c8e-6f1d-4e7a-9c3b-1d2e3f4a5b60",
+      "name": "EnergyGrid Alert Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        816,
+        624
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Strict allowlist for the energygrid.alert.v1 payload. Anything outside the\n// closed contract fails this execution (the webhook then answers non-2xx and\n// the runtime logs alert_failed); nothing unvalidated reaches Telegram.\nconst items = $input.all();\nif (items.length !== 1) throw new Error('EG_ALERT_ITEM_COUNT');\nconst body = items[0].json && items[0].json.body;\nif (!body || typeof body !== 'object' || Array.isArray(body)) throw new Error('EG_ALERT_BODY');\n\nconst KEYS = ['schema', 'event', 'timestamp', 'run_id', 'stage', 'status', 'support_ref', 'exit_code', 'counts', 'attention_required'];\nconst COUNT_KEYS = ['inventory', 'downloaded', 'present', 'failure'];\nconst STAGES = ['config', 'lock', 'list', 'fetch', 'publish', 'run'];\nconst STATUSES = ['RETRYABLE_NETWORK_FAILURE', 'LOGIN_FAILED', 'PORTAL_LAYOUT_CHANGED', 'DOWNLOAD_FAILED', 'INVALID_PDF', 'ARCHIVE_CONFLICT', 'STATE_INCONSISTENT', 'ACTION_REQUIRED', 'RUN_IN_PROGRESS', 'UNKNOWN'];\n\nconst keys = Object.keys(body);\nif (keys.length !== KEYS.length || !KEYS.every((key) => keys.includes(key))) throw new Error('EG_ALERT_KEYS');\nif (body.schema !== 'energygrid.alert.v1') throw new Error('EG_ALERT_SCHEMA');\nif (body.event !== 'energygrid_run_failed') throw new Error('EG_ALERT_EVENT');\nif (typeof body.timestamp !== 'string' || !/^\\d{4}-\\d\\d-\\d\\dT\\d\\d:\\d\\d:\\d\\dZ$/.test(body.timestamp)) throw new Error('EG_ALERT_TIMESTAMP');\nif (typeof body.run_id !== 'string' || !/^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|UNKNOWN)$/.test(body.run_id)) throw new Error('EG_ALERT_RUN_ID');\nif (!STAGES.includes(body.stage)) throw new Error('EG_ALERT_STAGE');\nif (!STATUSES.includes(body.status)) throw new Error('EG_ALERT_STATUS');\nif (typeof body.support_ref !== 'string' || !/^[A-Z][A-Z0-9_]{0,63}$/.test(body.support_ref)) throw new Error('EG_ALERT_SUPPORT_REF');\nif (!Number.isInteger(body.exit_code) || body.exit_code < -1 || body.exit_code > 255) throw new Error('EG_ALERT_EXIT_CODE');\nif (typeof body.attention_required !== 'boolean') throw new Error('EG_ALERT_ATTENTION');\nconst counts = body.counts;\nif (!counts || typeof counts !== 'object' || Array.isArray(counts)) throw new Error('EG_ALERT_COUNTS');\nconst countKeys = Object.keys(counts);\nif (countKeys.length !== COUNT_KEYS.length || !COUNT_KEYS.every((key) => countKeys.includes(key))) throw new Error('EG_ALERT_COUNTS');\nfor (const key of COUNT_KEYS) {\n  if (!Number.isInteger(counts[key]) || counts[key] < 0 || counts[key] > 1000000) throw new Error('EG_ALERT_COUNTS');\n}\n\nconst lines = [\n  body.attention_required ? 'EnergyGrid bill run FAILED - attention required' : 'EnergyGrid bill run skipped',\n  '',\n  'Stage: ' + body.stage,\n  'Status: ' + body.status,\n  'Reference: ' + body.support_ref,\n  'Exit code: ' + body.exit_code,\n  'Counts: inventory ' + counts.inventory + ', downloaded ' + counts.downloaded + ', present ' + counts.present + ', failed ' + counts.failure,\n  'Run: ' + body.run_id,\n  'Time (UTC): ' + body.timestamp,\n];\nreturn [{ json: { alert_text: lines.join('\\n') } }];\n"
+      },
+      "id": "6c1b3d9f-7a2e-4f8b-8d4c-2e3f4a5b6c71",
+      "name": "Validate Alert Payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1040,
+        624
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "REPLACE_WITH_TELEGRAM_CHAT_ID",
+        "text": "={{ $json.alert_text }}",
+        "additionalFields": {
+          "appendAttribution": false,
+          "disable_web_page_preview": true
+        }
+      },
+      "id": "7d2c4e0a-8b3f-4a9c-9e5d-3f4a5b6c7d82",
+      "name": "Send EnergyGrid Alert",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1264,
+        624
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## EnergyGrid alert ingress (inactive)\n\n- Loopback-only ingress for the direct-HTTP bill runtime's terminal-failure alert (`energygrid.alert.v1`).\n- The payload is privacy-minimal by contract: no tenant/account identifier, endpoint, filename, bill content or credential ever arrives here, and the Code node rejects anything outside the closed allowlist.\n- Do not add HTTP Request, Execute Command, file, database or AI nodes.\n\n### Required manual configuration (local import copy only)\n\n- **EnergyGrid Alert Webhook**: replace `REPLACE_WITH_ALERT_WEBHOOK_PATH` with a private unguessable path; bind a Header Auth credential whose header name/value match the runtime's private `alert.auth_header_name` / `auth_token_env` value. n8n must listen on loopback only for this ingress.\n- **Send EnergyGrid Alert**: bind the existing approved Telegram credential and replace `REPLACE_WITH_TELEGRAM_CHAT_ID`.\n- Import, credential binding and activation each require separate explicit Owner approval.",
+        "height": 300,
+        "width": 700
+      },
+      "id": "8e3d5f1b-9c4a-4bad-8f6e-4a5b6c7d8e93",
+      "name": "Boundary",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        760,
+        300
+      ]
+    }
+  ],
+  "connections": {
+    "EnergyGrid Alert Webhook": {
+      "main": [
+        [
+          {
+            "node": "Validate Alert Payload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Alert Payload": {
+      "main": [
+        [
+          {
+            "node": "Send EnergyGrid Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false
+  },
+  "staticData": null,
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "nodeGroups": [],
+  "versionId": "b2c3d4e5-6f7a-4b8c-9d0e-1f2a3b4c5d6e",
+  "sourceWorkflowId": null
+}

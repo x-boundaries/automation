@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -16,6 +16,17 @@ MIN_ATTEMPTS = 1
 MAX_ATTEMPTS = 3
 MIN_INVENTORY_CEILING = 1
 MAX_INVENTORY_CEILING = 100_000
+
+# DL-XB-199 G3-101. `browser` is the legacy Playwright source; `direct_http` is
+# the MVP daily source. The choice is explicit private configuration, never a
+# fallback: one run uses exactly one source.
+SOURCE_BROWSER = "browser"
+SOURCE_DIRECT_HTTP = "direct_http"
+SOURCES = (SOURCE_BROWSER, SOURCE_DIRECT_HTTP)
+MAX_TENANT_ID_LENGTH = 128
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+ENV_NAME_RE = r"\A[A-Z][A-Z0-9_]{0,63}\Z"
+HEADER_NAME_RE = r"\A[A-Za-z0-9-]{1,64}\Z"
 
 
 def find_checkout_root(start: Path | None = None) -> Path | None:
@@ -81,6 +92,88 @@ def _validate_account_identity(value: Any) -> str:
 
 
 @dataclass(frozen=True)
+class DirectHttpSettings:
+    """Private interface identity. Every field is excluded from `repr`.
+
+    The endpoints and the tenant identifier live only in the private host
+    configuration; nothing here is ever logged, printed or alerted.
+    """
+
+    list_url: str = field(repr=False)
+    fetch_url: str = field(repr=False)
+    tenant_id: str = field(repr=False)
+
+    def to_raw(self) -> dict[str, str]:
+        return {"list_url": self.list_url, "fetch_url": self.fetch_url, "tenant_id": self.tenant_id}
+
+
+@dataclass(frozen=True)
+class AlertSettings:
+    """Loopback-only alert ingress. The URL path and any token stay private."""
+
+    url: str = field(repr=False)
+    auth_header_name: str | None = field(default=None, repr=False)
+    auth_token_env: str | None = field(default=None, repr=False)
+
+    def to_raw(self) -> dict[str, Any]:
+        raw: dict[str, Any] = {"url": self.url}
+        if self.auth_header_name is not None:
+            raw["auth_header_name"] = self.auth_header_name
+            raw["auth_token_env"] = self.auth_token_env
+        return raw
+
+
+def _validate_endpoint(value: Any, label: str) -> str:
+    if not isinstance(value, str) or not value or value != value.strip():
+        raise ConfigError(f"{label} must be a non-empty absolute HTTP(S) URL")
+    parsed = urlparse(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ConfigError(f"{label} must be a non-empty absolute HTTP(S) URL")
+    if parsed.username is not None or parsed.password is not None or parsed.fragment:
+        raise ConfigError(f"{label} must not carry credentials or a fragment")
+    return value
+
+
+def _validate_direct_http(value: Any) -> DirectHttpSettings:
+    if not isinstance(value, dict) or set(value) != {"list_url", "fetch_url", "tenant_id"}:
+        raise ConfigError("direct_http must be an object with exactly list_url, fetch_url and tenant_id")
+    tenant = value["tenant_id"]
+    if (
+        not isinstance(tenant, str)
+        or not tenant
+        or tenant != tenant.strip()
+        or len(tenant) > MAX_TENANT_ID_LENGTH
+        or not tenant.isprintable()
+    ):
+        raise ConfigError("direct_http.tenant_id must be a non-empty printable string")
+    return DirectHttpSettings(
+        list_url=_validate_endpoint(value["list_url"], "direct_http.list_url"),
+        fetch_url=_validate_endpoint(value["fetch_url"], "direct_http.fetch_url"),
+        tenant_id=tenant,
+    )
+
+
+def _validate_alert(value: Any) -> AlertSettings:
+    import re
+
+    if not isinstance(value, dict) or not {"url"} <= set(value) <= {"url", "auth_header_name", "auth_token_env"}:
+        raise ConfigError("alert must be an object with url and optional auth_header_name/auth_token_env")
+    url = _validate_endpoint(value["url"], "alert.url")
+    if urlparse(url).hostname not in LOOPBACK_HOSTS:
+        raise ConfigError("alert.url must be a loopback address")
+    header = value.get("auth_header_name")
+    env_name = value.get("auth_token_env")
+    if (header is None) != (env_name is None):
+        raise ConfigError("alert auth_header_name and auth_token_env must be supplied together")
+    if header is not None:
+        if not isinstance(header, str) or not re.fullmatch(HEADER_NAME_RE, header):
+            raise ConfigError("alert.auth_header_name is invalid")
+        if not isinstance(env_name, str) or not re.fullmatch(ENV_NAME_RE, env_name):
+            raise ConfigError("alert.auth_token_env is invalid")
+    return AlertSettings(url=url, auth_header_name=header, auth_token_env=env_name)
+
+
+@dataclass(frozen=True)
 class RuntimeConfig:
     portal_url: str
     archive_root: Path
@@ -93,6 +186,9 @@ class RuntimeConfig:
     inventory_safety_ceiling: int = 1000
     browser_cache_path: Path | None = None
     checkout_root: Path | None = None
+    source: str = SOURCE_BROWSER
+    direct_http: DirectHttpSettings | None = field(default=None, repr=False)
+    alert: AlertSettings | None = field(default=None, repr=False)
 
     def with_overrides(self, overrides: dict[str, Any]) -> "RuntimeConfig":
         values: dict[str, Any] = {}
@@ -104,8 +200,14 @@ class RuntimeConfig:
                 values[key] = int(overrides[key])
         if not values:
             return self
+        raw: dict[str, Any] = {"source": self.source}
+        if self.direct_http is not None:
+            raw["direct_http"] = self.direct_http.to_raw()
+        if self.alert is not None:
+            raw["alert"] = self.alert.to_raw()
         return load_runtime_config(
             {
+                **raw,
                 "portal_url": self.portal_url,
                 "account_identity": self.account_identity,
                 "archive_root": str(values.get("archive_root", self.archive_root)),
@@ -120,11 +222,21 @@ class RuntimeConfig:
             checkout_root=self.checkout_root,
         )
 
-    def preflight(self, require_archive: bool = True) -> None:
+    def preflight(self, require_archive: bool = True, *, read_only: bool = False) -> None:
         if require_archive and (not self.archive_root.exists() or not self.archive_root.is_dir()):
             raise ConfigError("archive_root must already exist as a directory")
-        if self.state_path.exists() and self.state_path.is_dir():
+        if not read_only and self.state_path.exists() and self.state_path.is_dir():
             raise ConfigError("state_path must be a file path")
+        if read_only:
+            # Metadata only. StateStore owns absent/incompatible DB failures;
+            # SafeLogger alone may create the approved log root.
+            directories = [self.state_path.parent, self.temp_root, self.log_root]
+            if self.browser_cache_path is not None:
+                directories.append(self.browser_cache_path.parent)
+            for directory in directories:
+                if directory.exists() and not directory.is_dir():
+                    raise ConfigError("runtime directory path must be a directory")
+            return
         for directory in (self.state_path.parent, self.temp_root, self.log_root):
             directory.mkdir(parents=True, exist_ok=True)
         if self.browser_cache_path is not None:
@@ -143,7 +255,21 @@ def load_config_file(path: Path) -> dict[str, Any]:
 def load_runtime_config(raw: dict[str, Any], checkout_root: Path | None = None) -> RuntimeConfig:
     if not isinstance(raw, dict):
         raise ConfigError("config must be a JSON object")
-    account_identity = _validate_account_identity(raw.get("account_identity"))
+    source = raw.get("source", SOURCE_BROWSER)
+    if source not in SOURCES:
+        raise ConfigError("source must be browser or direct_http")
+    direct_http: DirectHttpSettings | None = None
+    if source == SOURCE_DIRECT_HTTP:
+        direct_http = _validate_direct_http(raw.get("direct_http"))
+        # The browser-only witness is not used by the direct-HTTP source.
+        account_identity = raw.get("account_identity") or ""
+        if not isinstance(account_identity, str):
+            raise ConfigError("account_identity must be a string")
+    else:
+        if "direct_http" in raw:
+            raise ConfigError("direct_http is configured but source is not direct_http")
+        account_identity = _validate_account_identity(raw.get("account_identity"))
+    alert = _validate_alert(raw["alert"]) if raw.get("alert") is not None else None
     checkout = resolved(checkout_root) if checkout_root is not None else find_checkout_root()
     required = ("archive_root", "state_path", "temp_root", "log_root")
     for key in required:
@@ -178,8 +304,15 @@ def load_runtime_config(raw: dict[str, Any], checkout_root: Path | None = None) 
         MAX_INVENTORY_CEILING,
         "inventory_safety_ceiling",
     )
+    if source == SOURCE_DIRECT_HTTP and raw.get("portal_url") in (None, ""):
+        portal_url = ""
+    else:
+        portal_url = _validate_url(raw.get("portal_url"))
     return RuntimeConfig(
-        portal_url=_validate_url(raw.get("portal_url")),
+        portal_url=portal_url,
+        source=source,
+        direct_http=direct_http,
+        alert=alert,
         account_identity=account_identity,
         archive_root=archive_root,
         state_path=state_path,
