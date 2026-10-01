@@ -222,11 +222,21 @@ class RuntimeConfig:
             checkout_root=self.checkout_root,
         )
 
-    def preflight(self, require_archive: bool = True) -> None:
+    def preflight(self, require_archive: bool = True, *, read_only: bool = False) -> None:
         if require_archive and (not self.archive_root.exists() or not self.archive_root.is_dir()):
             raise ConfigError("archive_root must already exist as a directory")
-        if self.state_path.exists() and self.state_path.is_dir():
+        if not read_only and self.state_path.exists() and self.state_path.is_dir():
             raise ConfigError("state_path must be a file path")
+        if read_only:
+            # Metadata only. StateStore owns absent/incompatible DB failures;
+            # SafeLogger alone may create the approved log root.
+            directories = [self.state_path.parent, self.temp_root, self.log_root]
+            if self.browser_cache_path is not None:
+                directories.append(self.browser_cache_path.parent)
+            for directory in directories:
+                if directory.exists() and not directory.is_dir():
+                    raise ConfigError("runtime directory path must be a directory")
+            return
         for directory in (self.state_path.parent, self.temp_root, self.log_root):
             directory.mkdir(parents=True, exist_ok=True)
         if self.browser_cache_path is not None:

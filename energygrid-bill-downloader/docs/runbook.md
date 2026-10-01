@@ -384,8 +384,40 @@ fetched again: it is proven present (or a conflict) by the existing rules. An
 immediate rerun therefore performs one LIST, zero FETCH and zero publication; it
 may update `last_seen_at_utc`, exactly as the existing state contract does.
 
+Direct-HTTP `list` requires a pre-existing compatible current-version state
+database in a pre-existing state directory. Missing, unreadable, corrupt, older,
+newer or incompatible state fails closed with `STATE_INCONSISTENT` (exit 20),
+before any source request. WAL-format databases and `-wal`, `-shm` or `-journal`
+companions are refused; list does not perform recovery or migration. SQLite is
+opened with an encoded `mode=ro` URI, query-only access and memory temp storage.
+
 `list` performs Phase 0 only and reports `pending_count` (exit 0 when nothing is
-pending, 20 when a `run` would fetch). It never fetches and never writes.
+pending, 20 when a `run` would fetch). It never fetches, publishes, mutates the
+archive or state records/schema, or traverses, cleans or creates the temp root.
+Preflight creates no operational directories, including state, temp and the
+optional browser-cache parent. The precise exceptions to "never writes" are
+approved privacy-minimal logging (SafeLogger may create its approved log root),
+stdout and process exit, and the existing non-blocking lock's open/lock/unlock/
+descriptor-close operations. Its inert file may be created or persist only in
+the pre-existing state directory. No list branch sends a failure notification.
+
+Normal `run` retains writable preflight, state creation and accepted schema
+initialisation/migration, stale owned-temp cleanup, acquisition, publication,
+reconciliation, failure notifications and the existing retry/idempotency rules.
+
+For final status-200 LIST and FETCH responses, the production HTTP parser admits
+the whole raw header section before email parsing: exact CRLF records and an
+explicit empty CRLF terminator, ASCII token field names immediately followed by
+colon, no folding, and only SP, HTAB, visible ASCII or opaque obs-text values.
+Only SP/HTAB are framing whitespace. Exactly one decimal Content-Length or one
+case-insensitive `chunked` Transfer-Encoding is required. Duplicate, combined,
+mixed or missing framing is rejected. Every parsed field must correspond in
+order to the raw ledger, with only physical CRLF and leading post-colon SP/HTAB
+removed; decoder state must match before any body read. Malformed final framing
+closes the connection with terminal `EG_HTTP_FRAMING_INCOMPLETE`, without retry.
+Interim `100 Continue` headers remain subject to the existing parser behavior;
+the final 200 response must independently pass admission. Strict chunk framing
+and the LIST 4 MiB / FETCH 32 MiB body ceilings remain in force.
 
 ### Single-run exclusion
 

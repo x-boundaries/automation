@@ -427,8 +427,9 @@ def run_direct_http(config: RuntimeConfig, logger: SafeLogger, run_id: str, list
 
     try:
         with RunLock(config.state_path.parent):
-            cleanup_stale_owned_temp(config.temp_root)
-            with StateStore(config.state_path) as state:
+            if not list_only:
+                cleanup_stale_owned_temp(config.temp_root)
+            with StateStore(config.state_path, read_only=list_only) as state:
                 if config.direct_http is None:
                     raise ConfigError("direct_http settings are missing")
                 source = DirectHttpSource(config.direct_http, config.timeout_seconds, config.max_attempts)
@@ -1361,7 +1362,10 @@ def main(argv: list[str] | None = None) -> int:
                 "max_attempts": args.max_attempts,
             }
         )
-        config.preflight(require_archive=True)
+        config.preflight(
+            require_archive=True,
+            read_only=config.source == SOURCE_DIRECT_HTTP and args.command == "list",
+        )
         run_id = str(uuid.uuid4())
         logger = SafeLogger(config.log_root, run_id)
         if config.source == SOURCE_DIRECT_HTTP:

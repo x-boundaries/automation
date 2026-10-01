@@ -133,41 +133,76 @@ _CHUNK_SIZE_LINE = re.compile(
 )
 
 
-class _StrictContentLengthHeaderReader:
-    """Validate Content-Length bytes before email parsing normalizes headers."""
+@dataclass(frozen=True)
+class _FinalHeaderAdmission:
+    fields: tuple[tuple[str, str], ...]
+    chunked: bool
+    length: int | None
+
+
+class _StrictFinalHeaderReader:
+    """Buffer and admit the entire final field set before email parsing."""
 
     def __init__(self, fp) -> None:
         self._fp = fp
-        self._expect_status_line = True
-        self._status_code: bytes | None = None
-        self._last_was_content_length = False
+        self.admission: _FinalHeaderAdmission | None = None
+        self._lines: list[bytes] = []
+        self._next_line = 0
+
+    def admit_final_headers(self) -> None:
+        fields: list[tuple[str, str]] = []
+        framing: dict[bytes, bytes] = {}
+        while True:
+            line = self._fp.readline(_HTTP_LINE_LIMIT + 1)
+            if len(line) > _HTTP_LINE_LIMIT or not line.endswith(b"\r\n"):
+                raise http.client.HTTPException(REF_FRAMING_INCOMPLETE)
+            self._lines.append(line)
+            if len(self._lines) > 100:
+                raise http.client.HTTPException(REF_FRAMING_INCOMPLETE)
+            if line == b"\r\n":
+                break
+            name, colon, value = line[:-2].partition(b":")
+            if (
+                not colon or not name
+                or any(byte not in _HTTP_TOKEN_CHARS for byte in name)
+                or any((byte < 32 and byte != 9) or byte == 127 for byte in value)
+            ):
+                raise http.client.HTTPException(REF_FRAMING_INCOMPLETE)
+            # This is the only email-parser transformation admitted: remove
+            # physical CRLF and SP/HTAB immediately after the colon.
+            fields.append((name.decode("ascii"), value.lstrip(b" \t").decode("latin-1")))
+            key = name.lower()
+            if key in (b"content-length", b"transfer-encoding"):
+                if key in framing:
+                    raise http.client.HTTPException(REF_FRAMING_INCOMPLETE)
+                framing[key] = value.strip(b" \t")
+        if len(framing) != 1:
+            raise http.client.HTTPException(REF_FRAMING_INCOMPLETE)
+        if b"content-length" in framing:
+            value = framing[b"content-length"]
+            if not value or any(byte < 48 or byte > 57 for byte in value):
+                raise http.client.HTTPException(REF_FRAMING_INCOMPLETE)
+            try:
+                length = int(value)
+            except ValueError:
+                # Preserve the runtime's integer conversion bound.
+                raise http.client.HTTPException(REF_FRAMING_INCOMPLETE) from None
+            chunked = False
+        else:
+            if framing[b"transfer-encoding"].lower() != b"chunked":
+                raise http.client.HTTPException(REF_FRAMING_INCOMPLETE)
+            length, chunked = None, True
+        self.admission = _FinalHeaderAdmission(tuple(fields), chunked, length)
 
     def readline(self, size: int = -1) -> bytes:
-        line = self._fp.readline(size)
-        if self._expect_status_line:
-            self._expect_status_line = False
-            status_parts = line.split(b" ", 2)
-            self._status_code = status_parts[1] if len(status_parts) > 1 else None
-            return line
-
-        if line in (b"\r\n", b"\n", b""):
-            self._expect_status_line = True
-            self._last_was_content_length = False
-            return line
-
-        if line[:1] in (b" ", b"\t"):
-            if self._last_was_content_length and self._status_code != b"100":
-                raise http.client.HTTPException("folded Content-Length field")
-            return line
-
-        name, separator, _value = line.partition(b":")
-        self._last_was_content_length = separator == b":" and name.lower() == b"content-length"
-        if self._last_was_content_length and self._status_code != b"100":
-            if not line.endswith(b"\r\n"):
-                raise http.client.HTTPException("malformed Content-Length field")
-            raw_value = line[:-2].partition(b":")[2].strip(b" \t")
-            if not raw_value or any(byte < ord("0") or byte > ord("9") for byte in raw_value):
-                raise http.client.HTTPException("malformed Content-Length field")
+        if self.admission is None:
+            # Status lines and interim/non-200 headers remain owned by the
+            # actual http.client parser, never inferred from blank records.
+            return self._fp.readline(size)
+        if self._next_line >= len(self._lines):
+            raise http.client.HTTPException(REF_FRAMING_INCOMPLETE)
+        line = self._lines[self._next_line]
+        self._next_line += 1
         return line
 
     def close(self) -> None:
@@ -177,28 +212,72 @@ class _StrictContentLengthHeaderReader:
 class _StrictHTTPResponse(http.client.HTTPResponse):
     """HTTPResponse that refuses permissive chunk terminators from CPython."""
 
+    def _read_status(self):
+        result = super()._read_status()
+        if result[1] == 200:
+            if not isinstance(self.fp, _StrictFinalHeaderReader):
+                raise http.client.HTTPException(REF_FRAMING_INCOMPLETE)
+            self.fp.admit_final_headers()
+        return result
+
     def begin(self) -> None:
+        if self.headers is not None:
+            return
         original_fp = self.fp
-        checked_fp = _StrictContentLengthHeaderReader(original_fp)
+        checked_fp = _StrictFinalHeaderReader(original_fp)
         self.fp = checked_fp
         try:
             super().begin()
+            if self.status == 200:
+                self._admission = checked_fp.admission
+                self._verify_fields()
+                admission = self._admission
+                # CPython recognises chunked without trailing OWS. Check its
+                # native result BEFORE the one permitted OWS alignment so an
+                # unrelated decoder mismatch cannot be silently repaired.
+                transfer = self.headers.get("Transfer-Encoding", "")
+                native_chunked = transfer.lower() == "chunked"
+                if (
+                    self.chunked is not native_chunked
+                    or self.length != admission.length
+                    or (native_chunked and self.chunk_left is not None)
+                    or (not native_chunked and self.chunk_left != http.client._UNKNOWN)
+                ):
+                    raise http.client.HTTPException(REF_FRAMING_INCOMPLETE)
+                if admission.chunked:
+                    self.chunked = True
+                    self.chunk_left = None
+                self.verify_admission()
+        except Exception:
+            self._close_conn()
+            raise
         finally:
             if self.fp is checked_fp:
                 self.fp = original_fp
-        transfer_encodings = self.headers.get_all("Transfer-Encoding", [])
-        admitted_chunked = False
-        if len(transfer_encodings) == 1:
-            value = transfer_encodings[0].strip(" \t")
-            admitted_chunked = value.isascii() and value.lower() == "chunked"
 
-        self.chunked = admitted_chunked
-        self.chunk_left = None
-        if admitted_chunked:
-            self.length = None
-        self.will_close = self._check_close()
-        if not self.will_close and not self.chunked and self.length is None:
-            self.will_close = True
+    def _verify_fields(self) -> None:
+        admission = getattr(self, "_admission", None)
+        if (
+            not isinstance(admission, _FinalHeaderAdmission)
+            or self.headers is None
+            or tuple(self.headers.raw_items()) != admission.fields
+        ):
+            raise http.client.HTTPException(REF_FRAMING_INCOMPLETE)
+
+    def verify_admission(self) -> None:
+        """Recheck the complete ledger and decoder immediately before reading."""
+        try:
+            self._verify_fields()
+            admission = self._admission
+            if (
+                self.chunked is not admission.chunked
+                or self.length != admission.length
+                or (admission.chunked and self.chunk_left is not None)
+            ):
+                raise http.client.HTTPException(REF_FRAMING_INCOMPLETE)
+        except http.client.HTTPException:
+            self._close_conn()
+            raise
 
     def _read_next_chunk_size(self) -> int:
         line = self.fp.readline(_HTTP_LINE_LIMIT + 1)
@@ -482,6 +561,12 @@ class DirectHttpSource:
         with response:
             if response.status != 200:
                 raise SourceContractError(REF_STATUS_UNEXPECTED, stage=stage)
+            try:
+                if not isinstance(response, _StrictHTTPResponse):
+                    raise http.client.HTTPException(REF_FRAMING_INCOMPLETE)
+                response.verify_admission()
+            except http.client.HTTPException:
+                raise SourceContractError(REF_FRAMING_INCOMPLETE, stage=stage) from None
             content_type = response.headers.get("Content-Type", "")
             transfer_encodings = response.headers.get_all("Transfer-Encoding", [])
             content_lengths = response.headers.get_all("Content-Length", [])
@@ -491,7 +576,7 @@ class DirectHttpSource:
                 if (
                     content_lengths
                     or len(transfer_encodings) != 1
-                    or transfer_encodings[0].strip().lower() != "chunked"
+                    or transfer_encodings[0].strip(" \t").lower() != "chunked"
                     or not chunked
                     or response.length is not None
                 ):

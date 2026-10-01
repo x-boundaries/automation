@@ -8,10 +8,13 @@ plants are searched for on every output surface.
 from __future__ import annotations
 
 import contextlib
+import builtins
 import io
+import http.client
 import json
 import os
 from pathlib import Path
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -19,7 +22,7 @@ import time
 import unittest
 from unittest import mock
 
-from energygrid_bill_downloader import cli, http_source
+from energygrid_bill_downloader import cli, http_source, reconcile
 from energygrid_bill_downloader.config import (
     DirectHttpSettings,
     load_runtime_config,
@@ -52,6 +55,7 @@ from tests.fixtures.synthetic_http_source import (
     status,
 )
 from tests.fixtures.synthetic_portal import synthetic_pdf
+from tests.test_state import FIXTURE_SCHEMA, create_state_fixture, state_snapshot
 
 
 CANARIES = (CANARY_TENANT, CANARY_OTHER_TENANT, CANARY_LIST_PATH, CANARY_FETCH_PATH, CANARY_FILENAME_MARK, "canary-private")
@@ -66,6 +70,20 @@ def setUpModule() -> None:
 
 def chunked_body(payload: bytes) -> bytes:
     return f"{len(payload):X}\r\n".encode("ascii") + payload + b"\r\n0\r\n\r\n"
+
+
+def exact_wire(wire: bytes, *, fragmented: bool = False):
+    """Transport-only fixture: no production admission code decides outcomes."""
+    def send(handler):
+        try:
+            for part in (bytes([byte]) for byte in wire) if fragmented else (wire,):
+                handler.wfile.write(part)
+                handler.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            pass  # Refusing a malformed header can close before all bytes arrive.
+        finally:
+            handler.close_connection = True
+    return send
 
 
 def chunked_wire(
@@ -99,6 +117,7 @@ class Deployment:
     """One private deployment: archive, state, temp, log roots and a config."""
 
     def __init__(self, tmp: Path, service: SyntheticBillService, **overrides) -> None:
+        tmp = tmp.resolve()
         self.tmp = tmp
         self.archive = tmp / "archive"
         self.archive.mkdir()
@@ -285,13 +304,15 @@ class PositiveControls(DirectHttpCase):
 
     def test_list_command_reports_pending_without_fetch_or_write(self) -> None:
         deployment = self.deployment()
+        create_state_fixture(deployment.state_path)
+        before = deployment.state_path.read_bytes()
         code, document = deployment.run("list")
         self.assertEqual(20, code)
         self.assertEqual("ACTION_REQUIRED", document["status"])
         self.assertEqual(4, document["pending_count"])
         self.assertEqual(0, self.service_state.fetch_count)
         self.assertEqual([], deployment.archived())
-        self.assertEqual([], deployment.state_rows())
+        self.assertEqual(before, deployment.state_path.read_bytes())
         deployment.run()
         code, document = deployment.run("list")
         self.assertEqual(0, code)
@@ -605,7 +626,7 @@ class FetchNegatives(DirectHttpCase):
 
 
 class HttpFramingAdmission(DirectHttpCase):
-    def _assert_framing_incomplete(self, stage: str, behaviour) -> None:
+    def _assert_framing_incomplete(self, stage: str, behaviour, *, failure_ordinal=0, rejected_body=None) -> None:
         list_before = len(self.service_state.list_requests)
         fetch_before = len(self.service_state.fetch_requests)
         with tempfile.TemporaryDirectory() as case_root:
@@ -615,8 +636,45 @@ class HttpFramingAdmission(DirectHttpCase):
                 self.service_state.fetch_queue = {}
             else:
                 self.service_state.list_queue = []
-                self.service_state.fetch_queue = {bill_name(0): [behaviour]}
-            code, document = deployment.run()
+                self.service_state.fetch_queue = {bill_name(failure_ordinal): [behaviour]}
+            with contextlib.ExitStack() as stack:
+                guards = [
+                    stack.enter_context(mock.patch.object(owner, name, side_effect=AssertionError(name)))
+                    for owner, name in (
+                        (StateStore, "mark_seen"), (StateStore, "record_archived"),
+                        (StateStore, "record_failure"), (reconcile, "publish_no_replace"),
+                    )
+                ]
+                if stage == "list":
+                    guards.append(stack.enter_context(mock.patch.object(
+                        reconcile, "create_run_directory", side_effect=AssertionError("acquisition"))))
+                written = []
+                real_open = Path.open
+                binary_creates = []
+
+                @contextlib.contextmanager
+                def tracked_open(path, mode="r", *args, **kwargs):
+                    with real_open(path, mode, *args, **kwargs) as stream:
+                        if mode in ("xb", "wb", "ab"):
+                            binary_creates.append(path)
+                            writer = mock.Mock(wraps=stream)
+
+                            def write(data):
+                                written.append(bytes(data))
+                                return stream.write(data)
+
+                            writer.write.side_effect = write
+                            yield writer
+                        else:
+                            yield stream
+
+                stack.enter_context(mock.patch.object(Path, "open", tracked_open))
+                code, document = deployment.run()
+                for guard in guards:
+                    guard.assert_not_called()
+                if rejected_body is not None:
+                    self.assertNotIn(rejected_body, written, "rejected bytes must never be written")
+                self.assertEqual(0 if stage == "list" else failure_ordinal, len(binary_creates))
 
             self.assertEqual(20, code, document)
             self.assertEqual([], deployment.archived(), "framing failure must not publish")
@@ -631,7 +689,7 @@ class HttpFramingAdmission(DirectHttpCase):
                 failures = [event for event in deployment.log_events() if event["phase"] == "invoice_failure"]
                 self.assertEqual(1, len(failures))
                 self.assertEqual("EG_HTTP_FRAMING_INCOMPLETE", failures[0].get("support_ref"))
-                self.assertEqual(1, len(self.service_state.fetch_requests) - fetch_before)
+                self.assertEqual(failure_ordinal + 1, len(self.service_state.fetch_requests) - fetch_before)
             self.assertEqual(1, len(self.service_state.list_requests) - list_before)
 
     def _assert_cases(self, stage: str, cases: list[tuple[str, object]]) -> None:
@@ -994,6 +1052,446 @@ class HttpFramingAdmission(DirectHttpCase):
             self.assertEqual(4, len(deployment.archived()))
             self.assertEqual(4, len(deployment.state_rows()))
             self.assertEqual([], deployment.temp_entries())
+
+
+    def test_whole_final_header_fixed_and_generated_rejections(self) -> None:
+        # G4-106 exact witnesses plus independently constructed HTTP grammar
+        # violations. Expected rejection comes from these fixed wire rules,
+        # never from calling or importing the production validator.
+        for stage in ("list", "fetch"):
+            payload = self._list_payload() if stage == "list" else synthetic_pdf(b"rejected-final-header")
+            length = str(len(payload)).encode("ascii")
+            content_type = b"application/json" if stage == "list" else b"application/pdf"
+            content = b"Content-Type: " + content_type + b"\r\n"
+            cl = b"Content-Length: " + length + b"\r\n"
+            te = b"Transfer-Encoding: chunked\r\n"
+            cases = [
+                ("G4-hidden-CL", b"X-Test: x\rContent-Length: " + length + b"\r\r\n", payload),
+                ("G4-TE", b"Transfer-Encoding: chunked\r\r\n", chunked_body(payload)),
+                ("G4-hidden-TE", b"X-Test: x\rTransfer-Encoding: chunked\r\r\n", chunked_body(payload)),
+                ("bare-LF", cl + b"X-Test: x\n", payload),
+                ("bare-CR", cl + b"X-Test: x\r", payload),
+                ("CRCRLF", cl + b"X-Test: x\r\r\n", payload),
+                ("folded-CL", cl + b"\tignored\r\n", payload),
+                ("folded-TE", te + b" ignored\r\n", chunked_body(payload)),
+                ("orphan", b"\tignored\r\n" + cl, payload),
+                ("unrelated-fold", b"X-Test: x\r\n folded\r\n" + cl, payload),
+                ("space-before-colon", b"Content-Length : " + length + b"\r\n", payload),
+                ("colonless", b"Unrelated\r\n" + cl, payload),
+                ("empty-name", b": x\r\n" + cl, payload),
+                ("invalid-name", b"X(Test): x\r\n" + cl, payload),
+                ("CL-TE", cl + te, chunked_body(payload)),
+                ("TE-CL", te + cl, chunked_body(payload)),
+                ("absent", b"X-Test: x\r\n", payload),
+                ("equal-CL", cl + cl, payload),
+                ("conflicting-CL", cl + b"Content-Length: 1\r\n", payload),
+                ("equal-TE", te + te, chunked_body(payload)),
+                ("conflicting-TE", te + b"Transfer-Encoding: gzip\r\n", chunked_body(payload)),
+            ]
+            for value in (b"", b"+1", b"-1", b"1.0", b"0x1", b"1 0", b"1\t0", b"1,1", b"\xb2"):
+                cases.append(("numeric-" + repr(value), b"Content-Length: " + value + b"\r\n", payload))
+            for value in (b"chunked,chunked", b"gzip, chunked", b"chunked; x=y", b"chunked gzip", b""):
+                cases.append(("coding-" + repr(value), b"Transfer-Encoding: " + value + b"\r\n", chunked_body(payload)))
+            # Mutate every forbidden control byte in an unrelated value/name.
+            for byte in (*range(9), *range(10, 32), 127):
+                for location in ("name", "value"):
+                    field = b"X" + bytes([byte]) + b"-Test: x\r\n" if location == "name" else b"X-Test: x" + bytes([byte]) + b"y\r\n"
+                    cases.append((f"control-{byte}-{location}", field + cl, payload))
+            # Hidden framing must fail in first, middle and last positions,
+            # regardless of whether the physical line starts with framing.
+            for field, body in ((cl, payload), (te, chunked_body(payload))):
+                for delimiter in (b"\r", b"\n", b"\r\r\n"):
+                    hidden = b"X-Test: x" + delimiter + field
+                    for position in range(3):
+                        fields = [b"X-A: a\r\n", b"X-B: b\r\n"]
+                        fields.insert(position, hidden)
+                        cases.append((f"hidden-{field[:3]!r}-{delimiter!r}-{position}", b"".join(fields), body))
+                for byte in (11, 12, 0x85, 0xa0):
+                    name, value = field[:-2].split(b":", 1)
+                    for changed in (bytes([byte]) + value, value + bytes([byte])):
+                        cases.append((f"framing-ows-{byte}-{changed!r}", name + b":" + changed + b"\r\n", body))
+            for label, fields, body in cases:
+                with self.subTest(stage=stage, wire=label):
+                    self._assert_framing_incomplete(
+                        stage, exact_wire(b"HTTP/1.1 200 OK\r\n" + content + fields + b"\r\n" + body),
+                        rejected_body=body,
+                    )
+
+    def test_final_terminators_eof_fragmentation_and_later_fetch_zero_effects(self) -> None:
+        for stage in ("list", "fetch"):
+            payload = self._list_payload() if stage == "list" else synthetic_pdf(b"rejected-fragmented")
+            header = b"HTTP/1.1 200 OK\r\nContent-Length: " + str(len(payload)).encode() + b"\r\n"
+            for ending in (b"", b"\n", b"\r", b"\r\r\n", b" \r\n"):
+                with self.subTest(stage=stage, terminator=ending):
+                    # EOF alone is never an explicit empty CRLF.
+                    self._assert_framing_incomplete(stage, exact_wire(header + ending), rejected_body=payload)
+            for ordinal in (0, 2):
+                with self.subTest(stage=stage, ordinal=ordinal):
+                    self._assert_framing_incomplete(
+                        stage,
+                        exact_wire(header + b"X-Test: x\rTransfer-Encoding: chunked\r\r\n\r\n" + payload, fragmented=True),
+                        failure_ordinal=ordinal if stage == "fetch" else 0, rejected_body=payload,
+                    )
+
+    def test_whole_final_header_positive_grammar_and_interim_controls(self) -> None:
+        payload = self._list_payload()
+        for chunked in (False, True):
+            framing = b"tRaNsFeR-EnCoDiNg:\t ChUnKeD \t\r\n" if chunked else b"cOnTeNt-LeNgTh:\t 000" + str(len(payload)).encode() + b" \t\r\n"
+            body = chunked_wire(payload, first_extension=b'; foo="x y"', trailer_fields=b"X-Trailer: \x85\xa0\r\n") if chunked else payload
+            fields = [
+                b"Content-Type: application/json\r\n",
+                b"X-Repeat: first\r\n", b"X-Repeat:\t second \t\r\n",
+                b"X-Opaque: " + bytes(range(128, 256)) + b"\r\n",
+                b"X-Empty:\t \r\n",
+            ]
+            for position in (0, 2, len(fields)):
+                for interim in (b"", b"HTTP/1.1\t100 Continue\r\nX-Test: x\rContent-Length: invalid\r\r\n\n"):
+                    with self.subTest(chunked=chunked, position=position, interim=bool(interim)):
+                        ordered = fields[:]
+                        ordered.insert(position, framing)
+                        self.service_state.list_queue = [exact_wire(
+                            interim + b"HTTP/1.1\t200 OK\r\n" + b"".join(ordered) + b"\r\n" + body,
+                            fragmented=True,
+                        )]
+                        source = DirectHttpSource(DirectHttpSettings(self.service.list_url, self.service.fetch_url, CANARY_TENANT), 5, 2)
+                        self.assertEqual(4, len(source.inventory(1000)))
+                        self.assertEqual(1, source.list_calls)
+
+    def test_missing_admission_parsed_correspondence_and_decoder_tampering(self) -> None:
+        base_begin = http.client.HTTPResponse.begin
+        parse_headers = http.client.parse_headers
+        mutations = {
+            "added": lambda headers: headers.add_header("X-Added", "value"),
+            "missing": lambda headers: headers.__delitem__("Content-Type"),
+            "reordered": lambda headers: headers._headers.reverse(),
+            "combined": lambda headers: headers.replace_header("Content-Type", "application/json, other"),
+            "framing-value": lambda headers: headers.replace_header("Content-Length", "1"),
+            "framing-cardinality": lambda headers: headers.add_header("Content-Length", headers["Content-Length"]),
+        }
+        with mock.patch.object(http_source._StrictFinalHeaderReader, "admit_final_headers", return_value=None):
+            self._assert_framing_incomplete("list", raw_body(self._list_payload()))
+        for label, mutate in mutations.items():
+            def parse(fp, *args, **kwargs):
+                headers = parse_headers(fp, *args, **kwargs)
+                if isinstance(fp, http_source._StrictFinalHeaderReader):
+                    mutate(headers)
+                return headers
+            with self.subTest(parsed=label), mock.patch.object(http.client, "parse_headers", parse):
+                self._assert_framing_incomplete("list", raw_body(self._list_payload()))
+        for chunked in (False, True):
+            for attribute, value in (("chunked", None), ("length", 1), ("chunk_left", 3)):
+                def begin(response):
+                    base_begin(response)
+                    setattr(response, attribute, value)
+                with self.subTest(chunked=chunked, attribute=attribute), mock.patch.object(http.client.HTTPResponse, "begin", begin):
+                    behaviour = raw_response([("Transfer-Encoding", "chunked")], chunked_body(self._list_payload())) if chunked else raw_body(self._list_payload())
+                    self._assert_framing_incomplete("list", behaviour)
+
+    def test_both_production_connection_classes_use_strict_response(self) -> None:
+        self.assertIs(http_source._StrictHTTPConnection.response_class, http_source._StrictHTTPResponse)
+        self.assertIs(http_source._StrictHTTPSConnection.response_class, http_source._StrictHTTPResponse)
+        # Bypass only TLS encryption over the loopback fixture. urllib,
+        # HTTPSConnection, HTTPResponse and the response parser remain real.
+        context = mock.Mock()
+        context.wrap_socket.side_effect = lambda sock, **kwargs: sock
+        with mock.patch.object(http_source._StrictHTTPSHandler, "__init__", lambda handler: (
+            http_source.urllib.request.HTTPSHandler.__init__(handler, context=context)
+        )):
+            settings = DirectHttpSettings(self.service.list_url.replace("http:", "https:"), self.service.fetch_url.replace("http:", "https:"), CANARY_TENANT)
+            source = DirectHttpSource(settings, 5, 2)
+            self.assertEqual(4, len(source.inventory(1000)))
+            self.service_state.list_queue = [exact_wire(b"HTTP/1.1 200 OK\r\nX-Test: x\rContent-Length: 2\r\r\n\r\n{}")]
+            with self.assertRaises(SourceContractError) as caught:
+                source.inventory(1000)
+            self.assertEqual("EG_HTTP_FRAMING_INCOMPLETE", caught.exception.support_ref)
+            self.assertEqual(2, source.list_calls)
+        self.assertEqual(2, context.wrap_socket.call_count)
+
+
+    def test_additional_chunk_grammar_failures_and_list_ceiling(self) -> None:
+        payload = self._list_payload()
+        for body in (
+            b"+2\r\n{}\r\n0\r\n\r\n", b"0x2\r\n{}\r\n0\r\n\r\n",
+            b"2;bad=\"unterminated\r\n{}\r\n0\r\n\r\n",
+            b"2;bad=\x00\r\n{}\r\n0\r\n\r\n", b"2\n{}\r\n0\r\n\r\n",
+            b"2\r\n{}\r\n0\r\n folded\r\n\r\n",
+            b"2\r\n{}\r\n0\r\nBad Name: x\r\n\r\n",
+            b"2\r\n{}\r\n0\r\nX-Test: \x7f\r\n\r\n",
+            b"2\r\n{}\r\n0\r\nContent-Length: 2\r\n\r\n",
+            b"2\r\n{}\r\n0\r\nTransfer-Encoding: chunked\r\n\r\n",
+        ):
+            for stage in ("list", "fetch"):
+                with self.subTest(stage=stage, body=body):
+                    self._assert_framing_incomplete(stage, raw_response([("Transfer-Encoding", "chunked")], body))
+        self.assertEqual(4 * 1024 * 1024, http_source.MAX_LIST_BYTES)
+        self.assertEqual(32 * 1024 * 1024, http_source.MAX_PDF_BYTES)
+        for behaviour in (
+            raw_response([("Content-Length", str(http_source.MAX_LIST_BYTES + 1))], b""),
+            raw_response([("Transfer-Encoding", "chunked")], chunked_body(b"x" * (http_source.MAX_LIST_BYTES + 1))),
+        ):
+            self.service_state.list_queue = [behaviour]
+            source = DirectHttpSource(DirectHttpSettings(self.service.list_url, self.service.fetch_url, CANARY_TENANT), 5, 2)
+            with self.assertRaises(SourceContractError) as caught:
+                source.inventory(1000)
+            self.assertEqual("EG_HTTP_LIST_OVERSIZE", caught.exception.support_ref)
+            self.assertEqual(1, source.list_calls)
+
+
+class ReadOnlyListCommand(DirectHttpCase):
+    """Exercise real command entry with both durable and call-level oracles."""
+
+    def assert_read_only_command(self, deployment, *, exit_code=20, status_name="ACTION_REQUIRED", list_calls=1, open_fault=False, sidecar_fault=False):
+        # The documented lock exception can change its parent's entry/mtime.
+        # Precreate the inert file so every other entry and directory mtime can
+        # be compared exactly, including the state parent. Missing-parent cases
+        # remain completely absent.
+        if deployment.state_path.parent.is_dir():
+            (deployment.state_path.parent / LOCK_FILENAME).touch(exist_ok=True)
+        lock_metadata = frozenset({"state/" + LOCK_FILENAME})
+        before = state_snapshot(deployment.tmp, metadata_only=lock_metadata)
+        request_count = len(self.service_state.list_requests)
+        fetch_count = len(self.service_state.fetch_requests)
+        violations = []
+        sql_violations = []
+        real_open = builtins.open
+        real_io_open = io.open
+        real_os_open = os.open
+        real_mkdir = os.mkdir
+        real_scandir = os.scandir
+        real_connect = sqlite3.connect
+        real_lstat = Path.lstat
+
+        def log_path(path):
+            return not isinstance(path, int) and Path(path).is_relative_to(deployment.log_root)
+
+        def reject(label):
+            violations.append(label)
+            raise AssertionError(label)
+
+        def guarded_open(original):
+            def opened(path, mode="r", *args, **kwargs):
+                if open_fault and not isinstance(path, int) and Path(path) == deployment.state_path:
+                    raise PermissionError("synthetic unreadable database")
+                if any(char in mode for char in "wax+") and not log_path(path):
+                    reject("file write")
+                return original(path, mode, *args, **kwargs)
+            return opened
+
+        def os_open(path, flags, *args, **kwargs):
+            writable = flags & (os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND)
+            allowed_lock = Path(path) == deployment.state_path.parent / LOCK_FILENAME and flags == os.O_RDWR | os.O_CREAT
+            if writable and not allowed_lock and not log_path(path):
+                reject("os.open write")
+            return real_os_open(path, flags, *args, **kwargs)
+
+        def mkdir(path, *args, **kwargs):
+            if not log_path(path):
+                reject("mkdir")
+            return real_mkdir(path, *args, **kwargs)
+
+        def scandir(path):
+            if not isinstance(path, int) and Path(path).is_relative_to(deployment.temp_root):
+                reject("temp traversal")
+            return real_scandir(path)
+
+        def lstat(path, *args, **kwargs):
+            if sidecar_fault and path.name.endswith("-shm"):
+                raise PermissionError("synthetic sidecar inspection error")
+            return real_lstat(path, *args, **kwargs)
+
+        def authorizer(action, arg1, arg2, _database, _trigger):
+            if action in {
+                sqlite3.SQLITE_INSERT, sqlite3.SQLITE_UPDATE, sqlite3.SQLITE_DELETE,
+                sqlite3.SQLITE_CREATE_TABLE, sqlite3.SQLITE_DROP_TABLE, sqlite3.SQLITE_ALTER_TABLE,
+                sqlite3.SQLITE_TRANSACTION, sqlite3.SQLITE_ATTACH, sqlite3.SQLITE_DETACH,
+            } or (action == sqlite3.SQLITE_PRAGMA and arg2 is not None and
+                  (arg1.lower(), arg2.lower()) not in {("query_only", "on"), ("temp_store", "memory"), ("table_xinfo", "bills")}):
+                sql_violations.append((action, arg1, arg2))
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+
+        def connect(database, **kwargs):
+            if database != deployment.state_path.resolve().as_uri() + "?mode=ro" or kwargs.get("uri") is not True:
+                reject("writable sqlite connection")
+            connection = real_connect(database, **kwargs)
+            connection.set_authorizer(authorizer)
+            return connection
+
+        with contextlib.ExitStack() as stack:
+            guards = [
+                stack.enter_context(mock.patch.object(owner, name, side_effect=lambda *a, _label=name, **k: reject(_label)))
+                for owner, name in (
+                    (cli, "cleanup_stale_owned_temp"), (cli, "notify_failure"),
+                    (StateStore, "_initialize"), (StateStore, "_transaction"),
+                    (StateStore, "mark_seen"), (StateStore, "record_archived"), (StateStore, "record_failure"),
+                    (DirectHttpSource, "download"), (reconcile, "create_run_directory"),
+                    (reconcile, "cleanup_run_directory"), (reconcile, "publish_no_replace"),
+                    (os, "unlink"), (os, "remove"), (os, "rmdir"), (os, "rename"), (os, "replace"), (os, "link"),
+                )
+            ]
+            stack.enter_context(mock.patch("builtins.open", guarded_open(real_open)))
+            stack.enter_context(mock.patch.object(io, "open", guarded_open(real_io_open)))
+            stack.enter_context(mock.patch.object(os, "open", os_open))
+            stack.enter_context(mock.patch.object(os, "mkdir", mkdir))
+            stack.enter_context(mock.patch.object(os, "scandir", scandir))
+            stack.enter_context(mock.patch.object(Path, "lstat", lstat))
+            stack.enter_context(mock.patch.object(sqlite3, "connect", connect))
+            code, document = deployment.run("list")
+            for guard in guards:
+                guard.assert_not_called()
+        self.assertEqual([], violations)
+        self.assertEqual([], sql_violations)
+        self.assertEqual(exit_code, code, document)
+        self.assertEqual(status_name, document["status"], document)
+        self.assertEqual(request_count + list_calls, len(self.service_state.list_requests))
+        self.assertEqual(fetch_count, len(self.service_state.fetch_requests))
+        after = state_snapshot(deployment.tmp, metadata_only=lock_metadata)
+        # Only the approved log root and containing fixture directory's mtime
+        # can change when the first log is created.
+        def business(snapshot):
+            return {key: value for key, value in snapshot.items() if key != "." and key != "logs" and not key.startswith("logs/")}
+        self.assertEqual(business(before), business(after))
+        self.assert_no_canary(deployment.last_stdout, deployment.log_text())
+        return document
+
+    def test_state_admission_matrix_at_command_entry(self) -> None:
+        cases = ("missing-parent", "missing-db", "version-zero-empty", "old-schema", "newer",
+                 "malformed", "view", "wrong-type", "corrupt", "wal-format", "-wal", "-shm", "-journal")
+        for label in cases:
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as tmp:
+                deployment = Deployment(Path(tmp), self.service)
+                if label == "missing-db":
+                    deployment.state_path.parent.mkdir()
+                elif label != "missing-parent":
+                    create_state_fixture(
+                        deployment.state_path,
+                        version=0 if label in ("version-zero-empty", "old-schema") else 2 if label == "newer" else 1,
+                        schema="" if label == "version-zero-empty" else
+                        "CREATE TABLE bills (filename_key TEXT PRIMARY KEY);" if label == "malformed" else
+                        "CREATE VIEW bills AS SELECT 1 AS filename_key;" if label == "view" else
+                        FIXTURE_SCHEMA.replace("byte_size INTEGER", "byte_size BLOB") if label == "wrong-type" else FIXTURE_SCHEMA,
+                    )
+                    if label == "corrupt":
+                        deployment.state_path.write_bytes(b"corrupt")
+                    elif label == "wal-format":
+                        data = bytearray(deployment.state_path.read_bytes())
+                        data[18:20] = b"\x02\x02"
+                        deployment.state_path.write_bytes(data)
+                    elif label in ("-wal", "-shm", "-journal"):
+                        deployment.state_path.with_name(deployment.state_path.name + label).write_bytes(b"canary")
+                self.assert_read_only_command(deployment, status_name="STATE_INCONSISTENT", list_calls=0)
+
+    def test_unreadable_state_and_sidecar_inspection_errors_at_command_entry(self) -> None:
+        deployment = self.deployment()
+        create_state_fixture(deployment.state_path)
+        self.assert_read_only_command(deployment, status_name="STATE_INCONSISTENT", list_calls=0, open_fault=True)
+        self.assert_read_only_command(deployment, status_name="STATE_INCONSISTENT", list_calls=0, sidecar_fault=True)
+
+    def test_current_empty_populated_pending_present_and_known_missing(self) -> None:
+        for label in ("empty", "populated", "all-present", "known-missing"):
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as tmp:
+                deployment = Deployment(Path(tmp), self.service)
+                create_state_fixture(deployment.state_path)
+                if label != "empty":
+                    name = "known-but-absent.pdf" if label == "known-missing" else bill_name(0)
+                    connection = sqlite3.connect(deployment.state_path)
+                    try:
+                        connection.execute(
+                            "INSERT INTO bills (filename_key, portal_filename, first_seen_at_utc, last_seen_at_utc, "
+                            "status, archived_at_utc, sha256) VALUES (?, ?, 'synthetic', 'synthetic', 'ARCHIVED', 'synthetic', ?)",
+                            (filename_key(name), name, "a" * 64),
+                        )
+                        connection.commit()
+                    finally:
+                        connection.close()
+                if label == "all-present":
+                    for ordinal in range(4):
+                        (deployment.archive / bill_name(ordinal)).write_bytes(synthetic_pdf(b"present"))
+                document = self.assert_read_only_command(
+                    deployment, exit_code=0 if label == "all-present" else 20,
+                    status_name="NO_NEW_BILLS" if label == "all-present" else "PORTAL_LAYOUT_CHANGED" if label == "known-missing" else "ACTION_REQUIRED",
+                )
+                if label != "known-missing":
+                    self.assertEqual(0 if label == "all-present" else 4, document["pending_count"])
+
+    def test_stale_fresh_unowned_temp_and_missing_optional_directories(self) -> None:
+        for temp_exists in (False, True):
+            with self.subTest(temp_exists=temp_exists), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                deployment = Deployment(root, self.service, browser_cache_path=str(root / "browser-parent" / "cache"))
+                create_state_fixture(deployment.state_path)
+                if temp_exists:
+                    for name, age in (
+                        ("run-11111111-1111-4111-8111-111111111111", 172800),
+                        ("run-22222222-2222-4222-8222-222222222222", 0),
+                        ("unowned", 172800), ("run-reserved", 172800),
+                    ):
+                        path = deployment.temp_root / name
+                        path.mkdir(parents=True)
+                        (path / "canary").write_bytes(b"preserve every byte")
+                        os.utime(path, (time.time() - age, time.time() - age))
+                    (deployment.temp_root / "unowned.txt").write_bytes(b"preserve")
+                self.assert_read_only_command(deployment)
+                self.assertEqual(temp_exists, deployment.temp_root.exists())
+                self.assertFalse((root / "browser-parent").exists())
+
+    def test_failure_branches_never_notify_or_mutate(self) -> None:
+        for label in ("framing", "transient", "planner", "unexpected"):
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as tmp:
+                deployment = Deployment(Path(tmp), self.service, alert={"url": "http://127.0.0.1:1/unused"})
+                create_state_fixture(deployment.state_path)
+                if label == "framing":
+                    self.service_state.list_queue = [exact_wire(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\r\n\r\n{}")]
+                elif label == "transient":
+                    self.service_state.list_queue = [status(503), status(503)]
+                elif label == "planner":
+                    files = default_files()
+                    files[0]["filename"] = "../unsafe.pdf"
+                    self.service_state.list_queue = [json_document({"success": True, "files": files})]
+                with contextlib.ExitStack() as stack:
+                    if label == "unexpected":
+                        stack.enter_context(mock.patch.object(cli, "reconcile_listed_inventory", side_effect=RuntimeError("private-canary")))
+                    self.assert_read_only_command(
+                        deployment, exit_code=10 if label == "transient" else 20,
+                        status_name="RETRYABLE_NETWORK_FAILURE" if label == "transient" else "ACTION_REQUIRED" if label == "unexpected" else "PORTAL_LAYOUT_CHANGED",
+                        list_calls=2 if label == "transient" else 0 if label == "unexpected" else 1,
+                    )
+
+    def test_lock_contention_and_process_death_release_at_command_entry(self) -> None:
+        deployment = self.deployment()
+        create_state_fixture(deployment.state_path)
+        holder = subprocess.Popen(
+            [sys.executable, "-c", LOCK_HOLDER, str(Path(__file__).resolve().parents[1]), str(deployment.state_path.parent)],
+            stdout=subprocess.PIPE, text=True,
+        )
+        try:
+            self.assertEqual("held", holder.stdout.readline().strip())
+            self.assert_read_only_command(deployment, exit_code=10, status_name="RUN_IN_PROGRESS", list_calls=0)
+        finally:
+            holder.kill()
+            holder.wait(timeout=30)
+            holder.stdout.close()
+        self.assert_read_only_command(deployment)
+
+    def test_normal_run_keeps_initialization_migration_and_owned_cleanup(self) -> None:
+        for schema in (None, "", FIXTURE_SCHEMA):
+            with self.subTest(schema=schema is None), tempfile.TemporaryDirectory() as tmp:
+                deployment = Deployment(Path(tmp), self.service)
+                if schema is not None:
+                    create_state_fixture(deployment.state_path, version=0, schema=schema)
+                stale = deployment.temp_root / "run-11111111-1111-4111-8111-111111111111"
+                stale.mkdir(parents=True)
+                (stale / "canary").write_bytes(b"stale owned")
+                os.utime(stale, (time.time() - 172800, time.time() - 172800))
+                unowned = deployment.temp_root / "run-reserved"
+                unowned.mkdir()
+                (unowned / "canary").write_bytes(b"unowned preserved")
+                code, document = deployment.run()
+                self.assertEqual(0, code, document)
+                self.assertFalse(stale.exists())
+                self.assertEqual(b"unowned preserved", (unowned / "canary").read_bytes())
+                self.assertEqual(4, len(deployment.archived()))
+                self.assertEqual(0, deployment.run()[0])
 
 
 class ArchiveConflicts(DirectHttpCase):

@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 from energygrid_bill_downloader.config import is_within, load_runtime_config
 from energygrid_bill_downloader.errors import ConfigError
@@ -110,6 +111,36 @@ class ConfigTests(unittest.TestCase):
         self.assertTrue(config.state_path.parent.is_dir())
         self.assertTrue(config.temp_root.is_dir())
         self.assertTrue(config.log_root.is_dir())
+
+    def test_read_only_preflight_has_no_directory_creation(self) -> None:
+        raw = self.raw()
+        raw["browser_cache_path"] = str(self.root / "browser-parent" / "cache")
+        config = load_runtime_config(raw, checkout_root=Path.cwd())
+        config.archive_root.mkdir()
+        before = set(self.root.rglob("*"))
+        with mock.patch.object(Path, "mkdir", side_effect=AssertionError("mkdir")) as mkdir:
+            config.preflight(read_only=True)
+            mkdir.assert_not_called()
+        self.assertEqual(before, set(self.root.rglob("*")))
+        for path in (config.state_path.parent, config.temp_root, config.log_root, config.browser_cache_path.parent):
+            self.assertFalse(path.exists())
+        # The default writable mode retains all operational parent creation.
+        config.preflight()
+        for path in (config.state_path.parent, config.temp_root, config.log_root, config.browser_cache_path.parent):
+            self.assertTrue(path.is_dir())
+
+    def test_read_only_preflight_still_validates_metadata(self) -> None:
+        config = load_runtime_config(self.raw(), checkout_root=Path.cwd())
+        with self.assertRaises(ConfigError):
+            config.preflight(read_only=True)
+        config.archive_root.mkdir()
+        config.temp_root.write_bytes(b"not a directory")
+        before = config.temp_root.read_bytes()
+        with mock.patch.object(Path, "mkdir", side_effect=AssertionError("mkdir")) as mkdir:
+            with self.assertRaises(ConfigError):
+                config.preflight(read_only=True)
+            mkdir.assert_not_called()
+        self.assertEqual(before, config.temp_root.read_bytes())
 
 
     def test_account_identity_is_required_and_non_empty_string(self) -> None:
